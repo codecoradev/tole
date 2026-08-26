@@ -17,7 +17,6 @@ jobs:
       - name: Fetch & check CLA signature
         id: check
         env:
-          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
         run: |
           # Fetch signatures.json directly from raw GitHub (public repo).
           # A fetch failure is an infra error — do NOT treat it as "unsigned".
@@ -29,6 +28,8 @@ jobs:
             echo "::error::Failed to fetch signatures.json (network). Refusing to report a false 'CLA not signed'."
             exit 1
           fi
+          python3 -c "import json; json.load(open('signatures.json'))" 2>/dev/null \
+            || { echo "::error::signatures.json is invalid JSON"; exit 1; }
           python3 - << 'EOF'
           import json, os
 
@@ -123,8 +124,6 @@ jobs:
 
       - name: Fail if not signed
         if: steps.check.outputs.signed != 'true'
-        env:
-          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
         run: |
           echo "❌ CLA not signed by $PR_AUTHOR"
           exit 1
