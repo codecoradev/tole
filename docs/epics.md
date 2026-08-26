@@ -1,15 +1,15 @@
-# cora-agent — Epics & Sprint Plan (6 Minggu)
+# cora-agent — Epics & Sprint Plan (6 Weeks)
 
-> Solo dev part-time, kapasitas ~10 jam/minggu. Bahasa Indonesia, istilah teknis English.
+> Solo dev part-time, capacity ~10 hours/week. English, technical terms as-is.
 > Ground truth roadmap: Phase 0 DONE (scaffold + CI). Phase 1a → 1b → 2 → 3.
 
-## Non-Goals (diulang dari roadmap)
+## Non-Goals (repeated from roadmap)
 
-- **Bukan** multi-agent orchestration / planner hierarkis.
-- **Bukan** sandbox container execution (Docker/gVisor) — tools berjalan via approval gates.
-- **Bukan** UI web/dashboard — CLI only.
-- **Bukan** provider non-LLM-first (no rule-based planner).
-- **Bukan** distribusi binary selain cross-build CI target yang disebut (aarch64-android, aarch64-apple-ios) — bukan packaging store (Play Store/App Store).
+- **Not** multi-agent orchestration / hierarchical planner.
+- **Not** sandbox container execution (Docker/gVisor) — tools run via approval gates.
+- **Not** web UI/dashboard — CLI only.
+- **Not** a non-LLM-first provider (no rule-based planner).
+- **Not** binary distribution beyond the cross-build CI targets mentioned (aarch64-android, aarch64-apple-ios) — no store packaging (Play Store/App Store).
 
 ---
 
@@ -17,131 +17,131 @@
 
 - **Phase:** 1a
 - **User Stories:**
-  - US1.1: Sebagai developer, saya ingin 3 store SQLite (sessions / turns+events / state snapshot) dengan schema `STORAGE_VERSION`-ed, agar evolusi schema terkontrol.
-  - US1.2: Sebagai developer, saya ingin migrate-on-open (migrasi idempoten saat DB dibuka), agar upgrade binary tidak merusak data lama.
+  - US1.1: As a developer, I want 3 SQLite stores (sessions / turns+events / state snapshot) with a `STORAGE_VERSION`-ed schema, so that schema evolution is controlled.
+  - US1.2: As a developer, I want migrate-on-open (idempotent migration when the DB is opened), so that upgrading the binary does not corrupt old data.
 - **Acceptance Criteria:**
-  - [ ] 3 store terpisah dengan schema terdokumentasi di `docs/` atau rustdoc.
-  - [ ] Open DB versi N-1 → auto-migrate ke N tanpa data loss (test roundtrip).
-  - [ ] Open DB versi > current → hard error dengan pesan jelas (test).
-  - [ ] Semua operasi lewat satu `Storage` trait; no raw SQL di caller.
-- **Est effort:** M (~12 jam)
+  - [ ] 3 separate stores with documented schema in `docs/` or rustdoc.
+  - [ ] Open DB version N-1 → auto-migrate to N without data loss (roundtrip test).
+  - [ ] Open DB version > current → hard error with a clear message (test).
+  - [ ] All operations go through a single `Storage` trait; no raw SQL in callers.
+- **Est effort:** M (~12 hours)
 - **Dependencies:** — (Phase 0 scaffold).
 
 ## E2 — State Machine: Program Counter, Seq CAS, Effect Sandwich
 
 - **Phase:** 1a
 - **User Stories:**
-  - US2.1: Sebagai developer, saya ingin program counter + sequence number dengan CAS (compare-and-swap), agar concurrency/double-apply effect terdeteksi.
-  - US2.2: Sebagai developer, saya ingin pola effect sandwich (persist intent → execute effect → persist result), agar crash di tengah effect dapat di-resume deterministik.
+  - US2.1: As a developer, I want a program counter + sequence number with CAS (compare-and-swap), so that concurrency/double-apply of effects is detected.
+  - US2.2: As a developer, I want the effect sandwich pattern (persist intent → execute effect → persist result), so that a crash mid-effect can be resumed deterministically.
 - **Acceptance Criteria:**
-  - [ ] `seq` bertambah monoton; stale write (seq mismatch) ditolak dengan error, bukan silent overwrite (unit test).
-  - [ ] Test: crash disimulasikan antara "persist intent" dan "execute" → resume menghasilkan state akhir identik dengan run tanpa crash (deterministic replay test).
-  - [ ] Program counter memvalidasi transisi step illegal → error, bukan panic.
-- **Est effort:** L (~16 jam)
+  - [ ] `seq` increments monotonically; stale write (seq mismatch) rejected with an error, not a silent overwrite (unit test).
+  - [ ] Test: crash simulated between "persist intent" and "execute" → resume produces a final state identical to a run without crash (deterministic replay test).
+  - [ ] Program counter validates illegal step transitions → error, not panic.
+- **Est effort:** L (~16 hours)
 - **Dependencies:** E1.
 
 ## E3 — Mock Provider + Tier A Tests
 
 - **Phase:** 1a
 - **User Stories:**
-  - US3.1: Sebagai developer, saya ingin mock LLM provider (scripted responses), agar agent loop dapat diuji tanpa API key/network.
+  - US3.1: As a developer, I want a mock LLM provider (scripted responses), so that the agent loop can be tested without an API key/network.
 - **Acceptance Criteria:**
-  - [ ] Mock provider mengikuti trait yang sama dengan provider riil.
-  - [ ] Tier A tests (fast, deterministic, no network) meng-cover: agent loop, state transitions, storage roundtrip.
-  - [ ] `cargo test --features mock-provider` hijau < 30 detik di CI.
-- **Est effort:** M (~10 jam)
+  - [ ] Mock provider follows the same trait as the real provider.
+  - [ ] Tier A tests (fast, deterministic, no network) cover: agent loop, state transitions, storage roundtrip.
+  - [ ] `cargo test --features mock-provider` green < 30 seconds in CI.
+- **Est effort:** M (~10 hours)
 - **Dependencies:** E2.
 
 ## E4 — `cora search` Tool (ReadOnly) + Real LLM Provider
 
 - **Phase:** 1b
 - **User Stories:**
-  - US4.1: Sebagai agent, saya ingin tool `cora search` (ReadOnly, memanggil cora brain/code search), agar dapat query context codebase tanpa risiko mutasi.
-  - US4.2: Sebagai user, saya ingin real LLM provider (trait impl, mis. HTTP client ke provider konfigurabel), agar agent berjalan dengan model nyata.
+  - US4.1: As an agent, I want a `cora search` tool (ReadOnly, calling cora brain/code search), so that I can query codebase context without mutation risk.
+  - US4.2: As a user, I want a real LLM provider (trait impl, e.g. an HTTP client to a configurable provider), so that the agent runs with a real model.
 - **Acceptance Criteria:**
-  - [ ] Tool registry meng-enforce `ReadOnly` permission — tool write-capable ditolak register tanpa approval gate (test).
-  - [ ] Real provider terkonfigurasi via env/config; API key tidak pernah di-log (test grep log output).
-  - [ ] Integration test (Tier B, network-optional, di-skip tanpa key): single turn end-to-end — prompt → provider → tool call `cora search` → jawaban.
-- **Est effort:** L (~14 jam)
+  - [ ] Tool registry enforces `ReadOnly` permission — write-capable tools are refused registration without an approval gate (test).
+  - [ ] Real provider configured via env/config; API key is never logged (test greps log output).
+  - [ ] Integration test (Tier B, network-optional, skipped without a key): single turn end-to-end — prompt → provider → `cora search` tool call → answer.
+- **Est effort:** L (~14 hours)
 - **Dependencies:** E3.
 
 ## E5 — End-to-End Single Turn + Crash-Resume Test
 
 - **Phase:** 1b
 - **User Stories:**
-  - US5.1: Sebagai developer, saya ingin test end-to-end single turn penuh (mock provider) + crash-resume, agar jaminan determinisme E2 terbukti di level integration.
+  - US5.1: As a developer, I want a full single-turn end-to-end test (mock provider) + crash-resume, so that E2's determinism guarantee is proven at the integration level.
 - **Acceptance Criteria:**
-  - [ ] Scenario test: kill process mid-turn → restart → run selesai dengan hasil identik run normal (golden-file compare).
-  - [ ] Test masuk CI sebagai Tier A (pakai mock provider).
-- **Est effort:** M (~8 jam)
+  - [ ] Scenario test: kill process mid-turn → restart → run completes with a result identical to a normal run (golden-file compare).
+  - [ ] Test enters CI as Tier A (using mock provider).
+- **Est effort:** M (~8 hours)
 - **Dependencies:** E2, E4.
 
 ## E6 — Approval Gates (Approver Trait + Allowlist + Interactive CLI)
 
 - **Phase:** 2
 - **User Stories:**
-  - US6.1: Sebagai user, saya ingin setiap tool Write/execute melewati `Approver` trait, agar aksi berbahaya selalu butuh persetujuan.
-  - US6.2: Sebagai user, saya ingin impl `AllowlistApprover` (pattern-based) dan `InteractiveApprover` (prompt y/N di CLI), agar bisa pilih mode otomatis-terbatas atau manual.
+  - US6.1: As a user, I want every Write/execute tool to pass through an `Approver` trait, so that dangerous actions always require approval.
+  - US6.2: As a user, I want an `AllowlistApprover` impl (pattern-based) and an `InteractiveApprover` (y/N prompt in the CLI), so that I can choose a limited-automatic or manual mode.
 - **Acceptance Criteria:**
-  - [ ] Semua tool non-ReadOnly wajib Approver; bypass = compile-time/test-time error path (test: unapproved write tidak dieksekusi, event `denied` tercatat).
+  - [ ] All non-ReadOnly tools require an Approver; bypass = compile-time/test-time error path (test: unapproved write is not executed, `denied` event recorded).
   - [ ] Allowlist: glob/pattern match unit tests.
-  - [ ] Interactive: prompt di CLI menampilkan command + diff ringkas sebelum y/N.
-- **Est effort:** M (~12 jam)
+  - [ ] Interactive: CLI prompt shows command + brief diff before y/N.
+- **Est effort:** M (~12 hours)
 - **Dependencies:** E4.
 
-## E7 — Tools Tambahan: uteke search (RO), file read (RO), gh CLI (Write)
+## E7 — Additional Tools: uteke search (RO), file read (RO), gh CLI (Write)
 
 - **Phase:** 2
 - **User Stories:**
-  - US7.1: Sebagai agent, saya ingin tool `uteke search` (ReadOnly) untuk query memori, tool `file read` (ReadOnly), dan tool `gh` CLI (Write: issue comment, PR create), agar mampu memperbaiki GitHub issue end-to-end.
+  - US7.1: As an agent, I want a `uteke search` tool (ReadOnly) to query memory, a `file read` tool (ReadOnly), and a `gh` CLI tool (Write: issue comment, PR create), so that I can fix a GitHub issue end-to-end.
 - **Acceptance Criteria:**
-  - [ ] 3 tool terimplementasi dengan test masing-masing (gh via dry-run/fake binary).
-  - [ ] `gh` Write selalu lewat Approver (E6).
-  - [ ] Path traversal pada file read ditolak (test).
-- **Est effort:** M (~12 jam)
+  - [ ] 3 tools implemented each with tests (gh via dry-run/fake binary).
+  - [ ] `gh` Write always goes through Approver (E6).
+  - [ ] Path traversal on file read is rejected (test).
+- **Est effort:** M (~12 hours)
 - **Dependencies:** E6.
 
-## E8 — MVP Gate: Perbaiki 1 GitHub Issue Riil End-to-End
+## E8 — MVP Gate: Fix 1 Real GitHub Issue End-to-End
 
 - **Phase:** 2 (gate)
 - **User Stories:**
-  - US8.1: Sebagai maintainer, saya ingin agent memperbaiki 1 issue riil (reproduce → fix → test → PR), agar MVP terbukti bernilai.
+  - US8.1: As a maintainer, I want the agent to fix 1 real issue (reproduce → fix → test → PR), so that the MVP proves its value.
 - **Acceptance Criteria:**
-  - [ ] Run terdokumentasi (log + session replay) di issue nyata di repo sendiri.
-  - [ ] PR dibuat via `gh` tool, CI hijau, PR merged (atau di-review manual lalu merge).
-  - [ ] Write-up retro: apa yang kurang → backlog Phase 3.
-- **Est effort:** M (~10 jam, termasuk intervensi manual yang dicatat)
+  - [ ] Documented run (log + session replay) on a real issue in our own repo.
+  - [ ] PR created via the `gh` tool, CI green, PR merged (or manually reviewed then merged).
+  - [ ] Retro write-up: what was lacking → Phase 3 backlog.
+- **Est effort:** M (~10 hours, including logged manual intervention)
 - **Dependencies:** E7, E5.
 
 ## E9 — Hardening, Cross-Build CI, Perf, OSS Prep
 
 - **Phase:** 3
 - **User Stories:**
-  - US9.1: Sebagai maintainer, saya ingin cross-build CI target `aarch64-android` dan `aarch64-apple-ios` hijau, agar jalur mobile terbukti.
-  - US9.2: Sebagai maintainer, saya ingin hardening (error handling, timeout tool, limit output) + benchmark perf dasar, agar siap pengguna luar.
-  - US9.3: Sebagai pengguna luar, saya ingin OSS prep (LICENSE, README, CONTRIBUTING, publish crate/binary), agar bisa coba.
+  - US9.1: As a maintainer, I want cross-build CI targets `aarch64-android` and `aarch64-apple-ios` green, so that the mobile path is proven.
+  - US9.2: As a maintainer, I want hardening (error handling, tool timeouts, output limits) + a basic perf benchmark, so that it is ready for external users.
+  - US9.3: As an external user, I want OSS prep (LICENSE, README, CONTRIBUTING, crate/binary publish), so that I can try it.
 - **Acceptance Criteria:**
-  - [ ] CI matrix build 2 target cross tersebut success (build saja, tidak run).
-  - [ ] Tool timeout + output truncation teruji; panic-free pada input jelek (fuzz-lite/manual).
-  - [ ] Benchmark: single turn mock < threshold terdokumen; dokumen hasil di `docs/perf.md`.
+  - [ ] CI matrix builds those 2 cross targets successfully (build only, no run).
+  - [ ] Tool timeout + output truncation tested; panic-free on bad input (fuzz-lite/manual).
+  - [ ] Benchmark: single turn mock < documented threshold; results documented in `docs/perf.md`.
   - [ ] Repo public-ready: LICENSE, README quickstart, SECURITY.md.
-- **Est effort:** L (~16 jam)
+- **Est effort:** L (~16 hours)
 - **Dependencies:** E8.
 
 ---
 
-## Sprint Plan (6 minggu, ~10 jam/minggu)
+## Sprint Plan (6 weeks, ~10 hours/week)
 
-| Minggu | Fokus | Epic | Deliverable | Checkpoint Review (akhir minggu) | Kill / Pivot Criteria |
+| Week | Focus | Epic | Deliverable | Checkpoint Review (end of week) | Kill / Pivot Criteria |
 |---|---|---|---|---|---|
-| W1 | Phase 1a — Storage | E1 | 3-store schema + migrate-on-open + test | Migrasi roundtrip hijau; schema doc ada | Jika SQLite abstraksi terbukti >2x overbudget (>20 jam), sederhanakan ke 1 file DB multi-table — jangan tunda. |
-| W2 | Phase 1a — State Machine + Mock | E2, E3 | Seq CAS, effect sandwich, mock provider, Tier A hijau | Crash-resume unit-level deterministik; `cargo test` hijau CI | Jika determinisme replay gagal terus >1 minggu ekstra: kill — arsitektur core tidak sound. |
-| W3 | Phase 1b — cora search + real provider | E4, E5 | ReadOnly tool + real LLM provider + E2E single turn + crash-resume test | E2E single turn (mock & real-if-key) hijau | Jika real provider flaky >50% run: ganti provider utama, jangan debug tanpa batas. |
-| W4 | Phase 2 — Approval Gates | E6 | Approver trait + Allowlist + Interactive CLI + tests | Demo CLI: write request → prompt y/N → denied tercatat | Jika desain Approver mulai creep ke RBAC kompleks: cut, cukup 2 impl. |
-| W5 | Phase 2 — Tools + MVP Gate | E7, E8 | uteke search, file read, gh Write + **MVP: 1 issue riil diperbaiki** | PR dari agent merged + retro write-up | **MVP gate:** jika setelah 2 sesi intervensi agent masih gagal total, evaluasi lanjut vs stop — jangan lanjut Phase 3 otomatis. |
-| W6 | Phase 3 — Hardening | E9 | Cross-build CI (aarch64-android, aarch64-apple-ios), timeout/truncation, perf doc, OSS prep | CI matrix hijau, LICENSE+README ready | Jika cross-build gagal karena dependency C: catat blocker, defer target — tidak boleh geser >W7. |
+| W1 | Phase 1a — Storage | E1 | 3-store schema + migrate-on-open + tests | Migration roundtrip green; schema doc exists | If the SQLite abstraction proves >2x over budget (>20 hours), simplify to a single multi-table DB file — do not delay. |
+| W2 | Phase 1a — State Machine + Mock | E2, E3 | Seq CAS, effect sandwich, mock provider, Tier A green | Deterministic unit-level crash-resume; `cargo test` green in CI | If replay determinism keeps failing for >1 extra week: kill — the core architecture is not sound. |
+| W3 | Phase 1b — cora search + real provider | E4, E5 | ReadOnly tool + real LLM provider + E2E single turn + crash-resume test | E2E single turn (mock & real-if-key) green | If the real provider is flaky >50% of runs: switch primary provider, don't debug endlessly. |
+| W4 | Phase 2 — Approval Gates | E6 | Approver trait + Allowlist + Interactive CLI + tests | CLI demo: write request → y/N prompt → denied recorded | If the Approver design starts creeping toward complex RBAC: cut it, 2 impls are enough. |
+| W5 | Phase 2 — Tools + MVP Gate | E7, E8 | uteke search, file read, gh Write + **MVP: 1 real issue fixed** | PR from agent merged + retro write-up | **MVP gate:** if after 2 intervention sessions the agent still fails completely, evaluate continue vs stop — do not automatically proceed to Phase 3. |
+| W6 | Phase 3 — Hardening | E9 | Cross-build CI (aarch64-android, aarch64-apple-ios), timeout/truncation, perf doc, OSS prep | CI matrix green, LICENSE+README ready | If cross-build fails due to a C dependency: record the blocker, defer the target — must not slip beyond W7. |
 
-### Catatan alokasi
+### Allocation notes
 
-- Buffer: setiap minggu sisakan ~2 jam untuk review checkpoint + backlog grooming.
-- Total estimasi: E1–E9 ≈ 110 jam vs kapasitas 60 jam → **estimasi effort adalah effort ideal; jika W5 MVP gate belum tercapai, W6 (Phase 3) ditunda, bukan dipadatkan.** MVP gate adalah satu-satunya deadline keras.
+- Buffer: each week, reserve ~2 hours for checkpoint review + backlog grooming.
+- Total estimate: E1–E9 ≈ 110 hours vs capacity of 60 hours → **the effort estimate is ideal effort; if the W5 MVP gate is not reached, W6 (Phase 3) is postponed, not compressed.** The MVP gate is the only hard deadline.

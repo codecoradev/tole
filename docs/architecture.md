@@ -1,16 +1,16 @@
 # cora-agent — Architecture Document
 
-> Status: Ground truth Phase 1–2. Bahasa Indonesia, istilah teknis English.
+> Status: Ground truth Phase 1–2. Written in English, technical terms kept as-is.
 > Crate layout: `crates/cora-agent-core` (pure lib) + `crates/cora-agent-cli` (thin host bin). Future: `cora-agent-ffi`.
 
-## 1. Prinsip Desain
+## 1. Design Principles
 
-1. **Durability first** — semua state yang menentukan perilaku agent harus survive crash. SQLite single file per session adalah satu-satunya source of truth.
-2. **Write-once** — conversation tree append-only & immutable. Tidak ada update/delete entry; koreksi = entry baru.
-3. **Core murni** — `cora-agent-core` tidak melakukan I/O interaktif (stdin/stdout/CLI). Embeddable via CLI, Corin (Tauri), atau `flutter_rust_bridge` FFI.
-4. **Portabel Phase 1–2** — tidak ada dependency *nix-only. Cross-build CI defer ke Phase 3.
+1. **Durability first** — all state that determines agent behavior must survive a crash. A single SQLite file per session is the single source of truth.
+2. **Write-once** — the conversation tree is append-only & immutable. No entry update/delete; corrections = new entries.
+3. **Pure core** — `cora-agent-core` performs no interactive I/O (stdin/stdout/CLI). Embeddable via CLI, Corin (Tauri), or `flutter_rust_bridge` FFI.
+4. **Portable Phase 1–2** — no *nix-only dependencies. Cross-build CI deferred to Phase 3.
 
-## 2. Crate Layout & Dependency
+## 2. Crate Layout & Dependencies
 
 ```mermaid
 graph TD
@@ -25,68 +25,68 @@ graph TD
     CORE -->|rusqlite bundled| DB
 ```
 
-- **cora-agent-core** — platform-agnostic library. Tidak ada asumsi stdin/stdout/CLI. Semua interaksi host (approval prompt, output streaming) lewat trait boundary (`Approver`, dsb.).
-- **cora-agent-cli** — thin host binary: parse config, wiring `InteractiveApprover` (prompt y/N di host), jalankan turn loop dari core.
-- **cora-agent-ffi** (future) — FFI binding untuk embedding di Corin / Flutter.
+- **cora-agent-core** — platform-agnostic library. No stdin/stdout/CLI assumptions. All host interactions (approval prompt, output streaming) go through trait boundaries (`Approver`, etc.).
+- **cora-agent-cli** — thin host binary: parse config, wire up `InteractiveApprover` (y/N prompt on the host), run the turn loop from core.
+- **cora-agent-ffi** (future) — FFI binding for embedding in Corin / Flutter.
 
 ## 3. Module Responsibility
 
-| Module | File | Tanggung Jawab |
+| Module | File | Responsibility |
 |---|---|---|
-| Durable storage | (session db) | SQLite single file per session; rusqlite bundled; WAL mode; semua write dalam `BEGIN IMMEDIATE`; migrate-on-open dengan `STORAGE_VERSION` const |
-| Conversation tree | `entry.rs` | Append-only, immutable entries (user/assistant/tool/final). Write-once; replay aman |
-| Registers | `register.rs` | Namespaced mutable cells: `lane`, `op`, `pending`, `fact`. Namespace menentukan lifecycle & cleanup semantics |
-| State machine | `state.rs` | Program counter + seq CAS untuk transition atomik; menjamin tidak ada double-advance / lost transition |
-| Tools | `tool.rs` | `Tool` trait dengan `Risk` tier: `ReadOnly` / `Write` / `Destructive`; registry & dispatch |
-| Approval | `approval.rs` | `Approver` trait; impl `AllowlistApprover` (config-driven, ada di core) + `InteractiveApprover` (y/N prompt — di **host**, bukan core) |
-| Provider | `provider.rs` | `Provider` trait tipis (LLM call abstraction). Phase 1: hand-rolled impl. Phase 2: evaluasi `rig` (MIT) — jika diadopsi, di-wrap di satu module boundary ini saja |
-| Session/orchestrator | (session) | Turn loop single-threaded; mengkoordinasikan state machine, effect sandwich, tool dispatch |
+| Durable storage | (session db) | SQLite single file per session; rusqlite bundled; WAL mode; all writes inside `BEGIN IMMEDIATE`; migrate-on-open with `STORAGE_VERSION` const |
+| Conversation tree | `entry.rs` | Append-only, immutable entries (user/assistant/tool/final). Write-once; safe to replay |
+| Registers | `register.rs` | Namespaced mutable cells: `lane`, `op`, `pending`, `fact`. The namespace determines lifecycle & cleanup semantics |
+| State machine | `state.rs` | Program counter + seq CAS for atomic transitions; guarantees no double-advance / lost transitions |
+| Tools | `tool.rs` | `Tool` trait with `Risk` tiers: `ReadOnly` / `Write` / `Destructive`; registry & dispatch |
+| Approval | `approval.rs` | `Approver` trait; impls `AllowlistApprover` (config-driven, lives in core) + `InteractiveApprover` (y/N prompt — in the **host**, not core) |
+| Provider | `provider.rs` | Thin `Provider` trait (LLM call abstraction). Phase 1: hand-rolled impl. Phase 2: evaluate `rig` (MIT) — if adopted, wrapped inside this single module boundary only |
+| Session/orchestrator | (session) | Single-threaded turn loop; coordinates the state machine, effect sandwich, tool dispatch |
 
 ## 4. Data Model (SQLite Tables)
 
 Single file per session (`<session-id>.db`), WAL mode.
 
-| Table | Kolom (inti) | Sifat |
+| Table | Core columns | Nature |
 |---|---|---|
-| `meta` | `key`, `value` — termasuk `storage_version` (`STORAGE_VERSION` const) | migrate-on-open; schema versioning |
+| `meta` | `key`, `value` — includes `storage_version` (`STORAGE_VERSION` const) | migrate-on-open; schema versioning |
 | `entries` | `id` (monotonic), `parent_id`, `kind` (user/assistant/tool/final), `payload`, `created_at` | **Append-only, immutable.** Conversation tree via `parent_id` |
 | `registers` | `namespace` (`lane`/`op`/`pending`/`fact`), `name`, `value`, `updated_at` | Mutable, upsert per (namespace, name) |
-| `state` | `id` (singleton), `pc` (program counter), `seq`, `status` | Transition via CAS pada `seq` |
+| `state` | `id` (singleton), `pc` (program counter), `seq`, `status` | Transition via CAS on `seq` |
 
-Invariant:
-- Semua write lewat transaksi `BEGIN IMMEDIATE` (write lock eksplisit, hindari SQLITE_BUSY upgrade deadlock).
-- `entries` tidak pernah di-UPDATE/DELETE — koreksi/error = append entry baru.
-- `state.seq` monotonic; transition valid hanya jika `seq == expected`.
+Invariants:
+- All writes go through `BEGIN IMMEDIATE` transactions (explicit write lock, avoids SQLITE_BUSY upgrade deadlock).
+- `entries` are never UPDATEd/DELETEd — corrections/errors = append a new entry.
+- `state.seq` is monotonic; a transition is valid only if `seq == expected`.
 
 ## 5. State Machine
 
-Program counter (`pc`) menentukan langkah berikutnya. Transition dilindungi **seq CAS**: read `(pc, seq)` → hitung next → `UPDATE ... WHERE seq = :expected` → jika 0 row affected, retry/abort (race terdeteksi).
+The program counter (`pc`) determines the next step. Transitions are guarded by **seq CAS**: read `(pc, seq)` → compute next → `UPDATE ... WHERE seq = :expected` → if 0 rows affected, retry/abort (race detected).
 
 ```mermaid
 stateDiagram-v2
     [*] --> Idle
     Idle --> Planning: user input (pc advance via CAS)
-    Planning --> ToolCall: intent terdeteksi
-    Planning --> Final: jawaban final
-    ToolCall --> AwaitingApproval: Risk != ReadOnly & tidak di-allowlist
+    Planning --> ToolCall: intent detected
+    Planning --> Final: final answer
+    ToolCall --> AwaitingApproval: Risk != ReadOnly & not allowlisted
     ToolCall --> Executing: Risk == ReadOnly / approved
     AwaitingApproval --> Executing: approved (y)
     AwaitingApproval --> Planning: denied (N) → append entry, replan
-    Executing --> Settling: effect selesai
-    Executing --> Planning: effect gagal → append error entry
+    Executing --> Settling: effect finished
+    Executing --> Planning: effect failed → append error entry
     Settling --> Planning: settlement written, pc advance
     Final --> [*]
 ```
 
 ## 6. Effect Sandwich
 
-Setiap eksekusi tool mengikuti pola tiga lapis — crash di titik mana pun dapat direcover secara deterministik:
+Every tool execution follows a three-layer pattern — a crash at any point can be recovered deterministically:
 
-1. **Intent commit** — append entry `pending` (intent) + set register `pending` → SQLite. Tahan crash: saat resume, entry pending tanpa settlement → tool **replay-safe** atau dianggap gagal.
-2. **Effect execute** — jalankan tool di luar transaksi DB (side effect dunia nyata).
-3. **Settlement write** — append entry hasil (success/error) + clear register `pending` + advance `pc` via CAS.
+1. **Intent commit** — append `pending` entry (intent) + set `pending` register → SQLite. Crash-safe: on resume, a pending entry without settlement → tool is **replay-safe** or considered failed.
+2. **Effect execute** — run the tool outside the DB transaction (real-world side effect).
+3. **Settlement write** — append result entry (success/error) + clear `pending` register + advance `pc` via CAS.
 
-Per-tool **replay safety** wajib dideklarasikan di `Tool` trait (idempotent / non-idempotent-with-guard / never-replay).
+Per-tool **replay safety** must be declared on the `Tool` trait (idempotent / non-idempotent-with-guard / never-replay).
 
 ```mermaid
 sequenceDiagram
@@ -96,8 +96,8 @@ sequenceDiagram
     participant AP as Approver (approval.rs)
 
     SM->>DB: 1. Intent commit (BEGIN IMMEDIATE)<br/>append pending entry + register pending
-    SM->>AP: cek Risk tier (ReadOnly/Write/Destructive)
-    alt perlu approval
+    SM->>AP: check Risk tier (ReadOnly/Write/Destructive)
+    alt approval required
         AP-->>SM: y (approved) / N (denied)
     end
     SM->>T: 2. Effect execute
@@ -108,42 +108,42 @@ sequenceDiagram
 ## 7. Tool & Approval
 
 - `Tool` trait: `name()`, `spec()`, `risk() -> Risk`, `execute(input) -> Output`. `Risk`:
-  - `ReadOnly` — boleh jalan tanpa approval.
-  - `Write` — perlu approval kecuali match allowlist.
-  - `Destructive` — selalu perlu approval (allowlist bisa opt-in eksplisit).
-- `Approver` trait: `approve(request) -> Decision`. Impl:
-  - `AllowlistApprover` — dari config (berjalan di core, deterministik, testable).
-  - `InteractiveApprover` — y/N prompt. **Berada di host (CLI)**, bukan di core — core hanya menerima impl trait via injection.
+  - `ReadOnly` — may run without approval.
+  - `Write` — requires approval unless it matches the allowlist.
+  - `Destructive` — always requires approval (allowlist may explicitly opt in).
+- `Approver` trait: `approve(request) -> Decision`. Impls:
+  - `AllowlistApprover` — from config (runs in core, deterministic, testable).
+  - `InteractiveApprover` — y/N prompt. **Lives in the host (CLI)**, not in core — core only receives the trait impl via injection.
 
 ## 8. Provider
 
-- Phase 1: `Provider` trait tipis (send completion, streaming optional). Implementasi hand-rolled minimal.
-- Phase 2: evaluasi **rig** (MIT). Jika diadopsi, semua penggunaan rig di-wrap di satu module boundary (`provider.rs`) agar trait publik core tidak berubah dan swap tetap murah.
+- Phase 1: thin `Provider` trait (send completion, streaming optional). Minimal hand-rolled implementation.
+- Phase 2: evaluate **rig** (MIT). If adopted, all rig usage is wrapped inside a single module boundary (`provider.rs`) so the core's public traits remain unchanged and swapping stays cheap.
 
 ## 9. Concurrency Model
 
-- **Single-threaded turn loop.** Satu session = satu thread eksekusi; tidak ada parallel tool call di Phase 1.
-- SQLite sebagai serialization point: WAL memungkinkan reader (UI/host preview) concurrent tanpa memblokir writer.
-- CAS pada `state.seq` melindungi dari double-drive (mis. resume + host race) — hanya satu yang menang, yang lain retry/abort.
+- **Single-threaded turn loop.** One session = one execution thread; no parallel tool calls in Phase 1.
+- SQLite as the serialization point: WAL allows concurrent readers (UI/host preview) without blocking the writer.
+- CAS on `state.seq` protects against double-drive (e.g. resume + host race) — only one wins, the other retries/aborts.
 
 ## 10. Error Handling Strategy
 
-- Semua fallible operation mengembalikan `Result<T, CoreError>`; error enum terpusap per-module dengan `thiserror`-style (non-panic di core).
-- **Storage error** → abort turn, session tetap konsisten (transaksi atomik). Tidak ada partial write.
-- **Effect error** → append entry error (settlement), state machine kembali ke Planning; tidak pernah panic keluar turn loop.
-- **Approval denied** → bukan error; append entry + replan.
-- **Corrupt/mismatched `STORAGE_VERSION`** → refuse open dengan error jelas (tidak auto-downgrade); migrasi hanya forward, run saat open.
-- Host (CLI) bertanggung jawab menampilkan error & exit code; core tidak print.
+- All fallible operations return `Result<T, CoreError>`; error enums centralized per-module with `thiserror`-style (no panics in core).
+- **Storage error** → abort the turn, session stays consistent (atomic transactions). No partial writes.
+- **Effect error** → append an error entry (settlement), state machine returns to Planning; never panics out of the turn loop.
+- **Approval denied** → not an error; append entry + replan.
+- **Corrupt/mismatched `STORAGE_VERSION`** → refuse to open with a clear error (no auto-downgrade); migrations are forward-only, run at open.
+- The host (CLI) is responsible for displaying errors & exit codes; core never prints.
 
 ## 11. Testing Strategy
 
-| Tier | Scope | Contoh |
+| Tier | Scope | Examples |
 |---|---|---|
-| **A — Unit** | State machine & storage | CAS transition (race → 0 row affected), migrate-on-open, register upsert per namespace, entry append immutability, `BEGIN IMMEDIATE` write path |
-| **B — Integration** | Crash-resume | Kill di tiga titik effect sandwich (setelah intent / saat effect / sebelum settlement) → resume menghasilkan settlement tepat satu kali (per tool replay-safety contract) |
-| **C — Adversarial** | Input jahat & abuse | Tool output raksasa, malformed tool args, approval spam, double-drive turn loop, state.seq collision, storage version mismatch, allowlist bypass pattern |
+| **A — Unit** | State machine & storage | CAS transition (race → 0 rows affected), migrate-on-open, register upsert per namespace, entry append immutability, `BEGIN IMMEDIATE` write path |
+| **B — Integration** | Crash-resume | Kill at the three points of the effect sandwich (after intent / during effect / before settlement) → resume produces the settlement exactly once (per tool replay-safety contract) |
+| **C — Adversarial** | Malicious input & abuse | Giant tool output, malformed tool args, approval spam, double-drive turn loop, state.seq collision, storage version mismatch, allowlist bypass patterns |
 
 ## 12. Phase Rules
 
-- Phase 1–2: **no *nix-only deps** — semua crate harus build di target portabel (Windows/macOS/Linux). Cross-build CI defer Phase 3.
-- Future `cora-agent-ffi` hanya boleh bergantung pada core, tidak mengandung logika domain.
+- Phase 1–2: **no *nix-only deps** — all crates must build on portable targets (Windows/macOS/Linux). Cross-build CI deferred to Phase 3.
+- The future `cora-agent-ffi` may only depend on core, and must not contain domain logic.

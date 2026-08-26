@@ -2,103 +2,103 @@
 
 | | |
 |---|---|
-| **Produk** | cora-agent — durable Rust agent harness |
-| **Repo** | `codecoradev/cora-agent` (MIT, adaptasi pi harness spec) |
-| **Versi dokumen** | v1.0 (Phase 0) |
-| **Status** | Draft — disetujui sebelum Phase 1 coding |
+| **Product** | cora-agent — durable Rust agent harness |
+| **Repo** | `codecoradev/cora-agent` (MIT, adaptation of pi harness spec) |
+| **Document version** | v1.0 (Phase 0) |
+| **Status** | Draft — approved before Phase 1 coding |
 | **Owner** | Anaz (internal dev) |
 
 ---
 
 ## 1. Problem Statement
 
-Agent LLM saat ini (pi, Claude Code, dll.) bersifat **ephemeral**: state hidup di memori, crash = hilangnya konteks, dan tidak ada audit trail yang bisa di-replay. Untuk workflow internal CodeCora yang butuh **durability, safety, dan auditability** (fix GitHub issue, merespon temuan cora-review, tanya-jawab dokumentasi), harness yang ada tidak memenuhi:
+Current LLM agents (pi, Claude Code, etc.) are **ephemeral**: state lives in memory, a crash means loss of context, and there is no replayable audit trail. For internal CodeCora workflows that need **durability, safety, and auditability** (fixing GitHub issues, responding to cora-review findings, documentation Q&A), existing harnesses fall short:
 
-1. **Tidak durable** — crash di tengah turn mengulang kerja dari nol, tool calls mahal diulang.
-2. **Tidak ada approval gate** — tool eksekusi langsung; tidak ada tiering ReadOnly/Write/Destructive.
-3. **Tidak embeddable** — harness monolitik CLI; Corin (desktop) dan mobile (Flutter) tidak bisa memakai core yang sama.
-4. **Tidak terintegrasi ekosistem Cora** — cora search (code graph), uteke (memory), gh CLI tidak first-class.
+1. **Not durable** — a crash mid-turn repeats work from scratch; expensive tool calls are re-executed.
+2. **No approval gates** — tools execute directly; there is no ReadOnly/Write/Destructive tiering.
+3. **Not embeddable** — monolithic CLI harnesses; Corin (desktop) and mobile (Flutter) cannot reuse the same core.
+4. **Not integrated with the Cora ecosystem** — cora search (code graph), uteke (memory), and gh CLI are not first-class.
 
 ### Goals
 
-- Harness Rust dengan **write-once conversation tree** (append-only entries, tidak bisa dimutasi) di atas SQLite.
-- **Register state machine** — namespaced mutable cells (`lane/op/pending/fact`) sebagai program counter operasi.
+- Rust harness with a **write-once conversation tree** (append-only entries, immutable) on top of SQLite.
+- **Register state machine** — namespaced mutable cells (`lane/op/pending/fact`) as the operation program counter.
 - **Risk-tiered approval gates**: ReadOnly / Write / Destructive.
 - **Embeddable core**: platform-agnostic library (no stdin/stdout), host = CLI / Corin / flutter_rust_bridge FFI.
-- Integrasi Cora ecosystem: cora search tool, uteke memory, gh CLI.
+- Cora ecosystem integration: cora search tool, uteke memory, gh CLI.
 
-### ⛔ Gate: 3 Internal Workflows wajib didefinisikan SEBELUM Phase 1 coding
+### ⛔ Gate: 3 Internal Workflows must be defined BEFORE Phase 1 coding
 
-| # | Workflow (placeholder) | Deskripsi | Status |
+| # | Workflow (placeholder) | Description | Status |
 |---|---|---|---|
-| W1 | `fix-gh-issue` | Agent baca GitHub issue via gh CLI → cora search untuk lokasi kode → patch → buat PR. | **[DEFINISIKAN SEBELUM PHASE 1]** |
-| W2 | `cora-review-responder` | Agent terima findings dari cora review diff → triage severity → draft reply PR comment. | **[DEFINISIKAN SEBELUM PHASE 1]** |
-| W3 | `docs-qnA` | QnA dokumentasi internal via uteke recall + cora brain search → jawaban dengan sitasi. | **[DEFINISIKAN SEBELUM PHASE 1]** |
+| W1 | `fix-gh-issue` | Agent reads a GitHub issue via gh CLI → cora search to locate code → patch → create PR. | **[DEFINE BEFORE PHASE 1]** |
+| W2 | `cora-review-responder` | Agent receives findings from cora review diff → triage severity → draft PR comment reply. | **[DEFINE BEFORE PHASE 1]** |
+| W3 | `docs-qnA` | Internal documentation QnA via uteke recall + cora brain search → answer with citations. | **[DEFINE BEFORE PHASE 1]** |
 
-> Setiap workflow harus punya: trigger, langkah tool calls, risk tier maksimal, dan expected outcome tertulis. Tanpa ini, Phase 1 tidak boleh mulai.
+> Every workflow must have: a written trigger, tool call steps, maximum risk tier, and expected outcome. Without these, Phase 1 must not start.
 
 ---
 
 ## 2. Non-Goals (v0)
 
-| Non-goal | Alasan / kapan dievaluasi |
+| Non-goal | Reason / when to re-evaluate |
 |---|---|
-| Multi-lane (parallel lanes) | v0 = **single lane**; lane register disiapkan tapi hanya 1 aktif. Multi-lane pasca-MVP. |
-| TUI / interactive UI | Host menyediakan UI; core tidak punya UI assumption. |
-| Parallel tool execution | Tool calls sekuensial per turn; simplifikasi state machine. |
-| Deferred redemption | Approval harus resolve sinkron di gate; tidak ada antrian redemption. |
-| Cross-build CI (macOS/Windows) | Linux-only sampai **Phase 3**; CI lint+test Linux dulu. |
+| Multi-lane (parallel lanes) | v0 = **single lane**; lane register is prepared but only 1 active. Multi-lane post-MVP. |
+| TUI / interactive UI | Host provides the UI; the core makes no UI assumptions. |
+| Parallel tool execution | Tool calls are sequential per turn; simplifies the state machine. |
+| Deferred redemption | Approvals must resolve synchronously at the gate; no redemption queue. |
+| Cross-build CI (macOS/Windows) | Linux-only until **Phase 3**; Linux lint+test CI first. |
 
 ---
 
 ## 3. User Personas
 
-| Persona | Kebutuhan |
+| Persona | Needs |
 |---|---|
-| **Internal dev (Anaz)** | Menjalankan workflow otomatis via CLI; crash-safe resume; audit log; approval gate untuk operasi berisik. |
-| **Embed host: Corin (desktop, Tauri)** | Embed core crate sebagai library; Approver interaktif via UI Corin. |
-| **Embed host: Flutter mobile** | FFI via flutter_rust_bridge; API surface minimal & serializable. |
+| **Internal dev (Anaz)** | Run automated workflows via CLI; crash-safe resume; audit log; approval gates for risky operations. |
+| **Embed host: Corin (desktop, Tauri)** | Embed the core crate as a library; interactive Approver via Corin UI. |
+| **Embed host: Flutter mobile** | FFI via flutter_rust_bridge; minimal & serializable API surface. |
 
 ---
 
 ## 4. Functional Requirements (per Module)
 
-| Module | ID | Requirement | Prioritas |
+| Module | ID | Requirement | Priority |
 |---|---|---|---|
-| **entry** | FR-E1 | Entry = node write-once pada conversation tree; sekali ditulis tidak bisa diubah/dihapus (immutable, append-only). | P0 |
-| **entry** | FR-E2 | Entry menyimpan role, payload (message/tool-call/tool-result), parent link, UUIDv7. | P0 |
-| **register** | FR-R1 | Namespaced mutable cells: `lane`, `op`, `pending`, `fact`; write melalui transaksi SQLite. | P0 |
-| **register** | FR-R2 | Register adalah satu-satunya state mutable; berfungsi sebagai program counter operasi. | P0 |
-| **state** | FR-S1 | Operation state machine dengan transisi eksplisit (mis. idle → running → awaiting-approval → running → done/failed); transisi invalid ditolak. | P0 |
-| **state** | FR-S2 | Setelah crash, state machine + register dipulihkan dari SQLite dan operasi resume dari checkpoint. | P0 |
+| **entry** | FR-E1 | Entry = write-once node on the conversation tree; once written it cannot be changed/deleted (immutable, append-only). | P0 |
+| **entry** | FR-E2 | Entry stores role, payload (message/tool-call/tool-result), parent link, UUIDv7. | P0 |
+| **register** | FR-R1 | Namespaced mutable cells: `lane`, `op`, `pending`, `fact`; written via SQLite transactions. | P0 |
+| **register** | FR-R2 | The register is the only mutable state; acts as the operation program counter. | P0 |
+| **state** | FR-S1 | Operation state machine with explicit transitions (e.g. idle → running → awaiting-approval → running → done/failed); invalid transitions are rejected. | P0 |
+| **state** | FR-S2 | After a crash, the state machine + register are restored from SQLite and the operation resumes from the checkpoint. | P0 |
 | **storage** | FR-D1 | SQLite backend, **one file per session**; WAL mode. | P0 |
-| **storage** | FR-D2 | Schema versioned (`STORAGE_VERSION`), **migrate-on-open**; versi lebih baru dari binary → error jelas. | P0 |
-| **tool** | FR-T1 | `Tool` trait dengan risk tier: `ReadOnly` / `Write` / `Destructive`; metadata (nama, deskripsi, schema argumen) diekspos ke provider. | P0 |
-| **tool** | FR-T2 | Tool execution sekuensial; hasil (termasuk error) dicatat sebagai entry tool-result. | P0 |
-| **approval** | FR-A1 | `Approver` trait: core menyediakan policy engine; impl `Allowlist` / `Interactive` hidup di host. | P0 |
-| **approval** | FR-A2 | Tool call dengan tier ≥ configured threshold wajib lewat approver sebelum eksekusi; keputusan dicatat di tree. | P0 |
-| **provider** | FR-P1 | `Provider` trait abstraksi LLM (stream/chat completion); implementasi concrete di host atau crate terpisah. | P0 |
-| **provider** | FR-P2 | Provider menerima snapshot tree (atau window) + tool metadata; tidak pernah menulis register langsung. | P0 |
+| **storage** | FR-D2 | Versioned schema (`STORAGE_VERSION`), **migrate-on-open**; version newer than the binary → clear error. | P0 |
+| **tool** | FR-T1 | `Tool` trait with risk tiers: `ReadOnly` / `Write` / `Destructive`; metadata (name, description, argument schema) exposed to the provider. | P0 |
+| **tool** | FR-T2 | Tool execution is sequential; results (including errors) are recorded as tool-result entries. | P0 |
+| **approval** | FR-A1 | `Approver` trait: the core provides the policy engine; `Allowlist` / `Interactive` impls live in the host. | P0 |
+| **approval** | FR-A2 | Tool calls with tier ≥ configured threshold must pass the approver before execution; decisions are recorded in the tree. | P0 |
+| **provider** | FR-P1 | `Provider` trait abstracting the LLM (stream/chat completion); concrete implementations in the host or a separate crate. | P0 |
+| **provider** | FR-P2 | Provider receives a tree snapshot (or window) + tool metadata; never writes the register directly. | P0 |
 
-> Catatan: `provider` saat ini belum punya file stub di core (lib.rs mendokumentasikannya) — buat `provider.rs` di Phase 1a.
+> Note: `provider` currently has no stub file in core (lib.rs documents it) — create `provider.rs` in Phase 1a.
 
 ---
 
 ## 5. Risk Tiers & Approval Matrix
 
-| Tier | Definisi | Contoh tool | Approval default |
+| Tier | Definition | Example tools | Default approval |
 |---|---|---|---|
-| **ReadOnly** | Tidak mengubah state dunia | cora search, uteke recall, gh view | Auto-allow (allowlist) |
-| **Write** | Mengubah state, reversible | patch file, gh pr create, uteke remember | Approver wajib (auto-allow untuk allowlist internal) |
-| **Destructive** | Tidak reversible / berdampak luas | force push, drop database, delete branch, `rm -rf` | Approver wajib, **selalu interactive** untuk internal dev; tidak bisa di-allowlist |
+| **ReadOnly** | Does not change world state | cora search, uteke recall, gh view | Auto-allow (allowlist) |
+| **Write** | Changes state, reversible | patch file, gh pr create, uteke remember | Approver required (auto-allow for internal allowlist) |
+| **Destructive** | Not reversible / broad impact | force push, drop database, delete branch, `rm -rf` | Approver required, **always interactive** for internal dev; cannot be allowlisted |
 
-Matriks keputusan:
+Decision matrix:
 
 | Tool tier \ Approver | Auto-allow | Interactive |
 |---|---|---|
-| ReadOnly | ✅ eksekusi | ✅ (bisa prompt) |
-| Write | ✅ jika ada di allowlist | ✅ prompt |
-| Destructive | ❌ ditolak | ✅ prompt + konfirmasi eksplisit |
+| ReadOnly | ✅ execute | ✅ (may prompt) |
+| Write | ✅ if in allowlist | ✅ prompt |
+| Destructive | ❌ rejected | ✅ prompt + explicit confirmation |
 
 ---
 
@@ -106,11 +106,11 @@ Matriks keputusan:
 
 | Phase | Scope | DoD (verifiable) |
 |---|---|---|
-| **0 — Stubs & spec** (selesai) | Crate layout, stubs, spec.md | ✅ 7 file stub + lib.rs; workspace build hijau |
-| **1a — Store + State machine + Mock provider** | entry, register, state, storage (SQLite), tool trait, approval trait, mock provider | Unit test lulus: (1) entry append-only enforced, (2) crash di tengah op → restart → resume dari checkpoint (test kill/reopen DB), (3) transisi state invalid ditolak, (4) migrate-on-open berfungsi. Demo CLI: mini-loop dengan mock provider + 1 tool ReadOnly. |
-| **1b — cora search tool + real LLM** | cora search tool (ReadOnly), provider real (LLM via API), W1 `fix-gh-issue` workflow | E2E: W1 berjalan penuh di CLI dengan LLM real; tool call cora search tercatat di tree; approval gate Write terpicu saat patch. |
-| **2 — Workflow 2 & 3** | W2 cora-review-responder, W3 docs-QnA (uteke), gh CLI tools, allowlist policy | E2E: W2 & W3 selesai penuh; audit replay (baca tree → timeline) tersedia. |
-| **3 — Hardening & embed prep** | Cross-build CI (macOS/Windows), FFI surface, dokumentasi public API, publikasi crate | CI matrix hijau; contoh embed minimal (Corin spike atau FFI test) compile; docs API lengkap. |
+| **0 — Stubs & spec** (done) | Crate layout, stubs, spec.md | ✅ 7 stub files + lib.rs; green workspace build |
+| **1a — Store + State machine + Mock provider** | entry, register, state, storage (SQLite), tool trait, approval trait, mock provider | Unit tests pass: (1) entry append-only enforced, (2) crash mid-op → restart → resume from checkpoint (kill/reopen DB test), (3) invalid state transitions rejected, (4) migrate-on-open works. Demo CLI: mini-loop with mock provider + 1 ReadOnly tool. |
+| **1b — cora search tool + real LLM** | cora search tool (ReadOnly), real provider (LLM via API), W1 `fix-gh-issue` workflow | E2E: W1 runs fully in CLI with real LLM; cora search tool call recorded in tree; Write approval gate triggered on patch. |
+| **2 — Workflows 2 & 3** | W2 cora-review-responder, W3 docs-QnA (uteke), gh CLI tools, allowlist policy | E2E: W2 & W3 fully complete; audit replay (read tree → timeline) available. |
+| **3 — Hardening & embed prep** | Cross-build CI (macOS/Windows), FFI surface, public API docs, crate publication | Green CI matrix; minimal embed example (Corin spike or FFI test) compiles; complete API docs. |
 
 ### Roadmap positioning (strategic)
 
@@ -118,37 +118,37 @@ Matriks keputusan:
 Internal tool (Phase 0-2) → OSS core release post-MVP (Phase 3) → Corin embed (CMO) → Flutter mobile
 ```
 
-Core selalu library-first; CLI hanyalah host pertama. Public API dibekukan/dikunci semantik saat rilis OSS.
+The core is always library-first; the CLI is merely the first host. The public API is frozen/semantically locked at OSS release.
 
 ---
 
-## 7. Kill Criteria (dari CFO)
+## 7. Kill Criteria (from CFO)
 
-Proyek dihentikan/di-frozen jika terpenuhi ≥2:
+The project is stopped/frozen if ≥2 are met:
 
-1. **Crash-resume tidak bisa dibuktikan bekerja** setelah Phase 1a + 1 iterasi perbaikan.
-2. **3 internal workflows tidak terpakai** — tidak ada usage nyata >1 bulan setelah Phase 2.
-3. **Maintenance >20% waktu hemat** yang seharusnya dihasilkan (negative ROI berkelanjutan).
-4. **Alternatif eksternal memenuhi kebutuhan** (harness OSS existing cukup durable + embeddable + integrasi Cora bisa dibuat sebagai plugin).
-5. **Biaya LLM per workflow tidak masuk akal** dibanding manual (tidak ada jalur optimasi).
-6. **Blocker teknis struktural** — SQLite state machine terbukti tidak cukup untuk complexity workflow nyata (bukan sekadar bug).
+1. **Crash-resume cannot be proven to work** after Phase 1a + 1 fix iteration.
+2. **3 internal workflows unused** — no real usage >1 month after Phase 2.
+3. **Maintenance >20% of saved time** the project should have produced (sustained negative ROI).
+4. **External alternatives meet the needs** (an existing OSS harness is durable + embeddable enough and Cora integration can be built as a plugin).
+5. **LLM cost per workflow unreasonable** compared to manual (no optimization path).
+6. **Structural technical blocker** — the SQLite state machine is proven insufficient for real-world workflow complexity (not just a bug).
 
 ---
 
 ## 8. Success Metrics
 
-| Metric | Target | Cara ukur |
+| Metric | Target | How to measure |
 |---|---|---|
-| Crash-resume | Test deterministik kill/restart lulus; ≥1 insiden nyata resume sukses | Test suite + log session |
-| Internal workflows E2E | **>2 workflow** (dari W1–W3) selesai end-to-end tanpa intervensi manusia di luar approval | Audit tree per session |
-| Maintenance overhead | **<20%** dari waktu yang dihemat oleh agent | Time-tracking kasar per bulan |
-| Approval compliance | 0 eksekusi Destructive tanpa approval tercatat | Audit tree scan |
-| Embeddability | Core crate compile tanpa feature CLI/UI; API serializable | CI check Phase 3 |
+| Crash-resume | Deterministic kill/restart test passes; ≥1 real incident of successful resume | Test suite + session logs |
+| Internal workflows E2E | **>2 workflows** (of W1–W3) complete end-to-end without human intervention beyond approvals | Tree audit per session |
+| Maintenance overhead | **<20%** of the time saved by the agent | Rough monthly time-tracking |
+| Approval compliance | 0 Destructive executions without a recorded approval | Tree audit scan |
+| Embeddability | Core crate compiles without CLI/UI feature; serializable API | Phase 3 CI check |
 
 ---
 
-## 9. Referensi
+## 9. References
 
-- `spec.md` (pi harness spec, MIT) — dasar desain entry/register/state.
-- `crates/cora-agent-core/src/lib.rs` — layout modul & terminologi resmi.
+- `spec.md` (pi harness spec, MIT) — basis for the entry/register/state design.
+- `crates/cora-agent-core/src/lib.rs` — module layout & official terminology.
 - Cora ecosystem: `cora` (code graph & review), `uteke` (semantic memory), `gh` CLI.
