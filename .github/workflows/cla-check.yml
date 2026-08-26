@@ -56,7 +56,7 @@ jobs:
         env:
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
         if: steps.check.outputs.signed != 'true'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const author = process.env.PR_AUTHOR;
@@ -105,7 +105,7 @@ jobs:
             }
 
       - name: Set commit status
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const signed = '${{ steps.check.outputs.signed }}' === 'true';
