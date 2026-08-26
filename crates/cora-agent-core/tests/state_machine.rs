@@ -369,3 +369,67 @@ fn begin_from_idle_is_illegal() {
     let err = begin(&mut s, "t", json!({}), ReplaySafety::Idempotent, None).unwrap_err();
     assert!(matches!(err, StorageError::IllegalTransition { .. }));
 }
+
+// ---------------------------------------------------------------------------
+// Sandwich invariants (cora review round 2)
+// ---------------------------------------------------------------------------
+
+/// begin() must refuse when a previous intent is still pending — the cell
+/// is the crash sentinel and must never be silently overwritten.
+#[test]
+fn begin_refuses_while_pending_cell_set() {
+    let dir = tmpdir("double-begin");
+    let mut s = JsonlStorage::create(&dir, "db", None).unwrap();
+    s.commit(Commit::new().transition(StateTransition::from(s.state().seq, Pc::Planning)))
+        .unwrap();
+    s.commit(Commit::new().transition(StateTransition::from(s.state().seq, Pc::ToolCall)))
+        .unwrap();
+    let h1 = begin(&mut s, "t", json!({"n":1}), ReplaySafety::Idempotent, None).unwrap();
+    let err = begin(&mut s, "t", json!({"n":2}), ReplaySafety::Idempotent, None).unwrap_err();
+    assert!(matches!(err, StorageError::Effect(_)));
+    // The original intent is untouched.
+    let pending_id = s
+        .get_register("pending", PENDING_KEY)
+        .and_then(|v| v.get("intentId"))
+        .cloned();
+    assert_eq!(pending_id, Some(json!(h1.intent_id)));
+}
+
+/// settle with a handle that does not match the pending cell is refused.
+#[test]
+fn settle_with_wrong_handle_is_refused() {
+    let dir = tmpdir("wrong-handle");
+    let mut s = JsonlStorage::create(&dir, "wh", None).unwrap();
+    s.commit(Commit::new().transition(StateTransition::from(s.state().seq, Pc::Planning)))
+        .unwrap();
+    s.commit(Commit::new().transition(StateTransition::from(s.state().seq, Pc::ToolCall)))
+        .unwrap();
+    let h1 = begin(&mut s, "t", json!({"n":1}), ReplaySafety::Idempotent, None).unwrap();
+    let forged = EffectHandle {
+        intent_id: "intent_9999".into(),
+    };
+    let err = cora_agent_core::machine::settle_ok(&mut s, &forged, json!({})).unwrap_err();
+    assert!(matches!(err, StorageError::Effect(_)));
+    let err = cora_agent_core::machine::settle_err(&mut s, &forged, "x").unwrap_err();
+    assert!(matches!(err, StorageError::Effect(_)));
+    // h1 is still the pending intent and can still settle normally.
+    cora_agent_core::machine::settle_ok(&mut s, &h1, json!({"ok":true})).unwrap();
+    finish(&mut s).unwrap();
+    assert_eq!(s.state().pc, Pc::Planning);
+}
+
+/// Double-settle (settle twice with the same handle) is refused: the cell
+/// was cleared by the first settlement.
+#[test]
+fn double_settle_is_refused() {
+    let dir = tmpdir("double-settle");
+    let mut s = JsonlStorage::create(&dir, "ds", None).unwrap();
+    s.commit(Commit::new().transition(StateTransition::from(s.state().seq, Pc::Planning)))
+        .unwrap();
+    s.commit(Commit::new().transition(StateTransition::from(s.state().seq, Pc::ToolCall)))
+        .unwrap();
+    let h = begin(&mut s, "t", json!({}), ReplaySafety::Idempotent, None).unwrap();
+    cora_agent_core::machine::settle_ok(&mut s, &h, json!({})).unwrap();
+    let err = cora_agent_core::machine::settle_ok(&mut s, &h, json!({})).unwrap_err();
+    assert!(matches!(err, StorageError::Effect(_)));
+}

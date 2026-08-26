@@ -34,6 +34,25 @@ use serde_json::{json, Value};
 /// loop is single-threaded by design).
 pub const PENDING_KEY: &str = "op";
 
+/// Guards a settlement against the durable pending cell: the handle must
+/// reference exactly the intent that is still in flight.
+fn verify_pending(s: &dyn Storage, handle: &EffectHandle) -> Result<(), StorageError> {
+    let cell = s.get_register("pending", PENDING_KEY).ok_or_else(|| {
+        StorageError::Effect(format!(
+            "settlement of {} refused: no pending cell (already settled or never begun)",
+            handle.intent_id
+        ))
+    })?;
+    let current = cell["intentId"].as_str().unwrap_or_default();
+    if current != handle.intent_id {
+        return Err(StorageError::Effect(format!(
+            "settlement of {} refused: pending cell holds different intent {current}",
+            handle.intent_id
+        )));
+    }
+    Ok(())
+}
+
 /// Per-tool replay contract, persisted inside the intent entry payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplaySafety {
@@ -87,8 +106,15 @@ pub fn begin(
     parent: Option<&str>,
 ) -> Result<EffectHandle, StorageError> {
     let seq = s.state().seq;
-    // Explicit intent id: deterministic, visible to the pending cell in the
-    // same atomic commit, and unique (seq strictly advances every commit).
+    // One sandwich at a time: a set pending cell means a previous effect
+    // never settled (crash or host bug) — refuse rather than overwrite.
+    if s.get_register("pending", PENDING_KEY).is_some() {
+        return Err(StorageError::Effect(
+            "begin() refused: pending cell already set (previous intent unsettled); resolve it via resume()/settle first".into(),
+        ));
+    }
+    // Explicit intent id: deterministic, visible to the pending cell in
+    // the same atomic commit, and unique (seq strictly advances every commit).
     let intent_id = format!("intent_{seq}");
     let commit = Commit::new()
         .entry(NewEntry {
@@ -125,6 +151,7 @@ pub fn settle_ok(
     handle: &EffectHandle,
     output: Value,
 ) -> Result<String, StorageError> {
+    verify_pending(s, handle)?;
     let seq = s.state().seq;
     let commit = Commit::new()
         .entry(NewEntry::with_parent(
@@ -146,6 +173,7 @@ pub fn settle_err(
     handle: &EffectHandle,
     message: &str,
 ) -> Result<String, StorageError> {
+    verify_pending(s, handle)?;
     let seq = s.state().seq;
     let commit = Commit::new()
         .entry(NewEntry::with_parent(

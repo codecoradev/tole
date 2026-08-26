@@ -66,6 +66,9 @@ pub enum StorageError {
     /// Caller error: bad namespace, unknown parent entry, duplicate id, etc.
     #[error("invalid commit: {0}")]
     Invalid(String),
+    /// An effect-sandwich invariant was violated (machine.rs guards).
+    #[error("effect sandwich violation: {0}")]
+    Effect(String),
     /// Underlying I/O failure.
     #[error(transparent)]
     Io(#[from] std::io::Error),
