@@ -12,12 +12,12 @@
 //! - `approval` — Approver trait (Allowlist / Interactive impls live in hosts)
 //! - `provider` — LLM provider abstraction
 
+pub mod approval;
 pub mod entry;
 pub mod register;
 pub mod state;
 pub mod storage;
 pub mod tool;
-pub mod approval;
 
 /// Semantic version of the durable schema (migrate-on-open, see spec.md Part 7).
 pub const STORAGE_VERSION: u32 = 1;
