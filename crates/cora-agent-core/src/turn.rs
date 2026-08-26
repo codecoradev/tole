@@ -11,7 +11,9 @@ use crate::approval::Verdict;
 use crate::entry::{EntryType, NewEntry};
 use serde_json::json;
 
-use crate::machine::{begin, finish, settle_err, settle_ok, ReplaySafety};
+use crate::machine::{
+    begin, finish, resume, settle_err, settle_ok, EffectHandle, ReplaySafety, Resume,
+};
 use crate::provider::{Provider, ProviderError, ProviderOutput};
 use crate::state::{Pc, StateTransition};
 use crate::storage::{Commit, Storage, StorageError};
@@ -40,8 +42,8 @@ pub enum TurnOutcome {
 
 /// Drive one full user turn to completion (single-threaded).
 ///
-/// `pc` must be `Idle` (fresh turn) — resume paths call the machine
-/// helpers directly.
+/// `pc` must be `Idle` (fresh turn) — resume paths call
+/// [`resume_turn`] instead.
 pub fn run_turn(
     s: &mut dyn Storage,
     p: &mut dyn Provider,
@@ -67,7 +69,118 @@ pub fn run_turn(
             ))
             .transition(StateTransition::from(seq, Pc::Planning)),
     )?;
+    drive(s, p, registry)
+}
 
+/// Resume a turn interrupted by a crash (or process exit) mid-flight and
+/// drive it to completion (E5).
+///
+/// The recovery protocol, fully driven by durable state — never guesses:
+///
+/// 1. A set `pending` cell means the crash landed inside an effect
+///    sandwich (intent committed, settlement not). The intent's recorded
+///    [`ReplaySafety`] contract decides: re-execute (`Idempotent`/
+///    `Guarded`) or settle as failed (`Never`).
+/// 2. No pending + pc `Settling` means the crash landed between settlement
+///    and `finish`; close the sandwich and replan.
+/// 3. No pending + pc `Planning` means the crash landed between provider
+///    steps; simply continue the loop.
+///
+/// The re-executed effect settles under the *same* intent id, so the
+/// recovered log is structurally identical to an uninterrupted run —
+/// the property the E5 golden-file test proves.
+pub fn resume_turn(
+    s: &mut dyn Storage,
+    p: &mut dyn Provider,
+    registry: &ToolRegistry,
+) -> Result<TurnOutcome, StorageError> {
+    match resume(s)? {
+        Resume::Clean => {
+            let pc_now = s.state().pc;
+            match pc_now {
+                Pc::Settling => finish(s)?,
+                Pc::Planning => {}
+                Pc::ToolCall => {
+                    // Crash between `Planning → ToolCall` and `begin()`: the
+                    // decision was never made durable, so the only honest
+                    // exit is to replan (legal per the §5 table).
+                    let seq = s.state().seq;
+                    s.commit(Commit::new().transition(StateTransition::from(seq, Pc::Planning)))?;
+                }
+                Pc::Final => {
+                    return Err(StorageError::Invalid(
+                        "resume_turn on a finished session: nothing to resume".into(),
+                    ))
+                }
+                other => {
+                    return Err(StorageError::Invalid(format!(
+                        "resume_turn: pc {other:?} with no pending intent is not resumable \
+                         (drive it with the machine helpers first)"
+                    )))
+                }
+            }
+        }
+        Resume::ReExecute {
+            intent_id,
+            tool,
+            input,
+            safety,
+        } => {
+            // The intent's recorded replay contract decides the guard:
+            // `Guarded` effects require a fresh approval before replay —
+            // may have landed before the effect ever ran, so replaying
+            // blind could double-fire a Write/Destructive tool.
+            if safety == ReplaySafety::Guarded {
+                let Some(t) = registry.get(&tool) else {
+                    append_turn_error(
+                        s,
+                        "unknown tool",
+                        &format!("guarded intent {intent_id} references unregistered tool {tool}"),
+                    )?;
+                    return Ok(TurnOutcome::UnknownTool { name: tool });
+                };
+                if t.risk() != Risk::ReadOnly {
+                    append_turn_error(
+                        s,
+                        "approval required",
+                        &format!("guarded intent {intent_id} needs a fresh approval to replay"),
+                    )?;
+                    return Ok(TurnOutcome::ApprovalRequired { name: tool });
+                }
+            }
+            let handle = EffectHandle { intent_id };
+            let out = match registry.get(&tool) {
+                Some(t) => t.execute(input),
+                // The tool vanished between runs (host wiring changed).
+                // The intent is durable — settle it as failed rather than
+                // aborting: the loop replans on the tool_result error.
+                None => Err(format!("unknown tool on resume: {tool}")),
+            };
+            match out {
+                Ok(o) => {
+                    settle_ok(s, &handle, o)?;
+                    finish(s)?;
+                }
+                Err(e) => {
+                    settle_err(s, &handle, &e)?;
+                }
+            }
+        }
+        Resume::Fail { intent_id, reason } => {
+            let handle = EffectHandle { intent_id };
+            settle_err(s, &handle, &reason)?;
+        }
+    }
+    drive(s, p, registry)
+}
+
+/// The planning loop shared by [`run_turn`] and [`resume_turn`]:
+/// provider step → (tool sandwich)* → Final, under the step budget.
+fn drive(
+    s: &mut dyn Storage,
+    p: &mut dyn Provider,
+    registry: &ToolRegistry,
+) -> Result<TurnOutcome, StorageError> {
     for _ in 0..MAX_STEPS {
         let transcript = s.entries().to_vec();
         let next = match p.complete(&transcript) {

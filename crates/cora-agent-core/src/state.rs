@@ -79,8 +79,12 @@ pub fn can_transition(from: Pc, to: Pc) -> bool {
             | (Planning, ToolCall)
             | (Planning, Final)
             | (ToolCall, AwaitingApproval)
-            | (ToolCall, Executing)
-            | (AwaitingApproval, Executing)
+     | (ToolCall, Executing)
+     // Decision made but no durable intent yet (crash window in the
+     // turn loop between `Planning → ToolCall` and `begin()`):
+     // nothing was persisted, so replanning is the only honest exit.
+     | (ToolCall, Planning)
+     | (AwaitingApproval, Executing)
             | (AwaitingApproval, Planning)
             | (Executing, Settling)
             | (Executing, Planning)
