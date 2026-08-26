@@ -103,14 +103,27 @@ impl OpenAiProvider {
 
     /// Build the request body. Separated so tests can inspect exactly what
     /// would go over the wire (and prove the key never appears in it).
+    ///
+    /// Phase 1 flattening: only chat messages (`kind == "message"` with a
+    /// recognized role) are sent. Tool calls, errors, and state records
+    /// stay in the durable log but are not part of the wire transcript.
     fn request_body(&self, transcript: &[Entry]) -> Value {
-        let _ = transcript;
+        let messages: Vec<Value> = transcript
+            .iter()
+            .filter(|e| e.kind.as_str() == "message")
+            .filter_map(|e| {
+                let role = e.payload.get("role")?.as_str()?;
+                // Only roles the chat-completions API accepts.
+                if !matches!(role, "user" | "assistant" | "system") {
+                    return None;
+                }
+                let text = e.payload.get("text").and_then(|t| t.as_str())?;
+                Some(json!({ "role": role, "content": text }))
+            })
+            .collect();
         json!({
             "model": self.cfg.model,
-            "messages": [
-                {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": "..."}
-            ]
+            "messages": messages,
         })
     }
 }
@@ -195,5 +208,56 @@ mod tests {
             "sk-secret-abc",
         );
         assert_eq!(out, "request to https://x failed with <redacted>");
+    }
+}
+
+#[cfg(test)]
+mod transcript_tests {
+    use super::*;
+    use crate::entry::{Entry, EntryType};
+    use serde_json::json;
+
+    fn msg(id: &str, role: &str, text: &str) -> Entry {
+        Entry {
+            id: id.into(),
+            parent_id: None,
+            seq: 0,
+            kind: EntryType::new(EntryType::MESSAGE),
+            payload: json!({ "role": role, "text": text }),
+            timestamp: 0,
+        }
+    }
+
+    #[test]
+    fn request_body_flattens_message_entries_in_order() {
+        let cfg = OpenAiConfig::new("https://x.example/v1", "m", "k");
+        let p = OpenAiProvider::new(cfg);
+        let transcript = vec![
+            msg("e1", "user", "hello"),
+            msg("e2", "assistant", "hi there"),
+            msg("e3", "user", "do a thing"),
+        ];
+        let body = p.request_body(&transcript);
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0]["role"], json!("user"));
+        assert_eq!(msgs[0]["content"], json!("hello"));
+        assert_eq!(msgs[2]["content"], json!("do a thing"));
+        assert_eq!(body["model"], json!("m"));
+    }
+
+    #[test]
+    fn request_body_skips_non_message_and_unknown_roles() {
+        let cfg = OpenAiConfig::new("https://x.example/v1", "m", "k");
+        let p = OpenAiProvider::new(cfg);
+        let mut odd = msg("e9", "tool", "ignored");
+        odd.kind = EntryType::new("error");
+        let transcript = vec![odd, msg("e10", "wizard", "unknown role")];
+        let body = p.request_body(&transcript);
+        assert_eq!(
+            body["messages"].as_array().map(|a| a.len()),
+            Some(0),
+            "non-message kinds and unknown roles must be filtered out"
+        );
     }
 }

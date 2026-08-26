@@ -10,7 +10,44 @@ use crate::tool::{Risk, Tool};
 #[cfg(test)]
 use serde_json::json;
 use serde_json::Value;
-use std::process::Command;
+use std::process::{Command, Output};
+use std::time::{Duration, Instant};
+
+/// Hard ceiling on any subprocess this tool spawns. The turn loop is
+/// synchronous — a hung `cora brain` would freeze the whole agent.
+pub const SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Runs `cmd`, killing it after `timeout`. Stdout/stderr are captured by
+/// the child itself (pipet) so a hung child can't wedge the read either.
+fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> Result<Output, String> {
+    use std::process::Stdio;
+    cmd.stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null());
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to spawn `cora` (is it on PATH?): {e}"))?;
+    let start = Instant::now();
+    // Poll until exit or deadline; the pipes are drained afterwards by
+    // wait_with_output (child already exited → cannot block).
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if start.elapsed() > timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!("cora brain timed out after {}s", timeout.as_secs()));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => return Err(format!("wait failed: {e}")),
+        }
+    }
+    child
+        .wait_with_output()
+        .map_err(|e| format!("failed to collect output: {e}"))
+}
 
 /// ReadOnly search over the current project's symbol index.
 #[derive(Debug, Clone)]
@@ -77,9 +114,7 @@ impl Tool for CoraSearchTool {
         if let Some(dir) = &self.workdir {
             cmd.current_dir(dir);
         }
-        let out = cmd
-            .output()
-            .map_err(|e| format!("failed to spawn `cora` (is it on PATH?): {e}"))?;
+        let out = run_with_timeout(&mut cmd, SUBPROCESS_TIMEOUT)?;
         if !out.status.success() {
             // stderr can be long; cap it so a runaway error doesn't blow
             // up the durable log record.
@@ -124,5 +159,34 @@ mod tests {
     fn rejects_missing_query_field() {
         let t = CoraSearchTool::new();
         assert!(t.execute(json!({"q": "x"})).is_err());
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+
+    #[test]
+    fn subprocess_is_killed_on_timeout() {
+        // `sleep 30` would outlive the 150ms budget; the wrapper must kill
+        // it and return an error instead of hanging the turn loop.
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        let start = std::time::Instant::now();
+        let res = run_with_timeout(&mut cmd, Duration::from_millis(150));
+        assert!(res.is_err(), "expected timeout error");
+        assert!(res.unwrap_err().contains("timed out"));
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "kill took too long"
+        );
+    }
+
+    #[test]
+    fn fast_subcommand_completes_normally() {
+        let mut cmd = Command::new("true");
+        let res = run_with_timeout(&mut cmd, Duration::from_secs(5));
+        assert!(res.is_ok());
+        assert!(res.unwrap().status.success());
     }
 }
