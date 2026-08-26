@@ -1,12 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["crates/cora-agent-core", "crates/cora-agent-cli"]
+members = ["crates/tole-core", "crates/tole-cli"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/codecoradev/cora-agent"
+repository = "https://github.com/codecoradev/tole"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }

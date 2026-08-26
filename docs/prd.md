@@ -1,9 +1,9 @@
-# PRD — cora-agent
+# PRD — tole
 
 | | |
 |---|---|
-| **Product** | cora-agent — durable Rust agent harness |
-| **Repo** | `codecoradev/cora-agent` (MIT, adaptation of pi harness spec) |
+| **Product** | tole — durable Rust agent harness |
+| **Repo** | `codecoradev/tole` (MIT, adaptation of pi harness spec) |
 | **Document version** | v1.0 (Phase 0) |
 | **Status** | Draft — approved before Phase 1 coding |
 | **Owner** | CodeCora |
@@ -150,5 +150,5 @@ The project is stopped/frozen if ≥2 are met:
 ## 9. References
 
 - `spec.md` (pi harness spec, MIT) — basis for the entry/register/state design.
-- `crates/cora-agent-core/src/lib.rs` — module layout & official terminology.
+- `crates/tole-core/src/lib.rs` — module layout & official terminology.
 - Cora ecosystem: `cora` (code graph & review), `uteke` (semantic memory), `gh` CLI.

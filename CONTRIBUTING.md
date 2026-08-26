@@ -1,4 +1,4 @@
-# Contributing to cora-agent
+# Contributing to tole
 
 ## Workflow
 
@@ -13,7 +13,7 @@ All repository artifacts are written in **English**: commit messages, PR titles/
 
 ## Design Rules
 
-- The core crate (`cora-agent-core`) must stay platform-agnostic: no stdin/stdout, no CLI assumptions. Host interaction goes through traits (`Storage`, `Provider`, `Tool`, `Approver`).
+- The core crate (`tole-core`) must stay platform-agnostic: no stdin/stdout, no CLI assumptions. Host interaction goes through traits (`Storage`, `Provider`, `Tool`, `Approver`).
 - Session storage is append-only (JSONL, one file per session). Never mutate or delete entries; corrections are new entries.
 - Every non-ReadOnly tool must go through an `Approver`. There is no bypass path.
 - Adding code is a last resort — first check whether configuration or an existing mechanism solves the problem.

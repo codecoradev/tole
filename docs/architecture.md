@@ -1,13 +1,13 @@
-# cora-agent — Architecture Document
+# tole — Architecture Document
 
 > Status: Ground truth Phase 1–2. Written in English, technical terms kept as-is.
-> Crate layout: `crates/cora-agent-core` (pure lib) + `crates/cora-agent-cli` (thin host bin). Future: `cora-agent-ffi`.
+> Crate layout: `crates/tole-core` (pure lib) + `crates/tole-cli` (thin host bin). Future: `tole-ffi`.
 
 ## 1. Design Principles
 
 1. **Durability first** — all state that determines agent behavior must survive a crash. The session file (JSONL, default) is the single source of truth.
 2. **Write-once** — the conversation tree is append-only & immutable. No entry update/delete; corrections = new entries.
-3. **Pure core** — `cora-agent-core` performs no interactive I/O (stdin/stdout/CLI). Embeddable via CLI, Corin (Tauri), or `flutter_rust_bridge` FFI.
+3. **Pure core** — `tole-core` performs no interactive I/O (stdin/stdout/CLI). Embeddable via CLI, Corin (Tauri), or `flutter_rust_bridge` FFI.
 4. **Portable Phase 1–2** — no *nix-only dependencies. Cross-build CI deferred to Phase 3.
 
 ## 2. Crate Layout & Dependencies
@@ -15,19 +15,19 @@
 ```mermaid
 graph TD
     subgraph Hosts
-        CLI["cora-agent-cli<br/>(thin bin: stdin/stdout,<br/>y/N prompt, config)"]
-        FFI["cora-agent-ffi<br/>(future: flutter_rust_bridge)"]
+        CLI["tole-cli<br/>(thin bin: stdin/stdout,<br/>y/N prompt, config)"]
+        FFI["tole-ffi<br/>(future: flutter_rust_bridge)"]
     end
-    CORE["cora-agent-core<br/>(pure platform-agnostic lib)"]
+    CORE["tole-core<br/>(pure platform-agnostic lib)"]
     DB[("JSONL<br/>session file (append-only)")]
     CLI -->|depends on| CORE
     FFI -.->|future| CORE
     CORE -->|append / replay| DB
 ```
 
-- **cora-agent-core** — platform-agnostic library. No stdin/stdout/CLI assumptions. All host interactions (approval prompt, output streaming) go through trait boundaries (`Approver`, etc.).
-- **cora-agent-cli** — thin host binary: parse config, wire up `InteractiveApprover` (y/N prompt on the host), run the turn loop from core.
-- **cora-agent-ffi** (future) — FFI binding for embedding in Corin / Flutter.
+- **tole-core** — platform-agnostic library. No stdin/stdout/CLI assumptions. All host interactions (approval prompt, output streaming) go through trait boundaries (`Approver`, etc.).
+- **tole-cli** — thin host binary: parse config, wire up `InteractiveApprover` (y/N prompt on the host), run the turn loop from core.
+- **tole-ffi** (future) — FFI binding for embedding in Corin / Flutter.
 
 ## 3. Module Responsibility
 
@@ -168,4 +168,4 @@ sequenceDiagram
 ## 12. Phase Rules
 
 - Phase 1–2: **no *nix-only deps** — all crates must build on portable targets (Windows/macOS/Linux). Cross-build CI deferred to Phase 3.
-- The future `cora-agent-ffi` may only depend on core, and must not contain domain logic.
+- The future `tole-ffi` may only depend on core, and must not contain domain logic.

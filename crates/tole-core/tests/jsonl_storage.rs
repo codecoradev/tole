@@ -8,13 +8,13 @@
 
 use serde_json::json;
 
-use cora_agent_core::entry::{EntryType, NewEntry};
-use cora_agent_core::register::{is_valid_namespace, RegisterWrite};
-use cora_agent_core::state::{Pc, StateTransition};
-use cora_agent_core::storage::{Commit, JsonlStorage, Storage, StorageError, UsageRecord};
+use tole_core::entry::{EntryType, NewEntry};
+use tole_core::register::{is_valid_namespace, RegisterWrite};
+use tole_core::state::{Pc, StateTransition};
+use tole_core::storage::{Commit, JsonlStorage, Storage, StorageError, UsageRecord};
 
 fn tmpdir(tag: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("cora-agent-e1-{}-{}", tag, std::process::id()));
+    let d = std::env::temp_dir().join(format!("tole-e1-{}-{}", tag, std::process::id()));
     std::fs::create_dir_all(&d).unwrap();
     d
 }
@@ -154,7 +154,7 @@ fn newer_format_version_is_hard_error() {
     match err {
         StorageError::UnsupportedVersion { file, supported } => {
             assert_eq!(file, 999);
-            assert_eq!(supported, cora_agent_core::STORAGE_VERSION);
+            assert_eq!(supported, tole_core::STORAGE_VERSION);
         }
         other => panic!("expected UnsupportedVersion, got {other:?}"),
     }
@@ -235,7 +235,7 @@ fn invalid_commits_are_rejected_before_any_write() {
     // Set without value.
     let e = s
         .commit(Commit::new().register(RegisterWrite {
-            op: cora_agent_core::register::RegisterOp::Set,
+            op: tole_core::register::RegisterOp::Set,
             namespace: "fact".into(),
             key: "k".into(),
             value: None,
