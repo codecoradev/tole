@@ -1,0 +1,16 @@
+{
+  "timestamp": "2026-08-26T04:36:12.097658601Z",
+  "commit": "604bb5e",
+  "branch": "chore/ci-governance-align",
+  "files_reviewed": 0,
+  "lines_reviewed": null,
+  "findings": {
+    "major": 1
+  },
+  "categories": {
+    "bug_risk": 1
+  },
+  "quality_score": 9.0,
+  "gate_status": "disabled",
+  "duration_ms": null
+}
