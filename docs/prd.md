@@ -6,13 +6,13 @@
 | **Repo** | `codecoradev/cora-agent` (MIT, adaptation of pi harness spec) |
 | **Document version** | v1.0 (Phase 0) |
 | **Status** | Draft — approved before Phase 1 coding |
-| **Owner** | Anaz (internal dev) |
+| **Owner** | CodeCora |
 
 ---
 
 ## 1. Problem Statement
 
-Current LLM agents (pi, Claude Code, etc.) are **ephemeral**: state lives in memory, a crash means loss of context, and there is no replayable audit trail. For internal CodeCora workflows that need **durability, safety, and auditability** (fixing GitHub issues, responding to cora-review findings, documentation Q&A), existing harnesses fall short:
+Current LLM agents (pi, Claude Code, etc.) are **ephemeral**: state lives in memory, a crash means loss of context, and there is no replayable audit trail. For development workflows that need **durability, safety, and auditability** (fixing GitHub issues, responding to code-review findings, documentation Q&A), existing harnesses fall short:
 
 1. **Not durable** — a crash mid-turn repeats work from scratch; expensive tool calls are re-executed.
 2. **No approval gates** — tools execute directly; there is no ReadOnly/Write/Destructive tiering.
@@ -27,13 +27,13 @@ Current LLM agents (pi, Claude Code, etc.) are **ephemeral**: state lives in mem
 - **Embeddable core**: platform-agnostic library (no stdin/stdout), host = CLI / Corin / flutter_rust_bridge FFI.
 - Cora ecosystem integration: cora search tool, uteke memory, gh CLI.
 
-### ⛔ Gate: 3 Internal Workflows must be defined BEFORE Phase 1 coding
+### ⛔ Gate: 3 Validation Workflows must be defined BEFORE Phase 1 coding
 
 | # | Workflow (placeholder) | Description | Status |
 |---|---|---|---|
 | W1 | `fix-gh-issue` | Agent reads a GitHub issue via gh CLI → cora search to locate code → patch → create PR. | **[DEFINE BEFORE PHASE 1]** |
 | W2 | `cora-review-responder` | Agent receives findings from cora review diff → triage severity → draft PR comment reply. | **[DEFINE BEFORE PHASE 1]** |
-| W3 | `docs-qnA` | Internal documentation QnA via uteke recall + cora brain search → answer with citations. | **[DEFINE BEFORE PHASE 1]** |
+| W3 | `docs-qnA` | Documentation QnA via uteke recall + cora brain search → answer with citations. | **[DEFINE BEFORE PHASE 1]** |
 
 > Every workflow must have: a written trigger, tool call steps, maximum risk tier, and expected outcome. Without these, Phase 1 must not start.
 
@@ -55,7 +55,7 @@ Current LLM agents (pi, Claude Code, etc.) are **ephemeral**: state lives in mem
 
 | Persona | Needs |
 |---|---|
-| **Internal dev (Anaz)** | Run automated workflows via CLI; crash-safe resume; audit log; approval gates for risky operations. |
+| **Maintainer (solo dev)** | Run automated workflows via CLI; crash-safe resume; audit log; approval gates for risky operations. |
 | **Embed host: Corin (desktop, Tauri)** | Embed the core crate as a library; interactive Approver via Corin UI. |
 | **Embed host: Flutter mobile** | FFI via flutter_rust_bridge; minimal & serializable API surface. |
 
@@ -90,7 +90,7 @@ Current LLM agents (pi, Claude Code, etc.) are **ephemeral**: state lives in mem
 |---|---|---|---|
 | **ReadOnly** | Does not change world state | cora search, uteke recall, gh view | Auto-allow (allowlist) |
 | **Write** | Changes state, reversible | patch file, gh pr create, uteke remember | Approver required (auto-allow for internal allowlist) |
-| **Destructive** | Not reversible / broad impact | force push, drop database, delete branch, `rm -rf` | Approver required, **always interactive** for internal dev; cannot be allowlisted |
+| **Destructive** | Not reversible / broad impact | force push, drop database, delete branch, `rm -rf` | Approver required, **always interactive**; cannot be allowlisted |
 
 Decision matrix:
 
@@ -127,7 +127,7 @@ The core is always library-first; the CLI is merely the first host. The public A
 The project is stopped/frozen if ≥2 are met:
 
 1. **Crash-resume cannot be proven to work** after Phase 1a + 1 fix iteration.
-2. **3 internal workflows unused** — no real usage >1 month after Phase 2.
+2. **Validation workflows unused** — no real usage >1 month after Phase 2.
 3. **Maintenance >20% of saved time** the project should have produced (sustained negative ROI).
 4. **External alternatives meet the needs** (an existing OSS harness is durable + embeddable enough and Cora integration can be built as a plugin).
 5. **LLM cost per workflow unreasonable** compared to manual (no optimization path).
@@ -140,7 +140,7 @@ The project is stopped/frozen if ≥2 are met:
 | Metric | Target | How to measure |
 |---|---|---|
 | Crash-resume | Deterministic kill/restart test passes; ≥1 real incident of successful resume | Test suite + session logs |
-| Internal workflows E2E | **>2 workflows** (of W1–W3) complete end-to-end without human intervention beyond approvals | Tree audit per session |
+| Validation workflows E2E | **>2 workflows** (of W1–W3) complete end-to-end without human intervention beyond approvals | Tree audit per session |
 | Maintenance overhead | **<20%** of the time saved by the agent | Rough monthly time-tracking |
 | Approval compliance | 0 Destructive executions without a recorded approval | Tree audit scan |
 | Embeddability | Core crate compiles without CLI/UI feature; serializable API | Phase 3 CI check |

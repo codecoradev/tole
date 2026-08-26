@@ -1,0 +1,12 @@
+{
+  "timestamp": "2026-08-26T03:58:13.217038921Z",
+  "commit": "964166e",
+  "branch": "develop",
+  "files_reviewed": 0,
+  "lines_reviewed": null,
+  "findings": {},
+  "categories": {},
+  "quality_score": 10.0,
+  "gate_status": "disabled",
+  "duration_ms": null
+}
