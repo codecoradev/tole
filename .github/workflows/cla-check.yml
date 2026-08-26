@@ -20,9 +20,11 @@ jobs:
           # Fetch signatures.json directly from raw GitHub (public repo).
           # A fetch failure is an infra error — do NOT treat it as "unsigned".
           ok=0
-          wget -q -O signatures.json "https://raw.githubusercontent.com/codecoradev/.github/main/.cla/signatures.json" && ok=1 \
-            || curl -sfL "https://raw.githubusercontent.com/codecoradev/.github/main/.cla/signatures.json" -o signatures.json && ok=1 \
-            || true
+          if wget -q -O signatures.json "https://raw.githubusercontent.com/codecoradev/.github/main/.cla/signatures.json"; then
+            ok=1
+          elif curl -sfL "https://raw.githubusercontent.com/codecoradev/.github/main/.cla/signatures.json" -o signatures.json; then
+            ok=1
+          fi
           if [ "$ok" != "1" ]; then
             echo "::error::Failed to fetch signatures.json (network). Refusing to report a false 'CLA not signed'."
             exit 1

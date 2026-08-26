@@ -24,6 +24,16 @@ jobs:
           PROJECT_NODE_ID: ${{ secrets.PROJECT_NODE_ID }}
           STATUS_FIELD_ID: PVTSSF_lADOEUV_vs4BahYpzhVYcGc
           DONE_OPTION_ID: 98236657
+        env:
+          EVENT: ${{ github.event.action }}
+          EVENT_NAME: ${{ github.event_name }}
+          ISSUE_NUMBER: ${{ github.event.issue.number || '' }}
+          ISSUE_NODE_ID: ${{ github.event.issue.node_id || '' }}
+          ISSUE_STATE: ${{ github.event.issue.state || '' }}
+          PR_NUMBER: ${{ github.event.pull_request.number || '' }}
+          PR_NODE_ID: ${{ github.event.pull_request.node_id || '' }}
+          PR_MERGED: ${{ github.event.pull_request.merged || '' }}
+          PR_URL: ${{ github.event.pull_request.html_url || '' }}
         run: |
           set -e
 
