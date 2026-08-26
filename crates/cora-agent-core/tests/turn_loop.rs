@@ -335,3 +335,38 @@ fn turn_refused_when_pc_not_idle() {
         .count();
     assert_eq!(users, 1);
 }
+
+// ---------------------------------------------------------------------------
+// Durable abort records (PR #17 review)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn all_abort_paths_leave_durable_error_records() {
+    for (name, tool, risk) in [
+        ("unknown", "nonexistent", Risk::ReadOnly),
+        ("approval", "write_file", Risk::Write),
+    ] {
+        let dir = tmpdir(name);
+        let mut s = JsonlStorage::create(&dir, name, None).unwrap();
+        let mut p = MockProvider::scripted(vec![ProviderOutput::ToolCall {
+            tool: tool.into(),
+            input: json!({}),
+        }]);
+        let mut reg = ToolRegistry::new();
+        reg.register(Box::new(WriteTool)).unwrap();
+
+        let _ = run_turn(&mut s, &mut p, &reg, "hi").unwrap();
+        // Durable ERROR entry exists, attached to the user message.
+        let errs: Vec<&cora_agent_core::entry::Entry> = s
+            .entries()
+            .iter()
+            .filter(|e| e.kind.as_str() == "error" && e.parent_id.is_some())
+            .collect();
+        assert_eq!(
+            errs.len(),
+            1,
+            "abort path {name} must leave exactly one durable error"
+        );
+        let _ = risk;
+    }
+}

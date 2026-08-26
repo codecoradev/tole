@@ -93,9 +93,14 @@ pub fn run_turn(
             }
             ProviderOutput::ToolCall { tool, input } => {
                 let Some(t) = registry.get(&tool) else {
+                    // Durable record, same contract as the other abort paths.
+                    append_turn_error(s, "unknown tool", &tool)?;
                     return Ok(TurnOutcome::UnknownTool { name: tool });
                 };
                 if t.risk() != Risk::ReadOnly {
+                    // Approval gate lands in E6; until then the turn aborts
+                    // with a durable record — never a silent park in Planning.
+                    append_turn_error(s, "approval required", &tool)?;
                     return Ok(TurnOutcome::ApprovalRequired { name: tool });
                 }
                 // Planning → ToolCall, then the sandwich.
