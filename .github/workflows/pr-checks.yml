@@ -81,7 +81,7 @@ jobs:
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
-          echo "Checking PR title: $PR_TITLE"
+          # Do not echo $PR_TITLE directly — untrusted content in logs
 
           # Conventional Commits: type(scope): description
           # Types: feat, fix, docs, chore, perf, refactor, test, build, ci, security
