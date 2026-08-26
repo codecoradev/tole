@@ -70,7 +70,7 @@ Current LLM agents (pi, Claude Code, etc.) are **ephemeral**: state lives in mem
 | **register** | FR-R1 | Namespaced mutable cells: `lane`, `op`, `pending`, `fact`; written atomically with entries in one commit. | P0 |
 | **register** | FR-R2 | The register is the only mutable state; acts as the operation program counter. | P0 |
 | **state** | FR-S1 | Operation state machine with explicit transitions (e.g. idle → running → awaiting-approval → running → done/failed); invalid transitions are rejected. | P0 |
-| **state** | FR-S2 | After a crash, the state machine + register are restored from SQLite and the operation resumes from the checkpoint. | P0 |
+| **state** | FR-S2 | After a crash, the state machine + register are restored by replaying the session file and the operation resumes from the checkpoint. | P0 |
 | **storage** | FR-D1 | JSONL backend, **one file per session** (default); optional SQLite backend behind the same `Storage` trait (feature-gated). | P0 |
 | **storage** | FR-D2 | Versioned schema (`STORAGE_VERSION`), **migrate-on-open**; version newer than the binary → clear error. | P0 |
 | **tool** | FR-T1 | `Tool` trait with risk tiers: `ReadOnly` / `Write` / `Destructive`; metadata (name, description, argument schema) exposed to the provider. | P0 |

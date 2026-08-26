@@ -57,7 +57,7 @@ graph TD
 
 ```jsonl
 {"v":1,"kind":"header","id":"<session-id>","storageVersion":1,"createdAt":...,"cwd":"..."}
-[{"kind":"entry","seq":101,"timestamp":...,"id":"e_50","parentId":"e_41","kind":"message","payload":{...}},
+[{"kind":"entry","seq":101,"timestamp":...,"id":"e_50","parentId":"e_41","type":"message","payload":{...}},
  {"kind":"register","op":"set","seq":102,"namespace":"op.state","key":"op_9","value":{...}},
  {"kind":"register","op":"set","seq":103,"namespace":"lane.leaf","key":"main","value":"e_50"}]
 {"kind":"usage","seq":110,"id":"u_7","entryId":"e_51","usage":{...}}
@@ -104,7 +104,7 @@ stateDiagram-v2
 
 Every tool execution follows a three-layer pattern — a crash at any point can be recovered deterministically:
 
-1. **Intent commit** — append `pending` entry (intent) + set `pending` register → SQLite. Crash-safe: on resume, a pending entry without settlement → tool is **replay-safe** or considered failed.
+1. **Intent commit** — append `pending` entry (intent) + set `pending` register → one atomic commit line. Crash-safe: on resume, a pending entry without settlement → tool is **replay-safe** or considered failed.
 2. **Effect execute** — run the tool outside the DB transaction (real-world side effect).
 3. **Settlement write** — append result entry (success/error) + clear `pending` register + advance `pc` via CAS.
 
@@ -117,14 +117,14 @@ sequenceDiagram
     participant T as Tool (tool.rs)
     participant AP as Approver (approval.rs)
 
-    SM->>DB: 1. Intent commit (BEGIN IMMEDIATE)<br/>append pending entry + register pending
+    SM->>DB: 1. Intent commit (one array line)<br/>append pending entry + register pending
     SM->>AP: check Risk tier (ReadOnly/Write/Destructive)
     alt approval required
         AP-->>SM: y (approved) / N (denied)
     end
     SM->>T: 2. Effect execute
     T-->>SM: result / error
-    SM->>DB: 3. Settlement write (BEGIN IMMEDIATE)<br/>append result entry, clear pending, pc++ (CAS)
+    SM->>DB: 3. Settlement write (one array line)<br/>append result entry, clear pending, pc++ (CAS)
 ```
 
 ## 7. Tool & Approval
@@ -161,7 +161,7 @@ sequenceDiagram
 
 | Tier | Scope | Examples |
 |---|---|---|
-| **A — Unit** | State machine & storage | CAS transition (race → 0 rows affected), migrate-on-open, register upsert per namespace, entry append immutability, `BEGIN IMMEDIATE` write path |
+| **A — Unit** | State machine & storage | CAS transition (seq race → mismatch), format version check on open, register upsert per namespace, entry append immutability, torn-last-line discard on replay |
 | **B — Integration** | Crash-resume | Kill at the three points of the effect sandwich (after intent / during effect / before settlement) → resume produces the settlement exactly once (per tool replay-safety contract) |
 | **C — Adversarial** | Malicious input & abuse | Giant tool output, malformed tool args, approval spam, double-drive turn loop, state.seq collision, storage version mismatch, allowlist bypass patterns |
 
