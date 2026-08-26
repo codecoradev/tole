@@ -18,18 +18,18 @@
 //! differences between a crashed run and a clean one; the *content* must
 //! be identical. That is the E5 acceptance criterion.
 
-use cora_agent_core::approval::{AllowlistApprover, Decision};
-use cora_agent_core::entry::{EntryType, NewEntry};
-use cora_agent_core::machine::{begin, ReplaySafety};
-use cora_agent_core::mock::MockProvider;
-use cora_agent_core::provider::ProviderOutput;
-use cora_agent_core::state::Pc;
-use cora_agent_core::state::StateTransition;
-use cora_agent_core::storage::{Commit, JsonlStorage, Storage};
-use cora_agent_core::tool::{Risk, Tool, ToolRegistry};
-use cora_agent_core::turn::{resume_turn, run_turn, TurnOutcome};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
+use tole_core::approval::{AllowlistApprover, Decision};
+use tole_core::entry::{EntryType, NewEntry};
+use tole_core::machine::{begin, ReplaySafety};
+use tole_core::mock::MockProvider;
+use tole_core::provider::ProviderOutput;
+use tole_core::state::Pc;
+use tole_core::state::StateTransition;
+use tole_core::storage::{Commit, JsonlStorage, Storage};
+use tole_core::tool::{Risk, Tool, ToolRegistry};
+use tole_core::turn::{resume_turn, run_turn, TurnOutcome};
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -98,7 +98,7 @@ fn golden(s: &JsonlStorage) -> Vec<String> {
         .collect()
 }
 
-fn final_text(out: Result<TurnOutcome, cora_agent_core::storage::StorageError>) -> String {
+fn final_text(out: Result<TurnOutcome, tole_core::storage::StorageError>) -> String {
     match out.unwrap() {
         TurnOutcome::Final { text } => text,
         other => panic!("expected Final, got {other:?}"),
@@ -177,7 +177,7 @@ fn crash_at_every_commit_boundary_resumes_to_same_result() {
             final_text(run_turn(&mut s, &mut p, &registry(false), "hello"))
         } else if k == 10 {
             // The turn completed before the "crash": nothing to resume.
-            assert_eq!(s.state().pc, cora_agent_core::state::Pc::Final);
+            assert_eq!(s.state().pc, tole_core::state::Pc::Final);
             ref_text.clone()
         } else {
             let script: Vec<ProviderOutput> =
@@ -185,7 +185,7 @@ fn crash_at_every_commit_boundary_resumes_to_same_result() {
             let mut p = MockProvider::scripted(script);
             final_text(resume_turn(&mut s, &mut p, &registry(false)))
         };
-        assert_eq!(s.state().pc, cora_agent_core::state::Pc::Final, "k={k}");
+        assert_eq!(s.state().pc, tole_core::state::Pc::Final, "k={k}");
         assert_eq!(text, ref_text, "k={k} final text diverged");
         assert_eq!(golden(&s), ref_lines, "k={k} golden diverged");
     }
@@ -252,12 +252,12 @@ fn sigkill_mid_sandwich_resumes_to_same_result() {
 
     // The killed session is mid-sandwich: intent durable, no settlement.
     let mut s = JsonlStorage::open(&file).unwrap();
-    assert_eq!(s.state().pc, cora_agent_core::state::Pc::Executing);
+    assert_eq!(s.state().pc, tole_core::state::Pc::Executing);
     let mut p = MockProvider::scripted(vec![ProviderOutput::Final {
         text: "survived".into(),
     }]);
     let text = final_text(resume_turn(&mut s, &mut p, &registry(true)));
-    assert_eq!(s.state().pc, cora_agent_core::state::Pc::Final);
+    assert_eq!(s.state().pc, tole_core::state::Pc::Final);
     assert_eq!(text, ref_text);
     assert_eq!(golden(&s), ref_lines);
 }

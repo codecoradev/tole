@@ -1,17 +1,17 @@
 [package]
-name = "cora-agent-cli"
-description = "Headless CLI host for cora-agent-core"
+name = "tole-cli"
+description = "Headless CLI host for tole-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [[bin]]
-name = "cora-agent"
+name = "tole"
 path = "src/main.rs"
 
 [dependencies]
-cora-agent-core = { path = "../cora-agent-core" }
+tole-core = { path = "../tole-core" }
 tokio = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }

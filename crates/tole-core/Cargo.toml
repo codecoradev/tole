@@ -1,5 +1,5 @@
 [package]
-name = "cora-agent-core"
+name = "tole-core"
 description = "Durable agent harness core: state machine, SQLite storage, tools, approval policy"
 version.workspace = true
 edition.workspace = true

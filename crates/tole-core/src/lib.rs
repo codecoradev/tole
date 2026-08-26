@@ -1,4 +1,4 @@
-//! cora-agent-core — durable agent harness core.
+//! tole-core — durable agent harness core.
 //!
 //! Platform-agnostic library. No stdin/stdout, no CLI assumptions.
 //! Designed to be embeddable via CLI, desktop app, or flutter_rust_bridge FFI.

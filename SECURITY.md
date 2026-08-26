@@ -8,7 +8,7 @@
 
 ## How to Report
 
-Use [GitHub Private Vulnerability Reporting](https://github.com/codecoradev/cora-agent/security/advisories/new) — this ensures the report is confidential and only visible to maintainers.
+Use [GitHub Private Vulnerability Reporting](https://github.com/codecoradev/tole/security/advisories/new) — this ensures the report is confidential and only visible to maintainers.
 
 Include as much detail as possible:
 

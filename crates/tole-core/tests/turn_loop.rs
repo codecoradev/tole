@@ -1,14 +1,14 @@
 //! E3 — Tier A tests: provider abstraction, tool registry, and the full
 //! turn loop on the mock provider (no network, deterministic, fast).
 
-use cora_agent_core::approval::{AllowlistApprover, Decision};
-use cora_agent_core::entry::Entry;
-use cora_agent_core::mock::MockProvider;
-use cora_agent_core::provider::{Provider, ProviderError, ProviderOutput};
-use cora_agent_core::storage::{JsonlStorage, Storage};
-use cora_agent_core::tool::{Risk, Tool, ToolRegistry};
-use cora_agent_core::turn::{run_turn, TurnOutcome, MAX_STEPS};
 use serde_json::{json, Value};
+use tole_core::approval::{AllowlistApprover, Decision};
+use tole_core::entry::Entry;
+use tole_core::mock::MockProvider;
+use tole_core::provider::{Provider, ProviderError, ProviderOutput};
+use tole_core::storage::{JsonlStorage, Storage};
+use tole_core::tool::{Risk, Tool, ToolRegistry};
+use tole_core::turn::{run_turn, TurnOutcome, MAX_STEPS};
 
 struct EchoTool;
 impl Tool for EchoTool {
@@ -143,7 +143,7 @@ fn turn_final_without_tools() {
     assert_eq!(msgs.len(), 2);
     assert_eq!(msgs[0].payload["role"], json!("user"));
     assert_eq!(msgs[1].payload["role"], json!("assistant"));
-    assert_eq!(s.state().pc, cora_agent_core::state::Pc::Final);
+    assert_eq!(s.state().pc, tole_core::state::Pc::Final);
 }
 
 #[test]
@@ -171,7 +171,7 @@ fn turn_tool_call_then_final() {
     assert!(kinds.contains(&"tool_result"));
     // Pending cell cleared after settlement.
     assert!(s.get_register("pending", "op").is_none());
-    assert_eq!(s.state().pc, cora_agent_core::state::Pc::Final);
+    assert_eq!(s.state().pc, tole_core::state::Pc::Final);
 }
 
 #[test]
@@ -213,7 +213,7 @@ fn turn_write_tool_requires_approval_gate() {
     }
     // The refusal is durable: an ERROR entry attached to the user message.
     assert!(!s.entries().iter().any(|e| e.kind.as_str() == "intent"));
-    assert_eq!(s.state().pc, cora_agent_core::state::Pc::Planning);
+    assert_eq!(s.state().pc, tole_core::state::Pc::Planning);
 }
 
 #[test]
@@ -237,7 +237,7 @@ fn turn_tool_failure_settles_error_and_replans() {
     // Error settlement is durable: an error entry exists, pending cleared.
     assert!(s.entries().iter().any(|e| e.kind.as_str() == "error"));
     assert!(s.get_register("pending", "op").is_none());
-    assert_eq!(s.state().pc, cora_agent_core::state::Pc::Final);
+    assert_eq!(s.state().pc, tole_core::state::Pc::Final);
 }
 
 #[test]
@@ -278,7 +278,7 @@ fn turn_provider_failure_aborts_cleanly() {
         other => panic!("expected ProviderFailed, got {other:?}"),
     }
     // Session still consistent: user message persisted, pc in Planning.
-    assert_eq!(s.state().pc, cora_agent_core::state::Pc::Planning);
+    assert_eq!(s.state().pc, tole_core::state::Pc::Planning);
     assert!(s
         .entries()
         .iter()
@@ -323,11 +323,11 @@ fn turn_refused_when_pc_not_idle() {
     let reg = ToolRegistry::new();
     let out = run_turn(&mut s, &mut p, &reg, "first").unwrap();
     assert!(matches!(out, TurnOutcome::ProviderFailed { .. }));
-    assert_eq!(s.state().pc, cora_agent_core::state::Pc::Planning);
+    assert_eq!(s.state().pc, tole_core::state::Pc::Planning);
 
     let err = run_turn(&mut s, &mut p, &reg, "second").unwrap_err();
     match err {
-        cora_agent_core::storage::StorageError::Invalid(msg) => {
+        tole_core::storage::StorageError::Invalid(msg) => {
             assert!(msg.contains("requires pc Idle"))
         }
         other => panic!("expected Invalid, got {other:?}"),
@@ -370,7 +370,7 @@ fn all_abort_paths_leave_durable_error_records() {
 
         let _ = run_turn(&mut s, &mut p, &reg, "hi").unwrap();
         // Durable ERROR entry exists, attached to the user message.
-        let errs: Vec<&cora_agent_core::entry::Entry> = s
+        let errs: Vec<&tole_core::entry::Entry> = s
             .entries()
             .iter()
             .filter(|e| e.kind.as_str() == "error" && e.parent_id.is_some())

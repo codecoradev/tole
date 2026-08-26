@@ -6,12 +6,10 @@
 //! each sandwich point; after resume, the observable durable state
 //! (entries, registers, machine position) must equal the reference.
 
-use cora_agent_core::machine::{
-    begin, finish, resume, EffectHandle, ReplaySafety, Resume, PENDING_KEY,
-};
-use cora_agent_core::state::{Pc, StateTransition};
-use cora_agent_core::storage::{Commit, JsonlStorage, Storage, StorageError};
 use serde_json::{json, Value};
+use tole_core::machine::{begin, finish, resume, EffectHandle, ReplaySafety, Resume, PENDING_KEY};
+use tole_core::state::{Pc, StateTransition};
+use tole_core::storage::{Commit, JsonlStorage, Storage, StorageError};
 
 fn tmpdir(name: &str) -> std::path::PathBuf {
     let d = std::env::temp_dir().join(format!("cora-e2-{}-{}", name, std::process::id()));
@@ -94,7 +92,7 @@ fn drive(
 }
 
 fn settle_ok_and_finish(s: &mut JsonlStorage, handle: &EffectHandle, out: Value) {
-    cora_agent_core::machine::settle_ok(s, handle, out).unwrap();
+    tole_core::machine::settle_ok(s, handle, out).unwrap();
     finish(s).unwrap();
 }
 
@@ -148,7 +146,7 @@ fn resume_and_finish(
         }
         Resume::Fail { intent_id, reason } => {
             let handle = EffectHandle { intent_id };
-            cora_agent_core::machine::settle_err(&mut s, &handle, &reason).unwrap();
+            tole_core::machine::settle_err(&mut s, &handle, &reason).unwrap();
         }
     }
     s.commit(Commit::new().transition(StateTransition::from(s.state().seq, Pc::Final)))
@@ -251,7 +249,7 @@ fn never_replay_crash_settles_as_failure() {
         Resume::Fail { intent_id, reason } => {
             assert!(!reason.is_empty());
             let handle = EffectHandle { intent_id };
-            cora_agent_core::machine::settle_err(&mut s, &handle, &reason).unwrap();
+            tole_core::machine::settle_err(&mut s, &handle, &reason).unwrap();
         }
         other => panic!("expected Fail, got {other:?}"),
     }
@@ -278,7 +276,7 @@ fn effect_error_settles_and_replans() {
         None,
     )
     .unwrap();
-    cora_agent_core::machine::settle_err(&mut s, &handle, "boom").unwrap();
+    tole_core::machine::settle_err(&mut s, &handle, "boom").unwrap();
     assert!(s.get_register("pending", PENDING_KEY).is_none());
     assert_eq!(s.state().pc, Pc::Planning);
     // Re-plan a new sandwich after the failure: legal per the table.
@@ -293,7 +291,7 @@ fn effect_error_settles_and_replans() {
     )
     .unwrap();
     let out = json!({"ok": true});
-    cora_agent_core::machine::settle_ok(&mut s, &h2, out).unwrap();
+    tole_core::machine::settle_ok(&mut s, &h2, out).unwrap();
     finish(&mut s).unwrap();
     assert_eq!(s.state().pc, Pc::Planning);
 }
@@ -316,7 +314,7 @@ fn compacted_file_replays_and_resumes_clean() {
         None,
     )
     .unwrap();
-    cora_agent_core::machine::settle_ok(&mut s, &handle, json!({"v": 9})).unwrap();
+    tole_core::machine::settle_ok(&mut s, &handle, json!({"v": 9})).unwrap();
     s.compact().unwrap();
     drop(s);
 
@@ -408,12 +406,12 @@ fn settle_with_wrong_handle_is_refused() {
     let forged = EffectHandle {
         intent_id: "intent_9999".into(),
     };
-    let err = cora_agent_core::machine::settle_ok(&mut s, &forged, json!({})).unwrap_err();
+    let err = tole_core::machine::settle_ok(&mut s, &forged, json!({})).unwrap_err();
     assert!(matches!(err, StorageError::Effect(_)));
-    let err = cora_agent_core::machine::settle_err(&mut s, &forged, "x").unwrap_err();
+    let err = tole_core::machine::settle_err(&mut s, &forged, "x").unwrap_err();
     assert!(matches!(err, StorageError::Effect(_)));
     // h1 is still the pending intent and can still settle normally.
-    cora_agent_core::machine::settle_ok(&mut s, &h1, json!({"ok":true})).unwrap();
+    tole_core::machine::settle_ok(&mut s, &h1, json!({"ok":true})).unwrap();
     finish(&mut s).unwrap();
     assert_eq!(s.state().pc, Pc::Planning);
 }
@@ -429,7 +427,7 @@ fn double_settle_is_refused() {
     s.commit(Commit::new().transition(StateTransition::from(s.state().seq, Pc::ToolCall)))
         .unwrap();
     let h = begin(&mut s, "t", json!({}), ReplaySafety::Idempotent, None).unwrap();
-    cora_agent_core::machine::settle_ok(&mut s, &h, json!({})).unwrap();
-    let err = cora_agent_core::machine::settle_ok(&mut s, &h, json!({})).unwrap_err();
+    tole_core::machine::settle_ok(&mut s, &h, json!({})).unwrap();
+    let err = tole_core::machine::settle_ok(&mut s, &h, json!({})).unwrap_err();
     assert!(matches!(err, StorageError::Effect(_)));
 }

@@ -1,4 +1,4 @@
-# cora-agent — Epics & Sprint Plan (6 Weeks)
+# tole — Epics & Sprint Plan (6 Weeks)
 
 > Solo dev part-time, capacity ~10 hours/week. English, technical terms as-is.
 > Ground truth roadmap: Phase 0 DONE (scaffold + CI). Phase 1a → 1b → 2 → 3.
