@@ -7,7 +7,7 @@
 //! - `entry`    — write-once conversation tree entries
 //! - `register` — namespaced mutable cells (lane/op/pending/fact)
 //! - `state`    — operation state machine (program counter)
-//! - `storage`  — SQLite backend, one file per session
+//! - `storage`  — JSONL backend (default) behind the `Storage` trait
 //! - `tool`     — Tool trait with risk tiers
 //! - `approval` — Approver trait (Allowlist / Interactive impls live in hosts)
 //! - `provider` — LLM provider abstraction
@@ -19,5 +19,5 @@ pub mod state;
 pub mod storage;
 pub mod tool;
 
-/// Semantic version of the durable schema (migrate-on-open, see spec.md Part 7).
+/// Semantic version of the durable schema (see storage module docs).
 pub const STORAGE_VERSION: u32 = 1;
