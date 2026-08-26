@@ -5,7 +5,7 @@
 
 ## 1. Design Principles
 
-1. **Durability first** — all state that determines agent behavior must survive a crash. A single SQLite file per session is the single source of truth.
+1. **Durability first** — all state that determines agent behavior must survive a crash. The session file (JSONL, default) is the single source of truth.
 2. **Write-once** — the conversation tree is append-only & immutable. No entry update/delete; corrections = new entries.
 3. **Pure core** — `cora-agent-core` performs no interactive I/O (stdin/stdout/CLI). Embeddable via CLI, Corin (Tauri), or `flutter_rust_bridge` FFI.
 4. **Portable Phase 1–2** — no *nix-only dependencies. Cross-build CI deferred to Phase 3.
@@ -19,10 +19,10 @@ graph TD
         FFI["cora-agent-ffi<br/>(future: flutter_rust_bridge)"]
     end
     CORE["cora-agent-core<br/>(pure platform-agnostic lib)"]
-    DB[("SQLite<br/>session file (WAL)")]
+    DB[("JSONL<br/>session file (append-only)")]
     CLI -->|depends on| CORE
     FFI -.->|future| CORE
-    CORE -->|rusqlite bundled| DB
+    CORE -->|append / replay| DB
 ```
 
 - **cora-agent-core** — platform-agnostic library. No stdin/stdout/CLI assumptions. All host interactions (approval prompt, output streaming) go through trait boundaries (`Approver`, etc.).
@@ -33,7 +33,7 @@ graph TD
 
 | Module | File | Responsibility |
 |---|---|---|
-| Durable storage | (session db) | SQLite single file per session; rusqlite bundled; WAL mode; all writes inside `BEGIN IMMEDIATE`; migrate-on-open with `STORAGE_VERSION` const |
+| Durable storage | (session file) | JSONL single file per session (default, industry pattern — Claude Code/Codex/pi); append-only commits; optional SQLite backend behind same `Storage` trait (feature-gated) |
 | Conversation tree | `entry.rs` | Append-only, immutable entries (user/assistant/tool/final). Write-once; safe to replay |
 | Registers | `register.rs` | Namespaced mutable cells: `lane`, `op`, `pending`, `fact`. The namespace determines lifecycle & cleanup semantics |
 | State machine | `state.rs` | Program counter + seq CAS for atomic transitions; guarantees no double-advance / lost transitions |
@@ -42,21 +42,43 @@ graph TD
 | Provider | `provider.rs` | Thin `Provider` trait (LLM call abstraction). Phase 1: hand-rolled impl. Phase 2: evaluate `rig` (MIT) — if adopted, wrapped inside this single module boundary only |
 | Session/orchestrator | (session) | Single-threaded turn loop; coordinates the state machine, effect sandwich, tool dispatch |
 
-## 4. Data Model (SQLite Tables)
+## 4. Data Model — Storage Backends
 
-Single file per session (`<session-id>.db`), WAL mode.
+**Default: one JSONL file per session (`<session-id>.jsonl`)** — following the pattern proven by Claude Code, Codex (rollout files), and pi (JSONL backend). Optional SQLite backend lives behind the same `Storage` trait for query-heavy consumers.
 
-| Table | Core columns | Nature |
-|---|---|---|
-| `meta` | `key`, `value` — includes `storage_version` (`STORAGE_VERSION` const) | migrate-on-open; schema versioning |
-| `entries` | `id` (monotonic), `parent_id`, `kind` (user/assistant/tool/final), `payload`, `created_at` | **Append-only, immutable.** Conversation tree via `parent_id` |
-| `registers` | `namespace` (`lane`/`op`/`pending`/`fact`), `name`, `value`, `updated_at` | Mutable, upsert per (namespace, name) |
-| `state` | `id` (singleton), `pc` (program counter), `seq`, `status` | Transition via CAS on `seq` |
+**Why JSONL as default (industry pattern):**
+- Append-only, O(1) per commit — no WAL, no lock management, no `BEGIN IMMEDIATE` discipline
+- Crash safety: a torn final line is discarded whole; process-crash durability per resolved commit
+- One file per session → corruption isolated, deletion = unlink, trivially debuggable (`cat`/`grep`/`jq`)
+- The file is a **replay recipe**, not the state: open replays lines into in-memory maps; all queries run in RAM
+- Write history is audit-friendly; compaction (rewrite via temp file + atomic rename) is optional and only when dead-bytes ratio crosses a threshold
 
-Invariants:
-- All writes go through `BEGIN IMMEDIATE` transactions (explicit write lock, avoids SQLITE_BUSY upgrade deadlock).
-- `entries` are never UPDATEd/DELETEd — corrections/errors = append a new entry.
+**Line format (one physical line per commit; array line groups one transaction):**
+
+```jsonl
+{"v":1,"kind":"header","id":"<session-id>","storageVersion":1,"createdAt":...,"cwd":"..."}
+[{"kind":"entry","seq":101,"timestamp":...,"id":"e_50","parentId":"e_41","kind":"message","payload":{...}},
+ {"kind":"register","op":"set","seq":102,"namespace":"op.state","key":"op_9","value":{...}},
+ {"kind":"register","op":"set","seq":103,"namespace":"lane.leaf","key":"main","value":"e_50"}]
+{"kind":"usage","seq":110,"id":"u_7","entryId":"e_51","usage":{...}}
+{"kind":"register","op":"delete","seq":131,"namespace":"op.state","key":"op_9"}
+```
+
+**Logical model (identical across backends):**
+
+| Form | Nature |
+|---|---|
+| `entries` | **Append-only, immutable** conversation tree: `id`, `parentId`, `seq`, `kind`, `payload`, `timestamp` |
+| `registers` | Namespaced mutable cells (`lane` / `op` / `pending` / `fact`), overwritten per key on `set`, removed on `delete` |
+| `usage` ledger | Append-only cost rows per provider attempt |
+| `state` | Singleton register: `pc` (program counter), `seq` — transition via CAS on `seq` |
+
+Invariants (all backends):
+- On open, lines replay in order; persisted `seq` must be strictly increasing (gaps legal — compaction drops dead lines and gaps are permitted).
+- `entries` are never modified or deleted — corrections = append a new entry. Registers are the only mutable state.
 - `state.seq` is monotonic; a transition is valid only if `seq == expected`.
+
+**Optional SQLite backend** (`feature = "sqlite"`): one `.db` file per session, WAL mode, all writes via `BEGIN IMMEDIATE`; same 3-store schema (entries WITHOUT ROWID + registers + usage_ledger). Chosen only when consumers need indexed queries (e.g. branch index scans); not used by the CLI in v0.
 
 ## 5. State Machine
 
@@ -91,7 +113,7 @@ Per-tool **replay safety** must be declared on the `Tool` trait (idempotent / no
 ```mermaid
 sequenceDiagram
     participant SM as State machine (state.rs)
-    participant DB as SQLite (WAL)
+    participant DB as Storage (JSONL)
     participant T as Tool (tool.rs)
     participant AP as Approver (approval.rs)
 
@@ -123,7 +145,7 @@ sequenceDiagram
 ## 9. Concurrency Model
 
 - **Single-threaded turn loop.** One session = one execution thread; no parallel tool calls in Phase 1.
-- SQLite as the serialization point: WAL allows concurrent readers (UI/host preview) without blocking the writer.
+- SQLite as the serialization point (optional backend): WAL allows concurrent readers (UI/host preview) without blocking the writer. The default JSONL backend serializes naturally (one append at a time; readers tail the file).
 - CAS on `state.seq` protects against double-drive (e.g. resume + host race) — only one wins, the other retries/aborts.
 
 ## 10. Error Handling Strategy

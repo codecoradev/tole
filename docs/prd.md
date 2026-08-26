@@ -21,7 +21,7 @@ Current LLM agents (pi, Claude Code, etc.) are **ephemeral**: state lives in mem
 
 ### Goals
 
-- Rust harness with a **write-once conversation tree** (append-only entries, immutable) on top of SQLite.
+- Rust harness with a **write-once conversation tree** (append-only entries, immutable) persisted as **one JSONL file per session** (industry pattern: Claude Code, Codex, pi).
 - **Register state machine** — namespaced mutable cells (`lane/op/pending/fact`) as the operation program counter.
 - **Risk-tiered approval gates**: ReadOnly / Write / Destructive.
 - **Embeddable core**: platform-agnostic library (no stdin/stdout), host = CLI / Corin / flutter_rust_bridge FFI.
@@ -67,11 +67,11 @@ Current LLM agents (pi, Claude Code, etc.) are **ephemeral**: state lives in mem
 |---|---|---|---|
 | **entry** | FR-E1 | Entry = write-once node on the conversation tree; once written it cannot be changed/deleted (immutable, append-only). | P0 |
 | **entry** | FR-E2 | Entry stores role, payload (message/tool-call/tool-result), parent link, UUIDv7. | P0 |
-| **register** | FR-R1 | Namespaced mutable cells: `lane`, `op`, `pending`, `fact`; written via SQLite transactions. | P0 |
+| **register** | FR-R1 | Namespaced mutable cells: `lane`, `op`, `pending`, `fact`; written atomically with entries in one commit. | P0 |
 | **register** | FR-R2 | The register is the only mutable state; acts as the operation program counter. | P0 |
 | **state** | FR-S1 | Operation state machine with explicit transitions (e.g. idle → running → awaiting-approval → running → done/failed); invalid transitions are rejected. | P0 |
 | **state** | FR-S2 | After a crash, the state machine + register are restored from SQLite and the operation resumes from the checkpoint. | P0 |
-| **storage** | FR-D1 | SQLite backend, **one file per session**; WAL mode. | P0 |
+| **storage** | FR-D1 | JSONL backend, **one file per session** (default); optional SQLite backend behind the same `Storage` trait (feature-gated). | P0 |
 | **storage** | FR-D2 | Versioned schema (`STORAGE_VERSION`), **migrate-on-open**; version newer than the binary → clear error. | P0 |
 | **tool** | FR-T1 | `Tool` trait with risk tiers: `ReadOnly` / `Write` / `Destructive`; metadata (name, description, argument schema) exposed to the provider. | P0 |
 | **tool** | FR-T2 | Tool execution is sequential; results (including errors) are recorded as tool-result entries. | P0 |
@@ -107,7 +107,7 @@ Decision matrix:
 | Phase | Scope | DoD (verifiable) |
 |---|---|---|
 | **0 — Stubs & spec** (done) | Crate layout, stubs, spec.md | ✅ 7 stub files + lib.rs; green workspace build |
-| **1a — Store + State machine + Mock provider** | entry, register, state, storage (SQLite), tool trait, approval trait, mock provider | Unit tests pass: (1) entry append-only enforced, (2) crash mid-op → restart → resume from checkpoint (kill/reopen DB test), (3) invalid state transitions rejected, (4) migrate-on-open works. Demo CLI: mini-loop with mock provider + 1 ReadOnly tool. |
+| **1a — Store + State machine + Mock provider** | entry, register, state, storage (JSONL default + in-memory), tool trait, approval trait, mock provider | Unit tests pass: (1) entry append-only enforced, (2) crash mid-op → restart → replay JSONL → resume from checkpoint (torn-last-line discarded whole), (3) invalid state transitions rejected, (4) compaction roundtrip (rewrite + atomic rename, seq gaps legal). Demo CLI: mini-loop with mock provider + 1 ReadOnly tool. |
 | **1b — cora search tool + real LLM** | cora search tool (ReadOnly), real provider (LLM via API), W1 `fix-gh-issue` workflow | E2E: W1 runs fully in CLI with real LLM; cora search tool call recorded in tree; Write approval gate triggered on patch. |
 | **2 — Workflows 2 & 3** | W2 cora-review-responder, W3 docs-QnA (uteke), gh CLI tools, allowlist policy | E2E: W2 & W3 fully complete; audit replay (read tree → timeline) available. |
 | **3 — Hardening & embed prep** | Cross-build CI (macOS/Windows), FFI surface, public API docs, crate publication | Green CI matrix; minimal embed example (Corin spike or FFI test) compiles; complete API docs. |
@@ -131,7 +131,7 @@ The project is stopped/frozen if ≥2 are met:
 3. **Maintenance >20% of saved time** the project should have produced (sustained negative ROI).
 4. **External alternatives meet the needs** (an existing OSS harness is durable + embeddable enough and Cora integration can be built as a plugin).
 5. **LLM cost per workflow unreasonable** compared to manual (no optimization path).
-6. **Structural technical blocker** — the SQLite state machine is proven insufficient for real-world workflow complexity (not just a bug).
+6. **Structural technical blocker** — the storage + state machine design is proven insufficient for real-world workflow complexity (not just a bug).
 
 ---
 

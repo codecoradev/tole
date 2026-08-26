@@ -13,17 +13,17 @@
 
 ---
 
-## E1 — Storage Layer (SQLite 3-Store Schema + Migrate-on-Open)
+## E1 — Storage Layer (JSONL Session File + Storage Trait)
 
 - **Phase:** 1a
 - **User Stories:**
-  - US1.1: As a developer, I want 3 SQLite stores (sessions / turns+events / state snapshot) with a `STORAGE_VERSION`-ed schema, so that schema evolution is controlled.
-  - US1.2: As a developer, I want migrate-on-open (idempotent migration when the DB is opened), so that upgrading the binary does not corrupt old data.
+  - US1.1: As a developer, I want a JSONL session file (header + append-only commit lines) with a versioned format, so that schema evolution is controlled and sessions are debuggable with standard tools.
+  - US1.2: As a developer, I want format versioning in the JSONL header with forward-compat checks on open, so that upgrading the binary does not corrupt old sessions.
 - **Acceptance Criteria:**
-  - [ ] 3 separate stores with documented schema in `docs/` or rustdoc.
-  - [ ] Open DB version N-1 → auto-migrate to N without data loss (roundtrip test).
-  - [ ] Open DB version > current → hard error with a clear message (test).
-  - [ ] All operations go through a single `Storage` trait; no raw SQL in callers.
+  - [ ] JSONL format documented (header, entry/register/usage lines) in `docs/` or rustdoc.
+  - [ ] Open file with older format version → replay/migrate cleanly (roundtrip test).
+  - [ ] Open file with newer format version → hard error with a clear message (test).
+  - [ ] All operations go through a single `Storage` trait; no backend-specific code in callers.
 - **Est effort:** M (~12 hours)
 - **Dependencies:** — (Phase 0 scaffold).
 
@@ -134,7 +134,7 @@
 
 | Week | Focus | Epic | Deliverable | Checkpoint Review (end of week) | Kill / Pivot Criteria |
 |---|---|---|---|---|---|
-| W1 | Phase 1a — Storage | E1 | 3-store schema + migrate-on-open + tests | Migration roundtrip green; schema doc exists | If the SQLite abstraction proves >2x over budget (>20 hours), simplify to a single multi-table DB file — do not delay. |
+| W1 | Phase 1a — Storage | E1 | JSONL session file + Storage trait + compaction + tests | Format roundtrip green (replay, torn-line discard, compaction); schema doc exists | If JSONL proves >2x over budget (>20 hours), simplify to in-memory + snapshot only — do not delay. |
 | W2 | Phase 1a — State Machine + Mock | E2, E3 | Seq CAS, effect sandwich, mock provider, Tier A green | Deterministic unit-level crash-resume; `cargo test` green in CI | If replay determinism keeps failing for >1 extra week: kill — the core architecture is not sound. |
 | W3 | Phase 1b — cora search + real provider | E4, E5 | ReadOnly tool + real LLM provider + E2E single turn + crash-resume test | E2E single turn (mock & real-if-key) green | If the real provider is flaky >50% of runs: switch primary provider, don't debug endlessly. |
 | W4 | Phase 2 — Approval Gates | E6 | Approver trait + Allowlist + Interactive CLI + tests | CLI demo: write request → y/N prompt → denied recorded | If the Approver design starts creeping toward complex RBAC: cut it, 2 impls are enough. |
