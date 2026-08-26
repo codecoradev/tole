@@ -7,6 +7,7 @@
 //! no-crash run (proven by the E2 determinism tests at sandwich level and
 //! the E5 golden-file test at loop level).
 
+use crate::approval::Verdict;
 use crate::entry::{EntryType, NewEntry};
 use serde_json::json;
 
@@ -98,10 +99,16 @@ pub fn run_turn(
                     return Ok(TurnOutcome::UnknownTool { name: tool });
                 };
                 if t.risk() != Risk::ReadOnly {
-                    // Approval gate lands in E6; until then the turn aborts
+                    // Approval gate (E4): the registry's approver decides.
+                    // `Deny` (or no approver reachable here) aborts the turn
                     // with a durable record — never a silent park in Planning.
-                    append_turn_error(s, "approval required", &tool)?;
-                    return Ok(TurnOutcome::ApprovalRequired { name: tool });
+                    match registry.decide(&tool) {
+                        Some(Verdict::Allow) => { /* fall through to execute */ }
+                        _ => {
+                            append_turn_error(s, "approval required", &tool)?;
+                            return Ok(TurnOutcome::ApprovalRequired { name: tool });
+                        }
+                    }
                 }
                 // Planning → ToolCall, then the sandwich.
                 let seq = s.state().seq;

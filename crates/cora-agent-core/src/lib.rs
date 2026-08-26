@@ -16,9 +16,11 @@
 //! - `turn`     — the single-threaded turn loop
 
 pub mod approval;
+pub mod cora_search;
 pub mod entry;
 pub mod machine;
 pub mod mock;
+pub mod openai;
 pub mod provider;
 pub mod register;
 pub mod state;
