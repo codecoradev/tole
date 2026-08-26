@@ -302,3 +302,36 @@ fn turn_survives_reopen_between_steps() {
     assert!(kinds.contains(&"intent"));
     assert!(kinds.contains(&"tool_result"));
 }
+
+// ---------------------------------------------------------------------------
+// Review fixes (PR #17)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn turn_refused_when_pc_not_idle() {
+    // First turn aborts mid-loop (provider failure) → pc is Planning.
+    // A second run_turn on the same session must be refused, not silently
+    // append another user message.
+    let dir = tmpdir("notidle");
+    let mut s = JsonlStorage::create(&dir, "ni", None).unwrap();
+    let mut p = MockProvider::scripted(vec![]);
+    let reg = ToolRegistry::new();
+    let out = run_turn(&mut s, &mut p, &reg, "first").unwrap();
+    assert!(matches!(out, TurnOutcome::ProviderFailed { .. }));
+    assert_eq!(s.state().pc, cora_agent_core::state::Pc::Planning);
+
+    let err = run_turn(&mut s, &mut p, &reg, "second").unwrap_err();
+    match err {
+        cora_agent_core::storage::StorageError::Invalid(msg) => {
+            assert!(msg.contains("requires pc Idle"))
+        }
+        other => panic!("expected Invalid, got {other:?}"),
+    }
+    // Exactly one user message was persisted.
+    let users = s
+        .entries()
+        .iter()
+        .filter(|e| e.kind.as_str() == "message" && e.payload["role"] == json!("user"))
+        .count();
+    assert_eq!(users, 1);
+}

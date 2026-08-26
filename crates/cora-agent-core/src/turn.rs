@@ -47,6 +47,15 @@ pub fn run_turn(
     registry: &ToolRegistry,
     user_input: &str,
 ) -> Result<TurnOutcome, StorageError> {
+    // Precondition enforced, not just documented: a session already mid-turn
+    // (e.g. after ProviderFailed) must be resolved via resume/finish first —
+    // driving two turns concurrently is a host bug.
+    let current = s.state().pc;
+    if current != Pc::Idle {
+        return Err(StorageError::Invalid(format!(
+            "run_turn requires pc Idle, found {current:?} — resolve the session first (resume/finish)"
+        )));
+    }
     // Idle → Planning, persisting the user message in the same commit.
     let seq = s.state().seq;
     s.commit(
@@ -104,5 +113,12 @@ pub fn run_turn(
             }
         }
     }
+    // Durable record of the loop-guard trip: without this commit the budget
+    // exhaustion is invisible to replay (pc just sits in Planning). An entry
+    // append needs no transition — the machine stays parked for the host.
+    s.commit(Commit::new().entry(NewEntry::root(
+        EntryType::new(EntryType::ERROR),
+        json!({ "error": "budget exhausted", "steps": MAX_STEPS }),
+    )))?;
     Ok(TurnOutcome::BudgetExhausted)
 }
