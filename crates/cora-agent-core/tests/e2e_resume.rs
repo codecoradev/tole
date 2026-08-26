@@ -18,9 +18,14 @@
 //! differences between a crashed run and a clean one; the *content* must
 //! be identical. That is the E5 acceptance criterion.
 
+use cora_agent_core::approval::{AllowlistApprover, Decision};
+use cora_agent_core::entry::{EntryType, NewEntry};
+use cora_agent_core::machine::{begin, ReplaySafety};
 use cora_agent_core::mock::MockProvider;
 use cora_agent_core::provider::ProviderOutput;
-use cora_agent_core::storage::{JsonlStorage, Storage};
+use cora_agent_core::state::Pc;
+use cora_agent_core::state::StateTransition;
+use cora_agent_core::storage::{Commit, JsonlStorage, Storage};
 use cora_agent_core::tool::{Risk, Tool, ToolRegistry};
 use cora_agent_core::turn::{resume_turn, run_turn, TurnOutcome};
 use serde_json::{json, Value};
@@ -276,4 +281,72 @@ fn child_main() {
     // Unreachable in the kill scenario; only hit if hang mode is broken.
     eprintln!("child finished without being killed: {out:?}");
     std::process::exit(1);
+}
+
+// ---------------------------------------------------------------------------
+// Regression: Guarded intents must not replay without a fresh approval
+// ---------------------------------------------------------------------------
+
+/// A Write-risk tool that must never silently replay after a crash.
+struct Bomb;
+impl Tool for Bomb {
+    fn name(&self) -> &str {
+        "bomb"
+    }
+    fn risk(&self) -> Risk {
+        Risk::Write
+    }
+    fn execute(&self, _input: Value) -> Result<Value, String> {
+        panic!("bomb fired on replay — double effect");
+    }
+}
+
+#[test]
+fn guarded_intent_replay_requires_fresh_approval() {
+    let dir = tmpdir("guarded");
+    // Wire an approving registry, crash mid-sandwich of a guarded intent
+    // (pending cell set, pc Executing), then reopen WITHOUT the approver
+    // (host restart dropped the interactive gate).
+    let mut s = JsonlStorage::create(&dir, "g", None).unwrap();
+    let seq = s.state().seq;
+    s.commit(
+        Commit::new()
+            .entry(NewEntry::root(
+                EntryType::new(EntryType::MESSAGE),
+                json!({ "role": "user", "text": "do it" }),
+            ))
+            .transition(StateTransition::from(seq, Pc::Planning)),
+    )
+    .unwrap();
+    let seq = s.state().seq;
+    s.commit(Commit::new().transition(StateTransition::from(seq, Pc::ToolCall)))
+        .unwrap();
+    begin(
+        &mut s,
+        "bomb",
+        json!({ "n": 1 }),
+        ReplaySafety::Guarded,
+        None,
+    )
+    .unwrap();
+    assert_eq!(s.state().pc, Pc::Executing);
+    drop(s);
+
+    // Reopen with an APPROVING registry (allowlist includes "bomb") —
+    // resume_turn must still refuse to replay a Guarded intent: fresh
+    // approval for a replay is a host decision, not a replay default.
+    let mut s2 = JsonlStorage::open(dir.join("g.jsonl")).unwrap();
+    let mut reg =
+        ToolRegistry::with_approver(AllowlistApprover::new(vec!["bomb".into()], Decision::Deny));
+    reg.register(Box::new(Bomb)).unwrap();
+    let mut p = MockProvider::scripted(vec![ProviderOutput::Final {
+        text: "never reached".into(),
+    }]);
+    let out = resume_turn(&mut s2, &mut p, &reg);
+    match out.unwrap() {
+        TurnOutcome::ApprovalRequired { name } => assert_eq!(name, "bomb"),
+        other => panic!("expected ApprovalRequired, got {other:?}"),
+    }
+    // The pending cell survives: the host may re-approve and re-resume.
+    assert!(s2.get_register("pending", "op").is_some());
 }

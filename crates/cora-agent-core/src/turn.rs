@@ -124,14 +124,36 @@ pub fn resume_turn(
             intent_id,
             tool,
             input,
-            safety: _,
+            safety,
         } => {
+            // The intent's recorded replay contract decides the guard:
+            // `Guarded` effects require a fresh approval before replay —
+            // may have landed before the effect ever ran, so replaying
+            // blind could double-fire a Write/Destructive tool.
+            if safety == ReplaySafety::Guarded {
+                let Some(t) = registry.get(&tool) else {
+                    append_turn_error(
+                        s,
+                        "unknown tool",
+                        &format!("guarded intent {intent_id} references unregistered tool {tool}"),
+                    )?;
+                    return Ok(TurnOutcome::UnknownTool { name: tool });
+                };
+                if t.risk() != Risk::ReadOnly {
+                    append_turn_error(
+                        s,
+                        "approval required",
+                        &format!("guarded intent {intent_id} needs a fresh approval to replay"),
+                    )?;
+                    return Ok(TurnOutcome::ApprovalRequired { name: tool });
+                }
+            }
             let handle = EffectHandle { intent_id };
             let out = match registry.get(&tool) {
                 Some(t) => t.execute(input),
                 // The tool vanished between runs (host wiring changed).
                 // The intent is durable — settle it as failed rather than
-                // aborting: the loop replans on the error record.
+                // aborting: the loop replans on the tool_result error.
                 None => Err(format!("unknown tool on resume: {tool}")),
             };
             match out {
