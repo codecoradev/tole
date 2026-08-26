@@ -16,7 +16,6 @@ jobs:
     steps:
       - name: Fetch & check CLA signature
         id: check
-        env:
         run: |
           # Fetch signatures.json directly from raw GitHub (public repo).
           # A fetch failure is an infra error — do NOT treat it as "unsigned".
