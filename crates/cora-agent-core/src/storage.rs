@@ -375,6 +375,10 @@ impl JsonlStorage {
             if !buf.ends_with(b"\n") {
                 break; // torn tail
             }
+            // Count the complete physical line NOW — before any `continue`
+            // below — so good_bytes never under-counts (an empty or skipped
+            // line is still bytes that must never be truncated away).
+            good_bytes += buf.len() as u64;
             let line = match std::str::from_utf8(&buf) {
                 Ok(s) => s.trim_end().to_string(),
                 Err(_) => {
@@ -410,7 +414,6 @@ impl JsonlStorage {
                 last_seq = seq;
                 out.apply(&rec, lineno)?;
             }
-            good_bytes += buf.len() as u64;
         }
         // A torn tail was discarded during replay. Physically truncate the
         // partial bytes NOW, before the append handle concatenates a new

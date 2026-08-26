@@ -334,6 +334,39 @@ fn usage_survives_compact_in_same_session() {
 }
 
 #[test]
+fn blank_line_in_middle_never_truncates_valid_data() {
+    // Regression: good_bytes used to skip blank lines (`continue` bypassed
+    // the byte count), so open() "repaired" a healthy file by truncating
+    // the final commits away. A file with a stray blank line must open
+    // clean with ALL committed entries intact.
+    let dir = tmpdir("blank");
+    let mut s = JsonlStorage::create(&dir, "bl", None).unwrap();
+    s.commit(Commit::new().entry(message(json!({"n":1}))))
+        .unwrap();
+    s.commit(Commit::new().entry(message(json!({"n":2}))))
+        .unwrap();
+    drop(s);
+
+    let path = dir.join("bl.jsonl");
+    let raw = std::fs::read_to_string(&path).unwrap();
+    let tampered = raw.replace("\n\n", "\n"); // no-op on healthy files
+    assert_eq!(tampered, raw);
+    // Insert a blank line between header and first entry.
+    let mut lines: Vec<&str> = raw.split('\n').collect();
+    let blank_at = 1;
+    lines.insert(blank_at, "");
+    std::fs::write(&path, lines.join("\n")).unwrap();
+
+    let reopened = JsonlStorage::open(&path).unwrap();
+    assert_eq!(reopened.entries().len(), 2);
+    assert_eq!(reopened.entries()[1].payload["n"], 2);
+    // Reopen again: the file must still hold both entries (no truncation).
+    drop(reopened);
+    let again = JsonlStorage::open(&path).unwrap();
+    assert_eq!(again.entries().len(), 2);
+}
+
+#[test]
 fn seq_is_monotonic_across_mixed_records() {
     let dir = tmpdir("seq");
     let mut s = JsonlStorage::create(&dir, "sq", None).unwrap();
