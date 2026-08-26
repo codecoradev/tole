@@ -16,15 +16,19 @@ jobs:
     steps:
       - name: Fetch & check CLA signature
         id: check
+        env:
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
         run: |
-          # Fetch signatures.json directly from raw GitHub (public repo)
-          # Use wget as primary (handles 200-with-404-body better than curl)
-          wget -q -O signatures.json "https://raw.githubusercontent.com/codecoradev/.github/main/.cla/signatures.json" 2>/dev/null \
-            || curl -sfL "https://raw.githubusercontent.com/codecoradev/.github/main/.cla/signatures.json" -o signatures.json 2>/dev/null \
-            || echo '{"signatures":[]}' > signatures.json
-          # Validate JSON — if invalid, use empty
-          python3 -c "import json; json.load(open('signatures.json'))" 2>/dev/null \
-            || echo '{"signatures":[]}' > signatures.json
+          # Fetch signatures.json directly from raw GitHub (public repo).
+          # A fetch failure is an infra error — do NOT treat it as "unsigned".
+          ok=0
+          wget -q -O signatures.json "https://raw.githubusercontent.com/codecoradev/.github/main/.cla/signatures.json" && ok=1 \
+            || curl -sfL "https://raw.githubusercontent.com/codecoradev/.github/main/.cla/signatures.json" -o signatures.json && ok=1 \
+            || true
+          if [ "$ok" != "1" ]; then
+            echo "::error::Failed to fetch signatures.json (network). Refusing to report a false 'CLA not signed'."
+            exit 1
+          fi
           python3 - << 'EOF'
           import json, os
 
