@@ -47,12 +47,14 @@ jobs:
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
 
       - name: Comment on PR (unsigned only)
+        env:
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
         if: steps.check.outputs.signed != 'true'
         uses: actions/github-script@v7
         with:
           script: |
-            const author = '${{ github.event.pull_request.user.login }}';
-            const prNumber = ${{ github.event.pull_request.number }};
+            const author = process.env.PR_AUTHOR;
+            const prNumber = context.issue.number;
 
             const body = [
                   '## ⚠️ CodeCoraDev CLA Bot',
@@ -117,6 +119,8 @@ jobs:
 
       - name: Fail if not signed
         if: steps.check.outputs.signed != 'true'
+        env:
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
         run: |
-          echo "❌ CLA not signed by ${{ github.event.pull_request.user.login }}"
+          echo "❌ CLA not signed by $PR_AUTHOR"
           exit 1
