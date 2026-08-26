@@ -1,6 +1,7 @@
 //! E3 — Tier A tests: provider abstraction, tool registry, and the full
 //! turn loop on the mock provider (no network, deterministic, fast).
 
+use cora_agent_core::approval::{AllowlistApprover, Decision};
 use cora_agent_core::entry::Entry;
 use cora_agent_core::mock::MockProvider;
 use cora_agent_core::provider::{Provider, ProviderError, ProviderOutput};
@@ -199,14 +200,18 @@ fn turn_write_tool_requires_approval_gate() {
         input: json!({"path": "x"}),
     }]);
     let mut reg = ToolRegistry::new();
-    reg.register(Box::new(WriteTool)).unwrap();
+    // E4: no approver wired in — registration of a Write tool is refused
+    // at the registry level (earlier and stricter than the old E3 behavior,
+    // which registered everything and aborted per-call).
+    let err = reg.register(Box::new(WriteTool)).unwrap_err();
+    assert!(err.contains("approval gate"));
 
     let out = run_turn(&mut s, &mut p, &reg, "hi").unwrap();
     match out {
-        TurnOutcome::ApprovalRequired { name } => assert_eq!(name, "write_file"),
-        other => panic!("expected ApprovalRequired, got {other:?}"),
+        TurnOutcome::UnknownTool { name } => assert_eq!(name, "write_file"),
+        other => panic!("expected UnknownTool, got {other:?}"),
     }
-    // No sandwich was started: no intent entry, pc stayed in Planning.
+    // The refusal is durable: an ERROR entry attached to the user message.
     assert!(!s.entries().iter().any(|e| e.kind.as_str() == "intent"));
     assert_eq!(s.state().pc, cora_agent_core::state::Pc::Planning);
 }
@@ -353,7 +358,15 @@ fn all_abort_paths_leave_durable_error_records() {
             input: json!({}),
         }]);
         let mut reg = ToolRegistry::new();
-        reg.register(Box::new(WriteTool)).unwrap();
+        // Write tools need an approver (E4); only the approval path
+        // registers one here via with_approver.
+        if name == "approval" {
+            reg = ToolRegistry::with_approver(AllowlistApprover::new(
+                vec!["write_file".into()],
+                Decision::Deny,
+            ));
+            reg.register(Box::new(WriteTool)).unwrap();
+        }
 
         let _ = run_turn(&mut s, &mut p, &reg, "hi").unwrap();
         // Durable ERROR entry exists, attached to the user message.
