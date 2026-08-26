@@ -116,9 +116,20 @@ pub fn run_turn(
     // Durable record of the loop-guard trip: without this commit the budget
     // exhaustion is invisible to replay (pc just sits in Planning). An entry
     // append needs no transition — the machine stays parked for the host.
-    s.commit(Commit::new().entry(NewEntry::root(
-        EntryType::new(EntryType::ERROR),
-        json!({ "error": "budget exhausted", "steps": MAX_STEPS }),
-    )))?;
+    // Attached to the turn's user message: the chain stays connected and
+    // replay can attribute the trip to the originating turn.
+    let parent = s
+        .entries()
+        .iter()
+        .rev()
+        .find(|e| e.kind.as_str() == "message" && e.payload["role"] == json!("user"))
+        .map(|e| e.id.clone());
+    s.commit(Commit::new().entry(NewEntry {
+        id: None,
+        parent_id: parent,
+        kind: EntryType::new(EntryType::ERROR),
+        payload: json!({ "error": "budget exhausted", "steps": MAX_STEPS }),
+        timestamp: 0,
+    }))?;
     Ok(TurnOutcome::BudgetExhausted)
 }
