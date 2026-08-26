@@ -568,7 +568,7 @@ fn sync_dir(path: &Path) -> std::io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
     let parent = path
         .parent()
-        .filter(|p| p.as_os_str().as_bytes().len() > 0)
+        .filter(|p| !p.as_os_str().as_bytes().is_empty())
         .unwrap_or_else(|| Path::new("."));
     File::open(parent)?.sync_all()
 }
