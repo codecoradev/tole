@@ -212,10 +212,10 @@ fn drive(
                     return Ok(TurnOutcome::UnknownTool { name: tool });
                 };
                 if t.risk() != Risk::ReadOnly {
-                    // Approval gate (E4): the registry's approver decides.
-                    // `Deny` (or no approver reachable here) aborts the turn
-                    // with a durable record — never a silent park in Planning.
-                    match registry.decide(&tool) {
+                    // Approval gate (E4/E6): the wired approver decides per
+                    // call. `Deny` (or no approver reachable here) aborts the
+                    // turn with a durable record — never a silent park.
+                    match registry.decide(&tool, &input) {
                         Some(Verdict::Allow) => { /* fall through to execute */ }
                         _ => {
                             append_turn_error(s, "approval required", &tool)?;

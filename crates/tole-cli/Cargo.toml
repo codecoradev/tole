@@ -15,3 +15,5 @@ tole-core = { path = "../tole-core" }
 tokio = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
+clap = { workspace = true }
+libc = "0.2"
