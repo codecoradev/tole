@@ -66,12 +66,14 @@ jobs:
             local stdout_result exit_code
             set +e
             stdout_result=$(gh api graphql \
-              -f query="
-                mutation {
-                  addProjectV2ItemById(input: {projectId: \"$PROJECT_NODE_ID\", contentId: \"$node_id\"}) {
+              -f query='
+                mutation($projectId: ID!, $contentId: ID!) {
+                  addProjectV2ItemById(input: {projectId: $projectId, contentId: $contentId}) {
                     item { id }
                   }
-                }" 2>"$err_file")
+                }' \
+              -f projectId="$PROJECT_NODE_ID" \
+              -f contentId="$node_id" 2>"$err_file")
             exit_code=$?
             set -e
             local stderr_result
@@ -102,9 +104,9 @@ jobs:
           get_item_id() {
             local content_node_id="$1"
             gh api graphql \
-              -f query="
-                query {
-                  node(id: \"$PROJECT_NODE_ID\") {
+              -f query='
+                query($projectId: ID!) {
+                  node(id: $projectId) {
                     ... on ProjectV2 {
                       items(first: 100) {
                         nodes {
@@ -117,7 +119,8 @@ jobs:
                       }
                     }
                   }
-                }" 2>/dev/null \
+                }' \
+              -f projectId="$PROJECT_NODE_ID" 2>/dev/null \
               | python3 -c "
                   import sys, json
                   data = json.load(sys.stdin)
@@ -137,17 +140,21 @@ jobs:
             local item_id="$1"
             echo "Setting item $item_id → Done"
             gh api graphql \
-              -f query="
-                mutation {
+              -f query='
+                mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
                   updateProjectV2ItemFieldValue(input: {
-                    projectId: \"$PROJECT_NODE_ID\",
-                    itemId: \"$item_id\",
-                    fieldId: \"$STATUS_FIELD_ID\",
-                    value: { singleSelectOptionId: \"$DONE_OPTION_ID\" }
+                    projectId: $projectId,
+                    itemId: $itemId,
+                    fieldId: $fieldId,
+                    value: { singleSelectOptionId: $optionId }
                   }) {
                     projectV2Item { id }
                   }
-                }" 2>&1
+                }' \
+              -f projectId="$PROJECT_NODE_ID" \
+              -f itemId="$item_id" \
+              -f fieldId="$STATUS_FIELD_ID" \
+              -f optionId="$DONE_OPTION_ID" 2>&1
           }
 
           # ==================================================================
@@ -163,16 +170,17 @@ jobs:
               #
               # Step 1: query the PR for "closingIssuesReferences".
               LINKED=$(gh api graphql \
-                -f query="
-                  query {
-                    node(id: \"$PR_NODE_ID\") {
+                -f query='
+                  query($id: ID!) {
+                    node(id: $id) {
                       ... on PullRequest {
                         closingIssuesReferences(first: 20) {
                           nodes { id number }
                         }
                       }
                     }
-                  }" 2>/dev/null \
+                  }' \
+                -f id="$PR_NODE_ID" 2>/dev/null \
                 | python3 -c "
                     import sys, json
                     data = json.load(sys.stdin)
