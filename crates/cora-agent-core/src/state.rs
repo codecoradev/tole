@@ -68,3 +68,22 @@ impl StateTransition {
         }
     }
 }
+
+/// Returns `true` when `from -> to` is a legal step of the operation loop
+/// (architecture §5 state diagram).
+pub fn can_transition(from: Pc, to: Pc) -> bool {
+    use Pc::*;
+    matches!(
+        (from, to),
+        (Idle, Planning)
+            | (Planning, ToolCall)
+            | (Planning, Final)
+            | (ToolCall, AwaitingApproval)
+            | (ToolCall, Executing)
+            | (AwaitingApproval, Executing)
+            | (AwaitingApproval, Planning)
+            | (Executing, Settling)
+            | (Executing, Planning)
+            | (Settling, Planning)
+    )
+}

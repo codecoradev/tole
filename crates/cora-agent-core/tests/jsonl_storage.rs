@@ -36,6 +36,10 @@ fn roundtrip_full_session_through_trait() {
     let root_id = root[0].id.clone();
 
     let observed = s.state().seq;
+    // Legal path per the §5 diagram: Idle → Planning → ToolCall.
+    // One transition per commit (atomic), so two commits.
+    s.commit(Commit::new().transition(StateTransition::from(observed, Pc::Planning)))
+        .unwrap();
     s.commit(
         Commit::new()
             .entry(NewEntry::with_parent(
@@ -48,7 +52,7 @@ fn roundtrip_full_session_through_trait() {
                 "op_1",
                 json!({"tool":"read_file"}),
             ))
-            .transition(StateTransition::from(observed, Pc::ToolCall)),
+            .transition(StateTransition::from(s.state().seq, Pc::ToolCall)),
     )
     .unwrap();
     s.commit(

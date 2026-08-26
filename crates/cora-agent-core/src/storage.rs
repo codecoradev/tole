@@ -54,6 +54,15 @@ pub enum StorageError {
         /// The `seq` the machine actually holds.
         actual: u64,
     },
+    /// A commit attempted a program-counter step outside the legal transition
+    /// table (architecture §5).
+    #[error("illegal pc transition: {from:?} -> {to:?} is not a legal step")]
+    IllegalTransition {
+        /// The program counter the machine holds.
+        from: Pc,
+        /// The program counter the commit tried to move to.
+        to: Pc,
+    },
     /// Caller error: bad namespace, unknown parent entry, duplicate id, etc.
     #[error("invalid commit: {0}")]
     Invalid(String),
@@ -229,7 +238,16 @@ enum Record {
         cost_usd: Option<f64>,
     },
     #[serde(rename = "state")]
-    State { seq: u64, pc: Pc },
+    State {
+        seq: u64,
+        pc: Pc,
+        /// `true` only for the materialized state record written by
+        /// `compact()` — it summarizes "the machine is at `pc`" and is
+        /// exempt from transition-legality replay checks. Live commits
+        /// always write `snapshot: false`.
+        #[serde(default)]
+        snapshot: bool,
+    },
 }
 
 impl Record {
@@ -491,7 +509,18 @@ impl JsonlStorage {
                 });
                 Ok(())
             }
-            Record::State { seq, pc } => {
+            Record::State { seq, pc, snapshot } => {
+                // Replay enforces the same legality table as live commits.
+                // A file whose recorded steps walk outside the table is
+                // corrupt (hand-edited or written by a broken build).
+                // Compaction snapshots are exempt: they summarize the
+                // final position, they are not steps.
+                if !*snapshot && !crate::state::can_transition(self.state.pc, *pc) {
+                    return Err(StorageError::IllegalTransition {
+                        from: self.state.pc,
+                        to: *pc,
+                    });
+                }
                 self.state = MachineState { pc: *pc, seq: *seq };
                 Ok(())
             }
@@ -547,6 +576,7 @@ impl JsonlStorage {
             records.push(Record::State {
                 seq: next,
                 pc: t.new_pc,
+                snapshot: false,
             });
         }
         if let Some(u) = &c.usage {
@@ -685,6 +715,12 @@ impl Storage for JsonlStorage {
                     actual: self.state.seq,
                 });
             }
+            if !crate::state::can_transition(self.state.pc, t.new_pc) {
+                return Err(StorageError::IllegalTransition {
+                    from: self.state.pc,
+                    to: t.new_pc,
+                });
+            }
         }
 
         // Materialize entries (assign seq + auto ids) while validating.
@@ -805,6 +841,7 @@ impl Storage for JsonlStorage {
         records.push(Record::State {
             seq,
             pc: self.state.pc,
+            snapshot: true,
         });
 
         // Write to temp file, fsync, then atomic rename over the live path,
