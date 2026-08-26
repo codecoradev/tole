@@ -173,11 +173,20 @@ fn torn_final_line_is_discarded_whole() {
     truncated.truncate(cut);
     std::fs::write(&path, truncated).unwrap();
 
-    let reopened = JsonlStorage::open(&path).unwrap();
+    let mut reopened = JsonlStorage::open(&path).unwrap();
     // Header replayed; the torn entry line was discarded whole.
     assert_eq!(reopened.session_id(), "t");
     assert_eq!(reopened.entries().len(), 0);
     assert_eq!(reopened.last_seq(), 0);
+    // Torn bytes were physically truncated: a fresh commit must NOT
+    // concatenate onto the fragment (regression for the CodeCora finding).
+    reopened
+        .commit(Commit::new().entry(message(json!({"after":1}))))
+        .unwrap();
+    drop(reopened);
+    let again = JsonlStorage::open(&path).unwrap();
+    assert_eq!(again.entries().len(), 1);
+    assert_eq!(again.entries()[0].payload["after"], 1);
 }
 
 #[test]

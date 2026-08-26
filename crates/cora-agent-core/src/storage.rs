@@ -355,10 +355,12 @@ impl JsonlStorage {
 
         // Body lines: solo object or array (one transaction per line).
         // Manual read loop so a torn FINAL line (crash mid-append) can be
-        // detected by probing for EOF and discarded whole; corruption in a
-        // non-final line is a hard error.
+        // detected and discarded whole; corruption in a non-final line is a
+        // hard error. `good_bytes` tracks the end of the last complete line
+        // so a torn tail can be physically truncated before appending.
         let mut lineno = 1usize;
         let mut last_seq = 0u64;
+        let mut good_bytes = line.len() as u64;
         let mut buf: Vec<u8> = Vec::new();
         loop {
             buf.clear();
@@ -367,12 +369,15 @@ impl JsonlStorage {
                 break; // clean EOF
             }
             lineno += 1;
+            // No trailing newline = the write was torn (every committed
+            // line is written with \n). Discard whole, leave bytes out of
+            // good_bytes so they get truncated below.
+            if !buf.ends_with(b"\n") {
+                break; // torn tail
+            }
             let line = match std::str::from_utf8(&buf) {
                 Ok(s) => s.trim_end().to_string(),
                 Err(_) => {
-                    if is_at_eof(&mut reader) {
-                        break; // torn tail: discard whole
-                    }
                     return Err(StorageError::Corrupt(format!(
                         "line {lineno}: invalid UTF-8"
                     )));
@@ -405,6 +410,14 @@ impl JsonlStorage {
                 last_seq = seq;
                 out.apply(&rec, lineno)?;
             }
+            good_bytes += buf.len() as u64;
+        }
+        // A torn tail was discarded during replay. Physically truncate the
+        // partial bytes NOW, before the append handle concatenates a new
+        // commit line onto the fragment (would corrupt the file forever).
+        if good_bytes < file_len(&out.path)? {
+            truncate_file(&out.path, good_bytes)?;
+            sync_dir(&out.path)?;
         }
         // The global seq advances with every record, transition or not.
         out.state.seq = out.state.seq.max(last_seq);
@@ -561,6 +574,19 @@ impl JsonlStorage {
 fn is_at_eof(reader: &mut BufReader<File>) -> bool {
     let mut probe = [0u8; 1];
     matches!(reader.read(&mut probe), Ok(0))
+}
+
+/// File length in bytes (used to detect a discarded torn tail on open).
+fn file_len(path: &Path) -> std::io::Result<u64> {
+    Ok(std::fs::metadata(path)?.len())
+}
+
+/// Truncates the file to `len` bytes and fsyncs it.
+fn truncate_file(path: &Path, len: u64) -> std::io::Result<()> {
+    let f = OpenOptions::new().write(true).truncate(false).open(path)?;
+    f.set_len(len)?;
+    f.sync_data()?;
+    Ok(())
 }
 
 /// Durability: flush a rename into the parent directory so the directory
