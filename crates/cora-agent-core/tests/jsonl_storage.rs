@@ -298,6 +298,33 @@ fn duplicate_entry_id_rejected() {
 }
 
 #[test]
+fn usage_survives_compact_in_same_session() {
+    // Regression: commit() wrote usage rows to the file but never pushed
+    // them to the in-memory list, so compact() (which rewrites from that
+    // list) silently dropped usage rows committed since open.
+    let dir = tmpdir("usage-compact");
+    let mut s = JsonlStorage::create(&dir, "uc", None).unwrap();
+    let e = s.commit(Commit::new().entry(message(json!({})))).unwrap();
+    s.commit(Commit::new().usage(UsageRecord {
+        id: String::new(),
+        entry_id: e[0].id.clone(),
+        usage: json!({"input_tokens": 7}),
+        cost_usd: Some(0.002),
+    }))
+    .unwrap();
+    // Visible in-memory before compact...
+    assert_eq!(s.usages().len(), 1);
+    s.compact().unwrap();
+    // ...and still present in the rewritten file.
+    assert_eq!(s.usages().len(), 1);
+    drop(s);
+    let reopened = JsonlStorage::open(dir.join("uc.jsonl")).unwrap();
+    assert_eq!(reopened.usages().len(), 1);
+    assert_eq!(reopened.usages()[0].usage["input_tokens"], 7);
+    assert_eq!(reopened.usages()[0].cost_usd, Some(0.002));
+}
+
+#[test]
 fn seq_is_monotonic_across_mixed_records() {
     let dir = tmpdir("seq");
     let mut s = JsonlStorage::create(&dir, "sq", None).unwrap();

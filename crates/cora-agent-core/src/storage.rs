@@ -159,6 +159,9 @@ pub trait Storage {
     /// Enumerates live cells in a namespace.
     fn list_register(&self, namespace: &str) -> Vec<(&str, &Value)>;
 
+    /// All usage rows in seq order (committed this session + replayed).
+    fn usages(&self) -> &[UsageRecord];
+
     /// Applies one atomic commit; returns the committed entries.
     ///
     /// Rejects stale CAS tokens (`StaleTransition`) instead of silently
@@ -626,6 +629,10 @@ impl Storage for JsonlStorage {
             .collect()
     }
 
+    fn usages(&self) -> &[UsageRecord] {
+        &self.usage
+    }
+
     fn commit(&mut self, c: Commit) -> Result<Vec<Entry>, StorageError> {
         // Validate before writing any byte.
         for w in &c.registers {
@@ -696,6 +703,19 @@ impl Storage for JsonlStorage {
                 self.children.entry(p.clone()).or_default().push(idx);
             }
             self.by_id.insert(e.id.clone(), idx);
+        }
+        if let Some(u) = &c.usage {
+            let id = if u.id.is_empty() {
+                format!("u_{final_seq}")
+            } else {
+                u.id.clone()
+            };
+            self.usage.push(UsageRecord {
+                id,
+                entry_id: u.entry_id.clone(),
+                usage: u.usage.clone(),
+                cost_usd: u.cost_usd,
+            });
         }
         for w in &c.registers {
             let cell = (w.namespace.clone(), w.key.clone());
