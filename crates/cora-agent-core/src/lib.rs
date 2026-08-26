@@ -14,6 +14,7 @@
 
 pub mod approval;
 pub mod entry;
+pub mod machine;
 pub mod register;
 pub mod state;
 pub mod storage;
