@@ -480,11 +480,14 @@ impl JsonlStorage {
     }
 
     /// Durably appends one physical line.
+    ///
+    /// The line is flushed and fsynced so a crash never loses a *committed*
+    /// record. (A crash mid-line leaves a torn tail, which open() discards
+    /// whole — see the torn-tail test.)
     fn append_line(&mut self, line: &str) -> Result<(), StorageError> {
         writeln!(self.writer, "{line}")?;
         self.writer.flush()?;
-        // NOTE: fsync of the parent dir is a platform-specific nicety; flush
-        // to the OS plus append-mode atomicity is sufficient for v0.
+        self.writer.get_ref().sync_data()?;
         Ok(())
     }
 
@@ -555,6 +558,24 @@ impl JsonlStorage {
 fn is_at_eof(reader: &mut BufReader<File>) -> bool {
     let mut probe = [0u8; 1];
     matches!(reader.read(&mut probe), Ok(0))
+}
+
+/// Durability: flush a rename into the parent directory so the directory
+/// entry itself survives a crash. POSIX-only; on non-Unix targets opening
+/// the directory is not possible and we accept the platform's guarantees.
+#[cfg(unix)]
+fn sync_dir(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let parent = path
+        .parent()
+        .filter(|p| p.as_os_str().as_bytes().len() > 0)
+        .unwrap_or_else(|| Path::new("."));
+    File::open(parent)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_path: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 fn now_ms() -> u64 {
@@ -737,7 +758,8 @@ impl Storage for JsonlStorage {
             pc: self.state.pc,
         });
 
-        // Write to temp file, then atomic rename over the live path.
+        // Write to temp file, fsync, then atomic rename over the live path,
+        // then fsync the directory so the rename itself survives a crash.
         let tmp = self.path.with_extension("jsonl.tmp");
         {
             let mut w = BufWriter::new(File::create(&tmp)?);
@@ -754,8 +776,10 @@ impl Storage for JsonlStorage {
                 writeln!(w, "{}", serde_json::to_string(r)?)?;
             }
             w.flush()?;
+            w.get_ref().sync_data()?;
         }
         std::fs::rename(&tmp, &self.path)?;
+        sync_dir(&self.path)?;
         // Reopen the writer on the new file.
         self.writer = BufWriter::new(OpenOptions::new().append(true).open(&self.path)?);
         self.state.seq = seq;
