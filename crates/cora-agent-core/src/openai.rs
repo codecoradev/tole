@@ -77,6 +77,9 @@ impl OpenAiConfig {
 pub struct OpenAiProvider {
     cfg: OpenAiConfig,
     timeout: Duration,
+    /// Optional system prompt prepended to the wire transcript. Explicit
+    /// opt-in: absent by default, never invented by the provider itself.
+    system_prompt: Option<String>,
 }
 
 impl OpenAiProvider {
@@ -84,12 +87,19 @@ impl OpenAiProvider {
         Self {
             cfg,
             timeout: Duration::from_secs(120),
+            system_prompt: None,
         }
     }
 
     /// Override the default 120s timeout.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    /// Set a system prompt (prepended as the first message).
+    pub fn with_system_prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.system_prompt = Some(prompt.into());
         self
     }
 
@@ -108,19 +118,24 @@ impl OpenAiProvider {
     /// recognized role) are sent. Tool calls, errors, and state records
     /// stay in the durable log but are not part of the wire transcript.
     fn request_body(&self, transcript: &[Entry]) -> Value {
-        let messages: Vec<Value> = transcript
-            .iter()
-            .filter(|e| e.kind.as_str() == "message")
-            .filter_map(|e| {
-                let role = e.payload.get("role")?.as_str()?;
-                // Only roles the chat-completions API accepts.
-                if !matches!(role, "user" | "assistant" | "system") {
-                    return None;
-                }
-                let text = e.payload.get("text").and_then(|t| t.as_str())?;
-                Some(json!({ "role": role, "content": text }))
-            })
-            .collect();
+        let mut messages: Vec<Value> = Vec::new();
+        if let Some(sys) = &self.system_prompt {
+            messages.push(json!({ "role": "system", "content": sys }));
+        }
+        messages.extend(
+            transcript
+                .iter()
+                .filter(|e| e.kind.as_str() == "message")
+                .filter_map(|e| {
+                    let role = e.payload.get("role")?.as_str()?;
+                    // Only roles the chat-completions API accepts.
+                    if !matches!(role, "user" | "assistant" | "system") {
+                        return None;
+                    }
+                    let text = e.payload.get("text").and_then(|t| t.as_str())?;
+                    Some(json!({ "role": role, "content": text }))
+                }),
+        );
         json!({
             "model": self.cfg.model,
             "messages": messages,
@@ -259,5 +274,43 @@ mod transcript_tests {
             Some(0),
             "non-message kinds and unknown roles must be filtered out"
         );
+    }
+}
+
+#[cfg(test)]
+mod system_prompt_tests {
+    use super::*;
+    use crate::entry::{Entry, EntryType};
+    use serde_json::json;
+
+    fn msg(role: &str, text: &str) -> Entry {
+        Entry {
+            id: "e".into(),
+            parent_id: None,
+            seq: 0,
+            kind: EntryType::new(EntryType::MESSAGE),
+            payload: json!({ "role": role, "text": text }),
+            timestamp: 0,
+        }
+    }
+
+    #[test]
+    fn system_prompt_prepended_when_set() {
+        let p = OpenAiProvider::new(OpenAiConfig::new("https://x/v1", "m", "k"))
+            .with_system_prompt("you are cora");
+        let body = p.request_body(&[msg("user", "hi")]);
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0]["role"], json!("system"));
+        assert_eq!(msgs[0]["content"], json!("you are cora"));
+    }
+
+    #[test]
+    fn no_system_message_when_unset() {
+        let p = OpenAiProvider::new(OpenAiConfig::new("https://x/v1", "m", "k"));
+        let body = p.request_body(&[msg("user", "hi")]);
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["role"], json!("user"));
     }
 }

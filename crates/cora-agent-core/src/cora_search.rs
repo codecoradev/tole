@@ -17,9 +17,12 @@ use std::time::{Duration, Instant};
 /// synchronous — a hung `cora brain` would freeze the whole agent.
 pub const SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Runs `cmd`, killing it after `timeout`. Stdout/stderr are captured by
-/// the child itself (pipet) so a hung child can't wedge the read either.
+/// Runs `cmd`, killing it after `timeout`. Stdout/stderr are drained on
+/// dedicated reader threads: a child writing more than the OS pipe buffer
+/// (~64KB) would otherwise block on write while we only poll its status,
+/// and we'd time out on a perfectly valid run.
 fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> Result<Output, String> {
+    use std::io::Read;
     use std::process::Stdio;
     cmd.stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -27,26 +30,46 @@ fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> Result<Output, Stri
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("failed to spawn `cora` (is it on PATH?): {e}"))?;
+    let mut stdout_pipe = child.stdout.take().expect("stdout piped above");
+    let mut stderr_pipe = child.stderr.take().expect("stderr piped above");
+    let mut t_out = Some(std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut buf);
+        buf
+    }));
+    let mut t_err = Some(std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buf);
+        buf
+    }));
     let start = Instant::now();
-    // Poll until exit or deadline; the pipes are drained afterwards by
-    // wait_with_output (child already exited → cannot block).
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(status)) => break status,
             Ok(None) => {
                 if start.elapsed() > timeout {
                     let _ = child.kill();
                     let _ = child.wait();
+                    let _ = t_out.take().map(std::thread::JoinHandle::join);
+                    let _ = t_err.take().map(std::thread::JoinHandle::join);
                     return Err(format!("cora brain timed out after {}s", timeout.as_secs()));
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
-            Err(e) => return Err(format!("wait failed: {e}")),
+            Err(e) => {
+                let _ = t_out.take().map(std::thread::JoinHandle::join);
+                let _ = t_err.take().map(std::thread::JoinHandle::join);
+                return Err(format!("wait failed: {e}"));
+            }
         }
-    }
-    child
-        .wait_with_output()
-        .map_err(|e| format!("failed to collect output: {e}"))
+    };
+    let stdout = t_out.take().and_then(|t| t.join().ok()).unwrap_or_default();
+    let stderr = t_err.take().and_then(|t| t.join().ok()).unwrap_or_default();
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 /// ReadOnly search over the current project's symbol index.
