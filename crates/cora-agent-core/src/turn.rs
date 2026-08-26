@@ -72,6 +72,9 @@ pub fn run_turn(
         let next = match p.complete(&transcript) {
             Ok(o) => o,
             Err(ProviderError(msg)) => {
+                // Durable record, same contract as BudgetExhausted: the
+                // failure must be visible to replay, not just the caller.
+                append_turn_error(s, "provider failed", &msg)?;
                 return Ok(TurnOutcome::ProviderFailed { message: msg });
             }
         };
@@ -113,11 +116,14 @@ pub fn run_turn(
             }
         }
     }
-    // Durable record of the loop-guard trip: without this commit the budget
-    // exhaustion is invisible to replay (pc just sits in Planning). An entry
-    // append needs no transition — the machine stays parked for the host.
-    // Attached to the turn's user message: the chain stays connected and
-    // replay can attribute the trip to the originating turn.
+    append_turn_error(s, "budget exhausted", &format!("{MAX_STEPS} steps"))?;
+    Ok(TurnOutcome::BudgetExhausted)
+}
+
+/// Appends a durable ERROR entry under the turn's user message. No
+/// transition: the machine stays parked in Planning for the host to
+/// resolve (resume/finish) — the record exists so replay can see why.
+fn append_turn_error(s: &mut dyn Storage, error: &str, detail: &str) -> Result<(), StorageError> {
     let parent = s
         .entries()
         .iter()
@@ -128,8 +134,8 @@ pub fn run_turn(
         id: None,
         parent_id: parent,
         kind: EntryType::new(EntryType::ERROR),
-        payload: json!({ "error": "budget exhausted", "steps": MAX_STEPS }),
+        payload: json!({ "error": error, "detail": detail }),
         timestamp: 0,
     }))?;
-    Ok(TurnOutcome::BudgetExhausted)
+    Ok(())
 }
