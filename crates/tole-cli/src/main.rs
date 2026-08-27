@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use crate::approver::InteractiveApprover;
 use crate::tools::WriteFileTool;
 use tole_core::cora_search::CoraSearchTool;
+use tole_core::file_tools::{DeleteFileTool, EditFileTool};
 use tole_core::gh::GhTool;
 use tole_core::openai::{OpenAiConfig, OpenAiProvider};
 use tole_core::read_file::ReadFileTool;
@@ -139,10 +140,16 @@ fn build_registry(approver: InteractiveApprover<approver::StdioPrompt>) -> Resul
     reg.register(Box::new(ReadFileTool::new(cwd.clone())))
         .map_err(|e| anyhow::anyhow!("registering read_file: {e}"))?;
     // Write tools: gated per call. The jail root is the cwd.
-    reg.register(Box::new(WriteFileTool::new(cwd)))
+    reg.register(Box::new(WriteFileTool::new(cwd.clone())))
         .map_err(|e| anyhow::anyhow!("registering write_file: {e}"))?;
+    reg.register(Box::new(EditFileTool::new(cwd.clone())))
+        .map_err(|e| anyhow::anyhow!("registering edit_file: {e}"))?;
     reg.register(Box::new(GhTool::new("codecoradev/tole")))
         .map_err(|e| anyhow::anyhow!("registering gh: {e}"))?;
+    // Destructive tools: interactive-approver-only registration; every
+    // call prompts — allowlists and --yes never apply (PRD risk table).
+    reg.register(Box::new(DeleteFileTool::new(cwd)))
+        .map_err(|e| anyhow::anyhow!("registering delete_file: {e}"))?;
     Ok(reg)
 }
 
