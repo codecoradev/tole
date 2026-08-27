@@ -243,12 +243,13 @@ impl OpenAiProvider {
             let input: Value = match serde_json::from_str(&args) {
                 Ok(v) => v,
                 Err(err) => {
-                    // Malformed arguments from the model: surface the parse
-                    // error as the tool result instead of silently running
-                    // the tool with `{}` — the model can retry with valid JSON.
-                    return Ok(ProviderOutput::ToolCall {
+                    // Malformed arguments: the tool must NOT run. Surface the
+                    // parse error so the loop settles it as an error result
+                    // and the model can retry with well-formed JSON.
+                    return Ok(ProviderOutput::InvalidToolArgs {
                         tool: name.to_string(),
-                        input: json!({ "__arguments_parse_error": err.to_string(), "raw": args }),
+                        raw: args,
+                        reason: err.to_string(),
                     });
                 }
             };

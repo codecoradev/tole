@@ -24,6 +24,17 @@ pub enum ProviderOutput {
         /// Tool input as declared by the tool's spec.
         input: serde_json::Value,
     },
+    /// The model requested a tool but its `arguments` were not valid JSON.
+    /// The tool is **not** executed; the model receives the parse error as
+    /// the settlement and may retry with well-formed arguments.
+    InvalidToolArgs {
+        /// Registry name of the tool the model tried to call.
+        tool: String,
+        /// The raw `arguments` string exactly as received from the provider.
+        raw: String,
+        /// Human-readable serde error.
+        reason: String,
+    },
 }
 
 /// Failures from a provider call (transport, auth, malformed reply...).
