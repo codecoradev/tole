@@ -86,6 +86,24 @@ enum Command {
         /// Session id to inspect.
         id: String,
     },
+    /// Interactive multi-turn chat on one durable session (B1).
+    Chat {
+        /// Resume an existing session by id instead of starting new.
+        #[arg(long)]
+        resume: Option<String>,
+
+        /// Resume the most recently modified session in the sessions dir.
+        #[arg(long, conflicts_with = "resume")]
+        last: bool,
+
+        /// Same semantics as `run --allow`.
+        #[arg(long = "allow")]
+        allow_patterns: Vec<String>,
+
+        /// Same semantics as `run --yes`.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 fn main() {
@@ -114,6 +132,12 @@ fn dispatch(cli: Cli) -> Result<()> {
             yes,
         } => resume_command(&sessions_dir, &id, &allow_patterns, yes),
         Command::Status { id } => status_command(&sessions_dir, &id),
+        Command::Chat {
+            resume,
+            last,
+            allow_patterns,
+            yes,
+        } => chat_command(&sessions_dir, resume, last, &allow_patterns, yes),
     }
 }
 
@@ -224,6 +248,185 @@ fn status_command(sessions_dir: &Path, id: &str) -> Result<()> {
     println!("entries: {}", storage.entries().len());
     println!("pc:      {:?}", storage.state().pc);
     println!("seq:     {}", storage.state().seq);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Chat (B1)
+// ---------------------------------------------------------------------------
+
+/// Most recently modified session id in `dir` (None when empty).
+fn latest_session_id(dir: &Path) -> Option<String> {
+    let mut best: Option<(std::time::SystemTime, String)> = None;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.ends_with(".jsonl") || !valid_session_id(name.trim_end_matches(".jsonl")) {
+            continue;
+        }
+        let mtime = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        if best.as_ref().is_none_or(|(t, _)| mtime > *t) {
+            best = Some((mtime, name.trim_end_matches(".jsonl").to_string()));
+        }
+    }
+    best.map(|(_, id)| id)
+}
+
+/// The B1 REPL: one durable session, many turns. Every user line becomes a
+/// turn; mid-flight states (denial, provider failure) are resolved by
+/// `resume_turn` on the next line, keeping the conversation alive without
+/// losing durable context. Ctrl-C / EOF exit cleanly — every commit is
+/// already durable, `tole chat --resume <id>` picks the thread back up.
+fn chat_command(
+    sessions_dir: &Path,
+    resume: Option<String>,
+    last: bool,
+    allow_patterns: &[String],
+    yes: bool,
+) -> Result<()> {
+    use std::io::{BufRead, Write};
+
+    let cfg = OpenAiConfig::from_env().context(
+        "missing provider config: set TOLE_BASE_URL / TOLE_MODEL / TOLE_API_KEY \
+         (or the OPENAI_* equivalents)",
+    )?;
+
+    // Resolve the session: explicit id, --last, or fresh.
+    let (session_id, fresh) = if let Some(id) = resume {
+        if !valid_session_id(&id) {
+            anyhow::bail!("invalid session id {id:?} (allowed: [a-z0-9-], max 64)");
+        }
+        let path = session_path(sessions_dir, &id);
+        if !path.exists() {
+            anyhow::bail!("session {id} not found at {}", path.display());
+        }
+        (id, false)
+    } else if last {
+        let Some(id) = latest_session_id(sessions_dir) else {
+            anyhow::bail!("no sessions found in {}", sessions_dir.display());
+        };
+        (id, false)
+    } else {
+        (new_session_id(), true)
+    };
+
+    if fresh {
+        std::fs::create_dir_all(sessions_dir)
+            .with_context(|| format!("creating {}", sessions_dir.display()))?;
+    }
+    let path = session_path(sessions_dir, &session_id);
+    let mut storage = if fresh {
+        JsonlStorage::create(sessions_dir, &session_id, None)
+            .with_context(|| format!("creating session {session_id}"))?
+    } else {
+        JsonlStorage::open(&path).context("replaying session log")?
+    };
+    println!(
+        "tole chat — session {session_id} (Ctrl-D exits, resume: tole chat --resume {session_id})"
+    );
+
+    let registry = build_registry(build_approver(allow_patterns, yes))?;
+    let mut provider = OpenAiProvider::new(cfg).with_tool_specs(registry.specs());
+
+    let stdin = std::io::stdin();
+    loop {
+        print!("you> ");
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        match stdin.lock().read_line(&mut line) {
+            Ok(0) => {
+                println!();
+                break; // EOF: clean exit, session stays durable
+            }
+            Ok(_) => {}
+            Err(e) => anyhow::bail!("reading stdin: {e}"),
+        }
+        let text = line.trim();
+        // Bound auto-resolve attempts per message so a wedged session
+        // can't spin forever (each retry is a full provider round-trip).
+        let mut retries_left: u8 = 2;
+        match text {
+            "" => continue,
+            "/exit" | "/quit" => break,
+            "/status" => {
+                println!(
+                    "pc: {:?}  seq: {}  entries: {}",
+                    storage.state().pc,
+                    storage.state().seq,
+                    storage.entries().len()
+                );
+                continue;
+            }
+            _ => {}
+        }
+
+        // Dispatch by durable state: a boundary (Idle/Final) starts a new
+        // turn; anything mid-flight is resolved via resume FIRST (looping
+        // until it lands on a boundary), and only then does the freshly
+        // typed message run as its own turn — user input is never dropped.
+        let outcome = loop {
+            match storage.state().pc {
+                tole_core::state::Pc::Idle | tole_core::state::Pc::Final => {
+                    break run_turn(&mut storage, &mut provider, &registry, text);
+                }
+                mid => {
+                    eprintln!("tole> (resolving interrupted turn, pc={mid:?}…)");
+                    match resume_turn(&mut storage, &mut provider, &registry) {
+                        // Landed on a boundary — dispatch the message now.
+                        Ok(TurnOutcome::Final { .. }) => continue,
+                        // Still stuck (re-denied, provider still down):
+                        // surface it; the NEXT user message retries the
+                        // resolve. The current message is preserved in
+                        // this loop and will run once the session clears.
+                        Ok(
+                            other @ (TurnOutcome::ApprovalRequired { .. }
+                            | TurnOutcome::ProviderFailed { .. }),
+                        ) => {
+                            if retries_left == 0 {
+                                break Ok(other);
+                            }
+                            retries_left -= 1;
+                            continue;
+                        }
+                        Ok(other) => break Ok(other),
+                        Err(e) => {
+                            // Storage-level failure resolving: do not lose
+                            // the user's message — report and keep the
+                            // input buffered for the next attempt.
+                            break Err(e);
+                        }
+                    }
+                }
+            }
+        };
+
+        match outcome {
+            Ok(TurnOutcome::Final { text }) => println!("tole> {text}"),
+            Ok(TurnOutcome::ApprovalRequired { name }) => eprintln!(
+                "tole> (approval denied for '{name}' — turn aborted; your next message resumes)"
+            ),
+            Ok(TurnOutcome::UnknownTool { name }) => {
+                eprintln!("tole> (unknown tool '{name}' — recorded; next message resumes)")
+            }
+            Ok(TurnOutcome::ProviderFailed { message }) => {
+                eprintln!("tole> (provider failed: {message}; next message retries via resume)")
+            }
+            Ok(TurnOutcome::BudgetExhausted) => {
+                eprintln!("tole> (step budget exhausted — turn aborted; next message resumes)")
+            }
+            Ok(TurnOutcome::LoopDetected { .. }) => eprintln!(
+                "tole> (loop guard tripped — identical tool calls repeated; next message resumes)"
+            ),
+            Ok(TurnOutcome::Storage(e)) => anyhow::bail!("storage error: {e}"),
+            Err(e) => anyhow::bail!("turn failed: {e}"),
+        }
+    }
+    println!(
+        "session {session_id} closed — entries: {}",
+        storage.entries().len()
+    );
     Ok(())
 }
 

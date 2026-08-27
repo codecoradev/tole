@@ -459,3 +459,40 @@ fn all_abort_paths_leave_durable_error_records() {
         let _ = risk;
     }
 }
+
+#[test]
+fn chat_reopens_final_session_for_next_turn() {
+    // B1: a completed turn (pc=Final) accepts a new user message — the
+    // session becomes a multi-turn conversation on one durable tree.
+    let dir = tmpdir("chatreopen");
+    let mut s = JsonlStorage::create(&dir, "cr", None).unwrap();
+    let reg = ToolRegistry::new();
+
+    // Turn 1: scripted final answer.
+    let mut p1 = MockProvider::scripted(vec![ProviderOutput::Final {
+        text: "first answer".into(),
+    }]);
+    let out = run_turn(&mut s, &mut p1, &reg, "hello").unwrap();
+    assert!(matches!(out, TurnOutcome::Final { ref text } if text == "first answer"));
+    assert_eq!(s.state().pc, tole_core::state::Pc::Final);
+
+    // Turn 2 on the SAME session: re-open Final → Planning.
+    let mut p2 = MockProvider::scripted(vec![ProviderOutput::Final {
+        text: "second answer".into(),
+    }]);
+    let out = run_turn(&mut s, &mut p2, &reg, "again").unwrap();
+    assert!(matches!(out, TurnOutcome::Final { ref text } if text == "second answer"));
+
+    // The tree holds the full conversation: 2 user + 2 assistant messages.
+    let users = s
+        .entries()
+        .iter()
+        .filter(|e| e.kind.as_str() == "message" && e.payload["role"] == json!("user"))
+        .count();
+    let assistants = s
+        .entries()
+        .iter()
+        .filter(|e| e.kind.as_str() == "message" && e.payload["role"] == json!("assistant"))
+        .count();
+    assert_eq!((users, assistants), (2, 2));
+}

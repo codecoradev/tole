@@ -58,16 +58,18 @@ pub fn run_turn(
     registry: &ToolRegistry,
     user_input: &str,
 ) -> Result<TurnOutcome, StorageError> {
-    // Precondition enforced, not just documented: a session already mid-turn
-    // (e.g. after ProviderFailed) must be resolved via resume/finish first —
-    // driving two turns concurrently is a host bug.
+    // Precondition enforced, not just documented: the session must be at a
+    // turn boundary — Idle (never started / E1 initial state) or Final
+    // (previous turn delivered; B1 chat re-opens it). Anything else means a
+    // turn is mid-flight (e.g. after ProviderFailed) and must be resolved
+    // via resume/finish first — driving two turns concurrently is a host bug.
     let current = s.state().pc;
-    if current != Pc::Idle {
+    if !matches!(current, Pc::Idle | Pc::Final) {
         return Err(StorageError::Invalid(format!(
-            "run_turn requires pc Idle, found {current:?} — resolve the session first (resume/finish)"
+            "run_turn requires pc Idle or Final, found {current:?} — resolve the session first (resume/finish)"
         )));
     }
-    // Idle → Planning, persisting the user message in the same commit.
+    // (Idle|Final) → Planning, persisting the user message in the same commit.
     let seq = s.state().seq;
     s.commit(
         Commit::new()
