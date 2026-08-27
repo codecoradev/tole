@@ -18,15 +18,19 @@
 pub mod approval;
 pub mod cora_search;
 pub mod entry;
+pub mod gh;
 pub mod machine;
 pub mod mock;
 pub mod openai;
 pub mod provider;
+pub mod read_file;
 pub mod register;
 pub mod state;
 pub mod storage;
+pub mod subprocess;
 pub mod tool;
 pub mod turn;
+pub mod uteke_search;
 
 /// Semantic version of the durable schema (see storage module docs).
 pub const STORAGE_VERSION: u32 = 1;

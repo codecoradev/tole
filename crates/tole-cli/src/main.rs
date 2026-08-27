@@ -10,10 +10,13 @@ use std::path::{Path, PathBuf};
 use crate::approver::InteractiveApprover;
 use crate::tools::WriteFileTool;
 use tole_core::cora_search::CoraSearchTool;
+use tole_core::gh::GhTool;
 use tole_core::openai::{OpenAiConfig, OpenAiProvider};
+use tole_core::read_file::ReadFileTool;
 use tole_core::storage::{JsonlStorage, Storage};
 use tole_core::tool::ToolRegistry;
 use tole_core::turn::{resume_turn, run_turn, TurnOutcome, LOOP_TRIP_AFTER};
+use tole_core::uteke_search::UtekeSearchTool;
 
 /// Where sessions live unless the user overrides it.
 const DEFAULT_SESSIONS_DIR: &str = ".tole/sessions";
@@ -127,14 +130,19 @@ fn build_approver(
 
 fn build_registry(approver: InteractiveApprover<approver::StdioPrompt>) -> Result<ToolRegistry> {
     let mut reg = ToolRegistry::with_approver(approver);
+    let cwd = std::env::current_dir().context("resolving cwd")?;
     // ReadOnly tools: no approval needed.
     reg.register(Box::new(CoraSearchTool::new()))
         .map_err(|e| anyhow::anyhow!("registering cora_search: {e}"))?;
+    reg.register(Box::new(UtekeSearchTool::new()))
+        .map_err(|e| anyhow::anyhow!("registering uteke_search: {e}"))?;
+    reg.register(Box::new(ReadFileTool::new(cwd.clone())))
+        .map_err(|e| anyhow::anyhow!("registering read_file: {e}"))?;
     // Write tools: gated per call. The jail root is the cwd.
-    reg.register(Box::new(WriteFileTool::new(
-        std::env::current_dir().context("resolving cwd for write_file jail")?,
-    )))
-    .map_err(|e| anyhow::anyhow!("registering write_file: {e}"))?;
+    reg.register(Box::new(WriteFileTool::new(cwd)))
+        .map_err(|e| anyhow::anyhow!("registering write_file: {e}"))?;
+    reg.register(Box::new(GhTool::new("codecoradev/tole")))
+        .map_err(|e| anyhow::anyhow!("registering gh: {e}"))?;
     Ok(reg)
 }
 
