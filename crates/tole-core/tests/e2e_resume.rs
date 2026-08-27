@@ -265,7 +265,7 @@ fn sigkill_mid_sandwich_resumes_to_same_result() {
 /// Child half of the SIGKILL test: drive the turn until the hang tool
 /// parks inside the effect window, then die by parental SIGKILL.
 fn child_main() {
-    let file = PathBuf::from(std::env::var(FILE_ENV).expect("CORAGENT_E5_FILE missing"));
+    let file = PathBuf::from(std::env::var(FILE_ENV).expect("CORA_E5_FILE missing"));
     let mut s = JsonlStorage::create(file.parent().unwrap(), "killed", None).unwrap();
     let _guard = &mut s; // keep the writer alive while parked
     let mut p = MockProvider::scripted(vec![

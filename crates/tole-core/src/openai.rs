@@ -5,7 +5,8 @@
 //! errors are scrubbed so a failed request can never echo it back into
 //! logs or the durable log.
 //!
-//! Config resolution order: explicit struct fields > env (`CORAGENT_*`).
+//! Config resolution order: explicit struct fields > env (`TOLE_*`, then
+//! `CORAGENT_*` legacy, then `OPENAI_*`).
 
 use crate::provider::{Provider, ProviderError, ProviderOutput};
 use serde_json::{json, Value};
@@ -23,17 +24,19 @@ pub struct OpenAiConfig {
     pub api_key: String,
 }
 
-/// Env names are namespaced (`CORAGENT_*`) to avoid collisions with other
+/// Env names are namespaced (`TOLE_*`) to avoid collisions with other
 /// tools on the same host.
-pub const ENV_BASE_URL: &str = "CORAGENT_BASE_URL";
-pub const ENV_MODEL: &str = "CORAGENT_MODEL";
-pub const ENV_API_KEY: &str = "CORAGENT_API_KEY";
+pub const ENV_BASE_URL: &str = "TOLE_BASE_URL";
+pub const ENV_MODEL: &str = "TOLE_MODEL";
+pub const ENV_API_KEY: &str = "TOLE_API_KEY";
 
 /// Prefixes tried by [`OpenAiConfig::from_env`], in order. The first
 /// prefix whose full triple (`_BASE_URL`, `_MODEL`, `_API_KEY`) is
 /// present and non-empty wins; prefixes are never mixed, so a
 /// half-configured environment cannot silently blend two sources.
-pub const ENV_PREFIXES: [&str; 2] = ["CORAGENT", "OPENAI"];
+/// `TOLE_*` is canonical; `CORAGENT_*` is the pre-rename legacy name;
+/// `OPENAI_*` is the de-facto standard for OpenAI-compatible providers.
+pub const ENV_PREFIXES: [&str; 3] = ["TOLE", "CORAGENT", "OPENAI"];
 
 /// Resolve one variable under `prefix`, treating whitespace-only as absent.
 fn env_var(prefix: &str, suffix: &str) -> Option<String> {
@@ -392,29 +395,37 @@ mod tests {
         assert_eq!(cfg.model, "gpt-fallback");
         assert_eq!(cfg.api_key, "sk-openai");
 
-        // Case 2: both prefixes complete → CORAGENT wins, no mixing.
+        // Case 2: all prefixes complete → TOLE wins, no mixing.
         set(
             "CORAGENT",
             &[
                 ("BASE_URL", "https://coragent.example/v1"),
-                ("MODEL", "glm-test"),
+                ("MODEL", "glm-legacy"),
                 ("API_KEY", "sk-coragent"),
             ],
         );
-        let cfg = OpenAiConfig::from_env().expect("CORAGENT must take priority");
-        assert_eq!(cfg.base_url, "https://coragent.example/v1");
-        assert_eq!(cfg.api_key, "sk-coragent");
+        set(
+            "TOLE",
+            &[
+                ("BASE_URL", "https://tole.example/v1"),
+                ("MODEL", "glm-test"),
+                ("API_KEY", "sk-tole"),
+            ],
+        );
+        let cfg = OpenAiConfig::from_env().expect("TOLE must take priority");
+        assert_eq!(cfg.base_url, "https://tole.example/v1");
+        assert_eq!(cfg.api_key, "sk-tole");
 
-        // Case 3: CORAGENT half-set + OPENAI complete → still OPENAI
-        // (incomplete prefix is skipped whole, never blended).
-        std::env::remove_var("CORAGENT_API_KEY");
+        // Case 3: TOLE half-set + CORAGENT complete → CORAGENT legacy
+        // still honored (incomplete prefix skipped whole, never blended).
+        std::env::remove_var("TOLE_API_KEY");
         let cfg = OpenAiConfig::from_env().expect("incomplete prefix must be skipped");
-        assert_eq!(cfg.api_key, "sk-openai", "must not blend prefixes");
+        assert_eq!(cfg.api_key, "sk-coragent", "must not blend prefixes");
 
         // Case 4: whitespace-only values count as absent.
-        std::env::set_var("CORAGENT_API_KEY", "   ");
+        std::env::set_var("TOLE_API_KEY", "   ");
         let cfg = OpenAiConfig::from_env().expect("whitespace key counts as absent");
-        assert_eq!(cfg.api_key, "sk-openai");
+        assert_eq!(cfg.api_key, "sk-coragent");
 
         // Restore the original environment.
         clear_all();
