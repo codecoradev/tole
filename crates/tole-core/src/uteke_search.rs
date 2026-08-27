@@ -7,7 +7,7 @@
 
 use crate::subprocess::{run_with_timeout, SUBPROCESS_TIMEOUT};
 use crate::tool::{Risk, Tool};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::process::Command;
 
 /// ReadOnly semantic recall over the local uteke store.
@@ -54,6 +54,17 @@ impl Tool for UtekeSearchTool {
             .and_then(Value::as_str)
             .unwrap_or("<missing query>");
         format!("uteke recall: {q}")
+    }
+
+    fn spec(&self) -> Option<Value> {
+        Some(json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "description": "Semantic query for the uteke memory index" },
+                "room": { "type": "string", "description": "Optional room name to scope the recall" }
+            },
+            "required": ["query"]
+        }))
     }
 
     fn execute(&self, input: Value) -> Result<Value, String> {

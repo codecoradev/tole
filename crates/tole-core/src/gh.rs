@@ -6,7 +6,7 @@
 
 use crate::subprocess::{run_with_timeout, SUBPROCESS_TIMEOUT};
 use crate::tool::{Risk, Tool};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -163,6 +163,26 @@ impl Tool for GhTool {
 
     fn describe(&self, input: &Value) -> String {
         self.command_line(input).unwrap_or_else(|e| e)
+    }
+
+    fn spec(&self) -> Option<Value> {
+        Some(json!({
+            "type": "object",
+            "properties": {
+                "op": {
+                    "type": "string",
+                    "enum": ["issue_comment", "issue_create", "pr_create"],
+                    "description": "GitHub operation to perform via gh CLI"
+                },
+                "repo": { "type": "string", "description": "Repository as owner/name" },
+                "number": { "type": "string", "description": "Issue or PR number (digits only)" },
+                "body": { "type": "string", "description": "Markdown body for the comment, issue, or PR description" },
+                "title": { "type": "string", "description": "Title for issue_create / pr_create" },
+                "head": { "type": "string", "description": "Branch to merge FROM (pr_create)" },
+                "base": { "type": "string", "description": "Branch to merge INTO (pr_create)" }
+            },
+            "required": ["op"]
+        }))
     }
 
     fn execute(&self, input: Value) -> Result<Value, String> {

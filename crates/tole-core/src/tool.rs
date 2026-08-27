@@ -8,7 +8,7 @@
 //! invocation.
 
 use crate::approval::{Approver, ToolRequest, Verdict};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::HashMap;
 
 /// What a tool is allowed to touch. Drives the approval gate.
@@ -43,6 +43,12 @@ pub trait Tool: Send + Sync {
     /// approval prompts (E6). Default: tool name + risk.
     fn describe(&self, _input: &Value) -> String {
         format!("{} ({})", self.name(), self.risk().as_str())
+    }
+    /// JSON Schema for the input object, sent to the provider as this
+    /// tool's `parameters` (E4.5). `None` (the default) means "object
+    /// with no declared properties" — still callable, just untyped.
+    fn spec(&self) -> Option<Value> {
+        None
     }
     /// Execute with JSON input, return JSON output or a plain error.
     fn execute(&self, input: Value) -> Result<Value, String>;
@@ -110,6 +116,31 @@ impl ToolRegistry {
     /// Look up a tool by name.
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {
         self.tools.get(name).map(|b| b.as_ref())
+    }
+
+    /// OpenAI-format `tools` array for every registered tool (E4.5).
+    /// Sorted by name so the wire payload is deterministic — the same
+    /// registry always serializes to the same request body.
+    pub fn specs(&self) -> Vec<Value> {
+        let mut names: Vec<&String> = self.tools.keys().collect();
+        names.sort();
+        names
+            .into_iter()
+            .map(|n| {
+                let t = &self.tools[n];
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": t.name(),
+                        "description": t.describe(&serde_json::Value::Null),
+                        "parameters": t.spec().unwrap_or_else(|| json!({
+                            "type": "object",
+                            "properties": {},
+                        })),
+                    },
+                })
+            })
+            .collect()
     }
 
     /// Per-call approval verdict for a non-ReadOnly tool. `None` when no

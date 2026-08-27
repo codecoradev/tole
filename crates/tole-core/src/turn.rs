@@ -302,6 +302,25 @@ fn drive(
                 settle_ok(s, &handle, out)?;
                 finish(s)?;
             }
+            ProviderOutput::InvalidToolArgs { tool, raw, reason } => {
+                // Malformed `arguments` from the model: record the intent
+                // (for auditability) and settle it as an error WITHOUT
+                // executing anything. The model sees the parse error in the
+                // next request and can retry with well-formed JSON.
+                let seq = s.state().seq;
+                s.commit(Commit::new().transition(StateTransition::from(seq, Pc::ToolCall)))?;
+                let handle = begin(
+                    s,
+                    &tool,
+                    serde_json::Value::String(raw),
+                    ReplaySafety::Idempotent,
+                    None,
+                )?;
+                let msg = format!("tool arguments are not valid JSON: {reason}");
+                append_turn_error(s, "invalid tool arguments", &msg)?;
+                settle_err(s, &handle, &msg)?;
+                continue;
+            }
         }
     }
     append_turn_error(s, "budget exhausted", &format!("{MAX_STEPS} steps"))?;
