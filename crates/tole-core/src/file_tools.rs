@@ -24,6 +24,7 @@ use crate::tool::{Risk, Tool};
 use serde_json::{json, Value};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// Hard cap on the file size `edit_file` will touch (bytes) — matches
@@ -69,39 +70,61 @@ fn jailed(root: &Path, rel: &str, tool: &str) -> Result<PathBuf, String> {
 fn atomic_write(target: &Path, new: &str) -> Result<(), String> {
     let parent = target.parent().unwrap_or_else(|| Path::new("."));
     // Temp name must not collide with anything the model could predict;
-    // suffix with pid to keep concurrent sessions apart.
+    // suffix with pid to keep concurrent sessions apart. A stale temp
+    // from a crashed prior attempt would brick the tool (create_new
+    // refuses overwrite), so an AlreadyExists temp is removed once and
+    // the open retried — self-healing instead of session-bricking.
     let tmp = parent.join(format!(".tole-edit-{}.tmp", std::process::id()));
-    // Refuse to write through a symlink at the leaf.
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&tmp)
-            .map_err(|e| format!("edit_file: open temp {}: {e}", tmp.display()))?;
-        f.write_all(new.as_bytes())
-            .map_err(|e| format!("edit_file: write temp {}: {e}", tmp.display()))?;
-    }
-    #[cfg(not(unix))]
-    {
-        let is_symlink = tmp
-            .symlink_metadata()
-            .map(|m| m.file_type().is_symlink())
-            .unwrap_or(false);
-        if is_symlink {
-            return Err(format!("edit_file: refusing symlink {}", tmp.display()));
+    let open_fresh = |tmp: &Path| -> Result<std::fs::File, String> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(tmp)
+                .map_err(|e| format!("edit_file: open temp {}: {e}", tmp.display()))
         }
-        std::fs::write(&tmp, new)
-            .map_err(|e| format!("edit_file: write temp {}: {e}", tmp.display()))?;
+        #[cfg(not(unix))]
+        {
+            let is_symlink = tmp
+                .symlink_metadata()
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false);
+            if is_symlink {
+                return Err(format!("edit_file: refusing symlink {}", tmp.display()));
+            }
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(tmp)
+                .map_err(|e| format!("edit_file: open temp {}: {e}", tmp.display()))
+        }
+    };
+    let mut file = match open_fresh(&tmp) {
+        Ok(f) => f,
+        Err(e) => {
+            // Self-heal: clear a stale temp from a crashed attempt, then
+            // retry exactly once. Any second failure is a real error.
+            let _ = std::fs::remove_file(&tmp);
+            open_fresh(&tmp).map_err(|_| e)?
+        }
+    };
+    if let Err(e) = file.write_all(new.as_bytes()) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("edit_file: write temp {}: {e}", tmp.display()));
     }
-    std::fs::rename(&tmp, target)
-        .map_err(|e| format!("edit_file: rename into place {}: {e}", target.display()))?;
+    drop(file);
+    if let Err(e) = std::fs::rename(&tmp, target) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!(
+            "edit_file: rename into place {}: {e}",
+            target.display()
+        ));
+    }
     Ok(())
 }
-
 /// Edit a file under a fixed root directory. Input:
 /// `{ "path": "rel", "old_hash": "<16-hex from read_file>", "old_text": "...", "new_text": "..." }`.
 #[derive(Debug, Clone)]
@@ -290,6 +313,26 @@ mod tests {
         assert_eq!(a, content_hash("fn main() {}"));
         assert_ne!(a, content_hash("fn main()  "));
         assert_eq!(a.len(), 16);
+    }
+
+    #[test]
+    fn stale_temp_self_heals() {
+        let dir = tmpdir("stale-temp");
+        write(&dir, "f.txt", "old\n");
+        // Simulate a crashed prior attempt: stale temp with our pid.
+        let stale = dir.join(format!(".tole-edit-{}.tmp", std::process::id()));
+        std::fs::write(&stale, "garbage").unwrap();
+        let h = content_hash(&std::fs::read_to_string(dir.join("f.txt")).unwrap());
+        let t = EditFileTool::new(dir.clone());
+        t.execute(json!({
+            "path": "f.txt",
+            "old_hash": h,
+            "old_text": "old",
+            "new_text": "new"
+        }))
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("f.txt")).unwrap(), "new\n");
+        assert!(!stale.exists(), "stale temp must be cleaned up");
     }
 
     // ---- edit_file ----

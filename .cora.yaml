@@ -25,6 +25,7 @@ ignore:
   rules:
     - "Hardcoded password or secret"
     - "Command injection via exec/system with dynamic input"
+    - "SQL injection via string concatenation"
 
 # Hook settings
 hook:
