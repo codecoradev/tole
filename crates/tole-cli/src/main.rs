@@ -165,7 +165,7 @@ fn run_command(
 ) -> Result<()> {
     let cfg = OpenAiConfig::from_env().context(
         "missing provider config: set TOLE_BASE_URL / TOLE_MODEL / TOLE_API_KEY \
-         (or the CORAGENT_* / OPENAI_* equivalents)",
+         (or the OPENAI_* equivalents)",
     )?;
     let session_id = new_session_id();
     std::fs::create_dir_all(sessions_dir)
@@ -196,7 +196,7 @@ fn resume_command(
     }
     let cfg = OpenAiConfig::from_env().context(
         "missing provider config: set TOLE_BASE_URL / TOLE_MODEL / TOLE_API_KEY \
-         (or the CORAGENT_* / OPENAI_* equivalents)",
+         (or the OPENAI_* equivalents)",
     )?;
     let mut storage = JsonlStorage::open(&path).context("replaying session log")?;
 

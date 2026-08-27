@@ -6,7 +6,7 @@
 //! logs or the durable log.
 //!
 //! Config resolution order: explicit struct fields > env (`TOLE_*`, then
-//! `CORAGENT_*` legacy, then `OPENAI_*`).
+//! `OPENAI_*`).
 
 use crate::provider::{Provider, ProviderError, ProviderOutput};
 use serde_json::{json, Value};
@@ -34,9 +34,9 @@ pub const ENV_API_KEY: &str = "TOLE_API_KEY";
 /// prefix whose full triple (`_BASE_URL`, `_MODEL`, `_API_KEY`) is
 /// present and non-empty wins; prefixes are never mixed, so a
 /// half-configured environment cannot silently blend two sources.
-/// `TOLE_*` is canonical; `CORAGENT_*` is the pre-rename legacy name;
-/// `OPENAI_*` is the de-facto standard for OpenAI-compatible providers.
-pub const ENV_PREFIXES: [&str; 3] = ["TOLE", "CORAGENT", "OPENAI"];
+/// `TOLE_*` is canonical; `OPENAI_*` is the de-facto standard for
+/// OpenAI-compatible providers.
+pub const ENV_PREFIXES: [&str; 2] = ["TOLE", "OPENAI"];
 
 /// Resolve one variable under `prefix`, treating whitespace-only as absent.
 fn env_var(prefix: &str, suffix: &str) -> Option<String> {
@@ -60,7 +60,7 @@ impl OpenAiConfig {
         }
     }
 
-    /// Resolve from environment: the first of `CORAGENT_*` then `OPENAI_*`
+    /// Resolve from environment: the first of `TOLE_*` then `OPENAI_*`
     /// whose complete triple (`_BASE_URL`, `_MODEL`, `_API_KEY`) is set
     /// and non-empty. Prefixes are never mixed. `None` when neither
     /// prefix yields a complete triple.
@@ -342,7 +342,7 @@ mod tests {
 
     #[test]
     fn env_resolution_requires_all_three() {
-        // Deliberately not touching real env: from_env reads CORAGENT_*,
+        // Deliberately not touching real env: from_env reads TOLE_*,
         // which is absent in CI → None (and that's the tested contract).
         // A full presence test would need serialised env access.
         let cfg = OpenAiConfig::from_env();
@@ -374,7 +374,7 @@ mod tests {
 
         let _g = LOCK.lock().unwrap();
         // Snapshot + restore: never leak env mutations into other tests.
-        let snapshot: Vec<(String, String)> = ["CORAGENT", "OPENAI"]
+        let snapshot: Vec<(String, String)> = ["TOLE", "OPENAI"]
             .iter()
             .flat_map(|p| ["BASE_URL", "MODEL", "API_KEY"].map(|k| format!("{p}_{k}")))
             .filter_map(|k| std::env::var(&k).ok().map(|v| (k, v)))
@@ -395,15 +395,7 @@ mod tests {
         assert_eq!(cfg.model, "gpt-fallback");
         assert_eq!(cfg.api_key, "sk-openai");
 
-        // Case 2: all prefixes complete → TOLE wins, no mixing.
-        set(
-            "CORAGENT",
-            &[
-                ("BASE_URL", "https://coragent.example/v1"),
-                ("MODEL", "glm-legacy"),
-                ("API_KEY", "sk-coragent"),
-            ],
-        );
+        // Case 2: both prefixes complete → TOLE wins, no mixing.
         set(
             "TOLE",
             &[
@@ -416,16 +408,16 @@ mod tests {
         assert_eq!(cfg.base_url, "https://tole.example/v1");
         assert_eq!(cfg.api_key, "sk-tole");
 
-        // Case 3: TOLE half-set + CORAGENT complete → CORAGENT legacy
-        // still honored (incomplete prefix skipped whole, never blended).
+        // Case 3: TOLE half-set + OPENAI complete → still OPENAI
+        // (incomplete prefix skipped whole, never blended).
         std::env::remove_var("TOLE_API_KEY");
         let cfg = OpenAiConfig::from_env().expect("incomplete prefix must be skipped");
-        assert_eq!(cfg.api_key, "sk-coragent", "must not blend prefixes");
+        assert_eq!(cfg.api_key, "sk-openai", "must not blend prefixes");
 
         // Case 4: whitespace-only values count as absent.
         std::env::set_var("TOLE_API_KEY", "   ");
         let cfg = OpenAiConfig::from_env().expect("whitespace key counts as absent");
-        assert_eq!(cfg.api_key, "sk-coragent");
+        assert_eq!(cfg.api_key, "sk-openai");
 
         // Restore the original environment.
         clear_all();
