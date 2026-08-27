@@ -344,6 +344,9 @@ fn chat_command(
             Err(e) => anyhow::bail!("reading stdin: {e}"),
         }
         let text = line.trim();
+        // Bound auto-resolve attempts per message so a wedged session
+        // can't spin forever (each retry is a full provider round-trip).
+        let mut retries_left: u8 = 2;
         match text {
             "" => continue,
             "/exit" | "/quit" => break,
@@ -360,21 +363,41 @@ fn chat_command(
         }
 
         // Dispatch by durable state: a boundary (Idle/Final) starts a new
-        // turn; anything mid-flight resolves via resume first, so a prior
-        // denial/provider failure never wedges the conversation.
-        let outcome = match storage.state().pc {
-            tole_core::state::Pc::Idle | tole_core::state::Pc::Final => {
-                run_turn(&mut storage, &mut provider, &registry, text)
-            }
-            _ => {
-                // Mid-flight: resolve it, then (if it lands on a boundary)
-                // immediately run this new message as its own turn.
-                match resume_turn(&mut storage, &mut provider, &registry) {
-                    Ok(TurnOutcome::Final { .. }) => {
-                        run_turn(&mut storage, &mut provider, &registry, text)
+        // turn; anything mid-flight is resolved via resume FIRST (looping
+        // until it lands on a boundary), and only then does the freshly
+        // typed message run as its own turn — user input is never dropped.
+        let outcome = loop {
+            match storage.state().pc {
+                tole_core::state::Pc::Idle | tole_core::state::Pc::Final => {
+                    break run_turn(&mut storage, &mut provider, &registry, text);
+                }
+                mid => {
+                    eprintln!("tole> (resolving interrupted turn, pc={mid:?}…)");
+                    match resume_turn(&mut storage, &mut provider, &registry) {
+                        // Landed on a boundary — dispatch the message now.
+                        Ok(TurnOutcome::Final { .. }) => continue,
+                        // Still stuck (re-denied, provider still down):
+                        // surface it; the NEXT user message retries the
+                        // resolve. The current message is preserved in
+                        // this loop and will run once the session clears.
+                        Ok(
+                            other @ (TurnOutcome::ApprovalRequired { .. }
+                            | TurnOutcome::ProviderFailed { .. }),
+                        ) => {
+                            if retries_left == 0 {
+                                break Ok(other);
+                            }
+                            retries_left -= 1;
+                            continue;
+                        }
+                        Ok(other) => break Ok(other),
+                        Err(e) => {
+                            // Storage-level failure resolving: do not lose
+                            // the user's message — report and keep the
+                            // input buffered for the next attempt.
+                            break Err(e);
+                        }
                     }
-                    Ok(other) => Ok(other),
-                    Err(e) => Err(e),
                 }
             }
         };
