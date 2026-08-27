@@ -117,6 +117,10 @@ impl OpenAiProvider {
     /// Phase 1 flattening: only chat messages (`kind == "message"` with a
     /// recognized role) are sent. Tool calls, errors, and state records
     /// stay in the durable log but are not part of the wire transcript.
+    ///
+    /// E11: any occurrence of the API key inside message text is redacted
+    /// before the body goes over the wire — the durable log keeps the
+    /// original (local), the provider never sees the key.
     fn request_body(&self, transcript: &[Entry]) -> Value {
         let mut messages: Vec<Value> = Vec::new();
         if let Some(sys) = &self.system_prompt {
@@ -132,7 +136,11 @@ impl OpenAiProvider {
                     if !matches!(role, "user" | "assistant" | "system") {
                         return None;
                     }
-                    let text = e.payload.get("text").and_then(|t| t.as_str())?;
+                    let text = e
+                        .payload
+                        .get("text")
+                        .and_then(|t| t.as_str())
+                        .map(|t| scrub(t, &self.cfg.api_key))?;
                     Some(json!({ "role": role, "content": text }))
                 }),
         );
@@ -273,6 +281,47 @@ mod transcript_tests {
             body["messages"].as_array().map(|a| a.len()),
             Some(0),
             "non-message kinds and unknown roles must be filtered out"
+        );
+    }
+
+    #[test]
+    fn request_body_redacts_api_key_from_message_text() {
+        // E11: a user message that accidentally quotes the API key must
+        // never reach the provider in cleartext.
+        let key = "sk-super-secret-123";
+        let cfg = OpenAiConfig::new("https://x.example/v1", "m", key);
+        let p = OpenAiProvider::new(cfg);
+        let transcript = vec![msg(
+            "e1",
+            "user",
+            "my key is sk-super-secret-123 please help",
+        )];
+        let body = p.request_body(&transcript);
+        let serialized = body.to_string();
+        assert!(
+            !serialized.contains(key),
+            "api key leaked in request body: {serialized}"
+        );
+        assert!(
+            serialized.contains("<redacted>"),
+            "redaction marker missing: {serialized}"
+        );
+    }
+
+    #[test]
+    fn request_body_keeps_durable_log_text_untouched() {
+        // E11: redaction happens on the wire only — the durable entry
+        // passed in must not be mutated by request_body.
+        let key = "sk-super-secret-456";
+        let cfg = OpenAiConfig::new("https://x.example/v1", "m", key);
+        let p = OpenAiProvider::new(cfg);
+        let original = msg("e1", "user", "key: sk-super-secret-456");
+        let transcript = vec![original.clone()];
+        let _ = p.request_body(&transcript);
+        assert_eq!(
+            transcript[0].payload["text"],
+            json!("key: sk-super-secret-456"),
+            "durable log must keep the original text"
         );
     }
 }
