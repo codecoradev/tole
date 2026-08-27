@@ -29,6 +29,20 @@ pub const ENV_BASE_URL: &str = "CORAGENT_BASE_URL";
 pub const ENV_MODEL: &str = "CORAGENT_MODEL";
 pub const ENV_API_KEY: &str = "CORAGENT_API_KEY";
 
+/// Prefixes tried by [`OpenAiConfig::from_env`], in order. The first
+/// prefix whose full triple (`_BASE_URL`, `_MODEL`, `_API_KEY`) is
+/// present and non-empty wins; prefixes are never mixed, so a
+/// half-configured environment cannot silently blend two sources.
+pub const ENV_PREFIXES: [&str; 2] = ["CORAGENT", "OPENAI"];
+
+/// Resolve one variable under `prefix`, treating whitespace-only as absent.
+fn env_var(prefix: &str, suffix: &str) -> Option<String> {
+    std::env::var(format!("{prefix}_{suffix}"))
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
 impl OpenAiConfig {
     /// Build from explicit values.
     pub fn new(
@@ -43,20 +57,26 @@ impl OpenAiConfig {
         }
     }
 
-    /// Resolve from `CORAGENT_BASE_URL` / `CORAGENT_MODEL` / `CORAGENT_API_KEY`.
-    /// `None` when any of the three is missing/empty.
+    /// Resolve from environment: the first of `CORAGENT_*` then `OPENAI_*`
+    /// whose complete triple (`_BASE_URL`, `_MODEL`, `_API_KEY`) is set
+    /// and non-empty. Prefixes are never mixed. `None` when neither
+    /// prefix yields a complete triple.
     pub fn from_env() -> Option<Self> {
-        let base_url = std::env::var(ENV_BASE_URL).ok()?.trim().to_string();
-        let model = std::env::var(ENV_MODEL).ok()?.trim().to_string();
-        let api_key = std::env::var(ENV_API_KEY).ok()?.trim().to_string();
-        if base_url.is_empty() || model.is_empty() || api_key.is_empty() {
-            return None;
+        for prefix in ENV_PREFIXES {
+            let (Some(base_url), Some(model), Some(api_key)) = (
+                env_var(prefix, "BASE_URL"),
+                env_var(prefix, "MODEL"),
+                env_var(prefix, "API_KEY"),
+            ) else {
+                continue;
+            };
+            return Some(Self {
+                base_url,
+                model,
+                api_key,
+            });
         }
-        Some(Self {
-            base_url,
-            model,
-            api_key,
-        })
+        None
     }
 
     /// `Display` that structurally cannot leak the key: only lengths and
@@ -327,6 +347,80 @@ mod tests {
         // set, from_env returning Some is equally correct — both prove the
         // reader works without panicking on missing vars.
         let _ = cfg;
+    }
+
+    #[test]
+    fn env_prefix_resolution_prefers_coragent_and_never_mixes() {
+        // Env access is process-global; tests that mutate it must not run
+        // in parallel with other env-mutating tests. This is the only
+        // env-mutating test in this module, so a mutex here suffices.
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+        fn set(prefix: &str, vals: &[(&str, &str)]) {
+            for (k, v) in vals {
+                std::env::set_var(format!("{prefix}_{k}"), v);
+            }
+        }
+        fn clear_all() {
+            for p in ENV_PREFIXES {
+                for k in ["BASE_URL", "MODEL", "API_KEY"] {
+                    std::env::remove_var(format!("{p}_{k}"));
+                }
+            }
+        }
+
+        let _g = LOCK.lock().unwrap();
+        // Snapshot + restore: never leak env mutations into other tests.
+        let snapshot: Vec<(String, String)> = ["CORAGENT", "OPENAI"]
+            .iter()
+            .flat_map(|p| ["BASE_URL", "MODEL", "API_KEY"].map(|k| format!("{p}_{k}")))
+            .filter_map(|k| std::env::var(&k).ok().map(|v| (k, v)))
+            .collect();
+
+        // Case 1: only OPENAI_* complete → OPENAI wins (the fallback fix).
+        clear_all();
+        set(
+            "OPENAI",
+            &[
+                ("BASE_URL", "https://openai.example/v1"),
+                ("MODEL", "gpt-fallback"),
+                ("API_KEY", "sk-openai"),
+            ],
+        );
+        let cfg = OpenAiConfig::from_env().expect("OPENAI fallback must resolve");
+        assert_eq!(cfg.base_url, "https://openai.example/v1");
+        assert_eq!(cfg.model, "gpt-fallback");
+        assert_eq!(cfg.api_key, "sk-openai");
+
+        // Case 2: both prefixes complete → CORAGENT wins, no mixing.
+        set(
+            "CORAGENT",
+            &[
+                ("BASE_URL", "https://coragent.example/v1"),
+                ("MODEL", "glm-test"),
+                ("API_KEY", "sk-coragent"),
+            ],
+        );
+        let cfg = OpenAiConfig::from_env().expect("CORAGENT must take priority");
+        assert_eq!(cfg.base_url, "https://coragent.example/v1");
+        assert_eq!(cfg.api_key, "sk-coragent");
+
+        // Case 3: CORAGENT half-set + OPENAI complete → still OPENAI
+        // (incomplete prefix is skipped whole, never blended).
+        std::env::remove_var("CORAGENT_API_KEY");
+        let cfg = OpenAiConfig::from_env().expect("incomplete prefix must be skipped");
+        assert_eq!(cfg.api_key, "sk-openai", "must not blend prefixes");
+
+        // Case 4: whitespace-only values count as absent.
+        std::env::set_var("CORAGENT_API_KEY", "   ");
+        let cfg = OpenAiConfig::from_env().expect("whitespace key counts as absent");
+        assert_eq!(cfg.api_key, "sk-openai");
+
+        // Restore the original environment.
+        clear_all();
+        for (k, v) in &snapshot {
+            std::env::set_var(k, v);
+        }
     }
 
     #[test]

@@ -163,8 +163,10 @@ fn run_command(
     allow_patterns: &[String],
     yes: bool,
 ) -> Result<()> {
-    let cfg = OpenAiConfig::from_env()
-        .context("missing CORAGENT_BASE_URL / CORAGENT_MODEL / CORAGENT_API_KEY")?;
+    let cfg = OpenAiConfig::from_env().context(
+        "missing provider config: set CORAGENT_BASE_URL / CORAGENT_MODEL / CORAGENT_API_KEY \
+         (or the OPENAI_* equivalents)",
+    )?;
     let session_id = new_session_id();
     std::fs::create_dir_all(sessions_dir)
         .with_context(|| format!("creating {}", sessions_dir.display()))?;
@@ -192,8 +194,10 @@ fn resume_command(
     if !path.exists() {
         anyhow::bail!("session {id} not found at {}", path.display());
     }
-    let cfg = OpenAiConfig::from_env()
-        .context("missing CORAGENT_BASE_URL / CORAGENT_MODEL / CORAGENT_API_KEY")?;
+    let cfg = OpenAiConfig::from_env().context(
+        "missing provider config: set CORAGENT_BASE_URL / CORAGENT_MODEL / CORAGENT_API_KEY \
+         (or the OPENAI_* equivalents)",
+    )?;
     let mut storage = JsonlStorage::open(&path).context("replaying session log")?;
 
     let registry = build_registry(build_approver(allow_patterns, yes))?;
