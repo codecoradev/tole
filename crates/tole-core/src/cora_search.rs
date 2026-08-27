@@ -6,72 +6,17 @@
 //! no mutation, and the tool classification (`Risk::ReadOnly`) is the
 //! enforcement point for the approval gate.
 
+use crate::subprocess::{run_with_timeout, SUBPROCESS_TIMEOUT};
 use crate::tool::{Risk, Tool};
 #[cfg(test)]
 use serde_json::json;
 use serde_json::Value;
-use std::process::{Command, Output};
-use std::time::{Duration, Instant};
+use std::process::Command;
+#[cfg(test)]
+use std::time::Duration;
 
 /// Hard ceiling on any subprocess this tool spawns. The turn loop is
 /// synchronous — a hung `cora brain` would freeze the whole agent.
-pub const SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Runs `cmd`, killing it after `timeout`. Stdout/stderr are drained on
-/// dedicated reader threads: a child writing more than the OS pipe buffer
-/// (~64KB) would otherwise block on write while we only poll its status,
-/// and we'd time out on a perfectly valid run.
-fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> Result<Output, String> {
-    use std::io::Read;
-    use std::process::Stdio;
-    cmd.stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .stdin(Stdio::null());
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("failed to spawn `cora` (is it on PATH?): {e}"))?;
-    let mut stdout_pipe = child.stdout.take().expect("stdout piped above");
-    let mut stderr_pipe = child.stderr.take().expect("stderr piped above");
-    let mut t_out = Some(std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout_pipe.read_to_end(&mut buf);
-        buf
-    }));
-    let mut t_err = Some(std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stderr_pipe.read_to_end(&mut buf);
-        buf
-    }));
-    let start = Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
-                if start.elapsed() > timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let _ = t_out.take().map(std::thread::JoinHandle::join);
-                    let _ = t_err.take().map(std::thread::JoinHandle::join);
-                    return Err(format!("cora brain timed out after {}s", timeout.as_secs()));
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(e) => {
-                let _ = t_out.take().map(std::thread::JoinHandle::join);
-                let _ = t_err.take().map(std::thread::JoinHandle::join);
-                return Err(format!("wait failed: {e}"));
-            }
-        }
-    };
-    let stdout = t_out.take().and_then(|t| t.join().ok()).unwrap_or_default();
-    let stderr = t_err.take().and_then(|t| t.join().ok()).unwrap_or_default();
-    Ok(Output {
-        status,
-        stdout,
-        stderr,
-    })
-}
-
 /// ReadOnly search over the current project's symbol index.
 #[derive(Debug, Clone)]
 pub struct CoraSearchTool {
