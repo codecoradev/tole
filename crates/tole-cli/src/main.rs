@@ -15,10 +15,11 @@ use tole_core::gh::GhTool;
 use tole_core::git::GitTool;
 use tole_core::openai::{OpenAiConfig, OpenAiProvider};
 use tole_core::read_file::ReadFileTool;
+use tole_core::run_command::RunCommandTool;
 use tole_core::storage::{JsonlStorage, Storage};
 use tole_core::tool::ToolRegistry;
 use tole_core::turn::{resume_turn, run_turn, TurnOutcome, LOOP_TRIP_AFTER};
-use tole_core::uteke_search::UtekeSearchTool;
+use tole_core::uteke::{UtekeDocumentTool, UtekeRecallTool};
 
 /// Where sessions live unless the user overrides it.
 const DEFAULT_SESSIONS_DIR: &str = ".tole/sessions";
@@ -184,14 +185,45 @@ fn build_approver(
         .with_auto_write(yes)
 }
 
+/// B4 startup probing: a binary exists on PATH (or is an executable
+/// absolute path). Used to skip CLI-backed tools whose engine is not
+/// installed, instead of registering phantom tools that fail on every
+/// call.
+fn binary_available(name: &str) -> bool {
+    if name.contains('/') {
+        let p = std::path::Path::new(name);
+        return p.is_file();
+    }
+    if let Ok(path) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path) {
+            if dir.join(name).is_file() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn build_registry(approver: InteractiveApprover<approver::StdioPrompt>) -> Result<ToolRegistry> {
     let mut reg = ToolRegistry::with_approver(approver);
     let cwd = std::env::current_dir().context("resolving cwd")?;
     // ReadOnly tools: no approval needed.
     reg.register(Box::new(CoraSearchTool::new()))
         .map_err(|e| anyhow::anyhow!("registering cora_search: {e}"))?;
-    reg.register(Box::new(UtekeSearchTool::new()))
-        .map_err(|e| anyhow::anyhow!("registering uteke_search: {e}"))?;
+    // Uteke first-class (B4): recall (read) + document (write), behind
+    // startup probing — a missing uteke binary degrades to a warning,
+    // not phantom tools.
+    if binary_available("uteke") {
+        reg.register(Box::new(UtekeRecallTool::new()))
+            .map_err(|e| anyhow::anyhow!("registering uteke_recall: {e}"))?;
+        reg.register(Box::new(UtekeDocumentTool::new(None)))
+            .map_err(|e| anyhow::anyhow!("registering uteke_document: {e}"))?;
+    } else {
+        eprintln!("tole: uteke binary not found — uteke_recall/uteke_document disabled");
+    }
+    // Generic dynamic command (B4): argv-split, cwd-jailed, Risk::Write.
+    reg.register(Box::new(RunCommandTool::new(cwd.clone())))
+        .map_err(|e| anyhow::anyhow!("registering run_command: {e}"))?;
     reg.register(Box::new(ReadFileTool::new(cwd.clone())))
         .map_err(|e| anyhow::anyhow!("registering read_file: {e}"))?;
     // Write tools: gated per call. The jail root is the cwd.
