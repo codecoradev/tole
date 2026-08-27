@@ -18,6 +18,7 @@
 pub mod approval;
 pub mod cora_search;
 pub mod entry;
+pub mod file_tools;
 pub mod gh;
 pub mod machine;
 pub mod mock;

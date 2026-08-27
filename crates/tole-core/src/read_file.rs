@@ -100,7 +100,10 @@ impl Tool for ReadFileTool {
         // Lossy decode: source files are UTF-8; anything else still gets
         // a readable form instead of a hard error.
         let content = String::from_utf8_lossy(&bytes).into_owned();
-        Ok(json!({ "path": path, "content": content, "bytes": bytes.len() }))
+        // Content hash (E12): the model quotes this in `edit_file.old_hash`
+        // so stale anchors are refused before they corrupt a file.
+        let hash = crate::file_tools::content_hash(&content);
+        Ok(json!({ "path": path, "content": content, "bytes": bytes.len(), "hash": hash }))
     }
 }
 
