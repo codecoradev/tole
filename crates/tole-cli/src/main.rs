@@ -164,8 +164,8 @@ fn run_command(
     yes: bool,
 ) -> Result<()> {
     let cfg = OpenAiConfig::from_env().context(
-        "missing provider config: set CORAGENT_BASE_URL / CORAGENT_MODEL / CORAGENT_API_KEY \
-         (or the OPENAI_* equivalents)",
+        "missing provider config: set TOLE_BASE_URL / TOLE_MODEL / TOLE_API_KEY \
+         (or the CORAGENT_* / OPENAI_* equivalents)",
     )?;
     let session_id = new_session_id();
     std::fs::create_dir_all(sessions_dir)
@@ -195,8 +195,8 @@ fn resume_command(
         anyhow::bail!("session {id} not found at {}", path.display());
     }
     let cfg = OpenAiConfig::from_env().context(
-        "missing provider config: set CORAGENT_BASE_URL / CORAGENT_MODEL / CORAGENT_API_KEY \
-         (or the OPENAI_* equivalents)",
+        "missing provider config: set TOLE_BASE_URL / TOLE_MODEL / TOLE_API_KEY \
+         (or the CORAGENT_* / OPENAI_* equivalents)",
     )?;
     let mut storage = JsonlStorage::open(&path).context("replaying session log")?;
 
