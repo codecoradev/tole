@@ -150,6 +150,12 @@ pub trait Storage {
     /// Session id (matches the file stem).
     fn session_id(&self) -> &str;
 
+    /// B2: the system prompt pinned at session creation, if any.
+    /// Backends persist it in the header so resume re-applies it.
+    fn system_prompt(&self) -> Option<&str> {
+        None
+    }
+
     /// In-memory snapshot of the machine state (pc + seq).
     fn state(&self) -> MachineState;
 
@@ -204,6 +210,14 @@ struct HeaderLine {
     created_at: u64,
     #[serde(default)]
     cwd: String,
+    /// B2: system prompt pinned at session creation. Optional + skipped
+    /// when absent, so pre-B2 files replay unchanged.
+    #[serde(
+        default,
+        rename = "systemPrompt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    system_prompt: Option<String>,
 }
 
 /// Discriminated record inside a commit line (array element or solo object).
@@ -279,6 +293,7 @@ pub struct JsonlStorage {
     writer: BufWriter<File>,
     created_at: u64,
     cwd: String,
+    system_prompt: Option<String>,
     // In-memory state (the file is a replay recipe, not the state):
     entries: Vec<Entry>,
     by_id: BTreeMap<String, usize>,
@@ -295,6 +310,17 @@ impl JsonlStorage {
         session_id: impl Into<String>,
         cwd: Option<String>,
     ) -> Result<Self, StorageError> {
+        Self::create_with(dir, session_id, cwd, None)
+    }
+
+    /// B2: create with a pinned system prompt (persisted in the header,
+    /// applied to every provider request for this session).
+    pub fn create_with(
+        dir: impl AsRef<Path>,
+        session_id: impl Into<String>,
+        cwd: Option<String>,
+        system_prompt: Option<&str>,
+    ) -> Result<Self, StorageError> {
         let session_id = session_id.into();
         let path = dir.as_ref().join(format!("{session_id}.jsonl"));
         let created_at = now_ms();
@@ -306,6 +332,7 @@ impl JsonlStorage {
             storage_version: STORAGE_VERSION,
             created_at,
             cwd: cwd.clone(),
+            system_prompt: system_prompt.map(str::to_string),
         };
         let mut writer = BufWriter::new(
             OpenOptions::new()
@@ -321,6 +348,7 @@ impl JsonlStorage {
             writer,
             created_at,
             cwd,
+            system_prompt: system_prompt.map(str::to_string),
             entries: Vec::new(),
             by_id: BTreeMap::new(),
             children: BTreeMap::new(),
@@ -366,6 +394,7 @@ impl JsonlStorage {
             writer: BufWriter::new(OpenOptions::new().append(true).open(&path)?),
             created_at: header.created_at,
             cwd: header.cwd.clone(),
+            system_prompt: header.system_prompt.clone(),
             entries: Vec::new(),
             by_id: BTreeMap::new(),
             children: BTreeMap::new(),
@@ -655,6 +684,10 @@ impl Storage for JsonlStorage {
         &self.session_id
     }
 
+    fn system_prompt(&self) -> Option<&str> {
+        self.system_prompt.as_deref()
+    }
+
     fn state(&self) -> MachineState {
         self.state
     }
@@ -859,6 +892,7 @@ impl Storage for JsonlStorage {
                 storage_version: STORAGE_VERSION,
                 created_at: self.created_at,
                 cwd: self.cwd.clone(),
+                system_prompt: self.system_prompt.clone(),
             };
             writeln!(w, "{}", serde_json::to_string(&header)?)?;
             for r in &records {
