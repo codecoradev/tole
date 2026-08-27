@@ -70,8 +70,13 @@ impl GitOp {
                 Ok(argv)
             }
             GitOp::Add => {
-                // Paths are validated jail-side too, but reject dash-led
-                // here so the audit line can never show a flag injection.
+                // Paths must stay inside the workdir subtree: no absolute
+                // paths, no `..` components (git would happily stage them
+                // when the repository root sits above the workdir, e.g. a
+                // subdirectory of a monorepo). This is the jail the file
+                // tools enforce via canonicalize; for add, lexical
+                // rejection is airtight because git resolves the path
+                // itself afterwards.
                 let mut paths = Vec::new();
                 let Some(arr) = input.get("paths").and_then(Value::as_array) else {
                     return Err("git: 'paths' array is required for add".into());
@@ -83,6 +88,16 @@ impl GitOp {
                     let Some(p) = p.as_str().map(str::trim).filter(|v| !v.is_empty()) else {
                         return Err("git: every path must be a non-empty string".into());
                     };
+                    if p.starts_with('/') || p.starts_with('\\') {
+                        return Err(format!(
+                            "git: 'path' must be relative to the workspace: {p:?}"
+                        ));
+                    }
+                    if p.split(['/', '\\']).any(|c| c == "..") {
+                        return Err(format!(
+                            "git: 'path' must not escape the workspace (..): {p:?}"
+                        ));
+                    }
                     paths.push(no_dash("path", p)?);
                 }
                 // The one sanctioned catch-all: the whole tree, same as
@@ -295,6 +310,20 @@ mod tests {
         // leading-dash path
         assert!(t
             .command_line(&json!({"op":"add","paths":["--exec=/bin/sh"]}))
+            .is_err());
+        // jail escapes: absolute + parent traversal
+        assert!(t
+            .command_line(&json!({"op":"add","paths":["/etc/passwd"]}))
+            .is_err());
+        assert!(t
+            .command_line(&json!({"op":"add","paths":["../sibling/file"]}))
+            .is_err());
+        assert!(t
+            .command_line(&json!({"op":"add","paths":["safe/../../escape"]}))
+            .is_err());
+        // interior .. still caught after normalization by component check
+        assert!(t
+            .command_line(&json!({"op":"add","paths":["a/../b"]}))
             .is_err());
         // leading-dash message
         assert!(t
