@@ -87,6 +87,9 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
+    /// List sessions in the sessions dir (B3).
+    Sessions,
+
     /// Show durable state of a session.
     Status {
         /// Session id to inspect.
@@ -149,6 +152,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             allow_patterns,
             yes,
         } => resume_command(&sessions_dir, &id, &allow_patterns, yes),
+        Command::Sessions => sessions_command(&sessions_dir),
         Command::Status { id } => status_command(&sessions_dir, &id),
         Command::Chat {
             system,
@@ -286,7 +290,122 @@ fn status_command(sessions_dir: &Path, id: &str) -> Result<()> {
     println!("entries: {}", storage.entries().len());
     println!("pc:      {:?}", storage.state().pc);
     println!("seq:     {}", storage.state().seq);
+    // B3: orientation fields — turns (user messages), usage totals, and
+    // whether a system prompt is pinned.
+    let turns: usize = storage
+        .entries()
+        .iter()
+        .filter(|e| e.payload.get("role") == Some(&serde_json::json!("user")))
+        .count();
+    println!("turns:   {turns} (user messages)");
+    println!(
+        "system:  {}",
+        match storage.system_prompt() {
+            Some(_) => "pinned (see header)".to_string(),
+            None => "-".to_string(),
+        }
+    );
+    let usage = storage.usages();
+    let prompt_tokens: u64 = usage
+        .iter()
+        .filter_map(|u| u.usage.get("prompt_tokens").and_then(|v| v.as_u64()))
+        .sum();
+    let completion_tokens: u64 = usage
+        .iter()
+        .filter_map(|u| u.usage.get("completion_tokens").and_then(|v| v.as_u64()))
+        .sum();
+    let cost: f64 = usage.iter().filter_map(|u| u.cost_usd).sum::<f64>();
+    // `-0.0` renders as "-0.0000" (sum of no records is 0.0, but be
+    // explicit: a negative-zero cost display would look like a bug).
+    let cost = if cost == 0.0 { 0.0 } else { cost };
+    println!("usage:   {prompt_tokens} in / {completion_tokens} out tokens, ${cost:.4} USD");
     Ok(())
+}
+
+/// B3: list every session in the dir, newest first, one line each.
+fn sessions_command(sessions_dir: &Path) -> Result<()> {
+    if !sessions_dir.exists() {
+        println!(
+            "no sessions in {} (dir does not exist)",
+            sessions_dir.display()
+        );
+        return Ok(());
+    }
+    // (epoch_secs, id, pc, seq, turns) — epoch secs first so a plain
+    // sort_by_key ascending gives newest-first via Reverse.
+    let mut rows: Vec<(u64, String, String, u64, usize)> = Vec::new();
+    for entry in std::fs::read_dir(sessions_dir)?.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let stem = name.trim_end_matches(".jsonl");
+        if !name.ends_with(".jsonl") || !valid_session_id(stem) {
+            continue;
+        }
+        let mtime = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let id = stem.to_string();
+        // Read-only peek: replay the file to surface pc + turn count.
+        let s = match JsonlStorage::open(entry.path()) {
+            Ok(s) => s,
+            Err(_) => continue, // unreadable/corrupt: skip, don't fail the listing
+        };
+        let turns: usize = s
+            .entries()
+            .iter()
+            .filter(|e| e.payload.get("role") == Some(&serde_json::json!("user")))
+            .count();
+        rows.push((
+            mtime,
+            id,
+            format!("{:?}", s.state().pc),
+            s.state().seq,
+            turns,
+        ));
+    }
+    if rows.is_empty() {
+        println!("no sessions in {}", sessions_dir.display());
+        return Ok(());
+    }
+    rows.sort_by_key(|r| std::cmp::Reverse(r.0)); // newest first
+    println!(
+        "{:<26} {:<12} {:>5} {:>6}  mtime",
+        "session", "pc", "seq", "turns"
+    );
+    for row in &rows {
+        let mtime = fmt_mtime(std::time::UNIX_EPOCH + std::time::Duration::from_secs(row.0));
+        println!(
+            "{:<26} {:<12} {:>5} {:>6}  {mtime}",
+            row.1, row.2, row.3, row.4
+        );
+    }
+    Ok(())
+}
+
+/// `YYYY-mm-dd HH:MM` in UTC — stable, no chrono dep.
+fn fmt_mtime(t: std::time::SystemTime) -> String {
+    let secs = t
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = secs / 86400;
+    let rem = secs % 86400;
+    let (h, m) = (rem / 3600, (rem % 3600) / 60);
+    // civil-from-days (Howard Hinnant's algorithm) — no chrono.
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mth = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if mth <= 2 { y + 1 } else { y };
+    format!("{y:04}-{mth:02}-{d:02} {h:02}:{m:02}")
 }
 
 // ---------------------------------------------------------------------------
