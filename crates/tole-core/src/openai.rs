@@ -179,10 +179,14 @@ impl OpenAiProvider {
                 }
                 "tool_result" | "error" => {
                     // Settlement of the intent this entry hangs under.
-                    // Errors carry `error` instead of `output`. Content is
-                    // scrubbed before the wire (E11): the durable log keeps
-                    // the original locally, the provider never sees the key
-                    // even when a tool echoes it back.
+                    // Errors carry `error` instead of `output`. Turn-level
+                    // errors (no parent intent — e.g. budget exhausted,
+                    // invalid tool arguments) have no tool_call_id and are
+                    // skipped: the wire protocol only accepts tool messages
+                    // that answer a specific tool_call.
+                    let Some(parent) = e.parent_id.as_ref() else {
+                        continue;
+                    };
                     let content = if e.kind.as_str() == "tool_result" {
                         e.payload
                             .get("output")
@@ -193,7 +197,7 @@ impl OpenAiProvider {
                     };
                     messages.push(json!({
                         "role": "tool",
-                        "tool_call_id": e.parent_id,
+                        "tool_call_id": parent,
                         "content": scrub(&content.to_string(), &self.cfg.api_key),
                     }));
                 }
