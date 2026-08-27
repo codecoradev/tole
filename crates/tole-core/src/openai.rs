@@ -80,6 +80,8 @@ pub struct OpenAiProvider {
     /// Optional system prompt prepended to the wire transcript. Explicit
     /// opt-in: absent by default, never invented by the provider itself.
     system_prompt: Option<String>,
+    /// OpenAI `tools` array (E4.5). Empty = text-only turn, no tool use.
+    tool_specs: Vec<Value>,
 }
 
 impl OpenAiProvider {
@@ -88,6 +90,7 @@ impl OpenAiProvider {
             cfg,
             timeout: Duration::from_secs(120),
             system_prompt: None,
+            tool_specs: Vec::new(),
         }
     }
 
@@ -103,6 +106,13 @@ impl OpenAiProvider {
         self
     }
 
+    /// Inject tool specs (from `ToolRegistry::specs()`). Non-empty specs
+    /// enable tool-calling on the wire (E4.5).
+    pub fn with_tool_specs(mut self, specs: Vec<Value>) -> Self {
+        self.tool_specs = specs;
+        self
+    }
+
     /// The agent used for requests (timeout lives here in ureq 3.x).
     fn agent(&self) -> ureq::Agent {
         ureq::Agent::config_builder()
@@ -114,9 +124,11 @@ impl OpenAiProvider {
     /// Build the request body. Separated so tests can inspect exactly what
     /// would go over the wire (and prove the key never appears in it).
     ///
-    /// Phase 1 flattening: only chat messages (`kind == "message"` with a
-    /// recognized role) are sent. Tool calls, errors, and state records
-    /// stay in the durable log but are not part of the wire transcript.
+    /// Transcript flattening (E4.5): user/assistant chat messages pass
+    /// through in order; each `intent` entry becomes an assistant message
+    /// carrying `tool_calls` (intent id doubles as `tool_call_id`), and
+    /// the child `tool_result`/`error` settlement becomes the matching
+    /// `role:"tool"` message. State records stay in the durable log only.
     ///
     /// E11: any occurrence of the API key inside message text is redacted
     /// before the body goes over the wire — the durable log keeps the
@@ -126,37 +138,122 @@ impl OpenAiProvider {
         if let Some(sys) = &self.system_prompt {
             messages.push(json!({ "role": "system", "content": sys }));
         }
-        messages.extend(
-            transcript
-                .iter()
-                .filter(|e| e.kind.as_str() == "message")
-                .filter_map(|e| {
-                    let role = e.payload.get("role")?.as_str()?;
-                    // Only roles the chat-completions API accepts.
+        for e in transcript {
+            match e.kind.as_str() {
+                "message" => {
+                    let (Some(role), Some(text)) = (
+                        e.payload.get("role").and_then(Value::as_str),
+                        e.payload
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .map(|t| scrub(t, &self.cfg.api_key)),
+                    ) else {
+                        continue;
+                    };
                     if !matches!(role, "user" | "assistant" | "system") {
-                        return None;
+                        continue;
                     }
-                    let text = e
-                        .payload
-                        .get("text")
-                        .and_then(|t| t.as_str())
-                        .map(|t| scrub(t, &self.cfg.api_key))?;
-                    Some(json!({ "role": role, "content": text }))
-                }),
-        );
-        json!({
+                    messages.push(json!({ "role": role, "content": text }));
+                }
+                "intent" => {
+                    let (Some(tool), Some(input)) = (
+                        e.payload.get("tool").and_then(Value::as_str),
+                        e.payload.get("input"),
+                    ) else {
+                        continue;
+                    };
+                    // The intent id doubles as the wire tool_call_id —
+                    // deterministic and unique per sandwich.
+                    messages.push(json!({
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": e.id,
+                            "type": "function",
+                            "function": {
+                                "name": tool,
+                                "arguments": input.to_string(),
+                            },
+                        }],
+                    }));
+                }
+                "tool_result" | "error" => {
+                    // Settlement of the intent this entry hangs under.
+                    // Errors carry `error` instead of `output`.
+                    let content = if e.kind.as_str() == "tool_result" {
+                        e.payload
+                            .get("output")
+                            .cloned()
+                            .unwrap_or_else(|| json!({ "ok": true }))
+                    } else {
+                        json!({ "error": e.payload.get("error").cloned().unwrap_or(Value::Null) })
+                    };
+                    messages.push(json!({
+                        "role": "tool",
+                        "tool_call_id": e.parent_id,
+                        "content": content.to_string(),
+                    }));
+                }
+                _ => {}
+            }
+        }
+        let mut body = json!({
             "model": self.cfg.model,
             "messages": messages,
+        });
+        if !self.tool_specs.is_empty() {
+            body["tools"] = json!(self.tool_specs);
+        }
+        body
+    }
+
+    /// Parse a chat-completions response into the single next step the
+    /// state machine understands (E4.5). Precedence: a non-empty
+    /// `tool_calls` array wins over content text — the model asked for a
+    /// tool, and the loop must run it before any prose is meaningful.
+    /// First call only: the machine is single-path (§5).
+    fn parse_completion(resp: &Value) -> Result<ProviderOutput, ProviderError> {
+        let msg = resp
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("message"))
+            .ok_or_else(|| ProviderError("malformed response: no choices[0].message".into()))?;
+        let calls = msg
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .filter(|a| !a.is_empty());
+        if let Some(calls) = calls {
+            let first = &calls[0];
+            let name = first
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    ProviderError("malformed tool_call: missing function.name".into())
+                })?;
+            let args = first
+                .get("function")
+                .and_then(|f| f.get("arguments"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| "{}".into());
+            let input: Value = serde_json::from_str(&args).unwrap_or(json!({}));
+            return Ok(ProviderOutput::ToolCall {
+                tool: name.to_string(),
+                input,
+            });
+        }
+        let text = msg.get("content").and_then(Value::as_str).ok_or_else(|| {
+            ProviderError("malformed response: no content and no tool_calls".into())
+        })?;
+        Ok(ProviderOutput::Final {
+            text: text.to_string(),
         })
     }
 }
 
 impl Provider for OpenAiProvider {
     fn complete(&mut self, transcript: &[Entry]) -> Result<ProviderOutput, ProviderError> {
-        // Phase 1: no tool-calling loop on the real provider yet — the
-        // transcript is flattened to text and the reply is treated as
-        // final. The mock (E3 tests) exercises the full loop; E5 wires
-        // real tool calls.
         let body = self.request_body(transcript);
         let url = format!(
             "{}/chat/completions",
@@ -169,18 +266,7 @@ impl Provider for OpenAiProvider {
             .send_json(&body)
             .and_then(|mut r| r.body_mut().read_json::<Value>())
             .map_err(|e| ProviderError(scrub(&e.to_string(), &self.cfg.api_key)))?;
-        let text = resp
-            .get("choices")
-            .and_then(|c| c.get(0))
-            .and_then(|c| c.get("message"))
-            .and_then(|m| m.get("content"))
-            .and_then(|t| t.as_str())
-            .ok_or_else(|| {
-                ProviderError("malformed response: no choices[0].message.content".into())
-            })?;
-        Ok(ProviderOutput::Final {
-            text: text.to_string(),
-        })
+        Self::parse_completion(&resp)
     }
 }
 
@@ -251,6 +337,17 @@ mod transcript_tests {
         }
     }
 
+    fn state() -> Entry {
+        Entry {
+            id: "s1".into(),
+            parent_id: None,
+            seq: 0,
+            kind: EntryType::new("state"),
+            payload: json!({ "pc": "Planning" }),
+            timestamp: 0,
+        }
+    }
+
     #[test]
     fn request_body_flattens_message_entries_in_order() {
         let cfg = OpenAiConfig::new("https://x.example/v1", "m", "k");
@@ -270,18 +367,126 @@ mod transcript_tests {
     }
 
     #[test]
-    fn request_body_skips_non_message_and_unknown_roles() {
+    fn request_body_skips_unknown_roles_and_state_records() {
         let cfg = OpenAiConfig::new("https://x.example/v1", "m", "k");
         let p = OpenAiProvider::new(cfg);
-        let mut odd = msg("e9", "tool", "ignored");
-        odd.kind = EntryType::new("error");
-        let transcript = vec![odd, msg("e10", "wizard", "unknown role")];
+        // Unknown chat roles and state records stay log-only.
+        let transcript = vec![msg("e10", "wizard", "unknown role"), state()];
         let body = p.request_body(&transcript);
         assert_eq!(
             body["messages"].as_array().map(|a| a.len()),
             Some(0),
-            "non-message kinds and unknown roles must be filtered out"
+            "unknown roles and state records must be filtered out"
         );
+    }
+
+    #[test]
+    fn request_body_flattens_intent_and_result_to_tool_wire() {
+        // E4.5: intent → assistant tool_calls (intent id as tool_call_id),
+        // settlement → role:"tool" with the parent as tool_call_id.
+        let cfg = OpenAiConfig::new("https://x.example/v1", "m", "k");
+        let p = OpenAiProvider::new(cfg);
+        let mut intent = msg("intent_5", "assistant", "");
+        intent.kind = EntryType::new("intent");
+        intent.payload = json!({ "tool": "read_file", "input": { "path": "Cargo.toml" } });
+        let mut result = msg("e6", "tool", "");
+        result.kind = EntryType::new("tool_result");
+        result.parent_id = Some("intent_5".into());
+        result.payload = json!({ "ok": true, "output": { "bytes": 42 } });
+        let mut err = msg("e7", "tool", "");
+        err.kind = EntryType::new("error");
+        err.parent_id = Some("intent_5".into());
+        err.payload = json!({ "ok": false, "error": "boom" });
+        let body = p.request_body(&[intent.clone(), result, intent, err]);
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 4);
+        // intent → assistant tool_calls
+        assert_eq!(msgs[0]["role"], json!("assistant"));
+        assert_eq!(msgs[0]["tool_calls"][0]["id"], json!("intent_5"));
+        assert_eq!(
+            msgs[0]["tool_calls"][0]["function"]["name"],
+            json!("read_file")
+        );
+        assert_eq!(
+            msgs[0]["tool_calls"][0]["function"]["arguments"],
+            json!(r#"{"path":"Cargo.toml"}"#)
+        );
+        // settlement → role: tool with parent id
+        assert_eq!(msgs[1]["role"], json!("tool"));
+        assert_eq!(msgs[1]["tool_call_id"], json!("intent_5"));
+        assert_eq!(msgs[1]["content"], json!(r#"{"bytes":42}"#));
+        // error settlement also becomes a tool message (with error payload)
+        assert_eq!(msgs[3]["role"], json!("tool"));
+        assert_eq!(msgs[3]["tool_call_id"], json!("intent_5"));
+        assert!(msgs[3]["content"].as_str().unwrap().contains("boom"));
+    }
+
+    #[test]
+    fn request_body_sends_tools_when_specs_present() {
+        let cfg = OpenAiConfig::new("https://x.example/v1", "m", "k");
+        let spec = json!({
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "read_file (read-only)",
+                "parameters": { "type": "object", "properties": {} },
+            },
+        });
+        let with = OpenAiProvider::new(cfg.clone()).with_tool_specs(vec![spec]);
+        let body = with.request_body(&[]);
+        assert_eq!(body["tools"].as_array().map(Vec::len), Some(1));
+        let without = OpenAiProvider::new(cfg).request_body(&[]);
+        assert!(without.get("tools").is_none());
+    }
+
+    #[test]
+    fn parse_completion_prefers_tool_calls_over_text() {
+        let resp = json!({
+            "choices": [{
+                "message": {
+                    "content": "I will call a tool",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": "{\"path\":\"Cargo.toml\"}",
+                        },
+                    }],
+                },
+            }],
+        });
+        let out = OpenAiProvider::parse_completion(&resp).unwrap();
+        match out {
+            ProviderOutput::ToolCall { tool, input } => {
+                assert_eq!(tool, "read_file");
+                assert_eq!(input["path"], json!("Cargo.toml"));
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_completion_handles_text_only_and_malformed() {
+        // Text-only: Final.
+        let text = json!({ "choices": [{ "message": { "content": "done" } }] });
+        assert!(matches!(
+            OpenAiProvider::parse_completion(&text).unwrap(),
+            ProviderOutput::Final { .. }
+        ));
+        // No choices → malformed.
+        assert!(OpenAiProvider::parse_completion(&json!({})).is_err());
+        // Tool call missing function.name → malformed.
+        let bad = json!({ "choices": [{ "message": { "tool_calls": [{ "id": "x" }] } }] });
+        assert!(OpenAiProvider::parse_completion(&bad).is_err());
+        // Empty tool_calls array + content → Final by content.
+        let empty_calls = json!({
+            "choices": [{ "message": { "content": "hi", "tool_calls": [] } }],
+        });
+        assert!(matches!(
+            OpenAiProvider::parse_completion(&empty_calls).unwrap(),
+            ProviderOutput::Final { .. }
+        ));
     }
 
     #[test]

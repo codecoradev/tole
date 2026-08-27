@@ -67,6 +67,16 @@ impl Tool for ReadFileTool {
         format!("read file {path}")
     }
 
+    fn spec(&self) -> Option<Value> {
+        Some(json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Workspace-relative file path (no .., no absolute paths)" }
+            },
+            "required": ["path"]
+        }))
+    }
+
     fn execute(&self, input: Value) -> Result<Value, String> {
         let Some(path) = input.get("path").and_then(Value::as_str) else {
             return Err("read_file: missing 'path'".into());

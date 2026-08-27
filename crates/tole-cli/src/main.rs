@@ -166,7 +166,7 @@ fn run_command(
     println!("session: {session_id}");
 
     let registry = build_registry(build_approver(allow_patterns, yes))?;
-    let mut provider = OpenAiProvider::new(cfg);
+    let mut provider = OpenAiProvider::new(cfg).with_tool_specs(registry.specs());
     let outcome = run_turn(&mut storage, &mut provider, &registry, prompt)?;
     report_outcome(&session_id, outcome);
     Ok(())
@@ -190,7 +190,7 @@ fn resume_command(
     let mut storage = JsonlStorage::open(&path).context("replaying session log")?;
 
     let registry = build_registry(build_approver(allow_patterns, yes))?;
-    let mut provider = OpenAiProvider::new(cfg);
+    let mut provider = OpenAiProvider::new(cfg).with_tool_specs(registry.specs());
     let outcome = resume_turn(&mut storage, &mut provider, &registry)?;
     report_outcome(id, outcome);
     Ok(())

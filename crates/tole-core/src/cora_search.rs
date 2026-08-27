@@ -8,9 +8,7 @@
 
 use crate::subprocess::{run_with_timeout, SUBPROCESS_TIMEOUT};
 use crate::tool::{Risk, Tool};
-#[cfg(test)]
-use serde_json::json;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::process::Command;
 #[cfg(test)]
 use std::time::Duration;
@@ -63,6 +61,16 @@ impl Tool for CoraSearchTool {
 
     fn risk(&self) -> Risk {
         Risk::ReadOnly
+    }
+
+    fn spec(&self) -> Option<Value> {
+        Some(json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "description": "Search query for the cora code index" }
+            },
+            "required": ["query"]
+        }))
     }
 
     fn execute(&self, input: Value) -> Result<Value, String> {
