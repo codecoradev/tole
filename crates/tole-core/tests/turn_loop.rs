@@ -244,10 +244,26 @@ fn turn_tool_failure_settles_error_and_replans() {
 fn turn_budget_guard_trips_on_infinite_tool_loop() {
     let dir = tmpdir("budget");
     let mut s = JsonlStorage::create(&dir, "bg", None).unwrap();
-    let mut p = MockProvider::always(ProviderOutput::ToolCall {
-        tool: "echo".into(),
-        input: json!({}),
-    });
+    // Distinct input per step so the E10 loop guard never fires — this
+    // test exercises the *budget* ceiling only.
+    struct Varying {
+        step: std::cell::Cell<usize>,
+    }
+    impl Provider for Varying {
+        fn complete(
+            &mut self,
+            _t: &[tole_core::entry::Entry],
+        ) -> Result<ProviderOutput, ProviderError> {
+            self.step.set(self.step.get() + 1);
+            Ok(ProviderOutput::ToolCall {
+                tool: "echo".into(),
+                input: json!({ "n": self.step.get() }),
+            })
+        }
+    }
+    let mut p = Varying {
+        step: std::cell::Cell::new(0),
+    };
     let mut reg = ToolRegistry::new();
     reg.register(Box::new(EchoTool)).unwrap();
 
@@ -260,6 +276,66 @@ fn turn_budget_guard_trips_on_infinite_tool_loop() {
         .filter(|e| e.kind.as_str() == "intent")
         .count();
     assert_eq!(intents, MAX_STEPS);
+}
+
+#[test]
+fn turn_loop_guard_trips_on_repeated_identical_calls() {
+    let dir = tmpdir("loopguard");
+    let mut s = JsonlStorage::create(&dir, "lg", None).unwrap();
+    // Identical call, forever: the guard trips at LOOP_TRIP_AFTER.
+    let mut p = MockProvider::always(ProviderOutput::ToolCall {
+        tool: "echo".into(),
+        input: json!({ "same": true }),
+    });
+    let mut reg = ToolRegistry::new();
+    reg.register(Box::new(EchoTool)).unwrap();
+
+    let out = run_turn(&mut s, &mut p, &reg, "hi").unwrap();
+    assert!(matches!(out, TurnOutcome::LoopDetected { count: 3, .. }));
+    // Durable record: an error entry explains the trip.
+    assert!(s
+        .entries()
+        .iter()
+        .any(|e| { e.kind.as_str() == "error" && e.payload["error"] == json!("loop detected") }));
+    // Only 2 sandwiches settled: the third call is refused before execute.
+    let intents = s
+        .entries()
+        .iter()
+        .filter(|e| e.kind.as_str() == "intent")
+        .count();
+    assert_eq!(intents, 2);
+}
+
+#[test]
+fn turn_loop_guard_resets_on_different_input() {
+    let dir = tmpdir("loopreset");
+    let mut s = JsonlStorage::create(&dir, "lr", None).unwrap();
+    // a a b a a b … never 3 identical in a row: budget must be the trip,
+    // not the loop guard.
+    struct Alternating {
+        i: std::cell::Cell<usize>,
+    }
+    impl Provider for Alternating {
+        fn complete(
+            &mut self,
+            _t: &[tole_core::entry::Entry],
+        ) -> Result<ProviderOutput, ProviderError> {
+            self.i.set(self.i.get() + 1);
+            let which = if (self.i.get() - 1) % 3 < 2 { "a" } else { "b" };
+            Ok(ProviderOutput::ToolCall {
+                tool: "echo".into(),
+                input: json!({ "x": which }),
+            })
+        }
+    }
+    let mut p = Alternating {
+        i: std::cell::Cell::new(0),
+    };
+    let mut reg = ToolRegistry::new();
+    reg.register(Box::new(EchoTool)).unwrap();
+
+    let out = run_turn(&mut s, &mut p, &reg, "hi").unwrap();
+    assert!(matches!(out, TurnOutcome::BudgetExhausted));
 }
 
 #[test]

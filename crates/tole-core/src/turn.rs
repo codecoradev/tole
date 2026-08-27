@@ -9,7 +9,7 @@
 
 use crate::approval::Verdict;
 use crate::entry::{EntryType, NewEntry};
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::machine::{
     begin, finish, resume, settle_err, settle_ok, EffectHandle, ReplaySafety, Resume,
@@ -22,6 +22,11 @@ use crate::tool::{Risk, ToolRegistry};
 /// Hard ceiling on provider steps in one turn (loop-guard).
 pub const MAX_STEPS: usize = 32;
 
+/// Consecutive identical tool calls (same tool + same input) before the
+/// loop guard trips (E10). Identical calls are never progress — they are
+/// the cheapest failure mode to detect deterministically.
+pub const LOOP_TRIP_AFTER: usize = 3;
+
 /// Why a turn ended.
 #[derive(Debug)]
 pub enum TurnOutcome {
@@ -29,6 +34,9 @@ pub enum TurnOutcome {
     Final { text: String },
     /// Step budget exhausted — persistent loop-guard trip.
     BudgetExhausted,
+    /// The model repeated the same tool call (same tool + same input)
+    /// `LOOP_TRIP_AFTER` times in a row (E10 loop guard).
+    LoopDetected { tool: String, count: usize },
     /// The provider asked for a tool that is not registered.
     UnknownTool { name: String },
     /// The provider asked for a non-ReadOnly tool: needs the approval
@@ -174,6 +182,38 @@ pub fn resume_turn(
     drive(s, p, registry)
 }
 
+/// Fingerprint of a tool call for the E10 loop guard: tool name + canonical
+/// (sorted-keys) JSON of the input, hashed with the default hasher. Same
+/// call → same fingerprint regardless of key order in the input object.
+pub fn call_fingerprint(tool: &str, input: &Value) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    tool.hash(&mut h);
+    canonical_json(input).hash(&mut h);
+    h.finish()
+}
+
+/// Canonical JSON string: object keys sorted recursively, so `{a,b}` and
+/// `{b,a}` fingerprint identically.
+fn canonical_json(v: &Value) -> String {
+    match v {
+        Value::Object(map) => {
+            let mut keys: Vec<&str> = map.keys().map(String::as_str).collect();
+            keys.sort();
+            let parts: Vec<String> = keys
+                .iter()
+                .map(|k| format!("{:?}:{}", k, canonical_json(&map[*k])))
+                .collect();
+            format!("{{{}}}", parts.join(","))
+        }
+        Value::Array(items) => {
+            let parts: Vec<String> = items.iter().map(canonical_json).collect();
+            format!("[{}]", parts.join(","))
+        }
+        _ => serde_json::to_string(v).unwrap_or_default(),
+    }
+}
+
 /// The planning loop shared by [`run_turn`] and [`resume_turn`]:
 /// provider step → (tool sandwich)* → Final, under the step budget.
 fn drive(
@@ -181,6 +221,11 @@ fn drive(
     p: &mut dyn Provider,
     registry: &ToolRegistry,
 ) -> Result<TurnOutcome, StorageError> {
+    // E10 loop guard: fingerprint of the last tool call (tool + canonical
+    // input), with its consecutive repeat count. Identical calls are
+    // never progress.
+    let mut last_fp: Option<u64> = None;
+    let mut streak: usize = 0;
     for _ in 0..MAX_STEPS {
         let transcript = s.entries().to_vec();
         let next = match p.complete(&transcript) {
@@ -206,6 +251,24 @@ fn drive(
                 return Ok(TurnOutcome::Final { text });
             }
             ProviderOutput::ToolCall { tool, input } => {
+                // E10: fingerprint before anything else — the guard must
+                // see every call, including ones the registry will refuse.
+                let fp = call_fingerprint(&tool, &input);
+                streak = if Some(fp) == last_fp { streak + 1 } else { 1 };
+                last_fp = Some(fp);
+                if streak >= LOOP_TRIP_AFTER {
+                    append_turn_error(
+                        s,
+                        "loop detected",
+                        &format!(
+                            "tool {tool} called with identical input {streak} times in a row (guard trips at {LOOP_TRIP_AFTER})"
+                        ),
+                    )?;
+                    return Ok(TurnOutcome::LoopDetected {
+                        tool,
+                        count: streak,
+                    });
+                }
                 let Some(t) = registry.get(&tool) else {
                     // Durable record, same contract as the other abort paths.
                     append_turn_error(s, "unknown tool", &tool)?;

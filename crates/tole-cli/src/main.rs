@@ -13,7 +13,7 @@ use tole_core::cora_search::CoraSearchTool;
 use tole_core::openai::{OpenAiConfig, OpenAiProvider};
 use tole_core::storage::{JsonlStorage, Storage};
 use tole_core::tool::ToolRegistry;
-use tole_core::turn::{resume_turn, run_turn, TurnOutcome};
+use tole_core::turn::{resume_turn, run_turn, TurnOutcome, LOOP_TRIP_AFTER};
 
 /// Where sessions live unless the user overrides it.
 const DEFAULT_SESSIONS_DIR: &str = ".tole/sessions";
@@ -233,6 +233,12 @@ fn report_outcome(session_id: &str, outcome: TurnOutcome) {
         TurnOutcome::BudgetExhausted => {
             eprintln!("tole: step budget exhausted (resume with: tole resume {session_id})");
             std::process::exit(5);
+        }
+        TurnOutcome::LoopDetected { tool, count } => {
+            eprintln!(
+                "tole: loop detected — tool `{tool}` called with identical input {count} times in a row (guard trips at {LOOP_TRIP_AFTER}); resume with: tole resume {session_id}"
+            );
+            std::process::exit(7);
         }
         TurnOutcome::Storage(e) => {
             eprintln!("tole: storage error: {e}");
