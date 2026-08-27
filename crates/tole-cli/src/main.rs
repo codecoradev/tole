@@ -12,6 +12,7 @@ use crate::tools::WriteFileTool;
 use tole_core::cora_search::CoraSearchTool;
 use tole_core::file_tools::{DeleteFileTool, EditFileTool};
 use tole_core::gh::GhTool;
+use tole_core::git::GitTool;
 use tole_core::openai::{OpenAiConfig, OpenAiProvider};
 use tole_core::read_file::ReadFileTool;
 use tole_core::storage::{JsonlStorage, Storage};
@@ -146,6 +147,9 @@ fn build_registry(approver: InteractiveApprover<approver::StdioPrompt>) -> Resul
         .map_err(|e| anyhow::anyhow!("registering edit_file: {e}"))?;
     reg.register(Box::new(GhTool::new("codecoradev/tole")))
         .map_err(|e| anyhow::anyhow!("registering gh: {e}"))?;
+    // Light git: status/diff/add/commit (push stays human).
+    reg.register(Box::new(GitTool::new().in_dir(cwd.clone())))
+        .map_err(|e| anyhow::anyhow!("registering git: {e}"))?;
     // Destructive tools: interactive-approver-only registration; every
     // call prompts — allowlists and --yes never apply (PRD risk table).
     reg.register(Box::new(DeleteFileTool::new(cwd)))
