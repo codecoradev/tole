@@ -2,7 +2,7 @@
 
 Durable Rust agent harness: write-once conversation tree + register state machine over JSONL session files, with risk-tiered approval gates.
 
-Status: Phase 0 - blueprint and scaffold.
+Status: Phase 2 - tools and MVP gate (agent harness live).
 
 ## Workspace
 - crates/tole-core - platform-agnostic lib (state machine, storage, Tool/Approver traits)
