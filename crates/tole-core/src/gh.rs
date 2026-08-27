@@ -40,19 +40,40 @@ impl GhOp {
                 .filter(|v| !v.trim().is_empty())
                 .ok_or_else(|| format!("gh: missing or empty '{k}'"))
         };
+        /// Positional and flag-adjacent values must never look like gh
+        /// flags: a model-supplied `number` or `base` of `--repo` would
+        /// redirect the command (argument injection past the whitelist).
+        /// Values passed as option payloads (`--body X`) are consumed by
+        /// clap as plain values, but we still reject a leading dash for
+        /// defense in depth.
+        fn no_flags(k: &str, v: &str) -> Result<String, String> {
+            if v.starts_with('-') {
+                return Err(format!("gh: '{k}' must not start with '-': {v:?}"));
+            }
+            Ok(v.to_string())
+        }
         match self {
-            GhOp::IssueComment => Ok(vec![
-                "issue".into(),
-                "comment".into(),
-                s("number")?,
-                "--body".into(),
-                s("body")?,
-            ]),
+            GhOp::IssueComment => {
+                // Issue numbers are digits by definition.
+                let number = s("number")?;
+                if !number.chars().all(|c| c.is_ascii_digit()) {
+                    return Err(format!(
+                        "gh: 'number' must be an issue number, got {number:?}"
+                    ));
+                }
+                Ok(vec![
+                    "issue".into(),
+                    "comment".into(),
+                    number,
+                    "--body".into(),
+                    s("body")?,
+                ])
+            }
             GhOp::IssueCreate => Ok(vec![
                 "issue".into(),
                 "create".into(),
                 "--title".into(),
-                s("title")?,
+                no_flags("title", &s("title")?)?,
                 "--body".into(),
                 s("body")?,
             ]),
@@ -60,11 +81,22 @@ impl GhOp {
                 "pr".into(),
                 "create".into(),
                 "--title".into(),
-                s("title")?,
+                no_flags("title", &s("title")?)?,
                 "--body".into(),
                 s("body")?,
                 "--base".into(),
-                s("base")?.clone(),
+                // Branch names: alphanumeric plus - _ . / — nothing else,
+                // and never a leading dash.
+                {
+                    let base = s("base")?;
+                    if !base
+                        .chars()
+                        .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
+                    {
+                        return Err(format!("gh: 'base' is not a valid branch name: {base:?}"));
+                    }
+                    no_flags("base", &base)?
+                },
             ]),
         }
     }
@@ -217,6 +249,41 @@ mod tests {
         assert!(t
             .command_line(&json!({ "op": "issue_comment", "body": "x" }))
             .is_err());
+    }
+
+    #[test]
+    fn rejects_argument_injection() {
+        let t = GhTool::new("codecoradev/tole");
+        // number: must be digits — no flags, no repo redirects.
+        assert!(t
+            .command_line(&json!({
+                "op": "issue_comment", "number": "--repo", "body": "x"
+            }))
+            .is_err());
+        // base: branch-name charset only.
+        assert!(t
+            .command_line(&json!({
+                "op": "pr_create", "title": "t", "body": "b", "base": "--flag"
+            }))
+            .is_err());
+        assert!(t
+            .command_line(&json!({
+                "op": "pr_create", "title": "t", "body": "b", "base": "evil branch;rm"
+            }))
+            .is_err());
+        // title: never a leading dash.
+        assert!(t
+            .command_line(&json!({
+                "op": "issue_create", "title": "--web", "body": "b"
+            }))
+            .is_err());
+        // body: payload of --body; clap consumes it as a value, but the
+        // audit string still quotes anything dash-led.
+        assert!(t
+            .command_line(&json!({
+                "op": "issue_comment", "number": "7", "body": "--repo x/y"
+            }))
+            .is_ok());
     }
 
     #[test]
