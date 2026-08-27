@@ -15,7 +15,7 @@
 //! the `uteke` binary is missing, they are skipped with a warning
 //! instead of appearing as phantom tools that fail on every call.
 
-use crate::subprocess::{run_with_timeout, SUBPROCESS_TIMEOUT};
+use crate::subprocess::{run_with_timeout, run_with_timeout_stdin, SUBPROCESS_TIMEOUT};
 use crate::tool::{Risk, Tool};
 use serde_json::{json, Value};
 use std::process::Command;
@@ -81,6 +81,15 @@ impl Tool for UtekeRecallTool {
         let mut cmd = Command::new("uteke");
         match input.get("room").and_then(Value::as_str) {
             Some(room) if !room.trim().is_empty() => {
+                // Same argv-flag-injection defense as UtekeDocumentTool:
+                // a room like "--json" must never reach the argv.
+                if room.starts_with('-')
+                    || !room
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                {
+                    return Err("room must be [a-zA-Z0-9-_] and not start with a hyphen".into());
+                }
                 // Room-scoped: uteke room recall <room> "<query>" --limit N --json
                 cmd.arg("room")
                     .arg("recall")
@@ -205,31 +214,16 @@ impl Tool for UtekeDocumentTool {
 
         // 1) Create/update the document (content via stdin: no argv
         //    length limits, no content ever visible in `ps` output).
+        //    Uses run_with_timeout_stdin: drain threads on all three
+        //    pipes — no deadlock on large documents — and the hard
+        //    subprocess timeout every other invocation gets.
         let mut cmd = Command::new("uteke");
         cmd.arg("doc")
             .arg("create")
             .arg(slug)
             .arg("--file")
             .arg("-");
-        cmd.stdin(std::process::Stdio::piped());
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| format!("spawning uteke doc create: {e}"))?;
-        {
-            use std::io::Write;
-            let stdin = child
-                .stdin
-                .as_mut()
-                .ok_or_else(|| "uteke stdin unavailable".to_owned())?;
-            stdin
-                .write_all(markdown.as_bytes())
-                .map_err(|e| format!("writing document to uteke stdin: {e}"))?;
-        }
-        let out = child
-            .wait_with_output()
-            .map_err(|e| format!("waiting for uteke doc create: {e}"))?;
+        let out = run_with_timeout_stdin(&mut cmd, SUBPROCESS_TIMEOUT, markdown.as_bytes())?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
             let snippet: String = stderr.chars().take(500).collect();
@@ -328,5 +322,28 @@ mod tests {
         let t2 = UtekeDocumentTool::new(None);
         let d2 = t2.describe(&json!({"slug": "retro-b1", "room": "ops"}));
         assert!(d2.contains("ops"), "{d2}");
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+
+    #[test]
+    fn recall_rejects_flag_like_room() {
+        // Regression: room values must never reach argv as flags.
+        let t = UtekeRecallTool::new();
+        let err = t
+            .execute(json!({"query": "x", "room": "--json"}))
+            .unwrap_err();
+        assert!(err.contains("not start with a hyphen"), "{err}");
+    }
+
+    #[test]
+    fn recall_rejects_bad_room_charset() {
+        let t = UtekeRecallTool::new();
+        assert!(t
+            .execute(json!({"query": "x", "room": "bad room"}))
+            .is_err());
     }
 }
