@@ -179,7 +179,10 @@ impl OpenAiProvider {
                 }
                 "tool_result" | "error" => {
                     // Settlement of the intent this entry hangs under.
-                    // Errors carry `error` instead of `output`.
+                    // Errors carry `error` instead of `output`. Content is
+                    // scrubbed before the wire (E11): the durable log keeps
+                    // the original locally, the provider never sees the key
+                    // even when a tool echoes it back.
                     let content = if e.kind.as_str() == "tool_result" {
                         e.payload
                             .get("output")
@@ -191,7 +194,7 @@ impl OpenAiProvider {
                     messages.push(json!({
                         "role": "tool",
                         "tool_call_id": e.parent_id,
-                        "content": content.to_string(),
+                        "content": scrub(&content.to_string(), &self.cfg.api_key),
                     }));
                 }
                 _ => {}
@@ -237,7 +240,18 @@ impl OpenAiProvider {
                 .and_then(Value::as_str)
                 .map(str::to_string)
                 .unwrap_or_else(|| "{}".into());
-            let input: Value = serde_json::from_str(&args).unwrap_or(json!({}));
+            let input: Value = match serde_json::from_str(&args) {
+                Ok(v) => v,
+                Err(err) => {
+                    // Malformed arguments from the model: surface the parse
+                    // error as the tool result instead of silently running
+                    // the tool with `{}` — the model can retry with valid JSON.
+                    return Ok(ProviderOutput::ToolCall {
+                        tool: name.to_string(),
+                        input: json!({ "__arguments_parse_error": err.to_string(), "raw": args }),
+                    });
+                }
+            };
             return Ok(ProviderOutput::ToolCall {
                 tool: name.to_string(),
                 input,
