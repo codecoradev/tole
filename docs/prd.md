@@ -2,11 +2,32 @@
 
 | | |
 |---|---|
-| **Product** | tole — durable Rust agent harness |
+| **Product** | tole — durable conversational harness |
 | **Repo** | `codecoradev/tole` (MIT, adaptation of pi harness spec) |
-| **Document version** | v1.0 (Phase 0) |
-| **Status** | Draft — approved before Phase 1 coding |
+| **Document version** | v1.1 (2026-08-27 replan: chat-first) |
+| **Status** | v1.0 approved & executed through Phase 2; v1.1 replan approved |
 | **Owner** | CodeCora |
+
+---
+
+## 0. Identity (v1.1 replan)
+
+> **tole = a durable conversational harness**: a personal-assistant chatbot
+> that can call tools, whose sessions persist and resume. Light coding
+> ability comes from tools — it is not an autonomous coding agent.
+
+- **Primary direction**: chatbot / personal assistant (`tole chat`), with
+  durable sessions as the core differentiator (write-once log, crash-resume,
+  replayable audit).
+- **Optional integrations** (first-class builtins when present):
+  uteke (memory: recall + documents) and cora-code (code intelligence).
+- **Coding-lite**: file CRUD + git add/commit + gh issue/PR ops exist as
+  tools; the agent can do light coding work interactively.
+- **Dynamic tools**: a generic `run_command` builtin (approval-gated) lets
+  the model use any CLI on the host without recompilation; no TOML tool DSL
+  (rejected: poor UX).
+- Single provider protocol (OpenAI-compatible; `TOLE_*` > `OPENAI_*` env)
+  is sufficient for the foreseeable future.
 
 ---
 
@@ -31,9 +52,9 @@ Current LLM agents (pi, Claude Code, etc.) are **ephemeral**: state lives in mem
 
 | # | Workflow (placeholder) | Description | Status |
 |---|---|---|---|
-| W1 | `fix-gh-issue` | Agent reads a GitHub issue via gh CLI → cora search to locate code → patch → create PR. | **[DEFINE BEFORE PHASE 1]** |
-| W2 | `cora-review-responder` | Agent receives findings from cora review diff → triage severity → draft PR comment reply. | **[DEFINE BEFORE PHASE 1]** |
-| W3 | `docs-qnA` | Documentation QnA via uteke recall + cora brain search → answer with citations. | **[DEFINE BEFORE PHASE 1]** |
+| W1 | `fix-gh-issue` | Agent reads a GitHub issue via gh CLI → cora search to locate code → patch → create PR. | ✅ Validated E8 (issue #33 → PR #34, agent-executed edit chain) |
+| W2 | `cora-review-responder` | Agent receives findings from cora review diff → triage severity → draft PR comment reply. | ✅ Exercised organically (CodeCora rebuttals, e.g. PR #37) |
+| W3 | `docs-qnA` | Documentation QnA via uteke recall + cora brain search → answer with citations. | Pending — now targeted by Track B (chat-first) |
 
 > Every workflow must have: a written trigger, tool call steps, maximum risk tier, and expected outcome. Without these, Phase 1 must not start.
 
