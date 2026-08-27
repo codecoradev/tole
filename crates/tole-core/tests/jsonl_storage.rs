@@ -394,3 +394,29 @@ fn seq_is_monotonic_across_mixed_records() {
     let reopened = JsonlStorage::open(dir.join("sq.jsonl")).unwrap();
     assert_eq!(reopened.last_seq(), seq0 + 2);
 }
+
+#[test]
+fn system_prompt_roundtrip_and_backward_compat() {
+    let dir = tmpdir("sysprompt");
+
+    // B2 session: prompt persisted in the header, replayed on open.
+    let mut s: JsonlStorage =
+        JsonlStorage::create_with(&dir, "sys", None, Some("You are Tole.")).unwrap();
+    assert_eq!(Storage::system_prompt(&s), Some("You are Tole."));
+    s.commit(Commit::new().entry(message(json!({"role":"user","text":"hi"}))))
+        .unwrap();
+    drop(s);
+
+    let reopened = JsonlStorage::open(dir.join("sys.jsonl")).unwrap();
+    assert_eq!(reopened.system_prompt(), Some("You are Tole."));
+
+    // Pre-B2 file (no systemPrompt field) replays as None — no error.
+    let old = dir.join("old.jsonl");
+    std::fs::write(
+        &old,
+        "{\"v\":1,\"kind\":\"header\",\"id\":\"old\",\"storageVersion\":1,\"created_at\":1,\"cwd\":\"\"}\n",
+    )
+    .unwrap();
+    let legacy = JsonlStorage::open(&old).unwrap();
+    assert_eq!(legacy.system_prompt(), None);
+}

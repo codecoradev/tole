@@ -57,6 +57,12 @@ enum Command {
         /// The user prompt for this turn.
         prompt: String,
 
+        /// System prompt for this session (highest priority; else
+        /// TOLE_SYSTEM_PROMPT env; else none). Pinned in the session
+        /// header — resume re-applies exactly this.
+        #[arg(long)]
+        system: Option<String>,
+
         /// Auto-allow Write tools matching this glob pattern without
         /// asking (e.g. --allow 'write_*'). Destructive tools are never
         /// auto-allowed. Repeatable.
@@ -88,6 +94,11 @@ enum Command {
     },
     /// Interactive multi-turn chat on one durable session (B1).
     Chat {
+        /// System prompt for a fresh session (ignored when resuming —
+        /// the header-pinned prompt wins). Highest priority; else
+        /// TOLE_SYSTEM_PROMPT env; else none.
+        #[arg(long)]
+        system: Option<String>,
         /// Resume an existing session by id instead of starting new.
         #[arg(long)]
         resume: Option<String>,
@@ -123,9 +134,16 @@ fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Run {
             prompt,
+            system,
             allow_patterns,
             yes,
-        } => run_command(&sessions_dir, &prompt, &allow_patterns, yes),
+        } => run_command(
+            &sessions_dir,
+            &prompt,
+            system.as_deref(),
+            &allow_patterns,
+            yes,
+        ),
         Command::Resume {
             id,
             allow_patterns,
@@ -133,11 +151,19 @@ fn dispatch(cli: Cli) -> Result<()> {
         } => resume_command(&sessions_dir, &id, &allow_patterns, yes),
         Command::Status { id } => status_command(&sessions_dir, &id),
         Command::Chat {
+            system,
             resume,
             last,
             allow_patterns,
             yes,
-        } => chat_command(&sessions_dir, resume, last, &allow_patterns, yes),
+        } => chat_command(
+            &sessions_dir,
+            system.as_deref(),
+            resume,
+            last,
+            &allow_patterns,
+            yes,
+        ),
     }
 }
 
@@ -188,6 +214,7 @@ fn build_registry(approver: InteractiveApprover<approver::StdioPrompt>) -> Resul
 fn run_command(
     sessions_dir: &Path,
     prompt: &str,
+    system: Option<&str>,
     allow_patterns: &[String],
     yes: bool,
 ) -> Result<()> {
@@ -198,12 +225,17 @@ fn run_command(
     let session_id = new_session_id();
     std::fs::create_dir_all(sessions_dir)
         .with_context(|| format!("creating {}", sessions_dir.display()))?;
-    let mut storage = JsonlStorage::create(sessions_dir, &session_id, None)
-        .with_context(|| format!("creating session {session_id}"))?;
+    let system_prompt = system.map(str::to_string).or_else(resolve_system_prompt);
+    let mut storage =
+        JsonlStorage::create_with(sessions_dir, &session_id, None, system_prompt.as_deref())
+            .with_context(|| format!("creating session {session_id}"))?;
     println!("session: {session_id}");
 
     let registry = build_registry(build_approver(allow_patterns, yes))?;
     let mut provider = OpenAiProvider::new(cfg).with_tool_specs(registry.specs());
+    if let Some(sys) = system_prompt.as_deref() {
+        provider = provider.with_system_prompt(sys);
+    }
     let outcome = run_turn(&mut storage, &mut provider, &registry, prompt)?;
     report_outcome(&session_id, outcome);
     Ok(())
@@ -230,6 +262,12 @@ fn resume_command(
 
     let registry = build_registry(build_approver(allow_patterns, yes))?;
     let mut provider = OpenAiProvider::new(cfg).with_tool_specs(registry.specs());
+    // B2: the system prompt is pinned in the session header — resume
+    // re-applies exactly what the session was created with (never the
+    // ambient env, which may have changed since).
+    if let Some(sys) = storage.system_prompt() {
+        provider = provider.with_system_prompt(sys);
+    }
     let outcome = resume_turn(&mut storage, &mut provider, &registry)?;
     report_outcome(id, outcome);
     Ok(())
@@ -281,6 +319,7 @@ fn latest_session_id(dir: &Path) -> Option<String> {
 /// already durable, `tole chat --resume <id>` picks the thread back up.
 fn chat_command(
     sessions_dir: &Path,
+    system: Option<&str>,
     resume: Option<String>,
     last: bool,
     allow_patterns: &[String],
@@ -318,7 +357,8 @@ fn chat_command(
     }
     let path = session_path(sessions_dir, &session_id);
     let mut storage = if fresh {
-        JsonlStorage::create(sessions_dir, &session_id, None)
+        let system_prompt = system.map(str::to_string).or_else(resolve_system_prompt);
+        JsonlStorage::create_with(sessions_dir, &session_id, None, system_prompt.as_deref())
             .with_context(|| format!("creating session {session_id}"))?
     } else {
         JsonlStorage::open(&path).context("replaying session log")?
@@ -329,6 +369,11 @@ fn chat_command(
 
     let registry = build_registry(build_approver(allow_patterns, yes))?;
     let mut provider = OpenAiProvider::new(cfg).with_tool_specs(registry.specs());
+    // B2: fresh sessions pin the resolved prompt; resumed sessions re-apply
+    // the header-pinned one (see create_with above / JsonlStorage::open).
+    if let Some(sys) = storage.system_prompt() {
+        provider = provider.with_system_prompt(sys);
+    }
 
     let stdin = std::io::stdin();
     loop {
@@ -428,6 +473,18 @@ fn chat_command(
         storage.entries().len()
     );
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// System prompt (B2)
+// ---------------------------------------------------------------------------
+
+/// Resolution order: --system flag > TOLE_SYSTEM_PROMPT env > none.
+/// The flag is handled by clap (not parsed here); env is the fallback.
+fn resolve_system_prompt() -> Option<String> {
+    std::env::var("TOLE_SYSTEM_PROMPT")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
 }
 
 // ---------------------------------------------------------------------------
