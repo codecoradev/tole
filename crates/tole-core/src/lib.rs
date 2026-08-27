@@ -27,12 +27,13 @@ pub mod openai;
 pub mod provider;
 pub mod read_file;
 pub mod register;
+pub mod run_command;
 pub mod state;
 pub mod storage;
 pub mod subprocess;
 pub mod tool;
 pub mod turn;
-pub mod uteke_search;
+pub mod uteke;
 
 /// Semantic version of the durable schema (see storage module docs).
 pub const STORAGE_VERSION: u32 = 1;
