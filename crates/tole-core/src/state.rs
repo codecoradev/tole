@@ -89,5 +89,9 @@ pub fn can_transition(from: Pc, to: Pc) -> bool {
             | (Executing, Settling)
             | (Executing, Planning)
             | (Settling, Planning)
+            // B1 chat: a delivered Final answer re-opens when the user
+            // sends the next message. The tree stays append-only — the
+            // re-open is just another transition, never a rewrite.
+            | (Final, Planning)
     )
 }
