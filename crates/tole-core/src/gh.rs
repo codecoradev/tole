@@ -17,6 +17,9 @@ pub enum GhOp {
     IssueComment,
     IssueCreate,
     PrCreate,
+    IssueView,
+    IssueList,
+    PrView,
 }
 
 impl GhOp {
@@ -26,6 +29,9 @@ impl GhOp {
             "issue_comment" => Some(GhOp::IssueComment),
             "issue_create" => Some(GhOp::IssueCreate),
             "pr_create" => Some(GhOp::PrCreate),
+            "issue_view" => Some(GhOp::IssueView),
+            "issue_list" => Some(GhOp::IssueList),
+            "pr_view" => Some(GhOp::PrView),
             _ => None,
         }
     }
@@ -98,7 +104,98 @@ impl GhOp {
                     no_flags("base", &base)?
                 },
             ]),
+            GhOp::IssueView => {
+                let number = digit_field(input, "issue number")?;
+                Ok(vec![
+                    "issue".into(),
+                    "view".into(),
+                    number,
+                    "--json".into(),
+                    ISSUE_VIEW_FIELDS.into(),
+                ])
+            }
+            GhOp::IssueList => {
+                // Optional state filter: only "open" / "closed" / "all",
+                // whitelisted — never a free-form flag the model could
+                // shape into something else.
+                let mut argv = vec![
+                    "issue".to_string(),
+                    "list".to_string(),
+                    "--json".into(),
+                    ISSUE_LIST_FIELDS.into(),
+                ];
+                if let Some(state) = input.get("state").and_then(Value::as_str) {
+                    match state {
+                        "open" | "closed" | "all" => argv.push("--state".into()),
+                        _ => {
+                            return Err(format!(
+                                "gh: 'state' must be one of open|closed|all, got {state:?}"
+                            ))
+                        }
+                    }
+                    // safety: matched against the whitelist above
+                    argv.push(state.to_string());
+                }
+                if let Some(limit) = digit_field_opt(input, "limit")? {
+                    argv.push("--limit".into());
+                    argv.push(limit);
+                }
+                Ok(argv)
+            }
+            GhOp::PrView => {
+                let number = digit_field(input, "PR number")?;
+                Ok(vec![
+                    "pr".into(),
+                    "view".into(),
+                    number,
+                    "--json".into(),
+                    PR_VIEW_FIELDS.into(),
+                ])
+            }
         }
+    }
+}
+
+/// Fields fetched by issue_view — deliberately minimal: no author email,
+/// no assignees' private data. Comments are fetched separately if needed
+/// (a follow-up read op), keeping this payload bounded.
+const ISSUE_VIEW_FIELDS: &str = "number,title,body,state,url,labels,createdAt,closedAt";
+
+const ISSUE_LIST_FIELDS: &str = "number,title,state,url,updatedAt";
+
+const PR_VIEW_FIELDS: &str =
+    "number,title,body,state,url,baseRefName,headRefName,mergeable,statusCheckRollup";
+
+/// Validate a required digit-only field (an issue/PR number).
+fn digit_field(input: &Value, what: &str) -> Result<String, String> {
+    let v = input
+        .get("number")
+        .and_then(Value::as_str)
+        .filter(|v| !v.trim().is_empty())
+        .ok_or_else(|| format!("gh: missing or empty 'number' ({what})"))?;
+    if !v.chars().all(|c| c.is_ascii_digit()) {
+        return Err(format!(
+            "gh: 'number' must be a {what} (digits only), got {v:?}"
+        ));
+    }
+    Ok(v.to_string())
+}
+
+/// Validate an optional digit-only field (e.g. `limit`).
+fn digit_field_opt(input: &Value, name: &str) -> Result<Option<String>, String> {
+    let Some(v) = input.get(name).and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    if v.trim().is_empty() {
+        return Ok(None);
+    }
+    if !v.chars().all(|c| c.is_ascii_digit()) {
+        return Err(format!("gh: '{name}' must be digits only, got {v:?}"));
+    }
+    // Cap: gh's own limit range is 1..=1000; 200 keeps payloads bounded.
+    match v.parse::<u32>() {
+        Ok(n) if (1..=200).contains(&n) => Ok(Some(n.to_string())),
+        _ => Err(format!("gh: '{name}' must be within 1..=200, got {v:?}")),
     }
 }
 
@@ -142,7 +239,7 @@ impl GhTool {
             .and_then(Value::as_str)
             .and_then(GhOp::parse)
             .ok_or_else(|| {
-                "gh: 'op' must be one of issue_comment | issue_create | pr_create".to_string()
+                "gh: 'op' must be one of issue_view | issue_list | pr_view | issue_comment | issue_create | pr_create".to_string()
             })?;
         let mut argv = op.argv(input)?;
         argv.push("--repo".into());
@@ -171,11 +268,13 @@ impl Tool for GhTool {
             "properties": {
                 "op": {
                     "type": "string",
-                    "enum": ["issue_comment", "issue_create", "pr_create"],
-                    "description": "GitHub operation to perform via gh CLI"
+                    "enum": ["issue_view", "issue_list", "pr_view", "issue_comment", "issue_create", "pr_create"],
+                    "description": "GitHub operation: issue_view/issue_list/pr_view are read-only (fetch issue/PR data as JSON); issue_comment/issue_create/pr_create are writes"
                 },
-                "repo": { "type": "string", "description": "Repository as owner/name" },
+                "repo": { "type": "string", "description": "Repository as owner/name (fixed at registration; input value is ignored)" },
                 "number": { "type": "string", "description": "Issue or PR number (digits only)" },
+                "state": { "type": "string", "enum": ["open", "closed", "all"], "description": "Filter for issue_list (optional, default open)" },
+                "limit": { "type": "string", "description": "Max results for issue_list (digits, 1..=200, default 30)" },
                 "body": { "type": "string", "description": "Markdown body for the comment, issue, or PR description" },
                 "title": { "type": "string", "description": "Title for issue_create / pr_create" },
                 "head": { "type": "string", "description": "Branch to merge FROM (pr_create)" },
@@ -191,7 +290,7 @@ impl Tool for GhTool {
             .and_then(Value::as_str)
             .and_then(GhOp::parse)
             .ok_or_else(|| {
-                "gh: 'op' must be one of issue_comment | issue_create | pr_create".to_string()
+                "gh: 'op' must be one of issue_view | issue_list | pr_view | issue_comment | issue_create | pr_create".to_string()
             })?;
         let argv = op.argv(&input)?;
         let mut cmd = Command::new(&self.bin);
@@ -256,6 +355,81 @@ mod tests {
         let t = GhTool::new("codecoradev/tole");
         assert!(t.command_line(&json!({ "op": "repo_delete" })).is_err());
         assert!(t.command_line(&json!({})).is_err());
+    }
+
+    #[test]
+    fn read_ops_build_expected_argv() {
+        let t = GhTool::new("codecoradev/tole");
+        // issue_view
+        let line = t
+            .command_line(&json!({ "op": "issue_view", "number": "33" }))
+            .unwrap();
+        assert_eq!(
+            line,
+            format!(
+                "gh issue view 33 --json '{}' --repo codecoradev/tole",
+                ISSUE_VIEW_FIELDS
+            )
+        );
+        // pr_view
+        let line = t
+            .command_line(&json!({ "op": "pr_view", "number": "34" }))
+            .unwrap();
+        assert_eq!(
+            line,
+            format!(
+                "gh pr view 34 --json '{}' --repo codecoradev/tole",
+                PR_VIEW_FIELDS
+            )
+        );
+        // issue_list default
+        let line = t.command_line(&json!({ "op": "issue_list" })).unwrap();
+        assert_eq!(
+            line,
+            format!(
+                "gh issue list --json '{}' --repo codecoradev/tole",
+                ISSUE_LIST_FIELDS
+            )
+        );
+        // issue_list with state + limit
+        let line = t
+            .command_line(&json!({ "op": "issue_list", "state": "closed", "limit": "10" }))
+            .unwrap();
+        assert_eq!(
+            line,
+            format!(
+                "gh issue list --json '{}' --state closed --limit 10 --repo codecoradev/tole",
+                ISSUE_LIST_FIELDS
+            )
+        );
+    }
+
+    #[test]
+    fn read_ops_reject_injection() {
+        let t = GhTool::new("codecoradev/tole");
+        // number must be digits
+        assert!(t
+            .command_line(&json!({ "op": "issue_view", "number": "--repo" }))
+            .is_err());
+        assert!(t
+            .command_line(&json!({ "op": "pr_view", "number": "web" }))
+            .is_err());
+        // state whitelist
+        assert!(t
+            .command_line(&json!({ "op": "issue_list", "state": "--limit" }))
+            .is_err());
+        assert!(t
+            .command_line(&json!({ "op": "issue_list", "state": "OPEN" }))
+            .is_err());
+        // limit digits + range
+        assert!(t
+            .command_line(&json!({ "op": "issue_list", "limit": "--repo" }))
+            .is_err());
+        assert!(t
+            .command_line(&json!({ "op": "issue_list", "limit": "999" }))
+            .is_err());
+        // missing number
+        assert!(t.command_line(&json!({ "op": "issue_view" })).is_err());
     }
 
     #[test]
