@@ -10,6 +10,12 @@ repository.workspace = true
 name = "tole"
 path = "src/main.rs"
 
+[features]
+# Mirrors tole-core's shell-tools gate so cfg in this crate resolves.
+# The CLI always wants the shell tools; embedders use tole-core directly.
+default = ["shell-tools"]
+shell-tools = ["tole-core/shell-tools"]
+
 [dependencies]
 tole-core = { path = "../tole-core" }
 tokio = { workspace = true }

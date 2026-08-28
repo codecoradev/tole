@@ -9,16 +9,21 @@ use std::path::{Path, PathBuf};
 
 use crate::approver::InteractiveApprover;
 use crate::tools::WriteFileTool;
+#[cfg(feature = "shell-tools")]
 use tole_core::cora_search::CoraSearchTool;
 use tole_core::file_tools::{DeleteFileTool, EditFileTool};
+#[cfg(feature = "shell-tools")]
 use tole_core::gh::GhTool;
+#[cfg(feature = "shell-tools")]
 use tole_core::git::GitTool;
 use tole_core::openai::{OpenAiConfig, OpenAiProvider};
 use tole_core::read_file::ReadFileTool;
+#[cfg(feature = "shell-tools")]
 use tole_core::run_command::RunCommandTool;
 use tole_core::storage::{JsonlStorage, Storage};
 use tole_core::tool::ToolRegistry;
 use tole_core::turn::{resume_turn, run_turn, TurnOutcome, LOOP_TRIP_AFTER};
+#[cfg(feature = "shell-tools")]
 use tole_core::uteke::{UtekeDocumentTool, UtekeRecallTool};
 
 /// Where sessions live unless the user overrides it.
@@ -208,11 +213,13 @@ fn build_registry(approver: InteractiveApprover<approver::StdioPrompt>) -> Resul
     let mut reg = ToolRegistry::with_approver(approver);
     let cwd = std::env::current_dir().context("resolving cwd")?;
     // ReadOnly tools: no approval needed.
+    #[cfg(feature = "shell-tools")]
     reg.register(Box::new(CoraSearchTool::new()))
         .map_err(|e| anyhow::anyhow!("registering cora_search: {e}"))?;
     // Uteke first-class (B4): recall (read) + document (write), behind
     // startup probing — a missing uteke binary degrades to a warning,
     // not phantom tools.
+    #[cfg(feature = "shell-tools")]
     if binary_available("uteke") {
         reg.register(Box::new(UtekeRecallTool::new()))
             .map_err(|e| anyhow::anyhow!("registering uteke_recall: {e}"))?;
@@ -222,6 +229,7 @@ fn build_registry(approver: InteractiveApprover<approver::StdioPrompt>) -> Resul
         eprintln!("tole: uteke binary not found — uteke_recall/uteke_document disabled");
     }
     // Generic dynamic command (B4): argv-split, cwd-jailed, Risk::Write.
+    #[cfg(feature = "shell-tools")]
     reg.register(Box::new(RunCommandTool::new(cwd.clone())))
         .map_err(|e| anyhow::anyhow!("registering run_command: {e}"))?;
     reg.register(Box::new(ReadFileTool::new(cwd.clone())))
@@ -231,9 +239,11 @@ fn build_registry(approver: InteractiveApprover<approver::StdioPrompt>) -> Resul
         .map_err(|e| anyhow::anyhow!("registering write_file: {e}"))?;
     reg.register(Box::new(EditFileTool::new(cwd.clone())))
         .map_err(|e| anyhow::anyhow!("registering edit_file: {e}"))?;
+    #[cfg(feature = "shell-tools")]
     reg.register(Box::new(GhTool::new("codecoradev/tole")))
         .map_err(|e| anyhow::anyhow!("registering gh: {e}"))?;
     // Light git: status/diff/add/commit (push stays human).
+    #[cfg(feature = "shell-tools")]
     reg.register(Box::new(GitTool::new().in_dir(cwd.clone())))
         .map_err(|e| anyhow::anyhow!("registering git: {e}"))?;
     // Destructive tools: interactive-approver-only registration; every
