@@ -6,6 +6,14 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# CLI-backed tools that spawn subprocesses (run_command, git, gh, cora,
+# uteke). Default-on for the CLI host; embedders on platforms without a
+# shell (Android/iOS via flutter_rust_bridge) build with
+# --no-default-features and register their own tool set.
+default = ["shell-tools"]
+shell-tools = []
+
 [dependencies]
 libc = "0.2"
 serde = { workspace = true }
