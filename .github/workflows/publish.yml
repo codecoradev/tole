@@ -1,0 +1,40 @@
+name: Publish to crates.io
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  publish:
+    name: Publish tole-core
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Idempotent by explicit classification: an "already published"
+      # rejection is a SUCCESS outcome (the crate is at this version on
+      # crates.io); any other failure is a real error and fails the job.
+      - name: Publish tole-core
+        id: publish
+        run: |
+          set +e
+          cargo publish --token ${{ secrets.CARGO_REGISTRY_TOKEN }} -p tole-core 2>&1 | tee publish.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -eq 0 ]; then
+            echo "result=published" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if grep -qiE "already (exists|uploaded|published)|duplicate version" publish.log; then
+            echo "::notice::tole-core is already at this version on crates.io — no-op"
+            echo "result=already-published" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "result=failed" >> "$GITHUB_OUTPUT"
+          exit 1
+
+      - name: Report
+        run: 'echo "publish result: ${{ steps.publish.outputs.result }}"'
+

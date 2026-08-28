@@ -1,0 +1,39 @@
+# Cora Code Review Configuration
+# See: https://github.com/codecoradev/cora-cli
+
+# Provider settings — use global config (~/.cora/config.yaml)
+
+# Review focus areas
+focus:
+  - security
+  - performance
+  - bugs
+
+# Custom rules / additional instructions for the reviewer
+rules:
+  - "Fields and struct members named `api_key` (e.g. OpenAiConfig.api_key) are runtime-populated identifiers resolved from TOLE_API_KEY / OPENAI_API_KEY env vars. They are never hardcoded secrets. Do not flag 'hardcoded password or secret' on these declarations."
+  - "Tool execution uses Command::new with explicit argv arrays (cora_search.rs, gh.rs, uteke_search.rs, subprocess.rs). Binary paths and arguments are validated (gh.rs validates number/base against strict regex; read_file/write_file enforce a path jail). This is a controlled subprocess invocation pattern, not command injection. Do not flag 'command injection' on these call sites."
+  - "The scrub() function in openai.rs replaces the provider API key in outgoing wire content (E11 redaction). The durable log intentionally keeps the original text locally; redaction is wire-only by design. Do not flag missing redaction on durable log writes."
+  - "Loop-guard fingerprinting (E10) hashes tool name + sorted-keys JSON input to detect repeated identical calls. The guard intentionally allows up to 3 identical consecutive calls before erroring; this is deliberate budget behavior, not a missing validation."
+
+# Ignore patterns
+ignore:
+  files:
+    - "*.lock"
+    - "Cargo.lock"
+    - "target/"
+  rules:
+    - "Hardcoded password or secret"
+    - "Command injection via exec/system with dynamic input"
+    - "SQL injection via string concatenation"
+
+# Hook settings
+hook:
+  mode: warn          # "warn" (print but allow) or "block" (fail commit)
+  min_severity: major # minimum severity to trigger hook action
+  max_diff_size: 5242880 # max 5MB diff chars before refusing
+
+# Output settings
+output:
+  format: pretty      # pretty, json, compact, sarif
+  color: true

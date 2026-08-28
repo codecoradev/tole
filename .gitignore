@@ -1,2 +1,6 @@
 /target
 Cargo.lock
+
+# cora review local artifacts
+.cora/
+.tole/
