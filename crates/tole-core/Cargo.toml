@@ -7,8 +7,6 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-tokio = { workspace = true }
-rusqlite = { workspace = true }
 libc = "0.2"
 serde = { workspace = true }
 serde_json = { workspace = true }
