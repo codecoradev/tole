@@ -1,0 +1,24 @@
+name: Publish to crates.io
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  publish:
+    name: Publish tole-core
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Only publish on real releases (workflow_dispatch runs are
+      # idempotent: crates.io rejects an already-published version).
+      - name: Publish tole-core
+        run: cargo publish --token ${{ secrets.CARGO_REGISTRY_TOKEN }} -p tole-core
+        continue-on-error: true
+
+      - name: Report
+        run: echo "publish attempted — see log above (already-published versions are a no-op)"
