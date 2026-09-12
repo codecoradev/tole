@@ -27,6 +27,14 @@ pub const MAX_STEPS: usize = 32;
 /// the cheapest failure mode to detect deterministically.
 pub const LOOP_TRIP_AFTER: usize = 3;
 
+/// One automatic retry for a timeout-classified provider failure per
+/// turn (issue #58): missions have died to a transient gateway timeout
+/// before any tool ran, while the same session completed end-to-end on a
+/// manual resume. The retry is a pure re-read — a failed provider step
+/// commits nothing, so the transcript is unchanged and the durable log
+/// records the retry decision before it happens.
+pub const PROVIDER_TIMEOUT_RETRIES: usize = 1;
+
 /// Why a turn ended.
 #[derive(Debug)]
 pub enum TurnOutcome {
@@ -228,11 +236,26 @@ fn drive(
     // never progress.
     let mut last_fp: Option<u64> = None;
     let mut streak: usize = 0;
+    // Issue #58: one automatic retry for a timeout-classified provider
+    // failure. Budgeted per turn, not per step — a flapping gateway must
+    // not get a retry for every step of the same turn.
+    let mut timeout_retries_left = PROVIDER_TIMEOUT_RETRIES;
     for _ in 0..MAX_STEPS {
         let transcript = s.entries().to_vec();
         let next = match p.complete(&transcript) {
             Ok(o) => o,
             Err(ProviderError(msg)) => {
+                if msg.contains("timeout") && timeout_retries_left > 0 {
+                    timeout_retries_left -= 1;
+                    // Durable, replay-visible decision record BEFORE the
+                    // retry fires (same contract as append_turn_error).
+                    append_turn_error(
+                        s,
+                        "provider timeout, retrying",
+                        &format!("transient gateway timeout; {timeout_retries_left} automatic retry left this turn"),
+                    )?;
+                    continue;
+                }
                 // Durable record, same contract as BudgetExhausted: the
                 // failure must be visible to replay, not just the caller.
                 append_turn_error(s, "provider failed", &msg)?;
