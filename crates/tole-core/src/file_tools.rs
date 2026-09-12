@@ -44,7 +44,16 @@ pub fn content_hash(content: &str) -> String {
 /// target (through symlinks) must stay inside `root`.
 fn jailed(root: &Path, rel: &str, tool: &str) -> Result<PathBuf, String> {
     let rel_path = Path::new(rel);
-    if rel_path.is_absolute() || rel.contains("..") {
+    // Component-based validation (uniform with WriteFileTool; CodeCora
+    // scan #6/#12): on Windows, drive-prefixed and rooted relatives are
+    // NOT `is_absolute()` yet `Path::join` lets both escape the base, and
+    // a substring `..` check falsely rejects benign names containing "..".
+    // Require every component to be a normal name.
+    use std::path::Component;
+    let all_normal = rel_path
+        .components()
+        .all(|c| matches!(c, Component::Normal(_)));
+    if !all_normal {
         return Err(format!("{tool}: path escapes the jail: {rel}"));
     }
     let target = root.join(rel_path);
