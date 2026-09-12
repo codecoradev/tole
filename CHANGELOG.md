@@ -36,6 +36,12 @@ live E2E findings (2026-09-11 vetio missions + 2026-09-12 optimization pass).
   step; `complete()` borrows the storage slice (#66).
 
 ### Fixed
+- `AllowlistApprover` constructor semantics (#70): documented the
+  decision pipeline (pattern match → Allow; `default` applies only to
+  NON-matches, so `new(vec!["x"], Decision::Deny)` ALLOWS "x") with a
+  regression test, and added unambiguous `allow_only`/`deny_only`
+  constructors — the misleading shape that let the guarded-replay
+  livelock test look correct for months.
 - Replay safety derives from tool risk (#68): a crash mid-sandwich no
   longer blindly re-executes a Write/Destructive tool on resume —
   Guarded intents require fresh approver consent, and a denied/absent
