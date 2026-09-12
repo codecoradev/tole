@@ -52,6 +52,14 @@ pub fn scrub_env_for_child(cmd: &mut Command) -> &mut Command {
 /// - Path-qualified programs (`/bin/rm`) are refused outright: bare
 ///   names resolve via PATH, which is the audited surface.
 ///
+/// SCOPE (read before extending): this is a best-effort blocklist for
+/// headline accidental cases, NOT a sandbox. Wrapper/interpreter
+/// bypasses (sudo apt, timeout 5 dd, find -delete, python rmtree, ...)
+/// are expected; the PRIMARY control for non-ReadOnly commands is the
+/// per-call approval gate, and complete argv sandboxing is explicitly
+/// out of scope (threat-model RC-1 row / Design Rules: adding a real
+/// sandbox is a different product).
+///
 /// Returns Err(message) when the argv must be refused.
 pub fn check_destructive_argv(argv: &[String]) -> Result<(), String> {
     const REFUSE: &str = "refused \u{2014} this command is destructive beyond the Write risk tier (disk/system teardown, or recursive deletion rooted outside the workspace). If you truly need it, ask the operator to run it manually; Destructive-tier classification is tracked in the threat model.";
@@ -122,7 +130,13 @@ pub fn check_destructive_argv(argv: &[String]) -> Result<(), String> {
             }
             return Ok(()); // rm never wraps other programs
         }
-        const WRAPPERS: [&str; 6] = ["sh", "bash", "env", "busybox", "xargs", "nohup"];
+        // sudo/doas: recursive (they wrap the real command). timeout and
+        // friends are NOT wrapper-recursed — their first non-flag token
+        // is a duration, not a program — the conservative full-token
+        // scan below still catches teardown names among their args.
+        const WRAPPERS: [&str; 8] = [
+            "sh", "bash", "env", "busybox", "xargs", "nohup", "sudo", "doas",
+        ];
         if WRAPPERS.contains(&prog.as_str()) {
             let args = &tokens[1..];
             // sh/bash command-string mode: any -c inside a short-flag
@@ -370,6 +384,8 @@ mod destructive_argv_tests {
             s(&["env", "-C", ".", "rm", "-rf", "/"]),         // env -C dir bypass
             s(&["nohup", "sh", "-c", "dd if=/dev/zero of=/dev/sda"]), // nested sh
             s(&["env", "bash", "-c", "rm -rf /etc"]),         // nested bash
+            s(&["sudo", "rm", "-rf", "/"]),                   // sudo wrapper
+            s(&["doas", "rm", "-rf", "/"]),                   // doas wrapper
         ] {
             let err = check_destructive_argv(&argv)
                 .err()
