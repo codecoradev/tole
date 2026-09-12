@@ -1,0 +1,28 @@
+name: Evals
+
+on:
+  pull_request:
+    branches: [develop, main]
+  push:
+    branches: [main]
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  tier1:
+    name: Evals Tier 1
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Tier 1: deterministic behavioral contracts (wire-shape stability,
+      # resume equivalence, abort-path contracts, approval matrix).
+      # No network, no provider, no secrets. Tier 2 NEVER runs in CI
+      # (costs money, needs provider keys) — see evals/README.md.
+      - name: Run Tier 1 evals
+        run: cargo test -p tole-core --test evals_tier1 --release

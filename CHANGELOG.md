@@ -11,6 +11,11 @@ Reliability & long-running work: the post-soak optimization batch driven by
 live E2E findings (2026-09-11 vetio missions + 2026-09-12 optimization pass).
 
 ### Added
+- MCP client (`mcp` feature): connect external MCP servers over stdio
+  via `--mcp-server name=command [args...]` and use their tools from
+  the registry. Trust model: every MCP tool is Risk::Write (approval
+  gate always fires — server metadata is never trusted), results are
+  fenced like native tool output, server env is scrubbed (#74, #77).
 - `--workspace <dir>` global flag — the file tools' jail root
   (read_file/write_file/edit_file/delete_file) is now configurable;
   defaults to the process cwd. Canonicalized and strictly validated; the

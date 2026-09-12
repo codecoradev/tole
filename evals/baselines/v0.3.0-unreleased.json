@@ -1,0 +1,44 @@
+{
+ "generated_at": "2026-09-12T18:53:49+0700",
+ "missions": [
+  {
+   "mission": "crash_resume",
+   "exit_code": 0,
+   "text": "RESUMED-DONE",
+   "stderr_tail": "",
+   "sessions_dir": "/tmp/tole-eval-crash_resume-zjuq332v",
+   "duration_secs": 32.1,
+   "prompt_tokens": 15923,
+   "completion_tokens": 572,
+   "tool_calls": 7,
+   "success": true,
+   "detail": "must finish in the same durable session after recovery"
+  },
+  {
+   "mission": "echo_chain",
+   "exit_code": 0,
+   "text": "CHAIN-OK",
+   "stderr_tail": "",
+   "sessions_dir": "/tmp/tole-eval-echo_chain-igokw_qm",
+   "duration_secs": 16.5,
+   "prompt_tokens": 4848,
+   "completion_tokens": 439,
+   "tool_calls": 2,
+   "success": true,
+   "detail": "must call a tool at least twice and confirm"
+  },
+  {
+   "mission": "read_and_report",
+   "exit_code": 0,
+   "text": "ALPHA-77",
+   "stderr_tail": "",
+   "sessions_dir": "/tmp/tole-eval-read_and_report-7lqqgv30",
+   "duration_secs": 8.9,
+   "prompt_tokens": 3187,
+   "completion_tokens": 83,
+   "tool_calls": 1,
+   "success": true,
+   "detail": "answer must contain the planted marker"
+  }
+ ]
+}

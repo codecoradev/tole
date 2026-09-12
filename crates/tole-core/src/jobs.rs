@@ -135,6 +135,37 @@ impl Tool for JobPollTool {
             .metadata()
             .map_err(|e| format!("job_poll: stat log: {e}"))?
             .len();
+        // JOB-2 (threat model): a chatty/unpolled job can grow its log
+        // without bound. Past 10 MiB, truncate to the LAST MAX_LOG_BYTES
+        // of what was ACTUALLY read — the offset derives from the buffer,
+        // not the earlier stat, so a concurrent poll that shrunk the file
+        // in between can never cause a slice panic. Safe against the
+        // append-mode child: its next write lands at the new EOF, no
+        // sparse NUL holes.
+        const MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
+        // window = cap + slack; guard on `window` so len - window cannot
+        // underflow for sizes between cap and cap+slack (CodeCora #1).
+        const SLACK: u64 = 1024;
+        let window = MAX_LOG_BYTES + SLACK;
+        if len > window {
+            // Bounded window: read only the last ~MAX_LOG_BYTES (+ 1 KiB
+            // line-boundary slack) instead of the whole file — a multi-GiB
+            // log must not OOM the host on first poll (threat-model JOB-2).
+            let mut bytes = Vec::new();
+            log_file
+                .seek(SeekFrom::Start(len - window))
+                .map_err(|e| format!("job_poll: seek log: {e}"))?;
+            log_file
+                .by_ref()
+                .take(window)
+                .read_to_end(&mut bytes)
+                .map_err(|e| format!("job_poll: read log: {e}"))?;
+            std::fs::write(&path, &bytes).map_err(|e| format!("job_poll: truncate log: {e}"))?;
+        }
+        let len = log_file
+            .metadata()
+            .map_err(|e| format!("job_poll: stat log: {e}"))?
+            .len();
         let start = len.saturating_sub(READ_WINDOW);
         use std::io::{Read, Seek, SeekFrom};
         log_file
@@ -225,19 +256,37 @@ impl Tool for JobStartTool {
         if program.is_empty() {
             return Err("job_start: program name must not be empty".into());
         }
+        // RC-1 (threat model): the SAME destructive-argv refusal as
+        // run_command — detached execution is not an exemption.
+        crate::subprocess::check_destructive_argv(&argv)?;
 
         let id = new_job_id();
         let dir = jobs_root(&self.root).join(&id);
         std::fs::create_dir_all(&dir)
             .map_err(|e| format!("job_start: creating {}: {e}", dir.display()))?;
+        // Job logs can contain arbitrary child output — keep the dir
+        // owner-only (threat model: tole-jobs exposure).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        }
         let log_path = dir.join("log");
-        let log_out =
-            std::fs::File::create(&log_path).map_err(|e| format!("job_start: log: {e}"))?;
+        // Append mode (threat-model JOB-2): the child's writes always
+        // land at current EOF, so poll-side truncation cannot create
+        // sparse NUL holes behind the child's file offset.
+        let log_out = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .map_err(|e| format!("job_start: log: {e}"))?;
         let log_err = log_out
             .try_clone()
             .map_err(|e| format!("job_start: log: {e}"))?;
 
         let mut cmd = Command::new(program);
+        // Secret env never reaches children (threat-model ENV-1).
+        crate::subprocess::scrub_env_for_child(&mut cmd);
         cmd.args(&argv[1..])
             .current_dir(&self.root)
             .stdin(Stdio::null())
@@ -275,6 +324,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn poll_truncates_runaway_log() {
+        let dir = tmpdir("logcap");
+        // Craft an oversized log + pid for a live process (this test
+        // process itself is alive, so running=true is deterministic).
+        let job_dir = dir.join(JOBS_DIR).join("j-logcap-test");
+        std::fs::create_dir_all(&job_dir).unwrap();
+        std::fs::write(job_dir.join("pid"), std::process::id().to_string()).unwrap();
+        let blob = "x".repeat(10 * 1024 * 1024 + 4096);
+        std::fs::write(job_dir.join("log"), blob).unwrap();
+
+        let poll = JobPollTool::new(dir.clone());
+        let out = poll.execute(json!({ "job": "j-logcap-test" })).unwrap();
+        assert_eq!(out["running"], json!(true));
+        let len = std::fs::metadata(job_dir.join("log")).unwrap().len();
+        // Cap = MAX_LOG_BYTES + the 1 KiB line-boundary slack.
+        assert!(
+            len <= 10 * 1024 * 1024 + 1024,
+            "log must be capped, got {len}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
