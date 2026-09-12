@@ -7,7 +7,7 @@ on:
 
 jobs:
   publish:
-    name: Publish tole-core
+    name: Publish tole-core and tole-cli
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -35,6 +35,27 @@ jobs:
           echo "result=failed" >> "$GITHUB_OUTPUT"
           exit 1
 
+      # tole-cli depends on tole-core by version (pinned in its manifest),
+      # so the core publish above MUST have succeeded (published or
+      # already-published) before the CLI can resolve its dependency.
+      - name: Publish tole-cli
+        id: publish-cli
+        run: |
+          set +e
+          cargo publish --token ${{ secrets.CARGO_REGISTRY_TOKEN }} -p tole-cli 2>&1 | tee publish-cli.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -eq 0 ]; then
+            echo "result=published" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if grep -qiE "already (exists|uploaded|published)|duplicate version" publish-cli.log; then
+            echo "::notice::tole-cli is already at this version on crates.io — no-op"
+            echo "result=already-published" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "result=failed" >> "$GITHUB_OUTPUT"
+          exit 1
+
       - name: Report
-        run: 'echo "publish result: ${{ steps.publish.outputs.result }}"'
+        run: 'echo "publish result: core=${{ steps.publish.outputs.result }} cli=${{ steps.publish-cli.outputs.result }}"'
 
