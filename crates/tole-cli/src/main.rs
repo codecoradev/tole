@@ -88,10 +88,17 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
-    /// Resume an interrupted session (E5 crash-resume).
+    /// Resume an interrupted session (E5 crash-resume). With an optional
+    /// PROMPT, appends it as a new user message and runs one full turn
+    /// (issue #55): headless flows can continue a mission without a
+    /// separate `run` session. Without PROMPT, behaves as before:
+    /// approvals-only recovery of a mid-flight turn.
     Resume {
         /// Session id to resume.
         id: String,
+
+        /// Optional new user message for the resumed session.
+        prompt: Option<String>,
 
         /// Same semantics as `run --allow`.
         #[arg(long = "allow")]
@@ -164,11 +171,13 @@ fn dispatch(cli: Cli) -> Result<()> {
         ),
         Command::Resume {
             id,
+            prompt,
             allow_patterns,
             yes,
         } => resume_command(
             &sessions_dir,
             &id,
+            prompt.as_deref(),
             &allow_patterns,
             yes,
             cli.workspace.clone(),
@@ -339,6 +348,7 @@ fn run_command(
 fn resume_command(
     sessions_dir: &Path,
     id: &str,
+    prompt: Option<&str>,
     allow_patterns: &[String],
     yes: bool,
     workspace: Option<String>,
@@ -364,7 +374,16 @@ fn resume_command(
     if let Some(sys) = storage.system_prompt() {
         provider = provider.with_system_prompt(sys);
     }
-    let outcome = resume_turn(&mut storage, &mut provider, &registry)?;
+    let outcome = match prompt {
+        Some(text) if !text.trim().is_empty() => {
+            // New instructions on a settled session (issue #55): the
+            // machine accepts a user message at a turn boundary, so
+            // reuse run_turn on the resumed storage instead of the
+            // approvals-only resume protocol.
+            run_turn(&mut storage, &mut provider, &registry, text)?
+        }
+        _ => resume_turn(&mut storage, &mut provider, &registry)?,
+    };
     report_outcome(id, outcome);
     Ok(())
 }
