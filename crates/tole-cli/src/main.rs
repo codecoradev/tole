@@ -52,6 +52,12 @@ struct Cli {
     #[arg(short, long, global = true)]
     sessions_dir: Option<String>,
 
+    /// Root directory for the file tools (read_file/write_file/edit_file/
+    /// delete_file). Defaults to the current directory. run_command/git
+    /// stay bound to the process cwd regardless.
+    #[arg(long, global = true)]
+    workspace: Option<String>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -152,12 +158,19 @@ fn dispatch(cli: Cli) -> Result<()> {
             system.as_deref(),
             &allow_patterns,
             yes,
+            cli.workspace.clone(),
         ),
         Command::Resume {
             id,
             allow_patterns,
             yes,
-        } => resume_command(&sessions_dir, &id, &allow_patterns, yes),
+        } => resume_command(
+            &sessions_dir,
+            &id,
+            &allow_patterns,
+            yes,
+            cli.workspace.clone(),
+        ),
         Command::Sessions => sessions_command(&sessions_dir),
         Command::Status { id } => status_command(&sessions_dir, &id),
         Command::Chat {
@@ -173,6 +186,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             last,
             &allow_patterns,
             yes,
+            cli.workspace.clone(),
         ),
     }
 }
@@ -209,9 +223,33 @@ fn binary_available(name: &str) -> bool {
     false
 }
 
-fn build_registry(approver: InteractiveApprover<approver::StdioPrompt>) -> Result<ToolRegistry> {
+/// Resolve the file-tools jail root: `--workspace <dir>` when given,
+/// otherwise the process cwd (issue #57). The directory must exist — a
+/// typo silently widening the jail to cwd would be worse than failing.
+/// In tools.rs (not main.rs) so a bin-only crate can unit-test it.
+pub fn resolve_workspace_root(explicit: Option<&String>) -> Result<PathBuf> {
+    match explicit {
+        Some(ws) => {
+            let p = PathBuf::from(ws);
+            let canon = p
+                .canonicalize()
+                .map_err(|e| anyhow::anyhow!("workspace directory {}: {e}", p.display()))?;
+            if !canon.is_dir() {
+                anyhow::bail!("workspace is not a directory: {}", canon.display());
+            }
+            Ok(canon)
+        }
+        None => std::env::current_dir().context("resolving cwd"),
+    }
+}
+
+fn build_registry(
+    approver: InteractiveApprover<approver::StdioPrompt>,
+    workspace: Option<&String>,
+) -> Result<ToolRegistry> {
     let mut reg = ToolRegistry::with_approver(approver);
     let cwd = std::env::current_dir().context("resolving cwd")?;
+    let file_root = resolve_workspace_root(workspace)?;
     // ReadOnly tools: no approval needed.
     #[cfg(feature = "shell-tools")]
     reg.register(Box::new(CoraSearchTool::new()))
@@ -232,12 +270,12 @@ fn build_registry(approver: InteractiveApprover<approver::StdioPrompt>) -> Resul
     #[cfg(feature = "shell-tools")]
     reg.register(Box::new(RunCommandTool::new(cwd.clone())))
         .map_err(|e| anyhow::anyhow!("registering run_command: {e}"))?;
-    reg.register(Box::new(ReadFileTool::new(cwd.clone())))
+    reg.register(Box::new(ReadFileTool::new(file_root.clone())))
         .map_err(|e| anyhow::anyhow!("registering read_file: {e}"))?;
-    // Write tools: gated per call. The jail root is the cwd.
-    reg.register(Box::new(WriteFileTool::new(cwd.clone())))
+    // Write tools: gated per call. The jail root is the workspace.
+    reg.register(Box::new(WriteFileTool::new(file_root.clone())))
         .map_err(|e| anyhow::anyhow!("registering write_file: {e}"))?;
-    reg.register(Box::new(EditFileTool::new(cwd.clone())))
+    reg.register(Box::new(EditFileTool::new(file_root.clone())))
         .map_err(|e| anyhow::anyhow!("registering edit_file: {e}"))?;
     #[cfg(feature = "shell-tools")]
     reg.register(Box::new(GhTool::new("codecoradev/tole")))
@@ -248,7 +286,7 @@ fn build_registry(approver: InteractiveApprover<approver::StdioPrompt>) -> Resul
         .map_err(|e| anyhow::anyhow!("registering git: {e}"))?;
     // Destructive tools: interactive-approver-only registration; every
     // call prompts — allowlists and --yes never apply (PRD risk table).
-    reg.register(Box::new(DeleteFileTool::new(cwd)))
+    reg.register(Box::new(DeleteFileTool::new(file_root)))
         .map_err(|e| anyhow::anyhow!("registering delete_file: {e}"))?;
     Ok(reg)
 }
@@ -263,6 +301,7 @@ fn run_command(
     system: Option<&str>,
     allow_patterns: &[String],
     yes: bool,
+    workspace: Option<String>,
 ) -> Result<()> {
     let cfg = OpenAiConfig::from_env().context(
         "missing provider config: set TOLE_BASE_URL / TOLE_MODEL / TOLE_API_KEY \
@@ -277,7 +316,7 @@ fn run_command(
             .with_context(|| format!("creating session {session_id}"))?;
     println!("session: {session_id}");
 
-    let registry = build_registry(build_approver(allow_patterns, yes))?;
+    let registry = build_registry(build_approver(allow_patterns, yes), workspace.as_ref())?;
     let mut provider = OpenAiProvider::new(cfg).with_tool_specs(registry.specs());
     if let Some(sys) = system_prompt.as_deref() {
         provider = provider.with_system_prompt(sys);
@@ -292,6 +331,7 @@ fn resume_command(
     id: &str,
     allow_patterns: &[String],
     yes: bool,
+    workspace: Option<String>,
 ) -> Result<()> {
     if !valid_session_id(id) {
         anyhow::bail!("invalid session id {id:?} (allowed: [a-z0-9-], max 64)");
@@ -306,7 +346,7 @@ fn resume_command(
     )?;
     let mut storage = JsonlStorage::open(&path).context("replaying session log")?;
 
-    let registry = build_registry(build_approver(allow_patterns, yes))?;
+    let registry = build_registry(build_approver(allow_patterns, yes), workspace.as_ref())?;
     let mut provider = OpenAiProvider::new(cfg).with_tool_specs(registry.specs());
     // B2: the system prompt is pinned in the session header — resume
     // re-applies exactly what the session was created with (never the
@@ -485,6 +525,7 @@ fn chat_command(
     last: bool,
     allow_patterns: &[String],
     yes: bool,
+    workspace: Option<String>,
 ) -> Result<()> {
     use std::io::{BufRead, Write};
 
@@ -528,7 +569,7 @@ fn chat_command(
         "tole chat — session {session_id} (Ctrl-D exits, resume: tole chat --resume {session_id})"
     );
 
-    let registry = build_registry(build_approver(allow_patterns, yes))?;
+    let registry = build_registry(build_approver(allow_patterns, yes), workspace.as_ref())?;
     let mut provider = OpenAiProvider::new(cfg).with_tool_specs(registry.specs());
     // B2: fresh sessions pin the resolved prompt; resumed sessions re-apply
     // the header-pinned one (see create_with above / JsonlStorage::open).
@@ -698,4 +739,43 @@ fn new_session_id() -> String {
         .map(|d| d.as_millis())
         .unwrap_or(0);
     format!("s-{ms:x}-{pid:x}", pid = std::process::id())
+}
+
+#[cfg(test)]
+mod workspace_tests {
+    use super::resolve_workspace_root;
+
+    #[test]
+    fn workspace_valid_dir_canonicalized() {
+        let dir = std::env::temp_dir().join(format!("tole-ws-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ws = dir.clone().into_os_string().into_string().unwrap();
+        let resolved = resolve_workspace_root(Some(&ws)).unwrap();
+        assert_eq!(resolved, dir.canonicalize().unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn workspace_missing_dir_rejected() {
+        let err = resolve_workspace_root(Some(&"/nonexistent/tole/ws".to_string()));
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn workspace_file_rejected() {
+        let f = std::env::temp_dir().join(format!("tole-ws-file-{}", std::process::id()));
+        let _ = std::fs::remove_file(&f);
+        std::fs::write(&f, "x").unwrap();
+        let ws = f.clone().into_os_string().into_string().unwrap();
+        let err = resolve_workspace_root(Some(&ws));
+        assert!(err.is_err());
+        let _ = std::fs::remove_file(&f);
+    }
+
+    #[test]
+    fn workspace_none_falls_back_to_cwd() {
+        let resolved = resolve_workspace_root(None).unwrap();
+        assert_eq!(resolved, std::env::current_dir().unwrap());
+    }
 }
