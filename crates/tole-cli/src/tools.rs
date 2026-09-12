@@ -29,7 +29,17 @@ impl WriteFileTool {
     /// tail cannot be a symlink yet.
     fn jailed(&self, rel: &str) -> Option<PathBuf> {
         let rel_path = Path::new(rel);
-        if rel_path.is_absolute() || rel.contains("..") {
+        // Component-based validation (CodeCora scan #6/#12): on Windows,
+        // drive-prefixed (`C:evil`) and rooted (`\evil`) relatives are NOT
+        // `is_absolute()`, yet `Path::join` lets both escape the base — and
+        // a substring `..` check both misses prefix tricks and falsely
+        // rejects benign names containing "..". Require every component to
+        // be a normal name; Prefix/RootDir/ParentDir are rejected outright.
+        use std::path::Component;
+        let all_normal = rel_path
+            .components()
+            .all(|c| matches!(c, Component::Normal(_)));
+        if !all_normal {
             return None;
         }
         let target = self.root.join(rel_path);
