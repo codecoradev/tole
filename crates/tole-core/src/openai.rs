@@ -105,6 +105,9 @@ pub struct OpenAiProvider {
     system_prompt: Option<String>,
     /// OpenAI `tools` array (E4.5). Empty = text-only turn, no tool use.
     tool_specs: Vec<Value>,
+    /// Provider-reported `usage` object from the last response (status
+    /// command previously showed 0/0 because it was never captured).
+    last_usage_obj: Option<Value>,
 }
 
 impl OpenAiProvider {
@@ -114,6 +117,7 @@ impl OpenAiProvider {
             timeout: Duration::from_secs(120),
             system_prompt: None,
             tool_specs: Vec::new(),
+            last_usage_obj: None,
         }
     }
 
@@ -308,7 +312,14 @@ impl Provider for OpenAiProvider {
             .send_json(&body)
             .and_then(|mut r| r.body_mut().read_json::<Value>())
             .map_err(|e| ProviderError(scrub(&e.to_string(), &self.cfg.api_key)))?;
+        // Capture provider-reported usage (issue: status showed 0/0) —
+        // exposed via `last_usage` for the turn loop's durable ledger.
+        self.last_usage_obj = resp.get("usage").cloned().filter(Value::is_object);
         Self::parse_completion(&resp)
+    }
+
+    fn last_usage(&self) -> Option<Value> {
+        self.last_usage_obj.clone()
     }
 }
 

@@ -32,6 +32,14 @@ Exit-code reference:
 
 All repository artifacts are written in **English**: commit messages, PR titles/bodies, issues, code comments, and documentation files. Keep chat discussions in whatever language you prefer — files must be English.
 
+## Live-Mission Binary Hygiene
+
+Running live agent missions against a stale binary produces misleading results (the model truthfully reports tools that no longer exist, or old behavior that was already fixed). Before any live validation or mission run:
+
+- Always build and invoke the **repo checkout binary**, not a PATH-resolved one: `cargo build --release -p tole-cli && ./target/release/tole ...`
+- If a `~/.cargo/bin/tole` shim is installed, re-sync it after every version bump: `cp target/release/tole ~/.cargo/bin/tole` — verify with `tole --version` matching the workspace version in `Cargo.toml`.
+- Note: only `tole-core` is published to crates.io; `tole-cli` is NOT on the registry, so registry-based installs do not provide the CLI.
+
 ## Design Rules
 
 - The core crate (`tole-core`) must stay platform-agnostic: no stdin/stdout, no CLI assumptions. Host interaction goes through traits (`Storage`, `Provider`, `Tool`, `Approver`).

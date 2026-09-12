@@ -9,7 +9,7 @@ use std::collections::VecDeque;
 
 /// Replays a scripted list of outputs in order, or repeats one forever.
 pub struct MockProvider {
-    script: VecDeque<ProviderOutput>,
+    script: VecDeque<Result<ProviderOutput, ProviderError>>,
     repeat: Option<ProviderOutput>,
 }
 
@@ -17,7 +17,20 @@ impl MockProvider {
     /// Replays `script` in order; errors once the script is exhausted.
     pub fn scripted(script: Vec<ProviderOutput>) -> Self {
         Self {
-            script: script.into(),
+            script: script.into_iter().map(Ok).collect(),
+            repeat: None,
+        }
+    }
+
+    /// Script provider steps including failures (issue #58 retry tests):
+    /// `Err(msg)` surfaces as `ProviderError(msg)` on that call, exactly
+    /// like a real provider error (e.g. a gateway timeout).
+    pub fn scripted_with_failures(steps: Vec<Result<ProviderOutput, String>>) -> Self {
+        Self {
+            script: steps
+                .into_iter()
+                .map(|r| r.map_err(ProviderError))
+                .collect(),
             repeat: None,
         }
     }
@@ -38,6 +51,6 @@ impl Provider for MockProvider {
         }
         self.script
             .pop_front()
-            .ok_or_else(|| ProviderError("script exhausted".into()))
+            .unwrap_or_else(|| Err(ProviderError("script exhausted".into())))
     }
 }

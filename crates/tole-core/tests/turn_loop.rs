@@ -56,9 +56,244 @@ fn tmpdir(name: &str) -> std::path::PathBuf {
     d
 }
 
+/// Mock that reports provider usage like OpenAI does.
+struct UsageMock {
+    step: std::sync::Mutex<usize>,
+    outputs: Vec<ProviderOutput>,
+    usage: Value,
+}
+impl Provider for UsageMock {
+    fn complete(&mut self, _t: &[Entry]) -> Result<ProviderOutput, ProviderError> {
+        let mut i = self.step.lock().unwrap();
+        let out = self
+            .outputs
+            .get(*i)
+            .cloned()
+            .ok_or_else(|| ProviderError("exhausted".into()));
+        *i += 1;
+        out
+    }
+    fn last_usage(&self) -> Option<Value> {
+        Some(self.usage.clone())
+    }
+}
+
+#[test]
+fn usage_rows_are_written_durably_per_step() {
+    let dir = tmpdir("usage-ledger");
+    let mut s = JsonlStorage::create(&dir, "ul", None).unwrap();
+    let mut p = UsageMock {
+        step: std::sync::Mutex::new(0),
+        outputs: vec![
+            ProviderOutput::ToolCall {
+                tool: "echo".into(),
+                input: json!({"n": 1}),
+            },
+            ProviderOutput::Final {
+                text: "done".into(),
+            },
+        ],
+        usage: json!({"prompt_tokens": 100, "completion_tokens": 7}),
+    };
+    let mut reg = ToolRegistry::new();
+    reg.register(Box::new(EchoTool)).unwrap();
+
+    let out = run_turn(&mut s, &mut p, &reg, "hi").unwrap();
+    assert!(matches!(out, TurnOutcome::Final { .. }));
+    // Two steps -> two usage rows, anchored to existing entries, replayable.
+    let usages = s.usages();
+    assert_eq!(usages.len(), 2);
+    assert_eq!(usages[0].usage["prompt_tokens"], json!(100));
+    for u in usages {
+        assert!(
+            s.entries().iter().any(|e| e.id == u.entry_id),
+            "usage row must anchor to a real entry"
+        );
+    }
+    // Totals the CLI status view sums.
+    let total_in: u64 = usages
+        .iter()
+        .filter_map(|u| u.usage.get("prompt_tokens").and_then(|v| v.as_u64()))
+        .sum();
+    assert_eq!(total_in, 200);
+}
+
+#[test]
+fn no_usage_rows_without_provider_usage() {
+    let dir = tmpdir("usage-none");
+    let mut s = JsonlStorage::create(&dir, "un", None).unwrap();
+    let mut p = MockProvider::scripted(vec![ProviderOutput::Final { text: "f".into() }]);
+    let mut reg = ToolRegistry::new();
+    reg.register(Box::new(EchoTool)).unwrap();
+    run_turn(&mut s, &mut p, &reg, "hi").unwrap();
+    assert_eq!(s.usages().len(), 0);
+}
+
 // ---------------------------------------------------------------------------
-// Provider trait + mock
+// Issue #58: harness-level retry-once on timeout-classified provider failure
 // ---------------------------------------------------------------------------
+
+#[test]
+fn provider_timeout_retried_once_then_succeeds() {
+    let dir = tmpdir("t58-retry");
+    let mut s = JsonlStorage::create(&dir, "t58r", None).unwrap();
+    let mut p = MockProvider::scripted_with_failures(vec![
+        Err("provider failed: timeout: global".into()),
+        Ok(ProviderOutput::Final {
+            text: "done".into(),
+        }),
+    ]);
+    let mut reg = ToolRegistry::new();
+    reg.register(Box::new(EchoTool)).unwrap();
+
+    let out = run_turn(&mut s, &mut p, &reg, "hi").unwrap();
+    match out {
+        TurnOutcome::Final { text } => assert_eq!(text, "done"),
+        other => panic!("expected Final after timeout retry, got {other:?}"),
+    }
+    // Durable audit trail: the retry decision must be visible to replay.
+    let errs: Vec<&Entry> = s
+        .entries()
+        .iter()
+        .filter(|e| e.kind.as_str() == "error")
+        .collect();
+    assert_eq!(errs.len(), 1);
+    assert_eq!(
+        errs[0].payload["error"],
+        json!("provider transient failure, retrying")
+    );
+    // 0 tool executions on the timeout path — the transcript the retry
+    // re-reads is unchanged by the failed step.
+    assert_eq!(s.state().pc, tole_core::state::Pc::Final);
+}
+
+#[test]
+fn provider_timeout_second_failure_aborts() {
+    let dir = tmpdir("t58-second");
+    let mut s = JsonlStorage::create(&dir, "t58s", None).unwrap();
+    let mut p = MockProvider::scripted_with_failures(vec![
+        Err("provider failed: timeout: global".into()),
+        Err("provider failed: timeout: global".into()),
+    ]);
+    let mut reg = ToolRegistry::new();
+    reg.register(Box::new(EchoTool)).unwrap();
+
+    let out = run_turn(&mut s, &mut p, &reg, "hi").unwrap();
+    match out {
+        TurnOutcome::ProviderFailed { message } => {
+            assert!(message.contains("timeout"));
+        }
+        other => panic!("expected ProviderFailed, got {other:?}"),
+    }
+    // One retry record + one final failure record.
+    let errs: Vec<&Entry> = s
+        .entries()
+        .iter()
+        .filter(|e| e.kind.as_str() == "error")
+        .collect();
+    assert_eq!(errs.len(), 2);
+    assert_eq!(
+        errs[0].payload["error"],
+        json!("provider transient failure, retrying")
+    );
+    assert_eq!(errs[1].payload["error"], json!("provider failed"));
+}
+
+#[test]
+fn provider_429_rate_limit_retried_once() {
+    let dir = tmpdir("t58-429");
+    let mut s = JsonlStorage::create(&dir, "t58q", None).unwrap();
+    let mut p = MockProvider::scripted_with_failures(vec![
+        Err("provider failed: http status: 429".into()),
+        Ok(ProviderOutput::Final {
+            text: "after-429".into(),
+        }),
+    ]);
+    let mut reg = ToolRegistry::new();
+    reg.register(Box::new(EchoTool)).unwrap();
+
+    let out = run_turn(&mut s, &mut p, &reg, "hi").unwrap();
+    match out {
+        TurnOutcome::Final { text } => assert_eq!(text, "after-429"),
+        other => panic!("expected Final after 429 retry, got {other:?}"),
+    }
+    let errs: Vec<&Entry> = s
+        .entries()
+        .iter()
+        .filter(|e| e.kind.as_str() == "error")
+        .collect();
+    assert_eq!(errs.len(), 1);
+    assert_eq!(
+        errs[0].payload["error"],
+        json!("provider transient failure, retrying")
+    );
+}
+
+#[test]
+fn non_timeout_provider_error_not_retried() {
+    let dir = tmpdir("t58-nontimeout");
+    let mut s = JsonlStorage::create(&dir, "t58n", None).unwrap();
+    let mut p = MockProvider::scripted_with_failures(vec![
+        Err("provider failed: 401 unauthorized".into()),
+        Ok(ProviderOutput::Final {
+            text: "never".into(),
+        }),
+    ]);
+    let mut reg = ToolRegistry::new();
+    reg.register(Box::new(EchoTool)).unwrap();
+
+    let out = run_turn(&mut s, &mut p, &reg, "hi").unwrap();
+    match out {
+        TurnOutcome::ProviderFailed { message } => {
+            assert!(message.contains("401"));
+        }
+        other => panic!("expected ProviderFailed, got {other:?}"),
+    }
+    // No retry record: only the terminal failure is durable.
+    let errs: Vec<&Entry> = s
+        .entries()
+        .iter()
+        .filter(|e| e.kind.as_str() == "error")
+        .collect();
+    assert_eq!(errs.len(), 1);
+    assert_eq!(errs[0].payload["error"], json!("provider failed"));
+}
+
+#[test]
+fn flapping_timeout_retries_only_once_per_turn() {
+    let dir = tmpdir("t58-flap");
+    let mut s = JsonlStorage::create(&dir, "t58f", None).unwrap();
+    // Timeout, success, then another timeout: the second timeout must NOT
+    // get a second retry (budget is per turn, not per step).
+    let mut p = MockProvider::scripted_with_failures(vec![
+        Err("provider failed: timeout: global".into()),
+        Ok(ProviderOutput::ToolCall {
+            tool: "echo".into(),
+            input: json!({"n": 1}),
+        }),
+        Err("provider failed: timeout: global".into()),
+        Ok(ProviderOutput::Final {
+            text: "never".into(),
+        }),
+    ]);
+    let mut reg = ToolRegistry::new();
+    reg.register(Box::new(EchoTool)).unwrap();
+
+    let out = run_turn(&mut s, &mut p, &reg, "hi").unwrap();
+    match out {
+        TurnOutcome::ProviderFailed { message } => assert!(message.contains("timeout")),
+        other => panic!("expected ProviderFailed, got {other:?}"),
+    }
+    let retry_records: Vec<&Entry> = s
+        .entries()
+        .iter()
+        .filter(|e| {
+            e.kind.as_str() == "error"
+                && e.payload["error"] == json!("provider transient failure, retrying")
+        })
+        .collect();
+    assert_eq!(retry_records.len(), 1);
+}
 
 #[test]
 fn mock_replays_script_in_order_then_errors() {
