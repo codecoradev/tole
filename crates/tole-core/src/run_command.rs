@@ -149,7 +149,12 @@ impl Tool for RunCommandTool {
         // No shell → no PATH trickery beyond what exec itself resolves;
         // still refuse obvious absolute/relative path forms so the audit
         // line always names a program, not a path traversal.
+        // RC-1 (threat model): destructive argv refused pre-spawn, via
+        // the shared helper (also applied by job_start).
+        crate::subprocess::check_destructive_argv(&argv)?;
         let mut cmd = Command::new(program);
+        // Secret env never reaches children (threat-model ENV-1).
+        crate::subprocess::scrub_env_for_child(&mut cmd);
         cmd.args(&argv[1..]).current_dir(&self.cwd);
         let out = run_with_timeout(&mut cmd, SUBPROCESS_TIMEOUT)?;
         let stdout = String::from_utf8_lossy(&out.stdout);
@@ -166,6 +171,64 @@ impl Tool for RunCommandTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn catastrophic_argv_refused() {
+        let t = RunCommandTool::new(PathBuf::from("/tmp"));
+        for line in [
+            "rm -rf /",
+            "rm --recursive /",
+            "rm -r ../outside",
+            "rm -rf /etc",
+            "rm -rf ~",
+            "mkfs.ext4 /dev/sda1",
+            "dd if=/dev/zero of=/dev/sda",
+            "shutdown -h now",
+            "/bin/rm -rf /",
+            "sh -c 'rm -rf /etc'",
+            "bash -lc 'dd if=/dev/zero of=/dev/sda'",
+            "env FOO=1 rm -rf /",
+        ] {
+            let err = t
+                .execute(json!({ "command": line }))
+                .err()
+                .unwrap_or_else(|| panic!("must refuse: {line}"));
+            assert!(
+                err.contains("destructive beyond the Write risk tier"),
+                "{line}"
+            );
+        }
+    }
+
+    /// Token matching must not over-refuse benign commands whose ARGUMENT
+    /// TEXT merely contains destructive keywords (CodeCora #3), and
+    /// path-qualified PROGRAMS are refused (wrapper/PATH bypass).
+    #[test]
+    fn benign_commands_with_destructive_looking_args_pass() {
+        let t = RunCommandTool::new(std::env::temp_dir());
+        for line in [
+            "cat middleware.ts",
+            "grep shutdown runbook.md",
+            "git add file",
+            "cargo add serde",
+            "echo useradd",
+        ] {
+            let out = t.execute(json!({ "command": line }));
+            assert!(out.is_ok(), "must NOT refuse: {line}");
+        }
+        // Scoped recursive rm inside the workspace stays allowed (Write
+        // tier territory), including dot-segment noise that normalizes
+        // inside.
+        assert!(t.execute(json!({ "command": "rm -rf ./build" })).is_ok());
+        assert!(t
+            .execute(json!({ "command": "rm -rf ./a/../build" }))
+            .is_ok());
+        // Path-qualified program: refused (PATH resolution is the way).
+        let err = t
+            .execute(json!({ "command": "/bin/echo hi" }))
+            .expect_err("path-qualified program must be refused");
+        assert!(err.contains("destructive beyond the Write risk tier"));
+    }
 
     #[test]
     fn classified_write_never_destructive() {

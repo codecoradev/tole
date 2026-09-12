@@ -11,6 +11,11 @@ Reliability & long-running work: the post-soak optimization batch driven by
 live E2E findings (2026-09-11 vetio missions + 2026-09-12 optimization pass).
 
 ### Added
+- MCP client (`mcp` feature): connect external MCP servers over stdio
+  via `--mcp-server name=command [args...]` and use their tools from
+  the registry. Trust model: every MCP tool is Risk::Write (approval
+  gate always fires — server metadata is never trusted), results are
+  fenced like native tool output, server env is scrubbed (#74, #77).
 - `--workspace <dir>` global flag — the file tools' jail root
   (read_file/write_file/edit_file/delete_file) is now configurable;
   defaults to the process cwd. Canonicalized and strictly validated; the
@@ -27,6 +32,12 @@ live E2E findings (2026-09-11 vetio missions + 2026-09-12 optimization pass).
   provider step anchored to the last committed entry — `tole status` now
   reports real token totals instead of 0/0 (#66).
 - Live-mission binary hygiene rules in CONTRIBUTING.md (#60, #61).
+- Agentic eval harness (issue #73, #76): Tier 1 deterministic contracts
+  wired into a dedicated Evals CI job (wire-shape stability = prefix-
+  cache contract, resume equivalence, abort-path resumability, approval
+  matrix); Tier 2 live BYOK missions scored on success/steps/usage-
+  ledger tokens; Tier 3 per-release baselines with a >25%-regression
+  diff gate (`evals/`).
 
 ### Changed
 - Retry classification: 429/rate-limit responses join timeouts as

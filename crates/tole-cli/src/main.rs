@@ -60,6 +60,13 @@ struct Cli {
     #[arg(long, global = true)]
     workspace: Option<String>,
 
+    /// Register an external MCP server over stdio: name=command [args...].
+    /// Repeatable. Every MCP tool joins the registry as Risk::Write and
+    /// goes through the normal approval gate. Requires the `mcp` feature.
+    #[cfg(feature = "mcp")]
+    #[arg(long, global = true)]
+    mcp_server: Vec<String>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -168,6 +175,8 @@ fn dispatch(cli: Cli) -> Result<()> {
             &allow_patterns,
             yes,
             cli.workspace.clone(),
+            #[cfg(feature = "mcp")]
+            cli.mcp_server.clone(),
         ),
         Command::Resume {
             id,
@@ -181,6 +190,8 @@ fn dispatch(cli: Cli) -> Result<()> {
             &allow_patterns,
             yes,
             cli.workspace.clone(),
+            #[cfg(feature = "mcp")]
+            cli.mcp_server.clone(),
         ),
         Command::Sessions => sessions_command(&sessions_dir),
         Command::Status { id } => status_command(&sessions_dir, &id),
@@ -198,6 +209,8 @@ fn dispatch(cli: Cli) -> Result<()> {
             &allow_patterns,
             yes,
             cli.workspace.clone(),
+            #[cfg(feature = "mcp")]
+            cli.mcp_server.clone(),
         ),
     }
 }
@@ -257,6 +270,7 @@ pub fn resolve_workspace_root(explicit: Option<&String>) -> Result<PathBuf> {
 fn build_registry(
     approver: InteractiveApprover<approver::StdioPrompt>,
     workspace: Option<&String>,
+    #[cfg(feature = "mcp")] mcp_servers: &[tole_core::mcp::McpServerConfig],
 ) -> Result<ToolRegistry> {
     let mut reg = ToolRegistry::with_approver(approver);
     let cwd = std::env::current_dir().context("resolving cwd")?;
@@ -307,6 +321,15 @@ fn build_registry(
     // call prompts — allowlists and --yes never apply (PRD risk table).
     reg.register(Box::new(DeleteFileTool::new(file_root)))
         .map_err(|e| anyhow::anyhow!("registering delete_file: {e}"))?;
+    // MCP servers (#74): registered last so a slow server never blocks
+    // native tool availability; per-call approval applies as usual.
+    #[cfg(feature = "mcp")]
+    for cfg in mcp_servers {
+        let names = tole_core::mcp::register_server_tools(&mut reg, cfg);
+        if names.is_empty() {
+            eprintln!("tole: mcp[{}]: no tools registered", cfg.name);
+        }
+    }
     Ok(reg)
 }
 
@@ -321,6 +344,7 @@ fn run_command(
     allow_patterns: &[String],
     yes: bool,
     workspace: Option<String>,
+    #[cfg(feature = "mcp")] mcp_server: Vec<String>,
 ) -> Result<()> {
     let cfg = OpenAiConfig::from_env().context(
         "missing provider config: set TOLE_BASE_URL / TOLE_MODEL / TOLE_API_KEY \
@@ -335,6 +359,19 @@ fn run_command(
             .with_context(|| format!("creating session {session_id}"))?;
     println!("session: {session_id}");
 
+    #[cfg(feature = "mcp")]
+    let mcp_cfgs: Vec<tole_core::mcp::McpServerConfig> = mcp_server
+        .iter()
+        .map(|s| tole_core::mcp::McpServerConfig::parse(s))
+        .collect::<Result<Vec<_>, String>>()
+        .map_err(anyhow::Error::msg)?;
+    #[cfg(feature = "mcp")]
+    let registry = build_registry(
+        build_approver(allow_patterns, yes),
+        workspace.as_ref(),
+        &mcp_cfgs,
+    )?;
+    #[cfg(not(feature = "mcp"))]
     let registry = build_registry(build_approver(allow_patterns, yes), workspace.as_ref())?;
     let mut provider = OpenAiProvider::new(cfg).with_tool_specs(registry.specs());
     if let Some(sys) = system_prompt.as_deref() {
@@ -352,6 +389,7 @@ fn resume_command(
     allow_patterns: &[String],
     yes: bool,
     workspace: Option<String>,
+    #[cfg(feature = "mcp")] mcp_server: Vec<String>,
 ) -> Result<()> {
     if !valid_session_id(id) {
         anyhow::bail!("invalid session id {id:?} (allowed: [a-z0-9-], max 64)");
@@ -366,6 +404,19 @@ fn resume_command(
     )?;
     let mut storage = JsonlStorage::open(&path).context("replaying session log")?;
 
+    #[cfg(feature = "mcp")]
+    let mcp_cfgs: Vec<tole_core::mcp::McpServerConfig> = mcp_server
+        .iter()
+        .map(|s| tole_core::mcp::McpServerConfig::parse(s))
+        .collect::<Result<Vec<_>, String>>()
+        .map_err(anyhow::Error::msg)?;
+    #[cfg(feature = "mcp")]
+    let registry = build_registry(
+        build_approver(allow_patterns, yes),
+        workspace.as_ref(),
+        &mcp_cfgs,
+    )?;
+    #[cfg(not(feature = "mcp"))]
     let registry = build_registry(build_approver(allow_patterns, yes), workspace.as_ref())?;
     let mut provider = OpenAiProvider::new(cfg).with_tool_specs(registry.specs());
     // B2: the system prompt is pinned in the session header — resume
@@ -555,6 +606,7 @@ fn chat_command(
     allow_patterns: &[String],
     yes: bool,
     workspace: Option<String>,
+    #[cfg(feature = "mcp")] mcp_server: Vec<String>,
 ) -> Result<()> {
     use std::io::{BufRead, Write};
 
@@ -598,6 +650,19 @@ fn chat_command(
         "tole chat — session {session_id} (Ctrl-D exits, resume: tole chat --resume {session_id})"
     );
 
+    #[cfg(feature = "mcp")]
+    let mcp_cfgs: Vec<tole_core::mcp::McpServerConfig> = mcp_server
+        .iter()
+        .map(|s| tole_core::mcp::McpServerConfig::parse(s))
+        .collect::<Result<Vec<_>, String>>()
+        .map_err(anyhow::Error::msg)?;
+    #[cfg(feature = "mcp")]
+    let registry = build_registry(
+        build_approver(allow_patterns, yes),
+        workspace.as_ref(),
+        &mcp_cfgs,
+    )?;
+    #[cfg(not(feature = "mcp"))]
     let registry = build_registry(build_approver(allow_patterns, yes), workspace.as_ref())?;
     let mut provider = OpenAiProvider::new(cfg).with_tool_specs(registry.specs());
     // B2: fresh sessions pin the resolved prompt; resumed sessions re-apply

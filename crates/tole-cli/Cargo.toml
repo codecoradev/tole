@@ -15,6 +15,7 @@ path = "src/main.rs"
 # The CLI always wants the shell tools; embedders use tole-core directly.
 default = ["shell-tools"]
 shell-tools = ["tole-core/shell-tools"]
+mcp = ["tole-core/mcp"]
 
 [dependencies]
 tole-core = { version = "0.3.0", path = "../tole-core" }
