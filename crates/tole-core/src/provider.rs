@@ -6,6 +6,7 @@
 //! (E4) implements the same trait — the turn loop cannot tell them apart.
 
 use crate::entry::Entry;
+use serde_json::Value;
 
 /// One completion step: the model either finishes the turn or asks for a
 /// tool. There is no mixed text+tool response — the loop forces a single
@@ -47,4 +48,12 @@ pub trait Provider {
     /// Produce the next step given the full materialized transcript
     /// (entries in commit order — user, assistant, intent, results...).
     fn complete(&mut self, transcript: &[Entry]) -> Result<ProviderOutput, ProviderError>;
+
+    /// Provider-reported usage for the LAST completed `complete()` call,
+    /// if the provider exposes it (OpenAI-compatible: the response body's
+    /// `usage` object). Consumed by the turn loop to append a durable
+    /// UsageRecord; default None so scripted/mocks stay free to ignore it.
+    fn last_usage(&self) -> Option<Value> {
+        None
+    }
 }
