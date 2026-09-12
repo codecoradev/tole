@@ -16,6 +16,8 @@ use tole_core::file_tools::{DeleteFileTool, EditFileTool};
 use tole_core::gh::GhTool;
 #[cfg(feature = "shell-tools")]
 use tole_core::git::GitTool;
+#[cfg(feature = "shell-tools")]
+use tole_core::jobs::{JobPollTool, JobStartTool};
 use tole_core::openai::{OpenAiConfig, OpenAiProvider};
 use tole_core::read_file::ReadFileTool;
 #[cfg(feature = "shell-tools")]
@@ -232,6 +234,14 @@ fn build_registry(approver: InteractiveApprover<approver::StdioPrompt>) -> Resul
     #[cfg(feature = "shell-tools")]
     reg.register(Box::new(RunCommandTool::new(cwd.clone())))
         .map_err(|e| anyhow::anyhow!("registering run_command: {e}"))?;
+    // Long-running jobs (#59): detached spawn + poll, logs inside the
+    // file-tools workspace so read_file can reach the full log.
+    #[cfg(feature = "shell-tools")]
+    reg.register(Box::new(JobStartTool::new(file_root.clone())))
+        .map_err(|e| anyhow::anyhow!("registering job_start: {e}"))?;
+    #[cfg(feature = "shell-tools")]
+    reg.register(Box::new(JobPollTool::new(file_root.clone())))
+        .map_err(|e| anyhow::anyhow!("registering job_poll: {e}"))?;
     reg.register(Box::new(ReadFileTool::new(cwd.clone())))
         .map_err(|e| anyhow::anyhow!("registering read_file: {e}"))?;
     // Write tools: gated per call. The jail root is the cwd.

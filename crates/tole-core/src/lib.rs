@@ -34,6 +34,8 @@ pub mod file_tools;
 pub mod gh;
 #[cfg(feature = "shell-tools")]
 pub mod git;
+#[cfg(feature = "shell-tools")]
+pub mod jobs;
 pub mod machine;
 pub mod mock;
 pub mod openai;
