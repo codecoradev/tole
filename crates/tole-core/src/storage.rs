@@ -428,7 +428,6 @@ impl JsonlStorage {
             // Count the complete physical line NOW — before any `continue`
             // below — so good_bytes never under-counts (an empty or skipped
             // line is still bytes that must never be truncated away).
-            good_bytes += buf.len() as u64;
             let line = match std::str::from_utf8(&buf) {
                 Ok(s) => s.trim_end().to_string(),
                 Err(_) => {
@@ -438,6 +437,7 @@ impl JsonlStorage {
                 }
             };
             if line.is_empty() {
+                good_bytes += buf.len() as u64;
                 continue;
             }
             let parsed: Result<Vec<Record>, serde_json::Error> = if line.starts_with('[') {
@@ -446,10 +446,18 @@ impl JsonlStorage {
                 serde_json::from_str::<Record>(&line).map(|r| vec![r])
             };
             let records = match parsed {
-                Ok(r) => r,
+                Ok(r) => {
+                    // Count the complete physical line only after it has
+                    // parsed (scan #47): counting before the parse made a
+                    // newline-terminated invalid final line look fully
+                    // consumed, so the truncation below never fired and the
+                    // next append bricked the session forever.
+                    good_bytes += buf.len() as u64;
+                    r
+                }
                 Err(e) => {
                     if is_at_eof(&mut reader) {
-                        break; // torn final line: discard whole
+                        break; // torn/unparseable final line: discard whole
                     }
                     return Err(StorageError::Corrupt(format!("line {lineno}: {e}")));
                 }

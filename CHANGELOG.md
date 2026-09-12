@@ -35,6 +35,18 @@ live E2E findings (2026-09-11 vetio missions + 2026-09-12 optimization pass).
 - The turn loop no longer clones the full transcript for every provider
   step; `complete()` borrows the storage slice (#66).
 
+### Fixed
+- Replay safety derives from tool risk (#68): a crash mid-sandwich no
+  longer blindly re-executes a Write/Destructive tool on resume —
+  Guarded intents require fresh approver consent, and a denied/absent
+  approver settles the intent instead of livelocking the session.
+- File-tool jails validate by path components (#68): Windows
+  drive-prefixed/rooted relatives can no longer escape via `join`, and
+  benign names containing ".." are no longer falsely rejected.
+- JSONL torn-line recovery (#68): a newline-terminated corrupt final
+  line is truncated on open instead of surviving and permanently
+  bricking the session on the next append.
+
 ## [0.2.0] — 2026-08-27
 
 Chat-first replan (v1.1): tole becomes a durable conversational harness —
