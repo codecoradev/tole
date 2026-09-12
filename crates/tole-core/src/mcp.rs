@@ -231,7 +231,8 @@ impl McpConnection {
             }
             if text.chars().count() > MAX_RESULT_CHARS {
                 let cut: String = text.chars().take(MAX_RESULT_CHARS).collect();
-                text = format!("{cut}\n…[truncated, server output exceeded {MAX_RESULT_CHARS} chars]");
+                text =
+                    format!("{cut}\n…[truncated, server output exceeded {MAX_RESULT_CHARS} chars]");
                 break;
             }
         }
