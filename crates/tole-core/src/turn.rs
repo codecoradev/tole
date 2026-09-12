@@ -16,7 +16,7 @@ use crate::machine::{
 };
 use crate::provider::{Provider, ProviderError, ProviderOutput};
 use crate::state::{Pc, StateTransition};
-use crate::storage::{Commit, Storage, StorageError};
+use crate::storage::{Commit, Storage, StorageError, UsageRecord};
 use crate::tool::{Risk, ToolRegistry};
 
 /// Hard ceiling on provider steps in one turn (loop-guard).
@@ -241,18 +241,24 @@ fn drive(
     // not get a retry for every step of the same turn.
     let mut timeout_retries_left = PROVIDER_TIMEOUT_RETRIES;
     for _ in 0..MAX_STEPS {
-        let transcript = s.entries().to_vec();
-        let next = match p.complete(&transcript) {
+        // No clone: complete() borrows the storage slice. (The old
+        // to_vec() allocated the whole transcript every provider step.)
+        let next = match p.complete(s.entries()) {
             Ok(o) => o,
             Err(ProviderError(msg)) => {
-                if msg.contains("timeout") && timeout_retries_left > 0 {
+                // Retry classification (#58 + live 429 evidence): gateway
+                // timeouts AND rate-limit rejections are both transient.
+                const TRANSIENT: [&str; 2] = ["timeout", "429"];
+                if TRANSIENT.iter().any(|k| msg.contains(k)) && timeout_retries_left > 0 {
                     timeout_retries_left -= 1;
                     // Durable, replay-visible decision record BEFORE the
                     // retry fires (same contract as append_turn_error).
                     append_turn_error(
                         s,
-                        "provider timeout, retrying",
-                        &format!("transient gateway timeout; {timeout_retries_left} automatic retry left this turn"),
+                        "provider transient failure, retrying",
+                        &format!(
+                            "gateway timeout or 429 rate limit; {timeout_retries_left} automatic retry left this turn"
+                        ),
                     )?;
                     continue;
                 }
@@ -262,6 +268,22 @@ fn drive(
                 return Ok(TurnOutcome::ProviderFailed { message: msg });
             }
         };
+        // Provider-reported usage for THIS step (None for mocks/scripts).
+        // Single capture point per step: anchored to the last committed
+        // entry — exactly what the request covered as input (the answer
+        // itself is not part of its own request). Usage-only commits
+        // carry no transition, so they are legal mid-Planning and
+        // replay-safe (Record::Usage).
+        if let Some(u) = p.last_usage() {
+            if let Some(last) = s.entries().last() {
+                s.commit(Commit::new().usage(UsageRecord {
+                    id: String::new(),
+                    entry_id: last.id.clone(),
+                    usage: u,
+                    cost_usd: None,
+                }))?;
+            }
+        }
         match next {
             ProviderOutput::Final { text } => {
                 let seq = s.state().seq;
