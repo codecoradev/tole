@@ -40,8 +40,8 @@ lives) / **gap** (tracked) / **N/A** (with rationale).
 | Supply chain (deps) | **control** | Cargo Audit + Trivy FS Scan required by rulesets on every PR and push. |
 | Resource exhaustion | **control + fixed here (JOB-2)** | Provider 120 s timeout, subprocess 30 s ceiling, step budget 32, loop guard, read caps; job logs now truncated at poll when >10 MiB (unbounded disk growth previously possible while unpolled). |
 | Session/message tampering | **control** | Append-only JSONL, CAS state transitions, seq monotonicity, torn-line recovery with truncation (#68); compaction never drops entries. |
-| Injection via config | **N/A → control** | `.cora.yaml`/session headers are owner-controlled files; MCP (future, #74) adds an untrusted-config surface and MUST re-open this row. |
-| Identity & authz of sub-agents | **N/A** | tole v0 is single-agent, single-tenant. |
+| Injection via config | **control (MCP shipped)** | `.cora.yaml`/session headers are owner-controlled. MCP servers (#74) add an untrusted surface: server-supplied tool metadata is never trusted for risk tier (everything is Write → approval gate), tool results flow through the same fence/scrub path as native results, and the connection env is scrubbed. Residual: a malicious MCP server controls its own tool descriptions (model-visible) — treat server config as operator trust. |
+| Identity & authz of sub-agents | **N/A** | tole v0 is single-agent, single-tenant. MCP servers are external tools, not sub-agents. |
 | Human oversight | **control** | Risk-tiered approval gate (every non-ReadOnly call; Destructive never auto-allowed), #68 closed the replay-without-consent hole. |
 
 ## Deliberate limitations (documented, not fixed)
@@ -65,6 +65,7 @@ lives) / **gap** (tracked) / **N/A** (with rationale).
 
 - Per-call Destructive classification heuristics (from RC-1) — needs a
   design discussion before code.
-- MCP (#74) re-opens: untrusted tool descriptions, server-supplied env,
-  network transport. Trust model must be extended there BEFORE any MCP
-  code lands.
+- MCP (#74, SHIPPED): stdio client live; trust-model extensions applied
+  (metadata never trusted for risk, scrubbed env, fenced results).
+  Remaining MCP surface: HTTP/SSE transport, server auth, resource
+  subscriptions — each re-opens this document.

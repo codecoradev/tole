@@ -13,11 +13,20 @@ repository.workspace = true
 # --no-default-features and register their own tool set.
 default = ["shell-tools"]
 shell-tools = []
+# MCP client (issue #74): register external MCP servers' tools into the
+# registry over stdio. Mobile/embedder profiles stay MCP-free.
+mcp = ["dep:rmcp", "dep:tokio", "shell-tools"]
 
 [dependencies]
+rmcp = { version = "3.3", features = ["client", "transport-child-process"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "process", "time"], optional = true }
 libc = "0.2"
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 ureq = { workspace = true }
+
+[[test]]
+name = "mcp_tests"
+required-features = ["mcp"]

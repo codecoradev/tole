@@ -37,6 +37,8 @@ pub mod git;
 #[cfg(feature = "shell-tools")]
 pub mod jobs;
 pub mod machine;
+#[cfg(feature = "mcp")]
+pub mod mcp;
 pub mod mock;
 pub mod openai;
 pub mod provider;
