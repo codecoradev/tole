@@ -418,7 +418,21 @@ pub fn register_server_tools(
             // must not flood the registry (and provider tool specs).
             const MAX_TOOLS_PER_SERVER: usize = 64;
             for (server_tool, description) in tools.into_iter().take(MAX_TOOLS_PER_SERVER) {
-                let mcp_name = format!("mcp_{}_{}", cfg.name, server_tool);
+                // Sanitize the registry-facing name (CodeCora): provider
+                // APIs enforce ^[a-zA-Z0-9_-]{1,64}$ on function names —
+                // one bad server name must not break every completion.
+                let sanitized: String = server_tool
+                    .chars()
+                    .map(|c| {
+                        if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                            c
+                        } else {
+                            '_'
+                        }
+                    })
+                    .collect();
+                let mut mcp_name = format!("mcp_{}_{}", cfg.name, sanitized);
+                mcp_name.truncate(64);
                 if reg
                     .register(Box::new(McpTool::new(
                         cfg.name.clone(),
@@ -429,6 +443,11 @@ pub fn register_server_tools(
                     .is_ok()
                 {
                     registered.push(mcp_name);
+                } else {
+                    eprintln!(
+                        "tole: mcp[{}]: tool {:?} could not register (name collision?)",
+                        cfg.name, server_tool
+                    );
                 }
             }
             eprintln!(
