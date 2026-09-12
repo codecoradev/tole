@@ -111,6 +111,9 @@ pub fn glob_match(pattern: &str, text: &str) -> bool {
 pub struct AllowlistApprover {
     patterns: Vec<String>,
     default: Decision,
+    /// `deny_only` mode: patterns DENY instead of allow (the default then
+    /// governs non-matches, normally Allow).
+    deny_mode: bool,
 }
 
 impl Default for AllowlistApprover {
@@ -118,20 +121,65 @@ impl Default for AllowlistApprover {
         Self {
             patterns: Vec::new(),
             default: Decision::Deny,
+            deny_mode: false,
         }
     }
 }
 
 impl AllowlistApprover {
+    /// Allowlisted tools are ALLOWED; everything else (not matching any
+    /// pattern) gets `default`.
+    ///
+    /// # Semantics trap to know before using
+    /// The decision pipeline is: Destructive → always Deny; a pattern
+    /// match → Allow; only then `default`. So `new(vec!["bomb"],
+    /// Decision::Deny)` **allows** "bomb" — the default only applies to
+    /// NON-matches. For unambiguous intent use [`allow_only`] (patterns
+    /// are the allowed set, default Deny) or [`deny_only`] (patterns are
+    /// the denied set, default Allow).
+    ///
+    /// Kept with current behavior for 0.2.0 compatibility (published on
+    /// crates.io); `Decision::Ask` resolves to Deny here — use the
+    /// interactive approver for human prompting.
     pub fn new(patterns: Vec<String>, default: Decision) -> Self {
-        Self { patterns, default }
+        Self {
+            patterns,
+            default,
+            deny_mode: false,
+        }
+    }
+
+    /// Allow exactly the listed glob patterns; deny everything else.
+    /// The reading order matches the runtime behavior one-to-one.
+    pub fn allow_only(patterns: Vec<String>) -> Self {
+        Self {
+            patterns,
+            default: Decision::Deny,
+            deny_mode: false,
+        }
+    }
+
+    /// Deny exactly the listed glob patterns; allow everything else.
+    /// Destructive tools remain always-denied regardless of patterns.
+    pub fn deny_only(patterns: Vec<String>) -> Self {
+        Self {
+            patterns,
+            default: Decision::Allow,
+            deny_mode: true,
+        }
     }
 
     fn decision(&self, req: &ToolRequest<'_>) -> Verdict {
         if req.risk == Risk::Destructive {
             return Verdict::Deny;
         }
-        if self.patterns.iter().any(|p| glob_match(p, req.tool)) {
+        let matched = self.patterns.iter().any(|p| glob_match(p, req.tool));
+        if self.deny_mode {
+            // deny_only: patterns deny, non-matches fall to the default.
+            if matched {
+                return Verdict::Deny;
+            }
+        } else if matched {
             return Verdict::Allow;
         }
         match self.default {
@@ -165,6 +213,31 @@ mod tests {
         let a = AllowlistApprover::new(vec!["write_file".into()], Decision::Deny);
         assert_eq!(a.decide(&req("write_file", Risk::Write)), Verdict::Allow);
         assert_eq!(a.decide(&req("rm_rf", Risk::Write)), Verdict::Deny);
+    }
+
+    #[test]
+    fn allow_only_is_unambiguous() {
+        let a = AllowlistApprover::allow_only(vec!["read_*".into()]);
+        assert_eq!(a.decide(&req("read_file", Risk::ReadOnly)), Verdict::Allow);
+        assert_eq!(a.decide(&req("rm_rf", Risk::Write)), Verdict::Deny);
+    }
+
+    #[test]
+    fn deny_only_denies_listed_and_allows_rest() {
+        let a = AllowlistApprover::deny_only(vec!["rm_*".into()]);
+        assert_eq!(a.decide(&req("rm_rf", Risk::Write)), Verdict::Deny);
+        assert_eq!(a.decide(&req("read_file", Risk::ReadOnly)), Verdict::Allow);
+    }
+
+    /// The trap the new constructors document: the DEFAULT applies to
+    /// non-matches, so a listed tool is ALLOWED even when the default
+    /// says Deny. Codified so nobody "fixes" it silently in either
+    /// direction (0.2.0 compat + interactive UX both rely on it).
+    #[test]
+    fn new_with_deny_default_still_allows_matches() {
+        let a = AllowlistApprover::new(vec!["bomb".into()], Decision::Deny);
+        assert_eq!(a.decide(&req("bomb", Risk::Write)), Verdict::Allow);
+        assert_eq!(a.decide(&req("other", Risk::Write)), Verdict::Deny);
     }
 
     #[test]
