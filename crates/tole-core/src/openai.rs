@@ -160,7 +160,10 @@ impl OpenAiProvider {
     /// E11: any occurrence of the API key inside message text is redacted
     /// before the body goes over the wire — the durable log keeps the
     /// original (local), the provider never sees the key.
-    fn request_body(&self, transcript: &[Entry]) -> Value {
+    /// Public for the eval harness (issue #73): wire-shape stability is
+    /// a behavioral contract that must be assertable from outside the
+    /// crate. Production code paths keep using it internally.
+    pub fn request_body(&self, transcript: &[Entry]) -> Value {
         let mut messages: Vec<Value> = Vec::new();
         if let Some(sys) = &self.system_prompt {
             messages.push(json!({ "role": "system", "content": sys }));
