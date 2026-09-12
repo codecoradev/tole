@@ -29,7 +29,16 @@ impl ReadFileTool {
     /// the model gets actionable feedback.
     fn jailed(&self, rel: &str) -> Result<PathBuf, String> {
         let rel_path = Path::new(rel);
-        if rel_path.is_absolute() || rel.contains("..") {
+        // Component-based validation (uniform with the other file tools;
+        // CodeCora scan #6/#12): drive-prefixed/rooted Windows relatives
+        // are NOT is_absolute() yet escape via join; a substring ".." both
+        // misses them and rejects benign names. Require all-normal
+        // components.
+        use std::path::Component;
+        let all_normal = rel_path
+            .components()
+            .all(|c| matches!(c, Component::Normal(_)));
+        if !all_normal {
             return Err(format!("read_file: path escapes the jail: {rel}"));
         }
         let target = self.root.join(rel_path);

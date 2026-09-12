@@ -332,21 +332,92 @@ fn guarded_intent_replay_requires_fresh_approval() {
     assert_eq!(s.state().pc, Pc::Executing);
     drop(s);
 
-    // Reopen with an APPROVING registry (allowlist includes "bomb") —
-    // resume_turn must still refuse to replay a Guarded intent: fresh
-    // approval for a replay is a host decision, not a replay default.
-    let mut s2 = JsonlStorage::open(dir.join("g.jsonl")).unwrap();
+    // Reopen with a DENYING approver — the guard must actually consult it
+    // (CodeCora scan #34: the old code returned ApprovalRequired without
+    // ever calling the approver, leaving the intent pending forever and
+    // livelocking every future resume). Deny → the bomb NEVER fires AND
+    // the sandwich settles as failed, so the session stays resumable.
+    let s2 = JsonlStorage::open(dir.join("g.jsonl")).unwrap();
+    // bomb is NOT allowlisted and the default is Deny -> decide() = Deny.
     let mut reg =
-        ToolRegistry::with_approver(AllowlistApprover::new(vec!["bomb".into()], Decision::Deny));
+        ToolRegistry::with_approver(AllowlistApprover::new(vec!["other".into()], Decision::Deny));
     reg.register(Box::new(Bomb)).unwrap();
     let mut p = MockProvider::scripted(vec![ProviderOutput::Final {
-        text: "never reached".into(),
+        text: "replanned".into(),
     }]);
+    let mut s2 = s2;
     let out = resume_turn(&mut s2, &mut p, &reg);
     match out.unwrap() {
         TurnOutcome::ApprovalRequired { name } => assert_eq!(name, "bomb"),
         other => panic!("expected ApprovalRequired, got {other:?}"),
     }
-    // The pending cell survives: the host may re-approve and re-resume.
-    assert!(s2.get_register("pending", "op").is_some());
+    // The intent is SETTLED (failed): pending cell cleared — no livelock.
+    assert!(s2.get_register("pending", "op").is_none());
+    assert_eq!(s2.state().pc, Pc::Planning);
+}
+
+/// A Write-risk tool that records its firings (for the allow path).
+struct CountingWrite(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+impl Tool for CountingWrite {
+    fn name(&self) -> &str {
+        "counted"
+    }
+    fn risk(&self) -> Risk {
+        Risk::Write
+    }
+    fn execute(&self, _input: Value) -> Result<Value, String> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(json!({ "fired": true }))
+    }
+}
+
+#[test]
+fn guarded_intent_replays_when_approver_allows() {
+    let dir = tmpdir("guarded-allow");
+    // Same setup, but the approver ALLOWS (the tool is allowlisted): the
+    // replay must proceed — fresh consent obtained — and the effect runs
+    // exactly once across the crash + resume boundary.
+    let mut s = JsonlStorage::create(&dir, "ga", None).unwrap();
+    let seq = s.state().seq;
+    s.commit(
+        Commit::new()
+            .entry(NewEntry::root(
+                EntryType::new(EntryType::MESSAGE),
+                json!({ "role": "user", "text": "do it" }),
+            ))
+            .transition(StateTransition::from(seq, Pc::Planning)),
+    )
+    .unwrap();
+    let seq = s.state().seq;
+    s.commit(Commit::new().transition(StateTransition::from(seq, Pc::ToolCall)))
+        .unwrap();
+    begin(
+        &mut s,
+        "counted",
+        json!({ "n": 1 }),
+        ReplaySafety::Guarded,
+        None,
+    )
+    .unwrap();
+    drop(s);
+
+    let s2 = JsonlStorage::open(dir.join("ga.jsonl")).unwrap();
+    let fired = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut reg = ToolRegistry::with_approver(AllowlistApprover::new(
+        vec!["counted".into()],
+        Decision::Deny,
+    ));
+    reg.register(Box::new(CountingWrite(fired.clone())))
+        .unwrap();
+    let mut p = MockProvider::scripted(vec![ProviderOutput::Final {
+        text: "after-allow".into(),
+    }]);
+    let mut s2 = s2;
+    let out = resume_turn(&mut s2, &mut p, &reg);
+    match out.unwrap() {
+        TurnOutcome::Final { text } => assert_eq!(text, "after-allow"),
+        other => panic!("expected Final after allowed replay, got {other:?}"),
+    }
+    assert!(s2.get_register("pending", "op").is_none());
+    assert_eq!(fired.load(std::sync::atomic::Ordering::SeqCst), 1);
 }

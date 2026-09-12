@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] — 2026-09-12
+
+Reliability & long-running work: the post-soak optimization batch driven by
+live E2E findings (2026-09-11 vetio missions + 2026-09-12 optimization pass).
+
+### Added
+- `--workspace <dir>` global flag — the file tools' jail root
+  (read_file/write_file/edit_file/delete_file) is now configurable;
+  defaults to the process cwd. Canonicalized and strictly validated; the
+  TOCTOU-safe jail walk is unchanged (#57, #63).
+- `job_start` / `job_poll` tools — detached long-running jobs (own process
+  group, stdin null, stdout+stderr to `tole-jobs/<id>/log` inside the
+  workspace) with ReadOnly liveness+log-tail polling; zombie states count
+  as finished and reads are bounded to an 8 KiB window (#59, #56, #64).
+- `tole resume <id> "<prompt>"` — continue a settled session with new
+  instructions; headless multi-mission flows keep one durable session.
+  Bare `resume` keeps the approvals-only recovery semantics (#55, #65).
+- Usage ledger wiring: `Provider::last_usage` (default `None`) +
+  `OpenAiProvider` response-usage capture; one durable `UsageRecord` per
+  provider step anchored to the last committed entry — `tole status` now
+  reports real token totals instead of 0/0 (#66).
+- Live-mission binary hygiene rules in CONTRIBUTING.md (#60, #61).
+
+### Changed
+- Retry classification: 429/rate-limit responses join timeouts as
+  transient and get the one automatic per-turn retry; the durable audit
+  entry is now "provider transient failure, retrying" (#58, #62, #66).
+- The turn loop no longer clones the full transcript for every provider
+  step; `complete()` borrows the storage slice (#66).
+
 ## [0.2.0] — 2026-08-27
 
 Chat-first replan (v1.1): tole becomes a durable conversational harness —

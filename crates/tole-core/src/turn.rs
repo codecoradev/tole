@@ -144,26 +144,54 @@ pub fn resume_turn(
             input,
             safety,
         } => {
+            let intent_id = intent_id.clone();
             // The intent's recorded replay contract decides the guard:
             // `Guarded` effects require a fresh approval before replay —
             // may have landed before the effect ever ran, so replaying
             // blind could double-fire a Write/Destructive tool.
             if safety == ReplaySafety::Guarded {
                 let Some(t) = registry.get(&tool) else {
+                    // Unregistered tool on a Guarded intent: settle the
+                    // sandwich as failed so the session stays resumable
+                    // (scan #34: never park with an open intent).
+                    settle_err(
+                        s,
+                        &EffectHandle { intent_id },
+                        &format!("guarded intent references unregistered tool {tool}"),
+                    )?;
                     append_turn_error(
                         s,
                         "unknown tool",
-                        &format!("guarded intent {intent_id} references unregistered tool {tool}"),
+                        &format!("guarded intent references unregistered tool {tool}"),
                     )?;
                     return Ok(TurnOutcome::UnknownTool { name: tool });
                 };
                 if t.risk() != Risk::ReadOnly {
-                    append_turn_error(
-                        s,
-                        "approval required",
-                        &format!("guarded intent {intent_id} needs a fresh approval to replay"),
-                    )?;
-                    return Ok(TurnOutcome::ApprovalRequired { name: tool });
+                    // Fresh consent for a replayed non-ReadOnly effect:
+                    // actually ASK the wired approver. Allow → proceed to
+                    // execute below; deny/absent → settle the sandwich as
+                    // failed (loop replans on the error) instead of
+                    // returning with the intent permanently pending.
+                    match registry.decide(&tool, &input) {
+                        Some(Verdict::Allow) => {}
+                        _ => {
+                            settle_err(
+                                s,
+                                &EffectHandle {
+                                    intent_id: intent_id.clone(),
+                                },
+                                "replay denied: no fresh approval for a guarded effect",
+                            )?;
+                            append_turn_error(
+                                s,
+                                "approval required",
+                                &format!(
+                                    "guarded intent {intent_id} replay denied (no fresh approval)"
+                                ),
+                            )?;
+                            return Ok(TurnOutcome::ApprovalRequired { name: tool });
+                        }
+                    }
                 }
             }
             let handle = EffectHandle { intent_id };
@@ -333,10 +361,20 @@ fn drive(
                         }
                     }
                 }
-                // Planning → ToolCall, then the sandwich.
+                // Planning → ToolCall, then the sandwich. The replay
+                // contract derives from RISK, not a blanket Idempotent
+                // (CodeCora scan #33): a crash after a Write/Destructive
+                // effect ran but before settlement must NOT blindly
+                // re-execute on resume — Guarded forces re-consultation
+                // of the approver (below) before any replay.
+                let safety = if t.risk() == Risk::ReadOnly {
+                    ReplaySafety::Idempotent
+                } else {
+                    ReplaySafety::Guarded
+                };
                 let seq = s.state().seq;
                 s.commit(Commit::new().transition(StateTransition::from(seq, Pc::ToolCall)))?;
-                let handle = begin(s, &tool, input.clone(), ReplaySafety::Idempotent, None)?;
+                let handle = begin(s, &tool, input.clone(), safety, None)?;
                 let out = match t.execute(input) {
                     Ok(o) => o,
                     Err(e) => {
@@ -356,6 +394,9 @@ fn drive(
                 // next request and can retry with well-formed JSON.
                 let seq = s.state().seq;
                 s.commit(Commit::new().transition(StateTransition::from(seq, Pc::ToolCall)))?;
+                // Nothing executes for this intent (it is settled as an
+                // error immediately below), so Idempotent is the honest
+                // contract: a replay can only ever settle it again.
                 let handle = begin(
                     s,
                     &tool,

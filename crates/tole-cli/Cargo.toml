@@ -17,7 +17,7 @@ default = ["shell-tools"]
 shell-tools = ["tole-core/shell-tools"]
 
 [dependencies]
-tole-core = { path = "../tole-core" }
+tole-core = { version = "0.3.0", path = "../tole-core" }
 tokio = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
