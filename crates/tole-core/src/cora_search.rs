@@ -82,6 +82,7 @@ impl Tool for CoraSearchTool {
             return Err("query must not be empty".into());
         }
         let mut cmd = Command::new("cora");
+        crate::subprocess::scrub_env_for_child(&mut cmd);
         cmd.arg("brain")
             .arg(query)
             .arg("--json")

@@ -210,6 +210,7 @@ impl Tool for GitTool {
         let op = parse_op(&input)?;
         let argv = op.argv(&input)?;
         let mut cmd = Command::new(&self.bin);
+        crate::subprocess::scrub_env_for_child(&mut cmd);
         cmd.args(&argv);
         if let Some(dir) = &self.workdir {
             cmd.current_dir(dir);

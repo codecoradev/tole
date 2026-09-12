@@ -79,6 +79,7 @@ impl Tool for UtekeRecallTool {
             return Err("query must not be empty".into());
         }
         let mut cmd = Command::new("uteke");
+        crate::subprocess::scrub_env_for_child(&mut cmd);
         match input.get("room").and_then(Value::as_str) {
             Some(room) if !room.trim().is_empty() => {
                 // Same argv-flag-injection defense as UtekeDocumentTool:
@@ -218,6 +219,7 @@ impl Tool for UtekeDocumentTool {
         //    pipes — no deadlock on large documents — and the hard
         //    subprocess timeout every other invocation gets.
         let mut cmd = Command::new("uteke");
+        crate::subprocess::scrub_env_for_child(&mut cmd);
         cmd.arg("doc")
             .arg("create")
             .arg(slug)
