@@ -8,7 +8,7 @@
 1. **Durability first** — all state that determines agent behavior must survive a crash. The session file (JSONL, default) is the single source of truth.
 2. **Write-once** — the conversation tree is append-only & immutable. No entry update/delete; corrections = new entries.
 3. **Pure core** — `tole-core` performs no interactive I/O (stdin/stdout/CLI). Embeddable via CLI, Corin (Tauri), or `flutter_rust_bridge` FFI.
-4. **Portable Phase 1–2** — no *nix-only dependencies. Cross-build CI deferred to Phase 3.
+4. **Portable Phase 1–2** — no *nix-only dependencies. Cross-build CI (aarch64-apple-ios / aarch64-linux-android compile checks) landed 2026-09-18 (#82).
 
 ## 2. Crate Layout & Dependencies
 
@@ -167,5 +167,5 @@ sequenceDiagram
 
 ## 12. Phase Rules
 
-- Phase 1–2: **no *nix-only deps** — all crates must build on portable targets (Windows/macOS/Linux). Cross-build CI deferred to Phase 3.
+- Phase 1–2: **no *nix-only deps** — all crates must build on portable targets (Windows/macOS/Linux). Cross-build CI (iOS/Android compile checks) landed 2026-09-18 (#82); the embedder profile stays green via the CI `cross-compile` job.
 - The future `tole-ffi` may only depend on core, and must not contain domain logic.
