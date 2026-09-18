@@ -132,7 +132,7 @@ sequenceDiagram
 - `Tool` trait: `name()`, `spec()`, `risk() -> Risk`, `execute(input) -> Output`. `Risk`:
   - `ReadOnly` — may run without approval.
   - `Write` — requires approval unless it matches the allowlist.
-  - `Destructive` — always requires approval (allowlist may explicitly opt in).
+  - `Destructive` — always requires interactive approval and is **never allowlisted** (structural invariant: the registry refuses registration without an interactive approver, `AllowlistApprover` denies on sight, and the host prompt ignores `--allow`/`--yes`).
 - `Approver` trait: `approve(request) -> Decision`. Impls:
   - `AllowlistApprover` — from config (runs in core, deterministic, testable).
   - `InteractiveApprover` — y/N prompt. **Lives in the host (CLI)**, not in core — core only receives the trait impl via injection.

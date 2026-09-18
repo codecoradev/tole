@@ -124,44 +124,19 @@ impl Tool for JobPollTool {
             .parse()
             .map_err(|_| format!("job_poll: corrupt pid file for {job}"))?;
         let running = Self::pid_alive(pid)?;
-        // Tail the LAST LOG_TAIL_CHARS without loading the whole file:
-        // detached job logs grow unbounded (render logs are chatty), so
-        // stat → seek near the end → read only a bounded slice.
+        // JOB-2 (threat model): a chatty/unpolled job can grow its log
+        // without bound — but the bound is enforced on the READ side only:
+        // seek near the end and read a bounded slice, so a multi-GiB log
+        // can never OOM the host on poll. The previous poll-time
+        // truncate-to-10-MiB write-back is GONE (CodeCora scan
+        // 2026-09-18): job_poll is Risk::ReadOnly and a read must never
+        // mutate the job's log — the risk-tier invariant outweighs the
+        // disk-space convenience. Log growth is bounded by the job's own
+        // lifetime; clearing a runaway log is an operator action.
         const READ_WINDOW: u64 = 8 * 1024;
         let path = dir.join("log");
         let mut log_file =
             std::fs::File::open(&path).map_err(|_| format!("job_poll: no log for {job}"))?;
-        let len = log_file
-            .metadata()
-            .map_err(|e| format!("job_poll: stat log: {e}"))?
-            .len();
-        // JOB-2 (threat model): a chatty/unpolled job can grow its log
-        // without bound. Past 10 MiB, truncate to the LAST MAX_LOG_BYTES
-        // of what was ACTUALLY read — the offset derives from the buffer,
-        // not the earlier stat, so a concurrent poll that shrunk the file
-        // in between can never cause a slice panic. Safe against the
-        // append-mode child: its next write lands at the new EOF, no
-        // sparse NUL holes.
-        const MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
-        // window = cap + slack; guard on `window` so len - window cannot
-        // underflow for sizes between cap and cap+slack (CodeCora #1).
-        const SLACK: u64 = 1024;
-        let window = MAX_LOG_BYTES + SLACK;
-        if len > window {
-            // Bounded window: read only the last ~MAX_LOG_BYTES (+ 1 KiB
-            // line-boundary slack) instead of the whole file — a multi-GiB
-            // log must not OOM the host on first poll (threat-model JOB-2).
-            let mut bytes = Vec::new();
-            log_file
-                .seek(SeekFrom::Start(len - window))
-                .map_err(|e| format!("job_poll: seek log: {e}"))?;
-            log_file
-                .by_ref()
-                .take(window)
-                .read_to_end(&mut bytes)
-                .map_err(|e| format!("job_poll: read log: {e}"))?;
-            std::fs::write(&path, &bytes).map_err(|e| format!("job_poll: truncate log: {e}"))?;
-        }
         let len = log_file
             .metadata()
             .map_err(|e| format!("job_poll: stat log: {e}"))?
@@ -327,7 +302,7 @@ mod tests {
     }
 
     #[test]
-    fn poll_truncates_runaway_log() {
+    fn poll_runaway_log_reads_tail_without_mutating() {
         let dir = tmpdir("logcap");
         // Craft an oversized log + pid for a live process (this test
         // process itself is alive, so running=true is deterministic).
@@ -340,12 +315,17 @@ mod tests {
         let poll = JobPollTool::new(dir.clone());
         let out = poll.execute(json!({ "job": "j-logcap-test" })).unwrap();
         assert_eq!(out["running"], json!(true));
+        // job_poll is Risk::ReadOnly: the bounded tail read must NOT
+        // truncate/rewrite the log file (CodeCora scan 2026-09-18).
         let len = std::fs::metadata(job_dir.join("log")).unwrap().len();
-        // Cap = MAX_LOG_BYTES + the 1 KiB line-boundary slack.
-        assert!(
-            len <= 10 * 1024 * 1024 + 1024,
-            "log must be capped, got {len}"
+        assert_eq!(
+            len,
+            10 * 1024 * 1024 + 4096,
+            "a read-only poll must not mutate the log"
         );
+        // The tail the poll returns comes from the END of the log.
+        let tail = out["log_tail"].as_str().unwrap_or_default();
+        assert!(!tail.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

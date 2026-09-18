@@ -4,10 +4,49 @@
 //! would freeze the whole agent, so every subprocess gets a hard ceiling.
 
 use std::process::{Command, Output};
+use std::sync::mpsc;
 use std::time::Duration;
 
 /// Default ceiling for tool subprocesses (mirrors cora_search's E4 value).
 pub const SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Per-stream capture ceiling: a hostile or chatty child must not be able
+/// to exhaust host memory before the timeout fires (CodeCora scan
+/// 2026-09-18). Generous on purpose — real tool output (diffs, logs) sits
+/// far below it.
+const MAX_CAPTURE: u64 = 32 * 1024 * 1024;
+const CAPTURE_TRUNCATED_MARK: &[u8] = b"\n\xe2\x80\xa6[tole: output truncated at 32 MiB]\n";
+
+/// How long to wait for the pipe readers after the child is gone. A
+/// grandchild that inherited the pipe can hold it open far past the
+/// child's exit; joining the reader unconditionally blocked the agent for
+/// that whole time (CodeCora scan 2026-09-18). Trade-off: output that has
+/// not arrived within the grace window is dropped when a descendant keeps
+/// the pipe open.
+const DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+/// Read a pipe into a buffer under [`MAX_CAPTURE`], then hand it to the
+/// waiter. Marks truncation when the cap was hit; the caller-side
+/// `take(N + 1)` trick makes cap-hit detection exact.
+fn drain_capped(pipe: impl std::io::Read, tx: mpsc::Sender<Vec<u8>>) {
+    use std::io::Read;
+    let mut pipe = pipe.take(MAX_CAPTURE + 1);
+    let mut buf = Vec::new();
+    let _ = pipe.read_to_end(&mut buf);
+    if buf.len() > MAX_CAPTURE as usize {
+        buf.truncate(MAX_CAPTURE as usize);
+        buf.extend_from_slice(CAPTURE_TRUNCATED_MARK);
+    }
+    let _ = tx.send(buf);
+}
+
+/// Bounded wait for one drained stream. On grace expiry the reader thread
+/// is left behind on purpose: it terminates by itself once every pipe
+/// holder closes (a leaked-but-doomed thread beats an unbounded agent
+/// hang).
+fn recv_with_grace<T>(rx: &mpsc::Receiver<T>) -> Option<T> {
+    rx.recv_timeout(DRAIN_GRACE).ok()
+}
 
 /// Environment variable names that must NOT reach child processes
 /// (threat-model ENV-1): anything secret-shaped, where "secret-shaped"
@@ -83,16 +122,34 @@ pub fn check_destructive_argv(argv: &[String]) -> Result<(), String> {
     /// Conservative payload scan for shell command STRINGS: a shell
     /// parser is out of scope, so any teardown token anywhere — or an
     /// `rm` token anywhere plus a recursive-flag token anywhere — refuses.
+    /// Shell quoting survives naive tokenization (`'rm` is not `rm`), so
+    /// tokens are quote-stripped before matching — conservative matcher,
+    /// false positives acceptable (CodeCora scan 2026-09-18).
     fn payload_destructive(tokens: &[String]) -> bool {
-        let lc: Vec<String> = tokens.iter().map(|t| t.to_ascii_lowercase()).collect();
+        let lc: Vec<String> = tokens
+            .iter()
+            .map(|t| strip_quotes(t).to_ascii_lowercase())
+            .collect();
         lc.iter().any(|t| teardown_name(t))
-            || (lc.iter().any(|t| t == "rm") && lc.iter().any(|t| recursive_flag(t)))
+            || (lc.iter().any(|t| t == "rm" || t.ends_with("/rm"))
+                && lc.iter().any(|t| recursive_flag(t)))
+    }
+
+    /// One layer of shell-quote stripping for the conservative matcher:
+    /// `'rm` and `rm'` inside a payload must be seen as `rm`.
+    fn strip_quotes(t: &str) -> &str {
+        t.trim_start_matches(['\'', '"'])
+            .trim_end_matches(['\'', '"'])
     }
 
     fn scan(tokens: &[String], depth: u8) -> Result<(), String> {
         if depth > MAX_WRAPPER_DEPTH || tokens.is_empty() {
             return Ok(());
         }
+        // Quote-strip every token BEFORE matching: single/double-quoted
+        // payload words (`sh -c 'rm -rf /'`) must not hide behind their
+        // quotes (CodeCora scan 2026-09-18).
+        let tokens: Vec<String> = tokens.iter().map(|t| strip_quotes(t).to_string()).collect();
         let prog = tokens[0].to_ascii_lowercase();
         if prog.contains('/') {
             // Path-qualified program escapes PATH-resolution auditing.
@@ -149,9 +206,16 @@ pub fn check_destructive_argv(argv: &[String]) -> Result<(), String> {
             {
                 for tok in args.iter().filter(|a| !a.starts_with('-')) {
                     let inner: Vec<String> = tok.split_whitespace().map(str::to_string).collect();
+                    // BOTH checks (CodeCora scan + review round-trip):
+                    // payload_destructive keeps the conservative
+                    // whole-payload match for COMPOUND statements
+                    // (`echo hi; rm -rf /` — rm is not the first token),
+                    // while full scan() recursion adds what it cannot see:
+                    // path-qualified programs and nested shells.
                     if payload_destructive(&inner) {
                         return Err(REFUSE.to_string());
                     }
+                    scan(&inner, depth + 1)?;
                 }
                 return Ok(());
             }
@@ -207,7 +271,6 @@ pub fn check_destructive_argv(argv: &[String]) -> Result<(), String> {
 /// (~64KB) would otherwise block on write while we only poll its status,
 /// and we'd time out on a perfectly valid run.
 pub fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> Result<Output, String> {
-    use std::io::Read;
     use std::process::Stdio;
     cmd.stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -215,18 +278,12 @@ pub fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> Result<Output, 
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("failed to spawn subprocess (is it on PATH?): {e}"))?;
-    let mut stdout_pipe = child.stdout.take().expect("stdout piped above");
-    let mut stderr_pipe = child.stderr.take().expect("stderr piped above");
-    let t_out = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout_pipe.read_to_end(&mut buf);
-        buf
-    });
-    let t_err = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stderr_pipe.read_to_end(&mut buf);
-        buf
-    });
+    let stdout_pipe = child.stdout.take().expect("stdout piped above");
+    let stderr_pipe = child.stderr.take().expect("stderr piped above");
+    let (tx_out, rx_out) = mpsc::channel();
+    let (tx_err, rx_err) = mpsc::channel();
+    std::thread::spawn(move || drain_capped(stdout_pipe, tx_out));
+    std::thread::spawn(move || drain_capped(stderr_pipe, tx_err));
     let start = std::time::Instant::now();
     let status = loop {
         match child.try_wait() {
@@ -245,8 +302,8 @@ pub fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> Result<Output, 
             Err(e) => return Err(format!("wait failed: {e}")),
         }
     };
-    let stdout = t_out.join().unwrap_or_default();
-    let stderr = t_err.join().unwrap_or_default();
+    let stdout = recv_with_grace(&rx_out).unwrap_or_default();
+    let stderr = recv_with_grace(&rx_err).unwrap_or_default();
     Ok(Output {
         status,
         stdout,
@@ -264,7 +321,6 @@ pub fn run_with_timeout_stdin(
     timeout: Duration,
     stdin_data: &[u8],
 ) -> Result<Output, String> {
-    use std::io::Read;
     use std::process::Stdio;
     cmd.stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -274,24 +330,20 @@ pub fn run_with_timeout_stdin(
         .map_err(|e| format!("failed to spawn subprocess (is it on PATH?): {e}"))?;
     let mut stdin_pipe = child.stdin.take().expect("stdin piped above");
     let data = stdin_data.to_vec();
-    let t_in = std::thread::spawn(move || {
+    let (tx_in, rx_in) = mpsc::channel();
+    std::thread::spawn(move || {
         use std::io::Write;
         let _ = stdin_pipe.write_all(&data);
         // Drop closes the pipe → child sees EOF.
         drop(stdin_pipe);
+        let _ = tx_in.send(());
     });
-    let mut stdout_pipe = child.stdout.take().expect("stdout piped above");
-    let mut stderr_pipe = child.stderr.take().expect("stderr piped above");
-    let t_out = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout_pipe.read_to_end(&mut buf);
-        buf
-    });
-    let t_err = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stderr_pipe.read_to_end(&mut buf);
-        buf
-    });
+    let stdout_pipe = child.stdout.take().expect("stdout piped above");
+    let stderr_pipe = child.stderr.take().expect("stderr piped above");
+    let (tx_out, rx_out) = mpsc::channel();
+    let (tx_err, rx_err) = mpsc::channel();
+    std::thread::spawn(move || drain_capped(stdout_pipe, tx_out));
+    std::thread::spawn(move || drain_capped(stderr_pipe, tx_err));
     let start = std::time::Instant::now();
     let status = loop {
         match child.try_wait() {
@@ -310,9 +362,12 @@ pub fn run_with_timeout_stdin(
             Err(e) => return Err(format!("wait failed: {e}")),
         }
     };
-    let _ = t_in.join(); // writer thread always terminates (write_all or EPIPE)
-    let stdout = t_out.join().unwrap_or_default();
-    let stderr = t_err.join().unwrap_or_default();
+    // Writer: bounded grace like the readers — the old unconditional join
+    // hung forever when a child (or its descendants) never read stdin
+    // (CodeCora review on the scan-triage PR).
+    let _ = recv_with_grace(&rx_in);
+    let stdout = recv_with_grace(&rx_out).unwrap_or_default();
+    let stderr = recv_with_grace(&rx_err).unwrap_or_default();
     Ok(Output {
         status,
         stdout,
@@ -442,5 +497,46 @@ mod stdin_tests {
             "hello stdin"
         );
         assert_eq!(out.stdout.len(), 200_000);
+    }
+}
+
+#[cfg(test)]
+mod capture_hardening_tests {
+    use super::*;
+    use std::process::Command;
+
+    #[test]
+    fn oversized_output_is_capped_with_marker() {
+        // 40 MB of output vs the 32 MiB per-stream capture ceiling.
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("head -c 40000000 /dev/zero | tr '\\0' 'x'");
+        let out = run_with_timeout(&mut cmd, SUBPROCESS_TIMEOUT).unwrap();
+        let cap = MAX_CAPTURE as usize;
+        assert!(out.stdout.len() > cap - 1024, "cap must be reached");
+        assert!(
+            out.stdout.len() <= cap + CAPTURE_TRUNCATED_MARK.len(),
+            "capture must not exceed cap + marker"
+        );
+        assert!(out.stdout.ends_with(CAPTURE_TRUNCATED_MARK));
+    }
+
+    #[test]
+    fn grandchild_holding_pipe_does_not_hang() {
+        // `sh` exits at once; the backgrounded sleep inherits the pipe and
+        // holds it for 30s. The old join-based drain blocked the agent for
+        // that entire window; the drain grace returns in ~2s. Output that
+        // has not fully arrived within the grace window is dropped — the
+        // documented trade-off.
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("echo started; sleep 30 &");
+        let t0 = std::time::Instant::now();
+        let out = run_with_timeout(&mut cmd, SUBPROCESS_TIMEOUT).unwrap();
+        assert!(out.status.success());
+        assert!(
+            t0.elapsed() < Duration::from_secs(15),
+            "drain must not wait for the pipe-holding grandchild"
+        );
+        assert!(out.stdout.is_empty(), "unterminated stream is dropped");
     }
 }
