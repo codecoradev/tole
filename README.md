@@ -14,10 +14,11 @@ tole is the agent harness of the CodeCora ecosystem — the hands. Two sibling
 tools plug in as first-class tools (auto-detected at startup; a missing binary
 degrades to a warning, never a phantom tool):
 
-- **cora-code** (`cora`) — code intelligence. `cora_search` recalls indexed
-  symbols via hybrid search (FTS5 + vector + graph). The full surface
-  (callers, impact, dead-code, review) is available by attaching the built-in
-  server: `tole run --mcp-server cora="cora mcp" ...`
+- **cora-code** (`cora`) — code intelligence. Attached automatically when
+  the `cora` binary is on PATH: tole detects the built-in `cora mcp`
+  server and registers its 18-tool surface (brain search, callers,
+  impact, affected tests, dead-code, review — registry names
+  `mcp_cora_*`). Opt out with `--no-auto-mcp`.
 - **uteke** (`uteke`) — memory. `uteke_recall` (semantic recall, room-scoped)
   and `uteke_document` (markdown → durable knowledge) register automatically
   when the `uteke` binary is on PATH.
@@ -53,7 +54,8 @@ export TOLE_API_KEY=...
 Useful flags (all subcommands): `--system` (persona, pinned in the session
 header), `--workspace <dir>` (file-tools jail root), `--allow <glob>`
 (repeatable pre-authorization for Write tools, e.g. `--allow 'write_*'`),
-`--yes` (auto-allow every Write; Destructive still prompts), `--mcp-server`.
+`--yes` (auto-allow every Write; Destructive still prompts), `--mcp-server`,
+`--no-auto-mcp` (skip the cora auto-preset).
 
 ## Tools
 
@@ -65,7 +67,7 @@ header), `--workspace <dir>` (file-tools jail root), `--allow <glob>`
 | `gh` | Write | read-only ops, argv-validated per op; `--repo` is fixed at registration (currently `codecoradev/tole`) — per-repo wiring is a known gap |
 | `run_command` | Write | argv-split (no shell), cwd-jailed, timeout + output cap |
 | `job_start`, `job_poll` | Write / RO | detached long-running jobs with log tailing |
-| `cora_search` | RO | hybrid codebase search via `cora brain` |
+| `cora_search` | RO | hybrid codebase search via `cora brain`; native fallback — skipped when the cora MCP surface is attached |
 | `uteke_recall`, `uteke_document` | RO / Write | semantic memory recall / markdown → room |
 | `mcp_*` (from `--mcp-server`) | Write | server metadata is **never** trusted for risk; approval gate always applies |
 
