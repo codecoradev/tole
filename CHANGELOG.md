@@ -20,6 +20,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--mcp-server` work on a plain `cargo build -p tole-cli`. Embedder
   profiles are unaffected — `tole-core` defaults do not change.
 
+### Added
+- Harness memory loop (`--memory uteke` / `TOLE_MEMORY`): on the first
+  turn of a fresh session, memories relevant to the prompt are recalled
+  from the owner's uteke store (namespace `repo-<dir>`,
+  `TOLE_MEMORY_NAMESPACE` to override) and injected into the user
+  message inside a clearly marked fenced block — the durable log stores
+  exactly what the provider saw. When the session settles with a final
+  answer, a compact summary is stored back (`--type context`, tagged
+  `tole,session`). Host-initiated on both ends (the model cannot
+  trigger or suppress it); every failure degrades to stderr and the
+  turn proceeds without memory.
+
 ### Changed
 - `cora_search` follows the same startup-probing contract as the uteke
   tools: a missing `cora` binary degrades to a one-line warning instead

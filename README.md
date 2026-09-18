@@ -79,6 +79,23 @@ approver, allowlists deny them on sight, and `--yes` never covers them. There
 is no bypass path. Secret redaction is wire-only (the durable local log keeps
 the original text by design).
 
+## Memory loop
+
+`--memory uteke` (or `TOLE_MEMORY=uteke`) turns the harness into a
+cross-session memory loop — host-initiated on both ends, the model can
+neither trigger nor suppress it:
+
+- **Before the first turn** of a fresh session, memories relevant to the
+  prompt are recalled from the owner's uteke store and injected into the
+  message inside a clearly marked fenced block; the durable log records
+  exactly what the provider saw.
+- **When the session settles** with a final answer, a compact summary is
+  stored back — the next session's recall can find it.
+
+The namespace follows the ecosystem `repo-<dir>` convention
+(`TOLE_MEMORY_NAMESPACE` overrides). Every memory failure degrades to a
+stderr note; the turn proceeds without memory.
+
 ## Design sources
 
 Research notes and design sources: adapted from pi's harness spec (MIT).
