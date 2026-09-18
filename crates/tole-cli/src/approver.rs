@@ -126,7 +126,6 @@ mod tests {
 
     #[test]
     fn write_prompted_then_allowed_or_denied() {
-        let mut seen_allows = 0;
         for answer in [Verdict::Allow, Verdict::Deny] {
             let a = InteractiveApprover::new(ScriptedPrompt {
                 answers: std::sync::Mutex::new(vec![answer]),
@@ -134,8 +133,6 @@ mod tests {
             });
             assert_eq!(a.decide(&req("write_file", Risk::Write)), answer);
         }
-        seen_allows += 0;
-        let _ = seen_allows;
     }
 
     #[test]

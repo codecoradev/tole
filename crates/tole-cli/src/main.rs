@@ -1,14 +1,11 @@
 //! CLI host for tole-core: arg parsing and session wiring.
 
-mod approver;
-mod tools;
-
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
-use crate::approver::InteractiveApprover;
-use crate::tools::WriteFileTool;
+use tole_cli::approver::{InteractiveApprover, StdioPrompt};
+use tole_cli::tools::WriteFileTool;
 #[cfg(feature = "shell-tools")]
 use tole_core::cora_search::CoraSearchTool;
 use tole_core::file_tools::{DeleteFileTool, EditFileTool};
@@ -329,10 +326,7 @@ fn resolve_memory(flag: Option<&String>) -> Result<Option<tole_core::memory::Mem
     Ok(Some(cfg))
 }
 
-fn build_approver(
-    allow_patterns: &[String],
-    yes: bool,
-) -> InteractiveApprover<approver::StdioPrompt> {
+fn build_approver(allow_patterns: &[String], yes: bool) -> InteractiveApprover<StdioPrompt> {
     InteractiveApprover::stdio()
         .with_allow_patterns(allow_patterns.to_vec())
         .with_auto_write(yes)
@@ -378,13 +372,30 @@ fn merge_mcp_specs(explicit: &[String], no_auto_mcp: bool, auto: Vec<String>) ->
 /// installed, instead of registering phantom tools that fail on every
 /// call.
 fn binary_available(name: &str) -> bool {
+    fn executable(p: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // is_file() alone accepts non-executable files; a probe that
+            // says "available" for an unrunnable binary is a phantom tool
+            // by another name (CodeCora scan 2026-09-18).
+            std::fs::metadata(p)
+                .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
+        }
+        #[cfg(not(unix))]
+        {
+            // Windows: PATH lookups append extensions (".exe"); probe the
+            // obvious one rather than declaring a runnable binary absent.
+            p.is_file() || p.with_extension("exe").is_file()
+        }
+    }
     if name.contains('/') {
-        let p = std::path::Path::new(name);
-        return p.is_file();
+        return executable(Path::new(name));
     }
     if let Ok(path) = std::env::var("PATH") {
         for dir in std::env::split_paths(&path) {
-            if dir.join(name).is_file() {
+            if executable(&dir.join(name)) {
                 return true;
             }
         }
@@ -413,7 +424,7 @@ pub fn resolve_workspace_root(explicit: Option<&String>) -> Result<PathBuf> {
 }
 
 fn build_registry(
-    approver: InteractiveApprover<approver::StdioPrompt>,
+    approver: InteractiveApprover<StdioPrompt>,
     workspace: Option<&String>,
     #[cfg(feature = "mcp")] mcp_servers: &[tole_core::mcp::McpServerConfig],
 ) -> Result<ToolRegistry> {
@@ -517,15 +528,9 @@ fn run_command(
         "missing provider config: set TOLE_BASE_URL / TOLE_MODEL / TOLE_API_KEY \
          (or the OPENAI_* equivalents)",
     )?;
-    let session_id = new_session_id();
-    std::fs::create_dir_all(sessions_dir)
-        .with_context(|| format!("creating {}", sessions_dir.display()))?;
-    let system_prompt = system.map(str::to_string).or_else(resolve_system_prompt);
-    let mut storage =
-        JsonlStorage::create_with(sessions_dir, &session_id, None, system_prompt.as_deref())
-            .with_context(|| format!("creating session {session_id}"))?;
-    println!("session: {session_id}");
-
+    // Build everything that can fail BEFORE the session file exists, so a
+    // failed startup does not leave a stray empty session polluting
+    // `sessions` / `--last` (CodeCora scan 2026-09-18).
     #[cfg(feature = "mcp")]
     let mcp_cfgs: Vec<tole_core::mcp::McpServerConfig> = host
         .mcp_server
@@ -541,6 +546,16 @@ fn run_command(
     )?;
     #[cfg(not(feature = "mcp"))]
     let registry = build_registry(build_approver(allow_patterns, yes), host.workspace.as_ref())?;
+
+    let session_id = new_session_id();
+    std::fs::create_dir_all(sessions_dir)
+        .with_context(|| format!("creating {}", sessions_dir.display()))?;
+    let system_prompt = system.map(str::to_string).or_else(resolve_system_prompt);
+    let mut storage =
+        JsonlStorage::create_with(sessions_dir, &session_id, None, system_prompt.as_deref())
+            .with_context(|| format!("creating session {session_id}"))?;
+    println!("session: {session_id}");
+
     let mut provider = OpenAiProvider::new(cfg).with_tool_specs(registry.specs());
     if let Some(sys) = system_prompt.as_deref() {
         provider = provider.with_system_prompt(sys);
@@ -613,7 +628,16 @@ fn resume_command(
             // machine accepts a user message at a turn boundary, so
             // reuse run_turn on the resumed storage instead of the
             // approvals-only resume protocol.
-            run_turn(&mut storage, &mut provider, &registry, text)?
+            let outcome = run_turn(&mut storage, &mut provider, &registry, text)?;
+            // Memory loop (CodeCora scan 2026-09-18): a settled resumed
+            // turn leaves a summary like `run` does — the continuation is
+            // its own durable event. No recall injection here: the resumed
+            // session already carries its context.
+            #[cfg(feature = "shell-tools")]
+            if let TurnOutcome::Final { text: answer } = &outcome {
+                host.remember(id, text, answer);
+            }
+            outcome
         }
         _ => resume_turn(&mut storage, &mut provider, &registry)?,
     };
@@ -680,8 +704,13 @@ fn sessions_command(sessions_dir: &Path) -> Result<()> {
     let mut rows: Vec<(u64, String, String, u64, usize)> = Vec::new();
     for entry in std::fs::read_dir(sessions_dir)?.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
-        let stem = name.trim_end_matches(".jsonl");
-        if !name.ends_with(".jsonl") || !valid_session_id(stem) {
+        // strip_suffix, not trim_end_matches: a (weird but possible)
+        // "x.jsonl.jsonl" would otherwise yield the unusable id "x.jsonl"
+        // (CodeCora scan 2026-09-18).
+        let Some(stem) = name.strip_suffix(".jsonl") else {
+            continue;
+        };
+        if !valid_session_id(stem) {
             continue;
         }
         let mtime = entry
@@ -761,7 +790,10 @@ fn latest_session_id(dir: &Path) -> Option<String> {
     let mut best: Option<(std::time::SystemTime, String)> = None;
     for entry in std::fs::read_dir(dir).ok()?.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
-        if !name.ends_with(".jsonl") || !valid_session_id(name.trim_end_matches(".jsonl")) {
+        let Some(stem) = name.strip_suffix(".jsonl") else {
+            continue;
+        };
+        if !valid_session_id(stem) {
             continue;
         }
         let mtime = entry
@@ -815,6 +847,25 @@ fn chat_command(
         (new_session_id(), true)
     };
 
+    // Build everything that can fail BEFORE the fresh session file is
+    // created, so a failed startup does not leave a stray empty session
+    // polluting `sessions` / `--last` (CodeCora scan 2026-09-18).
+    #[cfg(feature = "mcp")]
+    let mcp_cfgs: Vec<tole_core::mcp::McpServerConfig> = host
+        .mcp_server
+        .iter()
+        .map(|s| tole_core::mcp::McpServerConfig::parse(s))
+        .collect::<Result<Vec<_>, String>>()
+        .map_err(anyhow::Error::msg)?;
+    #[cfg(feature = "mcp")]
+    let registry = build_registry(
+        build_approver(allow_patterns, yes),
+        host.workspace.as_ref(),
+        &mcp_cfgs,
+    )?;
+    #[cfg(not(feature = "mcp"))]
+    let registry = build_registry(build_approver(allow_patterns, yes), host.workspace.as_ref())?;
+
     if fresh {
         std::fs::create_dir_all(sessions_dir)
             .with_context(|| format!("creating {}", sessions_dir.display()))?;
@@ -831,21 +882,6 @@ fn chat_command(
         "tole chat — session {session_id} (Ctrl-D exits, resume: tole chat --resume {session_id})"
     );
 
-    #[cfg(feature = "mcp")]
-    let mcp_cfgs: Vec<tole_core::mcp::McpServerConfig> = host
-        .mcp_server
-        .iter()
-        .map(|s| tole_core::mcp::McpServerConfig::parse(s))
-        .collect::<Result<Vec<_>, String>>()
-        .map_err(anyhow::Error::msg)?;
-    #[cfg(feature = "mcp")]
-    let registry = build_registry(
-        build_approver(allow_patterns, yes),
-        host.workspace.as_ref(),
-        &mcp_cfgs,
-    )?;
-    #[cfg(not(feature = "mcp"))]
-    let registry = build_registry(build_approver(allow_patterns, yes), host.workspace.as_ref())?;
     let mut provider = OpenAiProvider::new(cfg).with_tool_specs(registry.specs());
     // B2: fresh sessions pin the resolved prompt; resumed sessions re-apply
     // the header-pinned one (see create_with above / JsonlStorage::open).
@@ -858,8 +894,10 @@ fn chat_command(
     // session summary is stored when the REPL exits cleanly.
     #[cfg(feature = "shell-tools")]
     let (mut memory_injected, mut first_prompt, mut last_answer) = (!fresh, None, None);
-    #[cfg(not(feature = "shell-tools"))]
-    let memory_injected = true;
+    // Set when the typed message could not run because the session was
+    // stuck mid-flight and the bounded resolve retries ran out — the
+    // message is NOT in the durable log, so the operator must resend it.
+    let mut dropped_message = false;
 
     let stdin = std::io::stdin();
     loop {
@@ -933,6 +971,7 @@ fn chat_command(
                             | TurnOutcome::ProviderFailed { .. }),
                         ) => {
                             if retries_left == 0 {
+                                dropped_message = true;
                                 break Ok(other);
                             }
                             retries_left -= 1;
@@ -975,6 +1014,12 @@ fn chat_command(
             ),
             Ok(TurnOutcome::Storage(e)) => anyhow::bail!("storage error: {e}"),
             Err(e) => anyhow::bail!("turn failed: {e}"),
+        }
+        if dropped_message {
+            // The typed message never reached the durable log — saying
+            // "your next message resumes" alone would let the operator
+            // believe it was recorded (CodeCora scan 2026-09-18).
+            eprintln!("tole> (note: the message you just typed was NOT recorded — resolve the session state, then resend it)");
         }
     }
     // Memory loop, post-session: a clean REPL exit with at least one

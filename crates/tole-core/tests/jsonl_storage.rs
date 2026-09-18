@@ -15,6 +15,9 @@ use tole_core::storage::{Commit, JsonlStorage, Storage, StorageError, UsageRecor
 
 fn tmpdir(tag: &str) -> std::path::PathBuf {
     let d = std::env::temp_dir().join(format!("tole-e1-{}-{}", tag, std::process::id()));
+    // Clear any stale dir from a previous run of the same pid — leftover
+    // state must never leak between tests (CodeCora scan 2026-09-18).
+    let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     d
 }

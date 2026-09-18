@@ -26,6 +26,12 @@ use std::sync::mpsc;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+/// Error-class prefix: transport failures evict the connection, while
+/// tool-reported/argument errors keep it (see the module docs). Producer
+/// and matcher share this constant so they cannot drift (CodeCora scan
+/// 2026-09-18: brittle string-prefix matching).
+const TRANSPORT_ERR: &str = "mcp transport";
+
 /// Request into the background tokio reactor.
 enum McpRequest {
     ListTools {
@@ -156,7 +162,7 @@ fn runtime() -> mpsc::Sender<McpRequest> {
                                     // server is healthy: tearing it down on
                                     // every failed call would respawn on the
                                     // next call and drop server session state.
-                                    if r.as_ref().is_err_and(|e| e.starts_with("mcp transport")) {
+                                    if r.as_ref().is_err_and(|e| e.starts_with(TRANSPORT_ERR)) {
                                         conns.remove(&server);
                                     }
                                     let _ = resp.send(r);
@@ -218,7 +224,7 @@ impl McpConnection {
             .service
             .call_tool(params)
             .await
-            .map_err(|e| format!("mcp transport: tool call failed: {e}"))?;
+            .map_err(|e| format!("{TRANSPORT_ERR}: tool call failed: {e}"))?;
         // Untrusted server output: cap what reaches the transcript/log
         // (threat model resource-exhaustion row), with a marked suffix.
         // The cap applies INCREMENTALLY while appending (CodeCora scan
@@ -362,16 +368,23 @@ impl Tool for McpTool {
         // content before a harmful tail). Server-supplied description is
         // capped with the same marker discipline.
         fn truncate_marked(s: &str, max: usize) -> String {
-            let chars: Vec<char> = s.chars().collect();
-            if chars.len() <= max {
-                s.to_string()
-            } else {
-                format!(
-                    "{}…[truncated, +{} chars]",
-                    chars[..max].iter().collect::<String>(),
-                    chars.len() - max
-                )
+            // Streaming: no full Vec<char> materialization of an
+            // arbitrarily large argument payload (CodeCora scan
+            // 2026-09-18).
+            let mut out = String::new();
+            let mut taken = 0usize;
+            let mut total = 0usize;
+            for ch in s.chars() {
+                total += 1;
+                if taken < max {
+                    out.push(ch);
+                    taken += 1;
+                }
             }
+            if total > max {
+                out.push_str(&format!("…[truncated, +{} chars]", total - max));
+            }
+            out
         }
         let description = truncate_marked(&self.description, 200);
         let args = truncate_marked(

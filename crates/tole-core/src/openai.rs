@@ -110,6 +110,11 @@ impl OpenAiConfig {
 pub struct OpenAiProvider {
     cfg: OpenAiConfig,
     timeout: Duration,
+    /// Connection pool: built once per provider (and rebuilt only when
+    /// `with_timeout` changes the timeout) instead of a fresh agent per
+    /// request — a per-call agent defeats TLS/connection reuse (CodeCora
+    /// scan 2026-09-18).
+    agent: ureq::Agent,
     /// Optional system prompt prepended to the wire transcript. Explicit
     /// opt-in: absent by default, never invented by the provider itself.
     system_prompt: Option<String>,
@@ -122,17 +127,28 @@ pub struct OpenAiProvider {
 
 impl OpenAiProvider {
     pub fn new(cfg: OpenAiConfig) -> Self {
+        let timeout = Duration::from_secs(120);
+        let agent = Self::build_agent(timeout);
         Self {
             cfg,
-            timeout: Duration::from_secs(120),
+            timeout,
+            agent,
             system_prompt: None,
             tool_specs: Vec::new(),
             last_usage_obj: None,
         }
     }
 
+    fn build_agent(timeout: Duration) -> ureq::Agent {
+        ureq::Agent::config_builder()
+            .timeout_global(Some(timeout))
+            .build()
+            .new_agent()
+    }
+
     /// Override the default 120s timeout.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.agent = Self::build_agent(timeout);
         self.timeout = timeout;
         self
     }
@@ -148,14 +164,6 @@ impl OpenAiProvider {
     pub fn with_tool_specs(mut self, specs: Vec<Value>) -> Self {
         self.tool_specs = specs;
         self
-    }
-
-    /// The agent used for requests (timeout lives here in ureq 3.x).
-    fn agent(&self) -> ureq::Agent {
-        ureq::Agent::config_builder()
-            .timeout_global(Some(self.timeout))
-            .build()
-            .new_agent()
     }
 
     /// Build the request body. Separated so tests can inspect exactly what
@@ -281,12 +289,17 @@ impl OpenAiProvider {
                 .ok_or_else(|| {
                     ProviderError("malformed tool_call: missing function.name".into())
                 })?;
-            let args = first
-                .get("function")
-                .and_then(|f| f.get("arguments"))
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .unwrap_or_else(|| "{}".into());
+            // `arguments` should be a JSON-encoded string, but some
+            // providers emit it as a raw object — serialize it instead of
+            // silently discarding the model's input as "{}" (CodeCora
+            // scan 2026-09-18).
+            let args: String = match first.get("function").and_then(|f| f.get("arguments")) {
+                Some(Value::String(s)) => s.clone(),
+                Some(Value::Object(_)) | Some(Value::Array(_)) => {
+                    first["function"]["arguments"].to_string()
+                }
+                _ => "{}".into(),
+            };
             let input: Value = match serde_json::from_str(&args) {
                 Ok(v) => v,
                 Err(err) => {
@@ -322,7 +335,7 @@ impl Provider for OpenAiProvider {
             self.cfg.base_url.trim_end_matches('/')
         );
         let resp = self
-            .agent()
+            .agent
             .post(&url)
             .header("Authorization", format!("Bearer {}", self.cfg.api_key))
             .send_json(&body)
@@ -358,8 +371,13 @@ pub(crate) const TOOL_RESULT_BEGIN: &str = "<<<TOOL_RESULT_BEGIN>>>";
 pub(crate) const TOOL_RESULT_END: &str = "<<<TOOL_RESULT_END>>>";
 
 /// Remove any accidental occurrence of the secret from an error string.
-/// Falls back to a generic message if scrubbing somehow fails.
+/// An empty secret is a no-op: `contains("")` is always true and
+/// `replace("", …)` would splice the redaction marker between every
+/// character, mangling the whole message (CodeCora scan 2026-09-18).
 fn scrub(msg: &str, secret: &str) -> String {
+    if secret.is_empty() {
+        return msg.to_string();
+    }
     if msg.contains(secret) {
         msg.replace(secret, "<redacted>")
     } else {

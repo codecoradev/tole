@@ -8,3 +8,7 @@ Cargo.lock
 # eval run debris (tier2 missions create these in workspaces)
 marker.txt
 mission-data.txt
+
+# python bytecode (evals tier2)
+__pycache__/
+*.pyc

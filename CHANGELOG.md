@@ -31,6 +31,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   profiles are unaffected — `tole-core` defaults do not change.
 
 ### Fixed
+- **write_file had no wire schema**: it was the only registered tool
+  without a `spec()` override, so providers received a property-less
+  schema and could legally answer `arguments: {}` — every write failed
+  with "missing 'path'" and identical retries tripped the loop guard
+  (found live, GLM via bifrost). Spec declares path+content required;
+  regression test pins it.
 - CodeCora scan triage (2026-09-18, 54 files): 8 of the 10 MAJOR findings
   fixed — derived `Debug` on `OpenAiConfig` leaked `api_key` via `{:?}`
   (manual redacting impl); the uteke recall query could inject CLI flags
@@ -48,6 +54,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tracked on the scan-triage issue.
 - docs: architecture.md no longer says the Destructive tier may be
   allowlisted (contradicted the never-allowlistable invariant).
+
+### Fixed
+- Remaining CodeCora scan findings (2026-09-18 sweep): `scrub()` no
+  longer mangles text when the secret is empty; non-string tool-call
+  arguments are serialized instead of silently replaced with `{}`;
+  `OpenAiProvider` reuses one ureq agent (connection reuse) instead of
+  building one per request; failed startups no longer leave a stray
+  empty session file (registry/provider are built before the session is
+  created); `resume <id> "<prompt>"` now stores the memory summary like
+  `run`; chat states explicitly when a typed message was dropped after
+  exhausted mid-flight retries; session ids use `strip_suffix` (a
+  `x.jsonl.jsonl` file no longer yields an unusable id);
+  `binary_available` honors the executable bit (unix) / `.exe`
+  (windows); edit_file's approval line shows the actual old→new change;
+  edit_file temp files are unique per attempt and legacy stale temps are
+  swept; delete_file on a symlinked path removes the LINK, not the
+  referent; job_start kills the spawned job when the pid file cannot be
+  written; MCP tool-request descriptions truncate without materializing
+  the whole payload, and the transport-error class shares one constant;
+  tole-cli is now lib+bin so integration tests drive the REAL jailed
+  tools and approver instead of drifting re-implementations; evals
+  Tier 2 runner is Python 3.9-compatible, cleans its mkdtemp session
+  dirs, uses a portable timestamp, and the baseline diff no longer
+  flags newly-passing missions as regressions or skips zero baselines
+  silently; threat-model ENV/JOB-2 rows updated to match the code.
 
 ### Changed
 - `cora_search` follows the same startup-probing contract as the uteke

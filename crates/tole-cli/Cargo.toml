@@ -6,6 +6,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[lib]
+name = "tole_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "tole"
 path = "src/main.rs"
