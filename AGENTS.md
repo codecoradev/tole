@@ -17,8 +17,9 @@ the source of truth when this file and reality disagree.
   comments, docs) is written in English.
 - **Branches:** `develop` = integration, `main` = release (tags only).
   Work happens as branch → PR → squash-merge into `develop`. No direct
-  pushes, no force pushes. Branch names: `feature/*`, `fix/*`, `docs/*`,
-  `chore/*`.
+  pushes, no force pushes. Branch names (CI-enforced): `feat/*`, `fix/*`,
+  `docs/*`, `chore/*`, `perf/*`, `security/*`, `refactor/*`, `test/*`,
+  `build/*`, `ci/` — note `feat/`, not `feature/`.
 - **Commits:** Conventional Commits (`feat:`, `fix:`, `docs:`, `chore:`,
   `refactor:`, `test:`).
 - **PRs:** one logical change per PR (larger work = issue first). Body
