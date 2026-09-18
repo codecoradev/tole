@@ -30,6 +30,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--mcp-server` work on a plain `cargo build -p tole-cli`. Embedder
   profiles are unaffected — `tole-core` defaults do not change.
 
+### Fixed
+- CodeCora scan triage (2026-09-18, 54 files): 8 of the 10 MAJOR findings
+  fixed — derived `Debug` on `OpenAiConfig` leaked `api_key` via `{:?}`
+  (manual redacting impl); the uteke recall query could inject CLI flags
+  (leading-dash guard); the uteke room-link spawn skipped env scrubbing;
+  `job_poll` (ReadOnly) truncated/rewrote the job log (bounded read only —
+  behavior change: runaway logs are no longer trimmed on poll; clear them
+  as an operator); the MCP result cap was applied after a full block copy
+  (incremental, single-oversized-block safe); subprocess capture is capped
+  at 32 MiB per stream with a marked truncation suffix, and the drain no
+  longer blocks indefinitely on a grandchild holding the pipe (2s grace —
+  unterminated output is dropped); the `sh -c` payload scan now recurses
+  and strips shell quotes (`sh -c "/bin/rm -rf /"` and nested-shell
+  payloads are refused); `gh pr_create` actually passes the advertised
+  `head` field (validated like `base`). Remaining MAJOR/MINOR findings are
+  tracked on the scan-triage issue.
+- docs: architecture.md no longer says the Destructive tier may be
+  allowlisted (contradicted the never-allowlistable invariant).
+
 ### Changed
 - `cora_search` follows the same startup-probing contract as the uteke
   tools: a missing `cora` binary degrades to a one-line warning instead

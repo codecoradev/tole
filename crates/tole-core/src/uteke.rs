@@ -78,6 +78,13 @@ impl Tool for UtekeRecallTool {
         if query.trim().is_empty() {
             return Err("query must not be empty".into());
         }
+        // A leading-dash query would reach the uteke binary as a CLI FLAG,
+        // not as search text (`uteke recall "--store /elsewhere"`) — the
+        // same argv-flag-injection defense as the room check below.
+        // (CodeCora scan 2026-09-18, MAJOR.)
+        if query.starts_with('-') {
+            return Err("query must not start with '-'".into());
+        }
         let mut cmd = Command::new("uteke");
         crate::subprocess::scrub_env_for_child(&mut cmd);
         match input.get("room").and_then(Value::as_str) {
@@ -239,6 +246,9 @@ impl Tool for UtekeDocumentTool {
         let mut linked = false;
         if let Some(room) = &room {
             let mut link = Command::new("uteke");
+            // ENV-1: same secret scrubbing as every other spawn point
+            // (CodeCora scan 2026-09-18 — this spawn point missed it).
+            crate::subprocess::scrub_env_for_child(&mut link);
             link.arg("room")
                 .arg("add-document")
                 .arg(room)
@@ -347,5 +357,26 @@ mod regression_tests {
         assert!(t
             .execute(json!({"query": "x", "room": "bad room"}))
             .is_err());
+    }
+
+    #[test]
+    fn recall_rejects_leading_dash_query() {
+        // A leading-dash query would reach the uteke CLI as a flag, not
+        // as search text (CodeCora scan 2026-09-18, MAJOR).
+        let t = UtekeRecallTool::new();
+        assert!(t.execute(json!({"query": "--store /elsewhere"})).is_err());
+        assert!(t.execute(json!({"query": "-x"})).is_err());
+        // Benign queries pass the guard; the rest of the pipeline may go
+        // either way depending on whether the uteke binary is installed
+        // and the store reachable — assert the FAILURE REASON, not
+        // success/failure itself (this test must never touch the real
+        // store non-deterministically).
+        match t.execute(json!({"query": "state machine design"})) {
+            Ok(_) => {}
+            Err(err) => assert!(
+                !err.contains("must not start with '-'"),
+                "guard fired on benign query: {err}"
+            ),
+        }
     }
 }

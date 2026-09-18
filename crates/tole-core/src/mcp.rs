@@ -221,20 +221,19 @@ impl McpConnection {
             .map_err(|e| format!("mcp transport: tool call failed: {e}"))?;
         // Untrusted server output: cap what reaches the transcript/log
         // (threat model resource-exhaustion row), with a marked suffix.
+        // The cap applies INCREMENTALLY while appending (CodeCora scan
+        // 2026-09-18): a single oversized text block must not be copied
+        // into the buffer in full before any limit is checked.
         const MAX_RESULT_CHARS: usize = 256 * 1024;
-        let mut text = String::new();
-        for block in &result.content {
-            if let rmcp::model::ContentBlock::Text(t) = block {
-                text.push_str(&t.text);
-                text.push('\n');
-            }
-            if text.chars().count() > MAX_RESULT_CHARS {
-                let cut: String = text.chars().take(MAX_RESULT_CHARS).collect();
-                text =
-                    format!("{cut}\n…[truncated, server output exceeded {MAX_RESULT_CHARS} chars]");
-                break;
-            }
-        }
+        let blocks: Vec<&str> = result
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                rmcp::model::ContentBlock::Text(t) => Some(t.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        let text = cap_text_blocks(&blocks, MAX_RESULT_CHARS);
         // MCP spec: servers report tool FAILURE via isError + textual
         // content. That must settle as an error here, not Ok — the
         // durable log's success/failure bookkeeping depends on it.
@@ -243,6 +242,39 @@ impl McpConnection {
         }
         Ok(text)
     }
+}
+
+/// Cap untrusted text blocks for the transcript: append up to `max`
+/// chars total, with a marked suffix when anything was cut. Pure so the
+/// truncation contract is testable without a live server (CodeCora scan
+/// 2026-09-18 — the cap must apply while appending, not after a full
+/// block copy).
+fn cap_text_blocks(blocks: &[&str], max: usize) -> String {
+    let mut text = String::new();
+    let mut len = 0usize;
+    let mut truncated = false;
+    for block in blocks {
+        if truncated {
+            break;
+        }
+        for ch in block.chars() {
+            if len >= max {
+                truncated = true;
+                break;
+            }
+            text.push(ch);
+            len += 1;
+        }
+        if !truncated {
+            text.push('\n');
+        }
+    }
+    if truncated {
+        text.push_str(&format!(
+            "\n…[truncated, server output exceeded {max} chars]"
+        ));
+    }
+    text
 }
 
 async fn start_server(
@@ -466,4 +498,37 @@ pub fn register_server_tools(
         ),
     }
     registered
+}
+
+#[cfg(test)]
+mod cap_tests {
+    use super::cap_text_blocks;
+
+    #[test]
+    fn under_cap_joins_blocks_with_newlines() {
+        let out = cap_text_blocks(&["alpha", "beta"], 1024);
+        assert_eq!(out, "alpha\nbeta\n");
+        assert!(!out.contains("truncated"));
+    }
+
+    #[test]
+    fn single_oversized_block_is_capped_incrementally() {
+        let big = "x".repeat(5000);
+        let out = cap_text_blocks(&[big.as_str()], 1000);
+        assert!(out.chars().count() < 1200, "must not carry the full block");
+        assert!(out.contains("truncated, server output exceeded 1000 chars"));
+    }
+
+    #[test]
+    fn later_blocks_dropped_once_cap_hit() {
+        let out = cap_text_blocks(&["aaaa", "bbbb", "cccc"], 6);
+        // "aaaa\n" fills 5; "bbbb" contributes 1 char then the cap trips.
+        assert!(out.starts_with("aaaa\nb"));
+        assert!(out.contains("truncated, server output exceeded 6 chars"));
+    }
+
+    #[test]
+    fn empty_input_yields_empty_string() {
+        assert_eq!(cap_text_blocks(&[], 100), "");
+    }
 }

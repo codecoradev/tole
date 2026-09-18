@@ -14,7 +14,7 @@ use std::time::Duration;
 
 /// Where a config value came from — for tests and debug output that must
 /// never include the key itself.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct OpenAiConfig {
     /// e.g. `https://api.openai.com/v1`
     pub base_url: String,
@@ -22,6 +22,16 @@ pub struct OpenAiConfig {
     pub model: String,
     /// Never logged; goes only into the `Authorization` header.
     pub api_key: String,
+}
+
+impl std::fmt::Debug for OpenAiConfig {
+    /// Manual impl: the derived `Debug` would print `api_key` in
+    /// cleartext (CodeCora scan 2026-09-18), turning any incidental
+    /// `{:?}` log line of a config or provider into a credential leak.
+    /// `safe_description()` remains the explicit human-readable form.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.safe_description())
+    }
 }
 
 /// Env names are namespaced (`TOLE_*`) to avoid collisions with other
@@ -372,6 +382,25 @@ mod tests {
         );
         let d = cfg.safe_description();
         assert!(!d.contains("sk-supersecret-123"), "key leaked: {d}");
+        assert!(d.contains("test-model"));
+    }
+
+    #[test]
+    fn config_debug_never_leaks_key() {
+        // The derived Debug printed api_key in cleartext (CodeCora scan
+        // 2026-09-18); the manual impl must keep `{:?}` — and therefore
+        // any provider struct containing the config — key-free.
+        let cfg = OpenAiConfig::new(
+            "https://api.example.com/v1",
+            "test-model",
+            "sk-supersecret-123",
+        );
+        let d = format!("{cfg:?}");
+        assert!(
+            !d.contains("sk-supersecret-123"),
+            "key leaked via Debug: {d}"
+        );
+        assert!(d.contains("redacted"));
         assert!(d.contains("test-model"));
     }
 
