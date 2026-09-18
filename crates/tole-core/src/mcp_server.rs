@@ -88,19 +88,27 @@ impl RegistryServer {
             .registry
             .get(name)
             .ok_or_else(|| format!("unknown tool: {name}"))?;
+        // Structural guard, NOT an approver decision (CodeCora scan
+        // finding): `RegistryServer::new` accepts any registry, including
+        // one built with a permissive approver that would Allow a
+        // Destructive call. Hiding it from tools/list is not enough — it
+        // must be uncallable, period.
+        if tool.risk() == Risk::Destructive {
+            return Err("destructive tools are never exposed in server mode".into());
+        }
         match tool.risk() {
             Risk::ReadOnly => {}
-            Risk::Write | Risk::Destructive => match self.registry.decide(name, &args) {
+            Risk::Write => match self.registry.decide(name, &args) {
                 Some(crate::approval::Verdict::Allow) => {}
                 _ => {
                     return Err(
                         "denied by approval policy — this MCP server only pre-authorizes \
-                         Write tools listed in --allow patterns (Destructive tools are \
-                         never exposed in server mode)"
+                         Write tools listed in --allow patterns"
                             .into(),
                     )
                 }
             },
+            Risk::Destructive => unreachable!("guarded above"),
         }
         tool.execute(args)
     }
@@ -317,6 +325,43 @@ mod tests {
             other => panic!("expected text content, got {other:?}"),
         };
         assert!(text.contains('"') && text.contains("x"), "{text}");
+        client.cancel().await.ok();
+    }
+
+    /// CodeCora scan regression: an embedder CAN pass a registry whose
+    /// approver allows Destructive (interactive-permissive). The server
+    /// must still refuse to execute it — hiding it from tools/list is not
+    /// enough.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn destructive_uncallable_even_with_permissive_registry() {
+        struct PermissiveApprover;
+        impl crate::approval::Approver for PermissiveApprover {
+            fn decide(&self, _req: &crate::approval::ToolRequest<'_>) -> crate::approval::Verdict {
+                crate::approval::Verdict::Allow
+            }
+            fn interactive(&self) -> bool {
+                true // the only way a Destructive tool registers at all
+            }
+        }
+        let mut reg = ToolRegistry::with_approver(PermissiveApprover);
+        reg.register(Box::new(BombTool))
+            .expect("permissive registry accepts it");
+        let client = connect(RegistryServer::new(reg)).await;
+        // Hidden from listing...
+        let listed = client.peer().list_tools(None).await.unwrap();
+        assert!(!listed.tools.iter().any(|t| t.name == "bomb"));
+        // ...and uncallable.
+        let res = client
+            .peer()
+            .call_tool(CallToolRequestParams::new("bomb"))
+            .await
+            .unwrap();
+        assert_eq!(res.is_error, Some(true));
+        let text = match &res.content[0] {
+            ContentBlock::Text(t) => t.text.clone(),
+            other => panic!("expected text content, got {other:?}"),
+        };
+        assert!(text.contains("never exposed in server mode"), "{text}");
         client.cancel().await.ok();
     }
 
