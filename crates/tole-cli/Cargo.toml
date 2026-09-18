@@ -11,9 +11,10 @@ name = "tole"
 path = "src/main.rs"
 
 [features]
-# Mirrors tole-core's shell-tools gate so cfg in this crate resolves.
-# The CLI always wants the shell tools; embedders use tole-core directly.
-default = ["shell-tools"]
+# Mirrors tole-core's gates so cfg in this crate resolves. The CLI
+# always wants the shell tools and the MCP client (the auto-preset needs
+# it); embedders use tole-core directly with their own feature choices.
+default = ["shell-tools", "mcp"]
 shell-tools = ["tole-core/shell-tools"]
 mcp = ["tole-core/mcp"]
 
