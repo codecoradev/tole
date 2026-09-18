@@ -679,7 +679,20 @@ fn all_abort_paths_leave_durable_error_records() {
             reg.register(Box::new(WriteTool)).unwrap();
         }
 
-        let _ = run_turn(&mut s, &mut p, &reg, "hi").unwrap();
+        let outcome = run_turn(&mut s, &mut p, &reg, "hi").unwrap();
+        // Neither abort flavor may end in a Final answer — the turn must
+        // park on the failure and leave the durable ERROR record checked
+        // below (CodeCora scan 2026-09-18: do not discard the outcome
+        // under test). The exact flavor differs per case: "unknown" →
+        // UnknownTool; "approval" → the allowlist here pattern-matches
+        // `write_file` (AllowlistApprover semantics: match beats the
+        // default), the tool RUNS, and the exhausted script settles as
+        // ProviderFailed — the real approval gate contract is covered by
+        // `turn_write_tool_requires_approval_gate`.
+        assert!(
+            !matches!(outcome, TurnOutcome::Final { .. }),
+            "aborted turn must not produce Final, got {outcome:?}"
+        );
         // Durable ERROR entry exists, attached to the user message.
         let errs: Vec<&tole_core::entry::Entry> = s
             .entries()

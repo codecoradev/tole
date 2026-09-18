@@ -65,23 +65,6 @@ impl WriteFileTool {
         }
         Some(resolved)
     }
-
-    /// Reject final targets that are symlinks — kept for the
-    /// non-unix fallback path inside `write_jailed`.
-    #[cfg(not(unix))]
-    fn reject_symlink_target(target: &Path) -> Result<(), String> {
-        let is_symlink = target
-            .symlink_metadata()
-            .map(|m| m.file_type().is_symlink())
-            .unwrap_or(false);
-        if is_symlink {
-            return Err(format!(
-                "refusing to write through symlink {}",
-                target.display()
-            ));
-        }
-        Ok(())
-    }
 }
 
 impl Tool for WriteFileTool {
@@ -114,6 +97,22 @@ impl Tool for WriteFileTool {
         let bytes = content.len();
         self.write_jailed(&target, content)?;
         Ok(json!({ "path": path, "bytes": bytes }))
+    }
+
+    /// Wire schema. This override is LOAD-BEARING: without it the tool
+    /// reached providers with a property-less schema, and GLM legally
+    /// answered `arguments: {}` — every write_file call failed with
+    /// "missing 'path'" (found live, 2026-09-18: 3 identical calls tripped
+    /// the loop guard).
+    fn spec(&self) -> Option<Value> {
+        Some(json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Workspace-relative file path (no .., no absolute paths)" },
+                "content": { "type": "string", "description": "Full file content to write (the file is created or overwritten)" }
+            },
+            "required": ["path", "content"]
+        }))
     }
 }
 
@@ -187,6 +186,10 @@ impl WriteFileTool {
         }
         #[cfg(not(unix))]
         {
+            // Best-effort symlink refusal immediately before the write.
+            // Residual TOCTOU remains on non-unix hosts (no O_NOFOLLOW
+            // equivalent wired here yet) — unix, the primary host, is
+            // race-free via O_NOFOLLOW (CodeCora scan 2026-09-18).
             let is_symlink = target
                 .symlink_metadata()
                 .map(|m| m.file_type().is_symlink())
@@ -240,6 +243,19 @@ mod tests {
         assert!(t
             .execute(json!({ "path": "a/../../escape.txt", "content": "x" }))
             .is_err());
+    }
+
+    #[test]
+    fn wire_spec_declares_required_properties() {
+        // CodeCora scan + live E2E: a missing spec reached providers as a
+        // property-less schema and the model legally answered
+        // `arguments: {}`.
+        let t = WriteFileTool::new(std::env::temp_dir());
+        let spec = t.spec().expect("write_file must declare a schema");
+        let props = &spec["properties"];
+        assert!(props.get("path").is_some(), "path must be declared");
+        assert!(props.get("content").is_some(), "content must be declared");
+        assert_eq!(spec["required"], json!(["path", "content"]));
     }
 
     #[test]

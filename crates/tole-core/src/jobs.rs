@@ -279,8 +279,15 @@ impl Tool for JobStartTool {
             .spawn()
             .map_err(|e| format!("job_start: failed to spawn (is it on PATH?): {e}"))?;
         let pid = child.id();
-        std::fs::write(dir.join("pid"), pid.to_string())
-            .map_err(|e| format!("job_start: pid file: {e}"))?;
+        if let Err(e) = std::fs::write(dir.join("pid"), pid.to_string()) {
+            // Without the pid file the job is untrackable — a spawn that
+            // reports failure must not leave a live orphan behind
+            // (CodeCora scan 2026-09-18).
+            let mut child = child;
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("job_start: pid file: {e}"));
+        }
         Ok(json!({
             "job": id,
             "pid": pid,

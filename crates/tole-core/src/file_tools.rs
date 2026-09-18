@@ -83,7 +83,20 @@ fn atomic_write(target: &Path, new: &str) -> Result<(), String> {
     // from a crashed prior attempt would brick the tool (create_new
     // refuses overwrite), so an AlreadyExists temp is removed once and
     // the open retried — self-healing instead of session-bricking.
-    let tmp = parent.join(format!(".tole-edit-{}.tmp", std::process::id()));
+    // Legacy stale sweep: crashed attempts of the OLD pid-only naming
+    // (`.tole-edit-{pid}.tmp`) are removed up front. A concurrent
+    // nanos-unique temp can never match this exact name, so the sweep
+    // cannot delete a live writer's file (CodeCora scan 2026-09-18).
+    let _ = std::fs::remove_file(parent.join(format!(".tole-edit-{}.tmp", std::process::id())));
+    // New names are unique per attempt (pid + subsec-nanos): create_new
+    // can therefore never collide with a concurrent same-pid writer, and
+    // the on-collision self-heal below only ever fires for a genuinely
+    // stale exact match.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let tmp = parent.join(format!(".tole-edit-{}-{nanos}.tmp", std::process::id()));
     let open_fresh = |tmp: &Path| -> Result<std::fs::File, String> {
         #[cfg(unix)]
         {
@@ -161,7 +174,25 @@ impl Tool for EditFileTool {
             .get("path")
             .and_then(Value::as_str)
             .unwrap_or("<missing path>");
-        format!("edit file {path}")
+        // The approver approves THIS string: show the actual change, not
+        // just the file name (CodeCora scan 2026-09-18). Bounded previews
+        // keep the approval line readable.
+        fn preview(v: Option<&Value>, max: usize) -> String {
+            let t = v
+                .and_then(Value::as_str)
+                .unwrap_or("<missing>")
+                .replace('\n', "\\n");
+            let mut out: String = t.chars().take(max).collect();
+            if t.chars().count() > max {
+                out.push('…');
+            }
+            out
+        }
+        format!(
+            "edit file {path}: {:?} -> {:?}",
+            preview(input.get("old_text"), 80),
+            preview(input.get("new_text"), 80)
+        )
     }
 
     fn spec(&self) -> Option<Value> {
@@ -283,16 +314,24 @@ impl Tool for DeleteFileTool {
             return Err("delete_file: missing 'path'".into());
         };
         let target = jailed(&self.root, path, "delete_file")?;
-        let meta = std::fs::symlink_metadata(&target)
+        // The jail canonicalizes, which FOLLOWS a symlink: deleting
+        // `target` would remove the referent and leave a dangling link in
+        // the workspace. Detect a symlinked path via the pre-canonical
+        // location and remove the LINK itself instead (CodeCora scan
+        // 2026-09-18).
+        let direct = self.root.join(path);
+        let meta = std::fs::symlink_metadata(&direct)
             .map_err(|e| format!("delete_file: stat {}: {e}", target.display()))?;
         if meta.is_dir() {
             return Err(format!(
                 "delete_file: is a directory: {path} (directories are out of scope)"
             ));
         }
-        std::fs::remove_file(&target)
-            .map_err(|e| format!("delete_file: {}: {e}", target.display()))?;
-        Ok(json!({ "path": path, "deleted": true }))
+        let is_symlink = meta.file_type().is_symlink();
+        let victim = if is_symlink { &direct } else { &target };
+        std::fs::remove_file(victim)
+            .map_err(|e| format!("delete_file: {}: {e}", victim.display()))?;
+        Ok(json!({ "path": path, "deleted": true, "symlink": is_symlink }))
     }
 }
 

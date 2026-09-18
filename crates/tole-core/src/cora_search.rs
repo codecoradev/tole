@@ -10,11 +10,12 @@ use crate::subprocess::{run_with_timeout, SUBPROCESS_TIMEOUT};
 use crate::tool::{Risk, Tool};
 use serde_json::{json, Value};
 use std::process::Command;
+// Hard ceiling on any subprocess this tool spawns (SUBPROCESS_TIMEOUT):
+// the turn loop is synchronous — a hung `cora brain` would freeze the
+// whole agent.
 #[cfg(test)]
 use std::time::Duration;
 
-/// Hard ceiling on any subprocess this tool spawns. The turn loop is
-/// synchronous — a hung `cora brain` would freeze the whole agent.
 /// ReadOnly search over the current project's symbol index.
 #[derive(Debug, Clone)]
 pub struct CoraSearchTool {
@@ -140,6 +141,7 @@ mod tests {
 }
 
 #[cfg(test)]
+#[cfg(unix)] // `sleep`/`true` fixtures are unix-only (CodeCora scan 2026-09-18)
 mod timeout_tests {
     use super::*;
 

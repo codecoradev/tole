@@ -12,11 +12,14 @@ Usage:
 
 import argparse
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
 import time
+from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 REPO = Path(__file__).resolve().parents[2]
 BINARY = REPO / "target/release/tole"
@@ -63,7 +66,7 @@ def run_tole(args: list[str], timeout: int = TIMEOUT_SECS) -> tuple[int, str, st
     return proc.returncode, proc.stdout, proc.stderr
 
 
-def session_file(sessions_dir: Path) -> Path | None:
+def session_file(sessions_dir: Path) -> Optional[Path]:
     files = sorted(sessions_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime)
     return files[-1] if files else None
 
@@ -159,6 +162,9 @@ def run_mission(name: str, workspace: Path) -> dict:
     ok, detail = MISSIONS[name]({**out, "sessions": sessions_count})
     out["success"] = ok
     out["detail"] = detail
+    # Clean the per-mission session dir (CodeCora scan 2026-09-18:
+    # mkdtemp dirs were never removed).
+    shutil.rmtree(sessions, ignore_errors=True)
     return out
 
 
@@ -175,7 +181,10 @@ def main() -> int:
         raise SystemExit(f"release binary missing: {BINARY} — build it first")
 
     names = sorted(MISSIONS) if ns.all else [ns.mission]
-    results = {"generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "missions": []}
+    results = {
+        "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "missions": [],
+    }
     for name in names:
         with tempfile.TemporaryDirectory(prefix="tole-eval-ws-") as ws:
             print(f"=== {name} ===", flush=True)
