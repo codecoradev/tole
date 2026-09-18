@@ -3,6 +3,9 @@
 > Ground truth: Phase 1a/1b/2 complete (E1–E8, E10–E12, E4.5, gh read ops,
 > TOLE_* env). 114/114 tests, CI 12/12. Replan 2026-08-27: chat-first
 > direction per PRD v1.1 §0 Identity.
+> Status sync 2026-09-18 (v0.3.0): Track A (A1–A2) and Track B (B1–B4) are
+> **complete** — code is authoritative over this doc. Track C (E9) in
+> progress; MCP client shipped ahead of schedule (#74).
 
 ## Identity recap (PRD v1.1)
 
@@ -22,9 +25,9 @@ edit) · gh read ops · TOLE_* env canonical.
 
 ---
 
-## Track A — Coding-lite completion (small, closes old promises)
+## Track A — Coding-lite completion (small, closes old promises) — ✅ DONE
 
-### A1 — Scoped pre-authorization
+### A1 — Scoped pre-authorization — ✅ DONE (v0.3.0)
 - **What:** `--allow <risk>:<tool>` (repeatable), e.g. `--allow write:edit_file`.
   Pre-authorizes specific Write tools for headless/CI runs.
 - **Hard rule:** Destructive is **never** allowlistable — structural
@@ -34,7 +37,7 @@ edit) · gh read ops · TOLE_* env canonical.
   still denied. Unit tests for the flag parser + approver wiring.
 - **Est:** S
 
-### A2 — Git tool (light)
+### A2 — Git tool (light) — ✅ DONE (v0.3.0, `git.rs` registered in the CLI host)
 - **What:** `git` builtin: `status`, `diff`, `add`, `commit` ops, argv
   whitelist discipline identical to gh.rs (validated per-op args, no
   free-form flags). Push stays manual.
@@ -48,9 +51,9 @@ edit) · gh read ops · TOLE_* env canonical.
 
 ---
 
-## Track B — Chat-first (the product direction)
+## Track B — Chat-first (the product direction) — ✅ DONE
 
-### B1 — Chat mode (`tole chat`) — keystone
+### B1 — Chat mode (`tole chat`) — keystone — ✅ DONE (v0.3.0)
 - **What:** multi-turn REPL: prompt → agentic turn (durable, exactly like
   `run`) → answer → next prompt. `--resume <id>` / `--last` to continue.
   Explicit resume (no implicit auto-continue) — deliberate state
@@ -60,7 +63,7 @@ edit) · gh read ops · TOLE_* env canonical.
   cleanly closed session.
 - **Est:** M
 
-### B2 — System prompt & agent identity
+### B2 — System prompt & agent identity — ✅ DONE (v0.3.0)
 - **What:** resolution `--system` flag > `TOLE_SYSTEM_PROMPT` env >
   default. Persisted in the session header (once, not per-turn — token
   efficient, replay-accurate). Analysis note: persona must stay stable
@@ -70,14 +73,14 @@ edit) · gh read ops · TOLE_* env canonical.
   replay still green.
 - **Est:** S–M
 
-### B3 — Session UX
+### B3 — Session UX — ✅ DONE (v0.3.0, as `tole sessions` + `tole status <id>`)
 - **What:** `tole sessions list` (id, age, turn count, last-message
   preview, usage) and `tole sessions show <id>` (timeline view). Branching
   deferred.
 - **Acceptance:** list + inspect without opening JSONL by hand.
 - **Est:** S
 
-### B4 — Dynamic tools: generic `run_command` + startup probing + uteke first-class
+### B4 — Dynamic tools: generic `run_command` + startup probing + uteke first-class — ✅ DONE (v0.3.0)
 - **What:**
   1. **`run_command` builtin**: input `{ "command": "..." }` → shlex-parsed
      to argv (no shell), cwd-jail, subprocess timeout + output cap. Risk
@@ -98,18 +101,19 @@ edit) · gh read ops · TOLE_* env canonical.
 
 ---
 
-## Track C — Deferred (revisit after Track B)
+## Track C — In progress (E9)
 
 E9 hardening/OSS-prep (issue #9): cross-build CI (aarch64-android,
 aarch64-apple-ios), timeout/truncation fuzz-lite, perf doc, LICENSE/README
-publish. MCP integration if a non-CLI tool need appears. Session branching.
+publish. MCP client **shipped** (#74, closed 2026-09-12). Session branching
+still deferred.
 
 ---
 
 ## Execution order
 
 ```
-A1 → A2 → B1 → B2 → B3 → B4 → (Track C revisit)
+A1 → A2 → B1 → B2 → B3 → B4 → (Track C revisit)   ← all of Track A/B done
 ```
 
 A-track first: small, closes the coding-lite promises and unblocks headless
