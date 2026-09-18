@@ -164,7 +164,6 @@ mod tests {
     use rmcp::service::serve_client;
     use rmcp::RoleClient;
     use serde_json::json;
-    use std::sync::Arc;
 
     struct EchoTool;
     impl Tool for EchoTool {
