@@ -7,6 +7,9 @@ use std::path::{Path, PathBuf};
 use tole_cli::approver::{InteractiveApprover, StdioPrompt};
 use tole_cli::tools::WriteFileTool;
 use tole_core::approval::AllowlistApprover;
+
+#[cfg(feature = "shell-tools")]
+mod acp;
 #[cfg(feature = "shell-tools")]
 use tole_core::cora_search::CoraSearchTool;
 use tole_core::file_tools::{DeleteFileTool, EditFileTool};
@@ -152,6 +155,30 @@ enum Command {
         #[arg(long)]
         workspace: Option<String>,
     },
+    /// Serve tole as an ACP agent over stdio (issue #95): editors and
+    /// ACP clients drive durable tole sessions; tool approvals surface
+    /// as permission requests in the client.
+    #[cfg(feature = "shell-tools")]
+    Acp {
+        /// Same semantics as `run --allow` (Write pre-authorization).
+        #[arg(long = "allow")]
+        allow_patterns: Vec<String>,
+
+        /// Auto-allow every Write call (Destructive still prompts in the
+        /// client).
+        #[arg(long)]
+        yes: bool,
+
+        /// Default file-tools root; each session's jail is the client's
+        /// session cwd.
+        #[arg(long)]
+        workspace: Option<String>,
+
+        /// Memory loop backend (`uteke`) — same as `--memory uteke` on
+        /// run/chat. Falls back to the TOLE_MEMORY env.
+        #[arg(long)]
+        memory: Option<String>,
+    },
     /// Interactive multi-turn chat on one durable session (B1).
     Chat {
         /// System prompt for a fresh session (ignored when resuming —
@@ -234,6 +261,16 @@ fn dispatch(cli: Cli) -> Result<()> {
             allow_patterns,
             workspace,
         } => mcp_server_command(workspace.as_ref(), &allow_patterns),
+        #[cfg(feature = "shell-tools")]
+        Command::Acp {
+            allow_patterns,
+            yes,
+            workspace,
+            memory,
+        } => {
+            let memory = resolve_memory(memory.as_ref())?;
+            crate::acp::run_acp(&allow_patterns, yes, workspace.as_ref(), memory)
+        }
         Command::Sessions => sessions_command(&sessions_dir),
         Command::Status { id } => status_command(&sessions_dir, &id),
         Command::Chat {
