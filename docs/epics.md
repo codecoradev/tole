@@ -110,10 +110,32 @@ still deferred.
 
 ---
 
+## Track D — Integration surfaces (approved 2026-09-18)
+
+tole-core gains three hosts beyond the CLI, in build order (each reuses the
+previous layer):
+
+### D1 — \`tole mcp\`: MCP server over stdio (issue #94)
+Expose the registry's hardened tools via rmcp's server side. ReadOnly tools
+always callable; Write needs \`--allow\`; Destructive structurally absent.
+Est: S–M.
+
+### D2 — \`tole acp\`: Agent Client Protocol host (issue #95)
+Editor integration (Zed et al.): ACP sessions ↔ JSONL sessions, ACP
+permission requests ↔ the approval gate, streaming turn events. Est: M.
+
+### D3 — \`tole-serve\`: server mode (issue #96)
+Long-running daemon (uteke-serve pattern): MCP Streamable HTTP + thin REST,
+token auth, server-side durable sessions, per-session workspace jails.
+Est: M–L.
+
+---
+
 ## Execution order
 
 ```
-A1 → A2 → B1 → B2 → B3 → B4 → (Track C revisit)   ← all of Track A/B done
+A1 → A2 → B1 → B2 → B3 → B4 → Track C → D1 → D2 → D3
+                                   ↑ all of Track A/B done; C in progress
 ```
 
 A-track first: small, closes the coding-lite promises and unblocks headless
