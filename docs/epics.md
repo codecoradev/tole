@@ -120,7 +120,7 @@ Expose the registry's hardened tools via rmcp's server side. ReadOnly tools
 always callable; Write needs `--allow`; Destructive structurally absent.
 Est: S–M.
 
-### D2 — `tole acp`: Agent Client Protocol host (issue #95)
+### D2 — `tole acp`: Agent Client Protocol host (issue #95) — ✅ DONE (2026-09-18)
 Editor integration (Zed et al.): ACP sessions ↔ JSONL sessions, ACP
 permission requests ↔ the approval gate, streaming turn events. Est: M.
 

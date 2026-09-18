@@ -31,6 +31,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   profiles are unaffected — `tole-core` defaults do not change.
 
 ### Added
+- `tole acp`: tole as an **Agent Client Protocol agent** over stdio
+  (issue #95) — editors (Zed et al.) drive durable tole sessions:
+  `session/new`/`session/load` map to the JSONL session store, prompts run
+  full tole turns, the final answer streams as an `agent_message_chunk`,
+  and Write/Destructive tool calls surface as
+  `session/request_permission` requests — the editor human approves, with
+  Destructive consent being a genuine per-call decision. Provider config
+  is only required when a prompt actually runs. The session map survives
+  across prompts (a first-run regression where fresh state replaced the
+  map after one turn — caught by CodeCora review — is fixed, along with
+  session-id path-traversal and mutex-poisoning hardening).
 - `tole mcp`: tole as an **MCP server** over stdio (issue #94) — the
   registry's hardened tools (jailed file ops, argv-validated git, detached
   jobs, memory loop, cora/uteke integrations) become callable by any MCP
