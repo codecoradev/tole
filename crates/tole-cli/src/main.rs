@@ -74,6 +74,16 @@ struct Cli {
     #[arg(long, global = true)]
     no_auto_mcp: bool,
 
+    /// Harness memory loop backend (run/chat): on the first turn of a
+    /// fresh session, memories relevant to the prompt are recalled from
+    /// the owner's store and injected into the message; when the session
+    /// settles, a compact summary is stored back. Currently `uteke`
+    /// (namespace: repo-<dir>, override: TOLE_MEMORY_NAMESPACE). Falls
+    /// back to the TOLE_MEMORY env.
+    #[cfg(feature = "shell-tools")]
+    #[arg(long, global = true)]
+    memory: Option<String>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -171,6 +181,15 @@ fn dispatch(cli: Cli) -> Result<()> {
     );
     #[cfg(feature = "mcp")]
     let mcp_specs = merge_mcp_specs(&cli.mcp_server, cli.no_auto_mcp, auto_mcp_specs());
+    let host = HostConfig {
+        workspace: cli.workspace.clone(),
+        #[cfg(feature = "mcp")]
+        mcp_server: mcp_specs,
+        #[cfg(feature = "shell-tools")]
+        memory: resolve_memory(cli.memory.as_ref())?,
+        #[cfg(not(feature = "shell-tools"))]
+        memory: None,
+    };
     match cli.command {
         Command::Run {
             prompt,
@@ -183,9 +202,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             system.as_deref(),
             &allow_patterns,
             yes,
-            cli.workspace.clone(),
-            #[cfg(feature = "mcp")]
-            mcp_specs.clone(),
+            &host,
         ),
         Command::Resume {
             id,
@@ -198,9 +215,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             prompt.as_deref(),
             &allow_patterns,
             yes,
-            cli.workspace.clone(),
-            #[cfg(feature = "mcp")]
-            mcp_specs.clone(),
+            &host,
         ),
         Command::Sessions => sessions_command(&sessions_dir),
         Command::Status { id } => status_command(&sessions_dir, &id),
@@ -217,9 +232,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             last,
             &allow_patterns,
             yes,
-            cli.workspace.clone(),
-            #[cfg(feature = "mcp")]
-            mcp_specs,
+            &host,
         ),
     }
 }
@@ -227,6 +240,94 @@ fn dispatch(cli: Cli) -> Result<()> {
 // ---------------------------------------------------------------------------
 // Wiring
 // ---------------------------------------------------------------------------
+
+/// Host knobs shared by the command fns: the file-tools jail root, the
+/// MCP server list, the memory backend. Bundled so per-command
+/// signatures stop growing with every feature.
+struct HostConfig {
+    workspace: Option<String>,
+    #[cfg(feature = "mcp")]
+    mcp_server: Vec<String>,
+    #[cfg(feature = "shell-tools")]
+    memory: Option<tole_core::memory::MemoryConfig>,
+}
+
+#[cfg(feature = "shell-tools")]
+impl HostConfig {
+    /// Pre-turn recall injection (memory loop): the returned prompt is
+    /// what the provider sees and what the durable log records. Any
+    /// failure degrades to the bare prompt — memory is an enhancement,
+    /// never a dependency.
+    fn inject_memory(&self, prompt: &str) -> String {
+        let Some(mem) = self.memory.as_ref() else {
+            return prompt.to_string();
+        };
+        match tole_core::memory::recall_block(mem, prompt) {
+            Ok(block) if !block.is_empty() => {
+                eprintln!(
+                    "tole: memory: recalled context injected ({})",
+                    mem.namespace
+                );
+                format!("{prompt}{block}")
+            }
+            Ok(_) => prompt.to_string(),
+            Err(e) => {
+                eprintln!("tole: memory recall failed (continuing without): {e}");
+                prompt.to_string()
+            }
+        }
+    }
+
+    /// Post-session summary (memory loop): best-effort, stderr on
+    /// failure, the session itself is never affected.
+    fn remember(&self, session_id: &str, first_prompt: &str, last_answer: &str) {
+        let Some(mem) = self.memory.as_ref() else {
+            return;
+        };
+        match tole_core::memory::remember_session(mem, session_id, first_prompt, last_answer) {
+            Ok(_) => eprintln!("tole: memory: session summary stored in {}", mem.namespace),
+            Err(e) => eprintln!("tole: memory remember failed (session unaffected): {e}"),
+        }
+    }
+}
+
+/// Memory backend resolution: the `--memory` flag wins over the
+/// `TOLE_MEMORY` env; `uteke` is the only backend. The namespace follows
+/// the ecosystem `repo-<dir>` convention unless `TOLE_MEMORY_NAMESPACE`
+/// overrides it. A missing uteke binary degrades to a warning + no-op
+/// (the same probe contract as the uteke tools).
+#[cfg(feature = "shell-tools")]
+fn resolve_memory(flag: Option<&String>) -> Result<Option<tole_core::memory::MemoryConfig>> {
+    let chosen = flag
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            std::env::var("TOLE_MEMORY")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        });
+    let Some(backend) = chosen else {
+        return Ok(None);
+    };
+    if backend != "uteke" {
+        anyhow::bail!("unsupported memory backend {backend:?} (only 'uteke' is available)");
+    }
+    if !binary_available("uteke") {
+        eprintln!(
+            "tole: memory backend 'uteke' requested but the binary is missing — memory loop disabled"
+        );
+        return Ok(None);
+    }
+    let mut cfg = tole_core::memory::MemoryConfig::for_cwd("uteke", &std::env::current_dir()?);
+    if let Ok(ns) = std::env::var("TOLE_MEMORY_NAMESPACE") {
+        let ns = ns.trim();
+        if !ns.is_empty() {
+            cfg.namespace = tole_core::memory::sanitize_namespace(ns);
+        }
+    }
+    Ok(Some(cfg))
+}
 
 fn build_approver(
     allow_patterns: &[String],
@@ -410,8 +511,7 @@ fn run_command(
     system: Option<&str>,
     allow_patterns: &[String],
     yes: bool,
-    workspace: Option<String>,
-    #[cfg(feature = "mcp")] mcp_server: Vec<String>,
+    host: &HostConfig,
 ) -> Result<()> {
     let cfg = OpenAiConfig::from_env().context(
         "missing provider config: set TOLE_BASE_URL / TOLE_MODEL / TOLE_API_KEY \
@@ -427,7 +527,8 @@ fn run_command(
     println!("session: {session_id}");
 
     #[cfg(feature = "mcp")]
-    let mcp_cfgs: Vec<tole_core::mcp::McpServerConfig> = mcp_server
+    let mcp_cfgs: Vec<tole_core::mcp::McpServerConfig> = host
+        .mcp_server
         .iter()
         .map(|s| tole_core::mcp::McpServerConfig::parse(s))
         .collect::<Result<Vec<_>, String>>()
@@ -435,16 +536,30 @@ fn run_command(
     #[cfg(feature = "mcp")]
     let registry = build_registry(
         build_approver(allow_patterns, yes),
-        workspace.as_ref(),
+        host.workspace.as_ref(),
         &mcp_cfgs,
     )?;
     #[cfg(not(feature = "mcp"))]
-    let registry = build_registry(build_approver(allow_patterns, yes), workspace.as_ref())?;
+    let registry = build_registry(build_approver(allow_patterns, yes), host.workspace.as_ref())?;
     let mut provider = OpenAiProvider::new(cfg).with_tool_specs(registry.specs());
     if let Some(sys) = system_prompt.as_deref() {
         provider = provider.with_system_prompt(sys);
     }
-    let outcome = run_turn(&mut storage, &mut provider, &registry, prompt)?;
+    // Memory loop, pre-turn: recalled context rides inside the first
+    // user message — the durable log stores exactly what was sent. The
+    // summary remembers the PRE-injection prompt: storing the injected
+    // block would echo recalled memory back into the store (amplification).
+    #[cfg(feature = "shell-tools")]
+    let (raw_prompt, prompt) = (prompt.to_string(), host.inject_memory(prompt));
+    #[cfg(not(feature = "shell-tools"))]
+    let prompt = prompt.to_string();
+    let outcome = run_turn(&mut storage, &mut provider, &registry, &prompt)?;
+    // Memory loop, post-session: a settled Final turn leaves a compact
+    // summary behind for the next session's recall.
+    #[cfg(feature = "shell-tools")]
+    if let TurnOutcome::Final { text } = &outcome {
+        host.remember(&session_id, &raw_prompt, text);
+    }
     report_outcome(&session_id, outcome);
     Ok(())
 }
@@ -455,8 +570,7 @@ fn resume_command(
     prompt: Option<&str>,
     allow_patterns: &[String],
     yes: bool,
-    workspace: Option<String>,
-    #[cfg(feature = "mcp")] mcp_server: Vec<String>,
+    host: &HostConfig,
 ) -> Result<()> {
     if !valid_session_id(id) {
         anyhow::bail!("invalid session id {id:?} (allowed: [a-z0-9-], max 64)");
@@ -472,7 +586,8 @@ fn resume_command(
     let mut storage = JsonlStorage::open(&path).context("replaying session log")?;
 
     #[cfg(feature = "mcp")]
-    let mcp_cfgs: Vec<tole_core::mcp::McpServerConfig> = mcp_server
+    let mcp_cfgs: Vec<tole_core::mcp::McpServerConfig> = host
+        .mcp_server
         .iter()
         .map(|s| tole_core::mcp::McpServerConfig::parse(s))
         .collect::<Result<Vec<_>, String>>()
@@ -480,11 +595,11 @@ fn resume_command(
     #[cfg(feature = "mcp")]
     let registry = build_registry(
         build_approver(allow_patterns, yes),
-        workspace.as_ref(),
+        host.workspace.as_ref(),
         &mcp_cfgs,
     )?;
     #[cfg(not(feature = "mcp"))]
-    let registry = build_registry(build_approver(allow_patterns, yes), workspace.as_ref())?;
+    let registry = build_registry(build_approver(allow_patterns, yes), host.workspace.as_ref())?;
     let mut provider = OpenAiProvider::new(cfg).with_tool_specs(registry.specs());
     // B2: the system prompt is pinned in the session header — resume
     // re-applies exactly what the session was created with (never the
@@ -665,10 +780,6 @@ fn latest_session_id(dir: &Path) -> Option<String> {
 /// `resume_turn` on the next line, keeping the conversation alive without
 /// losing durable context. Ctrl-C / EOF exit cleanly — every commit is
 /// already durable, `tole chat --resume <id>` picks the thread back up.
-// Eight knobs mirror the other command fns; the mcp feature adds one.
-// Bundling into a config struct is churn without a second caller — the
-// lint gate is the honest marker instead.
-#[allow(clippy::too_many_arguments)]
 fn chat_command(
     sessions_dir: &Path,
     system: Option<&str>,
@@ -676,8 +787,7 @@ fn chat_command(
     last: bool,
     allow_patterns: &[String],
     yes: bool,
-    workspace: Option<String>,
-    #[cfg(feature = "mcp")] mcp_server: Vec<String>,
+    host: &HostConfig,
 ) -> Result<()> {
     use std::io::{BufRead, Write};
 
@@ -722,7 +832,8 @@ fn chat_command(
     );
 
     #[cfg(feature = "mcp")]
-    let mcp_cfgs: Vec<tole_core::mcp::McpServerConfig> = mcp_server
+    let mcp_cfgs: Vec<tole_core::mcp::McpServerConfig> = host
+        .mcp_server
         .iter()
         .map(|s| tole_core::mcp::McpServerConfig::parse(s))
         .collect::<Result<Vec<_>, String>>()
@@ -730,17 +841,25 @@ fn chat_command(
     #[cfg(feature = "mcp")]
     let registry = build_registry(
         build_approver(allow_patterns, yes),
-        workspace.as_ref(),
+        host.workspace.as_ref(),
         &mcp_cfgs,
     )?;
     #[cfg(not(feature = "mcp"))]
-    let registry = build_registry(build_approver(allow_patterns, yes), workspace.as_ref())?;
+    let registry = build_registry(build_approver(allow_patterns, yes), host.workspace.as_ref())?;
     let mut provider = OpenAiProvider::new(cfg).with_tool_specs(registry.specs());
     // B2: fresh sessions pin the resolved prompt; resumed sessions re-apply
     // the header-pinned one (see create_with above / JsonlStorage::open).
     if let Some(sys) = storage.system_prompt() {
         provider = provider.with_system_prompt(sys);
     }
+
+    // Memory loop state: recall rides into the first message of a FRESH
+    // session only (a resumed session already carries its context); the
+    // session summary is stored when the REPL exits cleanly.
+    #[cfg(feature = "shell-tools")]
+    let (mut memory_injected, mut first_prompt, mut last_answer) = (!fresh, None, None);
+    #[cfg(not(feature = "shell-tools"))]
+    let memory_injected = true;
 
     let stdin = std::io::stdin();
     loop {
@@ -778,10 +897,27 @@ fn chat_command(
         // turn; anything mid-flight is resolved via resume FIRST (looping
         // until it lands on a boundary), and only then does the freshly
         // typed message run as its own turn — user input is never dropped.
+        //
+        // Memory loop, pre-turn: the first fresh-session message carries
+        // the recalled-context block; the durable log records exactly
+        // what the provider sees.
+        #[cfg(feature = "shell-tools")]
+        if first_prompt.is_none() {
+            first_prompt = Some(text.to_string());
+        }
+        #[cfg(feature = "shell-tools")]
+        let turn_prompt: String = if fresh && !memory_injected {
+            memory_injected = true;
+            host.inject_memory(text)
+        } else {
+            text.to_string()
+        };
+        #[cfg(not(feature = "shell-tools"))]
+        let turn_prompt = text.to_string();
         let outcome = loop {
             match storage.state().pc {
                 tole_core::state::Pc::Idle | tole_core::state::Pc::Final => {
-                    break run_turn(&mut storage, &mut provider, &registry, text);
+                    break run_turn(&mut storage, &mut provider, &registry, &turn_prompt);
                 }
                 mid => {
                     eprintln!("tole> (resolving interrupted turn, pc={mid:?}…)");
@@ -815,7 +951,13 @@ fn chat_command(
         };
 
         match outcome {
-            Ok(TurnOutcome::Final { text }) => println!("tole> {text}"),
+            Ok(TurnOutcome::Final { text }) => {
+                #[cfg(feature = "shell-tools")]
+                {
+                    last_answer = Some(text.clone());
+                }
+                println!("tole> {text}");
+            }
             Ok(TurnOutcome::ApprovalRequired { name }) => eprintln!(
                 "tole> (approval denied for '{name}' — turn aborted; your next message resumes)"
             ),
@@ -834,6 +976,12 @@ fn chat_command(
             Ok(TurnOutcome::Storage(e)) => anyhow::bail!("storage error: {e}"),
             Err(e) => anyhow::bail!("turn failed: {e}"),
         }
+    }
+    // Memory loop, post-session: a clean REPL exit with at least one
+    // completed turn leaves a compact summary in the namespace.
+    #[cfg(feature = "shell-tools")]
+    if let (Some(fp), Some(la)) = (first_prompt.as_deref(), last_answer.as_deref()) {
+        host.remember(&session_id, fp, la);
     }
     println!(
         "session {session_id} closed — entries: {}",

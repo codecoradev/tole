@@ -24,6 +24,7 @@
 //! - `provider` — LLM provider abstraction
 //! - `mock`     — scripted provider for deterministic Tier A tests
 //! - `turn`     — the single-threaded turn loop
+//! - `memory`   — harness-level uteke memory loop (recall/remember)
 
 pub mod approval;
 #[cfg(feature = "shell-tools")]
@@ -39,6 +40,8 @@ pub mod jobs;
 pub mod machine;
 #[cfg(feature = "mcp")]
 pub mod mcp;
+#[cfg(feature = "shell-tools")]
+pub mod memory;
 pub mod mock;
 pub mod openai;
 pub mod provider;
