@@ -153,3 +153,49 @@ fn acp_load_returns_existing_session() {
     let loaded = acp2.wait_response(2, Duration::from_secs(20));
     assert_eq!(loaded["result"]["sessionId"], session_id);
 }
+
+/// The map must survive across prompts (CodeCora scan regression: a
+/// fresh Arc per prompt dropped every session after the first turn).
+#[test]
+fn acp_session_survives_multiple_session_news() {
+    let mut acp = AcpProcess::spawn();
+    let cwd = temp_cwd("multi");
+
+    acp.send(&json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {"protocolVersion": 1, "clientCapabilities": {}}
+    }));
+    let _ = acp.wait_response(1, Duration::from_secs(20));
+
+    for n in 2..=4 {
+        acp.send(&json!({
+            "jsonrpc": "2.0", "id": n, "method": "session/new",
+            "params": {"cwd": cwd.to_string_lossy()}
+        }));
+        let r = acp.wait_response(n, Duration::from_secs(20));
+        assert!(
+            r["result"]["sessionId"].is_string(),
+            "session/new {n} failed"
+        );
+    }
+}
+
+/// Path traversal via sessionId is refused at the protocol surface.
+#[test]
+fn acp_rejects_traversal_session_ids() {
+    let mut acp = AcpProcess::spawn();
+    let cwd = temp_cwd("traversal");
+
+    acp.send(&json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {"protocolVersion": 1, "clientCapabilities": {}}
+    }));
+    let _ = acp.wait_response(1, Duration::from_secs(20));
+
+    acp.send(&json!({
+        "jsonrpc": "2.0", "id": 2, "method": "session/load",
+        "params": {"cwd": cwd.to_string_lossy(), "sessionId": "../../etc/passwd"}
+    }));
+    let r = acp.wait_response(2, Duration::from_secs(20));
+    assert!(r.get("error").is_some(), "traversal id must be an error");
+}

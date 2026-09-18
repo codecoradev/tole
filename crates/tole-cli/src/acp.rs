@@ -241,7 +241,12 @@ pub fn run_acp(
         }
     });
 
-    let mut sessions = Sessions::new();
+    // The session map lives for the WHOLE server lifetime and is shared
+    // with prompt threads (Arc clone per prompt). Holding the map lock
+    // for the duration of a turn also serializes access to one session's
+    // storage — session/load of a busy id simply waits its turn instead
+    // of opening a divergent second handle.
+    let sessions: SharedSessions = StdArc::new(Mutex::new(Sessions::new()));
     let stdin = std::io::stdin();
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
@@ -290,11 +295,14 @@ pub fn run_acp(
                     .and_then(Value::as_str)
                     .unwrap_or(".")
                     .to_string();
-                let session_id = params
-                    .get("sessionId")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-                    .unwrap_or_else(new_session_id);
+                let session_id = match params.get("sessionId").and_then(Value::as_str) {
+                    Some(id) => validate_session_id(id),
+                    None => Some(new_session_id()),
+                };
+                let Some(session_id) = session_id else {
+                    reply_error(&conn, id, "session/load: invalid sessionId");
+                    continue;
+                };
                 match open_session(
                     &session_id,
                     &cwd,
@@ -305,7 +313,9 @@ pub fn run_acp(
                     conn.clone(),
                 ) {
                     Ok(state) => {
-                        sessions.map.insert(session_id.clone(), state);
+                        lock_sessions(&sessions)
+                            .map
+                            .insert(session_id.clone(), state);
                         reply(&conn, id, json!({ "sessionId": session_id }));
                     }
                     Err(e) => reply_error(&conn, id, &e.to_string()),
@@ -316,8 +326,13 @@ pub fn run_acp(
                     .get("sessionId")
                     .and_then(Value::as_str)
                     .map(str::to_string)
+                    .map(|id| validate_session_id(&id))
                 else {
                     reply_error(&conn, id, "session/prompt: missing sessionId");
+                    continue;
+                };
+                let Some(session_id) = session_id else {
+                    reply_error(&conn, id, "session/prompt: invalid sessionId");
                     continue;
                 };
                 // ACP sends `prompt` as an array of content blocks; a
@@ -338,12 +353,12 @@ pub fn run_acp(
                 // error) so this reader loop stays live for permission
                 // requests while the turn runs.
                 let conn = conn.clone();
-                let sessions_ptr = share_sessions(&mut sessions);
+                let sessions = sessions.clone();
                 let prompt_clone = prompt_text;
                 let session_id_clone = session_id.clone();
                 std::thread::spawn(move || {
                     let result =
-                        run_prompt(sessions_ptr, &session_id_clone, &prompt_clone, conn.clone());
+                        run_prompt(sessions, &session_id_clone, &prompt_clone, conn.clone());
                     match result {
                         Ok(stop) => reply(&conn, id, json!({ "stopReason": stop })),
                         Err(e) => reply_error(&conn, id, &e.to_string()),
@@ -360,15 +375,15 @@ pub fn run_acp(
     Ok(())
 }
 
-// The sessions map must be shareable with the per-prompt threads; wrap it
-// here so the method bodies stay readable.
 use std::sync::Arc as StdArc;
 type SharedSessions = StdArc<Mutex<Sessions>>;
 
-fn share_sessions(sessions: &mut Sessions) -> SharedSessions {
-    // A fresh Arc per ACP server instance is fine: the reader loop owns
-    // the map for the process lifetime and hands clones to turn threads.
-    StdArc::new(Mutex::new(std::mem::replace(sessions, Sessions::new())))
+/// Poisoning-tolerant lock: one panicking turn must not brick the whole
+/// ACP server (CodeCora scan finding — mutex poisoning).
+fn lock_sessions(sessions: &SharedSessions) -> std::sync::MutexGuard<'_, Sessions> {
+    sessions
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn reply(conn: &Conn, id: Option<Value>, result: Value) {
@@ -382,6 +397,26 @@ fn reply_error(conn: &Conn, id: Option<Value>, message: &str) {
         &json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32603, "message": message}})
             .to_string(),
     );
+}
+
+/// ACP session ids are tole session ids: reject path separators,
+/// parent refs, and anything outside the tole charset before the id ever
+/// touches a path (CodeCora scan finding: `../` or absolute ids would
+/// escape the sessions dir via Path::join).
+fn validate_session_id(id: &str) -> Option<String> {
+    let ok = !id.is_empty()
+        && id.len() <= 64
+        && !id.contains('/')
+        && !id.contains('\\')
+        && !id.contains("..")
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'));
+    if ok {
+        Some(id.to_string())
+    } else {
+        None
+    }
 }
 
 fn new_session_id() -> String {
@@ -529,7 +564,8 @@ fn run_prompt(
     prompt: &str,
     conn: Conn,
 ) -> Result<String> {
-    let mut sessions = sessions.lock().expect("sessions lock");
+    // Poisoning-tolerant: see lock_sessions.
+    let mut sessions = lock_sessions(&sessions);
     let Some(state) = sessions.map.get_mut(session_id) else {
         anyhow::bail!("unknown session: {session_id}");
     };
