@@ -3,7 +3,7 @@
 //! config-parsing and trust-model contracts that don't need a server.
 
 use tole_core::mcp::McpServerConfig;
-use tole_core::tool::Risk;
+use tole_core::tool::{Risk, Tool};
 
 #[test]
 fn parses_name_command_args() {
