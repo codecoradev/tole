@@ -443,6 +443,47 @@ pub fn resolve_workspace_root(explicit: Option<&String>) -> Result<PathBuf> {
     }
 }
 
+/// Best-effort `owner/name` from a git remote URL, for gh tool
+/// targeting (CodeCora dogfood finding 2026-09-18: a hardcoded repo
+/// made `gh` target the wrong project outside this checkout).
+fn github_repo_from_remote_url(url: &str) -> Option<String> {
+    let url = url.trim().trim_end_matches('/');
+    let url = url.strip_suffix(".git").unwrap_or(url);
+    let idx = url.to_ascii_lowercase().find("github.com")?;
+    let rest = &url[idx + "github.com".len()..];
+    let rest = rest.trim_start_matches(['/', ':']);
+    let mut parts = rest.split('/');
+    let owner = parts.next()?;
+    let name = parts.next()?;
+    let valid = |s: &str| {
+        !s.is_empty()
+            && !s.starts_with('-')
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    };
+    if valid(owner) && valid(name) {
+        Some(format!("{owner}/{name}"))
+    } else {
+        None
+    }
+}
+
+/// Ask the checkout itself which GitHub repo it belongs to ( Falls back
+/// to None → callers keep the tole default).
+#[cfg(feature = "shell-tools")]
+fn detect_github_repo(cwd: &Path) -> Option<String> {
+    use std::process::Command;
+    let mut cmd = Command::new("git");
+    cmd.args(["config", "--get", "remote.origin.url"])
+        .current_dir(cwd);
+    let out = tole_core::subprocess::run_with_timeout(&mut cmd, std::time::Duration::from_secs(5))
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    github_repo_from_remote_url(&String::from_utf8_lossy(&out.stdout))
+}
+
 fn build_registry(
     approver: InteractiveApprover<StdioPrompt>,
     workspace: Option<&String>,
@@ -483,8 +524,14 @@ fn build_registry(
     reg.register(Box::new(EditFileTool::new(file_root.clone())))
         .map_err(|e| anyhow::anyhow!("registering edit_file: {e}"))?;
     #[cfg(feature = "shell-tools")]
-    reg.register(Box::new(GhTool::new("codecoradev/tole")))
-        .map_err(|e| anyhow::anyhow!("registering gh: {e}"))?;
+    {
+        // Target the checkout's own GitHub repo when detectable — a
+        // hardcoded one made `gh` act on the wrong project (CodeCora
+        // dogfood finding 2026-09-18).
+        let gh_repo = detect_github_repo(&cwd).unwrap_or_else(|| "codecoradev/tole".into());
+        reg.register(Box::new(GhTool::new(gh_repo)))
+            .map_err(|e| anyhow::anyhow!("registering gh: {e}"))?;
+    }
     // Light git: status/diff/add/commit (push stays human).
     #[cfg(feature = "shell-tools")]
     reg.register(Box::new(GitTool::new().in_dir(cwd.clone())))
@@ -575,7 +622,8 @@ fn build_server_registry(
         .map_err(|e| anyhow::anyhow!("registering edit_file: {e}"))?;
     #[cfg(feature = "shell-tools")]
     {
-        reg.register(Box::new(GhTool::new("codecoradev/tole")))
+        let gh_repo = detect_github_repo(&cwd).unwrap_or_else(|| "codecoradev/tole".into());
+        reg.register(Box::new(GhTool::new(gh_repo)))
             .map_err(|e| anyhow::anyhow!("registering gh: {e}"))?;
         reg.register(Box::new(GitTool::new().in_dir(cwd.clone())))
             .map_err(|e| anyhow::anyhow!("registering git: {e}"))?;
@@ -1183,6 +1231,64 @@ fn new_session_id() -> String {
         .map(|d| d.as_millis())
         .unwrap_or(0);
     format!("s-{ms:x}-{pid:x}", pid = std::process::id())
+}
+
+#[cfg(all(test, feature = "shell-tools"))]
+mod gh_repo_tests {
+    use super::*;
+
+    #[test]
+    fn parses_https_ssh_and_git_suffix() {
+        assert_eq!(
+            github_repo_from_remote_url("https://github.com/foo/bar.git").as_deref(),
+            Some("foo/bar")
+        );
+        assert_eq!(
+            github_repo_from_remote_url("https://github.com/foo/bar").as_deref(),
+            Some("foo/bar")
+        );
+        assert_eq!(
+            github_repo_from_remote_url("git@github.com:foo/bar.git").as_deref(),
+            Some("foo/bar")
+        );
+        assert_eq!(
+            github_repo_from_remote_url("https://user:token@github.com/Foo/Bar.git").as_deref(),
+            Some("Foo/Bar")
+        );
+    }
+
+    #[test]
+    fn rejects_non_github_and_garbage() {
+        assert!(github_repo_from_remote_url("https://gitlab.com/foo/bar.git").is_none());
+        assert!(github_repo_from_remote_url("https://github.com/only-owner").is_none());
+        assert!(github_repo_from_remote_url("not a url").is_none());
+        assert!(github_repo_from_remote_url("https://github.com/-bad/name").is_none());
+    }
+
+    #[test]
+    fn detects_repo_from_checkout() {
+        // A real checkout: init + remote origin, then detect.
+        let dir = std::env::temp_dir().join(format!("tole-gh-detect-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .unwrap()
+        };
+        run(&["init", "-q"]);
+        run(&[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/detected/owner-name.git",
+        ]);
+        let detected = detect_github_repo(&dir);
+        assert_eq!(detected.as_deref(), Some("detected/owner-name"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]
