@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use tole_cli::approver::{InteractiveApprover, StdioPrompt};
 use tole_cli::tools::WriteFileTool;
+use tole_core::approval::AllowlistApprover;
 #[cfg(feature = "shell-tools")]
 use tole_core::cora_search::CoraSearchTool;
 use tole_core::file_tools::{DeleteFileTool, EditFileTool};
@@ -137,6 +138,20 @@ enum Command {
         /// Session id to inspect.
         id: String,
     },
+    /// Serve tole's tools over MCP stdio (issue #94): ReadOnly tools are
+    /// always callable; Write tools require --allow patterns (server mode
+    /// has no stdin human — stdin IS the protocol); Destructive tools are
+    /// structurally absent.
+    #[cfg(all(feature = "mcp", feature = "shell-tools"))]
+    Mcp {
+        /// Same semantics as `run --allow` (Write pre-authorization).
+        #[arg(long = "allow")]
+        allow_patterns: Vec<String>,
+
+        /// Root directory for the file tools (same as run).
+        #[arg(long)]
+        workspace: Option<String>,
+    },
     /// Interactive multi-turn chat on one durable session (B1).
     Chat {
         /// System prompt for a fresh session (ignored when resuming —
@@ -214,6 +229,11 @@ fn dispatch(cli: Cli) -> Result<()> {
             yes,
             &host,
         ),
+        #[cfg(all(feature = "mcp", feature = "shell-tools"))]
+        Command::Mcp {
+            allow_patterns,
+            workspace,
+        } => mcp_server_command(workspace.as_ref(), &allow_patterns),
         Command::Sessions => sessions_command(&sessions_dir),
         Command::Status { id } => status_command(&sessions_dir, &id),
         Command::Chat {
@@ -510,6 +530,72 @@ fn build_registry(
         }
     }
     Ok(reg)
+}
+
+/// Server-mode registry: the same hardened tools as `build_registry`,
+/// minus two things a server cannot have — the interactive approver
+/// (stdin is the MCP protocol) and Destructive tools (structurally
+/// refused without one; skipped here with a note). Write tools need
+/// explicit `--allow` pre-authorization.
+#[cfg(all(feature = "mcp", feature = "shell-tools"))]
+fn build_server_registry(
+    workspace: Option<&String>,
+    allow_patterns: &[String],
+) -> Result<ToolRegistry> {
+    let mut reg =
+        ToolRegistry::with_approver(AllowlistApprover::allow_only(allow_patterns.to_vec()));
+    let cwd = std::env::current_dir().context("resolving cwd")?;
+    let file_root = resolve_workspace_root(workspace)?;
+    let count = |reg: &ToolRegistry| reg.specs().len();
+
+    #[cfg(feature = "shell-tools")]
+    {
+        if binary_available("cora") {
+            reg.register(Box::new(CoraSearchTool::new()))
+                .map_err(|e| anyhow::anyhow!("registering cora_search: {e}"))?;
+        }
+        if binary_available("uteke") {
+            reg.register(Box::new(UtekeRecallTool::new()))
+                .map_err(|e| anyhow::anyhow!("registering uteke_recall: {e}"))?;
+            reg.register(Box::new(UtekeDocumentTool::new(None)))
+                .map_err(|e| anyhow::anyhow!("registering uteke_document: {e}"))?;
+        }
+        reg.register(Box::new(RunCommandTool::new(cwd.clone())))
+            .map_err(|e| anyhow::anyhow!("registering run_command: {e}"))?;
+        reg.register(Box::new(JobStartTool::new(file_root.clone())))
+            .map_err(|e| anyhow::anyhow!("registering job_start: {e}"))?;
+        reg.register(Box::new(JobPollTool::new(file_root.clone())))
+            .map_err(|e| anyhow::anyhow!("registering job_poll: {e}"))?;
+    }
+    reg.register(Box::new(ReadFileTool::new(file_root.clone())))
+        .map_err(|e| anyhow::anyhow!("registering read_file: {e}"))?;
+    reg.register(Box::new(WriteFileTool::new(file_root.clone())))
+        .map_err(|e| anyhow::anyhow!("registering write_file: {e}"))?;
+    reg.register(Box::new(EditFileTool::new(file_root.clone())))
+        .map_err(|e| anyhow::anyhow!("registering edit_file: {e}"))?;
+    #[cfg(feature = "shell-tools")]
+    {
+        reg.register(Box::new(GhTool::new("codecoradev/tole")))
+            .map_err(|e| anyhow::anyhow!("registering gh: {e}"))?;
+        reg.register(Box::new(GitTool::new().in_dir(cwd.clone())))
+            .map_err(|e| anyhow::anyhow!("registering git: {e}"))?;
+    }
+    // delete_file (Destructive) is deliberately NOT registered: behind a
+    // non-interactive approver the registry refuses it structurally.
+    eprintln!("tole mcp: {} tool(s) registered", count(&reg));
+    Ok(reg)
+}
+
+/// D1 (issue #94): serve the registry over MCP stdio. Blocks until the
+/// client disconnects.
+#[cfg(all(feature = "mcp", feature = "shell-tools"))]
+fn mcp_server_command(workspace: Option<&String>, allow_patterns: &[String]) -> Result<()> {
+    let registry = build_server_registry(workspace, allow_patterns)?;
+    tokio::runtime::Runtime::new()
+        .context("creating tokio runtime")?
+        .block_on(tole_core::mcp_server::serve_stdio(registry))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

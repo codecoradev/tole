@@ -30,6 +30,10 @@ tole is the agent harness of the CodeCora ecosystem — the hands:
   the optional [memory loop](#memory-loop) closes the circle.
 - Anything else that speaks **MCP over stdio** joins the same registry via
   repeatable `--mcp-server name=command [args...]` flags.
+- **tole as an MCP server**: `tole mcp` serves the registry's hardened tools
+  (jailed file ops, git, jobs, memory) to any MCP client. ReadOnly tools are
+  always callable; Write tools require `--allow` patterns; Destructive tools
+  are structurally absent.
 
 Every ecosystem integration is probe-first: a missing binary degrades to a
 one-line warning, never a phantom tool.

@@ -115,16 +115,16 @@ still deferred.
 tole-core gains three hosts beyond the CLI, in build order (each reuses the
 previous layer):
 
-### D1 — \`tole mcp\`: MCP server over stdio (issue #94)
+### D1 — `tole mcp`: MCP server over stdio (issue #94)
 Expose the registry's hardened tools via rmcp's server side. ReadOnly tools
-always callable; Write needs \`--allow\`; Destructive structurally absent.
+always callable; Write needs `--allow`; Destructive structurally absent.
 Est: S–M.
 
-### D2 — \`tole acp\`: Agent Client Protocol host (issue #95)
+### D2 — `tole acp`: Agent Client Protocol host (issue #95)
 Editor integration (Zed et al.): ACP sessions ↔ JSONL sessions, ACP
 permission requests ↔ the approval gate, streaming turn events. Est: M.
 
-### D3 — \`tole-serve\`: server mode (issue #96)
+### D3 — `tole-serve`: server mode (issue #96)
 Long-running daemon (uteke-serve pattern): MCP Streamable HTTP + thin REST,
 token auth, server-side durable sessions, per-session workspace jails.
 Est: M–L.

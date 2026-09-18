@@ -18,7 +18,7 @@ shell-tools = []
 mcp = ["dep:rmcp", "dep:tokio", "shell-tools"]
 
 [dependencies]
-rmcp = { version = "3.3", features = ["client", "transport-child-process"], optional = true }
+rmcp = { version = "3.3", features = ["client", "server", "transport-io", "transport-child-process"], optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "process", "time"], optional = true }
 libc = "0.2"
 serde = { workspace = true }
