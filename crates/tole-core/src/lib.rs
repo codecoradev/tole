@@ -40,6 +40,8 @@ pub mod jobs;
 pub mod machine;
 #[cfg(feature = "mcp")]
 pub mod mcp;
+#[cfg(feature = "mcp")]
+pub mod mcp_server;
 #[cfg(feature = "shell-tools")]
 pub mod memory;
 pub mod mock;

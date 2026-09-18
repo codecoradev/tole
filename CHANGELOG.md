@@ -30,6 +30,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--mcp-server` work on a plain `cargo build -p tole-cli`. Embedder
   profiles are unaffected — `tole-core` defaults do not change.
 
+### Added
+- `tole mcp`: tole as an **MCP server** over stdio (issue #94) — the
+  registry's hardened tools (jailed file ops, argv-validated git, detached
+  jobs, memory loop, cora/uteke integrations) become callable by any MCP
+  client. ReadOnly tools always callable; Write tools pre-authorized via
+  `--allow` patterns (Destructive structurally absent — registration
+  behind a non-interactive approver is refused). Verified live: 11 tools
+  listed, read_file round-trip, write without `--allow` denied with an
+  actionable message.
+
 ### Fixed
 - **write_file had no wire schema**: it was the only registered tool
   without a `spec()` override, so providers received a property-less
