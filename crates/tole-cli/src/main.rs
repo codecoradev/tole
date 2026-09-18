@@ -67,6 +67,13 @@ struct Cli {
     #[arg(long, global = true)]
     mcp_server: Vec<String>,
 
+    /// Skip the auto-detected MCP presets (currently: the local `cora mcp`
+    /// server attached when the `cora` binary is on PATH). Explicit
+    /// --mcp-server flags are unaffected. Requires the `mcp` feature.
+    #[cfg(feature = "mcp")]
+    #[arg(long, global = true)]
+    no_auto_mcp: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -162,6 +169,8 @@ fn dispatch(cli: Cli) -> Result<()> {
             .clone()
             .unwrap_or_else(|| DEFAULT_SESSIONS_DIR.to_string()),
     );
+    #[cfg(feature = "mcp")]
+    let mcp_specs = merge_mcp_specs(&cli.mcp_server, cli.no_auto_mcp, auto_mcp_specs());
     match cli.command {
         Command::Run {
             prompt,
@@ -176,7 +185,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             yes,
             cli.workspace.clone(),
             #[cfg(feature = "mcp")]
-            cli.mcp_server.clone(),
+            mcp_specs.clone(),
         ),
         Command::Resume {
             id,
@@ -191,7 +200,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             yes,
             cli.workspace.clone(),
             #[cfg(feature = "mcp")]
-            cli.mcp_server.clone(),
+            mcp_specs.clone(),
         ),
         Command::Sessions => sessions_command(&sessions_dir),
         Command::Status { id } => status_command(&sessions_dir, &id),
@@ -210,7 +219,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             yes,
             cli.workspace.clone(),
             #[cfg(feature = "mcp")]
-            cli.mcp_server.clone(),
+            mcp_specs,
         ),
     }
 }
@@ -226,6 +235,41 @@ fn build_approver(
     InteractiveApprover::stdio()
         .with_allow_patterns(allow_patterns.to_vec())
         .with_auto_write(yes)
+}
+
+/// Auto-detected MCP presets: server specs attached with zero
+/// configuration. Currently just the local `cora mcp` server when the
+/// `cora` binary is on PATH — the full code-intel surface (callers,
+/// impact, dead-code, review) without a manual flag.
+#[cfg(feature = "mcp")]
+fn auto_mcp_specs() -> Vec<String> {
+    if binary_available("cora") {
+        vec!["cora=cora mcp".to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Merge explicit `--mcp-server` specs over the auto-detected presets.
+/// An explicit spec with the same server name wins — the user said what
+/// they meant. `auto` is injected so the merge is unit-testable without
+/// depending on which binaries this machine happens to have.
+#[cfg(feature = "mcp")]
+fn merge_mcp_specs(explicit: &[String], no_auto_mcp: bool, auto: Vec<String>) -> Vec<String> {
+    let mut specs = explicit.to_vec();
+    if !no_auto_mcp {
+        let explicit_names: Vec<&str> = explicit
+            .iter()
+            .map(|s| s.split('=').next().unwrap_or_default())
+            .collect();
+        for spec in auto {
+            let name = spec.split('=').next().unwrap_or_default();
+            if !explicit_names.contains(&name) {
+                specs.push(spec);
+            }
+        }
+    }
+    specs
 }
 
 /// B4 startup probing: a binary exists on PATH (or is an executable
@@ -275,10 +319,6 @@ fn build_registry(
     let mut reg = ToolRegistry::with_approver(approver);
     let cwd = std::env::current_dir().context("resolving cwd")?;
     let file_root = resolve_workspace_root(workspace)?;
-    // ReadOnly tools: no approval needed.
-    #[cfg(feature = "shell-tools")]
-    reg.register(Box::new(CoraSearchTool::new()))
-        .map_err(|e| anyhow::anyhow!("registering cora_search: {e}"))?;
     // Uteke first-class (B4): recall (read) + document (write), behind
     // startup probing — a missing uteke binary degrades to a warning,
     // not phantom tools.
@@ -324,10 +364,37 @@ fn build_registry(
     // MCP servers (#74): registered last so a slow server never blocks
     // native tool availability; per-call approval applies as usual.
     #[cfg(feature = "mcp")]
+    let mut cora_mcp_tools = 0usize;
+    #[cfg(feature = "mcp")]
     for cfg in mcp_servers {
         let names = tole_core::mcp::register_server_tools(&mut reg, cfg);
+        #[cfg(feature = "mcp")]
+        if cfg.name == "cora" {
+            cora_mcp_tools = names.len();
+        }
         if names.is_empty() {
             eprintln!("tole: mcp[{}]: no tools registered", cfg.name);
+        }
+    }
+    // Native cora_search (E4): single-tool fallback, registered only when
+    // the cora MCP surface did NOT materialize — decision is based on the
+    // REGISTRATION OUTCOME, not config presence: a cora binary whose MCP
+    // server fails (handshake, old version) must degrade to the native
+    // tool instead of silently losing all code-intel (CodeCora finding).
+    // The full MCP toolset supersedes the fallback when it registered.
+    #[cfg(feature = "shell-tools")]
+    {
+        #[cfg(feature = "mcp")]
+        let cora_mcp_ok = cora_mcp_tools > 0;
+        #[cfg(not(feature = "mcp"))]
+        let cora_mcp_ok = false;
+        if !cora_mcp_ok {
+            if binary_available("cora") {
+                reg.register(Box::new(CoraSearchTool::new()))
+                    .map_err(|e| anyhow::anyhow!("registering cora_search: {e}"))?;
+            } else {
+                eprintln!("tole: cora binary not found — cora_search disabled");
+            }
         }
     }
     Ok(reg)
@@ -598,6 +665,10 @@ fn latest_session_id(dir: &Path) -> Option<String> {
 /// `resume_turn` on the next line, keeping the conversation alive without
 /// losing durable context. Ctrl-C / EOF exit cleanly — every commit is
 /// already durable, `tole chat --resume <id>` picks the thread back up.
+// Eight knobs mirror the other command fns; the mcp feature adds one.
+// Bundling into a config struct is churn without a second caller — the
+// lint gate is the honest marker instead.
+#[allow(clippy::too_many_arguments)]
 fn chat_command(
     sessions_dir: &Path,
     system: Option<&str>,
@@ -838,7 +909,6 @@ fn new_session_id() -> String {
 #[cfg(test)]
 mod workspace_tests {
     use super::resolve_workspace_root;
-
     #[test]
     fn workspace_valid_dir_canonicalized() {
         let dir = std::env::temp_dir().join(format!("tole-ws-{}", std::process::id()));
@@ -871,5 +941,58 @@ mod workspace_tests {
     fn workspace_none_falls_back_to_cwd() {
         let resolved = resolve_workspace_root(None).unwrap();
         assert_eq!(resolved, std::env::current_dir().unwrap());
+    }
+}
+
+#[cfg(all(test, feature = "mcp"))]
+mod mcp_preset_tests {
+    use super::merge_mcp_specs;
+
+    #[test]
+    fn auto_spec_appended_when_no_explicit() {
+        let merged = merge_mcp_specs(&[], false, vec!["cora=cora mcp".into()]);
+        assert_eq!(merged, vec!["cora=cora mcp".to_string()]);
+    }
+
+    #[test]
+    fn explicit_same_name_wins_over_auto() {
+        let merged = merge_mcp_specs(
+            &["cora=/opt/other/cora mcp --strict".to_string()],
+            false,
+            vec!["cora=cora mcp".into()],
+        );
+        assert_eq!(
+            merged,
+            vec!["cora=/opt/other/cora mcp --strict".to_string()]
+        );
+    }
+
+    #[test]
+    fn unrelated_explicit_and_auto_coexist() {
+        let merged = merge_mcp_specs(
+            &["fs=npx -y fs-server".to_string()],
+            false,
+            vec!["cora=cora mcp".into()],
+        );
+        assert_eq!(merged, vec!["fs=npx -y fs-server", "cora=cora mcp"]);
+    }
+
+    #[test]
+    fn no_auto_flag_drops_presets_keeps_explicit() {
+        let merged = merge_mcp_specs(
+            &["fs=npx -y fs-server".to_string()],
+            true,
+            vec!["cora=cora mcp".into()],
+        );
+        assert_eq!(merged, vec!["fs=npx -y fs-server".to_string()]);
+    }
+
+    #[test]
+    fn malformed_explicit_spec_treated_as_its_own_name() {
+        // No '=' at all: the whole string counts as the name, so the
+        // preset still attaches (parse() will reject the malformed spec
+        // downstream with its normal error — this merge never panics).
+        let merged = merge_mcp_specs(&["not-a-spec".into()], false, vec!["cora=cora mcp".into()]);
+        assert_eq!(merged, vec!["not-a-spec", "cora=cora mcp"]);
     }
 }

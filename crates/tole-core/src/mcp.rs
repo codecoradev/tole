@@ -22,7 +22,6 @@
 use crate::subprocess::SUBPROCESS_TIMEOUT;
 use crate::tool::{Risk, Tool};
 use serde_json::{json, Value};
-use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -175,7 +174,7 @@ fn runtime() -> mpsc::Sender<McpRequest> {
 /// Live connection state lives INSIDE the reactor thread (rmcp sessions
 /// are !Send-safe to keep there), keyed by server name.
 struct McpConnection {
-    service: rmcp::service::RunningService<rmcp::service::RoleClient, rmcp::model::ClientInfo>,
+    service: rmcp::service::RunningService<rmcp::service::RoleClient, rmcp::model::ClientConfig>,
 }
 
 impl McpConnection {
@@ -265,7 +264,7 @@ async fn start_server(
         .map_err(|e| format!("mcp {:?}: failed to start server: {e}", cfg.name))?;
     let service = tokio::time::timeout(
         SUBPROCESS_TIMEOUT,
-        rmcp::service::serve_client(rmcp::model::ClientInfo::default(), transport),
+        rmcp::service::serve_client(rmcp::model::ClientConfig::default(), transport),
     )
     .await
     .map_err(|_| format!("mcp {:?}: handshake timed out", cfg.name))?
@@ -437,7 +436,7 @@ pub fn register_server_tools(
                     .register(Box::new(McpTool::new(
                         cfg.name.clone(),
                         mcp_name.clone(),
-                        server_tool,
+                        server_tool.clone(),
                         description,
                     )))
                     .is_ok()

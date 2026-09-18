@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- cora auto-preset: when the `cora` binary is on PATH, tole attaches the
+  local `cora mcp` server automatically — the full code-intel surface
+  (brain search, callers, impact, affected tests, dead-code, review;
+  registry names `mcp_cora_*`). Opt out per run with `--no-auto-mcp`;
+  an explicit `--mcp-server cora=...` replaces the preset for that name.
+  MCP tools keep the never-trusted trust model: `Risk::Write`, approval
+  gate always applies.
+- The `tole-cli` default feature set now includes the `mcp` client
+  (`default = ["shell-tools", "mcp"]`): the auto-preset and
+  `--mcp-server` work on a plain `cargo build -p tole-cli`. Embedder
+  profiles are unaffected — `tole-core` defaults do not change.
+
+### Changed
+- `cora_search` follows the same startup-probing contract as the uteke
+  tools: a missing `cora` binary degrades to a one-line warning instead
+  of registering a phantom tool, and the native single-tool fallback is
+  skipped when the cora MCP surface is attached.
+
 ## [0.3.0] — 2026-09-12
 
 Reliability & long-running work: the post-soak optimization batch driven by
