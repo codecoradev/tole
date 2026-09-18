@@ -319,24 +319,6 @@ fn build_registry(
     let mut reg = ToolRegistry::with_approver(approver);
     let cwd = std::env::current_dir().context("resolving cwd")?;
     let file_root = resolve_workspace_root(workspace)?;
-    // Native cora_search (E4): single-tool fallback, registered only when
-    // the cora binary exists AND the cora MCP surface is not attached —
-    // the MCP server supersedes it with the full code-intel toolset.
-    #[cfg(feature = "shell-tools")]
-    {
-        #[cfg(feature = "mcp")]
-        let cora_mcp_attached = mcp_servers.iter().any(|c| c.name == "cora");
-        #[cfg(not(feature = "mcp"))]
-        let cora_mcp_attached = false;
-        if !cora_mcp_attached {
-            if binary_available("cora") {
-                reg.register(Box::new(CoraSearchTool::new()))
-                    .map_err(|e| anyhow::anyhow!("registering cora_search: {e}"))?;
-            } else {
-                eprintln!("tole: cora binary not found — cora_search disabled");
-            }
-        }
-    }
     // Uteke first-class (B4): recall (read) + document (write), behind
     // startup probing — a missing uteke binary degrades to a warning,
     // not phantom tools.
@@ -382,10 +364,37 @@ fn build_registry(
     // MCP servers (#74): registered last so a slow server never blocks
     // native tool availability; per-call approval applies as usual.
     #[cfg(feature = "mcp")]
+    let mut cora_mcp_tools = 0usize;
+    #[cfg(feature = "mcp")]
     for cfg in mcp_servers {
         let names = tole_core::mcp::register_server_tools(&mut reg, cfg);
+        #[cfg(feature = "mcp")]
+        if cfg.name == "cora" {
+            cora_mcp_tools = names.len();
+        }
         if names.is_empty() {
             eprintln!("tole: mcp[{}]: no tools registered", cfg.name);
+        }
+    }
+    // Native cora_search (E4): single-tool fallback, registered only when
+    // the cora MCP surface did NOT materialize — decision is based on the
+    // REGISTRATION OUTCOME, not config presence: a cora binary whose MCP
+    // server fails (handshake, old version) must degrade to the native
+    // tool instead of silently losing all code-intel (CodeCora finding).
+    // The full MCP toolset supersedes the fallback when it registered.
+    #[cfg(feature = "shell-tools")]
+    {
+        #[cfg(feature = "mcp")]
+        let cora_mcp_ok = cora_mcp_tools > 0;
+        #[cfg(not(feature = "mcp"))]
+        let cora_mcp_ok = false;
+        if !cora_mcp_ok {
+            if binary_available("cora") {
+                reg.register(Box::new(CoraSearchTool::new()))
+                    .map_err(|e| anyhow::anyhow!("registering cora_search: {e}"))?;
+            } else {
+                eprintln!("tole: cora binary not found — cora_search disabled");
+            }
         }
     }
     Ok(reg)
