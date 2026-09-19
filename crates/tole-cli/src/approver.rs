@@ -17,8 +17,24 @@ pub trait PromptFn: Send + Sync {
     fn prompt(&self, req: &ToolRequest<'_>) -> Verdict;
 }
 
-/// Production prompt: prints command + input to stdout, reads y/N from
-/// stdin. EOF / unrecognized input ⇒ Deny (fail closed).
+/// Preview of the tool input shown in the approval prompt: long payloads
+/// are truncated (UTF-8-safe on char boundaries) with an explicit marker
+/// instead of flooding the terminal. The full input always lives in the
+/// durable session log; `tole status` is the audit surface.
+const INPUT_PREVIEW_MAX: usize = 500;
+
+fn input_preview(input: &serde_json::Value) -> String {
+    let rendered = input.to_string();
+    if rendered.chars().count() <= INPUT_PREVIEW_MAX {
+        return rendered;
+    }
+    let head: String = rendered.chars().take(INPUT_PREVIEW_MAX).collect();
+    let skipped = rendered.chars().count() - INPUT_PREVIEW_MAX;
+    format!("{head}… (+{skipped} more chars; full input in the session log)")
+}
+
+/// Production prompt: prints command + input preview to stdout, reads
+/// y/N from stdin. EOF / unrecognized input ⇒ Deny (fail closed).
 pub struct StdioPrompt;
 
 impl PromptFn for StdioPrompt {
@@ -27,7 +43,7 @@ impl PromptFn for StdioPrompt {
         println!("── approval required ──────────────────────────");
         println!("tool:  {} [{}]", req.tool, req.risk.as_str());
         println!("what:  {}", req.description);
-        println!("input: {}", req.input);
+        println!("input: {}", input_preview(req.input));
         print!("allow? [y/N] ");
         let _ = io::stdout().flush();
         let mut line = String::new();
@@ -100,6 +116,31 @@ impl<P: PromptFn> Approver for InteractiveApprover<P> {
 mod tests {
     use super::*;
     use serde_json::Value;
+
+    #[test]
+    fn input_preview_short_input_passes_through() {
+        let v = Value::String("hello".into());
+        assert_eq!(input_preview(&v), r#""hello""#);
+    }
+
+    #[test]
+    fn input_preview_long_input_truncates_with_marker() {
+        // 1998 x's + 2 JSON quotes = 2000 chars → 1500 skipped after the
+        // 500-char head.
+        let long = "x".repeat(1998);
+        let v = Value::String(long);
+        let out = input_preview(&v);
+        assert!(out.chars().count() < 600);
+        assert!(out.contains("… (+1500 more chars; full input in the session log)"));
+        // UTF-8-safe: multi-byte content still truncates on char boundaries
+        // (598 é's + 2 quotes = 600 chars → 100 skipped).
+        let multibyte = "é".repeat(598);
+        let out2 = input_preview(&Value::String(multibyte));
+        assert!(out2.contains("… (+100 more chars; full input in the session log)"));
+        assert!(out2.is_char_boundary(
+            out2.len() - "… (+100 more chars; full input in the session log)".len()
+        ));
+    }
 
     /// Scripted prompt: records requests, replays canned verdicts.
     struct ScriptedPrompt {
