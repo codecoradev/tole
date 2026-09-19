@@ -100,7 +100,9 @@ enum Command {
         system: Option<String>,
 
         /// Auto-allow Write tools matching this glob pattern without
-        /// asking (e.g. --allow 'write_*'). Destructive tools are never
+        /// asking (e.g. --allow 'write_*'). Patterns match tool names
+        /// only: an equivalent-effect tool such as run_command stays
+        /// separately gated, and Destructive tools are never
         /// auto-allowed. Repeatable.
         #[arg(long = "allow")]
         allow_patterns: Vec<String>,
@@ -684,7 +686,10 @@ fn run_command(
     let session_id = new_session_id();
     std::fs::create_dir_all(sessions_dir)
         .with_context(|| format!("creating {}", sessions_dir.display()))?;
-    let system_prompt = system.map(str::to_string).or_else(resolve_system_prompt);
+    let system_prompt = system
+        .map(str::to_string)
+        .or_else(resolve_system_prompt)
+        .or_else(|| Some(default_system_prompt().to_string()));
     let mut storage =
         JsonlStorage::create_with(sessions_dir, &session_id, None, system_prompt.as_deref())
             .with_context(|| format!("creating session {session_id}"))?;
@@ -1006,7 +1011,10 @@ fn chat_command(
     }
     let path = session_path(sessions_dir, &session_id);
     let mut storage = if fresh {
-        let system_prompt = system.map(str::to_string).or_else(resolve_system_prompt);
+        let system_prompt = system
+            .map(str::to_string)
+            .or_else(resolve_system_prompt)
+            .or_else(|| Some(default_system_prompt().to_string()));
         JsonlStorage::create_with(sessions_dir, &session_id, None, system_prompt.as_deref())
             .with_context(|| format!("creating session {session_id}"))?
     } else {
@@ -1181,6 +1189,30 @@ fn resolve_system_prompt() -> Option<String> {
         .filter(|s| !s.trim().is_empty())
 }
 
+/// Built-in default system prompt for fresh sessions (no `--system`, no
+/// `TOLE_SYSTEM_PROMPT`). Tool discipline keeps the model on the dedicated,
+/// guarded lanes: the file tools run inside the workspace jail with
+/// hash-anchored editing, while `run_command` is a generic escape hatch
+/// that no `--allow` pattern for file tools can cover (issue #103, from a
+/// live E2E where the model routed a write through `bash -c`).
+#[cfg(feature = "shell-tools")]
+fn default_system_prompt() -> &'static str {
+    "You are tole, a careful personal assistant. Tool discipline: for anything \
+involving files, prefer the dedicated tools — read_file, write_file, \
+edit_file — instead of run_command; they are safer and their approvals are \
+what the user's --allow settings mean. Use run_command only for what those \
+cannot do (pipes, builds, process control). Keep answers concise."
+}
+
+/// Same default without shell tools: `run_command` is not registered in
+/// this profile, so the prompt must not advertise it.
+#[cfg(not(feature = "shell-tools"))]
+fn default_system_prompt() -> &'static str {
+    "You are tole, a careful personal assistant. Tool discipline: for anything \
+involving files, prefer the dedicated tools — read_file, write_file, \
+edit_file. Keep answers concise."
+}
+
 // ---------------------------------------------------------------------------
 // Reporting
 // ---------------------------------------------------------------------------
@@ -1288,6 +1320,23 @@ mod gh_repo_tests {
         let detected = detect_github_repo(&dir);
         assert_eq!(detected.as_deref(), Some("detected/owner-name"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod default_prompt_tests {
+    #[test]
+    fn default_prompt_keeps_model_on_dedicated_file_tools() {
+        let p = super::default_system_prompt();
+        assert!(p.contains("prefer the dedicated tools"));
+        #[cfg(feature = "shell-tools")]
+        assert!(p.contains("run_command"));
+    }
+
+    #[test]
+    fn default_prompt_is_short() {
+        // Prompt discipline: a few lines, not a constitution.
+        assert!(super::default_system_prompt().chars().count() < 600);
     }
 }
 
