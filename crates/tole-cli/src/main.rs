@@ -110,7 +110,7 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
-    /// Resume an interrupted session (E5 crash-resume). With an optional
+    /// Resume an interrupted session. With an optional
     /// PROMPT, appends it as a new user message and runs one full turn
     /// (issue #55): headless flows can continue a mission without a
     /// separate `run` session. Without PROMPT, behaves as before:
@@ -130,7 +130,7 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
-    /// List sessions in the sessions dir (B3).
+    /// List sessions in the sessions dir, newest first.
     Sessions,
 
     /// Show durable state of a session.
@@ -152,7 +152,7 @@ enum Command {
         #[arg(long)]
         workspace: Option<String>,
     },
-    /// Interactive multi-turn chat on one durable session (B1).
+    /// Interactive multi-turn chat on one durable session.
     Chat {
         /// System prompt for a fresh session (ignored when resuming —
         /// the header-pinned prompt wins). Highest priority; else
@@ -828,7 +828,7 @@ fn status_command(sessions_dir: &Path, id: &str) -> Result<()> {
 fn sessions_command(sessions_dir: &Path) -> Result<()> {
     if !sessions_dir.exists() {
         println!(
-            "no sessions in {} (dir does not exist)",
+            "no sessions in {} (dir does not exist) — start one with: tole chat",
             sessions_dir.display()
         );
         return Ok(());
@@ -1091,8 +1091,8 @@ fn chat_command(
                 tole_core::state::Pc::Idle | tole_core::state::Pc::Final => {
                     break run_turn(&mut storage, &mut provider, &registry, &turn_prompt);
                 }
-                mid => {
-                    eprintln!("tole> (resolving interrupted turn, pc={mid:?}…)");
+                _ => {
+                    eprintln!("tole> (resolving the interrupted turn…)");
                     match resume_turn(&mut storage, &mut provider, &registry) {
                         // Landed on a boundary — dispatch the message now.
                         Ok(TurnOutcome::Final { .. }) => continue,
