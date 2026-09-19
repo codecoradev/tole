@@ -17,20 +17,26 @@ pub trait PromptFn: Send + Sync {
     fn prompt(&self, req: &ToolRequest<'_>) -> Verdict;
 }
 
-/// Preview of the tool input shown in the approval prompt: long payloads
-/// are truncated (UTF-8-safe on char boundaries) with an explicit marker
-/// instead of flooding the terminal. The full input always lives in the
+/// Preview of the tool input shown in the approval prompt. HEAD **and**
+/// TAIL are kept (cora MAJOR, 2026-09-19): a head-only cut could hide a
+/// dangerous path/command suffix beyond the preview from the human
+/// approver, weakening the fail-closed gate. Short scalar fields (paths,
+/// commands — the security-relevant values) stay fully visible; only
+/// oversized blobs lose their middle. The full input always lives in the
 /// durable session log; `tole status` is the audit surface.
-const INPUT_PREVIEW_MAX: usize = 500;
+const INPUT_PREVIEW_HEAD: usize = 400;
+const INPUT_PREVIEW_TAIL: usize = 400;
 
 fn input_preview(input: &serde_json::Value) -> String {
     let rendered = input.to_string();
-    if rendered.chars().count() <= INPUT_PREVIEW_MAX {
+    let total = rendered.chars().count();
+    if total <= INPUT_PREVIEW_HEAD + INPUT_PREVIEW_TAIL {
         return rendered;
     }
-    let head: String = rendered.chars().take(INPUT_PREVIEW_MAX).collect();
-    let skipped = rendered.chars().count() - INPUT_PREVIEW_MAX;
-    format!("{head}… (+{skipped} more chars; full input in the session log)")
+    let head: String = rendered.chars().take(INPUT_PREVIEW_HEAD).collect();
+    let tail: String = rendered.chars().skip(total - INPUT_PREVIEW_TAIL).collect();
+    let skipped = total - INPUT_PREVIEW_HEAD - INPUT_PREVIEW_TAIL;
+    format!("{head}… (+{skipped} more chars)…{tail}")
 }
 
 /// Production prompt: prints command + input preview to stdout, reads
@@ -124,22 +130,27 @@ mod tests {
     }
 
     #[test]
-    fn input_preview_long_input_truncates_with_marker() {
-        // 1998 x's + 2 JSON quotes = 2000 chars → 1500 skipped after the
-        // 500-char head.
+    fn input_preview_long_input_truncates_middle_keeps_both_ends() {
+        // 1998 x's + 2 JSON quotes = 2000 chars → middle 1200 elided.
         let long = "x".repeat(1998);
-        let v = Value::String(long);
-        let out = input_preview(&v);
-        assert!(out.chars().count() < 600);
-        assert!(out.contains("… (+1500 more chars; full input in the session log)"));
+        let out = input_preview(&Value::String(long));
+        assert!(out.contains("… (+1200 more chars)…"));
+        assert!(out.starts_with('"'));
+        assert!(out.ends_with('"'));
         // UTF-8-safe: multi-byte content still truncates on char boundaries
-        // (598 é's + 2 quotes = 600 chars → 100 skipped).
-        let multibyte = "é".repeat(598);
+        // (1000 é's + 2 quotes = 1002 chars → 202 skipped).
+        let multibyte = "é".repeat(1000);
         let out2 = input_preview(&Value::String(multibyte));
-        assert!(out2.contains("… (+100 more chars; full input in the session log)"));
-        assert!(out2.is_char_boundary(
-            out2.len() - "… (+100 more chars; full input in the session log)".len()
-        ));
+        assert!(out2.contains("… (+202 more chars)…"));
+        assert!(out2.starts_with('"'));
+        assert!(out2.ends_with('"'));
+        // A short security-relevant scalar stays fully visible even at the
+        // head/tail threshold edge (799 chars < 400+400).
+        let edge = "p".repeat(797);
+        assert_eq!(
+            input_preview(&Value::String(edge.clone())),
+            format!("\"{edge}\"")
+        );
     }
 
     /// Scripted prompt: records requests, replays canned verdicts.
