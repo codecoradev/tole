@@ -1049,17 +1049,17 @@ mod poison_tests {
         assert_eq!(s.entries().len(), 2);
         assert_eq!(s.last_seq(), 3);
 
-        // Recovery: reopen the REAL file (the /dev/full fragment never
-        // touched it — writeln failed on write, file intact), replay is
-        // clean and commits work again.
+        // Recovery: reopen the REAL file — replay now includes the
+        // compact snapshot AND the post-compact commit; the session is
+        // fully usable again.
         drop(s);
         let path = dir.join("p.jsonl");
         let mut reopened = JsonlStorage::open(&path).unwrap();
-        assert_eq!(reopened.entries().len(), 1);
+        assert_eq!(reopened.entries().len(), 2);
         reopened
-            .commit(Commit::new().entry(msg(json!({ "n": 2 }))))
+            .commit(Commit::new().entry(msg(json!({ "n": 3 }))))
             .unwrap();
-        assert_eq!(reopened.last_seq(), 2);
+        assert_eq!(reopened.last_seq(), 4);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
