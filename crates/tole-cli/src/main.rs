@@ -231,7 +231,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         #[cfg(feature = "shell-tools")]
         memory: resolve_memory(cli.memory.as_ref())?,
         #[cfg(not(feature = "shell-tools"))]
-        memory: None,
+        memory: (),
     };
     match cli.command {
         Command::Run {
@@ -264,7 +264,29 @@ fn dispatch(cli: Cli) -> Result<()> {
         Command::Mcp {
             allow_patterns,
             workspace,
-        } => mcp_server_command(workspace.as_ref(), &allow_patterns),
+        } => {
+            // Global flags must not SILENTLY no-op on this subcommand
+            // (cora scan-3 #9): plan-mode filters the served registry to
+            // read-only; hooks are not wired in server mode (no local
+            // approver boundary — server mode pre-authorizes via
+            // --allow), so --on-pretool/--on-posttool error out loudly
+            // instead of being ignored.
+            if host.on_pretool_non_empty() || host.on_posttool_non_empty() {
+                anyhow::bail!(
+                    "--on-pretool/--on-posttool are not supported by `tole mcp` \
+                     (server mode pre-authorizes Write tools with --allow instead)"
+                );
+            }
+            if host.plan_mode {
+                eprintln!("tole mcp: --plan-mode is active — serving read-only tools only");
+            }
+            mcp_server_command(
+                workspace.as_ref(),
+                &allow_patterns,
+                #[cfg(feature = "mcp")]
+                host.plan_mode,
+            )
+        }
         Command::Sessions => sessions_command(&sessions_dir),
         Command::Status { id } => status_command(&sessions_dir, &id),
         Command::Chat {
@@ -302,8 +324,24 @@ struct HostConfig {
     /// Tool-boundary hook command lines (issue #110), default empty.
     on_pretool: Vec<String>,
     on_posttool: Vec<String>,
+    /// shell-tools-only host knob. `not(feature = "shell-tools")` builds
+    /// still assign `memory: None` in dispatch — the field stays so the
+    /// assignments and helper signatures never fork per profile.
+    #[cfg(not(feature = "shell-tools"))]
+    memory: (),
     #[cfg(feature = "shell-tools")]
     memory: Option<tole_core::memory::MemoryConfig>,
+}
+
+impl HostConfig {
+    #[cfg(any(feature = "shell-tools", feature = "mcp"))]
+    fn on_pretool_non_empty(&self) -> bool {
+        !self.on_pretool.is_empty()
+    }
+    #[cfg(any(feature = "shell-tools", feature = "mcp"))]
+    fn on_posttool_non_empty(&self) -> bool {
+        !self.on_posttool.is_empty()
+    }
 }
 
 #[cfg(feature = "shell-tools")]
@@ -674,8 +712,23 @@ fn build_server_registry(
 /// D1 (issue #94): serve the registry over MCP stdio. Blocks until the
 /// client disconnects.
 #[cfg(all(feature = "mcp", feature = "shell-tools"))]
-fn mcp_server_command(workspace: Option<&String>, allow_patterns: &[String]) -> Result<()> {
+#[cfg_attr(not(feature = "mcp"), allow(unused_variables))]
+fn mcp_server_command(
+    workspace: Option<&String>,
+    allow_patterns: &[String],
+    #[cfg(feature = "mcp")] plan_mode: bool,
+) -> Result<()> {
     let registry = build_server_registry(workspace, allow_patterns)?;
+    // Plan mode (issue #109) applies to server mode too (cora scan-3
+    // #9): serve read-only tools only when the operator asked for it.
+    #[cfg(feature = "mcp")]
+    let mut registry = registry;
+    #[cfg(feature = "mcp")]
+    if plan_mode {
+        let mut reg = registry;
+        reg.retain_read_only();
+        registry = reg;
+    }
     tokio::runtime::Runtime::new()
         .context("creating tokio runtime")?
         .block_on(tole_core::mcp_server::serve_stdio(registry))
@@ -1133,11 +1186,12 @@ fn chat_command(
     // Set when the typed message could not run because the session was
     // stuck mid-flight and the bounded resolve retries ran out — the
     // message is NOT in the durable log, so the operator must resend it.
-    let mut dropped_message = false;
-
+    // SCOPED PER MESSAGE (cora scan-3 #8): declared inside the loop —
+    // an outer flag never reset, so one drop warned forever after.
     let stdin = std::io::stdin();
     loop {
-        print!("you> ");
+        let mut dropped_message = false;
+        print!("you>");
         let _ = std::io::stdout().flush();
         let mut line = String::new();
         match stdin.lock().read_line(&mut line) {

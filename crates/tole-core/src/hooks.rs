@@ -62,6 +62,10 @@ impl ProcessHook {
         }
         let mut cmd = Command::new(&self.program);
         cmd.args(&self.args);
+        // Hook processes are external programs: strip secret-shaped env
+        // (API keys etc.) exactly like every other child spawn (cora
+        // scan-3 #23 — same contract as run_command/memory).
+        crate::subprocess::scrub_env_for_child(&mut cmd);
         let out = run_with_timeout_stdin(&mut cmd, self.timeout, payload.to_string().as_bytes())?;
         // Output cap: a runaway hook cannot flood the durable log.
         let mut stdout = out.stdout;
