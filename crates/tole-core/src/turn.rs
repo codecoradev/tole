@@ -360,6 +360,14 @@ fn drive(
                             return Ok(TurnOutcome::ApprovalRequired { name: tool });
                         }
                     }
+                    // Opt-in pre-hooks (issue #110, shell-tools only): a
+                    // deny (exit 2) settles the same way as an approval
+                    // denial — durable turn error + ApprovalRequired.
+                    #[cfg(feature = "shell-tools")]
+                    if let Some(reason) = registry.pre_hook_denial(&tool, &input) {
+                        append_turn_error(s, "pre-hook denial", &format!("{tool}: {reason}"))?;
+                        return Ok(TurnOutcome::ApprovalRequired { name: tool });
+                    }
                 }
                 // Planning → ToolCall, then the sandwich. The replay
                 // contract derives from RISK, not a blanket Idempotent
@@ -375,15 +383,33 @@ fn drive(
                 let seq = s.state().seq;
                 s.commit(Commit::new().transition(StateTransition::from(seq, Pc::ToolCall)))?;
                 let handle = begin(s, &tool, input.clone(), safety, None)?;
+                // Post-hook input snapshot (issue #110): execute consumes
+                // `input` by value; hooks observe the exact call input.
+                // Write/Destructive ONLY — ReadOnly stays zero-overhead
+                // (the documented hook contract; cora-caught).
+                #[cfg(feature = "shell-tools")]
+                let hook_input = if t.risk() != Risk::ReadOnly && registry.has_post_hooks() {
+                    Some(input.clone())
+                } else {
+                    None
+                };
                 let out = match t.execute(input) {
                     Ok(o) => o,
                     Err(e) => {
                         // settle_err lands in Planning directly (§10) —
                         // no finish() hop on the failure path.
+                        #[cfg(feature = "shell-tools")]
+                        if let Some(i) = &hook_input {
+                            registry.post_hook_notify(&tool, i, false);
+                        }
                         settle_err(s, &handle, &e)?;
                         continue;
                     }
                 };
+                #[cfg(feature = "shell-tools")]
+                if let Some(i) = &hook_input {
+                    registry.post_hook_notify(&tool, i, true);
+                }
                 settle_ok(s, &handle, out)?;
                 finish(s)?;
             }

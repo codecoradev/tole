@@ -90,6 +90,23 @@ struct Cli {
     #[arg(long, global = true)]
     plan_mode: bool,
 
+    /// Pre-tool-use process hook (issue #110): runs before every
+    /// Write/Destructive tool executes. Receives one JSON object on
+    /// stdin (`{"event":"pretool","tool":...,"input":...}`); exit code
+    /// 2 = DENY the call (durable, the loop replans); any other
+    /// non-zero exit / timeout is a logged non-blocking hook failure.
+    /// Example: --on-pretool /usr/local/bin/tole-guard.sh. Repeatable;
+    /// default OFF.
+    #[arg(long, global = true)]
+    on_pretool: Vec<String>,
+
+    /// Post-tool-use process hook (issue #110): runs after every
+    /// Write/Destructive tool settles. Receives
+    /// `{"event":"posttool","tool":...,"input":...,"ok":true|false}`;
+    /// observe-only (output cannot block). Repeatable; default OFF.
+    #[arg(long, global = true)]
+    on_posttool: Vec<String>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -208,6 +225,9 @@ fn dispatch(cli: Cli) -> Result<()> {
         #[cfg(feature = "mcp")]
         mcp_server: mcp_specs,
         plan_mode: cli.plan_mode,
+
+        on_pretool: cli.on_pretool.clone(),
+        on_posttool: cli.on_posttool.clone(),
         #[cfg(feature = "shell-tools")]
         memory: resolve_memory(cli.memory.as_ref())?,
         #[cfg(not(feature = "shell-tools"))]
@@ -278,6 +298,10 @@ struct HostConfig {
     mcp_server: Vec<String>,
     /// Plan mode (issue #109): registry filtered to ReadOnly tools.
     plan_mode: bool,
+
+    /// Tool-boundary hook command lines (issue #110), default empty.
+    on_pretool: Vec<String>,
+    on_posttool: Vec<String>,
     #[cfg(feature = "shell-tools")]
     memory: Option<tole_core::memory::MemoryConfig>,
 }
@@ -699,6 +723,15 @@ fn run_command(
     if host.plan_mode {
         registry.retain_read_only();
     }
+    // Opt-in tool-boundary hooks (issue #110): deny-only policy
+    // injection for Write/Destructive calls, default OFF.
+    #[cfg(feature = "shell-tools")]
+    if !host.on_pretool.is_empty() || !host.on_posttool.is_empty() {
+        registry.set_hooks(tole_core::hooks::ToolHooks::from_cli(
+            &host.on_pretool,
+            &host.on_posttool,
+        ));
+    }
 
     let session_id = new_session_id();
     std::fs::create_dir_all(sessions_dir)
@@ -776,6 +809,15 @@ fn resume_command(
     // approval — filtered tools never appear in specs().
     if host.plan_mode {
         registry.retain_read_only();
+    }
+    // Opt-in tool-boundary hooks (issue #110): deny-only policy
+    // injection for Write/Destructive calls, default OFF.
+    #[cfg(feature = "shell-tools")]
+    if !host.on_pretool.is_empty() || !host.on_posttool.is_empty() {
+        registry.set_hooks(tole_core::hooks::ToolHooks::from_cli(
+            &host.on_pretool,
+            &host.on_posttool,
+        ));
     }
     let mut provider = OpenAiProvider::new(cfg).with_tool_specs(registry.specs());
     // B2: the system prompt is pinned in the session header — resume
@@ -1046,6 +1088,15 @@ fn chat_command(
     // approval — filtered tools never appear in specs().
     if host.plan_mode {
         registry.retain_read_only();
+    }
+    // Opt-in tool-boundary hooks (issue #110): deny-only policy
+    // injection for Write/Destructive calls, default OFF.
+    #[cfg(feature = "shell-tools")]
+    if !host.on_pretool.is_empty() || !host.on_posttool.is_empty() {
+        registry.set_hooks(tole_core::hooks::ToolHooks::from_cli(
+            &host.on_pretool,
+            &host.on_posttool,
+        ));
     }
 
     if fresh {

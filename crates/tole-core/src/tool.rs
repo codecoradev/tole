@@ -59,6 +59,10 @@ pub trait Tool: Send + Sync {
 pub struct ToolRegistry {
     tools: HashMap<String, Box<dyn Tool>>,
     approver: Option<Box<dyn Approver>>,
+    /// Opt-in process hooks (issue #110, shell-tools only): deny-only
+    /// policy injection at the tool boundary. `None` = off, zero cost.
+    #[cfg(feature = "shell-tools")]
+    hooks: Option<crate::hooks::ToolHooks>,
 }
 
 impl ToolRegistry {
@@ -74,6 +78,51 @@ impl ToolRegistry {
         Self {
             tools: HashMap::new(),
             approver: Some(Box::new(approver)),
+            #[cfg(feature = "shell-tools")]
+            hooks: None,
+        }
+    }
+
+    /// Attach opt-in tool-boundary hooks (issue #110). Default OFF.
+    #[cfg(feature = "shell-tools")]
+    pub fn set_hooks(&mut self, hooks: crate::hooks::ToolHooks) {
+        self.hooks = Some(hooks);
+    }
+
+    /// Pre-hook pass: returns the deny reason when any pre-hook exits 2.
+    /// Hook FAILURES (crash, timeout, non-2 exit) are logged and
+    /// non-blocking by contract.
+    #[cfg(feature = "shell-tools")]
+    pub(crate) fn pre_hook_denial(&self, tool: &str, input: &Value) -> Option<String> {
+        let hooks = self.hooks.as_ref()?;
+        for h in &hooks.pre {
+            match h.run("pretool", tool, input, None) {
+                Ok(Some(reason)) => return Some(reason),
+                Ok(None) => {}
+                Err(e) => eprintln!("tole: pre-hook failure (non-blocking): {e}"),
+            }
+        }
+        None
+    }
+
+    /// True when at least one post-hook is wired (callers skip input
+    /// cloning otherwise).
+    #[cfg(feature = "shell-tools")]
+    pub(crate) fn has_post_hooks(&self) -> bool {
+        self.hooks
+            .as_ref()
+            .map(|h| !h.post.is_empty())
+            .unwrap_or(false)
+    }
+
+    /// Post-hook pass (observe-only): failures are logged, never block.
+    #[cfg(feature = "shell-tools")]
+    pub(crate) fn post_hook_notify(&self, tool: &str, input: &Value, ok: bool) {
+        let Some(hooks) = &self.hooks else { return };
+        for h in &hooks.post {
+            if let Err(e) = h.run("posttool", tool, input, Some(ok)) {
+                eprintln!("tole: post-hook failure (non-blocking): {e}");
+            }
         }
     }
 
