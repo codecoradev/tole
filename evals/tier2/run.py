@@ -47,15 +47,17 @@ TIMEOUT_SECS = 300
 
 # Secret-shaped tokens must never reach the archive. Per-family shapes,
 # length-guarded so prose ("sketching", "risk-management") cannot match:
-# provider/API keys (sk-…, rk-…), GitHub tokens (ghp_/gho_/github_pat_),
-# Slack (xoxb-/xoxp-), Google (AIza…).
+# provider/API keys (sk-…, rk-…), GitHub token families
+# (ghp_/gho_/ghs_/ghu_/ghr_, github_pat_), GitLab (glpat-), Slack
+# (xoxb-/xoxp-/xoxa-), Google (AIza…), AWS access key IDs (AKIA…).
 _SECRET_SHAPED = re.compile(
     r"\b(?:sk|rk)-[A-Za-z0-9_\-]{12,}"
-    r"|ghp_[A-Za-z0-9]{20,}"
-    r"|gho_[A-Za-z0-9]{20,}"
+    r"|gh[poshur]_[A-Za-z0-9]{20,}"
     r"|github_pat_[A-Za-z0-9_]{20,}"
-    r"|xox[bp]-[A-Za-z0-9\-]{10,}"
+    r"|glpat-[A-Za-z0-9_\-]{20,}"
+    r"|xox[abpr]-[A-Za-z0-9\-]{10,}"
     r"|AIza[0-9A-Za-z_\-]{20,}"
+    r"|AKIA[0-9A-Z]{16}"
 )
 
 
@@ -76,7 +78,9 @@ def redact_line(line: str, host_paths: list[str]) -> str:
     # fully dropped, never partially kept.
     def stub(m: "re.Match[str]") -> str:
         tok = m.group(0)
-        fam = re.match(r"sk-|rk-|ghp_|gho_|github_pat_|xox[bp]-|AIza", tok)
+        fam = re.match(
+            r"sk-|rk-|gh[poshur]_|github_pat_|glpat-|xox[abpr]-|AIza|AKIA", tok
+        )
         return (fam.group(0) if fam else "") + "***REDACTED***"
 
     out = _SECRET_SHAPED.sub(stub, line)

@@ -288,7 +288,36 @@ fn incumbent_default_prompt() -> Result<String> {
                 break;
             }
             Some(b'\\') => {
-                i += 2; // skip escaped char (\" or line continuation)
+                // Escape decoding (cora full-scan #30): the pushed prompt
+                // must be what RUST sees at runtime, not the raw source
+                // text. Handle the escapes that can legally appear in a
+                // string literal; `\<newline>` is a line continuation
+                // (the escaped char IS the newline).
+                match bytes.get(i + 1) {
+                    Some(b'n') => out.push('\n'),
+                    Some(b't') => out.push('\t'),
+                    Some(b'r') => out.push('\r'),
+                    Some(b'"') => out.push('"'),
+                    Some(b'\\') => out.push('\\'),
+                    Some(b'\'') => out.push('\''),
+                    Some(b'0') => bail!("unexpected \\0 in prompt literal"),
+                    Some(_) => {
+                        // Line continuation: `\<newline>[whitespace]` —
+                        // Rust strips the newline AND leading whitespace
+                        // of the next line.
+                        let mut j = i + 1;
+                        while matches!(
+                            bytes.get(j),
+                            Some(b'\n') | Some(b'\r') | Some(b' ') | Some(b'\t')
+                        ) {
+                            j += 1;
+                        }
+                        i = j;
+                        continue;
+                    }
+                    None => bail!("unterminated default prompt literal"),
+                }
+                i += 2;
             }
             Some(_) => {
                 let ch = rest[i..].chars().next().unwrap();

@@ -367,9 +367,17 @@ impl JsonlStorage {
         let file = File::open(&path)?;
         let mut reader = BufReader::new(file);
 
-        // Header (line 1, mandatory).
-        let mut line = String::new();
-        reader.read_line(&mut line)?;
+        // Header (line 1, mandatory). Read with read_until: a header line
+        // WITHOUT its trailing newline (crash mid-header-write) is a torn
+        // write exactly like a torn final line — parse it for the error
+        // message, but refuse to open for append: good_bytes = 0 makes the
+        // truncation below remove the whole file, so the next append never
+        // glues itself onto a newline-less header and bricks the session
+        // (cora full-scan #23).
+        let mut header_buf: Vec<u8> = Vec::new();
+        reader.read_until(b'\n', &mut header_buf)?;
+        let line = String::from_utf8(header_buf.clone())
+            .map_err(|_| StorageError::Corrupt("header: invalid UTF-8".into()))?;
         if line.trim().is_empty() {
             return Err(StorageError::Corrupt("empty file (missing header)".into()));
         }
@@ -387,6 +395,19 @@ impl JsonlStorage {
                 supported: STORAGE_VERSION,
             });
         }
+        // Torn header: complete JSON but no newline. This file can never
+        // be appended to safely (a body line would glue onto the
+        // newline-less header), and an append-style writer over an empty
+        // file would produce a headerless file that bricks the NEXT
+        // open(). Fail explicitly: the host's recovery path is
+        // create_with(), which rewrites the file with a fresh complete
+        // header (cora full-scan #23, second-round fix).
+        if !header_buf.ends_with(b"\n") {
+            return Err(StorageError::Corrupt(
+                "torn header (missing newline); recreate the session with create_with()".into(),
+            ));
+        }
+        let mut good_bytes = header_buf.len() as u64;
 
         let mut out = Self {
             session_id: header.id.clone(),
@@ -410,7 +431,6 @@ impl JsonlStorage {
         // so a torn tail can be physically truncated before appending.
         let mut lineno = 1usize;
         let mut last_seq = 0u64;
-        let mut good_bytes = line.len() as u64;
         let mut buf: Vec<u8> = Vec::new();
         loop {
             buf.clear();
