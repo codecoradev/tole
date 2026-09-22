@@ -1213,11 +1213,22 @@ fn chat_command(
                             retries_left -= 1;
                             continue;
                         }
-                        Ok(other) => break Ok(other),
+                        Ok(other) => {
+                            // UnknownTool / BudgetExhausted / LoopDetected
+                            // / Storage: the typed message never reached
+                            // the durable log (run_turn was never
+                            // reached). Flag it so the operator gets the
+                            // not-recorded note below (cora full-scan
+                            // #7 — silently continuing would let them
+                            // believe the input was recorded).
+                            dropped_message = true;
+                            break Ok(other);
+                        }
                         Err(e) => {
                             // Storage-level failure resolving: do not lose
                             // the user's message — report and keep the
                             // input buffered for the next attempt.
+                            dropped_message = true;
                             break Err(e);
                         }
                     }
@@ -1249,7 +1260,14 @@ fn chat_command(
                 "tole> (loop guard tripped — identical tool calls repeated; next message resumes)"
             ),
             Ok(TurnOutcome::Storage(e)) => anyhow::bail!("storage error: {e}"),
-            Err(e) => anyhow::bail!("turn failed: {e}"),
+            Err(e) => {
+                // Resolve-path failure: the typed message was NOT
+                // recorded. Print the same not-recorded note the
+                // dropped_message path uses, then surface the error
+                // (previously this bailed silently on the note).
+                eprintln!("tole> (note: the message you just typed was NOT recorded — resolve the session state, then resend it)");
+                anyhow::bail!("turn failed: {e}");
+            }
         }
         if dropped_message {
             // The typed message never reached the durable log — saying
