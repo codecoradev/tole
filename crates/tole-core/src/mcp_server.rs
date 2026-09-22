@@ -150,9 +150,7 @@ impl ServerHandler for RegistryServer {
         let server = self.clone();
         let executed = tokio::task::spawn_blocking(move || server.execute_checked(&name, args))
             .await
-            .map_err(|e| {
-                McpError::internal_error(format!("tool task join failed: {e}"), None)
-            })?;
+            .map_err(|e| McpError::internal_error(format!("tool task join failed: {e}"), None))?;
         match executed {
             Ok(result) => Ok(CallToolResult::success(vec![ContentBlock::text(
                 serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string()),
