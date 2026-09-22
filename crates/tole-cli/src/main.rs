@@ -706,7 +706,7 @@ fn run_command(
     let system_prompt = system
         .map(str::to_string)
         .or_else(resolve_system_prompt)
-        .or_else(|| Some(default_prompt_for(host.plan_mode)));
+        .or_else(|| Some(build_default_prompt(host.plan_mode)));
     let mut storage =
         JsonlStorage::create_with(sessions_dir, &session_id, None, system_prompt.as_deref())
             .with_context(|| format!("creating session {session_id}"))?;
@@ -929,8 +929,13 @@ fn fmt_mtime(t: std::time::SystemTime) -> String {
     let days = secs / 86400;
     let rem = secs % 86400;
     let (h, m) = (rem / 3600, (rem % 3600) / 60);
-    // civil-from-days (Howard Hinnant's algorithm) — no chrono.
-    let z = days as i64 + 719_468;
+    format!("{} {h:02}:{m:02}", civil_from_days(days as i64))
+}
+
+/// Civil date `YYYY-mm-dd` from days since the Unix epoch (Howard
+/// Hinnant's algorithm — no chrono dep).
+fn civil_from_days(days: i64) -> String {
+    let z = days + 719_468;
     let era = z.div_euclid(146097);
     let doe = z.rem_euclid(146097);
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
@@ -940,7 +945,16 @@ fn fmt_mtime(t: std::time::SystemTime) -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let mth = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if mth <= 2 { y + 1 } else { y };
-    format!("{y:04}-{mth:02}-{d:02} {h:02}:{m:02}")
+    format!("{y:04}-{mth:02}-{d:02}")
+}
+
+/// Today's UTC date, `YYYY-mm-dd`.
+fn today_utc() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    civil_from_days((secs / 86400) as i64)
 }
 
 // ---------------------------------------------------------------------------
@@ -1043,7 +1057,7 @@ fn chat_command(
         let system_prompt = system
             .map(str::to_string)
             .or_else(resolve_system_prompt)
-            .or_else(|| Some(default_prompt_for(host.plan_mode)));
+            .or_else(|| Some(build_default_prompt(host.plan_mode)));
         JsonlStorage::create_with(sessions_dir, &session_id, None, system_prompt.as_deref())
             .with_context(|| format!("creating session {session_id}"))?
     } else {
@@ -1259,6 +1273,25 @@ until the session is started without --plan-mode."
     }
 }
 
+/// Default prompt for the session's mode + dynamic context sections
+/// (issues #109 + #111): the shared incumbent text, the plan-mode
+/// read-only sentence when planning, then a ONE-LINE context section
+/// (working directory, today's UTC date). ONE context line MAXIMUM —
+/// no env dumps, no fingerprints. Session start only: the assembled
+/// prompt is pinned in the session header, so within a session the
+/// wire body stays append-only (KV-cache prefix property untouched).
+fn build_default_prompt(plan_mode: bool) -> String {
+    let mut p = default_prompt_for(plan_mode);
+    let cwd = std::env::current_dir()
+        .map(|d| d.display().to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+    p.push_str(&format!(
+        "\nContext: working directory {cwd}; today is {} (UTC).",
+        today_utc()
+    ));
+    p
+}
+
 // ---------------------------------------------------------------------------
 // Reporting
 // ---------------------------------------------------------------------------
@@ -1386,6 +1419,7 @@ mod default_prompt_tests {
     }
 
     #[test]
+    #[test]
     fn plan_mode_prompt_extends_the_incumbent_without_touching_it() {
         let plan = super::default_prompt_for(true);
         let base = super::default_system_prompt();
@@ -1396,6 +1430,39 @@ mod default_prompt_tests {
         assert!(plan.contains("read-only"));
         // Non-plan default is byte-identical to the incumbent fn.
         assert_eq!(super::default_prompt_for(false), base);
+    }
+
+    #[test]
+    fn context_sections_append_date_and_cwd_without_mutating_the_mode_prompt() {
+        let built = super::build_default_prompt(false);
+        let mode = super::default_prompt_for(false);
+        assert!(built.starts_with(&mode));
+        assert!(built.contains("working directory "));
+        assert!(built.contains("today is "));
+        // Exactly ONE appended context line.
+        assert_eq!(built.matches('\n').count(), mode.matches('\n').count() + 1);
+        // Date shape YYYY-mm-dd (civil-from-days output).
+        let tail = built
+            .rsplit("today is ")
+            .next()
+            .unwrap()
+            .trim_end_matches(" (UTC).");
+        assert_eq!(tail.len(), 10);
+        assert_eq!(tail.as_bytes()[4], b'-');
+        assert_eq!(tail.as_bytes()[7], b'-');
+        // Plan mode composes: context rides AFTER the plan sentence.
+        let planned = super::build_default_prompt(true);
+        assert!(planned.contains("PLAN MODE"));
+        assert!(planned.rfind("Context:").unwrap() > planned.rfind("PLAN MODE").unwrap());
+    }
+
+    #[test]
+    fn civil_from_days_matches_known_dates() {
+        // Day 0 = 1970-01-01; leap-year boundary (2024-01-01) and a
+        // mid-2026 date (computed, not guessed).
+        assert_eq!(super::civil_from_days(0), "1970-01-01");
+        assert_eq!(super::civil_from_days(19_723), "2024-01-01");
+        assert_eq!(super::civil_from_days(20_646), "2026-07-12");
     }
 }
 
