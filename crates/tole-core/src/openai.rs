@@ -358,12 +358,31 @@ impl Provider for OpenAiProvider {
             .post(&url)
             .header("Authorization", format!("Bearer {}", self.cfg.api_key))
             .send_json(&body)
-            .and_then(|mut r| r.body_mut().read_json::<Value>())
+            .map_err(|e| ProviderError(scrub(&e.to_string(), &self.cfg.api_key)))?;
+        // HTTP status FIRST (cora full-scan #46): a non-2xx body is often
+        // HTML/error JSON that read_json would mangle into a misleading
+        // "malformed response". Surface status + scrubbed body snippet;
+        // the "http status: N" phrasing is load-bearing — the turn loop's
+        // transient-retry classification (#66) matches on it.
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body_text = resp
+                .into_body()
+                .read_to_string()
+                .unwrap_or_else(|_| "<unreadable body>".to_string());
+            let body_text = scrub(&body_text, &self.cfg.api_key);
+            let snippet: String = body_text.chars().take(200).collect();
+            return Err(ProviderError(format!("http status: {status} — {snippet}")));
+        }
+        let mut resp = resp;
+        let resp_body = resp
+            .body_mut()
+            .read_json::<Value>()
             .map_err(|e| ProviderError(scrub(&e.to_string(), &self.cfg.api_key)))?;
         // Capture provider-reported usage (issue: status showed 0/0) —
         // exposed via `last_usage` for the turn loop's durable ledger.
-        self.last_usage_obj = resp.get("usage").cloned().filter(Value::is_object);
-        Self::parse_completion(&resp)
+        self.last_usage_obj = resp_body.get("usage").cloned().filter(Value::is_object);
+        Self::parse_completion(&resp_body)
     }
 
     fn last_usage(&self) -> Option<Value> {

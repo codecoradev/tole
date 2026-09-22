@@ -93,6 +93,17 @@ impl GitOp {
                             "git: 'path' must be relative to the workspace: {p:?}"
                         ));
                     }
+                    // Windows drive-letter absolute paths (`C:\...`,
+                    // `C:/...`) slip past the separator checks above
+                    // (cora full-scan #30) — the second byte `:` marks a
+                    // drive. The lexical jail must be host-OS-honest:
+                    // tole mobile targets Android, but a workspace synced
+                    // to/from a Windows host must not become an escape.
+                    if p.len() > 1 && p.as_bytes()[1] == b':' {
+                        return Err(format!(
+                            "git: 'path' must be relative to the workspace (drive-letter path): {p:?}"
+                        ));
+                    }
                     if p.split(['/', '\\']).any(|c| c == "..") {
                         return Err(format!(
                             "git: 'path' must not escape the workspace (..): {p:?}"
@@ -257,6 +268,35 @@ mod tests {
     #[test]
     fn classified_write() {
         assert_eq!(GitTool::new().risk(), Risk::Write);
+    }
+
+    #[test]
+    fn add_jail_rejects_absolute_and_drive_letter_paths() {
+        let t = GitTool::new();
+        // POSIX absolute + backslash root + Windows drive letters (cora
+        // full-scan #30: `C:\evil` passed both separator checks).
+        for bad in [
+            "/etc/passwd",
+            "\\Windows\\evil",
+            "C:\\Windows\\evil",
+            "C:/Users/evil",
+        ] {
+            let err = t
+                .command_line(&json!({"op":"add","paths":[bad]}))
+                .unwrap_err();
+            assert!(
+                err.contains("relative to the workspace"),
+                "{bad}: got {err}"
+            );
+        }
+        // Plain relative paths still pass.
+        assert!(t
+            .command_line(&json!({"op":"add","paths":["src/main.rs"]}))
+            .is_ok());
+        // A filename with a colon NOT at position 1 stays legal.
+        assert!(t
+            .command_line(&json!({"op":"add","paths":["weird:name.txt"]}))
+            .is_ok());
     }
 
     #[test]
