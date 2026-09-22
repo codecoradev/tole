@@ -971,6 +971,13 @@ impl Storage for JsonlStorage {
         // Reopen the writer on the new file.
         self.writer = BufWriter::new(OpenOptions::new().append(true).open(&self.path)?);
         self.state.seq = seq;
+        // The file was atomically rewritten from COMPLETE records only —
+        // any torn fragment that justified the poison no longer exists.
+        // Clear the poison (CodeCora round-2 on the #53 fix): leaving it
+        // set would permanently disable a session whose file was just
+        // verifiably repaired. This makes compact() the sanctioned
+        // recovery path for a poisoned session.
+        self.poisoned = None;
         Ok(())
     }
 }
@@ -1003,12 +1010,18 @@ mod poison_tests {
             .unwrap();
 
         // Swap the writer to /dev/full: every write() returns ENOSPC.
-        s.writer = BufWriter::new(
-            OpenOptions::new()
-                .write(true)
-                .open("/dev/full")
-                .expect("this test requires /dev/full (Linux)"),
-        );
+        // Linux-only inside the test body (the unix gate covers macOS/
+        // FreeBSD where /dev/full does not exist) — skip honestly there
+        // instead of panicking (CodeCora CI annotation).
+        match OpenOptions::new().write(true).open("/dev/full") {
+            Ok(f) => s.writer = BufWriter::new(f),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("/dev/full unavailable on this platform — poison path untested here");
+                let _ = std::fs::remove_dir_all(&dir);
+                return;
+            }
+            Err(e) => panic!("unexpected error opening /dev/full: {e}"),
+        }
 
         let first = s.commit(Commit::new().entry(msg(json!({ "n": 2 }))));
         assert!(first.is_err(), "append to /dev/full must fail");
@@ -1024,6 +1037,17 @@ mod poison_tests {
         // In-memory state was never mutated by the failed commits.
         assert_eq!(s.entries().len(), 1);
         assert_eq!(s.last_seq(), 1);
+
+        // compact() is the sanctioned recovery (CodeCora round-2): it
+        // atomically rewrites the file from complete records only, so
+        // the poison clears and commits work again WITHOUT a reopen.
+        // The snapshot carries seq = 2 (header + snapshot line); the
+        // post-compact commit continues from there as seq 3.
+        s.compact().unwrap();
+        s.commit(Commit::new().entry(msg(json!({ "n": 2 }))))
+            .unwrap();
+        assert_eq!(s.entries().len(), 2);
+        assert_eq!(s.last_seq(), 3);
 
         // Recovery: reopen the REAL file (the /dev/full fragment never
         // touched it — writeln failed on write, file intact), replay is
