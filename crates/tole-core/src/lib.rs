@@ -49,6 +49,7 @@ pub mod openai;
 pub mod provider;
 pub mod read_file;
 pub mod register;
+pub mod replay;
 #[cfg(feature = "shell-tools")]
 pub mod run_command;
 pub mod state;

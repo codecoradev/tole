@@ -1,0 +1,7 @@
+{
+ "mission": "echo_chain",
+ "model": "glm/glm-5.1",
+ "session": "s-1a0c813609d-64945.jsonl",
+ "recorded_at": "2026-09-22T07:45:35+00:00",
+ "source": "evals/tier2/run.py --archive (issue #107)"
+}

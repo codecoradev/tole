@@ -42,6 +42,40 @@ Run locally: `python3 evals/tier2/run.py --all` (requires provider env
 and the freshly built release binary — see CONTRIBUTING binary
 hygiene).
 
+### Tier 2.5 — offline trace replay (`evals/replay/`, issue #107)
+
+The Dream-RSI replay-evaluation pattern (arXiv:2609.14858) applied to
+this harness: with `run.py --archive`, each Tier-2 run keeps a
+**redacted** copy of its session JSONL under `evals/traces/<model>/<mission>/`
+(secret-shaped tokens and host paths scrubbed). A recorded trace is an
+exact simulator of what the model saw, so a candidate prompt can be
+**replayed** over the recorded tool outcomes at zero tool executions —
+one completion call per (candidate, mission) is the whole cost.
+
+```sh
+python3 evals/tier2/run.py --all --archive     # record (real provider)
+cargo build -p tole-cli --bin tole-replay      # operator-built scorer
+target/debug/tole-replay --traces evals/traces \
+  --revised evals/replay/prompts/my-candidate.txt [--model <id>] [--json]
+```
+
+The scorer ALWAYS evaluates the incumbent (the shipped default prompt,
+extracted from the CLI source — never a drifting copy) in the same run
+and only reports `SHIP: revised` when the revision's average score over
+the trace corpus is strictly better (monotone selection, Dream-RSI §3).
+Scoring: a COMPLETED walk scores 0.7 × positional tool-path agreement +
+0.3 × final-answer match; a walk that diverges or errors scores 0 —
+dreaming is exact only inside the recorded world, so credit past the
+divergence point would be fiction (`path_agreement` is still reported
+for diagnosis).
+
+Rules: replay is an **advisory pre-check** for prompt/policy revisions —
+it cannot see real tool effects, so it does not replace Tier 2; live
+missions remain the release gate. Traces are model-pinned (the
+`--model` filter exists for a reason); do not compare scores across
+models. `evals/traces/` is still reviewed like any committed artifact:
+the archiver redacts, but grep before committing.
+
 ### Tier 3 — baselines (`evals/baselines/`)
 
 `baselines/<tag>.json` stores Tier-2 results per release tag.
