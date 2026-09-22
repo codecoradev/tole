@@ -420,14 +420,27 @@ fn drive(
                 // next request and can retry with well-formed JSON.
                 let seq = s.state().seq;
                 s.commit(Commit::new().transition(StateTransition::from(seq, Pc::ToolCall)))?;
-                // Nothing executes for this intent (it is settled as an
-                // error immediately below), so Idempotent is the honest
-                // contract: a replay can only ever settle it again.
+                // Replay safety derives from TOOL RISK, not from the fact
+                // that nothing executed now (cora scan-3 #50): a crash
+                // between this intent and its settlement must re-consult
+                // the approval gate for a Write/Destructive tool on
+                // resume, exactly like the normal ToolCall path. The
+                // intent's input is the RAW malformed arguments, so a
+                // guarded replay re-settles it as an error — never an
+                // execution.
+                let risky = registry
+                    .get(&tool)
+                    .map(|t| t.risk() != Risk::ReadOnly)
+                    .unwrap_or(false);
                 let handle = begin(
                     s,
                     &tool,
                     serde_json::Value::String(raw),
-                    ReplaySafety::Idempotent,
+                    if risky {
+                        ReplaySafety::Guarded
+                    } else {
+                        ReplaySafety::Idempotent
+                    },
                     None,
                 )?;
                 let msg = format!("tool arguments are not valid JSON: {reason}");

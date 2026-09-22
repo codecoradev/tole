@@ -301,6 +301,42 @@ fn incumbent_default_prompt() -> Result<String> {
                     Some(b'\\') => out.push('\\'),
                     Some(b'\'') => out.push('\''),
                     Some(b'0') => bail!("unexpected \\0 in prompt literal"),
+                    // \xHH and \uNNNN are legal Rust escapes (cora
+                    // scan-3 #74): decode them — a silent skip would
+                    // corrupt the incumbent and poison every replay
+                    // score computed from it.
+                    Some(b'x') => {
+                        let hex: String = rest[i + 2..].chars().take(2).collect();
+                        if hex.len() < 2 {
+                            bail!("truncated \\x escape in prompt literal");
+                        }
+                        let byte = u8::from_str_radix(&hex, 16)
+                            .map_err(|_| anyhow::anyhow!("bad \\x escape: \\x{hex}"))?;
+                        out.push(byte as char);
+                        i += 4;
+                        continue;
+                    }
+                    Some(b'u') => {
+                        if bytes.get(i + 2) != Some(&b'{') {
+                            bail!("\\u escape without {{ in prompt literal");
+                        }
+                        let close = rest[i + 3..]
+                            .find('}')
+                            .ok_or_else(|| anyhow::anyhow!("unterminated \\u{{...}} escape"))?;
+                        let hex = &rest[i + 3..i + 3 + close];
+                        if hex.is_empty() || hex.len() > 6 {
+                            bail!("bad \\u{{...}} escape: \\u{{{hex}}}");
+                        }
+                        let ch = u32::from_str_radix(hex, 16)
+                            .ok()
+                            .and_then(char::from_u32)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("bad \\u{{...}} escape: \\u{{{hex}}}")
+                            })?;
+                        out.push(ch);
+                        i += 3 + close + 1;
+                        continue;
+                    }
                     Some(_) => {
                         // Line continuation: `\<newline>[whitespace]` —
                         // Rust strips the newline AND leading whitespace
