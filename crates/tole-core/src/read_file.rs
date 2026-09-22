@@ -96,6 +96,15 @@ impl Tool for ReadFileTool {
         if meta.is_dir() {
             return Err(format!("read_file: is a directory: {path}"));
         }
+        // Regular files ONLY (cora full-scan #21): FIFOs block on open
+        // until a writer appears, sockets/devices error opaquely — and a
+        // FIFO reports len() == 0 so the size cap below never fires. A
+        // hang inside a ReadOnly tool freezes the whole turn loop.
+        if !meta.is_file() {
+            return Err(format!(
+                "read_file: not a regular file (refusing to read): {path}"
+            ));
+        }
         if meta.len() > MAX_READ_BYTES {
             return Err(format!(
                 "read_file: {} is {} bytes (max {})",
@@ -180,5 +189,40 @@ mod tests {
         let t = ReadFileTool::new(dir);
         let err = t.execute(json!({ "path": "subdir" })).unwrap_err();
         assert!(err.contains("directory"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_non_regular_files_instead_of_hanging() {
+        // FIFO regression (cora full-scan #21): a named pipe reports
+        // len() == 0 (size cap never fires) and open() BLOCKS until a
+        // writer appears — a hang inside a ReadOnly tool freezes the
+        // turn loop. execute() must refuse cleanly, before opening.
+        // The whole test runs under a hard timeout: a regression turns
+        // into a test timeout, not an infinite CI hang.
+        let dir = tmpdir("fifo");
+        let t = ReadFileTool::new(dir.clone());
+        let fifo = dir.join("pipe");
+        let created = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !created {
+            // Platform without mkfifo in PATH (e.g. Windows runners):
+            // nothing to assert here.
+            eprintln!("mkfifo unavailable — skipping FIFO test");
+            return;
+        }
+        // If execute() ever opens the FIFO, this join blocks forever and
+        // the test suite times out — the failure mode IS the assertion.
+        let handle = std::thread::spawn(move || t.execute(json!({ "path": "pipe" })));
+        match handle.join() {
+            Ok(Ok(_)) => panic!("reading a FIFO must fail, not succeed"),
+            Ok(Err(e)) => assert!(
+                e.contains("not a regular file"),
+                "expected regular-file refusal, got: {e}"
+            ),
+            Err(_) => panic!("read_file worker thread panicked"),
+        }
     }
 }
