@@ -13,8 +13,10 @@ Usage:
 
 With --archive (issue #107), a REDACTED copy of each mission's session
 JSONL is kept under evals/traces/<model>/<mission>/ (secret-shaped
-tokens and host session paths scrubbed) for offline replay scoring:
-  cargo build -p tole-cli --bin tole-replay
+tokens and host session paths scrubbed) for offline replay scoring.
+The scorer bin is feature-gated (issue #118) — build it with:
+  cargo build -p tole-cli --features replay --bin tole-replay
+then:
   target/debug/tole-replay --traces evals/traces \
     --revised evals/replay/prompts/<candidate>.txt
 
