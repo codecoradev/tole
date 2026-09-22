@@ -1419,7 +1419,6 @@ mod default_prompt_tests {
     }
 
     #[test]
-    #[test]
     fn plan_mode_prompt_extends_the_incumbent_without_touching_it() {
         let plan = super::default_prompt_for(true);
         let base = super::default_system_prompt();
