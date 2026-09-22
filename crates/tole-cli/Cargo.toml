@@ -21,6 +21,11 @@ path = "src/main.rs"
 default = ["shell-tools", "mcp"]
 shell-tools = ["tole-core/shell-tools"]
 mcp = ["tole-core/mcp"]
+# Offline trace replay scorer (issue #107/#118): eval-only bin, NOT in
+# the default build. `cargo install tole-cli` and plain `cargo build`
+# never produce it; eval sessions opt in explicitly:
+#   cargo build -p tole-cli --features replay --bin tole-replay
+replay = []
 
 [dependencies]
 tole-core = { version = "0.3.0", path = "../tole-core" }
@@ -30,9 +35,11 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 libc = "0.2"
 
-# Offline trace replay scorer (issue #107). Lives under evals/ and is
-# operator-built for eval use — it is NOT part of the shipped tole
-# binary and not installed by `cargo install tole-cli`.
+# Offline trace replay scorer (issue #107, gated behind the `replay`
+# feature since #118). Lives under evals/ and is operator-built for
+# eval use — it is NOT part of the shipped tole binary and NOT built
+# by default; see the `replay` feature above.
 [[bin]]
 name = "tole-replay"
 path = "../../evals/replay/replay.rs"
+required-features = ["replay"]

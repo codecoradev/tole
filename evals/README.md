@@ -54,7 +54,7 @@ one completion call per (candidate, mission) is the whole cost.
 
 ```sh
 python3 evals/tier2/run.py --all --archive     # record (real provider)
-cargo build -p tole-cli --bin tole-replay      # operator-built scorer
+cargo build -p tole-cli --features replay --bin tole-replay
 target/debug/tole-replay --traces evals/traces \
   --revised evals/replay/prompts/my-candidate.txt [--model <id>] [--json]
 ```
