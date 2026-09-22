@@ -118,6 +118,17 @@ impl ToolRegistry {
         self.tools.get(name).map(|b| b.as_ref())
     }
 
+    /// Plan-mode filter (issue #109): drop every non-ReadOnly tool from
+    /// the registry. The guarantee is ABSENCE, not approval — filtered
+    /// tools never appear in `specs()`, so the model cannot even see
+    /// them on the wire. Irreversible by design: a registry filtered
+    /// this way cannot grow Write tools back (no re-register path).
+    /// Read-only in-place mutation of the registry is safe because
+    /// callers build registries fresh per session.
+    pub fn retain_read_only(&mut self) {
+        self.tools.retain(|_, t| t.risk() == Risk::ReadOnly);
+    }
+
     /// OpenAI-format `tools` array for every registered tool (E4.5).
     /// Sorted by name so the wire payload is deterministic — the same
     /// registry always serializes to the same request body.
@@ -160,5 +171,88 @@ impl ToolRegistry {
     /// True when an approver is wired in.
     pub fn has_approver(&self) -> bool {
         self.approver.is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::read_file::ReadFileTool;
+
+    struct FakeWrite;
+    struct FakeDestructive;
+
+    impl Tool for FakeWrite {
+        fn name(&self) -> &str {
+            "fake_write"
+        }
+        fn risk(&self) -> Risk {
+            Risk::Write
+        }
+        fn execute(&self, _: Value) -> Result<Value, String> {
+            Ok(json!({}))
+        }
+    }
+
+    impl Tool for FakeDestructive {
+        fn name(&self) -> &str {
+            "fake_destructive"
+        }
+        fn risk(&self) -> Risk {
+            Risk::Destructive
+        }
+        fn execute(&self, _: Value) -> Result<Value, String> {
+            Ok(json!({}))
+        }
+    }
+
+    /// Deny-all AND interactive: satisfies BOTH registration invariants
+    /// (Write needs an approver, Destructive needs an interactive one)
+    /// without granting anything.
+    struct DenyAllInteractive;
+
+    impl crate::approval::Approver for DenyAllInteractive {
+        fn decide(&self, _req: &crate::approval::ToolRequest<'_>) -> crate::approval::Verdict {
+            crate::approval::Verdict::Deny
+        }
+        fn interactive(&self) -> bool {
+            true
+        }
+    }
+
+    fn registry_with_all_risks() -> ToolRegistry {
+        // Write/Destructive registration REQUIRES an (interactive)
+        // approver — a deny-all one is enough for this test.
+        let mut reg = ToolRegistry::with_approver(DenyAllInteractive);
+        reg.register(Box::new(ReadFileTool::new(std::env::temp_dir())))
+            .unwrap();
+        reg.register(Box::new(FakeWrite)).unwrap();
+        reg.register(Box::new(FakeDestructive)).unwrap();
+        reg
+    }
+
+    #[test]
+    fn retain_read_only_keeps_only_readonly_tools() {
+        let mut reg = registry_with_all_risks();
+        assert_eq!(reg.specs().len(), 3);
+        reg.retain_read_only();
+        let names: Vec<String> = reg
+            .specs()
+            .iter()
+            .filter_map(|s| s["function"]["name"].as_str())
+            .map(str::to_string)
+            .collect();
+        assert_eq!(names, vec!["read_file".to_string()]);
+        assert!(reg.get("fake_write").is_none());
+        assert!(reg.get("fake_destructive").is_none());
+        assert!(reg.get("read_file").is_some());
+    }
+
+    #[test]
+    fn retain_read_only_is_idempotent() {
+        let mut reg = registry_with_all_risks();
+        reg.retain_read_only();
+        reg.retain_read_only();
+        assert_eq!(reg.specs().len(), 1);
     }
 }

@@ -82,6 +82,14 @@ struct Cli {
     #[arg(long, global = true)]
     memory: Option<String>,
 
+    /// Plan mode: expose ONLY read-only tools for the session — write/
+    /// delete/run tools are absent from the wire entirely (the model
+    /// cannot even see them). For explore-and-plan runs before granting
+    /// any mutation. The default system prompt gains a matching
+    /// read-only instruction; explicit --system overrides still win.
+    #[arg(long, global = true)]
+    plan_mode: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -199,6 +207,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         workspace: cli.workspace.clone(),
         #[cfg(feature = "mcp")]
         mcp_server: mcp_specs,
+        plan_mode: cli.plan_mode,
         #[cfg(feature = "shell-tools")]
         memory: resolve_memory(cli.memory.as_ref())?,
         #[cfg(not(feature = "shell-tools"))]
@@ -267,6 +276,8 @@ struct HostConfig {
     workspace: Option<String>,
     #[cfg(feature = "mcp")]
     mcp_server: Vec<String>,
+    /// Plan mode (issue #109): registry filtered to ReadOnly tools.
+    plan_mode: bool,
     #[cfg(feature = "shell-tools")]
     memory: Option<tole_core::memory::MemoryConfig>,
 }
@@ -675,13 +686,19 @@ fn run_command(
         .collect::<Result<Vec<_>, String>>()
         .map_err(anyhow::Error::msg)?;
     #[cfg(feature = "mcp")]
-    let registry = build_registry(
+    let mut registry = build_registry(
         build_approver(allow_patterns, yes),
         host.workspace.as_ref(),
         &mcp_cfgs,
     )?;
     #[cfg(not(feature = "mcp"))]
-    let registry = build_registry(build_approver(allow_patterns, yes), host.workspace.as_ref())?;
+    let mut registry =
+        build_registry(build_approver(allow_patterns, yes), host.workspace.as_ref())?;
+    // Plan mode (issue #109): the guarantee is ABSENCE on the wire, not
+    // approval — filtered tools never appear in specs().
+    if host.plan_mode {
+        registry.retain_read_only();
+    }
 
     let session_id = new_session_id();
     std::fs::create_dir_all(sessions_dir)
@@ -689,7 +706,7 @@ fn run_command(
     let system_prompt = system
         .map(str::to_string)
         .or_else(resolve_system_prompt)
-        .or_else(|| Some(default_system_prompt().to_string()));
+        .or_else(|| Some(default_prompt_for(host.plan_mode)));
     let mut storage =
         JsonlStorage::create_with(sessions_dir, &session_id, None, system_prompt.as_deref())
             .with_context(|| format!("creating session {session_id}"))?;
@@ -747,13 +764,19 @@ fn resume_command(
         .collect::<Result<Vec<_>, String>>()
         .map_err(anyhow::Error::msg)?;
     #[cfg(feature = "mcp")]
-    let registry = build_registry(
+    let mut registry = build_registry(
         build_approver(allow_patterns, yes),
         host.workspace.as_ref(),
         &mcp_cfgs,
     )?;
     #[cfg(not(feature = "mcp"))]
-    let registry = build_registry(build_approver(allow_patterns, yes), host.workspace.as_ref())?;
+    let mut registry =
+        build_registry(build_approver(allow_patterns, yes), host.workspace.as_ref())?;
+    // Plan mode (issue #109): the guarantee is ABSENCE on the wire, not
+    // approval — filtered tools never appear in specs().
+    if host.plan_mode {
+        registry.retain_read_only();
+    }
     let mut provider = OpenAiProvider::new(cfg).with_tool_specs(registry.specs());
     // B2: the system prompt is pinned in the session header — resume
     // re-applies exactly what the session was created with (never the
@@ -997,13 +1020,19 @@ fn chat_command(
         .collect::<Result<Vec<_>, String>>()
         .map_err(anyhow::Error::msg)?;
     #[cfg(feature = "mcp")]
-    let registry = build_registry(
+    let mut registry = build_registry(
         build_approver(allow_patterns, yes),
         host.workspace.as_ref(),
         &mcp_cfgs,
     )?;
     #[cfg(not(feature = "mcp"))]
-    let registry = build_registry(build_approver(allow_patterns, yes), host.workspace.as_ref())?;
+    let mut registry =
+        build_registry(build_approver(allow_patterns, yes), host.workspace.as_ref())?;
+    // Plan mode (issue #109): the guarantee is ABSENCE on the wire, not
+    // approval — filtered tools never appear in specs().
+    if host.plan_mode {
+        registry.retain_read_only();
+    }
 
     if fresh {
         std::fs::create_dir_all(sessions_dir)
@@ -1014,7 +1043,7 @@ fn chat_command(
         let system_prompt = system
             .map(str::to_string)
             .or_else(resolve_system_prompt)
-            .or_else(|| Some(default_system_prompt().to_string()));
+            .or_else(|| Some(default_prompt_for(host.plan_mode)));
         JsonlStorage::create_with(sessions_dir, &session_id, None, system_prompt.as_deref())
             .with_context(|| format!("creating session {session_id}"))?
     } else {
@@ -1213,6 +1242,23 @@ involving files, prefer the dedicated tools — read_file, write_file, \
 edit_file. Keep answers concise."
 }
 
+/// The default prompt for the session's mode (issue #109). Plan mode
+/// appends the read-only instruction to the SAME incumbent text — the
+/// identity/tool-discipline section is shared, so the non-plan default
+/// never drifts from what the replay scorer greps out of this file.
+fn default_prompt_for(plan_mode: bool) -> String {
+    let base = default_system_prompt();
+    if plan_mode {
+        format!(
+            "{base} PLAN MODE: only read-only tools exist in this \
+session; explore and produce a plan — mutation tools are absent \
+until the session is started without --plan-mode."
+        )
+    } else {
+        base.to_string()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Reporting
 // ---------------------------------------------------------------------------
@@ -1337,6 +1383,19 @@ mod default_prompt_tests {
     fn default_prompt_is_short() {
         // Prompt discipline: a few lines, not a constitution.
         assert!(super::default_system_prompt().chars().count() < 600);
+    }
+
+    #[test]
+    fn plan_mode_prompt_extends_the_incumbent_without_touching_it() {
+        let plan = super::default_prompt_for(true);
+        let base = super::default_system_prompt();
+        // The incumbent text is untouched and still the prefix...
+        assert!(plan.starts_with(base));
+        // ...with the read-only instruction appended.
+        assert!(plan.contains("PLAN MODE"));
+        assert!(plan.contains("read-only"));
+        // Non-plan default is byte-identical to the incumbent fn.
+        assert_eq!(super::default_prompt_for(false), base);
     }
 }
 
