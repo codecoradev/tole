@@ -32,9 +32,11 @@ use rmcp::ErrorData as McpError;
 use rmcp::{RoleServer, ServiceExt};
 use std::sync::Arc;
 
-/// An MCP server view of a [`ToolRegistry`].
+/// An MCP server view of a [`ToolRegistry`]. Cloneable (Arc-shared
+/// registry) so `call_tool` can move a handle into `spawn_blocking`.
+#[derive(Clone)]
 pub struct RegistryServer {
-    registry: ToolRegistry,
+    registry: std::sync::Arc<ToolRegistry>,
 }
 
 impl RegistryServer {
@@ -44,7 +46,9 @@ impl RegistryServer {
     /// would try to read the protocol's stdin. Destructive tools are then
     /// refused at registration and structurally absent from the server.
     pub fn new(registry: ToolRegistry) -> Self {
-        Self { registry }
+        Self {
+            registry: std::sync::Arc::new(registry),
+        }
     }
 
     fn registered_names(&self) -> Vec<String> {
@@ -138,7 +142,16 @@ impl ServerHandler for RegistryServer {
     ) -> Result<CallToolResponse, McpError> {
         let name = request.name.to_string();
         let args = serde_json::Value::Object(request.arguments.unwrap_or_default());
-        match self.execute_checked(&name, args) {
+        // Tool execution is SYNCHRONOUS and can block for a long time
+        // (git runs with a 120s budget; run_command 420s). It must run
+        // on a blocking thread, not pin the async runtime's workers
+        // (cora full-scan #29): one slow tool call would stall every
+        // other request this runtime is serving.
+        let server = self.clone();
+        let executed = tokio::task::spawn_blocking(move || server.execute_checked(&name, args))
+            .await
+            .map_err(|e| McpError::internal_error(format!("tool task join failed: {e}"), None))?;
+        match executed {
             Ok(result) => Ok(CallToolResult::success(vec![ContentBlock::text(
                 serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string()),
             )])
