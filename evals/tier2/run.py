@@ -8,23 +8,110 @@ Usage:
   python3 evals/tier2/run.py --all
   python3 evals/tier2/run.py --mission read_and_report
   python3 evals/tier2/run.py --all --out results.json
+  python3 evals/tier2/run.py --all --archive          # + trace archive
+  TOLE_EVAL_BINARY=/path/to/tole python3 evals/tier2/run.py --all
+
+With --archive (issue #107), a REDACTED copy of each mission's session
+JSONL is kept under evals/traces/<model>/<mission>/ (secret-shaped
+tokens and host session paths scrubbed) for offline replay scoring:
+  cargo build -p tole-cli --bin tole-replay
+  target/debug/tole-replay --traces evals/traces \
+    --revised evals/replay/prompts/<candidate>.txt
+
+The incumbent (shipped default prompt) is always evaluated in the same
+run — extracted from the CLI source, never from a copy that can drift.
 """
 
 import argparse
 import json
+import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 REPO = Path(__file__).resolve().parents[2]
-BINARY = REPO / "target/release/tole"
+# Binary override for eval sessions on shared hosts (issue #107): point
+# TOLE_EVAL_BINARY at the freshly built release binary instead of
+# whichever stale target/release happens to exist.
+BINARY = Path(os.environ.get("TOLE_EVAL_BINARY", str(REPO / "target/release/tole")))
 RESULTS_DEFAULT = Path(__file__).parent / "results.json"
+# Trace archive root for --archive (Tier 2.5 replay, issue #107).
+ARCHIVE_DEFAULT = REPO / "evals" / "traces"
 TIMEOUT_SECS = 300
+
+# Secret-shaped tokens must never reach the archive. Per-family shapes,
+# length-guarded so prose ("sketching", "risk-management") cannot match:
+# provider/API keys (sk-…, rk-…), GitHub tokens (ghp_/gho_/github_pat_),
+# Slack (xoxb-/xoxp-), Google (AIza…).
+_SECRET_SHAPED = re.compile(
+    r"\b(?:sk|rk)-[A-Za-z0-9_\-]{12,}"
+    r"|ghp_[A-Za-z0-9]{20,}"
+    r"|gho_[A-Za-z0-9]{20,}"
+    r"|github_pat_[A-Za-z0-9_]{20,}"
+    r"|xox[bp]-[A-Za-z0-9\-]{10,}"
+    r"|AIza[0-9A-Za-z_\-]{20,}"
+)
+
+
+def resolved_model() -> Optional[str]:
+    """The model this run uses (same resolution order as tole: TOLE_* then
+    OPENAI_*). Recorded into results.json so Tier-3 diffs are honest
+    about what they compare (diff.py documents the operator-trust gap)."""
+    for prefix in ("TOLE", "OPENAI"):
+        v = os.environ.get(f"{prefix}_MODEL", "").strip()
+        if v:
+            return v
+    return None
+
+
+def redact_line(line: str, host_paths: list[str]) -> str:
+    # Keep only the token FAMILY (sk-, ghp_, github_pat_, …) so the
+    # archive is still greppable by shape — the secret material itself is
+    # fully dropped, never partially kept.
+    def stub(m: "re.Match[str]") -> str:
+        tok = m.group(0)
+        fam = re.match(r"sk-|rk-|ghp_|gho_|github_pat_|xox[bp]-|AIza", tok)
+        return (fam.group(0) if fam else "") + "***REDACTED***"
+
+    out = _SECRET_SHAPED.sub(stub, line)
+    for p in host_paths:
+        if p:
+            out = out.replace(p, "<HOSTPATH>")
+    return out
+
+
+def archive_trace(
+    sessions_dir: Path, mission: str, archive_root: Path, model: Optional[str]
+) -> Optional[Path]:
+    """Copy the (redacted) session JSONL into
+    archive_root/<model>/<mission>/ + write meta.json. Returns the copy
+    path, or None when the run produced no session file."""
+    log = session_file(sessions_dir)
+    if log is None:
+        return None
+    dest_dir = archive_root / (model or "unknown-model") / mission
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    host_paths = [str(sessions_dir)]
+    dest = dest_dir / log.name
+    lines = []
+    for raw in log.read_text().splitlines():
+        lines.append(redact_line(raw, host_paths) if raw.strip() else raw)
+    dest.write_text("\n".join(lines) + ("\n" if lines else ""))
+    meta = {
+        "mission": mission,
+        "model": model,
+        "session": log.name,
+        "recorded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "source": "evals/tier2/run.py --archive (issue #107)",
+    }
+    (dest_dir / f"{log.stem}.meta.json").write_text(json.dumps(meta, indent=1) + "\n")
+    return dest
 
 # Mission spec: name -> (prompt, judgefn(out: dict) -> (ok, detail))
 # `out` fields: text (final answer), stdout, session (durable log parsed)
@@ -96,7 +183,12 @@ def durable_metrics(log: Path) -> dict:
     }
 
 
-def run_mission(name: str, workspace: Path) -> dict:
+def run_mission(
+    name: str,
+    workspace: Path,
+    archive_root: Optional[Path] = None,
+    model: Optional[str] = None,
+) -> dict:
     sessions = Path(tempfile.mkdtemp(prefix=f"tole-eval-{name}-"))
     started = time.time()
 
@@ -162,6 +254,12 @@ def run_mission(name: str, workspace: Path) -> dict:
     ok, detail = MISSIONS[name]({**out, "sessions": sessions_count})
     out["success"] = ok
     out["detail"] = detail
+    out["model"] = model
+    # Tier 2.5 (issue #107): before deleting the session dir, archive a
+    # REDACTED copy for offline trace replay (evals/replay/).
+    if archive_root is not None:
+        archived = archive_trace(sessions, name, archive_root, model)
+        out["archived_trace"] = str(archived) if archived else None
     # Clean the per-mission session dir (CodeCora scan 2026-09-18:
     # mkdtemp dirs were never removed).
     shutil.rmtree(sessions, ignore_errors=True)
@@ -173,6 +271,15 @@ def main() -> int:
     ap.add_argument("--mission", choices=sorted(MISSIONS))
     ap.add_argument("--all", action="store_true")
     ap.add_argument("--out", default=str(RESULTS_DEFAULT))
+    ap.add_argument(
+        "--archive",
+        nargs="?",
+        const=str(ARCHIVE_DEFAULT),
+        default=None,
+        metavar="DIR",
+        help="archive a redacted copy of each mission trace to "
+        "DIR/<model>/<mission>/ for offline replay (default: evals/traces)",
+    )
     ns = ap.parse_args()
     if not ns.all and not ns.mission:
         ap.error("pick --all or --mission")
@@ -180,15 +287,20 @@ def main() -> int:
     if not BINARY.exists():
         raise SystemExit(f"release binary missing: {BINARY} — build it first")
 
+    model = resolved_model()
+    archive_root = Path(ns.archive) if ns.archive else None
     names = sorted(MISSIONS) if ns.all else [ns.mission]
     results = {
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "model": model,
         "missions": [],
     }
     for name in names:
         with tempfile.TemporaryDirectory(prefix="tole-eval-ws-") as ws:
             print(f"=== {name} ===", flush=True)
-            results["missions"].append(run_mission(name, Path(ws)))
+            results["missions"].append(
+                run_mission(name, Path(ws), archive_root, model)
+            )
 
     out_path = Path(ns.out)
     out_path.write_text(json.dumps(results, indent=1))

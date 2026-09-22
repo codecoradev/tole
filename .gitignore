@@ -12,3 +12,6 @@ mission-data.txt
 # python bytecode (evals tier2)
 __pycache__/
 *.pyc
+
+# Tier-2 runner transient output (baseline copies live in evals/baselines/)
+/evals/tier2/results.json

@@ -29,3 +29,10 @@ serde_json = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 libc = "0.2"
+
+# Offline trace replay scorer (issue #107). Lives under evals/ and is
+# operator-built for eval use — it is NOT part of the shipped tole
+# binary and not installed by `cargo install tole-cli`.
+[[bin]]
+name = "tole-replay"
+path = "../../evals/replay/replay.rs"
