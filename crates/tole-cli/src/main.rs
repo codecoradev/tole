@@ -11,6 +11,8 @@ use tole_core::approval::AllowlistApprover;
 #[cfg(feature = "shell-tools")]
 mod acp;
 #[cfg(feature = "shell-tools")]
+mod serve;
+#[cfg(feature = "shell-tools")]
 use tole_core::cora_search::CoraSearchTool;
 use tole_core::file_tools::{DeleteFileTool, EditFileTool};
 #[cfg(feature = "shell-tools")]
@@ -206,6 +208,36 @@ enum Command {
         #[arg(long)]
         memory: Option<String>,
     },
+    /// Serve tole over HTTP (issue #96): token-authenticated daemon with
+    /// REST session endpoints. Binds 127.0.0.1 by default.
+    #[cfg(feature = "shell-tools")]
+    Serve {
+        /// TCP port to listen on.
+        #[arg(long, default_value_t = 7801)]
+        port: u16,
+
+        /// Bind address (default: 127.0.0.1 — local only).
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: String,
+
+        /// Bearer token required on every request (or TOLE_SERVE_TOKEN
+        /// env). Refuses to start without one.
+        #[arg(long)]
+        token: Option<String>,
+
+        /// Same semantics as `run --allow` (Write pre-authorization).
+        #[arg(long = "allow")]
+        allow_patterns: Vec<String>,
+
+        /// Root directory for the file tools (same as run).
+        #[arg(long)]
+        workspace: Option<String>,
+
+        /// Memory loop backend (`uteke`) — same as `--memory uteke` on
+        /// run/chat. Falls back to the TOLE_MEMORY env.
+        #[arg(long)]
+        memory: Option<String>,
+    },
     /// Interactive multi-turn chat on one durable session.
     Chat {
         /// System prompt for a fresh session (ignored when resuming —
@@ -341,6 +373,26 @@ fn dispatch(cli: Cli) -> Result<()> {
                 host.plan_mode,
                 memory,
             )
+        }
+        #[cfg(feature = "shell-tools")]
+        Command::Serve {
+            port,
+            bind,
+            token,
+            allow_patterns,
+            workspace,
+            memory,
+        } => {
+            let memory = resolve_memory(memory.as_ref())?;
+            crate::serve::run_serve(crate::serve::ServeConfig {
+                bind,
+                port,
+                token,
+                allow_patterns,
+                workspace,
+                plan_mode: host.plan_mode,
+                memory,
+            })
         }
         Command::Sessions => sessions_command(&sessions_dir),
         Command::Status { id } => status_command(&sessions_dir, &id),
@@ -573,31 +625,6 @@ pub fn resolve_workspace_root(explicit: Option<&String>) -> Result<PathBuf> {
     }
 }
 
-/// Best-effort `owner/name` from a git remote URL, for gh tool
-/// targeting (CodeCora dogfood finding 2026-09-18: a hardcoded repo
-/// made `gh` target the wrong project outside this checkout).
-fn github_repo_from_remote_url(url: &str) -> Option<String> {
-    let url = url.trim().trim_end_matches('/');
-    let url = url.strip_suffix(".git").unwrap_or(url);
-    let idx = url.to_ascii_lowercase().find("github.com")?;
-    let rest = &url[idx + "github.com".len()..];
-    let rest = rest.trim_start_matches(['/', ':']);
-    let mut parts = rest.split('/');
-    let owner = parts.next()?;
-    let name = parts.next()?;
-    let valid = |s: &str| {
-        !s.is_empty()
-            && !s.starts_with('-')
-            && s.chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-    };
-    if valid(owner) && valid(name) {
-        Some(format!("{owner}/{name}"))
-    } else {
-        None
-    }
-}
-
 /// Ask the checkout itself which GitHub repo it belongs to ( Falls back
 /// to None → callers keep the tole default).
 #[cfg(feature = "shell-tools")]
@@ -611,7 +638,7 @@ fn detect_github_repo(cwd: &Path) -> Option<String> {
     if !out.status.success() {
         return None;
     }
-    github_repo_from_remote_url(&String::from_utf8_lossy(&out.stdout))
+    tole_cli::session_host::github_repo_from_remote_url(&String::from_utf8_lossy(&out.stdout))
 }
 
 fn build_registry(
@@ -1529,29 +1556,44 @@ mod gh_repo_tests {
     #[test]
     fn parses_https_ssh_and_git_suffix() {
         assert_eq!(
-            github_repo_from_remote_url("https://github.com/foo/bar.git").as_deref(),
+            tole_cli::session_host::github_repo_from_remote_url("https://github.com/foo/bar.git")
+                .as_deref(),
             Some("foo/bar")
         );
         assert_eq!(
-            github_repo_from_remote_url("https://github.com/foo/bar").as_deref(),
+            tole_cli::session_host::github_repo_from_remote_url("https://github.com/foo/bar")
+                .as_deref(),
             Some("foo/bar")
         );
         assert_eq!(
-            github_repo_from_remote_url("git@github.com:foo/bar.git").as_deref(),
+            tole_cli::session_host::github_repo_from_remote_url("git@github.com:foo/bar.git")
+                .as_deref(),
             Some("foo/bar")
         );
         assert_eq!(
-            github_repo_from_remote_url("https://user:token@github.com/Foo/Bar.git").as_deref(),
+            tole_cli::session_host::github_repo_from_remote_url(
+                "https://user:token@github.com/Foo/Bar.git"
+            )
+            .as_deref(),
             Some("Foo/Bar")
         );
     }
 
     #[test]
     fn rejects_non_github_and_garbage() {
-        assert!(github_repo_from_remote_url("https://gitlab.com/foo/bar.git").is_none());
-        assert!(github_repo_from_remote_url("https://github.com/only-owner").is_none());
-        assert!(github_repo_from_remote_url("not a url").is_none());
-        assert!(github_repo_from_remote_url("https://github.com/-bad/name").is_none());
+        assert!(tole_cli::session_host::github_repo_from_remote_url(
+            "https://gitlab.com/foo/bar.git"
+        )
+        .is_none());
+        assert!(tole_cli::session_host::github_repo_from_remote_url(
+            "https://github.com/only-owner"
+        )
+        .is_none());
+        assert!(tole_cli::session_host::github_repo_from_remote_url("not a url").is_none());
+        assert!(tole_cli::session_host::github_repo_from_remote_url(
+            "https://github.com/-bad/name"
+        )
+        .is_none());
     }
 
     #[test]

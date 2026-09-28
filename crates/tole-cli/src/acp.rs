@@ -2,7 +2,7 @@
 //!
 //! Editors and ACP-capable clients (Zed et al.) launch `tole acp` and
 //! drive a durable tole session over line-delimited JSON-RPC on
-//! stdio/stderr:
+//! stdin/stderr:
 //!
 //! - `initialize` → protocol + capability handshake
 //! - `session/new` / `session/load` → a durable JSONL session (workspace
@@ -20,18 +20,22 @@
 //! Wire hygiene: protocol messages go to stdout; all diagnostics go to
 //! stderr. No new dependencies — the JSON-RPC framing is hand-rolled
 //! line-delimited JSON (serde_json only).
+//!
+//! The session machinery lives in [`tole_cli::session_host`] — one
+//! implementation shared with `tole serve`.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
-use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tole_cli::approver::{InteractiveApprover, PromptFn};
-use tole_cli::tools::WriteFileTool;
+use tole_cli::session_host::{
+    lock_sessions, new_session_id, open_session, run_session_turn, validate_session_id, Sessions,
+};
 
 const ACP_PROTOCOL_VERSION: u32 = 1;
 /// Permission requests can sit in an editor until a human clicks; do not
@@ -63,7 +67,7 @@ impl Conn {
 
     fn send_line(&self, line: &str) {
         if self.tx.send(format!("{line}\n")).is_err() {
-            // Client is gone; the pending waits below will time out and
+            // Client is gone; the pending wait below will time out and
             // the session loop winds down on EOF anyway.
         }
     }
@@ -74,7 +78,8 @@ impl Conn {
     }
 
     /// Agent-initiated request (permission): returns the client's result
-    /// object, or an error-shaped object on timeout/cancel.
+    /// object. Client cancellations/errors arrive as the error variant of
+    /// the routed reply and fail closed (deny).
     fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
         let id = {
             let mut n = self.next_id.lock().expect("id lock");
@@ -97,8 +102,21 @@ impl Conn {
     }
 
     /// Reader-side routing: a response line completes a pending agent
-    /// request.
-    fn route_response(&self, id: u64, result: Value) {
+    /// request. Client ERROR replies route too — an errored permission
+    /// must fail closed immediately, not hang for the full timeout
+    /// (CodeCora scan 2026-09-28).
+    fn route_reply(&self, id: u64, msg: &Value) {
+        if let Some(result) = msg.get("result").cloned() {
+            self.route(id, result);
+        } else if let Some(err) = msg.get("error").cloned() {
+            self.route(
+                id,
+                json!({"outcome": {"outcome": "cancelled"}, "error": err}),
+            );
+        }
+    }
+
+    fn route(&self, id: u64, result: Value) {
         if let Some(tx) = self.pending.lock().expect("pending lock").remove(&id) {
             let _ = tx.send(result);
         }
@@ -191,43 +209,6 @@ impl PromptFn for AcpPrompt {
 }
 
 // ---------------------------------------------------------------------------
-// Session state
-// ---------------------------------------------------------------------------
-
-struct SessionState {
-    // Per-session storage lock: a turn holds THIS (not the session-map
-    // lock), so the reader loop stays live for permission routing while
-    // a prompt runs (CodeCora scan deadlock finding).
-    storage: StdArc<Mutex<tole_core::storage::JsonlStorage>>,
-    registry: StdArc<tole_core::tool::ToolRegistry>,
-    system_prompt: Option<String>,
-    memory: Option<tole_core::memory::MemoryConfig>,
-    first_prompt_done: StdArc<Mutex<bool>>,
-    busy: StdArc<Mutex<bool>>,
-}
-
-/// Marks a session busy for its whole lifetime; Drop un-marks even on
-/// panic, so one failed turn cannot brick the session.
-struct BusyGuard(StdArc<Mutex<bool>>);
-impl Drop for BusyGuard {
-    fn drop(&mut self) {
-        *self.0.lock().expect("busy lock") = false;
-    }
-}
-
-struct Sessions {
-    map: HashMap<String, SessionState>,
-}
-
-impl Sessions {
-    fn new() -> Self {
-        Self {
-            map: HashMap::new(),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // ACP server loop
 // ---------------------------------------------------------------------------
 
@@ -256,11 +237,11 @@ pub fn run_acp(
     });
 
     // The session map lives for the WHOLE server lifetime and is shared
-    // with prompt threads (Arc clone per prompt). Holding the map lock
-    // for the duration of a turn also serializes access to one session's
-    // storage — session/load of a busy id simply waits its turn instead
-    // of opening a divergent second handle.
-    let sessions: SharedSessions = StdArc::new(Mutex::new(Sessions::new()));
+    // with prompt threads (Arc clone per prompt). A turn holds only its
+    // own per-session storage lock, so this reader loop stays live for
+    // permission routing while prompts run.
+    let sessions: tole_cli::session_host::SharedSessions =
+        Arc::new(Mutex::new(Sessions::default()));
     let stdin = std::io::stdin();
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
@@ -281,14 +262,7 @@ pub fn run_acp(
             // fail closed immediately, not hang for the full timeout
             // (CodeCora scan 2026-09-28).
             if let Some(id) = msg.get("id").and_then(Value::as_u64) {
-                if let Some(result) = msg.get("result").cloned() {
-                    conn.route_response(id, result);
-                } else if let Some(err) = msg.get("error").cloned() {
-                    conn.route_response(
-                        id,
-                        json!({"outcome": {"outcome": "cancelled"}, "error": err}),
-                    );
-                }
+                conn.route_reply(id, &msg);
             }
             continue;
         };
@@ -318,10 +292,10 @@ pub fn run_acp(
                     .to_string();
                 let session_id = match params.get("sessionId").and_then(Value::as_str) {
                     Some(id) => validate_session_id(id),
-                    None => Some(new_session_id()),
+                    None => Some(new_session_id("acp")),
                 };
                 let Some(session_id) = session_id else {
-                    reply_error(&conn, id, "session/load: invalid sessionId");
+                    reply_error(&conn, id, "session: invalid sessionId");
                     continue;
                 };
                 // A turn holds its session's storage lock and marks it
@@ -339,15 +313,20 @@ pub fn run_acp(
                     reply_error(&conn, id, "session is busy running a turn");
                     continue;
                 }
+                let approver = InteractiveApprover::new(AcpPrompt {
+                    conn: conn.clone(),
+                    session_id: session_id.clone(),
+                    counter: Arc::new(Mutex::new(0)),
+                })
+                .with_allow_patterns(allow_patterns.to_vec())
+                .with_auto_write(auto_write);
                 match open_session(
                     &session_id,
                     &cwd,
                     loading,
-                    allow_patterns,
-                    auto_write,
                     plan_mode,
+                    approver,
                     memory.clone(),
-                    conn.clone(),
                 ) {
                     Ok(state) => {
                         // Insert + busy re-check in ONE critical section:
@@ -370,7 +349,7 @@ pub fn run_acp(
                         sessions.map.insert(session_id.clone(), state);
                         reply(&conn, id, json!({ "sessionId": session_id }));
                     }
-                    Err(e) => reply_error(&conn, id, &e.to_string()),
+                    Err(e) => reply_error(&conn, id, &e),
                 }
             }
             "session/prompt" => {
@@ -378,13 +357,8 @@ pub fn run_acp(
                     .get("sessionId")
                     .and_then(Value::as_str)
                     .map(str::to_string)
-                    .map(|id| validate_session_id(&id))
                 else {
                     reply_error(&conn, id, "session/prompt: missing sessionId");
-                    continue;
-                };
-                let Some(session_id) = session_id else {
-                    reply_error(&conn, id, "session/prompt: invalid sessionId");
                     continue;
                 };
                 // ACP sends `prompt` as an array of content blocks; a
@@ -401,19 +375,28 @@ pub fn run_acp(
                         continue;
                     }
                 };
-                // Response is delivered from the turn thread (result or
-                // error) so this reader loop stays live for permission
-                // requests while the turn runs.
+                // The turn runs on its own thread; this reader loop stays
+                // live for permission routing while it runs.
                 let conn = conn.clone();
                 let sessions = sessions.clone();
-                let prompt_clone = prompt_text;
                 let session_id_clone = session_id.clone();
                 std::thread::spawn(move || {
-                    let result =
-                        run_prompt(sessions, &session_id_clone, &prompt_clone, conn.clone());
-                    match result {
-                        Ok(stop) => reply(&conn, id, json!({ "stopReason": stop })),
-                        Err(e) => reply_error(&conn, id, &e.to_string()),
+                    match run_session_turn(sessions, &session_id_clone, &prompt_text) {
+                        Ok((stop, Some(text))) => {
+                            conn.send_notification(
+                                "session/update",
+                                json!({
+                                    "sessionId": session_id_clone,
+                                    "update": {
+                                        "sessionUpdate": "agent_message_chunk",
+                                        "content": {"type": "text", "text": text},
+                                    }
+                                }),
+                            );
+                            reply(&conn, id, json!({ "stopReason": stop }));
+                        }
+                        Ok((stop, None)) => reply(&conn, id, json!({ "stopReason": stop })),
+                        Err(e) => reply_error(&conn, id, &e),
                     }
                 });
             }
@@ -427,17 +410,6 @@ pub fn run_acp(
     Ok(())
 }
 
-use std::sync::Arc as StdArc;
-type SharedSessions = StdArc<Mutex<Sessions>>;
-
-/// Poisoning-tolerant lock: one panicking turn must not brick the whole
-/// ACP server (CodeCora scan finding — mutex poisoning).
-fn lock_sessions(sessions: &SharedSessions) -> std::sync::MutexGuard<'_, Sessions> {
-    sessions
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
 fn reply(conn: &Conn, id: Option<Value>, result: Value) {
     let Some(id) = id else { return };
     conn.send_line(&json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string());
@@ -449,302 +421,4 @@ fn reply_error(conn: &Conn, id: Option<Value>, message: &str) {
         &json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32603, "message": message}})
             .to_string(),
     );
-}
-
-/// ACP session ids are tole session ids: reject path separators,
-/// parent refs, and anything outside the tole charset before the id ever
-/// touches a path (CodeCora scan finding: `../` or absolute ids would
-/// escape the sessions dir via Path::join).
-fn validate_session_id(id: &str) -> Option<String> {
-    let ok = !id.is_empty()
-        && id.len() <= 64
-        && !id.contains('/')
-        && !id.contains('\\')
-        && !id.contains("..")
-        && id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'));
-    if ok {
-        Some(id.to_string())
-    } else {
-        None
-    }
-}
-
-fn new_session_id() -> String {
-    let ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    format!("acp-{ms:x}-{:x}", std::process::id())
-}
-
-/// Create/open a session: workspace jail = the client's cwd; approval =
-/// the ACP editor (interactive — which is what unlocks Destructive tools
-/// with genuine human consent).
-#[allow(clippy::too_many_arguments)]
-fn open_session(
-    session_id: &str,
-    cwd: &str,
-    loading: bool,
-    allow_patterns: &[String],
-    auto_write: bool,
-    plan_mode: bool,
-    memory: Option<tole_core::memory::MemoryConfig>,
-    conn: Conn,
-) -> Result<SessionState> {
-    let workspace = PathBuf::from(cwd);
-    let workspace_canon = workspace
-        .canonicalize()
-        .with_context(|| format!("session workspace {}: {cwd}", workspace.display()))?;
-    let system_prompt = std::env::var("TOLE_SYSTEM_PROMPT")
-        .ok()
-        .filter(|s| !s.trim().is_empty());
-
-    let mut reg = tole_core::tool::ToolRegistry::with_approver(
-        InteractiveApprover::new(AcpPrompt {
-            conn,
-            session_id: session_id.to_string(),
-            counter: Arc::new(Mutex::new(0)),
-        })
-        .with_allow_patterns(allow_patterns.to_vec())
-        .with_auto_write(auto_write),
-    );
-    use tole_core::cora_search::CoraSearchTool;
-    use tole_core::file_tools::{DeleteFileTool, EditFileTool};
-    use tole_core::gh::GhTool;
-    use tole_core::git::GitTool;
-    use tole_core::jobs::{JobPollTool, JobStartTool};
-    use tole_core::read_file::ReadFileTool;
-    use tole_core::run_command::RunCommandTool;
-    use tole_core::uteke::{UtekeDocumentTool, UtekeRecallTool};
-    if tole_cli_binary_available("cora") {
-        reg.register(Box::new(CoraSearchTool::new()))
-            .map_err(anyhow::Error::msg)?;
-    }
-    if tole_cli_binary_available("uteke") {
-        reg.register(Box::new(UtekeRecallTool::new()))
-            .map_err(anyhow::Error::msg)?;
-        if !plan_mode {
-            reg.register(Box::new(UtekeDocumentTool::new(None)))
-                .map_err(anyhow::Error::msg)?;
-        }
-    }
-    // Write-tier tools: skipped entirely under --plan-mode (read-only
-    // sessions — the model cannot even attempt a write). The earlier
-    // draft registered everything and "filtered" afterwards, which
-    // CodeCora rightly called out: the full registry under --yes broke
-    // the read-only contract.
-    if !plan_mode {
-        reg.register(Box::new(RunCommandTool::new(workspace_canon.clone())))
-            .map_err(anyhow::Error::msg)?;
-        reg.register(Box::new(JobStartTool::new(workspace_canon.clone())))
-            .map_err(anyhow::Error::msg)?;
-        reg.register(Box::new(WriteFileTool::new(workspace_canon.clone())))
-            .map_err(anyhow::Error::msg)?;
-        reg.register(Box::new(EditFileTool::new(workspace_canon.clone())))
-            .map_err(anyhow::Error::msg)?;
-        {
-            let repo =
-                detect_github_repo(&workspace_canon).unwrap_or_else(|| "codecoradev/tole".into());
-            reg.register(Box::new(GhTool::new(repo)))
-                .map_err(anyhow::Error::msg)?;
-        }
-        reg.register(Box::new(GitTool::new().in_dir(workspace_canon.clone())))
-            .map_err(anyhow::Error::msg)?;
-        // delete_file IS registered here: the ACP editor prompt is an
-        // interactive approver, so a Destructive tool carries genuine
-        // human consent — the same rule as the CLI, not an exception.
-        reg.register(Box::new(DeleteFileTool::new(workspace_canon.clone())))
-            .map_err(anyhow::Error::msg)?;
-    }
-    reg.register(Box::new(JobPollTool::new(workspace_canon.clone())))
-        .map_err(anyhow::Error::msg)?;
-    reg.register(Box::new(ReadFileTool::new(workspace_canon.clone())))
-        .map_err(anyhow::Error::msg)?;
-
-    let storage = if loading {
-        let dir = sessions_dir_for(cwd)?;
-        tole_core::storage::JsonlStorage::open(dir.join(format!("{session_id}.jsonl")))
-            .context("loading session")?
-    } else {
-        let dir = sessions_dir_for(cwd)?;
-        std::fs::create_dir_all(&dir)?;
-        tole_core::storage::JsonlStorage::create_with(
-            &dir,
-            session_id,
-            None,
-            system_prompt.as_deref(),
-        )
-        .context("creating session")?
-    };
-    // --plan-mode: read-only sessions — Write/Destructive tools are not
-    // registered at all, so the model cannot even attempt them.
-    if plan_mode {
-        eprintln!("tole acp: --plan-mode is active — serving read-only tools only");
-        return Ok(SessionState {
-            storage: StdArc::new(Mutex::new(storage)),
-            registry: StdArc::new(reg),
-            system_prompt,
-            memory,
-            first_prompt_done: StdArc::new(Mutex::new(loading)),
-            busy: StdArc::new(Mutex::new(false)),
-        });
-    }
-    Ok(SessionState {
-        storage: StdArc::new(Mutex::new(storage)),
-        registry: StdArc::new(reg),
-        system_prompt,
-        memory,
-        first_prompt_done: StdArc::new(Mutex::new(loading)),
-        busy: StdArc::new(Mutex::new(false)),
-    })
-}
-
-fn sessions_dir_for(cwd: &str) -> Result<PathBuf> {
-    let dir = PathBuf::from(cwd).join(".tole/sessions");
-    std::fs::create_dir_all(&dir)?;
-    Ok(dir)
-}
-
-fn tole_cli_binary_available(name: &str) -> bool {
-    if name.contains('/') {
-        return std::path::Path::new(name).is_file();
-    }
-    if let Ok(path) = std::env::var("PATH") {
-        for dir in std::env::split_paths(&path) {
-            if dir.join(name).is_file() {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-fn detect_github_repo(cwd: &PathBuf) -> Option<String> {
-    let mut cmd = std::process::Command::new("git");
-    cmd.args(["config", "--get", "remote.origin.url"])
-        .current_dir(cwd);
-    let out = tole_core::subprocess::run_with_timeout(&mut cmd, std::time::Duration::from_secs(5))
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    crate::github_repo_from_remote_url(&String::from_utf8_lossy(&out.stdout))
-}
-
-/// One ACP prompt = one full tole turn. Returns the stop reason.
-fn run_prompt(
-    sessions: SharedSessions,
-    session_id: &str,
-    prompt: &str,
-    conn: Conn,
-) -> Result<String> {
-    // Brief map lock: take the session's handles and reject a busy
-    // session. The MAP lock is released here — a running turn holds only
-    // its OWN storage lock, so the reader loop stays live for permission
-    // routing (CodeCora deadlock finding).
-    let (storage, registry, memory, system_prompt, first_prompt_done, busy_guard) = {
-        let mut sessions = lock_sessions(&sessions);
-        let Some(state) = sessions.map.get_mut(session_id) else {
-            anyhow::bail!("unknown session: {session_id}");
-        };
-        {
-            let mut busy = state.busy.lock().expect("busy lock");
-            if *busy {
-                anyhow::bail!("session is busy running a turn");
-            }
-            *busy = true;
-        }
-        (
-            state.storage.clone(),
-            state.registry.clone(),
-            state.memory.clone(),
-            state.system_prompt.clone(),
-            state.first_prompt_done.clone(),
-            std::sync::Arc::clone(&state.busy),
-        )
-    };
-    // Panic-safe un-busy: Drop clears the flag even if the turn unwinds.
-    let _busy_guard = BusyGuard(busy_guard);
-
-    // Memory loop, pre-turn (first prompt of a fresh session only).
-    let mut effective = prompt.to_string();
-    #[cfg(feature = "shell-tools")]
-    {
-        let done = *first_prompt_done.lock().expect("fpd lock");
-        if !done {
-            if let Some(mem) = &memory {
-                if let Ok(block) = tole_core::memory::recall_block(mem, prompt) {
-                    if !block.is_empty() {
-                        eprintln!("tole acp: memory: recalled context injected");
-                        effective = format!("{prompt}{block}");
-                    }
-                }
-            }
-        }
-    }
-
-    // Provider: built per turn (cheap), so a session can be created
-    // without provider env and only fail when a turn is actually run.
-    let cfg = tole_core::openai::OpenAiConfig::from_env().context(
-        "missing provider config: set TOLE_BASE_URL / TOLE_MODEL / TOLE_API_KEY \
-         (or the OPENAI_* equivalents)",
-    )?;
-    let mut provider =
-        tole_core::openai::OpenAiProvider::new(cfg).with_tool_specs(registry.specs());
-    if let Some(sys) = system_prompt.as_deref() {
-        provider = provider.with_system_prompt(sys);
-    }
-
-    let mut storage = storage.lock().unwrap_or_else(|p| p.into_inner());
-    let outcome = tole_core::turn::run_turn(&mut *storage, &mut provider, &registry, &effective)?;
-
-    #[cfg(feature = "shell-tools")]
-    if let tole_core::turn::TurnOutcome::Final { text } = &outcome {
-        if let Some(mem) = &memory {
-            let _ = tole_core::memory::remember_session(mem, session_id, prompt, text);
-        }
-    }
-    *first_prompt_done.lock().expect("fpd lock") = true;
-
-    let stop = match &outcome {
-        tole_core::turn::TurnOutcome::Final { text } => {
-            conn.send_notification(
-                "session/update",
-                json!({
-                    "sessionId": session_id,
-                    "update": {
-                        "sessionUpdate": "agent_message_chunk",
-                        "content": {"type": "text", "text": text},
-                    }
-                }),
-            );
-            "end_turn"
-        }
-        tole_core::turn::TurnOutcome::ApprovalRequired { name } => {
-            eprintln!("tole acp: approval denied for '{name}'");
-            "refusal"
-        }
-        tole_core::turn::TurnOutcome::UnknownTool { name } => {
-            eprintln!("tole acp: unknown tool '{name}'");
-            "refusal"
-        }
-        tole_core::turn::TurnOutcome::ProviderFailed { message } => {
-            eprintln!("tole acp: provider failed: {message}");
-            "refusal"
-        }
-        tole_core::turn::TurnOutcome::BudgetExhausted => {
-            eprintln!("tole acp: step budget exhausted");
-            "max_tokens"
-        }
-        tole_core::turn::TurnOutcome::LoopDetected { tool, .. } => {
-            eprintln!("tole acp: loop detected on '{tool}'");
-            "refusal"
-        }
-        tole_core::turn::TurnOutcome::Storage(e) => {
-            anyhow::bail!("storage error: {e}");
-        }
-    };
-    Ok(stop.to_string())
 }
