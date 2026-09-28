@@ -145,70 +145,101 @@ pub fn resume_turn(
             safety,
         } => {
             let intent_id = intent_id.clone();
-            // The intent's recorded replay contract decides the guard:
-            // `Guarded` effects require a fresh approval before replay —
-            // may have landed before the effect ever ran, so replaying
-            // blind could double-fire a Write/Destructive tool.
-            if safety == ReplaySafety::Guarded {
-                let Some(t) = registry.get(&tool) else {
-                    // Unregistered tool on a Guarded intent: settle the
-                    // sandwich as failed so the session stays resumable
-                    // (scan #34: never park with an open intent).
-                    settle_err(
-                        s,
-                        &EffectHandle { intent_id },
-                        &format!("guarded intent references unregistered tool {tool}"),
-                    )?;
-                    append_turn_error(
-                        s,
-                        "unknown tool",
-                        &format!("guarded intent references unregistered tool {tool}"),
-                    )?;
-                    return Ok(TurnOutcome::UnknownTool { name: tool });
-                };
-                if t.risk() != Risk::ReadOnly {
-                    // Fresh consent for a replayed non-ReadOnly effect:
-                    // actually ASK the wired approver. Allow → proceed to
-                    // execute below; deny/absent → settle the sandwich as
-                    // failed (loop replans on the error) instead of
-                    // returning with the intent permanently pending.
-                    match registry.decide(&tool, &input) {
-                        Some(Verdict::Allow) => {}
-                        _ => {
+            // scan-3: an InvalidToolArgs intent records its input as a
+            // bare JSON STRING (the raw malformed arguments). Such an
+            // intent must NEVER execute — re-settle it as an error and let
+            // the provider replan (CodeCora scan-3 finding: the old path
+            // replayed it blind, executing the tool with a raw string).
+            if !input.is_object() {
+                settle_err(
+                    s,
+                    &EffectHandle {
+                        intent_id: intent_id.clone(),
+                    },
+                    "intent carried malformed (non-object) arguments",
+                )?;
+                append_turn_error(
+                    s,
+                    "invalid tool arguments",
+                    &format!("replayed intent {intent_id} carried malformed arguments"),
+                )?;
+            } else {
+                if safety == ReplaySafety::Guarded {
+                    let Some(t) = registry.get(&tool) else {
+                        // Unregistered tool on a Guarded intent: settle the
+                        // sandwich as failed so the session stays resumable
+                        // (scan #34: never park with an open intent).
+                        settle_err(
+                            s,
+                            &EffectHandle { intent_id },
+                            &format!("guarded intent references unregistered tool {tool}"),
+                        )?;
+                        append_turn_error(
+                            s,
+                            "unknown tool",
+                            &format!("guarded intent references unregistered tool {tool}"),
+                        )?;
+                        return Ok(TurnOutcome::UnknownTool { name: tool });
+                    };
+                    if t.risk() != Risk::ReadOnly {
+                        // Fresh consent for a replayed non-ReadOnly effect:
+                        // actually ASK the wired approver. Allow → proceed to
+                        // execute below; deny/absent → settle the sandwich as
+                        // failed (loop replans on the error) instead of
+                        // returning with the intent permanently pending.
+                        match registry.decide(&tool, &input) {
+                            Some(Verdict::Allow) => {}
+                            _ => {
+                                settle_err(
+                                    s,
+                                    &EffectHandle {
+                                        intent_id: intent_id.clone(),
+                                    },
+                                    "replay denied: no fresh approval for a guarded effect",
+                                )?;
+                                append_turn_error(
+                                    s,
+                                    "approval required",
+                                    &format!(
+                                    "guarded intent {intent_id} replay denied (no fresh approval)"
+                                ),
+                                )?;
+                                return Ok(TurnOutcome::ApprovalRequired { name: tool });
+                            }
+                        }
+                        // scan-3: opt-in pre-hooks apply on replay too — a
+                        // hook-deny must not be bypassable by crashing before
+                        // settlement (mirrors the normal-path check).
+                        #[cfg(feature = "shell-tools")]
+                        if let Some(reason) = registry.pre_hook_denial(&tool, &input) {
                             settle_err(
                                 s,
                                 &EffectHandle {
                                     intent_id: intent_id.clone(),
                                 },
-                                "replay denied: no fresh approval for a guarded effect",
+                                &format!("replay denied by pre-hook: {reason}"),
                             )?;
-                            append_turn_error(
-                                s,
-                                "approval required",
-                                &format!(
-                                    "guarded intent {intent_id} replay denied (no fresh approval)"
-                                ),
-                            )?;
+                            append_turn_error(s, "pre-hook denial", &format!("{tool}: {reason}"))?;
                             return Ok(TurnOutcome::ApprovalRequired { name: tool });
                         }
                     }
                 }
-            }
-            let handle = EffectHandle { intent_id };
-            let out = match registry.get(&tool) {
-                Some(t) => t.execute(input),
-                // The tool vanished between runs (host wiring changed).
-                // The intent is durable — settle it as failed rather than
-                // aborting: the loop replans on the tool_result error.
-                None => Err(format!("unknown tool on resume: {tool}")),
-            };
-            match out {
-                Ok(o) => {
-                    settle_ok(s, &handle, o)?;
-                    finish(s)?;
-                }
-                Err(e) => {
-                    settle_err(s, &handle, &e)?;
+                let handle = EffectHandle { intent_id };
+                let out = match registry.get(&tool) {
+                    Some(t) => t.execute(input),
+                    // The tool vanished between runs (host wiring changed).
+                    // The intent is durable — settle it as failed rather than
+                    // aborting: the loop replans on the tool_result error.
+                    None => Err(format!("unknown tool on resume: {tool}")),
+                };
+                match out {
+                    Ok(o) => {
+                        settle_ok(s, &handle, o)?;
+                        finish(s)?;
+                    }
+                    Err(e) => {
+                        settle_err(s, &handle, &e)?;
+                    }
                 }
             }
         }

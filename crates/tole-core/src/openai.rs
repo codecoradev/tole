@@ -186,6 +186,14 @@ impl OpenAiProvider {
         if let Some(sys) = &self.system_prompt {
             messages.push(json!({ "role": "system", "content": sys }));
         }
+        // Intent ids, for the tool-message parent check below (scan-3: a
+        // tool_result/error whose parent is NOT an intent must never
+        // reach the wire as a tool message answering a tool_call).
+        let intent_ids: std::collections::HashSet<&str> = transcript
+            .iter()
+            .filter(|e| e.kind.as_str() == "intent")
+            .map(|e| e.id.as_str())
+            .collect();
         for e in transcript {
             match e.kind.as_str() {
                 "message" => {
@@ -235,6 +243,13 @@ impl OpenAiProvider {
                     let Some(parent) = e.parent_id.as_ref() else {
                         continue;
                     };
+                    // The parent must be an actual INTENT: otherwise this
+                    // tool message would answer a tool_call that never
+                    // existed, which OpenAI-compatible providers reject
+                    // outright (CodeCora scan-3 finding).
+                    if !intent_ids.contains(parent.as_str()) {
+                        continue;
+                    }
                     let content = if e.kind.as_str() == "tool_result" {
                         e.payload
                             .get("output")

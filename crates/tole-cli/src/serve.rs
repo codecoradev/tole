@@ -112,18 +112,47 @@ struct Request {
     body: String,
 }
 
+/// Ceiling for the request line + all header bytes combined: a client
+/// that streams an endless line without a newline must not buffer
+/// gigabytes pre-auth (CodeCora scan-3: unbounded buffering).
+const MAX_HEADER_BYTES: usize = 32 * 1024;
+
 fn read_request(stream: &TcpStream) -> Option<Request> {
     let mut reader = BufReader::new(stream);
     let mut request_line = String::new();
-    reader.read_line(&mut request_line).ok()?;
+    // take() bounds the read: an over-long line arrives truncated with no
+    // trailing newline, which the caller treats as a protocol error.
+    reader
+        .by_ref()
+        .take(MAX_HEADER_BYTES as u64)
+        .read_line(&mut request_line)
+        .ok()?;
+    if !request_line.ends_with('\n') {
+        return None;
+    }
     let mut parts = request_line.split_whitespace();
     let method = parts.next()?.to_string();
     let path = parts.next()?.to_string();
     let mut authorization = None;
     let mut content_length = 0usize;
+    let mut header_bytes = 0usize;
     loop {
+        if header_bytes > MAX_HEADER_BYTES {
+            return None;
+        }
         let mut line = String::new();
-        reader.read_line(&mut line).ok()?;
+        let n = reader
+            .by_ref()
+            .take((MAX_HEADER_BYTES - header_bytes) as u64)
+            .read_line(&mut line)
+            .ok()?;
+        if n == 0 {
+            return None;
+        }
+        header_bytes += n;
+        if !line.ends_with('\n') {
+            return None;
+        }
         let line = line.trim_end();
         if line.is_empty() {
             break;
@@ -235,9 +264,35 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                 state.memory.clone(),
             ) {
                 Ok(session_state) => {
-                    lock_sessions(&state.sessions)
-                        .map
-                        .insert(session_id.clone(), session_state);
+                    {
+                        // Cap the live map: a long-running daemon must not
+                        // grow without bound (CodeCora scan-3). Sessions
+                        // are durable on disk (the JSONL file) — eviction
+                        // drops only the in-memory handle, never the
+                        // file; busy sessions are never evicted.
+                        const MAX_SESSIONS: usize = 256;
+                        let mut sessions = lock_sessions(&state.sessions);
+                        while sessions.map.len() >= MAX_SESSIONS {
+                            let oldest = sessions
+                                .map
+                                .iter()
+                                .filter(|(_, st)| !*st.busy.lock().expect("busy lock"))
+                                .map(|(id, _)| id.clone())
+                                .next();
+                            match oldest {
+                                Some(id) => {
+                                    sessions.map.remove(&id);
+                                }
+                                None => {
+                                    return (
+                                        503,
+                                        json!({"error": "all sessions busy — at capacity"}),
+                                    )
+                                }
+                            }
+                        }
+                        sessions.map.insert(session_id.clone(), session_state);
+                    }
                     (200, json!({"sessionId": session_id, "workspace": cwd}))
                 }
                 Err(e) => (500, json!({"error": e})),

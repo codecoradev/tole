@@ -130,8 +130,14 @@ pub fn check_destructive_argv(argv: &[String]) -> Result<(), String> {
             .iter()
             .map(|t| strip_quotes(t).to_ascii_lowercase())
             .collect();
-        lc.iter().any(|t| teardown_name(t))
-            || (lc.iter().any(|t| t == "rm" || t.ends_with("/rm"))
+        // Command-LOOKUP tokens are also dash-stripped ("-rm" → "rm");
+        // flag tokens keep their dashes so recursive_flag still matches.
+        let cmds: Vec<String> = lc
+            .iter()
+            .map(|t| t.trim_start_matches('-').to_string())
+            .collect();
+        cmds.iter().any(|t| teardown_name(t))
+            || (cmds.iter().any(|t| t == "rm" || t.ends_with("/rm"))
                 && lc.iter().any(|t| recursive_flag(t)))
     }
 
@@ -148,9 +154,12 @@ pub fn check_destructive_argv(argv: &[String]) -> Result<(), String> {
         }
         // Quote-strip every token BEFORE matching: single/double-quoted
         // payload words (`sh -c 'rm -rf /'`) must not hide behind their
-        // quotes (CodeCora scan 2026-09-18).
+        // quotes (CodeCora scan 2026-09-18). Leading dashes on the
+        // PROGRAM token are stripped too (scan-3): `sh -c "-rm ..."` is
+        // not a valid shell command, but conservatively treating "-rm"
+        // as `rm` refuses rather than hoping the shell errors out.
         let tokens: Vec<String> = tokens.iter().map(|t| strip_quotes(t).to_string()).collect();
-        let prog = tokens[0].to_ascii_lowercase();
+        let prog = tokens[0].trim_start_matches('-').to_ascii_lowercase();
         if prog.contains('/') {
             // Path-qualified program escapes PATH-resolution auditing.
             return Err(REFUSE.to_string());
@@ -204,7 +213,13 @@ pub fn check_destructive_argv(argv: &[String]) -> Result<(), String> {
                     a == "-c" || (a.starts_with('-') && !a.starts_with("--") && a.contains('c'))
                 })
             {
-                for tok in args.iter().filter(|a| !a.starts_with('-')) {
+                // A payload may itself start with '-' (`sh -c "-rm -rf /"`
+                // is a valid shell invocation whose first WORD is the
+                // command) — scan it too, but let scan()'s own
+                // path-qualified/teardown rules do the refusing (CodeCora
+                // scan-3: tokens starting with '-' were filtered out of
+                // the payload scan entirely).
+                for tok in args.iter().filter(|a| !a.starts_with("--")) {
                     let inner: Vec<String> = tok.split_whitespace().map(str::to_string).collect();
                     // BOTH checks (CodeCora scan + review round-trip):
                     // payload_destructive keeps the conservative
@@ -434,13 +449,15 @@ mod destructive_argv_tests {
             s(&["busybox", "mkfs.ext4", "/dev/sda"]),         // wrapper bypass
             s(&["nohup", "shutdown", "-h", "now"]),           // wrapper bypass
             s(&["sh", "-c", "rm -rf /etc"]),                  // quoted payload
+            s(&["sh", "-c", "-rm -rf /etc"]),                 // dash-prefixed payload (scan-3)
+            s(&["bash", "-c", "/bin/rm -rf /"]), // dash-prefixed + path-qualified (scan-3)
             s(&["bash", "-lc", "dd if=/dev/zero of=/dev/sda"]), // quoted payload
-            s(&["xargs", "-n", "1", "rm", "-rf", "/"]),       // option value derails naive scan
-            s(&["env", "-C", ".", "rm", "-rf", "/"]),         // env -C dir bypass
+            s(&["xargs", "-n", "1", "rm", "-rf", "/"]), // option value derails naive scan
+            s(&["env", "-C", ".", "rm", "-rf", "/"]), // env -C dir bypass
             s(&["nohup", "sh", "-c", "dd if=/dev/zero of=/dev/sda"]), // nested sh
-            s(&["env", "bash", "-c", "rm -rf /etc"]),         // nested bash
-            s(&["sudo", "rm", "-rf", "/"]),                   // sudo wrapper
-            s(&["doas", "rm", "-rf", "/"]),                   // doas wrapper
+            s(&["env", "bash", "-c", "rm -rf /etc"]), // nested bash
+            s(&["sudo", "rm", "-rf", "/"]),      // sudo wrapper
+            s(&["doas", "rm", "-rf", "/"]),      // doas wrapper
         ] {
             let err = check_destructive_argv(&argv)
                 .err()
