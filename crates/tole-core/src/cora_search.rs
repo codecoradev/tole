@@ -82,6 +82,11 @@ impl Tool for CoraSearchTool {
         if query.trim().is_empty() {
             return Err("query must not be empty".into());
         }
+        // Flag-injection guard (cora scan-3 #32): a leading '-' would
+        // reach the cora CLI as a flag — same guard uteke_recall has.
+        if query.starts_with('-') {
+            return Err("query must not start with '-'".into());
+        }
         let mut cmd = Command::new("cora");
         crate::subprocess::scrub_env_for_child(&mut cmd);
         cmd.arg("brain")

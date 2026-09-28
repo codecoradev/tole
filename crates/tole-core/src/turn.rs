@@ -360,6 +360,14 @@ fn drive(
                             return Ok(TurnOutcome::ApprovalRequired { name: tool });
                         }
                     }
+                    // Opt-in pre-hooks (issue #110, shell-tools only): a
+                    // deny (exit 2) settles the same way as an approval
+                    // denial — durable turn error + ApprovalRequired.
+                    #[cfg(feature = "shell-tools")]
+                    if let Some(reason) = registry.pre_hook_denial(&tool, &input) {
+                        append_turn_error(s, "pre-hook denial", &format!("{tool}: {reason}"))?;
+                        return Ok(TurnOutcome::ApprovalRequired { name: tool });
+                    }
                 }
                 // Planning → ToolCall, then the sandwich. The replay
                 // contract derives from RISK, not a blanket Idempotent
@@ -375,15 +383,33 @@ fn drive(
                 let seq = s.state().seq;
                 s.commit(Commit::new().transition(StateTransition::from(seq, Pc::ToolCall)))?;
                 let handle = begin(s, &tool, input.clone(), safety, None)?;
+                // Post-hook input snapshot (issue #110): execute consumes
+                // `input` by value; hooks observe the exact call input.
+                // Write/Destructive ONLY — ReadOnly stays zero-overhead
+                // (the documented hook contract; cora-caught).
+                #[cfg(feature = "shell-tools")]
+                let hook_input = if t.risk() != Risk::ReadOnly && registry.has_post_hooks() {
+                    Some(input.clone())
+                } else {
+                    None
+                };
                 let out = match t.execute(input) {
                     Ok(o) => o,
                     Err(e) => {
                         // settle_err lands in Planning directly (§10) —
                         // no finish() hop on the failure path.
+                        #[cfg(feature = "shell-tools")]
+                        if let Some(i) = &hook_input {
+                            registry.post_hook_notify(&tool, i, false);
+                        }
                         settle_err(s, &handle, &e)?;
                         continue;
                     }
                 };
+                #[cfg(feature = "shell-tools")]
+                if let Some(i) = &hook_input {
+                    registry.post_hook_notify(&tool, i, true);
+                }
                 settle_ok(s, &handle, out)?;
                 finish(s)?;
             }
@@ -394,14 +420,27 @@ fn drive(
                 // next request and can retry with well-formed JSON.
                 let seq = s.state().seq;
                 s.commit(Commit::new().transition(StateTransition::from(seq, Pc::ToolCall)))?;
-                // Nothing executes for this intent (it is settled as an
-                // error immediately below), so Idempotent is the honest
-                // contract: a replay can only ever settle it again.
+                // Replay safety derives from TOOL RISK, not from the fact
+                // that nothing executed now (cora scan-3 #50): a crash
+                // between this intent and its settlement must re-consult
+                // the approval gate for a Write/Destructive tool on
+                // resume, exactly like the normal ToolCall path. The
+                // intent's input is the RAW malformed arguments, so a
+                // guarded replay re-settles it as an error — never an
+                // execution.
+                let risky = registry
+                    .get(&tool)
+                    .map(|t| t.risk() != Risk::ReadOnly)
+                    .unwrap_or(false);
                 let handle = begin(
                     s,
                     &tool,
                     serde_json::Value::String(raw),
-                    ReplaySafety::Idempotent,
+                    if risky {
+                        ReplaySafety::Guarded
+                    } else {
+                        ReplaySafety::Idempotent
+                    },
                     None,
                 )?;
                 let msg = format!("tool arguments are not valid JSON: {reason}");

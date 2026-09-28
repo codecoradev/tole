@@ -289,18 +289,37 @@ impl OpenAiProvider {
                 .ok_or_else(|| {
                     ProviderError("malformed tool_call: missing function.name".into())
                 })?;
-            // `arguments` should be a JSON-encoded string, but some
-            // providers emit it as a raw object — serialize it instead of
-            // silently discarding the model's input as "{}" (CodeCora
-            // scan 2026-09-18).
-            let args: String = match first.get("function").and_then(|f| f.get("arguments")) {
+            // `arguments` should be a JSON-encoded string; some providers
+            // emit it as a raw object — serialize it. A MISSING/null/blank
+            // `arguments` is a MALFORMED tool call, not an empty one
+            // (issue #83): silently substituting `{}` ran tools with empty
+            // input and looped. Surface InvalidToolArgs so the model
+            // retries with well-formed arguments.
+            let raw_args = first
+                .get("function")
+                .and_then(|f| f.get("arguments"))
+                .filter(|v| !v.is_null());
+            let args: String = match raw_args {
                 Some(Value::String(s)) => s.clone(),
-                Some(Value::Object(_)) | Some(Value::Array(_)) => {
+                Some(Value::Object(_) | Value::Array(_)) => {
                     first["function"]["arguments"].to_string()
                 }
-                _ => "{}".into(),
+                _ => {
+                    return Ok(ProviderOutput::InvalidToolArgs {
+                        tool: name.to_string(),
+                        raw: String::new(),
+                        reason: "missing arguments".into(),
+                    })
+                }
             };
-            let input: Value = match serde_json::from_str(&args) {
+            if args.trim().is_empty() {
+                return Ok(ProviderOutput::InvalidToolArgs {
+                    tool: name.to_string(),
+                    raw: args,
+                    reason: "missing arguments (blank string)".into(),
+                });
+            }
+            let input: Value = match serde_json::from_str(args.trim()) {
                 Ok(v) => v,
                 Err(err) => {
                     // Malformed arguments: the tool must NOT run. Surface the
@@ -339,12 +358,31 @@ impl Provider for OpenAiProvider {
             .post(&url)
             .header("Authorization", format!("Bearer {}", self.cfg.api_key))
             .send_json(&body)
-            .and_then(|mut r| r.body_mut().read_json::<Value>())
+            .map_err(|e| ProviderError(scrub(&e.to_string(), &self.cfg.api_key)))?;
+        // HTTP status FIRST (cora full-scan #46): a non-2xx body is often
+        // HTML/error JSON that read_json would mangle into a misleading
+        // "malformed response". Surface status + scrubbed body snippet;
+        // the "http status: N" phrasing is load-bearing — the turn loop's
+        // transient-retry classification (#66) matches on it.
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body_text = resp
+                .into_body()
+                .read_to_string()
+                .unwrap_or_else(|_| "<unreadable body>".to_string());
+            let body_text = scrub(&body_text, &self.cfg.api_key);
+            let snippet: String = body_text.chars().take(200).collect();
+            return Err(ProviderError(format!("http status: {status} — {snippet}")));
+        }
+        let mut resp = resp;
+        let resp_body = resp
+            .body_mut()
+            .read_json::<Value>()
             .map_err(|e| ProviderError(scrub(&e.to_string(), &self.cfg.api_key)))?;
         // Capture provider-reported usage (issue: status showed 0/0) —
         // exposed via `last_usage` for the turn loop's durable ledger.
-        self.last_usage_obj = resp.get("usage").cloned().filter(Value::is_object);
-        Self::parse_completion(&resp)
+        self.last_usage_obj = resp_body.get("usage").cloned().filter(Value::is_object);
+        Self::parse_completion(&resp_body)
     }
 
     fn last_usage(&self) -> Option<Value> {
@@ -682,6 +720,48 @@ mod transcript_tests {
             ProviderOutput::ToolCall { tool, input } => {
                 assert_eq!(tool, "read_file");
                 assert_eq!(input["path"], json!("Cargo.toml"));
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_completion_missing_arguments_is_invalid_not_empty() {
+        // Issue #83: a missing/null/blank `arguments` field is a malformed
+        // tool call. It must surface as InvalidToolArgs (the model sees the
+        // error and retries well-formed) — never silently run with empty
+        // input, which looped the old `{}` substitution into the guard.
+        for resp in [
+            json!({ "choices": [{ "message": { "tool_calls": [
+                { "id": "c1", "type": "function", "function": { "name": "write_file" } },
+            ] } }] }),
+            json!({ "choices": [{ "message": { "tool_calls": [
+                { "id": "c2", "type": "function",
+                  "function": { "name": "write_file", "arguments": null } },
+            ] } }] }),
+            json!({ "choices": [{ "message": { "tool_calls": [
+                { "id": "c3", "type": "function",
+                  "function": { "name": "write_file", "arguments": "   " } },
+            ] } }] }),
+        ] {
+            let out = OpenAiProvider::parse_completion(&resp).unwrap();
+            match out {
+                ProviderOutput::InvalidToolArgs { tool, reason, .. } => {
+                    assert_eq!(tool, "write_file");
+                    assert!(reason.contains("missing arguments"), "reason: {reason}");
+                }
+                other => panic!("expected InvalidToolArgs, got {other:?}"),
+            }
+        }
+        // Object-shaped arguments (some gateways) still parse through.
+        let obj = json!({ "choices": [{ "message": { "tool_calls": [
+            { "id": "c4", "type": "function",
+              "function": { "name": "write_file", "arguments": { "path": "x.txt" } } },
+        ] } }] });
+        match OpenAiProvider::parse_completion(&obj).unwrap() {
+            ProviderOutput::ToolCall { tool, input } => {
+                assert_eq!(tool, "write_file");
+                assert_eq!(input["path"], json!("x.txt"));
             }
             other => panic!("expected ToolCall, got {other:?}"),
         }

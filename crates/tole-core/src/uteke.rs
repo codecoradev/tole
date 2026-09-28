@@ -174,10 +174,13 @@ impl Tool for UtekeDocumentTool {
             "type": "object",
             "properties": {
                 "slug": { "type": "string", "description": "URL-friendly document identifier (kebab-case)" },
-                "title": { "type": "string", "description": "Document title (defaults to the first '# ' heading)" },
-                "markdown": { "type": "string", "description": "Full markdown content of the document" },
-                "room": { "type": "string", "description": "Optional room id to link the document into" },
-                "tags": { "type": "array", "items": { "type": "string" }, "description": "Optional tags" }
+                // NO advertised `title`/`tags`: execute() passes slug +
+                // markdown only (the uteke doc-create CLI derives the
+                // title from the first '# ' heading). Advertising inputs
+                // the tool silently drops is a spec lie (cora scan-3
+                // #33) — models waste turns filling dead fields.
+                "markdown": { "type": "string", "description": "Full markdown content of the document (title = first '# ' heading)" },
+                "room": { "type": "string", "description": "Optional room id to link the document into" }
             },
             "required": ["slug", "markdown"]
         }))

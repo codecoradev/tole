@@ -138,6 +138,21 @@ fn atomic_write(target: &Path, new: &str) -> Result<(), String> {
         return Err(format!("edit_file: write temp {}: {e}", tmp.display()));
     }
     drop(file);
+    // Preserve the TARGET's permissions across the atomic rename (cora
+    // scan-3 #60): the temp file was created with default permissions,
+    // so a rename-over would silently drop exec bits and restrictive
+    // modes (e.g. 0600 secrets) from the resulting inode.
+    #[cfg(unix)]
+    if let Ok(meta) = std::fs::metadata(target) {
+        let perms = meta.permissions();
+        if let Err(e) = std::fs::set_permissions(&tmp, perms) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!(
+                "edit_file: preserve permissions on {}: {e}",
+                tmp.display()
+            ));
+        }
+    }
     if let Err(e) = std::fs::rename(&tmp, target) {
         let _ = std::fs::remove_file(&tmp);
         return Err(format!(

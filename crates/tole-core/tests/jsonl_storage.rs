@@ -164,6 +164,51 @@ fn newer_format_version_is_hard_error() {
 }
 
 #[test]
+fn torn_header_fails_open_and_create_with_recovers() {
+    let dir = tmpdir("torn-header");
+    let mut s = JsonlStorage::create(&dir, "th", None).unwrap();
+    s.commit(Commit::new().entry(message(json!({"ok": 1}))))
+        .unwrap();
+    drop(s);
+
+    // Simulate a crash mid-HEADER-write: header JSON complete, file ends
+    // WITHOUT its newline. Cut right before the header's own '\n'.
+    let path = dir.join("th.jsonl");
+    let raw = std::fs::read(&path).unwrap();
+    let header_end = raw.iter().position(|b| *b == b'\n').unwrap();
+    let mut truncated = raw.clone();
+    truncated.truncate(header_end); // header bytes, no newline, no body
+    assert!(!truncated.ends_with(b"\n"));
+    std::fs::write(&path, truncated).unwrap();
+
+    // open() must FAIL explicitly — never hand back a writer that would
+    // glue a body line onto the newline-less header (cora full-scan #23).
+    let err = match JsonlStorage::open(&path) {
+        Err(e) => e,
+        Ok(_) => panic!("open must fail on a torn header"),
+    };
+    match err {
+        StorageError::Corrupt(msg) => {
+            assert!(msg.contains("torn header"), "{msg}");
+        }
+        other => panic!("expected Corrupt, got {other:?}"),
+    }
+
+    // Host recovery: the torn-header file holds ZERO recoverable data
+    // (no complete line was ever written), so the dead file is deleted
+    // and the session is recreated with a fresh, complete header.
+    std::fs::remove_file(&path).unwrap();
+    let mut fresh = JsonlStorage::create_with(&dir, "th", None, None).unwrap();
+    fresh
+        .commit(Commit::new().entry(message(json!({"after": 1}))))
+        .unwrap();
+    drop(fresh);
+    let again = JsonlStorage::open(&path).unwrap();
+    assert_eq!(again.session_id(), "th");
+    assert_eq!(again.entries().len(), 1);
+}
+
+#[test]
 fn torn_final_line_is_discarded_whole() {
     let dir = tmpdir("torn");
     let mut s = JsonlStorage::create(&dir, "t", None).unwrap();

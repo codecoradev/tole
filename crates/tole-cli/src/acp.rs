@@ -237,6 +237,7 @@ pub fn run_acp(
     allow_patterns: &[String],
     auto_write: bool,
     _workspace_default: Option<&String>,
+    plan_mode: bool,
     memory: Option<tole_core::memory::MemoryConfig>,
 ) -> Result<()> {
     let (line_tx, line_rx) = mpsc::channel::<String>();
@@ -322,6 +323,7 @@ pub fn run_acp(
                     loading,
                     allow_patterns,
                     auto_write,
+                    plan_mode,
                     memory.clone(),
                     conn.clone(),
                 ) {
@@ -444,12 +446,14 @@ fn new_session_id() -> String {
 /// the ACP editor (interactive — which is what unlocks Destructive tools
 /// with genuine human consent).
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn open_session(
     session_id: &str,
     cwd: &str,
     loading: bool,
     allow_patterns: &[String],
     auto_write: bool,
+    plan_mode: bool,
     memory: Option<tole_core::memory::MemoryConfig>,
     conn: Conn,
 ) -> Result<SessionState> {
@@ -529,6 +533,19 @@ fn open_session(
         )
         .context("creating session")?
     };
+    // --plan-mode: read-only sessions — Write/Destructive tools are not
+    // registered at all, so the model cannot even attempt them.
+    if plan_mode {
+        eprintln!("tole acp: --plan-mode is active — serving read-only tools only");
+        return Ok(SessionState {
+            storage: StdArc::new(Mutex::new(storage)),
+            registry: StdArc::new(reg),
+            system_prompt,
+            memory,
+            first_prompt_done: StdArc::new(Mutex::new(loading)),
+            busy: StdArc::new(Mutex::new(false)),
+        });
+    }
     Ok(SessionState {
         storage: StdArc::new(Mutex::new(storage)),
         registry: StdArc::new(reg),

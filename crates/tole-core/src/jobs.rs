@@ -42,13 +42,17 @@ fn jobs_root(root: &Path) -> PathBuf {
     root.join(JOBS_DIR)
 }
 
-/// `j-<hex ms>-<hex pid>` — same time-ordered shape as session ids.
+/// `j-<hex ms>-<hex pid>-<hex n>` — same time-ordered shape as session
+/// ids, plus a process-wide counter segment so two job_start calls in
+/// the SAME millisecond can never collide (cora full-scan #34).
 fn new_job_id() -> String {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    format!("j-{ms:x}-{:x}", std::process::id())
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("j-{ms:x}-{:x}-{n:x}", std::process::id())
 }
 
 /// Read-only introspection of a detached job: running? log tail?
