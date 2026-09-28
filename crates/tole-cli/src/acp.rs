@@ -276,12 +276,19 @@ pub fn run_acp(
             .and_then(Value::as_str)
             .map(str::to_string)
         else {
-            // A response to one of OUR requests (permission).
-            if let (Some(id), Some(result)) = (
-                msg.get("id").and_then(Value::as_u64),
-                msg.get("result").cloned(),
-            ) {
-                conn.route_response(id, result);
+            // A response to one of OUR requests (permission). Client
+            // ERROR replies route as well — an errored permission must
+            // fail closed immediately, not hang for the full timeout
+            // (CodeCora scan 2026-09-28).
+            if let Some(id) = msg.get("id").and_then(Value::as_u64) {
+                if let Some(result) = msg.get("result").cloned() {
+                    conn.route_response(id, result);
+                } else if let Some(err) = msg.get("error").cloned() {
+                    conn.route_response(
+                        id,
+                        json!({"outcome": {"outcome": "cancelled"}, "error": err}),
+                    );
+                }
             }
             continue;
         };
@@ -317,6 +324,21 @@ pub fn run_acp(
                     reply_error(&conn, id, "session/load: invalid sessionId");
                     continue;
                 };
+                // A turn holds its session's storage lock and marks it
+                // busy; loading a busy id would open a SECOND handle on
+                // the same JSONL mid-turn (CodeCora scan 2026-09-28).
+                let busy_now = {
+                    let sessions = lock_sessions(&sessions);
+                    sessions
+                        .map
+                        .get(&session_id)
+                        .map(|st| *st.busy.lock().expect("busy lock"))
+                        .unwrap_or(false)
+                };
+                if busy_now {
+                    reply_error(&conn, id, "session is busy running a turn");
+                    continue;
+                }
                 match open_session(
                     &session_id,
                     &cwd,
@@ -328,9 +350,24 @@ pub fn run_acp(
                     conn.clone(),
                 ) {
                     Ok(state) => {
-                        lock_sessions(&sessions)
+                        // Insert + busy re-check in ONE critical section:
+                        // open_session is slow (canonicalize + a git
+                        // subprocess), and a prompt that set busy inside
+                        // that window must not be orphaned by the insert
+                        // swapping in a fresh, not-busy state (CodeCora
+                        // scan 2026-09-28).
+                        let mut sessions = lock_sessions(&sessions);
+                        let busy_now = sessions
                             .map
-                            .insert(session_id.clone(), state);
+                            .get(&session_id)
+                            .map(|st| *st.busy.lock().expect("busy lock"))
+                            .unwrap_or(false);
+                        if busy_now {
+                            drop(sessions);
+                            reply_error(&conn, id, "session became busy while opening — retry");
+                            continue;
+                        }
+                        sessions.map.insert(session_id.clone(), state);
                         reply(&conn, id, json!({ "sessionId": session_id }));
                     }
                     Err(e) => reply_error(&conn, id, &e.to_string()),
@@ -446,7 +483,6 @@ fn new_session_id() -> String {
 /// the ACP editor (interactive — which is what unlocks Destructive tools
 /// with genuine human consent).
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn open_session(
     session_id: &str,
     cwd: &str,
@@ -489,33 +525,42 @@ fn open_session(
     if tole_cli_binary_available("uteke") {
         reg.register(Box::new(UtekeRecallTool::new()))
             .map_err(anyhow::Error::msg)?;
-        reg.register(Box::new(UtekeDocumentTool::new(None)))
+        if !plan_mode {
+            reg.register(Box::new(UtekeDocumentTool::new(None)))
+                .map_err(anyhow::Error::msg)?;
+        }
+    }
+    // Write-tier tools: skipped entirely under --plan-mode (read-only
+    // sessions — the model cannot even attempt a write). The earlier
+    // draft registered everything and "filtered" afterwards, which
+    // CodeCora rightly called out: the full registry under --yes broke
+    // the read-only contract.
+    if !plan_mode {
+        reg.register(Box::new(RunCommandTool::new(workspace_canon.clone())))
+            .map_err(anyhow::Error::msg)?;
+        reg.register(Box::new(JobStartTool::new(workspace_canon.clone())))
+            .map_err(anyhow::Error::msg)?;
+        reg.register(Box::new(WriteFileTool::new(workspace_canon.clone())))
+            .map_err(anyhow::Error::msg)?;
+        reg.register(Box::new(EditFileTool::new(workspace_canon.clone())))
+            .map_err(anyhow::Error::msg)?;
+        {
+            let repo =
+                detect_github_repo(&workspace_canon).unwrap_or_else(|| "codecoradev/tole".into());
+            reg.register(Box::new(GhTool::new(repo)))
+                .map_err(anyhow::Error::msg)?;
+        }
+        reg.register(Box::new(GitTool::new().in_dir(workspace_canon.clone())))
+            .map_err(anyhow::Error::msg)?;
+        // delete_file IS registered here: the ACP editor prompt is an
+        // interactive approver, so a Destructive tool carries genuine
+        // human consent — the same rule as the CLI, not an exception.
+        reg.register(Box::new(DeleteFileTool::new(workspace_canon.clone())))
             .map_err(anyhow::Error::msg)?;
     }
-    reg.register(Box::new(RunCommandTool::new(workspace_canon.clone())))
-        .map_err(anyhow::Error::msg)?;
-    reg.register(Box::new(JobStartTool::new(workspace_canon.clone())))
-        .map_err(anyhow::Error::msg)?;
     reg.register(Box::new(JobPollTool::new(workspace_canon.clone())))
         .map_err(anyhow::Error::msg)?;
     reg.register(Box::new(ReadFileTool::new(workspace_canon.clone())))
-        .map_err(anyhow::Error::msg)?;
-    reg.register(Box::new(WriteFileTool::new(workspace_canon.clone())))
-        .map_err(anyhow::Error::msg)?;
-    reg.register(Box::new(EditFileTool::new(workspace_canon.clone())))
-        .map_err(anyhow::Error::msg)?;
-    {
-        let repo =
-            detect_github_repo(&workspace_canon).unwrap_or_else(|| "codecoradev/tole".into());
-        reg.register(Box::new(GhTool::new(repo)))
-            .map_err(anyhow::Error::msg)?;
-    }
-    reg.register(Box::new(GitTool::new().in_dir(workspace_canon.clone())))
-        .map_err(anyhow::Error::msg)?;
-    // delete_file IS registered here: the ACP editor prompt is an
-    // interactive approver, so a Destructive tool carries genuine human
-    // consent — the same rule as the CLI, not an exception.
-    reg.register(Box::new(DeleteFileTool::new(workspace_canon.clone())))
         .map_err(anyhow::Error::msg)?;
 
     let storage = if loading {
