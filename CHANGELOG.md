@@ -41,7 +41,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is only required when a prompt actually runs. The session map survives
   across prompts (a first-run regression where fresh state replaced the
   map after one turn — caught by CodeCora review — is fixed, along with
-  session-id path-traversal and mutex-poisoning hardening).
+  session-id path-traversal and mutex-poisoning hardening). The
+  session-map lock is held only briefly — a running turn keeps its OWN
+  storage lock, so the reader loop stays live for permission routing
+  (the first implementation deadlocked protocol routing for up to the
+  permission timeout whenever a client opened a session while a
+  permission request was pending — caught by CodeCora review). Sessions
+  reject concurrent turns (busy) and panic-safe un-busy via Drop.
 - `tole mcp`: tole as an **MCP server** over stdio (issue #94) — the
   registry's hardened tools (jailed file ops, argv-validated git, detached
   jobs, memory loop, cora/uteke integrations) become callable by any MCP

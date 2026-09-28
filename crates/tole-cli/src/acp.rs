@@ -195,11 +195,24 @@ impl PromptFn for AcpPrompt {
 // ---------------------------------------------------------------------------
 
 struct SessionState {
-    storage: tole_core::storage::JsonlStorage,
-    registry: tole_core::tool::ToolRegistry,
+    // Per-session storage lock: a turn holds THIS (not the session-map
+    // lock), so the reader loop stays live for permission routing while
+    // a prompt runs (CodeCora scan deadlock finding).
+    storage: StdArc<Mutex<tole_core::storage::JsonlStorage>>,
+    registry: StdArc<tole_core::tool::ToolRegistry>,
     system_prompt: Option<String>,
     memory: Option<tole_core::memory::MemoryConfig>,
-    first_prompt_done: bool,
+    first_prompt_done: StdArc<Mutex<bool>>,
+    busy: StdArc<Mutex<bool>>,
+}
+
+/// Marks a session busy for its whole lifetime; Drop un-marks even on
+/// panic, so one failed turn cannot brick the session.
+struct BusyGuard(StdArc<Mutex<bool>>);
+impl Drop for BusyGuard {
+    fn drop(&mut self) {
+        *self.0.lock().expect("busy lock") = false;
+    }
 }
 
 struct Sessions {
@@ -517,11 +530,12 @@ fn open_session(
         .context("creating session")?
     };
     Ok(SessionState {
-        storage,
-        registry: reg,
+        storage: StdArc::new(Mutex::new(storage)),
+        registry: StdArc::new(reg),
         system_prompt,
         memory,
-        first_prompt_done: loading,
+        first_prompt_done: StdArc::new(Mutex::new(loading)),
+        busy: StdArc::new(Mutex::new(false)),
     })
 }
 
@@ -564,21 +578,46 @@ fn run_prompt(
     prompt: &str,
     conn: Conn,
 ) -> Result<String> {
-    // Poisoning-tolerant: see lock_sessions.
-    let mut sessions = lock_sessions(&sessions);
-    let Some(state) = sessions.map.get_mut(session_id) else {
-        anyhow::bail!("unknown session: {session_id}");
+    // Brief map lock: take the session's handles and reject a busy
+    // session. The MAP lock is released here — a running turn holds only
+    // its OWN storage lock, so the reader loop stays live for permission
+    // routing (CodeCora deadlock finding).
+    let (storage, registry, memory, system_prompt, first_prompt_done, busy_guard) = {
+        let mut sessions = lock_sessions(&sessions);
+        let Some(state) = sessions.map.get_mut(session_id) else {
+            anyhow::bail!("unknown session: {session_id}");
+        };
+        {
+            let mut busy = state.busy.lock().expect("busy lock");
+            if *busy {
+                anyhow::bail!("session is busy running a turn");
+            }
+            *busy = true;
+        }
+        (
+            state.storage.clone(),
+            state.registry.clone(),
+            state.memory.clone(),
+            state.system_prompt.clone(),
+            state.first_prompt_done.clone(),
+            std::sync::Arc::clone(&state.busy),
+        )
     };
+    // Panic-safe un-busy: Drop clears the flag even if the turn unwinds.
+    let _busy_guard = BusyGuard(busy_guard);
 
     // Memory loop, pre-turn (first prompt of a fresh session only).
     let mut effective = prompt.to_string();
     #[cfg(feature = "shell-tools")]
-    if let Some(mem) = state.memory.clone() {
-        if !state.first_prompt_done {
-            if let Ok(block) = tole_core::memory::recall_block(&mem, prompt) {
-                if !block.is_empty() {
-                    eprintln!("tole acp: memory: recalled context injected");
-                    effective = format!("{prompt}{block}");
+    {
+        let done = *first_prompt_done.lock().expect("fpd lock");
+        if !done {
+            if let Some(mem) = &memory {
+                if let Ok(block) = tole_core::memory::recall_block(mem, prompt) {
+                    if !block.is_empty() {
+                        eprintln!("tole acp: memory: recalled context injected");
+                        effective = format!("{prompt}{block}");
+                    }
                 }
             }
         }
@@ -591,25 +630,21 @@ fn run_prompt(
          (or the OPENAI_* equivalents)",
     )?;
     let mut provider =
-        tole_core::openai::OpenAiProvider::new(cfg).with_tool_specs(state.registry.specs());
-    if let Some(sys) = state.system_prompt.as_deref() {
+        tole_core::openai::OpenAiProvider::new(cfg).with_tool_specs(registry.specs());
+    if let Some(sys) = system_prompt.as_deref() {
         provider = provider.with_system_prompt(sys);
     }
 
-    let outcome = tole_core::turn::run_turn(
-        &mut state.storage,
-        &mut provider,
-        &state.registry,
-        &effective,
-    )?;
+    let mut storage = storage.lock().unwrap_or_else(|p| p.into_inner());
+    let outcome = tole_core::turn::run_turn(&mut *storage, &mut provider, &registry, &effective)?;
 
     #[cfg(feature = "shell-tools")]
     if let tole_core::turn::TurnOutcome::Final { text } = &outcome {
-        if let Some(mem) = state.memory.clone() {
-            let _ = tole_core::memory::remember_session(&mem, session_id, prompt, text);
+        if let Some(mem) = &memory {
+            let _ = tole_core::memory::remember_session(mem, session_id, prompt, text);
         }
     }
-    state.first_prompt_done = true;
+    *first_prompt_done.lock().expect("fpd lock") = true;
 
     let stop = match &outcome {
         tole_core::turn::TurnOutcome::Final { text } => {
