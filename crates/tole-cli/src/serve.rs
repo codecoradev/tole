@@ -21,8 +21,9 @@
 
 use anyhow::{Context, Result};
 use serde_json::json;
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{IpAddr, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -42,6 +43,15 @@ pub struct ServeConfig {
     pub memory: Option<MemoryConfig>,
 }
 
+/// Max concurrently open connections: each pinned thread holds ~8 KiB
+/// stack + a socket; capping bounds thread/socket exhaustion (CodeCora
+/// scan-3 Wave-2 hardening).
+const MAX_CONNECTIONS: usize = 32;
+/// Failed-auth attempts allowed per source IP per window before the IP is
+/// dropped until the window rolls over (simple fixed-window limiter).
+const AUTH_WINDOW_SECS: u64 = 60;
+const MAX_AUTH_FAILURES: u32 = 10;
+
 struct State {
     sessions: SharedSessions,
     allow_patterns: Vec<String>,
@@ -49,6 +59,10 @@ struct State {
     memory: Option<MemoryConfig>,
     token: String,
     workspace_default: Option<String>,
+    live_connections: std::sync::atomic::AtomicUsize,
+    /// (window_start_epoch, failure_count) per source IP — fixed-window
+    /// auth-failure limiter (brute-force hardening).
+    auth_failures: Mutex<HashMap<IpAddr, (u64, u32)>>,
 }
 
 /// Read/write ceilings per connection: a client that opens a socket and
@@ -68,21 +82,31 @@ pub fn run_serve(cfg: ServeConfig) -> Result<()> {
         memory: cfg.memory.clone(),
         token,
         workspace_default: cfg.workspace.clone(),
+        live_connections: std::sync::atomic::AtomicUsize::new(0),
+        auth_failures: Mutex::new(HashMap::new()),
     });
     eprintln!(
         "tole serve: listening on http://{addr} ({} allow pattern(s), plan_mode={})",
         cfg.allow_patterns.len(),
         cfg.plan_mode
     );
+    use std::sync::atomic::Ordering;
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
+        // Connection cap: refuse when at capacity (thread exhaustion DoS).
+        if state.live_connections.load(Ordering::Relaxed) >= MAX_CONNECTIONS {
+            drop(stream);
+            continue;
+        }
         let _ = stream.set_read_timeout(Some(SERVE_IO_TIMEOUT));
         let _ = stream.set_write_timeout(Some(SERVE_IO_TIMEOUT));
+        state.live_connections.fetch_add(1, Ordering::Relaxed);
         let state = Arc::clone(&state);
         // One request per connection (Connection: close) — deliberately
         // simple: the client is curl/any HTTP client, not a browser.
+        // ConnGuard (inside handle_conn) handles the decrement.
         std::thread::spawn(move || {
-            handle_conn(stream, state);
+            handle_conn(stream, Arc::clone(&state));
         });
     }
     Ok(())
@@ -204,13 +228,58 @@ fn respond(stream: &mut TcpStream, status: u16, payload: &serde_json::Value) {
     let _ = stream.flush();
 }
 
+/// Panic-safe connection-count guard: decrements on Drop (normal or
+/// unwind), so the counter never permanently inflates after a panicking
+/// handler.
+struct ConnGuard(Arc<State>);
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.0
+            .live_connections
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 fn handle_conn(mut stream: TcpStream, state: Arc<State>) {
+    let _guard = ConnGuard(Arc::clone(&state));
     let Some(req) = read_request(&stream) else {
         return;
     };
 
     // Auth: bearer token on everything except /health (which carries no
-    // information — it is a liveness probe).
+    // information — it is a liveness probe). Failed auths are rate-limited
+    // per source IP (CodeCora scan-3 Wave-2: brute-force hardening).
+    let peer_ip = stream.peer_addr().ok().map(|a| a.ip());
+
+    // Rate-limit: refuse when this IP has too many recent auth failures.
+    // The lock is dropped before any respond call (CodeCora: a stalled
+    // client must not hold the auth_failures mutex during a write).
+    if let Some(ip) = peer_ip {
+        let rate_limited = {
+            let fails = state.auth_failures.lock().expect("auth failures lock");
+            matches!(
+                fails.get(&ip).map(|(window, count)| {
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0)
+                        .saturating_sub(*window)
+                        <= AUTH_WINDOW_SECS
+                        && *count >= MAX_AUTH_FAILURES
+                }),
+                Some(true)
+            )
+        };
+        if rate_limited {
+            respond(
+                &mut stream,
+                429,
+                &json!({"error": "too many failed auth attempts"}),
+            );
+            return;
+        }
+    }
+
     let authorized = req.path == "/health"
         || req
             .authorization
@@ -219,6 +288,23 @@ fn handle_conn(mut stream: TcpStream, state: Arc<State>) {
             .map(|t| t == state.token)
             .unwrap_or(false);
     if !authorized {
+        if let Some(ip) = peer_ip {
+            let mut fails = state.auth_failures.lock().expect("auth failures lock");
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            // Periodic sweep: drop entries whose window has fully
+            // expired — bounds memory growth from unique source IPs
+            // (CodeCora scan round-2 on this PR).
+            fails.retain(|_, (window, _)| now.saturating_sub(*window) <= AUTH_WINDOW_SECS * 4);
+            let entry = fails.entry(ip).or_insert((now, 0));
+            if now.saturating_sub(entry.0) > AUTH_WINDOW_SECS {
+                entry.0 = now;
+                entry.1 = 0;
+            }
+            entry.1 += 1;
+        }
         respond(&mut stream, 401, &json!({"error": "unauthorized"}));
         return;
     }
