@@ -279,6 +279,10 @@ fn dispatch(cli: Cli) -> Result<()> {
     );
     #[cfg(feature = "mcp")]
     let mcp_specs = merge_mcp_specs(&cli.mcp_server, cli.no_auto_mcp, auto_mcp_specs());
+    // scan-3 finding fix: the global --workspace/--memory flags now flow
+    // into the host, so `tole serve/acp/mcp` honor them as fallbacks when
+    // the subcommand-level flags are absent (previously they were
+    // silently ignored by those subcommands).
     let host = HostConfig {
         workspace: cli.workspace.clone(),
         #[cfg(feature = "mcp")]
@@ -339,6 +343,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             if host.plan_mode {
                 eprintln!("tole mcp: --plan-mode is active — serving read-only tools only");
             }
+            let workspace = workspace.or_else(|| host.workspace.clone());
             mcp_server_command(
                 workspace.as_ref(),
                 &allow_patterns,
@@ -365,7 +370,11 @@ fn dispatch(cli: Cli) -> Result<()> {
             if host.plan_mode {
                 eprintln!("tole acp: --plan-mode is active — serving read-only tools only");
             }
-            let memory = resolve_memory(memory.as_ref())?;
+            let memory = match memory.as_deref().filter(|s| !s.trim().is_empty()) {
+                Some(_) => resolve_memory(memory.as_ref())?,
+                None => host.memory.clone(),
+            };
+            let workspace = workspace.or_else(|| host.workspace.clone());
             crate::acp::run_acp(
                 &allow_patterns,
                 yes,
@@ -383,7 +392,11 @@ fn dispatch(cli: Cli) -> Result<()> {
             workspace,
             memory,
         } => {
-            let memory = resolve_memory(memory.as_ref())?;
+            let memory = match memory.as_deref().filter(|s| !s.trim().is_empty()) {
+                Some(_) => resolve_memory(memory.as_ref())?,
+                None => host.memory.clone(),
+            };
+            let workspace = workspace.or_else(|| host.workspace.clone());
             crate::serve::run_serve(crate::serve::ServeConfig {
                 bind,
                 port,

@@ -968,8 +968,20 @@ impl Storage for JsonlStorage {
         }
         std::fs::rename(&tmp, &self.path)?;
         sync_dir(&self.path)?;
-        // Reopen the writer on the new file.
-        self.writer = BufWriter::new(OpenOptions::new().append(true).open(&self.path)?);
+        // Reopen the writer on the new file. If THIS reopen fails, the
+        // rename has already happened: the old writer now points at an
+        // unlinked inode, so any further commit would vanish silently.
+        // Mark the session poisoned — every subsequent commit fails
+        // LOUDLY instead of losing data (CodeCora scan-3: silent loss).
+        self.writer = BufWriter::new(match OpenOptions::new().append(true).open(&self.path) {
+            Ok(w) => w,
+            Err(e) => {
+                self.poisoned = Some(StorageError::Invalid(format!(
+                    "compact(): reopen after rename failed: {e}"
+                )));
+                return Err(e.into());
+            }
+        });
         self.state.seq = seq;
         // The file was atomically rewritten from COMPLETE records only —
         // any torn fragment that justified the poison no longer exists.

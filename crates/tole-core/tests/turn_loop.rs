@@ -657,7 +657,7 @@ fn turn_refused_when_pc_not_idle() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn all_abort_paths_leave_durable_error_records() {
+fn abort_paths_leave_durable_error_records_and_no_final() {
     for (name, tool, risk) in [
         ("unknown", "nonexistent", Risk::ReadOnly),
         ("approval", "write_file", Risk::Write),

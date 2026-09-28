@@ -72,11 +72,17 @@ pub fn validate_session_id(id: &str) -> Option<String> {
 }
 
 pub fn new_session_id(prefix: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // Monotonic counter suffix: ms+pid alone can collide when two
+    // sessions are created within the same millisecond of the same
+    // process (CodeCora scan-3: collision → silent session overwrite).
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    format!("{prefix}-{ms:x}-{:x}", std::process::id())
+    format!("{prefix}-{ms:x}-{n:x}-{:x}", std::process::id())
 }
 
 /// Create/open a session: workspace jail = the client-provided cwd;
