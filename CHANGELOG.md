@@ -31,6 +31,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   profiles are unaffected — `tole-core` defaults do not change.
 
 ### Added
+- `tole serve`: tole as a **token-authenticated HTTP daemon** (issue
+  #96, v1) — REST endpoints for the session host: create/list sessions,
+  run turns, poll status. Turn execution is serialized per session
+  (concurrent prompts get 409), the session map + durable JSONL live
+  server-side, and the allowlist approver keeps Destructive tools
+  structurally absent (a server has no human to ask). Zero new
+  dependencies (hand-rolled HTTP/1.1). Per-connection read/write
+  timeouts (30s). MCP-over-HTTP is the follow-up.
 - `tole acp`: tole as an **Agent Client Protocol agent** over stdio
   (issue #95) — editors (Zed et al.) drive durable tole sessions:
   `session/new`/`session/load` map to the JSONL session store, prompts run
