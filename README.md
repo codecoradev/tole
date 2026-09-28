@@ -34,6 +34,9 @@ tole is the agent harness of the CodeCora ecosystem — the hands:
   (jailed file ops, git, jobs, memory) to any MCP client. ReadOnly tools are
   always callable; Write tools require `--allow` patterns; Destructive tools
   are structurally absent.
+- **tole as an ACP agent**: `tole acp` speaks the Agent Client Protocol —
+  editors (Zed et al.) drive durable tole sessions, and tool approvals
+  surface as permission requests in the editor.
 
 Every ecosystem integration is probe-first: a missing binary degrades to a
 one-line warning, never a phantom tool.
