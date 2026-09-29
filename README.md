@@ -37,10 +37,13 @@ tole is the agent harness of the CodeCora ecosystem — the hands:
 - **tole as an ACP agent**: `tole acp` speaks the Agent Client Protocol —
   editors (Zed et al.) drive durable tole sessions, and tool approvals
   surface as permission requests in the editor.
-- **tole as an HTTP daemon**: `tole serve` (issue #96, v1) exposes the
-  session host over token-authenticated REST — remote clients create
-  sessions, run turns, and poll status without SSH-ing into the box.
-  Binds 127.0.0.1 by default.
+- **tole as an HTTP daemon**: `tole serve` (issue #96) exposes the session
+  host over token-authenticated REST — remote clients create sessions, run
+  turns, and poll status without SSH-ing into the box. Binds 127.0.0.1 by
+  default. `--transport mcp` (issue #137) serves **multi-session MCP over
+  Streamable HTTP** instead: one authenticated MCP connection addresses N
+  durable tole sessions (`tole_session_new/prompt/status/list` + the
+  registry tools routed to each session's workspace jail).
 
 Every ecosystem integration is probe-first: a missing binary degrades to a
 one-line warning, never a phantom tool.

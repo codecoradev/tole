@@ -32,11 +32,20 @@ use rmcp::ErrorData as McpError;
 use rmcp::{RoleServer, ServiceExt};
 use std::sync::Arc;
 
+/// Resolves the tool registry of the session named by `session_id`
+/// (#137: per-session jails). None when the host has no session model
+/// (stdio MCP mode — the single registry is the whole surface).
+pub type SessionRegistryResolver = Arc<dyn Fn(&str) -> Option<Arc<ToolRegistry>> + Send + Sync>;
+
 /// An MCP server view of a [`ToolRegistry`]. Cloneable (Arc-shared
 /// registry) so `call_tool` can move a handle into `spawn_blocking`.
 #[derive(Clone)]
 pub struct RegistryServer {
     registry: std::sync::Arc<ToolRegistry>,
+    /// Multi-session HTTP hosts set this: when a tool call carries a
+    /// `session_id` argument (and the name is not a session tool), the
+    /// call routes to THAT session's registry (its jail + approver).
+    session_resolver: Option<SessionRegistryResolver>,
 }
 
 impl RegistryServer {
@@ -48,6 +57,34 @@ impl RegistryServer {
     pub fn new(registry: ToolRegistry) -> Self {
         Self {
             registry: std::sync::Arc::new(registry),
+            session_resolver: None,
+        }
+    }
+
+    /// Attach the per-session registry resolver (#137). Without it, tool
+    /// calls always run against the server-level registry.
+    pub fn with_session_resolver(mut self, resolver: SessionRegistryResolver) -> Self {
+        self.session_resolver = Some(resolver);
+        self
+    }
+
+    /// Register additional tools AFTER construction (#137: the
+    /// multi-session MCP host adds tole_session_* tools that carry their
+    /// own SharedSessions state — they are not part of a plain registry
+    /// build). Same risk rules apply: Destructive registration behind a
+    /// non-interactive approver is refused by the registry itself.
+    pub fn with_extra_tools(
+        mut registry: ToolRegistry,
+        tools: Vec<Box<dyn crate::tool::Tool>>,
+    ) -> Self {
+        for t in tools {
+            registry
+                .register(t)
+                .expect("with_extra_tools: duplicate tool name");
+        }
+        Self {
+            registry: std::sync::Arc::new(registry),
+            session_resolver: None,
         }
     }
 
@@ -88,8 +125,29 @@ impl RegistryServer {
         name: &str,
         args: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        let tool = self
-            .registry
+        // #137 multi-session routing: a `session_id` argument addresses
+        // the SESSION's registry (its workspace jail + approver). The
+        // session tools themselves (tole_session_*) always stay on the
+        // server-level registry — they carry the session map.
+        let session_id = args
+            .get("session_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let (registry, args) = match (&self.session_resolver, session_id) {
+            (Some(resolve), Some(sid))
+                if !name.starts_with("tole_session_") && self.registry.get(name).is_some() =>
+            {
+                let reg = resolve(&sid).ok_or_else(|| format!("unknown session: {sid}"))?;
+                // Strip the routing key before the tool sees the args.
+                let mut a = args;
+                if let serde_json::Value::Object(map) = &mut a {
+                    map.remove("session_id");
+                }
+                (reg, a)
+            }
+            _ => (self.registry.clone(), args),
+        };
+        let tool = registry
             .get(name)
             .ok_or_else(|| format!("unknown tool: {name}"))?;
         // Structural guard, NOT an approver decision (CodeCora scan
@@ -102,7 +160,7 @@ impl RegistryServer {
         }
         match tool.risk() {
             Risk::ReadOnly => {}
-            Risk::Write => match self.registry.decide(name, &args) {
+            Risk::Write => match registry.decide(name, &args) {
                 Some(crate::approval::Verdict::Allow) => {}
                 _ => {
                     return Err(
