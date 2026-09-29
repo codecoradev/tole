@@ -124,10 +124,11 @@ Est: S–M.
 Editor integration (Zed et al.): ACP sessions ↔ JSONL sessions, ACP
 permission requests ↔ the approval gate, streaming turn events. Est: M.
 
-### D3 — `tole-serve`: server mode (issue #96)
-Long-running daemon (uteke-serve pattern): MCP Streamable HTTP + thin REST,
-token auth, server-side durable sessions, per-session workspace jails.
-Est: M–L.
+### D3 — `tole-serve`: server mode (issues #96, #137) — ✅ DONE (2026-09-28)
+Long-running daemon (uteke-serve pattern): thin REST (v1, #96) +
+**multi-session MCP over Streamable HTTP** (`--transport mcp`, #137) —
+one authenticated connection, N durable sessions, per-session jail
+routing via `session_id`. Est: M–L.
 
 ---
 

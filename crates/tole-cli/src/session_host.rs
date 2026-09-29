@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use std::sync::{Arc as StdArc, Mutex};
 use tole_core::memory::MemoryConfig;
 
+#[derive(Clone)]
 pub struct SessionState {
     /// Per-session storage lock: a turn holds THIS (not the session-map
     /// lock), so the reader loop stays live for permission routing while

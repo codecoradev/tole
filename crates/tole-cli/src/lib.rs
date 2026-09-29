@@ -4,4 +4,5 @@
 //! drift from production behavior (CodeCora scan 2026-09-18).
 pub mod approver;
 pub mod session_host;
+pub mod session_tools;
 pub mod tools;

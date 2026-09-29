@@ -31,6 +31,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   profiles are unaffected — `tole-core` defaults do not change.
 
 ### Added
+- `tole serve --transport mcp` — **multi-session MCP over Streamable
+  HTTP** (issue #137): one authenticated MCP connection addresses N
+  durable tole sessions. Session tools (`tole_session_new`,
+  `tole_session_prompt`, `tole_session_status`, `tole_session_list`)
+  ride alongside the registry tools; a `session_id` argument routes a
+  tool call to THAT session's registry (workspace jail + approver), and
+  an ambiguous no-id call with 2+ open sessions is refused. Served with
+  hyper directly (no axum) behind the same bearer-token auth as REST;
+  Destructive stays structurally absent (non-interactive approvers).
 - `tole serve`: tole as a **token-authenticated HTTP daemon** (issue
   #96, v1) — REST endpoints for the session host: create/list sessions,
   run turns, poll status. Turn execution is serialized per session

@@ -1,0 +1,153 @@
+//! #137: `tole serve --transport mcp` — multi-session MCP over
+//! Streamable HTTP.
+//!
+//! One authenticated MCP connection addresses N durable tole sessions:
+//! the `tole_session_*` tools (from [`crate::session_tools`]) ride
+//! alongside the regular registry tools. rmcp's
+//! `StreamableHttpService` is a tower Service; it is served with hyper
+//! directly (no axum — the smallest HTTP stack that can host a tower
+//! Service) behind the same bearer-token auth as the REST transport.
+//!
+//! Wire: hyper accept loop → auth check (401 pre-routing) →
+//! StreamableHttpService (MCP JSON-RPC + SSE) → RegistryServer (with
+//! session tools) → session_host machinery.
+
+use anyhow::{Context, Result};
+use std::sync::Arc;
+
+use tole_cli::session_tools::SessionToolState;
+use tole_core::memory::MemoryConfig;
+
+/// Serve MCP over Streamable HTTP. Blocks until the listener errors.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_mcp_http(
+    bind: &str,
+    port: u16,
+    token: &str,
+    allow_patterns: Vec<String>,
+    plan_mode: bool,
+    memory: Option<MemoryConfig>,
+) -> Result<()> {
+    use hyper_util::rt::TokioIo;
+    use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+    use rmcp::transport::streamable_http_server::tower::StreamableHttpService;
+
+    let addr = format!("{bind}:{port}");
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .with_context(|| format!("binding {addr}"))?;
+    eprintln!(
+        "tole serve (mcp): listening on http://{addr} ({} allow pattern(s), plan_mode={})",
+        allow_patterns.len(),
+        plan_mode
+    );
+
+    // The MCP service: the session-tool state is shared across the
+    // service factory's instances (one Arc per connection).
+    let session_state = Arc::new(SessionToolState::new(
+        allow_patterns.clone(),
+        plan_mode,
+        memory,
+        std::env::current_dir().context("resolving server cwd")?,
+    ));
+
+    // The registry: the standard server-mode tools + the session tools,
+    // plus the per-session resolver — a tool call carrying `session_id`
+    // routes to THAT session's registry (its jail + approver).
+    let registry = crate::build_server_registry_for_mcp(plan_mode)?;
+    let session_tools = session_state.tools();
+    let resolver_sessions = Arc::clone(&session_state.sessions);
+    let resolver: tole_core::mcp_server::SessionRegistryResolver = Arc::new(move |sid: &str| {
+        let sessions = tole_cli::session_host::lock_sessions(&resolver_sessions);
+        sessions.map.get(sid).map(|st| Arc::clone(&st.registry))
+    });
+    let server = tole_core::mcp_server::RegistryServer::with_extra_tools(registry, session_tools)
+        .with_session_resolver(resolver);
+
+    let session_manager: Arc<LocalSessionManager> = Arc::new(LocalSessionManager::default());
+    let svc = StreamableHttpService::new(
+        move || Ok(server.clone()),
+        session_manager,
+        Default::default(),
+    );
+
+    let token = token.to_string();
+    loop {
+        let (stream, _peer) = listener.accept().await?;
+        let svc = svc.clone();
+        let token = token.clone();
+        tokio::spawn(async move {
+            let io = TokioIo::new(stream);
+            let svc_for_conn = svc.clone();
+            let token_for_conn = token.clone();
+            let hyper_service =
+                hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                    let svc = svc_for_conn.clone();
+                    let token = token_for_conn.clone();
+                    async move {
+                        use http_body_util::BodyExt;
+                        // Bearer-token gate BEFORE the MCP service sees
+                        // anything (#137 auth surface).
+                        let auth = req
+                            .headers()
+                            .get(hyper::header::AUTHORIZATION)
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|v| v.strip_prefix("Bearer "))
+                            .map(|t| t == token)
+                            .unwrap_or(false);
+                        // Unified response body type for both arms.
+                        type RespBody = http_body_util::combinators::BoxBody<
+                            hyper::body::Bytes,
+                            std::io::Error,
+                        >;
+                        fn box_full(bytes: hyper::body::Bytes) -> RespBody {
+                            http_body_util::Full::new(bytes)
+                                .map_err(|never| match never {})
+                                .boxed()
+                        }
+                        if !auth {
+                            let resp = hyper::Response::builder()
+                                .status(401)
+                                .header("content-type", "application/json")
+                                .body(box_full(hyper::body::Bytes::from(
+                                    "{\"error\":\"unauthorized\"}",
+                                )))
+                                .map_err(|e| std::io::Error::other(e.to_string()))?;
+                            return Ok::<_, std::io::Error>(resp);
+                        }
+                        // Tower → hyper bridge: collect the request body,
+                        // call the service (Error = Infallible), adapt the
+                        // response body back to a hyper body.
+                        use tower_service::Service as _;
+                        let (parts, incoming) = req.into_parts();
+                        let body_bytes: hyper::body::Bytes = incoming
+                            .collect()
+                            .await
+                            .map(|c| c.to_bytes())
+                            .unwrap_or_default();
+                        let full_req: http::Request<http_body_util::Full<hyper::body::Bytes>> =
+                            http::Request::from_parts(parts, http_body_util::Full::new(body_bytes));
+                        let mut svc = svc;
+                        let resp = match svc.call(full_req).await {
+                            Ok(r) => r,
+                            Err(infallible) => match infallible {},
+                        };
+                        let (rp, rbody) = resp.into_parts();
+                        // STREAM the body (CodeCora round-2): collecting
+                        // an SSE response before sending would withhold
+                        // all bytes for the entire tool call — long
+                        // tole_session_prompt turns would trip client
+                        // idle timeouts and drop incremental updates.
+                        // BodyStream forwards frames as they arrive.
+                        let body: RespBody = http_body_util::BodyStream::new(rbody)
+                            .map_err(|inf| match inf {})
+                            .boxed();
+                        Ok(hyper::Response::from_parts(rp, body))
+                    }
+                });
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(io, hyper_service)
+                .await;
+        });
+    }
+}

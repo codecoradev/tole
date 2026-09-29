@@ -16,9 +16,11 @@ shell-tools = []
 # MCP client (issue #74): register external MCP servers' tools into the
 # registry over stdio. Mobile/embedder profiles stay MCP-free.
 mcp = ["dep:rmcp", "dep:tokio", "shell-tools"]
+# rmcp streamable-http-server pulls tower/http types for the HTTP transport.
+mcp-http = ["mcp", "rmcp/transport-streamable-http-server"]
 
 [dependencies]
-rmcp = { version = "3.3", features = ["client", "server", "transport-io", "transport-child-process"], optional = true }
+rmcp = { version = "3.3", features = ["client", "server", "transport-io", "transport-child-process", "transport-streamable-http-server"], optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "process", "time"], optional = true }
 libc = "0.2"
 serde = { workspace = true }

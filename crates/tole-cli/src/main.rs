@@ -10,6 +10,8 @@ use tole_core::approval::AllowlistApprover;
 
 #[cfg(feature = "shell-tools")]
 mod acp;
+#[cfg(feature = "mcp-http")]
+mod mcp_http;
 #[cfg(feature = "shell-tools")]
 mod serve;
 #[cfg(feature = "shell-tools")]
@@ -208,13 +210,17 @@ enum Command {
         #[arg(long)]
         memory: Option<String>,
     },
-    /// Serve tole over HTTP (issue #96): token-authenticated daemon with
-    /// REST session endpoints. Binds 127.0.0.1 by default.
+    /// Serve tole over HTTP (issue #96): token-authenticated daemon;
+    /// `--transport mcp` serves the multi-session MCP surface (#137).
     #[cfg(feature = "shell-tools")]
     Serve {
         /// TCP port to listen on.
         #[arg(long, default_value_t = 7801)]
         port: u16,
+
+        /// Transport: `rest` (default) or `mcp` (Streamable HTTP).
+        #[arg(long, default_value = "rest")]
+        transport: String,
 
         /// Bind address (default: 127.0.0.1 — local only).
         #[arg(long, default_value = "127.0.0.1")]
@@ -387,6 +393,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         Command::Serve {
             port,
             bind,
+            transport,
             token,
             allow_patterns,
             workspace,
@@ -397,10 +404,34 @@ fn dispatch(cli: Cli) -> Result<()> {
                 None => host.memory.clone(),
             };
             let workspace = workspace.or_else(|| host.workspace.clone());
+            // Both transports refuse to start without a token (#96/#137).
+            let token = token
+                .or_else(|| std::env::var("TOLE_SERVE_TOKEN").ok())
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .context(
+                    "refusing to start an unauthenticated server: set --token or TOLE_SERVE_TOKEN",
+                )?;
+            if transport == "mcp" {
+                #[cfg(feature = "mcp-http")]
+                {
+                    let rt = tokio::runtime::Runtime::new().context("creating tokio runtime")?;
+                    return rt.block_on(crate::mcp_http::run_mcp_http(
+                        &bind,
+                        port,
+                        &token,
+                        allow_patterns,
+                        host.plan_mode,
+                        memory,
+                    ));
+                }
+                #[cfg(not(feature = "mcp-http"))]
+                anyhow::bail!("--transport mcp requires the mcp-http feature");
+            }
             crate::serve::run_serve(crate::serve::ServeConfig {
                 bind,
                 port,
-                token,
+                token: Some(token),
                 allow_patterns,
                 workspace,
                 plan_mode: host.plan_mode,
@@ -808,6 +839,16 @@ fn build_server_registry(
 /// client disconnects.
 #[cfg(all(feature = "mcp", feature = "shell-tools"))]
 #[cfg_attr(not(feature = "mcp"), allow(unused_variables))]
+/// Server-mode registry for the MCP-over-HTTP host (#137): the same
+/// hardened tools as stdio MCP (D1); the session tools join separately
+/// via RegistryServer::with_extra_tools.
+#[cfg(all(feature = "mcp-http", feature = "shell-tools"))]
+fn build_server_registry_for_mcp(_plan_mode: bool) -> Result<ToolRegistry> {
+    // Empty allowlist: the session tools carry their own approver per
+    // session; registry Write tools stay pre-auth-off (deny by default).
+    build_server_registry(None, &[])
+}
+
 fn mcp_server_command(
     workspace: Option<&String>,
     allow_patterns: &[String],
