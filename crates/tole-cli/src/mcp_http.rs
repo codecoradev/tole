@@ -95,14 +95,23 @@ pub async fn run_mcp_http(
                             .and_then(|v| v.strip_prefix("Bearer "))
                             .map(|t| t == token)
                             .unwrap_or(false);
+                        // Unified response body type for both arms.
+                        type RespBody = http_body_util::combinators::BoxBody<
+                            hyper::body::Bytes,
+                            std::io::Error,
+                        >;
+                        fn box_full(bytes: hyper::body::Bytes) -> RespBody {
+                            http_body_util::Full::new(bytes)
+                                .map_err(|never| match never {})
+                                .boxed()
+                        }
                         if !auth {
-                            let body = http_body_util::Full::new(hyper::body::Bytes::from(
-                                "{\"error\":\"unauthorized\"}",
-                            ));
                             let resp = hyper::Response::builder()
                                 .status(401)
                                 .header("content-type", "application/json")
-                                .body(body)
+                                .body(box_full(hyper::body::Bytes::from(
+                                    "{\"error\":\"unauthorized\"}",
+                                )))
                                 .map_err(|e| std::io::Error::other(e.to_string()))?;
                             return Ok::<_, std::io::Error>(resp);
                         }
@@ -124,15 +133,16 @@ pub async fn run_mcp_http(
                             Err(infallible) => match infallible {},
                         };
                         let (rp, rbody) = resp.into_parts();
-                        let resp_bytes: hyper::body::Bytes = rbody
-                            .collect()
-                            .await
-                            .map(|c| c.to_bytes())
-                            .unwrap_or_default();
-                        Ok(hyper::Response::from_parts(
-                            rp,
-                            http_body_util::Full::new(resp_bytes),
-                        ))
+                        // STREAM the body (CodeCora round-2): collecting
+                        // an SSE response before sending would withhold
+                        // all bytes for the entire tool call — long
+                        // tole_session_prompt turns would trip client
+                        // idle timeouts and drop incremental updates.
+                        // BodyStream forwards frames as they arrive.
+                        let body: RespBody = http_body_util::BodyStream::new(rbody)
+                            .map_err(|inf| match inf {})
+                            .boxed();
+                        Ok(hyper::Response::from_parts(rp, body))
                     }
                 });
             let _ = hyper::server::conn::http1::Builder::new()
