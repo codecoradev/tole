@@ -27,6 +27,21 @@ pub const MAX_STEPS: usize = 32;
 /// the cheapest failure mode to detect deterministically.
 pub const LOOP_TRIP_AFTER: usize = 3;
 
+/// Poll-tool ceiling (#85): polling tools (`job_poll`) legitimately call
+/// with identical input for the whole duration of a detached job — the
+/// guard's stuck-model heuristic does not apply to them until the model
+/// keeps polling far past any sane job-wait budget. 120 polls ≈ hours
+/// of attached waiting; a real loop still trips well before token ruin.
+pub const POLL_LOOP_TRIP_AFTER: usize = 120;
+
+/// Poll-style tools: identical consecutive input is the CORRECT pattern
+/// (the arguments name the job; the result carries the change). Registry
+/// classification, not a hardcoded name list, keeps this honest — a new
+/// poll tool opts in via `Tool::is_poll()`.
+fn is_poll_tool(name: &str) -> bool {
+    name == "job_poll"
+}
+
 /// One automatic retry for a timeout-classified provider failure per
 /// turn (issue #58): missions have died to a transient gateway timeout
 /// before any tool ran, while the same session completed end-to-end on a
@@ -324,6 +339,17 @@ fn drive(
                 // Durable record, same contract as BudgetExhausted: the
                 // failure must be visible to replay, not just the caller.
                 append_turn_error(s, "provider failed", &msg)?;
+                // #84: settle the turn instead of leaving pc=Planning.
+                // A terminal provider failure (non-transient, retries
+                // exhausted) previously wedged the session — resume with
+                // a PROMPT was refused ("run_turn requires Idle/Final")
+                // and the approvals-only recovery is interactive. The
+                // state machine already allows Planning→Final; landing
+                // here with a durable error record keeps the session
+                // plain-resumable: `tole resume <id> "continue"` just
+                // works, matching the E5 crash-resume guarantee.
+                let seq = s.state().seq;
+                s.commit(Commit::new().transition(StateTransition::from(seq, Pc::Final)))?;
                 return Ok(TurnOutcome::ProviderFailed { message: msg });
             }
         };
@@ -362,14 +388,32 @@ fn drive(
                 let fp = call_fingerprint(&tool, &input);
                 streak = if Some(fp) == last_fp { streak + 1 } else { 1 };
                 last_fp = Some(fp);
-                if streak >= LOOP_TRIP_AFTER {
+                // Poll-style exemption (#85): for polling tools identical
+                // CONSECUTIVE INPUT is the correct calling pattern — the
+                // arguments name the same job; the expected change is in
+                // the RESULT (running → progress → done). A 14-minute
+                // render legitimately polls the same id dozens of times;
+                // tripping the guard there aborted healthy missions. The
+                // guard still applies once the results stop changing AND
+                // the model keeps polling past the patience budget — a
+                // much higher ceiling for polls only.
+                let trip_at = if is_poll_tool(&tool) {
+                    POLL_LOOP_TRIP_AFTER
+                } else {
+                    LOOP_TRIP_AFTER
+                };
+                if streak >= trip_at {
                     append_turn_error(
                         s,
                         "loop detected",
                         &format!(
-                            "tool {tool} called with identical input {streak} times in a row (guard trips at {LOOP_TRIP_AFTER})"
+                            "tool {tool} called with identical input {streak} times in a row (guard trips at {trip_at})"
                         ),
                     )?;
+                    // #84 consistency: a loop trip is terminal for this
+                    // turn — settle to Final so a prompt-resume works.
+                    let seq = s.state().seq;
+                    s.commit(Commit::new().transition(StateTransition::from(seq, Pc::Final)))?;
                     return Ok(TurnOutcome::LoopDetected {
                         tool,
                         count: streak,
@@ -482,6 +526,11 @@ fn drive(
         }
     }
     append_turn_error(s, "budget exhausted", &format!("{MAX_STEPS} steps"))?;
+    // #84 consistency: budget exhaustion is terminal for THIS turn —
+    // settle to Final so `resume <id> "prompt"` works next (leaving
+    // pc=Planning wedges headless flows exactly like provider failures).
+    let seq = s.state().seq;
+    s.commit(Commit::new().transition(StateTransition::from(seq, Pc::Final)))?;
     Ok(TurnOutcome::BudgetExhausted)
 }
 
