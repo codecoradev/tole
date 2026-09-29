@@ -146,7 +146,8 @@ stderr note; the turn proceeds without memory.
 ## Documentation
 
 - [Architecture](docs/architecture.md) · [Threat model](docs/threat-model.md)
-  · [PRD](docs/prd.md) · [Epics & roadmap](docs/epics.md)
+  · [PRD](docs/prd.md) · [Epics & roadmap](docs/epics.md) ·
+  [Performance record](docs/perf.md)
 - [CONTRIBUTING.md](CONTRIBUTING.md) — workflow, issue/PR rules, merge gate,
   cora review gate, live-mission binary hygiene
 - [AGENTS.md](AGENTS.md) — the same rules for AI coding agents

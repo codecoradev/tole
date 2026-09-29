@@ -101,12 +101,12 @@ edit) · gh read ops · TOLE_* env canonical.
 
 ---
 
-## Track C — In progress (E9)
+## Track C — ✅ DONE (E9, closed 2026-09-28)
 
-E9 hardening/OSS-prep (issue #9): cross-build CI (aarch64-android,
-aarch64-apple-ios), timeout/truncation fuzz-lite, perf doc, LICENSE/README
-publish. MCP client **shipped** (#74, closed 2026-09-12). Session branching
-still deferred.
+E9 hardening/OSS-prep (issue #9) complete: cross-build CI (#82),
+timeout/truncation fuzz-lite + panic-free corpus (perf PR), perf
+thresholds + docs/perf.md, LICENSE/README/SECURITY public-ready (#79,
+#91). MCP client shipped early (#74). Session branching stays deferred.
 
 ---
 
