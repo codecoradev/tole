@@ -114,6 +114,17 @@ struct Cli {
     #[arg(long, global = true)]
     on_posttool: Vec<String>,
 
+    /// Turn-end stop gate hook (issue #145): runs when the model
+    /// produces its final message, BEFORE it commits. Receives one JSON
+    /// object on stdin (`{"event":"turnend","final_text_preview":...,
+    /// "tools":[{"tool":...,"risk":...}]}`); exit code 2 = DENY the
+    /// finish — the reason becomes the model's next input and the loop
+    /// continues (bounded: 3 denials per turn, then the turn settles as
+    /// blocked). 30s timeout per hook (verification gates run lint/tests).
+    /// Example: --on-turnend "cargo check". Repeatable; default OFF.
+    #[arg(long, global = true)]
+    on_turnend: Vec<String>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -297,6 +308,7 @@ fn dispatch(cli: Cli) -> Result<()> {
 
         on_pretool: cli.on_pretool.clone(),
         on_posttool: cli.on_posttool.clone(),
+        on_turnend: cli.on_turnend.clone(),
         #[cfg(feature = "shell-tools")]
         memory: resolve_memory(cli.memory.as_ref())?,
         #[cfg(not(feature = "shell-tools"))]
@@ -474,6 +486,7 @@ struct HostConfig {
 
     /// Tool-boundary hook command lines (issue #110), default empty.
     on_pretool: Vec<String>,
+    on_turnend: Vec<String>,
     on_posttool: Vec<String>,
     /// shell-tools-only host knob. `not(feature = "shell-tools")` builds
     /// still assign `memory: None` in dispatch — the field stays so the
@@ -916,11 +929,14 @@ fn run_command(
     // Opt-in tool-boundary hooks (issue #110): deny-only policy
     // injection for Write/Destructive calls, default OFF.
     #[cfg(feature = "shell-tools")]
-    if !host.on_pretool.is_empty() || !host.on_posttool.is_empty() {
-        registry.set_hooks(tole_core::hooks::ToolHooks::from_cli(
-            &host.on_pretool,
-            &host.on_posttool,
-        ));
+    if !host.on_pretool.is_empty() || !host.on_posttool.is_empty() || !host.on_turnend.is_empty() {
+        let mut hooks = tole_core::hooks::ToolHooks::from_cli(&host.on_pretool, &host.on_posttool);
+        hooks.turnend = host
+            .on_turnend
+            .iter()
+            .map(|c| tole_core::hooks::turnend_hook(c))
+            .collect();
+        registry.set_hooks(hooks);
     }
 
     let session_id = new_session_id();
@@ -1003,11 +1019,14 @@ fn resume_command(
     // Opt-in tool-boundary hooks (issue #110): deny-only policy
     // injection for Write/Destructive calls, default OFF.
     #[cfg(feature = "shell-tools")]
-    if !host.on_pretool.is_empty() || !host.on_posttool.is_empty() {
-        registry.set_hooks(tole_core::hooks::ToolHooks::from_cli(
-            &host.on_pretool,
-            &host.on_posttool,
-        ));
+    if !host.on_pretool.is_empty() || !host.on_posttool.is_empty() || !host.on_turnend.is_empty() {
+        let mut hooks = tole_core::hooks::ToolHooks::from_cli(&host.on_pretool, &host.on_posttool);
+        hooks.turnend = host
+            .on_turnend
+            .iter()
+            .map(|c| tole_core::hooks::turnend_hook(c))
+            .collect();
+        registry.set_hooks(hooks);
     }
     let mut provider = OpenAiProvider::new(cfg).with_tool_specs(registry.specs());
     // B2: the system prompt is pinned in the session header — resume
@@ -1286,11 +1305,14 @@ fn chat_command(
     // Opt-in tool-boundary hooks (issue #110): deny-only policy
     // injection for Write/Destructive calls, default OFF.
     #[cfg(feature = "shell-tools")]
-    if !host.on_pretool.is_empty() || !host.on_posttool.is_empty() {
-        registry.set_hooks(tole_core::hooks::ToolHooks::from_cli(
-            &host.on_pretool,
-            &host.on_posttool,
-        ));
+    if !host.on_pretool.is_empty() || !host.on_posttool.is_empty() || !host.on_turnend.is_empty() {
+        let mut hooks = tole_core::hooks::ToolHooks::from_cli(&host.on_pretool, &host.on_posttool);
+        hooks.turnend = host
+            .on_turnend
+            .iter()
+            .map(|c| tole_core::hooks::turnend_hook(c))
+            .collect();
+        registry.set_hooks(hooks);
     }
 
     if fresh {
@@ -1457,6 +1479,11 @@ fn chat_command(
             Ok(TurnOutcome::BudgetExhausted) => {
                 eprintln!("tole> (step budget exhausted — turn aborted; next message resumes)")
             }
+            Ok(TurnOutcome::StopGateBlocked { reason }) => {
+                eprintln!(
+                    "tole> (stop gate blocked: {reason} — turn aborted; next message resumes)"
+                )
+            }
             Ok(TurnOutcome::LoopDetected { .. }) => eprintln!(
                 "tole> (loop guard tripped — identical tool calls repeated; next message resumes)"
             ),
@@ -1584,6 +1611,12 @@ fn report_outcome(session_id: &str, outcome: TurnOutcome) {
     match outcome {
         TurnOutcome::Final { text, .. } => {
             println!("{text}");
+        }
+        TurnOutcome::StopGateBlocked { reason } => {
+            eprintln!(
+                "tole: stop gate blocked the turn: {reason} (resume with: tole resume {session_id})"
+            );
+            std::process::exit(6);
         }
         TurnOutcome::ApprovalRequired { name } => {
             eprintln!(

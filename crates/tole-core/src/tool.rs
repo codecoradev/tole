@@ -126,6 +126,53 @@ impl ToolRegistry {
         }
     }
 
+    /// True when at least one turn-end gate is wired.
+    #[cfg(feature = "shell-tools")]
+    pub(crate) fn has_turnend_hooks(&self) -> bool {
+        self.hooks
+            .as_ref()
+            .map(|h| !h.turnend.is_empty())
+            .unwrap_or(false)
+    }
+
+    /// Turn-end gate pass (issue #145). `tools` is the per-turn tool/risk
+    /// summary the payload carries. Returns the FIRST deny reason (exit
+    /// 2); hook failures are logged and non-blocking per the #110
+    /// contract. Stop after the first deny: the model fixes one complaint
+    /// at a time — re-running all gates on every denial would burn the
+    /// step budget re-reporting the same failures.
+    #[cfg(feature = "shell-tools")]
+    pub(crate) fn turnend_denial(
+        &self,
+        final_preview: &str,
+        tools: &[(String, crate::tool::Risk)],
+    ) -> Option<String> {
+        let hooks = self.hooks.as_ref()?;
+        let payload = serde_json::json!({
+            "event": "turnend",
+            "final_text_preview": &final_preview.chars().take(8192).collect::<String>(),
+            "tools": tools
+                .iter()
+                .map(|(t, r)| {
+                    let risk = match r {
+                        Risk::ReadOnly => "readonly",
+                        Risk::Write => "write",
+                        Risk::Destructive => "destructive",
+                    };
+                    serde_json::json!({"tool": t, "risk": risk})
+                })
+                .collect::<Vec<_>>(),
+        });
+        for h in &hooks.turnend {
+            match h.run("turnend", "turn", &payload, None) {
+                Ok(Some(reason)) => return Some(reason),
+                Ok(None) => {}
+                Err(e) => eprintln!("tole: turnend-hook failure (non-blocking): {e}"),
+            }
+        }
+        None
+    }
+
     /// Register a tool. Duplicate names are a wiring bug and are refused
     /// (no panics in core). Write tools require an approver; Destructive
     /// tools require an *interactive* approver (structural enforcement —

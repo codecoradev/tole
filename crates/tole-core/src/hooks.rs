@@ -93,6 +93,11 @@ impl ProcessHook {
 pub struct ToolHooks {
     pub pre: Vec<ProcessHook>,
     pub post: Vec<ProcessHook>,
+    /// Turn-end gates (issue #145): fire when the provider produces the
+    /// final message, BEFORE it commits. Deny (exit 2) forces the loop to
+    /// continue — the model must satisfy the gate. Verification gates
+    /// legitimately run lint/tests, so these get a 30s timeout each.
+    pub turnend: Vec<ProcessHook>,
 }
 
 impl ToolHooks {
@@ -101,8 +106,22 @@ impl ToolHooks {
         Self {
             pre: pre.iter().map(|s| ProcessHook::new(s)).collect(),
             post: post.iter().map(|s| ProcessHook::new(s)).collect(),
+            turnend: Vec::new(),
         }
     }
+}
+
+/// Default per-hook timeout for turn-end gates: a verification gate that
+/// runs `cargo check` / lint legitimately needs more than the 5s tool
+/// budget; 30s is the documented #145 contract.
+pub const TURNEND_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Build a turn-end gate hook from a CLI command line (30s timeout).
+#[cfg(feature = "shell-tools")]
+pub fn turnend_hook(command_line: &str) -> ProcessHook {
+    let mut h = ProcessHook::new(command_line);
+    h.timeout = TURNEND_TIMEOUT;
+    h
 }
 
 #[cfg(test)]
