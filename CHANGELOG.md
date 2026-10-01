@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Turn-end stop gates (#145, `--on-turnend`, default OFF): deterministic
+  script gates that fire when the model produces its final message,
+  BEFORE it commits. Deny (exit 2) forces continuation — the reason
+  becomes the model's next input and the loop re-runs (the Claude Code
+  "stop hook / gate forces the model to fix it" pattern). Bounded: 3
+  denials per turn then the turn settles durably as `StopGateBlocked`
+  (prompt-resumable); hook failures stay non-blocking; 30s per-hook
+  timeout (verification gates run lint/tests). Payload carries the
+  final-text preview (8 KiB) and the per-turn tool/risk summary.
 - Memory-loop decision typing (#143): a session that executed any
   Write/Destructive tool is stored to uteke with `--type decision` and a
   `wrote` tag (plain context sessions unchanged). The flag is durable
