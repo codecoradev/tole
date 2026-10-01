@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `verify_package` tool (#144, ReadOnly): checks a package name against
+  the crates.io / npm registry before any install — the slopsquatting
+  defense (hallucinated names get pre-registered with malware; 43% of
+  hallucinated names recur, 13% are one character from a real package).
+  Not-found answers include registry candidates; one-character
+  candidates surface a typo-squat warning; 429/5xx honestly report
+  `rate_limited` (never "not found"). The default system prompt tells
+  the model to verify before installing.
 - Turn-end stop gates (#145, `--on-turnend`, default OFF): deterministic
   script gates that fire when the model produces its final message,
   BEFORE it commits. Deny (exit 2) forces continuation — the reason
@@ -21,8 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   30s per-hook timeout. Payload carries the final-text preview (8 KiB)
   and the per-turn tool/risk summary.
 - Memory-loop decision typing (#143): a session that executed any
-  Write/Destructive tool is stored to uteke with `--type decision` and a
-  `wrote` tag (plain context sessions unchanged). The flag is durable
+  Write/Destructive tool is stored to uteke with `--type decision` and
+  a `wrote` tag (plain context sessions unchanged). The flag is durable
   and session-scoped — set on fresh execution AND crash-replay of a
   Write, never reset by turn machinery — and derived from tool risk,
   not model claims. Summary content contract is unchanged: first
