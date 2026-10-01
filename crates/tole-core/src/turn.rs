@@ -432,14 +432,26 @@ fn drive(
                         .entries()
                         .iter()
                         .rposition(|e| {
-                            e.kind.as_str() == "message" && e.payload["role"] == json!("user")
+                            // cora CI round 2: this loop's OWN deny
+                            // feedback is also a user-role entry — if it
+                            // counted, turn_start would jump past the
+                            // turn's tool calls on the second Final and
+                            // a presence-keyed gate would be defeated.
+                            // Hence the explicit marker is skipped.
+                            e.kind.as_str() == "message"
+                                && e.payload["role"] == json!("user")
+                                && e.payload["stop_gate_feedback"] != json!(true)
                         })
                         .unwrap_or(0);
                     let tools_seen: Vec<(String, Risk)> = s
                         .entries()
                         .iter()
                         .skip(turn_start)
-                        .filter(|e| e.kind.as_str() == "tool_call")
+                        // Intents are stored as generic entries whose
+                        // payload carries `tool` (the kind is "entry",
+                        // not "tool_call" — found by the round-2 test's
+                        // payload dump, not by reading code).
+                        .filter(|e| e.payload.get("tool").is_some())
                         .filter_map(|e| {
                             let tool = e.payload.get("tool")?.as_str()?.to_string();
                             let risk = registry
@@ -469,7 +481,8 @@ fn drive(
                             EntryType::new(EntryType::MESSAGE),
                             json!({
                                 "role": "user",
-                                "text": format!("stop gate: {reason}")
+                                "text": format!("stop gate: {reason}"),
+                                "stop_gate_feedback": true
                             }),
                         )))?;
                         continue;

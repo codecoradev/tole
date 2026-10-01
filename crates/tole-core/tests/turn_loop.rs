@@ -1339,3 +1339,64 @@ fn stop_gate_payload_is_per_turn_not_history() {
         "turn 2 payload must not contain turn 1's tools: {tools:?}"
     );
 }
+
+#[test]
+fn stop_gate_payload_keeps_tools_across_own_denial() {
+    // cora CI round 2: the deny feedback entry is user-role; on the
+    // second Final it must NOT become the turn window start, or the
+    // turn's earlier tool calls vanish from the payload and a
+    // presence-keyed gate ("deny if write_file ran") is defeated by
+    // just re-finalizing.
+    let dir = tmpdir("gate-feedback");
+    let mut s = JsonlStorage::create(&dir, "gfb", None).unwrap();
+    let dump = std::env::temp_dir().join(format!("tole-gate-fb-{}", std::process::id()));
+    let _ = std::fs::remove_file(&dump);
+    let gate = std::env::temp_dir().join(format!("tole-gate-fbsh-{}", std::process::id()));
+    std::fs::write(
+        &gate,
+        format!("#!/bin/sh\ntee -a {} >/dev/null\nexit 2\n", dump.display()),
+    )
+    .unwrap();
+    let mut reg = registry_with_gates_write(&[format!("/bin/sh {}", gate.display())]);
+    reg.register(Box::new(WriteTool)).unwrap();
+    reg.register(Box::new(EchoTool)).unwrap();
+
+    // Write tool runs once, then the provider keeps finalizing: the gate
+    // always denies → denials 1..3 fire, the third trips the cap. The
+    // LAST payload must still contain write_file (the feedback entry did
+    // not shrink the window).
+    let mut p = MockProvider::scripted(vec![
+        ProviderOutput::ToolCall {
+            tool: "write_file".into(),
+            input: json!({"path": "a.txt"}),
+        },
+        ProviderOutput::Final {
+            text: "attempt 2".into(),
+        },
+        ProviderOutput::Final {
+            text: "attempt 3".into(),
+        },
+        ProviderOutput::Final {
+            text: "attempt 4".into(),
+        },
+        ProviderOutput::Final {
+            text: "attempt 5".into(),
+        },
+    ]);
+    let out = run_turn(&mut s, &mut p, &reg, "hi").unwrap();
+    match out {
+        TurnOutcome::StopGateBlocked { .. } => {}
+        other => panic!("expected StopGateBlocked, got {other:?}"),
+    }
+
+    // The LAST dumped payload (from the second Final, after the feedback
+    // entry) must still contain write_file — the window did not jump.
+    let content = std::fs::read_to_string(&dump).unwrap();
+    let de = serde_json::Deserializer::from_str(&content).into_iter::<serde_json::Value>();
+    let v = de.last().expect("payloads").expect("valid json");
+    let tools = v["tools"].as_array().cloned().unwrap_or_default();
+    assert!(
+        tools.iter().any(|t| t["tool"] == "write_file"),
+        "second-Final payload must keep the turn's tools: {tools:?}"
+    );
+}
