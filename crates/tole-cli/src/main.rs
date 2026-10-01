@@ -32,6 +32,7 @@ use tole_core::tool::ToolRegistry;
 use tole_core::turn::{resume_turn, run_turn, TurnOutcome, LOOP_TRIP_AFTER};
 #[cfg(feature = "shell-tools")]
 use tole_core::uteke::{UtekeDocumentTool, UtekeRecallTool};
+use tole_core::verify_package::VerifyPackageTool;
 
 /// Where sessions live unless the user overrides it.
 const DEFAULT_SESSIONS_DIR: &str = ".tole/sessions";
@@ -718,6 +719,8 @@ fn build_registry(
     #[cfg(feature = "shell-tools")]
     reg.register(Box::new(JobPollTool::new(file_root.clone())))
         .map_err(|e| anyhow::anyhow!("registering job_poll: {e}"))?;
+    reg.register(Box::new(VerifyPackageTool::new()))
+        .map_err(|e| anyhow::anyhow!("registering verify_package: {e}"))?;
     reg.register(Box::new(ReadFileTool::new(file_root.clone())))
         .map_err(|e| anyhow::anyhow!("registering read_file: {e}"))?;
     // Write tools: gated per call. The jail root is the workspace.
@@ -816,6 +819,8 @@ fn build_server_registry(
         reg.register(Box::new(JobPollTool::new(file_root.clone())))
             .map_err(|e| anyhow::anyhow!("registering job_poll: {e}"))?;
     }
+    reg.register(Box::new(VerifyPackageTool::new()))
+        .map_err(|e| anyhow::anyhow!("registering verify_package: {e}"))?;
     reg.register(Box::new(ReadFileTool::new(file_root.clone())))
         .map_err(|e| anyhow::anyhow!("registering read_file: {e}"))?;
     reg.register(Box::new(WriteFileTool::new(file_root.clone())))
@@ -1526,7 +1531,10 @@ fn default_system_prompt() -> &'static str {
 involving files, prefer the dedicated tools — read_file, write_file, \
 edit_file — instead of run_command; they are safer and their approvals are \
 what the user's --allow settings mean. Use run_command only for what those \
-cannot do (pipes, builds, process control). Keep answers concise."
+cannot do (pipes, builds, process control). Before running any package \
+install (cargo add, bun add, npm install), verify the package name exists \
+with the verify_package tool — hallucinated package names are a real \
+supply-chain attack vector. Keep answers concise."
 }
 
 /// Same default without shell tools: `run_command` is not registered in
@@ -1535,7 +1543,8 @@ cannot do (pipes, builds, process control). Keep answers concise."
 fn default_system_prompt() -> &'static str {
     "You are tole, a careful personal assistant. Tool discipline: for anything \
 involving files, prefer the dedicated tools — read_file, write_file, \
-edit_file. Keep answers concise."
+edit_file. Before running any package install, verify the package name \
+exists with the verify_package tool. Keep answers concise."
 }
 
 /// The default prompt for the session's mode (issue #109). Plan mode

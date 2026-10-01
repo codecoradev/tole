@@ -65,6 +65,7 @@ pub mod tool;
 pub mod turn;
 #[cfg(feature = "shell-tools")]
 pub mod uteke;
+pub mod verify_package;
 
 /// Semantic version of the durable schema (see storage module docs).
 pub const STORAGE_VERSION: u32 = 1;
