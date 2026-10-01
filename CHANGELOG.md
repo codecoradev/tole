@@ -159,6 +159,12 @@ live E2E findings (2026-09-11 vetio missions + 2026-09-12 optimization pass).
   provider step anchored to the last committed entry — `tole status` now
   reports real token totals instead of 0/0 (#66).
 - Live-mission binary hygiene rules in CONTRIBUTING.md (#60, #61).
+- Agentic eval harness (issue #73, #76): Tier 1 deterministic contracts
+  wired into a dedicated Evals CI job (wire-shape stability = prefix-
+  cache contract, resume equivalence, abort-path resumability, approval
+  matrix); Tier 2 live BYOK missions scored on success/steps/usage-
+  ledger tokens; Tier 3 per-release baselines with a >25%-regression
+  diff gate (`evals/`).
 
 ### Changed
 - Retry classification: 429/rate-limit responses join timeouts as
@@ -166,6 +172,24 @@ live E2E findings (2026-09-11 vetio missions + 2026-09-12 optimization pass).
   entry is now "provider transient failure, retrying" (#58, #62, #66).
 - The turn loop no longer clones the full transcript for every provider
   step; `complete()` borrows the storage slice (#66).
+
+### Fixed
+- `AllowlistApprover` constructor semantics (#70): documented the
+  decision pipeline (pattern match → Allow; `default` applies only to
+  NON-matches, so `new(vec!["x"], Decision::Deny)` ALLOWS "x") with a
+  regression test, and added unambiguous `allow_only`/`deny_only`
+  constructors — the misleading shape that let the guarded-replay
+  livelock test look correct for months.
+- Replay safety derives from tool risk (#68): a crash mid-sandwich no
+  longer blindly re-executes a Write/Destructive tool on resume —
+  Guarded intents require fresh approver consent, and a denied/absent
+  approver settles the intent instead of livelocking the session.
+- File-tool jails validate by path components (#68): Windows
+  drive-prefixed/rooted relatives can no longer escape via `join`, and
+  benign names containing ".." are no longer falsely rejected.
+- JSONL torn-line recovery (#68): a newline-terminated corrupt final
+  line is truncated on open instead of surviving and permanently
+  bricking the session on the next append.
 
 ## [0.2.0] — 2026-08-27
 
