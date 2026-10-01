@@ -278,15 +278,15 @@ pub fn run_session_turn(
         .map_err(|e| e.to_string())?;
 
     #[cfg(feature = "shell-tools")]
-    if let tole_core::turn::TurnOutcome::Final { text } = &outcome {
+    if let tole_core::turn::TurnOutcome::Final { text, wrote } = &outcome {
         if let Some(mem) = &memory {
-            let _ = tole_core::memory::remember_session(mem, session_id, prompt, text);
+            let _ = tole_core::memory::remember_session(mem, session_id, prompt, text, *wrote);
         }
     }
     *first_prompt_done.lock().expect("fpd lock") = true;
 
     let stop = match &outcome {
-        tole_core::turn::TurnOutcome::Final { text } => {
+        tole_core::turn::TurnOutcome::Final { text, .. } => {
             final_text = Some(text.clone());
             "end_turn"
         }

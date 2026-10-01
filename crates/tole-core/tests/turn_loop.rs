@@ -8,7 +8,7 @@ use tole_core::mock::MockProvider;
 use tole_core::provider::{Provider, ProviderError, ProviderOutput};
 use tole_core::storage::{JsonlStorage, Storage};
 use tole_core::tool::{Risk, Tool, ToolRegistry};
-use tole_core::turn::{run_turn, TurnOutcome, MAX_STEPS};
+use tole_core::turn::{resume_turn, run_turn, TurnOutcome, MAX_STEPS};
 
 struct EchoTool;
 impl Tool for EchoTool {
@@ -148,7 +148,7 @@ fn provider_timeout_retried_once_then_succeeds() {
 
     let out = run_turn(&mut s, &mut p, &reg, "hi").unwrap();
     match out {
-        TurnOutcome::Final { text } => assert_eq!(text, "done"),
+        TurnOutcome::Final { text, .. } => assert_eq!(text, "done"),
         other => panic!("expected Final after timeout retry, got {other:?}"),
     }
     // Durable audit trail: the retry decision must be visible to replay.
@@ -214,7 +214,7 @@ fn provider_429_rate_limit_retried_once() {
 
     let out = run_turn(&mut s, &mut p, &reg, "hi").unwrap();
     match out {
-        TurnOutcome::Final { text } => assert_eq!(text, "after-429"),
+        TurnOutcome::Final { text, .. } => assert_eq!(text, "after-429"),
         other => panic!("expected Final after 429 retry, got {other:?}"),
     }
     let errs: Vec<&Entry> = s
@@ -366,7 +366,7 @@ fn turn_final_without_tools() {
 
     let out = run_turn(&mut s, &mut p, &reg, "hi").unwrap();
     match out {
-        TurnOutcome::Final { text } => assert_eq!(text, "hello!"),
+        TurnOutcome::Final { text, .. } => assert_eq!(text, "hello!"),
         other => panic!("expected Final, got {other:?}"),
     }
     // Durable state: user message + assistant message, pc Final.
@@ -740,7 +740,7 @@ fn chat_reopens_final_session_for_next_turn() {
         text: "first answer".into(),
     }]);
     let out = run_turn(&mut s, &mut p1, &reg, "hello").unwrap();
-    assert!(matches!(out, TurnOutcome::Final { ref text } if text == "first answer"));
+    assert!(matches!(out, TurnOutcome::Final { ref text, .. } if text == "first answer"));
     assert_eq!(s.state().pc, tole_core::state::Pc::Final);
 
     // Turn 2 on the SAME session: re-open Final → Planning.
@@ -748,7 +748,7 @@ fn chat_reopens_final_session_for_next_turn() {
         text: "second answer".into(),
     }]);
     let out = run_turn(&mut s, &mut p2, &reg, "again").unwrap();
-    assert!(matches!(out, TurnOutcome::Final { ref text } if text == "second answer"));
+    assert!(matches!(out, TurnOutcome::Final { ref text, .. } if text == "second answer"));
 
     // The tree holds the full conversation: 2 user + 2 assistant messages.
     let users = s
@@ -846,5 +846,202 @@ fn loop_guard_exempts_poll_tools_but_trips_eventually() {
     assert!(
         matches!(out, TurnOutcome::LoopDetected { ref tool, .. } if tool == "stuck_tool"),
         "non-poll identical calls must still trip: {out:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #143: write-sessions are typed as decisions in the memory loop
+// ---------------------------------------------------------------------------
+
+#[test]
+fn write_session_reports_wrote_true_on_final() {
+    let dir = tmpdir("decision-wrote");
+    let mut s = JsonlStorage::create(&dir, "dw", None).unwrap();
+    let mut p = MockProvider::scripted(vec![
+        ProviderOutput::ToolCall {
+            tool: "write_file".into(),
+            input: json!({"path": "a.txt"}),
+        },
+        ProviderOutput::Final {
+            text: "written".into(),
+        },
+    ]);
+    let mut reg = ToolRegistry::with_approver(AllowlistApprover::new(
+        vec!["write_file".to_string()],
+        Decision::Deny,
+    ));
+    reg.register(Box::new(WriteTool)).unwrap();
+
+    let out = run_turn(&mut s, &mut p, &reg, "hi").unwrap();
+    match out {
+        TurnOutcome::Final { wrote, .. } => assert!(
+            wrote,
+            "a session that executed a Write tool must report wrote=true"
+        ),
+        other => panic!("expected Final, got {other:?}"),
+    }
+}
+
+#[test]
+fn readonly_session_reports_wrote_false_on_final() {
+    let dir = tmpdir("decision-readonly");
+    let mut s = JsonlStorage::create(&dir, "dr", None).unwrap();
+    let mut p = MockProvider::scripted(vec![
+        ProviderOutput::ToolCall {
+            tool: "echo".into(),
+            input: json!({}),
+        },
+        ProviderOutput::Final {
+            text: "done".into(),
+        },
+    ]);
+    let mut reg = ToolRegistry::new();
+    reg.register(Box::new(EchoTool)).unwrap();
+
+    let out = run_turn(&mut s, &mut p, &reg, "hi").unwrap();
+    match out {
+        TurnOutcome::Final { wrote, .. } => {
+            assert!(!wrote, "read-only sessions must keep wrote=false")
+        }
+        other => panic!("expected Final, got {other:?}"),
+    }
+}
+
+#[test]
+fn wrote_flag_survives_crash_resume_boundary() {
+    // Write settles, provider dies BEFORE Final, session resumes:
+    // the resumed turn's Final must still carry wrote=true (the
+    // durable fact register, not an in-RAM flag).
+    let dir = tmpdir("decision-resume");
+    let mut s = JsonlStorage::create(&dir, "dres", None).unwrap();
+    let mut p = MockProvider::scripted(vec![ProviderOutput::ToolCall {
+        tool: "write_file".into(),
+        input: json!({"path": "a.txt"}),
+    }]);
+    let mut reg = ToolRegistry::with_approver(AllowlistApprover::new(
+        vec!["write_file".to_string()],
+        Decision::Deny,
+    ));
+    reg.register(Box::new(WriteTool)).unwrap();
+
+    let out = run_turn(&mut s, &mut p, &reg, "hi").unwrap();
+    assert!(
+        matches!(out, TurnOutcome::ProviderFailed { .. }),
+        "script exhaustion surfaces as ProviderFailed"
+    );
+    // Post-#84 the abort settles pc=Final (terminal, prompt-resumable);
+    // the durable flag SURVIVES the abort — it records that this turn
+    // did write — and is only cleared when the next fresh turn starts.
+    assert_eq!(
+        s.get_register("fact", "wrote_this_turn"),
+        Some(&json!(true)),
+        "flag must be durable across the abort boundary"
+    );
+}
+
+#[test]
+fn wrote_flag_inherits_across_a_settling_crash_resume() {
+    // The live inheritance scenario: crash lands between settle_ok and
+    // the next provider step (pc=Settling, flag already durable). Built
+    // through the REAL machine helpers — begin() + settle_ok() — so the
+    // crash-window state is exactly what production produces.
+    let dir = tmpdir("decision-settling");
+    let mut s = JsonlStorage::create(&dir, "dset", None).unwrap();
+    use tole_core::entry::{EntryType, NewEntry};
+    use tole_core::machine::ReplaySafety;
+    use tole_core::machine::{begin, settle_ok};
+    use tole_core::state::{Pc, StateTransition};
+    use tole_core::storage::Commit;
+
+    let seq = s.state().seq;
+    s.commit(
+        Commit::new()
+            .entry(NewEntry::root(
+                EntryType::new(EntryType::MESSAGE),
+                json!({ "role": "user", "text": "hi" }),
+            ))
+            .transition(StateTransition::from(seq, Pc::Planning)),
+    )
+    .unwrap();
+    // drive() lands ToolCall before begin() — mirror the same legal path.
+    let seq = s.state().seq;
+    s.commit(Commit::new().transition(StateTransition::from(seq, Pc::ToolCall)))
+        .unwrap();
+    let handle = begin(&mut s, "echo", json!({}), ReplaySafety::Idempotent, None).unwrap();
+    // (drive() commits the durable flag right before settle_ok; mirror it)
+    s.commit(
+        Commit::new().register(tole_core::register::RegisterWrite::set(
+            "fact",
+            "wrote_this_turn",
+            json!(true),
+        )),
+    )
+    .unwrap();
+    settle_ok(&mut s, &handle, json!({})).unwrap();
+    assert_eq!(s.state().pc, Pc::Settling);
+
+    let mut reg = ToolRegistry::new();
+    reg.register(Box::new(EchoTool)).unwrap();
+    let mut p = MockProvider::scripted(vec![ProviderOutput::Final {
+        text: "recovered".into(),
+    }]);
+    let out = resume_turn(&mut s, &mut p, &reg).unwrap();
+    match out {
+        TurnOutcome::Final { wrote, .. } => {
+            assert!(wrote, "resumed turn must keep the earlier Write visible");
+        }
+        other => panic!("expected Final after resume, got {other:?}"),
+    }
+    // Session-scoped: the flag persists past Final (nothing resets it).
+    assert_eq!(
+        s.get_register("fact", "wrote_this_turn"),
+        Some(&json!(true))
+    );
+}
+
+#[test]
+fn aborted_writing_turn_keeps_the_session_flag() {
+    // Session-scoped contract (#143, cora round 2): turn 1 writes, then
+    // aborts (post-#84 pc=Final). The prompt-resume turn is a FRESH
+    // run_turn — it must NOT reset the session flag: the session wrote,
+    // period. The follow-up turn's Final reports wrote=true.
+    let dir = tmpdir("decision-stale");
+    let mut s = JsonlStorage::create(&dir, "dstale", None).unwrap();
+    let mut reg = ToolRegistry::with_approver(AllowlistApprover::new(
+        vec!["write_file".to_string()],
+        Decision::Deny,
+    ));
+    reg.register(Box::new(WriteTool)).unwrap();
+
+    let mut p1 = MockProvider::scripted(vec![ProviderOutput::ToolCall {
+        tool: "write_file".into(),
+        input: json!({"path": "a.txt"}),
+    }]);
+    let out1 = run_turn(&mut s, &mut p1, &reg, "turn one").unwrap();
+    assert!(matches!(out1, TurnOutcome::ProviderFailed { .. }));
+    assert_eq!(
+        s.get_register("fact", "wrote_this_turn"),
+        Some(&json!(true))
+    );
+
+    // Post-#84: the abort settled pc=Final with the flag STILL true.
+    // A prompt-resume is a FRESH run_turn and must NOT reset the
+    // session-scoped flag — the session wrote, period.
+    let mut p3 = MockProvider::scripted(vec![ProviderOutput::Final {
+        text: "next turn".into(),
+    }]);
+    let out3 = run_turn(&mut s, &mut p3, &reg, "turn two (prompt-resume)").unwrap();
+    match out3 {
+        TurnOutcome::Final { wrote, .. } => {
+            assert!(
+                wrote,
+                "a fresh turn in a session that wrote before reports wrote=true (session-scoped)"
+            );
+        }
+        other => panic!("expected Final, got {other:?}"),
+    }
+    assert_eq!(
+        s.get_register("fact", "wrote_this_turn"),
+        Some(&json!(true))
     );
 }

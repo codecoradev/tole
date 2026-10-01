@@ -524,11 +524,12 @@ impl HostConfig {
 
     /// Post-session summary (memory loop): best-effort, stderr on
     /// failure, the session itself is never affected.
-    fn remember(&self, session_id: &str, first_prompt: &str, last_answer: &str) {
+    fn remember(&self, session_id: &str, first_prompt: &str, last_answer: &str, wrote: bool) {
         let Some(mem) = self.memory.as_ref() else {
             return;
         };
-        match tole_core::memory::remember_session(mem, session_id, first_prompt, last_answer) {
+        match tole_core::memory::remember_session(mem, session_id, first_prompt, last_answer, wrote)
+        {
             Ok(_) => eprintln!("tole: memory: session summary stored in {}", mem.namespace),
             Err(e) => eprintln!("tole: memory remember failed (session unaffected): {e}"),
         }
@@ -955,8 +956,8 @@ fn run_command(
     // Memory loop, post-session: a settled Final turn leaves a compact
     // summary behind for the next session's recall.
     #[cfg(feature = "shell-tools")]
-    if let TurnOutcome::Final { text } = &outcome {
-        host.remember(&session_id, &raw_prompt, text);
+    if let TurnOutcome::Final { text, wrote } = &outcome {
+        host.remember(&session_id, &raw_prompt, text, *wrote);
     }
     report_outcome(&session_id, outcome);
     Ok(())
@@ -1032,8 +1033,12 @@ fn resume_command(
             // its own durable event. No recall injection here: the resumed
             // session already carries its context.
             #[cfg(feature = "shell-tools")]
-            if let TurnOutcome::Final { text: answer } = &outcome {
-                host.remember(id, text, answer);
+            if let TurnOutcome::Final {
+                text: answer,
+                wrote,
+            } = &outcome
+            {
+                host.remember(id, text, answer, *wrote);
             }
             outcome
         }
@@ -1324,6 +1329,9 @@ fn chat_command(
     // session summary is stored when the REPL exits cleanly.
     #[cfg(feature = "shell-tools")]
     let (mut memory_injected, mut first_prompt, mut last_answer) = (!fresh, None, None);
+    // Issue #143: did any turn of this chat execute a Write/Destructive tool?
+    #[cfg(feature = "shell-tools")]
+    let mut chat_wrote = false;
     // Set when the typed message could not run because the session was
     // stuck mid-flight and the bounded resolve retries ran out — the
     // message is NOT in the durable log, so the operator must resend it.
@@ -1432,11 +1440,14 @@ fn chat_command(
         };
 
         match outcome {
-            Ok(TurnOutcome::Final { text }) => {
+            Ok(TurnOutcome::Final { text, wrote }) => {
                 #[cfg(feature = "shell-tools")]
                 {
                     last_answer = Some(text.clone());
+                    chat_wrote |= wrote;
                 }
+                #[cfg(not(feature = "shell-tools"))]
+                let _ = wrote;
                 println!("tole> {text}");
             }
             Ok(TurnOutcome::ApprovalRequired { name }) => eprintln!(
@@ -1470,12 +1481,24 @@ fn chat_command(
             // believe it was recorded (CodeCora scan 2026-09-18).
             eprintln!("tole> (note: the message you just typed was NOT recorded — resolve the session state, then resend it)");
         }
+        // #143 (cora): a writing turn that ABORTED (provider failure,
+        // loop guard, budget) still wrote to disk — the durable
+        // session-scoped register survives the abort, so fold it in here
+        // too, not only on the Final arm.
+        #[cfg(feature = "shell-tools")]
+        if storage
+            .get_register("fact", "wrote_this_turn")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            chat_wrote = true;
+        }
     }
     // Memory loop, post-session: a clean REPL exit with at least one
     // completed turn leaves a compact summary in the namespace.
     #[cfg(feature = "shell-tools")]
     if let (Some(fp), Some(la)) = (first_prompt.as_deref(), last_answer.as_deref()) {
-        host.remember(&session_id, fp, la);
+        host.remember(&session_id, fp, la, chat_wrote);
     }
     println!(
         "session {session_id} closed — entries: {}",
@@ -1568,7 +1591,7 @@ fn build_default_prompt(plan_mode: bool) -> String {
 /// scripts notice.
 fn report_outcome(session_id: &str, outcome: TurnOutcome) {
     match outcome {
-        TurnOutcome::Final { text } => {
+        TurnOutcome::Final { text, .. } => {
             println!("{text}");
         }
         TurnOutcome::ApprovalRequired { name } => {

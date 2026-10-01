@@ -287,7 +287,7 @@ fn tier1_abort_paths_park_resumable_with_audit() {
         }]);
         let out2 = resume_turn(&mut s, &mut p2, &reg).unwrap();
         assert!(
-            matches!(out2, TurnOutcome::Final { text } if text == "recovered"),
+            matches!(out2, TurnOutcome::Final { text, .. } if text == "recovered"),
             "{name}"
         );
     }
