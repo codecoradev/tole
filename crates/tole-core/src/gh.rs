@@ -83,27 +83,50 @@ impl GhOp {
                 "--body".into(),
                 s("body")?,
             ]),
-            GhOp::PrCreate => Ok(vec![
-                "pr".into(),
-                "create".into(),
-                "--title".into(),
-                no_flags("title", &s("title")?)?,
-                "--body".into(),
-                s("body")?,
-                "--base".into(),
-                // Branch names: alphanumeric plus - _ . / — nothing else,
-                // and never a leading dash.
+            GhOp::PrCreate => {
+                let mut argv = vec![
+                    "pr".into(),
+                    "create".into(),
+                    "--title".into(),
+                    no_flags("title", &s("title")?)?,
+                    "--body".into(),
+                    s("body")?,
+                    "--base".into(),
+                    // Branch names: alphanumeric plus - _ . / — nothing else,
+                    // and never a leading dash.
+                    {
+                        let base = s("base")?;
+                        if !base
+                            .chars()
+                            .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
+                        {
+                            return Err(format!("gh: 'base' is not a valid branch name: {base:?}"));
+                        }
+                        no_flags("base", &base)?
+                    },
+                ];
+                // head is optional in the spec, but when the model provides
+                // it, it MUST reach the argv: the field was advertised and
+                // then silently dropped (CodeCora scan 2026-09-18), so a PR
+                // could be opened from the wrong branch while the caller
+                // believed it had set one.
+                if let Some(head) = input
+                    .get("head")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
                 {
-                    let base = s("base")?;
-                    if !base
+                    if !head
                         .chars()
                         .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
                     {
-                        return Err(format!("gh: 'base' is not a valid branch name: {base:?}"));
+                        return Err(format!("gh: 'head' is not a valid branch name: {head:?}"));
                     }
-                    no_flags("base", &base)?
-                },
-            ]),
+                    argv.push("--head".into());
+                    argv.push(no_flags("head", head)?);
+                }
+                Ok(argv)
+            }
             GhOp::IssueView => {
                 let number = digit_field(input, "issue number")?;
                 Ok(vec![
@@ -520,5 +543,28 @@ mod tests {
             "pr create --title feat: x --body body text --base develop --repo codecoradev/tole"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pr_create_passes_and_validates_head() {
+        let t = GhTool::new("codecoradev/tole");
+        // head must actually reach the argv (it was silently dropped
+        // before — CodeCora scan 2026-09-18).
+        let joined = t
+            .command_line(
+                &json!({"op":"pr_create","title":"t","body":"b","base":"develop","head":"feat/x"}),
+            )
+            .unwrap();
+        assert!(joined.contains("--head feat/x"), "cmd: {joined}");
+        assert!(joined.contains("--base develop"));
+        // Invalid branch names refuse.
+        assert!(t
+            .command_line(&json!({"op":"pr_create","title":"t","body":"b","base":"develop","head":"--upload-pack=x"}))
+            .is_err());
+        // Absent head stays absent (gh falls back to the current branch).
+        let joined = t
+            .command_line(&json!({"op":"pr_create","title":"t","body":"b","base":"develop"}))
+            .unwrap();
+        assert!(!joined.contains("--head"));
     }
 }

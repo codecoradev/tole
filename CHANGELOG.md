@@ -5,6 +5,133 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.4.0] — 2026-10-01
+
+### Added
+- Harness memory loop (`--memory uteke` / `TOLE_MEMORY`): on the first
+  turn of a fresh session, memories relevant to the prompt are recalled
+  from the owner's uteke store (namespace `repo-<dir>`,
+  `TOLE_MEMORY_NAMESPACE` to override) and injected into the user
+  message inside a clearly marked fenced block — the durable log stores
+  exactly what the provider saw. When the session settles with a final
+  answer, a compact summary is stored back (`--type context`, tagged
+  `tole,session`). Host-initiated on both ends (the model cannot
+  trigger or suppress it); every failure degrades to stderr and the
+  turn proceeds without memory.
+- cora auto-preset: when the `cora` binary is on PATH, tole attaches the
+  local `cora mcp` server automatically — the full code-intel surface
+  (brain search, callers, impact, affected tests, dead-code, review;
+  registry names `mcp_cora_*`). Opt out per run with `--no-auto-mcp`;
+  an explicit `--mcp-server cora=...` replaces the preset for that name.
+  MCP tools keep the never-trusted trust model: `Risk::Write`, approval
+  gate always applies.
+- The `tole-cli` default feature set now includes the `mcp` client
+  (`default = ["shell-tools", "mcp"]`): the auto-preset and
+  `--mcp-server` work on a plain `cargo build -p tole-cli`. Embedder
+  profiles are unaffected — `tole-core` defaults do not change.
+
+### Added
+- `tole serve --transport mcp` — **multi-session MCP over Streamable
+  HTTP** (issue #137): one authenticated MCP connection addresses N
+  durable tole sessions. Session tools (`tole_session_new`,
+  `tole_session_prompt`, `tole_session_status`, `tole_session_list`)
+  ride alongside the registry tools; a `session_id` argument routes a
+  tool call to THAT session's registry (workspace jail + approver), and
+  an ambiguous no-id call with 2+ open sessions is refused. Served with
+  hyper directly (no axum) behind the same bearer-token auth as REST;
+  Destructive stays structurally absent (non-interactive approvers).
+- `tole serve`: tole as a **token-authenticated HTTP daemon** (issue
+  #96, v1) — REST endpoints for the session host: create/list sessions,
+  run turns, poll status. Turn execution is serialized per session
+  (concurrent prompts get 409), the session map + durable JSONL live
+  server-side, and the allowlist approver keeps Destructive tools
+  structurally absent (a server has no human to ask). Zero new
+  dependencies (hand-rolled HTTP/1.1). Per-connection read/write
+  timeouts (30s). MCP-over-HTTP is the follow-up.
+- `tole acp`: tole as an **Agent Client Protocol agent** over stdio
+  (issue #95) — editors (Zed et al.) drive durable tole sessions:
+  `session/new`/`session/load` map to the JSONL session store, prompts run
+  full tole turns, the final answer streams as an `agent_message_chunk`,
+  and Write/Destructive tool calls surface as
+  `session/request_permission` requests — the editor human approves, with
+  Destructive consent being a genuine per-call decision. Provider config
+  is only required when a prompt actually runs. The session map survives
+  across prompts (a first-run regression where fresh state replaced the
+  map after one turn — caught by CodeCora review — is fixed, along with
+  session-id path-traversal and mutex-poisoning hardening). The
+  session-map lock is held only briefly — a running turn keeps its OWN
+  storage lock, so the reader loop stays live for permission routing
+  (the first implementation deadlocked protocol routing for up to the
+  permission timeout whenever a client opened a session while a
+  permission request was pending — caught by CodeCora review). Sessions
+  reject concurrent turns (busy) and panic-safe un-busy via Drop.
+- `tole mcp`: tole as an **MCP server** over stdio (issue #94) — the
+  registry's hardened tools (jailed file ops, argv-validated git, detached
+  jobs, memory loop, cora/uteke integrations) become callable by any MCP
+  client. ReadOnly tools always callable; Write tools pre-authorized via
+  `--allow` patterns (Destructive structurally absent — registration
+  behind a non-interactive approver is refused). Verified live: 11 tools
+  listed, read_file round-trip, write without `--allow` denied with an
+  actionable message.
+
+### Fixed
+- **write_file had no wire schema**: it was the only registered tool
+  without a `spec()` override, so providers received a property-less
+  schema and could legally answer `arguments: {}` — every write failed
+  with "missing 'path'" and identical retries tripped the loop guard
+  (found live, GLM via bifrost). Spec declares path+content required;
+  regression test pins it.
+- CodeCora scan triage (2026-09-18, 54 files): 8 of the 10 MAJOR findings
+  fixed — derived `Debug` on `OpenAiConfig` leaked `api_key` via `{:?}`
+  (manual redacting impl); the uteke recall query could inject CLI flags
+  (leading-dash guard); the uteke room-link spawn skipped env scrubbing;
+  `job_poll` (ReadOnly) truncated/rewrote the job log (bounded read only —
+  behavior change: runaway logs are no longer trimmed on poll; clear them
+  as an operator); the MCP result cap was applied after a full block copy
+  (incremental, single-oversized-block safe); subprocess capture is capped
+  at 32 MiB per stream with a marked truncation suffix, and the drain no
+  longer blocks indefinitely on a grandchild holding the pipe (2s grace —
+  unterminated output is dropped); the `sh -c` payload scan now recurses
+  and strips shell quotes (`sh -c "/bin/rm -rf /"` and nested-shell
+  payloads are refused); `gh pr_create` actually passes the advertised
+  `head` field (validated like `base`). Remaining MAJOR/MINOR findings are
+  tracked on the scan-triage issue.
+- docs: architecture.md no longer says the Destructive tier may be
+  allowlisted (contradicted the never-allowlistable invariant).
+
+### Fixed
+- Remaining CodeCora scan findings (2026-09-18 sweep): `scrub()` no
+  longer mangles text when the secret is empty; non-string tool-call
+  arguments are serialized instead of silently replaced with `{}`;
+  `OpenAiProvider` reuses one ureq agent (connection reuse) instead of
+  building one per request; failed startups no longer leave a stray
+  empty session file (registry/provider are built before the session is
+  created); `resume <id> "<prompt>"` now stores the memory summary like
+  `run`; chat states explicitly when a typed message was dropped after
+  exhausted mid-flight retries; session ids use `strip_suffix` (a
+  `x.jsonl.jsonl` file no longer yields an unusable id);
+  `binary_available` honors the executable bit (unix) / `.exe`
+  (windows); edit_file's approval line shows the actual old→new change;
+  edit_file temp files are unique per attempt and legacy stale temps are
+  swept; delete_file on a symlinked path removes the LINK, not the
+  referent; job_start kills the spawned job when the pid file cannot be
+  written; MCP tool-request descriptions truncate without materializing
+  the whole payload, and the transport-error class shares one constant;
+  tole-cli is now lib+bin so integration tests drive the REAL jailed
+  tools and approver instead of drifting re-implementations; evals
+  Tier 2 runner is Python 3.9-compatible, cleans its mkdtemp session
+  dirs, uses a portable timestamp, and the baseline diff no longer
+  flags newly-passing missions as regressions or skips zero baselines
+  silently; threat-model ENV/JOB-2 rows updated to match the code.
+
+### Changed
+- `cora_search` follows the same startup-probing contract as the uteke
+  tools: a missing `cora` binary degrades to a one-line warning instead
+  of registering a phantom tool, and the native single-tool fallback is
+  skipped when the cora MCP surface is attached.
+
 ## [0.3.0] — 2026-09-12
 
 Reliability & long-running work: the post-soak optimization batch driven by

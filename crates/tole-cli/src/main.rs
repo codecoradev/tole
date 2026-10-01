@@ -1,14 +1,19 @@
 //! CLI host for tole-core: arg parsing and session wiring.
 
-mod approver;
-mod tools;
-
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
-use crate::approver::InteractiveApprover;
-use crate::tools::WriteFileTool;
+use tole_cli::approver::{InteractiveApprover, StdioPrompt};
+use tole_cli::tools::WriteFileTool;
+use tole_core::approval::AllowlistApprover;
+
+#[cfg(feature = "shell-tools")]
+mod acp;
+#[cfg(feature = "mcp-http")]
+mod mcp_http;
+#[cfg(feature = "shell-tools")]
+mod serve;
 #[cfg(feature = "shell-tools")]
 use tole_core::cora_search::CoraSearchTool;
 use tole_core::file_tools::{DeleteFileTool, EditFileTool};
@@ -67,6 +72,48 @@ struct Cli {
     #[arg(long, global = true)]
     mcp_server: Vec<String>,
 
+    /// Skip the auto-detected MCP presets (currently: the local `cora mcp`
+    /// server attached when the `cora` binary is on PATH). Explicit
+    /// --mcp-server flags are unaffected. Requires the `mcp` feature.
+    #[cfg(feature = "mcp")]
+    #[arg(long, global = true)]
+    no_auto_mcp: bool,
+
+    /// Harness memory loop backend (run/chat): on the first turn of a
+    /// fresh session, memories relevant to the prompt are recalled from
+    /// the owner's store and injected into the message; when the session
+    /// settles, a compact summary is stored back. Currently `uteke`
+    /// (namespace: repo-<dir>, override: TOLE_MEMORY_NAMESPACE). Falls
+    /// back to the TOLE_MEMORY env.
+    #[cfg(feature = "shell-tools")]
+    #[arg(long, global = true)]
+    memory: Option<String>,
+
+    /// Plan mode: expose ONLY read-only tools for the session — write/
+    /// delete/run tools are absent from the wire entirely (the model
+    /// cannot even see them). For explore-and-plan runs before granting
+    /// any mutation. The default system prompt gains a matching
+    /// read-only instruction; explicit --system overrides still win.
+    #[arg(long, global = true)]
+    plan_mode: bool,
+
+    /// Pre-tool-use process hook (issue #110): runs before every
+    /// Write/Destructive tool executes. Receives one JSON object on
+    /// stdin (`{"event":"pretool","tool":...,"input":...}`); exit code
+    /// 2 = DENY the call (durable, the loop replans); any other
+    /// non-zero exit / timeout is a logged non-blocking hook failure.
+    /// Example: --on-pretool /usr/local/bin/tole-guard.sh. Repeatable;
+    /// default OFF.
+    #[arg(long, global = true)]
+    on_pretool: Vec<String>,
+
+    /// Post-tool-use process hook (issue #110): runs after every
+    /// Write/Destructive tool settles. Receives
+    /// `{"event":"posttool","tool":...,"input":...,"ok":true|false}`;
+    /// observe-only (output cannot block). Repeatable; default OFF.
+    #[arg(long, global = true)]
+    on_posttool: Vec<String>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -85,7 +132,9 @@ enum Command {
         system: Option<String>,
 
         /// Auto-allow Write tools matching this glob pattern without
-        /// asking (e.g. --allow 'write_*'). Destructive tools are never
+        /// asking (e.g. --allow 'write_*'). Patterns match tool names
+        /// only: an equivalent-effect tool such as run_command stays
+        /// separately gated, and Destructive tools are never
         /// auto-allowed. Repeatable.
         #[arg(long = "allow")]
         allow_patterns: Vec<String>,
@@ -95,7 +144,7 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
-    /// Resume an interrupted session (E5 crash-resume). With an optional
+    /// Resume an interrupted session. With an optional
     /// PROMPT, appends it as a new user message and runs one full turn
     /// (issue #55): headless flows can continue a mission without a
     /// separate `run` session. Without PROMPT, behaves as before:
@@ -115,7 +164,7 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
-    /// List sessions in the sessions dir (B3).
+    /// List sessions in the sessions dir, newest first.
     Sessions,
 
     /// Show durable state of a session.
@@ -123,7 +172,79 @@ enum Command {
         /// Session id to inspect.
         id: String,
     },
-    /// Interactive multi-turn chat on one durable session (B1).
+    /// Serve tole's tools over MCP stdio (issue #94): ReadOnly tools are
+    /// always callable; Write tools require --allow patterns (server mode
+    /// has no stdin human — stdin IS the protocol); Destructive tools are
+    /// structurally absent.
+    #[cfg(all(feature = "mcp", feature = "shell-tools"))]
+    Mcp {
+        /// Same semantics as `run --allow` (Write pre-authorization).
+        #[arg(long = "allow")]
+        allow_patterns: Vec<String>,
+
+        /// Root directory for the file tools (same as run).
+        #[arg(long)]
+        workspace: Option<String>,
+    },
+    /// Serve tole as an ACP agent over stdio (issue #95): editors and
+    /// ACP clients drive durable tole sessions; tool approvals surface
+    /// as permission requests in the client.
+    #[cfg(feature = "shell-tools")]
+    Acp {
+        /// Same semantics as `run --allow` (Write pre-authorization).
+        #[arg(long = "allow")]
+        allow_patterns: Vec<String>,
+
+        /// Auto-allow every Write call (Destructive still prompts in the
+        /// client).
+        #[arg(long)]
+        yes: bool,
+
+        /// Default file-tools root; each session's jail is the client's
+        /// session cwd.
+        #[arg(long)]
+        workspace: Option<String>,
+
+        /// Memory loop backend (`uteke`) — same as `--memory uteke` on
+        /// run/chat. Falls back to the TOLE_MEMORY env.
+        #[arg(long)]
+        memory: Option<String>,
+    },
+    /// Serve tole over HTTP (issue #96): token-authenticated daemon;
+    /// `--transport mcp` serves the multi-session MCP surface (#137).
+    #[cfg(feature = "shell-tools")]
+    Serve {
+        /// TCP port to listen on.
+        #[arg(long, default_value_t = 7801)]
+        port: u16,
+
+        /// Transport: `rest` (default) or `mcp` (Streamable HTTP).
+        #[arg(long, default_value = "rest")]
+        transport: String,
+
+        /// Bind address (default: 127.0.0.1 — local only).
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: String,
+
+        /// Bearer token required on every request (or TOLE_SERVE_TOKEN
+        /// env). Refuses to start without one.
+        #[arg(long)]
+        token: Option<String>,
+
+        /// Same semantics as `run --allow` (Write pre-authorization).
+        #[arg(long = "allow")]
+        allow_patterns: Vec<String>,
+
+        /// Root directory for the file tools (same as run).
+        #[arg(long)]
+        workspace: Option<String>,
+
+        /// Memory loop backend (`uteke`) — same as `--memory uteke` on
+        /// run/chat. Falls back to the TOLE_MEMORY env.
+        #[arg(long)]
+        memory: Option<String>,
+    },
+    /// Interactive multi-turn chat on one durable session.
     Chat {
         /// System prompt for a fresh session (ignored when resuming —
         /// the header-pinned prompt wins). Highest priority; else
@@ -162,6 +283,25 @@ fn dispatch(cli: Cli) -> Result<()> {
             .clone()
             .unwrap_or_else(|| DEFAULT_SESSIONS_DIR.to_string()),
     );
+    #[cfg(feature = "mcp")]
+    let mcp_specs = merge_mcp_specs(&cli.mcp_server, cli.no_auto_mcp, auto_mcp_specs());
+    // scan-3 finding fix: the global --workspace/--memory flags now flow
+    // into the host, so `tole serve/acp/mcp` honor them as fallbacks when
+    // the subcommand-level flags are absent (previously they were
+    // silently ignored by those subcommands).
+    let host = HostConfig {
+        workspace: cli.workspace.clone(),
+        #[cfg(feature = "mcp")]
+        mcp_server: mcp_specs,
+        plan_mode: cli.plan_mode,
+
+        on_pretool: cli.on_pretool.clone(),
+        on_posttool: cli.on_posttool.clone(),
+        #[cfg(feature = "shell-tools")]
+        memory: resolve_memory(cli.memory.as_ref())?,
+        #[cfg(not(feature = "shell-tools"))]
+        memory: (),
+    };
     match cli.command {
         Command::Run {
             prompt,
@@ -174,9 +314,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             system.as_deref(),
             &allow_patterns,
             yes,
-            cli.workspace.clone(),
-            #[cfg(feature = "mcp")]
-            cli.mcp_server.clone(),
+            &host,
         ),
         Command::Resume {
             id,
@@ -189,10 +327,117 @@ fn dispatch(cli: Cli) -> Result<()> {
             prompt.as_deref(),
             &allow_patterns,
             yes,
-            cli.workspace.clone(),
-            #[cfg(feature = "mcp")]
-            cli.mcp_server.clone(),
+            &host,
         ),
+        #[cfg(all(feature = "mcp", feature = "shell-tools"))]
+        Command::Mcp {
+            allow_patterns,
+            workspace,
+        } => {
+            // Global flags must not SILENTLY no-op on this subcommand
+            // (cora scan-3 #9): plan-mode filters the served registry to
+            // read-only; hooks are not wired in server mode (no local
+            // approver boundary — server mode pre-authorizes via
+            // --allow), so --on-pretool/--on-posttool error out loudly
+            // instead of being ignored.
+            if host.on_pretool_non_empty() || host.on_posttool_non_empty() {
+                anyhow::bail!(
+                    "--on-pretool/--on-posttool are not supported by `tole mcp` \
+                     (server mode pre-authorizes Write tools with --allow instead)"
+                );
+            }
+            if host.plan_mode {
+                eprintln!("tole mcp: --plan-mode is active — serving read-only tools only");
+            }
+            let workspace = workspace.or_else(|| host.workspace.clone());
+            mcp_server_command(
+                workspace.as_ref(),
+                &allow_patterns,
+                #[cfg(feature = "mcp")]
+                host.plan_mode,
+            )
+        }
+        #[cfg(feature = "shell-tools")]
+        Command::Acp {
+            allow_patterns,
+            yes,
+            workspace,
+            memory,
+        } => {
+            // Same loud-bail rule as `tole mcp` for hooks: the ACP host
+            // does not wire local pre/post hooks — approvals happen in
+            // the editor via permission requests instead.
+            if host.on_pretool_non_empty() || host.on_posttool_non_empty() {
+                anyhow::bail!(
+                    "--on-pretool/--on-posttool are not supported by `tole acp` \
+                     (approvals happen via session/request_permission in the client)"
+                );
+            }
+            if host.plan_mode {
+                eprintln!("tole acp: --plan-mode is active — serving read-only tools only");
+            }
+            let memory = match memory.as_deref().filter(|s| !s.trim().is_empty()) {
+                Some(_) => resolve_memory(memory.as_ref())?,
+                None => host.memory.clone(),
+            };
+            let workspace = workspace.or_else(|| host.workspace.clone());
+            crate::acp::run_acp(
+                &allow_patterns,
+                yes,
+                workspace.as_ref(),
+                host.plan_mode,
+                memory,
+            )
+        }
+        #[cfg(feature = "shell-tools")]
+        Command::Serve {
+            port,
+            bind,
+            transport,
+            token,
+            allow_patterns,
+            workspace,
+            memory,
+        } => {
+            let memory = match memory.as_deref().filter(|s| !s.trim().is_empty()) {
+                Some(_) => resolve_memory(memory.as_ref())?,
+                None => host.memory.clone(),
+            };
+            let workspace = workspace.or_else(|| host.workspace.clone());
+            // Both transports refuse to start without a token (#96/#137).
+            let token = token
+                .or_else(|| std::env::var("TOLE_SERVE_TOKEN").ok())
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .context(
+                    "refusing to start an unauthenticated server: set --token or TOLE_SERVE_TOKEN",
+                )?;
+            if transport == "mcp" {
+                #[cfg(feature = "mcp-http")]
+                {
+                    let rt = tokio::runtime::Runtime::new().context("creating tokio runtime")?;
+                    return rt.block_on(crate::mcp_http::run_mcp_http(
+                        &bind,
+                        port,
+                        &token,
+                        allow_patterns,
+                        host.plan_mode,
+                        memory,
+                    ));
+                }
+                #[cfg(not(feature = "mcp-http"))]
+                anyhow::bail!("--transport mcp requires the mcp-http feature");
+            }
+            crate::serve::run_serve(crate::serve::ServeConfig {
+                bind,
+                port,
+                token: Some(token),
+                allow_patterns,
+                workspace,
+                plan_mode: host.plan_mode,
+                memory,
+            })
+        }
         Command::Sessions => sessions_command(&sessions_dir),
         Command::Status { id } => status_command(&sessions_dir, &id),
         Command::Chat {
@@ -208,9 +453,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             last,
             &allow_patterns,
             yes,
-            cli.workspace.clone(),
-            #[cfg(feature = "mcp")]
-            cli.mcp_server.clone(),
+            &host,
         ),
     }
 }
@@ -219,13 +462,155 @@ fn dispatch(cli: Cli) -> Result<()> {
 // Wiring
 // ---------------------------------------------------------------------------
 
-fn build_approver(
-    allow_patterns: &[String],
-    yes: bool,
-) -> InteractiveApprover<approver::StdioPrompt> {
+/// Host knobs shared by the command fns: the file-tools jail root, the
+/// MCP server list, the memory backend. Bundled so per-command
+/// signatures stop growing with every feature.
+struct HostConfig {
+    workspace: Option<String>,
+    #[cfg(feature = "mcp")]
+    mcp_server: Vec<String>,
+    /// Plan mode (issue #109): registry filtered to ReadOnly tools.
+    plan_mode: bool,
+
+    /// Tool-boundary hook command lines (issue #110), default empty.
+    on_pretool: Vec<String>,
+    on_posttool: Vec<String>,
+    /// shell-tools-only host knob. `not(feature = "shell-tools")` builds
+    /// still assign `memory: None` in dispatch — the field stays so the
+    /// assignments and helper signatures never fork per profile.
+    #[cfg(not(feature = "shell-tools"))]
+    memory: (),
+    #[cfg(feature = "shell-tools")]
+    memory: Option<tole_core::memory::MemoryConfig>,
+}
+
+impl HostConfig {
+    #[cfg(any(feature = "shell-tools", feature = "mcp"))]
+    fn on_pretool_non_empty(&self) -> bool {
+        !self.on_pretool.is_empty()
+    }
+    #[cfg(any(feature = "shell-tools", feature = "mcp"))]
+    fn on_posttool_non_empty(&self) -> bool {
+        !self.on_posttool.is_empty()
+    }
+}
+
+#[cfg(feature = "shell-tools")]
+impl HostConfig {
+    /// Pre-turn recall injection (memory loop): the returned prompt is
+    /// what the provider sees and what the durable log records. Any
+    /// failure degrades to the bare prompt — memory is an enhancement,
+    /// never a dependency.
+    fn inject_memory(&self, prompt: &str) -> String {
+        let Some(mem) = self.memory.as_ref() else {
+            return prompt.to_string();
+        };
+        match tole_core::memory::recall_block(mem, prompt) {
+            Ok(block) if !block.is_empty() => {
+                eprintln!(
+                    "tole: memory: recalled context injected ({})",
+                    mem.namespace
+                );
+                format!("{prompt}{block}")
+            }
+            Ok(_) => prompt.to_string(),
+            Err(e) => {
+                eprintln!("tole: memory recall failed (continuing without): {e}");
+                prompt.to_string()
+            }
+        }
+    }
+
+    /// Post-session summary (memory loop): best-effort, stderr on
+    /// failure, the session itself is never affected.
+    fn remember(&self, session_id: &str, first_prompt: &str, last_answer: &str) {
+        let Some(mem) = self.memory.as_ref() else {
+            return;
+        };
+        match tole_core::memory::remember_session(mem, session_id, first_prompt, last_answer) {
+            Ok(_) => eprintln!("tole: memory: session summary stored in {}", mem.namespace),
+            Err(e) => eprintln!("tole: memory remember failed (session unaffected): {e}"),
+        }
+    }
+}
+
+/// Memory backend resolution: the `--memory` flag wins over the
+/// `TOLE_MEMORY` env; `uteke` is the only backend. The namespace follows
+/// the ecosystem `repo-<dir>` convention unless `TOLE_MEMORY_NAMESPACE`
+/// overrides it. A missing uteke binary degrades to a warning + no-op
+/// (the same probe contract as the uteke tools).
+#[cfg(feature = "shell-tools")]
+fn resolve_memory(flag: Option<&String>) -> Result<Option<tole_core::memory::MemoryConfig>> {
+    let chosen = flag
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            std::env::var("TOLE_MEMORY")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        });
+    let Some(backend) = chosen else {
+        return Ok(None);
+    };
+    if backend != "uteke" {
+        anyhow::bail!("unsupported memory backend {backend:?} (only 'uteke' is available)");
+    }
+    if !binary_available("uteke") {
+        eprintln!(
+            "tole: memory backend 'uteke' requested but the binary is missing — memory loop disabled"
+        );
+        return Ok(None);
+    }
+    let mut cfg = tole_core::memory::MemoryConfig::for_cwd("uteke", &std::env::current_dir()?);
+    if let Ok(ns) = std::env::var("TOLE_MEMORY_NAMESPACE") {
+        let ns = ns.trim();
+        if !ns.is_empty() {
+            cfg.namespace = tole_core::memory::sanitize_namespace(ns);
+        }
+    }
+    Ok(Some(cfg))
+}
+
+fn build_approver(allow_patterns: &[String], yes: bool) -> InteractiveApprover<StdioPrompt> {
     InteractiveApprover::stdio()
         .with_allow_patterns(allow_patterns.to_vec())
         .with_auto_write(yes)
+}
+
+/// Auto-detected MCP presets: server specs attached with zero
+/// configuration. Currently just the local `cora mcp` server when the
+/// `cora` binary is on PATH — the full code-intel surface (callers,
+/// impact, dead-code, review) without a manual flag.
+#[cfg(feature = "mcp")]
+fn auto_mcp_specs() -> Vec<String> {
+    if binary_available("cora") {
+        vec!["cora=cora mcp".to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Merge explicit `--mcp-server` specs over the auto-detected presets.
+/// An explicit spec with the same server name wins — the user said what
+/// they meant. `auto` is injected so the merge is unit-testable without
+/// depending on which binaries this machine happens to have.
+#[cfg(feature = "mcp")]
+fn merge_mcp_specs(explicit: &[String], no_auto_mcp: bool, auto: Vec<String>) -> Vec<String> {
+    let mut specs = explicit.to_vec();
+    if !no_auto_mcp {
+        let explicit_names: Vec<&str> = explicit
+            .iter()
+            .map(|s| s.split('=').next().unwrap_or_default())
+            .collect();
+        for spec in auto {
+            let name = spec.split('=').next().unwrap_or_default();
+            if !explicit_names.contains(&name) {
+                specs.push(spec);
+            }
+        }
+    }
+    specs
 }
 
 /// B4 startup probing: a binary exists on PATH (or is an executable
@@ -233,13 +618,30 @@ fn build_approver(
 /// installed, instead of registering phantom tools that fail on every
 /// call.
 fn binary_available(name: &str) -> bool {
+    fn executable(p: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // is_file() alone accepts non-executable files; a probe that
+            // says "available" for an unrunnable binary is a phantom tool
+            // by another name (CodeCora scan 2026-09-18).
+            std::fs::metadata(p)
+                .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
+        }
+        #[cfg(not(unix))]
+        {
+            // Windows: PATH lookups append extensions (".exe"); probe the
+            // obvious one rather than declaring a runnable binary absent.
+            p.is_file() || p.with_extension("exe").is_file()
+        }
+    }
     if name.contains('/') {
-        let p = std::path::Path::new(name);
-        return p.is_file();
+        return executable(Path::new(name));
     }
     if let Ok(path) = std::env::var("PATH") {
         for dir in std::env::split_paths(&path) {
-            if dir.join(name).is_file() {
+            if executable(&dir.join(name)) {
                 return true;
             }
         }
@@ -267,18 +669,30 @@ pub fn resolve_workspace_root(explicit: Option<&String>) -> Result<PathBuf> {
     }
 }
 
+/// Ask the checkout itself which GitHub repo it belongs to ( Falls back
+/// to None → callers keep the tole default).
+#[cfg(feature = "shell-tools")]
+fn detect_github_repo(cwd: &Path) -> Option<String> {
+    use std::process::Command;
+    let mut cmd = Command::new("git");
+    cmd.args(["config", "--get", "remote.origin.url"])
+        .current_dir(cwd);
+    let out = tole_core::subprocess::run_with_timeout(&mut cmd, std::time::Duration::from_secs(5))
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    tole_cli::session_host::github_repo_from_remote_url(&String::from_utf8_lossy(&out.stdout))
+}
+
 fn build_registry(
-    approver: InteractiveApprover<approver::StdioPrompt>,
+    approver: InteractiveApprover<StdioPrompt>,
     workspace: Option<&String>,
     #[cfg(feature = "mcp")] mcp_servers: &[tole_core::mcp::McpServerConfig],
 ) -> Result<ToolRegistry> {
     let mut reg = ToolRegistry::with_approver(approver);
     let cwd = std::env::current_dir().context("resolving cwd")?;
     let file_root = resolve_workspace_root(workspace)?;
-    // ReadOnly tools: no approval needed.
-    #[cfg(feature = "shell-tools")]
-    reg.register(Box::new(CoraSearchTool::new()))
-        .map_err(|e| anyhow::anyhow!("registering cora_search: {e}"))?;
     // Uteke first-class (B4): recall (read) + document (write), behind
     // startup probing — a missing uteke binary degrades to a warning,
     // not phantom tools.
@@ -311,8 +725,14 @@ fn build_registry(
     reg.register(Box::new(EditFileTool::new(file_root.clone())))
         .map_err(|e| anyhow::anyhow!("registering edit_file: {e}"))?;
     #[cfg(feature = "shell-tools")]
-    reg.register(Box::new(GhTool::new("codecoradev/tole")))
-        .map_err(|e| anyhow::anyhow!("registering gh: {e}"))?;
+    {
+        // Target the checkout's own GitHub repo when detectable — a
+        // hardcoded one made `gh` act on the wrong project (CodeCora
+        // dogfood finding 2026-09-18).
+        let gh_repo = detect_github_repo(&cwd).unwrap_or_else(|| "codecoradev/tole".into());
+        reg.register(Box::new(GhTool::new(gh_repo)))
+            .map_err(|e| anyhow::anyhow!("registering gh: {e}"))?;
+    }
     // Light git: status/diff/add/commit (push stays human).
     #[cfg(feature = "shell-tools")]
     reg.register(Box::new(GitTool::new().in_dir(cwd.clone())))
@@ -324,13 +744,132 @@ fn build_registry(
     // MCP servers (#74): registered last so a slow server never blocks
     // native tool availability; per-call approval applies as usual.
     #[cfg(feature = "mcp")]
+    let mut cora_mcp_tools = 0usize;
+    #[cfg(feature = "mcp")]
     for cfg in mcp_servers {
         let names = tole_core::mcp::register_server_tools(&mut reg, cfg);
+        #[cfg(feature = "mcp")]
+        if cfg.name == "cora" {
+            cora_mcp_tools = names.len();
+        }
         if names.is_empty() {
             eprintln!("tole: mcp[{}]: no tools registered", cfg.name);
         }
     }
+    // Native cora_search (E4): single-tool fallback, registered only when
+    // the cora MCP surface did NOT materialize — decision is based on the
+    // REGISTRATION OUTCOME, not config presence: a cora binary whose MCP
+    // server fails (handshake, old version) must degrade to the native
+    // tool instead of silently losing all code-intel (CodeCora finding).
+    // The full MCP toolset supersedes the fallback when it registered.
+    #[cfg(feature = "shell-tools")]
+    {
+        #[cfg(feature = "mcp")]
+        let cora_mcp_ok = cora_mcp_tools > 0;
+        #[cfg(not(feature = "mcp"))]
+        let cora_mcp_ok = false;
+        if !cora_mcp_ok {
+            if binary_available("cora") {
+                reg.register(Box::new(CoraSearchTool::new()))
+                    .map_err(|e| anyhow::anyhow!("registering cora_search: {e}"))?;
+            } else {
+                eprintln!("tole: cora binary not found — cora_search disabled");
+            }
+        }
+    }
     Ok(reg)
+}
+
+/// Server-mode registry: the same hardened tools as `build_registry`,
+/// minus two things a server cannot have — the interactive approver
+/// (stdin is the MCP protocol) and Destructive tools (structurally
+/// refused without one; skipped here with a note). Write tools need
+/// explicit `--allow` pre-authorization.
+#[cfg(all(feature = "mcp", feature = "shell-tools"))]
+fn build_server_registry(
+    workspace: Option<&String>,
+    allow_patterns: &[String],
+) -> Result<ToolRegistry> {
+    let mut reg =
+        ToolRegistry::with_approver(AllowlistApprover::allow_only(allow_patterns.to_vec()));
+    let cwd = std::env::current_dir().context("resolving cwd")?;
+    let file_root = resolve_workspace_root(workspace)?;
+    let count = |reg: &ToolRegistry| reg.specs().len();
+
+    #[cfg(feature = "shell-tools")]
+    {
+        if binary_available("cora") {
+            reg.register(Box::new(CoraSearchTool::new()))
+                .map_err(|e| anyhow::anyhow!("registering cora_search: {e}"))?;
+        }
+        if binary_available("uteke") {
+            reg.register(Box::new(UtekeRecallTool::new()))
+                .map_err(|e| anyhow::anyhow!("registering uteke_recall: {e}"))?;
+            reg.register(Box::new(UtekeDocumentTool::new(None)))
+                .map_err(|e| anyhow::anyhow!("registering uteke_document: {e}"))?;
+        }
+        reg.register(Box::new(RunCommandTool::new(cwd.clone())))
+            .map_err(|e| anyhow::anyhow!("registering run_command: {e}"))?;
+        reg.register(Box::new(JobStartTool::new(file_root.clone())))
+            .map_err(|e| anyhow::anyhow!("registering job_start: {e}"))?;
+        reg.register(Box::new(JobPollTool::new(file_root.clone())))
+            .map_err(|e| anyhow::anyhow!("registering job_poll: {e}"))?;
+    }
+    reg.register(Box::new(ReadFileTool::new(file_root.clone())))
+        .map_err(|e| anyhow::anyhow!("registering read_file: {e}"))?;
+    reg.register(Box::new(WriteFileTool::new(file_root.clone())))
+        .map_err(|e| anyhow::anyhow!("registering write_file: {e}"))?;
+    reg.register(Box::new(EditFileTool::new(file_root.clone())))
+        .map_err(|e| anyhow::anyhow!("registering edit_file: {e}"))?;
+    #[cfg(feature = "shell-tools")]
+    {
+        let gh_repo = detect_github_repo(&cwd).unwrap_or_else(|| "codecoradev/tole".into());
+        reg.register(Box::new(GhTool::new(gh_repo)))
+            .map_err(|e| anyhow::anyhow!("registering gh: {e}"))?;
+        reg.register(Box::new(GitTool::new().in_dir(cwd.clone())))
+            .map_err(|e| anyhow::anyhow!("registering git: {e}"))?;
+    }
+    // delete_file (Destructive) is deliberately NOT registered: behind a
+    // non-interactive approver the registry refuses it structurally.
+    eprintln!("tole mcp: {} tool(s) registered", count(&reg));
+    Ok(reg)
+}
+
+/// D1 (issue #94): serve the registry over MCP stdio. Blocks until the
+/// client disconnects.
+#[cfg(all(feature = "mcp", feature = "shell-tools"))]
+#[cfg_attr(not(feature = "mcp"), allow(unused_variables))]
+/// Server-mode registry for the MCP-over-HTTP host (#137): the same
+/// hardened tools as stdio MCP (D1); the session tools join separately
+/// via RegistryServer::with_extra_tools.
+#[cfg(all(feature = "mcp-http", feature = "shell-tools"))]
+fn build_server_registry_for_mcp(_plan_mode: bool) -> Result<ToolRegistry> {
+    // Empty allowlist: the session tools carry their own approver per
+    // session; registry Write tools stay pre-auth-off (deny by default).
+    build_server_registry(None, &[])
+}
+
+fn mcp_server_command(
+    workspace: Option<&String>,
+    allow_patterns: &[String],
+    #[cfg(feature = "mcp")] plan_mode: bool,
+) -> Result<()> {
+    let registry = build_server_registry(workspace, allow_patterns)?;
+    // Plan mode (issue #109) applies to server mode too (cora scan-3
+    // #9): serve read-only tools only when the operator asked for it.
+    #[cfg(feature = "mcp")]
+    let mut registry = registry;
+    #[cfg(feature = "mcp")]
+    if plan_mode {
+        let mut reg = registry;
+        reg.retain_read_only();
+        registry = reg;
+    }
+    tokio::runtime::Runtime::new()
+        .context("creating tokio runtime")?
+        .block_on(tole_core::mcp_server::serve_stdio(registry))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -343,41 +882,77 @@ fn run_command(
     system: Option<&str>,
     allow_patterns: &[String],
     yes: bool,
-    workspace: Option<String>,
-    #[cfg(feature = "mcp")] mcp_server: Vec<String>,
+    host: &HostConfig,
 ) -> Result<()> {
     let cfg = OpenAiConfig::from_env().context(
         "missing provider config: set TOLE_BASE_URL / TOLE_MODEL / TOLE_API_KEY \
          (or the OPENAI_* equivalents)",
     )?;
-    let session_id = new_session_id();
-    std::fs::create_dir_all(sessions_dir)
-        .with_context(|| format!("creating {}", sessions_dir.display()))?;
-    let system_prompt = system.map(str::to_string).or_else(resolve_system_prompt);
-    let mut storage =
-        JsonlStorage::create_with(sessions_dir, &session_id, None, system_prompt.as_deref())
-            .with_context(|| format!("creating session {session_id}"))?;
-    println!("session: {session_id}");
-
+    // Build everything that can fail BEFORE the session file exists, so a
+    // failed startup does not leave a stray empty session polluting
+    // `sessions` / `--last` (CodeCora scan 2026-09-18).
     #[cfg(feature = "mcp")]
-    let mcp_cfgs: Vec<tole_core::mcp::McpServerConfig> = mcp_server
+    let mcp_cfgs: Vec<tole_core::mcp::McpServerConfig> = host
+        .mcp_server
         .iter()
         .map(|s| tole_core::mcp::McpServerConfig::parse(s))
         .collect::<Result<Vec<_>, String>>()
         .map_err(anyhow::Error::msg)?;
     #[cfg(feature = "mcp")]
-    let registry = build_registry(
+    let mut registry = build_registry(
         build_approver(allow_patterns, yes),
-        workspace.as_ref(),
+        host.workspace.as_ref(),
         &mcp_cfgs,
     )?;
     #[cfg(not(feature = "mcp"))]
-    let registry = build_registry(build_approver(allow_patterns, yes), workspace.as_ref())?;
+    let mut registry =
+        build_registry(build_approver(allow_patterns, yes), host.workspace.as_ref())?;
+    // Plan mode (issue #109): the guarantee is ABSENCE on the wire, not
+    // approval — filtered tools never appear in specs().
+    if host.plan_mode {
+        registry.retain_read_only();
+    }
+    // Opt-in tool-boundary hooks (issue #110): deny-only policy
+    // injection for Write/Destructive calls, default OFF.
+    #[cfg(feature = "shell-tools")]
+    if !host.on_pretool.is_empty() || !host.on_posttool.is_empty() {
+        registry.set_hooks(tole_core::hooks::ToolHooks::from_cli(
+            &host.on_pretool,
+            &host.on_posttool,
+        ));
+    }
+
+    let session_id = new_session_id();
+    std::fs::create_dir_all(sessions_dir)
+        .with_context(|| format!("creating {}", sessions_dir.display()))?;
+    let system_prompt = system
+        .map(str::to_string)
+        .or_else(resolve_system_prompt)
+        .or_else(|| Some(build_default_prompt(host.plan_mode)));
+    let mut storage =
+        JsonlStorage::create_with(sessions_dir, &session_id, None, system_prompt.as_deref())
+            .with_context(|| format!("creating session {session_id}"))?;
+    println!("session: {session_id}");
+
     let mut provider = OpenAiProvider::new(cfg).with_tool_specs(registry.specs());
     if let Some(sys) = system_prompt.as_deref() {
         provider = provider.with_system_prompt(sys);
     }
-    let outcome = run_turn(&mut storage, &mut provider, &registry, prompt)?;
+    // Memory loop, pre-turn: recalled context rides inside the first
+    // user message — the durable log stores exactly what was sent. The
+    // summary remembers the PRE-injection prompt: storing the injected
+    // block would echo recalled memory back into the store (amplification).
+    #[cfg(feature = "shell-tools")]
+    let (raw_prompt, prompt) = (prompt.to_string(), host.inject_memory(prompt));
+    #[cfg(not(feature = "shell-tools"))]
+    let prompt = prompt.to_string();
+    let outcome = run_turn(&mut storage, &mut provider, &registry, &prompt)?;
+    // Memory loop, post-session: a settled Final turn leaves a compact
+    // summary behind for the next session's recall.
+    #[cfg(feature = "shell-tools")]
+    if let TurnOutcome::Final { text } = &outcome {
+        host.remember(&session_id, &raw_prompt, text);
+    }
     report_outcome(&session_id, outcome);
     Ok(())
 }
@@ -388,8 +963,7 @@ fn resume_command(
     prompt: Option<&str>,
     allow_patterns: &[String],
     yes: bool,
-    workspace: Option<String>,
-    #[cfg(feature = "mcp")] mcp_server: Vec<String>,
+    host: &HostConfig,
 ) -> Result<()> {
     if !valid_session_id(id) {
         anyhow::bail!("invalid session id {id:?} (allowed: [a-z0-9-], max 64)");
@@ -405,19 +979,35 @@ fn resume_command(
     let mut storage = JsonlStorage::open(&path).context("replaying session log")?;
 
     #[cfg(feature = "mcp")]
-    let mcp_cfgs: Vec<tole_core::mcp::McpServerConfig> = mcp_server
+    let mcp_cfgs: Vec<tole_core::mcp::McpServerConfig> = host
+        .mcp_server
         .iter()
         .map(|s| tole_core::mcp::McpServerConfig::parse(s))
         .collect::<Result<Vec<_>, String>>()
         .map_err(anyhow::Error::msg)?;
     #[cfg(feature = "mcp")]
-    let registry = build_registry(
+    let mut registry = build_registry(
         build_approver(allow_patterns, yes),
-        workspace.as_ref(),
+        host.workspace.as_ref(),
         &mcp_cfgs,
     )?;
     #[cfg(not(feature = "mcp"))]
-    let registry = build_registry(build_approver(allow_patterns, yes), workspace.as_ref())?;
+    let mut registry =
+        build_registry(build_approver(allow_patterns, yes), host.workspace.as_ref())?;
+    // Plan mode (issue #109): the guarantee is ABSENCE on the wire, not
+    // approval — filtered tools never appear in specs().
+    if host.plan_mode {
+        registry.retain_read_only();
+    }
+    // Opt-in tool-boundary hooks (issue #110): deny-only policy
+    // injection for Write/Destructive calls, default OFF.
+    #[cfg(feature = "shell-tools")]
+    if !host.on_pretool.is_empty() || !host.on_posttool.is_empty() {
+        registry.set_hooks(tole_core::hooks::ToolHooks::from_cli(
+            &host.on_pretool,
+            &host.on_posttool,
+        ));
+    }
     let mut provider = OpenAiProvider::new(cfg).with_tool_specs(registry.specs());
     // B2: the system prompt is pinned in the session header — resume
     // re-applies exactly what the session was created with (never the
@@ -431,7 +1021,16 @@ fn resume_command(
             // machine accepts a user message at a turn boundary, so
             // reuse run_turn on the resumed storage instead of the
             // approvals-only resume protocol.
-            run_turn(&mut storage, &mut provider, &registry, text)?
+            let outcome = run_turn(&mut storage, &mut provider, &registry, text)?;
+            // Memory loop (CodeCora scan 2026-09-18): a settled resumed
+            // turn leaves a summary like `run` does — the continuation is
+            // its own durable event. No recall injection here: the resumed
+            // session already carries its context.
+            #[cfg(feature = "shell-tools")]
+            if let TurnOutcome::Final { text: answer } = &outcome {
+                host.remember(id, text, answer);
+            }
+            outcome
         }
         _ => resume_turn(&mut storage, &mut provider, &registry)?,
     };
@@ -488,7 +1087,7 @@ fn status_command(sessions_dir: &Path, id: &str) -> Result<()> {
 fn sessions_command(sessions_dir: &Path) -> Result<()> {
     if !sessions_dir.exists() {
         println!(
-            "no sessions in {} (dir does not exist)",
+            "no sessions in {} (dir does not exist) — start one with: tole chat",
             sessions_dir.display()
         );
         return Ok(());
@@ -498,8 +1097,13 @@ fn sessions_command(sessions_dir: &Path) -> Result<()> {
     let mut rows: Vec<(u64, String, String, u64, usize)> = Vec::new();
     for entry in std::fs::read_dir(sessions_dir)?.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
-        let stem = name.trim_end_matches(".jsonl");
-        if !name.ends_with(".jsonl") || !valid_session_id(stem) {
+        // strip_suffix, not trim_end_matches: a (weird but possible)
+        // "x.jsonl.jsonl" would otherwise yield the unusable id "x.jsonl"
+        // (CodeCora scan 2026-09-18).
+        let Some(stem) = name.strip_suffix(".jsonl") else {
+            continue;
+        };
+        if !valid_session_id(stem) {
             continue;
         }
         let mtime = entry
@@ -556,8 +1160,13 @@ fn fmt_mtime(t: std::time::SystemTime) -> String {
     let days = secs / 86400;
     let rem = secs % 86400;
     let (h, m) = (rem / 3600, (rem % 3600) / 60);
-    // civil-from-days (Howard Hinnant's algorithm) — no chrono.
-    let z = days as i64 + 719_468;
+    format!("{} {h:02}:{m:02}", civil_from_days(days as i64))
+}
+
+/// Civil date `YYYY-mm-dd` from days since the Unix epoch (Howard
+/// Hinnant's algorithm — no chrono dep).
+fn civil_from_days(days: i64) -> String {
+    let z = days + 719_468;
     let era = z.div_euclid(146097);
     let doe = z.rem_euclid(146097);
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
@@ -567,7 +1176,16 @@ fn fmt_mtime(t: std::time::SystemTime) -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let mth = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if mth <= 2 { y + 1 } else { y };
-    format!("{y:04}-{mth:02}-{d:02} {h:02}:{m:02}")
+    format!("{y:04}-{mth:02}-{d:02}")
+}
+
+/// Today's UTC date, `YYYY-mm-dd`.
+fn today_utc() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    civil_from_days((secs / 86400) as i64)
 }
 
 // ---------------------------------------------------------------------------
@@ -579,7 +1197,10 @@ fn latest_session_id(dir: &Path) -> Option<String> {
     let mut best: Option<(std::time::SystemTime, String)> = None;
     for entry in std::fs::read_dir(dir).ok()?.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
-        if !name.ends_with(".jsonl") || !valid_session_id(name.trim_end_matches(".jsonl")) {
+        let Some(stem) = name.strip_suffix(".jsonl") else {
+            continue;
+        };
+        if !valid_session_id(stem) {
             continue;
         }
         let mtime = entry
@@ -605,8 +1226,7 @@ fn chat_command(
     last: bool,
     allow_patterns: &[String],
     yes: bool,
-    workspace: Option<String>,
-    #[cfg(feature = "mcp")] mcp_server: Vec<String>,
+    host: &HostConfig,
 ) -> Result<()> {
     use std::io::{BufRead, Write};
 
@@ -634,13 +1254,50 @@ fn chat_command(
         (new_session_id(), true)
     };
 
+    // Build everything that can fail BEFORE the fresh session file is
+    // created, so a failed startup does not leave a stray empty session
+    // polluting `sessions` / `--last` (CodeCora scan 2026-09-18).
+    #[cfg(feature = "mcp")]
+    let mcp_cfgs: Vec<tole_core::mcp::McpServerConfig> = host
+        .mcp_server
+        .iter()
+        .map(|s| tole_core::mcp::McpServerConfig::parse(s))
+        .collect::<Result<Vec<_>, String>>()
+        .map_err(anyhow::Error::msg)?;
+    #[cfg(feature = "mcp")]
+    let mut registry = build_registry(
+        build_approver(allow_patterns, yes),
+        host.workspace.as_ref(),
+        &mcp_cfgs,
+    )?;
+    #[cfg(not(feature = "mcp"))]
+    let mut registry =
+        build_registry(build_approver(allow_patterns, yes), host.workspace.as_ref())?;
+    // Plan mode (issue #109): the guarantee is ABSENCE on the wire, not
+    // approval — filtered tools never appear in specs().
+    if host.plan_mode {
+        registry.retain_read_only();
+    }
+    // Opt-in tool-boundary hooks (issue #110): deny-only policy
+    // injection for Write/Destructive calls, default OFF.
+    #[cfg(feature = "shell-tools")]
+    if !host.on_pretool.is_empty() || !host.on_posttool.is_empty() {
+        registry.set_hooks(tole_core::hooks::ToolHooks::from_cli(
+            &host.on_pretool,
+            &host.on_posttool,
+        ));
+    }
+
     if fresh {
         std::fs::create_dir_all(sessions_dir)
             .with_context(|| format!("creating {}", sessions_dir.display()))?;
     }
     let path = session_path(sessions_dir, &session_id);
     let mut storage = if fresh {
-        let system_prompt = system.map(str::to_string).or_else(resolve_system_prompt);
+        let system_prompt = system
+            .map(str::to_string)
+            .or_else(resolve_system_prompt)
+            .or_else(|| Some(build_default_prompt(host.plan_mode)));
         JsonlStorage::create_with(sessions_dir, &session_id, None, system_prompt.as_deref())
             .with_context(|| format!("creating session {session_id}"))?
     } else {
@@ -650,20 +1307,6 @@ fn chat_command(
         "tole chat — session {session_id} (Ctrl-D exits, resume: tole chat --resume {session_id})"
     );
 
-    #[cfg(feature = "mcp")]
-    let mcp_cfgs: Vec<tole_core::mcp::McpServerConfig> = mcp_server
-        .iter()
-        .map(|s| tole_core::mcp::McpServerConfig::parse(s))
-        .collect::<Result<Vec<_>, String>>()
-        .map_err(anyhow::Error::msg)?;
-    #[cfg(feature = "mcp")]
-    let registry = build_registry(
-        build_approver(allow_patterns, yes),
-        workspace.as_ref(),
-        &mcp_cfgs,
-    )?;
-    #[cfg(not(feature = "mcp"))]
-    let registry = build_registry(build_approver(allow_patterns, yes), workspace.as_ref())?;
     let mut provider = OpenAiProvider::new(cfg).with_tool_specs(registry.specs());
     // B2: fresh sessions pin the resolved prompt; resumed sessions re-apply
     // the header-pinned one (see create_with above / JsonlStorage::open).
@@ -671,9 +1314,20 @@ fn chat_command(
         provider = provider.with_system_prompt(sys);
     }
 
+    // Memory loop state: recall rides into the first message of a FRESH
+    // session only (a resumed session already carries its context); the
+    // session summary is stored when the REPL exits cleanly.
+    #[cfg(feature = "shell-tools")]
+    let (mut memory_injected, mut first_prompt, mut last_answer) = (!fresh, None, None);
+    // Set when the typed message could not run because the session was
+    // stuck mid-flight and the bounded resolve retries ran out — the
+    // message is NOT in the durable log, so the operator must resend it.
+    // SCOPED PER MESSAGE (cora scan-3 #8): declared inside the loop —
+    // an outer flag never reset, so one drop warned forever after.
     let stdin = std::io::stdin();
     loop {
-        print!("you> ");
+        let mut dropped_message = false;
+        print!("you>");
         let _ = std::io::stdout().flush();
         let mut line = String::new();
         match stdin.lock().read_line(&mut line) {
@@ -707,13 +1361,30 @@ fn chat_command(
         // turn; anything mid-flight is resolved via resume FIRST (looping
         // until it lands on a boundary), and only then does the freshly
         // typed message run as its own turn — user input is never dropped.
+        //
+        // Memory loop, pre-turn: the first fresh-session message carries
+        // the recalled-context block; the durable log records exactly
+        // what the provider sees.
+        #[cfg(feature = "shell-tools")]
+        if first_prompt.is_none() {
+            first_prompt = Some(text.to_string());
+        }
+        #[cfg(feature = "shell-tools")]
+        let turn_prompt: String = if fresh && !memory_injected {
+            memory_injected = true;
+            host.inject_memory(text)
+        } else {
+            text.to_string()
+        };
+        #[cfg(not(feature = "shell-tools"))]
+        let turn_prompt = text.to_string();
         let outcome = loop {
             match storage.state().pc {
                 tole_core::state::Pc::Idle | tole_core::state::Pc::Final => {
-                    break run_turn(&mut storage, &mut provider, &registry, text);
+                    break run_turn(&mut storage, &mut provider, &registry, &turn_prompt);
                 }
-                mid => {
-                    eprintln!("tole> (resolving interrupted turn, pc={mid:?}…)");
+                _ => {
+                    eprintln!("tole> (resolving the interrupted turn…)");
                     match resume_turn(&mut storage, &mut provider, &registry) {
                         // Landed on a boundary — dispatch the message now.
                         Ok(TurnOutcome::Final { .. }) => continue,
@@ -726,16 +1397,28 @@ fn chat_command(
                             | TurnOutcome::ProviderFailed { .. }),
                         ) => {
                             if retries_left == 0 {
+                                dropped_message = true;
                                 break Ok(other);
                             }
                             retries_left -= 1;
                             continue;
                         }
-                        Ok(other) => break Ok(other),
+                        Ok(other) => {
+                            // UnknownTool / BudgetExhausted / LoopDetected
+                            // / Storage: the typed message never reached
+                            // the durable log (run_turn was never
+                            // reached). Flag it so the operator gets the
+                            // not-recorded note below (cora full-scan
+                            // #7 — silently continuing would let them
+                            // believe the input was recorded).
+                            dropped_message = true;
+                            break Ok(other);
+                        }
                         Err(e) => {
                             // Storage-level failure resolving: do not lose
                             // the user's message — report and keep the
                             // input buffered for the next attempt.
+                            dropped_message = true;
                             break Err(e);
                         }
                     }
@@ -744,7 +1427,13 @@ fn chat_command(
         };
 
         match outcome {
-            Ok(TurnOutcome::Final { text }) => println!("tole> {text}"),
+            Ok(TurnOutcome::Final { text }) => {
+                #[cfg(feature = "shell-tools")]
+                {
+                    last_answer = Some(text.clone());
+                }
+                println!("tole> {text}");
+            }
             Ok(TurnOutcome::ApprovalRequired { name }) => eprintln!(
                 "tole> (approval denied for '{name}' — turn aborted; your next message resumes)"
             ),
@@ -761,8 +1450,27 @@ fn chat_command(
                 "tole> (loop guard tripped — identical tool calls repeated; next message resumes)"
             ),
             Ok(TurnOutcome::Storage(e)) => anyhow::bail!("storage error: {e}"),
-            Err(e) => anyhow::bail!("turn failed: {e}"),
+            Err(e) => {
+                // Resolve-path failure: the typed message was NOT
+                // recorded. Print the same not-recorded note the
+                // dropped_message path uses, then surface the error
+                // (previously this bailed silently on the note).
+                eprintln!("tole> (note: the message you just typed was NOT recorded — resolve the session state, then resend it)");
+                anyhow::bail!("turn failed: {e}");
+            }
         }
+        if dropped_message {
+            // The typed message never reached the durable log — saying
+            // "your next message resumes" alone would let the operator
+            // believe it was recorded (CodeCora scan 2026-09-18).
+            eprintln!("tole> (note: the message you just typed was NOT recorded — resolve the session state, then resend it)");
+        }
+    }
+    // Memory loop, post-session: a clean REPL exit with at least one
+    // completed turn leaves a compact summary in the namespace.
+    #[cfg(feature = "shell-tools")]
+    if let (Some(fp), Some(la)) = (first_prompt.as_deref(), last_answer.as_deref()) {
+        host.remember(&session_id, fp, la);
     }
     println!(
         "session {session_id} closed — entries: {}",
@@ -781,6 +1489,66 @@ fn resolve_system_prompt() -> Option<String> {
     std::env::var("TOLE_SYSTEM_PROMPT")
         .ok()
         .filter(|s| !s.trim().is_empty())
+}
+
+/// Built-in default system prompt for fresh sessions (no `--system`, no
+/// `TOLE_SYSTEM_PROMPT`). Tool discipline keeps the model on the dedicated,
+/// guarded lanes: the file tools run inside the workspace jail with
+/// hash-anchored editing, while `run_command` is a generic escape hatch
+/// that no `--allow` pattern for file tools can cover (issue #103, from a
+/// live E2E where the model routed a write through `bash -c`).
+#[cfg(feature = "shell-tools")]
+fn default_system_prompt() -> &'static str {
+    "You are tole, a careful personal assistant. Tool discipline: for anything \
+involving files, prefer the dedicated tools — read_file, write_file, \
+edit_file — instead of run_command; they are safer and their approvals are \
+what the user's --allow settings mean. Use run_command only for what those \
+cannot do (pipes, builds, process control). Keep answers concise."
+}
+
+/// Same default without shell tools: `run_command` is not registered in
+/// this profile, so the prompt must not advertise it.
+#[cfg(not(feature = "shell-tools"))]
+fn default_system_prompt() -> &'static str {
+    "You are tole, a careful personal assistant. Tool discipline: for anything \
+involving files, prefer the dedicated tools — read_file, write_file, \
+edit_file. Keep answers concise."
+}
+
+/// The default prompt for the session's mode (issue #109). Plan mode
+/// appends the read-only instruction to the SAME incumbent text — the
+/// identity/tool-discipline section is shared, so the non-plan default
+/// never drifts from what the replay scorer greps out of this file.
+fn default_prompt_for(plan_mode: bool) -> String {
+    let base = default_system_prompt();
+    if plan_mode {
+        format!(
+            "{base} PLAN MODE: only read-only tools exist in this \
+session; explore and produce a plan — mutation tools are absent \
+until the session is started without --plan-mode."
+        )
+    } else {
+        base.to_string()
+    }
+}
+
+/// Default prompt for the session's mode + dynamic context sections
+/// (issues #109 + #111): the shared incumbent text, the plan-mode
+/// read-only sentence when planning, then a ONE-LINE context section
+/// (working directory, today's UTC date). ONE context line MAXIMUM —
+/// no env dumps, no fingerprints. Session start only: the assembled
+/// prompt is pinned in the session header, so within a session the
+/// wire body stays append-only (KV-cache prefix property untouched).
+fn build_default_prompt(plan_mode: bool) -> String {
+    let mut p = default_prompt_for(plan_mode);
+    let cwd = std::env::current_dir()
+        .map(|d| d.display().to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+    p.push_str(&format!(
+        "\nContext: working directory {cwd}; today is {} (UTC).",
+        today_utc()
+    ));
+    p
 }
 
 // ---------------------------------------------------------------------------
@@ -835,10 +1603,145 @@ fn new_session_id() -> String {
     format!("s-{ms:x}-{pid:x}", pid = std::process::id())
 }
 
+#[cfg(all(test, feature = "shell-tools"))]
+mod gh_repo_tests {
+    use super::*;
+
+    #[test]
+    fn parses_https_ssh_and_git_suffix() {
+        assert_eq!(
+            tole_cli::session_host::github_repo_from_remote_url("https://github.com/foo/bar.git")
+                .as_deref(),
+            Some("foo/bar")
+        );
+        assert_eq!(
+            tole_cli::session_host::github_repo_from_remote_url("https://github.com/foo/bar")
+                .as_deref(),
+            Some("foo/bar")
+        );
+        assert_eq!(
+            tole_cli::session_host::github_repo_from_remote_url("git@github.com:foo/bar.git")
+                .as_deref(),
+            Some("foo/bar")
+        );
+        assert_eq!(
+            tole_cli::session_host::github_repo_from_remote_url(
+                "https://user:token@github.com/Foo/Bar.git"
+            )
+            .as_deref(),
+            Some("Foo/Bar")
+        );
+    }
+
+    #[test]
+    fn rejects_non_github_and_garbage() {
+        assert!(tole_cli::session_host::github_repo_from_remote_url(
+            "https://gitlab.com/foo/bar.git"
+        )
+        .is_none());
+        assert!(tole_cli::session_host::github_repo_from_remote_url(
+            "https://github.com/only-owner"
+        )
+        .is_none());
+        assert!(tole_cli::session_host::github_repo_from_remote_url("not a url").is_none());
+        assert!(tole_cli::session_host::github_repo_from_remote_url(
+            "https://github.com/-bad/name"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn detects_repo_from_checkout() {
+        // A real checkout: init + remote origin, then detect.
+        let dir = std::env::temp_dir().join(format!("tole-gh-detect-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .unwrap()
+        };
+        run(&["init", "-q"]);
+        run(&[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/detected/owner-name.git",
+        ]);
+        let detected = detect_github_repo(&dir);
+        assert_eq!(detected.as_deref(), Some("detected/owner-name"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod default_prompt_tests {
+    #[test]
+    fn default_prompt_keeps_model_on_dedicated_file_tools() {
+        let p = super::default_system_prompt();
+        assert!(p.contains("prefer the dedicated tools"));
+        #[cfg(feature = "shell-tools")]
+        assert!(p.contains("run_command"));
+    }
+
+    #[test]
+    fn default_prompt_is_short() {
+        // Prompt discipline: a few lines, not a constitution.
+        assert!(super::default_system_prompt().chars().count() < 600);
+    }
+
+    #[test]
+    fn plan_mode_prompt_extends_the_incumbent_without_touching_it() {
+        let plan = super::default_prompt_for(true);
+        let base = super::default_system_prompt();
+        // The incumbent text is untouched and still the prefix...
+        assert!(plan.starts_with(base));
+        // ...with the read-only instruction appended.
+        assert!(plan.contains("PLAN MODE"));
+        assert!(plan.contains("read-only"));
+        // Non-plan default is byte-identical to the incumbent fn.
+        assert_eq!(super::default_prompt_for(false), base);
+    }
+
+    #[test]
+    fn context_sections_append_date_and_cwd_without_mutating_the_mode_prompt() {
+        let built = super::build_default_prompt(false);
+        let mode = super::default_prompt_for(false);
+        assert!(built.starts_with(&mode));
+        assert!(built.contains("working directory "));
+        assert!(built.contains("today is "));
+        // Exactly ONE appended context line.
+        assert_eq!(built.matches('\n').count(), mode.matches('\n').count() + 1);
+        // Date shape YYYY-mm-dd (civil-from-days output).
+        let tail = built
+            .rsplit("today is ")
+            .next()
+            .unwrap()
+            .trim_end_matches(" (UTC).");
+        assert_eq!(tail.len(), 10);
+        assert_eq!(tail.as_bytes()[4], b'-');
+        assert_eq!(tail.as_bytes()[7], b'-');
+        // Plan mode composes: context rides AFTER the plan sentence.
+        let planned = super::build_default_prompt(true);
+        assert!(planned.contains("PLAN MODE"));
+        assert!(planned.rfind("Context:").unwrap() > planned.rfind("PLAN MODE").unwrap());
+    }
+
+    #[test]
+    fn civil_from_days_matches_known_dates() {
+        // Day 0 = 1970-01-01; leap-year boundary (2024-01-01) and a
+        // mid-2026 date (computed, not guessed).
+        assert_eq!(super::civil_from_days(0), "1970-01-01");
+        assert_eq!(super::civil_from_days(19_723), "2024-01-01");
+        assert_eq!(super::civil_from_days(20_646), "2026-07-12");
+    }
+}
+
 #[cfg(test)]
 mod workspace_tests {
     use super::resolve_workspace_root;
-
     #[test]
     fn workspace_valid_dir_canonicalized() {
         let dir = std::env::temp_dir().join(format!("tole-ws-{}", std::process::id()));
@@ -871,5 +1774,58 @@ mod workspace_tests {
     fn workspace_none_falls_back_to_cwd() {
         let resolved = resolve_workspace_root(None).unwrap();
         assert_eq!(resolved, std::env::current_dir().unwrap());
+    }
+}
+
+#[cfg(all(test, feature = "mcp"))]
+mod mcp_preset_tests {
+    use super::merge_mcp_specs;
+
+    #[test]
+    fn auto_spec_appended_when_no_explicit() {
+        let merged = merge_mcp_specs(&[], false, vec!["cora=cora mcp".into()]);
+        assert_eq!(merged, vec!["cora=cora mcp".to_string()]);
+    }
+
+    #[test]
+    fn explicit_same_name_wins_over_auto() {
+        let merged = merge_mcp_specs(
+            &["cora=/opt/other/cora mcp --strict".to_string()],
+            false,
+            vec!["cora=cora mcp".into()],
+        );
+        assert_eq!(
+            merged,
+            vec!["cora=/opt/other/cora mcp --strict".to_string()]
+        );
+    }
+
+    #[test]
+    fn unrelated_explicit_and_auto_coexist() {
+        let merged = merge_mcp_specs(
+            &["fs=npx -y fs-server".to_string()],
+            false,
+            vec!["cora=cora mcp".into()],
+        );
+        assert_eq!(merged, vec!["fs=npx -y fs-server", "cora=cora mcp"]);
+    }
+
+    #[test]
+    fn no_auto_flag_drops_presets_keeps_explicit() {
+        let merged = merge_mcp_specs(
+            &["fs=npx -y fs-server".to_string()],
+            true,
+            vec!["cora=cora mcp".into()],
+        );
+        assert_eq!(merged, vec!["fs=npx -y fs-server".to_string()]);
+    }
+
+    #[test]
+    fn malformed_explicit_spec_treated_as_its_own_name() {
+        // No '=' at all: the whole string counts as the name, so the
+        // preset still attaches (parse() will reject the malformed spec
+        // downstream with its normal error — this merge never panics).
+        let merged = merge_mcp_specs(&["not-a-spec".into()], false, vec!["cora=cora mcp".into()]);
+        assert_eq!(merged, vec!["not-a-spec", "cora=cora mcp"]);
     }
 }

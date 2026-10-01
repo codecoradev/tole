@@ -24,6 +24,7 @@
 //! - `provider` — LLM provider abstraction
 //! - `mock`     — scripted provider for deterministic Tier A tests
 //! - `turn`     — the single-threaded turn loop
+//! - `memory`   — harness-level uteke memory loop (recall/remember)
 
 pub mod approval;
 #[cfg(feature = "shell-tools")]
@@ -34,16 +35,26 @@ pub mod file_tools;
 pub mod gh;
 #[cfg(feature = "shell-tools")]
 pub mod git;
+// Process hooks spawn subprocesses (issue #110) — same gate as the
+// subprocess helper they build on; mobile/embedder profiles have no
+// shell and no hooks.
+#[cfg(feature = "shell-tools")]
+pub mod hooks;
 #[cfg(feature = "shell-tools")]
 pub mod jobs;
 pub mod machine;
 #[cfg(feature = "mcp")]
 pub mod mcp;
+#[cfg(feature = "mcp")]
+pub mod mcp_server;
+#[cfg(feature = "shell-tools")]
+pub mod memory;
 pub mod mock;
 pub mod openai;
 pub mod provider;
 pub mod read_file;
 pub mod register;
+pub mod replay;
 #[cfg(feature = "shell-tools")]
 pub mod run_command;
 pub mod state;

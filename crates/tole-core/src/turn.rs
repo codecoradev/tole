@@ -27,6 +27,21 @@ pub const MAX_STEPS: usize = 32;
 /// the cheapest failure mode to detect deterministically.
 pub const LOOP_TRIP_AFTER: usize = 3;
 
+/// Poll-tool ceiling (#85): polling tools (`job_poll`) legitimately call
+/// with identical input for the whole duration of a detached job — the
+/// guard's stuck-model heuristic does not apply to them until the model
+/// keeps polling far past any sane job-wait budget. 120 polls ≈ hours
+/// of attached waiting; a real loop still trips well before token ruin.
+pub const POLL_LOOP_TRIP_AFTER: usize = 120;
+
+/// Poll-style tools: identical consecutive input is the CORRECT pattern
+/// (the arguments name the job; the result carries the change). Registry
+/// classification, not a hardcoded name list, keeps this honest — a new
+/// poll tool opts in via `Tool::is_poll()`.
+fn is_poll_tool(name: &str) -> bool {
+    name == "job_poll"
+}
+
 /// One automatic retry for a timeout-classified provider failure per
 /// turn (issue #58): missions have died to a transient gateway timeout
 /// before any tool ran, while the same session completed end-to-end on a
@@ -145,70 +160,101 @@ pub fn resume_turn(
             safety,
         } => {
             let intent_id = intent_id.clone();
-            // The intent's recorded replay contract decides the guard:
-            // `Guarded` effects require a fresh approval before replay —
-            // may have landed before the effect ever ran, so replaying
-            // blind could double-fire a Write/Destructive tool.
-            if safety == ReplaySafety::Guarded {
-                let Some(t) = registry.get(&tool) else {
-                    // Unregistered tool on a Guarded intent: settle the
-                    // sandwich as failed so the session stays resumable
-                    // (scan #34: never park with an open intent).
-                    settle_err(
-                        s,
-                        &EffectHandle { intent_id },
-                        &format!("guarded intent references unregistered tool {tool}"),
-                    )?;
-                    append_turn_error(
-                        s,
-                        "unknown tool",
-                        &format!("guarded intent references unregistered tool {tool}"),
-                    )?;
-                    return Ok(TurnOutcome::UnknownTool { name: tool });
-                };
-                if t.risk() != Risk::ReadOnly {
-                    // Fresh consent for a replayed non-ReadOnly effect:
-                    // actually ASK the wired approver. Allow → proceed to
-                    // execute below; deny/absent → settle the sandwich as
-                    // failed (loop replans on the error) instead of
-                    // returning with the intent permanently pending.
-                    match registry.decide(&tool, &input) {
-                        Some(Verdict::Allow) => {}
-                        _ => {
+            // scan-3: an InvalidToolArgs intent records its input as a
+            // bare JSON STRING (the raw malformed arguments). Such an
+            // intent must NEVER execute — re-settle it as an error and let
+            // the provider replan (CodeCora scan-3 finding: the old path
+            // replayed it blind, executing the tool with a raw string).
+            if !input.is_object() {
+                settle_err(
+                    s,
+                    &EffectHandle {
+                        intent_id: intent_id.clone(),
+                    },
+                    "intent carried malformed (non-object) arguments",
+                )?;
+                append_turn_error(
+                    s,
+                    "invalid tool arguments",
+                    &format!("replayed intent {intent_id} carried malformed arguments"),
+                )?;
+            } else {
+                if safety == ReplaySafety::Guarded {
+                    let Some(t) = registry.get(&tool) else {
+                        // Unregistered tool on a Guarded intent: settle the
+                        // sandwich as failed so the session stays resumable
+                        // (scan #34: never park with an open intent).
+                        settle_err(
+                            s,
+                            &EffectHandle { intent_id },
+                            &format!("guarded intent references unregistered tool {tool}"),
+                        )?;
+                        append_turn_error(
+                            s,
+                            "unknown tool",
+                            &format!("guarded intent references unregistered tool {tool}"),
+                        )?;
+                        return Ok(TurnOutcome::UnknownTool { name: tool });
+                    };
+                    if t.risk() != Risk::ReadOnly {
+                        // Fresh consent for a replayed non-ReadOnly effect:
+                        // actually ASK the wired approver. Allow → proceed to
+                        // execute below; deny/absent → settle the sandwich as
+                        // failed (loop replans on the error) instead of
+                        // returning with the intent permanently pending.
+                        match registry.decide(&tool, &input) {
+                            Some(Verdict::Allow) => {}
+                            _ => {
+                                settle_err(
+                                    s,
+                                    &EffectHandle {
+                                        intent_id: intent_id.clone(),
+                                    },
+                                    "replay denied: no fresh approval for a guarded effect",
+                                )?;
+                                append_turn_error(
+                                    s,
+                                    "approval required",
+                                    &format!(
+                                    "guarded intent {intent_id} replay denied (no fresh approval)"
+                                ),
+                                )?;
+                                return Ok(TurnOutcome::ApprovalRequired { name: tool });
+                            }
+                        }
+                        // scan-3: opt-in pre-hooks apply on replay too — a
+                        // hook-deny must not be bypassable by crashing before
+                        // settlement (mirrors the normal-path check).
+                        #[cfg(feature = "shell-tools")]
+                        if let Some(reason) = registry.pre_hook_denial(&tool, &input) {
                             settle_err(
                                 s,
                                 &EffectHandle {
                                     intent_id: intent_id.clone(),
                                 },
-                                "replay denied: no fresh approval for a guarded effect",
+                                &format!("replay denied by pre-hook: {reason}"),
                             )?;
-                            append_turn_error(
-                                s,
-                                "approval required",
-                                &format!(
-                                    "guarded intent {intent_id} replay denied (no fresh approval)"
-                                ),
-                            )?;
+                            append_turn_error(s, "pre-hook denial", &format!("{tool}: {reason}"))?;
                             return Ok(TurnOutcome::ApprovalRequired { name: tool });
                         }
                     }
                 }
-            }
-            let handle = EffectHandle { intent_id };
-            let out = match registry.get(&tool) {
-                Some(t) => t.execute(input),
-                // The tool vanished between runs (host wiring changed).
-                // The intent is durable — settle it as failed rather than
-                // aborting: the loop replans on the tool_result error.
-                None => Err(format!("unknown tool on resume: {tool}")),
-            };
-            match out {
-                Ok(o) => {
-                    settle_ok(s, &handle, o)?;
-                    finish(s)?;
-                }
-                Err(e) => {
-                    settle_err(s, &handle, &e)?;
+                let handle = EffectHandle { intent_id };
+                let out = match registry.get(&tool) {
+                    Some(t) => t.execute(input),
+                    // The tool vanished between runs (host wiring changed).
+                    // The intent is durable — settle it as failed rather than
+                    // aborting: the loop replans on the tool_result error.
+                    None => Err(format!("unknown tool on resume: {tool}")),
+                };
+                match out {
+                    Ok(o) => {
+                        settle_ok(s, &handle, o)?;
+                        finish(s)?;
+                    }
+                    Err(e) => {
+                        settle_err(s, &handle, &e)?;
+                    }
                 }
             }
         }
@@ -293,6 +339,17 @@ fn drive(
                 // Durable record, same contract as BudgetExhausted: the
                 // failure must be visible to replay, not just the caller.
                 append_turn_error(s, "provider failed", &msg)?;
+                // #84: settle the turn instead of leaving pc=Planning.
+                // A terminal provider failure (non-transient, retries
+                // exhausted) previously wedged the session — resume with
+                // a PROMPT was refused ("run_turn requires Idle/Final")
+                // and the approvals-only recovery is interactive. The
+                // state machine already allows Planning→Final; landing
+                // here with a durable error record keeps the session
+                // plain-resumable: `tole resume <id> "continue"` just
+                // works, matching the E5 crash-resume guarantee.
+                let seq = s.state().seq;
+                s.commit(Commit::new().transition(StateTransition::from(seq, Pc::Final)))?;
                 return Ok(TurnOutcome::ProviderFailed { message: msg });
             }
         };
@@ -331,14 +388,32 @@ fn drive(
                 let fp = call_fingerprint(&tool, &input);
                 streak = if Some(fp) == last_fp { streak + 1 } else { 1 };
                 last_fp = Some(fp);
-                if streak >= LOOP_TRIP_AFTER {
+                // Poll-style exemption (#85): for polling tools identical
+                // CONSECUTIVE INPUT is the correct calling pattern — the
+                // arguments name the same job; the expected change is in
+                // the RESULT (running → progress → done). A 14-minute
+                // render legitimately polls the same id dozens of times;
+                // tripping the guard there aborted healthy missions. The
+                // guard still applies once the results stop changing AND
+                // the model keeps polling past the patience budget — a
+                // much higher ceiling for polls only.
+                let trip_at = if is_poll_tool(&tool) {
+                    POLL_LOOP_TRIP_AFTER
+                } else {
+                    LOOP_TRIP_AFTER
+                };
+                if streak >= trip_at {
                     append_turn_error(
                         s,
                         "loop detected",
                         &format!(
-                            "tool {tool} called with identical input {streak} times in a row (guard trips at {LOOP_TRIP_AFTER})"
+                            "tool {tool} called with identical input {streak} times in a row (guard trips at {trip_at})"
                         ),
                     )?;
+                    // #84 consistency: a loop trip is terminal for this
+                    // turn — settle to Final so a prompt-resume works.
+                    let seq = s.state().seq;
+                    s.commit(Commit::new().transition(StateTransition::from(seq, Pc::Final)))?;
                     return Ok(TurnOutcome::LoopDetected {
                         tool,
                         count: streak,
@@ -360,6 +435,14 @@ fn drive(
                             return Ok(TurnOutcome::ApprovalRequired { name: tool });
                         }
                     }
+                    // Opt-in pre-hooks (issue #110, shell-tools only): a
+                    // deny (exit 2) settles the same way as an approval
+                    // denial — durable turn error + ApprovalRequired.
+                    #[cfg(feature = "shell-tools")]
+                    if let Some(reason) = registry.pre_hook_denial(&tool, &input) {
+                        append_turn_error(s, "pre-hook denial", &format!("{tool}: {reason}"))?;
+                        return Ok(TurnOutcome::ApprovalRequired { name: tool });
+                    }
                 }
                 // Planning → ToolCall, then the sandwich. The replay
                 // contract derives from RISK, not a blanket Idempotent
@@ -375,15 +458,33 @@ fn drive(
                 let seq = s.state().seq;
                 s.commit(Commit::new().transition(StateTransition::from(seq, Pc::ToolCall)))?;
                 let handle = begin(s, &tool, input.clone(), safety, None)?;
+                // Post-hook input snapshot (issue #110): execute consumes
+                // `input` by value; hooks observe the exact call input.
+                // Write/Destructive ONLY — ReadOnly stays zero-overhead
+                // (the documented hook contract; cora-caught).
+                #[cfg(feature = "shell-tools")]
+                let hook_input = if t.risk() != Risk::ReadOnly && registry.has_post_hooks() {
+                    Some(input.clone())
+                } else {
+                    None
+                };
                 let out = match t.execute(input) {
                     Ok(o) => o,
                     Err(e) => {
                         // settle_err lands in Planning directly (§10) —
                         // no finish() hop on the failure path.
+                        #[cfg(feature = "shell-tools")]
+                        if let Some(i) = &hook_input {
+                            registry.post_hook_notify(&tool, i, false);
+                        }
                         settle_err(s, &handle, &e)?;
                         continue;
                     }
                 };
+                #[cfg(feature = "shell-tools")]
+                if let Some(i) = &hook_input {
+                    registry.post_hook_notify(&tool, i, true);
+                }
                 settle_ok(s, &handle, out)?;
                 finish(s)?;
             }
@@ -394,14 +495,27 @@ fn drive(
                 // next request and can retry with well-formed JSON.
                 let seq = s.state().seq;
                 s.commit(Commit::new().transition(StateTransition::from(seq, Pc::ToolCall)))?;
-                // Nothing executes for this intent (it is settled as an
-                // error immediately below), so Idempotent is the honest
-                // contract: a replay can only ever settle it again.
+                // Replay safety derives from TOOL RISK, not from the fact
+                // that nothing executed now (cora scan-3 #50): a crash
+                // between this intent and its settlement must re-consult
+                // the approval gate for a Write/Destructive tool on
+                // resume, exactly like the normal ToolCall path. The
+                // intent's input is the RAW malformed arguments, so a
+                // guarded replay re-settles it as an error — never an
+                // execution.
+                let risky = registry
+                    .get(&tool)
+                    .map(|t| t.risk() != Risk::ReadOnly)
+                    .unwrap_or(false);
                 let handle = begin(
                     s,
                     &tool,
                     serde_json::Value::String(raw),
-                    ReplaySafety::Idempotent,
+                    if risky {
+                        ReplaySafety::Guarded
+                    } else {
+                        ReplaySafety::Idempotent
+                    },
                     None,
                 )?;
                 let msg = format!("tool arguments are not valid JSON: {reason}");
@@ -412,6 +526,11 @@ fn drive(
         }
     }
     append_turn_error(s, "budget exhausted", &format!("{MAX_STEPS} steps"))?;
+    // #84 consistency: budget exhaustion is terminal for THIS turn —
+    // settle to Final so `resume <id> "prompt"` works next (leaving
+    // pc=Planning wedges headless flows exactly like provider failures).
+    let seq = s.state().seq;
+    s.commit(Commit::new().transition(StateTransition::from(seq, Pc::Final)))?;
     Ok(TurnOutcome::BudgetExhausted)
 }
 

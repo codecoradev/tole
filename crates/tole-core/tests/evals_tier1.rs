@@ -17,7 +17,7 @@
 //!    verdicts (the #68 semantics as a table).
 
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use tole_core::approval::AllowlistApprover;
 use tole_core::entry::{EntryType, NewEntry};
@@ -82,7 +82,7 @@ impl Tool for DestructiveTool {
 
 /// Canonical transcript building block: a session where the user asked
 /// for something, the model called echo, got a result, and answered.
-fn canonical_session(dir: &PathBuf, id: &str) -> JsonlStorage {
+fn canonical_session(dir: &Path, id: &str) -> JsonlStorage {
     let mut s = JsonlStorage::create(
         dir,
         id,

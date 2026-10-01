@@ -1,0 +1,450 @@
+//! D1 (issue #94): tole as an MCP **server** over stdio.
+//!
+//! The registry's hardened tools — jailed file ops, argv-validated git,
+//! detached jobs, the uteke/cora integrations — become callable by ANY
+//! MCP client (ZCode, Claude, editor agents), instead of being locked
+//! inside the CLI process. The engine is untouched: this module is a
+//! thin rmcp `ServerHandler` over an ordinary [`ToolRegistry`].
+//!
+//! Approval policy in server context (the design decision behind D1):
+//! there is no stdin human — stdin IS the protocol channel — so the
+//! interactive approver is replaced by explicit pre-authorization:
+//!
+//! - ReadOnly tools are always callable (no approval by definition).
+//! - Write tools require `--allow <glob>` patterns (the existing flag);
+//!   without them every Write call settles as a tool error telling the
+//!   caller how to re-authorize.
+//! - **Destructive tools are structurally absent**: registration behind a
+//!   non-interactive approver is refused by the registry (the three-layer
+//!   invariant holds — the server cannot weaken it, only skip it).
+//!
+//! Logging hygiene: stderr is safe (stdio transport speaks on stdout);
+//! anything writing to stdout outside the protocol would corrupt it.
+
+use crate::tool::{Risk, ToolRegistry};
+use rmcp::handler::server::ServerHandler;
+use rmcp::model::{
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ListToolsResult,
+    PaginatedRequestParams, Tool,
+};
+use rmcp::service::RequestContext;
+use rmcp::ErrorData as McpError;
+use rmcp::{RoleServer, ServiceExt};
+use std::sync::Arc;
+
+/// Resolves the tool registry of the session named by `session_id`
+/// (#137: per-session jails). None when the host has no session model
+/// (stdio MCP mode — the single registry is the whole surface).
+pub type SessionRegistryResolver = Arc<dyn Fn(&str) -> Option<Arc<ToolRegistry>> + Send + Sync>;
+
+/// An MCP server view of a [`ToolRegistry`]. Cloneable (Arc-shared
+/// registry) so `call_tool` can move a handle into `spawn_blocking`.
+#[derive(Clone)]
+pub struct RegistryServer {
+    registry: std::sync::Arc<ToolRegistry>,
+    /// Multi-session HTTP hosts set this: when a tool call carries a
+    /// `session_id` argument (and the name is not a session tool), the
+    /// call routes to THAT session's registry (its jail + approver).
+    session_resolver: Option<SessionRegistryResolver>,
+}
+
+impl RegistryServer {
+    /// Wrap a registry. In server mode the registry must be built with a
+    /// NON-interactive approver (e.g.
+    /// `AllowlistApprover::allow_only(patterns)`): interactive prompts
+    /// would try to read the protocol's stdin. Destructive tools are then
+    /// refused at registration and structurally absent from the server.
+    pub fn new(registry: ToolRegistry) -> Self {
+        Self {
+            registry: std::sync::Arc::new(registry),
+            session_resolver: None,
+        }
+    }
+
+    /// Attach the per-session registry resolver (#137). Without it, tool
+    /// calls always run against the server-level registry.
+    pub fn with_session_resolver(mut self, resolver: SessionRegistryResolver) -> Self {
+        self.session_resolver = Some(resolver);
+        self
+    }
+
+    /// Register additional tools AFTER construction (#137: the
+    /// multi-session MCP host adds tole_session_* tools that carry their
+    /// own SharedSessions state — they are not part of a plain registry
+    /// build). Same risk rules apply: Destructive registration behind a
+    /// non-interactive approver is refused by the registry itself.
+    pub fn with_extra_tools(
+        mut registry: ToolRegistry,
+        tools: Vec<Box<dyn crate::tool::Tool>>,
+    ) -> Self {
+        for t in tools {
+            registry
+                .register(t)
+                .expect("with_extra_tools: duplicate tool name");
+        }
+        Self {
+            registry: std::sync::Arc::new(registry),
+            session_resolver: None,
+        }
+    }
+
+    fn registered_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .registry
+            .specs()
+            .into_iter()
+            .filter_map(|s| {
+                // specs() nests under function.name (OpenAI wire shape).
+                s["function"]["name"].as_str().map(str::to_string)
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn tool_by_name(&self, name: &str) -> Option<Tool> {
+        let t = self.registry.get(name)?;
+        if t.risk() == Risk::Destructive {
+            // Belt and suspenders: a non-interactive server registry
+            // refuses Destructive registration outright; never list one.
+            return None;
+        }
+        let schema = t
+            .spec()
+            .unwrap_or_else(|| serde_json::json!({"type": "object", "properties": {}}));
+        let input_schema = Arc::new(schema.as_object().cloned().unwrap_or_default());
+        Some(Tool::new(
+            name.to_owned(),
+            t.describe(&serde_json::Value::Null),
+            input_schema,
+        ))
+    }
+
+    fn execute_checked(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        // #137 multi-session routing: a `session_id` argument addresses
+        // the SESSION's registry (its workspace jail + approver). The
+        // session tools themselves (tole_session_*) always stay on the
+        // server-level registry — they carry the session map.
+        let session_id = args
+            .get("session_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let (registry, args) = match (&self.session_resolver, session_id) {
+            (Some(resolve), Some(sid))
+                if !name.starts_with("tole_session_") && self.registry.get(name).is_some() =>
+            {
+                let reg = resolve(&sid).ok_or_else(|| format!("unknown session: {sid}"))?;
+                // Strip the routing key before the tool sees the args.
+                let mut a = args;
+                if let serde_json::Value::Object(map) = &mut a {
+                    map.remove("session_id");
+                }
+                (reg, a)
+            }
+            _ => (self.registry.clone(), args),
+        };
+        let tool = registry
+            .get(name)
+            .ok_or_else(|| format!("unknown tool: {name}"))?;
+        // Structural guard, NOT an approver decision (CodeCora scan
+        // finding): `RegistryServer::new` accepts any registry, including
+        // one built with a permissive approver that would Allow a
+        // Destructive call. Hiding it from tools/list is not enough — it
+        // must be uncallable, period.
+        if tool.risk() == Risk::Destructive {
+            return Err("destructive tools are never exposed in server mode".into());
+        }
+        match tool.risk() {
+            Risk::ReadOnly => {}
+            Risk::Write => match registry.decide(name, &args) {
+                Some(crate::approval::Verdict::Allow) => {}
+                _ => {
+                    return Err(
+                        "denied by approval policy — this MCP server only pre-authorizes \
+                         Write tools listed in --allow patterns"
+                            .into(),
+                    )
+                }
+            },
+            Risk::Destructive => unreachable!("guarded above"),
+        }
+        tool.execute(args)
+    }
+}
+
+impl ServerHandler for RegistryServer {
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, McpError> {
+        let tools = self
+            .registered_names()
+            .into_iter()
+            .filter_map(|name| self.tool_by_name(&name))
+            .collect();
+        Ok(ListToolsResult {
+            tools,
+            ..Default::default()
+        })
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        let name = request.name.to_string();
+        let args = serde_json::Value::Object(request.arguments.unwrap_or_default());
+        // Tool execution is SYNCHRONOUS and can block for a long time
+        // (git runs with a 120s budget; run_command 420s). It must run
+        // on a blocking thread, not pin the async runtime's workers
+        // (cora full-scan #29): one slow tool call would stall every
+        // other request this runtime is serving.
+        let server = self.clone();
+        let executed = tokio::task::spawn_blocking(move || server.execute_checked(&name, args))
+            .await
+            .map_err(|e| McpError::internal_error(format!("tool task join failed: {e}"), None))?;
+        match executed {
+            Ok(result) => Ok(CallToolResult::success(vec![ContentBlock::text(
+                serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string()),
+            )])
+            .into()),
+            Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(e)]).into()),
+        }
+    }
+}
+
+/// Serve the registry over stdio (the standard MCP spawn pattern: the
+/// caller launches `tole mcp` and speaks JSON-RPC on stdin/stdout).
+/// Blocks until the client disconnects.
+pub async fn serve_stdio(registry: ToolRegistry) -> Result<(), String> {
+    use rmcp::transport::stdio;
+    let service = RegistryServer::new(registry)
+        .serve(stdio())
+        .await
+        .map_err(|e| format!("mcp server: initialize failed: {e}"))?;
+    service
+        .waiting()
+        .await
+        .map_err(|e| format!("mcp server: {e}"))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::approval::AllowlistApprover;
+    use crate::tool::{Risk, Tool};
+    use rmcp::service::serve_client;
+    use rmcp::RoleClient;
+    use serde_json::json;
+
+    struct EchoTool;
+    impl Tool for EchoTool {
+        fn name(&self) -> &str {
+            "echo_tool"
+        }
+        fn risk(&self) -> Risk {
+            Risk::ReadOnly
+        }
+        fn describe(&self, _input: &serde_json::Value) -> String {
+            "echoes input".into()
+        }
+        fn spec(&self) -> Option<serde_json::Value> {
+            Some(json!({"type": "object", "properties": {"msg": {"type": "string"}}}))
+        }
+        fn execute(&self, input: serde_json::Value) -> Result<serde_json::Value, String> {
+            Ok(json!({"echoed": input}))
+        }
+    }
+
+    struct WriteTool;
+    impl Tool for WriteTool {
+        fn name(&self) -> &str {
+            "fake_write"
+        }
+        fn risk(&self) -> Risk {
+            Risk::Write
+        }
+        fn describe(&self, _input: &serde_json::Value) -> String {
+            "fake write".into()
+        }
+        fn execute(&self, input: serde_json::Value) -> Result<serde_json::Value, String> {
+            Ok(json!({"wrote": input}))
+        }
+    }
+
+    struct BombTool;
+    impl Tool for BombTool {
+        fn name(&self) -> &str {
+            "bomb"
+        }
+        fn risk(&self) -> Risk {
+            Risk::Destructive
+        }
+        fn describe(&self, _input: &serde_json::Value) -> String {
+            "boom".into()
+        }
+        fn execute(&self, _: serde_json::Value) -> Result<serde_json::Value, String> {
+            unreachable!("destructive must never execute in server mode")
+        }
+    }
+
+    fn server_registry(allow_write: bool) -> ToolRegistry {
+        let patterns = if allow_write {
+            vec!["fake_write".to_string()]
+        } else {
+            vec![]
+        };
+        let mut reg = ToolRegistry::with_approver(AllowlistApprover::allow_only(patterns));
+        reg.register(Box::new(EchoTool)).unwrap();
+        reg.register(Box::new(WriteTool)).unwrap();
+        reg
+    }
+
+    async fn connect(server: RegistryServer) -> rmcp::service::RunningService<RoleClient, ()> {
+        let (client_out, server_in) = tokio::io::duplex(8192);
+        let (server_out, client_in) = tokio::io::duplex(8192);
+        tokio::spawn(async move {
+            // HOLD the running service for the connection's lifetime: dropping
+            // it closes the transport the moment the handshake returns
+            // (the BrokenPipe the first test run tripped over).
+            match server.serve((server_in, server_out)).await {
+                Ok(running) => {
+                    let _ = running.waiting().await;
+                }
+                Err(e) => eprintln!("MCP_SERVER_ERR: {e:?}"),
+            }
+        });
+        serve_client((), (client_in, client_out))
+            .await
+            .expect("client initialize")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn end_to_end_lists_only_non_destructive_tools() {
+        // Destructive registration is refused by the non-interactive
+        // server registry — the structural invariant holds over MCP.
+        let mut reg = server_registry(false);
+        assert!(
+            reg.register(Box::new(BombTool)).is_err(),
+            "server-mode registry must refuse Destructive tools"
+        );
+        let client = connect(RegistryServer::new(reg)).await;
+        let listed = client.peer().list_tools(None).await.unwrap();
+        let names: Vec<String> = listed.tools.iter().map(|t| t.name.to_string()).collect();
+        assert_eq!(names, vec!["echo_tool", "fake_write"]);
+        assert!(!names.iter().any(|n| n == "bomb"));
+        client.cancel().await.ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn end_to_end_lists_schemas_from_spec() {
+        let client = connect(RegistryServer::new(server_registry(false))).await;
+        let listed = client.peer().list_tools(None).await.unwrap();
+        let echo = listed
+            .tools
+            .iter()
+            .find(|t| t.name == "echo_tool")
+            .expect("echo_tool listed");
+        assert!(
+            echo.input_schema["properties"].get("msg").is_some(),
+            "input schema must mirror spec().properties"
+        );
+        client.cancel().await.ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn end_to_end_write_without_allow_is_a_tool_error() {
+        let client = connect(RegistryServer::new(server_registry(false))).await;
+        let res = client
+            .peer()
+            .call_tool(
+                CallToolRequestParams::new("fake_write")
+                    .with_arguments(json!({"x": 1}).as_object().expect("object").clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.is_error, Some(true));
+        let text = match &res.content[0] {
+            ContentBlock::Text(t) => t.text.clone(),
+            other => panic!("expected text content, got {other:?}"),
+        };
+        assert!(text.contains("denied by approval policy"), "{text}");
+        client.cancel().await.ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn end_to_end_write_with_allow_executes() {
+        let client = connect(RegistryServer::new(server_registry(true))).await;
+        let res = client
+            .peer()
+            .call_tool(
+                CallToolRequestParams::new("fake_write")
+                    .with_arguments(json!({"x": 1}).as_object().expect("object").clone()),
+            )
+            .await
+            .unwrap();
+        assert_ne!(res.is_error, Some(true));
+        let text = match &res.content[0] {
+            ContentBlock::Text(t) => t.text.clone(),
+            other => panic!("expected text content, got {other:?}"),
+        };
+        assert!(text.contains('"') && text.contains("x"), "{text}");
+        client.cancel().await.ok();
+    }
+
+    /// CodeCora scan regression: an embedder CAN pass a registry whose
+    /// approver allows Destructive (interactive-permissive). The server
+    /// must still refuse to execute it — hiding it from tools/list is not
+    /// enough.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn destructive_uncallable_even_with_permissive_registry() {
+        struct PermissiveApprover;
+        impl crate::approval::Approver for PermissiveApprover {
+            fn decide(&self, _req: &crate::approval::ToolRequest<'_>) -> crate::approval::Verdict {
+                crate::approval::Verdict::Allow
+            }
+            fn interactive(&self) -> bool {
+                true // the only way a Destructive tool registers at all
+            }
+        }
+        let mut reg = ToolRegistry::with_approver(PermissiveApprover);
+        reg.register(Box::new(BombTool))
+            .expect("permissive registry accepts it");
+        let client = connect(RegistryServer::new(reg)).await;
+        // Hidden from listing...
+        let listed = client.peer().list_tools(None).await.unwrap();
+        assert!(!listed.tools.iter().any(|t| t.name == "bomb"));
+        // ...and uncallable.
+        let res = client
+            .peer()
+            .call_tool(CallToolRequestParams::new("bomb"))
+            .await
+            .unwrap();
+        assert_eq!(res.is_error, Some(true));
+        let text = match &res.content[0] {
+            ContentBlock::Text(t) => t.text.clone(),
+            other => panic!("expected text content, got {other:?}"),
+        };
+        assert!(text.contains("never exposed in server mode"), "{text}");
+        client.cancel().await.ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn end_to_end_unknown_tool_is_a_tool_error() {
+        let client = connect(RegistryServer::new(server_registry(false))).await;
+        let res = client
+            .peer()
+            .call_tool(CallToolRequestParams::new("nope"))
+            .await
+            .unwrap();
+        assert_eq!(res.is_error, Some(true));
+        client.cancel().await.ok();
+    }
+}
