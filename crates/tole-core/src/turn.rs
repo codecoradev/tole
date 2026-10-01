@@ -424,9 +424,21 @@ fn drive(
                 // abort settles pc=Final (terminal, prompt-resumable).
                 #[cfg(feature = "shell-tools")]
                 if registry.has_turnend_hooks() {
+                    // Per-TURN summary (cora CI): only tool calls after
+                    // the last user message count — earlier turns' tools
+                    // would re-trigger history-keyed gates on every
+                    // later Final of a resumed/chat session.
+                    let turn_start = s
+                        .entries()
+                        .iter()
+                        .rposition(|e| {
+                            e.kind.as_str() == "message" && e.payload["role"] == json!("user")
+                        })
+                        .unwrap_or(0);
                     let tools_seen: Vec<(String, Risk)> = s
                         .entries()
                         .iter()
+                        .skip(turn_start)
                         .filter(|e| e.kind.as_str() == "tool_call")
                         .filter_map(|e| {
                             let tool = e.payload.get("tool")?.as_str()?.to_string();

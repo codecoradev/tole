@@ -1088,6 +1088,21 @@ fn registry_with_gates(cmds: &[String]) -> ToolRegistry {
     reg
 }
 
+/// Same but Write-capable (approver allowlists write_file).
+fn registry_with_gates_write(cmds: &[String]) -> ToolRegistry {
+    let mut reg = ToolRegistry::with_approver(tole_core::approval::AllowlistApprover::new(
+        vec!["write_file".to_string()],
+        tole_core::approval::Decision::Deny,
+    ));
+    let mut hooks = tole_core::hooks::ToolHooks::from_cli(&[], &[]);
+    hooks.turnend = cmds
+        .iter()
+        .map(|c| tole_core::hooks::turnend_hook(c))
+        .collect();
+    reg.set_hooks(hooks);
+    reg
+}
+
 #[test]
 fn stop_gate_deny_blocks_final_and_forces_continuation() {
     // First Final is DENIED (gate exit 2): it must NOT commit; the deny
@@ -1256,4 +1271,71 @@ fn stop_gate_nonzero_exit_denies_with_stdout_reason() {
             .unwrap_or(false)
     });
     assert!(has_reason, "the 101 verdict reason must be durable");
+}
+
+#[test]
+fn stop_gate_payload_is_per_turn_not_history() {
+    // cora CI: turn 1 executes a Write; turn 2 (fresh run_turn) produces
+    // a Final. The gate payload must list turn 2's tools only — a
+    // history-keyed gate would re-fire on every later Final.
+    let dir = tmpdir("gate-perturn");
+    let mut s = JsonlStorage::create(&dir, "gpt", None).unwrap();
+    // Gate script: dump the payload's tools array, then pass.
+    let dump = std::env::temp_dir().join(format!("tole-gate-dump-{}", std::process::id()));
+    let _ = std::fs::remove_file(&dump);
+    let gate = std::env::temp_dir().join(format!("tole-gate-dumpsh-{}", std::process::id()));
+    std::fs::write(
+        &gate,
+        format!(
+            "#!/bin/sh\ncat > /dev/null\npython3 -c \"import sys,json;d=json.load(open('{}'.replace(chr(39),chr(39))));print(json.dumps(d))\" /dev/stdin >> {} 2>/dev/null || true\nexit 0\n",
+            "",
+            dump.display()
+        ),
+    )
+    .unwrap();
+    // Simpler: use a tiny python that appends stdin to the dump file.
+    std::fs::write(
+        &gate,
+        format!("#!/bin/sh\ntee -a {} >/dev/null\nexit 0\n", dump.display()),
+    )
+    .unwrap();
+    let _reg = registry_with_gates(&[format!("/bin/sh {}", gate.display())]);
+
+    // Turn 1: a Write tool executes.
+    // registry with gates + tools, shared across both turns
+    let mut reg_all = registry_with_gates_write(&[format!("/bin/sh {}", gate.display())]);
+    reg_all.register(Box::new(WriteTool)).unwrap();
+    reg_all.register(Box::new(EchoTool)).unwrap();
+
+    let mut p1 = MockProvider::scripted(vec![
+        ProviderOutput::ToolCall {
+            tool: "write_file".into(),
+            input: json!({"path": "a.txt"}),
+        },
+        ProviderOutput::Final {
+            text: "turn one done".into(),
+        },
+    ]);
+    run_turn(&mut s, &mut p1, &reg_all, "turn one").unwrap();
+
+    // Turn 2: no tools, just a Final.
+    let mut p2 = MockProvider::scripted(vec![ProviderOutput::Final {
+        text: "turn two done".into(),
+    }]);
+    run_turn(&mut s, &mut p2, &reg_all, "turn two").unwrap();
+
+    // Inspect the LAST payload dumped: it must contain turn 2's tools
+    // (none) and NOT write_file from turn 1. Payloads are concatenated
+    // on one line by `tee -a`, so stream-decode all JSON values.
+    let content = std::fs::read_to_string(&dump).unwrap();
+    let de = serde_json::Deserializer::from_str(&content).into_iter::<serde_json::Value>();
+    let v = de
+        .last()
+        .expect("gate received at least one JSON payload")
+        .expect("valid payload json");
+    let tools = v["tools"].as_array().cloned().unwrap_or_default();
+    assert!(
+        !tools.iter().any(|t| t["tool"] == "write_file"),
+        "turn 2 payload must not contain turn 1's tools: {tools:?}"
+    );
 }
