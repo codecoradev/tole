@@ -1045,3 +1045,358 @@ fn aborted_writing_turn_keeps_the_session_flag() {
         Some(&json!(true))
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #145: turn-end stop gates (--on-turnend)
+// ---------------------------------------------------------------------------
+
+struct GateScript {
+    /// exit code the gate script returns; stdout is its reason on deny
+    code: i32,
+    reason: &'static str,
+}
+
+/// Build a gate hook command line: a sh script that emits `reason` and
+/// exits with `code`. Returns (command_line, _dir_keepalive).
+fn gate_cmd(g: &GateScript) -> (String, std::path::PathBuf) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let n = SEQ.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("tole-gate-{}-{n}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("gate.sh");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\necho '{}'\nexit {}\n",
+            g.reason.replace('\'', "'\\''"),
+            g.code
+        ),
+    )
+    .unwrap();
+    (format!("/bin/sh {}", path.display()), dir)
+}
+
+fn registry_with_gates(cmds: &[String]) -> ToolRegistry {
+    let mut reg = ToolRegistry::new();
+    let mut hooks = tole_core::hooks::ToolHooks::from_cli(&[], &[]);
+    hooks.turnend = cmds
+        .iter()
+        .map(|c| tole_core::hooks::turnend_hook(c))
+        .collect();
+    reg.set_hooks(hooks);
+    reg
+}
+
+/// Same but Write-capable (approver allowlists write_file).
+fn registry_with_gates_write(cmds: &[String]) -> ToolRegistry {
+    let mut reg = ToolRegistry::with_approver(tole_core::approval::AllowlistApprover::new(
+        vec!["write_file".to_string()],
+        tole_core::approval::Decision::Deny,
+    ));
+    let mut hooks = tole_core::hooks::ToolHooks::from_cli(&[], &[]);
+    hooks.turnend = cmds
+        .iter()
+        .map(|c| tole_core::hooks::turnend_hook(c))
+        .collect();
+    reg.set_hooks(hooks);
+    reg
+}
+
+#[test]
+fn stop_gate_deny_blocks_final_and_forces_continuation() {
+    // First Final is DENIED (gate exit 2): it must NOT commit; the deny
+    // reason lands as a user-role entry; the model's second Final PASSES
+    // (the gate is stateful: deny once, then pass) and the turn
+    // completes with the new text.
+    let dir = tmpdir("gate-deny");
+    let mut s = JsonlStorage::create(&dir, "gd", None).unwrap();
+    // stateful gate: first run exits 2, later runs exit 0
+    let counter = std::env::temp_dir().join(format!("tole-gate-count-{}", std::process::id()));
+    let _ = std::fs::remove_file(&counter);
+    let gate = std::env::temp_dir().join(format!("tole-gate-once-{}", std::process::id()));
+    std::fs::write(
+        &gate,
+        format!(
+            "#!/bin/sh\nN=$(cat {}) 2>/dev/null || echo 0 > {}; N=$((N+1)); echo $N > {};\nif [ $N -eq 1 ]; then echo 'tests failing'; exit 2; fi\nexit 0\n",
+            counter.display(), counter.display(), counter.display()
+        ),
+    )
+    .unwrap();
+    let cmd = format!("/bin/sh {}", gate.display());
+    let _keep = gate;
+    let reg = registry_with_gates(&[cmd]);
+    let mut p = MockProvider::scripted(vec![
+        ProviderOutput::Final {
+            text: "done (broken)".into(),
+        },
+        ProviderOutput::Final {
+            text: "done (fixed)".into(),
+        },
+    ]);
+    let out = run_turn(&mut s, &mut p, &reg, "hi").unwrap();
+    match out {
+        TurnOutcome::Final { text, .. } => assert_eq!(text, "done (fixed)"),
+        other => panic!("expected Final after continuation, got {other:?}"),
+    }
+    // The denied Final was never committed as an assistant message.
+    let assistant_texts: Vec<String> = s
+        .entries()
+        .iter()
+        .filter(|e| e.kind.as_str() == "message" && e.payload["role"] == json!("assistant"))
+        .filter_map(|e| e.payload["text"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        !assistant_texts.iter().any(|t| t.contains("broken")),
+        "denied Final must not commit: {assistant_texts:?}"
+    );
+    // The deny reason IS in the log as user-role feedback.
+    let has_reason = s.entries().iter().any(|e| {
+        e.kind.as_str() == "message"
+            && e.payload["role"] == json!("user")
+            && e.payload["text"]
+                .as_str()
+                .map(|t| t.contains("tests failing"))
+                .unwrap_or(false)
+    });
+    assert!(has_reason, "deny reason must be durable");
+}
+
+#[test]
+fn stop_gate_pass_is_behavior_identical() {
+    let dir = tmpdir("gate-pass");
+    let mut s = JsonlStorage::create(&dir, "gp", None).unwrap();
+    let (cmd, _keep) = gate_cmd(&GateScript {
+        code: 0,
+        reason: "",
+    });
+    let reg = registry_with_gates(&[cmd]);
+    let mut p = MockProvider::scripted(vec![ProviderOutput::Final {
+        text: "clean".into(),
+    }]);
+    let out = run_turn(&mut s, &mut p, &reg, "hi").unwrap();
+    match out {
+        TurnOutcome::Final { text, wrote } => {
+            assert_eq!(text, "clean");
+            assert!(!wrote);
+        }
+        other => panic!("expected Final, got {other:?}"),
+    }
+    // No gate feedback entries leaked into the log.
+    let gate_entries = s
+        .entries()
+        .iter()
+        .filter(|e| {
+            e.payload["text"]
+                .as_str()
+                .map(|t| t.starts_with("stop gate:"))
+                .unwrap_or(false)
+        })
+        .count();
+    assert_eq!(gate_entries, 0);
+}
+
+#[test]
+fn stop_gate_cap_trips_in_isolation() {
+    // A gate that ALWAYS denies must end the turn at the cap
+    // (StopGateBlocked) — not livelock. Only the gate trips here: the
+    // provider yields endless Finals (loop guard needs identical TOOL
+    // calls, budget needs MAX_STEPS steps — neither fires first at cap 3).
+    let dir = tmpdir("gate-cap");
+    let mut s = JsonlStorage::create(&dir, "gc", None).unwrap();
+    let (cmd, _keep) = gate_cmd(&GateScript {
+        code: 2,
+        reason: "never passes",
+    });
+    let reg = registry_with_gates(&[cmd]);
+    let mut p = MockProvider::always(ProviderOutput::Final {
+        text: "attempt".into(),
+    });
+    let out = run_turn(&mut s, &mut p, &reg, "hi").unwrap();
+    match out {
+        TurnOutcome::StopGateBlocked { reason } => {
+            assert!(reason.contains("never passes"));
+        }
+        other => panic!("expected StopGateBlocked, got {other:?}"),
+    }
+    // Post-#84: terminal settle is prompt-resumable.
+    assert!(matches!(s.state().pc, tole_core::state::Pc::Final));
+    // Durable error record exists.
+    assert!(s
+        .entries()
+        .iter()
+        .any(|e| e.kind.as_str() == "error" && e.payload["error"] == json!("stop gate blocked")));
+}
+
+#[test]
+fn stop_gate_nonzero_exit_denies_with_stdout_reason() {
+    // Gate semantics (issue #145, live-E2E correction): ANY non-zero
+    // exit is a DENY — a verification gate's exit 1 / 101 is its
+    // verdict ("tests failed", "cargo check failed"), not a crash.
+    // The stdout becomes the reason the model sees.
+    let dir = tmpdir("gate-nonzero");
+    let mut s = JsonlStorage::create(&dir, "gnz", None).unwrap();
+    // stateful gate: first run exits 101 (verdict), later runs pass
+    let counter = std::env::temp_dir().join(format!("tole-gate-nz-{}", std::process::id()));
+    let _ = std::fs::remove_file(&counter);
+    let gate = std::env::temp_dir().join(format!("tole-gate-nzsh-{}", std::process::id()));
+    std::fs::write(
+        &gate,
+        format!(
+            "#!/bin/sh\necho 'compile error'\nN=$(cat {}) 2>/dev/null || echo 0 > {}; N=$((N+1)); echo $N > {};\nif [ $N -eq 1 ]; then exit 101; fi\nexit 0\n",
+            counter.display(),
+            counter.display(),
+            counter.display()
+        ),
+    )
+    .unwrap();
+    let reg = registry_with_gates(&[format!("/bin/sh {}", gate.display())]);
+    let mut p = MockProvider::scripted(vec![
+        ProviderOutput::Final {
+            text: "done".into(),
+        },
+        ProviderOutput::Final {
+            text: "done for real".into(),
+        },
+    ]);
+    let out = run_turn(&mut s, &mut p, &reg, "hi").unwrap();
+    match out {
+        TurnOutcome::Final { text, .. } => assert_eq!(text, "done for real"),
+        other => panic!("expected Final after gate denial, got {other:?}"),
+    }
+    let has_reason = s.entries().iter().any(|e| {
+        e.payload["text"]
+            .as_str()
+            .map(|t| t.contains("compile error"))
+            .unwrap_or(false)
+    });
+    assert!(has_reason, "the 101 verdict reason must be durable");
+}
+
+#[test]
+fn stop_gate_payload_is_per_turn_not_history() {
+    // cora CI: turn 1 executes a Write; turn 2 (fresh run_turn) produces
+    // a Final. The gate payload must list turn 2's tools only — a
+    // history-keyed gate would re-fire on every later Final.
+    let dir = tmpdir("gate-perturn");
+    let mut s = JsonlStorage::create(&dir, "gpt", None).unwrap();
+    // Gate script: dump the payload's tools array, then pass.
+    let dump = std::env::temp_dir().join(format!("tole-gate-dump-{}", std::process::id()));
+    let _ = std::fs::remove_file(&dump);
+    let gate = std::env::temp_dir().join(format!("tole-gate-dumpsh-{}", std::process::id()));
+    std::fs::write(
+        &gate,
+        format!(
+            "#!/bin/sh\ncat > /dev/null\npython3 -c \"import sys,json;d=json.load(open('{}'.replace(chr(39),chr(39))));print(json.dumps(d))\" /dev/stdin >> {} 2>/dev/null || true\nexit 0\n",
+            "",
+            dump.display()
+        ),
+    )
+    .unwrap();
+    // Simpler: use a tiny python that appends stdin to the dump file.
+    std::fs::write(
+        &gate,
+        format!("#!/bin/sh\ntee -a {} >/dev/null\nexit 0\n", dump.display()),
+    )
+    .unwrap();
+    let _reg = registry_with_gates(&[format!("/bin/sh {}", gate.display())]);
+
+    // Turn 1: a Write tool executes.
+    // registry with gates + tools, shared across both turns
+    let mut reg_all = registry_with_gates_write(&[format!("/bin/sh {}", gate.display())]);
+    reg_all.register(Box::new(WriteTool)).unwrap();
+    reg_all.register(Box::new(EchoTool)).unwrap();
+
+    let mut p1 = MockProvider::scripted(vec![
+        ProviderOutput::ToolCall {
+            tool: "write_file".into(),
+            input: json!({"path": "a.txt"}),
+        },
+        ProviderOutput::Final {
+            text: "turn one done".into(),
+        },
+    ]);
+    run_turn(&mut s, &mut p1, &reg_all, "turn one").unwrap();
+
+    // Turn 2: no tools, just a Final.
+    let mut p2 = MockProvider::scripted(vec![ProviderOutput::Final {
+        text: "turn two done".into(),
+    }]);
+    run_turn(&mut s, &mut p2, &reg_all, "turn two").unwrap();
+
+    // Inspect the LAST payload dumped: it must contain turn 2's tools
+    // (none) and NOT write_file from turn 1. Payloads are concatenated
+    // on one line by `tee -a`, so stream-decode all JSON values.
+    let content = std::fs::read_to_string(&dump).unwrap();
+    let de = serde_json::Deserializer::from_str(&content).into_iter::<serde_json::Value>();
+    let v = de
+        .last()
+        .expect("gate received at least one JSON payload")
+        .expect("valid payload json");
+    let tools = v["tools"].as_array().cloned().unwrap_or_default();
+    assert!(
+        !tools.iter().any(|t| t["tool"] == "write_file"),
+        "turn 2 payload must not contain turn 1's tools: {tools:?}"
+    );
+}
+
+#[test]
+fn stop_gate_payload_keeps_tools_across_own_denial() {
+    // cora CI round 2: the deny feedback entry is user-role; on the
+    // second Final it must NOT become the turn window start, or the
+    // turn's earlier tool calls vanish from the payload and a
+    // presence-keyed gate ("deny if write_file ran") is defeated by
+    // just re-finalizing.
+    let dir = tmpdir("gate-feedback");
+    let mut s = JsonlStorage::create(&dir, "gfb", None).unwrap();
+    let dump = std::env::temp_dir().join(format!("tole-gate-fb-{}", std::process::id()));
+    let _ = std::fs::remove_file(&dump);
+    let gate = std::env::temp_dir().join(format!("tole-gate-fbsh-{}", std::process::id()));
+    std::fs::write(
+        &gate,
+        format!("#!/bin/sh\ntee -a {} >/dev/null\nexit 2\n", dump.display()),
+    )
+    .unwrap();
+    let mut reg = registry_with_gates_write(&[format!("/bin/sh {}", gate.display())]);
+    reg.register(Box::new(WriteTool)).unwrap();
+    reg.register(Box::new(EchoTool)).unwrap();
+
+    // Write tool runs once, then the provider keeps finalizing: the gate
+    // always denies → denials 1..3 fire, the third trips the cap. The
+    // LAST payload must still contain write_file (the feedback entry did
+    // not shrink the window).
+    let mut p = MockProvider::scripted(vec![
+        ProviderOutput::ToolCall {
+            tool: "write_file".into(),
+            input: json!({"path": "a.txt"}),
+        },
+        ProviderOutput::Final {
+            text: "attempt 2".into(),
+        },
+        ProviderOutput::Final {
+            text: "attempt 3".into(),
+        },
+        ProviderOutput::Final {
+            text: "attempt 4".into(),
+        },
+        ProviderOutput::Final {
+            text: "attempt 5".into(),
+        },
+    ]);
+    let out = run_turn(&mut s, &mut p, &reg, "hi").unwrap();
+    match out {
+        TurnOutcome::StopGateBlocked { .. } => {}
+        other => panic!("expected StopGateBlocked, got {other:?}"),
+    }
+
+    // The LAST dumped payload (from the second Final, after the feedback
+    // entry) must still contain write_file — the window did not jump.
+    let content = std::fs::read_to_string(&dump).unwrap();
+    let de = serde_json::Deserializer::from_str(&content).into_iter::<serde_json::Value>();
+    let v = de.last().expect("payloads").expect("valid json");
+    let tools = v["tools"].as_array().cloned().unwrap_or_default();
+    assert!(
+        tools.iter().any(|t| t["tool"] == "write_file"),
+        "second-Final payload must keep the turn's tools: {tools:?}"
+    );
+}

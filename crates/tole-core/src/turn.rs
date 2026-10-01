@@ -68,6 +68,9 @@ pub enum TurnOutcome {
     ApprovalRequired { name: String },
     /// Provider failed after all retries; the turn aborts.
     ProviderFailed { message: String },
+    /// A turn-end stop gate (issue #145) denied the final message more
+    /// times than the per-turn cap allows; the gate reason is durable.
+    StopGateBlocked { reason: String },
     /// Storage error: abort the turn, session stays consistent.
     Storage(StorageError),
 }
@@ -321,6 +324,10 @@ fn canonical_json(v: &Value) -> String {
 
 /// The planning loop shared by [`run_turn`] and [`resume_turn`]:
 /// provider step → (tool sandwich)* → Final, under the step budget.
+/// Per-turn cap on stop-gate denials (issue #145): after this many
+/// gate-forced continuations, the turn settles as `StopGateBlocked`.
+pub const STOP_GATE_DENIAL_CAP: u32 = 3;
+
 fn drive(
     s: &mut dyn Storage,
     p: &mut dyn Provider,
@@ -331,6 +338,11 @@ fn drive(
     // never progress.
     let mut last_fp: Option<u64> = None;
     let mut streak: usize = 0;
+    // Issue #145: turn-end stop-gate denials this turn (bounded — a
+    // gate that always denies must not livelock the loop; the E10
+    // guard-interaction rule wants the cap testable in isolation).
+    #[cfg(feature = "shell-tools")]
+    let mut stop_gate_denials: u32 = 0;
     // Issue #143: has this SESSION executed a Write/Destructive tool?
     // Surfaced on Final so the host memory loop can type the session.
     // The flag lives in a durable, session-scoped fact register: set
@@ -403,6 +415,79 @@ fn drive(
         }
         match next {
             ProviderOutput::Final { text } => {
+                // Issue #145: turn-end stop gates fire BEFORE the final
+                // message commits. Deny (exit 2) = gate-forces-continuation:
+                // the Final is NOT committed; the reason lands as a user-
+                // role entry the model sees next step, and the loop re-runs.
+                // Bounded by STOP_GATE_DENIAL_CAP denials per turn — cap
+                // trip settles durably as StopGateBlocked. Post-#84 the
+                // abort settles pc=Final (terminal, prompt-resumable).
+                #[cfg(feature = "shell-tools")]
+                if registry.has_turnend_hooks() {
+                    // Per-TURN summary (cora CI): only tool calls after
+                    // the last user message count — earlier turns' tools
+                    // would re-trigger history-keyed gates on every
+                    // later Final of a resumed/chat session.
+                    let turn_start = s
+                        .entries()
+                        .iter()
+                        .rposition(|e| {
+                            // cora CI round 2: this loop's OWN deny
+                            // feedback is also a user-role entry — if it
+                            // counted, turn_start would jump past the
+                            // turn's tool calls on the second Final and
+                            // a presence-keyed gate would be defeated.
+                            // Hence the explicit marker is skipped.
+                            e.kind.as_str() == "message"
+                                && e.payload["role"] == json!("user")
+                                && e.payload["stop_gate_feedback"] != json!(true)
+                        })
+                        .unwrap_or(0);
+                    let tools_seen: Vec<(String, Risk)> = s
+                        .entries()
+                        .iter()
+                        .skip(turn_start)
+                        // Intents are stored as generic entries whose
+                        // payload carries `tool` (the kind is "entry",
+                        // not "tool_call" — found by the round-2 test's
+                        // payload dump, not by reading code).
+                        .filter(|e| e.payload.get("tool").is_some())
+                        .filter_map(|e| {
+                            let tool = e.payload.get("tool")?.as_str()?.to_string();
+                            let risk = registry
+                                .get(&tool)
+                                .map(|t| t.risk())
+                                .unwrap_or(Risk::ReadOnly);
+                            Some((tool, risk))
+                        })
+                        .collect();
+                    if let Some(reason) = registry.turnend_denial(&text, &tools_seen) {
+                        stop_gate_denials += 1;
+                        if stop_gate_denials > STOP_GATE_DENIAL_CAP {
+                            append_turn_error(
+                                s,
+                                "stop gate blocked",
+                                &format!(
+                                    "denied {stop_gate_denials} times this turn (cap {STOP_GATE_DENIAL_CAP}); last reason: {reason}"
+                                ),
+                            )?;
+                            let seq = s.state().seq;
+                            s.commit(
+                                Commit::new().transition(StateTransition::from(seq, Pc::Final)),
+                            )?;
+                            return Ok(TurnOutcome::StopGateBlocked { reason });
+                        }
+                        s.commit(Commit::new().entry(NewEntry::root(
+                            EntryType::new(EntryType::MESSAGE),
+                            json!({
+                                "role": "user",
+                                "text": format!("stop gate: {reason}"),
+                                "stop_gate_feedback": true
+                            }),
+                        )))?;
+                        continue;
+                    }
+                }
                 let seq = s.state().seq;
                 s.commit(
                     Commit::new()

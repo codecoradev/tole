@@ -290,6 +290,10 @@ pub fn run_session_turn(
             final_text = Some(text.clone());
             "end_turn"
         }
+        tole_core::turn::TurnOutcome::StopGateBlocked { reason } => {
+            eprintln!("tole: stop gate blocked the turn: {reason}");
+            "refusal"
+        }
         tole_core::turn::TurnOutcome::ApprovalRequired { name } => {
             eprintln!("tole: approval denied for '{name}'");
             "refusal"
