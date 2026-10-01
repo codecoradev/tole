@@ -116,7 +116,7 @@ fn write_request_prompted_and_allowed_executes() {
         },
     ]);
     match run_turn(&mut s, &mut p, &reg, "please write out.txt").unwrap() {
-        TurnOutcome::Final { text } => assert_eq!(text, "written!"),
+        TurnOutcome::Final { text, .. } => assert_eq!(text, "written!"),
         other => panic!("expected Final, got {other:?}"),
     }
     assert_eq!(

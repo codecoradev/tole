@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Memory-loop decision typing (#143): a session that executed any
+  Write/Destructive tool is stored to uteke with `--type decision` and a
+  `wrote` tag (plain context sessions unchanged). The flag is durable
+  and session-scoped — set on fresh execution AND crash-replay of a
+  Write, never reset by turn machinery — and derived from tool risk,
+  not model claims. Summary content contract is unchanged: first
+  prompt + final answer only.
+
 ## [0.4.0] — 2026-10-01
 
 ### Added

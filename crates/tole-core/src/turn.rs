@@ -15,6 +15,7 @@ use crate::machine::{
     begin, finish, resume, settle_err, settle_ok, EffectHandle, ReplaySafety, Resume,
 };
 use crate::provider::{Provider, ProviderError, ProviderOutput};
+use crate::register::RegisterWrite;
 use crate::state::{Pc, StateTransition};
 use crate::storage::{Commit, Storage, StorageError, UsageRecord};
 use crate::tool::{Risk, ToolRegistry};
@@ -54,7 +55,7 @@ pub const PROVIDER_TIMEOUT_RETRIES: usize = 1;
 #[derive(Debug)]
 pub enum TurnOutcome {
     /// The model returned a final answer.
-    Final { text: String },
+    Final { text: String, wrote: bool },
     /// Step budget exhausted — persistent loop-guard trip.
     BudgetExhausted,
     /// The model repeated the same tool call (same tool + same input)
@@ -93,6 +94,10 @@ pub fn run_turn(
         )));
     }
     // (Idle|Final) → Planning, persisting the user message in the same commit.
+    // `fact.wrote_this_turn` is deliberately NOT reset here: it is
+    // session-scoped (#143) — a session that ever executed a Write is a
+    // decision session, including after an abort (post-#84 pc=Final) and
+    // across prompt-resumes into fresh run_turn calls.
     let seq = s.state().seq;
     s.commit(
         Commit::new()
@@ -241,18 +246,34 @@ pub fn resume_turn(
                 }
                 let handle = EffectHandle { intent_id };
                 let out = match registry.get(&tool) {
-                    Some(t) => t.execute(input),
+                    Some(t) => {
+                        let risk = t.risk();
+                        (t.execute(input), risk)
+                    }
                     // The tool vanished between runs (host wiring changed).
                     // The intent is durable — settle it as failed rather than
                     // aborting: the loop replans on the tool_result error.
-                    None => Err(format!("unknown tool on resume: {tool}")),
+                    None => (
+                        Err(format!("unknown tool on resume: {tool}")),
+                        Risk::ReadOnly,
+                    ),
                 };
                 match out {
-                    Ok(o) => {
+                    (Ok(o), risk) => {
+                        // #143 (cora): replayed Writes are writes too — the
+                        // session-scoped flag must see them, or a crash
+                        // before first execution misclassifies the session.
+                        if risk != Risk::ReadOnly {
+                            s.commit(Commit::new().register(RegisterWrite::set(
+                                "fact",
+                                "wrote_this_turn",
+                                json!(true),
+                            )))?;
+                        }
                         settle_ok(s, &handle, o)?;
                         finish(s)?;
                     }
-                    Err(e) => {
+                    (Err(e), _) => {
                         settle_err(s, &handle, &e)?;
                     }
                 }
@@ -310,6 +331,17 @@ fn drive(
     // never progress.
     let mut last_fp: Option<u64> = None;
     let mut streak: usize = 0;
+    // Issue #143: has this SESSION executed a Write/Destructive tool?
+    // Surfaced on Final so the host memory loop can type the session.
+    // The flag lives in a durable, session-scoped fact register: set
+    // wherever such a tool settles (fresh execution AND crash-replay),
+    // never reset by turn machinery — a session that ever wrote is a
+    // decision session (cora findings on the first cut: the in-RAM flag
+    // died at resume boundaries and replayed writes were invisible).
+    let mut wrote = s
+        .get_register("fact", "wrote_this_turn")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     // Issue #58: one automatic retry for a timeout-classified provider
     // failure. Budgeted per turn, not per step — a flapping gateway must
     // not get a retry for every step of the same turn.
@@ -380,7 +412,7 @@ fn drive(
                         ))
                         .transition(StateTransition::from(seq, Pc::Final)),
                 )?;
-                return Ok(TurnOutcome::Final { text });
+                return Ok(TurnOutcome::Final { text, wrote });
             }
             ProviderOutput::ToolCall { tool, input } => {
                 // E10: fingerprint before anything else — the guard must
@@ -484,6 +516,14 @@ fn drive(
                 #[cfg(feature = "shell-tools")]
                 if let Some(i) = &hook_input {
                     registry.post_hook_notify(&tool, i, true);
+                }
+                if t.risk() != Risk::ReadOnly {
+                    wrote = true;
+                    s.commit(Commit::new().register(RegisterWrite::set(
+                        "fact",
+                        "wrote_this_turn",
+                        json!(true),
+                    )))?;
                 }
                 settle_ok(s, &handle, out)?;
                 finish(s)?;
