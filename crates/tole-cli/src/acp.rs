@@ -104,7 +104,10 @@ impl Conn {
     /// Reader-side routing: a response line completes a pending agent
     /// request. Client ERROR replies route too — an errored permission
     /// must fail closed immediately, not hang for the full timeout
-    /// (CodeCora scan 2026-09-28).
+    /// (CodeCora scan 2026-09-28). cora scan 2026-10-01 (#155): a reply
+    /// with the matching id but NEITHER field (malformed client) gets
+    /// the same immediate fail-closed treatment — otherwise the waiting
+    /// thread hangs for the full timeout on garbage input.
     fn route_reply(&self, id: u64, msg: &Value) {
         if let Some(result) = msg.get("result").cloned() {
             self.route(id, result);
@@ -112,6 +115,13 @@ impl Conn {
             self.route(
                 id,
                 json!({"outcome": {"outcome": "cancelled"}, "error": err}),
+            );
+        } else {
+            // Malformed reply: fail closed now (cancelled outcome), the
+            // requester surfaces the error instead of blocking.
+            self.route(
+                id,
+                json!({"outcome": {"outcome": "cancelled"}, "error": "malformed reply"}),
             );
         }
     }
@@ -375,6 +385,14 @@ pub fn run_acp(
                         continue;
                     }
                 };
+                // cora scan 2026-10-01 (#155 #4): an empty array or one
+                // carrying only non-text blocks (e.g. images) joins to an
+                // empty string — launching a full agent turn on empty
+                // input must be rejected exactly like a missing prompt.
+                if prompt_text.trim().is_empty() {
+                    reply_error(&conn, id, "session/prompt: missing prompt");
+                    continue;
+                }
                 // The turn runs on its own thread; this reader loop stays
                 // live for permission routing while it runs.
                 let conn = conn.clone();
