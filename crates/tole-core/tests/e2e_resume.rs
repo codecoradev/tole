@@ -100,7 +100,7 @@ fn golden(s: &JsonlStorage) -> Vec<String> {
 
 fn final_text(out: Result<TurnOutcome, tole_core::storage::StorageError>) -> String {
     match out.unwrap() {
-        TurnOutcome::Final { text } => text,
+        TurnOutcome::Final { text, .. } => text,
         other => panic!("expected Final, got {other:?}"),
     }
 }
@@ -415,9 +415,21 @@ fn guarded_intent_replays_when_approver_allows() {
     let mut s2 = s2;
     let out = resume_turn(&mut s2, &mut p, &reg);
     match out.unwrap() {
-        TurnOutcome::Final { text } => assert_eq!(text, "after-allow"),
+        TurnOutcome::Final { text, wrote } => {
+            assert_eq!(text, "after-allow");
+            // #143 (cora round 2): a replayed WRITE still writes — the
+            // Final must mark the session as a decision session.
+            assert!(
+                wrote,
+                "allowed replay of a Write tool must report wrote=true"
+            );
+        }
         other => panic!("expected Final after allowed replay, got {other:?}"),
     }
     assert!(s2.get_register("pending", "op").is_none());
+    assert_eq!(
+        s2.get_register("fact", "wrote_this_turn"),
+        Some(&json!(true))
+    );
     assert_eq!(fired.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
