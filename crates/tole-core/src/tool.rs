@@ -164,10 +164,28 @@ impl ToolRegistry {
                 .collect::<Vec<_>>(),
         });
         for h in &hooks.turnend {
-            match h.run("turnend", "turn", &payload, None) {
-                Ok(Some(reason)) => return Some(reason),
-                Ok(None) => {}
-                Err(e) => eprintln!("tole: turnend-hook failure (non-blocking): {e}"),
+            // GATE semantics (issue #145): exit 0 = pass; ANY non-zero
+            // exit denies, with stdout (or a default) as the reason the
+            // model will see. A verification gate's nonzero exit is its
+            // verdict ("tests failed" exits 1, cargo exits 101) — the
+            // #110 exit-2-only rule would classify real verdicts as
+            // non-blocking failures, which the first live E2E disproved.
+            match h.run_raw(&payload) {
+                Ok((0, _)) => {}
+                Ok((_, stdout)) => {
+                    let reason = if stdout.is_empty() {
+                        "denied by turnend gate (no reason given)".to_string()
+                    } else {
+                        format!("denied by turnend gate: {stdout}")
+                    };
+                    return Some(reason);
+                }
+                Err(e) => {
+                    // True INFRASTRUCTURE failures (spawn error, timeout)
+                    // stay non-blocking: a broken gate must not hold the
+                    // agent hostage (same contract as #110 hook failures).
+                    eprintln!("tole: turnend-hook failure (non-blocking): {e}");
+                }
             }
         }
         None

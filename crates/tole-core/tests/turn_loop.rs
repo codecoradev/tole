@@ -1214,18 +1214,46 @@ fn stop_gate_cap_trips_in_isolation() {
 }
 
 #[test]
-fn stop_gate_failure_is_non_blocking() {
-    // Hook FAILURE (exit 1 = not 2) must not block: the turn completes.
-    let dir = tmpdir("gate-fail");
-    let mut s = JsonlStorage::create(&dir, "gf", None).unwrap();
-    let (cmd, _keep) = gate_cmd(&GateScript {
-        code: 1,
-        reason: "hook exploded",
-    });
-    let reg = registry_with_gates(&[cmd]);
-    let mut p = MockProvider::scripted(vec![ProviderOutput::Final {
-        text: "fine".into(),
-    }]);
+fn stop_gate_nonzero_exit_denies_with_stdout_reason() {
+    // Gate semantics (issue #145, live-E2E correction): ANY non-zero
+    // exit is a DENY — a verification gate's exit 1 / 101 is its
+    // verdict ("tests failed", "cargo check failed"), not a crash.
+    // The stdout becomes the reason the model sees.
+    let dir = tmpdir("gate-nonzero");
+    let mut s = JsonlStorage::create(&dir, "gnz", None).unwrap();
+    // stateful gate: first run exits 101 (verdict), later runs pass
+    let counter = std::env::temp_dir().join(format!("tole-gate-nz-{}", std::process::id()));
+    let _ = std::fs::remove_file(&counter);
+    let gate = std::env::temp_dir().join(format!("tole-gate-nzsh-{}", std::process::id()));
+    std::fs::write(
+        &gate,
+        format!(
+            "#!/bin/sh\necho 'compile error'\nN=$(cat {}) 2>/dev/null || echo 0 > {}; N=$((N+1)); echo $N > {};\nif [ $N -eq 1 ]; then exit 101; fi\nexit 0\n",
+            counter.display(),
+            counter.display(),
+            counter.display()
+        ),
+    )
+    .unwrap();
+    let reg = registry_with_gates(&[format!("/bin/sh {}", gate.display())]);
+    let mut p = MockProvider::scripted(vec![
+        ProviderOutput::Final {
+            text: "done".into(),
+        },
+        ProviderOutput::Final {
+            text: "done for real".into(),
+        },
+    ]);
     let out = run_turn(&mut s, &mut p, &reg, "hi").unwrap();
-    assert!(matches!(out, TurnOutcome::Final { .. }));
+    match out {
+        TurnOutcome::Final { text, .. } => assert_eq!(text, "done for real"),
+        other => panic!("expected Final after gate denial, got {other:?}"),
+    }
+    let has_reason = s.entries().iter().any(|e| {
+        e.payload["text"]
+            .as_str()
+            .map(|t| t.contains("compile error"))
+            .unwrap_or(false)
+    });
+    assert!(has_reason, "the 101 verdict reason must be durable");
 }

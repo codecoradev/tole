@@ -46,6 +46,24 @@ impl ProcessHook {
         }
     }
 
+    /// Raw variant for turn-end gates (issue #145): returns the actual
+    /// exit code + stdout so the caller can apply the GATE semantics
+    /// (exit 0 = pass; ANY non-zero exit = deny with stdout as reason) —
+    /// unlike tool hooks, where only exit 2 denies and other failures
+    /// are non-blocking. A verification gate's nonzero exit IS its
+    /// verdict ("tests failing" exits 1, cargo exits 101), not a crash.
+    pub fn run_raw(&self, payload: &Value) -> Result<(i32, String), String> {
+        let mut cmd = Command::new(&self.program);
+        cmd.args(&self.args);
+        crate::subprocess::scrub_env_for_child(&mut cmd);
+        let out = run_with_timeout_stdin(&mut cmd, self.timeout, payload.to_string().as_bytes())?;
+        let mut stdout = out.stdout;
+        stdout.truncate(32 * 1024);
+        let stdout = String::from_utf8_lossy(&stdout).trim().to_string();
+        let code = out.status.code().unwrap_or(-1);
+        Ok((code, stdout))
+    }
+
     /// Run the hook. `Ok(None)` = allow/no-op; `Ok(Some(reason))` =
     /// deny (exit 2, pre-hooks only); `Err` = hook failure
     /// (non-blocking by contract — callers log and continue).
