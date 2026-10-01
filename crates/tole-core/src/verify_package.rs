@@ -179,6 +179,7 @@ fn check_registry(
     ecosystem: &str,
     name: &str,
     bases: Option<(&str, &str)>,
+    want_candidates: bool,
 ) -> Result<RegistryCheck, String> {
     let (exists_url, search_url) = endpoints(ecosystem, name, bases)?;
     let mut out = RegistryCheck {
@@ -213,9 +214,12 @@ fn check_registry(
         Err(_) => out.rate_limited = true,     // network/parse error: honest unknown
     }
 
-    // Candidates when we need nearest-real-name evidence. For npm also
-    // probe without scope when the scoped lookup failed.
-    if out.exists != Some(true) {
+    // Candidates (issue #144, cora CI): fetched when the caller wants
+    // them — exact=false ALWAYS (even when the name exists), and on a
+    // not-found regardless of exact (nearest-real-name evidence is the
+    // whole point there). exact=true + exists skips the search entirely.
+    let need_candidates = want_candidates || out.exists == Some(false);
+    if need_candidates {
         if let Ok((_, Some(body))) = fetch(agent, &search_url) {
             out.candidates = candidates_from(ecosystem, &body);
         }
@@ -271,7 +275,7 @@ pub fn verify(
         .timeout_global(Some(HTTP_TIMEOUT))
         .build()
         .new_agent();
-    let check = check_registry(&agent, ecosystem, name, base_override)?;
+    let check = check_registry(&agent, ecosystem, name, base_override, !exact)?;
 
     let mut out = json!({
         "ecosystem": ecosystem,
@@ -290,7 +294,7 @@ pub fn verify(
         out["newest_version"] = json!(v);
     }
 
-    if check.exists == Some(false) || (!exact && check.exists == Some(true)) {
+    if check.exists == Some(false) || !exact {
         let near: Vec<&String> = check
             .candidates
             .iter()
@@ -558,6 +562,34 @@ mod mock_server_tests {
         let out = verify("npm", "@leftscope/pad", true, Some((&bases.0, &bases.1))).unwrap();
         assert_eq!(out["exists"], json!(false));
         assert!(out["candidates"].as_array().is_some());
+    }
+
+    #[test]
+    fn mock_exact_false_on_existing_name_returns_candidates() {
+        // cora CI: exact=false must NOT be a silent no-op — candidates are
+        // fetched even when the name exists (adjacent-name discovery).
+        let bases = start_mock(|path| {
+            if path == "/c/crates/serde" {
+                (
+                    200,
+                    r#"{"crate":{"name":"serde","max_stable_version":"1.0.229"}}"#,
+                )
+            } else if path.starts_with("/c/crates?q=serde") {
+                (
+                    200,
+                    r#"{"crates":[{"name":"serde_json"},{"name":"serde_yaml"}]}"#,
+                )
+            } else {
+                (404, "{}")
+            }
+        });
+        let out = verify("crates", "serde", false, Some((&bases.0, &bases.1))).unwrap();
+        assert_eq!(out["exists"], json!(true));
+        let cands = out["candidates"].as_array().expect("candidates present");
+        assert!(cands.iter().any(|c| c == "serde_json"));
+        // exact=true on the same name never searches: no candidates key.
+        let out2 = verify("crates", "serde", true, Some((&bases.0, &bases.1))).unwrap();
+        assert!(out2.get("candidates").is_none());
     }
 
     #[test]
