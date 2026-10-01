@@ -1,5 +1,4 @@
 /target
-Cargo.lock
 
 # cora review local artifacts
 .cora/
@@ -8,3 +7,10 @@ Cargo.lock
 # eval run debris (tier2 missions create these in workspaces)
 marker.txt
 mission-data.txt
+
+# python bytecode (evals tier2)
+__pycache__/
+*.pyc
+
+# Tier-2 runner transient output (baseline copies live in evals/baselines/)
+/evals/tier2/results.json

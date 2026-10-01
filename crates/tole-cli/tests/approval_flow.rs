@@ -2,9 +2,11 @@
 //! write request → (scripted) y/N prompt → denied recorded / allowed
 //! executed, over the real turn loop and JSONL storage.
 
-use serde_json::json;
+use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
+use tole_cli::approver::{InteractiveApprover, PromptFn};
+use tole_cli::tools::WriteFileTool;
 use tole_core::approval::{Approver, ToolRequest, Verdict};
 use tole_core::mock::MockProvider;
 use tole_core::provider::ProviderOutput;
@@ -12,125 +14,36 @@ use tole_core::storage::{JsonlStorage, Storage};
 use tole_core::tool::{Risk, Tool, ToolRegistry};
 use tole_core::turn::{run_turn, TurnOutcome};
 
-use approver::InteractiveApprover;
+/// Prompt that always answers with the canned verdict (drives the REAL
+/// `InteractiveApprover` — since the tole_cli lib target, integration
+/// tests import the production approver + jailed tools instead of
+/// re-implementations that drift; CodeCora scan 2026-09-18).
+pub struct CannedPrompt(pub Verdict);
 
-// The bin's modules are not importable from an integration test, so the
-// prompt + tool under test are re-declared here in the exact same shape
-// as `src/approver.rs` / `src/tools.rs` (they are host-side, small, and
-// unit-tested there; this file exercises the *loop* semantics).
-mod approver {
-    use tole_core::approval::{glob_match, Approver, ToolRequest, Verdict};
-    use tole_core::tool::Risk;
-
-    pub trait PromptFn: Send + Sync {
-        fn prompt(&self, req: &ToolRequest<'_>) -> Verdict;
-    }
-
-    /// Prompt that always answers with the canned verdict.
-    pub struct CannedPrompt(pub Verdict);
-
-    impl PromptFn for CannedPrompt {
-        fn prompt(&self, _req: &ToolRequest<'_>) -> Verdict {
-            self.0
-        }
-    }
-
-    pub struct InteractiveApprover<P: PromptFn> {
-        patterns: Vec<String>,
-        auto_write: bool,
-        prompter: P,
-    }
-
-    impl InteractiveApprover<CannedPrompt> {
-        pub fn answering(v: Verdict) -> Self {
-            Self::new(CannedPrompt(v))
-        }
-    }
-
-    impl<P: PromptFn> InteractiveApprover<P> {
-        pub fn new(prompter: P) -> Self {
-            Self {
-                patterns: Vec::new(),
-                auto_write: false,
-                prompter,
-            }
-        }
-
-        pub fn with_allow_patterns(mut self, patterns: Vec<String>) -> Self {
-            self.patterns = patterns;
-            self
-        }
-
-        pub fn with_auto_write(mut self, yes: bool) -> Self {
-            self.auto_write = yes;
-            self
-        }
-    }
-
-    impl<P: PromptFn> Approver for InteractiveApprover<P> {
-        fn decide(&self, req: &ToolRequest<'_>) -> Verdict {
-            if req.risk == Risk::Destructive {
-                return self.prompter.prompt(req);
-            }
-            if self.auto_write || self.patterns.iter().any(|p| glob_match(p, req.tool)) {
-                return Verdict::Allow;
-            }
-            self.prompter.prompt(req)
-        }
-
-        fn interactive(&self) -> bool {
-            true
-        }
+impl PromptFn for CannedPrompt {
+    fn prompt(&self, _req: &ToolRequest<'_>) -> Verdict {
+        self.0
     }
 }
 
-mod tools {
-    use serde_json::{json, Value};
-    use std::path::PathBuf;
-    use tole_core::tool::{Risk, Tool};
+/// Local helper matching the real constructor ergonomics.
+fn answering(v: Verdict) -> InteractiveApprover<CannedPrompt> {
+    InteractiveApprover::new(CannedPrompt(v))
+}
 
-    pub struct WriteFileTool {
-        pub root: PathBuf,
+/// The Destructive probe: test-only by nature (the real Destructive
+/// tools live in the registry wiring, gated behind an interactive
+/// approver).
+pub struct Bomb;
+impl Tool for Bomb {
+    fn name(&self) -> &str {
+        "bomb"
     }
-
-    impl Tool for WriteFileTool {
-        fn name(&self) -> &str {
-            "write_file"
-        }
-        fn risk(&self) -> Risk {
-            Risk::Write
-        }
-        fn describe(&self, input: &Value) -> String {
-            format!(
-                "write file {}",
-                input.get("path").and_then(Value::as_str).unwrap_or("?")
-            )
-        }
-        fn execute(&self, input: Value) -> Result<Value, String> {
-            let path = input
-                .get("path")
-                .and_then(Value::as_str)
-                .ok_or("missing path")?;
-            let content = input
-                .get("content")
-                .and_then(Value::as_str)
-                .ok_or("missing content")?;
-            std::fs::write(self.root.join(path), content).map_err(|e| e.to_string())?;
-            Ok(json!({ "path": path, "bytes": content.len() }))
-        }
+    fn risk(&self) -> Risk {
+        Risk::Destructive
     }
-
-    pub struct Bomb;
-    impl Tool for Bomb {
-        fn name(&self) -> &str {
-            "bomb"
-        }
-        fn risk(&self) -> Risk {
-            Risk::Destructive
-        }
-        fn execute(&self, _input: Value) -> Result<Value, String> {
-            Ok(json!({ "boom": true }))
-        }
+    fn execute(&self, _input: Value) -> Result<Value, String> {
+        Ok(json!({ "boom": true }))
     }
 }
 
@@ -143,12 +56,11 @@ fn tmpdir(name: &str) -> PathBuf {
 
 fn registry_with(dir: &Path, approver: impl Approver + 'static, with_bomb: bool) -> ToolRegistry {
     let mut reg = ToolRegistry::with_approver(approver);
-    reg.register(Box::new(tools::WriteFileTool {
-        root: dir.to_path_buf(),
-    }))
-    .unwrap();
+    // The REAL jailed write tool, not a stand-in.
+    reg.register(Box::new(WriteFileTool::new(dir.to_path_buf())))
+        .unwrap();
     if with_bomb {
-        reg.register(Box::new(tools::Bomb)).unwrap();
+        reg.register(Box::new(Bomb)).unwrap();
     }
     reg
 }
@@ -159,7 +71,7 @@ fn registry_with(dir: &Path, approver: impl Approver + 'static, with_bomb: bool)
 fn write_request_prompted_and_denied_is_recorded() {
     let dir = tmpdir("denied");
     let mut s = JsonlStorage::create(&dir, "denied", None).unwrap();
-    let reg = registry_with(&dir, InteractiveApprover::answering(Verdict::Deny), false);
+    let reg = registry_with(&dir, answering(Verdict::Deny), false);
     let mut p = MockProvider::scripted(vec![
         ProviderOutput::ToolCall {
             tool: "write_file".into(),
@@ -193,7 +105,7 @@ fn write_request_prompted_and_denied_is_recorded() {
 fn write_request_prompted_and_allowed_executes() {
     let dir = tmpdir("allowed");
     let mut s = JsonlStorage::create(&dir, "allowed", None).unwrap();
-    let reg = registry_with(&dir, InteractiveApprover::answering(Verdict::Allow), false);
+    let reg = registry_with(&dir, answering(Verdict::Allow), false);
     let mut p = MockProvider::scripted(vec![
         ProviderOutput::ToolCall {
             tool: "write_file".into(),
@@ -220,7 +132,7 @@ fn allow_pattern_skips_prompt_entirely() {
     let mut s = JsonlStorage::create(&dir, "pattern", None).unwrap();
     let reg = registry_with(
         &dir,
-        InteractiveApprover::answering(Verdict::Deny) // human says N — must not be asked
+        answering(Verdict::Deny) // human says N — must not be asked
             .with_allow_patterns(vec!["write_*".into()]),
         false,
     );
@@ -251,7 +163,7 @@ fn destructive_always_prompts_despite_allow_all() {
     let mut s = JsonlStorage::create(&dir, "bomb", None).unwrap();
     let reg = registry_with(
         &dir,
-        InteractiveApprover::answering(Verdict::Deny)
+        answering(Verdict::Deny)
             .with_allow_patterns(vec!["*".into()])
             .with_auto_write(true),
         true,
@@ -285,19 +197,17 @@ fn destructive_always_prompts_despite_allow_all() {
 fn registry_refuses_destructive_behind_allowlist() {
     use tole_core::approval::AllowlistApprover;
     let mut reg = ToolRegistry::with_approver(AllowlistApprover::default());
-    let err = reg.register(Box::new(tools::Bomb)).unwrap_err();
+    let err = reg.register(Box::new(Bomb)).unwrap_err();
     assert!(err.contains("Destructive"), "got: {err}");
 }
 
 /// The request the prompt renders carries everything a human needs.
 #[test]
 fn tool_request_carries_prompt_fields() {
-    let a = InteractiveApprover::answering(Verdict::Allow);
+    let a = answering(Verdict::Allow);
     let input = json!({ "path": "notes.md", "content": "hi" });
     // Build a request the way the registry does and inspect it.
-    let t = tools::WriteFileTool {
-        root: PathBuf::from("."),
-    };
+    let t = WriteFileTool::new(PathBuf::from("."));
     let req = ToolRequest {
         tool: t.name(),
         risk: t.risk(),

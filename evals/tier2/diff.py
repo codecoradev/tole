@@ -48,11 +48,21 @@ def main() -> int:
             continue
         if not old["success"] and new["success"]:
             notes.append(f"{name}: FAIL -> SUCCESS (improvement)")
+            # An improvement is not subject to the growth check — flagging
+            # higher token usage on a newly-passing mission as a harness
+            # regression contradicted the documented scope (CodeCora scan
+            # 2026-09-18).
+            continue
         for metric in ("prompt_tokens", "completion_tokens", "tool_calls"):
             o, n = old.get(metric, 0), new.get(metric, 0)
-            if o and n > o * 1.25:
-                regressions.append(
-                    f"{name}: {metric} grew {o} -> {n} (>25% harness regression)"
+            if o:
+                if n > o * 1.25:
+                    regressions.append(
+                        f"{name}: {metric} grew {o} -> {n} (>25% harness regression)"
+                    )
+            elif n:
+                notes.append(
+                    f"{name}: {metric} baseline is 0 (now {n}) — growth check skipped"
                 )
     for name in cur:
         if name not in base:

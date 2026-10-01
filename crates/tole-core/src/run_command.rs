@@ -113,7 +113,17 @@ impl Tool for RunCommandTool {
             .and_then(Value::as_str)
             .unwrap_or("<missing command>");
         match Self::split_argv(line) {
-            Ok(argv) => format!("run: {}", argv.join(" ")),
+            // Re-quote tokens with whitespace/quotes/metacharacters so
+            // the approval prompt preserves token boundaries (cora
+            // full-scan #16): `printf a b` and `printf a b` (two args)
+            // must render differently.
+            Ok(argv) => format!(
+                "run: {}",
+                argv.iter()
+                    .map(|a| quote_for_display(a))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ),
             Err(e) => format!("run: <unparsable command: {e}>"),
         }
     }
@@ -168,6 +178,27 @@ impl Tool for RunCommandTool {
     }
 }
 
+/// Re-quote a single argv token for DISPLAY (cora full-scan #16):
+/// tokens containing whitespace, quotes, or shell metacharacters get
+/// single-quoted (with embedded single quotes widened to `'\''`) so an
+/// approval prompt shows the true token boundaries — `printf 'a b'`
+/// (one arg with a space) renders differently from `printf a b` (two
+/// args).
+fn quote_for_display(tok: &str) -> String {
+    let needs_quoting = tok.is_empty()
+        || tok.chars().any(|c| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    '\'' | '"' | '$' | '`' | ';' | '|' | '&' | '<' | '>' | '(' | ')' | '\\'
+                )
+        });
+    if !needs_quoting {
+        return tok.to_string();
+    }
+    format!("'{}'", tok.replace('\'', r"'\''"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,7 +236,22 @@ mod tests {
     /// path-qualified PROGRAMS are refused (wrapper/PATH bypass).
     #[test]
     fn benign_commands_with_destructive_looking_args_pass() {
-        let t = RunCommandTool::new(std::env::temp_dir());
+        // ISOLATED jail (cora full-scan #18): this test EXECUTES
+        // `rm -rf ./build` — running it against the SHARED temp dir
+        // deleted any peer test's files living at <temp>/build. Each
+        // run gets its own scratch jail with a `build` dir inside.
+        let jail = std::env::temp_dir().join(format!(
+            "tole-run-benign-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(jail.join("build")).unwrap();
+        std::fs::write(jail.join("middleware.ts"), "x").unwrap();
+        std::fs::write(jail.join("runbook.md"), "x").unwrap();
+        let t = RunCommandTool::new(jail.clone());
         for line in [
             "cat middleware.ts",
             "grep shutdown runbook.md",
@@ -223,6 +269,7 @@ mod tests {
         assert!(t
             .execute(json!({ "command": "rm -rf ./a/../build" }))
             .is_ok());
+        let _ = std::fs::remove_dir_all(&jail);
         // Path-qualified program: refused (PATH resolution is the way).
         let err = t
             .execute(json!({ "command": "/bin/echo hi" }))
@@ -257,7 +304,25 @@ mod tests {
     fn describe_shows_exact_argv() {
         let t = RunCommandTool::new(PathBuf::from("/tmp"));
         let d = t.describe(&json!({"command": "ls -la 'my dir'"}));
-        assert_eq!(d, "run: ls -la my dir");
+        // Token boundaries preserved: the quoted arg renders re-quoted.
+        assert_eq!(d, "run: ls -la 'my dir'");
+    }
+
+    #[test]
+    fn describe_quotes_ambiguous_tokens() {
+        let t = RunCommandTool::new(PathBuf::from("/tmp"));
+        // One arg WITH a space renders quoted...
+        let one = t.describe(&json!({"command": "printf 'a b'"}));
+        assert_eq!(one, "run: printf 'a b'");
+        // ...differently from two args (the cora full-scan #16 point).
+        let two = t.describe(&json!({"command": "printf a b"}));
+        assert_eq!(two, "run: printf a b");
+        assert_ne!(one, two);
+        // Embedded single quotes widen to '\''; metacharacters quoted.
+        let semi = t.describe(&json!({"command": "echo 'x; y'"}));
+        assert_eq!(semi, r"run: echo 'x; y'");
+        let meta = t.describe(&json!({"command": "echo a;b"}));
+        assert_eq!(meta, r"run: echo 'a;b'");
     }
 
     #[test]

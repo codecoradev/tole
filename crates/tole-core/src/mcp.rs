@@ -22,10 +22,15 @@
 use crate::subprocess::SUBPROCESS_TIMEOUT;
 use crate::tool::{Risk, Tool};
 use serde_json::{json, Value};
-use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
+
+/// Error-class prefix: transport failures evict the connection, while
+/// tool-reported/argument errors keep it (see the module docs). Producer
+/// and matcher share this constant so they cannot drift (CodeCora scan
+/// 2026-09-18: brittle string-prefix matching).
+const TRANSPORT_ERR: &str = "mcp transport";
 
 /// Request into the background tokio reactor.
 enum McpRequest {
@@ -157,7 +162,7 @@ fn runtime() -> mpsc::Sender<McpRequest> {
                                     // server is healthy: tearing it down on
                                     // every failed call would respawn on the
                                     // next call and drop server session state.
-                                    if r.as_ref().is_err_and(|e| e.starts_with("mcp transport")) {
+                                    if r.as_ref().is_err_and(|e| e.starts_with(TRANSPORT_ERR)) {
                                         conns.remove(&server);
                                     }
                                     let _ = resp.send(r);
@@ -175,7 +180,7 @@ fn runtime() -> mpsc::Sender<McpRequest> {
 /// Live connection state lives INSIDE the reactor thread (rmcp sessions
 /// are !Send-safe to keep there), keyed by server name.
 struct McpConnection {
-    service: rmcp::service::RunningService<rmcp::service::RoleClient, rmcp::model::ClientInfo>,
+    service: rmcp::service::RunningService<rmcp::service::RoleClient, rmcp::model::ClientConfig>,
 }
 
 impl McpConnection {
@@ -219,23 +224,22 @@ impl McpConnection {
             .service
             .call_tool(params)
             .await
-            .map_err(|e| format!("mcp transport: tool call failed: {e}"))?;
+            .map_err(|e| format!("{TRANSPORT_ERR}: tool call failed: {e}"))?;
         // Untrusted server output: cap what reaches the transcript/log
         // (threat model resource-exhaustion row), with a marked suffix.
+        // The cap applies INCREMENTALLY while appending (CodeCora scan
+        // 2026-09-18): a single oversized text block must not be copied
+        // into the buffer in full before any limit is checked.
         const MAX_RESULT_CHARS: usize = 256 * 1024;
-        let mut text = String::new();
-        for block in &result.content {
-            if let rmcp::model::ContentBlock::Text(t) = block {
-                text.push_str(&t.text);
-                text.push('\n');
-            }
-            if text.chars().count() > MAX_RESULT_CHARS {
-                let cut: String = text.chars().take(MAX_RESULT_CHARS).collect();
-                text =
-                    format!("{cut}\n…[truncated, server output exceeded {MAX_RESULT_CHARS} chars]");
-                break;
-            }
-        }
+        let blocks: Vec<&str> = result
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                rmcp::model::ContentBlock::Text(t) => Some(t.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        let text = cap_text_blocks(&blocks, MAX_RESULT_CHARS);
         // MCP spec: servers report tool FAILURE via isError + textual
         // content. That must settle as an error here, not Ok — the
         // durable log's success/failure bookkeeping depends on it.
@@ -244,6 +248,39 @@ impl McpConnection {
         }
         Ok(text)
     }
+}
+
+/// Cap untrusted text blocks for the transcript: append up to `max`
+/// chars total, with a marked suffix when anything was cut. Pure so the
+/// truncation contract is testable without a live server (CodeCora scan
+/// 2026-09-18 — the cap must apply while appending, not after a full
+/// block copy).
+fn cap_text_blocks(blocks: &[&str], max: usize) -> String {
+    let mut text = String::new();
+    let mut len = 0usize;
+    let mut truncated = false;
+    for block in blocks {
+        if truncated {
+            break;
+        }
+        for ch in block.chars() {
+            if len >= max {
+                truncated = true;
+                break;
+            }
+            text.push(ch);
+            len += 1;
+        }
+        if !truncated {
+            text.push('\n');
+        }
+    }
+    if truncated {
+        text.push_str(&format!(
+            "\n…[truncated, server output exceeded {max} chars]"
+        ));
+    }
+    text
 }
 
 async fn start_server(
@@ -265,7 +302,7 @@ async fn start_server(
         .map_err(|e| format!("mcp {:?}: failed to start server: {e}", cfg.name))?;
     let service = tokio::time::timeout(
         SUBPROCESS_TIMEOUT,
-        rmcp::service::serve_client(rmcp::model::ClientInfo::default(), transport),
+        rmcp::service::serve_client(rmcp::model::ClientConfig::default(), transport),
     )
     .await
     .map_err(|_| format!("mcp {:?}: handshake timed out", cfg.name))?
@@ -331,16 +368,23 @@ impl Tool for McpTool {
         // content before a harmful tail). Server-supplied description is
         // capped with the same marker discipline.
         fn truncate_marked(s: &str, max: usize) -> String {
-            let chars: Vec<char> = s.chars().collect();
-            if chars.len() <= max {
-                s.to_string()
-            } else {
-                format!(
-                    "{}…[truncated, +{} chars]",
-                    chars[..max].iter().collect::<String>(),
-                    chars.len() - max
-                )
+            // Streaming: no full Vec<char> materialization of an
+            // arbitrarily large argument payload (CodeCora scan
+            // 2026-09-18).
+            let mut out = String::new();
+            let mut taken = 0usize;
+            let mut total = 0usize;
+            for ch in s.chars() {
+                total += 1;
+                if taken < max {
+                    out.push(ch);
+                    taken += 1;
+                }
             }
+            if total > max {
+                out.push_str(&format!("…[truncated, +{} chars]", total - max));
+            }
+            out
         }
         let description = truncate_marked(&self.description, 200);
         let args = truncate_marked(
@@ -437,7 +481,7 @@ pub fn register_server_tools(
                     .register(Box::new(McpTool::new(
                         cfg.name.clone(),
                         mcp_name.clone(),
-                        server_tool,
+                        server_tool.clone(),
                         description,
                     )))
                     .is_ok()
@@ -467,4 +511,37 @@ pub fn register_server_tools(
         ),
     }
     registered
+}
+
+#[cfg(test)]
+mod cap_tests {
+    use super::cap_text_blocks;
+
+    #[test]
+    fn under_cap_joins_blocks_with_newlines() {
+        let out = cap_text_blocks(&["alpha", "beta"], 1024);
+        assert_eq!(out, "alpha\nbeta\n");
+        assert!(!out.contains("truncated"));
+    }
+
+    #[test]
+    fn single_oversized_block_is_capped_incrementally() {
+        let big = "x".repeat(5000);
+        let out = cap_text_blocks(&[big.as_str()], 1000);
+        assert!(out.chars().count() < 1200, "must not carry the full block");
+        assert!(out.contains("truncated, server output exceeded 1000 chars"));
+    }
+
+    #[test]
+    fn later_blocks_dropped_once_cap_hit() {
+        let out = cap_text_blocks(&["aaaa", "bbbb", "cccc"], 6);
+        // "aaaa\n" fills 5; "bbbb" contributes 1 char then the cap trips.
+        assert!(out.starts_with("aaaa\nb"));
+        assert!(out.contains("truncated, server output exceeded 6 chars"));
+    }
+
+    #[test]
+    fn empty_input_yields_empty_string() {
+        assert_eq!(cap_text_blocks(&[], 100), "");
+    }
 }

@@ -588,12 +588,20 @@ fn turn_provider_failure_aborts_cleanly() {
         }
         other => panic!("expected ProviderFailed, got {other:?}"),
     }
-    // Session still consistent: user message persisted, pc in Planning.
-    assert_eq!(s.state().pc, tole_core::state::Pc::Planning);
+    // #84: terminal provider failure SETTLES the turn (Planning→Final)
+    // instead of wedging at Planning — a plain `resume <id> "prompt"`
+    // must work next, no interactive recovery dance.
+    assert_eq!(s.state().pc, tole_core::state::Pc::Final);
     assert!(s
         .entries()
         .iter()
         .any(|e| e.kind.as_str() == "message" && e.payload["role"] == json!("user")));
+    // And the next turn drives cleanly from the settled state.
+    let mut p2 = MockProvider::scripted(vec![ProviderOutput::Final {
+        text: "recovered".into(),
+    }]);
+    let out2 = run_turn(&mut s, &mut p2, &reg, "continue").unwrap();
+    assert!(matches!(out2, TurnOutcome::Final { .. }), "got {out2:?}");
 }
 
 #[test]
@@ -625,15 +633,26 @@ fn turn_survives_reopen_between_steps() {
 
 #[test]
 fn turn_refused_when_pc_not_idle() {
-    // First turn aborts mid-loop (provider failure) → pc is Planning.
-    // A second run_turn on the same session must be refused, not silently
-    // append another user message.
+    // A session parked mid-flight (pc=Planning via a manual commit —
+    // provider failures now SETTLE to Final per #84) must refuse a
+    // second concurrent run_turn, not silently append another user
+    // message. The wedge state is constructed directly: commit a
+    // Planning transition with no driving turn.
     let dir = tmpdir("notidle");
     let mut s = JsonlStorage::create(&dir, "ni", None).unwrap();
     let mut p = MockProvider::scripted(vec![]);
     let reg = ToolRegistry::new();
-    let out = run_turn(&mut s, &mut p, &reg, "first").unwrap();
-    assert!(matches!(out, TurnOutcome::ProviderFailed { .. }));
+    use tole_core::entry::{EntryType, NewEntry};
+    use tole_core::state::StateTransition;
+    use tole_core::storage::{Commit, Storage};
+    s.commit(Commit::new().entry(NewEntry::root(
+        EntryType::new(EntryType::MESSAGE),
+        json!({"role": "user", "text": "first"}),
+    )))
+    .unwrap();
+    let seq = s.state().seq; // CAS: seq AFTER the entry commit
+    s.commit(Commit::new().transition(StateTransition::from(seq, tole_core::state::Pc::Planning)))
+        .unwrap();
     assert_eq!(s.state().pc, tole_core::state::Pc::Planning);
 
     let err = run_turn(&mut s, &mut p, &reg, "second").unwrap_err();
@@ -657,7 +676,7 @@ fn turn_refused_when_pc_not_idle() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn all_abort_paths_leave_durable_error_records() {
+fn abort_paths_leave_durable_error_records_and_no_final() {
     for (name, tool, risk) in [
         ("unknown", "nonexistent", Risk::ReadOnly),
         ("approval", "write_file", Risk::Write),
@@ -679,7 +698,20 @@ fn all_abort_paths_leave_durable_error_records() {
             reg.register(Box::new(WriteTool)).unwrap();
         }
 
-        let _ = run_turn(&mut s, &mut p, &reg, "hi").unwrap();
+        let outcome = run_turn(&mut s, &mut p, &reg, "hi").unwrap();
+        // Neither abort flavor may end in a Final answer — the turn must
+        // park on the failure and leave the durable ERROR record checked
+        // below (CodeCora scan 2026-09-18: do not discard the outcome
+        // under test). The exact flavor differs per case: "unknown" →
+        // UnknownTool; "approval" → the allowlist here pattern-matches
+        // `write_file` (AllowlistApprover semantics: match beats the
+        // default), the tool RUNS, and the exhausted script settles as
+        // ProviderFailed — the real approval gate contract is covered by
+        // `turn_write_tool_requires_approval_gate`.
+        assert!(
+            !matches!(outcome, TurnOutcome::Final { .. }),
+            "aborted turn must not produce Final, got {outcome:?}"
+        );
         // Durable ERROR entry exists, attached to the user message.
         let errs: Vec<&tole_core::entry::Entry> = s
             .entries()
@@ -730,4 +762,89 @@ fn chat_reopens_final_session_for_next_turn() {
         .filter(|e| e.kind.as_str() == "message" && e.payload["role"] == json!("assistant"))
         .count();
     assert_eq!((users, assistants), (2, 2));
+}
+
+#[test]
+fn loop_guard_exempts_poll_tools_but_trips_eventually() {
+    // #85: a poll tool with identical input is the CORRECT pattern (the
+    // arguments name the job; the result carries the change). The guard
+    // must let dozens of identical job_poll calls through, while a
+    // non-poll tool still trips at LOOP_TRIP_AFTER, and even polls trip
+    // at the (much higher) patience ceiling.
+    use tole_core::tool::{Risk, Tool};
+
+    struct FakePoll;
+    impl Tool for FakePoll {
+        fn name(&self) -> &str {
+            "job_poll"
+        }
+        fn risk(&self) -> Risk {
+            Risk::ReadOnly
+        }
+        fn describe(&self, _i: &Value) -> String {
+            "poll".into()
+        }
+        fn execute(&self, _i: Value) -> Result<Value, String> {
+            Ok(json!({"running": true}))
+        }
+    }
+    struct FakeStuck;
+    impl Tool for FakeStuck {
+        fn name(&self) -> &str {
+            "stuck_tool"
+        }
+        fn risk(&self) -> Risk {
+            Risk::ReadOnly
+        }
+        fn describe(&self, _i: &Value) -> String {
+            "stuck".into()
+        }
+        fn execute(&self, _i: Value) -> Result<Value, String> {
+            Ok(json!({}))
+        }
+    }
+
+    // 50 identical polls: legal (under the 120 poll ceiling).
+    let dir = tmpdir("poll-ok");
+    let mut s = JsonlStorage::create(&dir, "poll-ok", None).unwrap();
+    let mut reg = ToolRegistry::new();
+    reg.register(Box::new(FakePoll)).unwrap();
+    let mut script = Vec::new();
+    for _ in 0..25 {
+        script.push(ProviderOutput::ToolCall {
+            tool: "job_poll".into(),
+            input: json!({"job": "j-1"}),
+        });
+    }
+    script.push(ProviderOutput::Final {
+        text: "done".into(),
+    });
+    let mut p = MockProvider::scripted(script);
+    let out = run_turn(&mut s, &mut p, &reg, "wait for job").unwrap();
+    assert!(
+        matches!(out, TurnOutcome::Final { .. }),
+        "identical polls under the step budget must NOT trip: {out:?}"
+    );
+
+    // Same count of identical NON-poll calls: still trips at 3.
+    let dir = tmpdir("stuck");
+    let mut s = JsonlStorage::create(&dir, "stuck", None).unwrap();
+    let mut reg = ToolRegistry::new();
+    reg.register(Box::new(FakeStuck)).unwrap();
+    let mut script = Vec::new();
+    for _ in 0..5 {
+        script.push(ProviderOutput::ToolCall {
+            tool: "stuck_tool".into(),
+            input: json!({"x": 1}),
+        });
+    }
+    script.push(ProviderOutput::Final {
+        text: "unreachable".into(),
+    });
+    let mut p = MockProvider::scripted(script);
+    let out = run_turn(&mut s, &mut p, &reg, "go").unwrap();
+    assert!(
+        matches!(out, TurnOutcome::LoopDetected { ref tool, .. } if tool == "stuck_tool"),
+        "non-poll identical calls must still trip: {out:?}"
+    );
 }

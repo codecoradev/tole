@@ -294,6 +294,12 @@ pub struct JsonlStorage {
     created_at: u64,
     cwd: String,
     system_prompt: Option<String>,
+    /// Set when an append previously failed mid-write (cora full-scan
+    /// #53): the file may now end in a newline-less fragment, so ANY
+    /// further commit could glue its line onto the fragment and brick
+    /// the session. Poisoned storage rejects commits with a fatal error
+    /// until the host re-opens/re-creates the session.
+    poisoned: Option<StorageError>,
     // In-memory state (the file is a replay recipe, not the state):
     entries: Vec<Entry>,
     by_id: BTreeMap<String, usize>,
@@ -355,6 +361,7 @@ impl JsonlStorage {
             registers: BTreeMap::new(),
             usage: Vec::new(),
             state: MachineState::default(),
+            poisoned: None,
         })
     }
 
@@ -367,9 +374,17 @@ impl JsonlStorage {
         let file = File::open(&path)?;
         let mut reader = BufReader::new(file);
 
-        // Header (line 1, mandatory).
-        let mut line = String::new();
-        reader.read_line(&mut line)?;
+        // Header (line 1, mandatory). Read with read_until: a header line
+        // WITHOUT its trailing newline (crash mid-header-write) is a torn
+        // write exactly like a torn final line — parse it for the error
+        // message, but refuse to open for append: good_bytes = 0 makes the
+        // truncation below remove the whole file, so the next append never
+        // glues itself onto a newline-less header and bricks the session
+        // (cora full-scan #23).
+        let mut header_buf: Vec<u8> = Vec::new();
+        reader.read_until(b'\n', &mut header_buf)?;
+        let line = String::from_utf8(header_buf.clone())
+            .map_err(|_| StorageError::Corrupt("header: invalid UTF-8".into()))?;
         if line.trim().is_empty() {
             return Err(StorageError::Corrupt("empty file (missing header)".into()));
         }
@@ -387,6 +402,19 @@ impl JsonlStorage {
                 supported: STORAGE_VERSION,
             });
         }
+        // Torn header: complete JSON but no newline. This file can never
+        // be appended to safely (a body line would glue onto the
+        // newline-less header), and an append-style writer over an empty
+        // file would produce a headerless file that bricks the NEXT
+        // open(). Fail explicitly: the host's recovery path is
+        // create_with(), which rewrites the file with a fresh complete
+        // header (cora full-scan #23, second-round fix).
+        if !header_buf.ends_with(b"\n") {
+            return Err(StorageError::Corrupt(
+                "torn header (missing newline); recreate the session with create_with()".into(),
+            ));
+        }
+        let mut good_bytes = header_buf.len() as u64;
 
         let mut out = Self {
             session_id: header.id.clone(),
@@ -401,6 +429,7 @@ impl JsonlStorage {
             registers: BTreeMap::new(),
             usage: Vec::new(),
             state: MachineState::default(),
+            poisoned: None,
         };
 
         // Body lines: solo object or array (one transaction per line).
@@ -410,7 +439,6 @@ impl JsonlStorage {
         // so a torn tail can be physically truncated before appending.
         let mut lineno = 1usize;
         let mut last_seq = 0u64;
-        let mut good_bytes = line.len() as u64;
         let mut buf: Vec<u8> = Vec::new();
         loop {
             buf.clear();
@@ -573,9 +601,22 @@ impl JsonlStorage {
     /// record. (A crash mid-line leaves a torn tail, which open() discards
     /// whole — see the torn-tail test.)
     fn append_line(&mut self, line: &str) -> Result<(), StorageError> {
-        writeln!(self.writer, "{line}")?;
-        self.writer.flush()?;
-        self.writer.get_ref().sync_data()?;
+        let res = (|| -> Result<(), StorageError> {
+            writeln!(self.writer, "{line}")?;
+            self.writer.flush()?;
+            self.writer.get_ref().sync_data()?;
+            Ok(())
+        })();
+        if let Err(e) = res {
+            // The write may have landed PARTIALLY (classic: ENOSPC): the
+            // file can now end in a newline-less fragment. Poison the
+            // storage — commit()'s gate refuses every later append so a
+            // retry can never glue its line onto the fragment (cora
+            // full-scan #53). In-memory state stays untouched and the
+            // fragment is discarded by the next open()'s torn-tail rule.
+            self.poisoned = Some(StorageError::Io(std::io::Error::other(e.to_string())));
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -737,6 +778,16 @@ impl Storage for JsonlStorage {
     }
 
     fn commit(&mut self, c: Commit) -> Result<Vec<Entry>, StorageError> {
+        // Poison gate (cora full-scan #53): a previous append failed
+        // mid-write, so the file may end in a newline-less fragment. Any
+        // further append could glue onto it and brick the session —
+        // refuse until the host re-opens (which replays only complete
+        // lines) or re-creates the session.
+        if let Some(p) = &self.poisoned {
+            return Err(StorageError::Corrupt(format!(
+                "storage poisoned by an earlier failed append ({p}); re-open or re-create the session"
+            )));
+        }
         // Validate before writing any byte.
         for w in &c.registers {
             if !is_valid_namespace(&w.namespace) {
@@ -772,18 +823,24 @@ impl Storage for JsonlStorage {
         // `e_<seq>`) becomes visible to the entries that follow it in the
         // same commit line. Deterministic and side-effect free, so a
         // rejection here happens before any byte is written.
-        let mut known_ids: std::collections::HashSet<String> = self.by_id.keys().cloned().collect();
+        //
+        // O(new entries), not O(total entries) (cora full-scan #52):
+        // parent checks use by_id.contains_key() directly, and only the
+        // CURRENT commit's ids go into a small local set — cloning the
+        // whole by_id index per commit made sessions O(N²) overall.
+        let mut new_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut committed: Vec<Entry> = Vec::with_capacity(c.entries.len());
         let mut next = self.state.seq;
         for e in &c.entries {
             if let Some(p) = &e.parent_id {
-                if !known_ids.contains(p) {
+                let known = self.by_id.contains_key(p) || new_ids.contains(p);
+                if !known {
                     return Err(StorageError::Invalid(format!("unknown parent entry: {p}")));
                 }
             }
             next += 1;
             let id = e.id.clone().unwrap_or_else(|| format!("e_{next}"));
-            if !known_ids.insert(id.clone()) {
+            if self.by_id.contains_key(&id) || !new_ids.insert(id.clone()) {
                 return Err(StorageError::Invalid(format!("duplicate entry id: {id}")));
             }
             committed.push(Entry {
@@ -911,9 +968,144 @@ impl Storage for JsonlStorage {
         }
         std::fs::rename(&tmp, &self.path)?;
         sync_dir(&self.path)?;
-        // Reopen the writer on the new file.
-        self.writer = BufWriter::new(OpenOptions::new().append(true).open(&self.path)?);
+        // Reopen the writer on the new file. If THIS reopen fails, the
+        // rename has already happened: the old writer now points at an
+        // unlinked inode, so any further commit would vanish silently.
+        // Mark the session poisoned — every subsequent commit fails
+        // LOUDLY instead of losing data (CodeCora scan-3: silent loss).
+        self.writer = BufWriter::new(match OpenOptions::new().append(true).open(&self.path) {
+            Ok(w) => w,
+            Err(e) => {
+                self.poisoned = Some(StorageError::Invalid(format!(
+                    "compact(): reopen after rename failed: {e}"
+                )));
+                return Err(e.into());
+            }
+        });
         self.state.seq = seq;
+        // The file was atomically rewritten from COMPLETE records only —
+        // any torn fragment that justified the poison no longer exists.
+        // Clear the poison (CodeCora round-2 on the #53 fix): leaving it
+        // set would permanently disable a session whose file was just
+        // verifiably repaired. This makes compact() the sanctioned
+        // recovery path for a poisoned session.
+        self.poisoned = None;
         Ok(())
+    }
+}
+
+#[cfg(all(test, unix))]
+mod poison_tests {
+    use super::*;
+    use crate::entry::{EntryType, NewEntry};
+    use serde_json::json;
+
+    fn msg(v: Value) -> NewEntry {
+        NewEntry::root(EntryType::new(EntryType::MESSAGE), v)
+    }
+
+    /// Inject a REAL mid-write failure (ENOSPC) by re-pointing the
+    /// writer at /dev/full, then drive the poison contract end-to-end:
+    /// the failing commit errors, every later commit hits the poison
+    /// gate, in-memory state stays untouched, and a re-open discards
+    /// the fragment and works again. Direct field access is the honest
+    /// injection point here — chmod-based injection is ineffective
+    /// because create() already holds a write-enabled fd (cora ronde-2
+    /// caught the chmod variant as a false-coverage MAJOR).
+    #[test]
+    fn failed_append_poisons_until_reopen() {
+        let dir = std::env::temp_dir().join(format!("tole-poison-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut s = JsonlStorage::create(&dir, "p", None).unwrap();
+        s.commit(Commit::new().entry(msg(json!({ "n": 1 }))))
+            .unwrap();
+
+        // Swap the writer to /dev/full: every write() returns ENOSPC.
+        // Linux-only inside the test body (the unix gate covers macOS/
+        // FreeBSD where /dev/full does not exist) — skip honestly there
+        // instead of panicking (CodeCora CI annotation).
+        match OpenOptions::new().write(true).open("/dev/full") {
+            Ok(f) => s.writer = BufWriter::new(f),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("/dev/full unavailable on this platform — poison path untested here");
+                let _ = std::fs::remove_dir_all(&dir);
+                return;
+            }
+            Err(e) => panic!("unexpected error opening /dev/full: {e}"),
+        }
+
+        let first = s.commit(Commit::new().entry(msg(json!({ "n": 2 }))));
+        assert!(first.is_err(), "append to /dev/full must fail");
+
+        // Poisoned: the retry (the exact bug #53 describes) is refused.
+        let second = s
+            .commit(Commit::new().entry(msg(json!({ "n": 3 }))))
+            .unwrap_err();
+        assert!(
+            second.to_string().contains("poisoned"),
+            "second commit must hit the poison gate, got: {second}"
+        );
+        // In-memory state was never mutated by the failed commits.
+        assert_eq!(s.entries().len(), 1);
+        assert_eq!(s.last_seq(), 1);
+
+        // compact() is the sanctioned recovery (CodeCora round-2): it
+        // atomically rewrites the file from complete records only, so
+        // the poison clears and commits work again WITHOUT a reopen.
+        // The snapshot carries seq = 2 (header + snapshot line); the
+        // post-compact commit continues from there as seq 3.
+        s.compact().unwrap();
+        s.commit(Commit::new().entry(msg(json!({ "n": 2 }))))
+            .unwrap();
+        assert_eq!(s.entries().len(), 2);
+        assert_eq!(s.last_seq(), 3);
+
+        // Recovery: reopen the REAL file — replay now includes the
+        // compact snapshot AND the post-compact commit; the session is
+        // fully usable again.
+        drop(s);
+        let path = dir.join("p.jsonl");
+        let mut reopened = JsonlStorage::open(&path).unwrap();
+        assert_eq!(reopened.entries().len(), 2);
+        reopened
+            .commit(Commit::new().entry(msg(json!({ "n": 3 }))))
+            .unwrap();
+        assert_eq!(reopened.last_seq(), 4);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// O(new) commit validation (#52): intra-commit parents resolve via
+    /// the local new-id set, duplicates across commits still rejected.
+    #[test]
+    fn intra_commit_parents_and_duplicate_ids_still_validated() {
+        let dir = std::env::temp_dir().join(format!("tole-p_ids-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut s = JsonlStorage::create(&dir, "ids", None).unwrap();
+        // parent references an earlier entry IN THE SAME commit.
+        let c = Commit::new()
+            .entry(msg(json!({ "role": "parent" })))
+            .entry(NewEntry::with_parent(
+                "e_1",
+                EntryType::new(EntryType::MESSAGE),
+                json!({ "role": "child" }),
+            ));
+        s.commit(c).unwrap();
+        assert_eq!(s.entries().len(), 2);
+        // Duplicate id across commits is still refused.
+        let dup = NewEntry {
+            id: Some("e_1".into()),
+            parent_id: None,
+            kind: EntryType::new(EntryType::MESSAGE),
+            payload: json!({}),
+            timestamp: 0,
+        };
+        assert!(s
+            .commit(Commit::new().entry(dup))
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

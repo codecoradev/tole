@@ -59,6 +59,10 @@ pub trait Tool: Send + Sync {
 pub struct ToolRegistry {
     tools: HashMap<String, Box<dyn Tool>>,
     approver: Option<Box<dyn Approver>>,
+    /// Opt-in process hooks (issue #110, shell-tools only): deny-only
+    /// policy injection at the tool boundary. `None` = off, zero cost.
+    #[cfg(feature = "shell-tools")]
+    hooks: Option<crate::hooks::ToolHooks>,
 }
 
 impl ToolRegistry {
@@ -74,6 +78,51 @@ impl ToolRegistry {
         Self {
             tools: HashMap::new(),
             approver: Some(Box::new(approver)),
+            #[cfg(feature = "shell-tools")]
+            hooks: None,
+        }
+    }
+
+    /// Attach opt-in tool-boundary hooks (issue #110). Default OFF.
+    #[cfg(feature = "shell-tools")]
+    pub fn set_hooks(&mut self, hooks: crate::hooks::ToolHooks) {
+        self.hooks = Some(hooks);
+    }
+
+    /// Pre-hook pass: returns the deny reason when any pre-hook exits 2.
+    /// Hook FAILURES (crash, timeout, non-2 exit) are logged and
+    /// non-blocking by contract.
+    #[cfg(feature = "shell-tools")]
+    pub(crate) fn pre_hook_denial(&self, tool: &str, input: &Value) -> Option<String> {
+        let hooks = self.hooks.as_ref()?;
+        for h in &hooks.pre {
+            match h.run("pretool", tool, input, None) {
+                Ok(Some(reason)) => return Some(reason),
+                Ok(None) => {}
+                Err(e) => eprintln!("tole: pre-hook failure (non-blocking): {e}"),
+            }
+        }
+        None
+    }
+
+    /// True when at least one post-hook is wired (callers skip input
+    /// cloning otherwise).
+    #[cfg(feature = "shell-tools")]
+    pub(crate) fn has_post_hooks(&self) -> bool {
+        self.hooks
+            .as_ref()
+            .map(|h| !h.post.is_empty())
+            .unwrap_or(false)
+    }
+
+    /// Post-hook pass (observe-only): failures are logged, never block.
+    #[cfg(feature = "shell-tools")]
+    pub(crate) fn post_hook_notify(&self, tool: &str, input: &Value, ok: bool) {
+        let Some(hooks) = &self.hooks else { return };
+        for h in &hooks.post {
+            if let Err(e) = h.run("posttool", tool, input, Some(ok)) {
+                eprintln!("tole: post-hook failure (non-blocking): {e}");
+            }
         }
     }
 
@@ -118,6 +167,17 @@ impl ToolRegistry {
         self.tools.get(name).map(|b| b.as_ref())
     }
 
+    /// Plan-mode filter (issue #109): drop every non-ReadOnly tool from
+    /// the registry. The guarantee is ABSENCE, not approval — filtered
+    /// tools never appear in `specs()`, so the model cannot even see
+    /// them on the wire. Irreversible by design: a registry filtered
+    /// this way cannot grow Write tools back (no re-register path).
+    /// Read-only in-place mutation of the registry is safe because
+    /// callers build registries fresh per session.
+    pub fn retain_read_only(&mut self) {
+        self.tools.retain(|_, t| t.risk() == Risk::ReadOnly);
+    }
+
     /// OpenAI-format `tools` array for every registered tool (E4.5).
     /// Sorted by name so the wire payload is deterministic — the same
     /// registry always serializes to the same request body.
@@ -160,5 +220,88 @@ impl ToolRegistry {
     /// True when an approver is wired in.
     pub fn has_approver(&self) -> bool {
         self.approver.is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::read_file::ReadFileTool;
+
+    struct FakeWrite;
+    struct FakeDestructive;
+
+    impl Tool for FakeWrite {
+        fn name(&self) -> &str {
+            "fake_write"
+        }
+        fn risk(&self) -> Risk {
+            Risk::Write
+        }
+        fn execute(&self, _: Value) -> Result<Value, String> {
+            Ok(json!({}))
+        }
+    }
+
+    impl Tool for FakeDestructive {
+        fn name(&self) -> &str {
+            "fake_destructive"
+        }
+        fn risk(&self) -> Risk {
+            Risk::Destructive
+        }
+        fn execute(&self, _: Value) -> Result<Value, String> {
+            Ok(json!({}))
+        }
+    }
+
+    /// Deny-all AND interactive: satisfies BOTH registration invariants
+    /// (Write needs an approver, Destructive needs an interactive one)
+    /// without granting anything.
+    struct DenyAllInteractive;
+
+    impl crate::approval::Approver for DenyAllInteractive {
+        fn decide(&self, _req: &crate::approval::ToolRequest<'_>) -> crate::approval::Verdict {
+            crate::approval::Verdict::Deny
+        }
+        fn interactive(&self) -> bool {
+            true
+        }
+    }
+
+    fn registry_with_all_risks() -> ToolRegistry {
+        // Write/Destructive registration REQUIRES an (interactive)
+        // approver — a deny-all one is enough for this test.
+        let mut reg = ToolRegistry::with_approver(DenyAllInteractive);
+        reg.register(Box::new(ReadFileTool::new(std::env::temp_dir())))
+            .unwrap();
+        reg.register(Box::new(FakeWrite)).unwrap();
+        reg.register(Box::new(FakeDestructive)).unwrap();
+        reg
+    }
+
+    #[test]
+    fn retain_read_only_keeps_only_readonly_tools() {
+        let mut reg = registry_with_all_risks();
+        assert_eq!(reg.specs().len(), 3);
+        reg.retain_read_only();
+        let names: Vec<String> = reg
+            .specs()
+            .iter()
+            .filter_map(|s| s["function"]["name"].as_str())
+            .map(str::to_string)
+            .collect();
+        assert_eq!(names, vec!["read_file".to_string()]);
+        assert!(reg.get("fake_write").is_none());
+        assert!(reg.get("fake_destructive").is_none());
+        assert!(reg.get("read_file").is_some());
+    }
+
+    #[test]
+    fn retain_read_only_is_idempotent() {
+        let mut reg = registry_with_all_risks();
+        reg.retain_read_only();
+        reg.retain_read_only();
+        assert_eq!(reg.specs().len(), 1);
     }
 }
