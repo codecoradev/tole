@@ -69,3 +69,27 @@ lives) / **gap** (tracked) / **N/A** (with rationale).
   (metadata never trusted for risk, scrubbed env, fenced results).
   Remaining MCP surface: HTTP/SSE transport, server auth, resource
   subscriptions — each re-opens this document.
+
+## Memory loop — decision typing (#143)
+
+The session summary stored by the memory loop keeps its content contract
+(first prompt + final answer only — never raw tool output), so the
+prompt-injection-into-memory surface is unchanged. What #143 adds is a
+TYPE: sessions that executed a Write/Destructive tool are stored with
+`--type decision` and a `wrote` tag. The `wrote` bit is derived from the
+harness's own tool-risk accounting (durable, session-scoped
+`fact.wrote_this_turn` register — set on fresh execution AND
+crash-replay, never reset by turn machinery), not from model-asserted
+content — the model cannot claim or suppress the decision typing.
+
+## Turn-end stop gates (#145)
+
+`--on-turnend` gates run owner-controlled scripts at the final-message
+boundary. Two surfaces are deliberate and bounded: (1) the deny reason is
+owner-authored input (the gate script is trusted the same way
+`--on-pretool` scripts are — argv-executed, env-scrubbed, timed out), and
+it enters the transcript as a user-role entry the model will read; (2) the
+final-text preview handed to the gate is capped at 8 KiB and never leaves
+the host process. Denials are capped at 3 per turn, so a permanently
+failing gate cannot livelock the loop — the turn settles durably as
+`StopGateBlocked`, visible to replay.

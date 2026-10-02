@@ -126,6 +126,71 @@ impl ToolRegistry {
         }
     }
 
+    /// True when at least one turn-end gate is wired.
+    #[cfg(feature = "shell-tools")]
+    pub(crate) fn has_turnend_hooks(&self) -> bool {
+        self.hooks
+            .as_ref()
+            .map(|h| !h.turnend.is_empty())
+            .unwrap_or(false)
+    }
+
+    /// Turn-end gate pass (issue #145). `tools` is the per-turn tool/risk
+    /// summary the payload carries. Returns the FIRST deny reason (exit
+    /// 2); hook failures are logged and non-blocking per the #110
+    /// contract. Stop after the first deny: the model fixes one complaint
+    /// at a time — re-running all gates on every denial would burn the
+    /// step budget re-reporting the same failures.
+    #[cfg(feature = "shell-tools")]
+    pub(crate) fn turnend_denial(
+        &self,
+        final_preview: &str,
+        tools: &[(String, crate::tool::Risk)],
+    ) -> Option<String> {
+        let hooks = self.hooks.as_ref()?;
+        let payload = serde_json::json!({
+            "event": "turnend",
+            "final_text_preview": &final_preview.chars().take(8192).collect::<String>(),
+            "tools": tools
+                .iter()
+                .map(|(t, r)| {
+                    let risk = match r {
+                        Risk::ReadOnly => "readonly",
+                        Risk::Write => "write",
+                        Risk::Destructive => "destructive",
+                    };
+                    serde_json::json!({"tool": t, "risk": risk})
+                })
+                .collect::<Vec<_>>(),
+        });
+        for h in &hooks.turnend {
+            // GATE semantics (issue #145): exit 0 = pass; ANY non-zero
+            // exit denies, with stdout (or a default) as the reason the
+            // model will see. A verification gate's nonzero exit is its
+            // verdict ("tests failed" exits 1, cargo exits 101) — the
+            // #110 exit-2-only rule would classify real verdicts as
+            // non-blocking failures, which the first live E2E disproved.
+            match h.run_raw(&payload) {
+                Ok((0, _)) => {}
+                Ok((_, stdout)) => {
+                    let reason = if stdout.is_empty() {
+                        "denied by turnend gate (no reason given)".to_string()
+                    } else {
+                        format!("denied by turnend gate: {stdout}")
+                    };
+                    return Some(reason);
+                }
+                Err(e) => {
+                    // True INFRASTRUCTURE failures (spawn error, timeout)
+                    // stay non-blocking: a broken gate must not hold the
+                    // agent hostage (same contract as #110 hook failures).
+                    eprintln!("tole: turnend-hook failure (non-blocking): {e}");
+                }
+            }
+        }
+        None
+    }
+
     /// Register a tool. Duplicate names are a wiring bug and are refused
     /// (no panics in core). Write tools require an approver; Destructive
     /// tools require an *interactive* approver (structural enforcement —

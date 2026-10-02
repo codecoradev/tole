@@ -96,7 +96,7 @@ Current LLM agents (pi, Claude Code, etc.) are **ephemeral**: state lives in mem
 | **storage** | FR-D2 | Versioned schema (`STORAGE_VERSION`), **migrate-on-open**; version newer than the binary → clear error. | P0 |
 | **tool** | FR-T1 | `Tool` trait with risk tiers: `ReadOnly` / `Write` / `Destructive`; metadata (name, description, argument schema) exposed to the provider. | P0 |
 | **tool** | FR-T2 | Tool execution is sequential; results (including errors) are recorded as tool-result entries. | P0 |
-| **approval** | FR-A1 | `Approver` trait: the core provides the policy engine; `Allowlist` / `Interactive` impls live in the host. | P0 |
+| **approval** | FR-A1 | `Approver` trait: the core provides the policy engine and the config-driven `AllowlistApprover`; the host provides the `InteractiveApprover` (y/N prompt) impl via injection. | P0 |
 | **approval** | FR-A2 | Tool calls with tier ≥ configured threshold must pass the approver before execution; decisions are recorded in the tree. | P0 |
 | **provider** | FR-P1 | `Provider` trait abstracting the LLM (stream/chat completion); concrete implementations in the host or a separate crate. | P0 |
 | **provider** | FR-P2 | Provider receives a tree snapshot (or window) + tool metadata; never writes the register directly. | P0 |
