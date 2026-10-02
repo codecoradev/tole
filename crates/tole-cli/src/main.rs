@@ -126,6 +126,15 @@ struct Cli {
     #[arg(long, global = true)]
     on_turnend: Vec<String>,
 
+    /// Trust preset: auto-allow the fleet's own ecosystem tools without
+    /// per-call approval. `internal` = uteke_*/cora_search/mcp_cora_*/
+    /// verify_package/job_*/tole_session_*; `read_only` = every safe
+    /// read. Repeatable; flag wins over the TOLE_TRUST env; `none`
+    /// (default) = today's behavior. Pure sugar over --allow patterns —
+    /// Destructive tools are never auto-allowed.
+    #[arg(long, global = true)]
+    trust: Vec<String>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -315,38 +324,49 @@ fn dispatch(cli: Cli) -> Result<()> {
         #[cfg(not(feature = "shell-tools"))]
         memory: (),
     };
+    // Trust presets (issue #159): expand once, before dispatch — every
+    // allow_patterns-consuming subcommand appends these.
+    let trust_extra = expand_trust(&cli.trust)?;
+
     match cli.command {
         Command::Run {
             prompt,
             system,
-            allow_patterns,
+            allow_patterns: allow_patterns_in,
             yes,
-        } => run_command(
-            &sessions_dir,
-            &prompt,
-            system.as_deref(),
-            &allow_patterns,
-            yes,
-            &host,
-        ),
+        } => {
+            let allow_patterns = with_trust(allow_patterns_in, &trust_extra);
+            run_command(
+                &sessions_dir,
+                &prompt,
+                system.as_deref(),
+                &allow_patterns,
+                yes,
+                &host,
+            )
+        }
         Command::Resume {
             id,
             prompt,
-            allow_patterns,
+            allow_patterns: allow_patterns_in,
             yes,
-        } => resume_command(
-            &sessions_dir,
-            &id,
-            prompt.as_deref(),
-            &allow_patterns,
-            yes,
-            &host,
-        ),
+        } => {
+            let allow_patterns = with_trust(allow_patterns_in, &trust_extra);
+            resume_command(
+                &sessions_dir,
+                &id,
+                prompt.as_deref(),
+                &allow_patterns,
+                yes,
+                &host,
+            )
+        }
         #[cfg(all(feature = "mcp", feature = "shell-tools"))]
         Command::Mcp {
-            allow_patterns,
+            allow_patterns: allow_patterns_in,
             workspace,
         } => {
+            let allow_patterns = with_trust(allow_patterns_in, &trust_extra);
             // Global flags must not SILENTLY no-op on this subcommand
             // (cora scan-3 #9): plan-mode filters the served registry to
             // read-only; hooks are not wired in server mode (no local
@@ -372,11 +392,12 @@ fn dispatch(cli: Cli) -> Result<()> {
         }
         #[cfg(feature = "shell-tools")]
         Command::Acp {
-            allow_patterns,
+            allow_patterns: allow_patterns_in,
             yes,
             workspace,
             memory,
         } => {
+            let allow_patterns = with_trust(allow_patterns_in, &trust_extra);
             // Same loud-bail rule as `tole mcp` for hooks: the ACP host
             // does not wire local pre/post hooks — approvals happen in
             // the editor via permission requests instead.
@@ -408,10 +429,11 @@ fn dispatch(cli: Cli) -> Result<()> {
             bind,
             transport,
             token,
-            allow_patterns,
+            allow_patterns: allow_patterns_in,
             workspace,
             memory,
         } => {
+            let allow_patterns = with_trust(allow_patterns_in, &trust_extra);
             let memory = match memory.as_deref().filter(|s| !s.trim().is_empty()) {
                 Some(_) => resolve_memory(memory.as_ref())?,
                 None => host.memory.clone(),
@@ -457,17 +479,20 @@ fn dispatch(cli: Cli) -> Result<()> {
             system,
             resume,
             last,
-            allow_patterns,
+            allow_patterns: allow_patterns_in,
             yes,
-        } => chat_command(
-            &sessions_dir,
-            system.as_deref(),
-            resume,
-            last,
-            &allow_patterns,
-            yes,
-            &host,
-        ),
+        } => {
+            let allow_patterns = with_trust(allow_patterns_in, &trust_extra);
+            chat_command(
+                &sessions_dir,
+                system.as_deref(),
+                resume,
+                last,
+                &allow_patterns,
+                yes,
+                &host,
+            )
+        }
     }
 }
 
@@ -698,6 +723,72 @@ fn detect_github_repo(cwd: &Path) -> Option<String> {
         return None;
     }
     tole_cli::session_host::github_repo_from_remote_url(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Trust presets (issue #159): one word for "auto-allow the fleet's own
+/// ecosystem tools". Pure sugar — the expanded patterns feed the SAME
+/// AllowlistApprover machinery as `--allow`, so enforcement (and the
+/// Destructive-never-allowed invariant) is unchanged. `internal` covers
+/// the probe-gated native integrations (uteke_*, cora_search) plus the
+/// cora MCP auto-preset surface (mcp_cora_*) and the always-safe
+/// verify_package/job tools; it deliberately excludes the write-capable
+/// native tools (write_file/edit_file/run_command/git/gh), which keep
+/// prompting.
+const TRUST_PRESETS: &[(&str, &[&str])] = &[
+    (
+        "internal",
+        &[
+            "uteke_*",
+            "cora_search",
+            "mcp_cora_*",
+            "verify_package",
+            "job_*",
+            "tole_session_*",
+        ],
+    ),
+    (
+        "read_only",
+        &[
+            "read_file",
+            "verify_package",
+            "uteke_recall",
+            "cora_search",
+            "tole_session_status",
+            "tole_session_list",
+            "job_poll",
+        ],
+    ),
+];
+
+/// Expand `--trust` preset names into extra allow patterns. Unknown
+/// preset names are a hard error — a typo silently narrowing trust would
+/// be worse than failing. `none`/empty → no extra patterns.
+fn expand_trust(presets: &[String]) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for p in presets {
+        if p.eq_ignore_ascii_case("none") {
+            continue;
+        }
+        let found = TRUST_PRESETS
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(p))
+            .map(|(_, patterns)| patterns);
+        let Some(patterns) = found else {
+            let names: Vec<&str> = TRUST_PRESETS.iter().map(|(n, _)| *n).collect();
+            anyhow::bail!(
+                "unknown trust preset {p:?} — available: {}",
+                names.join(", ")
+            );
+        };
+        out.extend(patterns.iter().map(|s| s.to_string()));
+    }
+    Ok(out)
+}
+
+/// Append the trust-preset patterns to the user's `--allow` list.
+fn with_trust(mut allow_patterns: Vec<String>, trust_extra: &[String]) -> Vec<String> {
+    allow_patterns.extend(trust_extra.iter().cloned());
+    allow_patterns
 }
 
 fn build_registry(
@@ -1892,5 +1983,60 @@ mod mcp_preset_tests {
         // downstream with its normal error — this merge never panics).
         let merged = merge_mcp_specs(&["not-a-spec".into()], false, vec!["cora=cora mcp".into()]);
         assert_eq!(merged, vec!["not-a-spec", "cora=cora mcp"]);
+    }
+}
+
+#[cfg(test)]
+mod trust_preset_tests {
+    use super::*;
+
+    #[test]
+    fn internal_expands_to_expected_patterns() {
+        let pats = expand_trust(&["internal".to_string()]).unwrap();
+        for want in [
+            "uteke_*",
+            "cora_search",
+            "mcp_cora_*",
+            "verify_package",
+            "job_*",
+            "tole_session_*",
+        ] {
+            assert!(
+                pats.iter().any(|p| p == want),
+                "internal missing {want}: {pats:?}"
+            );
+        }
+        // must NOT include write-capable native tools
+        assert!(!pats.iter().any(|p| p == "write_file"));
+        assert!(!pats.iter().any(|p| p == "run_command"));
+    }
+
+    #[test]
+    fn none_expands_to_empty() {
+        assert!(expand_trust(&["none".to_string()]).unwrap().is_empty());
+        assert!(expand_trust(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn unknown_preset_is_a_loud_error() {
+        let err = expand_trust(&["internalx".to_string()]).unwrap_err();
+        assert!(err.to_string().contains("unknown trust preset"));
+        assert!(err.to_string().contains("internal"));
+    }
+
+    #[test]
+    fn case_insensitive_and_union() {
+        let pats = expand_trust(&["INTERNAL".to_string(), "read_only".to_string()]).unwrap();
+        assert!(pats.iter().any(|p| p == "uteke_*"));
+        assert!(pats.iter().any(|p| p == "read_file"));
+    }
+
+    #[test]
+    fn with_trust_appends_preserving_user_patterns() {
+        let out = with_trust(
+            vec!["write_file".to_string()],
+            &["uteke_*".to_string(), "cora_search".to_string()],
+        );
+        assert_eq!(out, vec!["write_file", "uteke_*", "cora_search"]);
     }
 }
