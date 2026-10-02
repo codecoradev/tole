@@ -32,6 +32,7 @@ use tole_core::tool::ToolRegistry;
 use tole_core::turn::{resume_turn, run_turn, TurnOutcome, LOOP_TRIP_AFTER};
 #[cfg(feature = "shell-tools")]
 use tole_core::uteke::{UtekeDocumentTool, UtekeRecallTool};
+use tole_core::verify_package::VerifyPackageTool;
 
 /// Where sessions live unless the user overrides it.
 const DEFAULT_SESSIONS_DIR: &str = ".tole/sessions";
@@ -113,6 +114,17 @@ struct Cli {
     /// observe-only (output cannot block). Repeatable; default OFF.
     #[arg(long, global = true)]
     on_posttool: Vec<String>,
+
+    /// Turn-end stop gate hook (issue #145): runs when the model
+    /// produces its final message, BEFORE it commits. Receives one JSON
+    /// object on stdin (`{"event":"turnend","final_text_preview":...,
+    /// "tools":[{"tool":...,"risk":...}]}`); exit code 2 = DENY the
+    /// finish — the reason becomes the model's next input and the loop
+    /// continues (bounded: 3 denials per turn, then the turn settles as
+    /// blocked). 30s timeout per hook (verification gates run lint/tests).
+    /// Example: --on-turnend "cargo check". Repeatable; default OFF.
+    #[arg(long, global = true)]
+    on_turnend: Vec<String>,
 
     #[command(subcommand)]
     command: Command,
@@ -297,6 +309,7 @@ fn dispatch(cli: Cli) -> Result<()> {
 
         on_pretool: cli.on_pretool.clone(),
         on_posttool: cli.on_posttool.clone(),
+        on_turnend: cli.on_turnend.clone(),
         #[cfg(feature = "shell-tools")]
         memory: resolve_memory(cli.memory.as_ref())?,
         #[cfg(not(feature = "shell-tools"))]
@@ -474,6 +487,7 @@ struct HostConfig {
 
     /// Tool-boundary hook command lines (issue #110), default empty.
     on_pretool: Vec<String>,
+    on_turnend: Vec<String>,
     on_posttool: Vec<String>,
     /// shell-tools-only host knob. `not(feature = "shell-tools")` builds
     /// still assign `memory: None` in dispatch — the field stays so the
@@ -523,11 +537,12 @@ impl HostConfig {
 
     /// Post-session summary (memory loop): best-effort, stderr on
     /// failure, the session itself is never affected.
-    fn remember(&self, session_id: &str, first_prompt: &str, last_answer: &str) {
+    fn remember(&self, session_id: &str, first_prompt: &str, last_answer: &str, wrote: bool) {
         let Some(mem) = self.memory.as_ref() else {
             return;
         };
-        match tole_core::memory::remember_session(mem, session_id, first_prompt, last_answer) {
+        match tole_core::memory::remember_session(mem, session_id, first_prompt, last_answer, wrote)
+        {
             Ok(_) => eprintln!("tole: memory: session summary stored in {}", mem.namespace),
             Err(e) => eprintln!("tole: memory remember failed (session unaffected): {e}"),
         }
@@ -717,6 +732,8 @@ fn build_registry(
     #[cfg(feature = "shell-tools")]
     reg.register(Box::new(JobPollTool::new(file_root.clone())))
         .map_err(|e| anyhow::anyhow!("registering job_poll: {e}"))?;
+    reg.register(Box::new(VerifyPackageTool::new()))
+        .map_err(|e| anyhow::anyhow!("registering verify_package: {e}"))?;
     reg.register(Box::new(ReadFileTool::new(file_root.clone())))
         .map_err(|e| anyhow::anyhow!("registering read_file: {e}"))?;
     // Write tools: gated per call. The jail root is the workspace.
@@ -815,6 +832,8 @@ fn build_server_registry(
         reg.register(Box::new(JobPollTool::new(file_root.clone())))
             .map_err(|e| anyhow::anyhow!("registering job_poll: {e}"))?;
     }
+    reg.register(Box::new(VerifyPackageTool::new()))
+        .map_err(|e| anyhow::anyhow!("registering verify_package: {e}"))?;
     reg.register(Box::new(ReadFileTool::new(file_root.clone())))
         .map_err(|e| anyhow::anyhow!("registering read_file: {e}"))?;
     reg.register(Box::new(WriteFileTool::new(file_root.clone())))
@@ -915,11 +934,14 @@ fn run_command(
     // Opt-in tool-boundary hooks (issue #110): deny-only policy
     // injection for Write/Destructive calls, default OFF.
     #[cfg(feature = "shell-tools")]
-    if !host.on_pretool.is_empty() || !host.on_posttool.is_empty() {
-        registry.set_hooks(tole_core::hooks::ToolHooks::from_cli(
-            &host.on_pretool,
-            &host.on_posttool,
-        ));
+    if !host.on_pretool.is_empty() || !host.on_posttool.is_empty() || !host.on_turnend.is_empty() {
+        let mut hooks = tole_core::hooks::ToolHooks::from_cli(&host.on_pretool, &host.on_posttool);
+        hooks.turnend = host
+            .on_turnend
+            .iter()
+            .map(|c| tole_core::hooks::turnend_hook(c))
+            .collect();
+        registry.set_hooks(hooks);
     }
 
     let session_id = new_session_id();
@@ -950,8 +972,8 @@ fn run_command(
     // Memory loop, post-session: a settled Final turn leaves a compact
     // summary behind for the next session's recall.
     #[cfg(feature = "shell-tools")]
-    if let TurnOutcome::Final { text } = &outcome {
-        host.remember(&session_id, &raw_prompt, text);
+    if let TurnOutcome::Final { text, wrote } = &outcome {
+        host.remember(&session_id, &raw_prompt, text, *wrote);
     }
     report_outcome(&session_id, outcome);
     Ok(())
@@ -1002,11 +1024,14 @@ fn resume_command(
     // Opt-in tool-boundary hooks (issue #110): deny-only policy
     // injection for Write/Destructive calls, default OFF.
     #[cfg(feature = "shell-tools")]
-    if !host.on_pretool.is_empty() || !host.on_posttool.is_empty() {
-        registry.set_hooks(tole_core::hooks::ToolHooks::from_cli(
-            &host.on_pretool,
-            &host.on_posttool,
-        ));
+    if !host.on_pretool.is_empty() || !host.on_posttool.is_empty() || !host.on_turnend.is_empty() {
+        let mut hooks = tole_core::hooks::ToolHooks::from_cli(&host.on_pretool, &host.on_posttool);
+        hooks.turnend = host
+            .on_turnend
+            .iter()
+            .map(|c| tole_core::hooks::turnend_hook(c))
+            .collect();
+        registry.set_hooks(hooks);
     }
     let mut provider = OpenAiProvider::new(cfg).with_tool_specs(registry.specs());
     // B2: the system prompt is pinned in the session header — resume
@@ -1027,8 +1052,12 @@ fn resume_command(
             // its own durable event. No recall injection here: the resumed
             // session already carries its context.
             #[cfg(feature = "shell-tools")]
-            if let TurnOutcome::Final { text: answer } = &outcome {
-                host.remember(id, text, answer);
+            if let TurnOutcome::Final {
+                text: answer,
+                wrote,
+            } = &outcome
+            {
+                host.remember(id, text, answer, *wrote);
             }
             outcome
         }
@@ -1281,11 +1310,14 @@ fn chat_command(
     // Opt-in tool-boundary hooks (issue #110): deny-only policy
     // injection for Write/Destructive calls, default OFF.
     #[cfg(feature = "shell-tools")]
-    if !host.on_pretool.is_empty() || !host.on_posttool.is_empty() {
-        registry.set_hooks(tole_core::hooks::ToolHooks::from_cli(
-            &host.on_pretool,
-            &host.on_posttool,
-        ));
+    if !host.on_pretool.is_empty() || !host.on_posttool.is_empty() || !host.on_turnend.is_empty() {
+        let mut hooks = tole_core::hooks::ToolHooks::from_cli(&host.on_pretool, &host.on_posttool);
+        hooks.turnend = host
+            .on_turnend
+            .iter()
+            .map(|c| tole_core::hooks::turnend_hook(c))
+            .collect();
+        registry.set_hooks(hooks);
     }
 
     if fresh {
@@ -1319,6 +1351,9 @@ fn chat_command(
     // session summary is stored when the REPL exits cleanly.
     #[cfg(feature = "shell-tools")]
     let (mut memory_injected, mut first_prompt, mut last_answer) = (!fresh, None, None);
+    // Issue #143: did any turn of this chat execute a Write/Destructive tool?
+    #[cfg(feature = "shell-tools")]
+    let mut chat_wrote = false;
     // Set when the typed message could not run because the session was
     // stuck mid-flight and the bounded resolve retries ran out — the
     // message is NOT in the durable log, so the operator must resend it.
@@ -1427,11 +1462,14 @@ fn chat_command(
         };
 
         match outcome {
-            Ok(TurnOutcome::Final { text }) => {
+            Ok(TurnOutcome::Final { text, wrote }) => {
                 #[cfg(feature = "shell-tools")]
                 {
                     last_answer = Some(text.clone());
+                    chat_wrote |= wrote;
                 }
+                #[cfg(not(feature = "shell-tools"))]
+                let _ = wrote;
                 println!("tole> {text}");
             }
             Ok(TurnOutcome::ApprovalRequired { name }) => eprintln!(
@@ -1445,6 +1483,11 @@ fn chat_command(
             }
             Ok(TurnOutcome::BudgetExhausted) => {
                 eprintln!("tole> (step budget exhausted — turn aborted; next message resumes)")
+            }
+            Ok(TurnOutcome::StopGateBlocked { reason }) => {
+                eprintln!(
+                    "tole> (stop gate blocked: {reason} — turn aborted; next message resumes)"
+                )
             }
             Ok(TurnOutcome::LoopDetected { .. }) => eprintln!(
                 "tole> (loop guard tripped — identical tool calls repeated; next message resumes)"
@@ -1465,12 +1508,24 @@ fn chat_command(
             // believe it was recorded (CodeCora scan 2026-09-18).
             eprintln!("tole> (note: the message you just typed was NOT recorded — resolve the session state, then resend it)");
         }
+        // #143 (cora): a writing turn that ABORTED (provider failure,
+        // loop guard, budget) still wrote to disk — the durable
+        // session-scoped register survives the abort, so fold it in here
+        // too, not only on the Final arm.
+        #[cfg(feature = "shell-tools")]
+        if storage
+            .get_register("fact", "wrote_this_turn")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            chat_wrote = true;
+        }
     }
     // Memory loop, post-session: a clean REPL exit with at least one
     // completed turn leaves a compact summary in the namespace.
     #[cfg(feature = "shell-tools")]
     if let (Some(fp), Some(la)) = (first_prompt.as_deref(), last_answer.as_deref()) {
-        host.remember(&session_id, fp, la);
+        host.remember(&session_id, fp, la, chat_wrote);
     }
     println!(
         "session {session_id} closed — entries: {}",
@@ -1503,7 +1558,10 @@ fn default_system_prompt() -> &'static str {
 involving files, prefer the dedicated tools — read_file, write_file, \
 edit_file — instead of run_command; they are safer and their approvals are \
 what the user's --allow settings mean. Use run_command only for what those \
-cannot do (pipes, builds, process control). Keep answers concise."
+cannot do (pipes, builds, process control). Before running any package \
+install (cargo add, bun add, npm install), verify the package name exists \
+with the verify_package tool — hallucinated package names are a real \
+supply-chain attack vector. Keep answers concise."
 }
 
 /// Same default without shell tools: `run_command` is not registered in
@@ -1512,7 +1570,8 @@ cannot do (pipes, builds, process control). Keep answers concise."
 fn default_system_prompt() -> &'static str {
     "You are tole, a careful personal assistant. Tool discipline: for anything \
 involving files, prefer the dedicated tools — read_file, write_file, \
-edit_file. Keep answers concise."
+edit_file. Before running any package install, verify the package name \
+exists with the verify_package tool. Keep answers concise."
 }
 
 /// The default prompt for the session's mode (issue #109). Plan mode
@@ -1559,8 +1618,14 @@ fn build_default_prompt(plan_mode: bool) -> String {
 /// scripts notice.
 fn report_outcome(session_id: &str, outcome: TurnOutcome) {
     match outcome {
-        TurnOutcome::Final { text } => {
+        TurnOutcome::Final { text, .. } => {
             println!("{text}");
+        }
+        TurnOutcome::StopGateBlocked { reason } => {
+            eprintln!(
+                "tole: stop gate blocked the turn: {reason} (resume with: tole resume {session_id})"
+            );
+            std::process::exit(6);
         }
         TurnOutcome::ApprovalRequired { name } => {
             eprintln!(

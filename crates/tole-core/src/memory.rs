@@ -161,6 +161,7 @@ pub fn remember_session(
     session_id: &str,
     first_prompt: &str,
     last_answer: &str,
+    wrote: bool,
 ) -> Result<String, String> {
     fn cap(s: &str, max: usize) -> String {
         let t = s.trim();
@@ -182,6 +183,14 @@ pub fn remember_session(
         // store even if the caps above change.
         return Err("remember content exceeds cap".into());
     }
+    // Issue #143: a session that executed a Write/Destructive tool is a
+    // decision record, not plain context — type and tag it accordingly so
+    // "every decision in this repo" is a first-class uteke retrieval.
+    let (mem_type, tags): (&str, &str) = if wrote {
+        ("decision", "tole,session,wrote")
+    } else {
+        ("context", "tole,session")
+    };
     let mut cmd = Command::new(&cfg.bin);
     crate::subprocess::scrub_env_for_child(&mut cmd);
     cmd.arg("remember")
@@ -189,9 +198,9 @@ pub fn remember_session(
         .arg("--namespace")
         .arg(&cfg.namespace)
         .arg("--type")
-        .arg("context")
+        .arg(mem_type)
         .arg("--tags")
-        .arg("tole,session")
+        .arg(tags)
         .arg("--source")
         .arg("tole-harness")
         .arg("--source-type")
@@ -345,13 +354,46 @@ mod tests {
             namespace: "repo-tole".into(),
             limit: 3,
         };
-        let out = remember_session(&cfg, "s-abc", "fix the jail", "done — tests added").unwrap();
+        let out =
+            remember_session(&cfg, "s-abc", "fix the jail", "done — tests added", false).unwrap();
         assert!(out.contains("id: mem-123"));
         let argv = std::fs::read_to_string(&log).unwrap();
         assert!(argv.contains("remember [tole session s-abc] fix the jail → done — tests added"));
         assert!(argv.contains("--namespace repo-tole"));
         assert!(argv.contains("--type context"));
         assert!(argv.contains("--tags tole,session"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_session_is_typed_decision_with_wrote_tag() {
+        let dir = std::env::temp_dir().join(format!("tole-mem-d-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("uteke");
+        let log = dir.join("argv.log");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\necho \"$@\" > {}\necho \"id: mem-456\"\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let cfg = MemoryConfig {
+            bin: bin.display().to_string(),
+            namespace: "repo-tole".into(),
+            limit: 3,
+        };
+        remember_session(&cfg, "s-def", "add the jail", "done", true).unwrap();
+        let argv = std::fs::read_to_string(&log).unwrap();
+        assert!(argv.contains("--type decision"));
+        assert!(argv.contains("--tags tole,session,wrote"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -377,7 +419,7 @@ mod tests {
             namespace: "repo-tole".into(),
             limit: 3,
         };
-        remember_session(&cfg, "s-abc", "multi\nline\nprompt", "answer").unwrap();
+        remember_session(&cfg, "s-abc", "multi\nline\nprompt", "answer", false).unwrap();
         let argv = std::fs::read_to_string(&log).unwrap();
         assert!(!argv.contains('\n') || argv.lines().count() == 1);
         assert!(argv.contains("multi line prompt"));

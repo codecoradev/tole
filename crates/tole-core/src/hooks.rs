@@ -46,6 +46,24 @@ impl ProcessHook {
         }
     }
 
+    /// Raw variant for turn-end gates (issue #145): returns the actual
+    /// exit code + stdout so the caller can apply the GATE semantics
+    /// (exit 0 = pass; ANY non-zero exit = deny with stdout as reason) —
+    /// unlike tool hooks, where only exit 2 denies and other failures
+    /// are non-blocking. A verification gate's nonzero exit IS its
+    /// verdict ("tests failing" exits 1, cargo exits 101), not a crash.
+    pub fn run_raw(&self, payload: &Value) -> Result<(i32, String), String> {
+        let mut cmd = Command::new(&self.program);
+        cmd.args(&self.args);
+        crate::subprocess::scrub_env_for_child(&mut cmd);
+        let out = run_with_timeout_stdin(&mut cmd, self.timeout, payload.to_string().as_bytes())?;
+        let mut stdout = out.stdout;
+        stdout.truncate(32 * 1024);
+        let stdout = String::from_utf8_lossy(&stdout).trim().to_string();
+        let code = out.status.code().unwrap_or(-1);
+        Ok((code, stdout))
+    }
+
     /// Run the hook. `Ok(None)` = allow/no-op; `Ok(Some(reason))` =
     /// deny (exit 2, pre-hooks only); `Err` = hook failure
     /// (non-blocking by contract — callers log and continue).
@@ -93,6 +111,11 @@ impl ProcessHook {
 pub struct ToolHooks {
     pub pre: Vec<ProcessHook>,
     pub post: Vec<ProcessHook>,
+    /// Turn-end gates (issue #145): fire when the provider produces the
+    /// final message, BEFORE it commits. Deny (exit 2) forces the loop to
+    /// continue — the model must satisfy the gate. Verification gates
+    /// legitimately run lint/tests, so these get a 30s timeout each.
+    pub turnend: Vec<ProcessHook>,
 }
 
 impl ToolHooks {
@@ -101,8 +124,22 @@ impl ToolHooks {
         Self {
             pre: pre.iter().map(|s| ProcessHook::new(s)).collect(),
             post: post.iter().map(|s| ProcessHook::new(s)).collect(),
+            turnend: Vec::new(),
         }
     }
+}
+
+/// Default per-hook timeout for turn-end gates: a verification gate that
+/// runs `cargo check` / lint legitimately needs more than the 5s tool
+/// budget; 30s is the documented #145 contract.
+pub const TURNEND_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Build a turn-end gate hook from a CLI command line (30s timeout).
+#[cfg(feature = "shell-tools")]
+pub fn turnend_hook(command_line: &str) -> ProcessHook {
+    let mut h = ProcessHook::new(command_line);
+    h.timeout = TURNEND_TIMEOUT;
+    h
 }
 
 #[cfg(test)]
