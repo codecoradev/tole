@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-10-02
+
 ### Added
 - `verify_package` tool (#144, ReadOnly): checks a package name against
   the crates.io / npm registry before any install — the slopsquatting
