@@ -135,6 +135,16 @@ struct Cli {
     #[arg(long, global = true)]
     trust: Vec<String>,
 
+    /// Load a SKILL.md file into the system prompt (issue #161). The
+    /// file must have YAML frontmatter with `name` matching its parent
+    /// directory (or just be a plain path). Repeatable.
+    #[arg(long, global = true)]
+    skill: Vec<PathBuf>,
+
+    /// Disable skills support (discovery + load_skill tool).
+    #[arg(long, global = true)]
+    no_skills: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -312,6 +322,8 @@ fn dispatch(cli: Cli) -> Result<()> {
     // silently ignored by those subcommands).
     let host = HostConfig {
         workspace: cli.workspace.clone(),
+        skills: cli.skill.clone(),
+        no_skills: cli.no_skills,
         #[cfg(feature = "mcp")]
         mcp_server: mcp_specs,
         plan_mode: cli.plan_mode,
@@ -505,6 +517,10 @@ fn dispatch(cli: Cli) -> Result<()> {
 /// signatures stop growing with every feature.
 struct HostConfig {
     workspace: Option<String>,
+    /// Issue #161: explicit --skill files (loaded into the system prompt)
+    skills: Vec<PathBuf>,
+    /// Issue #161: --no-skills disables skills discovery + load_skill.
+    no_skills: bool,
     #[cfg(feature = "mcp")]
     mcp_server: Vec<String>,
     /// Plan mode (issue #109): registry filtered to ReadOnly tools.
@@ -986,6 +1002,44 @@ fn mcp_server_command(
 // Commands
 // ---------------------------------------------------------------------------
 
+/// Skills wiring (issue #161): shared by run/chat/serve. Loads `--skill`
+/// files (loud error on broken ones), and when the workspace exposes a
+/// non-empty skills dir, registers the ReadOnly load_skill tool and
+/// returns the index/section block to append to the system prompt.
+/// `--no-skills` short-circuits everything.
+fn apply_skills(
+    skills: &[PathBuf],
+    workspace: Option<&String>,
+    no_skills: bool,
+    registry: &mut ToolRegistry,
+) -> Result<String> {
+    let mut sections = String::new();
+    if no_skills {
+        return Ok(sections);
+    }
+    let ws_path = workspace.map(PathBuf::from);
+    for path in skills {
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("--skill {}: {e}", path.display()))?;
+        let name = path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("skill")
+            .to_string();
+        let skill = tole_core::skills::parse_skill(&content, &name)
+            .map_err(|e| anyhow::anyhow!("--skill {}: {e}", path.display()))?;
+        sections.push_str(&format!("\n\n# Skill: {}\n{}", skill.name, skill.body));
+    }
+    if !tole_core::skills::available_skills(ws_path.as_deref()).is_empty() {
+        sections.push_str(&tole_core::skills::index_block(ws_path.as_deref()));
+        registry
+            .register(Box::new(tole_core::skills::LoadSkillTool::new(ws_path)))
+            .map_err(|e| anyhow::anyhow!("registering load_skill: {e}"))?;
+    }
+    Ok(sections)
+}
+
 fn run_command(
     sessions_dir: &Path,
     prompt: &str,
@@ -1022,6 +1076,13 @@ fn run_command(
     if host.plan_mode {
         registry.retain_read_only();
     }
+    // Skills (issue #161): --skill files + discovery; load_skill registers ReadOnly.
+    let skill_sections = apply_skills(
+        &host.skills,
+        host.workspace.as_ref(),
+        host.no_skills,
+        &mut registry,
+    )?;
     // Opt-in tool-boundary hooks (issue #110): deny-only policy
     // injection for Write/Destructive calls, default OFF.
     #[cfg(feature = "shell-tools")]
@@ -1042,6 +1103,8 @@ fn run_command(
         .map(str::to_string)
         .or_else(resolve_system_prompt)
         .or_else(|| Some(build_default_prompt(host.plan_mode)));
+    // Skills (issue #161): skill sections append after the base prompt.
+    let system_prompt = system_prompt.map(|p| format!("{p}{skill_sections}"));
     let mut storage =
         JsonlStorage::create_with(sessions_dir, &session_id, None, system_prompt.as_deref())
             .with_context(|| format!("creating session {session_id}"))?;
@@ -1112,6 +1175,13 @@ fn resume_command(
     if host.plan_mode {
         registry.retain_read_only();
     }
+    // Skills (issue #161): --skill files + discovery; load_skill registers ReadOnly.
+    let _skill_sections = apply_skills(
+        &host.skills,
+        host.workspace.as_ref(),
+        host.no_skills,
+        &mut registry,
+    )?;
     // Opt-in tool-boundary hooks (issue #110): deny-only policy
     // injection for Write/Destructive calls, default OFF.
     #[cfg(feature = "shell-tools")]
@@ -1398,6 +1468,13 @@ fn chat_command(
     if host.plan_mode {
         registry.retain_read_only();
     }
+    // Skills (issue #161): --skill files + discovery; load_skill registers ReadOnly.
+    let skill_sections = apply_skills(
+        &host.skills,
+        host.workspace.as_ref(),
+        host.no_skills,
+        &mut registry,
+    )?;
     // Opt-in tool-boundary hooks (issue #110): deny-only policy
     // injection for Write/Destructive calls, default OFF.
     #[cfg(feature = "shell-tools")]
@@ -1421,6 +1498,8 @@ fn chat_command(
             .map(str::to_string)
             .or_else(resolve_system_prompt)
             .or_else(|| Some(build_default_prompt(host.plan_mode)));
+        // Skills (issue #161): sections append after the base prompt.
+        let system_prompt = system_prompt.map(|p| format!("{p}{skill_sections}"));
         JsonlStorage::create_with(sessions_dir, &session_id, None, system_prompt.as_deref())
             .with_context(|| format!("creating session {session_id}"))?
     } else {
@@ -2038,5 +2117,60 @@ mod trust_preset_tests {
             &["uteke_*".to_string(), "cora_search".to_string()],
         );
         assert_eq!(out, vec!["write_file", "uteke_*", "cora_search"]);
+    }
+}
+
+#[cfg(test)]
+mod skills_wiring_tests {
+    use super::*;
+
+    #[test]
+    fn apply_skills_loads_explicit_skill_files_and_registers_tool() {
+        let dir = std::env::temp_dir().join(format!("tole-skills-wire-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("skills").join("demo")).unwrap();
+        std::fs::write(
+            dir.join("skills").join("demo").join("SKILL.md"),
+            "---\nname: demo\ndescription: \"d\"\n---\nbody",
+        )
+        .unwrap();
+        let mut reg = ToolRegistry::new();
+        let skill_file = dir.join("skills").join("demo").join("SKILL.md");
+        let sections = apply_skills(
+            &[skill_file],
+            Some(&dir.to_string_lossy().to_string()),
+            false,
+            &mut reg,
+        )
+        .unwrap();
+        assert!(sections.contains("# Skill: demo"));
+        assert!(sections.contains("body"));
+        assert!(reg.get("load_skill").is_some(), "load_skill registered");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_skills_no_skills_short_circuits() {
+        let dir = std::env::temp_dir().join(format!("tole-skills-off-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("skills").join("demo")).unwrap();
+        std::fs::write(
+            dir.join("skills").join("demo").join("SKILL.md"),
+            "---\nname: demo\ndescription: \"d\"\n---\nbody",
+        )
+        .unwrap();
+        let mut reg = ToolRegistry::new();
+        let sections = apply_skills(
+            &[],
+            Some(&dir.to_string_lossy().to_string()),
+            true,
+            &mut reg,
+        )
+        .unwrap();
+        assert!(sections.is_empty());
+        assert!(
+            reg.get("load_skill").is_none(),
+            "--no-skills must not register"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
