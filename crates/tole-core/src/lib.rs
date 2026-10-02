@@ -57,6 +57,7 @@ pub mod register;
 pub mod replay;
 #[cfg(feature = "shell-tools")]
 pub mod run_command;
+pub mod skills;
 pub mod state;
 pub mod storage;
 #[cfg(feature = "shell-tools")]
