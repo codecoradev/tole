@@ -58,6 +58,8 @@ cargo install tole-cli        # the `tole` binary from crates.io
 # or build from source:
 git clone https://github.com/codecoradev/tole && cd tole
 cargo build --release -p tole-cli && ./target/release/tole --help
+# `tole serve --transport mcp` needs the opt-in HTTP feature:
+cargo build --release -p tole-cli --features mcp-http
 ```
 
 ## Quickstart
@@ -108,6 +110,8 @@ trust: `internal` / `read_only`), `--skill <path>` (load a SKILL.md),
 | `git` | Write | `status` / `diff` / `add` / `commit` only — **push stays human** |
 | `gh` | Write | read-only ops, argv-validated per op; `--repo` is fixed at registration (currently `codecoradev/tole`) — per-repo wiring is a known gap |
 | `run_command` | Write | argv-split (no shell), cwd-jailed, timeout + output cap |
+| `verify_package` | RO | crates.io / npm registry check before any install — hallucinated names get NOT FOUND + candidates, edit-distance-1 candidates get a typo-squat warning |
+| `load_skill` | RO | loads a discovered SKILL.md on demand (`--skill` pins one upfront; `--no-skills` disables) |
 | `job_start`, `job_poll` | Write / RO | detached long-running jobs with log tailing |
 | `cora_search` | RO | hybrid codebase search via `cora brain`; native fallback — skipped when the cora MCP surface is attached |
 | `uteke_recall`, `uteke_document` | RO / Write | semantic memory recall / markdown → room |

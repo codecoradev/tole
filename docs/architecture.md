@@ -14,19 +14,25 @@
 
 ```mermaid
 graph TD
-    subgraph Hosts
-        CLI["tole-cli<br/>(thin bin: stdin/stdout,<br/>y/N prompt, config)"]
-        FFI["tole-ffi<br/>(future: flutter_rust_bridge)"]
+    subgraph Hosts (tole-cli bin)
+        CLI["run / chat / resume<br/>(y/N prompt, config)"]
+        MCP["tole mcp<br/>(MCP server over stdio)"]
+        ACP["tole acp<br/>(ACP agent over stdio)"]
+        SERVE["tole serve<br/>(REST + MCP-over-HTTP daemon)"]
     end
+    HOSTLIB["tole-cli lib<br/>(approver, session_host,<br/>session_tools, tools)"]
     CORE["tole-core<br/>(pure platform-agnostic lib)"]
     DB[("JSONL<br/>session file (append-only)")]
-    CLI -->|depends on| CORE
-    FFI -.->|future| CORE
+    CLI --> HOSTLIB
+    MCP --> HOSTLIB
+    ACP --> HOSTLIB
+    SERVE --> HOSTLIB
+    HOSTLIB -->|depends on| CORE
     CORE -->|append / replay| DB
 ```
 
 - **tole-core** — platform-agnostic library. No stdin/stdout/CLI assumptions. All host interactions (approval prompt, output streaming) go through trait boundaries (`Approver`, etc.).
-- **tole-cli** — thin host binary: parse config, wire up `InteractiveApprover` (y/N prompt on the host), run the turn loop from core.
+- **tole-cli** — one binary, four faces sharing the `session_host` machinery (durable JSONL session open/turn, busy-serialization, id validation): the CLI (`run`/`chat`/`resume`, interactive y/N approver), `tole mcp` (tool server; allowlist approver, Destructive structurally absent), `tole acp` (editor agent; approvals become `session/request_permission`), and `tole serve` (token-authenticated REST daemon; `--transport mcp` serves multi-session MCP over Streamable HTTP — one connection, N sessions routed by `session_id`; needs the `mcp-http` feature).
 - **tole-ffi** (future) — FFI binding for embedding in Corin / Flutter.
 
 ## 3. Module Responsibility
@@ -40,7 +46,13 @@ graph TD
 | Tools | `tool.rs` | `Tool` trait with `Risk` tiers: `ReadOnly` / `Write` / `Destructive`; registry & dispatch |
 | Approval | `approval.rs` | `Approver` trait; impls `AllowlistApprover` (config-driven, lives in core) + `InteractiveApprover` (y/N prompt — in the **host**, not core) |
 | Provider | `provider.rs` | Thin `Provider` trait (LLM call abstraction). Phase 1: hand-rolled impl. Phase 2: evaluate `rig` (MIT) — if adopted, wrapped inside this single module boundary only |
-| Session/orchestrator | (session) | Single-threaded turn loop; coordinates the state machine, effect sandwich, tool dispatch |
+| Session/orchestrator | `turn.rs` | Single-threaded turn loop; coordinates the state machine, effect sandwich, tool dispatch; loop/budget guards, stop gates |
+| Hooks | `hooks.rs` | Opt-in process hooks (`--on-pretool`/`--on-posttool` deny-only; `--on-turnend` stop gates, 3-denial cap) |
+| Memory loop | `memory.rs` | Host-initiated uteke recall injection + settle-summary store (`--memory uteke` / `TOLE_MEMORY`), decision typing |
+| Skills | `skills.rs` | SKILL.md parsing/loading (`--skill`, discovery, the `load_skill` tool) |
+| Registry MCP view | `mcp_server.rs` | `RegistryServer`: serves the registry over MCP incl. multi-session `session_id` routing + the 2+ session ambiguity refusal |
+| Session host | `tole-cli: session_host.rs` | Shared open/turn machinery for acp/serve/mcp sessions: per-session jail + approver, busy-flag serialization, `--sessions-dir` override |
+| Ecosystem tools | `cora_search.rs`, `uteke.rs`, `verify_package.rs`, `git.rs`, `gh.rs`, `jobs.rs`, `run_command.rs` | Probe-gated integrations (missing binary ⇒ warning, no phantom tool), argv-validated git/gh, detached jobs, registry pre-install checks |
 
 ## 4. Data Model — Storage Backends
 

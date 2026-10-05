@@ -66,9 +66,59 @@ lives) / **gap** (tracked) / **N/A** (with rationale).
 - Per-call Destructive classification heuristics (from RC-1) — needs a
   design discussion before code.
 - MCP (#74, SHIPPED): stdio client live; trust-model extensions applied
-  (metadata never trusted for risk, scrubbed env, fenced results).
-  Remaining MCP surface: HTTP/SSE transport, server auth, resource
-  subscriptions — each re-opens this document.
+  (metadata never trusted for risk, scrubbed env, fenced results). The
+  former "remaining surface" items shipped: HTTP transport + server auth
+  are `tole serve --transport mcp` (#96/#137, hardened in #136) — see the
+  Server surfaces section below. Resource subscriptions remain unshipped;
+  that would re-open this document.
+
+## Server surfaces — `tole serve`, `tole mcp`, `tole acp` (#94–#96, #137)
+
+All three faces share one rule set: non-interactive hosts never gain
+interactive powers. Concretely: `Destructive` registration is refused
+behind a non-interactive approver (structurally absent from `tole mcp`
+and serve; ACP is the exception by design — its approvals are genuine
+per-call human decisions routed to the editor, so `delete_file` may
+register there). The daemon adds: mandatory bearer token (refuses to
+start without one), per-IP auth-failure rate limiting, a connection
+cap, IO timeouts, and the **jail-of-jails** — a client-supplied session
+cwd must canonicalize inside the server workspace root (default the
+server cwd, `--workspace` override), or a remote client could jail a
+session to `/`. Multi-session MCP routing strips the `session_id` key
+before the tool sees its arguments, and a no-id registry call with 2+
+open sessions is refused (the #138-documented ambiguity refusal,
+implemented 2026-10-05) rather than silently executing against the
+server-level registry.
+
+## Skills loading (#161/#162)
+
+SKILL.md files are operator-supplied prompt content, loaded into the
+system prompt (`--skill`) or served on demand via the ReadOnly
+`load_skill` tool (discovery index only — name + description — until
+loaded). The surface is the same as `--system`: whoever controls the
+workspace `skills/` dir or `~/.codecora/tole/skills/` controls prompt
+content; discovery from a compromised repo is prompt injection by
+another name. Frontmatter is validated loudly (name/dir mismatch is a
+hard error) and bodies are capped (16 KiB) — but content itself is
+trusted by definition, same tier as the system prompt.
+
+## verify_package (#144)
+
+The ReadOnly registry check before any install answers the
+slopsquatting class: hallucinated names surface NOT FOUND with registry
+candidates, one-character candidates carry a typo-squat warning, and
+registry 429/5xx report `rate_limited` honestly (never "not found").
+It is advisory to the model — installs still go through the normal
+approval gate (`run_command` Write tier).
+
+## Trust presets (#160, env fixed in #166)
+
+`--trust` / `TOLE_TRUST` presets are pure sugar over `--allow` globs —
+they widen nothing structurally: Destructive is never auto-allowed,
+write-capable native tools keep prompting under `internal`, and unknown
+preset names (flag or env) fail loudly. A typo'd env value breaks every
+invocation with a clear error — deliberately, per the
+typo-silently-narrowing-trust rule.
 
 ## Memory loop — decision typing (#143)
 
