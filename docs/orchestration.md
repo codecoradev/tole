@@ -91,7 +91,9 @@ the producers — a fresh session sees the artifacts, not the rationalizations.
   `job_start`/`job_poll` inside the worker session — not in a bigger timeout.
 - **Policy per worker:** `--allow` pre-authorizes Writes per worker;
   `--plan-mode` removes mutation tools from the wire entirely;
-  `--on-pretool` scripts enforce org-specific policy without recompiling.
+  `--on-pretool` scripts enforce org-specific policy without recompiling
+  (CLI workers — `run`/`chat`/`resume`; the serve/acp/mcp faces refuse
+  pre/post hooks loudly, and take `--on-turnend` stop gates instead).
 - **Cost discipline:** fan-out multiplies token spend roughly by N. Budget
   per task, not per worker; promote a topology to default only with measured
   numbers (see `evals/` for how to measure).

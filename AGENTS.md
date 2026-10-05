@@ -118,12 +118,18 @@ that makes them stale. This regression has happened twice (#33 and again
 
 ## 8. Infra facts (verified only, with dates)
 
+- **2026-10-05:** cora auth is re-provisioned (`cora review --staged`
+  returns a real verdict with NO `CORA_*` exports in the environment —
+  verified across PRs #164/#166). The 2026-09-18 export requirement is
+  obsolete.
+- **2026-10-05:** both `tole-core` and `tole-cli` are on crates.io at
+  **0.5.0** (checked via the crates.io API). Registry parity with the
+  checkout is current as of this date; live missions still run the
+  freshly built `./target/release/tole` (see CONTRIBUTING →
+  Live-mission binary hygiene). Note `cargo install tole-cli` does NOT
+  include the `mcp-http` feature — `tole serve --transport mcp` needs a
+  source build with `--features mcp-http`.
 - **2026-09-18:** cora 0.13.0 no longer reads the legacy `~/.cora/auth.toml`
   / `~/.cora/config.yaml`. Until re-provisioned with `cora auth login`,
   exports are required: `CORA_API_KEY`, `CORA_BASE_URL`, `CORA_MODEL`
-  (verified working — review returns a real verdict with these three set).
-- **2026-09-12:** only `tole-core` was on crates.io; as of the 0.3.0
-  releases **both** `tole-core` and `tole-cli` (0.3.0) are published. The
-  registry copy still lags the checkout — live missions run the freshly
-  built `./target/release/tole` (see CONTRIBUTING → Live-mission binary
-  hygiene).
+  (superseded by the 2026-10-05 note above).

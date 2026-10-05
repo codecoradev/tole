@@ -119,6 +119,9 @@ behavior that was already fixed). Before any live validation or mission run:
   one: `cargo build --release -p tole-cli && ./target/release/tole ...`.
   Both `tole-core` and `tole-cli` are published to crates.io, but the
   registry copy lags your checkout.
+- Missions touching `tole serve --transport mcp` need the opt-in HTTP
+  feature: `cargo build --release -p tole-cli --features mcp-http` (the
+  plain build fails fast with a clear error on that transport).
 - If a `~/.cargo/bin/tole` shim is installed, re-sync it after every version
   bump: `cp target/release/tole ~/.cargo/bin/tole` — verify with
   `tole --version` matching the workspace version in `Cargo.toml`.

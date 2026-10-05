@@ -1,11 +1,15 @@
 # tole — Epics & Roadmap (v1.1, chat-first replan)
 
 > Ground truth: Phase 1a/1b/2 complete (E1–E8, E10–E12, E4.5, gh read ops,
-> TOLE_* env). 114/114 tests, CI 12/12. Replan 2026-08-27: chat-first
-> direction per PRD v1.1 §0 Identity.
-> Status sync 2026-09-18 (v0.3.0): Track A (A1–A2) and Track B (B1–B4) are
-> **complete** — code is authoritative over this doc. Track C (E9) in
-> progress; MCP client shipped ahead of schedule (#74).
+> TOLE_* env). Replan 2026-08-27: chat-first direction per PRD v1.1 §0
+> Identity.
+> Status sync 2026-09-18 (v0.3.0): Track A (A1–A2) and Track B (B1–B4)
+> **complete**; MCP client shipped ahead of schedule (#74).
+> Status sync 2026-10-05 (v0.5.0 on crates.io): Tracks C and D
+> **complete** (E9 closed 2026-09-28; D1–D3 all shipped — D1 in v0.4.0,
+> D2 2026-09-18, D3 2026-09-28). Post-D3 work is shipped too (see the
+> Post-D3 section). 298/298 workspace tests, CI green. Code is
+> authoritative over this doc.
 
 ## Identity recap (PRD v1.1)
 
@@ -115,7 +119,7 @@ thresholds + docs/perf.md, LICENSE/README/SECURITY public-ready (#79,
 tole-core gains three hosts beyond the CLI, in build order (each reuses the
 previous layer):
 
-### D1 — `tole mcp`: MCP server over stdio (issue #94)
+### D1 — `tole mcp`: MCP server over stdio (issue #94) — ✅ DONE (v0.4.0)
 Expose the registry's hardened tools via rmcp's server side. ReadOnly tools
 always callable; Write needs `--allow`; Destructive structurally absent.
 Est: S–M.
@@ -132,11 +136,39 @@ routing via `session_id`. Est: M–L.
 
 ---
 
+## Post-D3 — shipped on develop (synced 2026-10-05)
+
+Everything below is merged; CHANGELOG entries carry the detail.
+
+- **v0.4.0:** harness memory loop (`--memory uteke` / `TOLE_MEMORY`),
+  cora MCP auto-preset (`--no-auto-mcp` opt-out), write_file wire-schema
+  fix, 2026-09-18 CodeCora scan triage fixes, serve hardening Wave 2
+  (#136: connection cap, auth rate-limit, IO timeouts).
+- **v0.5.0 (2026-10-02):** `verify_package` (#144, the slopsquatting
+  defense), turn-end stop gates `--on-turnend` (#145), memory-loop
+  decision typing (#143), multi-session MCP-over-HTTP (#137/#138),
+  ACP scan minors (#156).
+- **Post-0.5.0:** `--trust` presets (#160), SKILL.md support
+  (`--skill` + discovery + `load_skill`, #161/#162).
+- **2026-10-05 sweep fixes (#163/#164):** loud refusals for
+  client-session-only flags on the server faces; `--sessions-dir`
+  honored by serve/acp; `--workspace` honored by `serve --transport
+  mcp`; `--on-turnend` wired into serve/acp; the #138 ambiguity
+  refusal implemented; skills discovery defaults to cwd.
+- **2026-10-05 activation fix (#165/#166):** `TOLE_TRUST` env actually
+  read (was documented but unimplemented).
+
+Known open follow-up: `cargo install tole-cli` does not include the
+`mcp-http` feature — `tole serve --transport mcp` needs a source build
+with `--features mcp-http` (clean error at startup otherwise).
+
+---
+
 ## Execution order
 
 ```
-A1 → A2 → B1 → B2 → B3 → B4 → Track C → D1 → D2 → D3
-                                   ↑ all of Track A/B done; C in progress
+A1 → A2 → B1 → B2 → B3 → B4 → Track C → D1 → D2 → D3 → Post-D3
+                         ↑ all tracks done; see the Post-D3 section
 ```
 
 A-track first: small, closes the coding-lite promises and unblocks headless
