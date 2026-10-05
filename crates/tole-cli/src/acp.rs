@@ -36,11 +36,102 @@ use tole_cli::approver::{InteractiveApprover, PromptFn};
 use tole_cli::session_host::{
     lock_sessions, new_session_id, open_session, run_session_turn, validate_session_id, Sessions,
 };
+use tole_core::storage::Storage;
 
 const ACP_PROTOCOL_VERSION: u32 = 1;
 /// Permission requests can sit in an editor until a human clicks; do not
 /// turn that into a timeout race.
 const PERMISSION_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Durable per-session model override (issue #176): a `fact/model`
+/// register write. Registers are the sanctioned append-only mutable
+/// state, so the override survives `session/load` in a fresh process
+/// and `run_session_turn` (shared with `tole serve`) applies it when
+/// building the provider.
+const MODEL_REGISTER: (&str, &str) = ("fact", "model");
+
+// ---------------------------------------------------------------------------
+// Model picker: ACP session config options (issue #176)
+// ---------------------------------------------------------------------------
+
+/// Parse the `TOLE_MODELS` env into the advertised model list: comma
+/// separated, trimmed, empties dropped, duplicates collapsed, order kept.
+/// Empty result = no picker advertised (today's behavior).
+pub(crate) fn parse_model_list(env_val: Option<&str>) -> Vec<String> {
+    let Some(raw) = env_val else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for id in raw.split(',') {
+        let id = id.trim();
+        if !id.is_empty() && !out.iter().any(|m| m == id) {
+            out.push(id.to_string());
+        }
+    }
+    out
+}
+
+/// The full advertised option list: the `TOLE_MODELS` entries plus the
+/// session's current model (prepended when missing — the spec requires
+/// `currentValue` to be one of the options so the picker can render it).
+fn advertised_models(current: &str, models: &[String]) -> Vec<String> {
+    if current.is_empty() || models.iter().any(|m| m == current) {
+        models.to_vec()
+    } else {
+        let mut all = vec![current.to_string()];
+        all.extend(models.iter().cloned());
+        all
+    }
+}
+
+/// Build the `configOptions` entry for the model picker, or `None` when
+/// there is nothing to advertise (no `TOLE_MODELS` configured).
+/// Wire shape per the ACP session-config-options spec: a `select`-kind
+/// option with `category: "model"` — Termul/Zed render it as the model
+/// dropdown. Select-only: boolean options additionally require the
+/// client's `session.configOptions.boolean` capability, which tole does
+/// not probe.
+pub(crate) fn model_config_option(current: &str, models: &[String]) -> Option<Value> {
+    if models.is_empty() {
+        return None;
+    }
+    let all = advertised_models(current, models);
+    Some(json!({
+        "id": "model",
+        "name": "Model",
+        "category": "model",
+        "type": "select",
+        "currentValue": current,
+        "options": all
+            .iter()
+            .map(|m| json!({"value": m, "name": m}))
+            .collect::<Vec<_>>(),
+    }))
+}
+
+/// The full `configOptions` response array for a session: the model
+/// picker when configured. `current` is the effective model — the
+/// durable register override when set, else the env default, else the
+/// first advertised entry.
+fn config_options_for(current: &str, models: &[String]) -> Option<Vec<Value>> {
+    let mut current = current.to_string();
+    if current.is_empty() {
+        current = models.first()?.clone();
+    }
+    model_config_option(&current, models).map(|o| vec![o])
+}
+
+/// Read the durable model override from a session's storage.
+fn session_model_override(
+    storage: &Arc<Mutex<tole_core::storage::JsonlStorage>>,
+) -> Option<String> {
+    let storage = storage.lock().unwrap_or_else(|p| p.into_inner());
+    storage
+        .get_register(MODEL_REGISTER.0, MODEL_REGISTER.1)
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
 
 // ---------------------------------------------------------------------------
 // Connection: outgoing lines + response routing
@@ -254,6 +345,13 @@ pub fn run_acp(
     // permission routing while prompts run.
     let sessions: tole_cli::session_host::SharedSessions =
         Arc::new(Mutex::new(Sessions::default()));
+    // Advertised model list (issue #176): static for the process
+    // lifetime — env cannot change under a running agent.
+    let models = parse_model_list(std::env::var("TOLE_MODELS").ok().as_deref());
+    let env_model = std::env::var("TOLE_MODEL")
+        .ok()
+        .or_else(|| std::env::var("OPENAI_MODEL").ok())
+        .filter(|m| !m.trim().is_empty());
     let stdin = std::io::stdin();
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
@@ -290,6 +388,10 @@ pub fn run_acp(
                         "agentCapabilities": {
                             "loadSession": true,
                             "promptCapabilities": {},
+                        },
+                        "agentInfo": {
+                            "name": "tole",
+                            "version": env!("CARGO_PKG_VERSION"),
                         },
                         "authMethods": [],
                     }),
@@ -361,8 +463,20 @@ pub fn run_acp(
                             reply_error(&conn, id, "session became busy while opening — retry");
                             continue;
                         }
+                        // Model picker state (issue #176): the durable
+                        // register override wins, else the env default,
+                        // else the first advertised entry. Read BEFORE
+                        // the state moves into the session map.
+                        let model_override = session_model_override(&state.storage);
                         sessions.map.insert(session_id.clone(), state);
-                        reply(&conn, id, json!({ "sessionId": session_id }));
+                        let current = model_override
+                            .or_else(|| env_model.clone())
+                            .unwrap_or_default();
+                        let mut result = json!({ "sessionId": session_id });
+                        if let Some(opts) = config_options_for(&current, &models) {
+                            result["configOptions"] = Value::Array(opts);
+                        }
+                        reply(&conn, id, result);
                     }
                     Err(e) => reply_error(&conn, id, &e),
                 }
@@ -423,6 +537,9 @@ pub fn run_acp(
                     }
                 });
             }
+            "session/set_config_option" => {
+                set_config_option(&conn, id, &sessions, &params, &models, env_model.as_deref());
+            }
             other => {
                 if id.is_some() {
                     reply_error(&conn, id, &format!("method not supported: {other}"));
@@ -431,6 +548,95 @@ pub fn run_acp(
         }
     }
     Ok(())
+}
+
+/// `session/set_config_option` (issue #176): the client picked a new
+/// value for a config option. Only the `model` select exists today.
+///
+/// The spec allows setting while a turn is generating; tole refuses it
+/// instead. The reader loop would otherwise block on the storage mutex
+/// the running turn holds — exactly the permission-routing deadlock
+/// class the CodeCora scan removed — for a change that could only apply
+/// to the NEXT turn anyway (the provider is built once per turn).
+/// Clients retry after the turn settles.
+fn set_config_option(
+    conn: &Conn,
+    id: Option<Value>,
+    sessions: &tole_cli::session_host::SharedSessions,
+    params: &Value,
+    models: &[String],
+    env_model: Option<&str>,
+) {
+    let Some(session_id) = params.get("sessionId").and_then(Value::as_str) else {
+        reply_error(conn, id, "session/set_config_option: missing sessionId");
+        return;
+    };
+    let Some(config_id) = params.get("configId").and_then(Value::as_str) else {
+        reply_error(conn, id, "session/set_config_option: missing configId");
+        return;
+    };
+    if config_id != "model" {
+        reply_error(
+            conn,
+            id,
+            &format!("session/set_config_option: unknown configId: {config_id}"),
+        );
+        return;
+    }
+    let Some(value) = params.get("value").and_then(Value::as_str) else {
+        reply_error(conn, id, "session/set_config_option: missing value");
+        return;
+    };
+
+    let env_current = env_model.unwrap_or_default();
+    // Validate against exactly what this session advertises (including
+    // the prepended env default): a value outside the list would break
+    // the picker's currentValue ∈ options invariant.
+    if !advertised_models(env_current, models)
+        .iter()
+        .any(|m| m == value)
+    {
+        reply_error(
+            conn,
+            id,
+            &format!("session/set_config_option: unknown model value: {value}"),
+        );
+        return;
+    }
+
+    // Busy-check BEFORE touching the storage mutex: a running turn holds
+    // the storage lock for its whole duration, and this handler runs on
+    // the reader thread that routes permission requests.
+    {
+        let sessions = lock_sessions(sessions);
+        let Some(state) = sessions.map.get(session_id) else {
+            reply_error(conn, id, &format!("unknown session: {session_id}"));
+            return;
+        };
+        if *state.busy.lock().expect("busy lock") {
+            reply_error(conn, id, "session is busy running a turn");
+            return;
+        }
+        // Durable write (append-only register entry), replayed by
+        // session/load and honored by run_session_turn on every turn.
+        let mut storage = state.storage.lock().unwrap_or_else(|p| p.into_inner());
+        let commit =
+            tole_core::storage::Commit::new().register(tole_core::register::RegisterWrite::set(
+                MODEL_REGISTER.0,
+                MODEL_REGISTER.1,
+                json!(value),
+            ));
+        if let Err(e) = storage.commit(commit) {
+            reply_error(conn, id, &format!("storing model override: {e}"));
+            return;
+        }
+    }
+    let current = value.to_string();
+    let mut result = json!({});
+    if let Some(opts) = config_options_for(&current, models) {
+        result["configOptions"] = Value::Array(opts);
+    }
+    reply(conn, id, result);
 }
 
 fn reply(conn: &Conn, id: Option<Value>, result: Value) {
@@ -444,4 +650,69 @@ fn reply_error(conn: &Conn, id: Option<Value>, message: &str) {
         &json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32603, "message": message}})
             .to_string(),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_list_unset_or_empty_advertises_nothing() {
+        assert!(parse_model_list(None).is_empty());
+        assert!(parse_model_list(Some("")).is_empty());
+        assert!(parse_model_list(Some("  , , ")).is_empty());
+    }
+
+    #[test]
+    fn model_list_trims_dedupes_keeps_order() {
+        assert_eq!(
+            parse_model_list(Some(
+                " glm/glm-5.3-flash , glm/glm-5.3 , glm/glm-5.3-flash "
+            )),
+            vec!["glm/glm-5.3-flash", "glm/glm-5.3"]
+        );
+    }
+
+    #[test]
+    fn config_option_none_without_models() {
+        assert!(model_config_option("m", &[]).is_none());
+        assert!(config_options_for("m", &[]).is_none());
+    }
+
+    #[test]
+    fn config_option_wire_shape_matches_spec() {
+        let o = model_config_option("model-a", &["model-a".into(), "model-b".into()])
+            .expect("advertised");
+        assert_eq!(o["id"], "model");
+        assert_eq!(o["name"], "Model");
+        assert_eq!(o["category"], "model");
+        assert_eq!(o["type"], "select");
+        assert_eq!(o["currentValue"], "model-a");
+        assert_eq!(
+            o["options"],
+            json!([
+                {"value": "model-a", "name": "model-a"},
+                {"value": "model-b", "name": "model-b"},
+            ])
+        );
+    }
+
+    #[test]
+    fn config_option_prepends_current_when_missing_from_list() {
+        // The spec requires currentValue ∈ options; the env default (or a
+        // stale override after an env change) must therefore be prepended.
+        let o = model_config_option("model-z", &["model-a".into()]).expect("advertised");
+        assert_eq!(o["currentValue"], "model-z");
+        assert_eq!(
+            o["options"][0],
+            json!({"value": "model-z", "name": "model-z"})
+        );
+        assert_eq!(o["options"].as_array().expect("options").len(), 2);
+    }
+
+    #[test]
+    fn config_options_empty_current_falls_back_to_first_advertised() {
+        let opts = config_options_for("", &["model-a".into(), "model-b".into()]).expect("opts");
+        assert_eq!(opts[0]["currentValue"], "model-a");
+    }
 }
