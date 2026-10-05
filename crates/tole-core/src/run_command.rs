@@ -25,11 +25,23 @@ use std::process::Command;
 pub struct RunCommandTool {
     /// Jail directory (the session cwd).
     pub cwd: PathBuf,
+    /// Child-agent mode (#171): additionally refuse spawning the tole
+    /// binary itself — a child session bypassing the depth cap via
+    /// run_command is the verified escape hatch (2026-10-05).
+    pub child_agent_mode: bool,
 }
 
 impl RunCommandTool {
     pub fn new(cwd: PathBuf) -> Self {
-        Self { cwd }
+        Self {
+            cwd,
+            child_agent_mode: false,
+        }
+    }
+
+    pub fn in_child_agent_mode(mut self) -> Self {
+        self.child_agent_mode = true;
+        self
     }
 
     /// Split a command line into argv (shlex-compatible subset). Public
@@ -162,6 +174,9 @@ impl Tool for RunCommandTool {
         // RC-1 (threat model): destructive argv refused pre-spawn, via
         // the shared helper (also applied by job_start).
         crate::subprocess::check_destructive_argv(&argv)?;
+        if self.child_agent_mode {
+            crate::agents::check_child_agent_argv(&argv)?;
+        }
         let mut cmd = Command::new(program);
         // Secret env never reaches children (threat-model ENV-1).
         crate::subprocess::scrub_env_for_child(&mut cmd);

@@ -98,6 +98,13 @@ struct Cli {
     #[arg(long, global = true)]
     plan_mode: bool,
 
+    /// Child agents (#171): PARENT-ONLY operator mode — spawned child
+    /// agents each get their own git worktree + branch. Default OFF;
+    /// the model cannot flip this per call (worktrees stay bounded by
+    /// the child cap; merge-back stays human). Applies to run/chat/resume.
+    #[arg(long, global = true)]
+    agents_worktree: bool,
+
     /// Pre-tool-use process hook (issue #110): runs before every
     /// Write/Destructive tool executes. Receives one JSON object on
     /// stdin (`{"event":"pretool","tool":...,"input":...}`); exit code
@@ -339,6 +346,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         #[cfg(feature = "mcp")]
         mcp_server: mcp_specs,
         plan_mode: cli.plan_mode,
+        agents_worktree: cli.agents_worktree,
 
         on_pretool: cli.on_pretool.clone(),
         on_posttool: cli.on_posttool.clone(),
@@ -570,6 +578,10 @@ struct HostConfig {
     mcp_server: Vec<String>,
     /// Plan mode (issue #109): registry filtered to ReadOnly tools.
     plan_mode: bool,
+    /// Child agents (#171): PARENT-ONLY operator mode — children spawn
+    /// into per-child git worktrees. Default false; the model cannot
+    /// flip this per call (storage boomerang, owner decision 2026-10-05).
+    agents_worktree: bool,
 
     /// Tool-boundary hook command lines (issue #110), default empty.
     on_pretool: Vec<String>,
@@ -909,7 +921,16 @@ fn build_registry(
     approver: InteractiveApprover<StdioPrompt>,
     workspace: Option<&String>,
     #[cfg(feature = "mcp")] mcp_servers: &[tole_core::mcp::McpServerConfig],
+    agents_worktree: bool,
+    parent_allows: &[String],
 ) -> Result<ToolRegistry> {
+    // Child-agent depth (#171): spawned children carry TOLE_AGENT_DEPTH=1;
+    // at depth >= 1 the agent tools vanish (structural cap) and the
+    // spawn-yourself bypass closes in run_command/job_start.
+    let agent_depth: u32 = std::env::var("TOLE_AGENT_DEPTH")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0);
     let mut reg = ToolRegistry::with_approver(approver);
     let cwd = std::env::current_dir().context("resolving cwd")?;
     let file_root = resolve_workspace_root(workspace)?;
@@ -927,12 +948,34 @@ fn build_registry(
     }
     // Generic dynamic command (B4): argv-split, cwd-jailed, Risk::Write.
     #[cfg(feature = "shell-tools")]
-    reg.register(Box::new(RunCommandTool::new(cwd.clone())))
+    let run_cmd = RunCommandTool::new(cwd.clone());
+    let run_cmd = if std::env::var("TOLE_AGENT_DEPTH")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(0)
+        >= 1
+    {
+        run_cmd.in_child_agent_mode()
+    } else {
+        run_cmd
+    };
+    reg.register(Box::new(run_cmd))
         .map_err(|e| anyhow::anyhow!("registering run_command: {e}"))?;
     // Long-running jobs (#59): detached spawn + poll, logs inside the
     // file-tools workspace so read_file can reach the full log.
     #[cfg(feature = "shell-tools")]
-    reg.register(Box::new(JobStartTool::new(file_root.clone())))
+    let job_start = JobStartTool::new(file_root.clone());
+    let job_start = if std::env::var("TOLE_AGENT_DEPTH")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(0)
+        >= 1
+    {
+        job_start.in_child_agent_mode()
+    } else {
+        job_start
+    };
+    reg.register(Box::new(job_start))
         .map_err(|e| anyhow::anyhow!("registering job_start: {e}"))?;
     #[cfg(feature = "shell-tools")]
     reg.register(Box::new(JobPollTool::new(file_root.clone())))
@@ -944,6 +987,20 @@ fn build_registry(
     if let Some(t) = tole_core::systemone::SystemOneTool::from_env() {
         reg.register(Box::new(t))
             .map_err(|e| anyhow::anyhow!("registering systemone_decide: {e}"))?;
+    }
+    // Child agents (#171): parent-only. Depth >= 1 = this IS a child —
+    // no agent tools at all (the structural depth cap).
+    if agent_depth == 0 {
+        let bin = std::env::current_exe().context("resolving the tole binary for child agents")?;
+        let start = tole_core::agents::AgentStartTool::new(bin, file_root.clone())
+            .with_worktrees(agents_worktree)
+            .with_parent_allows(parent_allows.to_vec());
+        reg.register(Box::new(start))
+            .map_err(|e| anyhow::anyhow!("registering agent_start: {e}"))?;
+        reg.register(Box::new(tole_core::agents::AgentPollTool::new(
+            file_root.clone(),
+        )))
+        .map_err(|e| anyhow::anyhow!("registering agent_poll: {e}"))?;
     }
     reg.register(Box::new(ReadFileTool::new(file_root.clone())))
         .map_err(|e| anyhow::anyhow!("registering read_file: {e}"))?;
@@ -1037,9 +1094,31 @@ fn build_server_registry(
             reg.register(Box::new(UtekeDocumentTool::new(None)))
                 .map_err(|e| anyhow::anyhow!("registering uteke_document: {e}"))?;
         }
-        reg.register(Box::new(RunCommandTool::new(cwd.clone())))
+        let run_cmd = RunCommandTool::new(cwd.clone());
+        let run_cmd = if std::env::var("TOLE_AGENT_DEPTH")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+            >= 1
+        {
+            run_cmd.in_child_agent_mode()
+        } else {
+            run_cmd
+        };
+        reg.register(Box::new(run_cmd))
             .map_err(|e| anyhow::anyhow!("registering run_command: {e}"))?;
-        reg.register(Box::new(JobStartTool::new(file_root.clone())))
+        let job_start = JobStartTool::new(file_root.clone());
+        let job_start = if std::env::var("TOLE_AGENT_DEPTH")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+            >= 1
+        {
+            job_start.in_child_agent_mode()
+        } else {
+            job_start
+        };
+        reg.register(Box::new(job_start))
             .map_err(|e| anyhow::anyhow!("registering job_start: {e}"))?;
         reg.register(Box::new(JobPollTool::new(file_root.clone())))
             .map_err(|e| anyhow::anyhow!("registering job_poll: {e}"))?;
@@ -1200,10 +1279,16 @@ fn run_command(
         build_approver(allow_patterns, yes),
         host.workspace.as_ref(),
         &mcp_cfgs,
+        host.agents_worktree,
+        allow_patterns,
     )?;
     #[cfg(not(feature = "mcp"))]
-    let mut registry =
-        build_registry(build_approver(allow_patterns, yes), host.workspace.as_ref())?;
+    let mut registry = build_registry(
+        build_approver(allow_patterns, yes),
+        host.workspace.as_ref(),
+        host.agents_worktree,
+        allow_patterns,
+    )?;
     // Plan mode (issue #109): the guarantee is ABSENCE on the wire, not
     // approval — filtered tools never appear in specs().
     if host.plan_mode {
@@ -1299,10 +1384,16 @@ fn resume_command(
         build_approver(allow_patterns, yes),
         host.workspace.as_ref(),
         &mcp_cfgs,
+        host.agents_worktree,
+        allow_patterns,
     )?;
     #[cfg(not(feature = "mcp"))]
-    let mut registry =
-        build_registry(build_approver(allow_patterns, yes), host.workspace.as_ref())?;
+    let mut registry = build_registry(
+        build_approver(allow_patterns, yes),
+        host.workspace.as_ref(),
+        host.agents_worktree,
+        allow_patterns,
+    )?;
     // Plan mode (issue #109): the guarantee is ABSENCE on the wire, not
     // approval — filtered tools never appear in specs().
     if host.plan_mode {
@@ -1592,10 +1683,16 @@ fn chat_command(
         build_approver(allow_patterns, yes),
         host.workspace.as_ref(),
         &mcp_cfgs,
+        host.agents_worktree,
+        allow_patterns,
     )?;
     #[cfg(not(feature = "mcp"))]
-    let mut registry =
-        build_registry(build_approver(allow_patterns, yes), host.workspace.as_ref())?;
+    let mut registry = build_registry(
+        build_approver(allow_patterns, yes),
+        host.workspace.as_ref(),
+        host.agents_worktree,
+        allow_patterns,
+    )?;
     // Plan mode (issue #109): the guarantee is ABSENCE on the wire, not
     // approval — filtered tools never appear in specs().
     if host.plan_mode {

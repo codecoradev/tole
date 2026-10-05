@@ -5,6 +5,9 @@ surfaces — no orchestrator inside tole itself. Tole's core stays single-lane b
 design (v0 identity); orchestration is a **caller-side** composition problem,
 and every pattern below composes four existing features:
 
+- `agent_start`/`agent_poll` — depth-1 child agents inside ONE session
+  (#171; structurally no grandchildren, ephemeral uteke mailboxes,
+  optional per-child worktrees via the parent-only `--agents-worktree`)
 - `tole serve --transport mcp` — one HTTP endpoint, N multi-session MCP
   workers (#137/#138), hardened (connection cap, auth rate-limit, IO timeouts, #136)
 - `resume <id> "<prompt>"` — continue a durable session with new instructions (#65)

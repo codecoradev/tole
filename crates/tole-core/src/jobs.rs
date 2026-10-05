@@ -177,11 +177,22 @@ impl Tool for JobPollTool {
 /// Spawn a detached long-running command; returns the job id at once.
 pub struct JobStartTool {
     root: PathBuf,
+    /// Child-agent mode (#171): refuse spawning the tole binary —
+    /// closes the depth-cap bypass via detached jobs.
+    child_agent_mode: bool,
 }
 
 impl JobStartTool {
     pub fn new(root: PathBuf) -> Self {
-        Self { root }
+        Self {
+            root,
+            child_agent_mode: false,
+        }
+    }
+
+    pub fn in_child_agent_mode(mut self) -> Self {
+        self.child_agent_mode = true;
+        self
     }
 }
 
@@ -238,6 +249,9 @@ impl Tool for JobStartTool {
         // RC-1 (threat model): the SAME destructive-argv refusal as
         // run_command — detached execution is not an exemption.
         crate::subprocess::check_destructive_argv(&argv)?;
+        if self.child_agent_mode {
+            crate::agents::check_child_agent_argv(&argv)?;
+        }
 
         let id = new_job_id();
         let dir = jobs_root(&self.root).join(&id);

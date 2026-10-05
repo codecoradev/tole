@@ -40,7 +40,7 @@ pub const POLL_LOOP_TRIP_AFTER: usize = 120;
 /// classification, not a hardcoded name list, keeps this honest — a new
 /// poll tool opts in via `Tool::is_poll()`.
 fn is_poll_tool(name: &str) -> bool {
-    name == "job_poll"
+    name == "job_poll" || name == "agent_poll"
 }
 
 /// One automatic retry for a timeout-classified provider failure per
