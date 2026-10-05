@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc as StdArc, Mutex};
 use tole_core::memory::MemoryConfig;
+use tole_core::storage::Storage;
 
 #[derive(Clone)]
 pub struct SessionState {
@@ -26,6 +27,10 @@ pub struct SessionState {
     pub memory: Option<MemoryConfig>,
     pub first_prompt_done: StdArc<Mutex<bool>>,
     pub busy: StdArc<Mutex<bool>>,
+    /// Cancellation checkpoint (issue #178): the transport sets it on
+    /// client cancel (ACP `session/cancel`); the turn loop checks it
+    /// between steps. `serve` never sets it — REST behavior unchanged.
+    pub cancel: tole_core::cancel::CancelToken,
 }
 
 /// Marks a session busy for its whole lifetime; Drop un-marks even on
@@ -89,6 +94,11 @@ pub fn new_session_id(prefix: &str) -> String {
 /// Create/open a session: workspace jail = the client-provided cwd;
 /// approval = the caller-provided approver (ACP: the interactive editor;
 /// serve: the non-interactive allowlist).
+///
+/// `sessions_dir_override` honors an explicit `--sessions-dir` from the
+/// host (None keeps the per-session-cwd default `<cwd>/.tole/sessions`).
+/// `turnend` wires `--on-turnend` stop gates onto the session's registry
+/// (empty = off).
 #[allow(clippy::too_many_arguments)]
 pub fn open_session(
     session_id: &str,
@@ -97,6 +107,10 @@ pub fn open_session(
     plan_mode: bool,
     approver: impl tole_core::approval::Approver + 'static,
     memory: Option<MemoryConfig>,
+    sessions_dir_override: Option<&std::path::Path>,
+    turnend: Vec<String>,
+    parent_allows: Vec<String>,
+    cancel: tole_core::cancel::CancelToken,
 ) -> Result<SessionState, String> {
     let workspace = PathBuf::from(cwd);
     let workspace_canon = workspace
@@ -130,15 +144,30 @@ pub fn open_session(
     // draft registered everything and "filtered" afterwards, which
     // CodeCora rightly called out: the full registry under --yes broke
     // the read-only contract.
+    let agent_depth: u32 = std::env::var("TOLE_AGENT_DEPTH")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0);
     if !plan_mode {
-        reg.register(Box::new(RunCommandTool::new(workspace_canon.clone())))?;
-        reg.register(Box::new(JobStartTool::new(workspace_canon.clone())))?;
+        let run_cmd = if agent_depth >= 1 {
+            RunCommandTool::new(workspace_canon.clone()).in_child_agent_mode()
+        } else {
+            RunCommandTool::new(workspace_canon.clone())
+        };
+        reg.register(Box::new(run_cmd))?;
+        let job_start = if agent_depth >= 1 {
+            JobStartTool::new(workspace_canon.clone()).in_child_agent_mode()
+        } else {
+            JobStartTool::new(workspace_canon.clone())
+        };
+        reg.register(Box::new(job_start))?;
         reg.register(Box::new(WriteFileTool::new(workspace_canon.clone())))?;
         reg.register(Box::new(EditFileTool::new(workspace_canon.clone())))?;
         {
             let repo =
                 detect_github_repo(&workspace_canon).unwrap_or_else(|| "codecoradev/tole".into());
             reg.register(Box::new(GhTool::new(repo)))?;
+            register_gitea(&mut reg, &workspace_canon);
         }
         reg.register(Box::new(GitTool::new().in_dir(workspace_canon.clone())))?;
         // delete_file (Destructive) registers ONLY behind an interactive
@@ -150,14 +179,45 @@ pub fn open_session(
     }
     reg.register(Box::new(JobPollTool::new(workspace_canon.clone())))?;
     reg.register(Box::new(ReadFileTool::new(workspace_canon.clone())))?;
+    // systemone_decide (#172): probe-gated on SYSTEMONE_API_KEY.
+    if let Some(t) = tole_core::systemone::SystemOneTool::from_env() {
+        reg.register(Box::new(t))?;
+    }
+    // Child agents (#171): parent sessions only — a child (depth >= 1)
+    // gets no agent tools at all (the structural depth cap).
+    if agent_depth == 0 && !plan_mode {
+        if let Ok(bin) = std::env::current_exe() {
+            let _ = reg.register(Box::new(
+                tole_core::agents::AgentStartTool::new(bin, workspace_canon.clone())
+                    .with_parent_allows(parent_allows.clone()),
+            ));
+            let _ = reg.register(Box::new(tole_core::agents::AgentPollTool::new(
+                workspace_canon.clone(),
+            )));
+        }
+    }
+    // Turn-end stop gates (#145): the same registry-level wiring the
+    // run/chat hosts use, applied to server-face sessions.
+    if !turnend.is_empty() {
+        let mut hooks = tole_core::hooks::ToolHooks::from_cli(&[], &[]);
+        hooks.turnend = turnend
+            .iter()
+            .map(|c| tole_core::hooks::turnend_hook(c))
+            .collect();
+        reg.set_hooks(hooks);
+    }
 
+    let dir = match sessions_dir_override {
+        Some(d) => {
+            std::fs::create_dir_all(d).map_err(|e| format!("creating {}: {e}", d.display()))?;
+            d.to_path_buf()
+        }
+        None => sessions_dir_for(cwd)?,
+    };
     let storage = if loading {
-        let dir = sessions_dir_for(cwd)?;
         tole_core::storage::JsonlStorage::open(dir.join(format!("{session_id}.jsonl")))
             .map_err(|e| format!("loading session: {e}"))?
     } else {
-        let dir = sessions_dir_for(cwd)?;
-        std::fs::create_dir_all(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
         tole_core::storage::JsonlStorage::create_with(
             &dir,
             session_id,
@@ -173,6 +233,7 @@ pub fn open_session(
         memory,
         first_prompt_done: StdArc::new(Mutex::new(loading)),
         busy: StdArc::new(Mutex::new(false)),
+        cancel,
     })
 }
 
@@ -208,6 +269,51 @@ pub fn detect_github_repo(cwd: &PathBuf) -> Option<String> {
     crate::session_host::github_repo_from_remote_url(&String::from_utf8_lossy(&out.stdout))
 }
 
+/// Register the `gitea` tool when BOTH probe legs hold: the checkout's
+/// origin remote points at a Gitea instance (not GitHub — that's `gh`)
+/// and a token env exists (`TOLE_GITEA_TOKEN` or `GITEA_TOKEN`).
+/// Absent legs degrade to one warning line, never a phantom tool — the
+/// same probe contract as uteke/cora.
+pub fn register_gitea(reg: &mut tole_core::tool::ToolRegistry, cwd: &std::path::Path) {
+    use tole_core::gitea::{gitea_from_remote, GiteaRemote, GiteaTool};
+    let mut cmd = std::process::Command::new("git");
+    cmd.args(["config", "--get", "remote.origin.url"])
+        .current_dir(cwd);
+    let Ok(out) =
+        tole_core::subprocess::run_with_timeout(&mut cmd, std::time::Duration::from_secs(5))
+    else {
+        return;
+    };
+    if !out.status.success() {
+        return;
+    }
+    let remote = gitea_from_remote(&String::from_utf8_lossy(&out.stdout));
+    let (base, repo) = match remote {
+        GiteaRemote::Ok { base, repo } => (base, repo),
+        GiteaRemote::InsecureHttp { host } => {
+            eprintln!(
+                "tole: origin is a Gitea remote over plain http ({host}) — refusing to send the \
+                 token unencrypted; use an https remote (loopback http is allowed)"
+            );
+            return;
+        }
+        GiteaRemote::NotGitea => return,
+    };
+    let token = std::env::var("TOLE_GITEA_TOKEN")
+        .or_else(|_| std::env::var("GITEA_TOKEN"))
+        .ok()
+        .filter(|t| !t.trim().is_empty());
+    let Some(token) = token else {
+        eprintln!(
+            "tole: origin is a Gitea remote ({repo}) but no TOLE_GITEA_TOKEN/GITEA_TOKEN is set — gitea tool disabled"
+        );
+        return;
+    };
+    if let Err(e) = reg.register(Box::new(GiteaTool::new(base, token, repo))) {
+        eprintln!("tole: registering gitea: {e}");
+    }
+}
+
 /// One prompt = one full tole turn. Returns `(stop_reason, final_text)`;
 /// the transport decides how to deliver them (ACP: notification chunk +
 /// response; serve: the HTTP response body).
@@ -220,7 +326,7 @@ pub fn run_session_turn(
     // session. The MAP lock is released here — a running turn holds only
     // its OWN storage lock, so the transport loop stays live (CodeCora
     // deadlock finding).
-    let (storage, registry, memory, system_prompt, first_prompt_done, busy_guard) = {
+    let (storage, registry, memory, system_prompt, first_prompt_done, busy_guard, cancel) = {
         let mut sessions = lock_sessions(&sessions);
         let Some(state) = sessions.map.get_mut(session_id) else {
             return Err(format!("unknown session: {session_id}"));
@@ -231,6 +337,11 @@ pub fn run_session_turn(
                 return Err("session is busy running a turn".into());
             }
             *busy = true;
+            // Wipe a stale cancel flag in the SAME critical section as
+            // the busy claim (#178): a cancel that lands after this
+            // point targets THIS turn; one that landed before it had no
+            // in-flight turn to target and must not kill the new one.
+            state.cancel.reset();
         }
         (
             state.storage.clone(),
@@ -239,6 +350,7 @@ pub fn run_session_turn(
             state.system_prompt.clone(),
             state.first_prompt_done.clone(),
             std::sync::Arc::clone(&state.busy),
+            state.cancel.clone(),
         )
     };
     // Panic-safe un-busy: Drop clears the flag even if the turn unwinds.
@@ -261,21 +373,39 @@ pub fn run_session_turn(
         }
     }
 
-    let Some(cfg) = tole_core::openai::OpenAiConfig::from_env() else {
+    // Lock the storage for the rest of the turn. The provider is built
+    // fresh every turn (issue #176): a `fact/model` register override —
+    // set durably by `tole acp`'s session/set_config_option — wins over
+    // the env default. serve sessions have no setter today, so this is
+    // a no-op there.
+    let mut storage = storage.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(mut cfg) = tole_core::openai::OpenAiConfig::from_env() else {
         return Err(
             "missing provider config: set TOLE_BASE_URL / TOLE_MODEL / TOLE_API_KEY              (or the OPENAI_* equivalents)"
                 .into(),
         );
     };
+    if let Some(model) = storage
+        .get_register("fact", "model")
+        .and_then(serde_json::Value::as_str)
+        .filter(|m| !m.trim().is_empty())
+    {
+        cfg.model = model.to_string();
+    }
     let mut provider =
         tole_core::openai::OpenAiProvider::new(cfg).with_tool_specs(registry.specs());
     if let Some(sys) = system_prompt.as_deref() {
         provider = provider.with_system_prompt(sys);
     }
 
-    let mut storage = storage.lock().unwrap_or_else(|p| p.into_inner());
-    let outcome = tole_core::turn::run_turn(&mut *storage, &mut provider, &registry, &effective)
-        .map_err(|e| e.to_string())?;
+    let outcome = tole_core::turn::run_turn_with_cancel(
+        &mut *storage,
+        &mut provider,
+        &registry,
+        &effective,
+        &cancel,
+    )
+    .map_err(|e| e.to_string())?;
 
     #[cfg(feature = "shell-tools")]
     if let tole_core::turn::TurnOutcome::Final { text, wrote } = &outcome {
@@ -307,6 +437,7 @@ pub fn run_session_turn(
             "refusal"
         }
         tole_core::turn::TurnOutcome::BudgetExhausted => "max_tokens",
+        tole_core::turn::TurnOutcome::Cancelled => "cancelled",
         tole_core::turn::TurnOutcome::LoopDetected { tool, .. } => {
             eprintln!("tole: loop detected on '{tool}'");
             "refusal"

@@ -7,6 +7,119 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-10-06
+
+### Added
+- `gitea` tool — the Gitea counterpart of `gh`, over the instance's
+  REST API (`TOLE_GITEA_TOKEN` / `GITEA_TOKEN` + a Gitea `origin`
+  remote; probe-gated: absent token or non-Gitea remote degrades to one
+  warning, no phantom tool). Same six ops as `gh` (issue_view /
+  issue_list / pr_view read-only; issue_comment / issue_create /
+  pr_create writes), Risk::Write through the approval gate, routes
+  whitelisted in one auditable function, per-call `repo` override
+  validated (`owner/name`, traversal/dash refused), token never shown
+  in approval lines. Self-hosted instances with explicit ports are
+  parsed from the remote (`http://host:3000/owner/repo`); GitHub
+  remotes never register it (that's `gh`).
+- `gh` hardening: `number`/`limit` accept JSON integers (models send
+  counts as numbers); optional per-call `repo` override (validated,
+  shown in the approval line) replaces the registration-time lock —
+  closing the README "per-repo wiring is a known gap" note.
+- `mcp-http` is now a **default feature** of `tole-cli`: a plain
+  `cargo install tole-cli` / `cargo build -p tole-cli` exposes all four
+  documented faces, including `tole serve --transport mcp` (previously
+  opt-in — a registry install errored on that transport). Embedders are
+  unaffected: `tole-core` defaults do not change, and the mobile
+  cross-compile targets only build `tole-core`.
+- `--trust` presets (#160): one-word trust for the fleet's ecosystem
+  tools — `internal` (uteke_*/cora_search/mcp_cora_*/verify_package/
+  job_*/tole_session_*), `read_only` (every safe read), `none`
+  (default). Pure sugar over `--allow` globs; Destructive is never
+  auto-allowed; unknown presets fail loudly; flag wins over the
+  `TOLE_TRUST` env. (Landed on develop 2026-10-02, backfilled here.)
+- SKILL.md support (#161/#162): `--skill <path>` loads a skill file
+  into the system prompt (fenced, 16 KiB cap, loud frontmatter errors);
+  discovery over `<workspace>/skills/` + `~/.codecora/tole/skills/`
+  registers the ReadOnly `load_skill` tool with a one-line index;
+  `--no-skills` disables everything. (Landed on develop 2026-10-02,
+  backfilled here.)
+
+- `systemone_decide` (#172/#173) — typed decisions (choice / score /
+  noul + confidence) from any System One backend, active when
+  `SYSTEMONE_API_KEY` is set; `SYSTEMONE_BASE_URL` picks the backend
+  (hosted Jev default, self-hosted compatible). ReadOnly, approval-free.
+- Depth-1 child agents (#171/#174): `agent_start` / `agent_poll` spawn
+  and harvest durable child sessions from within one session —
+  structurally no grandchildren (registry depth cap), results via
+  ephemeral per-child uteke mailboxes, optional per-child git worktrees
+  behind the parent-only `--agents-worktree` flag.
+- ACP native model picker + per-session approval controls (#176/#177/#179):
+  `TOLE_MODELS` (comma-separated ids) advertises a model switch via ACP
+  session config options, persisted durably per session across resumes;
+  an approval selector (`ask` / `auto`, session-scoped) plus an
+  `allow_always` option on Write permission requests let the editor
+  relax the gate without weakening the Destructive tier.
+- Cooperative cancellation on all three server faces (#178/#184/#185):
+  ACP `session/cancel`, REST `POST /sessions/{id}/cancel`, and the
+  `tole_session_cancel` multi-session MCP tool. All paths set the same
+  per-session token; the blocking turn observes it at checkpoints and
+  settles `stopReason: "cancelled"` as a normal durable turn end.
+  Spec-conformant: single in-flight tool calls are not interrupted,
+  unknown sessions 404, cancelling an idle session is idempotent;
+  `--trust internal` covers the new tool via the `tole_session_*` glob.
+
+### Fixed
+- **`TOLE_TRUST` env was documented but never read** (found by
+  activation testing 2026-10-05): `--trust` help says "flag wins over
+  the TOLE_TRUST env", yet no code read the variable — an env-only
+  setup silently kept prompting for fleet tools. The env now applies
+  whenever no `--trust` flag is passed (comma/whitespace separated for
+  multiple presets; an explicit flag still wins wholesale; unknown
+  presets in the env fail loudly, same as the flag).
+- Full-feature sweep findings (2026-10-05):
+  - **Silent no-op flags on the server faces** now fail loudly at
+    startup (the scan-3 #9 rule, previously enforced only for
+    pretool/posttool hooks): `--skill`/`--no-skills`/`--mcp-server` on
+    `tole mcp`/`serve`/`acp`, plus `--on-pretool`/`--on-posttool` on
+    `tole serve` (missed by the earlier bail) and `--on-turnend` on
+    `tole mcp`. The cora AUTO-PRESET does not trip the `--mcp-server`
+    refusal — only explicit flags do.
+  - `tole serve` (both transports) and `tole acp` now honor an explicit
+    `--sessions-dir` (default stays the per-session-cwd layout);
+    `tole serve --transport mcp` now honors `--workspace` as the
+    jail-of-jails root (default stays the server cwd); `--on-turnend`
+    stop gates are wired into serve/acp session turns (the same
+    registry-level gates the run host uses).
+  - **Multi-session MCP ambiguity refusal** (the #138-documented
+    behavior, previously unimplemented): a registry-tool call WITHOUT
+    `session_id` while 2+ sessions are open is refused with a clear
+    error instead of silently executing against the server-level
+    registry (server-cwd jail).
+  - Skills discovery now defaults to the CURRENT DIRECTORY when
+    `--workspace` is absent — the same default the file-tools jail
+    uses (a project with `<cwd>/skills/` used to silently get no
+    discovery).
+  - `--on-pretool` help text corrected: an exit-2 deny parks the turn
+    resumably at the denial (mirroring an approval denial); it does
+    not auto-replan in-flight.
+- **MCP-over-HTTP accept-loop hardening (#190):** the `tole serve
+  --transport mcp` face now matches the REST face's #136 Wave-2
+  controls — a 32-connection semaphore cap (refused at capacity),
+  `header_read_timeout` (30s) on the hyper HTTP/1 builder, and a 30s
+  bound on the auth-header and request-body read phases. SSE response
+  streaming is intentionally untouched: long `tole_session_prompt`
+  turns still stream incrementally; only connection establishment and
+  request intake are time-bounded. Closes the slowloris
+  task/fd-pinning class the full-codebase scan flagged as MAJOR
+  (scan finding #17, pre-0.6.0-tag gate).
+- Build/CI fixes riding the same train: the no-`mcp` `tole-cli`
+  profile compiles again (`mcp_server_command` is now gated behind the
+  `mcp` feature, #175/#180); project-sync board lookup resolves the
+  runtime Done-option id instead of a hardcoded value, and the
+  `set_done` mutation takes `optionId` as `String!` (the previous `ID!`
+  call failed against the live Projects API) — failures are now loud,
+  not silent (#181/#182, #183).
+
 ## [0.5.0] — 2026-10-02
 
 ### Added
@@ -280,3 +393,4 @@ Initial release: durable agent harness foundation.
   step-budget and loop guards, secret redaction on the wire,
   file tools (`read_file`, `write_file`, `edit_file` with hashline
   anchoring, `delete_file`), `cora_search`, E8 MVP gate passed.
+

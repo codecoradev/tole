@@ -26,7 +26,10 @@
 //! - `turn`     — the single-threaded turn loop
 //! - `memory`   — harness-level uteke memory loop (recall/remember)
 
+#[cfg(feature = "shell-tools")]
+pub mod agents;
 pub mod approval;
+pub mod cancel;
 #[cfg(feature = "shell-tools")]
 pub mod cora_search;
 pub mod entry;
@@ -35,6 +38,8 @@ pub mod file_tools;
 pub mod gh;
 #[cfg(feature = "shell-tools")]
 pub mod git;
+pub mod gitea;
+pub mod systemone;
 // Process hooks spawn subprocesses (issue #110) — same gate as the
 // subprocess helper they build on; mobile/embedder profiles have no
 // shell and no hooks.
@@ -57,6 +62,7 @@ pub mod register;
 pub mod replay;
 #[cfg(feature = "shell-tools")]
 pub mod run_command;
+pub mod skills;
 pub mod state;
 pub mod storage;
 #[cfg(feature = "shell-tools")]

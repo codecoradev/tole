@@ -41,6 +41,11 @@ pub struct ServeConfig {
     pub workspace: Option<String>,
     pub plan_mode: bool,
     pub memory: Option<MemoryConfig>,
+    /// Explicit `--sessions-dir` override (None = per-session-cwd
+    /// default, the pre-existing behavior).
+    pub sessions_dir: Option<std::path::PathBuf>,
+    /// `--on-turnend` stop gates wired onto every session registry.
+    pub turnend: Vec<String>,
 }
 
 /// Max concurrently open connections: each pinned thread holds ~8 KiB
@@ -59,6 +64,8 @@ struct State {
     memory: Option<MemoryConfig>,
     token: String,
     workspace_default: Option<String>,
+    sessions_dir: Option<std::path::PathBuf>,
+    turnend: Vec<String>,
     live_connections: std::sync::atomic::AtomicUsize,
     /// (window_start_epoch, failure_count) per source IP — fixed-window
     /// auth-failure limiter (brute-force hardening).
@@ -82,6 +89,8 @@ pub fn run_serve(cfg: ServeConfig) -> Result<()> {
         memory: cfg.memory.clone(),
         token,
         workspace_default: cfg.workspace.clone(),
+        sessions_dir: cfg.sessions_dir.clone(),
+        turnend: cfg.turnend.clone(),
         live_connections: std::sync::atomic::AtomicUsize::new(0),
         auth_failures: Mutex::new(HashMap::new()),
     });
@@ -348,6 +357,12 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                 state.plan_mode,
                 approver,
                 state.memory.clone(),
+                state.sessions_dir.as_deref(),
+                state.turnend.clone(),
+                state.allow_patterns.clone(),
+                // No REST cancel endpoint today (#178): a never-fired
+                // token keeps serve behavior unchanged.
+                tole_core::cancel::CancelToken::default(),
             ) {
                 Ok(session_state) => {
                     {
@@ -444,6 +459,23 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                         Ok((stop, None)) => (200, json!({"stopReason": stop})),
                         Err(e) if e.contains("session is busy") => (409, json!({"error": e})),
                         Err(e) => (500, json!({"error": e})),
+                    }
+                }
+                ("POST", id, Some("cancel")) => {
+                    // REST face of #178 (owner directive: serve follows
+                    // the ACP design). Sets the session's cancel token;
+                    // the in-flight prompt thread observes it at its
+                    // next checkpoint and answers ITS caller with
+                    // "cancelled". 404 only for an unknown session.
+                    let cancelled = {
+                        let sessions = lock_sessions(&state.sessions);
+                        sessions.map.get(id).map(|st| st.cancel.cancel()).is_some()
+                    };
+                    if cancelled {
+                        eprintln!("tole: session/{id} cancel requested (serve)");
+                        (200, json!({"cancelled": true, "sessionId": id}))
+                    } else {
+                        (404, json!({"error": "unknown session"}))
                     }
                 }
                 _ => (404, json!({"error": "not found"})),

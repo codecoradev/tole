@@ -16,9 +16,12 @@ path = "src/main.rs"
 
 [features]
 # Mirrors tole-core's gates so cfg in this crate resolves. The CLI
-# always wants the shell tools and the MCP client (the auto-preset needs
-# it); embedders use tole-core directly with their own feature choices.
-default = ["shell-tools", "mcp"]
+# always wants the shell tools, the MCP client (the auto-preset needs
+# it), and the HTTP daemon surface (`tole serve --transport mcp`) — a
+# crates.io install must expose every documented face (#163 follow-up,
+# 2026-10-05); embedders use tole-core directly with their own feature
+# choices and are unaffected by this crate's defaults.
+default = ["shell-tools", "mcp", "mcp-http"]
 shell-tools = ["tole-core/shell-tools"]
 mcp = ["tole-core/mcp"]
 # MCP-over-HTTP host (#137): rmcp streamable-http server + hyper serving.
@@ -30,7 +33,7 @@ mcp-http = ["mcp", "shell-tools", "dep:hyper", "dep:hyper-util", "dep:http-body-
 replay = []
 
 [dependencies]
-tole-core = { version = "0.5.0", path = "../tole-core" }
+tole-core = { version = "0.6.0", path = "../tole-core" }
 tokio = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }

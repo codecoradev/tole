@@ -9,11 +9,16 @@ Durable Rust agent harness: a conversational agent with risk-tiered approval
 gates, a write-once JSONL session log, and a register state machine — resumable
 after crashes, replayable forever.
 
-**Status:** v0.3.0 released — chat-first harness (chat / resume / sessions /
-jobs / MCP client). Post-0.3.0 work landing on `develop`: the uteke memory
-loop and the cora MCP auto-preset (see [CHANGELOG.md](CHANGELOG.md) →
-Unreleased). Phase 3 hardening (E9) in progress in
-[docs/epics.md](docs/epics.md).
+**Status:** v0.5.0 released — four faces on one durable core: the CLI
+(run / chat / resume / sessions / jobs), `tole mcp` (tool server),
+`tole acp` (editor agent), and `tole serve` (REST + multi-session
+MCP-over-HTTP daemon). Also in 0.5.0: the uteke memory loop, the cora
+MCP auto-preset, turn-end stop gates, `verify_package`, and SKILL.md
+support. On `develop` for the 0.6.0 train: `--trust` presets, System
+One decisions, depth-1 child agents, ACP model & approval pickers,
+and cooperative cancellation on every server face (see
+[CHANGELOG.md](CHANGELOG.md) → Unreleased). E9 hardening is closed;
+post-D3 waves live in [docs/epics.md](docs/epics.md).
 
 ## Ecosystem position
 
@@ -36,14 +41,21 @@ tole is the agent harness of the CodeCora ecosystem — the hands:
   are structurally absent.
 - **tole as an ACP agent**: `tole acp` speaks the Agent Client Protocol —
   editors (Zed et al.) drive durable tole sessions, and tool approvals
-  surface as permission requests in the editor.
+  surface as permission requests in the editor. Native pickers via ACP
+  config options (#176): `TOLE_MODELS` (comma-separated ids) advertises a
+  model switch that persists durably per session across resumes, and an
+  approval selector (`ask` / `auto`, session-scoped) plus an
+  `allow_always` option on Write permission requests let the human relax
+  the gate from the editor without weakening the Destructive tier.
 - **tole as an HTTP daemon**: `tole serve` (issue #96) exposes the session
   host over token-authenticated REST — remote clients create sessions, run
   turns, and poll status without SSH-ing into the box. Binds 127.0.0.1 by
-  default. `--transport mcp` (issue #137) serves **multi-session MCP over
+  default. `POST /sessions/{id}/cancel` (#178, REST face) stops an
+  in-flight turn — it settles `stopReason: "cancelled"`.
+  `--transport mcp` (issue #137) serves **multi-session MCP over
   Streamable HTTP** instead: one authenticated MCP connection addresses N
-  durable tole sessions (`tole_session_new/prompt/status/list` + the
-  registry tools routed to each session's workspace jail).
+  durable tole sessions (`tole_session_new/prompt/cancel/status/list` +
+  the registry tools routed to each session's workspace jail).
 
 Every ecosystem integration is probe-first: a missing binary degrades to a
 one-line warning, never a phantom tool.
@@ -55,6 +67,8 @@ cargo install tole-cli        # the `tole` binary from crates.io
 # or build from source:
 git clone https://github.com/codecoradev/tole && cd tole
 cargo build --release -p tole-cli && ./target/release/tole --help
+# `mcp-http` (needed by `tole serve --transport mcp`) is a default
+# feature since #168 — a plain build/install already includes it.
 ```
 
 ## Quickstart
@@ -83,7 +97,9 @@ Useful flags (all subcommands): `--system` (persona, pinned in the session
 header), `--workspace <dir>` (file-tools jail root), `--allow <glob>`
 (repeatable pre-authorization for Write tools, e.g. `--allow 'write_*'`),
 `--yes` (auto-allow every Write; Destructive still prompts), `--mcp-server`,
-`--no-auto-mcp` (skip the cora auto-preset).
+`--no-auto-mcp` (skip the cora auto-preset), `--trust <preset>` (one-word
+trust: `internal` / `read_only`), `--skill <path>` (load a SKILL.md),
+`--plan-mode` (read-only wire), `--on-turnend <cmd>` (final-message gate).
 
 ## Configuration (environment)
 
@@ -101,8 +117,13 @@ header), `--workspace <dir>` (file-tools jail root), `--allow <glob>`
 | `read_file`, `write_file`, `edit_file` | RO / Write | jailed to `--workspace` (TOCTOU-safe, symlink-refusing) |
 | `delete_file` | Destructive | always prompts; never allowlistable, even with `--yes` |
 | `git` | Write | `status` / `diff` / `add` / `commit` only — **push stays human** |
-| `gh` | Write | read-only ops, argv-validated per op; `--repo` is fixed at registration (currently `codecoradev/tole`) — per-repo wiring is a known gap |
+| `gh` | Write | read-only ops, argv-validated per op; `repo` defaults to the checkout's GitHub remote, optional per-call override (validated) |
 | `run_command` | Write | argv-split (no shell), cwd-jailed, timeout + output cap |
+| `verify_package` | RO | crates.io / npm registry check before any install — hallucinated names get NOT FOUND + candidates, edit-distance-1 candidates get a typo-squat warning |
+| `load_skill` | RO | loads a discovered SKILL.md on demand (`--skill` pins one upfront; `--no-skills` disables) |
+| `gitea` | Write | Gitea counterpart of `gh` over the instance REST API — registers when `origin` is a Gitea remote AND `TOLE_GITEA_TOKEN`/`GITEA_TOKEN` is set; same six ops |
+| `agent_start`, `agent_poll` | Write / RO | depth-1 child agents: spawn durable child sessions (structurally no grandchildren), results via per-child uteke mailboxes (ephemeral by default); `--agents-worktree` gives each child its own git worktree |
+| `systemone_decide` | RO | typed decisions (choice/score/noul + confidence) from a System One backend — active when `SYSTEMONE_API_KEY` is set; `SYSTEMONE_BASE_URL` picks the backend (hosted Jev default, self-hosted compatible) |
 | `job_start`, `job_poll` | Write / RO | detached long-running jobs with log tailing |
 | `cora_search` | RO | hybrid codebase search via `cora brain`; native fallback — skipped when the cora MCP surface is attached |
 | `uteke_recall`, `uteke_document` | RO / Write | semantic memory recall / markdown → room |

@@ -5,6 +5,9 @@ surfaces — no orchestrator inside tole itself. Tole's core stays single-lane b
 design (v0 identity); orchestration is a **caller-side** composition problem,
 and every pattern below composes four existing features:
 
+- `agent_start`/`agent_poll` — depth-1 child agents inside ONE session
+  (#171; structurally no grandchildren, ephemeral uteke mailboxes,
+  optional per-child worktrees via the parent-only `--agents-worktree`)
 - `tole serve --transport mcp` — one HTTP endpoint, N multi-session MCP
   workers (#137/#138), hardened (connection cap, auth rate-limit, IO timeouts, #136)
 - `resume <id> "<prompt>"` — continue a durable session with new instructions (#65)
@@ -91,7 +94,9 @@ the producers — a fresh session sees the artifacts, not the rationalizations.
   `job_start`/`job_poll` inside the worker session — not in a bigger timeout.
 - **Policy per worker:** `--allow` pre-authorizes Writes per worker;
   `--plan-mode` removes mutation tools from the wire entirely;
-  `--on-pretool` scripts enforce org-specific policy without recompiling.
+  `--on-pretool` scripts enforce org-specific policy without recompiling
+  (CLI workers — `run`/`chat`/`resume`; the serve/acp/mcp faces refuse
+  pre/post hooks loudly, and take `--on-turnend` stop gates instead).
 - **Cost discipline:** fan-out multiplies token spend roughly by N. Budget
   per task, not per worker; promote a topology to default only with measured
   numbers (see `evals/` for how to measure).

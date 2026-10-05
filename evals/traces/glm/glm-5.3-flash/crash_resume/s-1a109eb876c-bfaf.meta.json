@@ -1,0 +1,7 @@
+{
+ "mission": "crash_resume",
+ "model": "glm/glm-5.3-flash",
+ "session": "s-1a109eb876c-bfaf.jsonl",
+ "recorded_at": "2026-10-05T02:37:21+00:00",
+ "source": "evals/tier2/run.py --archive (issue #107)"
+}

@@ -20,6 +20,27 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-targets
 
+  # Issue #175: the embedder/mobile checks only cover tole-core's
+  # --no-default-features profile, so the tole-cli no-mcp host profile
+  # drifted uncompilable invisibly (feature-gated command paths
+  # referencing gated-out items). Keep it compiling AND warning-free —
+  # a drift here means a cfg gate is wrong somewhere.
+  no-mcp:
+    name: no-mcp profile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: no-mcp
+      - run: |
+          cargo check -p tole-cli --no-default-features --features shell-tools
+          cargo clippy -p tole-cli --no-default-features --features shell-tools -- -D warnings
+          cargo test -p tole-cli --no-default-features --features shell-tools
+
   fmt:
     name: Format
     runs-on: ubuntu-latest

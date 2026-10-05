@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use tole_cli::approver::{InteractiveApprover, StdioPrompt};
 use tole_cli::tools::WriteFileTool;
+#[cfg(feature = "mcp")]
 use tole_core::approval::AllowlistApprover;
 
 #[cfg(feature = "shell-tools")]
@@ -98,11 +99,20 @@ struct Cli {
     #[arg(long, global = true)]
     plan_mode: bool,
 
+    /// Child agents (#171): PARENT-ONLY operator mode — spawned child
+    /// agents each get their own git worktree + branch. Default OFF;
+    /// the model cannot flip this per call (worktrees stay bounded by
+    /// the child cap; merge-back stays human). Applies to run/chat/resume.
+    #[arg(long, global = true)]
+    agents_worktree: bool,
+
     /// Pre-tool-use process hook (issue #110): runs before every
     /// Write/Destructive tool executes. Receives one JSON object on
     /// stdin (`{"event":"pretool","tool":...,"input":...}`); exit code
-    /// 2 = DENY the call (durable, the loop replans); any other
-    /// non-zero exit / timeout is a logged non-blocking hook failure.
+    /// 2 = DENY the call (durable — the turn parks at the denial like
+    /// an approval denial and is resumable; on resume WITH a new prompt
+    /// the model sees the denial and replans); any other non-zero exit
+    /// / timeout is a logged non-blocking hook failure.
     /// Example: --on-pretool /usr/local/bin/tole-guard.sh. Repeatable;
     /// default OFF.
     #[arg(long, global = true)]
@@ -125,6 +135,25 @@ struct Cli {
     /// Example: --on-turnend "cargo check". Repeatable; default OFF.
     #[arg(long, global = true)]
     on_turnend: Vec<String>,
+
+    /// Trust preset: auto-allow the fleet's own ecosystem tools without
+    /// per-call approval. `internal` = uteke_*/cora_search/mcp_cora_*/
+    /// verify_package/job_*/tole_session_*; `read_only` = every safe
+    /// read. Repeatable; flag wins over the TOLE_TRUST env; `none`
+    /// (default) = today's behavior. Pure sugar over --allow patterns —
+    /// Destructive tools are never auto-allowed.
+    #[arg(long, global = true)]
+    trust: Vec<String>,
+
+    /// Load a SKILL.md file into the system prompt (issue #161). The
+    /// file must have YAML frontmatter with `name` matching its parent
+    /// directory (or just be a plain path). Repeatable.
+    #[arg(long, global = true)]
+    skill: Vec<PathBuf>,
+
+    /// Disable skills support (discovery + load_skill tool).
+    #[arg(long, global = true)]
+    no_skills: bool,
 
     #[command(subcommand)]
     command: Command,
@@ -200,7 +229,11 @@ enum Command {
     },
     /// Serve tole as an ACP agent over stdio (issue #95): editors and
     /// ACP clients drive durable tole sessions; tool approvals surface
-    /// as permission requests in the client.
+    /// as permission requests in the client (Write calls also offer
+    /// allow_always — remembered for the session, never for
+    /// Destructive). An `approval` selector (ask/auto) is always
+    /// advertised; TOLE_MODELS (comma-separated model ids) adds a model
+    /// picker, persisted durably per session (issue #176).
     #[cfg(feature = "shell-tools")]
     Acp {
         /// Same semantics as `run --allow` (Write pre-authorization).
@@ -295,17 +328,30 @@ fn dispatch(cli: Cli) -> Result<()> {
             .clone()
             .unwrap_or_else(|| DEFAULT_SESSIONS_DIR.to_string()),
     );
+    // The RAW override for the server faces: an explicit --sessions-dir
+    // relocates serve/acp session storage; the default (None) keeps the
+    // per-session-cwd layout those faces always had. The resolved
+    // `sessions_dir` above stays the run/chat/sessions/status default.
+    let sessions_dir_override = cli.sessions_dir.clone().map(PathBuf::from);
     #[cfg(feature = "mcp")]
     let mcp_specs = merge_mcp_specs(&cli.mcp_server, cli.no_auto_mcp, auto_mcp_specs());
+    // Explicit --mcp-server flags only — the merged `mcp_specs` also
+    // contains the cora auto-preset, which must NOT trigger the
+    // server-face refusal below.
+    #[cfg(feature = "mcp")]
+    let explicit_mcp = !cli.mcp_server.is_empty();
     // scan-3 finding fix: the global --workspace/--memory flags now flow
     // into the host, so `tole serve/acp/mcp` honor them as fallbacks when
     // the subcommand-level flags are absent (previously they were
     // silently ignored by those subcommands).
     let host = HostConfig {
         workspace: cli.workspace.clone(),
+        skills: cli.skill.clone(),
+        no_skills: cli.no_skills,
         #[cfg(feature = "mcp")]
         mcp_server: mcp_specs,
         plan_mode: cli.plan_mode,
+        agents_worktree: cli.agents_worktree,
 
         on_pretool: cli.on_pretool.clone(),
         on_posttool: cli.on_posttool.clone(),
@@ -315,38 +361,54 @@ fn dispatch(cli: Cli) -> Result<()> {
         #[cfg(not(feature = "shell-tools"))]
         memory: (),
     };
+    // Trust presets (issue #159): expand once, before dispatch — every
+    // allow_patterns-consuming subcommand appends these. The --trust
+    // flag wins over the TOLE_TRUST env (documented); the env splits on
+    // commas/whitespace so one variable can carry several presets.
+    let trust_extra = expand_trust(&resolve_trust_flags(
+        &cli.trust,
+        std::env::var("TOLE_TRUST").ok(),
+    ))?;
+
     match cli.command {
         Command::Run {
             prompt,
             system,
-            allow_patterns,
+            allow_patterns: allow_patterns_in,
             yes,
-        } => run_command(
-            &sessions_dir,
-            &prompt,
-            system.as_deref(),
-            &allow_patterns,
-            yes,
-            &host,
-        ),
+        } => {
+            let allow_patterns = with_trust(allow_patterns_in, &trust_extra);
+            run_command(
+                &sessions_dir,
+                &prompt,
+                system.as_deref(),
+                &allow_patterns,
+                yes,
+                &host,
+            )
+        }
         Command::Resume {
             id,
             prompt,
-            allow_patterns,
+            allow_patterns: allow_patterns_in,
             yes,
-        } => resume_command(
-            &sessions_dir,
-            &id,
-            prompt.as_deref(),
-            &allow_patterns,
-            yes,
-            &host,
-        ),
+        } => {
+            let allow_patterns = with_trust(allow_patterns_in, &trust_extra);
+            resume_command(
+                &sessions_dir,
+                &id,
+                prompt.as_deref(),
+                &allow_patterns,
+                yes,
+                &host,
+            )
+        }
         #[cfg(all(feature = "mcp", feature = "shell-tools"))]
         Command::Mcp {
-            allow_patterns,
+            allow_patterns: allow_patterns_in,
             workspace,
         } => {
+            let allow_patterns = with_trust(allow_patterns_in, &trust_extra);
             // Global flags must not SILENTLY no-op on this subcommand
             // (cora scan-3 #9): plan-mode filters the served registry to
             // read-only; hooks are not wired in server mode (no local
@@ -359,6 +421,14 @@ fn dispatch(cli: Cli) -> Result<()> {
                      (server mode pre-authorizes Write tools with --allow instead)"
                 );
             }
+            if !host.on_turnend.is_empty() {
+                anyhow::bail!(
+                    "--on-turnend is not supported by `tole mcp` (the tool server runs no \
+                     turns; stop gates apply to run/chat/resume/serve/acp sessions)"
+                );
+            }
+            #[cfg(feature = "mcp")]
+            check_client_session_flags("mcp", &host.skills, host.no_skills, explicit_mcp)?;
             if host.plan_mode {
                 eprintln!("tole mcp: --plan-mode is active — serving read-only tools only");
             }
@@ -372,11 +442,12 @@ fn dispatch(cli: Cli) -> Result<()> {
         }
         #[cfg(feature = "shell-tools")]
         Command::Acp {
-            allow_patterns,
+            allow_patterns: allow_patterns_in,
             yes,
             workspace,
             memory,
         } => {
+            let allow_patterns = with_trust(allow_patterns_in, &trust_extra);
             // Same loud-bail rule as `tole mcp` for hooks: the ACP host
             // does not wire local pre/post hooks — approvals happen in
             // the editor via permission requests instead.
@@ -386,6 +457,8 @@ fn dispatch(cli: Cli) -> Result<()> {
                      (approvals happen via session/request_permission in the client)"
                 );
             }
+            #[cfg(feature = "mcp")]
+            check_client_session_flags("acp", &host.skills, host.no_skills, explicit_mcp)?;
             if host.plan_mode {
                 eprintln!("tole acp: --plan-mode is active — serving read-only tools only");
             }
@@ -400,6 +473,8 @@ fn dispatch(cli: Cli) -> Result<()> {
                 workspace.as_ref(),
                 host.plan_mode,
                 memory,
+                sessions_dir_override.clone(),
+                host.on_turnend.clone(),
             )
         }
         #[cfg(feature = "shell-tools")]
@@ -408,10 +483,22 @@ fn dispatch(cli: Cli) -> Result<()> {
             bind,
             transport,
             token,
-            allow_patterns,
+            allow_patterns: allow_patterns_in,
             workspace,
             memory,
         } => {
+            let allow_patterns = with_trust(allow_patterns_in, &trust_extra);
+            // Loud bails, same rule as `tole mcp`/`tole acp`: these host
+            // flags have no server-face wiring, and a silent no-op is
+            // worse than a startup error (scan-3 #9).
+            if host.on_pretool_non_empty() || host.on_posttool_non_empty() {
+                anyhow::bail!(
+                    "--on-pretool/--on-posttool are not supported by `tole serve` \
+                     (a server has no local human; pre-authorize Write tools with --allow)"
+                );
+            }
+            #[cfg(feature = "mcp")]
+            check_client_session_flags("serve", &host.skills, host.no_skills, explicit_mcp)?;
             let memory = match memory.as_deref().filter(|s| !s.trim().is_empty()) {
                 Some(_) => resolve_memory(memory.as_ref())?,
                 None => host.memory.clone(),
@@ -436,6 +523,9 @@ fn dispatch(cli: Cli) -> Result<()> {
                         allow_patterns,
                         host.plan_mode,
                         memory,
+                        workspace.as_ref(),
+                        sessions_dir_override.clone(),
+                        host.on_turnend.clone(),
                     ));
                 }
                 #[cfg(not(feature = "mcp-http"))]
@@ -449,6 +539,8 @@ fn dispatch(cli: Cli) -> Result<()> {
                 workspace,
                 plan_mode: host.plan_mode,
                 memory,
+                sessions_dir: sessions_dir_override,
+                turnend: host.on_turnend.clone(),
             })
         }
         Command::Sessions => sessions_command(&sessions_dir),
@@ -457,17 +549,20 @@ fn dispatch(cli: Cli) -> Result<()> {
             system,
             resume,
             last,
-            allow_patterns,
+            allow_patterns: allow_patterns_in,
             yes,
-        } => chat_command(
-            &sessions_dir,
-            system.as_deref(),
-            resume,
-            last,
-            &allow_patterns,
-            yes,
-            &host,
-        ),
+        } => {
+            let allow_patterns = with_trust(allow_patterns_in, &trust_extra);
+            chat_command(
+                &sessions_dir,
+                system.as_deref(),
+                resume,
+                last,
+                &allow_patterns,
+                yes,
+                &host,
+            )
+        }
     }
 }
 
@@ -480,10 +575,18 @@ fn dispatch(cli: Cli) -> Result<()> {
 /// signatures stop growing with every feature.
 struct HostConfig {
     workspace: Option<String>,
+    /// Issue #161: explicit --skill files (loaded into the system prompt)
+    skills: Vec<PathBuf>,
+    /// Issue #161: --no-skills disables skills discovery + load_skill.
+    no_skills: bool,
     #[cfg(feature = "mcp")]
     mcp_server: Vec<String>,
     /// Plan mode (issue #109): registry filtered to ReadOnly tools.
     plan_mode: bool,
+    /// Child agents (#171): PARENT-ONLY operator mode — children spawn
+    /// into per-child git worktrees. Default false; the model cannot
+    /// flip this per call (storage boomerang, owner decision 2026-10-05).
+    agents_worktree: bool,
 
     /// Tool-boundary hook command lines (issue #110), default empty.
     on_pretool: Vec<String>,
@@ -700,11 +803,144 @@ fn detect_github_repo(cwd: &Path) -> Option<String> {
     tole_cli::session_host::github_repo_from_remote_url(&String::from_utf8_lossy(&out.stdout))
 }
 
+/// Trust presets (issue #159): one word for "auto-allow the fleet's own
+/// ecosystem tools". Pure sugar — the expanded patterns feed the SAME
+/// AllowlistApprover machinery as `--allow`, so enforcement (and the
+/// Destructive-never-allowed invariant) is unchanged. `internal` covers
+/// the probe-gated native integrations (uteke_*, cora_search) plus the
+/// cora MCP auto-preset surface (mcp_cora_*) and the always-safe
+/// verify_package/job tools; it deliberately excludes the write-capable
+/// native tools (write_file/edit_file/run_command/git/gh), which keep
+/// prompting.
+const TRUST_PRESETS: &[(&str, &[&str])] = &[
+    (
+        "internal",
+        &[
+            "uteke_*",
+            "cora_search",
+            "mcp_cora_*",
+            "verify_package",
+            "job_*",
+            "tole_session_*",
+        ],
+    ),
+    (
+        "read_only",
+        &[
+            "read_file",
+            "verify_package",
+            "uteke_recall",
+            "cora_search",
+            "tole_session_status",
+            "tole_session_list",
+            "job_poll",
+        ],
+    ),
+];
+
+/// Effective trust-preset flag list: an explicit `--trust` flag wins
+/// wholesale over the `TOLE_TRUST` env; with no flags, the env (split on
+/// commas/whitespace) is the list. Found by activation testing
+/// 2026-10-05: the env was documented ("flag wins over the TOLE_TRUST
+/// env") but never read — same documented-but-unimplemented class as the
+/// #138 ambiguity refusal.
+fn resolve_trust_flags(flag: &[String], env_val: Option<String>) -> Vec<String> {
+    if !flag.is_empty() {
+        return flag.to_vec();
+    }
+    let Some(env_val) = env_val else {
+        return Vec::new();
+    };
+    env_val
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Expand `--trust` preset names into extra allow patterns. Unknown
+/// preset names are a hard error — a typo silently narrowing trust would
+/// be worse than failing. `none`/empty → no extra patterns.
+fn expand_trust(presets: &[String]) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for p in presets {
+        if p.eq_ignore_ascii_case("none") {
+            continue;
+        }
+        let found = TRUST_PRESETS
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(p))
+            .map(|(_, patterns)| patterns);
+        let Some(patterns) = found else {
+            let names: Vec<&str> = TRUST_PRESETS.iter().map(|(n, _)| *n).collect();
+            anyhow::bail!(
+                "unknown trust preset {p:?} — available: {}",
+                names.join(", ")
+            );
+        };
+        out.extend(patterns.iter().map(|s| s.to_string()));
+    }
+    Ok(out)
+}
+
+/// Append the trust-preset patterns to the user's `--allow` list.
+fn with_trust(mut allow_patterns: Vec<String>, trust_extra: &[String]) -> Vec<String> {
+    allow_patterns.extend(trust_extra.iter().cloned());
+    allow_patterns
+}
+
+/// Server faces (mcp/serve/acp) refuse client-session-only flags loudly
+/// instead of silently ignoring them (scan-3 #9 rule; found by the
+/// 2026-10-05 full-feature sweep passing these flags got no error and
+/// no effect). `explicit_mcp_servers` must be the RAW `--mcp-server`
+/// flag state, not the merged preset list — the cora auto-preset must
+/// not trip this.
+///
+/// Every call site is `#[cfg(feature = "mcp")]`-gated (the `--mcp-server`
+/// flag and its presets exist only there), so without the `mcp` feature
+/// the function is unreachable and gated out to stay warning-free.
+#[cfg(feature = "mcp")]
+fn check_client_session_flags(
+    face: &str,
+    skills: &[PathBuf],
+    no_skills: bool,
+    explicit_mcp_servers: bool,
+) -> Result<()> {
+    if !skills.is_empty() {
+        anyhow::bail!(
+            "--skill is not supported by `tole {face}` (skills load into \
+             run/chat/resume session system prompts)"
+        );
+    }
+    if no_skills {
+        anyhow::bail!(
+            "--no-skills is not supported by `tole {face}` (server faces never load \
+             skills — nothing to disable)"
+        );
+    }
+    if explicit_mcp_servers {
+        anyhow::bail!(
+            "--mcp-server is not supported by `tole {face}` (external MCP clients \
+             attach to run/chat/resume sessions; server faces serve their own registry)"
+        );
+    }
+    Ok(())
+}
+
 fn build_registry(
     approver: InteractiveApprover<StdioPrompt>,
     workspace: Option<&String>,
     #[cfg(feature = "mcp")] mcp_servers: &[tole_core::mcp::McpServerConfig],
+    agents_worktree: bool,
+    parent_allows: &[String],
 ) -> Result<ToolRegistry> {
+    // Child-agent depth (#171): spawned children carry TOLE_AGENT_DEPTH=1;
+    // at depth >= 1 the agent tools vanish (structural cap) and the
+    // spawn-yourself bypass closes in run_command/job_start.
+    let agent_depth: u32 = std::env::var("TOLE_AGENT_DEPTH")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0);
     let mut reg = ToolRegistry::with_approver(approver);
     let cwd = std::env::current_dir().context("resolving cwd")?;
     let file_root = resolve_workspace_root(workspace)?;
@@ -722,18 +958,60 @@ fn build_registry(
     }
     // Generic dynamic command (B4): argv-split, cwd-jailed, Risk::Write.
     #[cfg(feature = "shell-tools")]
-    reg.register(Box::new(RunCommandTool::new(cwd.clone())))
+    let run_cmd = RunCommandTool::new(cwd.clone());
+    let run_cmd = if std::env::var("TOLE_AGENT_DEPTH")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(0)
+        >= 1
+    {
+        run_cmd.in_child_agent_mode()
+    } else {
+        run_cmd
+    };
+    reg.register(Box::new(run_cmd))
         .map_err(|e| anyhow::anyhow!("registering run_command: {e}"))?;
     // Long-running jobs (#59): detached spawn + poll, logs inside the
     // file-tools workspace so read_file can reach the full log.
     #[cfg(feature = "shell-tools")]
-    reg.register(Box::new(JobStartTool::new(file_root.clone())))
+    let job_start = JobStartTool::new(file_root.clone());
+    let job_start = if std::env::var("TOLE_AGENT_DEPTH")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(0)
+        >= 1
+    {
+        job_start.in_child_agent_mode()
+    } else {
+        job_start
+    };
+    reg.register(Box::new(job_start))
         .map_err(|e| anyhow::anyhow!("registering job_start: {e}"))?;
     #[cfg(feature = "shell-tools")]
     reg.register(Box::new(JobPollTool::new(file_root.clone())))
         .map_err(|e| anyhow::anyhow!("registering job_poll: {e}"))?;
     reg.register(Box::new(VerifyPackageTool::new()))
         .map_err(|e| anyhow::anyhow!("registering verify_package: {e}"))?;
+    // systemone_decide (#172): probe-gated — present iff SYSTEMONE_API_KEY
+    // is set; absent key = silently off (owner decision 2026-10-05).
+    if let Some(t) = tole_core::systemone::SystemOneTool::from_env() {
+        reg.register(Box::new(t))
+            .map_err(|e| anyhow::anyhow!("registering systemone_decide: {e}"))?;
+    }
+    // Child agents (#171): parent-only. Depth >= 1 = this IS a child —
+    // no agent tools at all (the structural depth cap).
+    if agent_depth == 0 {
+        let bin = std::env::current_exe().context("resolving the tole binary for child agents")?;
+        let start = tole_core::agents::AgentStartTool::new(bin, file_root.clone())
+            .with_worktrees(agents_worktree)
+            .with_parent_allows(parent_allows.to_vec());
+        reg.register(Box::new(start))
+            .map_err(|e| anyhow::anyhow!("registering agent_start: {e}"))?;
+        reg.register(Box::new(tole_core::agents::AgentPollTool::new(
+            file_root.clone(),
+        )))
+        .map_err(|e| anyhow::anyhow!("registering agent_poll: {e}"))?;
+    }
     reg.register(Box::new(ReadFileTool::new(file_root.clone())))
         .map_err(|e| anyhow::anyhow!("registering read_file: {e}"))?;
     // Write tools: gated per call. The jail root is the workspace.
@@ -749,6 +1027,7 @@ fn build_registry(
         let gh_repo = detect_github_repo(&cwd).unwrap_or_else(|| "codecoradev/tole".into());
         reg.register(Box::new(GhTool::new(gh_repo)))
             .map_err(|e| anyhow::anyhow!("registering gh: {e}"))?;
+        tole_cli::session_host::register_gitea(&mut reg, &cwd);
     }
     // Light git: status/diff/add/commit (push stays human).
     #[cfg(feature = "shell-tools")]
@@ -825,15 +1104,43 @@ fn build_server_registry(
             reg.register(Box::new(UtekeDocumentTool::new(None)))
                 .map_err(|e| anyhow::anyhow!("registering uteke_document: {e}"))?;
         }
-        reg.register(Box::new(RunCommandTool::new(cwd.clone())))
+        let run_cmd = RunCommandTool::new(cwd.clone());
+        let run_cmd = if std::env::var("TOLE_AGENT_DEPTH")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+            >= 1
+        {
+            run_cmd.in_child_agent_mode()
+        } else {
+            run_cmd
+        };
+        reg.register(Box::new(run_cmd))
             .map_err(|e| anyhow::anyhow!("registering run_command: {e}"))?;
-        reg.register(Box::new(JobStartTool::new(file_root.clone())))
+        let job_start = JobStartTool::new(file_root.clone());
+        let job_start = if std::env::var("TOLE_AGENT_DEPTH")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+            >= 1
+        {
+            job_start.in_child_agent_mode()
+        } else {
+            job_start
+        };
+        reg.register(Box::new(job_start))
             .map_err(|e| anyhow::anyhow!("registering job_start: {e}"))?;
         reg.register(Box::new(JobPollTool::new(file_root.clone())))
             .map_err(|e| anyhow::anyhow!("registering job_poll: {e}"))?;
     }
     reg.register(Box::new(VerifyPackageTool::new()))
         .map_err(|e| anyhow::anyhow!("registering verify_package: {e}"))?;
+    // systemone_decide (#172): probe-gated — present iff SYSTEMONE_API_KEY
+    // is set; absent key = silently off (owner decision 2026-10-05).
+    if let Some(t) = tole_core::systemone::SystemOneTool::from_env() {
+        reg.register(Box::new(t))
+            .map_err(|e| anyhow::anyhow!("registering systemone_decide: {e}"))?;
+    }
     reg.register(Box::new(ReadFileTool::new(file_root.clone())))
         .map_err(|e| anyhow::anyhow!("registering read_file: {e}"))?;
     reg.register(Box::new(WriteFileTool::new(file_root.clone())))
@@ -845,6 +1152,7 @@ fn build_server_registry(
         let gh_repo = detect_github_repo(&cwd).unwrap_or_else(|| "codecoradev/tole".into());
         reg.register(Box::new(GhTool::new(gh_repo)))
             .map_err(|e| anyhow::anyhow!("registering gh: {e}"))?;
+        tole_cli::session_host::register_gitea(&mut reg, &cwd);
         reg.register(Box::new(GitTool::new().in_dir(cwd.clone())))
             .map_err(|e| anyhow::anyhow!("registering git: {e}"))?;
     }
@@ -854,10 +1162,6 @@ fn build_server_registry(
     Ok(reg)
 }
 
-/// D1 (issue #94): serve the registry over MCP stdio. Blocks until the
-/// client disconnects.
-#[cfg(all(feature = "mcp", feature = "shell-tools"))]
-#[cfg_attr(not(feature = "mcp"), allow(unused_variables))]
 /// Server-mode registry for the MCP-over-HTTP host (#137): the same
 /// hardened tools as stdio MCP (D1); the session tools join separately
 /// via RegistryServer::with_extra_tools.
@@ -868,17 +1172,24 @@ fn build_server_registry_for_mcp(_plan_mode: bool) -> Result<ToolRegistry> {
     build_server_registry(None, &[])
 }
 
+/// D1 (issue #94): serve the registry over MCP stdio. Blocks until the
+/// client disconnects.
+///
+/// Gated as a whole (issue #175): only the gated `Command::Mcp` arm
+/// calls it, but an ungated definition still references
+/// `build_server_registry` and `tole_core::mcp_server::serve_stdio` —
+/// both absent without the `mcp` feature — so the no-mcp profile
+/// failed to compile even though every call site was gated.
+#[cfg(all(feature = "mcp", feature = "shell-tools"))]
 fn mcp_server_command(
     workspace: Option<&String>,
     allow_patterns: &[String],
-    #[cfg(feature = "mcp")] plan_mode: bool,
+    plan_mode: bool,
 ) -> Result<()> {
     let registry = build_server_registry(workspace, allow_patterns)?;
     // Plan mode (issue #109) applies to server mode too (cora scan-3
     // #9): serve read-only tools only when the operator asked for it.
-    #[cfg(feature = "mcp")]
     let mut registry = registry;
-    #[cfg(feature = "mcp")]
     if plan_mode {
         let mut reg = registry;
         reg.retain_read_only();
@@ -894,6 +1205,65 @@ fn mcp_server_command(
 // ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
+
+/// Skills wiring (issue #161): shared by run/chat/serve. Loads `--skill`
+/// files (loud error on broken ones), and when the workspace exposes a
+/// non-empty skills dir, registers the ReadOnly load_skill tool and
+/// returns the index/section block to append to the system prompt.
+/// `--no-skills` short-circuits everything.
+///
+/// Discovery root: an explicit `--workspace` wins; absent flags fall
+/// back to the CURRENT DIRECTORY — the same default the file-tools
+/// jail uses (found by the 2026-10-05 sweep: a project with
+/// `<cwd>/skills/` and no flag silently got no discovery).
+fn apply_skills(
+    skills: &[PathBuf],
+    workspace: Option<&String>,
+    no_skills: bool,
+    registry: &mut ToolRegistry,
+) -> Result<String> {
+    if no_skills {
+        return Ok(String::new());
+    }
+    let ws_root = resolve_workspace_root(workspace)?;
+    apply_skills_in(skills, Some(ws_root), false, registry)
+}
+
+/// Testable core of [`apply_skills`] taking the RESOLVED discovery
+/// root (None = caller already resolved to cwd; kept Option so tests
+/// can pass a tmpdir without changing the process cwd).
+fn apply_skills_in(
+    skills: &[PathBuf],
+    ws_root: Option<PathBuf>,
+    no_skills: bool,
+    registry: &mut ToolRegistry,
+) -> Result<String> {
+    let mut sections = String::new();
+    if no_skills {
+        return Ok(sections);
+    }
+    let ws_path = ws_root;
+    for path in skills {
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("--skill {}: {e}", path.display()))?;
+        let name = path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("skill")
+            .to_string();
+        let skill = tole_core::skills::parse_skill(&content, &name)
+            .map_err(|e| anyhow::anyhow!("--skill {}: {e}", path.display()))?;
+        sections.push_str(&format!("\n\n# Skill: {}\n{}", skill.name, skill.body));
+    }
+    if !tole_core::skills::available_skills(ws_path.as_deref()).is_empty() {
+        sections.push_str(&tole_core::skills::index_block(ws_path.as_deref()));
+        registry
+            .register(Box::new(tole_core::skills::LoadSkillTool::new(ws_path)))
+            .map_err(|e| anyhow::anyhow!("registering load_skill: {e}"))?;
+    }
+    Ok(sections)
+}
 
 fn run_command(
     sessions_dir: &Path,
@@ -922,15 +1292,28 @@ fn run_command(
         build_approver(allow_patterns, yes),
         host.workspace.as_ref(),
         &mcp_cfgs,
+        host.agents_worktree,
+        allow_patterns,
     )?;
     #[cfg(not(feature = "mcp"))]
-    let mut registry =
-        build_registry(build_approver(allow_patterns, yes), host.workspace.as_ref())?;
+    let mut registry = build_registry(
+        build_approver(allow_patterns, yes),
+        host.workspace.as_ref(),
+        host.agents_worktree,
+        allow_patterns,
+    )?;
     // Plan mode (issue #109): the guarantee is ABSENCE on the wire, not
     // approval — filtered tools never appear in specs().
     if host.plan_mode {
         registry.retain_read_only();
     }
+    // Skills (issue #161): --skill files + discovery; load_skill registers ReadOnly.
+    let skill_sections = apply_skills(
+        &host.skills,
+        host.workspace.as_ref(),
+        host.no_skills,
+        &mut registry,
+    )?;
     // Opt-in tool-boundary hooks (issue #110): deny-only policy
     // injection for Write/Destructive calls, default OFF.
     #[cfg(feature = "shell-tools")]
@@ -951,6 +1334,8 @@ fn run_command(
         .map(str::to_string)
         .or_else(resolve_system_prompt)
         .or_else(|| Some(build_default_prompt(host.plan_mode)));
+    // Skills (issue #161): skill sections append after the base prompt.
+    let system_prompt = system_prompt.map(|p| format!("{p}{skill_sections}"));
     let mut storage =
         JsonlStorage::create_with(sessions_dir, &session_id, None, system_prompt.as_deref())
             .with_context(|| format!("creating session {session_id}"))?;
@@ -1012,15 +1397,28 @@ fn resume_command(
         build_approver(allow_patterns, yes),
         host.workspace.as_ref(),
         &mcp_cfgs,
+        host.agents_worktree,
+        allow_patterns,
     )?;
     #[cfg(not(feature = "mcp"))]
-    let mut registry =
-        build_registry(build_approver(allow_patterns, yes), host.workspace.as_ref())?;
+    let mut registry = build_registry(
+        build_approver(allow_patterns, yes),
+        host.workspace.as_ref(),
+        host.agents_worktree,
+        allow_patterns,
+    )?;
     // Plan mode (issue #109): the guarantee is ABSENCE on the wire, not
     // approval — filtered tools never appear in specs().
     if host.plan_mode {
         registry.retain_read_only();
     }
+    // Skills (issue #161): --skill files + discovery; load_skill registers ReadOnly.
+    let _skill_sections = apply_skills(
+        &host.skills,
+        host.workspace.as_ref(),
+        host.no_skills,
+        &mut registry,
+    )?;
     // Opt-in tool-boundary hooks (issue #110): deny-only policy
     // injection for Write/Destructive calls, default OFF.
     #[cfg(feature = "shell-tools")]
@@ -1298,15 +1696,28 @@ fn chat_command(
         build_approver(allow_patterns, yes),
         host.workspace.as_ref(),
         &mcp_cfgs,
+        host.agents_worktree,
+        allow_patterns,
     )?;
     #[cfg(not(feature = "mcp"))]
-    let mut registry =
-        build_registry(build_approver(allow_patterns, yes), host.workspace.as_ref())?;
+    let mut registry = build_registry(
+        build_approver(allow_patterns, yes),
+        host.workspace.as_ref(),
+        host.agents_worktree,
+        allow_patterns,
+    )?;
     // Plan mode (issue #109): the guarantee is ABSENCE on the wire, not
     // approval — filtered tools never appear in specs().
     if host.plan_mode {
         registry.retain_read_only();
     }
+    // Skills (issue #161): --skill files + discovery; load_skill registers ReadOnly.
+    let skill_sections = apply_skills(
+        &host.skills,
+        host.workspace.as_ref(),
+        host.no_skills,
+        &mut registry,
+    )?;
     // Opt-in tool-boundary hooks (issue #110): deny-only policy
     // injection for Write/Destructive calls, default OFF.
     #[cfg(feature = "shell-tools")]
@@ -1330,6 +1741,8 @@ fn chat_command(
             .map(str::to_string)
             .or_else(resolve_system_prompt)
             .or_else(|| Some(build_default_prompt(host.plan_mode)));
+        // Skills (issue #161): sections append after the base prompt.
+        let system_prompt = system_prompt.map(|p| format!("{p}{skill_sections}"));
         JsonlStorage::create_with(sessions_dir, &session_id, None, system_prompt.as_deref())
             .with_context(|| format!("creating session {session_id}"))?
     } else {
@@ -1489,6 +1902,9 @@ fn chat_command(
                     "tole> (stop gate blocked: {reason} — turn aborted; next message resumes)"
                 )
             }
+            Ok(TurnOutcome::Cancelled) => {
+                eprintln!("tole> (turn cancelled — next message resumes)")
+            }
             Ok(TurnOutcome::LoopDetected { .. }) => eprintln!(
                 "tole> (loop guard tripped — identical tool calls repeated; next message resumes)"
             ),
@@ -1645,6 +2061,10 @@ fn report_outcome(session_id: &str, outcome: TurnOutcome) {
         TurnOutcome::BudgetExhausted => {
             eprintln!("tole: step budget exhausted (resume with: tole resume {session_id})");
             std::process::exit(5);
+        }
+        TurnOutcome::Cancelled => {
+            eprintln!("tole: turn cancelled (resume with: tole resume {session_id})");
+            std::process::exit(8);
         }
         TurnOutcome::LoopDetected { tool, count } => {
             eprintln!(
@@ -1892,5 +2312,209 @@ mod mcp_preset_tests {
         // downstream with its normal error — this merge never panics).
         let merged = merge_mcp_specs(&["not-a-spec".into()], false, vec!["cora=cora mcp".into()]);
         assert_eq!(merged, vec!["not-a-spec", "cora=cora mcp"]);
+    }
+}
+
+#[cfg(test)]
+mod trust_preset_tests {
+    use super::*;
+
+    #[test]
+    fn internal_expands_to_expected_patterns() {
+        let pats = expand_trust(&["internal".to_string()]).unwrap();
+        for want in [
+            "uteke_*",
+            "cora_search",
+            "mcp_cora_*",
+            "verify_package",
+            "job_*",
+            "tole_session_*",
+        ] {
+            assert!(
+                pats.iter().any(|p| p == want),
+                "internal missing {want}: {pats:?}"
+            );
+        }
+        // must NOT include write-capable native tools
+        assert!(!pats.iter().any(|p| p == "write_file"));
+        assert!(!pats.iter().any(|p| p == "run_command"));
+    }
+
+    #[test]
+    fn none_expands_to_empty() {
+        assert!(expand_trust(&["none".to_string()]).unwrap().is_empty());
+        assert!(expand_trust(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn unknown_preset_is_a_loud_error() {
+        let err = expand_trust(&["internalx".to_string()]).unwrap_err();
+        assert!(err.to_string().contains("unknown trust preset"));
+        assert!(err.to_string().contains("internal"));
+    }
+
+    #[test]
+    fn case_insensitive_and_union() {
+        let pats = expand_trust(&["INTERNAL".to_string(), "read_only".to_string()]).unwrap();
+        assert!(pats.iter().any(|p| p == "uteke_*"));
+        assert!(pats.iter().any(|p| p == "read_file"));
+    }
+
+    #[test]
+    fn with_trust_appends_preserving_user_patterns() {
+        let out = with_trust(
+            vec!["write_file".to_string()],
+            &["uteke_*".to_string(), "cora_search".to_string()],
+        );
+        assert_eq!(out, vec!["write_file", "uteke_*", "cora_search"]);
+    }
+
+    #[test]
+    fn trust_env_used_when_flag_absent() {
+        let flags = resolve_trust_flags(&[], Some("internal".to_string()));
+        assert_eq!(flags, vec!["internal"]);
+        // commas and whitespace both separate presets
+        let flags = resolve_trust_flags(&[], Some("internal, read_only".to_string()));
+        assert_eq!(flags, vec!["internal", "read_only"]);
+    }
+
+    #[test]
+    fn trust_flag_wins_over_env() {
+        let flags = resolve_trust_flags(&["read_only".to_string()], Some("internal".to_string()));
+        assert_eq!(flags, vec!["read_only"], "explicit flag replaces the env");
+    }
+
+    #[test]
+    fn trust_env_end_to_end_expands() {
+        // the dispatch path: env-only resolves, then expands
+        let flags = resolve_trust_flags(&[], Some(" internal ".to_string()));
+        let pats = expand_trust(&flags).unwrap();
+        assert!(pats.iter().any(|p| p == "uteke_*"));
+    }
+
+    #[test]
+    fn trust_env_typo_is_a_loud_error() {
+        let flags = resolve_trust_flags(&[], Some("internalx".to_string()));
+        let err = expand_trust(&flags).unwrap_err();
+        assert!(err.to_string().contains("unknown trust preset"));
+    }
+}
+
+#[cfg(test)]
+mod skills_wiring_tests {
+    use super::*;
+
+    #[test]
+    fn apply_skills_loads_explicit_skill_files_and_registers_tool() {
+        let dir = std::env::temp_dir().join(format!("tole-skills-wire-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("skills").join("demo")).unwrap();
+        std::fs::write(
+            dir.join("skills").join("demo").join("SKILL.md"),
+            "---\nname: demo\ndescription: \"d\"\n---\nbody",
+        )
+        .unwrap();
+        let mut reg = ToolRegistry::new();
+        let skill_file = dir.join("skills").join("demo").join("SKILL.md");
+        let sections = apply_skills(
+            &[skill_file],
+            Some(&dir.to_string_lossy().to_string()),
+            false,
+            &mut reg,
+        )
+        .unwrap();
+        assert!(sections.contains("# Skill: demo"));
+        assert!(sections.contains("body"));
+        assert!(reg.get("load_skill").is_some(), "load_skill registered");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_skills_no_skills_short_circuits() {
+        let dir = std::env::temp_dir().join(format!("tole-skills-off-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("skills").join("demo")).unwrap();
+        std::fs::write(
+            dir.join("skills").join("demo").join("SKILL.md"),
+            "---\nname: demo\ndescription: \"d\"\n---\nbody",
+        )
+        .unwrap();
+        let mut reg = ToolRegistry::new();
+        let sections = apply_skills(
+            &[],
+            Some(&dir.to_string_lossy().to_string()),
+            true,
+            &mut reg,
+        )
+        .unwrap();
+        assert!(sections.is_empty());
+        assert!(
+            reg.get("load_skill").is_none(),
+            "--no-skills must not register"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F4 (2026-10-05): discovery must work from the RESOLVED root —
+    /// `apply_skills` with no --workspace now feeds the cwd in here, the
+    /// same default the file-tools jail uses. Pin the resolved-root
+    /// path (no explicit --skill files, discovery only).
+    #[test]
+    fn apply_skills_in_discovers_from_resolved_root() {
+        let dir = std::env::temp_dir().join(format!("tole-skills-cwd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("skills").join("demo")).unwrap();
+        std::fs::write(
+            dir.join("skills").join("demo").join("SKILL.md"),
+            "---\nname: demo\ndescription: \"d\"\n---\nbody",
+        )
+        .unwrap();
+        let mut reg = ToolRegistry::new();
+        let sections = apply_skills_in(&[], Some(dir.clone()), false, &mut reg).unwrap();
+        assert!(
+            sections.contains("demo"),
+            "discovery index must list the skill: {sections}"
+        );
+        assert!(reg.get("load_skill").is_some(), "load_skill registered");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_workspace_root_none_defaults_to_cwd() {
+        let root = resolve_workspace_root(None).unwrap();
+        assert_eq!(root, std::env::current_dir().unwrap());
+    }
+}
+
+#[cfg(all(test, feature = "mcp"))]
+mod server_face_flag_tests {
+    use super::*;
+
+    #[test]
+    fn clean_flags_pass() {
+        assert!(check_client_session_flags("serve", &[], false, false).is_ok());
+    }
+
+    #[test]
+    fn skill_flag_bails_loudly() {
+        let err =
+            check_client_session_flags("mcp", &[PathBuf::from("/tmp/SKILL.md")], false, false)
+                .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("--skill"), "{msg}");
+        assert!(msg.contains("tole mcp"), "{msg}");
+    }
+
+    #[test]
+    fn no_skills_flag_bails_loudly() {
+        let err = check_client_session_flags("acp", &[], true, false).unwrap_err();
+        assert!(err.to_string().contains("--no-skills"));
+    }
+
+    #[test]
+    fn explicit_mcp_server_bails_loudly() {
+        let err = check_client_session_flags("serve", &[], false, true).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("--mcp-server"), "{msg}");
+        assert!(msg.contains("tole serve"), "{msg}");
     }
 }
