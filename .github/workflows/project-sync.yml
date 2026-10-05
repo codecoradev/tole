@@ -82,7 +82,7 @@ jobs:
             }
           }'
 
-          SET_DONE_QUERY='mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: ID!) {
+          SET_DONE_QUERY='mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
             updateProjectV2ItemFieldValue(input: {
               projectId: $projectId,
               itemId: $itemId,
