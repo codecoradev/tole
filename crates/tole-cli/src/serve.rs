@@ -41,6 +41,11 @@ pub struct ServeConfig {
     pub workspace: Option<String>,
     pub plan_mode: bool,
     pub memory: Option<MemoryConfig>,
+    /// Explicit `--sessions-dir` override (None = per-session-cwd
+    /// default, the pre-existing behavior).
+    pub sessions_dir: Option<std::path::PathBuf>,
+    /// `--on-turnend` stop gates wired onto every session registry.
+    pub turnend: Vec<String>,
 }
 
 /// Max concurrently open connections: each pinned thread holds ~8 KiB
@@ -59,6 +64,8 @@ struct State {
     memory: Option<MemoryConfig>,
     token: String,
     workspace_default: Option<String>,
+    sessions_dir: Option<std::path::PathBuf>,
+    turnend: Vec<String>,
     live_connections: std::sync::atomic::AtomicUsize,
     /// (window_start_epoch, failure_count) per source IP — fixed-window
     /// auth-failure limiter (brute-force hardening).
@@ -82,6 +89,8 @@ pub fn run_serve(cfg: ServeConfig) -> Result<()> {
         memory: cfg.memory.clone(),
         token,
         workspace_default: cfg.workspace.clone(),
+        sessions_dir: cfg.sessions_dir.clone(),
+        turnend: cfg.turnend.clone(),
         live_connections: std::sync::atomic::AtomicUsize::new(0),
         auth_failures: Mutex::new(HashMap::new()),
     });
@@ -348,6 +357,8 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                 state.plan_mode,
                 approver,
                 state.memory.clone(),
+                state.sessions_dir.as_deref(),
+                state.turnend.clone(),
             ) {
                 Ok(session_state) => {
                     {

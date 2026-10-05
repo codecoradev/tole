@@ -230,6 +230,8 @@ pub fn run_acp(
     _workspace_default: Option<&String>,
     plan_mode: bool,
     memory: Option<tole_core::memory::MemoryConfig>,
+    sessions_dir: Option<std::path::PathBuf>,
+    turnend: Vec<String>,
 ) -> Result<()> {
     let (line_tx, line_rx) = mpsc::channel::<String>();
     let conn = Conn::new(line_tx.clone());
@@ -337,6 +339,8 @@ pub fn run_acp(
                     plan_mode,
                     approver,
                     memory.clone(),
+                    sessions_dir.as_deref(),
+                    turnend.clone(),
                 ) {
                     Ok(state) => {
                         // Insert + busy re-check in ONE critical section:

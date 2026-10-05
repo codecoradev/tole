@@ -101,8 +101,10 @@ struct Cli {
     /// Pre-tool-use process hook (issue #110): runs before every
     /// Write/Destructive tool executes. Receives one JSON object on
     /// stdin (`{"event":"pretool","tool":...,"input":...}`); exit code
-    /// 2 = DENY the call (durable, the loop replans); any other
-    /// non-zero exit / timeout is a logged non-blocking hook failure.
+    /// 2 = DENY the call (durable — the turn parks at the denial like
+    /// an approval denial and is resumable; on resume WITH a new prompt
+    /// the model sees the denial and replans); any other non-zero exit
+    /// / timeout is a logged non-blocking hook failure.
     /// Example: --on-pretool /usr/local/bin/tole-guard.sh. Repeatable;
     /// default OFF.
     #[arg(long, global = true)]
@@ -314,8 +316,18 @@ fn dispatch(cli: Cli) -> Result<()> {
             .clone()
             .unwrap_or_else(|| DEFAULT_SESSIONS_DIR.to_string()),
     );
+    // The RAW override for the server faces: an explicit --sessions-dir
+    // relocates serve/acp session storage; the default (None) keeps the
+    // per-session-cwd layout those faces always had. The resolved
+    // `sessions_dir` above stays the run/chat/sessions/status default.
+    let sessions_dir_override = cli.sessions_dir.clone().map(PathBuf::from);
     #[cfg(feature = "mcp")]
     let mcp_specs = merge_mcp_specs(&cli.mcp_server, cli.no_auto_mcp, auto_mcp_specs());
+    // Explicit --mcp-server flags only — the merged `mcp_specs` also
+    // contains the cora auto-preset, which must NOT trigger the
+    // server-face refusal below.
+    #[cfg(feature = "mcp")]
+    let explicit_mcp = !cli.mcp_server.is_empty();
     // scan-3 finding fix: the global --workspace/--memory flags now flow
     // into the host, so `tole serve/acp/mcp` honor them as fallbacks when
     // the subcommand-level flags are absent (previously they were
@@ -391,6 +403,14 @@ fn dispatch(cli: Cli) -> Result<()> {
                      (server mode pre-authorizes Write tools with --allow instead)"
                 );
             }
+            if !host.on_turnend.is_empty() {
+                anyhow::bail!(
+                    "--on-turnend is not supported by `tole mcp` (the tool server runs no \
+                     turns; stop gates apply to run/chat/resume/serve/acp sessions)"
+                );
+            }
+            #[cfg(feature = "mcp")]
+            check_client_session_flags("mcp", &host.skills, host.no_skills, explicit_mcp)?;
             if host.plan_mode {
                 eprintln!("tole mcp: --plan-mode is active — serving read-only tools only");
             }
@@ -419,6 +439,8 @@ fn dispatch(cli: Cli) -> Result<()> {
                      (approvals happen via session/request_permission in the client)"
                 );
             }
+            #[cfg(feature = "mcp")]
+            check_client_session_flags("acp", &host.skills, host.no_skills, explicit_mcp)?;
             if host.plan_mode {
                 eprintln!("tole acp: --plan-mode is active — serving read-only tools only");
             }
@@ -433,6 +455,8 @@ fn dispatch(cli: Cli) -> Result<()> {
                 workspace.as_ref(),
                 host.plan_mode,
                 memory,
+                sessions_dir_override.clone(),
+                host.on_turnend.clone(),
             )
         }
         #[cfg(feature = "shell-tools")]
@@ -446,6 +470,17 @@ fn dispatch(cli: Cli) -> Result<()> {
             memory,
         } => {
             let allow_patterns = with_trust(allow_patterns_in, &trust_extra);
+            // Loud bails, same rule as `tole mcp`/`tole acp`: these host
+            // flags have no server-face wiring, and a silent no-op is
+            // worse than a startup error (scan-3 #9).
+            if host.on_pretool_non_empty() || host.on_posttool_non_empty() {
+                anyhow::bail!(
+                    "--on-pretool/--on-posttool are not supported by `tole serve` \
+                     (a server has no local human; pre-authorize Write tools with --allow)"
+                );
+            }
+            #[cfg(feature = "mcp")]
+            check_client_session_flags("serve", &host.skills, host.no_skills, explicit_mcp)?;
             let memory = match memory.as_deref().filter(|s| !s.trim().is_empty()) {
                 Some(_) => resolve_memory(memory.as_ref())?,
                 None => host.memory.clone(),
@@ -470,6 +505,9 @@ fn dispatch(cli: Cli) -> Result<()> {
                         allow_patterns,
                         host.plan_mode,
                         memory,
+                        workspace.as_ref(),
+                        sessions_dir_override.clone(),
+                        host.on_turnend.clone(),
                     ));
                 }
                 #[cfg(not(feature = "mcp-http"))]
@@ -483,6 +521,8 @@ fn dispatch(cli: Cli) -> Result<()> {
                 workspace,
                 plan_mode: host.plan_mode,
                 memory,
+                sessions_dir: sessions_dir_override,
+                turnend: host.on_turnend.clone(),
             })
         }
         Command::Sessions => sessions_command(&sessions_dir),
@@ -807,6 +847,39 @@ fn with_trust(mut allow_patterns: Vec<String>, trust_extra: &[String]) -> Vec<St
     allow_patterns
 }
 
+/// Server faces (mcp/serve/acp) refuse client-session-only flags loudly
+/// instead of silently ignoring them (scan-3 #9 rule; found by the
+/// 2026-10-05 full-feature sweep passing these flags got no error and
+/// no effect). `explicit_mcp_servers` must be the RAW `--mcp-server`
+/// flag state, not the merged preset list — the cora auto-preset must
+/// not trip this.
+fn check_client_session_flags(
+    face: &str,
+    skills: &[PathBuf],
+    no_skills: bool,
+    explicit_mcp_servers: bool,
+) -> Result<()> {
+    if !skills.is_empty() {
+        anyhow::bail!(
+            "--skill is not supported by `tole {face}` (skills load into \
+             run/chat/resume session system prompts)"
+        );
+    }
+    if no_skills {
+        anyhow::bail!(
+            "--no-skills is not supported by `tole {face}` (server faces never load \
+             skills — nothing to disable)"
+        );
+    }
+    if explicit_mcp_servers {
+        anyhow::bail!(
+            "--mcp-server is not supported by `tole {face}` (external MCP clients \
+             attach to run/chat/resume sessions; server faces serve their own registry)"
+        );
+    }
+    Ok(())
+}
+
 fn build_registry(
     approver: InteractiveApprover<StdioPrompt>,
     workspace: Option<&String>,
@@ -1007,9 +1080,30 @@ fn mcp_server_command(
 /// non-empty skills dir, registers the ReadOnly load_skill tool and
 /// returns the index/section block to append to the system prompt.
 /// `--no-skills` short-circuits everything.
+///
+/// Discovery root: an explicit `--workspace` wins; absent flags fall
+/// back to the CURRENT DIRECTORY — the same default the file-tools
+/// jail uses (found by the 2026-10-05 sweep: a project with
+/// `<cwd>/skills/` and no flag silently got no discovery).
 fn apply_skills(
     skills: &[PathBuf],
     workspace: Option<&String>,
+    no_skills: bool,
+    registry: &mut ToolRegistry,
+) -> Result<String> {
+    if no_skills {
+        return Ok(String::new());
+    }
+    let ws_root = resolve_workspace_root(workspace)?;
+    apply_skills_in(skills, Some(ws_root), false, registry)
+}
+
+/// Testable core of [`apply_skills`] taking the RESOLVED discovery
+/// root (None = caller already resolved to cwd; kept Option so tests
+/// can pass a tmpdir without changing the process cwd).
+fn apply_skills_in(
+    skills: &[PathBuf],
+    ws_root: Option<PathBuf>,
     no_skills: bool,
     registry: &mut ToolRegistry,
 ) -> Result<String> {
@@ -1017,7 +1111,7 @@ fn apply_skills(
     if no_skills {
         return Ok(sections);
     }
-    let ws_path = workspace.map(PathBuf::from);
+    let ws_path = ws_root;
     for path in skills {
         let content = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("--skill {}: {e}", path.display()))?;
@@ -2172,5 +2266,69 @@ mod skills_wiring_tests {
             "--no-skills must not register"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F4 (2026-10-05): discovery must work from the RESOLVED root —
+    /// `apply_skills` with no --workspace now feeds the cwd in here, the
+    /// same default the file-tools jail uses. Pin the resolved-root
+    /// path (no explicit --skill files, discovery only).
+    #[test]
+    fn apply_skills_in_discovers_from_resolved_root() {
+        let dir = std::env::temp_dir().join(format!("tole-skills-cwd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("skills").join("demo")).unwrap();
+        std::fs::write(
+            dir.join("skills").join("demo").join("SKILL.md"),
+            "---\nname: demo\ndescription: \"d\"\n---\nbody",
+        )
+        .unwrap();
+        let mut reg = ToolRegistry::new();
+        let sections = apply_skills_in(&[], Some(dir.clone()), false, &mut reg).unwrap();
+        assert!(
+            sections.contains("demo"),
+            "discovery index must list the skill: {sections}"
+        );
+        assert!(reg.get("load_skill").is_some(), "load_skill registered");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_workspace_root_none_defaults_to_cwd() {
+        let root = resolve_workspace_root(None).unwrap();
+        assert_eq!(root, std::env::current_dir().unwrap());
+    }
+}
+
+#[cfg(test)]
+mod server_face_flag_tests {
+    use super::*;
+
+    #[test]
+    fn clean_flags_pass() {
+        assert!(check_client_session_flags("serve", &[], false, false).is_ok());
+    }
+
+    #[test]
+    fn skill_flag_bails_loudly() {
+        let err =
+            check_client_session_flags("mcp", &[PathBuf::from("/tmp/SKILL.md")], false, false)
+                .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("--skill"), "{msg}");
+        assert!(msg.contains("tole mcp"), "{msg}");
+    }
+
+    #[test]
+    fn no_skills_flag_bails_loudly() {
+        let err = check_client_session_flags("acp", &[], true, false).unwrap_err();
+        assert!(err.to_string().contains("--no-skills"));
+    }
+
+    #[test]
+    fn explicit_mcp_server_bails_loudly() {
+        let err = check_client_session_flags("serve", &[], false, true).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("--mcp-server"), "{msg}");
+        assert!(msg.contains("tole serve"), "{msg}");
     }
 }

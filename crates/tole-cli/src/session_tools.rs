@@ -33,6 +33,11 @@ pub struct SessionToolState {
     /// (CodeCora on #137: without it a client could jail a session to
     /// `/` — the whole filesystem). Defaults to the server cwd.
     pub workspace_root: std::path::PathBuf,
+    /// Explicit `--sessions-dir` override (None = per-session-cwd
+    /// default, the pre-existing behavior).
+    pub sessions_dir: Option<std::path::PathBuf>,
+    /// `--on-turnend` stop gates wired onto every session registry.
+    pub turnend: Vec<String>,
 }
 
 impl SessionToolState {
@@ -41,6 +46,8 @@ impl SessionToolState {
         plan_mode: bool,
         memory: Option<MemoryConfig>,
         workspace_root: std::path::PathBuf,
+        sessions_dir: Option<std::path::PathBuf>,
+        turnend: Vec<String>,
     ) -> Self {
         Self {
             sessions: Arc::new(std::sync::Mutex::new(Sessions::default())),
@@ -48,6 +55,8 @@ impl SessionToolState {
             plan_mode,
             memory,
             workspace_root,
+            sessions_dir,
+            turnend,
         }
     }
 
@@ -144,6 +153,8 @@ impl Tool for SessionNewTool {
             self.0.plan_mode,
             approver,
             self.0.memory.clone(),
+            self.0.sessions_dir.as_deref(),
+            self.0.turnend.clone(),
         )?;
         {
             // Cap + eviction, mirroring the REST transport (CodeCora:

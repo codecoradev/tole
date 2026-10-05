@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `--trust` presets (#160): one-word trust for the fleet's ecosystem
+  tools — `internal` (uteke_*/cora_search/mcp_cora_*/verify_package/
+  job_*/tole_session_*), `read_only` (every safe read), `none`
+  (default). Pure sugar over `--allow` globs; Destructive is never
+  auto-allowed; unknown presets fail loudly; flag wins over the
+  `TOLE_TRUST` env. (Landed on develop 2026-10-02, backfilled here.)
+- SKILL.md support (#161/#162): `--skill <path>` loads a skill file
+  into the system prompt (fenced, 16 KiB cap, loud frontmatter errors);
+  discovery over `<workspace>/skills/` + `~/.codecora/tole/skills/`
+  registers the ReadOnly `load_skill` tool with a one-line index;
+  `--no-skills` disables everything. (Landed on develop 2026-10-02,
+  backfilled here.)
+
+### Fixed
+- Full-feature sweep findings (2026-10-05):
+  - **Silent no-op flags on the server faces** now fail loudly at
+    startup (the scan-3 #9 rule, previously enforced only for
+    pretool/posttool hooks): `--skill`/`--no-skills`/`--mcp-server` on
+    `tole mcp`/`serve`/`acp`, plus `--on-pretool`/`--on-posttool` on
+    `tole serve` (missed by the earlier bail) and `--on-turnend` on
+    `tole mcp`. The cora AUTO-PRESET does not trip the `--mcp-server`
+    refusal — only explicit flags do.
+  - `tole serve` (both transports) and `tole acp` now honor an explicit
+    `--sessions-dir` (default stays the per-session-cwd layout);
+    `tole serve --transport mcp` now honors `--workspace` as the
+    jail-of-jails root (default stays the server cwd); `--on-turnend`
+    stop gates are wired into serve/acp session turns (the same
+    registry-level gates the run host uses).
+  - **Multi-session MCP ambiguity refusal** (the #138-documented
+    behavior, previously unimplemented): a registry-tool call WITHOUT
+    `session_id` while 2+ sessions are open is refused with a clear
+    error instead of silently executing against the server-level
+    registry (server-cwd jail).
+  - Skills discovery now defaults to the CURRENT DIRECTORY when
+    `--workspace` is absent — the same default the file-tools jail
+    uses (a project with `<cwd>/skills/` used to silently get no
+    discovery).
+  - `--on-pretool` help text corrected: an exit-2 deny parks the turn
+    resumably at the denial (mirroring an approval denial); it does
+    not auto-replan in-flight.
+
 ## [0.5.0] — 2026-10-02
 
 ### Added

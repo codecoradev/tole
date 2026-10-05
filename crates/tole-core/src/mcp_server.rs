@@ -37,6 +37,12 @@ use std::sync::Arc;
 /// (stdio MCP mode — the single registry is the whole surface).
 pub type SessionRegistryResolver = Arc<dyn Fn(&str) -> Option<Arc<ToolRegistry>> + Send + Sync>;
 
+/// Counts open sessions (#138): a registry-tool call WITHOUT a
+/// `session_id` while 2+ sessions are open is ambiguous — the caller
+/// probably meant one of them, so it is refused instead of silently
+/// executing against the server-level registry.
+pub type SessionCountFn = Arc<dyn Fn() -> usize + Send + Sync>;
+
 /// An MCP server view of a [`ToolRegistry`]. Cloneable (Arc-shared
 /// registry) so `call_tool` can move a handle into `spawn_blocking`.
 #[derive(Clone)]
@@ -46,6 +52,8 @@ pub struct RegistryServer {
     /// `session_id` argument (and the name is not a session tool), the
     /// call routes to THAT session's registry (its jail + approver).
     session_resolver: Option<SessionRegistryResolver>,
+    /// Open-session count for the ambiguity refusal above.
+    session_count: Option<SessionCountFn>,
 }
 
 impl RegistryServer {
@@ -58,6 +66,7 @@ impl RegistryServer {
         Self {
             registry: std::sync::Arc::new(registry),
             session_resolver: None,
+            session_count: None,
         }
     }
 
@@ -65,6 +74,14 @@ impl RegistryServer {
     /// calls always run against the server-level registry.
     pub fn with_session_resolver(mut self, resolver: SessionRegistryResolver) -> Self {
         self.session_resolver = Some(resolver);
+        self
+    }
+
+    /// Attach the open-session count for the ambiguity refusal: without
+    /// it (or at ≤1 open session) a no-id call keeps hitting the
+    /// server-level registry (single-session / stdio behavior).
+    pub fn with_session_count(mut self, count: SessionCountFn) -> Self {
+        self.session_count = Some(count);
         self
     }
 
@@ -85,6 +102,7 @@ impl RegistryServer {
         Self {
             registry: std::sync::Arc::new(registry),
             session_resolver: None,
+            session_count: None,
         }
     }
 
@@ -144,6 +162,27 @@ impl RegistryServer {
                     map.remove("session_id");
                 }
                 (reg, a)
+            }
+            // Ambiguity refusal (#138-documented): a registry-tool call
+            // without `session_id` while 2+ sessions are open would
+            // silently execute against the SERVER-level registry (server
+            // cwd jail) — almost certainly not what the caller meant.
+            (Some(_), None)
+                if {
+                    let is_registry_tool =
+                        !name.starts_with("tole_session_") && self.registry.get(name).is_some();
+                    let open = self
+                        .session_count
+                        .as_ref()
+                        .map(|count| count())
+                        .unwrap_or(0);
+                    is_registry_tool && open > 1
+                } =>
+            {
+                return Err(format!(
+                    "ambiguous '{name}' call: 2+ sessions are open — pass the 'session_id' \
+                     argument to route to the intended session"
+                ));
             }
             _ => (self.registry.clone(), args),
         };
@@ -445,6 +484,87 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.is_error, Some(true));
+        client.cancel().await.ok();
+    }
+
+    // #138-documented ambiguity refusal (implemented 2026-10-05): a
+    // registry-tool call without session_id while 2+ sessions are open
+    // must refuse instead of silently hitting the server-level registry.
+    fn session_server(open_sessions: usize) -> RegistryServer {
+        let session_reg = Arc::new(server_registry(false));
+        let known: Vec<String> = (0..open_sessions).map(|i| format!("s{i}")).collect();
+        let resolver_sessions = known.clone();
+        let resolver: SessionRegistryResolver = Arc::new(move |sid: &str| {
+            if resolver_sessions.iter().any(|s| s == sid) {
+                Some(Arc::clone(&session_reg))
+            } else {
+                None
+            }
+        });
+        let count: SessionCountFn = Arc::new(move || known.len());
+        RegistryServer::new(server_registry(false))
+            .with_session_resolver(resolver)
+            .with_session_count(count)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_id_call_with_two_sessions_is_refused() {
+        let client = connect(session_server(2)).await;
+        let res = client
+            .peer()
+            .call_tool(
+                CallToolRequestParams::new("echo_tool")
+                    .with_arguments(json!({"msg": "hi"}).as_object().expect("object").clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.is_error, Some(true));
+        let text = match &res.content[0] {
+            ContentBlock::Text(t) => t.text.clone(),
+            other => panic!("expected text content, got {other:?}"),
+        };
+        assert!(text.contains("ambiguous"), "{text}");
+        assert!(text.contains("session_id"), "{text}");
+        client.cancel().await.ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_id_call_with_one_session_still_runs_on_server_registry() {
+        let client = connect(session_server(1)).await;
+        let res = client
+            .peer()
+            .call_tool(
+                CallToolRequestParams::new("echo_tool")
+                    .with_arguments(json!({"msg": "hi"}).as_object().expect("object").clone()),
+            )
+            .await
+            .unwrap();
+        assert_ne!(res.is_error, Some(true));
+        client.cancel().await.ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn explicit_session_id_routes_even_with_two_sessions() {
+        let client = connect(session_server(2)).await;
+        let res = client
+            .peer()
+            .call_tool(
+                CallToolRequestParams::new("echo_tool").with_arguments(
+                    json!({"session_id": "s1", "msg": "hi"})
+                        .as_object()
+                        .expect("object")
+                        .clone(),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_ne!(res.is_error, Some(true));
+        // The routing key is stripped before the tool sees the args.
+        let text = match &res.content[0] {
+            ContentBlock::Text(t) => t.text.clone(),
+            other => panic!("expected text content, got {other:?}"),
+        };
+        assert!(!text.contains("session_id"), "{text}");
         client.cancel().await.ok();
     }
 }
