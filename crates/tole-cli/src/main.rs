@@ -228,7 +228,10 @@ enum Command {
     },
     /// Serve tole as an ACP agent over stdio (issue #95): editors and
     /// ACP clients drive durable tole sessions; tool approvals surface
-    /// as permission requests in the client.
+    /// as permission requests in the client. Set TOLE_MODELS (comma-
+    /// separated model ids) to advertise a model picker: the client
+    /// switches per session via session/set_config_option, persisted
+    /// durably and honored by every later turn (issue #176).
     #[cfg(feature = "shell-tools")]
     Acp {
         /// Same semantics as `run --allow` (Write pre-authorization).

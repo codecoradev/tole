@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc as StdArc, Mutex};
 use tole_core::memory::MemoryConfig;
+use tole_core::storage::Storage;
 
 #[derive(Clone)]
 pub struct SessionState {
@@ -360,19 +361,31 @@ pub fn run_session_turn(
         }
     }
 
-    let Some(cfg) = tole_core::openai::OpenAiConfig::from_env() else {
+    // Lock the storage for the rest of the turn. The provider is built
+    // fresh every turn (issue #176): a `fact/model` register override —
+    // set durably by `tole acp`'s session/set_config_option — wins over
+    // the env default. serve sessions have no setter today, so this is
+    // a no-op there.
+    let mut storage = storage.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(mut cfg) = tole_core::openai::OpenAiConfig::from_env() else {
         return Err(
             "missing provider config: set TOLE_BASE_URL / TOLE_MODEL / TOLE_API_KEY              (or the OPENAI_* equivalents)"
                 .into(),
         );
     };
+    if let Some(model) = storage
+        .get_register("fact", "model")
+        .and_then(serde_json::Value::as_str)
+        .filter(|m| !m.trim().is_empty())
+    {
+        cfg.model = model.to_string();
+    }
     let mut provider =
         tole_core::openai::OpenAiProvider::new(cfg).with_tool_specs(registry.specs());
     if let Some(sys) = system_prompt.as_deref() {
         provider = provider.with_system_prompt(sys);
     }
 
-    let mut storage = storage.lock().unwrap_or_else(|p| p.into_inner());
     let outcome = tole_core::turn::run_turn(&mut *storage, &mut provider, &registry, &effective)
         .map_err(|e| e.to_string())?;
 
