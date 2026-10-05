@@ -102,6 +102,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `--on-pretool` help text corrected: an exit-2 deny parks the turn
     resumably at the denial (mirroring an approval denial); it does
     not auto-replan in-flight.
+- **MCP-over-HTTP accept-loop hardening (#190):** the `tole serve
+  --transport mcp` face now matches the REST face's #136 Wave-2
+  controls — a 32-connection semaphore cap (refused at capacity),
+  `header_read_timeout` (30s) on the hyper HTTP/1 builder, and a 30s
+  bound on the auth-header and request-body read phases. SSE response
+  streaming is intentionally untouched: long `tole_session_prompt`
+  turns still stream incrementally; only connection establishment and
+  request intake are time-bounded. Closes the slowloris
+  task/fd-pinning class the full-codebase scan flagged as MAJOR
+  (scan finding #17, pre-0.6.0-tag gate).
 - Build/CI fixes riding the same train: the no-`mcp` `tole-cli`
   profile compiles again (`mcp_server_command` is now gated behind the
   `mcp` feature, #175/#180); project-sync board lookup resolves the
