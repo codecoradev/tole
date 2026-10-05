@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `mcp-http` is now a **default feature** of `tole-cli`: a plain
+  `cargo install tole-cli` / `cargo build -p tole-cli` exposes all four
+  documented faces, including `tole serve --transport mcp` (previously
+  opt-in — a registry install errored on that transport). Embedders are
+  unaffected: `tole-core` defaults do not change, and the mobile
+  cross-compile targets only build `tole-core`.
 - `--trust` presets (#160): one-word trust for the fleet's ecosystem
   tools — `internal` (uteke_*/cora_search/mcp_cora_*/verify_package/
   job_*/tole_session_*), `read_only` (every safe read), `none`

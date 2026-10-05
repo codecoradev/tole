@@ -20,7 +20,6 @@ use tole_core::memory::MemoryConfig;
 
 /// Serve MCP over Streamable HTTP. Blocks until the listener errors.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 pub async fn run_mcp_http(
     bind: &str,
     port: u16,
