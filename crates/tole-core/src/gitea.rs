@@ -92,13 +92,41 @@ impl GiteaTool {
     }
 
     /// The human-readable request this tool would make — used in the
-    /// approval prompt. Deliberately excludes the token.
+    /// approval prompt. Deliberately excludes the token. WRITE ops
+    /// append the model-controlled payload fields (title/body/head/
+    /// base), each bounded — the approver approves THIS content, the
+    /// same discipline as `gh`'s quoted command line (CodeCora PR #169
+    /// round 1: a `--allow gitea` pattern must not auto-post arbitrary
+    /// text sight-unseen).
     pub fn request_line(&self, input: &Value) -> Result<String, String> {
         let op = parse_op(input)?;
         let repo = target_repo(input, &self.repo)?;
         let number = opt_number(input)?;
         let (method, path) = op_route(op, &repo, number.as_deref(), input)?;
-        Ok(format!("gitea {method} /{path}"))
+        let mut line = format!("gitea {method} /{path}");
+        match op {
+            GiteaOp::IssueComment => {
+                line.push_str(&format!(" body={}", preview(input, "body")?));
+            }
+            GiteaOp::IssueCreate => {
+                line.push_str(&format!(
+                    " title={} body={}",
+                    preview(input, "title")?,
+                    preview(input, "body").unwrap_or_else(|_| "\"\"".into())
+                ));
+            }
+            GiteaOp::PrCreate => {
+                line.push_str(&format!(
+                    " title={} head={} base={} body={}",
+                    preview(input, "title")?,
+                    preview(input, "head")?,
+                    preview(input, "base")?,
+                    preview(input, "body").unwrap_or_else(|_| "\"\"".into())
+                ));
+            }
+            _ => {}
+        }
+        Ok(line)
     }
 
     /// One request returning `(status, body_json_or_null)` — the ureq-3
@@ -193,6 +221,21 @@ impl Tool for GiteaTool {
         self.request_line(&input)?;
         self.call(&input)
     }
+}
+
+/// One bounded, quoted payload field for the approval line. Empty and
+/// oversized values are shown truncated — the full payload always lives
+/// in the durable session log.
+fn preview(input: &Value, key: &str) -> Result<String, String> {
+    let v = required_str(input, key)?;
+    const MAX: usize = 120;
+    let out: String = v.chars().take(MAX).collect();
+    let clipped = if v.chars().count() > MAX {
+        format!("{out}…(+{} chars)", v.chars().count() - MAX)
+    } else {
+        out
+    };
+    Ok(format!("{clipped:?}"))
 }
 
 fn parse_op(input: &Value) -> Result<GiteaOp, String> {
@@ -385,47 +428,62 @@ fn op_body(op: GiteaOp, input: &Value) -> Result<Value, String> {
     }
 }
 
-/// Parse a Gitea remote URL into `(api_base, owner/repo)`. GitHub remotes
-/// return None (they belong to the `gh` tool). ssh remotes (`git@host:p/r`)
-/// map to https; http(s) remotes keep their scheme and may carry a port
-/// (`http://host:3000/owner/repo` — common for self-hosted Gitea).
-pub fn gitea_from_remote(url: &str) -> Option<(String, String)> {
+/// What a remote URL resolves to for the gitea tool.
+#[derive(Debug)]
+pub enum GiteaRemote {
+    /// Not a Gitea remote (or malformed / GitHub — GitHub belongs to `gh`).
+    NotGitea,
+    /// A Gitea remote over plain http to a NON-loopback host: registering
+    /// would send the token unencrypted — refused loudly by the host
+    /// (CodeCora PR #169 round 1).
+    InsecureHttp { host: String },
+    /// Usable: API base URL (scheme preserved for loopback http) + repo.
+    Ok { base: String, repo: String },
+}
+
+/// Parse a Gitea remote URL. ssh remotes (`git@host:p/r`) map to https;
+/// http remotes are accepted ONLY for loopback hosts (self-hosted
+/// Gitea on localhost:3000 has no network path to leak the token);
+/// GitHub remotes are `NotGitea` (they belong to the `gh` tool).
+pub fn gitea_from_remote(url: &str) -> GiteaRemote {
     let url = url.trim().trim_end_matches('/');
     let url = url.strip_suffix(".git").unwrap_or(url);
     let (scheme, host, path) = match url.strip_prefix("git@") {
-        Some(rest) => {
-            let (h, p) = rest.split_once(':')?;
-            ("https", h, p)
-        }
+        Some(rest) => match rest.split_once(':') {
+            Some((h, p)) => ("https", h, p),
+            None => return GiteaRemote::NotGitea,
+        },
         None => {
             let (scheme, rest) = match (url.strip_prefix("https://"), url.strip_prefix("http://")) {
                 (Some(r), _) => ("https", r),
                 (None, Some(r)) => ("http", r),
-                (None, None) => return None,
+                (None, None) => return GiteaRemote::NotGitea,
             };
-            let (h, p) = rest.split_once('/')?;
-            (scheme, h, p)
+            match rest.split_once('/') {
+                Some((h, p)) => (scheme, h, p),
+                None => return GiteaRemote::NotGitea,
+            }
         }
     };
     if host.eq_ignore_ascii_case("github.com") {
-        return None;
+        return GiteaRemote::NotGitea;
     }
     // host may carry :port — validate charset so it can't smuggle
-    // anything into the API base URL.
+    // anything into the API base URL. Loopback hosts (localhost has no
+    // dot) are exempt from the dot requirement.
+    let loopback = is_loopback(host);
     if host.is_empty()
-        || !host.contains('.')
+        || (!loopback && !host.contains('.'))
         || !host
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '.' | '-' | '_'))
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '.' | '-' | '_' | '[' | ']'))
     {
-        return None;
+        return GiteaRemote::NotGitea;
     }
     let mut parts = path.split('/');
-    let owner = parts.next()?;
-    let name = parts.next()?;
-    if parts.next().is_some() {
-        return None; // deeper path: not a plain repo remote
-    }
+    let (Some(owner), Some(name), None) = (parts.next(), parts.next(), parts.next()) else {
+        return GiteaRemote::NotGitea; // deeper/shorter path: not a plain repo remote
+    };
     let valid = |s: &str| {
         !s.is_empty()
             && !s.starts_with('-')
@@ -433,9 +491,24 @@ pub fn gitea_from_remote(url: &str) -> Option<(String, String)> {
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
     };
     if !valid(owner) || !valid(name) {
-        return None;
+        return GiteaRemote::NotGitea;
     }
-    Some((format!("{scheme}://{host}"), format!("{owner}/{name}")))
+    if scheme == "http" && !is_loopback(host) {
+        return GiteaRemote::InsecureHttp {
+            host: host.to_string(),
+        };
+    }
+    GiteaRemote::Ok {
+        base: format!("{scheme}://{host}"),
+        repo: format!("{owner}/{name}"),
+    }
+}
+
+/// `host[:port]` is a loopback address (no network path can leak the
+/// token over plain http).
+fn is_loopback(host: &str) -> bool {
+    let bare = host.split(':').next().unwrap_or(host);
+    bare == "localhost" || bare == "127.0.0.1" || bare == "[::1]" || bare == "::1"
 }
 
 #[cfg(test)]
@@ -470,6 +543,37 @@ mod tests {
         assert!(
             line(json!({"op": "issue_comment", "number": "3", "body": "hi"}))
                 .starts_with("gitea POST /api/v1/repos/acme/widgets/issues/3/comments")
+        );
+    }
+
+    /// CodeCora PR #169 round 1: the approver must SEE the write
+    /// payload — a `--allow gitea` pattern must not auto-post arbitrary
+    /// title/body sight-unseen.
+    #[test]
+    fn write_payloads_are_visible_and_bounded_in_the_approval_line() {
+        let t = tool();
+        let line = t
+            .request_line(&json!({"op": "issue_comment", "number": "3", "body": "ship it now"}))
+            .unwrap();
+        assert!(line.contains("body=\"ship it now\""), "{line}");
+
+        let line = t
+            .request_line(&json!({"op": "pr_create", "title": "Fix login", "head": "feat-x", "base": "main", "body": "long body"}))
+            .unwrap();
+        assert!(line.contains("title=\"Fix login\""), "{line}");
+        assert!(line.contains("head=\"feat-x\""), "{line}");
+        assert!(line.contains("base=\"main\""), "{line}");
+        assert!(line.contains("body=\"long body\""), "{line}");
+
+        // oversized payloads are truncated, never silently full-length
+        let long = "x".repeat(500);
+        let line = t
+            .request_line(&json!({"op": "issue_create", "title": long, "body": "b"}))
+            .unwrap();
+        assert!(line.contains("…(+380 chars)"), "{line}");
+        assert!(
+            line.chars().count() < 400,
+            "approval line must stay readable"
         );
     }
 
@@ -538,44 +642,73 @@ mod tests {
 
     #[test]
     fn remote_url_parses_instance_and_repo() {
-        // ssh and https remotes both yield (base, owner/repo)
-        assert_eq!(
-            gitea_from_remote("git@git.example.com:acme/widgets.git"),
-            Some((
-                "https://git.example.com".to_string(),
-                "acme/widgets".to_string()
-            ))
+        use GiteaRemote::*;
+        let ok = |u: &str, base: &str, repo: &str| match gitea_from_remote(u) {
+            Ok { base: b, repo: r } => (b == base && r == repo, format!("{b}/{r}")),
+            other => (false, format!("{other:?}")),
+        };
+        // ssh and https remotes both map to https
+        assert!(
+            ok(
+                "git@git.example.com:acme/widgets.git",
+                "https://git.example.com",
+                "acme/widgets"
+            )
+            .0
         );
-        assert_eq!(
-            gitea_from_remote("https://git.example.com/acme/widgets.git"),
-            Some((
-                "https://git.example.com".to_string(),
-                "acme/widgets".to_string()
-            ))
+        assert!(
+            ok(
+                "https://git.example.com/acme/widgets.git",
+                "https://git.example.com",
+                "acme/widgets"
+            )
+            .0
         );
-        assert_eq!(
-            gitea_from_remote("https://git.example.com/acme/widgets"),
-            Some((
-                "https://git.example.com".to_string(),
-                "acme/widgets".to_string()
-            ))
+        assert!(
+            ok(
+                "https://git.example.com/acme/widgets",
+                "https://git.example.com",
+                "acme/widgets"
+            )
+            .0
         );
-        // self-hosted Gitea commonly rides an explicit port
-        assert_eq!(
-            gitea_from_remote("http://git.internal:3000/acme/widgets.git"),
-            Some((
-                "http://git.internal:3000".to_string(),
-                "acme/widgets".to_string()
-            ))
+        // loopback http is fine (self-hosted Gitea on localhost — no
+        // network path can leak the token)
+        assert!(
+            ok(
+                "http://127.0.0.1:3000/acme/widgets.git",
+                "http://127.0.0.1:3000",
+                "acme/widgets"
+            )
+            .0
         );
-        // github remotes are NOT gitea targets
-        assert_eq!(gitea_from_remote("git@github.com:acme/widgets.git"), None);
-        assert_eq!(
+        assert!(
+            ok(
+                "http://localhost:3000/acme/widgets.git",
+                "http://localhost:3000",
+                "acme/widgets"
+            )
+            .0
+        );
+        // NON-loopback http would send the token unencrypted — refused
+        // loudly (CodeCora PR #169 round 1), never silently registered
+        match gitea_from_remote("http://git.example.com:3000/acme/widgets.git") {
+            InsecureHttp { host } => assert!(host.contains("git.example.com")),
+            other => panic!("expected InsecureHttp, got {other:?}"),
+        }
+        // github remotes are NOT gitea targets; deep paths / garbage too
+        assert!(matches!(
+            gitea_from_remote("git@github.com:acme/widgets.git"),
+            NotGitea
+        ));
+        assert!(matches!(
             gitea_from_remote("https://github.com/acme/widgets.git"),
-            None
-        );
-        // deep paths / garbage refuse
-        assert_eq!(gitea_from_remote("https://git.example.com/a/b/c.git"), None);
-        assert_eq!(gitea_from_remote("not a url"), None);
+            NotGitea
+        ));
+        assert!(matches!(
+            gitea_from_remote("https://git.example.com/a/b/c.git"),
+            NotGitea
+        ));
+        assert!(matches!(gitea_from_remote("not a url"), NotGitea));
     }
 }

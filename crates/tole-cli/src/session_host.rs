@@ -236,7 +236,7 @@ pub fn detect_github_repo(cwd: &PathBuf) -> Option<String> {
 /// Absent legs degrade to one warning line, never a phantom tool — the
 /// same probe contract as uteke/cora.
 pub fn register_gitea(reg: &mut tole_core::tool::ToolRegistry, cwd: &std::path::Path) {
-    use tole_core::gitea::{gitea_from_remote, GiteaTool};
+    use tole_core::gitea::{gitea_from_remote, GiteaRemote, GiteaTool};
     let mut cmd = std::process::Command::new("git");
     cmd.args(["config", "--get", "remote.origin.url"])
         .current_dir(cwd);
@@ -248,8 +248,17 @@ pub fn register_gitea(reg: &mut tole_core::tool::ToolRegistry, cwd: &std::path::
     if !out.status.success() {
         return;
     }
-    let Some((base, repo)) = gitea_from_remote(&String::from_utf8_lossy(&out.stdout)) else {
-        return;
+    let remote = gitea_from_remote(&String::from_utf8_lossy(&out.stdout));
+    let (base, repo) = match remote {
+        GiteaRemote::Ok { base, repo } => (base, repo),
+        GiteaRemote::InsecureHttp { host } => {
+            eprintln!(
+                "tole: origin is a Gitea remote over plain http ({host}) — refusing to send the \
+                 token unencrypted; use an https remote (loopback http is allowed)"
+            );
+            return;
+        }
+        GiteaRemote::NotGitea => return,
     };
     let token = std::env::var("TOLE_GITEA_TOKEN")
         .or_else(|_| std::env::var("GITEA_TOKEN"))
