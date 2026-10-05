@@ -1400,3 +1400,159 @@ fn stop_gate_payload_keeps_tools_across_own_denial() {
         "second-Final payload must keep the turn's tools: {tools:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #178 — cancellation checkpoints
+// ---------------------------------------------------------------------------
+
+use tole_core::approval::Verdict;
+use tole_core::cancel::CancelToken;
+use tole_core::state::Pc;
+use tole_core::turn::run_turn_with_cancel;
+
+/// Approver whose verdict is whatever the test needs (recorded per call).
+struct ScriptedApprover {
+    verdict: std::sync::Mutex<Verdict>,
+}
+impl tole_core::approval::Approver for ScriptedApprover {
+    fn decide(&self, _req: &tole_core::approval::ToolRequest<'_>) -> Verdict {
+        *self.verdict.lock().unwrap()
+    }
+    fn interactive(&self) -> bool {
+        true
+    }
+}
+
+/// Cancel set BEFORE run_turn: the loop stops before the FIRST provider
+/// call, the session settles durably to Final, and a follow-up prompt
+/// on the same storage runs normally (prompt-resumable).
+#[test]
+fn cancel_before_first_step_settles_cancelled_and_resumable() {
+    let dir = tmpdir("cancel-early");
+    let mut s = JsonlStorage::create(&dir, "cx1", None).unwrap();
+    let mut p = MockProvider::scripted(vec![ProviderOutput::Final { text: "f".into() }]);
+    let mut reg = ToolRegistry::new();
+    reg.register(Box::new(EchoTool)).unwrap();
+    let cancel = CancelToken::new();
+    cancel.cancel();
+    let out = run_turn_with_cancel(&mut s, &mut p, &reg, "hello", &cancel).unwrap();
+    assert!(matches!(out, TurnOutcome::Cancelled), "got {out:?}");
+    // Durable: terminal Final pc + the cancellation record exists.
+    assert_eq!(s.state().pc, Pc::Final);
+    let dump = serde_json::to_string(&s.entries()).unwrap();
+    assert!(dump.contains("cancelled"), "cancellation record missing");
+    // Prompt-resumable: a NEW token + fresh provider runs a normal turn.
+    let mut p2 = MockProvider::scripted(vec![ProviderOutput::Final {
+        text: "after".into(),
+    }]);
+    let out2 = run_turn_with_cancel(&mut s, &mut p2, &reg, "again", &CancelToken::new()).unwrap();
+    match out2 {
+        TurnOutcome::Final { text, .. } => assert_eq!(text, "after"),
+        other => panic!("expected Final after cancel, got {other:?}"),
+    }
+}
+
+/// Cancel lands BEFORE the tool executes (set on a checkpoint after the
+/// provider asked for the tool): the intent settles failed, the effect
+/// never runs, the turn settles Cancelled.
+#[test]
+fn cancel_before_tool_execution_prevents_effect() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static EXEC_COUNT: AtomicUsize = AtomicUsize::new(0);
+    struct CountingTool;
+    impl Tool for CountingTool {
+        fn name(&self) -> &str {
+            "counting"
+        }
+        fn risk(&self) -> Risk {
+            Risk::ReadOnly
+        }
+        fn execute(&self, _input: Value) -> Result<Value, String> {
+            EXEC_COUNT.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({"ran": true}))
+        }
+    }
+    let dir = tmpdir("cancel-before-tool");
+    let mut s = JsonlStorage::create(&dir, "cx2", None).unwrap();
+    let mut reg = ToolRegistry::new();
+    reg.register(Box::new(CountingTool)).unwrap();
+    // After the first provider step (the ToolCall ask), flip the flag:
+    // the checkpoint between settlement and execution sees it.
+    struct CancelAfterAsk {
+        steps: AtomicUsize,
+        cancel: CancelToken,
+    }
+    impl Provider for CancelAfterAsk {
+        fn complete(&mut self, _t: &[Entry]) -> Result<ProviderOutput, ProviderError> {
+            let n = self.steps.fetch_add(1, Ordering::SeqCst);
+            if n >= 1 {
+                self.cancel.cancel();
+            }
+            Ok(ProviderOutput::ToolCall {
+                tool: "counting".into(),
+                input: json!({"n": 1}),
+            })
+        }
+        fn last_usage(&self) -> Option<Value> {
+            None
+        }
+    }
+    let mut p = CancelAfterAsk {
+        steps: AtomicUsize::new(0),
+        cancel: CancelToken::new(),
+    };
+    let cancel = p.cancel.clone();
+    let out = run_turn_with_cancel(&mut s, &mut p, &reg, "go", &cancel).unwrap();
+    assert!(matches!(out, TurnOutcome::Cancelled), "got {out:?}");
+    // Exactly ONE execution — the first call ran before the cancel
+    // fired (it was issued by the provider pre-cancel); the checkpoint
+    // stopped every tool call AFTER the flag was observed.
+    assert_eq!(EXEC_COUNT.load(Ordering::SeqCst), 1);
+    assert_eq!(s.state().pc, Pc::Final);
+}
+
+/// Cancel arriving while a Write approval is pending: the approver
+/// fails closed to Deny, and the turn settles CANCELLED (not
+/// ApprovalRequired) because the denial was the cancel's side effect.
+#[test]
+fn cancel_during_pending_approval_settles_cancelled_not_refusal() {
+    let dir = tmpdir("cancel-pending-approval");
+    let mut s = JsonlStorage::create(&dir, "cx3", None).unwrap();
+    let mut reg = ToolRegistry::with_approver(ScriptedApprover {
+        verdict: std::sync::Mutex::new(Verdict::Deny),
+    });
+    reg.register(Box::new(WriteTool)).unwrap();
+    // The approver cancels the token when consulted = the cancel lands
+    // while the (simulated) permission wait was pending.
+    struct CancelOnAsk {
+        inner: ScriptedApprover,
+        cancel: CancelToken,
+    }
+    impl tole_core::approval::Approver for CancelOnAsk {
+        fn decide(&self, req: &tole_core::approval::ToolRequest<'_>) -> Verdict {
+            self.cancel.cancel();
+            self.inner.decide(req)
+        }
+        fn interactive(&self) -> bool {
+            true
+        }
+    }
+    let cancel = CancelToken::new();
+    let mut reg2 = ToolRegistry::with_approver(CancelOnAsk {
+        inner: ScriptedApprover {
+            verdict: std::sync::Mutex::new(Verdict::Deny),
+        },
+        cancel: cancel.clone(),
+    });
+    reg2.register(Box::new(WriteTool)).unwrap();
+    let mut p = MockProvider::scripted(vec![ProviderOutput::ToolCall {
+        tool: "write_file".into(),
+        input: json!({"path": "x.txt", "content": "v"}),
+    }]);
+    let out = run_turn_with_cancel(&mut s, &mut p, &reg2, "go", &cancel).unwrap();
+    assert!(
+        matches!(out, TurnOutcome::Cancelled),
+        "must settle cancelled, got {out:?}"
+    );
+    assert_eq!(s.state().pc, Pc::Final);
+}

@@ -216,10 +216,12 @@ impl Conn {
         self.send_line(&line);
     }
 
-    /// Agent-initiated request (permission): returns the client's result
-    /// object. Client cancellations/errors arrive as the error variant of
-    /// the routed reply and fail closed (deny).
-    fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
+    /// Send ONE agent-initiated request and hand back its reply
+    /// receiver, so the caller can wait in slices and re-check the
+    /// turn's cancellation token between slices (issue #178) — calling
+    /// [`Conn::request`] repeatedly would re-send duplicate wire
+    /// requests. Pair with [`Conn::abandon`] when giving up.
+    fn open_request(&self, method: &str, params: Value) -> (u64, mpsc::Receiver<Value>) {
         let id = {
             let mut n = self.next_id.lock().expect("id lock");
             let id = *n;
@@ -231,13 +233,13 @@ impl Conn {
         self.send_line(
             &json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string(),
         );
-        match rx.recv_timeout(timeout) {
-            Ok(v) => Ok(v),
-            Err(_) => {
-                self.pending.lock().expect("pending lock").remove(&id);
-                Err("client did not answer the permission request in time".into())
-            }
-        }
+        (id, rx)
+    }
+
+    /// Drop a pending request entry (fail-closed path). A late client
+    /// reply then finds no waiter and is ignored by `route`.
+    fn abandon(&self, id: u64) {
+        self.pending.lock().expect("pending lock").remove(&id);
     }
 
     /// Reader-side routing: a response line completes a pending agent
@@ -272,6 +274,54 @@ impl Conn {
     }
 }
 
+/// Outcome of a sliced permission wait (issue #178).
+enum WaitOutcome {
+    /// The client answered.
+    Reply(Value),
+    /// The window expired, the transport died, or the turn was
+    /// cancelled with the request unresolved. The caller fails closed.
+    Timeout,
+}
+
+/// Wait for ONE pending permission reply in slices, re-checking the
+/// turn's cancellation token between slices (issue #178) — the wire
+/// request was sent once via [`Conn::open_request`]; only the WAIT is
+/// sliced, so a mid-wait `session/cancel` unwinds the approval within
+/// ~1 s instead of after the full window. Every unresolved exit
+/// abandons the pending entry (late client replies find no waiter and
+/// are ignored by `route`).
+fn wait_permission(
+    conn: &Conn,
+    req_id: u64,
+    rx: mpsc::Receiver<Value>,
+    total: Duration,
+    cancel: &tole_core::cancel::CancelToken,
+) -> WaitOutcome {
+    let deadline = std::time::Instant::now() + total;
+    loop {
+        if cancel.is_cancelled() {
+            conn.abandon(req_id);
+            return WaitOutcome::Timeout;
+        }
+        match rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(v) => return WaitOutcome::Reply(v),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                // Writer thread gone (client vanished) — the ACP loop
+                // winds down on EOF anyway; fail closed now instead of
+                // sitting out the window.
+                conn.abandon(req_id);
+                return WaitOutcome::Timeout;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if std::time::Instant::now() >= deadline {
+                    conn.abandon(req_id);
+                    return WaitOutcome::Timeout;
+                }
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Approval: the editor is the human
 // ---------------------------------------------------------------------------
@@ -291,6 +341,11 @@ struct AcpPrompt {
     session_id: String,
     counter: Arc<Mutex<u64>>,
     patterns: Arc<Mutex<Vec<String>>>,
+    /// Cancellation checkpoint for the session's current turn
+    /// (issue #178): a `session/cancel` while a permission request is
+    /// pending stops the wait immediately — the spec requires pending
+    /// permission requests to settle `cancelled` (fail closed).
+    cancel: tole_core::cancel::CancelToken,
 }
 
 /// The `allow_always` PermissionOption kind — a standard kind
@@ -301,6 +356,41 @@ const OPTION_ALLOW_ALWAYS: &str = "allow-always";
 impl AcpPrompt {
     fn lock_patterns(&self) -> std::sync::MutexGuard<'_, Vec<String>> {
         self.patterns.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Map the client's chosen PermissionOption back to a tole verdict
+    /// (extracted verbatim from the pre-#178 match body).
+    fn map_option_choice(
+        &self,
+        result: &Value,
+        req: &tole_core::approval::ToolRequest<'_>,
+        option_reject: &str,
+    ) -> tole_core::approval::Verdict {
+        use tole_core::approval::Verdict;
+        use tole_core::tool::Risk;
+        let option_allow = "allow-once";
+        let chosen = result["outcome"]["optionId"]
+            .as_str()
+            .unwrap_or(option_reject);
+        // Comparison chain, NOT a match: a lowercase match arm would be
+        // a fresh binding matching EVERYTHING (a reject would have read
+        // as Allow).
+        if chosen == option_allow {
+            Verdict::Allow
+        } else if chosen == OPTION_ALLOW_ALWAYS {
+            if req.risk == Risk::Write {
+                // Remember for the session: the exact tool name joins
+                // the approver's pattern store (glob-matched; exact
+                // names match trivially). Not persisted — consent
+                // resets with the process.
+                self.lock_patterns().push(req.tool.to_string());
+            }
+            // A Destructive call must never be remembered, even when a
+            // hostile client echoes the option: honored one-time only.
+            Verdict::Allow
+        } else {
+            Verdict::Deny
+        }
     }
 }
 
@@ -350,41 +440,15 @@ impl PromptFn for AcpPrompt {
             },
             "options": options,
         });
+        let (req_id, rx) = self.conn.open_request("session/request_permission", params);
         let verdict =
-            match self
-                .conn
-                .request("session/request_permission", params, PERMISSION_TIMEOUT)
-            {
-                Ok(result) => {
-                    let chosen = result["outcome"]["optionId"]
-                        .as_str()
-                        .unwrap_or(option_reject);
-                    // Comparison chain, NOT a match: a lowercase match
-                    // arm would be a fresh binding matching EVERYTHING
-                    // (a reject would have read as Allow).
-                    if chosen == option_allow {
-                        Verdict::Allow
-                    } else if chosen == OPTION_ALLOW_ALWAYS {
-                        if req.risk == Risk::Write {
-                            // Remember for the session: the exact tool
-                            // name joins the approver's pattern store
-                            // (glob-matched; exact names match
-                            // trivially). Not persisted — consent
-                            // resets with the process.
-                            self.lock_patterns().push(req.tool.to_string());
-                        }
-                        // A Destructive call must never be remembered,
-                        // even when a hostile client echoes the option:
-                        // honored one-time only.
-                        Verdict::Allow
-                    } else {
-                        Verdict::Deny
-                    }
-                }
-                Err(_) => {
-                    // Cancelled or timed out: fail closed.
-                    Verdict::Deny
-                }
+            match wait_permission(&self.conn, req_id, rx, PERMISSION_TIMEOUT, &self.cancel) {
+                WaitOutcome::Reply(result) => self.map_option_choice(&result, req, option_reject),
+                // Timeout, dead transport, or a mid-wait cancel: fail
+                // closed (Deny) — the routing contract for unresolved
+                // permission requests. The already-set turn token makes a
+                // cancelled wait settle `cancelled`, not `refusal`.
+                WaitOutcome::Timeout => Verdict::Deny,
             };
         // Close the tool-call record.
         self.conn.send_notification(
@@ -528,14 +592,19 @@ pub fn run_acp(
                 // Shared approval handles: created here so the bridge
                 // (allow_always grants), the approver, and the
                 // set_config_option lookup all own the same stores.
-                // Seeded with the startup flag values.
+                // Seeded with the startup flag values. The cancel token
+                // (#178) is created HERE and shared three ways — the
+                // prompt bridge (permission wait), the session state
+                // (transport-side set), and the turn (checkpoint test).
                 let patterns = Arc::new(Mutex::new(allow_patterns.to_vec()));
                 let session_auto_write = Arc::new(Mutex::new(auto_write));
+                let cancel = tole_core::cancel::CancelToken::new();
                 let approver = InteractiveApprover::new(AcpPrompt {
                     conn: conn.clone(),
                     session_id: session_id.clone(),
                     counter: Arc::new(Mutex::new(0)),
                     patterns: Arc::clone(&patterns),
+                    cancel: cancel.clone(),
                 })
                 .with_allow_patterns(allow_patterns.to_vec())
                 .with_auto_write(auto_write)
@@ -551,6 +620,7 @@ pub fn run_acp(
                     sessions_dir.as_deref(),
                     turnend.clone(),
                     allow_patterns.to_vec(),
+                    cancel,
                 ) {
                     Ok(state) => {
                         // Insert + busy re-check in ONE critical section:
@@ -663,6 +733,29 @@ pub fn run_acp(
                     &models,
                     env_model.as_deref(),
                 );
+            }
+            // ACP baseline MUST (issue #178): stop the session's
+            // generating turn. A cancel BEFORE any prompt (or against an
+            // unknown session) is a no-op — the spec leaves that state
+            // unconstrained. A cancel while a permission request is
+            // pending also unwinds the wait below (fail closed to Deny,
+            // per spec) and the turn then settles as `cancelled`, not
+            // `refusal`.
+            "session/cancel" => {
+                let Some(session_id) = params.get("sessionId").and_then(Value::as_str) else {
+                    continue; // notification: no id, nothing to answer
+                };
+                let cancelled = {
+                    let sessions = lock_sessions(&sessions);
+                    sessions
+                        .map
+                        .get(session_id)
+                        .map(|st| st.cancel.cancel())
+                        .is_some()
+                };
+                if cancelled {
+                    eprintln!("tole: session/{session_id} cancel requested");
+                }
             }
             other => {
                 if id.is_some() {

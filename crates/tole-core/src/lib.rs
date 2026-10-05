@@ -29,6 +29,7 @@
 #[cfg(feature = "shell-tools")]
 pub mod agents;
 pub mod approval;
+pub mod cancel;
 #[cfg(feature = "shell-tools")]
 pub mod cora_search;
 pub mod entry;

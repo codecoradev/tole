@@ -8,6 +8,7 @@
 //! the E5 golden-file test at loop level).
 
 use crate::approval::Verdict;
+use crate::cancel::CancelToken;
 use crate::entry::{EntryType, NewEntry};
 use serde_json::{json, Value};
 
@@ -73,6 +74,10 @@ pub enum TurnOutcome {
     StopGateBlocked { reason: String },
     /// Storage error: abort the turn, session stays consistent.
     Storage(StorageError),
+    /// The client cancelled the turn (ACP `session/cancel`, issue
+    /// #178): the token fired between steps; the turn settled durably
+    /// to pc=Final, so the session stays prompt-resumable.
+    Cancelled,
 }
 
 /// Drive one full user turn to completion (single-threaded).
@@ -84,6 +89,20 @@ pub fn run_turn(
     p: &mut dyn Provider,
     registry: &ToolRegistry,
     user_input: &str,
+) -> Result<TurnOutcome, StorageError> {
+    run_turn_with_cancel(s, p, registry, user_input, &CancelToken::default())
+}
+
+/// [`run_turn`] with a cancellation checkpoint (issue #178). The token
+/// is consulted between provider steps and before every tool
+/// execution; a set token unwinds into a durable
+/// [`TurnOutcome::Cancelled`] (pc = Final) instead of running on.
+pub fn run_turn_with_cancel(
+    s: &mut dyn Storage,
+    p: &mut dyn Provider,
+    registry: &ToolRegistry,
+    user_input: &str,
+    cancel: &CancelToken,
 ) -> Result<TurnOutcome, StorageError> {
     // Precondition enforced, not just documented: the session must be at a
     // turn boundary — Idle (never started / E1 initial state) or Final
@@ -110,7 +129,7 @@ pub fn run_turn(
             ))
             .transition(StateTransition::from(seq, Pc::Planning)),
     )?;
-    drive(s, p, registry)
+    drive(s, p, registry, cancel)
 }
 
 /// Resume a turn interrupted by a crash (or process exit) mid-flight and
@@ -287,7 +306,10 @@ pub fn resume_turn(
             settle_err(s, &handle, &reason)?;
         }
     }
-    drive(s, p, registry)
+    // Recovery drives are not cancel-wired today (#178 covers live
+    // prompt turns; a crash-recovered resume has no in-flight request
+    // to cancel).
+    drive(s, p, registry, &CancelToken::default())
 }
 
 /// Fingerprint of a tool call for the E10 loop guard: tool name + canonical
@@ -332,6 +354,7 @@ fn drive(
     s: &mut dyn Storage,
     p: &mut dyn Provider,
     registry: &ToolRegistry,
+    cancel: &CancelToken,
 ) -> Result<TurnOutcome, StorageError> {
     // E10 loop guard: fingerprint of the last tool call (tool + canonical
     // input), with its consecutive repeat count. Identical calls are
@@ -359,6 +382,12 @@ fn drive(
     // not get a retry for every step of the same turn.
     let mut timeout_retries_left = PROVIDER_TIMEOUT_RETRIES;
     for _ in 0..MAX_STEPS {
+        // Cancellation checkpoint (issue #178): a client-cancelled turn
+        // stops before the next provider call and settles durably
+        // (settle_cancelled) — no further tokens burn, no tool runs.
+        if cancel.is_cancelled() {
+            return settle_cancelled(s);
+        }
         // No clone: complete() borrows the storage slice. (The old
         // to_vec() allocated the whole transcript every provider step.)
         let next = match p.complete(s.entries()) {
@@ -412,6 +441,15 @@ fn drive(
                     cost_usd: None,
                 }))?;
             }
+        }
+        // Cancellation checkpoint AFTER the provider call (issue #178):
+        // a cancel that landed while `complete()` was in flight must
+        // discard the late answer — the client that cancelled is owed
+        // `cancelled`, not an answer it stopped waiting for. Provider
+        // responses are pure reads (no pending intent), so dropping the
+        // output here is crash-safe by construction.
+        if cancel.is_cancelled() {
+            return settle_cancelled(s);
         }
         match next {
             ProviderOutput::Final { text } => {
@@ -548,6 +586,15 @@ fn drive(
                     match registry.decide(&tool, &input) {
                         Some(Verdict::Allow) => { /* fall through to execute */ }
                         _ => {
+                            // #178: a cancel that landed while the
+                            // permission was pending fails closed to
+                            // Deny AND must settle the turn as
+                            // CANCELLED, not refusal (the denial is
+                            // the cancel's side effect, not a model
+                            // refusal).
+                            if cancel.is_cancelled() {
+                                return settle_cancelled(s);
+                            }
                             append_turn_error(s, "approval required", &tool)?;
                             return Ok(TurnOutcome::ApprovalRequired { name: tool });
                         }
@@ -575,6 +622,16 @@ fn drive(
                 let seq = s.state().seq;
                 s.commit(Commit::new().transition(StateTransition::from(seq, Pc::ToolCall)))?;
                 let handle = begin(s, &tool, input.clone(), safety, None)?;
+                // Cancellation checkpoint (issue #178): cancel while the
+                // turn was settling/planning stops the effect BEFORE it
+                // runs — spec: "stop model requests and tool
+                // invocations as soon as possible". The fresh intent is
+                // settled as failed first (no pending cell survives a
+                // cancelled turn), then the turn unwinds durably.
+                if cancel.is_cancelled() {
+                    settle_err(s, &handle, "cancelled before execution")?;
+                    return settle_cancelled(s);
+                }
                 // Post-hook input snapshot (issue #110): execute consumes
                 // `input` by value; hooks observe the exact call input.
                 // Write/Destructive ONLY — ReadOnly stays zero-overhead
@@ -677,4 +734,15 @@ fn append_turn_error(s: &mut dyn Storage, error: &str, detail: &str) -> Result<(
         timestamp: 0,
     }))?;
     Ok(())
+}
+
+/// Settle a cancelled turn (issue #178): durable record + terminal
+/// pc=Final — the #84 consistency every other abort path follows, so
+/// `session/prompt` on the same session just works afterwards. Mirrors
+/// BudgetExhausted's tail exactly.
+fn settle_cancelled(s: &mut dyn Storage) -> Result<TurnOutcome, StorageError> {
+    append_turn_error(s, "cancelled", "client cancelled the turn (session/cancel)")?;
+    let seq = s.state().seq;
+    s.commit(Commit::new().transition(StateTransition::from(seq, Pc::Final)))?;
+    Ok(TurnOutcome::Cancelled)
 }
