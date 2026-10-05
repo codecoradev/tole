@@ -189,14 +189,20 @@ pub async fn run_mcp_http(
                         Ok(hyper::Response::from_parts(rp, body))
                     }
                 });
-            let _ = hyper::server::conn::http1::Builder::new()
-                // Slowloris hardening (#190, hyper 1.x): bound how long
-                // the connection may take to deliver request headers.
-                // (REST parity; the body read is separately bounded by
-                // SERVE_IO_TIMEOUT above, and SSE responses are not cut.)
-                .header_read_timeout(SERVE_IO_TIMEOUT)
-                .serve_connection(io, hyper_service)
-                .await;
+            // hyper_util's auto builder (http1) instead of hyper's raw
+            // http1::Builder: header_read_timeout REQUIRES a Timer, and
+            // the auto builder owns the timer wiring — hyper's raw
+            // builder panics per connection when the timeout is set
+            // without one (caught by the live smoke test, invisible to
+            // CI). SSE responses still stream (SSE is plain HTTP/1).
+            let _ = hyper_util::server::conn::auto::Builder::new(
+                hyper_util::rt::TokioExecutor::new(),
+            )
+            .http1()
+            .header_read_timeout(SERVE_IO_TIMEOUT)
+            .timer(hyper_util::rt::TokioTimer::new())
+            .serve_connection_with_upgrades(io, hyper_service)
+            .await;
         });
     }
 }

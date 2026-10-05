@@ -105,13 +105,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **MCP-over-HTTP accept-loop hardening (#190):** the `tole serve
   --transport mcp` face now matches the REST face's #136 Wave-2
   controls — a 32-connection semaphore cap (refused at capacity),
-  `header_read_timeout` (30s) on the hyper HTTP/1 builder, and a 30s
-  bound on the auth-header and request-body read phases. SSE response
-  streaming is intentionally untouched: long `tole_session_prompt`
-  turns still stream incrementally; only connection establishment and
-  request intake are time-bounded. Closes the slowloris
-  task/fd-pinning class the full-codebase scan flagged as MAJOR
-  (scan finding #17, pre-0.6.0-tag gate).
+  a 30s header-read timeout on the HTTP/1 connection, and a 30s
+  bound on the auth-header and request-body read phases. The
+  connection serves through hyper-util's `auto` http1 builder,
+  which wires the TokioTimer the timeout requires — hyper's raw
+  builder panics per connection when `header_read_timeout` is set
+  without a timer (caught by the pre-tag live smoke test, invisible
+  to CI). SSE response streaming is intentionally untouched: long
+  `tole_session_prompt` turns still stream incrementally; only
+  connection establishment and request intake are time-bounded.
+  Live-verified: 401 without a token, initialize over SSE, the
+  33rd idle connection reset at the cap, recovery after release.
+  Closes the slowloris task/fd-pinning class the full-codebase scan
+  flagged as MAJOR (scan finding #17, pre-0.6.0-tag gate).
 - Build/CI fixes riding the same train: the no-`mcp` `tole-cli`
   profile compiles again (`mcp_server_command` is now gated behind the
   `mcp` feature, #175/#180); project-sync board lookup resolves the
