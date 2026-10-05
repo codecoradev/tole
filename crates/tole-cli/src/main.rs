@@ -1287,6 +1287,7 @@ fn run_command(
         build_approver(allow_patterns, yes),
         host.workspace.as_ref(),
         host.agents_worktree,
+        allow_patterns,
     )?;
     // Plan mode (issue #109): the guarantee is ABSENCE on the wire, not
     // approval — filtered tools never appear in specs().
@@ -1391,6 +1392,7 @@ fn resume_command(
         build_approver(allow_patterns, yes),
         host.workspace.as_ref(),
         host.agents_worktree,
+        allow_patterns,
     )?;
     // Plan mode (issue #109): the guarantee is ABSENCE on the wire, not
     // approval — filtered tools never appear in specs().
@@ -1689,6 +1691,7 @@ fn chat_command(
         build_approver(allow_patterns, yes),
         host.workspace.as_ref(),
         host.agents_worktree,
+        allow_patterns,
     )?;
     // Plan mode (issue #109): the guarantee is ABSENCE on the wire, not
     // approval — filtered tools never appear in specs().
