@@ -461,6 +461,23 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                         Err(e) => (500, json!({"error": e})),
                     }
                 }
+                ("POST", id, Some("cancel")) => {
+                    // REST face of #178 (owner directive: serve follows
+                    // the ACP design). Sets the session's cancel token;
+                    // the in-flight prompt thread observes it at its
+                    // next checkpoint and answers ITS caller with
+                    // "cancelled". 404 only for an unknown session.
+                    let cancelled = {
+                        let sessions = lock_sessions(&state.sessions);
+                        sessions.map.get(id).map(|st| st.cancel.cancel()).is_some()
+                    };
+                    if cancelled {
+                        eprintln!("tole: session/{id} cancel requested (serve)");
+                        (200, json!({"cancelled": true, "sessionId": id}))
+                    } else {
+                        (404, json!({"error": "unknown session"}))
+                    }
+                }
                 _ => (404, json!({"error": "not found"})),
             }
         }

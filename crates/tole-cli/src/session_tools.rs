@@ -86,6 +86,7 @@ impl SessionToolState {
         vec![
             Box::new(SessionNewTool(self.clone())),
             Box::new(SessionPromptTool(self.clone())),
+            Box::new(SessionCancelTool(self.clone())),
             Box::new(SessionStatusTool(self.clone())),
             Box::new(SessionListTool(self.clone())),
         ]
@@ -256,6 +257,90 @@ impl Tool for SessionPromptTool {
             out["text"] = json!(t);
         }
         Ok(out)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// tole_session_cancel — the MCP face of #178
+// ---------------------------------------------------------------------------
+
+/// Cancels the target session's in-flight turn (`run_session_turn`
+/// observes the token at its next checkpoint and settles `cancelled`).
+/// MCP-idiomatic cancellation: the MCP wire layer has no turn-cancel
+/// notification handling for server-side tool execution, so the
+/// capability is exposed as a first-class tool — callable by any MCP
+/// client, addressable by session, before/while a `tole_session_prompt`
+/// runs (MCP tools may run concurrently from the client side).
+struct SessionCancelTool(SessionToolState);
+
+impl Tool for SessionCancelTool {
+    fn name(&self) -> &str {
+        "tole_session_cancel"
+    }
+    fn risk(&self) -> Risk {
+        Risk::ReadOnly
+    }
+    fn describe(&self, input: &Value) -> String {
+        format!(
+            "cancel the in-flight turn of session {:?}",
+            input
+                .get("session_id")
+                .and_then(Value::as_str)
+                .unwrap_or("<implicit>")
+        )
+    }
+    fn spec(&self) -> Option<Value> {
+        Some(json!({
+            "type": "object",
+            "properties": {
+                "session_id": { "type": "string", "description": "Target session (optional when exactly one is open)" },
+                "reason": { "type": "string", "description": "Optional cancellation reason (logged)" }
+            }
+        }))
+    }
+    fn execute(&self, input: Value) -> Result<Value, String> {
+        let reason = input
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        // Resolve the id exactly like tole_session_prompt (explicit or
+        // implicit-singleton), then set the token under the map lock.
+        let (session_id, found) =
+            {
+                let sessions = lock_sessions(&self.0.sessions);
+                let id = match input.get("session_id").and_then(Value::as_str) {
+                    Some(id) => Some(id.to_string()),
+                    None if sessions.map.len() == 1 => {
+                        Some(sessions.map.keys().next().expect("len==1").clone())
+                    }
+                    None => None,
+                };
+                match id {
+                    Some(id) => {
+                        let found = sessions.map.get(&id).map(|st| st.cancel.cancel()).is_some();
+                        (id, found)
+                    }
+                    None => return Err(
+                        "missing 'session_id': pass it explicitly (or keep exactly one session \
+                         open)"
+                            .into(),
+                    ),
+                }
+            };
+        if !found {
+            return Err(format!("unknown session: {session_id}"));
+        }
+        if !reason.is_empty() {
+            eprintln!("tole: session/{session_id} cancel requested (mcp): {reason}");
+        } else {
+            eprintln!("tole: session/{session_id} cancel requested (mcp)");
+        }
+        Ok(json!({
+            "cancelled": true,
+            "session_id": session_id,
+            "note": "the in-flight turn settles 'cancelled' at its next checkpoint; a prompt response already past its last checkpoint completes normally"
+        }))
     }
 }
 
