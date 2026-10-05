@@ -1,0 +1,51 @@
+{
+ "generated_at": "2026-10-05T09:36:32+07:00",
+ "model": "glm/glm-5.3-flash",
+ "missions": [
+  {
+   "mission": "crash_resume",
+   "exit_code": 2,
+   "text": "\u2500\u2500 approval required \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\ntool:  write_file [Write]\nwhat:  write file marker.txt\ninput: {\"content\":\"RESUMED-DONE\",\"path\":\"marker.txt\"}\nallow? [y/N]",
+   "stderr_tail": "tole: mcp[cora]: 18 tool(s) registered in 48.845ms\ntole: approval denied for 'write_file' \u2014 turn aborted, denial recorded (resume with: tole resume s-1a109eb876c-bfaf)\n",
+   "sessions_dir": "/var/folders/c2/4ylvn77x557_y58psxmrblm80000gn/T/tole-eval-crash_resume-xa8i__cg",
+   "duration_secs": 48.4,
+   "prompt_tokens": 30852,
+   "completion_tokens": 725,
+   "tool_calls": 7,
+   "success": true,
+   "detail": "must finish in the same durable session after recovery",
+   "model": "glm/glm-5.3-flash",
+   "archived_trace": "/Users/mis-puragroup/development/riset-ai/tole/evals/traces/glm/glm-5.3-flash/crash_resume/s-1a109eb876c-bfaf.jsonl"
+  },
+  {
+   "mission": "echo_chain",
+   "exit_code": 0,
+   "text": "CHAIN-OK",
+   "stderr_tail": "tole: mcp[cora]: 18 tool(s) registered in 24.474916ms\n",
+   "sessions_dir": "/var/folders/c2/4ylvn77x557_y58psxmrblm80000gn/T/tole-eval-echo_chain-exu_7nwf",
+   "duration_secs": 28.6,
+   "prompt_tokens": 11082,
+   "completion_tokens": 242,
+   "tool_calls": 2,
+   "success": true,
+   "detail": "must call a tool at least twice and confirm",
+   "model": "glm/glm-5.3-flash",
+   "archived_trace": "/Users/mis-puragroup/development/riset-ai/tole/evals/traces/glm/glm-5.3-flash/echo_chain/s-1a109ec446a-c177.jsonl"
+  },
+  {
+   "mission": "read_and_report",
+   "exit_code": 0,
+   "text": "ALPHA-77",
+   "stderr_tail": "tole: mcp[cora]: 18 tool(s) registered in 28.736791ms\n",
+   "sessions_dir": "/var/folders/c2/4ylvn77x557_y58psxmrblm80000gn/T/tole-eval-read_and_report-86xrqman",
+   "duration_secs": 9.3,
+   "prompt_tokens": 7343,
+   "completion_tokens": 68,
+   "tool_calls": 1,
+   "success": true,
+   "detail": "answer must contain the planted marker",
+   "model": "glm/glm-5.3-flash",
+   "archived_trace": "/Users/mis-puragroup/development/riset-ai/tole/evals/traces/glm/glm-5.3-flash/read_and_report/s-1a109ecb43d-c308.jsonl"
+  }
+ ]
+}

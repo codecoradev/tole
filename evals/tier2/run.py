@@ -103,7 +103,11 @@ def archive_trace(
         return None
     dest_dir = archive_root / (model or "unknown-model") / mission
     dest_dir.mkdir(parents=True, exist_ok=True)
-    host_paths = [str(sessions_dir)]
+    # HOME must ride along: the default system prompt embeds the
+    # working directory ("working directory /Users/…/repo"), which is a
+    # host path even though it never touches the sessions dir (caught
+    # reviewing the 2026-10-05 glm-5.3-flash archive).
+    host_paths = [str(sessions_dir), str(Path.home())]
     dest = dest_dir / log.name
     lines = []
     for raw in log.read_text().splitlines():
