@@ -32,7 +32,7 @@ graph TD
 ```
 
 - **tole-core** — platform-agnostic library. No stdin/stdout/CLI assumptions. All host interactions (approval prompt, output streaming) go through trait boundaries (`Approver`, etc.).
-- **tole-cli** — one binary, four faces sharing the `session_host` machinery (durable JSONL session open/turn, busy-serialization, id validation): the CLI (`run`/`chat`/`resume`, interactive y/N approver), `tole mcp` (tool server; allowlist approver, Destructive structurally absent), `tole acp` (editor agent; approvals become `session/request_permission`, optional `TOLE_MODELS` model picker via ACP config options #176), and `tole serve` (token-authenticated REST daemon; `--transport mcp` serves multi-session MCP over Streamable HTTP — one connection, N sessions routed by `session_id`; needs the `mcp-http` feature).
+- **tole-cli** — one binary, four faces sharing the `session_host` machinery (durable JSONL session open/turn, busy-serialization, id validation): the CLI (`run`/`chat`/`resume`, interactive y/N approver), `tole mcp` (tool server; allowlist approver, Destructive structurally absent), `tole acp` (editor agent; approvals become `session/request_permission` with an `allow_always` per-session grant, approval + `TOLE_MODELS` model pickers via ACP config options #176), and `tole serve` (token-authenticated REST daemon; `--transport mcp` serves multi-session MCP over Streamable HTTP — one connection, N sessions routed by `session_id`; needs the `mcp-http` feature).
 - **tole-ffi** (future) — FFI binding for embedding in Corin / Flutter.
 
 ## 3. Module Responsibility
