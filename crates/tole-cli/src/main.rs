@@ -954,6 +954,7 @@ fn build_registry(
         let gh_repo = detect_github_repo(&cwd).unwrap_or_else(|| "codecoradev/tole".into());
         reg.register(Box::new(GhTool::new(gh_repo)))
             .map_err(|e| anyhow::anyhow!("registering gh: {e}"))?;
+        tole_cli::session_host::register_gitea(&mut reg, &cwd);
     }
     // Light git: status/diff/add/commit (push stays human).
     #[cfg(feature = "shell-tools")]
@@ -1050,6 +1051,7 @@ fn build_server_registry(
         let gh_repo = detect_github_repo(&cwd).unwrap_or_else(|| "codecoradev/tole".into());
         reg.register(Box::new(GhTool::new(gh_repo)))
             .map_err(|e| anyhow::anyhow!("registering gh: {e}"))?;
+        tole_cli::session_host::register_gitea(&mut reg, &cwd);
         reg.register(Box::new(GitTool::new().in_dir(cwd.clone())))
             .map_err(|e| anyhow::anyhow!("registering git: {e}"))?;
     }

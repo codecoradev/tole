@@ -193,8 +193,12 @@ const PR_VIEW_FIELDS: &str =
 fn digit_field(input: &Value, what: &str) -> Result<String, String> {
     let v = input
         .get("number")
-        .and_then(Value::as_str)
-        .filter(|v| !v.trim().is_empty())
+        .and_then(|v| match v {
+            // Models may send counts as JSON integers — normalize both.
+            Value::Number(n) => n.as_u64().map(|u| u.to_string()),
+            Value::String(s) if !s.trim().is_empty() => Some(s.clone()),
+            _ => None,
+        })
         .ok_or_else(|| format!("gh: missing or empty 'number' ({what})"))?;
     if !v.chars().all(|c| c.is_ascii_digit()) {
         return Err(format!(
@@ -204,14 +208,59 @@ fn digit_field(input: &Value, what: &str) -> Result<String, String> {
     Ok(v.to_string())
 }
 
+/// Per-call repo override: validated `owner/name` (same charset rule as
+/// registration-time detection) or the registration default. The
+/// approver sees the resolved repo in the audit line — an override can
+/// never happen silently.
+fn resolve_repo(input: &Value, default: &str) -> Result<String, String> {
+    let Some(v) = input.get("repo") else {
+        return Ok(default.to_string());
+    };
+    match v {
+        Value::Null => Ok(default.to_string()),
+        Value::String(s) if s.trim().is_empty() => Ok(default.to_string()),
+        Value::String(s) => {
+            let Some((owner, name)) = s.split_once('/') else {
+                return Err(format!("gh: 'repo' must be owner/name, got {s:?}"));
+            };
+            let valid = |p: &str| {
+                !p.is_empty()
+                    && !p.starts_with('-')
+                    && p.chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+            };
+            if !valid(owner) || !valid(name) || s.contains("..") {
+                return Err(format!("gh: 'repo' must be owner/name, got {s:?}"));
+            }
+            Ok(s.clone())
+        }
+        other => Err(format!(
+            "gh: 'repo' must be a string (owner/name), got {other}"
+        )),
+    }
+}
+
 /// Validate an optional digit-only field (e.g. `limit`).
 fn digit_field_opt(input: &Value, name: &str) -> Result<Option<String>, String> {
-    let Some(v) = input.get(name).and_then(Value::as_str) else {
-        return Ok(None);
+    let v = match input.get(name) {
+        None | Some(Value::Null) => return Ok(None),
+        // Models may send counts as JSON integers — normalize both.
+        Some(Value::Number(n)) => match n.as_u64() {
+            Some(u) => u.to_string(),
+            None => {
+                return Err(format!(
+                    "gh: '{name}' must be a non-negative integer, got {n}"
+                ))
+            }
+        },
+        Some(Value::String(s)) if s.trim().is_empty() => return Ok(None),
+        Some(Value::String(s)) => s.clone(),
+        Some(other) => {
+            return Err(format!(
+                "gh: '{name}' must be digits or an integer, got {other}"
+            ))
+        }
     };
-    if v.trim().is_empty() {
-        return Ok(None);
-    }
     if !v.chars().all(|c| c.is_ascii_digit()) {
         return Err(format!("gh: '{name}' must be digits only, got {v:?}"));
     }
@@ -266,7 +315,7 @@ impl GhTool {
             })?;
         let mut argv = op.argv(input)?;
         argv.push("--repo".into());
-        argv.push(self.repo.clone());
+        argv.push(resolve_repo(input, &self.repo)?);
         let quoted: Vec<String> = argv.iter().map(|a| shlex_quote(a)).collect();
         Ok(format!("{} {}", self.bin.display(), quoted.join(" ")))
     }
@@ -294,7 +343,7 @@ impl Tool for GhTool {
                     "enum": ["issue_view", "issue_list", "pr_view", "issue_comment", "issue_create", "pr_create"],
                     "description": "GitHub operation: issue_view/issue_list/pr_view are read-only (fetch issue/PR data as JSON); issue_comment/issue_create/pr_create are writes"
                 },
-                "repo": { "type": "string", "description": "Repository as owner/name (fixed at registration; input value is ignored)" },
+                "repo": { "type": "string", "description": "Repository as owner/name (optional per-call override; defaults to the registration-time repo)" },
                 "number": { "type": "string", "description": "Issue or PR number (digits only)" },
                 "state": { "type": "string", "enum": ["open", "closed", "all"], "description": "Filter for issue_list (optional, default open)" },
                 "limit": { "type": "string", "description": "Max results for issue_list (digits, 1..=200, default 30)" },
@@ -316,9 +365,10 @@ impl Tool for GhTool {
                 "gh: 'op' must be one of issue_view | issue_list | pr_view | issue_comment | issue_create | pr_create".to_string()
             })?;
         let argv = op.argv(&input)?;
+        let repo = resolve_repo(&input, &self.repo)?;
         let mut cmd = Command::new(&self.bin);
         crate::subprocess::scrub_env_for_child(&mut cmd);
-        cmd.args(&argv).arg("--repo").arg(&self.repo);
+        cmd.args(&argv).arg("--repo").arg(&repo);
         if let Some(dir) = &self.workdir {
             cmd.current_dir(dir);
         }
@@ -351,6 +401,47 @@ fn shlex_quote(s: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn repo_override_resolves_and_validates() {
+        let t = GhTool::new("codecoradev/tole");
+        // valid override shows in the audit line
+        let line = t
+            .command_line(&json!({"op": "issue_view", "number": "5", "repo": "other/team"}))
+            .unwrap();
+        assert!(line.contains("--repo other/team"), "{line}");
+        // absent/empty falls back to the registration default
+        let line = t
+            .command_line(&json!({"op": "issue_view", "number": "5"}))
+            .unwrap();
+        assert!(line.contains("--repo codecoradev/tole"), "{line}");
+        // malformed / traversal / dash refused before spawning
+        assert!(t
+            .command_line(&json!({"op": "issue_view", "number": "5", "repo": "../x"}))
+            .is_err());
+        assert!(t
+            .command_line(&json!({"op": "issue_view", "number": "5", "repo": "-o/x"}))
+            .is_err());
+        assert!(t
+            .command_line(&json!({"op": "issue_view", "number": "5", "repo": "owner"}))
+            .is_err());
+    }
+
+    #[test]
+    fn numbers_accept_integer_json() {
+        let t = GhTool::new("codecoradev/tole");
+        let line = t
+            .command_line(&json!({"op": "issue_view", "number": 164}))
+            .unwrap();
+        assert!(line.contains("164"), "{line}");
+        // negative / fractional integers still refused
+        assert!(t
+            .command_line(&json!({"op": "issue_view", "number": -1}))
+            .is_err());
+        assert!(t
+            .command_line(&json!({"op": "issue_list", "limit": 1.5}))
+            .is_err());
+    }
 
     #[test]
     fn classified_write() {
