@@ -20,6 +20,7 @@ use tole_core::memory::MemoryConfig;
 
 /// Serve MCP over Streamable HTTP. Blocks until the listener errors.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub async fn run_mcp_http(
     bind: &str,
     port: u16,
@@ -27,6 +28,9 @@ pub async fn run_mcp_http(
     allow_patterns: Vec<String>,
     plan_mode: bool,
     memory: Option<MemoryConfig>,
+    workspace: Option<&String>,
+    sessions_dir: Option<std::path::PathBuf>,
+    turnend: Vec<String>,
 ) -> Result<()> {
     use hyper_util::rt::TokioIo;
     use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
@@ -42,13 +46,19 @@ pub async fn run_mcp_http(
         plan_mode
     );
 
+    // The jail-of-jails root: explicit `--workspace` wins (canonicalized
+    // like the run host resolves it); default stays the server cwd.
+    let workspace_root = crate::resolve_workspace_root(workspace)
+        .context("resolving --workspace for the session jail root")?;
     // The MCP service: the session-tool state is shared across the
     // service factory's instances (one Arc per connection).
     let session_state = Arc::new(SessionToolState::new(
         allow_patterns.clone(),
         plan_mode,
         memory,
-        std::env::current_dir().context("resolving server cwd")?,
+        workspace_root,
+        sessions_dir,
+        turnend,
     ));
 
     // The registry: the standard server-mode tools + the session tools,
@@ -61,8 +71,17 @@ pub async fn run_mcp_http(
         let sessions = tole_cli::session_host::lock_sessions(&resolver_sessions);
         sessions.map.get(sid).map(|st| Arc::clone(&st.registry))
     });
+    // Session count for the ambiguity refusal (#138-documented): a
+    // registry-tool call WITHOUT session_id while 2+ sessions are open
+    // is refused instead of silently hitting the server-level registry.
+    let count_sessions = Arc::clone(&session_state.sessions);
+    let session_count: tole_core::mcp_server::SessionCountFn = Arc::new(move || {
+        let sessions = tole_cli::session_host::lock_sessions(&count_sessions);
+        sessions.map.len()
+    });
     let server = tole_core::mcp_server::RegistryServer::with_extra_tools(registry, session_tools)
-        .with_session_resolver(resolver);
+        .with_session_resolver(resolver)
+        .with_session_count(session_count);
 
     let session_manager: Arc<LocalSessionManager> = Arc::new(LocalSessionManager::default());
     let svc = StreamableHttpService::new(

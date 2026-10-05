@@ -6,7 +6,9 @@
 //! on stdin (`{"event":"pretool"|"posttool","tool":...,"input":...,
 //! "ok":...}`) and may print one JSON object to stdout. **Exit code 2**
 //! is a DENY (pre-hooks only): the pending call is settled as a durable
-//! error and the loop replans. Any other non-zero exit, non-JSON
+//! error and the turn parks resumably at it (the same outcome as an
+//! approval denial — resume with a new prompt to replan). Any other
+//! non-zero exit, non-JSON
 //! stdout, a timeout, or a spawn failure is a HOOK FAILURE: recorded to
 //! stderr, never blocks the call. argv execution only (no shell
 //! string). Hooks fire for Write/Destructive tools only — ReadOnly

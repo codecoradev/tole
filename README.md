@@ -9,11 +9,14 @@ Durable Rust agent harness: a conversational agent with risk-tiered approval
 gates, a write-once JSONL session log, and a register state machine — resumable
 after crashes, replayable forever.
 
-**Status:** v0.3.0 released — chat-first harness (chat / resume / sessions /
-jobs / MCP client). Post-0.3.0 work landing on `develop`: the uteke memory
-loop and the cora MCP auto-preset (see [CHANGELOG.md](CHANGELOG.md) →
-Unreleased). Phase 3 hardening (E9) in progress in
-[docs/epics.md](docs/epics.md).
+**Status:** v0.5.0 released — four faces on one durable core: the CLI
+(run / chat / resume / sessions / jobs), `tole mcp` (tool server),
+`tole acp` (editor agent), and `tole serve` (REST + multi-session
+MCP-over-HTTP daemon). Also in 0.5.0: the uteke memory loop, the cora
+MCP auto-preset, turn-end stop gates, `verify_package`, and SKILL.md
+support. Landing on `develop` post-0.5.0: `--trust` presets and SKILL
+support (see [CHANGELOG.md](CHANGELOG.md) → Unreleased). Phase 3
+hardening (E9) in progress in [docs/epics.md](docs/epics.md).
 
 ## Ecosystem position
 
@@ -83,7 +86,9 @@ Useful flags (all subcommands): `--system` (persona, pinned in the session
 header), `--workspace <dir>` (file-tools jail root), `--allow <glob>`
 (repeatable pre-authorization for Write tools, e.g. `--allow 'write_*'`),
 `--yes` (auto-allow every Write; Destructive still prompts), `--mcp-server`,
-`--no-auto-mcp` (skip the cora auto-preset).
+`--no-auto-mcp` (skip the cora auto-preset), `--trust <preset>` (one-word
+trust: `internal` / `read_only`), `--skill <path>` (load a SKILL.md),
+`--plan-mode` (read-only wire), `--on-turnend <cmd>` (final-message gate).
 
 ## Configuration (environment)
 

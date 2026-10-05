@@ -89,6 +89,11 @@ pub fn new_session_id(prefix: &str) -> String {
 /// Create/open a session: workspace jail = the client-provided cwd;
 /// approval = the caller-provided approver (ACP: the interactive editor;
 /// serve: the non-interactive allowlist).
+///
+/// `sessions_dir_override` honors an explicit `--sessions-dir` from the
+/// host (None keeps the per-session-cwd default `<cwd>/.tole/sessions`).
+/// `turnend` wires `--on-turnend` stop gates onto the session's registry
+/// (empty = off).
 #[allow(clippy::too_many_arguments)]
 pub fn open_session(
     session_id: &str,
@@ -97,6 +102,8 @@ pub fn open_session(
     plan_mode: bool,
     approver: impl tole_core::approval::Approver + 'static,
     memory: Option<MemoryConfig>,
+    sessions_dir_override: Option<&std::path::Path>,
+    turnend: Vec<String>,
 ) -> Result<SessionState, String> {
     let workspace = PathBuf::from(cwd);
     let workspace_canon = workspace
@@ -150,14 +157,28 @@ pub fn open_session(
     }
     reg.register(Box::new(JobPollTool::new(workspace_canon.clone())))?;
     reg.register(Box::new(ReadFileTool::new(workspace_canon.clone())))?;
+    // Turn-end stop gates (#145): the same registry-level wiring the
+    // run/chat hosts use, applied to server-face sessions.
+    if !turnend.is_empty() {
+        let mut hooks = tole_core::hooks::ToolHooks::from_cli(&[], &[]);
+        hooks.turnend = turnend
+            .iter()
+            .map(|c| tole_core::hooks::turnend_hook(c))
+            .collect();
+        reg.set_hooks(hooks);
+    }
 
+    let dir = match sessions_dir_override {
+        Some(d) => {
+            std::fs::create_dir_all(d).map_err(|e| format!("creating {}: {e}", d.display()))?;
+            d.to_path_buf()
+        }
+        None => sessions_dir_for(cwd)?,
+    };
     let storage = if loading {
-        let dir = sessions_dir_for(cwd)?;
         tole_core::storage::JsonlStorage::open(dir.join(format!("{session_id}.jsonl")))
             .map_err(|e| format!("loading session: {e}"))?
     } else {
-        let dir = sessions_dir_for(cwd)?;
-        std::fs::create_dir_all(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
         tole_core::storage::JsonlStorage::create_with(
             &dir,
             session_id,
