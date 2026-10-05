@@ -349,8 +349,13 @@ fn dispatch(cli: Cli) -> Result<()> {
         memory: (),
     };
     // Trust presets (issue #159): expand once, before dispatch — every
-    // allow_patterns-consuming subcommand appends these.
-    let trust_extra = expand_trust(&cli.trust)?;
+    // allow_patterns-consuming subcommand appends these. The --trust
+    // flag wins over the TOLE_TRUST env (documented); the env splits on
+    // commas/whitespace so one variable can carry several presets.
+    let trust_extra = expand_trust(&resolve_trust_flags(
+        &cli.trust,
+        std::env::var("TOLE_TRUST").ok(),
+    ))?;
 
     match cli.command {
         Command::Run {
@@ -815,6 +820,26 @@ const TRUST_PRESETS: &[(&str, &[&str])] = &[
         ],
     ),
 ];
+
+/// Effective trust-preset flag list: an explicit `--trust` flag wins
+/// wholesale over the `TOLE_TRUST` env; with no flags, the env (split on
+/// commas/whitespace) is the list. Found by activation testing
+/// 2026-10-05: the env was documented ("flag wins over the TOLE_TRUST
+/// env") but never read — same documented-but-unimplemented class as the
+/// #138 ambiguity refusal.
+fn resolve_trust_flags(flag: &[String], env_val: Option<String>) -> Vec<String> {
+    if !flag.is_empty() {
+        return flag.to_vec();
+    }
+    let Some(env_val) = env_val else {
+        return Vec::new();
+    };
+    env_val
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
 
 /// Expand `--trust` preset names into extra allow patterns. Unknown
 /// preset names are a hard error — a typo silently narrowing trust would
@@ -2211,6 +2236,36 @@ mod trust_preset_tests {
             &["uteke_*".to_string(), "cora_search".to_string()],
         );
         assert_eq!(out, vec!["write_file", "uteke_*", "cora_search"]);
+    }
+
+    #[test]
+    fn trust_env_used_when_flag_absent() {
+        let flags = resolve_trust_flags(&[], Some("internal".to_string()));
+        assert_eq!(flags, vec!["internal"]);
+        // commas and whitespace both separate presets
+        let flags = resolve_trust_flags(&[], Some("internal, read_only".to_string()));
+        assert_eq!(flags, vec!["internal", "read_only"]);
+    }
+
+    #[test]
+    fn trust_flag_wins_over_env() {
+        let flags = resolve_trust_flags(&["read_only".to_string()], Some("internal".to_string()));
+        assert_eq!(flags, vec!["read_only"], "explicit flag replaces the env");
+    }
+
+    #[test]
+    fn trust_env_end_to_end_expands() {
+        // the dispatch path: env-only resolves, then expands
+        let flags = resolve_trust_flags(&[], Some(" internal ".to_string()));
+        let pats = expand_trust(&flags).unwrap();
+        assert!(pats.iter().any(|p| p == "uteke_*"));
+    }
+
+    #[test]
+    fn trust_env_typo_is_a_loud_error() {
+        let flags = resolve_trust_flags(&[], Some("internalx".to_string()));
+        let err = expand_trust(&flags).unwrap_err();
+        assert!(err.to_string().contains("unknown trust preset"));
     }
 }
 
