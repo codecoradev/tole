@@ -14,9 +14,11 @@ after crashes, replayable forever.
 `tole acp` (editor agent), and `tole serve` (REST + multi-session
 MCP-over-HTTP daemon). Also in 0.5.0: the uteke memory loop, the cora
 MCP auto-preset, turn-end stop gates, `verify_package`, and SKILL.md
-support. Landing on `develop` post-0.5.0: `--trust` presets and SKILL
-support (see [CHANGELOG.md](CHANGELOG.md) → Unreleased). Phase 3
-hardening (E9) in progress in [docs/epics.md](docs/epics.md).
+support. On `develop` for the 0.6.0 train: `--trust` presets, System
+One decisions, depth-1 child agents, ACP model & approval pickers,
+and cooperative cancellation on every server face (see
+[CHANGELOG.md](CHANGELOG.md) → Unreleased). E9 hardening is closed;
+post-D3 waves live in [docs/epics.md](docs/epics.md).
 
 ## Ecosystem position
 
@@ -65,8 +67,8 @@ cargo install tole-cli        # the `tole` binary from crates.io
 # or build from source:
 git clone https://github.com/codecoradev/tole && cd tole
 cargo build --release -p tole-cli && ./target/release/tole --help
-# `tole serve --transport mcp` needs the opt-in HTTP feature:
-cargo build --release -p tole-cli --features mcp-http
+# `mcp-http` (needed by `tole serve --transport mcp`) is a default
+# feature since #168 — a plain build/install already includes it.
 ```
 
 ## Quickstart
