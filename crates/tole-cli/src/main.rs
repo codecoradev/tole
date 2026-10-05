@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use tole_cli::approver::{InteractiveApprover, StdioPrompt};
 use tole_cli::tools::WriteFileTool;
+#[cfg(feature = "mcp")]
 use tole_core::approval::AllowlistApprover;
 
 #[cfg(feature = "shell-tools")]
@@ -894,6 +895,11 @@ fn with_trust(mut allow_patterns: Vec<String>, trust_extra: &[String]) -> Vec<St
 /// no effect). `explicit_mcp_servers` must be the RAW `--mcp-server`
 /// flag state, not the merged preset list — the cora auto-preset must
 /// not trip this.
+///
+/// Every call site is `#[cfg(feature = "mcp")]`-gated (the `--mcp-server`
+/// flag and its presets exist only there), so without the `mcp` feature
+/// the function is unreachable and gated out to stay warning-free.
+#[cfg(feature = "mcp")]
 fn check_client_session_flags(
     face: &str,
     skills: &[PathBuf],
@@ -1156,10 +1162,6 @@ fn build_server_registry(
     Ok(reg)
 }
 
-/// D1 (issue #94): serve the registry over MCP stdio. Blocks until the
-/// client disconnects.
-#[cfg(all(feature = "mcp", feature = "shell-tools"))]
-#[cfg_attr(not(feature = "mcp"), allow(unused_variables))]
 /// Server-mode registry for the MCP-over-HTTP host (#137): the same
 /// hardened tools as stdio MCP (D1); the session tools join separately
 /// via RegistryServer::with_extra_tools.
@@ -1170,17 +1172,24 @@ fn build_server_registry_for_mcp(_plan_mode: bool) -> Result<ToolRegistry> {
     build_server_registry(None, &[])
 }
 
+/// D1 (issue #94): serve the registry over MCP stdio. Blocks until the
+/// client disconnects.
+///
+/// Gated as a whole (issue #175): only the gated `Command::Mcp` arm
+/// calls it, but an ungated definition still references
+/// `build_server_registry` and `tole_core::mcp_server::serve_stdio` —
+/// both absent without the `mcp` feature — so the no-mcp profile
+/// failed to compile even though every call site was gated.
+#[cfg(all(feature = "mcp", feature = "shell-tools"))]
 fn mcp_server_command(
     workspace: Option<&String>,
     allow_patterns: &[String],
-    #[cfg(feature = "mcp")] plan_mode: bool,
+    plan_mode: bool,
 ) -> Result<()> {
     let registry = build_server_registry(workspace, allow_patterns)?;
     // Plan mode (issue #109) applies to server mode too (cora scan-3
     // #9): serve read-only tools only when the operator asked for it.
-    #[cfg(feature = "mcp")]
     let mut registry = registry;
-    #[cfg(feature = "mcp")]
     if plan_mode {
         let mut reg = registry;
         reg.retain_read_only();
@@ -2469,7 +2478,7 @@ mod skills_wiring_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "mcp"))]
 mod server_face_flag_tests {
     use super::*;
 
