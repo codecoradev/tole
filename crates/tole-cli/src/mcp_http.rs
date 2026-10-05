@@ -189,12 +189,16 @@ pub async fn run_mcp_http(
                         Ok(hyper::Response::from_parts(rp, body))
                     }
                 });
+            // hyper's raw http1 builder stays (H1-only: no h2c
+            // sniffing on this authenticated transport). The
+            // header_read_timeout REQUIRES a wired timer — without one
+            // hyper panics per connection ("no timer set"; caught by
+            // the pre-tag live smoke test, invisible to CI). Wire
+            // hyper_util's TokioTimer (its `tokio` feature, already
+            // enabled) BEFORE serve_connection.
             let _ = hyper::server::conn::http1::Builder::new()
-                // Slowloris hardening (#190, hyper 1.x): bound how long
-                // the connection may take to deliver request headers.
-                // (REST parity; the body read is separately bounded by
-                // SERVE_IO_TIMEOUT above, and SSE responses are not cut.)
                 .header_read_timeout(SERVE_IO_TIMEOUT)
+                .timer(hyper_util::rt::TokioTimer::new())
                 .serve_connection(io, hyper_service)
                 .await;
         });
