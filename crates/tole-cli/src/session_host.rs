@@ -27,6 +27,10 @@ pub struct SessionState {
     pub memory: Option<MemoryConfig>,
     pub first_prompt_done: StdArc<Mutex<bool>>,
     pub busy: StdArc<Mutex<bool>>,
+    /// Cancellation checkpoint (issue #178): the transport sets it on
+    /// client cancel (ACP `session/cancel`); the turn loop checks it
+    /// between steps. `serve` never sets it — REST behavior unchanged.
+    pub cancel: tole_core::cancel::CancelToken,
 }
 
 /// Marks a session busy for its whole lifetime; Drop un-marks even on
@@ -106,6 +110,7 @@ pub fn open_session(
     sessions_dir_override: Option<&std::path::Path>,
     turnend: Vec<String>,
     parent_allows: Vec<String>,
+    cancel: tole_core::cancel::CancelToken,
 ) -> Result<SessionState, String> {
     let workspace = PathBuf::from(cwd);
     let workspace_canon = workspace
@@ -228,6 +233,7 @@ pub fn open_session(
         memory,
         first_prompt_done: StdArc::new(Mutex::new(loading)),
         busy: StdArc::new(Mutex::new(false)),
+        cancel,
     })
 }
 
@@ -320,7 +326,7 @@ pub fn run_session_turn(
     // session. The MAP lock is released here — a running turn holds only
     // its OWN storage lock, so the transport loop stays live (CodeCora
     // deadlock finding).
-    let (storage, registry, memory, system_prompt, first_prompt_done, busy_guard) = {
+    let (storage, registry, memory, system_prompt, first_prompt_done, busy_guard, cancel) = {
         let mut sessions = lock_sessions(&sessions);
         let Some(state) = sessions.map.get_mut(session_id) else {
             return Err(format!("unknown session: {session_id}"));
@@ -331,6 +337,11 @@ pub fn run_session_turn(
                 return Err("session is busy running a turn".into());
             }
             *busy = true;
+            // Wipe a stale cancel flag in the SAME critical section as
+            // the busy claim (#178): a cancel that lands after this
+            // point targets THIS turn; one that landed before it had no
+            // in-flight turn to target and must not kill the new one.
+            state.cancel.reset();
         }
         (
             state.storage.clone(),
@@ -339,6 +350,7 @@ pub fn run_session_turn(
             state.system_prompt.clone(),
             state.first_prompt_done.clone(),
             std::sync::Arc::clone(&state.busy),
+            state.cancel.clone(),
         )
     };
     // Panic-safe un-busy: Drop clears the flag even if the turn unwinds.
@@ -386,8 +398,14 @@ pub fn run_session_turn(
         provider = provider.with_system_prompt(sys);
     }
 
-    let outcome = tole_core::turn::run_turn(&mut *storage, &mut provider, &registry, &effective)
-        .map_err(|e| e.to_string())?;
+    let outcome = tole_core::turn::run_turn_with_cancel(
+        &mut *storage,
+        &mut provider,
+        &registry,
+        &effective,
+        &cancel,
+    )
+    .map_err(|e| e.to_string())?;
 
     #[cfg(feature = "shell-tools")]
     if let tole_core::turn::TurnOutcome::Final { text, wrote } = &outcome {
@@ -419,6 +437,7 @@ pub fn run_session_turn(
             "refusal"
         }
         tole_core::turn::TurnOutcome::BudgetExhausted => "max_tokens",
+        tole_core::turn::TurnOutcome::Cancelled => "cancelled",
         tole_core::turn::TurnOutcome::LoopDetected { tool, .. } => {
             eprintln!("tole: loop detected on '{tool}'");
             "refusal"

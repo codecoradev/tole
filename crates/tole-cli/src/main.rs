@@ -1902,6 +1902,9 @@ fn chat_command(
                     "tole> (stop gate blocked: {reason} — turn aborted; next message resumes)"
                 )
             }
+            Ok(TurnOutcome::Cancelled) => {
+                eprintln!("tole> (turn cancelled — next message resumes)")
+            }
             Ok(TurnOutcome::LoopDetected { .. }) => eprintln!(
                 "tole> (loop guard tripped — identical tool calls repeated; next message resumes)"
             ),
@@ -2058,6 +2061,10 @@ fn report_outcome(session_id: &str, outcome: TurnOutcome) {
         TurnOutcome::BudgetExhausted => {
             eprintln!("tole: step budget exhausted (resume with: tole resume {session_id})");
             std::process::exit(5);
+        }
+        TurnOutcome::Cancelled => {
+            eprintln!("tole: turn cancelled (resume with: tole resume {session_id})");
+            std::process::exit(8);
         }
         TurnOutcome::LoopDetected { tool, count } => {
             eprintln!(

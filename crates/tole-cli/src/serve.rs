@@ -360,6 +360,9 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                 state.sessions_dir.as_deref(),
                 state.turnend.clone(),
                 state.allow_patterns.clone(),
+                // No REST cancel endpoint today (#178): a never-fired
+                // token keeps serve behavior unchanged.
+                tole_core::cancel::CancelToken::default(),
             ) {
                 Ok(session_state) => {
                     {
