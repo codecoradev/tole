@@ -143,3 +143,38 @@ final-text preview handed to the gate is capped at 8 KiB and never leaves
 the host process. Denials are capped at 3 per turn, so a permanently
 failing gate cannot livelock the loop — the turn settles durably as
 `StopGateBlocked`, visible to replay.
+
+## Cooperative cancellation (#178/#184/#185)
+
+All three server faces expose cooperative turn cancellation: ACP
+clients send `session/cancel`, REST callers `POST /sessions/{id}/cancel`,
+MCP clients call `tole_session_cancel`. Every path sets the same
+per-session token; a blocking turn observes it at checkpoints (between
+provider calls and tool executions) and settles
+`stopReason: "cancelled"` as a normal, durable turn end — the session
+resumes as usual. Per the ACP and MCP specs the receiver MAY ignore
+cancellation for work that cannot be stopped: a single in-flight tool
+call (including `run_command`) is not interrupted; the token is
+checked before the next one. Unknown session ids 404; cancelling an
+idle session is an idempotent no-op. The `tole_session_*` glob in the
+`--trust internal` preset covers the new MCP tool.
+
+## Depth-1 child agents (#171/#174)
+
+`agent_start` spawns a child tole session; `agent_poll` reads its
+result. The registry enforces a structural depth cap (no
+grandchildren), results travel via ephemeral uteke mailboxes, and the
+parent-only `--agents-worktree` flag gives each child its own git
+worktree. A child's prompt is model/operator-supplied — the same trust
+tier as the session system prompt. Child sessions are ordinary durable
+sessions: approval gates, risk tiers, and secret redaction apply
+unchanged inside them.
+
+## `systemone_decide` (#172/#173)
+
+ReadOnly tool, active only when `SYSTEMONE_API_KEY` is set
+(`SYSTEMONE_BASE_URL` selects the backend — hosted Jev default,
+self-hosted compatible). The decision payload sent to the backend is
+model-controlled context: treat the System One backend as an external
+data flow. The tool executes no writes; results are advisory input to
+the session like any other ReadOnly tool.

@@ -10,6 +10,8 @@
 > D2 2026-09-18, D3 2026-09-28). Post-D3 work is shipped too (see the
 > Post-D3 section). 298/298 workspace tests, CI green. Code is
 > authoritative over this doc.
+> Status sync 2026-10-06 (pre-0.6.0): the 0.6.0 train (#168–#185) is
+> fully merged to develop — see the Post-D3 section.
 
 ## Identity recap (PRD v1.1)
 
@@ -157,10 +159,19 @@ Everything below is merged; CHANGELOG entries carry the detail.
   refusal implemented; skills discovery defaults to cwd.
 - **2026-10-05 activation fix (#165/#166):** `TOLE_TRUST` env actually
   read (was documented but unimplemented).
-
-Known open follow-up: `cargo install tole-cli` does not include the
-`mcp-http` feature — `tole serve --transport mcp` needs a source build
-with `--features mcp-http` (clean error at startup otherwise).
+- **0.6.0 train (merged to develop 2026-10-05/06):**
+  `mcp-http` becomes a default `tole-cli` feature (#168 — every
+  documented face works on a plain install); the `gitea` tool (#169);
+  the v0.5.0 Tier-2 baseline + HOME-scrubbing eval archiver (#170);
+  `systemone_decide` typed decisions (#172/#173); depth-1 child
+  agents `agent_start`/`agent_poll` (#171/#174); the no-mcp build
+  gate fix (#175/#180); ACP native model picker + per-session
+  approval controls (#176/#177/#179); ACP `session/cancel` (#178/#184);
+  project-sync board-sync fixes (#181/#182, #183); REST
+  `POST /sessions/{id}/cancel` + the `tole_session_cancel` MCP tool
+  (#178/#185) — cooperative cancellation now exists on all three
+  server faces (ACP, REST, MCP), spec-conformant (the receiver may
+  ignore un-cancellable work; single-tool calls are not interrupted).
 
 ---
 

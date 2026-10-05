@@ -42,6 +42,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--no-skills` disables everything. (Landed on develop 2026-10-02,
   backfilled here.)
 
+- `systemone_decide` (#172/#173) — typed decisions (choice / score /
+  noul + confidence) from any System One backend, active when
+  `SYSTEMONE_API_KEY` is set; `SYSTEMONE_BASE_URL` picks the backend
+  (hosted Jev default, self-hosted compatible). ReadOnly, approval-free.
+- Depth-1 child agents (#171/#174): `agent_start` / `agent_poll` spawn
+  and harvest durable child sessions from within one session —
+  structurally no grandchildren (registry depth cap), results via
+  ephemeral per-child uteke mailboxes, optional per-child git worktrees
+  behind the parent-only `--agents-worktree` flag.
+- ACP native model picker + per-session approval controls (#176/#177/#179):
+  `TOLE_MODELS` (comma-separated ids) advertises a model switch via ACP
+  session config options, persisted durably per session across resumes;
+  an approval selector (`ask` / `auto`, session-scoped) plus an
+  `allow_always` option on Write permission requests let the editor
+  relax the gate without weakening the Destructive tier.
+- Cooperative cancellation on all three server faces (#178/#184/#185):
+  ACP `session/cancel`, REST `POST /sessions/{id}/cancel`, and the
+  `tole_session_cancel` multi-session MCP tool. All paths set the same
+  per-session token; the blocking turn observes it at checkpoints and
+  settles `stopReason: "cancelled"` as a normal durable turn end.
+  Spec-conformant: single in-flight tool calls are not interrupted,
+  unknown sessions 404, cancelling an idle session is idempotent;
+  `--trust internal` covers the new tool via the `tole_session_*` glob.
+
 ### Fixed
 - **`TOLE_TRUST` env was documented but never read** (found by
   activation testing 2026-10-05): `--trust` help says "flag wins over
@@ -76,6 +100,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `--on-pretool` help text corrected: an exit-2 deny parks the turn
     resumably at the denial (mirroring an approval denial); it does
     not auto-replan in-flight.
+- Build/CI fixes riding the same train: the no-`mcp` `tole-cli`
+  profile compiles again (`mcp_server_command` is now gated behind the
+  `mcp` feature, #175/#180); project-sync board lookup resolves the
+  runtime Done-option id instead of a hardcoded value, and the
+  `set_done` mutation takes `optionId` as `String!` (the previous `ID!`
+  call failed against the live Projects API) — failures are now loud,
+  not silent (#181/#182, #183).
 
 ## [0.5.0] — 2026-10-02
 
