@@ -922,6 +922,7 @@ fn build_registry(
     workspace: Option<&String>,
     #[cfg(feature = "mcp")] mcp_servers: &[tole_core::mcp::McpServerConfig],
     agents_worktree: bool,
+    parent_allows: &[String],
 ) -> Result<ToolRegistry> {
     // Child-agent depth (#171): spawned children carry TOLE_AGENT_DEPTH=1;
     // at depth >= 1 the agent tools vanish (structural cap) and the
@@ -992,7 +993,8 @@ fn build_registry(
     if agent_depth == 0 {
         let bin = std::env::current_exe().context("resolving the tole binary for child agents")?;
         let start = tole_core::agents::AgentStartTool::new(bin, file_root.clone())
-            .with_worktrees(agents_worktree);
+            .with_worktrees(agents_worktree)
+            .with_parent_allows(parent_allows.to_vec());
         reg.register(Box::new(start))
             .map_err(|e| anyhow::anyhow!("registering agent_start: {e}"))?;
         reg.register(Box::new(tole_core::agents::AgentPollTool::new(
@@ -1278,6 +1280,7 @@ fn run_command(
         host.workspace.as_ref(),
         &mcp_cfgs,
         host.agents_worktree,
+        allow_patterns,
     )?;
     #[cfg(not(feature = "mcp"))]
     let mut registry = build_registry(
@@ -1381,6 +1384,7 @@ fn resume_command(
         host.workspace.as_ref(),
         &mcp_cfgs,
         host.agents_worktree,
+        allow_patterns,
     )?;
     #[cfg(not(feature = "mcp"))]
     let mut registry = build_registry(
@@ -1678,6 +1682,7 @@ fn chat_command(
         host.workspace.as_ref(),
         &mcp_cfgs,
         host.agents_worktree,
+        allow_patterns,
     )?;
     #[cfg(not(feature = "mcp"))]
     let mut registry = build_registry(

@@ -104,6 +104,7 @@ pub fn open_session(
     memory: Option<MemoryConfig>,
     sessions_dir_override: Option<&std::path::Path>,
     turnend: Vec<String>,
+    parent_allows: Vec<String>,
 ) -> Result<SessionState, String> {
     let workspace = PathBuf::from(cwd);
     let workspace_canon = workspace
@@ -180,10 +181,10 @@ pub fn open_session(
     // gets no agent tools at all (the structural depth cap).
     if agent_depth == 0 && !plan_mode {
         if let Ok(bin) = std::env::current_exe() {
-            let _ = reg.register(Box::new(tole_core::agents::AgentStartTool::new(
-                bin,
-                workspace_canon.clone(),
-            )));
+            let _ = reg.register(Box::new(
+                tole_core::agents::AgentStartTool::new(bin, workspace_canon.clone())
+                    .with_parent_allows(parent_allows.clone()),
+            ));
             let _ = reg.register(Box::new(tole_core::agents::AgentPollTool::new(
                 workspace_canon.clone(),
             )));

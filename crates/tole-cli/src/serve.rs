@@ -359,6 +359,7 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                 state.memory.clone(),
                 state.sessions_dir.as_deref(),
                 state.turnend.clone(),
+                state.allow_patterns.clone(),
             ) {
                 Ok(session_state) => {
                     {

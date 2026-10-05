@@ -341,6 +341,7 @@ pub fn run_acp(
                     memory.clone(),
                     sessions_dir.as_deref(),
                     turnend.clone(),
+                    allow_patterns.to_vec(),
                 ) {
                     Ok(state) => {
                         // Insert + busy re-check in ONE critical section:

@@ -106,7 +106,10 @@ fn agents_root(root: &std::path::Path) -> PathBuf {
     root.join(AGENTS_DIR)
 }
 
-fn pid_alive(pid: u32) -> bool {
+/// Result<bool> like jobs.rs (CodeCora PR #174 round 2): a ps failure
+/// must NOT be read as "process dead" — on ps-less hosts that would
+/// consume-and-wipe a live child's mailbox and undercount the cap.
+fn pid_alive(pid: u32) -> Result<bool, String> {
     let out = crate::subprocess::run_with_timeout(
         Command::new("ps")
             .arg("-p")
@@ -114,15 +117,14 @@ fn pid_alive(pid: u32) -> bool {
             .arg("-o")
             .arg("stat="),
         crate::subprocess::SUBPROCESS_TIMEOUT,
-    );
-    match out {
-        Ok(o) if o.status.success() => {
-            let s = String::from_utf8_lossy(&o.stdout);
-            let state = s.trim();
-            !state.is_empty() && !state.starts_with('Z')
-        }
-        _ => false,
+    )?;
+    if !out.status.success() {
+        // ps exits non-zero for an unknown pid — that IS "dead".
+        return Ok(false);
     }
+    let state = String::from_utf8_lossy(&out.stdout);
+    let state = state.trim();
+    Ok(!state.is_empty() && !state.starts_with('Z'))
 }
 
 /// One agent's durable state (meta.json in its dir).
@@ -150,21 +152,28 @@ fn write_meta(dir: &std::path::Path, meta: &AgentMeta) -> Result<(), String> {
 }
 
 /// Count LIVE agents (used to enforce MAX concurrent). Dead-but-
-/// unconsumed agents do not block new slots.
-fn live_agents(root: &std::path::Path) -> usize {
-    let Some(entries) = std::fs::read_dir(agents_root(root)).ok() else {
-        return 0;
+/// unconsumed agents do not block new slots. A liveness-check FAILURE
+/// is an error, not zero (CodeCora PR #174 round 2).
+fn live_agents(root: &std::path::Path) -> Result<usize, String> {
+    let mut n = 0;
+    let root_dir = match std::fs::read_dir(agents_root(root)) {
+        Ok(entries) => entries,
+        // No agents yet = zero live (the dir appears on first spawn).
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(format!("agents dir: {e}")),
     };
-    entries
-        .flatten()
-        .filter(|e| {
-            let dir = e.path();
-            let Ok(pid) = std::fs::read_to_string(dir.join("pid")) else {
-                return false;
-            };
-            pid.trim().parse::<u32>().map(pid_alive).unwrap_or(false)
-        })
-        .count()
+    for e in root_dir.flatten() {
+        let dir = e.path();
+        let Ok(pid) = std::fs::read_to_string(dir.join("pid")) else {
+            continue;
+        };
+        if let Ok(pid) = pid.trim().parse::<u32>() {
+            if pid_alive(pid)? {
+                n += 1;
+            }
+        }
+    }
+    Ok(n)
 }
 
 /// Best-effort mailbox cleanup (ephemeral default): `uteke forget`
@@ -220,7 +229,12 @@ pub struct AgentStartTool {
     pub worktree_mode: bool,
     pub max_concurrent: usize,
     pub timeout_secs: u64,
-    pub default_allows: Vec<String>,
+    /// The PARENT operator's approved Write-allow patterns. The child's
+    /// allowlist can never exceed this set: requested patterns must be
+    /// glob-covered by a parent pattern, and the default is exactly the
+    /// parent's list (CodeCora PR #174 round 2 — a non-interactive
+    /// parent must not let the model hand a child broader writes).
+    pub parent_allows: Vec<String>,
 }
 
 impl AgentStartTool {
@@ -232,8 +246,13 @@ impl AgentStartTool {
             worktree_mode: false,
             max_concurrent: DEFAULT_MAX_CONCURRENT,
             timeout_secs: DEFAULT_TIMEOUT_SECS,
-            default_allows: Vec::new(),
+            parent_allows: Vec::new(),
         }
+    }
+
+    pub fn with_parent_allows(mut self, patterns: Vec<String>) -> Self {
+        self.parent_allows = patterns;
+        self
     }
 
     pub fn at_depth(mut self, depth: u32) -> Self {
@@ -276,7 +295,7 @@ impl Tool for AgentStartTool {
             "start child agent: {:?} (child allowlist: {:?}, worktree: {})",
             preview,
             if allows.is_empty() {
-                self.default_allows.clone()
+                self.parent_allows.clone()
             } else {
                 allows
             },
@@ -318,7 +337,7 @@ impl Tool for AgentStartTool {
             .get("keep_mailbox")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let allows: Vec<String> = input
+        let requested: Vec<String> = input
             .get("allow")
             .and_then(Value::as_array)
             .map(|a| {
@@ -328,12 +347,36 @@ impl Tool for AgentStartTool {
                     .collect()
             })
             .unwrap_or_default();
-        for pat in &allows {
+        for pat in &requested {
             if pat.starts_with('-') || pat.is_empty() {
                 return Err(format!("agent_start: bad allow pattern {pat:?}"));
             }
         }
-        let live = live_agents(&self.root);
+        // Subset enforcement: every requested pattern must be glob-covered
+        // by a PARENT pattern; the default is the parent's own list. The
+        // child can never write wider than the operator approved.
+        let allows = if requested.is_empty() {
+            self.parent_allows.clone()
+        } else {
+            let uncovered: Vec<&String> = requested
+                .iter()
+                .filter(|p| {
+                    !self
+                        .parent_allows
+                        .iter()
+                        .any(|pp| crate::approval::glob_match(pp, p))
+                })
+                .collect();
+            if !uncovered.is_empty() {
+                return Err(format!(
+                    "agent_start: child allow pattern(s) {uncovered:?} exceed the parent's \
+                     approved scope {:?} — children can never be granted wider writes",
+                    self.parent_allows
+                ));
+            }
+            requested
+        };
+        let live = live_agents(&self.root)?;
         if live >= self.max_concurrent {
             return Err(format!(
                 "agent_start: {live} child agent(s) already running (cap {}) — poll and \
@@ -423,7 +466,7 @@ impl Tool for AgentStartTool {
             .arg(&sessions_dir)
             .arg("--workspace")
             .arg(&child_cwd);
-        for pat in allows.iter().chain(self.default_allows.iter()) {
+        for pat in &allows {
             cmd.arg("--allow").arg(pat);
         }
         // `--` terminates the child's flag parsing: a model-supplied
@@ -441,15 +484,21 @@ impl Tool for AgentStartTool {
             use std::os::unix::process::CommandExt;
             cmd.process_group(0);
         }
-        let child = cmd
+        let mut child = cmd
             .spawn()
             .map_err(|e| format!("agent_start: spawning {}: {e}", self.bin.display()))?;
         let pid = child.id();
+        // pid file BEFORE detaching: a spawn that reports failure must
+        // not leave a live orphan (the jobs.rs invariant — CodeCora PR
+        // #174 round 2). On write failure the child is killed.
+        if let Err(e) = std::fs::write(dir.join("pid"), pid.to_string()) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("agent_start: pid file: {e}"));
+        }
         // Detach: the child survives the parent CLI exiting; we never
         // wait on it (poll checks liveness via ps, like jobs).
         drop(child);
-        std::fs::write(dir.join("pid"), pid.to_string())
-            .map_err(|e| format!("agent_start: pid file: {e}"))?;
 
         Ok(json!({
             "agent": id,
@@ -524,7 +573,8 @@ impl Tool for AgentPollTool {
             .parse()
             .map_err(|_| format!("agent_poll: corrupt pid file for {id}"))?;
         let meta = read_meta(&dir)?;
-        let running = pid_alive(pid);
+        let running =
+            pid_alive(pid).map_err(|e| format!("agent_poll: liveness check failed: {e}"))?;
         let elapsed_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
@@ -749,9 +799,18 @@ mod tests {
         let id = out["agent"].as_str().unwrap().to_string();
         assert!(valid_agent_id(&id));
         assert!(out["mailbox"].as_str().unwrap().starts_with("agent-"));
-        // Wait for the fake child to exit, then poll: settled + tail.
-        std::thread::sleep(std::time::Duration::from_millis(700));
-        let st = poll.execute(json!({"agent": id})).unwrap();
+        // Poll until settled (parallel test load makes fixed sleeps
+        // flaky — the child is a detached shell echo).
+        let mut st = None;
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let r = poll.execute(json!({"agent": id})).unwrap();
+            if r["running"] == json!(false) {
+                st = Some(r);
+                break;
+            }
+        }
+        let st = st.unwrap_or_else(|| panic!("fake child never settled"));
         assert_eq!(st["running"], json!(false), "{st}");
         assert!(
             st["log_tail"].as_str().unwrap().contains("FAKE_AGENT_DONE"),
@@ -802,6 +861,34 @@ mod tests {
         )
         .unwrap();
         assert!(String::from_utf8_lossy(&listed.stdout).contains(&branch));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// CodeCora PR #174 round 2: the child's allowlist can never exceed
+    /// the parent operator's approved scope — requested patterns must
+    /// be glob-covered; the default IS the parent's list.
+    #[test]
+    fn child_allowlist_is_subset_of_parent_scope() {
+        let d = tmp("subset");
+        let start = AgentStartTool::new(fake_child(&d), d.clone())
+            .with_parent_allows(vec!["write_*".to_string(), "git".to_string()]);
+        // wider-than-parent → refused
+        let err = start
+            .execute(json!({"prompt": "x", "allow": ["*"]}))
+            .unwrap_err();
+        assert!(err.contains("exceed the parent"), "{err}");
+        let err = start
+            .execute(json!({"prompt": "x", "allow": ["run_command"]}))
+            .unwrap_err();
+        assert!(err.contains("exceed the parent"), "{err}");
+        // covered → accepted
+        for req in [vec!["write_file"], vec!["write_edit", "git"]] {
+            let r: Vec<String> = req.iter().map(|s| s.to_string()).collect();
+            match start.execute(json!({"prompt": "x", "allow": r})) {
+                Ok(_) => {}
+                Err(e) => panic!("covered pattern {req:?} rejected: {e}"),
+            }
+        }
         let _ = std::fs::remove_dir_all(&d);
     }
 
