@@ -45,23 +45,39 @@ pub const DEFAULT_MAX_CONCURRENT: usize = 4;
 /// is deliberately out of scope — same contract as jobs).
 const DEFAULT_TIMEOUT_SECS: u64 = 30 * 60;
 
-/// Refuse argv whose program IS the tole binary (or an obvious path to
-/// it): in child mode that would bypass the depth cap. Checked in
+/// Refuse any argv that would spawn a depth-0 tole from a child
+/// session: a program element that IS the tole binary (any path form),
+/// a tole invocation smuggled behind wrappers (`env -u … tole`,
+/// `bash -c '… tole …'` — matched as a WORD anywhere in argv), or any
+/// manipulation of the TOLE_AGENT_DEPTH marker itself. Checked in
 /// addition to the destructive-payload scan.
+///
+/// Documented residual (CodeCora PR #174 round 1): a RENAMED COPY of
+/// the binary (`cp $(which tole) ./t && ./t run`) is not nameably
+/// distinguishable — but that is the same authority the child already
+/// has to spawn arbitrary subprocesses via run_command (which stays
+/// Write-tier + approved/allowlisted by the parent's policy); the
+/// depth cap prevents silent budget multiplication, not overt hostile
+/// action that is fully visible in the audit log.
 pub fn check_child_agent_argv(argv: &[String]) -> Result<(), String> {
-    let Some(prog) = argv.first() else {
-        return Ok(());
-    };
-    let base = prog
-        .rsplit('/')
-        .next()
-        .unwrap_or(prog)
-        .trim_end_matches(".exe");
-    if base == "tole" || base == "tole-cli" {
-        return Err(format!(
-            "child agents may not spawn the tole binary ({prog:?}) — the agent tree is capped \
-             at one level by design (issue #171)"
-        ));
+    const ERR: &str = "child agents may not spawn or reconfigure the tole binary — the agent \
+         tree is capped at one level by design (issue #171)";
+    if argv.iter().any(|a| a.contains("TOLE_AGENT_DEPTH")) {
+        return Err(ERR.to_string());
+    }
+    // Word-level detection across EVERY element: wrappers smuggle the
+    // invocation inside one string (`bash -c "… exec tole run"`), so a
+    // basename check on argv[0] alone is not enough. Segments split on
+    // whitespace and shell/path separators; compound fleet names
+    // (`tole-agents`, `tole-jobs`) survive intact and stay allowed.
+    for arg in argv {
+        let segments = arg.split(|c: char| c.is_whitespace() || matches!(c, ';' | '&' | '|' | '/'));
+        for seg in segments {
+            let seg = seg.trim_end_matches(".exe");
+            if seg == "tole" || seg == "tole-cli" {
+                return Err(ERR.to_string());
+            }
+        }
     }
     Ok(())
 }
@@ -410,7 +426,12 @@ impl Tool for AgentStartTool {
         for pat in allows.iter().chain(self.default_allows.iter()) {
             cmd.arg("--allow").arg(pat);
         }
-        cmd.arg(&prompt)
+        // `--` terminates the child's flag parsing: a model-supplied
+        // prompt like "--yes real mission" must reach the child as the
+        // POSITIONAL prompt, never as approver-escalating flags
+        // (CodeCora PR #174 round 1).
+        cmd.arg("--")
+            .arg(&prompt)
             .current_dir(&child_cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::from(log_out))
@@ -632,6 +653,80 @@ mod tests {
         assert!(check_child_agent_argv(&["tole.exe".into()]).is_err());
         assert!(check_child_agent_argv(&["git".into(), "status".into()]).is_ok());
         assert!(check_child_agent_argv(&[]).is_ok());
+    }
+
+    /// CodeCora PR #174 round 1: the env-token escape hatch — wrappers
+    /// that unset the depth marker or smuggle a tole invocation behind
+    /// an interpreter — must be refused, not just the bare binary name.
+    #[test]
+    fn child_argv_refuses_env_and_wrapper_escapes() {
+        for argv in [
+            vec!["env", "-u", "TOLE_AGENT_DEPTH", "tole", "run", "x"],
+            vec!["bash", "-c", "unset TOLE_AGENT_DEPTH; exec tole run x"],
+            vec!["sh", "-c", "TOLE_AGENT_DEPTH=0 tole chat"],
+            vec!["env", "TOLE_AGENT_DEPTH=0", "/usr/bin/tole", "run"],
+            vec!["bash", "-c", "echo tole-agents && exec tole run"],
+        ] {
+            let owned: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+            assert!(
+                check_child_agent_argv(&owned).is_err(),
+                "must refuse: {argv:?}"
+            );
+        }
+        // benign mentions of the agents dir are NOT the binary
+        let ok: Vec<String> = vec![
+            "ls".into(),
+            "tole-agents/a-1/log".into(),
+            "tole-jobs".into(),
+        ];
+        assert!(check_child_agent_argv(&ok).is_ok());
+    }
+
+    /// CodeCora PR #174 round 1: a leading-dash prompt must reach the
+    /// child as the POSITIONAL prompt behind `--`, never as flags.
+    #[test]
+    fn leading_dash_prompt_is_guarded_by_double_dash() {
+        let d = tmp("dashguard");
+        #[cfg(unix)]
+        {
+            let p = d.join("dump-tole");
+            let dump = d.join("argv.txt");
+            let script = format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\nexit 0\n",
+                dump.display()
+            );
+            std::fs::write(&p, script).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755));
+            let start = AgentStartTool::new(&p, d.clone());
+            let out = start
+                .execute(json!({"prompt": "--yes sneaky mission"}))
+                .unwrap();
+            // Poll for the dump: under parallel test load the detached
+            // child can take longer than a fixed sleep.
+            let mut dumped = None;
+            for _ in 0..50 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                if let Ok(t) = std::fs::read_to_string(&dump) {
+                    dumped = Some(t);
+                    break;
+                }
+            }
+            let dumped = dumped
+                .unwrap_or_else(|| panic!("child never wrote the argv dump at {}", dump.display()));
+            let argv: Vec<&str> = dumped.lines().collect();
+            let id = out["agent"].as_str().unwrap();
+            let _ = id;
+            // the exact sequence: ... "--" "--yes sneaky mission"
+            let pos = argv.iter().position(|a| *a == "--");
+            assert!(pos.is_some(), "argv must contain --: {argv:?}");
+            let prompt_pos = pos.unwrap() + 1;
+            assert_eq!(
+                argv[prompt_pos], "--yes sneaky mission",
+                "prompt must be the positional after --: {argv:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

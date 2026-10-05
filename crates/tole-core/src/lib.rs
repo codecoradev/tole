@@ -26,6 +26,7 @@
 //! - `turn`     — the single-threaded turn loop
 //! - `memory`   — harness-level uteke memory loop (recall/remember)
 
+#[cfg(feature = "shell-tools")]
 pub mod agents;
 pub mod approval;
 #[cfg(feature = "shell-tools")]
