@@ -137,9 +137,23 @@ pub fn open_session(
     // draft registered everything and "filtered" afterwards, which
     // CodeCora rightly called out: the full registry under --yes broke
     // the read-only contract.
+    let agent_depth: u32 = std::env::var("TOLE_AGENT_DEPTH")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0);
     if !plan_mode {
-        reg.register(Box::new(RunCommandTool::new(workspace_canon.clone())))?;
-        reg.register(Box::new(JobStartTool::new(workspace_canon.clone())))?;
+        let run_cmd = if agent_depth >= 1 {
+            RunCommandTool::new(workspace_canon.clone()).in_child_agent_mode()
+        } else {
+            RunCommandTool::new(workspace_canon.clone())
+        };
+        reg.register(Box::new(run_cmd))?;
+        let job_start = if agent_depth >= 1 {
+            JobStartTool::new(workspace_canon.clone()).in_child_agent_mode()
+        } else {
+            JobStartTool::new(workspace_canon.clone())
+        };
+        reg.register(Box::new(job_start))?;
         reg.register(Box::new(WriteFileTool::new(workspace_canon.clone())))?;
         reg.register(Box::new(EditFileTool::new(workspace_canon.clone())))?;
         {
@@ -161,6 +175,19 @@ pub fn open_session(
     // systemone_decide (#172): probe-gated on SYSTEMONE_API_KEY.
     if let Some(t) = tole_core::systemone::SystemOneTool::from_env() {
         reg.register(Box::new(t))?;
+    }
+    // Child agents (#171): parent sessions only — a child (depth >= 1)
+    // gets no agent tools at all (the structural depth cap).
+    if agent_depth == 0 && !plan_mode {
+        if let Ok(bin) = std::env::current_exe() {
+            let _ = reg.register(Box::new(tole_core::agents::AgentStartTool::new(
+                bin,
+                workspace_canon.clone(),
+            )));
+            let _ = reg.register(Box::new(tole_core::agents::AgentPollTool::new(
+                workspace_canon.clone(),
+            )));
+        }
     }
     // Turn-end stop gates (#145): the same registry-level wiring the
     // run/chat hosts use, applied to server-face sessions.

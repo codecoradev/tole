@@ -1,0 +1,729 @@
+//! Child agents (issue #171): a parent session spawns N durable child
+//! `tole run` sessions — depth capped at ONE (no grandchildren), the
+//! mailbox is a per-child uteke namespace, ephemeral by default.
+//!
+//! Architecture = the jobs pattern (detached spawn + on-disk state +
+//! poll), composed with the memory loop's namespace override:
+//!
+//! - `agent_start` — spawn `<bin> run "<prompt>"` DETACHED with
+//!   `TOLE_AGENT_DEPTH=1`, `TOLE_MEMORY_NAMESPACE=agent-<id>`,
+//!   `TOLE_MEMORY=uteke`. The child is a full tole session: own JSONL
+//!   (inside the agent dir), own registry (BUILT WITHOUT the agent
+//!   tools — the structural depth cap), own usage ledger. Its settle
+//!   summary lands in its mailbox namespace automatically (the memory
+//!   loop), which is the ONLY result channel back up.
+//! - `agent_poll`  — liveness + log tail +, once settled, the mailbox
+//!   summary; consuming a settled result CLEANS the mailbox (soft,
+//!   best-effort) unless the agent was started with `keep_mailbox`.
+//!
+//! Worktree mode (parent-only operator flag, default OFF): the child
+//! gets its own `git worktree` + branch; merge-back stays human.
+//!
+//! Security invariants:
+//! - depth: registration skips these tools entirely when
+//!   TOLE_AGENT_DEPTH >= 1 (see the CLI wiring) AND the tool itself
+//!   refuses — belt and braces.
+//! - the run_command/job_start bypass (spawning `tole` by name) is
+//!   closed in child mode by `check_child_agent_argv` (wired via
+//!   `in_child_mode` on those tools).
+//! - env: the child INHERITS the parent env (it needs the provider
+//!   key) — the normal secret scrub is deliberately NOT applied here;
+//!   isolation comes from depth + jail + policy visibility instead.
+
+use crate::tool::{Risk, Tool};
+use serde_json::{json, Value};
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::sync::Mutex;
+
+const AGENTS_DIR: &str = "tole-agents";
+const LOG_TAIL_CHARS: usize = 2000;
+const READ_WINDOW: u64 = 8 * 1024;
+/// Hard default for concurrent LIVE children per parent (issue #171).
+pub const DEFAULT_MAX_CONCURRENT: usize = 4;
+/// A child running longer than this is reported `timed_out` (killing
+/// is deliberately out of scope — same contract as jobs).
+const DEFAULT_TIMEOUT_SECS: u64 = 30 * 60;
+
+/// Refuse argv whose program IS the tole binary (or an obvious path to
+/// it): in child mode that would bypass the depth cap. Checked in
+/// addition to the destructive-payload scan.
+pub fn check_child_agent_argv(argv: &[String]) -> Result<(), String> {
+    let Some(prog) = argv.first() else {
+        return Ok(());
+    };
+    let base = prog
+        .rsplit('/')
+        .next()
+        .unwrap_or(prog)
+        .trim_end_matches(".exe");
+    if base == "tole" || base == "tole-cli" {
+        return Err(format!(
+            "child agents may not spawn the tole binary ({prog:?}) — the agent tree is capped \
+             at one level by design (issue #171)"
+        ));
+    }
+    Ok(())
+}
+
+/// `a-<hex ms>-<hex pid>-<hex n>` — path-safe, collision-free (same
+/// shape as job ids).
+fn new_agent_id() -> String {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("a-{ms:x}-{:x}-{n:x}", std::process::id())
+}
+
+fn valid_agent_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+fn agents_root(root: &std::path::Path) -> PathBuf {
+    root.join(AGENTS_DIR)
+}
+
+fn pid_alive(pid: u32) -> bool {
+    let out = crate::subprocess::run_with_timeout(
+        Command::new("ps")
+            .arg("-p")
+            .arg(pid.to_string())
+            .arg("-o")
+            .arg("stat="),
+        crate::subprocess::SUBPROCESS_TIMEOUT,
+    );
+    match out {
+        Ok(o) if o.status.success() => {
+            let s = String::from_utf8_lossy(&o.stdout);
+            let state = s.trim();
+            !state.is_empty() && !state.starts_with('Z')
+        }
+        _ => false,
+    }
+}
+
+/// One agent's durable state (meta.json in its dir).
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub struct AgentMeta {
+    pub prompt: String,
+    pub mailbox_ns: String,
+    pub keep_mailbox: bool,
+    pub spawned_at_ms: u128,
+    #[serde(default)]
+    pub worktree: Option<String>,
+    #[serde(default)]
+    pub branch: Option<String>,
+}
+
+fn read_meta(dir: &std::path::Path) -> Result<AgentMeta, String> {
+    let raw =
+        std::fs::read_to_string(dir.join("meta.json")).map_err(|e| format!("agent meta: {e}"))?;
+    serde_json::from_str(&raw).map_err(|e| format!("agent meta parse: {e}"))
+}
+
+fn write_meta(dir: &std::path::Path, meta: &AgentMeta) -> Result<(), String> {
+    let raw = serde_json::to_string(meta).map_err(|e| format!("agent meta serialize: {e}"))?;
+    std::fs::write(dir.join("meta.json"), raw).map_err(|e| format!("agent meta write: {e}"))
+}
+
+/// Count LIVE agents (used to enforce MAX concurrent). Dead-but-
+/// unconsumed agents do not block new slots.
+fn live_agents(root: &std::path::Path) -> usize {
+    let Some(entries) = std::fs::read_dir(agents_root(root)).ok() else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|e| {
+            let dir = e.path();
+            let Ok(pid) = std::fs::read_to_string(dir.join("pid")) else {
+                return false;
+            };
+            pid.trim().parse::<u32>().map(pid_alive).unwrap_or(false)
+        })
+        .count()
+}
+
+/// Best-effort mailbox cleanup (ephemeral default): `uteke forget`
+/// each memory in the child's namespace. Soft failure — cleanup is an
+/// optimization; the durable child JSONL is the real archive.
+fn clean_mailbox(ns: &str) {
+    let mut list = Command::new("uteke");
+    list.args(["list", "--namespace", ns, "--json"])
+        .stdin(Stdio::null());
+    let Ok(out) =
+        crate::subprocess::run_with_timeout(&mut list, crate::subprocess::SUBPROCESS_TIMEOUT)
+    else {
+        return;
+    };
+    if !out.status.success() {
+        return;
+    }
+    let Ok(Value::Array(items)) =
+        serde_json::from_str::<Value>(&String::from_utf8_lossy(&out.stdout))
+    else {
+        return;
+    };
+    for id in items
+        .iter()
+        .filter_map(|m| m.get("id").and_then(Value::as_str))
+    {
+        let mut cmd = Command::new("uteke");
+        cmd.args(["forget", id, "--namespace", ns]);
+        // forget asks for confirmation — answer it.
+        let _ = crate::subprocess::run_with_timeout_stdin(
+            &mut cmd,
+            crate::subprocess::SUBPROCESS_TIMEOUT,
+            b"y\n",
+        );
+    }
+}
+
+/// Spawn a durable child agent session (Risk::Write: it runs a full
+/// agent turn with tools — the approver sees the prompt and the
+/// child's allowlist before anything runs).
+pub struct AgentStartTool {
+    /// The tole binary to spawn (defaults to the running executable;
+    /// injectable for tests).
+    pub bin: PathBuf,
+    /// File-tools root: agent dirs live under `<root>/tole-agents/`,
+    /// and worktrees under `<root>/.tole-worktrees/`.
+    pub root: PathBuf,
+    /// This session's depth (0 = parent). The tool refuses at >= 1;
+    /// registration also skips it (structural belt and braces).
+    pub depth: u32,
+    /// Parent-only operator mode (default false): each child gets a
+    /// git worktree + branch. The MODEL cannot flip this per call.
+    pub worktree_mode: bool,
+    pub max_concurrent: usize,
+    pub timeout_secs: u64,
+    pub default_allows: Vec<String>,
+}
+
+impl AgentStartTool {
+    pub fn new(bin: impl Into<PathBuf>, root: impl Into<PathBuf>) -> Self {
+        Self {
+            bin: bin.into(),
+            root: root.into(),
+            depth: 0,
+            worktree_mode: false,
+            max_concurrent: DEFAULT_MAX_CONCURRENT,
+            timeout_secs: DEFAULT_TIMEOUT_SECS,
+            default_allows: Vec::new(),
+        }
+    }
+
+    pub fn at_depth(mut self, depth: u32) -> Self {
+        self.depth = depth;
+        self
+    }
+
+    pub fn with_worktrees(mut self, on: bool) -> Self {
+        self.worktree_mode = on;
+        self
+    }
+}
+
+impl Tool for AgentStartTool {
+    fn name(&self) -> &str {
+        "agent_start"
+    }
+
+    fn risk(&self) -> Risk {
+        Risk::Write
+    }
+
+    fn describe(&self, input: &Value) -> String {
+        let prompt = input
+            .get("prompt")
+            .and_then(Value::as_str)
+            .unwrap_or("<missing prompt>");
+        let preview: String = prompt.chars().take(160).collect();
+        let allows: Vec<String> = input
+            .get("allow")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        format!(
+            "start child agent: {:?} (child allowlist: {:?}, worktree: {})",
+            preview,
+            if allows.is_empty() {
+                self.default_allows.clone()
+            } else {
+                allows
+            },
+            self.worktree_mode
+        )
+    }
+
+    fn spec(&self) -> Option<Value> {
+        Some(json!({
+            "type": "object",
+            "description": "Spawn a durable child tole session running one mission. The child cannot spawn children (depth cap 1). Its settle summary lands in a per-child uteke mailbox; read it with agent_poll (which also cleans the mailbox once consumed, unless keep_mailbox).",
+            "properties": {
+                "prompt": { "type": "string", "description": "The child's mission (its one user prompt)" },
+                "allow": {
+                    "type": "array", "items": { "type": "string" },
+                    "description": "The child's Write-tool allow patterns (glob). Keep minimal — the human approves this policy here."
+                },
+                "keep_mailbox": { "type": "boolean", "description": "Keep the uteke mailbox after the result is consumed (default false — ephemeral). The child's session JSONL is always kept." }
+            },
+            "required": ["prompt"]
+        }))
+    }
+
+    fn execute(&self, input: Value) -> Result<Value, String> {
+        if self.depth >= 1 {
+            return Err(
+                "agent_start: child agents cannot spawn children — the agent tree is capped at \
+                 one level (issue #171)"
+                    .into(),
+            );
+        }
+        let prompt = input
+            .get("prompt")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .filter(|p| !p.trim().is_empty())
+            .ok_or("agent_start: missing or empty 'prompt'")?;
+        let keep_mailbox = input
+            .get("keep_mailbox")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let allows: Vec<String> = input
+            .get("allow")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(|s| s.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for pat in &allows {
+            if pat.starts_with('-') || pat.is_empty() {
+                return Err(format!("agent_start: bad allow pattern {pat:?}"));
+            }
+        }
+        let live = live_agents(&self.root);
+        if live >= self.max_concurrent {
+            return Err(format!(
+                "agent_start: {live} child agent(s) already running (cap {}) — poll and \
+                 consume their results first",
+                self.max_concurrent
+            ));
+        }
+
+        let id = new_agent_id();
+        let dir = agents_root(&self.root).join(&id);
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("agent_start: creating {}: {e}", dir.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        }
+
+        // Worktree mode (parent-only flag): isolate the child's file
+        // mutations in its own worktree + branch; merge stays human.
+        let mut child_cwd = self.root.clone();
+        let (worktree, branch) = if self.worktree_mode {
+            let wt = self.root.join(".tole-worktrees").join(&id);
+            let branch = format!("agent/{id}");
+            let out = crate::subprocess::run_with_timeout(
+                Command::new("git")
+                    .args(["worktree", "add"])
+                    .arg(&wt)
+                    .arg("-b")
+                    .arg(&branch)
+                    .current_dir(&self.root),
+                crate::subprocess::SUBPROCESS_TIMEOUT,
+            );
+            match out {
+                Ok(o) if o.status.success() => {
+                    child_cwd = wt.clone();
+                    (Some(wt.display().to_string()), Some(branch))
+                }
+                Ok(o) => {
+                    return Err(format!(
+                        "agent_start: git worktree add failed: {}",
+                        String::from_utf8_lossy(&o.stderr)
+                    ));
+                }
+                Err(e) => return Err(format!("agent_start: git worktree add: {e}")),
+            }
+        } else {
+            (None, None)
+        };
+
+        let mailbox_ns = format!("agent-{id}");
+        let meta = AgentMeta {
+            prompt: prompt.clone(),
+            mailbox_ns: mailbox_ns.clone(),
+            keep_mailbox,
+            spawned_at_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0),
+            worktree: worktree.clone(),
+            branch: branch.clone(),
+        };
+        write_meta(&dir, &meta)?;
+
+        // The child's sessions live INSIDE its agent dir: the whole dir
+        // is the unit of durability + cleanup.
+        let sessions_dir = dir.join("sessions");
+        let log_path = dir.join("log");
+        let log_out = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .map_err(|e| format!("agent_start: log: {e}"))?;
+        let log_err = log_out
+            .try_clone()
+            .map_err(|e| format!("agent_start: log: {e}"))?;
+
+        let mut cmd = Command::new(&self.bin);
+        // Deliberately NO env scrub: the child IS a tole session and
+        // needs the provider key. Isolation = depth cap + jail + the
+        // approved child allowlist (see the module doc).
+        cmd.env("TOLE_AGENT_DEPTH", "1")
+            .env("TOLE_MEMORY_NAMESPACE", &mailbox_ns)
+            .env("TOLE_MEMORY", "uteke")
+            .arg("run")
+            .arg("--sessions-dir")
+            .arg(&sessions_dir)
+            .arg("--workspace")
+            .arg(&child_cwd);
+        for pat in allows.iter().chain(self.default_allows.iter()) {
+            cmd.arg("--allow").arg(pat);
+        }
+        cmd.arg(&prompt)
+            .current_dir(&child_cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log_out))
+            .stderr(Stdio::from(log_err));
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+        let child = cmd
+            .spawn()
+            .map_err(|e| format!("agent_start: spawning {}: {e}", self.bin.display()))?;
+        let pid = child.id();
+        // Detach: the child survives the parent CLI exiting; we never
+        // wait on it (poll checks liveness via ps, like jobs).
+        drop(child);
+        std::fs::write(dir.join("pid"), pid.to_string())
+            .map_err(|e| format!("agent_start: pid file: {e}"))?;
+
+        Ok(json!({
+            "agent": id,
+            "pid": pid,
+            "mailbox": mailbox_ns,
+            "worktree": worktree,
+            "branch": branch,
+            "note": "running detached; poll with agent_poll (the result summary arrives via the mailbox)",
+        }))
+    }
+}
+
+/// Poll a child agent: liveness, log tail, and once settled the
+/// mailbox summary (consuming it cleans the mailbox by default).
+pub struct AgentPollTool {
+    pub root: PathBuf,
+    pub timeout_secs: u64,
+    /// Serialize consume-once: a settled agent's mailbox cleanup must
+    /// not race a second poll.
+    pub consumed: Mutex<Vec<String>>,
+}
+
+impl AgentPollTool {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self {
+            root: root.into(),
+            timeout_secs: DEFAULT_TIMEOUT_SECS,
+            consumed: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl Tool for AgentPollTool {
+    fn name(&self) -> &str {
+        "agent_poll"
+    }
+
+    fn risk(&self) -> Risk {
+        Risk::ReadOnly
+    }
+
+    fn describe(&self, input: &Value) -> String {
+        let id = input
+            .get("agent")
+            .and_then(Value::as_str)
+            .unwrap_or("<missing>");
+        format!("poll child agent {id}")
+    }
+
+    fn spec(&self) -> Option<Value> {
+        Some(json!({
+            "type": "object",
+            "properties": {
+                "agent": { "type": "string", "description": "Agent id returned by agent_start" }
+            },
+            "required": ["agent"]
+        }))
+    }
+
+    fn execute(&self, input: Value) -> Result<Value, String> {
+        let id = input
+            .get("agent")
+            .and_then(Value::as_str)
+            .ok_or("agent_poll: input must be {\"agent\": \"<id>\"}")?;
+        if !valid_agent_id(id) {
+            return Err(format!("agent_poll: invalid agent id {id:?}"));
+        }
+        let dir = agents_root(&self.root).join(id);
+        let pid: u32 = std::fs::read_to_string(dir.join("pid"))
+            .map_err(|_| format!("agent_poll: unknown agent {id}"))?
+            .trim()
+            .parse()
+            .map_err(|_| format!("agent_poll: corrupt pid file for {id}"))?;
+        let meta = read_meta(&dir)?;
+        let running = pid_alive(pid);
+        let elapsed_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+            .saturating_sub(meta.spawned_at_ms);
+        let timed_out = running && elapsed_ms > self.timeout_secs as u128 * 1000;
+
+        // Bounded log tail (same read-window discipline as job_poll).
+        let mut tail = String::new();
+        if let Ok(mut f) = std::fs::File::open(dir.join("log")) {
+            use std::io::{Read, Seek, SeekFrom};
+            let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+            let start = len.saturating_sub(READ_WINDOW);
+            let _ = f.seek(SeekFrom::Start(start));
+            let mut bytes = Vec::new();
+            let _ = f.take(READ_WINDOW).read_to_end(&mut bytes);
+            let buf = String::from_utf8_lossy(&bytes).into_owned();
+            tail = if buf.chars().count() > LOG_TAIL_CHARS {
+                buf.chars()
+                    .skip(buf.chars().count() - LOG_TAIL_CHARS)
+                    .collect()
+            } else {
+                buf
+            };
+        }
+
+        let mut out = json!({
+            "agent": id,
+            "running": running,
+            "timed_out": timed_out,
+            "elapsed_secs": elapsed_ms / 1000,
+            "log_tail": tail,
+            "branch": meta.branch,
+        });
+
+        if running {
+            return Ok(out);
+        }
+        // Settled: pull the summary from the mailbox, then clean it
+        // (consume-once, unless keep_mailbox).
+        let already = self
+            .consumed
+            .lock()
+            .map(|c| c.iter().any(|x| x == id))
+            .unwrap_or(false);
+        let cfg = crate::memory::MemoryConfig {
+            bin: "uteke".into(),
+            namespace: meta.mailbox_ns.clone(),
+            limit: 3,
+        };
+        if !already {
+            if let Some(summary) = crate::memory::recall(&cfg, &meta.prompt)
+                .ok()
+                .map(|hits| {
+                    hits.iter()
+                        .map(|h| h.content.clone())
+                        .collect::<Vec<_>>()
+                        .join("\n---\n")
+                })
+                .filter(|s| !s.is_empty())
+            {
+                out["summary"] = json!(summary);
+            }
+            if !meta.keep_mailbox {
+                clean_mailbox(&meta.mailbox_ns);
+            }
+            if let Ok(mut c) = self.consumed.lock() {
+                c.push(id.to_string());
+            }
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn fake_child(dir: &std::path::Path) -> PathBuf {
+        // A stand-in "tole binary": prints a line, exits 0. Tests drive
+        // spawn/poll mechanics without a real agent turn.
+        #[cfg(unix)]
+        {
+            let p = dir.join("fake-tole");
+            std::fs::write(&p, "#!/bin/sh\necho FAKE_AGENT_DONE\nexit 0\n").unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755));
+            p
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = dir;
+            PathBuf::from("true")
+        }
+    }
+
+    fn sleeper_child(dir: &std::path::Path, secs: u64) -> PathBuf {
+        #[cfg(unix)]
+        {
+            let p = dir.join("sleep-tole");
+            std::fs::write(&p, format!("#!/bin/sh\nsleep {secs}\n")).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755));
+            p
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (dir, secs);
+            PathBuf::from("true")
+        }
+    }
+
+    fn tmp(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("tole-agents-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn child_argv_refuses_tole_binary() {
+        assert!(check_child_agent_argv(&["tole".into(), "run".into(), "x".into()]).is_err());
+        assert!(check_child_agent_argv(&["/usr/local/bin/tole".into(), "chat".into()]).is_err());
+        assert!(check_child_agent_argv(&["tole-cli".into()]).is_err());
+        assert!(check_child_agent_argv(&["tole.exe".into()]).is_err());
+        assert!(check_child_agent_argv(&["git".into(), "status".into()]).is_ok());
+        assert!(check_child_agent_argv(&[]).is_ok());
+    }
+
+    #[test]
+    fn depth_one_refuses_to_spawn() {
+        let d = tmp("depth");
+        let t = AgentStartTool::new(fake_child(&d), d.clone()).at_depth(1);
+        let err = t
+            .execute(json!({"prompt": "grandchild attempt"}))
+            .unwrap_err();
+        assert!(err.contains("capped at one level"), "{err}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn spawn_poll_settle_roundtrip() {
+        let d = tmp("roundtrip");
+        let start = AgentStartTool::new(fake_child(&d), d.clone());
+        let poll = AgentPollTool::new(d.clone());
+        let out = start.execute(json!({"prompt": "do the thing"})).unwrap();
+        let id = out["agent"].as_str().unwrap().to_string();
+        assert!(valid_agent_id(&id));
+        assert!(out["mailbox"].as_str().unwrap().starts_with("agent-"));
+        // Wait for the fake child to exit, then poll: settled + tail.
+        std::thread::sleep(std::time::Duration::from_millis(700));
+        let st = poll.execute(json!({"agent": id})).unwrap();
+        assert_eq!(st["running"], json!(false), "{st}");
+        assert!(
+            st["log_tail"].as_str().unwrap().contains("FAKE_AGENT_DONE"),
+            "{st}"
+        );
+        // The agent dir (session home + log) stays for audit.
+        assert!(agents_root(&d).join(&id).join("log").is_file());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn concurrency_cap_enforced() {
+        let d = tmp("cap");
+        // Cap 1 + a child that sleeps: the second spawn must refuse.
+        let start = AgentStartTool::new(sleeper_child(&d, 3), d.clone());
+        let start = AgentStartTool {
+            max_concurrent: 1,
+            ..start
+        };
+        let _first = start.execute(json!({"prompt": "slow"})).unwrap();
+        let err = start.execute(json!({"prompt": "second"})).unwrap_err();
+        assert!(err.contains("cap 1"), "{err}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn worktree_mode_creates_branch_and_jail() {
+        let d = tmp("worktree");
+        // a real (tiny) git repo — worktree add needs it
+        let _ = crate::subprocess::run_with_timeout(
+            Command::new("git").arg("init").arg("-q").current_dir(&d),
+            crate::subprocess::SUBPROCESS_TIMEOUT,
+        );
+        let start = AgentStartTool::new(fake_child(&d), d.clone()).with_worktrees(true);
+        let out = start
+            .execute(json!({"prompt": "isolated mission"}))
+            .unwrap();
+        let branch = out["branch"].as_str().unwrap().to_string();
+        assert!(branch.starts_with("agent/"), "{out}");
+        let wt = PathBuf::from(out["worktree"].as_str().unwrap());
+        assert!(wt.is_dir(), "worktree dir must exist");
+        // the child's jail + cwd WAS the worktree: verify via git itself
+        let listed = crate::subprocess::run_with_timeout(
+            Command::new("git")
+                .args(["worktree", "list"])
+                .current_dir(&d),
+            crate::subprocess::SUBPROCESS_TIMEOUT,
+        )
+        .unwrap();
+        assert!(String::from_utf8_lossy(&listed.stdout).contains(&branch));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn bad_inputs_refused() {
+        let d = tmp("inputs");
+        let t = AgentStartTool::new(fake_child(&d), d.clone());
+        assert!(t.execute(json!({})).is_err());
+        assert!(t.execute(json!({"prompt": "  "})).is_err());
+        assert!(
+            t.execute(json!({"prompt": "x", "allow": ["-bad"]}))
+                .is_err(),
+            "leading-dash allow pattern must be refused"
+        );
+        let poll = AgentPollTool::new(d.clone());
+        assert!(poll.execute(json!({"agent": "nope"})).is_err());
+        assert!(poll.execute(json!({"agent": "../escape"})).is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
