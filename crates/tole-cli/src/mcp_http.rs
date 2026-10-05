@@ -189,20 +189,18 @@ pub async fn run_mcp_http(
                         Ok(hyper::Response::from_parts(rp, body))
                     }
                 });
-            // hyper_util's auto builder (http1) instead of hyper's raw
-            // http1::Builder: header_read_timeout REQUIRES a Timer, and
-            // the auto builder owns the timer wiring — hyper's raw
-            // builder panics per connection when the timeout is set
-            // without one (caught by the live smoke test, invisible to
-            // CI). SSE responses still stream (SSE is plain HTTP/1).
-            let _ = hyper_util::server::conn::auto::Builder::new(
-                hyper_util::rt::TokioExecutor::new(),
-            )
-            .http1()
-            .header_read_timeout(SERVE_IO_TIMEOUT)
-            .timer(hyper_util::rt::TokioTimer::new())
-            .serve_connection_with_upgrades(io, hyper_service)
-            .await;
+            // hyper's raw http1 builder stays (H1-only: no h2c
+            // sniffing on this authenticated transport). The
+            // header_read_timeout REQUIRES a wired timer — without one
+            // hyper panics per connection ("no timer set"; caught by
+            // the pre-tag live smoke test, invisible to CI). Wire
+            // hyper_util's TokioTimer (its `tokio` feature, already
+            // enabled) BEFORE serve_connection.
+            let _ = hyper::server::conn::http1::Builder::new()
+                .header_read_timeout(SERVE_IO_TIMEOUT)
+                .timer(hyper_util::rt::TokioTimer::new())
+                .serve_connection(io, hyper_service)
+                .await;
         });
     }
 }
