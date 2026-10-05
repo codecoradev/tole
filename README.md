@@ -39,10 +39,12 @@ tole is the agent harness of the CodeCora ecosystem — the hands:
   are structurally absent.
 - **tole as an ACP agent**: `tole acp` speaks the Agent Client Protocol —
   editors (Zed et al.) drive durable tole sessions, and tool approvals
-  surface as permission requests in the editor. `TOLE_MODELS` (comma-
-  separated ids) advertises a native model picker: the client switches
-  the model per session and the choice persists durably across resumes
-  (#176).
+  surface as permission requests in the editor. Native pickers via ACP
+  config options (#176): `TOLE_MODELS` (comma-separated ids) advertises a
+  model switch that persists durably per session across resumes, and an
+  approval selector (`ask` / `auto`, session-scoped) plus an
+  `allow_always` option on Write permission requests let the human relax
+  the gate from the editor without weakening the Destructive tier.
 - **tole as an HTTP daemon**: `tole serve` (issue #96) exposes the session
   host over token-authenticated REST — remote clients create sessions, run
   turns, and poll status without SSH-ing into the box. Binds 127.0.0.1 by

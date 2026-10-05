@@ -199,18 +199,22 @@ fn session_new_advertises_model_picker() {
     let opts = created["result"]["configOptions"]
         .as_array()
         .expect("configOptions advertised");
-    assert_eq!(opts.len(), 1);
-    assert_eq!(opts[0]["id"], "model");
-    assert_eq!(opts[0]["category"], "model");
-    assert_eq!(opts[0]["type"], "select");
-    assert_eq!(opts[0]["currentValue"], "model-a");
-    assert_eq!(opts[0]["options"].as_array().expect("options").len(), 2);
+    // Approval first (priority order), model picker second (issue #176).
+    assert_eq!(opts.len(), 2);
+    assert_eq!(opts[0]["id"], "approval");
+    let model = &opts[1];
+    assert_eq!(model["id"], "model");
+    assert_eq!(model["category"], "model");
+    assert_eq!(model["type"], "select");
+    assert_eq!(model["currentValue"], "model-a");
+    assert_eq!(model["options"].as_array().expect("options").len(), 2);
 }
 
-/// Back-compat: without TOLE_MODELS nothing is advertised (the host's
-/// picker stays hidden — exactly pre-#176 behavior).
+/// Without TOLE_MODELS only the approval selector is advertised — the
+/// model picker stays hidden (the host renders no model dropdown,
+/// exactly pre-#176 picker behavior).
 #[test]
-fn no_tole_models_advertises_nothing() {
+fn no_tole_models_advertises_no_model_picker() {
     let mut acp = AcpProcess::spawn_with(&[("TOLE_MODEL", "model-a")]);
     acp.initialize(1);
     let cwd = temp_cwd("noplcker");
@@ -219,11 +223,11 @@ fn no_tole_models_advertises_nothing() {
         "params": {"cwd": cwd.to_string_lossy()}
     }));
     let created = acp.wait_response(2, Duration::from_secs(20));
-    assert!(
-        created["result"].get("configOptions").is_none(),
-        "no configOptions without TOLE_MODELS: {}",
-        created["result"]
-    );
+    let opts = created["result"]["configOptions"]
+        .as_array()
+        .expect("approval entry always advertised");
+    assert_eq!(opts.len(), 1, "no model picker without TOLE_MODELS");
+    assert_eq!(opts[0]["id"], "approval");
 }
 
 /// set_config_option switches the picker, validates values, and the
@@ -253,7 +257,7 @@ fn set_config_option_switches_validates_and_persists() {
     }));
     let switched = acp.wait_response(3, Duration::from_secs(20));
     assert_eq!(
-        switched["result"]["configOptions"][0]["currentValue"], "model-b",
+        switched["result"]["configOptions"][1]["currentValue"], "model-b",
         "response must carry the complete config state: {switched}"
     );
 
@@ -296,7 +300,7 @@ fn set_config_option_switches_validates_and_persists() {
     let loaded = acp2.wait_response(2, Duration::from_secs(20));
     assert_eq!(loaded["result"]["sessionId"], session_id);
     assert_eq!(
-        loaded["result"]["configOptions"][0]["currentValue"], "model-b",
+        loaded["result"]["configOptions"][1]["currentValue"], "model-b",
         "durable override must survive a fresh process: {loaded}"
     );
 }
@@ -329,7 +333,7 @@ fn prompt_uses_switched_model_per_session() {
     }));
     let switched = acp.wait_response(3, Duration::from_secs(20));
     assert_eq!(
-        switched["result"]["configOptions"][0]["currentValue"],
+        switched["result"]["configOptions"][1]["currentValue"],
         "model-b"
     );
 
@@ -367,4 +371,48 @@ fn prompt_uses_switched_model_per_session() {
         let seen = seen.lock().unwrap();
         assert_eq!(seen.last().expect("second prompt"), "model-a");
     }
+}
+
+/// Regression (cora MAJOR, PR 2): flipping the approval selector must
+/// reply with the session's CURRENT model — the durable override, not
+/// the first advertised entry.
+#[test]
+fn approval_flip_reply_keeps_current_model() {
+    let mut acp = AcpProcess::spawn_with(&[
+        ("TOLE_MODEL", "model-a"),
+        ("TOLE_MODELS", "model-a,model-b"),
+    ]);
+    acp.initialize(1);
+    let cwd = temp_cwd("flipreply");
+    acp.send(&json!({
+        "jsonrpc": "2.0", "id": 2, "method": "session/new",
+        "params": {"cwd": cwd.to_string_lossy()}
+    }));
+    let session_id = acp.wait_response(2, Duration::from_secs(20))["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    acp.send(&json!({
+        "jsonrpc": "2.0", "id": 3, "method": "session/set_config_option",
+        "params": {"sessionId": session_id, "configId": "model", "value": "model-b"}
+    }));
+    let _ = acp.wait_response(3, Duration::from_secs(20));
+
+    acp.send(&json!({
+        "jsonrpc": "2.0", "id": 4, "method": "session/set_config_option",
+        "params": {"sessionId": session_id, "configId": "approval", "value": "auto"}
+    }));
+    let reply = acp.wait_response(4, Duration::from_secs(20));
+    let opts = reply["result"]["configOptions"].as_array().unwrap();
+    let model = opts
+        .iter()
+        .find(|o| o["id"] == "model")
+        .expect("model entry");
+    assert_eq!(
+        model["currentValue"], "model-b",
+        "approval flip must not render a stale model: {reply}"
+    );
+    let approval = opts.iter().find(|o| o["id"] == "approval").unwrap();
+    assert_eq!(approval["currentValue"], "auto");
 }

@@ -109,16 +109,48 @@ pub(crate) fn model_config_option(current: &str, models: &[String]) -> Option<Va
     }))
 }
 
-/// The full `configOptions` response array for a session: the model
-/// picker when configured. `current` is the effective model — the
-/// durable register override when set, else the env default, else the
-/// first advertised entry.
-fn config_options_for(current: &str, models: &[String]) -> Option<Vec<Value>> {
-    let mut current = current.to_string();
-    if current.is_empty() {
-        current = models.first()?.clone();
+/// Build the `configOptions` entry for the approval selector: the
+/// per-session `--yes` equivalent, category `mode` so hosts render it
+/// next to the model picker. Session-scoped by design — approval
+/// consent resets with the process, so it is NOT persisted like the
+/// model override.
+fn approval_config_option(auto_write: bool) -> Value {
+    json!({
+        "id": "approval",
+        "name": "Approval",
+        "category": "mode",
+        "type": "select",
+        "currentValue": if auto_write { "auto" } else { "ask" },
+        "options": [
+            {"value": "ask", "name": "Ask",
+             "description": "Request permission before Write tools"},
+            {"value": "auto", "name": "Auto",
+             "description": "Auto-allow Write tools (Destructive still prompts)"},
+        ],
+    })
+}
+
+/// The full `configOptions` response array for a session: the approval
+/// selector always, the model picker when configured.
+fn config_options_for(
+    current_model: &str,
+    models: &[String],
+    auto_write: bool,
+) -> Option<Vec<Value>> {
+    // The approval selector is unconditional; an early `?` on the model
+    // fallback must not swallow it (found by the no-env E2E).
+    let mut opts = vec![approval_config_option(auto_write)];
+    if !models.is_empty() {
+        let current = if current_model.is_empty() {
+            models.first().expect("non-empty").clone()
+        } else {
+            current_model.to_string()
+        };
+        if let Some(model) = model_config_option(&current, models) {
+            opts.push(model);
+        }
     }
-    model_config_option(&current, models).map(|o| vec![o])
+    Some(opts)
 }
 
 /// Read the durable model override from a session's storage.
@@ -131,6 +163,22 @@ fn session_model_override(
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
+}
+
+/// Per-session approval state, addressable by session id so
+/// `session/set_config_option` can act without touching the storage
+/// mutex (the reader thread must never block on a running turn). The
+/// auto-write handle is the same `Arc` the session's
+/// `InteractiveApprover` owns; the effective model mirrors what
+/// `session/new` computed (durable override or env default) and is
+/// updated by `set_model_option`, so every config-state reply renders
+/// the CURRENT selection (cora MAJOR, PR 2: an approval flip must not
+/// show a stale model). The pattern store stays bridge-owned
+/// (`AcpPrompt`) — grants land there.
+#[derive(Clone)]
+struct SessionApprovalState {
+    auto_write: Arc<Mutex<bool>>,
+    current_model: Arc<Mutex<String>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -230,15 +278,36 @@ impl Conn {
 
 /// PromptFn bridge: renders a `session/request_permission` request to the
 /// ACP client and maps the chosen option back to a tole verdict.
+///
+/// The shared approval-state handles (issue #176 PR 2) let the human's
+/// `allow_always` choice grant the exact tool name for the rest of the
+/// session, and the `approval` config option flip auto-write — the same
+/// `--allow` / `--yes` mechanisms, granted interactively instead of at
+/// startup. Destructive calls never get an `allow_always` option and an
+/// echoed one is honored ONE-TIME only (never remembered): Destructive
+/// is never allowlistable.
 struct AcpPrompt {
     conn: Conn,
     session_id: String,
     counter: Arc<Mutex<u64>>,
+    patterns: Arc<Mutex<Vec<String>>>,
+}
+
+/// The `allow_always` PermissionOption kind — a standard kind
+/// (allow_once | allow_always | reject_once | reject_always) that hosts
+/// render with "remember this choice" semantics.
+const OPTION_ALLOW_ALWAYS: &str = "allow-always";
+
+impl AcpPrompt {
+    fn lock_patterns(&self) -> std::sync::MutexGuard<'_, Vec<String>> {
+        self.patterns.lock().unwrap_or_else(|p| p.into_inner())
+    }
 }
 
 impl PromptFn for AcpPrompt {
     fn prompt(&self, req: &tole_core::approval::ToolRequest<'_>) -> tole_core::approval::Verdict {
         use tole_core::approval::Verdict;
+        use tole_core::tool::Risk;
         let option_allow = "allow-once";
         let option_reject = "reject-once";
         let call_id = {
@@ -260,6 +329,17 @@ impl PromptFn for AcpPrompt {
                 }
             }),
         );
+        // allow_always only for Write-tier calls: Destructive is never
+        // allowlistable, and ReadOnly never reaches the approver.
+        let mut options =
+            vec![json!({"kind": "allow_once", "name": "Allow", "optionId": option_allow})];
+        if req.risk == Risk::Write {
+            options.push(json!({
+                "kind": "allow_always", "name": "Always allow",
+                "optionId": OPTION_ALLOW_ALWAYS,
+            }));
+        }
+        options.push(json!({"kind": "reject_once", "name": "Reject", "optionId": option_reject}));
         let params = json!({
             "sessionId": self.session_id,
             "toolCall": {
@@ -268,10 +348,7 @@ impl PromptFn for AcpPrompt {
                 "kind": "other",
                 "rawInput": req.input,
             },
-            "options": [
-                {"kind": "allow_once", "name": "Allow", "optionId": option_allow},
-                {"kind": "reject_once", "name": "Reject", "optionId": option_reject},
-            ],
+            "options": options,
         });
         let verdict =
             match self
@@ -282,7 +359,23 @@ impl PromptFn for AcpPrompt {
                     let chosen = result["outcome"]["optionId"]
                         .as_str()
                         .unwrap_or(option_reject);
+                    // Comparison chain, NOT a match: a lowercase match
+                    // arm would be a fresh binding matching EVERYTHING
+                    // (a reject would have read as Allow).
                     if chosen == option_allow {
+                        Verdict::Allow
+                    } else if chosen == OPTION_ALLOW_ALWAYS {
+                        if req.risk == Risk::Write {
+                            // Remember for the session: the exact tool
+                            // name joins the approver's pattern store
+                            // (glob-matched; exact names match
+                            // trivially). Not persisted — consent
+                            // resets with the process.
+                            self.lock_patterns().push(req.tool.to_string());
+                        }
+                        // A Destructive call must never be remembered,
+                        // even when a hostile client echoes the option:
+                        // honored one-time only.
                         Verdict::Allow
                     } else {
                         Verdict::Deny
@@ -345,6 +438,11 @@ pub fn run_acp(
     // permission routing while prompts run.
     let sessions: tole_cli::session_host::SharedSessions =
         Arc::new(Mutex::new(Sessions::default()));
+    // Per-session shared approval state (issue #176 PR 2): addressable
+    // by session id so set_config_option can flip the session's
+    // auto-write while the approver owns the same handles.
+    let approval_states: Arc<Mutex<HashMap<String, SessionApprovalState>>> =
+        Arc::new(Mutex::new(HashMap::new()));
     // Advertised model list (issue #176): static for the process
     // lifetime — env cannot change under a running agent.
     let models = parse_model_list(std::env::var("TOLE_MODELS").ok().as_deref());
@@ -427,13 +525,22 @@ pub fn run_acp(
                     reply_error(&conn, id, "session is busy running a turn");
                     continue;
                 }
+                // Shared approval handles: created here so the bridge
+                // (allow_always grants), the approver, and the
+                // set_config_option lookup all own the same stores.
+                // Seeded with the startup flag values.
+                let patterns = Arc::new(Mutex::new(allow_patterns.to_vec()));
+                let session_auto_write = Arc::new(Mutex::new(auto_write));
                 let approver = InteractiveApprover::new(AcpPrompt {
                     conn: conn.clone(),
                     session_id: session_id.clone(),
                     counter: Arc::new(Mutex::new(0)),
+                    patterns: Arc::clone(&patterns),
                 })
                 .with_allow_patterns(allow_patterns.to_vec())
-                .with_auto_write(auto_write);
+                .with_auto_write(auto_write)
+                .with_shared_patterns(Arc::clone(&patterns))
+                .with_shared_auto_write(Arc::clone(&session_auto_write));
                 match open_session(
                     &session_id,
                     &cwd,
@@ -472,8 +579,17 @@ pub fn run_acp(
                         let current = model_override
                             .or_else(|| env_model.clone())
                             .unwrap_or_default();
+                        let session_auto =
+                            *session_auto_write.lock().unwrap_or_else(|p| p.into_inner());
+                        approval_states.lock().expect("approval map").insert(
+                            session_id.clone(),
+                            SessionApprovalState {
+                                auto_write: session_auto_write,
+                                current_model: Arc::new(Mutex::new(current.clone())),
+                            },
+                        );
                         let mut result = json!({ "sessionId": session_id });
-                        if let Some(opts) = config_options_for(&current, &models) {
+                        if let Some(opts) = config_options_for(&current, &models, session_auto) {
                             result["configOptions"] = Value::Array(opts);
                         }
                         reply(&conn, id, result);
@@ -538,7 +654,15 @@ pub fn run_acp(
                 });
             }
             "session/set_config_option" => {
-                set_config_option(&conn, id, &sessions, &params, &models, env_model.as_deref());
+                set_config_option(
+                    &conn,
+                    id,
+                    &sessions,
+                    &approval_states,
+                    &params,
+                    &models,
+                    env_model.as_deref(),
+                );
             }
             other => {
                 if id.is_some() {
@@ -551,18 +675,23 @@ pub fn run_acp(
 }
 
 /// `session/set_config_option` (issue #176): the client picked a new
-/// value for a config option. Only the `model` select exists today.
+/// value for a config option. Two selects exist: `model` and
+/// `approval`.
 ///
-/// The spec allows setting while a turn is generating; tole refuses it
-/// instead. The reader loop would otherwise block on the storage mutex
-/// the running turn holds — exactly the permission-routing deadlock
-/// class the CodeCora scan removed — for a change that could only apply
-/// to the NEXT turn anyway (the provider is built once per turn).
-/// Clients retry after the turn settles.
+/// Asymmetry is deliberate. `model` needs the session's storage mutex
+/// (register write), so a running turn must refuse it — the reader loop
+/// would otherwise block on the lock the turn holds, the exact
+/// permission-routing deadlock class the CodeCora scan removed, for a
+/// change that only applies to the NEXT turn anyway (the provider is
+/// built once per turn). `approval` is an atomic flag flip on shared
+/// handles — no storage lock — so the spec's "at any point, even while
+/// generating" is honored: the very next approval check in the same
+/// turn sees it. Destructive tools are unaffected by either setting.
 fn set_config_option(
     conn: &Conn,
     id: Option<Value>,
     sessions: &tole_cli::session_host::SharedSessions,
+    approval_states: &Arc<Mutex<HashMap<String, SessionApprovalState>>>,
     params: &Value,
     models: &[String],
     env_model: Option<&str>,
@@ -575,19 +704,92 @@ fn set_config_option(
         reply_error(conn, id, "session/set_config_option: missing configId");
         return;
     };
-    if config_id != "model" {
-        reply_error(
-            conn,
-            id,
-            &format!("session/set_config_option: unknown configId: {config_id}"),
-        );
-        return;
-    }
     let Some(value) = params.get("value").and_then(Value::as_str) else {
         reply_error(conn, id, "session/set_config_option: missing value");
         return;
     };
 
+    match config_id {
+        "model" => set_model_option(
+            conn,
+            id,
+            sessions,
+            approval_states,
+            session_id,
+            value,
+            models,
+            env_model,
+        ),
+        "approval" => set_approval_option(conn, id, approval_states, session_id, value, models),
+        other => reply_error(
+            conn,
+            id,
+            &format!("session/set_config_option: unknown configId: {other}"),
+        ),
+    }
+}
+
+/// The `approval` config option: `ask` (per-call permission) or `auto`
+/// (the `--yes` semantics — every Write auto-allowed, Destructive still
+/// prompts). An atomic flip on the shared handle, visible to approval
+/// checks immediately, including mid-turn. NOT persisted: consent
+/// resets with the process by design.
+fn set_approval_option(
+    conn: &Conn,
+    id: Option<Value>,
+    approval_states: &Arc<Mutex<HashMap<String, SessionApprovalState>>>,
+    session_id: &str,
+    value: &str,
+    models: &[String],
+) {
+    let auto = match value {
+        "ask" => false,
+        "auto" => true,
+        _ => {
+            reply_error(
+                conn,
+                id,
+                &format!("session/set_config_option: unknown approval value: {value}"),
+            );
+            return;
+        }
+    };
+    let state = {
+        let map = approval_states.lock().expect("approval map");
+        match map.get(session_id) {
+            Some(st) => st.clone(),
+            None => {
+                reply_error(conn, id, &format!("unknown session: {session_id}"));
+                return;
+            }
+        }
+    };
+    *state.auto_write.lock().unwrap_or_else(|p| p.into_inner()) = auto;
+    let current = state
+        .current_model
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    let mut result = json!({});
+    if let Some(opts) = config_options_for(&current, models, auto) {
+        result["configOptions"] = Value::Array(opts);
+    }
+    reply(conn, id, result);
+}
+
+/// The `model` config option: persist the choice as a durable register
+/// write and reply with the complete config state.
+#[allow(clippy::too_many_arguments)]
+fn set_model_option(
+    conn: &Conn,
+    id: Option<Value>,
+    sessions: &tole_cli::session_host::SharedSessions,
+    approval_states: &Arc<Mutex<HashMap<String, SessionApprovalState>>>,
+    session_id: &str,
+    value: &str,
+    models: &[String],
+    env_model: Option<&str>,
+) {
     let env_current = env_model.unwrap_or_default();
     // Validate against exactly what this session advertises (including
     // the prepended env default): a value outside the list would break
@@ -631,9 +833,25 @@ fn set_config_option(
             return;
         }
     }
-    let current = value.to_string();
+    // The spec reply carries the COMPLETE config state — approval entry
+    // included, with its live values from the session cache.
+    let state = {
+        let map = approval_states.lock().expect("approval map");
+        match map.get(session_id) {
+            Some(st) => st.clone(),
+            None => {
+                reply_error(conn, id, &format!("unknown session: {session_id}"));
+                return;
+            }
+        }
+    };
+    *state
+        .current_model
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = value.to_string();
+    let auto = *state.auto_write.lock().unwrap_or_else(|p| p.into_inner());
     let mut result = json!({});
-    if let Some(opts) = config_options_for(&current, models) {
+    if let Some(opts) = config_options_for(value, models, auto) {
         result["configOptions"] = Value::Array(opts);
     }
     reply(conn, id, result);
@@ -674,9 +892,15 @@ mod tests {
     }
 
     #[test]
-    fn config_option_none_without_models() {
+    fn config_options_without_models_still_advertise_approval() {
         assert!(model_config_option("m", &[]).is_none());
-        assert!(config_options_for("m", &[]).is_none());
+        // The approval selector is always advertised; the model picker
+        // is the optional one (issue #176).
+        let opts = config_options_for("m", &[], false).expect("approval entry");
+        assert_eq!(opts.len(), 1);
+        assert_eq!(opts[0]["id"], "approval");
+        assert_eq!(opts[0]["category"], "mode");
+        assert_eq!(opts[0]["currentValue"], "ask");
     }
 
     #[test]
@@ -711,8 +935,15 @@ mod tests {
     }
 
     #[test]
-    fn config_options_empty_current_falls_back_to_first_advertised() {
-        let opts = config_options_for("", &["model-a".into(), "model-b".into()]).expect("opts");
-        assert_eq!(opts[0]["currentValue"], "model-a");
+    fn config_options_order_and_empty_current_fallback() {
+        // Approval first (priority order per the spec), model second;
+        // an empty current model falls back to the first advertised id.
+        let opts =
+            config_options_for("", &["model-a".into(), "model-b".into()], true).expect("opts");
+        assert_eq!(opts.len(), 2);
+        assert_eq!(opts[0]["id"], "approval");
+        assert_eq!(opts[0]["currentValue"], "auto");
+        assert_eq!(opts[1]["id"], "model");
+        assert_eq!(opts[1]["currentValue"], "model-a");
     }
 }
