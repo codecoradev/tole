@@ -22,6 +22,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backfilled here.)
 
 ### Fixed
+- **`TOLE_TRUST` env was documented but never read** (found by
+  activation testing 2026-10-05): `--trust` help says "flag wins over
+  the TOLE_TRUST env", yet no code read the variable — an env-only
+  setup silently kept prompting for fleet tools. The env now applies
+  whenever no `--trust` flag is passed (comma/whitespace separated for
+  multiple presets; an explicit flag still wins wholesale; unknown
+  presets in the env fail loudly, same as the flag).
 - Full-feature sweep findings (2026-10-05):
   - **Silent no-op flags on the server faces** now fail loudly at
     startup (the scan-3 #9 rule, previously enforced only for
