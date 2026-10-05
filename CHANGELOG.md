@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `gitea` tool — the Gitea counterpart of `gh`, over the instance's
+  REST API (`TOLE_GITEA_TOKEN` / `GITEA_TOKEN` + a Gitea `origin`
+  remote; probe-gated: absent token or non-Gitea remote degrades to one
+  warning, no phantom tool). Same six ops as `gh` (issue_view /
+  issue_list / pr_view read-only; issue_comment / issue_create /
+  pr_create writes), Risk::Write through the approval gate, routes
+  whitelisted in one auditable function, per-call `repo` override
+  validated (`owner/name`, traversal/dash refused), token never shown
+  in approval lines. Self-hosted instances with explicit ports are
+  parsed from the remote (`http://host:3000/owner/repo`); GitHub
+  remotes never register it (that's `gh`).
+- `gh` hardening: `number`/`limit` accept JSON integers (models send
+  counts as numbers); optional per-call `repo` override (validated,
+  shown in the approval line) replaces the registration-time lock —
+  closing the README "per-repo wiring is a known gap" note.
 - `mcp-http` is now a **default feature** of `tole-cli`: a plain
   `cargo install tole-cli` / `cargo build -p tole-cli` exposes all four
   documented faces, including `tole serve --transport mcp` (previously

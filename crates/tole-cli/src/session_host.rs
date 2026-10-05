@@ -146,6 +146,7 @@ pub fn open_session(
             let repo =
                 detect_github_repo(&workspace_canon).unwrap_or_else(|| "codecoradev/tole".into());
             reg.register(Box::new(GhTool::new(repo)))?;
+            register_gitea(&mut reg, &workspace_canon);
         }
         reg.register(Box::new(GitTool::new().in_dir(workspace_canon.clone())))?;
         // delete_file (Destructive) registers ONLY behind an interactive
@@ -227,6 +228,51 @@ pub fn detect_github_repo(cwd: &PathBuf) -> Option<String> {
         return None;
     }
     crate::session_host::github_repo_from_remote_url(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Register the `gitea` tool when BOTH probe legs hold: the checkout's
+/// origin remote points at a Gitea instance (not GitHub — that's `gh`)
+/// and a token env exists (`TOLE_GITEA_TOKEN` or `GITEA_TOKEN`).
+/// Absent legs degrade to one warning line, never a phantom tool — the
+/// same probe contract as uteke/cora.
+pub fn register_gitea(reg: &mut tole_core::tool::ToolRegistry, cwd: &std::path::Path) {
+    use tole_core::gitea::{gitea_from_remote, GiteaRemote, GiteaTool};
+    let mut cmd = std::process::Command::new("git");
+    cmd.args(["config", "--get", "remote.origin.url"])
+        .current_dir(cwd);
+    let Ok(out) =
+        tole_core::subprocess::run_with_timeout(&mut cmd, std::time::Duration::from_secs(5))
+    else {
+        return;
+    };
+    if !out.status.success() {
+        return;
+    }
+    let remote = gitea_from_remote(&String::from_utf8_lossy(&out.stdout));
+    let (base, repo) = match remote {
+        GiteaRemote::Ok { base, repo } => (base, repo),
+        GiteaRemote::InsecureHttp { host } => {
+            eprintln!(
+                "tole: origin is a Gitea remote over plain http ({host}) — refusing to send the \
+                 token unencrypted; use an https remote (loopback http is allowed)"
+            );
+            return;
+        }
+        GiteaRemote::NotGitea => return,
+    };
+    let token = std::env::var("TOLE_GITEA_TOKEN")
+        .or_else(|_| std::env::var("GITEA_TOKEN"))
+        .ok()
+        .filter(|t| !t.trim().is_empty());
+    let Some(token) = token else {
+        eprintln!(
+            "tole: origin is a Gitea remote ({repo}) but no TOLE_GITEA_TOKEN/GITEA_TOKEN is set — gitea tool disabled"
+        );
+        return;
+    };
+    if let Err(e) = reg.register(Box::new(GiteaTool::new(base, token, repo))) {
+        eprintln!("tole: registering gitea: {e}");
+    }
 }
 
 /// One prompt = one full tole turn. Returns `(stop_reason, final_text)`;

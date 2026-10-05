@@ -108,10 +108,11 @@ trust: `internal` / `read_only`), `--skill <path>` (load a SKILL.md),
 | `read_file`, `write_file`, `edit_file` | RO / Write | jailed to `--workspace` (TOCTOU-safe, symlink-refusing) |
 | `delete_file` | Destructive | always prompts; never allowlistable, even with `--yes` |
 | `git` | Write | `status` / `diff` / `add` / `commit` only — **push stays human** |
-| `gh` | Write | read-only ops, argv-validated per op; `--repo` is fixed at registration (currently `codecoradev/tole`) — per-repo wiring is a known gap |
+| `gh` | Write | read-only ops, argv-validated per op; `repo` defaults to the checkout's GitHub remote, optional per-call override (validated) |
 | `run_command` | Write | argv-split (no shell), cwd-jailed, timeout + output cap |
 | `verify_package` | RO | crates.io / npm registry check before any install — hallucinated names get NOT FOUND + candidates, edit-distance-1 candidates get a typo-squat warning |
 | `load_skill` | RO | loads a discovered SKILL.md on demand (`--skill` pins one upfront; `--no-skills` disables) |
+| `gitea` | Write | Gitea counterpart of `gh` over the instance REST API — registers when `origin` is a Gitea remote AND `TOLE_GITEA_TOKEN`/`GITEA_TOKEN` is set; same six ops |
 | `job_start`, `job_poll` | Write / RO | detached long-running jobs with log tailing |
 | `cora_search` | RO | hybrid codebase search via `cora brain`; native fallback — skipped when the cora MCP surface is attached |
 | `uteke_recall`, `uteke_document` | RO / Write | semantic memory recall / markdown → room |

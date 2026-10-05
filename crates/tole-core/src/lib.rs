@@ -35,6 +35,7 @@ pub mod file_tools;
 pub mod gh;
 #[cfg(feature = "shell-tools")]
 pub mod git;
+pub mod gitea;
 // Process hooks spawn subprocesses (issue #110) — same gate as the
 // subprocess helper they build on; mobile/embedder profiles have no
 // shell and no hooks.
