@@ -79,9 +79,11 @@ interactive powers. Concretely: `Destructive` registration is refused
 behind a non-interactive approver (structurally absent from `tole mcp`
 and serve; ACP is the exception by design — its approvals are genuine
 per-call human decisions routed to the editor, so `delete_file` may
-register there). The daemon adds: mandatory bearer token (refuses to
+register there). The daemon adds (both transports): mandatory bearer token (refuses to
 start without one), per-IP auth-failure rate limiting, a connection
-cap, IO timeouts, and the **jail-of-jails** — a client-supplied session
+cap (32), IO timeouts (30s: header, auth-header, and request-body
+phases on the MCP transport — SSE response streaming is never cut),
+and the **jail-of-jails** — a client-supplied session
 cwd must canonicalize inside the server workspace root (default the
 server cwd, `--workspace` override), or a remote client could jail a
 session to `/`. Multi-session MCP routing strips the `session_id` key

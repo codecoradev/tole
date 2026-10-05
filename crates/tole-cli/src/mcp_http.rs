@@ -89,12 +89,30 @@ pub async fn run_mcp_http(
         Default::default(),
     );
 
+    // Connection cap + IO timeouts (issue #190 — parity with the REST
+    // transport's #136 Wave-2 hardening): the accept loop must not pin
+    // unbounded tasks/fds for slowloris clients. A semaphore permit is
+    // held for the whole connection (released on close); at capacity
+    // the connection is refused, exactly like the REST face. SSE
+    // streams are never cut mid-turn — only the header phase and each
+    // request-body read are time-bounded.
+    const MAX_CONNECTIONS: usize = 32;
+    const SERVE_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+    let conn_sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
+
     let token = token.to_string();
     loop {
         let (stream, _peer) = listener.accept().await?;
+        let Ok(permit) = conn_sem.clone().try_acquire_owned() else {
+            // At capacity: close immediately, same semantics as REST.
+            drop(stream);
+            continue;
+        };
         let svc = svc.clone();
         let token = token.clone();
         tokio::spawn(async move {
+            // Hold the permit for the whole connection; dropped on close.
+            let _permit = permit;
             let io = TokioIo::new(stream);
             let svc_for_conn = svc.clone();
             let token_for_conn = token.clone();
@@ -105,14 +123,19 @@ pub async fn run_mcp_http(
                     async move {
                         use http_body_util::BodyExt;
                         // Bearer-token gate BEFORE the MCP service sees
-                        // anything (#137 auth surface).
-                        let auth = req
-                            .headers()
-                            .get(hyper::header::AUTHORIZATION)
-                            .and_then(|v| v.to_str().ok())
-                            .and_then(|v| v.strip_prefix("Bearer "))
-                            .map(|t| t == token)
-                            .unwrap_or(false);
+                        // anything (#137 auth surface), under the IO
+                        // timeout so a trickling client can't pin the
+                        // task (#190, mirrors the REST face).
+                        let auth = tokio::time::timeout(SERVE_IO_TIMEOUT, async {
+                            req.headers()
+                                .get(hyper::header::AUTHORIZATION)
+                                .and_then(|v| v.to_str().ok())
+                                .and_then(|v| v.strip_prefix("Bearer "))
+                                .map(|t| t == token)
+                                .unwrap_or(false)
+                        })
+                        .await
+                        .unwrap_or(false);
                         // Unified response body type for both arms.
                         type RespBody = http_body_util::combinators::BoxBody<
                             hyper::body::Bytes,
@@ -135,14 +158,17 @@ pub async fn run_mcp_http(
                         }
                         // Tower → hyper bridge: collect the request body,
                         // call the service (Error = Infallible), adapt the
-                        // response body back to a hyper body.
+                        // response body back to a hyper body. The collect
+                        // is time-bounded (#190) — an unauthenticated or
+                        // trickling client can't hold the task forever;
+                        // SSE RESPONSE streaming below is untouched.
                         use tower_service::Service as _;
                         let (parts, incoming) = req.into_parts();
-                        let body_bytes: hyper::body::Bytes = incoming
-                            .collect()
-                            .await
-                            .map(|c| c.to_bytes())
-                            .unwrap_or_default();
+                        let body_bytes: hyper::body::Bytes =
+                            tokio::time::timeout(SERVE_IO_TIMEOUT, incoming.collect())
+                                .await
+                                .map(|c| c.map(|c| c.to_bytes()).unwrap_or_default())
+                                .unwrap_or_default();
                         let full_req: http::Request<http_body_util::Full<hyper::body::Bytes>> =
                             http::Request::from_parts(parts, http_body_util::Full::new(body_bytes));
                         let mut svc = svc;
@@ -164,6 +190,11 @@ pub async fn run_mcp_http(
                     }
                 });
             let _ = hyper::server::conn::http1::Builder::new()
+                // Slowloris hardening (#190, hyper 1.x): bound how long
+                // the connection may take to deliver request headers.
+                // (REST parity; the body read is separately bounded by
+                // SERVE_IO_TIMEOUT above, and SSE responses are not cut.)
+                .header_read_timeout(SERVE_IO_TIMEOUT)
                 .serve_connection(io, hyper_service)
                 .await;
         });
