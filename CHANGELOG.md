@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-10-06
+
 ### Added
 - `gitea` tool — the Gitea counterpart of `gh`, over the instance's
   REST API (`TOLE_GITEA_TOKEN` / `GITEA_TOKEN` + a Gitea `origin`
@@ -381,3 +383,4 @@ Initial release: durable agent harness foundation.
   step-budget and loop guards, secret redaction on the wire,
   file tools (`read_file`, `write_file`, `edit_file` with hashline
   anchoring, `delete_file`), `cora_search`, E8 MVP gate passed.
+
