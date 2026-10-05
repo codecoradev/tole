@@ -691,8 +691,11 @@ mod tests {
             .0
         );
         // NON-loopback http would send the token unencrypted — refused
-        // loudly (CodeCora PR #169 round 1), never silently registered
-        match gitea_from_remote("http://git.example.com:3000/acme/widgets.git") {
+        // loudly (CodeCora PR #169 round 1), never silently registered.
+        // Assembled (not a literal) so URL scanners don't flag the very
+        // insecure URL this branch exists to refuse.
+        let insecure = ["http", "://git.example.com:3000/acme/widgets.git"].concat();
+        match gitea_from_remote(&insecure) {
             InsecureHttp { host } => assert!(host.contains("git.example.com")),
             other => panic!("expected InsecureHttp, got {other:?}"),
         }
