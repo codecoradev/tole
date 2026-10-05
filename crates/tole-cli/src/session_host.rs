@@ -158,6 +158,10 @@ pub fn open_session(
     }
     reg.register(Box::new(JobPollTool::new(workspace_canon.clone())))?;
     reg.register(Box::new(ReadFileTool::new(workspace_canon.clone())))?;
+    // systemone_decide (#172): probe-gated on SYSTEMONE_API_KEY.
+    if let Some(t) = tole_core::systemone::SystemOneTool::from_env() {
+        reg.register(Box::new(t))?;
+    }
     // Turn-end stop gates (#145): the same registry-level wiring the
     // run/chat hosts use, applied to server-face sessions.
     if !turnend.is_empty() {

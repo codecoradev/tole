@@ -939,6 +939,12 @@ fn build_registry(
         .map_err(|e| anyhow::anyhow!("registering job_poll: {e}"))?;
     reg.register(Box::new(VerifyPackageTool::new()))
         .map_err(|e| anyhow::anyhow!("registering verify_package: {e}"))?;
+    // systemone_decide (#172): probe-gated — present iff SYSTEMONE_API_KEY
+    // is set; absent key = silently off (owner decision 2026-10-05).
+    if let Some(t) = tole_core::systemone::SystemOneTool::from_env() {
+        reg.register(Box::new(t))
+            .map_err(|e| anyhow::anyhow!("registering systemone_decide: {e}"))?;
+    }
     reg.register(Box::new(ReadFileTool::new(file_root.clone())))
         .map_err(|e| anyhow::anyhow!("registering read_file: {e}"))?;
     // Write tools: gated per call. The jail root is the workspace.
@@ -1040,6 +1046,12 @@ fn build_server_registry(
     }
     reg.register(Box::new(VerifyPackageTool::new()))
         .map_err(|e| anyhow::anyhow!("registering verify_package: {e}"))?;
+    // systemone_decide (#172): probe-gated — present iff SYSTEMONE_API_KEY
+    // is set; absent key = silently off (owner decision 2026-10-05).
+    if let Some(t) = tole_core::systemone::SystemOneTool::from_env() {
+        reg.register(Box::new(t))
+            .map_err(|e| anyhow::anyhow!("registering systemone_decide: {e}"))?;
+    }
     reg.register(Box::new(ReadFileTool::new(file_root.clone())))
         .map_err(|e| anyhow::anyhow!("registering read_file: {e}"))?;
     reg.register(Box::new(WriteFileTool::new(file_root.clone())))
