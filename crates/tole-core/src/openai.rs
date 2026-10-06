@@ -526,6 +526,13 @@ impl OpenAiProvider {
                 }
             };
             let _ = id;
+            // Issue #232: settle THIS step's reasoning exactly like the
+            // text path below — without a sink the accumulated thought
+            // surfaces once at turn end; with a sink the deltas were
+            // the emission (already None from the per-call reset).
+            if self.on_reasoning_delta.is_none() && !reasoning.trim().is_empty() {
+                self.last_reasoning_obj = Some(reasoning);
+            }
             return Ok(ProviderOutput::ToolCall { tool: name, input });
         }
         // No tool calls: the answer must have content (GLM emits an
@@ -548,6 +555,14 @@ impl OpenAiProvider {
 
 impl Provider for OpenAiProvider {
     fn complete(&mut self, transcript: &[Entry]) -> Result<ProviderOutput, ProviderError> {
+        // Issue #232 (scan #106): last_usage / last_reasoning describe
+        // THIS response only. Reset per call — a tool-call step (which
+        // returns early) or a gateway that omits usage must never leave
+        // the previous response's values for the turn-loop observer and
+        // the durable ledger. Each path (streaming, non-stream, error)
+        // then sets what it actually has.
+        self.last_usage_obj = None;
+        self.last_reasoning_obj = None;
         let mut body = self.request_body(transcript);
         // Issue #196 phase 3: the streaming envelope rides on top of the
         // request body — the Tier-1 golden contract keeps asserting the
@@ -1293,6 +1308,116 @@ mod streaming_tests {
         }
         // No sink: the accumulated thought surfaces once, turn-end.
         assert_eq!(p.last_reasoning().unwrap(), "thinking");
+    }
+
+    /// Issue #232 regression: each response's usage/reasoning stand
+    /// alone. A tool-call step (early return) must not inherit the
+    /// previous response's values, and a step whose gateway omits the
+    /// usage chunk must CLEAR it (the durable ledger gets nothing for
+    /// that step, not the previous step's numbers).
+    #[test]
+    fn tool_call_step_sets_fresh_reasoning_and_usage_per_response() {
+        // Response 1: text final — reasoning + usage recorded.
+        let capture = Arc::new(Mutex::new(String::new()));
+        let url = serve_stream(
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"reasoning\":\"first thought\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+                "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2,\"total_tokens\":3}}\n\n",
+                "data: [DONE]\n\n",
+            )
+            .to_string(),
+            Arc::clone(&capture),
+        );
+        let mut p = OpenAiProvider::new(OpenAiConfig::new(url, "m", "sk-test"));
+        assert!(matches!(
+            p.complete(&[]).unwrap(),
+            ProviderOutput::Final { .. }
+        ));
+        assert_eq!(p.last_reasoning().unwrap(), "first thought");
+        assert_eq!(p.last_usage().unwrap()["prompt_tokens"], json!(1));
+
+        // Response 2: tool-call step — its own reasoning + usage.
+        let url = serve_stream(
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"reasoning\":\"second thought\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"echo\",\"arguments\":\"{}\"}}]}}]}\n\n",
+                "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":6,\"total_tokens\":11}}\n\n",
+                "data: [DONE]\n\n",
+            )
+            .to_string(),
+            Arc::clone(&capture),
+        );
+        let p2 = OpenAiProvider::new(OpenAiConfig::new(url, "m", "sk-test"));
+        let mut p = p2;
+        assert!(matches!(
+            p.complete(&[]).unwrap(),
+            ProviderOutput::ToolCall { .. }
+        ));
+        assert_eq!(
+            p.last_reasoning().unwrap(),
+            "second thought",
+            "the tool-call step's OWN reasoning is surfaced (no sink attached)"
+        );
+        assert_eq!(
+            p.last_usage().unwrap()["prompt_tokens"],
+            json!(5),
+            "usage is this step's, not the previous response's"
+        );
+
+        // Response 3: gateway omits the usage chunk → ledger gets None,
+        // never the stale previous-step numbers.
+        let url = serve_stream(
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n",
+            )
+            .to_string(),
+            Arc::clone(&capture),
+        );
+        let p3 = OpenAiProvider::new(OpenAiConfig::new(url, "m", "sk-test"));
+        let mut p = p3;
+        assert!(matches!(
+            p.complete(&[]).unwrap(),
+            ProviderOutput::Final { .. }
+        ));
+        assert!(
+            p.last_usage().is_none(),
+            "omitted usage must reset, not leak the previous response's"
+        );
+    }
+
+    /// Issue #232: with a reasoning sink attached, the deltas WERE the
+    /// emission — a tool-call step leaves last_reasoning None (no
+    /// double emission), mirroring the text path.
+    #[test]
+    fn tool_call_step_with_reasoning_sink_leaves_reasoning_none() {
+        let capture = Arc::new(Mutex::new(String::new()));
+        let url = serve_stream(
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"reasoning\":\"think part\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"echo\",\"arguments\":\"{}\"}}]}}]}\n\n",
+                "data: [DONE]\n\n",
+            )
+            .to_string(),
+            Arc::clone(&capture),
+        );
+        let mut p = OpenAiProvider::new(OpenAiConfig::new(url, "m", "sk-test"));
+        let fired: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let r_sink = Arc::clone(&fired);
+        p = p.with_delta_sinks(
+            None,
+            Some(Arc::new(move |r: &str| {
+                r_sink.lock().unwrap().push(format!("think:{r}"))
+            })),
+        );
+        assert!(matches!(
+            p.complete(&[]).unwrap(),
+            ProviderOutput::ToolCall { .. }
+        ));
+        assert_eq!(*fired.lock().unwrap(), vec!["think:think part"]);
+        assert!(p.last_reasoning().is_none(), "deltas already delivered");
     }
 
     #[test]
