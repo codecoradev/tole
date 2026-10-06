@@ -496,6 +496,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                     "--plan-mode has no meaning for a mission (missions mutate by definition)"
                 );
             }
+            #[cfg(feature = "mcp")]
             check_client_session_flags("mission", &host.skills, host.no_skills, explicit_mcp)?;
             let sessions_dir = sessions_dir.clone();
             std::fs::create_dir_all(&sessions_dir)

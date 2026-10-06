@@ -215,44 +215,61 @@ pub fn run_mission(
         match &outcome {
             TurnOutcome::Final { text, .. } => {
                 let declares = text.contains(MISSION_COMPLETE_MARKER);
-                if declares {
-                    if let Some(cmd) = &cfg.verify {
-                        match run_verify(cmd) {
-                            Ok(()) => {
+                match &cfg.verify {
+                    // Per-turn verification (cora CI on #206): the gate
+                    // is the ground truth EVERY turn, not just on marker
+                    // turns — a pass without the marker keeps the mission
+                    // going (the model finishes remaining work), a fail
+                    // always returns the output to the model.
+                    Some(cmd) => match run_verify(cmd) {
+                        Ok(()) => {
+                            if declares {
                                 status = "complete";
                                 break;
                             }
-                            Err(output) => {
-                                verify_failures += 1;
-                                eprintln!(
-                                    "mission: verify failed ({verify_failures}/{VERIFY_FAILURE_CAP})"
-                                );
-                                if verify_failures >= VERIFY_FAILURE_CAP {
-                                    status = "verify_failed";
-                                    break;
-                                }
-                                continuation = Some(format!(
-                                    "You declared {MISSION_COMPLETE_MARKER} but \
-                                     verification disagrees.\n{output}\n\n\
-                                     Fix the cause and continue."
-                                ));
-                            }
+                            continuation = Some(format!(
+                                "Verification passed, but you have not declared \
+                                 {MISSION_COMPLETE_MARKER} — finish any remaining \
+                                 work toward the goal, then declare it."
+                            ));
                         }
-                    } else {
-                        status = "complete";
-                        break;
+                        Err(output) => {
+                            verify_failures += 1;
+                            eprintln!(
+                                "mission: verify failed ({verify_failures}/{VERIFY_FAILURE_CAP})"
+                            );
+                            if verify_failures >= VERIFY_FAILURE_CAP {
+                                status = "verify_failed";
+                                break;
+                            }
+                            let claim = if declares {
+                                format!(
+                                    "You declared {MISSION_COMPLETE_MARKER} but \
+                                     verification disagrees. "
+                                )
+                            } else {
+                                String::new()
+                            };
+                            continuation = Some(format!(
+                                "{claim}Verification FAILED:\n{output}\n\n\
+                                 Fix the cause and continue."
+                            ));
+                        }
+                    },
+                    None => {
+                        if declares {
+                            status = "complete";
+                            break;
+                        }
+                        let used_now = steps_used(&storage);
+                        continuation = Some(format!(
+                            "Mission continues. Steps used: {used_now}/{}; \
+                             time left: {} min. Keep working the plan.",
+                            cfg.max_steps,
+                            cfg.max_minutes
+                                .saturating_sub(started.elapsed().as_secs() / 60)
+                        ));
                     }
-                } else if let TurnOutcome::Final { .. } = outcome {
-                    // Not done: chain with a continuation prompt carrying
-                    // the remaining budget.
-                    let used_now = steps_used(&storage);
-                    continuation = Some(format!(
-                        "Mission continues. Steps used: {used_now}/{}; \
-                         time left: {} min. Keep working the plan.",
-                        cfg.max_steps,
-                        cfg.max_minutes
-                            .saturating_sub(started.elapsed().as_secs() / 60)
-                    ));
                 }
             }
             other => {
