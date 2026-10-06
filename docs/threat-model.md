@@ -194,8 +194,10 @@ and every revision is auditable in the replay. `todo_read` is ReadOnly.
 `tole mission` chains normal durable turns autonomously. The risk frame
 is unchanged and deliberate: the same approval gates, risk tiers, and
 write-once audit apply per chained turn — autonomy does not widen the
-boundary. Budgets bound blast radius in time/steps; exhaustion is
-resumable, never a dead session. `--verify` gives the operator a
+boundary. Budgets bound blast radius in time, steps, and tokens
+(#201); exhaustion is resumable, never a dead session. The durable cost
+report keeps autonomous spend honest and comparable — an unmeasured
+mission is an unaudited one. `--verify` gives the operator a
 machine-checkable completion condition stronger than the model's own
 claim. Destructive tools remain structurally un-auto-allowable in
 missions.

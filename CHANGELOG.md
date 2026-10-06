@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Mission budget tiers + cost report (#201): `--max-tokens` ceiling joins
+  `--max-steps`/`--max-minutes`; conservative defaults with `--trust
+  internal` headroom (explicit flags win); a durable cost report (steps,
+  turns, tokens, wall time, tool-call counts by risk tier) lands on the
+  session at every settle path and `tole status` renders it.
 - `tole mission` (#199): budgeted autonomous turn-chaining toward a goal —
   `--max-steps` / `--max-minutes` budgets (exhaustion settles resumably),
   optional `--verify <cmd>` gate (exit 0 = completion; failures return to

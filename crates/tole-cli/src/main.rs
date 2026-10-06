@@ -198,13 +198,21 @@ enum Command {
         goal: String,
 
         /// Total provider steps across all chained turns (from the
-        /// durable usage ledger).
-        #[arg(long, default_value_t = 48)]
-        max_steps: u64,
+        /// durable usage ledger). Default: budget tier (48; 96 with
+        /// --trust internal).
+        #[arg(long)]
+        max_steps: Option<u64>,
 
-        /// Wall-clock cap in minutes.
-        #[arg(long, default_value_t = 15)]
-        max_minutes: u64,
+        /// Wall-clock cap in minutes. Default: budget tier (15; 30 with
+        /// --trust internal).
+        #[arg(long)]
+        max_minutes: Option<u64>,
+
+        /// Total token ceiling (prompt + completion, from the usage
+        /// ledger). Default: budget tier (200k; 500k with
+        /// --trust internal).
+        #[arg(long)]
+        max_tokens: Option<u64>,
 
         /// Verification command run after each turn; exit 0 = goal
         /// achieved (overrides the model's completion marker). Failures
@@ -489,6 +497,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             goal,
             max_steps,
             max_minutes,
+            max_tokens,
             verify,
             verify_timeout,
             resume,
@@ -503,6 +512,10 @@ fn dispatch(cli: Cli) -> Result<()> {
             }
             #[cfg(feature = "mcp")]
             check_client_session_flags("mission", &host.skills, host.no_skills, explicit_mcp)?;
+            // Budget tier (issue #201): the internal trust preset earns
+            // the trusted tier's headroom; explicit flags always win.
+            let trusted = trust_extra.iter().any(|p| p == "todo_write");
+            let tier = mission::BudgetTier::resolve(trusted, max_steps, max_minutes, max_tokens);
             let sessions_dir = sessions_dir.clone();
             std::fs::create_dir_all(&sessions_dir)
                 .with_context(|| format!("creating {}", sessions_dir.display()))?;
@@ -531,8 +544,9 @@ fn dispatch(cli: Cli) -> Result<()> {
             mission::run_mission(
                 mission::MissionConfig {
                     goal,
-                    max_steps,
-                    max_minutes,
+                    max_steps: tier.max_steps,
+                    max_minutes: tier.max_minutes,
+                    max_tokens: tier.max_tokens,
                     verify,
                     verify_timeout_secs: verify_timeout,
                     resume_id: resume,
@@ -1646,6 +1660,11 @@ fn status_command(sessions_dir: &Path, id: &str) -> Result<()> {
     // explicit: a negative-zero cost display would look like a bug).
     let cost = if cost == 0.0 { 0.0 } else { cost };
     println!("usage:   {prompt_tokens} in / {completion_tokens} out tokens, ${cost:.4} USD");
+    // Mission cost report (issue #201): the durable fact/mission register
+    // a settled mission leaves behind.
+    if let Some(mission) = storage.get_register("fact", "mission") {
+        println!("mission: {}", mission);
+    }
     Ok(())
 }
 

@@ -21,7 +21,7 @@
 //! un-auto-allowable; approvals (interactive) and gates apply per turn.
 
 use anyhow::{Context, Result};
-use serde_json::json;
+use serde_json::{json, Value};
 
 use tole_core::openai::{OpenAiConfig, OpenAiProvider};
 use tole_core::storage::{JsonlStorage, Storage};
@@ -38,6 +38,45 @@ pub const MISSION_COMPLETE_MARKER: &str = "MISSION_COMPLETE";
 /// failure's output in context before the cap trips.
 pub const VERIFY_FAILURE_CAP: u32 = 3;
 
+/// Budget tier (issue #201): conservative by default; a trusted
+/// ecosystem context (`--trust internal`) earns headroom, and explicit
+/// flags always win over any tier default.
+#[derive(Clone, Copy, Debug)]
+pub struct BudgetTier {
+    pub max_steps: u64,
+    pub max_minutes: u64,
+    pub max_tokens: u64,
+}
+
+pub const DEFAULT_TIER: BudgetTier = BudgetTier {
+    max_steps: 48,
+    max_minutes: 15,
+    max_tokens: 200_000,
+};
+pub const TRUSTED_TIER: BudgetTier = BudgetTier {
+    max_steps: 96,
+    max_minutes: 30,
+    max_tokens: 500_000,
+};
+
+impl BudgetTier {
+    /// Resolve the tier: explicit flags win per-field; the trusted tier
+    /// applies only where the operator gave no explicit value.
+    pub fn resolve(
+        trusted: bool,
+        max_steps: Option<u64>,
+        max_minutes: Option<u64>,
+        max_tokens: Option<u64>,
+    ) -> Self {
+        let base = if trusted { TRUSTED_TIER } else { DEFAULT_TIER };
+        Self {
+            max_steps: max_steps.unwrap_or(base.max_steps),
+            max_minutes: max_minutes.unwrap_or(base.max_minutes),
+            max_tokens: max_tokens.unwrap_or(base.max_tokens),
+        }
+    }
+}
+
 /// Resolved mission parameters.
 pub struct MissionConfig {
     /// The goal, verbatim from the operator.
@@ -46,6 +85,9 @@ pub struct MissionConfig {
     pub max_steps: u64,
     /// Wall-clock cap in minutes.
     pub max_minutes: u64,
+    /// Total token ceiling (prompt + completion, from the durable
+    /// usage ledger).
+    pub max_tokens: u64,
     /// Optional verification command (ground truth for completion).
     pub verify: Option<String>,
     /// Continue an interrupted mission instead of starting a new one.
@@ -111,6 +153,26 @@ fn run_verify(cmd: &str, timeout: std::time::Duration) -> Result<(), String> {
 /// Snapshot the durable usage ledger (provider steps so far).
 fn steps_used(storage: &JsonlStorage) -> u64 {
     storage.usages().len() as u64
+}
+
+/// Tokens (prompt + completion) recorded in the durable ledger.
+fn tokens_used(storage: &JsonlStorage) -> u64 {
+    storage
+        .usages()
+        .iter()
+        .map(|u| {
+            u.usage
+                .get("prompt_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+                .saturating_add(
+                    u.usage
+                        .get("completion_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0),
+                )
+        })
+        .sum()
 }
 
 /// Run one mission to completion/exhaustion. The CALLER builds the
@@ -201,6 +263,15 @@ pub fn run_mission(
                 cfg.max_steps
             );
             status = "exhausted_steps";
+            break;
+        }
+        let tokens = tokens_used(&storage);
+        if tokens >= cfg.max_tokens {
+            eprintln!(
+                "mission: token budget exhausted ({tokens}/{}) after {turns} turn(s)",
+                cfg.max_tokens
+            );
+            status = "exhausted_tokens";
             break;
         }
         if std::time::Instant::now() >= deadline {
@@ -306,17 +377,40 @@ pub fn run_mission(
         }
     }
 
-    // Durable summary (issue #199 acceptance): a fact register on the
-    // session — visible in the replay, trivially extensible by #201's
-    // cost report.
+    // Durable cost report (issue #201): a fact register on the session
+    // — steps, turns, tokens, wall time, and tool-call counts by risk
+    // tier (folded from the durable intents; risk from the live
+    // registry). `tole status` renders it.
     let wall_secs = started.elapsed().as_secs();
+    let mut tool_calls = json!({"readonly": 0, "write": 0, "destructive": 0});
+    use tole_core::entry::EntryType;
+    for e in storage.entries() {
+        if e.kind.as_str() == EntryType::INTENT {
+            if let Some(tool) = e.payload.get("tool").and_then(Value::as_str) {
+                let risk = registry
+                    .get(tool)
+                    .map(|t| t.risk())
+                    .unwrap_or(tole_core::tool::Risk::ReadOnly);
+                let key = match risk {
+                    tole_core::tool::Risk::ReadOnly => "readonly",
+                    tole_core::tool::Risk::Write => "write",
+                    tole_core::tool::Risk::Destructive => "destructive",
+                };
+                tool_calls[key] = json!(tool_calls[key].as_u64().unwrap_or(0) + 1);
+            }
+        }
+    }
     let summary = json!({
         "goal": cfg.goal,
         "status": status,
         "turns": turns,
         "steps": steps_used(&storage),
+        "tokens_in_out": tokens_used(&storage),
         "verify_failures": verify_failures,
         "wall_seconds": wall_secs,
+        "budget": {"max_steps": cfg.max_steps, "max_minutes": cfg.max_minutes,
+                   "max_tokens": cfg.max_tokens},
+        "tool_calls": tool_calls,
     });
     {
         use tole_core::register::RegisterWrite;
@@ -337,4 +431,31 @@ pub fn run_mission(
         steps_used(&storage)
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::BudgetTier;
+
+    /// Issue #201: explicit flags win per-field; the trusted tier only
+    /// fills where the operator gave nothing.
+    #[test]
+    fn tier_resolution_explicit_wins_and_trusted_fills() {
+        let d = BudgetTier::resolve(false, None, None, None);
+        assert_eq!(
+            (d.max_steps, d.max_minutes, d.max_tokens),
+            (48, 15, 200_000)
+        );
+        let t = BudgetTier::resolve(true, None, None, None);
+        assert_eq!(
+            (t.max_steps, t.max_minutes, t.max_tokens),
+            (96, 30, 500_000)
+        );
+        // Explicit values override BOTH tiers, per-field.
+        let mixed = BudgetTier::resolve(true, Some(10), None, Some(1_000));
+        assert_eq!(
+            (mixed.max_steps, mixed.max_minutes, mixed.max_tokens),
+            (10, 30, 1_000)
+        );
+    }
 }
