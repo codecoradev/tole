@@ -90,7 +90,7 @@ pub enum TurnOutcome {
 /// best-effort UI plumbing; errors are dropped. The default bodies are
 /// deliberate no-ops, hence the unused-variable allowance.
 #[allow(unused_variables)]
-pub trait TurnObserver {
+pub trait TurnObserver: Send + Sync {
     /// A tool call passed every gate (approval, hooks, loop guard) and
     /// is about to execute. `input` is the exact call input.
     fn tool_started(&self, tool: &str, input: &Value) {}
@@ -100,6 +100,10 @@ pub trait TurnObserver {
     /// The model's reasoning for the provider step that just completed,
     /// when the provider supplies one (`Provider::last_reasoning`).
     fn reasoning(&self, text: &str) {}
+    /// A burst of streamed answer text (issue #196 phase 3). Fired only
+    /// when the provider streams AND delta sinks are attached; hosts
+    /// suppress their end-of-turn full-text delivery accordingly.
+    fn text_delta(&self, text: &str) {}
 }
 
 /// Drive one full user turn to completion (single-threaded).

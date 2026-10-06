@@ -368,6 +368,11 @@ struct AcpObserver {
     conn: Conn,
     session_id: String,
     counter: Arc<Mutex<u64>>,
+    /// Set once answer text has been streamed via text_delta (issue
+    /// #196 phase 3): the end-of-turn full-text delivery is suppressed
+    /// so the host receives the message exactly once. Shared with the
+    /// prompt thread — the trait object cannot expose the field.
+    text_streamed: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// The open card's id (cora MAJOR, #196): `tool_call_update` must
     /// reference the `toolCallId` the started card announced, or hosts
     /// cannot correlate them and the card stays `in_progress` forever.
@@ -436,6 +441,21 @@ impl tole_core::turn::TurnObserver for AcpObserver {
                 "sessionId": self.session_id,
                 "update": {
                     "sessionUpdate": "agent_thought_chunk",
+                    "content": {"type": "text", "text": text},
+                }
+            }),
+        );
+    }
+
+    fn text_delta(&self, text: &str) {
+        self.text_streamed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.conn.send_notification(
+            "session/update",
+            json!({
+                "sessionId": self.session_id,
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
                     "content": {"type": "text", "text": text},
                 }
             }),
@@ -873,29 +893,38 @@ pub fn run_acp(
                         .unwrap_or_default()
                 };
                 std::thread::spawn(move || {
-                    let observer = AcpObserver {
+                    // Phase 3 dedup flag, shared with the closure below —
+                    // the trait object cannot expose the field.
+                    let text_streamed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let observer: Arc<dyn tole_core::turn::TurnObserver> = Arc::new(AcpObserver {
                         conn: conn.clone(),
                         session_id: session_id_clone.clone(),
                         counter: tool_ids,
                         current: Mutex::new(None),
-                    };
+                        text_streamed: Arc::clone(&text_streamed),
+                    });
                     match run_session_turn(
                         sessions,
                         &session_id_clone,
                         &prompt_text,
-                        Some(&observer),
+                        Some(Arc::clone(&observer)),
                     ) {
                         Ok((stop, Some(text))) => {
-                            conn.send_notification(
-                                "session/update",
-                                json!({
-                                    "sessionId": session_id_clone,
-                                    "update": {
-                                        "sessionUpdate": "agent_message_chunk",
-                                        "content": {"type": "text", "text": text},
-                                    }
-                                }),
-                            );
+                            // Phase 3: when deltas already streamed the
+                            // answer, the full text was delivered live —
+                            // re-sending it would duplicate the message.
+                            if !text_streamed.load(std::sync::atomic::Ordering::SeqCst) {
+                                conn.send_notification(
+                                    "session/update",
+                                    json!({
+                                        "sessionId": session_id_clone,
+                                        "update": {
+                                            "sessionUpdate": "agent_message_chunk",
+                                            "content": {"type": "text", "text": text},
+                                        }
+                                    }),
+                                );
+                            }
                             reply(&conn, id, json!({ "stopReason": stop }));
                         }
                         Ok((stop, None)) => reply(&conn, id, json!({ "stopReason": stop })),
