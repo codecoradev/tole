@@ -143,18 +143,25 @@ impl RegistryServer {
         name: &str,
         args: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        // #137 multi-session routing: a `session_id` argument addresses
-        // the SESSION's registry (its workspace jail + approver). The
-        // session tools themselves (tole_session_*) always stay on the
-        // server-level registry — they carry the session map.
         let session_id = args
             .get("session_id")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string);
+        let is_session_tool = name.starts_with("tole_session_");
         let (registry, args) = match (&self.session_resolver, session_id) {
-            (Some(resolve), Some(sid))
-                if !name.starts_with("tole_session_") && self.registry.get(name).is_some() =>
-            {
+            // #137 multi-session routing, #226/#227 semantics: a
+            // `session_id` argument names the caller's intended context —
+            // resolve the SESSION registry FIRST and execute there.
+            // Session registries may EXTEND the server-level registry
+            // (host-added per-session tools), so server-side presence is
+            // NOT required to route. An id that does not resolve is a
+            // loud error, never a silent fallback to the server registry
+            // (#74: that fallback let a bogus id bypass the #138
+            // ambiguity refusal and execute in the server cwd jail, or
+            // run a same-named server tool instead of the session's).
+            // The session tools themselves (tole_session_*) stay on the
+            // server-level registry — they carry the session map.
+            (Some(resolve), Some(sid)) if !is_session_tool => {
                 let reg = resolve(&sid).ok_or_else(|| format!("unknown session: {sid}"))?;
                 // Strip the routing key before the tool sees the args.
                 let mut a = args;
@@ -163,21 +170,20 @@ impl RegistryServer {
                 }
                 (reg, a)
             }
-            // Ambiguity refusal (#138-documented): a registry-tool call
-            // without `session_id` while 2+ sessions are open would
-            // silently execute against the SERVER-level registry (server
-            // cwd jail) — almost certainly not what the caller meant.
+            // Ambiguity refusal (#138-documented, #226/#227-tightened):
+            // ANY non-session-tool call without `session_id` while 2+
+            // sessions are open is refused — the caller may have meant
+            // one of them (a session-only extension tool would otherwise
+            // die as an opaque "unknown tool" on the server registry,
+            // and a server tool may not be what the caller meant).
             (Some(_), None)
-                if {
-                    let is_registry_tool =
-                        !name.starts_with("tole_session_") && self.registry.get(name).is_some();
-                    let open = self
+                if !is_session_tool
+                    && self
                         .session_count
                         .as_ref()
                         .map(|count| count())
-                        .unwrap_or(0);
-                    is_registry_tool && open > 1
-                } =>
+                        .unwrap_or(0)
+                        > 1 =>
             {
                 return Err(format!(
                     "ambiguous '{name}' call: 2+ sessions are open — pass the 'session_id' \
@@ -565,6 +571,117 @@ mod tests {
             other => panic!("expected text content, got {other:?}"),
         };
         assert!(!text.contains("session_id"), "{text}");
+        client.cancel().await.ok();
+    }
+
+    /// Issue #227 (scan #73) regression: a session registry may EXTEND
+    /// the server registry — a tool that exists only in the session's
+    /// registry is callable WITH its session_id instead of falling
+    /// through to an opaque "unknown tool" on the server registry.
+    struct SessionOnlyTool;
+    impl crate::tool::Tool for SessionOnlyTool {
+        fn name(&self) -> &str {
+            "session_only_tool"
+        }
+        fn risk(&self) -> Risk {
+            Risk::ReadOnly
+        }
+        fn describe(&self, _input: &serde_json::Value) -> String {
+            "lives only in the session registry".into()
+        }
+        fn execute(&self, _: serde_json::Value) -> Result<serde_json::Value, String> {
+            Ok(json!({"from": "session registry"}))
+        }
+    }
+
+    fn extension_session_server(open_sessions: usize) -> RegistryServer {
+        // The SESSION registry carries a tool the server registry lacks.
+        let mut sreg = server_registry(false);
+        sreg.register(Box::new(SessionOnlyTool)).unwrap();
+        let session_reg = Arc::new(sreg);
+        let known: Vec<String> = (0..open_sessions).map(|i| format!("s{i}")).collect();
+        let resolver_sessions = known.clone();
+        let resolver: SessionRegistryResolver = Arc::new(move |sid: &str| {
+            if resolver_sessions.iter().any(|s| s == sid) {
+                Some(Arc::clone(&session_reg))
+            } else {
+                None
+            }
+        });
+        let count: SessionCountFn = Arc::new(move || known.len());
+        RegistryServer::new(server_registry(false))
+            .with_session_resolver(resolver)
+            .with_session_count(count)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_only_tool_executes_via_explicit_session_id() {
+        let client = connect(extension_session_server(2)).await;
+        let res = client
+            .peer()
+            .call_tool(
+                CallToolRequestParams::new("session_only_tool")
+                    .with_arguments(json!({"session_id": "s0"}).as_object().unwrap().clone()),
+            )
+            .await
+            .unwrap();
+        assert_ne!(res.is_error, Some(true));
+        let text = match &res.content[0] {
+            ContentBlock::Text(t) => t.text.clone(),
+            other => panic!("expected text content, got {other:?}"),
+        };
+        assert!(text.contains("session registry"), "{text}");
+        client.cancel().await.ok();
+    }
+
+    /// Issue #227 (scan #74) regression: a BOGUS session_id must fail
+    /// closed — never fall through to the server-level registry (which
+    /// would execute a same-named server tool or leak the server jail,
+    /// silently bypassing the #138 ambiguity refusal).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bogus_session_id_fails_closed_no_server_fallback() {
+        let client = connect(extension_session_server(2)).await;
+        // echo_tool EXISTS server-side: the old code would execute the
+        // server copy on an unresolvable id. It must refuse instead.
+        let res = client
+            .peer()
+            .call_tool(
+                CallToolRequestParams::new("echo_tool").with_arguments(
+                    json!({"session_id": "bogus", "msg": "hi"})
+                        .as_object()
+                        .expect("object")
+                        .clone(),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.is_error, Some(true));
+        let text = match &res.content[0] {
+            ContentBlock::Text(t) => t.text.clone(),
+            other => panic!("expected text content, got {other:?}"),
+        };
+        assert!(text.contains("unknown session: bogus"), "{text}");
+        assert!(!text.contains("echoed"), "{text}");
+        client.cancel().await.ok();
+    }
+
+    /// And a session-only tool called WITHOUT session_id while 2+
+    /// sessions are open gets the ambiguity refusal — not an opaque
+    /// server-registry "unknown tool".
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_only_tool_without_id_with_two_sessions_is_refused() {
+        let client = connect(extension_session_server(2)).await;
+        let res = client
+            .peer()
+            .call_tool(CallToolRequestParams::new("session_only_tool"))
+            .await
+            .unwrap();
+        assert_eq!(res.is_error, Some(true));
+        let text = match &res.content[0] {
+            ContentBlock::Text(t) => t.text.clone(),
+            other => panic!("expected text content, got {other:?}"),
+        };
+        assert!(text.contains("ambiguous"), "{text}");
         client.cancel().await.ok();
     }
 }
