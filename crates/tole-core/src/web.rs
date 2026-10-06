@@ -27,6 +27,8 @@ const MAX_REDIRECTS: usize = 5;
 
 /// Resolve `host` to addresses via the OS resolver (same source the
 /// request itself would use).
+/// Address-resolution step, kept pure for the SSRF unit tests.
+#[cfg_attr(not(test), allow(dead_code))]
 fn resolve_host(host: &str) -> Result<Vec<std::net::IpAddr>, String> {
     use std::net::ToSocketAddrs;
     let addrs: Vec<std::net::IpAddr> = (host, 443u16)
@@ -72,6 +74,8 @@ fn ip_is_private(ip: &std::net::IpAddr) -> bool {
 /// and query/fragment NEVER reach the authority (cora: `?`/`#`-
 /// terminated authorities defeated the old manual string splits).
 /// Brackets stripped for resolver consumption.
+/// URI-authority host extraction (unit-tested; kept pure).
+#[cfg_attr(not(test), allow(dead_code))]
 fn parse_host(url: &str) -> Result<String, String> {
     let uri: ureq::http::Uri = url
         .parse()
@@ -85,21 +89,19 @@ fn parse_host(url: &str) -> Result<String, String> {
         .ok_or_else(|| "web_fetch: URL has no host".into())
 }
 
-fn host_is_public(url: &str) -> Result<(), String> {
-    let opt_out = std::env::var("TOLE_WEB_ALLOW_PRIVATE")
+fn ssrf_opt_out() -> bool {
+    std::env::var("TOLE_WEB_ALLOW_PRIVATE")
         .map(|v| v == "1")
-        .unwrap_or(false);
-    host_is_public_opt(url, opt_out)
+        .unwrap_or(false)
 }
 
-/// Pure form (tests): the SSRF range check with an explicit opt-out.
-fn host_is_public_opt(url: &str, opt_out: bool) -> Result<(), String> {
+/// Filter resolved addresses through the SSRF guard (pure form kept
+/// for tests). Private IP + no opt-out → Err naming the host/IP.
+fn vet_addrs(host: &str, addrs: &[std::net::IpAddr], opt_out: bool) -> Result<(), String> {
     if opt_out {
         return Ok(());
     }
-    let host = parse_host(url)?;
-    let addrs = resolve_host(&host)?;
-    for ip in &addrs {
+    for ip in addrs {
         if ip_is_private(ip) {
             return Err(format!(
                 "web_fetch: {host} resolves to a private/loopback address ({ip}) — \
@@ -110,73 +112,87 @@ fn host_is_public_opt(url: &str, opt_out: bool) -> Result<(), String> {
     Ok(())
 }
 
-thread_local! {
-    /// Addresses vetted for the NEXT fetch on this thread. The fetch
-    /// agent's resolver answers ONLY with these — a DNS rebinding that
-    /// flips between the check and the connect cannot re-point the
-    /// request into an internal network (cora DNS-rebinding MAJOR).
-    static VETTED: std::cell::RefCell<Vec<std::net::IpAddr>> =
-        const { std::cell::RefCell::new(Vec::new()) };
+/// Pure form (tests): the SSRF range check with an explicit opt-out.
+/// Pure form (tests): the SSRF range check with an explicit opt-out.
+#[cfg_attr(not(test), allow(dead_code))]
+fn host_is_public_opt(url: &str, opt_out: bool) -> Result<(), String> {
+    let host = parse_host(url)?;
+    let addrs = resolve_host(&host)?;
+    vet_addrs(&host, &addrs, opt_out)
 }
 
-/// Validate `url` through the SSRF guard, pin its resolved addresses,
-/// and return an agent whose resolver answers only with those pins.
-/// The pinning consumes the guard's OWN resolution (same OS resolver),
-/// closing the check-vs-connect gap. `web_search` has no user URL
-/// (its endpoint is the configured backend), so the plain agent
-/// suffices there.
-fn fetch_agent_vetted(url: &str) -> Result<ureq::Agent, String> {
-    host_is_public(url)?;
-    let addrs = resolve_host(&parse_host(url)?)?;
-    VETTED.with(|v| {
-        let mut v = v.borrow_mut();
-        v.clear();
-        v.extend(addrs);
-    });
-    Ok(ureq::Agent::with_parts(
-        ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(30)))
-            .max_redirects(0)
-            .build(),
-        ureq::unversioned::transport::DefaultConnector::default(),
-        PinningResolver,
-    ))
-}
-
-/// Resolver answering ONLY with this thread's vetted addresses.
+/// CHECK-IN-RESOLVER (cora DNS-rebinding MAJOR, fixed properly): the
+/// SSRF guard runs INSIDE the fetch agent's resolver — the address
+/// list the connection uses is the list the guard vetted in the same
+/// call. There is no separate check-then-resolve window to rebind
+/// across; every redirect hop builds a fresh agent, so each hop is
+/// re-vetted against its own resolution.
 #[derive(Debug)]
-struct PinningResolver;
+struct SsrfResolver {
+    opt_out: bool,
+}
 
-impl ureq::unversioned::resolver::Resolver for PinningResolver {
+impl ureq::unversioned::resolver::Resolver for SsrfResolver {
     fn resolve(
         &self,
         uri: &ureq::http::Uri,
         _config: &ureq::config::Config,
         _timeout: ureq::unversioned::transport::NextTimeout,
     ) -> Result<ureq::unversioned::resolver::ResolvedSocketAddrs, ureq::Error> {
-        let _ = uri;
-        VETTED.with(|v| {
-            let vetted = v.borrow();
-            if vetted.is_empty() {
-                return Err(ureq::Error::HostNotFound);
-            }
-            let mut out = ureq::unversioned::resolver::ResolvedSocketAddrs::from_fn(|_| {
-                std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0)
-            });
-            out.truncate(0);
-            let port = uri.port_u16().unwrap_or(match uri.scheme_str() {
-                Some("http") => 80,
-                _ => 443,
-            });
-            for ip in vetted.iter().take(16) {
-                out.push(std::net::SocketAddr::new(*ip, port));
-            }
-            if out.is_empty() {
-                return Err(ureq::Error::HostNotFound);
-            }
-            Ok(out)
-        })
+        use std::net::ToSocketAddrs;
+        let host = uri
+            .host()
+            .map(|h| {
+                h.trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .to_ascii_lowercase()
+            })
+            .unwrap_or_default();
+        let port = uri.port_u16().unwrap_or(match uri.scheme_str() {
+            Some("http") => 80,
+            _ => 443,
+        });
+        let addrs: Vec<std::net::IpAddr> = (host.as_str(), port)
+            .to_socket_addrs()
+            .map_err(|_| ureq::Error::HostNotFound)?
+            .map(|a| a.ip())
+            .collect();
+        if addrs.is_empty() {
+            return Err(ureq::Error::HostNotFound);
+        }
+        if let Err(e) = vet_addrs(&host, &addrs, self.opt_out) {
+            eprintln!("{e}");
+            return Err(ureq::Error::HostNotFound);
+        }
+        let mut out = ureq::unversioned::resolver::ResolvedSocketAddrs::from_fn(|_| {
+            std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0)
+        });
+        for a in addrs.iter().take(16) {
+            out.push(std::net::SocketAddr::new(*a, port));
+        }
+        if out.is_empty() {
+            return Err(ureq::Error::HostNotFound);
+        }
+        Ok(out)
     }
+}
+
+/// Fetch agent whose resolver VETS-AND-PINS in one step: resolution,
+/// the private-range check, and the connection's address list all come
+/// from the same resolver call, so the cora "two separate DNS lookups"
+/// rebinding window no longer exists. Each redirect hop constructs a
+/// fresh agent (re-vetted per hop).
+fn fetch_agent_vetted() -> ureq::Agent {
+    ureq::Agent::with_parts(
+        ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(30)))
+            .max_redirects(0)
+            .build(),
+        ureq::unversioned::transport::DefaultConnector::default(),
+        SsrfResolver {
+            opt_out: ssrf_opt_out(),
+        },
+    )
 }
 
 /// Search-only plumbing (no user URL → no SSRF surface): a 30 s agent
@@ -330,7 +346,7 @@ impl Tool for WebFetchTool {
         // Manual redirect following: every hop re-runs the SSRF guard
         // AND re-pins the resolver to the hop's own vetted addresses
         // (DNS rebinding between hops is the same TOCTOU class).
-        let mut res = fetch_agent_vetted(&url)?
+        let mut res = fetch_agent_vetted()
             .get(&url)
             .call()
             .map_err(|e| format!("web_fetch: {e}"))?;
@@ -346,7 +362,7 @@ impl Tool for WebFetchTool {
                 .map(str::to_string)
                 .ok_or_else(|| format!("web_fetch: {status} redirect without Location"))?;
             url = join_redirect(&url, &location);
-            res = fetch_agent_vetted(&url)?
+            res = fetch_agent_vetted()
                 .get(&url)
                 .call()
                 .map_err(|e| format!("web_fetch: {e}"))?;
