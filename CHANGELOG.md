@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Run ergonomics (#216): `run --prompt-file <path|->`, `--name <alias>`
+  (header-pinned; `tole sessions` shows it, `resume` accepts it), and
+  `--timeout <secs>` wall-clock cap (checkpoint cancel — settles
+  resumably, never dead).
 - Mobile-control guide (#202): docs/mobile-control.md defines the REST
   surface uteke-mobile consumes (sessions, approvals, cancel, cost
   report) with the auth model and cross-repo acceptance; threat model

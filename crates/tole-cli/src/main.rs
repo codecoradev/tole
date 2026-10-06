@@ -32,7 +32,7 @@ use tole_core::read_file::ReadFileTool;
 use tole_core::run_command::RunCommandTool;
 use tole_core::storage::{JsonlStorage, Storage};
 use tole_core::tool::ToolRegistry;
-use tole_core::turn::{resume_turn, run_turn, TurnOutcome, LOOP_TRIP_AFTER};
+use tole_core::turn::{resume_turn, run_turn, run_turn_with_cancel, TurnOutcome, LOOP_TRIP_AFTER};
 #[cfg(feature = "shell-tools")]
 use tole_core::uteke::{UtekeDocumentTool, UtekeRecallTool};
 use tole_core::verify_package::VerifyPackageTool;
@@ -165,8 +165,25 @@ struct Cli {
 enum Command {
     /// Start a new session and run one user turn.
     Run {
-        /// The user prompt for this turn.
-        prompt: String,
+        /// The user prompt for this turn. Omit when --prompt-file is set.
+        prompt: Option<String>,
+
+        /// Read the prompt from a file (`-` = stdin). Mutually exclusive
+        /// with the positional PROMPT (issue #216).
+        #[arg(long = "prompt-file")]
+        prompt_file: Option<String>,
+
+        /// Operator alias stored in the session header — `tole sessions`
+        /// shows it and `resume` accepts it instead of the generated id
+        /// (issue #216).
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Wall-clock cap for the turn, in seconds. Expiry cancels the
+        /// turn at the next checkpoint — it settles resumably, never
+        /// dead (issue #216).
+        #[arg(long)]
+        timeout: Option<u64>,
 
         /// System prompt for this session (highest priority; else
         /// TOLE_SYSTEM_PROMPT env; else none). Pinned in the session
@@ -446,11 +463,35 @@ fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Run {
             prompt,
+            prompt_file,
+            name,
+            timeout,
             system,
             allow_patterns: allow_patterns_in,
             yes,
         } => {
             let allow_patterns = with_trust(allow_patterns_in, &trust_extra);
+            // Prompt resolution (issue #216): exactly one of positional
+            // PROMPT / --prompt-file ('-' = stdin).
+            let prompt = match (prompt, prompt_file.as_deref()) {
+                (Some(p), None) => p,
+                (None, Some("-")) => {
+                    use std::io::Read;
+                    let mut buf = String::new();
+                    std::io::stdin()
+                        .read_to_string(&mut buf)
+                        .context("reading prompt from stdin")?;
+                    buf
+                }
+                (None, Some(path)) => std::fs::read_to_string(path)
+                    .with_context(|| format!("reading prompt file {path}"))?,
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("pass either a positional PROMPT or --prompt-file, not both")
+                }
+                (None, None) => {
+                    anyhow::bail!("missing prompt (positional PROMPT or --prompt-file)")
+                }
+            };
             run_command(
                 &sessions_dir,
                 &prompt,
@@ -458,6 +499,8 @@ fn dispatch(cli: Cli) -> Result<()> {
                 &allow_patterns,
                 yes,
                 &host,
+                name.as_deref(),
+                timeout,
             )
         }
         Command::Resume {
@@ -1412,6 +1455,7 @@ fn apply_skills_in(
     Ok(sections)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_command(
     sessions_dir: &Path,
     prompt: &str,
@@ -1419,6 +1463,8 @@ fn run_command(
     allow_patterns: &[String],
     yes: bool,
     host: &HostConfig,
+    name: Option<&str>,
+    timeout_secs: Option<u64>,
 ) -> Result<()> {
     let cfg = OpenAiConfig::from_env().context(
         "missing provider config: set TOLE_BASE_URL / TOLE_MODEL / TOLE_API_KEY \
@@ -1483,10 +1529,18 @@ fn run_command(
         .or_else(|| Some(build_default_prompt(host.plan_mode)));
     // Skills (issue #161): skill sections append after the base prompt.
     let system_prompt = system_prompt.map(|p| format!("{p}{skill_sections}"));
-    let mut storage =
-        JsonlStorage::create_with(sessions_dir, &session_id, None, system_prompt.as_deref())
-            .with_context(|| format!("creating session {session_id}"))?;
+    let mut storage = JsonlStorage::create_named(
+        sessions_dir,
+        &session_id,
+        None,
+        system_prompt.as_deref(),
+        name,
+    )
+    .with_context(|| format!("creating session {session_id}"))?;
     println!("session: {session_id}");
+    if let Some(alias) = name {
+        println!("name: {alias}");
+    }
     // Task-list tools (issue #198): fresh session → empty state; both
     // tools join the registry (todo_write absent in plan mode via the
     // retain_read_only filter above — registration here is additive).
@@ -1516,7 +1570,26 @@ fn run_command(
     let (raw_prompt, prompt) = (prompt.to_string(), host.inject_memory(prompt));
     #[cfg(not(feature = "shell-tools"))]
     let prompt = prompt.to_string();
-    let outcome = run_turn(&mut storage, &mut provider, &registry, &prompt)?;
+    // Wall-clock cap (issue #216): a timer thread cancels the turn's
+    // token at the deadline; the loop's checkpoints unwind it into a
+    // durable Cancelled — resumable, never dead.
+    let cancel = tole_core::cancel::CancelToken::default();
+    let timer = timeout_secs.map(|secs| {
+        let token = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(secs));
+            token.cancel();
+        })
+    });
+    let outcome = run_turn_with_cancel(&mut storage, &mut provider, &registry, &prompt, &cancel)?;
+    // Join ONLY when the timer fired (cora MAJOR): join otherwise blocks
+    // for the remaining budget after the turn already finished. Detach —
+    // the process exits right after run_command anyway.
+    if timer.is_some() && cancel.is_cancelled() {
+        if let Some(t) = timer {
+            t.join().ok();
+        }
+    }
     // Memory loop, post-session: a settled Final turn leaves a compact
     // summary behind for the next session's recall.
     #[cfg(feature = "shell-tools")]
@@ -1535,10 +1608,44 @@ fn resume_command(
     yes: bool,
     host: &HostConfig,
 ) -> Result<()> {
-    if !valid_session_id(id) {
-        anyhow::bail!("invalid session id {id:?} (allowed: [a-z0-9-], max 64)");
-    }
-    let path = session_path(sessions_dir, id);
+    // Resolve by NAME first (issue #216): an alias from `run --name`
+    // is accepted anywhere an id is; exact ids still win when the file
+    // exists directly.
+    let id = if valid_session_id(id) && session_path(sessions_dir, id).exists() {
+        id.to_string()
+    } else {
+        let mut best: Option<(std::time::SystemTime, String)> = None;
+        for entry in std::fs::read_dir(sessions_dir)
+            .with_context(|| format!("listing {}", sessions_dir.display()))?
+            .flatten()
+        {
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            let Some(stem) = file_name.strip_suffix(".jsonl") else {
+                continue;
+            };
+            if !valid_session_id(stem) {
+                continue;
+            }
+            let Ok(s) = JsonlStorage::open(entry.path()) else {
+                continue;
+            };
+            if s.session_name() == Some(id) {
+                let mtime = entry.metadata().ok().and_then(|mm| mm.modified().ok());
+                match &best {
+                    Some((t, _)) if mtime.map(|mt| mt >= *t) != Some(true) => {}
+                    _ => best = Some((mtime.unwrap_or(std::time::UNIX_EPOCH), stem.to_string())),
+                }
+            }
+        }
+        match best {
+            Some((_, resolved)) => resolved,
+            None => anyhow::bail!(
+                "no session with id or name {id:?} in {}",
+                sessions_dir.display()
+            ),
+        }
+    };
+    let path = session_path(sessions_dir, &id);
     if !path.exists() {
         anyhow::bail!("session {id} not found at {}", path.display());
     }
@@ -1639,13 +1746,13 @@ fn resume_command(
                 wrote,
             } = &outcome
             {
-                host.remember(id, text, answer, *wrote);
+                host.remember(&id, text, answer, *wrote);
             }
             outcome
         }
         _ => resume_turn(&mut storage, &mut provider, &registry)?,
     };
-    report_outcome(id, outcome);
+    report_outcome(&id, outcome);
     Ok(())
 }
 
@@ -1710,7 +1817,9 @@ fn sessions_command(sessions_dir: &Path) -> Result<()> {
     }
     // (epoch_secs, id, pc, seq, turns) — epoch secs first so a plain
     // sort_by_key ascending gives newest-first via Reverse.
-    let mut rows: Vec<(u64, String, String, u64, usize)> = Vec::new();
+    // (epoch_secs, id, pc, seq, turns, name) — epoch secs first so a
+    // plain sort_by_key ascending gives newest-first via Reverse.
+    let mut rows: Vec<(u64, String, String, u64, usize, Option<String>)> = Vec::new();
     for entry in std::fs::read_dir(sessions_dir)?.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
         // strip_suffix, not trim_end_matches: a (weird but possible)
@@ -1746,6 +1855,7 @@ fn sessions_command(sessions_dir: &Path) -> Result<()> {
             format!("{:?}", s.state().pc),
             s.state().seq,
             turns,
+            s.session_name().map(str::to_string),
         ));
     }
     if rows.is_empty() {
@@ -1754,14 +1864,15 @@ fn sessions_command(sessions_dir: &Path) -> Result<()> {
     }
     rows.sort_by_key(|r| std::cmp::Reverse(r.0)); // newest first
     println!(
-        "{:<26} {:<12} {:>5} {:>6}  mtime",
-        "session", "pc", "seq", "turns"
+        "{:<26} {:<18} {:<12} {:>5} {:>6}  mtime",
+        "session", "name", "pc", "seq", "turns"
     );
     for row in &rows {
         let mtime = fmt_mtime(std::time::UNIX_EPOCH + std::time::Duration::from_secs(row.0));
+        let name = row.5.clone().unwrap_or_else(|| "-".to_string());
         println!(
-            "{:<26} {:<12} {:>5} {:>6}  {mtime}",
-            row.1, row.2, row.3, row.4
+            "{:<26} {:<18} {:<12} {:>5} {:>6}  {mtime}",
+            row.1, name, row.2, row.3, row.4
         );
     }
     Ok(())
