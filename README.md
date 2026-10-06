@@ -9,16 +9,21 @@ Durable Rust agent harness: a conversational agent with risk-tiered approval
 gates, a write-once JSONL session log, and a register state machine — resumable
 after crashes, replayable forever.
 
-**Status:** v0.5.0 released — four faces on one durable core: the CLI
-(run / chat / resume / sessions / jobs), `tole mcp` (tool server),
+**Status:** v0.6.0 released; the 0.7.0 train is release-candidate on
+`develop`. Four faces on one durable core: the CLI (run / chat /
+resume / sessions / jobs / **mission**), `tole mcp` (tool server),
 `tole acp` (editor agent), and `tole serve` (REST + multi-session
-MCP-over-HTTP daemon). Also in 0.5.0: the uteke memory loop, the cora
-MCP auto-preset, turn-end stop gates, `verify_package`, and SKILL.md
-support. On `develop` for the 0.6.0 train: `--trust` presets, System
-One decisions, depth-1 child agents, ACP model & approval pickers,
-and cooperative cancellation on every server face (see
-[CHANGELOG.md](CHANGELOG.md) → Unreleased). E9 hardening is closed;
-post-D3 waves live in [docs/epics.md](docs/epics.md).
+MCP-over-HTTP daemon). Identity (owner-approved): a chat-first
+personal assistant WITH a mission mode for autonomous work —
+budgeted turn-chaining (`tole mission --max-steps/--max-minutes/
+--max-tokens/--verify`), durable task-list tools (`todo_write`/
+`todo_read`), cost reports, and remote approvals via the serve face
+(the 0.9.0 mobile track consumes them from a phone). Also shipped on
+this train: ACP intra-turn visibility + true text streaming, ACP
+auto model picker, run ergonomics (`--prompt-file/--name/--timeout`),
+read-only `web_fetch`/`web_search` (SSRF-guarded), and startup
+update notification + `tole upgrade`. See
+[CHANGELOG.md](CHANGELOG.md) and [docs/epics.md](docs/epics.md).
 
 ## Ecosystem position
 
