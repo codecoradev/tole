@@ -212,3 +212,18 @@ denied so a lost connection cannot strand a mission, and every decision
 writes a durable audit register naming the approval id, tool, and
 verdict. The phone/CLI holder is therefore a full approver: treat the
 token as approval authority and scope it accordingly.
+
+### Phone as approval surface (#202)
+
+uteke-mobile consumes the #200 queue: the phone becomes a remote
+approver. The boundary is the serve token — it carries approval
+authority, so device compromise equals write access to the box. Locked
+down accordingly: the token is a revocable secret (rotate = serve
+restart), decisions are one-shot per (session, effect) with expiry to
+denied (a stolen device cannot bank future approvals), every decision
+is audited on the session, and there is no push endpoint in tole — the
+phone pulls, so the attack surface tole exposes is exactly the
+authenticated REST face. Scoped device tokens (per-device, revocable,
+read-only vs approver roles) are the recognized follow-up; until then
+the deployment guidance is a dedicated OS user + minimal
+`--allow`/`--trust` on the serve process.

@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Mobile-control guide (#202): docs/mobile-control.md defines the REST
+  surface uteke-mobile consumes (sessions, approvals, cancel, cost
+  report) with the auth model and cross-repo acceptance; threat model
+  gains the phone-as-approval-surface section.
 - Remote approvals (#200): serve-face Write approvals become a queue —
   `GET /approvals` + `POST /approvals/{id}/decision` (allow = one-shot
   fingerprint + approvals-only resume; deny = recorded verdict), expiry
