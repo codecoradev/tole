@@ -71,6 +71,7 @@ pub mod storage;
 pub mod subprocess;
 pub mod tool;
 pub mod turn;
+pub mod update_check;
 #[cfg(feature = "shell-tools")]
 pub mod uteke;
 pub mod verify_package;

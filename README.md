@@ -108,6 +108,7 @@ trust: `internal` / `read_only`), `--skill <path>` (load a SKILL.md),
 | `TOLE_BASE_URL`, `TOLE_MODEL`, `TOLE_API_KEY` | LLM provider — any OpenAI-compatible endpoint (`OPENAI_*` equivalents read as fallback) |
 | `TOLE_SYSTEM_PROMPT` | default persona when `--system` is absent |
 | `TOLE_MEMORY` | memory loop backend (`uteke`) — same as `--memory uteke` |
+| `TOLE_NO_UPDATE_CHECK` | `1` disables the startup update-check banner (issue #220) |
 | `TOLE_MEMORY_NAMESPACE` | override the loop's namespace (default: `repo-<directory name>`) |
 
 ## Tools

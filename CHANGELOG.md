@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `tole upgrade` + startup update notification (issue #220): a
+  cache-backed (24 h) banner on startup when a newer crates.io
+  release exists (`/releases/latest` redirect primary, API fallback,
+  network failures silent, `TOLE_NO_UPDATE_CHECK=1` opts out), and
+  `tole upgrade [--check] [--yes]` which resolves the latest version
+  from crates.io and re-runs `cargo install tole-cli`, verifying the
+  binary afterwards. Non-cargo binaries get an explicit note.
 - `web_fetch` / `web_search` (#215): read-only internet access — fetch
   is direct HTTPS (512 KB cap, content-type allowlist, HTML→text), search
   probe-gated on `TOLE_WEB_SEARCH_URL` (fleet backend contract). No
