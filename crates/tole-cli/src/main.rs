@@ -13,6 +13,7 @@ use tole_core::approval::AllowlistApprover;
 mod acp;
 #[cfg(feature = "mcp-http")]
 mod mcp_http;
+mod mission;
 #[cfg(feature = "shell-tools")]
 mod serve;
 #[cfg(feature = "shell-tools")]
@@ -177,6 +178,50 @@ enum Command {
         /// only: an equivalent-effect tool such as run_command stays
         /// separately gated, and Destructive tools are never
         /// auto-allowed. Repeatable.
+        #[arg(long = "allow")]
+        allow_patterns: Vec<String>,
+
+        /// Auto-allow every Write call without prompting (heads-up
+        /// mode. Destructive tools still prompt).
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Run an autonomous mission: budgeted turn-chaining toward a goal
+    /// (issue #199). Every chained turn is a normal durable turn —
+    /// crash mid-mission resumes exactly where it stopped; Destructive
+    /// tools stay un-auto-allowable. Termination: the model declares
+    /// MISSION_COMPLETE (and `--verify` exits 0, when set), or a budget
+    /// trips (`--max-steps` / `--max-minutes`), or the verify gate fails
+    /// too many times. A durable summary lands on the session either way.
+    Mission {
+        /// The mission goal, verbatim.
+        goal: String,
+
+        /// Total provider steps across all chained turns (from the
+        /// durable usage ledger).
+        #[arg(long, default_value_t = 48)]
+        max_steps: u64,
+
+        /// Wall-clock cap in minutes.
+        #[arg(long, default_value_t = 15)]
+        max_minutes: u64,
+
+        /// Verification command run after each turn; exit 0 = goal
+        /// achieved (overrides the model's completion marker). Failures
+        /// return to the model with the output; 3 failures settle the
+        /// mission as verify_failed.
+        #[arg(long)]
+        verify: Option<String>,
+
+        /// Per-run timeout of the --verify command, in seconds.
+        #[arg(long, default_value_t = 300)]
+        verify_timeout: u64,
+
+        /// Continue an interrupted mission instead of starting a new one.
+        #[arg(long)]
+        resume: Option<String>,
+
+        /// Same semantics as `run --allow`.
         #[arg(long = "allow")]
         allow_patterns: Vec<String>,
 
@@ -438,6 +483,62 @@ fn dispatch(cli: Cli) -> Result<()> {
                 &allow_patterns,
                 #[cfg(feature = "mcp")]
                 host.plan_mode,
+            )
+        }
+        Command::Mission {
+            goal,
+            max_steps,
+            max_minutes,
+            verify,
+            verify_timeout,
+            resume,
+            allow_patterns: allow_patterns_in,
+            yes,
+        } => {
+            let allow_patterns = with_trust(allow_patterns_in, &trust_extra);
+            if host.plan_mode {
+                anyhow::bail!(
+                    "--plan-mode has no meaning for a mission (missions mutate by definition)"
+                );
+            }
+            #[cfg(feature = "mcp")]
+            check_client_session_flags("mission", &host.skills, host.no_skills, explicit_mcp)?;
+            let sessions_dir = sessions_dir.clone();
+            std::fs::create_dir_all(&sessions_dir)
+                .with_context(|| format!("creating {}", sessions_dir.display()))?;
+            #[cfg(feature = "mcp")]
+            let mcp_cfgs: Vec<tole_core::mcp::McpServerConfig> = host
+                .mcp_server
+                .iter()
+                .map(|s| tole_core::mcp::McpServerConfig::parse(s))
+                .collect::<Result<Vec<_>, String>>()
+                .map_err(anyhow::Error::msg)?;
+            #[cfg(feature = "mcp")]
+            let registry = build_registry(
+                build_approver(&allow_patterns, yes),
+                host.workspace.as_ref(),
+                &mcp_cfgs,
+                host.agents_worktree,
+                &allow_patterns,
+            )?;
+            #[cfg(not(feature = "mcp"))]
+            let registry = build_registry(
+                build_approver(&allow_patterns, yes),
+                host.workspace.as_ref(),
+                host.agents_worktree,
+                &allow_patterns,
+            )?;
+            mission::run_mission(
+                mission::MissionConfig {
+                    goal,
+                    max_steps,
+                    max_minutes,
+                    verify,
+                    verify_timeout_secs: verify_timeout,
+                    resume_id: resume,
+                },
+                registry,
+                &sessions_dir,
             )
         }
         #[cfg(feature = "shell-tools")]
@@ -2032,7 +2133,7 @@ exists with the verify_package tool. Keep answers concise."
 /// appends the read-only instruction to the SAME incumbent text — the
 /// identity/tool-discipline section is shared, so the non-plan default
 /// never drifts from what the replay scorer greps out of this file.
-fn default_prompt_for(plan_mode: bool) -> String {
+pub fn default_prompt_for(plan_mode: bool) -> String {
     let base = default_system_prompt();
     if plan_mode {
         format!(

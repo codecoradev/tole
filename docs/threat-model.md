@@ -188,3 +188,14 @@ write-once session log itself (the tool's result entry is the record; no
 side channel, no file). The threat surface equals any Write tool: prompt
 injection could rewrite the plan, but the list is data, never executed —
 and every revision is auditable in the replay. `todo_read` is ReadOnly.
+
+### Mission mode (#199)
+
+`tole mission` chains normal durable turns autonomously. The risk frame
+is unchanged and deliberate: the same approval gates, risk tiers, and
+write-once audit apply per chained turn — autonomy does not widen the
+boundary. Budgets bound blast radius in time/steps; exhaustion is
+resumable, never a dead session. `--verify` gives the operator a
+machine-checkable completion condition stronger than the model's own
+claim. Destructive tools remain structurally un-auto-allowable in
+missions.
