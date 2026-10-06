@@ -81,6 +81,13 @@ impl GiteaTool {
     ) -> Self {
         let agent = ureq::Agent::config_builder()
             .timeout_global(Some(API_TIMEOUT))
+            // Issue #233 (scan #120): 4xx/5xx must come back as Ok(resp)
+            // so the Gitea error JSON body is readable. In ureq 3,
+            // Error::StatusCode carries ONLY the code — the body is
+            // unreachable from it, which is how every API failure used
+            // to degrade to "no error body". call() still keeps the
+            // Ok/Err split on status.
+            .http_status_as_error(false)
             .build()
             .new_agent();
         Self {
@@ -129,27 +136,25 @@ impl GiteaTool {
         Ok(line)
     }
 
-    /// One request returning `(status, body_json_or_null)` — the ureq-3
-    /// pattern from verify_package: 4xx/5xx arrive as
-    /// `Err(StatusCode(code))` and ARE the answer (Gitea error JSON).
+    /// One request returning `(status, body_json_or_null)`. With
+    /// `http_status_as_error(false)` (issue #233), 4xx/5xx arrive as a
+    /// normal response and the Gitea error JSON is read uniformly for
+    /// success AND failure — `call()` keeps the Ok/Err split on status.
     fn fetch(&self, method: &str, url: &str, body: Option<Value>) -> Result<(u16, Value), String> {
         let auth = format!("token {}", self.token);
         let resp = match (method, body) {
-            ("POST", Some(b)) => match self
+            ("POST", Some(b)) => self
                 .agent
                 .post(url)
                 .header("Authorization", &auth)
                 .send_json(&b)
-            {
-                Ok(r) => r,
-                Err(ureq::Error::StatusCode(code)) => return Ok((code, Value::Null)),
-                Err(e) => return Err(format!("gitea: {e}")),
-            },
-            (_, None) => match self.agent.get(url).header("Authorization", &auth).call() {
-                Ok(r) => r,
-                Err(ureq::Error::StatusCode(code)) => return Ok((code, Value::Null)),
-                Err(e) => return Err(format!("gitea: {e}")),
-            },
+                .map_err(|e| format!("gitea: {e}"))?,
+            (_, None) => self
+                .agent
+                .get(url)
+                .header("Authorization", &auth)
+                .call()
+                .map_err(|e| format!("gitea: {e}"))?,
             (m, _) => return Err(format!("gitea: unsupported method/body mix: {m}")),
         };
         let status = resp.status().as_u16();
@@ -713,5 +718,62 @@ mod tests {
             NotGitea
         ));
         assert!(matches!(gitea_from_remote("not a url"), NotGitea));
+    }
+
+    /// Issue #233 regression: a 4xx/5xx body (Gitea error JSON) must be
+    /// surfaced in the tool error — never degraded to "no error body".
+    /// (ureq 3's Error::StatusCode carries only the code; the fix reads
+    /// error responses as normal responses.)
+    #[test]
+    fn error_response_bodies_are_surfaced() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            use std::io::Read;
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf);
+            let body = r#"{"message":"issue does not exist","url":"http://localhost/swagger"}"#;
+            let resp = format!(
+                "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = std::io::Write::write_all(&mut s, resp.as_bytes());
+        });
+        let t = GiteaTool::new(format!("http://{addr}"), "tok", "acme/widgets");
+        let err = t
+            .execute(json!({"op": "issue_view", "number": 99}))
+            .unwrap_err();
+        assert!(err.contains("HTTP 404"), "{err}");
+        assert!(
+            err.contains("issue does not exist"),
+            "Gitea's error JSON message must surface: {err}"
+        );
+        assert!(!err.contains("no error body"), "{err}");
+    }
+
+    /// Guard against the #233 fix breaking the 2xx path: the body is
+    /// still parsed and returned on success.
+    #[test]
+    fn success_response_still_parses() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            use std::io::Read;
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf);
+            let body = r#"{"number":7,"title":"it works"}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = std::io::Write::write_all(&mut s, resp.as_bytes());
+        });
+        let t = GiteaTool::new(format!("http://{addr}"), "tok", "acme/widgets");
+        let out = t.execute(json!({"op": "issue_view", "number": 7})).unwrap();
+        assert_eq!(out["title"], json!("it works"));
     }
 }
