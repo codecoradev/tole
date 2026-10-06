@@ -585,6 +585,70 @@ pub fn run_session_turn(
     Ok((stop.to_string(), final_text))
 }
 
+/// Approvals-only recovery over the serve face (issue #200): no new
+/// prompt — `resume_turn` settles the parked guarded effect (its
+/// approver consult happens with the one-shot remote approval in
+/// place) and replans to completion. Mirrors the provider/model
+/// construction of [`run_session_turn`]; the memory loop does not
+/// participate (no new user message).
+pub fn resume_session_turn(
+    sessions: SharedSessions,
+    session_id: &str,
+) -> Result<(String, Option<String>), String> {
+    let (storage, registry, system_prompt, busy_guard, cancel) = {
+        let mut sessions = lock_sessions(&sessions);
+        let Some(state) = sessions.map.get_mut(session_id) else {
+            return Err(format!("unknown session: {session_id}"));
+        };
+        {
+            let mut busy = state.busy.lock().expect("busy lock");
+            if *busy {
+                return Err("session is busy running a turn".into());
+            }
+            *busy = true;
+            state.cancel.reset();
+        }
+        (
+            state.storage.clone(),
+            state.registry.clone(),
+            state.system_prompt.clone(),
+            StdArc::clone(&state.busy),
+            state.cancel.clone(),
+        )
+    };
+    let _busy_guard = BusyGuard(busy_guard);
+    let mut storage = storage.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(mut cfg) = tole_core::openai::OpenAiConfig::from_env() else {
+        return Err(
+            "missing provider config: set TOLE_BASE_URL / TOLE_MODEL / TOLE_API_KEY              (or the OPENAI_* equivalents)"
+                .into(),
+        );
+    };
+    if let Some(model) = storage
+        .get_register("fact", "model")
+        .and_then(serde_json::Value::as_str)
+        .filter(|m| !m.trim().is_empty())
+    {
+        cfg.model = model.to_string();
+    }
+    let mut provider =
+        tole_core::openai::OpenAiProvider::new(cfg).with_tool_specs(registry.specs());
+    if let Some(sys) = system_prompt.as_deref() {
+        provider = provider.with_system_prompt(sys);
+    }
+    let outcome = tole_core::turn::resume_turn(&mut *storage, &mut provider, &registry)
+        .map_err(|e| e.to_string())?;
+    let stop = match &outcome {
+        tole_core::turn::TurnOutcome::Final { text, .. } => {
+            Ok((("end_turn".to_string()), Some(text.clone())))
+        }
+        tole_core::turn::TurnOutcome::Cancelled => Ok(("cancelled".to_string(), None)),
+        _ => Ok(("refusal".to_string(), None)),
+    };
+    let _ = cancel;
+    stop
+}
+
 /// Best-effort `owner/name` from a git remote URL, for gh tool targeting.
 pub fn github_repo_from_remote_url(url: &str) -> Option<String> {
     let url = url.trim().trim_end_matches('/');

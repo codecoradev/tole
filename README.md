@@ -130,6 +130,23 @@ trust: `internal` / `read_only`), `--skill <path>` (load a SKILL.md),
 | `mcp_*` (from `--mcp-server`) | Write | server metadata is **never** trusted for risk; approval gate always applies |
 | `todo_write`, `todo_read` | Write / RO | durable mission task list (at most one `in_progress`); state lives in session entries — write results are the record, crash-resume restores the last settled list; covered by `--trust internal` |
 
+## Remote approvals
+
+```bash
+tole serve --token $TOLE_SERVE_TOKEN          # on the box
+tole approvals list --url http://box:7801 --token $TOKEN
+tole approvals allow apr-... --url http://box:7801 --token $TOKEN
+```
+
+When a serve-face session hits a non-preauthorized Write (#200), the
+pending decision becomes a queue entry and the turn settles resumably
+(fail-closed). A remote operator lists and decides: **allow** stores a
+one-shot approval and resumes the session (the replayed effect
+re-consults the gate — exactly once), **deny** records the verdict.
+Entries expire to denied (15 min) so nothing hangs silently; every
+decision lands a durable audit register on the session. MCP/ACP parity
+is a follow-up.
+
 ## Mission mode
 
 ```bash

@@ -59,6 +59,9 @@ const MAX_AUTH_FAILURES: u32 = 10;
 
 struct State {
     sessions: SharedSessions,
+    /// Remote approval queue (issue #200): pending Write decisions from
+    /// every session, decided via /approvals routes.
+    approvals: Arc<tole_cli::approvals::ApprovalQueue>,
     allow_patterns: Vec<String>,
     plan_mode: bool,
     memory: Option<MemoryConfig>,
@@ -84,6 +87,7 @@ pub fn run_serve(cfg: ServeConfig) -> Result<()> {
         .with_context(|| format!("binding {addr} (in use? change --port)"))?;
     let state = Arc::new(State {
         sessions: Arc::new(Mutex::new(Sessions::default())),
+        approvals: tole_cli::approvals::ApprovalQueue::shared(),
         allow_patterns: cfg.allow_patterns.clone(),
         plan_mode: cfg.plan_mode,
         memory: cfg.memory.clone(),
@@ -322,6 +326,58 @@ fn handle_conn(mut stream: TcpStream, state: Arc<State>) {
     respond(&mut stream, status, &payload);
 }
 
+/// Write the decision audit register onto the session's durable log:
+/// via the in-memory handle when present (blocking lock), reopening the
+/// JSONL from disk when the session was evicted. Errors propagate.
+fn write_approval_audit(
+    state: &State,
+    session_id: &str,
+    approval_id: &str,
+    allow: bool,
+    tool: &str,
+) -> Result<(), String> {
+    use tole_core::register::RegisterWrite;
+    use tole_core::storage::{Commit, JsonlStorage, Storage};
+    let register = RegisterWrite::set(
+        "fact",
+        format!("approval_{approval_id}"),
+        json!({
+            "decision": if allow { "allow" } else { "deny" },
+            "tool": tool,
+            "approvalId": approval_id,
+            "decidedAtMs": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+        }),
+    );
+    // In-memory handle first.
+    {
+        let sessions = lock_sessions(&state.sessions);
+        if let Some(st) = sessions.map.get(session_id) {
+            let mut storage = st.storage.lock().unwrap_or_else(|p| p.into_inner());
+            return storage
+                .commit(Commit::new().register(register))
+                .map(|_| ())
+                .map_err(|e| e.to_string());
+        }
+    }
+    // Evicted: reopen the durable file. The sessions dir override is the
+    // daemon's; the file name is the session id (the durable contract).
+    let dir = match &state.sessions_dir {
+        Some(d) => d.clone(),
+        None => std::env::current_dir()
+            .map_err(|e| e.to_string())?
+            .join(".tole/sessions"),
+    };
+    let mut storage =
+        JsonlStorage::open(dir.join(format!("{session_id}.jsonl"))).map_err(|e| e.to_string())?;
+    storage
+        .commit(Commit::new().register(register))
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
 fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_json::Value) {
     match (method, path) {
         ("GET", "/health") => (200, json!({"status": "ok"})),
@@ -348,8 +404,21 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                 .and_then(|v| v.as_str())
                 .unwrap_or(state.workspace_default.as_deref().unwrap_or("."));
             let session_id = tole_cli::session_host::new_session_id("srv");
-            let approver =
-                tole_core::approval::AllowlistApprover::allow_only(state.allow_patterns.clone());
+            // Issue #200: non-preauthorized Writes queue for a remote
+            // decision (deny now, resumable; allow = one-shot replay).
+            // Queue-time storage path (cora MAJOR): an evicted session's
+            // audit fallback must reopen the EXACT durable file — with
+            // no --sessions-dir the log lives under the session's cwd.
+            let storage_dir: std::path::PathBuf = match &state.sessions_dir {
+                Some(d) => d.clone(),
+                None => std::path::Path::new(cwd).join(".tole/sessions"),
+            };
+            let approver = tole_cli::approvals::QueueApprover::new(
+                state.allow_patterns.clone(),
+                Arc::clone(&state.approvals),
+                &session_id,
+                storage_dir.join(format!("{session_id}.jsonl")),
+            );
             match open_session(
                 &session_id,
                 cwd,
@@ -405,6 +474,76 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                     (200, json!({"sessionId": session_id, "workspace": cwd}))
                 }
                 Err(e) => (500, json!({"error": e})),
+            }
+        }
+        // Remote approvals (issue #200): list + decide.
+        ("GET", p) if p == "/approvals" || p.starts_with("/approvals?") => {
+            let session = p.split_once('?').and_then(|(_, q)| {
+                q.split('&')
+                    .find_map(|kv| kv.strip_prefix("session=").map(str::to_string))
+            });
+            let list = state
+                .approvals
+                .list(session.as_deref())
+                .iter()
+                .map(tole_cli::approvals::approval_json)
+                .collect::<Vec<_>>();
+            (200, json!({"approvals": list}))
+        }
+        (method, p)
+            if method == "POST" && (p.starts_with("/approvals/") && p.ends_with("/decision")) =>
+        {
+            let id = p
+                .trim_start_matches("/approvals/")
+                .trim_end_matches("/decision")
+                .to_string();
+            let Ok(req) = serde_json::from_str::<serde_json::Value>(body) else {
+                return (400, json!({"error": "invalid JSON body"}));
+            };
+            let allow = match req.get("decision").and_then(|v| v.as_str()) {
+                Some("allow") => true,
+                Some("deny") => false,
+                _ => return (400, json!({"error": "decision must be 'allow' or 'deny'"})),
+            };
+            let (session_id, tool, status) = match state.approvals.decide(&id, allow) {
+                tole_cli::approvals::DecisionOutcome::Decided {
+                    status,
+                    session_id,
+                    tool,
+                } => (session_id, tool, status),
+                tole_cli::approvals::DecisionOutcome::Unknown => {
+                    return (404, json!({"error": "unknown approval id"}));
+                }
+            };
+            // Durable audit — REQUIRED (cora MAJOR): the decision lands
+            // on the session even when the in-memory handle was evicted
+            // (reopen from disk) and even when a turn holds the storage
+            // lock (block: the audit contract outweighs latency here).
+            // A total failure is a 5xx, never a silent skip.
+            let audit = write_approval_audit(state, &session_id, &id, allow, &tool);
+            if audit.is_err() {
+                return (
+                    500,
+                    json!({"error": "audit write failed — decision NOT recorded;                            the queue entry reflects the verdict but the durable                            trail is incomplete"}),
+                );
+            }
+            if allow {
+                // Approvals-only resume: the replayed guarded effect
+                // consults the approver, the one-shot matches, the tool
+                // executes. Runs off-thread — the turn may take a while.
+                let sessions = Arc::clone(&state.sessions);
+                let sid = session_id.clone();
+                std::thread::spawn(move || {
+                    if let Err(e) = tole_cli::session_host::resume_session_turn(sessions, &sid) {
+                        eprintln!("tole serve: approval resume failed: {e}");
+                    }
+                });
+                (
+                    202,
+                    json!({"id": id, "status": status.as_str(), "resuming": true}),
+                )
+            } else {
+                (200, json!({"id": id, "status": status.as_str()}))
             }
         }
         (method, path) if path.starts_with("/sessions/") => {
