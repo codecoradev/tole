@@ -17,6 +17,7 @@ mod mcp_http;
 mod mission;
 #[cfg(feature = "shell-tools")]
 mod serve;
+mod upgrade;
 #[cfg(feature = "shell-tools")]
 use tole_core::cora_search::CoraSearchTool;
 use tole_core::file_tools::{DeleteFileTool, EditFileTool};
@@ -256,6 +257,16 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
+    /// Check for updates and self-upgrade via cargo (issue #220).
+    Upgrade {
+        /// Only report whether an update is available; do not install.
+        #[arg(long)]
+        check: bool,
+
+        /// Skip the confirmation prompt (CI/automation).
+        #[arg(long)]
+        yes: bool,
+    },
     /// Resume an interrupted session. With an optional
     /// PROMPT, appends it as a new user message and runs one full turn
     /// (issue #55): headless flows can continue a mission without a
@@ -413,6 +424,17 @@ fn main() {
 }
 
 fn dispatch(cli: Cli) -> Result<()> {
+    // Startup update notification (issue #220): banner is best-effort,
+    // cache-backed, and skipped entirely for `tole upgrade` (which does
+    // its own check) and for TOLE_NO_UPDATE_CHECK=1 (checked inside).
+    if !matches!(cli.command, Command::Upgrade { .. }) {
+        if let Some(handle) = tole_core::update_check::check_and_notify() {
+            // Do not join: a hanging network must never delay startup.
+            // Detach — the thread dies with the process, which is fine
+            // for a best-effort banner.
+            drop(handle);
+        }
+    }
     let sessions_dir = PathBuf::from(
         cli.sessions_dir
             .clone()
@@ -502,6 +524,13 @@ fn dispatch(cli: Cli) -> Result<()> {
                 name.as_deref(),
                 timeout,
             )
+        }
+        Command::Upgrade { check, yes } => {
+            let code = upgrade::run(check, yes)?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
         }
         Command::Resume {
             id,
