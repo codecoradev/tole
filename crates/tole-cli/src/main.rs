@@ -11,6 +11,7 @@ use tole_core::approval::AllowlistApprover;
 
 #[cfg(feature = "shell-tools")]
 mod acp;
+use tole_cli::approvals;
 #[cfg(feature = "mcp-http")]
 mod mcp_http;
 mod mission;
@@ -258,6 +259,25 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
+    /// Remote approvals (issue #200): list pending Write-approval
+    /// requests on a `tole serve` instance and allow/deny them. URL
+    /// defaults to TOLE_SERVE_URL or http://127.0.0.1:7801; token to
+    /// TOLE_SERVE_TOKEN.
+    Approvals {
+        /// list | allow | deny
+        action: String,
+
+        /// The approval id (required for allow/deny).
+        id: Option<String>,
+
+        /// Base URL of the serve instance.
+        #[arg(long, default_value = "http://127.0.0.1:7801")]
+        url: String,
+
+        /// Bearer token (defaults to TOLE_SERVE_TOKEN).
+        #[arg(long)]
+        token: Option<String>,
+    },
     /// List sessions in the sessions dir, newest first.
     Sessions,
 
@@ -492,6 +512,17 @@ fn dispatch(cli: Cli) -> Result<()> {
                 #[cfg(feature = "mcp")]
                 host.plan_mode,
             )
+        }
+        Command::Approvals {
+            action,
+            id,
+            url,
+            token,
+        } => {
+            let token = token
+                .or_else(|| std::env::var("TOLE_SERVE_TOKEN").ok())
+                .context("approval decisions need a token (--token or TOLE_SERVE_TOKEN)")?;
+            approvals::cli(&action, id.as_deref(), &url, &token)
         }
         Command::Mission {
             goal,

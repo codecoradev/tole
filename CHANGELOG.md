@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Remote approvals (#200): serve-face Write approvals become a queue —
+  `GET /approvals` + `POST /approvals/{id}/decision` (allow = one-shot
+  fingerprint + approvals-only resume; deny = recorded verdict), expiry
+  to denied (15 min), durable audit registers, and a CLI consumer
+  (`tole approvals list/allow/deny`). MCP/ACP parity follow-up.
 - Mission budget tiers + cost report (#201): `--max-tokens` ceiling joins
   `--max-steps`/`--max-minutes`; conservative defaults with `--trust
   internal` headroom (explicit flags win); a durable cost report (steps,

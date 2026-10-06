@@ -201,3 +201,14 @@ mission is an unaudited one. `--verify` gives the operator a
 machine-checkable completion condition stronger than the model's own
 claim. Destructive tools remain structurally un-auto-allowable in
 missions.
+
+### Remote approver trust boundary (#200)
+
+The `/approvals` decision endpoint is the remote trust boundary: it is
+behind the same bearer-token auth + rate limiter as every serve route,
+and a decision is a one-shot for exactly one queued effect (fingerprint
+of tool + canonical input) — never a blanket allow. Decisions expire to
+denied so a lost connection cannot strand a mission, and every decision
+writes a durable audit register naming the approval id, tool, and
+verdict. The phone/CLI holder is therefore a full approver: treat the
+token as approval authority and scope it accordingly.
