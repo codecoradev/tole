@@ -130,6 +130,23 @@ trust: `internal` / `read_only`), `--skill <path>` (load a SKILL.md),
 | `mcp_*` (from `--mcp-server`) | Write | server metadata is **never** trusted for risk; approval gate always applies |
 | `todo_write`, `todo_read` | Write / RO | durable mission task list (at most one `in_progress`); state lives in session entries — write results are the record, crash-resume restores the last settled list; covered by `--trust internal` |
 
+## Mission mode
+
+```bash
+tole mission "ship the feature" --max-steps 48 --max-minutes 15 \
+  --verify "cargo test" --yes
+```
+
+Autonomous turn-chaining toward a goal (#199): the existing turn
+machinery looped until the model declares `MISSION_COMPLETE` (and
+`--verify` exits 0, when set) or a budget trips (`--max-steps`,
+`--max-minutes`). Every chained turn is a normal durable turn — crash
+mid-mission resumes exactly where it stopped (`tole mission --resume
+<id>`, or plain `tole resume`), cancel works unchanged, Destructive
+tools stay un-auto-allowable, and a durable summary lands on the
+session either way. Plans ride the `todo_write`/`todo_read` tools
+(#198); budget exhaustion settles resumably, never a dead session.
+
 ## Approval gates
 
 Every non-ReadOnly call goes through an `Approver`. `Destructive` tools are

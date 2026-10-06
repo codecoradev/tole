@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `tole mission` (#199): budgeted autonomous turn-chaining toward a goal —
+  `--max-steps` / `--max-minutes` budgets (exhaustion settles resumably),
+  optional `--verify <cmd>` gate (exit 0 = completion; failures return to
+  the model with output, 3 strikes settle `verify_failed`), durable
+  mission summary on the session, `--resume <id>` continuation.
 - `todo_write` / `todo_read` (#198): durable mission task list persisted as
   ordinary session entries — `todo_write` echoes the full list as its result
   (the durable record), state re-hydrates from the transcript on
