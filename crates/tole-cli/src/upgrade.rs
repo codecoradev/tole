@@ -23,8 +23,11 @@ pub fn run(check_only: bool, yes: bool) -> anyhow::Result<i32> {
         tole_core::update_check::latest_on_crates_io().map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let current = tole_core::update_check::current_version_for_upgrade();
-    if latest == current {
-        println!("already up to date ({current})");
+    // Fail-closed semver compare (cora alert): a source build newer
+    // than crates.io's max_version is NOT an upgrade — raw string
+    // equality would call it one (or miss the real thing).
+    if !tole_core::update_check::is_newer_public(&latest, current) {
+        println!("already up to date ({current}; crates.io latest {latest})");
         return Ok(0);
     }
     println!("update available: {current} -> {latest}");

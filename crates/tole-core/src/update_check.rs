@@ -117,6 +117,11 @@ fn parse_semver(v: &str) -> Option<(u64, u64, u64)> {
     Some((major, minor, patch))
 }
 
+/// Public (crates.io vs running binary) for `tole upgrade`.
+pub fn is_newer_public(latest: &str, current: &str) -> bool {
+    is_newer(latest, current)
+}
+
 fn is_newer(latest: &str, current: &str) -> bool {
     match (parse_semver(latest), parse_semver(current)) {
         (Some(l), Some(c)) => l > c,
