@@ -71,6 +71,20 @@ pub(crate) fn parse_model_list(env_val: Option<&str>) -> Vec<String> {
     out
 }
 
+/// Model-list resolution precedence (issue #195): a non-empty
+/// `TOLE_MODELS` wins AS-IS — deterministic, no network, the operator's
+/// explicit override/filter. Empty or unset falls to `probe` (the
+/// provider's `GET /models`); its result is used whatever it is,
+/// including empty (a failed probe is cached by the caller — never
+/// retried per session).
+fn resolve_model_list(env_val: Option<&str>, probe: impl FnOnce() -> Vec<String>) -> Vec<String> {
+    let from_env = parse_model_list(env_val);
+    if !from_env.is_empty() {
+        return from_env;
+    }
+    probe()
+}
+
 /// The full advertised option list: the `TOLE_MODELS` entries plus the
 /// session's current model (prepended when missing — the spec requires
 /// `currentValue` to be one of the options so the picker can render it).
@@ -507,9 +521,47 @@ pub fn run_acp(
     // auto-write while the approver owns the same handles.
     let approval_states: Arc<Mutex<HashMap<String, SessionApprovalState>>> =
         Arc::new(Mutex::new(HashMap::new()));
-    // Advertised model list (issue #176): static for the process
-    // lifetime — env cannot change under a running agent.
-    let models = parse_model_list(std::env::var("TOLE_MODELS").ok().as_deref());
+    // Advertised model list (issues #176/#195): `TOLE_MODELS` wins
+    // as-is; otherwise the provider's `GET /models` is probed ONCE on
+    // first use (lazy — agent spawn stays instant) and cached for the
+    // process lifetime, failures included (one stderr line, no per-
+    // session retry). No provider config → nothing to probe.
+    let env_models_raw = std::env::var("TOLE_MODELS").ok();
+    let probe_cfg = tole_core::openai::OpenAiConfig::from_env();
+    let models_cache: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let model_list = || {
+        resolve_model_list(env_models_raw.as_deref(), || {
+            // Probe at most once per process — failures are cached too,
+            // so a broken gateway costs one stderr line, not one retry
+            // per session.
+            models_cache.get().cloned().unwrap_or_else(|| {
+                let computed = match probe_cfg.as_ref() {
+                    None => Vec::new(),
+                    Some(cfg) => {
+                        match tole_core::openai::fetch_model_ids(&cfg.base_url, &cfg.api_key) {
+                            Ok(list) if !list.is_empty() => list,
+                            Ok(_) => {
+                                eprintln!(
+                                    "tole acp: provider /models returned no ids — set \
+                                         TOLE_MODELS to advertise a model picker"
+                                );
+                                Vec::new()
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "tole acp: {e} — set TOLE_MODELS to advertise a \
+                                         model picker"
+                                );
+                                Vec::new()
+                            }
+                        }
+                    }
+                };
+                let _ = models_cache.set(computed.clone());
+                computed
+            })
+        })
+    };
     let env_model = std::env::var("TOLE_MODEL")
         .ok()
         .or_else(|| std::env::var("OPENAI_MODEL").ok())
@@ -659,7 +711,9 @@ pub fn run_acp(
                             },
                         );
                         let mut result = json!({ "sessionId": session_id });
-                        if let Some(opts) = config_options_for(&current, &models, session_auto) {
+                        if let Some(opts) =
+                            config_options_for(&current, &model_list(), session_auto)
+                        {
                             result["configOptions"] = Value::Array(opts);
                         }
                         reply(&conn, id, result);
@@ -730,7 +784,7 @@ pub fn run_acp(
                     &sessions,
                     &approval_states,
                     &params,
-                    &models,
+                    &model_list(),
                     env_model.as_deref(),
                 );
             }
@@ -966,6 +1020,31 @@ fn reply_error(conn: &Conn, id: Option<Value>, message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_model_list_env_wins_without_probe() {
+        let mut probed = false;
+        let out = resolve_model_list(Some("a, b"), || {
+            probed = true;
+            vec!["z".to_string()]
+        });
+        assert_eq!(out, vec!["a", "b"]);
+        assert!(!probed, "a non-empty TOLE_MODELS must bypass the probe");
+    }
+
+    #[test]
+    fn resolve_model_list_falls_to_probe_when_env_unset_or_empty() {
+        assert_eq!(resolve_model_list(None, || vec!["z".into()]), vec!["z"]);
+        assert_eq!(
+            resolve_model_list(Some("  , "), || vec!["z".into()]),
+            vec!["z"]
+        );
+    }
+
+    #[test]
+    fn resolve_model_list_keeps_empty_probe_result() {
+        assert!(resolve_model_list(None, Vec::new).is_empty());
+    }
 
     #[test]
     fn model_list_unset_or_empty_advertises_nothing() {
