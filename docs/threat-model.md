@@ -227,3 +227,15 @@ authenticated REST face. Scoped device tokens (per-device, revocable,
 read-only vs approver roles) are the recognized follow-up; until then
 the deployment guidance is a dedicated OS user + minimal
 `--allow`/`--trust` on the serve process.
+
+### Web tools (#215)
+
+`web_fetch`/`web_search` are ReadOnly: results enter context as model
+content and are never executed — the exfiltration framing is identical
+to any tool output. Fetch is text-only (no JS, no browser), size-capped
+(512 KB), content-type allowlisted; search requires an explicit
+`TOLE_WEB_SEARCH_URL` backend (probe-first — no keyless scraping). A
+crafted page CAN steer a mission via prompt injection; the mitigation
+is the same as every other untrusted input: tool-result fencing,
+approval gates on anything that matters, and mission budgets bounding
+the blast radius.

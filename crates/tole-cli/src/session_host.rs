@@ -280,6 +280,13 @@ pub fn open_session(
     }
     reg.register(Box::new(JobPollTool::new(workspace_canon.clone())))?;
     reg.register(Box::new(ReadFileTool::new(workspace_canon.clone())))?;
+    // Web tools (issue #215): fetch always (direct HTTPS); search only
+    // when a backend is configured (TOLE_WEB_SEARCH_URL) — probe-first:
+    // no backend, no tool, never a phantom.
+    reg.register(Box::new(tole_core::web::WebFetchTool))?;
+    if tole_core::web::WebSearchTool::from_env().is_some() {
+        reg.register(Box::new(tole_core::web::WebSearchTool::from_env().unwrap()))?;
+    }
     // Plan publishing (issue #196 phase 4): model-facing tool, present
     // only when the transport has a client that renders plans (ACP).
     if let Some(emitter) = plan_emitter {
