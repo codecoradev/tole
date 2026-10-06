@@ -28,6 +28,12 @@ pub struct SessionState {
     pub first_prompt_done: StdArc<Mutex<bool>>,
     pub busy: StdArc<Mutex<bool>>,
     /// Cancellation checkpoint (issue #178): the transport sets it on
+    /// Per-session tool-card id counter (issue #196; cora CI on PR
+    /// #203): observer ids must keep incrementing ACROSS turns — a
+    /// per-turn counter would re-emit `tool-1` on the second prompt and
+    /// hosts would correlate the completion onto the previous turn's
+    /// stale card.
+    pub tool_ids: StdArc<Mutex<u64>>,
     /// client cancel (ACP `session/cancel`); the turn loop checks it
     /// between steps. `serve` never sets it — REST behavior unchanged.
     pub cancel: tole_core::cancel::CancelToken,
@@ -48,6 +54,100 @@ pub struct Sessions {
 }
 
 pub type SharedSessions = StdArc<Mutex<Sessions>>;
+
+/// Callback publishing a plan payload to the session's client (issue
+/// #196 phase 4). ACP wires a closure sending the standard `plan`
+/// session/update (Termul's PlanPanel renders it, full-replace); the
+/// serve/MCP faces pass None — no UI to render plans there.
+pub type PlanEmitter = StdArc<dyn Fn(&serde_json::Value) + Send + Sync>;
+
+/// The model-facing `update_plan` tool (issue #196 phase 4): publishes
+/// the execution plan to the host's plan panel. Structurally
+/// ReadOnly — it mutates nothing durable and has no side effects
+/// beyond the notification. Validation is strict-but-lenient: required
+/// `content`, enum-checked `priority`/`status` with spec defaults, so
+/// the model self-corrects from the error text on malformed input.
+pub struct UpdatePlanTool {
+    emitter: PlanEmitter,
+}
+
+impl UpdatePlanTool {
+    pub fn new(emitter: PlanEmitter) -> Self {
+        Self { emitter }
+    }
+}
+
+impl tole_core::tool::Tool for UpdatePlanTool {
+    fn name(&self) -> &str {
+        "update_plan"
+    }
+    fn risk(&self) -> tole_core::tool::Risk {
+        tole_core::tool::Risk::ReadOnly
+    }
+    fn describe(&self, _input: &serde_json::Value) -> String {
+        "publish the execution plan to the user's plan panel".into()
+    }
+    fn spec(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "entries": {
+                    "type": "array",
+                    "description": "The FULL plan, replacing any previous one",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "content": {"type": "string"},
+                            "priority": {"enum": ["high", "medium", "low"]},
+                            "status": {"enum": ["pending", "in_progress", "completed"]}
+                        },
+                        "required": ["content"]
+                    }
+                }
+            },
+            "required": ["entries"]
+        }))
+    }
+    fn execute(&self, input: serde_json::Value) -> Result<serde_json::Value, String> {
+        let entries = normalize_plan(&input)?;
+        (self.emitter)(&entries);
+        Ok(serde_json::json!({
+            "ok": true,
+            "entries": entries.as_array().map(|a| a.len()).unwrap_or(0)
+        }))
+    }
+}
+
+/// Validate + normalize plan entries into the ACP `plan` update shape.
+fn normalize_plan(input: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let arr = input["entries"]
+        .as_array()
+        .ok_or("update_plan: 'entries' (array) is required")?;
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    for e in arr {
+        let content = e["content"]
+            .as_str()
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .ok_or("update_plan: each entry needs a non-empty 'content' string")?;
+        let priority = e["priority"].as_str().unwrap_or("medium");
+        if !matches!(priority, "high" | "medium" | "low") {
+            return Err(format!(
+                "update_plan: invalid priority '{priority}' (high | medium | low)"
+            ));
+        }
+        let status = e["status"].as_str().unwrap_or("pending");
+        if !matches!(status, "pending" | "in_progress" | "completed") {
+            return Err(format!(
+                "update_plan: invalid status '{status}' (pending | in_progress | completed)"
+            ));
+        }
+        out.push(serde_json::json!({
+            "content": content, "priority": priority, "status": status
+        }));
+    }
+    Ok(serde_json::Value::Array(out))
+}
 
 /// Poisoning-tolerant lock: one panicking turn must not brick the whole
 /// server (CodeCora scan finding — mutex poisoning).
@@ -111,6 +211,7 @@ pub fn open_session(
     turnend: Vec<String>,
     parent_allows: Vec<String>,
     cancel: tole_core::cancel::CancelToken,
+    plan_emitter: Option<PlanEmitter>,
 ) -> Result<SessionState, String> {
     let workspace = PathBuf::from(cwd);
     let workspace_canon = workspace
@@ -179,6 +280,11 @@ pub fn open_session(
     }
     reg.register(Box::new(JobPollTool::new(workspace_canon.clone())))?;
     reg.register(Box::new(ReadFileTool::new(workspace_canon.clone())))?;
+    // Plan publishing (issue #196 phase 4): model-facing tool, present
+    // only when the transport has a client that renders plans (ACP).
+    if let Some(emitter) = plan_emitter {
+        reg.register(Box::new(UpdatePlanTool::new(emitter)))?;
+    }
     // systemone_decide (#172): probe-gated on SYSTEMONE_API_KEY.
     if let Some(t) = tole_core::systemone::SystemOneTool::from_env() {
         reg.register(Box::new(t))?;
@@ -234,6 +340,7 @@ pub fn open_session(
         first_prompt_done: StdArc::new(Mutex::new(loading)),
         busy: StdArc::new(Mutex::new(false)),
         cancel,
+        tool_ids: StdArc::new(Mutex::new(0)),
     })
 }
 
@@ -471,5 +578,46 @@ pub fn github_repo_from_remote_url(url: &str) -> Option<String> {
         Some(format!("{owner}/{name}"))
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod plan_tests {
+    use super::*;
+
+    #[test]
+    fn normalize_plan_validates_enums_and_defaults() {
+        let plan = normalize_plan(&serde_json::json!({
+            "entries": [
+                {"content": "step one", "status": "in_progress"},
+                {"content": "step two", "priority": "high"},
+            ]
+        }))
+        .unwrap();
+        assert_eq!(
+            plan,
+            serde_json::json!([
+                {"content": "step one", "priority": "medium", "status": "in_progress"},
+                {"content": "step two", "priority": "high", "status": "pending"},
+            ])
+        );
+    }
+
+    #[test]
+    fn normalize_plan_rejects_malformed_input_loudly() {
+        // Missing array.
+        assert!(normalize_plan(&serde_json::json!({})).is_err());
+        // Empty content.
+        assert!(normalize_plan(&serde_json::json!({"entries": [{"content": " "}]})).is_err());
+        // Out-of-enum values are refused, not silently coerced — the
+        // model sees the error text and self-corrects.
+        assert!(normalize_plan(
+            &serde_json::json!({"entries": [{"content": "x", "priority": "urgent"}]})
+        )
+        .is_err());
+        assert!(normalize_plan(
+            &serde_json::json!({"entries": [{"content": "x", "status": "done"}]})
+        )
+        .is_err());
     }
 }

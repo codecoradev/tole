@@ -746,6 +746,25 @@ pub fn run_acp(
                 .with_auto_write(auto_write)
                 .with_shared_patterns(Arc::clone(&patterns))
                 .with_shared_auto_write(Arc::clone(&session_auto_write));
+                // Plan publishing (issue #196 phase 4): ACP clients
+                // render the standard `plan` session/update (Termul's
+                // PlanPanel, full-replace semantics).
+                let plan_emitter: tole_cli::session_host::PlanEmitter = {
+                    let conn = conn.clone();
+                    let sid = session_id.clone();
+                    Arc::new(move |entries| {
+                        conn.send_notification(
+                            "session/update",
+                            json!({
+                                "sessionId": sid,
+                                "update": {
+                                    "sessionUpdate": "plan",
+                                    "entries": entries,
+                                }
+                            }),
+                        );
+                    })
+                };
                 match open_session(
                     &session_id,
                     &cwd,
@@ -757,6 +776,7 @@ pub fn run_acp(
                     turnend.clone(),
                     allow_patterns.to_vec(),
                     cancel,
+                    Some(plan_emitter),
                 ) {
                     Ok(state) => {
                         // Insert + busy re-check in ONE critical section:
@@ -841,11 +861,22 @@ pub fn run_acp(
                 let conn = conn.clone();
                 let sessions = sessions.clone();
                 let session_id_clone = session_id.clone();
+                // The observer's id counter lives on the SESSION (cora
+                // CI on #203): ids keep incrementing across turns so a
+                // completion can never correlate onto a stale card.
+                let tool_ids = {
+                    let sessions = lock_sessions(&sessions);
+                    sessions
+                        .map
+                        .get(&session_id)
+                        .map(|st| st.tool_ids.clone())
+                        .unwrap_or_default()
+                };
                 std::thread::spawn(move || {
                     let observer = AcpObserver {
                         conn: conn.clone(),
                         session_id: session_id_clone.clone(),
-                        counter: Arc::new(Mutex::new(0)),
+                        counter: tool_ids,
                         current: Mutex::new(None),
                     };
                     match run_session_turn(

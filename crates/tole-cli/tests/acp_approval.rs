@@ -255,11 +255,21 @@ fn spawn_mock() -> String {
                         ("victim.txt", "bye")
                     } else if last_user.contains("SECOND_WRITE") {
                         ("mission-2.txt", "two")
+                    } else if last_user.contains("PLAN_MISSION") {
+                        ("plan.txt", "planned")
                     } else {
                         ("mission-1.txt", "one")
                     };
                     let (name, args) = if last_user.contains("DELETE_MISSION") {
                         ("delete_file", json!({"path": path}))
+                    } else if last_user.contains("PLAN_MISSION") {
+                        (
+                            "update_plan",
+                            json!({"entries": [
+                                {"content": "read the spec", "status": "completed"},
+                                {"content": "write the plan", "status": "in_progress"},
+                            ]}),
+                        )
                     } else {
                         ("write_file", json!({"path": path, "content": content}))
                     };
@@ -531,4 +541,41 @@ fn observer_streams_thought_and_tool_cards() {
         .unwrap();
     let card_idx = kinds.iter().position(|k| *k == "tool_call").unwrap();
     assert!(thought_idx < card_idx, "thought first, action after");
+}
+
+/// Issue #196 phase 4, end-to-end: the model's update_plan call reaches
+/// the host as a standard `plan` session/update (Termul PlanPanel
+/// shape), with validated/normalized entries.
+#[test]
+fn plan_updates_reach_the_host() {
+    let env_pairs = provider_env().1;
+    let env: Vec<(&str, &str)> = env_pairs
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let acp = AcpProcess::spawn_with(&env, Policy::AllowOnce);
+    acp.initialize();
+    let cwd = temp_cwd("plan");
+    let sid = acp.new_session(2, &cwd)["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    acp.send(&json!({
+        "jsonrpc": "2.0", "id": 3, "method": "session/set_config_option",
+        "params": {"sessionId": sid, "configId": "approval", "value": "auto"}
+    }));
+    let _ = acp.wait_response(3, Duration::from_secs(20));
+
+    assert_eq!(acp.prompt(4, &sid, "PLAN_MISSION plan it"), "end_turn");
+
+    let updates = acp.updates.lock().unwrap().clone();
+    let plan = updates
+        .iter()
+        .find(|u| u["sessionUpdate"] == "plan")
+        .expect("a plan update must reach the host");
+    let entries = plan["entries"].as_array().expect("entries array");
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0]["content"], "read the spec");
+    assert_eq!(entries[0]["status"], "completed");
+    assert_eq!(entries[1]["priority"], "medium", "spec default applied");
 }

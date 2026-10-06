@@ -363,6 +363,8 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                 // No REST cancel endpoint today (#178): a never-fired
                 // token keeps serve behavior unchanged.
                 tole_core::cancel::CancelToken::default(),
+                // No plan UI on the REST face.
+                None,
             ) {
                 Ok(session_state) => {
                     {

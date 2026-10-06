@@ -158,6 +158,7 @@ impl Tool for SessionNewTool {
             self.0.turnend.clone(),
             self.0.allow_patterns.clone(),
             tole_core::cancel::CancelToken::default(),
+            None,
         )?;
         {
             // Cap + eviction, mirroring the REST transport (CodeCora:
