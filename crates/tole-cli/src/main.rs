@@ -213,6 +213,10 @@ enum Command {
         #[arg(long)]
         verify: Option<String>,
 
+        /// Per-run timeout of the --verify command, in seconds.
+        #[arg(long, default_value_t = 300)]
+        verify_timeout: u64,
+
         /// Continue an interrupted mission instead of starting a new one.
         #[arg(long)]
         resume: Option<String>,
@@ -486,6 +490,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             max_steps,
             max_minutes,
             verify,
+            verify_timeout,
             resume,
             allow_patterns: allow_patterns_in,
             yes,
@@ -529,6 +534,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                     max_steps,
                     max_minutes,
                     verify,
+                    verify_timeout_secs: verify_timeout,
                     resume_id: resume,
                 },
                 registry,

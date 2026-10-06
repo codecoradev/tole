@@ -38,9 +38,6 @@ pub const MISSION_COMPLETE_MARKER: &str = "MISSION_COMPLETE";
 /// failure's output in context before the cap trips.
 pub const VERIFY_FAILURE_CAP: u32 = 3;
 
-/// Per-run timeout of the `--verify` command.
-const VERIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
 /// Resolved mission parameters.
 pub struct MissionConfig {
     /// The goal, verbatim from the operator.
@@ -53,6 +50,9 @@ pub struct MissionConfig {
     pub verify: Option<String>,
     /// Continue an interrupted mission instead of starting a new one.
     pub resume_id: Option<String>,
+    /// Per-run timeout of the `--verify` command (seconds). Default 300
+    /// — `cargo test`-class suites are the advertised use.
+    pub verify_timeout_secs: u64,
 }
 
 /// The mission addendum appended to the default system prompt.
@@ -80,13 +80,17 @@ fn mission_prompt(goal: &str, verify: Option<&str>) -> String {
     p
 }
 
-/// Run the `--verify` command (sh -c, 30 s timeout). Returns
-/// Ok(()) on exit-0, Err(output tail) otherwise.
-fn run_verify(cmd: &str) -> Result<(), String> {
+/// Run the `--verify` command (sh -c, operator-budgeted timeout).
+/// Returns Ok(()) on exit-0, Err(output tail) otherwise.
+fn run_verify(cmd: &str, timeout: std::time::Duration) -> Result<(), String> {
     let mut c = std::process::Command::new("sh");
     c.arg("-c").arg(cmd);
-    let out = run_with_timeout(&mut c, VERIFY_TIMEOUT)
-        .map_err(|e| format!("verify command failed to run: {e}"))?;
+    let out = run_with_timeout(&mut c, timeout).map_err(|_| {
+        format!(
+            "verify command timed out after {}s (raise --verify-timeout)",
+            timeout.as_secs()
+        )
+    })?;
     if out.status.success() {
         return Ok(());
     }
@@ -221,7 +225,10 @@ pub fn run_mission(
                     // turns — a pass without the marker keeps the mission
                     // going (the model finishes remaining work), a fail
                     // always returns the output to the model.
-                    Some(cmd) => match run_verify(cmd) {
+                    Some(cmd) => match run_verify(
+                        cmd,
+                        std::time::Duration::from_secs(cfg.verify_timeout_secs),
+                    ) {
                         Ok(()) => {
                             if declares {
                                 status = "complete";
