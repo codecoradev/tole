@@ -39,6 +39,15 @@ pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     /// Risk classification; the loop auto-executes `ReadOnly` only.
     fn risk(&self) -> Risk;
+    /// Poll-style classification (issue #231): poll tools may repeat
+    /// identical calls for the whole duration of a detached job — the
+    /// turn loop grants them the dedicated poll budget
+    /// (`POLL_LOOP_TRIP_AFTER`) instead of consuming `MAX_STEPS`, and
+    /// raises their loop guard accordingly. Default false; the built-in
+    /// poll tools (`job_poll`, `agent_poll`) opt in.
+    fn is_poll(&self) -> bool {
+        false
+    }
     /// One-line human summary of what this call will do, shown in
     /// approval prompts (E6). Default: tool name + risk.
     fn describe(&self, _input: &Value) -> String {

@@ -781,6 +781,9 @@ fn loop_guard_exempts_poll_tools_but_trips_eventually() {
         fn risk(&self) -> Risk {
             Risk::ReadOnly
         }
+        fn is_poll(&self) -> bool {
+            true
+        }
         fn describe(&self, _i: &Value) -> String {
             "poll".into()
         }
@@ -1678,4 +1681,92 @@ fn observer_absent_changes_nothing() {
     let reg = ToolRegistry::new();
     let out = run_turn(&mut s, &mut p, &reg, "hi").unwrap();
     assert!(matches!(out, TurnOutcome::Final { .. }));
+}
+
+// ---------------------------------------------------------------------------
+// Issue #231: dual budgets — polls don't consume MAX_STEPS
+// ---------------------------------------------------------------------------
+
+/// Regression (issue #231, scan #97): 40 identical poll calls used to
+/// die at step 32 with BudgetExhausted (dead POLL_LOOP_TRIP_AFTER=120).
+/// Now poll steps draw from their own budget and the mission completes.
+#[test]
+fn polls_do_not_consume_the_model_step_budget() {
+    struct FakePoll;
+    impl Tool for FakePoll {
+        fn name(&self) -> &str {
+            "job_poll"
+        }
+        fn risk(&self) -> Risk {
+            Risk::ReadOnly
+        }
+        fn is_poll(&self) -> bool {
+            true
+        }
+        fn execute(&self, _i: Value) -> Result<Value, String> {
+            Ok(json!({"running": true}))
+        }
+    }
+    let dir = tmpdir("poll-over-32");
+    let mut s = JsonlStorage::create(&dir, "poll-over-32", None).unwrap();
+    let mut reg = ToolRegistry::new();
+    reg.register(Box::new(FakePoll)).unwrap();
+    let mut script = Vec::new();
+    for _ in 0..40 {
+        script.push(ProviderOutput::ToolCall {
+            tool: "job_poll".into(),
+            input: json!({"job": "j-1"}),
+        });
+    }
+    script.push(ProviderOutput::Final {
+        text: "done".into(),
+    });
+    let mut p = MockProvider::scripted(script);
+    let out = run_turn(&mut s, &mut p, &reg, "wait for the long job").unwrap();
+    assert!(
+        matches!(out, TurnOutcome::Final { .. }),
+        "40 polls must fit the turn (old code died at 32): {out:?}"
+    );
+}
+
+/// The trait-driven classification the docs always promised (issue
+/// #231, scan #98): a NEW poll tool opts in via `Tool::is_poll()` and
+/// immediately gets the poll guard ceiling — no name list to extend.
+#[test]
+fn new_poll_tool_opts_in_via_trait_not_name() {
+    struct RenderPoll;
+    impl Tool for RenderPoll {
+        fn name(&self) -> &str {
+            "render_poll"
+        }
+        fn risk(&self) -> Risk {
+            Risk::ReadOnly
+        }
+        fn is_poll(&self) -> bool {
+            true
+        }
+        fn execute(&self, _i: Value) -> Result<Value, String> {
+            Ok(json!({"status": "rendering"}))
+        }
+    }
+    let dir = tmpdir("render-poll");
+    let mut s = JsonlStorage::create(&dir, "render-poll", None).unwrap();
+    let mut reg = ToolRegistry::new();
+    reg.register(Box::new(RenderPoll)).unwrap();
+    let mut script = Vec::new();
+    for _ in 0..6 {
+        script.push(ProviderOutput::ToolCall {
+            tool: "render_poll".into(),
+            input: json!({"id": "r-1"}),
+        });
+    }
+    script.push(ProviderOutput::Final {
+        text: "done".into(),
+    });
+    let mut p = MockProvider::scripted(script);
+    let out = run_turn(&mut s, &mut p, &reg, "wait for render").unwrap();
+    assert!(
+        matches!(out, TurnOutcome::Final { .. }),
+        "6 identical render_poll calls must not trip LOOP_TRIP_AFTER: {out:?}"
+    );
 }
