@@ -27,9 +27,24 @@ pub struct TodoState {
 }
 
 impl TodoState {
-    /// Shared handle for the pair of tools.
-    pub fn shared() -> Arc<Self> {
+    /// Fresh, fully independent state for ONE session or mission. Every
+    /// session host owns its own instance — todo state is per-session,
+    /// never process-global (issue #226).
+    pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// Deprecated alias for [`TodoState::new`]. The state was never a
+    /// process-global singleton — every call already returned a fresh
+    /// instance — but the name kept inviting that misreading (the
+    /// 0.7.0 pre-tag scan filed it as a cross-session leak, issue
+    /// #226). Use [`TodoState::new`].
+    #[deprecated(
+        since = "0.7.0",
+        note = "`shared` was never a global singleton; use TodoState::new() (issue #226)"
+    )]
+    pub fn shared() -> Arc<Self> {
+        Self::new()
     }
 
     /// Seed from a session transcript: pair INTENT entries
@@ -215,7 +230,7 @@ mod tests {
     use super::*;
 
     fn tool_pair() -> (TodoWriteTool, TodoReadTool, Arc<TodoState>) {
-        let state = TodoState::shared();
+        let state = TodoState::new();
         (
             TodoWriteTool::new(Arc::clone(&state)),
             TodoReadTool::new(Arc::clone(&state)),
@@ -282,7 +297,7 @@ mod tests {
     /// last one, and a settlement from another tool never pollutes it.
     #[test]
     fn hydrate_folds_settled_write_results_in_order() {
-        let state = TodoState::shared();
+        let state = TodoState::new();
         let entry = |id: &str, parent: Option<&str>, kind: &'static str, payload: Value| {
             crate::entry::Entry {
                 id: id.to_string(),
@@ -342,5 +357,36 @@ mod tests {
         assert_eq!(list.len(), 2);
         assert_eq!(list[0]["status"], "completed");
         assert_eq!(list[1]["id"], "t2");
+    }
+
+    /// Issue #226 regression: todo state is PER-SESSION. Each host
+    /// (`tole serve`/ACP open_session, mission, run/chat) builds its own
+    /// instance via `TodoState::new()`; a write in one session's state
+    /// must be invisible to another session's, and re-hydrating a
+    /// session from its own (empty) transcript must not resurrect
+    /// another instance's list.
+    #[test]
+    fn state_instances_are_independent_per_session() {
+        let session_a = TodoState::new();
+        let session_b = TodoState::new();
+
+        let write_a = TodoWriteTool::new(Arc::clone(&session_a));
+        let read_b = TodoReadTool::new(Arc::clone(&session_b));
+
+        write_a
+            .execute(json!({"todos": [
+                {"id": "a1", "content": "a's private task", "status": "in_progress"}
+            ]}))
+            .unwrap();
+
+        // B folds only B's own transcript (empty here): A's list must
+        // never bleed in.
+        session_b.hydrate(&[]);
+        let seen = read_b.execute(json!({})).unwrap();
+        assert_eq!(
+            seen["todos"].as_array().unwrap().len(),
+            0,
+            "session B must not observe session A's todo list"
+        );
     }
 }

@@ -221,7 +221,7 @@ pub fn run_mission(
     };
     // Task-list tools (#198): hydrated from the transcript on resume.
     {
-        let todo_state = tole_core::todo::TodoState::shared();
+        let todo_state = tole_core::todo::TodoState::new();
         todo_state.hydrate(storage.entries());
         registry
             .register(Box::new(tole_core::todo::TodoReadTool::new(

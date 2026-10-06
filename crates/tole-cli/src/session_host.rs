@@ -344,7 +344,7 @@ pub fn open_session(
     // todo_write outputs), so crash-resume restores the last list.
     // todo_read is ReadOnly (plan-mode safe); todo_write joins the other
     // Write tools in being absent under --plan-mode.
-    let todo_state = tole_core::todo::TodoState::shared();
+    let todo_state = tole_core::todo::TodoState::new();
     todo_state.hydrate(storage.entries());
     reg.register(Box::new(tole_core::todo::TodoReadTool::new(StdArc::clone(
         &todo_state,
