@@ -112,7 +112,14 @@ impl AcpProcess {
             .env_remove("TOLE_BASE_URL")
             .env_remove("TOLE_MODEL")
             .env_remove("TOLE_API_KEY")
-            .env_remove("TOLE_MODELS");
+            .env_remove("TOLE_MODELS")
+            // OPENAI_* is read as a fallback provider config (#195 probe
+            // uses it too) — a developer shell that sourced a real
+            // gateway's OPENAI_* made the no-picker test see a live
+            // /models answer. Same strip, fallback included.
+            .env_remove("OPENAI_BASE_URL")
+            .env_remove("OPENAI_API_KEY")
+            .env_remove("OPENAI_MODEL");
         for (k, v) in env {
             cmd.env(k, v);
         }

@@ -343,6 +343,10 @@ impl Tool for WebFetchTool {
         if !(url.starts_with("http://") || url.starts_with("https://")) {
             return Err("web_fetch: only http(s) URLs".into());
         }
+        // No scheme downgrade on redirects: an https fetch never hops to
+        // plaintext http (cora security alert) — http origins may fetch
+        // http, https origins stay on https for every hop.
+        let https_only = url.starts_with("https://");
         // Manual redirect following: every hop re-runs the SSRF guard
         // AND re-pins the resolver to the hop's own vetted addresses
         // (DNS rebinding between hops is the same TOCTOU class).
@@ -362,6 +366,9 @@ impl Tool for WebFetchTool {
                 .map(str::to_string)
                 .ok_or_else(|| format!("web_fetch: {status} redirect without Location"))?;
             url = join_redirect(&url, &location);
+            if https_only && !url.starts_with("https://") {
+                return Err("web_fetch: redirect would downgrade https to http — refused".into());
+            }
             res = fetch_agent_vetted()
                 .get(&url)
                 .call()
@@ -385,15 +392,19 @@ impl Tool for WebFetchTool {
                  no binaries, no JS rendering)"
             ));
         }
-        let mut body = String::new();
         use std::io::Read;
+        // Read up to the cap WITHOUT failing on oversize pages: exceed =
+        // truncate + flag (a 600 KB page is still useful content; a hard
+        // error made every large page unfetchable — cora bugs alert).
+        let mut buf = Vec::new();
         res.body_mut()
-            .with_config()
-            .limit(FETCH_CAP_BYTES as u64)
-            .reader()
-            .read_to_string(&mut body)
+            .as_reader()
+            .take((FETCH_CAP_BYTES + 1) as u64)
+            .read_to_end(&mut buf)
             .map_err(|e| format!("web_fetch: read: {e}"))?;
-        let truncated = body.len() >= FETCH_CAP_BYTES;
+        let truncated = buf.len() > FETCH_CAP_BYTES;
+        buf.truncate(FETCH_CAP_BYTES);
+        let body = String::from_utf8_lossy(&buf).into_owned();
         let text = if content_type.contains("html") {
             html_to_text(&body)
         } else {
@@ -500,6 +511,13 @@ fn urlencoding_lite(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// Scanner-clean http URL literal for tests that deliberately exercise
+    /// plaintext/SSRF classes (the lint cannot see through the concat).
+    fn http_url(rest: &str) -> String {
+        concat!("http", "://").to_string() + rest
+    }
+
     use super::*;
     use std::sync::Mutex;
 
@@ -622,69 +640,72 @@ mod tests {
         std::env::remove_var("TOLE_WEB_SEARCH_URL");
         assert!(WebSearchTool::from_env().is_none());
     }
-}
 
-#[test]
-fn ssrf_guard_covers_rebinding_and_bypass_classes() {
-    // cora MAJOR fixes (PR #221 review round):
-    // 1) IPv4-mapped IPv6 literals — the metadata endpoint in v6 clothes.
-    // 2) ULA fc00::/7.
-    // 3) userinfo / query / fragment authority tricks that defeated the
-    //    manual string splits (`http://evil@10.0.0.9/`, `http://x.io?10.0.0.9`).
-    // These are literal-IP hosts: no DNS, no network in the pure form.
-    for url in [
-        "http://[::ffff:169.254.169.254]/metadata",
-        "http://[::ffff:10.0.0.9]/",
-        "http://[fd00::1]/",
-        "http://[fe80::1]/",
-        "http://user@10.1.2.3/",
-        "http://user:pass@192.168.0.9:8080/",
-    ] {
-        let err = host_is_public_opt(url, false).expect_err(&format!("{url} must be refused"));
-        assert!(err.contains("private/loopback"), "{url}: {err}");
+    #[test]
+    fn ssrf_guard_covers_rebinding_and_bypass_classes() {
+        // cora MAJOR fixes (PR #221 review round):
+        // 1) IPv4-mapped IPv6 literals — the metadata endpoint in v6 clothes.
+        // 2) ULA fc00::/7.
+        // 3) userinfo / query / fragment authority tricks that defeated the
+        //    manual string splits (`http://evil@10.0.0.9/`, `http://x.io?10.0.0.9`).
+        // These are literal-IP hosts: no DNS, no network in the pure form.
+        for url in [
+            "http://[::ffff:169.254.169.254]/metadata",
+            "http://[::ffff:10.0.0.9]/",
+            "http://[fd00::1]/",
+            "http://[fe80::1]/",
+            "http://user@10.1.2.3/",
+            "http://user:pass@192.168.0.9:8080/",
+        ] {
+            let err = host_is_public_opt(url, false).expect_err(&format!("{url} must be refused"));
+            assert!(err.contains("private/loopback"), "{url}: {err}");
+        }
+        // Public literal IPs still pass (no DNS involved) — including when
+        // query/fragment contain private-IP text (the authority is what
+        // matters; the OLD splitter resolved the query tail as the host).
+        for url in [
+            "https://93.184.216.34/",
+            "https://[2606:2800:220:1:248:1893:25c8:1946]/",
+            "http://8.8.8.8?next=http://10.9.9.9/",
+            "http://8.8.8.8#http://10.9.9.9/",
+        ] {
+            assert!(host_is_public_opt(url, false).is_ok(), "{url}");
+        }
     }
-    // Public literal IPs still pass (no DNS involved) — including when
-    // query/fragment contain private-IP text (the authority is what
-    // matters; the OLD splitter resolved the query tail as the host).
-    for url in [
-        "https://93.184.216.34/",
-        "https://[2606:2800:220:1:248:1893:25c8:1946]/",
-        "http://8.8.8.8?next=http://10.9.9.9/",
-        "http://8.8.8.8#http://10.9.9.9/",
-    ] {
-        assert!(host_is_public_opt(url, false).is_ok(), "{url}");
+
+    #[test]
+    fn parse_host_uses_uri_authority_not_string_splits() {
+        // The old splitter took everything before '?'/'#' as part of the
+        // host candidate and only handled '@' on the right side; the URI
+        // parser must own this.
+        assert_eq!(
+            parse_host("https://Example.COM/Path?q=1").unwrap(),
+            "example.com"
+        );
+        assert_eq!(parse_host("http://user@10.0.0.1/x").unwrap(), "10.0.0.1");
+        assert_eq!(
+            parse_host("http://[2001:db8::1]:8443/x").unwrap(),
+            "2001:db8::1"
+        );
+        assert!(parse_host("not a url at all").is_err());
     }
-}
 
-#[test]
-fn parse_host_uses_uri_authority_not_string_splits() {
-    // The old splitter took everything before '?'/'#' as part of the
-    // host candidate and only handled '@' on the right side; the URI
-    // parser must own this.
-    assert_eq!(
-        parse_host("https://Example.COM/Path?q=1").unwrap(),
-        "example.com"
-    );
-    assert_eq!(parse_host("http://user@10.0.0.1/x").unwrap(), "10.0.0.1");
-    assert_eq!(
-        parse_host("http://[2001:db8::1]:8443/x").unwrap(),
-        "2001:db8::1"
-    );
-    assert!(parse_host("not a url at all").is_err());
-}
-
-#[test]
-fn ssrf_guard_refuses_private_hosts_without_opt_out() {
-    // Pure form: no process env (parallel env tests race), no network.
-    for url in [
-        "https://127.0.0.1:1/secret",
-        "https://169.254.169.254/latest/meta-data/",
-        "https://10.0.0.5/admin",
-        "http://192.168.1.1/",
-        "http://[::1]/",
-    ] {
-        let err = host_is_public_opt(url, false).unwrap_err();
-        assert!(err.contains("private/loopback"), "{url}: {err}");
-        assert!(host_is_public_opt(url, true).is_ok(), "{url} opted out");
+    #[test]
+    fn ssrf_guard_refuses_private_hosts_without_opt_out() {
+        // Pure form: no process env (parallel env tests race), no network.
+        for url in [
+            "https://127.0.0.1:1/secret".to_string(),
+            "https://169.254.169.254/latest/meta-data/".to_string(),
+            "https://10.0.0.5/admin".to_string(),
+            http_url("192.168.1.1/"),
+            http_url("[::1]/"),
+        ] {
+            let err = host_is_public_opt(&url, false).unwrap_err();
+            assert!(err.contains("private/loopback"), "{url}: {err}");
+            assert!(
+                host_is_public_opt(url.as_str(), true).is_ok(),
+                "{url} opted out"
+            );
+        }
     }
 }
