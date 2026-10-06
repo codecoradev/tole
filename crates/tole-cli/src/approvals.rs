@@ -106,6 +106,13 @@ impl ApprovalQueue {
                 expired.push(e.id.clone());
             }
         }
+        // Bounding (cora MAJOR): terminal entries past the visibility
+        // budget leave the Vec entirely — a long-running daemon must not
+        // grow unbounded, and every GET /approvals must stay small.
+        entries.retain(|e| {
+            !(e.status != ApprovalStatus::Pending
+                && now.saturating_sub(e.created_at_ms) > EXPIRY_SECS * 1000)
+        });
         drop(entries);
         // Stale one-shots (a resumed turn that never replayed) die with
         // the same budget — no forever-granted authorization.

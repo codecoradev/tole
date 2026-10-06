@@ -351,27 +351,32 @@ fn write_approval_audit(
                 .unwrap_or(0),
         }),
     );
-    // In-memory handle first.
-    {
+    // In-memory handle: clone the storage Arc under the map lock, then
+    // RELEASE the map lock before touching the storage mutex — a turn
+    // holds that lock for its whole duration, and freezing the global
+    // map would stall every route (cora MAJOR).
+    let handle = {
         let sessions = lock_sessions(&state.sessions);
-        if let Some(st) = sessions.map.get(session_id) {
-            let mut storage = st.storage.lock().unwrap_or_else(|p| p.into_inner());
-            return storage
-                .commit(Commit::new().register(register))
-                .map(|_| ())
-                .map_err(|e| e.to_string());
-        }
-    }
-    // Evicted: reopen the durable file. The sessions dir override is the
-    // daemon's; the file name is the session id (the durable contract).
-    let dir = match &state.sessions_dir {
-        Some(d) => d.clone(),
-        None => std::env::current_dir()
-            .map_err(|e| e.to_string())?
-            .join(".tole/sessions"),
+        sessions
+            .map
+            .get(session_id)
+            .map(|st| std::sync::Arc::clone(&st.storage))
     };
-    let mut storage =
-        JsonlStorage::open(dir.join(format!("{session_id}.jsonl"))).map_err(|e| e.to_string())?;
+    if let Some(storage) = handle {
+        let mut storage = storage.lock().unwrap_or_else(|p| p.into_inner());
+        return storage
+            .commit(Commit::new().register(register))
+            .map(|_| ())
+            .map_err(|e| e.to_string());
+    }
+    // Evicted: reopen the queue-time durable path — the EXACT file the
+    // session was created with (cwd-dependent layouts defeat daemon-cwd
+    // guesses, cora MAJOR).
+    let path = state
+        .approvals
+        .storage_path(session_id)
+        .ok_or_else(|| format!("no queued approval for session {session_id}"))?;
+    let mut storage = JsonlStorage::open(path).map_err(|e| e.to_string())?;
     storage
         .commit(Commit::new().register(register))
         .map(|_| ())
