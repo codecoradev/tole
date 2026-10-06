@@ -124,6 +124,12 @@ pub fn run_mission(
 ) -> Result<()> {
     let started = std::time::Instant::now();
     let deadline = started + std::time::Duration::from_secs(cfg.max_minutes * 60);
+    // Resolve provider config BEFORE the session file exists — a config
+    // failure must not leave an empty, unsummarized session (cora CI).
+    let provider_cfg = OpenAiConfig::from_env().context(
+        "missing provider config: set TOLE_BASE_URL / TOLE_MODEL / TOLE_API_KEY \
+         (or the OPENAI_* equivalents)",
+    )?;
 
     // Session: fresh (goal pinned via first prompt) or resumed.
     let (mut storage, session_id, first_prompt) = match &cfg.resume_id {
@@ -167,11 +173,7 @@ pub fn run_mission(
             .map_err(|e| anyhow::anyhow!("registering todo_write: {e}"))?;
     }
 
-    let mut provider = OpenAiProvider::new(OpenAiConfig::from_env().context(
-        "missing provider config: set TOLE_BASE_URL / TOLE_MODEL / TOLE_API_KEY \
-         (or the OPENAI_* equivalents)",
-    )?)
-    .with_tool_specs(registry.specs());
+    let mut provider = OpenAiProvider::new(provider_cfg).with_tool_specs(registry.specs());
 
     let mut turns: u64 = 0;
     let mut verify_failures: u32 = 0;
@@ -210,15 +212,28 @@ pub fn run_mission(
             break;
         }
         let Some(prompt) = continuation.take() else {
-            status = "complete";
+            // No continuation queued and no completion declared: a logic
+            // bug upstream — settle loudly, the summary records it.
+            status = "error";
             break;
         };
-        let outcome = run_turn(&mut storage, &mut provider, &registry, &prompt)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let outcome = match run_turn(&mut storage, &mut provider, &registry, &prompt) {
+            Ok(o) => o,
+            Err(e) => {
+                // Storage-class failure: still summarize (the "either
+                // way" contract), then surface the error.
+                eprintln!("mission: turn storage error: {e}");
+                status = "error";
+                break;
+            }
+        };
         turns += 1;
         match &outcome {
             TurnOutcome::Final { text, .. } => {
-                let declares = text.contains(MISSION_COMPLETE_MARKER);
+                // Line-exact per the pinned contract ("a line containing
+                // exactly MISSION_COMPLETE"): a mere MENTION of the word
+                // (the model restating the rules) must not declare.
+                let declares = text.lines().any(|l| l.trim() == MISSION_COMPLETE_MARKER);
                 match &cfg.verify {
                     // Per-turn verification (cora CI on #206): the gate
                     // is the ground truth EVERY turn, not just on marker
