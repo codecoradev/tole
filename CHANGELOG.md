@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-10-06
+
 ### Added
 - `tole upgrade` + startup update notification (issue #220): a
   cache-backed (24 h) banner on startup when a newer crates.io
