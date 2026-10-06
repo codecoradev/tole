@@ -321,6 +321,7 @@ pub fn run_session_turn(
     sessions: SharedSessions,
     session_id: &str,
     prompt: &str,
+    observer: Option<&dyn tole_core::turn::TurnObserver>,
 ) -> Result<(String, Option<String>), String> {
     // Brief map lock: take the session's handles and reject a busy
     // session. The MAP lock is released here — a running turn holds only
@@ -398,12 +399,13 @@ pub fn run_session_turn(
         provider = provider.with_system_prompt(sys);
     }
 
-    let outcome = tole_core::turn::run_turn_with_cancel(
+    let outcome = tole_core::turn::run_turn_with_observer(
         &mut *storage,
         &mut provider,
         &registry,
         &effective,
         &cancel,
+        observer,
     )
     .map_err(|e| e.to_string())?;
 

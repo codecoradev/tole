@@ -123,6 +123,9 @@ pub struct OpenAiProvider {
     /// Provider-reported `usage` object from the last response (status
     /// command previously showed 0/0 because it was never captured).
     last_usage_obj: Option<Value>,
+    /// The model's reasoning from the last step (issue #196 phase 2):
+    /// captured for the turn-loop observer; never durable.
+    last_reasoning_obj: Option<String>,
 }
 
 impl OpenAiProvider {
@@ -136,6 +139,7 @@ impl OpenAiProvider {
             system_prompt: None,
             tool_specs: Vec::new(),
             last_usage_obj: None,
+            last_reasoning_obj: None,
         }
     }
 
@@ -397,11 +401,22 @@ impl Provider for OpenAiProvider {
         // Capture provider-reported usage (issue: status showed 0/0) —
         // exposed via `last_usage` for the turn loop's durable ledger.
         self.last_usage_obj = resp_body.get("usage").cloned().filter(Value::is_object);
+        // Capture the model's reasoning (issue #196 phase 2): GLM-class
+        // responses carry it next to `content`; absent on most other
+        // gateways. Observer-only — the durable log keeps the answer.
+        self.last_reasoning_obj = resp_body["choices"][0]["message"]["reasoning"]
+            .as_str()
+            .map(str::to_string)
+            .filter(|r| !r.trim().is_empty());
         Self::parse_completion(&resp_body)
     }
 
     fn last_usage(&self) -> Option<Value> {
         self.last_usage_obj.clone()
+    }
+
+    fn last_reasoning(&self) -> Option<String> {
+        self.last_reasoning_obj.clone()
     }
 }
 

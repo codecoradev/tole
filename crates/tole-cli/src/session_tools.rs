@@ -251,7 +251,8 @@ impl Tool for SessionPromptTool {
                     ),
                 }
             };
-        let (stop, text) = run_session_turn(Arc::clone(&self.0.sessions), &session_id, &text)?;
+        let (stop, text) =
+            run_session_turn(Arc::clone(&self.0.sessions), &session_id, &text, None)?;
         let mut out = json!({ "stop_reason": stop });
         if let Some(t) = text {
             out["text"] = json!(t);

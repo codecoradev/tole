@@ -1556,3 +1556,126 @@ fn cancel_during_pending_approval_settles_cancelled_not_refusal() {
     );
     assert_eq!(s.state().pc, Pc::Final);
 }
+
+// ---------------------------------------------------------------------------
+// Issue #196 phases 1+2: the observer sees reasoning + tool lifecycle
+// ---------------------------------------------------------------------------
+
+/// Scripted outputs WITH reasoning — the GLM-class shape where each
+/// response carries a `reasoning` field next to the action.
+struct ReasoningScripted {
+    steps: std::sync::Mutex<std::collections::VecDeque<(ProviderOutput, Option<String>)>>,
+    reasoning: Option<String>,
+}
+
+impl Provider for ReasoningScripted {
+    fn complete(&mut self, _: &[Entry]) -> Result<ProviderOutput, ProviderError> {
+        let (out, reasoning) = self
+            .steps
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("script exhausted");
+        self.reasoning = reasoning;
+        Ok(out)
+    }
+
+    fn last_reasoning(&self) -> Option<String> {
+        self.reasoning.clone()
+    }
+}
+
+impl ReasoningScripted {
+    fn new(steps: Vec<(ProviderOutput, Option<String>)>) -> Self {
+        Self {
+            steps: std::sync::Mutex::new(steps.into()),
+            reasoning: None,
+        }
+    }
+}
+
+/// Records observer events as display strings, in fire order.
+struct Recorder(std::sync::Mutex<Vec<String>>);
+impl tole_core::turn::TurnObserver for Recorder {
+    fn tool_started(&self, tool: &str, _input: &Value) {
+        self.0.lock().unwrap().push(format!("started:{tool}"));
+    }
+    fn tool_finished(&self, tool: &str, ok: bool, preview: &str) {
+        self.0
+            .lock()
+            .unwrap()
+            .push(format!("finished:{tool}:{ok}:{preview}"));
+    }
+    fn reasoning(&self, text: &str) {
+        self.0.lock().unwrap().push(format!("reasoning:{text}"));
+    }
+}
+
+#[test]
+fn observer_sees_reasoning_then_tool_lifecycle_per_step() {
+    let dir = tmpdir("observer");
+    let mut s = JsonlStorage::create(&dir, "obs", None).unwrap();
+    let mut p = ReasoningScripted::new(vec![
+        (
+            ProviderOutput::ToolCall {
+                tool: "echo".into(),
+                input: json!({"n": 1}),
+            },
+            Some("I should call echo first".into()),
+        ),
+        (
+            ProviderOutput::ToolCall {
+                tool: "flaky".into(),
+                input: json!({"x": 2}),
+            },
+            None,
+        ),
+        (
+            ProviderOutput::Final {
+                text: "done".into(),
+            },
+            Some("settling".into()),
+        ),
+    ]);
+    let mut reg = ToolRegistry::new();
+    reg.register(Box::new(EchoTool)).unwrap();
+    reg.register(Box::new(FlakyTool)).unwrap();
+    let rec = Recorder(std::sync::Mutex::new(Vec::new()));
+
+    let out = tole_core::turn::run_turn_with_observer(
+        &mut s,
+        &mut p,
+        &reg,
+        "hi",
+        &tole_core::cancel::CancelToken::default(),
+        Some(&rec),
+    )
+    .unwrap();
+    assert!(matches!(out, TurnOutcome::Final { .. }));
+
+    let events = rec.0.lock().unwrap().clone();
+    assert_eq!(
+        events,
+        vec![
+            "reasoning:I should call echo first",
+            "started:echo",
+            "finished:echo:true:{\"n\":1}",
+            // Step 2 has no reasoning (None) — no event.
+            "started:flaky",
+            "finished:flaky:false:tool exploded",
+            // Step 3: final — reasoning only, no tool events.
+            "reasoning:settling",
+        ]
+    );
+}
+
+/// A no-observer run behaves identically (the default entry points).
+#[test]
+fn observer_absent_changes_nothing() {
+    let dir = tmpdir("observer-none");
+    let mut s = JsonlStorage::create(&dir, "obs-none", None).unwrap();
+    let mut p = MockProvider::scripted(vec![ProviderOutput::Final { text: "f".into() }]);
+    let reg = ToolRegistry::new();
+    let out = run_turn(&mut s, &mut p, &reg, "hi").unwrap();
+    assert!(matches!(out, TurnOutcome::Final { .. }));
+}
