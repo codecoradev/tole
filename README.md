@@ -145,7 +145,9 @@ one-shot approval and resumes the session (the replayed effect
 re-consults the gate — exactly once), **deny** records the verdict.
 Entries expire to denied (15 min) so nothing hangs silently; every
 decision lands a durable audit register on the session. MCP/ACP parity
-is a follow-up.
+is a follow-up. This is also the surface uteke-mobile drives —
+[docs/mobile-control.md](docs/mobile-control.md) is the mobile-control
+guide (#202).
 
 ## Mission mode
 
