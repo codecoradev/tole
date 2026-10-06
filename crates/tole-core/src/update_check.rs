@@ -138,7 +138,14 @@ pub fn check_network() -> Result<UpdateInfo, String> {
         .new_agent();
 
     // Primary: the redirect target of /releases/latest IS the tag URL.
-    let head = agent
+    // max_redirects(0) is REQUIRED — ureq's default follows the 302 and
+    // returns the final HTML page, defeating the Location parse (cora).
+    let no_redirect_agent = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(10)))
+        .max_redirects(0)
+        .build()
+        .new_agent();
+    let head = no_redirect_agent
         .head(&format!("https://github.com/{REPO}/releases/latest"))
         .call();
     let latest = match head {
