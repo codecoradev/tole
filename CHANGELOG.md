@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `todo_write` / `todo_read` (#198): durable mission task list persisted as
+  ordinary session entries — `todo_write` echoes the full list as its result
+  (the durable record), state re-hydrates from the transcript on
+  open/resume, at most one task `in_progress`; `todo_write` is Write
+  (covered by `--trust internal`), `todo_read` is ReadOnly.
 ## [0.6.0] — 2026-10-06
 
 ### Added

@@ -180,3 +180,11 @@ self-hosted compatible). The decision payload sent to the backend is
 model-controlled context: treat the System One backend as an external
 data flow. The tool executes no writes; results are advisory input to
 the session like any other ReadOnly tool.
+
+### Task-list tools (#198)
+
+`todo_write` mutates only the session's task list, which lives in the
+write-once session log itself (the tool's result entry is the record; no
+side channel, no file). The threat surface equals any Write tool: prompt
+injection could rewrite the plan, but the list is data, never executed —
+and every revision is auditable in the replay. `todo_read` is ReadOnly.
