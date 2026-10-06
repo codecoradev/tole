@@ -164,6 +164,19 @@ impl ApprovalQueue {
             .map(|e| e.storage_path.clone())
     }
 
+    /// Validate an id WITHOUT mutating: (session_id, tool) when the
+    /// entry is Pending. The decision route audits BEFORE deciding, so
+    /// a failed audit leaves the queue untouched.
+    pub fn peek_pending(&self, id: &str) -> Option<(String, String)> {
+        self.prune_expired();
+        self.entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .find(|e| e.id == id && e.status == ApprovalStatus::Pending)
+            .map(|e| (e.session_id.clone(), e.tool.clone()))
+    }
+
     /// Apply an operator decision.
     pub fn decide(&self, id: &str, allow: bool) -> DecisionOutcome {
         self.prune_expired();
