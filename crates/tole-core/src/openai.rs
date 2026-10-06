@@ -438,6 +438,36 @@ fn scrub(msg: &str, secret: &str) -> String {
     }
 }
 
+/// Probe the provider's `GET /models` endpoint (issue #195): the model
+/// ids the gateway serves, provider order, deduped. Read-only, same
+/// base_url/credentials as chat completions — no new trust surface.
+/// Deliberately short timeout: this feeds a UI convenience (the ACP
+/// model picker), never a correctness dependency — callers degrade to
+/// "no picker" on any error, per the probe-first contract.
+pub fn fetch_model_ids(base_url: &str, api_key: &str) -> Result<Vec<String>, String> {
+    let agent = OpenAiProvider::build_agent(Duration::from_secs(3));
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let mut res = agent
+        .get(&url)
+        .header("Authorization", &format!("Bearer {api_key}"))
+        .call()
+        .map_err(|e| scrub(&format!("models probe: {e}"), api_key))?;
+    let body: Value = res
+        .body_mut()
+        .read_json()
+        .map_err(|e| scrub(&format!("models probe: {e}"), api_key))?;
+    let mut out: Vec<String> = Vec::new();
+    for m in body["data"].as_array().unwrap_or(&Vec::new()) {
+        if let Some(id) = m["id"].as_str() {
+            let id = id.trim();
+            if !id.is_empty() && !out.iter().any(|k| k == id) {
+                out.push(id.to_string());
+            }
+        }
+    }
+    Ok(out)
+}
+
 use crate::entry::Entry;
 
 #[cfg(test)]
@@ -882,5 +912,39 @@ mod system_prompt_tests {
         let msgs = body["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0]["role"], json!("user"));
+    }
+}
+
+#[cfg(test)]
+mod models_probe_tests {
+    use super::*;
+
+    #[test]
+    fn fetch_model_ids_parses_dedupes_and_fails_soft() {
+        // One-shot mock: standard {"data":[{"id":...}]} shape, with a
+        // duplicate and an empty id to prove dedupe + filtering.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                use std::io::{Read, Write};
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf);
+                let body = r#"{"data":[{"id":"b"},{"id":"a"},{"id":"b"},{"id":" "}]}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+        let ids = fetch_model_ids(&format!("http://{addr}/v1"), "sk-test").unwrap();
+        assert_eq!(ids, vec!["b", "a"]);
+
+        // Unreachable endpoint: Err, and the key never leaks into the
+        // error text (the same scrub contract as chat completions).
+        let err = fetch_model_ids("http://127.0.0.1:9/v1", "sk-secret").unwrap_err();
+        assert!(!err.contains("sk-secret"));
     }
 }
