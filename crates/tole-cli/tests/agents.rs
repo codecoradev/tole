@@ -13,12 +13,60 @@ use std::net::TcpListener;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-/// Minimal content-driven OpenAI-compatible server. Decision table:
-/// - first user message contains `CHILD_MISSION` → final "CHILD_ANSWER_42"
-/// - first user message contains `DEPTH_PROBE`   → agent_start call
-///   (the depth-cap test: a child must NOT have that tool)
-/// - otherwise (parent): no tool results yet → agent_start; last tool
-///   result `"running": true` → agent_poll; settled → final.
+// Minimal content-driven OpenAI-compatible server. Decision table:
+// - first user message contains `CHILD_MISSION` → final "CHILD_ANSWER_42"
+// - first user message contains `DEPTH_PROBE`   → agent_start call
+//   (the depth-cap test: a child must NOT have that tool)
+// - otherwise (parent): no tool results yet → agent_start; last tool
+//   result `"running": true` → agent_poll; settled → final.
+
+// Convert a plain chat-completion reply into an SSE stream body
+// (issue #196 phase 3 mocks).
+fn completion_to_sse(reply: &Value) -> String {
+    let mut out = String::new();
+    let msg = &reply["choices"][0]["message"];
+    let model = reply["model"].as_str().unwrap_or("mock");
+    let mut chunk_of = |delta: Value| {
+        let c = json!({
+            "id": "chatcmpl-sse", "object": "chat.completion.chunk", "created": 1,
+            "model": model,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": null}],
+            "usage": null
+        });
+        out.push_str(&format!("data: {c}\n\n"));
+    };
+    if let Some(c) = msg["content"].as_str() {
+        if !c.is_empty() {
+            let (a, b) = c.split_at(c.len().div_ceil(2));
+            chunk_of(json!({"content": a}));
+            chunk_of(json!({"content": b}));
+        }
+    }
+    if let Some(tcs) = msg["tool_calls"].as_array() {
+        for (i, tc) in tcs.iter().enumerate() {
+            let name = tc["function"]["name"].as_str().unwrap_or("");
+            let args = tc["function"]["arguments"].as_str().unwrap_or("{}");
+            let (a1, a2) = args.split_at(args.len().div_ceil(2));
+            chunk_of(json!({"tool_calls": [{"index": i, "id": tc["id"],
+                "function": {"name": name, "arguments": a1}}]}));
+            chunk_of(json!({"tool_calls": [{"index": i,
+                "function": {"arguments": a2}}]}));
+        }
+    }
+    if !msg["tool_calls"].is_null() {
+        out.push_str(&format!(
+            "data: {}\n\n",
+            json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}], "usage": null})
+        ));
+    }
+    out.push_str(&format!(
+        "data: {}\n\n",
+        json!({"choices": [], "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}})
+    ));
+    out.push_str("data: [DONE]\n\n");
+    out
+}
+
 fn spawn_mock() -> (String, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -56,14 +104,26 @@ fn spawn_mock() -> (String, Arc<AtomicUsize>) {
                         break; // client closed; use whatever we have
                     }
                 }
+                let streamed = body.get("stream").and_then(Value::as_bool) == Some(true);
                 hits3.fetch_add(1, Ordering::SeqCst);
                 let reply = decide(&body);
-                let data = reply.to_string();
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    data.len(),
-                    data
-                );
+                let resp = if streamed {
+                    // The headers/body already arrived (body_in parsed it
+                    // above); answer with the SSE form.
+                    let body = completion_to_sse(&reply);
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                } else {
+                    let data = reply.to_string();
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        data.len(),
+                        data
+                    )
+                };
                 let _ = s.write_all(resp.as_bytes());
             });
         }

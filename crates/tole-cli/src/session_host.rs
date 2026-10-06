@@ -428,7 +428,7 @@ pub fn run_session_turn(
     sessions: SharedSessions,
     session_id: &str,
     prompt: &str,
-    observer: Option<&dyn tole_core::turn::TurnObserver>,
+    observer: Option<StdArc<dyn tole_core::turn::TurnObserver>>,
 ) -> Result<(String, Option<String>), String> {
     // Brief map lock: take the session's handles and reject a busy
     // session. The MAP lock is released here — a running turn holds only
@@ -505,6 +505,17 @@ pub fn run_session_turn(
     if let Some(sys) = system_prompt.as_deref() {
         provider = provider.with_system_prompt(sys);
     }
+    // Live-token sinks (issue #196 phase 3): when an observer is wired
+    // (ACP), streamed reasoning/content deltas flow to it DURING the
+    // provider call; the decisive output semantics are unchanged.
+    if let Some(o) = observer.as_ref() {
+        let ot = StdArc::clone(o);
+        let or = StdArc::clone(o);
+        provider = provider.with_delta_sinks(
+            Some(StdArc::new(move |t: &str| ot.text_delta(t))),
+            Some(StdArc::new(move |r: &str| or.reasoning(r))),
+        );
+    }
 
     let outcome = tole_core::turn::run_turn_with_observer(
         &mut *storage,
@@ -512,7 +523,7 @@ pub fn run_session_turn(
         &registry,
         &effective,
         &cancel,
-        observer,
+        observer.as_ref().map(StdArc::as_ref),
     )
     .map_err(|e| e.to_string())?;
 
