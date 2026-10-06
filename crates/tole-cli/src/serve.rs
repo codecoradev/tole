@@ -363,6 +363,8 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                 // No REST cancel endpoint today (#178): a never-fired
                 // token keeps serve behavior unchanged.
                 tole_core::cancel::CancelToken::default(),
+                // No plan UI on the REST face.
+                None,
             ) {
                 Ok(session_state) => {
                     {
@@ -452,7 +454,7 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                     let Some(text) = req.get("text").and_then(|v| v.as_str()) else {
                         return (400, json!({"error": "missing text"}));
                     };
-                    match run_session_turn(Arc::clone(&state.sessions), id, text) {
+                    match run_session_turn(Arc::clone(&state.sessions), id, text, None) {
                         Ok((stop, Some(final_text))) => {
                             (200, json!({"stopReason": stop, "text": final_text}))
                         }

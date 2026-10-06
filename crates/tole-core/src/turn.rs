@@ -80,6 +80,28 @@ pub enum TurnOutcome {
     Cancelled,
 }
 
+/// Progress sink for host UIs (issue #196): the turn loop fires these at
+/// deterministic points so an ACP/editor face can show live tool cards
+/// and the model's reasoning instead of a silent turn.
+///
+/// Contract: implementations must never panic or block — callbacks run
+/// on the turn's single thread between durable-state transitions, and a
+/// panicking observer would unwind through them. All methods are
+/// best-effort UI plumbing; errors are dropped. The default bodies are
+/// deliberate no-ops, hence the unused-variable allowance.
+#[allow(unused_variables)]
+pub trait TurnObserver {
+    /// A tool call passed every gate (approval, hooks, loop guard) and
+    /// is about to execute. `input` is the exact call input.
+    fn tool_started(&self, tool: &str, input: &Value) {}
+    /// The tool settled. `preview` is a short output/error excerpt for
+    /// display — never a replacement for the durable settlement.
+    fn tool_finished(&self, tool: &str, ok: bool, preview: &str) {}
+    /// The model's reasoning for the provider step that just completed,
+    /// when the provider supplies one (`Provider::last_reasoning`).
+    fn reasoning(&self, text: &str) {}
+}
+
 /// Drive one full user turn to completion (single-threaded).
 ///
 /// `pc` must be `Idle` (fresh turn) — resume paths call
@@ -103,6 +125,20 @@ pub fn run_turn_with_cancel(
     registry: &ToolRegistry,
     user_input: &str,
     cancel: &CancelToken,
+) -> Result<TurnOutcome, StorageError> {
+    run_turn_with_observer(s, p, registry, user_input, cancel, None)
+}
+
+/// [`run_turn_with_cancel`] with a progress observer (issue #196): the
+/// host receives tool lifecycle + reasoning events while the turn runs.
+/// Existing entry points are unchanged wrappers (no observer).
+pub fn run_turn_with_observer(
+    s: &mut dyn Storage,
+    p: &mut dyn Provider,
+    registry: &ToolRegistry,
+    user_input: &str,
+    cancel: &CancelToken,
+    observer: Option<&dyn TurnObserver>,
 ) -> Result<TurnOutcome, StorageError> {
     // Precondition enforced, not just documented: the session must be at a
     // turn boundary — Idle (never started / E1 initial state) or Final
@@ -129,7 +165,7 @@ pub fn run_turn_with_cancel(
             ))
             .transition(StateTransition::from(seq, Pc::Planning)),
     )?;
-    drive(s, p, registry, cancel)
+    drive(s, p, registry, cancel, observer)
 }
 
 /// Resume a turn interrupted by a crash (or process exit) mid-flight and
@@ -308,8 +344,8 @@ pub fn resume_turn(
     }
     // Recovery drives are not cancel-wired today (#178 covers live
     // prompt turns; a crash-recovered resume has no in-flight request
-    // to cancel).
-    drive(s, p, registry, &CancelToken::default())
+    // to cancel). No observer: recovery is an interactive host flow.
+    drive(s, p, registry, &CancelToken::default(), None)
 }
 
 /// Fingerprint of a tool call for the E10 loop guard: tool name + canonical
@@ -321,6 +357,18 @@ pub fn call_fingerprint(tool: &str, input: &Value) -> u64 {
     tool.hash(&mut h);
     canonical_json(input).hash(&mut h);
     h.finish()
+}
+
+/// Bounded display excerpt for observer events (issue #196): the first
+/// ~200 chars of a tool output/error. Display only — the durable
+/// settlement always carries the full value.
+fn short_preview(v: &impl std::fmt::Display) -> String {
+    let raw = v.to_string();
+    let mut out: String = raw.chars().take(200).collect();
+    if raw.chars().count() > 200 {
+        out.push('…');
+    }
+    out
 }
 
 /// Canonical JSON string: object keys sorted recursively, so `{a,b}` and
@@ -355,6 +403,7 @@ fn drive(
     p: &mut dyn Provider,
     registry: &ToolRegistry,
     cancel: &CancelToken,
+    observer: Option<&dyn TurnObserver>,
 ) -> Result<TurnOutcome, StorageError> {
     // E10 loop guard: fingerprint of the last tool call (tool + canonical
     // input), with its consecutive repeat count. Identical calls are
@@ -450,6 +499,14 @@ fn drive(
         // output here is crash-safe by construction.
         if cancel.is_cancelled() {
             return settle_cancelled(s);
+        }
+        // Issue #196 phase 2: surface the model's reasoning for this
+        // step (when the provider supplies one) BEFORE the step's
+        // effect lands — thought first, action after.
+        if let Some(o) = observer {
+            if let Some(r) = p.last_reasoning() {
+                o.reasoning(&r);
+            }
         }
         match next {
             ProviderOutput::Final { text } => {
@@ -642,6 +699,12 @@ fn drive(
                 } else {
                     None
                 };
+                // Issue #196 phase 1: every gate has passed (approval,
+                // hooks, loop guard, cancel) — the host sees the card
+                // exactly when real work begins.
+                if let Some(o) = observer {
+                    o.tool_started(&tool, &input);
+                }
                 let out = match t.execute(input) {
                     Ok(o) => o,
                     Err(e) => {
@@ -650,6 +713,9 @@ fn drive(
                         #[cfg(feature = "shell-tools")]
                         if let Some(i) = &hook_input {
                             registry.post_hook_notify(&tool, i, false);
+                        }
+                        if let Some(o) = observer {
+                            o.tool_finished(&tool, false, &short_preview(&e));
                         }
                         settle_err(s, &handle, &e)?;
                         continue;
@@ -666,6 +732,9 @@ fn drive(
                         "wrote_this_turn",
                         json!(true),
                     )))?;
+                }
+                if let Some(o) = observer {
+                    o.tool_finished(&tool, true, &short_preview(&out));
                 }
                 settle_ok(s, &handle, out)?;
                 finish(s)?;

@@ -689,7 +689,15 @@ mod tests {
     }
 
     fn tmp(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("tole-agents-{tag}-{}", std::process::id()));
+        // Unique PER CALL: pid alone is not enough — CI hit "Text file
+        // busy" when a second exec of the same fixed dump path raced a
+        // still-open write fd (PR #203 run). A monotonic suffix gives
+        // every call its own directory; no cross-test exec/write races
+        // are possible by construction.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let d =
+            std::env::temp_dir().join(format!("tole-agents-{tag}-{}-{n:x}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d

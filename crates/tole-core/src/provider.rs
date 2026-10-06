@@ -56,4 +56,15 @@ pub trait Provider {
     fn last_usage(&self) -> Option<Value> {
         None
     }
+
+    /// The model's reasoning/thought for the LAST completed `complete()`
+    /// call, when the provider exposes one (OpenAI-compatible GLM-class
+    /// responses carry a `reasoning` field next to `content`). Consumed
+    /// by the turn loop's observer (issue #196) for host-side thought
+    /// surfacing — never persisted to the durable log (the ledger keeps
+    /// the answer, not the deliberation). Default None: mocks and
+    /// providers without a notion of thought stay silent.
+    fn last_reasoning(&self) -> Option<String> {
+        None
+    }
 }

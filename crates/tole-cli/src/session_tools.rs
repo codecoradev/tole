@@ -158,6 +158,7 @@ impl Tool for SessionNewTool {
             self.0.turnend.clone(),
             self.0.allow_patterns.clone(),
             tole_core::cancel::CancelToken::default(),
+            None,
         )?;
         {
             // Cap + eviction, mirroring the REST transport (CodeCora:
@@ -251,7 +252,8 @@ impl Tool for SessionPromptTool {
                     ),
                 }
             };
-        let (stop, text) = run_session_turn(Arc::clone(&self.0.sessions), &session_id, &text)?;
+        let (stop, text) =
+            run_session_turn(Arc::clone(&self.0.sessions), &session_id, &text, None)?;
         let mut out = json!({ "stop_reason": stop });
         if let Some(t) = text {
             out["text"] = json!(t);

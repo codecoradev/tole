@@ -337,6 +337,113 @@ fn wait_permission(
 }
 
 // ---------------------------------------------------------------------------
+// Progress observer: tool cards + thought bubbles (issue #196)
+// ---------------------------------------------------------------------------
+
+/// ACP `ToolKind` for a tole tool name (issue #196 phase 1): the spec's
+/// taxonomy drives host icons and progress rendering. Mapping falls out
+/// of the registry vocabulary; "other" stays the fallback for anything
+/// unmapped. Registry-gated tools only ever map when actually present —
+/// this is a pure name lookup, no registration assumption.
+fn tool_kind(tool: &str) -> &'static str {
+    match tool {
+        "read_file" | "tole_session_list" | "tole_session_status" => "read",
+        "write_file" | "edit_file" => "edit",
+        "delete_file" => "delete",
+        "run_command" | "git" | "gh" | "gitea" | "job_start" | "job_poll" => "execute",
+        "cora_search" | "uteke_recall" => "search",
+        "systemone_decide" | "agent_start" | "agent_poll" => "think",
+        "uteke_document" | "tole_session_new" | "tole_session_prompt" => "edit",
+        _ => "other",
+    }
+}
+
+/// The turn-loop observer for the ACP face (issue #196): translates
+/// core turn events into `session/update` notifications — a tool card
+/// (proper `kind` + `name`) at execution start, its completion with a
+/// bounded output preview, and the model's reasoning as an
+/// `agent_thought_chunk`. All fire mid-turn, so the host shows live
+/// progress instead of a silent "Working…".
+struct AcpObserver {
+    conn: Conn,
+    session_id: String,
+    counter: Arc<Mutex<u64>>,
+    /// The open card's id (cora MAJOR, #196): `tool_call_update` must
+    /// reference the `toolCallId` the started card announced, or hosts
+    /// cannot correlate them and the card stays `in_progress` forever.
+    /// Tools run sequentially on the turn thread, so one slot suffices.
+    current: Mutex<Option<String>>,
+}
+
+impl AcpObserver {
+    fn next_id(&self) -> String {
+        let mut n = self.counter.lock().expect("observer id lock");
+        *n += 1;
+        format!("tool-{n}")
+    }
+}
+
+impl tole_core::turn::TurnObserver for AcpObserver {
+    fn tool_started(&self, tool: &str, input: &Value) {
+        let id = self.next_id();
+        *self.current.lock().expect("observer current lock") = Some(id.clone());
+        self.conn.send_notification(
+            "session/update",
+            json!({
+                "sessionId": self.session_id,
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": id,
+                    "title": tool,
+                    "name": tool,
+                    "kind": tool_kind(tool),
+                    "rawInput": input,
+                    "status": "in_progress",
+                }
+            }),
+        );
+    }
+
+    fn tool_finished(&self, _tool: &str, ok: bool, preview: &str) {
+        // Correlate with the started card; fall back to a fresh id only
+        // if a finished event ever arrives without a started (cannot
+        // happen today — every execution passes tool_started first).
+        let id = self
+            .current
+            .lock()
+            .expect("observer current lock")
+            .take()
+            .unwrap_or_else(|| self.next_id());
+        self.conn.send_notification(
+            "session/update",
+            json!({
+                "sessionId": self.session_id,
+                "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": id,
+                    "status": if ok { "completed" } else { "failed" },
+                    "content": [{"type": "content",
+                                 "content": {"type": "text", "text": preview}}],
+                }
+            }),
+        );
+    }
+
+    fn reasoning(&self, text: &str) {
+        self.conn.send_notification(
+            "session/update",
+            json!({
+                "sessionId": self.session_id,
+                "update": {
+                    "sessionUpdate": "agent_thought_chunk",
+                    "content": {"type": "text", "text": text},
+                }
+            }),
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Approval: the editor is the human
 // ---------------------------------------------------------------------------
 
@@ -417,22 +524,12 @@ impl PromptFn for AcpPrompt {
         let call_id = {
             let mut n = self.counter.lock().expect("call id lock");
             *n += 1;
-            format!("call-{n}")
+            format!("perm-{n}")
         };
-        // Announce the tool call first so editors can render it.
-        self.conn.send_notification(
-            "session/update",
-            json!({
-                "sessionId": self.session_id,
-                "update": {
-                    "sessionUpdate": "tool_call",
-                    "toolCallId": call_id,
-                    "title": req.description,
-                    "kind": "other",
-                    "rawInput": req.input,
-                }
-            }),
-        );
+        // The timeline card is the observer's job (issue #196): announce
+        // + completion fire from the turn loop for EVERY execution. The
+        // permission request stays self-contained — hosts render the
+        // dialog from the embedded toolCall, now with the real kind.
         // allow_always only for Write-tier calls: Destructive is never
         // allowlistable, and ReadOnly never reaches the approver.
         let mut options =
@@ -449,34 +546,21 @@ impl PromptFn for AcpPrompt {
             "toolCall": {
                 "toolCallId": call_id,
                 "title": req.description,
-                "kind": "other",
+                "name": req.tool,
+                "kind": tool_kind(req.tool),
                 "rawInput": req.input,
             },
             "options": options,
         });
         let (req_id, rx) = self.conn.open_request("session/request_permission", params);
-        let verdict =
-            match wait_permission(&self.conn, req_id, rx, PERMISSION_TIMEOUT, &self.cancel) {
-                WaitOutcome::Reply(result) => self.map_option_choice(&result, req, option_reject),
-                // Timeout, dead transport, or a mid-wait cancel: fail
-                // closed (Deny) — the routing contract for unresolved
-                // permission requests. The already-set turn token makes a
-                // cancelled wait settle `cancelled`, not `refusal`.
-                WaitOutcome::Timeout => Verdict::Deny,
-            };
-        // Close the tool-call record.
-        self.conn.send_notification(
-            "session/update",
-            json!({
-                "sessionId": self.session_id,
-                "update": {
-                    "sessionUpdate": "tool_call_update",
-                    "toolCallId": call_id,
-                    "status": if verdict == Verdict::Allow { "completed" } else { "rejected" },
-                }
-            }),
-        );
-        verdict
+        match wait_permission(&self.conn, req_id, rx, PERMISSION_TIMEOUT, &self.cancel) {
+            WaitOutcome::Reply(result) => self.map_option_choice(&result, req, option_reject),
+            // Timeout, dead transport, or a mid-wait cancel: fail
+            // closed (Deny) — the routing contract for unresolved
+            // permission requests. The already-set turn token makes a
+            // cancelled wait settle `cancelled`, not `refusal`.
+            WaitOutcome::Timeout => Verdict::Deny,
+        }
     }
 }
 
@@ -662,6 +746,25 @@ pub fn run_acp(
                 .with_auto_write(auto_write)
                 .with_shared_patterns(Arc::clone(&patterns))
                 .with_shared_auto_write(Arc::clone(&session_auto_write));
+                // Plan publishing (issue #196 phase 4): ACP clients
+                // render the standard `plan` session/update (Termul's
+                // PlanPanel, full-replace semantics).
+                let plan_emitter: tole_cli::session_host::PlanEmitter = {
+                    let conn = conn.clone();
+                    let sid = session_id.clone();
+                    Arc::new(move |entries| {
+                        conn.send_notification(
+                            "session/update",
+                            json!({
+                                "sessionId": sid,
+                                "update": {
+                                    "sessionUpdate": "plan",
+                                    "entries": entries,
+                                }
+                            }),
+                        );
+                    })
+                };
                 match open_session(
                     &session_id,
                     &cwd,
@@ -673,6 +776,7 @@ pub fn run_acp(
                     turnend.clone(),
                     allow_patterns.to_vec(),
                     cancel,
+                    Some(plan_emitter),
                 ) {
                     Ok(state) => {
                         // Insert + busy re-check in ONE critical section:
@@ -757,8 +861,30 @@ pub fn run_acp(
                 let conn = conn.clone();
                 let sessions = sessions.clone();
                 let session_id_clone = session_id.clone();
+                // The observer's id counter lives on the SESSION (cora
+                // CI on #203): ids keep incrementing across turns so a
+                // completion can never correlate onto a stale card.
+                let tool_ids = {
+                    let sessions = lock_sessions(&sessions);
+                    sessions
+                        .map
+                        .get(&session_id)
+                        .map(|st| st.tool_ids.clone())
+                        .unwrap_or_default()
+                };
                 std::thread::spawn(move || {
-                    match run_session_turn(sessions, &session_id_clone, &prompt_text) {
+                    let observer = AcpObserver {
+                        conn: conn.clone(),
+                        session_id: session_id_clone.clone(),
+                        counter: tool_ids,
+                        current: Mutex::new(None),
+                    };
+                    match run_session_turn(
+                        sessions,
+                        &session_id_clone,
+                        &prompt_text,
+                        Some(&observer),
+                    ) {
                         Ok((stop, Some(text))) => {
                             conn.send_notification(
                                 "session/update",

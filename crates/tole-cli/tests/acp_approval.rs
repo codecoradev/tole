@@ -30,6 +30,9 @@ struct AcpProcess {
     permission_count: Arc<AtomicUsize>,
     /// The `kind` list offered by each permission request, in order.
     offered_kinds: Arc<Mutex<Vec<Vec<String>>>>,
+    /// Every `session/update` notification, in arrival order (issue #196
+    /// E2E: thought chunks + tool cards).
+    updates: Arc<Mutex<Vec<Value>>>,
 }
 
 impl AcpProcess {
@@ -57,6 +60,8 @@ impl AcpProcess {
         let permission_count = Arc::new(AtomicUsize::new(0));
         let offered_kinds = Arc::new(Mutex::new(Vec::new()));
         let policy = Arc::new(Mutex::new(policy));
+        let updates: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let updates_reader = Arc::clone(&updates);
         let (tx, rx) = mpsc::channel();
         let count = Arc::clone(&permission_count);
         let kinds = Arc::clone(&offered_kinds);
@@ -96,6 +101,12 @@ impl AcpProcess {
                     let _ = w.flush();
                     continue;
                 }
+                if msg.get("method").and_then(Value::as_str) == Some("session/update") {
+                    updates_reader
+                        .lock()
+                        .unwrap()
+                        .push(msg["params"]["update"].clone());
+                }
                 if tx.send(line).is_err() {
                     break;
                 }
@@ -107,6 +118,7 @@ impl AcpProcess {
             stdin,
             permission_count,
             offered_kinds,
+            updates,
         }
     }
 
@@ -243,11 +255,21 @@ fn spawn_mock() -> String {
                         ("victim.txt", "bye")
                     } else if last_user.contains("SECOND_WRITE") {
                         ("mission-2.txt", "two")
+                    } else if last_user.contains("PLAN_MISSION") {
+                        ("plan.txt", "planned")
                     } else {
                         ("mission-1.txt", "one")
                     };
                     let (name, args) = if last_user.contains("DELETE_MISSION") {
                         ("delete_file", json!({"path": path}))
+                    } else if last_user.contains("PLAN_MISSION") {
+                        (
+                            "update_plan",
+                            json!({"entries": [
+                                {"content": "read the spec", "status": "completed"},
+                                {"content": "write the plan", "status": "in_progress"},
+                            ]}),
+                        )
                     } else {
                         ("write_file", json!({"path": path, "content": content}))
                     };
@@ -256,6 +278,7 @@ fn spawn_mock() -> String {
                         "model": "mock",
                         "choices": [{"index": 0, "message": {"role": "assistant",
                             "content": null,
+                            "reasoning": "I will act on the mission, then report.",
                             "tool_calls": [{"id": "call_1", "type": "function",
                                 "function": {"name": name, "arguments": args.to_string()}}]},
                             "finish_reason": "tool_calls"}],
@@ -440,4 +463,119 @@ fn destructive_never_remembered() {
             "Destructive must not offer allow_always: {kinds:?}"
         );
     }
+}
+
+/// Issue #196 phases 1+2, end-to-end: during a live turn the host
+/// receives the model's reasoning as an agent_thought_chunk BEFORE the
+/// tool card, the tool card carries the spec kind (write_file → edit)
+/// with in_progress status, and the card completes with an output
+/// preview — instead of a silent "Working…".
+#[test]
+fn observer_streams_thought_and_tool_cards() {
+    let env_pairs = provider_env().1;
+    let env: Vec<(&str, &str)> = env_pairs
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let acp = AcpProcess::spawn_with(&env, Policy::AllowOnce);
+    acp.initialize();
+    let cwd = temp_cwd("observer");
+    let sid = acp.new_session(2, &cwd)["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // Auto approval: zero permission noise, pure lifecycle observation.
+    acp.send(&json!({
+        "jsonrpc": "2.0", "id": 3, "method": "session/set_config_option",
+        "params": {"sessionId": sid, "configId": "approval", "value": "auto"}
+    }));
+    let _ = acp.wait_response(3, Duration::from_secs(20));
+
+    assert_eq!(acp.prompt(4, &sid, "WRITE_MISSION observe"), "end_turn");
+
+    let updates = acp.updates.lock().unwrap().clone();
+    let kinds: Vec<&str> = updates
+        .iter()
+        .filter_map(|u| u["sessionUpdate"].as_str())
+        .collect();
+    assert!(
+        kinds.contains(&"agent_thought_chunk"),
+        "reasoning must surface as a thought chunk: {kinds:?}"
+    );
+    let thought = updates
+        .iter()
+        .find(|u| u["sessionUpdate"] == "agent_thought_chunk")
+        .expect("thought");
+    assert_eq!(
+        thought["content"]["text"], "I will act on the mission, then report.",
+        "the provider's reasoning field reaches the host verbatim"
+    );
+    let card = updates
+        .iter()
+        .find(|u| u["sessionUpdate"] == "tool_call" && u["name"] == "write_file")
+        .expect("tool card");
+    assert_eq!(card["kind"], "edit", "write_file maps to the edit kind");
+    assert_eq!(card["status"], "in_progress");
+    assert_eq!(card["toolCallId"].as_str().unwrap(), "tool-1");
+    let done = updates
+        .iter()
+        .find(|u| u["sessionUpdate"] == "tool_call_update")
+        .expect("card close");
+    assert_eq!(done["status"], "completed");
+    assert_eq!(
+        done["toolCallId"], card["toolCallId"],
+        "the completion must correlate with the started card (cora MAJOR)"
+    );
+    assert!(
+        done["content"][0]["content"]["text"]
+            .as_str()
+            .unwrap()
+            .len()
+            <= 201,
+        "preview is bounded"
+    );
+    // Ordering: thought strictly before the tool card.
+    let thought_idx = kinds
+        .iter()
+        .position(|k| *k == "agent_thought_chunk")
+        .unwrap();
+    let card_idx = kinds.iter().position(|k| *k == "tool_call").unwrap();
+    assert!(thought_idx < card_idx, "thought first, action after");
+}
+
+/// Issue #196 phase 4, end-to-end: the model's update_plan call reaches
+/// the host as a standard `plan` session/update (Termul PlanPanel
+/// shape), with validated/normalized entries.
+#[test]
+fn plan_updates_reach_the_host() {
+    let env_pairs = provider_env().1;
+    let env: Vec<(&str, &str)> = env_pairs
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let acp = AcpProcess::spawn_with(&env, Policy::AllowOnce);
+    acp.initialize();
+    let cwd = temp_cwd("plan");
+    let sid = acp.new_session(2, &cwd)["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    acp.send(&json!({
+        "jsonrpc": "2.0", "id": 3, "method": "session/set_config_option",
+        "params": {"sessionId": sid, "configId": "approval", "value": "auto"}
+    }));
+    let _ = acp.wait_response(3, Duration::from_secs(20));
+
+    assert_eq!(acp.prompt(4, &sid, "PLAN_MISSION plan it"), "end_turn");
+
+    let updates = acp.updates.lock().unwrap().clone();
+    let plan = updates
+        .iter()
+        .find(|u| u["sessionUpdate"] == "plan")
+        .expect("a plan update must reach the host");
+    let entries = plan["entries"].as_array().expect("entries array");
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0]["content"], "read the spec");
+    assert_eq!(entries[0]["status"], "completed");
+    assert_eq!(entries[1]["priority"], "medium", "spec default applied");
 }
