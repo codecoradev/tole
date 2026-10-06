@@ -822,6 +822,7 @@ const TRUST_PRESETS: &[(&str, &[&str])] = &[
             "verify_package",
             "job_*",
             "tole_session_*",
+            "todo_write",
         ],
     ),
     (
@@ -1340,6 +1341,22 @@ fn run_command(
         JsonlStorage::create_with(sessions_dir, &session_id, None, system_prompt.as_deref())
             .with_context(|| format!("creating session {session_id}"))?;
     println!("session: {session_id}");
+    // Task-list tools (issue #198): fresh session → empty state; both
+    // tools join the registry (todo_write absent in plan mode via the
+    // retain_read_only filter above — registration here is additive).
+    let todo_state = tole_core::todo::TodoState::shared();
+    registry
+        .register(Box::new(tole_core::todo::TodoReadTool::new(
+            std::sync::Arc::clone(&todo_state),
+        )))
+        .map_err(|e| anyhow::anyhow!("registering todo_read: {e}"))?;
+    if !host.plan_mode {
+        registry
+            .register(Box::new(tole_core::todo::TodoWriteTool::new(
+                std::sync::Arc::clone(&todo_state),
+            )))
+            .map_err(|e| anyhow::anyhow!("registering todo_write: {e}"))?;
+    }
 
     let mut provider = OpenAiProvider::new(cfg).with_tool_specs(registry.specs());
     if let Some(sys) = system_prompt.as_deref() {
@@ -1407,6 +1424,27 @@ fn resume_command(
         host.agents_worktree,
         allow_patterns,
     )?;
+    // Task-list tools (issue #198): state hydrated from the replayed
+    // transcript so a resumed mission keeps its plan. Registered BEFORE
+    // the plan-mode filter — todo_write must be ABSENT on the wire under
+    // --plan-mode (the retain_read_only guarantee), not merely gated.
+    {
+        let todo_state = tole_core::todo::TodoState::shared();
+        {
+            use tole_core::storage::Storage;
+            todo_state.hydrate(storage.entries());
+        }
+        registry
+            .register(Box::new(tole_core::todo::TodoReadTool::new(
+                std::sync::Arc::clone(&todo_state),
+            )))
+            .map_err(|e| anyhow::anyhow!("registering todo_read: {e}"))?;
+        registry
+            .register(Box::new(tole_core::todo::TodoWriteTool::new(
+                std::sync::Arc::clone(&todo_state),
+            )))
+            .map_err(|e| anyhow::anyhow!("registering todo_write: {e}"))?;
+    }
     // Plan mode (issue #109): the guarantee is ABSENCE on the wire, not
     // approval — filtered tools never appear in specs().
     if host.plan_mode {
