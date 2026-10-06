@@ -156,6 +156,12 @@ pub trait Storage {
         None
     }
 
+    /// The operator alias (issue #216), if the session was created with
+    /// `run --name`. Default None so other backends stay unaffected.
+    fn session_name(&self) -> Option<&str> {
+        None
+    }
+
     /// In-memory snapshot of the machine state (pc + seq).
     fn state(&self) -> MachineState;
 
@@ -218,6 +224,10 @@ struct HeaderLine {
         skip_serializing_if = "Option::is_none"
     )]
     system_prompt: Option<String>,
+    /// Operator alias (issue #216): `run --name batch-1`. Optional +
+    /// skipped when absent, so pre-name files replay unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
 }
 
 /// Discriminated record inside a commit line (array element or solo object).
@@ -294,6 +304,8 @@ pub struct JsonlStorage {
     created_at: u64,
     cwd: String,
     system_prompt: Option<String>,
+    /// Operator alias (issue #216), pinned in the header.
+    name: Option<String>,
     /// Set when an append previously failed mid-write (cora full-scan
     /// #53): the file may now end in a newline-less fragment, so ANY
     /// further commit could glue its line onto the fragment and brick
@@ -327,6 +339,19 @@ impl JsonlStorage {
         cwd: Option<String>,
         system_prompt: Option<&str>,
     ) -> Result<Self, StorageError> {
+        Self::create_named(dir, session_id, cwd, system_prompt, None)
+    }
+
+    /// Issue #216: create with a pinned system prompt AND an operator
+    /// alias (`run --name`). Additive header field — pre-name files
+    /// replay unchanged.
+    pub fn create_named(
+        dir: impl AsRef<Path>,
+        session_id: impl Into<String>,
+        cwd: Option<String>,
+        system_prompt: Option<&str>,
+        name: Option<&str>,
+    ) -> Result<Self, StorageError> {
         let session_id = session_id.into();
         let path = dir.as_ref().join(format!("{session_id}.jsonl"));
         let created_at = now_ms();
@@ -339,6 +364,7 @@ impl JsonlStorage {
             created_at,
             cwd: cwd.clone(),
             system_prompt: system_prompt.map(str::to_string),
+            name: name.map(str::to_string),
         };
         let mut writer = BufWriter::new(
             OpenOptions::new()
@@ -354,6 +380,7 @@ impl JsonlStorage {
             writer,
             created_at,
             cwd,
+            name: name.map(str::to_string),
             system_prompt: system_prompt.map(str::to_string),
             entries: Vec::new(),
             by_id: BTreeMap::new(),
@@ -422,6 +449,7 @@ impl JsonlStorage {
             writer: BufWriter::new(OpenOptions::new().append(true).open(&path)?),
             created_at: header.created_at,
             cwd: header.cwd.clone(),
+            name: header.name.clone(),
             system_prompt: header.system_prompt.clone(),
             entries: Vec::new(),
             by_id: BTreeMap::new(),
@@ -737,6 +765,10 @@ impl Storage for JsonlStorage {
         self.system_prompt.as_deref()
     }
 
+    fn session_name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
     fn state(&self) -> MachineState {
         self.state
     }
@@ -957,6 +989,7 @@ impl Storage for JsonlStorage {
                 storage_version: STORAGE_VERSION,
                 created_at: self.created_at,
                 cwd: self.cwd.clone(),
+                name: self.name.clone(),
                 system_prompt: self.system_prompt.clone(),
             };
             writeln!(w, "{}", serde_json::to_string(&header)?)?;

@@ -165,6 +165,10 @@ mid-mission resumes exactly where it stopped (`tole mission --resume
 tools stay un-auto-allowable, and a durable summary lands on the
 session either way. Plans ride the `todo_write`/`todo_read` tools
 (#198); budget exhaustion settles resumably, never a dead session.
+Run ergonomics (#216): `run --prompt-file <path>` (`-` = stdin),
+`--name <alias>` (stored in the session header — `tole sessions` shows
+it and `resume` accepts the alias), and `--timeout <secs>` (wall-clock
+cap; expiry cancels at a checkpoint — resumable, never dead).
 Budget tiers (#201): conservative defaults (48 steps / 15 min / 200k
 tokens) with headroom under `--trust internal` (96 / 30 / 500k) —
 explicit flags always win; a durable cost report (turns, steps, tokens,
