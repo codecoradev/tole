@@ -78,17 +78,25 @@ pub fn run(check_only: bool, yes: bool) -> anyhow::Result<i32> {
         anyhow::bail!("cargo install failed (exit {status})");
     }
 
-    // Verify the shim now reports the new version.
-    let bin = exe
-        .parent()
-        .map(|d| d.join("tole"))
-        .unwrap_or_else(|| std::path::PathBuf::from("tole"));
-    match Command::new(&bin).arg("--version").output() {
+    // Verify the CARGO-INSTALLED binary reports the new version — not
+    // the sibling of the currently running exe (cora alert): on a
+    // source checkout (exe = target/debug/tole) the cargo install lands
+    // in ~/.cargo/bin/tole, a different path entirely.
+    let cargo_bin = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .map(|h| {
+            std::path::PathBuf::from(h)
+                .join(".cargo")
+                .join("bin")
+                .join("tole")
+        })
+        .unwrap_or_else(|_| std::path::PathBuf::from("tole"));
+    match Command::new(&cargo_bin).arg("--version").output() {
         Ok(out) if out.status.success() => {
             let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            println!("verified: {v}");
+            println!("verified: {v} ({cargo_bin:?})");
         }
-        _ => eprintln!("warning: could not verify the upgraded binary"),
+        _ => eprintln!("warning: could not verify the upgraded binary at {cargo_bin:?}"),
     }
 
     println!("upgrade complete: {current} -> {latest}");
