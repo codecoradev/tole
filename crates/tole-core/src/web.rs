@@ -25,21 +25,66 @@ const SNIPPET_CAP_CHARS: usize = 400;
 /// Redirect hops allowed before refusing (each hop re-validated).
 const MAX_REDIRECTS: usize = 5;
 
-/// Shared HTTP plumbing: a 30 s agent with AUTO-REDIRECTS OFF — every
-/// hop is validated against the SSRF guard manually (a public URL that
-/// bounces to an internal one is the classic bypass).
-fn agent() -> ureq::Agent {
-    ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(30)))
-        .max_redirects(0)
-        .build()
-        .new_agent()
+/// Resolve `host` to addresses via the OS resolver (same source the
+/// request itself would use).
+fn resolve_host(host: &str) -> Result<Vec<std::net::IpAddr>, String> {
+    use std::net::ToSocketAddrs;
+    let addrs: Vec<std::net::IpAddr> = (host, 443u16)
+        .to_socket_addrs()
+        .map_err(|e| format!("web_fetch: resolving {host}: {e}"))?
+        .map(|a| a.ip())
+        .collect();
+    if addrs.is_empty() {
+        return Err(format!("web_fetch: host {host} did not resolve"));
+    }
+    Ok(addrs)
 }
 
-/// SSRF guard (cora MAJOR on #215): resolve the host and refuse
-/// loopback / link-local (cloud metadata!) / private / unspecified
-/// ranges. `TOLE_WEB_ALLOW_PRIVATE=1` opts out for local development
-/// and tests — an explicit, documented escape hatch, never a default.
+/// True when `ip` must not be fetched: loopback, link-local (cloud
+/// metadata!), private, unspecified, broadcast — plus the IPv6
+/// neighbors of those: IPv4-mapped literals (`::ffff:169.254.169.254`
+/// is the metadata endpoint as surely as the v4 literal) and ULA
+/// `fc00::/7`. The v6 link-local mask is the canonical /10, not /16.
+fn ip_is_private(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+        }
+        std::net::IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return ip_is_private(&std::net::IpAddr::V4(v4));
+            }
+            let seg = v6.segments();
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (seg[0] & 0xffc0) == 0xfe80
+                || (seg[0] & 0xfe00) == 0xfc00
+        }
+    }
+}
+
+/// Host extraction via the `http` crate's URI parser
+/// (`Authority::host`): case-insensitive, userinfo-aware (`user@host`),
+/// and query/fragment NEVER reach the authority (cora: `?`/`#`-
+/// terminated authorities defeated the old manual string splits).
+/// Brackets stripped for resolver consumption.
+fn parse_host(url: &str) -> Result<String, String> {
+    let uri: ureq::http::Uri = url
+        .parse()
+        .map_err(|e| format!("web_fetch: unparseable URL: {e}"))?;
+    uri.host()
+        .map(|h| {
+            h.trim_start_matches('[')
+                .trim_end_matches(']')
+                .to_ascii_lowercase()
+        })
+        .ok_or_else(|| "web_fetch: URL has no host".into())
+}
+
 fn host_is_public(url: &str) -> Result<(), String> {
     let opt_out = std::env::var("TOLE_WEB_ALLOW_PRIVATE")
         .map(|v| v == "1")
@@ -52,48 +97,102 @@ fn host_is_public_opt(url: &str, opt_out: bool) -> Result<(), String> {
     if opt_out {
         return Ok(());
     }
-    let host = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
-    let host = host.split('/').next().unwrap_or("");
-    let host = host.rsplit_once('@').map(|(_, h)| h).unwrap_or(host);
-    // Bracketed IPv6 literals ([::1]:port): strip brackets WITHOUT
-    // splitting on ':' — splitting turned "[::1]" into "[" (cora-cycle
-    // test failure).
-    let host = if let Some(stripped) = host.strip_prefix('[') {
-        stripped.split(']').next().unwrap_or(stripped)
-    } else {
-        host.split(':').next().unwrap_or(host)
-    };
-    use std::net::ToSocketAddrs;
-    let addrs: Vec<std::net::IpAddr> = (host, 443u16)
-        .to_socket_addrs()
-        .map_err(|e| format!("web_fetch: resolving {host}: {e}"))?
-        .map(|a| a.ip())
-        .collect();
-    if addrs.is_empty() {
-        return Err(format!("web_fetch: host {host} did not resolve"));
-    }
+    let host = parse_host(url)?;
+    let addrs = resolve_host(&host)?;
     for ip in &addrs {
-        let private = match ip {
-            std::net::IpAddr::V4(v4) => {
-                v4.is_loopback()
-                    || v4.is_private()
-                    || v4.is_link_local()
-                    || v4.is_unspecified()
-                    || v4.is_broadcast()
-            }
-            std::net::IpAddr::V6(v6) => {
-                v6.is_loopback() || v6.is_unspecified() || (v6.segments()[0] & 0xffc0) == 0xfe80
-            }
-        };
-        if private {
+        if ip_is_private(ip) {
             return Err(format!(
-                "web_fetch: {host} resolves to a private/loopback address ({ip}) —                  internal networks are not fetchable (TOLE_WEB_ALLOW_PRIVATE=1 opts out)"
+                "web_fetch: {host} resolves to a private/loopback address ({ip}) — \
+                 internal networks are not fetchable (TOLE_WEB_ALLOW_PRIVATE=1 opts out)"
             ));
         }
     }
     Ok(())
 }
 
+thread_local! {
+    /// Addresses vetted for the NEXT fetch on this thread. The fetch
+    /// agent's resolver answers ONLY with these — a DNS rebinding that
+    /// flips between the check and the connect cannot re-point the
+    /// request into an internal network (cora DNS-rebinding MAJOR).
+    static VETTED: std::cell::RefCell<Vec<std::net::IpAddr>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Validate `url` through the SSRF guard, pin its resolved addresses,
+/// and return an agent whose resolver answers only with those pins.
+/// The pinning consumes the guard's OWN resolution (same OS resolver),
+/// closing the check-vs-connect gap. `web_search` has no user URL
+/// (its endpoint is the configured backend), so the plain agent
+/// suffices there.
+fn fetch_agent_vetted(url: &str) -> Result<ureq::Agent, String> {
+    host_is_public(url)?;
+    let addrs = resolve_host(&parse_host(url)?)?;
+    VETTED.with(|v| {
+        let mut v = v.borrow_mut();
+        v.clear();
+        v.extend(addrs);
+    });
+    Ok(ureq::Agent::with_parts(
+        ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(30)))
+            .max_redirects(0)
+            .build(),
+        ureq::unversioned::transport::DefaultConnector::default(),
+        PinningResolver,
+    ))
+}
+
+/// Resolver answering ONLY with this thread's vetted addresses.
+#[derive(Debug)]
+struct PinningResolver;
+
+impl ureq::unversioned::resolver::Resolver for PinningResolver {
+    fn resolve(
+        &self,
+        uri: &ureq::http::Uri,
+        _config: &ureq::config::Config,
+        _timeout: ureq::unversioned::transport::NextTimeout,
+    ) -> Result<ureq::unversioned::resolver::ResolvedSocketAddrs, ureq::Error> {
+        let _ = uri;
+        VETTED.with(|v| {
+            let vetted = v.borrow();
+            if vetted.is_empty() {
+                return Err(ureq::Error::HostNotFound);
+            }
+            let mut out = ureq::unversioned::resolver::ResolvedSocketAddrs::from_fn(|_| {
+                std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0)
+            });
+            out.truncate(0);
+            let port = uri.port_u16().unwrap_or(match uri.scheme_str() {
+                Some("http") => 80,
+                _ => 443,
+            });
+            for ip in vetted.iter().take(16) {
+                out.push(std::net::SocketAddr::new(*ip, port));
+            }
+            if out.is_empty() {
+                return Err(ureq::Error::HostNotFound);
+            }
+            Ok(out)
+        })
+    }
+}
+
+/// Search-only plumbing (no user URL → no SSRF surface): a 30 s agent
+/// with AUTO-REDIRECTS OFF.
+fn agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(30)))
+        .max_redirects(0)
+        .build()
+        .new_agent()
+}
+
+/// SSRF guard (cora MAJOR on #215): resolve the host and refuse
+/// loopback / link-local (cloud metadata!) / private / unspecified
+/// ranges. `TOLE_WEB_ALLOW_PRIVATE=1` opts out for local development
+/// and tests — an explicit, documented escape hatch, never a default.
 /// Resolve a possibly-relative Location against the previous URL
 /// (minimal join: absolute URLs pass through; leading-/ paths join the
 /// origin; everything else joins the current directory).
@@ -228,9 +327,10 @@ impl Tool for WebFetchTool {
         if !(url.starts_with("http://") || url.starts_with("https://")) {
             return Err("web_fetch: only http(s) URLs".into());
         }
-        host_is_public(&url)?;
-        // Manual redirect following: every hop re-runs the SSRF guard.
-        let mut res = agent()
+        // Manual redirect following: every hop re-runs the SSRF guard
+        // AND re-pins the resolver to the hop's own vetted addresses
+        // (DNS rebinding between hops is the same TOCTOU class).
+        let mut res = fetch_agent_vetted(&url)?
             .get(&url)
             .call()
             .map_err(|e| format!("web_fetch: {e}"))?;
@@ -246,8 +346,7 @@ impl Tool for WebFetchTool {
                 .map(str::to_string)
                 .ok_or_else(|| format!("web_fetch: {status} redirect without Location"))?;
             url = join_redirect(&url, &location);
-            host_is_public(&url)?;
-            res = agent()
+            res = fetch_agent_vetted(&url)?
                 .get(&url)
                 .call()
                 .map_err(|e| format!("web_fetch: {e}"))?;
@@ -510,12 +609,61 @@ mod tests {
 }
 
 #[test]
+fn ssrf_guard_covers_rebinding_and_bypass_classes() {
+    // cora MAJOR fixes (PR #221 review round):
+    // 1) IPv4-mapped IPv6 literals — the metadata endpoint in v6 clothes.
+    // 2) ULA fc00::/7.
+    // 3) userinfo / query / fragment authority tricks that defeated the
+    //    manual string splits (`http://evil@10.0.0.9/`, `http://x.io?10.0.0.9`).
+    // These are literal-IP hosts: no DNS, no network in the pure form.
+    for url in [
+        "http://[::ffff:169.254.169.254]/metadata",
+        "http://[::ffff:10.0.0.9]/",
+        "http://[fd00::1]/",
+        "http://[fe80::1]/",
+        "http://user@10.1.2.3/",
+        "http://user:pass@192.168.0.9:8080/",
+    ] {
+        let err = host_is_public_opt(url, false).expect_err(&format!("{url} must be refused"));
+        assert!(err.contains("private/loopback"), "{url}: {err}");
+    }
+    // Public literal IPs still pass (no DNS involved) — including when
+    // query/fragment contain private-IP text (the authority is what
+    // matters; the OLD splitter resolved the query tail as the host).
+    for url in [
+        "https://93.184.216.34/",
+        "https://[2606:2800:220:1:248:1893:25c8:1946]/",
+        "http://8.8.8.8?next=http://10.9.9.9/",
+        "http://8.8.8.8#http://10.9.9.9/",
+    ] {
+        assert!(host_is_public_opt(url, false).is_ok(), "{url}");
+    }
+}
+
+#[test]
+fn parse_host_uses_uri_authority_not_string_splits() {
+    // The old splitter took everything before '?'/'#' as part of the
+    // host candidate and only handled '@' on the right side; the URI
+    // parser must own this.
+    assert_eq!(
+        parse_host("https://Example.COM/Path?q=1").unwrap(),
+        "example.com"
+    );
+    assert_eq!(parse_host("http://user@10.0.0.1/x").unwrap(), "10.0.0.1");
+    assert_eq!(
+        parse_host("http://[2001:db8::1]:8443/x").unwrap(),
+        "2001:db8::1"
+    );
+    assert!(parse_host("not a url at all").is_err());
+}
+
+#[test]
 fn ssrf_guard_refuses_private_hosts_without_opt_out() {
     // Pure form: no process env (parallel env tests race), no network.
     for url in [
-        "http://127.0.0.1:1/secret",
-        "http://169.254.169.254/latest/meta-data/",
-        "http://10.0.0.5/admin",
+        "https://127.0.0.1:1/secret",
+        "https://169.254.169.254/latest/meta-data/",
+        "https://10.0.0.5/admin",
         "http://192.168.1.1/",
         "http://[::1]/",
     ] {
