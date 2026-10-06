@@ -336,3 +336,53 @@ fn budget_exhaustion_settles_resumably() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Issue #201: a token ceiling trips `exhausted_tokens`, and the
+/// durable cost report (with tier + tool-call counts) is visible via
+/// `tole status`.
+#[test]
+fn token_budget_and_cost_report_visible_in_status() {
+    let base = spawn_mock("NONE".into());
+    let dir = temp_dir("tokens");
+    let env = [
+        ("TOLE_BASE_URL".to_string(), base),
+        ("TOLE_MODEL".to_string(), "mock-model".to_string()),
+        ("TOLE_API_KEY".to_string(), "sk-test".to_string()),
+    ];
+    let env_ref: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let sessions = dir.join("sessions");
+    let (out, err, code) = run_tole(
+        &env_ref,
+        &[
+            "mission",
+            "-s",
+            sessions.to_str().unwrap(),
+            "--yes",
+            "--max-tokens",
+            "1",
+            "work until tokens run out",
+        ],
+    );
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("status: exhausted_tokens"), "{out}");
+
+    let session_id = out
+        .lines()
+        .find_map(|l| l.strip_prefix("mission: "))
+        .expect("session id")
+        .to_string();
+    let (status_out, status_err, status_code) = run_tole(
+        &env_ref,
+        &["status", "-s", sessions.to_str().unwrap(), &session_id],
+    );
+    assert_eq!(status_code, 0, "{status_err}");
+    assert!(
+        status_out.contains("mission:"),
+        "status must render the cost report: {status_out}"
+    );
+    assert!(
+        status_out.contains("exhausted_tokens") && status_out.contains("tool_calls"),
+        "the report carries status + per-tier counts: {status_out}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

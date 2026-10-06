@@ -140,12 +140,16 @@ tole mission "ship the feature" --max-steps 48 --max-minutes 15 \
 Autonomous turn-chaining toward a goal (#199): the existing turn
 machinery looped until the model declares `MISSION_COMPLETE` (and
 `--verify` exits 0, when set) or a budget trips (`--max-steps`,
-`--max-minutes`). Every chained turn is a normal durable turn — crash
+`--max-minutes`, `--max-tokens`). Every chained turn is a normal durable turn — crash
 mid-mission resumes exactly where it stopped (`tole mission --resume
 <id>`, or plain `tole resume`), cancel works unchanged, Destructive
 tools stay un-auto-allowable, and a durable summary lands on the
 session either way. Plans ride the `todo_write`/`todo_read` tools
 (#198); budget exhaustion settles resumably, never a dead session.
+Budget tiers (#201): conservative defaults (48 steps / 15 min / 200k
+tokens) with headroom under `--trust internal` (96 / 30 / 500k) —
+explicit flags always win; a durable cost report (turns, steps, tokens,
+per-risk-tier tool calls) lands on the session and `tole status` renders it.
 
 ## Approval gates
 
