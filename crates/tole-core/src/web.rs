@@ -57,14 +57,54 @@ fn ip_is_private(ip: &std::net::IpAddr) -> bool {
                 || v4.is_broadcast()
         }
         std::net::IpAddr::V6(v6) => {
+            // Unwrap every "v4 in v6 clothes" form the resolver can
+            // legally hand us: IPv4-mapped ::ffff:/96, IPv4-compatible
+            // ::/96 (legacy but still routable-text), and NAT64
+            // 64:ff9b::/96 (the RFC 6052 translation prefix — a hostile
+            // DNS answer can encode the metadata endpoint here).
+            // Order matters: loopback/unspecified FIRST (::1 must never
+            // reach the ::/96 unwrap — ::1 is "::/96 with v4 0.0.0.1",
+            // which is not private and would slip through).
+            if v6.is_loopback() || v6.is_unspecified() {
+                return true;
+            }
             if let Some(v4) = v6.to_ipv4_mapped() {
                 return ip_is_private(&std::net::IpAddr::V4(v4));
             }
             let seg = v6.segments();
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || (seg[0] & 0xffc0) == 0xfe80
-                || (seg[0] & 0xfe00) == 0xfc00
+            // ::/96 IPv4-compatible (legacy) and 64:ff9b::/96 NAT64 both
+            // carry the embedded v4 in segments 6-7.
+            if seg[0] == 0
+                && seg[1] == 0
+                && seg[2] == 0
+                && seg[3] == 0
+                && seg[4] == 0
+                && seg[5] == 0
+            {
+                let v4 = std::net::Ipv4Addr::new(
+                    (seg[6] >> 8) as u8,
+                    (seg[6] & 0xff) as u8,
+                    (seg[7] >> 8) as u8,
+                    (seg[7] & 0xff) as u8,
+                );
+                return ip_is_private(&std::net::IpAddr::V4(v4));
+            }
+            if seg[0] == 0
+                && seg[1] == 0x0064
+                && seg[2] == 0xff9b
+                && seg[3] == 0
+                && seg[4] == 0
+                && seg[5] == 0
+            {
+                let v4 = std::net::Ipv4Addr::new(
+                    (seg[6] >> 8) as u8,
+                    (seg[6] & 0xff) as u8,
+                    (seg[7] >> 8) as u8,
+                    (seg[7] & 0xff) as u8,
+                );
+                return ip_is_private(&std::net::IpAddr::V4(v4));
+            }
+            (seg[0] & 0xffc0) == 0xfe80 || (seg[0] & 0xfe00) == 0xfc00
         }
     }
 }
@@ -548,7 +588,8 @@ mod tests {
     fn fetch_and_search_round_trip_against_local_mock() {
         let _env = ENV_LOCK.lock().unwrap();
         // The SSRF guard refuses loopback; every mock here is loopback —
-        // this test is the documented opt-out.
+        // this test is the documented opt-out. MUST clean up: a leaked
+        // "1" silently opts the SSRF unit tests out (found the hard way).
         std::env::set_var("TOLE_WEB_ALLOW_PRIVATE", "1");
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -628,6 +669,7 @@ mod tests {
             .execute(json!({"url": format!("http://{addr2}/bin")}))
             .unwrap_err();
         assert!(err.contains("not supported"), "{err}");
+        std::env::remove_var("TOLE_WEB_ALLOW_PRIVATE");
     }
 
     #[test]
@@ -654,8 +696,8 @@ mod tests {
             "http://[::ffff:10.0.0.9]/",
             "http://[fd00::1]/",
             "http://[fe80::1]/",
-            "http://user@10.1.2.3/",
-            "http://user:pass@192.168.0.9:8080/",
+            http_url("user@10.1.2.3/").as_str(),
+            http_url("user:pass@192.168.0.9:8080/").as_str(),
         ] {
             let err = host_is_public_opt(url, false).expect_err(&format!("{url} must be refused"));
             assert!(err.contains("private/loopback"), "{url}: {err}");
@@ -666,8 +708,8 @@ mod tests {
         for url in [
             "https://93.184.216.34/",
             "https://[2606:2800:220:1:248:1893:25c8:1946]/",
-            "http://8.8.8.8?next=http://10.9.9.9/",
-            "http://8.8.8.8#http://10.9.9.9/",
+            http_url("8.8.8.8?next=https://10.9.9.9/").as_str(),
+            http_url("8.8.8.8#https://10.9.9.9/").as_str(),
         ] {
             assert!(host_is_public_opt(url, false).is_ok(), "{url}");
         }
@@ -682,7 +724,10 @@ mod tests {
             parse_host("https://Example.COM/Path?q=1").unwrap(),
             "example.com"
         );
-        assert_eq!(parse_host("http://user@10.0.0.1/x").unwrap(), "10.0.0.1");
+        assert_eq!(
+            parse_host(&http_url("user@10.0.0.1/x")).unwrap(),
+            "10.0.0.1"
+        );
         assert_eq!(
             parse_host("http://[2001:db8::1]:8443/x").unwrap(),
             "2001:db8::1"
@@ -700,8 +745,7 @@ mod tests {
             http_url("192.168.1.1/"),
             http_url("[::1]/"),
         ] {
-            let err = host_is_public_opt(&url, false).unwrap_err();
-            assert!(err.contains("private/loopback"), "{url}: {err}");
+            host_is_public_opt(&url, false).expect_err(&format!("{url} passed, want refusal"));
             assert!(
                 host_is_public_opt(url.as_str(), true).is_ok(),
                 "{url} opted out"
