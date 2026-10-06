@@ -1204,6 +1204,14 @@ fn build_registry(
     }
     reg.register(Box::new(ReadFileTool::new(file_root.clone())))
         .map_err(|e| anyhow::anyhow!("registering read_file: {e}"))?;
+    // Web tools (issue #215): probe-first — fetch always; search only
+    // with TOLE_WEB_SEARCH_URL.
+    reg.register(Box::new(tole_core::web::WebFetchTool))
+        .map_err(|e| anyhow::anyhow!("registering web_fetch: {e}"))?;
+    if tole_core::web::WebSearchTool::from_env().is_some() {
+        reg.register(Box::new(tole_core::web::WebSearchTool::from_env().unwrap()))
+            .map_err(|e| anyhow::anyhow!("registering web_search: {e}"))?;
+    }
     // Write tools: gated per call. The jail root is the workspace.
     reg.register(Box::new(WriteFileTool::new(file_root.clone())))
         .map_err(|e| anyhow::anyhow!("registering write_file: {e}"))?;
@@ -1333,6 +1341,14 @@ fn build_server_registry(
     }
     reg.register(Box::new(ReadFileTool::new(file_root.clone())))
         .map_err(|e| anyhow::anyhow!("registering read_file: {e}"))?;
+    // Web tools (issue #215): probe-first — fetch always; search only
+    // with TOLE_WEB_SEARCH_URL.
+    reg.register(Box::new(tole_core::web::WebFetchTool))
+        .map_err(|e| anyhow::anyhow!("registering web_fetch: {e}"))?;
+    if tole_core::web::WebSearchTool::from_env().is_some() {
+        reg.register(Box::new(tole_core::web::WebSearchTool::from_env().unwrap()))
+            .map_err(|e| anyhow::anyhow!("registering web_search: {e}"))?;
+    }
     reg.register(Box::new(WriteFileTool::new(file_root.clone())))
         .map_err(|e| anyhow::anyhow!("registering write_file: {e}"))?;
     reg.register(Box::new(EditFileTool::new(file_root.clone())))

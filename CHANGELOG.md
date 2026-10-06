@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `web_fetch` / `web_search` (#215): read-only internet access — fetch
+  is direct HTTPS (512 KB cap, content-type allowlist, HTML→text), search
+  probe-gated on `TOLE_WEB_SEARCH_URL` (fleet backend contract). No
+  backend, no tool.
 - Run ergonomics (#216): `run --prompt-file <path|->`, `--name <alias>`
   (header-pinned; `tole sessions` shows it, `resume` accepts it), and
   `--timeout <secs>` wall-clock cap (checkpoint cancel — settles
