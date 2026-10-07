@@ -29,19 +29,22 @@ pub const MAX_STEPS: usize = 32;
 /// the cheapest failure mode to detect deterministically.
 pub const LOOP_TRIP_AFTER: usize = 3;
 
-/// Poll-tool ceiling (#85): polling tools (`job_poll`) legitimately call
-/// with identical input for the whole duration of a detached job — the
-/// guard's stuck-model heuristic does not apply to them until the model
-/// keeps polling far past any sane job-wait budget. 120 polls ≈ hours
-/// of attached waiting; a real loop still trips well before token ruin.
+/// Poll-tool ceiling (#85, #231): polling tools (`job_poll`,
+/// `agent_poll`) legitimately call with identical input for the whole
+/// duration of a detached job. 120 polls ≈ hours of attached waiting; a
+/// real loop still trips well before token ruin. This is ALSO the
+/// per-turn poll-step budget: poll executions don't consume
+/// [`MAX_STEPS`], so a long attached wait can no longer die at step 32
+/// with BudgetExhausted — the documented patience contract is now the
+/// implemented one.
 pub const POLL_LOOP_TRIP_AFTER: usize = 120;
 
-/// Poll-style tools: identical consecutive input is the CORRECT pattern
-/// (the arguments name the job; the result carries the change). Registry
-/// classification, not a hardcoded name list, keeps this honest — a new
-/// poll tool opts in via `Tool::is_poll()`.
-fn is_poll_tool(name: &str) -> bool {
-    name == "job_poll" || name == "agent_poll"
+/// Registry classification for poll-style tools (issue #231, scan
+/// finding #98): a tool opts in by overriding [`Tool::is_poll`], not by
+/// appearing on a hardcoded name list. Unregistered/unknown names are
+/// not poll tools.
+pub fn is_poll_tool(registry: &ToolRegistry, name: &str) -> bool {
+    registry.get(name).is_some_and(|t| t.is_poll())
 }
 
 /// One automatic retry for a timeout-classified provider failure per
@@ -246,7 +249,17 @@ pub fn resume_turn(
                     &format!("replayed intent {intent_id} carried malformed arguments"),
                 )?;
             } else {
-                if safety == ReplaySafety::Guarded {
+                // Issue #249 (rescan #127): the replay gate keys on the
+                // CURRENT registry risk, not the recorded safety. The
+                // recorded value was derived from the tool's risk at
+                // intent-commit time; if the host wiring changed (or a
+                // tool impl changed), a now-Write tool must still meet
+                // the approval gate. Idempotent-recorded ReadOnly
+                // replays get the same consultation a fresh call would.
+                let current_risk = registry.get(&tool).map(|t| t.risk());
+                let needs_gate = safety == ReplaySafety::Guarded
+                    || matches!(current_risk, Some(r) if r != Risk::ReadOnly);
+                if needs_gate {
                     let Some(t) = registry.get(&tool) else {
                         // Unregistered tool on a Guarded intent: settle the
                         // sandwich as failed so the session stays resumable
@@ -434,7 +447,27 @@ fn drive(
     // failure. Budgeted per turn, not per step — a flapping gateway must
     // not get a retry for every step of the same turn.
     let mut timeout_retries_left = PROVIDER_TIMEOUT_RETRIES;
-    for _ in 0..MAX_STEPS {
+    // Issue #231 (scan #97): MAX_STEPS counts MODEL steps of the
+    // mission; a poll step is attached waiting, not mission progress.
+    // Poll executions draw from their own budget (POLL_LOOP_TRIP_AFTER)
+    // so a long attached wait no longer dies at step 32 — the exact
+    // outcome #85 was written to prevent. The step budget still bounds
+    // everything else (provider steps, replans, tool calls), and the
+    // combined budget is hard-capped at the sum.
+    let mut steps = 0usize;
+    let mut poll_steps = 0usize;
+    while steps < MAX_STEPS {
+        steps += 1;
+        if poll_steps >= POLL_LOOP_TRIP_AFTER {
+            append_turn_error(
+                s,
+                "budget exhausted",
+                &format!("poll budget exhausted: {POLL_LOOP_TRIP_AFTER} polls in one turn"),
+            )?;
+            let seq = s.state().seq;
+            s.commit(Commit::new().transition(StateTransition::from(seq, Pc::Final)))?;
+            return Ok(TurnOutcome::BudgetExhausted);
+        }
         // Cancellation checkpoint (issue #178): a client-cancelled turn
         // stops before the next provider call and settles durably
         // (settle_cancelled) — no further tokens burn, no tool runs.
@@ -613,7 +646,15 @@ fn drive(
                 // guard still applies once the results stop changing AND
                 // the model keeps polling past the patience budget — a
                 // much higher ceiling for polls only.
-                let trip_at = if is_poll_tool(&tool) {
+                let poll = is_poll_tool(registry, &tool);
+                // Issue #231: a poll step is attached waiting, not
+                // mission progress — refund the model-step debit and
+                // draw from the dedicated poll budget instead.
+                if poll {
+                    steps = steps.saturating_sub(1);
+                    poll_steps += 1;
+                }
+                let trip_at = if poll {
                     POLL_LOOP_TRIP_AFTER
                 } else {
                     LOOP_TRIP_AFTER

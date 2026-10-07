@@ -265,9 +265,14 @@ pub fn open_session(
         reg.register(Box::new(WriteFileTool::new(workspace_canon.clone())))?;
         reg.register(Box::new(EditFileTool::new(workspace_canon.clone())))?;
         {
-            let repo =
-                detect_github_repo(&workspace_canon).unwrap_or_else(|| "codecoradev/tole".into());
-            reg.register(Box::new(GhTool::new(repo)))?;
+            // Issue #254 (rescan #24): probe-gated like the gitea tool —
+            // when GitHub detection fails, NO gh tool (a hardcoded
+            // fallback repo invited wrong-repo writes from any
+            // unrelated workspace). Absent legs degrade, never a
+            // phantom.
+            if let Some(repo) = detect_github_repo(&workspace_canon) {
+                reg.register(Box::new(GhTool::new(repo)))?;
+            }
             register_gitea(&mut reg, &workspace_canon);
         }
         reg.register(Box::new(GitTool::new().in_dir(workspace_canon.clone())))?;
@@ -344,7 +349,7 @@ pub fn open_session(
     // todo_write outputs), so crash-resume restores the last list.
     // todo_read is ReadOnly (plan-mode safe); todo_write joins the other
     // Write tools in being absent under --plan-mode.
-    let todo_state = tole_core::todo::TodoState::shared();
+    let todo_state = tole_core::todo::TodoState::new();
     todo_state.hydrate(storage.entries());
     reg.register(Box::new(tole_core::todo::TodoReadTool::new(StdArc::clone(
         &todo_state,

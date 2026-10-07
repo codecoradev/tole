@@ -62,23 +62,173 @@ const DEFAULT_TIMEOUT_SECS: u64 = 30 * 60;
 pub fn check_child_agent_argv(argv: &[String]) -> Result<(), String> {
     const ERR: &str = "child agents may not spawn or reconfigure the tole binary — the agent \
          tree is capped at one level by design (issue #171)";
-    if argv.iter().any(|a| a.contains("TOLE_AGENT_DEPTH")) {
+    if argv
+        .iter()
+        // Normalize the same way the token scan below does (CI cora
+        // round on #245: `TOLE_AGENT_DEPT""H` split the marker across
+        // quote removal; round 5: `${V}` splits it via expansion —
+        // both normalize to the literal marker here).
+        .any(|a| {
+            let stripped: String = a
+                .chars()
+                .filter(|c| !matches!(c, '"' | '\'' | '\\' | '$' | '{' | '}'))
+                .collect();
+            stripped.contains("TOLE_AGENT_DEPTH")
+        })
+    {
         return Err(ERR.to_string());
     }
-    // Word-level detection across EVERY element: wrappers smuggle the
-    // invocation inside one string (`bash -c "… exec tole run"`), so a
-    // basename check on argv[0] alone is not enough. Segments split on
-    // whitespace and shell/path separators; compound fleet names
-    // (`tole-agents`, `tole-jobs`) survive intact and stay allowed.
-    for arg in argv {
-        let segments = arg.split(|c: char| c.is_whitespace() || matches!(c, ';' | '&' | '|' | '/'));
-        for seg in segments {
-            let seg = seg.trim_end_matches(".exe");
-            if seg == "tole" || seg == "tole-cli" {
-                return Err(ERR.to_string());
+    // Issue #228 (scan #123): ONE normalized segmentation pass. Every
+    // argument is split on whitespace and shell/path/assignment
+    // separators (`; & | / =`), then quote/substitution punctuation is
+    // stripped — the SAME normalization for the env-clear detection and
+    // the binary detection (cora review round 1: matching bare `env`
+    // while the binary check normalized paths/quotes let
+    // `/usr/bin/env -i …` or `"env" -i` revive the depth-marker wipe).
+    // - `env` invocation flags `-i` / `-u` / `--ignore-environment`
+    //   (incl. compound shorts like `-iu`) are refused outright: only
+    //   an environment-clearing env can strip TOLE_AGENT_DEPTH.
+    // - The tole binary is matched AFTER stripping, so `tole"`,
+    //   `"tole"`, `t=tole`, `$(... tole)` no longer slip the exact
+    //   match; compound fleet names (`tole-agents`, `tole-jobs`) stay
+    //   allowed (the hyphen is not a separator).
+    {
+        // Contexts CROSS argv elements and are NEVER cleared mid-argv
+        // (cora review rounds 3+6): `$VAR` indirection and chained
+        // assignments (`e=env; f=-i; $e $f …`) can smuggle both the
+        // env/exec token and its flag through bare-name tokens, so any
+        // clearing rule was evadable. The cost is a small false-refusal
+        // window (`grep -i` after an env mention in the SAME argv),
+        // accepted for the depth invariant; the structural fix (depth
+        // via a marker file the child cannot env-clear) closes the
+        // class entirely.
+        // Substitution punctuation widens the ENV context (the env
+        // keyword itself may be assembled at runtime:
+        // `$(printf e)$(printf nv) -i …`, CI cora round on #245) — but
+        // ONLY the env side. The earlier version also widened exec and
+        // refused every `bash -c "echo $HOME"` (the `-c` flag matched
+        // exec's 'c' rule). The exec-keyword-via-substitution case is
+        // undecidable at the token level; it is covered by the guard
+        // boundary below (overt, auditable) and the structural
+        // marker-file follow-up.
+        let any_subst = argv
+            .iter()
+            .any(|a| a.contains('$') || a.contains('`') || a.contains('('));
+        let mut saw_env = false;
+        let mut saw_exec = false;
+        for arg in argv {
+            let segments =
+                arg.split(|c: char| c.is_whitespace() || matches!(c, ';' | '&' | '|' | '/' | '='));
+            for seg in segments {
+                // Track whether the RAW segment carried substitution
+                // punctuation: a wipe flag or keyword can be assembled
+                // at runtime (`env -$(echo i)`, `env $(printf '\55')`
+                // — rounds 7+10) and cannot be statically cleared.
+                let raw_subst = seg.contains('$')
+                    || seg.contains('`')
+                    || seg.contains('(')
+                    || seg.contains(')');
+                // Strip QUOTES/backslashes/substitution FIRST (CI cora
+                // round 2 on #245: `exec "tole.exe"` — trimming `.exe`
+                // before quote-stripping was a no-op while the trailing
+                // quote hid it), THEN the `.exe` suffix.
+                let tok: String = seg
+                    .chars()
+                    .filter(|c| !matches!(c, '"' | '\'' | '`' | '$' | '(' | ')' | '{' | '}' | '\\'))
+                    .collect();
+                let tok = tok.trim_end_matches(".exe").to_string();
+                if tok == "env" {
+                    saw_env = true;
+                    saw_exec = false;
+                    continue;
+                }
+                if tok == "exec" {
+                    saw_exec = true;
+                    saw_env = false;
+                    continue;
+                }
+                if tok.is_empty() {
+                    // Artifact of adjacent separators (`env | grep`):
+                    // carries no command semantics — must NOT clear the
+                    // wipe context (cora round-4 benign case).
+                    continue;
+                }
+                if tok == "tole" || tok == "tole-cli" {
+                    return Err(ERR.to_string());
+                }
+                if (saw_env || saw_exec) && raw_subst {
+                    // ANY substitution-adjacent segment in a wipe
+                    // context is refused (cora review round 10): the
+                    // flag itself may be built without a dash prefix
+                    // (`env $(printf '\55') sh` = `env -i sh`).
+                    return Err(ERR.to_string());
+                }
+                if let Some(body) = tok.strip_prefix('-') {
+                    // A dash-token whose raw form carried substitution
+                    // punctuation is refused outright in env/exec
+                    // context (round 7): `env -$(echo i)` builds the
+                    // wipe flag at runtime. Long flag after env: GNU
+                    // getopt_long accepts unambiguous abbreviations
+                    // (`--ignore-env` wipes exactly like
+                    // `--ignore-environment`, cora review round 5), so
+                    // ANY long flag in env context is treated as
+                    // env-clearing. Short clusters use containment
+                    // (`-vi`, `-iu` …), not exclusivity — same for
+                    // exec's `-cl` (round 5 #2).
+                    // env context: literal `env` seen OR substitution
+                    // anywhere (the keyword may be assembled at
+                    // runtime). Under a literal env: any long flag
+                    // (GNU abbreviation, round 5) or an i/u-containing
+                    // short cluster. Under any_subst alone: the named
+                    // env-clearing long flags, any i/u-containing
+                    // short cluster, or a substitution-built segment
+                    // (CI cora round 4: `--ignore-environment` built
+                    // next to an assembled keyword; bare `--` in
+                    // `rm -- "$f"` stays benign — its body has no
+                    // i/u).
+                    let env_clear = if saw_env {
+                        raw_subst
+                            || tok.starts_with("--")
+                            || body.chars().any(|c| c == 'i' || c == 'u')
+                    } else if any_subst {
+                        raw_subst
+                            // Long-form env-clearing flags (incl. GNU
+                            // abbreviations: `--i`, `--ignore-env` —
+                            // CI cora round 5 on #245). Any `--x` flag
+                            // next to an assembled env keyword is
+                            // refused (undecidable which abbreviation)
+                            // EXCEPT the bare `--` end-of-options
+                            // marker (`rm -- "$f"`): its strip-prefix
+                            // body is the literal "-", not empty.
+                            || (tok.starts_with("--") && tok != "--")
+                            || (!tok.starts_with("--")
+                                && body.chars().any(|c| c == 'i' || c == 'u'))
+                    } else {
+                        false
+                    };
+                    let exec_clear = saw_exec
+                        && !tok.starts_with("--")
+                        && (raw_subst || body.chars().any(|c| c == 'c'));
+                    if env_clear || exec_clear {
+                        return Err(ERR.to_string());
+                    }
+                }
             }
         }
     }
+    // Guard boundary (documented, issue #228): this is a TOKEN-level
+    // check. Two classes are explicitly OUT of scope here:
+    // 1. An interpreter script that clears the environment itself
+    //    (`python -c 'os.environ.clear(); os.execv(…)'`) — by the
+    //    module contract that is OVERT hostile action, fully visible
+    //    in the audit log, not silent budget multiplication.
+    // 2. Runtime-ASSEMBLED identifiers (`unset TOLE_AGE${V}NT_DEPTH`,
+    //    `e=e; f=xec; $e$f …`) — undecidable at the token level: any
+    //    static rule either misses a construction or refuses ordinary
+    //    variable use. The structural closure is the tracked
+    //    follow-up: propagate depth via a marker FILE the child
+    //    cannot env-clear, making every one of these constructions
+    //    inert.
     Ok(())
 }
 
@@ -138,6 +288,11 @@ pub struct AgentMeta {
     pub worktree: Option<String>,
     #[serde(default)]
     pub branch: Option<String>,
+    /// Consume-once flag, PERSISTED (issue #234): the in-process Mutex
+    /// alone lost the fact on every new parent process, so a second
+    /// poll re-recalled the mailbox after cleanup — flapping summaries.
+    #[serde(default)]
+    pub mailbox_consumed: bool,
 }
 
 fn read_meta(dir: &std::path::Path) -> Result<AgentMeta, String> {
@@ -153,7 +308,10 @@ fn write_meta(dir: &std::path::Path, meta: &AgentMeta) -> Result<(), String> {
 
 /// Count LIVE agents (used to enforce MAX concurrent). Dead-but-
 /// unconsumed agents do not block new slots. A liveness-check FAILURE
-/// is an error, not zero (CodeCora PR #174 round 2).
+/// is an error, not zero (CodeCora PR #174 round 2). Callers racing to
+/// spawn MUST hold [`agents_root_lock`] around count+register (issue
+/// #234: count-then-spawn without a lock lets two parents exceed the
+/// cap).
 fn live_agents(root: &std::path::Path) -> Result<usize, String> {
     let mut n = 0;
     let root_dir = match std::fs::read_dir(agents_root(root)) {
@@ -174,6 +332,45 @@ fn live_agents(root: &std::path::Path) -> Result<usize, String> {
         }
     }
     Ok(n)
+}
+
+/// Serialize the count-then-register critical section of
+/// `agent_start` across processes (issue #234, scan #124 TOCTOU): an
+/// exclusive flock on `<root>/tole-agents/LOCK`. Held from the
+/// liveness count until the child's pid file is written, so two
+/// concurrent parents cannot both observe "3 live" and exceed the cap.
+/// The lock lives on a FIXED file (not per-agent dirs, which are
+/// created after the check) and is advisory — cooperative by design,
+/// matching every other tole on-host contract.
+#[cfg(unix)]
+fn agents_root_lock(root: &std::path::Path) -> Result<std::fs::File, String> {
+    let lock = open_lock_file(root)?;
+    use std::os::fd::AsRawFd;
+    let rc = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) };
+    if rc != 0 {
+        return Err(format!("agents lock: {}", std::io::Error::last_os_error()));
+    }
+    Ok(lock)
+}
+
+/// Non-unix hosts run agents single-parent today; the flock is the unix
+/// serialization mechanism. Still open the SAME regular LOCK file (a
+/// directory open fails on Windows) so both platforms agree on layout.
+#[cfg(not(unix))]
+fn agents_root_lock(root: &std::path::Path) -> Result<std::fs::File, String> {
+    open_lock_file(root)
+}
+
+fn open_lock_file(root: &std::path::Path) -> Result<std::fs::File, String> {
+    let dir = agents_root(root);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("agents dir: {e}"))?;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .read(true)
+        .open(dir.join("LOCK"))
+        .map_err(|e| format!("agents lock: {e}"))
 }
 
 /// Best-effort mailbox cleanup (ephemeral default): `uteke forget`
@@ -376,6 +573,10 @@ impl Tool for AgentStartTool {
             }
             requested
         };
+        // Issue #234: hold the flock across count + register — the
+        // count-then-spawn window is the TOCTOU the scan flagged. The
+        // guard releases when `_lock` drops (spawn errors included).
+        let _lock = agents_root_lock(&self.root)?;
         let live = live_agents(&self.root)?;
         if live >= self.max_concurrent {
             return Err(format!(
@@ -438,6 +639,7 @@ impl Tool for AgentStartTool {
                 .unwrap_or(0),
             worktree: worktree.clone(),
             branch: branch.clone(),
+            mailbox_consumed: false,
         };
         write_meta(&dir, &meta)?;
 
@@ -496,6 +698,9 @@ impl Tool for AgentStartTool {
             let _ = child.wait();
             return Err(format!("agent_start: pid file: {e}"));
         }
+        // pid written = the agent is registered — the count now sees it.
+        // Release the #234 flock before the (slow) detached run.
+        drop(_lock);
         // Detach: the child survives the parent CLI exiting; we never
         // wait on it (poll checks liveness via ps, like jobs).
         drop(child);
@@ -540,6 +745,10 @@ impl Tool for AgentPollTool {
         Risk::ReadOnly
     }
 
+    fn is_poll(&self) -> bool {
+        true
+    }
+
     fn describe(&self, input: &Value) -> String {
         let id = input
             .get("agent")
@@ -572,7 +781,7 @@ impl Tool for AgentPollTool {
             .trim()
             .parse()
             .map_err(|_| format!("agent_poll: corrupt pid file for {id}"))?;
-        let meta = read_meta(&dir)?;
+        let mut meta = read_meta(&dir)?;
         let running =
             pid_alive(pid).map_err(|e| format!("agent_poll: liveness check failed: {e}"))?;
         let elapsed_ms = std::time::SystemTime::now()
@@ -614,37 +823,48 @@ impl Tool for AgentPollTool {
             return Ok(out);
         }
         // Settled: pull the summary from the mailbox, then clean it
-        // (consume-once, unless keep_mailbox).
-        let already = self
-            .consumed
-            .lock()
-            .map(|c| c.iter().any(|x| x == id))
-            .unwrap_or(false);
-        let cfg = crate::memory::MemoryConfig {
-            bin: "uteke".into(),
-            namespace: meta.mailbox_ns.clone(),
-            limit: 3,
+        // (consume-once, unless keep_mailbox). The consumed flag is
+        // PERSISTED in meta.json (issue #234) so a later poll —
+        // possibly from another parent process — does not resurrect a
+        // cleaned mailbox. The in-process Mutex is held across the
+        // ENTIRE consume section (issue #260, rescan #155: dropping it
+        // after the read let two concurrent polls both recall+clean).
+        let already = {
+            let _g = self.consumed.lock();
+            if meta.mailbox_consumed {
+                true
+            } else {
+                let cfg = crate::memory::MemoryConfig {
+                    bin: "uteke".into(),
+                    namespace: meta.mailbox_ns.clone(),
+                    limit: 3,
+                };
+                if let Some(summary) = crate::memory::recall(&cfg, &meta.prompt)
+                    .ok()
+                    .map(|hits| {
+                        hits.iter()
+                            .map(|h| h.content.clone())
+                            .collect::<Vec<_>>()
+                            .join("\n---\n")
+                    })
+                    .filter(|s| !s.is_empty())
+                {
+                    out["summary"] = json!(summary);
+                }
+                if !meta.keep_mailbox {
+                    clean_mailbox(&meta.mailbox_ns);
+                }
+                meta.mailbox_consumed = true;
+                if let Err(e) = write_meta(&dir, &meta) {
+                    // Degrade loudly-but-softly: the summary WAS
+                    // delivered; a failed persist could let a future
+                    // poll re-recall.
+                    out["consume_persist_warning"] = json!(e);
+                }
+                false
+            }
         };
-        if !already {
-            if let Some(summary) = crate::memory::recall(&cfg, &meta.prompt)
-                .ok()
-                .map(|hits| {
-                    hits.iter()
-                        .map(|h| h.content.clone())
-                        .collect::<Vec<_>>()
-                        .join("\n---\n")
-                })
-                .filter(|s| !s.is_empty())
-            {
-                out["summary"] = json!(summary);
-            }
-            if !meta.keep_mailbox {
-                clean_mailbox(&meta.mailbox_ns);
-            }
-            if let Ok(mut c) = self.consumed.lock() {
-                c.push(id.to_string());
-            }
-        }
+        let _ = already;
         Ok(out)
     }
 }
@@ -738,6 +958,163 @@ mod tests {
             "tole-jobs".into(),
         ];
         assert!(check_child_agent_argv(&ok).is_ok());
+        // No env/exec token in the argv → no wipe context at all.
+        let benign: Vec<Vec<String>> = vec![
+            vec!["cp".into(), "-u".into(), "a".into(), "b".into()],
+            vec!["bash".into(), "-c".into(), "ls -i notes".into()],
+            // Ordinary variable use is NOT a wipe (CI cora round on
+            // #245: the removed any_subst widening refused this).
+            vec!["bash".into(), "-c".into(), "echo $HOME".into()],
+            vec!["bash".into(), "-c".into(), "rm -- \"$f\"".into()],
+            vec!["bash".into(), "-c".into(), "grep -c x $(ls)".into()],
+        ];
+        for v in &benign {
+            assert!(
+                check_child_agent_argv(v).is_ok(),
+                "benign command must pass: {v:?}"
+            );
+        }
+        // Quoted .exe (CI cora round 2 on #245): the suffix trim must
+        // run AFTER quote-stripping.
+        let quoted_exe: Vec<String> =
+            vec!["bash".into(), "-c".into(), "exec \"tole.exe\" run".into()];
+        assert!(check_child_agent_argv(&quoted_exe).is_err());
+        // Documented over-block (issue #228 trade): a short i/u/c flag
+        // AFTER an env/exec token in the SAME argv is refused even when
+        // it is not a wipe (`grep -i`) — the never-clear context is the
+        // only sound token-level rule against indirection smuggling.
+        let over: Vec<String> = vec!["bash".into(), "-c".into(), "env | grep -i PATH".into()];
+        assert!(check_child_agent_argv(&over).is_err());
+        // Known token-level bypasses (issue #228 guard boundary) —
+        // pinned as OK-here assertions: the structural marker-file fix
+        // flips these to refused. Runtime-assembled identifiers are
+        // undecidable at the token level; refusing them would break
+        // ordinary variable use.
+        for known_bypass in [
+            vec![
+                "bash",
+                "-c",
+                "V=; unset TOLE_AGE${V}NT_DEPTH; p=to; \"$p\"le run",
+            ],
+            vec![
+                "bash",
+                "-c",
+                "e=e; f=xec; p=/usr/local/bin/to; $e$f -c \"$p\"le run mission",
+            ],
+        ] {
+            let owned: Vec<String> = known_bypass.iter().map(|s| s.to_string()).collect();
+            assert!(
+                check_child_agent_argv(&owned).is_ok(),
+                "documented token-level bypass changed behavior — update the guard: {known_bypass:?}"
+            );
+        }
+    }
+
+    /// Issue #228 regression (scan #123): quoting/substitution/`env -i`
+    /// bypasses are refused. The concrete exploit from the scan —
+    /// `env -i /bin/bash -c 'p=/usr/local/bin/to; exec "$p"le run
+    /// mission'` — must NOT pass the guard.
+    #[test]
+    fn child_argv_refuses_quoting_substitution_and_env_clear() {
+        for argv in [
+            // `env -i` wipes the depth marker entirely.
+            vec!["env", "-i", "/bin/bash", "-c", "tole run mission"],
+            vec!["env", "--ignore-environment", "tole", "run"],
+            // GNU abbreviation + mixed short cluster (cora round 5).
+            vec!["env", "--ignore-env", "bash", "-c", "tole run"],
+            vec!["env", "-vi", "tole", "run"],
+            // Substitution-built env keyword (CI cora round on #245):
+            // `$(printf e)$(printf nv)` expands to `env`; any_subst
+            // arms the env context so the `-i` is refused.
+            vec![
+                "bash",
+                "-c",
+                "p=/usr/local/bin/to; $(printf e)$(printf nv) -i \"$p\"le run mission",
+            ],
+            // Quote-split depth marker (CI cora round 2 on #245) —
+            // statically decodable: stripping quotes yields the literal
+            // marker. (The `${V}` variant is NOT statically decodable —
+            // documented in the guard boundary below.)
+            vec![
+                "bash",
+                "-c",
+                "unset TOLE_AGENT_DEPT\"\"H; p=/usr/local/bin/to; \"$p\"le run mission",
+            ],
+            // Assembled env keyword with abbreviated long flag (CI cora
+            // round 5 on #245): `--i` = `--ignore-environment`.
+            vec![
+                "bash",
+                "-c",
+                "p=to; $(printf e)$(printf nv) --i \"$p\"le run mission",
+            ],
+            // Path-qualified / quoted env (cora review round 1 on #228).
+            vec!["/usr/bin/env", "-i", "tole", "run"],
+            vec!["\"env\"", "-i", "tole", "run"],
+            vec!["env", "-iu", "TOLE_AGENT_DEPTH", "tole", "run"],
+            // env-clear hidden INSIDE a -c script string.
+            vec!["bash", "-c", "env -i tole run mission"],
+            vec!["sh", "-c", "env --ignore-environment tole run"],
+            // Variable indirection, 2-hop (`f=-i` then `$e $f`) —
+            // cora review round 6 on #228: context is never cleared
+            // mid-argv, so the smuggled flag is still caught.
+            vec!["bash", "-c", "e=env; f=-i; $e $f bash -c 'tole run'"],
+            // Quoting / adjacent punctuation around the binary name.
+            vec!["bash", "-c", "exec \"tole\" run"],
+            vec!["sh", "-c", "tole) run"],
+            vec!["bash", "-c", "$(... command -v tole) run mission"],
+            // Assignment-smuggled binary: `t=tole` is caught directly
+            // ('=' splits the assignment).
+            vec!["bash", "-c", "t=tole; exec $t run"],
+            // Cross-element `env -i` (cora review round 4, CRITICAL:
+            // the per-element reset skipped the flag in separate argv
+            // elements) — the scan's own exploit shape, no literal
+            // `tole` token anywhere.
+            vec![
+                "env",
+                "-i",
+                "/bin/bash",
+                "-c",
+                "p=/usr/local/bin/to; exec \"$p\"le run mission",
+            ],
+            // Benign flag reuse must NOT be refused (round 4 #2) —
+            // asserted ok below, after the refusal loop.
+            // `exec -c` = empty environment (bash/ksh) — the second
+            // wipe path (cora review round 2 on #228).
+            vec![
+                "bash",
+                "-c",
+                "p=/usr/local/bin/to; exec -c \"$p\"le run mission",
+            ],
+            vec!["bash", "-c", "exec -c tole run"],
+            // NOTE (issue #228): constructed-name concatenation like
+            // `p=/usr/local/bin/to; exec "$p"le run` is undecidable at
+            // the argv-token level, but it is NOT a bypass anymore: it
+            // inherits TOLE_AGENT_DEPTH=1 and every environment-clearing
+            // escape (`env -i/-u/--ignore-environment`, `exec -c`) is
+            // refused above, so the spawned tole starts childed — agent
+            // tools structurally absent.
+            // Backslash separator trick.
+            vec!["bash", "-c", "\\tole run"],
+            // Substitution-built env keyword (cora CI round on #245 —
+            // REVERTED later the same PR: `$(echo e)$(echo nv)` needs
+            // `saw_env` to catch the following `-i`, and it does: `env`
+            // or not, `-i` after a substitution-adjacent segment in env
+            // context is refused via raw_subst. The any_subst widening
+            // itself was removed as over-broad (blocked `echo $HOME`).
+            // Substitution-built flag (cora review round 7 on #228):
+            // `env -$(echo i)` constructs the wipe flag at runtime.
+            vec![
+                "bash",
+                "-c",
+                "env -$(echo i) bash -c 'p=/usr/local/bin/to; exec \"$p\"le run'",
+            ],
+        ] {
+            let owned: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+            assert!(
+                check_child_agent_argv(&owned).is_err(),
+                "must refuse: {argv:?}"
+            );
+        }
     }
 
     /// CodeCora PR #174 round 1: a leading-dash prompt must reach the
@@ -841,6 +1218,77 @@ mod tests {
         let _first = start.execute(json!({"prompt": "slow"})).unwrap();
         let err = start.execute(json!({"prompt": "second"})).unwrap_err();
         assert!(err.contains("cap 1"), "{err}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Issue #234 regression: the count→register window is serialized
+    /// by the flock. Two concurrent parents at cap 1 must yield exactly
+    /// ONE success — the old count-then-spawn race let both through.
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_starts_cannot_exceed_the_cap() {
+        let d = tmp("cap-race");
+        let start = AgentStartTool::new(sleeper_child(&d, 3), d.clone());
+        let start = AgentStartTool {
+            max_concurrent: 1,
+            ..start
+        };
+        let s1 = AgentStartTool {
+            root: d.clone(),
+            bin: start.bin.clone(),
+            depth: 0,
+            worktree_mode: false,
+            max_concurrent: 1,
+            timeout_secs: start.timeout_secs,
+            parent_allows: Vec::new(),
+        };
+        let (r1, r2) = std::thread::scope(|s| {
+            let h1 = s.spawn(|| start.execute(json!({"prompt": "a"})));
+            let h2 = s.spawn(|| s1.execute(json!({"prompt": "b"})));
+            (h1.join().unwrap(), h2.join().unwrap())
+        });
+        let oks = [r1.is_ok(), r2.is_ok()].iter().filter(|x| **x).count();
+        assert_eq!(
+            oks, 1,
+            "exactly one spawn may win the cap race: r1={r1:?} r2={r2:?}"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Issue #234 regression: the consume-once flag is PERSISTED — a
+    /// NEW poll tool instance (fresh process equivalent) must see the
+    /// mailbox as consumed and not resurrect the summary.
+    #[test]
+    fn consumed_flag_survives_a_new_poll_instance() {
+        let d = tmp("consumed-persist");
+        let bin = fake_child(&d);
+        let start = AgentStartTool::new(&bin, d.clone());
+        let out = start.execute(json!({"prompt": "quick"})).unwrap();
+        let id = out["agent"].as_str().unwrap().to_string();
+        // Wait for the fake child to settle.
+        let poll = AgentPollTool::new(d.clone());
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let st = poll.execute(json!({"agent": id})).unwrap();
+            if st["running"] == json!(false) {
+                break;
+            }
+        }
+        // First poll after settle consumes (recalls + cleans + marks).
+        let _ = poll.execute(json!({"agent": id})).unwrap();
+        // A brand-new instance = a new parent process.
+        let poll2 = AgentPollTool::new(d.clone());
+        let again = poll2.execute(json!({"agent": id})).unwrap();
+        assert!(
+            again.get("summary").is_none(),
+            "a fresh poll instance must see the mailbox consumed: {again}"
+        );
+        // And the flag is on disk.
+        let meta: AgentMeta = serde_json::from_str(
+            &std::fs::read_to_string(agents_root(&d).join(&id).join("meta.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(meta.mailbox_consumed);
         let _ = std::fs::remove_dir_all(&d);
     }
 

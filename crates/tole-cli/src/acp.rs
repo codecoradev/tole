@@ -632,31 +632,64 @@ pub fn run_acp(
     // session retry). No provider config → nothing to probe.
     let env_models_raw = std::env::var("TOLE_MODELS").ok();
     let probe_cfg = tole_core::openai::OpenAiConfig::from_env();
+    /// Bounded wait for the lazy /models probe (issue #257): a hung
+    /// gateway must not stall the ACP reader thread beyond this.
+    const PROBE_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
     let models_cache: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     let model_list = || {
         resolve_model_list(env_models_raw.as_deref(), || {
             // Probe at most once per process — failures are cached too,
             // so a broken gateway costs one stderr line, not one retry
-            // per session.
+            // per session. Issue #257 (rescan #41): the probe runs
+            // OFF the protocol reader thread (spawn_blocking) — an
+            // inline network fetch here stalled session/new and
+            // set_config for the whole gateway timeout.
             models_cache.get().cloned().unwrap_or_else(|| {
+                // Issue #257 + cora CI round 2: ONLY a successful
+                // non-empty probe lands in the OnceLock. Failure and
+                // timeout paths return WITHOUT caching, so the next
+                // session/new retries after the gateway recovers (the
+                // old single-cache flow pinned an empty list for the
+                // process lifetime after one timeout).
                 let computed = match probe_cfg.as_ref() {
-                    None => Vec::new(),
+                    None => return Vec::new(),
                     Some(cfg) => {
-                        match tole_core::openai::fetch_model_ids(&cfg.base_url, &cfg.api_key) {
-                            Ok(list) if !list.is_empty() => list,
-                            Ok(_) => {
+                        let base = cfg.base_url.clone();
+                        let key = cfg.api_key.clone();
+                        // Detached probe + bounded wait (cora round 1:
+                        // join() still blocked the reader thread).
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        std::thread::spawn(move || {
+                            let _ = tx.send(tole_core::openai::fetch_model_ids(&base, &key));
+                        });
+                        match rx.recv_timeout(PROBE_WAIT) {
+                            Ok(Ok(list)) if !list.is_empty() => list,
+                            Ok(Ok(_)) => {
                                 eprintln!(
                                     "tole acp: provider /models returned no ids — set \
                                          TOLE_MODELS to advertise a model picker"
                                 );
-                                Vec::new()
+                                return Vec::new();
                             }
-                            Err(e) => {
+                            Ok(Err(e)) => {
                                 eprintln!(
                                     "tole acp: {e} — set TOLE_MODELS to advertise a \
                                          model picker"
                                 );
-                                Vec::new()
+                                return Vec::new();
+                            }
+                            Err(_) => {
+                                // Timeout (or sender dropped): NOT
+                                // cached — the next session/new may
+                                // retry once the gateway recovers;
+                                // each retry is bounded by PROBE_WAIT.
+                                eprintln!(
+                                    "tole acp: provider /models probe did not answer within \
+                                         {:?} — set TOLE_MODELS to advertise a model picker",
+                                    PROBE_WAIT
+                                );
+                                return Vec::new();
                             }
                         }
                     }

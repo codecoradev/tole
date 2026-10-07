@@ -613,6 +613,31 @@ fn dispatch(cli: Cli) -> Result<()> {
                     "--plan-mode has no meaning for a mission (missions mutate by definition)"
                 );
             }
+            // Issue #258 (rescan #46, scan-3 #9 rule): global flags must
+            // not SILENTLY no-op — missions build their own registry and
+            // run no host memory loop today, so hook/memory flags are
+            // loudly refused instead of being ignored.
+            if host.on_pretool_non_empty() || host.on_posttool_non_empty() {
+                anyhow::bail!(
+                    "--on-pretool/--on-posttool are not supported by `tole run mission` \
+                     (mission registries do not wire tool hooks yet)"
+                );
+            }
+            if !host.on_turnend.is_empty() {
+                anyhow::bail!(
+                    "--on-turnend is not supported by `tole run mission` (mission turns \
+                     settle through the mission loop, not the turn-end hook path)"
+                );
+            }
+            // #[cfg]-mirrored like the HostConfig field itself: without
+            // shell-tools the field is the unit type (cora round 1).
+            #[cfg(feature = "shell-tools")]
+            if host.memory.is_some() {
+                anyhow::bail!(
+                    "--memory is not supported by `tole run mission` (the mission loop does \
+                     not run the harness memory loop yet)"
+                );
+            }
             #[cfg(feature = "mcp")]
             check_client_session_flags("mission", &host.skills, host.no_skills, explicit_mcp)?;
             // Budget tier (issue #201): the internal trust preset earns
@@ -1589,7 +1614,7 @@ fn run_command(
     // Task-list tools (issue #198): fresh session → empty state; both
     // tools join the registry (todo_write absent in plan mode via the
     // retain_read_only filter above — registration here is additive).
-    let todo_state = tole_core::todo::TodoState::shared();
+    let todo_state = tole_core::todo::TodoState::new();
     registry
         .register(Box::new(tole_core::todo::TodoReadTool::new(
             std::sync::Arc::clone(&todo_state),
@@ -1727,7 +1752,7 @@ fn resume_command(
     // the plan-mode filter — todo_write must be ABSENT on the wire under
     // --plan-mode (the retain_read_only guarantee), not merely gated.
     {
-        let todo_state = tole_core::todo::TodoState::shared();
+        let todo_state = tole_core::todo::TodoState::new();
         {
             use tole_core::storage::Storage;
             todo_state.hydrate(storage.entries());

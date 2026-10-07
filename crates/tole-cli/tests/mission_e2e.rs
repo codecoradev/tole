@@ -310,7 +310,10 @@ fn budget_exhaustion_settles_resumably() {
             "impossible in one turn",
         ],
     );
-    assert_eq!(code, 0, "budget exhaustion is a normal exit: {err}");
+    assert_ne!(
+        code, 0,
+        "budget exhaustion must exit nonzero (issue #253): {err}"
+    );
     assert!(out.contains("status: exhausted_steps"), "{out}");
     // The session is a normal durable session: `resume` with a prompt
     // runs another turn and completes the mission.
@@ -363,7 +366,10 @@ fn token_budget_and_cost_report_visible_in_status() {
             "work until tokens run out",
         ],
     );
-    assert_eq!(code, 0, "{err}");
+    assert_ne!(
+        code, 0,
+        "exhausted_tokens must exit nonzero (issue #253): {err}"
+    );
     assert!(out.contains("status: exhausted_tokens"), "{out}");
 
     let session_id = out

@@ -81,13 +81,29 @@ fn url_encode(name: &str) -> String {
     out
 }
 
-/// Levenshtein distance, early-capped at 2 (we only care about ≤1).
+/// The comparable form of a package name for typo analysis: the bare
+/// name (last `/` segment). A scoped query and a bare candidate must be
+/// compared like-for-like — comparing `scope/foo` against the bare
+/// fallback candidate `foo` verbatim is distance 6 and made every bare
+/// fallback invisible to the typosquat warning (issue #235).
+fn comparable_name(n: &str) -> &str {
+    n.split('/').next_back().unwrap_or(n)
+}
+
+/// Levenshtein distance, capped at 2 (callers only care about ≤1).
 fn edit_distance_capped(a: &str, b: &str) -> usize {
     if a == b {
         return 0;
     }
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
+    // Length diff > 1 ALREADY guarantees distance > 1 — decided before
+    // the DP (issue #235: the old row-min early exit was subtle,
+    // untested on adversarial inputs, and unnecessary at package-name
+    // sizes; the length guard is provably sound on its own).
+    if a.len().abs_diff(b.len()) > 1 {
+        return 2;
+    }
     let mut prev: Vec<usize> = (0..=b.len()).collect();
     let mut cur = vec![0usize; b.len() + 1];
     for i in 1..=a.len() {
@@ -97,11 +113,6 @@ fn edit_distance_capped(a: &str, b: &str) -> usize {
             cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
         }
         std::mem::swap(&mut prev, &mut cur);
-        // cheap cap: if the best cell in the finished row already exceeds 1
-        // and lengths differ by more than 1, distance > 1 is certain
-        if *prev.iter().min().unwrap() > 1 && a.len().abs_diff(b.len()) > 1 {
-            return 2;
-        }
     }
     prev[b.len()].min(2)
 }
@@ -298,9 +309,7 @@ pub fn verify(
         let near: Vec<&String> = check
             .candidates
             .iter()
-            .filter(|c| {
-                edit_distance_capped(name.trim_start_matches('@'), c.trim_start_matches('@')) <= 1
-            })
+            .filter(|c| edit_distance_capped(comparable_name(name), comparable_name(c)) <= 1)
             .collect();
         if !near.is_empty() {
             out["typo_squat_warning"] = json!(format!(
@@ -414,6 +423,43 @@ mod tests {
         assert_eq!(edit_distance_capped("react", "react"), 0);
         assert_eq!(edit_distance_capped("reaat", "react"), 1);
         assert!(edit_distance_capped("completely-different", "react") >= 2);
+    }
+
+    /// Issue #235: boundary cases the old row-min early exit left
+    /// untested. The behavior contract: distance values are EXACT up to
+    /// the cap — equal length never false-caps, ±1 length is computed,
+    /// >1 length is an immediate (provably sound) cap.
+    #[test]
+    fn edit_distance_boundary_cases() {
+        // Multi-star / adversarial DP shapes: equal-length strings whose
+        // every position differs. Values are EXACT up to the cap, 2 above.
+        assert_eq!(edit_distance_capped("aaaa", "bbbb"), 2); // true 4, capped
+        assert_eq!(edit_distance_capped("aaa", "aab"), 1);
+        assert_eq!(edit_distance_capped("abc", "acb"), 2);
+        assert_eq!(edit_distance_capped("kitten", "sitten"), 1);
+        assert_eq!(edit_distance_capped("kitten", "sitting"), 2); // true 3, capped
+                                                                  // Length ±1 boundaries: insertion/deletion cases.
+        assert_eq!(edit_distance_capped("abc", "ab"), 1);
+        assert_eq!(edit_distance_capped("ab", "abc"), 1);
+        assert_eq!(edit_distance_capped("abc", "x"), 2); // true 2 (capped)
+                                                         // Length diff > 1: cap BEFORE the DP — but the RESULT must equal
+                                                         // the true capped distance (regression guard for the old
+                                                         // combined guard ordering).
+        assert_eq!(edit_distance_capped("abc", "x"), 2);
+        assert_eq!(edit_distance_capped("abcdefgh", "xy"), 2);
+        // Unicode: distance is over chars, not bytes.
+        assert_eq!(edit_distance_capped("héllo", "hallo"), 1);
+    }
+
+    /// Issue #235: the typosquat comparison uses the BARE name — a
+    /// scoped query `@scope/reaat` must flag the bare candidate `react`
+    /// (distance 1), which the old `trim_start_matches('@')` comparison
+    /// missed ("scope/reaat" vs "react" = far over the cap).
+    #[test]
+    fn comparable_name_bares_scoped_queries() {
+        assert_eq!(comparable_name("@scope/react"), "react");
+        assert_eq!(comparable_name("react"), "react");
+        assert_eq!(comparable_name("@a/b/c"), "c");
     }
 
     #[test]
@@ -561,7 +607,15 @@ mod mock_server_tests {
         });
         let out = verify("npm", "@leftscope/pad", true, Some((&bases.0, &bases.1))).unwrap();
         assert_eq!(out["exists"], json!(false));
-        assert!(out["candidates"].as_array().is_some());
+        // Issue #235: the bare fallback candidate "pad" is distance 0
+        // from the query's bare name — it now surfaces as a TYPOSQUAT
+        // WARNING (the old comparison never matched scoped-vs-bare and
+        // dropped it into plain `candidates`).
+        assert!(
+            out["typo_squat_warning"].as_str().unwrap().contains("pad"),
+            "{out}"
+        );
+        assert!(out["near_candidates"].as_array().is_some());
     }
 
     #[test]
