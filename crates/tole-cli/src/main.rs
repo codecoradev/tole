@@ -1422,10 +1422,16 @@ fn build_server_registry(
 /// hardened tools as stdio MCP (D1); the session tools join separately
 /// via RegistryServer::with_extra_tools.
 #[cfg(all(feature = "mcp-http", feature = "shell-tools"))]
-fn build_server_registry_for_mcp(_plan_mode: bool) -> Result<ToolRegistry> {
+fn build_server_registry_for_mcp(plan_mode: bool) -> Result<ToolRegistry> {
     // Empty allowlist: the session tools carry their own approver per
     // session; registry Write tools stay pre-auth-off (deny by default).
-    build_server_registry(None, &[])
+    let mut registry = build_server_registry(None, &[])?;
+    // Plan mode (#294): same retain_read_only semantics as the other
+    // faces — Write/Destructive tools are absent, not merely denied.
+    if plan_mode {
+        registry.retain_read_only();
+    }
+    Ok(registry)
 }
 
 /// D1 (issue #94): serve the registry over MCP stdio. Blocks until the
@@ -2963,5 +2969,33 @@ mod chat_todo_tests {
         register_todo_tools(&mut plan, &[], true).unwrap();
         assert!(plan.get("todo_read").is_some());
         assert!(plan.get("todo_write").is_none());
+    }
+
+    /// Issue #294 regression: the server-level registry of the MCP HTTP
+    /// face must be read-only under plan mode (absent, not just denied).
+    #[cfg(all(feature = "mcp-http", feature = "shell-tools"))]
+    #[test]
+    fn mcp_server_registry_is_read_only_under_plan_mode() {
+        use tole_core::tool::Risk;
+        let normal = build_server_registry_for_mcp(false).unwrap();
+        assert!(
+            normal.specs().iter().any(|s| normal
+                .get(s["function"]["name"].as_str().unwrap())
+                .unwrap()
+                .risk()
+                != Risk::ReadOnly),
+            "non-plan registry must expose write tools"
+        );
+        let plan = build_server_registry_for_mcp(true).unwrap();
+        let specs = plan.specs();
+        assert!(!specs.is_empty());
+        for spec in &specs {
+            let name = spec["function"]["name"].as_str().unwrap();
+            assert_eq!(
+                plan.get(name).unwrap().risk(),
+                Risk::ReadOnly,
+                "{name} must not survive plan mode"
+            );
+        }
     }
 }
