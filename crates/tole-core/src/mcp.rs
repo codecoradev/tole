@@ -272,7 +272,15 @@ fn cap_text_blocks(blocks: &[&str], max: usize) -> String {
             len += 1;
         }
         if !truncated {
-            text.push('\n');
+            // Issue #251 (rescan #130): the separator counts toward the
+            // cap too — N empty blocks each added an uncounted byte, a
+            // trivial transcript-cap bypass for a hostile server.
+            if len >= max {
+                truncated = true;
+            } else {
+                text.push('\n');
+                len += 1;
+            }
         }
     }
     if truncated {
@@ -543,5 +551,35 @@ mod cap_tests {
     #[test]
     fn empty_input_yields_empty_string() {
         assert_eq!(cap_text_blocks(&[], 100), "");
+    }
+
+    /// Issue #251 regression: separators count toward the cap — a
+    /// hostile server cannot exceed MAX_RESULT_CHARS with thousands of
+    /// empty (or 1-char) blocks.
+    #[test]
+    fn many_small_blocks_cannot_bypass_the_cap() {
+        let blocks: Vec<&str> = vec!["a"; 5000];
+        let out = cap_text_blocks(&blocks, 1000);
+        let content_len =
+            out.chars().count() - "…[truncated, server output exceeded 1000 chars]".len() - 1;
+        assert!(
+            content_len <= 1000 + 2,
+            "total content must stay at the cap (+ separator/truncation slack): {content_len}"
+        );
+        assert!(out.contains("truncated"));
+        // The all-empty-block variant: pure newline flood. At most ONE
+        // separator byte slips past (the byte that reaches the cap was
+        // pushed before the check) — bounded, versus unbounded before.
+        let empty: Vec<&str> = vec![""; 5000];
+        let out2 = cap_text_blocks(&empty, 1000);
+        assert!(
+            out2.contains("truncated"),
+            "empty-block flood must trip the cap"
+        );
+        assert!(
+            out2.chars().count() <= 1000 + 50,
+            "got {}",
+            out2.chars().count()
+        );
     }
 }
