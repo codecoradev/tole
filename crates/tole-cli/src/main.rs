@@ -1167,6 +1167,23 @@ fn check_client_session_flags(
     Ok(())
 }
 
+/// Register the `gh` tool against the checkout's own GitHub repo.
+/// Probe-gated (issues #254, #293): when detection fails there is NO
+/// gh tool — a hardcoded fallback repo invited wrong-repo writes from
+/// any unrelated workspace.
+#[cfg(feature = "shell-tools")]
+fn register_gh(reg: &mut ToolRegistry, cwd: &Path) -> Result<()> {
+    match detect_github_repo(cwd) {
+        Some(repo) => reg
+            .register(Box::new(GhTool::new(repo)))
+            .map_err(|e| anyhow::anyhow!("registering gh: {e}")),
+        None => {
+            eprintln!("tole: no GitHub origin remote detected — gh tool not registered");
+            Ok(())
+        }
+    }
+}
+
 fn build_registry(
     approver: InteractiveApprover<StdioPrompt>,
     workspace: Option<&String>,
@@ -1269,12 +1286,7 @@ fn build_registry(
         .map_err(|e| anyhow::anyhow!("registering edit_file: {e}"))?;
     #[cfg(feature = "shell-tools")]
     {
-        // Target the checkout's own GitHub repo when detectable — a
-        // hardcoded one made `gh` act on the wrong project (CodeCora
-        // dogfood finding 2026-09-18).
-        let gh_repo = detect_github_repo(&cwd).unwrap_or_else(|| "codecoradev/tole".into());
-        reg.register(Box::new(GhTool::new(gh_repo)))
-            .map_err(|e| anyhow::anyhow!("registering gh: {e}"))?;
+        register_gh(&mut reg, &cwd)?;
         tole_cli::session_host::register_gitea(&mut reg, &cwd);
     }
     // Light git: status/diff/add/commit (push stays human).
@@ -1405,9 +1417,7 @@ fn build_server_registry(
         .map_err(|e| anyhow::anyhow!("registering edit_file: {e}"))?;
     #[cfg(feature = "shell-tools")]
     {
-        let gh_repo = detect_github_repo(&cwd).unwrap_or_else(|| "codecoradev/tole".into());
-        reg.register(Box::new(GhTool::new(gh_repo)))
-            .map_err(|e| anyhow::anyhow!("registering gh: {e}"))?;
+        register_gh(&mut reg, &cwd)?;
         tole_cli::session_host::register_gitea(&mut reg, &cwd);
         reg.register(Box::new(GitTool::new().in_dir(cwd.clone())))
             .map_err(|e| anyhow::anyhow!("registering git: {e}"))?;
@@ -2536,6 +2546,20 @@ mod gh_repo_tests {
             "https://github.com/-bad/name"
         )
         .is_none());
+    }
+
+    #[test]
+    fn gh_tool_not_registered_without_detected_repo() {
+        // Issue #293: a non-GitHub cwd must yield NO gh tool (no
+        // hardcoded fallback repo).
+        let dir = std::env::temp_dir().join(format!("tole-gh-none-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut reg =
+            ToolRegistry::with_approver(tole_core::approval::AllowlistApprover::allow_only(vec![]));
+        register_gh(&mut reg, &dir).unwrap();
+        assert!(reg.get("gh").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
