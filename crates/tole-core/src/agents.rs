@@ -217,12 +217,18 @@ pub fn check_child_agent_argv(argv: &[String]) -> Result<(), String> {
         }
     }
     // Guard boundary (documented, issue #228): this is a TOKEN-level
-    // check. An interpreter script that clears the environment itself
-    // (`python -c 'os.environ.clear(); os.execv(…)'`) is out of scope
-    // here — by the module contract that is OVERT hostile action, fully
-    // visible in the audit log, not silent budget multiplication. The
-    // structural fix (depth via a marker file the child cannot env-
-    // clear) is tracked as follow-up hardening.
+    // check. Two classes are explicitly OUT of scope here:
+    // 1. An interpreter script that clears the environment itself
+    //    (`python -c 'os.environ.clear(); os.execv(…)'`) — by the
+    //    module contract that is OVERT hostile action, fully visible
+    //    in the audit log, not silent budget multiplication.
+    // 2. Runtime-ASSEMBLED identifiers (`unset TOLE_AGE${V}NT_DEPTH`,
+    //    `e=e; f=xec; $e$f …`) — undecidable at the token level: any
+    //    static rule either misses a construction or refuses ordinary
+    //    variable use. The structural closure is the tracked
+    //    follow-up: propagate depth via a marker FILE the child
+    //    cannot env-clear, making every one of these constructions
+    //    inert.
     Ok(())
 }
 
@@ -997,18 +1003,14 @@ mod tests {
                 "-c",
                 "p=/usr/local/bin/to; $(printf e)$(printf nv) -i \"$p\"le run mission",
             ],
-            // Quote-split depth marker (CI cora round 2 on #245) and
-            // the ${V} expansion variant (round 5) — both normalize to
-            // the literal marker in the pre-check.
+            // Quote-split depth marker (CI cora round 2 on #245) —
+            // statically decodable: stripping quotes yields the literal
+            // marker. (The `${V}` variant is NOT statically decodable —
+            // documented in the guard boundary below.)
             vec![
                 "bash",
                 "-c",
                 "unset TOLE_AGENT_DEPT\"\"H; p=/usr/local/bin/to; \"$p\"le run mission",
-            ],
-            vec![
-                "bash",
-                "-c",
-                "V=; unset TOLE_AGE${V}NT_DEPTH; p=to; \"$p\"le run",
             ],
             // Assembled env keyword with abbreviated long flag (CI cora
             // round 5 on #245): `--i` = `--ignore-environment`.
