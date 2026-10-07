@@ -245,27 +245,91 @@ fn agent() -> ureq::Agent {
         .new_agent()
 }
 
+/// A redirect hop may only land on http(s). `join_redirect` passes any
+/// RFC 3986 absolute reference through verbatim, so the fetch loop gates
+/// the joined URL here (file:/ftp:/gopher: Locations never reach the
+/// fetcher).
+fn redirect_scheme_allowed(url: &str) -> bool {
+    url.starts_with("http://") || url.starts_with("https://")
+}
+
 /// SSRF guard (cora MAJOR on #215): resolve the host and refuse
 /// loopback / link-local (cloud metadata!) / private / unspecified
 /// ranges. `TOLE_WEB_ALLOW_PRIVATE=1` opts out for local development
 /// and tests — an explicit, documented escape hatch, never a default.
-/// Resolve a possibly-relative Location against the previous URL
-/// (minimal join: absolute URLs pass through; leading-/ paths join the
-/// origin; everything else joins the current directory).
+/// RFC 3986 §5.2 reference resolution of a redirect `Location` against
+/// `base` — the URL of the response that carried it (the CURRENT hop,
+/// not the original request). Handles absolute URLs, network-path
+/// (`//host/p`), absolute-path, query-only, and relative-path references
+/// including `.`/`..` segment removal. Fragments are dropped (never sent).
 fn join_redirect(base: &str, location: &str) -> String {
-    if location.starts_with("http://") || location.starts_with("https://") {
+    let location = location.split('#').next().unwrap_or("");
+    let has_scheme = location.split_once(':').is_some_and(|(s, _)| {
+        s.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    });
+    if has_scheme {
         return location.to_string();
     }
-    let origin_end = base
-        .split_once("://")
-        .map(|(scheme, rest)| scheme.len() + 3 + rest.split('/').next().unwrap_or("").len())
-        .unwrap_or(0);
-    let origin = &base[..origin_end];
-    if let Some(path) = location.strip_prefix('/') {
-        format!("{origin}/{path}")
-    } else {
-        format!("{}/{}", base.trim_end_matches('/'), location)
+    let base = base.split('#').next().unwrap_or("");
+    let (scheme, rest) = base.split_once("://").unwrap_or(("", base));
+    let auth_end = rest.find(['/', '?']).unwrap_or(rest.len());
+    let (authority, path_query) = rest.split_at(auth_end);
+    let (base_path, base_query) = match path_query.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (path_query, None),
+    };
+    let origin = format!("{scheme}://{authority}");
+    if location.starts_with("//") {
+        return format!("{scheme}:{location}");
     }
+    if location.is_empty() {
+        return base.to_string();
+    }
+    let (ref_path, ref_query) = match location.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (location, None),
+    };
+    let (path, query) = if ref_path.is_empty() {
+        (base_path.to_string(), ref_query.or(base_query))
+    } else if ref_path.starts_with('/') {
+        (remove_dot_segments(ref_path), ref_query)
+    } else {
+        let dir = match base_path.rfind('/') {
+            Some(i) => &base_path[..=i],
+            None if authority.is_empty() => "",
+            None => "/",
+        };
+        (remove_dot_segments(&format!("{dir}{ref_path}")), ref_query)
+    };
+    match query {
+        Some(q) => format!("{origin}{path}?{q}"),
+        None => format!("{origin}{path}"),
+    }
+}
+
+/// RFC 3986 §5.2.4 `remove_dot_segments` (segment-stack form).
+fn remove_dot_segments(path: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    let mut trailing_slash = false;
+    for seg in path.split('/').skip(1) {
+        trailing_slash = false;
+        match seg {
+            "." => trailing_slash = true,
+            ".." => {
+                out.pop();
+                trailing_slash = true;
+            }
+            s => out.push(s),
+        }
+    }
+    let mut res = String::from("/");
+    res.push_str(&out.join("/"));
+    if trailing_slash && !out.is_empty() {
+        res.push('/');
+    }
+    res
 }
 
 /// `html2text`-lite: drop script/style blocks, strip tags, decode the
@@ -418,6 +482,9 @@ impl Tool for WebFetchTool {
                 .map(str::to_string)
                 .ok_or_else(|| format!("web_fetch: {status} redirect without Location"))?;
             url = join_redirect(&url, &location);
+            if !redirect_scheme_allowed(&url) {
+                return Err("web_fetch: redirect to a non-http(s) scheme — refused".into());
+            }
             if https_only && !url.starts_with("https://") {
                 return Err("web_fetch: redirect would downgrade https to http — refused".into());
             }
@@ -563,6 +630,60 @@ fn urlencoding_lite(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::join_redirect;
+
+    /// #281: RFC 3986 §5.4 reference resolution against the current hop.
+    #[test]
+    fn redirect_gate_refuses_non_http_schemes() {
+        use super::redirect_scheme_allowed;
+        for loc in [
+            "file:///etc/passwd",
+            "ftp://h.example/x",
+            "gopher://h.example/",
+            "javascript:alert(1)",
+        ] {
+            let joined = join_redirect("https://h.example/a", loc);
+            assert!(!redirect_scheme_allowed(&joined), "{loc}");
+        }
+        assert!(redirect_scheme_allowed(&join_redirect(
+            "https://h.example/a",
+            "/b"
+        )));
+        assert!(redirect_scheme_allowed(&join_redirect(
+            "http://h.example/a",
+            "https://x.example/"
+        )));
+    }
+
+    #[test]
+    fn join_redirect_resolves_per_rfc3986() {
+        let b = "https://h.example/a/b/c?q=1";
+        for (loc, want) in [
+            ("g", "https://h.example/a/b/g"),
+            ("./g", "https://h.example/a/b/g"),
+            ("g/", "https://h.example/a/b/g/"),
+            ("/g", "https://h.example/g"),
+            ("//other.example/g", "https://other.example/g"),
+            ("?y", "https://h.example/a/b/c?y"),
+            ("../g", "https://h.example/a/g"),
+            ("../../g", "https://h.example/g"),
+            ("../../../g", "https://h.example/g"),
+            ("g#s", "https://h.example/a/b/g"),
+            ("", "https://h.example/a/b/c?q=1"),
+            ("https://x.example/p", "https://x.example/p"),
+        ] {
+            assert_eq!(join_redirect(b, loc), want, "location {loc:?}");
+        }
+        // Second hop: a relative Location resolves against THAT hop's URL.
+        let hop2 = join_redirect(b, "../x/y");
+        assert_eq!(hop2, "https://h.example/a/x/y");
+        assert_eq!(join_redirect(&hop2, "z"), "https://h.example/a/x/z");
+        // Authority-only base.
+        assert_eq!(
+            join_redirect("https://h.example", "g"),
+            "https://h.example/g"
+        );
+    }
 
     /// Scanner-clean http URL literal for tests that deliberately exercise
     /// plaintext/SSRF classes (the lint cannot see through the concat).

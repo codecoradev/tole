@@ -127,21 +127,25 @@ impl Default for AllowlistApprover {
 }
 
 impl AllowlistApprover {
-    /// Allowlisted tools are ALLOWED; everything else (not matching any
-    /// pattern) gets `default`.
+    /// Build an approver whose `default` verdict governs everything.
     ///
-    /// # Semantics trap to know before using
-    /// The decision pipeline is: Destructive → always Deny; a pattern
-    /// match → Allow; only then `default`. So `new(vec!["bomb"],
-    /// Decision::Deny)` **allows** "bomb" — the default only applies to
-    /// NON-matches. For unambiguous intent use [`allow_only`] (patterns
-    /// are the allowed set, default Deny) or [`deny_only`] (patterns are
-    /// the denied set, default Allow).
+    /// # Fail-closed semantics (#283)
+    /// Patterns can only ever *widen* access when the default is
+    /// [`Decision::Allow`] (where they are redundant). With
+    /// `Decision::Deny` / `Decision::Ask` (Ask resolves to Deny in
+    /// core) the default is the final verdict and the patterns are
+    /// ignored: `new(vec!["bomb"], Decision::Deny)` DENIES "bomb". It
+    /// used to allow listed tools, contradicting the configured default.
+    /// `Destructive` is always denied regardless.
     ///
-    /// Kept with current behavior for 0.2.0 compatibility (published on
-    /// crates.io); `Decision::Ask` resolves to Deny here — use the
-    /// interactive approver for human prompting.
+    /// To allow a specific set use [`allow_only`]; to deny a specific
+    /// set use [`deny_only`].
     pub fn new(patterns: Vec<String>, default: Decision) -> Self {
+        let patterns = if default == Decision::Allow {
+            patterns
+        } else {
+            Vec::new()
+        };
         Self {
             patterns,
             default,
@@ -210,7 +214,7 @@ mod tests {
 
     #[test]
     fn allowlist_allows_listed_tools() {
-        let a = AllowlistApprover::new(vec!["write_file".into()], Decision::Deny);
+        let a = AllowlistApprover::allow_only(vec!["write_file".into()]);
         assert_eq!(a.decide(&req("write_file", Risk::Write)), Verdict::Allow);
         assert_eq!(a.decide(&req("rm_rf", Risk::Write)), Verdict::Deny);
     }
@@ -229,15 +233,16 @@ mod tests {
         assert_eq!(a.decide(&req("read_file", Risk::ReadOnly)), Verdict::Allow);
     }
 
-    /// The trap the new constructors document: the DEFAULT applies to
-    /// non-matches, so a listed tool is ALLOWED even when the default
-    /// says Deny. Codified so nobody "fixes" it silently in either
-    /// direction (0.2.0 compat + interactive UX both rely on it).
+    /// #283: with a Deny/Ask default the verdict is final — listed
+    /// tools are NOT allowed (fail closed). `allow_only` is the way to
+    /// build an allowlist.
     #[test]
-    fn new_with_deny_default_still_allows_matches() {
+    fn new_with_deny_default_denies_listed_tools() {
         let a = AllowlistApprover::new(vec!["bomb".into()], Decision::Deny);
-        assert_eq!(a.decide(&req("bomb", Risk::Write)), Verdict::Allow);
+        assert_eq!(a.decide(&req("bomb", Risk::Write)), Verdict::Deny);
         assert_eq!(a.decide(&req("other", Risk::Write)), Verdict::Deny);
+        let a = AllowlistApprover::new(vec!["bomb".into()], Decision::Ask);
+        assert_eq!(a.decide(&req("bomb", Risk::Write)), Verdict::Deny);
     }
 
     #[test]
@@ -289,7 +294,7 @@ mod tests {
 
     #[test]
     fn allowlist_patterns_match_by_glob() {
-        let a = AllowlistApprover::new(vec!["read_*".into()], Decision::Deny);
+        let a = AllowlistApprover::allow_only(vec!["read_*".into()]);
         assert_eq!(a.decide(&req("read_file", Risk::Write)), Verdict::Allow);
         assert_eq!(a.decide(&req("reads", Risk::Write)), Verdict::Deny);
     }

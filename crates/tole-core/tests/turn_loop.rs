@@ -2,7 +2,7 @@
 //! turn loop on the mock provider (no network, deterministic, fast).
 
 use serde_json::{json, Value};
-use tole_core::approval::{AllowlistApprover, Decision};
+use tole_core::approval::AllowlistApprover;
 use tole_core::entry::Entry;
 use tole_core::mock::MockProvider;
 use tole_core::provider::{Provider, ProviderError, ProviderOutput};
@@ -696,10 +696,9 @@ fn abort_paths_leave_durable_error_records_and_no_final() {
         // Write tools need an approver (E4); only the approval path
         // registers one here via with_approver.
         if name == "approval" {
-            reg = ToolRegistry::with_approver(AllowlistApprover::new(
-                vec!["write_file".into()],
-                Decision::Deny,
-            ));
+            reg = ToolRegistry::with_approver(AllowlistApprover::allow_only(vec![
+                "write_file".into()
+            ]));
             reg.register(Box::new(WriteTool)).unwrap();
         }
 
@@ -874,10 +873,10 @@ fn write_session_reports_wrote_true_on_final() {
             text: "written".into(),
         },
     ]);
-    let mut reg = ToolRegistry::with_approver(AllowlistApprover::new(
-        vec!["write_file".to_string()],
-        Decision::Deny,
-    ));
+    let mut reg =
+        ToolRegistry::with_approver(AllowlistApprover::allow_only(
+            vec!["write_file".to_string()],
+        ));
     reg.register(Box::new(WriteTool)).unwrap();
 
     let out = run_turn(&mut s, &mut p, &reg, "hi").unwrap();
@@ -926,10 +925,10 @@ fn wrote_flag_survives_crash_resume_boundary() {
         tool: "write_file".into(),
         input: json!({"path": "a.txt"}),
     }]);
-    let mut reg = ToolRegistry::with_approver(AllowlistApprover::new(
-        vec!["write_file".to_string()],
-        Decision::Deny,
-    ));
+    let mut reg =
+        ToolRegistry::with_approver(AllowlistApprover::allow_only(
+            vec!["write_file".to_string()],
+        ));
     reg.register(Box::new(WriteTool)).unwrap();
 
     let out = run_turn(&mut s, &mut p, &reg, "hi").unwrap();
@@ -1015,10 +1014,10 @@ fn aborted_writing_turn_keeps_the_session_flag() {
     // period. The follow-up turn's Final reports wrote=true.
     let dir = tmpdir("decision-stale");
     let mut s = JsonlStorage::create(&dir, "dstale", None).unwrap();
-    let mut reg = ToolRegistry::with_approver(AllowlistApprover::new(
-        vec!["write_file".to_string()],
-        Decision::Deny,
-    ));
+    let mut reg =
+        ToolRegistry::with_approver(AllowlistApprover::allow_only(
+            vec!["write_file".to_string()],
+        ));
     reg.register(Box::new(WriteTool)).unwrap();
 
     let mut p1 = MockProvider::scripted(vec![ProviderOutput::ToolCall {
@@ -1098,10 +1097,10 @@ fn registry_with_gates(cmds: &[String]) -> ToolRegistry {
 
 /// Same but Write-capable (approver allowlists write_file).
 fn registry_with_gates_write(cmds: &[String]) -> ToolRegistry {
-    let mut reg = ToolRegistry::with_approver(tole_core::approval::AllowlistApprover::new(
-        vec!["write_file".to_string()],
-        tole_core::approval::Decision::Deny,
-    ));
+    let mut reg =
+        ToolRegistry::with_approver(tole_core::approval::AllowlistApprover::allow_only(vec![
+            "write_file".to_string(),
+        ]));
     let mut hooks = tole_core::hooks::ToolHooks::from_cli(&[], &[]);
     hooks.turnend = cmds
         .iter()

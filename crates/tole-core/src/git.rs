@@ -229,6 +229,11 @@ impl Tool for GitTool {
     fn execute(&self, input: Value) -> Result<Value, String> {
         let op = parse_op(&input)?;
         let argv = op.argv(&input)?;
+        // #282: reject NUL up front; otherwise spawn fails with a
+        // misleading "is it on PATH?" error.
+        if argv.iter().any(|a| a.contains('\0')) {
+            return Err("git: arguments must not contain NUL bytes".into());
+        }
         let mut cmd = Command::new(&self.bin);
         crate::subprocess::scrub_env_for_child(&mut cmd);
         cmd.args(&argv);
@@ -412,6 +417,20 @@ mod tests {
         assert!(t
             .command_line(&json!({"op":"commit","message":"x".repeat(501)}))
             .is_err());
+    }
+
+    /// #282: a NUL byte in a model-supplied message/path must surface as a
+    /// clear tool error (never a panic, never a misleading spawn error).
+    #[test]
+    fn nul_byte_in_argv_is_a_clear_error_not_a_panic() {
+        let t = GitTool::new();
+        for input in [
+            json!({"op":"commit","message":"a\u{0}b"}),
+            json!({"op":"add","paths":["a\u{0}b"]}),
+        ] {
+            let err = t.execute(input).unwrap_err();
+            assert!(err.contains("NUL"), "unexpected error: {err}");
+        }
     }
 
     #[test]

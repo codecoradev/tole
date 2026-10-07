@@ -20,7 +20,7 @@
 
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
-use tole_core::approval::{AllowlistApprover, Decision};
+use tole_core::approval::AllowlistApprover;
 use tole_core::entry::{EntryType, NewEntry};
 use tole_core::machine::{begin, ReplaySafety};
 use tole_core::mock::MockProvider;
@@ -339,8 +339,7 @@ fn guarded_intent_replay_requires_fresh_approval() {
     // the sandwich settles as failed, so the session stays resumable.
     let s2 = JsonlStorage::open(dir.join("g.jsonl")).unwrap();
     // bomb is NOT allowlisted and the default is Deny -> decide() = Deny.
-    let mut reg =
-        ToolRegistry::with_approver(AllowlistApprover::new(vec!["other".into()], Decision::Deny));
+    let mut reg = ToolRegistry::with_approver(AllowlistApprover::allow_only(vec!["other".into()]));
     reg.register(Box::new(Bomb)).unwrap();
     let mut p = MockProvider::scripted(vec![ProviderOutput::Final {
         text: "replanned".into(),
@@ -403,10 +402,8 @@ fn guarded_intent_replays_when_approver_allows() {
 
     let s2 = JsonlStorage::open(dir.join("ga.jsonl")).unwrap();
     let fired = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let mut reg = ToolRegistry::with_approver(AllowlistApprover::new(
-        vec!["counted".into()],
-        Decision::Deny,
-    ));
+    let mut reg =
+        ToolRegistry::with_approver(AllowlistApprover::allow_only(vec!["counted".into()]));
     reg.register(Box::new(CountingWrite(fired.clone())))
         .unwrap();
     let mut p = MockProvider::scripted(vec![ProviderOutput::Final {
