@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tole_cli::session_host::{
-    lock_sessions, open_session, run_session_turn, Sessions, SharedSessions,
+    lock_sessions, open_session, run_session_turn, Sessions, SharedSessions, MAX_SESSIONS,
 };
 use tole_core::memory::MemoryConfig;
 use tole_core::storage::Storage;
@@ -447,32 +447,10 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                         // are durable on disk (the JSONL file) — eviction
                         // drops only the in-memory handle, never the
                         // file; busy sessions are never evicted.
-                        const MAX_SESSIONS: usize = 256;
                         let mut sessions = lock_sessions(&state.sessions);
-                        while sessions.map.len() >= MAX_SESSIONS {
-                            // try_lock on busy: a LOCKED busy means a turn
-                            // is mid-flight on that session — skip it
-                            // without blocking the whole map (CodeCora
-                            // scan round-2). All-busy at capacity → 503.
-                            let oldest = sessions
-                                .map
-                                .iter()
-                                .filter(|(_, st)| {
-                                    matches!(st.busy.try_lock().as_deref().copied(), Ok(false))
-                                })
-                                .map(|(id, _)| id.clone())
-                                .next();
-                            match oldest {
-                                Some(id) => {
-                                    sessions.map.remove(&id);
-                                }
-                                None => {
-                                    return (
-                                        503,
-                                        json!({"error": "all sessions busy — at capacity"}),
-                                    )
-                                }
-                            }
+                        // All-busy at capacity → 503.
+                        if sessions.evict_for_insert(MAX_SESSIONS).is_err() {
+                            return (503, json!({"error": "all sessions busy — at capacity"}));
                         }
                         sessions.map.insert(session_id.clone(), session_state);
                     }
