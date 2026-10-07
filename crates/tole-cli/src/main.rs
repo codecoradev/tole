@@ -613,6 +613,28 @@ fn dispatch(cli: Cli) -> Result<()> {
                     "--plan-mode has no meaning for a mission (missions mutate by definition)"
                 );
             }
+            // Issue #258 (rescan #46, scan-3 #9 rule): global flags must
+            // not SILENTLY no-op — missions build their own registry and
+            // run no host memory loop today, so hook/memory flags are
+            // loudly refused instead of being ignored.
+            if host.on_pretool_non_empty() || host.on_posttool_non_empty() {
+                anyhow::bail!(
+                    "--on-pretool/--on-posttool are not supported by `tole run mission` \
+                     (mission registries do not wire tool hooks yet)"
+                );
+            }
+            if !host.on_turnend.is_empty() {
+                anyhow::bail!(
+                    "--on-turnend is not supported by `tole run mission` (mission turns \
+                     settle through the mission loop, not the turn-end hook path)"
+                );
+            }
+            if host.memory.is_some() {
+                anyhow::bail!(
+                    "--memory is not supported by `tole run mission` (the mission loop does \
+                     not run the harness memory loop yet)"
+                );
+            }
             #[cfg(feature = "mcp")]
             check_client_session_flags("mission", &host.skills, host.no_skills, explicit_mcp)?;
             // Budget tier (issue #201): the internal trust preset earns
