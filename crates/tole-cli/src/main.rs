@@ -2016,6 +2016,31 @@ fn latest_session_id(dir: &Path) -> Option<String> {
 /// `resume_turn` on the next line, keeping the conversation alive without
 /// losing durable context. Ctrl-C / EOF exit cleanly — every commit is
 /// already durable, `tole chat --resume <id>` picks the thread back up.
+/// Register `todo_read`/`todo_write` with state hydrated from `entries`
+/// (issue #276). `todo_write` is skipped in plan mode so it stays absent
+/// on the wire, matching the `retain_read_only` guarantee.
+fn register_todo_tools(
+    registry: &mut ToolRegistry,
+    entries: &[tole_core::entry::Entry],
+    plan_mode: bool,
+) -> Result<()> {
+    let todo_state = tole_core::todo::TodoState::new();
+    todo_state.hydrate(entries);
+    registry
+        .register(Box::new(tole_core::todo::TodoReadTool::new(
+            std::sync::Arc::clone(&todo_state),
+        )))
+        .map_err(|e| anyhow::anyhow!("registering todo_read: {e}"))?;
+    if !plan_mode {
+        registry
+            .register(Box::new(tole_core::todo::TodoWriteTool::new(
+                std::sync::Arc::clone(&todo_state),
+            )))
+            .map_err(|e| anyhow::anyhow!("registering todo_write: {e}"))?;
+    }
+    Ok(())
+}
+
 fn chat_command(
     sessions_dir: &Path,
     system: Option<&str>,
@@ -2118,6 +2143,12 @@ fn chat_command(
     } else {
         JsonlStorage::open(&path).context("replaying session log")?
     };
+    // Task-list tools (issues #198/#276): per-session state hydrated from
+    // the replayed transcript so a resumed chat keeps its plan.
+    {
+        use tole_core::storage::Storage;
+        register_todo_tools(&mut registry, storage.entries(), host.plan_mode)?;
+    }
     println!(
         "tole chat — session {session_id} (Ctrl-D exits, resume: tole chat --resume {session_id})"
     );
@@ -2886,5 +2917,25 @@ mod server_face_flag_tests {
         let msg = err.to_string();
         assert!(msg.contains("--mcp-server"), "{msg}");
         assert!(msg.contains("tole serve"), "{msg}");
+    }
+}
+
+#[cfg(test)]
+mod chat_todo_tests {
+    use super::*;
+
+    /// Issue #276 regression: the chat face registers both todo tools
+    /// (and only todo_read in plan mode).
+    #[test]
+    fn chat_registers_todo_tools_and_respects_plan_mode() {
+        let mut reg =
+            ToolRegistry::with_approver(tole_core::approval::AllowlistApprover::allow_only(vec![]));
+        register_todo_tools(&mut reg, &[], false).unwrap();
+        assert!(reg.get("todo_read").is_some());
+        assert!(reg.get("todo_write").is_some());
+        let mut plan = ToolRegistry::new();
+        register_todo_tools(&mut plan, &[], true).unwrap();
+        assert!(plan.get("todo_read").is_some());
+        assert!(plan.get("todo_write").is_none());
     }
 }
