@@ -980,6 +980,29 @@ mod tests {
         // only sound token-level rule against indirection smuggling.
         let over: Vec<String> = vec!["bash".into(), "-c".into(), "env | grep -i PATH".into()];
         assert!(check_child_agent_argv(&over).is_err());
+        // Known token-level bypasses (issue #228 guard boundary) —
+        // pinned as OK-here assertions: the structural marker-file fix
+        // flips these to refused. Runtime-assembled identifiers are
+        // undecidable at the token level; refusing them would break
+        // ordinary variable use.
+        for known_bypass in [
+            vec![
+                "bash",
+                "-c",
+                "V=; unset TOLE_AGE${V}NT_DEPTH; p=to; \"$p\"le run",
+            ],
+            vec![
+                "bash",
+                "-c",
+                "e=e; f=xec; p=/usr/local/bin/to; $e$f -c \"$p\"le run mission",
+            ],
+        ] {
+            let owned: Vec<String> = known_bypass.iter().map(|s| s.to_string()).collect();
+            assert!(
+                check_child_agent_argv(&owned).is_ok(),
+                "documented token-level bypass changed behavior — update the guard: {known_bypass:?}"
+            );
+        }
     }
 
     /// Issue #228 regression (scan #123): quoting/substitution/`env -i`
