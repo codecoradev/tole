@@ -430,6 +430,13 @@ pub fn run_mission(
         "turns: {turns}  steps: {}  verify failures: {verify_failures}  wall: {wall_secs}s",
         steps_used(&storage)
     );
+    // Issue #253 (rescan #25): --verify is a CI-style gate — a mission
+    // that did NOT complete successfully must exit NONZERO so scripts
+    // and the agent loop can branch on it. `done` (and only a completed
+    // mission) exits 0.
+    if status != "done" {
+        anyhow::bail!("mission ended with status: {status}");
+    }
     Ok(())
 }
 
