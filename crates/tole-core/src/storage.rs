@@ -292,6 +292,18 @@ impl Record {
 // JSONL backend
 // ---------------------------------------------------------------------------
 
+/// The single session-id rule (issue #295): non-empty, at most 64 bytes,
+/// `[A-Za-z0-9_-]` only. The id is joined into a file path, so this also
+/// guarantees no `/`, `\`, `..` or other traversal. Shared by the
+/// storage boundary and every host (CLI, serve, ACP, MCP).
+pub fn is_valid_session_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+}
+
 /// JSONL session file backend (default).
 ///
 /// [`JsonlStorage::create`] starts a fresh session file,
@@ -357,14 +369,7 @@ impl JsonlStorage {
         // the storage layer enforces the safe charset itself instead of
         // trusting every caller to validate first (hosts already do via
         // validate_session_id; this is the boundary backstop).
-        let id_ok = !session_id.is_empty()
-            && session_id.len() <= 64
-            && !session_id.contains('/')
-            && !session_id.contains('\\')
-            && !session_id.contains("..")
-            && session_id
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'));
+        let id_ok = is_valid_session_id(&session_id);
         if !id_ok {
             return Err(StorageError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -1089,6 +1094,20 @@ mod poison_tests {
         // The safe charset still works.
         assert!(JsonlStorage::create_named(&dir, "s-abc123", None, None, None).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #295: one shared rule — uppercase and `_` are valid,
+    /// traversal and over-long ids are not.
+    #[test]
+    fn is_valid_session_id_table() {
+        let max = "a".repeat(64);
+        for ok in ["s-abc123", "ABC", "a_b", "Mixed_Case-1", max.as_str()] {
+            assert!(is_valid_session_id(ok), "must accept: {ok:?}");
+        }
+        let long = "a".repeat(65);
+        for bad in ["", "..", "../x", "a/b", "a\\b", "a.b", "a b", long.as_str()] {
+            assert!(!is_valid_session_id(bad), "must reject: {bad:?}");
+        }
     }
 
     #[test]

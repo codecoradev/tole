@@ -46,14 +46,10 @@ fn session_path(dir: &Path, id: &str) -> PathBuf {
     dir.join(format!("{id}.jsonl"))
 }
 
-/// Session id validity: `[a-z0-9-]` — also prevents `../` traversal in
-/// the sessions dir.
+/// Session id validity — the one shared rule (`[A-Za-z0-9_-]`, 1..=64,
+/// no traversal), identical to what serve/ACP/storage accept.
 fn valid_session_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 64
-        && id
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    tole_core::storage::is_valid_session_id(id)
 }
 
 /// `tole` — a durable agent loop with approval gates.
@@ -2559,6 +2555,36 @@ mod gh_repo_tests {
         let detected = detect_github_repo(&dir);
         assert_eq!(detected.as_deref(), Some("detected/owner-name"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod session_id_rule_tests {
+    /// Issue #295: the CLI (`--resume`/`status`) and serve/ACP must agree
+    /// on every id, including uppercase and `_`.
+    #[test]
+    fn cli_and_serve_acp_session_id_rules_agree() {
+        let long = "a".repeat(65);
+        let cases = [
+            ("s-abc123", true),
+            ("Session_ID-1", true),
+            ("UPPER", true),
+            ("under_score", true),
+            ("", false),
+            ("..", false),
+            ("../evil", false),
+            ("a/b", false),
+            ("a\\b", false),
+            (long.as_str(), false),
+        ];
+        for (id, ok) in cases {
+            assert_eq!(super::valid_session_id(id), ok, "valid_session_id({id:?})");
+            assert_eq!(
+                tole_cli::session_host::validate_session_id(id).is_some(),
+                ok,
+                "validate_session_id({id:?})"
+            );
+        }
     }
 }
 
