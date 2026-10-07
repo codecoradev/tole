@@ -62,7 +62,19 @@ const DEFAULT_TIMEOUT_SECS: u64 = 30 * 60;
 pub fn check_child_agent_argv(argv: &[String]) -> Result<(), String> {
     const ERR: &str = "child agents may not spawn or reconfigure the tole binary — the agent \
          tree is capped at one level by design (issue #171)";
-    if argv.iter().any(|a| a.contains("TOLE_AGENT_DEPTH")) {
+    if argv
+        .iter()
+        // Normalize the same way the token scan below does (CI cora
+        // round on #245: `TOLE_AGENT_DEPT""H` split the marker across
+        // quote removal and dodged the raw substring check).
+        .any(|a| {
+            let stripped: String = a
+                .chars()
+                .filter(|c| !matches!(c, '"' | '\'' | '\\'))
+                .collect();
+            stripped.contains("TOLE_AGENT_DEPTH")
+        })
+    {
         return Err(ERR.to_string());
     }
     // Issue #228 (scan #123): ONE normalized segmentation pass. Every
@@ -89,12 +101,18 @@ pub fn check_child_agent_argv(argv: &[String]) -> Result<(), String> {
         // accepted for the depth invariant; the structural fix (depth
         // via a marker file the child cannot env-clear) closes the
         // class entirely.
-        // Substitution punctuation in a SHORT-flag position can build a
-        // wipe flag at runtime (`env -$(echo i)`, rounds 7+10). The
-        // any_subst widening from earlier rounds was TOO BROAD (CI cora
-        // round: `bash -c "echo $HOME"` was refused) — the targeted
-        // raw_subst refusal inside env/exec contexts is the sound rule,
-        // so any_subst no longer widens anything.
+        // Substitution punctuation widens the ENV context (the env
+        // keyword itself may be assembled at runtime:
+        // `$(printf e)$(printf nv) -i …`, CI cora round on #245) — but
+        // ONLY the env side. The earlier version also widened exec and
+        // refused every `bash -c "echo $HOME"` (the `-c` flag matched
+        // exec's 'c' rule). The exec-keyword-via-substitution case is
+        // undecidable at the token level; it is covered by the guard
+        // boundary below (overt, auditable) and the structural
+        // marker-file follow-up.
+        let any_subst = argv
+            .iter()
+            .any(|a| a.contains('$') || a.contains('`') || a.contains('('));
         let mut saw_env = false;
         let mut saw_exec = false;
         for arg in argv {
@@ -156,7 +174,7 @@ pub fn check_child_agent_argv(argv: &[String]) -> Result<(), String> {
                     // env-clearing. Short clusters use containment
                     // (`-vi`, `-iu` …), not exclusivity — same for
                     // exec's `-cl` (round 5 #2).
-                    let env_clear = saw_env
+                    let env_clear = (saw_env || any_subst)
                         && (raw_subst
                             || tok.starts_with("--")
                             || body.chars().any(|c| c == 'i' || c == 'u'));
@@ -943,6 +961,20 @@ mod tests {
             // GNU abbreviation + mixed short cluster (cora round 5).
             vec!["env", "--ignore-env", "bash", "-c", "tole run"],
             vec!["env", "-vi", "tole", "run"],
+            // Substitution-built env keyword (CI cora round on #245):
+            // `$(printf e)$(printf nv)` expands to `env`; any_subst
+            // arms the env context so the `-i` is refused.
+            vec![
+                "bash",
+                "-c",
+                "p=/usr/local/bin/to; $(printf e)$(printf nv) -i \"$p\"le run mission",
+            ],
+            // Quote-split depth marker (CI cora round 2 on #245).
+            vec![
+                "bash",
+                "-c",
+                "unset TOLE_AGENT_DEPT\"\"H; p=/usr/local/bin/to; \"$p\"le run mission",
+            ],
             // Path-qualified / quoted env (cora review round 1 on #228).
             vec!["/usr/bin/env", "-i", "tole", "run"],
             vec!["\"env\"", "-i", "tole", "run"],
