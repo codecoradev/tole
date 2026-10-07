@@ -264,12 +264,9 @@ fn approval_allow_round_trip_executes_the_work() {
     assert_eq!(list["approvals"][0]["status"], "approved", "{list}");
     // The one-shot replay actually EXECUTED the write: the tool is
     // jailed to the serve process cwd (the test binary's package dir).
-    // Issue #259 (rescan #16): the marker must be REMOVED BEFORE the
-    // run — a stale file from a crashed prior run would false-pass the
-    // existence assert below.
+    // Issue #259: the stale-marker cleanup happens BEFORE the run (top
+    // of this test), so this assert proves THIS run's write landed.
     let work_file = std::path::Path::new("approved.txt");
-    let _ = std::fs::remove_file(work_file);
-    assert!(!work_file.exists(), "stale marker must be gone pre-run");
     assert!(work_file.exists(), "the approved write must have executed");
     let _ = std::fs::remove_file(work_file);
 }
