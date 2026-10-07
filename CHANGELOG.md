@@ -7,6 +7,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-10-06
+
+### Added
+- `tole upgrade` + startup update notification (issue #220): a
+  cache-backed (24 h) banner on startup when a newer crates.io
+  release exists (`/releases/latest` redirect primary, API fallback,
+  network failures silent, `TOLE_NO_UPDATE_CHECK=1` opts out), and
+  `tole upgrade [--check] [--yes]` which resolves the latest version
+  from crates.io and re-runs `cargo install tole-cli`, verifying the
+  binary afterwards. Non-cargo binaries get an explicit note.
+- `web_fetch` / `web_search` (#215): read-only internet access — fetch
+  is direct HTTPS (512 KB cap, content-type allowlist, HTML→text), search
+  probe-gated on `TOLE_WEB_SEARCH_URL` (fleet backend contract). No
+  backend, no tool.
+- Run ergonomics (#216): `run --prompt-file <path|->`, `--name <alias>`
+  (header-pinned; `tole sessions` shows it, `resume` accepts it), and
+  `--timeout <secs>` wall-clock cap (checkpoint cancel — settles
+  resumably, never dead).
+- Mobile-control guide (#202): docs/mobile-control.md defines the REST
+  surface uteke-mobile consumes (sessions, approvals, cancel, cost
+  report) with the auth model and cross-repo acceptance; threat model
+  gains the phone-as-approval-surface section.
+- Remote approvals (#200): serve-face Write approvals become a queue —
+  `GET /approvals` + `POST /approvals/{id}/decision` (allow = one-shot
+  fingerprint + approvals-only resume; deny = recorded verdict), expiry
+  to denied (15 min), durable audit registers, and a CLI consumer
+  (`tole approvals list/allow/deny`). MCP/ACP parity follow-up.
+- Mission budget tiers + cost report (#201): `--max-tokens` ceiling joins
+  `--max-steps`/`--max-minutes`; conservative defaults with `--trust
+  internal` headroom (explicit flags win); a durable cost report (steps,
+  turns, tokens, wall time, tool-call counts by risk tier) lands on the
+  session at every settle path and `tole status` renders it.
+- `tole mission` (#199): budgeted autonomous turn-chaining toward a goal —
+  `--max-steps` / `--max-minutes` budgets (exhaustion settles resumably),
+  optional `--verify <cmd>` gate (exit 0 = completion; failures return to
+  the model with output, 3 strikes settle `verify_failed`), durable
+  mission summary on the session, `--resume <id>` continuation.
+- `todo_write` / `todo_read` (#198): durable mission task list persisted as
+  ordinary session entries — `todo_write` echoes the full list as its result
+  (the durable record), state re-hydrates from the transcript on
+  open/resume, at most one task `in_progress`; `todo_write` is Write
+  (covered by `--trust internal`), `todo_read` is ReadOnly.
+### Fixed
+Pre-tag full-codebase scan gate (all MAJORs triaged valid and fixed):
+- Per-session `TodoState` — todo list no longer leaks across concurrent
+  serve/ACP sessions (#226).
+- MCP server: session-registry-first routing, unknown session id fails
+  closed, ambiguity refusal no longer bypassable (#227).
+- Child agents: argv depth guard closes quoting/`env -i`/`exec -c`/
+  substitution escapes (#228); spawn cap flock-serialized, mailbox
+  consumed flag persisted and consume lock held end-to-end (#234, #260).
+- Evals tier 2: judges require exit 0 and strip approval-banner echo (#229).
+- `git` tool: stdout capped at 20k chars with a truncated flag (#230);
+  colon pathspec magic refused in the add jail (#247).
+- Turn loop: poll steps exempt from `MAX_STEPS`, trait-driven `is_poll`
+  (#231); replay approval gate keyed to current tool risk (#249).
+- OpenAI streaming: usage/reasoning reset per response (#232).
+- `gitea` tool surfaces 4xx/5xx error bodies (#233).
+- `verify_package`: length-guarded edit-distance, bare-name typo
+  comparison (#235).
+- Hardening: storage session-id charset enforced at the boundary (#248);
+  web redirect cap is a hard error (#250); MCP result cap counts
+  separators (#251); `gh` tool probe-gated, no hardcoded repo (#254);
+  session list uses `try_lock` busy flags (#256); systemone caps keyed on
+  exact URL authority; approval URLs refuse plaintext `https://`
+  downgrade (#246); monotonic counter in approval entry ids; bounded
+  detached ACP `/models` probe; `tole mission` exits nonzero on non-done
+  statuses and refuses unsupported hook/memory flags.
+
 ## [0.6.0] — 2026-10-06
 
 ### Added

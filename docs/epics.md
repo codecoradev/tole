@@ -172,6 +172,21 @@ Everything below is merged; CHANGELOG entries carry the detail.
   (#178/#185) — cooperative cancellation now exists on all three
   server faces (ACP, REST, MCP), spec-conformant (the receiver may
   ignore un-cancellable work; single-tool calls are not interrupted).
+- **0.7.0 Mission MVP (merged to develop 2026-10-06; identity
+  extended owner-approved — chat-first personal assistant WITH a
+  mission mode for autonomous work):** durable task-list tools
+  `todo_write`/`todo_read` (#198/#205); `tole mission` budgeted
+  turn-chaining with `--max-steps/--max-minutes/--max-tokens/--verify`
+  and durable mission summaries (#199/#206); budget tiers + cost
+  report (#201/#207); ACP intra-turn visibility + true text streaming
+  (#196/#203/#204); ACP model picker auto-advertised from the
+  provider `/models` endpoint (#195/#197); remote approvals via the
+  serve face — queue, decisions, expiry, CLI consumer (#200/#214);
+  run ergonomics `--prompt-file/--name/--timeout` (#216/#219);
+  read-only `web_fetch`/`web_search` SSRF-guarded (#215/#221,
+  three CodeCora review rounds); startup update notification +
+  `tole upgrade` (#220/#222, fleet-parity with uteke/cora); the
+  mobile-control guide (#202/#218) defines the 0.9.0 surface.
 
 ---
 

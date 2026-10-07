@@ -180,3 +180,62 @@ self-hosted compatible). The decision payload sent to the backend is
 model-controlled context: treat the System One backend as an external
 data flow. The tool executes no writes; results are advisory input to
 the session like any other ReadOnly tool.
+
+### Task-list tools (#198)
+
+`todo_write` mutates only the session's task list, which lives in the
+write-once session log itself (the tool's result entry is the record; no
+side channel, no file). The threat surface equals any Write tool: prompt
+injection could rewrite the plan, but the list is data, never executed —
+and every revision is auditable in the replay. `todo_read` is ReadOnly.
+
+### Mission mode (#199)
+
+`tole mission` chains normal durable turns autonomously. The risk frame
+is unchanged and deliberate: the same approval gates, risk tiers, and
+write-once audit apply per chained turn — autonomy does not widen the
+boundary. Budgets bound blast radius in time, steps, and tokens
+(#201); exhaustion is resumable, never a dead session. The durable cost
+report keeps autonomous spend honest and comparable — an unmeasured
+mission is an unaudited one. `--verify` gives the operator a
+machine-checkable completion condition stronger than the model's own
+claim. Destructive tools remain structurally un-auto-allowable in
+missions.
+
+### Remote approver trust boundary (#200)
+
+The `/approvals` decision endpoint is the remote trust boundary: it is
+behind the same bearer-token auth + rate limiter as every serve route,
+and a decision is a one-shot for exactly one queued effect (fingerprint
+of tool + canonical input) — never a blanket allow. Decisions expire to
+denied so a lost connection cannot strand a mission, and every decision
+writes a durable audit register naming the approval id, tool, and
+verdict. The phone/CLI holder is therefore a full approver: treat the
+token as approval authority and scope it accordingly.
+
+### Phone as approval surface (#202)
+
+uteke-mobile consumes the #200 queue: the phone becomes a remote
+approver. The boundary is the serve token — it carries approval
+authority, so device compromise equals write access to the box. Locked
+down accordingly: the token is a revocable secret (rotate = serve
+restart), decisions are one-shot per (session, effect) with expiry to
+denied (a stolen device cannot bank future approvals), every decision
+is audited on the session, and there is no push endpoint in tole — the
+phone pulls, so the attack surface tole exposes is exactly the
+authenticated REST face. Scoped device tokens (per-device, revocable,
+read-only vs approver roles) are the recognized follow-up; until then
+the deployment guidance is a dedicated OS user + minimal
+`--allow`/`--trust` on the serve process.
+
+### Web tools (#215)
+
+`web_fetch`/`web_search` are ReadOnly: results enter context as model
+content and are never executed — the exfiltration framing is identical
+to any tool output. Fetch is text-only (no JS, no browser), size-capped
+(512 KB), content-type allowlisted; search requires an explicit
+`TOLE_WEB_SEARCH_URL` backend (probe-first — no keyless scraping). A
+crafted page CAN steer a mission via prompt injection; the mitigation
+is the same as every other untrusted input: tool-result fencing,
+approval gates on anything that matters, and mission budgets bounding
+the blast radius.

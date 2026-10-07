@@ -9,16 +9,21 @@ Durable Rust agent harness: a conversational agent with risk-tiered approval
 gates, a write-once JSONL session log, and a register state machine — resumable
 after crashes, replayable forever.
 
-**Status:** v0.5.0 released — four faces on one durable core: the CLI
-(run / chat / resume / sessions / jobs), `tole mcp` (tool server),
+**Status:** v0.6.0 released; the 0.7.0 train is release-candidate on
+`develop`. Four faces on one durable core: the CLI (run / chat /
+resume / sessions / jobs / **mission**), `tole mcp` (tool server),
 `tole acp` (editor agent), and `tole serve` (REST + multi-session
-MCP-over-HTTP daemon). Also in 0.5.0: the uteke memory loop, the cora
-MCP auto-preset, turn-end stop gates, `verify_package`, and SKILL.md
-support. On `develop` for the 0.6.0 train: `--trust` presets, System
-One decisions, depth-1 child agents, ACP model & approval pickers,
-and cooperative cancellation on every server face (see
-[CHANGELOG.md](CHANGELOG.md) → Unreleased). E9 hardening is closed;
-post-D3 waves live in [docs/epics.md](docs/epics.md).
+MCP-over-HTTP daemon). Identity (owner-approved): a chat-first
+personal assistant WITH a mission mode for autonomous work —
+budgeted turn-chaining (`tole mission --max-steps/--max-minutes/
+--max-tokens/--verify`), durable task-list tools (`todo_write`/
+`todo_read`), cost reports, and remote approvals via the serve face
+(the 0.9.0 mobile track consumes them from a phone). Also shipped on
+this train: ACP intra-turn visibility + true text streaming, ACP
+auto model picker, run ergonomics (`--prompt-file/--name/--timeout`),
+read-only `web_fetch`/`web_search` (SSRF-guarded), and startup
+update notification + `tole upgrade`. See
+[CHANGELOG.md](CHANGELOG.md) and [docs/epics.md](docs/epics.md).
 
 ## Ecosystem position
 
@@ -108,6 +113,7 @@ trust: `internal` / `read_only`), `--skill <path>` (load a SKILL.md),
 | `TOLE_BASE_URL`, `TOLE_MODEL`, `TOLE_API_KEY` | LLM provider — any OpenAI-compatible endpoint (`OPENAI_*` equivalents read as fallback) |
 | `TOLE_SYSTEM_PROMPT` | default persona when `--system` is absent |
 | `TOLE_MEMORY` | memory loop backend (`uteke`) — same as `--memory uteke` |
+| `TOLE_NO_UPDATE_CHECK` | `1` disables the startup update-check banner (issue #220) |
 | `TOLE_MEMORY_NAMESPACE` | override the loop's namespace (default: `repo-<directory name>`) |
 
 ## Tools
@@ -128,6 +134,52 @@ trust: `internal` / `read_only`), `--skill <path>` (load a SKILL.md),
 | `cora_search` | RO | hybrid codebase search via `cora brain`; native fallback — skipped when the cora MCP surface is attached |
 | `uteke_recall`, `uteke_document` | RO / Write | semantic memory recall / markdown → room |
 | `mcp_*` (from `--mcp-server`) | Write | server metadata is **never** trusted for risk; approval gate always applies |
+| `web_fetch`, `web_search` | RO | text-only internet (no JS/browser): fetch is direct HTTPS, size-capped, content-type allowlisted, HTML→text; search needs `TOLE_WEB_SEARCH_URL` (fleet backend, `{"results":[{title,url,snippet}]}`) — no backend, no tool; results are model content, never executed |
+| `todo_write`, `todo_read` | Write / RO | durable mission task list (at most one `in_progress`); state lives in session entries — write results are the record, crash-resume restores the last settled list; covered by `--trust internal` |
+
+## Remote approvals
+
+```bash
+tole serve --token $TOLE_SERVE_TOKEN          # on the box
+tole approvals list --url http://box:7801 --token $TOKEN
+tole approvals allow apr-... --url http://box:7801 --token $TOKEN
+```
+
+When a serve-face session hits a non-preauthorized Write (#200), the
+pending decision becomes a queue entry and the turn settles resumably
+(fail-closed). A remote operator lists and decides: **allow** stores a
+one-shot approval and resumes the session (the replayed effect
+re-consults the gate — exactly once), **deny** records the verdict.
+Entries expire to denied (15 min) so nothing hangs silently; every
+decision lands a durable audit register on the session. MCP/ACP parity
+is a follow-up. This is also the surface uteke-mobile drives —
+[docs/mobile-control.md](docs/mobile-control.md) is the mobile-control
+guide (#202).
+
+## Mission mode
+
+```bash
+tole mission "ship the feature" --max-steps 48 --max-minutes 15 \
+  --verify "cargo test" --yes
+```
+
+Autonomous turn-chaining toward a goal (#199): the existing turn
+machinery looped until the model declares `MISSION_COMPLETE` (and
+`--verify` exits 0, when set) or a budget trips (`--max-steps`,
+`--max-minutes`, `--max-tokens`). Every chained turn is a normal durable turn — crash
+mid-mission resumes exactly where it stopped (`tole mission --resume
+<id>`, or plain `tole resume`), cancel works unchanged, Destructive
+tools stay un-auto-allowable, and a durable summary lands on the
+session either way. Plans ride the `todo_write`/`todo_read` tools
+(#198); budget exhaustion settles resumably, never a dead session.
+Run ergonomics (#216): `run --prompt-file <path>` (`-` = stdin),
+`--name <alias>` (stored in the session header — `tole sessions` shows
+it and `resume` accepts the alias), and `--timeout <secs>` (wall-clock
+cap; expiry cancels at a checkpoint — resumable, never dead).
+Budget tiers (#201): conservative defaults (48 steps / 15 min / 200k
+tokens) with headroom under `--trust internal` (96 / 30 / 500k) —
+explicit flags always win; a durable cost report (turns, steps, tokens,
+per-risk-tier tool calls) lands on the session and `tole status` renders it.
 
 ## Approval gates
 

@@ -11,10 +11,13 @@ use tole_core::approval::AllowlistApprover;
 
 #[cfg(feature = "shell-tools")]
 mod acp;
+use tole_cli::approvals;
 #[cfg(feature = "mcp-http")]
 mod mcp_http;
+mod mission;
 #[cfg(feature = "shell-tools")]
 mod serve;
+mod upgrade;
 #[cfg(feature = "shell-tools")]
 use tole_core::cora_search::CoraSearchTool;
 use tole_core::file_tools::{DeleteFileTool, EditFileTool};
@@ -30,7 +33,7 @@ use tole_core::read_file::ReadFileTool;
 use tole_core::run_command::RunCommandTool;
 use tole_core::storage::{JsonlStorage, Storage};
 use tole_core::tool::ToolRegistry;
-use tole_core::turn::{resume_turn, run_turn, TurnOutcome, LOOP_TRIP_AFTER};
+use tole_core::turn::{resume_turn, run_turn, run_turn_with_cancel, TurnOutcome, LOOP_TRIP_AFTER};
 #[cfg(feature = "shell-tools")]
 use tole_core::uteke::{UtekeDocumentTool, UtekeRecallTool};
 use tole_core::verify_package::VerifyPackageTool;
@@ -163,8 +166,25 @@ struct Cli {
 enum Command {
     /// Start a new session and run one user turn.
     Run {
-        /// The user prompt for this turn.
-        prompt: String,
+        /// The user prompt for this turn. Omit when --prompt-file is set.
+        prompt: Option<String>,
+
+        /// Read the prompt from a file (`-` = stdin). Mutually exclusive
+        /// with the positional PROMPT (issue #216).
+        #[arg(long = "prompt-file")]
+        prompt_file: Option<String>,
+
+        /// Operator alias stored in the session header — `tole sessions`
+        /// shows it and `resume` accepts it instead of the generated id
+        /// (issue #216).
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Wall-clock cap for the turn, in seconds. Expiry cancels the
+        /// turn at the next checkpoint — it settles resumably, never
+        /// dead (issue #216).
+        #[arg(long)]
+        timeout: Option<u64>,
 
         /// System prompt for this session (highest priority; else
         /// TOLE_SYSTEM_PROMPT env; else none). Pinned in the session
@@ -182,6 +202,68 @@ enum Command {
 
         /// Auto-allow every Write call without prompting (heads-up
         /// mode. Destructive tools still prompt).
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Run an autonomous mission: budgeted turn-chaining toward a goal
+    /// (issue #199). Every chained turn is a normal durable turn —
+    /// crash mid-mission resumes exactly where it stopped; Destructive
+    /// tools stay un-auto-allowable. Termination: the model declares
+    /// MISSION_COMPLETE (and `--verify` exits 0, when set), or a budget
+    /// trips (`--max-steps` / `--max-minutes`), or the verify gate fails
+    /// too many times. A durable summary lands on the session either way.
+    Mission {
+        /// The mission goal, verbatim.
+        goal: String,
+
+        /// Total provider steps across all chained turns (from the
+        /// durable usage ledger). Default: budget tier (48; 96 with
+        /// --trust internal).
+        #[arg(long)]
+        max_steps: Option<u64>,
+
+        /// Wall-clock cap in minutes. Default: budget tier (15; 30 with
+        /// --trust internal).
+        #[arg(long)]
+        max_minutes: Option<u64>,
+
+        /// Total token ceiling (prompt + completion, from the usage
+        /// ledger). Default: budget tier (200k; 500k with
+        /// --trust internal).
+        #[arg(long)]
+        max_tokens: Option<u64>,
+
+        /// Verification command run after each turn; exit 0 = goal
+        /// achieved (overrides the model's completion marker). Failures
+        /// return to the model with the output; 3 failures settle the
+        /// mission as verify_failed.
+        #[arg(long)]
+        verify: Option<String>,
+
+        /// Per-run timeout of the --verify command, in seconds.
+        #[arg(long, default_value_t = 300)]
+        verify_timeout: u64,
+
+        /// Continue an interrupted mission instead of starting a new one.
+        #[arg(long)]
+        resume: Option<String>,
+
+        /// Same semantics as `run --allow`.
+        #[arg(long = "allow")]
+        allow_patterns: Vec<String>,
+
+        /// Auto-allow every Write call without prompting (heads-up
+        /// mode. Destructive tools still prompt).
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Check for updates and self-upgrade via cargo (issue #220).
+    Upgrade {
+        /// Only report whether an update is available; do not install.
+        #[arg(long)]
+        check: bool,
+
+        /// Skip the confirmation prompt (CI/automation).
         #[arg(long)]
         yes: bool,
     },
@@ -204,6 +286,25 @@ enum Command {
         /// Same semantics as `run --yes`.
         #[arg(long)]
         yes: bool,
+    },
+    /// Remote approvals (issue #200): list pending Write-approval
+    /// requests on a `tole serve` instance and allow/deny them. URL
+    /// defaults to TOLE_SERVE_URL or http://127.0.0.1:7801; token to
+    /// TOLE_SERVE_TOKEN.
+    Approvals {
+        /// list | allow | deny
+        action: String,
+
+        /// The approval id (required for allow/deny).
+        id: Option<String>,
+
+        /// Base URL of the serve instance.
+        #[arg(long, default_value = "http://127.0.0.1:7801")]
+        url: String,
+
+        /// Bearer token (defaults to TOLE_SERVE_TOKEN).
+        #[arg(long)]
+        token: Option<String>,
     },
     /// List sessions in the sessions dir, newest first.
     Sessions,
@@ -323,6 +424,17 @@ fn main() {
 }
 
 fn dispatch(cli: Cli) -> Result<()> {
+    // Startup update notification (issue #220): banner is best-effort,
+    // cache-backed, and skipped entirely for `tole upgrade` (which does
+    // its own check) and for TOLE_NO_UPDATE_CHECK=1 (checked inside).
+    if !matches!(cli.command, Command::Upgrade { .. }) {
+        if let Some(handle) = tole_core::update_check::check_and_notify() {
+            // Do not join: a hanging network must never delay startup.
+            // Detach — the thread dies with the process, which is fine
+            // for a best-effort banner.
+            drop(handle);
+        }
+    }
     let sessions_dir = PathBuf::from(
         cli.sessions_dir
             .clone()
@@ -373,11 +485,35 @@ fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Run {
             prompt,
+            prompt_file,
+            name,
+            timeout,
             system,
             allow_patterns: allow_patterns_in,
             yes,
         } => {
             let allow_patterns = with_trust(allow_patterns_in, &trust_extra);
+            // Prompt resolution (issue #216): exactly one of positional
+            // PROMPT / --prompt-file ('-' = stdin).
+            let prompt = match (prompt, prompt_file.as_deref()) {
+                (Some(p), None) => p,
+                (None, Some("-")) => {
+                    use std::io::Read;
+                    let mut buf = String::new();
+                    std::io::stdin()
+                        .read_to_string(&mut buf)
+                        .context("reading prompt from stdin")?;
+                    buf
+                }
+                (None, Some(path)) => std::fs::read_to_string(path)
+                    .with_context(|| format!("reading prompt file {path}"))?,
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("pass either a positional PROMPT or --prompt-file, not both")
+                }
+                (None, None) => {
+                    anyhow::bail!("missing prompt (positional PROMPT or --prompt-file)")
+                }
+            };
             run_command(
                 &sessions_dir,
                 &prompt,
@@ -385,7 +521,16 @@ fn dispatch(cli: Cli) -> Result<()> {
                 &allow_patterns,
                 yes,
                 &host,
+                name.as_deref(),
+                timeout,
             )
+        }
+        Command::Upgrade { check, yes } => {
+            let code = upgrade::run(check, yes)?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
         }
         Command::Resume {
             id,
@@ -438,6 +583,104 @@ fn dispatch(cli: Cli) -> Result<()> {
                 &allow_patterns,
                 #[cfg(feature = "mcp")]
                 host.plan_mode,
+            )
+        }
+        Command::Approvals {
+            action,
+            id,
+            url,
+            token,
+        } => {
+            let token = token
+                .or_else(|| std::env::var("TOLE_SERVE_TOKEN").ok())
+                .context("approval decisions need a token (--token or TOLE_SERVE_TOKEN)")?;
+            approvals::cli(&action, id.as_deref(), &url, &token)
+        }
+        Command::Mission {
+            goal,
+            max_steps,
+            max_minutes,
+            max_tokens,
+            verify,
+            verify_timeout,
+            resume,
+            allow_patterns: allow_patterns_in,
+            yes,
+        } => {
+            let allow_patterns = with_trust(allow_patterns_in, &trust_extra);
+            if host.plan_mode {
+                anyhow::bail!(
+                    "--plan-mode has no meaning for a mission (missions mutate by definition)"
+                );
+            }
+            // Issue #258 (rescan #46, scan-3 #9 rule): global flags must
+            // not SILENTLY no-op — missions build their own registry and
+            // run no host memory loop today, so hook/memory flags are
+            // loudly refused instead of being ignored.
+            if host.on_pretool_non_empty() || host.on_posttool_non_empty() {
+                anyhow::bail!(
+                    "--on-pretool/--on-posttool are not supported by `tole run mission` \
+                     (mission registries do not wire tool hooks yet)"
+                );
+            }
+            if !host.on_turnend.is_empty() {
+                anyhow::bail!(
+                    "--on-turnend is not supported by `tole run mission` (mission turns \
+                     settle through the mission loop, not the turn-end hook path)"
+                );
+            }
+            // #[cfg]-mirrored like the HostConfig field itself: without
+            // shell-tools the field is the unit type (cora round 1).
+            #[cfg(feature = "shell-tools")]
+            if host.memory.is_some() {
+                anyhow::bail!(
+                    "--memory is not supported by `tole run mission` (the mission loop does \
+                     not run the harness memory loop yet)"
+                );
+            }
+            #[cfg(feature = "mcp")]
+            check_client_session_flags("mission", &host.skills, host.no_skills, explicit_mcp)?;
+            // Budget tier (issue #201): the internal trust preset earns
+            // the trusted tier's headroom; explicit flags always win.
+            let trusted = trust_extra.iter().any(|p| p == "todo_write");
+            let tier = mission::BudgetTier::resolve(trusted, max_steps, max_minutes, max_tokens);
+            let sessions_dir = sessions_dir.clone();
+            std::fs::create_dir_all(&sessions_dir)
+                .with_context(|| format!("creating {}", sessions_dir.display()))?;
+            #[cfg(feature = "mcp")]
+            let mcp_cfgs: Vec<tole_core::mcp::McpServerConfig> = host
+                .mcp_server
+                .iter()
+                .map(|s| tole_core::mcp::McpServerConfig::parse(s))
+                .collect::<Result<Vec<_>, String>>()
+                .map_err(anyhow::Error::msg)?;
+            #[cfg(feature = "mcp")]
+            let registry = build_registry(
+                build_approver(&allow_patterns, yes),
+                host.workspace.as_ref(),
+                &mcp_cfgs,
+                host.agents_worktree,
+                &allow_patterns,
+            )?;
+            #[cfg(not(feature = "mcp"))]
+            let registry = build_registry(
+                build_approver(&allow_patterns, yes),
+                host.workspace.as_ref(),
+                host.agents_worktree,
+                &allow_patterns,
+            )?;
+            mission::run_mission(
+                mission::MissionConfig {
+                    goal,
+                    max_steps: tier.max_steps,
+                    max_minutes: tier.max_minutes,
+                    max_tokens: tier.max_tokens,
+                    verify,
+                    verify_timeout_secs: verify_timeout,
+                    resume_id: resume,
+                },
+                registry,
+                &sessions_dir,
             )
         }
         #[cfg(feature = "shell-tools")]
@@ -822,6 +1065,7 @@ const TRUST_PRESETS: &[(&str, &[&str])] = &[
             "verify_package",
             "job_*",
             "tole_session_*",
+            "todo_write",
         ],
     ),
     (
@@ -1014,6 +1258,14 @@ fn build_registry(
     }
     reg.register(Box::new(ReadFileTool::new(file_root.clone())))
         .map_err(|e| anyhow::anyhow!("registering read_file: {e}"))?;
+    // Web tools (issue #215): probe-first — fetch always; search only
+    // with TOLE_WEB_SEARCH_URL.
+    reg.register(Box::new(tole_core::web::WebFetchTool))
+        .map_err(|e| anyhow::anyhow!("registering web_fetch: {e}"))?;
+    if tole_core::web::WebSearchTool::from_env().is_some() {
+        reg.register(Box::new(tole_core::web::WebSearchTool::from_env().unwrap()))
+            .map_err(|e| anyhow::anyhow!("registering web_search: {e}"))?;
+    }
     // Write tools: gated per call. The jail root is the workspace.
     reg.register(Box::new(WriteFileTool::new(file_root.clone())))
         .map_err(|e| anyhow::anyhow!("registering write_file: {e}"))?;
@@ -1143,6 +1395,14 @@ fn build_server_registry(
     }
     reg.register(Box::new(ReadFileTool::new(file_root.clone())))
         .map_err(|e| anyhow::anyhow!("registering read_file: {e}"))?;
+    // Web tools (issue #215): probe-first — fetch always; search only
+    // with TOLE_WEB_SEARCH_URL.
+    reg.register(Box::new(tole_core::web::WebFetchTool))
+        .map_err(|e| anyhow::anyhow!("registering web_fetch: {e}"))?;
+    if tole_core::web::WebSearchTool::from_env().is_some() {
+        reg.register(Box::new(tole_core::web::WebSearchTool::from_env().unwrap()))
+            .map_err(|e| anyhow::anyhow!("registering web_search: {e}"))?;
+    }
     reg.register(Box::new(WriteFileTool::new(file_root.clone())))
         .map_err(|e| anyhow::anyhow!("registering write_file: {e}"))?;
     reg.register(Box::new(EditFileTool::new(file_root.clone())))
@@ -1265,6 +1525,7 @@ fn apply_skills_in(
     Ok(sections)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_command(
     sessions_dir: &Path,
     prompt: &str,
@@ -1272,6 +1533,8 @@ fn run_command(
     allow_patterns: &[String],
     yes: bool,
     host: &HostConfig,
+    name: Option<&str>,
+    timeout_secs: Option<u64>,
 ) -> Result<()> {
     let cfg = OpenAiConfig::from_env().context(
         "missing provider config: set TOLE_BASE_URL / TOLE_MODEL / TOLE_API_KEY \
@@ -1336,10 +1599,34 @@ fn run_command(
         .or_else(|| Some(build_default_prompt(host.plan_mode)));
     // Skills (issue #161): skill sections append after the base prompt.
     let system_prompt = system_prompt.map(|p| format!("{p}{skill_sections}"));
-    let mut storage =
-        JsonlStorage::create_with(sessions_dir, &session_id, None, system_prompt.as_deref())
-            .with_context(|| format!("creating session {session_id}"))?;
+    let mut storage = JsonlStorage::create_named(
+        sessions_dir,
+        &session_id,
+        None,
+        system_prompt.as_deref(),
+        name,
+    )
+    .with_context(|| format!("creating session {session_id}"))?;
     println!("session: {session_id}");
+    if let Some(alias) = name {
+        println!("name: {alias}");
+    }
+    // Task-list tools (issue #198): fresh session → empty state; both
+    // tools join the registry (todo_write absent in plan mode via the
+    // retain_read_only filter above — registration here is additive).
+    let todo_state = tole_core::todo::TodoState::new();
+    registry
+        .register(Box::new(tole_core::todo::TodoReadTool::new(
+            std::sync::Arc::clone(&todo_state),
+        )))
+        .map_err(|e| anyhow::anyhow!("registering todo_read: {e}"))?;
+    if !host.plan_mode {
+        registry
+            .register(Box::new(tole_core::todo::TodoWriteTool::new(
+                std::sync::Arc::clone(&todo_state),
+            )))
+            .map_err(|e| anyhow::anyhow!("registering todo_write: {e}"))?;
+    }
 
     let mut provider = OpenAiProvider::new(cfg).with_tool_specs(registry.specs());
     if let Some(sys) = system_prompt.as_deref() {
@@ -1353,7 +1640,26 @@ fn run_command(
     let (raw_prompt, prompt) = (prompt.to_string(), host.inject_memory(prompt));
     #[cfg(not(feature = "shell-tools"))]
     let prompt = prompt.to_string();
-    let outcome = run_turn(&mut storage, &mut provider, &registry, &prompt)?;
+    // Wall-clock cap (issue #216): a timer thread cancels the turn's
+    // token at the deadline; the loop's checkpoints unwind it into a
+    // durable Cancelled — resumable, never dead.
+    let cancel = tole_core::cancel::CancelToken::default();
+    let timer = timeout_secs.map(|secs| {
+        let token = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(secs));
+            token.cancel();
+        })
+    });
+    let outcome = run_turn_with_cancel(&mut storage, &mut provider, &registry, &prompt, &cancel)?;
+    // Join ONLY when the timer fired (cora MAJOR): join otherwise blocks
+    // for the remaining budget after the turn already finished. Detach —
+    // the process exits right after run_command anyway.
+    if timer.is_some() && cancel.is_cancelled() {
+        if let Some(t) = timer {
+            t.join().ok();
+        }
+    }
     // Memory loop, post-session: a settled Final turn leaves a compact
     // summary behind for the next session's recall.
     #[cfg(feature = "shell-tools")]
@@ -1372,10 +1678,44 @@ fn resume_command(
     yes: bool,
     host: &HostConfig,
 ) -> Result<()> {
-    if !valid_session_id(id) {
-        anyhow::bail!("invalid session id {id:?} (allowed: [a-z0-9-], max 64)");
-    }
-    let path = session_path(sessions_dir, id);
+    // Resolve by NAME first (issue #216): an alias from `run --name`
+    // is accepted anywhere an id is; exact ids still win when the file
+    // exists directly.
+    let id = if valid_session_id(id) && session_path(sessions_dir, id).exists() {
+        id.to_string()
+    } else {
+        let mut best: Option<(std::time::SystemTime, String)> = None;
+        for entry in std::fs::read_dir(sessions_dir)
+            .with_context(|| format!("listing {}", sessions_dir.display()))?
+            .flatten()
+        {
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            let Some(stem) = file_name.strip_suffix(".jsonl") else {
+                continue;
+            };
+            if !valid_session_id(stem) {
+                continue;
+            }
+            let Ok(s) = JsonlStorage::open(entry.path()) else {
+                continue;
+            };
+            if s.session_name() == Some(id) {
+                let mtime = entry.metadata().ok().and_then(|mm| mm.modified().ok());
+                match &best {
+                    Some((t, _)) if mtime.map(|mt| mt >= *t) != Some(true) => {}
+                    _ => best = Some((mtime.unwrap_or(std::time::UNIX_EPOCH), stem.to_string())),
+                }
+            }
+        }
+        match best {
+            Some((_, resolved)) => resolved,
+            None => anyhow::bail!(
+                "no session with id or name {id:?} in {}",
+                sessions_dir.display()
+            ),
+        }
+    };
+    let path = session_path(sessions_dir, &id);
     if !path.exists() {
         anyhow::bail!("session {id} not found at {}", path.display());
     }
@@ -1407,6 +1747,27 @@ fn resume_command(
         host.agents_worktree,
         allow_patterns,
     )?;
+    // Task-list tools (issue #198): state hydrated from the replayed
+    // transcript so a resumed mission keeps its plan. Registered BEFORE
+    // the plan-mode filter — todo_write must be ABSENT on the wire under
+    // --plan-mode (the retain_read_only guarantee), not merely gated.
+    {
+        let todo_state = tole_core::todo::TodoState::new();
+        {
+            use tole_core::storage::Storage;
+            todo_state.hydrate(storage.entries());
+        }
+        registry
+            .register(Box::new(tole_core::todo::TodoReadTool::new(
+                std::sync::Arc::clone(&todo_state),
+            )))
+            .map_err(|e| anyhow::anyhow!("registering todo_read: {e}"))?;
+        registry
+            .register(Box::new(tole_core::todo::TodoWriteTool::new(
+                std::sync::Arc::clone(&todo_state),
+            )))
+            .map_err(|e| anyhow::anyhow!("registering todo_write: {e}"))?;
+    }
     // Plan mode (issue #109): the guarantee is ABSENCE on the wire, not
     // approval — filtered tools never appear in specs().
     if host.plan_mode {
@@ -1455,13 +1816,13 @@ fn resume_command(
                 wrote,
             } = &outcome
             {
-                host.remember(id, text, answer, *wrote);
+                host.remember(&id, text, answer, *wrote);
             }
             outcome
         }
         _ => resume_turn(&mut storage, &mut provider, &registry)?,
     };
-    report_outcome(id, outcome);
+    report_outcome(&id, outcome);
     Ok(())
 }
 
@@ -1507,6 +1868,11 @@ fn status_command(sessions_dir: &Path, id: &str) -> Result<()> {
     // explicit: a negative-zero cost display would look like a bug).
     let cost = if cost == 0.0 { 0.0 } else { cost };
     println!("usage:   {prompt_tokens} in / {completion_tokens} out tokens, ${cost:.4} USD");
+    // Mission cost report (issue #201): the durable fact/mission register
+    // a settled mission leaves behind.
+    if let Some(mission) = storage.get_register("fact", "mission") {
+        println!("mission: {}", mission);
+    }
     Ok(())
 }
 
@@ -1521,7 +1887,9 @@ fn sessions_command(sessions_dir: &Path) -> Result<()> {
     }
     // (epoch_secs, id, pc, seq, turns) — epoch secs first so a plain
     // sort_by_key ascending gives newest-first via Reverse.
-    let mut rows: Vec<(u64, String, String, u64, usize)> = Vec::new();
+    // (epoch_secs, id, pc, seq, turns, name) — epoch secs first so a
+    // plain sort_by_key ascending gives newest-first via Reverse.
+    let mut rows: Vec<(u64, String, String, u64, usize, Option<String>)> = Vec::new();
     for entry in std::fs::read_dir(sessions_dir)?.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
         // strip_suffix, not trim_end_matches: a (weird but possible)
@@ -1557,6 +1925,7 @@ fn sessions_command(sessions_dir: &Path) -> Result<()> {
             format!("{:?}", s.state().pc),
             s.state().seq,
             turns,
+            s.session_name().map(str::to_string),
         ));
     }
     if rows.is_empty() {
@@ -1565,14 +1934,15 @@ fn sessions_command(sessions_dir: &Path) -> Result<()> {
     }
     rows.sort_by_key(|r| std::cmp::Reverse(r.0)); // newest first
     println!(
-        "{:<26} {:<12} {:>5} {:>6}  mtime",
-        "session", "pc", "seq", "turns"
+        "{:<26} {:<18} {:<12} {:>5} {:>6}  mtime",
+        "session", "name", "pc", "seq", "turns"
     );
     for row in &rows {
         let mtime = fmt_mtime(std::time::UNIX_EPOCH + std::time::Duration::from_secs(row.0));
+        let name = row.5.clone().unwrap_or_else(|| "-".to_string());
         println!(
-            "{:<26} {:<12} {:>5} {:>6}  {mtime}",
-            row.1, row.2, row.3, row.4
+            "{:<26} {:<18} {:<12} {:>5} {:>6}  {mtime}",
+            row.1, name, row.2, row.3, row.4
         );
     }
     Ok(())
@@ -1994,7 +2364,7 @@ exists with the verify_package tool. Keep answers concise."
 /// appends the read-only instruction to the SAME incumbent text — the
 /// identity/tool-discipline section is shared, so the non-plan default
 /// never drifts from what the replay scorer greps out of this file.
-fn default_prompt_for(plan_mode: bool) -> String {
+pub fn default_prompt_for(plan_mode: bool) -> String {
     let base = default_system_prompt();
     if plan_mode {
         format!(

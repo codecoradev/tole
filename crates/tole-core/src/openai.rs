@@ -12,6 +12,12 @@ use crate::provider::{Provider, ProviderError, ProviderOutput};
 use serde_json::{json, Value};
 use std::time::Duration;
 
+/// A live-token callback (issue #196 phase 3): invoked per reasoning/
+/// content burst while a streamed completion is in flight. The turn
+/// loop never sees partial data — `complete()` still returns one
+/// decisive output built from the accumulated stream.
+pub type DeltaSink = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+
 /// Where a config value came from — for tests and debug output that must
 /// never include the key itself.
 #[derive(Clone, PartialEq, Eq)]
@@ -106,7 +112,7 @@ impl OpenAiConfig {
 
 /// OpenAI-compatible provider (works with OpenAI, Groq, OpenRouter, vLLM,
 /// LiteLLM proxies, … — anything speaking `/chat/completions`).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OpenAiProvider {
     cfg: OpenAiConfig,
     timeout: Duration,
@@ -123,6 +129,32 @@ pub struct OpenAiProvider {
     /// Provider-reported `usage` object from the last response (status
     /// command previously showed 0/0 because it was never captured).
     last_usage_obj: Option<Value>,
+    /// The model's reasoning from the last step (issue #196 phase 2):
+    /// captured for the turn-loop observer; never durable.
+    last_reasoning_obj: Option<String>,
+    /// Live-token sinks (issue #196 phase 3): present on host faces
+    /// that render progress (ACP). When set, reasoning arrives via
+    /// deltas and `last_reasoning` stays None — no double emission.
+    on_text_delta: Option<DeltaSink>,
+    on_reasoning_delta: Option<DeltaSink>,
+    /// `stream: true` on the wire. Default on; `TOLE_STREAM=0` is the
+    /// escape hatch for gateways that reject the streaming envelope.
+    streaming: bool,
+}
+
+impl std::fmt::Debug for OpenAiProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenAiProvider")
+            .field("cfg", &self.cfg.safe_description())
+            .field("timeout", &self.timeout)
+            .field("tool_specs", &self.tool_specs.len())
+            .field("streaming", &self.streaming)
+            .field("text_sink", &self.on_text_delta.is_some())
+            .field("reasoning_sink", &self.on_reasoning_delta.is_some())
+            .field("has_usage", &self.last_usage_obj.is_some())
+            .field("has_reasoning", &self.last_reasoning_obj.is_some())
+            .finish()
+    }
 }
 
 impl OpenAiProvider {
@@ -136,7 +168,32 @@ impl OpenAiProvider {
             system_prompt: None,
             tool_specs: Vec::new(),
             last_usage_obj: None,
+            last_reasoning_obj: None,
+            on_text_delta: None,
+            on_reasoning_delta: None,
+            streaming: std::env::var("TOLE_STREAM")
+                .map(|v| v != "0")
+                .unwrap_or(true),
         }
+    }
+
+    /// Override the streaming default (tests; `TOLE_STREAM=0` sets the
+    /// same field in production).
+    pub fn with_streaming(mut self, on: bool) -> Self {
+        self.streaming = on;
+        self
+    }
+
+    /// Attach live-token sinks (issue #196 phase 3). Call BEFORE the
+    /// first `complete()`; the provider invokes them mid-stream.
+    pub fn with_delta_sinks(
+        mut self,
+        on_text: Option<DeltaSink>,
+        on_reasoning: Option<DeltaSink>,
+    ) -> Self {
+        self.on_text_delta = on_text;
+        self.on_reasoning_delta = on_reasoning;
+        self
     }
 
     fn build_agent(timeout: Duration) -> ureq::Agent {
@@ -361,9 +418,159 @@ impl OpenAiProvider {
     }
 }
 
+impl OpenAiProvider {
+    /// Issue #196 phase 3: drive one streamed completion to [DONE].
+    ///
+    /// Semantics, matched against the live wire (bifrost/GLM, 2026-10-06):
+    /// - `data: {...}` chunks carry `choices[0].delta` with optional
+    ///   `reasoning` / `content` / `tool_calls` fragments; the final
+    ///   chunk carries the FULL `usage` object; `data: [DONE]` ends it.
+    /// - Reasoning/content bursts invoke the sinks mid-flight (when
+    ///   attached); when a reasoning sink is present `last_reasoning`
+    ///   stays None — the deltas WERE the emission, no double-send.
+    /// - Tool-call fragments arrive split across chunks (`function.
+    ///   arguments` concatenates); only after [DONE] does the loop get
+    ///   its decisive ToolCall — nothing executes mid-stream.
+    /// - The accumulated content may be empty when the model only made
+    ///   tool calls (mirrors the non-stream parse contract).
+    fn complete_streaming<R: std::io::BufRead>(
+        &mut self,
+        mut reader: R,
+    ) -> Result<ProviderOutput, ProviderError> {
+        let mut text = String::new();
+        let mut reasoning = String::new();
+        // Tool-call fragments by index: (id, name, arguments-so-far).
+        let mut tool_calls: std::collections::BTreeMap<u64, (String, String, String)> =
+            std::collections::BTreeMap::new();
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = reader.read_line(&mut line).map_err(|e| {
+                ProviderError(scrub(&format!("stream read: {e}"), &self.cfg.api_key))
+            })?;
+            if n == 0 {
+                break; // EOF without [DONE]: treat like end-of-stream.
+            }
+            let line = line.trim();
+            if line.is_empty() || line.starts_with(':') {
+                continue; // keep-alive / comment per SSE
+            }
+            let Some(data) = line.strip_prefix("data:") else {
+                continue; // non-data SSE field: ignore
+            };
+            let data = data.trim();
+            if data == "[DONE]" {
+                break;
+            }
+            let chunk: Value = serde_json::from_str(data).map_err(|e| {
+                ProviderError(scrub(
+                    &format!("malformed stream chunk: {e}"),
+                    &self.cfg.api_key,
+                ))
+            })?;
+            if let Some(u) = chunk.get("usage").filter(|u| u.is_object()) {
+                self.last_usage_obj = Some(u.clone());
+            }
+            let choice = &chunk["choices"][0];
+            let delta = &choice["delta"];
+            if let Some(r) = delta["reasoning"].as_str() {
+                if !r.is_empty() {
+                    reasoning.push_str(r);
+                    if let Some(sink) = &self.on_reasoning_delta {
+                        sink(r);
+                    }
+                }
+            }
+            if let Some(t) = delta["content"].as_str() {
+                if !t.is_empty() {
+                    text.push_str(t);
+                    if let Some(sink) = &self.on_text_delta {
+                        sink(t);
+                    }
+                }
+            }
+            if let Some(frags) = delta["tool_calls"].as_array() {
+                for f in frags {
+                    let idx = f["index"].as_u64().unwrap_or(0);
+                    let slot = tool_calls.entry(idx).or_default();
+                    if let Some(id) = f["id"].as_str() {
+                        slot.0.push_str(id);
+                    }
+                    if let Some(name) = f["function"]["name"].as_str() {
+                        slot.1.push_str(name);
+                    }
+                    if let Some(args) = f["function"]["arguments"].as_str() {
+                        slot.2.push_str(args);
+                    }
+                }
+            }
+        }
+        // Decisive output from the accumulation — same contract as the
+        // non-stream parse: one tool call per step, or the final text.
+        if let Some((_, (id, name, args))) = tool_calls.into_iter().next() {
+            if args.trim().is_empty() {
+                return Ok(ProviderOutput::InvalidToolArgs {
+                    tool: name,
+                    raw: args,
+                    reason: "missing arguments (blank string)".into(),
+                });
+            }
+            let input: Value = match serde_json::from_str(args.trim()) {
+                Ok(v) => v,
+                Err(err) => {
+                    return Ok(ProviderOutput::InvalidToolArgs {
+                        tool: name,
+                        raw: args,
+                        reason: err.to_string(),
+                    });
+                }
+            };
+            let _ = id;
+            // Issue #232: settle THIS step's reasoning exactly like the
+            // text path below — without a sink the accumulated thought
+            // surfaces once at turn end; with a sink the deltas were
+            // the emission (already None from the per-call reset).
+            if self.on_reasoning_delta.is_none() && !reasoning.trim().is_empty() {
+                self.last_reasoning_obj = Some(reasoning);
+            }
+            return Ok(ProviderOutput::ToolCall { tool: name, input });
+        }
+        // No tool calls: the answer must have content (GLM emits an
+        // empty content:"" chunk at the end — empty total = malformed).
+        if text.is_empty() {
+            return Err(ProviderError(
+                "malformed response: empty stream (no content, no tool calls)".into(),
+            ));
+        }
+        // Deltas already delivered the reasoning when a sink was wired;
+        // otherwise surface the accumulated thought once, turn-end.
+        if self.on_reasoning_delta.is_none() && !reasoning.trim().is_empty() {
+            self.last_reasoning_obj = Some(std::mem::take(&mut reasoning));
+        } else {
+            self.last_reasoning_obj = None;
+        }
+        Ok(ProviderOutput::Final { text })
+    }
+}
+
 impl Provider for OpenAiProvider {
     fn complete(&mut self, transcript: &[Entry]) -> Result<ProviderOutput, ProviderError> {
-        let body = self.request_body(transcript);
+        // Issue #232 (scan #106): last_usage / last_reasoning describe
+        // THIS response only. Reset per call — a tool-call step (which
+        // returns early) or a gateway that omits usage must never leave
+        // the previous response's values for the turn-loop observer and
+        // the durable ledger. Each path (streaming, non-stream, error)
+        // then sets what it actually has.
+        self.last_usage_obj = None;
+        self.last_reasoning_obj = None;
+        let mut body = self.request_body(transcript);
+        // Issue #196 phase 3: the streaming envelope rides on top of the
+        // request body — the Tier-1 golden contract keeps asserting the
+        // MESSAGE payload, which is what cache-friendliness depends on.
+        if self.streaming {
+            body["stream"] = serde_json::json!(true);
+            body["stream_options"] = serde_json::json!({"include_usage": true});
+        }
         let url = format!(
             "{}/chat/completions",
             self.cfg.base_url.trim_end_matches('/')
@@ -389,6 +596,13 @@ impl Provider for OpenAiProvider {
             let snippet: String = body_text.chars().take(200).collect();
             return Err(ProviderError(format!("http status: {status} — {snippet}")));
         }
+        // Issue #196 phase 3: SSE streaming — deltas flow to the sinks
+        // while the stream is read; complete() returns one decisive
+        // output built from the accumulation.
+        if self.streaming {
+            return self
+                .complete_streaming(std::io::BufReader::new(resp.into_body().into_reader()));
+        }
         let mut resp = resp;
         let resp_body = resp
             .body_mut()
@@ -397,11 +611,22 @@ impl Provider for OpenAiProvider {
         // Capture provider-reported usage (issue: status showed 0/0) —
         // exposed via `last_usage` for the turn loop's durable ledger.
         self.last_usage_obj = resp_body.get("usage").cloned().filter(Value::is_object);
+        // Capture the model's reasoning (issue #196 phase 2): GLM-class
+        // responses carry it next to `content`; absent on most other
+        // gateways. Observer-only — the durable log keeps the answer.
+        self.last_reasoning_obj = resp_body["choices"][0]["message"]["reasoning"]
+            .as_str()
+            .map(str::to_string)
+            .filter(|r| !r.trim().is_empty());
         Self::parse_completion(&resp_body)
     }
 
     fn last_usage(&self) -> Option<Value> {
         self.last_usage_obj.clone()
+    }
+
+    fn last_reasoning(&self) -> Option<String> {
+        self.last_reasoning_obj.clone()
     }
 }
 
@@ -436,6 +661,36 @@ fn scrub(msg: &str, secret: &str) -> String {
     } else {
         msg.to_string()
     }
+}
+
+/// Probe the provider's `GET /models` endpoint (issue #195): the model
+/// ids the gateway serves, provider order, deduped. Read-only, same
+/// base_url/credentials as chat completions — no new trust surface.
+/// Deliberately short timeout: this feeds a UI convenience (the ACP
+/// model picker), never a correctness dependency — callers degrade to
+/// "no picker" on any error, per the probe-first contract.
+pub fn fetch_model_ids(base_url: &str, api_key: &str) -> Result<Vec<String>, String> {
+    let agent = OpenAiProvider::build_agent(Duration::from_secs(3));
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let mut res = agent
+        .get(&url)
+        .header("Authorization", &format!("Bearer {api_key}"))
+        .call()
+        .map_err(|e| scrub(&format!("models probe: {e}"), api_key))?;
+    let body: Value = res
+        .body_mut()
+        .read_json()
+        .map_err(|e| scrub(&format!("models probe: {e}"), api_key))?;
+    let mut out: Vec<String> = Vec::new();
+    for m in body["data"].as_array().unwrap_or(&Vec::new()) {
+        if let Some(id) = m["id"].as_str() {
+            let id = id.trim();
+            if !id.is_empty() && !out.iter().any(|k| k == id) {
+                out.push(id.to_string());
+            }
+        }
+    }
+    Ok(out)
 }
 
 use crate::entry::Entry;
@@ -882,5 +1137,318 @@ mod system_prompt_tests {
         let msgs = body["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0]["role"], json!("user"));
+    }
+}
+
+#[cfg(test)]
+mod models_probe_tests {
+    use super::*;
+
+    #[test]
+    fn fetch_model_ids_parses_dedupes_and_fails_soft() {
+        // One-shot mock: standard {"data":[{"id":...}]} shape, with a
+        // duplicate and an empty id to prove dedupe + filtering.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                use std::io::{Read, Write};
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf);
+                let body = r#"{"data":[{"id":"b"},{"id":"a"},{"id":"b"},{"id":" "}]}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+        let ids = fetch_model_ids(&format!("http://{addr}/v1"), "sk-test").unwrap();
+        assert_eq!(ids, vec!["b", "a"]);
+
+        // Unreachable endpoint: Err, and the key never leaks into the
+        // error text (the same scrub contract as chat completions).
+        let err = fetch_model_ids("http://127.0.0.1:9/v1", "sk-secret").unwrap_err();
+        assert!(!err.contains("sk-secret"));
+    }
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    /// One-shot SSE mock: serves the given pre-built stream body and
+    /// captures the raw request for envelope assertions.
+    fn serve_stream(body: String, capture: Arc<Mutex<String>>) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                use std::io::Read;
+                // Read until the full content-length body has arrived —
+                // a single read can return headers only.
+                let mut buf: Vec<u8> = Vec::new();
+                let mut chunk = [0u8; 8192];
+                loop {
+                    let n = s.read(&mut chunk).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(h) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&buf[..h]).to_string();
+                        let clen: usize = head
+                            .lines()
+                            .find_map(|l| {
+                                let (k, v) = l.split_once(':')?;
+                                if k.eq_ignore_ascii_case("content-length") {
+                                    v.trim().parse().ok()
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(0);
+                        if buf.len() >= h + 4 + clen {
+                            break;
+                        }
+                    }
+                }
+                *capture.lock().unwrap() = String::from_utf8_lossy(&buf).to_string();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = std::io::Write::write_all(&mut s, resp.as_bytes());
+            }
+        });
+        format!("http://{addr}/v1")
+    }
+
+    #[test]
+    fn streaming_builds_tool_call_from_fragments_and_captures_usage() {
+        let capture = Arc::new(Mutex::new(String::new()));
+        let url = serve_stream(
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"reasoning\":\"I will \"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"reasoning\":\"write the file\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"write_file\",\"arguments\":\"{\\\"pa\"}}]}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"th\\\":\\\"a.txt\\\"}\"}}]}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":4,\"total_tokens\":13}}\n\n",
+                "data: [DONE]\n\n",
+            )
+            .to_string(),
+            Arc::clone(&capture),
+        );
+        let mut p = OpenAiProvider::new(OpenAiConfig::new(url, "m", "sk-test"));
+        let fired: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let t_sink = Arc::clone(&fired);
+        let r_sink = Arc::clone(&fired);
+        p = p.with_delta_sinks(
+            Some(Arc::new(move |t: &str| {
+                t_sink.lock().unwrap().push(format!("text:{t}"))
+            })),
+            Some(Arc::new(move |r: &str| {
+                r_sink.lock().unwrap().push(format!("think:{r}"))
+            })),
+        );
+        let out = p.complete(&[]).unwrap();
+        // Envelope asserted on the wire: stream fields ride the request.
+        {
+            // Compact: send_json may serialize with spaces after colons.
+            let req: String = capture
+                .lock()
+                .unwrap()
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            assert!(req.contains("\"stream\":true"), "{}", req);
+            assert!(req.contains("include_usage"), "{}", req);
+        }
+        match out {
+            ProviderOutput::ToolCall { tool, input } => {
+                assert_eq!(tool, "write_file");
+                assert_eq!(input, json!({"path": "a.txt"}), "fragments concatenate");
+            }
+            other => panic!("expected tool call, got {other:?}"),
+        }
+        assert_eq!(
+            *fired.lock().unwrap(),
+            vec!["think:I will ", "think:write the file"],
+            "sinks fire per burst, in stream order"
+        );
+        // Usage from the final chunk feeds the durable ledger.
+        assert_eq!(p.last_usage().unwrap()["prompt_tokens"], json!(9));
+        // The reasoning sink already delivered the thought: no replay.
+        assert!(p.last_reasoning().is_none());
+    }
+
+    #[test]
+    fn streaming_text_final_without_sinks_keeps_turn_end_reasoning() {
+        let capture = Arc::new(Mutex::new(String::new()));
+        let url = serve_stream(
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"reasoning\":\"thinking\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n",
+            )
+            .to_string(),
+            Arc::clone(&capture),
+        );
+        let mut p = OpenAiProvider::new(OpenAiConfig::new(url, "m", "sk-test"));
+        let out = p.complete(&[]).unwrap();
+        match out {
+            ProviderOutput::Final { text } => assert_eq!(text, "hello"),
+            other => panic!("expected final, got {other:?}"),
+        }
+        // No sink: the accumulated thought surfaces once, turn-end.
+        assert_eq!(p.last_reasoning().unwrap(), "thinking");
+    }
+
+    /// One-shot SSE mock that serves the given bodies on SEQUENTIAL
+    /// connections over ONE port — so a single provider instance can
+    /// make several complete() calls (issue #232 stale-state coverage
+    /// requires the SAME provider across responses).
+    fn serve_stream_seq(bodies: Vec<String>) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for body in bodies {
+                let Ok((mut s, _)) = listener.accept() else {
+                    break;
+                };
+                use std::io::Read;
+                let mut buf = [0u8; 8192];
+                let _ = s.read(&mut buf);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = std::io::Write::write_all(&mut s, resp.as_bytes());
+            }
+        });
+        format!("http://{addr}/v1")
+    }
+
+    /// Issue #232 regression: each response's usage/reasoning stand
+    /// alone ON THE SAME PROVIDER. A tool-call step (early return) must
+    /// not inherit the previous response's values, and a step whose
+    /// gateway omits the usage chunk must CLEAR it (the durable ledger
+    /// gets nothing for that step, not the previous step's numbers).
+    #[test]
+    fn tool_call_step_sets_fresh_reasoning_and_usage_per_response() {
+        let url = serve_stream_seq(vec![
+            // Response 1: text final — reasoning + usage recorded.
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"reasoning\":\"first thought\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+                "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2,\"total_tokens\":3}}\n\n",
+                "data: [DONE]\n\n",
+            )
+            .to_string(),
+            // Response 2: tool-call step — its own reasoning + usage.
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"reasoning\":\"second thought\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"echo\",\"arguments\":\"{}\"}}]}}]}\n\n",
+                "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":6,\"total_tokens\":11}}\n\n",
+                "data: [DONE]\n\n",
+            )
+            .to_string(),
+            // Response 3: gateway omits the usage chunk → ledger cleared.
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n",
+            )
+            .to_string(),
+        ]);
+        // ONE provider for all three responses: the stale-state carry-
+        // over under test only exists between calls on the same
+        // instance (cora review: fresh providers made the old version
+        // of this test pass even without the fix).
+        let mut p = OpenAiProvider::new(OpenAiConfig::new(url, "m", "sk-test"));
+
+        assert!(matches!(
+            p.complete(&[]).unwrap(),
+            ProviderOutput::Final { .. }
+        ));
+        assert_eq!(p.last_reasoning().unwrap(), "first thought");
+        assert_eq!(p.last_usage().unwrap()["prompt_tokens"], json!(1));
+
+        assert!(matches!(
+            p.complete(&[]).unwrap(),
+            ProviderOutput::ToolCall { .. }
+        ));
+        assert_eq!(
+            p.last_reasoning().unwrap(),
+            "second thought",
+            "the tool-call step's OWN reasoning is surfaced (no sink attached)"
+        );
+        assert_eq!(
+            p.last_usage().unwrap()["prompt_tokens"],
+            json!(5),
+            "usage is this step's, not the previous response's"
+        );
+
+        assert!(matches!(
+            p.complete(&[]).unwrap(),
+            ProviderOutput::Final { .. }
+        ));
+        assert!(
+            p.last_usage().is_none(),
+            "omitted usage must reset, not leak the previous response's"
+        );
+        assert!(
+            p.last_reasoning().is_none(),
+            "no reasoning in this response — must not show the previous one"
+        );
+    }
+
+    /// Issue #232: with a reasoning sink attached, the deltas WERE the
+    /// emission — a tool-call step leaves last_reasoning None (no
+    /// double emission), mirroring the text path.
+    #[test]
+    fn tool_call_step_with_reasoning_sink_leaves_reasoning_none() {
+        let capture = Arc::new(Mutex::new(String::new()));
+        let url = serve_stream(
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"reasoning\":\"think part\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"echo\",\"arguments\":\"{}\"}}]}}]}\n\n",
+                "data: [DONE]\n\n",
+            )
+            .to_string(),
+            Arc::clone(&capture),
+        );
+        let mut p = OpenAiProvider::new(OpenAiConfig::new(url, "m", "sk-test"));
+        let fired: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let r_sink = Arc::clone(&fired);
+        p = p.with_delta_sinks(
+            None,
+            Some(Arc::new(move |r: &str| {
+                r_sink.lock().unwrap().push(format!("think:{r}"))
+            })),
+        );
+        assert!(matches!(
+            p.complete(&[]).unwrap(),
+            ProviderOutput::ToolCall { .. }
+        ));
+        assert_eq!(*fired.lock().unwrap(), vec!["think:think part"]);
+        assert!(p.last_reasoning().is_none(), "deltas already delivered");
+    }
+
+    #[test]
+    fn streaming_flag_overridable_for_legacy_gateways() {
+        let p = OpenAiProvider::new(OpenAiConfig::new("http://127.0.0.1:9/v1", "m", "k"))
+            .with_streaming(false);
+        assert!(
+            !p.streaming,
+            "the escape hatch must be able to turn streaming off"
+        );
     }
 }

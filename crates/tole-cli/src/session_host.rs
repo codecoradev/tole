@@ -28,6 +28,12 @@ pub struct SessionState {
     pub first_prompt_done: StdArc<Mutex<bool>>,
     pub busy: StdArc<Mutex<bool>>,
     /// Cancellation checkpoint (issue #178): the transport sets it on
+    /// Per-session tool-card id counter (issue #196; cora CI on PR
+    /// #203): observer ids must keep incrementing ACROSS turns — a
+    /// per-turn counter would re-emit `tool-1` on the second prompt and
+    /// hosts would correlate the completion onto the previous turn's
+    /// stale card.
+    pub tool_ids: StdArc<Mutex<u64>>,
     /// client cancel (ACP `session/cancel`); the turn loop checks it
     /// between steps. `serve` never sets it — REST behavior unchanged.
     pub cancel: tole_core::cancel::CancelToken,
@@ -48,6 +54,100 @@ pub struct Sessions {
 }
 
 pub type SharedSessions = StdArc<Mutex<Sessions>>;
+
+/// Callback publishing a plan payload to the session's client (issue
+/// #196 phase 4). ACP wires a closure sending the standard `plan`
+/// session/update (Termul's PlanPanel renders it, full-replace); the
+/// serve/MCP faces pass None — no UI to render plans there.
+pub type PlanEmitter = StdArc<dyn Fn(&serde_json::Value) + Send + Sync>;
+
+/// The model-facing `update_plan` tool (issue #196 phase 4): publishes
+/// the execution plan to the host's plan panel. Structurally
+/// ReadOnly — it mutates nothing durable and has no side effects
+/// beyond the notification. Validation is strict-but-lenient: required
+/// `content`, enum-checked `priority`/`status` with spec defaults, so
+/// the model self-corrects from the error text on malformed input.
+pub struct UpdatePlanTool {
+    emitter: PlanEmitter,
+}
+
+impl UpdatePlanTool {
+    pub fn new(emitter: PlanEmitter) -> Self {
+        Self { emitter }
+    }
+}
+
+impl tole_core::tool::Tool for UpdatePlanTool {
+    fn name(&self) -> &str {
+        "update_plan"
+    }
+    fn risk(&self) -> tole_core::tool::Risk {
+        tole_core::tool::Risk::ReadOnly
+    }
+    fn describe(&self, _input: &serde_json::Value) -> String {
+        "publish the execution plan to the user's plan panel".into()
+    }
+    fn spec(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "entries": {
+                    "type": "array",
+                    "description": "The FULL plan, replacing any previous one",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "content": {"type": "string"},
+                            "priority": {"enum": ["high", "medium", "low"]},
+                            "status": {"enum": ["pending", "in_progress", "completed"]}
+                        },
+                        "required": ["content"]
+                    }
+                }
+            },
+            "required": ["entries"]
+        }))
+    }
+    fn execute(&self, input: serde_json::Value) -> Result<serde_json::Value, String> {
+        let entries = normalize_plan(&input)?;
+        (self.emitter)(&entries);
+        Ok(serde_json::json!({
+            "ok": true,
+            "entries": entries.as_array().map(|a| a.len()).unwrap_or(0)
+        }))
+    }
+}
+
+/// Validate + normalize plan entries into the ACP `plan` update shape.
+fn normalize_plan(input: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let arr = input["entries"]
+        .as_array()
+        .ok_or("update_plan: 'entries' (array) is required")?;
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    for e in arr {
+        let content = e["content"]
+            .as_str()
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .ok_or("update_plan: each entry needs a non-empty 'content' string")?;
+        let priority = e["priority"].as_str().unwrap_or("medium");
+        if !matches!(priority, "high" | "medium" | "low") {
+            return Err(format!(
+                "update_plan: invalid priority '{priority}' (high | medium | low)"
+            ));
+        }
+        let status = e["status"].as_str().unwrap_or("pending");
+        if !matches!(status, "pending" | "in_progress" | "completed") {
+            return Err(format!(
+                "update_plan: invalid status '{status}' (pending | in_progress | completed)"
+            ));
+        }
+        out.push(serde_json::json!({
+            "content": content, "priority": priority, "status": status
+        }));
+    }
+    Ok(serde_json::Value::Array(out))
+}
 
 /// Poisoning-tolerant lock: one panicking turn must not brick the whole
 /// server (CodeCora scan finding — mutex poisoning).
@@ -111,6 +211,7 @@ pub fn open_session(
     turnend: Vec<String>,
     parent_allows: Vec<String>,
     cancel: tole_core::cancel::CancelToken,
+    plan_emitter: Option<PlanEmitter>,
 ) -> Result<SessionState, String> {
     let workspace = PathBuf::from(cwd);
     let workspace_canon = workspace
@@ -164,9 +265,14 @@ pub fn open_session(
         reg.register(Box::new(WriteFileTool::new(workspace_canon.clone())))?;
         reg.register(Box::new(EditFileTool::new(workspace_canon.clone())))?;
         {
-            let repo =
-                detect_github_repo(&workspace_canon).unwrap_or_else(|| "codecoradev/tole".into());
-            reg.register(Box::new(GhTool::new(repo)))?;
+            // Issue #254 (rescan #24): probe-gated like the gitea tool —
+            // when GitHub detection fails, NO gh tool (a hardcoded
+            // fallback repo invited wrong-repo writes from any
+            // unrelated workspace). Absent legs degrade, never a
+            // phantom.
+            if let Some(repo) = detect_github_repo(&workspace_canon) {
+                reg.register(Box::new(GhTool::new(repo)))?;
+            }
             register_gitea(&mut reg, &workspace_canon);
         }
         reg.register(Box::new(GitTool::new().in_dir(workspace_canon.clone())))?;
@@ -179,6 +285,18 @@ pub fn open_session(
     }
     reg.register(Box::new(JobPollTool::new(workspace_canon.clone())))?;
     reg.register(Box::new(ReadFileTool::new(workspace_canon.clone())))?;
+    // Web tools (issue #215): fetch always (direct HTTPS); search only
+    // when a backend is configured (TOLE_WEB_SEARCH_URL) — probe-first:
+    // no backend, no tool, never a phantom.
+    reg.register(Box::new(tole_core::web::WebFetchTool))?;
+    if tole_core::web::WebSearchTool::from_env().is_some() {
+        reg.register(Box::new(tole_core::web::WebSearchTool::from_env().unwrap()))?;
+    }
+    // Plan publishing (issue #196 phase 4): model-facing tool, present
+    // only when the transport has a client that renders plans (ACP).
+    if let Some(emitter) = plan_emitter {
+        reg.register(Box::new(UpdatePlanTool::new(emitter)))?;
+    }
     // systemone_decide (#172): probe-gated on SYSTEMONE_API_KEY.
     if let Some(t) = tole_core::systemone::SystemOneTool::from_env() {
         reg.register(Box::new(t))?;
@@ -226,6 +344,22 @@ pub fn open_session(
         )
         .map_err(|e| format!("creating session: {e}"))?
     };
+    // Task-list tools (issue #198): registered after the storage open —
+    // the state is seeded from the replayed transcript (settled
+    // todo_write outputs), so crash-resume restores the last list.
+    // todo_read is ReadOnly (plan-mode safe); todo_write joins the other
+    // Write tools in being absent under --plan-mode.
+    let todo_state = tole_core::todo::TodoState::new();
+    todo_state.hydrate(storage.entries());
+    reg.register(Box::new(tole_core::todo::TodoReadTool::new(StdArc::clone(
+        &todo_state,
+    ))))?;
+    if !plan_mode {
+        reg.register(Box::new(tole_core::todo::TodoWriteTool::new(
+            StdArc::clone(&todo_state),
+        )))?;
+    }
+
     Ok(SessionState {
         storage: StdArc::new(Mutex::new(storage)),
         registry: StdArc::new(reg),
@@ -234,6 +368,7 @@ pub fn open_session(
         first_prompt_done: StdArc::new(Mutex::new(loading)),
         busy: StdArc::new(Mutex::new(false)),
         cancel,
+        tool_ids: StdArc::new(Mutex::new(0)),
     })
 }
 
@@ -321,6 +456,7 @@ pub fn run_session_turn(
     sessions: SharedSessions,
     session_id: &str,
     prompt: &str,
+    observer: Option<StdArc<dyn tole_core::turn::TurnObserver>>,
 ) -> Result<(String, Option<String>), String> {
     // Brief map lock: take the session's handles and reject a busy
     // session. The MAP lock is released here — a running turn holds only
@@ -397,13 +533,25 @@ pub fn run_session_turn(
     if let Some(sys) = system_prompt.as_deref() {
         provider = provider.with_system_prompt(sys);
     }
+    // Live-token sinks (issue #196 phase 3): when an observer is wired
+    // (ACP), streamed reasoning/content deltas flow to it DURING the
+    // provider call; the decisive output semantics are unchanged.
+    if let Some(o) = observer.as_ref() {
+        let ot = StdArc::clone(o);
+        let or = StdArc::clone(o);
+        provider = provider.with_delta_sinks(
+            Some(StdArc::new(move |t: &str| ot.text_delta(t))),
+            Some(StdArc::new(move |r: &str| or.reasoning(r))),
+        );
+    }
 
-    let outcome = tole_core::turn::run_turn_with_cancel(
+    let outcome = tole_core::turn::run_turn_with_observer(
         &mut *storage,
         &mut provider,
         &registry,
         &effective,
         &cancel,
+        observer.as_ref().map(StdArc::as_ref),
     )
     .map_err(|e| e.to_string())?;
 
@@ -449,6 +597,70 @@ pub fn run_session_turn(
     Ok((stop.to_string(), final_text))
 }
 
+/// Approvals-only recovery over the serve face (issue #200): no new
+/// prompt — `resume_turn` settles the parked guarded effect (its
+/// approver consult happens with the one-shot remote approval in
+/// place) and replans to completion. Mirrors the provider/model
+/// construction of [`run_session_turn`]; the memory loop does not
+/// participate (no new user message).
+pub fn resume_session_turn(
+    sessions: SharedSessions,
+    session_id: &str,
+) -> Result<(String, Option<String>), String> {
+    let (storage, registry, system_prompt, busy_guard, cancel) = {
+        let mut sessions = lock_sessions(&sessions);
+        let Some(state) = sessions.map.get_mut(session_id) else {
+            return Err(format!("unknown session: {session_id}"));
+        };
+        {
+            let mut busy = state.busy.lock().expect("busy lock");
+            if *busy {
+                return Err("session is busy running a turn".into());
+            }
+            *busy = true;
+            state.cancel.reset();
+        }
+        (
+            state.storage.clone(),
+            state.registry.clone(),
+            state.system_prompt.clone(),
+            StdArc::clone(&state.busy),
+            state.cancel.clone(),
+        )
+    };
+    let _busy_guard = BusyGuard(busy_guard);
+    let mut storage = storage.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(mut cfg) = tole_core::openai::OpenAiConfig::from_env() else {
+        return Err(
+            "missing provider config: set TOLE_BASE_URL / TOLE_MODEL / TOLE_API_KEY              (or the OPENAI_* equivalents)"
+                .into(),
+        );
+    };
+    if let Some(model) = storage
+        .get_register("fact", "model")
+        .and_then(serde_json::Value::as_str)
+        .filter(|m| !m.trim().is_empty())
+    {
+        cfg.model = model.to_string();
+    }
+    let mut provider =
+        tole_core::openai::OpenAiProvider::new(cfg).with_tool_specs(registry.specs());
+    if let Some(sys) = system_prompt.as_deref() {
+        provider = provider.with_system_prompt(sys);
+    }
+    let outcome = tole_core::turn::resume_turn(&mut *storage, &mut provider, &registry)
+        .map_err(|e| e.to_string())?;
+    let stop = match &outcome {
+        tole_core::turn::TurnOutcome::Final { text, .. } => {
+            Ok((("end_turn".to_string()), Some(text.clone())))
+        }
+        tole_core::turn::TurnOutcome::Cancelled => Ok(("cancelled".to_string(), None)),
+        _ => Ok(("refusal".to_string(), None)),
+    };
+    let _ = cancel;
+    stop
+}
+
 /// Best-effort `owner/name` from a git remote URL, for gh tool targeting.
 pub fn github_repo_from_remote_url(url: &str) -> Option<String> {
     let url = url.trim().trim_end_matches('/');
@@ -469,5 +681,46 @@ pub fn github_repo_from_remote_url(url: &str) -> Option<String> {
         Some(format!("{owner}/{name}"))
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod plan_tests {
+    use super::*;
+
+    #[test]
+    fn normalize_plan_validates_enums_and_defaults() {
+        let plan = normalize_plan(&serde_json::json!({
+            "entries": [
+                {"content": "step one", "status": "in_progress"},
+                {"content": "step two", "priority": "high"},
+            ]
+        }))
+        .unwrap();
+        assert_eq!(
+            plan,
+            serde_json::json!([
+                {"content": "step one", "priority": "medium", "status": "in_progress"},
+                {"content": "step two", "priority": "high", "status": "pending"},
+            ])
+        );
+    }
+
+    #[test]
+    fn normalize_plan_rejects_malformed_input_loudly() {
+        // Missing array.
+        assert!(normalize_plan(&serde_json::json!({})).is_err());
+        // Empty content.
+        assert!(normalize_plan(&serde_json::json!({"entries": [{"content": " "}]})).is_err());
+        // Out-of-enum values are refused, not silently coerced — the
+        // model sees the error text and self-corrects.
+        assert!(normalize_plan(
+            &serde_json::json!({"entries": [{"content": "x", "priority": "urgent"}]})
+        )
+        .is_err());
+        assert!(normalize_plan(
+            &serde_json::json!({"entries": [{"content": "x", "status": "done"}]})
+        )
+        .is_err());
     }
 }

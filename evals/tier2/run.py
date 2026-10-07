@@ -123,25 +123,64 @@ def archive_trace(
     (dest_dir / f"{log.stem}.meta.json").write_text(json.dumps(meta, indent=1) + "\n")
     return dest
 
-# Mission spec: name -> (prompt, judgefn(out: dict) -> (ok, detail))
+# Mission spec: name -> (judgefn(out: dict) -> (ok, detail))
 # `out` fields: text (final answer), stdout, session (durable log parsed)
 
 
+def strip_approval_banners(text: str) -> str:
+    """Remove interactive approval prompt banners from stdout (issue #229).
+
+    The approval banner (approver.rs) echoes the tool INPUT as JSON — a
+    judge substring match over raw stdout can be satisfied by the echo
+    alone (the committed v0.5.0 baseline records a false PASS exactly
+    this way: exit 2, approval denied, yet `RESUMED-DONE` "found" in the
+    banner's input echo). Judges must reason over what the agent
+    actually SAID, so banner blocks are stripped at the source: from a
+    `── approval required ──` header through the trailing `allow? [y/N]`
+    line (or end of output if truncated).
+    """
+    lines = text.splitlines()
+    kept: list[str] = []
+    skipping = False
+    for line in lines:
+        if "── approval required ──" in line:
+            skipping = True
+            continue
+        if skipping:
+            if line.startswith("allow? ["):
+                skipping = False
+            continue
+        kept.append(line)
+    return "\n".join(kept).strip()
+
+
 def judge_read_and_report(out: dict):
-    ok = "ALPHA-77" in out["text"]
-    return ok, "answer must contain the planted marker"
+    ok = out["exit_code"] == 0 and "ALPHA-77" in out["text"]
+    return ok, "must exit 0 and answer with the planted marker"
 
 
 def judge_echo_chain(out: dict):
-    ok = out["tool_calls"] >= 2 and "CHAIN-OK" in out["text"]
-    return ok, "must call a tool at least twice and confirm"
+    ok = (
+        out["exit_code"] == 0
+        and out["tool_calls"] >= 2
+        and "CHAIN-OK" in out["text"]
+    )
+    return ok, "must exit 0, call a tool at least twice, and confirm"
 
 
 def judge_crash_resume(out: dict):
     # The runner resumes after a synthetic failure; success = completed
     # the mission in the SAME session (runner asserts session count == 1).
-    ok = out["sessions"] == 1 and "RESUMED-DONE" in out["text"]
-    return ok, "must finish in the same durable session after recovery"
+    # exit_code == 0 is required (issue #229): the approval banner's
+    # input echo used to satisfy the substring check on a run that
+    # exited 2 with the approval denied — a false PASS in our own
+    # release gate.
+    ok = (
+        out["exit_code"] == 0
+        and out["sessions"] == 1
+        and "RESUMED-DONE" in out["text"]
+    )
+    return ok, "must exit 0 and finish in the same durable session after recovery"
 
 
 MISSIONS = {
@@ -249,7 +288,10 @@ def run_mission(
     )
     text = "\n".join(
         line for line in stdout.splitlines() if not line.startswith("session:")
-    ).strip()
+    )
+    # Issue #229: approval banners echo tool INPUT JSON — strip them so
+    # judges never match on the echo (see strip_approval_banners).
+    text = strip_approval_banners(text)
 
     out = {
         "mission": name,

@@ -158,6 +158,7 @@ impl Tool for SessionNewTool {
             self.0.turnend.clone(),
             self.0.allow_patterns.clone(),
             tole_core::cancel::CancelToken::default(),
+            None,
         )?;
         {
             // Cap + eviction, mirroring the REST transport (CodeCora:
@@ -251,7 +252,8 @@ impl Tool for SessionPromptTool {
                     ),
                 }
             };
-        let (stop, text) = run_session_turn(Arc::clone(&self.0.sessions), &session_id, &text)?;
+        let (stop, text) =
+            run_session_turn(Arc::clone(&self.0.sessions), &session_id, &text, None)?;
         let mut out = json!({ "stop_reason": stop });
         if let Some(t) = text {
             out["text"] = json!(t);
@@ -407,9 +409,17 @@ impl Tool for SessionListTool {
             .map
             .iter()
             .map(|(id, st)| {
+                // Issue #256 (rescan #38): NEVER take a blocking lock on
+                // a session's busy mutex while holding the sessions-map
+                // lock — a busy session's turn thread serializes this
+                // behind its whole step, and two list calls deadlock on
+                // each other's map lock. try_lock like the eviction
+                // path (line ~175): a busy session reports "unknown"
+                // instead of stalling the listing.
+                let busy = st.busy.try_lock().map(|b| *b).unwrap_or(true);
                 json!({
                     "session_id": id,
-                    "busy": *st.busy.lock().expect("busy lock"),
+                    "busy": busy,
                 })
             })
             .collect();

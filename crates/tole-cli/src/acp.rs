@@ -71,6 +71,20 @@ pub(crate) fn parse_model_list(env_val: Option<&str>) -> Vec<String> {
     out
 }
 
+/// Model-list resolution precedence (issue #195): a non-empty
+/// `TOLE_MODELS` wins AS-IS — deterministic, no network, the operator's
+/// explicit override/filter. Empty or unset falls to `probe` (the
+/// provider's `GET /models`); its result is used whatever it is,
+/// including empty (a failed probe is cached by the caller — never
+/// retried per session).
+fn resolve_model_list(env_val: Option<&str>, probe: impl FnOnce() -> Vec<String>) -> Vec<String> {
+    let from_env = parse_model_list(env_val);
+    if !from_env.is_empty() {
+        return from_env;
+    }
+    probe()
+}
+
 /// The full advertised option list: the `TOLE_MODELS` entries plus the
 /// session's current model (prepended when missing — the spec requires
 /// `currentValue` to be one of the options so the picker can render it).
@@ -323,6 +337,133 @@ fn wait_permission(
 }
 
 // ---------------------------------------------------------------------------
+// Progress observer: tool cards + thought bubbles (issue #196)
+// ---------------------------------------------------------------------------
+
+/// ACP `ToolKind` for a tole tool name (issue #196 phase 1): the spec's
+/// taxonomy drives host icons and progress rendering. Mapping falls out
+/// of the registry vocabulary; "other" stays the fallback for anything
+/// unmapped. Registry-gated tools only ever map when actually present —
+/// this is a pure name lookup, no registration assumption.
+fn tool_kind(tool: &str) -> &'static str {
+    match tool {
+        "read_file" | "tole_session_list" | "tole_session_status" => "read",
+        "write_file" | "edit_file" => "edit",
+        "delete_file" => "delete",
+        "run_command" | "git" | "gh" | "gitea" | "job_start" | "job_poll" => "execute",
+        "cora_search" | "uteke_recall" => "search",
+        "systemone_decide" | "agent_start" | "agent_poll" => "think",
+        "uteke_document" | "tole_session_new" | "tole_session_prompt" => "edit",
+        _ => "other",
+    }
+}
+
+/// The turn-loop observer for the ACP face (issue #196): translates
+/// core turn events into `session/update` notifications — a tool card
+/// (proper `kind` + `name`) at execution start, its completion with a
+/// bounded output preview, and the model's reasoning as an
+/// `agent_thought_chunk`. All fire mid-turn, so the host shows live
+/// progress instead of a silent "Working…".
+struct AcpObserver {
+    conn: Conn,
+    session_id: String,
+    counter: Arc<Mutex<u64>>,
+    /// Set once answer text has been streamed via text_delta (issue
+    /// #196 phase 3): the end-of-turn full-text delivery is suppressed
+    /// so the host receives the message exactly once. Shared with the
+    /// prompt thread — the trait object cannot expose the field.
+    text_streamed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The open card's id (cora MAJOR, #196): `tool_call_update` must
+    /// reference the `toolCallId` the started card announced, or hosts
+    /// cannot correlate them and the card stays `in_progress` forever.
+    /// Tools run sequentially on the turn thread, so one slot suffices.
+    current: Mutex<Option<String>>,
+}
+
+impl AcpObserver {
+    fn next_id(&self) -> String {
+        let mut n = self.counter.lock().expect("observer id lock");
+        *n += 1;
+        format!("tool-{n}")
+    }
+}
+
+impl tole_core::turn::TurnObserver for AcpObserver {
+    fn tool_started(&self, tool: &str, input: &Value) {
+        let id = self.next_id();
+        *self.current.lock().expect("observer current lock") = Some(id.clone());
+        self.conn.send_notification(
+            "session/update",
+            json!({
+                "sessionId": self.session_id,
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": id,
+                    "title": tool,
+                    "name": tool,
+                    "kind": tool_kind(tool),
+                    "rawInput": input,
+                    "status": "in_progress",
+                }
+            }),
+        );
+    }
+
+    fn tool_finished(&self, _tool: &str, ok: bool, preview: &str) {
+        // Correlate with the started card; fall back to a fresh id only
+        // if a finished event ever arrives without a started (cannot
+        // happen today — every execution passes tool_started first).
+        let id = self
+            .current
+            .lock()
+            .expect("observer current lock")
+            .take()
+            .unwrap_or_else(|| self.next_id());
+        self.conn.send_notification(
+            "session/update",
+            json!({
+                "sessionId": self.session_id,
+                "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": id,
+                    "status": if ok { "completed" } else { "failed" },
+                    "content": [{"type": "content",
+                                 "content": {"type": "text", "text": preview}}],
+                }
+            }),
+        );
+    }
+
+    fn reasoning(&self, text: &str) {
+        self.conn.send_notification(
+            "session/update",
+            json!({
+                "sessionId": self.session_id,
+                "update": {
+                    "sessionUpdate": "agent_thought_chunk",
+                    "content": {"type": "text", "text": text},
+                }
+            }),
+        );
+    }
+
+    fn text_delta(&self, text: &str) {
+        self.text_streamed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.conn.send_notification(
+            "session/update",
+            json!({
+                "sessionId": self.session_id,
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": text},
+                }
+            }),
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Approval: the editor is the human
 // ---------------------------------------------------------------------------
 
@@ -403,22 +544,12 @@ impl PromptFn for AcpPrompt {
         let call_id = {
             let mut n = self.counter.lock().expect("call id lock");
             *n += 1;
-            format!("call-{n}")
+            format!("perm-{n}")
         };
-        // Announce the tool call first so editors can render it.
-        self.conn.send_notification(
-            "session/update",
-            json!({
-                "sessionId": self.session_id,
-                "update": {
-                    "sessionUpdate": "tool_call",
-                    "toolCallId": call_id,
-                    "title": req.description,
-                    "kind": "other",
-                    "rawInput": req.input,
-                }
-            }),
-        );
+        // The timeline card is the observer's job (issue #196): announce
+        // + completion fire from the turn loop for EVERY execution. The
+        // permission request stays self-contained — hosts render the
+        // dialog from the embedded toolCall, now with the real kind.
         // allow_always only for Write-tier calls: Destructive is never
         // allowlistable, and ReadOnly never reaches the approver.
         let mut options =
@@ -435,34 +566,21 @@ impl PromptFn for AcpPrompt {
             "toolCall": {
                 "toolCallId": call_id,
                 "title": req.description,
-                "kind": "other",
+                "name": req.tool,
+                "kind": tool_kind(req.tool),
                 "rawInput": req.input,
             },
             "options": options,
         });
         let (req_id, rx) = self.conn.open_request("session/request_permission", params);
-        let verdict =
-            match wait_permission(&self.conn, req_id, rx, PERMISSION_TIMEOUT, &self.cancel) {
-                WaitOutcome::Reply(result) => self.map_option_choice(&result, req, option_reject),
-                // Timeout, dead transport, or a mid-wait cancel: fail
-                // closed (Deny) — the routing contract for unresolved
-                // permission requests. The already-set turn token makes a
-                // cancelled wait settle `cancelled`, not `refusal`.
-                WaitOutcome::Timeout => Verdict::Deny,
-            };
-        // Close the tool-call record.
-        self.conn.send_notification(
-            "session/update",
-            json!({
-                "sessionId": self.session_id,
-                "update": {
-                    "sessionUpdate": "tool_call_update",
-                    "toolCallId": call_id,
-                    "status": if verdict == Verdict::Allow { "completed" } else { "rejected" },
-                }
-            }),
-        );
-        verdict
+        match wait_permission(&self.conn, req_id, rx, PERMISSION_TIMEOUT, &self.cancel) {
+            WaitOutcome::Reply(result) => self.map_option_choice(&result, req, option_reject),
+            // Timeout, dead transport, or a mid-wait cancel: fail
+            // closed (Deny) — the routing contract for unresolved
+            // permission requests. The already-set turn token makes a
+            // cancelled wait settle `cancelled`, not `refusal`.
+            WaitOutcome::Timeout => Verdict::Deny,
+        }
     }
 }
 
@@ -507,9 +625,80 @@ pub fn run_acp(
     // auto-write while the approver owns the same handles.
     let approval_states: Arc<Mutex<HashMap<String, SessionApprovalState>>> =
         Arc::new(Mutex::new(HashMap::new()));
-    // Advertised model list (issue #176): static for the process
-    // lifetime — env cannot change under a running agent.
-    let models = parse_model_list(std::env::var("TOLE_MODELS").ok().as_deref());
+    // Advertised model list (issues #176/#195): `TOLE_MODELS` wins
+    // as-is; otherwise the provider's `GET /models` is probed ONCE on
+    // first use (lazy — agent spawn stays instant) and cached for the
+    // process lifetime, failures included (one stderr line, no per-
+    // session retry). No provider config → nothing to probe.
+    let env_models_raw = std::env::var("TOLE_MODELS").ok();
+    let probe_cfg = tole_core::openai::OpenAiConfig::from_env();
+    /// Bounded wait for the lazy /models probe (issue #257): a hung
+    /// gateway must not stall the ACP reader thread beyond this.
+    const PROBE_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+    let models_cache: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let model_list = || {
+        resolve_model_list(env_models_raw.as_deref(), || {
+            // Probe at most once per process — failures are cached too,
+            // so a broken gateway costs one stderr line, not one retry
+            // per session. Issue #257 (rescan #41): the probe runs
+            // OFF the protocol reader thread (spawn_blocking) — an
+            // inline network fetch here stalled session/new and
+            // set_config for the whole gateway timeout.
+            models_cache.get().cloned().unwrap_or_else(|| {
+                // Issue #257 + cora CI round 2: ONLY a successful
+                // non-empty probe lands in the OnceLock. Failure and
+                // timeout paths return WITHOUT caching, so the next
+                // session/new retries after the gateway recovers (the
+                // old single-cache flow pinned an empty list for the
+                // process lifetime after one timeout).
+                let computed = match probe_cfg.as_ref() {
+                    None => return Vec::new(),
+                    Some(cfg) => {
+                        let base = cfg.base_url.clone();
+                        let key = cfg.api_key.clone();
+                        // Detached probe + bounded wait (cora round 1:
+                        // join() still blocked the reader thread).
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        std::thread::spawn(move || {
+                            let _ = tx.send(tole_core::openai::fetch_model_ids(&base, &key));
+                        });
+                        match rx.recv_timeout(PROBE_WAIT) {
+                            Ok(Ok(list)) if !list.is_empty() => list,
+                            Ok(Ok(_)) => {
+                                eprintln!(
+                                    "tole acp: provider /models returned no ids — set \
+                                         TOLE_MODELS to advertise a model picker"
+                                );
+                                return Vec::new();
+                            }
+                            Ok(Err(e)) => {
+                                eprintln!(
+                                    "tole acp: {e} — set TOLE_MODELS to advertise a \
+                                         model picker"
+                                );
+                                return Vec::new();
+                            }
+                            Err(_) => {
+                                // Timeout (or sender dropped): NOT
+                                // cached — the next session/new may
+                                // retry once the gateway recovers;
+                                // each retry is bounded by PROBE_WAIT.
+                                eprintln!(
+                                    "tole acp: provider /models probe did not answer within \
+                                         {:?} — set TOLE_MODELS to advertise a model picker",
+                                    PROBE_WAIT
+                                );
+                                return Vec::new();
+                            }
+                        }
+                    }
+                };
+                let _ = models_cache.set(computed.clone());
+                computed
+            })
+        })
+    };
     let env_model = std::env::var("TOLE_MODEL")
         .ok()
         .or_else(|| std::env::var("OPENAI_MODEL").ok())
@@ -610,6 +799,25 @@ pub fn run_acp(
                 .with_auto_write(auto_write)
                 .with_shared_patterns(Arc::clone(&patterns))
                 .with_shared_auto_write(Arc::clone(&session_auto_write));
+                // Plan publishing (issue #196 phase 4): ACP clients
+                // render the standard `plan` session/update (Termul's
+                // PlanPanel, full-replace semantics).
+                let plan_emitter: tole_cli::session_host::PlanEmitter = {
+                    let conn = conn.clone();
+                    let sid = session_id.clone();
+                    Arc::new(move |entries| {
+                        conn.send_notification(
+                            "session/update",
+                            json!({
+                                "sessionId": sid,
+                                "update": {
+                                    "sessionUpdate": "plan",
+                                    "entries": entries,
+                                }
+                            }),
+                        );
+                    })
+                };
                 match open_session(
                     &session_id,
                     &cwd,
@@ -621,6 +829,7 @@ pub fn run_acp(
                     turnend.clone(),
                     allow_patterns.to_vec(),
                     cancel,
+                    Some(plan_emitter),
                 ) {
                     Ok(state) => {
                         // Insert + busy re-check in ONE critical section:
@@ -659,7 +868,9 @@ pub fn run_acp(
                             },
                         );
                         let mut result = json!({ "sessionId": session_id });
-                        if let Some(opts) = config_options_for(&current, &models, session_auto) {
+                        if let Some(opts) =
+                            config_options_for(&current, &model_list(), session_auto)
+                        {
                             result["configOptions"] = Value::Array(opts);
                         }
                         reply(&conn, id, result);
@@ -703,19 +914,50 @@ pub fn run_acp(
                 let conn = conn.clone();
                 let sessions = sessions.clone();
                 let session_id_clone = session_id.clone();
+                // The observer's id counter lives on the SESSION (cora
+                // CI on #203): ids keep incrementing across turns so a
+                // completion can never correlate onto a stale card.
+                let tool_ids = {
+                    let sessions = lock_sessions(&sessions);
+                    sessions
+                        .map
+                        .get(&session_id)
+                        .map(|st| st.tool_ids.clone())
+                        .unwrap_or_default()
+                };
                 std::thread::spawn(move || {
-                    match run_session_turn(sessions, &session_id_clone, &prompt_text) {
+                    // Phase 3 dedup flag, shared with the closure below —
+                    // the trait object cannot expose the field.
+                    let text_streamed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let observer: Arc<dyn tole_core::turn::TurnObserver> = Arc::new(AcpObserver {
+                        conn: conn.clone(),
+                        session_id: session_id_clone.clone(),
+                        counter: tool_ids,
+                        current: Mutex::new(None),
+                        text_streamed: Arc::clone(&text_streamed),
+                    });
+                    match run_session_turn(
+                        sessions,
+                        &session_id_clone,
+                        &prompt_text,
+                        Some(Arc::clone(&observer)),
+                    ) {
                         Ok((stop, Some(text))) => {
-                            conn.send_notification(
-                                "session/update",
-                                json!({
-                                    "sessionId": session_id_clone,
-                                    "update": {
-                                        "sessionUpdate": "agent_message_chunk",
-                                        "content": {"type": "text", "text": text},
-                                    }
-                                }),
-                            );
+                            // Phase 3: when deltas already streamed the
+                            // answer, the full text was delivered live —
+                            // re-sending it would duplicate the message.
+                            if !text_streamed.load(std::sync::atomic::Ordering::SeqCst) {
+                                conn.send_notification(
+                                    "session/update",
+                                    json!({
+                                        "sessionId": session_id_clone,
+                                        "update": {
+                                            "sessionUpdate": "agent_message_chunk",
+                                            "content": {"type": "text", "text": text},
+                                        }
+                                    }),
+                                );
+                            }
                             reply(&conn, id, json!({ "stopReason": stop }));
                         }
                         Ok((stop, None)) => reply(&conn, id, json!({ "stopReason": stop })),
@@ -730,7 +972,7 @@ pub fn run_acp(
                     &sessions,
                     &approval_states,
                     &params,
-                    &models,
+                    &model_list(),
                     env_model.as_deref(),
                 );
             }
@@ -966,6 +1208,31 @@ fn reply_error(conn: &Conn, id: Option<Value>, message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_model_list_env_wins_without_probe() {
+        let mut probed = false;
+        let out = resolve_model_list(Some("a, b"), || {
+            probed = true;
+            vec!["z".to_string()]
+        });
+        assert_eq!(out, vec!["a", "b"]);
+        assert!(!probed, "a non-empty TOLE_MODELS must bypass the probe");
+    }
+
+    #[test]
+    fn resolve_model_list_falls_to_probe_when_env_unset_or_empty() {
+        assert_eq!(resolve_model_list(None, || vec!["z".into()]), vec!["z"]);
+        assert_eq!(
+            resolve_model_list(Some("  , "), || vec!["z".into()]),
+            vec!["z"]
+        );
+    }
+
+    #[test]
+    fn resolve_model_list_keeps_empty_probe_result() {
+        assert!(resolve_model_list(None, Vec::new).is_empty());
+    }
 
     #[test]
     fn model_list_unset_or_empty_advertises_nothing() {

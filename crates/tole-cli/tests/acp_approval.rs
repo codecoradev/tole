@@ -10,6 +10,79 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+
+/// Convert a plain chat-completion reply into an SSE stream body
+/// (issue #196 phase 3 mocks): reasoning/content deltas, tool_call
+/// fragments split across chunks (the concatenation contract), the
+/// usage-bearing final chunk, and [DONE].
+fn completion_to_sse(reply: &Value) -> String {
+    let mut out = String::new();
+    let msg = &reply["choices"][0]["message"];
+    let model = reply["model"].as_str().unwrap_or("mock");
+    let mut chunk_of = |delta: Value| {
+        let c = json!({
+            "id": "chatcmpl-sse", "object": "chat.completion.chunk", "created": 1,
+            "model": model,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": null}],
+            "usage": null
+        });
+        out.push_str(&format!("data: {c}\n\n"));
+    };
+    if let Some(r) = msg["reasoning"].as_str() {
+        chunk_of(json!({"reasoning": r}));
+    }
+    if let Some(c) = msg["content"].as_str() {
+        // Split content across two chunks to exercise accumulation and
+        // the text_streamed dedup on the ACP side.
+        if !c.is_empty() {
+            let (a, b) = c.split_at(c.len().div_ceil(2));
+            chunk_of(json!({"content": a}));
+            chunk_of(json!({"content": b}));
+        }
+    }
+    if let Some(tcs) = msg["tool_calls"].as_array() {
+        for (i, tc) in tcs.iter().enumerate() {
+            let name = tc["function"]["name"].as_str().unwrap_or("");
+            let args = tc["function"]["arguments"].as_str().unwrap_or("{}");
+            let (a1, a2) = args.split_at(args.len().div_ceil(2));
+            chunk_of(json!({"tool_calls": [{"index": i, "id": tc["id"],
+                "function": {"name": name, "arguments": a1}}]}));
+            chunk_of(json!({"tool_calls": [{"index": i,
+                "function": {"arguments": a2}}]}));
+        }
+    }
+    if !msg["tool_calls"].is_null() {
+        out.push_str(&format!(
+            "data: {}\n\n",
+            json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}], "usage": null})
+        ));
+    }
+    out.push_str(&format!(
+        "data: {}\n\n",
+        json!({"choices": [], "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}})
+    ));
+    out.push_str("data: [DONE]\n\n");
+    out
+}
+
+fn sse_response(reply: &Value, streamed: bool) -> String {
+    if streamed {
+        let body = completion_to_sse(reply);
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+    } else {
+        let data = reply.to_string();
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            data.len(),
+            data
+        )
+    }
+}
+
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
@@ -30,6 +103,9 @@ struct AcpProcess {
     permission_count: Arc<AtomicUsize>,
     /// The `kind` list offered by each permission request, in order.
     offered_kinds: Arc<Mutex<Vec<Vec<String>>>>,
+    /// Every `session/update` notification, in arrival order (issue #196
+    /// E2E: thought chunks + tool cards).
+    updates: Arc<Mutex<Vec<Value>>>,
 }
 
 impl AcpProcess {
@@ -57,6 +133,8 @@ impl AcpProcess {
         let permission_count = Arc::new(AtomicUsize::new(0));
         let offered_kinds = Arc::new(Mutex::new(Vec::new()));
         let policy = Arc::new(Mutex::new(policy));
+        let updates: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let updates_reader = Arc::clone(&updates);
         let (tx, rx) = mpsc::channel();
         let count = Arc::clone(&permission_count);
         let kinds = Arc::clone(&offered_kinds);
@@ -96,6 +174,12 @@ impl AcpProcess {
                     let _ = w.flush();
                     continue;
                 }
+                if msg.get("method").and_then(Value::as_str) == Some("session/update") {
+                    updates_reader
+                        .lock()
+                        .unwrap()
+                        .push(msg["params"]["update"].clone());
+                }
                 if tx.send(line).is_err() {
                     break;
                 }
@@ -107,6 +191,7 @@ impl AcpProcess {
             stdin,
             permission_count,
             offered_kinds,
+            updates,
         }
     }
 
@@ -208,6 +293,7 @@ fn spawn_mock() -> String {
                 let mut buf = Vec::new();
                 let mut chunk = [0u8; 16384];
                 let mut body = Value::Null;
+                let mut streamed = false;
                 let deadline = std::time::Instant::now() + Duration::from_secs(10);
                 while std::time::Instant::now() < deadline {
                     let n = s.read(&mut chunk).unwrap_or(0);
@@ -216,6 +302,7 @@ fn spawn_mock() -> String {
                     }
                     if let Some(h) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
                         if let Ok(v) = serde_json::from_slice::<Value>(&buf[h + 4..]) {
+                            streamed = v.get("stream").and_then(Value::as_bool) == Some(true);
                             body = v;
                             break;
                         }
@@ -243,11 +330,21 @@ fn spawn_mock() -> String {
                         ("victim.txt", "bye")
                     } else if last_user.contains("SECOND_WRITE") {
                         ("mission-2.txt", "two")
+                    } else if last_user.contains("PLAN_MISSION") {
+                        ("plan.txt", "planned")
                     } else {
                         ("mission-1.txt", "one")
                     };
                     let (name, args) = if last_user.contains("DELETE_MISSION") {
                         ("delete_file", json!({"path": path}))
+                    } else if last_user.contains("PLAN_MISSION") {
+                        (
+                            "update_plan",
+                            json!({"entries": [
+                                {"content": "read the spec", "status": "completed"},
+                                {"content": "write the plan", "status": "in_progress"},
+                            ]}),
+                        )
                     } else {
                         ("write_file", json!({"path": path, "content": content}))
                     };
@@ -256,6 +353,7 @@ fn spawn_mock() -> String {
                         "model": "mock",
                         "choices": [{"index": 0, "message": {"role": "assistant",
                             "content": null,
+                            "reasoning": "I will act on the mission, then report.",
                             "tool_calls": [{"id": "call_1", "type": "function",
                                 "function": {"name": name, "arguments": args.to_string()}}]},
                             "finish_reason": "tool_calls"}],
@@ -270,12 +368,7 @@ fn spawn_mock() -> String {
                         "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
                     })
                 };
-                let data = reply.to_string();
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    data.len(),
-                    data
-                );
+                let resp = sse_response(&reply, streamed);
                 let _ = s.write_all(resp.as_bytes());
             });
         }
@@ -440,4 +533,119 @@ fn destructive_never_remembered() {
             "Destructive must not offer allow_always: {kinds:?}"
         );
     }
+}
+
+/// Issue #196 phases 1+2, end-to-end: during a live turn the host
+/// receives the model's reasoning as an agent_thought_chunk BEFORE the
+/// tool card, the tool card carries the spec kind (write_file → edit)
+/// with in_progress status, and the card completes with an output
+/// preview — instead of a silent "Working…".
+#[test]
+fn observer_streams_thought_and_tool_cards() {
+    let env_pairs = provider_env().1;
+    let env: Vec<(&str, &str)> = env_pairs
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let acp = AcpProcess::spawn_with(&env, Policy::AllowOnce);
+    acp.initialize();
+    let cwd = temp_cwd("observer");
+    let sid = acp.new_session(2, &cwd)["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // Auto approval: zero permission noise, pure lifecycle observation.
+    acp.send(&json!({
+        "jsonrpc": "2.0", "id": 3, "method": "session/set_config_option",
+        "params": {"sessionId": sid, "configId": "approval", "value": "auto"}
+    }));
+    let _ = acp.wait_response(3, Duration::from_secs(20));
+
+    assert_eq!(acp.prompt(4, &sid, "WRITE_MISSION observe"), "end_turn");
+
+    let updates = acp.updates.lock().unwrap().clone();
+    let kinds: Vec<&str> = updates
+        .iter()
+        .filter_map(|u| u["sessionUpdate"].as_str())
+        .collect();
+    assert!(
+        kinds.contains(&"agent_thought_chunk"),
+        "reasoning must surface as a thought chunk: {kinds:?}"
+    );
+    let thought = updates
+        .iter()
+        .find(|u| u["sessionUpdate"] == "agent_thought_chunk")
+        .expect("thought");
+    assert_eq!(
+        thought["content"]["text"], "I will act on the mission, then report.",
+        "the provider's reasoning field reaches the host verbatim"
+    );
+    let card = updates
+        .iter()
+        .find(|u| u["sessionUpdate"] == "tool_call" && u["name"] == "write_file")
+        .expect("tool card");
+    assert_eq!(card["kind"], "edit", "write_file maps to the edit kind");
+    assert_eq!(card["status"], "in_progress");
+    assert_eq!(card["toolCallId"].as_str().unwrap(), "tool-1");
+    let done = updates
+        .iter()
+        .find(|u| u["sessionUpdate"] == "tool_call_update")
+        .expect("card close");
+    assert_eq!(done["status"], "completed");
+    assert_eq!(
+        done["toolCallId"], card["toolCallId"],
+        "the completion must correlate with the started card (cora MAJOR)"
+    );
+    assert!(
+        done["content"][0]["content"]["text"]
+            .as_str()
+            .unwrap()
+            .len()
+            <= 201,
+        "preview is bounded"
+    );
+    // Ordering: thought strictly before the tool card.
+    let thought_idx = kinds
+        .iter()
+        .position(|k| *k == "agent_thought_chunk")
+        .unwrap();
+    let card_idx = kinds.iter().position(|k| *k == "tool_call").unwrap();
+    assert!(thought_idx < card_idx, "thought first, action after");
+}
+
+/// Issue #196 phase 4, end-to-end: the model's update_plan call reaches
+/// the host as a standard `plan` session/update (Termul PlanPanel
+/// shape), with validated/normalized entries.
+#[test]
+fn plan_updates_reach_the_host() {
+    let env_pairs = provider_env().1;
+    let env: Vec<(&str, &str)> = env_pairs
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let acp = AcpProcess::spawn_with(&env, Policy::AllowOnce);
+    acp.initialize();
+    let cwd = temp_cwd("plan");
+    let sid = acp.new_session(2, &cwd)["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    acp.send(&json!({
+        "jsonrpc": "2.0", "id": 3, "method": "session/set_config_option",
+        "params": {"sessionId": sid, "configId": "approval", "value": "auto"}
+    }));
+    let _ = acp.wait_response(3, Duration::from_secs(20));
+
+    assert_eq!(acp.prompt(4, &sid, "PLAN_MISSION plan it"), "end_turn");
+
+    let updates = acp.updates.lock().unwrap().clone();
+    let plan = updates
+        .iter()
+        .find(|u| u["sessionUpdate"] == "plan")
+        .expect("a plan update must reach the host");
+    let entries = plan["entries"].as_array().expect("entries array");
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0]["content"], "read the spec");
+    assert_eq!(entries[0]["status"], "completed");
+    assert_eq!(entries[1]["priority"], "medium", "spec default applied");
 }

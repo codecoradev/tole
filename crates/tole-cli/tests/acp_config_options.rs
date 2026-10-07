@@ -10,6 +10,79 @@ use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+
+/// Convert a plain chat-completion reply into an SSE stream body
+/// (issue #196 phase 3 mocks): reasoning/content deltas, tool_call
+/// fragments split across chunks (the concatenation contract), the
+/// usage-bearing final chunk, and [DONE].
+fn completion_to_sse(reply: &Value) -> String {
+    let mut out = String::new();
+    let msg = &reply["choices"][0]["message"];
+    let model = reply["model"].as_str().unwrap_or("mock");
+    let mut chunk_of = |delta: Value| {
+        let c = json!({
+            "id": "chatcmpl-sse", "object": "chat.completion.chunk", "created": 1,
+            "model": model,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": null}],
+            "usage": null
+        });
+        out.push_str(&format!("data: {c}\n\n"));
+    };
+    if let Some(r) = msg["reasoning"].as_str() {
+        chunk_of(json!({"reasoning": r}));
+    }
+    if let Some(c) = msg["content"].as_str() {
+        // Split content across two chunks to exercise accumulation and
+        // the text_streamed dedup on the ACP side.
+        if !c.is_empty() {
+            let (a, b) = c.split_at(c.len().div_ceil(2));
+            chunk_of(json!({"content": a}));
+            chunk_of(json!({"content": b}));
+        }
+    }
+    if let Some(tcs) = msg["tool_calls"].as_array() {
+        for (i, tc) in tcs.iter().enumerate() {
+            let name = tc["function"]["name"].as_str().unwrap_or("");
+            let args = tc["function"]["arguments"].as_str().unwrap_or("{}");
+            let (a1, a2) = args.split_at(args.len().div_ceil(2));
+            chunk_of(json!({"tool_calls": [{"index": i, "id": tc["id"],
+                "function": {"name": name, "arguments": a1}}]}));
+            chunk_of(json!({"tool_calls": [{"index": i,
+                "function": {"arguments": a2}}]}));
+        }
+    }
+    if !msg["tool_calls"].is_null() {
+        out.push_str(&format!(
+            "data: {}\n\n",
+            json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}], "usage": null})
+        ));
+    }
+    out.push_str(&format!(
+        "data: {}\n\n",
+        json!({"choices": [], "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}})
+    ));
+    out.push_str("data: [DONE]\n\n");
+    out
+}
+
+fn sse_response(reply: &Value, streamed: bool) -> String {
+    if streamed {
+        let body = completion_to_sse(reply);
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+    } else {
+        let data = reply.to_string();
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            data.len(),
+            data
+        )
+    }
+}
+
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
@@ -39,7 +112,14 @@ impl AcpProcess {
             .env_remove("TOLE_BASE_URL")
             .env_remove("TOLE_MODEL")
             .env_remove("TOLE_API_KEY")
-            .env_remove("TOLE_MODELS");
+            .env_remove("TOLE_MODELS")
+            // OPENAI_* is read as a fallback provider config (#195 probe
+            // uses it too) — a developer shell that sourced a real
+            // gateway's OPENAI_* made the no-picker test see a live
+            // /models answer. Same strip, fallback included.
+            .env_remove("OPENAI_BASE_URL")
+            .env_remove("OPENAI_API_KEY")
+            .env_remove("OPENAI_MODEL");
         for (k, v) in env {
             cmd.env(k, v);
         }
@@ -121,19 +201,48 @@ fn temp_cwd(tag: &str) -> std::path::PathBuf {
 // Mock provider: records the model field of every request, always finals
 // ---------------------------------------------------------------------------
 
-fn spawn_mock() -> (String, Arc<Mutex<Vec<String>>>) {
+/// `models_reply`: what GET /models answers — a fixed two-id list (the
+/// default), a 500, or an empty list. Issue #195 E2E coverage.
+#[derive(Clone, Copy)]
+enum ModelsReply {
+    List,
+    ServerError,
+    Empty,
+}
+
+fn spawn_mock() -> (
+    String,
+    Arc<Mutex<Vec<String>>>,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    spawn_mock_with(ModelsReply::List)
+}
+
+fn spawn_mock_with(
+    models_reply: ModelsReply,
+) -> (
+    String,
+    Arc<Mutex<Vec<String>>>,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let models_hits = Arc::new(AtomicUsize::new(0));
     let seen_inner = Arc::clone(&seen);
+    let hits_inner = Arc::clone(&models_hits);
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             let seen_conn = Arc::clone(&seen_inner);
+            let hits_conn = Arc::clone(&hits_inner);
             std::thread::spawn(move || {
                 let mut s = stream;
                 let mut buf = Vec::new();
                 let mut chunk = [0u8; 16384];
                 let mut body = Value::Null;
+                let mut streamed = false;
+                let mut is_models_get = false;
                 let deadline = std::time::Instant::now() + Duration::from_secs(10);
                 while std::time::Instant::now() < deadline {
                     let n = s.read(&mut chunk).unwrap_or(0);
@@ -141,7 +250,19 @@ fn spawn_mock() -> (String, Arc<Mutex<Vec<String>>>) {
                         buf.extend_from_slice(&chunk[..n]);
                     }
                     if let Some(h) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        if !is_models_get {
+                            let head = String::from_utf8_lossy(&buf[..h]).to_string();
+                            let request_line = head.lines().next().unwrap_or("");
+                            is_models_get = request_line.starts_with("GET ")
+                                && request_line.contains("/models");
+                        }
+                        if is_models_get {
+                            break;
+                        }
+                        // POST: keep reading until the body parses — it
+                        // may arrive in segments after the header block.
                         if let Ok(v) = serde_json::from_slice::<Value>(&buf[h + 4..]) {
+                            streamed = v.get("stream").and_then(Value::as_bool) == Some(true);
                             body = v;
                             break;
                         }
@@ -149,6 +270,27 @@ fn spawn_mock() -> (String, Arc<Mutex<Vec<String>>>) {
                     if n == 0 {
                         break;
                     }
+                }
+                if is_models_get {
+                    hits_conn.fetch_add(1, Ordering::SeqCst);
+                    let (status, payload) = match models_reply {
+                        ModelsReply::List => (
+                            "200 OK",
+                            json!({"data": [{"id": "model-b"}, {"id": "model-a"}]}),
+                        ),
+                        ModelsReply::Empty => ("200 OK", json!({"data": []})),
+                        ModelsReply::ServerError => {
+                            ("500 Internal Server Error", json!({"error": "down"}))
+                        }
+                    };
+                    let data = payload.to_string();
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        data.len(),
+                        data
+                    );
+                    let _ = s.write_all(resp.as_bytes());
+                    return;
                 }
                 seen_conn
                     .lock()
@@ -164,17 +306,12 @@ fn spawn_mock() -> (String, Arc<Mutex<Vec<String>>>) {
                     }],
                     "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
                 });
-                let data = reply.to_string();
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    data.len(),
-                    data
-                );
+                let resp = sse_response(&reply, streamed);
                 let _ = s.write_all(resp.as_bytes());
             });
         }
     });
-    (format!("http://{addr}/v1"), seen)
+    (format!("http://{addr}/v1"), seen, models_hits)
 }
 
 // ---------------------------------------------------------------------------
@@ -310,7 +447,7 @@ fn set_config_option_switches_validates_and_persists() {
 /// default), applied from the durable register on every turn.
 #[test]
 fn prompt_uses_switched_model_per_session() {
-    let (base_url, seen) = spawn_mock();
+    let (base_url, seen, _models_hits) = spawn_mock();
     let mut acp = AcpProcess::spawn_with(&[
         ("TOLE_BASE_URL", base_url.as_str()),
         ("TOLE_MODEL", "model-a"),
@@ -415,4 +552,130 @@ fn approval_flip_reply_keeps_current_model() {
     );
     let approval = opts.iter().find(|o| o["id"] == "approval").unwrap();
     assert_eq!(approval["currentValue"], "auto");
+}
+
+/// Issue #195: with NO TOLE_MODELS, the picker is auto-advertised from
+/// the provider's GET /models — probed once per process, cached.
+#[test]
+fn model_picker_auto_advertised_from_provider_models() {
+    use std::sync::atomic::Ordering;
+    let (base_url, _seen, models_hits) = spawn_mock();
+    let mut acp = AcpProcess::spawn_with(&[
+        ("TOLE_BASE_URL", base_url.as_str()),
+        ("TOLE_MODEL", "model-a"),
+        ("TOLE_API_KEY", "sk-test"),
+    ]);
+    acp.initialize(1);
+    let cwd = temp_cwd("autopick");
+    acp.send(&json!({
+        "jsonrpc": "2.0", "id": 2, "method": "session/new",
+        "params": {"cwd": cwd.to_string_lossy()}
+    }));
+    let created = acp.wait_response(2, Duration::from_secs(20));
+    let opts = created["result"]["configOptions"].as_array().unwrap();
+    let model = opts
+        .iter()
+        .find(|o| o["id"] == "model")
+        .expect("auto picker");
+    assert_eq!(
+        model["options"].as_array().unwrap().len(),
+        2,
+        "options come from the provider's /models list"
+    );
+    assert_eq!(model["currentValue"], "model-a");
+    assert_eq!(models_hits.load(Ordering::SeqCst), 1);
+
+    // A second session/new must NOT re-probe (cached per process).
+    acp.send(&json!({
+        "jsonrpc": "2.0", "id": 3, "method": "session/new",
+        "params": {"cwd": cwd.to_string_lossy()}
+    }));
+    let _ = acp.wait_response(3, Duration::from_secs(20));
+    assert_eq!(
+        models_hits.load(Ordering::SeqCst),
+        1,
+        "probe is once per process"
+    );
+}
+
+/// Issue #195: an explicit TOLE_MODELS wins as-is — deterministic, no
+/// network (the /models endpoint is never touched).
+#[test]
+fn tole_models_override_skips_provider_probe() {
+    use std::sync::atomic::Ordering;
+    let (base_url, _seen, models_hits) = spawn_mock();
+    let mut acp = AcpProcess::spawn_with(&[
+        ("TOLE_BASE_URL", base_url.as_str()),
+        ("TOLE_MODEL", "model-a"),
+        ("TOLE_API_KEY", "sk-test"),
+        ("TOLE_MODELS", "model-a,model-z"),
+    ]);
+    acp.initialize(1);
+    let cwd = temp_cwd("override");
+    acp.send(&json!({
+        "jsonrpc": "2.0", "id": 2, "method": "session/new",
+        "params": {"cwd": cwd.to_string_lossy()}
+    }));
+    let created = acp.wait_response(2, Duration::from_secs(20));
+    let model = created["result"]["configOptions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["id"] == "model")
+        .expect("env picker")
+        .clone();
+    assert_eq!(
+        model["options"].as_array().unwrap().len(),
+        2,
+        "exactly the env list, not the provider's"
+    );
+    assert_eq!(
+        models_hits.load(Ordering::SeqCst),
+        0,
+        "no probe when env set"
+    );
+}
+
+/// Issue #195: a failing probe degrades to today's behavior — approval
+/// entry only, no model picker, no error surfaced to the client.
+#[test]
+fn failed_probe_degrades_to_no_picker() {
+    let (base_url, _seen, _hits) = spawn_mock_with(ModelsReply::ServerError);
+    let mut acp = AcpProcess::spawn_with(&[
+        ("TOLE_BASE_URL", base_url.as_str()),
+        ("TOLE_MODEL", "model-a"),
+        ("TOLE_API_KEY", "sk-test"),
+    ]);
+    acp.initialize(1);
+    let cwd = temp_cwd("probe500");
+    acp.send(&json!({
+        "jsonrpc": "2.0", "id": 2, "method": "session/new",
+        "params": {"cwd": cwd.to_string_lossy()}
+    }));
+    let created = acp.wait_response(2, Duration::from_secs(20));
+    let opts = created["result"]["configOptions"].as_array().unwrap();
+    assert_eq!(opts.len(), 1, "approval only: {opts:?}");
+    assert_eq!(opts[0]["id"], "approval");
+}
+
+/// Issue #195: an empty /models list degrades exactly like a failure —
+/// approval only, one stderr note, no picker.
+#[test]
+fn empty_models_list_degrades_to_no_picker() {
+    let (base_url, _seen, _hits) = spawn_mock_with(ModelsReply::Empty);
+    let mut acp = AcpProcess::spawn_with(&[
+        ("TOLE_BASE_URL", base_url.as_str()),
+        ("TOLE_MODEL", "model-a"),
+        ("TOLE_API_KEY", "sk-test"),
+    ]);
+    acp.initialize(1);
+    let cwd = temp_cwd("emptymodels");
+    acp.send(&json!({
+        "jsonrpc": "2.0", "id": 2, "method": "session/new",
+        "params": {"cwd": cwd.to_string_lossy()}
+    }));
+    let created = acp.wait_response(2, Duration::from_secs(20));
+    let opts = created["result"]["configOptions"].as_array().unwrap();
+    assert_eq!(opts.len(), 1, "approval only: {opts:?}");
+    assert_eq!(opts[0]["id"], "approval");
 }
