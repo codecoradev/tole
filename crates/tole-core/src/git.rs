@@ -93,6 +93,15 @@ impl GitOp {
                             "git: 'path' must be relative to the workspace: {p:?}"
                         ));
                     }
+                    // Issue #247 (rescan #99): a pathspec starting with
+                    // ':' is git pathspec MAGIC — ':/' or ':(top)'
+                    // anchors at the repository ROOT, escaping the
+                    // workdir jail the same way an absolute path would.
+                    if p.starts_with(':') {
+                        return Err(format!(
+                            "git: 'path' must be relative to the workspace (pathspec magic ':' is not allowed): {p:?}"
+                        ));
+                    }
                     // Windows drive-letter absolute paths (`C:\...`,
                     // `C:/...`) slip past the separator checks above
                     // (cora full-scan #30) — the second byte `:` marks a
@@ -314,6 +323,13 @@ mod tests {
         assert!(t
             .command_line(&json!({"op":"add","paths":["weird:name.txt"]}))
             .is_ok());
+        // Issue #247: pathspec magic cannot anchor at the repo root.
+        for bad in [":/", ":(top)", ":(top,magic)src/x"] {
+            let err = t
+                .command_line(&json!({"op":"add","paths":[bad]}))
+                .unwrap_err();
+            assert!(err.contains("pathspec magic"), "{bad}: got {err}");
+        }
     }
 
     #[test]
