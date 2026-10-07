@@ -394,11 +394,23 @@ impl Tool for WebFetchTool {
             .get(&url)
             .call()
             .map_err(|e| format!("web_fetch: {e}"))?;
-        for _ in 0..MAX_REDIRECTS {
+        // Issue #250 (rescan #100): MAX_REDIRECTS must be a hard cap.
+        // The old loop simply exited after MAX_REDIRECTS iterations and
+        // FELL THROUGH to body handling — a still-3xx response was
+        // processed as content (and the Location never followed).
+        let mut redirects = 0usize;
+        loop {
             let status = res.status().as_u16();
             if !(300..400).contains(&status) {
                 break;
             }
+            if redirects >= MAX_REDIRECTS {
+                return Err(format!(
+                    "web_fetch: exceeded {MAX_REDIRECTS} redirect hops — refusing to treat the \
+                     final 3xx as content"
+                ));
+            }
+            redirects += 1;
             let location = res
                 .headers()
                 .get("location")
