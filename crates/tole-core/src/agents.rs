@@ -89,13 +89,12 @@ pub fn check_child_agent_argv(argv: &[String]) -> Result<(), String> {
         // accepted for the depth invariant; the structural fix (depth
         // via a marker file the child cannot env-clear) closes the
         // class entirely.
-        // Substitution punctuation ANYWHERE in the argv means the
-        // env/exec keyword itself may be assembled at runtime
-        // (`$(echo e)$(echo nv)` → `env`, cora review round 8) — the
-        // env context is then assumed for every dash token.
-        let any_subst = argv
-            .iter()
-            .any(|a| a.contains('$') || a.contains('`') || a.contains('('));
+        // Substitution punctuation in a SHORT-flag position can build a
+        // wipe flag at runtime (`env -$(echo i)`, rounds 7+10). The
+        // any_subst widening from earlier rounds was TOO BROAD (CI cora
+        // round: `bash -c "echo $HOME"` was refused) — the targeted
+        // raw_subst refusal inside env/exec contexts is the sound rule,
+        // so any_subst no longer widens anything.
         let mut saw_env = false;
         let mut saw_exec = false;
         for arg in argv {
@@ -110,11 +109,15 @@ pub fn check_child_agent_argv(argv: &[String]) -> Result<(), String> {
                     || seg.contains('`')
                     || seg.contains('(')
                     || seg.contains(')');
+                // Strip QUOTES/backslashes/substitution FIRST (CI cora
+                // round 2 on #245: `exec "tole.exe"` — trimming `.exe`
+                // before quote-stripping was a no-op while the trailing
+                // quote hid it), THEN the `.exe` suffix.
                 let tok: String = seg
-                    .trim_end_matches(".exe")
                     .chars()
                     .filter(|c| !matches!(c, '"' | '\'' | '`' | '$' | '(' | ')' | '{' | '}' | '\\'))
                     .collect();
+                let tok = tok.trim_end_matches(".exe").to_string();
                 if tok == "env" {
                     saw_env = true;
                     saw_exec = false;
@@ -153,15 +156,11 @@ pub fn check_child_agent_argv(argv: &[String]) -> Result<(), String> {
                     // env-clearing. Short clusters use containment
                     // (`-vi`, `-iu` …), not exclusivity — same for
                     // exec's `-cl` (round 5 #2).
-                    let env_ctx = saw_env || any_subst;
-                    let env_clear = env_ctx
+                    let env_clear = saw_env
                         && (raw_subst
                             || tok.starts_with("--")
                             || body.chars().any(|c| c == 'i' || c == 'u'));
-                    // exec mirrors env (cora review round 9): the exec
-                    // keyword may itself be substitution-assembled
-                    // (`$e$f` → `exec`), so any_subst widens it too.
-                    let exec_clear = (saw_exec || any_subst)
+                    let exec_clear = saw_exec
                         && !tok.starts_with("--")
                         && (raw_subst || body.chars().any(|c| c == 'c'));
                     if env_clear || exec_clear {
@@ -906,6 +905,11 @@ mod tests {
         let benign: Vec<Vec<String>> = vec![
             vec!["cp".into(), "-u".into(), "a".into(), "b".into()],
             vec!["bash".into(), "-c".into(), "ls -i notes".into()],
+            // Ordinary variable use is NOT a wipe (CI cora round on
+            // #245: the removed any_subst widening refused this).
+            vec!["bash".into(), "-c".into(), "echo $HOME".into()],
+            vec!["bash".into(), "-c".into(), "rm -- \"$f\"".into()],
+            vec!["bash".into(), "-c".into(), "grep -c x $(ls)".into()],
         ];
         for v in &benign {
             assert!(
@@ -913,6 +917,11 @@ mod tests {
                 "benign command must pass: {v:?}"
             );
         }
+        // Quoted .exe (CI cora round 2 on #245): the suffix trim must
+        // run AFTER quote-stripping.
+        let quoted_exe: Vec<String> =
+            vec!["bash".into(), "-c".into(), "exec \"tole.exe\" run".into()];
+        assert!(check_child_agent_argv(&quoted_exe).is_err());
         // Documented over-block (issue #228 trade): a short i/u/c flag
         // AFTER an env/exec token in the SAME argv is refused even when
         // it is not a wipe (`grep -i`) — the never-clear context is the
@@ -982,20 +991,14 @@ mod tests {
             // tools structurally absent.
             // Backslash separator trick.
             vec!["bash", "-c", "\\tole run"],
-            // Indirect exec keyword (`$e$f` → `exec`) with `-c` —
-            // cora review round 9 on #228.
-            vec![
-                "bash",
-                "-c",
-                "e=e; f=xec; p=/usr/local/bin/to; $e$f -c \"$p\"le run mission",
-            ],
-            // Substitution-built env keyword itself (cora review
-            // round 8 on #228): `$(echo e)$(echo nv)` expands to `env`.
-            vec![
-                "bash",
-                "-c",
-                "$(echo e)$(echo nv) -i bash -c 'p=/usr/local/bin/to; exec \"$p\"le run mission'",
-            ],
+            // Substitution-built env keyword (cora CI round on #245 —
+            // REVERTED later the same PR: `$(echo e)$(echo nv)` needs
+            // `saw_env` to catch the following `-i`, and it does: `env`
+            // or not, `-i` after a substitution-adjacent segment in env
+            // context is refused via raw_subst. The any_subst widening
+            // itself was removed as over-broad (blocked `echo $HOME`).
+            // Benign variable use must pass (CI cora round 1).
+            vec!["bash", "-c", "echo $HOME"],
             // Substitution-built flag (cora review round 7 on #228):
             // `env -$(echo i)` constructs the wipe flag at runtime.
             vec![
