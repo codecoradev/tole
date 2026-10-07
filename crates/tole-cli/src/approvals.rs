@@ -134,7 +134,35 @@ impl ApprovalQueue {
         storage_path: std::path::PathBuf,
     ) -> String {
         self.prune_expired();
-        let id = format!("apr-{:x}-{:x}", now_ms(), fingerprint as u32);
+        // Issue #255 (rescan #36): the id previously used only
+        // (millisecond timestamp, low-32 fingerprint) — two entries
+        // queued in the same millisecond with matching fingerprints
+        // collided. Cora CI round: a bare process-local counter still
+        // collides ACROSS processes (each CLI is one process per
+        // session, both emitting seq 0) and after restart. Mix in a
+        // per-process RANDOM NONCE (generated once per process) so ids
+        // are unique across processes and restarts.
+        static NONCE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let nonce = *NONCE.get_or_init(|| {
+            let mut b = [0u8; 8];
+            if std::fs::File::open("/dev/urandom")
+                .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut b))
+                .is_err()
+            {
+                // Fallback: time + pid hash (still cross-process unique
+                // in practice).
+                let t = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0);
+                b = (t ^ (std::process::id() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+                    .to_le_bytes();
+            }
+            u64::from_le_bytes(b)
+        });
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let id = format!("apr-{:x}-{:x}{:x}", now_ms(), nonce, seq);
         self.entries
             .lock()
             .unwrap_or_else(|p| p.into_inner())
