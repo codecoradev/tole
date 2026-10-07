@@ -194,15 +194,7 @@ fn live_agents(root: &std::path::Path) -> Result<usize, String> {
 /// matching every other tole on-host contract.
 #[cfg(unix)]
 fn agents_root_lock(root: &std::path::Path) -> Result<std::fs::File, String> {
-    let dir = agents_root(root);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("agents dir: {e}"))?;
-    let lock = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .read(true)
-        .open(dir.join("LOCK"))
-        .map_err(|e| format!("agents lock: {e}"))?;
+    let lock = open_lock_file(root)?;
     use std::os::fd::AsRawFd;
     let rc = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) };
     if rc != 0 {
@@ -211,11 +203,24 @@ fn agents_root_lock(root: &std::path::Path) -> Result<std::fs::File, String> {
     Ok(lock)
 }
 
+/// Non-unix hosts run agents single-parent today; the flock is the unix
+/// serialization mechanism. Still open the SAME regular LOCK file (a
+/// directory open fails on Windows) so both platforms agree on layout.
 #[cfg(not(unix))]
-fn agents_root_lock(_root: &std::path::Path) -> Result<std::fs::File, String> {
-    // Non-unix hosts run agents single-parent today; the flock is the
-    // unix serialization mechanism.
-    Ok(std::fs::File::open(std::env::temp_dir()).map_err(|e| format!("agents lock: {e}"))?)
+fn agents_root_lock(root: &std::path::Path) -> Result<std::fs::File, String> {
+    open_lock_file(root)
+}
+
+fn open_lock_file(root: &std::path::Path) -> Result<std::fs::File, String> {
+    let dir = agents_root(root);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("agents dir: {e}"))?;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .read(true)
+        .open(dir.join("LOCK"))
+        .map_err(|e| format!("agents lock: {e}"))
 }
 
 /// Best-effort mailbox cleanup (ephemeral default): `uteke forget`
