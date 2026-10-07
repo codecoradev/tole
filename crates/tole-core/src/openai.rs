@@ -1310,16 +1310,41 @@ mod streaming_tests {
         assert_eq!(p.last_reasoning().unwrap(), "thinking");
     }
 
+    /// One-shot SSE mock that serves the given bodies on SEQUENTIAL
+    /// connections over ONE port — so a single provider instance can
+    /// make several complete() calls (issue #232 stale-state coverage
+    /// requires the SAME provider across responses).
+    fn serve_stream_seq(bodies: Vec<String>) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for body in bodies {
+                let Ok((mut s, _)) = listener.accept() else {
+                    break;
+                };
+                use std::io::Read;
+                let mut buf = [0u8; 8192];
+                let _ = s.read(&mut buf);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = std::io::Write::write_all(&mut s, resp.as_bytes());
+            }
+        });
+        format!("http://{addr}/v1")
+    }
+
     /// Issue #232 regression: each response's usage/reasoning stand
-    /// alone. A tool-call step (early return) must not inherit the
-    /// previous response's values, and a step whose gateway omits the
-    /// usage chunk must CLEAR it (the durable ledger gets nothing for
-    /// that step, not the previous step's numbers).
+    /// alone ON THE SAME PROVIDER. A tool-call step (early return) must
+    /// not inherit the previous response's values, and a step whose
+    /// gateway omits the usage chunk must CLEAR it (the durable ledger
+    /// gets nothing for that step, not the previous step's numbers).
     #[test]
     fn tool_call_step_sets_fresh_reasoning_and_usage_per_response() {
-        // Response 1: text final — reasoning + usage recorded.
-        let capture = Arc::new(Mutex::new(String::new()));
-        let url = serve_stream(
+        let url = serve_stream_seq(vec![
+            // Response 1: text final — reasoning + usage recorded.
             concat!(
                 "data: {\"choices\":[{\"delta\":{\"reasoning\":\"first thought\"}}]}\n\n",
                 "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
@@ -1327,18 +1352,7 @@ mod streaming_tests {
                 "data: [DONE]\n\n",
             )
             .to_string(),
-            Arc::clone(&capture),
-        );
-        let mut p = OpenAiProvider::new(OpenAiConfig::new(url, "m", "sk-test"));
-        assert!(matches!(
-            p.complete(&[]).unwrap(),
-            ProviderOutput::Final { .. }
-        ));
-        assert_eq!(p.last_reasoning().unwrap(), "first thought");
-        assert_eq!(p.last_usage().unwrap()["prompt_tokens"], json!(1));
-
-        // Response 2: tool-call step — its own reasoning + usage.
-        let url = serve_stream(
+            // Response 2: tool-call step — its own reasoning + usage.
             concat!(
                 "data: {\"choices\":[{\"delta\":{\"reasoning\":\"second thought\"}}]}\n\n",
                 "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"echo\",\"arguments\":\"{}\"}}]}}]}\n\n",
@@ -1346,10 +1360,27 @@ mod streaming_tests {
                 "data: [DONE]\n\n",
             )
             .to_string(),
-            Arc::clone(&capture),
-        );
-        let p2 = OpenAiProvider::new(OpenAiConfig::new(url, "m", "sk-test"));
-        let mut p = p2;
+            // Response 3: gateway omits the usage chunk → ledger cleared.
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n",
+            )
+            .to_string(),
+        ]);
+        // ONE provider for all three responses: the stale-state carry-
+        // over under test only exists between calls on the same
+        // instance (cora review: fresh providers made the old version
+        // of this test pass even without the fix).
+        let mut p = OpenAiProvider::new(OpenAiConfig::new(url, "m", "sk-test"));
+
+        assert!(matches!(
+            p.complete(&[]).unwrap(),
+            ProviderOutput::Final { .. }
+        ));
+        assert_eq!(p.last_reasoning().unwrap(), "first thought");
+        assert_eq!(p.last_usage().unwrap()["prompt_tokens"], json!(1));
+
         assert!(matches!(
             p.complete(&[]).unwrap(),
             ProviderOutput::ToolCall { .. }
@@ -1365,19 +1396,6 @@ mod streaming_tests {
             "usage is this step's, not the previous response's"
         );
 
-        // Response 3: gateway omits the usage chunk → ledger gets None,
-        // never the stale previous-step numbers.
-        let url = serve_stream(
-            concat!(
-                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
-                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
-                "data: [DONE]\n\n",
-            )
-            .to_string(),
-            Arc::clone(&capture),
-        );
-        let p3 = OpenAiProvider::new(OpenAiConfig::new(url, "m", "sk-test"));
-        let mut p = p3;
         assert!(matches!(
             p.complete(&[]).unwrap(),
             ProviderOutput::Final { .. }
@@ -1385,6 +1403,10 @@ mod streaming_tests {
         assert!(
             p.last_usage().is_none(),
             "omitted usage must reset, not leak the previous response's"
+        );
+        assert!(
+            p.last_reasoning().is_none(),
+            "no reasoning in this response — must not show the previous one"
         );
     }
 
