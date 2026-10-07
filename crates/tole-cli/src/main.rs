@@ -1589,7 +1589,7 @@ fn run_command(
     // Task-list tools (issue #198): fresh session → empty state; both
     // tools join the registry (todo_write absent in plan mode via the
     // retain_read_only filter above — registration here is additive).
-    let todo_state = tole_core::todo::TodoState::shared();
+    let todo_state = tole_core::todo::TodoState::new();
     registry
         .register(Box::new(tole_core::todo::TodoReadTool::new(
             std::sync::Arc::clone(&todo_state),
@@ -1727,7 +1727,7 @@ fn resume_command(
     // the plan-mode filter — todo_write must be ABSENT on the wire under
     // --plan-mode (the retain_read_only guarantee), not merely gated.
     {
-        let todo_state = tole_core::todo::TodoState::shared();
+        let todo_state = tole_core::todo::TodoState::new();
         {
             use tole_core::storage::Storage;
             todo_state.hydrate(storage.entries());
