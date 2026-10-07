@@ -646,17 +646,19 @@ pub fn run_acp(
             // inline network fetch here stalled session/new and
             // set_config for the whole gateway timeout.
             models_cache.get().cloned().unwrap_or_else(|| {
+                // Issue #257 + cora CI round 2: ONLY a successful
+                // non-empty probe lands in the OnceLock. Failure and
+                // timeout paths return WITHOUT caching, so the next
+                // session/new retries after the gateway recovers (the
+                // old single-cache flow pinned an empty list for the
+                // process lifetime after one timeout).
                 let computed = match probe_cfg.as_ref() {
-                    None => Vec::new(),
+                    None => return Vec::new(),
                     Some(cfg) => {
                         let base = cfg.base_url.clone();
                         let key = cfg.api_key.clone();
-                        // Detached probe + bounded wait (issue #257,
-                        // rescan #41, cora round 1: join() still blocked
-                        // the reader thread; now the caller waits at
-                        // most PROBE_WAIT on a hung gateway, the probe
-                        // thread finishes alone, and the OnceLock caches
-                        // its result only if it landed in time).
+                        // Detached probe + bounded wait (cora round 1:
+                        // join() still blocked the reader thread).
                         let (tx, rx) = std::sync::mpsc::channel();
                         std::thread::spawn(move || {
                             let _ = tx.send(tole_core::openai::fetch_model_ids(&base, &key));
@@ -668,26 +670,26 @@ pub fn run_acp(
                                     "tole acp: provider /models returned no ids — set \
                                          TOLE_MODELS to advertise a model picker"
                                 );
-                                Vec::new()
+                                return Vec::new();
                             }
                             Ok(Err(e)) => {
                                 eprintln!(
                                     "tole acp: {e} — set TOLE_MODELS to advertise a \
                                          model picker"
                                 );
-                                Vec::new()
+                                return Vec::new();
                             }
                             Err(_) => {
-                                // Timeout (or sender dropped): do NOT
-                                // cache — the next session/new may retry
-                                // once the gateway recovers, and each
-                                // retry is bounded by PROBE_WAIT.
+                                // Timeout (or sender dropped): NOT
+                                // cached — the next session/new may
+                                // retry once the gateway recovers;
+                                // each retry is bounded by PROBE_WAIT.
                                 eprintln!(
                                     "tole acp: provider /models probe did not answer within \
                                          {:?} — set TOLE_MODELS to advertise a model picker",
                                     PROBE_WAIT
                                 );
-                                Vec::new()
+                                return Vec::new();
                             }
                         }
                     }
