@@ -684,4 +684,165 @@ mod tests {
         assert!(text.contains("ambiguous"), "{text}");
         client.cancel().await.ok();
     }
+
+    // -----------------------------------------------------------------
+    // Gate characterization (issue #303, PR 1 of 3). These pin what
+    // `execute_checked` does TODAY so the gate refactor can prove it
+    // changed nothing. They are not requirements.
+    // -----------------------------------------------------------------
+
+    use crate::approval::{Approver, ToolRequest, Verdict};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Approver that counts how often it is consulted.
+    struct CountingApprover {
+        verdict: Verdict,
+        calls: Arc<AtomicUsize>,
+    }
+    impl Approver for CountingApprover {
+        fn decide(&self, _req: &ToolRequest<'_>) -> Verdict {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.verdict
+        }
+        fn interactive(&self) -> bool {
+            true // lets a Destructive tool register (permissive embedder)
+        }
+    }
+
+    /// Tool that counts executions, with a configurable risk.
+    struct ProbeTool {
+        name: &'static str,
+        risk: Risk,
+        runs: Arc<AtomicUsize>,
+    }
+    impl crate::tool::Tool for ProbeTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn risk(&self) -> Risk {
+            self.risk
+        }
+        fn execute(&self, input: serde_json::Value) -> Result<serde_json::Value, String> {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({ "probe_ran": input }))
+        }
+    }
+
+    fn probe_server(
+        verdict: Verdict,
+        tools: &[(&'static str, Risk)],
+    ) -> (RegistryServer, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let consulted = Arc::new(AtomicUsize::new(0));
+        let runs = Arc::new(AtomicUsize::new(0));
+        let mut reg = ToolRegistry::with_approver(CountingApprover {
+            verdict,
+            calls: consulted.clone(),
+        });
+        for (name, risk) in tools {
+            reg.register(Box::new(ProbeTool {
+                name,
+                risk: *risk,
+                runs: runs.clone(),
+            }))
+            .unwrap();
+        }
+        (RegistryServer::new(reg), consulted, runs)
+    }
+
+    #[test]
+    fn gate_char_mcp_unknown_tool_message() {
+        let (srv, consulted, _) = probe_server(Verdict::Allow, &[]);
+        let err = srv.execute_checked("nope", json!({})).unwrap_err();
+        assert_eq!(err, "unknown tool: nope");
+        assert_eq!(consulted.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn gate_char_mcp_destructive_refused_even_if_approver_allows() {
+        let (srv, consulted, runs) = probe_server(Verdict::Allow, &[("boom", Risk::Destructive)]);
+        let err = srv.execute_checked("boom", json!({})).unwrap_err();
+        assert_eq!(err, "destructive tools are never exposed in server mode");
+        // Structural refusal: the approver is never even asked.
+        assert_eq!(consulted.load(Ordering::SeqCst), 0);
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn gate_char_mcp_write_denied_exact_message_and_no_execution() {
+        let (srv, consulted, runs) = probe_server(Verdict::Deny, &[("w", Risk::Write)]);
+        let err = srv.execute_checked("w", json!({})).unwrap_err();
+        assert_eq!(
+            err,
+            "denied by approval policy — this MCP server only pre-authorizes Write tools listed in --allow patterns"
+        );
+        assert_eq!(consulted.load(Ordering::SeqCst), 1);
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn gate_char_mcp_write_allowed_executes_after_one_consultation() {
+        let (srv, consulted, runs) = probe_server(Verdict::Allow, &[("w", Risk::Write)]);
+        let out = srv.execute_checked("w", json!({"k": 1})).unwrap();
+        assert_eq!(out, json!({"probe_ran": {"k": 1}}));
+        assert_eq!(consulted.load(Ordering::SeqCst), 1);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn gate_char_mcp_readonly_executes_without_consulting_approver() {
+        let (srv, consulted, runs) = probe_server(Verdict::Deny, &[("r", Risk::ReadOnly)]);
+        let out = srv.execute_checked("r", json!({"k": 2})).unwrap();
+        assert_eq!(out, json!({"probe_ran": {"k": 2}}));
+        assert_eq!(consulted.load(Ordering::SeqCst), 0);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+    }
+
+    /// Pins CURRENT behavior, not a requirement: `execute_checked` never
+    /// consults pre-hooks. Server faces refuse hooks by design (see
+    /// docs/orchestration.md; the CLI errors on --on-pretool for `tole
+    /// mcp`), so a registry carrying a denying pre-hook still executes
+    /// here. If a later change wires hooks into this path, update this
+    /// test deliberately.
+    #[test]
+    fn gate_char_mcp_pre_hooks_are_not_consulted() {
+        let dir = std::env::temp_dir().join(format!("tole-gate-char-mcp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("hook-ran");
+        let _ = std::fs::remove_file(&marker);
+        let script = dir.join("deny.sh");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\ntouch {}\necho nope\nexit 2\n", marker.display()),
+        )
+        .unwrap();
+        let consulted = Arc::new(AtomicUsize::new(0));
+        let runs = Arc::new(AtomicUsize::new(0));
+        let mut reg = ToolRegistry::with_approver(CountingApprover {
+            verdict: Verdict::Allow,
+            calls: consulted.clone(),
+        });
+        for (name, risk) in [("w", Risk::Write), ("r", Risk::ReadOnly)] {
+            reg.register(Box::new(ProbeTool {
+                name,
+                risk,
+                runs: runs.clone(),
+            }))
+            .unwrap();
+        }
+        let mut hooks = crate::hooks::ToolHooks::from_cli(&[], &[]);
+        hooks.pre = vec![crate::hooks::ProcessHook::new(&format!(
+            "/bin/sh {}",
+            script.display()
+        ))];
+        reg.set_hooks(hooks);
+        let srv = RegistryServer::new(reg);
+        assert!(srv.execute_checked("w", json!({})).is_ok());
+        assert!(srv.execute_checked("r", json!({})).is_ok());
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+        assert!(
+            !marker.exists(),
+            "pre-hook must not run on the MCP server path"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
