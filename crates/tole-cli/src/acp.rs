@@ -632,6 +632,10 @@ pub fn run_acp(
     // session retry). No provider config → nothing to probe.
     let env_models_raw = std::env::var("TOLE_MODELS").ok();
     let probe_cfg = tole_core::openai::OpenAiConfig::from_env();
+    /// Bounded wait for the lazy /models probe (issue #257): a hung
+    /// gateway must not stall the ACP reader thread beyond this.
+    const PROBE_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
     let models_cache: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     let model_list = || {
         resolve_model_list(env_models_raw.as_deref(), || {
@@ -647,10 +651,17 @@ pub fn run_acp(
                     Some(cfg) => {
                         let base = cfg.base_url.clone();
                         let key = cfg.api_key.clone();
-                        match std::thread::scope(|s| {
-                            s.spawn(|| tole_core::openai::fetch_model_ids(&base, &key))
-                                .join()
-                        }) {
+                        // Detached probe + bounded wait (issue #257,
+                        // rescan #41, cora round 1: join() still blocked
+                        // the reader thread; now the caller waits at
+                        // most PROBE_WAIT on a hung gateway, the probe
+                        // thread finishes alone, and the OnceLock caches
+                        // its result only if it landed in time).
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        std::thread::spawn(move || {
+                            let _ = tx.send(tole_core::openai::fetch_model_ids(&base, &key));
+                        });
+                        match rx.recv_timeout(PROBE_WAIT) {
                             Ok(Ok(list)) if !list.is_empty() => list,
                             Ok(Ok(_)) => {
                                 eprintln!(
@@ -667,11 +678,14 @@ pub fn run_acp(
                                 Vec::new()
                             }
                             Err(_) => {
-                                // Probe thread panicked: treat like any
-                                // other probe failure.
+                                // Timeout (or sender dropped): do NOT
+                                // cache — the next session/new may retry
+                                // once the gateway recovers, and each
+                                // retry is bounded by PROBE_WAIT.
                                 eprintln!(
-                                    "tole acp: provider /models probe failed — set \
-                                         TOLE_MODELS to advertise a model picker"
+                                    "tole acp: provider /models probe did not answer within \
+                                         {:?} — set TOLE_MODELS to advertise a model picker",
+                                    PROBE_WAIT
                                 );
                                 Vec::new()
                             }
