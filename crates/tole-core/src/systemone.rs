@@ -52,7 +52,7 @@ fn caps_for(endpoint: &str) -> BackendCaps {
     let is_hosted = endpoint
         .parse::<ureq::http::Uri>()
         .ok()
-        .and_then(|u| u.host_str().map(|h| h.eq_ignore_ascii_case(HOSTED_HOST)))
+        .and_then(|u| u.host().map(|h| h.eq_ignore_ascii_case(HOSTED_HOST)))
         .unwrap_or(false);
     if is_hosted {
         BackendCaps {
