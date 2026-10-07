@@ -741,8 +741,16 @@ impl Tool for AgentPollTool {
         "agent_poll"
     }
 
+    /// `Write`, not `ReadOnly` (issue #300): a settled poll CONSUMES the
+    /// mailbox — it forgets the uteke mailbox namespace and persists
+    /// `mailbox_consumed` in meta.json. The tier must match the behavior
+    /// (a ReadOnly tool must never mutate; unlike `job_poll`, whose
+    /// write-back was removed for exactly that reason). Consume-once is
+    /// load-bearing (#243/#260/#287), so the tier moves rather than the
+    /// side effect. Plan mode drops Write tools, but it also drops
+    /// `agent_start`, so no child can exist to poll there.
     fn risk(&self) -> Risk {
-        Risk::ReadOnly
+        Risk::Write
     }
 
     fn is_poll(&self) -> bool {
@@ -1312,6 +1320,20 @@ mod tests {
         )
         .unwrap();
         assert!(meta.mailbox_consumed);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Issue #300: a settled poll forgets the mailbox and persists
+    /// `mailbox_consumed`, so it must NOT be classified ReadOnly (the tier
+    /// the gate and plan mode key on). Pins both tools' tier.
+    #[test]
+    fn agent_tools_are_write_tier_because_poll_mutates() {
+        let d = tmp("risk-tier");
+        assert_eq!(AgentPollTool::new(d.clone()).risk(), Risk::Write);
+        assert_eq!(
+            AgentStartTool::new("/bin/true", d.clone()).risk(),
+            Risk::Write
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 

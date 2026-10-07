@@ -1048,7 +1048,8 @@ fn detect_github_repo(cwd: &Path) -> Option<String> {
 /// Destructive-never-allowed invariant) is unchanged. `internal` covers
 /// the probe-gated native integrations (uteke_*, cora_search) plus the
 /// cora MCP auto-preset surface (mcp_cora_*) and the always-safe
-/// verify_package/job tools; it deliberately excludes the write-capable
+/// verify_package/job tools plus `agent_poll` (Write since #300; exact name,
+/// so `agent_start` still prompts); it deliberately excludes the write-capable
 /// native tools (write_file/edit_file/run_command/git/gh), which keep
 /// prompting.
 const TRUST_PRESETS: &[(&str, &[&str])] = &[
@@ -1060,6 +1061,7 @@ const TRUST_PRESETS: &[(&str, &[&str])] = &[
             "mcp_cora_*",
             "verify_package",
             "job_*",
+            "agent_poll",
             "tole_session_*",
             "todo_write",
         ],
@@ -2785,6 +2787,7 @@ mod trust_preset_tests {
             "mcp_cora_*",
             "verify_package",
             "job_*",
+            "agent_poll",
             "tole_session_*",
         ] {
             assert!(
@@ -2795,6 +2798,9 @@ mod trust_preset_tests {
         // must NOT include write-capable native tools
         assert!(!pats.iter().any(|p| p == "write_file"));
         assert!(!pats.iter().any(|p| p == "run_command"));
+        // agent_poll (Write since #300) is allowlisted by exact name so the
+        // poll loop stays unattended; agent_start must keep prompting.
+        assert!(!pats.iter().any(|p| p == "agent_*" || p == "agent_start"));
     }
 
     #[test]

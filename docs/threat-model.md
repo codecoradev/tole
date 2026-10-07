@@ -164,7 +164,12 @@ idle session is an idempotent no-op. The `tole_session_*` glob in the
 ## Depth-1 child agents (#171/#174)
 
 `agent_start` spawns a child tole session; `agent_poll` reads its
-result. The registry enforces a structural depth cap (no
+result. Both are `Risk::Write` (#300): a settled poll consumes the
+mailbox (uteke forget + `mailbox_consumed` in meta.json), so the tier
+matches the side effect and plan mode drops it (plan mode also drops
+`agent_start`, so no child exists to poll). `--trust internal`
+allowlists `agent_poll` by exact name to keep the poll loop unattended;
+`agent_start` still prompts. The registry enforces a structural depth cap (no
 grandchildren), results travel via ephemeral uteke mailboxes, and the
 parent-only `--agents-worktree` flag gives each child its own git
 worktree. A child's prompt is model/operator-supplied — the same trust
