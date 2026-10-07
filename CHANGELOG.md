@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+Rescan-2 MAJORs (#276–#287):
+- Security: server-supplied text is sanitized before it reaches MCP approval
+  prompts (#286); the subprocess env scrubber matches SECRET/TOKEN/
+  PASSWORD/API_KEY-shaped names by substring (#284, `TOKENIZERS_PARALLELISM`
+  kept); memory `recall` passes the query after `--` (#280); a failed or
+  timed-out request-body read on the MCP HTTP face is a 400, not an empty
+  body (#277); MCP registration sync waits longer than the serial reactor's
+  worst-case queueing (#285).
+- Redirects: `web_fetch` resolves relative `Location`s per RFC 3986 against
+  the current hop and refuses non-http(s) hops (#281).
+- `git` rejects NUL bytes in argv with a clear error (#282).
+- **Behavior change:** `AllowlistApprover::new(patterns, Deny|Ask)` now
+  ignores `patterns` — the default verdict is final (fail closed). Embedders
+  that used `new(p, Deny)` as an allowlist must use `allow_only(p)` (#283).
+- `chat` registers and hydrates `todo_read`/`todo_write` (#276); an agent
+  mailbox is marked consumed only after a successful recall (#287).
+- Tests: the perf `resume_replay` gate actually replays 25 tool calls and
+  asserts it (#278); `turn_loop` temp dirs are unique per call (#279).
+
 ## [0.7.0] — 2026-10-06
 
 ### Added
