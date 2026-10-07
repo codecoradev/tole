@@ -249,7 +249,17 @@ pub fn resume_turn(
                     &format!("replayed intent {intent_id} carried malformed arguments"),
                 )?;
             } else {
-                if safety == ReplaySafety::Guarded {
+                // Issue #249 (rescan #127): the replay gate keys on the
+                // CURRENT registry risk, not the recorded safety. The
+                // recorded value was derived from the tool's risk at
+                // intent-commit time; if the host wiring changed (or a
+                // tool impl changed), a now-Write tool must still meet
+                // the approval gate. Idempotent-recorded ReadOnly
+                // replays get the same consultation a fresh call would.
+                let current_risk = registry.get(&tool).map(|t| t.risk());
+                let needs_gate = safety == ReplaySafety::Guarded
+                    || matches!(current_risk, Some(r) if r != Risk::ReadOnly);
+                if needs_gate {
                     let Some(t) = registry.get(&tool) else {
                         // Unregistered tool on a Guarded intent: settle the
                         // sandwich as failed so the session stays resumable
