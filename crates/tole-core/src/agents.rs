@@ -138,6 +138,11 @@ pub struct AgentMeta {
     pub worktree: Option<String>,
     #[serde(default)]
     pub branch: Option<String>,
+    /// Consume-once flag, PERSISTED (issue #234): the in-process Mutex
+    /// alone lost the fact on every new parent process, so a second
+    /// poll re-recalled the mailbox after cleanup — flapping summaries.
+    #[serde(default)]
+    pub mailbox_consumed: bool,
 }
 
 fn read_meta(dir: &std::path::Path) -> Result<AgentMeta, String> {
@@ -153,7 +158,10 @@ fn write_meta(dir: &std::path::Path, meta: &AgentMeta) -> Result<(), String> {
 
 /// Count LIVE agents (used to enforce MAX concurrent). Dead-but-
 /// unconsumed agents do not block new slots. A liveness-check FAILURE
-/// is an error, not zero (CodeCora PR #174 round 2).
+/// is an error, not zero (CodeCora PR #174 round 2). Callers racing to
+/// spawn MUST hold [`agents_root_lock`] around count+register (issue
+/// #234: count-then-spawn without a lock lets two parents exceed the
+/// cap).
 fn live_agents(root: &std::path::Path) -> Result<usize, String> {
     let mut n = 0;
     let root_dir = match std::fs::read_dir(agents_root(root)) {
@@ -174,6 +182,40 @@ fn live_agents(root: &std::path::Path) -> Result<usize, String> {
         }
     }
     Ok(n)
+}
+
+/// Serialize the count-then-register critical section of
+/// `agent_start` across processes (issue #234, scan #124 TOCTOU): an
+/// exclusive flock on `<root>/tole-agents/LOCK`. Held from the
+/// liveness count until the child's pid file is written, so two
+/// concurrent parents cannot both observe "3 live" and exceed the cap.
+/// The lock lives on a FIXED file (not per-agent dirs, which are
+/// created after the check) and is advisory — cooperative by design,
+/// matching every other tole on-host contract.
+#[cfg(unix)]
+fn agents_root_lock(root: &std::path::Path) -> Result<std::fs::File, String> {
+    let dir = agents_root(root);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("agents dir: {e}"))?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .read(true)
+        .open(dir.join("LOCK"))
+        .map_err(|e| format!("agents lock: {e}"))?;
+    use std::os::fd::AsRawFd;
+    let rc = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) };
+    if rc != 0 {
+        return Err(format!("agents lock: {}", std::io::Error::last_os_error()));
+    }
+    Ok(lock)
+}
+
+#[cfg(not(unix))]
+fn agents_root_lock(_root: &std::path::Path) -> Result<std::fs::File, String> {
+    // Non-unix hosts run agents single-parent today; the flock is the
+    // unix serialization mechanism.
+    Ok(std::fs::File::open(std::env::temp_dir()).map_err(|e| format!("agents lock: {e}"))?)
 }
 
 /// Best-effort mailbox cleanup (ephemeral default): `uteke forget`
@@ -376,6 +418,10 @@ impl Tool for AgentStartTool {
             }
             requested
         };
+        // Issue #234: hold the flock across count + register — the
+        // count-then-spawn window is the TOCTOU the scan flagged. The
+        // guard releases when `_lock` drops (spawn errors included).
+        let _lock = agents_root_lock(&self.root)?;
         let live = live_agents(&self.root)?;
         if live >= self.max_concurrent {
             return Err(format!(
@@ -438,6 +484,7 @@ impl Tool for AgentStartTool {
                 .unwrap_or(0),
             worktree: worktree.clone(),
             branch: branch.clone(),
+            mailbox_consumed: false,
         };
         write_meta(&dir, &meta)?;
 
@@ -496,6 +543,9 @@ impl Tool for AgentStartTool {
             let _ = child.wait();
             return Err(format!("agent_start: pid file: {e}"));
         }
+        // pid written = the agent is registered — the count now sees it.
+        // Release the #234 flock before the (slow) detached run.
+        drop(_lock);
         // Detach: the child survives the parent CLI exiting; we never
         // wait on it (poll checks liveness via ps, like jobs).
         drop(child);
@@ -572,7 +622,7 @@ impl Tool for AgentPollTool {
             .trim()
             .parse()
             .map_err(|_| format!("agent_poll: corrupt pid file for {id}"))?;
-        let meta = read_meta(&dir)?;
+        let mut meta = read_meta(&dir)?;
         let running =
             pid_alive(pid).map_err(|e| format!("agent_poll: liveness check failed: {e}"))?;
         let elapsed_ms = std::time::SystemTime::now()
@@ -614,12 +664,15 @@ impl Tool for AgentPollTool {
             return Ok(out);
         }
         // Settled: pull the summary from the mailbox, then clean it
-        // (consume-once, unless keep_mailbox).
-        let already = self
-            .consumed
-            .lock()
-            .map(|c| c.iter().any(|x| x == id))
-            .unwrap_or(false);
+        // (consume-once, unless keep_mailbox). The consumed flag is
+        // PERSISTED in meta.json (issue #234) so a later poll —
+        // possibly from another parent process — does not resurrect a
+        // cleaned mailbox; the in-process Mutex serializes the
+        // check-and-mark within this process.
+        let already = {
+            let _g = self.consumed.lock();
+            meta.mailbox_consumed
+        };
         let cfg = crate::memory::MemoryConfig {
             bin: "uteke".into(),
             namespace: meta.mailbox_ns.clone(),
@@ -641,8 +694,11 @@ impl Tool for AgentPollTool {
             if !meta.keep_mailbox {
                 clean_mailbox(&meta.mailbox_ns);
             }
-            if let Ok(mut c) = self.consumed.lock() {
-                c.push(id.to_string());
+            meta.mailbox_consumed = true;
+            if let Err(e) = write_meta(&dir, &meta) {
+                // Degrade loudly-but-softly: the summary WAS delivered;
+                // a failed persist could let a future poll re-recall.
+                out["consume_persist_warning"] = json!(e);
             }
         }
         Ok(out)
@@ -841,6 +897,77 @@ mod tests {
         let _first = start.execute(json!({"prompt": "slow"})).unwrap();
         let err = start.execute(json!({"prompt": "second"})).unwrap_err();
         assert!(err.contains("cap 1"), "{err}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Issue #234 regression: the count→register window is serialized
+    /// by the flock. Two concurrent parents at cap 1 must yield exactly
+    /// ONE success — the old count-then-spawn race let both through.
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_starts_cannot_exceed_the_cap() {
+        let d = tmp("cap-race");
+        let start = AgentStartTool::new(sleeper_child(&d, 3), d.clone());
+        let start = AgentStartTool {
+            max_concurrent: 1,
+            ..start
+        };
+        let s1 = AgentStartTool {
+            root: d.clone(),
+            bin: start.bin.clone(),
+            depth: 0,
+            worktree_mode: false,
+            max_concurrent: 1,
+            timeout_secs: start.timeout_secs,
+            parent_allows: Vec::new(),
+        };
+        let (r1, r2) = std::thread::scope(|s| {
+            let h1 = s.spawn(|| start.execute(json!({"prompt": "a"})));
+            let h2 = s.spawn(|| s1.execute(json!({"prompt": "b"})));
+            (h1.join().unwrap(), h2.join().unwrap())
+        });
+        let oks = [r1.is_ok(), r2.is_ok()].iter().filter(|x| **x).count();
+        assert_eq!(
+            oks, 1,
+            "exactly one spawn may win the cap race: r1={r1:?} r2={r2:?}"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Issue #234 regression: the consume-once flag is PERSISTED — a
+    /// NEW poll tool instance (fresh process equivalent) must see the
+    /// mailbox as consumed and not resurrect the summary.
+    #[test]
+    fn consumed_flag_survives_a_new_poll_instance() {
+        let d = tmp("consumed-persist");
+        let bin = fake_child(&d);
+        let start = AgentStartTool::new(&bin, d.clone());
+        let out = start.execute(json!({"prompt": "quick"})).unwrap();
+        let id = out["agent"].as_str().unwrap().to_string();
+        // Wait for the fake child to settle.
+        let poll = AgentPollTool::new(d.clone());
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let st = poll.execute(json!({"agent": id})).unwrap();
+            if st["running"] == json!(false) {
+                break;
+            }
+        }
+        // First poll after settle consumes (recalls + cleans + marks).
+        let _ = poll.execute(json!({"agent": id})).unwrap();
+        // A brand-new instance = a new parent process.
+        let poll2 = AgentPollTool::new(d.clone());
+        let again = poll2.execute(json!({"agent": id})).unwrap();
+        assert!(
+            again.get("summary").is_none(),
+            "a fresh poll instance must see the mailbox consumed: {again}"
+        );
+        // And the flag is on disk.
+        let meta: AgentMeta = serde_json::from_str(
+            &std::fs::read_to_string(agents_root(&d).join(&id).join("meta.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(meta.mailbox_consumed);
         let _ = std::fs::remove_dir_all(&d);
     }
 
