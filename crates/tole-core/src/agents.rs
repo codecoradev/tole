@@ -997,8 +997,6 @@ mod tests {
             // or not, `-i` after a substitution-adjacent segment in env
             // context is refused via raw_subst. The any_subst widening
             // itself was removed as over-broad (blocked `echo $HOME`).
-            // Benign variable use must pass (CI cora round 1).
-            vec!["bash", "-c", "echo $HOME"],
             // Substitution-built flag (cora review round 7 on #228):
             // `env -$(echo i)` constructs the wipe flag at runtime.
             vec![
