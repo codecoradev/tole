@@ -50,18 +50,30 @@ fn recv_with_grace<T>(rx: &mpsc::Receiver<T>) -> Option<T> {
 
 /// Environment variable names that must NOT reach child processes
 /// (threat-model ENV-1): anything secret-shaped, where "secret-shaped"
-/// means the name contains API_KEY, _SECRET, _TOKEN, or PASSWORD
-/// (case-insensitive). Exception: GITHUB_TOKEN is kept — gh/git push
+/// means the name contains API_KEY/APIKEY, SECRET, TOKEN, PASSWORD/PASSWD,
+/// CREDENTIAL, or PRIVATE_KEY (case-insensitive substring, so
+/// `SECRET_KEY`, `AUTHTOKEN`, `DB_PASSWD` are covered — #284).
+/// Exceptions: GITHUB_TOKEN is kept — gh/git push
 /// auth needs it, and its scope is documented in the threat model.
 pub fn scrub_env_for_child(cmd: &mut Command) -> &mut Command {
-    const KEEP: [&str; 1] = ["GITHUB_TOKEN"];
+    // TOKENIZERS_PARALLELISM is a non-secret HF tuning knob that the
+    // broader TOKEN match would otherwise sweep up.
+    const KEEP: [&str; 2] = ["GITHUB_TOKEN", "TOKENIZERS_PARALLELISM"];
     for (k, _) in std::env::vars_os() {
         let Some(name) = k.to_str() else { continue };
         let upper = name.to_ascii_uppercase();
-        let secret_shaped = upper.contains("API_KEY")
-            || upper.contains("_SECRET")
-            || upper.contains("_TOKEN")
-            || upper.contains("PASSWORD");
+        let secret_shaped = [
+            "API_KEY",
+            "APIKEY",
+            "SECRET",
+            "TOKEN",
+            "PASSWORD",
+            "PASSWD",
+            "CREDENTIAL",
+            "PRIVATE_KEY",
+        ]
+        .iter()
+        .any(|m| upper.contains(m));
         if secret_shaped && !KEEP.contains(&upper.as_str()) {
             cmd.env_remove(name);
         }
@@ -407,6 +419,11 @@ mod env_scrub_tests {
         std::env::set_var("TOLE_TEST_API_KEY", "x");
         std::env::set_var("TOLE_TEST_SECRET_VALUE", "x");
         std::env::set_var("MY_PASSWORD", "x");
+        // #284: names without the underscore-prefixed form.
+        std::env::set_var("SECRET_KEY", "x");
+        std::env::set_var("TOLE_TEST_AUTHTOKEN", "x");
+        std::env::set_var("TOLE_TEST_DB_PASSWD", "x");
+        std::env::set_var("TOLE_TEST_APIKEY", "x");
         std::env::set_var("TOLE_TEST_KEEP_ME", "visible");
         let mut cmd = Command::new("sh");
         cmd.arg("-c").arg("env");
@@ -414,11 +431,19 @@ mod env_scrub_tests {
         assert!(!env.contains("TOLE_TEST_API_KEY"));
         assert!(!env.contains("TOLE_TEST_SECRET_VALUE"));
         assert!(!env.contains("MY_PASSWORD"));
+        assert!(!env.contains("SECRET_KEY="));
+        assert!(!env.contains("TOLE_TEST_AUTHTOKEN"));
+        assert!(!env.contains("TOLE_TEST_DB_PASSWD"));
+        assert!(!env.contains("TOLE_TEST_APIKEY"));
         assert!(env.contains("TOLE_TEST_KEEP_ME=visible"));
         assert!(env.contains("PATH="));
         std::env::remove_var("TOLE_TEST_API_KEY");
         std::env::remove_var("TOLE_TEST_SECRET_VALUE");
         std::env::remove_var("MY_PASSWORD");
+        std::env::remove_var("SECRET_KEY");
+        std::env::remove_var("TOLE_TEST_AUTHTOKEN");
+        std::env::remove_var("TOLE_TEST_DB_PASSWD");
+        std::env::remove_var("TOLE_TEST_APIKEY");
         std::env::remove_var("TOLE_TEST_KEEP_ME");
     }
 }
