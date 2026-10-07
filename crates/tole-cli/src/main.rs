@@ -2928,7 +2928,8 @@ mod chat_todo_tests {
     /// (and only todo_read in plan mode).
     #[test]
     fn chat_registers_todo_tools_and_respects_plan_mode() {
-        let mut reg = ToolRegistry::with_approver(AllowlistApprover::allow_only(vec![]));
+        let mut reg =
+            ToolRegistry::with_approver(tole_core::approval::AllowlistApprover::allow_only(vec![]));
         register_todo_tools(&mut reg, &[], false).unwrap();
         assert!(reg.get("todo_read").is_some());
         assert!(reg.get("todo_write").is_some());
