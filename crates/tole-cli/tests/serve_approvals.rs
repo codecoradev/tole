@@ -208,6 +208,9 @@ fn temp_dir(tag: &str) -> std::path::PathBuf {
 /// The full round trip: queue → allow → work executes → audit register.
 #[test]
 fn approval_allow_round_trip_executes_the_work() {
+    // Issue #259: clear any stale marker BEFORE the run, not just after
+    // the assert — a crashed prior run must not false-pass this test.
+    let _ = std::fs::remove_file(std::path::Path::new("approved.txt"));
     let base = spawn_mock();
     let _dir = temp_dir("allow");
     let env = [
@@ -261,6 +264,8 @@ fn approval_allow_round_trip_executes_the_work() {
     assert_eq!(list["approvals"][0]["status"], "approved", "{list}");
     // The one-shot replay actually EXECUTED the write: the tool is
     // jailed to the serve process cwd (the test binary's package dir).
+    // Issue #259: the stale-marker cleanup happens BEFORE the run (top
+    // of this test), so this assert proves THIS run's write landed.
     let work_file = std::path::Path::new("approved.txt");
     assert!(work_file.exists(), "the approved write must have executed");
     let _ = std::fs::remove_file(work_file);
