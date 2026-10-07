@@ -176,17 +176,25 @@ pub fn check_child_agent_argv(argv: &[String]) -> Result<(), String> {
                     // exec's `-cl` (round 5 #2).
                     // env context: literal `env` seen OR substitution
                     // anywhere (the keyword may be assembled at
-                    // runtime). Long flags only wipe when the LITERAL
-                    // env token was seen (CI cora round: under
-                    // any_subst alone, `rm -- "$f"` matched the
-                    // long-flag rule); substitution-built short
-                    // flags/raw segments still refuse under any_subst.
+                    // runtime). Under a literal env: any long flag
+                    // (GNU abbreviation, round 5) or an i/u-containing
+                    // short cluster. Under any_subst alone: the named
+                    // env-clearing long flags, any i/u-containing
+                    // short cluster, or a substitution-built segment
+                    // (CI cora round 4: `--ignore-environment` built
+                    // next to an assembled keyword; bare `--` in
+                    // `rm -- "$f"` stays benign — its body has no
+                    // i/u).
                     let env_clear = if saw_env {
                         raw_subst
                             || tok.starts_with("--")
                             || body.chars().any(|c| c == 'i' || c == 'u')
                     } else if any_subst {
-                        raw_subst || body.chars().all(|c| c == 'i' || c == 'u')
+                        raw_subst
+                            || tok.starts_with("--ignore-environment")
+                            || tok.starts_with("--unset")
+                            || (!tok.starts_with("--")
+                                && body.chars().any(|c| c == 'i' || c == 'u'))
                     } else {
                         false
                     };
