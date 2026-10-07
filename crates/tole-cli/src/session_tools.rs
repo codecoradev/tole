@@ -409,9 +409,17 @@ impl Tool for SessionListTool {
             .map
             .iter()
             .map(|(id, st)| {
+                // Issue #256 (rescan #38): NEVER take a blocking lock on
+                // a session's busy mutex while holding the sessions-map
+                // lock — a busy session's turn thread serializes this
+                // behind its whole step, and two list calls deadlock on
+                // each other's map lock. try_lock like the eviction
+                // path (line ~175): a busy session reports "unknown"
+                // instead of stalling the listing.
+                let busy = st.busy.try_lock().map(|b| *b).unwrap_or(true);
                 json!({
                     "session_id": id,
-                    "busy": *st.busy.lock().expect("busy lock"),
+                    "busy": busy,
                 })
             })
             .collect();
