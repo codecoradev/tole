@@ -50,7 +50,12 @@ impl Tool for WriteTool {
 }
 
 fn tmpdir(name: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("cora-e3-{}-{}", name, std::process::id()));
+    // Unique PER CALL (pid + monotonic counter): two tests sharing a tag
+    // (e.g. "unknown") must never remove_dir_all each other's directory
+    // when the harness runs them in parallel.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let d = std::env::temp_dir().join(format!("cora-e3-{}-{}-{n:x}", name, std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     d
