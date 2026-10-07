@@ -196,9 +196,11 @@ pub fn check_child_agent_argv(argv: &[String]) -> Result<(), String> {
                             // abbreviations: `--i`, `--ignore-env` —
                             // CI cora round 5 on #245). Any `--x` flag
                             // next to an assembled env keyword is
-                            // refused (undecidable which abbreviation);
-                            // short clusters via i/u containment.
-                            || tok.starts_with("--")
+                            // refused (undecidable which abbreviation)
+                            // EXCEPT the bare `--` end-of-options
+                            // marker (`rm -- "$f"`): its strip-prefix
+                            // body is the literal "-", not empty.
+                            || (tok.starts_with("--") && tok != "--")
                             || (!tok.starts_with("--")
                                 && body.chars().any(|c| c == 'i' || c == 'u'))
                     } else {
