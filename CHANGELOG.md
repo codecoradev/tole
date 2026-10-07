@@ -49,6 +49,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (the durable record), state re-hydrates from the transcript on
   open/resume, at most one task `in_progress`; `todo_write` is Write
   (covered by `--trust internal`), `todo_read` is ReadOnly.
+### Fixed
+Pre-tag full-codebase scan gate (all MAJORs triaged valid and fixed):
+- Per-session `TodoState` — todo list no longer leaks across concurrent
+  serve/ACP sessions (#226).
+- MCP server: session-registry-first routing, unknown session id fails
+  closed, ambiguity refusal no longer bypassable (#227).
+- Child agents: argv depth guard closes quoting/`env -i`/`exec -c`/
+  substitution escapes (#228); spawn cap flock-serialized, mailbox
+  consumed flag persisted and consume lock held end-to-end (#234, #260).
+- Evals tier 2: judges require exit 0 and strip approval-banner echo (#229).
+- `git` tool: stdout capped at 20k chars with a truncated flag (#230);
+  colon pathspec magic refused in the add jail (#247).
+- Turn loop: poll steps exempt from `MAX_STEPS`, trait-driven `is_poll`
+  (#231); replay approval gate keyed to current tool risk (#249).
+- OpenAI streaming: usage/reasoning reset per response (#232).
+- `gitea` tool surfaces 4xx/5xx error bodies (#233).
+- `verify_package`: length-guarded edit-distance, bare-name typo
+  comparison (#235).
+- Hardening: storage session-id charset enforced at the boundary (#248);
+  web redirect cap is a hard error (#250); MCP result cap counts
+  separators (#251); `gh` tool probe-gated, no hardcoded repo (#254);
+  session list uses `try_lock` busy flags (#256); systemone caps keyed on
+  exact URL authority; approval URLs refuse plaintext `https://`
+  downgrade (#246); monotonic counter in approval entry ids; bounded
+  detached ACP `/models` probe; `tole mission` exits nonzero on non-done
+  statuses and refuses unsupported hook/memory flags.
+
 ## [0.6.0] — 2026-10-06
 
 ### Added
