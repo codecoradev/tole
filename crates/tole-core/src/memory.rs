@@ -88,13 +88,16 @@ const MAX_HIT_CHARS: usize = 400;
 pub fn recall(cfg: &MemoryConfig, query: &str) -> Result<Vec<RecallHit>, String> {
     let mut cmd = Command::new(&cfg.bin);
     crate::subprocess::scrub_env_for_child(&mut cmd);
+    // The user-controlled query goes AFTER `--`: a leading-hyphen prompt
+    // must be a positional, never parsed as uteke flags (#280).
     cmd.arg("recall")
-        .arg(query)
         .arg("--namespace")
         .arg(&cfg.namespace)
         .arg("--limit")
         .arg(cfg.limit.to_string())
-        .arg("--json");
+        .arg("--json")
+        .arg("--")
+        .arg(query);
     let out = run_with_timeout(&mut cmd, SUBPROCESS_TIMEOUT)?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -320,7 +323,13 @@ mod tests {
         assert_eq!(hits[0].content, "remembered fact");
         assert!((hits[0].score - 0.8).abs() < 1e-9);
         let argv = std::fs::read_to_string(&log).unwrap();
-        assert!(argv.contains("recall state machine"));
+        assert!(argv.contains("recall --namespace"));
+        assert!(argv.trim_end().ends_with("-- state machine"));
+        // #280: a leading-hyphen prompt stays a positional after `--`.
+        recall(&cfg, "--namespace evil").unwrap();
+        let argv = std::fs::read_to_string(&log).unwrap();
+        assert!(argv.trim_end().ends_with("-- --namespace evil"));
+        assert!(argv.starts_with("recall --namespace repo-tole"));
         assert!(argv.contains("--namespace repo-tole"));
         assert!(argv.contains("--limit 2"));
         assert!(argv.contains("--json"));
