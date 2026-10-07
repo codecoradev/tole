@@ -353,6 +353,24 @@ impl JsonlStorage {
         name: Option<&str>,
     ) -> Result<Self, StorageError> {
         let session_id = session_id.into();
+        // Issue #248 (rescan #145): the id is joined into a file path —
+        // the storage layer enforces the safe charset itself instead of
+        // trusting every caller to validate first (hosts already do via
+        // validate_session_id; this is the boundary backstop).
+        let id_ok = !session_id.is_empty()
+            && session_id.len() <= 64
+            && !session_id.contains('/')
+            && !session_id.contains('\\')
+            && !session_id.contains("..")
+            && session_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'));
+        if !id_ok {
+            return Err(StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid session id: {session_id:?}"),
+            )));
+        }
         let path = dir.as_ref().join(format!("{session_id}.jsonl"));
         let created_at = now_ms();
         let cwd = cwd.unwrap_or_default();
@@ -1045,6 +1063,34 @@ mod poison_tests {
     /// injection point here — chmod-based injection is ineffective
     /// because create() already holds a write-enabled fd (cora ronde-2
     /// caught the chmod variant as a false-coverage MAJOR).
+    /// Issue #248 regression: the storage boundary itself refuses ids
+    /// that could escape the sessions dir — no caller can skip the
+    /// validation by forgetting it upstream.
+    #[test]
+    fn create_named_refuses_unsafe_session_ids() {
+        let dir = std::env::temp_dir().join(format!("tole-sid-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for bad in [
+            "../../evil",
+            "/abs/path",
+            "a/b",
+            "a\\b",
+            "..",
+            "",
+            "a b",
+            "id;rm",
+        ] {
+            assert!(
+                JsonlStorage::create_named(&dir, bad, None, None, None).is_err(),
+                "must refuse: {bad:?}"
+            );
+        }
+        // The safe charset still works.
+        assert!(JsonlStorage::create_named(&dir, "s-abc123", None, None, None).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn failed_append_poisons_until_reopen() {
         let dir = std::env::temp_dir().join(format!("tole-poison-{}", std::process::id()));
