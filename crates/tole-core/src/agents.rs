@@ -676,40 +676,45 @@ impl Tool for AgentPollTool {
         // (consume-once, unless keep_mailbox). The consumed flag is
         // PERSISTED in meta.json (issue #234) so a later poll —
         // possibly from another parent process — does not resurrect a
-        // cleaned mailbox; the in-process Mutex serializes the
-        // check-and-mark within this process.
+        // cleaned mailbox. The in-process Mutex is held across the
+        // ENTIRE consume section (issue #260, rescan #155: dropping it
+        // after the read let two concurrent polls both recall+clean).
         let already = {
             let _g = self.consumed.lock();
-            meta.mailbox_consumed
+            if meta.mailbox_consumed {
+                true
+            } else {
+                let cfg = crate::memory::MemoryConfig {
+                    bin: "uteke".into(),
+                    namespace: meta.mailbox_ns.clone(),
+                    limit: 3,
+                };
+                if let Some(summary) = crate::memory::recall(&cfg, &meta.prompt)
+                    .ok()
+                    .map(|hits| {
+                        hits.iter()
+                            .map(|h| h.content.clone())
+                            .collect::<Vec<_>>()
+                            .join("\n---\n")
+                    })
+                    .filter(|s| !s.is_empty())
+                {
+                    out["summary"] = json!(summary);
+                }
+                if !meta.keep_mailbox {
+                    clean_mailbox(&meta.mailbox_ns);
+                }
+                meta.mailbox_consumed = true;
+                if let Err(e) = write_meta(&dir, &meta) {
+                    // Degrade loudly-but-softly: the summary WAS
+                    // delivered; a failed persist could let a future
+                    // poll re-recall.
+                    out["consume_persist_warning"] = json!(e);
+                }
+                false
+            }
         };
-        let cfg = crate::memory::MemoryConfig {
-            bin: "uteke".into(),
-            namespace: meta.mailbox_ns.clone(),
-            limit: 3,
-        };
-        if !already {
-            if let Some(summary) = crate::memory::recall(&cfg, &meta.prompt)
-                .ok()
-                .map(|hits| {
-                    hits.iter()
-                        .map(|h| h.content.clone())
-                        .collect::<Vec<_>>()
-                        .join("\n---\n")
-                })
-                .filter(|s| !s.is_empty())
-            {
-                out["summary"] = json!(summary);
-            }
-            if !meta.keep_mailbox {
-                clean_mailbox(&meta.mailbox_ns);
-            }
-            meta.mailbox_consumed = true;
-            if let Err(e) = write_meta(&dir, &meta) {
-                // Degrade loudly-but-softly: the summary WAS delivered;
-                // a failed persist could let a future poll re-recall.
-                out["consume_persist_warning"] = json!(e);
-            }
-        }
+        let _ = already;
         Ok(out)
     }
 }
