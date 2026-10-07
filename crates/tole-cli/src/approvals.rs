@@ -134,7 +134,15 @@ impl ApprovalQueue {
         storage_path: std::path::PathBuf,
     ) -> String {
         self.prune_expired();
-        let id = format!("apr-{:x}-{:x}", now_ms(), fingerprint as u32);
+        // Issue #255 (rescan #36): the id previously used only
+        // (millisecond timestamp, low-32 fingerprint) — two entries
+        // queued in the same millisecond with matching fingerprints
+        // collided (same tool+input queued concurrently by two
+        // sessions). A process-wide monotonic counter makes the id
+        // unique within the process regardless of timing.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let id = format!("apr-{:x}-{:x}", now_ms(), seq);
         self.entries
             .lock()
             .unwrap_or_else(|p| p.into_inner())
