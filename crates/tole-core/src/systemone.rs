@@ -44,7 +44,17 @@ pub struct BackendCaps {
 }
 
 fn caps_for(endpoint: &str) -> BackendCaps {
-    if endpoint.contains(HOSTED_HOST) {
+    // Issue #252 (rescan #90): match the URL AUTHORITY exactly, not a
+    // substring — `https://api.typesafe.ai.evil.com/` (or any URL that
+    // embeds the host in its path/query) must not inherit hosted
+    // limits. Uses ureq's http::Uri (same authority parser the web
+    // tool's SSRF guard relies on).
+    let is_hosted = endpoint
+        .parse::<ureq::http::Uri>()
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.eq_ignore_ascii_case(HOSTED_HOST)))
+        .unwrap_or(false);
+    if is_hosted {
         BackendCaps {
             max_options: 255,
             max_state_bytes: 64 * 1024,
@@ -351,6 +361,16 @@ mod tests {
     }
     fn selfhosted() -> SystemOneTool {
         SystemOneTool::new("http://127.0.0.1:1/decide", "k")
+    }
+
+    /// Issue #252 regression: the authority must match EXACTLY —
+    /// lookalike hosts and path-embedded mentions get self-hosted caps.
+    #[test]
+    fn caps_key_on_exact_authority() {
+        assert!(caps_for("https://api.typesafe.ai/v1/systemone").hosted);
+        assert!(!caps_for("https://api.typesafe.ai.evil.com/v1").hosted);
+        assert!(!caps_for("https://evil.com/?x=api.typesafe.ai").hosted);
+        assert!(!caps_for("http://127.0.0.1:1/decide").hosted);
     }
 
     #[test]
