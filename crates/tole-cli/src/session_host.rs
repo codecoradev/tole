@@ -55,6 +55,44 @@ pub struct Sessions {
 
 pub type SharedSessions = StdArc<Mutex<Sessions>>;
 
+/// Cap on the live in-memory session map, shared by every face (REST,
+/// MCP, ACP). Sessions are durable on disk (the JSONL file) — eviction
+/// drops only the in-memory handle, never the file.
+pub const MAX_SESSIONS: usize = 256;
+
+/// Every session in the map is mid-turn, so none can be evicted.
+#[derive(Debug, PartialEq, Eq)]
+pub struct AllSessionsBusy;
+
+impl Sessions {
+    /// Make room for one more session: while the map is at `max`, evict
+    /// one NON-busy session. A busy flag that is itself locked means a
+    /// turn is mid-flight on that session, so it is skipped via
+    /// `try_lock` without blocking the whole map (CodeCora scan
+    /// round-2). Returns the evicted ids so callers can prune any side
+    /// maps keyed by session id; `Err(AllSessionsBusy)` when at capacity
+    /// with nothing evictable.
+    pub fn evict_for_insert(&mut self, max: usize) -> Result<Vec<String>, AllSessionsBusy> {
+        let mut evicted = Vec::new();
+        while self.map.len() >= max {
+            let oldest = self
+                .map
+                .iter()
+                .filter(|(_, st)| matches!(st.busy.try_lock().as_deref().copied(), Ok(false)))
+                .map(|(id, _)| id.clone())
+                .next();
+            match oldest {
+                Some(id) => {
+                    self.map.remove(&id);
+                    evicted.push(id);
+                }
+                None => return Err(AllSessionsBusy),
+            }
+        }
+        Ok(evicted)
+    }
+}
+
 /// Callback publishing a plan payload to the session's client (issue
 /// #196 phase 4). ACP wires a closure sending the standard `plan`
 /// session/update (Termul's PlanPanel renders it, full-replace); the
@@ -715,5 +753,83 @@ mod plan_tests {
             &serde_json::json!({"entries": [{"content": "x", "status": "done"}]})
         )
         .is_err());
+    }
+}
+
+#[cfg(test)]
+mod eviction_tests {
+    use super::*;
+
+    struct TmpDir(PathBuf);
+    impl TmpDir {
+        fn new(tag: &str) -> Self {
+            let d = std::env::temp_dir().join(format!("tole-evict-{tag}-{}", std::process::id()));
+            std::fs::create_dir_all(&d).unwrap();
+            Self(d)
+        }
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn state(dir: &std::path::Path, name: &str, busy: bool) -> SessionState {
+        let storage = tole_core::storage::JsonlStorage::create(dir, name, None).unwrap();
+        SessionState {
+            storage: StdArc::new(Mutex::new(storage)),
+            registry: StdArc::new(tole_core::tool::ToolRegistry::new()),
+            system_prompt: None,
+            memory: None,
+            first_prompt_done: StdArc::new(Mutex::new(false)),
+            busy: StdArc::new(Mutex::new(busy)),
+            cancel: tole_core::cancel::CancelToken::default(),
+            tool_ids: StdArc::new(Mutex::new(0)),
+        }
+    }
+
+    #[test]
+    fn below_cap_evicts_nothing() {
+        let dir = TmpDir::new("below");
+        let mut s = Sessions::default();
+        s.map.insert("a".into(), state(dir.path(), "a", false));
+        assert_eq!(s.evict_for_insert(2), Ok(vec![]));
+        assert_eq!(s.map.len(), 1);
+    }
+
+    #[test]
+    fn at_cap_evicts_an_idle_session_and_reports_its_id() {
+        let dir = TmpDir::new("atcap");
+        let mut s = Sessions::default();
+        s.map.insert("busy".into(), state(dir.path(), "busy", true));
+        s.map
+            .insert("idle".into(), state(dir.path(), "idle", false));
+        let evicted = s.evict_for_insert(2).unwrap();
+        assert_eq!(evicted, vec!["idle".to_string()]);
+        assert!(s.map.contains_key("busy"), "busy session must survive");
+        assert_eq!(s.map.len(), 1);
+    }
+
+    #[test]
+    fn all_busy_at_cap_errors_and_evicts_nothing() {
+        let dir = TmpDir::new("allbusy");
+        let mut s = Sessions::default();
+        s.map.insert("a".into(), state(dir.path(), "a", true));
+        s.map.insert("b".into(), state(dir.path(), "b", true));
+        assert_eq!(s.evict_for_insert(2), Err(AllSessionsBusy));
+        assert_eq!(s.map.len(), 2);
+    }
+
+    #[test]
+    fn locked_busy_flag_counts_as_busy() {
+        let dir = TmpDir::new("locked");
+        let mut s = Sessions::default();
+        s.map.insert("a".into(), state(dir.path(), "a", false));
+        let flag = s.map["a"].busy.clone();
+        let _held = flag.lock().unwrap();
+        assert_eq!(s.evict_for_insert(1), Err(AllSessionsBusy));
     }
 }

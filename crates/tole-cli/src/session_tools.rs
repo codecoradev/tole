@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use crate::session_host::{
     lock_sessions, new_session_id, open_session, run_session_turn, SessionState, Sessions,
-    SharedSessions,
+    SharedSessions, MAX_SESSIONS,
 };
 use tole_core::memory::MemoryConfig;
 use tole_core::tool::{Risk, Tool};
@@ -166,26 +166,11 @@ impl Tool for SessionNewTool {
             // durable on disk; eviction drops only the in-memory handle.
             // Busy sessions are never evicted; all-busy at capacity is
             // a clear error.
-            const MAX_SESSIONS: usize = 256;
             let mut sessions = lock_sessions(&self.0.sessions);
-            while sessions.map.len() >= MAX_SESSIONS {
-                let oldest = sessions
-                    .map
-                    .iter()
-                    .filter(|(_, st)| matches!(st.busy.try_lock().as_deref().copied(), Ok(false)))
-                    .map(|(id, _)| id.clone())
-                    .next();
-                match oldest {
-                    Some(id) => {
-                        sessions.map.remove(&id);
-                    }
-                    None => {
-                        return Err(
-                            "session map at capacity and all sessions busy — close one first"
-                                .into(),
-                        )
-                    }
-                }
+            if sessions.evict_for_insert(MAX_SESSIONS).is_err() {
+                return Err(
+                    "session map at capacity and all sessions busy — close one first".into(),
+                );
             }
             sessions.map.insert(session_id.clone(), state);
         }

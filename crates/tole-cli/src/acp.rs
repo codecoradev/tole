@@ -35,6 +35,7 @@ use std::time::Duration;
 use tole_cli::approver::{InteractiveApprover, PromptFn};
 use tole_cli::session_host::{
     lock_sessions, new_session_id, open_session, run_session_turn, validate_session_id, Sessions,
+    MAX_SESSIONS,
 };
 use tole_core::storage::Storage;
 
@@ -854,6 +855,31 @@ pub fn run_acp(
                         // else the first advertised entry. Read BEFORE
                         // the state moves into the session map.
                         let model_override = session_model_override(&state.storage);
+                        // Cap the live map like serve/MCP, and prune the
+                        // approval state of every evicted session so the
+                        // parallel map cannot grow without bound (#299).
+                        // Re-opening an existing id replaces in place and
+                        // needs no room.
+                        if !sessions.map.contains_key(&session_id) {
+                            match sessions.evict_for_insert(MAX_SESSIONS) {
+                                Ok(evicted) => {
+                                    let mut approvals =
+                                        approval_states.lock().expect("approval map");
+                                    for old in &evicted {
+                                        approvals.remove(old);
+                                    }
+                                }
+                                Err(_) => {
+                                    drop(sessions);
+                                    reply_error(
+                                        &conn,
+                                        id,
+                                        "session map at capacity and all sessions busy — close one first",
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
                         sessions.map.insert(session_id.clone(), state);
                         let current = model_override
                             .or_else(|| env_model.clone())

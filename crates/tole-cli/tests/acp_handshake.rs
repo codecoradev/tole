@@ -199,3 +199,54 @@ fn acp_rejects_traversal_session_ids() {
     let r = acp.wait_response(2, Duration::from_secs(20));
     assert!(r.get("error").is_some(), "traversal id must be an error");
 }
+
+/// #299: the live session map is capped (MAX_SESSIONS = 256, like serve
+/// and MCP) and an evicted session's approval state is pruned with it.
+/// Opening 257 sessions must all succeed; exactly one (the evicted one)
+/// loses its approval entry, which `set_config_option` reports as an
+/// unknown session. Before the fix none were evicted or pruned.
+#[test]
+fn acp_session_cap_evicts_and_prunes_approval_state() {
+    const CAP: u64 = 256;
+    let mut acp = AcpProcess::spawn();
+    let cwd = temp_cwd("cap");
+
+    acp.send(&json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {"protocolVersion": 1, "clientCapabilities": {}}
+    }));
+    let _ = acp.wait_response(1, Duration::from_secs(20));
+
+    let mut ids = Vec::new();
+    for n in 0..=CAP {
+        let rid = 100 + n;
+        acp.send(&json!({
+            "jsonrpc": "2.0", "id": rid, "method": "session/new",
+            "params": {"cwd": cwd.to_string_lossy()}
+        }));
+        let r = acp.wait_response(rid, Duration::from_secs(30));
+        ids.push(
+            r["result"]["sessionId"]
+                .as_str()
+                .unwrap_or_else(|| panic!("session/new {n} failed: {r}"))
+                .to_string(),
+        );
+    }
+
+    let mut unknown = 0;
+    for (n, sid) in ids.iter().enumerate() {
+        let rid = 1000 + n as u64;
+        acp.send(&json!({
+            "jsonrpc": "2.0", "id": rid, "method": "session/set_config_option",
+            "params": {"sessionId": sid, "configId": "approval", "value": "ask"}
+        }));
+        if acp
+            .wait_response(rid, Duration::from_secs(30))
+            .get("error")
+            .is_some()
+        {
+            unknown += 1;
+        }
+    }
+    assert_eq!(unknown, 1, "exactly one session evicted past the cap");
+}
