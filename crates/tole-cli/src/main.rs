@@ -629,6 +629,9 @@ fn dispatch(cli: Cli) -> Result<()> {
                      settle through the mission loop, not the turn-end hook path)"
                 );
             }
+            // #[cfg]-mirrored like the HostConfig field itself: without
+            // shell-tools the field is the unit type (cora round 1).
+            #[cfg(feature = "shell-tools")]
             if host.memory.is_some() {
                 anyhow::bail!(
                     "--memory is not supported by `tole run mission` (the mission loop does \
