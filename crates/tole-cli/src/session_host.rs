@@ -162,14 +162,7 @@ pub fn lock_sessions(sessions: &SharedSessions) -> std::sync::MutexGuard<'_, Ses
 /// touches a path (CodeCora scan finding: `../` or absolute ids would
 /// escape the sessions dir via Path::join).
 pub fn validate_session_id(id: &str) -> Option<String> {
-    let ok = !id.is_empty()
-        && id.len() <= 64
-        && !id.contains('/')
-        && !id.contains('\\')
-        && !id.contains("..")
-        && id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'));
+    let ok = tole_core::storage::is_valid_session_id(id);
     if ok {
         Some(id.to_string())
     } else {
