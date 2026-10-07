@@ -174,10 +174,22 @@ pub fn check_child_agent_argv(argv: &[String]) -> Result<(), String> {
                     // env-clearing. Short clusters use containment
                     // (`-vi`, `-iu` …), not exclusivity — same for
                     // exec's `-cl` (round 5 #2).
-                    let env_clear = (saw_env || any_subst)
-                        && (raw_subst
+                    // env context: literal `env` seen OR substitution
+                    // anywhere (the keyword may be assembled at
+                    // runtime). Long flags only wipe when the LITERAL
+                    // env token was seen (CI cora round: under
+                    // any_subst alone, `rm -- "$f"` matched the
+                    // long-flag rule); substitution-built short
+                    // flags/raw segments still refuse under any_subst.
+                    let env_clear = if saw_env {
+                        raw_subst
                             || tok.starts_with("--")
-                            || body.chars().any(|c| c == 'i' || c == 'u'));
+                            || body.chars().any(|c| c == 'i' || c == 'u')
+                    } else if any_subst {
+                        raw_subst || body.chars().all(|c| c == 'i' || c == 'u')
+                    } else {
+                        false
+                    };
                     let exec_clear = saw_exec
                         && !tok.starts_with("--")
                         && (raw_subst || body.chars().any(|c| c == 'c'));
