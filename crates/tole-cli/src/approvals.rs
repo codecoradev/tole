@@ -317,11 +317,22 @@ fn http_call(
 ) -> anyhow::Result<(u16, Value)> {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpStream;
+    // Issue #246 (rescan #35): the raw-TcpStream transport is plaintext
+    // by design (loopback approval daemon, Connection: close). An
+    // https:// URL can NEVER be served correctly over it — stripping
+    // the scheme silently sent the Bearer token in cleartext. Loud
+    // refusal; no downgrade.
+    if url.starts_with("https://") {
+        return Err(anyhow::anyhow!(
+            "approval endpoint {url} uses https:// but the approval HTTP client is a plaintext \
+             loopback-only transport — serve the approval daemon over http:// (the bearer token \
+             would otherwise cross the wire unencrypted)"
+        ));
+    }
     // url → host:port (+ optional base path is not supported; the serve
     // face is root-mounted).
     let authority = url
         .trim_start_matches("http://")
-        .trim_start_matches("https://")
         .trim_end_matches('/')
         .to_string();
     let mut stream =
@@ -403,5 +414,21 @@ pub fn cli(action: &str, id: Option<&str>, url: &str, token: &str) -> anyhow::Re
             Ok(())
         }
         other => anyhow::bail!("unknown action {other:?} — use list | allow | deny"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Issue #246 regression: an https:// approval URL is loudly
+    /// refused — never silently downgraded to plaintext (the Bearer
+    /// token would cross the wire unencrypted).
+    #[test]
+    fn https_approval_url_is_refused() {
+        let err = http_call("https://127.0.0.1:9/approve", "tok", "GET", "/p", None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("https://"), "{msg}");
+        assert!(msg.contains("plaintext"), "{msg}");
     }
 }
