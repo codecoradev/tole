@@ -233,10 +233,27 @@ impl Tool for GitTool {
             return Err(format!("git exited {}: {}", out.status, snippet));
         }
         let stdout = String::from_utf8_lossy(&out.stdout);
+        let (body, truncated) = cap_stdout(stdout.trim());
         Ok(json!({
-            "stdout": stdout.trim(),
+            "stdout": body,
+            "truncated": truncated,
         }))
     }
+}
+
+/// Stdout cap (issue #230): a `git diff` on a large working set can
+/// produce megabytes — that floods the model context. Same policy as
+/// the web tools' 20 000-char result cap: keep the head, flag the cut.
+const STDOUT_CAP_CHARS: usize = 20_000;
+
+fn cap_stdout(s: &str) -> (String, bool) {
+    let count = s.chars().count();
+    if count <= STDOUT_CAP_CHARS {
+        return (s.to_string(), false);
+    }
+    let mut out: String = s.chars().take(STDOUT_CAP_CHARS).collect();
+    out.push('…');
+    (out, true)
 }
 
 /// Minimal shlex-style quoting for the audit string (same rules as gh.rs).
@@ -405,6 +422,44 @@ mod tests {
         assert_eq!(out["stdout"], json!("ok"));
         let recorded = std::fs::read_to_string(&log).unwrap();
         assert_eq!(recorded.trim(), "commit -m feat: x");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #230 regression: oversized git stdout is capped and flagged
+    /// instead of flooding the model context.
+    #[test]
+    fn stdout_over_cap_is_truncated_with_flag() {
+        let big = "x".repeat(crate::git::STDOUT_CAP_CHARS + 123);
+        let (body, truncated) = cap_stdout(&big);
+        assert!(truncated);
+        assert_eq!(body.chars().count(), crate::git::STDOUT_CAP_CHARS + 1); // + ellipsis
+        assert!(body.ends_with('…'));
+
+        let small = "short output";
+        let (body, truncated) = cap_stdout(small);
+        assert!(!truncated);
+        assert_eq!(body, small);
+    }
+
+    #[test]
+    fn fake_git_binary_truncates_large_output_end_to_end() {
+        let dir = std::env::temp_dir().join(format!("tole-git-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("git");
+        std::fs::write(&bin, "#!/bin/sh\nprintf 'y%.0s' $(seq 1 25000)\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let t = GitTool::new().with_bin(&bin);
+        let out = t.execute(json!({"op":"status"})).unwrap();
+        assert_eq!(out["truncated"], json!(true));
+        assert_eq!(
+            out["stdout"].as_str().unwrap().chars().count(),
+            crate::git::STDOUT_CAP_CHARS + 1
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
