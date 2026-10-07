@@ -62,23 +62,173 @@ const DEFAULT_TIMEOUT_SECS: u64 = 30 * 60;
 pub fn check_child_agent_argv(argv: &[String]) -> Result<(), String> {
     const ERR: &str = "child agents may not spawn or reconfigure the tole binary — the agent \
          tree is capped at one level by design (issue #171)";
-    if argv.iter().any(|a| a.contains("TOLE_AGENT_DEPTH")) {
+    if argv
+        .iter()
+        // Normalize the same way the token scan below does (CI cora
+        // round on #245: `TOLE_AGENT_DEPT""H` split the marker across
+        // quote removal; round 5: `${V}` splits it via expansion —
+        // both normalize to the literal marker here).
+        .any(|a| {
+            let stripped: String = a
+                .chars()
+                .filter(|c| !matches!(c, '"' | '\'' | '\\' | '$' | '{' | '}'))
+                .collect();
+            stripped.contains("TOLE_AGENT_DEPTH")
+        })
+    {
         return Err(ERR.to_string());
     }
-    // Word-level detection across EVERY element: wrappers smuggle the
-    // invocation inside one string (`bash -c "… exec tole run"`), so a
-    // basename check on argv[0] alone is not enough. Segments split on
-    // whitespace and shell/path separators; compound fleet names
-    // (`tole-agents`, `tole-jobs`) survive intact and stay allowed.
-    for arg in argv {
-        let segments = arg.split(|c: char| c.is_whitespace() || matches!(c, ';' | '&' | '|' | '/'));
-        for seg in segments {
-            let seg = seg.trim_end_matches(".exe");
-            if seg == "tole" || seg == "tole-cli" {
-                return Err(ERR.to_string());
+    // Issue #228 (scan #123): ONE normalized segmentation pass. Every
+    // argument is split on whitespace and shell/path/assignment
+    // separators (`; & | / =`), then quote/substitution punctuation is
+    // stripped — the SAME normalization for the env-clear detection and
+    // the binary detection (cora review round 1: matching bare `env`
+    // while the binary check normalized paths/quotes let
+    // `/usr/bin/env -i …` or `"env" -i` revive the depth-marker wipe).
+    // - `env` invocation flags `-i` / `-u` / `--ignore-environment`
+    //   (incl. compound shorts like `-iu`) are refused outright: only
+    //   an environment-clearing env can strip TOLE_AGENT_DEPTH.
+    // - The tole binary is matched AFTER stripping, so `tole"`,
+    //   `"tole"`, `t=tole`, `$(... tole)` no longer slip the exact
+    //   match; compound fleet names (`tole-agents`, `tole-jobs`) stay
+    //   allowed (the hyphen is not a separator).
+    {
+        // Contexts CROSS argv elements and are NEVER cleared mid-argv
+        // (cora review rounds 3+6): `$VAR` indirection and chained
+        // assignments (`e=env; f=-i; $e $f …`) can smuggle both the
+        // env/exec token and its flag through bare-name tokens, so any
+        // clearing rule was evadable. The cost is a small false-refusal
+        // window (`grep -i` after an env mention in the SAME argv),
+        // accepted for the depth invariant; the structural fix (depth
+        // via a marker file the child cannot env-clear) closes the
+        // class entirely.
+        // Substitution punctuation widens the ENV context (the env
+        // keyword itself may be assembled at runtime:
+        // `$(printf e)$(printf nv) -i …`, CI cora round on #245) — but
+        // ONLY the env side. The earlier version also widened exec and
+        // refused every `bash -c "echo $HOME"` (the `-c` flag matched
+        // exec's 'c' rule). The exec-keyword-via-substitution case is
+        // undecidable at the token level; it is covered by the guard
+        // boundary below (overt, auditable) and the structural
+        // marker-file follow-up.
+        let any_subst = argv
+            .iter()
+            .any(|a| a.contains('$') || a.contains('`') || a.contains('('));
+        let mut saw_env = false;
+        let mut saw_exec = false;
+        for arg in argv {
+            let segments =
+                arg.split(|c: char| c.is_whitespace() || matches!(c, ';' | '&' | '|' | '/' | '='));
+            for seg in segments {
+                // Track whether the RAW segment carried substitution
+                // punctuation: a wipe flag or keyword can be assembled
+                // at runtime (`env -$(echo i)`, `env $(printf '\55')`
+                // — rounds 7+10) and cannot be statically cleared.
+                let raw_subst = seg.contains('$')
+                    || seg.contains('`')
+                    || seg.contains('(')
+                    || seg.contains(')');
+                // Strip QUOTES/backslashes/substitution FIRST (CI cora
+                // round 2 on #245: `exec "tole.exe"` — trimming `.exe`
+                // before quote-stripping was a no-op while the trailing
+                // quote hid it), THEN the `.exe` suffix.
+                let tok: String = seg
+                    .chars()
+                    .filter(|c| !matches!(c, '"' | '\'' | '`' | '$' | '(' | ')' | '{' | '}' | '\\'))
+                    .collect();
+                let tok = tok.trim_end_matches(".exe").to_string();
+                if tok == "env" {
+                    saw_env = true;
+                    saw_exec = false;
+                    continue;
+                }
+                if tok == "exec" {
+                    saw_exec = true;
+                    saw_env = false;
+                    continue;
+                }
+                if tok.is_empty() {
+                    // Artifact of adjacent separators (`env | grep`):
+                    // carries no command semantics — must NOT clear the
+                    // wipe context (cora round-4 benign case).
+                    continue;
+                }
+                if tok == "tole" || tok == "tole-cli" {
+                    return Err(ERR.to_string());
+                }
+                if (saw_env || saw_exec) && raw_subst {
+                    // ANY substitution-adjacent segment in a wipe
+                    // context is refused (cora review round 10): the
+                    // flag itself may be built without a dash prefix
+                    // (`env $(printf '\55') sh` = `env -i sh`).
+                    return Err(ERR.to_string());
+                }
+                if let Some(body) = tok.strip_prefix('-') {
+                    // A dash-token whose raw form carried substitution
+                    // punctuation is refused outright in env/exec
+                    // context (round 7): `env -$(echo i)` builds the
+                    // wipe flag at runtime. Long flag after env: GNU
+                    // getopt_long accepts unambiguous abbreviations
+                    // (`--ignore-env` wipes exactly like
+                    // `--ignore-environment`, cora review round 5), so
+                    // ANY long flag in env context is treated as
+                    // env-clearing. Short clusters use containment
+                    // (`-vi`, `-iu` …), not exclusivity — same for
+                    // exec's `-cl` (round 5 #2).
+                    // env context: literal `env` seen OR substitution
+                    // anywhere (the keyword may be assembled at
+                    // runtime). Under a literal env: any long flag
+                    // (GNU abbreviation, round 5) or an i/u-containing
+                    // short cluster. Under any_subst alone: the named
+                    // env-clearing long flags, any i/u-containing
+                    // short cluster, or a substitution-built segment
+                    // (CI cora round 4: `--ignore-environment` built
+                    // next to an assembled keyword; bare `--` in
+                    // `rm -- "$f"` stays benign — its body has no
+                    // i/u).
+                    let env_clear = if saw_env {
+                        raw_subst
+                            || tok.starts_with("--")
+                            || body.chars().any(|c| c == 'i' || c == 'u')
+                    } else if any_subst {
+                        raw_subst
+                            // Long-form env-clearing flags (incl. GNU
+                            // abbreviations: `--i`, `--ignore-env` —
+                            // CI cora round 5 on #245). Any `--x` flag
+                            // next to an assembled env keyword is
+                            // refused (undecidable which abbreviation)
+                            // EXCEPT the bare `--` end-of-options
+                            // marker (`rm -- "$f"`): its strip-prefix
+                            // body is the literal "-", not empty.
+                            || (tok.starts_with("--") && tok != "--")
+                            || (!tok.starts_with("--")
+                                && body.chars().any(|c| c == 'i' || c == 'u'))
+                    } else {
+                        false
+                    };
+                    let exec_clear = saw_exec
+                        && !tok.starts_with("--")
+                        && (raw_subst || body.chars().any(|c| c == 'c'));
+                    if env_clear || exec_clear {
+                        return Err(ERR.to_string());
+                    }
+                }
             }
         }
     }
+    // Guard boundary (documented, issue #228): this is a TOKEN-level
+    // check. Two classes are explicitly OUT of scope here:
+    // 1. An interpreter script that clears the environment itself
+    //    (`python -c 'os.environ.clear(); os.execv(…)'`) — by the
+    //    module contract that is OVERT hostile action, fully visible
+    //    in the audit log, not silent budget multiplication.
+    // 2. Runtime-ASSEMBLED identifiers (`unset TOLE_AGE${V}NT_DEPTH`,
+    //    `e=e; f=xec; $e$f …`) — undecidable at the token level: any
+    //    static rule either misses a construction or refuses ordinary
+    //    variable use. The structural closure is the tracked
+    //    follow-up: propagate depth via a marker FILE the child
+    //    cannot env-clear, making every one of these constructions
+    //    inert.
     Ok(())
 }
 
@@ -808,6 +958,163 @@ mod tests {
             "tole-jobs".into(),
         ];
         assert!(check_child_agent_argv(&ok).is_ok());
+        // No env/exec token in the argv → no wipe context at all.
+        let benign: Vec<Vec<String>> = vec![
+            vec!["cp".into(), "-u".into(), "a".into(), "b".into()],
+            vec!["bash".into(), "-c".into(), "ls -i notes".into()],
+            // Ordinary variable use is NOT a wipe (CI cora round on
+            // #245: the removed any_subst widening refused this).
+            vec!["bash".into(), "-c".into(), "echo $HOME".into()],
+            vec!["bash".into(), "-c".into(), "rm -- \"$f\"".into()],
+            vec!["bash".into(), "-c".into(), "grep -c x $(ls)".into()],
+        ];
+        for v in &benign {
+            assert!(
+                check_child_agent_argv(v).is_ok(),
+                "benign command must pass: {v:?}"
+            );
+        }
+        // Quoted .exe (CI cora round 2 on #245): the suffix trim must
+        // run AFTER quote-stripping.
+        let quoted_exe: Vec<String> =
+            vec!["bash".into(), "-c".into(), "exec \"tole.exe\" run".into()];
+        assert!(check_child_agent_argv(&quoted_exe).is_err());
+        // Documented over-block (issue #228 trade): a short i/u/c flag
+        // AFTER an env/exec token in the SAME argv is refused even when
+        // it is not a wipe (`grep -i`) — the never-clear context is the
+        // only sound token-level rule against indirection smuggling.
+        let over: Vec<String> = vec!["bash".into(), "-c".into(), "env | grep -i PATH".into()];
+        assert!(check_child_agent_argv(&over).is_err());
+        // Known token-level bypasses (issue #228 guard boundary) —
+        // pinned as OK-here assertions: the structural marker-file fix
+        // flips these to refused. Runtime-assembled identifiers are
+        // undecidable at the token level; refusing them would break
+        // ordinary variable use.
+        for known_bypass in [
+            vec![
+                "bash",
+                "-c",
+                "V=; unset TOLE_AGE${V}NT_DEPTH; p=to; \"$p\"le run",
+            ],
+            vec![
+                "bash",
+                "-c",
+                "e=e; f=xec; p=/usr/local/bin/to; $e$f -c \"$p\"le run mission",
+            ],
+        ] {
+            let owned: Vec<String> = known_bypass.iter().map(|s| s.to_string()).collect();
+            assert!(
+                check_child_agent_argv(&owned).is_ok(),
+                "documented token-level bypass changed behavior — update the guard: {known_bypass:?}"
+            );
+        }
+    }
+
+    /// Issue #228 regression (scan #123): quoting/substitution/`env -i`
+    /// bypasses are refused. The concrete exploit from the scan —
+    /// `env -i /bin/bash -c 'p=/usr/local/bin/to; exec "$p"le run
+    /// mission'` — must NOT pass the guard.
+    #[test]
+    fn child_argv_refuses_quoting_substitution_and_env_clear() {
+        for argv in [
+            // `env -i` wipes the depth marker entirely.
+            vec!["env", "-i", "/bin/bash", "-c", "tole run mission"],
+            vec!["env", "--ignore-environment", "tole", "run"],
+            // GNU abbreviation + mixed short cluster (cora round 5).
+            vec!["env", "--ignore-env", "bash", "-c", "tole run"],
+            vec!["env", "-vi", "tole", "run"],
+            // Substitution-built env keyword (CI cora round on #245):
+            // `$(printf e)$(printf nv)` expands to `env`; any_subst
+            // arms the env context so the `-i` is refused.
+            vec![
+                "bash",
+                "-c",
+                "p=/usr/local/bin/to; $(printf e)$(printf nv) -i \"$p\"le run mission",
+            ],
+            // Quote-split depth marker (CI cora round 2 on #245) —
+            // statically decodable: stripping quotes yields the literal
+            // marker. (The `${V}` variant is NOT statically decodable —
+            // documented in the guard boundary below.)
+            vec![
+                "bash",
+                "-c",
+                "unset TOLE_AGENT_DEPT\"\"H; p=/usr/local/bin/to; \"$p\"le run mission",
+            ],
+            // Assembled env keyword with abbreviated long flag (CI cora
+            // round 5 on #245): `--i` = `--ignore-environment`.
+            vec![
+                "bash",
+                "-c",
+                "p=to; $(printf e)$(printf nv) --i \"$p\"le run mission",
+            ],
+            // Path-qualified / quoted env (cora review round 1 on #228).
+            vec!["/usr/bin/env", "-i", "tole", "run"],
+            vec!["\"env\"", "-i", "tole", "run"],
+            vec!["env", "-iu", "TOLE_AGENT_DEPTH", "tole", "run"],
+            // env-clear hidden INSIDE a -c script string.
+            vec!["bash", "-c", "env -i tole run mission"],
+            vec!["sh", "-c", "env --ignore-environment tole run"],
+            // Variable indirection, 2-hop (`f=-i` then `$e $f`) —
+            // cora review round 6 on #228: context is never cleared
+            // mid-argv, so the smuggled flag is still caught.
+            vec!["bash", "-c", "e=env; f=-i; $e $f bash -c 'tole run'"],
+            // Quoting / adjacent punctuation around the binary name.
+            vec!["bash", "-c", "exec \"tole\" run"],
+            vec!["sh", "-c", "tole) run"],
+            vec!["bash", "-c", "$(... command -v tole) run mission"],
+            // Assignment-smuggled binary: `t=tole` is caught directly
+            // ('=' splits the assignment).
+            vec!["bash", "-c", "t=tole; exec $t run"],
+            // Cross-element `env -i` (cora review round 4, CRITICAL:
+            // the per-element reset skipped the flag in separate argv
+            // elements) — the scan's own exploit shape, no literal
+            // `tole` token anywhere.
+            vec![
+                "env",
+                "-i",
+                "/bin/bash",
+                "-c",
+                "p=/usr/local/bin/to; exec \"$p\"le run mission",
+            ],
+            // Benign flag reuse must NOT be refused (round 4 #2) —
+            // asserted ok below, after the refusal loop.
+            // `exec -c` = empty environment (bash/ksh) — the second
+            // wipe path (cora review round 2 on #228).
+            vec![
+                "bash",
+                "-c",
+                "p=/usr/local/bin/to; exec -c \"$p\"le run mission",
+            ],
+            vec!["bash", "-c", "exec -c tole run"],
+            // NOTE (issue #228): constructed-name concatenation like
+            // `p=/usr/local/bin/to; exec "$p"le run` is undecidable at
+            // the argv-token level, but it is NOT a bypass anymore: it
+            // inherits TOLE_AGENT_DEPTH=1 and every environment-clearing
+            // escape (`env -i/-u/--ignore-environment`, `exec -c`) is
+            // refused above, so the spawned tole starts childed — agent
+            // tools structurally absent.
+            // Backslash separator trick.
+            vec!["bash", "-c", "\\tole run"],
+            // Substitution-built env keyword (cora CI round on #245 —
+            // REVERTED later the same PR: `$(echo e)$(echo nv)` needs
+            // `saw_env` to catch the following `-i`, and it does: `env`
+            // or not, `-i` after a substitution-adjacent segment in env
+            // context is refused via raw_subst. The any_subst widening
+            // itself was removed as over-broad (blocked `echo $HOME`).
+            // Substitution-built flag (cora review round 7 on #228):
+            // `env -$(echo i)` constructs the wipe flag at runtime.
+            vec![
+                "bash",
+                "-c",
+                "env -$(echo i) bash -c 'p=/usr/local/bin/to; exec \"$p\"le run'",
+            ],
+        ] {
+            let owned: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+            assert!(
+                check_child_agent_argv(&owned).is_err(),
+                "must refuse: {argv:?}"
+            );
+        }
     }
 
     /// CodeCora PR #174 round 1: a leading-dash prompt must reach the
