@@ -245,6 +245,14 @@ fn agent() -> ureq::Agent {
         .new_agent()
 }
 
+/// A redirect hop may only land on http(s). `join_redirect` passes any
+/// RFC 3986 absolute reference through verbatim, so the fetch loop gates
+/// the joined URL here (file:/ftp:/gopher: Locations never reach the
+/// fetcher).
+fn redirect_scheme_allowed(url: &str) -> bool {
+    url.starts_with("http://") || url.starts_with("https://")
+}
+
 /// SSRF guard (cora MAJOR on #215): resolve the host and refuse
 /// loopback / link-local (cloud metadata!) / private / unspecified
 /// ranges. `TOLE_WEB_ALLOW_PRIVATE=1` opts out for local development
@@ -474,6 +482,9 @@ impl Tool for WebFetchTool {
                 .map(str::to_string)
                 .ok_or_else(|| format!("web_fetch: {status} redirect without Location"))?;
             url = join_redirect(&url, &location);
+            if !redirect_scheme_allowed(&url) {
+                return Err("web_fetch: redirect to a non-http(s) scheme — refused".into());
+            }
             if https_only && !url.starts_with("https://") {
                 return Err("web_fetch: redirect would downgrade https to http — refused".into());
             }
@@ -622,6 +633,28 @@ mod tests {
     use super::join_redirect;
 
     /// #281: RFC 3986 §5.4 reference resolution against the current hop.
+    #[test]
+    fn redirect_gate_refuses_non_http_schemes() {
+        use super::redirect_scheme_allowed;
+        for loc in [
+            "file:///etc/passwd",
+            "ftp://h.example/x",
+            "gopher://h.example/",
+            "javascript:alert(1)",
+        ] {
+            let joined = join_redirect("https://h.example/a", loc);
+            assert!(!redirect_scheme_allowed(&joined), "{loc}");
+        }
+        assert!(redirect_scheme_allowed(&join_redirect(
+            "https://h.example/a",
+            "/b"
+        )));
+        assert!(redirect_scheme_allowed(&join_redirect(
+            "http://h.example/a",
+            "https://x.example/"
+        )));
+    }
+
     #[test]
     fn join_redirect_resolves_per_rfc3986() {
         let b = "https://h.example/a/b/c?q=1";
