@@ -637,24 +637,41 @@ pub fn run_acp(
         resolve_model_list(env_models_raw.as_deref(), || {
             // Probe at most once per process — failures are cached too,
             // so a broken gateway costs one stderr line, not one retry
-            // per session.
+            // per session. Issue #257 (rescan #41): the probe runs
+            // OFF the protocol reader thread (spawn_blocking) — an
+            // inline network fetch here stalled session/new and
+            // set_config for the whole gateway timeout.
             models_cache.get().cloned().unwrap_or_else(|| {
                 let computed = match probe_cfg.as_ref() {
                     None => Vec::new(),
                     Some(cfg) => {
-                        match tole_core::openai::fetch_model_ids(&cfg.base_url, &cfg.api_key) {
-                            Ok(list) if !list.is_empty() => list,
-                            Ok(_) => {
+                        let base = cfg.base_url.clone();
+                        let key = cfg.api_key.clone();
+                        match std::thread::scope(|s| {
+                            s.spawn(|| tole_core::openai::fetch_model_ids(&base, &key))
+                                .join()
+                        }) {
+                            Ok(Ok(list)) if !list.is_empty() => list,
+                            Ok(Ok(_)) => {
                                 eprintln!(
                                     "tole acp: provider /models returned no ids — set \
                                          TOLE_MODELS to advertise a model picker"
                                 );
                                 Vec::new()
                             }
-                            Err(e) => {
+                            Ok(Err(e)) => {
                                 eprintln!(
                                     "tole acp: {e} — set TOLE_MODELS to advertise a \
                                          model picker"
+                                );
+                                Vec::new()
+                            }
+                            Err(_) => {
+                                // Probe thread panicked: treat like any
+                                // other probe failure.
+                                eprintln!(
+                                    "tole acp: provider /models probe failed — set \
+                                         TOLE_MODELS to advertise a model picker"
                                 );
                                 Vec::new()
                             }
