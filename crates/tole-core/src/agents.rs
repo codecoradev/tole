@@ -66,11 +66,12 @@ pub fn check_child_agent_argv(argv: &[String]) -> Result<(), String> {
         .iter()
         // Normalize the same way the token scan below does (CI cora
         // round on #245: `TOLE_AGENT_DEPT""H` split the marker across
-        // quote removal and dodged the raw substring check).
+        // quote removal; round 5: `${V}` splits it via expansion —
+        // both normalize to the literal marker here).
         .any(|a| {
             let stripped: String = a
                 .chars()
-                .filter(|c| !matches!(c, '"' | '\'' | '\\'))
+                .filter(|c| !matches!(c, '"' | '\'' | '\\' | '$' | '{' | '}'))
                 .collect();
             stripped.contains("TOLE_AGENT_DEPTH")
         })
@@ -191,8 +192,13 @@ pub fn check_child_agent_argv(argv: &[String]) -> Result<(), String> {
                             || body.chars().any(|c| c == 'i' || c == 'u')
                     } else if any_subst {
                         raw_subst
-                            || tok.starts_with("--ignore-environment")
-                            || tok.starts_with("--unset")
+                            // Long-form env-clearing flags (incl. GNU
+                            // abbreviations: `--i`, `--ignore-env` —
+                            // CI cora round 5 on #245). Any `--x` flag
+                            // next to an assembled env keyword is
+                            // refused (undecidable which abbreviation);
+                            // short clusters via i/u containment.
+                            || tok.starts_with("--")
                             || (!tok.starts_with("--")
                                 && body.chars().any(|c| c == 'i' || c == 'u'))
                     } else {
@@ -989,11 +995,25 @@ mod tests {
                 "-c",
                 "p=/usr/local/bin/to; $(printf e)$(printf nv) -i \"$p\"le run mission",
             ],
-            // Quote-split depth marker (CI cora round 2 on #245).
+            // Quote-split depth marker (CI cora round 2 on #245) and
+            // the ${V} expansion variant (round 5) — both normalize to
+            // the literal marker in the pre-check.
             vec![
                 "bash",
                 "-c",
                 "unset TOLE_AGENT_DEPT\"\"H; p=/usr/local/bin/to; \"$p\"le run mission",
+            ],
+            vec![
+                "bash",
+                "-c",
+                "V=; unset TOLE_AGE${V}NT_DEPTH; p=to; \"$p\"le run",
+            ],
+            // Assembled env keyword with abbreviated long flag (CI cora
+            // round 5 on #245): `--i` = `--ignore-environment`.
+            vec![
+                "bash",
+                "-c",
+                "p=to; $(printf e)$(printf nv) --i \"$p\"le run mission",
             ],
             // Path-qualified / quoted env (cora review round 1 on #228).
             vec!["/usr/bin/env", "-i", "tole", "run"],
