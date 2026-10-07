@@ -540,6 +540,10 @@ impl Tool for AgentPollTool {
         Risk::ReadOnly
     }
 
+    fn is_poll(&self) -> bool {
+        true
+    }
+
     fn describe(&self, input: &Value) -> String {
         let id = input
             .get("agent")

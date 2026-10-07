@@ -93,6 +93,10 @@ impl Tool for JobPollTool {
         Risk::ReadOnly
     }
 
+    fn is_poll(&self) -> bool {
+        true
+    }
+
     fn describe(&self, input: &Value) -> String {
         let job = input
             .get("job")
