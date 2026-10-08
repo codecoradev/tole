@@ -299,7 +299,9 @@ impl ToolRegistry {
             tool: name,
             risk: t.risk(),
             input,
-            description: t.describe(input),
+            // Single fan-out point (#327): neutralize control/bidi/separator
+            // chars before any approval surface sees the description.
+            description: crate::sanitize::sanitize_one_line(&t.describe(input)),
         };
         self.approver.as_ref().map(|a| a.decide(&req))
     }
@@ -354,6 +356,61 @@ mod tests {
         fn interactive(&self) -> bool {
             true
         }
+    }
+
+    /// Write tool whose `describe` echoes a model-controlled string.
+    struct EchoDescribe;
+
+    impl Tool for EchoDescribe {
+        fn name(&self) -> &str {
+            "echo_describe"
+        }
+        fn risk(&self) -> Risk {
+            Risk::Write
+        }
+        fn describe(&self, input: &Value) -> String {
+            format!("start job: {}", input["cmd"].as_str().unwrap_or(""))
+        }
+        fn execute(&self, _: Value) -> Result<Value, String> {
+            Ok(json!({}))
+        }
+    }
+
+    /// Records every description it is asked to decide on.
+    struct Recording(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl crate::approval::Approver for Recording {
+        fn decide(&self, req: &crate::approval::ToolRequest<'_>) -> crate::approval::Verdict {
+            self.0.lock().unwrap().push(req.description.clone());
+            crate::approval::Verdict::Deny
+        }
+        fn interactive(&self) -> bool {
+            true
+        }
+    }
+
+    fn decide_description(cmd: &str) -> String {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut reg = ToolRegistry::with_approver(Recording(seen.clone()));
+        reg.register(Box::new(EchoDescribe)).unwrap();
+        reg.decide("echo_describe", &json!({ "cmd": cmd })).unwrap();
+        let v = seen.lock().unwrap();
+        v[0].clone()
+    }
+
+    #[test]
+    fn decide_sanitizes_hostile_description() {
+        let d = decide_description("ls\x1b[2K\rAPPROVED \u{202E}gnp.exe\u{2028}rm -rf /");
+        for bad in ['\x1b', '\r', '\u{202E}', '\u{2028}'] {
+            assert!(!d.contains(bad), "raw {bad:?} reached approver: {d:?}");
+        }
+        assert!(d.contains("\\u{1b}") && d.contains("\\u{202e}"), "{d:?}");
+    }
+
+    #[test]
+    fn decide_leaves_normal_description_unchanged() {
+        let cmd = "echo \"héllo\" 日本語 🚀 'x'";
+        assert_eq!(decide_description(cmd), format!("start job: {cmd}"));
     }
 
     fn registry_with_all_risks() -> ToolRegistry {

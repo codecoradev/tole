@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Approval prompts now show control characters, bidi overrides and line separators in tool descriptions as visible escapes (shared sanitizer in ToolRegistry::decide) (#327).
+
 ## [0.7.1] — 2026-10-08
 
 ### Changed

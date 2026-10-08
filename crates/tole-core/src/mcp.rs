@@ -455,23 +455,9 @@ impl Tool for McpTool {
     }
 }
 
-/// Replace every control character (ANSI ESC, CR/LF, tabs, C1, ...) in
-/// server-supplied text with a space so it cannot spoof or rewrite the
-/// approval prompt (#286). Also drops Unicode line/paragraph separators
-/// and bidi overrides, which render as line breaks / reorder text.
-fn sanitize_one_line(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_control()
-                || matches!(c, '\u{2028}' | '\u{2029}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
-            {
-                ' '
-            } else {
-                c
-            }
-        })
-        .collect()
-}
+// Server-supplied text is sanitized via the shared
+// `crate::sanitize::sanitize_one_line` (#286, #327).
+use crate::sanitize::sanitize_one_line;
 
 /// Sync-side wait for a `tools/list` verdict. The reactor is serial: a
 /// ListTools can queue behind another in-flight op (up to CALL_TIMEOUT)
