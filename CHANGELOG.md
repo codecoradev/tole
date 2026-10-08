@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- The MCP server path (`RegistryServer::execute_checked`) now authorizes tool
+  calls through the same crate-internal gate as `drive`/`resume_turn`.
+  Behavior change for `RegistryServer::new` embedders: pre-hooks configured on
+  an embedder-supplied registry are now enforced there (a configured deny-hook
+  must not be bypassable on one path). No in-repo face is affected, since
+  none can attach pre-hooks. Destructive refusal and error strings are
+  unchanged (#303, part 3 of 3).
 - Internal refactor, no behavior change: `drive` and `resume_turn` now share
   one crate-internal tool-call authorization gate (`gate.rs`) with a typed
   denial and a `Permit` required to execute non-ReadOnly tools; tool risk is
