@@ -195,29 +195,30 @@ impl RegistryServer {
         let tool = registry
             .get(name)
             .ok_or_else(|| format!("unknown tool: {name}"))?;
-        // Structural guard, NOT an approver decision (CodeCora scan
-        // finding): `RegistryServer::new` accepts any registry, including
-        // one built with a permissive approver that would Allow a
-        // Destructive call. Hiding it from tools/list is not enough — it
-        // must be uncallable, period.
+        // Server-mode policy, enforced BEFORE and outside the gate (the
+        // gate knows nothing about server mode). Structural guard, NOT an
+        // approver decision (CodeCora scan finding): `RegistryServer::new`
+        // accepts any registry, including one built with a permissive
+        // approver that would Allow a Destructive call. Hiding it from
+        // tools/list is not enough — it must be uncallable, period, and
+        // the approver is never consulted for it.
         if tool.risk() == Risk::Destructive {
             return Err("destructive tools are never exposed in server mode".into());
         }
-        match tool.risk() {
-            Risk::ReadOnly => {}
-            Risk::Write => match registry.decide(name, &args) {
-                Some(crate::approval::Verdict::Allow) => {}
-                _ => {
-                    return Err(
-                        "denied by approval policy — this MCP server only pre-authorizes \
-                         Write tools listed in --allow patterns"
-                            .into(),
-                    )
-                }
-            },
-            Risk::Destructive => unreachable!("guarded above"),
-        }
-        tool.execute(args)
+        // Everything else goes through the one authorization gate (#303).
+        // Pre-hooks: server faces never carry them (the CLI refuses
+        // --on-pretool for mcp/serve/acp; session registries wire only
+        // turn-end hooks), so the gate's pre-hook step is a no-op here.
+        let authorized = crate::gate::authorize(&registry, name, &args, crate::gate::Mode::Fresh)
+            .map_err(|denied| match denied {
+            crate::gate::Denied::UnknownTool => format!("unknown tool: {name}"),
+            // Approver denial (a pre-hook denial is unreachable on
+            // server faces): same message either way.
+            _ => "denied by approval policy — this MCP server only pre-authorizes \
+                      Write tools listed in --allow patterns"
+                .to_string(),
+        })?;
+        authorized.execute(args)
     }
 }
 
@@ -797,14 +798,16 @@ mod tests {
         assert_eq!(runs.load(Ordering::SeqCst), 1);
     }
 
-    /// Pins CURRENT behavior, not a requirement: `execute_checked` never
-    /// consults pre-hooks. Server faces refuse hooks by design (see
-    /// docs/orchestration.md; the CLI errors on --on-pretool for `tole
-    /// mcp`), so a registry carrying a denying pre-hook still executes
-    /// here. If a later change wires hooks into this path, update this
-    /// test deliberately.
+    /// INTENTIONAL behavior change vs the PR 1 characterization (#303 part
+    /// 3 of 3): `execute_checked` now authorizes through the gate, so a
+    /// pre-hook configured on the registry IS enforced. A configured
+    /// deny-hook that one path silently ignores is a bypass. No in-repo
+    /// server face can attach pre-hooks (the CLI refuses --on-pretool for
+    /// mcp/serve/acp; see docs/orchestration.md), so only embedders that
+    /// pass a hook-carrying registry to the public `RegistryServer::new`
+    /// are affected, in the stricter direction.
     #[test]
-    fn gate_char_mcp_pre_hooks_are_not_consulted() {
+    fn gate_char_mcp_pre_hooks_are_enforced_via_the_gate() {
         let dir = std::env::temp_dir().join(format!("tole-gate-char-mcp-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let marker = dir.join("hook-ran");
@@ -836,13 +839,62 @@ mod tests {
         ))];
         reg.set_hooks(hooks);
         let srv = RegistryServer::new(reg);
-        assert!(srv.execute_checked("w", json!({})).is_ok());
-        assert!(srv.execute_checked("r", json!({})).is_ok());
-        assert_eq!(runs.load(Ordering::SeqCst), 2);
-        assert!(
-            !marker.exists(),
-            "pre-hook must not run on the MCP server path"
+        // Write: approver allows, the denying pre-hook refuses; the tool
+        // never runs and the message is the standard policy denial.
+        assert_eq!(
+            srv.execute_checked("w", json!({})),
+            Err(
+                "denied by approval policy — this MCP server only pre-authorizes \
+                 Write tools listed in --allow patterns"
+                    .to_string()
+            )
         );
+        assert_eq!(consulted.load(Ordering::SeqCst), 1);
+        assert!(marker.exists(), "pre-hook must run for a Write call");
+        // ReadOnly is never gated, so it neither consults hooks nor is denied.
+        assert!(srv.execute_checked("r", json!({})).is_ok());
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Server-face registries (`tole_cli::session_host::open_session`)
+    /// wire ONLY turn-end hooks, built from `from_cli(&[], &[])` — never
+    /// pre-hooks — and the CLI refuses `--on-pretool` for mcp/serve/acp.
+    /// Since the gate consults pre-hooks, pin that exactly that wiring
+    /// leaves the authorization outcome unchanged and runs no hook here.
+    #[test]
+    fn server_face_hook_wiring_has_no_pre_hooks_and_does_not_affect_gate() {
+        let dir = std::env::temp_dir().join(format!("tole-gate-mcp-te-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("turnend-ran");
+        let _ = std::fs::remove_file(&marker);
+        let mut hooks = crate::hooks::ToolHooks::from_cli(&[], &[]);
+        assert!(
+            hooks.pre.is_empty(),
+            "server wiring must carry no pre-hooks"
+        );
+        hooks.turnend = vec![crate::hooks::turnend_hook(&format!(
+            "/bin/sh -c 'touch {}; exit 2'",
+            marker.display()
+        ))];
+        let consulted = Arc::new(AtomicUsize::new(0));
+        let runs = Arc::new(AtomicUsize::new(0));
+        let mut reg = ToolRegistry::with_approver(CountingApprover {
+            verdict: Verdict::Allow,
+            calls: consulted.clone(),
+        });
+        reg.register(Box::new(ProbeTool {
+            name: "w",
+            risk: Risk::Write,
+            runs: runs.clone(),
+        }))
+        .unwrap();
+        reg.set_hooks(hooks);
+        let srv = RegistryServer::new(reg);
+        assert!(srv.execute_checked("w", json!({})).is_ok());
+        assert_eq!(consulted.load(Ordering::SeqCst), 1);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        assert!(!marker.exists(), "turn-end hook must not run on this path");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
