@@ -205,6 +205,10 @@ impl Tool for GitTool {
         Risk::Write
     }
 
+    fn summary(&self) -> String {
+        "Light version control in the workspace: status, diff, add, commit. No push; a human pushes.".into()
+    }
+
     fn describe(&self, input: &Value) -> String {
         self.command_line(input).unwrap_or_else(|e| e)
     }

@@ -122,6 +122,10 @@ impl tole_core::tool::Tool for UpdatePlanTool {
     fn risk(&self) -> tole_core::tool::Risk {
         tole_core::tool::Risk::ReadOnly
     }
+    fn summary(&self) -> String {
+        "Publish or replace the execution plan shown in the user's plan panel.".into()
+    }
+
     fn describe(&self, _input: &serde_json::Value) -> String {
         "publish the execution plan to the user's plan panel".into()
     }

@@ -286,6 +286,10 @@ impl Tool for SystemOneTool {
         Risk::ReadOnly
     }
 
+    fn summary(&self) -> String {
+        "Typed decisions (choice, score or noul) with calibrated confidence from a System One backend. Pass filtered state and literal criteria.".into()
+    }
+
     fn describe(&self, input: &Value) -> String {
         // Shape only — state content never goes into the audit line.
         match self.build_request(input) {

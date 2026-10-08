@@ -423,6 +423,10 @@ impl Tool for WebFetchTool {
     fn risk(&self) -> Risk {
         Risk::ReadOnly
     }
+    fn summary(&self) -> String {
+        "Fetch an http(s) URL and return its text content, size-capped.".into()
+    }
+
     fn describe(&self, input: &Value) -> String {
         format!(
             "fetch {} (text-only, size-capped)",
@@ -564,6 +568,10 @@ impl Tool for WebSearchTool {
     fn risk(&self) -> Risk {
         Risk::ReadOnly
     }
+    fn summary(&self) -> String {
+        "Search the web and return ranked results.".into()
+    }
+
     fn describe(&self, input: &Value) -> String {
         format!("web search: {}", input["query"].as_str().unwrap_or("?"))
     }

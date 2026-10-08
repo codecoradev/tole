@@ -68,6 +68,10 @@ impl Tool for ReadFileTool {
         Risk::ReadOnly
     }
 
+    fn summary(&self) -> String {
+        "Read a text file inside the workspace.".into()
+    }
+
     fn describe(&self, input: &Value) -> String {
         let path = input
             .get("path")
