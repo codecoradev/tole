@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - systemone_decide surfaces the provider's 4xx/5xx error body (bounded) instead of "no error body" (#328).
+- tole-cli: the bare `--no-default-features` profile now compiles (#330).
 
 ## [0.7.1] — 2026-10-08
 
