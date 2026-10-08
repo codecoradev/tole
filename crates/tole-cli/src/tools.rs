@@ -76,6 +76,10 @@ impl Tool for WriteFileTool {
         Risk::Write
     }
 
+    fn summary(&self) -> String {
+        "Write a text file inside the workspace, creating or overwriting it.".into()
+    }
+
     fn describe(&self, input: &Value) -> String {
         let path = input
             .get("path")
@@ -121,8 +125,20 @@ impl WriteFileTool {
     /// `symlink_metadata` never follows links, so a symlinked component
     /// is rejected instead of traversed — then write with `O_NOFOLLOW`
     /// (unix): if the final component is or becomes a symlink, the open
-    /// itself fails instead of following it out of the jail. Closes the
-    /// check-then-write race (TOCTOU) on both the tail and the target.
+    /// itself fails instead of following it out of the jail.
+    ///
+    /// What is and is not guaranteed: `O_NOFOLLOW` protects only the
+    /// FINAL path component, so a symlink swapped in at the leaf between
+    /// the walk and the `open()` is refused. It does NOT protect the
+    /// intermediate components: if an already-verified parent directory
+    /// is replaced by a symlink after the walk but before `open()`, the
+    /// open follows it and can escape the jail. That is a residual
+    /// check-then-use race (see "Deliberate limitations" in
+    /// `docs/threat-model.md`). Exploiting it needs a concurrent local
+    /// process with write access to the workspace, and the model already
+    /// has full process authority via `run_command`/`job_start` — the
+    /// jail bounds cwd, not capability. Closing it would need a
+    /// per-component `openat` descent (`O_DIRECTORY | O_NOFOLLOW`).
     fn write_jailed(&self, target: &Path, content: &str) -> Result<(), String> {
         let root = self
             .root
@@ -188,8 +204,10 @@ impl WriteFileTool {
         {
             // Best-effort symlink refusal immediately before the write.
             // Residual TOCTOU remains on non-unix hosts (no O_NOFOLLOW
-            // equivalent wired here yet) — unix, the primary host, is
-            // race-free via O_NOFOLLOW (CodeCora scan 2026-09-18).
+            // equivalent wired here yet). On unix, O_NOFOLLOW closes the
+            // final-component swap only; the parent-component swap
+            // residual described on `write_jailed` applies there too
+            // (CodeCora scan 2026-09-18, rescan #329).
             let is_symlink = target
                 .symlink_metadata()
                 .map(|m| m.file_type().is_symlink())

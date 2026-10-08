@@ -85,6 +85,9 @@ impl SystemOneTool {
     pub fn new(endpoint: impl Into<String>, api_key: impl Into<String>) -> Self {
         let agent = ureq::Agent::config_builder()
             .timeout_global(Some(API_TIMEOUT))
+            // 4xx/5xx come back as Ok(resp) so the provider's error body
+            // is readable (same as gitea.rs, #233; #328).
+            .http_status_as_error(false)
             .build()
             .new_agent();
         Self {
@@ -256,24 +259,64 @@ impl SystemOneTool {
         Ok(Value::Object(body))
     }
 
-    /// One POST → `(status, body_json_or_null)`. ureq-3 pattern from
-    /// verify_package: 4xx/5xx arrive as Err(StatusCode) and ARE the
-    /// answer (rate limits / overload are verdicts, not crashes).
+    /// One POST → `(status, body)`. The agent is configured with
+    /// `http_status_as_error(false)`, so 4xx/5xx arrive as `Ok(resp)` and
+    /// ARE the answer (rate limits / overload are verdicts, not crashes).
+    /// Success bodies are parsed as JSON; non-2xx bodies are read with a
+    /// hard byte cap and surfaced as JSON when parseable, else as a
+    /// string. Transport errors stay `Err` (no key material in the text).
     fn fetch(&self, body: &Value) -> Result<(u16, Value), String> {
-        let resp = match self
+        use std::io::Read;
+        let mut resp = self
             .agent
             .post(&self.endpoint)
             .header("Authorization", &format!("Bearer {}", self.api_key))
             .send_json(body)
-        {
-            Ok(r) => r,
-            Err(ureq::Error::StatusCode(code)) => return Ok((code, Value::Null)),
-            Err(e) => return Err(format!("systemone: {e}")),
-        };
+            .map_err(|e| match e {
+                ureq::Error::StatusCode(code) => format!("systemone: HTTP {code}"),
+                e => format!("systemone: {e}"),
+            })?;
         let status = resp.status().as_u16();
-        let mut resp = resp;
+        if !(200..300).contains(&status) {
+            let mut raw = Vec::new();
+            let _ = resp
+                .body_mut()
+                .as_reader()
+                .take(ERROR_BODY_MAX_BYTES)
+                .read_to_end(&mut raw);
+            let text = String::from_utf8_lossy(&raw).trim().to_string();
+            let parsed = match serde_json::from_str::<Value>(&text) {
+                Ok(v) => v,
+                Err(_) if text.is_empty() => Value::Null,
+                Err(_) => Value::String(text),
+            };
+            return Ok((status, parsed));
+        }
         let parsed = resp.body_mut().read_json::<Value>().unwrap_or(Value::Null);
         Ok((status, parsed))
+    }
+}
+
+/// Max bytes read from a non-2xx response body.
+const ERROR_BODY_MAX_BYTES: u64 = 4096;
+/// Max characters of provider error text surfaced to the caller.
+const ERROR_DETAIL_MAX_CHARS: usize = 500;
+
+/// Human-readable provider detail from an error body, capped.
+fn error_detail(parsed: &Value) -> String {
+    let text = parsed
+        .get("message")
+        .or_else(|| parsed.get("error"))
+        .and_then(Value::as_str)
+        .or_else(|| parsed.as_str())
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .unwrap_or("no error body");
+    if text.chars().count() > ERROR_DETAIL_MAX_CHARS {
+        let cut: String = text.chars().take(ERROR_DETAIL_MAX_CHARS).collect();
+        format!("{cut}…")
+    } else {
+        text.to_string()
     }
 }
 
@@ -284,6 +327,10 @@ impl Tool for SystemOneTool {
 
     fn risk(&self) -> Risk {
         Risk::ReadOnly
+    }
+
+    fn summary(&self) -> String {
+        "Typed decisions (choice, score or noul) with calibrated confidence from a System One backend. Pass filtered state and literal criteria.".into()
     }
 
     fn describe(&self, input: &Value) -> String {
@@ -334,11 +381,7 @@ impl Tool for SystemOneTool {
         let body = self.build_request(&input)?;
         let (status, parsed) = self.fetch(&body)?;
         if !(200..300).contains(&status) {
-            let detail = parsed
-                .get("message")
-                .or_else(|| parsed.get("error"))
-                .and_then(Value::as_str)
-                .unwrap_or("no error body");
+            let detail = error_detail(&parsed);
             return Err(match status {
                 401 => format!("systemone: invalid or missing API key (HTTP 401): {detail}"),
                 429 => format!("systemone: rate limited (HTTP 429) — back off and retry: {detail}"),
@@ -522,5 +565,69 @@ mod tests {
             .execute(json!({"state": "s", "questions": [{"id": "q", "type": "noul"}]}))
             .unwrap_err();
         assert!(err.contains("rate limited"), "{err}");
+        assert!(err.contains("slow down"), "{err}");
+        assert!(!err.contains("no error body"), "{err}");
+    }
+
+    /// One-shot mock: answers a single request with the given status line
+    /// and raw body, returns the endpoint URL.
+    fn one_shot(status: &'static str, body: String) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut buf = [0u8; 8192];
+                let _ = s.read(&mut buf);
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+        format!("http://{addr}/decide")
+    }
+
+    fn q() -> Value {
+        json!({"state": "s", "questions": [{"id": "q", "type": "noul"}]})
+    }
+
+    #[test]
+    fn http_500_json_body_is_surfaced_without_key() {
+        let url = one_shot(
+            "500 Internal Server Error",
+            json!({"message": "model crashed: shard 7"}).to_string(),
+        );
+        let err = SystemOneTool::new(url, "sk-secret-key")
+            .execute(q())
+            .unwrap_err();
+        assert!(err.contains("HTTP 500"), "{err}");
+        assert!(err.contains("model crashed: shard 7"), "{err}");
+        assert!(!err.contains("sk-secret-key"), "{err}");
+    }
+
+    #[test]
+    fn http_error_non_json_or_empty_body_stays_honest() {
+        let url = one_shot("502 Bad Gateway", "<html>upstream down</html>".into());
+        let err = SystemOneTool::new(url, "k").execute(q()).unwrap_err();
+        assert!(err.contains("HTTP 502"), "{err}");
+        assert!(err.contains("upstream down"), "{err}");
+
+        let url = one_shot("503 Service Unavailable", String::new());
+        let err = SystemOneTool::new(url, "k").execute(q()).unwrap_err();
+        assert!(err.contains("HTTP 503"), "{err}");
+        assert!(err.contains("no error body"), "{err}");
+    }
+
+    #[test]
+    fn huge_error_body_is_bounded() {
+        let url = one_shot(
+            "500 Internal Server Error",
+            json!({"error": "x".repeat(100_000)}).to_string(),
+        );
+        let err = SystemOneTool::new(url, "k").execute(q()).unwrap_err();
+        assert!(err.contains("HTTP 500"), "{err}");
+        assert!(err.chars().count() < 700, "{}", err.chars().count());
     }
 }

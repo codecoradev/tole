@@ -184,6 +184,10 @@ impl Tool for EditFileTool {
         Risk::Write
     }
 
+    fn summary(&self) -> String {
+        "Edit a workspace file by replacing an exact text snippet with new text.".into()
+    }
+
     fn describe(&self, input: &Value) -> String {
         let path = input
             .get("path")
@@ -304,6 +308,10 @@ impl Tool for DeleteFileTool {
 
     fn risk(&self) -> Risk {
         Risk::Destructive
+    }
+
+    fn summary(&self) -> String {
+        "Delete one file inside the workspace.".into()
     }
 
     fn describe(&self, input: &Value) -> String {

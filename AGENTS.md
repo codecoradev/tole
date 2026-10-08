@@ -122,9 +122,10 @@ that makes them stale. This regression has happened twice (#33 and again
   returns a real verdict with NO `CORA_*` exports in the environment —
   verified across PRs #164/#166). The 2026-09-18 export requirement is
   obsolete.
-- **2026-10-05:** both `tole-core` and `tole-cli` are on crates.io at
-  **0.5.0** (checked via the crates.io API). Registry parity with the
-  checkout is current as of this date; live missions still run the
+- **2026-10-08:** both `tole-core` and `tole-cli` are on crates.io at
+  **0.7.1** (released via the GitHub release `v0.7.1`; `publish.yml`
+  published core then cli; checked via the crates.io API). Registry
+  parity with the checkout is current as of this date; live missions still run the
   freshly built `./target/release/tole` (see CONTRIBUTING →
   Live-mission binary hygiene). Since #168 `mcp-http` is a default `tole-cli` feature —
   `cargo install tole-cli` includes `tole serve --transport mcp`.

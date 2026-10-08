@@ -119,6 +119,11 @@ impl Tool for RunCommandTool {
         Risk::Write
     }
 
+    fn summary(&self) -> String {
+        "Run one command (program plus arguments, no shell) in the workspace and return its output."
+            .into()
+    }
+
     fn describe(&self, input: &Value) -> String {
         let line = input
             .get("command")
