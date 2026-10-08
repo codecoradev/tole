@@ -76,14 +76,61 @@ pub(crate) fn parse_model_list(env_val: Option<&str>) -> Vec<String> {
 /// `TOLE_MODELS` wins AS-IS — deterministic, no network, the operator's
 /// explicit override/filter. Empty or unset falls to `probe` (the
 /// provider's `GET /models`); its result is used whatever it is,
-/// including empty (a failed probe is cached by the caller — never
-/// retried per session).
+/// including empty (a successful probe is cached for the process
+/// lifetime by the caller; a failed one only for `PROBE_FAIL_TTL`, see
+/// `ProbeCache`).
 fn resolve_model_list(env_val: Option<&str>, probe: impl FnOnce() -> Vec<String>) -> Vec<String> {
     let from_env = parse_model_list(env_val);
     if !from_env.is_empty() {
         return from_env;
     }
     probe()
+}
+
+/// How long a failed/timed-out `/models` probe is remembered (issue #319).
+/// Within this window callers get an empty list instantly instead of paying
+/// another `PROBE_WAIT` against a hanging gateway; after it, one retry is
+/// allowed so a recovered gateway is picked up without restarting.
+const PROBE_FAIL_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Cache for the lazy `/models` probe: a success is kept for the process
+/// lifetime, a failure only until `PROBE_FAIL_TTL` elapses. The clock is a
+/// parameter so the logic is testable without sleeping.
+#[derive(Default)]
+struct ProbeCache {
+    ok: Option<Vec<String>>,
+    failed_at: Option<std::time::Instant>,
+}
+
+impl ProbeCache {
+    /// `probe` returns `Some(non-empty list)` on success, `None` on any
+    /// failure (error, empty list, timeout). It is only called on a cache
+    /// miss (no success yet and no fresh failure).
+    fn get(
+        &mut self,
+        now: std::time::Instant,
+        probe: impl FnOnce() -> Option<Vec<String>>,
+    ) -> Vec<String> {
+        if let Some(list) = &self.ok {
+            return list.clone();
+        }
+        if let Some(at) = self.failed_at {
+            if now.saturating_duration_since(at) < PROBE_FAIL_TTL {
+                return Vec::new();
+            }
+        }
+        match probe() {
+            Some(list) => {
+                self.ok = Some(list.clone());
+                self.failed_at = None;
+                list
+            }
+            None => {
+                self.failed_at = Some(now);
+                Vec::new()
+            }
+        }
+    }
 }
 
 /// The full advertised option list: the `TOLE_MODELS` entries plus the
@@ -626,77 +673,61 @@ pub fn run_acp(
     // auto-write while the approver owns the same handles.
     let approval_states: Arc<Mutex<HashMap<String, SessionApprovalState>>> =
         Arc::new(Mutex::new(HashMap::new()));
-    // Advertised model list (issues #176/#195): `TOLE_MODELS` wins
-    // as-is; otherwise the provider's `GET /models` is probed ONCE on
-    // first use (lazy — agent spawn stays instant) and cached for the
-    // process lifetime, failures included (one stderr line, no per-
-    // session retry). No provider config → nothing to probe.
+    // Advertised model list (issues #176/#195/#319): `TOLE_MODELS` wins
+    // as-is; otherwise the provider's `GET /models` is probed lazily on
+    // first use (agent spawn stays instant). A success is cached for the
+    // process lifetime; a failure/timeout only for PROBE_FAIL_TTL, so a
+    // hung gateway neither stalls every call nor is pinned forever. No
+    // provider config -> nothing to probe.
     let env_models_raw = std::env::var("TOLE_MODELS").ok();
     let probe_cfg = tole_core::openai::OpenAiConfig::from_env();
-    /// Bounded wait for the lazy /models probe (issue #257): a hung
-    /// gateway must not stall the ACP reader thread beyond this.
-    const PROBE_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+    /// Bounded wait for the lazy /models probe (issues #257/#319). It runs
+    /// inline on the ACP reader thread (session/new, set_config_option), so
+    /// it is kept short: 5s covers a healthy gateway's `/models` (normally
+    /// well under 1s) while capping the reader stall; a failure is then
+    /// remembered for PROBE_FAIL_TTL, so a hung gateway costs at most one
+    /// 5s wait per 30s, not one per call.
+    const PROBE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
-    let models_cache: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let models_cache: Mutex<ProbeCache> = Mutex::new(ProbeCache::default());
+    // Callers must hold no sessions/approval lock while calling this: the
+    // probe can block for up to PROBE_WAIT (issue #319).
     let model_list = || {
         resolve_model_list(env_models_raw.as_deref(), || {
-            // Probe at most once per process — failures are cached too,
-            // so a broken gateway costs one stderr line, not one retry
-            // per session. Issue #257 (rescan #41): the probe runs
-            // OFF the protocol reader thread (spawn_blocking) — an
-            // inline network fetch here stalled session/new and
-            // set_config for the whole gateway timeout.
-            models_cache.get().cloned().unwrap_or_else(|| {
-                // Issue #257 + cora CI round 2: ONLY a successful
-                // non-empty probe lands in the OnceLock. Failure and
-                // timeout paths return WITHOUT caching, so the next
-                // session/new retries after the gateway recovers (the
-                // old single-cache flow pinned an empty list for the
-                // process lifetime after one timeout).
-                let computed = match probe_cfg.as_ref() {
-                    None => return Vec::new(),
-                    Some(cfg) => {
-                        let base = cfg.base_url.clone();
-                        let key = cfg.api_key.clone();
-                        // Detached probe + bounded wait (cora round 1:
-                        // join() still blocked the reader thread).
-                        let (tx, rx) = std::sync::mpsc::channel();
-                        std::thread::spawn(move || {
-                            let _ = tx.send(tole_core::openai::fetch_model_ids(&base, &key));
-                        });
-                        match rx.recv_timeout(PROBE_WAIT) {
-                            Ok(Ok(list)) if !list.is_empty() => list,
-                            Ok(Ok(_)) => {
-                                eprintln!(
-                                    "tole acp: provider /models returned no ids — set \
-                                         TOLE_MODELS to advertise a model picker"
-                                );
-                                return Vec::new();
-                            }
-                            Ok(Err(e)) => {
-                                eprintln!(
-                                    "tole acp: {e} — set TOLE_MODELS to advertise a \
-                                         model picker"
-                                );
-                                return Vec::new();
-                            }
-                            Err(_) => {
-                                // Timeout (or sender dropped): NOT
-                                // cached — the next session/new may
-                                // retry once the gateway recovers;
-                                // each retry is bounded by PROBE_WAIT.
-                                eprintln!(
-                                    "tole acp: provider /models probe did not answer within \
-                                         {:?} — set TOLE_MODELS to advertise a model picker",
-                                    PROBE_WAIT
-                                );
-                                return Vec::new();
-                            }
-                        }
+            let Some(cfg) = probe_cfg.as_ref() else {
+                return Vec::new();
+            };
+            let mut cache = models_cache.lock().unwrap_or_else(|p| p.into_inner());
+            cache.get(std::time::Instant::now(), || {
+                let base = cfg.base_url.clone();
+                let key = cfg.api_key.clone();
+                // Detached probe + bounded wait (join() would block the
+                // reader thread for the whole gateway timeout).
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let _ = tx.send(tole_core::openai::fetch_model_ids(&base, &key));
+                });
+                match rx.recv_timeout(PROBE_WAIT) {
+                    Ok(Ok(list)) if !list.is_empty() => Some(list),
+                    Ok(Ok(_)) => {
+                        eprintln!(
+                            "tole acp: provider /models returned no ids — set \
+                             TOLE_MODELS to advertise a model picker"
+                        );
+                        None
                     }
-                };
-                let _ = models_cache.set(computed.clone());
-                computed
+                    Ok(Err(e)) => {
+                        eprintln!("tole acp: {e} — set TOLE_MODELS to advertise a model picker");
+                        None
+                    }
+                    Err(_) => {
+                        eprintln!(
+                            "tole acp: provider /models probe did not answer within \
+                             {PROBE_WAIT:?} — set TOLE_MODELS to advertise a model picker"
+                        );
+                        None
+                    }
+                }
             })
         })
     };
@@ -833,6 +864,11 @@ pub fn run_acp(
                     Some(plan_emitter),
                 ) {
                     Ok(state) => {
+                        // Resolve the model list BEFORE taking the
+                        // sessions lock: the lazy /models probe can block
+                        // for PROBE_WAIT and must never run under it
+                        // (issue #319).
+                        let models = model_list();
                         // Insert + busy re-check in ONE critical section:
                         // open_session is slow (canonicalize + a git
                         // subprocess), and a prompt that set busy inside
@@ -894,9 +930,7 @@ pub fn run_acp(
                             },
                         );
                         let mut result = json!({ "sessionId": session_id });
-                        if let Some(opts) =
-                            config_options_for(&current, &model_list(), session_auto)
-                        {
+                        if let Some(opts) = config_options_for(&current, &models, session_auto) {
                             result["configOptions"] = Value::Array(opts);
                         }
                         reply(&conn, id, result);
@@ -1258,6 +1292,43 @@ mod tests {
     #[test]
     fn resolve_model_list_keeps_empty_probe_result() {
         assert!(resolve_model_list(None, Vec::new).is_empty());
+    }
+
+    fn probe_ok() -> Option<Vec<String>> {
+        Some(vec!["m".into()])
+    }
+
+    #[test]
+    fn probe_cache_fresh_failure_served_from_sentinel() {
+        let t0 = std::time::Instant::now();
+        let mut c = ProbeCache::default();
+        assert!(c.get(t0, || None).is_empty());
+        let almost = t0 + PROBE_FAIL_TTL - std::time::Duration::from_secs(1);
+        let out = c.get(almost, || panic!("must not re-probe within TTL"));
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn probe_cache_retries_after_ttl_and_caches_success() {
+        let t0 = std::time::Instant::now();
+        let mut c = ProbeCache::default();
+        assert!(c.get(t0, || None).is_empty());
+        let later = t0 + PROBE_FAIL_TTL;
+        assert_eq!(c.get(later, probe_ok), vec!["m"]);
+        // Success is permanent: no probe, even far in the future.
+        let far = later + PROBE_FAIL_TTL * 100;
+        assert_eq!(c.get(far, || panic!("success must stay cached")), vec!["m"]);
+    }
+
+    #[test]
+    fn probe_cache_failure_after_ttl_restarts_window() {
+        let t0 = std::time::Instant::now();
+        let mut c = ProbeCache::default();
+        assert!(c.get(t0, || None).is_empty());
+        let t1 = t0 + PROBE_FAIL_TTL;
+        assert!(c.get(t1, || None).is_empty());
+        let soon = t1 + std::time::Duration::from_secs(1);
+        assert!(c.get(soon, || panic!("window restarted")).is_empty());
     }
 
     #[test]
