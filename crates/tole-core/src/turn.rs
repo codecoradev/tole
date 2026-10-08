@@ -7,9 +7,9 @@
 //! no-crash run (proven by the E2 determinism tests at sandwich level and
 //! the E5 golden-file test at loop level).
 
-use crate::approval::Verdict;
 use crate::cancel::CancelToken;
 use crate::entry::{EntryType, NewEntry};
+use crate::gate::{self, Denied};
 use serde_json::{json, Value};
 
 use crate::machine::{
@@ -197,6 +197,19 @@ pub fn resume_turn(
     p: &mut dyn Provider,
     registry: &ToolRegistry,
 ) -> Result<TurnOutcome, StorageError> {
+    resume_turn_with_cancel(s, p, registry, &CancelToken::default())
+}
+
+/// [`resume_turn`] with a cancellation token (#318): the replan loop after
+/// the replayed intent is driven with `cancel`, so a client cancel during
+/// an approval-resume settles the turn as `Cancelled` (pc=Final) at the
+/// next checkpoint instead of being ignored.
+pub fn resume_turn_with_cancel(
+    s: &mut dyn Storage,
+    p: &mut dyn Provider,
+    registry: &ToolRegistry,
+    cancel: &CancelToken,
+) -> Result<TurnOutcome, StorageError> {
     match resume(s)? {
         Resume::Clean => {
             let pc_now = s.state().pc;
@@ -249,108 +262,8 @@ pub fn resume_turn(
                     &format!("replayed intent {intent_id} carried malformed arguments"),
                 )?;
             } else {
-                // Issue #249 (rescan #127): the replay gate keys on the
-                // CURRENT registry risk, not the recorded safety. The
-                // recorded value was derived from the tool's risk at
-                // intent-commit time; if the host wiring changed (or a
-                // tool impl changed), a now-Write tool must still meet
-                // the approval gate. Idempotent-recorded ReadOnly
-                // replays get the same consultation a fresh call would.
-                let current_risk = registry.get(&tool).map(|t| t.risk());
-                let needs_gate = safety == ReplaySafety::Guarded
-                    || matches!(current_risk, Some(r) if r != Risk::ReadOnly);
-                if needs_gate {
-                    let Some(t) = registry.get(&tool) else {
-                        // Unregistered tool on a Guarded intent: settle the
-                        // sandwich as failed so the session stays resumable
-                        // (scan #34: never park with an open intent).
-                        settle_err(
-                            s,
-                            &EffectHandle { intent_id },
-                            &format!("guarded intent references unregistered tool {tool}"),
-                        )?;
-                        append_turn_error(
-                            s,
-                            "unknown tool",
-                            &format!("guarded intent references unregistered tool {tool}"),
-                        )?;
-                        return Ok(TurnOutcome::UnknownTool { name: tool });
-                    };
-                    if t.risk() != Risk::ReadOnly {
-                        // Fresh consent for a replayed non-ReadOnly effect:
-                        // actually ASK the wired approver. Allow → proceed to
-                        // execute below; deny/absent → settle the sandwich as
-                        // failed (loop replans on the error) instead of
-                        // returning with the intent permanently pending.
-                        match registry.decide(&tool, &input) {
-                            Some(Verdict::Allow) => {}
-                            _ => {
-                                settle_err(
-                                    s,
-                                    &EffectHandle {
-                                        intent_id: intent_id.clone(),
-                                    },
-                                    "replay denied: no fresh approval for a guarded effect",
-                                )?;
-                                append_turn_error(
-                                    s,
-                                    "approval required",
-                                    &format!(
-                                    "guarded intent {intent_id} replay denied (no fresh approval)"
-                                ),
-                                )?;
-                                return Ok(TurnOutcome::ApprovalRequired { name: tool });
-                            }
-                        }
-                        // scan-3: opt-in pre-hooks apply on replay too — a
-                        // hook-deny must not be bypassable by crashing before
-                        // settlement (mirrors the normal-path check).
-                        #[cfg(feature = "shell-tools")]
-                        if let Some(reason) = registry.pre_hook_denial(&tool, &input) {
-                            settle_err(
-                                s,
-                                &EffectHandle {
-                                    intent_id: intent_id.clone(),
-                                },
-                                &format!("replay denied by pre-hook: {reason}"),
-                            )?;
-                            append_turn_error(s, "pre-hook denial", &format!("{tool}: {reason}"))?;
-                            return Ok(TurnOutcome::ApprovalRequired { name: tool });
-                        }
-                    }
-                }
-                let handle = EffectHandle { intent_id };
-                let out = match registry.get(&tool) {
-                    Some(t) => {
-                        let risk = t.risk();
-                        (t.execute(input), risk)
-                    }
-                    // The tool vanished between runs (host wiring changed).
-                    // The intent is durable — settle it as failed rather than
-                    // aborting: the loop replans on the tool_result error.
-                    None => (
-                        Err(format!("unknown tool on resume: {tool}")),
-                        Risk::ReadOnly,
-                    ),
-                };
-                match out {
-                    (Ok(o), risk) => {
-                        // #143 (cora): replayed Writes are writes too — the
-                        // session-scoped flag must see them, or a crash
-                        // before first execution misclassifies the session.
-                        if risk != Risk::ReadOnly {
-                            s.commit(Commit::new().register(RegisterWrite::set(
-                                "fact",
-                                "wrote_this_turn",
-                                json!(true),
-                            )))?;
-                        }
-                        settle_ok(s, &handle, o)?;
-                        finish(s)?;
-                    }
-                    (Err(e), _) => {
-                        settle_err(s, &handle, &e)?;
-                    }
+                if let Some(outcome) = replay_intent(s, registry, intent_id, tool, input, safety)? {
+                    return Ok(outcome);
                 }
             }
         }
@@ -359,10 +272,96 @@ pub fn resume_turn(
             settle_err(s, &handle, &reason)?;
         }
     }
-    // Recovery drives are not cancel-wired today (#178 covers live
-    // prompt turns; a crash-recovered resume has no in-flight request
-    // to cancel). No observer: recovery is an interactive host flow.
-    drive(s, p, registry, &CancelToken::default(), None)
+    // No observer: recovery is an interactive host flow. `resume_turn`
+    // passes a never-cancelled token; serve passes the session's (#318).
+    drive(s, p, registry, cancel, None)
+}
+
+/// Sets the session-scoped `wrote_this_turn` fact (#143). Shared by the
+/// fresh and replay paths — a Write that settles on either must be seen.
+fn record_wrote(s: &mut dyn Storage) -> Result<(), StorageError> {
+    s.commit(Commit::new().register(RegisterWrite::set("fact", "wrote_this_turn", json!(true))))?;
+    Ok(())
+}
+
+/// Replay of a crash-interrupted intent through the gate (issue #249,
+/// scan-3). `Ok(Some(_))` is a terminal outcome; `Ok(None)` means the
+/// intent was settled and the caller drives on.
+fn replay_intent(
+    s: &mut dyn Storage,
+    registry: &ToolRegistry,
+    intent_id: String,
+    tool: String,
+    input: Value,
+    safety: ReplaySafety,
+) -> Result<Option<TurnOutcome>, StorageError> {
+    let handle = EffectHandle {
+        intent_id: intent_id.clone(),
+    };
+    let mode = gate::Mode::Replay { recorded: safety };
+    let auth = match gate::authorize(registry, &tool, &input, mode) {
+        Ok(a) => a,
+        Err(Denied::UnknownTool) if safety == ReplaySafety::Guarded => {
+            // Unregistered tool on a Guarded intent: settle the sandwich as
+            // failed so the session stays resumable (scan #34: never park
+            // with an open intent).
+            let msg = format!("guarded intent references unregistered tool {tool}");
+            settle_err(s, &handle, &msg)?;
+            append_turn_error(s, "unknown tool", &msg)?;
+            // settle_err left pc at Planning (Executing → Planning); the
+            // abort is terminal, so Planning → Final (#316).
+            settle_final(s)?;
+            return Ok(Some(TurnOutcome::UnknownTool { name: tool }));
+        }
+        Err(Denied::UnknownTool) => {
+            // The tool vanished between runs (host wiring changed). The
+            // intent is durable — settle it as failed rather than
+            // aborting: the loop replans on the tool_result error.
+            settle_err(s, &handle, &format!("unknown tool on resume: {tool}"))?;
+            return Ok(None);
+        }
+        Err(Denied::Approver) => {
+            // Fresh consent for a replayed non-ReadOnly effect was refused:
+            // settle the sandwich as failed (loop replans on the error)
+            // instead of returning with the intent permanently pending.
+            settle_err(
+                s,
+                &handle,
+                "replay denied: no fresh approval for a guarded effect",
+            )?;
+            append_turn_error(
+                s,
+                "approval required",
+                &format!("guarded intent {intent_id} replay denied (no fresh approval)"),
+            )?;
+            return Ok(Some(TurnOutcome::ApprovalRequired { name: tool }));
+        }
+        #[cfg(feature = "shell-tools")]
+        Err(Denied::PreHook { reason }) => {
+            // scan-3: a hook-deny must not be bypassable by crashing
+            // before settlement (mirrors the fresh-path check).
+            settle_err(s, &handle, &format!("replay denied by pre-hook: {reason}"))?;
+            append_turn_error(s, "pre-hook denial", &format!("{tool}: {reason}"))?;
+            return Ok(Some(TurnOutcome::ApprovalRequired { name: tool }));
+        }
+    };
+    let is_write = auth.is_write();
+    match auth.execute(input) {
+        Ok(o) => {
+            // #143 (cora): replayed Writes are writes too — the
+            // session-scoped flag must see them, or a crash before first
+            // execution misclassifies the session.
+            if is_write {
+                record_wrote(s)?;
+            }
+            settle_ok(s, &handle, o)?;
+            finish(s)?;
+        }
+        Err(e) => {
+            settle_err(s, &handle, &e)?;
+        }
+    }
+    Ok(None)
 }
 
 /// Fingerprint of a tool call for the E10 loop guard: tool name + canonical
@@ -676,50 +675,48 @@ fn drive(
                         count: streak,
                     });
                 }
-                let Some(t) = registry.get(&tool) else {
-                    // Durable record, same contract as the other abort paths.
-                    append_turn_error(s, "unknown tool", &tool)?;
-                    return Ok(TurnOutcome::UnknownTool { name: tool });
-                };
-                if t.risk() != Risk::ReadOnly {
-                    // Approval gate (E4/E6): the wired approver decides per
-                    // call. `Deny` (or no approver reachable here) aborts the
-                    // turn with a durable record — never a silent park.
-                    match registry.decide(&tool, &input) {
-                        Some(Verdict::Allow) => { /* fall through to execute */ }
-                        _ => {
-                            // #178: a cancel that landed while the
-                            // permission was pending fails closed to
-                            // Deny AND must settle the turn as
-                            // CANCELLED, not refusal (the denial is
-                            // the cancel's side effect, not a model
-                            // refusal).
-                            if cancel.is_cancelled() {
-                                return settle_cancelled(s);
-                            }
-                            append_turn_error(s, "approval required", &tool)?;
-                            return Ok(TurnOutcome::ApprovalRequired { name: tool });
-                        }
+                // Authorization (PDP, see gate.rs): approver, then opt-in
+                // pre-hooks. The denial is mapped to the durable record here.
+                let auth = match gate::authorize(registry, &tool, &input, gate::Mode::Fresh) {
+                    Ok(a) => a,
+                    Err(Denied::UnknownTool) => {
+                        // Durable record + terminal pc=Final, the same #84
+                        // contract as the other abort paths (#316): without
+                        // it the next run_turn is refused (pc=Planning).
+                        append_turn_error(s, "unknown tool", &tool)?;
+                        settle_final(s)?;
+                        return Ok(TurnOutcome::UnknownTool { name: tool });
                     }
-                    // Opt-in pre-hooks (issue #110, shell-tools only): a
-                    // deny (exit 2) settles the same way as an approval
-                    // denial — durable turn error + ApprovalRequired.
+                    Err(Denied::Approver) => {
+                        // #178: a cancel that landed while the permission
+                        // was pending fails closed to Deny AND must settle
+                        // the turn as CANCELLED, not refusal (the denial is
+                        // the cancel's side effect, not a model refusal).
+                        if cancel.is_cancelled() {
+                            return settle_cancelled(s);
+                        }
+                        append_turn_error(s, "approval required", &tool)?;
+                        return Ok(TurnOutcome::ApprovalRequired { name: tool });
+                    }
                     #[cfg(feature = "shell-tools")]
-                    if let Some(reason) = registry.pre_hook_denial(&tool, &input) {
+                    Err(Denied::PreHook { reason }) => {
+                        // Pre-hook deny (issue #110) settles like an approval
+                        // denial: durable turn error + ApprovalRequired.
                         append_turn_error(s, "pre-hook denial", &format!("{tool}: {reason}"))?;
                         return Ok(TurnOutcome::ApprovalRequired { name: tool });
                     }
-                }
+                };
+                let is_write = auth.is_write();
                 // Planning → ToolCall, then the sandwich. The replay
                 // contract derives from RISK, not a blanket Idempotent
                 // (CodeCora scan #33): a crash after a Write/Destructive
                 // effect ran but before settlement must NOT blindly
                 // re-execute on resume — Guarded forces re-consultation
-                // of the approver (below) before any replay.
-                let safety = if t.risk() == Risk::ReadOnly {
-                    ReplaySafety::Idempotent
-                } else {
+                // of the approver before any replay.
+                let safety = if is_write {
                     ReplaySafety::Guarded
+                } else {
+                    ReplaySafety::Idempotent
                 };
                 let seq = s.state().seq;
                 s.commit(Commit::new().transition(StateTransition::from(seq, Pc::ToolCall)))?;
@@ -739,7 +736,7 @@ fn drive(
                 // Write/Destructive ONLY — ReadOnly stays zero-overhead
                 // (the documented hook contract; cora-caught).
                 #[cfg(feature = "shell-tools")]
-                let hook_input = if t.risk() != Risk::ReadOnly && registry.has_post_hooks() {
+                let hook_input = if is_write && registry.has_post_hooks() {
                     Some(input.clone())
                 } else {
                     None
@@ -750,7 +747,7 @@ fn drive(
                 if let Some(o) = observer {
                     o.tool_started(&tool, &input);
                 }
-                let out = match t.execute(input) {
+                let out = match auth.execute(input) {
                     Ok(o) => o,
                     Err(e) => {
                         // settle_err lands in Planning directly (§10) —
@@ -770,13 +767,9 @@ fn drive(
                 if let Some(i) = &hook_input {
                     registry.post_hook_notify(&tool, i, true);
                 }
-                if t.risk() != Risk::ReadOnly {
+                if is_write {
                     wrote = true;
-                    s.commit(Commit::new().register(RegisterWrite::set(
-                        "fact",
-                        "wrote_this_turn",
-                        json!(true),
-                    )))?;
+                    record_wrote(s)?;
                 }
                 if let Some(o) = observer {
                     o.tool_finished(&tool, true, &short_preview(&out));
@@ -847,6 +840,14 @@ fn append_turn_error(s: &mut dyn Storage, error: &str, detail: &str) -> Result<(
         payload: json!({ "error": error, "detail": detail }),
         timestamp: 0,
     }))?;
+    Ok(())
+}
+
+/// Terminal settlement shared by abort paths that already wrote their
+/// durable error record: commit `pc → Final` (legal only from Planning).
+fn settle_final(s: &mut dyn Storage) -> Result<(), StorageError> {
+    let seq = s.state().seq;
+    s.commit(Commit::new().transition(StateTransition::from(seq, Pc::Final)))?;
     Ok(())
 }
 

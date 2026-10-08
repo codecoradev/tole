@@ -472,6 +472,11 @@ impl Tool for AgentStartTool {
         Risk::Write
     }
 
+    fn summary(&self) -> String {
+        "Start a child tole agent session on one mission; collect its result with agent_poll."
+            .into()
+    }
+
     fn describe(&self, input: &Value) -> String {
         let prompt = input
             .get("prompt")
@@ -741,12 +746,24 @@ impl Tool for AgentPollTool {
         "agent_poll"
     }
 
+    /// `Write`, not `ReadOnly` (issue #300): a settled poll CONSUMES the
+    /// mailbox — it forgets the uteke mailbox namespace and persists
+    /// `mailbox_consumed` in meta.json. The tier must match the behavior
+    /// (a ReadOnly tool must never mutate; unlike `job_poll`, whose
+    /// write-back was removed for exactly that reason). Consume-once is
+    /// load-bearing (#243/#260/#287), so the tier moves rather than the
+    /// side effect. Plan mode drops Write tools, but it also drops
+    /// `agent_start`, so no child can exist to poll there.
     fn risk(&self) -> Risk {
-        Risk::ReadOnly
+        Risk::Write
     }
 
     fn is_poll(&self) -> bool {
         true
+    }
+
+    fn summary(&self) -> String {
+        "Poll a child agent started with agent_start for its status and result.".into()
     }
 
     fn describe(&self, input: &Value) -> String {
@@ -829,43 +846,61 @@ impl Tool for AgentPollTool {
         // cleaned mailbox. The in-process Mutex is held across the
         // ENTIRE consume section (issue #260, rescan #155: dropping it
         // after the read let two concurrent polls both recall+clean).
-        let already = {
-            let _g = self.consumed.lock();
-            if meta.mailbox_consumed {
-                true
-            } else {
-                let cfg = crate::memory::MemoryConfig {
-                    bin: "uteke".into(),
-                    namespace: meta.mailbox_ns.clone(),
-                    limit: 3,
-                };
-                if let Some(summary) = crate::memory::recall(&cfg, &meta.prompt)
-                    .ok()
-                    .map(|hits| {
-                        hits.iter()
-                            .map(|h| h.content.clone())
-                            .collect::<Vec<_>>()
-                            .join("\n---\n")
-                    })
-                    .filter(|s| !s.is_empty())
-                {
+        self.consume_mailbox(&dir, &mut meta, &mut out, crate::memory::recall);
+        Ok(out)
+    }
+}
+
+impl AgentPollTool {
+    /// Consume-once mailbox handling for a settled child. The mailbox is
+    /// marked consumed and cleaned ONLY when the recall succeeded (hits or
+    /// an explicit empty result); on a recall error the result is kept and
+    /// the next poll retries (issue #287, regression of #260).
+    fn consume_mailbox<F>(
+        &self,
+        dir: &std::path::Path,
+        meta: &mut AgentMeta,
+        out: &mut Value,
+        recall: F,
+    ) where
+        F: Fn(&crate::memory::MemoryConfig, &str) -> Result<Vec<crate::memory::RecallHit>, String>,
+    {
+        let _g = self.consumed.lock();
+        if meta.mailbox_consumed {
+            return;
+        }
+        let cfg = crate::memory::MemoryConfig {
+            bin: "uteke".into(),
+            namespace: meta.mailbox_ns.clone(),
+            limit: 3,
+        };
+        match recall(&cfg, &meta.prompt) {
+            Ok(hits) => {
+                let summary = hits
+                    .iter()
+                    .map(|h| h.content.clone())
+                    .collect::<Vec<_>>()
+                    .join("\n---\n");
+                if !summary.is_empty() {
                     out["summary"] = json!(summary);
                 }
-                if !meta.keep_mailbox {
-                    clean_mailbox(&meta.mailbox_ns);
-                }
-                meta.mailbox_consumed = true;
-                if let Err(e) = write_meta(&dir, &meta) {
-                    // Degrade loudly-but-softly: the summary WAS
-                    // delivered; a failed persist could let a future
-                    // poll re-recall.
-                    out["consume_persist_warning"] = json!(e);
-                }
-                false
             }
-        };
-        let _ = already;
-        Ok(out)
+            Err(e) => {
+                out["recall_error"] = json!(format!(
+                    "mailbox recall failed; result kept, poll again to retry: {e}"
+                ));
+                return;
+            }
+        }
+        if !meta.keep_mailbox {
+            clean_mailbox(&meta.mailbox_ns);
+        }
+        meta.mailbox_consumed = true;
+        if let Err(e) = write_meta(dir, meta) {
+            // Degrade loudly-but-softly: the summary WAS delivered; a
+            // failed persist could let a future poll re-recall.
+            out["consume_persist_warning"] = json!(e);
+        }
     }
 }
 
@@ -1274,8 +1309,13 @@ mod tests {
                 break;
             }
         }
-        // First poll after settle consumes (recalls + cleans + marks).
-        let _ = poll.execute(json!({"agent": id})).unwrap();
+        // First consume after settle (recalls + cleans + marks). Stubbed
+        // recall: success with an explicit empty result (issue #287 —
+        // a real `uteke` may be absent or failing in the test env).
+        let dir = agents_root(&d).join(&id);
+        let mut meta = read_meta(&dir).unwrap();
+        let mut out = json!({});
+        poll.consume_mailbox(&dir, &mut meta, &mut out, |_, _| Ok(Vec::new()));
         // A brand-new instance = a new parent process.
         let poll2 = AgentPollTool::new(d.clone());
         let again = poll2.execute(json!({"agent": id})).unwrap();
@@ -1289,6 +1329,57 @@ mod tests {
         )
         .unwrap();
         assert!(meta.mailbox_consumed);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Issue #300: a settled poll forgets the mailbox and persists
+    /// `mailbox_consumed`, so it must NOT be classified ReadOnly (the tier
+    /// the gate and plan mode key on). Pins both tools' tier.
+    #[test]
+    fn agent_tools_are_write_tier_because_poll_mutates() {
+        let d = tmp("risk-tier");
+        assert_eq!(AgentPollTool::new(d.clone()).risk(), Risk::Write);
+        assert_eq!(
+            AgentStartTool::new("/bin/true", d.clone()).risk(),
+            Risk::Write
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Issue #287 regression: a failed recall must NOT mark the mailbox
+    /// consumed (nor clean it) — the next poll retries and delivers.
+    #[test]
+    fn recall_error_keeps_mailbox_unconsumed_and_retries() {
+        let d = tmp("recall-err");
+        let bin = fake_child(&d);
+        let start = AgentStartTool::new(&bin, d.clone());
+        let out = start.execute(json!({"prompt": "quick"})).unwrap();
+        let id = out["agent"].as_str().unwrap().to_string();
+        let dir = agents_root(&d).join(&id);
+        let poll = AgentPollTool::new(d.clone());
+        let mut meta = read_meta(&dir).unwrap();
+        let mut out = json!({});
+        poll.consume_mailbox(&dir, &mut meta, &mut out, |_, _| {
+            Err("uteke unavailable".into())
+        });
+        assert!(!meta.mailbox_consumed, "error must not mark consumed");
+        assert!(out.get("summary").is_none());
+        assert!(out["recall_error"].is_string(), "{out}");
+        assert!(
+            !read_meta(&dir).unwrap().mailbox_consumed,
+            "error must not persist the consumed flag"
+        );
+        // Retry succeeds: summary delivered, then consumed.
+        let mut out2 = json!({});
+        poll.consume_mailbox(&dir, &mut meta, &mut out2, |_, _| {
+            Ok(vec![crate::memory::RecallHit {
+                score: 1.0,
+                content: "child result".into(),
+            }])
+        });
+        assert_eq!(out2["summary"], json!("child result"));
+        assert!(meta.mailbox_consumed);
+        assert!(read_meta(&dir).unwrap().mailbox_consumed);
         let _ = std::fs::remove_dir_all(&d);
     }
 

@@ -18,6 +18,22 @@ use std::sync::Arc;
 use tole_cli::session_tools::SessionToolState;
 use tole_core::memory::MemoryConfig;
 
+/// Collect a request body under `limit`. Any read error or timeout is an
+/// `Err` — never silently an empty body (#277).
+async fn collect_body_bounded<B>(
+    body: B,
+    limit: std::time::Duration,
+) -> Result<hyper::body::Bytes, ()>
+where
+    B: hyper::body::Body,
+{
+    use http_body_util::BodyExt;
+    match tokio::time::timeout(limit, body.collect()).await {
+        Ok(Ok(c)) => Ok(c.to_bytes()),
+        _ => Err(()),
+    }
+}
+
 /// Serve MCP over Streamable HTTP. Blocks until the listener errors.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_mcp_http(
@@ -164,11 +180,20 @@ pub async fn run_mcp_http(
                         // SSE RESPONSE streaming below is untouched.
                         use tower_service::Service as _;
                         let (parts, incoming) = req.into_parts();
-                        let body_bytes: hyper::body::Bytes =
-                            tokio::time::timeout(SERVE_IO_TIMEOUT, incoming.collect())
-                                .await
-                                .map(|c| c.map(|c| c.to_bytes()).unwrap_or_default())
-                                .unwrap_or_default();
+                        // A read error/timeout REJECTS the request: a
+                        // truncated body must never execute as a valid
+                        // empty one (#277).
+                        let Ok(body_bytes) = collect_body_bounded(incoming, SERVE_IO_TIMEOUT).await
+                        else {
+                            let resp = hyper::Response::builder()
+                                .status(400)
+                                .header("content-type", "application/json")
+                                .body(box_full(hyper::body::Bytes::from(
+                                    "{\"error\":\"request body read failed\"}",
+                                )))
+                                .map_err(|e| std::io::Error::other(e.to_string()))?;
+                            return Ok::<_, std::io::Error>(resp);
+                        };
                         let full_req: http::Request<http_body_util::Full<hyper::body::Bytes>> =
                             http::Request::from_parts(parts, http_body_util::Full::new(body_bytes));
                         let mut svc = svc;
@@ -202,5 +227,78 @@ pub async fn run_mcp_http(
                 .serve_connection(io, hyper_service)
                 .await;
         });
+    }
+}
+
+#[cfg(test)]
+mod body_tests {
+    use super::collect_body_bounded;
+    use hyper::body::{Body, Frame};
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use std::time::Duration;
+
+    /// Yields one data frame, then errors or stalls forever.
+    struct Broken {
+        sent: bool,
+        stall: bool,
+    }
+    impl Body for Broken {
+        type Data = hyper::body::Bytes;
+        type Error = std::io::Error;
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            if !self.sent {
+                self.sent = true;
+                return Poll::Ready(Some(Ok(Frame::data(hyper::body::Bytes::from("{\"par")))));
+            }
+            if self.stall {
+                Poll::Pending
+            } else {
+                Poll::Ready(Some(Err(std::io::Error::other("reset"))))
+            }
+        }
+    }
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn read_error_is_rejected_not_empty() {
+        let r = rt().block_on(collect_body_bounded(
+            Broken {
+                sent: false,
+                stall: false,
+            },
+            Duration::from_secs(5),
+        ));
+        assert!(r.is_err(), "a body read error must reject");
+    }
+
+    #[test]
+    fn read_timeout_is_rejected_not_empty() {
+        let r = rt().block_on(collect_body_bounded(
+            Broken {
+                sent: false,
+                stall: true,
+            },
+            Duration::from_millis(50),
+        ));
+        assert!(r.is_err(), "a body read timeout must reject");
+    }
+
+    #[test]
+    fn complete_body_is_returned() {
+        let r = rt().block_on(collect_body_bounded(
+            http_body_util::Full::new(hyper::body::Bytes::from("ok")),
+            Duration::from_secs(5),
+        ));
+        assert_eq!(r.unwrap().as_ref(), b"ok");
     }
 }

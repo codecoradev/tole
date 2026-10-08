@@ -55,6 +55,44 @@ pub struct Sessions {
 
 pub type SharedSessions = StdArc<Mutex<Sessions>>;
 
+/// Cap on the live in-memory session map, shared by every face (REST,
+/// MCP, ACP). Sessions are durable on disk (the JSONL file) — eviction
+/// drops only the in-memory handle, never the file.
+pub const MAX_SESSIONS: usize = 256;
+
+/// Every session in the map is mid-turn, so none can be evicted.
+#[derive(Debug, PartialEq, Eq)]
+pub struct AllSessionsBusy;
+
+impl Sessions {
+    /// Make room for one more session: while the map is at `max`, evict
+    /// one NON-busy session. A busy flag that is itself locked means a
+    /// turn is mid-flight on that session, so it is skipped via
+    /// `try_lock` without blocking the whole map (CodeCora scan
+    /// round-2). Returns the evicted ids so callers can prune any side
+    /// maps keyed by session id; `Err(AllSessionsBusy)` when at capacity
+    /// with nothing evictable.
+    pub fn evict_for_insert(&mut self, max: usize) -> Result<Vec<String>, AllSessionsBusy> {
+        let mut evicted = Vec::new();
+        while self.map.len() >= max {
+            let oldest = self
+                .map
+                .iter()
+                .filter(|(_, st)| matches!(st.busy.try_lock().as_deref().copied(), Ok(false)))
+                .map(|(id, _)| id.clone())
+                .next();
+            match oldest {
+                Some(id) => {
+                    self.map.remove(&id);
+                    evicted.push(id);
+                }
+                None => return Err(AllSessionsBusy),
+            }
+        }
+        Ok(evicted)
+    }
+}
+
 /// Callback publishing a plan payload to the session's client (issue
 /// #196 phase 4). ACP wires a closure sending the standard `plan`
 /// session/update (Termul's PlanPanel renders it, full-replace); the
@@ -84,6 +122,10 @@ impl tole_core::tool::Tool for UpdatePlanTool {
     fn risk(&self) -> tole_core::tool::Risk {
         tole_core::tool::Risk::ReadOnly
     }
+    fn summary(&self) -> String {
+        "Publish or replace the execution plan shown in the user's plan panel.".into()
+    }
+
     fn describe(&self, _input: &serde_json::Value) -> String {
         "publish the execution plan to the user's plan panel".into()
     }
@@ -162,14 +204,7 @@ pub fn lock_sessions(sessions: &SharedSessions) -> std::sync::MutexGuard<'_, Ses
 /// touches a path (CodeCora scan finding: `../` or absolute ids would
 /// escape the sessions dir via Path::join).
 pub fn validate_session_id(id: &str) -> Option<String> {
-    let ok = !id.is_empty()
-        && id.len() <= 64
-        && !id.contains('/')
-        && !id.contains('\\')
-        && !id.contains("..")
-        && id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'));
+    let ok = tole_core::storage::is_valid_session_id(id);
     if ok {
         Some(id.to_string())
     } else {
@@ -563,37 +598,11 @@ pub fn run_session_turn(
     }
     *first_prompt_done.lock().expect("fpd lock") = true;
 
-    let stop = match &outcome {
-        tole_core::turn::TurnOutcome::Final { text, .. } => {
-            final_text = Some(text.clone());
-            "end_turn"
-        }
-        tole_core::turn::TurnOutcome::StopGateBlocked { reason } => {
-            eprintln!("tole: stop gate blocked the turn: {reason}");
-            "refusal"
-        }
-        tole_core::turn::TurnOutcome::ApprovalRequired { name } => {
-            eprintln!("tole: approval denied for '{name}'");
-            "refusal"
-        }
-        tole_core::turn::TurnOutcome::UnknownTool { name } => {
-            eprintln!("tole: unknown tool '{name}'");
-            "refusal"
-        }
-        tole_core::turn::TurnOutcome::ProviderFailed { message } => {
-            eprintln!("tole: provider failed: {message}");
-            "refusal"
-        }
-        tole_core::turn::TurnOutcome::BudgetExhausted => "max_tokens",
-        tole_core::turn::TurnOutcome::Cancelled => "cancelled",
-        tole_core::turn::TurnOutcome::LoopDetected { tool, .. } => {
-            eprintln!("tole: loop detected on '{tool}'");
-            "refusal"
-        }
-        tole_core::turn::TurnOutcome::Storage(e) => {
-            return Err(format!("storage error: {e}"));
-        }
-    };
+    if let tole_core::turn::TurnOutcome::Final { text, .. } = &outcome {
+        final_text = Some(text.clone());
+    }
+    log_outcome(&outcome);
+    let stop = stop_reason(&outcome)?;
     Ok((stop.to_string(), final_text))
 }
 
@@ -648,17 +657,53 @@ pub fn resume_session_turn(
     if let Some(sys) = system_prompt.as_deref() {
         provider = provider.with_system_prompt(sys);
     }
-    let outcome = tole_core::turn::resume_turn(&mut *storage, &mut provider, &registry)
-        .map_err(|e| e.to_string())?;
-    let stop = match &outcome {
-        tole_core::turn::TurnOutcome::Final { text, .. } => {
-            Ok((("end_turn".to_string()), Some(text.clone())))
-        }
-        tole_core::turn::TurnOutcome::Cancelled => Ok(("cancelled".to_string(), None)),
-        _ => Ok(("refusal".to_string(), None)),
+    // #318: the session token is wired into the replan loop, so
+    // `/cancel` during an approval-resume settles the turn as cancelled.
+    // The `reset()` above stays: like `run_session_turn`, it runs inside
+    // the busy claim, so a cancel landing after the claim targets this
+    // resume, while one that landed earlier had no in-flight turn to
+    // target (cancel is unconditional) and must not kill it.
+    let outcome =
+        tole_core::turn::resume_turn_with_cancel(&mut *storage, &mut provider, &registry, &cancel)
+            .map_err(|e| e.to_string())?;
+    let final_text = match &outcome {
+        tole_core::turn::TurnOutcome::Final { text, .. } => Some(text.clone()),
+        _ => None,
     };
-    let _ = cancel;
-    stop
+    log_outcome(&outcome);
+    Ok((stop_reason(&outcome)?, final_text))
+}
+
+/// Single stop-reason mapping for `run_session_turn` and
+/// `resume_session_turn` (#318) so the two cannot drift. A storage error
+/// outcome is surfaced as `Err`.
+fn stop_reason(outcome: &tole_core::turn::TurnOutcome) -> Result<String, String> {
+    use tole_core::turn::TurnOutcome as O;
+    Ok(match outcome {
+        O::Final { .. } => "end_turn",
+        O::BudgetExhausted => "max_tokens",
+        O::Cancelled => "cancelled",
+        O::StopGateBlocked { .. }
+        | O::ApprovalRequired { .. }
+        | O::UnknownTool { .. }
+        | O::ProviderFailed { .. }
+        | O::LoopDetected { .. } => "refusal",
+        O::Storage(e) => return Err(format!("storage error: {e}")),
+    }
+    .to_string())
+}
+
+/// Operator-visible stderr line for non-final outcomes (unchanged text).
+fn log_outcome(outcome: &tole_core::turn::TurnOutcome) {
+    use tole_core::turn::TurnOutcome as O;
+    match outcome {
+        O::StopGateBlocked { reason } => eprintln!("tole: stop gate blocked the turn: {reason}"),
+        O::ApprovalRequired { name } => eprintln!("tole: approval denied for '{name}'"),
+        O::UnknownTool { name } => eprintln!("tole: unknown tool '{name}'"),
+        O::ProviderFailed { message } => eprintln!("tole: provider failed: {message}"),
+        O::LoopDetected { tool, .. } => eprintln!("tole: loop detected on '{tool}'"),
+        _ => {}
+    }
 }
 
 /// Best-effort `owner/name` from a git remote URL, for gh tool targeting.
@@ -722,5 +767,117 @@ mod plan_tests {
             &serde_json::json!({"entries": [{"content": "x", "status": "done"}]})
         )
         .is_err());
+    }
+}
+
+#[cfg(test)]
+mod eviction_tests {
+    use super::*;
+
+    struct TmpDir(PathBuf);
+    impl TmpDir {
+        fn new(tag: &str) -> Self {
+            let d = std::env::temp_dir().join(format!("tole-evict-{tag}-{}", std::process::id()));
+            std::fs::create_dir_all(&d).unwrap();
+            Self(d)
+        }
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn state(dir: &std::path::Path, name: &str, busy: bool) -> SessionState {
+        let storage = tole_core::storage::JsonlStorage::create(dir, name, None).unwrap();
+        SessionState {
+            storage: StdArc::new(Mutex::new(storage)),
+            registry: StdArc::new(tole_core::tool::ToolRegistry::new()),
+            system_prompt: None,
+            memory: None,
+            first_prompt_done: StdArc::new(Mutex::new(false)),
+            busy: StdArc::new(Mutex::new(busy)),
+            cancel: tole_core::cancel::CancelToken::default(),
+            tool_ids: StdArc::new(Mutex::new(0)),
+        }
+    }
+
+    #[test]
+    fn below_cap_evicts_nothing() {
+        let dir = TmpDir::new("below");
+        let mut s = Sessions::default();
+        s.map.insert("a".into(), state(dir.path(), "a", false));
+        assert_eq!(s.evict_for_insert(2), Ok(vec![]));
+        assert_eq!(s.map.len(), 1);
+    }
+
+    #[test]
+    fn at_cap_evicts_an_idle_session_and_reports_its_id() {
+        let dir = TmpDir::new("atcap");
+        let mut s = Sessions::default();
+        s.map.insert("busy".into(), state(dir.path(), "busy", true));
+        s.map
+            .insert("idle".into(), state(dir.path(), "idle", false));
+        let evicted = s.evict_for_insert(2).unwrap();
+        assert_eq!(evicted, vec!["idle".to_string()]);
+        assert!(s.map.contains_key("busy"), "busy session must survive");
+        assert_eq!(s.map.len(), 1);
+    }
+
+    #[test]
+    fn all_busy_at_cap_errors_and_evicts_nothing() {
+        let dir = TmpDir::new("allbusy");
+        let mut s = Sessions::default();
+        s.map.insert("a".into(), state(dir.path(), "a", true));
+        s.map.insert("b".into(), state(dir.path(), "b", true));
+        assert_eq!(s.evict_for_insert(2), Err(AllSessionsBusy));
+        assert_eq!(s.map.len(), 2);
+    }
+
+    #[test]
+    fn locked_busy_flag_counts_as_busy() {
+        let dir = TmpDir::new("locked");
+        let mut s = Sessions::default();
+        s.map.insert("a".into(), state(dir.path(), "a", false));
+        let flag = s.map["a"].busy.clone();
+        let _held = flag.lock().unwrap();
+        assert_eq!(s.evict_for_insert(1), Err(AllSessionsBusy));
+    }
+}
+
+#[cfg(test)]
+mod stop_reason_tests {
+    use super::stop_reason;
+    use tole_core::turn::TurnOutcome as O;
+
+    #[test]
+    fn maps_every_outcome_once_for_run_and_resume() {
+        let s = |o: O| stop_reason(&o).unwrap();
+        assert_eq!(
+            s(O::Final {
+                text: "t".into(),
+                wrote: false
+            }),
+            "end_turn"
+        );
+        assert_eq!(s(O::BudgetExhausted), "max_tokens");
+        assert_eq!(s(O::Cancelled), "cancelled");
+        for o in [
+            O::StopGateBlocked { reason: "r".into() },
+            O::ApprovalRequired { name: "n".into() },
+            O::UnknownTool { name: "n".into() },
+            O::ProviderFailed {
+                message: "m".into(),
+            },
+            O::LoopDetected {
+                tool: "t".into(),
+                count: 3,
+            },
+        ] {
+            assert_eq!(s(o), "refusal");
+        }
     }
 }

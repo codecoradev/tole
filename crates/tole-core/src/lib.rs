@@ -34,6 +34,8 @@ pub mod cancel;
 pub mod cora_search;
 pub mod entry;
 pub mod file_tools;
+// Tool-call authorization gate (#303): crate-internal, no public API.
+pub(crate) mod gate;
 #[cfg(feature = "shell-tools")]
 pub mod gh;
 #[cfg(feature = "shell-tools")]
@@ -64,6 +66,8 @@ pub mod register;
 pub mod replay;
 #[cfg(feature = "shell-tools")]
 pub mod run_command;
+// Approval-surface text sanitizer (#327): crate-internal, no public API.
+pub(crate) mod sanitize;
 pub mod skills;
 pub mod state;
 pub mod storage;

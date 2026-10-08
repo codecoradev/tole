@@ -42,26 +42,39 @@ fn resolve_host(host: &str) -> Result<Vec<std::net::IpAddr>, String> {
     Ok(addrs)
 }
 
+/// IPv4 special-use check, hand-rolled with octet math (std's
+/// `is_shared`/`is_benchmarking`/`is_reserved` are unstable).
+fn v4_is_private(v4: &std::net::Ipv4Addr) -> bool {
+    let [a, b, c, _] = v4.octets();
+    v4.is_loopback()
+        || v4.is_private()
+        || v4.is_link_local()
+        || v4.is_unspecified()
+        || v4.is_broadcast()
+        || a == 0 // 0.0.0.0/8 "this network"
+        || (a == 100 && (b & 0xc0) == 64) // 100.64.0.0/10 CGNAT / Tailscale
+        || (a == 192 && b == 0 && c == 0) // 192.0.0.0/24 IETF protocol assignments
+        || (a == 198 && (b & 0xfe) == 18) // 198.18.0.0/15 benchmarking
+        || a >= 224 // 224.0.0.0/4 multicast + 240.0.0.0/4 reserved
+}
+
 /// True when `ip` must not be fetched: loopback, link-local (cloud
-/// metadata!), private, unspecified, broadcast — plus the IPv6
-/// neighbors of those: IPv4-mapped literals (`::ffff:169.254.169.254`
-/// is the metadata endpoint as surely as the v4 literal) and ULA
-/// `fc00::/7`. The v6 link-local mask is the canonical /10, not /16.
+/// metadata!), private, CGNAT, multicast, reserved, benchmarking,
+/// unspecified, broadcast — plus the IPv6 neighbors of those:
+/// IPv4-mapped literals (`::ffff:169.254.169.254` is the metadata
+/// endpoint as surely as the v4 literal), NAT64, 6to4 and Teredo
+/// embeddings, ULA `fc00::/7`, site-local `fec0::/10` and multicast
+/// `ff00::/8`. The v6 link-local mask is the canonical /10, not /16.
 fn ip_is_private(ip: &std::net::IpAddr) -> bool {
     match ip {
-        std::net::IpAddr::V4(v4) => {
-            v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.is_unspecified()
-                || v4.is_broadcast()
-        }
+        std::net::IpAddr::V4(v4) => v4_is_private(v4),
         std::net::IpAddr::V6(v6) => {
             // Unwrap every "v4 in v6 clothes" form the resolver can
             // legally hand us: IPv4-mapped ::ffff:/96, IPv4-compatible
-            // ::/96 (legacy but still routable-text), and NAT64
-            // 64:ff9b::/96 (the RFC 6052 translation prefix — a hostile
-            // DNS answer can encode the metadata endpoint here).
+            // ::/96 (legacy but still routable-text), NAT64
+            // 64:ff9b::/96 (RFC 6052), 6to4 2002::/16 and Teredo
+            // 2001::/32. A hostile DNS answer can encode the metadata
+            // endpoint in any of them.
             // Order matters: loopback/unspecified FIRST (::1 must never
             // reach the ::/96 unwrap — ::1 is "::/96 with v4 0.0.0.1",
             // which is not private and would slip through).
@@ -69,42 +82,36 @@ fn ip_is_private(ip: &std::net::IpAddr) -> bool {
                 return true;
             }
             if let Some(v4) = v6.to_ipv4_mapped() {
-                return ip_is_private(&std::net::IpAddr::V4(v4));
+                return v4_is_private(&v4);
             }
             let seg = v6.segments();
+            let v4_from = |hi: u16, lo: u16| {
+                std::net::Ipv4Addr::new(
+                    (hi >> 8) as u8,
+                    (hi & 0xff) as u8,
+                    (lo >> 8) as u8,
+                    (lo & 0xff) as u8,
+                )
+            };
             // ::/96 IPv4-compatible (legacy) and 64:ff9b::/96 NAT64 both
             // carry the embedded v4 in segments 6-7.
-            if seg[0] == 0
-                && seg[1] == 0
-                && seg[2] == 0
-                && seg[3] == 0
-                && seg[4] == 0
-                && seg[5] == 0
-            {
-                let v4 = std::net::Ipv4Addr::new(
-                    (seg[6] >> 8) as u8,
-                    (seg[6] & 0xff) as u8,
-                    (seg[7] >> 8) as u8,
-                    (seg[7] & 0xff) as u8,
-                );
-                return ip_is_private(&std::net::IpAddr::V4(v4));
+            if seg[..6] == [0, 0, 0, 0, 0, 0] || seg[..6] == [0, 0x0064, 0xff9b, 0, 0, 0] {
+                return v4_is_private(&v4_from(seg[6], seg[7]));
             }
-            if seg[0] == 0
-                && seg[1] == 0x0064
-                && seg[2] == 0xff9b
-                && seg[3] == 0
-                && seg[4] == 0
-                && seg[5] == 0
-            {
-                let v4 = std::net::Ipv4Addr::new(
-                    (seg[6] >> 8) as u8,
-                    (seg[6] & 0xff) as u8,
-                    (seg[7] >> 8) as u8,
-                    (seg[7] & 0xff) as u8,
-                );
-                return ip_is_private(&std::net::IpAddr::V4(v4));
+            // 6to4: 2002:AABB:CCDD::/48 embeds the v4 in segments 1-2.
+            if seg[0] == 0x2002 {
+                return v4_is_private(&v4_from(seg[1], seg[2]));
             }
-            (seg[0] & 0xffc0) == 0xfe80 || (seg[0] & 0xfe00) == 0xfc00
+            // Teredo 2001:0::/32: server v4 in segments 2-3, client v4
+            // is the bitwise NOT of segments 6-7. Either private -> refuse.
+            if seg[0] == 0x2001 && seg[1] == 0 {
+                return v4_is_private(&v4_from(seg[2], seg[3]))
+                    || v4_is_private(&v4_from(!seg[6], !seg[7]));
+            }
+            (seg[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
+                || (seg[0] & 0xffc0) == 0xfec0 // fec0::/10 site-local
+                || (seg[0] & 0xfe00) == 0xfc00 // fc00::/7 ULA
+                || (seg[0] & 0xff00) == 0xff00 // ff00::/8 multicast
         }
     }
 }
@@ -245,27 +252,91 @@ fn agent() -> ureq::Agent {
         .new_agent()
 }
 
+/// A redirect hop may only land on http(s). `join_redirect` passes any
+/// RFC 3986 absolute reference through verbatim, so the fetch loop gates
+/// the joined URL here (file:/ftp:/gopher: Locations never reach the
+/// fetcher).
+fn redirect_scheme_allowed(url: &str) -> bool {
+    url.starts_with("http://") || url.starts_with("https://")
+}
+
 /// SSRF guard (cora MAJOR on #215): resolve the host and refuse
 /// loopback / link-local (cloud metadata!) / private / unspecified
 /// ranges. `TOLE_WEB_ALLOW_PRIVATE=1` opts out for local development
 /// and tests — an explicit, documented escape hatch, never a default.
-/// Resolve a possibly-relative Location against the previous URL
-/// (minimal join: absolute URLs pass through; leading-/ paths join the
-/// origin; everything else joins the current directory).
+/// RFC 3986 §5.2 reference resolution of a redirect `Location` against
+/// `base` — the URL of the response that carried it (the CURRENT hop,
+/// not the original request). Handles absolute URLs, network-path
+/// (`//host/p`), absolute-path, query-only, and relative-path references
+/// including `.`/`..` segment removal. Fragments are dropped (never sent).
 fn join_redirect(base: &str, location: &str) -> String {
-    if location.starts_with("http://") || location.starts_with("https://") {
+    let location = location.split('#').next().unwrap_or("");
+    let has_scheme = location.split_once(':').is_some_and(|(s, _)| {
+        s.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    });
+    if has_scheme {
         return location.to_string();
     }
-    let origin_end = base
-        .split_once("://")
-        .map(|(scheme, rest)| scheme.len() + 3 + rest.split('/').next().unwrap_or("").len())
-        .unwrap_or(0);
-    let origin = &base[..origin_end];
-    if let Some(path) = location.strip_prefix('/') {
-        format!("{origin}/{path}")
-    } else {
-        format!("{}/{}", base.trim_end_matches('/'), location)
+    let base = base.split('#').next().unwrap_or("");
+    let (scheme, rest) = base.split_once("://").unwrap_or(("", base));
+    let auth_end = rest.find(['/', '?']).unwrap_or(rest.len());
+    let (authority, path_query) = rest.split_at(auth_end);
+    let (base_path, base_query) = match path_query.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (path_query, None),
+    };
+    let origin = format!("{scheme}://{authority}");
+    if location.starts_with("//") {
+        return format!("{scheme}:{location}");
     }
+    if location.is_empty() {
+        return base.to_string();
+    }
+    let (ref_path, ref_query) = match location.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (location, None),
+    };
+    let (path, query) = if ref_path.is_empty() {
+        (base_path.to_string(), ref_query.or(base_query))
+    } else if ref_path.starts_with('/') {
+        (remove_dot_segments(ref_path), ref_query)
+    } else {
+        let dir = match base_path.rfind('/') {
+            Some(i) => &base_path[..=i],
+            None if authority.is_empty() => "",
+            None => "/",
+        };
+        (remove_dot_segments(&format!("{dir}{ref_path}")), ref_query)
+    };
+    match query {
+        Some(q) => format!("{origin}{path}?{q}"),
+        None => format!("{origin}{path}"),
+    }
+}
+
+/// RFC 3986 §5.2.4 `remove_dot_segments` (segment-stack form).
+fn remove_dot_segments(path: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    let mut trailing_slash = false;
+    for seg in path.split('/').skip(1) {
+        trailing_slash = false;
+        match seg {
+            "." => trailing_slash = true,
+            ".." => {
+                out.pop();
+                trailing_slash = true;
+            }
+            s => out.push(s),
+        }
+    }
+    let mut res = String::from("/");
+    res.push_str(&out.join("/"));
+    if trailing_slash && !out.is_empty() {
+        res.push('/');
+    }
+    res
 }
 
 /// `html2text`-lite: drop script/style blocks, strip tags, decode the
@@ -359,6 +430,10 @@ impl Tool for WebFetchTool {
     fn risk(&self) -> Risk {
         Risk::ReadOnly
     }
+    fn summary(&self) -> String {
+        "Fetch an http(s) URL and return its text content, size-capped.".into()
+    }
+
     fn describe(&self, input: &Value) -> String {
         format!(
             "fetch {} (text-only, size-capped)",
@@ -418,6 +493,9 @@ impl Tool for WebFetchTool {
                 .map(str::to_string)
                 .ok_or_else(|| format!("web_fetch: {status} redirect without Location"))?;
             url = join_redirect(&url, &location);
+            if !redirect_scheme_allowed(&url) {
+                return Err("web_fetch: redirect to a non-http(s) scheme — refused".into());
+            }
             if https_only && !url.starts_with("https://") {
                 return Err("web_fetch: redirect would downgrade https to http — refused".into());
             }
@@ -497,6 +575,10 @@ impl Tool for WebSearchTool {
     fn risk(&self) -> Risk {
         Risk::ReadOnly
     }
+    fn summary(&self) -> String {
+        "Search the web and return ranked results.".into()
+    }
+
     fn describe(&self, input: &Value) -> String {
         format!("web search: {}", input["query"].as_str().unwrap_or("?"))
     }
@@ -563,6 +645,60 @@ fn urlencoding_lite(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::join_redirect;
+
+    /// #281: RFC 3986 §5.4 reference resolution against the current hop.
+    #[test]
+    fn redirect_gate_refuses_non_http_schemes() {
+        use super::redirect_scheme_allowed;
+        for loc in [
+            "file:///etc/passwd",
+            "ftp://h.example/x",
+            "gopher://h.example/",
+            "javascript:alert(1)",
+        ] {
+            let joined = join_redirect("https://h.example/a", loc);
+            assert!(!redirect_scheme_allowed(&joined), "{loc}");
+        }
+        assert!(redirect_scheme_allowed(&join_redirect(
+            "https://h.example/a",
+            "/b"
+        )));
+        assert!(redirect_scheme_allowed(&join_redirect(
+            "http://h.example/a",
+            "https://x.example/"
+        )));
+    }
+
+    #[test]
+    fn join_redirect_resolves_per_rfc3986() {
+        let b = "https://h.example/a/b/c?q=1";
+        for (loc, want) in [
+            ("g", "https://h.example/a/b/g"),
+            ("./g", "https://h.example/a/b/g"),
+            ("g/", "https://h.example/a/b/g/"),
+            ("/g", "https://h.example/g"),
+            ("//other.example/g", "https://other.example/g"),
+            ("?y", "https://h.example/a/b/c?y"),
+            ("../g", "https://h.example/a/g"),
+            ("../../g", "https://h.example/g"),
+            ("../../../g", "https://h.example/g"),
+            ("g#s", "https://h.example/a/b/g"),
+            ("", "https://h.example/a/b/c?q=1"),
+            ("https://x.example/p", "https://x.example/p"),
+        ] {
+            assert_eq!(join_redirect(b, loc), want, "location {loc:?}");
+        }
+        // Second hop: a relative Location resolves against THAT hop's URL.
+        let hop2 = join_redirect(b, "../x/y");
+        assert_eq!(hop2, "https://h.example/a/x/y");
+        assert_eq!(join_redirect(&hop2, "z"), "https://h.example/a/x/z");
+        // Authority-only base.
+        assert_eq!(
+            join_redirect("https://h.example", "g"),
+            "https://h.example/g"
+        );
+    }
 
     /// Scanner-clean http URL literal for tests that deliberately exercise
     /// plaintext/SSRF classes (the lint cannot see through the concat).
@@ -762,6 +898,65 @@ mod tests {
                 host_is_public_opt(url.as_str(), true).is_ok(),
                 "{url} opted out"
             );
+        }
+    }
+
+    #[test]
+    fn ip_is_private_special_use_table() {
+        let allowed = [
+            "8.8.8.8",
+            "1.1.1.1",
+            "93.184.216.34",
+            "100.63.255.255",
+            "100.128.0.0",
+            "192.0.1.1",
+            "198.17.255.255",
+            "198.20.0.0",
+            "223.255.255.255",
+            "2606:2800:220:1::1",
+            // 6to4 embedding 8.8.8.8
+            "2002:808:808::1",
+            // Teredo: server 8.8.8.8, client 1.2.3.4 (NOT = fefd:fcfb)
+            "2001:0:808:808::fefd:fcfb",
+        ];
+        for a in allowed {
+            let ip: std::net::IpAddr = a.parse().unwrap();
+            assert!(!ip_is_private(&ip), "{a} must stay allowed");
+        }
+        let refused = [
+            "0.0.0.1",
+            "0.255.255.255",
+            "100.64.0.0",
+            "100.64.0.1",
+            "100.127.255.255",
+            "192.0.0.0",
+            "192.0.0.255",
+            "198.18.0.0",
+            "198.19.255.255",
+            "224.0.0.0",
+            "239.255.255.255",
+            "240.0.0.0",
+            "255.255.255.254",
+            "ff00::",
+            "ff02::1",
+            "fec0::1",
+            "feff::1",
+            // 6to4 embedding 10.0.0.1 / 169.254.169.254 / 100.64.0.1
+            "2002:a00:1::1",
+            "2002:a9fe:a9fe::1",
+            "2002:6440:1::1",
+            // Teredo, private server v4 (segments 2-3)
+            "2001:0:a00:1::fefd:fcfb",
+            "2001:0:a9fe:a9fe::fefd:fcfb",
+            "2001:0:6440:1::fefd:fcfb",
+            // Teredo, private client v4 (bitwise NOT of segments 6-7)
+            "2001:0:808:808::f5ff:fffe",
+            "2001:0:808:808::5601:5601",
+            "2001:0:808:808::9bbf:fffe",
+        ];
+        for a in refused {
+            let ip: std::net::IpAddr = a.parse().unwrap();
+            assert!(ip_is_private(&ip), "{a} must be refused");
         }
     }
 }

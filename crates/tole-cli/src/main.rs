@@ -46,14 +46,10 @@ fn session_path(dir: &Path, id: &str) -> PathBuf {
     dir.join(format!("{id}.jsonl"))
 }
 
-/// Session id validity: `[a-z0-9-]` — also prevents `../` traversal in
-/// the sessions dir.
+/// Session id validity — the one shared rule (`[A-Za-z0-9_-]`, 1..=64,
+/// no traversal), identical to what serve/ACP/storage accept.
 fn valid_session_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 64
-        && id
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    tole_core::storage::is_valid_session_id(id)
 }
 
 /// `tole` — a durable agent loop with approval gates.
@@ -1052,7 +1048,8 @@ fn detect_github_repo(cwd: &Path) -> Option<String> {
 /// Destructive-never-allowed invariant) is unchanged. `internal` covers
 /// the probe-gated native integrations (uteke_*, cora_search) plus the
 /// cora MCP auto-preset surface (mcp_cora_*) and the always-safe
-/// verify_package/job tools; it deliberately excludes the write-capable
+/// verify_package/job tools plus `agent_poll` (Write since #300; exact name,
+/// so `agent_start` still prompts); it deliberately excludes the write-capable
 /// native tools (write_file/edit_file/run_command/git/gh), which keep
 /// prompting.
 const TRUST_PRESETS: &[(&str, &[&str])] = &[
@@ -1064,6 +1061,7 @@ const TRUST_PRESETS: &[(&str, &[&str])] = &[
             "mcp_cora_*",
             "verify_package",
             "job_*",
+            "agent_poll",
             "tole_session_*",
             "todo_write",
         ],
@@ -1171,6 +1169,23 @@ fn check_client_session_flags(
     Ok(())
 }
 
+/// Register the `gh` tool against the checkout's own GitHub repo.
+/// Probe-gated (issues #254, #293): when detection fails there is NO
+/// gh tool — a hardcoded fallback repo invited wrong-repo writes from
+/// any unrelated workspace.
+#[cfg(feature = "shell-tools")]
+fn register_gh(reg: &mut ToolRegistry, cwd: &Path) -> Result<()> {
+    match detect_github_repo(cwd) {
+        Some(repo) => reg
+            .register(Box::new(GhTool::new(repo)))
+            .map_err(|e| anyhow::anyhow!("registering gh: {e}")),
+        None => {
+            eprintln!("tole: no GitHub origin remote detected — gh tool not registered");
+            Ok(())
+        }
+    }
+}
+
 fn build_registry(
     approver: InteractiveApprover<StdioPrompt>,
     workspace: Option<&String>,
@@ -1273,12 +1288,7 @@ fn build_registry(
         .map_err(|e| anyhow::anyhow!("registering edit_file: {e}"))?;
     #[cfg(feature = "shell-tools")]
     {
-        // Target the checkout's own GitHub repo when detectable — a
-        // hardcoded one made `gh` act on the wrong project (CodeCora
-        // dogfood finding 2026-09-18).
-        let gh_repo = detect_github_repo(&cwd).unwrap_or_else(|| "codecoradev/tole".into());
-        reg.register(Box::new(GhTool::new(gh_repo)))
-            .map_err(|e| anyhow::anyhow!("registering gh: {e}"))?;
+        register_gh(&mut reg, &cwd)?;
         tole_cli::session_host::register_gitea(&mut reg, &cwd);
     }
     // Light git: status/diff/add/commit (push stays human).
@@ -1409,9 +1419,7 @@ fn build_server_registry(
         .map_err(|e| anyhow::anyhow!("registering edit_file: {e}"))?;
     #[cfg(feature = "shell-tools")]
     {
-        let gh_repo = detect_github_repo(&cwd).unwrap_or_else(|| "codecoradev/tole".into());
-        reg.register(Box::new(GhTool::new(gh_repo)))
-            .map_err(|e| anyhow::anyhow!("registering gh: {e}"))?;
+        register_gh(&mut reg, &cwd)?;
         tole_cli::session_host::register_gitea(&mut reg, &cwd);
         reg.register(Box::new(GitTool::new().in_dir(cwd.clone())))
             .map_err(|e| anyhow::anyhow!("registering git: {e}"))?;
@@ -1426,10 +1434,16 @@ fn build_server_registry(
 /// hardened tools as stdio MCP (D1); the session tools join separately
 /// via RegistryServer::with_extra_tools.
 #[cfg(all(feature = "mcp-http", feature = "shell-tools"))]
-fn build_server_registry_for_mcp(_plan_mode: bool) -> Result<ToolRegistry> {
+fn build_server_registry_for_mcp(plan_mode: bool) -> Result<ToolRegistry> {
     // Empty allowlist: the session tools carry their own approver per
     // session; registry Write tools stay pre-auth-off (deny by default).
-    build_server_registry(None, &[])
+    let mut registry = build_server_registry(None, &[])?;
+    // Plan mode (#294): same retain_read_only semantics as the other
+    // faces — Write/Destructive tools are absent, not merely denied.
+    if plan_mode {
+        registry.retain_read_only();
+    }
+    Ok(registry)
 }
 
 /// D1 (issue #94): serve the registry over MCP stdio. Blocks until the
@@ -2016,6 +2030,31 @@ fn latest_session_id(dir: &Path) -> Option<String> {
 /// `resume_turn` on the next line, keeping the conversation alive without
 /// losing durable context. Ctrl-C / EOF exit cleanly — every commit is
 /// already durable, `tole chat --resume <id>` picks the thread back up.
+/// Register `todo_read`/`todo_write` with state hydrated from `entries`
+/// (issue #276). `todo_write` is skipped in plan mode so it stays absent
+/// on the wire, matching the `retain_read_only` guarantee.
+fn register_todo_tools(
+    registry: &mut ToolRegistry,
+    entries: &[tole_core::entry::Entry],
+    plan_mode: bool,
+) -> Result<()> {
+    let todo_state = tole_core::todo::TodoState::new();
+    todo_state.hydrate(entries);
+    registry
+        .register(Box::new(tole_core::todo::TodoReadTool::new(
+            std::sync::Arc::clone(&todo_state),
+        )))
+        .map_err(|e| anyhow::anyhow!("registering todo_read: {e}"))?;
+    if !plan_mode {
+        registry
+            .register(Box::new(tole_core::todo::TodoWriteTool::new(
+                std::sync::Arc::clone(&todo_state),
+            )))
+            .map_err(|e| anyhow::anyhow!("registering todo_write: {e}"))?;
+    }
+    Ok(())
+}
+
 fn chat_command(
     sessions_dir: &Path,
     system: Option<&str>,
@@ -2118,6 +2157,12 @@ fn chat_command(
     } else {
         JsonlStorage::open(&path).context("replaying session log")?
     };
+    // Task-list tools (issues #198/#276): per-session state hydrated from
+    // the replayed transcript so a resumed chat keeps its plan.
+    {
+        use tole_core::storage::Storage;
+        register_todo_tools(&mut registry, storage.entries(), host.plan_mode)?;
+    }
     println!(
         "tole chat — session {session_id} (Ctrl-D exits, resume: tole chat --resume {session_id})"
     );
@@ -2259,7 +2304,7 @@ fn chat_command(
                 "tole> (approval denied for '{name}' — turn aborted; your next message resumes)"
             ),
             Ok(TurnOutcome::UnknownTool { name }) => {
-                eprintln!("tole> (unknown tool '{name}' — recorded; next message resumes)")
+                eprintln!("tole> (unknown tool '{name}' — recorded; your next message continues)")
             }
             Ok(TurnOutcome::ProviderFailed { message }) => {
                 eprintln!("tole> (provider failed: {message}; next message retries via resume)")
@@ -2506,6 +2551,20 @@ mod gh_repo_tests {
     }
 
     #[test]
+    fn gh_tool_not_registered_without_detected_repo() {
+        // Issue #293: a non-GitHub cwd must yield NO gh tool (no
+        // hardcoded fallback repo).
+        let dir = std::env::temp_dir().join(format!("tole-gh-none-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut reg =
+            ToolRegistry::with_approver(tole_core::approval::AllowlistApprover::allow_only(vec![]));
+        register_gh(&mut reg, &dir).unwrap();
+        assert!(reg.get("gh").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn detects_repo_from_checkout() {
         // A real checkout: init + remote origin, then detect.
         let dir = std::env::temp_dir().join(format!("tole-gh-detect-{}", std::process::id()));
@@ -2528,6 +2587,36 @@ mod gh_repo_tests {
         let detected = detect_github_repo(&dir);
         assert_eq!(detected.as_deref(), Some("detected/owner-name"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod session_id_rule_tests {
+    /// Issue #295: the CLI (`--resume`/`status`) and serve/ACP must agree
+    /// on every id, including uppercase and `_`.
+    #[test]
+    fn cli_and_serve_acp_session_id_rules_agree() {
+        let long = "a".repeat(65);
+        let cases = [
+            ("s-abc123", true),
+            ("Session_ID-1", true),
+            ("UPPER", true),
+            ("under_score", true),
+            ("", false),
+            ("..", false),
+            ("../evil", false),
+            ("a/b", false),
+            ("a\\b", false),
+            (long.as_str(), false),
+        ];
+        for (id, ok) in cases {
+            assert_eq!(super::valid_session_id(id), ok, "valid_session_id({id:?})");
+            assert_eq!(
+                tole_cli::session_host::validate_session_id(id).is_some(),
+                ok,
+                "validate_session_id({id:?})"
+            );
+        }
     }
 }
 
@@ -2698,6 +2787,7 @@ mod trust_preset_tests {
             "mcp_cora_*",
             "verify_package",
             "job_*",
+            "agent_poll",
             "tole_session_*",
         ] {
             assert!(
@@ -2708,6 +2798,9 @@ mod trust_preset_tests {
         // must NOT include write-capable native tools
         assert!(!pats.iter().any(|p| p == "write_file"));
         assert!(!pats.iter().any(|p| p == "run_command"));
+        // agent_poll (Write since #300) is allowlisted by exact name so the
+        // poll loop stays unattended; agent_start must keep prompting.
+        assert!(!pats.iter().any(|p| p == "agent_*" || p == "agent_start"));
     }
 
     #[test]
@@ -2886,5 +2979,53 @@ mod server_face_flag_tests {
         let msg = err.to_string();
         assert!(msg.contains("--mcp-server"), "{msg}");
         assert!(msg.contains("tole serve"), "{msg}");
+    }
+}
+
+#[cfg(test)]
+mod chat_todo_tests {
+    use super::*;
+
+    /// Issue #276 regression: the chat face registers both todo tools
+    /// (and only todo_read in plan mode).
+    #[test]
+    fn chat_registers_todo_tools_and_respects_plan_mode() {
+        let mut reg =
+            ToolRegistry::with_approver(tole_core::approval::AllowlistApprover::allow_only(vec![]));
+        register_todo_tools(&mut reg, &[], false).unwrap();
+        assert!(reg.get("todo_read").is_some());
+        assert!(reg.get("todo_write").is_some());
+        let mut plan = ToolRegistry::new();
+        register_todo_tools(&mut plan, &[], true).unwrap();
+        assert!(plan.get("todo_read").is_some());
+        assert!(plan.get("todo_write").is_none());
+    }
+
+    /// Issue #294 regression: the server-level registry of the MCP HTTP
+    /// face must be read-only under plan mode (absent, not just denied).
+    #[cfg(all(feature = "mcp-http", feature = "shell-tools"))]
+    #[test]
+    fn mcp_server_registry_is_read_only_under_plan_mode() {
+        use tole_core::tool::Risk;
+        let normal = build_server_registry_for_mcp(false).unwrap();
+        assert!(
+            normal.specs().iter().any(|s| normal
+                .get(s["function"]["name"].as_str().unwrap())
+                .unwrap()
+                .risk()
+                != Risk::ReadOnly),
+            "non-plan registry must expose write tools"
+        );
+        let plan = build_server_registry_for_mcp(true).unwrap();
+        let specs = plan.specs();
+        assert!(!specs.is_empty());
+        for spec in &specs {
+            let name = spec["function"]["name"].as_str().unwrap();
+            assert_eq!(
+                plan.get(name).unwrap().risk(),
+                Risk::ReadOnly,
+                "{name} must not survive plan mode"
+            );
+        }
     }
 }

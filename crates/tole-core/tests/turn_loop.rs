@@ -2,7 +2,7 @@
 //! turn loop on the mock provider (no network, deterministic, fast).
 
 use serde_json::{json, Value};
-use tole_core::approval::{AllowlistApprover, Decision};
+use tole_core::approval::AllowlistApprover;
 use tole_core::entry::Entry;
 use tole_core::mock::MockProvider;
 use tole_core::provider::{Provider, ProviderError, ProviderOutput};
@@ -50,7 +50,12 @@ impl Tool for WriteTool {
 }
 
 fn tmpdir(name: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("cora-e3-{}-{}", name, std::process::id()));
+    // Unique PER CALL (pid + monotonic counter): two tests sharing a tag
+    // (e.g. "unknown") must never remove_dir_all each other's directory
+    // when the harness runs them in parallel.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let d = std::env::temp_dir().join(format!("cora-e3-{}-{}-{n:x}", name, std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     d
@@ -448,7 +453,7 @@ fn turn_write_tool_requires_approval_gate() {
     }
     // The refusal is durable: an ERROR entry attached to the user message.
     assert!(!s.entries().iter().any(|e| e.kind.as_str() == "intent"));
-    assert_eq!(s.state().pc, tole_core::state::Pc::Planning);
+    assert_eq!(s.state().pc, tole_core::state::Pc::Final);
 }
 
 #[test]
@@ -691,10 +696,9 @@ fn abort_paths_leave_durable_error_records_and_no_final() {
         // Write tools need an approver (E4); only the approval path
         // registers one here via with_approver.
         if name == "approval" {
-            reg = ToolRegistry::with_approver(AllowlistApprover::new(
-                vec!["write_file".into()],
-                Decision::Deny,
-            ));
+            reg = ToolRegistry::with_approver(AllowlistApprover::allow_only(vec![
+                "write_file".into()
+            ]));
             reg.register(Box::new(WriteTool)).unwrap();
         }
 
@@ -869,10 +873,10 @@ fn write_session_reports_wrote_true_on_final() {
             text: "written".into(),
         },
     ]);
-    let mut reg = ToolRegistry::with_approver(AllowlistApprover::new(
-        vec!["write_file".to_string()],
-        Decision::Deny,
-    ));
+    let mut reg =
+        ToolRegistry::with_approver(AllowlistApprover::allow_only(
+            vec!["write_file".to_string()],
+        ));
     reg.register(Box::new(WriteTool)).unwrap();
 
     let out = run_turn(&mut s, &mut p, &reg, "hi").unwrap();
@@ -921,10 +925,10 @@ fn wrote_flag_survives_crash_resume_boundary() {
         tool: "write_file".into(),
         input: json!({"path": "a.txt"}),
     }]);
-    let mut reg = ToolRegistry::with_approver(AllowlistApprover::new(
-        vec!["write_file".to_string()],
-        Decision::Deny,
-    ));
+    let mut reg =
+        ToolRegistry::with_approver(AllowlistApprover::allow_only(
+            vec!["write_file".to_string()],
+        ));
     reg.register(Box::new(WriteTool)).unwrap();
 
     let out = run_turn(&mut s, &mut p, &reg, "hi").unwrap();
@@ -1010,10 +1014,10 @@ fn aborted_writing_turn_keeps_the_session_flag() {
     // period. The follow-up turn's Final reports wrote=true.
     let dir = tmpdir("decision-stale");
     let mut s = JsonlStorage::create(&dir, "dstale", None).unwrap();
-    let mut reg = ToolRegistry::with_approver(AllowlistApprover::new(
-        vec!["write_file".to_string()],
-        Decision::Deny,
-    ));
+    let mut reg =
+        ToolRegistry::with_approver(AllowlistApprover::allow_only(
+            vec!["write_file".to_string()],
+        ));
     reg.register(Box::new(WriteTool)).unwrap();
 
     let mut p1 = MockProvider::scripted(vec![ProviderOutput::ToolCall {
@@ -1053,6 +1057,7 @@ fn aborted_writing_turn_keeps_the_session_flag() {
 // Issue #145: turn-end stop gates (--on-turnend)
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "shell-tools")]
 struct GateScript {
     /// exit code the gate script returns; stdout is its reason on deny
     code: i32,
@@ -1061,6 +1066,7 @@ struct GateScript {
 
 /// Build a gate hook command line: a sh script that emits `reason` and
 /// exits with `code`. Returns (command_line, _dir_keepalive).
+#[cfg(feature = "shell-tools")]
 fn gate_cmd(g: &GateScript) -> (String, std::path::PathBuf) {
     use std::sync::atomic::{AtomicU32, Ordering};
     static SEQ: AtomicU32 = AtomicU32::new(0);
@@ -1080,6 +1086,7 @@ fn gate_cmd(g: &GateScript) -> (String, std::path::PathBuf) {
     (format!("/bin/sh {}", path.display()), dir)
 }
 
+#[cfg(feature = "shell-tools")]
 fn registry_with_gates(cmds: &[String]) -> ToolRegistry {
     let mut reg = ToolRegistry::new();
     let mut hooks = tole_core::hooks::ToolHooks::from_cli(&[], &[]);
@@ -1092,11 +1099,12 @@ fn registry_with_gates(cmds: &[String]) -> ToolRegistry {
 }
 
 /// Same but Write-capable (approver allowlists write_file).
+#[cfg(feature = "shell-tools")]
 fn registry_with_gates_write(cmds: &[String]) -> ToolRegistry {
-    let mut reg = ToolRegistry::with_approver(tole_core::approval::AllowlistApprover::new(
-        vec!["write_file".to_string()],
-        tole_core::approval::Decision::Deny,
-    ));
+    let mut reg =
+        ToolRegistry::with_approver(tole_core::approval::AllowlistApprover::allow_only(vec![
+            "write_file".to_string(),
+        ]));
     let mut hooks = tole_core::hooks::ToolHooks::from_cli(&[], &[]);
     hooks.turnend = cmds
         .iter()
@@ -1106,6 +1114,7 @@ fn registry_with_gates_write(cmds: &[String]) -> ToolRegistry {
     reg
 }
 
+#[cfg(feature = "shell-tools")]
 #[test]
 fn stop_gate_deny_blocks_final_and_forces_continuation() {
     // First Final is DENIED (gate exit 2): it must NOT commit; the deny
@@ -1165,6 +1174,7 @@ fn stop_gate_deny_blocks_final_and_forces_continuation() {
     assert!(has_reason, "deny reason must be durable");
 }
 
+#[cfg(feature = "shell-tools")]
 #[test]
 fn stop_gate_pass_is_behavior_identical() {
     let dir = tmpdir("gate-pass");
@@ -1199,6 +1209,7 @@ fn stop_gate_pass_is_behavior_identical() {
     assert_eq!(gate_entries, 0);
 }
 
+#[cfg(feature = "shell-tools")]
 #[test]
 fn stop_gate_cap_trips_in_isolation() {
     // A gate that ALWAYS denies must end the turn at the cap
@@ -1231,6 +1242,7 @@ fn stop_gate_cap_trips_in_isolation() {
         .any(|e| e.kind.as_str() == "error" && e.payload["error"] == json!("stop gate blocked")));
 }
 
+#[cfg(feature = "shell-tools")]
 #[test]
 fn stop_gate_nonzero_exit_denies_with_stdout_reason() {
     // Gate semantics (issue #145, live-E2E correction): ANY non-zero
@@ -1276,6 +1288,7 @@ fn stop_gate_nonzero_exit_denies_with_stdout_reason() {
     assert!(has_reason, "the 101 verdict reason must be durable");
 }
 
+#[cfg(feature = "shell-tools")]
 #[test]
 fn stop_gate_payload_is_per_turn_not_history() {
     // cora CI: turn 1 executes a Write; turn 2 (fresh run_turn) produces
@@ -1343,6 +1356,7 @@ fn stop_gate_payload_is_per_turn_not_history() {
     );
 }
 
+#[cfg(feature = "shell-tools")]
 #[test]
 fn stop_gate_payload_keeps_tools_across_own_denial() {
     // cora CI round 2: the deny feedback entry is user-role; on the

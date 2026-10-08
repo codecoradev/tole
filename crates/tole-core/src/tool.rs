@@ -53,6 +53,19 @@ pub trait Tool: Send + Sync {
     fn describe(&self, _input: &Value) -> String {
         format!("{} ({})", self.name(), self.risk().as_str())
     }
+    /// Static, provider-facing description of the tool, sent as the
+    /// `description` of its spec (issue #320). Unlike `describe`, which
+    /// renders ONE concrete call for an approval prompt and may validate
+    /// its input (and so return an error string for `Null`), this takes
+    /// no input and must never fail.
+    ///
+    /// Default: tool name + risk tier. Deliberately NOT derived from
+    /// `describe(Null)`: there is no way to tell a real description from
+    /// a validation error string. Override with one sentence on what the
+    /// tool does and its main operations.
+    fn summary(&self) -> String {
+        format!("{} ({})", self.name(), self.risk().as_str())
+    }
     /// JSON Schema for the input object, sent to the provider as this
     /// tool's `parameters` (E4.5). `None` (the default) means "object
     /// with no declared properties" — still callable, just untyped.
@@ -266,7 +279,7 @@ impl ToolRegistry {
                     "type": "function",
                     "function": {
                         "name": t.name(),
-                        "description": t.describe(&serde_json::Value::Null),
+                        "description": t.summary(),
                         "parameters": t.spec().unwrap_or_else(|| json!({
                             "type": "object",
                             "properties": {},
@@ -286,7 +299,9 @@ impl ToolRegistry {
             tool: name,
             risk: t.risk(),
             input,
-            description: t.describe(input),
+            // Single fan-out point (#327): neutralize control/bidi/separator
+            // chars before any approval surface sees the description.
+            description: crate::sanitize::sanitize_one_line(&t.describe(input)),
         };
         self.approver.as_ref().map(|a| a.decide(&req))
     }
@@ -343,6 +358,61 @@ mod tests {
         }
     }
 
+    /// Write tool whose `describe` echoes a model-controlled string.
+    struct EchoDescribe;
+
+    impl Tool for EchoDescribe {
+        fn name(&self) -> &str {
+            "echo_describe"
+        }
+        fn risk(&self) -> Risk {
+            Risk::Write
+        }
+        fn describe(&self, input: &Value) -> String {
+            format!("start job: {}", input["cmd"].as_str().unwrap_or(""))
+        }
+        fn execute(&self, _: Value) -> Result<Value, String> {
+            Ok(json!({}))
+        }
+    }
+
+    /// Records every description it is asked to decide on.
+    struct Recording(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl crate::approval::Approver for Recording {
+        fn decide(&self, req: &crate::approval::ToolRequest<'_>) -> crate::approval::Verdict {
+            self.0.lock().unwrap().push(req.description.clone());
+            crate::approval::Verdict::Deny
+        }
+        fn interactive(&self) -> bool {
+            true
+        }
+    }
+
+    fn decide_description(cmd: &str) -> String {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut reg = ToolRegistry::with_approver(Recording(seen.clone()));
+        reg.register(Box::new(EchoDescribe)).unwrap();
+        reg.decide("echo_describe", &json!({ "cmd": cmd })).unwrap();
+        let v = seen.lock().unwrap();
+        v[0].clone()
+    }
+
+    #[test]
+    fn decide_sanitizes_hostile_description() {
+        let d = decide_description("ls\x1b[2K\rAPPROVED \u{202E}gnp.exe\u{2028}rm -rf /");
+        for bad in ['\x1b', '\r', '\u{202E}', '\u{2028}'] {
+            assert!(!d.contains(bad), "raw {bad:?} reached approver: {d:?}");
+        }
+        assert!(d.contains("\\u{1b}") && d.contains("\\u{202e}"), "{d:?}");
+    }
+
+    #[test]
+    fn decide_leaves_normal_description_unchanged() {
+        let cmd = "echo \"héllo\" 日本語 🚀 'x'";
+        assert_eq!(decide_description(cmd), format!("start job: {cmd}"));
+    }
+
     fn registry_with_all_risks() -> ToolRegistry {
         // Write/Destructive registration REQUIRES an (interactive)
         // approver — a deny-all one is enough for this test.
@@ -369,6 +439,37 @@ mod tests {
         assert!(reg.get("fake_write").is_none());
         assert!(reg.get("fake_destructive").is_none());
         assert!(reg.get("read_file").is_some());
+    }
+
+    /// Issue #320: an external `Tool` that predates `summary()` (it
+    /// implements only the required methods) must keep compiling, and
+    /// gets the safe default — never an error string, even when its
+    /// `describe` validates input and fails for `Null`.
+    #[test]
+    fn external_tool_without_summary_gets_safe_default() {
+        struct Legacy;
+        impl Tool for Legacy {
+            fn name(&self) -> &str {
+                "legacy"
+            }
+            fn risk(&self) -> Risk {
+                Risk::ReadOnly
+            }
+            fn describe(&self, input: &Value) -> String {
+                match input.get("x") {
+                    Some(_) => "legacy call".into(),
+                    None => "legacy: missing 'x'".into(),
+                }
+            }
+            fn execute(&self, _: Value) -> Result<Value, String> {
+                Ok(json!({}))
+            }
+        }
+        assert_eq!(Legacy.summary(), "legacy (ReadOnly)");
+        let mut reg = ToolRegistry::new();
+        reg.register(Box::new(Legacy)).unwrap();
+        let specs = reg.specs();
+        assert_eq!(specs[0]["function"]["description"], "legacy (ReadOnly)");
     }
 
     #[test]

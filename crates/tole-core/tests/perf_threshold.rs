@@ -104,20 +104,40 @@ fn resume_replay_under_budget() {
     // the number that decides whether long sessions stay practical.
     let dir = tmpdir("replay");
     let mut s = JsonlStorage::create(&dir, "perf-replay", None).unwrap();
-    let reg = ToolRegistry::new();
+    let mut reg = ToolRegistry::with_approver(AllowlistApprover::allow_only(vec![]));
+    reg.register(Box::new(EchoTool)).unwrap();
+    // Stay below the turn loop's MAX_STEPS (32) so the turn completes.
+    const CALLS: usize = 25;
     let mut script = Vec::new();
-    for _ in 0..50 {
+    for i in 0..CALLS {
         script.push(ProviderOutput::ToolCall {
-            tool: "unknown_tool".into(),
-            input: json!({}),
+            tool: "echo".into(),
+            input: json!({ "n": i }),
         });
     }
     script.push(ProviderOutput::Final {
         text: "done".into(),
     });
     let mut p = MockProvider::scripted(script);
-    // Unknown tools settle as errors; the loop replans until budget/EOF.
-    let _ = run_turn(&mut s, &mut p, &reg, "many").unwrap();
+    let out = run_turn(&mut s, &mut p, &reg, "many").unwrap();
+    assert!(
+        matches!(out, TurnOutcome::Final { .. }),
+        "replay fixture must complete, got {out:?} — otherwise the gate is vacuous"
+    );
+    let written = s.entries().len();
+    // Anti-vacuity: every call must have really executed (an intent and
+    // a tool_result each), not aborted on the first unknown tool.
+    let results = s
+        .entries()
+        .iter()
+        .filter(|e| e.kind.as_str() == "tool_result")
+        .count();
+    assert_eq!(results, CALLS, "replay fixture must execute all tool calls");
+    assert!(
+        written >= 2 * CALLS,
+        "expected >= {} entries, got {written}",
+        2 * CALLS
+    );
     let start = Instant::now();
     let reopened = JsonlStorage::open(dir.join("perf-replay.jsonl")).unwrap();
     let elapsed = start.elapsed();
@@ -125,5 +145,10 @@ fn resume_replay_under_budget() {
         elapsed.as_millis() < TURN_BUDGET_MS,
         "replay of {} entries took {elapsed:?} (budget {TURN_BUDGET_MS}ms)",
         reopened.entries().len()
+    );
+    assert_eq!(
+        reopened.entries().len(),
+        written,
+        "reopen must replay every entry that was written"
     );
 }

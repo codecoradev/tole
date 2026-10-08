@@ -9,8 +9,8 @@ Durable Rust agent harness: a conversational agent with risk-tiered approval
 gates, a write-once JSONL session log, and a register state machine — resumable
 after crashes, replayable forever.
 
-**Status:** v0.6.0 released; the 0.7.0 train is release-candidate on
-`develop`. Four faces on one durable core: the CLI (run / chat /
+**Status:** v0.7.0 released; v0.7.1 (rescan-2 hardening + one
+tool-call authorization gate) is release-candidate on `develop`. Four faces on one durable core: the CLI (run / chat /
 resume / sessions / jobs / **mission**), `tole mcp` (tool server),
 `tole acp` (editor agent), and `tole serve` (REST + multi-session
 MCP-over-HTTP daemon). Identity (owner-approved): a chat-first
@@ -18,8 +18,8 @@ personal assistant WITH a mission mode for autonomous work —
 budgeted turn-chaining (`tole mission --max-steps/--max-minutes/
 --max-tokens/--verify`), durable task-list tools (`todo_write`/
 `todo_read`), cost reports, and remote approvals via the serve face
-(the 0.9.0 mobile track consumes them from a phone). Also shipped on
-this train: ACP intra-turn visibility + true text streaming, ACP
+(the 0.9.0 mobile track consumes them from a phone). Shipped in
+0.7.0: ACP intra-turn visibility + true text streaming, ACP
 auto model picker, run ergonomics (`--prompt-file/--name/--timeout`),
 read-only `web_fetch`/`web_search` (SSRF-guarded), and startup
 update notification + `tole upgrade`. See
@@ -128,7 +128,7 @@ trust: `internal` / `read_only`), `--skill <path>` (load a SKILL.md),
 | `verify_package` | RO | crates.io / npm registry check before any install — hallucinated names get NOT FOUND + candidates, edit-distance-1 candidates get a typo-squat warning |
 | `load_skill` | RO | loads a discovered SKILL.md on demand (`--skill` pins one upfront; `--no-skills` disables) |
 | `gitea` | Write | Gitea counterpart of `gh` over the instance REST API — registers when `origin` is a Gitea remote AND `TOLE_GITEA_TOKEN`/`GITEA_TOKEN` is set; same six ops |
-| `agent_start`, `agent_poll` | Write / RO | depth-1 child agents: spawn durable child sessions (structurally no grandchildren), results via per-child uteke mailboxes (ephemeral by default); `--agents-worktree` gives each child its own git worktree |
+| `agent_start`, `agent_poll` | Write / Write | depth-1 child agents: spawn durable child sessions (structurally no grandchildren), results via per-child uteke mailboxes (ephemeral by default); `agent_poll` is Write because a settled poll consumes (cleans) the mailbox, and `--trust internal` allowlists it by name; `--agents-worktree` gives each child its own git worktree |
 | `systemone_decide` | RO | typed decisions (choice/score/noul + confidence) from a System One backend — active when `SYSTEMONE_API_KEY` is set; `SYSTEMONE_BASE_URL` picks the backend (hosted Jev default, self-hosted compatible) |
 | `job_start`, `job_poll` | Write / RO | detached long-running jobs with log tailing |
 | `cora_search` | RO | hybrid codebase search via `cora brain`; native fallback — skipped when the cora MCP surface is attached |
