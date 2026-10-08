@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use tole_cli::approver::{InteractiveApprover, StdioPrompt};
 use tole_cli::tools::WriteFileTool;
+use tole_cli::trust::expand_trust;
 #[cfg(feature = "mcp")]
 use tole_core::approval::AllowlistApprover;
 
@@ -410,6 +411,24 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
+    /// Project config file `.tole/config.toml` (#208): validate it with
+    /// `config check`. The file is not applied to sessions yet.
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
+}
+
+/// `tole config <action>` — an enum so later parts can add variants.
+#[derive(Subcommand)]
+enum ConfigAction {
+    /// Validate `<cwd>/.tole/config.toml` (or --config) and print what was
+    /// parsed. Exits non-zero on any error.
+    Check {
+        /// Check this file instead of `<cwd>/.tole/config.toml`.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
 }
 
 fn main() {
@@ -421,6 +440,18 @@ fn main() {
 }
 
 fn dispatch(cli: Cli) -> Result<()> {
+    // `tole config ...` is self-contained: it reads no session/env state
+    // and must not trigger the update banner.
+    if let Command::Config { action } = &cli.command {
+        return match action {
+            ConfigAction::Check { config } => {
+                let cwd = std::env::current_dir().context("cannot determine the cwd")?;
+                let out = tole_cli::config::check(&cwd, config.as_deref())?;
+                println!("{out}");
+                Ok(())
+            }
+        };
+    }
     // Startup update notification (issue #220): banner is best-effort,
     // cache-backed, and skipped entirely for `tole upgrade` (which does
     // its own check) and for TOLE_NO_UPDATE_CHECK=1 (checked inside).
@@ -482,6 +513,8 @@ fn dispatch(cli: Cli) -> Result<()> {
     ))?;
 
     match cli.command {
+        // Handled at the top of `dispatch`, before any session/env state.
+        Command::Config { .. } => unreachable!("`tole config` returns early"),
         Command::Run {
             prompt,
             prompt_file,
@@ -1046,44 +1079,6 @@ fn detect_github_repo(cwd: &Path) -> Option<String> {
     tole_cli::session_host::github_repo_from_remote_url(&String::from_utf8_lossy(&out.stdout))
 }
 
-/// Trust presets (issue #159): one word for "auto-allow the fleet's own
-/// ecosystem tools". Pure sugar — the expanded patterns feed the SAME
-/// AllowlistApprover machinery as `--allow`, so enforcement (and the
-/// Destructive-never-allowed invariant) is unchanged. `internal` covers
-/// the probe-gated native integrations (uteke_*, cora_search) plus the
-/// cora MCP auto-preset surface (mcp_cora_*) and the always-safe
-/// verify_package/job tools plus `agent_poll` (Write since #300; exact name,
-/// so `agent_start` still prompts); it deliberately excludes the write-capable
-/// native tools (write_file/edit_file/run_command/git/gh), which keep
-/// prompting.
-const TRUST_PRESETS: &[(&str, &[&str])] = &[
-    (
-        "internal",
-        &[
-            "uteke_*",
-            "cora_search",
-            "mcp_cora_*",
-            "verify_package",
-            "job_*",
-            "agent_poll",
-            "tole_session_*",
-            "todo_write",
-        ],
-    ),
-    (
-        "read_only",
-        &[
-            "read_file",
-            "verify_package",
-            "uteke_recall",
-            "cora_search",
-            "tole_session_status",
-            "tole_session_list",
-            "job_poll",
-        ],
-    ),
-];
-
 /// Effective trust-preset flag list: an explicit `--trust` flag wins
 /// wholesale over the `TOLE_TRUST` env; with no flags, the env (split on
 /// commas/whitespace) is the list. Found by activation testing
@@ -1113,31 +1108,6 @@ const DEFAULT_SERVE_URL: &str = "http://127.0.0.1:7801";
 fn resolve_serve_url(flag: Option<String>, env_val: Option<String>) -> String {
     flag.or_else(|| env_val.filter(|v| !v.is_empty()))
         .unwrap_or_else(|| DEFAULT_SERVE_URL.to_string())
-}
-
-/// Expand `--trust` preset names into extra allow patterns. Unknown
-/// preset names are a hard error — a typo silently narrowing trust would
-/// be worse than failing. `none`/empty → no extra patterns.
-fn expand_trust(presets: &[String]) -> Result<Vec<String>> {
-    let mut out = Vec::new();
-    for p in presets {
-        if p.eq_ignore_ascii_case("none") {
-            continue;
-        }
-        let found = TRUST_PRESETS
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case(p))
-            .map(|(_, patterns)| patterns);
-        let Some(patterns) = found else {
-            let names: Vec<&str> = TRUST_PRESETS.iter().map(|(n, _)| *n).collect();
-            anyhow::bail!(
-                "unknown trust preset {p:?} — available: {}",
-                names.join(", ")
-            );
-        };
-        out.extend(patterns.iter().map(|s| s.to_string()));
-    }
-    Ok(out)
 }
 
 /// Append the trust-preset patterns to the user's `--allow` list.

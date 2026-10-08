@@ -117,6 +117,25 @@ trust: `internal` / `read_only`), `--skill <path>` (load a SKILL.md),
 | `TOLE_NO_UPDATE_CHECK` | `1` disables the startup update-check banner (issue #220) |
 | `TOLE_MEMORY_NAMESPACE` | override the loop's namespace (default: `repo-<directory name>`) |
 
+## Configuration (project file)
+
+`tole config check` validates a project config file, `<cwd>/.tole/config.toml`
+(or `--config <path>`; no parent-directory walk), and prints every key that is
+set. **Nothing is applied yet:** this is part 1 of 3 of #208 — the file is only
+loaded and validated, and flags, env and runtime behavior are unchanged. Trust
+(a content-bound approval before a project file may take effect) and the
+flag > env > config precedence come in the next parts.
+
+The schema is strict (unknown keys, wrong types, malformed TOML, unknown `trust`
+presets and files over 64 KiB are errors, reported as `path:line:col: message`).
+Flat snake_case keys mirror the global flags (`model`, `base_url`, `sessions_dir`,
+`workspace`, `plan_mode`, `memory`, `trust`, `allow`, `mcp_server`, `no_auto_mcp`,
+`on_pretool`, `on_posttool`, `on_turnend`, `skill`, `no_skills`, `system_prompt`)
+plus one `[mission]` table (`max_steps`, `max_minutes`, `max_tokens`, `verify`,
+`verify_timeout`). Secrets never belong in a project file: any key whose name
+contains `secret`, `password`, `token` or `api_key` (any depth, any case) is a
+hard error.
+
 ## Tools
 
 | Tool | Risk | Notes |

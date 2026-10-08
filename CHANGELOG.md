@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `tole config check` validates `.tole/config.toml` (strict schema, secret keys rejected, 64 KiB cap); the file is NOT applied to sessions yet (#208, part 1 of 3).
+
 ### Fixed
 - `tole approvals` now honors `TOLE_SERVE_URL` (precedence: --url > env > default http://127.0.0.1:7801) as its help text always claimed (#339).
 
