@@ -2,6 +2,11 @@
 //! `Risk::Write` for everything (conservative: even reads go through the
 //! approver; per-op risk is a future refinement, see gh.rs note).
 //!
+//! Scope note: `status` and `diff` take no pathspec and run with cwd = the
+//! workdir, so they cover the whole repository containing it (in a monorepo
+//! subdirectory that includes sibling directories). By design; the jail
+//! (#247) applies to `add` pathspecs. See `docs/threat-model.md`.
+//!
 //! Same argv-whitelist discipline as `gh.rs`: an op enum maps to a fixed
 //! argv shape, every free-form value is validated (no leading dash, sane
 //! charset), and anything unexpected is refused *before* spawning.
@@ -59,6 +64,7 @@ impl GitOp {
             }
             Ok(v.to_string())
         }
+        // Status/Diff: no pathspec by design — repo-wide, see module docs.
         match self {
             GitOp::Status => Ok(vec!["status".into(), "--short".into(), "--branch".into()]),
             GitOp::Diff => {

@@ -24,7 +24,10 @@ lives) / **gap** (tracked) / **N/A** (with rationale).
    workspace file or a compromised job subprocess can inject
    instructions here (OWASP: prompt injection).
 3. **Workspace → filesystem.** File tools jail to `--workspace`
-   (component-validated, TOCTOU-safe walk, #68); `run_command`/`job_start`
+   (component-validated walk using `symlink_metadata`, final component
+   opened with `O_NOFOLLOW` on unix, #68; a parent-directory swap between
+   walk and open remains a residual race — see Deliberate limitations);
+   `run_command`/`job_start`
    run with cwd jailed but FULL process authority — the jail bounds *cwd*,
    not capability.
 4. **Child env.** Spawned commands inherit the host environment by default.
@@ -58,6 +61,26 @@ lives) / **gap** (tracked) / **N/A** (with rationale).
   write access to the operator's workspace, at which point host
   compromise is already achieved. Jobs dirs are created 0700 to reduce
   exposure; no further control planned.
+- **`write_file` parent-component swap (residual TOCTOU)** — the walk
+  checks each component with `symlink_metadata`, then the final `open()`
+  uses `O_NOFOLLOW`, which protects only the FINAL component. A leaf
+  symlink swap is refused; replacing an already-verified parent directory
+  with a symlink between the walk and the `open()` is not caught and can
+  escape the jail. Exploiting it requires a concurrent local process with
+  write access to the workspace, and the model already has full process
+  authority through `run_command`/`job_start` (the jail bounds cwd, not
+  capability), so severity is low. A per-component `openat` descent
+  (`O_DIRECTORY | O_NOFOLLOW`, e.g. via `cap-std`) could close it as a
+  possible future hardening; none is planned or promised. Non-unix hosts
+  have no `O_NOFOLLOW` equivalent wired (best-effort `symlink_metadata`
+  check only).
+- **`git status`/`diff` are repo-wide by design** — they take no
+  pathspec and run with cwd = the tool's workdir, so they show the whole
+  repository containing it; in a monorepo subdirectory that includes
+  modified files of sibling directories. This is not a jail escape: the
+  jail (#247) applies to `add` pathspecs (no absolute paths, `..`, or
+  pathspec magic), and the whole git tool is `Risk::Write`, so every call
+  — reads included — goes through the approval gate.
 - **Injection residual** (above) — fences are a mitigation, not immunity;
   the model must still treat fenced content as data.
 

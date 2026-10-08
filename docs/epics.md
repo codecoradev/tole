@@ -187,7 +187,7 @@ Everything below is merged; CHANGELOG entries carry the detail.
   three CodeCora review rounds); startup update notification +
   `tole upgrade` (#220/#222, fleet-parity with uteke/cora); the
   mobile-control guide (#202/#218) defines the 0.9.0 surface.
-- **0.7.1 Hardening patch (release-candidate on develop 2026-10-08):**
+- **0.7.1 Hardening patch (released 2026-10-08):**
   pre-tag rescan MAJORs #226–#235 and rescan-2 #276–#287 fixed (env
   scrubbing, MCP approval-prompt sanitizing, redirect/NUL/argv hardening,
   mailbox consume-once, perf-gate and tmpdir test fixes); follow-ups
@@ -198,6 +198,13 @@ Everything below is merged; CHANGELOG entries carry the detail.
   PRs #304/#309/#312). Behavior changes: `AllowlistApprover::new(_, Deny|Ask)`
   ignores patterns (#283), `agent_poll` is Write (#300), embedder
   registries with pre-hooks are enforced on the MCP path (#303).
+- **0.7.2 Maintenance patch (release-candidate on develop 2026-10-08):**
+  scan backlog closed — systemone error bodies surfaced (#328), `write_file`
+  and `git status/diff` limitations documented accurately (#329), the bare
+  `--no-default-features` tole-cli profile compiles and is CI-checked (#330);
+  Dependabot PRs no longer blocked by naming/description/CLA checks (#322 plus
+  a ruleset context change); dependency bumps (rmcp 3.5.0, tokio 1.53.2,
+  libc 0.2.190, uuid 1.27.0). No behavior changes.
 
 ---
 
