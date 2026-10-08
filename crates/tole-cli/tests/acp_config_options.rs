@@ -208,6 +208,8 @@ enum ModelsReply {
     List,
     ServerError,
     Empty,
+    /// Accept the request and never answer (a hanging gateway, #319).
+    Hang,
 }
 
 fn spawn_mock() -> (
@@ -273,12 +275,17 @@ fn spawn_mock_with(
                 }
                 if is_models_get {
                     hits_conn.fetch_add(1, Ordering::SeqCst);
+                    if matches!(models_reply, ModelsReply::Hang) {
+                        std::thread::sleep(Duration::from_secs(45));
+                        return;
+                    }
                     let (status, payload) = match models_reply {
                         ModelsReply::List => (
                             "200 OK",
                             json!({"data": [{"id": "model-b"}, {"id": "model-a"}]}),
                         ),
                         ModelsReply::Empty => ("200 OK", json!({"data": []})),
+                        ModelsReply::Hang => unreachable!("handled above"),
                         ModelsReply::ServerError => {
                             ("500 Internal Server Error", json!({"error": "down"}))
                         }
@@ -678,4 +685,45 @@ fn empty_models_list_degrades_to_no_picker() {
     let opts = created["result"]["configOptions"].as_array().unwrap();
     assert_eq!(opts.len(), 1, "approval only: {opts:?}");
     assert_eq!(opts[0]["id"], "approval");
+}
+
+/// Issue #319: a /models endpoint that never answers must not stall
+/// session/new for the old 60s wait, and the failure is remembered (30s
+/// sentinel) so the next session/new neither re-probes nor waits again.
+#[test]
+fn hanging_models_endpoint_does_not_stall_session_new() {
+    use std::sync::atomic::Ordering;
+    let (base_url, _seen, models_hits) = spawn_mock_with(ModelsReply::Hang);
+    let mut acp = AcpProcess::spawn_with(&[
+        ("TOLE_BASE_URL", base_url.as_str()),
+        ("TOLE_MODEL", "model-a"),
+        ("TOLE_API_KEY", "sk-test"),
+    ]);
+    acp.initialize(1);
+    let cwd = temp_cwd("probehang");
+    let started = std::time::Instant::now();
+    acp.send(&json!({
+        "jsonrpc": "2.0", "id": 2, "method": "session/new",
+        "params": {"cwd": cwd.to_string_lossy()}
+    }));
+    // Old code waited 60s; the bound is now 5s (+ slack for CI).
+    let created = acp.wait_response(2, Duration::from_secs(15));
+    assert!(started.elapsed() < Duration::from_secs(15));
+    let opts = created["result"]["configOptions"].as_array().unwrap();
+    assert_eq!(opts.len(), 1, "approval only: {opts:?}");
+    assert_eq!(models_hits.load(Ordering::SeqCst), 1);
+
+    // Within the failure TTL: instant answer, no second probe.
+    let again = std::time::Instant::now();
+    acp.send(&json!({
+        "jsonrpc": "2.0", "id": 3, "method": "session/new",
+        "params": {"cwd": cwd.to_string_lossy()}
+    }));
+    let _ = acp.wait_response(3, Duration::from_secs(3));
+    assert!(again.elapsed() < Duration::from_secs(3));
+    assert_eq!(
+        models_hits.load(Ordering::SeqCst),
+        1,
+        "failure sentinel suppresses the re-probe"
+    );
 }

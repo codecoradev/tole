@@ -453,7 +453,7 @@ fn turn_write_tool_requires_approval_gate() {
     }
     // The refusal is durable: an ERROR entry attached to the user message.
     assert!(!s.entries().iter().any(|e| e.kind.as_str() == "intent"));
-    assert_eq!(s.state().pc, tole_core::state::Pc::Planning);
+    assert_eq!(s.state().pc, tole_core::state::Pc::Final);
 }
 
 #[test]

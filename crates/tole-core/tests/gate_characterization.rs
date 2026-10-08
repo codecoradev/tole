@@ -27,7 +27,9 @@ use tole_core::provider::ProviderOutput;
 use tole_core::state::{Pc, StateTransition};
 use tole_core::storage::{Commit, JsonlStorage, Storage};
 use tole_core::tool::{Risk, Tool, ToolRegistry};
-use tole_core::turn::{resume_turn, run_turn, run_turn_with_cancel, TurnOutcome};
+use tole_core::turn::{
+    resume_turn, resume_turn_with_cancel, run_turn, run_turn_with_cancel, TurnOutcome,
+};
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -395,6 +397,7 @@ fn gate_char_fresh_unknown_tool() {
         vec![("unknown tool".to_string(), "ghost".to_string())]
     );
     assert_eq!(count_kind(&s, "intent"), 0);
+    assert_eq!(s.state().pc, Pc::Final);
 }
 
 #[test]
@@ -669,6 +672,7 @@ fn gate_char_replay_guarded_unregistered_tool() {
         )]
     );
     assert!(s.get_register("pending", "op").is_none());
+    assert_eq!(s.state().pc, Pc::Final);
 }
 
 #[test]
@@ -799,4 +803,61 @@ fn gate_char_replay_readonly_never_runs_pre_hook() {
     assert!(matches!(out, TurnOutcome::Final { .. }), "{out:?}");
     assert!(!marker.exists());
     assert_eq!(r.runs(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// #316 / #318 regressions
+// ---------------------------------------------------------------------------
+
+#[test]
+fn gate_char_fresh_unknown_tool_then_next_turn_succeeds() {
+    let r = rig(Verdict::Allow, &[("w", Risk::Write)]);
+    let dir = tmpdir("fresh-unknown-next");
+    let mut s = JsonlStorage::create(&dir, "s", None).unwrap();
+    let mut p = MockProvider::scripted(vec![call("ghost"), final_out("ok")]);
+    let out = run_turn(&mut s, &mut p, &r.reg, "go").unwrap();
+    assert!(matches!(out, TurnOutcome::UnknownTool { .. }), "{out:?}");
+    let out = run_turn(&mut s, &mut p, &r.reg, "again").unwrap();
+    assert!(
+        matches!(&out, TurnOutcome::Final { text, .. } if text == "ok"),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn gate_char_replay_guarded_unknown_tool_then_next_turn_succeeds() {
+    let r = rig(Verdict::Allow, &[("w", Risk::Write)]);
+    let (mut s, _) = seed_pending(
+        "rp-g-ghost-next",
+        "ghost",
+        json!({"n": 1}),
+        ReplaySafety::Guarded,
+    );
+    let out = replay(&r, &mut s, vec![]);
+    assert!(matches!(out, TurnOutcome::UnknownTool { .. }), "{out:?}");
+    let mut p = MockProvider::scripted(vec![final_out("ok")]);
+    let out = run_turn(&mut s, &mut p, &r.reg, "again").unwrap();
+    assert!(
+        matches!(&out, TurnOutcome::Final { text, .. } if text == "ok"),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn gate_char_resume_with_cancelled_token_settles_cancelled() {
+    let r = rig(Verdict::Allow, &[("r", Risk::ReadOnly)]);
+    let (mut s, _) = seed_pending("rp-cancel", "r", json!({"n": 1}), ReplaySafety::Idempotent);
+    let cancel = CancelToken::new();
+    cancel.cancel();
+    let mut p = MockProvider::scripted(vec![final_out("never")]);
+    let out = resume_turn_with_cancel(&mut s, &mut p, &r.reg, &cancel).unwrap();
+    assert!(matches!(out, TurnOutcome::Cancelled), "{out:?}");
+    assert_eq!(s.state().pc, Pc::Final);
+    assert_eq!(
+        turn_errors(&s),
+        vec![(
+            "cancelled".to_string(),
+            "client cancelled the turn (session/cancel)".to_string()
+        )]
+    );
 }

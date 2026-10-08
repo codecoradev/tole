@@ -42,26 +42,39 @@ fn resolve_host(host: &str) -> Result<Vec<std::net::IpAddr>, String> {
     Ok(addrs)
 }
 
+/// IPv4 special-use check, hand-rolled with octet math (std's
+/// `is_shared`/`is_benchmarking`/`is_reserved` are unstable).
+fn v4_is_private(v4: &std::net::Ipv4Addr) -> bool {
+    let [a, b, c, _] = v4.octets();
+    v4.is_loopback()
+        || v4.is_private()
+        || v4.is_link_local()
+        || v4.is_unspecified()
+        || v4.is_broadcast()
+        || a == 0 // 0.0.0.0/8 "this network"
+        || (a == 100 && (b & 0xc0) == 64) // 100.64.0.0/10 CGNAT / Tailscale
+        || (a == 192 && b == 0 && c == 0) // 192.0.0.0/24 IETF protocol assignments
+        || (a == 198 && (b & 0xfe) == 18) // 198.18.0.0/15 benchmarking
+        || a >= 224 // 224.0.0.0/4 multicast + 240.0.0.0/4 reserved
+}
+
 /// True when `ip` must not be fetched: loopback, link-local (cloud
-/// metadata!), private, unspecified, broadcast — plus the IPv6
-/// neighbors of those: IPv4-mapped literals (`::ffff:169.254.169.254`
-/// is the metadata endpoint as surely as the v4 literal) and ULA
-/// `fc00::/7`. The v6 link-local mask is the canonical /10, not /16.
+/// metadata!), private, CGNAT, multicast, reserved, benchmarking,
+/// unspecified, broadcast — plus the IPv6 neighbors of those:
+/// IPv4-mapped literals (`::ffff:169.254.169.254` is the metadata
+/// endpoint as surely as the v4 literal), NAT64, 6to4 and Teredo
+/// embeddings, ULA `fc00::/7`, site-local `fec0::/10` and multicast
+/// `ff00::/8`. The v6 link-local mask is the canonical /10, not /16.
 fn ip_is_private(ip: &std::net::IpAddr) -> bool {
     match ip {
-        std::net::IpAddr::V4(v4) => {
-            v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.is_unspecified()
-                || v4.is_broadcast()
-        }
+        std::net::IpAddr::V4(v4) => v4_is_private(v4),
         std::net::IpAddr::V6(v6) => {
             // Unwrap every "v4 in v6 clothes" form the resolver can
             // legally hand us: IPv4-mapped ::ffff:/96, IPv4-compatible
-            // ::/96 (legacy but still routable-text), and NAT64
-            // 64:ff9b::/96 (the RFC 6052 translation prefix — a hostile
-            // DNS answer can encode the metadata endpoint here).
+            // ::/96 (legacy but still routable-text), NAT64
+            // 64:ff9b::/96 (RFC 6052), 6to4 2002::/16 and Teredo
+            // 2001::/32. A hostile DNS answer can encode the metadata
+            // endpoint in any of them.
             // Order matters: loopback/unspecified FIRST (::1 must never
             // reach the ::/96 unwrap — ::1 is "::/96 with v4 0.0.0.1",
             // which is not private and would slip through).
@@ -69,42 +82,36 @@ fn ip_is_private(ip: &std::net::IpAddr) -> bool {
                 return true;
             }
             if let Some(v4) = v6.to_ipv4_mapped() {
-                return ip_is_private(&std::net::IpAddr::V4(v4));
+                return v4_is_private(&v4);
             }
             let seg = v6.segments();
+            let v4_from = |hi: u16, lo: u16| {
+                std::net::Ipv4Addr::new(
+                    (hi >> 8) as u8,
+                    (hi & 0xff) as u8,
+                    (lo >> 8) as u8,
+                    (lo & 0xff) as u8,
+                )
+            };
             // ::/96 IPv4-compatible (legacy) and 64:ff9b::/96 NAT64 both
             // carry the embedded v4 in segments 6-7.
-            if seg[0] == 0
-                && seg[1] == 0
-                && seg[2] == 0
-                && seg[3] == 0
-                && seg[4] == 0
-                && seg[5] == 0
-            {
-                let v4 = std::net::Ipv4Addr::new(
-                    (seg[6] >> 8) as u8,
-                    (seg[6] & 0xff) as u8,
-                    (seg[7] >> 8) as u8,
-                    (seg[7] & 0xff) as u8,
-                );
-                return ip_is_private(&std::net::IpAddr::V4(v4));
+            if seg[..6] == [0, 0, 0, 0, 0, 0] || seg[..6] == [0, 0x0064, 0xff9b, 0, 0, 0] {
+                return v4_is_private(&v4_from(seg[6], seg[7]));
             }
-            if seg[0] == 0
-                && seg[1] == 0x0064
-                && seg[2] == 0xff9b
-                && seg[3] == 0
-                && seg[4] == 0
-                && seg[5] == 0
-            {
-                let v4 = std::net::Ipv4Addr::new(
-                    (seg[6] >> 8) as u8,
-                    (seg[6] & 0xff) as u8,
-                    (seg[7] >> 8) as u8,
-                    (seg[7] & 0xff) as u8,
-                );
-                return ip_is_private(&std::net::IpAddr::V4(v4));
+            // 6to4: 2002:AABB:CCDD::/48 embeds the v4 in segments 1-2.
+            if seg[0] == 0x2002 {
+                return v4_is_private(&v4_from(seg[1], seg[2]));
             }
-            (seg[0] & 0xffc0) == 0xfe80 || (seg[0] & 0xfe00) == 0xfc00
+            // Teredo 2001:0::/32: server v4 in segments 2-3, client v4
+            // is the bitwise NOT of segments 6-7. Either private -> refuse.
+            if seg[0] == 0x2001 && seg[1] == 0 {
+                return v4_is_private(&v4_from(seg[2], seg[3]))
+                    || v4_is_private(&v4_from(!seg[6], !seg[7]));
+            }
+            (seg[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
+                || (seg[0] & 0xffc0) == 0xfec0 // fec0::/10 site-local
+                || (seg[0] & 0xfe00) == 0xfc00 // fc00::/7 ULA
+                || (seg[0] & 0xff00) == 0xff00 // ff00::/8 multicast
         }
     }
 }
@@ -891,6 +898,65 @@ mod tests {
                 host_is_public_opt(url.as_str(), true).is_ok(),
                 "{url} opted out"
             );
+        }
+    }
+
+    #[test]
+    fn ip_is_private_special_use_table() {
+        let allowed = [
+            "8.8.8.8",
+            "1.1.1.1",
+            "93.184.216.34",
+            "100.63.255.255",
+            "100.128.0.0",
+            "192.0.1.1",
+            "198.17.255.255",
+            "198.20.0.0",
+            "223.255.255.255",
+            "2606:2800:220:1::1",
+            // 6to4 embedding 8.8.8.8
+            "2002:808:808::1",
+            // Teredo: server 8.8.8.8, client 1.2.3.4 (NOT = fefd:fcfb)
+            "2001:0:808:808::fefd:fcfb",
+        ];
+        for a in allowed {
+            let ip: std::net::IpAddr = a.parse().unwrap();
+            assert!(!ip_is_private(&ip), "{a} must stay allowed");
+        }
+        let refused = [
+            "0.0.0.1",
+            "0.255.255.255",
+            "100.64.0.0",
+            "100.64.0.1",
+            "100.127.255.255",
+            "192.0.0.0",
+            "192.0.0.255",
+            "198.18.0.0",
+            "198.19.255.255",
+            "224.0.0.0",
+            "239.255.255.255",
+            "240.0.0.0",
+            "255.255.255.254",
+            "ff00::",
+            "ff02::1",
+            "fec0::1",
+            "feff::1",
+            // 6to4 embedding 10.0.0.1 / 169.254.169.254 / 100.64.0.1
+            "2002:a00:1::1",
+            "2002:a9fe:a9fe::1",
+            "2002:6440:1::1",
+            // Teredo, private server v4 (segments 2-3)
+            "2001:0:a00:1::fefd:fcfb",
+            "2001:0:a9fe:a9fe::fefd:fcfb",
+            "2001:0:6440:1::fefd:fcfb",
+            // Teredo, private client v4 (bitwise NOT of segments 6-7)
+            "2001:0:808:808::f5ff:fffe",
+            "2001:0:808:808::5601:5601",
+            "2001:0:808:808::9bbf:fffe",
+        ];
+        for a in refused {
+            let ip: std::net::IpAddr = a.parse().unwrap();
+            assert!(ip_is_private(&ip), "{a} must be refused");
         }
     }
 }

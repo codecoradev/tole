@@ -598,37 +598,11 @@ pub fn run_session_turn(
     }
     *first_prompt_done.lock().expect("fpd lock") = true;
 
-    let stop = match &outcome {
-        tole_core::turn::TurnOutcome::Final { text, .. } => {
-            final_text = Some(text.clone());
-            "end_turn"
-        }
-        tole_core::turn::TurnOutcome::StopGateBlocked { reason } => {
-            eprintln!("tole: stop gate blocked the turn: {reason}");
-            "refusal"
-        }
-        tole_core::turn::TurnOutcome::ApprovalRequired { name } => {
-            eprintln!("tole: approval denied for '{name}'");
-            "refusal"
-        }
-        tole_core::turn::TurnOutcome::UnknownTool { name } => {
-            eprintln!("tole: unknown tool '{name}'");
-            "refusal"
-        }
-        tole_core::turn::TurnOutcome::ProviderFailed { message } => {
-            eprintln!("tole: provider failed: {message}");
-            "refusal"
-        }
-        tole_core::turn::TurnOutcome::BudgetExhausted => "max_tokens",
-        tole_core::turn::TurnOutcome::Cancelled => "cancelled",
-        tole_core::turn::TurnOutcome::LoopDetected { tool, .. } => {
-            eprintln!("tole: loop detected on '{tool}'");
-            "refusal"
-        }
-        tole_core::turn::TurnOutcome::Storage(e) => {
-            return Err(format!("storage error: {e}"));
-        }
-    };
+    if let tole_core::turn::TurnOutcome::Final { text, .. } = &outcome {
+        final_text = Some(text.clone());
+    }
+    log_outcome(&outcome);
+    let stop = stop_reason(&outcome)?;
     Ok((stop.to_string(), final_text))
 }
 
@@ -683,17 +657,53 @@ pub fn resume_session_turn(
     if let Some(sys) = system_prompt.as_deref() {
         provider = provider.with_system_prompt(sys);
     }
-    let outcome = tole_core::turn::resume_turn(&mut *storage, &mut provider, &registry)
-        .map_err(|e| e.to_string())?;
-    let stop = match &outcome {
-        tole_core::turn::TurnOutcome::Final { text, .. } => {
-            Ok((("end_turn".to_string()), Some(text.clone())))
-        }
-        tole_core::turn::TurnOutcome::Cancelled => Ok(("cancelled".to_string(), None)),
-        _ => Ok(("refusal".to_string(), None)),
+    // #318: the session token is wired into the replan loop, so
+    // `/cancel` during an approval-resume settles the turn as cancelled.
+    // The `reset()` above stays: like `run_session_turn`, it runs inside
+    // the busy claim, so a cancel landing after the claim targets this
+    // resume, while one that landed earlier had no in-flight turn to
+    // target (cancel is unconditional) and must not kill it.
+    let outcome =
+        tole_core::turn::resume_turn_with_cancel(&mut *storage, &mut provider, &registry, &cancel)
+            .map_err(|e| e.to_string())?;
+    let final_text = match &outcome {
+        tole_core::turn::TurnOutcome::Final { text, .. } => Some(text.clone()),
+        _ => None,
     };
-    let _ = cancel;
-    stop
+    log_outcome(&outcome);
+    Ok((stop_reason(&outcome)?, final_text))
+}
+
+/// Single stop-reason mapping for `run_session_turn` and
+/// `resume_session_turn` (#318) so the two cannot drift. A storage error
+/// outcome is surfaced as `Err`.
+fn stop_reason(outcome: &tole_core::turn::TurnOutcome) -> Result<String, String> {
+    use tole_core::turn::TurnOutcome as O;
+    Ok(match outcome {
+        O::Final { .. } => "end_turn",
+        O::BudgetExhausted => "max_tokens",
+        O::Cancelled => "cancelled",
+        O::StopGateBlocked { .. }
+        | O::ApprovalRequired { .. }
+        | O::UnknownTool { .. }
+        | O::ProviderFailed { .. }
+        | O::LoopDetected { .. } => "refusal",
+        O::Storage(e) => return Err(format!("storage error: {e}")),
+    }
+    .to_string())
+}
+
+/// Operator-visible stderr line for non-final outcomes (unchanged text).
+fn log_outcome(outcome: &tole_core::turn::TurnOutcome) {
+    use tole_core::turn::TurnOutcome as O;
+    match outcome {
+        O::StopGateBlocked { reason } => eprintln!("tole: stop gate blocked the turn: {reason}"),
+        O::ApprovalRequired { name } => eprintln!("tole: approval denied for '{name}'"),
+        O::UnknownTool { name } => eprintln!("tole: unknown tool '{name}'"),
+        O::ProviderFailed { message } => eprintln!("tole: provider failed: {message}"),
+        O::LoopDetected { tool, .. } => eprintln!("tole: loop detected on '{tool}'"),
+        _ => {}
+    }
 }
 
 /// Best-effort `owner/name` from a git remote URL, for gh tool targeting.
@@ -835,5 +845,39 @@ mod eviction_tests {
         let flag = s.map["a"].busy.clone();
         let _held = flag.lock().unwrap();
         assert_eq!(s.evict_for_insert(1), Err(AllSessionsBusy));
+    }
+}
+
+#[cfg(test)]
+mod stop_reason_tests {
+    use super::stop_reason;
+    use tole_core::turn::TurnOutcome as O;
+
+    #[test]
+    fn maps_every_outcome_once_for_run_and_resume() {
+        let s = |o: O| stop_reason(&o).unwrap();
+        assert_eq!(
+            s(O::Final {
+                text: "t".into(),
+                wrote: false
+            }),
+            "end_turn"
+        );
+        assert_eq!(s(O::BudgetExhausted), "max_tokens");
+        assert_eq!(s(O::Cancelled), "cancelled");
+        for o in [
+            O::StopGateBlocked { reason: "r".into() },
+            O::ApprovalRequired { name: "n".into() },
+            O::UnknownTool { name: "n".into() },
+            O::ProviderFailed {
+                message: "m".into(),
+            },
+            O::LoopDetected {
+                tool: "t".into(),
+                count: 3,
+            },
+        ] {
+            assert_eq!(s(o), "refusal");
+        }
     }
 }
