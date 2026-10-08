@@ -37,6 +37,10 @@ tole-core = { version = "0.7.2", path = "../tole-core" }
 tokio = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
+serde = { workspace = true }
+# `.tole/config.toml` loader (#208). Parse-only: no encoder needed beyond
+# `display` (value rendering in `tole config check`). tole-core stays free of it.
+toml = { version = "1", default-features = false, features = ["std", "parse", "display", "serde"] }
 clap = { workspace = true }
 libc = "0.2"
 hyper = { version = "1", features = ["server", "http1"], optional = true }
