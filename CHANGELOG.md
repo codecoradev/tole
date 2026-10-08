@@ -7,14 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1] — 2026-10-08
+
 ### Changed
 - Unknown-tool aborts (fresh and guarded replay) now settle the turn to `Final` like every other abort (#316). A bare `tole resume <id>` after one reports "nothing to resume"; send a new prompt instead. The Tier 1 abort-path contract moved from "parks at Planning, resume continues" to "settles to Final, next prompt continues".
 - `serve` approval-resume now honors `/cancel`, and `BudgetExhausted` maps to `max_tokens` there too (#318).
 - Tool specs sent to the provider now use a static `Tool::summary()` (defaulted method) instead of `describe(Null)`; git and systemone were being advertised with validation error strings (#320).
-
-## [0.7.1] — 2026-10-08
-
-### Changed
 - The MCP server path (`RegistryServer::execute_checked`) now authorizes tool
   calls through the same crate-internal gate as `drive`/`resume_turn`.
   Behavior change for `RegistryServer::new` embedders: pre-hooks configured on
