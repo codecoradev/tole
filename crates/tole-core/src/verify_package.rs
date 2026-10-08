@@ -353,6 +353,10 @@ impl Tool for VerifyPackageTool {
         Risk::ReadOnly
     }
 
+    fn summary(&self) -> String {
+        "Check that a package name exists in the crates.io or npm registry, to catch hallucinated dependencies.".into()
+    }
+
     fn describe(&self, input: &Value) -> String {
         let eco = input
             .get("ecosystem")

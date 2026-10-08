@@ -48,6 +48,10 @@ impl Tool for UtekeRecallTool {
         Risk::ReadOnly
     }
 
+    fn summary(&self) -> String {
+        "Recall relevant long-term memories from uteke, optionally scoped to a room.".into()
+    }
+
     fn describe(&self, input: &Value) -> String {
         let q = input
             .get("query")
@@ -151,6 +155,10 @@ impl Tool for UtekeDocumentTool {
     fn risk(&self) -> Risk {
         // Mutates the owner's memory store (doc upsert + room link).
         Risk::Write
+    }
+
+    fn summary(&self) -> String {
+        "Create or update a uteke document and link it into a room.".into()
     }
 
     fn describe(&self, input: &Value) -> String {

@@ -64,6 +64,11 @@ impl Tool for CoraSearchTool {
         Risk::ReadOnly
     }
 
+    fn summary(&self) -> String {
+        "Semantic search over the cora code index for existing symbols, patterns and call paths."
+            .into()
+    }
+
     fn spec(&self) -> Option<Value> {
         Some(json!({
             "type": "object",

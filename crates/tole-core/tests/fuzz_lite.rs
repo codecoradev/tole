@@ -3,6 +3,10 @@
 //! (seeded LCG, no rand dep): the same corpus runs in CI every time;
 //! randomized-but-reproducible beats exhaustive for the harness's
 //! surface.
+//!
+//! Every test here drives shell-tools-gated modules (git, run_command,
+//! subprocess), so the whole file is gated (#310).
+#![cfg(feature = "shell-tools")]
 
 use serde_json::{json, Value};
 use tole_core::file_tools::{DeleteFileTool, EditFileTool};

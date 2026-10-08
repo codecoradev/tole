@@ -165,6 +165,10 @@ impl Tool for TodoWriteTool {
     fn risk(&self) -> Risk {
         Risk::Write
     }
+    fn summary(&self) -> String {
+        "Replace the mission task list with the full updated list of todos.".into()
+    }
+
     fn describe(&self, _input: &Value) -> String {
         "update the mission task list".into()
     }
@@ -216,6 +220,10 @@ impl Tool for TodoReadTool {
     fn risk(&self) -> Risk {
         Risk::ReadOnly
     }
+    fn summary(&self) -> String {
+        "Read the current mission task list.".into()
+    }
+
     fn describe(&self, _input: &Value) -> String {
         "read the current mission task list".into()
     }

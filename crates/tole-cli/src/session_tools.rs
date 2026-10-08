@@ -107,6 +107,10 @@ impl Tool for SessionNewTool {
         Risk::ReadOnly // the session itself is a handle; tool risk is
                        // governed by the session's allowlist approver
     }
+    fn summary(&self) -> String {
+        "Open a new tole session rooted at a workspace directory; returns a session id.".into()
+    }
+
     fn describe(&self, input: &Value) -> String {
         format!(
             "open tole session (cwd={:?})",
@@ -195,6 +199,10 @@ impl Tool for SessionPromptTool {
         // the tool uncallable without blanket --allow (found live).
         Risk::ReadOnly
     }
+    fn summary(&self) -> String {
+        "Send a prompt to a tole session and run one turn to completion.".into()
+    }
+
     fn describe(&self, input: &Value) -> String {
         format!(
             "run one tole turn (session {:?})",
@@ -267,6 +275,10 @@ impl Tool for SessionCancelTool {
     fn risk(&self) -> Risk {
         Risk::ReadOnly
     }
+    fn summary(&self) -> String {
+        "Cancel the in-flight turn of a tole session.".into()
+    }
+
     fn describe(&self, input: &Value) -> String {
         format!(
             "cancel the in-flight turn of session {:?}",
@@ -344,6 +356,10 @@ impl Tool for SessionStatusTool {
     fn risk(&self) -> Risk {
         Risk::ReadOnly
     }
+    fn summary(&self) -> String {
+        "Report the status of a tole session.".into()
+    }
+
     fn describe(&self, input: &Value) -> String {
         format!(
             "session status ({:?})",
@@ -382,6 +398,10 @@ impl Tool for SessionListTool {
     fn risk(&self) -> Risk {
         Risk::ReadOnly
     }
+    fn summary(&self) -> String {
+        "List the open tole sessions.".into()
+    }
+
     fn describe(&self, _input: &Value) -> String {
         "list open tole sessions".into()
     }
