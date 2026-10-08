@@ -7,9 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.2] — 2026-10-08
+
 ### Fixed
 - systemone_decide surfaces the provider's 4xx/5xx error body (bounded) instead of "no error body" (#328).
-- tole-cli: the bare `--no-default-features` profile now compiles (#330).
+- tole-cli: the bare `--no-default-features` profile now compiles (#330); CI now
+  checks that profile and `tole-core --no-default-features --tests` so neither can regress.
+
+### Changed
+- Dependency updates: `rmcp` 3.4.1 → 3.5.0, `tokio` 1.53.1 → 1.53.2,
+  `libc` 0.2.189 → 0.2.190, `uuid` 1.26.1 → 1.27.0 (lockfile only).
+- Docs: the `write_file` parent-component symlink race is now documented as a
+  residual limitation and `git status`/`diff` are documented as repo-wide by
+  design; the previous "TOCTOU-safe" wording overclaimed (#329).
+- CI: Dependabot/Renovate PRs are exempt from the Branch Naming and PR
+  Description checks (#322).
 
 ## [0.7.1] — 2026-10-08
 
