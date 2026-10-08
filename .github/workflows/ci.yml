@@ -24,7 +24,9 @@ jobs:
   # --no-default-features profile, so the tole-cli no-mcp host profile
   # drifted uncompilable invisibly (feature-gated command paths
   # referencing gated-out items). Keep it compiling AND warning-free —
-  # a drift here means a cfg gate is wrong somewhere.
+  # a drift here means a cfg gate is wrong somewhere. Issue #310: also
+  # check tole-core's integration tests in --no-default-features (they
+  # silently stopped compiling there once).
   no-mcp:
     name: no-mcp profile
     runs-on: ubuntu-latest
@@ -37,9 +39,12 @@ jobs:
         with:
           key: no-mcp
       - run: |
+          # #330: the bare profile (neither shell-tools nor mcp) must compile too.
+          cargo check -p tole-cli --no-default-features
           cargo check -p tole-cli --no-default-features --features shell-tools
           cargo clippy -p tole-cli --no-default-features --features shell-tools -- -D warnings
           cargo test -p tole-cli --no-default-features --features shell-tools
+          cargo check -p tole-core --no-default-features --tests
 
   fmt:
     name: Format
