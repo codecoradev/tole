@@ -13,6 +13,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   denial and a `Permit` required to execute non-ReadOnly tools; tool risk is
   read once per call. Durable entry shapes and error strings are unchanged
   (#303, part 2 of 3).
+- **Behavior change:** `agent_poll` is now `Risk::Write` (a successful poll
+  consumes the mailbox: it writes `meta.json` and forgets mailbox memories),
+  matching the rule that a ReadOnly poll never mutates. `--trust internal`
+  allowlists the exact name `agent_poll`, so poll loops stay prompt-free and
+  `agent_start` still prompts; users on the `read_only` preset who approved
+  `agent_start` are now prompted on every `agent_poll`; plan mode drops it
+  together with `agent_start` (#300).
 
 ### Fixed
 Rescan-2 MAJORs (#276–#287):
@@ -33,6 +40,19 @@ Rescan-2 MAJORs (#276–#287):
   mailbox is marked consumed only after a successful recall (#287).
 - Tests: the perf `resume_replay` gate actually replays 25 tool calls and
   asserts it (#278); `turn_loop` temp dirs are unique per call (#279).
+
+Architecture-review follow-ups (#293–#299):
+- The `gh` tool is registered only when a GitHub origin is detected; the
+  hardcoded `codecoradev/tole` fallback on the run/chat/resume/mission and
+  `tole mcp` faces is gone (#293).
+- `tole serve --transport mcp` honors `--plan-mode` in its server-level
+  registry (only ReadOnly tools remain) (#294).
+- One session-id rule everywhere: `[A-Za-z0-9_-]`, at most 64 bytes
+  (`tole_core::storage::is_valid_session_id`); an id accepted by serve/ACP
+  is no longer rejected by `tole chat --resume` / `tole status` (#295).
+- `tole acp` caps live sessions at 256 with non-busy eviction (shared helper
+  with serve and the MCP session tools) and prunes the approval state of
+  evicted sessions (#299).
 
 ## [0.7.0] — 2026-10-06
 
