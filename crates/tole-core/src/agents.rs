@@ -472,6 +472,11 @@ impl Tool for AgentStartTool {
         Risk::Write
     }
 
+    fn summary(&self) -> String {
+        "Start a child tole agent session on one mission; collect its result with agent_poll."
+            .into()
+    }
+
     fn describe(&self, input: &Value) -> String {
         let prompt = input
             .get("prompt")
@@ -755,6 +760,10 @@ impl Tool for AgentPollTool {
 
     fn is_poll(&self) -> bool {
         true
+    }
+
+    fn summary(&self) -> String {
+        "Poll a child agent started with agent_start for its status and result.".into()
     }
 
     fn describe(&self, input: &Value) -> String {

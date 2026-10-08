@@ -197,6 +197,19 @@ pub fn resume_turn(
     p: &mut dyn Provider,
     registry: &ToolRegistry,
 ) -> Result<TurnOutcome, StorageError> {
+    resume_turn_with_cancel(s, p, registry, &CancelToken::default())
+}
+
+/// [`resume_turn`] with a cancellation token (#318): the replan loop after
+/// the replayed intent is driven with `cancel`, so a client cancel during
+/// an approval-resume settles the turn as `Cancelled` (pc=Final) at the
+/// next checkpoint instead of being ignored.
+pub fn resume_turn_with_cancel(
+    s: &mut dyn Storage,
+    p: &mut dyn Provider,
+    registry: &ToolRegistry,
+    cancel: &CancelToken,
+) -> Result<TurnOutcome, StorageError> {
     match resume(s)? {
         Resume::Clean => {
             let pc_now = s.state().pc;
@@ -259,10 +272,9 @@ pub fn resume_turn(
             settle_err(s, &handle, &reason)?;
         }
     }
-    // Recovery drives are not cancel-wired today (#178 covers live
-    // prompt turns; a crash-recovered resume has no in-flight request
-    // to cancel). No observer: recovery is an interactive host flow.
-    drive(s, p, registry, &CancelToken::default(), None)
+    // No observer: recovery is an interactive host flow. `resume_turn`
+    // passes a never-cancelled token; serve passes the session's (#318).
+    drive(s, p, registry, cancel, None)
 }
 
 /// Sets the session-scoped `wrote_this_turn` fact (#143). Shared by the
@@ -296,6 +308,9 @@ fn replay_intent(
             let msg = format!("guarded intent references unregistered tool {tool}");
             settle_err(s, &handle, &msg)?;
             append_turn_error(s, "unknown tool", &msg)?;
+            // settle_err left pc at Planning (Executing → Planning); the
+            // abort is terminal, so Planning → Final (#316).
+            settle_final(s)?;
             return Ok(Some(TurnOutcome::UnknownTool { name: tool }));
         }
         Err(Denied::UnknownTool) => {
@@ -665,8 +680,11 @@ fn drive(
                 let auth = match gate::authorize(registry, &tool, &input, gate::Mode::Fresh) {
                     Ok(a) => a,
                     Err(Denied::UnknownTool) => {
-                        // Durable record, same contract as the other abort paths.
+                        // Durable record + terminal pc=Final, the same #84
+                        // contract as the other abort paths (#316): without
+                        // it the next run_turn is refused (pc=Planning).
                         append_turn_error(s, "unknown tool", &tool)?;
+                        settle_final(s)?;
                         return Ok(TurnOutcome::UnknownTool { name: tool });
                     }
                     Err(Denied::Approver) => {
@@ -822,6 +840,14 @@ fn append_turn_error(s: &mut dyn Storage, error: &str, detail: &str) -> Result<(
         payload: json!({ "error": error, "detail": detail }),
         timestamp: 0,
     }))?;
+    Ok(())
+}
+
+/// Terminal settlement shared by abort paths that already wrote their
+/// durable error record: commit `pc → Final` (legal only from Planning).
+fn settle_final(s: &mut dyn Storage) -> Result<(), StorageError> {
+    let seq = s.state().seq;
+    s.commit(Commit::new().transition(StateTransition::from(seq, Pc::Final)))?;
     Ok(())
 }
 

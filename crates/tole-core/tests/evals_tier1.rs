@@ -244,14 +244,14 @@ fn tier1_resume_equivalence() {
 // 3. ABORT-PATH CONTRACTS
 // ---------------------------------------------------------------------------
 
-/// Every abort outcome must (a) park the machine at a pc the next
-/// resume/run accepts, and (b) leave a durable ERROR record so replay
+/// Every abort outcome must (a) settle the machine at a pc the next run
+/// (prompt) accepts, and (b) leave a durable ERROR record so replay
 /// can see why. This is the resumability guarantee as a table.
 #[test]
 fn tier1_abort_paths_park_resumable_with_audit() {
     type Drive = Box<dyn Fn(&mut JsonlStorage, &mut MockProvider, &ToolRegistry) -> TurnOutcome>;
     let cases: Vec<(&str, Drive)> = vec![
-        // Unknown tool: durable error, stays Planning (resumable).
+        // Unknown tool: durable error, settles to Final (#84/#316); the next prompt continues the session.
         (
             "unknown_tool",
             Box::new(
@@ -274,18 +274,25 @@ fn tier1_abort_paths_park_resumable_with_audit() {
             matches!(out, TurnOutcome::UnknownTool { .. }),
             "{name}: unexpected {out:?}"
         );
-        // (a) parked in a resumable state: Planning.
-        assert_eq!(s.state().pc, Pc::Planning, "{name}");
+        // (a) settled to Final (#84/#316).
+        assert_eq!(s.state().pc, Pc::Final, "{name}");
         // (b) durable audit record exists.
         assert!(
             s.entries().iter().any(|e| e.kind.as_str() == "error"),
             "{name}: no durable error record"
         );
-        // (c) the next resume continues the session (no wedging).
+        // (c) bare resume has nothing to resume (same as LoopDetected)...
+        let mut p_unused = MockProvider::scripted(vec![]);
+        let err = resume_turn(&mut s, &mut p_unused, &reg).unwrap_err();
+        assert!(
+            err.to_string().contains("nothing to resume"),
+            "{name}: {err}"
+        );
+        // ...and the next prompt continues the session (no wedging).
         let mut p2 = MockProvider::scripted(vec![ProviderOutput::Final {
             text: "recovered".into(),
         }]);
-        let out2 = resume_turn(&mut s, &mut p2, &reg).unwrap();
+        let out2 = run_turn(&mut s, &mut p2, &reg, "again").unwrap();
         assert!(
             matches!(out2, TurnOutcome::Final { text, .. } if text == "recovered"),
             "{name}"

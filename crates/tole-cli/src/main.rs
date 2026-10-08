@@ -440,6 +440,8 @@ fn dispatch(cli: Cli) -> Result<()> {
     // relocates serve/acp session storage; the default (None) keeps the
     // per-session-cwd layout those faces always had. The resolved
     // `sessions_dir` above stays the run/chat/sessions/status default.
+    // Only the shell-tools serve/acp faces read this (#330).
+    #[cfg_attr(not(feature = "shell-tools"), allow(unused_variables))]
     let sessions_dir_override = cli.sessions_dir.clone().map(PathBuf::from);
     #[cfg(feature = "mcp")]
     let mcp_specs = merge_mcp_specs(&cli.mcp_server, cli.no_auto_mcp, auto_mcp_specs());
@@ -835,17 +837,16 @@ struct HostConfig {
     /// still assign `memory: None` in dispatch — the field stays so the
     /// assignments and helper signatures never fork per profile.
     #[cfg(not(feature = "shell-tools"))]
+    #[allow(dead_code)] // placeholder field, never read in the bare profile (#330)
     memory: (),
     #[cfg(feature = "shell-tools")]
     memory: Option<tole_core::memory::MemoryConfig>,
 }
 
 impl HostConfig {
-    #[cfg(any(feature = "shell-tools", feature = "mcp"))]
     fn on_pretool_non_empty(&self) -> bool {
         !self.on_pretool.is_empty()
     }
-    #[cfg(any(feature = "shell-tools", feature = "mcp"))]
     fn on_posttool_non_empty(&self) -> bool {
         !self.on_posttool.is_empty()
     }
@@ -974,6 +975,7 @@ fn merge_mcp_specs(explicit: &[String], no_auto_mcp: bool, auto: Vec<String>) ->
 /// absolute path). Used to skip CLI-backed tools whose engine is not
 /// installed, instead of registering phantom tools that fail on every
 /// call.
+#[cfg_attr(not(feature = "shell-tools"), allow(dead_code))] // probes only run with shell-tools (#330)
 fn binary_available(name: &str) -> bool {
     fn executable(p: &Path) -> bool {
         #[cfg(unix)]
@@ -1201,6 +1203,8 @@ fn build_registry(
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(0);
     let mut reg = ToolRegistry::with_approver(approver);
+    // Only the shell-tools registrations read cwd (#330).
+    #[cfg_attr(not(feature = "shell-tools"), allow(unused_variables))]
     let cwd = std::env::current_dir().context("resolving cwd")?;
     let file_root = resolve_workspace_root(workspace)?;
     // Uteke first-class (B4): recall (read) + document (write), behind
@@ -1217,35 +1221,39 @@ fn build_registry(
     }
     // Generic dynamic command (B4): argv-split, cwd-jailed, Risk::Write.
     #[cfg(feature = "shell-tools")]
-    let run_cmd = RunCommandTool::new(cwd.clone());
-    let run_cmd = if std::env::var("TOLE_AGENT_DEPTH")
-        .ok()
-        .and_then(|v| v.trim().parse::<u32>().ok())
-        .unwrap_or(0)
-        >= 1
     {
-        run_cmd.in_child_agent_mode()
-    } else {
-        run_cmd
-    };
-    reg.register(Box::new(run_cmd))
-        .map_err(|e| anyhow::anyhow!("registering run_command: {e}"))?;
+        let run_cmd = RunCommandTool::new(cwd.clone());
+        let run_cmd = if std::env::var("TOLE_AGENT_DEPTH")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+            >= 1
+        {
+            run_cmd.in_child_agent_mode()
+        } else {
+            run_cmd
+        };
+        reg.register(Box::new(run_cmd))
+            .map_err(|e| anyhow::anyhow!("registering run_command: {e}"))?;
+    }
     // Long-running jobs (#59): detached spawn + poll, logs inside the
     // file-tools workspace so read_file can reach the full log.
     #[cfg(feature = "shell-tools")]
-    let job_start = JobStartTool::new(file_root.clone());
-    let job_start = if std::env::var("TOLE_AGENT_DEPTH")
-        .ok()
-        .and_then(|v| v.trim().parse::<u32>().ok())
-        .unwrap_or(0)
-        >= 1
     {
-        job_start.in_child_agent_mode()
-    } else {
-        job_start
-    };
-    reg.register(Box::new(job_start))
-        .map_err(|e| anyhow::anyhow!("registering job_start: {e}"))?;
+        let job_start = JobStartTool::new(file_root.clone());
+        let job_start = if std::env::var("TOLE_AGENT_DEPTH")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+            >= 1
+        {
+            job_start.in_child_agent_mode()
+        } else {
+            job_start
+        };
+        reg.register(Box::new(job_start))
+            .map_err(|e| anyhow::anyhow!("registering job_start: {e}"))?;
+    }
     #[cfg(feature = "shell-tools")]
     reg.register(Box::new(JobPollTool::new(file_root.clone())))
         .map_err(|e| anyhow::anyhow!("registering job_poll: {e}"))?;
@@ -2304,7 +2312,7 @@ fn chat_command(
                 "tole> (approval denied for '{name}' — turn aborted; your next message resumes)"
             ),
             Ok(TurnOutcome::UnknownTool { name }) => {
-                eprintln!("tole> (unknown tool '{name}' — recorded; next message resumes)")
+                eprintln!("tole> (unknown tool '{name}' — recorded; your next message continues)")
             }
             Ok(TurnOutcome::ProviderFailed { message }) => {
                 eprintln!("tole> (provider failed: {message}; next message retries via resume)")

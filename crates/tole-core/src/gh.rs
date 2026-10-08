@@ -330,6 +330,10 @@ impl Tool for GhTool {
         Risk::Write
     }
 
+    fn summary(&self) -> String {
+        "GitHub issues and PRs via the gh CLI: view/list issues, view a PR (read-only); comment on an issue, create an issue or PR (writes).".into()
+    }
+
     fn describe(&self, input: &Value) -> String {
         self.command_line(input).unwrap_or_else(|e| e)
     }
