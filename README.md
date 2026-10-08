@@ -9,8 +9,8 @@ Durable Rust agent harness: a conversational agent with risk-tiered approval
 gates, a write-once JSONL session log, and a register state machine — resumable
 after crashes, replayable forever.
 
-**Status:** v0.6.0 released; the 0.7.0 train is release-candidate on
-`develop`. Four faces on one durable core: the CLI (run / chat /
+**Status:** v0.7.0 released; v0.7.1 (rescan-2 hardening + one
+tool-call authorization gate) is release-candidate on `develop`. Four faces on one durable core: the CLI (run / chat /
 resume / sessions / jobs / **mission**), `tole mcp` (tool server),
 `tole acp` (editor agent), and `tole serve` (REST + multi-session
 MCP-over-HTTP daemon). Identity (owner-approved): a chat-first
@@ -18,8 +18,8 @@ personal assistant WITH a mission mode for autonomous work —
 budgeted turn-chaining (`tole mission --max-steps/--max-minutes/
 --max-tokens/--verify`), durable task-list tools (`todo_write`/
 `todo_read`), cost reports, and remote approvals via the serve face
-(the 0.9.0 mobile track consumes them from a phone). Also shipped on
-this train: ACP intra-turn visibility + true text streaming, ACP
+(the 0.9.0 mobile track consumes them from a phone). Shipped in
+0.7.0: ACP intra-turn visibility + true text streaming, ACP
 auto model picker, run ergonomics (`--prompt-file/--name/--timeout`),
 read-only `web_fetch`/`web_search` (SSRF-guarded), and startup
 update notification + `tole upgrade`. See

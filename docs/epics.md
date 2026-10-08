@@ -187,6 +187,17 @@ Everything below is merged; CHANGELOG entries carry the detail.
   three CodeCora review rounds); startup update notification +
   `tole upgrade` (#220/#222, fleet-parity with uteke/cora); the
   mobile-control guide (#202/#218) defines the 0.9.0 surface.
+- **0.7.1 Hardening patch (release-candidate on develop 2026-10-08):**
+  pre-tag rescan MAJORs #226–#235 and rescan-2 #276–#287 fixed (env
+  scrubbing, MCP approval-prompt sanitizing, redirect/NUL/argv hardening,
+  mailbox consume-once, perf-gate and tmpdir test fixes); follow-ups
+  #293 (no hardcoded `gh` repo), #294 (plan mode in the MCP server
+  registry), #295 (one session-id rule), #299 (ACP session cap), #300
+  (`agent_poll` is Write); one crate-internal tool-call authorization
+  gate used by `drive`, `resume_turn` and the MCP server path (#303,
+  PRs #304/#309/#312). Behavior changes: `AllowlistApprover::new(_, Deny|Ask)`
+  ignores patterns (#283), `agent_poll` is Write (#300), embedder
+  registries with pre-hooks are enforced on the MCP path (#303).
 
 ---
 
