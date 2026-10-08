@@ -2304,7 +2304,7 @@ fn chat_command(
                 "tole> (approval denied for '{name}' — turn aborted; your next message resumes)"
             ),
             Ok(TurnOutcome::UnknownTool { name }) => {
-                eprintln!("tole> (unknown tool '{name}' — recorded; next message resumes)")
+                eprintln!("tole> (unknown tool '{name}' — recorded; your next message continues)")
             }
             Ok(TurnOutcome::ProviderFailed { message }) => {
                 eprintln!("tole> (provider failed: {message}; next message retries via resume)")
