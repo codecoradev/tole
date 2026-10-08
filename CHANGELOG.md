@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1] — 2026-10-08
+
 ### Changed
 - The MCP server path (`RegistryServer::execute_checked`) now authorizes tool
   calls through the same crate-internal gate as `drive`/`resume_turn`.
