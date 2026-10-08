@@ -7,14 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1] — 2026-10-08
+
 ### Changed
 - Unknown-tool aborts (fresh and guarded replay) now settle the turn to `Final` like every other abort (#316). A bare `tole resume <id>` after one reports "nothing to resume"; send a new prompt instead. The Tier 1 abort-path contract moved from "parks at Planning, resume continues" to "settles to Final, next prompt continues".
 - `serve` approval-resume now honors `/cancel`, and `BudgetExhausted` maps to `max_tokens` there too (#318).
 - Tool specs sent to the provider now use a static `Tool::summary()` (defaulted method) instead of `describe(Null)`; git and systemone were being advertised with validation error strings (#320).
-
-## [0.7.1] — 2026-10-08
-
-### Changed
 - The MCP server path (`RegistryServer::execute_checked`) now authorizes tool
   calls through the same crate-internal gate as `drive`/`resume_turn`.
   Behavior change for `RegistryServer::new` embedders: pre-hooks configured on
@@ -50,6 +48,14 @@ Rescan-2 MAJORs (#276–#287):
 - **Behavior change:** `AllowlistApprover::new(patterns, Deny|Ask)` now
   ignores `patterns` — the default verdict is final (fail closed). Embedders
   that used `new(p, Deny)` as an allowlist must use `allow_only(p)` (#283).
+- **Behavior change:** the `web_fetch` SSRF guard now also refuses 100.64.0.0/10
+  (CGNAT / Tailscale-style overlay networks), 0.0.0.0/8, 192.0.0.0/24,
+  198.18.0.0/15, multicast (224.0.0.0/4, ff00::/8), reserved 240.0.0.0/4,
+  site-local fec0::/10, and 6to4/Teredo addresses that embed a private IPv4.
+  Fetching a host on a tailnet now requires `TOLE_WEB_ALLOW_PRIVATE=1` (#317).
+- `tole acp`: a hanging `/models` endpoint no longer re-stalls every
+  `session/new` (probe wait 60 s → 5 s, failures cached for 30 s, probe runs
+  before the sessions lock is taken) (#319).
 - `chat` registers and hydrates `todo_read`/`todo_write` (#276); an agent
   mailbox is marked consumed only after a successful recall (#287).
 - Tests: the perf `resume_replay` gate actually replays 25 tool calls and
