@@ -149,6 +149,12 @@ sequenceDiagram
   - `AllowlistApprover` — from config (runs in core, deterministic, testable).
   - `InteractiveApprover` — y/N prompt. **Lives in the host (CLI)**, not in core — core only receives the trait impl via injection.
 
+### Tool-call gate
+
+The turn loop's two tool paths — a fresh provider call (`drive`) and a crash-replayed intent (`resume_turn`) — share one authorization module, `crates/tole-core/src/gate.rs` (crate-internal; see [GLOSSARY.md](../GLOSSARY.md)). `gate::authorize(registry, name, input, Mode)` is the policy decision point: it reads the tool's risk once, then consults the approver and the opt-in pre-hooks in that order, returning an `Authorized` call or a typed `Denied` (`Approver`, `PreHook`, `UnknownTool`). `Mode::Fresh` gates when risk is not `ReadOnly`; `Mode::Replay { recorded }` gates when the recorded safety is `Guarded` **or** the current risk is not `ReadOnly` (#249).
+
+The turn loop remains the enforcement point: it maps each `Denied` to the existing durable records and `TurnOutcome`s, and owns the effect sandwich, cancel checkpoints, observer, post-hooks and the `wrote_this_turn` fact. A non-`ReadOnly` `Authorized` carries a `Permit` (private constructor) and `Authorized::execute` is the only way the loop runs a tool, so executing a Write/Destructive tool without passing the gate does not compile inside the crate. The public `Tool` trait and `ToolRegistry::decide` are unchanged.
+
 ## 8. Provider
 
 - Phase 1: thin `Provider` trait (send completion, streaming optional). Minimal hand-rolled implementation.

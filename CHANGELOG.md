@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Internal refactor, no behavior change: `drive` and `resume_turn` now share
+  one crate-internal tool-call authorization gate (`gate.rs`) with a typed
+  denial and a `Permit` required to execute non-ReadOnly tools; tool risk is
+  read once per call. Durable entry shapes and error strings are unchanged
+  (#303, part 2 of 3).
+
 ### Fixed
 Rescan-2 MAJORs (#276–#287):
 - Security: server-supplied text is sanitized before it reaches MCP approval
