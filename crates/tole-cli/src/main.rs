@@ -294,9 +294,10 @@ enum Command {
         /// The approval id (required for allow/deny).
         id: Option<String>,
 
-        /// Base URL of the serve instance.
-        #[arg(long, default_value = "http://127.0.0.1:7801")]
-        url: String,
+        /// Base URL of the serve instance (defaults to TOLE_SERVE_URL,
+        /// then http://127.0.0.1:7801).
+        #[arg(long)]
+        url: Option<String>,
 
         /// Bearer token (defaults to TOLE_SERVE_TOKEN).
         #[arg(long)]
@@ -592,6 +593,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             let token = token
                 .or_else(|| std::env::var("TOLE_SERVE_TOKEN").ok())
                 .context("approval decisions need a token (--token or TOLE_SERVE_TOKEN)")?;
+            let url = resolve_serve_url(url, std::env::var("TOLE_SERVE_URL").ok());
             approvals::cli(&action, id.as_deref(), &url, &token)
         }
         Command::Mission {
@@ -1100,6 +1102,17 @@ fn resolve_trust_flags(flag: &[String], env_val: Option<String>) -> Vec<String> 
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .collect()
+}
+
+/// Default base URL of a `tole serve` instance for `tole approvals`.
+const DEFAULT_SERVE_URL: &str = "http://127.0.0.1:7801";
+
+/// Effective serve URL for `tole approvals` (#339): an explicit `--url`
+/// wins over the `TOLE_SERVE_URL` env, which wins over the default. An
+/// empty env value counts as unset.
+fn resolve_serve_url(flag: Option<String>, env_val: Option<String>) -> String {
+    flag.or_else(|| env_val.filter(|v| !v.is_empty()))
+        .unwrap_or_else(|| DEFAULT_SERVE_URL.to_string())
 }
 
 /// Expand `--trust` preset names into extra allow patterns. Unknown
@@ -2861,6 +2874,49 @@ mod trust_preset_tests {
         let flags = resolve_trust_flags(&[], Some(" internal ".to_string()));
         let pats = expand_trust(&flags).unwrap();
         assert!(pats.iter().any(|p| p == "uteke_*"));
+    }
+
+    #[test]
+    fn serve_url_flag_wins_over_env() {
+        let u = resolve_serve_url(
+            Some("http://flag:1".to_string()),
+            Some("http://env:2".to_string()),
+        );
+        assert_eq!(u, "http://flag:1");
+    }
+
+    #[test]
+    fn serve_url_env_wins_over_default() {
+        let u = resolve_serve_url(None, Some("http://remote:9".to_string()));
+        assert_eq!(u, "http://remote:9");
+    }
+
+    #[test]
+    fn serve_url_empty_env_is_ignored() {
+        assert_eq!(
+            resolve_serve_url(None, Some(String::new())),
+            DEFAULT_SERVE_URL
+        );
+    }
+
+    #[test]
+    fn serve_url_default_when_neither() {
+        assert_eq!(resolve_serve_url(None, None), "http://127.0.0.1:7801");
+    }
+
+    #[test]
+    fn approvals_parse_without_url_leaves_it_unset() {
+        let cli = Cli::try_parse_from(["tole", "approvals", "list"]).unwrap();
+        match cli.command {
+            Command::Approvals { url, .. } => assert!(url.is_none()),
+            _ => panic!("expected Approvals"),
+        }
+        let cli =
+            Cli::try_parse_from(["tole", "approvals", "list", "--url", "http://x:1"]).unwrap();
+        match cli.command {
+            Command::Approvals { url, .. } => assert_eq!(url.as_deref(), Some("http://x:1")),
+            _ => panic!("expected Approvals"),
+        }
     }
 
     #[test]
