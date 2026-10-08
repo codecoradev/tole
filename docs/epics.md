@@ -187,7 +187,7 @@ Everything below is merged; CHANGELOG entries carry the detail.
   three CodeCora review rounds); startup update notification +
   `tole upgrade` (#220/#222, fleet-parity with uteke/cora); the
   mobile-control guide (#202/#218) defines the 0.9.0 surface.
-- **0.7.1 Hardening patch (release-candidate on develop 2026-10-08):**
+- **0.7.1 Hardening patch (released 2026-10-08):**
   pre-tag rescan MAJORs #226–#235 and rescan-2 #276–#287 fixed (env
   scrubbing, MCP approval-prompt sanitizing, redirect/NUL/argv hardening,
   mailbox consume-once, perf-gate and tmpdir test fixes); follow-ups
