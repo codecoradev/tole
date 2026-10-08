@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- tole-cli: the bare `--no-default-features` profile now compiles (#330).
+
 ## [0.7.1] — 2026-10-08
 
 ### Changed

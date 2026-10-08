@@ -39,6 +39,8 @@ jobs:
         with:
           key: no-mcp
       - run: |
+          # #330: the bare profile (neither shell-tools nor mcp) must compile too.
+          cargo check -p tole-cli --no-default-features
           cargo check -p tole-cli --no-default-features --features shell-tools
           cargo clippy -p tole-cli --no-default-features --features shell-tools -- -D warnings
           cargo test -p tole-cli --no-default-features --features shell-tools
