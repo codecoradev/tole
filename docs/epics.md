@@ -198,7 +198,7 @@ Everything below is merged; CHANGELOG entries carry the detail.
   PRs #304/#309/#312). Behavior changes: `AllowlistApprover::new(_, Deny|Ask)`
   ignores patterns (#283), `agent_poll` is Write (#300), embedder
   registries with pre-hooks are enforced on the MCP path (#303).
-- **0.7.2 Maintenance patch (release-candidate on develop 2026-10-08):**
+- **0.7.2 Maintenance patch (released 2026-10-08):**
   scan backlog closed — systemone error bodies surfaced (#328), `write_file`
   and `git status/diff` limitations documented accurately (#329), the bare
   `--no-default-features` tole-cli profile compiles and is CI-checked (#330);

@@ -9,9 +9,9 @@ Durable Rust agent harness: a conversational agent with risk-tiered approval
 gates, a write-once JSONL session log, and a register state machine — resumable
 after crashes, replayable forever.
 
-**Status:** v0.7.2 is release-candidate on `develop` (v0.7.1 shipped the rescan-2
-hardening + one tool-call authorization gate; see the CHANGELOG for its
-behavior changes). Four faces on one durable core: the CLI (run / chat /
+**Status:** v0.7.2 released (maintenance patch on top of v0.7.1, which shipped
+the rescan-2 hardening + one tool-call authorization gate; see the CHANGELOG
+for the behavior changes). Four faces on one durable core: the CLI (run / chat /
 resume / sessions / jobs / **mission**), `tole mcp` (tool server),
 `tole acp` (editor agent), and `tole serve` (REST + multi-session
 MCP-over-HTTP daemon). Identity (owner-approved): a chat-first
