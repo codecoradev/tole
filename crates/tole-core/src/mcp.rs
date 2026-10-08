@@ -369,6 +369,13 @@ impl Tool for McpTool {
         Risk::Write
     }
 
+    fn summary(&self) -> String {
+        // Provider-facing text is deliberately unchanged from the
+        // pre-`summary()` wire: the server-supplied description in the
+        // approval-line format (wire stability for existing sessions).
+        self.describe(&Value::Null)
+    }
+
     fn describe(&self, input: &Value) -> String {
         // The approver approves THIS string: surface the model-controlled
         // arguments. Truncation is always MARKED — an approver must know
@@ -570,6 +577,19 @@ mod prompt_and_budget_tests {
             "approval prompt must be control-free: {d:?}"
         );
         assert!(d.contains("harmless"));
+    }
+
+    #[test]
+    fn summary_keeps_server_supplied_description() {
+        let tool = McpTool::new(
+            "srv".into(),
+            "mcp_srv_t".into(),
+            "t".into(),
+            "Does the thing".into(),
+        );
+        let s = tool.summary();
+        assert!(s.contains("Does the thing"), "{s:?}");
+        assert!(s.starts_with("mcp[srv] "), "{s:?}");
     }
 
     #[test]

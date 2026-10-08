@@ -53,6 +53,19 @@ pub trait Tool: Send + Sync {
     fn describe(&self, _input: &Value) -> String {
         format!("{} ({})", self.name(), self.risk().as_str())
     }
+    /// Static, provider-facing description of the tool, sent as the
+    /// `description` of its spec (issue #320). Unlike `describe`, which
+    /// renders ONE concrete call for an approval prompt and may validate
+    /// its input (and so return an error string for `Null`), this takes
+    /// no input and must never fail.
+    ///
+    /// Default: tool name + risk tier. Deliberately NOT derived from
+    /// `describe(Null)`: there is no way to tell a real description from
+    /// a validation error string. Override with one sentence on what the
+    /// tool does and its main operations.
+    fn summary(&self) -> String {
+        format!("{} ({})", self.name(), self.risk().as_str())
+    }
     /// JSON Schema for the input object, sent to the provider as this
     /// tool's `parameters` (E4.5). `None` (the default) means "object
     /// with no declared properties" — still callable, just untyped.
@@ -266,7 +279,7 @@ impl ToolRegistry {
                     "type": "function",
                     "function": {
                         "name": t.name(),
-                        "description": t.describe(&serde_json::Value::Null),
+                        "description": t.summary(),
                         "parameters": t.spec().unwrap_or_else(|| json!({
                             "type": "object",
                             "properties": {},
@@ -369,6 +382,37 @@ mod tests {
         assert!(reg.get("fake_write").is_none());
         assert!(reg.get("fake_destructive").is_none());
         assert!(reg.get("read_file").is_some());
+    }
+
+    /// Issue #320: an external `Tool` that predates `summary()` (it
+    /// implements only the required methods) must keep compiling, and
+    /// gets the safe default — never an error string, even when its
+    /// `describe` validates input and fails for `Null`.
+    #[test]
+    fn external_tool_without_summary_gets_safe_default() {
+        struct Legacy;
+        impl Tool for Legacy {
+            fn name(&self) -> &str {
+                "legacy"
+            }
+            fn risk(&self) -> Risk {
+                Risk::ReadOnly
+            }
+            fn describe(&self, input: &Value) -> String {
+                match input.get("x") {
+                    Some(_) => "legacy call".into(),
+                    None => "legacy: missing 'x'".into(),
+                }
+            }
+            fn execute(&self, _: Value) -> Result<Value, String> {
+                Ok(json!({}))
+            }
+        }
+        assert_eq!(Legacy.summary(), "legacy (ReadOnly)");
+        let mut reg = ToolRegistry::new();
+        reg.register(Box::new(Legacy)).unwrap();
+        let specs = reg.specs();
+        assert_eq!(specs[0]["function"]["description"], "legacy (ReadOnly)");
     }
 
     #[test]

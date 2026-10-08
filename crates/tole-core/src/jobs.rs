@@ -97,6 +97,10 @@ impl Tool for JobPollTool {
         true
     }
 
+    fn summary(&self) -> String {
+        "Poll a background job started with job_start for its status and output.".into()
+    }
+
     fn describe(&self, input: &Value) -> String {
         let job = input
             .get("job")
@@ -209,6 +213,11 @@ impl Tool for JobStartTool {
         // Spawns arbitrary processes: at least Write, like run_command.
         // Destructive stays reserved for explicit delete-like tools.
         Risk::Write
+    }
+
+    fn summary(&self) -> String {
+        "Start a long-running command as a background job; returns a job id to poll with job_poll."
+            .into()
     }
 
     fn describe(&self, input: &Value) -> String {

@@ -195,6 +195,10 @@ impl Tool for GiteaTool {
         Risk::Write
     }
 
+    fn summary(&self) -> String {
+        "Gitea issues and PRs over its API: view/list issues, view a PR (read-only); comment on an issue, create an issue or PR (writes).".into()
+    }
+
     fn describe(&self, input: &Value) -> String {
         self.request_line(input).unwrap_or_else(|e| e)
     }

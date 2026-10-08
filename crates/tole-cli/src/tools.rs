@@ -76,6 +76,10 @@ impl Tool for WriteFileTool {
         Risk::Write
     }
 
+    fn summary(&self) -> String {
+        "Write a text file inside the workspace, creating or overwriting it.".into()
+    }
+
     fn describe(&self, input: &Value) -> String {
         let path = input
             .get("path")

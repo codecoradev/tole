@@ -210,6 +210,10 @@ impl crate::tool::Tool for LoadSkillTool {
         crate::tool::Risk::ReadOnly
     }
 
+    fn summary(&self) -> String {
+        "Load the full instructions of a named skill from the skills index.".into()
+    }
+
     fn describe(&self, input: &Value) -> String {
         let name = input.get("name").and_then(Value::as_str).unwrap_or("?");
         format!("load skill {name:?}")
