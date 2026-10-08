@@ -1057,6 +1057,7 @@ fn aborted_writing_turn_keeps_the_session_flag() {
 // Issue #145: turn-end stop gates (--on-turnend)
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "shell-tools")]
 struct GateScript {
     /// exit code the gate script returns; stdout is its reason on deny
     code: i32,
@@ -1065,6 +1066,7 @@ struct GateScript {
 
 /// Build a gate hook command line: a sh script that emits `reason` and
 /// exits with `code`. Returns (command_line, _dir_keepalive).
+#[cfg(feature = "shell-tools")]
 fn gate_cmd(g: &GateScript) -> (String, std::path::PathBuf) {
     use std::sync::atomic::{AtomicU32, Ordering};
     static SEQ: AtomicU32 = AtomicU32::new(0);
@@ -1084,6 +1086,7 @@ fn gate_cmd(g: &GateScript) -> (String, std::path::PathBuf) {
     (format!("/bin/sh {}", path.display()), dir)
 }
 
+#[cfg(feature = "shell-tools")]
 fn registry_with_gates(cmds: &[String]) -> ToolRegistry {
     let mut reg = ToolRegistry::new();
     let mut hooks = tole_core::hooks::ToolHooks::from_cli(&[], &[]);
@@ -1096,6 +1099,7 @@ fn registry_with_gates(cmds: &[String]) -> ToolRegistry {
 }
 
 /// Same but Write-capable (approver allowlists write_file).
+#[cfg(feature = "shell-tools")]
 fn registry_with_gates_write(cmds: &[String]) -> ToolRegistry {
     let mut reg =
         ToolRegistry::with_approver(tole_core::approval::AllowlistApprover::allow_only(vec![
@@ -1110,6 +1114,7 @@ fn registry_with_gates_write(cmds: &[String]) -> ToolRegistry {
     reg
 }
 
+#[cfg(feature = "shell-tools")]
 #[test]
 fn stop_gate_deny_blocks_final_and_forces_continuation() {
     // First Final is DENIED (gate exit 2): it must NOT commit; the deny
@@ -1169,6 +1174,7 @@ fn stop_gate_deny_blocks_final_and_forces_continuation() {
     assert!(has_reason, "deny reason must be durable");
 }
 
+#[cfg(feature = "shell-tools")]
 #[test]
 fn stop_gate_pass_is_behavior_identical() {
     let dir = tmpdir("gate-pass");
@@ -1203,6 +1209,7 @@ fn stop_gate_pass_is_behavior_identical() {
     assert_eq!(gate_entries, 0);
 }
 
+#[cfg(feature = "shell-tools")]
 #[test]
 fn stop_gate_cap_trips_in_isolation() {
     // A gate that ALWAYS denies must end the turn at the cap
@@ -1235,6 +1242,7 @@ fn stop_gate_cap_trips_in_isolation() {
         .any(|e| e.kind.as_str() == "error" && e.payload["error"] == json!("stop gate blocked")));
 }
 
+#[cfg(feature = "shell-tools")]
 #[test]
 fn stop_gate_nonzero_exit_denies_with_stdout_reason() {
     // Gate semantics (issue #145, live-E2E correction): ANY non-zero
@@ -1280,6 +1288,7 @@ fn stop_gate_nonzero_exit_denies_with_stdout_reason() {
     assert!(has_reason, "the 101 verdict reason must be durable");
 }
 
+#[cfg(feature = "shell-tools")]
 #[test]
 fn stop_gate_payload_is_per_turn_not_history() {
     // cora CI: turn 1 executes a Write; turn 2 (fresh run_turn) produces
@@ -1347,6 +1356,7 @@ fn stop_gate_payload_is_per_turn_not_history() {
     );
 }
 
+#[cfg(feature = "shell-tools")]
 #[test]
 fn stop_gate_payload_keeps_tools_across_own_denial() {
     // cora CI round 2: the deny feedback entry is user-role; on the
