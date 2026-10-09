@@ -2783,6 +2783,51 @@ mod gh_repo_tests {
         .is_none());
     }
 
+    /// #352: only a host that is EXACTLY github.com counts; the string
+    /// "github.com" inside a longer hostname, userinfo or the path must not
+    /// redirect the gh tool to an attacker-named repo.
+    #[test]
+    fn host_must_be_exactly_github_com() {
+        let parse = tole_cli::session_host::github_repo_from_remote_url;
+        for bad in [
+            "https://notgithub.com/owner/name",
+            "https://github.com.evil.io/owner/name",
+            "ssh://git@github.com.evil.io/o/r",
+            "https://evil.io/github.com/owner/name",
+            "https://gitea.example/github.com/owner/name.git",
+            "https://github.com@evil.io/owner/name",
+            "https://user:github.com@evil.io/owner/name",
+            "ssh://git@evil.io:github.com/o/r",
+            "git@evil.io:github.com/o/r",
+            "git@github.com.evil.io:o/r",
+            "evil.io:github.com:o/r",
+            "https://githubxcom/owner/name",
+            "https://gist.github.com/owner/name",
+            "github.com/owner/name",
+        ] {
+            assert!(parse(bad).is_none(), "{bad} must not resolve to a repo");
+        }
+    }
+
+    #[test]
+    fn accepts_the_real_github_forms() {
+        let parse = tole_cli::session_host::github_repo_from_remote_url;
+        for (url, want) in [
+            ("https://github.com/o/r", "o/r"),
+            ("https://github.com/o/r/", "o/r"),
+            ("https://GitHub.COM/o/r.git", "o/r"),
+            ("https://github.com:443/o/r.git", "o/r"),
+            ("https://user:tok@github.com/o/r.git", "o/r"),
+            ("ssh://git@github.com/o/r.git", "o/r"),
+            ("ssh://git@github.com:22/o/r.git", "o/r"),
+            ("git@github.com:o/r.git", "o/r"),
+            ("github.com:o/r", "o/r"),
+            ("git://github.com/o/r.git", "o/r"),
+        ] {
+            assert_eq!(parse(url).as_deref(), Some(want), "{url}");
+        }
+    }
+
     #[test]
     fn gh_tool_not_registered_without_detected_repo() {
         // Issue #293: a non-GitHub cwd must yield NO gh tool (no
