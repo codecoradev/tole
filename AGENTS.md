@@ -123,7 +123,7 @@ that makes them stale. This regression has happened twice (#33 and again
   verified across PRs #164/#166). The 2026-09-18 export requirement is
   obsolete.
 - **2026-10-09:** both `tole-core` and `tole-cli` are on crates.io at
-  **0.8.0** (released via the GitHub release `v0.8.0`; `publish.yml`
+  **0.8.1** (released via the GitHub release `v0.8.1`; `publish.yml`
   published core then cli; checked via the crates.io API). Registry
   parity with the checkout is current as of this date; live missions still run the
   freshly built `./target/release/tole` (see CONTRIBUTING →
