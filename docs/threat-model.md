@@ -267,3 +267,85 @@ crafted page CAN steer a mission via prompt injection; the mitigation
 is the same as every other untrusted input: tool-result fencing,
 approval gates on anything that matters, and mission budgets bounding
 the blast radius.
+
+### Project config trust (#208)
+
+`<cwd>/.tole/config.toml` is untrusted input from a cloned repo: it may
+carry `allow`, `trust`, hooks, `skill` and `mcp_server`. Part 2 added the
+trust machinery, part 3a wired the startup gate and the low-risk keys, part 3b
+applies the security-sensitive ones (`trust`, `allow`, `mcp_server`,
+`on_pretool`/`on_posttool`/`on_turnend`, `skill`, `plan_mode`, `no_auto_mcp`,
+`no_skills`, `[mission]` `verify`/`verify_timeout`):
+
+- **Content-bound, outside the repo.** The approval is a snapshot of the exact
+  file bytes in `$CODECORA_HOME/tole/trusted-configs.json` (default
+  `~/.codecora`), keyed by canonical project directory. Any byte change
+  (including whitespace or CRLF) makes it untrusted again; the repo cannot
+  pre-trust itself. There is no home-less fallback: with no `CODECORA_HOME`
+  or `HOME` tole errors instead of writing a store next to the project. The
+  home is resolved by ONE shared function (`tole_core::paths`, #344) also used
+  for user-global skills and the update-check cache: empty = unset, a relative
+  value is refused, and skills / the update check are skipped (never read from
+  or written to the cwd) when it is unresolvable.
+- **Terminal-safe prompt.** The path, the full content and the diff against the
+  previously trusted version are attacker-controlled text shown to a human at
+  the decision. Control characters (ESC, CR, NUL, DEL, C1), bidi
+  overrides/isolates, line/paragraph separators and zero-width characters are
+  printed as visible `\u{hex}` escapes, so the prompt cannot be rewritten.
+- **Fail closed.** Without a terminal there is no question: the answer is an
+  error naming the file and `tole config trust`. A corrupt, unreadable or
+  unsupported-version store is a hard error and is never overwritten.
+  `tole config trust` refuses a file that does not validate.
+- **Explicit path = intent.** A file named on the command line (`--config`) is
+  user intent and does not consult the store. `--no-config` skips discovery,
+  the gate and any output.
+- **Startup gating.** Every command except `config`, `upgrade` and `approvals`
+  runs the gate before anything else (before the update banner, session
+  creation or provider access). Only `run`/`chat`/`resume`/`mission` with a
+  terminal on stdin AND stderr (and not `--prompt-file -`) may ask; `sessions`,
+  `status` and the protocol faces `serve`/`acp`/`mcp` NEVER prompt — their
+  stdin/stdout are protocol channels — and fail closed with the exact
+  `tole config trust` instruction while the command does not run.
+- **Vetted bytes only.** The gate reads the file once; that exact content is
+  what gets parsed into the settings. The file is never re-read after vetting,
+  so a swap between check and use cannot smuggle in other content.
+- **No config, no change.** Without a config file nothing is read, printed or
+  looked up (not even the trust store location).
+- **Secrets stay out.** The API key and serve token are env-only; the schema
+  rejects secret-like keys, and `config check` prints only model/base_url
+  values.
+- **Sensitive keys apply only after trust.** `allow`, `trust`, the hooks,
+  `mcp_server` and `skill` take effect through the SAME single startup path as
+  every other key: nothing from the file is read into the settings before the
+  gate passed, and `--no-config` drops all of them. A config `allow` / `trust`
+  list feeds the very same allowlist machinery as the flags.
+- **Destructive is never allowlistable via the config.** `allow = ["*"]`,
+  `allow = ["delete_file"]` or a trust preset cannot skip the Destructive
+  prompt on the interactive CLI (the approver checks `Destructive` before any
+  pattern), and on the non-interactive faces the Destructive tools remain
+  structurally unregistered. Tests drive the real binary with such a config and
+  assert the file survives.
+- **Faces that refuse hooks refuse config hooks too.** `serve`/`acp`/`mcp`
+  refuse `--on-pretool`/`--on-posttool` (and `mcp` `--on-turnend`), `mission`
+  refuses the hooks, `--plan-mode`, `--memory` and the client-session flags
+  (`--skill`, `--no-skills`, `--mcp-server`) on every one of these faces. The
+  check runs on the EFFECTIVE (post-config) values, so a safety hook or deny
+  policy arriving from the file makes the command fail loudly (with a
+  `--no-config` hint) instead of being silently ignored.
+- **Replace, never merge; booleans only up.** A higher layer replaces a whole
+  list key, so a flag cannot be "extended" by a hostile file; a boolean key is
+  `flag || config` (a flag cannot switch a config `true` off, `--no-config`
+  can).
+- **Unsupported keys are loud.** A build without the `mcp` feature rejects
+  `mcp_server`/`no_auto_mcp`, one without `shell-tools` the hook keys and
+  `memory`, naming the key and the feature.
+
+Residual risks: a trusted config is trusted — a user who approves a malicious
+file at the prompt (or with `tole config trust --yes`, or names it with
+`--config`) grants exactly what the equivalent flags could grant (allowlisted
+Write tools, hooks that run as the user, MCP servers spawned as the user,
+skills injected into the prompt); it is shown in full, but a human decides; the trust store is a plain 0600 file in the
+user's home, so anything running as that user can edit it; the store update is
+an unlocked read-modify-write, so two concurrent `tole config trust` runs can
+lose one of the two records (the loser is simply asked again; the file itself
+is replaced atomically and never corrupted).

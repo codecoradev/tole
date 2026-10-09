@@ -9,9 +9,10 @@ Durable Rust agent harness: a conversational agent with risk-tiered approval
 gates, a write-once JSONL session log, and a register state machine — resumable
 after crashes, replayable forever.
 
-**Status:** v0.7.2 is release-candidate on `develop` (v0.7.1 shipped the rescan-2
-hardening + one tool-call authorization gate; see the CHANGELOG for its
-behavior changes). Four faces on one durable core: the CLI (run / chat /
+**Status:** v0.7.2 released; v0.8.0 is release-candidate on `develop` — it adds
+the per-project config `.tole/config.toml` (trusted before it applies; see the
+Configuration section) on top of v0.7.x (rescan-2 hardening, one tool-call
+authorization gate; see the CHANGELOG for the behavior changes). Four faces on one durable core: the CLI (run / chat /
 resume / sessions / jobs / **mission**), `tole mcp` (tool server),
 `tole acp` (editor agent), and `tole serve` (REST + multi-session
 MCP-over-HTTP daemon). Identity (owner-approved): a chat-first
@@ -116,6 +117,103 @@ trust: `internal` / `read_only`), `--skill <path>` (load a SKILL.md),
 | `TOLE_MEMORY` | memory loop backend (`uteke`) — same as `--memory uteke` |
 | `TOLE_NO_UPDATE_CHECK` | `1` disables the startup update-check banner (issue #220) |
 | `TOLE_MEMORY_NAMESPACE` | override the loop's namespace (default: `repo-<directory name>`) |
+
+## Configuration (project file)
+
+`<cwd>/.tole/config.toml` (no parent-directory walk) holds per-project defaults.
+It is loaded by every command except `config`, `upgrade` and `approvals`; use
+`--config <path>` to name another file (a path given on the command line is
+trusted without a trust record) or `--no-config` to ignore any file entirely
+(no discovery, no trust check, no output). When a config is loaded, one line
+`tole: using config <path>` goes to stderr. **Precedence: flag > env > config >
+default**, and a project without a config file behaves exactly as before.
+
+**Keys.** Every key is optional; the schema is strict (an unknown key, a wrong
+type or a secret-like key is an error with `file:line`; the file is capped at
+64 KiB).
+
+| Key | Mirrors | Effective value |
+|-----|---------|-----------------|
+| `model`, `base_url`, `system_prompt`, `memory` | the provider env, `--system`, `--memory` | flag > env > config |
+| `sessions_dir`, `workspace` | `--sessions-dir`, `--workspace` | flag > config > default |
+| `[mission]` `max_steps`, `max_minutes`, `max_tokens` | `mission --max-*` | flag > config > budget tier |
+| `[mission]` `verify`, `verify_timeout` | `mission --verify`, `--verify-timeout` | flag > config > default (`300`) |
+| `trust` (list of presets) | `--trust` | flag > `TOLE_TRUST` env > config |
+| `allow` (list of globs) | the subcommand's own `--allow` | flag > config |
+| `mcp_server` (list) | `--mcp-server` | flag > config |
+| `on_pretool`, `on_posttool`, `on_turnend` (lists) | `--on-pretool` / `--on-posttool` / `--on-turnend` | flag > config |
+| `skill` (list of paths) | `--skill` | flag > config (paths resolve against the cwd) |
+| `plan_mode`, `no_auto_mcp`, `no_skills` (booleans) | `--plan-mode`, `--no-auto-mcp`, `--no-skills` | `flag \|\| config` |
+
+The API key only ever comes from the environment (a secret-like key in the file
+is an error). An empty env variable counts as unset.
+
+- **Lists are replaced wholesale.** A higher layer replaces the whole list for
+  that key; lists are never merged. A non-empty `--allow` list replaces the
+  config `allow` list entirely (an empty flag list means "not given"), exactly
+  like `--trust` over `TOLE_TRUST`. Every subcommand has its own `--allow`; the
+  config `allow` is the fallback when THAT subcommand's `--allow` is empty.
+- **Booleans can only be turned on.** `effective = flag || config`: a flag can
+  turn a setting on but there is no flag that forces it off, so a config `true`
+  is dropped only with `--no-config` (or by editing / untrusting the file).
+  `tole config check` says so next to each boolean.
+- **Same effect as the flag.** `plan_mode = true` removes the write/delete/run
+  tools from the wire like `--plan-mode`; `allow`/`trust` feed the same
+  allowlist as the flags, so `Destructive` tools still always prompt (they can
+  never be allowed through the file, and on the non-interactive faces they stay
+  unregistered).
+- **Faces that refuse a flag refuse it from the config too.** `serve`, `acp`,
+  `mcp` and `mission` refuse `--on-pretool`/`--on-posttool` (and `--on-turnend`
+  where the flag is refused), `--skill`, `--no-skills`, `--mcp-server` (and
+  `--plan-mode` on `mission`). A value that arrives from the config is refused
+  with the same message plus `use --no-config to ignore the project config`;
+  tole never silently drops a project's safety hook.
+- **Feature-less builds.** In a build without the `mcp` feature, `mcp_server` /
+  `no_auto_mcp` in the config is an error naming the key and the feature; without
+  `shell-tools` the same holds for the hook keys and `memory`.
+
+`tole config check` prints every key that is set with its effective value and
+where it came from (`flag`, `env VAR`, `config`, `default`), using the same
+resolution code as startup (lists show the effective list, booleans
+`effective: true (config)` or `(flag)`).
+
+The file is untrusted input (it lives in a cloned repo), so it needs a
+content-bound approval before it takes effect:
+
+- On an interactive command (`run`, `chat`, `resume`, `mission`) with a terminal
+  on both stdin and stderr, an untrusted or changed config is shown in full and
+  you are asked `trust this config? [y/N]`. Everywhere else (`sessions`,
+  `status`, `serve`, `acp`, `mcp`, no terminal, or `--prompt-file -`) tole
+  FAILS CLOSED with the exact instruction (`tole config trust`) and runs
+  nothing; `serve`/`acp`/`mcp` never ask because their stdin/stdout are
+  protocol channels.
+
+- `tole config trust [--config <path>] [--yes]` validates the file, prints its
+  path and FULL content (plus a line diff against the previously trusted
+  version) with control and bidi characters escaped, then asks `[y/N]`.
+  Without a terminal it refuses unless `--yes` is given (the content is still
+  printed).
+- The approval is stored outside the repo in
+  `$CODECORA_HOME/tole/trusted-configs.json` (default `~/.codecora`, mode 0600)
+  as a snapshot of the file keyed by canonical project directory. A config is
+  trusted only while its bytes are identical to that snapshot; any edit makes it
+  untrusted again.
+- `tole config untrust [--config <path>]` removes the record (no error if
+  absent). `tole config check` prints `trust: trusted`, `trust: NOT trusted` or
+  `trust: CHANGED since it was trusted`; its exit code stays 0 for a valid file
+  whatever the trust state.
+- A corrupt or unsupported-version store is an error naming the file; tole never
+  overwrites it.
+
+The schema is strict (unknown keys, wrong types, malformed TOML, unknown `trust`
+presets and files over 64 KiB are errors, reported as `path:line:col: message`).
+Flat snake_case keys mirror the global flags (`model`, `base_url`, `sessions_dir`,
+`workspace`, `plan_mode`, `memory`, `trust`, `allow`, `mcp_server`, `no_auto_mcp`,
+`on_pretool`, `on_posttool`, `on_turnend`, `skill`, `no_skills`, `system_prompt`)
+plus one `[mission]` table (`max_steps`, `max_minutes`, `max_tokens`, `verify`,
+`verify_timeout`). Secrets never belong in a project file: any key whose name
+contains `secret`, `password`, `token` or `api_key` (any depth, any case) is a
+hard error.
 
 ## Tools
 

@@ -23,7 +23,7 @@
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
-use tole_core::openai::{OpenAiConfig, OpenAiProvider};
+use tole_core::openai::OpenAiProvider;
 use tole_core::storage::{JsonlStorage, Storage};
 use tole_core::subprocess::run_with_timeout;
 use tole_core::tool::ToolRegistry;
@@ -188,7 +188,7 @@ pub fn run_mission(
     let deadline = started + std::time::Duration::from_secs(cfg.max_minutes * 60);
     // Resolve provider config BEFORE the session file exists — a config
     // failure must not leave an empty, unsummarized session (cora CI).
-    let provider_cfg = OpenAiConfig::from_env().context(
+    let provider_cfg = tole_cli::config_apply::provider_config().context(
         "missing provider config: set TOLE_BASE_URL / TOLE_MODEL / TOLE_API_KEY \
          (or the OPENAI_* equivalents)",
     )?;

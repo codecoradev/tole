@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-10-09
+
+### Added
+- Project config `.tole/config.toml` (#208): per-directory defaults for `model`, `base_url`,
+  `system_prompt`, `memory`, `sessions_dir`, `workspace`, `trust`, `allow`, `mcp_server`, the
+  hooks (`on_pretool`/`on_posttool`/`on_turnend`), `skill`, `plan_mode`, `no_auto_mcp`,
+  `no_skills` and the `[mission]` table (`max_steps`, `max_minutes`, `max_tokens`, `verify`,
+  `verify_timeout`). Precedence is flag > env > config > default; list keys are replaced
+  wholesale by the higher layer and booleans can only be turned on by flags. The file is
+  untrusted input from the repo: it applies only after you trust it (`tole config trust`;
+  content-bound, stored outside the repo in `$CODECORA_HOME/tole/trusted-configs.json`).
+  Interactive commands ask `[y/N]` showing the full content and a diff; `serve`/`acp`/`mcp` and
+  non-interactive runs fail closed. `--config <path>` names a file explicitly (trusted) and
+  `--no-config` ignores it. Secrets (`api_key`, tokens, ...) are rejected, `Destructive` tools
+  can never be allowlisted through the config, and faces that refuse hooks, skills or MCP
+  servers refuse them from the config too.
+- `tole config check|trust|untrust`: validate the file and show every effective value with its
+  source (flag/env/config/default); trust or untrust the current content.
+
+### Changed
+- CI: the bare `--no-default-features` profile of `tole-cli` is now tested (not only checked), and the ACP/serve e2e tests are gated on `shell-tools` (#349).
+- `--skill` / `--no-skills` on `tole serve`/`acp`/`mcp`/`mission` are now refused in builds without the `mcp` feature too (they were silently ignored there), and the refusal also covers values coming from the project config (#346).
+
+### Fixed
+- The `gh` tool is only targeted at a remote whose host is exactly `github.com`: the string no longer matches inside a longer hostname (`github.com.evil.io`), the userinfo or another forge's path, and `host:port` URLs parse correctly (#352).
+- `tole approvals` now honors `TOLE_SERVE_URL` (precedence: --url > env > default http://127.0.0.1:7801) as its help text always claimed (#339).
+- CodeCora home is resolved in one place: skills and the update-check cache no longer fall back to the current directory when HOME is unset, and CODECORA_HOME now means the same thing everywhere (`$CODECORA_HOME/tole/...`; the update-check cache moves from `$CODECORA_HOME/.codecora/tole` to `$CODECORA_HOME/tole`) (#344).
+
 ## [0.7.2] — 2026-10-08
 
 ### Fixed

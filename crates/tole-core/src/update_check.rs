@@ -49,22 +49,10 @@ impl UpdateInfo {
     }
 }
 
-/// std-only home resolution (matches `skills.rs`; no `dirs` dep).
-fn codecora_home() -> Option<std::path::PathBuf> {
-    std::env::var("CODECORA_HOME")
-        .map(std::path::PathBuf::from)
-        .ok()
-        .or_else(|| {
-            std::env::var("HOME")
-                .or_else(|_| std::env::var("USERPROFILE"))
-                .map(std::path::PathBuf::from)
-                .ok()
-        })
-        .map(|h| h.join(".codecora").join("tole"))
-}
-
+/// `<codecora root>/tole/update-cache.json` via the shared resolver
+/// (#344); `None` (check skipped) when the home is unresolvable.
 fn cache_path() -> Option<std::path::PathBuf> {
-    codecora_home().map(|d| d.join("update-cache.json"))
+    crate::paths::tole_data_dir().map(|d| d.join("update-cache.json"))
 }
 
 fn now_secs() -> u64 {
@@ -268,12 +256,35 @@ mod tests {
         assert!(b.contains("0.7.0") && b.contains("0.6.0") && b.contains("tole upgrade"));
     }
 
+    #[cfg(unix)]
     #[test]
-    fn parse_host_ignores_codecora_home_absence() {
-        // codecora_home() falls back to HOME/USERPROFILE; on any system
-        // with a home this resolves somewhere writable.
-        if std::env::var("HOME").is_ok() || std::env::var("USERPROFILE").is_ok() {
-            assert!(cache_path().is_some());
-        }
+    fn cache_path_follows_the_shared_resolver() {
+        use crate::paths::with_env;
+        with_env(
+            &[("CODECORA_HOME", Some("/cc")), ("HOME", Some("/h"))],
+            || {
+                assert_eq!(
+                    cache_path(),
+                    Some(std::path::PathBuf::from("/cc/tole/update-cache.json"))
+                );
+            },
+        );
+        with_env(&[("CODECORA_HOME", None), ("HOME", Some("/h"))], || {
+            assert_eq!(
+                cache_path(),
+                Some(std::path::PathBuf::from(
+                    "/h/.codecora/tole/update-cache.json"
+                ))
+            );
+        });
+        // Unresolvable (or relative) home: no cache path, never the cwd.
+        with_env(
+            &[
+                ("CODECORA_HOME", Some("rel")),
+                ("HOME", None),
+                ("USERPROFILE", None),
+            ],
+            || assert_eq!(cache_path(), None),
+        );
     }
 }

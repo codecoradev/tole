@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use tole_cli::approver::{InteractiveApprover, StdioPrompt};
 use tole_cli::tools::WriteFileTool;
+use tole_cli::trust::expand_trust;
 #[cfg(feature = "mcp")]
 use tole_core::approval::AllowlistApprover;
 
@@ -27,7 +28,7 @@ use tole_core::gh::GhTool;
 use tole_core::git::GitTool;
 #[cfg(feature = "shell-tools")]
 use tole_core::jobs::{JobPollTool, JobStartTool};
-use tole_core::openai::{OpenAiConfig, OpenAiProvider};
+use tole_core::openai::OpenAiProvider;
 use tole_core::read_file::ReadFileTool;
 #[cfg(feature = "shell-tools")]
 use tole_core::run_command::RunCommandTool;
@@ -37,9 +38,6 @@ use tole_core::turn::{resume_turn, run_turn, run_turn_with_cancel, TurnOutcome, 
 #[cfg(feature = "shell-tools")]
 use tole_core::uteke::{UtekeDocumentTool, UtekeRecallTool};
 use tole_core::verify_package::VerifyPackageTool;
-
-/// Where sessions live unless the user overrides it.
-const DEFAULT_SESSIONS_DIR: &str = ".tole/sessions";
 
 /// Session id → path (`<dir>/<id>.jsonl`).
 fn session_path(dir: &Path, id: &str) -> PathBuf {
@@ -154,6 +152,18 @@ struct Cli {
     #[arg(long, global = true)]
     no_skills: bool,
 
+    /// Use this project config file instead of `<cwd>/.tole/config.toml`
+    /// (#208). A path named on the command line is user intent, so it is
+    /// trusted without a trust record. Precedence: flag > env > config >
+    /// default. Also selects the file for `tole config check|trust|untrust`.
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
+
+    /// Ignore any project config file entirely (#208): no discovery, no
+    /// trust check, no output.
+    #[arg(long, global = true, conflicts_with = "config")]
+    no_config: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -236,9 +246,9 @@ enum Command {
         #[arg(long)]
         verify: Option<String>,
 
-        /// Per-run timeout of the --verify command, in seconds.
-        #[arg(long, default_value_t = 300)]
-        verify_timeout: u64,
+        /// Per-run timeout of the --verify command, in seconds [default: 300]
+        #[arg(long)]
+        verify_timeout: Option<u64>,
 
         /// Continue an interrupted mission instead of starting a new one.
         #[arg(long)]
@@ -294,9 +304,10 @@ enum Command {
         /// The approval id (required for allow/deny).
         id: Option<String>,
 
-        /// Base URL of the serve instance.
-        #[arg(long, default_value = "http://127.0.0.1:7801")]
-        url: String,
+        /// Base URL of the serve instance (defaults to TOLE_SERVE_URL,
+        /// then http://127.0.0.1:7801).
+        #[arg(long)]
+        url: Option<String>,
 
         /// Bearer token (defaults to TOLE_SERVE_TOKEN).
         #[arg(long)]
@@ -409,6 +420,35 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
+    /// Project config file `.tole/config.toml` (#208): `check` validates
+    /// it and shows the effective values, `trust`/`untrust` manage the
+    /// trust record. Every key is applied after trust (flag > env > config
+    /// > default); `--no-config` ignores the file.
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
+}
+
+/// `tole config <action>` — an enum so later parts can add variants.
+#[derive(Subcommand)]
+enum ConfigAction {
+    /// Validate `<cwd>/.tole/config.toml` (or --config) and print what was
+    /// parsed plus the effective value and source of each applied key.
+    /// Exits non-zero on any error.
+    Check,
+    /// Trust `<cwd>/.tole/config.toml` (or --config): shows the full
+    /// content (and a diff vs the previously trusted version), then asks
+    /// `[y/N]`. The approval is content-bound and stored outside the repo
+    /// (`$CODECORA_HOME/tole/trusted-configs.json`).
+    Trust {
+        /// Skip the question (the content is still printed). Required
+        /// when there is no terminal to ask on.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Forget the trust record for the config (no error if absent).
+    Untrust,
 }
 
 fn main() {
@@ -419,7 +459,191 @@ fn main() {
     }
 }
 
+/// How the startup config gate treats a command (#208).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GatePolicy {
+    /// `config`, `upgrade`, `approvals`: no config is loaded.
+    Skip,
+    /// Interactive CLI commands: an untrusted config may be reviewed and
+    /// approved at the terminal (still needs stdin AND stderr to be ttys).
+    MayPrompt,
+    /// Everything else (sessions/status, and the serve/acp/mcp protocol
+    /// faces whose stdin/stdout are channels): fail closed, never ask.
+    NoPrompt,
+}
+
+fn gate_policy(cmd: &Command) -> GatePolicy {
+    match cmd {
+        Command::Config { .. } | Command::Upgrade { .. } | Command::Approvals { .. } => {
+            GatePolicy::Skip
+        }
+        // `--prompt-file -` consumes stdin as the prompt: a question on
+        // the same stream would eat prompt text.
+        Command::Run { prompt_file, .. } if prompt_file.as_deref() == Some("-") => {
+            GatePolicy::NoPrompt
+        }
+        Command::Run { .. }
+        | Command::Chat { .. }
+        | Command::Resume { .. }
+        | Command::Mission { .. } => GatePolicy::MayPrompt,
+        _ => GatePolicy::NoPrompt,
+    }
+}
+
+/// What the command line supplied for the config-applied keys. ONE place,
+/// shared by startup and `tole config check`.
+fn config_flags(cli: &Cli) -> tole_cli::config_apply::Flags {
+    let mut f = tole_cli::config_apply::Flags {
+        sessions_dir: cli.sessions_dir.clone(),
+        workspace: cli.workspace.clone(),
+        trust: cli.trust.clone(),
+        on_pretool: cli.on_pretool.clone(),
+        on_posttool: cli.on_posttool.clone(),
+        on_turnend: cli.on_turnend.clone(),
+        skill: cli.skill.clone(),
+        plan_mode: cli.plan_mode,
+        no_skills: cli.no_skills,
+        ..Default::default()
+    };
+    #[cfg(feature = "shell-tools")]
+    {
+        f.memory = cli.memory.clone();
+    }
+    #[cfg(feature = "mcp")]
+    {
+        f.mcp_server = cli.mcp_server.clone();
+        f.no_auto_mcp = cli.no_auto_mcp;
+    }
+    // Every subcommand with its own `--allow` feeds it here: the config
+    // `allow` list is the fallback when THAT flag list is empty.
+    match &cli.command {
+        Command::Run {
+            system,
+            allow_patterns,
+            ..
+        }
+        | Command::Chat {
+            system,
+            allow_patterns,
+            ..
+        } => {
+            f.system = system.clone();
+            f.allow = allow_patterns.clone();
+        }
+        Command::Resume { allow_patterns, .. } => f.allow = allow_patterns.clone(),
+        Command::Mission {
+            max_steps,
+            max_minutes,
+            max_tokens,
+            verify,
+            verify_timeout,
+            allow_patterns,
+            ..
+        } => {
+            f.max_steps = *max_steps;
+            f.max_minutes = *max_minutes;
+            f.max_tokens = *max_tokens;
+            f.verify = verify.clone();
+            f.verify_timeout = *verify_timeout;
+            f.allow = allow_patterns.clone();
+        }
+        #[cfg(all(feature = "mcp", feature = "shell-tools"))]
+        Command::Mcp { allow_patterns, .. } => f.allow = allow_patterns.clone(),
+        #[cfg(feature = "shell-tools")]
+        Command::Acp { allow_patterns, .. } | Command::Serve { allow_patterns, .. } => {
+            f.allow = allow_patterns.clone()
+        }
+        _ => {}
+    }
+    f
+}
+
 fn dispatch(cli: Cli) -> Result<()> {
+    use tole_cli::config_apply::{self, Settings};
+    // `tole config ...` is self-contained: it reads no session/env state
+    // and must not trigger the update banner.
+    if let Command::Config { action } = &cli.command {
+        let cwd = std::env::current_dir().context("cannot determine the cwd")?;
+        let explicit = cli.config.as_deref();
+        return match action {
+            ConfigAction::Check => {
+                let out = config_apply::check(
+                    &cwd,
+                    explicit,
+                    &config_flags(&cli),
+                    &config_apply::real_env,
+                )?;
+                println!("{out}");
+                // Validity != trust: the exit code stays 0 either way.
+                if tole_cli::config::discover(&cwd, explicit).is_some() {
+                    let (subject, _) = tole_cli::config_trust::Subject::resolve(&cwd, explicit)?;
+                    let store = tole_cli::config_trust::default_store_path()?;
+                    println!("{}", tole_cli::config_trust::trust_line(&subject, &store)?);
+                }
+                Ok(())
+            }
+            ConfigAction::Trust { yes } => {
+                let store = tole_cli::config_trust::default_store_path()?;
+                tole_cli::config_trust::trust_cmd(
+                    &cwd,
+                    explicit,
+                    *yes,
+                    &store,
+                    &mut tole_cli::config_trust::StdIo,
+                )
+            }
+            ConfigAction::Untrust => {
+                let store = tole_cli::config_trust::default_store_path()?;
+                tole_cli::config_trust::untrust_cmd(
+                    &cwd,
+                    explicit,
+                    &store,
+                    &mut tole_cli::config_trust::StdIo,
+                )
+            }
+        };
+    }
+    // Project config (#208): gate + parse BEFORE anything else runs (no
+    // update banner, no session work). `--no-config` and the skip-list
+    // commands never touch the file; with no config file at all this is
+    // a silent no-op.
+    let policy = gate_policy(&cli.command);
+    let project_config = if policy == GatePolicy::Skip || cli.no_config {
+        None
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => config_apply::load_project_config(
+                &cwd,
+                cli.config.as_deref(),
+                &tole_cli::config_trust::default_store_path,
+                &mut config_apply::StartupIo::new(policy == GatePolicy::MayPrompt),
+            )?,
+            // No usable cwd: nothing to discover (as before, relative
+            // paths just fail later); an explicit --config still reports.
+            Err(e) if cli.config.is_some() => {
+                return Err(anyhow::Error::new(e).context("cannot determine the cwd"))
+            }
+            Err(_) => None,
+        }
+    };
+    let cfg = project_config.map(|l| l.config);
+    if let Some(cfg) = &cfg {
+        // A key this build cannot honor is a loud startup error, never a
+        // silent ignore (the matching flag does not exist here).
+        if let Some(msg) = config_apply::unsupported_keys(
+            cfg,
+            cfg!(feature = "mcp"),
+            cfg!(feature = "shell-tools"),
+        ) {
+            anyhow::bail!(msg);
+        }
+        config_apply::install_fill(Settings::fill_from(cfg));
+    }
+    let settings = Settings::resolve(
+        &config_flags(&cli),
+        cfg.as_ref().unwrap_or(&Default::default()),
+        &config_apply::real_env,
+    );
     // Startup update notification (issue #220): banner is best-effort,
     // cache-backed, and skipped entirely for `tole upgrade` (which does
     // its own check) and for TOLE_NO_UPDATE_CHECK=1 (checked inside).
@@ -431,66 +655,70 @@ fn dispatch(cli: Cli) -> Result<()> {
             drop(handle);
         }
     }
-    let sessions_dir = PathBuf::from(
-        cli.sessions_dir
-            .clone()
-            .unwrap_or_else(|| DEFAULT_SESSIONS_DIR.to_string()),
-    );
+    // flag > config > default; the ONE resolution `sessions`, `status`,
+    // `run`, `chat`, `resume` and `mission` share.
+    let sessions_dir = PathBuf::from(settings.sessions_dir.value.clone());
     // The RAW override for the server faces: an explicit --sessions-dir
     // relocates serve/acp session storage; the default (None) keeps the
     // per-session-cwd layout those faces always had. The resolved
     // `sessions_dir` above stays the run/chat/sessions/status default.
     // Only the shell-tools serve/acp faces read this (#330).
     #[cfg_attr(not(feature = "shell-tools"), allow(unused_variables))]
-    let sessions_dir_override = cli.sessions_dir.clone().map(PathBuf::from);
+    let sessions_dir_override = (settings.sessions_dir.source != config_apply::Source::Default)
+        .then(|| PathBuf::from(settings.sessions_dir.value.clone()));
     #[cfg(feature = "mcp")]
-    let mcp_specs = merge_mcp_specs(&cli.mcp_server, cli.no_auto_mcp, auto_mcp_specs());
-    // Explicit --mcp-server flags only — the merged `mcp_specs` also
-    // contains the cora auto-preset, which must NOT trigger the
-    // server-face refusal below.
-    #[cfg(feature = "mcp")]
-    let explicit_mcp = !cli.mcp_server.is_empty();
+    let mcp_specs = merge_mcp_specs(
+        &config_apply::values(&settings.mcp_server),
+        settings.no_auto_mcp.value,
+        auto_mcp_specs(),
+    );
+    // Explicit servers only (--mcp-server flag or the config `mcp_server`
+    // list) — the merged `mcp_specs` also contains the cora auto-preset,
+    // which must NOT trigger the server-face refusal below. Always false
+    // in a build without the `mcp` feature (the config key is refused at
+    // startup there, and the flag does not exist).
+    let explicit_mcp = settings.mcp_server.is_some();
     // scan-3 finding fix: the global --workspace/--memory flags now flow
     // into the host, so `tole serve/acp/mcp` honor them as fallbacks when
     // the subcommand-level flags are absent (previously they were
     // silently ignored by those subcommands).
     let host = HostConfig {
-        workspace: cli.workspace.clone(),
-        skills: cli.skill.clone(),
-        no_skills: cli.no_skills,
+        workspace: settings.workspace.as_ref().map(|w| w.value.clone()),
+        skills: config_apply::values(&settings.skill),
+        no_skills: settings.no_skills.value,
         #[cfg(feature = "mcp")]
         mcp_server: mcp_specs,
-        plan_mode: cli.plan_mode,
+        plan_mode: settings.plan_mode.value,
         agents_worktree: cli.agents_worktree,
 
-        on_pretool: cli.on_pretool.clone(),
-        on_posttool: cli.on_posttool.clone(),
-        on_turnend: cli.on_turnend.clone(),
+        on_pretool: config_apply::values(&settings.on_pretool),
+        on_posttool: config_apply::values(&settings.on_posttool),
+        on_turnend: config_apply::values(&settings.on_turnend),
         #[cfg(feature = "shell-tools")]
-        memory: resolve_memory(cli.memory.as_ref())?,
+        memory: resolve_memory(settings.memory.as_ref().map(|m| m.value.as_str()))?,
         #[cfg(not(feature = "shell-tools"))]
         memory: (),
     };
     // Trust presets (issue #159): expand once, before dispatch — every
-    // allow_patterns-consuming subcommand appends these. The --trust
-    // flag wins over the TOLE_TRUST env (documented); the env splits on
-    // commas/whitespace so one variable can carry several presets.
-    let trust_extra = expand_trust(&resolve_trust_flags(
-        &cli.trust,
-        std::env::var("TOLE_TRUST").ok(),
-    ))?;
+    // allow_patterns-consuming subcommand appends these. --trust >
+    // TOLE_TRUST > config `trust`, the higher layer replacing the whole
+    // list (the env splits on commas/whitespace so one variable can carry
+    // several presets).
+    let trust_extra = expand_trust(&config_apply::values(&settings.trust))?;
 
     match cli.command {
+        // Handled at the top of `dispatch`, before any session/env state.
+        Command::Config { .. } => unreachable!("`tole config` returns early"),
         Command::Run {
             prompt,
             prompt_file,
             name,
             timeout,
-            system,
-            allow_patterns: allow_patterns_in,
+            system: _,
+            allow_patterns: _,
             yes,
         } => {
-            let allow_patterns = with_trust(allow_patterns_in, &trust_extra);
+            let allow_patterns = with_trust(config_apply::values(&settings.allow), &trust_extra);
             // Prompt resolution (issue #216): exactly one of positional
             // PROMPT / --prompt-file ('-' = stdin).
             let prompt = match (prompt, prompt_file.as_deref()) {
@@ -515,7 +743,8 @@ fn dispatch(cli: Cli) -> Result<()> {
             run_command(
                 &sessions_dir,
                 &prompt,
-                system.as_deref(),
+                // --system > TOLE_SYSTEM_PROMPT > config (already resolved).
+                settings.system_prompt.as_ref().map(|e| e.value.as_str()),
                 &allow_patterns,
                 yes,
                 &host,
@@ -533,10 +762,10 @@ fn dispatch(cli: Cli) -> Result<()> {
         Command::Resume {
             id,
             prompt,
-            allow_patterns: allow_patterns_in,
+            allow_patterns: _,
             yes,
         } => {
-            let allow_patterns = with_trust(allow_patterns_in, &trust_extra);
+            let allow_patterns = with_trust(config_apply::values(&settings.allow), &trust_extra);
             resume_command(
                 &sessions_dir,
                 &id,
@@ -548,10 +777,10 @@ fn dispatch(cli: Cli) -> Result<()> {
         }
         #[cfg(all(feature = "mcp", feature = "shell-tools"))]
         Command::Mcp {
-            allow_patterns: allow_patterns_in,
+            allow_patterns: _,
             workspace,
         } => {
-            let allow_patterns = with_trust(allow_patterns_in, &trust_extra);
+            let allow_patterns = with_trust(config_apply::values(&settings.allow), &trust_extra);
             // Global flags must not SILENTLY no-op on this subcommand
             // (cora scan-3 #9): plan-mode filters the served registry to
             // read-only; hooks are not wired in server mode (no local
@@ -559,19 +788,20 @@ fn dispatch(cli: Cli) -> Result<()> {
             // --allow), so --on-pretool/--on-posttool error out loudly
             // instead of being ignored.
             if host.on_pretool_non_empty() || host.on_posttool_non_empty() {
-                anyhow::bail!(
+                return Err(refuse(
                     "--on-pretool/--on-posttool are not supported by `tole mcp` \
-                     (server mode pre-authorizes Write tools with --allow instead)"
-                );
+                     (server mode pre-authorizes Write tools with --allow instead)",
+                    pretool_from_config(&settings),
+                ));
             }
             if !host.on_turnend.is_empty() {
-                anyhow::bail!(
+                return Err(refuse(
                     "--on-turnend is not supported by `tole mcp` (the tool server runs no \
-                     turns; stop gates apply to run/chat/resume/serve/acp sessions)"
-                );
+                     turns; stop gates apply to run/chat/resume/serve/acp sessions)",
+                    from_config(&settings.on_turnend),
+                ));
             }
-            #[cfg(feature = "mcp")]
-            check_client_session_flags("mcp", &host.skills, host.no_skills, explicit_mcp)?;
+            check_server_face_flags("mcp", &host, &settings, explicit_mcp)?;
             if host.plan_mode {
                 eprintln!("tole mcp: --plan-mode is active — serving read-only tools only");
             }
@@ -592,56 +822,69 @@ fn dispatch(cli: Cli) -> Result<()> {
             let token = token
                 .or_else(|| std::env::var("TOLE_SERVE_TOKEN").ok())
                 .context("approval decisions need a token (--token or TOLE_SERVE_TOKEN)")?;
+            let url = resolve_serve_url(url, std::env::var("TOLE_SERVE_URL").ok());
             approvals::cli(&action, id.as_deref(), &url, &token)
         }
         Command::Mission {
             goal,
-            max_steps,
-            max_minutes,
-            max_tokens,
-            verify,
-            verify_timeout,
+            max_steps: _,
+            max_minutes: _,
+            max_tokens: _,
+            verify: _,
+            verify_timeout: _,
             resume,
-            allow_patterns: allow_patterns_in,
+            allow_patterns: _,
             yes,
         } => {
-            let allow_patterns = with_trust(allow_patterns_in, &trust_extra);
+            let allow_patterns = with_trust(config_apply::values(&settings.allow), &trust_extra);
             if host.plan_mode {
-                anyhow::bail!(
-                    "--plan-mode has no meaning for a mission (missions mutate by definition)"
-                );
+                return Err(refuse(
+                    "--plan-mode has no meaning for a mission (missions mutate by definition)",
+                    settings.plan_mode.source == config_apply::Source::Config,
+                ));
             }
             // Issue #258 (rescan #46, scan-3 #9 rule): global flags must
             // not SILENTLY no-op — missions build their own registry and
             // run no host memory loop today, so hook/memory flags are
             // loudly refused instead of being ignored.
             if host.on_pretool_non_empty() || host.on_posttool_non_empty() {
-                anyhow::bail!(
+                return Err(refuse(
                     "--on-pretool/--on-posttool are not supported by `tole run mission` \
-                     (mission registries do not wire tool hooks yet)"
-                );
+                     (mission registries do not wire tool hooks yet)",
+                    pretool_from_config(&settings),
+                ));
             }
             if !host.on_turnend.is_empty() {
-                anyhow::bail!(
+                return Err(refuse(
                     "--on-turnend is not supported by `tole run mission` (mission turns \
-                     settle through the mission loop, not the turn-end hook path)"
-                );
+                     settle through the mission loop, not the turn-end hook path)",
+                    from_config(&settings.on_turnend),
+                ));
             }
             // #[cfg]-mirrored like the HostConfig field itself: without
             // shell-tools the field is the unit type (cora round 1).
             #[cfg(feature = "shell-tools")]
             if host.memory.is_some() {
-                anyhow::bail!(
+                return Err(refuse(
                     "--memory is not supported by `tole run mission` (the mission loop does \
-                     not run the harness memory loop yet)"
-                );
+                     not run the harness memory loop yet)",
+                    settings
+                        .memory
+                        .as_ref()
+                        .is_some_and(|m| m.source == config_apply::Source::Config),
+                ));
             }
-            #[cfg(feature = "mcp")]
-            check_client_session_flags("mission", &host.skills, host.no_skills, explicit_mcp)?;
+            check_server_face_flags("mission", &host, &settings, explicit_mcp)?;
             // Budget tier (issue #201): the internal trust preset earns
             // the trusted tier's headroom; explicit flags always win.
             let trusted = trust_extra.iter().any(|p| p == "todo_write");
-            let tier = mission::BudgetTier::resolve(trusted, max_steps, max_minutes, max_tokens);
+            // flag > config > budget tier (no env for the budgets).
+            let tier = mission::BudgetTier::resolve(
+                trusted,
+                settings.max_steps.as_ref().map(|e| e.value),
+                settings.max_minutes.as_ref().map(|e| e.value),
+                settings.max_tokens.as_ref().map(|e| e.value),
+            );
             let sessions_dir = sessions_dir.clone();
             std::fs::create_dir_all(&sessions_dir)
                 .with_context(|| format!("creating {}", sessions_dir.display()))?;
@@ -673,8 +916,9 @@ fn dispatch(cli: Cli) -> Result<()> {
                     max_steps: tier.max_steps,
                     max_minutes: tier.max_minutes,
                     max_tokens: tier.max_tokens,
-                    verify,
-                    verify_timeout_secs: verify_timeout,
+                    // flag > config; timeout flag > config > 300.
+                    verify: settings.verify.as_ref().map(|v| v.value.clone()),
+                    verify_timeout_secs: settings.verify_timeout.value,
                     resume_id: resume,
                 },
                 registry,
@@ -683,28 +927,28 @@ fn dispatch(cli: Cli) -> Result<()> {
         }
         #[cfg(feature = "shell-tools")]
         Command::Acp {
-            allow_patterns: allow_patterns_in,
+            allow_patterns: _,
             yes,
             workspace,
             memory,
         } => {
-            let allow_patterns = with_trust(allow_patterns_in, &trust_extra);
+            let allow_patterns = with_trust(config_apply::values(&settings.allow), &trust_extra);
             // Same loud-bail rule as `tole mcp` for hooks: the ACP host
             // does not wire local pre/post hooks — approvals happen in
             // the editor via permission requests instead.
             if host.on_pretool_non_empty() || host.on_posttool_non_empty() {
-                anyhow::bail!(
+                return Err(refuse(
                     "--on-pretool/--on-posttool are not supported by `tole acp` \
-                     (approvals happen via session/request_permission in the client)"
-                );
+                     (approvals happen via session/request_permission in the client)",
+                    pretool_from_config(&settings),
+                ));
             }
-            #[cfg(feature = "mcp")]
-            check_client_session_flags("acp", &host.skills, host.no_skills, explicit_mcp)?;
+            check_server_face_flags("acp", &host, &settings, explicit_mcp)?;
             if host.plan_mode {
                 eprintln!("tole acp: --plan-mode is active — serving read-only tools only");
             }
             let memory = match memory.as_deref().filter(|s| !s.trim().is_empty()) {
-                Some(_) => resolve_memory(memory.as_ref())?,
+                Some(m) => resolve_memory(Some(m))?,
                 None => host.memory.clone(),
             };
             let workspace = workspace.or_else(|| host.workspace.clone());
@@ -724,24 +968,24 @@ fn dispatch(cli: Cli) -> Result<()> {
             bind,
             transport,
             token,
-            allow_patterns: allow_patterns_in,
+            allow_patterns: _,
             workspace,
             memory,
         } => {
-            let allow_patterns = with_trust(allow_patterns_in, &trust_extra);
+            let allow_patterns = with_trust(config_apply::values(&settings.allow), &trust_extra);
             // Loud bails, same rule as `tole mcp`/`tole acp`: these host
             // flags have no server-face wiring, and a silent no-op is
             // worse than a startup error (scan-3 #9).
             if host.on_pretool_non_empty() || host.on_posttool_non_empty() {
-                anyhow::bail!(
+                return Err(refuse(
                     "--on-pretool/--on-posttool are not supported by `tole serve` \
-                     (a server has no local human; pre-authorize Write tools with --allow)"
-                );
+                     (a server has no local human; pre-authorize Write tools with --allow)",
+                    pretool_from_config(&settings),
+                ));
             }
-            #[cfg(feature = "mcp")]
-            check_client_session_flags("serve", &host.skills, host.no_skills, explicit_mcp)?;
+            check_server_face_flags("serve", &host, &settings, explicit_mcp)?;
             let memory = match memory.as_deref().filter(|s| !s.trim().is_empty()) {
-                Some(_) => resolve_memory(memory.as_ref())?,
+                Some(m) => resolve_memory(Some(m))?,
                 None => host.memory.clone(),
             };
             let workspace = workspace.or_else(|| host.workspace.clone());
@@ -787,16 +1031,16 @@ fn dispatch(cli: Cli) -> Result<()> {
         Command::Sessions => sessions_command(&sessions_dir),
         Command::Status { id } => status_command(&sessions_dir, &id),
         Command::Chat {
-            system,
+            system: _,
             resume,
             last,
-            allow_patterns: allow_patterns_in,
+            allow_patterns: _,
             yes,
         } => {
-            let allow_patterns = with_trust(allow_patterns_in, &trust_extra);
+            let allow_patterns = with_trust(config_apply::values(&settings.allow), &trust_extra);
             chat_command(
                 &sessions_dir,
-                system.as_deref(),
+                settings.system_prompt.as_ref().map(|e| e.value.as_str()),
                 resume,
                 last,
                 &allow_patterns,
@@ -892,22 +1136,17 @@ impl HostConfig {
     }
 }
 
-/// Memory backend resolution: the `--memory` flag wins over the
-/// `TOLE_MEMORY` env; `uteke` is the only backend. The namespace follows
+/// Memory backend resolution: `chosen` is the already-resolved backend
+/// name (`--memory` flag > `TOLE_MEMORY` env > project config, see
+/// `config_apply::Settings`); `uteke` is the only backend. The namespace follows
 /// the ecosystem `repo-<dir>` convention unless `TOLE_MEMORY_NAMESPACE`
 /// overrides it. A missing uteke binary degrades to a warning + no-op
 /// (the same probe contract as the uteke tools).
 #[cfg(feature = "shell-tools")]
-fn resolve_memory(flag: Option<&String>) -> Result<Option<tole_core::memory::MemoryConfig>> {
-    let chosen = flag
+fn resolve_memory(chosen: Option<&str>) -> Result<Option<tole_core::memory::MemoryConfig>> {
+    let chosen = chosen
         .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            std::env::var("TOLE_MEMORY")
-                .ok()
-                .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty())
-        });
+        .filter(|s| !s.is_empty());
     let Some(backend) = chosen else {
         return Ok(None);
     };
@@ -1044,87 +1283,29 @@ fn detect_github_repo(cwd: &Path) -> Option<String> {
     tole_cli::session_host::github_repo_from_remote_url(&String::from_utf8_lossy(&out.stdout))
 }
 
-/// Trust presets (issue #159): one word for "auto-allow the fleet's own
-/// ecosystem tools". Pure sugar — the expanded patterns feed the SAME
-/// AllowlistApprover machinery as `--allow`, so enforcement (and the
-/// Destructive-never-allowed invariant) is unchanged. `internal` covers
-/// the probe-gated native integrations (uteke_*, cora_search) plus the
-/// cora MCP auto-preset surface (mcp_cora_*) and the always-safe
-/// verify_package/job tools plus `agent_poll` (Write since #300; exact name,
-/// so `agent_start` still prompts); it deliberately excludes the write-capable
-/// native tools (write_file/edit_file/run_command/git/gh), which keep
-/// prompting.
-const TRUST_PRESETS: &[(&str, &[&str])] = &[
-    (
-        "internal",
-        &[
-            "uteke_*",
-            "cora_search",
-            "mcp_cora_*",
-            "verify_package",
-            "job_*",
-            "agent_poll",
-            "tole_session_*",
-            "todo_write",
-        ],
-    ),
-    (
-        "read_only",
-        &[
-            "read_file",
-            "verify_package",
-            "uteke_recall",
-            "cora_search",
-            "tole_session_status",
-            "tole_session_list",
-            "job_poll",
-        ],
-    ),
-];
-
-/// Effective trust-preset flag list: an explicit `--trust` flag wins
-/// wholesale over the `TOLE_TRUST` env; with no flags, the env (split on
-/// commas/whitespace) is the list. Found by activation testing
-/// 2026-10-05: the env was documented ("flag wins over the TOLE_TRUST
-/// env") but never read — same documented-but-unimplemented class as the
-/// #138 ambiguity refusal.
+/// Flag-over-env trust list (the pre-config rule, #159), kept as a thin
+/// test oracle over the shared [`config_apply::resolve_list`]: startup
+/// resolves `trust` through `Settings::resolve` (flag > TOLE_TRUST env >
+/// config), whose first two layers must stay exactly this behavior.
+#[cfg(test)]
 fn resolve_trust_flags(flag: &[String], env_val: Option<String>) -> Vec<String> {
-    if !flag.is_empty() {
-        return flag.to_vec();
-    }
-    let Some(env_val) = env_val else {
-        return Vec::new();
-    };
-    env_val
-        .split(|c: char| c == ',' || c.is_whitespace())
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect()
+    let env = env_val
+        .map(|v| tole_cli::config_apply::split_env_list(&v))
+        .unwrap_or_default();
+    tole_cli::config_apply::resolve_list(flag, &env, None)
+        .map(|(v, _)| v)
+        .unwrap_or_default()
 }
 
-/// Expand `--trust` preset names into extra allow patterns. Unknown
-/// preset names are a hard error — a typo silently narrowing trust would
-/// be worse than failing. `none`/empty → no extra patterns.
-fn expand_trust(presets: &[String]) -> Result<Vec<String>> {
-    let mut out = Vec::new();
-    for p in presets {
-        if p.eq_ignore_ascii_case("none") {
-            continue;
-        }
-        let found = TRUST_PRESETS
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case(p))
-            .map(|(_, patterns)| patterns);
-        let Some(patterns) = found else {
-            let names: Vec<&str> = TRUST_PRESETS.iter().map(|(n, _)| *n).collect();
-            anyhow::bail!(
-                "unknown trust preset {p:?} — available: {}",
-                names.join(", ")
-            );
-        };
-        out.extend(patterns.iter().map(|s| s.to_string()));
-    }
-    Ok(out)
+/// Default base URL of a `tole serve` instance for `tole approvals`.
+const DEFAULT_SERVE_URL: &str = "http://127.0.0.1:7801";
+
+/// Effective serve URL for `tole approvals` (#339): an explicit `--url`
+/// wins over the `TOLE_SERVE_URL` env, which wins over the default. An
+/// empty env value counts as unset.
+fn resolve_serve_url(flag: Option<String>, env_val: Option<String>) -> String {
+    flag.or_else(|| env_val.filter(|v| !v.is_empty()))
+        .unwrap_or_else(|| DEFAULT_SERVE_URL.to_string())
 }
 
 /// Append the trust-preset patterns to the user's `--allow` list.
@@ -1140,10 +1321,9 @@ fn with_trust(mut allow_patterns: Vec<String>, trust_extra: &[String]) -> Vec<St
 /// flag state, not the merged preset list — the cora auto-preset must
 /// not trip this.
 ///
-/// Every call site is `#[cfg(feature = "mcp")]`-gated (the `--mcp-server`
-/// flag and its presets exist only there), so without the `mcp` feature
-/// the function is unreachable and gated out to stay warning-free.
-#[cfg(feature = "mcp")]
+/// Ungated since #208 part 3b: a config `skill` / `no_skills` must be
+/// refused on these faces in EVERY build profile, not only with `mcp`
+/// (without the feature `explicit_mcp_servers` is always false).
 fn check_client_session_flags(
     face: &str,
     skills: &[PathBuf],
@@ -1169,6 +1349,51 @@ fn check_client_session_flags(
         );
     }
     Ok(())
+}
+
+/// A refusal that may stem from the project config rather than the command
+/// line: the message is the flag's, plus (for config-sourced values) the way
+/// out. A safety hook / policy that arrives from the config must never be
+/// silently dropped on a face that cannot honor it.
+fn refuse(msg: &str, from_config: bool) -> anyhow::Error {
+    if from_config {
+        anyhow::anyhow!(
+            "{msg} (the value comes from the project config; \
+             use --no-config to ignore the project config)"
+        )
+    } else {
+        anyhow::anyhow!("{msg}")
+    }
+}
+
+fn from_config<T>(e: &tole_cli::config_apply::ListEff<T>) -> bool {
+    e.as_ref()
+        .is_some_and(|e| e.source == tole_cli::config_apply::Source::Config)
+}
+
+fn pretool_from_config(s: &tole_cli::config_apply::Settings) -> bool {
+    from_config(&s.on_pretool) || from_config(&s.on_posttool)
+}
+
+/// [`check_client_session_flags`] over the EFFECTIVE (post-config) values;
+/// a config-sourced offender gets the `--no-config` hint.
+fn check_server_face_flags(
+    face: &str,
+    host: &HostConfig,
+    settings: &tole_cli::config_apply::Settings,
+    explicit_mcp: bool,
+) -> Result<()> {
+    check_client_session_flags(face, &host.skills, host.no_skills, explicit_mcp).map_err(|e| {
+        // Same order as the checks inside: skill, no_skills, mcp_server.
+        let cfg = if !host.skills.is_empty() {
+            from_config(&settings.skill)
+        } else if host.no_skills {
+            settings.no_skills.source == tole_cli::config_apply::Source::Config
+        } else {
+            from_config(&settings.mcp_server)
+        };
+        refuse(&e.to_string(), cfg)
+    })
 }
 
 /// Register the `gh` tool against the checkout's own GitHub repo.
@@ -1558,7 +1783,7 @@ fn run_command(
     name: Option<&str>,
     timeout_secs: Option<u64>,
 ) -> Result<()> {
-    let cfg = OpenAiConfig::from_env().context(
+    let cfg = tole_cli::config_apply::provider_config().context(
         "missing provider config: set TOLE_BASE_URL / TOLE_MODEL / TOLE_API_KEY \
          (or the OPENAI_* equivalents)",
     )?;
@@ -1741,7 +1966,7 @@ fn resume_command(
     if !path.exists() {
         anyhow::bail!("session {id} not found at {}", path.display());
     }
-    let cfg = OpenAiConfig::from_env().context(
+    let cfg = tole_cli::config_apply::provider_config().context(
         "missing provider config: set TOLE_BASE_URL / TOLE_MODEL / TOLE_API_KEY \
          (or the OPENAI_* equivalents)",
     )?;
@@ -2074,7 +2299,7 @@ fn chat_command(
 ) -> Result<()> {
     use std::io::{BufRead, Write};
 
-    let cfg = OpenAiConfig::from_env().context(
+    let cfg = tole_cli::config_apply::provider_config().context(
         "missing provider config: set TOLE_BASE_URL / TOLE_MODEL / TOLE_API_KEY \
          (or the OPENAI_* equivalents)",
     )?;
@@ -2558,6 +2783,51 @@ mod gh_repo_tests {
         .is_none());
     }
 
+    /// #352: only a host that is EXACTLY github.com counts; the string
+    /// "github.com" inside a longer hostname, userinfo or the path must not
+    /// redirect the gh tool to an attacker-named repo.
+    #[test]
+    fn host_must_be_exactly_github_com() {
+        let parse = tole_cli::session_host::github_repo_from_remote_url;
+        for bad in [
+            "https://notgithub.com/owner/name",
+            "https://github.com.evil.io/owner/name",
+            "ssh://git@github.com.evil.io/o/r",
+            "https://evil.io/github.com/owner/name",
+            "https://gitea.example/github.com/owner/name.git",
+            "https://github.com@evil.io/owner/name",
+            "https://user:github.com@evil.io/owner/name",
+            "ssh://git@evil.io:github.com/o/r",
+            "git@evil.io:github.com/o/r",
+            "git@github.com.evil.io:o/r",
+            "evil.io:github.com:o/r",
+            "https://githubxcom/owner/name",
+            "https://gist.github.com/owner/name",
+            "github.com/owner/name",
+        ] {
+            assert!(parse(bad).is_none(), "{bad} must not resolve to a repo");
+        }
+    }
+
+    #[test]
+    fn accepts_the_real_github_forms() {
+        let parse = tole_cli::session_host::github_repo_from_remote_url;
+        for (url, want) in [
+            ("https://github.com/o/r", "o/r"),
+            ("https://github.com/o/r/", "o/r"),
+            ("https://GitHub.COM/o/r.git", "o/r"),
+            ("https://github.com:443/o/r.git", "o/r"),
+            ("https://user:tok@github.com/o/r.git", "o/r"),
+            ("ssh://git@github.com/o/r.git", "o/r"),
+            ("ssh://git@github.com:22/o/r.git", "o/r"),
+            ("git@github.com:o/r.git", "o/r"),
+            ("github.com:o/r", "o/r"),
+            ("git://github.com/o/r.git", "o/r"),
+        ] {
+            assert_eq!(parse(url).as_deref(), Some(want), "{url}");
+        }
+    }
+
     #[test]
     fn gh_tool_not_registered_without_detected_repo() {
         // Issue #293: a non-GitHub cwd must yield NO gh tool (no
@@ -2864,6 +3134,49 @@ mod trust_preset_tests {
     }
 
     #[test]
+    fn serve_url_flag_wins_over_env() {
+        let u = resolve_serve_url(
+            Some("http://flag:1".to_string()),
+            Some("http://env:2".to_string()),
+        );
+        assert_eq!(u, "http://flag:1");
+    }
+
+    #[test]
+    fn serve_url_env_wins_over_default() {
+        let u = resolve_serve_url(None, Some("http://remote:9".to_string()));
+        assert_eq!(u, "http://remote:9");
+    }
+
+    #[test]
+    fn serve_url_empty_env_is_ignored() {
+        assert_eq!(
+            resolve_serve_url(None, Some(String::new())),
+            DEFAULT_SERVE_URL
+        );
+    }
+
+    #[test]
+    fn serve_url_default_when_neither() {
+        assert_eq!(resolve_serve_url(None, None), "http://127.0.0.1:7801");
+    }
+
+    #[test]
+    fn approvals_parse_without_url_leaves_it_unset() {
+        let cli = Cli::try_parse_from(["tole", "approvals", "list"]).unwrap();
+        match cli.command {
+            Command::Approvals { url, .. } => assert!(url.is_none()),
+            _ => panic!("expected Approvals"),
+        }
+        let cli =
+            Cli::try_parse_from(["tole", "approvals", "list", "--url", "http://x:1"]).unwrap();
+        match cli.command {
+            Command::Approvals { url, .. } => assert_eq!(url.as_deref(), Some("http://x:1")),
+            _ => panic!("expected Approvals"),
+        }
+    }
+
+    #[test]
     fn trust_env_typo_is_a_loud_error() {
         let flags = resolve_trust_flags(&[], Some("internalx".to_string()));
         let err = expand_trust(&flags).unwrap_err();
@@ -3037,3 +3350,7 @@ mod chat_todo_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "main_gate_tests.rs"]
+mod gate_policy_tests;

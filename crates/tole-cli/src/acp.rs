@@ -680,7 +680,7 @@ pub fn run_acp(
     // hung gateway neither stalls every call nor is pinned forever. No
     // provider config -> nothing to probe.
     let env_models_raw = std::env::var("TOLE_MODELS").ok();
-    let probe_cfg = tole_core::openai::OpenAiConfig::from_env();
+    let probe_cfg = tole_cli::config_apply::provider_config();
     /// Bounded wait for the lazy /models probe (issues #257/#319). It runs
     /// inline on the ACP reader thread (session/new, set_config_option), so
     /// it is kept short: 5s covers a healthy gateway's `/models` (normally
@@ -734,7 +734,9 @@ pub fn run_acp(
     let env_model = std::env::var("TOLE_MODEL")
         .ok()
         .or_else(|| std::env::var("OPENAI_MODEL").ok())
-        .filter(|m| !m.trim().is_empty());
+        .filter(|m| !m.trim().is_empty())
+        // Project config (#208) only when the env names no model.
+        .or_else(tole_cli::config_apply::config_model);
     let stdin = std::io::stdin();
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
