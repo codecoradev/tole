@@ -8,10 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- `tole config check` validates `.tole/config.toml` (strict schema, secret keys rejected, 64 KiB cap); the file is NOT applied to sessions yet (#208, part 1 of 3).
-- `tole config trust|untrust` and trust status in `tole config check` (content-bound, stored outside the repo); still not applied to sessions (#208, part 2 of 3).
-- `.tole/config.toml` is now applied for model, base_url, system_prompt, memory, sessions_dir, workspace and [mission] budgets after trust (`--config`, `--no-config`); precedence flag > env > config > default; security-sensitive keys follow in the next part (#208, part 3a).
-- `.tole/config.toml` now also applies trust, allow, mcp_server, hooks, skill, plan_mode, no_auto_mcp, no_skills and mission verify/verify_timeout after trust (lists replaced wholesale by the higher layer; booleans can only be turned on by flags; faces that refuse these flags refuse them from config too) — completes #208.
+- Project config `.tole/config.toml` (#208): per-directory defaults for `model`, `base_url`,
+  `system_prompt`, `memory`, `sessions_dir`, `workspace`, `trust`, `allow`, `mcp_server`, the
+  hooks (`on_pretool`/`on_posttool`/`on_turnend`), `skill`, `plan_mode`, `no_auto_mcp`,
+  `no_skills` and the `[mission]` table (`max_steps`, `max_minutes`, `max_tokens`, `verify`,
+  `verify_timeout`). Precedence is flag > env > config > default; list keys are replaced
+  wholesale by the higher layer and booleans can only be turned on by flags. The file is
+  untrusted input from the repo: it applies only after you trust it (`tole config trust`;
+  content-bound, stored outside the repo in `$CODECORA_HOME/tole/trusted-configs.json`).
+  Interactive commands ask `[y/N]` showing the full content and a diff; `serve`/`acp`/`mcp` and
+  non-interactive runs fail closed. `--config <path>` names a file explicitly (trusted) and
+  `--no-config` ignores it. Secrets (`api_key`, tokens, ...) are rejected, `Destructive` tools
+  can never be allowlisted through the config, and faces that refuse hooks, skills or MCP
+  servers refuse them from the config too.
+- `tole config check|trust|untrust`: validate the file and show every effective value with its
+  source (flag/env/config/default); trust or untrust the current content.
+
+### Changed
+- `--skill` / `--no-skills` on `tole serve`/`acp`/`mcp`/`mission` are now refused in builds without the `mcp` feature too (they were silently ignored there), and the refusal also covers values coming from the project config (#346).
 
 ### Fixed
 - `tole approvals` now honors `TOLE_SERVE_URL` (precedence: --url > env > default http://127.0.0.1:7801) as its help text always claimed (#339).
