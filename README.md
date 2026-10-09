@@ -219,7 +219,7 @@ hard error.
 
 | Tool | Risk | Notes |
 |------|------|-------|
-| `read_file`, `write_file`, `edit_file` | RO / Write | jailed to `--workspace` (TOCTOU-safe, symlink-refusing) |
+| `read_file`, `write_file`, `edit_file` | RO / Write | jailed to `--workspace` (TOCTOU-safe, symlink-refusing); `read_file` returns at most 20,000 chars per call (`offset`/`limit` in chars, `next_offset` to continue) |
 | `delete_file` | Destructive | always prompts; never allowlistable, even with `--yes` |
 | `git` | Write | `status` / `diff` / `add` / `commit` only — **push stays human** |
 | `gh` | Write | read-only ops, argv-validated per op; `repo` defaults to the checkout's GitHub remote, optional per-call override (validated) |
