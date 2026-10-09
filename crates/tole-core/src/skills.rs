@@ -88,18 +88,12 @@ fn candidate_dirs(workspace: Option<&Path>, name: &str) -> Vec<PathBuf> {
     if let Some(ws) = workspace {
         dirs.push(ws.join("skills").join(name));
     }
-    let home = std::env::var("CODECORA_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            // std-only home resolution (the `dirs` crate would be a new
-            // dep for one call): HOME on unix, USERPROFILE on windows.
-            std::env::var("HOME")
-                .or_else(|_| std::env::var("USERPROFILE"))
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from("."))
-                .join(".codecora")
-        });
-    dirs.push(home.join("tole").join("skills").join(name));
+    // Shared resolver (#344). When the CodeCora home is unresolvable the
+    // user-global location is skipped entirely — never the cwd, which may
+    // be a cloned, untrusted project.
+    if let Some(data) = crate::paths::tole_data_dir() {
+        dirs.push(data.join("skills").join(name));
+    }
     dirs
 }
 
@@ -285,33 +279,59 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("tole-skills-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let ws = tmp.join("ws");
-        let user = tmp.join("userhome").join(".codecora").join("tole");
+        let home = tmp.join("cchome");
+        let user = home.join("tole");
         std::fs::create_dir_all(&ws).unwrap();
         std::fs::create_dir_all(&user).unwrap();
 
-        // SAFETY: serial test (cargo runs lib tests on one thread per
-        // binary by default only when not using threads; this env var is
-        // read per-call, so we accept the race in exchange for coverage —
-        // the other tests do not read CODECORA_HOME).
-        std::env::set_var("CODECORA_HOME", user.parent().unwrap().parent().unwrap());
-        write_skill(
-            user.parent().unwrap().parent().unwrap(),
-            "demo",
-            "demo",
-            "user-global",
-            "user body",
-        );
+        // write_skill puts files under `<dir>/skills/<name>`; the user-global
+        // layout is `$CODECORA_HOME/tole/skills/<name>`.
+        write_skill(&user, "demo", "demo", "user-global", "user body");
+        write_skill(&user, "other", "other", "user only", "user other");
         write_skill(&ws, "demo", "demo", "project", "project body");
 
-        let s = load_skill(Some(&ws), "demo").unwrap();
-        assert_eq!(s.description, "project", "project must win");
-
-        // user-global found when project lacks it
-        write_skill(&ws, "other", "other", "only in project", "x");
-        let s2 = load_skill(Some(&ws), "demo").unwrap();
-        assert_eq!(s2.body, "project body");
+        crate::paths::with_env(&[("CODECORA_HOME", home.to_str())], || {
+            let s = load_skill(Some(&ws), "demo").unwrap();
+            assert_eq!(s.description, "project", "project must win");
+            // user-global found when the project lacks it
+            let s2 = load_skill(Some(&ws), "other").unwrap();
+            assert_eq!(s2.body, "user other");
+        });
         let _ = std::fs::remove_dir_all(&tmp);
-        std::env::remove_var("CODECORA_HOME");
+    }
+
+    #[test]
+    fn no_cwd_fallback_when_codecora_home_is_unresolvable() {
+        // Nothing set, or only empty / relative values: the user-global
+        // location must be skipped, never resolved against the cwd (a
+        // possibly cloned, untrusted project) — #344.
+        let unresolvable: [&[(&str, Option<&str>)]; 3] = [
+            &[
+                ("CODECORA_HOME", None),
+                ("HOME", None),
+                ("USERPROFILE", None),
+            ],
+            &[
+                ("CODECORA_HOME", Some("")),
+                ("HOME", Some("")),
+                ("USERPROFILE", None),
+            ],
+            &[
+                ("CODECORA_HOME", Some("rel")),
+                ("HOME", None),
+                ("USERPROFILE", Some("rel")),
+            ],
+        ];
+        for vars in unresolvable {
+            crate::paths::with_env(vars, || {
+                assert!(
+                    candidate_dirs(None, "demo").is_empty(),
+                    "no user-global candidate when home is unresolvable ({vars:?})"
+                );
+                let err = load_skill(None, "demo").unwrap_err();
+                assert!(!err.contains(".codecora"), "{err}");
+            });
+        }
     }
 
     #[test]

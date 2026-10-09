@@ -282,7 +282,11 @@ applies the security-sensitive ones (`trust`, `allow`, `mcp_server`,
   `~/.codecora`), keyed by canonical project directory. Any byte change
   (including whitespace or CRLF) makes it untrusted again; the repo cannot
   pre-trust itself. There is no home-less fallback: with no `CODECORA_HOME`
-  or `HOME` tole errors instead of writing a store next to the project.
+  or `HOME` tole errors instead of writing a store next to the project. The
+  home is resolved by ONE shared function (`tole_core::paths`, #344) also used
+  for user-global skills and the update-check cache: empty = unset, a relative
+  value is refused, and skills / the update check are skipped (never read from
+  or written to the cwd) when it is unresolvable.
 - **Terminal-safe prompt.** The path, the full content and the diff against the
   previously trusted version are attacker-controlled text shown to a human at
   the decision. Control characters (ESC, CR, NUL, DEL, C1), bidi

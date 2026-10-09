@@ -60,6 +60,7 @@ pub mod mcp_server;
 pub mod memory;
 pub mod mock;
 pub mod openai;
+pub mod paths;
 pub mod provider;
 pub mod read_file;
 pub mod register;
