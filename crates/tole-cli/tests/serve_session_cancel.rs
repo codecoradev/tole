@@ -5,6 +5,10 @@
 //! and the session accepts a follow-up prompt normally. Unknown
 //! sessions 404.
 
+// These tests spawn the real `tole acp`/`tole serve` binary, which only exists
+// with the `shell-tools` feature (#349): the bare profile has no such face.
+#![cfg(feature = "shell-tools")]
+
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpListener;
