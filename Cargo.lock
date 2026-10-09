@@ -1427,7 +1427,7 @@ dependencies = [
 
 [[package]]
 name = "tole-cli"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1447,7 +1447,7 @@ dependencies = [
 
 [[package]]
 name = "tole-core"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "libc",
  "rmcp",
