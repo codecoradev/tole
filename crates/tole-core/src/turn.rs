@@ -517,7 +517,25 @@ fn drive(
         // itself is not part of its own request). Usage-only commits
         // carry no transition, so they are legal mid-Planning and
         // replay-safe (Record::Usage).
-        if let Some(u) = p.last_usage() {
+        //
+        // Issue #211: a provider that also reports the request-size
+        // breakdown has it merged under the namespaced `tole_wire` key;
+        // the provider's own keys stay untouched. A provider that
+        // reported wire stats but no usage still leaves a record holding
+        // only `tole_wire` (readers sum `prompt_tokens` etc. with a 0
+        // default). Neither reported: no record, as before.
+        let usage = match (p.last_usage(), p.last_wire_stats()) {
+            (Some(mut u), Some(w)) => {
+                if let Some(obj) = u.as_object_mut() {
+                    obj.insert("tole_wire".to_string(), w);
+                }
+                Some(u)
+            }
+            (Some(u), None) => Some(u),
+            (None, Some(w)) => Some(json!({ "tole_wire": w })),
+            (None, None) => None,
+        };
+        if let Some(u) = usage {
             if let Some(last) = s.entries().last() {
                 s.commit(Commit::new().usage(UsageRecord {
                     id: String::new(),

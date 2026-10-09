@@ -2120,6 +2120,11 @@ fn status_command(sessions_dir: &Path, id: &str) -> Result<()> {
     if let Some(mission) = storage.get_register("fact", "mission") {
         println!("mission: {}", mission);
     }
+    // Issue #211: usage report derived from the ledger (additive block,
+    // rendered after the pre-existing lines; older sessions read `n/a`).
+    for line in tole_cli::usage_report::usage_report(usage).render_lines() {
+        println!("{line}");
+    }
     Ok(())
 }
 

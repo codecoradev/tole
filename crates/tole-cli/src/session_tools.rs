@@ -381,11 +381,16 @@ impl Tool for SessionStatusTool {
         use tole_core::storage::Storage;
         let st = self.0.resolve(&input)?;
         let busy = *st.busy.lock().expect("busy lock");
-        let entries = match st.storage.try_lock() {
-            Ok(guard) => json!(guard.entries().len()),
-            Err(_) => json!(null), // turn in flight
+        let (entries, report) = match st.storage.try_lock() {
+            Ok(guard) => (
+                json!(guard.entries().len()),
+                // Issue #211: additive usage report (same object as the
+                // serve status JSON).
+                crate::usage_report::usage_report(guard.usages()).to_json(),
+            ),
+            Err(_) => (json!(null), json!(null)), // turn in flight
         };
-        Ok(json!({ "busy": busy, "entries": entries }))
+        Ok(json!({ "busy": busy, "entries": entries, "usage_report": report }))
     }
 }
 

@@ -11,3 +11,4 @@ pub mod session_host;
 pub mod session_tools;
 pub mod tools;
 pub mod trust;
+pub mod usage_report;

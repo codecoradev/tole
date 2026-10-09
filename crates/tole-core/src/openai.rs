@@ -12,6 +12,69 @@ use crate::provider::{Provider, ProviderError, ProviderOutput};
 use serde_json::{json, Value};
 use std::time::Duration;
 
+/// Serialized size of one provider request, in CHARACTERS (Unicode
+/// scalar values, `chars().count()`, not bytes: tokenizer-free and
+/// independent of the script the transcript is written in). Issue #211.
+///
+/// - `system_chars`: the text of the leading `role:"system"` message's
+///   `content` (0 when there is none).
+/// - `tools_chars`: the compact JSON serialization of the `tools` array
+///   (0 when the body has none).
+/// - `history_chars`: the compact JSON serialization of every other
+///   message (role/envelope included), summed.
+/// - `messages`: the number of messages in the body, system included.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WireStats {
+    pub system_chars: u64,
+    pub tools_chars: u64,
+    pub history_chars: u64,
+    pub messages: u64,
+}
+
+impl WireStats {
+    /// The stored shape, merged into the usage record under `tole_wire`.
+    pub fn to_value(&self) -> Value {
+        json!({
+            "system_chars": self.system_chars,
+            "tools_chars": self.tools_chars,
+            "history_chars": self.history_chars,
+            "messages": self.messages,
+        })
+    }
+}
+
+/// Measure a request body as built by `OpenAiProvider::request_body`
+/// (before the `stream`/`stream_options` envelope). Pure: the body is
+/// only read.
+pub fn wire_stats(body: &Value) -> WireStats {
+    let chars = |v: &Value| v.to_string().chars().count() as u64;
+    let msgs = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let mut system_chars = 0;
+    let mut history_chars = 0;
+    for (i, m) in msgs.iter().enumerate() {
+        if i == 0 && m.get("role").and_then(Value::as_str) == Some("system") {
+            system_chars = m
+                .get("content")
+                .and_then(Value::as_str)
+                .map(|s| s.chars().count() as u64)
+                .unwrap_or(0);
+        } else {
+            history_chars += chars(m);
+        }
+    }
+    let tools_chars = body.get("tools").map(chars).unwrap_or(0);
+    WireStats {
+        system_chars,
+        tools_chars,
+        history_chars,
+        messages: msgs.len() as u64,
+    }
+}
+
 /// A live-token callback (issue #196 phase 3): invoked per reasoning/
 /// content burst while a streamed completion is in flight. The turn
 /// loop never sees partial data — `complete()` still returns one
@@ -132,6 +195,9 @@ pub struct OpenAiProvider {
     /// The model's reasoning from the last step (issue #196 phase 2):
     /// captured for the turn-loop observer; never durable.
     last_reasoning_obj: Option<String>,
+    /// Request-size breakdown of the last call (issue #211), reset per
+    /// call like usage/reasoning.
+    last_wire_stats_obj: Option<Value>,
     /// Live-token sinks (issue #196 phase 3): present on host faces
     /// that render progress (ACP). When set, reasoning arrives via
     /// deltas and `last_reasoning` stays None — no double emission.
@@ -169,6 +235,7 @@ impl OpenAiProvider {
             tool_specs: Vec::new(),
             last_usage_obj: None,
             last_reasoning_obj: None,
+            last_wire_stats_obj: None,
             on_text_delta: None,
             on_reasoning_delta: None,
             streaming: std::env::var("TOLE_STREAM")
@@ -563,7 +630,11 @@ impl Provider for OpenAiProvider {
         // then sets what it actually has.
         self.last_usage_obj = None;
         self.last_reasoning_obj = None;
+        self.last_wire_stats_obj = None;
         let mut body = self.request_body(transcript);
+        // Issue #211: measure BEFORE the streaming envelope is layered
+        // on — the same body the Tier-1 golden pins. Read-only.
+        self.last_wire_stats_obj = Some(wire_stats(&body).to_value());
         // Issue #196 phase 3: the streaming envelope rides on top of the
         // request body — the Tier-1 golden contract keeps asserting the
         // MESSAGE payload, which is what cache-friendliness depends on.
@@ -627,6 +698,10 @@ impl Provider for OpenAiProvider {
 
     fn last_reasoning(&self) -> Option<String> {
         self.last_reasoning_obj.clone()
+    }
+
+    fn last_wire_stats(&self) -> Option<Value> {
+        self.last_wire_stats_obj.clone()
     }
 }
 
@@ -1177,6 +1252,7 @@ mod models_probe_tests {
 #[cfg(test)]
 mod streaming_tests {
     use super::*;
+    use crate::entry::{Entry, EntryType};
     use std::sync::{Arc, Mutex};
 
     /// One-shot SSE mock: serves the given pre-built stream body and
@@ -1450,5 +1526,170 @@ mod streaming_tests {
             !p.streaming,
             "the escape hatch must be able to turn streaming off"
         );
+    }
+
+    // ---- Issue #211: wire stats --------------------------------------
+
+    fn user_entry(id: &str, text: &str) -> Entry {
+        Entry {
+            id: id.into(),
+            parent_id: None,
+            seq: 0,
+            kind: EntryType::new(EntryType::MESSAGE),
+            payload: json!({ "role": "user", "text": text }),
+            timestamp: 0,
+        }
+    }
+
+    fn two_tool_specs() -> Vec<Value> {
+        vec![
+            json!({"type":"function","function":{"name":"a","description":"d","parameters":{}}}),
+            json!({"type":"function","function":{"name":"b","description":"d","parameters":{}}}),
+        ]
+    }
+
+    #[test]
+    fn wire_stats_empty_tools_counts_zero_and_no_system() {
+        let body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+        let w = wire_stats(&body);
+        assert_eq!(w.tools_chars, 0);
+        assert_eq!(w.system_chars, 0);
+        assert_eq!(w.messages, 1);
+        assert_eq!(
+            w.history_chars,
+            r#"{"content":"hi","role":"user"}"#.chars().count() as u64
+        );
+        // No messages key at all: all zeros, no panic.
+        assert_eq!(
+            wire_stats(&json!({})),
+            WireStats {
+                system_chars: 0,
+                tools_chars: 0,
+                history_chars: 0,
+                messages: 0
+            }
+        );
+    }
+
+    #[test]
+    fn wire_stats_counts_characters_not_bytes() {
+        let body = json!({"messages": [
+            {"role": "system", "content": "héllo世界"},
+            {"role": "user", "content": "日本語"},
+        ]});
+        let w = wire_stats(&body);
+        assert_eq!(w.system_chars, 7, "chars, not the 11 UTF-8 bytes");
+        assert_eq!(
+            w.history_chars,
+            r#"{"content":"日本語","role":"user"}"#.chars().count() as u64
+        );
+        assert!(w.history_chars < r#"{"content":"日本語","role":"user"}"#.len() as u64);
+    }
+
+    #[test]
+    fn wire_stats_known_transcript_has_exact_numbers() {
+        let p = OpenAiProvider::new(OpenAiConfig::new("https://x/v1", "m", "k"))
+            .with_system_prompt("You are tole.")
+            .with_tool_specs(two_tool_specs());
+        let body = p.request_body(&[user_entry("e1", "hi")]);
+        let w = wire_stats(&body);
+        let tools_literal = r#"[{"function":{"description":"d","name":"a","parameters":{}},"type":"function"},{"function":{"description":"d","name":"b","parameters":{}},"type":"function"}]"#;
+        assert_eq!(w.system_chars, 13);
+        assert_eq!(w.tools_chars, tools_literal.chars().count() as u64);
+        assert_eq!(w.history_chars, 30);
+        assert_eq!(w.messages, 2);
+        assert_eq!(
+            w.to_value(),
+            json!({"system_chars": 13, "tools_chars": tools_literal.chars().count(),
+                   "history_chars": 30, "messages": 2})
+        );
+    }
+
+    #[test]
+    fn wire_stats_includes_tool_call_and_tool_result_messages() {
+        let body = json!({"messages": [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": null, "tool_calls": [{"id": "i1"}]},
+            {"role": "tool", "tool_call_id": "i1", "content": "output"},
+        ]});
+        let w = wire_stats(&body);
+        let expected: u64 = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m.to_string().chars().count() as u64)
+            .sum();
+        assert_eq!(w.history_chars, expected);
+        assert_eq!(w.messages, 3);
+    }
+
+    #[test]
+    fn wire_stats_does_not_touch_the_body() {
+        let p = OpenAiProvider::new(OpenAiConfig::new("https://x/v1", "m", "k"))
+            .with_system_prompt("s")
+            .with_tool_specs(two_tool_specs());
+        let body = p.request_body(&[user_entry("e1", "hi")]);
+        let before = body.to_string();
+        let _ = wire_stats(&body);
+        assert_eq!(body.to_string(), before);
+    }
+
+    /// Wire unchanged (#211): the body that really goes over the socket,
+    /// minus the streaming envelope, is byte-identical to `request_body`;
+    /// and the stored stats equal `wire_stats` of that same body.
+    #[test]
+    fn complete_sends_request_body_unchanged_and_reports_its_stats() {
+        let capture = Arc::new(Mutex::new(String::new()));
+        let url = serve_stream(
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
+                "data: [DONE]\n\n",
+            )
+            .to_string(),
+            Arc::clone(&capture),
+        );
+        let mut p = OpenAiProvider::new(OpenAiConfig::new(url, "m", "sk-test"))
+            .with_streaming(true)
+            .with_system_prompt("You are tole.")
+            .with_tool_specs(two_tool_specs());
+        let transcript = vec![user_entry("e1", "hi")];
+        let expected = p.request_body(&transcript);
+        p.complete(&transcript).unwrap();
+        let raw = capture.lock().unwrap().clone();
+        let sent = raw.split_once("\r\n\r\n").unwrap().1;
+        let mut sent: Value = serde_json::from_str(sent).unwrap();
+        let obj = sent.as_object_mut().unwrap();
+        assert_eq!(obj.remove("stream"), Some(json!(true)));
+        assert!(obj.remove("stream_options").is_some());
+        assert_eq!(
+            sent.to_string(),
+            expected.to_string(),
+            "wire body must be unchanged"
+        );
+        assert_eq!(
+            p.last_wire_stats().unwrap(),
+            wire_stats(&expected).to_value()
+        );
+    }
+
+    /// Per-call semantics: each call reports ITS request's numbers, and
+    /// a call that fails leaves no stale numbers from the previous one
+    /// reachable as this step's.
+    #[test]
+    fn wire_stats_are_per_call_not_carried_over() {
+        let url = serve_stream_seq(vec![
+            "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\ndata: [DONE]\n\n".to_string(),
+            "data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}]}\n\ndata: [DONE]\n\n".to_string(),
+        ]);
+        let mut p = OpenAiProvider::new(OpenAiConfig::new(url, "m", "sk-test"));
+        assert!(p.last_wire_stats().is_none(), "nothing before any call");
+        p.complete(&[user_entry("e1", "hi")]).unwrap();
+        let first = p.last_wire_stats().unwrap();
+        p.complete(&[user_entry("e1", "hi"), user_entry("e2", "more text here")])
+            .unwrap();
+        let second = p.last_wire_stats().unwrap();
+        assert_eq!(first["messages"], json!(1));
+        assert_eq!(second["messages"], json!(2));
+        assert!(second["history_chars"].as_u64() > first["history_chars"].as_u64());
     }
 }

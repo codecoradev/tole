@@ -406,6 +406,10 @@ pub fn run_mission(
         "turns": turns,
         "steps": steps_used(&storage),
         "tokens_in_out": tokens_used(&storage),
+        // Issue #211: reported only — never counted against any budget.
+        // `null` when no step reported cached tokens (unknown, not 0).
+        "cached_tokens": tole_cli::usage_report::usage_report(storage.usages())
+            .to_json()["cached_tokens"],
         "verify_failures": verify_failures,
         "wall_seconds": wall_secs,
         "budget": {"max_steps": cfg.max_steps, "max_minutes": cfg.max_minutes,
