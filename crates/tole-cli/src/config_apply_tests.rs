@@ -614,7 +614,16 @@ fn check_shows_effective_value_and_source_for_every_key() {
             .iter()
             .find(|l| l.starts_with(&format!("{k} = ")))
             .unwrap_or_else(|| panic!("{k} missing in\n{joined}"));
-        assert!(line.contains("effective:"), "{line}");
+        // Keys whose feature is compiled out are shown as unsupported by
+        // this build (startup refuses them) instead of an effective value.
+        let gated_off = (cfg!(not(feature = "mcp")) && matches!(k, "mcp_server" | "no_auto_mcp"))
+            || (cfg!(not(feature = "shell-tools"))
+                && matches!(k, "on_pretool" | "on_posttool" | "on_turnend"));
+        if gated_off {
+            assert!(line.contains("not supported by this build"), "{line}");
+        } else {
+            assert!(line.contains("effective:"), "{line}");
+        }
     }
     let line = |k: &str| {
         lines

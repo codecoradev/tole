@@ -367,10 +367,19 @@ fn h_security_sensitive_keys_are_applied_now() {
     // config's plan_mode / hooks ARE applied, so `mission` refuses with the
     // matching flag message (plus the --no-config hint) BEFORE it reaches
     // the provider check (no provider env in the child).
-    let (d, home) = project(
-        "plan_mode = true\non_pretool = [\"x\"]\non_posttool = [\"y\"]\non_turnend = [\"z\"]\n\
-         no_skills = true\ntrust = [\"internal\"]\nallow = [\"write_*\"]\nmcp_server = [\"a=b\"]\n",
+    // Keys whose feature is compiled out are refused at startup with a
+    // different (build-support) message, so only include the ones this
+    // profile supports; plan_mode/no_skills/trust/allow need no feature.
+    let mut toml = String::from(
+        "plan_mode = true\nno_skills = true\ntrust = [\"internal\"]\nallow = [\"write_*\"]\n",
     );
+    if cfg!(feature = "shell-tools") {
+        toml.push_str("on_pretool = [\"x\"]\non_posttool = [\"y\"]\non_turnend = [\"z\"]\n");
+    }
+    if cfg!(feature = "mcp") {
+        toml.push_str("mcp_server = [\"a=b\"]\n");
+    }
+    let (d, home) = project(&toml);
     trust(&d, &home);
     let o = tole(&d, &home, &["mission", "goal"]);
     let err = text(&o.stderr);
