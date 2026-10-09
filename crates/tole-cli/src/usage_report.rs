@@ -22,7 +22,9 @@ pub struct WirePoint {
     pub system_chars: u64,
     pub tools_chars: u64,
     pub history_chars: u64,
-    pub messages: u64,
+    /// Message count of the request; `None` when the record does not carry it
+    /// (unknown is never rendered as a measured zero).
+    pub messages: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -101,7 +103,7 @@ fn wire_of(u: &Value) -> Option<WirePoint> {
         system_chars,
         tools_chars,
         history_chars,
-        messages: w.get("messages").and_then(Value::as_u64).unwrap_or(0),
+        messages: w.get("messages").and_then(Value::as_u64),
     })
 }
 
@@ -416,5 +418,15 @@ mod tests {
         assert_eq!(r.steps, 2);
         assert_eq!(r.prompt_tokens, 0);
         assert!(r.wire_first.is_none());
+    }
+
+    #[test]
+    fn missing_messages_is_unknown_not_zero() {
+        let r = usage_report(&[rec(
+            json!({"tole_wire": {"system_chars": 1, "tools_chars": 2, "history_chars": 3}}),
+        )]);
+        let w = r.wire_first.expect("wire point without messages is kept");
+        assert_eq!(w.messages, None);
+        assert_eq!(wire_json(&w)["messages"], Value::Null);
     }
 }

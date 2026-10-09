@@ -44,6 +44,9 @@ impl ReadFileTool {
     /// also an escape. Errors distinguish escape from plain not-found so
     /// the model gets actionable feedback.
     fn jailed(&self, rel: &str) -> Result<PathBuf, String> {
+        if rel.is_empty() {
+            return Err("read_file: path is empty".to_string());
+        }
         let rel_path = Path::new(rel);
         // Component-based validation (uniform with the other file tools;
         // CodeCora scan #6/#12): drive-prefixed/rooted Windows relatives
@@ -205,6 +208,13 @@ mod tests {
         let out = t.execute(json!({ "path": "a.txt" })).unwrap();
         assert_eq!(out["content"], json!("hello"));
         assert_eq!(out["bytes"], json!(5));
+    }
+
+    #[test]
+    fn rejects_empty_path() {
+        let t = ReadFileTool::new(tmpdir("empty"));
+        let err = t.execute(json!({ "path": "" })).unwrap_err();
+        assert!(err.to_string().contains("path is empty"), "{err}");
     }
 
     #[test]
