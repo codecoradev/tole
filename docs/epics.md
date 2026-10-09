@@ -211,6 +211,10 @@ Everything below is merged; CHANGELOG entries carry the detail.
   default for every key (lists replaced wholesale, booleans only turned on by
   flags), and refusal of config-sourced hooks/skills/MCP servers on the faces
   that refuse the flags.
+- **0.8.1 Token-efficiency patch (#211) (released 2026-10-09):** usage and per-step request-size report in
+  `tole status`/serve status (#356), `read_file` 20,000-char cap with `offset`/`limit` continuation (#357),
+  wire-size reference missions with a CI bound (#358), two scan-found fixes (#360); scan backlog in #361.
+  Deferred: lazy tool registration, history trimming, non-cached budget accounting.
 
 ---
 
