@@ -2,7 +2,7 @@
 //! the gate function and the terminal-safe review text behind
 //! `tole config trust|untrust|check`.
 //!
-//! NOTHING here is called from startup yet — part 3 wires [`gate`] in. The
+//! [`gate`] runs at startup (see `config_apply::load_project_config`). The
 //! config file is untrusted input from a cloned repo, so:
 //!
 //! * the trust record lives OUTSIDE the repo
@@ -404,7 +404,7 @@ pub enum Origin {
 }
 
 /// What the gate decided. `content` is the exact text that was vetted —
-/// part 3 should parse THIS, not re-read the file (no check/use race).
+/// startup parses THIS, never re-reads the file (no check/use race).
 #[derive(Debug, Clone, PartialEq)]
 pub struct GateOutcome {
     pub kind: GateKind,

@@ -271,8 +271,11 @@ the blast radius.
 ### Project config trust (#208)
 
 `<cwd>/.tole/config.toml` is untrusted input from a cloned repo: it may
-carry `allow`, `trust`, hooks and `mcp_server`. Part 2 adds the trust
-machinery (not yet applied to sessions — part 3 wires the startup gate):
+carry `allow`, `trust`, hooks and `mcp_server`. Part 2 added the trust
+machinery; part 3a wires the startup gate and applies ONLY the low-risk keys
+(`model`, `base_url`, `system_prompt`, `memory`, `sessions_dir`, `workspace`,
+`[mission]` budgets). The security-sensitive keys stay parsed-but-inert until
+part 3b:
 
 - **Content-bound, outside the repo.** The approval is a snapshot of the exact
   file bytes in `$CODECORA_HOME/tole/trusted-configs.json` (default
@@ -290,8 +293,27 @@ machinery (not yet applied to sessions — part 3 wires the startup gate):
   unsupported-version store is a hard error and is never overwritten.
   `tole config trust` refuses a file that does not validate.
 - **Explicit path = intent.** A file named on the command line (`--config`) is
-  user intent and does not consult the store (enforced in part 3).
+  user intent and does not consult the store. `--no-config` skips discovery,
+  the gate and any output.
+- **Startup gating.** Every command except `config`, `upgrade` and `approvals`
+  runs the gate before anything else (before the update banner, session
+  creation or provider access). Only `run`/`chat`/`resume`/`mission` with a
+  terminal on stdin AND stderr (and not `--prompt-file -`) may ask; `sessions`,
+  `status` and the protocol faces `serve`/`acp`/`mcp` NEVER prompt — their
+  stdin/stdout are protocol channels — and fail closed with the exact
+  `tole config trust` instruction while the command does not run.
+- **Vetted bytes only.** The gate reads the file once; that exact content is
+  what gets parsed into the settings. The file is never re-read after vetting,
+  so a swap between check and use cannot smuggle in other content.
+- **No config, no change.** Without a config file nothing is read, printed or
+  looked up (not even the trust store location).
+- **Secrets stay out.** The API key and serve token are env-only; the schema
+  rejects secret-like keys, and `config check` prints only model/base_url
+  values.
 
 Residual risks: a user can still approve a malicious file at the prompt (it is
 shown in full, but a human decides); the trust store is a plain 0600 file in the
-user's home, so anything running as that user can edit it.
+user's home, so anything running as that user can edit it; the store update is
+an unlocked read-modify-write, so two concurrent `tole config trust` runs can
+lose one of the two records (the loser is simply asked again; the file itself
+is replaced atomically and never corrupted).
