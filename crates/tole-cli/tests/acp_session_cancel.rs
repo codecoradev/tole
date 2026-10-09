@@ -6,6 +6,10 @@
 //! turn settles `cancelled`, not `refusal`. Both leave a durable
 //! `cancelled` record in the session JSONL.
 
+// These tests spawn the real `tole acp`/`tole serve` binary, which only exists
+// with the `shell-tools` feature (#349): the bare profile has no such face.
+#![cfg(feature = "shell-tools")]
+
 use serde_json::{json, Value};
 use std::io::{BufRead, Read, Write};
 use std::net::TcpListener;

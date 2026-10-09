@@ -2,6 +2,10 @@
 //! Spawns the real `tole acp` binary and speaks line-delimited JSON-RPC
 //! with a deadline-guarded reader.
 
+// These tests spawn the real `tole acp`/`tole serve` binary, which only exists
+// with the `shell-tools` feature (#349): the bare profile has no such face.
+#![cfg(feature = "shell-tools")]
+
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 use std::process::{Child, Command, Stdio};
