@@ -93,7 +93,7 @@ tole chat --memory uteke                    # …with cross-session memory
 tole chat --resume <id>                     # pick the thread back up (also: --last)
 tole resume <id> "next instruction"         # continue a settled session
 tole sessions                               # list durable sessions
-tole status <id>                            # pc / seq / turns / token usage
+tole status <id>                            # pc / seq / turns / token + cache usage / request-size split
 ```
 
 Sessions live in `.tole/sessions/<id>.jsonl` (override with
@@ -278,7 +278,13 @@ cap; expiry cancels at a checkpoint — resumable, never dead).
 Budget tiers (#201): conservative defaults (48 steps / 15 min / 200k
 tokens) with headroom under `--trust internal` (96 / 30 / 500k) —
 explicit flags always win; a durable cost report (turns, steps, tokens,
-per-risk-tier tool calls) lands on the session and `tole status` renders it.
+per-risk-tier tool calls, cached tokens) lands on the session and `tole status` renders it.
+`tole status` (and `GET /sessions/{id}/status`, as `usage_report`) also shows
+the usage derived from the ledger for any session: prompt / completion /
+reasoning / cached tokens, the cache-hit rate, and the request size in
+characters split into system+tools vs history at the first and last step
+(#211; recorded per step under `tole_wire`; sessions recorded before it read
+`n/a`). Reported only — `--max-tokens` accounting is unchanged.
 
 ## Approval gates
 

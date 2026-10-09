@@ -82,7 +82,7 @@ graph TD
 |---|---|
 | `entries` | **Append-only, immutable** conversation tree: `id`, `parentId`, `seq`, `kind`, `payload`, `timestamp` |
 | `registers` | Namespaced mutable cells (`lane` / `op` / `pending` / `fact`), overwritten per key on `set`, removed on `delete` |
-| `usage` ledger | Append-only cost rows per provider attempt |
+| `usage` ledger | Append-only cost rows per provider attempt; the provider-reported `usage` object plus, when the provider reports it, a namespaced `tole_wire` = `{system_chars, tools_chars, history_chars, messages}` request-size split (#211) |
 | `state` | Singleton register: `pc` (program counter), `seq` — transition via CAS on `seq` |
 
 Invariants (all backends):

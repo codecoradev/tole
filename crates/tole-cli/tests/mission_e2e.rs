@@ -132,7 +132,8 @@ fn spawn_mock(require_file: std::path::PathBuf) -> String {
                     out.push_str(&format!(
                         "data: {}\n\n",
                         json!({"choices": [], "usage": {"prompt_tokens": 1,
-                               "completion_tokens": 1, "total_tokens": 2}})
+                               "completion_tokens": 1, "total_tokens": 2,
+                               "prompt_tokens_details": {"cached_tokens": 1}}})
                     ));
                     out.push_str("data: [DONE]\n\n");
                     format!(
@@ -390,5 +391,65 @@ fn token_budget_and_cost_report_visible_in_status() {
         status_out.contains("exhausted_tokens") && status_out.contains("tool_calls"),
         "the report carries status + per-tier counts: {status_out}"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #211: the settle-time `fact/mission` register gains an additive
+/// `cached_tokens`, and the budget-facing fields are unchanged: every
+/// mock step reports prompt 1 + completion 1 (cached 1), so
+/// `tokens_in_out == 2 * steps` and `cached_tokens == steps`.
+#[test]
+fn mission_register_reports_cached_tokens_without_touching_budget_fields() {
+    let base = spawn_mock("NONE".into());
+    let dir = temp_dir("cached");
+    let env = [
+        ("TOLE_BASE_URL".to_string(), base),
+        ("TOLE_MODEL".to_string(), "mock-model".to_string()),
+        ("TOLE_API_KEY".to_string(), "sk-test".to_string()),
+    ];
+    let env_ref: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let sessions = dir.join("sessions");
+    let (out, err, code) = run_tole(
+        &env_ref,
+        &[
+            "mission",
+            "-s",
+            sessions.to_str().unwrap(),
+            "--yes",
+            "--max-steps",
+            "12",
+            "accomplish the thing",
+        ],
+    );
+    assert_eq!(code, 0, "mission failed: {err}");
+    let session_id = out
+        .lines()
+        .find_map(|l| l.strip_prefix("mission: "))
+        .expect("session id")
+        .to_string();
+    let (status_out, status_err, status_code) = run_tole(
+        &env_ref,
+        &["status", "-s", sessions.to_str().unwrap(), &session_id],
+    );
+    assert_eq!(status_code, 0, "{status_err}");
+    let register: Value = serde_json::from_str(
+        status_out
+            .lines()
+            .find_map(|l| l.strip_prefix("mission: "))
+            .expect("mission register line"),
+    )
+    .expect("register is JSON");
+    let steps = register["steps"].as_u64().unwrap();
+    assert!(steps >= 2, "{register}");
+    assert_eq!(register["tokens_in_out"], json!(2 * steps), "{register}");
+    assert_eq!(register["cached_tokens"], json!(steps), "{register}");
+    // The real binary also stores the wire split: the status block
+    // renders it (first/last step, not n/a).
+    assert!(
+        status_out.contains(&format!("steps:   {steps}")),
+        "{status_out}"
+    );
+    assert!(status_out.contains("first step:"), "{status_out}");
+    assert!(status_out.contains("(hit rate 100.0%)"), "{status_out}");
     let _ = std::fs::remove_dir_all(&dir);
 }
