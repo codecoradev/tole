@@ -136,3 +136,30 @@ fn git_and_systemone_summaries_are_static() {
     assert!(git.describe(&Value::Null).contains("'op' must be one of"));
     assert!(git.describe(&json!({"op": "status"})).contains("status"));
 }
+
+/// Issue #211 (PR 2): loose CI bound on the size of the FULL default
+/// registry's `tools` array as it goes over the wire (characters of its
+/// compact JSON, counted by the same `wire_stats` the usage ledger uses).
+/// Measured 2026-10-09: 13,879 chars for 27 tools (no `web_search`: its
+/// key is not set in CI). Bound = ceil(measured * 1.25) rounded up. A
+/// bump needs a written justification in the PR, like the mission bounds
+/// in `crates/tole-core/tests/wire_size_missions.rs`.
+const FULL_REGISTRY_TOOLS_CHARS_BOUND: u64 = 18_000;
+
+#[test]
+fn full_registry_tools_chars_within_bound() {
+    let reg = full_registry();
+    let specs = reg.specs();
+    let w = tole_core::openai::wire_stats(&json!({ "tools": specs, "messages": [] }));
+    println!(
+        "MEASURED full_registry: tools={} tools_chars={}",
+        specs.len(),
+        w.tools_chars
+    );
+    assert!(
+        w.tools_chars <= FULL_REGISTRY_TOOLS_CHARS_BOUND,
+        "full-registry tool specs are {} chars, bound {FULL_REGISTRY_TOOLS_CHARS_BOUND}; \
+         re-baseline only with a justification (see the constant's doc)",
+        w.tools_chars
+    );
+}
