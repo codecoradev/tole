@@ -28,7 +28,7 @@ use tole_core::gh::GhTool;
 use tole_core::git::GitTool;
 #[cfg(feature = "shell-tools")]
 use tole_core::jobs::{JobPollTool, JobStartTool};
-use tole_core::openai::{OpenAiConfig, OpenAiProvider};
+use tole_core::openai::OpenAiProvider;
 use tole_core::read_file::ReadFileTool;
 #[cfg(feature = "shell-tools")]
 use tole_core::run_command::RunCommandTool;
@@ -38,9 +38,6 @@ use tole_core::turn::{resume_turn, run_turn, run_turn_with_cancel, TurnOutcome, 
 #[cfg(feature = "shell-tools")]
 use tole_core::uteke::{UtekeDocumentTool, UtekeRecallTool};
 use tole_core::verify_package::VerifyPackageTool;
-
-/// Where sessions live unless the user overrides it.
-const DEFAULT_SESSIONS_DIR: &str = ".tole/sessions";
 
 /// Session id → path (`<dir>/<id>.jsonl`).
 fn session_path(dir: &Path, id: &str) -> PathBuf {
@@ -154,6 +151,18 @@ struct Cli {
     /// Disable skills support (discovery + load_skill tool).
     #[arg(long, global = true)]
     no_skills: bool,
+
+    /// Use this project config file instead of `<cwd>/.tole/config.toml`
+    /// (#208). A path named on the command line is user intent, so it is
+    /// trusted without a trust record. Precedence: flag > env > config >
+    /// default. Also selects the file for `tole config check|trust|untrust`.
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
+
+    /// Ignore any project config file entirely (#208): no discovery, no
+    /// trust check, no output.
+    #[arg(long, global = true, conflicts_with = "config")]
+    no_config: bool,
 
     #[command(subcommand)]
     command: Command,
@@ -411,8 +420,11 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
-    /// Project config file `.tole/config.toml` (#208): validate it with
-    /// `config check`. The file is not applied to sessions yet.
+    /// Project config file `.tole/config.toml` (#208): `check` validates
+    /// it and shows the effective values, `trust`/`untrust` manage the
+    /// trust record. Applied to model, base_url, system_prompt, memory,
+    /// sessions_dir, workspace and [mission] budgets after trust; the
+    /// security-sensitive keys are validated but not applied yet.
     Config {
         #[command(subcommand)]
         action: ConfigAction,
@@ -423,32 +435,21 @@ enum Command {
 #[derive(Subcommand)]
 enum ConfigAction {
     /// Validate `<cwd>/.tole/config.toml` (or --config) and print what was
-    /// parsed. Exits non-zero on any error.
-    Check {
-        /// Check this file instead of `<cwd>/.tole/config.toml`.
-        #[arg(long)]
-        config: Option<PathBuf>,
-    },
+    /// parsed plus the effective value and source of each applied key.
+    /// Exits non-zero on any error.
+    Check,
     /// Trust `<cwd>/.tole/config.toml` (or --config): shows the full
     /// content (and a diff vs the previously trusted version), then asks
     /// `[y/N]`. The approval is content-bound and stored outside the repo
-    /// (`$CODECORA_HOME/tole/trusted-configs.json`). The file is not
-    /// applied to sessions yet.
+    /// (`$CODECORA_HOME/tole/trusted-configs.json`).
     Trust {
-        /// Trust this file instead of `<cwd>/.tole/config.toml`.
-        #[arg(long)]
-        config: Option<PathBuf>,
         /// Skip the question (the content is still printed). Required
         /// when there is no terminal to ask on.
         #[arg(long)]
         yes: bool,
     },
     /// Forget the trust record for the config (no error if absent).
-    Untrust {
-        /// Untrust this file instead of `<cwd>/.tole/config.toml`.
-        #[arg(long)]
-        config: Option<PathBuf>,
-    },
+    Untrust,
 }
 
 fn main() {
@@ -459,47 +460,143 @@ fn main() {
     }
 }
 
+/// How the startup config gate treats a command (#208).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GatePolicy {
+    /// `config`, `upgrade`, `approvals`: no config is loaded.
+    Skip,
+    /// Interactive CLI commands: an untrusted config may be reviewed and
+    /// approved at the terminal (still needs stdin AND stderr to be ttys).
+    MayPrompt,
+    /// Everything else (sessions/status, and the serve/acp/mcp protocol
+    /// faces whose stdin/stdout are channels): fail closed, never ask.
+    NoPrompt,
+}
+
+fn gate_policy(cmd: &Command) -> GatePolicy {
+    match cmd {
+        Command::Config { .. } | Command::Upgrade { .. } | Command::Approvals { .. } => {
+            GatePolicy::Skip
+        }
+        // `--prompt-file -` consumes stdin as the prompt: a question on
+        // the same stream would eat prompt text.
+        Command::Run { prompt_file, .. } if prompt_file.as_deref() == Some("-") => {
+            GatePolicy::NoPrompt
+        }
+        Command::Run { .. }
+        | Command::Chat { .. }
+        | Command::Resume { .. }
+        | Command::Mission { .. } => GatePolicy::MayPrompt,
+        _ => GatePolicy::NoPrompt,
+    }
+}
+
+/// What the command line supplied for the config-applied keys. ONE place,
+/// shared by startup and `tole config check`.
+fn config_flags(cli: &Cli) -> tole_cli::config_apply::Flags {
+    let mut f = tole_cli::config_apply::Flags {
+        sessions_dir: cli.sessions_dir.clone(),
+        workspace: cli.workspace.clone(),
+        ..Default::default()
+    };
+    #[cfg(feature = "shell-tools")]
+    {
+        f.memory = cli.memory.clone();
+    }
+    match &cli.command {
+        Command::Run { system, .. } | Command::Chat { system, .. } => f.system = system.clone(),
+        Command::Mission {
+            max_steps,
+            max_minutes,
+            max_tokens,
+            ..
+        } => {
+            f.max_steps = *max_steps;
+            f.max_minutes = *max_minutes;
+            f.max_tokens = *max_tokens;
+        }
+        _ => {}
+    }
+    f
+}
+
 fn dispatch(cli: Cli) -> Result<()> {
+    use tole_cli::config_apply::{self, Settings};
     // `tole config ...` is self-contained: it reads no session/env state
     // and must not trigger the update banner.
     if let Command::Config { action } = &cli.command {
+        let cwd = std::env::current_dir().context("cannot determine the cwd")?;
+        let explicit = cli.config.as_deref();
         return match action {
-            ConfigAction::Check { config } => {
-                let cwd = std::env::current_dir().context("cannot determine the cwd")?;
-                let out = tole_cli::config::check(&cwd, config.as_deref())?;
+            ConfigAction::Check => {
+                let out = config_apply::check(
+                    &cwd,
+                    explicit,
+                    &config_flags(&cli),
+                    &config_apply::real_env,
+                )?;
                 println!("{out}");
                 // Validity != trust: the exit code stays 0 either way.
-                if tole_cli::config::discover(&cwd, config.as_deref()).is_some() {
-                    let (subject, _) =
-                        tole_cli::config_trust::Subject::resolve(&cwd, config.as_deref())?;
+                if tole_cli::config::discover(&cwd, explicit).is_some() {
+                    let (subject, _) = tole_cli::config_trust::Subject::resolve(&cwd, explicit)?;
                     let store = tole_cli::config_trust::default_store_path()?;
                     println!("{}", tole_cli::config_trust::trust_line(&subject, &store)?);
                 }
                 Ok(())
             }
-            ConfigAction::Trust { config, yes } => {
-                let cwd = std::env::current_dir().context("cannot determine the cwd")?;
+            ConfigAction::Trust { yes } => {
                 let store = tole_cli::config_trust::default_store_path()?;
                 tole_cli::config_trust::trust_cmd(
                     &cwd,
-                    config.as_deref(),
+                    explicit,
                     *yes,
                     &store,
                     &mut tole_cli::config_trust::StdIo,
                 )
             }
-            ConfigAction::Untrust { config } => {
-                let cwd = std::env::current_dir().context("cannot determine the cwd")?;
+            ConfigAction::Untrust => {
                 let store = tole_cli::config_trust::default_store_path()?;
                 tole_cli::config_trust::untrust_cmd(
                     &cwd,
-                    config.as_deref(),
+                    explicit,
                     &store,
                     &mut tole_cli::config_trust::StdIo,
                 )
             }
         };
     }
+    // Project config (#208): gate + parse BEFORE anything else runs (no
+    // update banner, no session work). `--no-config` and the skip-list
+    // commands never touch the file; with no config file at all this is
+    // a silent no-op.
+    let policy = gate_policy(&cli.command);
+    let project_config = if policy == GatePolicy::Skip || cli.no_config {
+        None
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => config_apply::load_project_config(
+                &cwd,
+                cli.config.as_deref(),
+                &tole_cli::config_trust::default_store_path,
+                &mut config_apply::StartupIo::new(policy == GatePolicy::MayPrompt),
+            )?,
+            // No usable cwd: nothing to discover (as before, relative
+            // paths just fail later); an explicit --config still reports.
+            Err(e) if cli.config.is_some() => {
+                return Err(anyhow::Error::new(e).context("cannot determine the cwd"))
+            }
+            Err(_) => None,
+        }
+    };
+    let cfg = project_config.map(|l| l.config);
+    if let Some(cfg) = &cfg {
+        config_apply::install_fill(Settings::fill_from(cfg));
+    }
+    let settings = Settings::resolve(
+        &config_flags(&cli),
+        cfg.as_ref().unwrap_or(&Default::default()),
+        &config_apply::real_env,
+    );
     // Startup update notification (issue #220): banner is best-effort,
     // cache-backed, and skipped entirely for `tole upgrade` (which does
     // its own check) and for TOLE_NO_UPDATE_CHECK=1 (checked inside).
@@ -511,18 +608,17 @@ fn dispatch(cli: Cli) -> Result<()> {
             drop(handle);
         }
     }
-    let sessions_dir = PathBuf::from(
-        cli.sessions_dir
-            .clone()
-            .unwrap_or_else(|| DEFAULT_SESSIONS_DIR.to_string()),
-    );
+    // flag > config > default; the ONE resolution `sessions`, `status`,
+    // `run`, `chat`, `resume` and `mission` share.
+    let sessions_dir = PathBuf::from(settings.sessions_dir.value.clone());
     // The RAW override for the server faces: an explicit --sessions-dir
     // relocates serve/acp session storage; the default (None) keeps the
     // per-session-cwd layout those faces always had. The resolved
     // `sessions_dir` above stays the run/chat/sessions/status default.
     // Only the shell-tools serve/acp faces read this (#330).
     #[cfg_attr(not(feature = "shell-tools"), allow(unused_variables))]
-    let sessions_dir_override = cli.sessions_dir.clone().map(PathBuf::from);
+    let sessions_dir_override = (settings.sessions_dir.source != config_apply::Source::Default)
+        .then(|| PathBuf::from(settings.sessions_dir.value.clone()));
     #[cfg(feature = "mcp")]
     let mcp_specs = merge_mcp_specs(&cli.mcp_server, cli.no_auto_mcp, auto_mcp_specs());
     // Explicit --mcp-server flags only — the merged `mcp_specs` also
@@ -535,7 +631,7 @@ fn dispatch(cli: Cli) -> Result<()> {
     // the subcommand-level flags are absent (previously they were
     // silently ignored by those subcommands).
     let host = HostConfig {
-        workspace: cli.workspace.clone(),
+        workspace: settings.workspace.as_ref().map(|w| w.value.clone()),
         skills: cli.skill.clone(),
         no_skills: cli.no_skills,
         #[cfg(feature = "mcp")]
@@ -547,7 +643,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         on_posttool: cli.on_posttool.clone(),
         on_turnend: cli.on_turnend.clone(),
         #[cfg(feature = "shell-tools")]
-        memory: resolve_memory(cli.memory.as_ref())?,
+        memory: resolve_memory(settings.memory.as_ref().map(|m| m.value.as_str()))?,
         #[cfg(not(feature = "shell-tools"))]
         memory: (),
     };
@@ -568,7 +664,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             prompt_file,
             name,
             timeout,
-            system,
+            system: _,
             allow_patterns: allow_patterns_in,
             yes,
         } => {
@@ -597,7 +693,8 @@ fn dispatch(cli: Cli) -> Result<()> {
             run_command(
                 &sessions_dir,
                 &prompt,
-                system.as_deref(),
+                // --system > TOLE_SYSTEM_PROMPT > config (already resolved).
+                settings.system_prompt.as_ref().map(|e| e.value.as_str()),
                 &allow_patterns,
                 yes,
                 &host,
@@ -679,9 +776,9 @@ fn dispatch(cli: Cli) -> Result<()> {
         }
         Command::Mission {
             goal,
-            max_steps,
-            max_minutes,
-            max_tokens,
+            max_steps: _,
+            max_minutes: _,
+            max_tokens: _,
             verify,
             verify_timeout,
             resume,
@@ -724,7 +821,13 @@ fn dispatch(cli: Cli) -> Result<()> {
             // Budget tier (issue #201): the internal trust preset earns
             // the trusted tier's headroom; explicit flags always win.
             let trusted = trust_extra.iter().any(|p| p == "todo_write");
-            let tier = mission::BudgetTier::resolve(trusted, max_steps, max_minutes, max_tokens);
+            // flag > config > budget tier (no env for the budgets).
+            let tier = mission::BudgetTier::resolve(
+                trusted,
+                settings.max_steps.as_ref().map(|e| e.value),
+                settings.max_minutes.as_ref().map(|e| e.value),
+                settings.max_tokens.as_ref().map(|e| e.value),
+            );
             let sessions_dir = sessions_dir.clone();
             std::fs::create_dir_all(&sessions_dir)
                 .with_context(|| format!("creating {}", sessions_dir.display()))?;
@@ -787,7 +890,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                 eprintln!("tole acp: --plan-mode is active — serving read-only tools only");
             }
             let memory = match memory.as_deref().filter(|s| !s.trim().is_empty()) {
-                Some(_) => resolve_memory(memory.as_ref())?,
+                Some(m) => resolve_memory(Some(m))?,
                 None => host.memory.clone(),
             };
             let workspace = workspace.or_else(|| host.workspace.clone());
@@ -824,7 +927,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             #[cfg(feature = "mcp")]
             check_client_session_flags("serve", &host.skills, host.no_skills, explicit_mcp)?;
             let memory = match memory.as_deref().filter(|s| !s.trim().is_empty()) {
-                Some(_) => resolve_memory(memory.as_ref())?,
+                Some(m) => resolve_memory(Some(m))?,
                 None => host.memory.clone(),
             };
             let workspace = workspace.or_else(|| host.workspace.clone());
@@ -870,7 +973,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         Command::Sessions => sessions_command(&sessions_dir),
         Command::Status { id } => status_command(&sessions_dir, &id),
         Command::Chat {
-            system,
+            system: _,
             resume,
             last,
             allow_patterns: allow_patterns_in,
@@ -879,7 +982,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             let allow_patterns = with_trust(allow_patterns_in, &trust_extra);
             chat_command(
                 &sessions_dir,
-                system.as_deref(),
+                settings.system_prompt.as_ref().map(|e| e.value.as_str()),
                 resume,
                 last,
                 &allow_patterns,
@@ -975,22 +1078,17 @@ impl HostConfig {
     }
 }
 
-/// Memory backend resolution: the `--memory` flag wins over the
-/// `TOLE_MEMORY` env; `uteke` is the only backend. The namespace follows
+/// Memory backend resolution: `chosen` is the already-resolved backend
+/// name (`--memory` flag > `TOLE_MEMORY` env > project config, see
+/// `config_apply::Settings`); `uteke` is the only backend. The namespace follows
 /// the ecosystem `repo-<dir>` convention unless `TOLE_MEMORY_NAMESPACE`
 /// overrides it. A missing uteke binary degrades to a warning + no-op
 /// (the same probe contract as the uteke tools).
 #[cfg(feature = "shell-tools")]
-fn resolve_memory(flag: Option<&String>) -> Result<Option<tole_core::memory::MemoryConfig>> {
-    let chosen = flag
+fn resolve_memory(chosen: Option<&str>) -> Result<Option<tole_core::memory::MemoryConfig>> {
+    let chosen = chosen
         .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            std::env::var("TOLE_MEMORY")
-                .ok()
-                .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty())
-        });
+        .filter(|s| !s.is_empty());
     let Some(backend) = chosen else {
         return Ok(None);
     };
@@ -1589,7 +1687,7 @@ fn run_command(
     name: Option<&str>,
     timeout_secs: Option<u64>,
 ) -> Result<()> {
-    let cfg = OpenAiConfig::from_env().context(
+    let cfg = tole_cli::config_apply::provider_config().context(
         "missing provider config: set TOLE_BASE_URL / TOLE_MODEL / TOLE_API_KEY \
          (or the OPENAI_* equivalents)",
     )?;
@@ -1772,7 +1870,7 @@ fn resume_command(
     if !path.exists() {
         anyhow::bail!("session {id} not found at {}", path.display());
     }
-    let cfg = OpenAiConfig::from_env().context(
+    let cfg = tole_cli::config_apply::provider_config().context(
         "missing provider config: set TOLE_BASE_URL / TOLE_MODEL / TOLE_API_KEY \
          (or the OPENAI_* equivalents)",
     )?;
@@ -2105,7 +2203,7 @@ fn chat_command(
 ) -> Result<()> {
     use std::io::{BufRead, Write};
 
-    let cfg = OpenAiConfig::from_env().context(
+    let cfg = tole_cli::config_apply::provider_config().context(
         "missing provider config: set TOLE_BASE_URL / TOLE_MODEL / TOLE_API_KEY \
          (or the OPENAI_* equivalents)",
     )?;
@@ -3111,3 +3209,7 @@ mod chat_todo_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "main_gate_tests.rs"]
+mod gate_policy_tests;

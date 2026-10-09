@@ -119,15 +119,42 @@ trust: `internal` / `read_only`), `--skill <path>` (load a SKILL.md),
 
 ## Configuration (project file)
 
-`tole config check` validates a project config file, `<cwd>/.tole/config.toml`
-(or `--config <path>`; no parent-directory walk), and prints every key that is
-set. **Nothing is applied yet:** this is part 2 of 3 of #208 — the file is only
-loaded, validated and (optionally) trusted; flags, env and runtime behavior are
-unchanged. Startup gating, `--config`/`--no-config` as global flags and the
-flag > env > config precedence come in the next part.
+`<cwd>/.tole/config.toml` (no parent-directory walk) holds per-project defaults.
+It is loaded by every command except `config`, `upgrade` and `approvals`; use
+`--config <path>` to name another file (a path given on the command line is
+trusted without a trust record) or `--no-config` to ignore any file entirely
+(no discovery, no trust check, no output). When a config is loaded, one line
+`tole: using config <path>` goes to stderr. **Precedence: flag > env > config >
+default**, and a project without a config file behaves exactly as before.
+
+**Applied now (#208, part 3a of 4):** `model`, `base_url`, `system_prompt`,
+`memory`, `sessions_dir`, `workspace` and the `[mission]` budgets `max_steps`,
+`max_minutes`, `max_tokens`. Env still wins over the file (`TOLE_MODEL`,
+`TOLE_BASE_URL`, `TOLE_SYSTEM_PROMPT`, `TOLE_MEMORY` and the `OPENAI_*`
+fallbacks; an empty variable counts as unset); the API key only ever comes from
+the environment. Relative `sessions_dir` / `workspace` resolve against the
+current directory, like the flags.
+
+**Validated but NOT applied yet (next release part):** `trust`, `allow`,
+`mcp_server`, `on_pretool`, `on_posttool`, `on_turnend`, `skill`, `plan_mode`,
+`no_auto_mcp`, `no_skills`, `mission.verify`, `mission.verify_timeout`. They are
+parsed and checked, and `tole config check` marks them
+`(parsed, not applied yet — 3b)`; setting them has no effect today.
+
+`tole config check` prints every key that is set with its effective value and
+where it came from (`flag`, `env VAR`, `config`, `default`), using the same
+resolution code as startup.
 
 The file is untrusted input (it lives in a cloned repo), so it needs a
-content-bound approval before it may ever take effect:
+content-bound approval before it takes effect:
+
+- On an interactive command (`run`, `chat`, `resume`, `mission`) with a terminal
+  on both stdin and stderr, an untrusted or changed config is shown in full and
+  you are asked `trust this config? [y/N]`. Everywhere else (`sessions`,
+  `status`, `serve`, `acp`, `mcp`, no terminal, or `--prompt-file -`) tole
+  FAILS CLOSED with the exact instruction (`tole config trust`) and runs
+  nothing; `serve`/`acp`/`mcp` never ask because their stdin/stdout are
+  protocol channels.
 
 - `tole config trust [--config <path>] [--yes]` validates the file, prints its
   path and FULL content (plus a line diff against the previously trusted

@@ -252,9 +252,12 @@ pub fn open_session(
     let workspace_canon = workspace
         .canonicalize()
         .map_err(|e| format!("session workspace {}: {e}", workspace.display()))?;
+    // TOLE_SYSTEM_PROMPT env > project config (#208; absent unless a
+    // trusted config installed it) > none.
     let system_prompt = std::env::var("TOLE_SYSTEM_PROMPT")
         .ok()
-        .filter(|s| !s.trim().is_empty());
+        .filter(|s| !s.trim().is_empty())
+        .or_else(crate::config_apply::config_system_prompt);
 
     let interactive = approver.interactive();
     let mut reg = tole_core::tool::ToolRegistry::with_approver(approver);
@@ -550,7 +553,7 @@ pub fn run_session_turn(
     // the env default. serve sessions have no setter today, so this is
     // a no-op there.
     let mut storage = storage.lock().unwrap_or_else(|p| p.into_inner());
-    let Some(mut cfg) = tole_core::openai::OpenAiConfig::from_env() else {
+    let Some(mut cfg) = crate::config_apply::provider_config() else {
         return Err(
             "missing provider config: set TOLE_BASE_URL / TOLE_MODEL / TOLE_API_KEY              (or the OPENAI_* equivalents)"
                 .into(),
@@ -639,7 +642,7 @@ pub fn resume_session_turn(
     };
     let _busy_guard = BusyGuard(busy_guard);
     let mut storage = storage.lock().unwrap_or_else(|p| p.into_inner());
-    let Some(mut cfg) = tole_core::openai::OpenAiConfig::from_env() else {
+    let Some(mut cfg) = crate::config_apply::provider_config() else {
         return Err(
             "missing provider config: set TOLE_BASE_URL / TOLE_MODEL / TOLE_API_KEY              (or the OPENAI_* equivalents)"
                 .into(),

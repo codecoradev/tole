@@ -1,6 +1,5 @@
-//! Project config file `.tole/config.toml` (#208, part 1 of 3): LOAD +
-//! VALIDATE only. Nothing here is applied to sessions — flags, env and
-//! runtime behavior are untouched until a later part wires precedence in.
+//! Project config file `.tole/config.toml` (#208): LOAD + VALIDATE. Applying
+//! the keys (precedence, trust gate at startup) lives in `config_apply`.
 //!
 //! The file is untrusted input (it lives in a cloned repo), so the loader
 //! is strict: a 64 KiB bounded read, a pre-check that refuses secret-like
@@ -231,19 +230,34 @@ fn quote(s: &str) -> String {
     format!("{s:?}")
 }
 
+/// Per-key text appended after `[config]` on the key's line (effective
+/// value + source, or the "not applied" marker). Keys use the rendered
+/// names (`model`, `mission.max_steps`, ...).
+pub type Annotations = std::collections::BTreeMap<&'static str, String>;
+
 /// Render `key = value  [config]` lines for every key that is set. List
 /// values go one entry per line; unset keys are not listed.
 pub fn render(cfg: &Config) -> Vec<String> {
+    render_with(cfg, &Annotations::new())
+}
+
+/// [`render`] with a per-key suffix after the `[config]` tag.
+pub fn render_with(cfg: &Config, ann: &Annotations) -> Vec<String> {
     const SRC: &str = "config";
     let mut out = Vec::new();
+    let note = |key: &str| ann.get(key).map_or("", String::as_str);
     let scalar = |out: &mut Vec<String>, key: &str, v: Option<String>| {
         if let Some(v) = v {
-            out.push(format!("{key} = {v}  [{SRC}]"));
+            out.push(format!("{key} = {v}  [{SRC}]{}", note(key)));
         }
     };
     let list = |out: &mut Vec<String>, key: &str, v: &Option<Vec<String>>| {
         if let Some(items) = v {
-            out.push(format!("{key} = [{} entries]  [{SRC}]", items.len()));
+            out.push(format!(
+                "{key} = [{} entries]  [{SRC}]{}",
+                items.len(),
+                note(key)
+            ));
             for i in items {
                 out.push(format!("  - {}", quote(i)));
             }
@@ -312,21 +326,30 @@ pub fn render(cfg: &Config) -> Vec<String> {
 }
 
 /// `tole config check`: returns the text to print, or the error. `cwd`
-/// and `explicit` are parameters (no global state).
-pub fn check(cwd: &Path, explicit: Option<&Path>) -> Result<String, ConfigError> {
+/// and `explicit` are parameters (no global state). `annotate` supplies
+/// the per-key suffixes from the shared resolution (see
+/// `config_apply::check`).
+pub fn check(
+    cwd: &Path,
+    explicit: Option<&Path>,
+    annotate: &dyn Fn(&Config) -> Annotations,
+) -> Result<String, ConfigError> {
     let Some(path) = discover(cwd, explicit) else {
         return Ok(format!("no {CONFIG_REL_PATH} in {}", cwd.display()));
     };
     let cfg = load(&path)?;
     let shown = path.canonicalize().unwrap_or(path);
     let mut lines = vec![format!("config: {}", shown.display())];
-    let rendered = render(&cfg);
+    let rendered = render_with(&cfg, &annotate(&cfg));
     if rendered.is_empty() {
         lines.push("(valid; no keys set)".to_string());
     } else {
         lines.extend(rendered);
     }
-    lines.push("note: the config is validated only — it is not applied to sessions yet.".into());
+    lines.push(
+        "note: keys marked `parsed, not applied yet` are validated only (next release part)."
+            .into(),
+    );
     Ok(lines.join("\n"))
 }
 
@@ -529,13 +552,13 @@ verify_timeout = 60
     #[test]
     fn check_reports_absent_valid_and_missing_explicit() {
         let d = tmpdir();
-        let out = check(&d, None).unwrap();
+        let out = check(&d, None, &|_| Annotations::new()).unwrap();
         assert!(out.starts_with("no .tole/config.toml in "), "{out}");
         let f = d.join("c.toml");
         std::fs::write(&f, "model = \"m\"\n").unwrap();
-        let out = check(&d, Some(&f)).unwrap();
+        let out = check(&d, Some(&f), &|_| Annotations::new()).unwrap();
         assert!(out.contains("model = \"m\"  [config]"), "{out}");
-        assert!(check(&d, Some(&d.join("nope.toml"))).is_err());
+        assert!(check(&d, Some(&d.join("nope.toml")), &|_| Annotations::new()).is_err());
     }
 
     #[test]
