@@ -246,9 +246,9 @@ enum Command {
         #[arg(long)]
         verify: Option<String>,
 
-        /// Per-run timeout of the --verify command, in seconds.
-        #[arg(long, default_value_t = 300)]
-        verify_timeout: u64,
+        /// Per-run timeout of the --verify command, in seconds [default: 300]
+        #[arg(long)]
+        verify_timeout: Option<u64>,
 
         /// Continue an interrupted mission instead of starting a new one.
         #[arg(long)]
@@ -422,9 +422,8 @@ enum Command {
     },
     /// Project config file `.tole/config.toml` (#208): `check` validates
     /// it and shows the effective values, `trust`/`untrust` manage the
-    /// trust record. Applied to model, base_url, system_prompt, memory,
-    /// sessions_dir, workspace and [mission] budgets after trust; the
-    /// security-sensitive keys are validated but not applied yet.
+    /// trust record. Every key is applied after trust (flag > env > config
+    /// > default); `--no-config` ignores the file.
     Config {
         #[command(subcommand)]
         action: ConfigAction,
@@ -497,23 +496,62 @@ fn config_flags(cli: &Cli) -> tole_cli::config_apply::Flags {
     let mut f = tole_cli::config_apply::Flags {
         sessions_dir: cli.sessions_dir.clone(),
         workspace: cli.workspace.clone(),
+        trust: cli.trust.clone(),
+        on_pretool: cli.on_pretool.clone(),
+        on_posttool: cli.on_posttool.clone(),
+        on_turnend: cli.on_turnend.clone(),
+        skill: cli.skill.clone(),
+        plan_mode: cli.plan_mode,
+        no_skills: cli.no_skills,
         ..Default::default()
     };
     #[cfg(feature = "shell-tools")]
     {
         f.memory = cli.memory.clone();
     }
+    #[cfg(feature = "mcp")]
+    {
+        f.mcp_server = cli.mcp_server.clone();
+        f.no_auto_mcp = cli.no_auto_mcp;
+    }
+    // Every subcommand with its own `--allow` feeds it here: the config
+    // `allow` list is the fallback when THAT flag list is empty.
     match &cli.command {
-        Command::Run { system, .. } | Command::Chat { system, .. } => f.system = system.clone(),
+        Command::Run {
+            system,
+            allow_patterns,
+            ..
+        }
+        | Command::Chat {
+            system,
+            allow_patterns,
+            ..
+        } => {
+            f.system = system.clone();
+            f.allow = allow_patterns.clone();
+        }
+        Command::Resume { allow_patterns, .. } => f.allow = allow_patterns.clone(),
         Command::Mission {
             max_steps,
             max_minutes,
             max_tokens,
+            verify,
+            verify_timeout,
+            allow_patterns,
             ..
         } => {
             f.max_steps = *max_steps;
             f.max_minutes = *max_minutes;
             f.max_tokens = *max_tokens;
+            f.verify = verify.clone();
+            f.verify_timeout = *verify_timeout;
+            f.allow = allow_patterns.clone();
+        }
+        #[cfg(all(feature = "mcp", feature = "shell-tools"))]
+        Command::Mcp { allow_patterns, .. } => f.allow = allow_patterns.clone(),
+        #[cfg(feature = "shell-tools")]
+        Command::Acp { allow_patterns, .. } | Command::Serve { allow_patterns, .. } => {
+            f.allow = allow_patterns.clone()
         }
         _ => {}
     }
@@ -590,6 +628,15 @@ fn dispatch(cli: Cli) -> Result<()> {
     };
     let cfg = project_config.map(|l| l.config);
     if let Some(cfg) = &cfg {
+        // A key this build cannot honor is a loud startup error, never a
+        // silent ignore (the matching flag does not exist here).
+        if let Some(msg) = config_apply::unsupported_keys(
+            cfg,
+            cfg!(feature = "mcp"),
+            cfg!(feature = "shell-tools"),
+        ) {
+            anyhow::bail!(msg);
+        }
         config_apply::install_fill(Settings::fill_from(cfg));
     }
     let settings = Settings::resolve(
@@ -620,41 +667,44 @@ fn dispatch(cli: Cli) -> Result<()> {
     let sessions_dir_override = (settings.sessions_dir.source != config_apply::Source::Default)
         .then(|| PathBuf::from(settings.sessions_dir.value.clone()));
     #[cfg(feature = "mcp")]
-    let mcp_specs = merge_mcp_specs(&cli.mcp_server, cli.no_auto_mcp, auto_mcp_specs());
-    // Explicit --mcp-server flags only — the merged `mcp_specs` also
-    // contains the cora auto-preset, which must NOT trigger the
-    // server-face refusal below.
-    #[cfg(feature = "mcp")]
-    let explicit_mcp = !cli.mcp_server.is_empty();
+    let mcp_specs = merge_mcp_specs(
+        &config_apply::values(&settings.mcp_server),
+        settings.no_auto_mcp.value,
+        auto_mcp_specs(),
+    );
+    // Explicit servers only (--mcp-server flag or the config `mcp_server`
+    // list) — the merged `mcp_specs` also contains the cora auto-preset,
+    // which must NOT trigger the server-face refusal below. Always false
+    // in a build without the `mcp` feature (the config key is refused at
+    // startup there, and the flag does not exist).
+    let explicit_mcp = settings.mcp_server.is_some();
     // scan-3 finding fix: the global --workspace/--memory flags now flow
     // into the host, so `tole serve/acp/mcp` honor them as fallbacks when
     // the subcommand-level flags are absent (previously they were
     // silently ignored by those subcommands).
     let host = HostConfig {
         workspace: settings.workspace.as_ref().map(|w| w.value.clone()),
-        skills: cli.skill.clone(),
-        no_skills: cli.no_skills,
+        skills: config_apply::values(&settings.skill),
+        no_skills: settings.no_skills.value,
         #[cfg(feature = "mcp")]
         mcp_server: mcp_specs,
-        plan_mode: cli.plan_mode,
+        plan_mode: settings.plan_mode.value,
         agents_worktree: cli.agents_worktree,
 
-        on_pretool: cli.on_pretool.clone(),
-        on_posttool: cli.on_posttool.clone(),
-        on_turnend: cli.on_turnend.clone(),
+        on_pretool: config_apply::values(&settings.on_pretool),
+        on_posttool: config_apply::values(&settings.on_posttool),
+        on_turnend: config_apply::values(&settings.on_turnend),
         #[cfg(feature = "shell-tools")]
         memory: resolve_memory(settings.memory.as_ref().map(|m| m.value.as_str()))?,
         #[cfg(not(feature = "shell-tools"))]
         memory: (),
     };
     // Trust presets (issue #159): expand once, before dispatch — every
-    // allow_patterns-consuming subcommand appends these. The --trust
-    // flag wins over the TOLE_TRUST env (documented); the env splits on
-    // commas/whitespace so one variable can carry several presets.
-    let trust_extra = expand_trust(&resolve_trust_flags(
-        &cli.trust,
-        std::env::var("TOLE_TRUST").ok(),
-    ))?;
+    // allow_patterns-consuming subcommand appends these. --trust >
+    // TOLE_TRUST > config `trust`, the higher layer replacing the whole
+    // list (the env splits on commas/whitespace so one variable can carry
+    // several presets).
+    let trust_extra = expand_trust(&config_apply::values(&settings.trust))?;
 
     match cli.command {
         // Handled at the top of `dispatch`, before any session/env state.
@@ -665,10 +715,10 @@ fn dispatch(cli: Cli) -> Result<()> {
             name,
             timeout,
             system: _,
-            allow_patterns: allow_patterns_in,
+            allow_patterns: _,
             yes,
         } => {
-            let allow_patterns = with_trust(allow_patterns_in, &trust_extra);
+            let allow_patterns = with_trust(config_apply::values(&settings.allow), &trust_extra);
             // Prompt resolution (issue #216): exactly one of positional
             // PROMPT / --prompt-file ('-' = stdin).
             let prompt = match (prompt, prompt_file.as_deref()) {
@@ -712,10 +762,10 @@ fn dispatch(cli: Cli) -> Result<()> {
         Command::Resume {
             id,
             prompt,
-            allow_patterns: allow_patterns_in,
+            allow_patterns: _,
             yes,
         } => {
-            let allow_patterns = with_trust(allow_patterns_in, &trust_extra);
+            let allow_patterns = with_trust(config_apply::values(&settings.allow), &trust_extra);
             resume_command(
                 &sessions_dir,
                 &id,
@@ -727,10 +777,10 @@ fn dispatch(cli: Cli) -> Result<()> {
         }
         #[cfg(all(feature = "mcp", feature = "shell-tools"))]
         Command::Mcp {
-            allow_patterns: allow_patterns_in,
+            allow_patterns: _,
             workspace,
         } => {
-            let allow_patterns = with_trust(allow_patterns_in, &trust_extra);
+            let allow_patterns = with_trust(config_apply::values(&settings.allow), &trust_extra);
             // Global flags must not SILENTLY no-op on this subcommand
             // (cora scan-3 #9): plan-mode filters the served registry to
             // read-only; hooks are not wired in server mode (no local
@@ -738,19 +788,20 @@ fn dispatch(cli: Cli) -> Result<()> {
             // --allow), so --on-pretool/--on-posttool error out loudly
             // instead of being ignored.
             if host.on_pretool_non_empty() || host.on_posttool_non_empty() {
-                anyhow::bail!(
+                return Err(refuse(
                     "--on-pretool/--on-posttool are not supported by `tole mcp` \
-                     (server mode pre-authorizes Write tools with --allow instead)"
-                );
+                     (server mode pre-authorizes Write tools with --allow instead)",
+                    pretool_from_config(&settings),
+                ));
             }
             if !host.on_turnend.is_empty() {
-                anyhow::bail!(
+                return Err(refuse(
                     "--on-turnend is not supported by `tole mcp` (the tool server runs no \
-                     turns; stop gates apply to run/chat/resume/serve/acp sessions)"
-                );
+                     turns; stop gates apply to run/chat/resume/serve/acp sessions)",
+                    from_config(&settings.on_turnend),
+                ));
             }
-            #[cfg(feature = "mcp")]
-            check_client_session_flags("mcp", &host.skills, host.no_skills, explicit_mcp)?;
+            check_server_face_flags("mcp", &host, &settings, explicit_mcp)?;
             if host.plan_mode {
                 eprintln!("tole mcp: --plan-mode is active — serving read-only tools only");
             }
@@ -779,45 +830,51 @@ fn dispatch(cli: Cli) -> Result<()> {
             max_steps: _,
             max_minutes: _,
             max_tokens: _,
-            verify,
-            verify_timeout,
+            verify: _,
+            verify_timeout: _,
             resume,
-            allow_patterns: allow_patterns_in,
+            allow_patterns: _,
             yes,
         } => {
-            let allow_patterns = with_trust(allow_patterns_in, &trust_extra);
+            let allow_patterns = with_trust(config_apply::values(&settings.allow), &trust_extra);
             if host.plan_mode {
-                anyhow::bail!(
-                    "--plan-mode has no meaning for a mission (missions mutate by definition)"
-                );
+                return Err(refuse(
+                    "--plan-mode has no meaning for a mission (missions mutate by definition)",
+                    settings.plan_mode.source == config_apply::Source::Config,
+                ));
             }
             // Issue #258 (rescan #46, scan-3 #9 rule): global flags must
             // not SILENTLY no-op — missions build their own registry and
             // run no host memory loop today, so hook/memory flags are
             // loudly refused instead of being ignored.
             if host.on_pretool_non_empty() || host.on_posttool_non_empty() {
-                anyhow::bail!(
+                return Err(refuse(
                     "--on-pretool/--on-posttool are not supported by `tole run mission` \
-                     (mission registries do not wire tool hooks yet)"
-                );
+                     (mission registries do not wire tool hooks yet)",
+                    pretool_from_config(&settings),
+                ));
             }
             if !host.on_turnend.is_empty() {
-                anyhow::bail!(
+                return Err(refuse(
                     "--on-turnend is not supported by `tole run mission` (mission turns \
-                     settle through the mission loop, not the turn-end hook path)"
-                );
+                     settle through the mission loop, not the turn-end hook path)",
+                    from_config(&settings.on_turnend),
+                ));
             }
             // #[cfg]-mirrored like the HostConfig field itself: without
             // shell-tools the field is the unit type (cora round 1).
             #[cfg(feature = "shell-tools")]
             if host.memory.is_some() {
-                anyhow::bail!(
+                return Err(refuse(
                     "--memory is not supported by `tole run mission` (the mission loop does \
-                     not run the harness memory loop yet)"
-                );
+                     not run the harness memory loop yet)",
+                    settings
+                        .memory
+                        .as_ref()
+                        .is_some_and(|m| m.source == config_apply::Source::Config),
+                ));
             }
-            #[cfg(feature = "mcp")]
-            check_client_session_flags("mission", &host.skills, host.no_skills, explicit_mcp)?;
+            check_server_face_flags("mission", &host, &settings, explicit_mcp)?;
             // Budget tier (issue #201): the internal trust preset earns
             // the trusted tier's headroom; explicit flags always win.
             let trusted = trust_extra.iter().any(|p| p == "todo_write");
@@ -859,8 +916,9 @@ fn dispatch(cli: Cli) -> Result<()> {
                     max_steps: tier.max_steps,
                     max_minutes: tier.max_minutes,
                     max_tokens: tier.max_tokens,
-                    verify,
-                    verify_timeout_secs: verify_timeout,
+                    // flag > config; timeout flag > config > 300.
+                    verify: settings.verify.as_ref().map(|v| v.value.clone()),
+                    verify_timeout_secs: settings.verify_timeout.value,
                     resume_id: resume,
                 },
                 registry,
@@ -869,23 +927,23 @@ fn dispatch(cli: Cli) -> Result<()> {
         }
         #[cfg(feature = "shell-tools")]
         Command::Acp {
-            allow_patterns: allow_patterns_in,
+            allow_patterns: _,
             yes,
             workspace,
             memory,
         } => {
-            let allow_patterns = with_trust(allow_patterns_in, &trust_extra);
+            let allow_patterns = with_trust(config_apply::values(&settings.allow), &trust_extra);
             // Same loud-bail rule as `tole mcp` for hooks: the ACP host
             // does not wire local pre/post hooks — approvals happen in
             // the editor via permission requests instead.
             if host.on_pretool_non_empty() || host.on_posttool_non_empty() {
-                anyhow::bail!(
+                return Err(refuse(
                     "--on-pretool/--on-posttool are not supported by `tole acp` \
-                     (approvals happen via session/request_permission in the client)"
-                );
+                     (approvals happen via session/request_permission in the client)",
+                    pretool_from_config(&settings),
+                ));
             }
-            #[cfg(feature = "mcp")]
-            check_client_session_flags("acp", &host.skills, host.no_skills, explicit_mcp)?;
+            check_server_face_flags("acp", &host, &settings, explicit_mcp)?;
             if host.plan_mode {
                 eprintln!("tole acp: --plan-mode is active — serving read-only tools only");
             }
@@ -910,22 +968,22 @@ fn dispatch(cli: Cli) -> Result<()> {
             bind,
             transport,
             token,
-            allow_patterns: allow_patterns_in,
+            allow_patterns: _,
             workspace,
             memory,
         } => {
-            let allow_patterns = with_trust(allow_patterns_in, &trust_extra);
+            let allow_patterns = with_trust(config_apply::values(&settings.allow), &trust_extra);
             // Loud bails, same rule as `tole mcp`/`tole acp`: these host
             // flags have no server-face wiring, and a silent no-op is
             // worse than a startup error (scan-3 #9).
             if host.on_pretool_non_empty() || host.on_posttool_non_empty() {
-                anyhow::bail!(
+                return Err(refuse(
                     "--on-pretool/--on-posttool are not supported by `tole serve` \
-                     (a server has no local human; pre-authorize Write tools with --allow)"
-                );
+                     (a server has no local human; pre-authorize Write tools with --allow)",
+                    pretool_from_config(&settings),
+                ));
             }
-            #[cfg(feature = "mcp")]
-            check_client_session_flags("serve", &host.skills, host.no_skills, explicit_mcp)?;
+            check_server_face_flags("serve", &host, &settings, explicit_mcp)?;
             let memory = match memory.as_deref().filter(|s| !s.trim().is_empty()) {
                 Some(m) => resolve_memory(Some(m))?,
                 None => host.memory.clone(),
@@ -976,10 +1034,10 @@ fn dispatch(cli: Cli) -> Result<()> {
             system: _,
             resume,
             last,
-            allow_patterns: allow_patterns_in,
+            allow_patterns: _,
             yes,
         } => {
-            let allow_patterns = with_trust(allow_patterns_in, &trust_extra);
+            let allow_patterns = with_trust(config_apply::values(&settings.allow), &trust_extra);
             chat_command(
                 &sessions_dir,
                 settings.system_prompt.as_ref().map(|e| e.value.as_str()),
@@ -1225,24 +1283,18 @@ fn detect_github_repo(cwd: &Path) -> Option<String> {
     tole_cli::session_host::github_repo_from_remote_url(&String::from_utf8_lossy(&out.stdout))
 }
 
-/// Effective trust-preset flag list: an explicit `--trust` flag wins
-/// wholesale over the `TOLE_TRUST` env; with no flags, the env (split on
-/// commas/whitespace) is the list. Found by activation testing
-/// 2026-10-05: the env was documented ("flag wins over the TOLE_TRUST
-/// env") but never read — same documented-but-unimplemented class as the
-/// #138 ambiguity refusal.
+/// Flag-over-env trust list (the pre-config rule, #159), kept as a thin
+/// test oracle over the shared [`config_apply::resolve_list`]: startup
+/// resolves `trust` through `Settings::resolve` (flag > TOLE_TRUST env >
+/// config), whose first two layers must stay exactly this behavior.
+#[cfg(test)]
 fn resolve_trust_flags(flag: &[String], env_val: Option<String>) -> Vec<String> {
-    if !flag.is_empty() {
-        return flag.to_vec();
-    }
-    let Some(env_val) = env_val else {
-        return Vec::new();
-    };
-    env_val
-        .split(|c: char| c == ',' || c.is_whitespace())
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect()
+    let env = env_val
+        .map(|v| tole_cli::config_apply::split_env_list(&v))
+        .unwrap_or_default();
+    tole_cli::config_apply::resolve_list(flag, &env, None)
+        .map(|(v, _)| v)
+        .unwrap_or_default()
 }
 
 /// Default base URL of a `tole serve` instance for `tole approvals`.
@@ -1269,10 +1321,9 @@ fn with_trust(mut allow_patterns: Vec<String>, trust_extra: &[String]) -> Vec<St
 /// flag state, not the merged preset list — the cora auto-preset must
 /// not trip this.
 ///
-/// Every call site is `#[cfg(feature = "mcp")]`-gated (the `--mcp-server`
-/// flag and its presets exist only there), so without the `mcp` feature
-/// the function is unreachable and gated out to stay warning-free.
-#[cfg(feature = "mcp")]
+/// Ungated since #208 part 3b: a config `skill` / `no_skills` must be
+/// refused on these faces in EVERY build profile, not only with `mcp`
+/// (without the feature `explicit_mcp_servers` is always false).
 fn check_client_session_flags(
     face: &str,
     skills: &[PathBuf],
@@ -1298,6 +1349,51 @@ fn check_client_session_flags(
         );
     }
     Ok(())
+}
+
+/// A refusal that may stem from the project config rather than the command
+/// line: the message is the flag's, plus (for config-sourced values) the way
+/// out. A safety hook / policy that arrives from the config must never be
+/// silently dropped on a face that cannot honor it.
+fn refuse(msg: &str, from_config: bool) -> anyhow::Error {
+    if from_config {
+        anyhow::anyhow!(
+            "{msg} (the value comes from the project config; \
+             use --no-config to ignore the project config)"
+        )
+    } else {
+        anyhow::anyhow!("{msg}")
+    }
+}
+
+fn from_config<T>(e: &tole_cli::config_apply::ListEff<T>) -> bool {
+    e.as_ref()
+        .is_some_and(|e| e.source == tole_cli::config_apply::Source::Config)
+}
+
+fn pretool_from_config(s: &tole_cli::config_apply::Settings) -> bool {
+    from_config(&s.on_pretool) || from_config(&s.on_posttool)
+}
+
+/// [`check_client_session_flags`] over the EFFECTIVE (post-config) values;
+/// a config-sourced offender gets the `--no-config` hint.
+fn check_server_face_flags(
+    face: &str,
+    host: &HostConfig,
+    settings: &tole_cli::config_apply::Settings,
+    explicit_mcp: bool,
+) -> Result<()> {
+    check_client_session_flags(face, &host.skills, host.no_skills, explicit_mcp).map_err(|e| {
+        // Same order as the checks inside: skill, no_skills, mcp_server.
+        let cfg = if !host.skills.is_empty() {
+            from_config(&settings.skill)
+        } else if host.no_skills {
+            settings.no_skills.source == tole_cli::config_apply::Source::Config
+        } else {
+            from_config(&settings.mcp_server)
+        };
+        refuse(&e.to_string(), cfg)
+    })
 }
 
 /// Register the `gh` tool against the checkout's own GitHub repo.

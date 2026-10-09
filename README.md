@@ -127,23 +127,54 @@ trusted without a trust record) or `--no-config` to ignore any file entirely
 `tole: using config <path>` goes to stderr. **Precedence: flag > env > config >
 default**, and a project without a config file behaves exactly as before.
 
-**Applied now (#208, part 3a of 4):** `model`, `base_url`, `system_prompt`,
-`memory`, `sessions_dir`, `workspace` and the `[mission]` budgets `max_steps`,
-`max_minutes`, `max_tokens`. Env still wins over the file (`TOLE_MODEL`,
-`TOLE_BASE_URL`, `TOLE_SYSTEM_PROMPT`, `TOLE_MEMORY` and the `OPENAI_*`
-fallbacks; an empty variable counts as unset); the API key only ever comes from
-the environment. Relative `sessions_dir` / `workspace` resolve against the
-current directory, like the flags.
+**Keys.** Every key is optional; the schema is strict (an unknown key, a wrong
+type or a secret-like key is an error with `file:line`; the file is capped at
+64 KiB).
 
-**Validated but NOT applied yet (next release part):** `trust`, `allow`,
-`mcp_server`, `on_pretool`, `on_posttool`, `on_turnend`, `skill`, `plan_mode`,
-`no_auto_mcp`, `no_skills`, `mission.verify`, `mission.verify_timeout`. They are
-parsed and checked, and `tole config check` marks them
-`(parsed, not applied yet — 3b)`; setting them has no effect today.
+| Key | Mirrors | Effective value |
+|-----|---------|-----------------|
+| `model`, `base_url`, `system_prompt`, `memory` | the provider env, `--system`, `--memory` | flag > env > config |
+| `sessions_dir`, `workspace` | `--sessions-dir`, `--workspace` | flag > config > default |
+| `[mission]` `max_steps`, `max_minutes`, `max_tokens` | `mission --max-*` | flag > config > budget tier |
+| `[mission]` `verify`, `verify_timeout` | `mission --verify`, `--verify-timeout` | flag > config > default (`300`) |
+| `trust` (list of presets) | `--trust` | flag > `TOLE_TRUST` env > config |
+| `allow` (list of globs) | the subcommand's own `--allow` | flag > config |
+| `mcp_server` (list) | `--mcp-server` | flag > config |
+| `on_pretool`, `on_posttool`, `on_turnend` (lists) | `--on-pretool` / `--on-posttool` / `--on-turnend` | flag > config |
+| `skill` (list of paths) | `--skill` | flag > config (paths resolve against the cwd) |
+| `plan_mode`, `no_auto_mcp`, `no_skills` (booleans) | `--plan-mode`, `--no-auto-mcp`, `--no-skills` | `flag \|\| config` |
+
+The API key only ever comes from the environment (a secret-like key in the file
+is an error). An empty env variable counts as unset.
+
+- **Lists are replaced wholesale.** A higher layer replaces the whole list for
+  that key; lists are never merged. A non-empty `--allow` list replaces the
+  config `allow` list entirely (an empty flag list means "not given"), exactly
+  like `--trust` over `TOLE_TRUST`. Every subcommand has its own `--allow`; the
+  config `allow` is the fallback when THAT subcommand's `--allow` is empty.
+- **Booleans can only be turned on.** `effective = flag || config`: a flag can
+  turn a setting on but there is no flag that forces it off, so a config `true`
+  is dropped only with `--no-config` (or by editing / untrusting the file).
+  `tole config check` says so next to each boolean.
+- **Same effect as the flag.** `plan_mode = true` removes the write/delete/run
+  tools from the wire like `--plan-mode`; `allow`/`trust` feed the same
+  allowlist as the flags, so `Destructive` tools still always prompt (they can
+  never be allowed through the file, and on the non-interactive faces they stay
+  unregistered).
+- **Faces that refuse a flag refuse it from the config too.** `serve`, `acp`,
+  `mcp` and `mission` refuse `--on-pretool`/`--on-posttool` (and `--on-turnend`
+  where the flag is refused), `--skill`, `--no-skills`, `--mcp-server` (and
+  `--plan-mode` on `mission`). A value that arrives from the config is refused
+  with the same message plus `use --no-config to ignore the project config`;
+  tole never silently drops a project's safety hook.
+- **Feature-less builds.** In a build without the `mcp` feature, `mcp_server` /
+  `no_auto_mcp` in the config is an error naming the key and the feature; without
+  `shell-tools` the same holds for the hook keys and `memory`.
 
 `tole config check` prints every key that is set with its effective value and
 where it came from (`flag`, `env VAR`, `config`, `default`), using the same
-resolution code as startup.
+resolution code as startup (lists show the effective list, booleans
+`effective: true (config)` or `(flag)`).
 
 The file is untrusted input (it lives in a cloned repo), so it needs a
 content-bound approval before it takes effect:

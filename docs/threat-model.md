@@ -271,11 +271,11 @@ the blast radius.
 ### Project config trust (#208)
 
 `<cwd>/.tole/config.toml` is untrusted input from a cloned repo: it may
-carry `allow`, `trust`, hooks and `mcp_server`. Part 2 added the trust
-machinery; part 3a wires the startup gate and applies ONLY the low-risk keys
-(`model`, `base_url`, `system_prompt`, `memory`, `sessions_dir`, `workspace`,
-`[mission]` budgets). The security-sensitive keys stay parsed-but-inert until
-part 3b:
+carry `allow`, `trust`, hooks, `skill` and `mcp_server`. Part 2 added the
+trust machinery, part 3a wired the startup gate and the low-risk keys, part 3b
+applies the security-sensitive ones (`trust`, `allow`, `mcp_server`,
+`on_pretool`/`on_posttool`/`on_turnend`, `skill`, `plan_mode`, `no_auto_mcp`,
+`no_skills`, `[mission]` `verify`/`verify_timeout`):
 
 - **Content-bound, outside the repo.** The approval is a snapshot of the exact
   file bytes in `$CODECORA_HOME/tole/trusted-configs.json` (default
@@ -310,9 +310,37 @@ part 3b:
 - **Secrets stay out.** The API key and serve token are env-only; the schema
   rejects secret-like keys, and `config check` prints only model/base_url
   values.
+- **Sensitive keys apply only after trust.** `allow`, `trust`, the hooks,
+  `mcp_server` and `skill` take effect through the SAME single startup path as
+  every other key: nothing from the file is read into the settings before the
+  gate passed, and `--no-config` drops all of them. A config `allow` / `trust`
+  list feeds the very same allowlist machinery as the flags.
+- **Destructive is never allowlistable via the config.** `allow = ["*"]`,
+  `allow = ["delete_file"]` or a trust preset cannot skip the Destructive
+  prompt on the interactive CLI (the approver checks `Destructive` before any
+  pattern), and on the non-interactive faces the Destructive tools remain
+  structurally unregistered. Tests drive the real binary with such a config and
+  assert the file survives.
+- **Faces that refuse hooks refuse config hooks too.** `serve`/`acp`/`mcp`
+  refuse `--on-pretool`/`--on-posttool` (and `mcp` `--on-turnend`), `mission`
+  refuses the hooks, `--plan-mode`, `--memory` and the client-session flags
+  (`--skill`, `--no-skills`, `--mcp-server`) on every one of these faces. The
+  check runs on the EFFECTIVE (post-config) values, so a safety hook or deny
+  policy arriving from the file makes the command fail loudly (with a
+  `--no-config` hint) instead of being silently ignored.
+- **Replace, never merge; booleans only up.** A higher layer replaces a whole
+  list key, so a flag cannot be "extended" by a hostile file; a boolean key is
+  `flag || config` (a flag cannot switch a config `true` off, `--no-config`
+  can).
+- **Unsupported keys are loud.** A build without the `mcp` feature rejects
+  `mcp_server`/`no_auto_mcp`, one without `shell-tools` the hook keys and
+  `memory`, naming the key and the feature.
 
-Residual risks: a user can still approve a malicious file at the prompt (it is
-shown in full, but a human decides); the trust store is a plain 0600 file in the
+Residual risks: a trusted config is trusted — a user who approves a malicious
+file at the prompt (or with `tole config trust --yes`, or names it with
+`--config`) grants exactly what the equivalent flags could grant (allowlisted
+Write tools, hooks that run as the user, MCP servers spawned as the user,
+skills injected into the prompt); it is shown in full, but a human decides; the trust store is a plain 0600 file in the
 user's home, so anything running as that user can edit it; the store update is
 an unlocked read-modify-write, so two concurrent `tole config trust` runs can
 lose one of the two records (the loser is simply asked again; the file itself

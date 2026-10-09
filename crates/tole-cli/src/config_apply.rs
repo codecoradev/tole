@@ -1,12 +1,15 @@
-//! Project config application (#208, part 3a of 4): startup wiring of the
-//! trust gate, the flag > env > config > default precedence framework and
-//! the LOW-RISK keys only (`model`, `base_url`, `system_prompt`, `memory`,
-//! `sessions_dir`, `workspace`, `[mission]` budgets).
+//! Project config application (#208, parts 3a + 3b): startup wiring of the
+//! trust gate and the flag > env > config > default precedence for EVERY
+//! key — the low-risk ones (`model`, `base_url`, `system_prompt`,
+//! `memory`, `sessions_dir`, `workspace`, `[mission]` budgets) and the
+//! security-sensitive ones (`trust`, `allow`, `mcp_server`, the hook lists,
+//! `skill`, `plan_mode`, `no_auto_mcp`, `no_skills`, `mission.verify`,
+//! `mission.verify_timeout`).
 //!
-//! The security-sensitive keys (`trust`, `allow`, `mcp_server`, the hook
-//! lists, `skill`, `plan_mode`, `no_auto_mcp`, `no_skills`, `mission.verify`,
-//! `mission.verify_timeout`) are validated by [`crate::config`] but are
-//! NEVER applied here — that is part 3b.
+//! Nothing here runs before the trust gate passed (there is ONE startup
+//! path, in `main`). List keys are replaced wholesale by the higher layer
+//! ([`resolve_list`]); boolean keys can only be turned ON by a flag
+//! ([`resolve_bool`]).
 //!
 //! Everything is a pure function of its inputs (flags, an injected env
 //! lookup, the parsed [`Config`]) so `tole config check` and startup run the
@@ -57,9 +60,8 @@ pub fn nonblank(v: Option<String>) -> Option<String> {
 }
 
 /// flag > env > config. `None` when no layer has a value (the caller then
-/// applies its default, or has none). Part 3b adds `resolve_list` (a higher
-/// layer replaces the whole list) and the "flags can only turn on" boolean
-/// next to this; both reuse [`Source`].
+/// applies its default, or has none). [`resolve_list`] and [`resolve_bool`]
+/// are the list / boolean flavors; all reuse [`Source`].
 pub fn resolve<T>(flag: Option<T>, env: Option<T>, cfg: Option<T>) -> Option<(T, Source)> {
     flag.map(|v| (v, Source::Flag))
         .or_else(|| env.map(|v| (v, Source::Env)))
@@ -89,6 +91,55 @@ pub fn resolve_string_or(
     default: &str,
 ) -> (String, Source) {
     resolve_string(flag, env, cfg).unwrap_or((default.to_string(), Source::Default))
+}
+
+/// LIST keys: the highest NON-EMPTY layer replaces the whole list (lists
+/// are never merged across layers). An empty flag list means "not given"
+/// (a repeatable clap flag cannot tell the difference), an empty env /
+/// config list likewise. `None` when every layer is empty.
+pub fn resolve_list<T: Clone>(
+    flag: &[T],
+    env: &[T],
+    cfg: Option<&[T]>,
+) -> Option<(Vec<T>, Source)> {
+    if !flag.is_empty() {
+        return Some((flag.to_vec(), Source::Flag));
+    }
+    if !env.is_empty() {
+        return Some((env.to_vec(), Source::Env));
+    }
+    match cfg {
+        Some(c) if !c.is_empty() => Some((c.to_vec(), Source::Config)),
+        _ => None,
+    }
+}
+
+/// BOOLEAN keys: a flag can only turn the setting ON — there is no flag
+/// that forces `false` — so `effective = flag || config`. A config `true`
+/// is dropped only by `--no-config` (or by editing / untrusting the file).
+/// The source is `flag` when the flag is given, else `config` when the file
+/// sets the key (`true` or `false`), else `default`.
+pub fn resolve_bool(flag: bool, cfg: Option<bool>) -> (bool, Source) {
+    if flag {
+        (true, Source::Flag)
+    } else if let Some(c) = cfg {
+        (c, Source::Config)
+    } else {
+        (false, Source::Default)
+    }
+}
+
+/// The values of a resolved list key (empty when no layer set it).
+pub fn values<T: Clone>(e: &ListEff<T>) -> Vec<T> {
+    e.as_ref().map(|e| e.value.clone()).unwrap_or_default()
+}
+
+/// Split a list-valued env variable (`TOLE_TRUST`) on commas / whitespace.
+pub fn split_env_list(v: &str) -> Vec<String> {
+    v.split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// Real environment lookup for [`Settings::resolve`].
@@ -274,10 +325,36 @@ pub struct Flags {
     pub max_steps: Option<u64>,
     pub max_minutes: Option<u64>,
     pub max_tokens: Option<u64>,
+    // ---- security-sensitive keys (3b). Lists: empty = not given.
+    /// `--trust` (global).
+    pub trust: Vec<String>,
+    /// The running subcommand's own `--allow` (each subcommand has one).
+    pub allow: Vec<String>,
+    /// `--mcp-server` (global; `mcp` feature only).
+    pub mcp_server: Vec<String>,
+    pub on_pretool: Vec<String>,
+    pub on_posttool: Vec<String>,
+    pub on_turnend: Vec<String>,
+    pub skill: Vec<PathBuf>,
+    /// Boolean flags: `true` only when the flag was given.
+    pub plan_mode: bool,
+    pub no_auto_mcp: bool,
+    pub no_skills: bool,
+    /// `mission --verify`.
+    pub verify: Option<String>,
+    /// `mission --verify-timeout` (`None` = not given; the clap default
+    /// is applied here, see [`DEFAULT_VERIFY_TIMEOUT_SECS`]).
+    pub verify_timeout: Option<u64>,
 }
 
-/// The resolved low-risk settings. Security-sensitive keys have NO field
-/// here by design (they are not applied until part 3b).
+/// `tole mission --verify-timeout` default.
+pub const DEFAULT_VERIFY_TIMEOUT_SECS: u64 = 300;
+
+/// A resolved list key (`None` = empty in every layer).
+pub type ListEff<T> = Option<Eff<Vec<T>>>;
+
+/// The resolved settings: low-risk keys (3a) and security-sensitive keys
+/// (3b), all through the SAME precedence functions.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
     pub sessions_dir: Eff<String>,
@@ -288,6 +365,19 @@ pub struct Settings {
     pub max_steps: Option<Eff<u64>>,
     pub max_minutes: Option<Eff<u64>>,
     pub max_tokens: Option<Eff<u64>>,
+    /// `--trust` / `TOLE_TRUST` / config `trust` (preset NAMES, unexpanded).
+    pub trust: ListEff<String>,
+    pub allow: ListEff<String>,
+    pub mcp_server: ListEff<String>,
+    pub on_pretool: ListEff<String>,
+    pub on_posttool: ListEff<String>,
+    pub on_turnend: ListEff<String>,
+    pub skill: ListEff<PathBuf>,
+    pub plan_mode: Eff<bool>,
+    pub no_auto_mcp: Eff<bool>,
+    pub no_skills: Eff<bool>,
+    pub verify: Option<Eff<String>>,
+    pub verify_timeout: Eff<u64>,
 }
 
 impl Settings {
@@ -302,6 +392,16 @@ impl Settings {
         let mission = cfg.mission.clone().unwrap_or_default();
         let num =
             |flag: Option<u64>, c: Option<u64>| resolve(flag, None, c).map(|(v, s)| Eff::new(v, s));
+        let list = |flag: &[String], c: &Option<Vec<String>>| {
+            resolve_list(flag, &[], c.as_deref()).map(|(v, s)| Eff::new(v, s))
+        };
+        let boolean = |flag: bool, c: Option<bool>| {
+            let (v, s) = resolve_bool(flag, c);
+            Eff::new(v, s)
+        };
+        let env_trust = env("TOLE_TRUST")
+            .map(|v| split_env_list(&v))
+            .unwrap_or_default();
         Settings {
             sessions_dir: Eff::new(sd, sd_src),
             workspace: resolve_string(flags.workspace.clone(), None, cfg.workspace.clone())
@@ -323,6 +423,34 @@ impl Settings {
             max_steps: num(flags.max_steps, mission.max_steps),
             max_minutes: num(flags.max_minutes, mission.max_minutes),
             max_tokens: num(flags.max_tokens, mission.max_tokens),
+            trust: resolve_list(&flags.trust, &env_trust, cfg.trust.as_deref())
+                .map(|p| Eff::from_pair(p, "TOLE_TRUST")),
+            allow: list(&flags.allow, &cfg.allow),
+            mcp_server: list(&flags.mcp_server, &cfg.mcp_server),
+            on_pretool: list(&flags.on_pretool, &cfg.on_pretool),
+            on_posttool: list(&flags.on_posttool, &cfg.on_posttool),
+            on_turnend: list(&flags.on_turnend, &cfg.on_turnend),
+            skill: {
+                let cfg_skill: Option<Vec<PathBuf>> = cfg
+                    .skill
+                    .as_ref()
+                    .map(|v| v.iter().map(PathBuf::from).collect());
+                resolve_list(&flags.skill, &[], cfg_skill.as_deref()).map(|(v, s)| Eff::new(v, s))
+            },
+            plan_mode: boolean(flags.plan_mode, cfg.plan_mode),
+            no_auto_mcp: boolean(flags.no_auto_mcp, cfg.no_auto_mcp),
+            no_skills: boolean(flags.no_skills, cfg.no_skills),
+            verify: resolve_string(flags.verify.clone(), None, mission.verify.clone())
+                .map(|(v, s)| Eff::new(v, s)),
+            verify_timeout: {
+                let (v, s) = resolve_or(
+                    flags.verify_timeout,
+                    None,
+                    mission.verify_timeout,
+                    DEFAULT_VERIFY_TIMEOUT_SECS,
+                );
+                Eff::new(v, s)
+            },
         }
     }
 
@@ -355,11 +483,13 @@ fn show_prompt(p: &str) -> String {
     }
 }
 
-const NOT_APPLIED: &str = "  (parsed, not applied yet — 3b)";
+/// Tail of a boolean key's `config check` line: a config value can only be
+/// raised by a flag, never lowered.
+const BOOL_NOTE: &str = "  (flags can only turn this on; --no-config drops the file)";
 
-/// Per-key suffixes for `tole config check`: applied keys get the
-/// effective value + its source, security-sensitive ones the "not applied"
-/// marker. Keys are the names [`crate::config::render_with`] uses.
+/// Per-key suffixes for `tole config check`: every key shows the effective
+/// value + its source. Keys are the names [`crate::config::render_with`]
+/// uses.
 pub fn annotations(s: &Settings) -> BTreeMap<&'static str, String> {
     let mut m = BTreeMap::new();
     let eff = |e: &Option<Eff<String>>, show: &dyn Fn(&str) -> String| match e {
@@ -370,6 +500,11 @@ pub fn annotations(s: &Settings) -> BTreeMap<&'static str, String> {
         Some(e) => format!("  effective: {}  {}", e.value, e.describe()),
         None => "  effective: (budget tier default)".to_string(),
     };
+    let list = |e: &ListEff<String>| match e {
+        Some(e) => format!("  effective: {}  {}", show_list(&e.value), e.describe()),
+        None => "  effective: (none)".to_string(),
+    };
+    let boolean = |e: &Eff<bool>| format!("  effective: {}  {}{BOOL_NOTE}", e.value, e.describe());
     m.insert("model", eff(&s.provider.model, &show_str));
     m.insert("base_url", eff(&s.provider.base_url, &show_str));
     m.insert(
@@ -384,31 +519,99 @@ pub fn annotations(s: &Settings) -> BTreeMap<&'static str, String> {
     #[cfg(feature = "shell-tools")]
     m.insert("memory", eff(&s.memory, &show_str));
     #[cfg(not(feature = "shell-tools"))]
-    m.insert(
-        "memory",
-        "  (parsed, not applied — needs the shell-tools feature)".to_string(),
-    );
+    m.insert("memory", NEEDS_SHELL_TOOLS.to_string());
     m.insert("system_prompt", eff(&s.system_prompt, &show_prompt));
     m.insert("mission.max_steps", num(&s.max_steps));
     m.insert("mission.max_minutes", num(&s.max_minutes));
     m.insert("mission.max_tokens", num(&s.max_tokens));
-    for k in [
-        "plan_mode",
-        "trust",
-        "allow",
-        "mcp_server",
-        "no_auto_mcp",
-        "on_pretool",
-        "on_posttool",
-        "on_turnend",
-        "skill",
-        "no_skills",
-        "mission.verify",
-        "mission.verify_timeout",
-    ] {
-        m.insert(k, NOT_APPLIED.to_string());
+    m.insert("plan_mode", boolean(&s.plan_mode));
+    m.insert("trust", list(&s.trust));
+    m.insert("allow", list(&s.allow));
+    #[cfg(feature = "mcp")]
+    {
+        m.insert("mcp_server", list(&s.mcp_server));
+        m.insert("no_auto_mcp", boolean(&s.no_auto_mcp));
     }
+    #[cfg(not(feature = "mcp"))]
+    for k in ["mcp_server", "no_auto_mcp"] {
+        m.insert(k, NEEDS_MCP.to_string());
+    }
+    #[cfg(feature = "shell-tools")]
+    {
+        m.insert("on_pretool", list(&s.on_pretool));
+        m.insert("on_posttool", list(&s.on_posttool));
+        m.insert("on_turnend", list(&s.on_turnend));
+    }
+    #[cfg(not(feature = "shell-tools"))]
+    for k in ["on_pretool", "on_posttool", "on_turnend"] {
+        m.insert(k, NEEDS_SHELL_TOOLS.to_string());
+    }
+    m.insert(
+        "skill",
+        match &s.skill {
+            Some(e) => {
+                let shown: Vec<String> = e.value.iter().map(|p| p.display().to_string()).collect();
+                format!("  effective: {}  {}", show_list(&shown), e.describe())
+            }
+            None => "  effective: (none)".to_string(),
+        },
+    );
+    m.insert("no_skills", boolean(&s.no_skills));
+    m.insert("mission.verify", eff(&s.verify, &show_str));
+    m.insert(
+        "mission.verify_timeout",
+        format!(
+            "  effective: {}  {}",
+            s.verify_timeout.value,
+            s.verify_timeout.describe()
+        ),
+    );
     m
+}
+
+#[cfg(not(feature = "shell-tools"))]
+const NEEDS_SHELL_TOOLS: &str =
+    "  (not supported by this build: needs the shell-tools feature; startup refuses it)";
+#[cfg(not(feature = "mcp"))]
+const NEEDS_MCP: &str =
+    "  (not supported by this build: needs the mcp feature; startup refuses it)";
+
+fn show_list(items: &[String]) -> String {
+    let inner: Vec<String> = items.iter().map(|i| show_str(i)).collect();
+    format!("[{}]", inner.join(", "))
+}
+
+/// The first config key this BUILD cannot honor, as a loud startup error
+/// message (never a silent ignore). `mcp` / `shell_tools` are the build's
+/// features, injected so every combination is unit-testable.
+pub fn unsupported_keys(cfg: &Config, mcp: bool, shell_tools: bool) -> Option<String> {
+    let need = |key: &str, feature: &str| {
+        Some(format!(
+            "project config key `{key}` needs the `{feature}` feature, which this build of \
+             tole lacks (remove the key, or use --no-config to ignore the project config)"
+        ))
+    };
+    if !mcp {
+        if cfg.mcp_server.is_some() {
+            return need("mcp_server", "mcp");
+        }
+        if cfg.no_auto_mcp.is_some() {
+            return need("no_auto_mcp", "mcp");
+        }
+    }
+    if !shell_tools {
+        for (key, set) in [
+            ("on_pretool", cfg.on_pretool.is_some()),
+            ("on_posttool", cfg.on_posttool.is_some()),
+            ("on_turnend", cfg.on_turnend.is_some()),
+            ("memory", cfg.memory.is_some()),
+        ] {
+            if set {
+                return need(key, "shell-tools");
+            }
+        }
+    }
+    None
 }
 
 /// `tole config check`: validate + render with effective values. Runs the
