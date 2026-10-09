@@ -9,7 +9,7 @@ Durable Rust agent harness: a conversational agent with risk-tiered approval
 gates, a write-once JSONL session log, and a register state machine — resumable
 after crashes, replayable forever.
 
-**Status:** v0.8.0 released — it adds the per-project config `.tole/config.toml`
+**Status:** v0.8.1 released — it adds token-usage reporting and a capped, resumable `read_file` (#211) on top of v0.8.0, which added the per-project config `.tole/config.toml`
 (trusted before it applies; see the Configuration section) on top of v0.7.x
 (rescan-2 hardening, one tool-call authorization gate; see the CHANGELOG for
 the behavior changes). Four faces on one durable core: the CLI (run / chat /
