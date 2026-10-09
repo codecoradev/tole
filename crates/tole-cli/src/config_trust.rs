@@ -68,31 +68,16 @@ pub enum TrustStatus {
     Changed,
 }
 
-/// Store location: `$CODECORA_HOME/tole/trusted-configs.json`, else
-/// `$HOME|$USERPROFILE/.codecora/tole/trusted-configs.json` (the layout
-/// `skills.rs` uses; tole-core's helpers are private, and widening its
-/// published API for three lines was not worth it). Unlike skills there is
-/// NO fallback to the cwd: a store inside the (possibly hostile) project
-/// would defeat the whole point, so a missing home is an error.
+/// Store location: `<codecora root>/tole/trusted-configs.json`, the root
+/// coming from tole-core's single shared resolver
+/// ([`tole_core::paths::tole_data_dir`]: `$CODECORA_HOME`, else
+/// `$HOME|$USERPROFILE/.codecora`; empty = unset, relative refused). There
+/// is NO fallback to the cwd: a store inside the (possibly hostile) project
+/// would defeat the whole point, so an unresolvable home is an error.
 pub fn default_store_path() -> Result<PathBuf> {
-    // Empty counts as unset, and a RELATIVE root is refused: either would
-    // resolve against the cwd, i.e. into the (possibly hostile) project.
-    let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
-    let root = var("CODECORA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| {
-            var("HOME")
-                .or_else(|| var("USERPROFILE"))
-                .map(|h| PathBuf::from(h).join(".codecora"))
-        })
-        .ok_or_else(|| anyhow!("cannot locate the trust store: set CODECORA_HOME or HOME"))?;
-    if !root.is_absolute() {
-        bail!(
-            "cannot locate the trust store: {} is not an absolute path",
-            root.display()
-        );
-    }
-    Ok(root.join("tole").join(STORE_FILE))
+    tole_core::paths::tole_data_dir()
+        .map(|d| d.join(STORE_FILE))
+        .ok_or_else(|| anyhow!("cannot locate the trust store: set CODECORA_HOME or HOME"))
 }
 
 fn store_err(path: &Path, what: &str) -> anyhow::Error {
