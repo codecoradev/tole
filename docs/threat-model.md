@@ -267,3 +267,31 @@ crafted page CAN steer a mission via prompt injection; the mitigation
 is the same as every other untrusted input: tool-result fencing,
 approval gates on anything that matters, and mission budgets bounding
 the blast radius.
+
+### Project config trust (#208)
+
+`<cwd>/.tole/config.toml` is untrusted input from a cloned repo: it may
+carry `allow`, `trust`, hooks and `mcp_server`. Part 2 adds the trust
+machinery (not yet applied to sessions — part 3 wires the startup gate):
+
+- **Content-bound, outside the repo.** The approval is a snapshot of the exact
+  file bytes in `$CODECORA_HOME/tole/trusted-configs.json` (default
+  `~/.codecora`), keyed by canonical project directory. Any byte change
+  (including whitespace or CRLF) makes it untrusted again; the repo cannot
+  pre-trust itself. There is no home-less fallback: with no `CODECORA_HOME`
+  or `HOME` tole errors instead of writing a store next to the project.
+- **Terminal-safe prompt.** The path, the full content and the diff against the
+  previously trusted version are attacker-controlled text shown to a human at
+  the decision. Control characters (ESC, CR, NUL, DEL, C1), bidi
+  overrides/isolates, line/paragraph separators and zero-width characters are
+  printed as visible `\u{hex}` escapes, so the prompt cannot be rewritten.
+- **Fail closed.** Without a terminal there is no question: the answer is an
+  error naming the file and `tole config trust`. A corrupt, unreadable or
+  unsupported-version store is a hard error and is never overwritten.
+  `tole config trust` refuses a file that does not validate.
+- **Explicit path = intent.** A file named on the command line (`--config`) is
+  user intent and does not consult the store (enforced in part 3).
+
+Residual risks: a user can still approve a malicious file at the prompt (it is
+shown in full, but a human decides); the trust store is a plain 0600 file in the
+user's home, so anything running as that user can edit it.

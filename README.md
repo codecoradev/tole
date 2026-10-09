@@ -121,10 +121,30 @@ trust: `internal` / `read_only`), `--skill <path>` (load a SKILL.md),
 
 `tole config check` validates a project config file, `<cwd>/.tole/config.toml`
 (or `--config <path>`; no parent-directory walk), and prints every key that is
-set. **Nothing is applied yet:** this is part 1 of 3 of #208 — the file is only
-loaded and validated, and flags, env and runtime behavior are unchanged. Trust
-(a content-bound approval before a project file may take effect) and the
-flag > env > config precedence come in the next parts.
+set. **Nothing is applied yet:** this is part 2 of 3 of #208 — the file is only
+loaded, validated and (optionally) trusted; flags, env and runtime behavior are
+unchanged. Startup gating, `--config`/`--no-config` as global flags and the
+flag > env > config precedence come in the next part.
+
+The file is untrusted input (it lives in a cloned repo), so it needs a
+content-bound approval before it may ever take effect:
+
+- `tole config trust [--config <path>] [--yes]` validates the file, prints its
+  path and FULL content (plus a line diff against the previously trusted
+  version) with control and bidi characters escaped, then asks `[y/N]`.
+  Without a terminal it refuses unless `--yes` is given (the content is still
+  printed).
+- The approval is stored outside the repo in
+  `$CODECORA_HOME/tole/trusted-configs.json` (default `~/.codecora`, mode 0600)
+  as a snapshot of the file keyed by canonical project directory. A config is
+  trusted only while its bytes are identical to that snapshot; any edit makes it
+  untrusted again.
+- `tole config untrust [--config <path>]` removes the record (no error if
+  absent). `tole config check` prints `trust: trusted`, `trust: NOT trusted` or
+  `trust: CHANGED since it was trusted`; its exit code stays 0 for a valid file
+  whatever the trust state.
+- A corrupt or unsupported-version store is an error naming the file; tole never
+  overwrites it.
 
 The schema is strict (unknown keys, wrong types, malformed TOML, unknown `trust`
 presets and files over 64 KiB are errors, reported as `path:line:col: message`).
