@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-10-09
+
 ### Added
 - Project config `.tole/config.toml` (#208): per-directory defaults for `model`, `base_url`,
   `system_prompt`, `memory`, `sessions_dir`, `workspace`, `trust`, `allow`, `mcp_server`, the
