@@ -42,7 +42,7 @@ meaning). Its shape — every unknown value is `null`, never a fabricated 0:
 
 | Field | Meaning |
 |---|---|
-| `steps` | provider steps recorded (the same count the mission step budget uses) |
+| `steps` | provider steps that reported usage (the same count the mission step budget uses; rows holding only `tole_wire` are not counted) |
 | `prompt_tokens`, `completion_tokens` | sums over the usage ledger |
 | `reasoning_tokens` | sum of `completion_tokens_details.reasoning_tokens`; `null` if no step reported it |
 | `cached_tokens` | sum of cached prompt tokens (`prompt_tokens_details.cached_tokens`, falling back to `cached_read_tokens` and the other gateway spellings); `null` if no step reported it |

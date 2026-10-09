@@ -152,7 +152,9 @@ fn run_verify(cmd: &str, timeout: std::time::Duration) -> Result<(), String> {
 
 /// Snapshot the durable usage ledger (provider steps so far).
 fn steps_used(storage: &JsonlStorage) -> u64 {
-    storage.usages().len() as u64
+    // Wire-only rows (#211: request sizes without provider usage) are not
+    // provider steps — budget semantics are exactly as before.
+    tole_cli::usage_report::provider_steps(storage.usages())
 }
 
 /// Tokens (prompt + completion) recorded in the durable ledger.
@@ -449,7 +451,75 @@ pub fn run_mission(
 
 #[cfg(test)]
 mod budget_tests {
-    use super::BudgetTier;
+    use super::{steps_used, tokens_used, BudgetTier};
+    use serde_json::{json, Value};
+    use tole_core::entry::Entry;
+    use tole_core::provider::{Provider, ProviderError, ProviderOutput};
+    use tole_core::storage::{JsonlStorage, Storage};
+    use tole_core::tool::ToolRegistry;
+    use tole_core::turn::run_turn;
+
+    /// Reports request sizes (#211) and, optionally, provider usage.
+    struct Wired {
+        usage: Option<Value>,
+    }
+    impl Provider for Wired {
+        fn complete(&mut self, _t: &[Entry]) -> Result<ProviderOutput, ProviderError> {
+            Ok(ProviderOutput::Final { text: "ok".into() })
+        }
+        fn last_usage(&self) -> Option<Value> {
+            self.usage.clone()
+        }
+        fn last_wire_stats(&self) -> Option<Value> {
+            Some(json!({"system_chars": 1, "tools_chars": 2, "history_chars": 3, "messages": 1}))
+        }
+    }
+
+    fn store(tag: &str) -> JsonlStorage {
+        let d = std::env::temp_dir().join(format!(
+            "tole-budget-{tag}-{}-{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        JsonlStorage::create(&d, "b", None).unwrap()
+    }
+
+    /// #211 invariant: a gateway that reports NO usage leaves wire-only
+    /// ledger rows, which must not count as steps or tokens — the step
+    /// and token budgets behave exactly as before.
+    #[test]
+    fn wire_only_rows_do_not_move_step_or_token_budgets() {
+        let mut s = store("wire-only");
+        let reg = ToolRegistry::new();
+        let mut p = Wired { usage: None };
+        for t in ["a", "b", "c"] {
+            run_turn(&mut s, &mut p, &reg, t).unwrap();
+        }
+        assert_eq!(s.usages().len(), 3, "rows are stored (PR 2 needs them)");
+        assert_eq!(steps_used(&s), 0);
+        assert_eq!(tokens_used(&s), 0);
+    }
+
+    /// Mixed ledger: only rows with provider usage are steps.
+    #[test]
+    fn mixed_ledger_counts_only_provider_usage_steps() {
+        let mut s = store("mixed");
+        let reg = ToolRegistry::new();
+        run_turn(&mut s, &mut Wired { usage: None }, &reg, "a").unwrap();
+        let mut with = Wired {
+            usage: Some(json!({"prompt_tokens": 10, "completion_tokens": 4})),
+        };
+        run_turn(&mut s, &mut with, &reg, "b").unwrap();
+        run_turn(&mut s, &mut Wired { usage: None }, &reg, "c").unwrap();
+        run_turn(&mut s, &mut with, &reg, "d").unwrap();
+        assert_eq!(s.usages().len(), 4);
+        assert_eq!(steps_used(&s), 2);
+        assert_eq!(tokens_used(&s), 28);
+    }
 
     /// Issue #201: explicit flags win per-field; the trusted tier only
     /// fills where the operator gave nothing.

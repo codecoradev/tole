@@ -27,7 +27,7 @@ pub struct WirePoint {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct UsageReport {
-    /// Provider steps recorded (`usages().len()`, same as the mission
+    /// Provider steps with reported usage (`provider_steps`, same as the mission
     /// step budget counts).
     pub steps: u64,
     pub prompt_tokens: u64,
@@ -50,6 +50,24 @@ pub struct UsageReport {
     /// History growth in characters per step between `wire_first` and
     /// `wire_last` (None unless they are different steps).
     pub history_growth_per_step: Option<f64>,
+}
+
+/// True when the ledger row carries a provider-reported usage object,
+/// i.e. it is NOT a wire-only row (`{"tole_wire": ...}` and nothing
+/// else, stored when a provider reports request sizes but no usage).
+/// The single definition of "provider step" for the mission step budget,
+/// `fact/mission.steps` and the report, so wire-only rows never change
+/// step accounting (#211).
+pub fn reports_provider_usage(rec: &UsageRecord) -> bool {
+    match rec.usage.as_object() {
+        Some(o) => !(o.len() == 1 && o.contains_key("tole_wire")),
+        None => true,
+    }
+}
+
+/// Number of provider steps in a ledger (see `reports_provider_usage`).
+pub fn provider_steps(usages: &[UsageRecord]) -> u64 {
+    usages.iter().filter(|u| reports_provider_usage(u)).count() as u64
 }
 
 fn u64_at(v: &Value, path: &[&str]) -> Option<u64> {
@@ -91,7 +109,7 @@ fn wire_of(u: &Value) -> Option<WirePoint> {
 /// malformed fields are treated as unknown.
 pub fn usage_report(usages: &[UsageRecord]) -> UsageReport {
     let mut r = UsageReport {
-        steps: usages.len() as u64,
+        steps: provider_steps(usages),
         prompt_tokens: 0,
         completion_tokens: 0,
         reasoning_tokens: 0,
@@ -289,6 +307,31 @@ mod tests {
         assert_eq!(j["wire"]["last"]["prefix_chars"], json!(1000));
         assert_eq!(j["wire"]["history_growth_per_step"], json!(100.0));
         assert!(r.render_lines().join("\n").contains("+100.0 chars/step"));
+    }
+
+    #[test]
+    fn wire_only_rows_do_not_count_as_provider_steps() {
+        let wire_only = rec(json!({"tole_wire": wire(1, 2, 3)}));
+        assert!(!reports_provider_usage(&wire_only));
+        assert!(reports_provider_usage(&rec(json!({"prompt_tokens": 1}))));
+        assert!(
+            reports_provider_usage(&rec(json!({}))),
+            "empty object counted before #211"
+        );
+        assert!(reports_provider_usage(&rec(
+            json!({"prompt_tokens": 1, "tole_wire": wire(1, 2, 3)})
+        )));
+        let mixed = [
+            rec(json!({"prompt_tokens": 5, "tole_wire": wire(1, 2, 3)})),
+            wire_only.clone(),
+            rec(json!({"prompt_tokens": 7})),
+        ];
+        assert_eq!(provider_steps(&mixed), 2);
+        let r = usage_report(&mixed);
+        assert_eq!(r.steps, 2);
+        assert_eq!(r.prompt_tokens, 12);
+        // Wire points still span ALL rows that carry tole_wire.
+        assert!(r.wire_first.is_some() && r.wire_last.is_some());
     }
 
     #[test]
