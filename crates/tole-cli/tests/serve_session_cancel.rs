@@ -298,3 +298,46 @@ fn serve_cancel_mid_provider_settles_cancelled_and_resumable() {
     assert_eq!(code, 200, "{resp}");
     assert_eq!(resp["stopReason"].as_str(), Some("end_turn"), "{resp}");
 }
+
+/// #211: `GET /sessions/{id}/status` gains an ADDITIVE `usage_report`
+/// object; the pre-existing keys stay. A fresh session reports zero
+/// steps and `null` for what was never measured; after a turn the real
+/// provider's per-step wire split is there.
+#[test]
+fn serve_status_json_has_additive_usage_report() {
+    let base = spawn_mock();
+    let serve = ServeProcess::spawn(&base);
+    let (_, created) = serve.request("POST", "/sessions", "{}").unwrap();
+    let sid = created["sessionId"].as_str().unwrap().to_string();
+
+    let (code, st) = serve
+        .request("GET", &format!("/sessions/{sid}/status"), "")
+        .unwrap();
+    assert_eq!(code, 200, "{st}");
+    assert_eq!(st["id"], json!(sid));
+    assert!(st.get("entries").is_some() && st.get("busy").is_some());
+    assert_eq!(st["usage_report"]["steps"], json!(0), "{st}");
+    assert_eq!(st["usage_report"]["cached_tokens"], Value::Null, "{st}");
+    assert_eq!(st["usage_report"]["wire"], Value::Null, "{st}");
+
+    let (code, resp) = serve
+        .request(
+            "POST",
+            &format!("/sessions/{sid}/prompt"),
+            r#"{"text": "quick"}"#,
+        )
+        .unwrap();
+    assert_eq!(code, 200, "{resp}");
+
+    let (_, st) = serve
+        .request("GET", &format!("/sessions/{sid}/status"), "")
+        .unwrap();
+    let r = &st["usage_report"];
+    assert_eq!(r["steps"], json!(1), "{st}");
+    assert_eq!(r["prompt_tokens"], json!(1), "{st}");
+    assert_eq!(r["completion_tokens"], json!(1), "{st}");
+    let first = &r["wire"]["first"];
+    assert!(first["history_chars"].as_u64().unwrap() > 0, "{st}");
+    assert!(first["prefix_chars"].as_u64().unwrap() > 0, "{st}");
+    assert_eq!(r["wire"]["history_growth_per_step"], Value::Null, "{st}");
+}

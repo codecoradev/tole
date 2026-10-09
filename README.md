@@ -9,10 +9,10 @@ Durable Rust agent harness: a conversational agent with risk-tiered approval
 gates, a write-once JSONL session log, and a register state machine — resumable
 after crashes, replayable forever.
 
-**Status:** v0.7.2 released; v0.8.0 is release-candidate on `develop` — it adds
-the per-project config `.tole/config.toml` (trusted before it applies; see the
-Configuration section) on top of v0.7.x (rescan-2 hardening, one tool-call
-authorization gate; see the CHANGELOG for the behavior changes). Four faces on one durable core: the CLI (run / chat /
+**Status:** v0.8.1 released — it adds token-usage reporting and a capped, resumable `read_file` (#211) on top of v0.8.0, which added the per-project config `.tole/config.toml`
+(trusted before it applies; see the Configuration section) on top of v0.7.x
+(rescan-2 hardening, one tool-call authorization gate; see the CHANGELOG for
+the behavior changes). Four faces on one durable core: the CLI (run / chat /
 resume / sessions / jobs / **mission**), `tole mcp` (tool server),
 `tole acp` (editor agent), and `tole serve` (REST + multi-session
 MCP-over-HTTP daemon). Identity (owner-approved): a chat-first
@@ -93,7 +93,7 @@ tole chat --memory uteke                    # …with cross-session memory
 tole chat --resume <id>                     # pick the thread back up (also: --last)
 tole resume <id> "next instruction"         # continue a settled session
 tole sessions                               # list durable sessions
-tole status <id>                            # pc / seq / turns / token usage
+tole status <id>                            # pc / seq / turns / token + cache usage / request-size split
 ```
 
 Sessions live in `.tole/sessions/<id>.jsonl` (override with
@@ -219,7 +219,7 @@ hard error.
 
 | Tool | Risk | Notes |
 |------|------|-------|
-| `read_file`, `write_file`, `edit_file` | RO / Write | jailed to `--workspace` (TOCTOU-safe, symlink-refusing) |
+| `read_file`, `write_file`, `edit_file` | RO / Write | jailed to `--workspace` (TOCTOU-safe, symlink-refusing); `read_file` returns at most 20,000 chars per call (`offset`/`limit` in chars, `next_offset` to continue) |
 | `delete_file` | Destructive | always prompts; never allowlistable, even with `--yes` |
 | `git` | Write | `status` / `diff` / `add` / `commit` only — **push stays human** |
 | `gh` | Write | read-only ops, argv-validated per op; `repo` defaults to the checkout's GitHub remote, optional per-call override (validated) |
@@ -278,7 +278,13 @@ cap; expiry cancels at a checkpoint — resumable, never dead).
 Budget tiers (#201): conservative defaults (48 steps / 15 min / 200k
 tokens) with headroom under `--trust internal` (96 / 30 / 500k) —
 explicit flags always win; a durable cost report (turns, steps, tokens,
-per-risk-tier tool calls) lands on the session and `tole status` renders it.
+per-risk-tier tool calls, cached tokens) lands on the session and `tole status` renders it.
+`tole status` (and `GET /sessions/{id}/status`, as `usage_report`) also shows
+the usage derived from the ledger for any session: prompt / completion /
+reasoning / cached tokens, the cache-hit rate, and the request size in
+characters split into system+tools vs history at the first and last step
+(#211; recorded per step under `tole_wire`; sessions recorded before it read
+`n/a`). Reported only — `--max-tokens` accounting is unchanged.
 
 ## Approval gates
 

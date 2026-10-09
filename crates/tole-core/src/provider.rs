@@ -67,4 +67,15 @@ pub trait Provider {
     fn last_reasoning(&self) -> Option<String> {
         None
     }
+
+    /// Request-size breakdown for the LAST `complete()` call (issue
+    /// #211): `{system_chars, tools_chars, history_chars, messages}`,
+    /// measured on the request body before any streaming envelope (see
+    /// `openai::wire_stats`). Like `last_usage`, it describes THIS call
+    /// only — providers reset it per call. The turn loop stores it under
+    /// the namespaced `tole_wire` key of the usage record. Default None:
+    /// mocks and providers without a wire notion add nothing.
+    fn last_wire_stats(&self) -> Option<Value> {
+        None
+    }
 }

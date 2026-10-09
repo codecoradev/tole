@@ -59,6 +59,9 @@ fn new_list_status_roundtrip() {
         .execute(json!({"session_id": sid_a}))
         .unwrap();
     assert_eq!(st["busy"], json!(false));
+    // #211: additive usage report object (fresh session: no steps).
+    assert_eq!(st["usage_report"]["steps"], json!(0), "{st}");
+    assert_eq!(st["usage_report"]["wire"], json!(null), "{st}");
 }
 
 #[test]

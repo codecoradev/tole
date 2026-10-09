@@ -16,7 +16,7 @@ rate-limited per source IP).
 |---|---|---|
 | List sessions | `GET /sessions` | id + busy per session |
 | Start a mission | `POST /sessions` `{cwd}` → `POST /sessions/{id}/prompt` `{text}` | the prompt is the mission goal (`tole mission` semantics chain turns; a serve prompt runs ONE turn — mission chaining over serve is a follow-up) |
-| Mission status | `GET /sessions/{id}/status` | busy flag, entry count, usage totals, mission cost report (`fact/mission` register, #201) |
+| Mission status | `GET /sessions/{id}/status` | busy flag, entry count, `usage_report` (tokens, cache-hit rate, request-size split; #211), mission cost report (`fact/mission` register, #201) |
 | **Pending approvals** | `GET /approvals` | queue entries: id, session, tool, status; expires to denied after 15 min |
 | **Approve / deny** | `POST /approvals/{id}/decision` `{"decision":"allow"\|"deny"}` | allow = one-shot for exactly that (session, tool+input) + automatic resume; deny = recorded verdict |
 | Cancel a turn | `POST /sessions/{id}/cancel` (#178) | the turn settles `cancelled`, durably |
@@ -31,6 +31,28 @@ The round trip the app must support (the cross-repo acceptance):
 3. `POST /approvals/{id}/decision` — allow or deny.
 4. `202` (allow) means the resume is running; `GET /sessions/{id}/status`
    until `busy` clears.
+
+## Status JSON fields
+
+`GET /sessions/{id}/status` returns `{id, entries, busy, usage_report}`.
+`entries` and `usage_report` are `null` while a turn is in flight (the
+session storage is busy). `usage_report` was added by #211 and is purely
+additive: clients must ignore unknown fields (the existing three keep their
+meaning). Its shape — every unknown value is `null`, never a fabricated 0:
+
+| Field | Meaning |
+|---|---|
+| `steps` | provider steps that reported usage (the same count the mission step budget uses; rows holding only `tole_wire` are not counted) |
+| `prompt_tokens`, `completion_tokens` | sums over the usage ledger |
+| `reasoning_tokens` | sum of `completion_tokens_details.reasoning_tokens`; `null` if no step reported it |
+| `cached_tokens` | sum of cached prompt tokens (`prompt_tokens_details.cached_tokens`, falling back to `cached_read_tokens` and the other gateway spellings); `null` if no step reported it |
+| `cache_hit_rate` | cached / prompt over the steps that reported cached tokens; `null` if unknown |
+| `wire` | `null` for sessions recorded before #211, else `{first, last, history_growth_per_step}`; `first`/`last` = `{prefix_chars, system_chars, tools_chars, history_chars, messages}` of the first/last step that has it (characters, not bytes; `prefix_chars` = system + tools) |
+
+The mission cost report (`fact/mission`) is rendered by `tole status`; it
+gained an additive `cached_tokens` (`null` when no step reported it). The
+MCP/ACP `tole_session_status` tool returns the same `usage_report` next to
+`busy` and `entries`.
 
 ## Auth model
 

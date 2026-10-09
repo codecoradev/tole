@@ -123,6 +123,153 @@ fn usage_rows_are_written_durably_per_step() {
     assert_eq!(total_in, 200);
 }
 
+/// Mock reporting a per-step wire breakdown (issue #211) next to an
+/// optional provider usage object. `stats` is consumed one per step.
+struct WireMock {
+    step: usize,
+    outputs: Vec<ProviderOutput>,
+    usage: Option<Value>,
+    stats: Vec<Value>,
+}
+impl Provider for WireMock {
+    fn complete(&mut self, _t: &[Entry]) -> Result<ProviderOutput, ProviderError> {
+        let out = self
+            .outputs
+            .get(self.step)
+            .cloned()
+            .ok_or_else(|| ProviderError("exhausted".into()));
+        self.step += 1;
+        out
+    }
+    fn last_usage(&self) -> Option<Value> {
+        self.usage.clone()
+    }
+    fn last_wire_stats(&self) -> Option<Value> {
+        self.stats.get(self.step - 1).cloned()
+    }
+}
+
+fn wire_json(n: u64) -> Value {
+    json!({"system_chars": n, "tools_chars": n * 2, "history_chars": n * 3, "messages": n})
+}
+
+#[test]
+fn wire_stats_are_merged_into_usage_under_tole_wire_and_provider_keys_survive() {
+    let dir = tmpdir("usage-wire");
+    let mut s = JsonlStorage::create(&dir, "uw", None).unwrap();
+    let mut p = WireMock {
+        step: 0,
+        outputs: vec![
+            ProviderOutput::ToolCall {
+                tool: "echo".into(),
+                input: json!({"n": 1}),
+            },
+            ProviderOutput::Final {
+                text: "done".into(),
+            },
+        ],
+        usage: Some(json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 7,
+            "prompt_tokens_details": {"cached_tokens": 64},
+        })),
+        stats: vec![wire_json(1), wire_json(2)],
+    };
+    let mut reg = ToolRegistry::new();
+    reg.register(Box::new(EchoTool)).unwrap();
+    run_turn(&mut s, &mut p, &reg, "hi").unwrap();
+    let usages = s.usages();
+    assert_eq!(usages.len(), 2);
+    for (i, u) in usages.iter().enumerate() {
+        assert_eq!(u.usage["tole_wire"], wire_json(i as u64 + 1), "step {i}");
+        // Provider keys are untouched.
+        assert_eq!(u.usage["prompt_tokens"], json!(100));
+        assert_eq!(u.usage["completion_tokens"], json!(7));
+        assert_eq!(u.usage["prompt_tokens_details"]["cached_tokens"], json!(64));
+    }
+    // Ledger consumers are unaffected: same step count, same token sums.
+    let total_in: u64 = usages
+        .iter()
+        .filter_map(|u| u.usage.get("prompt_tokens").and_then(|v| v.as_u64()))
+        .sum();
+    assert_eq!(total_in, 200);
+}
+
+#[test]
+fn wire_stats_without_provider_usage_store_a_tole_wire_only_record() {
+    let dir = tmpdir("usage-wire-only");
+    let mut s = JsonlStorage::create(&dir, "uwo", None).unwrap();
+    let mut p = WireMock {
+        step: 0,
+        outputs: vec![ProviderOutput::Final { text: "f".into() }],
+        usage: None,
+        stats: vec![wire_json(5)],
+    };
+    let mut reg = ToolRegistry::new();
+    reg.register(Box::new(EchoTool)).unwrap();
+    run_turn(&mut s, &mut p, &reg, "hi").unwrap();
+    let usages = s.usages();
+    assert_eq!(usages.len(), 1, "still one ledger row = one step");
+    assert_eq!(usages[0].usage, json!({"tole_wire": wire_json(5)}));
+    // A consumer summing prompt/completion tokens reads 0 from it.
+    let tokens: u64 = usages
+        .iter()
+        .map(|u| {
+            u.usage
+                .get("prompt_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+                + u.usage
+                    .get("completion_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0)
+        })
+        .sum();
+    assert_eq!(tokens, 0);
+}
+
+/// Stored numbers equal `wire_stats` of the REAL request body for a
+/// known transcript (fixed system prompt, 2 tools, one user message).
+#[test]
+fn stored_wire_numbers_equal_wire_stats_of_the_request_body() {
+    use tole_core::openai::{wire_stats, OpenAiConfig, OpenAiProvider};
+    struct BodyMeasuring {
+        inner: OpenAiProvider,
+        last: Option<Value>,
+    }
+    impl Provider for BodyMeasuring {
+        fn complete(&mut self, t: &[Entry]) -> Result<ProviderOutput, ProviderError> {
+            self.last = Some(wire_stats(&self.inner.request_body(t)).to_value());
+            Ok(ProviderOutput::Final { text: "ok".into() })
+        }
+        fn last_wire_stats(&self) -> Option<Value> {
+            self.last.clone()
+        }
+    }
+    let specs = vec![
+        json!({"type":"function","function":{"name":"a","description":"d","parameters":{}}}),
+        json!({"type":"function","function":{"name":"b","description":"d","parameters":{}}}),
+    ];
+    let inner = OpenAiProvider::new(OpenAiConfig::new("https://x/v1", "m", "k"))
+        .with_system_prompt("You are tole.")
+        .with_tool_specs(specs);
+    let mut p = BodyMeasuring { inner, last: None };
+    let dir = tmpdir("usage-wire-golden");
+    let mut s = JsonlStorage::create(&dir, "uwg", Some("You are tole.".into())).unwrap();
+    let mut reg = ToolRegistry::new();
+    reg.register(Box::new(EchoTool)).unwrap();
+    run_turn(&mut s, &mut p, &reg, "hi").unwrap();
+    let usages = s.usages();
+    assert_eq!(usages.len(), 1);
+    let tools_len = r#"[{"function":{"description":"d","name":"a","parameters":{}},"type":"function"},{"function":{"description":"d","name":"b","parameters":{}},"type":"function"}]"#
+        .chars()
+        .count();
+    assert_eq!(
+        usages[0].usage["tole_wire"],
+        json!({"system_chars": 13, "tools_chars": tools_len, "history_chars": 30, "messages": 2})
+    );
+}
+
 #[test]
 fn no_usage_rows_without_provider_usage() {
     let dir = tmpdir("usage-none");

@@ -544,17 +544,22 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                     // blocking status on it would pin the endpoint (and
                     // the map) for the entire turn (CodeCora scan
                     // 2026-09-28). try_lock keeps this non-blocking.
-                    let (busy, entries) = {
+                    let (busy, entries, report) = {
                         let sessions = lock_sessions(&state.sessions);
                         let Some(st) = sessions.map.get(id) else {
                             return (404, json!({"error": "unknown session"}));
                         };
                         let busy = *st.busy.lock().expect("busy lock");
-                        let entries = match st.storage.try_lock() {
-                            Ok(guard) => Some(guard.entries().len()),
-                            Err(_) => None, // turn in flight — skip the count
+                        let (entries, report) = match st.storage.try_lock() {
+                            Ok(guard) => (
+                                Some(guard.entries().len()),
+                                // Issue #211: additive usage report.
+                                tole_cli::usage_report::usage_report(guard.usages()).to_json(),
+                            ),
+                            // turn in flight — skip the count and report
+                            Err(_) => (None, json!(null)),
                         };
-                        (busy, entries)
+                        (busy, entries, report)
                     };
                     let entries = match entries {
                         Some(n) => json!(n),
@@ -566,6 +571,7 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                             "id": id,
                             "entries": entries,
                             "busy": busy,
+                            "usage_report": report,
                         }),
                     )
                 }
