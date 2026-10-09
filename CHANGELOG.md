@@ -27,9 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   source (flag/env/config/default); trust or untrust the current content.
 
 ### Changed
+- CI: the bare `--no-default-features` profile of `tole-cli` is now tested (not only checked), and the ACP/serve e2e tests are gated on `shell-tools` (#349).
 - `--skill` / `--no-skills` on `tole serve`/`acp`/`mcp`/`mission` are now refused in builds without the `mcp` feature too (they were silently ignored there), and the refusal also covers values coming from the project config (#346).
 
 ### Fixed
+- The `gh` tool is only targeted at a remote whose host is exactly `github.com`: the string no longer matches inside a longer hostname (`github.com.evil.io`), the userinfo or another forge's path, and `host:port` URLs parse correctly (#352).
 - `tole approvals` now honors `TOLE_SERVE_URL` (precedence: --url > env > default http://127.0.0.1:7801) as its help text always claimed (#339).
 - CodeCora home is resolved in one place: skills and the update-check cache no longer fall back to the current directory when HOME is unset, and CODECORA_HOME now means the same thing everywhere (`$CODECORA_HOME/tole/...`; the update-check cache moves from `$CODECORA_HOME/.codecora/tole` to `$CODECORA_HOME/tole`) (#344).
 

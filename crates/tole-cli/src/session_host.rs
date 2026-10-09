@@ -710,12 +710,36 @@ fn log_outcome(outcome: &tole_core::turn::TurnOutcome) {
 }
 
 /// Best-effort `owner/name` from a git remote URL, for gh tool targeting.
+///
+/// The host must be EXACTLY `github.com` (case-insensitive): the URL is split
+/// into authority and path first, so `github.com` appearing inside a longer
+/// hostname (`github.com.evil.io`, `notgithub.com`), in the userinfo or in the
+/// path of another forge never redirects the gh tool to an attacker-named repo
+/// (#352). Handles `scheme://[user[:pass]@]host[:port]/owner/name` and the
+/// scp-like `[user@]host:owner/name`.
 pub fn github_repo_from_remote_url(url: &str) -> Option<String> {
     let url = url.trim().trim_end_matches('/');
     let url = url.strip_suffix(".git").unwrap_or(url);
-    let idx = url.to_ascii_lowercase().find("github.com")?;
-    let rest = &url[idx + "github.com".len()..];
-    let rest = rest.trim_start_matches(['/', ':']);
+    let (host, path) = if let Some((_, rest)) = url.split_once("://") {
+        let (authority, path) = rest.split_once('/')?;
+        // Strip userinfo (everything up to the LAST '@'), then an optional
+        // numeric port.
+        let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+        let host = match host_port.rsplit_once(':') {
+            Some((h, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => h,
+            _ => host_port,
+        };
+        (host, path)
+    } else {
+        // scp-like: `[user@]host:path` (no scheme, no `//`).
+        let (left, path) = url.split_once(':')?;
+        let host = left.rsplit_once('@').map_or(left, |(_, h)| h);
+        (host, path)
+    };
+    if !host.eq_ignore_ascii_case("github.com") {
+        return None;
+    }
+    let rest = path.trim_start_matches('/');
     let mut parts = rest.split('/');
     let owner = parts.next()?;
     let name = parts.next()?;
