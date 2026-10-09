@@ -10,6 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - `tole status` and the serve status JSON now report token usage, cache-hit rate and a per-step request-size split (system+tools vs history, stored per step under `tole_wire` in the usage record); `fact/mission` gains `cached_tokens`. Instrumentation only: the wire, budgets and durable entry shapes are unchanged (#211, part 1 of 3).
 
+### Changed
+- `read_file` now returns at most 20,000 characters per call and accepts `offset`/`limit` (characters); the result carries `truncated`, `total_chars` and `next_offset` so large files are read in chunks instead of being re-sent whole on every later step (#211, part 3 of 3).
+
 ## [0.8.0] — 2026-10-09
 
 ### Added
