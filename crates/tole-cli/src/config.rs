@@ -110,7 +110,7 @@ pub fn discover(cwd: &Path, explicit: Option<&Path>) -> Option<PathBuf> {
 
 /// Read at most `MAX_CONFIG_BYTES` (+1 to detect overflow) — never the
 /// whole file — and decode as UTF-8.
-fn read_bounded(path: &Path) -> Result<String, ConfigError> {
+pub fn read_source(path: &Path) -> Result<String, ConfigError> {
     let err = |message: String| ConfigError {
         path: path.to_path_buf(),
         line_col: None,
@@ -220,7 +220,7 @@ pub fn parse(src: &str, path: &Path) -> Result<Config, ConfigError> {
 
 /// Read (bounded) and validate the config file at `path`.
 pub fn load(path: &Path) -> Result<Config, ConfigError> {
-    let src = read_bounded(path)?;
+    let src = read_source(path)?;
     parse(&src, path)
 }
 

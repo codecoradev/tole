@@ -429,6 +429,26 @@ enum ConfigAction {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// Trust `<cwd>/.tole/config.toml` (or --config): shows the full
+    /// content (and a diff vs the previously trusted version), then asks
+    /// `[y/N]`. The approval is content-bound and stored outside the repo
+    /// (`$CODECORA_HOME/tole/trusted-configs.json`). The file is not
+    /// applied to sessions yet.
+    Trust {
+        /// Trust this file instead of `<cwd>/.tole/config.toml`.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Skip the question (the content is still printed). Required
+        /// when there is no terminal to ask on.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Forget the trust record for the config (no error if absent).
+    Untrust {
+        /// Untrust this file instead of `<cwd>/.tole/config.toml`.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
 }
 
 fn main() {
@@ -448,7 +468,35 @@ fn dispatch(cli: Cli) -> Result<()> {
                 let cwd = std::env::current_dir().context("cannot determine the cwd")?;
                 let out = tole_cli::config::check(&cwd, config.as_deref())?;
                 println!("{out}");
+                // Validity != trust: the exit code stays 0 either way.
+                if tole_cli::config::discover(&cwd, config.as_deref()).is_some() {
+                    let (subject, _) =
+                        tole_cli::config_trust::Subject::resolve(&cwd, config.as_deref())?;
+                    let store = tole_cli::config_trust::default_store_path()?;
+                    println!("{}", tole_cli::config_trust::trust_line(&subject, &store)?);
+                }
                 Ok(())
+            }
+            ConfigAction::Trust { config, yes } => {
+                let cwd = std::env::current_dir().context("cannot determine the cwd")?;
+                let store = tole_cli::config_trust::default_store_path()?;
+                tole_cli::config_trust::trust_cmd(
+                    &cwd,
+                    config.as_deref(),
+                    *yes,
+                    &store,
+                    &mut tole_cli::config_trust::StdIo,
+                )
+            }
+            ConfigAction::Untrust { config } => {
+                let cwd = std::env::current_dir().context("cannot determine the cwd")?;
+                let store = tole_cli::config_trust::default_store_path()?;
+                tole_cli::config_trust::untrust_cmd(
+                    &cwd,
+                    config.as_deref(),
+                    &store,
+                    &mut tole_cli::config_trust::StdIo,
+                )
             }
         };
     }
