@@ -362,21 +362,44 @@ fn h_memory_config_is_applied_and_flag_and_env_beat_it() {
 }
 
 #[test]
-fn h_security_sensitive_keys_are_not_applied_yet() {
-    // If plan_mode / on_pretool / on_turnend were applied, `mission` would
-    // refuse with the matching message; instead it reaches the provider
-    // check (no provider env in the child).
-    let (d, home) = project(
-        "plan_mode = true\non_pretool = [\"x\"]\non_posttool = [\"y\"]\non_turnend = [\"z\"]\n\
-         no_skills = true\ntrust = [\"internal\"]\nallow = [\"write_*\"]\nmcp_server = [\"a=b\"]\n",
+fn h_security_sensitive_keys_are_applied_now() {
+    // 3b flipped this test (it asserted "not applied yet" in 3a): the
+    // config's plan_mode / hooks ARE applied, so `mission` refuses with the
+    // matching flag message (plus the --no-config hint) BEFORE it reaches
+    // the provider check (no provider env in the child).
+    // Keys whose feature is compiled out are refused at startup with a
+    // different (build-support) message, so only include the ones this
+    // profile supports; plan_mode/no_skills/trust/allow need no feature.
+    let mut toml = String::from(
+        "plan_mode = true\nno_skills = true\ntrust = [\"internal\"]\nallow = [\"write_*\"]\n",
     );
+    if cfg!(feature = "shell-tools") {
+        toml.push_str("on_pretool = [\"x\"]\non_posttool = [\"y\"]\non_turnend = [\"z\"]\n");
+    }
+    if cfg!(feature = "mcp") {
+        toml.push_str("mcp_server = [\"a=b\"]\n");
+    }
+    let (d, home) = project(&toml);
     trust(&d, &home);
     let o = tole(&d, &home, &["mission", "goal"]);
     let err = text(&o.stderr);
-    assert!(!err.contains("--plan-mode"), "{err}");
-    assert!(!err.contains("--on-pretool"), "{err}");
-    assert!(!err.contains("--on-turnend"), "{err}");
-    assert!(err.contains("missing provider config"), "{err}");
+    assert!(!o.status.success(), "{err}");
+    assert!(
+        err.contains("--plan-mode has no meaning for a mission"),
+        "{err}"
+    );
+    assert!(
+        err.contains("use --no-config to ignore the project config"),
+        "{err}"
+    );
+    assert!(!err.contains("missing provider config"), "{err}");
+    // --no-config drops all of it: the mission reaches the provider check.
+    let o = tole(&d, &home, &["--no-config", "mission", "goal"]);
+    assert!(
+        text(&o.stderr).contains("missing provider config"),
+        "{}",
+        text(&o.stderr)
+    );
 }
 
 // ------------------------------------------------- model / base_url
@@ -469,7 +492,7 @@ fn config_check_shows_effective_values_and_sources() {
         "{out}"
     );
     assert!(
-        out.contains("plan_mode = true  [config]  (parsed, not applied yet — 3b)"),
+        out.contains("plan_mode = true  [config]  effective: true  (config)"),
         "{out}"
     );
     // `config check` itself never prints the "using config" line.

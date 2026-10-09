@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `tole config check` validates `.tole/config.toml` (strict schema, secret keys rejected, 64 KiB cap); the file is NOT applied to sessions yet (#208, part 1 of 3).
 - `tole config trust|untrust` and trust status in `tole config check` (content-bound, stored outside the repo); still not applied to sessions (#208, part 2 of 3).
 - `.tole/config.toml` is now applied for model, base_url, system_prompt, memory, sessions_dir, workspace and [mission] budgets after trust (`--config`, `--no-config`); precedence flag > env > config > default; security-sensitive keys follow in the next part (#208, part 3a).
+- `.tole/config.toml` now also applies trust, allow, mcp_server, hooks, skill, plan_mode, no_auto_mcp, no_skills and mission verify/verify_timeout after trust (lists replaced wholesale by the higher layer; booleans can only be turned on by flags; faces that refuse these flags refuse them from config too) — completes #208.
 
 ### Fixed
 - `tole approvals` now honors `TOLE_SERVE_URL` (precedence: --url > env > default http://127.0.0.1:7801) as its help text always claimed (#339).

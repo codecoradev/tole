@@ -347,7 +347,8 @@ pub fn check(
         lines.extend(rendered);
     }
     lines.push(
-        "note: keys marked `parsed, not applied yet` are validated only (next release part)."
+        "note: precedence is flag > env > config > default; a higher layer replaces a whole \
+         list key, flags can only turn boolean keys on, and --no-config ignores this file."
             .into(),
     );
     Ok(lines.join("\n"))

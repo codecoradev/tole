@@ -205,6 +205,13 @@ Everything below is merged; CHANGELOG entries carry the detail.
   Dependabot PRs no longer blocked by naming/description/CLA checks (#322 plus
   a ruleset context change); dependency bumps (rmcp 3.5.0, tokio 1.53.2,
   libc 0.2.190, uuid 1.27.0). No behavior changes.
+- **Project config `.tole/config.toml` (#208):** merged to develop
+  2026-10-09 (parts #342/#343/#345 + this PR), unreleased. Strict TOML schema,
+  content-bound trust store outside the repo, fail-closed gate on the protocol
+  faces, `tole config check|trust|untrust`, precedence flag > env > config >
+  default for every key (lists replaced wholesale, booleans only turned on by
+  flags), and refusal of config-sourced hooks/skills/MCP servers on the faces
+  that refuse the flags.
 
 ---
 
