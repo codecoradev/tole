@@ -210,3 +210,30 @@ fn session_cancel_tool_sets_token_and_resolves_implicit_session() {
     st.cancel.reset();
     assert!(!token.is_cancelled());
 }
+
+#[cfg(unix)]
+#[test]
+fn session_is_rooted_at_the_canonical_cwd_the_jail_check_validated() {
+    let dir = ws("canon");
+    // A symlink INSIDE the workspace root pointing at another inside dir:
+    // the jail check validates the canonical target, so the session must
+    // be rooted there and not at the raw (re-resolvable) spelling.
+    std::os::unix::fs::symlink(dir.join("a"), dir.join("link")).unwrap();
+    let state = SessionToolState::new(
+        vec![],
+        false,
+        None,
+        std::path::PathBuf::from(&dir),
+        None,
+        vec![],
+    );
+    let tools = state.tools();
+    let out = tool_by_name(&tools, "tole_session_new")
+        .execute(json!({"cwd": dir.join("link").to_string_lossy()}))
+        .unwrap();
+    let want = dir.join("a").canonicalize().unwrap();
+    assert_eq!(
+        std::path::Path::new(out["workspace"].as_str().unwrap()),
+        want.as_path()
+    );
+}
