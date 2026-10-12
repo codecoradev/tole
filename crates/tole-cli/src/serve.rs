@@ -218,7 +218,9 @@ fn read_request(stream: &TcpStream) -> Result<Request, ReadError> {
     let mut authorization = None;
     let mut content_length: Option<usize> = None;
     let mut expect_continue = false;
-    let mut header_bytes = 0usize;
+    // The request line counts against the same ceiling as the headers:
+    // the documented limit is 32 KiB for both combined.
+    let mut header_bytes = request_line.len();
     loop {
         if header_bytes > MAX_HEADER_BYTES {
             return Err(ReadError::Io);
@@ -514,6 +516,16 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                 .get("cwd")
                 .and_then(|v| v.as_str())
                 .unwrap_or(state.workspace_default.as_deref().unwrap_or("."));
+            // Capacity first: `open_session` creates the session file on
+            // disk, so refusing AFTER it (503) would orphan that file. The
+            // re-check at insert time below still guards a concurrent
+            // creator.
+            if lock_sessions(&state.sessions)
+                .evict_for_insert(MAX_SESSIONS)
+                .is_err()
+            {
+                return (503, json!({"error": "all sessions busy — at capacity"}));
+            }
             let session_id = tole_cli::session_host::new_session_id("srv");
             // Issue #200: non-preauthorized Writes queue for a remote
             // decision (deny now, resumable; allow = one-shot replay).

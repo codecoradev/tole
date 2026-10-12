@@ -122,6 +122,31 @@ fn mission_prompt(goal: &str, verify: Option<&str>) -> String {
     p
 }
 
+/// Upper bound for `--max-minutes` (10 years): a huge value must neither
+/// wrap `minutes * 60` nor overflow the `Instant` arithmetic.
+const MAX_MINUTES_CAP: u64 = 60 * 24 * 365 * 10;
+
+fn max_minutes_duration(minutes: u64) -> std::time::Duration {
+    std::time::Duration::from_secs(minutes.min(MAX_MINUTES_CAP) * 60)
+}
+
+/// A `--resume` id names a file inside the sessions dir; it must be a plain
+/// file stem (the shape `new_session_id` produces), never a path.
+fn validate_session_id(id: &str) -> Result<()> {
+    let ok = !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    if ok {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "invalid mission session id {id:?}: expected letters, digits, '-' and '_' only"
+        )
+    }
+}
+
 /// Failure to run the verify command to completion. Carries the real cause
 /// (spawn failure, wait error or timeout) instead of reporting every
 /// subprocess error as a timeout.
@@ -192,7 +217,7 @@ pub fn run_mission(
     sessions_dir: &std::path::Path,
 ) -> Result<()> {
     let started = std::time::Instant::now();
-    let deadline = started + std::time::Duration::from_secs(cfg.max_minutes * 60);
+    let deadline = started + max_minutes_duration(cfg.max_minutes);
     // Resolve provider config BEFORE the session file exists — a config
     // failure must not leave an empty, unsummarized session (cora CI).
     let provider_cfg = tole_cli::config_apply::provider_config().context(
@@ -203,6 +228,7 @@ pub fn run_mission(
     // Session: fresh (goal pinned via first prompt) or resumed.
     let (mut storage, session_id, first_prompt) = match &cfg.resume_id {
         Some(id) => {
+            validate_session_id(id)?;
             let path = sessions_dir.join(format!("{id}.jsonl"));
             let storage = JsonlStorage::open(&path)
                 .with_context(|| format!("opening mission session {id}"))?;
@@ -563,6 +589,24 @@ mod verify_error_tests {
         assert!(e.contains("failed to spawn subprocess"), "{e}");
         assert!(!e.contains("timed out"), "{e}");
         assert!(e.contains("--verify-timeout is 300s"), "{e}");
+    }
+
+    #[test]
+    fn resume_id_must_be_a_plain_session_stem() {
+        let id = tole_cli::session_host::new_session_id("mission");
+        assert!(validate_session_id(&id).is_ok(), "{id}");
+        for bad in ["", "../x", "a/b", "a\\b", "..", "x.jsonl", "/etc/passwd"] {
+            assert!(validate_session_id(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn huge_max_minutes_is_capped_not_wrapped() {
+        let d = max_minutes_duration(u64::MAX);
+        assert_eq!(d.as_secs(), MAX_MINUTES_CAP * 60);
+        // Instant arithmetic must not overflow either.
+        let _ = std::time::Instant::now() + d;
+        assert_eq!(max_minutes_duration(2).as_secs(), 120);
     }
 
     #[test]
