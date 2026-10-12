@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tole_cli::session_host::{
     lock_sessions, open_session, run_session_turn, Sessions, SharedSessions, MAX_SESSIONS,
@@ -79,6 +79,11 @@ struct State {
 /// never speaks must not pin a thread forever (CodeCora scan
 /// 2026-09-28, thread-exhaustion DoS). Generous for real clients.
 const SERVE_IO_TIMEOUT: Duration = Duration::from_secs(30);
+/// Total budget for reading one request (request line, headers and body).
+/// The per-read timeout alone lets a client that trickles one byte every
+/// few seconds pin a connection slot indefinitely (slow-loris); this
+/// deadline bounds the whole read.
+const REQUEST_READ_DEADLINE: Duration = Duration::from_secs(15);
 
 pub fn run_serve(cfg: ServeConfig) -> Result<()> {
     let token = resolve_token(&cfg.token)?;
@@ -149,13 +154,48 @@ struct Request {
     body: String,
 }
 
+/// Why a request could not be read; decides the response (if any).
+enum ReadError {
+    /// Connection-level failure or timeout: nothing useful to answer.
+    Io,
+    /// Syntactically unacceptable request: answered with 400.
+    Bad(&'static str),
+    /// Declared body over the ceiling: answered with 413.
+    TooLarge,
+}
+
 /// Ceiling for the request line + all header bytes combined: a client
 /// that streams an endless line without a newline must not buffer
 /// gigabytes pre-auth (CodeCora scan-3: unbounded buffering).
 const MAX_HEADER_BYTES: usize = 32 * 1024;
+/// Ceiling for a request body.
+const MAX_BODY_BYTES: usize = 1024 * 1024;
 
-fn read_request(stream: &TcpStream) -> Option<Request> {
-    let mut reader = BufReader::new(stream);
+/// A reader that re-arms the socket read timeout before every read so the
+/// remaining time until `deadline` — not just the per-read timeout —
+/// bounds the whole request read.
+struct DeadlineReader<'a> {
+    stream: &'a TcpStream,
+    deadline: Instant,
+}
+
+impl Read for DeadlineReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        self.stream
+            .set_read_timeout(Some(remaining.min(SERVE_IO_TIMEOUT)))?;
+        self.stream.read(buf)
+    }
+}
+
+fn read_request(stream: &TcpStream) -> Result<Request, ReadError> {
+    let mut reader = BufReader::new(DeadlineReader {
+        stream,
+        deadline: Instant::now() + REQUEST_READ_DEADLINE,
+    });
     let mut request_line = String::new();
     // take() bounds the read: an over-long line arrives truncated with no
     // trailing newline, which the caller treats as a protocol error.
@@ -163,55 +203,87 @@ fn read_request(stream: &TcpStream) -> Option<Request> {
         .by_ref()
         .take(MAX_HEADER_BYTES as u64)
         .read_line(&mut request_line)
-        .ok()?;
+        .map_err(|_| ReadError::Io)?;
     if !request_line.ends_with('\n') {
-        return None;
+        return Err(ReadError::Io);
     }
     let mut parts = request_line.split_whitespace();
-    let method = parts.next()?.to_string();
-    let path = parts.next()?.to_string();
+    let method = parts
+        .next()
+        .ok_or(ReadError::Bad("malformed request line"))?;
+    let path = parts
+        .next()
+        .ok_or(ReadError::Bad("malformed request line"))?;
+    let (method, path) = (method.to_string(), path.to_string());
     let mut authorization = None;
-    let mut content_length = 0usize;
+    let mut content_length: Option<usize> = None;
+    let mut expect_continue = false;
     let mut header_bytes = 0usize;
     loop {
         if header_bytes > MAX_HEADER_BYTES {
-            return None;
+            return Err(ReadError::Io);
         }
         let mut line = String::new();
         let n = reader
             .by_ref()
             .take((MAX_HEADER_BYTES - header_bytes) as u64)
             .read_line(&mut line)
-            .ok()?;
+            .map_err(|_| ReadError::Io)?;
         if n == 0 {
-            return None;
+            return Err(ReadError::Io);
         }
         header_bytes += n;
         if !line.ends_with('\n') {
-            return None;
+            return Err(ReadError::Io);
         }
         let line = line.trim_end();
         if line.is_empty() {
             break;
         }
-        let lower = line.to_ascii_lowercase();
-        if let Some(v) = lower.strip_prefix("content-length:") {
-            content_length = v.trim().parse().unwrap_or(0);
-        }
-        // Authorization keeps its ORIGINAL case (the bearer token is
-        // case-sensitive — a lowercased copy never matches).
-        if let Some(v) = line.strip_prefix("Authorization:") {
-            authorization = Some(v.trim().to_string());
+        // Header names are case-insensitive (RFC 9110 §5.1); values keep
+        // their original case (the bearer token is case-sensitive).
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        if name.eq_ignore_ascii_case("content-length") {
+            // Two Content-Length headers (or an unparsable one) are a
+            // request-smuggling hazard: reject instead of last-wins.
+            if content_length.is_some() {
+                return Err(ReadError::Bad("duplicate Content-Length"));
+            }
+            content_length = Some(
+                value
+                    .parse()
+                    .map_err(|_| ReadError::Bad("invalid Content-Length"))?,
+            );
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            // Chunked bodies are not supported; guessing a framing is
+            // exactly what smuggling relies on.
+            return Err(ReadError::Bad("Transfer-Encoding is not supported"));
+        } else if name.eq_ignore_ascii_case("authorization") {
+            authorization = Some(value.to_string());
+        } else if name.eq_ignore_ascii_case("expect") && value.eq_ignore_ascii_case("100-continue")
+        {
+            expect_continue = true;
         }
     }
-    if content_length > 1024 * 1024 {
-        return None; // body too large — refuse rather than buffer it
+    let content_length = content_length.unwrap_or(0);
+    if content_length > MAX_BODY_BYTES {
+        return Err(ReadError::TooLarge); // refuse rather than buffer it
+    }
+    if content_length > 0 && expect_continue {
+        // curl sends `Expect: 100-continue` for bodies over ~1 KiB and
+        // waits ~1s for this interim response before sending the body.
+        let mut w = stream;
+        let _ = w.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
+        let _ = w.flush();
     }
     let mut body = vec![0u8; content_length];
     if content_length > 0 {
-        reader.read_exact(&mut body).ok()?;
+        reader.read_exact(&mut body).map_err(|_| ReadError::Io)?;
     }
-    Some(Request {
+    Ok(Request {
         method,
         path,
         authorization,
@@ -219,19 +291,33 @@ fn read_request(stream: &TcpStream) -> Option<Request> {
     })
 }
 
-fn respond(stream: &mut TcpStream, status: u16, payload: &serde_json::Value) {
-    let body = payload.to_string();
-    let reason = match status {
+/// Constant-time byte comparison for secrets (a short-circuiting `==`
+/// leaks the length of the matching prefix through timing). The length
+/// itself is not secret here.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+fn reason_phrase(status: u16) -> &'static str {
+    match status {
         200 => "OK",
+        202 => "Accepted",
         400 => "Bad Request",
         401 => "Unauthorized",
         404 => "Not Found",
         405 => "Method Not Allowed",
         409 => "Conflict",
         413 => "Payload Too Large",
+        429 => "Too Many Requests",
         500 => "Internal Server Error",
-        _ => "OK",
-    };
+        503 => "Service Unavailable",
+        _ => "Unknown",
+    }
+}
+
+fn respond(stream: &mut TcpStream, status: u16, payload: &serde_json::Value) {
+    let body = payload.to_string();
+    let reason = reason_phrase(status);
     let head = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
@@ -255,8 +341,21 @@ impl Drop for ConnGuard {
 
 fn handle_conn(mut stream: TcpStream, state: Arc<State>) {
     let _guard = ConnGuard(Arc::clone(&state));
-    let Some(req) = read_request(&stream) else {
-        return;
+    let req = match read_request(&stream) {
+        Ok(r) => r,
+        Err(ReadError::Io) => return,
+        Err(ReadError::Bad(msg)) => {
+            respond(&mut stream, 400, &json!({"error": msg}));
+            return;
+        }
+        Err(ReadError::TooLarge) => {
+            respond(
+                &mut stream,
+                413,
+                &json!({"error": "request body too large"}),
+            );
+            return;
+        }
     };
 
     // Auth: bearer token on everything except /health (which carries no
@@ -269,7 +368,10 @@ fn handle_conn(mut stream: TcpStream, state: Arc<State>) {
     // client must not hold the auth_failures mutex during a write).
     if let Some(ip) = peer_ip {
         let rate_limited = {
-            let fails = state.auth_failures.lock().expect("auth failures lock");
+            let fails = state
+                .auth_failures
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
             matches!(
                 fails.get(&ip).map(|(window, count)| {
                     std::time::SystemTime::now()
@@ -297,12 +399,16 @@ fn handle_conn(mut stream: TcpStream, state: Arc<State>) {
         || req
             .authorization
             .as_deref()
-            .and_then(|a| a.strip_prefix("Bearer "))
-            .map(|t| t == state.token)
+            .and_then(|a| a.split_once(' '))
+            .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+            .map(|(_, t)| ct_eq(t.trim().as_bytes(), state.token.as_bytes()))
             .unwrap_or(false);
     if !authorized {
         if let Some(ip) = peer_ip {
-            let mut fails = state.auth_failures.lock().expect("auth failures lock");
+            let mut fails = state
+                .auth_failures
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
@@ -612,5 +718,64 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
             }
         }
         _ => (404, json!({"error": "not found"})),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ct_eq_matches_only_equal_slices() {
+        assert!(ct_eq(b"secret", b"secret"));
+        assert!(!ct_eq(b"secret", b"secreT"));
+        assert!(!ct_eq(b"secret", b"secre"));
+        assert!(ct_eq(b"", b""));
+    }
+
+    #[test]
+    fn reason_phrases_cover_every_status_the_routes_emit() {
+        assert_eq!(reason_phrase(202), "Accepted");
+        assert_eq!(reason_phrase(429), "Too Many Requests");
+        assert_eq!(reason_phrase(503), "Service Unavailable");
+        assert_eq!(reason_phrase(413), "Payload Too Large");
+    }
+
+    #[test]
+    fn deadline_reader_bounds_a_trickling_client() {
+        // A client sending one byte per 100 ms never trips the per-read
+        // timeout; the total deadline must still cut the read off.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let writer = std::thread::spawn(move || {
+            let mut c = TcpStream::connect(addr).unwrap();
+            for _ in 0..40 {
+                if c.write_all(b"x").is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+        let (server_side, _) = listener.accept().unwrap();
+        let mut r = DeadlineReader {
+            stream: &server_side,
+            deadline: Instant::now() + Duration::from_millis(400),
+        };
+        let started = Instant::now();
+        let mut buf = [0u8; 1];
+        let err = loop {
+            match r.read(&mut buf) {
+                Ok(0) => panic!("peer closed before the deadline"),
+                Ok(_) => continue,
+                Err(e) => break e,
+            }
+        };
+        assert!(matches!(
+            err.kind(),
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+        ));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        drop(server_side);
+        let _ = writer.join();
     }
 }
