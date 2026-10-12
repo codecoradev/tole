@@ -147,3 +147,22 @@ fn ambiguous_framing_is_rejected() {
         .unwrap();
     assert!(status(&bad).contains("400"), "{bad}");
 }
+
+#[test]
+fn request_line_and_headers_share_one_size_ceiling() {
+    let s = Serve::spawn();
+    // 20 KiB request line + 20 KiB header: each fits alone, together they
+    // exceed the documented 32 KiB ceiling, so the connection is dropped
+    // without ever reaching routing.
+    let req = format!(
+        "GET /{} HTTP/1.1\r\nAuthorization: Bearer t0ken\r\nX-Pad: {}\r\nConnection: close\r\n\r\n",
+        "a".repeat(20 * 1024),
+        "b".repeat(20 * 1024)
+    );
+    let r = s.raw(&req).unwrap_or_default();
+    assert!(
+        r.is_empty(),
+        "expected a dropped connection, got {}",
+        status(&r)
+    );
+}

@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A client cancel that lands while the fresh approval of a crash-interrupted guarded intent is pending now settles the resumed turn as `Cancelled` instead of `ApprovalRequired`, like the fresh path (#361).
 - `tole mission`'s verify step reports the real cause when the verify command cannot be run (spawn or wait failure) instead of calling every error a timeout (#361).
 - MCP `tole_session_new` roots the session at the canonical path its workspace-jail check validated (and returns it as `workspace`), and checks session capacity before creating the session file, so a full server no longer leaves an orphaned session on disk (#361).
+- `tole serve` `POST /sessions` checks capacity before creating the session file, so a `503` no longer leaves an orphaned session on disk, and the request line now counts against the same 32 KiB ceiling as the headers (#368).
+- `tole mission --resume` accepts only a plain session id (letters, digits, `-`, `_`) instead of letting a path escape the sessions directory, and an absurd `--max-minutes` is capped at 10 years instead of wrapping the deadline (#368).
 
 ## [0.8.1] — 2026-10-09
 
