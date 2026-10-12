@@ -122,17 +122,22 @@ fn mission_prompt(goal: &str, verify: Option<&str>) -> String {
     p
 }
 
+/// Failure to run the verify command to completion. Carries the real cause
+/// (spawn failure, wait error or timeout) instead of reporting every
+/// subprocess error as a timeout.
+fn verify_run_error(cause: &str, timeout: std::time::Duration) -> String {
+    format!(
+        "verify command did not complete: {cause} (--verify-timeout is {}s)",
+        timeout.as_secs()
+    )
+}
+
 /// Run the `--verify` command (sh -c, operator-budgeted timeout).
 /// Returns Ok(()) on exit-0, Err(output tail) otherwise.
 fn run_verify(cmd: &str, timeout: std::time::Duration) -> Result<(), String> {
     let mut c = std::process::Command::new("sh");
     c.arg("-c").arg(cmd);
-    let out = run_with_timeout(&mut c, timeout).map_err(|_| {
-        format!(
-            "verify command timed out after {}s (raise --verify-timeout)",
-            timeout.as_secs()
-        )
-    })?;
+    let out = run_with_timeout(&mut c, timeout).map_err(|e| verify_run_error(&e, timeout))?;
     if out.status.success() {
         return Ok(());
     }
@@ -541,5 +546,28 @@ mod budget_tests {
             (mixed.max_steps, mixed.max_minutes, mixed.max_tokens),
             (10, 30, 1_000)
         );
+    }
+}
+
+#[cfg(test)]
+mod verify_error_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn a_spawn_failure_is_not_reported_as_a_timeout() {
+        let e = verify_run_error(
+            "failed to spawn subprocess (is it on PATH?): No such file or directory",
+            Duration::from_secs(300),
+        );
+        assert!(e.contains("failed to spawn subprocess"), "{e}");
+        assert!(!e.contains("timed out"), "{e}");
+        assert!(e.contains("--verify-timeout is 300s"), "{e}");
+    }
+
+    #[test]
+    fn a_real_timeout_still_says_so() {
+        let e = run_verify("sleep 5", Duration::from_secs(1)).unwrap_err();
+        assert!(e.contains("timed out after 1s"), "{e}");
     }
 }

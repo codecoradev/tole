@@ -148,6 +148,22 @@ impl Tool for SessionNewTool {
                 root.display()
             ));
         }
+        // The jail check above validated the CANONICAL path, so the session
+        // must be rooted at that same path: a symlink swapped in after the
+        // check (or a `..`/symlink spelling in the raw string) must not
+        // redirect the session elsewhere.
+        let cwd = target
+            .to_str()
+            .ok_or_else(|| format!("cwd {cwd:?} is not valid UTF-8 once resolved"))?;
+        // Capacity first: open_session creates the session file on disk, so
+        // refusing AFTER it would leave an orphaned session behind. The
+        // re-check at insert time below still guards a concurrent creator.
+        if lock_sessions(&self.0.sessions)
+            .evict_for_insert(MAX_SESSIONS)
+            .is_err()
+        {
+            return Err("session map at capacity and all sessions busy — close one first".into());
+        }
         let session_id = new_session_id("mcp");
         let approver =
             tole_core::approval::AllowlistApprover::allow_only(self.0.allow_patterns.clone());
