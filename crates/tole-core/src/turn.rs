@@ -262,7 +262,9 @@ pub fn resume_turn_with_cancel(
                     &format!("replayed intent {intent_id} carried malformed arguments"),
                 )?;
             } else {
-                if let Some(outcome) = replay_intent(s, registry, intent_id, tool, input, safety)? {
+                if let Some(outcome) =
+                    replay_intent(s, registry, cancel, intent_id, tool, input, safety)?
+                {
                     return Ok(outcome);
                 }
             }
@@ -290,6 +292,7 @@ fn record_wrote(s: &mut dyn Storage) -> Result<(), StorageError> {
 fn replay_intent(
     s: &mut dyn Storage,
     registry: &ToolRegistry,
+    cancel: &CancelToken,
     intent_id: String,
     tool: String,
     input: Value,
@@ -329,6 +332,12 @@ fn replay_intent(
                 &handle,
                 "replay denied: no fresh approval for a guarded effect",
             )?;
+            // #178: a cancel that landed while the fresh approval was
+            // pending fails closed to Deny, but the turn is CANCELLED, not
+            // refused — the same contract as the fresh path in `drive`.
+            if cancel.is_cancelled() {
+                return settle_cancelled(s).map(Some);
+            }
             append_turn_error(
                 s,
                 "approval required",

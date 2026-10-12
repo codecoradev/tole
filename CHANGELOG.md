@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - `tole serve` HTTP hardening (#361): header names are matched case-insensitively (a lowercase `authorization:` was refused), `Expect: 100-continue` is answered (curl no longer stalls ~1s on POST bodies over 1 KiB), reading a request has a 15s total deadline (a client trickling bytes can no longer pin a connection slot), an oversized body gets `413`, duplicate/invalid `Content-Length` and `Transfer-Encoding` get `400`, the bearer token is compared in constant time, a poisoned auth-failure lock no longer disables authentication, and `202`/`429`/`503` carry their real reason phrases.
+- A client cancel that lands while the fresh approval of a crash-interrupted guarded intent is pending now settles the resumed turn as `Cancelled` instead of `ApprovalRequired`, like the fresh path (#361).
 
 ## [0.8.1] — 2026-10-09
 
