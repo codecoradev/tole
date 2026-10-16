@@ -8,9 +8,11 @@
 #![cfg(feature = "shell-tools")]
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+
+mod common;
 
 struct Serve {
     child: Child,
@@ -19,28 +21,14 @@ struct Serve {
 
 impl Serve {
     fn spawn() -> Self {
-        let port = TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let child = Command::new(env!("CARGO_BIN_EXE_tole"))
-            .args(["serve", "--port", &port.to_string(), "--token", "t0ken"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .expect("spawn tole serve");
-        let me = Self { child, port };
-        for _ in 0..50 {
-            if let Ok(r) = me.raw("GET /health HTTP/1.1\r\nConnection: close\r\n\r\n") {
-                if r.starts_with("HTTP/1.1 200") {
-                    return me;
-                }
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        panic!("serve never became healthy");
+        let (child, port) = common::spawn_listening(|port| {
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
+            cmd.args(["serve", "--port", &port.to_string(), "--token", "t0ken"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null());
+            cmd
+        });
+        Self { child, port }
     }
 
     fn connect(&self) -> std::io::Result<TcpStream> {
@@ -165,4 +153,34 @@ fn request_line_and_headers_share_one_size_ceiling() {
         "expected a dropped connection, got {}",
         status(&r)
     );
+}
+
+/// The port-race guard itself: an instance that exits before listening
+/// (as `tole serve` does on "Address already in use") is retried on a new
+/// port, and readiness comes from the "listening on" line.
+#[cfg(unix)]
+#[test]
+fn spawn_listening_retries_an_instance_that_exits_before_listening() {
+    let mut attempts = 0;
+    let (mut child, port) = common::spawn_listening(|port| {
+        attempts += 1;
+        let script = if attempts == 1 {
+            "echo 'binding: Address already in use' >&2; exit 1".to_string()
+        } else {
+            format!("echo 'listening on http://127.0.0.1:{port}' >&2; sleep 30")
+        };
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", &script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null());
+        cmd
+    });
+    assert_eq!(attempts, 2, "the first instance exited and was retried");
+    assert!(port > 0);
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "the second one is running"
+    );
+    let _ = child.kill();
+    let _ = child.wait();
 }

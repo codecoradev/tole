@@ -16,6 +16,8 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
+mod common;
+
 struct ServeProcess {
     child: Child,
     addr: String,
@@ -24,9 +26,6 @@ struct ServeProcess {
 
 impl ServeProcess {
     fn spawn(base_url: &str) -> Arc<Self> {
-        let port_listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = port_listener.local_addr().unwrap().port();
-        drop(port_listener);
         let cwd = std::env::temp_dir().join(format!(
             "tole-serve-cancel-{}-{:x}",
             std::time::SystemTime::now()
@@ -36,31 +35,33 @@ impl ServeProcess {
             std::process::id()
         ));
         std::fs::create_dir_all(&cwd).unwrap();
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
-        cmd.args([
-            "serve",
-            "--port",
-            &port.to_string(),
-            "--workspace",
-            cwd.to_string_lossy().as_ref(),
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .env_remove("TOLE_MEMORY")
-        .env_remove("TOLE_MEMORY_NAMESPACE")
-        .env_remove("TOLE_TRUST");
-        cmd.env("TOLE_BASE_URL", base_url);
-        cmd.env("TOLE_MODEL", "mock-model");
-        cmd.env("TOLE_API_KEY", "sk-test");
         let token = "test-token-123".to_string();
-        cmd.env("TOLE_SERVE_TOKEN", &token);
-        let child = cmd.spawn().expect("spawn tole serve");
+        let (child, port) = common::spawn_listening(|port| {
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
+            cmd.args([
+                "serve",
+                "--port",
+                &port.to_string(),
+                "--workspace",
+                cwd.to_string_lossy().as_ref(),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .env_remove("TOLE_MEMORY")
+            .env_remove("TOLE_MEMORY_NAMESPACE")
+            .env_remove("TOLE_TRUST");
+            cmd.env("TOLE_BASE_URL", base_url);
+            cmd.env("TOLE_MODEL", "mock-model");
+            cmd.env("TOLE_API_KEY", "sk-test");
+            cmd.env("TOLE_SERVE_TOKEN", &token);
+            cmd
+        });
         let proc = Arc::new(Self {
             child,
             addr: format!("127.0.0.1:{port}"),
             token,
         });
+        // The listener is up; also confirm the HTTP face answers.
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
         while std::time::Instant::now() < deadline {
             if let Some((200, _)) = proc.request("GET", "/health", "") {
