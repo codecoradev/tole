@@ -23,6 +23,11 @@ use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 
+/// Env var carrying a child's agent id (set by `agent_start`).
+pub const ENV_AGENT_ID: &str = "TOLE_AGENT_ID";
+/// Env var carrying the shared touch-log path (set by `agent_start`).
+pub const ENV_TOUCH_LOG: &str = "TOLE_AGENT_TOUCH_LOG";
+
 /// Paths one watcher remembers; beyond it new paths are not tracked
 /// (bounded memory — notices for the tracked set keep working).
 pub const MAX_TRACKED_PATHS: usize = 4096;

@@ -1524,7 +1524,7 @@ fn build_registry(
         )))
         .map_err(|e| anyhow::anyhow!("registering agent_poll: {e}"))?;
     }
-    reg.register(Box::new(ReadFileTool::new(file_root.clone())))
+    reg.register(tole_cli::sibling::track(Box::new(ReadFileTool::new(file_root.clone())), tracking.as_ref(), &file_root))
         .map_err(|e| anyhow::anyhow!("registering read_file: {e}"))?;
     // Web tools (issue #215): probe-first — fetch always; search only
     // with TOLE_WEB_SEARCH_URL.
@@ -1535,9 +1535,9 @@ fn build_registry(
             .map_err(|e| anyhow::anyhow!("registering web_search: {e}"))?;
     }
     // Write tools: gated per call. The jail root is the workspace.
-    reg.register(Box::new(WriteFileTool::new(file_root.clone())))
+    reg.register(tole_cli::sibling::track(Box::new(WriteFileTool::new(file_root.clone())), tracking.as_ref(), &file_root))
         .map_err(|e| anyhow::anyhow!("registering write_file: {e}"))?;
-    reg.register(Box::new(EditFileTool::new(file_root.clone())))
+    reg.register(tole_cli::sibling::track(Box::new(EditFileTool::new(file_root.clone())), tracking.as_ref(), &file_root))
         .map_err(|e| anyhow::anyhow!("registering edit_file: {e}"))?;
     #[cfg(feature = "shell-tools")]
     {
@@ -1550,7 +1550,7 @@ fn build_registry(
         .map_err(|e| anyhow::anyhow!("registering git: {e}"))?;
     // Destructive tools: interactive-approver-only registration; every
     // call prompts — allowlists and --yes never apply (PRD risk table).
-    reg.register(Box::new(DeleteFileTool::new(file_root)))
+    reg.register(tole_cli::sibling::track(Box::new(DeleteFileTool::new(file_root.clone())), tracking.as_ref(), &file_root))
         .map_err(|e| anyhow::anyhow!("registering delete_file: {e}"))?;
     // MCP servers (#74): registered last so a slow server never blocks
     // native tool availability; per-call approval applies as usual.
@@ -1656,7 +1656,7 @@ fn build_server_registry(
         reg.register(Box::new(t))
             .map_err(|e| anyhow::anyhow!("registering systemone_decide: {e}"))?;
     }
-    reg.register(Box::new(ReadFileTool::new(file_root.clone())))
+    reg.register(tole_cli::sibling::track(Box::new(ReadFileTool::new(file_root.clone())), tracking.as_ref(), &file_root))
         .map_err(|e| anyhow::anyhow!("registering read_file: {e}"))?;
     // Web tools (issue #215): probe-first — fetch always; search only
     // with TOLE_WEB_SEARCH_URL.
@@ -1666,9 +1666,9 @@ fn build_server_registry(
         reg.register(Box::new(tole_core::web::WebSearchTool::from_env().unwrap()))
             .map_err(|e| anyhow::anyhow!("registering web_search: {e}"))?;
     }
-    reg.register(Box::new(WriteFileTool::new(file_root.clone())))
+    reg.register(tole_cli::sibling::track(Box::new(WriteFileTool::new(file_root.clone())), tracking.as_ref(), &file_root))
         .map_err(|e| anyhow::anyhow!("registering write_file: {e}"))?;
-    reg.register(Box::new(EditFileTool::new(file_root.clone())))
+    reg.register(tole_cli::sibling::track(Box::new(EditFileTool::new(file_root.clone())), tracking.as_ref(), &file_root))
         .map_err(|e| anyhow::anyhow!("registering edit_file: {e}"))?;
     #[cfg(feature = "shell-tools")]
     {

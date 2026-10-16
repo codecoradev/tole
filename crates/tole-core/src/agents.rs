@@ -244,7 +244,9 @@ fn new_agent_id() -> String {
     format!("a-{ms:x}-{:x}-{n:x}", std::process::id())
 }
 
-pub(crate) fn valid_agent_id(id: &str) -> bool {
+/// The agent-id charset (`a-<hex>-<hex>-<hex>` as generated): used to
+/// validate ids read back from env or the shared sibling log.
+pub fn valid_agent_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 64
         && id
@@ -666,6 +668,13 @@ impl Tool for AgentStartTool {
         // needs the provider key. Isolation = depth cap + jail + the
         // approved child allowlist (see the module doc).
         cmd.env("TOLE_AGENT_DEPTH", "1")
+            // Sibling change notices (#380): the child's identity and the
+            // shared touch log every sibling of this parent appends to.
+            .env(crate::sibling_watch::ENV_AGENT_ID, &id)
+            .env(
+                crate::sibling_watch::ENV_TOUCH_LOG,
+                agents_root(&self.root).join("touch.log"),
+            )
             .env("TOLE_MEMORY_NAMESPACE", &mailbox_ns)
             .env("TOLE_MEMORY", "uteke")
             .arg("run")
