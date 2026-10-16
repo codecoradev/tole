@@ -135,6 +135,12 @@ fn check_path(path: &str) -> Result<(), String> {
     if has_control(path) || path.contains('\\') {
         return bad("artifact path has control characters or a backslash");
     }
+    // A colon is a Windows drive prefix (`C:/x`, which `Path::join` treats
+    // as replacing the base, escaping the workspace) or an NTFS alternate
+    // data stream (`file:stream`); neither belongs in a workspace path.
+    if path.contains(':') {
+        return bad(format!("artifact path {path:?} must not contain ':'"));
+    }
     if path.starts_with('/') || path.starts_with('~') {
         return bad(format!("artifact path {path:?} must be workspace-relative"));
     }
@@ -350,6 +356,10 @@ mod tests {
             "a\\b",
             "a\nb",
             "a\0b",
+            "C:/Users/x",
+            "c:foo",
+            "D:\\x",
+            "file.txt:stream",
         ] {
             assert!(try_path(bad).is_err(), "{bad:?}");
         }

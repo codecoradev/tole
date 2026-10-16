@@ -34,8 +34,9 @@ When a child closes it leaves one validated JSON document in its agent dir:
   the data channel.
 - **Validation is strict** and treats the document as untrusted
   model-authored input: unknown fields are errors; every field is bounded;
-  a path must be workspace-relative with no `..`, no backslash, no control
-  characters and no leading `-`; a `rev` must be a plain commit or ref name
+  a path must be workspace-relative with no `..`, no backslash, no colon
+  (a Windows drive prefix would replace the workspace root when joined), no
+  control characters and no leading `-`; a `rev` must be a plain commit or ref name
   (alphanumeric start, safe charset, no `..`), so neither can be parsed as a
   command-line option or escape the workspace.
 - Text rendered for another model (`consume_preamble`, `fix_prompt`) escapes
