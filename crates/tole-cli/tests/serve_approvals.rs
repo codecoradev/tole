@@ -15,31 +15,28 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+mod common;
+
 struct ServeProcess {
     child: Child,
     port: u16,
 }
 
 impl ServeProcess {
-    fn spawn(env: &[(&str, &str)], token: &str, port: u16) -> Self {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
-        cmd.args(["serve", "--port", &port.to_string(), "--token", token])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit());
-        for (k, v) in env {
-            cmd.env(k, v);
-        }
-        let child = cmd.spawn().expect("spawn tole serve");
-        let me = Self { child, port };
-        // Health-poll until the listener is up.
-        for _ in 0..50 {
-            if me.http("GET", "/health", None).0 == 200 {
-                return me;
+    /// `_port` is ignored: a free port is chosen (and retried) by
+    /// `common::spawn_listening`, which also waits for the listener.
+    fn spawn(env: &[(&str, &str)], token: &str, _port: u16) -> Self {
+        let (child, port) = common::spawn_listening(|port| {
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
+            cmd.args(["serve", "--port", &port.to_string(), "--token", token])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null());
+            for (k, v) in env {
+                cmd.env(k, v);
             }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        panic!("serve never became healthy");
+            cmd
+        });
+        Self { child, port }
     }
 
     fn http(&self, method: &str, path: &str, body: Option<&str>) -> (u16, Value) {
