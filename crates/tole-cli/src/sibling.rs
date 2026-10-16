@@ -35,7 +35,7 @@ pub struct Tracking {
 pub fn tracking_from_env(env: &dyn Fn(&str) -> Option<String>) -> Option<Tracking> {
     let agent = env(ENV_AGENT_ID)?.trim().to_string();
     let log = env(ENV_TOUCH_LOG)?.trim().to_string();
-    if !tole_core::agents::valid_agent_id(&agent) || log.is_empty() {
+    if !tole_core::sibling_watch::valid_agent_id(&agent) || log.is_empty() {
         return None;
     }
     Some(Tracking {

@@ -244,14 +244,9 @@ fn new_agent_id() -> String {
     format!("a-{ms:x}-{:x}-{n:x}", std::process::id())
 }
 
-/// The agent-id charset (`a-<hex>-<hex>-<hex>` as generated): used to
-/// validate ids read back from env or the shared sibling log.
+/// The agent-id charset: see [`crate::sibling_watch::valid_agent_id`].
 pub fn valid_agent_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 64
-        && id
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    crate::sibling_watch::valid_agent_id(id)
 }
 
 fn agents_root(root: &std::path::Path) -> PathBuf {
