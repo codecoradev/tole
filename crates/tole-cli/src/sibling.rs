@@ -12,7 +12,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tole_core::cancel::CancelToken;
-use tole_core::sibling_watch::{SiblingWatcher, Tracked, TouchRecorder, ENV_AGENT_ID, ENV_TOUCH_LOG};
+use tole_core::sibling_watch::{
+    SiblingWatcher, TouchRecorder, Tracked, ENV_AGENT_ID, ENV_TOUCH_LOG,
+};
 use tole_core::tool::Tool;
 
 /// How often the watcher folds the shared log. Notices are only ever
@@ -124,7 +126,8 @@ mod tests {
             "no log"
         );
         for bad in ["", "A-1", "a b", "a\n[x]", "../x"] {
-            let e = env_of(&[(ENV_AGENT_ID, bad), (ENV_TOUCH_LOG, "/x")]);
+            let pairs = [(ENV_AGENT_ID, bad), (ENV_TOUCH_LOG, "/x")];
+            let e = env_of(&pairs);
             assert_eq!(tracking_from_env(&e), None, "{bad:?}");
         }
     }
@@ -174,6 +177,9 @@ mod tests {
         }
         let t = track(Box::new(T), None, Path::new("/ws"));
         assert_eq!(t.name(), "read_file");
-        assert_eq!(t.execute(serde_json::json!({"path": "x"})).unwrap()["path"], "x");
+        assert_eq!(
+            t.execute(serde_json::json!({"path": "x"})).unwrap()["path"],
+            "x"
+        );
     }
 }
