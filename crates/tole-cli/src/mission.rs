@@ -13,7 +13,8 @@
 //!    the marker alone is not enough), or
 //! 3. a budget trips — `--max-steps` (provider steps across turns, from
 //!    the durable usage ledger) or `--max-minutes` (wall clock), or
-//! 4. the verify gate fails more than [`VERIFY_FAILURE_CAP`] times.
+//! 4. the verify gate has failed [`VERIFY_FAILURE_CAP`] times in total
+//!    (the count is cumulative across the mission, never reset by a pass).
 //!
 //! Exhaustion settles RESUMABLY (durable summary + pc=Final): a mission
 //! never leaves a dead session — `tole mission --resume <id>` (or a
@@ -33,8 +34,8 @@ use tole_core::turn::{run_turn, TurnOutcome};
 /// message containing this line declares the goal fully achieved.
 pub const MISSION_COMPLETE_MARKER: &str = "MISSION_COMPLETE";
 
-/// Verify-gate patience (issue #199): this many failed `--verify` runs
-/// settle the mission as `verify_failed` — the model gets each
+/// Verify-gate patience (issue #199): this many failed `--verify` runs in
+/// total (cumulative, not consecutive) settle the mission as `verify_failed` — the model gets each
 /// failure's output in context before the cap trips.
 pub const VERIFY_FAILURE_CAP: u32 = 3;
 

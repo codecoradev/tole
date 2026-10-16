@@ -632,6 +632,9 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                 // Approvals-only resume: the replayed guarded effect
                 // consults the approver, the one-shot matches, the tool
                 // executes. Runs off-thread — the turn may take a while.
+                // Bounded without the connection cap: an approval id is decided
+                // once (a repeat is 404 above) and pending approvals only come
+                // from the capped, one-turn-per-session map.
                 let sessions = Arc::clone(&state.sessions);
                 let sid = session_id.clone();
                 std::thread::spawn(move || {
