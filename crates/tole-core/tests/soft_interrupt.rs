@@ -312,3 +312,59 @@ fn without_interrupts_nothing_changes() {
     assert!(!s.entries().iter().any(is_interrupt));
     assert!(!s.entries().iter().any(|e| e.kind.as_str() == "error"));
 }
+
+#[test]
+fn a_notice_is_delivered_attributed_but_never_withdraws_output() {
+    // A tool call in flight is NOT withdrawn by a notice, a final answer is
+    // NOT superseded by one, and the entry says where it came from.
+    let dir = tmpdir("notice");
+    let mut s = JsonlStorage::create(&dir, "n", None).unwrap();
+    let cancel = CancelToken::default();
+    let runs = Arc::new(AtomicUsize::new(0));
+    let reg = registry(WorkTool {
+        runs: Arc::clone(&runs),
+        push_while_running: None,
+    });
+    let c = cancel.clone();
+    let mut p = Steered {
+        outputs: VecDeque::from([call_work(), final_text("done")]),
+        hook: Some(Box::new(move |n| {
+            // Pushed while the first call is in flight and again while the
+            // final answer is in flight.
+            c.interrupts()
+                .push_notice("child agent b changed a.rs")
+                .unwrap();
+            let _ = n;
+        })),
+        seen: vec![],
+    };
+    let out = run_turn_with_cancel(&mut s, &mut p, &reg, "go", &cancel).unwrap();
+    assert!(
+        matches!(out, TurnOutcome::Final { ref text, .. } if text == "done"),
+        "{out:?}"
+    );
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        1,
+        "the tool call was not withdrawn"
+    );
+    let entries = s.entries();
+    assert!(
+        !entries
+            .iter()
+            .any(|e| e.payload["error"] == json!("superseded by owner interrupt")),
+        "a notice never supersedes output"
+    );
+    let notice = entries
+        .iter()
+        .find(|e| is_interrupt(e))
+        .expect("notice delivered");
+    assert_eq!(notice.payload["source"], json!("notice"));
+    assert_eq!(notice.payload["urgent"], json!(false));
+    let text = notice.payload["text"].as_str().unwrap();
+    assert!(
+        text.contains("sibling notice") && text.contains("child agent b changed a.rs"),
+        "{text}"
+    );
+    assert_no_orphan_intents(entries);
+}

@@ -575,7 +575,7 @@ fn drive(
         // only by an URGENT one. Each drop is recorded durably, and the
         // next loop pass delivers the message at the safe point.
         let superseded = match &next {
-            ProviderOutput::Final { .. } => !cancel.interrupts().is_empty(),
+            ProviderOutput::Final { .. } => cancel.interrupts().has_owner(),
             ProviderOutput::ToolCall { .. } | ProviderOutput::InvalidToolArgs { .. } => {
                 cancel.interrupts().has_urgent()
             }
@@ -891,10 +891,10 @@ fn drive(
 /// that is all the provider sees.
 fn deliver_interrupts(s: &mut dyn Storage, cancel: &CancelToken) -> Result<(), StorageError> {
     for i in cancel.interrupts().drain() {
-        let tag = if i.urgent {
-            "owner interrupt · urgent"
-        } else {
-            "owner interrupt"
+        let (tag, source) = match (i.source, i.urgent) {
+            (crate::interrupt::Source::Notice, _) => ("sibling notice", "notice"),
+            (crate::interrupt::Source::Owner, true) => ("owner interrupt · urgent", "owner"),
+            (crate::interrupt::Source::Owner, false) => ("owner interrupt", "owner"),
         };
         s.commit(Commit::new().entry(NewEntry::root(
             EntryType::new(EntryType::MESSAGE),
@@ -902,6 +902,7 @@ fn deliver_interrupts(s: &mut dyn Storage, cancel: &CancelToken) -> Result<(), S
                 "role": "user",
                 "text": format!("[{tag} — injected mid-turn, not part of the original request] {}", i.text),
                 "interrupt": true,
+                "source": source,
                 "urgent": i.urgent,
             }),
         )))?;

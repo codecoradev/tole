@@ -70,6 +70,7 @@ pub mod replay;
 pub mod run_command;
 // Approval-surface text sanitizer (#327): crate-internal, no public API.
 pub(crate) mod sanitize;
+pub mod sibling_watch;
 pub mod skills;
 pub mod state;
 pub mod storage;
