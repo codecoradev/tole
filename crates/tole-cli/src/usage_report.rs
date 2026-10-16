@@ -55,15 +55,18 @@ pub struct UsageReport {
     pub history_growth_per_step: Option<f64>,
 }
 
-/// True when the ledger row carries a provider-reported usage object,
-/// i.e. it is NOT a wire-only row (`{"tole_wire": ...}` and nothing
-/// else, stored when a provider reports request sizes but no usage).
-/// The single definition of "provider step" for the mission step budget,
-/// `fact/mission.steps` and the report, so wire-only rows never change
-/// step accounting (#211).
+/// True when the ledger row carries a provider-reported usage object, i.e.
+/// it is NOT a row holding only tole's own namespaced keys (`tole_wire`,
+/// stored when a provider reports request sizes but no usage, #211;
+/// `tole_route`, the failover route, #209). The single definition of
+/// "provider step" for the mission step budget, `fact/mission.steps` and
+/// the report, so such rows never change step accounting.
 pub fn reports_provider_usage(rec: &UsageRecord) -> bool {
     match rec.usage.as_object() {
-        Some(o) => !(o.len() == 1 && o.contains_key("tole_wire")),
+        // Only tole's own namespaced keys (`tole_wire`, `tole_route`, ...):
+        // the provider reported nothing for this step.
+        // An empty object still counts (the pre-#211 contract).
+        Some(o) => o.is_empty() || o.keys().any(|k| !k.starts_with("tole_")),
         None => true,
     }
 }
@@ -673,6 +676,18 @@ mod tests {
         let t = turn_stats(&entries, &[rec_at("e_3", json!({"prompt_tokens": 4}))]);
         assert_eq!(t.len(), 1);
         assert_eq!(t[0].input_tokens, Some(4));
+    }
+
+    #[test]
+    fn rows_with_only_tole_keys_are_not_provider_steps() {
+        let route_only = rec(json!({"tole_route": {"provider": "reserve"}}));
+        let wire_and_route =
+            rec(json!({"tole_wire": wire(1, 2, 3), "tole_route": {"provider": "p"}}));
+        let real = rec(json!({"prompt_tokens": 4, "tole_route": {"provider": "p"}}));
+        assert!(!reports_provider_usage(&route_only));
+        assert!(!reports_provider_usage(&wire_and_route));
+        assert!(reports_provider_usage(&real));
+        assert_eq!(provider_steps(&[route_only, wire_and_route, real]), 1);
     }
 
     #[test]
