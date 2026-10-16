@@ -244,7 +244,8 @@ fn new_agent_id() -> String {
     format!("a-{ms:x}-{:x}-{n:x}", std::process::id())
 }
 
-pub(crate) fn valid_agent_id(id: &str) -> bool {
+/// The agent-id charset: see [`crate::sibling_watch::valid_agent_id`].
+pub fn valid_agent_id(id: &str) -> bool {
     crate::sibling_watch::valid_agent_id(id)
 }
 
@@ -662,6 +663,13 @@ impl Tool for AgentStartTool {
         // needs the provider key. Isolation = depth cap + jail + the
         // approved child allowlist (see the module doc).
         cmd.env("TOLE_AGENT_DEPTH", "1")
+            // Sibling change notices (#380): the child's identity and the
+            // shared touch log every sibling of this parent appends to.
+            .env(crate::sibling_watch::ENV_AGENT_ID, &id)
+            .env(
+                crate::sibling_watch::ENV_TOUCH_LOG,
+                agents_root(&self.root).join("touch.log"),
+            )
             .env("TOLE_MEMORY_NAMESPACE", &mailbox_ns)
             .env("TOLE_MEMORY", "uteke")
             .arg("run")
@@ -1190,6 +1198,50 @@ mod tests {
             assert_eq!(
                 argv[prompt_pos], "--yes sneaky mission",
                 "prompt must be the positional after --: {argv:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// #380: the child learns its own id and the shared touch log of this
+    /// parent through the environment.
+    #[test]
+    fn child_gets_its_id_and_the_shared_touch_log_in_env() {
+        let d = tmp("sibenv");
+        #[cfg(unix)]
+        {
+            let p = d.join("dump-env");
+            let dump = d.join("env.txt");
+            let script = format!(
+                "#!/bin/sh\nprintf '%s\\n%s\\n' \"$TOLE_AGENT_ID\" \"$TOLE_AGENT_TOUCH_LOG\" > \"{}\"\nexit 0\n",
+                dump.display()
+            );
+            std::fs::write(&p, script).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755));
+            let out = AgentStartTool::new(&p, d.clone())
+                .execute(json!({"prompt": "x"}))
+                .unwrap();
+            let mut dumped = None;
+            for _ in 0..50 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                if let Ok(t) = std::fs::read_to_string(&dump) {
+                    if t.lines().count() >= 2 {
+                        dumped = Some(t);
+                        break;
+                    }
+                }
+            }
+            let dumped = dumped.expect("child never dumped its env");
+            let mut lines = dumped.lines();
+            let id = out["agent"].as_str().unwrap();
+            assert_eq!(lines.next(), Some(id));
+            assert!(valid_agent_id(id));
+            let log = lines.next().unwrap();
+            assert_eq!(
+                std::path::Path::new(log),
+                agents_root(&d).join("touch.log"),
+                "all siblings of one parent share one log"
             );
         }
         let _ = std::fs::remove_dir_all(&d);

@@ -1471,6 +1471,8 @@ fn build_registry(
     #[cfg_attr(not(feature = "shell-tools"), allow(unused_variables))]
     let cwd = std::env::current_dir().context("resolving cwd")?;
     let file_root = resolve_workspace_root(workspace)?;
+    // Child agents (#380): present only when spawned by `agent_start`.
+    let tracking = tole_cli::sibling::tracking_from_env(&tole_cli::config_apply::real_env);
     // Uteke first-class (B4): recall (read) + document (write), behind
     // startup probing — a missing uteke binary degrades to a warning,
     // not phantom tools.
@@ -1543,8 +1545,12 @@ fn build_registry(
         )))
         .map_err(|e| anyhow::anyhow!("registering agent_poll: {e}"))?;
     }
-    reg.register(Box::new(ReadFileTool::new(file_root.clone())))
-        .map_err(|e| anyhow::anyhow!("registering read_file: {e}"))?;
+    reg.register(tole_cli::sibling::track(
+        Box::new(ReadFileTool::new(file_root.clone())),
+        tracking.as_ref(),
+        &file_root,
+    ))
+    .map_err(|e| anyhow::anyhow!("registering read_file: {e}"))?;
     // Web tools (issue #215): probe-first — fetch always; search only
     // with TOLE_WEB_SEARCH_URL.
     reg.register(Box::new(tole_core::web::WebFetchTool))
@@ -1554,10 +1560,18 @@ fn build_registry(
             .map_err(|e| anyhow::anyhow!("registering web_search: {e}"))?;
     }
     // Write tools: gated per call. The jail root is the workspace.
-    reg.register(Box::new(WriteFileTool::new(file_root.clone())))
-        .map_err(|e| anyhow::anyhow!("registering write_file: {e}"))?;
-    reg.register(Box::new(EditFileTool::new(file_root.clone())))
-        .map_err(|e| anyhow::anyhow!("registering edit_file: {e}"))?;
+    reg.register(tole_cli::sibling::track(
+        Box::new(WriteFileTool::new(file_root.clone())),
+        tracking.as_ref(),
+        &file_root,
+    ))
+    .map_err(|e| anyhow::anyhow!("registering write_file: {e}"))?;
+    reg.register(tole_cli::sibling::track(
+        Box::new(EditFileTool::new(file_root.clone())),
+        tracking.as_ref(),
+        &file_root,
+    ))
+    .map_err(|e| anyhow::anyhow!("registering edit_file: {e}"))?;
     #[cfg(feature = "shell-tools")]
     {
         register_gh(&mut reg, &cwd)?;
@@ -1569,8 +1583,12 @@ fn build_registry(
         .map_err(|e| anyhow::anyhow!("registering git: {e}"))?;
     // Destructive tools: interactive-approver-only registration; every
     // call prompts — allowlists and --yes never apply (PRD risk table).
-    reg.register(Box::new(DeleteFileTool::new(file_root)))
-        .map_err(|e| anyhow::anyhow!("registering delete_file: {e}"))?;
+    reg.register(tole_cli::sibling::track(
+        Box::new(DeleteFileTool::new(file_root.clone())),
+        tracking.as_ref(),
+        &file_root,
+    ))
+    .map_err(|e| anyhow::anyhow!("registering delete_file: {e}"))?;
     // MCP servers (#74): registered last so a slow server never blocks
     // native tool availability; per-call approval applies as usual.
     #[cfg(feature = "mcp")]
@@ -1624,6 +1642,8 @@ fn build_server_registry(
         ToolRegistry::with_approver(AllowlistApprover::allow_only(allow_patterns.to_vec()));
     let cwd = std::env::current_dir().context("resolving cwd")?;
     let file_root = resolve_workspace_root(workspace)?;
+    // Child agents (#380): present only when spawned by `agent_start`.
+    let tracking = tole_cli::sibling::tracking_from_env(&tole_cli::config_apply::real_env);
     let count = |reg: &ToolRegistry| reg.specs().len();
 
     #[cfg(feature = "shell-tools")]
@@ -1675,8 +1695,12 @@ fn build_server_registry(
         reg.register(Box::new(t))
             .map_err(|e| anyhow::anyhow!("registering systemone_decide: {e}"))?;
     }
-    reg.register(Box::new(ReadFileTool::new(file_root.clone())))
-        .map_err(|e| anyhow::anyhow!("registering read_file: {e}"))?;
+    reg.register(tole_cli::sibling::track(
+        Box::new(ReadFileTool::new(file_root.clone())),
+        tracking.as_ref(),
+        &file_root,
+    ))
+    .map_err(|e| anyhow::anyhow!("registering read_file: {e}"))?;
     // Web tools (issue #215): probe-first — fetch always; search only
     // with TOLE_WEB_SEARCH_URL.
     reg.register(Box::new(tole_core::web::WebFetchTool))
@@ -1685,10 +1709,18 @@ fn build_server_registry(
         reg.register(Box::new(tole_core::web::WebSearchTool::from_env().unwrap()))
             .map_err(|e| anyhow::anyhow!("registering web_search: {e}"))?;
     }
-    reg.register(Box::new(WriteFileTool::new(file_root.clone())))
-        .map_err(|e| anyhow::anyhow!("registering write_file: {e}"))?;
-    reg.register(Box::new(EditFileTool::new(file_root.clone())))
-        .map_err(|e| anyhow::anyhow!("registering edit_file: {e}"))?;
+    reg.register(tole_cli::sibling::track(
+        Box::new(WriteFileTool::new(file_root.clone())),
+        tracking.as_ref(),
+        &file_root,
+    ))
+    .map_err(|e| anyhow::anyhow!("registering write_file: {e}"))?;
+    reg.register(tole_cli::sibling::track(
+        Box::new(EditFileTool::new(file_root.clone())),
+        tracking.as_ref(),
+        &file_root,
+    ))
+    .map_err(|e| anyhow::anyhow!("registering edit_file: {e}"))?;
     #[cfg(feature = "shell-tools")]
     {
         register_gh(&mut reg, &cwd)?;
@@ -1930,6 +1962,11 @@ fn run_command(
     // token at the deadline; the loop's checkpoints unwind it into a
     // durable Cancelled — resumable, never dead.
     let cancel = tole_core::cancel::CancelToken::default();
+    // Child agents (#380): fold the shared touch log and queue a notice at
+    // the next safe point when a sibling changes a file this child read or
+    // wrote. A no-op outside a child.
+    let _sibling_watcher = tole_cli::sibling::tracking_from_env(&tole_cli::config_apply::real_env)
+        .map(|t| tole_cli::sibling::start_watcher(&t, &cancel, tole_cli::sibling::POLL_INTERVAL));
     let timer = timeout_secs.map(|secs| {
         let token = cancel.clone();
         std::thread::spawn(move || {
