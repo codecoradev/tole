@@ -402,7 +402,7 @@ impl Tool for SessionStatusTool {
                 json!(guard.entries().len()),
                 // Issue #211: additive usage report (same object as the
                 // serve status JSON).
-                crate::usage_report::usage_report(guard.usages()).to_json(),
+                crate::usage_report::usage_json(guard.entries(), guard.usages()),
             ),
             Err(_) => (json!(null), json!(null)), // turn in flight
         };

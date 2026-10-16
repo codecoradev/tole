@@ -2125,6 +2125,10 @@ fn status_command(sessions_dir: &Path, id: &str) -> Result<()> {
     for line in tole_cli::usage_report::usage_report(usage).render_lines() {
         println!("{line}");
     }
+    // Issue #379: per user-turn stats from the same ledger.
+    for line in tole_cli::usage_report::turn_lines(storage.entries(), usage) {
+        println!("{line}");
+    }
     Ok(())
 }
 
