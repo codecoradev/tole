@@ -138,7 +138,7 @@ routing via `session_id`. Est: M–L.
 
 ---
 
-## Post-D3 — shipped on develop (synced 2026-10-05)
+## Post-D3 — shipped on develop (synced 2026-10-16)
 
 Everything below is merged; CHANGELOG entries carry the detail.
 
@@ -215,6 +215,25 @@ Everything below is merged; CHANGELOG entries carry the detail.
   `tole status`/serve status (#356), `read_file` 20,000-char cap with `offset`/`limit` continuation (#357),
   wire-size reference missions with a CI bound (#358), two scan-found fixes (#360); scan backlog in #361.
   Deferred: lazy tool registration, history trimming, non-cached budget accounting.
+- **0.8.2 Hardening patch (on develop, not yet tagged):** `tole serve` HTTP framing,
+  slow-client limits and a constant-time token check (#361/#364), cancel during replay
+  approval settles `cancelled` (#365), scan follow-ups (#366/#369), rustls advisories
+  (#376), MCP transport parity with REST — failed-auth limiter, body ceiling, resilient
+  accept (#400).
+- **Next feature set (on develop, unreleased; synced 2026-10-16):** each issue stays open
+  until its live E2E against a real provider has run.
+  - `tole doctor` — offline/catalog/full tiers and a coverage ledger (#378: #388/#390/#392,
+    follow-ups #401).
+  - Per-user-turn token stats in `tole status` and the status JSON (#379: #389).
+  - Soft interrupts — steer a running turn at its safe point, serve/MCP entry points
+    (#377: #391/#393).
+  - Memory injection hygiene — bounded, deduped, all-or-nothing recall (#384: #387).
+  - Sibling change notices between child agents (#380: #394/#395, #401).
+  - Typed child-agent handoff, roles and the verify gate (#383: #396/#397/#398;
+    design in `docs/child-agents-handoff.md`).
+- **Open backlog:** provider failover chain (#209), session branching (#210), multimodal
+  input (#212), MCP prompts/resources as quick commands (#213), background detach (#217),
+  Claude Code session resume (#381); the multi-client daemon note (#382) is parked.
 
 ---
 
