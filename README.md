@@ -118,6 +118,20 @@ trust: `internal` / `read_only`), `--skill <path>` (load a SKILL.md),
 | `TOLE_NO_UPDATE_CHECK` | `1` disables the startup update-check banner (issue #220) |
 | `TOLE_MEMORY_NAMESPACE` | override the loop's namespace (default: `repo-<directory name>`) |
 
+## Provider doctor
+
+`tole doctor` answers "is this provider/model actually usable?" in tiers:
+
+| `--tier` | Checks |
+|----------|--------|
+| `offline` | config resolves, base URL shape, key present (no network) |
+| `catalog` (default) | live `GET /models`; the configured model must be served |
+
+Tiers are cumulative and stop at the first blocker, which is printed with
+the command that fixes it. The exit code is non-zero when the requested
+tier is not reached. API keys and URL credentials never appear in the
+output.
+
 ## Configuration (project file)
 
 `<cwd>/.tole/config.toml` (no parent-directory walk) holds per-project defaults.
