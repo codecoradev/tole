@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - `tole doctor` (#378): tiered provider diagnostics — `offline` (wiring) and `catalog` (live `/models`, the model must be served); each blocker carries its fix command, the exit code is non-zero when the requested tier is not reached, and keys / URL credentials are never printed.
+- Per-user-turn token stats (#379): `tole status` lists input / output / cache-read / cache-write / reasoning tokens per turn and the status JSON (`GET /sessions/{id}/status`, `tole_session_status`) gains an additive `usage_report.turns` array. Derived from the durable usage ledger, so old sessions read the same way and nothing is stored twice; a value no step reported is `n/a` / `null`, never 0, and no elapsed time is invented.
 
 ### Changed
 - Memory loop injection hygiene (#384): the recalled batch is hard-capped at 24 items / 64 KiB and deduplicated; a malformed recall payload (non-array, or a hit without content) now fails the whole batch visibly instead of silently injecting fewer items; `tole serve`/MCP sessions report recall failures on stderr like the CLI does.
@@ -30,6 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `read_file` rejects an empty `path` with a clear message instead of a confusing "is a directory" error.
 
 ### Added
+- Per-user-turn token stats (#379): `tole status` lists input / output / cache-read / cache-write / reasoning tokens per turn and the status JSON (`GET /sessions/{id}/status`, `tole_session_status`) gains an additive `usage_report.turns` array. Derived from the durable usage ledger, so old sessions read the same way and nothing is stored twice; a value no step reported is `n/a` / `null`, never 0, and no elapsed time is invented.
 - `tole status` and the serve status JSON now report token usage, cache-hit rate and a per-step request-size split (system+tools vs history, stored per step under `tole_wire` in the usage record); `fact/mission` gains `cached_tokens`. Instrumentation only: the wire, budgets and durable entry shapes are unchanged (#211, part 1 of 3).
 
 ### Changed

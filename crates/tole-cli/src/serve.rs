@@ -675,7 +675,7 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                             Ok(guard) => (
                                 Some(guard.entries().len()),
                                 // Issue #211: additive usage report.
-                                tole_cli::usage_report::usage_report(guard.usages()).to_json(),
+                                tole_cli::usage_report::usage_json(guard.entries(), guard.usages()),
                             ),
                             // turn in flight — skip the count and report
                             Err(_) => (None, json!(null)),
