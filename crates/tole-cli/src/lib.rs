@@ -7,6 +7,7 @@ pub mod approver;
 pub mod config;
 pub mod config_apply;
 pub mod config_trust;
+pub mod doctor;
 pub mod session_host;
 pub mod session_tools;
 pub mod tools;

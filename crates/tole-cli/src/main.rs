@@ -1,6 +1,6 @@
 //! CLI host for tole-core: arg parsing and session wiring.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
@@ -315,6 +315,16 @@ enum Command {
     },
     /// List sessions in the sessions dir, newest first.
     Sessions,
+
+    /// Is the configured provider/model actually usable? Tiered checks —
+    /// offline (wiring), catalog (live /models), full (chat + streaming +
+    /// a real tool-call loop). Exits non-zero when the requested tier is not reached, so `--tier full`
+    /// is the release-validation gate.
+    Doctor {
+        /// offline | catalog.
+        #[arg(long, default_value = "catalog")]
+        tier: String,
+    },
 
     /// Show durable state of a session.
     Status {
@@ -1029,6 +1039,16 @@ fn dispatch(cli: Cli) -> Result<()> {
             })
         }
         Command::Sessions => sessions_command(&sessions_dir),
+        Command::Doctor { tier } => {
+            let Some(tier) = tole_cli::doctor::Tier::parse(&tier) else {
+                bail!("--tier must be offline or catalog (got {tier:?})");
+            };
+            let cfg = config_apply::provider_config();
+            if !tole_cli::doctor::run_cli(cfg.as_ref(), &config_apply::real_env, tier) {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
         Command::Status { id } => status_command(&sessions_dir, &id),
         Command::Chat {
             system: _,

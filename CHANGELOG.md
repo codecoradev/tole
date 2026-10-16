@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `tole doctor` (#378): tiered provider diagnostics — `offline` (wiring) and `catalog` (live `/models`, the model must be served); each blocker carries its fix command, the exit code is non-zero when the requested tier is not reached, and keys / URL credentials are never printed.
 - Per-user-turn token stats (#379): `tole status` lists input / output / cache-read / cache-write / reasoning tokens per turn and the status JSON (`GET /sessions/{id}/status`, `tole_session_status`) gains an additive `usage_report.turns` array. Derived from the durable usage ledger, so old sessions read the same way and nothing is stored twice; a value no step reported is `n/a` / `null`, never 0, and no elapsed time is invented.
 
 ### Changed
