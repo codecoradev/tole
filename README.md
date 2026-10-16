@@ -308,8 +308,11 @@ neither trigger nor suppress it:
   stored back — the next session's recall can find it.
 
 The namespace follows the ecosystem `repo-<dir>` convention
-(`TOLE_MEMORY_NAMESPACE` overrides). Every memory failure degrades to a
-stderr note; the turn proceeds without memory.
+(`TOLE_MEMORY_NAMESPACE` overrides). The injected batch is hard-capped
+at 24 items / 64 KiB (a larger `limit` is clamped; a hit is never cut
+mid-way) and deduplicated. A batch is all-or-nothing: an unparseable
+recall payload fails the whole batch with a stderr note rather than
+injecting fewer items, and the turn proceeds without memory.
 
 ## Workspace layout
 

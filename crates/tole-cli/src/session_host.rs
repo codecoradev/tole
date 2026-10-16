@@ -537,11 +537,15 @@ pub fn run_session_turn(
         let done = *first_prompt_done.lock().expect("fpd lock");
         if !done {
             if let Some(mem) = &memory {
-                if let Ok(block) = tole_core::memory::recall_block(mem, prompt) {
-                    if !block.is_empty() {
+                match tole_core::memory::recall_block(mem, prompt) {
+                    Ok(block) if !block.is_empty() => {
                         eprintln!("tole: memory: recalled context injected");
                         effective = format!("{prompt}{block}");
                     }
+                    Ok(_) => {}
+                    // Visible, never silent (#384): the turn still runs on
+                    // the bare prompt — memory is not a dependency.
+                    Err(e) => eprintln!("tole: memory recall failed (continuing without): {e}"),
                 }
             }
         }
