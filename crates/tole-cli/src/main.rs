@@ -1473,6 +1473,11 @@ fn build_registry(
     let file_root = resolve_workspace_root(workspace)?;
     // Child agents (#380): present only when spawned by `agent_start`.
     let tracking = tole_cli::sibling::tracking_from_env(&tole_cli::config_apply::real_env);
+    // Role children (#383) get the handoff tool; everyone else does not.
+    if let Some(tool) = tole_cli::handoff::tool_from_env(&tole_cli::config_apply::real_env) {
+        reg.register(Box::new(tool))
+            .map_err(|e| anyhow::anyhow!("registering handoff_submit: {e}"))?;
+    }
     // Uteke first-class (B4): recall (read) + document (write), behind
     // startup probing — a missing uteke binary degrades to a warning,
     // not phantom tools.
@@ -1644,6 +1649,11 @@ fn build_server_registry(
     let file_root = resolve_workspace_root(workspace)?;
     // Child agents (#380): present only when spawned by `agent_start`.
     let tracking = tole_cli::sibling::tracking_from_env(&tole_cli::config_apply::real_env);
+    // Role children (#383) get the handoff tool; everyone else does not.
+    if let Some(tool) = tole_cli::handoff::tool_from_env(&tole_cli::config_apply::real_env) {
+        reg.register(Box::new(tool))
+            .map_err(|e| anyhow::anyhow!("registering handoff_submit: {e}"))?;
+    }
     let count = |reg: &ToolRegistry| reg.specs().len();
 
     #[cfg(feature = "shell-tools")]
