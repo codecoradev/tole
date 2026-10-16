@@ -24,7 +24,6 @@
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
-use tole_core::openai::OpenAiProvider;
 use tole_core::storage::{JsonlStorage, Storage};
 use tole_core::subprocess::run_with_timeout;
 use tole_core::tool::ToolRegistry;
@@ -269,7 +268,12 @@ pub fn run_mission(
             .map_err(|e| anyhow::anyhow!("registering todo_write: {e}"))?;
     }
 
-    let mut provider = OpenAiProvider::new(provider_cfg).with_tool_specs(registry.specs());
+    let specs = registry.specs();
+    let mut provider =
+        tole_cli::provider_chain::build(provider_cfg, &tole_cli::config_apply::real_env, |p| {
+            p.with_tool_specs(specs.clone())
+        })
+        .map_err(|e| anyhow::anyhow!(e))?;
 
     let mut turns: u64 = 0;
     let mut verify_failures: u32 = 0;

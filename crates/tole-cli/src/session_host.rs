@@ -598,22 +598,26 @@ pub fn run_session_turn(
     {
         cfg.model = model.to_string();
     }
-    let mut provider =
-        tole_core::openai::OpenAiProvider::new(cfg).with_tool_specs(registry.specs());
-    if let Some(sys) = system_prompt.as_deref() {
-        provider = provider.with_system_prompt(sys);
-    }
     // Live-token sinks (issue #196 phase 3): when an observer is wired
     // (ACP), streamed reasoning/content deltas flow to it DURING the
-    // provider call; the decisive output semantics are unchanged.
-    if let Some(o) = observer.as_ref() {
-        let ot = StdArc::clone(o);
-        let or = StdArc::clone(o);
-        provider = provider.with_delta_sinks(
-            Some(StdArc::new(move |t: &str| ot.text_delta(t))),
-            Some(StdArc::new(move |r: &str| or.reasoning(r))),
-        );
-    }
+    // provider call; the decisive output semantics are unchanged. The same
+    // configuration applies to a reserve provider (#209).
+    let specs = registry.specs();
+    let mut provider = crate::provider_chain::build(cfg, &crate::config_apply::real_env, |p| {
+        let mut p = p.with_tool_specs(specs.clone());
+        if let Some(sys) = system_prompt.as_deref() {
+            p = p.with_system_prompt(sys);
+        }
+        if let Some(o) = observer.as_ref() {
+            let ot = StdArc::clone(o);
+            let or = StdArc::clone(o);
+            p = p.with_delta_sinks(
+                Some(StdArc::new(move |t: &str| ot.text_delta(t))),
+                Some(StdArc::new(move |r: &str| or.reasoning(r))),
+            );
+        }
+        p
+    })?;
 
     let outcome = tole_core::turn::run_turn_with_observer(
         &mut *storage,
@@ -687,11 +691,14 @@ pub fn resume_session_turn(
     {
         cfg.model = model.to_string();
     }
-    let mut provider =
-        tole_core::openai::OpenAiProvider::new(cfg).with_tool_specs(registry.specs());
-    if let Some(sys) = system_prompt.as_deref() {
-        provider = provider.with_system_prompt(sys);
-    }
+    let specs = registry.specs();
+    let mut provider = crate::provider_chain::build(cfg, &crate::config_apply::real_env, |p| {
+        let p = p.with_tool_specs(specs.clone());
+        match system_prompt.as_deref() {
+            Some(sys) => p.with_system_prompt(sys),
+            None => p,
+        }
+    })?;
     // #318: the session token is wired into the replan loop, so
     // `/cancel` during an approval-resume settles the turn as cancelled.
     // The `reset()` above stays: like `run_session_turn`, it runs inside
