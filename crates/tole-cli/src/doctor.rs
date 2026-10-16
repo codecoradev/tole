@@ -6,16 +6,34 @@
 //!   present). No network.
 //! - **catalog** — live `GET /models`; the configured model must be served
 //!   (when the gateway lists models at all).
+//! - **full** — three real calls through the real turn loop: a plain chat
+//!   completion, a streamed one, and a tool-call loop (the model must call
+//!   a probe tool and the loop must settle). This is the release gate: a
+//!   `full` green is the precondition for "ready to release" claims.
 //!
 //! Tiers are cumulative and stop at the first blocker, which carries the
 //! command that fixes it.
 
-use tole_core::openai::{fetch_model_ids, OpenAiConfig, ENV_PREFIXES};
+use serde_json::{json, Value};
+use std::path::PathBuf;
+use std::time::Duration;
+use tole_core::approval::{Approver, ToolRequest, Verdict};
+use tole_core::openai::{fetch_model_ids, OpenAiConfig, OpenAiProvider, ENV_PREFIXES};
+use tole_core::storage::JsonlStorage;
+use tole_core::tool::{Risk, Tool, ToolRegistry};
+use tole_core::turn::{run_turn, TurnOutcome};
+
+/// Per-call timeout of the `full` tier.
+const FULL_CALL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Marker the probe tool must receive back from the model (not a secret).
+const PROBE_MARKER: &str = "doctor-marker-7f3a";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Tier {
     Offline,
     Catalog,
+    Full,
 }
 
 impl Tier {
@@ -23,6 +41,7 @@ impl Tier {
         match self {
             Tier::Offline => "offline",
             Tier::Catalog => "catalog",
+            Tier::Full => "full",
         }
     }
 
@@ -30,6 +49,7 @@ impl Tier {
         match s {
             "offline" => Some(Tier::Offline),
             "catalog" => Some(Tier::Catalog),
+            "full" => Some(Tier::Full),
             _ => None,
         }
     }
@@ -117,6 +137,194 @@ fn base_url_ok(url: &str) -> bool {
     match rest {
         Some(r) => !r.is_empty() && !r.starts_with('/') && !url.chars().any(char::is_whitespace),
         None => false,
+    }
+}
+
+struct DenyAll;
+impl Approver for DenyAll {
+    fn decide(&self, _req: &ToolRequest<'_>) -> Verdict {
+        Verdict::Deny
+    }
+}
+
+/// ReadOnly probe the model must call in the `full` tier.
+struct ProbeTool {
+    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    saw_token: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Tool for ProbeTool {
+    fn name(&self) -> &str {
+        "doctor_probe"
+    }
+    fn risk(&self) -> Risk {
+        Risk::ReadOnly
+    }
+    fn summary(&self) -> String {
+        "Diagnostic probe: echoes the given marker back. Call it exactly once when asked.".into()
+    }
+    fn spec(&self) -> Option<Value> {
+        Some(json!({
+            "type": "object",
+            "properties": {"marker": {"type": "string", "description": "The marker to echo."}},
+            "required": ["marker"]
+        }))
+    }
+    fn execute(&self, input: Value) -> Result<Value, String> {
+        use std::sync::atomic::Ordering;
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if input["marker"].as_str() == Some(PROBE_MARKER) {
+            self.saw_token.store(true, Ordering::SeqCst);
+        }
+        Ok(json!({ "echo": input["marker"], "ok": true }))
+    }
+}
+
+fn scratch_dir(tag: &str) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir =
+        std::env::temp_dir().join(format!("tole-doctor-{}-{tag}-{nanos}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// Run one prompt through the real turn loop against the real provider.
+fn drive(
+    cfg: &OpenAiConfig,
+    streaming: bool,
+    registry: &ToolRegistry,
+    prompt: &str,
+    tag: &str,
+) -> Result<TurnOutcome, String> {
+    let dir = scratch_dir(tag);
+    let result = (|| {
+        let mut storage = JsonlStorage::create(&dir, format!("doctor-{tag}"), None)
+            .map_err(|e| format!("cannot create the scratch session: {e}"))?;
+        let mut provider = OpenAiProvider::new(cfg.clone())
+            .with_streaming(streaming)
+            .with_timeout(FULL_CALL_TIMEOUT)
+            .with_tool_specs(registry.specs());
+        run_turn(&mut storage, &mut provider, registry, prompt).map_err(|e| e.to_string())
+    })();
+    let _ = std::fs::remove_dir_all(&dir);
+    result
+}
+
+fn describe_outcome(o: &TurnOutcome) -> String {
+    match o {
+        TurnOutcome::Final { .. } => "final answer".into(),
+        TurnOutcome::ProviderFailed { message } => format!("provider failed: {message}"),
+        TurnOutcome::UnknownTool { name } => format!("model asked for unknown tool {name:?}"),
+        TurnOutcome::LoopDetected { tool, count } => {
+            format!("model repeated {tool:?} {count} times")
+        }
+        TurnOutcome::BudgetExhausted => "step budget exhausted".into(),
+        TurnOutcome::ApprovalRequired { name } => format!("tool {name:?} needed approval"),
+        other => format!("unexpected turn outcome: {other:?}"),
+    }
+}
+
+/// One plain-text check (`chat` or `stream`): a non-empty final answer.
+fn text_check(cfg: &OpenAiConfig, streaming: bool, out: &mut Outcome) -> bool {
+    let check: &'static str = if streaming { "stream" } else { "chat" };
+    let reg = ToolRegistry::with_approver(DenyAll);
+    match drive(
+        cfg,
+        streaming,
+        &reg,
+        "Reply with the single word PONG.",
+        check,
+    ) {
+        Ok(TurnOutcome::Final { text, .. }) if !text.trim().is_empty() => {
+            out.pass(format!("{check}: model answered"));
+            true
+        }
+        Ok(TurnOutcome::Final { .. }) => {
+            out.fail(
+                Tier::Full,
+                check,
+                "the model returned an empty answer".into(),
+                "tole run \"Reply with the single word PONG.\"".into(),
+            );
+            false
+        }
+        Ok(other) => {
+            out.fail(
+                Tier::Full,
+                check,
+                describe_outcome(&other),
+                "tole run \"Reply with the single word PONG.\"".into(),
+            );
+            false
+        }
+        Err(e) => {
+            out.fail(Tier::Full, check, e, "tole run \"ping\"".into());
+            false
+        }
+    }
+}
+
+/// The tool-call loop: the model must call the probe with the token and
+/// the loop must settle on a final answer afterwards.
+fn tools_check(cfg: &OpenAiConfig, out: &mut Outcome) -> bool {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let saw_token = Arc::new(AtomicBool::new(false));
+    let mut reg = ToolRegistry::with_approver(DenyAll);
+    let probe = ProbeTool {
+        calls: Arc::clone(&calls),
+        saw_token: Arc::clone(&saw_token),
+    };
+    if let Err(e) = reg.register(Box::new(probe)) {
+        out.fail(
+            Tier::Full,
+            "tools",
+            format!("cannot register the probe tool: {e}"),
+            "report this as a tole bug".into(),
+        );
+        return false;
+    }
+    let prompt = format!(
+        "Call the tool doctor_probe exactly once with {{\"marker\":\"{PROBE_MARKER}\"}}, \
+         then reply with the word DONE."
+    );
+    let fix = "pick a model with tool-calling support: export TOLE_MODEL=<model>".to_string();
+    match drive(cfg, true, &reg, &prompt, "tools") {
+        Ok(TurnOutcome::Final { .. }) => {
+            if calls.load(Ordering::SeqCst) == 0 {
+                out.fail(
+                    Tier::Full,
+                    "tools",
+                    "the model answered without calling the probe tool (tool calling not working)"
+                        .into(),
+                    fix,
+                );
+                false
+            } else if !saw_token.load(Ordering::SeqCst) {
+                out.fail(
+                    Tier::Full,
+                    "tools",
+                    "the model called the probe tool with the wrong arguments".into(),
+                    fix,
+                );
+                false
+            } else {
+                out.pass("tools: tool-call loop completed".into());
+                true
+            }
+        }
+        Ok(other) => {
+            out.fail(Tier::Full, "tools", describe_outcome(&other), fix);
+            false
+        }
+        Err(e) => {
+            out.fail(Tier::Full, "tools", e, fix);
+            false
+        }
     }
 }
 
@@ -255,6 +463,17 @@ fn diagnose_raw(
         }
     }
     out.reached = Some(Tier::Catalog);
+    if requested == Tier::Catalog {
+        return out;
+    }
+
+    // ---- full ----
+    if text_check(cfg, false, &mut out)
+        && text_check(cfg, true, &mut out)
+        && tools_check(cfg, &mut out)
+    {
+        out.reached = Some(Tier::Full);
+    }
     out
 }
 
@@ -280,11 +499,9 @@ pub fn run_cli(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::{json, Value};
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::Arc;
-    use std::time::Duration;
 
     fn no_env(_: &str) -> Option<String> {
         None
@@ -341,14 +558,55 @@ mod tests {
         format!("http://{addr}/v1")
     }
 
-    /// A provider that serves `GET /models` with the given ids.
-    fn models_provider(models: Vec<&'static str>) -> String {
-        serve(Arc::new(move |method, path, _| {
+    fn sse_text(text: &str) -> String {
+        format!(
+            "data: {}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n",
+            json!({"choices":[{"delta":{"role":"assistant","content":text}}]})
+        )
+    }
+
+    fn sse_tool(args: &str) -> String {
+        format!(
+            "data: {}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n",
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1",
+                "function":{"name":"doctor_probe","arguments":args}}]}}]})
+        )
+    }
+
+    /// A well-behaved provider; `calls_tool` toggles tool-calling.
+    fn good_provider(models: Vec<&'static str>, calls_tool: bool) -> String {
+        serve(Arc::new(move |method, path, body| {
             if method == "GET" && path.ends_with("/models") {
                 let data: Vec<Value> = models.iter().map(|m| json!({"id": m})).collect();
-                (200, "application/json", json!({"data": data}).to_string())
+                return (200, "application/json", json!({"data": data}).to_string());
+            }
+            let stream = body["stream"].as_bool() == Some(true);
+            let has_tools = body["tools"].as_array().is_some_and(|t| !t.is_empty());
+            let last_is_tool = body["messages"]
+                .as_array()
+                .and_then(|m| m.last())
+                .is_some_and(|m| m["role"] == "tool");
+            let want_call = has_tools && calls_tool && !last_is_tool;
+            if stream {
+                let sse = if want_call {
+                    sse_tool(&json!({"marker": PROBE_MARKER}).to_string())
+                } else {
+                    sse_text("PONG")
+                };
+                (200, "text/event-stream", sse)
             } else {
-                (404, "application/json", "{}".to_string())
+                let msg = if want_call {
+                    json!({"role":"assistant","content":null,"tool_calls":[{"id":"call_1",
+                        "type":"function","function":{"name":"doctor_probe",
+                        "arguments": json!({"marker": PROBE_MARKER}).to_string()}}]})
+                } else {
+                    json!({"role":"assistant","content":"PONG"})
+                };
+                (
+                    200,
+                    "application/json",
+                    json!({"choices":[{"message": msg}]}).to_string(),
+                )
             }
         }))
     }
@@ -407,7 +665,7 @@ mod tests {
 
     #[test]
     fn catalog_flags_an_unserved_model() {
-        let url = models_provider(vec!["alpha", "beta"]);
+        let url = good_provider(vec!["alpha", "beta"], true);
         let o = diagnose(Some(&cfg_for(url, "gamma")), &no_env, Tier::Catalog);
         let b = o.blocker.unwrap();
         assert_eq!((b.tier, b.check), (Tier::Catalog, "model"));
@@ -430,6 +688,44 @@ mod tests {
         assert_eq!(b.check, "models");
         assert!(b.fix.contains("/models"), "{}", b.fix);
         assert!(!b.message.contains("sk-test"));
+    }
+
+    #[test]
+    fn full_passes_against_a_well_behaved_provider() {
+        let url = good_provider(vec!["m"], true);
+        let o = diagnose(Some(&cfg_for(url, "m")), &no_env, Tier::Full);
+        assert!(o.blocker.is_none(), "{:?}", o.blocker);
+        assert_eq!(o.reached, Some(Tier::Full));
+        assert!(o.lines.iter().any(|l| l.contains("tools: tool-call loop")));
+    }
+
+    #[test]
+    fn full_fails_when_the_model_never_calls_the_tool() {
+        let url = good_provider(vec!["m"], false);
+        let o = diagnose(Some(&cfg_for(url, "m")), &no_env, Tier::Full);
+        let b = o.blocker.unwrap();
+        assert_eq!((b.tier, b.check), (Tier::Full, "tools"));
+        assert!(b.message.contains("without calling"), "{}", b.message);
+        assert_eq!(o.reached, Some(Tier::Catalog));
+    }
+
+    #[test]
+    fn full_fails_at_chat_when_completions_are_broken() {
+        let url = serve(Arc::new(|method, path, _| {
+            if method == "GET" && path.ends_with("/models") {
+                (
+                    200,
+                    "application/json",
+                    json!({"data":[{"id":"m"}]}).to_string(),
+                )
+            } else {
+                (500, "application/json", json!({"error":"boom"}).to_string())
+            }
+        }));
+        let o = diagnose(Some(&cfg_for(url, "m")), &no_env, Tier::Full);
+        let b = o.blocker.unwrap();
+        assert_eq!((b.tier, b.check), (Tier::Full, "chat"));
+        assert_eq!(o.reached, Some(Tier::Catalog));
     }
 
     #[test]
@@ -456,15 +752,10 @@ mod tests {
 
     #[test]
     fn tier_parse_roundtrip() {
-        for t in [Tier::Offline, Tier::Catalog] {
+        for t in [Tier::Offline, Tier::Catalog, Tier::Full] {
             assert_eq!(Tier::parse(t.as_str()), Some(t));
         }
         assert_eq!(Tier::parse("nope"), None);
-        assert_eq!(
-            Tier::parse("full"),
-            None,
-            "the full tier is not available yet"
-        );
-        assert!(Tier::Offline < Tier::Catalog);
+        assert!(Tier::Offline < Tier::Catalog && Tier::Catalog < Tier::Full);
     }
 }
