@@ -52,6 +52,8 @@ impl PromptFn for StdioPrompt {
         println!("what:  {}", req.description);
         println!("input: {}", input_preview(req.input));
         print!("allow? [y/N] ");
+        // A failed prompt flush is not actionable.
+        // cora-ignore: qual-error-ignore
         let _ = io::stdout().flush();
         let mut line = String::new();
         match io::stdin().lock().read_line(&mut line) {
