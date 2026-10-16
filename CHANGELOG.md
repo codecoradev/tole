@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Soft interrupts, core (#377): a bounded queue on the session's `CancelToken` that the turn loop drains at the safe point between a settled tool and the next provider call, committing each message as an attributed user-role entry (`interrupt: true`). An `urgent` interrupt (or any interrupt, for a final answer) withdraws an output that has not taken effect, so no tool call is left without its result, and records the drop durably. Host entry points (serve/MCP) follow separately.
 - `tole doctor` (#378): tiered provider diagnostics — `offline` (wiring) and `catalog` (live `/models`, the model must be served); each blocker carries its fix command, the exit code is non-zero when the requested tier is not reached, and keys / URL credentials are never printed.
 
 ### Changed
