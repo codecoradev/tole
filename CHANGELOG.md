@@ -16,6 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `tole doctor` (#378): tiered provider diagnostics — `offline` (wiring), `catalog` (live `/models`, model must be served) and `full` (chat, streaming and a real tool-call loop) — each blocker carries its fix command, and keys / URL credentials are never printed. Exits non-zero when the requested tier is not reached; `--tier full` is the release-validation gate.
 - Per-user-turn token stats (#379): `tole status` lists input / output / cache-read / cache-write / reasoning tokens per turn and the status JSON (`GET /sessions/{id}/status`, `tole_session_status`) gains an additive `usage_report.turns` array. Derived from the durable usage ledger, so old sessions read the same way and nothing is stored twice; a value no step reported is `n/a` / `null`, never 0, and no elapsed time is invented.
 
+### Fixed
+- `tole serve --transport mcp` is hardened to parity with the REST transport: the bearer token is compared in constant time and its scheme is case-insensitive; failed authentication is rate-limited per source IP (10 per minute, then `429`, same policy as REST); request bodies over 1 MiB are refused with `413` (declared or streamed, never buffered whole); a transient `accept()` error is logged and no longer ends the server and every session; and the no-op `timeout()` around the auth check is gone. The token comparison, header matching and limiter now live in one shared `auth` module used by both transports.
+
 ### Changed
 - Memory loop injection hygiene (#384): the recalled batch is hard-capped at 24 items / 64 KiB and deduplicated; a malformed recall payload (non-array, or a hit without content) now fails the whole batch visibly instead of silently injecting fewer items; `tole serve`/MCP sessions report recall failures on stderr like the CLI does.
 

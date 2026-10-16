@@ -4,6 +4,7 @@
 //! drift from production behavior (CodeCora scan 2026-09-18).
 pub mod approvals;
 pub mod approver;
+pub mod auth;
 pub mod config;
 pub mod config_apply;
 pub mod config_trust;
