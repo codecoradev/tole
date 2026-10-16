@@ -23,9 +23,8 @@
 
 use anyhow::{Context, Result};
 use serde_json::json;
-use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{IpAddr, TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -54,10 +53,6 @@ pub struct ServeConfig {
 /// stack + a socket; capping bounds thread/socket exhaustion (CodeCora
 /// scan-3 Wave-2 hardening).
 const MAX_CONNECTIONS: usize = 32;
-/// Failed-auth attempts allowed per source IP per window before the IP is
-/// dropped until the window rolls over (simple fixed-window limiter).
-const AUTH_WINDOW_SECS: u64 = 60;
-const MAX_AUTH_FAILURES: u32 = 10;
 
 struct State {
     sessions: SharedSessions,
@@ -72,9 +67,9 @@ struct State {
     sessions_dir: Option<std::path::PathBuf>,
     turnend: Vec<String>,
     live_connections: std::sync::atomic::AtomicUsize,
-    /// (window_start_epoch, failure_count) per source IP — fixed-window
-    /// auth-failure limiter (brute-force hardening).
-    auth_failures: Mutex<HashMap<IpAddr, (u64, u32)>>,
+    /// Per-source-IP failed-auth limiter (brute-force hardening), shared
+    /// logic with the MCP transport.
+    auth_failures: tole_cli::auth::AuthLimiter,
 }
 
 /// Read/write ceilings per connection: a client that opens a socket and
@@ -103,7 +98,7 @@ pub fn run_serve(cfg: ServeConfig) -> Result<()> {
         sessions_dir: cfg.sessions_dir.clone(),
         turnend: cfg.turnend.clone(),
         live_connections: std::sync::atomic::AtomicUsize::new(0),
-        auth_failures: Mutex::new(HashMap::new()),
+        auth_failures: tole_cli::auth::AuthLimiter::new(),
     });
     eprintln!(
         "tole serve: listening on http://{addr} ({} allow pattern(s), plan_mode={})",
@@ -295,13 +290,6 @@ fn read_request(stream: &TcpStream) -> Result<Request, ReadError> {
     })
 }
 
-/// Constant-time byte comparison for secrets (a short-circuiting `==`
-/// leaks the length of the matching prefix through timing). The length
-/// itself is not secret here.
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-}
-
 fn reason_phrase(status: u16) -> &'static str {
     match status {
         200 => "OK",
@@ -368,65 +356,20 @@ fn handle_conn(mut stream: TcpStream, state: Arc<State>) {
     let peer_ip = stream.peer_addr().ok().map(|a| a.ip());
 
     // Rate-limit: refuse when this IP has too many recent auth failures.
-    // The lock is dropped before any respond call (CodeCora: a stalled
-    // client must not hold the auth_failures mutex during a write).
-    if let Some(ip) = peer_ip {
-        let rate_limited = {
-            let fails = state
-                .auth_failures
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            matches!(
-                fails.get(&ip).map(|(window, count)| {
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0)
-                        .saturating_sub(*window)
-                        <= AUTH_WINDOW_SECS
-                        && *count >= MAX_AUTH_FAILURES
-                }),
-                Some(true)
-            )
-        };
-        if rate_limited {
-            respond(
-                &mut stream,
-                429,
-                &json!({"error": "too many failed auth attempts"}),
-            );
-            return;
-        }
+    if peer_ip.is_some_and(|ip| state.auth_failures.is_limited(ip)) {
+        respond(
+            &mut stream,
+            429,
+            &json!({"error": "too many failed auth attempts"}),
+        );
+        return;
     }
 
     let authorized = req.path == "/health"
-        || req
-            .authorization
-            .as_deref()
-            .and_then(|a| a.split_once(' '))
-            .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
-            .map(|(_, t)| ct_eq(t.trim().as_bytes(), state.token.as_bytes()))
-            .unwrap_or(false);
+        || tole_cli::auth::bearer_matches(req.authorization.as_deref(), &state.token);
     if !authorized {
         if let Some(ip) = peer_ip {
-            let mut fails = state
-                .auth_failures
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            // Periodic sweep: drop entries whose window has fully
-            // expired — bounds memory growth from unique source IPs
-            // (CodeCora scan round-2 on this PR).
-            fails.retain(|_, (window, _)| now.saturating_sub(*window) <= AUTH_WINDOW_SECS * 4);
-            let entry = fails.entry(ip).or_insert((now, 0));
-            if now.saturating_sub(entry.0) > AUTH_WINDOW_SECS {
-                entry.0 = now;
-                entry.1 = 0;
-            }
-            entry.1 += 1;
+            state.auth_failures.record_failure(ip);
         }
         respond(&mut stream, 401, &json!({"error": "unauthorized"}));
         return;
@@ -776,14 +719,6 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn ct_eq_matches_only_equal_slices() {
-        assert!(ct_eq(b"secret", b"secret"));
-        assert!(!ct_eq(b"secret", b"secreT"));
-        assert!(!ct_eq(b"secret", b"secre"));
-        assert!(ct_eq(b"", b""));
-    }
 
     #[test]
     fn reason_phrases_cover_every_status_the_routes_emit() {
