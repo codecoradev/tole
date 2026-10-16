@@ -41,6 +41,7 @@ pub mod gh;
 #[cfg(feature = "shell-tools")]
 pub mod git;
 pub mod gitea;
+pub mod handoff;
 pub mod interrupt;
 pub mod systemone;
 pub mod todo;
