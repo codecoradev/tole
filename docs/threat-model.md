@@ -173,7 +173,7 @@ failing gate cannot livelock the loop — the turn settles durably as
 
 All three server faces expose cooperative turn cancellation: ACP
 clients send `session/cancel`, REST callers `POST /sessions/{id}/cancel`,
-MCP clients call `tole_session_cancel`. Every path sets the same
+MCP clients call `tole_session_cancel`. Steering (soft interrupt, #377) goes through the same authenticated faces (`POST /sessions/{id}/interrupt`, `tole_session_interrupt`) and adds no authority: the message is ordinary user-role input to the session, so every tool the steered turn runs still passes the session's approver. Every path sets the same
 per-session token; a blocking turn observes it at checkpoints (between
 provider calls and tool executions) and settles
 `stopReason: "cancelled"` as a normal, durable turn end — the session

@@ -59,9 +59,13 @@ tole is the agent harness of the CodeCora ecosystem — the hands:
   turns, and poll status without SSH-ing into the box. Binds 127.0.0.1 by
   default. `POST /sessions/{id}/cancel` (#178, REST face) stops an
   in-flight turn — it settles `stopReason: "cancelled"`.
+  `POST /sessions/{id}/interrupt` (#377) steers the running turn instead,
+  without losing its work: the `{"text", "urgent"}` message is injected at
+  the turn's next safe point as an attributed entry (`409` when no turn
+  is running).
   `--transport mcp` (issue #137) serves **multi-session MCP over
   Streamable HTTP** instead: one authenticated MCP connection addresses N
-  durable tole sessions (`tole_session_new/prompt/cancel/status/list` +
+  durable tole sessions (`tole_session_new/prompt/cancel/interrupt/status/list` +
   the registry tools routed to each session's workspace jail).
 
 Every ecosystem integration is probe-first: a missing binary degrades to a
@@ -132,6 +136,12 @@ Tiers are cumulative and stop at the first blocker, which is printed with
 the command that fixes it. The exit code is non-zero when the requested
 tier is not reached, so `tole doctor --tier full` is the gate for "ready to
 release" claims. API keys and URL credentials never appear in the output.
+
+Every run is recorded in a coverage ledger (`$CODECORA_HOME/tole/doctor-ledger.json`,
+owner-readable only: level reached, first blocker, fix, timestamp per provider
++ model; `--no-ledger` skips it). `tole doctor --summary` prints `READY n-of-m`
+plus the first blocker and its fix command without running anything; the latest
+run wins per provider + model, so re-run `--tier full` before a release claim.
 
 ## Configuration (project file)
 

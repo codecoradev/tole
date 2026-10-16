@@ -87,6 +87,7 @@ impl SessionToolState {
             Box::new(SessionNewTool(self.clone())),
             Box::new(SessionPromptTool(self.clone())),
             Box::new(SessionCancelTool(self.clone())),
+            Box::new(SessionInterruptTool(self.clone())),
             Box::new(SessionStatusTool(self.clone())),
             Box::new(SessionListTool(self.clone())),
         ]
@@ -268,6 +269,71 @@ impl Tool for SessionPromptTool {
             out["text"] = json!(t);
         }
         Ok(out)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// tole_session_interrupt — soft interrupt (#377)
+// ---------------------------------------------------------------------------
+
+/// Steers the target session's in-flight turn WITHOUT cancelling it: the
+/// message lands at the turn's next safe point as an attributed user-role
+/// entry. Same classification as `tole_session_cancel` (callable while a
+/// `tole_session_prompt` runs; the session's own approver still gates every
+/// tool the steered turn runs).
+struct SessionInterruptTool(SessionToolState);
+
+impl Tool for SessionInterruptTool {
+    fn name(&self) -> &str {
+        "tole_session_interrupt"
+    }
+    fn risk(&self) -> Risk {
+        Risk::ReadOnly
+    }
+    fn summary(&self) -> String {
+        "Steer the in-flight turn of a tole session with a message, without cancelling it.".into()
+    }
+    fn describe(&self, input: &Value) -> String {
+        format!(
+            "interrupt session {:?}",
+            input
+                .get("session_id")
+                .and_then(Value::as_str)
+                .unwrap_or("<implicit>")
+        )
+    }
+    fn spec(&self) -> Option<Value> {
+        Some(json!({
+            "type": "object",
+            "properties": {
+                "session_id": { "type": "string", "description": "Target session (optional when exactly one is open)" },
+                "text": { "type": "string", "description": "The steering message" },
+                "urgent": { "type": "boolean", "description": "Also withdraw a tool call that has not started yet (default false)" }
+            },
+            "required": ["text"]
+        }))
+    }
+    fn execute(&self, input: Value) -> Result<Value, String> {
+        let text = input
+            .get("text")
+            .and_then(Value::as_str)
+            .ok_or("missing 'text'")?;
+        let urgent = input
+            .get("urgent")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let st = self.0.resolve(&input)?;
+        match crate::session_host::interrupt_session(&st, text, urgent) {
+            Ok(()) => Ok(json!({
+                "queued": true,
+                "urgent": urgent,
+                "note": "delivered at the turn's next safe point (after the running tool, before the next model call)"
+            })),
+            Err(crate::session_host::InterruptRefusal::NotBusy) => {
+                Err("no turn is running in this session".into())
+            }
+            Err(crate::session_host::InterruptRefusal::Invalid(e)) => Err(e),
+        }
     }
 }
 
