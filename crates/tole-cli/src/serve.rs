@@ -8,6 +8,8 @@
 //! - `GET  /sessions`              → list session ids + busy flags
 //! - `GET  /sessions/{id}`         → session status
 //! - `POST /sessions/{id}/prompt`  → run one turn (`{"text": "..."}`)
+//! - `POST /sessions/{id}/interrupt` → steer the running turn without
+//!   cancelling it (`{"text": "...", "urgent": false}`, #377)
 //!
 //! v1 scope: REST only (MCP-over-HTTP is the follow-up; the engine calls
 //! are identical). Auth is a static bearer token (env `TOLE_SERVE_TOKEN`
@@ -727,6 +729,41 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                         (200, json!({"cancelled": true, "sessionId": id}))
                     } else {
                         (404, json!({"error": "unknown session"}))
+                    }
+                }
+                ("POST", id, Some("interrupt")) => {
+                    // Soft interrupt (#377): steer the in-flight turn
+                    // without cancelling it. 409 when no turn is running.
+                    let Ok(req) = serde_json::from_str::<serde_json::Value>(body) else {
+                        return (400, json!({"error": "invalid JSON body"}));
+                    };
+                    let Some(text) = req.get("text").and_then(|v| v.as_str()) else {
+                        return (400, json!({"error": "missing text"}));
+                    };
+                    let urgent = req.get("urgent").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let st = {
+                        let sessions = lock_sessions(&state.sessions);
+                        sessions.map.get(id).cloned()
+                    };
+                    let Some(st) = st else {
+                        return (404, json!({"error": "unknown session"}));
+                    };
+                    match tole_cli::session_host::interrupt_session(&st, text, urgent) {
+                        Ok(()) => {
+                            eprintln!(
+                                "tole: session/{id} interrupt queued (serve, urgent={urgent})"
+                            );
+                            (
+                                202,
+                                json!({"queued": true, "urgent": urgent, "sessionId": id}),
+                            )
+                        }
+                        Err(tole_cli::session_host::InterruptRefusal::NotBusy) => {
+                            (409, json!({"error": "no turn is running in this session"}))
+                        }
+                        Err(tole_cli::session_host::InterruptRefusal::Invalid(e)) => {
+                            (400, json!({"error": e}))
+                        }
                     }
                 }
                 _ => (404, json!({"error": "not found"})),
