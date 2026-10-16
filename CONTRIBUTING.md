@@ -1,9 +1,8 @@
 # Contributing to tole
 
 Thank you for contributing! This document is the single entry point for the
-workflow; the ecosystem-wide standards it follows live in the uteke rooms
-`codecora-workflow-standard` and `codecoradev-conventions` (source of truth
-when this file and reality disagree).
+workflow; the ecosystem-wide standards it follows live in the team knowledge rooms
+(source of truth when this file and reality disagree).
 
 ## Workflow
 

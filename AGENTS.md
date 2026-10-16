@@ -56,7 +56,7 @@ cora review --staged          # exit 0 clean · exit 2 blocking → fix · exit 
 CI enforces the same set. There is no pre-commit hook installed by default —
 run these yourself.
 
-## 4. Tooling — cora & uteke first
+## 4. Tooling — cora & team memory first
 
 These sibling tools are the ecosystem's force multipliers. Use them instead
 of reinventing or brute-forcing:
@@ -75,27 +75,33 @@ of reinventing or brute-forcing:
 - `cora review --staged` before every commit (mandatory, see §3);
   `cora scan` after significant or security-adjacent changes.
 
-**uteke (semantic memory) — continuity across sessions:**
+**Team knowledge rooms (semantic memory) — continuity across sessions:**
 
-- `recall` before starting unfamiliar work — the decision may already be
-  recorded; `remember` durable outcomes and decisions of real work sessions
-  (namespace `repo-tole`, the ecosystem-wide `repo-<name>` convention).
-- Rooms `codecoradev-conventions` and `codecora-workflow-standard` hold the
-  ecosystem standards (branch strategy, PR/issue rules, merge gate,
-  governance) — they are the source of truth when this file and reality
-  disagree.
-- Long-form knowledge (runbooks, retros) goes through `uteke_document`
-  (markdown → durable, chunked, searchable).
+- Recall before starting unfamiliar work — the decision may already be
+  recorded; save durable outcomes and decisions of real work sessions back to
+  the repo's room (`repo-<name>` convention).
+- The team knowledge rooms hold the ecosystem standards (branch strategy,
+  PR/issue rules, merge gate, governance) — they are the source of truth when
+  this file and reality disagree.
+- Long-form knowledge (runbooks, retros) is saved as a durable, searchable
+  document in the same system.
 
-## 5. Cross-session continuity
+## 5. Session start (continuity ritual)
 
-At the START of every new session or round: read & understand the ecosystem
-standard rooms (`codecora-workflow-standard`, `uteke-conventions`) before doing
-any work, then recall this repo's context (`repo-tole`). At the END of a session
-that produced decisions or durable outcomes: remember them. Handing over
-mid-task: leave a `[HANDOFF]` entry (current state, next step, blockers).
-Repo files are canonical over mirrors; the ecosystem standards records live in
-uteke rooms (above).
+- New session or round: read & understand the team knowledge rooms before any
+  work, then recall this repo's context.
+- Save every decision or important outcome back to the responsible room during
+  or at the end of the session.
+- Handing over mid-task: leave a `[HANDOFF]` entry (current state, next step,
+  blockers).
+- Repo files are canonical over mirrors.
+
+## Workflow summary
+
+Issue → branch from `develop` → code + pre-commit checks → push → PR to
+`develop` (What / Why / Changes / Testing, English) → CI green + review
+verdict → squash-merge → cleanup → release (bump + CHANGELOG + tag).
+1 issue = 1 branch = 1 PR.
 
 ## 6. Design rules — do not bend
 
