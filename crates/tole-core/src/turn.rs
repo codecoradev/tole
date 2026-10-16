@@ -536,7 +536,7 @@ fn drive(
         // reported wire stats but no usage still leaves a record holding
         // only `tole_wire` (readers sum `prompt_tokens` etc. with a 0
         // default). Neither reported: no record, as before.
-        let usage = match (p.last_usage(), p.last_wire_stats()) {
+        let mut usage = match (p.last_usage(), p.last_wire_stats()) {
             (Some(mut u), Some(w)) => {
                 if let Some(obj) = u.as_object_mut() {
                     obj.insert("tole_wire".to_string(), w);
@@ -547,6 +547,13 @@ fn drive(
             (None, Some(w)) => Some(json!({ "tole_wire": w })),
             (None, None) => None,
         };
+        // Issue #209: the provider that answered (and any failover) rides
+        // along under the namespaced `tole_route` key — a switch is durable.
+        if let Some(route) = p.last_route() {
+            if let Some(obj) = usage.get_or_insert_with(|| json!({})).as_object_mut() {
+                obj.insert("tole_route".to_string(), route);
+            }
+        }
         if let Some(u) = usage {
             if let Some(last) = s.entries().last() {
                 s.commit(Commit::new().usage(UsageRecord {

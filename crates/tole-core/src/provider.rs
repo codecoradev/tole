@@ -78,4 +78,12 @@ pub trait Provider {
     fn last_wire_stats(&self) -> Option<Value> {
         None
     }
+
+    /// Which provider answered the LAST `complete()` call, and whether it
+    /// took a failover to get there (#209, `failover::FailoverProvider`).
+    /// Stored by the turn loop under the namespaced `tole_route` key of the
+    /// step's usage record. Default None: a single provider reports no route.
+    fn last_route(&self) -> Option<Value> {
+        None
+    }
 }

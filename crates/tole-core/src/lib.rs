@@ -33,6 +33,7 @@ pub mod cancel;
 #[cfg(feature = "shell-tools")]
 pub mod cora_search;
 pub mod entry;
+pub mod failover;
 pub mod file_tools;
 // Tool-call authorization gate (#303): crate-internal, no public API.
 pub(crate) mod gate;
