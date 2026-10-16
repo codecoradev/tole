@@ -133,8 +133,7 @@ full tier with the repo checkout binary:
 cargo build --release -p tole-cli && ./target/release/tole doctor --tier full
 ```
 
-It must exit 0 (chat, streaming and a real tool-call loop all green); the
-result is recorded in the coverage ledger (`tole doctor --summary`).
+It must exit 0 (chat, streaming and a real tool-call loop all green).
 
 ## Design rules
 

@@ -1,5 +1,4 @@
-//! `tole doctor` — tiered provider diagnostics and a persisted coverage
-//! ledger (#378).
+//! `tole doctor` — tiered provider diagnostics (#378).
 //!
 //! One command answers "is provider/model X actually usable?":
 //!
@@ -12,23 +11,17 @@
 //!   a probe tool and the loop must settle). This is the release gate: a
 //!   `full` green is the precondition for "ready to release" claims.
 //!
-//! Tiers are cumulative and stop at the first blocker. Every run is
-//! recorded in a ledger on disk (per provider + model: level reached, first
-//! blocker, fix command, timestamp); [`Ledger::summary`] renders the
-//! `READY n-of-m` line.
+//! Tiers are cumulative and stop at the first blocker, which carries the
+//! command that fixes it.
 
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 use tole_core::approval::{Approver, ToolRequest, Verdict};
 use tole_core::openai::{fetch_model_ids, OpenAiConfig, OpenAiProvider, ENV_PREFIXES};
 use tole_core::storage::JsonlStorage;
 use tole_core::tool::{Risk, Tool, ToolRegistry};
 use tole_core::turn::{run_turn, TurnOutcome};
-
-/// Ledger file name under the tole data dir.
-pub const LEDGER_FILE: &str = "doctor-ledger.json";
 
 /// Per-call timeout of the `full` tier.
 const FULL_CALL_TIMEOUT: Duration = Duration::from_secs(60);
@@ -484,168 +477,23 @@ fn diagnose_raw(
     out
 }
 
-// ------------------------------------------------------------------ ledger
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LedgerEntry {
-    pub provider: String,
-    pub model: String,
-    /// `none` | `offline` | `catalog` | `full`.
-    pub level: String,
-    pub blocker: Option<String>,
-    pub fix: Option<String>,
-    pub at_ms: u64,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Ledger {
-    pub entries: Vec<LedgerEntry>,
-}
-
-/// `<tole data dir>/doctor-ledger.json`.
-pub fn ledger_path() -> Result<PathBuf, String> {
-    tole_core::paths::tole_data_dir()
-        .map(|d| d.join(LEDGER_FILE))
-        .ok_or_else(|| "cannot locate the ledger: set CODECORA_HOME or HOME".to_string())
-}
-
-impl Ledger {
-    /// A missing file is an empty ledger; a corrupt one is an error (it is
-    /// never silently replaced).
-    pub fn load(path: &Path) -> Result<Ledger, String> {
-        match std::fs::read_to_string(path) {
-            Ok(s) => serde_json::from_str(&s)
-                .map_err(|e| format!("ledger {} is corrupt: {e}", path.display())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Ledger::default()),
-            Err(e) => Err(format!("cannot read ledger {}: {e}", path.display())),
-        }
-    }
-
-    /// Atomic write (temp file + rename).
-    pub fn save(&self, path: &Path) -> Result<(), String> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("cannot create {parent:?}: {e}"))?;
-        }
-        let tmp = path.with_extension("json.tmp");
-        let body = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        write_private(&tmp, body.as_bytes()).map_err(|e| format!("cannot write {tmp:?}: {e}"))?;
-        std::fs::rename(&tmp, path).map_err(|e| format!("cannot replace {path:?}: {e}"))
-    }
-
-    /// Record the latest run for `provider`+`model` (replaces the previous
-    /// entry for the pair; the latest evidence wins).
-    pub fn record(&mut self, provider: &str, model: &str, outcome: &Outcome, at_ms: u64) {
-        let entry = LedgerEntry {
-            provider: provider.to_string(),
-            model: model.to_string(),
-            level: outcome.reached.map_or("none", Tier::as_str).to_string(),
-            blocker: outcome
-                .blocker
-                .as_ref()
-                .map(|b| format!("{}: {}", b.check, b.message)),
-            fix: outcome.blocker.as_ref().map(|b| b.fix.clone()),
-            at_ms,
-        };
-        match self
-            .entries
-            .iter_mut()
-            .find(|e| e.provider == provider && e.model == model)
-        {
-            Some(slot) => *slot = entry,
-            None => self.entries.push(entry),
-        }
-    }
-
-    /// `READY n-of-m` (n = entries proven at `full`), then the first
-    /// blocker and its fix command when there is one.
-    pub fn summary(&self) -> String {
-        let m = self.entries.len();
-        let n = self.entries.iter().filter(|e| e.level == "full").count();
-        let mut out = format!("READY {n}-of-{m}");
-        if let Some(e) = self.entries.iter().find(|e| e.blocker.is_some()) {
-            out.push_str(&format!(
-                "\nfirst blocker: {}/{} ({}): {}",
-                e.provider,
-                e.model,
-                e.level,
-                e.blocker.as_deref().unwrap_or_default()
-            ));
-            if let Some(fix) = &e.fix {
-                out.push_str(&format!("\nfix: {fix}"));
-            }
-        }
-        out
-    }
-}
-
-/// Write `bytes` readable by the owner only (0600 on Unix). A stale file at
-/// `path` is removed first and the new one is created exclusively
-/// (`O_EXCL`), so a pre-planted file or symlink is never written through
-/// and the mode always applies.
-fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    match std::fs::remove_file(path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
-    }
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    opts.open(path)?.write_all(bytes)
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
-/// CLI entry: diagnose, persist to the ledger (unless `no_ledger`), print.
-/// Returns `true` when the requested tier was reached.
+/// CLI entry: diagnose and print. Returns `true` when the requested tier
+/// was reached.
 pub fn run_cli(
     cfg: Option<&OpenAiConfig>,
     env: &dyn Fn(&str) -> Option<String>,
     requested: Tier,
-    no_ledger: bool,
 ) -> bool {
     let outcome = diagnose(cfg, env, requested);
     println!("tole doctor — tier {}", requested.as_str());
     for l in &outcome.lines {
         println!("{l}");
     }
-    let ok = outcome.reached >= Some(requested) && outcome.blocker.is_none();
     if let Some(b) = &outcome.blocker {
         println!("blocked at {}: {}", b.tier.as_str(), b.message);
         println!("fix: {}", b.fix);
     }
-    // Only a configured provider has a ledger identity.
-    if let (Some(cfg), false) = (cfg, no_ledger) {
-        let saved = ledger_path().and_then(|p| {
-            let mut l = Ledger::load(&p)?;
-            l.record(&redact_url(&cfg.base_url), &cfg.model, &outcome, now_ms());
-            l.save(&p)?;
-            Ok(l)
-        });
-        match saved {
-            Ok(l) => println!("{}", l.summary()),
-            Err(e) => eprintln!("tole doctor: ledger not updated: {e}"),
-        }
-    }
-    ok
-}
-
-/// `tole doctor --summary`: print the ledger summary without running.
-pub fn print_summary() -> Result<(), String> {
-    let l = Ledger::load(&ledger_path()?)?;
-    println!("{}", l.summary());
-    Ok(())
+    outcome.reached >= Some(requested) && outcome.blocker.is_none()
 }
 
 #[cfg(test)]
@@ -880,58 +728,6 @@ mod tests {
         assert_eq!(o.reached, Some(Tier::Catalog));
     }
 
-    fn outcome(reached: Option<Tier>, blocker: Option<Blocker>) -> Outcome {
-        Outcome {
-            reached,
-            blocker,
-            lines: vec![],
-        }
-    }
-
-    #[test]
-    fn ledger_records_summarises_and_roundtrips() {
-        let mut l = Ledger::default();
-        l.record("https://a/v1", "m1", &outcome(Some(Tier::Full), None), 1);
-        let blocker = Blocker {
-            tier: Tier::Full,
-            check: "tools",
-            message: "no tool call".into(),
-            fix: "export TOLE_MODEL=<model>".into(),
-        };
-        l.record(
-            "https://b/v1",
-            "m2",
-            &outcome(Some(Tier::Catalog), Some(blocker)),
-            2,
-        );
-        assert_eq!(
-            l.summary(),
-            "READY 1-of-2\nfirst blocker: https://b/v1/m2 (catalog): tools: no tool call\nfix: export TOLE_MODEL=<model>"
-        );
-        // Latest evidence wins for the same pair.
-        l.record("https://b/v1", "m2", &outcome(Some(Tier::Full), None), 3);
-        assert_eq!(l.entries.len(), 2);
-        assert_eq!(l.summary(), "READY 2-of-2");
-
-        let dir = scratch_dir("ledger");
-        let path = dir.join("nested").join(LEDGER_FILE);
-        l.save(&path).unwrap();
-        assert_eq!(Ledger::load(&path).unwrap(), l);
-        assert!(!path.with_extension("json.tmp").exists());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn ledger_load_missing_is_empty_but_corrupt_is_an_error() {
-        let dir = scratch_dir("ledger-load");
-        let path = dir.join(LEDGER_FILE);
-        assert_eq!(Ledger::load(&path).unwrap(), Ledger::default());
-        assert_eq!(Ledger::default().summary(), "READY 0-of-0");
-        std::fs::write(&path, "{not json").unwrap();
-        assert!(Ledger::load(&path).unwrap_err().contains("corrupt"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     #[test]
     fn urls_are_reduced_to_scheme_host_path() {
         assert_eq!(
@@ -952,38 +748,6 @@ mod tests {
             "{all}"
         );
         assert!(all.contains("ftp://x/v1"), "{all}");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn stale_tmp_is_replaced_not_written_through() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = scratch_dir("ledger-stale");
-        let path = dir.join(LEDGER_FILE);
-        let tmp = path.with_extension("json.tmp");
-        // A pre-planted, world-readable tmp symlinked elsewhere.
-        let victim = dir.join("victim");
-        std::fs::write(&victim, "keep").unwrap();
-        std::os::unix::fs::symlink(&victim, &tmp).unwrap();
-        Ledger::default().save(&path).unwrap();
-        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn ledger_file_is_owner_only() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = scratch_dir("ledger-mode");
-        let path = dir.join(LEDGER_FILE);
-        Ledger::default().save(&path).unwrap();
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

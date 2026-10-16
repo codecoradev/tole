@@ -1,6 +1,6 @@
 //! CLI host for tole-core: arg parsing and session wiring.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
@@ -318,21 +318,12 @@ enum Command {
 
     /// Is the configured provider/model actually usable? Tiered checks —
     /// offline (wiring), catalog (live /models), full (chat + streaming +
-    /// a real tool-call loop) — recorded in a coverage ledger. Exits
-    /// non-zero when the requested tier is not reached, so `--tier full`
+    /// a real tool-call loop). Exits non-zero when the requested tier is not reached, so `--tier full`
     /// is the release-validation gate.
     Doctor {
         /// offline | catalog | full (full spends a few real tokens).
         #[arg(long, default_value = "catalog")]
         tier: String,
-
-        /// Do not record this run in the ledger.
-        #[arg(long)]
-        no_ledger: bool,
-
-        /// Only print the ledger summary (READY n-of-m); run nothing.
-        #[arg(long)]
-        summary: bool,
     },
 
     /// Show durable state of a session.
@@ -1048,22 +1039,12 @@ fn dispatch(cli: Cli) -> Result<()> {
             })
         }
         Command::Sessions => sessions_command(&sessions_dir),
-        Command::Doctor {
-            tier,
-            no_ledger,
-            summary,
-        } => {
-            if summary {
-                tole_cli::doctor::print_summary().map_err(|e| anyhow!(e))?;
-                return Ok(());
-            }
+        Command::Doctor { tier } => {
             let Some(tier) = tole_cli::doctor::Tier::parse(&tier) else {
                 bail!("--tier must be offline, catalog or full (got {tier:?})");
             };
             let cfg = config_apply::provider_config();
-            let ok =
-                tole_cli::doctor::run_cli(cfg.as_ref(), &config_apply::real_env, tier, no_ledger);
-            if !ok {
+            if !tole_cli::doctor::run_cli(cfg.as_ref(), &config_apply::real_env, tier) {
                 std::process::exit(1);
             }
             Ok(())
