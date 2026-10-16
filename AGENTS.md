@@ -89,10 +89,13 @@ of reinventing or brute-forcing:
 
 ## 5. Cross-session continuity
 
-Repo files are canonical over mirrors. Durable outcomes and decisions of
-real work sessions belong in uteke (`repo-tole`); the ecosystem standards
-records live in uteke rooms (above). Start a session on an unfamiliar area
-with a recall; end a session that made decisions with a remember.
+At the START of every new session or round: read & understand the ecosystem
+standard rooms (`codecora-workflow-standard`, `uteke-conventions`) before doing
+any work, then recall this repo's context (`repo-tole`). At the END of a session
+that produced decisions or durable outcomes: remember them. Handing over
+mid-task: leave a `[HANDOFF]` entry (current state, next step, blockers).
+Repo files are canonical over mirrors; the ecosystem standards records live in
+uteke rooms (above).
 
 ## 6. Design rules — do not bend
 
