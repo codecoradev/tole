@@ -207,11 +207,12 @@ fn add(acc: &mut Option<u64>, x: Option<u64>) {
 }
 
 /// A turn opens at a user message, except the stop-gate's own feedback
-/// message (the turn continues after it).
+/// and an owner's soft interrupt (#377): the turn continues after them.
 fn opens_turn(e: &Entry) -> bool {
     e.kind.as_str() == "message"
         && e.payload["role"] == json!("user")
         && e.payload["stop_gate_feedback"] != json!(true)
+        && e.payload["interrupt"] != json!(true)
 }
 
 /// Fold the usage ledger into per-user-turn stats. A usage row belongs to
@@ -656,6 +657,22 @@ mod tests {
             (t[1].input_tokens, t[1].output_tokens),
             (Some(50), Some(10))
         );
+    }
+
+    #[test]
+    fn a_soft_interrupt_does_not_open_a_turn() {
+        let entries = vec![
+            user(1),
+            entry(
+                2,
+                "message",
+                json!({"role": "user", "text": "steer", "interrupt": true}),
+            ),
+            assistant(3),
+        ];
+        let t = turn_stats(&entries, &[rec_at("e_3", json!({"prompt_tokens": 4}))]);
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].input_tokens, Some(4));
     }
 
     #[test]
