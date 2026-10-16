@@ -321,7 +321,7 @@ enum Command {
     /// a real tool-call loop). Exits non-zero when the requested tier is not reached, so `--tier full`
     /// is the release-validation gate.
     Doctor {
-        /// offline | catalog | full (full spends a few real tokens).
+        /// offline | catalog.
         #[arg(long, default_value = "catalog")]
         tier: String,
     },
@@ -1041,7 +1041,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         Command::Sessions => sessions_command(&sessions_dir),
         Command::Doctor { tier } => {
             let Some(tier) = tole_cli::doctor::Tier::parse(&tier) else {
-                bail!("--tier must be offline, catalog or full (got {tier:?})");
+                bail!("--tier must be offline or catalog (got {tier:?})");
             };
             let cfg = config_apply::provider_config();
             if !tole_cli::doctor::run_cli(cfg.as_ref(), &config_apply::real_env, tier) {

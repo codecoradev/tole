@@ -124,17 +124,6 @@ behavior that was already fixed). Before any live validation or mission run:
   bump: `cp target/release/tole ~/.cargo/bin/tole` — verify with
   `tole --version` matching the workspace version in `Cargo.toml`.
 
-## Release validation
-
-Before claiming a build is ready to release, run the provider doctor at the
-full tier with the repo checkout binary:
-
-```bash
-cargo build --release -p tole-cli && ./target/release/tole doctor --tier full
-```
-
-It must exit 0 (chat, streaming and a real tool-call loop all green).
-
 ## Design rules
 
 - The core crate (`tole-core`) must stay platform-agnostic: no stdin/stdout,

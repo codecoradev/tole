@@ -126,12 +126,11 @@ trust: `internal` / `read_only`), `--skill <path>` (load a SKILL.md),
 |----------|--------|
 | `offline` | config resolves, base URL shape, key present (no network) |
 | `catalog` (default) | live `GET /models`; the configured model must be served |
-| `full` | a chat call, a streamed call and a real tool-call loop (spends a few tokens) |
 
 Tiers are cumulative and stop at the first blocker, which is printed with
 the command that fixes it. The exit code is non-zero when the requested
-tier is not reached, so `tole doctor --tier full` is the gate for "ready to
-release" claims.
+tier is not reached. API keys and URL credentials never appear in the
+output.
 
 ## Configuration (project file)
 
