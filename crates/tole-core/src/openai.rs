@@ -747,7 +747,18 @@ fn scrub(msg: &str, secret: &str) -> String {
 /// model picker), never a correctness dependency — callers degrade to
 /// "no picker" on any error, per the probe-first contract.
 pub fn fetch_model_ids(base_url: &str, api_key: &str) -> Result<Vec<String>, String> {
-    let agent = OpenAiProvider::build_agent(Duration::from_secs(3));
+    fetch_model_ids_with_timeout(base_url, api_key, Duration::from_secs(3))
+}
+
+/// [`fetch_model_ids`] with a caller-chosen timeout, for callers where the
+/// probe IS the check (the provider doctor) rather than a UI convenience: a
+/// slow but healthy gateway must not be reported as broken.
+pub fn fetch_model_ids_with_timeout(
+    base_url: &str,
+    api_key: &str,
+    timeout: Duration,
+) -> Result<Vec<String>, String> {
+    let agent = OpenAiProvider::build_agent(timeout);
     let url = format!("{}/models", base_url.trim_end_matches('/'));
     let mut res = agent
         .get(&url)

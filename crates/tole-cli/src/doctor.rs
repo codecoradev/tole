@@ -22,13 +22,19 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tole_core::approval::{Approver, ToolRequest, Verdict};
-use tole_core::openai::{fetch_model_ids, OpenAiConfig, OpenAiProvider, ENV_PREFIXES};
+use tole_core::openai::{fetch_model_ids_with_timeout, OpenAiConfig, OpenAiProvider, ENV_PREFIXES};
 use tole_core::storage::JsonlStorage;
 use tole_core::tool::{Risk, Tool, ToolRegistry};
 use tole_core::turn::{run_turn, TurnOutcome};
 
 /// Ledger file name under the tole data dir.
 pub const LEDGER_FILE: &str = "doctor-ledger.json";
+
+/// Timeout of the catalog tier's `GET /models`. Generous on purpose: here
+/// the probe IS the check, so a slow but healthy gateway must not be
+/// reported as a blocker (the ACP model picker keeps its 3 s convenience
+/// timeout).
+const CATALOG_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Per-call timeout of the `full` tier.
 const FULL_CALL_TIMEOUT: Duration = Duration::from_secs(60);
@@ -141,10 +147,17 @@ fn base_url_ok(url: &str) -> bool {
     let rest = url
         .strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"));
-    match rest {
-        Some(r) => !r.is_empty() && !r.starts_with('/') && !url.chars().any(char::is_whitespace),
-        None => false,
+    let Some(rest) = rest else {
+        return false;
+    };
+    if url.chars().any(char::is_whitespace) {
+        return false;
     }
+    // The authority ends at the first '/', '?' or '#'; after any userinfo
+    // there must be a host (`https://?x` or `https://u:p@/v1` has none).
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = authority.rsplit('@').next().unwrap_or("");
+    !host.is_empty() && !host.starts_with(':')
 }
 
 struct DenyAll;
@@ -431,7 +444,7 @@ fn diagnose_raw(
     }
 
     // ---- catalog ----
-    match fetch_model_ids(&cfg.base_url, &cfg.api_key) {
+    match fetch_model_ids_with_timeout(&cfg.base_url, &cfg.api_key, CATALOG_TIMEOUT) {
         Err(e) => {
             out.fail(
                 Tier::Catalog,
@@ -533,6 +546,18 @@ impl Ledger {
         std::fs::rename(&tmp, path).map_err(|e| format!("cannot replace {path:?}: {e}"))
     }
 
+    /// Load, change and save the ledger under an exclusive advisory lock
+    /// (`<ledger>.lock`), so concurrent `tole doctor` runs (several
+    /// providers checked in parallel) cannot overwrite each other's entry
+    /// or race on the temp file. Returns the saved ledger.
+    pub fn update(path: &Path, change: impl FnOnce(&mut Ledger)) -> Result<Ledger, String> {
+        let _lock = lock_file(&path.with_extension("json.lock"))?;
+        let mut l = Ledger::load(path)?;
+        change(&mut l);
+        l.save(path)?;
+        Ok(l)
+    }
+
     /// Record the latest run for `provider`+`model` (replaces the previous
     /// entry for the pair; the latest evidence wins).
     pub fn record(&mut self, provider: &str, model: &str, outcome: &Outcome, at_ms: u64) {
@@ -577,6 +602,37 @@ impl Ledger {
         }
         out
     }
+}
+
+/// Open (creating, owner-only) and exclusively lock `path`; the lock is
+/// released when the returned file is dropped. Advisory and cooperative,
+/// like the agents-root lock. Non-unix hosts get no lock (single-writer).
+fn lock_file(path: &Path) -> Result<std::fs::File, String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("cannot create {parent:?}: {e}"))?;
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).truncate(false).write(true).read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let f = opts
+        .open(path)
+        .map_err(|e| format!("cannot open the ledger lock {path:?}: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: a valid, owned descriptor for the life of `f`.
+        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(format!(
+                "cannot lock the ledger: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+    Ok(f)
 }
 
 /// Write `bytes` readable by the owner only (0600 on Unix). A stale file at
@@ -628,10 +684,9 @@ pub fn run_cli(
     // Only a configured provider has a ledger identity.
     if let (Some(cfg), false) = (cfg, no_ledger) {
         let saved = ledger_path().and_then(|p| {
-            let mut l = Ledger::load(&p)?;
-            l.record(&redact_url(&cfg.base_url), &cfg.model, &outcome, now_ms());
-            l.save(&p)?;
-            Ok(l)
+            Ledger::update(&p, |l| {
+                l.record(&redact_url(&cfg.base_url), &cfg.model, &outcome, now_ms())
+            })
         });
         match saved {
             Ok(l) => println!("{}", l.summary()),
@@ -993,5 +1048,55 @@ mod tests {
         }
         assert_eq!(Tier::parse("nope"), None);
         assert!(Tier::Offline < Tier::Catalog && Tier::Catalog < Tier::Full);
+    }
+
+    #[test]
+    fn base_url_needs_a_host() {
+        for ok in [
+            "https://api.example.com/v1",
+            "http://127.0.0.1:8080",
+            "https://u:p@host/v1",
+            "https://host?x=1",
+        ] {
+            assert!(base_url_ok(ok), "{ok}");
+        }
+        for bad in [
+            "https://?x",
+            "https://#f",
+            "https:///v1",
+            "https://u:p@/v1",
+            "https://:8080/v1",
+            "ftp://host",
+            "https://ho st/v1",
+            "https://",
+        ] {
+            assert!(!base_url_ok(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn concurrent_ledger_updates_keep_every_entry() {
+        let dir = scratch_dir("ledger-concurrent");
+        let path = dir.join(LEDGER_FILE);
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let o = Outcome {
+                        reached: Some(Tier::Catalog),
+                        blocker: None,
+                        lines: vec![],
+                    };
+                    Ledger::update(&path, |l| l.record(&format!("https://p{i}/v1"), "m", &o, 1))
+                        .unwrap();
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let l = Ledger::load(&path).unwrap();
+        assert_eq!(l.entries.len(), 8, "no update was lost: {:?}", l.entries);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

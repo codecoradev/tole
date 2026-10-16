@@ -238,6 +238,34 @@ impl SiblingWatcher {
         }
     }
 
+    /// A watcher that starts at the current end of the log (at a line
+    /// boundary) instead of its beginning. The log is shared by every child
+    /// a parent ever spawned and is never truncated, so folding its whole
+    /// history on start-up costs O(lifetime of the agents root) for nothing:
+    /// changes made before this agent looked at a file are not news anyway.
+    pub fn from_end(agent: impl Into<String>, log: impl Into<PathBuf>) -> std::io::Result<Self> {
+        let mut w = Self::new(agent, log);
+        let mut f = match std::fs::File::open(&w.log) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(w),
+            Err(e) => return Err(e),
+        };
+        let len = f.metadata()?.len();
+        // Only the tail is read: a line is at most MAX_LINE bytes, so the
+        // last complete line ends inside the final 2 * MAX_LINE bytes.
+        let start = len.saturating_sub(2 * MAX_LINE as u64);
+        f.seek(SeekFrom::Start(start))?;
+        let mut tail = Vec::new();
+        f.read_to_end(&mut tail)?;
+        w.offset = match tail.iter().rposition(|&b| b == b'\n') {
+            Some(i) => start + i as u64 + 1,
+            // No newline in the tail: a half-written first line; start
+            // before it so it is read once complete.
+            None => start,
+        };
+        Ok(w)
+    }
+
     /// Read what was appended since the last poll and return the notices.
     /// Only complete lines are consumed (a half-written tail waits for the
     /// next poll); unparseable lines are skipped. A missing log is empty.
@@ -588,6 +616,56 @@ mod tests {
         );
         assert!(t.chars().count() < 400, "bounded: {}", t.chars().count());
         assert!(t.contains("not an instruction"));
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn from_end_skips_history_but_sees_what_comes_after() {
+        let (a, b, _wa, _wb, d) = pair("fromend");
+        let log = d.join("tole-agents").join("touch.log");
+        // History: I read x, a sibling changed it (before this watcher).
+        a.record(Op::Read, "x").unwrap();
+        b.record(Op::Write, "x").unwrap();
+        let mut w = SiblingWatcher::from_end("a", &log).unwrap();
+        assert!(w.poll().unwrap().is_empty(), "history is not replayed");
+        // New activity after start-up is seen as usual.
+        a.record(Op::Read, "y").unwrap();
+        b.record(Op::Write, "y").unwrap();
+        assert_eq!(w.poll().unwrap().len(), 1);
+        // A missing log is fine.
+        let none = SiblingWatcher::from_end("a", d.join("nope.log")).unwrap();
+        assert_eq!(none.offset, 0);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn from_end_waits_for_a_half_written_last_line() {
+        let (a, _b, _wa, _wb, d) = pair("fromend-partial");
+        let log = d.join("tole-agents").join("touch.log");
+        a.record(Op::Read, "z").unwrap();
+        let line = format!(
+            "{}\n",
+            json!({"a": "b", "o": "w", "p": normalize(&d.join("ws"), "z")})
+        );
+        let (head, tail) = line.split_at(line.len() / 2);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log)
+            .unwrap()
+            .write_all(head.as_bytes())
+            .unwrap();
+        let mut w = SiblingWatcher::from_end("a", &log).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log)
+            .unwrap()
+            .write_all(tail.as_bytes())
+            .unwrap();
+        // The completed line is read (not skipped), even though it began
+        // before the watcher started; it is not news for `a` here because
+        // a's own read was history.
+        w.poll().unwrap();
+        assert_eq!(w.offset, std::fs::metadata(&log).unwrap().len());
         let _ = std::fs::remove_dir_all(d);
     }
 }
