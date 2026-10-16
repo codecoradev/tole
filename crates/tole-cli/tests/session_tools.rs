@@ -237,3 +237,65 @@ fn session_is_rooted_at_the_canonical_cwd_the_jail_check_validated() {
         want.as_path()
     );
 }
+
+/// #377 MCP face: `tole_session_interrupt` queues a soft interrupt on the
+/// session's turn handle only while a turn is running; idle, unknown,
+/// blank and missing-text calls are clear errors.
+#[test]
+fn session_interrupt_tool_queues_only_for_a_running_turn() {
+    let dir = ws("interrupt-tool");
+    let state = SessionToolState::new(
+        vec![],
+        false,
+        None,
+        std::path::PathBuf::from(&dir),
+        None,
+        vec![],
+    );
+    let tools = state.tools();
+    let tool = tool_by_name(&tools, "tole_session_interrupt");
+
+    let err = tool
+        .execute(json!({"session_id": "nope", "text": "x"}))
+        .unwrap_err();
+    assert!(err.contains("unknown session"), "{err}");
+
+    let a = std::path::Path::new(&dir).join("a");
+    let sid = tool_by_name(&tools, "tole_session_new")
+        .execute(json!({"cwd": a.to_string_lossy()}))
+        .unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (token, busy) = {
+        let sessions = tole_cli::session_host::lock_sessions(&state.sessions);
+        let st = sessions.map.get(&sid).unwrap();
+        (st.cancel.clone(), std::sync::Arc::clone(&st.busy))
+    };
+
+    // Idle: nothing to steer.
+    let err = tool.execute(json!({"text": "x"})).unwrap_err();
+    assert!(err.contains("no turn is running"), "{err}");
+    assert!(token.interrupts().is_empty());
+
+    // Missing / blank text.
+    assert!(tool
+        .execute(json!({}))
+        .unwrap_err()
+        .contains("missing 'text'"));
+    *busy.lock().unwrap() = true;
+    assert!(tool.execute(json!({"text": "  "})).is_err());
+    assert!(token.interrupts().is_empty());
+
+    // Running: queued on THE session's handle, implicit session resolved.
+    let out = tool
+        .execute(json!({"text": "switch to Y", "urgent": true}))
+        .unwrap();
+    assert_eq!(out["queued"], json!(true));
+    assert_eq!(out["urgent"], json!(true));
+    let q = token.interrupts().drain();
+    assert_eq!(q.len(), 1);
+    assert_eq!((q[0].text.as_str(), q[0].urgent), ("switch to Y", true));
+    *busy.lock().unwrap() = false;
+    let _ = std::fs::remove_dir_all(&dir);
+}
