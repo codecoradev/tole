@@ -23,12 +23,23 @@ pub const MAX_PENDING: usize = 16;
 /// Largest accepted interrupt text, in bytes.
 pub const MAX_TEXT_BYTES: usize = 8 * 1024;
 
-/// One owner message injected mid-turn.
+/// Who queued an interrupt: the owner steering the turn, or the host
+/// relaying an informational notice (e.g. a sibling agent changed a file,
+/// #380). A notice never withdraws output and never supersedes a final
+/// answer — it is delivered at the next safe point if the turn has one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    Owner,
+    Notice,
+}
+
+/// One message injected mid-turn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Interrupt {
     pub text: String,
-    /// Also withdraw a tool call that has not started yet.
+    /// Also withdraw a tool call that has not started yet (owner only).
     pub urgent: bool,
+    pub source: Source,
 }
 
 /// Why a push was refused.
@@ -64,6 +75,16 @@ impl InterruptQueue {
     /// Queue a message. Bounded: blank, oversized, or beyond
     /// [`MAX_PENDING`] pending are refused, never truncated.
     pub fn push(&self, text: &str, urgent: bool) -> Result<(), PushError> {
+        self.push_from(text, urgent, Source::Owner)
+    }
+
+    /// Queue an informational notice (never urgent). Same bounds as
+    /// [`InterruptQueue::push`].
+    pub fn push_notice(&self, text: &str) -> Result<(), PushError> {
+        self.push_from(text, false, Source::Notice)
+    }
+
+    fn push_from(&self, text: &str, urgent: bool, source: Source) -> Result<(), PushError> {
         let text = text.trim();
         if text.is_empty() {
             return Err(PushError::Empty);
@@ -78,6 +99,7 @@ impl InterruptQueue {
         q.push_back(Interrupt {
             text: text.to_string(),
             urgent,
+            source,
         });
         Ok(())
     }
@@ -89,6 +111,11 @@ impl InterruptQueue {
 
     pub fn is_empty(&self) -> bool {
         self.lock().is_empty()
+    }
+
+    /// Is an owner message waiting (a notice does not count)?
+    pub fn has_owner(&self) -> bool {
+        self.lock().iter().any(|i| i.source == Source::Owner)
     }
 
     /// Is an urgent interrupt waiting?
@@ -113,16 +140,31 @@ mod tests {
             vec![
                 Interrupt {
                     text: "first".into(),
-                    urgent: false
+                    urgent: false,
+                    source: Source::Owner,
                 },
                 Interrupt {
                     text: "second".into(),
-                    urgent: true
+                    urgent: true,
+                    source: Source::Owner,
                 },
             ]
         );
         assert!(q.is_empty() && !q.has_urgent());
         assert!(q.drain().is_empty());
+    }
+
+    #[test]
+    fn a_notice_is_never_urgent_and_is_not_an_owner_message() {
+        let q = InterruptQueue::default();
+        q.push_notice("sibling changed a.rs").unwrap();
+        assert!(!q.has_urgent() && !q.has_owner() && !q.is_empty());
+        q.push("steer", false).unwrap();
+        assert!(q.has_owner());
+        let d = q.drain();
+        assert_eq!(d[0].source, Source::Notice);
+        assert!(!d[0].urgent);
+        assert_eq!(d[1].source, Source::Owner);
     }
 
     #[test]
