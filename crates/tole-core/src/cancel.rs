@@ -21,11 +21,20 @@ use std::sync::Arc;
 #[derive(Clone, Default)]
 pub struct CancelToken {
     flag: Arc<AtomicBool>,
+    /// Soft-interrupt queue (#377): the same per-session turn handle that
+    /// carries the cancel flag also carries steering messages. Never
+    /// cleared by `reset`: an interrupt waits for the next safe point.
+    interrupts: crate::interrupt::InterruptQueue,
 }
 
 impl CancelToken {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The session's soft-interrupt queue (#377).
+    pub fn interrupts(&self) -> &crate::interrupt::InterruptQueue {
+        &self.interrupts
     }
 
     /// Set by the transport when the client cancels the session's
