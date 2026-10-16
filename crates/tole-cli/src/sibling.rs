@@ -73,9 +73,19 @@ impl Drop for Watcher {
 pub fn start_watcher(tracking: &Tracking, cancel: &CancelToken, every: Duration) -> Watcher {
     let stop = Arc::new(AtomicBool::new(false));
     let (flag, token) = (Arc::clone(&stop), cancel.clone());
-    let mut watcher = SiblingWatcher::new(tracking.agent.clone(), tracking.log.clone());
+    // Start at the end of the shared log: its history predates this child.
+    let (mut watcher, mut reported) =
+        match SiblingWatcher::from_end(tracking.agent.clone(), tracking.log.clone()) {
+            Ok(w) => (w, false),
+            Err(e) => {
+                eprintln!("tole: sibling tracking: cannot read the touch log: {e}");
+                (
+                    SiblingWatcher::new(tracking.agent.clone(), tracking.log.clone()),
+                    true,
+                )
+            }
+        };
     std::thread::spawn(move || {
-        let mut reported = false;
         while !flag.load(Ordering::SeqCst) {
             match watcher.poll() {
                 Ok(notices) => {

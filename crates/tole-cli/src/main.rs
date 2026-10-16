@@ -1560,8 +1560,8 @@ fn build_registry(
     // with TOLE_WEB_SEARCH_URL.
     reg.register(Box::new(tole_core::web::WebFetchTool))
         .map_err(|e| anyhow::anyhow!("registering web_fetch: {e}"))?;
-    if tole_core::web::WebSearchTool::from_env().is_some() {
-        reg.register(Box::new(tole_core::web::WebSearchTool::from_env().unwrap()))
+    if let Some(search) = tole_core::web::WebSearchTool::from_env() {
+        reg.register(Box::new(search))
             .map_err(|e| anyhow::anyhow!("registering web_search: {e}"))?;
     }
     // Write tools: gated per call. The jail root is the workspace.
@@ -1715,8 +1715,8 @@ fn build_server_registry(
     // with TOLE_WEB_SEARCH_URL.
     reg.register(Box::new(tole_core::web::WebFetchTool))
         .map_err(|e| anyhow::anyhow!("registering web_fetch: {e}"))?;
-    if tole_core::web::WebSearchTool::from_env().is_some() {
-        reg.register(Box::new(tole_core::web::WebSearchTool::from_env().unwrap()))
+    if let Some(search) = tole_core::web::WebSearchTool::from_env() {
+        reg.register(Box::new(search))
             .map_err(|e| anyhow::anyhow!("registering web_search: {e}"))?;
     }
     reg.register(tole_cli::sibling::track(

@@ -355,8 +355,8 @@ pub fn open_session(
     // when a backend is configured (TOLE_WEB_SEARCH_URL) — probe-first:
     // no backend, no tool, never a phantom.
     reg.register(Box::new(tole_core::web::WebFetchTool))?;
-    if tole_core::web::WebSearchTool::from_env().is_some() {
-        reg.register(Box::new(tole_core::web::WebSearchTool::from_env().unwrap()))?;
+    if let Some(search) = tole_core::web::WebSearchTool::from_env() {
+        reg.register(Box::new(search))?;
     }
     // Plan publishing (issue #196 phase 4): model-facing tool, present
     // only when the transport has a client that renders plans (ACP).
