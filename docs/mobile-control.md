@@ -48,6 +48,7 @@ meaning). Its shape — every unknown value is `null`, never a fabricated 0:
 | `cached_tokens` | sum of cached prompt tokens (`prompt_tokens_details.cached_tokens`, falling back to `cached_read_tokens` and the other gateway spellings); `null` if no step reported it |
 | `cache_hit_rate` | cached / prompt over the steps that reported cached tokens; `null` if unknown |
 | `wire` | `null` for sessions recorded before #211, else `{first, last, history_growth_per_step}`; `first`/`last` = `{prefix_chars, system_chars, tools_chars, history_chars, messages}` of the first/last step that has it (characters, not bytes; `prefix_chars` = system + tools) |
+| `turns` | per user turn (#379), derived from the same ledger: `[{turn, user_entry, steps, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, cost_usd}]`. Each token field is the sum over the turn's steps that reported it and `null` when none did (unknown is never 0); no elapsed time is carried. `[]` for a session with no turn |
 
 The mission cost report (`fact/mission`) is rendered by `tole status`; it
 gained an additive `cached_tokens` (`null` when no step reported it). The

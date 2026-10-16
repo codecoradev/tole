@@ -298,7 +298,10 @@ the usage derived from the ledger for any session: prompt / completion /
 reasoning / cached tokens, the cache-hit rate, and the request size in
 characters split into system+tools vs history at the first and last step
 (#211; recorded per step under `tole_wire`; sessions recorded before it read
-`n/a`). Reported only — `--max-tokens` accounting is unchanged.
+`n/a`). It also lists per-user-turn stats (#379: input / output / cache-read /
+cache-write / reasoning tokens, `turns` in the status JSON), summed from the same
+ledger so they survive restarts; a value no step reported is `n/a` / `null`,
+never 0. Reported only — `--max-tokens` accounting is unchanged.
 
 ## Approval gates
 
