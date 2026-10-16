@@ -33,8 +33,8 @@ pub const LEDGER_FILE: &str = "doctor-ledger.json";
 /// Per-call timeout of the `full` tier.
 const FULL_CALL_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Token the probe tool must receive back from the model.
-const PROBE_TOKEN: &str = "tole-doctor-7f3a";
+/// Marker the probe tool must receive back from the model (not a secret).
+const PROBE_MARKER: &str = "doctor-marker-7f3a";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Tier {
@@ -168,22 +168,22 @@ impl Tool for ProbeTool {
         Risk::ReadOnly
     }
     fn summary(&self) -> String {
-        "Diagnostic probe: echoes the given token back. Call it exactly once when asked.".into()
+        "Diagnostic probe: echoes the given marker back. Call it exactly once when asked.".into()
     }
     fn spec(&self) -> Option<Value> {
         Some(json!({
             "type": "object",
-            "properties": {"token": {"type": "string", "description": "The token to echo."}},
-            "required": ["token"]
+            "properties": {"marker": {"type": "string", "description": "The marker to echo."}},
+            "required": ["marker"]
         }))
     }
     fn execute(&self, input: Value) -> Result<Value, String> {
         use std::sync::atomic::Ordering;
         self.calls.fetch_add(1, Ordering::SeqCst);
-        if input["token"].as_str() == Some(PROBE_TOKEN) {
+        if input["marker"].as_str() == Some(PROBE_MARKER) {
             self.saw_token.store(true, Ordering::SeqCst);
         }
-        Ok(json!({ "echo": input["token"], "ok": true }))
+        Ok(json!({ "echo": input["marker"], "ok": true }))
     }
 }
 
@@ -296,7 +296,7 @@ fn tools_check(cfg: &OpenAiConfig, out: &mut Outcome) -> bool {
         return false;
     }
     let prompt = format!(
-        "Call the tool doctor_probe exactly once with {{\"token\":\"{PROBE_TOKEN}\"}}, \
+        "Call the tool doctor_probe exactly once with {{\"marker\":\"{PROBE_MARKER}\"}}, \
          then reply with the word DONE."
     );
     let fix = "pick a model with tool-calling support: export TOLE_MODEL=<model>".to_string();
@@ -335,10 +335,58 @@ fn tools_check(cfg: &OpenAiConfig, out: &mut Outcome) -> bool {
     }
 }
 
+/// `scheme://host[:port]/path` only: userinfo, query and fragment can carry
+/// credentials and never belong in output or on disk.
+pub fn redact_url(url: &str) -> String {
+    let (scheme, rest) = match url.split_once("://") {
+        Some((s, r)) => (format!("{s}://"), r),
+        None => (String::new(), url),
+    };
+    let rest = rest.split(['?', '#']).next().unwrap_or("");
+    let (authority, path) = match rest.find('/') {
+        Some(i) => rest.split_at(i),
+        None => (rest, ""),
+    };
+    let host = authority.rsplit('@').next().unwrap_or("");
+    format!("{scheme}{host}{path}")
+}
+
+/// Strip the API key and any URL credentials from a diagnostic string.
+fn sanitize(text: &str, cfg: &OpenAiConfig) -> String {
+    // URL first: replacing the key first would break the URL match.
+    let mut t = text.to_string();
+    let shown = redact_url(&cfg.base_url);
+    if shown != cfg.base_url {
+        t = t.replace(&cfg.base_url, &shown);
+    }
+    if !cfg.api_key.is_empty() {
+        t = t.replace(&cfg.api_key, "<redacted>");
+    }
+    t
+}
+
 /// Run the diagnosis up to `requested`, stopping at the first blocker.
 /// `cfg` is the resolved provider (None = incomplete); `env` is only used
 /// to name what is missing.
 pub fn diagnose(
+    cfg: Option<&OpenAiConfig>,
+    env: &dyn Fn(&str) -> Option<String>,
+    requested: Tier,
+) -> Outcome {
+    let mut out = diagnose_raw(cfg, env, requested);
+    if let Some(cfg) = cfg {
+        for l in &mut out.lines {
+            *l = sanitize(l, cfg);
+        }
+        if let Some(b) = &mut out.blocker {
+            b.message = sanitize(&b.message, cfg);
+            b.fix = sanitize(&b.fix, cfg);
+        }
+    }
+    out
+}
+
+fn diagnose_raw(
     cfg: Option<&OpenAiConfig>,
     env: &dyn Fn(&str) -> Option<String>,
     requested: Tier,
@@ -481,7 +529,7 @@ impl Ledger {
         }
         let tmp = path.with_extension("json.tmp");
         let body = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(&tmp, body).map_err(|e| format!("cannot write {tmp:?}: {e}"))?;
+        write_private(&tmp, body.as_bytes()).map_err(|e| format!("cannot write {tmp:?}: {e}"))?;
         std::fs::rename(&tmp, path).map_err(|e| format!("cannot replace {path:?}: {e}"))
     }
 
@@ -531,6 +579,19 @@ impl Ledger {
     }
 }
 
+/// Write `bytes` readable by the owner only (0600 on Unix).
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)?.write_all(bytes)
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -560,7 +621,7 @@ pub fn run_cli(
     if let (Some(cfg), false) = (cfg, no_ledger) {
         let saved = ledger_path().and_then(|p| {
             let mut l = Ledger::load(&p)?;
-            l.record(&cfg.base_url, &cfg.model, &outcome, now_ms());
+            l.record(&redact_url(&cfg.base_url), &cfg.model, &outcome, now_ms());
             l.save(&p)?;
             Ok(l)
         });
@@ -672,7 +733,7 @@ mod tests {
             let want_call = has_tools && calls_tool && !last_is_tool;
             if stream {
                 let sse = if want_call {
-                    sse_tool(&json!({"token": PROBE_TOKEN}).to_string())
+                    sse_tool(&json!({"marker": PROBE_MARKER}).to_string())
                 } else {
                     sse_text("PONG")
                 };
@@ -681,7 +742,7 @@ mod tests {
                 let msg = if want_call {
                     json!({"role":"assistant","content":null,"tool_calls":[{"id":"call_1",
                         "type":"function","function":{"name":"doctor_probe",
-                        "arguments": json!({"token": PROBE_TOKEN}).to_string()}}]})
+                        "arguments": json!({"marker": PROBE_MARKER}).to_string()}}]})
                 } else {
                     json!({"role":"assistant","content":"PONG"})
                 };
@@ -860,6 +921,40 @@ mod tests {
         assert_eq!(Ledger::default().summary(), "READY 0-of-0");
         std::fs::write(&path, "{not json").unwrap();
         assert!(Ledger::load(&path).unwrap_err().contains("corrupt"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn urls_are_reduced_to_scheme_host_path() {
+        assert_eq!(
+            redact_url("https://u:p@host:8443/v1?key=abc#frag"),
+            "https://host:8443/v1"
+        );
+        assert_eq!(redact_url("http://host"), "http://host");
+        assert_eq!(redact_url("https://a@b@host/v1"), "https://host/v1");
+    }
+
+    #[test]
+    fn diagnostics_never_carry_the_key_or_url_credentials() {
+        let cfg = OpenAiConfig::new("ftp://user:hunter2@x/v1?k=sk-secret", "m", "sk-secret");
+        let o = diagnose(Some(&cfg), &no_env, Tier::Offline);
+        let all = format!("{:?}", o);
+        assert!(
+            !all.contains("hunter2") && !all.contains("sk-secret"),
+            "{all}"
+        );
+        assert!(all.contains("ftp://x/v1"), "{all}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ledger_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch_dir("ledger-mode");
+        let path = dir.join(LEDGER_FILE);
+        Ledger::default().save(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
