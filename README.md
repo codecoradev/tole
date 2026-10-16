@@ -356,7 +356,8 @@ injecting fewer items, and the turn proceeds without memory.
 
 - [Architecture](docs/architecture.md) · [Threat model](docs/threat-model.md)
   · [PRD](docs/prd.md) · [Epics & roadmap](docs/epics.md) ·
-  [Performance record](docs/perf.md)
+  [Performance record](docs/perf.md) ·
+  [Child-agent handoff](docs/child-agents-handoff.md)
 - [CONTRIBUTING.md](CONTRIBUTING.md) — workflow, issue/PR rules, merge gate,
   cora review gate, live-mission binary hygiene
 - [AGENTS.md](AGENTS.md) — the same rules for AI coding agents
