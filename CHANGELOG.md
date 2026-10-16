@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `tole doctor` coverage ledger (#378): every run is recorded per provider + model (level reached, first blocker, fix command, timestamp) in an owner-only `doctor-ledger.json` (atomic write, a corrupt file is an error, never replaced); `--summary` prints `READY n-of-m` + the first blocker and its fix, `--no-ledger` skips recording.
 - `tole doctor` (#378): tiered provider diagnostics — `offline` (wiring), `catalog` (live `/models`, model must be served) and `full` (chat, streaming and a real tool-call loop) — each blocker carries its fix command, and keys / URL credentials are never printed. Exits non-zero when the requested tier is not reached; `--tier full` is the release-validation gate.
 - Per-user-turn token stats (#379): `tole status` lists input / output / cache-read / cache-write / reasoning tokens per turn and the status JSON (`GET /sessions/{id}/status`, `tole_session_status`) gains an additive `usage_report.turns` array. Derived from the durable usage ledger, so old sessions read the same way and nothing is stored twice; a value no step reported is `n/a` / `null`, never 0, and no elapsed time is invented.
 

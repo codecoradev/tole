@@ -133,6 +133,12 @@ the command that fixes it. The exit code is non-zero when the requested
 tier is not reached, so `tole doctor --tier full` is the gate for "ready to
 release" claims. API keys and URL credentials never appear in the output.
 
+Every run is recorded in a coverage ledger (`$CODECORA_HOME/tole/doctor-ledger.json`,
+owner-readable only: level reached, first blocker, fix, timestamp per provider
++ model; `--no-ledger` skips it). `tole doctor --summary` prints `READY n-of-m`
+plus the first blocker and its fix command without running anything; the latest
+run wins per provider + model, so re-run `--tier full` before a release claim.
+
 ## Configuration (project file)
 
 `<cwd>/.tole/config.toml` (no parent-directory walk) holds per-project defaults.
