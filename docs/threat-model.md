@@ -200,6 +200,18 @@ tier as the session system prompt. Child sessions are ordinary durable
 sessions: approval gates, risk tiers, and secret redaction apply
 unchanged inside them.
 
+Typed handoff (#383) and sibling notices (#380) add two child-to-agent
+channels, both carrying model-authored text that is treated as untrusted. A
+role child gets a Write-tier `handoff_submit` tool that `agent_start`
+allowlists by exact name; it can only write one schema-validated, bounded
+file at the path the parent chose (the role is fixed by the parent), so it
+does not widen what the child may do. Artifact paths and refs are validated
+(workspace-relative, no `..`, backslash, colon or leading `-`; plain ref
+names), and any handoff or sibling-log text shown to another model is
+escaped and bounded. The shared sibling log is a same-user channel between
+processes that already share the parent's authority; a forged line can only
+add notices, and ids read from it must match the agent-id charset.
+
 ## `systemone_decide` (#172/#173)
 
 ReadOnly tool, active only when `SYSTEMONE_API_KEY` is set

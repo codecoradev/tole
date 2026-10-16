@@ -1,8 +1,8 @@
 # Child-agent handoff and verify gate (#383)
 
-Status: the schema, validation and close gate exist (`tole_core::handoff`);
-how a child submits it and how `agent_poll` enforces the gate follow in a
-second change. This page is the design both parts follow.
+Status: implemented — the schema, validation and close gate
+(`tole_core::handoff`), the child-side `handoff_submit` tool, the `role` /
+`consumes` inputs of `agent_start` and the gate in `agent_poll`.
 
 ## Problem
 
@@ -65,6 +65,29 @@ document.
 Neither failure is closed silently. `Handoff::fix_prompt()` builds the prompt
 of the `fix` child that should follow: what failed, the evidence the child
 reported, and the artifact references to read.
+
+## How it is wired
+
+- **Start**: `agent_start` takes an optional `role` and an optional
+  `consumes` list of artifact references. The child's mission is the
+  requested prompt, preceded by a short role brief and followed by the
+  artifacts to read (rendered with control characters escaped). With neither
+  input the child's prompt is exactly what was asked for.
+- **Submit**: a role child gets the `handoff_submit` tool (the parent sets
+  `TOLE_AGENT_ROLE` and `TOLE_AGENT_HANDOFF`). The tool validates the input
+  and writes `<agent dir>/handoff.json`; the role comes from the parent, not
+  from the model. It is Write-tier and the parent adds exactly this name to
+  the child's allowlist: it can only write that one validated, bounded file,
+  so it does not widen what the child may do.
+- **Poll**: for a settled role child `agent_poll` adds `role`, `gate`
+  (`closed`, `unverified`, `verify_failed`, or `no_handoff` for roles that
+  are not gated), the `handoff` itself, and — whenever the work is not
+  closed — a `fix_prompt`. A gated child that submitted nothing, or an
+  invalid document, is `unverified`.
+- **Fix**: nothing is spawned automatically. The parent model sees the
+  failed gate and the ready-made `fix_prompt` and decides whether to start a
+  `fix` child (an `agent_start` with `role: fix`), so spawning, approvals and
+  budgets stay under the parent's policy.
 
 ## Anti-goals
 

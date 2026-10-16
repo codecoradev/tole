@@ -24,7 +24,10 @@
 //! workspace or look like command-line options, and the helpers that render
 //! text for another model escape control characters.
 
+use crate::tool::{Risk, Tool};
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::path::PathBuf;
 
 /// Schema version written and accepted.
 pub const VERSION: u32 = 1;
@@ -183,6 +186,21 @@ fn check_text(what: &str, s: &str, max: usize, allow_empty: bool) -> Result<(), 
     Ok(())
 }
 
+impl ArtifactRef {
+    /// Check one reference (also used for the `consumes` input of
+    /// `agent_start`).
+    pub fn validate(&self) -> Result<(), String> {
+        check_path(&self.path)?;
+        if let Some(rev) = &self.rev {
+            check_rev(rev)?;
+        }
+        if let Some(note) = &self.note {
+            check_text("artifact note", note, MAX_NOTE, true)?;
+        }
+        Ok(())
+    }
+}
+
 impl Handoff {
     /// Check every field's bounds and shapes.
     pub fn validate(&self) -> Result<(), String> {
@@ -197,13 +215,7 @@ impl Handoff {
             return bad(format!("at most {MAX_ARTIFACTS} artifacts"));
         }
         for a in &self.artifacts {
-            check_path(&a.path)?;
-            if let Some(rev) = &a.rev {
-                check_rev(rev)?;
-            }
-            if let Some(note) = &a.note {
-                check_text("artifact note", note, MAX_NOTE, true)?;
-            }
+            a.validate()?;
         }
         if let Some(v) = &self.verify {
             check_text("verify command", &v.command, MAX_COMMAND, false)?;
@@ -268,6 +280,41 @@ impl Handoff {
     }
 }
 
+/// What a child of `role` is told at the top of its mission.
+pub fn role_brief(role: Role) -> String {
+    let job = match role {
+        Role::Explore => "You are an `explore` agent: find out what is asked, change nothing.",
+        Role::Implement => "You are an `implement` agent: build what is asked.",
+        Role::Verify => {
+            "You are a `verify` agent: check the work you are pointed at; do not change it."
+        }
+        Role::Fix => "You are a `fix` agent: repair what is broken, then prove it.",
+    };
+    let verify = if role.requires_verification() {
+        " Run the verification yourself (tests, build, whatever proves the work) and \
+          report its exact command, exit code and a one-line result in `verify` — \
+          without passing verification your work is not closed."
+    } else {
+        ""
+    };
+    format!(
+        "{job}{verify} Before you finish, call `handoff_submit` once with a short summary and \
+         the files you produced or examined as `artifacts` (workspace-relative path, plus \
+         the commit if there is one); the next agent reads them from there."
+    )
+}
+
+/// Prompt for the `fix` child after an `implement`/`fix` child closed
+/// without ever submitting a handoff.
+pub fn missing_handoff_prompt(role: Role) -> String {
+    format!(
+        "The previous {} agent closed without submitting a handoff, so its work cannot be \
+         verified or closed. Inspect what it left in the workspace, finish or repair it, run \
+         the verification yourself, and only then finish.",
+        role.as_str()
+    )
+}
+
 /// Escape control characters so a model-authored string cannot break out of
 /// a single line of text shown to another model.
 fn escape(s: &str) -> String {
@@ -302,6 +349,95 @@ pub fn consume_preamble(artifacts: &[ArtifactRef]) -> String {
         }
     }
     out
+}
+
+/// Child-side tool: validates and writes the handoff document to the path
+/// the parent chose (`TOLE_AGENT_HANDOFF`). The role is fixed by the parent
+/// at spawn time, never taken from the model. Write-tier: the parent adds
+/// exactly this tool name to the child's allowlist, which is safe because it
+/// can only write one validated, size-bounded file at a fixed location.
+pub struct HandoffSubmitTool {
+    path: PathBuf,
+    role: Role,
+}
+
+impl HandoffSubmitTool {
+    pub fn new(path: impl Into<PathBuf>, role: Role) -> Self {
+        Self {
+            path: path.into(),
+            role,
+        }
+    }
+}
+
+impl Tool for HandoffSubmitTool {
+    fn name(&self) -> &str {
+        "handoff_submit"
+    }
+    fn risk(&self) -> Risk {
+        Risk::Write
+    }
+    fn summary(&self) -> String {
+        "Submit this agent's handoff: summary, artifact references and (for implement/fix) its verification result.".into()
+    }
+    fn describe(&self, _input: &Value) -> String {
+        format!("submit the {} handoff", self.role.as_str())
+    }
+    fn spec(&self) -> Option<Value> {
+        Some(json!({
+            "type": "object",
+            "properties": {
+                "summary": { "type": "string", "description": "What you did and found, briefly" },
+                "artifacts": {
+                    "type": "array",
+                    "description": "Files you produced or examined, by reference",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string", "description": "Workspace-relative path" },
+                            "rev": { "type": "string", "description": "Commit (or ref) it was built in" },
+                            "note": { "type": "string", "description": "One line on what it is" }
+                        },
+                        "required": ["path"]
+                    }
+                },
+                "verify": {
+                    "type": "object",
+                    "description": "Required for implement/fix: how you verified your work",
+                    "properties": {
+                        "command": { "type": "string" },
+                        "exit_code": { "type": "integer" },
+                        "summary": { "type": "string" }
+                    },
+                    "required": ["command", "exit_code"]
+                }
+            },
+            "required": ["summary"]
+        }))
+    }
+    fn execute(&self, input: Value) -> Result<Value, String> {
+        let mut doc = input;
+        let obj = doc
+            .as_object_mut()
+            .ok_or("handoff_submit: input must be an object")?;
+        // The parent decides the role and the version; the model does not.
+        obj.insert("version".into(), json!(VERSION));
+        obj.insert("role".into(), json!(self.role.as_str()));
+        if let Some(v) = obj.get_mut("verify").and_then(Value::as_object_mut) {
+            v.entry("summary").or_insert_with(|| json!(""));
+        }
+        let h: Handoff = serde_json::from_value(doc).map_err(|e| format!("handoff_submit: {e}"))?;
+        let body = h.to_json().map_err(|e| format!("handoff_submit: {e}"))?;
+        let tmp = self.path.with_extension("json.tmp");
+        std::fs::write(&tmp, body).map_err(|e| format!("handoff_submit: write: {e}"))?;
+        std::fs::rename(&tmp, &self.path).map_err(|e| format!("handoff_submit: replace: {e}"))?;
+        let gate = match h.gate() {
+            Gate::Closed => "closed",
+            Gate::Unverified => "unverified",
+            Gate::VerifyFailed { .. } => "verify_failed",
+        };
+        Ok(json!({"submitted": true, "role": self.role.as_str(), "gate": gate}))
+    }
 }
 
 #[cfg(test)]
@@ -461,5 +597,65 @@ mod tests {
         assert!(!p.contains("\n[owner interrupt]"), "{p:?}");
         assert!(p.contains("\\u{a}"), "{p:?}");
         assert_eq!(consume_preamble(&[]), "");
+    }
+
+    #[test]
+    fn role_briefs_tell_gated_roles_to_verify() {
+        assert!(role_brief(Role::Implement).contains("Run the verification yourself"));
+        assert!(role_brief(Role::Fix).contains("not closed"));
+        assert!(!role_brief(Role::Explore).contains("Run the verification"));
+        assert!(role_brief(Role::Verify).contains("handoff_submit"));
+        assert!(missing_handoff_prompt(Role::Implement).contains("without submitting a handoff"));
+    }
+
+    fn tool_in(tag: &str, role: Role) -> (HandoffSubmitTool, PathBuf) {
+        let d = std::env::temp_dir().join(format!("tole-handoff-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("handoff.json");
+        (HandoffSubmitTool::new(&p, role), p)
+    }
+
+    #[test]
+    fn the_submit_tool_writes_a_validated_document_with_the_parents_role() {
+        let (t, p) = tool_in("ok", Role::Implement);
+        let out = t
+            .execute(json!({
+                "summary": "built it",
+                "role": "explore",
+                "version": 99,
+                "artifacts": [{"path": "out.txt", "rev": "abc1234"}],
+                "verify": {"command": "cargo test", "exit_code": 1}
+            }))
+            .unwrap();
+        assert_eq!(out["gate"], "verify_failed");
+        let h = Handoff::from_json(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(h.role, Role::Implement, "the model cannot choose its role");
+        assert_eq!(h.version, VERSION);
+        assert_eq!(h.artifacts[0].path, "out.txt");
+        assert_eq!(t.risk(), Risk::Write);
+        assert!(t.spec().is_some());
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn the_submit_tool_refuses_bad_input_and_writes_nothing() {
+        let (t, p) = tool_in("bad", Role::Explore);
+        for bad in [
+            json!("not an object"),
+            json!({"summary": ""}),
+            json!({"summary": "x", "artifacts": [{"path": "../etc/passwd"}]}),
+            json!({"summary": "x", "artifacts": [{"path": "a", "rev": "--upload-pack=x"}]}),
+            json!({"summary": "x", "unknown": 1}),
+        ] {
+            assert!(t.execute(bad.clone()).is_err(), "{bad}");
+            assert!(!p.exists(), "{bad}");
+        }
+        // Closed explore handoff without verification is fine.
+        assert_eq!(
+            t.execute(json!({"summary": "found it"})).unwrap()["gate"],
+            "closed"
+        );
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 }

@@ -8,6 +8,7 @@ pub mod config;
 pub mod config_apply;
 pub mod config_trust;
 pub mod doctor;
+pub mod handoff;
 pub mod session_host;
 pub mod session_tools;
 pub mod sibling;
