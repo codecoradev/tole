@@ -244,7 +244,7 @@ fn new_agent_id() -> String {
     format!("a-{ms:x}-{:x}-{n:x}", std::process::id())
 }
 
-fn valid_agent_id(id: &str) -> bool {
+pub(crate) fn valid_agent_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 64
         && id
