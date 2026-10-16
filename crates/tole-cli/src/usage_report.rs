@@ -11,6 +11,7 @@
 //! measured zero.
 
 use serde_json::{json, Value};
+use tole_core::entry::Entry;
 use tole_core::storage::UsageRecord;
 
 /// One step's request-size split, in characters (see
@@ -164,6 +165,167 @@ pub fn usage_report(usages: &[UsageRecord]) -> UsageReport {
         }
     }
     r
+}
+
+/// Cache-write (creation) tokens of one step: Anthropic-style
+/// `cache_creation_input_tokens`, or the gateway variant
+/// `prompt_tokens_details.cache_write_tokens`.
+fn cache_write_of(u: &Value) -> Option<u64> {
+    u64_at(u, &["cache_creation_input_tokens"])
+        .or_else(|| u64_at(u, &["prompt_tokens_details", "cache_write_tokens"]))
+}
+
+/// Provider-reported token stats of one user turn (#379): the sum over the
+/// provider steps of the turn. Derived at read time from the durable usage
+/// ledger, so there is no second copy to drift and sessions recorded
+/// before this existed read the same way.
+///
+/// Every field is `None` until at least one step reported it: unknown is
+/// never coerced to 0. No elapsed time is carried — it is not measured, so
+/// it is not shown.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TurnStats {
+    /// 1-based position of the turn in the session.
+    pub turn: u64,
+    /// Id of the user message that opened the turn.
+    pub user_entry: String,
+    /// Provider steps of the turn that reported usage.
+    pub steps: u64,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cache_read_tokens: Option<u64>,
+    pub cache_write_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
+    /// Sum of the ledger rows that carry a cost; `None` when none does.
+    pub cost_usd: Option<f64>,
+}
+
+fn add(acc: &mut Option<u64>, x: Option<u64>) {
+    if let Some(x) = x {
+        *acc = Some(acc.unwrap_or(0).saturating_add(x));
+    }
+}
+
+/// A turn opens at a user message, except the stop-gate's own feedback
+/// message (the turn continues after it).
+fn opens_turn(e: &Entry) -> bool {
+    e.kind.as_str() == "message"
+        && e.payload["role"] == json!("user")
+        && e.payload["stop_gate_feedback"] != json!(true)
+}
+
+/// Fold the usage ledger into per-user-turn stats. A usage row belongs to
+/// the turn that was open at the entry it is attached to. Never panics;
+/// rows attached to unknown entries (or before the first user message) are
+/// ignored rather than guessed into a turn.
+pub fn turn_stats(entries: &[Entry], usages: &[UsageRecord]) -> Vec<TurnStats> {
+    let starts: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| opens_turn(e))
+        .map(|(i, _)| i)
+        .collect();
+    let mut out: Vec<TurnStats> = starts
+        .iter()
+        .enumerate()
+        .map(|(n, &i)| TurnStats {
+            turn: n as u64 + 1,
+            user_entry: entries[i].id.clone(),
+            steps: 0,
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            reasoning_tokens: None,
+            cost_usd: None,
+        })
+        .collect();
+    let index: std::collections::HashMap<&str, usize> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (e.id.as_str(), i))
+        .collect();
+    for rec in usages {
+        let Some(&at) = index.get(rec.entry_id.as_str()) else {
+            continue;
+        };
+        let open = starts.partition_point(|&s| s <= at);
+        let Some(t) = open.checked_sub(1).and_then(|k| out.get_mut(k)) else {
+            continue;
+        };
+        if let Some(c) = rec.cost_usd {
+            t.cost_usd = Some(t.cost_usd.unwrap_or(0.0) + c);
+        }
+        if !reports_provider_usage(rec) {
+            continue;
+        }
+        let u = &rec.usage;
+        t.steps += 1;
+        add(&mut t.input_tokens, u64_at(u, &["prompt_tokens"]));
+        add(&mut t.output_tokens, u64_at(u, &["completion_tokens"]));
+        add(&mut t.cache_read_tokens, cached_of(u));
+        add(&mut t.cache_write_tokens, cache_write_of(u));
+        add(
+            &mut t.reasoning_tokens,
+            u64_at(u, &["completion_tokens_details", "reasoning_tokens"]),
+        );
+    }
+    out
+}
+
+/// The `usage_report` status object plus the additive per-turn array.
+pub fn usage_json(entries: &[Entry], usages: &[UsageRecord]) -> Value {
+    let mut j = usage_report(usages).to_json();
+    j["turns"] = Value::Array(
+        turn_stats(entries, usages)
+            .iter()
+            .map(TurnStats::to_json)
+            .collect(),
+    );
+    j
+}
+
+impl TurnStats {
+    /// Unknown values are `null` (never a fabricated zero).
+    pub fn to_json(&self) -> Value {
+        json!({
+            "turn": self.turn,
+            "user_entry": self.user_entry,
+            "steps": self.steps,
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "cache_read_tokens": self.cache_read_tokens,
+            "cache_write_tokens": self.cache_write_tokens,
+            "reasoning_tokens": self.reasoning_tokens,
+            "cost_usd": self.cost_usd,
+        })
+    }
+
+    /// One human line; unknown reads `n/a`.
+    pub fn render_line(&self) -> String {
+        let n = |v: Option<u64>| v.map_or("n/a".to_string(), |x| x.to_string());
+        format!(
+            "turn {}: {} steps, {} in / {} out / {} cache read / {} cache write / {} reasoning",
+            self.turn,
+            self.steps,
+            n(self.input_tokens),
+            n(self.output_tokens),
+            n(self.cache_read_tokens),
+            n(self.cache_write_tokens),
+            n(self.reasoning_tokens),
+        )
+    }
+}
+
+/// Per-turn lines for `tole status` (empty when the session has no turn).
+pub fn turn_lines(entries: &[Entry], usages: &[UsageRecord]) -> Vec<String> {
+    let turns = turn_stats(entries, usages);
+    if turns.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec!["per turn:".to_string()];
+    lines.extend(turns.iter().map(|t| format!("  {}", t.render_line())));
+    lines
 }
 
 fn wire_json(w: &WirePoint) -> Value {
@@ -428,5 +590,194 @@ mod tests {
         let w = r.wire_first.expect("wire point without messages is kept");
         assert_eq!(w.messages, None);
         assert_eq!(wire_json(&w)["messages"], Value::Null);
+    }
+
+    // ---- per-turn stats (#379) ----
+
+    fn entry(seq: u64, kind: &str, payload: Value) -> Entry {
+        Entry {
+            seq,
+            id: format!("e_{seq}"),
+            parent_id: None,
+            kind: tole_core::entry::EntryType::from_string(kind),
+            timestamp: 0,
+            payload,
+        }
+    }
+
+    fn user(seq: u64) -> Entry {
+        entry(seq, "message", json!({"role": "user", "text": "hi"}))
+    }
+
+    fn assistant(seq: u64) -> Entry {
+        entry(seq, "message", json!({"role": "assistant", "text": "ok"}))
+    }
+
+    fn rec_at(entry_id: &str, usage: Value) -> UsageRecord {
+        UsageRecord {
+            id: String::new(),
+            entry_id: entry_id.into(),
+            usage,
+            cost_usd: None,
+        }
+    }
+
+    #[test]
+    fn usage_is_grouped_by_user_turn_and_summed() {
+        let entries = vec![
+            user(1),
+            assistant(2),
+            user(3),
+            // The stop gate's own feedback does not open a turn.
+            entry(
+                4,
+                "message",
+                json!({"role": "user", "text": "gate", "stop_gate_feedback": true}),
+            ),
+            assistant(5),
+        ];
+        let usages = vec![
+            rec_at("e_1", json!({"prompt_tokens": 10, "completion_tokens": 2})),
+            rec_at("e_3", json!({"prompt_tokens": 20, "completion_tokens": 4})),
+            rec_at("e_4", json!({"prompt_tokens": 30, "completion_tokens": 6})),
+        ];
+        let t = turn_stats(&entries, &usages);
+        assert_eq!(t.len(), 2);
+        assert_eq!(
+            (t[0].turn, t[0].user_entry.as_str(), t[0].steps),
+            (1, "e_1", 1)
+        );
+        assert_eq!((t[0].input_tokens, t[0].output_tokens), (Some(10), Some(2)));
+        assert_eq!(
+            (t[1].turn, t[1].user_entry.as_str(), t[1].steps),
+            (2, "e_3", 2)
+        );
+        assert_eq!(
+            (t[1].input_tokens, t[1].output_tokens),
+            (Some(50), Some(10))
+        );
+    }
+
+    #[test]
+    fn unknown_stays_unknown_never_zero() {
+        let entries = vec![user(1), assistant(2), user(3), assistant(4)];
+        let usages = vec![
+            // Turn 1: prompt reported, nothing else.
+            rec_at("e_1", json!({"prompt_tokens": 7})),
+            // Turn 2: wire-only row — no provider usage at all.
+            rec_at("e_3", json!({"tole_wire": wire(1, 2, 3)})),
+        ];
+        let t = turn_stats(&entries, &usages);
+        assert_eq!(t[0].input_tokens, Some(7));
+        assert_eq!(t[0].output_tokens, None);
+        assert_eq!(t[0].cache_read_tokens, None);
+        assert_eq!(t[0].cache_write_tokens, None);
+        assert_eq!(t[0].reasoning_tokens, None);
+        assert_eq!(t[0].cost_usd, None);
+        assert_eq!(t[1].steps, 0);
+        assert_eq!(t[1].input_tokens, None);
+        let j = t[1].to_json();
+        assert_eq!(j["input_tokens"], Value::Null);
+        assert_eq!(j["cost_usd"], Value::Null);
+        assert!(
+            t[1].render_line().contains("n/a in / n/a out"),
+            "{}",
+            t[1].render_line()
+        );
+    }
+
+    #[test]
+    fn a_step_that_reports_nothing_does_not_hide_the_one_that_does() {
+        let entries = vec![user(1), assistant(2)];
+        let usages = vec![
+            rec_at("e_1", json!({"prompt_tokens": 5, "cached_tokens": 3})),
+            rec_at("e_2", json!({"prompt_tokens": 6})),
+        ];
+        let t = turn_stats(&entries, &usages);
+        assert_eq!(t[0].steps, 2);
+        assert_eq!(t[0].input_tokens, Some(11));
+        // Only one step reported the cache: its value, not a diluted sum.
+        assert_eq!(t[0].cache_read_tokens, Some(3));
+    }
+
+    #[test]
+    fn cache_write_and_cost_are_read_from_known_variants() {
+        let entries = vec![user(1)];
+        let mut a = rec_at("e_1", json!({"cache_creation_input_tokens": 4}));
+        a.cost_usd = Some(0.25);
+        let mut b = rec_at(
+            "e_1",
+            json!({"prompt_tokens_details": {"cache_write_tokens": 6}}),
+        );
+        b.cost_usd = Some(0.5);
+        let t = turn_stats(&entries, &[a, b]);
+        assert_eq!(t[0].cache_write_tokens, Some(10));
+        assert_eq!(t[0].cost_usd, Some(0.75));
+    }
+
+    #[test]
+    fn old_and_odd_sessions_still_fold() {
+        // No usage at all (a session recorded before usage existed).
+        let t = turn_stats(&[user(1), assistant(2)], &[]);
+        assert_eq!(t.len(), 1);
+        assert_eq!((t[0].steps, t[0].input_tokens), (0, None));
+        // No turn at all.
+        assert!(turn_stats(&[], &[rec_at("e_1", json!({"prompt_tokens": 1}))]).is_empty());
+        assert!(turn_lines(&[], &[]).is_empty());
+        // A row attached to an unknown entry is ignored, not guessed.
+        let t = turn_stats(&[user(1)], &[rec_at("e_99", json!({"prompt_tokens": 9}))]);
+        assert_eq!(t[0].input_tokens, None);
+    }
+
+    #[test]
+    fn stats_survive_a_restart_and_match_the_provider_block_exactly() {
+        use tole_core::entry::{EntryType, NewEntry};
+        use tole_core::storage::{Commit, JsonlStorage, Storage};
+        let dir = std::env::temp_dir().join(format!("tole-turnstats-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let provider_usage = json!({
+            "prompt_tokens": 123,
+            "completion_tokens": 45,
+            "prompt_tokens_details": {"cached_tokens": 100},
+            "completion_tokens_details": {"reasoning_tokens": 8}
+        });
+        let before = {
+            let mut s = JsonlStorage::create(&dir, "ts", None).unwrap();
+            let u = s
+                .commit(Commit::new().entry(NewEntry::root(
+                    EntryType::new(EntryType::MESSAGE),
+                    json!({"role": "user", "text": "hi"}),
+                )))
+                .unwrap();
+            s.commit(Commit::new().usage(UsageRecord {
+                id: String::new(),
+                entry_id: u[0].id.clone(),
+                usage: provider_usage.clone(),
+                cost_usd: None,
+            }))
+            .unwrap();
+            turn_stats(s.entries(), s.usages())
+        };
+        // "Restart": reopen from disk.
+        let s = JsonlStorage::open(dir.join("ts.jsonl")).unwrap();
+        let after = turn_stats(s.entries(), s.usages());
+        assert_eq!(before, after);
+        assert_eq!(after.len(), 1);
+        let t = &after[0];
+        assert_eq!(
+            (
+                t.input_tokens,
+                t.output_tokens,
+                t.cache_read_tokens,
+                t.reasoning_tokens
+            ),
+            (Some(123), Some(45), Some(100), Some(8))
+        );
+        assert_eq!(t.cache_write_tokens, None, "nothing invented");
+        let j = usage_json(s.entries(), s.usages());
+        assert_eq!(j["turns"][0]["input_tokens"], json!(123));
+        assert_eq!(j["turns"][0]["cache_write_tokens"], Value::Null);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
