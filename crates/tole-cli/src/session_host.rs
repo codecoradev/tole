@@ -39,6 +39,34 @@ pub struct SessionState {
     pub cancel: tole_core::cancel::CancelToken,
 }
 
+/// Why a soft interrupt was not queued (#377).
+#[derive(Debug, PartialEq, Eq)]
+pub enum InterruptRefusal {
+    /// No turn is running: there is nothing to steer, and a stale message
+    /// must not wait around to hijack the next, unrelated turn.
+    NotBusy,
+    /// Blank, oversized, or the queue is full (see `tole_core::interrupt`).
+    Invalid(String),
+}
+
+/// Queue a soft interrupt for the session's in-flight turn (#377). Shared
+/// by the REST and MCP faces. The turn loop delivers it at its next safe
+/// point; a turn that ends first leaves it queued for the next turn's
+/// first safe point (the check below is a best-effort guard, not a lock).
+pub fn interrupt_session(
+    st: &SessionState,
+    text: &str,
+    urgent: bool,
+) -> Result<(), InterruptRefusal> {
+    if !*st.busy.lock().expect("busy lock") {
+        return Err(InterruptRefusal::NotBusy);
+    }
+    st.cancel
+        .interrupts()
+        .push(text, urgent)
+        .map_err(|e| InterruptRefusal::Invalid(e.to_string()))
+}
+
 /// Marks a session busy for its whole lifetime; Drop un-marks even on
 /// panic, so one failed turn cannot brick the session.
 pub struct BusyGuard(StdArc<Mutex<bool>>);

@@ -232,11 +232,19 @@ fn spawn_mock() -> String {
                 if last_user.contains("DELAYED") {
                     std::thread::sleep(Duration::from_secs(2));
                 }
+                // #377: a transcript carrying the owner's soft interrupt
+                // is answered differently, so the test can see the
+                // steering reached the provider.
+                let steered = msgs.iter().any(|m| {
+                    m["content"]
+                        .as_str()
+                        .is_some_and(|c| c.contains("owner interrupt"))
+                });
                 let reply = json!({
                     "id": "chatcmpl-mock", "object": "chat.completion", "created": 1,
                     "model": "mock",
                     "choices": [{"index": 0, "message": {"role": "assistant",
-                        "content": "DONE"}, "finish_reason": "stop"}],
+                        "content": if steered { "STEERED" } else { "DONE" }}, "finish_reason": "stop"}],
                     "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
                 });
                 let resp = sse_response(&reply, streamed);
@@ -297,6 +305,57 @@ fn serve_cancel_mid_provider_settles_cancelled_and_resumable() {
         .expect("follow-up");
     assert_eq!(code, 200, "{resp}");
     assert_eq!(resp["stopReason"].as_str(), Some("end_turn"), "{resp}");
+}
+
+/// #377: `POST /sessions/{id}/interrupt` steers the in-flight turn without
+/// cancelling it. The first (stale) answer is superseded, the next provider
+/// call carries the attributed interrupt, and the prompt returns the
+/// steered answer. Idle / unknown / malformed requests are refused.
+#[test]
+fn serve_soft_interrupt_steers_the_running_turn() {
+    let base = spawn_mock();
+    let serve = ServeProcess::spawn(&base);
+    let (code, created) = serve.request("POST", "/sessions", "{}").expect("create");
+    assert_eq!(code, 200, "{created}");
+    let sid = created["sessionId"].as_str().unwrap().to_string();
+    let path = format!("/sessions/{sid}/interrupt");
+
+    // Refusals: unknown session, idle session, bad bodies.
+    let (code, _) = serve
+        .request("POST", "/sessions/nope/interrupt", r#"{"text":"x"}"#)
+        .unwrap();
+    assert_eq!(code, 404);
+    let (code, body) = serve.request("POST", &path, r#"{"text":"x"}"#).unwrap();
+    assert_eq!(code, 409, "no turn running: {body}");
+    let (code, _) = serve.request("POST", &path, "not json").unwrap();
+    assert_eq!(code, 400);
+    let (code, _) = serve.request("POST", &path, r#"{"nope":1}"#).unwrap();
+    assert_eq!(code, 400);
+
+    // A running turn (the first provider call takes ~2 s).
+    let thread_serve = Arc::clone(&serve);
+    let sid_clone = sid.clone();
+    let prompt = std::thread::spawn(move || {
+        thread_serve.request(
+            "POST",
+            &format!("/sessions/{sid_clone}/prompt"),
+            r#"{"text": "DELAYED mission"}"#,
+        )
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    let (code, _) = serve.request("POST", &path, r#"{"text":"   "}"#).unwrap();
+    assert_eq!(code, 400, "blank text is refused, not queued");
+    let (code, ack) = serve
+        .request("POST", &path, r#"{"text":"prefer approach Y"}"#)
+        .unwrap();
+    assert_eq!(code, 202, "{ack}");
+    assert_eq!(ack["queued"], json!(true));
+    assert_eq!(ack["urgent"], json!(false));
+
+    let (pcode, presp) = prompt.join().unwrap().expect("prompt response");
+    assert_eq!(pcode, 200, "{presp}");
+    assert_eq!(presp["stopReason"].as_str(), Some("end_turn"), "{presp}");
+    assert_eq!(presp["text"].as_str(), Some("STEERED"), "{presp}");
 }
 
 /// #211: `GET /sessions/{id}/status` gains an ADDITIVE `usage_report`

@@ -59,9 +59,13 @@ tole is the agent harness of the CodeCora ecosystem — the hands:
   turns, and poll status without SSH-ing into the box. Binds 127.0.0.1 by
   default. `POST /sessions/{id}/cancel` (#178, REST face) stops an
   in-flight turn — it settles `stopReason: "cancelled"`.
+  `POST /sessions/{id}/interrupt` (#377) steers the running turn instead,
+  without losing its work: the `{"text", "urgent"}` message is injected at
+  the turn's next safe point as an attributed entry (`409` when no turn
+  is running).
   `--transport mcp` (issue #137) serves **multi-session MCP over
   Streamable HTTP** instead: one authenticated MCP connection addresses N
-  durable tole sessions (`tole_session_new/prompt/cancel/status/list` +
+  durable tole sessions (`tole_session_new/prompt/cancel/interrupt/status/list` +
   the registry tools routed to each session's workspace jail).
 
 Every ecosystem integration is probe-first: a missing binary degrades to a
