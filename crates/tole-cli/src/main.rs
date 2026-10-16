@@ -2130,7 +2130,10 @@ fn status_command(sessions_dir: &Path, id: &str) -> Result<()> {
     let turns: usize = storage
         .entries()
         .iter()
-        .filter(|e| e.payload.get("role") == Some(&serde_json::json!("user")))
+        .filter(|e| {
+            e.payload.get("role") == Some(&serde_json::json!("user"))
+                && e.payload.get("interrupt") != Some(&serde_json::json!(true))
+        })
         .count();
     println!("turns:   {turns} (user messages)");
     println!(
@@ -2212,7 +2215,10 @@ fn sessions_command(sessions_dir: &Path) -> Result<()> {
         let turns: usize = s
             .entries()
             .iter()
-            .filter(|e| e.payload.get("role") == Some(&serde_json::json!("user")))
+            .filter(|e| {
+                e.payload.get("role") == Some(&serde_json::json!("user"))
+                    && e.payload.get("interrupt") != Some(&serde_json::json!(true))
+            })
             .count();
         rows.push((
             mtime,

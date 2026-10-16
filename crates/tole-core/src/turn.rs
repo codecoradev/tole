@@ -482,6 +482,9 @@ fn drive(
         if cancel.is_cancelled() {
             return settle_cancelled(s);
         }
+        // Soft-interrupt safe point (#377): the previous tool has settled
+        // and the next provider call has not started.
+        deliver_interrupts(s, cancel)?;
         // No clone: complete() borrows the storage slice. (The old
         // to_vec() allocated the whole transcript every provider step.)
         let next = match p.complete(s.entries()) {
@@ -563,6 +566,33 @@ fn drive(
         if cancel.is_cancelled() {
             return settle_cancelled(s);
         }
+        // Soft interrupt that landed while `complete()` was in flight
+        // (#377). Like the cancel above, the output is a pure read with no
+        // pending intent, so dropping it is crash-safe — and because the
+        // intent is never written, no `tool_use` can be left without its
+        // `tool_result`. A final answer is superseded by ANY pending
+        // interrupt (the owner is steering it); a not-yet-started tool call
+        // only by an URGENT one. Each drop is recorded durably, and the
+        // next loop pass delivers the message at the safe point.
+        let superseded = match &next {
+            ProviderOutput::Final { .. } => !cancel.interrupts().is_empty(),
+            ProviderOutput::ToolCall { .. } | ProviderOutput::InvalidToolArgs { .. } => {
+                cancel.interrupts().has_urgent()
+            }
+        };
+        if superseded {
+            let what = match &next {
+                ProviderOutput::Final { .. } => "final answer".to_string(),
+                ProviderOutput::ToolCall { tool, .. }
+                | ProviderOutput::InvalidToolArgs { tool, .. } => format!("tool call {tool:?}"),
+            };
+            append_turn_error(
+                s,
+                "superseded by owner interrupt",
+                &format!("the model's {what} was withdrawn before it took effect"),
+            )?;
+            continue;
+        }
         // Issue #196 phase 2: surface the model's reasoning for this
         // step (when the provider supplies one) BEFORE the step's
         // effect lands — thought first, action after.
@@ -599,6 +629,7 @@ fn drive(
                             e.kind.as_str() == "message"
                                 && e.payload["role"] == json!("user")
                                 && e.payload["stop_gate_feedback"] != json!(true)
+                                && e.payload["interrupt"] != json!(true)
                         })
                         .unwrap_or(0);
                     let tools_seen: Vec<(String, Risk)> = s
@@ -853,6 +884,31 @@ fn drive(
 /// Appends a durable ERROR entry under the turn's user message. No
 /// transition: the machine stays parked in Planning for the host to
 /// resolve (resume/finish) — the record exists so replay can see why.
+/// Commit every pending soft interrupt as an attributed user-role entry
+/// (#377). The marker fields keep it from opening a new turn (like the
+/// stop-gate feedback) and let hosts and readers tell an owner's steering
+/// from the original prompt; the text carries the attribution too, since
+/// that is all the provider sees.
+fn deliver_interrupts(s: &mut dyn Storage, cancel: &CancelToken) -> Result<(), StorageError> {
+    for i in cancel.interrupts().drain() {
+        let tag = if i.urgent {
+            "owner interrupt · urgent"
+        } else {
+            "owner interrupt"
+        };
+        s.commit(Commit::new().entry(NewEntry::root(
+            EntryType::new(EntryType::MESSAGE),
+            json!({
+                "role": "user",
+                "text": format!("[{tag} — injected mid-turn, not part of the original request] {}", i.text),
+                "interrupt": true,
+                "urgent": i.urgent,
+            }),
+        )))?;
+    }
+    Ok(())
+}
+
 fn append_turn_error(s: &mut dyn Storage, error: &str, detail: &str) -> Result<(), StorageError> {
     let parent = s
         .entries()
