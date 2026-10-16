@@ -245,11 +245,7 @@ fn new_agent_id() -> String {
 }
 
 pub(crate) fn valid_agent_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 64
-        && id
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    crate::sibling_watch::valid_agent_id(id)
 }
 
 fn agents_root(root: &std::path::Path) -> PathBuf {
