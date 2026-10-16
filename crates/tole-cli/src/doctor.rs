@@ -579,11 +579,19 @@ impl Ledger {
     }
 }
 
-/// Write `bytes` readable by the owner only (0600 on Unix).
+/// Write `bytes` readable by the owner only (0600 on Unix). A stale file at
+/// `path` is removed first and the new one is created exclusively
+/// (`O_EXCL`), so a pre-planted file or symlink is never written through
+/// and the mode always applies.
 fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
     let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -944,6 +952,26 @@ mod tests {
             "{all}"
         );
         assert!(all.contains("ftp://x/v1"), "{all}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_tmp_is_replaced_not_written_through() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch_dir("ledger-stale");
+        let path = dir.join(LEDGER_FILE);
+        let tmp = path.with_extension("json.tmp");
+        // A pre-planted, world-readable tmp symlinked elsewhere.
+        let victim = dir.join("victim");
+        std::fs::write(&victim, "keep").unwrap();
+        std::os::unix::fs::symlink(&victim, &tmp).unwrap();
+        Ledger::default().save(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
