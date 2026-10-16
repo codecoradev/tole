@@ -107,6 +107,8 @@ impl std::fmt::Debug for OpenAiConfig {
 /// tools on the same host.
 pub const ENV_BASE_URL: &str = "TOLE_BASE_URL";
 pub const ENV_MODEL: &str = "TOLE_MODEL";
+// The env var NAME, not a secret value.
+// cora-ignore: sec-hardcoded-secret
 pub const ENV_API_KEY: &str = "TOLE_API_KEY";
 
 /// Prefixes tried by [`OpenAiConfig::from_env`], in order. The first
