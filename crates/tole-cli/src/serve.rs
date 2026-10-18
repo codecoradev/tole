@@ -63,7 +63,9 @@ struct State {
     plan_mode: bool,
     memory: Option<MemoryConfig>,
     token: String,
-    workspace_default: Option<String>,
+    /// Jail-of-jails root (canonical): `--workspace`, else the server
+    /// cwd. Client-supplied session cwds must resolve inside it.
+    workspace_root: std::path::PathBuf,
     sessions_dir: Option<std::path::PathBuf>,
     turnend: Vec<String>,
     live_connections: std::sync::atomic::AtomicUsize,
@@ -84,6 +86,8 @@ const REQUEST_READ_DEADLINE: Duration = Duration::from_secs(15);
 
 pub fn run_serve(cfg: ServeConfig) -> Result<()> {
     let token = resolve_token(&cfg.token)?;
+    let workspace_root = crate::resolve_workspace_root(cfg.workspace.as_ref())
+        .context("resolving --workspace for the session jail root")?;
     let addr = format!("{}:{}", cfg.bind, cfg.port);
     let listener = TcpListener::bind(&addr)
         .with_context(|| format!("binding {addr} (in use? change --port)"))?;
@@ -94,7 +98,7 @@ pub fn run_serve(cfg: ServeConfig) -> Result<()> {
         plan_mode: cfg.plan_mode,
         memory: cfg.memory.clone(),
         token,
-        workspace_default: cfg.workspace.clone(),
+        workspace_root,
         sessions_dir: cfg.sessions_dir.clone(),
         turnend: cfg.turnend.clone(),
         live_connections: std::sync::atomic::AtomicUsize::new(0),
@@ -296,6 +300,7 @@ fn reason_phrase(status: u16) -> &'static str {
         202 => "Accepted",
         400 => "Bad Request",
         401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
         409 => "Conflict",
@@ -457,10 +462,21 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
             let Ok(req) = serde_json::from_str::<serde_json::Value>(body) else {
                 return (400, json!({"error": "invalid JSON body"}));
             };
-            let cwd = req
-                .get("cwd")
-                .and_then(|v| v.as_str())
-                .unwrap_or(state.workspace_default.as_deref().unwrap_or("."));
+            let requested = match req.get("cwd").and_then(|v| v.as_str()) {
+                Some(c) => c.to_string(),
+                None => state.workspace_root.to_string_lossy().into_owned(),
+            };
+            // Jail-of-jails — the same check the MCP transport's
+            // tole_session_new applies: without it a client could root a
+            // session (and its file/git tools) at `/` or `/etc`.
+            let jailed = match tole_cli::session_tools::jail_session_cwd(
+                &state.workspace_root,
+                &requested,
+            ) {
+                Ok(c) => c,
+                Err(e) => return (403, json!({"error": e})),
+            };
+            let cwd = jailed.as_str();
             // Capacity first: `open_session` creates the session file on
             // disk, so refusing AFTER it (503) would orphan that file. The
             // re-check at insert time below still guards a concurrent
@@ -726,6 +742,65 @@ mod tests {
         assert_eq!(reason_phrase(429), "Too Many Requests");
         assert_eq!(reason_phrase(503), "Service Unavailable");
         assert_eq!(reason_phrase(413), "Payload Too Large");
+        assert_eq!(reason_phrase(403), "Forbidden");
+    }
+
+    fn test_state(root: std::path::PathBuf, sessions_dir: std::path::PathBuf) -> State {
+        State {
+            sessions: Arc::new(Mutex::new(Sessions::default())),
+            approvals: tole_cli::approvals::ApprovalQueue::shared(),
+            allow_patterns: vec![],
+            plan_mode: false,
+            memory: None,
+            token: "t".into(),
+            workspace_root: root,
+            sessions_dir: Some(sessions_dir),
+            turnend: vec![],
+            live_connections: std::sync::atomic::AtomicUsize::new(0),
+            auth_failures: tole_cli::auth::AuthLimiter::new(),
+        }
+    }
+
+    /// cora 0.19 scan MAJOR: REST `POST /sessions` must enforce the same
+    /// jail-of-jails as the MCP transport — a cwd outside the server
+    /// workspace root is refused BEFORE any session file is created.
+    #[test]
+    fn rest_session_cwd_outside_workspace_root_is_refused() {
+        let base = std::env::temp_dir().join(format!("tole-serve-jail-{}", std::process::id()));
+        let root = base.join("ws");
+        let inside = root.join("sub");
+        let sessions = base.join("sessions");
+        std::fs::create_dir_all(&inside).unwrap();
+        std::fs::create_dir_all(&sessions).unwrap();
+        let state = test_state(root.clone(), sessions.clone());
+
+        for escape in [
+            "/",
+            base.to_str().unwrap(),
+            &format!("{}/..", root.display()),
+        ] {
+            let body = json!({ "cwd": escape }).to_string();
+            let (status, payload) = route(&state, "POST", "/sessions", &body);
+            assert_eq!(status, 403, "{escape}: {payload}");
+            assert!(payload["error"].as_str().unwrap().contains("escapes"));
+        }
+        assert_eq!(
+            std::fs::read_dir(&sessions).unwrap().count(),
+            0,
+            "a refused cwd must not leave a session file behind"
+        );
+
+        // Inside the root (and the default, omitted cwd) still open.
+        let body = json!({ "cwd": inside.to_str().unwrap() }).to_string();
+        let (status, payload) = route(&state, "POST", "/sessions", &body);
+        assert_eq!(status, 200, "{payload}");
+        assert_eq!(
+            payload["workspace"],
+            json!(inside.canonicalize().unwrap().to_str().unwrap())
+        );
+        let (status, payload) = route(&state, "POST", "/sessions", "{}");
+        assert_eq!(status, 200, "{payload}");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
