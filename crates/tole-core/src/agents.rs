@@ -319,6 +319,15 @@ pub struct AgentMeta {
     pub role: Option<String>,
 }
 
+/// The child's uteke mailbox namespace, derived from its (validated)
+/// agent id. The parent NEVER takes it from `meta.json`: the child can
+/// write that file, and the poll drives `uteke forget` on the namespace —
+/// a forged `mailbox_ns` (e.g. `repo-<name>`) would make the parent wipe
+/// an unrelated room (cora 0.19 scan MAJOR).
+fn mailbox_ns_for(id: &str) -> String {
+    format!("agent-{id}")
+}
+
 fn read_meta(dir: &std::path::Path) -> Result<AgentMeta, String> {
     let raw =
         std::fs::read_to_string(dir.join("meta.json")).map_err(|e| format!("agent meta: {e}"))?;
@@ -704,7 +713,7 @@ impl Tool for AgentStartTool {
             (None, None)
         };
 
-        let mailbox_ns = format!("agent-{id}");
+        let mailbox_ns = mailbox_ns_for(&id);
         let meta = AgentMeta {
             prompt: prompt.clone(),
             mailbox_ns: mailbox_ns.clone(),
@@ -931,7 +940,14 @@ impl Tool for AgentPollTool {
         // ENTIRE consume section (issue #260, rescan #155: dropping it
         // after the read let two concurrent polls both recall+clean).
         attach_handoff(&dir, &meta, &mut out);
-        self.consume_mailbox(&dir, &mut meta, &mut out, crate::memory::recall);
+        self.consume_mailbox(
+            &dir,
+            id,
+            &mut meta,
+            &mut out,
+            crate::memory::recall,
+            clean_mailbox,
+        );
         Ok(out)
     }
 }
@@ -992,22 +1008,29 @@ impl AgentPollTool {
     /// marked consumed and cleaned ONLY when the recall succeeded (hits or
     /// an explicit empty result); on a recall error the result is kept and
     /// the next poll retries (issue #287, regression of #260).
-    fn consume_mailbox<F>(
+    /// The namespace comes from `id` ([`mailbox_ns_for`]), never from the
+    /// child-writable `meta.mailbox_ns`. `clean` is injectable so tests
+    /// can observe which namespace would be forgotten.
+    fn consume_mailbox<F, C>(
         &self,
         dir: &std::path::Path,
+        id: &str,
         meta: &mut AgentMeta,
         out: &mut Value,
         recall: F,
+        clean: C,
     ) where
         F: Fn(&crate::memory::MemoryConfig, &str) -> Result<Vec<crate::memory::RecallHit>, String>,
+        C: Fn(&str),
     {
         let _g = self.consumed.lock();
         if meta.mailbox_consumed {
             return;
         }
+        let ns = mailbox_ns_for(id);
         let cfg = crate::memory::MemoryConfig {
             bin: "uteke".into(),
-            namespace: meta.mailbox_ns.clone(),
+            namespace: ns.clone(),
             limit: 3,
         };
         match recall(&cfg, &meta.prompt) {
@@ -1029,7 +1052,7 @@ impl AgentPollTool {
             }
         }
         if !meta.keep_mailbox {
-            clean_mailbox(&meta.mailbox_ns);
+            clean(&ns);
         }
         meta.mailbox_consumed = true;
         if let Err(e) = write_meta(dir, meta) {
@@ -1714,7 +1737,14 @@ mod tests {
         let dir = agents_root(&d).join(&id);
         let mut meta = read_meta(&dir).unwrap();
         let mut out = json!({});
-        poll.consume_mailbox(&dir, &mut meta, &mut out, |_, _| Ok(Vec::new()));
+        poll.consume_mailbox(
+            &dir,
+            &id,
+            &mut meta,
+            &mut out,
+            |_, _| Ok(Vec::new()),
+            |_| {},
+        );
         // A brand-new instance = a new parent process.
         let poll2 = AgentPollTool::new(d.clone());
         let again = poll2.execute(json!({"agent": id})).unwrap();
@@ -1758,9 +1788,14 @@ mod tests {
         let poll = AgentPollTool::new(d.clone());
         let mut meta = read_meta(&dir).unwrap();
         let mut out = json!({});
-        poll.consume_mailbox(&dir, &mut meta, &mut out, |_, _| {
-            Err("uteke unavailable".into())
-        });
+        poll.consume_mailbox(
+            &dir,
+            &id,
+            &mut meta,
+            &mut out,
+            |_, _| Err("uteke unavailable".into()),
+            |_| {},
+        );
         assert!(!meta.mailbox_consumed, "error must not mark consumed");
         assert!(out.get("summary").is_none());
         assert!(out["recall_error"].is_string(), "{out}");
@@ -1770,15 +1805,65 @@ mod tests {
         );
         // Retry succeeds: summary delivered, then consumed.
         let mut out2 = json!({});
-        poll.consume_mailbox(&dir, &mut meta, &mut out2, |_, _| {
-            Ok(vec![crate::memory::RecallHit {
-                score: 1.0,
-                content: "child result".into(),
-            }])
-        });
+        poll.consume_mailbox(
+            &dir,
+            &id,
+            &mut meta,
+            &mut out2,
+            |_, _| {
+                Ok(vec![crate::memory::RecallHit {
+                    score: 1.0,
+                    content: "child result".into(),
+                }])
+            },
+            |_| {},
+        );
         assert_eq!(out2["summary"], json!("child result"));
         assert!(meta.mailbox_consumed);
         assert!(read_meta(&dir).unwrap().mailbox_consumed);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// cora 0.19 scan MAJOR: `meta.json` is child-writable, so a forged
+    /// `mailbox_ns` must not steer the parent's recall or `uteke forget`
+    /// at another namespace — both use `agent-<id>`.
+    #[test]
+    fn forged_mailbox_ns_in_meta_is_ignored() {
+        let d = tmp("forged-ns");
+        let id = "a-forged";
+        let dir = agents_root(&d).join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut meta = AgentMeta {
+            prompt: "p".into(),
+            mailbox_ns: "repo-victim".into(),
+            keep_mailbox: false,
+            spawned_at_ms: 0,
+            worktree: None,
+            branch: None,
+            mailbox_consumed: false,
+            role: None,
+        };
+        write_meta(&dir, &meta).unwrap();
+        let recalled = std::sync::Mutex::new(Vec::<String>::new());
+        let cleaned = std::sync::Mutex::new(Vec::<String>::new());
+        let poll = AgentPollTool::new(d.clone());
+        let mut out = json!({});
+        poll.consume_mailbox(
+            &dir,
+            id,
+            &mut meta,
+            &mut out,
+            |cfg, _| {
+                recalled.lock().unwrap().push(cfg.namespace.clone());
+                Ok(Vec::new())
+            },
+            |ns| cleaned.lock().unwrap().push(ns.to_string()),
+        );
+        assert_eq!(
+            *recalled.lock().unwrap(),
+            vec!["agent-a-forged".to_string()]
+        );
+        assert_eq!(*cleaned.lock().unwrap(), vec!["agent-a-forged".to_string()]);
         let _ = std::fs::remove_dir_all(&d);
     }
 
