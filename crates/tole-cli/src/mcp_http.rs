@@ -96,7 +96,7 @@ pub async fn run_mcp_http(
     // The registry: the standard server-mode tools + the session tools,
     // plus the per-session resolver — a tool call carrying `session_id`
     // routes to THAT session's registry (its jail + approver).
-    let registry = crate::build_server_registry_for_mcp(plan_mode)?;
+    let registry = crate::build_server_registry_for_mcp(workspace, plan_mode)?;
     let session_tools = session_state.tools();
     let resolver_sessions = Arc::clone(&session_state.sessions);
     let resolver: tole_core::mcp_server::SessionRegistryResolver = Arc::new(move |sid: &str| {

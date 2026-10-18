@@ -22,6 +22,32 @@ use crate::session_host::{
 use tole_core::memory::MemoryConfig;
 use tole_core::tool::{Risk, Tool};
 
+/// Jail-of-jails, shared by both server transports (MCP
+/// `tole_session_new` and REST `POST /sessions`): a client-supplied
+/// session cwd must resolve INSIDE the server's workspace root —
+/// otherwise a remote client could point a session at `/` (the whole
+/// filesystem) or `/etc` (CodeCora #137). Returns the CANONICAL path the
+/// session must be rooted at: a symlink swapped in after the check (or a
+/// `..`/symlink spelling in the raw string) must not redirect it.
+pub fn jail_session_cwd(workspace_root: &std::path::Path, cwd: &str) -> Result<String, String> {
+    let root = workspace_root
+        .canonicalize()
+        .map_err(|e| format!("workspace root: {e}"))?;
+    let target = std::path::Path::new(cwd)
+        .canonicalize()
+        .map_err(|e| format!("cwd {cwd:?}: {e}"))?;
+    if target != root && !target.starts_with(&root) {
+        return Err(format!(
+            "cwd {cwd:?} escapes the server workspace root {}",
+            root.display()
+        ));
+    }
+    target
+        .to_str()
+        .map(str::to_string)
+        .ok_or_else(|| format!("cwd {cwd:?} is not valid UTF-8 once resolved"))
+}
+
 /// Shared factory state for the session tools.
 #[derive(Clone)]
 pub struct SessionToolState {
@@ -132,30 +158,8 @@ impl Tool for SessionNewTool {
             .get("cwd")
             .and_then(Value::as_str)
             .ok_or("tole_session_new: missing 'cwd'")?;
-        // Jail-of-jails: the client-supplied cwd must resolve INSIDE the
-        // server's workspace root — otherwise a remote client could point
-        // a session at / (the whole filesystem) or /etc (CodeCora #137).
-        let root = self
-            .0
-            .workspace_root
-            .canonicalize()
-            .map_err(|e| format!("workspace root: {e}"))?;
-        let target = std::path::Path::new(cwd)
-            .canonicalize()
-            .map_err(|e| format!("cwd {cwd:?}: {e}"))?;
-        if target != root && !target.starts_with(&root) {
-            return Err(format!(
-                "cwd {cwd:?} escapes the server workspace root {}",
-                root.display()
-            ));
-        }
-        // The jail check above validated the CANONICAL path, so the session
-        // must be rooted at that same path: a symlink swapped in after the
-        // check (or a `..`/symlink spelling in the raw string) must not
-        // redirect the session elsewhere.
-        let cwd = target
-            .to_str()
-            .ok_or_else(|| format!("cwd {cwd:?} is not valid UTF-8 once resolved"))?;
+        let jailed = jail_session_cwd(&self.0.workspace_root, cwd)?;
+        let cwd = jailed.as_str();
         // Capacity first: open_session creates the session file on disk, so
         // refusing AFTER it would leave an orphaned session behind. The
         // re-check at insert time below still guards a concurrent creator.

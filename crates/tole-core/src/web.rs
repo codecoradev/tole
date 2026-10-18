@@ -224,6 +224,22 @@ impl ureq::unversioned::resolver::Resolver for SsrfResolver {
     }
 }
 
+/// Config for [`fetch_agent_vetted`]. The environment proxy is OFF:
+/// ureq reads `HTTP(S)_PROXY` / `ALL_PROXY` by default, and through a
+/// proxy the resolver only ever sees (and vets) the PROXY host — the
+/// target, private or cloud-metadata IP included, would be fetched by
+/// the proxy unchecked (cora 0.19 scan MAJOR). Takes the builder so a
+/// test can prove a proxy already on it is stripped.
+fn vetted_config(
+    builder: ureq::config::ConfigBuilder<ureq::typestate::AgentScope>,
+) -> ureq::config::Config {
+    builder
+        .timeout_global(Some(Duration::from_secs(30)))
+        .max_redirects(0)
+        .proxy(None)
+        .build()
+}
+
 /// Fetch agent whose resolver VETS-AND-PINS in one step: resolution,
 /// the private-range check, and the connection's address list all come
 /// from the same resolver call, so the cora "two separate DNS lookups"
@@ -231,10 +247,7 @@ impl ureq::unversioned::resolver::Resolver for SsrfResolver {
 /// fresh agent (re-vetted per hop).
 fn fetch_agent_vetted() -> ureq::Agent {
     ureq::Agent::with_parts(
-        ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(30)))
-            .max_redirects(0)
-            .build(),
+        vetted_config(ureq::Agent::config_builder()),
         ureq::unversioned::transport::DefaultConnector::default(),
         SsrfResolver {
             opt_out: ssrf_opt_out(),
@@ -646,6 +659,19 @@ fn urlencoding_lite(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::join_redirect;
+
+    /// cora 0.19 scan MAJOR: an env proxy (`HTTPS_PROXY` & co.) on the
+    /// vetted fetch agent would let the target bypass the SSRF resolver.
+    /// Seed the builder with a proxy, as `Config::default()` does from
+    /// the environment, and require the vetted config to drop it.
+    #[test]
+    fn vetted_fetch_config_never_uses_a_proxy() {
+        use super::{fetch_agent_vetted, vetted_config};
+        let proxy = ureq::Proxy::new("http://127.0.0.1:3128").unwrap();
+        let seeded = ureq::Agent::config_builder().proxy(Some(proxy));
+        assert!(vetted_config(seeded).proxy().is_none());
+        assert!(fetch_agent_vetted().config().proxy().is_none());
+    }
 
     /// #281: RFC 3986 §5.4 reference resolution against the current hop.
     #[test]

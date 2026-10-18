@@ -1747,10 +1747,15 @@ fn build_server_registry(
 /// hardened tools as stdio MCP (D1); the session tools join separately
 /// via RegistryServer::with_extra_tools.
 #[cfg(all(feature = "mcp-http", feature = "shell-tools"))]
-fn build_server_registry_for_mcp(plan_mode: bool) -> Result<ToolRegistry> {
+fn build_server_registry_for_mcp(
+    workspace: Option<&String>,
+    plan_mode: bool,
+) -> Result<ToolRegistry> {
     // Empty allowlist: the session tools carry their own approver per
     // session; registry Write tools stay pre-auth-off (deny by default).
-    let mut registry = build_server_registry(None, &[])?;
+    // `--workspace` roots the server-level file tools exactly like the
+    // stdio `tole mcp` face — without it they jailed to the process cwd.
+    let mut registry = build_server_registry(workspace, &[])?;
     // Plan mode (#294): same retain_read_only semantics as the other
     // faces — Write/Destructive tools are absent, not merely denied.
     if plan_mode {
@@ -3448,7 +3453,7 @@ mod chat_todo_tests {
     #[test]
     fn mcp_server_registry_is_read_only_under_plan_mode() {
         use tole_core::tool::Risk;
-        let normal = build_server_registry_for_mcp(false).unwrap();
+        let normal = build_server_registry_for_mcp(None, false).unwrap();
         assert!(
             normal.specs().iter().any(|s| normal
                 .get(s["function"]["name"].as_str().unwrap())
@@ -3457,7 +3462,7 @@ mod chat_todo_tests {
                 != Risk::ReadOnly),
             "non-plan registry must expose write tools"
         );
-        let plan = build_server_registry_for_mcp(true).unwrap();
+        let plan = build_server_registry_for_mcp(None, true).unwrap();
         let specs = plan.specs();
         assert!(!specs.is_empty());
         for spec in &specs {
@@ -3468,6 +3473,25 @@ mod chat_todo_tests {
                 "{name} must not survive plan mode"
             );
         }
+    }
+
+    /// cora 0.19 scan MAJOR: the MCP HTTP face's server-level file tools
+    /// must be rooted at `--workspace`, not the process cwd.
+    #[cfg(all(feature = "mcp-http", feature = "shell-tools"))]
+    #[test]
+    fn mcp_server_registry_file_tools_are_rooted_at_workspace() {
+        let ws = std::env::temp_dir().join(format!("tole-mcp-ws-{}", std::process::id()));
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("only-in-ws.txt"), "rooted").unwrap();
+        let ws_arg = ws.to_str().unwrap().to_string();
+        let reg = build_server_registry_for_mcp(Some(&ws_arg), false).unwrap();
+        let out = reg
+            .get("read_file")
+            .unwrap()
+            .execute(serde_json::json!({ "path": "only-in-ws.txt" }))
+            .unwrap();
+        assert_eq!(out["content"], serde_json::json!("rooted"));
+        let _ = std::fs::remove_dir_all(&ws);
     }
 }
 
