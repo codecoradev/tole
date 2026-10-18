@@ -208,6 +208,23 @@ fn tokens_used(storage: &JsonlStorage) -> u64 {
         .sum()
 }
 
+/// The mission's provider: tool specs plus the system prompt pinned in
+/// the session header. Fresh and resumed missions both read it from
+/// storage, so `--resume` re-applies exactly the MISSION_COMPLETE rules
+/// the mission was created with (cora 0.19 scan MAJOR: the header was
+/// written but never sent, so the model never saw the marker contract).
+fn mission_provider(
+    cfg: tole_core::openai::OpenAiConfig,
+    specs: Vec<Value>,
+    storage: &JsonlStorage,
+) -> OpenAiProvider {
+    let provider = OpenAiProvider::new(cfg).with_tool_specs(specs);
+    match storage.system_prompt() {
+        Some(sys) => provider.with_system_prompt(sys),
+        None => provider,
+    }
+}
+
 /// Run one mission to completion/exhaustion. The CALLER builds the
 /// registry (the same dual-cfg `build_registry` path as `run`, so MCP /
 /// trust / workspace flags behave identically); mission approval is the
@@ -269,7 +286,7 @@ pub fn run_mission(
             .map_err(|e| anyhow::anyhow!("registering todo_write: {e}"))?;
     }
 
-    let mut provider = OpenAiProvider::new(provider_cfg).with_tool_specs(registry.specs());
+    let mut provider = mission_provider(provider_cfg, registry.specs(), &storage);
 
     let mut turns: u64 = 0;
     let mut verify_failures: u32 = 0;
@@ -590,6 +607,32 @@ mod verify_error_tests {
         assert!(e.contains("failed to spawn subprocess"), "{e}");
         assert!(!e.contains("timed out"), "{e}");
         assert!(e.contains("--verify-timeout is 300s"), "{e}");
+    }
+
+    /// cora 0.19 scan MAJOR: the mission system prompt pinned in the
+    /// session header must reach the wire — on a fresh run and, after
+    /// reopening the file, on `--resume`.
+    #[test]
+    fn mission_provider_sends_the_pinned_system_prompt_on_resume() {
+        use tole_core::openai::OpenAiConfig;
+        let d = std::env::temp_dir().join(format!("tole-mission-sys-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let sys = format!("base{}", mission_prompt("ship it", None));
+        let fresh = JsonlStorage::create_with(&d, "m1", None, Some(&sys)).unwrap();
+        let cfg = || OpenAiConfig::new("https://x/v1", "m", "k");
+        for storage in [fresh, JsonlStorage::open(d.join("m1.jsonl")).unwrap()] {
+            let body = mission_provider(cfg(), vec![], &storage).request_body(&[]);
+            let first = &body["messages"][0];
+            assert_eq!(first["role"], json!("system"), "{body}");
+            assert!(
+                first["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains(MISSION_COMPLETE_MARKER),
+                "{body}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
