@@ -40,9 +40,9 @@ continuity, infra facts.
   verdict in the PR comments ("✅ No issues found" or concrete findings —
   "Review could not complete" is a blocker), code-scanning alerts
   investigated (real → fix with regression test; FP → dismiss with
-  evidence), CI auto-fix max 3 attempts then escalate. Large change-sets
-  (~40+ files) time out Cora Review (10-min limit) — split into ~15–20-file
-  PRs.
+  evidence), CI auto-fix max 3 attempts then escalate. The Cora Review job
+  has a 30-min limit; large change-sets (~40+ files or ~850+ lines) can still
+  time out — split into ~15–20-file PRs.
 
 ## 3. Mandatory pre-commit checks
 
