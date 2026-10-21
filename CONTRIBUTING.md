@@ -32,9 +32,8 @@ workflow; the ecosystem-wide standards it follows live in the team knowledge roo
 
 ## Pull requests
 
-- One logical change per PR; large change-sets (~40+ files) deterministically
-  time out the Cora Review job (10-minute hard limit) — split into ~15–20-file
-  PRs.
+- One logical change per PR; large change-sets (~40+ files) can time out the
+  Cora Review job (30-minute limit) — split into ~15–20-file PRs.
 - Body sections, in order: **What / Why / Changes / Testing**. A PR without
   them fails the PR Description check.
 - Base every PR on `develop`. PRs into `main` are only accepted from
