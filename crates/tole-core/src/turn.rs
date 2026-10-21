@@ -492,8 +492,7 @@ fn drive(
             Err(ProviderError(msg)) => {
                 // Retry classification (#58 + live 429 evidence): gateway
                 // timeouts AND rate-limit rejections are both transient.
-                const TRANSIENT: [&str; 2] = ["timeout", "429"];
-                if TRANSIENT.iter().any(|k| msg.contains(k)) && timeout_retries_left > 0 {
+                if is_transient_provider_error(&msg) && timeout_retries_left > 0 {
                     timeout_retries_left -= 1;
                     // Durable, replay-visible decision record BEFORE the
                     // retry fires (same contract as append_turn_error).
@@ -951,4 +950,32 @@ fn settle_cancelled(s: &mut dyn Storage) -> Result<TurnOutcome, StorageError> {
     let seq = s.state().seq;
     s.commit(Commit::new().transition(StateTransition::from(seq, Pc::Final)))?;
     Ok(TurnOutcome::Cancelled)
+}
+
+/// Gateway timeouts and rate-limit rejections are transient (#58 + live
+/// 429 evidence). After a failover only the last provider's error counts:
+/// an earlier "timeout" must not make a fail-loud 401 look retryable.
+fn is_transient_provider_error(msg: &str) -> bool {
+    const TRANSIENT: [&str; 2] = ["timeout", "429"];
+    let lead = crate::failover::leading_error(msg);
+    TRANSIENT.iter().any(|k| lead.contains(k))
+}
+
+#[cfg(test)]
+mod transient_tests {
+    use super::is_transient_provider_error;
+
+    #[test]
+    fn only_the_last_failover_error_decides_a_retry() {
+        assert!(is_transient_provider_error("timeout: global"));
+        assert!(is_transient_provider_error(
+            "http status: 429 Too Many Requests — x"
+        ));
+        assert!(!is_transient_provider_error(
+            "http status: 401 Unauthorized — bad key [after failover from primary: timeout: global]"
+        ));
+        assert!(is_transient_provider_error(
+            "timeout: global [after failover from primary: http status: 502 Bad Gateway — a]"
+        ));
+    }
 }

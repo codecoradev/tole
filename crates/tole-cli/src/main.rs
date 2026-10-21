@@ -28,7 +28,6 @@ use tole_core::gh::GhTool;
 use tole_core::git::GitTool;
 #[cfg(feature = "shell-tools")]
 use tole_core::jobs::{JobPollTool, JobStartTool};
-use tole_core::openai::OpenAiProvider;
 use tole_core::read_file::ReadFileTool;
 #[cfg(feature = "shell-tools")]
 use tole_core::run_command::RunCommandTool;
@@ -1961,10 +1960,16 @@ fn run_command(
             .map_err(|e| anyhow::anyhow!("registering todo_write: {e}"))?;
     }
 
-    let mut provider = OpenAiProvider::new(cfg).with_tool_specs(registry.specs());
-    if let Some(sys) = system_prompt.as_deref() {
-        provider = provider.with_system_prompt(sys);
-    }
+    let specs = registry.specs();
+    let mut provider =
+        tole_cli::provider_chain::build(cfg, &tole_cli::config_apply::real_env, |p| {
+            let p = p.with_tool_specs(specs.clone());
+            match system_prompt.as_deref() {
+                Some(sys) => p.with_system_prompt(sys),
+                None => p,
+            }
+        })
+        .map_err(|e| anyhow::anyhow!(e))?;
     // Memory loop, pre-turn: recalled context rides inside the first
     // user message — the durable log stores exactly what was sent. The
     // summary remembers the PRE-injection prompt: storing the injected
@@ -2130,13 +2135,20 @@ fn resume_command(
             .collect();
         registry.set_hooks(hooks);
     }
-    let mut provider = OpenAiProvider::new(cfg).with_tool_specs(registry.specs());
     // B2: the system prompt is pinned in the session header — resume
     // re-applies exactly what the session was created with (never the
     // ambient env, which may have changed since).
-    if let Some(sys) = storage.system_prompt() {
-        provider = provider.with_system_prompt(sys);
-    }
+    let specs = registry.specs();
+    let pinned = storage.system_prompt().map(str::to_string);
+    let mut provider =
+        tole_cli::provider_chain::build(cfg, &tole_cli::config_apply::real_env, |p| {
+            let p = p.with_tool_specs(specs.clone());
+            match pinned.as_deref() {
+                Some(sys) => p.with_system_prompt(sys),
+                None => p,
+            }
+        })
+        .map_err(|e| anyhow::anyhow!(e))?;
     let outcome = match prompt {
         Some(text) if !text.trim().is_empty() => {
             // New instructions on a settled session (issue #55): the
@@ -2506,12 +2518,19 @@ fn chat_command(
         "tole chat — session {session_id} (Ctrl-D exits, resume: tole chat --resume {session_id})"
     );
 
-    let mut provider = OpenAiProvider::new(cfg).with_tool_specs(registry.specs());
     // B2: fresh sessions pin the resolved prompt; resumed sessions re-apply
     // the header-pinned one (see create_with above / JsonlStorage::open).
-    if let Some(sys) = storage.system_prompt() {
-        provider = provider.with_system_prompt(sys);
-    }
+    let specs = registry.specs();
+    let pinned = storage.system_prompt().map(str::to_string);
+    let mut provider =
+        tole_cli::provider_chain::build(cfg, &tole_cli::config_apply::real_env, |p| {
+            let p = p.with_tool_specs(specs.clone());
+            match pinned.as_deref() {
+                Some(sys) => p.with_system_prompt(sys),
+                None => p,
+            }
+        })
+        .map_err(|e| anyhow::anyhow!(e))?;
 
     // Memory loop state: recall rides into the first message of a FRESH
     // session only (a resumed session already carries its context); the

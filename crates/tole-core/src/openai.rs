@@ -512,10 +512,19 @@ impl OpenAiProvider {
         let mut tool_calls: std::collections::BTreeMap<u64, (String, String, String)> =
             std::collections::BTreeMap::new();
         let mut line = String::new();
+        // Did a sink already show part of this answer? A cut after that
+        // point must not fail over: a reserve would re-stream a full
+        // answer after the partial one (duplicated live output).
+        let mut emitted = false;
         loop {
             line.clear();
             let n = reader.read_line(&mut line).map_err(|e| {
-                ProviderError(scrub(&format!("stream read: {e}"), &self.cfg.api_key))
+                let head = if emitted {
+                    crate::failover::STREAM_CUT_AFTER_OUTPUT
+                } else {
+                    "stream read"
+                };
+                ProviderError(scrub(&format!("{head}: {e}"), &self.cfg.api_key))
             })?;
             if n == 0 {
                 break; // EOF without [DONE]: treat like end-of-stream.
@@ -547,6 +556,7 @@ impl OpenAiProvider {
                     reasoning.push_str(r);
                     if let Some(sink) = &self.on_reasoning_delta {
                         sink(r);
+                        emitted = true;
                     }
                 }
             }
@@ -555,6 +565,7 @@ impl OpenAiProvider {
                     text.push_str(t);
                     if let Some(sink) = &self.on_text_delta {
                         sink(t);
+                        emitted = true;
                     }
                 }
             }
@@ -1373,6 +1384,65 @@ mod streaming_tests {
         assert_eq!(p.last_usage().unwrap()["prompt_tokens"], json!(9));
         // The reasoning sink already delivered the thought: no replay.
         assert!(p.last_reasoning().is_none());
+    }
+
+    /// Reader that yields `data` then fails, like a dropped connection.
+    struct CutReader {
+        data: std::io::Cursor<Vec<u8>>,
+    }
+    impl std::io::Read for CutReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = std::io::Read::read(&mut self.data, buf)?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "connection reset by peer",
+                ));
+            }
+            Ok(n)
+        }
+    }
+
+    fn cut_stream(body: &str) -> std::io::BufReader<CutReader> {
+        std::io::BufReader::new(CutReader {
+            data: std::io::Cursor::new(body.as_bytes().to_vec()),
+        })
+    }
+
+    #[test]
+    fn a_stream_cut_after_live_output_is_not_a_failover_error() {
+        let seen = Arc::new(Mutex::new(String::new()));
+        let sink_seen = Arc::clone(&seen);
+        let sink: DeltaSink = Arc::new(move |t: &str| sink_seen.lock().unwrap().push_str(t));
+        let mut p = OpenAiProvider::new(OpenAiConfig::new("http://unused", "m", "sk-test"))
+            .with_delta_sinks(Some(sink), None);
+        let e = p
+            .complete_streaming(cut_stream(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\n",
+            ))
+            .unwrap_err()
+            .0;
+        assert_eq!(*seen.lock().unwrap(), "hel");
+        assert!(
+            e.starts_with(crate::failover::STREAM_CUT_AFTER_OUTPUT),
+            "{e}"
+        );
+        assert!(!crate::failover::is_failover_error(&e), "{e}");
+    }
+
+    #[test]
+    fn a_stream_cut_before_any_output_still_fails_over() {
+        let seen = Arc::new(Mutex::new(String::new()));
+        let sink_seen = Arc::clone(&seen);
+        let sink: DeltaSink = Arc::new(move |t: &str| sink_seen.lock().unwrap().push_str(t));
+        let mut p = OpenAiProvider::new(OpenAiConfig::new("http://unused", "m", "sk-test"))
+            .with_delta_sinks(Some(sink), None);
+        let e = p
+            .complete_streaming(cut_stream(": keep-alive\n\n"))
+            .unwrap_err()
+            .0;
+        assert!(e.starts_with("stream read: "), "{e}");
+        assert!(crate::failover::is_failover_error(&e), "{e}");
     }
 
     #[test]

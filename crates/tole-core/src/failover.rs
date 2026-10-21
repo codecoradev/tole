@@ -26,10 +26,32 @@ pub const DEFAULT_RETRY_PRIMARY_AFTER: Duration = Duration::from_secs(300);
 /// Longest error text kept per failed provider in the route record.
 const MAX_ERROR_CHARS: usize = 200;
 
+/// Separates the last provider's error from the earlier ones in a
+/// combined error: `"<last error> [after failover from <label>: ...]"`.
+pub const FAILOVER_MARKER: &str = " [after failover from ";
+
+/// Error prefix of a stream that broke after a live-token sink already
+/// showed part of the answer. Never fails over: the reserve would stream
+/// a whole new answer after the partial one.
+pub const STREAM_CUT_AFTER_OUTPUT: &str = "stream cut after output";
+
+/// The last provider's error of a combined failover error (the whole
+/// message when no failover happened). Retry classification must read
+/// only this part: the earlier errors may say "timeout" or "429" while
+/// the last one is a fail-loud 401.
+pub fn leading_error(message: &str) -> &str {
+    message
+        .split_once(FAILOVER_MARKER)
+        .map_or(message, |(head, _)| head)
+}
+
 /// Does this provider error mean "provider unavailable" (fail over) rather
 /// than "request wrong" (fail loud)?
 pub fn is_failover_error(message: &str) -> bool {
     let m = message.to_ascii_lowercase();
+    if m.starts_with(STREAM_CUT_AFTER_OUTPUT) {
+        return false;
+    }
     if let Some(rest) = m.strip_prefix("http status: ") {
         let code: u16 = rest
             .chars()
@@ -120,12 +142,19 @@ impl Provider for FailoverProvider {
         }
         self.last_answered = None;
         self.last_failed.clear();
-        let start = self.active;
-        for i in start..self.chain.len() {
+        // Active link first, then the rest in chain order, wrapping round:
+        // a sticky reserve that fails before the cooldown ends still lets
+        // an earlier (maybe recovered) provider answer the step.
+        let n = self.chain.len();
+        let order: Vec<usize> = (0..n).map(|k| (self.active + k) % n).collect();
+        for (pos, &i) in order.iter().enumerate() {
+            let has_next = pos + 1 < n;
             match self.chain[i].provider.complete(transcript) {
                 Ok(out) => {
                     if i != self.active {
-                        if self.active == 0 {
+                        if i == 0 {
+                            self.left_primary_at = None;
+                        } else if self.active == 0 {
                             self.left_primary_at = Some(Instant::now());
                         }
                         self.active = i;
@@ -133,7 +162,7 @@ impl Provider for FailoverProvider {
                     self.last_answered = Some(i);
                     return Ok(out);
                 }
-                Err(e) if i + 1 < self.chain.len() && is_failover_error(&e.0) => {
+                Err(e) if has_next && is_failover_error(&e.0) => {
                     self.last_failed
                         .push((self.chain[i].label.clone(), short(&e.0)));
                 }
@@ -141,15 +170,14 @@ impl Provider for FailoverProvider {
                     if self.last_failed.is_empty() {
                         return Err(e);
                     }
-                    // Keep the last error first: the turn loop's transient
-                    // retry classification reads the start of the message.
+                    // The last error leads; see `leading_error`.
                     let earlier: Vec<String> = self
                         .last_failed
                         .iter()
                         .map(|(l, m)| format!("{l}: {m}"))
                         .collect();
                     return Err(ProviderError(format!(
-                        "{} [after failover from {}]",
+                        "{}{FAILOVER_MARKER}{}]",
                         e.0,
                         earlier.join("; ")
                     )));
@@ -350,5 +378,60 @@ mod tests {
             f.complete(&[]).unwrap_err().0,
             "http status: 503 Service Unavailable — x"
         );
+    }
+
+    #[test]
+    fn a_fail_loud_reserve_error_does_not_look_transient() {
+        // Primary times out, reserve rejects the key: the combined error
+        // must classify by the reserve's error alone, not by the earlier
+        // "timeout" text appended after the failover marker.
+        let (p, _) = link("primary", vec![Err("timeout: global")]);
+        let (r, _) = link(
+            "reserve",
+            vec![Err("http status: 401 Unauthorized — bad key")],
+        );
+        let mut f = FailoverProvider::new(vec![p, r]);
+        let e = f.complete(&[]).unwrap_err().0;
+        assert!(e.contains(FAILOVER_MARKER), "{e}");
+        let lead = leading_error(&e);
+        assert_eq!(lead, "http status: 401 Unauthorized — bad key");
+        assert!(!lead.contains("timeout"));
+        assert_eq!(leading_error("plain error"), "plain error");
+    }
+
+    #[test]
+    fn a_stream_cut_after_output_never_fails_over() {
+        let msg = format!("{STREAM_CUT_AFTER_OUTPUT}: connection reset by peer");
+        assert!(!is_failover_error(&msg), "{msg}");
+        let leaked: &'static str = Box::leak(msg.into_boxed_str());
+        let (p, _) = link("primary", vec![Err(leaked)]);
+        let (r, rc) = link("reserve", vec![Ok("would duplicate")]);
+        let mut f = FailoverProvider::new(vec![p, r]);
+        assert!(f.complete(&[]).is_err());
+        assert_eq!(rc.get(), 0, "partial output already streamed: no re-stream");
+    }
+
+    #[test]
+    fn a_failing_sticky_reserve_wraps_back_to_the_primary() {
+        let (p, pc) = link(
+            "primary",
+            vec![
+                Err("http status: 503 Service Unavailable — blip"),
+                Ok("primary recovered"),
+            ],
+        );
+        let (r, rc) = link(
+            "reserve",
+            vec![Ok("reserve"), Err("io: Connection refused (os error 61)")],
+        );
+        let mut f = FailoverProvider::new(vec![p, r]);
+        assert_eq!(text(f.complete(&[]).unwrap()), "reserve");
+        // Cooldown (300 s) not elapsed, reserve is down: the primary is
+        // tried again instead of failing the step.
+        assert_eq!(text(f.complete(&[]).unwrap()), "primary recovered");
+        assert_eq!((pc.get(), rc.get()), (2, 2));
+        let route = f.last_route().unwrap();
+        assert_eq!(route["provider"], "primary");
+        assert_eq!(route["failover"]["from"], "reserve");
     }
 }

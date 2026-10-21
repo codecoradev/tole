@@ -213,13 +213,13 @@ fn tokens_used(storage: &JsonlStorage) -> u64 {
 /// storage, so `--resume` re-applies exactly the MISSION_COMPLETE rules
 /// the mission was created with (cora 0.19 scan MAJOR: the header was
 /// written but never sent, so the model never saw the marker contract).
-fn mission_provider(
-    cfg: tole_core::openai::OpenAiConfig,
+fn configure_mission_provider(
+    provider: OpenAiProvider,
     specs: Vec<Value>,
-    storage: &JsonlStorage,
+    system_prompt: Option<&str>,
 ) -> OpenAiProvider {
-    let provider = OpenAiProvider::new(cfg).with_tool_specs(specs);
-    match storage.system_prompt() {
+    let provider = provider.with_tool_specs(specs);
+    match system_prompt {
         Some(sys) => provider.with_system_prompt(sys),
         None => provider,
     }
@@ -286,7 +286,13 @@ pub fn run_mission(
             .map_err(|e| anyhow::anyhow!("registering todo_write: {e}"))?;
     }
 
-    let mut provider = mission_provider(provider_cfg, registry.specs(), &storage);
+    let specs = registry.specs();
+    let system_prompt = storage.system_prompt().map(str::to_owned);
+    let mut provider =
+        tole_cli::provider_chain::build(provider_cfg, &tole_cli::config_apply::real_env, |p| {
+            configure_mission_provider(p, specs.clone(), system_prompt.as_deref())
+        })
+        .map_err(|e| anyhow::anyhow!(e))?;
 
     let mut turns: u64 = 0;
     let mut verify_failures: u32 = 0;
@@ -621,7 +627,12 @@ mod verify_error_tests {
         let fresh = JsonlStorage::create_with(&d, "m1", None, Some(&sys)).unwrap();
         let cfg = || OpenAiConfig::new("https://x/v1", "m", "k");
         for storage in [fresh, JsonlStorage::open(d.join("m1.jsonl")).unwrap()] {
-            let body = mission_provider(cfg(), vec![], &storage).request_body(&[]);
+            let body = configure_mission_provider(
+                OpenAiProvider::new(cfg()),
+                vec![],
+                storage.system_prompt(),
+            )
+            .request_body(&[]);
             let first = &body["messages"][0];
             assert_eq!(first["role"], json!("system"), "{body}");
             assert!(

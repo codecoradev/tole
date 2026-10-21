@@ -87,3 +87,24 @@ pub trait Provider {
         None
     }
 }
+
+/// A boxed provider is a provider (hosts pick the concrete type at runtime,
+/// e.g. a plain provider or a `failover::FailoverProvider`). Every method is
+/// forwarded, including the defaulted ones.
+impl<P: Provider + ?Sized> Provider for Box<P> {
+    fn complete(&mut self, transcript: &[Entry]) -> Result<ProviderOutput, ProviderError> {
+        (**self).complete(transcript)
+    }
+    fn last_usage(&self) -> Option<Value> {
+        (**self).last_usage()
+    }
+    fn last_reasoning(&self) -> Option<String> {
+        (**self).last_reasoning()
+    }
+    fn last_wire_stats(&self) -> Option<Value> {
+        (**self).last_wire_stats()
+    }
+    fn last_route(&self) -> Option<Value> {
+        (**self).last_route()
+    }
+}
