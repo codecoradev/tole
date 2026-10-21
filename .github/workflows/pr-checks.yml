@@ -132,12 +132,23 @@ jobs:
           # Every commit on the branch: the squash commit can pick up
           # trailers from them even when it uses the PR description.
           MESSAGES=$(gh api "repos/$REPO/pulls/$PR_NUMBER/commits" --paginate --jq '.[].commit.message')
+          # grep: 0 = match, 1 = no match, >1 = error (an invalid pattern),
+          # which must fail loudly, never read as "no match".
+          matches() {
+            rc=0
+            printf '%s\n' "$1" | grep -qiE "$PATTERN" || rc=$?
+            if [ "$rc" -gt 1 ]; then
+              echo "::error::message-standard: MESSAGE_STANDARD_PATTERN is not a valid pattern"
+              exit 1
+            fi
+            return "$rc"
+          }
           FAILED=0
-          if printf '%s\n' "$MESSAGES" | grep -qiE "$PATTERN"; then
+          if matches "$MESSAGES"; then
             echo "::error::message-standard: a commit message carries a trailer that is not allowed (see the team message standard). Reword those commits before merging."
             FAILED=1
           fi
-          if printf '%s\n' "$PR_BODY" | grep -qiE "$PATTERN"; then
+          if matches "$PR_BODY"; then
             echo "::error::message-standard: the PR description carries a line that is not allowed (see the team message standard)."
             FAILED=1
           fi
