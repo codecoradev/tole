@@ -103,3 +103,56 @@ jobs:
             echo "Current: $PR_TITLE"
             exit 1
           fi
+
+  message-standard:
+    name: Message Standard
+    runs-on: ubuntu-latest
+    # Bot PRs are exempt, as above.
+    if: "!contains(fromJSON('[\"dependabot[bot]\", \"renovate[bot]\", \"github-actions[bot]\", \"app/dependabot\", \"app/renovate\"]'), github.event.pull_request.user.login)"
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Check commit messages and the PR description
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # The disallowed-line pattern lives in a repository variable
+          # (team message standard), not in this file.
+          PATTERN: ${{ vars.MESSAGE_STANDARD_PATTERN }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          # Fail loud when the standard is not configured: a skipped check
+          # must never look like a passing one.
+          if [ -z "$PATTERN" ]; then
+            echo "::error::message-standard: MESSAGE_STANDARD_PATTERN is not configured"
+            exit 1
+          fi
+          # Every commit on the branch: the squash commit can pick up
+          # trailers from them even when it uses the PR description.
+          MESSAGES=$(gh api "repos/$REPO/pulls/$PR_NUMBER/commits" --paginate --jq '.[].commit.message')
+          # grep: 0 = match, 1 = no match, >1 = error (an invalid pattern),
+          # which must fail loudly, never read as "no match".
+          matches() {
+            rc=0
+            printf '%s\n' "$1" | grep -qiE "$PATTERN" || rc=$?
+            if [ "$rc" -gt 1 ]; then
+              echo "::error::message-standard: MESSAGE_STANDARD_PATTERN is not a valid pattern"
+              exit 1
+            fi
+            return "$rc"
+          }
+          FAILED=0
+          if matches "$MESSAGES"; then
+            echo "::error::message-standard: a commit message carries a trailer that is not allowed (see the team message standard). Reword those commits before merging."
+            FAILED=1
+          fi
+          if matches "$PR_BODY"; then
+            echo "::error::message-standard: the PR description carries a line that is not allowed (see the team message standard)."
+            FAILED=1
+          fi
+          if [ "$FAILED" -eq 0 ]; then
+            echo "✅ Commit messages and PR description follow the message standard"
+          fi
+          exit "$FAILED"
