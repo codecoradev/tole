@@ -99,14 +99,6 @@ All repository artifacts are written in **English**: commit messages, PR
 titles/bodies, issues, code comments, and documentation files. Keep chat
 discussions in whatever language you prefer — files must be English.
 
-## CLA
-
-Contributions require a signed Contributor License Agreement —
-[CLA_INDIVIDUAL.md](CLA_INDIVIDUAL.md) or
-[CLA_CORPORATE.md](CLA_CORPORATE.md). The `cla-check` workflow enforces this
-per PR (bots are skipped). The CLA is a license agreement, not a copyright
-assignment: you retain ownership of your contributions.
-
 ## Live-mission binary hygiene
 
 Running live agent missions against a stale binary produces misleading
@@ -153,5 +145,4 @@ result is recorded in the coverage ledger (`tole doctor --summary`).
 
 ## License
 
-MIT. By contributing, you agree your contributions are licensed under the
-MIT license, and you sign the CLA above (enforced per PR by `cla-check`).
+Contributions are licensed to the project under the MIT license (inbound = outbound). No additional agreement is required.
