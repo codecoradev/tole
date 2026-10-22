@@ -363,10 +363,6 @@ injecting fewer items, and the turn proceeds without memory.
   cora review gate, live-mission binary hygiene
 - [AGENTS.md](AGENTS.md) — the same rules for AI coding agents
 - [CHANGELOG.md](CHANGELOG.md) · [Security policy](SECURITY.md)
-- Contributing requires the CLA:
-  [CLA_INDIVIDUAL.md](CLA_INDIVIDUAL.md) /
-  [CLA_CORPORATE.md](CLA_CORPORATE.md) (enforced per PR by `cla-check`;
-  PR and issue templates live in [.github/](.github/)).
 
 ## Development
 
