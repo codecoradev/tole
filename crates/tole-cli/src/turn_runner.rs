@@ -118,6 +118,21 @@ pub fn remember(
     }
 }
 
+/// The cancellation token for a CLI-face session plus, in a child agent,
+/// the sibling watcher that folds the shared touch log and queues change
+/// notices on that token for the turn loop's next safe point (#380). A
+/// no-op watcher (`None`) outside a child. Keep the watcher alive while
+/// turns run: dropping it stops the thread.
+pub fn cli_turn_token() -> (
+    tole_core::cancel::CancelToken,
+    Option<crate::sibling::Watcher>,
+) {
+    let cancel = tole_core::cancel::CancelToken::default();
+    let watcher = crate::sibling::tracking_from_env(&crate::config_apply::real_env)
+        .map(|t| crate::sibling::start_watcher(&t, &cancel, crate::sibling::POLL_INTERVAL));
+    (cancel, watcher)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

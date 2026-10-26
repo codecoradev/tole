@@ -24,7 +24,9 @@ mod serve;
 mod upgrade;
 use tole_core::storage::{JsonlStorage, Storage};
 use tole_core::tool::ToolRegistry;
-use tole_core::turn::{resume_turn, run_turn, run_turn_with_cancel, TurnOutcome, LOOP_TRIP_AFTER};
+use tole_core::turn::{
+    resume_turn_with_cancel, run_turn_with_cancel, TurnOutcome, LOOP_TRIP_AFTER,
+};
 
 /// Session id → path (`<dir>/<id>.jsonl`).
 fn session_path(dir: &Path, id: &str) -> PathBuf {
@@ -1596,12 +1598,9 @@ fn run_command(
     // Wall-clock cap (issue #216): a timer thread cancels the turn's
     // token at the deadline; the loop's checkpoints unwind it into a
     // durable Cancelled — resumable, never dead.
-    let cancel = tole_core::cancel::CancelToken::default();
-    // Child agents (#380): fold the shared touch log and queue a notice at
-    // the next safe point when a sibling changes a file this child read or
-    // wrote. A no-op outside a child.
-    let _sibling_watcher = tole_cli::sibling::tracking_from_env(&tole_cli::config_apply::real_env)
-        .map(|t| tole_cli::sibling::start_watcher(&t, &cancel, tole_cli::sibling::POLL_INTERVAL));
+    // Child agents (#380): the watcher queues sibling change notices on
+    // the same token. A no-op outside a child.
+    let (cancel, _sibling_watcher) = tole_cli::turn_runner::cli_turn_token();
     let timer = timeout_secs.map(|secs| {
         let token = cancel.clone();
         std::thread::spawn(move || {
@@ -1721,13 +1720,16 @@ fn resume_command(
         None,
     )
     .map_err(anyhow::Error::msg)?;
+    // The session token: sibling notices (#380) reach a resumed child too.
+    let (cancel, _sibling_watcher) = tole_cli::turn_runner::cli_turn_token();
     let outcome = match prompt {
         Some(text) if !text.trim().is_empty() => {
             // New instructions on a settled session (issue #55): the
             // machine accepts a user message at a turn boundary, so
             // reuse run_turn on the resumed storage instead of the
             // approvals-only resume protocol.
-            let outcome = run_turn(&mut storage, &mut provider, &registry, text)?;
+            let outcome =
+                run_turn_with_cancel(&mut storage, &mut provider, &registry, text, &cancel)?;
             // Memory loop (CodeCora scan 2026-09-18): a settled resumed
             // turn leaves a summary like `run` does — the continuation is
             // its own durable event. No recall injection here: the resumed
@@ -1742,7 +1744,7 @@ fn resume_command(
             }
             outcome
         }
-        _ => resume_turn(&mut storage, &mut provider, &registry)?,
+        _ => resume_turn_with_cancel(&mut storage, &mut provider, &registry, &cancel)?,
     };
     report_outcome(&id, outcome);
     Ok(())
@@ -2040,6 +2042,9 @@ fn chat_command(
         None,
     )
     .map_err(anyhow::Error::msg)?;
+    // One token for the whole chat session: sibling notices (#380) reach
+    // a child running `tole chat` at each turn's next safe point.
+    let (cancel, _sibling_watcher) = tole_cli::turn_runner::cli_turn_token();
 
     // Memory loop state: recall rides into the first message of a FRESH
     // session only (a resumed session already carries its context); the
@@ -2111,11 +2116,17 @@ fn chat_command(
         let outcome = loop {
             match storage.state().pc {
                 tole_core::state::Pc::Idle | tole_core::state::Pc::Final => {
-                    break run_turn(&mut storage, &mut provider, &registry, &turn_prompt);
+                    break run_turn_with_cancel(
+                        &mut storage,
+                        &mut provider,
+                        &registry,
+                        &turn_prompt,
+                        &cancel,
+                    );
                 }
                 _ => {
                     eprintln!("tole> (resolving the interrupted turn…)");
-                    match resume_turn(&mut storage, &mut provider, &registry) {
+                    match resume_turn_with_cancel(&mut storage, &mut provider, &registry, &cancel) {
                         // Landed on a boundary — dispatch the message now.
                         Ok(TurnOutcome::Final { .. }) => continue,
                         // Still stuck (re-denied, provider still down):
