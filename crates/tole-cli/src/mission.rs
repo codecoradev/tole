@@ -24,7 +24,6 @@
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
-use tole_core::openai::OpenAiProvider;
 use tole_core::storage::{JsonlStorage, Storage};
 use tole_core::subprocess::run_with_timeout;
 use tole_core::tool::ToolRegistry;
@@ -193,23 +192,6 @@ fn tokens_used(storage: &JsonlStorage) -> u64 {
     tole_core::transcript::tokens_in_out(storage.usages())
 }
 
-/// The mission's provider: tool specs plus the system prompt pinned in
-/// the session header. Fresh and resumed missions both read it from
-/// storage, so `--resume` re-applies exactly the MISSION_COMPLETE rules
-/// the mission was created with (cora 0.19 scan MAJOR: the header was
-/// written but never sent, so the model never saw the marker contract).
-fn configure_mission_provider(
-    provider: OpenAiProvider,
-    specs: Vec<Value>,
-    system_prompt: Option<&str>,
-) -> OpenAiProvider {
-    let provider = provider.with_tool_specs(specs);
-    match system_prompt {
-        Some(sys) => provider.with_system_prompt(sys),
-        None => provider,
-    }
-}
-
 /// Run one mission to completion/exhaustion. The CALLER builds the
 /// registry (the same dual-cfg `build_registry` path as `run`, so MCP /
 /// trust / workspace flags behave identically); mission approval is the
@@ -223,10 +205,7 @@ pub fn run_mission(
     let deadline = started + max_minutes_duration(cfg.max_minutes);
     // Resolve provider config BEFORE the session file exists — a config
     // failure must not leave an empty, unsummarized session (cora CI).
-    let provider_cfg = tole_cli::config_apply::provider_config().context(
-        "missing provider config: set TOLE_BASE_URL / TOLE_MODEL / TOLE_API_KEY \
-         (or the OPENAI_* equivalents)",
-    )?;
+    let provider_cfg = tole_cli::turn_runner::provider_config().map_err(anyhow::Error::msg)?;
 
     // Session: fresh (goal pinned via first prompt) or resumed.
     let (mut storage, session_id, first_prompt) = match &cfg.resume_id {
@@ -259,13 +238,15 @@ pub fn run_mission(
     // Missions refuse --plan-mode, so todo_write is always present.
     tole_cli::tool_roster::register_todo(&mut registry, storage.entries(), false)?;
 
-    let specs = registry.specs();
     let system_prompt = storage.system_prompt().map(str::to_owned);
-    let mut provider =
-        tole_cli::provider_chain::build(provider_cfg, &tole_cli::config_apply::real_env, |p| {
-            configure_mission_provider(p, specs.clone(), system_prompt.as_deref())
-        })
-        .map_err(|e| anyhow::anyhow!(e))?;
+    let mut provider = tole_cli::turn_runner::session_provider(
+        provider_cfg,
+        &storage,
+        registry.specs(),
+        system_prompt.as_deref(),
+        None,
+    )
+    .map_err(anyhow::Error::msg)?;
 
     let mut turns: u64 = 0;
     let mut verify_failures: u32 = 0;
@@ -593,17 +574,18 @@ mod verify_error_tests {
     /// reopening the file, on `--resume`.
     #[test]
     fn mission_provider_sends_the_pinned_system_prompt_on_resume() {
-        use tole_core::openai::OpenAiConfig;
+        use tole_core::openai::{OpenAiConfig, OpenAiProvider};
         let d = std::env::temp_dir().join(format!("tole-mission-sys-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         let sys = format!("base{}", mission_prompt("ship it", None));
         let fresh = JsonlStorage::create_with(&d, "m1", None, Some(&sys)).unwrap();
         let cfg = || OpenAiConfig::new("https://x/v1", "m", "k");
         for storage in [fresh, JsonlStorage::open(d.join("m1.jsonl")).unwrap()] {
-            let body = configure_mission_provider(
+            let body = tole_cli::turn_runner::configure_provider(
                 OpenAiProvider::new(cfg()),
                 vec![],
                 storage.system_prompt(),
+                None,
             )
             .request_body(&[]);
             let first = &body["messages"][0];

@@ -1537,10 +1537,7 @@ fn run_command(
     name: Option<&str>,
     timeout_secs: Option<u64>,
 ) -> Result<()> {
-    let cfg = tole_cli::config_apply::provider_config().context(
-        "missing provider config: set TOLE_BASE_URL / TOLE_MODEL / TOLE_API_KEY \
-         (or the OPENAI_* equivalents)",
-    )?;
+    let cfg = tole_cli::turn_runner::provider_config().map_err(anyhow::Error::msg)?;
     // Build everything that can fail BEFORE the session file exists, so a
     // failed startup does not leave a stray empty session polluting
     // `sessions` / `--last` (CodeCora scan 2026-09-18).
@@ -1596,16 +1593,14 @@ fn run_command(
     // Task-list tools (issue #198): a fresh session starts with an empty list.
     tool_roster::register_todo(&mut registry, storage.entries(), host.plan_mode)?;
 
-    let specs = registry.specs();
-    let mut provider =
-        tole_cli::provider_chain::build(cfg, &tole_cli::config_apply::real_env, |p| {
-            let p = p.with_tool_specs(specs.clone());
-            match system_prompt.as_deref() {
-                Some(sys) => p.with_system_prompt(sys),
-                None => p,
-            }
-        })
-        .map_err(|e| anyhow::anyhow!(e))?;
+    let mut provider = tole_cli::turn_runner::session_provider(
+        cfg,
+        &storage,
+        registry.specs(),
+        system_prompt.as_deref(),
+        None,
+    )
+    .map_err(anyhow::Error::msg)?;
     // Memory loop, pre-turn: recalled context rides inside the first
     // user message — the durable log stores exactly what was sent. The
     // summary remembers the PRE-injection prompt: storing the injected
@@ -1698,10 +1693,7 @@ fn resume_command(
     if !path.exists() {
         anyhow::bail!("session {id} not found at {}", path.display());
     }
-    let cfg = tole_cli::config_apply::provider_config().context(
-        "missing provider config: set TOLE_BASE_URL / TOLE_MODEL / TOLE_API_KEY \
-         (or the OPENAI_* equivalents)",
-    )?;
+    let cfg = tole_cli::turn_runner::provider_config().map_err(anyhow::Error::msg)?;
     let mut storage = JsonlStorage::open(&path).context("replaying session log")?;
 
     let mut registry = build_registry(build_approver(allow_patterns, yes), host, allow_patterns)?;
@@ -1736,17 +1728,15 @@ fn resume_command(
     // B2: the system prompt is pinned in the session header — resume
     // re-applies exactly what the session was created with (never the
     // ambient env, which may have changed since).
-    let specs = registry.specs();
     let pinned = storage.system_prompt().map(str::to_string);
-    let mut provider =
-        tole_cli::provider_chain::build(cfg, &tole_cli::config_apply::real_env, |p| {
-            let p = p.with_tool_specs(specs.clone());
-            match pinned.as_deref() {
-                Some(sys) => p.with_system_prompt(sys),
-                None => p,
-            }
-        })
-        .map_err(|e| anyhow::anyhow!(e))?;
+    let mut provider = tole_cli::turn_runner::session_provider(
+        cfg,
+        &storage,
+        registry.specs(),
+        pinned.as_deref(),
+        None,
+    )
+    .map_err(anyhow::Error::msg)?;
     let outcome = match prompt {
         Some(text) if !text.trim().is_empty() => {
             // New instructions on a settled session (issue #55): the
@@ -1976,10 +1966,7 @@ fn chat_command(
 ) -> Result<()> {
     use std::io::{BufRead, Write};
 
-    let cfg = tole_cli::config_apply::provider_config().context(
-        "missing provider config: set TOLE_BASE_URL / TOLE_MODEL / TOLE_API_KEY \
-         (or the OPENAI_* equivalents)",
-    )?;
+    let cfg = tole_cli::turn_runner::provider_config().map_err(anyhow::Error::msg)?;
 
     // Resolve the session: explicit id, --last, or fresh.
     let (session_id, fresh) = if let Some(id) = resume {
@@ -2060,17 +2047,15 @@ fn chat_command(
 
     // B2: fresh sessions pin the resolved prompt; resumed sessions re-apply
     // the header-pinned one (see create_with above / JsonlStorage::open).
-    let specs = registry.specs();
     let pinned = storage.system_prompt().map(str::to_string);
-    let mut provider =
-        tole_cli::provider_chain::build(cfg, &tole_cli::config_apply::real_env, |p| {
-            let p = p.with_tool_specs(specs.clone());
-            match pinned.as_deref() {
-                Some(sys) => p.with_system_prompt(sys),
-                None => p,
-            }
-        })
-        .map_err(|e| anyhow::anyhow!(e))?;
+    let mut provider = tole_cli::turn_runner::session_provider(
+        cfg,
+        &storage,
+        registry.specs(),
+        pinned.as_deref(),
+        None,
+    )
+    .map_err(anyhow::Error::msg)?;
 
     // Memory loop state: recall rides into the first message of a FRESH
     // session only (a resumed session already carries its context); the
