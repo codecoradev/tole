@@ -55,7 +55,10 @@ fn doctor_reports_old_and_missing_siblings_without_blocking() {
         stdout.contains("✗ cora 0.18.0 is older than the supported 0.19.0"),
         "{stdout}"
     );
-    assert!(stdout.contains("cargo install cora-code --locked"), "{stdout}");
+    assert!(
+        stdout.contains("cargo install cora-code --locked"),
+        "{stdout}"
+    );
     assert!(stdout.contains("- uteke not installed"), "{stdout}");
     let _ = std::fs::remove_dir_all(&bin);
     let _ = std::fs::remove_dir_all(&home);
