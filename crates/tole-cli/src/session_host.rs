@@ -9,7 +9,6 @@
 //! absent). Everything else — the jail, the registry, the memory loop —
 //! is identical.
 
-use crate::tools::WriteFileTool;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc as StdArc, Mutex};
@@ -287,99 +286,19 @@ pub fn open_session(
         .filter(|s| !s.trim().is_empty())
         .or_else(crate::config_apply::config_system_prompt);
 
-    let interactive = approver.interactive();
-    let mut reg = tole_core::tool::ToolRegistry::with_approver(approver);
-    use tole_core::cora_search::CoraSearchTool;
-    use tole_core::file_tools::{DeleteFileTool, EditFileTool};
-    use tole_core::gh::GhTool;
-    use tole_core::git::GitTool;
-    use tole_core::jobs::{JobPollTool, JobStartTool};
-    use tole_core::read_file::ReadFileTool;
-    use tole_core::run_command::RunCommandTool;
-    use tole_core::uteke::{UtekeDocumentTool, UtekeRecallTool};
-    if tole_cli_binary_available("cora") {
-        reg.register(Box::new(CoraSearchTool::new()))?;
-    }
-    if tole_cli_binary_available("uteke") {
-        reg.register(Box::new(UtekeRecallTool::new()))?;
-        if !plan_mode {
-            reg.register(Box::new(UtekeDocumentTool::new(None)))?;
-        }
-    }
-    // Write-tier tools: skipped entirely under --plan-mode (read-only
-    // sessions — the model cannot even attempt a write). The earlier
-    // draft registered everything and "filtered" afterwards, which
-    // CodeCora rightly called out: the full registry under --yes broke
-    // the read-only contract.
-    let agent_depth: u32 = std::env::var("TOLE_AGENT_DEPTH")
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(0);
-    if !plan_mode {
-        let run_cmd = if agent_depth >= 1 {
-            RunCommandTool::new(workspace_canon.clone()).in_child_agent_mode()
-        } else {
-            RunCommandTool::new(workspace_canon.clone())
-        };
-        reg.register(Box::new(run_cmd))?;
-        let job_start = if agent_depth >= 1 {
-            JobStartTool::new(workspace_canon.clone()).in_child_agent_mode()
-        } else {
-            JobStartTool::new(workspace_canon.clone())
-        };
-        reg.register(Box::new(job_start))?;
-        reg.register(Box::new(WriteFileTool::new(workspace_canon.clone())))?;
-        reg.register(Box::new(EditFileTool::new(workspace_canon.clone())))?;
-        {
-            // Issue #254 (rescan #24): probe-gated like the gitea tool —
-            // when GitHub detection fails, NO gh tool (a hardcoded
-            // fallback repo invited wrong-repo writes from any
-            // unrelated workspace). Absent legs degrade, never a
-            // phantom.
-            if let Some(repo) = detect_github_repo(&workspace_canon) {
-                reg.register(Box::new(GhTool::new(repo)))?;
-            }
-            register_gitea(&mut reg, &workspace_canon);
-        }
-        reg.register(Box::new(GitTool::new().in_dir(workspace_canon.clone())))?;
-        // delete_file (Destructive) registers ONLY behind an interactive
-        // approver — in serve mode (allowlist) it is skipped: Destructive
-        // is never allowlistable, and a server has no human to ask.
-        if interactive {
-            reg.register(Box::new(DeleteFileTool::new(workspace_canon.clone())))?;
-        }
-    }
-    reg.register(Box::new(JobPollTool::new(workspace_canon.clone())))?;
-    reg.register(Box::new(ReadFileTool::new(workspace_canon.clone())))?;
-    // Web tools (issue #215): fetch always (direct HTTPS); search only
-    // when a backend is configured (TOLE_WEB_SEARCH_URL) — probe-first:
-    // no backend, no tool, never a phantom.
-    reg.register(Box::new(tole_core::web::WebFetchTool))?;
-    if let Some(search) = tole_core::web::WebSearchTool::from_env() {
-        reg.register(Box::new(search))?;
-    }
-    // Plan publishing (issue #196 phase 4): model-facing tool, present
-    // only when the transport has a client that renders plans (ACP).
-    if let Some(emitter) = plan_emitter {
-        reg.register(Box::new(UpdatePlanTool::new(emitter)))?;
-    }
-    // systemone_decide (#172): probe-gated on SYSTEMONE_API_KEY.
-    if let Some(t) = tole_core::systemone::SystemOneTool::from_env() {
-        reg.register(Box::new(t))?;
-    }
-    // Child agents (#171): parent sessions only — a child (depth >= 1)
-    // gets no agent tools at all (the structural depth cap).
-    if agent_depth == 0 && !plan_mode {
-        if let Ok(bin) = std::env::current_exe() {
-            let _ = reg.register(Box::new(
-                tole_core::agents::AgentStartTool::new(bin, workspace_canon.clone())
-                    .with_parent_allows(parent_allows.clone()),
-            ));
-            let _ = reg.register(Box::new(tole_core::agents::AgentPollTool::new(
-                workspace_canon.clone(),
-            )));
-        }
-    }
+    // The shared tool roster (#420): server faces jail files AND shell
+    // tools to the session workspace, may start child agents (not in
+    // plan mode, never from a child), and publish plans when the
+    // transport renders them. delete_file follows the approver: only an
+    // interactive one (ACP) gets it.
+    let mut roster = crate::tool_roster::Roster::new(workspace_canon);
+    roster.plan_mode = plan_mode;
+    roster.agents = Some(crate::tool_roster::AgentTools {
+        worktrees: false,
+        parent_allows,
+    });
+    roster.plan_emitter = plan_emitter;
+    let mut reg = crate::tool_roster::build(approver, roster).map_err(|e| e.to_string())?;
     // Turn-end stop gates (#145): the same registry-level wiring the
     // run/chat hosts use, applied to server-face sessions.
     if !turnend.is_empty() {
@@ -442,20 +361,6 @@ pub fn sessions_dir_for(cwd: &str) -> Result<PathBuf, String> {
     let dir = PathBuf::from(cwd).join(".tole/sessions");
     std::fs::create_dir_all(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
     Ok(dir)
-}
-
-pub fn tole_cli_binary_available(name: &str) -> bool {
-    if name.contains('/') {
-        return std::path::Path::new(name).is_file();
-    }
-    if let Ok(path) = std::env::var("PATH") {
-        for dir in std::env::split_paths(&path) {
-            if dir.join(name).is_file() {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 pub fn detect_github_repo(cwd: &std::path::Path) -> Option<String> {
@@ -945,5 +850,57 @@ mod stop_reason_tests {
         ] {
             assert_eq!(s(o), "refusal");
         }
+    }
+}
+
+#[cfg(test)]
+mod roster_tests {
+    use super::*;
+    use tole_core::approval::AllowlistApprover;
+    use tole_core::tool::Risk;
+
+    fn open(tag: &str, plan_mode: bool) -> SessionState {
+        let ws = std::env::temp_dir().join(format!("tole-sh-roster-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(&ws).unwrap();
+        open_session(
+            "s-roster",
+            ws.to_str().unwrap(),
+            false,
+            plan_mode,
+            AllowlistApprover::allow_only(vec![]),
+            None,
+            Some(&ws.join("sessions")),
+            Vec::new(),
+            Vec::new(),
+            tole_core::cancel::CancelToken::default(),
+            None,
+        )
+        .unwrap()
+    }
+
+    /// #420: server sessions build their tools through the shared roster —
+    /// the same rules as the CLI (verify_package present; delete_file absent
+    /// behind a non-interactive approver; plan mode leaves ReadOnly only).
+    #[test]
+    fn server_sessions_use_the_shared_roster() {
+        let s = open("full", false);
+        assert!(s.registry.get("verify_package").is_some());
+        assert!(s.registry.get("write_file").is_some());
+        assert!(s.registry.get("todo_write").is_some());
+        assert!(s.registry.get("delete_file").is_none());
+
+        let p = open("plan", true);
+        assert!(p.registry.get("read_file").is_some());
+        assert!(p.registry.get("todo_read").is_some());
+        for name in ["write_file", "run_command", "agent_start", "todo_write"] {
+            assert!(p.registry.get(name).is_none(), "{name} in plan mode");
+        }
+        assert!(p
+            .registry
+            .specs()
+            .iter()
+            .filter_map(|s| s["function"]["name"].as_str().or(s["name"].as_str()))
+            .all(|n| p.registry.get(n).map(|t| t.risk()) == Some(Risk::ReadOnly)));
     }
 }
