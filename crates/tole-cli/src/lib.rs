@@ -9,6 +9,7 @@ pub mod config;
 pub mod config_apply;
 pub mod config_trust;
 pub mod doctor;
+pub mod ecosystem;
 pub mod handoff;
 pub mod provider_chain;
 pub mod session_host;

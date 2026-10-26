@@ -10,31 +10,39 @@
 //!   store and injected into the user message inside a clearly marked,
 //!   fenced block. The durable log stores exactly what the provider saw.
 //! - **Post-session remember**: when a session settles with at least one
-//!   completed turn, a compact summary lands in the namespace — the
+//!   completed turn, a compact summary lands in the room — the
 //!   next session's recall can find it. Cross-session continuity is the
 //!   whole point: the memory loop, not the model, makes tole durable.
 //!
 //! Failures degrade loudly-on-stderr and never break a turn: memory is
 //! an enhancement, not a dependency. All subprocess discipline mirrors
 //! `uteke.rs` (scrubbed env, hard timeout, argv-only — no shell).
+//!
+//! Storage layout (#422): memory lives in a uteke ROOM (`repo-<dir>`, or
+//! `agent-<id>` for a child's mailbox), the replacement for namespaces,
+//! which uteke 0.21 deprecates. Memory written by earlier tole versions
+//! sits in the namespace of the same name; recall falls back to it while
+//! the room is empty and uteke still has namespaces.
 
 use crate::subprocess::{run_with_timeout, SUBPROCESS_TIMEOUT};
 use serde_json::Value;
 use std::process::Command;
 
 /// Memory-loop configuration. `bin` is a single path element on PATH or
-/// an absolute path; `namespace` follows the ecosystem `repo-<name>`
-/// convention.
+/// an absolute path; `room` follows the ecosystem `repo-<name>`
+/// convention (sanitized with [`sanitize_namespace`]).
 #[derive(Debug, Clone)]
 pub struct MemoryConfig {
     pub bin: String,
-    pub namespace: String,
+    /// The uteke room memory is stored in and recalled from; also the
+    /// name of the legacy namespace recall falls back to.
+    pub room: String,
     /// Max recall hits injected per fresh session.
     pub limit: u32,
 }
 
 impl MemoryConfig {
-    /// Config for `bin` with the ecosystem namespace convention:
+    /// Config for `bin` with the ecosystem room convention:
     /// `repo-<directory name>` (e.g. a checkout at `…/riset-ai/tole`
     /// recalls from `repo-tole`). Names without a basename fall back to
     /// `repo-default`.
@@ -45,16 +53,16 @@ impl MemoryConfig {
             .unwrap_or_else(|| "default".to_string());
         Self {
             bin: bin.into(),
-            namespace: format!("repo-{}", sanitize_namespace(&dir)),
+            room: format!("repo-{}", sanitize_namespace(&dir)),
             limit: 3,
         }
     }
 }
 
-/// Namespace charset for argv safety: `[a-zA-Z0-9._-]`, never starting
-/// with a hyphen (a leading `-` would parse as a CLI flag). Offending
-/// characters collapse to `_`. Public so hosts that override the
-/// namespace (e.g. via env) apply the same rule.
+/// Room / namespace charset for argv safety: `[a-zA-Z0-9._-]`, never
+/// starting with a hyphen (a leading `-` would parse as a CLI flag).
+/// Offending characters collapse to `_`. Public so hosts that override
+/// the room (e.g. via env) apply the same rule.
 pub fn sanitize_namespace(raw: &str) -> String {
     let cleaned: String = raw
         .chars()
@@ -90,28 +98,51 @@ pub const MAX_BATCH_ITEMS: usize = 24;
 /// cross it is left out whole — a hit is never cut mid-way.
 pub const MAX_BATCH_BYTES: usize = 64 * 1024;
 
-/// Semantic recall over the namespace. Returns hits best-first; an empty
-/// store yields an empty vec (not an error).
+/// Semantic recall over the room. Returns hits best-first; an empty
+/// store yields an empty vec (not an error). While the room is empty the
+/// legacy namespace of the same name is tried (memory from before #422);
+/// that fallback is soft, so it keeps working once uteke drops namespaces.
 pub fn recall(cfg: &MemoryConfig, query: &str) -> Result<Vec<RecallHit>, String> {
-    let mut cmd = Command::new(&cfg.bin);
-    crate::subprocess::scrub_env_for_child(&mut cmd);
+    let limit = cfg.limit.min(MAX_BATCH_ITEMS as u32).to_string();
     // The user-controlled query goes AFTER `--`: a leading-hyphen prompt
     // must be a positional, never parsed as uteke flags (#280).
-    cmd.arg("recall")
-        .arg("--namespace")
-        .arg(&cfg.namespace)
-        .arg("--limit")
-        .arg(cfg.limit.min(MAX_BATCH_ITEMS as u32).to_string())
-        .arg("--json")
-        .arg("--")
-        .arg(query);
+    let room = [
+        "room", "recall", "--limit", &limit, "--json", "--", &cfg.room, query,
+    ];
+    let hits = run_recall(cfg, &room)?;
+    if !hits.is_empty() {
+        return Ok(hits);
+    }
+    let legacy = [
+        "recall",
+        "--namespace",
+        &cfg.room,
+        "--limit",
+        &limit,
+        "--json",
+        "--",
+        query,
+    ];
+    Ok(run_recall(cfg, &legacy).unwrap_or_default())
+}
+
+fn run_recall(cfg: &MemoryConfig, args: &[&str]) -> Result<Vec<RecallHit>, String> {
+    let mut cmd = Command::new(&cfg.bin);
+    crate::subprocess::scrub_env_for_child(&mut cmd);
+    cmd.args(args);
     let out = run_with_timeout(&mut cmd, SUBPROCESS_TIMEOUT)?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         let snippet: String = stderr.chars().take(300).collect();
         return Err(format!("uteke recall exited {}: {}", out.status, snippet));
     }
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    parse_hits(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Parse a uteke recall payload. Accepts the flat hit shape (`recall`,
+/// `room recall` without a query) and the nested one (`room recall` with
+/// a query: `{"memory": {...}, "score": ...}`).
+fn parse_hits(stdout: &str) -> Result<Vec<RecallHit>, String> {
     let parsed: Value = serde_json::from_str(stdout.trim())
         .map_err(|e| format!("uteke recall output was not valid JSON: {e}"))?;
     // All-or-nothing (#384): a payload we cannot fully understand fails the
@@ -122,7 +153,8 @@ pub fn recall(cfg: &MemoryConfig, query: &str) -> Result<Vec<RecallHit>, String>
     let mut seen = std::collections::HashSet::new();
     let mut hits = Vec::new();
     for (i, hit) in arr.iter().enumerate() {
-        let Some(content) = hit.get("content").and_then(Value::as_str) else {
+        let record = hit.get("memory").unwrap_or(hit);
+        let Some(content) = record.get("content").and_then(Value::as_str) else {
             return Err(format!("uteke recall hit #{} has no string content", i + 1));
         };
         if content.trim().is_empty() {
@@ -165,8 +197,8 @@ fn format_recall_block_bounded(
         return String::new();
     }
     let mut block = format!(
-        "\n\n---\n[recalled memory · uteke namespace {} — injected by the host before this turn]\n",
-        cfg.namespace
+        "\n\n---\n[recalled memory · uteke room {} — injected by the host before this turn]\n",
+        cfg.room
     );
     const FOOTER: &str = "[end recalled memory]";
     let mut included = 0usize;
@@ -238,8 +270,8 @@ pub fn remember_session(
     crate::subprocess::scrub_env_for_child(&mut cmd);
     cmd.arg("remember")
         .arg(&content)
-        .arg("--namespace")
-        .arg(&cfg.namespace)
+        .arg("--room")
+        .arg(&cfg.room)
         .arg("--type")
         .arg(mem_type)
         .arg("--tags")
@@ -273,18 +305,18 @@ mod tests {
     fn cwd_namespace_follows_repo_convention() {
         let dir = std::env::temp_dir().join("tole-memory-ns-test");
         let cfg = MemoryConfig::for_cwd("uteke", &dir);
-        assert_eq!(cfg.namespace, "repo-tole-memory-ns-test");
+        assert_eq!(cfg.room, "repo-tole-memory-ns-test");
         assert_eq!(cfg.limit, 3);
         // Root (no basename) falls back, never panics.
         let cfg_root = MemoryConfig::for_cwd("uteke", std::path::Path::new("/"));
-        assert_eq!(cfg_root.namespace, "repo-default");
+        assert_eq!(cfg_root.room, "repo-default");
     }
 
     #[test]
     fn recall_block_empty_when_no_hits() {
         let cfg = MemoryConfig {
             bin: "uteke".into(),
-            namespace: "repo-x".into(),
+            room: "repo-x".into(),
             limit: 3,
         };
         assert_eq!(format_recall_block(&cfg, &[]), "");
@@ -294,7 +326,7 @@ mod tests {
     fn recall_block_is_fenced_and_ordered() {
         let cfg = MemoryConfig {
             bin: "uteke".into(),
-            namespace: "repo-tole".into(),
+            room: "repo-tole".into(),
             limit: 3,
         };
         let hits = vec![
@@ -308,7 +340,7 @@ mod tests {
             },
         ];
         let block = format_recall_block(&cfg, &hits);
-        assert!(block.contains("[recalled memory · uteke namespace repo-tole"));
+        assert!(block.contains("[recalled memory · uteke room repo-tole"));
         assert!(block.contains("1. (0.91) decision: state machine"));
         assert!(block.contains("2. (0.72) namespace convention"));
         assert!(block.ends_with("[end recalled memory]"));
@@ -318,7 +350,7 @@ mod tests {
     fn recall_block_truncates_long_content() {
         let cfg = MemoryConfig {
             bin: "uteke".into(),
-            namespace: "repo-tole".into(),
+            room: "repo-tole".into(),
             limit: 1,
         };
         let hits = vec![RecallHit {
@@ -355,7 +387,7 @@ mod tests {
         }
         let cfg = MemoryConfig {
             bin: bin.display().to_string(),
-            namespace: "repo-tole".into(),
+            room: "repo-tole".into(),
             limit: 2,
         };
         let hits = recall(&cfg, "state machine").unwrap();
@@ -363,16 +395,72 @@ mod tests {
         assert_eq!(hits[0].content, "remembered fact");
         assert!((hits[0].score - 0.8).abs() < 1e-9);
         let argv = std::fs::read_to_string(&log).unwrap();
-        assert!(argv.contains("recall --namespace"));
-        assert!(argv.trim_end().ends_with("-- state machine"));
+        assert!(argv.starts_with("room recall"), "{argv}");
+        assert!(argv.trim_end().ends_with("-- repo-tole state machine"));
         // #280: a leading-hyphen prompt stays a positional after `--`.
         recall(&cfg, "--namespace evil").unwrap();
         let argv = std::fs::read_to_string(&log).unwrap();
-        assert!(argv.trim_end().ends_with("-- --namespace evil"));
-        assert!(argv.starts_with("recall --namespace repo-tole"));
-        assert!(argv.contains("--namespace repo-tole"));
+        assert!(argv.trim_end().ends_with("-- repo-tole --namespace evil"));
         assert!(argv.contains("--limit 2"));
         assert!(argv.contains("--json"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parses_flat_and_room_shaped_hits() {
+        let flat = r#"[{"score":0.5,"content":"flat fact"}]"#;
+        let nested = r#"[{"memory":{"id":"m1","content":"room fact"},"score":0.9}]"#;
+        assert_eq!(parse_hits(flat).unwrap()[0].content, "flat fact");
+        let h = parse_hits(nested).unwrap();
+        assert_eq!(h[0].content, "room fact");
+        assert!((h[0].score - 0.9).abs() < 1e-9);
+        assert!(parse_hits(r#"[{"memory":{"id":"m1"}}]"#).is_err());
+    }
+
+    /// #422: an empty room falls back to the legacy namespace of the same
+    /// name (memory written before rooms); a failing legacy recall is soft.
+    #[cfg(unix)]
+    #[test]
+    fn empty_room_falls_back_to_the_legacy_namespace() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("tole-mem-fb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("uteke");
+        let log = dir.join("argv.log");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\necho \"$@\" >> {}\nif [ \"$1\" = room ]; then echo '[]'; else echo '[{{\"score\":0.4,\"content\":\"legacy fact\"}}]'; fi\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cfg = MemoryConfig {
+            bin: bin.display().to_string(),
+            room: "repo-tole".into(),
+            limit: 3,
+        };
+        let hits = recall(&cfg, "q").unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].content, "legacy fact");
+        let argv = std::fs::read_to_string(&log).unwrap();
+        let calls: Vec<&str> = argv.lines().collect();
+        assert_eq!(calls.len(), 2, "{argv}");
+        assert!(calls[0].starts_with("room recall"), "{argv}");
+        assert!(
+            calls[1].starts_with("recall --namespace repo-tole"),
+            "{argv}"
+        );
+
+        // A legacy recall that fails (uteke without namespaces) is soft.
+        std::fs::write(
+            &bin,
+            "#!/bin/sh\nif [ \"$1\" = room ]; then echo '[]'; else exit 2; fi\n",
+        )
+        .unwrap();
+        assert!(recall(&cfg, "q").unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -400,7 +488,7 @@ mod tests {
         }
         let cfg = MemoryConfig {
             bin: bin.display().to_string(),
-            namespace: "repo-tole".into(),
+            room: "repo-tole".into(),
             limit: 3,
         };
         let out =
@@ -408,7 +496,8 @@ mod tests {
         assert!(out.contains("id: mem-123"));
         let argv = std::fs::read_to_string(&log).unwrap();
         assert!(argv.contains("remember [tole session s-abc] fix the jail → done — tests added"));
-        assert!(argv.contains("--namespace repo-tole"));
+        assert!(argv.contains("--room repo-tole"), "{argv}");
+        assert!(!argv.contains("--namespace"), "{argv}");
         assert!(argv.contains("--type context"));
         assert!(argv.contains("--tags tole,session"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -436,7 +525,7 @@ mod tests {
         }
         let cfg = MemoryConfig {
             bin: bin.display().to_string(),
-            namespace: "repo-tole".into(),
+            room: "repo-tole".into(),
             limit: 3,
         };
         remember_session(&cfg, "s-def", "add the jail", "done", true).unwrap();
@@ -465,7 +554,7 @@ mod tests {
         }
         let cfg = MemoryConfig {
             bin: bin.display().to_string(),
-            namespace: "repo-tole".into(),
+            room: "repo-tole".into(),
             limit: 3,
         };
         remember_session(&cfg, "s-abc", "multi\nline\nprompt", "answer", false).unwrap();
@@ -485,7 +574,7 @@ mod tests {
     fn cfg_x() -> MemoryConfig {
         MemoryConfig {
             bin: "uteke".into(),
-            namespace: "repo-x".into(),
+            room: "repo-x".into(),
             limit: 3,
         }
     }
@@ -528,7 +617,7 @@ mod tests {
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         MemoryConfig {
             bin: bin.display().to_string(),
-            namespace: "repo-x".into(),
+            room: "repo-x".into(),
             limit: 99,
         }
     }

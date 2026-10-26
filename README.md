@@ -45,6 +45,9 @@ tole is the agent harness of the CodeCora ecosystem — the hands:
   memory. `uteke_recall` (recall) and `uteke_document` (markdown → durable
   knowledge) register automatically when the `uteke` binary is on PATH, and
   the optional [memory loop](#memory-loop) closes the circle.
+- **Supported versions:** cora ≥ 0.19.0 and uteke ≥ 0.21.1 (both optional).
+  `tole doctor` reports each one as supported, too old (with the upgrade
+  command) or not installed.
 - Anything else that speaks **MCP over stdio** joins the same registry via
   repeatable `--mcp-server name=command [args...]` flags.
 - **tole as an MCP server**: `tole mcp` serves the registry's hardened tools
@@ -126,7 +129,7 @@ trust: `internal` / `read_only`), `--skill <path>` (load a SKILL.md),
 | `TOLE_SYSTEM_PROMPT` | default persona when `--system` is absent |
 | `TOLE_MEMORY` | memory loop backend (`uteke`) — same as `--memory uteke` |
 | `TOLE_NO_UPDATE_CHECK` | `1` disables the startup update-check banner (issue #220) |
-| `TOLE_MEMORY_NAMESPACE` | override the loop's namespace (default: `repo-<directory name>`) |
+| `TOLE_MEMORY_NAMESPACE` | override the loop's uteke room (default: `repo-<directory name>`; the name predates rooms) |
 
 ## Provider doctor
 
@@ -142,6 +145,10 @@ Tiers are cumulative and stop at the first blocker, which is printed with
 the command that fixes it. The exit code is non-zero when the requested
 tier is not reached, so `tole doctor --tier full` is the gate for "ready to
 release" claims. API keys and URL credentials never appear in the output.
+
+After the provider tiers, an `ecosystem:` section reports the sibling
+binaries against the supported floor (cora ≥ 0.19.0, uteke ≥ 0.21.1). It is
+informational: an old or missing sibling never fails the run.
 
 Every run is recorded in a coverage ledger (`$CODECORA_HOME/tole/doctor-ledger.json`,
 owner-readable only: level reached, first blocker, fix, timestamp per provider
@@ -341,8 +348,10 @@ neither trigger nor suppress it:
 - **When the session settles** with a final answer, a compact summary is
   stored back — the next session's recall can find it.
 
-The namespace follows the ecosystem `repo-<dir>` convention
-(`TOLE_MEMORY_NAMESPACE` overrides). The injected batch is hard-capped
+Memory lives in the uteke room `repo-<dir>` (uteke ≥ 0.21.1; rooms replace
+the deprecated namespaces; `TOLE_MEMORY_NAMESPACE` overrides the room). Memory
+stored by earlier tole versions in the namespace of the same name is still
+recalled while the room is empty. The injected batch is hard-capped
 at 24 items / 64 KiB (a larger `limit` is clamped; a hit is never cut
 mid-way) and deduplicated. A batch is all-or-nothing: an unparseable
 recall payload fails the whole batch with a stderr note rather than

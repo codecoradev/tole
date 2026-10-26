@@ -69,7 +69,7 @@ struct Cli {
     /// fresh session, memories relevant to the prompt are recalled from
     /// the owner's store and injected into the message; when the session
     /// settles, a compact summary is stored back. Currently `uteke`
-    /// (namespace: repo-<dir>, override: TOLE_MEMORY_NAMESPACE). Falls
+    /// (uteke room: repo-<dir>, override: TOLE_MEMORY_NAMESPACE). Falls
     /// back to the TOLE_MEMORY env.
     #[cfg(feature = "shell-tools")]
     #[arg(long, global = true)]
@@ -1114,10 +1114,7 @@ impl HostConfig {
         };
         match tole_core::memory::recall_block(mem, prompt) {
             Ok(block) if !block.is_empty() => {
-                eprintln!(
-                    "tole: memory: recalled context injected ({})",
-                    mem.namespace
-                );
+                eprintln!("tole: memory: recalled context injected ({})", mem.room);
                 format!("{prompt}{block}")
             }
             Ok(_) => prompt.to_string(),
@@ -1136,7 +1133,7 @@ impl HostConfig {
         };
         match tole_core::memory::remember_session(mem, session_id, first_prompt, last_answer, wrote)
         {
-            Ok(_) => eprintln!("tole: memory: session summary stored in {}", mem.namespace),
+            Ok(_) => eprintln!("tole: memory: session summary stored in room {}", mem.room),
             Err(e) => eprintln!("tole: memory remember failed (session unaffected): {e}"),
         }
     }
@@ -1144,9 +1141,9 @@ impl HostConfig {
 
 /// Memory backend resolution: `chosen` is the already-resolved backend
 /// name (`--memory` flag > `TOLE_MEMORY` env > project config, see
-/// `config_apply::Settings`); `uteke` is the only backend. The namespace follows
+/// `config_apply::Settings`); `uteke` is the only backend. The room follows
 /// the ecosystem `repo-<dir>` convention unless `TOLE_MEMORY_NAMESPACE`
-/// overrides it. A missing uteke binary degrades to a warning + no-op
+/// (kept under its old name) overrides it. A missing uteke binary degrades to a warning + no-op
 /// (the same probe contract as the uteke tools).
 #[cfg(feature = "shell-tools")]
 fn resolve_memory(chosen: Option<&str>) -> Result<Option<tole_core::memory::MemoryConfig>> {
@@ -1169,7 +1166,7 @@ fn resolve_memory(chosen: Option<&str>) -> Result<Option<tole_core::memory::Memo
     if let Ok(ns) = std::env::var("TOLE_MEMORY_NAMESPACE") {
         let ns = ns.trim();
         if !ns.is_empty() {
-            cfg.namespace = tole_core::memory::sanitize_namespace(ns);
+            cfg.room = tole_core::memory::sanitize_namespace(ns);
         }
     }
     Ok(Some(cfg))
