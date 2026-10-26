@@ -20,6 +20,7 @@ use crate::register::RegisterWrite;
 use crate::state::{Pc, StateTransition};
 use crate::storage::{Commit, Storage, StorageError, UsageRecord};
 use crate::tool::{Risk, ToolRegistry};
+use crate::transcript;
 
 /// Hard ceiling on provider steps in one turn (loop-guard).
 pub const MAX_STEPS: usize = 32;
@@ -538,19 +539,19 @@ fn drive(
         let mut usage = match (p.last_usage(), p.last_wire_stats()) {
             (Some(mut u), Some(w)) => {
                 if let Some(obj) = u.as_object_mut() {
-                    obj.insert("tole_wire".to_string(), w);
+                    obj.insert(transcript::WIRE_KEY.to_string(), w);
                 }
                 Some(u)
             }
             (Some(u), None) => Some(u),
-            (None, Some(w)) => Some(json!({ "tole_wire": w })),
+            (None, Some(w)) => Some(json!({ transcript::WIRE_KEY: w })),
             (None, None) => None,
         };
         // Issue #209: the provider that answered (and any failover) rides
         // along under the namespaced `tole_route` key — a switch is durable.
         if let Some(route) = p.last_route() {
             if let Some(obj) = usage.get_or_insert_with(|| json!({})).as_object_mut() {
-                obj.insert("tole_route".to_string(), route);
+                obj.insert(transcript::ROUTE_KEY.to_string(), route);
             }
         }
         if let Some(u) = usage {
@@ -622,22 +623,12 @@ fn drive(
                     // the last user message count — earlier turns' tools
                     // would re-trigger history-keyed gates on every
                     // later Final of a resumed/chat session.
-                    let turn_start = s
-                        .entries()
-                        .iter()
-                        .rposition(|e| {
-                            // cora CI round 2: this loop's OWN deny
-                            // feedback is also a user-role entry — if it
-                            // counted, turn_start would jump past the
-                            // turn's tool calls on the second Final and
-                            // a presence-keyed gate would be defeated.
-                            // Hence the explicit marker is skipped.
-                            e.kind.as_str() == "message"
-                                && e.payload["role"] == json!("user")
-                                && e.payload["stop_gate_feedback"] != json!(true)
-                                && e.payload["interrupt"] != json!(true)
-                        })
-                        .unwrap_or(0);
+                    // cora CI round 2: this loop's OWN deny feedback is
+                    // also a user-role entry — if it counted, turn_start
+                    // would jump past the turn's tool calls on the second
+                    // Final and a presence-keyed gate would be defeated.
+                    // `opens_turn` skips that marker (and interrupts).
+                    let turn_start = transcript::current_turn_start(s.entries()).unwrap_or(0);
                     let tools_seen: Vec<(String, Risk)> = s
                         .entries()
                         .iter()
@@ -677,7 +668,7 @@ fn drive(
                             json!({
                                 "role": "user",
                                 "text": format!("stop gate: {reason}"),
-                                "stop_gate_feedback": true
+                                transcript::STOP_GATE_FEEDBACK: true
                             }),
                         )))?;
                         continue;
@@ -907,7 +898,7 @@ fn deliver_interrupts(s: &mut dyn Storage, cancel: &CancelToken) -> Result<(), S
             json!({
                 "role": "user",
                 "text": format!("[{tag} — injected mid-turn, not part of the original request] {}", i.text),
-                "interrupt": true,
+                transcript::INTERRUPT: true,
                 "source": source,
                 "urgent": i.urgent,
             }),
