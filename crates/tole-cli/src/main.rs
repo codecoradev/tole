@@ -1445,6 +1445,31 @@ fn mcp_server_command(
 // Commands
 // ---------------------------------------------------------------------------
 
+/// The cora agent-as-reviewer flow (#422, cora >= 0.19): the calling
+/// model judges a diff itself, so cora needs no LLM key. Named in the
+/// system prompt only when both tools are registered (absent in plan
+/// mode, where MCP tools are filtered out, and without `cora mcp`).
+const CORA_REVIEW_SECTION: &str = "\n\n# Code review\nTo review a change: get its \
+unified diff (e.g. `git diff --cached` or `git diff <base>`), call \
+mcp_cora_cora_review_prepare with it, judge the diff yourself following \
+the returned instructions and response_schema, then call \
+mcp_cora_cora_review_finalize with the SAME diff and your findings (a JSON \
+array, [] when none) and report its verdict, including should_block.";
+
+fn review_section(registry: &ToolRegistry) -> &'static str {
+    let attached = [
+        "mcp_cora_cora_review_prepare",
+        "mcp_cora_cora_review_finalize",
+    ]
+    .iter()
+    .all(|name| registry.get(name).is_some());
+    if attached {
+        CORA_REVIEW_SECTION
+    } else {
+        ""
+    }
+}
+
 /// Skills wiring (issue #161): shared by run/chat/serve. Loads `--skill`
 /// files (loud error on broken ones), and when the workspace exposes a
 /// non-empty skills dir, registers the ReadOnly load_skill tool and
@@ -1555,8 +1580,10 @@ fn run_command(
         .map(str::to_string)
         .or_else(resolve_system_prompt)
         .or_else(|| Some(build_default_prompt(host.plan_mode)));
-    // Skills (issue #161): skill sections append after the base prompt.
-    let system_prompt = system_prompt.map(|p| format!("{p}{skill_sections}"));
+    // Skills (issue #161): skill sections append after the base prompt,
+    // after the cora review flow when its tools are attached (#422).
+    let review = review_section(&registry);
+    let system_prompt = system_prompt.map(|p| format!("{p}{review}{skill_sections}"));
     let mut storage = JsonlStorage::create_named(
         sessions_dir,
         &session_id,
@@ -2071,8 +2098,10 @@ fn chat_command(
             .map(str::to_string)
             .or_else(resolve_system_prompt)
             .or_else(|| Some(build_default_prompt(host.plan_mode)));
-        // Skills (issue #161): sections append after the base prompt.
-        let system_prompt = system_prompt.map(|p| format!("{p}{skill_sections}"));
+        // Skills (issue #161): sections append after the base prompt,
+        // after the cora review flow when its tools are attached (#422).
+        let review = review_section(&registry);
+        let system_prompt = system_prompt.map(|p| format!("{p}{review}{skill_sections}"));
         JsonlStorage::create_with(sessions_dir, &session_id, None, system_prompt.as_deref())
             .with_context(|| format!("creating session {session_id}"))?
     } else {
@@ -2646,6 +2675,34 @@ mod default_prompt_tests {
         let planned = super::build_default_prompt(true);
         assert!(planned.contains("PLAN MODE"));
         assert!(planned.rfind("Context:").unwrap() > planned.rfind("PLAN MODE").unwrap());
+    }
+
+    #[test]
+    fn review_section_only_when_both_cora_review_tools_are_registered() {
+        use tole_core::tool::{Risk, Tool};
+        struct Named(&'static str);
+        impl Tool for Named {
+            fn name(&self) -> &str {
+                self.0
+            }
+            fn risk(&self) -> Risk {
+                Risk::ReadOnly
+            }
+            fn execute(&self, _input: serde_json::Value) -> Result<serde_json::Value, String> {
+                Ok(serde_json::Value::Null)
+            }
+        }
+        let approver = || tole_core::approval::AllowlistApprover::allow_only(vec![]);
+        let mut reg = tole_core::tool::ToolRegistry::with_approver(approver());
+        assert_eq!(super::review_section(&reg), "");
+        reg.register(Box::new(Named("mcp_cora_cora_review_prepare")))
+            .unwrap();
+        assert_eq!(super::review_section(&reg), "", "finalize missing");
+        reg.register(Box::new(Named("mcp_cora_cora_review_finalize")))
+            .unwrap();
+        let section = super::review_section(&reg);
+        assert!(section.contains("mcp_cora_cora_review_prepare"));
+        assert!(section.contains("SAME diff"));
     }
 
     #[test]

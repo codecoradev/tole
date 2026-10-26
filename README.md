@@ -36,6 +36,11 @@ tole is the agent harness of the CodeCora ecosystem — the hands:
   tole detects the built-in `cora mcp` server and registers its 18-tool
   surface (brain search, callers, impact, affected tests, dead-code, review
   — registry names `mcp_cora_*`). Opt out with `--no-auto-mcp`.
+  **Code review** (cora ≥ 0.19): with the review tools attached, the system
+  prompt names cora's agent-as-reviewer flow — the model passes a diff to
+  `mcp_cora_cora_review_prepare`, judges it itself (no LLM key in cora), then
+  calls `mcp_cora_cora_review_finalize` with the same diff and its findings.
+  `--trust internal` allows the `mcp_cora_*` tools without prompting.
 - **[uteke](https://github.com/codecoradev/uteke)** (`uteke`) — semantic
   memory. `uteke_recall` (recall) and `uteke_document` (markdown → durable
   knowledge) register automatically when the `uteke` binary is on PATH, and
