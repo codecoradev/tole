@@ -458,7 +458,7 @@ pub fn tole_cli_binary_available(name: &str) -> bool {
     false
 }
 
-pub fn detect_github_repo(cwd: &PathBuf) -> Option<String> {
+pub fn detect_github_repo(cwd: &std::path::Path) -> Option<String> {
     let mut cmd = std::process::Command::new("git");
     cmd.args(["config", "--get", "remote.origin.url"])
         .current_dir(cwd);

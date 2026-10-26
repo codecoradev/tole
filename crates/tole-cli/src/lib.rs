@@ -14,6 +14,7 @@ pub mod provider_chain;
 pub mod session_host;
 pub mod session_tools;
 pub mod sibling;
+pub mod tool_roster;
 pub mod tools;
 pub mod trust;
 pub mod usage_report;
