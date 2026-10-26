@@ -15,6 +15,14 @@ use std::net::TcpListener;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+/// The scenario is timing-based (B's edit must land inside A's 4 s slow
+/// step), so the tests in this file run one at a time.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 fn completion_to_sse(reply: &Value) -> String {
     let mut out = String::new();
     let msg = &reply["choices"][0]["message"];
@@ -198,6 +206,7 @@ fn tole(
 
 #[test]
 fn a_sibling_edit_reaches_the_other_child_at_its_next_safe_point() {
+    let _serial = serial();
     let base = spawn_mock();
     let root = std::env::temp_dir().join(format!("tole-sibling-e2e-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -237,4 +246,96 @@ fn a_sibling_edit_reaches_the_other_child_at_its_next_safe_point() {
         "A never got the notice: {a_out}\n{a_err}"
     );
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// #428: child A drives its turn through `tole chat` or `tole resume`
+/// instead of `tole run`; the sibling notice must reach it the same way.
+fn a_notice_reaches_child_a_via(face: &str) {
+    let _serial = serial();
+    let base = spawn_mock();
+    let root = std::env::temp_dir().join(format!("tole-sibling-{face}-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let ws = root.join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::write(ws.join("shared.txt"), "original contents\n").unwrap();
+    let log = root.join("tole-agents").join("touch.log");
+
+    let mut a = tole(&base, &ws, &log, "a-a", "unused");
+    let prompt = "CHILD_A: read shared.txt twice";
+    let a = match face {
+        "chat" => {
+            let mut cmd = Command::new(a.get_program());
+            cmd.args(["chat", "--allow", "write_file"]);
+            for (k, v) in a.get_envs() {
+                match v {
+                    Some(v) => cmd.env(k, v),
+                    None => cmd.env_remove(k),
+                };
+            }
+            let mut child = cmd
+                .current_dir(&ws)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(format!("{prompt}\n").as_bytes())
+                .unwrap();
+            child
+        }
+        _ => {
+            let sessions = ws.join(".tole").join("sessions");
+            std::fs::create_dir_all(&sessions).unwrap();
+            tole_core::storage::JsonlStorage::create(&sessions, "s-child-a", None).unwrap();
+            let mut cmd = Command::new(a.get_program());
+            cmd.args(["resume", "--allow", "write_file", "s-child-a", prompt]);
+            for (k, v) in a.get_envs() {
+                match v {
+                    Some(v) => cmd.env(k, v),
+                    None => cmd.env_remove(k),
+                };
+            }
+            a = cmd;
+            a.current_dir(&ws)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap()
+        }
+    };
+    std::thread::sleep(Duration::from_millis(1500));
+
+    let b = tole(&base, &ws, &log, "a-b", "CHILD_B: overwrite shared.txt")
+        .output()
+        .unwrap();
+    assert!(
+        b.status.success(),
+        "B failed: {}",
+        String::from_utf8_lossy(&b.stderr)
+    );
+
+    let a = a.wait_with_output().unwrap();
+    let a_out = String::from_utf8_lossy(&a.stdout);
+    let a_err = String::from_utf8_lossy(&a.stderr);
+    assert!(a.status.success(), "A ({face}) failed: {a_out}\n{a_err}");
+    assert!(
+        a_out.contains("A_NOTICED"),
+        "A ({face}) never got the notice: {a_out}\n{a_err}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_sibling_edit_reaches_a_child_running_tole_chat() {
+    a_notice_reaches_child_a_via("chat");
+}
+
+#[test]
+fn a_sibling_edit_reaches_a_child_running_tole_resume() {
+    a_notice_reaches_child_a_via("resume");
 }
