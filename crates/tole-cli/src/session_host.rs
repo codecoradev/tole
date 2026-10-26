@@ -330,20 +330,10 @@ pub fn open_session(
         .map_err(|e| format!("creating session: {e}"))?
     };
     // Task-list tools (issue #198): registered after the storage open —
-    // the state is seeded from the replayed transcript (settled
-    // todo_write outputs), so crash-resume restores the last list.
-    // todo_read is ReadOnly (plan-mode safe); todo_write joins the other
-    // Write tools in being absent under --plan-mode.
-    let todo_state = tole_core::todo::TodoState::new();
-    todo_state.hydrate(storage.entries());
-    reg.register(Box::new(tole_core::todo::TodoReadTool::new(StdArc::clone(
-        &todo_state,
-    ))))?;
-    if !plan_mode {
-        reg.register(Box::new(tole_core::todo::TodoWriteTool::new(
-            StdArc::clone(&todo_state),
-        )))?;
-    }
+    // the state is seeded from the replayed transcript, so crash-resume
+    // restores the last list; todo_write is absent under --plan-mode.
+    crate::tool_roster::register_todo(&mut reg, storage.entries(), plan_mode)
+        .map_err(|e| e.to_string())?;
 
     Ok(SessionState {
         storage: StdArc::new(Mutex::new(storage)),
