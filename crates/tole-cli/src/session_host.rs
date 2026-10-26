@@ -455,24 +455,11 @@ pub fn run_session_turn(
     let mut final_text: Option<String> = None;
 
     // Memory loop, pre-turn (first prompt of a fresh session only).
-    let mut effective = prompt.to_string();
-    {
-        let done = *first_prompt_done.lock().expect("fpd lock");
-        if !done {
-            if let Some(mem) = &memory {
-                match tole_core::memory::recall_block(mem, prompt) {
-                    Ok(block) if !block.is_empty() => {
-                        eprintln!("tole: memory: recalled context injected");
-                        effective = format!("{prompt}{block}");
-                    }
-                    Ok(_) => {}
-                    // Visible, never silent (#384): the turn still runs on
-                    // the bare prompt — memory is not a dependency.
-                    Err(e) => eprintln!("tole: memory recall failed (continuing without): {e}"),
-                }
-            }
-        }
-    }
+    let effective = if *first_prompt_done.lock().expect("fpd lock") {
+        prompt.to_string()
+    } else {
+        crate::turn_runner::with_recalled_memory(memory.as_ref(), prompt)
+    };
 
     // Lock the storage for the rest of the turn. The provider is built
     // fresh every turn (issue #176): a `fact/model` register override —
@@ -505,9 +492,7 @@ pub fn run_session_turn(
 
     #[cfg(feature = "shell-tools")]
     if let tole_core::turn::TurnOutcome::Final { text, wrote } = &outcome {
-        if let Some(mem) = &memory {
-            let _ = tole_core::memory::remember_session(mem, session_id, prompt, text, *wrote);
-        }
+        crate::turn_runner::remember(memory.as_ref(), session_id, prompt, text, *wrote);
     }
     *first_prompt_done.lock().expect("fpd lock") = true;
 

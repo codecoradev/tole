@@ -6,6 +6,7 @@
 //! turn talks to, with which tools, under which system prompt.
 
 use std::sync::Arc;
+use tole_core::memory::MemoryConfig;
 use tole_core::openai::{OpenAiConfig, OpenAiProvider};
 use tole_core::provider::Provider;
 use tole_core::storage::Storage;
@@ -75,6 +76,48 @@ pub fn session_provider(
     })
 }
 
+/// Pre-turn recall (memory loop): the prompt with the recalled block
+/// appended — what the provider sees and the durable log records. No
+/// memory configured, nothing recalled, or a failed recall (reported on
+/// stderr, #384) all yield the bare prompt: memory is an enhancement,
+/// never a dependency.
+pub fn with_recalled_memory(memory: Option<&MemoryConfig>, prompt: &str) -> String {
+    let Some(mem) = memory else {
+        return prompt.to_string();
+    };
+    match tole_core::memory::recall_block(mem, prompt) {
+        Ok(block) if !block.is_empty() => {
+            eprintln!("tole: memory: recalled context injected ({})", mem.room);
+            format!("{prompt}{block}")
+        }
+        Ok(_) => prompt.to_string(),
+        Err(e) => {
+            eprintln!("tole: memory recall failed (continuing without): {e}");
+            prompt.to_string()
+        }
+    }
+}
+
+/// Store a session summary (memory loop): best effort, reported on
+/// stderr either way; the session itself is never affected. `first_prompt`
+/// is the PRE-injection prompt, so recalled memory is never echoed back
+/// into the store.
+pub fn remember(
+    memory: Option<&MemoryConfig>,
+    session_id: &str,
+    first_prompt: &str,
+    last_answer: &str,
+    wrote: bool,
+) {
+    let Some(mem) = memory else {
+        return;
+    };
+    match tole_core::memory::remember_session(mem, session_id, first_prompt, last_answer, wrote) {
+        Ok(_) => eprintln!("tole: memory: session summary stored in room {}", mem.room),
+        Err(e) => eprintln!("tole: memory remember failed (session unaffected): {e}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,5 +164,63 @@ mod tests {
             "{MISSING_PROVIDER_CONFIG}"
         );
         assert!(MISSING_PROVIDER_CONFIG.contains("TOLE_BASE_URL / TOLE_MODEL / TOLE_API_KEY"));
+    }
+    /// A fake `uteke` that prints `body` and logs its argv.
+    #[cfg(unix)]
+    fn fake_uteke(tag: &str, body: &str) -> (MemoryConfig, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("tole-turn-mem-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("uteke");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\necho \"$@\" >> {}/argv.log\n{body}\n",
+                dir.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cfg = MemoryConfig {
+            bin: bin.display().to_string(),
+            room: "repo-x".into(),
+            limit: 3,
+        };
+        (cfg, dir)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recall_appends_hits_and_degrades_to_the_bare_prompt() {
+        assert_eq!(with_recalled_memory(None, "p"), "p");
+        let (hit, d1) = fake_uteke("hit", "echo '[{\"score\":0.9,\"content\":\"a fact\"}]'");
+        let out = with_recalled_memory(Some(&hit), "p");
+        assert!(out.starts_with('p') && out.contains("a fact"), "{out}");
+        let (empty, d2) = fake_uteke("empty", "echo '[]'");
+        assert_eq!(with_recalled_memory(Some(&empty), "p"), "p");
+        let (broken, d3) = fake_uteke("broken", "exit 3");
+        assert_eq!(with_recalled_memory(Some(&broken), "p"), "p");
+        for d in [d1, d2, d3] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remember_stores_the_pre_injection_prompt_in_the_room() {
+        remember(None, "s", "p", "a", false); // no memory: a no-op
+        let (cfg, dir) = fake_uteke("remember", "echo id");
+        remember(Some(&cfg), "s-1", "bare prompt", "the answer", true);
+        let argv = std::fs::read_to_string(dir.join("argv.log")).unwrap();
+        assert!(
+            argv.starts_with("remember [tole session s-1] bare prompt → the answer"),
+            "{argv}"
+        );
+        assert!(
+            argv.contains("--room repo-x") && argv.contains("--type decision"),
+            "{argv}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
