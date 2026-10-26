@@ -1,16 +1,16 @@
 //! Child agents (issue #171): a parent session spawns N durable child
 //! `tole run` sessions — depth capped at ONE (no grandchildren), the
-//! mailbox is a per-child uteke namespace, ephemeral by default.
+//! mailbox is a per-child uteke room, ephemeral by default.
 //!
 //! Architecture = the jobs pattern (detached spawn + on-disk state +
-//! poll), composed with the memory loop's namespace override:
+//! poll), composed with the memory loop's room override:
 //!
 //! - `agent_start` — spawn `<bin> run "<prompt>"` DETACHED with
 //!   `TOLE_AGENT_DEPTH=1`, `TOLE_MEMORY_NAMESPACE=agent-<id>`,
 //!   `TOLE_MEMORY=uteke`. The child is a full tole session: own JSONL
 //!   (inside the agent dir), own registry (BUILT WITHOUT the agent
 //!   tools — the structural depth cap), own usage ledger. Its settle
-//!   summary lands in its mailbox namespace automatically (the memory
+//!   summary lands in its mailbox room automatically (the memory
 //!   loop), which is the ONLY result channel back up.
 //! - `agent_poll`  — liveness + log tail +, once settled, the mailbox
 //!   summary; consuming a settled result CLEANS the mailbox (soft,
@@ -319,9 +319,9 @@ pub struct AgentMeta {
     pub role: Option<String>,
 }
 
-/// The child's uteke mailbox namespace, derived from its (validated)
+/// The child's uteke mailbox room, derived from its (validated)
 /// agent id. The parent NEVER takes it from `meta.json`: the child can
-/// write that file, and the poll drives `uteke forget` on the namespace —
+/// write that file, and the poll drives `uteke forget` on the room —
 /// a forged `mailbox_ns` (e.g. `repo-<name>`) would make the parent wipe
 /// an unrelated room (cora 0.19 scan MAJOR).
 fn mailbox_ns_for(id: &str) -> String {
@@ -406,13 +406,28 @@ fn open_lock_file(root: &std::path::Path) -> Result<std::fs::File, String> {
         .map_err(|e| format!("agents lock: {e}"))
 }
 
-/// Best-effort mailbox cleanup (ephemeral default): `uteke forget`
-/// each memory in the child's namespace. Soft failure — cleanup is an
-/// optimization; the durable child JSONL is the real archive.
+/// Best-effort mailbox cleanup (ephemeral default): `uteke forget` each
+/// memory in the child's mailbox room, then drop the room; finally the
+/// legacy namespace of the same name (mailboxes written before #422).
+/// Soft failure — cleanup is an optimization; the durable child JSONL is
+/// the real archive.
 fn clean_mailbox(ns: &str) {
-    let mut list = Command::new("uteke");
-    list.args(["list", "--namespace", ns, "--json"])
+    // Deleting a room only unlinks its memories, so forget them first.
+    forget_listed(&["room", "recall", "--limit", "1000", "--json", "--", ns]);
+    let mut drop_room = Command::new("uteke");
+    drop_room
+        .args(["room", "delete", "--confirm", "--", ns])
         .stdin(Stdio::null());
+    let _ =
+        crate::subprocess::run_with_timeout(&mut drop_room, crate::subprocess::SUBPROCESS_TIMEOUT);
+    forget_listed(&["list", "--namespace", ns, "--limit", "1000", "--json"]);
+}
+
+/// `uteke forget --confirm <id>` for every memory a listing returns (flat
+/// `{"id"}` or nested `{"memory": {"id"}}` items).
+fn forget_listed(list_args: &[&str]) {
+    let mut list = Command::new("uteke");
+    list.args(list_args).stdin(Stdio::null());
     let Ok(out) =
         crate::subprocess::run_with_timeout(&mut list, crate::subprocess::SUBPROCESS_TIMEOUT)
     else {
@@ -426,18 +441,17 @@ fn clean_mailbox(ns: &str) {
     else {
         return;
     };
-    for id in items
-        .iter()
-        .filter_map(|m| m.get("id").and_then(Value::as_str))
-    {
+    for id in items.iter().filter_map(|m| {
+        m.get("memory")
+            .unwrap_or(m)
+            .get("id")
+            .and_then(Value::as_str)
+    }) {
         let mut cmd = Command::new("uteke");
-        cmd.args(["forget", id, "--namespace", ns]);
-        // forget asks for confirmation — answer it.
-        let _ = crate::subprocess::run_with_timeout_stdin(
-            &mut cmd,
-            crate::subprocess::SUBPROCESS_TIMEOUT,
-            b"y\n",
-        );
+        cmd.args(["forget", "--confirm", "--", id])
+            .stdin(Stdio::null());
+        let _ =
+            crate::subprocess::run_with_timeout(&mut cmd, crate::subprocess::SUBPROCESS_TIMEOUT);
     }
 }
 
@@ -840,7 +854,7 @@ impl Tool for AgentPollTool {
     }
 
     /// `Write`, not `ReadOnly` (issue #300): a settled poll CONSUMES the
-    /// mailbox — it forgets the uteke mailbox namespace and persists
+    /// mailbox — it forgets the uteke mailbox room and persists
     /// `mailbox_consumed` in meta.json. The tier must match the behavior
     /// (a ReadOnly tool must never mutate; unlike `job_poll`, whose
     /// write-back was removed for exactly that reason). Consume-once is
@@ -1008,9 +1022,9 @@ impl AgentPollTool {
     /// marked consumed and cleaned ONLY when the recall succeeded (hits or
     /// an explicit empty result); on a recall error the result is kept and
     /// the next poll retries (issue #287, regression of #260).
-    /// The namespace comes from `id` ([`mailbox_ns_for`]), never from the
+    /// The room comes from `id` ([`mailbox_ns_for`]), never from the
     /// child-writable `meta.mailbox_ns`. `clean` is injectable so tests
-    /// can observe which namespace would be forgotten.
+    /// can observe which room would be forgotten.
     fn consume_mailbox<F, C>(
         &self,
         dir: &std::path::Path,
@@ -1030,7 +1044,7 @@ impl AgentPollTool {
         let ns = mailbox_ns_for(id);
         let cfg = crate::memory::MemoryConfig {
             bin: "uteke".into(),
-            namespace: ns.clone(),
+            room: ns.clone(),
             limit: 3,
         };
         match recall(&cfg, &meta.prompt) {
@@ -1854,7 +1868,7 @@ mod tests {
             &mut meta,
             &mut out,
             |cfg, _| {
-                recalled.lock().unwrap().push(cfg.namespace.clone());
+                recalled.lock().unwrap().push(cfg.room.clone());
                 Ok(Vec::new())
             },
             |ns| cleaned.lock().unwrap().push(ns.to_string()),
