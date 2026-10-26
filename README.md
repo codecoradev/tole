@@ -124,7 +124,7 @@ trust: `internal` / `read_only`), `--skill <path>` (load a SKILL.md),
 | `TOLE_SYSTEM_PROMPT` | default persona when `--system` is absent |
 | `TOLE_MEMORY` | memory loop backend (`uteke`) — same as `--memory uteke` |
 | `TOLE_NO_UPDATE_CHECK` | `1` disables the startup update-check banner (issue #220) |
-| `TOLE_MEMORY_NAMESPACE` | override the loop's namespace (default: `repo-<directory name>`) |
+| `TOLE_MEMORY_NAMESPACE` | override the loop's uteke room (default: `repo-<directory name>`; the name predates rooms) |
 
 ## Provider doctor
 
@@ -343,8 +343,10 @@ neither trigger nor suppress it:
 - **When the session settles** with a final answer, a compact summary is
   stored back — the next session's recall can find it.
 
-The namespace follows the ecosystem `repo-<dir>` convention
-(`TOLE_MEMORY_NAMESPACE` overrides). The injected batch is hard-capped
+Memory lives in the uteke room `repo-<dir>` (uteke ≥ 0.21.1; rooms replace
+the deprecated namespaces; `TOLE_MEMORY_NAMESPACE` overrides the room). Memory
+stored by earlier tole versions in the namespace of the same name is still
+recalled while the room is empty. The injected batch is hard-capped
 at 24 items / 64 KiB (a larger `limit` is clamped; a hit is never cut
 mid-way) and deduplicated. A batch is all-or-nothing: an unparseable
 recall payload fails the whole batch with a stderr note rather than
