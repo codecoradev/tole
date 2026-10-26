@@ -5,9 +5,12 @@ use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
 use tole_cli::approver::{InteractiveApprover, StdioPrompt};
-use tole_cli::tool_roster::{self, binary_available, AgentTools, Roster};
+// The binary probe backs the uteke memory loop and the cora MCP preset.
+#[cfg(any(feature = "shell-tools", feature = "mcp"))]
+use tole_cli::tool_roster::binary_available;
+use tole_cli::tool_roster::{self, AgentTools, Roster};
 use tole_cli::trust::expand_trust;
-#[cfg(feature = "mcp")]
+#[cfg(all(feature = "mcp", feature = "shell-tools"))]
 use tole_core::approval::AllowlistApprover;
 
 #[cfg(feature = "shell-tools")]

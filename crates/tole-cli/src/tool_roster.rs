@@ -165,8 +165,8 @@ pub fn build(approver: impl Approver + 'static, roster: Roster) -> Result<ToolRe
     if let Some(t) = tole_core::systemone::SystemOneTool::from_env() {
         add(&mut reg, Box::new(t))?;
     }
-    // Child agents (#171): parent sessions only, never in plan mode.
-    #[cfg(feature = "shell-tools")]
+    // Child agents (#171): parent sessions only, never in plan mode. Not
+    // behind this crate's shell-tools gate: every CLI profile had them.
     if let (Some(agents), 0, false) = (&roster.agents, depth, plan) {
         let bin = std::env::current_exe().context("resolving the tole binary for child agents")?;
         let start = tole_core::agents::AgentStartTool::new(bin, root.clone())
