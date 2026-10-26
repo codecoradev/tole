@@ -1593,22 +1593,8 @@ fn run_command(
     if let Some(alias) = name {
         println!("name: {alias}");
     }
-    // Task-list tools (issue #198): fresh session → empty state; both
-    // tools join the registry (todo_write absent in plan mode via the
-    // retain_read_only filter above — registration here is additive).
-    let todo_state = tole_core::todo::TodoState::new();
-    registry
-        .register(Box::new(tole_core::todo::TodoReadTool::new(
-            std::sync::Arc::clone(&todo_state),
-        )))
-        .map_err(|e| anyhow::anyhow!("registering todo_read: {e}"))?;
-    if !host.plan_mode {
-        registry
-            .register(Box::new(tole_core::todo::TodoWriteTool::new(
-                std::sync::Arc::clone(&todo_state),
-            )))
-            .map_err(|e| anyhow::anyhow!("registering todo_write: {e}"))?;
-    }
+    // Task-list tools (issue #198): a fresh session starts with an empty list.
+    tool_roster::register_todo(&mut registry, storage.entries(), host.plan_mode)?;
 
     let specs = registry.specs();
     let mut provider =
@@ -1720,26 +1706,9 @@ fn resume_command(
 
     let mut registry = build_registry(build_approver(allow_patterns, yes), host, allow_patterns)?;
     // Task-list tools (issue #198): state hydrated from the replayed
-    // transcript so a resumed mission keeps its plan. Registered BEFORE
-    // the plan-mode filter — todo_write must be ABSENT on the wire under
-    // --plan-mode (the retain_read_only guarantee), not merely gated.
-    {
-        let todo_state = tole_core::todo::TodoState::new();
-        {
-            use tole_core::storage::Storage;
-            todo_state.hydrate(storage.entries());
-        }
-        registry
-            .register(Box::new(tole_core::todo::TodoReadTool::new(
-                std::sync::Arc::clone(&todo_state),
-            )))
-            .map_err(|e| anyhow::anyhow!("registering todo_read: {e}"))?;
-        registry
-            .register(Box::new(tole_core::todo::TodoWriteTool::new(
-                std::sync::Arc::clone(&todo_state),
-            )))
-            .map_err(|e| anyhow::anyhow!("registering todo_write: {e}"))?;
-    }
+    // transcript so a resumed session keeps its plan; todo_write is
+    // absent under --plan-mode.
+    tool_roster::register_todo(&mut registry, storage.entries(), host.plan_mode)?;
     // Plan mode (issue #109): the guarantee is ABSENCE on the wire, not
     // approval — filtered tools never appear in specs().
     if host.plan_mode {
@@ -1996,31 +1965,6 @@ fn latest_session_id(dir: &Path) -> Option<String> {
 /// `resume_turn` on the next line, keeping the conversation alive without
 /// losing durable context. Ctrl-C / EOF exit cleanly — every commit is
 /// already durable, `tole chat --resume <id>` picks the thread back up.
-/// Register `todo_read`/`todo_write` with state hydrated from `entries`
-/// (issue #276). `todo_write` is skipped in plan mode so it stays absent
-/// on the wire, matching the `retain_read_only` guarantee.
-fn register_todo_tools(
-    registry: &mut ToolRegistry,
-    entries: &[tole_core::entry::Entry],
-    plan_mode: bool,
-) -> Result<()> {
-    let todo_state = tole_core::todo::TodoState::new();
-    todo_state.hydrate(entries);
-    registry
-        .register(Box::new(tole_core::todo::TodoReadTool::new(
-            std::sync::Arc::clone(&todo_state),
-        )))
-        .map_err(|e| anyhow::anyhow!("registering todo_read: {e}"))?;
-    if !plan_mode {
-        registry
-            .register(Box::new(tole_core::todo::TodoWriteTool::new(
-                std::sync::Arc::clone(&todo_state),
-            )))
-            .map_err(|e| anyhow::anyhow!("registering todo_write: {e}"))?;
-    }
-    Ok(())
-}
-
 fn chat_command(
     sessions_dir: &Path,
     system: Option<&str>,
@@ -2108,7 +2052,7 @@ fn chat_command(
     // the replayed transcript so a resumed chat keeps its plan.
     {
         use tole_core::storage::Storage;
-        register_todo_tools(&mut registry, storage.entries(), host.plan_mode)?;
+        tool_roster::register_todo(&mut registry, storage.entries(), host.plan_mode)?;
     }
     println!(
         "tole chat — session {session_id} (Ctrl-D exits, resume: tole chat --resume {session_id})"
@@ -3064,11 +3008,11 @@ mod chat_todo_tests {
     fn chat_registers_todo_tools_and_respects_plan_mode() {
         let mut reg =
             ToolRegistry::with_approver(tole_core::approval::AllowlistApprover::allow_only(vec![]));
-        register_todo_tools(&mut reg, &[], false).unwrap();
+        tool_roster::register_todo(&mut reg, &[], false).unwrap();
         assert!(reg.get("todo_read").is_some());
         assert!(reg.get("todo_write").is_some());
         let mut plan = ToolRegistry::new();
-        register_todo_tools(&mut plan, &[], true).unwrap();
+        tool_roster::register_todo(&mut plan, &[], true).unwrap();
         assert!(plan.get("todo_read").is_some());
         assert!(plan.get("todo_write").is_none());
     }

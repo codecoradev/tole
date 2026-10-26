@@ -256,20 +256,8 @@ pub fn run_mission(
         }
     };
     // Task-list tools (#198): hydrated from the transcript on resume.
-    {
-        let todo_state = tole_core::todo::TodoState::new();
-        todo_state.hydrate(storage.entries());
-        registry
-            .register(Box::new(tole_core::todo::TodoReadTool::new(
-                std::sync::Arc::clone(&todo_state),
-            )))
-            .map_err(|e| anyhow::anyhow!("registering todo_read: {e}"))?;
-        registry
-            .register(Box::new(tole_core::todo::TodoWriteTool::new(
-                std::sync::Arc::clone(&todo_state),
-            )))
-            .map_err(|e| anyhow::anyhow!("registering todo_write: {e}"))?;
-    }
+    // Missions refuse --plan-mode, so todo_write is always present.
+    tole_cli::tool_roster::register_todo(&mut registry, storage.entries(), false)?;
 
     let specs = registry.specs();
     let system_prompt = storage.system_prompt().map(str::to_owned);

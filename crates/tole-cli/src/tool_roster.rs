@@ -256,6 +256,28 @@ pub fn build(approver: impl Approver + 'static, roster: Roster) -> Result<ToolRe
     Ok(reg)
 }
 
+/// Register `todo_read` / `todo_write` (#198) with state hydrated from the
+/// transcript, so a resumed session restores its last list (#276).
+/// `todo_write` is absent in plan mode, like every other Write tool.
+pub fn register_todo(
+    reg: &mut ToolRegistry,
+    entries: &[tole_core::entry::Entry],
+    plan_mode: bool,
+) -> Result<()> {
+    let state = tole_core::todo::TodoState::new();
+    state.hydrate(entries);
+    add(
+        reg,
+        Box::new(tole_core::todo::TodoReadTool::new(std::sync::Arc::clone(
+            &state,
+        ))),
+    )?;
+    if !plan_mode {
+        add(reg, Box::new(tole_core::todo::TodoWriteTool::new(state)))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
