@@ -681,6 +681,14 @@ pub fn run_cli(
         println!("blocked at {}: {}", b.tier.as_str(), b.message);
         println!("fix: {}", b.fix);
     }
+    // Sibling binaries (#422): reported, never blocking — both optional.
+    println!("ecosystem:");
+    for sib in crate::ecosystem::SIBLINGS {
+        println!(
+            "{}",
+            crate::ecosystem::line(sib, &crate::ecosystem::probe(sib))
+        );
+    }
     // Only a configured provider has a ledger identity.
     if let (Some(cfg), false) = (cfg, no_ledger) {
         let saved = ledger_path().and_then(|p| {
