@@ -55,26 +55,8 @@ pub struct UsageReport {
     pub history_growth_per_step: Option<f64>,
 }
 
-/// True when the ledger row carries a provider-reported usage object, i.e.
-/// it is NOT a row holding only tole's own namespaced keys (`tole_wire`,
-/// stored when a provider reports request sizes but no usage, #211;
-/// `tole_route`, the failover route, #209). The single definition of
-/// "provider step" for the mission step budget, `fact/mission.steps` and
-/// the report, so such rows never change step accounting.
-pub fn reports_provider_usage(rec: &UsageRecord) -> bool {
-    match rec.usage.as_object() {
-        // Only tole's own namespaced keys (`tole_wire`, `tole_route`, ...):
-        // the provider reported nothing for this step.
-        // An empty object still counts (the pre-#211 contract).
-        Some(o) => o.is_empty() || o.keys().any(|k| !k.starts_with("tole_")),
-        None => true,
-    }
-}
-
-/// Number of provider steps in a ledger (see `reports_provider_usage`).
-pub fn provider_steps(usages: &[UsageRecord]) -> u64 {
-    usages.iter().filter(|u| reports_provider_usage(u)).count() as u64
-}
+// The provider-step rule lives with the code that writes the usage rows.
+pub use tole_core::transcript::{provider_steps, reports_provider_usage};
 
 fn u64_at(v: &Value, path: &[&str]) -> Option<u64> {
     let mut cur = v;
@@ -98,7 +80,7 @@ fn cached_of(u: &Value) -> Option<u64> {
 }
 
 fn wire_of(u: &Value) -> Option<WirePoint> {
-    let w = u.get("tole_wire")?;
+    let w = u.get(tole_core::transcript::WIRE_KEY)?;
     let system_chars = w.get("system_chars")?.as_u64()?;
     let tools_chars = w.get("tools_chars")?.as_u64()?;
     let history_chars = w.get("history_chars")?.as_u64()?;
@@ -209,26 +191,12 @@ fn add(acc: &mut Option<u64>, x: Option<u64>) {
     }
 }
 
-/// A turn opens at a user message, except the stop-gate's own feedback
-/// and an owner's soft interrupt (#377): the turn continues after them.
-fn opens_turn(e: &Entry) -> bool {
-    e.kind.as_str() == "message"
-        && e.payload["role"] == json!("user")
-        && e.payload["stop_gate_feedback"] != json!(true)
-        && e.payload["interrupt"] != json!(true)
-}
-
 /// Fold the usage ledger into per-user-turn stats. A usage row belongs to
 /// the turn that was open at the entry it is attached to. Never panics;
 /// rows attached to unknown entries (or before the first user message) are
 /// ignored rather than guessed into a turn.
 pub fn turn_stats(entries: &[Entry], usages: &[UsageRecord]) -> Vec<TurnStats> {
-    let starts: Vec<usize> = entries
-        .iter()
-        .enumerate()
-        .filter(|(_, e)| opens_turn(e))
-        .map(|(i, _)| i)
-        .collect();
+    let starts = tole_core::transcript::turn_starts(entries);
     let mut out: Vec<TurnStats> = starts
         .iter()
         .enumerate()

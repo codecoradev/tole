@@ -129,3 +129,43 @@ fn session_with_tole_wire_shows_split_cache_rate_and_growth() {
     assert!(out.contains("history growth: +40.0 chars/step"), "{out}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The turn loop's own stop-gate feedback and an injected interrupt are
+/// user-role messages that do NOT open a turn; `tole status` and
+/// `tole sessions` used to count the feedback as a turn.
+#[test]
+fn status_and_sessions_count_turns_by_the_transcript_rule() {
+    use tole_core::entry::{EntryType, NewEntry};
+    use tole_core::storage::{Commit, Storage};
+    use tole_core::transcript::{INTERRUPT, STOP_GATE_FEEDBACK};
+
+    let dir = tmp("turns");
+    fixture(&dir, "turns", false, json!({"prompt_tokens": 1}));
+    let mut s = JsonlStorage::open(dir.join("turns.jsonl")).unwrap();
+    for flag in [STOP_GATE_FEEDBACK, INTERRUPT] {
+        s.commit(Commit::new().entry(NewEntry::root(
+            EntryType::new(EntryType::MESSAGE),
+            json!({"role": "user", "text": "marker", flag: true}),
+        )))
+        .unwrap();
+    }
+    drop(s);
+
+    let out = status(&dir, "turns");
+    assert!(out.contains("turns:   2 (user messages)"), "{out}");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_tole"))
+        .args(["sessions", "-s", dir.to_str().unwrap()])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run tole sessions");
+    assert!(out.status.success());
+    let out = String::from_utf8_lossy(&out.stdout);
+    let row = out
+        .lines()
+        .find(|l| l.starts_with("turns "))
+        .unwrap_or_else(|| panic!("no session row: {out}"));
+    let cols: Vec<&str> = row.split_whitespace().collect();
+    assert_eq!(cols[4], "2", "turns column: {out}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

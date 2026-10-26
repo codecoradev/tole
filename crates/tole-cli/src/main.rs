@@ -2191,14 +2191,7 @@ fn status_command(sessions_dir: &Path, id: &str) -> Result<()> {
     println!("seq:     {}", storage.state().seq);
     // B3: orientation fields — turns (user messages), usage totals, and
     // whether a system prompt is pinned.
-    let turns: usize = storage
-        .entries()
-        .iter()
-        .filter(|e| {
-            e.payload.get("role") == Some(&serde_json::json!("user"))
-                && e.payload.get("interrupt") != Some(&serde_json::json!(true))
-        })
-        .count();
+    let turns = tole_core::transcript::turn_count(storage.entries());
     println!("turns:   {turns} (user messages)");
     println!(
         "system:  {}",
@@ -2276,14 +2269,7 @@ fn sessions_command(sessions_dir: &Path) -> Result<()> {
             Ok(s) => s,
             Err(_) => continue, // unreadable/corrupt: skip, don't fail the listing
         };
-        let turns: usize = s
-            .entries()
-            .iter()
-            .filter(|e| {
-                e.payload.get("role") == Some(&serde_json::json!("user"))
-                    && e.payload.get("interrupt") != Some(&serde_json::json!(true))
-            })
-            .count();
+        let turns = tole_core::transcript::turn_count(s.entries());
         rows.push((
             mtime,
             id,

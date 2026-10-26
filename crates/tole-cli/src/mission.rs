@@ -185,27 +185,12 @@ fn run_verify(cmd: &str, timeout: std::time::Duration) -> Result<(), String> {
 fn steps_used(storage: &JsonlStorage) -> u64 {
     // Wire-only rows (#211: request sizes without provider usage) are not
     // provider steps — budget semantics are exactly as before.
-    tole_cli::usage_report::provider_steps(storage.usages())
+    tole_core::transcript::provider_steps(storage.usages())
 }
 
 /// Tokens (prompt + completion) recorded in the durable ledger.
 fn tokens_used(storage: &JsonlStorage) -> u64 {
-    storage
-        .usages()
-        .iter()
-        .map(|u| {
-            u.usage
-                .get("prompt_tokens")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0)
-                .saturating_add(
-                    u.usage
-                        .get("completion_tokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0),
-                )
-        })
-        .sum()
+    tole_core::transcript::tokens_in_out(storage.usages())
 }
 
 /// The mission's provider: tool specs plus the system prompt pinned in
