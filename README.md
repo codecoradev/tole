@@ -40,6 +40,9 @@ tole is the agent harness of the CodeCora ecosystem — the hands:
   memory. `uteke_recall` (recall) and `uteke_document` (markdown → durable
   knowledge) register automatically when the `uteke` binary is on PATH, and
   the optional [memory loop](#memory-loop) closes the circle.
+- **Supported versions:** cora ≥ 0.19.0 and uteke ≥ 0.21.1 (both optional).
+  `tole doctor` reports each one as supported, too old (with the upgrade
+  command) or not installed.
 - Anything else that speaks **MCP over stdio** joins the same registry via
   repeatable `--mcp-server name=command [args...]` flags.
 - **tole as an MCP server**: `tole mcp` serves the registry's hardened tools
@@ -137,6 +140,10 @@ Tiers are cumulative and stop at the first blocker, which is printed with
 the command that fixes it. The exit code is non-zero when the requested
 tier is not reached, so `tole doctor --tier full` is the gate for "ready to
 release" claims. API keys and URL credentials never appear in the output.
+
+After the provider tiers, an `ecosystem:` section reports the sibling
+binaries against the supported floor (cora ≥ 0.19.0, uteke ≥ 0.21.1). It is
+informational: an old or missing sibling never fails the run.
 
 Every run is recorded in a coverage ledger (`$CODECORA_HOME/tole/doctor-ledger.json`,
 owner-readable only: level reached, first blocker, fix, timestamp per provider
