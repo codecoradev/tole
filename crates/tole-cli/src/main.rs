@@ -1104,38 +1104,22 @@ impl HostConfig {
 
 #[cfg(feature = "shell-tools")]
 impl HostConfig {
-    /// Pre-turn recall injection (memory loop): the returned prompt is
-    /// what the provider sees and what the durable log records. Any
-    /// failure degrades to the bare prompt — memory is an enhancement,
-    /// never a dependency.
+    /// Pre-turn recall injection (memory loop), see
+    /// [`tole_cli::turn_runner::with_recalled_memory`].
     fn inject_memory(&self, prompt: &str) -> String {
-        let Some(mem) = self.memory.as_ref() else {
-            return prompt.to_string();
-        };
-        match tole_core::memory::recall_block(mem, prompt) {
-            Ok(block) if !block.is_empty() => {
-                eprintln!("tole: memory: recalled context injected ({})", mem.room);
-                format!("{prompt}{block}")
-            }
-            Ok(_) => prompt.to_string(),
-            Err(e) => {
-                eprintln!("tole: memory recall failed (continuing without): {e}");
-                prompt.to_string()
-            }
-        }
+        tole_cli::turn_runner::with_recalled_memory(self.memory.as_ref(), prompt)
     }
 
-    /// Post-session summary (memory loop): best-effort, stderr on
-    /// failure, the session itself is never affected.
+    /// Post-session summary (memory loop), see
+    /// [`tole_cli::turn_runner::remember`].
     fn remember(&self, session_id: &str, first_prompt: &str, last_answer: &str, wrote: bool) {
-        let Some(mem) = self.memory.as_ref() else {
-            return;
-        };
-        match tole_core::memory::remember_session(mem, session_id, first_prompt, last_answer, wrote)
-        {
-            Ok(_) => eprintln!("tole: memory: session summary stored in room {}", mem.room),
-            Err(e) => eprintln!("tole: memory remember failed (session unaffected): {e}"),
-        }
+        tole_cli::turn_runner::remember(
+            self.memory.as_ref(),
+            session_id,
+            first_prompt,
+            last_answer,
+            wrote,
+        );
     }
 }
 
