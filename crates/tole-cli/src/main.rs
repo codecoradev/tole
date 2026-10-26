@@ -5,9 +5,12 @@ use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
 use tole_cli::approver::{InteractiveApprover, StdioPrompt};
-use tole_cli::tools::WriteFileTool;
+// The binary probe backs the uteke memory loop and the cora MCP preset.
+#[cfg(any(feature = "shell-tools", feature = "mcp"))]
+use tole_cli::tool_roster::binary_available;
+use tole_cli::tool_roster::{self, AgentTools, Roster};
 use tole_cli::trust::expand_trust;
-#[cfg(feature = "mcp")]
+#[cfg(all(feature = "mcp", feature = "shell-tools"))]
 use tole_core::approval::AllowlistApprover;
 
 #[cfg(feature = "shell-tools")]
@@ -19,24 +22,9 @@ mod mission;
 #[cfg(feature = "shell-tools")]
 mod serve;
 mod upgrade;
-#[cfg(feature = "shell-tools")]
-use tole_core::cora_search::CoraSearchTool;
-use tole_core::file_tools::{DeleteFileTool, EditFileTool};
-#[cfg(feature = "shell-tools")]
-use tole_core::gh::GhTool;
-#[cfg(feature = "shell-tools")]
-use tole_core::git::GitTool;
-#[cfg(feature = "shell-tools")]
-use tole_core::jobs::{JobPollTool, JobStartTool};
-use tole_core::read_file::ReadFileTool;
-#[cfg(feature = "shell-tools")]
-use tole_core::run_command::RunCommandTool;
 use tole_core::storage::{JsonlStorage, Storage};
 use tole_core::tool::ToolRegistry;
 use tole_core::turn::{resume_turn, run_turn, run_turn_with_cancel, TurnOutcome, LOOP_TRIP_AFTER};
-#[cfg(feature = "shell-tools")]
-use tole_core::uteke::{UtekeDocumentTool, UtekeRecallTool};
-use tole_core::verify_package::VerifyPackageTool;
 
 /// Session id → path (`<dir>/<id>.jsonl`).
 fn session_path(dir: &Path, id: &str) -> PathBuf {
@@ -906,28 +894,8 @@ fn dispatch(cli: Cli) -> Result<()> {
             let sessions_dir = sessions_dir.clone();
             std::fs::create_dir_all(&sessions_dir)
                 .with_context(|| format!("creating {}", sessions_dir.display()))?;
-            #[cfg(feature = "mcp")]
-            let mcp_cfgs: Vec<tole_core::mcp::McpServerConfig> = host
-                .mcp_server
-                .iter()
-                .map(|s| tole_core::mcp::McpServerConfig::parse(s))
-                .collect::<Result<Vec<_>, String>>()
-                .map_err(anyhow::Error::msg)?;
-            #[cfg(feature = "mcp")]
-            let registry = build_registry(
-                build_approver(&allow_patterns, yes),
-                host.workspace.as_ref(),
-                &mcp_cfgs,
-                host.agents_worktree,
-                &allow_patterns,
-            )?;
-            #[cfg(not(feature = "mcp"))]
-            let registry = build_registry(
-                build_approver(&allow_patterns, yes),
-                host.workspace.as_ref(),
-                host.agents_worktree,
-                &allow_patterns,
-            )?;
+            let registry =
+                build_registry(build_approver(&allow_patterns, yes), &host, &allow_patterns)?;
             mission::run_mission(
                 mission::MissionConfig {
                     goal,
@@ -1248,43 +1216,6 @@ fn merge_mcp_specs(explicit: &[String], no_auto_mcp: bool, auto: Vec<String>) ->
     specs
 }
 
-/// B4 startup probing: a binary exists on PATH (or is an executable
-/// absolute path). Used to skip CLI-backed tools whose engine is not
-/// installed, instead of registering phantom tools that fail on every
-/// call.
-#[cfg_attr(not(feature = "shell-tools"), allow(dead_code))] // probes only run with shell-tools (#330)
-fn binary_available(name: &str) -> bool {
-    fn executable(p: &Path) -> bool {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            // is_file() alone accepts non-executable files; a probe that
-            // says "available" for an unrunnable binary is a phantom tool
-            // by another name (CodeCora scan 2026-09-18).
-            std::fs::metadata(p)
-                .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-                .unwrap_or(false)
-        }
-        #[cfg(not(unix))]
-        {
-            // Windows: PATH lookups append extensions (".exe"); probe the
-            // obvious one rather than declaring a runnable binary absent.
-            p.is_file() || p.with_extension("exe").is_file()
-        }
-    }
-    if name.contains('/') {
-        return executable(Path::new(name));
-    }
-    if let Ok(path) = std::env::var("PATH") {
-        for dir in std::env::split_paths(&path) {
-            if executable(&dir.join(name)) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
 /// Resolve the file-tools jail root: `--workspace <dir>` when given,
 /// otherwise the process cwd (issue #57). The directory must exist — a
 /// typo silently widening the jail to cwd would be worse than failing.
@@ -1303,22 +1234,6 @@ pub fn resolve_workspace_root(explicit: Option<&String>) -> Result<PathBuf> {
         }
         None => std::env::current_dir().context("resolving cwd"),
     }
-}
-
-/// Ask the checkout itself which GitHub repo it belongs to ( Falls back
-/// to None → callers keep the tole default).
-#[cfg(feature = "shell-tools")]
-fn detect_github_repo(cwd: &Path) -> Option<String> {
-    use std::process::Command;
-    let mut cmd = Command::new("git");
-    cmd.args(["config", "--get", "remote.origin.url"])
-        .current_dir(cwd);
-    let out = tole_core::subprocess::run_with_timeout(&mut cmd, std::time::Duration::from_secs(5))
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    tole_cli::session_host::github_repo_from_remote_url(&String::from_utf8_lossy(&out.stdout))
 }
 
 /// Flag-over-env trust list (the pre-config rule, #159), kept as a thin
@@ -1434,202 +1349,32 @@ fn check_server_face_flags(
     })
 }
 
-/// Register the `gh` tool against the checkout's own GitHub repo.
-/// Probe-gated (issues #254, #293): when detection fails there is NO
-/// gh tool — a hardcoded fallback repo invited wrong-repo writes from
-/// any unrelated workspace.
-#[cfg(feature = "shell-tools")]
-fn register_gh(reg: &mut ToolRegistry, cwd: &Path) -> Result<()> {
-    match detect_github_repo(cwd) {
-        Some(repo) => reg
-            .register(Box::new(GhTool::new(repo)))
-            .map_err(|e| anyhow::anyhow!("registering gh: {e}")),
-        None => {
-            eprintln!("tole: no GitHub origin remote detected — gh tool not registered");
-            Ok(())
-        }
-    }
-}
-
+/// The CLI faces' registry: the shared tool roster behind the
+/// interactive approver.
 fn build_registry(
     approver: InteractiveApprover<StdioPrompt>,
-    workspace: Option<&String>,
-    #[cfg(feature = "mcp")] mcp_servers: &[tole_core::mcp::McpServerConfig],
-    agents_worktree: bool,
-    parent_allows: &[String],
+    host: &HostConfig,
+    allow_patterns: &[String],
 ) -> Result<ToolRegistry> {
-    // Child-agent depth (#171): spawned children carry TOLE_AGENT_DEPTH=1;
-    // at depth >= 1 the agent tools vanish (structural cap) and the
-    // spawn-yourself bypass closes in run_command/job_start.
-    let agent_depth: u32 = std::env::var("TOLE_AGENT_DEPTH")
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(0);
-    let mut reg = ToolRegistry::with_approver(approver);
-    // Only the shell-tools registrations read cwd (#330).
-    #[cfg_attr(not(feature = "shell-tools"), allow(unused_variables))]
-    let cwd = std::env::current_dir().context("resolving cwd")?;
-    let file_root = resolve_workspace_root(workspace)?;
-    // Child agents (#380): present only when spawned by `agent_start`.
-    let tracking = tole_cli::sibling::tracking_from_env(&tole_cli::config_apply::real_env);
-    // Role children (#383) get the handoff tool; everyone else does not.
-    if let Some(tool) = tole_cli::handoff::tool_from_env(&tole_cli::config_apply::real_env) {
-        reg.register(Box::new(tool))
-            .map_err(|e| anyhow::anyhow!("registering handoff_submit: {e}"))?;
-    }
-    // Uteke first-class (B4): recall (read) + document (write), behind
-    // startup probing — a missing uteke binary degrades to a warning,
-    // not phantom tools.
-    #[cfg(feature = "shell-tools")]
-    if binary_available("uteke") {
-        reg.register(Box::new(UtekeRecallTool::new()))
-            .map_err(|e| anyhow::anyhow!("registering uteke_recall: {e}"))?;
-        reg.register(Box::new(UtekeDocumentTool::new(None)))
-            .map_err(|e| anyhow::anyhow!("registering uteke_document: {e}"))?;
-    } else {
-        eprintln!("tole: uteke binary not found — uteke_recall/uteke_document disabled");
-    }
-    // Generic dynamic command (B4): argv-split, cwd-jailed, Risk::Write.
-    #[cfg(feature = "shell-tools")]
-    {
-        let run_cmd = RunCommandTool::new(cwd.clone());
-        let run_cmd = if std::env::var("TOLE_AGENT_DEPTH")
-            .ok()
-            .and_then(|v| v.trim().parse::<u32>().ok())
-            .unwrap_or(0)
-            >= 1
-        {
-            run_cmd.in_child_agent_mode()
-        } else {
-            run_cmd
-        };
-        reg.register(Box::new(run_cmd))
-            .map_err(|e| anyhow::anyhow!("registering run_command: {e}"))?;
-    }
-    // Long-running jobs (#59): detached spawn + poll, logs inside the
-    // file-tools workspace so read_file can reach the full log.
-    #[cfg(feature = "shell-tools")]
-    {
-        let job_start = JobStartTool::new(file_root.clone());
-        let job_start = if std::env::var("TOLE_AGENT_DEPTH")
-            .ok()
-            .and_then(|v| v.trim().parse::<u32>().ok())
-            .unwrap_or(0)
-            >= 1
-        {
-            job_start.in_child_agent_mode()
-        } else {
-            job_start
-        };
-        reg.register(Box::new(job_start))
-            .map_err(|e| anyhow::anyhow!("registering job_start: {e}"))?;
-    }
-    #[cfg(feature = "shell-tools")]
-    reg.register(Box::new(JobPollTool::new(file_root.clone())))
-        .map_err(|e| anyhow::anyhow!("registering job_poll: {e}"))?;
-    reg.register(Box::new(VerifyPackageTool::new()))
-        .map_err(|e| anyhow::anyhow!("registering verify_package: {e}"))?;
-    // systemone_decide (#172): probe-gated — present iff SYSTEMONE_API_KEY
-    // is set; absent key = silently off (owner decision 2026-10-05).
-    if let Some(t) = tole_core::systemone::SystemOneTool::from_env() {
-        reg.register(Box::new(t))
-            .map_err(|e| anyhow::anyhow!("registering systemone_decide: {e}"))?;
-    }
-    // Child agents (#171): parent-only. Depth >= 1 = this IS a child —
-    // no agent tools at all (the structural depth cap).
-    if agent_depth == 0 {
-        let bin = std::env::current_exe().context("resolving the tole binary for child agents")?;
-        let start = tole_core::agents::AgentStartTool::new(bin, file_root.clone())
-            .with_worktrees(agents_worktree)
-            .with_parent_allows(parent_allows.to_vec());
-        reg.register(Box::new(start))
-            .map_err(|e| anyhow::anyhow!("registering agent_start: {e}"))?;
-        reg.register(Box::new(tole_core::agents::AgentPollTool::new(
-            file_root.clone(),
-        )))
-        .map_err(|e| anyhow::anyhow!("registering agent_poll: {e}"))?;
-    }
-    reg.register(tole_cli::sibling::track(
-        Box::new(ReadFileTool::new(file_root.clone())),
-        tracking.as_ref(),
-        &file_root,
-    ))
-    .map_err(|e| anyhow::anyhow!("registering read_file: {e}"))?;
-    // Web tools (issue #215): probe-first — fetch always; search only
-    // with TOLE_WEB_SEARCH_URL.
-    reg.register(Box::new(tole_core::web::WebFetchTool))
-        .map_err(|e| anyhow::anyhow!("registering web_fetch: {e}"))?;
-    if let Some(search) = tole_core::web::WebSearchTool::from_env() {
-        reg.register(Box::new(search))
-            .map_err(|e| anyhow::anyhow!("registering web_search: {e}"))?;
-    }
-    // Write tools: gated per call. The jail root is the workspace.
-    reg.register(tole_cli::sibling::track(
-        Box::new(WriteFileTool::new(file_root.clone())),
-        tracking.as_ref(),
-        &file_root,
-    ))
-    .map_err(|e| anyhow::anyhow!("registering write_file: {e}"))?;
-    reg.register(tole_cli::sibling::track(
-        Box::new(EditFileTool::new(file_root.clone())),
-        tracking.as_ref(),
-        &file_root,
-    ))
-    .map_err(|e| anyhow::anyhow!("registering edit_file: {e}"))?;
-    #[cfg(feature = "shell-tools")]
-    {
-        register_gh(&mut reg, &cwd)?;
-        tole_cli::session_host::register_gitea(&mut reg, &cwd);
-    }
-    // Light git: status/diff/add/commit (push stays human).
-    #[cfg(feature = "shell-tools")]
-    reg.register(Box::new(GitTool::new().in_dir(cwd.clone())))
-        .map_err(|e| anyhow::anyhow!("registering git: {e}"))?;
-    // Destructive tools: interactive-approver-only registration; every
-    // call prompts — allowlists and --yes never apply (PRD risk table).
-    reg.register(tole_cli::sibling::track(
-        Box::new(DeleteFileTool::new(file_root.clone())),
-        tracking.as_ref(),
-        &file_root,
-    ))
-    .map_err(|e| anyhow::anyhow!("registering delete_file: {e}"))?;
-    // MCP servers (#74): registered last so a slow server never blocks
-    // native tool availability; per-call approval applies as usual.
+    let mut roster = Roster::new(resolve_workspace_root(host.workspace.as_ref())?);
+    // CLI faces run shell tools in the process cwd; files stay jailed to
+    // the workspace.
+    roster.shell_dir = std::env::current_dir().context("resolving cwd")?;
+    roster.plan_mode = host.plan_mode;
+    roster.agents = Some(AgentTools {
+        worktrees: host.agents_worktree,
+        parent_allows: allow_patterns.to_vec(),
+    });
     #[cfg(feature = "mcp")]
-    let mut cora_mcp_tools = 0usize;
-    #[cfg(feature = "mcp")]
-    for cfg in mcp_servers {
-        let names = tole_core::mcp::register_server_tools(&mut reg, cfg);
-        #[cfg(feature = "mcp")]
-        if cfg.name == "cora" {
-            cora_mcp_tools = names.len();
-        }
-        if names.is_empty() {
-            eprintln!("tole: mcp[{}]: no tools registered", cfg.name);
-        }
-    }
-    // Native cora_search (E4): single-tool fallback, registered only when
-    // the cora MCP surface did NOT materialize — decision is based on the
-    // REGISTRATION OUTCOME, not config presence: a cora binary whose MCP
-    // server fails (handshake, old version) must degrade to the native
-    // tool instead of silently losing all code-intel (CodeCora finding).
-    // The full MCP toolset supersedes the fallback when it registered.
-    #[cfg(feature = "shell-tools")]
     {
-        #[cfg(feature = "mcp")]
-        let cora_mcp_ok = cora_mcp_tools > 0;
-        #[cfg(not(feature = "mcp"))]
-        let cora_mcp_ok = false;
-        if !cora_mcp_ok {
-            if binary_available("cora") {
-                reg.register(Box::new(CoraSearchTool::new()))
-                    .map_err(|e| anyhow::anyhow!("registering cora_search: {e}"))?;
-            } else {
-                eprintln!("tole: cora binary not found — cora_search disabled");
-            }
-        }
+        roster.mcp_servers = host
+            .mcp_server
+            .iter()
+            .map(|s| tole_core::mcp::McpServerConfig::parse(s))
+            .collect::<Result<Vec<_>, String>>()
+            .map_err(anyhow::Error::msg)?;
     }
-    Ok(reg)
+    tool_roster::build(approver, roster)
 }
 
 /// Server-mode registry: the same hardened tools as `build_registry`,
@@ -1641,105 +1386,18 @@ fn build_registry(
 fn build_server_registry(
     workspace: Option<&String>,
     allow_patterns: &[String],
+    plan_mode: bool,
 ) -> Result<ToolRegistry> {
-    let mut reg =
-        ToolRegistry::with_approver(AllowlistApprover::allow_only(allow_patterns.to_vec()));
-    let cwd = std::env::current_dir().context("resolving cwd")?;
-    let file_root = resolve_workspace_root(workspace)?;
-    // Child agents (#380): present only when spawned by `agent_start`.
-    let tracking = tole_cli::sibling::tracking_from_env(&tole_cli::config_apply::real_env);
-    // Role children (#383) get the handoff tool; everyone else does not.
-    if let Some(tool) = tole_cli::handoff::tool_from_env(&tole_cli::config_apply::real_env) {
-        reg.register(Box::new(tool))
-            .map_err(|e| anyhow::anyhow!("registering handoff_submit: {e}"))?;
-    }
-    let count = |reg: &ToolRegistry| reg.specs().len();
-
-    #[cfg(feature = "shell-tools")]
-    {
-        if binary_available("cora") {
-            reg.register(Box::new(CoraSearchTool::new()))
-                .map_err(|e| anyhow::anyhow!("registering cora_search: {e}"))?;
-        }
-        if binary_available("uteke") {
-            reg.register(Box::new(UtekeRecallTool::new()))
-                .map_err(|e| anyhow::anyhow!("registering uteke_recall: {e}"))?;
-            reg.register(Box::new(UtekeDocumentTool::new(None)))
-                .map_err(|e| anyhow::anyhow!("registering uteke_document: {e}"))?;
-        }
-        let run_cmd = RunCommandTool::new(cwd.clone());
-        let run_cmd = if std::env::var("TOLE_AGENT_DEPTH")
-            .ok()
-            .and_then(|v| v.trim().parse::<u32>().ok())
-            .unwrap_or(0)
-            >= 1
-        {
-            run_cmd.in_child_agent_mode()
-        } else {
-            run_cmd
-        };
-        reg.register(Box::new(run_cmd))
-            .map_err(|e| anyhow::anyhow!("registering run_command: {e}"))?;
-        let job_start = JobStartTool::new(file_root.clone());
-        let job_start = if std::env::var("TOLE_AGENT_DEPTH")
-            .ok()
-            .and_then(|v| v.trim().parse::<u32>().ok())
-            .unwrap_or(0)
-            >= 1
-        {
-            job_start.in_child_agent_mode()
-        } else {
-            job_start
-        };
-        reg.register(Box::new(job_start))
-            .map_err(|e| anyhow::anyhow!("registering job_start: {e}"))?;
-        reg.register(Box::new(JobPollTool::new(file_root.clone())))
-            .map_err(|e| anyhow::anyhow!("registering job_poll: {e}"))?;
-    }
-    reg.register(Box::new(VerifyPackageTool::new()))
-        .map_err(|e| anyhow::anyhow!("registering verify_package: {e}"))?;
-    // systemone_decide (#172): probe-gated — present iff SYSTEMONE_API_KEY
-    // is set; absent key = silently off (owner decision 2026-10-05).
-    if let Some(t) = tole_core::systemone::SystemOneTool::from_env() {
-        reg.register(Box::new(t))
-            .map_err(|e| anyhow::anyhow!("registering systemone_decide: {e}"))?;
-    }
-    reg.register(tole_cli::sibling::track(
-        Box::new(ReadFileTool::new(file_root.clone())),
-        tracking.as_ref(),
-        &file_root,
-    ))
-    .map_err(|e| anyhow::anyhow!("registering read_file: {e}"))?;
-    // Web tools (issue #215): probe-first — fetch always; search only
-    // with TOLE_WEB_SEARCH_URL.
-    reg.register(Box::new(tole_core::web::WebFetchTool))
-        .map_err(|e| anyhow::anyhow!("registering web_fetch: {e}"))?;
-    if let Some(search) = tole_core::web::WebSearchTool::from_env() {
-        reg.register(Box::new(search))
-            .map_err(|e| anyhow::anyhow!("registering web_search: {e}"))?;
-    }
-    reg.register(tole_cli::sibling::track(
-        Box::new(WriteFileTool::new(file_root.clone())),
-        tracking.as_ref(),
-        &file_root,
-    ))
-    .map_err(|e| anyhow::anyhow!("registering write_file: {e}"))?;
-    reg.register(tole_cli::sibling::track(
-        Box::new(EditFileTool::new(file_root.clone())),
-        tracking.as_ref(),
-        &file_root,
-    ))
-    .map_err(|e| anyhow::anyhow!("registering edit_file: {e}"))?;
-    #[cfg(feature = "shell-tools")]
-    {
-        register_gh(&mut reg, &cwd)?;
-        tole_cli::session_host::register_gitea(&mut reg, &cwd);
-        reg.register(Box::new(GitTool::new().in_dir(cwd.clone())))
-            .map_err(|e| anyhow::anyhow!("registering git: {e}"))?;
-    }
-    // delete_file (Destructive) is deliberately NOT registered: behind a
-    // non-interactive approver the registry refuses it structurally.
-    eprintln!("tole mcp: {} tool(s) registered", count(&reg));
+    let mut roster = Roster::new(resolve_workspace_root(workspace)?);
+    roster.shell_dir = std::env::current_dir().context("resolving cwd")?;
+    roster.plan_mode = plan_mode;
+    // No child agents and no MCP client tools behind an MCP server face;
+    // delete_file (Destructive) is absent behind the allowlist approver.
+    let reg = tool_roster::build(
+        AllowlistApprover::allow_only(allow_patterns.to_vec()),
+        roster,
+    )?;
+    eprintln!("tole mcp: {} tool(s) registered", reg.specs().len());
     Ok(reg)
 }
 
@@ -1755,13 +1413,8 @@ fn build_server_registry_for_mcp(
     // session; registry Write tools stay pre-auth-off (deny by default).
     // `--workspace` roots the server-level file tools exactly like the
     // stdio `tole mcp` face — without it they jailed to the process cwd.
-    let mut registry = build_server_registry(workspace, &[])?;
-    // Plan mode (#294): same retain_read_only semantics as the other
-    // faces — Write/Destructive tools are absent, not merely denied.
-    if plan_mode {
-        registry.retain_read_only();
-    }
-    Ok(registry)
+    // Plan mode (#294): the roster's absence semantics, as on every face.
+    build_server_registry(workspace, &[], plan_mode)
 }
 
 /// D1 (issue #94): serve the registry over MCP stdio. Blocks until the
@@ -1778,15 +1431,9 @@ fn mcp_server_command(
     allow_patterns: &[String],
     plan_mode: bool,
 ) -> Result<()> {
-    let registry = build_server_registry(workspace, allow_patterns)?;
     // Plan mode (issue #109) applies to server mode too (cora scan-3
     // #9): serve read-only tools only when the operator asked for it.
-    let mut registry = registry;
-    if plan_mode {
-        let mut reg = registry;
-        reg.retain_read_only();
-        registry = reg;
-    }
+    let registry = build_server_registry(workspace, allow_patterns, plan_mode)?;
     tokio::runtime::Runtime::new()
         .context("creating tokio runtime")?
         .block_on(tole_core::mcp_server::serve_stdio(registry))
@@ -1875,28 +1522,7 @@ fn run_command(
     // Build everything that can fail BEFORE the session file exists, so a
     // failed startup does not leave a stray empty session polluting
     // `sessions` / `--last` (CodeCora scan 2026-09-18).
-    #[cfg(feature = "mcp")]
-    let mcp_cfgs: Vec<tole_core::mcp::McpServerConfig> = host
-        .mcp_server
-        .iter()
-        .map(|s| tole_core::mcp::McpServerConfig::parse(s))
-        .collect::<Result<Vec<_>, String>>()
-        .map_err(anyhow::Error::msg)?;
-    #[cfg(feature = "mcp")]
-    let mut registry = build_registry(
-        build_approver(allow_patterns, yes),
-        host.workspace.as_ref(),
-        &mcp_cfgs,
-        host.agents_worktree,
-        allow_patterns,
-    )?;
-    #[cfg(not(feature = "mcp"))]
-    let mut registry = build_registry(
-        build_approver(allow_patterns, yes),
-        host.workspace.as_ref(),
-        host.agents_worktree,
-        allow_patterns,
-    )?;
+    let mut registry = build_registry(build_approver(allow_patterns, yes), host, allow_patterns)?;
     // Plan mode (issue #109): the guarantee is ABSENCE on the wire, not
     // approval — filtered tools never appear in specs().
     if host.plan_mode {
@@ -2068,28 +1694,7 @@ fn resume_command(
     )?;
     let mut storage = JsonlStorage::open(&path).context("replaying session log")?;
 
-    #[cfg(feature = "mcp")]
-    let mcp_cfgs: Vec<tole_core::mcp::McpServerConfig> = host
-        .mcp_server
-        .iter()
-        .map(|s| tole_core::mcp::McpServerConfig::parse(s))
-        .collect::<Result<Vec<_>, String>>()
-        .map_err(anyhow::Error::msg)?;
-    #[cfg(feature = "mcp")]
-    let mut registry = build_registry(
-        build_approver(allow_patterns, yes),
-        host.workspace.as_ref(),
-        &mcp_cfgs,
-        host.agents_worktree,
-        allow_patterns,
-    )?;
-    #[cfg(not(feature = "mcp"))]
-    let mut registry = build_registry(
-        build_approver(allow_patterns, yes),
-        host.workspace.as_ref(),
-        host.agents_worktree,
-        allow_patterns,
-    )?;
+    let mut registry = build_registry(build_approver(allow_patterns, yes), host, allow_patterns)?;
     // Task-list tools (issue #198): state hydrated from the replayed
     // transcript so a resumed mission keeps its plan. Registered BEFORE
     // the plan-mode filter — todo_write must be ABSENT on the wire under
@@ -2430,28 +2035,7 @@ fn chat_command(
     // Build everything that can fail BEFORE the fresh session file is
     // created, so a failed startup does not leave a stray empty session
     // polluting `sessions` / `--last` (CodeCora scan 2026-09-18).
-    #[cfg(feature = "mcp")]
-    let mcp_cfgs: Vec<tole_core::mcp::McpServerConfig> = host
-        .mcp_server
-        .iter()
-        .map(|s| tole_core::mcp::McpServerConfig::parse(s))
-        .collect::<Result<Vec<_>, String>>()
-        .map_err(anyhow::Error::msg)?;
-    #[cfg(feature = "mcp")]
-    let mut registry = build_registry(
-        build_approver(allow_patterns, yes),
-        host.workspace.as_ref(),
-        &mcp_cfgs,
-        host.agents_worktree,
-        allow_patterns,
-    )?;
-    #[cfg(not(feature = "mcp"))]
-    let mut registry = build_registry(
-        build_approver(allow_patterns, yes),
-        host.workspace.as_ref(),
-        host.agents_worktree,
-        allow_patterns,
-    )?;
+    let mut registry = build_registry(build_approver(allow_patterns, yes), host, allow_patterns)?;
     // Plan mode (issue #109): the guarantee is ABSENCE on the wire, not
     // approval — filtered tools never appear in specs().
     if host.plan_mode {
@@ -2946,9 +2530,11 @@ mod gh_repo_tests {
         let dir = std::env::temp_dir().join(format!("tole-gh-none-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let mut reg =
-            ToolRegistry::with_approver(tole_core::approval::AllowlistApprover::allow_only(vec![]));
-        register_gh(&mut reg, &dir).unwrap();
+        let reg = tool_roster::build(
+            tole_core::approval::AllowlistApprover::allow_only(vec![]),
+            Roster::new(dir.clone()),
+        )
+        .unwrap();
         assert!(reg.get("gh").is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2973,7 +2559,7 @@ mod gh_repo_tests {
             "origin",
             "https://github.com/detected/owner-name.git",
         ]);
-        let detected = detect_github_repo(&dir);
+        let detected = tole_cli::session_host::detect_github_repo(&dir);
         assert_eq!(detected.as_deref(), Some("detected/owner-name"));
         let _ = std::fs::remove_dir_all(&dir);
     }

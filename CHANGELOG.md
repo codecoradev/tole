@@ -26,6 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - `tole_core::transcript` (#418): one read-side view of the transcript conventions the turn loop writes — which user messages open a turn (not stop-gate feedback, not interrupts), which usage rows are provider steps (not rows holding only `tole_*` keys) and the token total. The turn loop, `tole status`, `tole sessions`, usage reports and mission budgets all use it, and embedders can count turns and steps without copying the rules.
+- Tool roster (#420, 1/3): the CLI faces (`run`, `resume`, `chat`, `mission`) and the MCP server faces (`tole mcp`, MCP-over-HTTP) build their tools through one `tool_roster` module instead of two copied builders. Plan mode is applied in one place, and there is one binary probe (`binary_available`, executable files only) and one GitHub-origin probe. The MCP server faces now report a missing `uteke` / `cora` binary or GitHub origin on stderr like the CLI does.
 - Memory loop injection hygiene (#384): the recalled batch is hard-capped at 24 items / 64 KiB and deduplicated; a malformed recall payload (non-array, or a hit without content) now fails the whole batch visibly instead of silently injecting fewer items; `tole serve`/MCP sessions report recall failures on stderr like the CLI does.
 
 ## [0.8.2] — 2026-10-12
