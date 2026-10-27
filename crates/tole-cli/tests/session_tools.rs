@@ -97,7 +97,6 @@ fn resolver_routes_to_session_jail() {
     let sessions = Arc::clone(&state.sessions);
     let resolve = |sid: &str| -> Option<std::sync::Arc<tole_core::tool::ToolRegistry>> {
         tole_cli::session_host::lock_sessions(&sessions)
-            .map
             .get(sid)
             .map(|st| Arc::clone(&st.registry))
     };
@@ -191,7 +190,7 @@ fn session_cancel_tool_sets_token_and_resolves_implicit_session() {
     // prove the tool flipped THE session's flag.
     let token = {
         let sessions = tole_cli::session_host::lock_sessions(&state.sessions);
-        sessions.map.get(&sid).unwrap().cancel.clone()
+        sessions.get(&sid).unwrap().cancel.clone()
     };
     assert!(!token.is_cancelled());
     let out = tool_by_name(&tools, "tole_session_cancel")
@@ -205,7 +204,7 @@ fn session_cancel_tool_sets_token_and_resolves_implicit_session() {
     // contract run_session_turn relies on) — cancel then re-prompt is
     // safe.
     let fresh = tole_cli::session_host::lock_sessions(&state.sessions);
-    let st = fresh.map.get(&sid).unwrap();
+    let st = fresh.get(&sid).unwrap();
     let _guard = st.busy.lock().unwrap();
     st.cancel.reset();
     assert!(!token.is_cancelled());
@@ -269,7 +268,7 @@ fn session_interrupt_tool_queues_only_for_a_running_turn() {
         .to_string();
     let (token, busy) = {
         let sessions = tole_cli::session_host::lock_sessions(&state.sessions);
-        let st = sessions.map.get(&sid).unwrap();
+        let st = sessions.get(&sid).unwrap();
         (st.cancel.clone(), std::sync::Arc::clone(&st.busy))
     };
 

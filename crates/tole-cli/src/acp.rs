@@ -34,8 +34,8 @@ use std::time::Duration;
 
 use tole_cli::approver::{InteractiveApprover, PromptFn};
 use tole_cli::session_host::{
-    lock_sessions, new_session_id, open_session, run_session_turn, validate_session_id, Sessions,
-    MAX_SESSIONS,
+    lock_sessions, new_session_id, open_session, run_session_turn, validate_session_id, AdmitError,
+    Sessions,
 };
 use tole_core::storage::Storage;
 
@@ -800,15 +800,7 @@ pub fn run_acp(
                 // A turn holds its session's storage lock and marks it
                 // busy; loading a busy id would open a SECOND handle on
                 // the same JSONL mid-turn (CodeCora scan 2026-09-28).
-                let busy_now = {
-                    let sessions = lock_sessions(&sessions);
-                    sessions
-                        .map
-                        .get(&session_id)
-                        .map(|st| *st.busy.lock().expect("busy lock"))
-                        .unwrap_or(false)
-                };
-                if busy_now {
+                if lock_sessions(&sessions).is_busy(&session_id) {
                     reply_error(&conn, id, "session is busy running a turn");
                     continue;
                 }
@@ -877,48 +869,37 @@ pub fn run_acp(
                         // that window must not be orphaned by the insert
                         // swapping in a fresh, not-busy state (CodeCora
                         // scan 2026-09-28).
-                        let mut sessions = lock_sessions(&sessions);
-                        let busy_now = sessions
-                            .map
-                            .get(&session_id)
-                            .map(|st| *st.busy.lock().expect("busy lock"))
-                            .unwrap_or(false);
-                        if busy_now {
-                            drop(sessions);
-                            reply_error(&conn, id, "session became busy while opening — retry");
-                            continue;
-                        }
                         // Model picker state (issue #176): the durable
                         // register override wins, else the env default,
                         // else the first advertised entry. Read BEFORE
                         // the state moves into the session map.
                         let model_override = session_model_override(&state.storage);
-                        // Cap the live map like serve/MCP, and prune the
-                        // approval state of every evicted session so the
-                        // parallel map cannot grow without bound (#299).
-                        // Re-opening an existing id replaces in place and
-                        // needs no room.
-                        if !sessions.map.contains_key(&session_id) {
-                            match sessions.evict_for_insert(MAX_SESSIONS) {
-                                Ok(evicted) => {
-                                    let mut approvals =
-                                        approval_states.lock().expect("approval map");
-                                    for old in &evicted {
-                                        approvals.remove(old);
-                                    }
-                                }
-                                Err(_) => {
-                                    drop(sessions);
-                                    reply_error(
-                                        &conn,
-                                        id,
-                                        "session map at capacity and all sessions busy — close one first",
-                                    );
-                                    continue;
+                        // The registry's admission rule: refuse an id that
+                        // became busy while opening (an insert would orphan
+                        // that turn), replace an idle one in place, evict
+                        // for a new id at capacity. Prune the approval
+                        // state of every evicted session so the parallel
+                        // map cannot grow without bound (#299).
+                        match lock_sessions(&sessions).admit(session_id.clone(), state) {
+                            Ok(evicted) => {
+                                let mut approvals = approval_states.lock().expect("approval map");
+                                for old in &evicted {
+                                    approvals.remove(old);
                                 }
                             }
+                            Err(AdmitError::Busy) => {
+                                reply_error(&conn, id, "session became busy while opening — retry");
+                                continue;
+                            }
+                            Err(AdmitError::AtCapacity) => {
+                                reply_error(
+                                    &conn,
+                                    id,
+                                    "session map at capacity and all sessions busy — close one first",
+                                );
+                                continue;
+                            }
                         }
-                        sessions.map.insert(session_id.clone(), state);
                         let current = model_override
                             .or_else(|| env_model.clone())
                             .unwrap_or_default();
@@ -979,14 +960,10 @@ pub fn run_acp(
                 // The observer's id counter lives on the SESSION (cora
                 // CI on #203): ids keep incrementing across turns so a
                 // completion can never correlate onto a stale card.
-                let tool_ids = {
-                    let sessions = lock_sessions(&sessions);
-                    sessions
-                        .map
-                        .get(&session_id)
-                        .map(|st| st.tool_ids.clone())
-                        .unwrap_or_default()
-                };
+                let tool_ids = lock_sessions(&sessions)
+                    .get(&session_id)
+                    .map(|st| st.tool_ids.clone())
+                    .unwrap_or_default();
                 std::thread::spawn(move || {
                     // Phase 3 dedup flag, shared with the closure below —
                     // the trait object cannot expose the field.
@@ -1049,14 +1026,7 @@ pub fn run_acp(
                 let Some(session_id) = params.get("sessionId").and_then(Value::as_str) else {
                     continue; // notification: no id, nothing to answer
                 };
-                let cancelled = {
-                    let sessions = lock_sessions(&sessions);
-                    sessions
-                        .map
-                        .get(session_id)
-                        .map(|st| st.cancel.cancel())
-                        .is_some()
-                };
+                let cancelled = lock_sessions(&sessions).cancel(session_id);
                 if cancelled {
                     eprintln!("tole: session/{session_id} cancel requested");
                 }
@@ -1208,7 +1178,7 @@ fn set_model_option(
     // the reader thread that routes permission requests.
     {
         let sessions = lock_sessions(sessions);
-        let Some(state) = sessions.map.get(session_id) else {
+        let Some(state) = sessions.get(session_id) else {
             reply_error(conn, id, &format!("unknown session: {session_id}"));
             return;
         };

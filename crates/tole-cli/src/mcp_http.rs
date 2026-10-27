@@ -101,7 +101,7 @@ pub async fn run_mcp_http(
     let resolver_sessions = Arc::clone(&session_state.sessions);
     let resolver: tole_core::mcp_server::SessionRegistryResolver = Arc::new(move |sid: &str| {
         let sessions = tole_cli::session_host::lock_sessions(&resolver_sessions);
-        sessions.map.get(sid).map(|st| Arc::clone(&st.registry))
+        sessions.get(sid).map(|st| Arc::clone(&st.registry))
     });
     // Session count for the ambiguity refusal (#138-documented): a
     // registry-tool call WITHOUT session_id while 2+ sessions are open
@@ -109,7 +109,7 @@ pub async fn run_mcp_http(
     let count_sessions = Arc::clone(&session_state.sessions);
     let session_count: tole_core::mcp_server::SessionCountFn = Arc::new(move || {
         let sessions = tole_cli::session_host::lock_sessions(&count_sessions);
-        sessions.map.len()
+        sessions.len()
     });
     let server = tole_core::mcp_server::RegistryServer::with_extra_tools(registry, session_tools)
         .with_session_resolver(resolver)

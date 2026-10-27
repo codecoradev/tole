@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use crate::session_host::{
     lock_sessions, new_session_id, open_session, run_session_turn, SessionState, Sessions,
-    SharedSessions, MAX_SESSIONS,
+    SharedSessions,
 };
 use tole_core::memory::MemoryConfig;
 use tole_core::tool::{Risk, Tool};
@@ -91,20 +91,11 @@ impl SessionToolState {
     /// session ergonomics); otherwise refuse with a clear error.
     fn resolve(&self, args: &Value) -> Result<SessionState, String> {
         let sessions = lock_sessions(&self.sessions);
-        match args.get("session_id").and_then(Value::as_str) {
-            Some(id) => sessions
-                .map
-                .get(id)
-                .cloned()
-                .ok_or_else(|| format!("unknown session: {id}")),
-            None if sessions.map.len() == 1 => {
-                Ok(sessions.map.values().next().expect("len==1").clone())
-            }
-            None => Err(
-                "missing 'session_id': pass it explicitly (or keep exactly one session open)"
-                    .into(),
-            ),
-        }
+        let id = sessions.resolve_id(args.get("session_id").and_then(Value::as_str))?;
+        sessions
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| format!("unknown session: {id}"))
     }
 
     /// The session-level tools as registry entries.
@@ -163,10 +154,7 @@ impl Tool for SessionNewTool {
         // Capacity first: open_session creates the session file on disk, so
         // refusing AFTER it would leave an orphaned session behind. The
         // re-check at insert time below still guards a concurrent creator.
-        if lock_sessions(&self.0.sessions)
-            .evict_for_insert(MAX_SESSIONS)
-            .is_err()
-        {
+        if lock_sessions(&self.0.sessions).ensure_room().is_err() {
             return Err("session map at capacity and all sessions busy — close one first".into());
         }
         let session_id = new_session_id("mcp");
@@ -185,20 +173,12 @@ impl Tool for SessionNewTool {
             tole_core::cancel::CancelToken::default(),
             None,
         )?;
-        {
-            // Cap + eviction, mirroring the REST transport (CodeCora:
-            // the MCP session map grew without bound). Sessions are
-            // durable on disk; eviction drops only the in-memory handle.
-            // Busy sessions are never evicted; all-busy at capacity is
-            // a clear error.
-            let mut sessions = lock_sessions(&self.0.sessions);
-            if sessions.evict_for_insert(MAX_SESSIONS).is_err() {
-                return Err(
-                    "session map at capacity and all sessions busy — close one first".into(),
-                );
-            }
-            sessions.map.insert(session_id.clone(), state);
-        }
+        // Cap + eviction (the registry's admission rule): sessions are
+        // durable on disk, eviction drops only the in-memory handle, and
+        // busy sessions are never evicted.
+        lock_sessions(&self.0.sessions)
+            .admit(session_id.clone(), state)
+            .map_err(|_| "session map at capacity and all sessions busy — close one first")?;
         Ok(json!({ "session_id": session_id, "workspace": cwd }))
     }
 }
@@ -251,21 +231,8 @@ impl Tool for SessionPromptTool {
             .to_string();
         // Resolve the session id (explicit or implicit-singleton) BEFORE
         // the turn: run_session_turn addresses the map by id.
-        let session_id =
-            {
-                let sessions = lock_sessions(&self.0.sessions);
-                match input.get("session_id").and_then(Value::as_str) {
-                    Some(id) => id.to_string(),
-                    None if sessions.map.len() == 1 => {
-                        sessions.map.keys().next().expect("len==1").clone()
-                    }
-                    None => return Err(
-                        "missing 'session_id': pass it explicitly (or keep exactly one session \
-                         open)"
-                            .into(),
-                    ),
-                }
-            };
+        let session_id = lock_sessions(&self.0.sessions)
+            .resolve_id(input.get("session_id").and_then(Value::as_str))?;
         let (stop, text) =
             run_session_turn(Arc::clone(&self.0.sessions), &session_id, &text, None)?;
         let mut out = json!({ "stop_reason": stop });
@@ -391,28 +358,12 @@ impl Tool for SessionCancelTool {
             .to_string();
         // Resolve the id exactly like tole_session_prompt (explicit or
         // implicit-singleton), then set the token under the map lock.
-        let (session_id, found) =
-            {
-                let sessions = lock_sessions(&self.0.sessions);
-                let id = match input.get("session_id").and_then(Value::as_str) {
-                    Some(id) => Some(id.to_string()),
-                    None if sessions.map.len() == 1 => {
-                        Some(sessions.map.keys().next().expect("len==1").clone())
-                    }
-                    None => None,
-                };
-                match id {
-                    Some(id) => {
-                        let found = sessions.map.get(&id).map(|st| st.cancel.cancel()).is_some();
-                        (id, found)
-                    }
-                    None => return Err(
-                        "missing 'session_id': pass it explicitly (or keep exactly one session \
-                         open)"
-                            .into(),
-                    ),
-                }
-            };
+        let (session_id, found) = {
+            let sessions = lock_sessions(&self.0.sessions);
+            let id = sessions.resolve_id(input.get("session_id").and_then(Value::as_str))?;
+            let found = sessions.cancel(&id);
+            (id, found)
+        };
         if !found {
             return Err(format!("unknown session: {session_id}"));
         }
@@ -502,7 +453,6 @@ impl Tool for SessionListTool {
     fn execute(&self, _input: Value) -> Result<Value, String> {
         let sessions = lock_sessions(&self.0.sessions);
         let list: Vec<Value> = sessions
-            .map
             .iter()
             .map(|(id, st)| {
                 // Issue #256 (rescan #38): NEVER take a blocking lock on
