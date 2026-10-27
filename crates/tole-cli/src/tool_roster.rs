@@ -97,6 +97,24 @@ pub fn binary_available(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Env var that turns on the probe notices below (#435).
+pub const VERBOSE_ENV: &str = "TOLE_VERBOSE";
+
+/// A probe miss (an optional binary or the GitHub origin is absent): an
+/// expected state on most machines, so it is printed only with
+/// `TOLE_VERBOSE=1`. `tole doctor` reports the sibling binaries anyway.
+#[cfg_attr(not(feature = "shell-tools"), allow(dead_code))] // probes run only with shell-tools
+fn probe_notice(msg: &str) {
+    if verbose(&crate::config_apply::real_env) {
+        eprintln!("tole: {msg}");
+    }
+}
+
+#[cfg_attr(not(feature = "shell-tools"), allow(dead_code))] // probes run only with shell-tools
+fn verbose(env: &dyn Fn(&str) -> Option<String>) -> bool {
+    env(VERBOSE_ENV).is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes"))
+}
+
 fn add(reg: &mut ToolRegistry, tool: Box<dyn Tool>) -> Result<()> {
     let name = tool.name().to_string();
     reg.register(tool)
@@ -105,7 +123,7 @@ fn add(reg: &mut ToolRegistry, tool: Box<dyn Tool>) -> Result<()> {
 
 /// Build the session's registry. Probe-gated tools (uteke, cora, gh,
 /// gitea, web search, systemone) are absent when their backend is, never
-/// phantoms; a missing binary is reported on stderr.
+/// phantoms; a miss is reported on stderr only with `TOLE_VERBOSE=1`.
 pub fn build(approver: impl Approver + 'static, roster: Roster) -> Result<ToolRegistry> {
     let interactive = approver.interactive();
     let mut reg = ToolRegistry::with_approver(approver);
@@ -134,7 +152,7 @@ pub fn build(approver: impl Approver + 'static, roster: Roster) -> Result<ToolRe
                 add(&mut reg, Box::new(UtekeDocumentTool::new(None)))?;
             }
         } else {
-            eprintln!("tole: uteke binary not found — uteke_recall/uteke_document disabled");
+            probe_notice("uteke binary not found — uteke_recall/uteke_document disabled");
         }
         if !plan {
             // A child's command tools refuse to spawn tole itself (the
@@ -192,9 +210,7 @@ pub fn build(approver: impl Approver + 'static, roster: Roster) -> Result<ToolRe
             // gh is probe-gated (#254): no detected GitHub origin, no tool.
             match crate::session_host::detect_github_repo(shell_dir) {
                 Some(repo) => add(&mut reg, Box::new(tole_core::gh::GhTool::new(repo)))?,
-                None => {
-                    eprintln!("tole: no GitHub origin remote detected — gh tool not registered")
-                }
+                None => probe_notice("no GitHub origin remote detected — gh tool not registered"),
             }
             crate::session_host::register_gitea(&mut reg, shell_dir);
             add(
@@ -241,7 +257,7 @@ pub fn build(approver: impl Approver + 'static, roster: Roster) -> Result<ToolRe
                 Box::new(tole_core::cora_search::CoraSearchTool::new()),
             )?;
         } else {
-            eprintln!("tole: cora binary not found — cora_search disabled");
+            probe_notice("cora binary not found — cora_search disabled");
         }
     }
     #[cfg(not(feature = "shell-tools"))]
@@ -353,5 +369,17 @@ mod tests {
         std::fs::write(&plain, "x").unwrap();
         assert!(!binary_available(plain.to_str().unwrap()));
         assert!(!binary_available("tole-no-such-binary-xyz"));
+    }
+
+    #[test]
+    fn probe_notices_are_off_unless_verbose() {
+        let env = |v: Option<&'static str>| {
+            move |k: &str| (k == VERBOSE_ENV).then_some(v).flatten().map(String::from)
+        };
+        assert!(!verbose(&env(None)));
+        assert!(!verbose(&env(Some("0"))));
+        assert!(!verbose(&env(Some(""))));
+        assert!(verbose(&env(Some("1"))));
+        assert!(verbose(&env(Some(" true "))));
     }
 }
