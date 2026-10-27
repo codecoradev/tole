@@ -75,6 +75,19 @@ three levels:
    security findings. A red Cora Review check means findings must be triaged
    before merge.
 
+   **Credentials.** The job prefers Anthropic workload identity federation:
+   when `ANTHROPIC_FEDERATION_RULE_ID`, `ANTHROPIC_ORGANIZATION_ID`,
+   `ANTHROPIC_SERVICE_ACCOUNT_ID` and `ANTHROPIC_WORKSPACE_ID` are available
+   (organization or repository secrets or variables), it exchanges its GitHub
+   OIDC token for a short-lived Anthropic access token and sends it only to
+   `https://api.anthropic.com/v1` (model `ANTHROPIC_MODEL`, default
+   `claude-opus-5-5`). Otherwise, or when the exchange fails, it uses
+   `CORA_API_KEY`, `CORA_BASE_URL` and `CORA_MODEL`; an empty secret fails
+   the job rather than passing silently. The federation rule's subject prefix
+   must use GitHub's numeric ids, e.g. `repo:codecoradev@<id>/tole@<id>:` —
+   `repo:codecoradev/tole:` never matches. Run the manual
+   `anthropic-wif-smoke.yml` workflow to check the exchange.
+
 Review behavior is configured in `.cora.yaml` (focus areas, tole-specific
 rules that encode intentional patterns — env-resolved credentials,
 argv-validated subprocess tools, wire-only redaction — plus ignore rules for
