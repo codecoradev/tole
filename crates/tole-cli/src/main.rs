@@ -144,12 +144,12 @@ struct Cli {
     /// Use this project config file instead of `<cwd>/.tole/config.toml`
     /// (#208). A path named on the command line is user intent, so it is
     /// trusted without a trust record. Precedence: flag > env > config >
-    /// default. Also selects the file for `tole config check|trust|untrust`.
+    /// user config (`$CODECORA_HOME/tole/config.toml`) > default. Also selects the file for `tole config check|trust|untrust`.
     #[arg(long, global = true)]
     config: Option<PathBuf>,
 
-    /// Ignore any project config file entirely (#208): no discovery, no
-    /// trust check, no output.
+    /// Ignore the project config file AND the user config (#208, #433): no
+    /// discovery, no trust check, no output.
     #[arg(long, global = true, conflicts_with = "config")]
     no_config: bool,
 
@@ -575,9 +575,11 @@ fn dispatch(cli: Cli) -> Result<()> {
         let explicit = cli.config.as_deref();
         return match action {
             ConfigAction::Check => {
+                let user = tole_cli::config::user_config_path();
                 let out = config_apply::check(
                     &cwd,
                     explicit,
+                    user.as_deref(),
                     &config_flags(&cli),
                     &config_apply::real_env,
                 )?;
@@ -634,7 +636,22 @@ fn dispatch(cli: Cli) -> Result<()> {
             Err(_) => None,
         }
     };
-    let cfg = project_config.map(|l| l.config);
+    // User config (#433): same commands, same `--no-config`; no trust gate.
+    let user_config = if policy == GatePolicy::Skip || cli.no_config {
+        None
+    } else {
+        config_apply::load_user_config(
+            tole_cli::config::user_config_path().as_deref(),
+            &mut config_apply::StartupIo::new(false),
+        )?
+    };
+    let cfg = match (project_config, user_config) {
+        (None, None) => None,
+        (p, u) => Some(tole_cli::config::layered(
+            &p.map(|l| l.config).unwrap_or_default(),
+            &u.map(|l| l.config).unwrap_or_default(),
+        )),
+    };
     if let Some(cfg) = &cfg {
         // A key this build cannot honor is a loud startup error, never a
         // silent ignore (the matching flag does not exist here).
@@ -848,7 +865,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             if host.plan_mode {
                 return Err(refuse(
                     "--plan-mode has no meaning for a mission (missions mutate by definition)",
-                    settings.plan_mode.source == config_apply::Source::Config,
+                    config_layer(settings.plan_mode.source),
                 ));
             }
             // Issue #258 (rescan #46, scan-3 #9 rule): global flags must
@@ -879,7 +896,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                     settings
                         .memory
                         .as_ref()
-                        .is_some_and(|m| m.source == config_apply::Source::Config),
+                        .and_then(|m| config_layer(m.source)),
                 ));
             }
             check_server_face_flags("mission", &host, &settings, explicit_mcp)?;
@@ -1287,28 +1304,42 @@ fn check_client_session_flags(
     Ok(())
 }
 
-/// A refusal that may stem from the project config rather than the command
-/// line: the message is the flag's, plus (for config-sourced values) the way
-/// out. A safety hook / policy that arrives from the config must never be
-/// silently dropped on a face that cannot honor it.
-fn refuse(msg: &str, from_config: bool) -> anyhow::Error {
-    if from_config {
-        anyhow::anyhow!(
-            "{msg} (the value comes from the project config; \
-             use --no-config to ignore the project config)"
-        )
-    } else {
-        anyhow::anyhow!("{msg}")
+/// A refusal that may stem from a config file rather than the command
+/// line: the message is the flag's, plus (for config-sourced values) the
+/// file it came from and the way out. A safety hook / policy that arrives
+/// from a config must never be silently dropped on a face that cannot
+/// honor it.
+fn refuse(msg: &str, layer: Option<tole_cli::config_apply::Source>) -> anyhow::Error {
+    match layer {
+        Some(layer) => anyhow::anyhow!(
+            "{msg} (the value comes from the {}; \
+             use --no-config to ignore the config files)",
+            match layer {
+                tole_cli::config_apply::Source::UserConfig => "user config",
+                _ => "project config",
+            }
+        ),
+        None => anyhow::anyhow!("{msg}"),
     }
 }
 
-fn from_config<T>(e: &tole_cli::config_apply::ListEff<T>) -> bool {
-    e.as_ref()
-        .is_some_and(|e| e.source == tole_cli::config_apply::Source::Config)
+/// The config layer a value came from, if it came from a config file
+/// (project or user, #433).
+fn config_layer(s: tole_cli::config_apply::Source) -> Option<tole_cli::config_apply::Source> {
+    use tole_cli::config_apply::Source;
+    matches!(s, Source::Config | Source::UserConfig).then_some(s)
 }
 
-fn pretool_from_config(s: &tole_cli::config_apply::Settings) -> bool {
-    from_config(&s.on_pretool) || from_config(&s.on_posttool)
+fn from_config<T>(
+    e: &tole_cli::config_apply::ListEff<T>,
+) -> Option<tole_cli::config_apply::Source> {
+    e.as_ref().and_then(|e| config_layer(e.source))
+}
+
+fn pretool_from_config(
+    s: &tole_cli::config_apply::Settings,
+) -> Option<tole_cli::config_apply::Source> {
+    from_config(&s.on_pretool).or_else(|| from_config(&s.on_posttool))
 }
 
 /// [`check_client_session_flags`] over the EFFECTIVE (post-config) values;
@@ -1324,7 +1355,7 @@ fn check_server_face_flags(
         let cfg = if !host.skills.is_empty() {
             from_config(&settings.skill)
         } else if host.no_skills {
-            settings.no_skills.source == tole_cli::config_apply::Source::Config
+            config_layer(settings.no_skills.source)
         } else {
             from_config(&settings.mcp_server)
         };

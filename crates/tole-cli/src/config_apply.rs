@@ -1,5 +1,6 @@
-//! Project config application (#208, parts 3a + 3b): startup wiring of the
-//! trust gate and the flag > env > config > default precedence for EVERY
+//! Config application (#208, parts 3a + 3b; user layer #433): startup
+//! wiring of the trust gate and the flag > env > config > user config >
+//! default precedence for EVERY
 //! key — the low-risk ones (`model`, `base_url`, `system_prompt`,
 //! `memory`, `sessions_dir`, `workspace`, `[mission]` budgets) and the
 //! security-sensitive ones (`trust`, `allow`, `mcp_server`, the hook lists,
@@ -38,7 +39,10 @@ pub const DEFAULT_SESSIONS_DIR: &str = ".tole/sessions";
 pub enum Source {
     Flag,
     Env,
+    /// The project config.
     Config,
+    /// The user config (#433).
+    UserConfig,
     Default,
 }
 
@@ -48,6 +52,7 @@ impl fmt::Display for Source {
             Source::Flag => "flag",
             Source::Env => "env",
             Source::Config => "config",
+            Source::UserConfig => "user config",
             Source::Default => "default",
         })
     }
@@ -385,8 +390,20 @@ pub struct Settings {
 }
 
 impl Settings {
-    /// THE resolution: startup and `config check` both call this.
+    /// THE resolution: startup and `config check` both call this. `cfg` is
+    /// the LAYERED config ([`crate::config::layered`]); a value it took
+    /// from the user layer is reported as [`Source::UserConfig`].
     pub fn resolve(flags: &Flags, cfg: &Config, env: &dyn Fn(&str) -> Option<String>) -> Settings {
+        let mut s = Self::resolve_layered(flags, cfg, env);
+        s.mark_user_keys(&cfg.user_keys);
+        s
+    }
+
+    fn resolve_layered(
+        flags: &Flags,
+        cfg: &Config,
+        env: &dyn Fn(&str) -> Option<String>,
+    ) -> Settings {
         let (sd, sd_src) = resolve_or(
             flags.sessions_dir.clone(),
             None,
@@ -467,6 +484,46 @@ impl Settings {
         }
     }
 
+    /// Relabel `Source::Config` as `Source::UserConfig` for the keys the
+    /// user layer supplied.
+    fn mark_user_keys(&mut self, user: &std::collections::BTreeSet<&'static str>) {
+        fn one<T>(e: &mut Eff<T>, key: &str, user: &std::collections::BTreeSet<&'static str>) {
+            if e.source == Source::Config && user.contains(key) {
+                e.source = Source::UserConfig;
+            }
+        }
+        fn opt<T>(
+            e: &mut Option<Eff<T>>,
+            key: &str,
+            user: &std::collections::BTreeSet<&'static str>,
+        ) {
+            if let Some(e) = e {
+                one(e, key, user);
+            }
+        }
+        one(&mut self.sessions_dir, "sessions_dir", user);
+        opt(&mut self.workspace, "workspace", user);
+        opt(&mut self.memory, "memory", user);
+        opt(&mut self.system_prompt, "system_prompt", user);
+        opt(&mut self.provider.base_url, "base_url", user);
+        opt(&mut self.provider.model, "model", user);
+        opt(&mut self.max_steps, "mission.max_steps", user);
+        opt(&mut self.max_minutes, "mission.max_minutes", user);
+        opt(&mut self.max_tokens, "mission.max_tokens", user);
+        opt(&mut self.trust, "trust", user);
+        opt(&mut self.allow, "allow", user);
+        opt(&mut self.mcp_server, "mcp_server", user);
+        opt(&mut self.on_pretool, "on_pretool", user);
+        opt(&mut self.on_posttool, "on_posttool", user);
+        opt(&mut self.on_turnend, "on_turnend", user);
+        opt(&mut self.skill, "skill", user);
+        one(&mut self.plan_mode, "plan_mode", user);
+        one(&mut self.no_auto_mcp, "no_auto_mcp", user);
+        one(&mut self.no_skills, "no_skills", user);
+        opt(&mut self.verify, "mission.verify", user);
+        one(&mut self.verify_timeout, "mission.verify_timeout", user);
+    }
+
     /// The fill to install for the deep server faces: ONLY the config's own
     /// values (the faces still apply env first).
     pub fn fill_from(cfg: &Config) -> ProviderFill {
@@ -498,7 +555,7 @@ fn show_prompt(p: &str) -> String {
 
 /// Tail of a boolean key's `config check` line: a config value can only be
 /// raised by a flag, never lowered.
-const BOOL_NOTE: &str = "  (flags can only turn this on; --no-config drops the file)";
+const BOOL_NOTE: &str = "  (flags can only turn this on; --no-config drops the config files)";
 
 /// Per-key suffixes for `tole config check`: every key shows the effective
 /// value + its source. Keys are the names [`crate::config::render_with`]
@@ -599,9 +656,14 @@ fn show_list(items: &[String]) -> String {
 /// features, injected so every combination is unit-testable.
 pub fn unsupported_keys(cfg: &Config, mcp: bool, shell_tools: bool) -> Option<String> {
     let need = |key: &str, feature: &str| {
+        let layer = if cfg.user_keys.contains(key) {
+            "user"
+        } else {
+            "project"
+        };
         Some(format!(
-            "project config key `{key}` needs the `{feature}` feature, which this build of \
-             tole lacks (remove the key, or use --no-config to ignore the project config)"
+            "{layer} config key `{key}` needs the `{feature}` feature, which this build of \
+             tole lacks (remove the key, or use --no-config to ignore the config files)"
         ))
     };
     if !mcp {
@@ -627,15 +689,16 @@ pub fn unsupported_keys(cfg: &Config, mcp: bool, shell_tools: bool) -> Option<St
     None
 }
 
-/// `tole config check`: validate + render with effective values. Runs the
-/// same [`Settings::resolve`] as startup.
+/// `tole config check`: validate + render both layers with effective
+/// values. Runs the same [`Settings::resolve`] as startup.
 pub fn check(
     cwd: &Path,
     explicit: Option<&Path>,
+    user: Option<&Path>,
     flags: &Flags,
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Result<String, ConfigError> {
-    crate::config::check(cwd, explicit, &|cfg| {
+    crate::config::check(cwd, explicit, user, &|cfg| {
         annotations(&Settings::resolve(flags, cfg, env))
     })
 }
@@ -706,6 +769,24 @@ pub fn load_project_config(
     let config = crate::config::parse(&outcome.content, &shown).map_err(|e| anyhow!("{e}"))?;
     io.inform(&format!(
         "tole: using config {}",
+        config_trust::sanitize(&shown.display().to_string())
+    ));
+    Ok(Some(Loaded { shown, config }))
+}
+
+/// Load the user config (#433) when the file exists. No trust gate: it
+/// lives outside any repository, in the same trust domain as the binary
+/// and the config trust store. It is still bounded and validated like a
+/// project config (secret-like keys, trust presets, unknown keys). On
+/// success one `tole: using user config <path>` line goes to `io.inform`.
+pub fn load_user_config(path: Option<&Path>, io: &mut dyn ConfigTrustIo) -> Result<Option<Loaded>> {
+    let Some(path) = path.filter(|p| p.exists()) else {
+        return Ok(None);
+    };
+    let config = crate::config::load(path).map_err(|e| anyhow!("{e}"))?;
+    let shown = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    io.inform(&format!(
+        "tole: using user config {}",
         config_trust::sanitize(&shown.display().to_string())
     ));
     Ok(Some(Loaded { shown, config }))

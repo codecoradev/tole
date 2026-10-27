@@ -135,9 +135,25 @@ fn config_flags_collects_the_security_flags_and_the_subcommands_own_allow() {
 
 #[test]
 fn refuse_adds_the_no_config_hint_only_for_config_values() {
-    let plain = refuse("--skill is not supported by `tole serve`", false).to_string();
+    use tole_cli::config_apply::Source;
+    let plain = refuse("--skill is not supported by `tole serve`", None).to_string();
     assert_eq!(plain, "--skill is not supported by `tole serve`");
-    let hinted = refuse("--skill is not supported by `tole serve`", true).to_string();
+    let hinted = refuse(
+        "--skill is not supported by `tole serve`",
+        Some(Source::Config),
+    )
+    .to_string();
     assert!(hinted.starts_with("--skill is not supported by `tole serve`"));
-    assert!(hinted.contains("use --no-config to ignore the project config"));
+    assert!(hinted.contains("comes from the project config"));
+    assert!(hinted.contains("use --no-config to ignore the config files"));
+    // A user-config value (#433) names its own layer.
+    let user = refuse(
+        "--skill is not supported by `tole serve`",
+        Some(Source::UserConfig),
+    )
+    .to_string();
+    assert!(user.contains("comes from the user config"), "{user}");
+    assert_eq!(config_layer(Source::Flag), None);
+    assert_eq!(config_layer(Source::Env), None);
+    assert_eq!(config_layer(Source::UserConfig), Some(Source::UserConfig));
 }

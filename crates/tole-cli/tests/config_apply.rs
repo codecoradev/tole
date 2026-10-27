@@ -389,7 +389,7 @@ fn h_security_sensitive_keys_are_applied_now() {
         "{err}"
     );
     assert!(
-        err.contains("use --no-config to ignore the project config"),
+        err.contains("use --no-config to ignore the config files"),
         "{err}"
     );
     assert!(!err.contains("missing provider config"), "{err}");
@@ -497,4 +497,120 @@ fn config_check_shows_effective_values_and_sources() {
     );
     // `config check` itself never prints the "using config" line.
     assert_eq!(text(&o.stderr), "");
+}
+
+// ------------------------------------------------------- user config (#433)
+
+/// A home whose user config (`<home>/tole/config.toml`) is `content`.
+fn user_home(content: &str) -> PathBuf {
+    let home = tmpdir();
+    std::fs::create_dir_all(home.join("tole")).unwrap();
+    std::fs::write(home.join("tole/config.toml"), content).unwrap();
+    home
+}
+
+#[test]
+fn user_config_applies_without_a_trust_record_and_project_wins() {
+    let (url, rx) = spawn_model_probe();
+    let home = user_home(&format!("model = \"user-model\"\nbase_url = \"{url}\"\n"));
+    // No project config, no trust record: the user layer is used as is.
+    let d = tmpdir();
+    let o = cmd(&d, &home, &["run", "hi"])
+        .env("TOLE_API_KEY", "k")
+        .output()
+        .unwrap();
+    assert!(
+        text(&o.stderr).contains("tole: using user config "),
+        "{}",
+        text(&o.stderr)
+    );
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+        "user-model"
+    );
+    // A trusted project config wins key by key; the user base_url stays.
+    std::fs::create_dir_all(d.join(".tole")).unwrap();
+    std::fs::write(d.join(".tole/config.toml"), "model = \"project-model\"\n").unwrap();
+    trust(&d, &home);
+    let _ = cmd(&d, &home, &["run", "hi"])
+        .env("TOLE_API_KEY", "k")
+        .output()
+        .unwrap();
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+        "project-model"
+    );
+    // Env still beats both.
+    let _ = cmd(&d, &home, &["run", "hi"])
+        .env("TOLE_API_KEY", "k")
+        .env("TOLE_MODEL", "env-model")
+        .output()
+        .unwrap();
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+        "env-model"
+    );
+}
+
+#[test]
+fn no_config_drops_the_user_config_too() {
+    let home = user_home("model = \"user-model\"\nbase_url = \"http://127.0.0.1:9\"\n");
+    let d = tmpdir();
+    let o = cmd(&d, &home, &["--no-config", "run", "hi"])
+        .env("TOLE_API_KEY", "k")
+        .output()
+        .unwrap();
+    let err = text(&o.stderr);
+    assert!(!err.contains("using user config"), "{err}");
+    assert!(err.contains("missing provider config"), "{err}");
+}
+
+#[test]
+fn an_invalid_user_config_is_a_loud_startup_error() {
+    let home = user_home("api_key = \"sk-x\"\n");
+    let o = tole(&tmpdir(), &home, &["sessions"]);
+    assert!(!o.status.success());
+    let err = text(&o.stderr);
+    assert!(err.contains("api_key"), "{err}");
+    assert!(
+        !err.contains("sk-x"),
+        "the value must never be echoed: {err}"
+    );
+}
+
+#[test]
+fn config_check_shows_both_layers_and_the_winning_source() {
+    let home = user_home("model = \"user-model\"\nskill = [\"g/SKILL.md\"]\n");
+    let (d, _) = project("model = \"project-model\"\n");
+    let o = tole(&d, &home, &["config", "check"]);
+    let out = text(&o.stdout);
+    assert!(o.status.success(), "{out} {}", text(&o.stderr));
+    assert!(out.starts_with("user config: "), "{out}");
+    assert!(
+        out.contains(
+            "model = \"user-model\"  [user config]  effective: \"project-model\"  (config)"
+        ),
+        "{out}"
+    );
+    assert!(
+        out.contains(
+            "skill = [1 entries]  [user config]  effective: [\"g/SKILL.md\"]  (user config)"
+        ),
+        "{out}"
+    );
+    assert!(
+        out.contains("model = \"project-model\"  [config]  effective: \"project-model\"  (config)"),
+        "{out}"
+    );
+}
+
+#[cfg(feature = "shell-tools")]
+#[test]
+fn a_user_config_hook_is_refused_on_a_server_face_naming_the_user_config() {
+    let home = user_home("on_turnend = [\"true\"]\n");
+    let o = tole(&tmpdir(), &home, &["mission", "x"]);
+    assert!(!o.status.success());
+    let err = text(&o.stderr);
+    assert!(err.contains("--on-turnend is not supported"), "{err}");
+    assert!(err.contains("comes from the user config"), "{err}");
 }

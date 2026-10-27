@@ -1,7 +1,12 @@
-//! Project config file `.tole/config.toml` (#208): LOAD + VALIDATE. Applying
-//! the keys (precedence, trust gate at startup) lives in `config_apply`.
+//! Config files (#208): LOAD + VALIDATE. Applying the keys (precedence,
+//! trust gate at startup) lives in `config_apply`.
 //!
-//! The file is untrusted input (it lives in a cloned repo), so the loader
+//! Two layers share one schema (#433): the project config
+//! `.tole/config.toml` and the user config `$CODECORA_HOME/tole/config.toml`
+//! (default `~/.codecora/tole/config.toml`). The project layer wins key by
+//! key ([`layered`]); the user layer holds a user's global defaults.
+//!
+//! The project file is untrusted input (it lives in a cloned repo), so the loader
 //! is strict: a 64 KiB bounded read, a pre-check that refuses secret-like
 //! keys at any depth, trust-preset names validated by the SAME function
 //! the `--trust` flag uses, and `deny_unknown_fields` so typos fail
@@ -9,6 +14,7 @@
 //! state.
 
 use serde::Deserialize;
+use std::collections::BTreeSet;
 use std::fmt;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -20,6 +26,16 @@ pub const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 
 /// Project-relative location of the config file.
 pub const CONFIG_REL_PATH: &str = ".tole/config.toml";
+
+/// File name of the user config under the tole data dir (#433).
+pub const USER_CONFIG_FILE: &str = "config.toml";
+
+/// Where the user config lives: `$CODECORA_HOME/tole/config.toml`, default
+/// `~/.codecora/tole/config.toml` (next to the config trust store). `None`
+/// when neither `CODECORA_HOME` nor a home directory is set.
+pub fn user_config_path() -> Option<PathBuf> {
+    tole_core::paths::tole_data_dir().map(|d| d.join(USER_CONFIG_FILE))
+}
 
 /// The `[mission]` table. Types mirror the `tole mission` flags
 /// (`--max-steps/--max-minutes/--max-tokens` are `Option<u64>`,
@@ -57,6 +73,10 @@ pub struct Config {
     pub no_skills: Option<bool>,
     pub system_prompt: Option<String>,
     pub mission: Option<MissionConfig>,
+    /// Keys (rendered names, e.g. `model`, `mission.verify`) whose value
+    /// came from the user layer; set by [`layered`], never by the file.
+    #[serde(skip)]
+    pub user_keys: BTreeSet<&'static str>,
 }
 
 /// A config problem, rendered as `<path>:<line>:<col>: <message>` when a
@@ -157,7 +177,7 @@ fn check_forbidden(
                 path: path.to_path_buf(),
                 line_col: Some(line_col(src, k.span().start)),
                 message: format!(
-                    "forbidden key `{name}`: secrets must never live in a project file \
+                    "forbidden key `{name}`: secrets must never live in a config file \
                      (keep credentials in the environment, e.g. TOLE_API_KEY)"
                 ),
             });
@@ -223,6 +243,104 @@ pub fn load(path: &Path) -> Result<Config, ConfigError> {
     parse(&src, path)
 }
 
+/// Merge the two layers key by key: the project value wins when it is set
+/// (by the same rules the precedence functions use: a blank string or an
+/// empty list counts as unset), else the user value. Lists are never
+/// merged across layers. The result records which keys came from the user
+/// layer in [`Config::user_keys`].
+pub fn layered(project: &Config, user: &Config) -> Config {
+    let mut from_user = BTreeSet::new();
+    fn pick<T: Clone>(
+        key: &'static str,
+        p: &Option<T>,
+        u: &Option<T>,
+        set: fn(&T) -> bool,
+        from_user: &mut BTreeSet<&'static str>,
+    ) -> Option<T> {
+        match (p, u) {
+            (Some(p), _) if set(p) => Some(p.clone()),
+            (_, Some(u)) if set(u) => {
+                from_user.insert(key);
+                Some(u.clone())
+            }
+            _ => p.clone(),
+        }
+    }
+    let text = |v: &String| !v.trim().is_empty();
+    let list = |v: &Vec<String>| !v.is_empty();
+    fn any<T>(_: &T) -> bool {
+        true
+    }
+    let pm = project.mission.clone().unwrap_or_default();
+    let um = user.mission.clone().unwrap_or_default();
+    let u = &mut from_user;
+    let mission = MissionConfig {
+        max_steps: pick("mission.max_steps", &pm.max_steps, &um.max_steps, any, u),
+        max_minutes: pick(
+            "mission.max_minutes",
+            &pm.max_minutes,
+            &um.max_minutes,
+            any,
+            u,
+        ),
+        max_tokens: pick("mission.max_tokens", &pm.max_tokens, &um.max_tokens, any, u),
+        verify: pick("mission.verify", &pm.verify, &um.verify, text, u),
+        verify_timeout: pick(
+            "mission.verify_timeout",
+            &pm.verify_timeout,
+            &um.verify_timeout,
+            any,
+            u,
+        ),
+    };
+    let mut out = Config {
+        model: pick("model", &project.model, &user.model, text, u),
+        base_url: pick("base_url", &project.base_url, &user.base_url, text, u),
+        sessions_dir: pick(
+            "sessions_dir",
+            &project.sessions_dir,
+            &user.sessions_dir,
+            text,
+            u,
+        ),
+        workspace: pick("workspace", &project.workspace, &user.workspace, text, u),
+        plan_mode: pick("plan_mode", &project.plan_mode, &user.plan_mode, any, u),
+        memory: pick("memory", &project.memory, &user.memory, text, u),
+        trust: pick("trust", &project.trust, &user.trust, list, u),
+        allow: pick("allow", &project.allow, &user.allow, list, u),
+        mcp_server: pick("mcp_server", &project.mcp_server, &user.mcp_server, list, u),
+        no_auto_mcp: pick(
+            "no_auto_mcp",
+            &project.no_auto_mcp,
+            &user.no_auto_mcp,
+            any,
+            u,
+        ),
+        on_pretool: pick("on_pretool", &project.on_pretool, &user.on_pretool, list, u),
+        on_posttool: pick(
+            "on_posttool",
+            &project.on_posttool,
+            &user.on_posttool,
+            list,
+            u,
+        ),
+        on_turnend: pick("on_turnend", &project.on_turnend, &user.on_turnend, list, u),
+        skill: pick("skill", &project.skill, &user.skill, list, u),
+        no_skills: pick("no_skills", &project.no_skills, &user.no_skills, any, u),
+        system_prompt: pick(
+            "system_prompt",
+            &project.system_prompt,
+            &user.system_prompt,
+            text,
+            u,
+        ),
+        mission: (project.mission.is_some() || user.mission.is_some()).then_some(mission),
+        user_keys: BTreeSet::new(),
+    };
+    out.user_keys = from_user;
+    out
+}
+
 /// Longest `system_prompt` rendered by `config check`, in chars.
 const PROMPT_DISPLAY_CHARS: usize = 80;
 
@@ -238,23 +356,28 @@ pub type Annotations = std::collections::BTreeMap<&'static str, String>;
 /// Render `key = value  [config]` lines for every key that is set. List
 /// values go one entry per line; unset keys are not listed.
 pub fn render(cfg: &Config) -> Vec<String> {
-    render_with(cfg, &Annotations::new())
+    render_with(cfg, PROJECT_TAG, &Annotations::new())
 }
 
-/// [`render`] with a per-key suffix after the `[config]` tag.
-pub fn render_with(cfg: &Config, ann: &Annotations) -> Vec<String> {
-    const SRC: &str = "config";
+/// The `[tag]` on a project config line.
+pub const PROJECT_TAG: &str = "config";
+/// The `[tag]` on a user config line.
+pub const USER_TAG: &str = "user config";
+
+/// [`render`] with the layer's tag and a per-key suffix after it.
+pub fn render_with(cfg: &Config, tag: &str, ann: &Annotations) -> Vec<String> {
+    let src = tag;
     let mut out = Vec::new();
     let note = |key: &str| ann.get(key).map_or("", String::as_str);
     let scalar = |out: &mut Vec<String>, key: &str, v: Option<String>| {
         if let Some(v) = v {
-            out.push(format!("{key} = {v}  [{SRC}]{}", note(key)));
+            out.push(format!("{key} = {v}  [{src}]{}", note(key)));
         }
     };
     let list = |out: &mut Vec<String>, key: &str, v: &Option<Vec<String>>| {
         if let Some(items) = v {
             out.push(format!(
-                "{key} = [{} entries]  [{SRC}]{}",
+                "{key} = [{} entries]  [{src}]{}",
                 items.len(),
                 note(key)
             ));
@@ -325,30 +448,61 @@ pub fn render_with(cfg: &Config, ann: &Annotations) -> Vec<String> {
     out
 }
 
-/// `tole config check`: returns the text to print, or the error. `cwd`
-/// and `explicit` are parameters (no global state). `annotate` supplies
-/// the per-key suffixes from the shared resolution (see
-/// `config_apply::check`).
+/// `tole config check`: returns the text to print, or the error. `cwd`,
+/// `explicit` and the user config path are parameters (no global state).
+/// `annotate` supplies the per-key suffixes from the shared resolution
+/// over the LAYERED config (see `config_apply::check`), so a user key a
+/// project key overrides shows the project as its effective source.
 pub fn check(
     cwd: &Path,
     explicit: Option<&Path>,
+    user: Option<&Path>,
     annotate: &dyn Fn(&Config) -> Annotations,
 ) -> Result<String, ConfigError> {
-    let Some(path) = discover(cwd, explicit) else {
-        return Ok(format!("no {CONFIG_REL_PATH} in {}", cwd.display()));
+    let user_cfg = match user {
+        Some(p) if p.exists() => Some((p.to_path_buf(), load(p)?)),
+        _ => None,
     };
-    let cfg = load(&path)?;
-    let shown = path.canonicalize().unwrap_or(path);
-    let mut lines = vec![format!("config: {}", shown.display())];
-    let rendered = render_with(&cfg, &annotate(&cfg));
-    if rendered.is_empty() {
-        lines.push("(valid; no keys set)".to_string());
-    } else {
-        lines.extend(rendered);
+    let project = match discover(cwd, explicit) {
+        Some(path) => Some((path.clone(), load(&path)?)),
+        None => None,
+    };
+    let none = Config::default();
+    let merged = layered(
+        project.as_ref().map_or(&none, |(_, c)| c),
+        user_cfg.as_ref().map_or(&none, |(_, c)| c),
+    );
+    let ann = annotate(&merged);
+    let mut lines = Vec::new();
+    let section = |lines: &mut Vec<String>, cfg: &Config, tag: &str| {
+        let rendered = render_with(cfg, tag, &ann);
+        if rendered.is_empty() {
+            lines.push("(valid; no keys set)".to_string());
+        } else {
+            lines.extend(rendered);
+        }
+    };
+    match (&user_cfg, user) {
+        (Some((path, cfg)), _) => {
+            let shown = path.canonicalize().unwrap_or(path.clone());
+            lines.push(format!("user config: {}", shown.display()));
+            section(&mut lines, cfg, USER_TAG);
+        }
+        (None, Some(p)) => lines.push(format!("no user config at {}", p.display())),
+        (None, None) => lines.push("no user config (set CODECORA_HOME or HOME)".into()),
+    }
+    match &project {
+        Some((path, cfg)) => {
+            let shown = path.canonicalize().unwrap_or(path.clone());
+            lines.push(format!("config: {}", shown.display()));
+            section(&mut lines, cfg, PROJECT_TAG);
+        }
+        None => lines.push(format!("no {CONFIG_REL_PATH} in {}", cwd.display())),
     }
     lines.push(
-        "note: precedence is flag > env > config > default; a higher layer replaces a whole \
-         list key, flags can only turn boolean keys on, and --no-config ignores this file."
+        "note: precedence is flag > env > config > user config > default; a higher layer \
+         replaces a whole list key, flags can only turn boolean keys on, and --no-config \
+         ignores both files."
             .into(),
     );
     Ok(lines.join("\n"))
@@ -451,7 +605,7 @@ verify_timeout = 60
             let e = parse(src, &p()).unwrap_err();
             assert!(
                 e.message
-                    .contains("secrets must never live in a project file"),
+                    .contains("secrets must never live in a config file"),
                 "{src:?} -> {e}"
             );
             assert!(e.line_col.is_some(), "{src:?} -> {e}");
@@ -553,13 +707,75 @@ verify_timeout = 60
     #[test]
     fn check_reports_absent_valid_and_missing_explicit() {
         let d = tmpdir();
-        let out = check(&d, None, &|_| Annotations::new()).unwrap();
-        assert!(out.starts_with("no .tole/config.toml in "), "{out}");
+        let none = |_: &Config| Annotations::new();
+        let out = check(&d, None, None, &none).unwrap();
+        assert!(out.contains("\nno .tole/config.toml in "), "{out}");
         let f = d.join("c.toml");
         std::fs::write(&f, "model = \"m\"\n").unwrap();
-        let out = check(&d, Some(&f), &|_| Annotations::new()).unwrap();
+        let out = check(&d, Some(&f), None, &none).unwrap();
         assert!(out.contains("model = \"m\"  [config]"), "{out}");
-        assert!(check(&d, Some(&d.join("nope.toml")), &|_| Annotations::new()).is_err());
+        assert!(check(&d, Some(&d.join("nope.toml")), None, &none).is_err());
+    }
+
+    #[test]
+    fn check_shows_both_layers() {
+        let d = tmpdir();
+        let none = |_: &Config| Annotations::new();
+        let user = d.join("user.toml");
+        let out = check(&d, None, Some(&user), &none).unwrap();
+        assert!(out.starts_with("no user config at "), "{out}");
+        std::fs::write(&user, "model = \"u\"\nskill = [\"g/SKILL.md\"]\n").unwrap();
+        let proj = d.join("p.toml");
+        std::fs::write(&proj, "model = \"p\"\n").unwrap();
+        let out = check(&d, Some(&proj), Some(&user), &|c| {
+            // The annotation sees the layered config.
+            assert_eq!(c.model.as_deref(), Some("p"));
+            assert!(c.user_keys.contains("skill") && !c.user_keys.contains("model"));
+            Annotations::new()
+        })
+        .unwrap();
+        assert!(out.starts_with("user config: "), "{out}");
+        assert!(out.contains("model = \"u\"  [user config]"), "{out}");
+        assert!(out.contains("model = \"p\"  [config]"), "{out}");
+        // A broken user config is an error, like a broken project config.
+        std::fs::write(&user, "api_key = \"x\"\n").unwrap();
+        assert!(check(&d, None, Some(&user), &none).is_err());
+    }
+
+    #[test]
+    fn project_layer_wins_key_by_key() {
+        let user = parse(
+            "model = \"u\"\nbase_url = \"http://u\"\nskill = [\"g\"]\nplan_mode = true\n\
+             [mission]\nmax_steps = 9\nverify = \"u\"\n",
+            &p(),
+        )
+        .unwrap();
+        let project = parse(
+            "model = \"p\"\nbase_url = \"  \"\nskill = []\nplan_mode = false\n\
+             [mission]\nverify = \"p\"\n",
+            &p(),
+        )
+        .unwrap();
+        let c = layered(&project, &user);
+        assert_eq!(c.model.as_deref(), Some("p"));
+        // Blank string / empty list in the project count as unset.
+        assert_eq!(c.base_url.as_deref(), Some("http://u"));
+        assert_eq!(c.skill.as_deref().unwrap(), ["g"]);
+        // An explicit project `false` is set: it wins over the user `true`.
+        assert_eq!(c.plan_mode, Some(false));
+        let m = c.mission.clone().unwrap();
+        assert_eq!((m.max_steps, m.verify.as_deref()), (Some(9), Some("p")));
+        let expected: BTreeSet<&str> = ["base_url", "skill", "mission.max_steps"].into();
+        assert_eq!(c.user_keys, expected);
+        // No layers at all: nothing set, no mission table.
+        assert_eq!(
+            layered(&Config::default(), &Config::default()),
+            Config::default()
+        );
+        // One layer alone passes through.
+        let only_user = layered(&Config::default(), &user);
+        assert_eq!(only_user.model.as_deref(), Some("u"));
+        assert!(only_user.user_keys.contains("model"));
     }
 
     #[test]

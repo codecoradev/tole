@@ -158,7 +158,7 @@ owner-readable only: level reached, first blocker, fix, timestamp per provider
 plus the first blocker and its fix command without running anything; the latest
 run wins per provider + model, so re-run `--tier full` before a release claim.
 
-## Configuration (project file)
+## Configuration (project and user files)
 
 `<cwd>/.tole/config.toml` (no parent-directory walk) holds per-project defaults.
 It is loaded by every command except `config`, `upgrade` and `approvals`; use
@@ -167,6 +167,15 @@ trusted without a trust record) or `--no-config` to ignore any file entirely
 (no discovery, no trust check, no output). When a config is loaded, one line
 `tole: using config <path>` goes to stderr. **Precedence: flag > env > config >
 default**, and a project without a config file behaves exactly as before.
+
+**User config (#433).** `$CODECORA_HOME/tole/config.toml` (default
+`~/.codecora/tole/config.toml`) holds a user's global defaults with the same
+keys and validation, e.g. a skill to preload everywhere. It sits below the
+project file: **flag > env > config > user config > default**, key by key (a
+project key replaces the user key, lists included). It needs no trust record
+(it lives outside any repository, like the trust store), prints
+`tole: using user config <path>`, and `--no-config` ignores it too.
+`tole config check` lists both files and shows which layer wins each key.
 
 **Keys.** Every key is optional; the schema is strict (an unknown key, a wrong
 type or a secret-like key is an error with `file:line`; the file is capped at

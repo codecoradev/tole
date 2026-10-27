@@ -1,6 +1,7 @@
 //! `tole config check` end-to-end (#208 part 1) with the REAL binary:
 //! exit codes and key output lines. Nothing here touches the process
-//! environment (the child gets an explicit cwd and its own env).
+//! environment (the child gets an explicit cwd and its own env, with an
+//! empty `CODECORA_HOME` so no user config leaks in).
 
 use std::path::Path;
 use std::path::PathBuf;
@@ -21,6 +22,7 @@ fn tole(cwd: &Path, args: &[&str]) -> Output {
         .args(args)
         .current_dir(cwd)
         .env("TOLE_NO_UPDATE_CHECK", "1")
+        .env("CODECORA_HOME", tmpdir())
         .output()
         .unwrap()
 }
@@ -35,7 +37,8 @@ fn no_config_exits_zero_with_notice() {
     let o = tole(&d, &["config", "check"]);
     assert!(o.status.success());
     let out = text(&o.stdout);
-    assert!(out.starts_with("no .tole/config.toml in "), "{out}");
+    assert!(out.starts_with("no user config at "), "{out}");
+    assert!(out.contains("\nno .tole/config.toml in "), "{out}");
 }
 
 #[test]
@@ -82,7 +85,7 @@ fn secret_key_exits_nonzero_naming_it() {
     let err = text(&o.stderr);
     assert!(err.contains("api_key"), "{err}");
     assert!(
-        err.contains("secrets must never live in a project file"),
+        err.contains("secrets must never live in a config file"),
         "{err}"
     );
     assert!(

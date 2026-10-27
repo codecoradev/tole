@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- User config (#433): `$CODECORA_HOME/tole/config.toml` (default `~/.codecora/tole/config.toml`) holds global defaults with the project config's keys and validation. Precedence is flag > env > project config > user config > default, key by key; it needs no trust record, `--no-config` ignores it too, and `tole config check` shows both files and the winning layer per key (`(user config)`).
 - `TOLE_SKILL` (#434): preload skill files from the environment (`SKILL.md` paths, separated like `PATH`) — the env layer of the `skill` key, so `--skill` still replaces it and it replaces the config's `skill` list. Server faces refuse it like `--skill`, and the refusal names the variable.
 - Code review with cora (#422, 3/3): when `cora mcp` (cora ≥ 0.19) is attached, the system prompt of `tole run` / `tole chat` names the agent-as-reviewer flow — `mcp_cora_cora_review_prepare` with the diff, the model's own judgement, then `mcp_cora_cora_review_finalize` with the same diff and its findings — so "review this change" uses cora's deterministic checks and verdict without an LLM key in cora. Absent in plan mode and without the review tools.
 - Supported sibling versions (#422): cora ≥ 0.19.0 and uteke ≥ 0.21.1, kept in one place (`tole_cli::ecosystem`). `tole doctor` prints an `ecosystem:` section reporting each binary as supported, too old (with its upgrade command) or not installed; it never blocks, since both are optional.
