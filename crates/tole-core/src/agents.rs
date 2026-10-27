@@ -73,7 +73,7 @@ pub fn check_child_agent_argv(argv: &[String]) -> Result<(), String> {
                 .chars()
                 .filter(|c| !matches!(c, '"' | '\'' | '\\' | '$' | '{' | '}'))
                 .collect();
-            stripped.contains("TOLE_AGENT_DEPTH")
+            stripped.contains(crate::child_env::DEPTH)
         })
     {
         return Err(ERR.to_string());
@@ -760,25 +760,21 @@ impl Tool for AgentStartTool {
         // Deliberately NO env scrub: the child IS a tole session and
         // needs the provider key. Isolation = depth cap + jail + the
         // approved child allowlist (see the module doc).
-        cmd.env("TOLE_AGENT_DEPTH", "1")
-            // Sibling change notices (#380): the child's identity and the
-            // shared touch log every sibling of this parent appends to.
-            .env(crate::sibling_watch::ENV_AGENT_ID, &id)
-            .env(
-                crate::sibling_watch::ENV_TOUCH_LOG,
-                agents_root(&self.root).join("touch.log"),
-            )
-            .env("TOLE_MEMORY_NAMESPACE", &mailbox_ns)
-            .env("TOLE_MEMORY", "uteke")
+        // The launch contract (child_env): depth 1, the child's identity
+        // and the touch log shared with its siblings (#380), its mailbox
+        // room, and for a role child its role and handoff file (#383).
+        let launch = crate::child_env::ChildLaunch {
+            id: id.clone(),
+            touch_log: agents_root(&self.root).join("touch.log"),
+            mailbox_room: mailbox_ns.clone(),
+            role: role.map(|r| (r, dir.join(HANDOFF_FILE))),
+        };
+        cmd.envs(launch.vars())
             .arg("run")
             .arg("--sessions-dir")
             .arg(&sessions_dir)
             .arg("--workspace")
             .arg(&child_cwd);
-        if let Some(r) = role {
-            cmd.env("TOLE_AGENT_ROLE", r.as_str())
-                .env("TOLE_AGENT_HANDOFF", dir.join(HANDOFF_FILE));
-        }
         for pat in &allows {
             cmd.arg("--allow").arg(pat);
         }
