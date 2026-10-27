@@ -282,7 +282,7 @@ hard error.
 | `cora_search` | RO | hybrid codebase search via `cora brain`; native fallback — skipped when the cora MCP surface is attached |
 | `uteke_recall`, `uteke_document` | RO / Write | semantic memory recall / markdown → room |
 | `mcp_*` (from `--mcp-server`) | Write | server metadata is **never** trusted for risk; approval gate always applies |
-| `web_fetch`, `web_search` | RO | text-only internet (no JS/browser): fetch is direct HTTPS, size-capped, content-type allowlisted, HTML→text; search needs `TOLE_WEB_SEARCH_URL` (fleet backend, `{"results":[{title,url,snippet}]}`) — no backend, no tool; results are model content, never executed |
+| `web_fetch`, `web_search` | RO | text-only internet (no JS/browser): fetch is direct HTTPS, size-capped, content-type allowlisted, HTML→text; search needs `TOLE_WEB_SEARCH_URL` (default contract `GET ?q=` → `{"results":[{title,url,snippet}]}`; `TOLE_WEB_SEARCH_METHOD=POST` sends `{"query","limit"}`, `TOLE_WEB_SEARCH_HEADERS='Authorization=Bearer ${KEY}'` adds headers sent only to the backend, `TOLE_WEB_SEARCH_FIELDS='snippet=description,results=items'` maps fields; a malformed value fails startup) — no backend, no tool; results are model content, never executed |
 | `todo_write`, `todo_read` | Write / RO | durable mission task list (at most one `in_progress`); state lives in session entries — write results are the record, crash-resume restores the last settled list; covered by `--trust internal` |
 
 ## Remote approvals
