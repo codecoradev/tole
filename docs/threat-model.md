@@ -280,6 +280,15 @@ is the same as every other untrusted input: tool-result fencing,
 approval gates on anything that matters, and mission budgets bounding
 the blast radius.
 
+Search backend credentials (#436): `TOLE_WEB_SEARCH_HEADERS` values (with
+`${VAR}` references expanded from the environment) are sent only to the
+`TOLE_WEB_SEARCH_URL` backend: the search agent follows no redirects, so a
+backend cannot bounce the credential to another host. Header names are
+RFC 9110 tokens, transport headers (`Host`, `Content-Length`,
+`Transfer-Encoding`, `Connection`, `Content-Type`) are refused, a value
+with a line break is refused (no header injection), and errors name the
+header or variable, never the value.
+
 ### Project config trust (#208)
 
 `<cwd>/.tole/config.toml` is untrusted input from a cloned repo: it may
