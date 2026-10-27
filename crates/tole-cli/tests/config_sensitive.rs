@@ -746,7 +746,7 @@ fn mission_verify_timeout_from_config_is_used() {
 
 // ------------------------------------------------------- face refusals
 
-const NO_CONFIG_HINT: &str = "use --no-config to ignore the project config";
+const NO_CONFIG_HINT: &str = "use --no-config to ignore the config files";
 
 /// The refused command must exit non-zero, print the flag's message plus
 /// the hint, and never have started (no stdout, no provider contact).

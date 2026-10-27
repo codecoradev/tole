@@ -361,3 +361,14 @@ user's home, so anything running as that user can edit it; the store update is
 an unlocked read-modify-write, so two concurrent `tole config trust` runs can
 lose one of the two records (the loser is simply asked again; the file itself
 is replaced atomically and never corrupted).
+
+### User config (#433)
+
+`$CODECORA_HOME/tole/config.toml` (default `~/.codecora/tole/config.toml`) has
+the project config's schema and sits below it in precedence. It is **not**
+trust-gated: it lives in the same directory as the trust store, so anyone
+who can write it can already write trust records (or set `CODECORA_HOME`).
+It is still bounded and validated like a project file (64 KiB, strict
+schema, secret-like keys refused), `--no-config` ignores it, and every face
+that refuses a hook / skill / MCP server from the command line refuses it
+from the user config too, naming the user config as the origin.

@@ -585,7 +585,7 @@ fn check_shows_effective_value_and_source_for_every_key() {
         ..Default::default()
     };
     let st = Settings::resolve(&flags, &c, &env);
-    let lines = crate::config::render_with(&c, &annotations(&st));
+    let lines = crate::config::render_with(&c, crate::config::PROJECT_TAG, &annotations(&st));
     let joined = lines.join("\n");
     assert!(!joined.contains("not applied"), "{joined}");
     for k in [
@@ -878,4 +878,41 @@ fn skill_precedence_flag_env_config() {
         Some((vec![PathBuf::from("cfg/SKILL.md")], Source::Config)),
         "a blank TOLE_SKILL leaves the config value"
     );
+}
+
+#[test]
+fn user_layer_keys_report_their_own_source() {
+    let user = crate::config::parse(
+        "skill = [\"g\"]\nplan_mode = true\nmodel = \"u\"\n[mission]\nverify_timeout = 9\n",
+        Path::new("u.toml"),
+    )
+    .unwrap();
+    let project = crate::config::parse("model = \"p\"\n", Path::new("p.toml")).unwrap();
+    let cfg = crate::config::layered(&project, &user);
+    let env = |_: &str| None;
+    let s = Settings::resolve(&Flags::default(), &cfg, &env);
+    assert_eq!(s.skill.as_ref().unwrap().source, Source::UserConfig);
+    assert_eq!(s.plan_mode.source, Source::UserConfig);
+    assert_eq!(s.verify_timeout.source, Source::UserConfig);
+    assert_eq!(s.provider.model.as_ref().unwrap().source, Source::Config);
+    assert_eq!(s.provider.model.as_ref().unwrap().value, "p");
+    assert_eq!(s.skill.as_ref().unwrap().describe(), "(user config)");
+    // A flag still wins over the user layer.
+    let flags = Flags {
+        skill: vec![PathBuf::from("f")],
+        ..Flags::default()
+    };
+    let s = Settings::resolve(&flags, &cfg, &env);
+    assert_eq!(s.skill.unwrap().source, Source::Flag);
+}
+
+#[test]
+fn unsupported_key_names_the_layer_it_came_from() {
+    let user = crate::config::parse("on_turnend = [\"x\"]\n", Path::new("u.toml")).unwrap();
+    let cfg = crate::config::layered(&Config::default(), &user);
+    let msg = unsupported_keys(&cfg, true, false).unwrap();
+    assert!(msg.starts_with("user config key `on_turnend`"), "{msg}");
+    let cfg = crate::config::layered(&user, &Config::default());
+    let msg = unsupported_keys(&cfg, true, false).unwrap();
+    assert!(msg.starts_with("project config key `on_turnend`"), "{msg}");
 }
