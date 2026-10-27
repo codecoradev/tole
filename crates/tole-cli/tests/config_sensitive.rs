@@ -27,7 +27,8 @@ fn tmpdir() -> PathBuf {
     d.canonicalize().unwrap()
 }
 
-const SCRUBBED: [&str; 11] = [
+const SCRUBBED: [&str; 12] = [
+    "TOLE_SKILL",
     "TOLE_MODEL",
     "TOLE_BASE_URL",
     "TOLE_API_KEY",
@@ -991,4 +992,67 @@ fn config_check_reports_effective_values_for_the_sensitive_keys() {
         out.contains("effective: [\"read_only\"]  (env TOLE_TRUST)"),
         "{out}"
     );
+}
+
+// ------------------------------------------------------------- TOLE_SKILL
+
+/// #434: `TOLE_SKILL` preloads skills like `--skill`, and the flag still
+/// replaces it (flag > env > config).
+#[test]
+fn tole_skill_env_loads_skills_and_the_flag_replaces_it() {
+    let (url, seen) = spawn_mock(vec![Step::Final("ok")]);
+    let (d, home) = skill_project("no_auto_mcp = true\n");
+    std::fs::create_dir_all(d.join("other/alt")).unwrap();
+    std::fs::write(
+        d.join("other/alt/SKILL.md"),
+        "---\nname: alt\ndescription: alt\n---\nALT-SKILL-BODY\n",
+    )
+    .unwrap();
+    let env_skill = d.join("skills/demo/SKILL.md");
+    let o = finish(with_provider(
+        with_env(
+            base_cmd(&d, &home, &["run", "hi"]),
+            "TOLE_SKILL",
+            env_skill.to_str().unwrap(),
+        ),
+        &url,
+    ));
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    let sys = system_text(&seen.lock().unwrap()[0]);
+    assert!(sys.contains("DEMO-SKILL-BODY"), "{sys}");
+    let o = finish(with_provider(
+        with_env(
+            base_cmd(&d, &home, &["--skill", "other/alt/SKILL.md", "run", "hi"]),
+            "TOLE_SKILL",
+            env_skill.to_str().unwrap(),
+        ),
+        &url,
+    ));
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    let sys = system_text(&seen.lock().unwrap()[1]);
+    assert!(sys.contains("ALT-SKILL-BODY"), "{sys}");
+    assert!(
+        !sys.contains("DEMO-SKILL-BODY"),
+        "the flag replaces TOLE_SKILL"
+    );
+}
+
+/// An exported TOLE_SKILL on a server face is refused like `--skill`, and
+/// the message names the variable instead of a flag nobody typed.
+#[cfg(feature = "shell-tools")]
+#[test]
+fn server_faces_name_tole_skill_in_the_refusal() {
+    let (d, home) = skill_project("");
+    let o = finish(with_env(
+        base_cmd(&d, &home, &["acp"]),
+        "TOLE_SKILL",
+        d.join("skills/demo/SKILL.md").to_str().unwrap(),
+    ));
+    let err = text(&o.stderr);
+    assert!(!o.status.success(), "{err}");
+    assert!(
+        err.contains("--skill is not supported by `tole acp`"),
+        "{err}"
+    );
+    assert!(err.contains("the value comes from TOLE_SKILL"), "{err}");
 }

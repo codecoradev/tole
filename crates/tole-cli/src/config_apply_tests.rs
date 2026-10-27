@@ -846,3 +846,36 @@ fn fill_carries_only_low_risk_provider_values() {
         ProviderFill::default()
     );
 }
+
+#[test]
+fn skill_precedence_flag_env_config() {
+    // #434: TOLE_SKILL is the env layer of the `skill` list (PATH-style).
+    let c = cfg("skill = [\"cfg/SKILL.md\"]\n");
+    let env = env_of(&[("TOLE_SKILL", "/a/SKILL.md::/b/SKILL.md")]);
+    let skill = |f: &Flags, e: &dyn Fn(&str) -> Option<String>| {
+        Settings::resolve(f, &c, e)
+            .skill
+            .map(|s| (s.value, s.source))
+    };
+    assert_eq!(
+        skill(&Flags::default(), &env),
+        Some((
+            vec![PathBuf::from("/a/SKILL.md"), PathBuf::from("/b/SKILL.md")],
+            Source::Env
+        )),
+        "empty entries are dropped"
+    );
+    let f = Flags {
+        skill: vec![PathBuf::from("flag/SKILL.md")],
+        ..Flags::default()
+    };
+    assert_eq!(
+        skill(&f, &env),
+        Some((vec![PathBuf::from("flag/SKILL.md")], Source::Flag))
+    );
+    assert_eq!(
+        skill(&Flags::default(), &env_of(&[("TOLE_SKILL", "")])),
+        Some((vec![PathBuf::from("cfg/SKILL.md")], Source::Config)),
+        "a blank TOLE_SKILL leaves the config value"
+    );
+}
