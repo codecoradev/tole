@@ -117,7 +117,9 @@ header), `--workspace <dir>` (file-tools jail root), `--allow <glob>`
 (repeatable pre-authorization for Write tools, e.g. `--allow 'write_*'`),
 `--yes` (auto-allow every Write; Destructive still prompts), `--mcp-server`,
 `--no-auto-mcp` (skip the cora auto-preset), `--trust <preset>` (one-word
-trust: `internal` / `read_only`), `--skill <path>` (load a SKILL.md),
+trust: `internal` / `read_only` / `workspace` — `read_only` plus
+`write_file`/`edit_file`, which are jailed to `--workspace`, so writes are
+auto-allowed only there; `delete_file` and `run_command` keep prompting), `--skill <path>` (load a SKILL.md),
 `--plan-mode` (read-only wire), `--on-turnend <cmd>` (final-message gate).
 
 ## Configuration (environment)

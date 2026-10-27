@@ -14,6 +14,14 @@ use anyhow::Result;
 /// so `agent_start` still prompts); it deliberately excludes the write-capable
 /// native tools (write_file/edit_file/run_command/git/gh), which keep
 /// prompting.
+///
+/// `workspace` (#437) is `read_only` plus `write_file` / `edit_file`: the
+/// file tools are jailed to the workspace root (`--workspace`, else the
+/// cwd; the path is canonicalized, so `../` and symlinks cannot escape),
+/// so auto-allowing them allows writes ONLY inside the workspace — unlike
+/// `--yes`, which also auto-allows `run_command`, `git` and every MCP tool.
+/// `delete_file` is Destructive and keeps prompting; `run_command` keeps
+/// prompting.
 pub const TRUST_PRESETS: &[(&str, &[&str])] = &[
     (
         "internal",
@@ -38,6 +46,20 @@ pub const TRUST_PRESETS: &[(&str, &[&str])] = &[
             "tole_session_status",
             "tole_session_list",
             "job_poll",
+        ],
+    ),
+    (
+        "workspace",
+        &[
+            "read_file",
+            "verify_package",
+            "uteke_recall",
+            "cora_search",
+            "tole_session_status",
+            "tole_session_list",
+            "job_poll",
+            "write_file",
+            "edit_file",
         ],
     ),
 ];

@@ -125,7 +125,8 @@ struct Cli {
     /// Trust preset: auto-allow the fleet's own ecosystem tools without
     /// per-call approval. `internal` = uteke_*/cora_search/mcp_cora_*/
     /// verify_package/job_*/tole_session_*; `read_only` = every safe
-    /// read. Repeatable; flag wins over the TOLE_TRUST env; `none`
+    /// read; `workspace` = `read_only` plus write_file/edit_file, which
+    /// are jailed to the workspace (#437). Repeatable; flag wins over the TOLE_TRUST env; `none`
     /// (default) = today's behavior. Pure sugar over --allow patterns —
     /// Destructive tools are never auto-allowed.
     #[arg(long, global = true)]
@@ -2798,6 +2799,22 @@ mod trust_preset_tests {
         // agent_poll (Write since #300) is allowlisted by exact name so the
         // poll loop stays unattended; agent_start must keep prompting.
         assert!(!pats.iter().any(|p| p == "agent_*" || p == "agent_start"));
+    }
+
+    #[test]
+    fn workspace_is_read_only_plus_the_jailed_file_writers() {
+        let ws = expand_trust(&["workspace".to_string()]).unwrap();
+        let ro = expand_trust(&["read_only".to_string()]).unwrap();
+        for p in &ro {
+            assert!(ws.contains(p), "workspace lacks read_only's {p}");
+        }
+        assert!(ws.iter().any(|p| p == "write_file"));
+        assert!(ws.iter().any(|p| p == "edit_file"));
+        // Exact names only: nothing that reaches outside the jail.
+        for never in ["delete_file", "run_command", "git", "gh", "agent_start"] {
+            assert!(!ws.iter().any(|p| p == never), "{never}: {ws:?}");
+        }
+        assert!(!ws.iter().any(|p| p.contains('*')), "{ws:?}");
     }
 
     #[test]

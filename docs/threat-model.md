@@ -145,6 +145,14 @@ preset names (flag or env) fail loudly. A typo'd env value breaks every
 invocation with a clear error — deliberately, per the
 typo-silently-narrowing-trust rule.
 
+`workspace` (#437) is the one preset that auto-allows write-capable native
+tools: `write_file` and `edit_file`, by exact name. Their only reach is the
+workspace jail (root canonicalized; `../` and symlinked targets refused), so
+the widening is bounded to `--workspace` (else the cwd). `delete_file`
+(Destructive) and `run_command` keep prompting, unlike `--yes`. A project
+config can name the preset only after its content was trusted, the same
+bar as `allow = ["write_file"]`.
+
 ## Memory loop — decision typing (#143)
 
 The session summary stored by the memory loop keeps its content contract
