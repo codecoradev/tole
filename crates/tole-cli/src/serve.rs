@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tole_cli::session_host::{
-    lock_sessions, open_session, run_session_turn, Sessions, SharedSessions, MAX_SESSIONS,
+    lock_sessions, open_session, run_session_turn, Sessions, SharedSessions,
 };
 use tole_core::memory::MemoryConfig;
 use tole_core::storage::Storage;
@@ -416,7 +416,6 @@ fn write_approval_audit(
     let handle = {
         let sessions = lock_sessions(&state.sessions);
         sessions
-            .map
             .get(session_id)
             .map(|st| std::sync::Arc::clone(&st.storage))
     };
@@ -447,7 +446,6 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
         ("GET", "/sessions") => {
             let sessions = lock_sessions(&state.sessions);
             let list: Vec<_> = sessions
-                .map
                 .iter()
                 .map(|(id, st)| {
                     json!({
@@ -481,10 +479,7 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
             // disk, so refusing AFTER it (503) would orphan that file. The
             // re-check at insert time below still guards a concurrent
             // creator.
-            if lock_sessions(&state.sessions)
-                .evict_for_insert(MAX_SESSIONS)
-                .is_err()
-            {
+            if lock_sessions(&state.sessions).ensure_room().is_err() {
                 return (503, json!({"error": "all sessions busy — at capacity"}));
             }
             let session_id = tole_cli::session_host::new_session_id("srv");
@@ -520,18 +515,16 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                 None,
             ) {
                 Ok(session_state) => {
+                    // Cap the live map (the registry's admission rule): a
+                    // long-running daemon must not grow without bound
+                    // (CodeCora scan-3). Eviction drops only the in-memory
+                    // handle, never the file; busy sessions are never
+                    // evicted, and all-busy at capacity is a 503.
+                    if lock_sessions(&state.sessions)
+                        .admit(session_id.clone(), session_state)
+                        .is_err()
                     {
-                        // Cap the live map: a long-running daemon must not
-                        // grow without bound (CodeCora scan-3). Sessions
-                        // are durable on disk (the JSONL file) — eviction
-                        // drops only the in-memory handle, never the
-                        // file; busy sessions are never evicted.
-                        let mut sessions = lock_sessions(&state.sessions);
-                        // All-busy at capacity → 503.
-                        if sessions.evict_for_insert(MAX_SESSIONS).is_err() {
-                            return (503, json!({"error": "all sessions busy — at capacity"}));
-                        }
-                        sessions.map.insert(session_id.clone(), session_state);
+                        return (503, json!({"error": "all sessions busy — at capacity"}));
                     }
                     (200, json!({"sessionId": session_id, "workspace": cwd}))
                 }
@@ -628,7 +621,7 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                     // 2026-09-28). try_lock keeps this non-blocking.
                     let (busy, entries, report) = {
                         let sessions = lock_sessions(&state.sessions);
-                        let Some(st) = sessions.map.get(id) else {
+                        let Some(st) = sessions.get(id) else {
                             return (404, json!({"error": "unknown session"}));
                         };
                         let busy = *st.busy.lock().expect("busy lock");
@@ -681,7 +674,7 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                     // "cancelled". 404 only for an unknown session.
                     let cancelled = {
                         let sessions = lock_sessions(&state.sessions);
-                        sessions.map.get(id).map(|st| st.cancel.cancel()).is_some()
+                        sessions.cancel(id)
                     };
                     if cancelled {
                         eprintln!("tole: session/{id} cancel requested (serve)");
@@ -702,7 +695,7 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                     let urgent = req.get("urgent").and_then(|v| v.as_bool()).unwrap_or(false);
                     let st = {
                         let sessions = lock_sessions(&state.sessions);
-                        sessions.map.get(id).cloned()
+                        sessions.get(id).cloned()
                     };
                     let Some(st) = st else {
                         return (404, json!({"error": "unknown session"}));

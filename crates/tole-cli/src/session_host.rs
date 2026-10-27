@@ -75,9 +75,13 @@ impl Drop for BusyGuard {
     }
 }
 
+/// The live session registry shared by every server face (REST, MCP,
+/// ACP). It owns the map's invariants — the capacity cap and eviction,
+/// the admission rule, and the per-turn busy claim — so the faces never
+/// touch the map itself.
 #[derive(Default)]
 pub struct Sessions {
-    pub map: HashMap<String, SessionState>,
+    map: HashMap<String, SessionState>,
 }
 
 pub type SharedSessions = StdArc<Mutex<Sessions>>;
@@ -91,7 +95,120 @@ pub const MAX_SESSIONS: usize = 256;
 #[derive(Debug, PartialEq, Eq)]
 pub struct AllSessionsBusy;
 
+/// Why [`Sessions::admit`] refused a session.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AdmitError {
+    /// At capacity and every live session is mid-turn.
+    AtCapacity,
+    /// The id is already live and running a turn; replacing it would
+    /// orphan that turn.
+    Busy,
+}
+
+/// The faces' one wording for an omitted `session_id` with zero or several
+/// sessions open.
+pub const AMBIGUOUS_SESSION: &str =
+    "missing 'session_id': pass it explicitly (or keep exactly one session open)";
+
 impl Sessions {
+    /// The live session `id`, if any.
+    pub fn get(&self, id: &str) -> Option<&SessionState> {
+        self.map.get(id)
+    }
+
+    /// Every live session, in no particular order.
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &SessionState)> {
+        self.map.iter()
+    }
+
+    /// True when `id` is live and running a turn.
+    pub fn is_busy(&self, id: &str) -> bool {
+        self.map
+            .get(id)
+            .is_some_and(|st| *st.busy.lock().expect("busy lock"))
+    }
+
+    /// Number of live sessions.
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// True when no session is live.
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    /// The session a request addresses: the explicit id, or the only live
+    /// session when none was given. Refused with [`AMBIGUOUS_SESSION`]
+    /// otherwise.
+    pub fn resolve_id(&self, explicit: Option<&str>) -> Result<String, String> {
+        match explicit {
+            Some(id) => Ok(id.to_string()),
+            None if self.map.len() == 1 => Ok(self.map.keys().next().expect("len == 1").clone()),
+            None => Err(AMBIGUOUS_SESSION.to_string()),
+        }
+    }
+
+    /// Request cancellation of `id`'s in-flight turn; false for an unknown
+    /// session.
+    pub fn cancel(&self, id: &str) -> bool {
+        self.map.get(id).map(|st| st.cancel.cancel()).is_some()
+    }
+
+    /// Make room for a new session BEFORE it is opened (opening creates
+    /// its file on disk, so refusing afterwards would orphan it). Returns
+    /// the evicted ids; [`Sessions::admit`] re-checks under the same lock
+    /// as the insert, for a concurrent creator.
+    pub fn ensure_room(&mut self) -> Result<Vec<String>, AllSessionsBusy> {
+        self.evict_for_insert(MAX_SESSIONS)
+    }
+
+    /// Admit an opened session under `id`. A live, idle session with the
+    /// same id is replaced in place (a re-open); a busy one is refused. A
+    /// new id evicts an idle session when the map is at capacity
+    /// ([`MAX_SESSIONS`]). Returns the evicted ids so callers can prune
+    /// their side maps.
+    pub fn admit(&mut self, id: String, state: SessionState) -> Result<Vec<String>, AdmitError> {
+        self.admit_capped(id, state, MAX_SESSIONS)
+    }
+
+    fn admit_capped(
+        &mut self,
+        id: String,
+        state: SessionState,
+        max: usize,
+    ) -> Result<Vec<String>, AdmitError> {
+        let evicted = match self.map.get(&id) {
+            Some(live) if *live.busy.lock().expect("busy lock") => return Err(AdmitError::Busy),
+            Some(_) => Vec::new(),
+            None => self
+                .evict_for_insert(max)
+                .map_err(|AllSessionsBusy| AdmitError::AtCapacity)?,
+        };
+        self.map.insert(id, state);
+        Ok(evicted)
+    }
+
+    /// Claim `id` for one turn: mark it busy and clear a stale cancel in
+    /// the same critical section (#178) — a cancel that lands after the
+    /// claim targets THIS turn; one that landed before had no turn to
+    /// target. The returned guard un-marks the session when dropped, even
+    /// on panic.
+    pub fn claim_turn(&self, id: &str) -> Result<(SessionState, BusyGuard), String> {
+        let state = self
+            .map
+            .get(id)
+            .ok_or_else(|| format!("unknown session: {id}"))?;
+        let mut busy = state.busy.lock().expect("busy lock");
+        if *busy {
+            return Err("session is busy running a turn".into());
+        }
+        *busy = true;
+        state.cancel.reset();
+        drop(busy);
+        Ok((state.clone(), BusyGuard(StdArc::clone(&state.busy))))
+    }
+
     /// Make room for one more session: while the map is at `max`, evict
     /// one NON-busy session. A busy flag that is itself locked means a
     /// turn is mid-flight on that session, so it is skipped via
@@ -99,7 +216,7 @@ impl Sessions {
     /// round-2). Returns the evicted ids so callers can prune any side
     /// maps keyed by session id; `Err(AllSessionsBusy)` when at capacity
     /// with nothing evictable.
-    pub fn evict_for_insert(&mut self, max: usize) -> Result<Vec<String>, AllSessionsBusy> {
+    fn evict_for_insert(&mut self, max: usize) -> Result<Vec<String>, AllSessionsBusy> {
         let mut evicted = Vec::new();
         while self.map.len() >= max {
             let oldest = self
@@ -419,39 +536,19 @@ pub fn run_session_turn(
     prompt: &str,
     observer: Option<StdArc<dyn tole_core::turn::TurnObserver>>,
 ) -> Result<(String, Option<String>), String> {
-    // Brief map lock: take the session's handles and reject a busy
-    // session. The MAP lock is released here — a running turn holds only
-    // its OWN storage lock, so the transport loop stays live (CodeCora
-    // deadlock finding).
-    let (storage, registry, memory, system_prompt, first_prompt_done, busy_guard, cancel) = {
-        let mut sessions = lock_sessions(&sessions);
-        let Some(state) = sessions.map.get_mut(session_id) else {
-            return Err(format!("unknown session: {session_id}"));
-        };
-        {
-            let mut busy = state.busy.lock().expect("busy lock");
-            if *busy {
-                return Err("session is busy running a turn".into());
-            }
-            *busy = true;
-            // Wipe a stale cancel flag in the SAME critical section as
-            // the busy claim (#178): a cancel that lands after this
-            // point targets THIS turn; one that landed before it had no
-            // in-flight turn to target and must not kill the new one.
-            state.cancel.reset();
-        }
-        (
-            state.storage.clone(),
-            state.registry.clone(),
-            state.memory.clone(),
-            state.system_prompt.clone(),
-            state.first_prompt_done.clone(),
-            std::sync::Arc::clone(&state.busy),
-            state.cancel.clone(),
-        )
-    };
-    // Panic-safe un-busy: Drop clears the flag even if the turn unwinds.
-    let _busy_guard = BusyGuard(busy_guard);
+    // Brief map lock: claim the session for this turn. The MAP lock is
+    // released here — a running turn holds only its OWN storage lock, so
+    // the transport loop stays live (CodeCora deadlock finding).
+    let (state, _busy_guard) = lock_sessions(&sessions).claim_turn(session_id)?;
+    let SessionState {
+        storage,
+        registry,
+        memory,
+        system_prompt,
+        first_prompt_done,
+        cancel,
+        ..
+    } = state;
     let mut final_text: Option<String> = None;
 
     // Memory loop, pre-turn (first prompt of a fresh session only).
@@ -514,28 +611,14 @@ pub fn resume_session_turn(
     sessions: SharedSessions,
     session_id: &str,
 ) -> Result<(String, Option<String>), String> {
-    let (storage, registry, system_prompt, busy_guard, cancel) = {
-        let mut sessions = lock_sessions(&sessions);
-        let Some(state) = sessions.map.get_mut(session_id) else {
-            return Err(format!("unknown session: {session_id}"));
-        };
-        {
-            let mut busy = state.busy.lock().expect("busy lock");
-            if *busy {
-                return Err("session is busy running a turn".into());
-            }
-            *busy = true;
-            state.cancel.reset();
-        }
-        (
-            state.storage.clone(),
-            state.registry.clone(),
-            state.system_prompt.clone(),
-            StdArc::clone(&state.busy),
-            state.cancel.clone(),
-        )
-    };
-    let _busy_guard = BusyGuard(busy_guard);
+    let (state, _busy_guard) = lock_sessions(&sessions).claim_turn(session_id)?;
+    let SessionState {
+        storage,
+        registry,
+        system_prompt,
+        cancel,
+        ..
+    } = state;
     let mut storage = storage.lock().unwrap_or_else(|p| p.into_inner());
     let cfg = crate::turn_runner::provider_config()?;
     let mut provider = crate::turn_runner::session_provider(
@@ -715,6 +798,72 @@ mod eviction_tests {
             cancel: tole_core::cancel::CancelToken::default(),
             tool_ids: StdArc::new(Mutex::new(0)),
         }
+    }
+
+    #[test]
+    fn admit_replaces_an_idle_id_refuses_a_busy_one_and_evicts_for_a_new_one() {
+        let dir = TmpDir::new("admit");
+        let mut s = Sessions::default();
+        assert_eq!(
+            s.admit_capped("a".into(), state(dir.path(), "a", false), 2),
+            Ok(vec![])
+        );
+        // Re-open of an idle id: replaced in place, nothing evicted.
+        assert_eq!(
+            s.admit_capped("a".into(), state(dir.path(), "a2", false), 2),
+            Ok(vec![])
+        );
+        assert_eq!(s.len(), 1);
+        assert_eq!(
+            s.admit_capped("b".into(), state(dir.path(), "b", true), 2),
+            Ok(vec![])
+        );
+        // A busy live id is never swapped out from under its turn.
+        assert_eq!(
+            s.admit_capped("b".into(), state(dir.path(), "b2", false), 2),
+            Err(AdmitError::Busy)
+        );
+        // A new id at capacity evicts the idle one, never the busy one.
+        assert_eq!(
+            s.admit_capped("c".into(), state(dir.path(), "c", true), 2),
+            Ok(vec!["a".to_string()])
+        );
+        assert!(s.get("b").is_some() && s.get("c").is_some());
+        assert_eq!(
+            s.admit_capped("d".into(), state(dir.path(), "d", false), 2),
+            Err(AdmitError::AtCapacity)
+        );
+    }
+
+    #[test]
+    fn claim_turn_marks_busy_resets_a_stale_cancel_and_releases_on_drop() {
+        let dir = TmpDir::new("claim");
+        let mut s = Sessions::default();
+        s.admit("a".into(), state(dir.path(), "a", false)).unwrap();
+        assert!(s.claim_turn("nope").is_err());
+        assert!(s.cancel("a"), "a stale cancel before the turn");
+        let (st, guard) = s.claim_turn("a").unwrap();
+        assert!(!st.cancel.is_cancelled(), "the claim clears it");
+        assert!(s.is_busy("a"));
+        assert_eq!(
+            s.claim_turn("a").err().as_deref(),
+            Some("session is busy running a turn")
+        );
+        drop(guard);
+        assert!(!s.is_busy("a"));
+        assert!(!s.cancel("nope"));
+    }
+
+    #[test]
+    fn resolve_id_uses_the_explicit_id_or_the_only_session() {
+        let dir = TmpDir::new("resolve");
+        let mut s = Sessions::default();
+        assert_eq!(s.resolve_id(None), Err(AMBIGUOUS_SESSION.to_string()));
+        s.admit("a".into(), state(dir.path(), "a", false)).unwrap();
+        assert_eq!(s.resolve_id(None), Ok("a".to_string()));
+        assert_eq!(s.resolve_id(Some("x")), Ok("x".to_string()));
+        s.admit("b".into(), state(dir.path(), "b", false)).unwrap();
+        assert_eq!(s.resolve_id(None), Err(AMBIGUOUS_SESSION.to_string()));
     }
 
     #[test]
