@@ -2,22 +2,17 @@
 //! role finds the role and the handoff path in its environment and gets the
 //! `handoff_submit` tool. Outside such a child this is a no-op.
 
-use std::path::PathBuf;
-use tole_core::handoff::{HandoffSubmitTool, Role};
+use tole_core::handoff::HandoffSubmitTool;
 
-pub const ENV_ROLE: &str = "TOLE_AGENT_ROLE";
-pub const ENV_HANDOFF: &str = "TOLE_AGENT_HANDOFF";
+pub const ENV_ROLE: &str = tole_core::child_env::ROLE;
+pub const ENV_HANDOFF: &str = tole_core::child_env::HANDOFF;
 
 /// The `handoff_submit` tool for this process, when it is a role child.
 /// Both variables must be present and the role must parse; anything else
 /// (including a role set without a path) registers nothing.
 pub fn tool_from_env(env: &dyn Fn(&str) -> Option<String>) -> Option<HandoffSubmitTool> {
-    let role = Role::parse(env(ENV_ROLE)?.trim())?;
-    let path = env(ENV_HANDOFF)?.trim().to_string();
-    if path.is_empty() {
-        return None;
-    }
-    Some(HandoffSubmitTool::new(PathBuf::from(path), role))
+    let (role, path) = tole_core::child_env::role(env)?;
+    Some(HandoffSubmitTool::new(path, role))
 }
 
 #[cfg(test)]

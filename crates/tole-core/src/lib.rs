@@ -31,6 +31,7 @@
 pub mod agents;
 pub mod approval;
 pub mod cancel;
+pub mod child_env;
 #[cfg(feature = "shell-tools")]
 pub mod cora_search;
 pub mod entry;

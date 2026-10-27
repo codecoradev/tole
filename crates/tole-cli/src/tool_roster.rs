@@ -68,10 +68,7 @@ impl Roster {
 
 /// Child-agent depth from `TOLE_AGENT_DEPTH` (0 = not a child).
 pub fn agent_depth() -> u32 {
-    std::env::var("TOLE_AGENT_DEPTH")
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(0)
+    tole_core::child_env::depth(&crate::config_apply::real_env)
 }
 
 /// True when `name` resolves to an executable file (a path, or a lookup

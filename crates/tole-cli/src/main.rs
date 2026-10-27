@@ -1149,7 +1149,7 @@ fn resolve_memory(chosen: Option<&str>) -> Result<Option<tole_core::memory::Memo
         return Ok(None);
     }
     let mut cfg = tole_core::memory::MemoryConfig::for_cwd("uteke", &std::env::current_dir()?);
-    if let Ok(ns) = std::env::var("TOLE_MEMORY_NAMESPACE") {
+    if let Ok(ns) = std::env::var(tole_core::child_env::MEMORY_ROOM) {
         let ns = ns.trim();
         if !ns.is_empty() {
             cfg.room = tole_core::memory::sanitize_namespace(ns);

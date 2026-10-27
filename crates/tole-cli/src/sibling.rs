@@ -12,9 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tole_core::cancel::CancelToken;
-use tole_core::sibling_watch::{
-    SiblingWatcher, TouchRecorder, Tracked, ENV_AGENT_ID, ENV_TOUCH_LOG,
-};
+use tole_core::sibling_watch::{SiblingWatcher, TouchRecorder, Tracked};
 use tole_core::tool::Tool;
 
 /// How often the watcher folds the shared log. Notices are only ever
@@ -33,15 +31,8 @@ pub struct Tracking {
 /// a tracked child, or when the id is not a well-formed agent id (never
 /// trusted blindly: it ends up in the shared log).
 pub fn tracking_from_env(env: &dyn Fn(&str) -> Option<String>) -> Option<Tracking> {
-    let agent = env(ENV_AGENT_ID)?.trim().to_string();
-    let log = env(ENV_TOUCH_LOG)?.trim().to_string();
-    if !tole_core::sibling_watch::valid_agent_id(&agent) || log.is_empty() {
-        return None;
-    }
-    Some(Tracking {
-        agent,
-        log: PathBuf::from(log),
-    })
+    let (agent, log) = tole_core::child_env::sibling(env)?;
+    Some(Tracking { agent, log })
 }
 
 /// Wrap a file tool so its successful accesses are recorded; identity when
@@ -108,7 +99,7 @@ pub fn start_watcher(tracking: &Tracking, cancel: &CancelToken, every: Duration)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tole_core::sibling_watch::Op;
+    use tole_core::sibling_watch::{Op, ENV_AGENT_ID, ENV_TOUCH_LOG};
 
     fn env_of<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
         move |k| {
