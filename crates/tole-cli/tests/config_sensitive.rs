@@ -14,7 +14,7 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -112,18 +112,19 @@ enum Step {
 
 type Seen = Arc<Mutex<Vec<Value>>>;
 
-/// Scripted provider: request n answers `steps[min(n, last)]`; every
-/// request body is recorded.
+/// Scripted provider: a request whose transcript already holds n tool
+/// results answers `steps[min(n, last)]`; every request body is recorded.
+/// Keyed on the conversation, not on the request count (#429): a client
+/// retry under load re-sends the same transcript and gets the same step,
+/// instead of consuming the next one.
 fn spawn_mock(steps: Vec<Step>) -> (String, Seen) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let seen: Seen = Arc::default();
-    let counter = Arc::new(AtomicUsize::new(0));
     let (seen2, steps) = (Arc::clone(&seen), Arc::new(steps));
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
-            let (seen, counter, steps) =
-                (Arc::clone(&seen2), Arc::clone(&counter), Arc::clone(&steps));
+            let (seen, steps) = (Arc::clone(&seen2), Arc::clone(&steps));
             std::thread::spawn(move || {
                 let mut s = stream;
                 let mut buf = Vec::new();
@@ -144,8 +145,10 @@ fn spawn_mock(steps: Vec<Step>) -> (String, Seen) {
                     }
                 }
                 let streamed = body["stream"].as_bool() == Some(true);
+                let n = body["messages"]
+                    .as_array()
+                    .map_or(0, |m| m.iter().filter(|m| m["role"] == "tool").count());
                 seen.lock().unwrap().push(body);
-                let n = counter.fetch_add(1, Ordering::SeqCst);
                 let step = steps[n.min(steps.len() - 1)].clone();
                 let (content, calls) = match step {
                     Step::Final(t) => (Some(t.to_string()), None),
@@ -483,7 +486,7 @@ fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
 #[cfg(all(unix, feature = "shell-tools"))]
 #[test]
 fn on_pretool_from_config_runs_and_can_deny() {
-    let (url, _) = spawn_mock(vec![
+    let (url, seen) = spawn_mock(vec![
         Step::Tool("write_file", r#"{"path":"out.txt","content":"x"}"#),
         Step::Final("done"),
     ]);
@@ -502,7 +505,8 @@ fn on_pretool_from_config_runs_and_can_deny() {
     let o = finish(with_provider(base_cmd(&d, &home, &["run", "go"]), &url));
     assert!(
         marker.exists(),
-        "the config hook was not invoked: {}",
+        "the config hook was not invoked ({} provider requests): {}",
+        seen.lock().unwrap().len(),
         text(&o.stderr)
     );
     let payload = std::fs::read_to_string(scripts.join("marker.stdin")).unwrap();
@@ -519,7 +523,7 @@ fn on_pretool_from_config_runs_and_can_deny() {
 #[cfg(all(unix, feature = "shell-tools"))]
 #[test]
 fn on_posttool_and_on_turnend_from_config_run() {
-    let (url, _) = spawn_mock(vec![
+    let (url, seen) = spawn_mock(vec![
         Step::Tool("write_file", r#"{"path":"out.txt","content":"x"}"#),
         Step::Final("done"),
     ]);
@@ -536,8 +540,17 @@ fn on_posttool_and_on_turnend_from_config_run() {
     ));
     let o = finish(with_provider(base_cmd(&d, &home, &["run", "go"]), &url));
     assert!(o.status.success(), "{}", text(&o.stderr));
-    assert!(post.exists(), "posttool hook not run");
-    assert!(end.exists(), "turnend hook not run");
+    let requests = seen.lock().unwrap().len();
+    assert!(
+        post.exists(),
+        "posttool hook not run ({requests} provider requests): {}",
+        text(&o.stderr)
+    );
+    assert!(
+        end.exists(),
+        "turnend hook not run ({requests} provider requests): {}",
+        text(&o.stderr)
+    );
 }
 
 // ----------------------------------------------------------- mcp_server
