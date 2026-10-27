@@ -142,6 +142,10 @@ pub fn split_env_list(v: &str) -> Vec<String> {
         .collect()
 }
 
+/// Skill files to preload (#434), `PATH`-style separated; the layer
+/// between `--skill` and the config's `skill` key.
+pub const SKILL_ENV: &str = "TOLE_SKILL";
+
 /// Real environment lookup for [`Settings::resolve`].
 pub fn real_env(name: &str) -> Option<String> {
     std::env::var(name).ok()
@@ -402,6 +406,14 @@ impl Settings {
         let env_trust = env("TOLE_TRUST")
             .map(|v| split_env_list(&v))
             .unwrap_or_default();
+        // `TOLE_SKILL` (#434): skill files separated like `PATH` entries.
+        let env_skill: Vec<PathBuf> = env(SKILL_ENV)
+            .map(|v| {
+                std::env::split_paths(&v)
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
         Settings {
             sessions_dir: Eff::new(sd, sd_src),
             workspace: resolve_string(flags.workspace.clone(), None, cfg.workspace.clone())
@@ -435,7 +447,8 @@ impl Settings {
                     .skill
                     .as_ref()
                     .map(|v| v.iter().map(PathBuf::from).collect());
-                resolve_list(&flags.skill, &[], cfg_skill.as_deref()).map(|(v, s)| Eff::new(v, s))
+                resolve_list(&flags.skill, &env_skill, cfg_skill.as_deref())
+                    .map(|p| Eff::from_pair(p, SKILL_ENV))
             },
             plan_mode: boolean(flags.plan_mode, cfg.plan_mode),
             no_auto_mcp: boolean(flags.no_auto_mcp, cfg.no_auto_mcp),

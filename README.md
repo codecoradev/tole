@@ -127,6 +127,7 @@ trust: `internal` / `read_only`), `--skill <path>` (load a SKILL.md),
 | `TOLE_BASE_URL`, `TOLE_MODEL`, `TOLE_API_KEY` | LLM provider — any OpenAI-compatible endpoint (`OPENAI_*` equivalents read as fallback) |
 | `TOLE_FALLBACK_BASE_URL`, `TOLE_FALLBACK_API_KEY`, `TOLE_FALLBACK_MODEL` | optional reserve provider (#209): a step that fails because the primary is unavailable (connection failure, timeout, 5xx, 429) is retried on the reserve, and the switch is recorded in the session log (`tole_route`). The reserve needs its own key (the primary's is never sent to another host); the model defaults to the primary's. Request errors (401/403/404/400) never fail over |
 | `TOLE_SYSTEM_PROMPT` | default persona when `--system` is absent |
+| `TOLE_SKILL` | skill files to preload (`SKILL.md` paths, separated like `PATH`); same as repeated `--skill`, which replaces it; refused by the server faces like `--skill` |
 | `TOLE_MEMORY` | memory loop backend (`uteke`) — same as `--memory uteke` |
 | `TOLE_NO_UPDATE_CHECK` | `1` disables the startup update-check banner (issue #220) |
 | `TOLE_VERBOSE` | `1` prints the startup probe misses (uteke / cora binary not found, no GitHub origin), which are silent by default; `tole doctor` reports the sibling binaries either way |

@@ -1328,6 +1328,19 @@ fn check_server_face_flags(
         } else {
             from_config(&settings.mcp_server)
         };
+        // An exported TOLE_SKILL reaches every face: name it, or the
+        // refusal would point at a --skill flag nobody typed.
+        let from_env = !host.skills.is_empty()
+            && settings
+                .skill
+                .as_ref()
+                .is_some_and(|s| s.source == tole_cli::config_apply::Source::Env);
+        if from_env {
+            return anyhow::anyhow!(
+                "{e} (the value comes from {}; unset it for this face)",
+                tole_cli::config_apply::SKILL_ENV
+            );
+        }
         refuse(&e.to_string(), cfg)
     })
 }
