@@ -7,8 +7,8 @@ name: Anthropic WIF smoke test
 # never a token.
 #
 # Manual only (Actions tab -> Run workflow), so it costs nothing on normal PRs.
-# The federation rule must allow this workflow's OIDC subject (for a manual run
-# on a branch that is `...:ref:refs/heads/<branch>`, not `...:pull_request`).
+# Runs only from `develop`, so the federation rule can allow exactly
+# `...:ref:refs/heads/develop` (not `...:pull_request`) and no other branch.
 
 on:
   workflow_dispatch:
@@ -22,6 +22,7 @@ jobs:
     name: Anthropic WIF smoke
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    if: github.ref == 'refs/heads/develop'
     env:
       # Identifiers, not credentials, but this repository is public: they live
       # in organization/repository secrets or variables, not in this file.
