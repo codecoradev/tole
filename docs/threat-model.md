@@ -423,6 +423,20 @@ an unlocked read-modify-write, so two concurrent `tole config trust` runs can
 lose one of the two records (the loser is simply asked again; the file itself
 is replaced atomically and never corrupted).
 
+### Global session index (#439)
+
+`$CODECORA_HOME/tole/sessions-index.jsonl` maps session ids to session files
+and cwds across projects. It holds no conversation content (previews are
+read from the session file at list time), is created owner-only (0600), is
+append-only (one `write` per line; a torn or foreign line is skipped, never
+fatal) and is best effort: a failure never affects a session, and
+`TOLE_NO_SESSION_INDEX=1` disables it. The index never moves a session
+across projects: `resume <id>` for a session of another project REFUSES and
+prints the command to run in that project, because this process's workspace
+jail, project config and trust were resolved for the current directory and
+would otherwise act on the wrong tree. Anyone who can write the index can
+already write the session files it points to (same home).
+
 ### User config (#433)
 
 `$CODECORA_HOME/tole/config.toml` (default `~/.codecora/tole/config.toml`) has

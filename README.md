@@ -105,6 +105,7 @@ tole chat --memory uteke                    # …with cross-session memory
 tole chat --resume <id>                     # pick the thread back up (also: --last)
 tole resume <id> "next instruction"         # continue a settled session
 tole sessions                               # list durable sessions
+tole sessions --all [--grep <text>]         # every project's sessions + where they live
 tole status <id>                            # pc / seq / turns / token + cache usage / request-size split
 ```
 

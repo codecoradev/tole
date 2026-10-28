@@ -438,13 +438,15 @@ pub fn open_session(
         tole_core::storage::JsonlStorage::open(dir.join(format!("{session_id}.jsonl")))
             .map_err(|e| format!("loading session: {e}"))?
     } else {
-        tole_core::storage::JsonlStorage::create_with(
+        let storage = tole_core::storage::JsonlStorage::create_with(
             &dir,
             session_id,
             None,
             system_prompt.as_deref(),
         )
-        .map_err(|e| format!("creating session: {e}"))?
+        .map_err(|e| format!("creating session: {e}"))?;
+        crate::session_index::record(&dir, session_id, "server");
+        storage
     };
     // Task-list tools (issue #198): registered after the storage open —
     // the state is seeded from the replayed transcript, so crash-resume

@@ -230,6 +230,7 @@ pub fn run_mission(
             let storage =
                 JsonlStorage::create_with(sessions_dir, &session_id, None, Some(&system_prompt))
                     .with_context(|| format!("creating mission session {session_id}"))?;
+            tole_cli::session_index::record(sessions_dir, &session_id, "mission");
             eprintln!("mission: session {session_id}");
             (storage, session_id, Some(cfg.goal.clone()))
         }
