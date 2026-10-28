@@ -305,9 +305,10 @@ pub fn pattern_denies(pattern: &str, req: &ToolRequest<'_>) -> bool {
 /// matched by the parent's argument at that position, extra arguments only
 /// under a parent's trailing lone `*`, and a child's own trailing `*` only
 /// under one. A parent tool-name pattern covering `run_command` covers
-/// every child command pattern. Anything else is a glob over the pattern
-/// text (the child's text taken literally, so a child glob that is wider
-/// than the parent's is refused).
+/// every child command pattern — unless the parent list holds a command
+/// deny, which [`list_covers`] handles. Anything else is a glob over the
+/// pattern text, with [`token_covers`] refusing a child glob wider than
+/// the parent's.
 pub fn pattern_covers(parent: &str, child: &str) -> bool {
     if parent.starts_with(DENY_PREFIX) || child.starts_with(DENY_PREFIX) {
         return false;
@@ -320,8 +321,40 @@ pub fn pattern_covers(parent: &str, child: &str) -> bool {
         // A command pattern never covers a tool-wide (or other) pattern.
         (Some(_), None) => false,
         (None, Some(_)) => !parent.ends_with(WORKSPACE_GUARD) && glob_match(parent, "run_command"),
-        (None, None) => glob_match(parent, child),
+        (None, None) => token_covers(parent, child),
     }
+}
+
+/// Does `parent` (a glob) cover every text the child glob `child` can
+/// match? A child without `*` / `?` is plain text: a glob match decides.
+/// A child WITH them is covered only by the identical glob or a lone `*`
+/// — anything finer would need real glob containment, and a wrong "yes"
+/// widens a child (`a?c` must not cover `a*c`).
+fn token_covers(parent: &str, child: &str) -> bool {
+    if child.contains(['*', '?']) {
+        parent == child || parent == "*"
+    } else {
+        glob_match(parent, child)
+    }
+}
+
+/// Does a PARENT allow LIST cover one CHILD allow pattern (#438)? Like
+/// [`pattern_covers`] over the parent's patterns, with one rule that needs
+/// the whole list: under a parent `run_command` deny, the parent runs a
+/// command unattended only through an explicit `run_command:` allow
+/// ([`pattern_verdict`] fails closed), so a child command pattern may only
+/// be covered by such a parent pattern — never by a bare `run_command`,
+/// `run_*` or `*`.
+pub fn list_covers(parent: &[String], child: &str) -> bool {
+    let command_deny = parent.iter().any(|p| {
+        p.strip_prefix(DENY_PREFIX)
+            .is_some_and(|q| q.starts_with(COMMAND_PATTERN_PREFIX))
+    });
+    let child_is_command = child.starts_with(COMMAND_PATTERN_PREFIX);
+    parent.iter().any(|pp| {
+        (!(command_deny && child_is_command) || pp.starts_with(COMMAND_PATTERN_PREFIX))
+            && pattern_covers(pp, child)
+    })
 }
 
 #[cfg(feature = "shell-tools")]
@@ -352,7 +385,7 @@ fn command_pattern_covers(parent: &str, child: &str) -> bool {
     pf.iter()
         .zip(&cf)
         .skip(1)
-        .all(|(pt, ct)| glob_match(pt, ct))
+        .all(|(pt, ct)| token_covers(pt, ct))
 }
 
 /// Without `run_command` in the build only an identical pattern covers.
@@ -500,6 +533,13 @@ impl AllowlistApprover {
 
     /// Deny exactly the listed glob patterns; allow everything else.
     /// Destructive tools remain always-denied regardless of patterns.
+    ///
+    /// A `run_command:` pattern here denies EVERY `run_command` call (#438):
+    /// a deny list cannot name all the ways to reach a program (`env rm`,
+    /// `sh -c …`), and this mode has no allow patterns that could name
+    /// safe commands — the same fail-closed rule [`pattern_verdict`]
+    /// applies to allow lists. Deny `run_command` by tool name to say so
+    /// explicitly, or use an allow list with `run_command:` allows.
     pub fn deny_only(patterns: Vec<String>) -> Self {
         Self {
             patterns,
@@ -515,11 +555,20 @@ impl AllowlistApprover {
         if self.deny_mode {
             // deny_only: every pattern denies (a `!` is redundant here);
             // non-matches fall to the default.
+            let unprefixed =
+                |p: &'_ String| -> String { p.strip_prefix(DENY_PREFIX).unwrap_or(p).to_string() };
             let matched = self
                 .patterns
                 .iter()
-                .any(|p| pattern_matches(p.strip_prefix(DENY_PREFIX).unwrap_or(p), req, true));
-            if matched {
+                .any(|p| pattern_matches(&unprefixed(p), req, true));
+            // Fail closed (see `deny_only`): any command deny refuses every
+            // run_command call.
+            let command_deny = req.tool == "run_command"
+                && self
+                    .patterns
+                    .iter()
+                    .any(|p| unprefixed(p).starts_with(COMMAND_PATTERN_PREFIX));
+            if matched || command_deny {
                 return Verdict::Deny;
             }
         } else {
@@ -825,7 +874,13 @@ mod tests {
         assert_eq!(a.decide(&r), Verdict::Deny);
         // deny_only treats `run_command:` patterns command-wise too.
         let d = AllowlistApprover::deny_only(vec!["run_command:rm *".into()]);
-        assert_eq!(d.decide(&r), Verdict::Allow, "ls is not rm in deny_only");
+        assert_eq!(
+            d.decide(&r),
+            Verdict::Deny,
+            "fail closed: a command deny refuses every run_command here"
+        );
+        // Other tools still follow the default.
+        assert_eq!(d.decide(&req("write_file", Risk::Write)), Verdict::Allow);
         let input = serde_json::json!({ "command": "rm x" });
         let r = ToolRequest { input: &input, ..r };
         assert_eq!(d.decide(&r), Verdict::Deny);
@@ -861,12 +916,44 @@ mod tests {
         // (the program is literal for an allow), so it covers nothing.
         assert!(!c("run_command:*", "run_command:git push *"));
         assert!(!c("run_command:g*", "run_command:rm *"));
+        // A child wildcard is covered only by the same glob or a lone `*`.
+        assert!(!c("run_command:git a?c", "run_command:git a*c"));
+        assert!(
+            c("run_command:git *", "run_command:git log*"),
+            "trailing * is any args"
+        );
+        assert!(c("run_command:git log *", "run_command:git log -n*"));
+        assert!(!c("w?", "w*"));
+        assert!(c("write_*", "write_*"));
         // Tool-wide parents cover command children; denies cover nothing.
         assert!(c("run_command", "run_command:rm -rf *"));
         assert!(c("*", "run_command:anything *"));
         assert!(!c("!run_command", "run_command:ls"));
         assert!(!c("run_command", "!run_command:ls"));
         assert!(c("write_*", "write_file"));
+    }
+
+    #[cfg(feature = "shell-tools")]
+    #[test]
+    fn under_a_parent_command_deny_only_command_allows_cover_a_child() {
+        let parent: Vec<String> = ["run_command", "!run_command:rm *"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        // The parent itself would ASK for `ls`: a child may not get it free.
+        assert!(!list_covers(&parent, "run_command:ls *"));
+        assert!(list_covers(&parent, "run_command"), "same as the parent");
+        let parent: Vec<String> = ["run_command:ls *", "!run_command:rm *"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(list_covers(&parent, "run_command:ls -la"));
+        assert!(!list_covers(&parent, "run_command:cat x"));
+        // Without a command deny a bare tool allow covers command children.
+        assert!(list_covers(
+            &["run_command".to_string()],
+            "run_command:ls *"
+        ));
     }
 
     #[test]

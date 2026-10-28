@@ -653,12 +653,7 @@ impl Tool for AgentStartTool {
             let uncovered: Vec<&String> = requested
                 .iter()
                 .filter(|p| !is_deny(p))
-                .filter(|p| {
-                    !self
-                        .parent_allows
-                        .iter()
-                        .any(|pp| crate::approval::pattern_covers(pp, p))
-                })
+                .filter(|p| !crate::approval::list_covers(&self.parent_allows, p))
                 .collect();
             if !uncovered.is_empty() {
                 return Err(format!(
