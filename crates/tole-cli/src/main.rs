@@ -304,7 +304,16 @@ enum Command {
         token: Option<String>,
     },
     /// List sessions in the sessions dir, newest first.
-    Sessions,
+    Sessions {
+        /// List sessions from every project (the global session index,
+        /// #439) instead of this directory's sessions dir.
+        #[arg(long)]
+        all: bool,
+        /// With --all: only sessions whose first prompt, name or cwd
+        /// contains this text (case-insensitive).
+        #[arg(long, requires = "all")]
+        grep: Option<String>,
+    },
 
     /// Is the configured provider/model actually usable? Tiered checks —
     /// offline (wiring), catalog (live /models), full (chat + streaming +
@@ -1051,7 +1060,8 @@ fn dispatch(cli: Cli) -> Result<()> {
                 turnend: host.on_turnend.clone(),
             })
         }
-        Command::Sessions => sessions_command(&sessions_dir),
+        Command::Sessions { all: false, .. } => sessions_command(&sessions_dir),
+        Command::Sessions { all: true, grep } => all_sessions_command(grep.as_deref()),
         Command::Doctor {
             tier,
             no_ledger,
@@ -1634,6 +1644,7 @@ fn run_command(
         name,
     )
     .with_context(|| format!("creating session {session_id}"))?;
+    tole_cli::session_index::record(sessions_dir, &session_id, "run");
     println!("session: {session_id}");
     if let Some(alias) = name {
         println!("name: {alias}");
@@ -1704,10 +1715,18 @@ fn resume_command(
         id.to_string()
     } else {
         let mut best: Option<(std::time::SystemTime, String)> = None;
-        for entry in std::fs::read_dir(sessions_dir)
-            .with_context(|| format!("listing {}", sessions_dir.display()))?
-            .flatten()
-        {
+        // No sessions dir here is no local match (the index may still know
+        // the id, #439); any other listing error is real.
+        let listing = match std::fs::read_dir(sessions_dir) {
+            Ok(rd) => Some(rd),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                return Err(
+                    anyhow::Error::new(e).context(format!("listing {}", sessions_dir.display()))
+                )
+            }
+        };
+        for entry in listing.into_iter().flatten().flatten() {
             let file_name = entry.file_name().to_string_lossy().to_string();
             let Some(stem) = file_name.strip_suffix(".jsonl") else {
                 continue;
@@ -1728,10 +1747,20 @@ fn resume_command(
         }
         match best {
             Some((_, resolved)) => resolved,
-            None => anyhow::bail!(
-                "no session with id or name {id:?} in {}",
-                sessions_dir.display()
-            ),
+            None => {
+                // Not here: the global index (#439) knows which project
+                // directory a session id lives in.
+                let indexed = tole_cli::session_index::index_path()
+                    .and_then(|idx| tole_cli::session_index::find(&idx, id));
+                if let Some(dir) = indexed.as_ref().and_then(|e| e.file.parent()) {
+                    eprintln!("tole: resuming {id} from {}", dir.display());
+                    return resume_command(dir, id, prompt, allow_patterns, yes, host);
+                }
+                anyhow::bail!(
+                    "no session with id or name {id:?} in {} (nor in the session index)",
+                    sessions_dir.display()
+                )
+            }
         }
     };
     let path = session_path(sessions_dir, &id);
@@ -1935,6 +1964,39 @@ fn sessions_command(sessions_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// `tole sessions --all` (#439): every indexed session whose file still
+/// exists, newest first, with its project directory.
+fn all_sessions_command(grep: Option<&str>) -> Result<()> {
+    let index = tole_cli::session_index::index_path()
+        .context("cannot locate the session index: set CODECORA_HOME or HOME")?;
+    let rows = tole_cli::session_index::rows(&index, grep);
+    if rows.is_empty() {
+        println!("no indexed sessions in {}", index.display());
+        return Ok(());
+    }
+    println!(
+        "{:<26} {:<16} {:<10} {:>5}  {:<16}  cwd / first prompt",
+        "session", "name", "pc", "turns", "started"
+    );
+    for r in &rows {
+        let started =
+            fmt_mtime(std::time::UNIX_EPOCH + std::time::Duration::from_secs(r.entry.created_at));
+        println!(
+            "{:<26} {:<16} {:<10} {:>5}  {:<16}  {}",
+            r.entry.id,
+            r.name.as_deref().unwrap_or("-"),
+            r.pc,
+            r.turns,
+            started,
+            r.entry.cwd.display()
+        );
+        if !r.preview.is_empty() {
+            println!("{:<26} {}", "", r.preview);
+        }
+    }
+    Ok(())
+}
+
 /// `YYYY-mm-dd HH:MM` in UTC — stable, no chrono dep.
 fn fmt_mtime(t: std::time::SystemTime) -> String {
     let secs = t
@@ -2078,8 +2140,11 @@ fn chat_command(
         // after the cora review flow when its tools are attached (#422).
         let review = review_section(&registry);
         let system_prompt = system_prompt.map(|p| format!("{p}{review}{skill_sections}"));
-        JsonlStorage::create_with(sessions_dir, &session_id, None, system_prompt.as_deref())
-            .with_context(|| format!("creating session {session_id}"))?
+        let storage =
+            JsonlStorage::create_with(sessions_dir, &session_id, None, system_prompt.as_deref())
+                .with_context(|| format!("creating session {session_id}"))?;
+        tole_cli::session_index::record(sessions_dir, &session_id, "chat");
+        storage
     } else {
         JsonlStorage::open(&path).context("replaying session log")?
     };

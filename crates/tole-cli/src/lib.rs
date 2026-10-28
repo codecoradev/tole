@@ -13,6 +13,7 @@ pub mod ecosystem;
 pub mod handoff;
 pub mod provider_chain;
 pub mod session_host;
+pub mod session_index;
 pub mod session_tools;
 pub mod sibling;
 pub mod tool_roster;
