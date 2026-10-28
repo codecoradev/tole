@@ -154,6 +154,17 @@ struct Cli {
     #[arg(long, global = true, conflicts_with = "config")]
     no_config: bool,
 
+    /// Compact the conversation between turns once a prompt reaches this
+    /// fraction of the model's context window (#440; `chat`, `resume`,
+    /// `mission`). Default 0.8. The window comes from TOLE_CONTEXT_WINDOW /
+    /// config `context_window`, else the provider's /models.
+    #[arg(long, global = true, value_parser = parse_fraction)]
+    compact_at: Option<f64>,
+
+    /// Never compact the conversation (#440).
+    #[arg(long, global = true)]
+    no_compaction: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -510,6 +521,16 @@ fn gate_policy(cmd: &Command) -> GatePolicy {
 
 /// What the command line supplied for the config-applied keys. ONE place,
 /// shared by startup and `tole config check`.
+/// `--compact-at`: a fraction in (0, 1].
+fn parse_fraction(s: &str) -> std::result::Result<f64, String> {
+    let v: f64 = s.parse().map_err(|_| format!("{s:?} is not a number"))?;
+    if v > 0.0 && v <= 1.0 {
+        Ok(v)
+    } else {
+        Err(format!("must be greater than 0 and at most 1, got {v}"))
+    }
+}
+
 fn config_flags(cli: &Cli) -> tole_cli::config_apply::Flags {
     let mut f = tole_cli::config_apply::Flags {
         sessions_dir: cli.sessions_dir.clone(),
@@ -521,6 +542,8 @@ fn config_flags(cli: &Cli) -> tole_cli::config_apply::Flags {
         skill: cli.skill.clone(),
         plan_mode: cli.plan_mode,
         no_skills: cli.no_skills,
+        compact_at: cli.compact_at,
+        no_compaction: cli.no_compaction,
         ..Default::default()
     };
     #[cfg(feature = "shell-tools")]
@@ -733,6 +756,11 @@ fn dispatch(cli: Cli) -> Result<()> {
         memory: resolve_memory(settings.memory.as_ref().map(|m| m.value.as_str()))?,
         #[cfg(not(feature = "shell-tools"))]
         memory: (),
+        compaction: tole_cli::compaction_host::CompactionSettings {
+            enabled: !settings.no_compaction.value,
+            at: settings.compact_at.value,
+            window: settings.context_window.as_ref().map(|w| w.value),
+        },
     };
     // Trust presets (issue #159): expand once, before dispatch — every
     // allow_patterns-consuming subcommand appends these. --trust >
@@ -952,6 +980,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                     verify: settings.verify.as_ref().map(|v| v.value.clone()),
                     verify_timeout_secs: settings.verify_timeout.value,
                     resume_id: resume,
+                    compaction: host.compaction,
                 },
                 registry,
                 &sessions_dir,
@@ -1138,6 +1167,8 @@ struct HostConfig {
     memory: (),
     #[cfg(feature = "shell-tools")]
     memory: Option<tole_core::memory::MemoryConfig>,
+    /// Context compaction between turns (#440).
+    compaction: tole_cli::compaction_host::CompactionSettings,
 }
 
 impl HostConfig {
@@ -1812,6 +1843,7 @@ fn resume_command(
     // re-applies exactly what the session was created with (never the
     // ambient env, which may have changed since).
     let pinned = storage.system_prompt().map(str::to_string);
+    let mut compactor = tole_cli::compaction_host::for_session(host.compaction, &cfg, &storage);
     let mut provider = tole_cli::turn_runner::session_provider(
         cfg,
         &storage,
@@ -1828,6 +1860,9 @@ fn resume_command(
             // machine accepts a user message at a turn boundary, so
             // reuse run_turn on the resumed storage instead of the
             // approvals-only resume protocol.
+            // Context compaction (#440) between the settled turn and the
+            // new instruction.
+            compactor.before_turn(&mut storage, &mut *provider);
             let outcome =
                 run_turn_with_cancel(&mut storage, &mut provider, &registry, text, &cancel)?;
             // Memory loop (CodeCora scan 2026-09-18): a settled resumed
@@ -1867,6 +1902,9 @@ fn status_command(sessions_dir: &Path, id: &str) -> Result<()> {
     // whether a system prompt is pinned.
     let turns = tole_core::transcript::turn_count(storage.entries());
     println!("turns:   {turns} (user messages)");
+    for line in tole_cli::compaction_host::status_lines(storage.entries()) {
+        println!("{line}");
+    }
     println!(
         "system:  {}",
         match storage.system_prompt() {
@@ -2170,6 +2208,7 @@ fn chat_command(
     // B2: fresh sessions pin the resolved prompt; resumed sessions re-apply
     // the header-pinned one (see create_with above / JsonlStorage::open).
     let pinned = storage.system_prompt().map(str::to_string);
+    let mut compactor = tole_cli::compaction_host::for_session(host.compaction, &cfg, &storage);
     let mut provider = tole_cli::turn_runner::session_provider(
         cfg,
         &storage,
@@ -2252,6 +2291,9 @@ fn chat_command(
         let outcome = loop {
             match storage.state().pc {
                 tole_core::state::Pc::Idle | tole_core::state::Pc::Final => {
+                    // Context compaction (#440): only here, between
+                    // settled turns.
+                    compactor.before_turn(&mut storage, &mut *provider);
                     break run_turn_with_cancel(
                         &mut storage,
                         &mut provider,

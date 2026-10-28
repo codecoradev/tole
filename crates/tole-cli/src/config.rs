@@ -72,6 +72,12 @@ pub struct Config {
     pub skill: Option<Vec<String>>,
     pub no_skills: Option<bool>,
     pub system_prompt: Option<String>,
+    /// The model's context window in tokens (#440); overrides `/models`.
+    pub context_window: Option<u64>,
+    /// Fraction of the context window that triggers compaction (#440).
+    pub compact_at: Option<f64>,
+    /// Turn context compaction off (#440).
+    pub no_compaction: Option<bool>,
     pub mission: Option<MissionConfig>,
     /// Keys (rendered names, e.g. `model`, `mission.verify`) whose value
     /// came from the user layer; set by [`layered`], never by the file.
@@ -234,7 +240,25 @@ pub fn parse(src: &str, path: &Path) -> Result<Config, ConfigError> {
     let doc = DeTable::parse(src).map_err(toml_err)?;
     check_forbidden(doc.get_ref(), None, src, path)?;
     check_trust(doc.get_ref(), src, path)?;
-    toml::from_str::<Config>(src).map_err(toml_err)
+    let cfg = toml::from_str::<Config>(src).map_err(toml_err)?;
+    let range = |message: String| ConfigError {
+        path: path.to_path_buf(),
+        line_col: None,
+        message,
+    };
+    if let Some(at) = cfg.compact_at {
+        if !(at > 0.0 && at <= 1.0) {
+            return Err(range(format!(
+                "compact_at must be greater than 0 and at most 1, got {at}"
+            )));
+        }
+    }
+    if cfg.context_window == Some(0) {
+        return Err(range(
+            "context_window must be a positive number of tokens".into(),
+        ));
+    }
+    Ok(cfg)
 }
 
 /// Read (bounded) and validate the config file at `path`.
@@ -334,6 +358,21 @@ pub fn layered(project: &Config, user: &Config) -> Config {
             text,
             u,
         ),
+        context_window: pick(
+            "context_window",
+            &project.context_window,
+            &user.context_window,
+            any,
+            u,
+        ),
+        compact_at: pick("compact_at", &project.compact_at, &user.compact_at, any, u),
+        no_compaction: pick(
+            "no_compaction",
+            &project.no_compaction,
+            &user.no_compaction,
+            any,
+            u,
+        ),
         mission: (project.mission.is_some() || user.mission.is_some()).then_some(mission),
         user_keys: BTreeSet::new(),
     };
@@ -421,6 +460,21 @@ pub fn render_with(cfg: &Config, tag: &str, ann: &Annotations) -> Vec<String> {
                 quote(p)
             }
         }),
+    );
+    scalar(
+        &mut out,
+        "context_window",
+        cfg.context_window.map(|n| n.to_string()),
+    );
+    scalar(
+        &mut out,
+        "compact_at",
+        cfg.compact_at.map(|n| n.to_string()),
+    );
+    scalar(
+        &mut out,
+        "no_compaction",
+        cfg.no_compaction.map(|b| b.to_string()),
     );
     if let Some(m) = &cfg.mission {
         scalar(
@@ -543,6 +597,9 @@ on_turnend = ["cargo check"]
 skill = ["skills/x/SKILL.md"]
 no_skills = false
 system_prompt = "hi"
+context_window = 131072
+compact_at = 0.75
+no_compaction = false
 
 [mission]
 max_steps = 10
@@ -570,6 +627,26 @@ verify_timeout = 60
         assert!(lines.contains(&"model = \"m\"  [config]".to_string()));
         assert!(lines.contains(&"  - \"internal\"".to_string()));
         assert!(lines.contains(&"mission.max_tokens = 1000  [config]".to_string()));
+    }
+
+    #[test]
+    fn compaction_keys_are_range_checked() {
+        let c = parse(FULL, &p()).unwrap();
+        assert_eq!(
+            (c.context_window, c.compact_at, c.no_compaction),
+            (Some(131072), Some(0.75), Some(false))
+        );
+        for bad in [
+            "compact_at = 0.0\n",
+            "compact_at = 1.5\n",
+            "compact_at = -0.2\n",
+        ] {
+            let e = parse(bad, &p()).unwrap_err();
+            assert!(e.message.contains("compact_at"), "{bad} -> {e}");
+        }
+        assert!(parse("compact_at = 1.0\n", &p()).is_ok());
+        assert!(parse("context_window = 0\n", &p()).is_err());
+        assert!(parse("context_window = -1\n", &p()).is_err());
     }
 
     #[test]

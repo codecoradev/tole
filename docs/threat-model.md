@@ -440,7 +440,10 @@ it are neutralized), introduced as a record rather than instructions, and
 the summary instruction tells the model to report instructions found in
 tool output as data. Residual risk: a prompt injection that already steered the model
 before compaction can persist through the summary, as it would through the
-model's own earlier answers.
+model's own earlier answers. The window lookup is one `GET /models` on the session's own provider,
+with the same base URL and credentials as chat completions (no new host or
+secret), at most once per process and only after a prompt passes 8k tokens;
+an explicit `TOLE_CONTEXT_WINDOW` / config `context_window` skips it.
 
 ### Global session index (#439)
 

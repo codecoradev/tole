@@ -95,6 +95,8 @@ pub struct MissionConfig {
     /// Per-run timeout of the `--verify` command (seconds). Default 300
     /// — `cargo test`-class suites are the advertised use.
     pub verify_timeout_secs: u64,
+    /// Context compaction between chained turns (#440).
+    pub compaction: tole_cli::compaction_host::CompactionSettings,
 }
 
 /// The mission addendum appended to the default system prompt.
@@ -240,6 +242,8 @@ pub fn run_mission(
     tole_cli::tool_roster::register_todo(&mut registry, storage.entries(), false)?;
 
     let system_prompt = storage.system_prompt().map(str::to_owned);
+    let mut compactor =
+        tole_cli::compaction_host::for_session(cfg.compaction, &provider_cfg, &storage);
     let mut provider = tole_cli::turn_runner::session_provider(
         provider_cfg,
         &storage,
@@ -300,6 +304,9 @@ pub fn run_mission(
             status = "error";
             break;
         };
+        // Context compaction (#440): between chained turns, after the
+        // budget checks; the summary call's tokens count toward them.
+        compactor.before_turn(&mut storage, &mut *provider);
         let outcome = match run_turn(&mut storage, &mut provider, &registry, &prompt) {
             Ok(o) => o,
             Err(e) => {

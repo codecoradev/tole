@@ -792,11 +792,76 @@ pub fn fetch_model_ids_with_timeout(
     Ok(out)
 }
 
+/// The context window a `/models` entry reports, in tokens (#440). Servers
+/// name it differently: `context_length` (OpenRouter, LM Studio),
+/// `context_window` (Groq), `max_context_length`, `max_model_len` (vLLM),
+/// `max_input_tokens` (LiteLLM-style), or `top_provider.context_length`
+/// (OpenRouter). `None` when none is a positive integer.
+pub fn context_window_of(model: &Value) -> Option<u64> {
+    let direct = [
+        "context_length",
+        "context_window",
+        "max_context_length",
+        "max_model_len",
+        "max_input_tokens",
+    ]
+    .iter()
+    .find_map(|k| model.get(*k).and_then(Value::as_u64));
+    direct
+        .or_else(|| model["top_provider"]["context_length"].as_u64())
+        .filter(|w| *w > 0)
+}
+
+/// The context window `GET /models` reports for `model` (#440): `Ok(None)`
+/// when the catalog lists the model without a window (or not at all).
+/// Same base_url / credentials as chat completions.
+pub fn fetch_context_window(
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    timeout: Duration,
+) -> Result<Option<u64>, String> {
+    let agent = OpenAiProvider::build_agent(timeout);
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let mut res = agent
+        .get(&url)
+        .header("Authorization", &format!("Bearer {api_key}"))
+        .call()
+        .map_err(|e| scrub(&format!("models probe: {e}"), api_key))?;
+    let body: Value = res
+        .body_mut()
+        .read_json()
+        .map_err(|e| scrub(&format!("models probe: {e}"), api_key))?;
+    Ok(body["data"]
+        .as_array()
+        .and_then(|all| all.iter().find(|m| m["id"].as_str() == Some(model)))
+        .and_then(context_window_of))
+}
+
 use crate::entry::Entry;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_window_is_read_from_the_usual_catalog_fields() {
+        for (entry, want) in [
+            (json!({"id": "m", "context_length": 131072}), Some(131072)),
+            (json!({"id": "m", "context_window": 8192}), Some(8192)),
+            (json!({"id": "m", "max_model_len": 32768}), Some(32768)),
+            (json!({"id": "m", "max_input_tokens": 200000}), Some(200000)),
+            (
+                json!({"id": "m", "top_provider": {"context_length": 64000}}),
+                Some(64000),
+            ),
+            (json!({"id": "m", "context_length": 0}), None),
+            (json!({"id": "m", "context_length": "big"}), None),
+            (json!({"id": "m", "owned_by": "x"}), None),
+        ] {
+            assert_eq!(context_window_of(&entry), want, "{entry}");
+        }
+    }
 
     #[test]
     fn config_display_never_leaks_key() {
