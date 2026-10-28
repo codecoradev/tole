@@ -181,15 +181,21 @@ written. Choose allows with care: `run_command:git *` also allows
 `git -c core.pager=… log`, `git config alias.x '!…'` and other ways a
 program runs code from its arguments.
 
-A DENY (`!…`) wins over every allow and over `--yes`, and its program
-matches by file name too. A deny list cannot be complete — `env rm`,
-`sh -c 'rm …'`, `find -exec rm`, `python -c` all reach `rm` — so: while any
-`run_command` deny is set, known wrappers (`sh`, `bash`, `env`, `sudo`,
-`xargs`, `busybox`, `timeout`, ...) always ask the human (refused where
-nobody can be asked), and the documented boundary is the ALLOWLIST: a
-deny narrows `--yes`, it does not make `--yes` safe. Denies travel with
-allow lists (config, ACP, serve) and a child agent always inherits its
-parent's denies.
+A DENY (`!…`) wins over every allow and over `--yes`; it compares the
+program by file name, case-insensitively and without a Windows executable
+extension, so `/bin/RM` and `rm.exe` do not slip past `rm *`. A deny list
+cannot be complete — `env rm`, `sh -c 'rm …'`, `find -exec rm`,
+`python -c`, `git -c …`, `make` all reach other programs — so the rule
+FAILS CLOSED: while any `run_command` deny is set, a command runs
+unattended only when an explicit `run_command:` allow names it (a bare
+`run_command` allow or `--yes` is not enough), never when its program is a
+known wrapper (`sh`, `bash`, `env`, `sudo`, `xargs`, ...), and everything
+else asks the human (refused where nobody can be asked). The ALLOWLIST is
+the boundary. Denies travel with allow lists (config, ACP, serve), a child
+agent always inherits its parent's denies, and a child's command pattern
+must be covered argument by argument by a parent pattern: a parent whose
+program token is a glob covers nothing, because for an allow the program is
+literal.
 
 ## Memory loop — decision typing (#143)
 

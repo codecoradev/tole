@@ -657,8 +657,7 @@ impl Tool for AgentStartTool {
                     !self
                         .parent_allows
                         .iter()
-                        .filter(|pp| !is_deny(pp))
-                        .any(|pp| crate::approval::glob_match(pp, p))
+                        .any(|pp| crate::approval::pattern_covers(pp, p))
                 })
                 .collect();
             if !uncovered.is_empty() {

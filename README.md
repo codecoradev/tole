@@ -118,7 +118,9 @@ header), `--workspace <dir>` (file-tools jail root), `--allow <glob>`
 `run_command:<argv>` matches commands by argument, e.g.
 `--allow 'run_command:git status *'` — a lone `*` is "any further
 arguments", the program is matched literally; a leading `!` denies and wins
-over every allow and `--yes`, e.g. `--allow '!run_command:rm *'`),
+over every allow and `--yes`, e.g. `--allow '!run_command:rm *'`; with a
+command deny set, only commands an explicit `run_command:` allow names run
+unattended — everything else asks),
 `--yes` (auto-allow every Write; Destructive still prompts), `--mcp-server`,
 `--no-auto-mcp` (skip the cora auto-preset), `--trust <preset>` (one-word
 trust: `internal` / `read_only` / `workspace` — `read_only` plus

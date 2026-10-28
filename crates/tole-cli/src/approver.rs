@@ -384,12 +384,21 @@ mod tests {
         let ls = serde_json::json!({ "command": "ls" });
         let env = serde_json::json!({ "command": "env rm -rf build" });
         let yes = InteractiveApprover::new(Panics)
-            .with_allow_patterns(vec!["!run_command:rm *".into()])
+            .with_allow_patterns(vec!["run_command:ls".into(), "!run_command:rm *".into()])
             .with_auto_write(true);
         if cfg!(feature = "shell-tools") {
             assert_eq!(yes.decide(&request(&rm)), Verdict::Deny);
         }
         assert_eq!(yes.decide(&request(&ls)), Verdict::Allow);
+        // Fail closed: under a command deny, --yes alone does not run an
+        // unnamed command unattended — the human is asked.
+        let other = serde_json::json!({ "command": "curl x" });
+        let asks_yes = InteractiveApprover::new(Says(Verdict::Deny))
+            .with_allow_patterns(vec!["!run_command:rm *".into()])
+            .with_auto_write(true);
+        if cfg!(feature = "shell-tools") {
+            assert_eq!(asks_yes.decide(&request(&other)), Verdict::Deny, "asked, N");
+        }
         let asks = InteractiveApprover::new(Says(Verdict::Deny))
             .with_allow_patterns(vec!["!run_command:rm *".into()])
             .with_auto_write(true);

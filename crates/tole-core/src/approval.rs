@@ -211,6 +211,19 @@ fn program_name(arg0: &str) -> &str {
     arg0.rsplit(['/', '\\']).next().unwrap_or(arg0)
 }
 
+/// The program as a DENY compares it: file name, ASCII-lowercased, a
+/// Windows executable extension dropped — so `/bin/rm`, `RM` and
+/// `rm.exe` are all `rm`.
+fn deny_program(arg0: &str) -> String {
+    let name = program_name(arg0).to_ascii_lowercase();
+    for ext in [".exe", ".cmd", ".bat", ".com"] {
+        if let Some(stem) = name.strip_suffix(ext) {
+            return stem.to_string();
+        }
+    }
+    name
+}
+
 /// Match a command pattern's tokens against an argv. Each token is a
 /// [`glob_match`] over ONE argument; a final lone `*` token stands for
 /// any remaining arguments (zero or more), otherwise the counts must be
@@ -228,7 +241,7 @@ fn argv_matches(pattern: &str, argv: &[String], deny: bool) -> bool {
     };
     let (a0, rest) = (&argv[0], &argv[1..]);
     let program_ok = if deny {
-        glob_match(p0, a0) || glob_match(p0, program_name(a0))
+        glob_match(&deny_program(p0), &deny_program(a0))
     } else {
         p0 == a0
     };
@@ -285,6 +298,69 @@ pub fn pattern_denies(pattern: &str, req: &ToolRequest<'_>) -> bool {
         .is_some_and(|p| pattern_matches(p, req, true))
 }
 
+/// Does a PARENT allow pattern cover a CHILD allow pattern, i.e. can the
+/// child never be allowed more than the parent (#174, #438)? Deny
+/// patterns never cover anything. A child `run_command:` pattern is
+/// checked per argument: the same literal program, each child argument
+/// matched by the parent's argument at that position, extra arguments only
+/// under a parent's trailing lone `*`, and a child's own trailing `*` only
+/// under one. A parent tool-name pattern covering `run_command` covers
+/// every child command pattern. Anything else is a glob over the pattern
+/// text (the child's text taken literally, so a child glob that is wider
+/// than the parent's is refused).
+pub fn pattern_covers(parent: &str, child: &str) -> bool {
+    if parent.starts_with(DENY_PREFIX) || child.starts_with(DENY_PREFIX) {
+        return false;
+    }
+    match (
+        parent.strip_prefix(COMMAND_PATTERN_PREFIX),
+        child.strip_prefix(COMMAND_PATTERN_PREFIX),
+    ) {
+        (Some(p), Some(c)) => command_pattern_covers(p, c),
+        // A command pattern never covers a tool-wide (or other) pattern.
+        (Some(_), None) => false,
+        (None, Some(_)) => !parent.ends_with(WORKSPACE_GUARD) && glob_match(parent, "run_command"),
+        (None, None) => glob_match(parent, child),
+    }
+}
+
+#[cfg(feature = "shell-tools")]
+fn command_pattern_covers(parent: &str, child: &str) -> bool {
+    use crate::run_command::RunCommandTool;
+    let (Ok(p), Ok(c)) = (
+        RunCommandTool::split_argv(parent),
+        RunCommandTool::split_argv(child),
+    ) else {
+        return false;
+    };
+    let split = |v: &[String]| -> (Vec<String>, bool) {
+        match v.split_last() {
+            Some((last, head)) if last == "*" => (head.to_vec(), true),
+            _ => (v.to_vec(), false),
+        }
+    };
+    let ((pf, p_open), (cf, c_open)) = (split(&p), split(&c));
+    let (Some(p0), Some(c0)) = (pf.first(), cf.first()) else {
+        return false;
+    };
+    if p0 != c0 || (c_open && !p_open) {
+        return false;
+    }
+    if (p_open && cf.len() < pf.len()) || (!p_open && cf.len() != pf.len()) {
+        return false;
+    }
+    pf.iter()
+        .zip(&cf)
+        .skip(1)
+        .all(|(pt, ct)| glob_match(pt, ct))
+}
+
+/// Without `run_command` in the build only an identical pattern covers.
+#[cfg(not(feature = "shell-tools"))]
+fn command_pattern_covers(parent: &str, child: &str) -> bool {
+    parent == child
+}
+
 /// What an allow list says about one request, before any default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PatternVerdict {
@@ -311,8 +387,17 @@ pub fn pattern_verdict(patterns: &[String], req: &ToolRequest<'_>) -> PatternVer
     });
     if command_deny {
         if let Some(argv) = command_argv(req) {
-            let name = program_name(&argv[0]).to_ascii_lowercase();
-            if COMMAND_WRAPPERS.contains(&name.as_str()) {
+            // Fail closed: a deny list can never name every way to reach a
+            // program (interpreters, `find -exec`, `git -c`, `make`, ...).
+            // While a command deny is set, a command runs unattended ONLY
+            // when an explicit `run_command:` allow names it — a bare
+            // `run_command` allow or `--yes` is not enough — and never when
+            // its program is a known wrapper.
+            let wrapper = COMMAND_WRAPPERS.contains(&deny_program(&argv[0]).as_str());
+            let explicit = patterns
+                .iter()
+                .any(|p| p.starts_with(COMMAND_PATTERN_PREFIX) && pattern_allows(p, req));
+            if wrapper || !explicit {
                 return PatternVerdict::Ask;
             }
         }
@@ -703,26 +788,33 @@ mod tests {
     #[test]
     fn deny_wins_sees_through_paths_and_sends_wrappers_to_a_human() {
         use PatternVerdict::*;
-        let pats = ["run_command", "!run_command:rm *"];
+        let pats = ["run_command:ls *", "run_command:env *", "!run_command:rm *"];
         assert_eq!(cmd_verdict(&pats, "ls -la"), Allow);
         assert_eq!(cmd_verdict(&pats, "rm -rf build"), Deny);
         assert_eq!(cmd_verdict(&pats, "/bin/rm -rf build"), Deny);
+        assert_eq!(cmd_verdict(&pats, "RM -rf build"), Deny, "case");
+        assert_eq!(cmd_verdict(&pats, "rm.exe -rf build"), Deny, "extension");
         assert_eq!(
             cmd_verdict(&pats, "rm"),
             Deny,
             "trailing * allows zero args"
         );
-        // Wrappers can hide the real program: ask, never auto-allow.
+        // Wrappers can hide the real program: ask, even when allowed.
         assert_eq!(cmd_verdict(&pats, "env rm -rf build"), Ask);
-        assert_eq!(cmd_verdict(&pats, "sh -c 'rm -rf build'"), Ask);
-        assert_eq!(cmd_verdict(&pats, "/usr/bin/sudo ls"), Ask);
+        // Fail closed: under a command deny, a command no explicit
+        // `run_command:` allow names asks — a bare tool allow is not enough.
+        let bare = ["run_command", "!run_command:rm *"];
+        assert_eq!(cmd_verdict(&bare, "ls -la"), Ask);
+        assert_eq!(cmd_verdict(&bare, "find . -exec rm {} ;"), Ask);
+        assert_eq!(cmd_verdict(&bare, "sh -c 'rm -rf build'"), Ask);
+        assert_eq!(cmd_verdict(&bare, "/usr/bin/sudo ls"), Ask);
         // Without a command deny, wrappers follow the normal rules.
         assert_eq!(cmd_verdict(&["run_command"], "env ls"), Allow);
         // A tool-name deny.
         assert_eq!(cmd_verdict(&["*", "!run_command"], "ls"), Deny);
         // Headless (nobody to ask): Ask is a refusal.
-        let a = AllowlistApprover::allow_only(pats.iter().map(|p| p.to_string()).collect());
-        let input = serde_json::json!({ "command": "env rm x" });
+        let a = AllowlistApprover::allow_only(bare.iter().map(|p| p.to_string()).collect());
+        let input = serde_json::json!({ "command": "ls x" });
         let r = ToolRequest {
             tool: "run_command",
             risk: Risk::Write,
@@ -733,10 +825,48 @@ mod tests {
         assert_eq!(a.decide(&r), Verdict::Deny);
         // deny_only treats `run_command:` patterns command-wise too.
         let d = AllowlistApprover::deny_only(vec!["run_command:rm *".into()]);
-        assert_eq!(d.decide(&r), Verdict::Allow, "env is not rm in deny_only");
+        assert_eq!(d.decide(&r), Verdict::Allow, "ls is not rm in deny_only");
         let input = serde_json::json!({ "command": "rm x" });
         let r = ToolRequest { input: &input, ..r };
         assert_eq!(d.decide(&r), Verdict::Deny);
+    }
+
+    #[cfg(feature = "shell-tools")]
+    #[test]
+    fn child_command_patterns_are_covered_per_argument() {
+        let c = |p: &str, ch: &str| pattern_covers(p, ch);
+        assert!(c("run_command:git status *", "run_command:git status -s"));
+        assert!(c("run_command:git status *", "run_command:git status *"));
+        assert!(c("run_command:git *", "run_command:git log --oneline"));
+        assert!(c(
+            "run_command:cargo test -p *",
+            "run_command:cargo test -p tole-cli"
+        ));
+        // Text globbing would have said yes to all of these.
+        // `git *` allows zero further arguments: plain `git` is narrower.
+        assert!(c("run_command:git *", "run_command:git"));
+        assert!(
+            !c("run_command:git log *", "run_command:git"),
+            "fewer args than the parent's fixed ones"
+        );
+        assert!(!c("run_command:git status", "run_command:git status *"));
+        assert!(!c(
+            "run_command:git status",
+            "run_command:git status; rm -rf /"
+        ));
+        assert!(!c("run_command:git s*", "run_command:git status *"));
+        assert!(!c("run_command:git *", "run_command:/usr/bin/git log"));
+        assert!(!c("run_command:git status *", "run_command"));
+        // Cora #118: a parent whose program token is a glob allows nothing
+        // (the program is literal for an allow), so it covers nothing.
+        assert!(!c("run_command:*", "run_command:git push *"));
+        assert!(!c("run_command:g*", "run_command:rm *"));
+        // Tool-wide parents cover command children; denies cover nothing.
+        assert!(c("run_command", "run_command:rm -rf *"));
+        assert!(c("*", "run_command:anything *"));
+        assert!(!c("!run_command", "run_command:ls"));
+        assert!(!c("run_command", "!run_command:ls"));
+        assert!(c("write_*", "write_file"));
     }
 
     #[test]
