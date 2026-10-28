@@ -5,6 +5,7 @@
 pub mod approvals;
 pub mod approver;
 pub mod auth;
+pub mod compaction_host;
 pub mod config;
 pub mod config_apply;
 pub mod config_trust;

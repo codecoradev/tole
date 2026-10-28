@@ -916,3 +916,44 @@ fn unsupported_key_names_the_layer_it_came_from() {
     let msg = unsupported_keys(&cfg, true, false).unwrap();
     assert!(msg.starts_with("project config key `on_turnend`"), "{msg}");
 }
+
+#[test]
+fn compaction_settings_resolve_flag_env_config_default() {
+    let none = |_: &str| None;
+    let s = Settings::resolve(&Flags::default(), &Config::default(), &none);
+    assert_eq!(s.context_window, None, "detect from /models");
+    assert_eq!(
+        (s.compact_at.value, s.compact_at.source),
+        (tole_core::compaction::Policy::DEFAULT_AT, Source::Default)
+    );
+    assert!(!s.no_compaction.value);
+    let cfg = crate::config::parse(
+        "context_window = 64000\ncompact_at = 0.7\nno_compaction = true\n",
+        Path::new("c.toml"),
+    )
+    .unwrap();
+    let s = Settings::resolve(&Flags::default(), &cfg, &none);
+    assert_eq!(s.context_window.as_ref().unwrap().value, 64000);
+    assert_eq!(
+        (s.compact_at.value, s.compact_at.source),
+        (0.7, Source::Config)
+    );
+    assert!(s.no_compaction.value);
+    // The env window beats the config; the flag fraction beats the config.
+    let env = |k: &str| (k == CONTEXT_WINDOW_ENV).then(|| "200000".to_string());
+    let flags = Flags {
+        compact_at: Some(0.9),
+        ..Flags::default()
+    };
+    let s = Settings::resolve(&flags, &cfg, &env);
+    let w = s.context_window.unwrap();
+    assert_eq!((w.value, w.source), (200000, Source::Env));
+    assert_eq!(
+        (s.compact_at.value, s.compact_at.source),
+        (0.9, Source::Flag)
+    );
+    // A malformed env window is ignored, not fatal.
+    let bad = |k: &str| (k == CONTEXT_WINDOW_ENV).then(|| "lots".to_string());
+    let s = Settings::resolve(&Flags::default(), &cfg, &bad);
+    assert_eq!(s.context_window.unwrap().source, Source::Config);
+}

@@ -151,6 +151,9 @@ pub fn split_env_list(v: &str) -> Vec<String> {
 /// between `--skill` and the config's `skill` key.
 pub const SKILL_ENV: &str = "TOLE_SKILL";
 
+/// The model's context window in tokens (#440); overrides `/models`.
+pub const CONTEXT_WINDOW_ENV: &str = "TOLE_CONTEXT_WINDOW";
+
 /// Real environment lookup for [`Settings::resolve`].
 pub fn real_env(name: &str) -> Option<String> {
     std::env::var(name).ok()
@@ -354,6 +357,10 @@ pub struct Flags {
     /// `mission --verify-timeout` (`None` = not given; the clap default
     /// is applied here, see [`DEFAULT_VERIFY_TIMEOUT_SECS`]).
     pub verify_timeout: Option<u64>,
+    /// `--compact-at` (#440).
+    pub compact_at: Option<f64>,
+    /// `--no-compaction` (#440).
+    pub no_compaction: bool,
 }
 
 /// `tole mission --verify-timeout` default.
@@ -387,6 +394,12 @@ pub struct Settings {
     pub no_skills: Eff<bool>,
     pub verify: Option<Eff<String>>,
     pub verify_timeout: Eff<u64>,
+    /// `TOLE_CONTEXT_WINDOW` > config `context_window` (#440); `None` =
+    /// detect from `/models`.
+    pub context_window: Option<Eff<u64>>,
+    /// `--compact-at` > config > [`tole_core::compaction::Policy::DEFAULT_AT`].
+    pub compact_at: Eff<f64>,
+    pub no_compaction: Eff<bool>,
 }
 
 impl Settings {
@@ -481,6 +494,24 @@ impl Settings {
                 );
                 Eff::new(v, s)
             },
+            context_window: resolve(
+                None,
+                env(CONTEXT_WINDOW_ENV)
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .filter(|n| *n > 0),
+                cfg.context_window,
+            )
+            .map(|p| Eff::from_pair(p, CONTEXT_WINDOW_ENV)),
+            compact_at: {
+                let (v, s) = resolve_or(
+                    flags.compact_at,
+                    None,
+                    cfg.compact_at,
+                    tole_core::compaction::Policy::DEFAULT_AT,
+                );
+                Eff::new(v, s)
+            },
+            no_compaction: boolean(flags.no_compaction, cfg.no_compaction),
         }
     }
 
@@ -522,6 +553,9 @@ impl Settings {
         one(&mut self.no_skills, "no_skills", user);
         opt(&mut self.verify, "mission.verify", user);
         one(&mut self.verify_timeout, "mission.verify_timeout", user);
+        opt(&mut self.context_window, "context_window", user);
+        one(&mut self.compact_at, "compact_at", user);
+        one(&mut self.no_compaction, "no_compaction", user);
     }
 
     /// The fill to install for the deep server faces: ONLY the config's own
@@ -628,6 +662,22 @@ pub fn annotations(s: &Settings) -> BTreeMap<&'static str, String> {
     );
     m.insert("no_skills", boolean(&s.no_skills));
     m.insert("mission.verify", eff(&s.verify, &show_str));
+    m.insert(
+        "context_window",
+        match &s.context_window {
+            Some(e) => format!("  effective: {}  {}", e.value, e.describe()),
+            None => "  effective: (detected from /models)".to_string(),
+        },
+    );
+    m.insert(
+        "compact_at",
+        format!(
+            "  effective: {}  {}",
+            s.compact_at.value,
+            s.compact_at.describe()
+        ),
+    );
+    m.insert("no_compaction", boolean(&s.no_compaction));
     m.insert(
         "mission.verify_timeout",
         format!(
