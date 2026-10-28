@@ -117,7 +117,14 @@ header), `--workspace <dir>` (file-tools jail root), `--allow <glob>`
 (repeatable pre-authorization for Write tools, e.g. `--allow 'write_*'`),
 `--yes` (auto-allow every Write; Destructive still prompts), `--mcp-server`,
 `--no-auto-mcp` (skip the cora auto-preset), `--trust <preset>` (one-word
-trust: `internal` / `read_only`), `--skill <path>` (load a SKILL.md),
+trust: `internal` / `read_only` / `workspace` — `read_only` plus
+`write_file`/`edit_file` auto-allowed only inside an explicit
+`--workspace` jail, and not for files another tool may execute — dot-paths
+(`.git/hooks`, `.envrc`, `.vscode/`), build and task files (`build.rs`,
+`Makefile`, `package.json`, ...) and scripts keep prompting, as do
+`delete_file` and `run_command`; a home or filesystem-root workspace is
+refused, and the guard is also available as `--allow 'write_file@workspace'`.
+Not a sandbox: review what it wrote before you run it), `--skill <path>` (load a SKILL.md),
 `--plan-mode` (read-only wire), `--on-turnend <cmd>` (final-message gate).
 
 ## Configuration (environment)

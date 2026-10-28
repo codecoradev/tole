@@ -145,6 +145,31 @@ preset names (flag or env) fail loudly. A typo'd env value breaks every
 invocation with a clear error — deliberately, per the
 typo-silently-narrowing-trust rule.
 
+`workspace` (#437) is the one preset that auto-allows write-capable native
+tools: `write_file` and `edit_file`, through the path guard
+(`write_file@workspace`). Their reach is the workspace jail (root
+canonicalized; `../` and symlinked targets refused), and the guard keeps
+prompting for every dot-path (a write to `.git/hooks/*`, `.envrc`,
+`.vscode/`, `.tole/` or `.github/workflows/` would turn into code execution
+the next time git, direnv, an editor or CI runs), for build and task files
+(`build.rs`, `Cargo.toml`, `Makefile`, `package.json`, `pyproject.toml`,
+`setup.py`, `Dockerfile`, ...), for instruction files tole or another agent
+loads (`SKILL.md`, `AGENTS.md`, `CLAUDE.md`) and for scripts (`.sh`, `.ps1`,
+...). The guard reads the target the tool reports through
+`Tool::approval_target` — the same jail resolution `execute` uses, so a
+symlink already in the workspace (`docs -> .git/hooks`) cannot launder a
+hook write — with Windows trailing dots/spaces normalized and 8.3 short
+names refused; a tool that reports no target fails the guard (prompts).
+The preset needs an explicit workspace (never the implicit cwd, which
+is usually a whole repository) and is refused on a home or filesystem-root
+workspace. Residual risk, accepted and documented: an
+auto-allowed write can still change ordinary files the user later executes
+(a `Makefile`, a script, source code); the preset is for a workspace whose
+results the user reviews, not a sandbox. `delete_file` (Destructive) and
+`run_command` keep prompting, unlike `--yes`. A project config can name the
+preset only after its content was trusted, the same bar as
+`allow = ["write_file"]`.
+
 ## Memory loop — decision typing (#143)
 
 The session summary stored by the memory loop keeps its content contract

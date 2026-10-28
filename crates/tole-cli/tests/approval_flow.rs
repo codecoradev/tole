@@ -213,9 +213,102 @@ fn tool_request_carries_prompt_fields() {
         risk: t.risk(),
         input: &input,
         description: t.describe(&input),
+        target: t.approval_target(&input),
     };
     assert_eq!(req.tool, "write_file");
     assert_eq!(req.risk, Risk::Write);
     assert_eq!(req.description, "write file notes.md");
     assert_eq!(a.decide(&req), Verdict::Allow);
+}
+
+/// #437: `--trust workspace` auto-allows plain writes inside the workspace
+/// jail (no prompt), a dot-path (`.git/hooks/...`) still prompts, and the
+/// Destructive `delete_file` still prompts.
+#[test]
+fn trust_workspace_writes_only_inside_the_jail_and_delete_still_prompts() {
+    use tole_core::file_tools::DeleteFileTool;
+    let root = tmpdir("trust-workspace");
+    let ws = root.join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::write(ws.join("old.txt"), "keep").unwrap();
+    let patterns = tole_cli::trust::expand_trust(&["workspace".into()]).unwrap();
+    // The human says N: any prompt shows up as ApprovalRequired.
+    let mut reg =
+        ToolRegistry::with_approver(answering(Verdict::Deny).with_allow_patterns(patterns));
+    reg.register(Box::new(WriteFileTool::new(ws.clone())))
+        .unwrap();
+    reg.register(Box::new(DeleteFileTool::new(ws.clone())))
+        .unwrap();
+    let mut s = JsonlStorage::create(&root, "trust-ws", None).unwrap();
+    let mut p = MockProvider::scripted(vec![
+        ProviderOutput::ToolCall {
+            tool: "write_file".into(),
+            input: json!({ "path": "report.md", "content": "inside" }),
+        },
+        ProviderOutput::ToolCall {
+            tool: "write_file".into(),
+            input: json!({ "path": ".git/hooks/pre-commit", "content": "boom" }),
+        },
+        ProviderOutput::Final {
+            text: "unreachable".into(),
+        },
+    ]);
+    match run_turn(&mut s, &mut p, &reg, "write a report").unwrap() {
+        TurnOutcome::ApprovalRequired { name } => assert_eq!(name, "write_file"),
+        other => panic!("expected the dot-path write to prompt, got {other:?}"),
+    }
+    assert_eq!(
+        std::fs::read_to_string(ws.join("report.md")).unwrap(),
+        "inside"
+    );
+    assert!(!ws.join(".git/hooks/pre-commit").exists());
+
+    // Destructive delete still prompts under the preset.
+    let mut s = JsonlStorage::create(&root, "trust-ws-delete", None).unwrap();
+    let mut p = MockProvider::scripted(vec![
+        ProviderOutput::ToolCall {
+            tool: "delete_file".into(),
+            input: json!({ "path": "old.txt" }),
+        },
+        ProviderOutput::Final {
+            text: "unreachable".into(),
+        },
+    ]);
+    match run_turn(&mut s, &mut p, &reg, "clean up").unwrap() {
+        TurnOutcome::ApprovalRequired { name } => assert_eq!(name, "delete_file"),
+        other => panic!("expected delete_file to prompt, got {other:?}"),
+    }
+    assert!(ws.join("old.txt").exists(), "denied delete must not run");
+}
+
+/// #437 (security review): the guard checks the RESOLVED target, not the
+/// path text — a symlink already in the workspace (`docs -> .git/hooks`)
+/// cannot launder `docs/pre-commit` into an auto-allowed hook write.
+#[cfg(unix)]
+#[test]
+fn trust_workspace_guard_follows_symlinks_to_the_real_target() {
+    let root = tmpdir("trust-workspace-symlink");
+    let ws = root.join("ws");
+    std::fs::create_dir_all(ws.join(".git/hooks")).unwrap();
+    std::os::unix::fs::symlink(ws.join(".git/hooks"), ws.join("docs")).unwrap();
+    let patterns = tole_cli::trust::expand_trust(&["workspace".into()]).unwrap();
+    let mut reg =
+        ToolRegistry::with_approver(answering(Verdict::Deny).with_allow_patterns(patterns));
+    reg.register(Box::new(WriteFileTool::new(ws.clone())))
+        .unwrap();
+    let mut s = JsonlStorage::create(&root, "trust-ws-symlink", None).unwrap();
+    let mut p = MockProvider::scripted(vec![
+        ProviderOutput::ToolCall {
+            tool: "write_file".into(),
+            input: json!({ "path": "docs/pre-commit", "content": "boom" }),
+        },
+        ProviderOutput::Final {
+            text: "unreachable".into(),
+        },
+    ]);
+    match run_turn(&mut s, &mut p, &reg, "write docs").unwrap() {
+        TurnOutcome::ApprovalRequired { name } => assert_eq!(name, "write_file"),
+        other => panic!("a symlinked hook write must prompt, got {other:?}"),
+    }
+    assert!(!ws.join(".git/hooks/pre-commit").exists());
 }

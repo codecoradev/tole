@@ -233,7 +233,8 @@ Everything below is merged; CHANGELOG entries carry the detail.
     design in `docs/child-agents-handoff.md`).
 - **0.10.0 (on develop, unreleased):** user config layer
   `$CODECORA_HOME/tole/config.toml` below the project config (#433);
-  `web_search` method, auth headers and field mapping (#436).
+  `web_search` method, auth headers and field mapping (#436);
+  `--trust workspace` (#437).
 - **Open backlog:** provider failover chain (#209), session branching (#210), multimodal
   input (#212), MCP prompts/resources as quick commands (#213), background detach (#217),
   Claude Code session resume (#381); the multi-client daemon note (#382) is parked.

@@ -50,6 +50,10 @@ pub struct ToolRequest<'a> {
     pub input: &'a Value,
     /// One-line human summary from `Tool::describe`.
     pub description: String,
+    /// The resolved write target from `Tool::approval_target` (#437):
+    /// relative to the canonical jail root, symlinks followed. `None` for
+    /// tools that do not report one.
+    pub target: Option<String>,
 }
 
 /// The approval policy engine. The turn loop consults this for every
@@ -70,6 +74,109 @@ pub trait Approver: Send + Sync {
     /// Gates Destructive tool registration.
     fn interactive(&self) -> bool {
         false
+    }
+}
+
+/// Suffix of a path-guarded allow pattern (#437): `write_file@workspace`
+/// allows `write_file` only when its `path` input passes
+/// [`workspace_guard_ok`] — so files that another tool may later EXECUTE
+/// (`.git/hooks/*`, `.envrc`, `.vscode/`, `.github/workflows/`, build and
+/// task files, scripts) keep prompting.
+pub const WORKSPACE_GUARD: &str = "@workspace";
+
+/// File names (any directory, case-insensitive) that build tools, task
+/// runners, package managers or agents (tole included) execute or load as
+/// instructions. A write to one keeps prompting under the guard.
+const EXECUTED_FILE_NAMES: &[&str] = &[
+    "build.rs",
+    "cargo.toml",
+    "makefile",
+    "gnumakefile",
+    "justfile",
+    "taskfile.yml",
+    "taskfile.yaml",
+    "package.json",
+    "pyproject.toml",
+    "setup.py",
+    "setup.cfg",
+    "conftest.py",
+    "noxfile.py",
+    "tox.ini",
+    "rakefile",
+    "gemfile",
+    "build.gradle",
+    "build.gradle.kts",
+    "settings.gradle",
+    "pom.xml",
+    "cmakelists.txt",
+    "meson.build",
+    "dockerfile",
+    "docker-compose.yml",
+    "compose.yaml",
+    "skill.md",
+    "agents.md",
+    "claude.md",
+];
+
+/// Script extensions a write to which keeps prompting under the guard.
+const SCRIPT_EXTENSIONS: &[&str] = &[".sh", ".bash", ".zsh", ".ps1", ".bat", ".cmd"];
+
+/// Does `path` qualify for a [`WORKSPACE_GUARD`] pattern? Relative and
+/// non-empty; no component starting with `.` (a lone `.` is fine; `..` is
+/// not); not an [`EXECUTED_FILE_NAMES`] file; not a script. `\` counts as a
+/// separator too, so a Windows-style path cannot hide a component. A
+/// denylist of the common cases, not a sandbox: ordinary source files stay
+/// writable.
+pub fn workspace_guard_ok(path: &str) -> bool {
+    let p = path.trim();
+    if p.is_empty() || p.starts_with('/') || p.starts_with('\\') || p.contains(':') {
+        return false;
+    }
+    // Windows ignores trailing dots and spaces (`Makefile.` is `Makefile`),
+    // and an 8.3 short name (`MAKEFI~1`) can alias any long one: normalize
+    // the first, refuse the second.
+    let raw: Vec<&str> = p
+        .split(['/', '\\'])
+        .filter(|c| !c.is_empty() && *c != ".")
+        .collect();
+    if raw.contains(&"..") {
+        return false;
+    }
+    let parts: Vec<&str> = raw.iter().map(|c| c.trim_end_matches(['.', ' '])).collect();
+    // A component made only of dots/spaces (`...`, `. .`) is no name.
+    if parts.iter().any(|c| c.is_empty()) {
+        return false;
+    }
+    if parts.iter().any(|c| has_short_name_marker(c)) {
+        return false;
+    }
+    let Some(name) = parts.last().map(|n| n.to_ascii_lowercase()) else {
+        return false;
+    };
+    parts.iter().all(|c| !c.starts_with('.'))
+        && !EXECUTED_FILE_NAMES.contains(&name.as_str())
+        && !SCRIPT_EXTENSIONS.iter().any(|ext| name.ends_with(ext))
+}
+
+/// `~` followed by a digit: a Windows 8.3 short-name alias.
+fn has_short_name_marker(c: &str) -> bool {
+    c.as_bytes()
+        .windows(2)
+        .any(|w| w[0] == b'~' && w[1].is_ascii_digit())
+}
+
+/// Does an ALLOW pattern cover this request? A plain pattern globs the
+/// tool name; a [`WORKSPACE_GUARD`] pattern also requires the RESOLVED
+/// write target ([`ToolRequest::target`], what the tool will actually
+/// touch after following symlinks — never the raw `path` text) to pass
+/// [`workspace_guard_ok`]. No target = no pass. The one place both
+/// approvers match allow patterns.
+pub fn pattern_allows(pattern: &str, req: &ToolRequest<'_>) -> bool {
+    match pattern.strip_suffix(WORKSPACE_GUARD) {
+        Some(name) => {
+            glob_match(name, req.tool) && req.target.as_deref().is_some_and(workspace_guard_ok)
+        }
+        None => glob_match(pattern, req.tool),
     }
 }
 
@@ -177,7 +284,14 @@ impl AllowlistApprover {
         if req.risk == Risk::Destructive {
             return Verdict::Deny;
         }
-        let matched = self.patterns.iter().any(|p| glob_match(p, req.tool));
+        let matched = if self.deny_mode {
+            // A deny pattern ignores the guard: denying more is the safe side.
+            self.patterns
+                .iter()
+                .any(|p| glob_match(p.strip_suffix(WORKSPACE_GUARD).unwrap_or(p), req.tool))
+        } else {
+            self.patterns.iter().any(|p| pattern_allows(p, req))
+        };
         if self.deny_mode {
             // deny_only: patterns deny, non-matches fall to the default.
             if matched {
@@ -209,6 +323,7 @@ mod tests {
             risk,
             input: &Value::Null,
             description: String::new(),
+            target: None,
         }
     }
 
@@ -313,5 +428,72 @@ mod tests {
     fn allowlist_is_not_interactive() {
         let a = AllowlistApprover::default();
         assert!(!a.interactive());
+    }
+
+    #[test]
+    fn workspace_guard_keeps_dot_paths_and_escapes_prompting() {
+        for ok in [
+            "report.md",
+            "docs/out.md",
+            "./a/b.txt",
+            "a/./b",
+            "src/main.rs",
+        ] {
+            assert!(workspace_guard_ok(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            ".git/hooks/pre-commit",
+            "sub/.git/config",
+            ".envrc",
+            ".vscode/tasks.json",
+            ".tole/config.toml",
+            "../x",
+            "a/../b",
+            "/etc/passwd",
+            "\\\\server\\share",
+            "C:\\x",
+            "a\\.git\\hooks",
+            ".",
+            "build.rs",
+            "crates/x/build.rs",
+            "Makefile",
+            "sub/package.json",
+            "Cargo.toml",
+            "skills/x/SKILL.md",
+            "AGENTS.md",
+            "scripts/deploy.sh",
+            "run.PS1",
+            "Makefile.",
+            "Makefile. .",
+            "MAKEFI~1",
+            "docs/BUILD~1.RS",
+            ".git./hooks/x",
+        ] {
+            assert!(!workspace_guard_ok(bad), "{bad}");
+        }
+        let guarded = AllowlistApprover::allow_only(vec!["write_file@workspace".into()]);
+        let input = serde_json::json!({"path": "out.md"});
+        let call = |target: Option<&str>| {
+            guarded.decide(&ToolRequest {
+                tool: "write_file",
+                risk: Risk::Write,
+                // The raw input never decides: the guard reads the target.
+                input: &input,
+                description: String::new(),
+                target: target.map(str::to_string),
+            })
+        };
+        assert_eq!(call(Some("out.md")), Verdict::Allow);
+        assert_eq!(call(Some(".git/hooks/x")), Verdict::Deny);
+        assert_eq!(call(None), Verdict::Deny, "no target, no guard pass");
+        // The guard pattern never matches another tool.
+        assert_eq!(
+            guarded.decide(&req("edit_file", Risk::Write)),
+            Verdict::Deny
+        );
+        // As a DENY pattern it denies the tool outright.
+        let deny = AllowlistApprover::deny_only(vec!["write_file@workspace".into()]);
+        assert_eq!(deny.decide(&req("write_file", Risk::Write)), Verdict::Deny);
     }
 }
