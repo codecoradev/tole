@@ -72,6 +72,15 @@ pub trait Tool: Send + Sync {
     fn spec(&self) -> Option<Value> {
         None
     }
+    /// Where this call would write, as a path RELATIVE to the tool's
+    /// canonical jail root with symlinks already resolved — the file the
+    /// tool will actually touch, not the text the model sent (#437). Only
+    /// jailed file writers implement it; the approver's workspace guard
+    /// ([`crate::approval::WORKSPACE_GUARD`]) fails closed (prompts) on
+    /// `None`. Decorators must forward it.
+    fn approval_target(&self, _input: &Value) -> Option<String> {
+        None
+    }
     /// Execute with JSON input, return JSON output or a plain error.
     fn execute(&self, input: Value) -> Result<Value, String>;
 }
@@ -302,6 +311,7 @@ impl ToolRegistry {
             // Single fan-out point (#327): neutralize control/bidi/separator
             // chars before any approval surface sees the description.
             description: crate::sanitize::sanitize_one_line(&t.describe(input)),
+            target: t.approval_target(input),
         };
         self.approver.as_ref().map(|a| a.decide(&req))
     }

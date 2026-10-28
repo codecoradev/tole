@@ -227,6 +227,17 @@ impl Tool for EditFileTool {
         }))
     }
 
+    /// The resolved target relative to the canonical root (#437): the
+    /// same [`jailed`] resolution `execute` uses, symlinks followed.
+    fn approval_target(&self, input: &Value) -> Option<String> {
+        let target = jailed(&self.root, input.get("path")?.as_str()?, "edit_file").ok()?;
+        let root = self.root.canonicalize().ok()?;
+        let rel = target.strip_prefix(&root).ok()?;
+        let parts: Option<Vec<&str>> = rel.components().map(|c| c.as_os_str().to_str()).collect();
+        let parts = parts?;
+        (!parts.is_empty()).then(|| parts.join("/"))
+    }
+
     fn execute(&self, input: Value) -> Result<Value, String> {
         let Some(path) = input.get("path").and_then(Value::as_str) else {
             return Err("edit_file: missing 'path'".into());

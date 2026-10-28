@@ -155,7 +155,12 @@ the next time git, direnv, an editor or CI runs), for build and task files
 (`build.rs`, `Cargo.toml`, `Makefile`, `package.json`, `pyproject.toml`,
 `setup.py`, `Dockerfile`, ...), for instruction files tole or another agent
 loads (`SKILL.md`, `AGENTS.md`, `CLAUDE.md`) and for scripts (`.sh`, `.ps1`,
-...). The preset needs an explicit workspace (never the implicit cwd, which
+...). The guard reads the target the tool reports through
+`Tool::approval_target` — the same jail resolution `execute` uses, so a
+symlink already in the workspace (`docs -> .git/hooks`) cannot launder a
+hook write — with Windows trailing dots/spaces normalized and 8.3 short
+names refused; a tool that reports no target fails the guard (prompts).
+The preset needs an explicit workspace (never the implicit cwd, which
 is usually a whole repository) and is refused on a home or filesystem-root
 workspace. Residual risk, accepted and documented: an
 auto-allowed write can still change ordinary files the user later executes

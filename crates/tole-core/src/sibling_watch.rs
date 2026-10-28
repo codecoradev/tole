@@ -168,6 +168,9 @@ impl Tool for Tracked {
     fn describe(&self, input: &Value) -> String {
         self.inner.describe(input)
     }
+    fn approval_target(&self, input: &Value) -> Option<String> {
+        self.inner.approval_target(input)
+    }
     fn summary(&self) -> String {
         self.inner.summary()
     }

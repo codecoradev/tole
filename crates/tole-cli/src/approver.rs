@@ -242,6 +242,7 @@ mod tests {
             risk,
             input: &Value::Null,
             description: format!("{tool} description"),
+            target: None,
         }
     }
 

@@ -213,6 +213,7 @@ fn tool_request_carries_prompt_fields() {
         risk: t.risk(),
         input: &input,
         description: t.describe(&input),
+        target: t.approval_target(&input),
     };
     assert_eq!(req.tool, "write_file");
     assert_eq!(req.risk, Risk::Write);
@@ -278,4 +279,36 @@ fn trust_workspace_writes_only_inside_the_jail_and_delete_still_prompts() {
         other => panic!("expected delete_file to prompt, got {other:?}"),
     }
     assert!(ws.join("old.txt").exists(), "denied delete must not run");
+}
+
+/// #437 (security review): the guard checks the RESOLVED target, not the
+/// path text — a symlink already in the workspace (`docs -> .git/hooks`)
+/// cannot launder `docs/pre-commit` into an auto-allowed hook write.
+#[cfg(unix)]
+#[test]
+fn trust_workspace_guard_follows_symlinks_to_the_real_target() {
+    let root = tmpdir("trust-workspace-symlink");
+    let ws = root.join("ws");
+    std::fs::create_dir_all(ws.join(".git/hooks")).unwrap();
+    std::os::unix::fs::symlink(ws.join(".git/hooks"), ws.join("docs")).unwrap();
+    let patterns = tole_cli::trust::expand_trust(&["workspace".into()]).unwrap();
+    let mut reg =
+        ToolRegistry::with_approver(answering(Verdict::Deny).with_allow_patterns(patterns));
+    reg.register(Box::new(WriteFileTool::new(ws.clone())))
+        .unwrap();
+    let mut s = JsonlStorage::create(&root, "trust-ws-symlink", None).unwrap();
+    let mut p = MockProvider::scripted(vec![
+        ProviderOutput::ToolCall {
+            tool: "write_file".into(),
+            input: json!({ "path": "docs/pre-commit", "content": "boom" }),
+        },
+        ProviderOutput::Final {
+            text: "unreachable".into(),
+        },
+    ]);
+    match run_turn(&mut s, &mut p, &reg, "write docs").unwrap() {
+        TurnOutcome::ApprovalRequired { name } => assert_eq!(name, "write_file"),
+        other => panic!("a symlinked hook write must prompt, got {other:?}"),
+    }
+    assert!(!ws.join(".git/hooks/pre-commit").exists());
 }

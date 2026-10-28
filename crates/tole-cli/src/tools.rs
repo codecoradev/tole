@@ -67,6 +67,15 @@ impl WriteFileTool {
     }
 }
 
+/// `target` relative to `root`, `/`-separated; `None` for the root itself
+/// or a non-UTF-8 path (the guard then fails closed).
+fn relative_target(target: &Path, root: &Path) -> Option<String> {
+    let rel = target.strip_prefix(root).ok()?;
+    let parts: Option<Vec<&str>> = rel.components().map(|c| c.as_os_str().to_str()).collect();
+    let parts = parts?;
+    (!parts.is_empty()).then(|| parts.join("/"))
+}
+
 impl Tool for WriteFileTool {
     fn name(&self) -> &str {
         "write_file"
@@ -86,6 +95,14 @@ impl Tool for WriteFileTool {
             .and_then(Value::as_str)
             .unwrap_or("<missing path>");
         format!("write file {path}")
+    }
+
+    /// The resolved target relative to the canonical root (#437): the
+    /// same [`Self::jailed`] resolution `execute` uses, symlinks followed.
+    fn approval_target(&self, input: &Value) -> Option<String> {
+        let target = self.jailed(input.get("path")?.as_str()?)?;
+        let root = self.root.canonicalize().ok()?;
+        relative_target(&target, &root)
     }
 
     fn execute(&self, input: Value) -> Result<Value, String> {
