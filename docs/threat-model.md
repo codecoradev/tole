@@ -423,6 +423,23 @@ an unlocked read-modify-write, so two concurrent `tole config trust` runs can
 lose one of the two records (the loser is simply asked again; the file itself
 is replaced atomically and never corrupted).
 
+### Context compaction (#440)
+
+A compaction replaces, on the wire only, the settled turns before the kept
+tail with a model-written summary; the session file keeps every entry. The
+summary is committed atomically with its usage row (a crash before the
+commit leaves the session pre-compaction), only between turns and at a turn
+boundary (no tool result is separated from its call), and an entry whose
+kept-entry id is unknown is ignored (full transcript). Trust: the summary is
+model output that may restate tool output, yet it reaches the wire as a
+user-role message (an assistant-first conversation is rejected by some
+OpenAI-compatible endpoints). It is therefore framed as a record, not new
+instructions, that keeps tool-sourced content untrusted, and the summary
+instruction tells the model to report instructions found in tool output as
+data. Residual risk: a prompt injection that already steered the model
+before compaction can persist through the summary, as it would through the
+model's own earlier answers.
+
 ### Global session index (#439)
 
 `$CODECORA_HOME/tole/sessions-index.jsonl` maps session ids to session files
