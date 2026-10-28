@@ -433,10 +433,12 @@ boundary (no tool result is separated from its call), and an entry whose
 kept-entry id is unknown is ignored (full transcript). Trust: the summary is
 model output that may restate tool output, yet it reaches the wire as a
 user-role message (an assistant-first conversation is rejected by some
-OpenAI-compatible endpoints). It is therefore framed as a record, not new
-instructions, that keeps tool-sourced content untrusted, and the summary
-instruction tells the model to report instructions found in tool output as
-data. Residual risk: a prompt injection that already steered the model
+OpenAI-compatible endpoints, and the system role would RAISE its
+authority). The marking is therefore structural: the summary goes inside
+the same untrusted-content fence as tool results (forged fence markers in
+it are neutralized), introduced as a record rather than instructions, and
+the summary instruction tells the model to report instructions found in
+tool output as data. Residual risk: a prompt injection that already steered the model
 before compaction can persist through the summary, as it would through the
 model's own earlier answers.
 
