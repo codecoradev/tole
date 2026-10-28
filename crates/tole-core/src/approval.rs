@@ -165,19 +165,162 @@ fn has_short_name_marker(c: &str) -> bool {
         .any(|w| w[0] == b'~' && w[1].is_ascii_digit())
 }
 
-/// Does an ALLOW pattern cover this request? A plain pattern globs the
-/// tool name; a [`WORKSPACE_GUARD`] pattern also requires the RESOLVED
-/// write target ([`ToolRequest::target`], what the tool will actually
-/// touch after following symlinks — never the raw `path` text) to pass
-/// [`workspace_guard_ok`]. No target = no pass. The one place both
-/// approvers match allow patterns.
-pub fn pattern_allows(pattern: &str, req: &ToolRequest<'_>) -> bool {
+/// Prefix of a DENY pattern in an allow list (#438): `!run_command:rm *`.
+/// A deny wins over every allow, `--yes` included, and travels wherever
+/// allow patterns travel (config `allow`, child agents, ACP, serve).
+pub const DENY_PREFIX: char = '!';
+
+/// Prefix of a command pattern (#438): `run_command:git status *` matches
+/// `run_command` calls by their argv, not just the tool name.
+pub const COMMAND_PATTERN_PREFIX: &str = "run_command:";
+
+/// Programs that run ANOTHER program from their arguments. A deny
+/// pattern cannot see through them (`env rm`, `sh -c 'rm …'`), so while
+/// any `run_command` deny is configured a call to one of these always
+/// goes to the human (and is denied where nobody can be asked), even
+/// under `--yes`.
+const COMMAND_WRAPPERS: &[&str] = &[
+    "sh", "bash", "zsh", "dash", "ksh", "fish", "env", "sudo", "doas", "xargs", "busybox", "nohup",
+    "nice", "timeout", "command", "exec", "time", "watch", "su", "runuser", "chroot", "setsid",
+    "stdbuf", "unbuffer", "parallel",
+];
+
+/// The argv a `run_command` call will execute: the SAME splitter the tool
+/// uses (no shell), so what is matched is what runs. `None` for another
+/// tool, a missing / unsplittable command, or a build without
+/// `run_command`.
+fn command_argv(req: &ToolRequest<'_>) -> Option<Vec<String>> {
+    if req.tool != "run_command" {
+        return None;
+    }
+    #[cfg(feature = "shell-tools")]
+    {
+        let line = req.input.get("command")?.as_str()?;
+        crate::run_command::RunCommandTool::split_argv(line)
+            .ok()
+            .filter(|a| !a.is_empty())
+    }
+    #[cfg(not(feature = "shell-tools"))]
+    {
+        None
+    }
+}
+
+/// The last path component of a program (`/usr/bin/rm` → `rm`).
+fn program_name(arg0: &str) -> &str {
+    arg0.rsplit(['/', '\\']).next().unwrap_or(arg0)
+}
+
+/// Match a command pattern's tokens against an argv. Each token is a
+/// [`glob_match`] over ONE argument; a final lone `*` token stands for
+/// any remaining arguments (zero or more), otherwise the counts must be
+/// equal. For an ALLOW the program token is compared literally with
+/// `argv[0]` (no globbing, no path tricks: `run_command:*` allows
+/// nothing); for a DENY it is a glob over `argv[0]` or its file name,
+/// so `/bin/rm` cannot slip past `rm *`.
+#[cfg(feature = "shell-tools")]
+fn argv_matches(pattern: &str, argv: &[String], deny: bool) -> bool {
+    let Ok(pat) = crate::run_command::RunCommandTool::split_argv(pattern) else {
+        return false;
+    };
+    let Some((p0, rest_pat)) = pat.split_first() else {
+        return false;
+    };
+    let (a0, rest) = (&argv[0], &argv[1..]);
+    let program_ok = if deny {
+        glob_match(p0, a0) || glob_match(p0, program_name(a0))
+    } else {
+        p0 == a0
+    };
+    if !program_ok {
+        return false;
+    }
+    let (fixed, open) = match rest_pat.split_last() {
+        Some((last, head)) if last == "*" => (head, true),
+        _ => (rest_pat, false),
+    };
+    if rest.len() < fixed.len() || (!open && rest.len() != fixed.len()) {
+        return false;
+    }
+    fixed.iter().zip(rest).all(|(p, a)| glob_match(p, a))
+}
+
+/// Does a POSITIVE pattern (no [`DENY_PREFIX`]) match this request?
+/// - `run_command:<argv pattern>`: `run_command` calls whose argv matches
+///   ([`argv_matches`]);
+/// - `<tool>@workspace`: the tool, and its RESOLVED write target
+///   ([`ToolRequest::target`], symlinks followed — never the raw `path`
+///   text) passes [`workspace_guard_ok`]; no target = no match;
+/// - otherwise a [`glob_match`] over the tool name.
+fn pattern_matches(pattern: &str, req: &ToolRequest<'_>, deny: bool) -> bool {
+    if let Some(cmd) = pattern.strip_prefix(COMMAND_PATTERN_PREFIX) {
+        #[cfg(feature = "shell-tools")]
+        return command_argv(req).is_some_and(|argv| argv_matches(cmd, &argv, deny));
+        // No run_command in this build: a command pattern matches nothing.
+        #[cfg(not(feature = "shell-tools"))]
+        {
+            let _ = cmd;
+            return false;
+        }
+    }
     match pattern.strip_suffix(WORKSPACE_GUARD) {
+        // A deny ignores the guard: denying more is the safe side.
+        Some(name) if deny => glob_match(name, req.tool),
         Some(name) => {
             glob_match(name, req.tool) && req.target.as_deref().is_some_and(workspace_guard_ok)
         }
         None => glob_match(pattern, req.tool),
     }
+}
+
+/// Does an ALLOW pattern cover this request? Deny patterns never allow.
+pub fn pattern_allows(pattern: &str, req: &ToolRequest<'_>) -> bool {
+    !pattern.starts_with(DENY_PREFIX) && pattern_matches(pattern, req, false)
+}
+
+/// Does a DENY pattern (`!…`) cover this request?
+pub fn pattern_denies(pattern: &str, req: &ToolRequest<'_>) -> bool {
+    pattern
+        .strip_prefix(DENY_PREFIX)
+        .is_some_and(|p| pattern_matches(p, req, true))
+}
+
+/// What an allow list says about one request, before any default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatternVerdict {
+    /// A deny pattern matched: refuse without asking.
+    Deny,
+    /// Only a human may decide (a command wrapper while a `run_command`
+    /// deny is configured); refuse where nobody can be asked.
+    Ask,
+    /// An allow pattern matched (and no deny did).
+    Allow,
+    /// Nothing matched: the approver's own default applies.
+    NoMatch,
+}
+
+/// THE allow-list evaluation both approvers use (#438): deny first, then
+/// the wrapper rule, then allow.
+pub fn pattern_verdict(patterns: &[String], req: &ToolRequest<'_>) -> PatternVerdict {
+    if patterns.iter().any(|p| pattern_denies(p, req)) {
+        return PatternVerdict::Deny;
+    }
+    let command_deny = patterns.iter().any(|p| {
+        p.strip_prefix(DENY_PREFIX)
+            .is_some_and(|q| q.starts_with(COMMAND_PATTERN_PREFIX))
+    });
+    if command_deny {
+        if let Some(argv) = command_argv(req) {
+            let name = program_name(&argv[0]).to_ascii_lowercase();
+            if COMMAND_WRAPPERS.contains(&name.as_str()) {
+                return PatternVerdict::Ask;
+            }
+        }
+    }
+    if patterns.iter().any(|p| pattern_allows(p, req)) {
+        return PatternVerdict::Allow;
+    }
+    PatternVerdict::NoMatch
 }
 
 /// Minimal glob for tool-name patterns: `*` matches any run of chars
@@ -284,21 +427,23 @@ impl AllowlistApprover {
         if req.risk == Risk::Destructive {
             return Verdict::Deny;
         }
-        let matched = if self.deny_mode {
-            // A deny pattern ignores the guard: denying more is the safe side.
-            self.patterns
-                .iter()
-                .any(|p| glob_match(p.strip_suffix(WORKSPACE_GUARD).unwrap_or(p), req.tool))
-        } else {
-            self.patterns.iter().any(|p| pattern_allows(p, req))
-        };
         if self.deny_mode {
-            // deny_only: patterns deny, non-matches fall to the default.
+            // deny_only: every pattern denies (a `!` is redundant here);
+            // non-matches fall to the default.
+            let matched = self
+                .patterns
+                .iter()
+                .any(|p| pattern_matches(p.strip_prefix(DENY_PREFIX).unwrap_or(p), req, true));
             if matched {
                 return Verdict::Deny;
             }
-        } else if matched {
-            return Verdict::Allow;
+        } else {
+            match pattern_verdict(&self.patterns, req) {
+                // Nobody to ask here: Ask is a refusal.
+                PatternVerdict::Deny | PatternVerdict::Ask => return Verdict::Deny,
+                PatternVerdict::Allow => return Verdict::Allow,
+                PatternVerdict::NoMatch => {}
+            }
         }
         match self.default {
             Decision::Allow => Verdict::Allow,
@@ -495,5 +640,114 @@ mod tests {
         // As a DENY pattern it denies the tool outright.
         let deny = AllowlistApprover::deny_only(vec!["write_file@workspace".into()]);
         assert_eq!(deny.decide(&req("write_file", Risk::Write)), Verdict::Deny);
+    }
+
+    // ------------------------------------------- command patterns (#438)
+
+    #[cfg(feature = "shell-tools")]
+    fn cmd_verdict(patterns: &[&str], line: &str) -> PatternVerdict {
+        let input = serde_json::json!({ "command": line });
+        let req = ToolRequest {
+            tool: "run_command",
+            risk: Risk::Write,
+            input: &input,
+            description: String::new(),
+            target: None,
+        };
+        let pats: Vec<String> = patterns.iter().map(|p| p.to_string()).collect();
+        pattern_verdict(&pats, &req)
+    }
+
+    #[cfg(feature = "shell-tools")]
+    #[test]
+    fn command_allow_patterns_match_the_argv_that_runs() {
+        use PatternVerdict::*;
+        let allow = ["run_command:git status *", "run_command:docker ps"];
+        assert_eq!(cmd_verdict(&allow, "git status"), Allow);
+        assert_eq!(cmd_verdict(&allow, "git status --porcelain -b"), Allow);
+        assert_eq!(cmd_verdict(&allow, "docker ps"), Allow);
+        // Exact arity without a trailing `*`.
+        assert_eq!(cmd_verdict(&allow, "docker ps -a"), NoMatch);
+        assert_eq!(cmd_verdict(&allow, "git push"), NoMatch);
+        // No shell: `;` is just an argument, never a second command, and
+        // the program token is literal (no path or glob tricks).
+        assert_eq!(cmd_verdict(&allow, "git status; rm -rf /"), NoMatch);
+        // Spaced out it matches, but runs only `git` with literal args
+        // `;`, `rm`, `-rf`, `/` — nothing is chained.
+        assert_eq!(cmd_verdict(&allow, "git status ; rm -rf /"), Allow);
+        assert_eq!(
+            cmd_verdict(&["run_command:echo *"], "rm -rf / ; echo"),
+            NoMatch
+        );
+        assert_eq!(cmd_verdict(&allow, "/usr/bin/git status"), NoMatch);
+        assert_eq!(cmd_verdict(&["run_command:*"], "rm -rf /"), NoMatch);
+        // Per-argument globs.
+        assert_eq!(
+            cmd_verdict(
+                &["run_command:cargo test -p tole-*"],
+                "cargo test -p tole-cli"
+            ),
+            Allow
+        );
+        // A command pattern never matches another tool, and an
+        // unterminated quote never matches.
+        assert_eq!(cmd_verdict(&allow, "git status 'oops"), NoMatch);
+        assert_eq!(
+            AllowlistApprover::allow_only(vec!["run_command:git *".into()])
+                .decide(&req("git", Risk::Write)),
+            Verdict::Deny
+        );
+    }
+
+    #[cfg(feature = "shell-tools")]
+    #[test]
+    fn deny_wins_sees_through_paths_and_sends_wrappers_to_a_human() {
+        use PatternVerdict::*;
+        let pats = ["run_command", "!run_command:rm *"];
+        assert_eq!(cmd_verdict(&pats, "ls -la"), Allow);
+        assert_eq!(cmd_verdict(&pats, "rm -rf build"), Deny);
+        assert_eq!(cmd_verdict(&pats, "/bin/rm -rf build"), Deny);
+        assert_eq!(
+            cmd_verdict(&pats, "rm"),
+            Deny,
+            "trailing * allows zero args"
+        );
+        // Wrappers can hide the real program: ask, never auto-allow.
+        assert_eq!(cmd_verdict(&pats, "env rm -rf build"), Ask);
+        assert_eq!(cmd_verdict(&pats, "sh -c 'rm -rf build'"), Ask);
+        assert_eq!(cmd_verdict(&pats, "/usr/bin/sudo ls"), Ask);
+        // Without a command deny, wrappers follow the normal rules.
+        assert_eq!(cmd_verdict(&["run_command"], "env ls"), Allow);
+        // A tool-name deny.
+        assert_eq!(cmd_verdict(&["*", "!run_command"], "ls"), Deny);
+        // Headless (nobody to ask): Ask is a refusal.
+        let a = AllowlistApprover::allow_only(pats.iter().map(|p| p.to_string()).collect());
+        let input = serde_json::json!({ "command": "env rm x" });
+        let r = ToolRequest {
+            tool: "run_command",
+            risk: Risk::Write,
+            input: &input,
+            description: String::new(),
+            target: None,
+        };
+        assert_eq!(a.decide(&r), Verdict::Deny);
+        // deny_only treats `run_command:` patterns command-wise too.
+        let d = AllowlistApprover::deny_only(vec!["run_command:rm *".into()]);
+        assert_eq!(d.decide(&r), Verdict::Allow, "env is not rm in deny_only");
+        let input = serde_json::json!({ "command": "rm x" });
+        let r = ToolRequest { input: &input, ..r };
+        assert_eq!(d.decide(&r), Verdict::Deny);
+    }
+
+    #[test]
+    fn deny_patterns_never_allow() {
+        assert!(!pattern_allows(
+            "!write_file",
+            &req("write_file", Risk::Write)
+        ));
+        assert!(pattern_denies("!write_*", &req("write_file", Risk::Write)));
+        let a = AllowlistApprover::allow_only(vec!["*".into(), "!write_file".into()]);
+        assert_eq!(a.decide(&req("write_file", Risk::Write)), Verdict::Deny);
+        assert_eq!(a.decide(&req("edit_file", Risk::Write)), Verdict::Allow);
     }
 }

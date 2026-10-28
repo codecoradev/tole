@@ -170,6 +170,27 @@ results the user reviews, not a sandbox. `delete_file` (Destructive) and
 preset only after its content was trusted, the same bar as
 `allow = ["write_file"]`.
 
+## Command patterns (#438)
+
+`run_command:<argv pattern>` allow patterns match the argv the tool
+executes — the same splitter, no shell — so `git status; rm -rf /` cannot
+chain a second command (it would run `git` with literal arguments). An
+ALLOW compares the program literally (`/usr/bin/git` does not match `git`,
+`run_command:*` matches nothing), so an allow can only be as wide as
+written. Choose allows with care: `run_command:git *` also allows
+`git -c core.pager=… log`, `git config alias.x '!…'` and other ways a
+program runs code from its arguments.
+
+A DENY (`!…`) wins over every allow and over `--yes`, and its program
+matches by file name too. A deny list cannot be complete — `env rm`,
+`sh -c 'rm …'`, `find -exec rm`, `python -c` all reach `rm` — so: while any
+`run_command` deny is set, known wrappers (`sh`, `bash`, `env`, `sudo`,
+`xargs`, `busybox`, `timeout`, ...) always ask the human (refused where
+nobody can be asked), and the documented boundary is the ALLOWLIST: a
+deny narrows `--yes`, it does not make `--yes` safe. Denies travel with
+allow lists (config, ACP, serve) and a child agent always inherits its
+parent's denies.
+
 ## Memory loop — decision typing (#143)
 
 The session summary stored by the memory loop keeps its content contract

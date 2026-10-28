@@ -114,7 +114,11 @@ mid-turn and resume exactly where it stopped.
 
 Useful flags (all subcommands): `--system` (persona, pinned in the session
 header), `--workspace <dir>` (file-tools jail root), `--allow <glob>`
-(repeatable pre-authorization for Write tools, e.g. `--allow 'write_*'`),
+(repeatable pre-authorization for Write tools, e.g. `--allow 'write_*'`;
+`run_command:<argv>` matches commands by argument, e.g.
+`--allow 'run_command:git status *'` — a lone `*` is "any further
+arguments", the program is matched literally; a leading `!` denies and wins
+over every allow and `--yes`, e.g. `--allow '!run_command:rm *'`),
 `--yes` (auto-allow every Write; Destructive still prompts), `--mcp-server`,
 `--no-auto-mcp` (skip the cora auto-preset), `--trust <preset>` (one-word
 trust: `internal` / `read_only` / `workspace` — `read_only` plus

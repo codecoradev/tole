@@ -644,15 +644,20 @@ impl Tool for AgentStartTool {
         // Subset enforcement: every requested pattern must be glob-covered
         // by a PARENT pattern; the default is the parent's own list. The
         // child can never write wider than the operator approved.
+        // Deny patterns (#438, `!…`) only narrow: a child may add its own,
+        // and ALWAYS inherits every parent deny — a child cannot shed one.
+        let is_deny = |p: &String| p.starts_with(crate::approval::DENY_PREFIX);
         let allows = if requested.is_empty() {
             self.parent_allows.clone()
         } else {
             let uncovered: Vec<&String> = requested
                 .iter()
+                .filter(|p| !is_deny(p))
                 .filter(|p| {
                     !self
                         .parent_allows
                         .iter()
+                        .filter(|pp| !is_deny(pp))
                         .any(|pp| crate::approval::glob_match(pp, p))
                 })
                 .collect();
@@ -663,7 +668,13 @@ impl Tool for AgentStartTool {
                     self.parent_allows
                 ));
             }
-            requested
+            let mut child = requested;
+            for deny in self.parent_allows.iter().filter(|p| is_deny(p)) {
+                if !child.contains(deny) {
+                    child.push(deny.clone());
+                }
+            }
+            child
         };
         // A role child gets exactly one extra, harness-owned tool name:
         // `handoff_submit` can only write one validated, bounded file at
@@ -1930,6 +1941,41 @@ mod tests {
                 Err(e) => panic!("covered pattern {req:?} rejected: {e}"),
             }
         }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// #438: deny patterns only narrow — a child may add its own and always
+    /// inherits every parent deny, even when it names its own allow list.
+    #[cfg(unix)]
+    #[test]
+    fn a_child_always_inherits_the_parent_denies() {
+        let allows_of = |argv: &[String]| -> Vec<String> {
+            argv.iter()
+                .enumerate()
+                .filter(|(i, _)| *i > 0 && argv[*i - 1] == "--allow")
+                .map(|(_, a)| a.clone())
+                .collect()
+        };
+        let parent = vec!["run_command".to_string(), "!run_command:rm *".to_string()];
+        let d = tmp("deny-inherit");
+        let (_, argv, _) = start_and_dump(
+            &d,
+            json!({"prompt": "x", "allow": ["run_command", "!run_command:curl *"]}),
+            parent.clone(),
+        );
+        let allows = allows_of(&argv);
+        for want in ["run_command", "!run_command:curl *", "!run_command:rm *"] {
+            assert!(allows.iter().any(|a| a == want), "{want}: {allows:?}");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+        // A parent deny never "covers" a child allow request.
+        let d = tmp("deny-cover");
+        let start = AgentStartTool::new(fake_child(&d), d.clone())
+            .with_parent_allows(vec!["!*".to_string()]);
+        let err = start
+            .execute(json!({"prompt": "x", "allow": ["write_file"]}))
+            .unwrap_err();
+        assert!(err.contains("exceed the parent"), "{err}");
         let _ = std::fs::remove_dir_all(&d);
     }
 
