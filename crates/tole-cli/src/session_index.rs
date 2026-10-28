@@ -126,6 +126,32 @@ pub fn find(index: &Path, id: &str) -> Option<Entry> {
     })
 }
 
+/// The command that resumes an indexed session in its own project:
+/// `cd <cwd> && tole resume <id>`, plus `--sessions-dir` when the session
+/// file is not in that project's default `.tole/sessions`. Paths are
+/// single-quoted for a POSIX shell when they need it.
+pub fn resume_hint(e: &Entry) -> String {
+    fn quote(p: &Path) -> String {
+        let s = p.display().to_string();
+        if s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/._-+:@%".contains(c))
+        {
+            s
+        } else {
+            format!("'{}'", s.replace('\'', "'\\''"))
+        }
+    }
+    let dir = e.file.parent().unwrap_or(Path::new("."));
+    let default = e.cwd.join(".tole/sessions");
+    let same = dir.canonicalize().ok() == default.canonicalize().ok();
+    let flag = if same {
+        String::new()
+    } else {
+        format!(" --sessions-dir {}", quote(dir))
+    };
+    format!("cd {} && tole{flag} resume {}", quote(&e.cwd), e.id)
+}
+
 /// What `sessions --all` shows for one session, read from its own file.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Row {
@@ -286,6 +312,21 @@ mod tests {
         assert!(super::rows(&idx, Some("nothing-like-this")).is_empty());
         assert_eq!(find(&idx, "s-live").unwrap().id, "s-live");
         assert!(find(&idx, "s-gone").is_none());
+        // The resume hint names the project dir (and a non-default
+        // sessions dir).
+        let e = find(&idx, "s-live").unwrap();
+        assert_eq!(
+            resume_hint(&e),
+            format!(
+                "cd /work/proj && tole --sessions-dir {} resume s-live",
+                d.display()
+            )
+        );
+        let spaced = Entry {
+            cwd: PathBuf::from("/work/my proj"),
+            ..e.clone()
+        };
+        assert!(resume_hint(&spaced).starts_with("cd '/work/my proj' && "));
         // An entry whose file is not `<id>.jsonl` never resolves the id.
         append(&idx, &entry("s-other", &d.join("s-live.jsonl"), 7)).unwrap();
         assert!(find(&idx, "s-other").is_none());

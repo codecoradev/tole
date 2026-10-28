@@ -1748,18 +1748,22 @@ fn resume_command(
         match best {
             Some((_, resolved)) => resolved,
             None => {
-                // Not here: the global index (#439) knows which project
-                // directory a session id lives in.
-                // `find` only returns an entry whose file is `<dir>/<id>.jsonl`,
-                // and only a valid id is looked up, so the call below resolves
-                // the id directly in `dir` and never falls back again.
+                // Not here: the global index (#439) knows which project the
+                // session belongs to. It is NOT resumed from here: this
+                // process's workspace jail, project config and trust were
+                // resolved for THIS directory, and the turn would act on
+                // the wrong tree. Name the exact command instead, so the
+                // owning project's config and trust gate apply.
                 let indexed = valid_session_id(id)
                     .then(tole_cli::session_index::index_path)
                     .flatten()
                     .and_then(|idx| tole_cli::session_index::find(&idx, id));
-                if let Some(dir) = indexed.as_ref().and_then(|e| e.file.parent()) {
-                    eprintln!("tole: resuming {id} from {}", dir.display());
-                    return resume_command(dir, id, prompt, allow_patterns, yes, host);
+                if let Some(e) = indexed {
+                    anyhow::bail!(
+                        "session {id} belongs to another project; resume it there so its \
+                         workspace, config and trust apply:\n  {}",
+                        tole_cli::session_index::resume_hint(&e)
+                    );
                 }
                 anyhow::bail!(
                     "no session with id or name {id:?} in {} (nor in the session index)",

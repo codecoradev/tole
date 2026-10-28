@@ -430,10 +430,12 @@ and cwds across projects. It holds no conversation content (previews are
 read from the session file at list time), is created owner-only (0600), is
 append-only (one `write` per line; a torn or foreign line is skipped, never
 fatal) and is best effort: a failure never affects a session, and
-`TOLE_NO_SESSION_INDEX=1` disables it. `resume <id>` trusts it only to name a
-directory: the session file there is opened and replayed like any local one,
-and a missing file falls through to "not found". Anyone who can write the
-index can already write the session files it points to (same home).
+`TOLE_NO_SESSION_INDEX=1` disables it. The index never moves a session
+across projects: `resume <id>` for a session of another project REFUSES and
+prints the command to run in that project, because this process's workspace
+jail, project config and trust were resolved for the current directory and
+would otherwise act on the wrong tree. Anyone who can write the index can
+already write the session files it points to (same home).
 
 ### User config (#433)
 

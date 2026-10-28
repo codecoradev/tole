@@ -1,6 +1,7 @@
 //! #439: the global session index end to end with the REAL binary — a
-//! session started in project A is listed by `tole sessions --all` and
-//! resumed by id from project B. `CODECORA_HOME` is isolated per test.
+//! session started in project A is listed by `tole sessions --all` from
+//! project B, and `tole resume <id>` from B names the command to run in A.
+//! `CODECORA_HOME` is isolated per test.
 
 use serde_json::{json, Value};
 use std::io::{Read, Write};
@@ -119,7 +120,7 @@ fn session_id(out: &Output) -> String {
 }
 
 #[test]
-fn a_session_is_listed_and_resumed_from_another_project() {
+fn a_session_is_listed_everywhere_and_resumed_in_its_own_project() {
     let url = spawn_mock();
     let home = tmpdir("home");
     let (a, b) = (tmpdir("project-a"), tmpdir("project-b"));
@@ -159,15 +160,26 @@ fn a_session_is_listed_and_resumed_from_another_project() {
     );
     assert!(!text(&miss.stdout).contains(&id));
 
-    // Resume by id from project B: the index says where the session lives.
+    // Resume by id from project B is refused (B's workspace, config and
+    // trust would apply to A's session); the error names the command.
     let r = tole(&b, &home, &url, &["resume", &id, "and the changelog"], &[]);
-    assert!(r.status.success(), "{}", text(&r.stderr));
-    assert!(text(&r.stderr).contains("resuming"), "{}", text(&r.stderr));
-    let file = std::fs::read_to_string(a.join(format!(".tole/sessions/{id}.jsonl"))).unwrap();
+    assert!(!r.status.success());
+    let err = text(&r.stderr);
+    assert!(err.contains("belongs to another project"), "{err}");
     assert!(
-        file.contains("and the changelog"),
-        "the turn landed in project A"
+        err.contains(&format!("cd {} && tole resume {id}", a.display())),
+        "{err}"
     );
+    let file = a.join(format!(".tole/sessions/{id}.jsonl"));
+    assert!(!std::fs::read_to_string(&file)
+        .unwrap()
+        .contains("and the changelog"));
+    // Run where it says: it resumes.
+    let r = tole(&a, &home, &url, &["resume", &id, "and the changelog"], &[]);
+    assert!(r.status.success(), "{}", text(&r.stderr));
+    assert!(std::fs::read_to_string(&file)
+        .unwrap()
+        .contains("and the changelog"));
 
     // The index never holds prompt text.
     let index = std::fs::read_to_string(home.join("tole/sessions-index.jsonl")).unwrap();
