@@ -236,7 +236,8 @@ Everything below is merged; CHANGELOG entries carry the detail.
   `web_search` method, auth headers and field mapping (#436);
   `--trust workspace` (#437); command-level allow/deny patterns for
   `run_command` (#438); global session index, `sessions --all` and
-  cwd-independent `resume` (#439).
+  cwd-independent `resume` (#439); context compaction core (#440, CLI wiring
+  follows).
 - **Open backlog:** provider failover chain (#209), session branching (#210), multimodal
   input (#212), MCP prompts/resources as quick commands (#213), background detach (#217),
   Claude Code session resume (#381); the multi-client daemon note (#382) is parked.

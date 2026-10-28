@@ -488,7 +488,9 @@ fn drive(
         deliver_interrupts(s, cancel)?;
         // No clone: complete() borrows the storage slice. (The old
         // to_vec() allocated the whole transcript every provider step.)
-        let next = match p.complete(s.entries()) {
+        // After a compaction (#440) the provider sees the summary plus the
+        // kept tail instead; without one this borrows the slice as before.
+        let next = match p.complete(&crate::compaction::view(s.entries())) {
             Ok(o) => o,
             Err(ProviderError(msg)) => {
                 // Retry classification (#58 + live 429 evidence): gateway
