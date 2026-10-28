@@ -1750,7 +1750,12 @@ fn resume_command(
             None => {
                 // Not here: the global index (#439) knows which project
                 // directory a session id lives in.
-                let indexed = tole_cli::session_index::index_path()
+                // `find` only returns an entry whose file is `<dir>/<id>.jsonl`,
+                // and only a valid id is looked up, so the call below resolves
+                // the id directly in `dir` and never falls back again.
+                let indexed = valid_session_id(id)
+                    .then(tole_cli::session_index::index_path)
+                    .flatten()
                     .and_then(|idx| tole_cli::session_index::find(&idx, id));
                 if let Some(dir) = indexed.as_ref().and_then(|e| e.file.parent()) {
                     eprintln!("tole: resuming {id} from {}", dir.display());

@@ -15,6 +15,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, Write};
+
 use std::path::{Path, PathBuf};
 use tole_core::storage::{JsonlStorage, Storage};
 
@@ -102,9 +103,11 @@ pub fn load(index: &Path) -> Vec<Entry> {
         return Vec::new();
     };
     let mut by_id: std::collections::HashMap<String, Entry> = std::collections::HashMap::new();
-    for line in std::io::BufReader::new(f).lines() {
-        let Ok(line) = line else { break };
-        if let Ok(e) = serde_json::from_str::<Entry>(&line) {
+    // Raw byte lines: a torn or non-UTF-8 line is skipped like any other
+    // bad line, never the end of the index.
+    for line in std::io::BufReader::new(f).split(b'\n') {
+        let Ok(line) = line else { break }; // a read error, not bad content
+        if let Ok(e) = serde_json::from_slice::<Entry>(&line) {
             by_id.insert(e.id.clone(), e);
         }
     }
@@ -113,11 +116,14 @@ pub fn load(index: &Path) -> Vec<Entry> {
     all
 }
 
-/// The indexed session with exactly this id whose file still exists.
+/// The indexed session with exactly this id whose file still exists AND
+/// is named `<id>.jsonl` — so its directory resolves the id locally; an
+/// entry pointing anywhere else (a corrupt or hand-edited line) is ignored.
 pub fn find(index: &Path, id: &str) -> Option<Entry> {
-    load(index)
-        .into_iter()
-        .find(|e| e.id == id && e.file.is_file())
+    let expected = format!("{id}.jsonl");
+    load(index).into_iter().find(|e| {
+        e.id == id && e.file.file_name().is_some_and(|n| n == expected.as_str()) && e.file.is_file()
+    })
 }
 
 /// What `sessions --all` shows for one session, read from its own file.
@@ -231,6 +237,13 @@ mod tests {
             .unwrap()
             .write_all(b"{\"id\": \"s-x\", trunc\nnot json\n")
             .unwrap();
+        // Non-UTF-8 garbage mid-file must not hide the lines after it.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&idx)
+            .unwrap()
+            .write_all(b"\xff\xfe\x00 torn\n")
+            .unwrap();
         append(&idx, &entry("s-a", &d.join("a2.jsonl"), 30)).unwrap();
         let all = load(&idx);
         let ids: Vec<&str> = all.iter().map(|e| e.id.as_str()).collect();
@@ -273,5 +286,8 @@ mod tests {
         assert!(super::rows(&idx, Some("nothing-like-this")).is_empty());
         assert_eq!(find(&idx, "s-live").unwrap().id, "s-live");
         assert!(find(&idx, "s-gone").is_none());
+        // An entry whose file is not `<id>.jsonl` never resolves the id.
+        append(&idx, &entry("s-other", &d.join("s-live.jsonl"), 7)).unwrap();
+        assert!(find(&idx, "s-other").is_none());
     }
 }
