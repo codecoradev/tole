@@ -9,7 +9,7 @@ Durable Rust agent harness: a conversational agent with risk-tiered approval
 gates, a write-once JSONL session log, and a register state machine — resumable
 after crashes, replayable forever.
 
-**Status:** v0.8.1 is the latest release. `develop` carries the unreleased v0.8.2 hardening patch (`tole serve` HTTP framing and slow-client limits, cancel during replay approval, scan follow-ups) and the next feature set: `tole doctor`, soft interrupts, per-turn token stats, sibling change notices and the typed child-agent handoff (see the CHANGELOG). v0.8.1 itself brought token-usage reporting and a capped, resumable `read_file` (#211), on top of v0.8.0, which added the per-project config `.tole/config.toml`
+**Status:** v0.9.0 is the latest release: `tole doctor`, soft interrupts, per-turn token stats, sibling change notices and the typed child-agent handoff, a provider failover chain, the user config layer, `--trust workspace`, command-level allow/deny patterns, a global session index (`sessions --all`) and context compaction, plus the 0.8.2 `tole serve` hardening (see the CHANGELOG). `develop` is working toward 0.10.0, a pi-style terminal UI (`tole-tui`, #464). v0.8.1 itself brought token-usage reporting and a capped, resumable `read_file` (#211), on top of v0.8.0, which added the per-project config `.tole/config.toml`
 (trusted before it applies; see the Configuration section) on top of v0.7.x
 (rescan-2 hardening, one tool-call authorization gate; see the CHANGELOG for
 the behavior changes). Four faces on one durable core: the CLI (run / chat /

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-10-28
+
+Includes the 0.8.2 hardening patch below, which was never tagged or published on its own.
+
 ### Added
 - Context compaction, wired (#440, 2/2): `chat`, `resume` and `mission` compact between turns once a prompt reaches `--compact-at` (default 0.8; config `compact_at`) of the model's context window. The window is `TOLE_CONTEXT_WINDOW` / config `context_window`, else what the provider's `/models` reports for the session's model (`context_length`, `context_window`, `max_context_length`, `max_model_len`, `max_input_tokens`, `top_provider.context_length`) — looked up lazily, only once a prompt passes 8k tokens, at most once per process; with neither, compaction stays off and says so once. A failed summary call is reported and the session continues uncompacted. `--no-compaction` / config `no_compaction` turns it off; `tole status` lists each compaction; `tole config check` shows the effective values and their sources.
 - Context compaction, core (#440, 1/2): `tole_core::compaction`. `compact()` summarizes the settled turns before the kept tail with the session's provider and commits ONE `compaction` entry (summary, first kept entry, compacted count, prompt size before) together with the summary call's usage row — atomic, append-only, the transcript is never rewritten. `view()` is what the provider sees: the transcript as is, or the latest summary (inside the untrusted-content fence used for tool results, introduced as a record rather than instructions) followed by the kept tail; the turn loop sends `view()`. `due()` compares the last call made AFTER the last compaction against `Policy { window, at, keep_turns }`, so the summary call never re-triggers it. Inactive until the CLI wiring (window resolution, `--compact-at`, `--no-compaction`, mission/chat/resume hooks, `tole status`) lands.
@@ -50,7 +54,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Tool roster (#420, 1/3): the CLI faces (`run`, `resume`, `chat`, `mission`) and the MCP server faces (`tole mcp`, MCP-over-HTTP) build their tools through one `tool_roster` module instead of two copied builders. Plan mode is applied in one place, and there is one binary probe (`binary_available`, executable files only) and one GitHub-origin probe. The MCP server faces now report a missing `uteke` / `cora` binary or GitHub origin on stderr like the CLI does.
 - Memory loop injection hygiene (#384): the recalled batch is hard-capped at 24 items / 64 KiB and deduplicated; a malformed recall payload (non-array, or a hit without content) now fails the whole batch visibly instead of silently injecting fewer items; `tole serve`/MCP sessions report recall failures on stderr like the CLI does.
 
-## [0.8.2] — 2026-10-12
+## [0.8.2] — 2026-10-12 (never tagged; shipped in 0.9.0)
 
 ### Fixed
 - `tole serve` HTTP hardening (#361): header names are matched case-insensitively (a lowercase `authorization:` was refused), `Expect: 100-continue` is answered (curl no longer stalls ~1s on POST bodies over 1 KiB), reading a request has a 15s total deadline (a client trickling bytes can no longer pin a connection slot), an oversized body gets `413`, duplicate/invalid `Content-Length` and `Transfer-Encoding` get `400`, the bearer token is compared in constant time, a poisoned auth-failure lock no longer disables authentication, and `202`/`429`/`503` carry their real reason phrases.
