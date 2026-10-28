@@ -8,7 +8,7 @@
 use std::io::{self, BufRead, Write};
 use std::sync::Arc;
 
-use tole_core::approval::{glob_match, Approver, ToolRequest, Verdict};
+use tole_core::approval::{pattern_allows, Approver, ToolRequest, Verdict};
 use tole_core::tool::Risk;
 
 /// How the approver asks a human and reads the answer. Injectable for
@@ -175,7 +175,7 @@ impl<P: PromptFn> Approver for InteractiveApprover<P> {
             .patterns
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if auto_write || patterns.iter().any(|p| glob_match(p, req.tool)) {
+        if auto_write || patterns.iter().any(|p| pattern_allows(p, req)) {
             return Verdict::Allow;
         }
         drop(patterns);

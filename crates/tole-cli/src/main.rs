@@ -731,6 +731,23 @@ fn dispatch(cli: Cli) -> Result<()> {
     // list (the env splits on commas/whitespace so one variable can carry
     // several presets).
     let trust_extra = expand_trust(&config_apply::values(&settings.trust))?;
+    // `--trust workspace` (#437) needs an explicit workspace that is not a
+    // home / filesystem root; resolved only when the preset is used.
+    let trust_names = config_apply::values(&settings.trust);
+    if trust_names
+        .iter()
+        .any(|p| p.eq_ignore_ascii_case("workspace"))
+    {
+        let root = match &settings.workspace {
+            Some(w) => Some(resolve_workspace_root(Some(&w.value))?),
+            None => None,
+        };
+        tole_cli::trust::check_workspace_root(
+            &trust_names,
+            root.as_deref(),
+            std::env::var_os("HOME").map(PathBuf::from).as_deref(),
+        )?;
+    }
 
     match cli.command {
         // Handled at the top of `dispatch`, before any session/env state.
@@ -2808,13 +2825,43 @@ mod trust_preset_tests {
         for p in &ro {
             assert!(ws.contains(p), "workspace lacks read_only's {p}");
         }
-        assert!(ws.iter().any(|p| p == "write_file"));
-        assert!(ws.iter().any(|p| p == "edit_file"));
-        // Exact names only: nothing that reaches outside the jail.
-        for never in ["delete_file", "run_command", "git", "gh", "agent_start"] {
+        // The writers only through the path guard, never bare.
+        assert!(ws.iter().any(|p| p == "write_file@workspace"));
+        assert!(ws.iter().any(|p| p == "edit_file@workspace"));
+        for never in [
+            "write_file",
+            "edit_file",
+            "delete_file",
+            "run_command",
+            "git",
+            "gh",
+            "agent_start",
+        ] {
             assert!(!ws.iter().any(|p| p == never), "{never}: {ws:?}");
         }
         assert!(!ws.iter().any(|p| p.contains('*')), "{ws:?}");
+    }
+
+    #[test]
+    fn workspace_preset_refuses_home_and_filesystem_root() {
+        use tole_cli::trust::check_workspace_root;
+        let ws = vec!["workspace".to_string()];
+        let home = std::env::temp_dir().join(format!("tole-ws-home-{}", std::process::id()));
+        let project = home.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        assert!(check_workspace_root(&ws, Some(&project), Some(&home)).is_ok());
+        let e = check_workspace_root(&ws, Some(&home), Some(&home)).unwrap_err();
+        assert!(
+            e.to_string().contains("your home or a filesystem root"),
+            "{e}"
+        );
+        assert!(check_workspace_root(&ws, Some(Path::new("/")), None).is_err());
+        // The implicit cwd is never enough.
+        let e = check_workspace_root(&ws, None, Some(&home)).unwrap_err();
+        assert!(e.to_string().contains("needs an explicit workspace"), "{e}");
+        // Other presets never look at the root.
+        assert!(check_workspace_root(&["read_only".into()], None, None).is_ok());
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

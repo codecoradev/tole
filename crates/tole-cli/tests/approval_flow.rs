@@ -220,9 +220,9 @@ fn tool_request_carries_prompt_fields() {
     assert_eq!(a.decide(&req), Verdict::Allow);
 }
 
-/// #437: `--trust workspace` auto-allows writes inside the workspace jail
-/// (no prompt), an escape is stopped by the jail itself (a tool error, not
-/// a write elsewhere), and the Destructive `delete_file` still prompts.
+/// #437: `--trust workspace` auto-allows plain writes inside the workspace
+/// jail (no prompt), a dot-path (`.git/hooks/...`) still prompts, and the
+/// Destructive `delete_file` still prompts.
 #[test]
 fn trust_workspace_writes_only_inside_the_jail_and_delete_still_prompts() {
     use tole_core::file_tools::DeleteFileTool;
@@ -246,8 +246,25 @@ fn trust_workspace_writes_only_inside_the_jail_and_delete_still_prompts() {
         },
         ProviderOutput::ToolCall {
             tool: "write_file".into(),
-            input: json!({ "path": "../escaped.md", "content": "outside" }),
+            input: json!({ "path": ".git/hooks/pre-commit", "content": "boom" }),
         },
+        ProviderOutput::Final {
+            text: "unreachable".into(),
+        },
+    ]);
+    match run_turn(&mut s, &mut p, &reg, "write a report").unwrap() {
+        TurnOutcome::ApprovalRequired { name } => assert_eq!(name, "write_file"),
+        other => panic!("expected the dot-path write to prompt, got {other:?}"),
+    }
+    assert_eq!(
+        std::fs::read_to_string(ws.join("report.md")).unwrap(),
+        "inside"
+    );
+    assert!(!ws.join(".git/hooks/pre-commit").exists());
+
+    // Destructive delete still prompts under the preset.
+    let mut s = JsonlStorage::create(&root, "trust-ws-delete", None).unwrap();
+    let mut p = MockProvider::scripted(vec![
         ProviderOutput::ToolCall {
             tool: "delete_file".into(),
             input: json!({ "path": "old.txt" }),
@@ -256,20 +273,9 @@ fn trust_workspace_writes_only_inside_the_jail_and_delete_still_prompts() {
             text: "unreachable".into(),
         },
     ]);
-    match run_turn(&mut s, &mut p, &reg, "write a report").unwrap() {
+    match run_turn(&mut s, &mut p, &reg, "clean up").unwrap() {
         TurnOutcome::ApprovalRequired { name } => assert_eq!(name, "delete_file"),
         other => panic!("expected delete_file to prompt, got {other:?}"),
     }
-    assert_eq!(
-        std::fs::read_to_string(ws.join("report.md")).unwrap(),
-        "inside"
-    );
-    assert!(!root.join("escaped.md").exists(), "the jail must hold");
-    assert!(
-        s.entries()
-            .iter()
-            .any(|e| e.payload.to_string().contains("escapes the jail")),
-        "the escape is recorded as a tool error"
-    );
     assert!(ws.join("old.txt").exists(), "denied delete must not run");
 }
