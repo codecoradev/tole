@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `agent_poll` and the concurrent-agent cap no longer treat a recycled pid as the agent: a live process that started well after the agent was spawned (`ps -o etime`) is a different process, so a dead child whose number was reused no longer holds a cap slot or reads as "running" forever (pre-tag scan of 0.9.0).
+
 ## [0.9.0] — 2026-10-28
 
 Includes the 0.8.2 hardening patch below, which was never tagged or published on its own.

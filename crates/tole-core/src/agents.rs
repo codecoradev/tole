@@ -298,6 +298,69 @@ fn pid_alive(pid: u32) -> Result<bool, String> {
     Ok(!state.is_empty() && !state.starts_with('Z'))
 }
 
+/// How much younger than the agent a live process may look before its pid
+/// is taken as REUSED: covers the spawn itself, `ps`'s one-second
+/// resolution and small clock steps.
+const PID_REUSE_SLACK_SECS: u64 = 60;
+
+/// Is the agent spawned at `spawned_at_ms` with `pid` still running?
+/// [`pid_alive`] alone counts a recycled pid — an unrelated process that
+/// got the dead child's number — as the child forever, wedging the
+/// concurrency cap and keeping `agent_poll` at "running" (scan
+/// 2026-10-28). A process that started well AFTER the agent did is not
+/// the agent.
+fn agent_alive(pid: u32, spawned_at_ms: u128) -> Result<bool, String> {
+    if !pid_alive(pid)? {
+        return Ok(false);
+    }
+    let Some(age) = process_age_secs(pid) else {
+        // No usable age: keep the plain liveness answer (never read a
+        // failed lookup as "dead", like `pid_alive`).
+        return Ok(true);
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let agent_age = u64::try_from(now_ms.saturating_sub(spawned_at_ms) / 1000).unwrap_or(u64::MAX);
+    Ok(age + PID_REUSE_SLACK_SECS >= agent_age)
+}
+
+/// Seconds since `pid` started (`ps -o etime=`), `None` when unknown.
+fn process_age_secs(pid: u32) -> Option<u64> {
+    let out = crate::subprocess::run_with_timeout(
+        Command::new("ps")
+            .arg("-p")
+            .arg(pid.to_string())
+            .arg("-o")
+            .arg("etime="),
+        crate::subprocess::SUBPROCESS_TIMEOUT,
+    )
+    .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_etime(String::from_utf8_lossy(&out.stdout).trim())
+}
+
+/// `ps` elapsed time, `[[dd-]hh:]mm:ss`, in seconds.
+fn parse_etime(s: &str) -> Option<u64> {
+    let (days, rest) = match s.split_once('-') {
+        Some((d, r)) => (d.parse::<u64>().ok()?, r),
+        None => (0, s),
+    };
+    let parts: Vec<u64> = rest
+        .split(':')
+        .map(|p| p.parse::<u64>().ok())
+        .collect::<Option<_>>()?;
+    let (h, m, sec) = match parts[..] {
+        [m, s] => (0, m, s),
+        [h, m, s] => (h, m, s),
+        _ => return None,
+    };
+    Some(((days * 24 + h) * 60 + m) * 60 + sec)
+}
+
 /// One agent's durable state (meta.json in its dir).
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct AgentMeta {
@@ -359,7 +422,12 @@ fn live_agents(root: &std::path::Path) -> Result<usize, String> {
             continue;
         };
         if let Ok(pid) = pid.trim().parse::<u32>() {
-            if pid_alive(pid)? {
+            // Without a readable meta (mid-spawn), plain liveness.
+            let alive = match read_meta(&dir) {
+                Ok(meta) => agent_alive(pid, meta.spawned_at_ms)?,
+                Err(_) => pid_alive(pid)?,
+            };
+            if alive {
                 n += 1;
             }
         }
@@ -907,8 +975,8 @@ impl Tool for AgentPollTool {
             .parse()
             .map_err(|_| format!("agent_poll: corrupt pid file for {id}"))?;
         let mut meta = read_meta(&dir)?;
-        let running =
-            pid_alive(pid).map_err(|e| format!("agent_poll: liveness check failed: {e}"))?;
+        let running = agent_alive(pid, meta.spawned_at_ms)
+            .map_err(|e| format!("agent_poll: liveness check failed: {e}"))?;
         let elapsed_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
@@ -1547,6 +1615,67 @@ mod tests {
         assert!(
             !agents_root(&d).exists() || std::fs::read_dir(agents_root(&d)).unwrap().count() == 0
         );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn ps_elapsed_time_parses_every_form() {
+        assert_eq!(parse_etime("00:07"), Some(7));
+        assert_eq!(parse_etime("12:34"), Some(754));
+        assert_eq!(parse_etime("01:02:03"), Some(3723));
+        assert_eq!(parse_etime("2-01:02:03"), Some(2 * 86_400 + 3723));
+        for bad in ["", "7", "a:b", "1:2:3:4", "x-01:02"] {
+            assert_eq!(parse_etime(bad), None, "{bad:?}");
+        }
+    }
+
+    /// Scan 2026-10-28: a live pid that STARTED after the agent was spawned
+    /// is a recycled number, not the agent — it must neither hold a cap
+    /// slot nor keep `agent_poll` at "running".
+    #[cfg(unix)]
+    #[test]
+    fn a_recycled_pid_is_not_the_agent() {
+        let mut live = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = live.id();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let hour_ago = now - 3_600_000;
+        assert!(agent_alive(pid, now).unwrap(), "the real agent is alive");
+        assert!(
+            !agent_alive(pid, hour_ago).unwrap(),
+            "a younger process is not"
+        );
+
+        let d = tmp("pid-reuse");
+        let dir = agents_root(&d).join("a-reused");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("pid"), pid.to_string()).unwrap();
+        let meta = |spawned_at_ms| AgentMeta {
+            prompt: "p".into(),
+            mailbox_ns: "agent-x".into(),
+            keep_mailbox: true,
+            spawned_at_ms,
+            worktree: None,
+            branch: None,
+            mailbox_consumed: true,
+            role: None,
+        };
+        write_meta(&dir, &meta(hour_ago)).unwrap();
+        assert_eq!(
+            live_agents(&d).unwrap(),
+            0,
+            "no cap slot for a recycled pid"
+        );
+        let polled = AgentPollTool::new(d.clone())
+            .execute(json!({"agent": "a-reused"}))
+            .unwrap();
+        assert_eq!(polled["running"], json!(false));
+        write_meta(&dir, &meta(now)).unwrap();
+        assert_eq!(live_agents(&d).unwrap(), 1);
+        let _ = live.kill();
+        let _ = live.wait();
         let _ = std::fs::remove_dir_all(&d);
     }
 
