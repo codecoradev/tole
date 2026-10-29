@@ -74,6 +74,14 @@ lives) / **gap** (tracked) / **N/A** (with rationale).
   possible future hardening; none is planned or promised. Non-unix hosts
   have no `O_NOFOLLOW` equivalent wired (best-effort `symlink_metadata`
   check only).
+- **`edit_file` read-modify-write window** — `edit_file` checks the
+  quoted content hash against the file it just read, then writes the edit
+  through a temp file and an atomic rename. A write by ANOTHER process
+  between that read and the rename is overwritten. The window is the
+  duration of one temp-file write; closing it would need a lock every
+  other writer honours, which editors and build tools do not. Within one
+  session tool calls are sequential, so only concurrent outside writers
+  are affected.
 - **`git status`/`diff` are repo-wide by design** — they take no
   pathspec and run with cwd = the tool's workdir, so they show the whole
   repository containing it; in a monorepo subdirectory that includes
@@ -263,6 +271,15 @@ names), and any handoff or sibling-log text shown to another model is
 escaped and bounded. The shared sibling log is a same-user channel between
 processes that already share the parent's authority; a forged line can only
 add notices, and ids read from it must match the agent-id charset.
+
+The verify gate is cooperative, not adversarial: a child that shares the
+parent's workspace can write files under `tole-agents/<id>/`, including
+`meta.json` (role, `keep_mailbox`, prompt) and its own handoff, so a
+deliberately hostile child can make its gate read `closed`. It gains no
+authority from that — it already runs with the parent's approvals and could
+report a passing handoff directly. What a forged `meta.json` must never
+reach is anything outside the child's own agent dir: the mailbox room is
+derived from the validated agent id, never read from the file.
 
 ## `systemone_decide` (#172/#173)
 
