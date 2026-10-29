@@ -131,13 +131,18 @@ that makes them stale. This regression has happened twice (#33 and again
   returns a real verdict with NO `CORA_*` exports in the environment —
   verified across PRs #164/#166). The 2026-09-18 export requirement is
   obsolete.
-- **2026-10-09:** both `tole-core` and `tole-cli` are on crates.io at
-  **0.8.1** (released via the GitHub release `v0.8.1`; `publish.yml`
-  published core then cli; checked via the crates.io API). Registry
-  parity with the checkout is current as of this date; live missions still run the
+- **2026-10-29:** both `tole-core` and `tole-cli` are on crates.io at
+  **0.9.0** (released via the GitHub release `v0.9.0`; `publish.yml`
+  published core then cli; checked via the crates.io API). 0.8.2 was never
+  tagged or published; its changes shipped in 0.9.0. Registry parity with
+  the checkout is current as of this date; live missions still run the
   freshly built `./target/release/tole` (see CONTRIBUTING →
   Live-mission binary hygiene). Since #168 `mcp-http` is a default `tole-cli` feature —
   `cargo install tole-cli` includes `tole serve --transport mcp`.
+- **2026-10-29:** CI Cora Review returns an empty result on very large
+  release ranges (v0.9.0: 87 files, ~14.7k lines). The release PR was
+  reviewed instead with `cora mcp` `review_prepare` / `review_finalize`
+  (agent as reviewer) over ~4k-line chunks, with the verdict posted on the PR.
 - **2026-09-18:** cora 0.13.0 no longer reads the legacy `~/.cora/auth.toml`
   / `~/.cora/config.yaml`. Until re-provisioned with `cora auth login`,
   exports are required: `CORA_API_KEY`, `CORA_BASE_URL`, `CORA_MODEL`
