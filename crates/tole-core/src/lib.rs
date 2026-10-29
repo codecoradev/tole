@@ -25,14 +25,18 @@
 //! - `mock`     — scripted provider for deterministic Tier A tests
 //! - `turn`     — the single-threaded turn loop
 //! - `memory`   — harness-level uteke memory loop (recall/remember)
+//! - `transcript` — read-side view of turn and usage-row conventions
 
 #[cfg(feature = "shell-tools")]
 pub mod agents;
 pub mod approval;
 pub mod cancel;
+pub mod child_env;
+pub mod compaction;
 #[cfg(feature = "shell-tools")]
 pub mod cora_search;
 pub mod entry;
+pub mod failover;
 pub mod file_tools;
 // Tool-call authorization gate (#303): crate-internal, no public API.
 pub(crate) mod gate;
@@ -41,8 +45,11 @@ pub mod gh;
 #[cfg(feature = "shell-tools")]
 pub mod git;
 pub mod gitea;
+pub mod handoff;
+pub mod interrupt;
 pub mod systemone;
 pub mod todo;
+pub mod transcript;
 pub mod web;
 // Process hooks spawn subprocesses (issue #110) — same gate as the
 // subprocess helper they build on; mobile/embedder profiles have no
@@ -69,6 +76,7 @@ pub mod replay;
 pub mod run_command;
 // Approval-surface text sanitizer (#327): crate-internal, no public API.
 pub(crate) mod sanitize;
+pub mod sibling_watch;
 pub mod skills;
 pub mod state;
 pub mod storage;

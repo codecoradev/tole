@@ -61,7 +61,7 @@ fn all_tools() -> Vec<Box<dyn Tool>> {
     let todo = tole_core::todo::TodoState::new();
     tools.push(Box::new(tole_core::todo::TodoWriteTool::new(todo.clone())));
     tools.push(Box::new(tole_core::todo::TodoReadTool::new(todo)));
-    if let Some(t) = tole_core::web::WebSearchTool::from_env() {
+    if let Ok(Some(t)) = tole_core::web::WebSearchTool::from_env() {
         tools.push(Box::new(t));
     }
     let state = SessionToolState::new(vec![], false, None, root, None, vec![]);

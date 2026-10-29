@@ -8,7 +8,7 @@
 use std::io::{self, BufRead, Write};
 use std::sync::Arc;
 
-use tole_core::approval::{glob_match, Approver, ToolRequest, Verdict};
+use tole_core::approval::{pattern_verdict, Approver, PatternVerdict, ToolRequest, Verdict};
 use tole_core::tool::Risk;
 
 /// How the approver asks a human and reads the answer. Injectable for
@@ -52,6 +52,8 @@ impl PromptFn for StdioPrompt {
         println!("what:  {}", req.description);
         println!("input: {}", input_preview(req.input));
         print!("allow? [y/N] ");
+        // A failed prompt flush is not actionable.
+        // cora-ignore: qual-error-ignore
         let _ = io::stdout().flush();
         let mut line = String::new();
         match io::stdin().lock().read_line(&mut line) {
@@ -173,11 +175,17 @@ impl<P: PromptFn> Approver for InteractiveApprover<P> {
             .patterns
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if auto_write || patterns.iter().any(|p| glob_match(p, req.tool)) {
-            return Verdict::Allow;
-        }
+        // A deny pattern (#438) wins over every allow AND over --yes; a
+        // command wrapper under a run_command deny always asks the human.
+        let verdict = pattern_verdict(&patterns, req);
         drop(patterns);
-        self.prompter.prompt(req)
+        match verdict {
+            PatternVerdict::Deny => Verdict::Deny,
+            PatternVerdict::Ask => self.prompter.prompt(req),
+            PatternVerdict::Allow => Verdict::Allow,
+            PatternVerdict::NoMatch if auto_write => Verdict::Allow,
+            PatternVerdict::NoMatch => self.prompter.prompt(req),
+        }
     }
 
     fn interactive(&self) -> bool {
@@ -240,6 +248,7 @@ mod tests {
             risk,
             input: &Value::Null,
             description: format!("{tool} description"),
+            target: None,
         }
     }
 
@@ -344,5 +353,61 @@ mod tests {
         })
         .with_shared_patterns(handle);
         assert_eq!(a.decide(&req("rm_rf", Risk::Destructive)), Verdict::Deny);
+    }
+
+    /// #438: a deny pattern beats --yes; a wrapper under a command deny
+    /// asks the human even under --yes.
+    #[test]
+    fn deny_beats_auto_write_and_wrappers_still_ask() {
+        struct Panics;
+        impl PromptFn for Panics {
+            fn prompt(&self, _req: &ToolRequest<'_>) -> Verdict {
+                panic!("must not prompt")
+            }
+        }
+        struct Says(Verdict);
+        impl PromptFn for Says {
+            fn prompt(&self, _req: &ToolRequest<'_>) -> Verdict {
+                self.0
+            }
+        }
+        fn request(input: &Value) -> ToolRequest<'_> {
+            ToolRequest {
+                tool: "run_command",
+                risk: Risk::Write,
+                input,
+                description: String::new(),
+                target: None,
+            }
+        }
+        let rm = serde_json::json!({ "command": "rm -rf build" });
+        let ls = serde_json::json!({ "command": "ls" });
+        let env = serde_json::json!({ "command": "env rm -rf build" });
+        let yes = InteractiveApprover::new(Panics)
+            .with_allow_patterns(vec!["run_command:ls".into(), "!run_command:rm *".into()])
+            .with_auto_write(true);
+        if cfg!(feature = "shell-tools") {
+            assert_eq!(yes.decide(&request(&rm)), Verdict::Deny);
+        }
+        assert_eq!(yes.decide(&request(&ls)), Verdict::Allow);
+        // Fail closed: under a command deny, --yes alone does not run an
+        // unnamed command unattended — the human is asked.
+        let other = serde_json::json!({ "command": "curl x" });
+        let asks_yes = InteractiveApprover::new(Says(Verdict::Deny))
+            .with_allow_patterns(vec!["!run_command:rm *".into()])
+            .with_auto_write(true);
+        if cfg!(feature = "shell-tools") {
+            assert_eq!(asks_yes.decide(&request(&other)), Verdict::Deny, "asked, N");
+        }
+        let asks = InteractiveApprover::new(Says(Verdict::Deny))
+            .with_allow_patterns(vec!["!run_command:rm *".into()])
+            .with_auto_write(true);
+        if cfg!(feature = "shell-tools") {
+            assert_eq!(
+                asks.decide(&request(&env)),
+                Verdict::Deny,
+                "asked, human said N"
+            );
+        }
     }
 }

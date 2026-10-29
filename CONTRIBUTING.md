@@ -1,9 +1,8 @@
 # Contributing to tole
 
 Thank you for contributing! This document is the single entry point for the
-workflow; the ecosystem-wide standards it follows live in the uteke rooms
-`codecora-workflow-standard` and `codecoradev-conventions` (source of truth
-when this file and reality disagree).
+workflow; the ecosystem-wide standards it follows live in the team knowledge rooms
+(source of truth when this file and reality disagree).
 
 ## Workflow
 
@@ -33,9 +32,8 @@ when this file and reality disagree).
 
 ## Pull requests
 
-- One logical change per PR; large change-sets (~40+ files) deterministically
-  time out the Cora Review job (10-minute hard limit) — split into ~15–20-file
-  PRs.
+- One logical change per PR; large change-sets (~40+ files) can time out the
+  Cora Review job (30-minute limit) — split into ~15–20-file PRs.
 - Body sections, in order: **What / Why / Changes / Testing**. A PR without
   them fails the PR Description check.
 - Base every PR on `develop`. PRs into `main` are only accepted from
@@ -77,6 +75,19 @@ three levels:
    security findings. A red Cora Review check means findings must be triaged
    before merge.
 
+   **Credentials.** The job prefers Anthropic workload identity federation:
+   when `ANTHROPIC_FEDERATION_RULE_ID`, `ANTHROPIC_ORGANIZATION_ID`,
+   `ANTHROPIC_SERVICE_ACCOUNT_ID` and `ANTHROPIC_WORKSPACE_ID` are available
+   (organization or repository secrets or variables), it exchanges its GitHub
+   OIDC token for a short-lived Anthropic access token and sends it only to
+   `https://api.anthropic.com/v1` (model `ANTHROPIC_MODEL`, default
+   `claude-opus-5-5`). Otherwise, or when the exchange fails, it uses
+   `CORA_API_KEY`, `CORA_BASE_URL` and `CORA_MODEL`; an empty secret fails
+   the job rather than passing silently. The federation rule's subject prefix
+   must use GitHub's numeric ids, e.g. `repo:codecoradev@<id>/tole@<id>:` —
+   `repo:codecoradev/tole:` never matches. Run the manual
+   `anthropic-wif-smoke.yml` workflow to check the exchange.
+
 Review behavior is configured in `.cora.yaml` (focus areas, tole-specific
 rules that encode intentional patterns — env-resolved credentials,
 argv-validated subprocess tools, wire-only redaction — plus ignore rules for
@@ -101,14 +112,6 @@ All repository artifacts are written in **English**: commit messages, PR
 titles/bodies, issues, code comments, and documentation files. Keep chat
 discussions in whatever language you prefer — files must be English.
 
-## CLA
-
-Contributions require a signed Contributor License Agreement —
-[CLA_INDIVIDUAL.md](CLA_INDIVIDUAL.md) or
-[CLA_CORPORATE.md](CLA_CORPORATE.md). The `cla-check` workflow enforces this
-per PR (bots are skipped). The CLA is a license agreement, not a copyright
-assignment: you retain ownership of your contributions.
-
 ## Live-mission binary hygiene
 
 Running live agent missions against a stale binary produces misleading
@@ -124,6 +127,18 @@ behavior that was already fixed). Before any live validation or mission run:
 - If a `~/.cargo/bin/tole` shim is installed, re-sync it after every version
   bump: `cp target/release/tole ~/.cargo/bin/tole` — verify with
   `tole --version` matching the workspace version in `Cargo.toml`.
+
+## Release validation
+
+Before claiming a build is ready to release, run the provider doctor at the
+full tier with the repo checkout binary:
+
+```bash
+cargo build --release -p tole-cli && ./target/release/tole doctor --tier full
+```
+
+It must exit 0 (chat, streaming and a real tool-call loop all green); the
+result is recorded in the coverage ledger (`tole doctor --summary`).
 
 ## Design rules
 
@@ -143,5 +158,4 @@ behavior that was already fixed). Before any live validation or mission run:
 
 ## License
 
-MIT. By contributing, you agree your contributions are licensed under the
-MIT license, and you sign the CLA above (enforced per PR by `cla-check`).
+Contributions are licensed to the project under the MIT license (inbound = outbound). No additional agreement is required.

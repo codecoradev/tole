@@ -8,6 +8,8 @@
 //! - `GET  /sessions`              → list session ids + busy flags
 //! - `GET  /sessions/{id}`         → session status
 //! - `POST /sessions/{id}/prompt`  → run one turn (`{"text": "..."}`)
+//! - `POST /sessions/{id}/interrupt` → steer the running turn without
+//!   cancelling it (`{"text": "...", "urgent": false}`, #377)
 //!
 //! v1 scope: REST only (MCP-over-HTTP is the follow-up; the engine calls
 //! are identical). Auth is a static bearer token (env `TOLE_SERVE_TOKEN`
@@ -21,14 +23,13 @@
 
 use anyhow::{Context, Result};
 use serde_json::json;
-use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{IpAddr, TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tole_cli::session_host::{
-    lock_sessions, open_session, run_session_turn, Sessions, SharedSessions, MAX_SESSIONS,
+    lock_sessions, open_session, run_session_turn, Sessions, SharedSessions,
 };
 use tole_core::memory::MemoryConfig;
 use tole_core::storage::Storage;
@@ -52,10 +53,6 @@ pub struct ServeConfig {
 /// stack + a socket; capping bounds thread/socket exhaustion (CodeCora
 /// scan-3 Wave-2 hardening).
 const MAX_CONNECTIONS: usize = 32;
-/// Failed-auth attempts allowed per source IP per window before the IP is
-/// dropped until the window rolls over (simple fixed-window limiter).
-const AUTH_WINDOW_SECS: u64 = 60;
-const MAX_AUTH_FAILURES: u32 = 10;
 
 struct State {
     sessions: SharedSessions,
@@ -66,22 +63,31 @@ struct State {
     plan_mode: bool,
     memory: Option<MemoryConfig>,
     token: String,
-    workspace_default: Option<String>,
+    /// Jail-of-jails root (canonical): `--workspace`, else the server
+    /// cwd. Client-supplied session cwds must resolve inside it.
+    workspace_root: std::path::PathBuf,
     sessions_dir: Option<std::path::PathBuf>,
     turnend: Vec<String>,
     live_connections: std::sync::atomic::AtomicUsize,
-    /// (window_start_epoch, failure_count) per source IP — fixed-window
-    /// auth-failure limiter (brute-force hardening).
-    auth_failures: Mutex<HashMap<IpAddr, (u64, u32)>>,
+    /// Per-source-IP failed-auth limiter (brute-force hardening), shared
+    /// logic with the MCP transport.
+    auth_failures: tole_cli::auth::AuthLimiter,
 }
 
 /// Read/write ceilings per connection: a client that opens a socket and
 /// never speaks must not pin a thread forever (CodeCora scan
 /// 2026-09-28, thread-exhaustion DoS). Generous for real clients.
 const SERVE_IO_TIMEOUT: Duration = Duration::from_secs(30);
+/// Total budget for reading one request (request line, headers and body).
+/// The per-read timeout alone lets a client that trickles one byte every
+/// few seconds pin a connection slot indefinitely (slow-loris); this
+/// deadline bounds the whole read.
+const REQUEST_READ_DEADLINE: Duration = Duration::from_secs(15);
 
 pub fn run_serve(cfg: ServeConfig) -> Result<()> {
     let token = resolve_token(&cfg.token)?;
+    let workspace_root = crate::resolve_workspace_root(cfg.workspace.as_ref())
+        .context("resolving --workspace for the session jail root")?;
     let addr = format!("{}:{}", cfg.bind, cfg.port);
     let listener = TcpListener::bind(&addr)
         .with_context(|| format!("binding {addr} (in use? change --port)"))?;
@@ -92,11 +98,11 @@ pub fn run_serve(cfg: ServeConfig) -> Result<()> {
         plan_mode: cfg.plan_mode,
         memory: cfg.memory.clone(),
         token,
-        workspace_default: cfg.workspace.clone(),
+        workspace_root,
         sessions_dir: cfg.sessions_dir.clone(),
         turnend: cfg.turnend.clone(),
         live_connections: std::sync::atomic::AtomicUsize::new(0),
-        auth_failures: Mutex::new(HashMap::new()),
+        auth_failures: tole_cli::auth::AuthLimiter::new(),
     });
     eprintln!(
         "tole serve: listening on http://{addr} ({} allow pattern(s), plan_mode={})",
@@ -149,13 +155,48 @@ struct Request {
     body: String,
 }
 
+/// Why a request could not be read; decides the response (if any).
+enum ReadError {
+    /// Connection-level failure or timeout: nothing useful to answer.
+    Io,
+    /// Syntactically unacceptable request: answered with 400.
+    Bad(&'static str),
+    /// Declared body over the ceiling: answered with 413.
+    TooLarge,
+}
+
 /// Ceiling for the request line + all header bytes combined: a client
 /// that streams an endless line without a newline must not buffer
 /// gigabytes pre-auth (CodeCora scan-3: unbounded buffering).
 const MAX_HEADER_BYTES: usize = 32 * 1024;
+/// Ceiling for a request body.
+const MAX_BODY_BYTES: usize = 1024 * 1024;
 
-fn read_request(stream: &TcpStream) -> Option<Request> {
-    let mut reader = BufReader::new(stream);
+/// A reader that re-arms the socket read timeout before every read so the
+/// remaining time until `deadline` — not just the per-read timeout —
+/// bounds the whole request read.
+struct DeadlineReader<'a> {
+    stream: &'a TcpStream,
+    deadline: Instant,
+}
+
+impl Read for DeadlineReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        self.stream
+            .set_read_timeout(Some(remaining.min(SERVE_IO_TIMEOUT)))?;
+        self.stream.read(buf)
+    }
+}
+
+fn read_request(stream: &TcpStream) -> Result<Request, ReadError> {
+    let mut reader = BufReader::new(DeadlineReader {
+        stream,
+        deadline: Instant::now() + REQUEST_READ_DEADLINE,
+    });
     let mut request_line = String::new();
     // take() bounds the read: an over-long line arrives truncated with no
     // trailing newline, which the caller treats as a protocol error.
@@ -163,55 +204,89 @@ fn read_request(stream: &TcpStream) -> Option<Request> {
         .by_ref()
         .take(MAX_HEADER_BYTES as u64)
         .read_line(&mut request_line)
-        .ok()?;
+        .map_err(|_| ReadError::Io)?;
     if !request_line.ends_with('\n') {
-        return None;
+        return Err(ReadError::Io);
     }
     let mut parts = request_line.split_whitespace();
-    let method = parts.next()?.to_string();
-    let path = parts.next()?.to_string();
+    let method = parts
+        .next()
+        .ok_or(ReadError::Bad("malformed request line"))?;
+    let path = parts
+        .next()
+        .ok_or(ReadError::Bad("malformed request line"))?;
+    let (method, path) = (method.to_string(), path.to_string());
     let mut authorization = None;
-    let mut content_length = 0usize;
-    let mut header_bytes = 0usize;
+    let mut content_length: Option<usize> = None;
+    let mut expect_continue = false;
+    // The request line counts against the same ceiling as the headers:
+    // the documented limit is 32 KiB for both combined.
+    let mut header_bytes = request_line.len();
     loop {
         if header_bytes > MAX_HEADER_BYTES {
-            return None;
+            return Err(ReadError::Io);
         }
         let mut line = String::new();
         let n = reader
             .by_ref()
             .take((MAX_HEADER_BYTES - header_bytes) as u64)
             .read_line(&mut line)
-            .ok()?;
+            .map_err(|_| ReadError::Io)?;
         if n == 0 {
-            return None;
+            return Err(ReadError::Io);
         }
         header_bytes += n;
         if !line.ends_with('\n') {
-            return None;
+            return Err(ReadError::Io);
         }
         let line = line.trim_end();
         if line.is_empty() {
             break;
         }
-        let lower = line.to_ascii_lowercase();
-        if let Some(v) = lower.strip_prefix("content-length:") {
-            content_length = v.trim().parse().unwrap_or(0);
-        }
-        // Authorization keeps its ORIGINAL case (the bearer token is
-        // case-sensitive — a lowercased copy never matches).
-        if let Some(v) = line.strip_prefix("Authorization:") {
-            authorization = Some(v.trim().to_string());
+        // Header names are case-insensitive (RFC 9110 §5.1); values keep
+        // their original case (the bearer token is case-sensitive).
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        if name.eq_ignore_ascii_case("content-length") {
+            // Two Content-Length headers (or an unparsable one) are a
+            // request-smuggling hazard: reject instead of last-wins.
+            if content_length.is_some() {
+                return Err(ReadError::Bad("duplicate Content-Length"));
+            }
+            content_length = Some(
+                value
+                    .parse()
+                    .map_err(|_| ReadError::Bad("invalid Content-Length"))?,
+            );
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            // Chunked bodies are not supported; guessing a framing is
+            // exactly what smuggling relies on.
+            return Err(ReadError::Bad("Transfer-Encoding is not supported"));
+        } else if name.eq_ignore_ascii_case("authorization") {
+            authorization = Some(value.to_string());
+        } else if name.eq_ignore_ascii_case("expect") && value.eq_ignore_ascii_case("100-continue")
+        {
+            expect_continue = true;
         }
     }
-    if content_length > 1024 * 1024 {
-        return None; // body too large — refuse rather than buffer it
+    let content_length = content_length.unwrap_or(0);
+    if content_length > MAX_BODY_BYTES {
+        return Err(ReadError::TooLarge); // refuse rather than buffer it
+    }
+    if content_length > 0 && expect_continue {
+        // curl sends `Expect: 100-continue` for bodies over ~1 KiB and
+        // waits ~1s for this interim response before sending the body.
+        let mut w = stream;
+        let _ = w.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
+        let _ = w.flush();
     }
     let mut body = vec![0u8; content_length];
     if content_length > 0 {
-        reader.read_exact(&mut body).ok()?;
+        reader.read_exact(&mut body).map_err(|_| ReadError::Io)?;
     }
-    Some(Request {
+    Ok(Request {
         method,
         path,
         authorization,
@@ -219,19 +294,27 @@ fn read_request(stream: &TcpStream) -> Option<Request> {
     })
 }
 
-fn respond(stream: &mut TcpStream, status: u16, payload: &serde_json::Value) {
-    let body = payload.to_string();
-    let reason = match status {
+fn reason_phrase(status: u16) -> &'static str {
+    match status {
         200 => "OK",
+        202 => "Accepted",
         400 => "Bad Request",
         401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
         409 => "Conflict",
         413 => "Payload Too Large",
+        429 => "Too Many Requests",
         500 => "Internal Server Error",
-        _ => "OK",
-    };
+        503 => "Service Unavailable",
+        _ => "Unknown",
+    }
+}
+
+fn respond(stream: &mut TcpStream, status: u16, payload: &serde_json::Value) {
+    let body = payload.to_string();
+    let reason = reason_phrase(status);
     let head = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
@@ -255,8 +338,21 @@ impl Drop for ConnGuard {
 
 fn handle_conn(mut stream: TcpStream, state: Arc<State>) {
     let _guard = ConnGuard(Arc::clone(&state));
-    let Some(req) = read_request(&stream) else {
-        return;
+    let req = match read_request(&stream) {
+        Ok(r) => r,
+        Err(ReadError::Io) => return,
+        Err(ReadError::Bad(msg)) => {
+            respond(&mut stream, 400, &json!({"error": msg}));
+            return;
+        }
+        Err(ReadError::TooLarge) => {
+            respond(
+                &mut stream,
+                413,
+                &json!({"error": "request body too large"}),
+            );
+            return;
+        }
     };
 
     // Auth: bearer token on everything except /health (which carries no
@@ -265,58 +361,20 @@ fn handle_conn(mut stream: TcpStream, state: Arc<State>) {
     let peer_ip = stream.peer_addr().ok().map(|a| a.ip());
 
     // Rate-limit: refuse when this IP has too many recent auth failures.
-    // The lock is dropped before any respond call (CodeCora: a stalled
-    // client must not hold the auth_failures mutex during a write).
-    if let Some(ip) = peer_ip {
-        let rate_limited = {
-            let fails = state.auth_failures.lock().expect("auth failures lock");
-            matches!(
-                fails.get(&ip).map(|(window, count)| {
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0)
-                        .saturating_sub(*window)
-                        <= AUTH_WINDOW_SECS
-                        && *count >= MAX_AUTH_FAILURES
-                }),
-                Some(true)
-            )
-        };
-        if rate_limited {
-            respond(
-                &mut stream,
-                429,
-                &json!({"error": "too many failed auth attempts"}),
-            );
-            return;
-        }
+    if peer_ip.is_some_and(|ip| state.auth_failures.is_limited(ip)) {
+        respond(
+            &mut stream,
+            429,
+            &json!({"error": "too many failed auth attempts"}),
+        );
+        return;
     }
 
     let authorized = req.path == "/health"
-        || req
-            .authorization
-            .as_deref()
-            .and_then(|a| a.strip_prefix("Bearer "))
-            .map(|t| t == state.token)
-            .unwrap_or(false);
+        || tole_cli::auth::bearer_matches(req.authorization.as_deref(), &state.token);
     if !authorized {
         if let Some(ip) = peer_ip {
-            let mut fails = state.auth_failures.lock().expect("auth failures lock");
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            // Periodic sweep: drop entries whose window has fully
-            // expired — bounds memory growth from unique source IPs
-            // (CodeCora scan round-2 on this PR).
-            fails.retain(|_, (window, _)| now.saturating_sub(*window) <= AUTH_WINDOW_SECS * 4);
-            let entry = fails.entry(ip).or_insert((now, 0));
-            if now.saturating_sub(entry.0) > AUTH_WINDOW_SECS {
-                entry.0 = now;
-                entry.1 = 0;
-            }
-            entry.1 += 1;
+            state.auth_failures.record_failure(ip);
         }
         respond(&mut stream, 401, &json!({"error": "unauthorized"}));
         return;
@@ -358,7 +416,6 @@ fn write_approval_audit(
     let handle = {
         let sessions = lock_sessions(&state.sessions);
         sessions
-            .map
             .get(session_id)
             .map(|st| std::sync::Arc::clone(&st.storage))
     };
@@ -389,7 +446,6 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
         ("GET", "/sessions") => {
             let sessions = lock_sessions(&state.sessions);
             let list: Vec<_> = sessions
-                .map
                 .iter()
                 .map(|(id, st)| {
                     json!({
@@ -404,10 +460,28 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
             let Ok(req) = serde_json::from_str::<serde_json::Value>(body) else {
                 return (400, json!({"error": "invalid JSON body"}));
             };
-            let cwd = req
-                .get("cwd")
-                .and_then(|v| v.as_str())
-                .unwrap_or(state.workspace_default.as_deref().unwrap_or("."));
+            let requested = match req.get("cwd").and_then(|v| v.as_str()) {
+                Some(c) => c.to_string(),
+                None => state.workspace_root.to_string_lossy().into_owned(),
+            };
+            // Jail-of-jails — the same check the MCP transport's
+            // tole_session_new applies: without it a client could root a
+            // session (and its file/git tools) at `/` or `/etc`.
+            let jailed = match tole_cli::session_tools::jail_session_cwd(
+                &state.workspace_root,
+                &requested,
+            ) {
+                Ok(c) => c,
+                Err(e) => return (403, json!({"error": e})),
+            };
+            let cwd = jailed.as_str();
+            // Capacity first: `open_session` creates the session file on
+            // disk, so refusing AFTER it (503) would orphan that file. The
+            // re-check at insert time below still guards a concurrent
+            // creator.
+            if lock_sessions(&state.sessions).ensure_room().is_err() {
+                return (503, json!({"error": "all sessions busy — at capacity"}));
+            }
             let session_id = tole_cli::session_host::new_session_id("srv");
             // Issue #200: non-preauthorized Writes queue for a remote
             // decision (deny now, resumable; allow = one-shot replay).
@@ -441,18 +515,16 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                 None,
             ) {
                 Ok(session_state) => {
+                    // Cap the live map (the registry's admission rule): a
+                    // long-running daemon must not grow without bound
+                    // (CodeCora scan-3). Eviction drops only the in-memory
+                    // handle, never the file; busy sessions are never
+                    // evicted, and all-busy at capacity is a 503.
+                    if lock_sessions(&state.sessions)
+                        .admit(session_id.clone(), session_state)
+                        .is_err()
                     {
-                        // Cap the live map: a long-running daemon must not
-                        // grow without bound (CodeCora scan-3). Sessions
-                        // are durable on disk (the JSONL file) — eviction
-                        // drops only the in-memory handle, never the
-                        // file; busy sessions are never evicted.
-                        let mut sessions = lock_sessions(&state.sessions);
-                        // All-busy at capacity → 503.
-                        if sessions.evict_for_insert(MAX_SESSIONS).is_err() {
-                            return (503, json!({"error": "all sessions busy — at capacity"}));
-                        }
-                        sessions.map.insert(session_id.clone(), session_state);
+                        return (503, json!({"error": "all sessions busy — at capacity"}));
                     }
                     (200, json!({"sessionId": session_id, "workspace": cwd}))
                 }
@@ -514,6 +586,9 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                 // Approvals-only resume: the replayed guarded effect
                 // consults the approver, the one-shot matches, the tool
                 // executes. Runs off-thread — the turn may take a while.
+                // Bounded without the connection cap: an approval id is decided
+                // once (a repeat is 404 above) and pending approvals only come
+                // from the capped, one-turn-per-session map.
                 let sessions = Arc::clone(&state.sessions);
                 let sid = session_id.clone();
                 std::thread::spawn(move || {
@@ -546,7 +621,7 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                     // 2026-09-28). try_lock keeps this non-blocking.
                     let (busy, entries, report) = {
                         let sessions = lock_sessions(&state.sessions);
-                        let Some(st) = sessions.map.get(id) else {
+                        let Some(st) = sessions.get(id) else {
                             return (404, json!({"error": "unknown session"}));
                         };
                         let busy = *st.busy.lock().expect("busy lock");
@@ -554,7 +629,7 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                             Ok(guard) => (
                                 Some(guard.entries().len()),
                                 // Issue #211: additive usage report.
-                                tole_cli::usage_report::usage_report(guard.usages()).to_json(),
+                                tole_cli::usage_report::usage_json(guard.entries(), guard.usages()),
                             ),
                             // turn in flight — skip the count and report
                             Err(_) => (None, json!(null)),
@@ -599,7 +674,7 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                     // "cancelled". 404 only for an unknown session.
                     let cancelled = {
                         let sessions = lock_sessions(&state.sessions);
-                        sessions.map.get(id).map(|st| st.cancel.cancel()).is_some()
+                        sessions.cancel(id)
                     };
                     if cancelled {
                         eprintln!("tole: session/{id} cancel requested (serve)");
@@ -608,9 +683,154 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                         (404, json!({"error": "unknown session"}))
                     }
                 }
+                ("POST", id, Some("interrupt")) => {
+                    // Soft interrupt (#377): steer the in-flight turn
+                    // without cancelling it. 409 when no turn is running.
+                    let Ok(req) = serde_json::from_str::<serde_json::Value>(body) else {
+                        return (400, json!({"error": "invalid JSON body"}));
+                    };
+                    let Some(text) = req.get("text").and_then(|v| v.as_str()) else {
+                        return (400, json!({"error": "missing text"}));
+                    };
+                    let urgent = req.get("urgent").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let st = {
+                        let sessions = lock_sessions(&state.sessions);
+                        sessions.get(id).cloned()
+                    };
+                    let Some(st) = st else {
+                        return (404, json!({"error": "unknown session"}));
+                    };
+                    match tole_cli::session_host::interrupt_session(&st, text, urgent) {
+                        Ok(()) => {
+                            eprintln!(
+                                "tole: session/{id} interrupt queued (serve, urgent={urgent})"
+                            );
+                            (
+                                202,
+                                json!({"queued": true, "urgent": urgent, "sessionId": id}),
+                            )
+                        }
+                        Err(tole_cli::session_host::InterruptRefusal::NotBusy) => {
+                            (409, json!({"error": "no turn is running in this session"}))
+                        }
+                        Err(tole_cli::session_host::InterruptRefusal::Invalid(e)) => {
+                            (400, json!({"error": e}))
+                        }
+                    }
+                }
                 _ => (404, json!({"error": "not found"})),
             }
         }
         _ => (404, json!({"error": "not found"})),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reason_phrases_cover_every_status_the_routes_emit() {
+        assert_eq!(reason_phrase(202), "Accepted");
+        assert_eq!(reason_phrase(429), "Too Many Requests");
+        assert_eq!(reason_phrase(503), "Service Unavailable");
+        assert_eq!(reason_phrase(413), "Payload Too Large");
+        assert_eq!(reason_phrase(403), "Forbidden");
+    }
+
+    fn test_state(root: std::path::PathBuf, sessions_dir: std::path::PathBuf) -> State {
+        State {
+            sessions: Arc::new(Mutex::new(Sessions::default())),
+            approvals: tole_cli::approvals::ApprovalQueue::shared(),
+            allow_patterns: vec![],
+            plan_mode: false,
+            memory: None,
+            token: "t".into(),
+            workspace_root: root,
+            sessions_dir: Some(sessions_dir),
+            turnend: vec![],
+            live_connections: std::sync::atomic::AtomicUsize::new(0),
+            auth_failures: tole_cli::auth::AuthLimiter::new(),
+        }
+    }
+
+    /// cora 0.19 scan MAJOR: REST `POST /sessions` must enforce the same
+    /// jail-of-jails as the MCP transport — a cwd outside the server
+    /// workspace root is refused BEFORE any session file is created.
+    #[test]
+    fn rest_session_cwd_outside_workspace_root_is_refused() {
+        let base = std::env::temp_dir().join(format!("tole-serve-jail-{}", std::process::id()));
+        let root = base.join("ws");
+        let inside = root.join("sub");
+        let sessions = base.join("sessions");
+        std::fs::create_dir_all(&inside).unwrap();
+        std::fs::create_dir_all(&sessions).unwrap();
+        let state = test_state(root.clone(), sessions.clone());
+
+        for escape in [
+            "/",
+            base.to_str().unwrap(),
+            &format!("{}/..", root.display()),
+        ] {
+            let body = json!({ "cwd": escape }).to_string();
+            let (status, payload) = route(&state, "POST", "/sessions", &body);
+            assert_eq!(status, 403, "{escape}: {payload}");
+            assert!(payload["error"].as_str().unwrap().contains("escapes"));
+        }
+        assert_eq!(
+            std::fs::read_dir(&sessions).unwrap().count(),
+            0,
+            "a refused cwd must not leave a session file behind"
+        );
+
+        // Inside the root (and the default, omitted cwd) still open.
+        let body = json!({ "cwd": inside.to_str().unwrap() }).to_string();
+        let (status, payload) = route(&state, "POST", "/sessions", &body);
+        assert_eq!(status, 200, "{payload}");
+        assert_eq!(
+            payload["workspace"],
+            json!(inside.canonicalize().unwrap().to_str().unwrap())
+        );
+        let (status, payload) = route(&state, "POST", "/sessions", "{}");
+        assert_eq!(status, 200, "{payload}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn deadline_reader_bounds_a_trickling_client() {
+        // A client sending one byte per 100 ms never trips the per-read
+        // timeout; the total deadline must still cut the read off.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let writer = std::thread::spawn(move || {
+            let mut c = TcpStream::connect(addr).unwrap();
+            for _ in 0..40 {
+                if c.write_all(b"x").is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+        let (server_side, _) = listener.accept().unwrap();
+        let mut r = DeadlineReader {
+            stream: &server_side,
+            deadline: Instant::now() + Duration::from_millis(400),
+        };
+        let started = Instant::now();
+        let mut buf = [0u8; 1];
+        let err = loop {
+            match r.read(&mut buf) {
+                Ok(0) => panic!("peer closed before the deadline"),
+                Ok(_) => continue,
+                Err(e) => break e,
+            }
+        };
+        assert!(matches!(
+            err.kind(),
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+        ));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        drop(server_side);
+        let _ = writer.join();
     }
 }

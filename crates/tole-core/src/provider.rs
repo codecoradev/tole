@@ -78,4 +78,33 @@ pub trait Provider {
     fn last_wire_stats(&self) -> Option<Value> {
         None
     }
+
+    /// Which provider answered the LAST `complete()` call, and whether it
+    /// took a failover to get there (#209, `failover::FailoverProvider`).
+    /// Stored by the turn loop under the namespaced `tole_route` key of the
+    /// step's usage record. Default None: a single provider reports no route.
+    fn last_route(&self) -> Option<Value> {
+        None
+    }
+}
+
+/// A boxed provider is a provider (hosts pick the concrete type at runtime,
+/// e.g. a plain provider or a `failover::FailoverProvider`). Every method is
+/// forwarded, including the defaulted ones.
+impl<P: Provider + ?Sized> Provider for Box<P> {
+    fn complete(&mut self, transcript: &[Entry]) -> Result<ProviderOutput, ProviderError> {
+        (**self).complete(transcript)
+    }
+    fn last_usage(&self) -> Option<Value> {
+        (**self).last_usage()
+    }
+    fn last_reasoning(&self) -> Option<String> {
+        (**self).last_reasoning()
+    }
+    fn last_wire_stats(&self) -> Option<Value> {
+        (**self).last_wire_stats()
+    }
+    fn last_route(&self) -> Option<Value> {
+        (**self).last_route()
+    }
 }

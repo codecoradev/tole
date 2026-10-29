@@ -1,16 +1,16 @@
 //! Child agents (issue #171): a parent session spawns N durable child
 //! `tole run` sessions — depth capped at ONE (no grandchildren), the
-//! mailbox is a per-child uteke namespace, ephemeral by default.
+//! mailbox is a per-child uteke room, ephemeral by default.
 //!
 //! Architecture = the jobs pattern (detached spawn + on-disk state +
-//! poll), composed with the memory loop's namespace override:
+//! poll), composed with the memory loop's room override:
 //!
 //! - `agent_start` — spawn `<bin> run "<prompt>"` DETACHED with
 //!   `TOLE_AGENT_DEPTH=1`, `TOLE_MEMORY_NAMESPACE=agent-<id>`,
 //!   `TOLE_MEMORY=uteke`. The child is a full tole session: own JSONL
 //!   (inside the agent dir), own registry (BUILT WITHOUT the agent
 //!   tools — the structural depth cap), own usage ledger. Its settle
-//!   summary lands in its mailbox namespace automatically (the memory
+//!   summary lands in its mailbox room automatically (the memory
 //!   loop), which is the ONLY result channel back up.
 //! - `agent_poll`  — liveness + log tail +, once settled, the mailbox
 //!   summary; consuming a settled result CLEANS the mailbox (soft,
@@ -73,7 +73,7 @@ pub fn check_child_agent_argv(argv: &[String]) -> Result<(), String> {
                 .chars()
                 .filter(|c| !matches!(c, '"' | '\'' | '\\' | '$' | '{' | '}'))
                 .collect();
-            stripped.contains("TOLE_AGENT_DEPTH")
+            stripped.contains(crate::child_env::DEPTH)
         })
     {
         return Err(ERR.to_string());
@@ -244,12 +244,33 @@ fn new_agent_id() -> String {
     format!("a-{ms:x}-{:x}-{n:x}", std::process::id())
 }
 
-fn valid_agent_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 64
-        && id
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+/// The agent-id charset: see [`crate::sibling_watch::valid_agent_id`].
+pub fn valid_agent_id(id: &str) -> bool {
+    crate::sibling_watch::valid_agent_id(id)
+}
+
+/// File name of a child's handoff inside its agent dir.
+pub const HANDOFF_FILE: &str = "handoff.json";
+
+/// The child's mission: what was asked, plus (when a role is set) its brief
+/// and the artifacts to read by reference. Unchanged when neither is given.
+fn compose_prompt(
+    prompt: &str,
+    role: Option<crate::handoff::Role>,
+    consumes: &[crate::handoff::ArtifactRef],
+) -> String {
+    let mut out = String::new();
+    if let Some(r) = role {
+        out.push_str(&crate::handoff::role_brief(r));
+        out.push_str("\n\n");
+    }
+    out.push_str(prompt);
+    let inputs = crate::handoff::consume_preamble(consumes);
+    if !inputs.is_empty() {
+        out.push_str("\n\n");
+        out.push_str(&inputs);
+    }
+    out
 }
 
 fn agents_root(root: &std::path::Path) -> PathBuf {
@@ -293,6 +314,18 @@ pub struct AgentMeta {
     /// poll re-recalled the mailbox after cleanup — flapping summaries.
     #[serde(default)]
     pub mailbox_consumed: bool,
+    /// Handoff role (#383), when the child was started with one.
+    #[serde(default)]
+    pub role: Option<String>,
+}
+
+/// The child's uteke mailbox room, derived from its (validated)
+/// agent id. The parent NEVER takes it from `meta.json`: the child can
+/// write that file, and the poll drives `uteke forget` on the room —
+/// a forged `mailbox_ns` (e.g. `repo-<name>`) would make the parent wipe
+/// an unrelated room (cora 0.19 scan MAJOR).
+fn mailbox_ns_for(id: &str) -> String {
+    format!("agent-{id}")
 }
 
 fn read_meta(dir: &std::path::Path) -> Result<AgentMeta, String> {
@@ -373,13 +406,28 @@ fn open_lock_file(root: &std::path::Path) -> Result<std::fs::File, String> {
         .map_err(|e| format!("agents lock: {e}"))
 }
 
-/// Best-effort mailbox cleanup (ephemeral default): `uteke forget`
-/// each memory in the child's namespace. Soft failure — cleanup is an
-/// optimization; the durable child JSONL is the real archive.
+/// Best-effort mailbox cleanup (ephemeral default): `uteke forget` each
+/// memory in the child's mailbox room, then drop the room; finally the
+/// legacy namespace of the same name (mailboxes written before #422).
+/// Soft failure — cleanup is an optimization; the durable child JSONL is
+/// the real archive.
 fn clean_mailbox(ns: &str) {
-    let mut list = Command::new("uteke");
-    list.args(["list", "--namespace", ns, "--json"])
+    // Deleting a room only unlinks its memories, so forget them first.
+    forget_listed(&["room", "recall", "--limit", "1000", "--json", "--", ns]);
+    let mut drop_room = Command::new("uteke");
+    drop_room
+        .args(["room", "delete", "--confirm", "--", ns])
         .stdin(Stdio::null());
+    let _ =
+        crate::subprocess::run_with_timeout(&mut drop_room, crate::subprocess::SUBPROCESS_TIMEOUT);
+    forget_listed(&["list", "--namespace", ns, "--limit", "1000", "--json"]);
+}
+
+/// `uteke forget --confirm <id>` for every memory a listing returns (flat
+/// `{"id"}` or nested `{"memory": {"id"}}` items).
+fn forget_listed(list_args: &[&str]) {
+    let mut list = Command::new("uteke");
+    list.args(list_args).stdin(Stdio::null());
     let Ok(out) =
         crate::subprocess::run_with_timeout(&mut list, crate::subprocess::SUBPROCESS_TIMEOUT)
     else {
@@ -393,18 +441,17 @@ fn clean_mailbox(ns: &str) {
     else {
         return;
     };
-    for id in items
-        .iter()
-        .filter_map(|m| m.get("id").and_then(Value::as_str))
-    {
+    for id in items.iter().filter_map(|m| {
+        m.get("memory")
+            .unwrap_or(m)
+            .get("id")
+            .and_then(Value::as_str)
+    }) {
         let mut cmd = Command::new("uteke");
-        cmd.args(["forget", id, "--namespace", ns]);
-        // forget asks for confirmation — answer it.
-        let _ = crate::subprocess::run_with_timeout_stdin(
-            &mut cmd,
-            crate::subprocess::SUBPROCESS_TIMEOUT,
-            b"y\n",
-        );
+        cmd.args(["forget", "--confirm", "--", id])
+            .stdin(Stdio::null());
+        let _ =
+            crate::subprocess::run_with_timeout(&mut cmd, crate::subprocess::SUBPROCESS_TIMEOUT);
     }
 }
 
@@ -515,7 +562,21 @@ impl Tool for AgentStartTool {
                     "type": "array", "items": { "type": "string" },
                     "description": "The child's Write-tool allow patterns (glob). Keep minimal — the human approves this policy here."
                 },
-                "keep_mailbox": { "type": "boolean", "description": "Keep the uteke mailbox after the result is consumed (default false — ephemeral). The child's session JSONL is always kept." }
+                "keep_mailbox": { "type": "boolean", "description": "Keep the uteke mailbox after the result is consumed (default false — ephemeral). The child's session JSONL is always kept." },
+                "role": { "type": "string", "enum": ["explore", "implement", "verify", "fix"], "description": "Handoff role (#383). The child submits a typed handoff when it finishes; an implement/fix child that does not pass verification is not closed — agent_poll reports it with a ready-made prompt for a fix child." },
+                "consumes": {
+                    "type": "array",
+                    "description": "Artifacts from earlier agents the child should read itself, by reference (workspace-relative path, optional rev) — not relayed through you",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string" },
+                            "rev": { "type": "string" },
+                            "note": { "type": "string" }
+                        },
+                        "required": ["path"]
+                    }
+                }
             },
             "required": ["prompt"]
         }))
@@ -539,6 +600,32 @@ impl Tool for AgentStartTool {
             .get("keep_mailbox")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        // Handoff role + the artifacts to consume (#383). Both optional;
+        // without them the child's prompt is exactly what was asked for.
+        let role = match input.get("role") {
+            None | Some(Value::Null) => None,
+            Some(v) => Some(
+                v.as_str()
+                    .and_then(crate::handoff::Role::parse)
+                    .ok_or("agent_start: 'role' must be explore, implement, verify or fix")?,
+            ),
+        };
+        let consumes: Vec<crate::handoff::ArtifactRef> = match input.get("consumes") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(v) => serde_json::from_value(v.clone())
+                .map_err(|e| format!("agent_start: bad 'consumes': {e}"))?,
+        };
+        if consumes.len() > crate::handoff::MAX_ARTIFACTS {
+            return Err(format!(
+                "agent_start: at most {} artifacts in 'consumes'",
+                crate::handoff::MAX_ARTIFACTS
+            ));
+        }
+        for a in &consumes {
+            a.validate()
+                .map_err(|e| format!("agent_start: bad 'consumes' entry: {e}"))?;
+        }
+        let prompt = compose_prompt(&prompt, role, &consumes);
         let requested: Vec<String> = input
             .get("allow")
             .and_then(Value::as_array)
@@ -557,17 +644,16 @@ impl Tool for AgentStartTool {
         // Subset enforcement: every requested pattern must be glob-covered
         // by a PARENT pattern; the default is the parent's own list. The
         // child can never write wider than the operator approved.
+        // Deny patterns (#438, `!…`) only narrow: a child may add its own,
+        // and ALWAYS inherits every parent deny — a child cannot shed one.
+        let is_deny = |p: &String| p.starts_with(crate::approval::DENY_PREFIX);
         let allows = if requested.is_empty() {
             self.parent_allows.clone()
         } else {
             let uncovered: Vec<&String> = requested
                 .iter()
-                .filter(|p| {
-                    !self
-                        .parent_allows
-                        .iter()
-                        .any(|pp| crate::approval::glob_match(pp, p))
-                })
+                .filter(|p| !is_deny(p))
+                .filter(|p| !crate::approval::list_covers(&self.parent_allows, p))
                 .collect();
             if !uncovered.is_empty() {
                 return Err(format!(
@@ -576,8 +662,21 @@ impl Tool for AgentStartTool {
                     self.parent_allows
                 ));
             }
-            requested
+            let mut child = requested;
+            for deny in self.parent_allows.iter().filter(|p| is_deny(p)) {
+                if !child.contains(deny) {
+                    child.push(deny.clone());
+                }
+            }
+            child
         };
+        // A role child gets exactly one extra, harness-owned tool name:
+        // `handoff_submit` can only write one validated, bounded file at
+        // the path chosen here, so it cannot widen what the child may do.
+        let mut allows = allows;
+        if role.is_some() && !allows.iter().any(|a| a == "handoff_submit") {
+            allows.push("handoff_submit".to_string());
+        }
         // Issue #234: hold the flock across count + register — the
         // count-then-spawn window is the TOCTOU the scan flagged. The
         // guard releases when `_lock` drops (spawn errors included).
@@ -633,7 +732,7 @@ impl Tool for AgentStartTool {
             (None, None)
         };
 
-        let mailbox_ns = format!("agent-{id}");
+        let mailbox_ns = mailbox_ns_for(&id);
         let meta = AgentMeta {
             prompt: prompt.clone(),
             mailbox_ns: mailbox_ns.clone(),
@@ -645,6 +744,7 @@ impl Tool for AgentStartTool {
             worktree: worktree.clone(),
             branch: branch.clone(),
             mailbox_consumed: false,
+            role: role.map(|r| r.as_str().to_string()),
         };
         write_meta(&dir, &meta)?;
 
@@ -665,9 +765,16 @@ impl Tool for AgentStartTool {
         // Deliberately NO env scrub: the child IS a tole session and
         // needs the provider key. Isolation = depth cap + jail + the
         // approved child allowlist (see the module doc).
-        cmd.env("TOLE_AGENT_DEPTH", "1")
-            .env("TOLE_MEMORY_NAMESPACE", &mailbox_ns)
-            .env("TOLE_MEMORY", "uteke")
+        // The launch contract (child_env): depth 1, the child's identity
+        // and the touch log shared with its siblings (#380), its mailbox
+        // room, and for a role child its role and handoff file (#383).
+        let launch = crate::child_env::ChildLaunch {
+            id: id.clone(),
+            touch_log: agents_root(&self.root).join("touch.log"),
+            mailbox_room: mailbox_ns.clone(),
+            role: role.map(|r| (r, dir.join(HANDOFF_FILE))),
+        };
+        cmd.envs(launch.vars())
             .arg("run")
             .arg("--sessions-dir")
             .arg(&sessions_dir)
@@ -716,6 +823,7 @@ impl Tool for AgentStartTool {
             "mailbox": mailbox_ns,
             "worktree": worktree,
             "branch": branch,
+            "role": role.map(|r| r.as_str()),
             "note": "running detached; poll with agent_poll (the result summary arrives via the mailbox)",
         }))
     }
@@ -747,7 +855,7 @@ impl Tool for AgentPollTool {
     }
 
     /// `Write`, not `ReadOnly` (issue #300): a settled poll CONSUMES the
-    /// mailbox — it forgets the uteke mailbox namespace and persists
+    /// mailbox — it forgets the uteke mailbox room and persists
     /// `mailbox_consumed` in meta.json. The tier must match the behavior
     /// (a ReadOnly tool must never mutate; unlike `job_poll`, whose
     /// write-back was removed for exactly that reason). Consume-once is
@@ -846,8 +954,67 @@ impl Tool for AgentPollTool {
         // cleaned mailbox. The in-process Mutex is held across the
         // ENTIRE consume section (issue #260, rescan #155: dropping it
         // after the read let two concurrent polls both recall+clean).
-        self.consume_mailbox(&dir, &mut meta, &mut out, crate::memory::recall);
+        attach_handoff(&dir, &meta, &mut out);
+        self.consume_mailbox(
+            &dir,
+            id,
+            &mut meta,
+            &mut out,
+            crate::memory::recall,
+            clean_mailbox,
+        );
         Ok(out)
+    }
+}
+
+/// The #383 verify gate for a settled child started with a role: attach its
+/// handoff and whether the work may be treated as closed. An implement/fix
+/// child that submitted nothing, or whose verification is missing or failed,
+/// is reported as such with the prompt for the fix child that should follow
+/// (the parent model decides whether to start it; nothing is spawned here).
+fn attach_handoff(dir: &std::path::Path, meta: &AgentMeta, out: &mut Value) {
+    use crate::handoff::{Gate, Handoff, Role};
+    let Some(role) = meta.role.as_deref().and_then(Role::parse) else {
+        return;
+    };
+    out["role"] = json!(role.as_str());
+    let raw = match std::fs::read_to_string(dir.join(HANDOFF_FILE)) {
+        Ok(raw) => raw,
+        Err(_) => {
+            // Nothing submitted.
+            if role.requires_verification() {
+                out["gate"] = json!("unverified");
+                out["gate_reason"] = json!("the child closed without submitting a handoff");
+                out["fix_prompt"] = json!(crate::handoff::missing_handoff_prompt(role));
+            } else {
+                out["gate"] = json!("no_handoff");
+            }
+            return;
+        }
+    };
+    match Handoff::from_json(&raw) {
+        Err(e) => {
+            // A malformed document is as good as none for a gated role.
+            out["handoff_error"] = json!(e);
+            if role.requires_verification() {
+                out["gate"] = json!("unverified");
+                out["gate_reason"] = json!("the submitted handoff is invalid");
+                out["fix_prompt"] = json!(crate::handoff::missing_handoff_prompt(role));
+            } else {
+                out["gate"] = json!("no_handoff");
+            }
+        }
+        Ok(h) => {
+            out["gate"] = json!(match h.gate() {
+                Gate::Closed => "closed",
+                Gate::Unverified => "unverified",
+                Gate::VerifyFailed { .. } => "verify_failed",
+            });
+            if let Some(p) = h.fix_prompt() {
+                out["fix_prompt"] = json!(p);
+            }
+            out["handoff"] = serde_json::to_value(&h).unwrap_or(Value::Null);
+        }
     }
 }
 
@@ -856,22 +1023,29 @@ impl AgentPollTool {
     /// marked consumed and cleaned ONLY when the recall succeeded (hits or
     /// an explicit empty result); on a recall error the result is kept and
     /// the next poll retries (issue #287, regression of #260).
-    fn consume_mailbox<F>(
+    /// The room comes from `id` ([`mailbox_ns_for`]), never from the
+    /// child-writable `meta.mailbox_ns`. `clean` is injectable so tests
+    /// can observe which room would be forgotten.
+    fn consume_mailbox<F, C>(
         &self,
         dir: &std::path::Path,
+        id: &str,
         meta: &mut AgentMeta,
         out: &mut Value,
         recall: F,
+        clean: C,
     ) where
         F: Fn(&crate::memory::MemoryConfig, &str) -> Result<Vec<crate::memory::RecallHit>, String>,
+        C: Fn(&str),
     {
         let _g = self.consumed.lock();
         if meta.mailbox_consumed {
             return;
         }
+        let ns = mailbox_ns_for(id);
         let cfg = crate::memory::MemoryConfig {
             bin: "uteke".into(),
-            namespace: meta.mailbox_ns.clone(),
+            room: ns.clone(),
             limit: 3,
         };
         match recall(&cfg, &meta.prompt) {
@@ -893,7 +1067,7 @@ impl AgentPollTool {
             }
         }
         if !meta.keep_mailbox {
-            clean_mailbox(&meta.mailbox_ns);
+            clean(&ns);
         }
         meta.mailbox_consumed = true;
         if let Err(e) = write_meta(dir, meta) {
@@ -1199,6 +1373,269 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// #380: the child learns its own id and the shared touch log of this
+    /// parent through the environment.
+    #[test]
+    fn child_gets_its_id_and_the_shared_touch_log_in_env() {
+        let d = tmp("sibenv");
+        #[cfg(unix)]
+        {
+            let p = d.join("dump-env");
+            let dump = d.join("env.txt");
+            let script = format!(
+                "#!/bin/sh\nprintf '%s\\n%s\\n' \"$TOLE_AGENT_ID\" \"$TOLE_AGENT_TOUCH_LOG\" > \"{}\"\nexit 0\n",
+                dump.display()
+            );
+            std::fs::write(&p, script).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755));
+            let out = AgentStartTool::new(&p, d.clone())
+                .execute(json!({"prompt": "x"}))
+                .unwrap();
+            let mut dumped = None;
+            for _ in 0..50 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                if let Ok(t) = std::fs::read_to_string(&dump) {
+                    if t.lines().count() >= 2 {
+                        dumped = Some(t);
+                        break;
+                    }
+                }
+            }
+            let dumped = dumped.expect("child never dumped its env");
+            let mut lines = dumped.lines();
+            let id = out["agent"].as_str().unwrap();
+            assert_eq!(lines.next(), Some(id));
+            assert!(valid_agent_id(id));
+            let log = lines.next().unwrap();
+            assert_eq!(
+                std::path::Path::new(log),
+                agents_root(&d).join("touch.log"),
+                "all siblings of one parent share one log"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // ---- #383 handoff roles ----
+
+    /// Start a child through a script that dumps its argv and the handoff
+    /// env, and return (argv lines, env lines).
+    #[cfg(unix)]
+    fn start_and_dump(
+        d: &std::path::Path,
+        input: Value,
+        allows: Vec<String>,
+    ) -> (Value, Vec<String>, Vec<String>) {
+        let p = d.join("dump-all");
+        let argv = d.join("argv.txt");
+        let envf = d.join("env.txt");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\nprintf '%s\\n%s\\n' \"$TOLE_AGENT_ROLE\" \"$TOLE_AGENT_HANDOFF\" > \"{}\"\nexit 0\n",
+            argv.display(),
+            envf.display()
+        );
+        std::fs::write(&p, script).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755));
+        let out = AgentStartTool::new(&p, d.to_path_buf())
+            .with_parent_allows(allows)
+            .execute(input)
+            .unwrap();
+        let mut got = None;
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if let (Ok(a), Ok(e)) = (
+                std::fs::read_to_string(&argv),
+                std::fs::read_to_string(&envf),
+            ) {
+                if e.lines().count() >= 2 {
+                    got = Some((a, e));
+                    break;
+                }
+            }
+        }
+        let (a, e) = got.expect("child never dumped");
+        (
+            out,
+            a.lines().map(str::to_string).collect(),
+            e.lines().map(str::to_string).collect(),
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_role_child_gets_its_brief_the_artifacts_to_read_the_env_and_the_handoff_tool() {
+        let d = tmp("role");
+        let (out, argv, env) = start_and_dump(
+            &d,
+            json!({
+                "prompt": "make the parser faster",
+                "role": "implement",
+                "consumes": [{"path": "notes/plan.md", "rev": "abc1234", "note": "the plan"}]
+            }),
+            vec!["write_*".into()],
+        );
+        let id = out["agent"].as_str().unwrap();
+        assert_eq!(out["role"], "implement");
+        let prompt = argv.last().unwrap();
+        // The whole multi-line prompt arrives as one argv element after `--`.
+        let joined = argv.join("\n");
+        assert!(joined.contains("You are an `implement` agent"), "{joined}");
+        assert!(joined.contains("make the parser faster"));
+        assert!(
+            joined.contains("notes/plan.md @ abc1234 (the plan)"),
+            "{joined}"
+        );
+        assert!(joined.contains("read them yourself"));
+        let _ = prompt;
+        // The harness-owned tool is allowlisted next to the parent's patterns.
+        let allows: Vec<&String> = argv
+            .iter()
+            .enumerate()
+            .filter(|(i, a)| *i > 0 && argv[*i - 1] == "--allow" && !a.is_empty())
+            .map(|(_, a)| a)
+            .collect();
+        assert!(
+            allows.iter().any(|a| *a == "write_*") && allows.iter().any(|a| *a == "handoff_submit"),
+            "{argv:?}"
+        );
+        assert_eq!(env[0], "implement");
+        assert_eq!(
+            std::path::Path::new(&env[1]),
+            agents_root(&d).join(id).join(HANDOFF_FILE)
+        );
+        let meta = read_meta(&agents_root(&d).join(id)).unwrap();
+        assert_eq!(meta.role.as_deref(), Some("implement"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn without_a_role_nothing_changes() {
+        let d = tmp("norole");
+        let (out, argv, env) = start_and_dump(&d, json!({"prompt": "just do it"}), vec![]);
+        assert_eq!(out["role"], Value::Null);
+        assert_eq!(argv.last().map(String::as_str), Some("just do it"));
+        assert!(!argv.iter().any(|a| a == "handoff_submit"));
+        assert_eq!(
+            env,
+            vec!["".to_string(), "".to_string()],
+            "no handoff env: {env:?}"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn bad_roles_and_consumes_are_refused_before_anything_is_spawned() {
+        let d = tmp("badrole");
+        let t = AgentStartTool::new(fake_child(&d), d.clone());
+        for bad in [
+            json!({"prompt": "x", "role": "boss"}),
+            json!({"prompt": "x", "role": 7}),
+            json!({"prompt": "x", "consumes": [{"path": "../etc/passwd"}]}),
+            json!({"prompt": "x", "consumes": [{"path": "a", "rev": "--upload-pack=x"}]}),
+            json!({"prompt": "x", "consumes": [{"nope": 1}]}),
+            json!({"prompt": "x", "consumes": "a.txt"}),
+        ] {
+            assert!(t.execute(bad.clone()).is_err(), "{bad}");
+        }
+        let many: Vec<Value> = (0..=crate::handoff::MAX_ARTIFACTS)
+            .map(|i| json!({"path": format!("f{i}")}))
+            .collect();
+        assert!(t.execute(json!({"prompt": "x", "consumes": many})).is_err());
+        assert!(
+            !agents_root(&d).exists() || std::fs::read_dir(agents_root(&d)).unwrap().count() == 0
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A settled agent dir built by hand: dead pid, role, optional handoff.
+    #[cfg(unix)]
+    fn settled(d: &std::path::Path, role: Option<&str>, handoff: Option<&str>) -> Value {
+        let id = format!("a-{}-gate", role.unwrap_or("none"));
+        let dir = agents_root(d).join(&id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut c = Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap();
+        let pid = c.id();
+        c.wait().unwrap();
+        std::fs::write(dir.join("pid"), pid.to_string()).unwrap();
+        write_meta(
+            &dir,
+            &AgentMeta {
+                prompt: "p".into(),
+                mailbox_ns: "agent-x".into(),
+                keep_mailbox: true,
+                spawned_at_ms: 0,
+                worktree: None,
+                branch: None,
+                mailbox_consumed: true,
+                role: role.map(str::to_string),
+            },
+        )
+        .unwrap();
+        if let Some(h) = handoff {
+            std::fs::write(dir.join(HANDOFF_FILE), h).unwrap();
+        }
+        AgentPollTool::new(d.to_path_buf())
+            .execute(json!({"agent": id}))
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_poll_gate_blocks_an_unverified_close_and_offers_a_fix_prompt() {
+        let d = tmp("gate");
+        let doc = |verify: &str| {
+            format!(
+                r#"{{"version":1,"role":"implement","summary":"built","artifacts":[{{"path":"out.txt","rev":"abc1234"}}]{verify}}}"#
+            )
+        };
+        // Nothing submitted by a gated role: blocked.
+        let o = settled(&d, Some("implement"), None);
+        assert_eq!(o["gate"], "unverified");
+        assert!(o["fix_prompt"]
+            .as_str()
+            .unwrap()
+            .contains("without submitting a handoff"));
+        // Submitted without verification.
+        let o = settled(&d, Some("fix"), Some(&doc("").replace("implement", "fix")));
+        assert_eq!(o["gate"], "unverified");
+        assert!(o["fix_prompt"]
+            .as_str()
+            .unwrap()
+            .contains("reported no verification"));
+        // Verification failed: the prompt names the failure and the artifact.
+        let failing =
+            doc(r#","verify":{"command":"cargo test","exit_code":101,"summary":"1 failed"}"#);
+        let o = settled(&d, Some("implement"), Some(&failing));
+        assert_eq!(o["gate"], "verify_failed");
+        let fp = o["fix_prompt"].as_str().unwrap();
+        assert!(
+            fp.contains("cargo test")
+                && fp.contains("exit 101")
+                && fp.contains("out.txt @ abc1234"),
+            "{fp}"
+        );
+        assert_eq!(o["handoff"]["artifacts"][0]["path"], "out.txt");
+        // Verified: closed, no fix prompt.
+        let ok = doc(r#","verify":{"command":"cargo test","exit_code":0,"summary":"ok"}"#);
+        let o = settled(&d, Some("implement"), Some(&ok));
+        assert_eq!(o["gate"], "closed");
+        assert!(o.get("fix_prompt").is_none());
+        // A malformed document is as good as none for a gated role.
+        let o = settled(&d, Some("implement"), Some("{not json"));
+        assert_eq!(o["gate"], "unverified");
+        assert!(o["handoff_error"]
+            .as_str()
+            .unwrap()
+            .contains("invalid handoff"));
+        // Ungated roles and role-less agents are not blocked.
+        assert_eq!(settled(&d, Some("explore"), None)["gate"], "no_handoff");
+        assert!(settled(&d, None, None).get("gate").is_none());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     #[test]
     fn depth_one_refuses_to_spawn() {
         let d = tmp("depth");
@@ -1315,7 +1752,14 @@ mod tests {
         let dir = agents_root(&d).join(&id);
         let mut meta = read_meta(&dir).unwrap();
         let mut out = json!({});
-        poll.consume_mailbox(&dir, &mut meta, &mut out, |_, _| Ok(Vec::new()));
+        poll.consume_mailbox(
+            &dir,
+            &id,
+            &mut meta,
+            &mut out,
+            |_, _| Ok(Vec::new()),
+            |_| {},
+        );
         // A brand-new instance = a new parent process.
         let poll2 = AgentPollTool::new(d.clone());
         let again = poll2.execute(json!({"agent": id})).unwrap();
@@ -1359,9 +1803,14 @@ mod tests {
         let poll = AgentPollTool::new(d.clone());
         let mut meta = read_meta(&dir).unwrap();
         let mut out = json!({});
-        poll.consume_mailbox(&dir, &mut meta, &mut out, |_, _| {
-            Err("uteke unavailable".into())
-        });
+        poll.consume_mailbox(
+            &dir,
+            &id,
+            &mut meta,
+            &mut out,
+            |_, _| Err("uteke unavailable".into()),
+            |_| {},
+        );
         assert!(!meta.mailbox_consumed, "error must not mark consumed");
         assert!(out.get("summary").is_none());
         assert!(out["recall_error"].is_string(), "{out}");
@@ -1371,15 +1820,65 @@ mod tests {
         );
         // Retry succeeds: summary delivered, then consumed.
         let mut out2 = json!({});
-        poll.consume_mailbox(&dir, &mut meta, &mut out2, |_, _| {
-            Ok(vec![crate::memory::RecallHit {
-                score: 1.0,
-                content: "child result".into(),
-            }])
-        });
+        poll.consume_mailbox(
+            &dir,
+            &id,
+            &mut meta,
+            &mut out2,
+            |_, _| {
+                Ok(vec![crate::memory::RecallHit {
+                    score: 1.0,
+                    content: "child result".into(),
+                }])
+            },
+            |_| {},
+        );
         assert_eq!(out2["summary"], json!("child result"));
         assert!(meta.mailbox_consumed);
         assert!(read_meta(&dir).unwrap().mailbox_consumed);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// cora 0.19 scan MAJOR: `meta.json` is child-writable, so a forged
+    /// `mailbox_ns` must not steer the parent's recall or `uteke forget`
+    /// at another namespace — both use `agent-<id>`.
+    #[test]
+    fn forged_mailbox_ns_in_meta_is_ignored() {
+        let d = tmp("forged-ns");
+        let id = "a-forged";
+        let dir = agents_root(&d).join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut meta = AgentMeta {
+            prompt: "p".into(),
+            mailbox_ns: "repo-victim".into(),
+            keep_mailbox: false,
+            spawned_at_ms: 0,
+            worktree: None,
+            branch: None,
+            mailbox_consumed: false,
+            role: None,
+        };
+        write_meta(&dir, &meta).unwrap();
+        let recalled = std::sync::Mutex::new(Vec::<String>::new());
+        let cleaned = std::sync::Mutex::new(Vec::<String>::new());
+        let poll = AgentPollTool::new(d.clone());
+        let mut out = json!({});
+        poll.consume_mailbox(
+            &dir,
+            id,
+            &mut meta,
+            &mut out,
+            |cfg, _| {
+                recalled.lock().unwrap().push(cfg.room.clone());
+                Ok(Vec::new())
+            },
+            |ns| cleaned.lock().unwrap().push(ns.to_string()),
+        );
+        assert_eq!(
+            *recalled.lock().unwrap(),
+            vec!["agent-a-forged".to_string()]
+        );
+        assert_eq!(*cleaned.lock().unwrap(), vec!["agent-a-forged".to_string()]);
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -1436,6 +1935,41 @@ mod tests {
                 Err(e) => panic!("covered pattern {req:?} rejected: {e}"),
             }
         }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// #438: deny patterns only narrow — a child may add its own and always
+    /// inherits every parent deny, even when it names its own allow list.
+    #[cfg(unix)]
+    #[test]
+    fn a_child_always_inherits_the_parent_denies() {
+        let allows_of = |argv: &[String]| -> Vec<String> {
+            argv.iter()
+                .enumerate()
+                .filter(|(i, _)| *i > 0 && argv[*i - 1] == "--allow")
+                .map(|(_, a)| a.clone())
+                .collect()
+        };
+        let parent = vec!["run_command".to_string(), "!run_command:rm *".to_string()];
+        let d = tmp("deny-inherit");
+        let (_, argv, _) = start_and_dump(
+            &d,
+            json!({"prompt": "x", "allow": ["run_command", "!run_command:curl *"]}),
+            parent.clone(),
+        );
+        let allows = allows_of(&argv);
+        for want in ["run_command", "!run_command:curl *", "!run_command:rm *"] {
+            assert!(allows.iter().any(|a| a == want), "{want}: {allows:?}");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+        // A parent deny never "covers" a child allow request.
+        let d = tmp("deny-cover");
+        let start = AgentStartTool::new(fake_child(&d), d.clone())
+            .with_parent_allows(vec!["!*".to_string()]);
+        let err = start
+            .execute(json!({"prompt": "x", "allow": ["write_file"]}))
+            .unwrap_err();
+        assert!(err.contains("exceed the parent"), "{err}");
         let _ = std::fs::remove_dir_all(&d);
     }
 

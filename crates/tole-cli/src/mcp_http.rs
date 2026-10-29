@@ -18,19 +18,36 @@ use std::sync::Arc;
 use tole_cli::session_tools::SessionToolState;
 use tole_core::memory::MemoryConfig;
 
-/// Collect a request body under `limit`. Any read error or timeout is an
-/// `Err` — never silently an empty body (#277).
+/// Largest request body accepted: the same ceiling as the REST transport.
+const MAX_BODY_BYTES: usize = 1024 * 1024;
+
+/// Why a request body was not accepted.
+#[derive(Debug, PartialEq, Eq)]
+enum BodyError {
+    /// More than `MAX_BODY_BYTES` (declared or streamed): answered with 413.
+    TooLarge,
+    /// Read error or timeout: answered with 400.
+    Unreadable,
+}
+
+/// Collect a request body under a time limit AND a size ceiling. Any read
+/// error or timeout is an `Err` — never silently an empty body (#277) — and
+/// a body over `max_bytes` is rejected as it streams in, so neither a
+/// declared nor a chunked oversized body is ever buffered whole.
 async fn collect_body_bounded<B>(
     body: B,
     limit: std::time::Duration,
-) -> Result<hyper::body::Bytes, ()>
+    max_bytes: usize,
+) -> Result<hyper::body::Bytes, BodyError>
 where
     B: hyper::body::Body,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
-    use http_body_util::BodyExt;
-    match tokio::time::timeout(limit, body.collect()).await {
+    use http_body_util::{BodyExt, LengthLimitError, Limited};
+    match tokio::time::timeout(limit, Limited::new(body, max_bytes).collect()).await {
         Ok(Ok(c)) => Ok(c.to_bytes()),
-        _ => Err(()),
+        Ok(Err(e)) if e.downcast_ref::<LengthLimitError>().is_some() => Err(BodyError::TooLarge),
+        _ => Err(BodyError::Unreadable),
     }
 }
 
@@ -79,12 +96,12 @@ pub async fn run_mcp_http(
     // The registry: the standard server-mode tools + the session tools,
     // plus the per-session resolver — a tool call carrying `session_id`
     // routes to THAT session's registry (its jail + approver).
-    let registry = crate::build_server_registry_for_mcp(plan_mode)?;
+    let registry = crate::build_server_registry_for_mcp(workspace, plan_mode)?;
     let session_tools = session_state.tools();
     let resolver_sessions = Arc::clone(&session_state.sessions);
     let resolver: tole_core::mcp_server::SessionRegistryResolver = Arc::new(move |sid: &str| {
         let sessions = tole_cli::session_host::lock_sessions(&resolver_sessions);
-        sessions.map.get(sid).map(|st| Arc::clone(&st.registry))
+        sessions.get(sid).map(|st| Arc::clone(&st.registry))
     });
     // Session count for the ambiguity refusal (#138-documented): a
     // registry-tool call WITHOUT session_id while 2+ sessions are open
@@ -92,7 +109,7 @@ pub async fn run_mcp_http(
     let count_sessions = Arc::clone(&session_state.sessions);
     let session_count: tole_core::mcp_server::SessionCountFn = Arc::new(move || {
         let sessions = tole_cli::session_host::lock_sessions(&count_sessions);
-        sessions.map.len()
+        sessions.len()
     });
     let server = tole_core::mcp_server::RegistryServer::with_extra_tools(registry, session_tools)
         .with_session_resolver(resolver)
@@ -117,8 +134,22 @@ pub async fn run_mcp_http(
     let conn_sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
 
     let token = token.to_string();
+    // Failed-auth limiter shared by every connection (same policy as REST).
+    let limiter = Arc::new(tole_cli::auth::AuthLimiter::new());
     loop {
-        let (stream, _peer) = listener.accept().await?;
+        // A transient accept error (EMFILE, ECONNABORTED, ...) must not end
+        // the server and drop every session: report it and keep serving,
+        // with a short pause so resource exhaustion does not spin.
+        let (stream, peer) = match listener.accept().await {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!("tole serve (mcp): accept failed (continuing): {e}");
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                continue;
+            }
+        };
+        let peer_ip = peer.ip();
+        let limiter = Arc::clone(&limiter);
         let Ok(permit) = conn_sem.clone().try_acquire_owned() else {
             // At capacity: close immediately, same semantics as REST.
             drop(stream);
@@ -132,26 +163,28 @@ pub async fn run_mcp_http(
             let io = TokioIo::new(stream);
             let svc_for_conn = svc.clone();
             let token_for_conn = token.clone();
+            let limiter_for_conn = Arc::clone(&limiter);
             let hyper_service =
                 hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
                     let svc = svc_for_conn.clone();
                     let token = token_for_conn.clone();
+                    let limiter = Arc::clone(&limiter_for_conn);
                     async move {
                         use http_body_util::BodyExt;
                         // Bearer-token gate BEFORE the MCP service sees
-                        // anything (#137 auth surface), under the IO
-                        // timeout so a trickling client can't pin the
-                        // task (#190, mirrors the REST face).
-                        let auth = tokio::time::timeout(SERVE_IO_TIMEOUT, async {
-                            req.headers()
-                                .get(hyper::header::AUTHORIZATION)
-                                .and_then(|v| v.to_str().ok())
-                                .and_then(|v| v.strip_prefix("Bearer "))
-                                .map(|t| t == token)
-                                .unwrap_or(false)
-                        })
-                        .await
-                        .unwrap_or(false);
+                        // anything (#137 auth surface): constant-time
+                        // comparison, and a per-IP limiter on failures —
+                        // both shared with the REST transport. The header
+                        // read itself is bounded by `header_read_timeout`
+                        // on the connection below.
+                        let limited = limiter.is_limited(peer_ip);
+                        let auth = !limited
+                            && tole_cli::auth::bearer_matches(
+                                req.headers()
+                                    .get(hyper::header::AUTHORIZATION)
+                                    .and_then(|v| v.to_str().ok()),
+                                &token,
+                            );
                         // Unified response body type for both arms.
                         type RespBody = http_body_util::combinators::BoxBody<
                             hyper::body::Bytes,
@@ -163,12 +196,16 @@ pub async fn run_mcp_http(
                                 .boxed()
                         }
                         if !auth {
+                            let (status, msg) = if limited {
+                                (429, "{\"error\":\"too many failed auth attempts\"}")
+                            } else {
+                                limiter.record_failure(peer_ip);
+                                (401, "{\"error\":\"unauthorized\"}")
+                            };
                             let resp = hyper::Response::builder()
-                                .status(401)
+                                .status(status)
                                 .header("content-type", "application/json")
-                                .body(box_full(hyper::body::Bytes::from(
-                                    "{\"error\":\"unauthorized\"}",
-                                )))
+                                .body(box_full(hyper::body::Bytes::from(msg)))
                                 .map_err(|e| std::io::Error::other(e.to_string()))?;
                             return Ok::<_, std::io::Error>(resp);
                         }
@@ -180,20 +217,46 @@ pub async fn run_mcp_http(
                         // SSE RESPONSE streaming below is untouched.
                         use tower_service::Service as _;
                         let (parts, incoming) = req.into_parts();
-                        // A read error/timeout REJECTS the request: a
-                        // truncated body must never execute as a valid
-                        // empty one (#277).
-                        let Ok(body_bytes) = collect_body_bounded(incoming, SERVE_IO_TIMEOUT).await
-                        else {
+                        // A declared body over the ceiling is refused before
+                        // a single byte is read (chunked bodies are caught
+                        // by the limit while streaming, below).
+                        let declared = parts
+                            .headers
+                            .get(hyper::header::CONTENT_LENGTH)
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|v| v.parse::<usize>().ok());
+                        if declared.is_some_and(|n| n > MAX_BODY_BYTES) {
                             let resp = hyper::Response::builder()
-                                .status(400)
+                                .status(413)
                                 .header("content-type", "application/json")
                                 .body(box_full(hyper::body::Bytes::from(
-                                    "{\"error\":\"request body read failed\"}",
+                                    "{\"error\":\"request body too large\"}",
                                 )))
                                 .map_err(|e| std::io::Error::other(e.to_string()))?;
                             return Ok::<_, std::io::Error>(resp);
-                        };
+                        }
+                        // A read error/timeout REJECTS the request: a
+                        // truncated body must never execute as a valid
+                        // empty one (#277).
+                        let body_bytes =
+                            match collect_body_bounded(incoming, SERVE_IO_TIMEOUT, MAX_BODY_BYTES)
+                                .await
+                            {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    let (status, msg) = if e == BodyError::TooLarge {
+                                        (413, "{\"error\":\"request body too large\"}")
+                                    } else {
+                                        (400, "{\"error\":\"request body read failed\"}")
+                                    };
+                                    let resp = hyper::Response::builder()
+                                        .status(status)
+                                        .header("content-type", "application/json")
+                                        .body(box_full(hyper::body::Bytes::from(msg)))
+                                        .map_err(|e| std::io::Error::other(e.to_string()))?;
+                                    return Ok::<_, std::io::Error>(resp);
+                                }
+                            };
                         let full_req: http::Request<http_body_util::Full<hyper::body::Bytes>> =
                             http::Request::from_parts(parts, http_body_util::Full::new(body_bytes));
                         let mut svc = svc;
@@ -232,7 +295,7 @@ pub async fn run_mcp_http(
 
 #[cfg(test)]
 mod body_tests {
-    use super::collect_body_bounded;
+    use super::{collect_body_bounded, BodyError};
     use hyper::body::{Body, Frame};
     use std::pin::Pin;
     use std::task::{Context, Poll};
@@ -277,8 +340,13 @@ mod body_tests {
                 stall: false,
             },
             Duration::from_secs(5),
+            1024,
         ));
-        assert!(r.is_err(), "a body read error must reject");
+        assert_eq!(
+            r,
+            Err(BodyError::Unreadable),
+            "a body read error must reject"
+        );
     }
 
     #[test]
@@ -289,8 +357,13 @@ mod body_tests {
                 stall: true,
             },
             Duration::from_millis(50),
+            1024,
         ));
-        assert!(r.is_err(), "a body read timeout must reject");
+        assert_eq!(
+            r,
+            Err(BodyError::Unreadable),
+            "a body read timeout must reject"
+        );
     }
 
     #[test]
@@ -298,7 +371,27 @@ mod body_tests {
         let r = rt().block_on(collect_body_bounded(
             http_body_util::Full::new(hyper::body::Bytes::from("ok")),
             Duration::from_secs(5),
+            1024,
         ));
         assert_eq!(r.unwrap().as_ref(), b"ok");
+    }
+
+    #[test]
+    fn a_body_over_the_ceiling_is_rejected_while_streaming() {
+        let big = hyper::body::Bytes::from(vec![b'x'; 2048]);
+        let r = rt().block_on(collect_body_bounded(
+            http_body_util::Full::new(big),
+            Duration::from_secs(5),
+            1024,
+        ));
+        assert_eq!(r, Err(BodyError::TooLarge));
+        // Exactly at the ceiling is fine.
+        let exact = hyper::body::Bytes::from(vec![b'x'; 1024]);
+        let r = rt().block_on(collect_body_bounded(
+            http_body_util::Full::new(exact),
+            Duration::from_secs(5),
+            1024,
+        ));
+        assert_eq!(r.unwrap().len(), 1024);
     }
 }

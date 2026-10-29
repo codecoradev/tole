@@ -355,6 +355,52 @@ fn guarded_intent_replay_requires_fresh_approval() {
     assert_eq!(s2.state().pc, Pc::Planning);
 }
 
+#[test]
+fn guarded_replay_denied_by_cancel_settles_cancelled() {
+    use tole_core::cancel::CancelToken;
+    use tole_core::turn::resume_turn_with_cancel;
+    let dir = tmpdir("guarded-cancel");
+    let mut s = JsonlStorage::create(&dir, "gc", None).unwrap();
+    let seq = s.state().seq;
+    s.commit(
+        Commit::new()
+            .entry(NewEntry::root(
+                EntryType::new(EntryType::MESSAGE),
+                json!({ "role": "user", "text": "do it" }),
+            ))
+            .transition(StateTransition::from(seq, Pc::Planning)),
+    )
+    .unwrap();
+    let seq = s.state().seq;
+    s.commit(Commit::new().transition(StateTransition::from(seq, Pc::ToolCall)))
+        .unwrap();
+    begin(
+        &mut s,
+        "bomb",
+        json!({ "n": 1 }),
+        ReplaySafety::Guarded,
+        None,
+    )
+    .unwrap();
+    drop(s);
+
+    // The fresh approval is refused AND the client cancelled meanwhile:
+    // the turn must settle as Cancelled (not ApprovalRequired), the
+    // intent must be settled (no livelock) and the bomb must not fire.
+    let mut s2 = JsonlStorage::open(dir.join("gc.jsonl")).unwrap();
+    let mut reg = ToolRegistry::with_approver(AllowlistApprover::allow_only(vec!["other".into()]));
+    reg.register(Box::new(Bomb)).unwrap();
+    let mut p = MockProvider::scripted(vec![ProviderOutput::Final {
+        text: "must not be reached".into(),
+    }]);
+    let cancel = CancelToken::default();
+    cancel.cancel();
+    let out = resume_turn_with_cancel(&mut s2, &mut p, &reg, &cancel).unwrap();
+    assert!(matches!(out, TurnOutcome::Cancelled), "got {out:?}");
+    assert!(s2.get_register("pending", "op").is_none());
+    assert_eq!(s2.state().pc, Pc::Final);
+}
+
 /// A Write-risk tool that records its firings (for the allow path).
 struct CountingWrite(std::sync::Arc<std::sync::atomic::AtomicUsize>);
 impl Tool for CountingWrite {

@@ -9,7 +9,7 @@ Durable Rust agent harness: a conversational agent with risk-tiered approval
 gates, a write-once JSONL session log, and a register state machine — resumable
 after crashes, replayable forever.
 
-**Status:** v0.8.1 released — it adds token-usage reporting and a capped, resumable `read_file` (#211) on top of v0.8.0, which added the per-project config `.tole/config.toml`
+**Status:** v0.9.0 is the latest release: `tole doctor`, soft interrupts, per-turn token stats, sibling change notices and the typed child-agent handoff, a provider failover chain, the user config layer, `--trust workspace`, command-level allow/deny patterns, a global session index (`sessions --all`) and context compaction, plus the 0.8.2 `tole serve` hardening (see the CHANGELOG). `develop` is working toward 0.10.0, a pi-style terminal UI (`tole-tui`, #464). v0.8.1 itself brought token-usage reporting and a capped, resumable `read_file` (#211), on top of v0.8.0, which added the per-project config `.tole/config.toml`
 (trusted before it applies; see the Configuration section) on top of v0.7.x
 (rescan-2 hardening, one tool-call authorization gate; see the CHANGELOG for
 the behavior changes). Four faces on one durable core: the CLI (run / chat /
@@ -36,10 +36,18 @@ tole is the agent harness of the CodeCora ecosystem — the hands:
   tole detects the built-in `cora mcp` server and registers its 18-tool
   surface (brain search, callers, impact, affected tests, dead-code, review
   — registry names `mcp_cora_*`). Opt out with `--no-auto-mcp`.
+  **Code review** (cora ≥ 0.19): with the review tools attached, the system
+  prompt names cora's agent-as-reviewer flow — the model passes a diff to
+  `mcp_cora_cora_review_prepare`, judges it itself (no LLM key in cora), then
+  calls `mcp_cora_cora_review_finalize` with the same diff and its findings.
+  `--trust internal` allows the `mcp_cora_*` tools without prompting.
 - **[uteke](https://github.com/codecoradev/uteke)** (`uteke`) — semantic
   memory. `uteke_recall` (recall) and `uteke_document` (markdown → durable
   knowledge) register automatically when the `uteke` binary is on PATH, and
   the optional [memory loop](#memory-loop) closes the circle.
+- **Supported versions:** cora ≥ 0.19.0 and uteke ≥ 0.21.1 (both optional).
+  `tole doctor` reports each one as supported, too old (with the upgrade
+  command) or not installed.
 - Anything else that speaks **MCP over stdio** joins the same registry via
   repeatable `--mcp-server name=command [args...]` flags.
 - **tole as an MCP server**: `tole mcp` serves the registry's hardened tools
@@ -59,9 +67,13 @@ tole is the agent harness of the CodeCora ecosystem — the hands:
   turns, and poll status without SSH-ing into the box. Binds 127.0.0.1 by
   default. `POST /sessions/{id}/cancel` (#178, REST face) stops an
   in-flight turn — it settles `stopReason: "cancelled"`.
+  `POST /sessions/{id}/interrupt` (#377) steers the running turn instead,
+  without losing its work: the `{"text", "urgent"}` message is injected at
+  the turn's next safe point as an attributed entry (`409` when no turn
+  is running).
   `--transport mcp` (issue #137) serves **multi-session MCP over
   Streamable HTTP** instead: one authenticated MCP connection addresses N
-  durable tole sessions (`tole_session_new/prompt/cancel/status/list` +
+  durable tole sessions (`tole_session_new/prompt/cancel/interrupt/status/list` +
   the registry tools routed to each session's workspace jail).
 
 Every ecosystem integration is probe-first: a missing binary degrades to a
@@ -93,6 +105,7 @@ tole chat --memory uteke                    # …with cross-session memory
 tole chat --resume <id>                     # pick the thread back up (also: --last)
 tole resume <id> "next instruction"         # continue a settled session
 tole sessions                               # list durable sessions
+tole sessions --all [--grep <text>]         # every project's sessions + where they live
 tole status <id>                            # pc / seq / turns / token + cache usage / request-size split
 ```
 
@@ -102,10 +115,23 @@ mid-turn and resume exactly where it stopped.
 
 Useful flags (all subcommands): `--system` (persona, pinned in the session
 header), `--workspace <dir>` (file-tools jail root), `--allow <glob>`
-(repeatable pre-authorization for Write tools, e.g. `--allow 'write_*'`),
+(repeatable pre-authorization for Write tools, e.g. `--allow 'write_*'`;
+`run_command:<argv>` matches commands by argument, e.g.
+`--allow 'run_command:git status *'` — a lone `*` is "any further
+arguments", the program is matched literally; a leading `!` denies and wins
+over every allow and `--yes`, e.g. `--allow '!run_command:rm *'`; with a
+command deny set, only commands an explicit `run_command:` allow names run
+unattended — everything else asks),
 `--yes` (auto-allow every Write; Destructive still prompts), `--mcp-server`,
 `--no-auto-mcp` (skip the cora auto-preset), `--trust <preset>` (one-word
-trust: `internal` / `read_only`), `--skill <path>` (load a SKILL.md),
+trust: `internal` / `read_only` / `workspace` — `read_only` plus
+`write_file`/`edit_file` auto-allowed only inside an explicit
+`--workspace` jail, and not for files another tool may execute — dot-paths
+(`.git/hooks`, `.envrc`, `.vscode/`), build and task files (`build.rs`,
+`Makefile`, `package.json`, ...) and scripts keep prompting, as do
+`delete_file` and `run_command`; a home or filesystem-root workspace is
+refused, and the guard is also available as `--allow 'write_file@workspace'`.
+Not a sandbox: review what it wrote before you run it), `--skill <path>` (load a SKILL.md),
 `--plan-mode` (read-only wire), `--on-turnend <cmd>` (final-message gate).
 
 ## Configuration (environment)
@@ -113,12 +139,41 @@ trust: `internal` / `read_only`), `--skill <path>` (load a SKILL.md),
 | Variable | Purpose |
 |----------|---------|
 | `TOLE_BASE_URL`, `TOLE_MODEL`, `TOLE_API_KEY` | LLM provider — any OpenAI-compatible endpoint (`OPENAI_*` equivalents read as fallback) |
+| `TOLE_FALLBACK_BASE_URL`, `TOLE_FALLBACK_API_KEY`, `TOLE_FALLBACK_MODEL` | optional reserve provider (#209): a step that fails because the primary is unavailable (connection failure, timeout, 5xx, 429) is retried on the reserve, and the switch is recorded in the session log (`tole_route`). The reserve needs its own key (the primary's is never sent to another host); the model defaults to the primary's. Request errors (401/403/404/400) never fail over |
 | `TOLE_SYSTEM_PROMPT` | default persona when `--system` is absent |
+| `TOLE_CONTEXT_WINDOW` | the model's context window in tokens, for context compaction (#440). Without it, tole reads the window from the provider's `/models` (`context_length`, `max_model_len`, ...) once a prompt passes 8k tokens; with neither, compaction stays off. `chat`, `resume` and `mission` compact between turns once a prompt reaches `--compact-at` (default 0.8) of the window: the settled turns before the last one become one durable `compaction` entry (a fenced summary), the session file keeps everything, and `tole status` lists each compaction. `--no-compaction` (or config `no_compaction = true`) turns it off; config keys `context_window`, `compact_at` |
+| `TOLE_SKILL` | skill files to preload (`SKILL.md` paths, separated like `PATH`); same as repeated `--skill`, which replaces it; refused by the server faces like `--skill` |
 | `TOLE_MEMORY` | memory loop backend (`uteke`) — same as `--memory uteke` |
 | `TOLE_NO_UPDATE_CHECK` | `1` disables the startup update-check banner (issue #220) |
-| `TOLE_MEMORY_NAMESPACE` | override the loop's namespace (default: `repo-<directory name>`) |
+| `TOLE_VERBOSE` | `1` prints the startup probe misses (uteke / cora binary not found, no GitHub origin), which are silent by default; `tole doctor` reports the sibling binaries either way |
+| `TOLE_MEMORY_NAMESPACE` | override the loop's uteke room (default: `repo-<directory name>`; the name predates rooms) |
 
-## Configuration (project file)
+## Provider doctor
+
+`tole doctor` answers "is this provider/model actually usable?" in tiers:
+
+| `--tier` | Checks |
+|----------|--------|
+| `offline` | config resolves, base URL shape, key present (no network) |
+| `catalog` (default) | live `GET /models`; the configured model must be served |
+| `full` | a chat call, a streamed call and a real tool-call loop (spends a few tokens) |
+
+Tiers are cumulative and stop at the first blocker, which is printed with
+the command that fixes it. The exit code is non-zero when the requested
+tier is not reached, so `tole doctor --tier full` is the gate for "ready to
+release" claims. API keys and URL credentials never appear in the output.
+
+After the provider tiers, an `ecosystem:` section reports the sibling
+binaries against the supported floor (cora ≥ 0.19.0, uteke ≥ 0.21.1). It is
+informational: an old or missing sibling never fails the run.
+
+Every run is recorded in a coverage ledger (`$CODECORA_HOME/tole/doctor-ledger.json`,
+owner-readable only: level reached, first blocker, fix, timestamp per provider
++ model; `--no-ledger` skips it). `tole doctor --summary` prints `READY n-of-m`
+plus the first blocker and its fix command without running anything; the latest
+run wins per provider + model, so re-run `--tier full` before a release claim.
+
+## Configuration (project and user files)
 
 `<cwd>/.tole/config.toml` (no parent-directory walk) holds per-project defaults.
 It is loaded by every command except `config`, `upgrade` and `approvals`; use
@@ -127,6 +182,15 @@ trusted without a trust record) or `--no-config` to ignore any file entirely
 (no discovery, no trust check, no output). When a config is loaded, one line
 `tole: using config <path>` goes to stderr. **Precedence: flag > env > config >
 default**, and a project without a config file behaves exactly as before.
+
+**User config (#433).** `$CODECORA_HOME/tole/config.toml` (default
+`~/.codecora/tole/config.toml`) holds a user's global defaults with the same
+keys and validation, e.g. a skill to preload everywhere. It sits below the
+project file: **flag > env > config > user config > default**, key by key (a
+project key replaces the user key, lists included). It needs no trust record
+(it lives outside any repository, like the trust store), prints
+`tole: using user config <path>`, and `--no-config` ignores it too.
+`tole config check` lists both files and shows which layer wins each key.
 
 **Keys.** Every key is optional; the schema is strict (an unknown key, a wrong
 type or a secret-like key is an error with `file:line`; the file is capped at
@@ -227,13 +291,13 @@ hard error.
 | `verify_package` | RO | crates.io / npm registry check before any install — hallucinated names get NOT FOUND + candidates, edit-distance-1 candidates get a typo-squat warning |
 | `load_skill` | RO | loads a discovered SKILL.md on demand (`--skill` pins one upfront; `--no-skills` disables) |
 | `gitea` | Write | Gitea counterpart of `gh` over the instance REST API — registers when `origin` is a Gitea remote AND `TOLE_GITEA_TOKEN`/`GITEA_TOKEN` is set; same six ops |
-| `agent_start`, `agent_poll` | Write / Write | depth-1 child agents: spawn durable child sessions (structurally no grandchildren), results via per-child uteke mailboxes (ephemeral by default); `agent_poll` is Write because a settled poll consumes (cleans) the mailbox, and `--trust internal` allowlists it by name; `--agents-worktree` gives each child its own git worktree |
+| `agent_start`, `agent_poll` | Write / Write | depth-1 child agents: spawn durable child sessions (structurally no grandchildren), results via per-child uteke mailboxes (ephemeral by default); `agent_poll` is Write because a settled poll consumes (cleans) the mailbox, and `--trust internal` allowlists it by name; `--agents-worktree` gives each child its own git worktree; siblings are told (#380) when another child changes a file they read or wrote, at their next safe point; `role` (`explore`/`implement`/`verify`/`fix`) and `consumes` (artifacts by reference) give children a typed handoff, and an implement/fix child without passing verification is not closed (#383) |
 | `systemone_decide` | RO | typed decisions (choice/score/noul + confidence) from a System One backend — active when `SYSTEMONE_API_KEY` is set; `SYSTEMONE_BASE_URL` picks the backend (hosted Jev default, self-hosted compatible) |
 | `job_start`, `job_poll` | Write / RO | detached long-running jobs with log tailing |
 | `cora_search` | RO | hybrid codebase search via `cora brain`; native fallback — skipped when the cora MCP surface is attached |
 | `uteke_recall`, `uteke_document` | RO / Write | semantic memory recall / markdown → room |
 | `mcp_*` (from `--mcp-server`) | Write | server metadata is **never** trusted for risk; approval gate always applies |
-| `web_fetch`, `web_search` | RO | text-only internet (no JS/browser): fetch is direct HTTPS, size-capped, content-type allowlisted, HTML→text; search needs `TOLE_WEB_SEARCH_URL` (fleet backend, `{"results":[{title,url,snippet}]}`) — no backend, no tool; results are model content, never executed |
+| `web_fetch`, `web_search` | RO | text-only internet (no JS/browser): fetch is direct HTTPS, size-capped, content-type allowlisted, HTML→text; search needs `TOLE_WEB_SEARCH_URL` (default contract `GET ?q=` → `{"results":[{title,url,snippet}]}`; `TOLE_WEB_SEARCH_METHOD=POST` sends `{"query","limit"}`, `TOLE_WEB_SEARCH_HEADERS='Authorization=Bearer ${KEY}'` adds headers sent only to the backend, `TOLE_WEB_SEARCH_FIELDS='snippet=description,results=items'` maps fields; a malformed value fails startup) — no backend, no tool; results are model content, never executed |
 | `todo_write`, `todo_read` | Write / RO | durable mission task list (at most one `in_progress`); state lives in session entries — write results are the record, crash-resume restores the last settled list; covered by `--trust internal` |
 
 ## Remote approvals
@@ -284,7 +348,10 @@ the usage derived from the ledger for any session: prompt / completion /
 reasoning / cached tokens, the cache-hit rate, and the request size in
 characters split into system+tools vs history at the first and last step
 (#211; recorded per step under `tole_wire`; sessions recorded before it read
-`n/a`). Reported only — `--max-tokens` accounting is unchanged.
+`n/a`). It also lists per-user-turn stats (#379: input / output / cache-read /
+cache-write / reasoning tokens, `turns` in the status JSON), summed from the same
+ledger so they survive restarts; a value no step reported is `n/a` / `null`,
+never 0. Reported only — `--max-tokens` accounting is unchanged.
 
 ## Approval gates
 
@@ -307,9 +374,14 @@ neither trigger nor suppress it:
 - **When the session settles** with a final answer, a compact summary is
   stored back — the next session's recall can find it.
 
-The namespace follows the ecosystem `repo-<dir>` convention
-(`TOLE_MEMORY_NAMESPACE` overrides). Every memory failure degrades to a
-stderr note; the turn proceeds without memory.
+Memory lives in the uteke room `repo-<dir>` (uteke ≥ 0.21.1; rooms replace
+the deprecated namespaces; `TOLE_MEMORY_NAMESPACE` overrides the room). Memory
+stored by earlier tole versions in the namespace of the same name is still
+recalled while the room is empty. The injected batch is hard-capped
+at 24 items / 64 KiB (a larger `limit` is clamped; a hit is never cut
+mid-way) and deduplicated. A batch is all-or-nothing: an unparseable
+recall payload fails the whole batch with a stderr note rather than
+injecting fewer items, and the turn proceeds without memory.
 
 ## Workspace layout
 
@@ -325,15 +397,12 @@ stderr note; the turn proceeds without memory.
 
 - [Architecture](docs/architecture.md) · [Threat model](docs/threat-model.md)
   · [PRD](docs/prd.md) · [Epics & roadmap](docs/epics.md) ·
-  [Performance record](docs/perf.md)
+  [Performance record](docs/perf.md) ·
+  [Child-agent handoff](docs/child-agents-handoff.md)
 - [CONTRIBUTING.md](CONTRIBUTING.md) — workflow, issue/PR rules, merge gate,
   cora review gate, live-mission binary hygiene
 - [AGENTS.md](AGENTS.md) — the same rules for AI coding agents
 - [CHANGELOG.md](CHANGELOG.md) · [Security policy](SECURITY.md)
-- Contributing requires the CLA:
-  [CLA_INDIVIDUAL.md](CLA_INDIVIDUAL.md) /
-  [CLA_CORPORATE.md](CLA_CORPORATE.md) (enforced per PR by `cla-check`;
-  PR and issue templates live in [.github/](.github/)).
 
 ## Development
 

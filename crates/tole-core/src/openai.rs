@@ -107,6 +107,8 @@ impl std::fmt::Debug for OpenAiConfig {
 /// tools on the same host.
 pub const ENV_BASE_URL: &str = "TOLE_BASE_URL";
 pub const ENV_MODEL: &str = "TOLE_MODEL";
+// The env var NAME, not a secret value.
+// cora-ignore: sec-hardcoded-secret
 pub const ENV_API_KEY: &str = "TOLE_API_KEY";
 
 /// Prefixes tried by [`OpenAiConfig::from_env`], in order. The first
@@ -510,10 +512,19 @@ impl OpenAiProvider {
         let mut tool_calls: std::collections::BTreeMap<u64, (String, String, String)> =
             std::collections::BTreeMap::new();
         let mut line = String::new();
+        // Did a sink already show part of this answer? A cut after that
+        // point must not fail over: a reserve would re-stream a full
+        // answer after the partial one (duplicated live output).
+        let mut emitted = false;
         loop {
             line.clear();
             let n = reader.read_line(&mut line).map_err(|e| {
-                ProviderError(scrub(&format!("stream read: {e}"), &self.cfg.api_key))
+                let head = if emitted {
+                    crate::failover::STREAM_CUT_AFTER_OUTPUT
+                } else {
+                    "stream read"
+                };
+                ProviderError(scrub(&format!("{head}: {e}"), &self.cfg.api_key))
             })?;
             if n == 0 {
                 break; // EOF without [DONE]: treat like end-of-stream.
@@ -545,6 +556,7 @@ impl OpenAiProvider {
                     reasoning.push_str(r);
                     if let Some(sink) = &self.on_reasoning_delta {
                         sink(r);
+                        emitted = true;
                     }
                 }
             }
@@ -553,6 +565,7 @@ impl OpenAiProvider {
                     text.push_str(t);
                     if let Some(sink) = &self.on_text_delta {
                         sink(t);
+                        emitted = true;
                     }
                 }
             }
@@ -745,7 +758,18 @@ fn scrub(msg: &str, secret: &str) -> String {
 /// model picker), never a correctness dependency — callers degrade to
 /// "no picker" on any error, per the probe-first contract.
 pub fn fetch_model_ids(base_url: &str, api_key: &str) -> Result<Vec<String>, String> {
-    let agent = OpenAiProvider::build_agent(Duration::from_secs(3));
+    fetch_model_ids_with_timeout(base_url, api_key, Duration::from_secs(3))
+}
+
+/// [`fetch_model_ids`] with a caller-chosen timeout, for callers where the
+/// probe IS the check (the provider doctor) rather than a UI convenience: a
+/// slow but healthy gateway must not be reported as broken.
+pub fn fetch_model_ids_with_timeout(
+    base_url: &str,
+    api_key: &str,
+    timeout: Duration,
+) -> Result<Vec<String>, String> {
+    let agent = OpenAiProvider::build_agent(timeout);
     let url = format!("{}/models", base_url.trim_end_matches('/'));
     let mut res = agent
         .get(&url)
@@ -768,11 +792,76 @@ pub fn fetch_model_ids(base_url: &str, api_key: &str) -> Result<Vec<String>, Str
     Ok(out)
 }
 
+/// The context window a `/models` entry reports, in tokens (#440). Servers
+/// name it differently: `context_length` (OpenRouter, LM Studio),
+/// `context_window` (Groq), `max_context_length`, `max_model_len` (vLLM),
+/// `max_input_tokens` (LiteLLM-style), or `top_provider.context_length`
+/// (OpenRouter). `None` when none is a positive integer.
+pub fn context_window_of(model: &Value) -> Option<u64> {
+    let direct = [
+        "context_length",
+        "context_window",
+        "max_context_length",
+        "max_model_len",
+        "max_input_tokens",
+    ]
+    .iter()
+    .find_map(|k| model.get(*k).and_then(Value::as_u64));
+    direct
+        .or_else(|| model["top_provider"]["context_length"].as_u64())
+        .filter(|w| *w > 0)
+}
+
+/// The context window `GET /models` reports for `model` (#440): `Ok(None)`
+/// when the catalog lists the model without a window (or not at all).
+/// Same base_url / credentials as chat completions.
+pub fn fetch_context_window(
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    timeout: Duration,
+) -> Result<Option<u64>, String> {
+    let agent = OpenAiProvider::build_agent(timeout);
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let mut res = agent
+        .get(&url)
+        .header("Authorization", &format!("Bearer {api_key}"))
+        .call()
+        .map_err(|e| scrub(&format!("models probe: {e}"), api_key))?;
+    let body: Value = res
+        .body_mut()
+        .read_json()
+        .map_err(|e| scrub(&format!("models probe: {e}"), api_key))?;
+    Ok(body["data"]
+        .as_array()
+        .and_then(|all| all.iter().find(|m| m["id"].as_str() == Some(model)))
+        .and_then(context_window_of))
+}
+
 use crate::entry::Entry;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_window_is_read_from_the_usual_catalog_fields() {
+        for (entry, want) in [
+            (json!({"id": "m", "context_length": 131072}), Some(131072)),
+            (json!({"id": "m", "context_window": 8192}), Some(8192)),
+            (json!({"id": "m", "max_model_len": 32768}), Some(32768)),
+            (json!({"id": "m", "max_input_tokens": 200000}), Some(200000)),
+            (
+                json!({"id": "m", "top_provider": {"context_length": 64000}}),
+                Some(64000),
+            ),
+            (json!({"id": "m", "context_length": 0}), None),
+            (json!({"id": "m", "context_length": "big"}), None),
+            (json!({"id": "m", "owned_by": "x"}), None),
+        ] {
+            assert_eq!(context_window_of(&entry), want, "{entry}");
+        }
+    }
 
     #[test]
     fn config_display_never_leaks_key() {
@@ -1360,6 +1449,65 @@ mod streaming_tests {
         assert_eq!(p.last_usage().unwrap()["prompt_tokens"], json!(9));
         // The reasoning sink already delivered the thought: no replay.
         assert!(p.last_reasoning().is_none());
+    }
+
+    /// Reader that yields `data` then fails, like a dropped connection.
+    struct CutReader {
+        data: std::io::Cursor<Vec<u8>>,
+    }
+    impl std::io::Read for CutReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = std::io::Read::read(&mut self.data, buf)?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "connection reset by peer",
+                ));
+            }
+            Ok(n)
+        }
+    }
+
+    fn cut_stream(body: &str) -> std::io::BufReader<CutReader> {
+        std::io::BufReader::new(CutReader {
+            data: std::io::Cursor::new(body.as_bytes().to_vec()),
+        })
+    }
+
+    #[test]
+    fn a_stream_cut_after_live_output_is_not_a_failover_error() {
+        let seen = Arc::new(Mutex::new(String::new()));
+        let sink_seen = Arc::clone(&seen);
+        let sink: DeltaSink = Arc::new(move |t: &str| sink_seen.lock().unwrap().push_str(t));
+        let mut p = OpenAiProvider::new(OpenAiConfig::new("http://unused", "m", "sk-test"))
+            .with_delta_sinks(Some(sink), None);
+        let e = p
+            .complete_streaming(cut_stream(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\n",
+            ))
+            .unwrap_err()
+            .0;
+        assert_eq!(*seen.lock().unwrap(), "hel");
+        assert!(
+            e.starts_with(crate::failover::STREAM_CUT_AFTER_OUTPUT),
+            "{e}"
+        );
+        assert!(!crate::failover::is_failover_error(&e), "{e}");
+    }
+
+    #[test]
+    fn a_stream_cut_before_any_output_still_fails_over() {
+        let seen = Arc::new(Mutex::new(String::new()));
+        let sink_seen = Arc::clone(&seen);
+        let sink: DeltaSink = Arc::new(move |t: &str| sink_seen.lock().unwrap().push_str(t));
+        let mut p = OpenAiProvider::new(OpenAiConfig::new("http://unused", "m", "sk-test"))
+            .with_delta_sinks(Some(sink), None);
+        let e = p
+            .complete_streaming(cut_stream(": keep-alive\n\n"))
+            .unwrap_err()
+            .0;
+        assert!(e.starts_with("stream read: "), "{e}");
+        assert!(crate::failover::is_failover_error(&e), "{e}");
     }
 
     #[test]

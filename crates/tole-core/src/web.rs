@@ -3,9 +3,11 @@
 //! Assistant-shaped internet access, probe-first: `web_fetch` speaks
 //! direct HTTPS (always available — no backend needed); `web_search`
 //! registers only when `TOLE_WEB_SEARCH_URL` names a search backend
-//! (the fleet contract: `GET {url}?q=…` answering
-//! `{"results":[{title,url,snippet}]}`). Absent backend = no search
-//! tool, never a phantom.
+//! (the default contract: `GET {url}?q=…` answering
+//! `{"results":[{title,url,snippet}]}`; #436 widens it with
+//! `TOLE_WEB_SEARCH_METHOD`, `TOLE_WEB_SEARCH_HEADERS` and
+//! `TOLE_WEB_SEARCH_FIELDS`, see [`WebSearchTool::from_env`]). Absent
+//! backend = no search tool, never a phantom.
 //!
 //! Safety frame (threat-model row in #215): results are MODEL CONTENT —
 //! the same trust tier as any ReadOnly output, never executed. Fetch is
@@ -224,6 +226,22 @@ impl ureq::unversioned::resolver::Resolver for SsrfResolver {
     }
 }
 
+/// Config for [`fetch_agent_vetted`]. The environment proxy is OFF:
+/// ureq reads `HTTP(S)_PROXY` / `ALL_PROXY` by default, and through a
+/// proxy the resolver only ever sees (and vets) the PROXY host — the
+/// target, private or cloud-metadata IP included, would be fetched by
+/// the proxy unchecked (cora 0.19 scan MAJOR). Takes the builder so a
+/// test can prove a proxy already on it is stripped.
+fn vetted_config(
+    builder: ureq::config::ConfigBuilder<ureq::typestate::AgentScope>,
+) -> ureq::config::Config {
+    builder
+        .timeout_global(Some(Duration::from_secs(30)))
+        .max_redirects(0)
+        .proxy(None)
+        .build()
+}
+
 /// Fetch agent whose resolver VETS-AND-PINS in one step: resolution,
 /// the private-range check, and the connection's address list all come
 /// from the same resolver call, so the cora "two separate DNS lookups"
@@ -231,10 +249,7 @@ impl ureq::unversioned::resolver::Resolver for SsrfResolver {
 /// fresh agent (re-vetted per hop).
 fn fetch_agent_vetted() -> ureq::Agent {
     ureq::Agent::with_parts(
-        ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(30)))
-            .max_redirects(0)
-            .build(),
+        vetted_config(ureq::Agent::config_builder()),
         ureq::unversioned::transport::DefaultConnector::default(),
         SsrfResolver {
             opt_out: ssrf_opt_out(),
@@ -549,22 +564,217 @@ impl Tool for WebFetchTool {
     }
 }
 
-/// `web_search`: the fleet search backend (`TOLE_WEB_SEARCH_URL`),
-/// contract `GET {url}?q=…` → `{"results":[{title,url,snippet}]}`.
+/// Search backend URL (#215).
+pub const SEARCH_URL_ENV: &str = "TOLE_WEB_SEARCH_URL";
+/// `GET` (default) or `POST` (#436).
+pub const SEARCH_METHOD_ENV: &str = "TOLE_WEB_SEARCH_METHOD";
+/// Extra request headers, `Name=Value` pairs separated by commas (#436).
+pub const SEARCH_HEADERS_ENV: &str = "TOLE_WEB_SEARCH_HEADERS";
+/// Response field mapping, `wire=backend` pairs separated by commas (#436).
+pub const SEARCH_FIELDS_ENV: &str = "TOLE_WEB_SEARCH_FIELDS";
+
+/// How the query reaches the backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchMethod {
+    /// `GET {url}?q=<query>`.
+    Get,
+    /// `POST {url}` with the JSON body `{"query": "<query>", "limit": 8}`.
+    Post,
+}
+
+/// Where each result field is read from in the backend's JSON. The
+/// default is the fleet contract `{"results":[{title,url,snippet}]}`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchFields {
+    pub results: String,
+    pub title: String,
+    pub url: String,
+    pub snippet: String,
+}
+
+impl Default for SearchFields {
+    fn default() -> Self {
+        SearchFields {
+            results: "results".into(),
+            title: "title".into(),
+            url: "url".into(),
+            snippet: "snippet".into(),
+        }
+    }
+}
+
+/// Header names the transport owns; a configured value would break
+/// framing or retarget the request.
+const RESERVED_HEADERS: [&str; 5] = [
+    "host",
+    "content-length",
+    "transfer-encoding",
+    "connection",
+    "content-type",
+];
+
+/// `${NAME}` references in a header value, expanded from `env`. A
+/// reference to an unset variable is an error naming the variable (never
+/// the value). No other syntax: `$NAME` and `$$` stay literal.
+fn expand_vars(v: &str, env: &dyn Fn(&str) -> Option<String>) -> Result<String, String> {
+    let mut out = String::with_capacity(v.len());
+    let mut rest = v;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let end = after
+            .find('}')
+            .ok_or_else(|| format!("{SEARCH_HEADERS_ENV}: unterminated `${{` in a header value"))?;
+        let name = &after[..end];
+        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+            return Err(format!(
+                "{SEARCH_HEADERS_ENV}: `${{{name}}}` is not a variable name"
+            ));
+        }
+        let value = env(name)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| format!("{SEARCH_HEADERS_ENV}: `${{{name}}}` is not set"))?;
+        out.push_str(&value);
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+/// RFC 9110 token characters (a header name).
+fn is_token(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+}
+
+/// Parse `TOLE_WEB_SEARCH_HEADERS`. Errors name the header, never its
+/// value (it usually carries a credential).
+fn parse_headers(
+    raw: &str,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<Vec<(String, String)>, String> {
+    let mut out = Vec::new();
+    for pair in raw.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let (name, value) = pair.split_once('=').ok_or_else(|| {
+            format!("{SEARCH_HEADERS_ENV}: expected `Name=Value`, got a pair without `=`")
+        })?;
+        let name = name.trim();
+        if !is_token(name) {
+            return Err(format!(
+                "{SEARCH_HEADERS_ENV}: `{name}` is not a header name"
+            ));
+        }
+        if RESERVED_HEADERS.contains(&name.to_ascii_lowercase().as_str()) {
+            return Err(format!(
+                "{SEARCH_HEADERS_ENV}: `{name}` is set by tole itself and cannot be configured"
+            ));
+        }
+        let value = expand_vars(value.trim(), env)?;
+        if value.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0) {
+            return Err(format!(
+                "{SEARCH_HEADERS_ENV}: the value of `{name}` contains a line break"
+            ));
+        }
+        out.push((name.to_string(), value));
+    }
+    Ok(out)
+}
+
+/// Parse `TOLE_WEB_SEARCH_FIELDS` over the default contract.
+fn parse_fields(raw: &str) -> Result<SearchFields, String> {
+    let mut f = SearchFields::default();
+    for pair in raw.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let (wire, backend) = pair
+            .split_once('=')
+            .ok_or_else(|| format!("{SEARCH_FIELDS_ENV}: expected `wire=backend`, got `{pair}`"))?;
+        let backend = backend.trim();
+        if backend.is_empty() {
+            return Err(format!(
+                "{SEARCH_FIELDS_ENV}: `{pair}` names no backend field"
+            ));
+        }
+        let slot = match wire.trim() {
+            "results" => &mut f.results,
+            "title" => &mut f.title,
+            "url" => &mut f.url,
+            "snippet" => &mut f.snippet,
+            other => {
+                return Err(format!(
+                    "{SEARCH_FIELDS_ENV}: unknown field `{other}` (expected results, title, url or snippet)"
+                ))
+            }
+        };
+        *slot = backend.to_string();
+    }
+    Ok(f)
+}
+
+/// `web_search`: the configured search backend (`TOLE_WEB_SEARCH_URL`),
+/// default contract `GET {url}?q=…` → `{"results":[{title,url,snippet}]}`.
+/// Configured headers are sent only to this backend (redirects are not
+/// followed), and their values never appear in errors or descriptions.
 pub struct WebSearchTool {
     backend: String,
+    method: SearchMethod,
+    headers: Vec<(String, String)>,
+    fields: SearchFields,
 }
 
 impl WebSearchTool {
-    /// Probe-gated construction: `Some` iff the backend env is set.
-    pub fn from_env() -> Option<Self> {
-        let backend = std::env::var("TOLE_WEB_SEARCH_URL").ok()?;
-        let backend = backend.trim().to_string();
-        if backend.is_empty() {
-            None
-        } else {
-            Some(Self { backend })
+    /// The default contract for `backend`, no extra headers.
+    pub fn new(backend: impl Into<String>) -> Self {
+        WebSearchTool {
+            backend: backend.into(),
+            method: SearchMethod::Get,
+            headers: Vec::new(),
+            fields: SearchFields::default(),
         }
+    }
+
+    /// Probe-gated construction from the process environment: `Ok(None)`
+    /// when `TOLE_WEB_SEARCH_URL` is unset or blank, an error (naming the
+    /// variable) when the method / headers / fields are malformed.
+    pub fn from_env() -> Result<Option<Self>, String> {
+        Self::from_lookup(&|k| std::env::var(k).ok())
+    }
+
+    /// [`Self::from_env`] over an injected lookup.
+    pub fn from_lookup(env: &dyn Fn(&str) -> Option<String>) -> Result<Option<Self>, String> {
+        let Some(backend) = env(SEARCH_URL_ENV)
+            .map(|b| b.trim().to_string())
+            .filter(|b| !b.is_empty())
+        else {
+            return Ok(None);
+        };
+        let method = match env(SEARCH_METHOD_ENV)
+            .map(|m| m.trim().to_ascii_uppercase())
+            .filter(|m| !m.is_empty())
+            .as_deref()
+        {
+            None | Some("GET") => SearchMethod::Get,
+            Some("POST") => SearchMethod::Post,
+            Some(other) => {
+                return Err(format!(
+                    "{SEARCH_METHOD_ENV}: expected GET or POST, got `{other}`"
+                ))
+            }
+        };
+        let headers = match env(SEARCH_HEADERS_ENV) {
+            Some(raw) => parse_headers(&raw, env)?,
+            None => Vec::new(),
+        };
+        let fields = match env(SEARCH_FIELDS_ENV) {
+            Some(raw) => parse_fields(&raw)?,
+            None => SearchFields::default(),
+        };
+        Ok(Some(WebSearchTool {
+            backend,
+            method,
+            headers,
+            fields,
+        }))
     }
 }
 
@@ -595,29 +805,44 @@ impl Tool for WebSearchTool {
             .map(str::trim)
             .filter(|q| !q.is_empty())
             .ok_or("web_search: 'query' is required")?;
-        let url = format!(
-            "{}?q={}",
-            self.backend.trim_end_matches('/'),
-            urlencoding_lite(query)
-        );
-        let mut res = agent()
-            .get(&url)
-            .call()
-            .map_err(|e| format!("web_search: {e}"))?;
+        let agent = agent();
+        let sent = match self.method {
+            SearchMethod::Get => {
+                let url = format!(
+                    "{}?q={}",
+                    self.backend.trim_end_matches('/'),
+                    urlencoding_lite(query)
+                );
+                let mut req = agent.get(&url);
+                for (k, v) in &self.headers {
+                    req = req.header(k.as_str(), v.as_str());
+                }
+                req.call()
+            }
+            SearchMethod::Post => {
+                let mut req = agent.post(&self.backend);
+                for (k, v) in &self.headers {
+                    req = req.header(k.as_str(), v.as_str());
+                }
+                req.send_json(json!({"query": query, "limit": SEARCH_RESULTS_CAP}))
+            }
+        };
+        let mut res = sent.map_err(|e| format!("web_search: {e}"))?;
         let body: Value = res
             .body_mut()
             .read_json()
             .map_err(|e| format!("web_search: backend returned non-JSON: {e}"))?;
-        let results: Vec<Value> = body["results"]
+        let f = &self.fields;
+        let results: Vec<Value> = body[f.results.as_str()]
             .as_array()
             .map(|arr| {
                 arr.iter()
                     .take(SEARCH_RESULTS_CAP)
                     .map(|r| {
                         json!({
-                            "title": r["title"].as_str().unwrap_or(""),
-                            "url": r["url"].as_str().unwrap_or(""),
-                            "snippet": cap_chars(r["snippet"].as_str().unwrap_or(""), SNIPPET_CAP_CHARS),
+                            "title": r[f.title.as_str()].as_str().unwrap_or(""),
+                            "url": r[f.url.as_str()].as_str().unwrap_or(""),
+                            "snippet": cap_chars(r[f.snippet.as_str()].as_str().unwrap_or(""), SNIPPET_CAP_CHARS),
                         })
                     })
                     .collect()
@@ -646,6 +871,19 @@ fn urlencoding_lite(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::join_redirect;
+
+    /// cora 0.19 scan MAJOR: an env proxy (`HTTPS_PROXY` & co.) on the
+    /// vetted fetch agent would let the target bypass the SSRF resolver.
+    /// Seed the builder with a proxy, as `Config::default()` does from
+    /// the environment, and require the vetted config to drop it.
+    #[test]
+    fn vetted_fetch_config_never_uses_a_proxy() {
+        use super::{fetch_agent_vetted, vetted_config};
+        let proxy = ureq::Proxy::new("http://127.0.0.1:3128").unwrap();
+        let seeded = ureq::Agent::config_builder().proxy(Some(proxy));
+        assert!(vetted_config(seeded).proxy().is_none());
+        assert!(fetch_agent_vetted().config().proxy().is_none());
+    }
 
     /// #281: RFC 3986 §5.4 reference resolution against the current hop.
     #[test]
@@ -779,9 +1017,7 @@ mod tests {
         let base = format!("http://{addr}");
 
         // Search against the mock backend.
-        let search = WebSearchTool {
-            backend: format!("{base}/search"),
-        };
+        let search = WebSearchTool::new(format!("{base}/search"));
         let out = search.execute(json!({"query": "rust lang"})).unwrap();
         assert_eq!(out["results"][0]["title"], "Rust");
         assert_eq!(
@@ -824,11 +1060,11 @@ mod tests {
     fn search_probe_gating_from_env() {
         let _env = ENV_LOCK.lock().unwrap();
         std::env::set_var("TOLE_WEB_SEARCH_URL", "http://x/search");
-        assert!(WebSearchTool::from_env().is_some());
+        assert!(WebSearchTool::from_env().unwrap().is_some());
         std::env::set_var("TOLE_WEB_SEARCH_URL", "  ");
-        assert!(WebSearchTool::from_env().is_none());
+        assert!(WebSearchTool::from_env().unwrap().is_none());
         std::env::remove_var("TOLE_WEB_SEARCH_URL");
-        assert!(WebSearchTool::from_env().is_none());
+        assert!(WebSearchTool::from_env().unwrap().is_none());
     }
 
     #[test]
@@ -958,5 +1194,170 @@ mod tests {
             let ip: std::net::IpAddr = a.parse().unwrap();
             assert!(ip_is_private(&ip), "{a} must be refused");
         }
+    }
+
+    // ------------------------------------------------ search config (#436)
+
+    fn lookup(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let m: std::collections::HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |k| m.get(k).cloned()
+    }
+
+    #[test]
+    fn search_is_absent_without_a_backend_and_defaults_to_the_fleet_contract() {
+        assert!(WebSearchTool::from_lookup(&lookup(&[])).unwrap().is_none());
+        assert!(
+            WebSearchTool::from_lookup(&lookup(&[(SEARCH_URL_ENV, "  ")]))
+                .unwrap()
+                .is_none()
+        );
+        let t = WebSearchTool::from_lookup(&lookup(&[(SEARCH_URL_ENV, "http://s/search")]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(t.method, SearchMethod::Get);
+        assert!(t.headers.is_empty());
+        assert_eq!(t.fields, SearchFields::default());
+    }
+
+    #[test]
+    fn headers_expand_variables_and_never_echo_values() {
+        let env = lookup(&[
+            (SEARCH_URL_ENV, "http://s"),
+            (
+                SEARCH_HEADERS_ENV,
+                "Authorization=Bearer ${NGINJEN_API_KEY}, X-Foo=a=b",
+            ),
+            ("NGINJEN_API_KEY", "sk-secret"),
+        ]);
+        let t = WebSearchTool::from_lookup(&env).unwrap().unwrap();
+        assert_eq!(
+            t.headers,
+            [
+                ("Authorization".to_string(), "Bearer sk-secret".to_string()),
+                ("X-Foo".to_string(), "a=b".to_string()),
+            ]
+        );
+        for (raw, needle) in [
+            ("Authorization=Bearer ${MISSING}", "`${MISSING}` is not set"),
+            ("Authorization=Bearer ${NGINJEN_API_KEY", "unterminated"),
+            ("Authorization=${bad-name}", "is not a variable name"),
+            ("Bad Name=x", "is not a header name"),
+            ("Host=evil.example", "set by tole itself"),
+            ("content-length=1", "set by tole itself"),
+            ("no-equals-sign", "without `=`"),
+        ] {
+            let env = lookup(&[
+                (SEARCH_URL_ENV, "http://s"),
+                (SEARCH_HEADERS_ENV, raw),
+                ("NGINJEN_API_KEY", "sk-secret"),
+            ]);
+            let e = WebSearchTool::from_lookup(&env).err().unwrap();
+            assert!(e.contains(needle), "{raw:?} -> {e}");
+            assert!(e.starts_with(SEARCH_HEADERS_ENV), "{e}");
+            assert!(!e.contains("sk-secret"), "a value leaked: {e}");
+        }
+        // A line break smuggled in through a variable is refused by name.
+        let env = lookup(&[
+            (SEARCH_URL_ENV, "http://s"),
+            (SEARCH_HEADERS_ENV, "X-Key=${K}"),
+            ("K", "sk-secret\r\nX-Injected: 1"),
+        ]);
+        let e = WebSearchTool::from_lookup(&env).err().unwrap();
+        assert!(e.contains("`X-Key` contains a line break"), "{e}");
+        assert!(!e.contains("sk-secret"), "{e}");
+    }
+
+    #[test]
+    fn method_and_fields_parse_strictly() {
+        let t = WebSearchTool::from_lookup(&lookup(&[
+            (SEARCH_URL_ENV, "http://s"),
+            (SEARCH_METHOD_ENV, " post "),
+            (SEARCH_FIELDS_ENV, "snippet=description, results=items"),
+        ]))
+        .unwrap()
+        .unwrap();
+        assert_eq!(t.method, SearchMethod::Post);
+        assert_eq!(t.fields.snippet, "description");
+        assert_eq!(t.fields.results, "items");
+        assert_eq!(t.fields.title, "title");
+        for (k, v, needle) in [
+            (SEARCH_METHOD_ENV, "PUT", "expected GET or POST"),
+            (SEARCH_FIELDS_ENV, "body=text", "unknown field `body`"),
+            (SEARCH_FIELDS_ENV, "snippet", "expected `wire=backend`"),
+            (SEARCH_FIELDS_ENV, "snippet= ", "names no backend field"),
+        ] {
+            let e = WebSearchTool::from_lookup(&lookup(&[(SEARCH_URL_ENV, "http://s"), (k, v)]))
+                .err()
+                .unwrap();
+            assert!(e.contains(needle), "{v:?} -> {e}");
+        }
+    }
+
+    /// The nginjen shape end to end: POST + JSON body, a bearer header,
+    /// `description` mapped to `snippet`.
+    #[test]
+    fn post_search_sends_headers_and_maps_fields() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut s, _) = listener.accept().unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
+                let n = s.read(&mut chunk).unwrap_or(0);
+                buf.extend_from_slice(&chunk[..n]);
+                let text = String::from_utf8_lossy(&buf).to_string();
+                if let Some(h) = text.find("\r\n\r\n") {
+                    if serde_json::from_str::<Value>(&text[h + 4..]).is_ok() {
+                        break;
+                    }
+                }
+                if n == 0 {
+                    break;
+                }
+            }
+            let _ = tx.send(String::from_utf8_lossy(&buf).to_string());
+            let body = json!({"items": [
+                {"title": "Rust", "url": "https://rust-lang.org", "description": "fast"}
+            ]})
+            .to_string();
+            let _ = s.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+        });
+        let t = WebSearchTool::from_lookup(&lookup(&[
+            (SEARCH_URL_ENV, &format!("http://{addr}/search")),
+            (SEARCH_METHOD_ENV, "POST"),
+            (SEARCH_HEADERS_ENV, "Authorization=Bearer ${KEY}"),
+            (SEARCH_FIELDS_ENV, "snippet=description,results=items"),
+            ("KEY", "k-1"),
+        ]))
+        .unwrap()
+        .unwrap();
+        let out = t.execute(json!({"query": "rust lang"})).unwrap();
+        assert_eq!(out["results"][0]["title"], "Rust");
+        assert_eq!(out["results"][0]["snippet"], "fast");
+        let req = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(req.starts_with("POST /search "), "{req}");
+        let lower = req.to_ascii_lowercase();
+        assert!(lower.contains("authorization: bearer k-1"), "{req}");
+        let body: Value = serde_json::from_str(&req[req.find("\r\n\r\n").unwrap() + 4..]).unwrap();
+        assert_eq!(
+            body,
+            json!({"query": "rust lang", "limit": SEARCH_RESULTS_CAP})
+        );
+        // The description of the call never carries a header value.
+        assert!(!t.describe(&json!({"query": "q"})).contains("k-1"));
     }
 }

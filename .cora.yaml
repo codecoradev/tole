@@ -26,6 +26,34 @@ ignore:
     - "Hardcoded password or secret"
     - "Command injection via exec/system with dynamic input"
     - "SQL injection via string concatenation"
+    # Deterministic rule ids (cora 0.19). Each was validated against a full
+    # `cora scan --no-llm` of the repo (457 findings) before being silenced:
+    # - bug-todo matches the WORD "todo" (the todo_write/TodoState feature,
+    #   `mod todo`), never a TODO marker: 22 of 22 hits were false positives.
+    - "bug-todo"
+    # - qual-clone: 306 info-level hits, almost all Arc/String clones that
+    #   are the intended ownership model; no signal.
+    - "qual-clone"
+    # - bug-expect: every hit states a local invariant in its message
+    #   (`expect("stdout piped above")`, poisoned-lock and runtime-build
+    #   expects); the project's style, not unchecked external input.
+    - "bug-expect"
+    # - bug-println: the CLI's stdout IS its interface and eprintln! is the
+    #   diagnostics channel. The real constraint (tole-core never writes to
+    #   stdout) is enforced precisely by the core-no-stdout rule below.
+    - "bug-println"
+
+# Deterministic custom rules (no LLM; run by `cora review` and `cora scan`).
+# `languages` takes file extensions, and `exclude` is required.
+rules_engine:
+  custom:
+    - id: core-no-stdout
+      # println!/print! but not eprintln!/eprint! (stderr diagnostics are fine).
+      pattern: "(?:^|[^a-z_])(?:println|print)!\\("
+      severity: major
+      message: "tole-core must stay embedder-safe: no stdout (hosts own I/O through the traits)"
+      languages: ["rs"]
+      exclude: ["crates/tole-cli/**", "evals/**", "**/tests/**"]
 
 # Hook settings
 hook:

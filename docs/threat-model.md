@@ -145,6 +145,58 @@ preset names (flag or env) fail loudly. A typo'd env value breaks every
 invocation with a clear error — deliberately, per the
 typo-silently-narrowing-trust rule.
 
+`workspace` (#437) is the one preset that auto-allows write-capable native
+tools: `write_file` and `edit_file`, through the path guard
+(`write_file@workspace`). Their reach is the workspace jail (root
+canonicalized; `../` and symlinked targets refused), and the guard keeps
+prompting for every dot-path (a write to `.git/hooks/*`, `.envrc`,
+`.vscode/`, `.tole/` or `.github/workflows/` would turn into code execution
+the next time git, direnv, an editor or CI runs), for build and task files
+(`build.rs`, `Cargo.toml`, `Makefile`, `package.json`, `pyproject.toml`,
+`setup.py`, `Dockerfile`, ...), for instruction files tole or another agent
+loads (`SKILL.md`, `AGENTS.md`, `CLAUDE.md`) and for scripts (`.sh`, `.ps1`,
+...). The guard reads the target the tool reports through
+`Tool::approval_target` — the same jail resolution `execute` uses, so a
+symlink already in the workspace (`docs -> .git/hooks`) cannot launder a
+hook write — with Windows trailing dots/spaces normalized and 8.3 short
+names refused; a tool that reports no target fails the guard (prompts).
+The preset needs an explicit workspace (never the implicit cwd, which
+is usually a whole repository) and is refused on a home or filesystem-root
+workspace. Residual risk, accepted and documented: an
+auto-allowed write can still change ordinary files the user later executes
+(a `Makefile`, a script, source code); the preset is for a workspace whose
+results the user reviews, not a sandbox. `delete_file` (Destructive) and
+`run_command` keep prompting, unlike `--yes`. A project config can name the
+preset only after its content was trusted, the same bar as
+`allow = ["write_file"]`.
+
+## Command patterns (#438)
+
+`run_command:<argv pattern>` allow patterns match the argv the tool
+executes — the same splitter, no shell — so `git status; rm -rf /` cannot
+chain a second command (it would run `git` with literal arguments). An
+ALLOW compares the program literally (`/usr/bin/git` does not match `git`,
+`run_command:*` matches nothing), so an allow can only be as wide as
+written. Choose allows with care: `run_command:git *` also allows
+`git -c core.pager=… log`, `git config alias.x '!…'` and other ways a
+program runs code from its arguments.
+
+A DENY (`!…`) wins over every allow and over `--yes`; it compares the
+program by file name, case-insensitively and without a Windows executable
+extension, so `/bin/RM` and `rm.exe` do not slip past `rm *`. A deny list
+cannot be complete — `env rm`, `sh -c 'rm …'`, `find -exec rm`,
+`python -c`, `git -c …`, `make` all reach other programs — so the rule
+FAILS CLOSED: while any `run_command` deny is set, a command runs
+unattended only when an explicit `run_command:` allow names it (a bare
+`run_command` allow or `--yes` is not enough), never when its program is a
+known wrapper (`sh`, `bash`, `env`, `sudo`, `xargs`, ...), and everything
+else asks the human (refused where nobody can be asked). The ALLOWLIST is
+the boundary. Denies travel with allow lists (config, ACP, serve), a child
+agent always inherits its parent's denies, and a child's command pattern
+must be covered argument by argument by a parent pattern: a parent whose
+program token is a glob covers nothing, because for an allow the program is
+literal.
+
 ## Memory loop — decision typing (#143)
 
 The session summary stored by the memory loop keeps its content contract
@@ -173,7 +225,7 @@ failing gate cannot livelock the loop — the turn settles durably as
 
 All three server faces expose cooperative turn cancellation: ACP
 clients send `session/cancel`, REST callers `POST /sessions/{id}/cancel`,
-MCP clients call `tole_session_cancel`. Every path sets the same
+MCP clients call `tole_session_cancel`. Steering (soft interrupt, #377) goes through the same authenticated faces (`POST /sessions/{id}/interrupt`, `tole_session_interrupt`) and adds no authority: the message is ordinary user-role input to the session, so every tool the steered turn runs still passes the session's approver. Every path sets the same
 per-session token; a blocking turn observes it at checkpoints (between
 provider calls and tool executions) and settles
 `stopReason: "cancelled"` as a normal, durable turn end — the session
@@ -199,6 +251,18 @@ worktree. A child's prompt is model/operator-supplied — the same trust
 tier as the session system prompt. Child sessions are ordinary durable
 sessions: approval gates, risk tiers, and secret redaction apply
 unchanged inside them.
+
+Typed handoff (#383) and sibling notices (#380) add two child-to-agent
+channels, both carrying model-authored text that is treated as untrusted. A
+role child gets a Write-tier `handoff_submit` tool that `agent_start`
+allowlists by exact name; it can only write one schema-validated, bounded
+file at the path the parent chose (the role is fixed by the parent), so it
+does not widen what the child may do. Artifact paths and refs are validated
+(workspace-relative, no `..`, backslash, colon or leading `-`; plain ref
+names), and any handoff or sibling-log text shown to another model is
+escaped and bounded. The shared sibling log is a same-user channel between
+processes that already share the parent's authority; a forged line can only
+add notices, and ids read from it must match the agent-id charset.
 
 ## `systemone_decide` (#172/#173)
 
@@ -267,6 +331,15 @@ crafted page CAN steer a mission via prompt injection; the mitigation
 is the same as every other untrusted input: tool-result fencing,
 approval gates on anything that matters, and mission budgets bounding
 the blast radius.
+
+Search backend credentials (#436): `TOLE_WEB_SEARCH_HEADERS` values (with
+`${VAR}` references expanded from the environment) are sent only to the
+`TOLE_WEB_SEARCH_URL` backend: the search agent follows no redirects, so a
+backend cannot bounce the credential to another host. Header names are
+RFC 9110 tokens, transport headers (`Host`, `Content-Length`,
+`Transfer-Encoding`, `Connection`, `Content-Type`) are refused, a value
+with a line break is refused (no header injection), and errors name the
+header or variable, never the value.
 
 ### Project config trust (#208)
 
@@ -349,3 +422,50 @@ user's home, so anything running as that user can edit it; the store update is
 an unlocked read-modify-write, so two concurrent `tole config trust` runs can
 lose one of the two records (the loser is simply asked again; the file itself
 is replaced atomically and never corrupted).
+
+### Context compaction (#440)
+
+A compaction replaces, on the wire only, the settled turns before the kept
+tail with a model-written summary; the session file keeps every entry. The
+summary is committed atomically with its usage row (a crash before the
+commit leaves the session pre-compaction), only between turns and at a turn
+boundary (no tool result is separated from its call), and an entry whose
+kept-entry id is unknown is ignored (full transcript). Trust: the summary is
+model output that may restate tool output, yet it reaches the wire as a
+user-role message (an assistant-first conversation is rejected by some
+OpenAI-compatible endpoints, and the system role would RAISE its
+authority). The marking is therefore structural: the summary goes inside
+the same untrusted-content fence as tool results (forged fence markers in
+it are neutralized), introduced as a record rather than instructions, and
+the summary instruction tells the model to report instructions found in
+tool output as data. Residual risk: a prompt injection that already steered the model
+before compaction can persist through the summary, as it would through the
+model's own earlier answers. The window lookup is one `GET /models` on the session's own provider,
+with the same base URL and credentials as chat completions (no new host or
+secret), at most once per process and only after a prompt passes 8k tokens;
+an explicit `TOLE_CONTEXT_WINDOW` / config `context_window` skips it.
+
+### Global session index (#439)
+
+`$CODECORA_HOME/tole/sessions-index.jsonl` maps session ids to session files
+and cwds across projects. It holds no conversation content (previews are
+read from the session file at list time), is created owner-only (0600), is
+append-only (one `write` per line; a torn or foreign line is skipped, never
+fatal) and is best effort: a failure never affects a session, and
+`TOLE_NO_SESSION_INDEX=1` disables it. The index never moves a session
+across projects: `resume <id>` for a session of another project REFUSES and
+prints the command to run in that project, because this process's workspace
+jail, project config and trust were resolved for the current directory and
+would otherwise act on the wrong tree. Anyone who can write the index can
+already write the session files it points to (same home).
+
+### User config (#433)
+
+`$CODECORA_HOME/tole/config.toml` (default `~/.codecora/tole/config.toml`) has
+the project config's schema and sits below it in precedence. It is **not**
+trust-gated: it lives in the same directory as the trust store, so anyone
+who can write it can already write trust records (or set `CODECORA_HOME`).
+It is still bounded and validated like a project file (64 KiB, strict
+schema, secret-like keys refused), `--no-config` ignores it, and every face
+that refuses a hook / skill / MCP server from the command line refuses it
+from the user config too, naming the user config as the origin.

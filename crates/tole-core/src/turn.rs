@@ -20,6 +20,7 @@ use crate::register::RegisterWrite;
 use crate::state::{Pc, StateTransition};
 use crate::storage::{Commit, Storage, StorageError, UsageRecord};
 use crate::tool::{Risk, ToolRegistry};
+use crate::transcript;
 
 /// Hard ceiling on provider steps in one turn (loop-guard).
 pub const MAX_STEPS: usize = 32;
@@ -262,7 +263,9 @@ pub fn resume_turn_with_cancel(
                     &format!("replayed intent {intent_id} carried malformed arguments"),
                 )?;
             } else {
-                if let Some(outcome) = replay_intent(s, registry, intent_id, tool, input, safety)? {
+                if let Some(outcome) =
+                    replay_intent(s, registry, cancel, intent_id, tool, input, safety)?
+                {
                     return Ok(outcome);
                 }
             }
@@ -290,6 +293,7 @@ fn record_wrote(s: &mut dyn Storage) -> Result<(), StorageError> {
 fn replay_intent(
     s: &mut dyn Storage,
     registry: &ToolRegistry,
+    cancel: &CancelToken,
     intent_id: String,
     tool: String,
     input: Value,
@@ -329,6 +333,12 @@ fn replay_intent(
                 &handle,
                 "replay denied: no fresh approval for a guarded effect",
             )?;
+            // #178: a cancel that landed while the fresh approval was
+            // pending fails closed to Deny, but the turn is CANCELLED, not
+            // refused — the same contract as the fresh path in `drive`.
+            if cancel.is_cancelled() {
+                return settle_cancelled(s).map(Some);
+            }
             append_turn_error(
                 s,
                 "approval required",
@@ -473,15 +483,19 @@ fn drive(
         if cancel.is_cancelled() {
             return settle_cancelled(s);
         }
+        // Soft-interrupt safe point (#377): the previous tool has settled
+        // and the next provider call has not started.
+        deliver_interrupts(s, cancel)?;
         // No clone: complete() borrows the storage slice. (The old
         // to_vec() allocated the whole transcript every provider step.)
-        let next = match p.complete(s.entries()) {
+        // After a compaction (#440) the provider sees the summary plus the
+        // kept tail instead; without one this borrows the slice as before.
+        let next = match p.complete(&crate::compaction::view(s.entries())) {
             Ok(o) => o,
             Err(ProviderError(msg)) => {
                 // Retry classification (#58 + live 429 evidence): gateway
                 // timeouts AND rate-limit rejections are both transient.
-                const TRANSIENT: [&str; 2] = ["timeout", "429"];
-                if TRANSIENT.iter().any(|k| msg.contains(k)) && timeout_retries_left > 0 {
+                if is_transient_provider_error(&msg) && timeout_retries_left > 0 {
                     timeout_retries_left -= 1;
                     // Durable, replay-visible decision record BEFORE the
                     // retry fires (same contract as append_turn_error).
@@ -524,17 +538,24 @@ fn drive(
         // reported wire stats but no usage still leaves a record holding
         // only `tole_wire` (readers sum `prompt_tokens` etc. with a 0
         // default). Neither reported: no record, as before.
-        let usage = match (p.last_usage(), p.last_wire_stats()) {
+        let mut usage = match (p.last_usage(), p.last_wire_stats()) {
             (Some(mut u), Some(w)) => {
                 if let Some(obj) = u.as_object_mut() {
-                    obj.insert("tole_wire".to_string(), w);
+                    obj.insert(transcript::WIRE_KEY.to_string(), w);
                 }
                 Some(u)
             }
             (Some(u), None) => Some(u),
-            (None, Some(w)) => Some(json!({ "tole_wire": w })),
+            (None, Some(w)) => Some(json!({ transcript::WIRE_KEY: w })),
             (None, None) => None,
         };
+        // Issue #209: the provider that answered (and any failover) rides
+        // along under the namespaced `tole_route` key — a switch is durable.
+        if let Some(route) = p.last_route() {
+            if let Some(obj) = usage.get_or_insert_with(|| json!({})).as_object_mut() {
+                obj.insert(transcript::ROUTE_KEY.to_string(), route);
+            }
+        }
         if let Some(u) = usage {
             if let Some(last) = s.entries().last() {
                 s.commit(Commit::new().usage(UsageRecord {
@@ -553,6 +574,33 @@ fn drive(
         // output here is crash-safe by construction.
         if cancel.is_cancelled() {
             return settle_cancelled(s);
+        }
+        // Soft interrupt that landed while `complete()` was in flight
+        // (#377). Like the cancel above, the output is a pure read with no
+        // pending intent, so dropping it is crash-safe — and because the
+        // intent is never written, no `tool_use` can be left without its
+        // `tool_result`. A final answer is superseded by ANY pending
+        // interrupt (the owner is steering it); a not-yet-started tool call
+        // only by an URGENT one. Each drop is recorded durably, and the
+        // next loop pass delivers the message at the safe point.
+        let superseded = match &next {
+            ProviderOutput::Final { .. } => cancel.interrupts().has_owner(),
+            ProviderOutput::ToolCall { .. } | ProviderOutput::InvalidToolArgs { .. } => {
+                cancel.interrupts().has_urgent()
+            }
+        };
+        if superseded {
+            let what = match &next {
+                ProviderOutput::Final { .. } => "final answer".to_string(),
+                ProviderOutput::ToolCall { tool, .. }
+                | ProviderOutput::InvalidToolArgs { tool, .. } => format!("tool call {tool:?}"),
+            };
+            append_turn_error(
+                s,
+                "superseded by owner interrupt",
+                &format!("the model's {what} was withdrawn before it took effect"),
+            )?;
+            continue;
         }
         // Issue #196 phase 2: surface the model's reasoning for this
         // step (when the provider supplies one) BEFORE the step's
@@ -577,21 +625,12 @@ fn drive(
                     // the last user message count — earlier turns' tools
                     // would re-trigger history-keyed gates on every
                     // later Final of a resumed/chat session.
-                    let turn_start = s
-                        .entries()
-                        .iter()
-                        .rposition(|e| {
-                            // cora CI round 2: this loop's OWN deny
-                            // feedback is also a user-role entry — if it
-                            // counted, turn_start would jump past the
-                            // turn's tool calls on the second Final and
-                            // a presence-keyed gate would be defeated.
-                            // Hence the explicit marker is skipped.
-                            e.kind.as_str() == "message"
-                                && e.payload["role"] == json!("user")
-                                && e.payload["stop_gate_feedback"] != json!(true)
-                        })
-                        .unwrap_or(0);
+                    // cora CI round 2: this loop's OWN deny feedback is
+                    // also a user-role entry — if it counted, turn_start
+                    // would jump past the turn's tool calls on the second
+                    // Final and a presence-keyed gate would be defeated.
+                    // `opens_turn` skips that marker (and interrupts).
+                    let turn_start = transcript::current_turn_start(s.entries()).unwrap_or(0);
                     let tools_seen: Vec<(String, Risk)> = s
                         .entries()
                         .iter()
@@ -631,7 +670,7 @@ fn drive(
                             json!({
                                 "role": "user",
                                 "text": format!("stop gate: {reason}"),
-                                "stop_gate_feedback": true
+                                transcript::STOP_GATE_FEEDBACK: true
                             }),
                         )))?;
                         continue;
@@ -844,6 +883,32 @@ fn drive(
 /// Appends a durable ERROR entry under the turn's user message. No
 /// transition: the machine stays parked in Planning for the host to
 /// resolve (resume/finish) — the record exists so replay can see why.
+/// Commit every pending soft interrupt as an attributed user-role entry
+/// (#377). The marker fields keep it from opening a new turn (like the
+/// stop-gate feedback) and let hosts and readers tell an owner's steering
+/// from the original prompt; the text carries the attribution too, since
+/// that is all the provider sees.
+fn deliver_interrupts(s: &mut dyn Storage, cancel: &CancelToken) -> Result<(), StorageError> {
+    for i in cancel.interrupts().drain() {
+        let (tag, source) = match (i.source, i.urgent) {
+            (crate::interrupt::Source::Notice, _) => ("sibling notice", "notice"),
+            (crate::interrupt::Source::Owner, true) => ("owner interrupt · urgent", "owner"),
+            (crate::interrupt::Source::Owner, false) => ("owner interrupt", "owner"),
+        };
+        s.commit(Commit::new().entry(NewEntry::root(
+            EntryType::new(EntryType::MESSAGE),
+            json!({
+                "role": "user",
+                "text": format!("[{tag} — injected mid-turn, not part of the original request] {}", i.text),
+                transcript::INTERRUPT: true,
+                "source": source,
+                "urgent": i.urgent,
+            }),
+        )))?;
+    }
+    Ok(())
+}
+
 fn append_turn_error(s: &mut dyn Storage, error: &str, detail: &str) -> Result<(), StorageError> {
     let parent = s
         .entries()
@@ -878,4 +943,32 @@ fn settle_cancelled(s: &mut dyn Storage) -> Result<TurnOutcome, StorageError> {
     let seq = s.state().seq;
     s.commit(Commit::new().transition(StateTransition::from(seq, Pc::Final)))?;
     Ok(TurnOutcome::Cancelled)
+}
+
+/// Gateway timeouts and rate-limit rejections are transient (#58 + live
+/// 429 evidence). After a failover only the last provider's error counts:
+/// an earlier "timeout" must not make a fail-loud 401 look retryable.
+fn is_transient_provider_error(msg: &str) -> bool {
+    const TRANSIENT: [&str; 2] = ["timeout", "429"];
+    let lead = crate::failover::leading_error(msg);
+    TRANSIENT.iter().any(|k| lead.contains(k))
+}
+
+#[cfg(test)]
+mod transient_tests {
+    use super::is_transient_provider_error;
+
+    #[test]
+    fn only_the_last_failover_error_decides_a_retry() {
+        assert!(is_transient_provider_error("timeout: global"));
+        assert!(is_transient_provider_error(
+            "http status: 429 Too Many Requests — x"
+        ));
+        assert!(!is_transient_provider_error(
+            "http status: 401 Unauthorized — bad key [after failover from primary: timeout: global]"
+        ));
+        assert!(is_transient_provider_error(
+            "timeout: global [after failover from primary: http status: 502 Bad Gateway — a]"
+        ));
+    }
 }

@@ -1,13 +1,16 @@
 //! CLI host for tole-core: arg parsing and session wiring.
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
 use tole_cli::approver::{InteractiveApprover, StdioPrompt};
-use tole_cli::tools::WriteFileTool;
+// The binary probe backs the uteke memory loop and the cora MCP preset.
+#[cfg(any(feature = "shell-tools", feature = "mcp"))]
+use tole_cli::tool_roster::binary_available;
+use tole_cli::tool_roster::{self, AgentTools, Roster};
 use tole_cli::trust::expand_trust;
-#[cfg(feature = "mcp")]
+#[cfg(all(feature = "mcp", feature = "shell-tools"))]
 use tole_core::approval::AllowlistApprover;
 
 #[cfg(feature = "shell-tools")]
@@ -19,25 +22,11 @@ mod mission;
 #[cfg(feature = "shell-tools")]
 mod serve;
 mod upgrade;
-#[cfg(feature = "shell-tools")]
-use tole_core::cora_search::CoraSearchTool;
-use tole_core::file_tools::{DeleteFileTool, EditFileTool};
-#[cfg(feature = "shell-tools")]
-use tole_core::gh::GhTool;
-#[cfg(feature = "shell-tools")]
-use tole_core::git::GitTool;
-#[cfg(feature = "shell-tools")]
-use tole_core::jobs::{JobPollTool, JobStartTool};
-use tole_core::openai::OpenAiProvider;
-use tole_core::read_file::ReadFileTool;
-#[cfg(feature = "shell-tools")]
-use tole_core::run_command::RunCommandTool;
 use tole_core::storage::{JsonlStorage, Storage};
 use tole_core::tool::ToolRegistry;
-use tole_core::turn::{resume_turn, run_turn, run_turn_with_cancel, TurnOutcome, LOOP_TRIP_AFTER};
-#[cfg(feature = "shell-tools")]
-use tole_core::uteke::{UtekeDocumentTool, UtekeRecallTool};
-use tole_core::verify_package::VerifyPackageTool;
+use tole_core::turn::{
+    resume_turn_with_cancel, run_turn_with_cancel, TurnOutcome, LOOP_TRIP_AFTER,
+};
 
 /// Session id → path (`<dir>/<id>.jsonl`).
 fn session_path(dir: &Path, id: &str) -> PathBuf {
@@ -82,7 +71,7 @@ struct Cli {
     /// fresh session, memories relevant to the prompt are recalled from
     /// the owner's store and injected into the message; when the session
     /// settles, a compact summary is stored back. Currently `uteke`
-    /// (namespace: repo-<dir>, override: TOLE_MEMORY_NAMESPACE). Falls
+    /// (uteke room: repo-<dir>, override: TOLE_MEMORY_NAMESPACE). Falls
     /// back to the TOLE_MEMORY env.
     #[cfg(feature = "shell-tools")]
     #[arg(long, global = true)]
@@ -136,7 +125,8 @@ struct Cli {
     /// Trust preset: auto-allow the fleet's own ecosystem tools without
     /// per-call approval. `internal` = uteke_*/cora_search/mcp_cora_*/
     /// verify_package/job_*/tole_session_*; `read_only` = every safe
-    /// read. Repeatable; flag wins over the TOLE_TRUST env; `none`
+    /// read; `workspace` = `read_only` plus write_file/edit_file, which
+    /// are jailed to the workspace (#437). Repeatable; flag wins over the TOLE_TRUST env; `none`
     /// (default) = today's behavior. Pure sugar over --allow patterns —
     /// Destructive tools are never auto-allowed.
     #[arg(long, global = true)]
@@ -155,14 +145,25 @@ struct Cli {
     /// Use this project config file instead of `<cwd>/.tole/config.toml`
     /// (#208). A path named on the command line is user intent, so it is
     /// trusted without a trust record. Precedence: flag > env > config >
-    /// default. Also selects the file for `tole config check|trust|untrust`.
+    /// user config (`$CODECORA_HOME/tole/config.toml`) > default. Also selects the file for `tole config check|trust|untrust`.
     #[arg(long, global = true)]
     config: Option<PathBuf>,
 
-    /// Ignore any project config file entirely (#208): no discovery, no
-    /// trust check, no output.
+    /// Ignore the project config file AND the user config (#208, #433): no
+    /// discovery, no trust check, no output.
     #[arg(long, global = true, conflicts_with = "config")]
     no_config: bool,
+
+    /// Compact the conversation between turns once a prompt reaches this
+    /// fraction of the model's context window (#440; `chat`, `resume`,
+    /// `mission`). Default 0.8. The window comes from TOLE_CONTEXT_WINDOW /
+    /// config `context_window`, else the provider's /models.
+    #[arg(long, global = true, value_parser = parse_fraction)]
+    compact_at: Option<f64>,
+
+    /// Never compact the conversation (#440).
+    #[arg(long, global = true)]
+    no_compaction: bool,
 
     #[command(subcommand)]
     command: Command,
@@ -314,7 +315,35 @@ enum Command {
         token: Option<String>,
     },
     /// List sessions in the sessions dir, newest first.
-    Sessions,
+    Sessions {
+        /// List sessions from every project (the global session index,
+        /// #439) instead of this directory's sessions dir.
+        #[arg(long)]
+        all: bool,
+        /// With --all: only sessions whose first prompt, name or cwd
+        /// contains this text (case-insensitive).
+        #[arg(long, requires = "all")]
+        grep: Option<String>,
+    },
+
+    /// Is the configured provider/model actually usable? Tiered checks —
+    /// offline (wiring), catalog (live /models), full (chat + streaming +
+    /// a real tool-call loop), recorded in a coverage ledger. Exits
+    /// non-zero when the requested tier is not reached, so `--tier full`
+    /// is the release-validation gate.
+    Doctor {
+        /// offline | catalog | full (full spends a few real tokens).
+        #[arg(long, default_value = "catalog")]
+        tier: String,
+
+        /// Do not record this run in the ledger.
+        #[arg(long)]
+        no_ledger: bool,
+
+        /// Only print the ledger summary (READY n-of-m); run nothing.
+        #[arg(long)]
+        summary: bool,
+    },
 
     /// Show durable state of a session.
     Status {
@@ -492,6 +521,16 @@ fn gate_policy(cmd: &Command) -> GatePolicy {
 
 /// What the command line supplied for the config-applied keys. ONE place,
 /// shared by startup and `tole config check`.
+/// `--compact-at`: a fraction in (0, 1].
+fn parse_fraction(s: &str) -> std::result::Result<f64, String> {
+    let v: f64 = s.parse().map_err(|_| format!("{s:?} is not a number"))?;
+    if v > 0.0 && v <= 1.0 {
+        Ok(v)
+    } else {
+        Err(format!("must be greater than 0 and at most 1, got {v}"))
+    }
+}
+
 fn config_flags(cli: &Cli) -> tole_cli::config_apply::Flags {
     let mut f = tole_cli::config_apply::Flags {
         sessions_dir: cli.sessions_dir.clone(),
@@ -503,6 +542,8 @@ fn config_flags(cli: &Cli) -> tole_cli::config_apply::Flags {
         skill: cli.skill.clone(),
         plan_mode: cli.plan_mode,
         no_skills: cli.no_skills,
+        compact_at: cli.compact_at,
+        no_compaction: cli.no_compaction,
         ..Default::default()
     };
     #[cfg(feature = "shell-tools")]
@@ -567,9 +608,11 @@ fn dispatch(cli: Cli) -> Result<()> {
         let explicit = cli.config.as_deref();
         return match action {
             ConfigAction::Check => {
+                let user = tole_cli::config::user_config_path();
                 let out = config_apply::check(
                     &cwd,
                     explicit,
+                    user.as_deref(),
                     &config_flags(&cli),
                     &config_apply::real_env,
                 )?;
@@ -626,7 +669,22 @@ fn dispatch(cli: Cli) -> Result<()> {
             Err(_) => None,
         }
     };
-    let cfg = project_config.map(|l| l.config);
+    // User config (#433): same commands, same `--no-config`; no trust gate.
+    let user_config = if policy == GatePolicy::Skip || cli.no_config {
+        None
+    } else {
+        config_apply::load_user_config(
+            tole_cli::config::user_config_path().as_deref(),
+            &mut config_apply::StartupIo::new(false),
+        )?
+    };
+    let cfg = match (project_config, user_config) {
+        (None, None) => None,
+        (p, u) => Some(tole_cli::config::layered(
+            &p.map(|l| l.config).unwrap_or_default(),
+            &u.map(|l| l.config).unwrap_or_default(),
+        )),
+    };
     if let Some(cfg) = &cfg {
         // A key this build cannot honor is a loud startup error, never a
         // silent ignore (the matching flag does not exist here).
@@ -698,6 +756,11 @@ fn dispatch(cli: Cli) -> Result<()> {
         memory: resolve_memory(settings.memory.as_ref().map(|m| m.value.as_str()))?,
         #[cfg(not(feature = "shell-tools"))]
         memory: (),
+        compaction: tole_cli::compaction_host::CompactionSettings {
+            enabled: !settings.no_compaction.value,
+            at: settings.compact_at.value,
+            window: settings.context_window.as_ref().map(|w| w.value),
+        },
     };
     // Trust presets (issue #159): expand once, before dispatch — every
     // allow_patterns-consuming subcommand appends these. --trust >
@@ -705,6 +768,23 @@ fn dispatch(cli: Cli) -> Result<()> {
     // list (the env splits on commas/whitespace so one variable can carry
     // several presets).
     let trust_extra = expand_trust(&config_apply::values(&settings.trust))?;
+    // `--trust workspace` (#437) needs an explicit workspace that is not a
+    // home / filesystem root; resolved only when the preset is used.
+    let trust_names = config_apply::values(&settings.trust);
+    if trust_names
+        .iter()
+        .any(|p| p.eq_ignore_ascii_case("workspace"))
+    {
+        let root = match &settings.workspace {
+            Some(w) => Some(resolve_workspace_root(Some(&w.value))?),
+            None => None,
+        };
+        tole_cli::trust::check_workspace_root(
+            &trust_names,
+            root.as_deref(),
+            std::env::var_os("HOME").map(PathBuf::from).as_deref(),
+        )?;
+    }
 
     match cli.command {
         // Handled at the top of `dispatch`, before any session/env state.
@@ -840,7 +920,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             if host.plan_mode {
                 return Err(refuse(
                     "--plan-mode has no meaning for a mission (missions mutate by definition)",
-                    settings.plan_mode.source == config_apply::Source::Config,
+                    config_layer(settings.plan_mode.source),
                 ));
             }
             // Issue #258 (rescan #46, scan-3 #9 rule): global flags must
@@ -871,7 +951,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                     settings
                         .memory
                         .as_ref()
-                        .is_some_and(|m| m.source == config_apply::Source::Config),
+                        .and_then(|m| config_layer(m.source)),
                 ));
             }
             check_server_face_flags("mission", &host, &settings, explicit_mcp)?;
@@ -888,28 +968,8 @@ fn dispatch(cli: Cli) -> Result<()> {
             let sessions_dir = sessions_dir.clone();
             std::fs::create_dir_all(&sessions_dir)
                 .with_context(|| format!("creating {}", sessions_dir.display()))?;
-            #[cfg(feature = "mcp")]
-            let mcp_cfgs: Vec<tole_core::mcp::McpServerConfig> = host
-                .mcp_server
-                .iter()
-                .map(|s| tole_core::mcp::McpServerConfig::parse(s))
-                .collect::<Result<Vec<_>, String>>()
-                .map_err(anyhow::Error::msg)?;
-            #[cfg(feature = "mcp")]
-            let registry = build_registry(
-                build_approver(&allow_patterns, yes),
-                host.workspace.as_ref(),
-                &mcp_cfgs,
-                host.agents_worktree,
-                &allow_patterns,
-            )?;
-            #[cfg(not(feature = "mcp"))]
-            let registry = build_registry(
-                build_approver(&allow_patterns, yes),
-                host.workspace.as_ref(),
-                host.agents_worktree,
-                &allow_patterns,
-            )?;
+            let registry =
+                build_registry(build_approver(&allow_patterns, yes), &host, &allow_patterns)?;
             mission::run_mission(
                 mission::MissionConfig {
                     goal,
@@ -920,6 +980,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                     verify: settings.verify.as_ref().map(|v| v.value.clone()),
                     verify_timeout_secs: settings.verify_timeout.value,
                     resume_id: resume,
+                    compaction: host.compaction,
                 },
                 registry,
                 &sessions_dir,
@@ -1028,7 +1089,28 @@ fn dispatch(cli: Cli) -> Result<()> {
                 turnend: host.on_turnend.clone(),
             })
         }
-        Command::Sessions => sessions_command(&sessions_dir),
+        Command::Sessions { all: false, .. } => sessions_command(&sessions_dir),
+        Command::Sessions { all: true, grep } => all_sessions_command(grep.as_deref()),
+        Command::Doctor {
+            tier,
+            no_ledger,
+            summary,
+        } => {
+            if summary {
+                tole_cli::doctor::print_summary().map_err(|e| anyhow!(e))?;
+                return Ok(());
+            }
+            let Some(tier) = tole_cli::doctor::Tier::parse(&tier) else {
+                bail!("--tier must be offline, catalog or full (got {tier:?})");
+            };
+            let cfg = config_apply::provider_config();
+            let ok =
+                tole_cli::doctor::run_cli(cfg.as_ref(), &config_apply::real_env, tier, no_ledger);
+            if !ok {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
         Command::Status { id } => status_command(&sessions_dir, &id),
         Command::Chat {
             system: _,
@@ -1085,6 +1167,8 @@ struct HostConfig {
     memory: (),
     #[cfg(feature = "shell-tools")]
     memory: Option<tole_core::memory::MemoryConfig>,
+    /// Context compaction between turns (#440).
+    compaction: tole_cli::compaction_host::CompactionSettings,
 }
 
 impl HostConfig {
@@ -1098,49 +1182,30 @@ impl HostConfig {
 
 #[cfg(feature = "shell-tools")]
 impl HostConfig {
-    /// Pre-turn recall injection (memory loop): the returned prompt is
-    /// what the provider sees and what the durable log records. Any
-    /// failure degrades to the bare prompt — memory is an enhancement,
-    /// never a dependency.
+    /// Pre-turn recall injection (memory loop), see
+    /// [`tole_cli::turn_runner::with_recalled_memory`].
     fn inject_memory(&self, prompt: &str) -> String {
-        let Some(mem) = self.memory.as_ref() else {
-            return prompt.to_string();
-        };
-        match tole_core::memory::recall_block(mem, prompt) {
-            Ok(block) if !block.is_empty() => {
-                eprintln!(
-                    "tole: memory: recalled context injected ({})",
-                    mem.namespace
-                );
-                format!("{prompt}{block}")
-            }
-            Ok(_) => prompt.to_string(),
-            Err(e) => {
-                eprintln!("tole: memory recall failed (continuing without): {e}");
-                prompt.to_string()
-            }
-        }
+        tole_cli::turn_runner::with_recalled_memory(self.memory.as_ref(), prompt)
     }
 
-    /// Post-session summary (memory loop): best-effort, stderr on
-    /// failure, the session itself is never affected.
+    /// Post-session summary (memory loop), see
+    /// [`tole_cli::turn_runner::remember`].
     fn remember(&self, session_id: &str, first_prompt: &str, last_answer: &str, wrote: bool) {
-        let Some(mem) = self.memory.as_ref() else {
-            return;
-        };
-        match tole_core::memory::remember_session(mem, session_id, first_prompt, last_answer, wrote)
-        {
-            Ok(_) => eprintln!("tole: memory: session summary stored in {}", mem.namespace),
-            Err(e) => eprintln!("tole: memory remember failed (session unaffected): {e}"),
-        }
+        tole_cli::turn_runner::remember(
+            self.memory.as_ref(),
+            session_id,
+            first_prompt,
+            last_answer,
+            wrote,
+        );
     }
 }
 
 /// Memory backend resolution: `chosen` is the already-resolved backend
 /// name (`--memory` flag > `TOLE_MEMORY` env > project config, see
-/// `config_apply::Settings`); `uteke` is the only backend. The namespace follows
+/// `config_apply::Settings`); `uteke` is the only backend. The room follows
 /// the ecosystem `repo-<dir>` convention unless `TOLE_MEMORY_NAMESPACE`
-/// overrides it. A missing uteke binary degrades to a warning + no-op
+/// (kept under its old name) overrides it. A missing uteke binary degrades to a warning + no-op
 /// (the same probe contract as the uteke tools).
 #[cfg(feature = "shell-tools")]
 fn resolve_memory(chosen: Option<&str>) -> Result<Option<tole_core::memory::MemoryConfig>> {
@@ -1160,10 +1225,10 @@ fn resolve_memory(chosen: Option<&str>) -> Result<Option<tole_core::memory::Memo
         return Ok(None);
     }
     let mut cfg = tole_core::memory::MemoryConfig::for_cwd("uteke", &std::env::current_dir()?);
-    if let Ok(ns) = std::env::var("TOLE_MEMORY_NAMESPACE") {
+    if let Ok(ns) = std::env::var(tole_core::child_env::MEMORY_ROOM) {
         let ns = ns.trim();
         if !ns.is_empty() {
-            cfg.namespace = tole_core::memory::sanitize_namespace(ns);
+            cfg.room = tole_core::memory::sanitize_namespace(ns);
         }
     }
     Ok(Some(cfg))
@@ -1210,43 +1275,6 @@ fn merge_mcp_specs(explicit: &[String], no_auto_mcp: bool, auto: Vec<String>) ->
     specs
 }
 
-/// B4 startup probing: a binary exists on PATH (or is an executable
-/// absolute path). Used to skip CLI-backed tools whose engine is not
-/// installed, instead of registering phantom tools that fail on every
-/// call.
-#[cfg_attr(not(feature = "shell-tools"), allow(dead_code))] // probes only run with shell-tools (#330)
-fn binary_available(name: &str) -> bool {
-    fn executable(p: &Path) -> bool {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            // is_file() alone accepts non-executable files; a probe that
-            // says "available" for an unrunnable binary is a phantom tool
-            // by another name (CodeCora scan 2026-09-18).
-            std::fs::metadata(p)
-                .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-                .unwrap_or(false)
-        }
-        #[cfg(not(unix))]
-        {
-            // Windows: PATH lookups append extensions (".exe"); probe the
-            // obvious one rather than declaring a runnable binary absent.
-            p.is_file() || p.with_extension("exe").is_file()
-        }
-    }
-    if name.contains('/') {
-        return executable(Path::new(name));
-    }
-    if let Ok(path) = std::env::var("PATH") {
-        for dir in std::env::split_paths(&path) {
-            if executable(&dir.join(name)) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
 /// Resolve the file-tools jail root: `--workspace <dir>` when given,
 /// otherwise the process cwd (issue #57). The directory must exist — a
 /// typo silently widening the jail to cwd would be worse than failing.
@@ -1265,22 +1293,6 @@ pub fn resolve_workspace_root(explicit: Option<&String>) -> Result<PathBuf> {
         }
         None => std::env::current_dir().context("resolving cwd"),
     }
-}
-
-/// Ask the checkout itself which GitHub repo it belongs to ( Falls back
-/// to None → callers keep the tole default).
-#[cfg(feature = "shell-tools")]
-fn detect_github_repo(cwd: &Path) -> Option<String> {
-    use std::process::Command;
-    let mut cmd = Command::new("git");
-    cmd.args(["config", "--get", "remote.origin.url"])
-        .current_dir(cwd);
-    let out = tole_core::subprocess::run_with_timeout(&mut cmd, std::time::Duration::from_secs(5))
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    tole_cli::session_host::github_repo_from_remote_url(&String::from_utf8_lossy(&out.stdout))
 }
 
 /// Flag-over-env trust list (the pre-config rule, #159), kept as a thin
@@ -1351,28 +1363,42 @@ fn check_client_session_flags(
     Ok(())
 }
 
-/// A refusal that may stem from the project config rather than the command
-/// line: the message is the flag's, plus (for config-sourced values) the way
-/// out. A safety hook / policy that arrives from the config must never be
-/// silently dropped on a face that cannot honor it.
-fn refuse(msg: &str, from_config: bool) -> anyhow::Error {
-    if from_config {
-        anyhow::anyhow!(
-            "{msg} (the value comes from the project config; \
-             use --no-config to ignore the project config)"
-        )
-    } else {
-        anyhow::anyhow!("{msg}")
+/// A refusal that may stem from a config file rather than the command
+/// line: the message is the flag's, plus (for config-sourced values) the
+/// file it came from and the way out. A safety hook / policy that arrives
+/// from a config must never be silently dropped on a face that cannot
+/// honor it.
+fn refuse(msg: &str, layer: Option<tole_cli::config_apply::Source>) -> anyhow::Error {
+    match layer {
+        Some(layer) => anyhow::anyhow!(
+            "{msg} (the value comes from the {}; \
+             use --no-config to ignore the config files)",
+            match layer {
+                tole_cli::config_apply::Source::UserConfig => "user config",
+                _ => "project config",
+            }
+        ),
+        None => anyhow::anyhow!("{msg}"),
     }
 }
 
-fn from_config<T>(e: &tole_cli::config_apply::ListEff<T>) -> bool {
-    e.as_ref()
-        .is_some_and(|e| e.source == tole_cli::config_apply::Source::Config)
+/// The config layer a value came from, if it came from a config file
+/// (project or user, #433).
+fn config_layer(s: tole_cli::config_apply::Source) -> Option<tole_cli::config_apply::Source> {
+    use tole_cli::config_apply::Source;
+    matches!(s, Source::Config | Source::UserConfig).then_some(s)
 }
 
-fn pretool_from_config(s: &tole_cli::config_apply::Settings) -> bool {
-    from_config(&s.on_pretool) || from_config(&s.on_posttool)
+fn from_config<T>(
+    e: &tole_cli::config_apply::ListEff<T>,
+) -> Option<tole_cli::config_apply::Source> {
+    e.as_ref().and_then(|e| config_layer(e.source))
+}
+
+fn pretool_from_config(
+    s: &tole_cli::config_apply::Settings,
+) -> Option<tole_cli::config_apply::Source> {
+    from_config(&s.on_pretool).or_else(|| from_config(&s.on_posttool))
 }
 
 /// [`check_client_session_flags`] over the EFFECTIVE (post-config) values;
@@ -1388,187 +1414,53 @@ fn check_server_face_flags(
         let cfg = if !host.skills.is_empty() {
             from_config(&settings.skill)
         } else if host.no_skills {
-            settings.no_skills.source == tole_cli::config_apply::Source::Config
+            config_layer(settings.no_skills.source)
         } else {
             from_config(&settings.mcp_server)
         };
+        // An exported TOLE_SKILL reaches every face: name it, or the
+        // refusal would point at a --skill flag nobody typed.
+        let from_env = !host.skills.is_empty()
+            && settings
+                .skill
+                .as_ref()
+                .is_some_and(|s| s.source == tole_cli::config_apply::Source::Env);
+        if from_env {
+            return anyhow::anyhow!(
+                "{e} (the value comes from {}; unset it for this face)",
+                tole_cli::config_apply::SKILL_ENV
+            );
+        }
         refuse(&e.to_string(), cfg)
     })
 }
 
-/// Register the `gh` tool against the checkout's own GitHub repo.
-/// Probe-gated (issues #254, #293): when detection fails there is NO
-/// gh tool — a hardcoded fallback repo invited wrong-repo writes from
-/// any unrelated workspace.
-#[cfg(feature = "shell-tools")]
-fn register_gh(reg: &mut ToolRegistry, cwd: &Path) -> Result<()> {
-    match detect_github_repo(cwd) {
-        Some(repo) => reg
-            .register(Box::new(GhTool::new(repo)))
-            .map_err(|e| anyhow::anyhow!("registering gh: {e}")),
-        None => {
-            eprintln!("tole: no GitHub origin remote detected — gh tool not registered");
-            Ok(())
-        }
-    }
-}
-
+/// The CLI faces' registry: the shared tool roster behind the
+/// interactive approver.
 fn build_registry(
     approver: InteractiveApprover<StdioPrompt>,
-    workspace: Option<&String>,
-    #[cfg(feature = "mcp")] mcp_servers: &[tole_core::mcp::McpServerConfig],
-    agents_worktree: bool,
-    parent_allows: &[String],
+    host: &HostConfig,
+    allow_patterns: &[String],
 ) -> Result<ToolRegistry> {
-    // Child-agent depth (#171): spawned children carry TOLE_AGENT_DEPTH=1;
-    // at depth >= 1 the agent tools vanish (structural cap) and the
-    // spawn-yourself bypass closes in run_command/job_start.
-    let agent_depth: u32 = std::env::var("TOLE_AGENT_DEPTH")
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(0);
-    let mut reg = ToolRegistry::with_approver(approver);
-    // Only the shell-tools registrations read cwd (#330).
-    #[cfg_attr(not(feature = "shell-tools"), allow(unused_variables))]
-    let cwd = std::env::current_dir().context("resolving cwd")?;
-    let file_root = resolve_workspace_root(workspace)?;
-    // Uteke first-class (B4): recall (read) + document (write), behind
-    // startup probing — a missing uteke binary degrades to a warning,
-    // not phantom tools.
-    #[cfg(feature = "shell-tools")]
-    if binary_available("uteke") {
-        reg.register(Box::new(UtekeRecallTool::new()))
-            .map_err(|e| anyhow::anyhow!("registering uteke_recall: {e}"))?;
-        reg.register(Box::new(UtekeDocumentTool::new(None)))
-            .map_err(|e| anyhow::anyhow!("registering uteke_document: {e}"))?;
-    } else {
-        eprintln!("tole: uteke binary not found — uteke_recall/uteke_document disabled");
-    }
-    // Generic dynamic command (B4): argv-split, cwd-jailed, Risk::Write.
-    #[cfg(feature = "shell-tools")]
-    {
-        let run_cmd = RunCommandTool::new(cwd.clone());
-        let run_cmd = if std::env::var("TOLE_AGENT_DEPTH")
-            .ok()
-            .and_then(|v| v.trim().parse::<u32>().ok())
-            .unwrap_or(0)
-            >= 1
-        {
-            run_cmd.in_child_agent_mode()
-        } else {
-            run_cmd
-        };
-        reg.register(Box::new(run_cmd))
-            .map_err(|e| anyhow::anyhow!("registering run_command: {e}"))?;
-    }
-    // Long-running jobs (#59): detached spawn + poll, logs inside the
-    // file-tools workspace so read_file can reach the full log.
-    #[cfg(feature = "shell-tools")]
-    {
-        let job_start = JobStartTool::new(file_root.clone());
-        let job_start = if std::env::var("TOLE_AGENT_DEPTH")
-            .ok()
-            .and_then(|v| v.trim().parse::<u32>().ok())
-            .unwrap_or(0)
-            >= 1
-        {
-            job_start.in_child_agent_mode()
-        } else {
-            job_start
-        };
-        reg.register(Box::new(job_start))
-            .map_err(|e| anyhow::anyhow!("registering job_start: {e}"))?;
-    }
-    #[cfg(feature = "shell-tools")]
-    reg.register(Box::new(JobPollTool::new(file_root.clone())))
-        .map_err(|e| anyhow::anyhow!("registering job_poll: {e}"))?;
-    reg.register(Box::new(VerifyPackageTool::new()))
-        .map_err(|e| anyhow::anyhow!("registering verify_package: {e}"))?;
-    // systemone_decide (#172): probe-gated — present iff SYSTEMONE_API_KEY
-    // is set; absent key = silently off (owner decision 2026-10-05).
-    if let Some(t) = tole_core::systemone::SystemOneTool::from_env() {
-        reg.register(Box::new(t))
-            .map_err(|e| anyhow::anyhow!("registering systemone_decide: {e}"))?;
-    }
-    // Child agents (#171): parent-only. Depth >= 1 = this IS a child —
-    // no agent tools at all (the structural depth cap).
-    if agent_depth == 0 {
-        let bin = std::env::current_exe().context("resolving the tole binary for child agents")?;
-        let start = tole_core::agents::AgentStartTool::new(bin, file_root.clone())
-            .with_worktrees(agents_worktree)
-            .with_parent_allows(parent_allows.to_vec());
-        reg.register(Box::new(start))
-            .map_err(|e| anyhow::anyhow!("registering agent_start: {e}"))?;
-        reg.register(Box::new(tole_core::agents::AgentPollTool::new(
-            file_root.clone(),
-        )))
-        .map_err(|e| anyhow::anyhow!("registering agent_poll: {e}"))?;
-    }
-    reg.register(Box::new(ReadFileTool::new(file_root.clone())))
-        .map_err(|e| anyhow::anyhow!("registering read_file: {e}"))?;
-    // Web tools (issue #215): probe-first — fetch always; search only
-    // with TOLE_WEB_SEARCH_URL.
-    reg.register(Box::new(tole_core::web::WebFetchTool))
-        .map_err(|e| anyhow::anyhow!("registering web_fetch: {e}"))?;
-    if tole_core::web::WebSearchTool::from_env().is_some() {
-        reg.register(Box::new(tole_core::web::WebSearchTool::from_env().unwrap()))
-            .map_err(|e| anyhow::anyhow!("registering web_search: {e}"))?;
-    }
-    // Write tools: gated per call. The jail root is the workspace.
-    reg.register(Box::new(WriteFileTool::new(file_root.clone())))
-        .map_err(|e| anyhow::anyhow!("registering write_file: {e}"))?;
-    reg.register(Box::new(EditFileTool::new(file_root.clone())))
-        .map_err(|e| anyhow::anyhow!("registering edit_file: {e}"))?;
-    #[cfg(feature = "shell-tools")]
-    {
-        register_gh(&mut reg, &cwd)?;
-        tole_cli::session_host::register_gitea(&mut reg, &cwd);
-    }
-    // Light git: status/diff/add/commit (push stays human).
-    #[cfg(feature = "shell-tools")]
-    reg.register(Box::new(GitTool::new().in_dir(cwd.clone())))
-        .map_err(|e| anyhow::anyhow!("registering git: {e}"))?;
-    // Destructive tools: interactive-approver-only registration; every
-    // call prompts — allowlists and --yes never apply (PRD risk table).
-    reg.register(Box::new(DeleteFileTool::new(file_root)))
-        .map_err(|e| anyhow::anyhow!("registering delete_file: {e}"))?;
-    // MCP servers (#74): registered last so a slow server never blocks
-    // native tool availability; per-call approval applies as usual.
+    let mut roster = Roster::new(resolve_workspace_root(host.workspace.as_ref())?);
+    // CLI faces run shell tools in the process cwd; files stay jailed to
+    // the workspace.
+    roster.shell_dir = std::env::current_dir().context("resolving cwd")?;
+    roster.plan_mode = host.plan_mode;
+    roster.agents = Some(AgentTools {
+        worktrees: host.agents_worktree,
+        parent_allows: allow_patterns.to_vec(),
+    });
     #[cfg(feature = "mcp")]
-    let mut cora_mcp_tools = 0usize;
-    #[cfg(feature = "mcp")]
-    for cfg in mcp_servers {
-        let names = tole_core::mcp::register_server_tools(&mut reg, cfg);
-        #[cfg(feature = "mcp")]
-        if cfg.name == "cora" {
-            cora_mcp_tools = names.len();
-        }
-        if names.is_empty() {
-            eprintln!("tole: mcp[{}]: no tools registered", cfg.name);
-        }
-    }
-    // Native cora_search (E4): single-tool fallback, registered only when
-    // the cora MCP surface did NOT materialize — decision is based on the
-    // REGISTRATION OUTCOME, not config presence: a cora binary whose MCP
-    // server fails (handshake, old version) must degrade to the native
-    // tool instead of silently losing all code-intel (CodeCora finding).
-    // The full MCP toolset supersedes the fallback when it registered.
-    #[cfg(feature = "shell-tools")]
     {
-        #[cfg(feature = "mcp")]
-        let cora_mcp_ok = cora_mcp_tools > 0;
-        #[cfg(not(feature = "mcp"))]
-        let cora_mcp_ok = false;
-        if !cora_mcp_ok {
-            if binary_available("cora") {
-                reg.register(Box::new(CoraSearchTool::new()))
-                    .map_err(|e| anyhow::anyhow!("registering cora_search: {e}"))?;
-            } else {
-                eprintln!("tole: cora binary not found — cora_search disabled");
-            }
-        }
+        roster.mcp_servers = host
+            .mcp_server
+            .iter()
+            .map(|s| tole_core::mcp::McpServerConfig::parse(s))
+            .collect::<Result<Vec<_>, String>>()
+            .map_err(anyhow::Error::msg)?;
     }
-    Ok(reg)
+    tool_roster::build(approver, roster)
 }
 
 /// Server-mode registry: the same hardened tools as `build_registry`,
@@ -1580,86 +1472,18 @@ fn build_registry(
 fn build_server_registry(
     workspace: Option<&String>,
     allow_patterns: &[String],
+    plan_mode: bool,
 ) -> Result<ToolRegistry> {
-    let mut reg =
-        ToolRegistry::with_approver(AllowlistApprover::allow_only(allow_patterns.to_vec()));
-    let cwd = std::env::current_dir().context("resolving cwd")?;
-    let file_root = resolve_workspace_root(workspace)?;
-    let count = |reg: &ToolRegistry| reg.specs().len();
-
-    #[cfg(feature = "shell-tools")]
-    {
-        if binary_available("cora") {
-            reg.register(Box::new(CoraSearchTool::new()))
-                .map_err(|e| anyhow::anyhow!("registering cora_search: {e}"))?;
-        }
-        if binary_available("uteke") {
-            reg.register(Box::new(UtekeRecallTool::new()))
-                .map_err(|e| anyhow::anyhow!("registering uteke_recall: {e}"))?;
-            reg.register(Box::new(UtekeDocumentTool::new(None)))
-                .map_err(|e| anyhow::anyhow!("registering uteke_document: {e}"))?;
-        }
-        let run_cmd = RunCommandTool::new(cwd.clone());
-        let run_cmd = if std::env::var("TOLE_AGENT_DEPTH")
-            .ok()
-            .and_then(|v| v.trim().parse::<u32>().ok())
-            .unwrap_or(0)
-            >= 1
-        {
-            run_cmd.in_child_agent_mode()
-        } else {
-            run_cmd
-        };
-        reg.register(Box::new(run_cmd))
-            .map_err(|e| anyhow::anyhow!("registering run_command: {e}"))?;
-        let job_start = JobStartTool::new(file_root.clone());
-        let job_start = if std::env::var("TOLE_AGENT_DEPTH")
-            .ok()
-            .and_then(|v| v.trim().parse::<u32>().ok())
-            .unwrap_or(0)
-            >= 1
-        {
-            job_start.in_child_agent_mode()
-        } else {
-            job_start
-        };
-        reg.register(Box::new(job_start))
-            .map_err(|e| anyhow::anyhow!("registering job_start: {e}"))?;
-        reg.register(Box::new(JobPollTool::new(file_root.clone())))
-            .map_err(|e| anyhow::anyhow!("registering job_poll: {e}"))?;
-    }
-    reg.register(Box::new(VerifyPackageTool::new()))
-        .map_err(|e| anyhow::anyhow!("registering verify_package: {e}"))?;
-    // systemone_decide (#172): probe-gated — present iff SYSTEMONE_API_KEY
-    // is set; absent key = silently off (owner decision 2026-10-05).
-    if let Some(t) = tole_core::systemone::SystemOneTool::from_env() {
-        reg.register(Box::new(t))
-            .map_err(|e| anyhow::anyhow!("registering systemone_decide: {e}"))?;
-    }
-    reg.register(Box::new(ReadFileTool::new(file_root.clone())))
-        .map_err(|e| anyhow::anyhow!("registering read_file: {e}"))?;
-    // Web tools (issue #215): probe-first — fetch always; search only
-    // with TOLE_WEB_SEARCH_URL.
-    reg.register(Box::new(tole_core::web::WebFetchTool))
-        .map_err(|e| anyhow::anyhow!("registering web_fetch: {e}"))?;
-    if tole_core::web::WebSearchTool::from_env().is_some() {
-        reg.register(Box::new(tole_core::web::WebSearchTool::from_env().unwrap()))
-            .map_err(|e| anyhow::anyhow!("registering web_search: {e}"))?;
-    }
-    reg.register(Box::new(WriteFileTool::new(file_root.clone())))
-        .map_err(|e| anyhow::anyhow!("registering write_file: {e}"))?;
-    reg.register(Box::new(EditFileTool::new(file_root.clone())))
-        .map_err(|e| anyhow::anyhow!("registering edit_file: {e}"))?;
-    #[cfg(feature = "shell-tools")]
-    {
-        register_gh(&mut reg, &cwd)?;
-        tole_cli::session_host::register_gitea(&mut reg, &cwd);
-        reg.register(Box::new(GitTool::new().in_dir(cwd.clone())))
-            .map_err(|e| anyhow::anyhow!("registering git: {e}"))?;
-    }
-    // delete_file (Destructive) is deliberately NOT registered: behind a
-    // non-interactive approver the registry refuses it structurally.
-    eprintln!("tole mcp: {} tool(s) registered", count(&reg));
+    let mut roster = Roster::new(resolve_workspace_root(workspace)?);
+    roster.shell_dir = std::env::current_dir().context("resolving cwd")?;
+    roster.plan_mode = plan_mode;
+    // No child agents and no MCP client tools behind an MCP server face;
+    // delete_file (Destructive) is absent behind the allowlist approver.
+    let reg = tool_roster::build(
+        AllowlistApprover::allow_only(allow_patterns.to_vec()),
+        roster,
+    )?;
+    eprintln!("tole mcp: {} tool(s) registered", reg.specs().len());
     Ok(reg)
 }
 
@@ -1667,16 +1491,16 @@ fn build_server_registry(
 /// hardened tools as stdio MCP (D1); the session tools join separately
 /// via RegistryServer::with_extra_tools.
 #[cfg(all(feature = "mcp-http", feature = "shell-tools"))]
-fn build_server_registry_for_mcp(plan_mode: bool) -> Result<ToolRegistry> {
+fn build_server_registry_for_mcp(
+    workspace: Option<&String>,
+    plan_mode: bool,
+) -> Result<ToolRegistry> {
     // Empty allowlist: the session tools carry their own approver per
     // session; registry Write tools stay pre-auth-off (deny by default).
-    let mut registry = build_server_registry(None, &[])?;
-    // Plan mode (#294): same retain_read_only semantics as the other
-    // faces — Write/Destructive tools are absent, not merely denied.
-    if plan_mode {
-        registry.retain_read_only();
-    }
-    Ok(registry)
+    // `--workspace` roots the server-level file tools exactly like the
+    // stdio `tole mcp` face — without it they jailed to the process cwd.
+    // Plan mode (#294): the roster's absence semantics, as on every face.
+    build_server_registry(workspace, &[], plan_mode)
 }
 
 /// D1 (issue #94): serve the registry over MCP stdio. Blocks until the
@@ -1693,15 +1517,9 @@ fn mcp_server_command(
     allow_patterns: &[String],
     plan_mode: bool,
 ) -> Result<()> {
-    let registry = build_server_registry(workspace, allow_patterns)?;
     // Plan mode (issue #109) applies to server mode too (cora scan-3
     // #9): serve read-only tools only when the operator asked for it.
-    let mut registry = registry;
-    if plan_mode {
-        let mut reg = registry;
-        reg.retain_read_only();
-        registry = reg;
-    }
+    let registry = build_server_registry(workspace, allow_patterns, plan_mode)?;
     tokio::runtime::Runtime::new()
         .context("creating tokio runtime")?
         .block_on(tole_core::mcp_server::serve_stdio(registry))
@@ -1712,6 +1530,31 @@ fn mcp_server_command(
 // ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
+
+/// The cora agent-as-reviewer flow (#422, cora >= 0.19): the calling
+/// model judges a diff itself, so cora needs no LLM key. Named in the
+/// system prompt only when both tools are registered (absent in plan
+/// mode, where MCP tools are filtered out, and without `cora mcp`).
+const CORA_REVIEW_SECTION: &str = "\n\n# Code review\nTo review a change: get its \
+unified diff (e.g. `git diff --cached` or `git diff <base>`), call \
+mcp_cora_cora_review_prepare with it, judge the diff yourself following \
+the returned instructions and response_schema, then call \
+mcp_cora_cora_review_finalize with the SAME diff and your findings (a JSON \
+array, [] when none) and report its verdict, including should_block.";
+
+fn review_section(registry: &ToolRegistry) -> &'static str {
+    let attached = [
+        "mcp_cora_cora_review_prepare",
+        "mcp_cora_cora_review_finalize",
+    ]
+    .iter()
+    .all(|name| registry.get(name).is_some());
+    if attached {
+        CORA_REVIEW_SECTION
+    } else {
+        ""
+    }
+}
 
 /// Skills wiring (issue #161): shared by run/chat/serve. Loads `--skill`
 /// files (loud error on broken ones), and when the workspace exposes a
@@ -1783,35 +1626,11 @@ fn run_command(
     name: Option<&str>,
     timeout_secs: Option<u64>,
 ) -> Result<()> {
-    let cfg = tole_cli::config_apply::provider_config().context(
-        "missing provider config: set TOLE_BASE_URL / TOLE_MODEL / TOLE_API_KEY \
-         (or the OPENAI_* equivalents)",
-    )?;
+    let cfg = tole_cli::turn_runner::provider_config().map_err(anyhow::Error::msg)?;
     // Build everything that can fail BEFORE the session file exists, so a
     // failed startup does not leave a stray empty session polluting
     // `sessions` / `--last` (CodeCora scan 2026-09-18).
-    #[cfg(feature = "mcp")]
-    let mcp_cfgs: Vec<tole_core::mcp::McpServerConfig> = host
-        .mcp_server
-        .iter()
-        .map(|s| tole_core::mcp::McpServerConfig::parse(s))
-        .collect::<Result<Vec<_>, String>>()
-        .map_err(anyhow::Error::msg)?;
-    #[cfg(feature = "mcp")]
-    let mut registry = build_registry(
-        build_approver(allow_patterns, yes),
-        host.workspace.as_ref(),
-        &mcp_cfgs,
-        host.agents_worktree,
-        allow_patterns,
-    )?;
-    #[cfg(not(feature = "mcp"))]
-    let mut registry = build_registry(
-        build_approver(allow_patterns, yes),
-        host.workspace.as_ref(),
-        host.agents_worktree,
-        allow_patterns,
-    )?;
+    let mut registry = build_registry(build_approver(allow_patterns, yes), host, allow_patterns)?;
     // Plan mode (issue #109): the guarantee is ABSENCE on the wire, not
     // approval — filtered tools never appear in specs().
     if host.plan_mode {
@@ -1844,8 +1663,10 @@ fn run_command(
         .map(str::to_string)
         .or_else(resolve_system_prompt)
         .or_else(|| Some(build_default_prompt(host.plan_mode)));
-    // Skills (issue #161): skill sections append after the base prompt.
-    let system_prompt = system_prompt.map(|p| format!("{p}{skill_sections}"));
+    // Skills (issue #161): skill sections append after the base prompt,
+    // after the cora review flow when its tools are attached (#422).
+    let review = review_section(&registry);
+    let system_prompt = system_prompt.map(|p| format!("{p}{review}{skill_sections}"));
     let mut storage = JsonlStorage::create_named(
         sessions_dir,
         &session_id,
@@ -1854,31 +1675,22 @@ fn run_command(
         name,
     )
     .with_context(|| format!("creating session {session_id}"))?;
+    tole_cli::session_index::record(sessions_dir, &session_id, "run");
     println!("session: {session_id}");
     if let Some(alias) = name {
         println!("name: {alias}");
     }
-    // Task-list tools (issue #198): fresh session → empty state; both
-    // tools join the registry (todo_write absent in plan mode via the
-    // retain_read_only filter above — registration here is additive).
-    let todo_state = tole_core::todo::TodoState::new();
-    registry
-        .register(Box::new(tole_core::todo::TodoReadTool::new(
-            std::sync::Arc::clone(&todo_state),
-        )))
-        .map_err(|e| anyhow::anyhow!("registering todo_read: {e}"))?;
-    if !host.plan_mode {
-        registry
-            .register(Box::new(tole_core::todo::TodoWriteTool::new(
-                std::sync::Arc::clone(&todo_state),
-            )))
-            .map_err(|e| anyhow::anyhow!("registering todo_write: {e}"))?;
-    }
+    // Task-list tools (issue #198): a fresh session starts with an empty list.
+    tool_roster::register_todo(&mut registry, storage.entries(), host.plan_mode)?;
 
-    let mut provider = OpenAiProvider::new(cfg).with_tool_specs(registry.specs());
-    if let Some(sys) = system_prompt.as_deref() {
-        provider = provider.with_system_prompt(sys);
-    }
+    let mut provider = tole_cli::turn_runner::session_provider(
+        cfg,
+        &storage,
+        registry.specs(),
+        system_prompt.as_deref(),
+        None,
+    )
+    .map_err(anyhow::Error::msg)?;
     // Memory loop, pre-turn: recalled context rides inside the first
     // user message — the durable log stores exactly what was sent. The
     // summary remembers the PRE-injection prompt: storing the injected
@@ -1890,7 +1702,9 @@ fn run_command(
     // Wall-clock cap (issue #216): a timer thread cancels the turn's
     // token at the deadline; the loop's checkpoints unwind it into a
     // durable Cancelled — resumable, never dead.
-    let cancel = tole_core::cancel::CancelToken::default();
+    // Child agents (#380): the watcher queues sibling change notices on
+    // the same token. A no-op outside a child.
+    let (cancel, _sibling_watcher) = tole_cli::turn_runner::cli_turn_token();
     let timer = timeout_secs.map(|secs| {
         let token = cancel.clone();
         std::thread::spawn(move || {
@@ -1932,10 +1746,18 @@ fn resume_command(
         id.to_string()
     } else {
         let mut best: Option<(std::time::SystemTime, String)> = None;
-        for entry in std::fs::read_dir(sessions_dir)
-            .with_context(|| format!("listing {}", sessions_dir.display()))?
-            .flatten()
-        {
+        // No sessions dir here is no local match (the index may still know
+        // the id, #439); any other listing error is real.
+        let listing = match std::fs::read_dir(sessions_dir) {
+            Ok(rd) => Some(rd),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                return Err(
+                    anyhow::Error::new(e).context(format!("listing {}", sessions_dir.display()))
+                )
+            }
+        };
+        for entry in listing.into_iter().flatten().flatten() {
             let file_name = entry.file_name().to_string_lossy().to_string();
             let Some(stem) = file_name.strip_suffix(".jsonl") else {
                 continue;
@@ -1956,65 +1778,43 @@ fn resume_command(
         }
         match best {
             Some((_, resolved)) => resolved,
-            None => anyhow::bail!(
-                "no session with id or name {id:?} in {}",
-                sessions_dir.display()
-            ),
+            None => {
+                // Not here: the global index (#439) knows which project the
+                // session belongs to. It is NOT resumed from here: this
+                // process's workspace jail, project config and trust were
+                // resolved for THIS directory, and the turn would act on
+                // the wrong tree. Name the exact command instead, so the
+                // owning project's config and trust gate apply.
+                let indexed = valid_session_id(id)
+                    .then(tole_cli::session_index::index_path)
+                    .flatten()
+                    .and_then(|idx| tole_cli::session_index::find(&idx, id));
+                if let Some(e) = indexed {
+                    anyhow::bail!(
+                        "session {id} belongs to another project; resume it there so its \
+                         workspace, config and trust apply:\n  {}",
+                        tole_cli::session_index::resume_hint(&e)
+                    );
+                }
+                anyhow::bail!(
+                    "no session with id or name {id:?} in {} (nor in the session index)",
+                    sessions_dir.display()
+                )
+            }
         }
     };
     let path = session_path(sessions_dir, &id);
     if !path.exists() {
         anyhow::bail!("session {id} not found at {}", path.display());
     }
-    let cfg = tole_cli::config_apply::provider_config().context(
-        "missing provider config: set TOLE_BASE_URL / TOLE_MODEL / TOLE_API_KEY \
-         (or the OPENAI_* equivalents)",
-    )?;
+    let cfg = tole_cli::turn_runner::provider_config().map_err(anyhow::Error::msg)?;
     let mut storage = JsonlStorage::open(&path).context("replaying session log")?;
 
-    #[cfg(feature = "mcp")]
-    let mcp_cfgs: Vec<tole_core::mcp::McpServerConfig> = host
-        .mcp_server
-        .iter()
-        .map(|s| tole_core::mcp::McpServerConfig::parse(s))
-        .collect::<Result<Vec<_>, String>>()
-        .map_err(anyhow::Error::msg)?;
-    #[cfg(feature = "mcp")]
-    let mut registry = build_registry(
-        build_approver(allow_patterns, yes),
-        host.workspace.as_ref(),
-        &mcp_cfgs,
-        host.agents_worktree,
-        allow_patterns,
-    )?;
-    #[cfg(not(feature = "mcp"))]
-    let mut registry = build_registry(
-        build_approver(allow_patterns, yes),
-        host.workspace.as_ref(),
-        host.agents_worktree,
-        allow_patterns,
-    )?;
+    let mut registry = build_registry(build_approver(allow_patterns, yes), host, allow_patterns)?;
     // Task-list tools (issue #198): state hydrated from the replayed
-    // transcript so a resumed mission keeps its plan. Registered BEFORE
-    // the plan-mode filter — todo_write must be ABSENT on the wire under
-    // --plan-mode (the retain_read_only guarantee), not merely gated.
-    {
-        let todo_state = tole_core::todo::TodoState::new();
-        {
-            use tole_core::storage::Storage;
-            todo_state.hydrate(storage.entries());
-        }
-        registry
-            .register(Box::new(tole_core::todo::TodoReadTool::new(
-                std::sync::Arc::clone(&todo_state),
-            )))
-            .map_err(|e| anyhow::anyhow!("registering todo_read: {e}"))?;
-        registry
-            .register(Box::new(tole_core::todo::TodoWriteTool::new(
-                std::sync::Arc::clone(&todo_state),
-            )))
-            .map_err(|e| anyhow::anyhow!("registering todo_write: {e}"))?;
-    }
+    // transcript so a resumed session keeps its plan; todo_write is
+    // absent under --plan-mode.
+    tool_roster::register_todo(&mut registry, storage.entries(), host.plan_mode)?;
     // Plan mode (issue #109): the guarantee is ABSENCE on the wire, not
     // approval — filtered tools never appear in specs().
     if host.plan_mode {
@@ -2039,20 +1839,32 @@ fn resume_command(
             .collect();
         registry.set_hooks(hooks);
     }
-    let mut provider = OpenAiProvider::new(cfg).with_tool_specs(registry.specs());
     // B2: the system prompt is pinned in the session header — resume
     // re-applies exactly what the session was created with (never the
     // ambient env, which may have changed since).
-    if let Some(sys) = storage.system_prompt() {
-        provider = provider.with_system_prompt(sys);
-    }
+    let pinned = storage.system_prompt().map(str::to_string);
+    let mut compactor = tole_cli::compaction_host::for_session(host.compaction, &cfg, &storage);
+    let mut provider = tole_cli::turn_runner::session_provider(
+        cfg,
+        &storage,
+        registry.specs(),
+        pinned.as_deref(),
+        None,
+    )
+    .map_err(anyhow::Error::msg)?;
+    // The session token: sibling notices (#380) reach a resumed child too.
+    let (cancel, _sibling_watcher) = tole_cli::turn_runner::cli_turn_token();
     let outcome = match prompt {
         Some(text) if !text.trim().is_empty() => {
             // New instructions on a settled session (issue #55): the
             // machine accepts a user message at a turn boundary, so
             // reuse run_turn on the resumed storage instead of the
             // approvals-only resume protocol.
-            let outcome = run_turn(&mut storage, &mut provider, &registry, text)?;
+            // Context compaction (#440) between the settled turn and the
+            // new instruction.
+            compactor.before_turn(&mut storage, &mut *provider);
+            let outcome =
+                run_turn_with_cancel(&mut storage, &mut provider, &registry, text, &cancel)?;
             // Memory loop (CodeCora scan 2026-09-18): a settled resumed
             // turn leaves a summary like `run` does — the continuation is
             // its own durable event. No recall injection here: the resumed
@@ -2067,7 +1879,7 @@ fn resume_command(
             }
             outcome
         }
-        _ => resume_turn(&mut storage, &mut provider, &registry)?,
+        _ => resume_turn_with_cancel(&mut storage, &mut provider, &registry, &cancel)?,
     };
     report_outcome(&id, outcome);
     Ok(())
@@ -2088,12 +1900,11 @@ fn status_command(sessions_dir: &Path, id: &str) -> Result<()> {
     println!("seq:     {}", storage.state().seq);
     // B3: orientation fields — turns (user messages), usage totals, and
     // whether a system prompt is pinned.
-    let turns: usize = storage
-        .entries()
-        .iter()
-        .filter(|e| e.payload.get("role") == Some(&serde_json::json!("user")))
-        .count();
+    let turns = tole_core::transcript::turn_count(storage.entries());
     println!("turns:   {turns} (user messages)");
+    for line in tole_cli::compaction_host::status_lines(storage.entries()) {
+        println!("{line}");
+    }
     println!(
         "system:  {}",
         match storage.system_prompt() {
@@ -2123,6 +1934,10 @@ fn status_command(sessions_dir: &Path, id: &str) -> Result<()> {
     // Issue #211: usage report derived from the ledger (additive block,
     // rendered after the pre-existing lines; older sessions read `n/a`).
     for line in tole_cli::usage_report::usage_report(usage).render_lines() {
+        println!("{line}");
+    }
+    // Issue #379: per user-turn stats from the same ledger.
+    for line in tole_cli::usage_report::turn_lines(storage.entries(), usage) {
         println!("{line}");
     }
     Ok(())
@@ -2166,11 +1981,7 @@ fn sessions_command(sessions_dir: &Path) -> Result<()> {
             Ok(s) => s,
             Err(_) => continue, // unreadable/corrupt: skip, don't fail the listing
         };
-        let turns: usize = s
-            .entries()
-            .iter()
-            .filter(|e| e.payload.get("role") == Some(&serde_json::json!("user")))
-            .count();
+        let turns = tole_core::transcript::turn_count(s.entries());
         rows.push((
             mtime,
             id,
@@ -2196,6 +2007,39 @@ fn sessions_command(sessions_dir: &Path) -> Result<()> {
             "{:<26} {:<18} {:<12} {:>5} {:>6}  {mtime}",
             row.1, name, row.2, row.3, row.4
         );
+    }
+    Ok(())
+}
+
+/// `tole sessions --all` (#439): every indexed session whose file still
+/// exists, newest first, with its project directory.
+fn all_sessions_command(grep: Option<&str>) -> Result<()> {
+    let index = tole_cli::session_index::index_path()
+        .context("cannot locate the session index: set CODECORA_HOME or HOME")?;
+    let rows = tole_cli::session_index::rows(&index, grep);
+    if rows.is_empty() {
+        println!("no indexed sessions in {}", index.display());
+        return Ok(());
+    }
+    println!(
+        "{:<26} {:<16} {:<10} {:>5}  {:<16}  cwd / first prompt",
+        "session", "name", "pc", "turns", "started"
+    );
+    for r in &rows {
+        let started =
+            fmt_mtime(std::time::UNIX_EPOCH + std::time::Duration::from_secs(r.entry.created_at));
+        println!(
+            "{:<26} {:<16} {:<10} {:>5}  {:<16}  {}",
+            r.entry.id,
+            r.name.as_deref().unwrap_or("-"),
+            r.pc,
+            r.turns,
+            started,
+            r.entry.cwd.display()
+        );
+        if !r.preview.is_empty() {
+            println!("{:<26} {}", "", r.preview);
+        }
     }
     Ok(())
 }
@@ -2268,31 +2112,6 @@ fn latest_session_id(dir: &Path) -> Option<String> {
 /// `resume_turn` on the next line, keeping the conversation alive without
 /// losing durable context. Ctrl-C / EOF exit cleanly — every commit is
 /// already durable, `tole chat --resume <id>` picks the thread back up.
-/// Register `todo_read`/`todo_write` with state hydrated from `entries`
-/// (issue #276). `todo_write` is skipped in plan mode so it stays absent
-/// on the wire, matching the `retain_read_only` guarantee.
-fn register_todo_tools(
-    registry: &mut ToolRegistry,
-    entries: &[tole_core::entry::Entry],
-    plan_mode: bool,
-) -> Result<()> {
-    let todo_state = tole_core::todo::TodoState::new();
-    todo_state.hydrate(entries);
-    registry
-        .register(Box::new(tole_core::todo::TodoReadTool::new(
-            std::sync::Arc::clone(&todo_state),
-        )))
-        .map_err(|e| anyhow::anyhow!("registering todo_read: {e}"))?;
-    if !plan_mode {
-        registry
-            .register(Box::new(tole_core::todo::TodoWriteTool::new(
-                std::sync::Arc::clone(&todo_state),
-            )))
-            .map_err(|e| anyhow::anyhow!("registering todo_write: {e}"))?;
-    }
-    Ok(())
-}
-
 fn chat_command(
     sessions_dir: &Path,
     system: Option<&str>,
@@ -2304,10 +2123,7 @@ fn chat_command(
 ) -> Result<()> {
     use std::io::{BufRead, Write};
 
-    let cfg = tole_cli::config_apply::provider_config().context(
-        "missing provider config: set TOLE_BASE_URL / TOLE_MODEL / TOLE_API_KEY \
-         (or the OPENAI_* equivalents)",
-    )?;
+    let cfg = tole_cli::turn_runner::provider_config().map_err(anyhow::Error::msg)?;
 
     // Resolve the session: explicit id, --last, or fresh.
     let (session_id, fresh) = if let Some(id) = resume {
@@ -2331,28 +2147,7 @@ fn chat_command(
     // Build everything that can fail BEFORE the fresh session file is
     // created, so a failed startup does not leave a stray empty session
     // polluting `sessions` / `--last` (CodeCora scan 2026-09-18).
-    #[cfg(feature = "mcp")]
-    let mcp_cfgs: Vec<tole_core::mcp::McpServerConfig> = host
-        .mcp_server
-        .iter()
-        .map(|s| tole_core::mcp::McpServerConfig::parse(s))
-        .collect::<Result<Vec<_>, String>>()
-        .map_err(anyhow::Error::msg)?;
-    #[cfg(feature = "mcp")]
-    let mut registry = build_registry(
-        build_approver(allow_patterns, yes),
-        host.workspace.as_ref(),
-        &mcp_cfgs,
-        host.agents_worktree,
-        allow_patterns,
-    )?;
-    #[cfg(not(feature = "mcp"))]
-    let mut registry = build_registry(
-        build_approver(allow_patterns, yes),
-        host.workspace.as_ref(),
-        host.agents_worktree,
-        allow_patterns,
-    )?;
+    let mut registry = build_registry(build_approver(allow_patterns, yes), host, allow_patterns)?;
     // Plan mode (issue #109): the guarantee is ABSENCE on the wire, not
     // approval — filtered tools never appear in specs().
     if host.plan_mode {
@@ -2388,10 +2183,15 @@ fn chat_command(
             .map(str::to_string)
             .or_else(resolve_system_prompt)
             .or_else(|| Some(build_default_prompt(host.plan_mode)));
-        // Skills (issue #161): sections append after the base prompt.
-        let system_prompt = system_prompt.map(|p| format!("{p}{skill_sections}"));
-        JsonlStorage::create_with(sessions_dir, &session_id, None, system_prompt.as_deref())
-            .with_context(|| format!("creating session {session_id}"))?
+        // Skills (issue #161): sections append after the base prompt,
+        // after the cora review flow when its tools are attached (#422).
+        let review = review_section(&registry);
+        let system_prompt = system_prompt.map(|p| format!("{p}{review}{skill_sections}"));
+        let storage =
+            JsonlStorage::create_with(sessions_dir, &session_id, None, system_prompt.as_deref())
+                .with_context(|| format!("creating session {session_id}"))?;
+        tole_cli::session_index::record(sessions_dir, &session_id, "chat");
+        storage
     } else {
         JsonlStorage::open(&path).context("replaying session log")?
     };
@@ -2399,18 +2199,27 @@ fn chat_command(
     // the replayed transcript so a resumed chat keeps its plan.
     {
         use tole_core::storage::Storage;
-        register_todo_tools(&mut registry, storage.entries(), host.plan_mode)?;
+        tool_roster::register_todo(&mut registry, storage.entries(), host.plan_mode)?;
     }
     println!(
         "tole chat — session {session_id} (Ctrl-D exits, resume: tole chat --resume {session_id})"
     );
 
-    let mut provider = OpenAiProvider::new(cfg).with_tool_specs(registry.specs());
     // B2: fresh sessions pin the resolved prompt; resumed sessions re-apply
     // the header-pinned one (see create_with above / JsonlStorage::open).
-    if let Some(sys) = storage.system_prompt() {
-        provider = provider.with_system_prompt(sys);
-    }
+    let pinned = storage.system_prompt().map(str::to_string);
+    let mut compactor = tole_cli::compaction_host::for_session(host.compaction, &cfg, &storage);
+    let mut provider = tole_cli::turn_runner::session_provider(
+        cfg,
+        &storage,
+        registry.specs(),
+        pinned.as_deref(),
+        None,
+    )
+    .map_err(anyhow::Error::msg)?;
+    // One token for the whole chat session: sibling notices (#380) reach
+    // a child running `tole chat` at each turn's next safe point.
+    let (cancel, _sibling_watcher) = tole_cli::turn_runner::cli_turn_token();
 
     // Memory loop state: recall rides into the first message of a FRESH
     // session only (a resumed session already carries its context); the
@@ -2482,11 +2291,20 @@ fn chat_command(
         let outcome = loop {
             match storage.state().pc {
                 tole_core::state::Pc::Idle | tole_core::state::Pc::Final => {
-                    break run_turn(&mut storage, &mut provider, &registry, &turn_prompt);
+                    // Context compaction (#440): only here, between
+                    // settled turns.
+                    compactor.before_turn(&mut storage, &mut *provider);
+                    break run_turn_with_cancel(
+                        &mut storage,
+                        &mut provider,
+                        &registry,
+                        &turn_prompt,
+                        &cancel,
+                    );
                 }
                 _ => {
                     eprintln!("tole> (resolving the interrupted turn…)");
-                    match resume_turn(&mut storage, &mut provider, &registry) {
+                    match resume_turn_with_cancel(&mut storage, &mut provider, &registry, &cancel) {
                         // Landed on a boundary — dispatch the message now.
                         Ok(TurnOutcome::Final { .. }) => continue,
                         // Still stuck (re-denied, provider still down):
@@ -2840,9 +2658,11 @@ mod gh_repo_tests {
         let dir = std::env::temp_dir().join(format!("tole-gh-none-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let mut reg =
-            ToolRegistry::with_approver(tole_core::approval::AllowlistApprover::allow_only(vec![]));
-        register_gh(&mut reg, &dir).unwrap();
+        let reg = tool_roster::build(
+            tole_core::approval::AllowlistApprover::allow_only(vec![]),
+            Roster::new(dir.clone()),
+        )
+        .unwrap();
         assert!(reg.get("gh").is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2867,7 +2687,7 @@ mod gh_repo_tests {
             "origin",
             "https://github.com/detected/owner-name.git",
         ]);
-        let detected = detect_github_repo(&dir);
+        let detected = tole_cli::session_host::detect_github_repo(&dir);
         assert_eq!(detected.as_deref(), Some("detected/owner-name"));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2954,6 +2774,34 @@ mod default_prompt_tests {
         let planned = super::build_default_prompt(true);
         assert!(planned.contains("PLAN MODE"));
         assert!(planned.rfind("Context:").unwrap() > planned.rfind("PLAN MODE").unwrap());
+    }
+
+    #[test]
+    fn review_section_only_when_both_cora_review_tools_are_registered() {
+        use tole_core::tool::{Risk, Tool};
+        struct Named(&'static str);
+        impl Tool for Named {
+            fn name(&self) -> &str {
+                self.0
+            }
+            fn risk(&self) -> Risk {
+                Risk::ReadOnly
+            }
+            fn execute(&self, _input: serde_json::Value) -> Result<serde_json::Value, String> {
+                Ok(serde_json::Value::Null)
+            }
+        }
+        let approver = || tole_core::approval::AllowlistApprover::allow_only(vec![]);
+        let mut reg = tole_core::tool::ToolRegistry::with_approver(approver());
+        assert_eq!(super::review_section(&reg), "");
+        reg.register(Box::new(Named("mcp_cora_cora_review_prepare")))
+            .unwrap();
+        assert_eq!(super::review_section(&reg), "", "finalize missing");
+        reg.register(Box::new(Named("mcp_cora_cora_review_finalize")))
+            .unwrap();
+        let section = super::review_section(&reg);
+        assert!(section.contains("mcp_cora_cora_review_prepare"));
+        assert!(section.contains("SAME diff"));
     }
 
     #[test]
@@ -3084,6 +2932,52 @@ mod trust_preset_tests {
         // agent_poll (Write since #300) is allowlisted by exact name so the
         // poll loop stays unattended; agent_start must keep prompting.
         assert!(!pats.iter().any(|p| p == "agent_*" || p == "agent_start"));
+    }
+
+    #[test]
+    fn workspace_is_read_only_plus_the_jailed_file_writers() {
+        let ws = expand_trust(&["workspace".to_string()]).unwrap();
+        let ro = expand_trust(&["read_only".to_string()]).unwrap();
+        for p in &ro {
+            assert!(ws.contains(p), "workspace lacks read_only's {p}");
+        }
+        // The writers only through the path guard, never bare.
+        assert!(ws.iter().any(|p| p == "write_file@workspace"));
+        assert!(ws.iter().any(|p| p == "edit_file@workspace"));
+        for never in [
+            "write_file",
+            "edit_file",
+            "delete_file",
+            "run_command",
+            "git",
+            "gh",
+            "agent_start",
+        ] {
+            assert!(!ws.iter().any(|p| p == never), "{never}: {ws:?}");
+        }
+        assert!(!ws.iter().any(|p| p.contains('*')), "{ws:?}");
+    }
+
+    #[test]
+    fn workspace_preset_refuses_home_and_filesystem_root() {
+        use tole_cli::trust::check_workspace_root;
+        let ws = vec!["workspace".to_string()];
+        let home = std::env::temp_dir().join(format!("tole-ws-home-{}", std::process::id()));
+        let project = home.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        assert!(check_workspace_root(&ws, Some(&project), Some(&home)).is_ok());
+        let e = check_workspace_root(&ws, Some(&home), Some(&home)).unwrap_err();
+        assert!(
+            e.to_string().contains("your home or a filesystem root"),
+            "{e}"
+        );
+        assert!(check_workspace_root(&ws, Some(Path::new("/")), None).is_err());
+        // The implicit cwd is never enough.
+        let e = check_workspace_root(&ws, None, Some(&home)).unwrap_err();
+        assert!(e.to_string().contains("needs an explicit workspace"), "{e}");
+        // Other presets never look at the root.
+        assert!(check_workspace_root(&["read_only".into()], None, None).is_ok());
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
@@ -3318,11 +3212,11 @@ mod chat_todo_tests {
     fn chat_registers_todo_tools_and_respects_plan_mode() {
         let mut reg =
             ToolRegistry::with_approver(tole_core::approval::AllowlistApprover::allow_only(vec![]));
-        register_todo_tools(&mut reg, &[], false).unwrap();
+        tool_roster::register_todo(&mut reg, &[], false).unwrap();
         assert!(reg.get("todo_read").is_some());
         assert!(reg.get("todo_write").is_some());
         let mut plan = ToolRegistry::new();
-        register_todo_tools(&mut plan, &[], true).unwrap();
+        tool_roster::register_todo(&mut plan, &[], true).unwrap();
         assert!(plan.get("todo_read").is_some());
         assert!(plan.get("todo_write").is_none());
     }
@@ -3333,7 +3227,7 @@ mod chat_todo_tests {
     #[test]
     fn mcp_server_registry_is_read_only_under_plan_mode() {
         use tole_core::tool::Risk;
-        let normal = build_server_registry_for_mcp(false).unwrap();
+        let normal = build_server_registry_for_mcp(None, false).unwrap();
         assert!(
             normal.specs().iter().any(|s| normal
                 .get(s["function"]["name"].as_str().unwrap())
@@ -3342,7 +3236,7 @@ mod chat_todo_tests {
                 != Risk::ReadOnly),
             "non-plan registry must expose write tools"
         );
-        let plan = build_server_registry_for_mcp(true).unwrap();
+        let plan = build_server_registry_for_mcp(None, true).unwrap();
         let specs = plan.specs();
         assert!(!specs.is_empty());
         for spec in &specs {
@@ -3353,6 +3247,25 @@ mod chat_todo_tests {
                 "{name} must not survive plan mode"
             );
         }
+    }
+
+    /// cora 0.19 scan MAJOR: the MCP HTTP face's server-level file tools
+    /// must be rooted at `--workspace`, not the process cwd.
+    #[cfg(all(feature = "mcp-http", feature = "shell-tools"))]
+    #[test]
+    fn mcp_server_registry_file_tools_are_rooted_at_workspace() {
+        let ws = std::env::temp_dir().join(format!("tole-mcp-ws-{}", std::process::id()));
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("only-in-ws.txt"), "rooted").unwrap();
+        let ws_arg = ws.to_str().unwrap().to_string();
+        let reg = build_server_registry_for_mcp(Some(&ws_arg), false).unwrap();
+        let out = reg
+            .get("read_file")
+            .unwrap()
+            .execute(serde_json::json!({ "path": "only-in-ws.txt" }))
+            .unwrap();
+        assert_eq!(out["content"], serde_json::json!("rooted"));
+        let _ = std::fs::remove_dir_all(&ws);
     }
 }
 

@@ -14,7 +14,7 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -27,7 +27,8 @@ fn tmpdir() -> PathBuf {
     d.canonicalize().unwrap()
 }
 
-const SCRUBBED: [&str; 11] = [
+const SCRUBBED: [&str; 12] = [
+    "TOLE_SKILL",
     "TOLE_MODEL",
     "TOLE_BASE_URL",
     "TOLE_API_KEY",
@@ -112,18 +113,19 @@ enum Step {
 
 type Seen = Arc<Mutex<Vec<Value>>>;
 
-/// Scripted provider: request n answers `steps[min(n, last)]`; every
-/// request body is recorded.
+/// Scripted provider: a request whose transcript already holds n tool
+/// results answers `steps[min(n, last)]`; every request body is recorded.
+/// Keyed on the conversation, not on the request count (#429): a client
+/// retry under load re-sends the same transcript and gets the same step,
+/// instead of consuming the next one.
 fn spawn_mock(steps: Vec<Step>) -> (String, Seen) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let seen: Seen = Arc::default();
-    let counter = Arc::new(AtomicUsize::new(0));
     let (seen2, steps) = (Arc::clone(&seen), Arc::new(steps));
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
-            let (seen, counter, steps) =
-                (Arc::clone(&seen2), Arc::clone(&counter), Arc::clone(&steps));
+            let (seen, steps) = (Arc::clone(&seen2), Arc::clone(&steps));
             std::thread::spawn(move || {
                 let mut s = stream;
                 let mut buf = Vec::new();
@@ -144,8 +146,10 @@ fn spawn_mock(steps: Vec<Step>) -> (String, Seen) {
                     }
                 }
                 let streamed = body["stream"].as_bool() == Some(true);
+                let n = body["messages"]
+                    .as_array()
+                    .map_or(0, |m| m.iter().filter(|m| m["role"] == "tool").count());
                 seen.lock().unwrap().push(body);
-                let n = counter.fetch_add(1, Ordering::SeqCst);
                 let step = steps[n.min(steps.len() - 1)].clone();
                 let (content, calls) = match step {
                     Step::Final(t) => (Some(t.to_string()), None),
@@ -453,6 +457,7 @@ fn config_patterns_hit_the_destructive_wall_in_approver_and_registry() {
         risk: Risk::Destructive,
         description: String::new(),
         input: &json!({}),
+        target: None,
     };
     assert_eq!(
         interactive.decide(&req),
@@ -483,7 +488,7 @@ fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
 #[cfg(all(unix, feature = "shell-tools"))]
 #[test]
 fn on_pretool_from_config_runs_and_can_deny() {
-    let (url, _) = spawn_mock(vec![
+    let (url, seen) = spawn_mock(vec![
         Step::Tool("write_file", r#"{"path":"out.txt","content":"x"}"#),
         Step::Final("done"),
     ]);
@@ -502,7 +507,8 @@ fn on_pretool_from_config_runs_and_can_deny() {
     let o = finish(with_provider(base_cmd(&d, &home, &["run", "go"]), &url));
     assert!(
         marker.exists(),
-        "the config hook was not invoked: {}",
+        "the config hook was not invoked ({} provider requests): {}",
+        seen.lock().unwrap().len(),
         text(&o.stderr)
     );
     let payload = std::fs::read_to_string(scripts.join("marker.stdin")).unwrap();
@@ -519,7 +525,7 @@ fn on_pretool_from_config_runs_and_can_deny() {
 #[cfg(all(unix, feature = "shell-tools"))]
 #[test]
 fn on_posttool_and_on_turnend_from_config_run() {
-    let (url, _) = spawn_mock(vec![
+    let (url, seen) = spawn_mock(vec![
         Step::Tool("write_file", r#"{"path":"out.txt","content":"x"}"#),
         Step::Final("done"),
     ]);
@@ -536,8 +542,17 @@ fn on_posttool_and_on_turnend_from_config_run() {
     ));
     let o = finish(with_provider(base_cmd(&d, &home, &["run", "go"]), &url));
     assert!(o.status.success(), "{}", text(&o.stderr));
-    assert!(post.exists(), "posttool hook not run");
-    assert!(end.exists(), "turnend hook not run");
+    let requests = seen.lock().unwrap().len();
+    assert!(
+        post.exists(),
+        "posttool hook not run ({requests} provider requests): {}",
+        text(&o.stderr)
+    );
+    assert!(
+        end.exists(),
+        "turnend hook not run ({requests} provider requests): {}",
+        text(&o.stderr)
+    );
 }
 
 // ----------------------------------------------------------- mcp_server
@@ -732,7 +747,7 @@ fn mission_verify_timeout_from_config_is_used() {
 
 // ------------------------------------------------------- face refusals
 
-const NO_CONFIG_HINT: &str = "use --no-config to ignore the project config";
+const NO_CONFIG_HINT: &str = "use --no-config to ignore the config files";
 
 /// The refused command must exit non-zero, print the flag's message plus
 /// the hint, and never have started (no stdout, no provider contact).
@@ -991,4 +1006,67 @@ fn config_check_reports_effective_values_for_the_sensitive_keys() {
         out.contains("effective: [\"read_only\"]  (env TOLE_TRUST)"),
         "{out}"
     );
+}
+
+// ------------------------------------------------------------- TOLE_SKILL
+
+/// #434: `TOLE_SKILL` preloads skills like `--skill`, and the flag still
+/// replaces it (flag > env > config).
+#[test]
+fn tole_skill_env_loads_skills_and_the_flag_replaces_it() {
+    let (url, seen) = spawn_mock(vec![Step::Final("ok")]);
+    let (d, home) = skill_project("no_auto_mcp = true\n");
+    std::fs::create_dir_all(d.join("other/alt")).unwrap();
+    std::fs::write(
+        d.join("other/alt/SKILL.md"),
+        "---\nname: alt\ndescription: alt\n---\nALT-SKILL-BODY\n",
+    )
+    .unwrap();
+    let env_skill = d.join("skills/demo/SKILL.md");
+    let o = finish(with_provider(
+        with_env(
+            base_cmd(&d, &home, &["run", "hi"]),
+            "TOLE_SKILL",
+            env_skill.to_str().unwrap(),
+        ),
+        &url,
+    ));
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    let sys = system_text(&seen.lock().unwrap()[0]);
+    assert!(sys.contains("DEMO-SKILL-BODY"), "{sys}");
+    let o = finish(with_provider(
+        with_env(
+            base_cmd(&d, &home, &["--skill", "other/alt/SKILL.md", "run", "hi"]),
+            "TOLE_SKILL",
+            env_skill.to_str().unwrap(),
+        ),
+        &url,
+    ));
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    let sys = system_text(&seen.lock().unwrap()[1]);
+    assert!(sys.contains("ALT-SKILL-BODY"), "{sys}");
+    assert!(
+        !sys.contains("DEMO-SKILL-BODY"),
+        "the flag replaces TOLE_SKILL"
+    );
+}
+
+/// An exported TOLE_SKILL on a server face is refused like `--skill`, and
+/// the message names the variable instead of a flag nobody typed.
+#[cfg(feature = "shell-tools")]
+#[test]
+fn server_faces_name_tole_skill_in_the_refusal() {
+    let (d, home) = skill_project("");
+    let o = finish(with_env(
+        base_cmd(&d, &home, &["acp"]),
+        "TOLE_SKILL",
+        d.join("skills/demo/SKILL.md").to_str().unwrap(),
+    ));
+    let err = text(&o.stderr);
+    assert!(!o.status.success(), "{err}");
+    assert!(
+        err.contains("--skill is not supported by `tole acp`"),
+        "{err}"
+    );
+    assert!(err.contains("the value comes from TOLE_SKILL"), "{err}");
 }

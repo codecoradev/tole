@@ -13,7 +13,8 @@
 //!    the marker alone is not enough), or
 //! 3. a budget trips — `--max-steps` (provider steps across turns, from
 //!    the durable usage ledger) or `--max-minutes` (wall clock), or
-//! 4. the verify gate fails more than [`VERIFY_FAILURE_CAP`] times.
+//! 4. the verify gate has failed [`VERIFY_FAILURE_CAP`] times in total
+//!    (the count is cumulative across the mission, never reset by a pass).
 //!
 //! Exhaustion settles RESUMABLY (durable summary + pc=Final): a mission
 //! never leaves a dead session — `tole mission --resume <id>` (or a
@@ -23,7 +24,6 @@
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
-use tole_core::openai::OpenAiProvider;
 use tole_core::storage::{JsonlStorage, Storage};
 use tole_core::subprocess::run_with_timeout;
 use tole_core::tool::ToolRegistry;
@@ -33,8 +33,8 @@ use tole_core::turn::{run_turn, TurnOutcome};
 /// message containing this line declares the goal fully achieved.
 pub const MISSION_COMPLETE_MARKER: &str = "MISSION_COMPLETE";
 
-/// Verify-gate patience (issue #199): this many failed `--verify` runs
-/// settle the mission as `verify_failed` — the model gets each
+/// Verify-gate patience (issue #199): this many failed `--verify` runs in
+/// total (cumulative, not consecutive) settle the mission as `verify_failed` — the model gets each
 /// failure's output in context before the cap trips.
 pub const VERIFY_FAILURE_CAP: u32 = 3;
 
@@ -95,6 +95,8 @@ pub struct MissionConfig {
     /// Per-run timeout of the `--verify` command (seconds). Default 300
     /// — `cargo test`-class suites are the advertised use.
     pub verify_timeout_secs: u64,
+    /// Context compaction between chained turns (#440).
+    pub compaction: tole_cli::compaction_host::CompactionSettings,
 }
 
 /// The mission addendum appended to the default system prompt.
@@ -122,17 +124,47 @@ fn mission_prompt(goal: &str, verify: Option<&str>) -> String {
     p
 }
 
+/// Upper bound for `--max-minutes` (10 years): a huge value must neither
+/// wrap `minutes * 60` nor overflow the `Instant` arithmetic.
+const MAX_MINUTES_CAP: u64 = 60 * 24 * 365 * 10;
+
+fn max_minutes_duration(minutes: u64) -> std::time::Duration {
+    std::time::Duration::from_secs(minutes.min(MAX_MINUTES_CAP) * 60)
+}
+
+/// A `--resume` id names a file inside the sessions dir; it must be a plain
+/// file stem (the shape `new_session_id` produces), never a path.
+fn validate_session_id(id: &str) -> Result<()> {
+    let ok = !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    if ok {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "invalid mission session id {id:?}: expected letters, digits, '-' and '_' only"
+        )
+    }
+}
+
+/// Failure to run the verify command to completion. Carries the real cause
+/// (spawn failure, wait error or timeout) instead of reporting every
+/// subprocess error as a timeout.
+fn verify_run_error(cause: &str, timeout: std::time::Duration) -> String {
+    format!(
+        "verify command did not complete: {cause} (--verify-timeout is {}s)",
+        timeout.as_secs()
+    )
+}
+
 /// Run the `--verify` command (sh -c, operator-budgeted timeout).
 /// Returns Ok(()) on exit-0, Err(output tail) otherwise.
 fn run_verify(cmd: &str, timeout: std::time::Duration) -> Result<(), String> {
     let mut c = std::process::Command::new("sh");
     c.arg("-c").arg(cmd);
-    let out = run_with_timeout(&mut c, timeout).map_err(|_| {
-        format!(
-            "verify command timed out after {}s (raise --verify-timeout)",
-            timeout.as_secs()
-        )
-    })?;
+    let out = run_with_timeout(&mut c, timeout).map_err(|e| verify_run_error(&e, timeout))?;
     if out.status.success() {
         return Ok(());
     }
@@ -154,27 +186,12 @@ fn run_verify(cmd: &str, timeout: std::time::Duration) -> Result<(), String> {
 fn steps_used(storage: &JsonlStorage) -> u64 {
     // Wire-only rows (#211: request sizes without provider usage) are not
     // provider steps — budget semantics are exactly as before.
-    tole_cli::usage_report::provider_steps(storage.usages())
+    tole_core::transcript::provider_steps(storage.usages())
 }
 
 /// Tokens (prompt + completion) recorded in the durable ledger.
 fn tokens_used(storage: &JsonlStorage) -> u64 {
-    storage
-        .usages()
-        .iter()
-        .map(|u| {
-            u.usage
-                .get("prompt_tokens")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0)
-                .saturating_add(
-                    u.usage
-                        .get("completion_tokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0),
-                )
-        })
-        .sum()
+    tole_core::transcript::tokens_in_out(storage.usages())
 }
 
 /// Run one mission to completion/exhaustion. The CALLER builds the
@@ -187,17 +204,15 @@ pub fn run_mission(
     sessions_dir: &std::path::Path,
 ) -> Result<()> {
     let started = std::time::Instant::now();
-    let deadline = started + std::time::Duration::from_secs(cfg.max_minutes * 60);
+    let deadline = started + max_minutes_duration(cfg.max_minutes);
     // Resolve provider config BEFORE the session file exists — a config
     // failure must not leave an empty, unsummarized session (cora CI).
-    let provider_cfg = tole_cli::config_apply::provider_config().context(
-        "missing provider config: set TOLE_BASE_URL / TOLE_MODEL / TOLE_API_KEY \
-         (or the OPENAI_* equivalents)",
-    )?;
+    let provider_cfg = tole_cli::turn_runner::provider_config().map_err(anyhow::Error::msg)?;
 
     // Session: fresh (goal pinned via first prompt) or resumed.
     let (mut storage, session_id, first_prompt) = match &cfg.resume_id {
         Some(id) => {
+            validate_session_id(id)?;
             let path = sessions_dir.join(format!("{id}.jsonl"));
             let storage = JsonlStorage::open(&path)
                 .with_context(|| format!("opening mission session {id}"))?;
@@ -217,27 +232,26 @@ pub fn run_mission(
             let storage =
                 JsonlStorage::create_with(sessions_dir, &session_id, None, Some(&system_prompt))
                     .with_context(|| format!("creating mission session {session_id}"))?;
+            tole_cli::session_index::record(sessions_dir, &session_id, "mission");
             eprintln!("mission: session {session_id}");
             (storage, session_id, Some(cfg.goal.clone()))
         }
     };
     // Task-list tools (#198): hydrated from the transcript on resume.
-    {
-        let todo_state = tole_core::todo::TodoState::new();
-        todo_state.hydrate(storage.entries());
-        registry
-            .register(Box::new(tole_core::todo::TodoReadTool::new(
-                std::sync::Arc::clone(&todo_state),
-            )))
-            .map_err(|e| anyhow::anyhow!("registering todo_read: {e}"))?;
-        registry
-            .register(Box::new(tole_core::todo::TodoWriteTool::new(
-                std::sync::Arc::clone(&todo_state),
-            )))
-            .map_err(|e| anyhow::anyhow!("registering todo_write: {e}"))?;
-    }
+    // Missions refuse --plan-mode, so todo_write is always present.
+    tole_cli::tool_roster::register_todo(&mut registry, storage.entries(), false)?;
 
-    let mut provider = OpenAiProvider::new(provider_cfg).with_tool_specs(registry.specs());
+    let system_prompt = storage.system_prompt().map(str::to_owned);
+    let mut compactor =
+        tole_cli::compaction_host::for_session(cfg.compaction, &provider_cfg, &storage);
+    let mut provider = tole_cli::turn_runner::session_provider(
+        provider_cfg,
+        &storage,
+        registry.specs(),
+        system_prompt.as_deref(),
+        None,
+    )
+    .map_err(anyhow::Error::msg)?;
 
     let mut turns: u64 = 0;
     let mut verify_failures: u32 = 0;
@@ -290,6 +304,9 @@ pub fn run_mission(
             status = "error";
             break;
         };
+        // Context compaction (#440): between chained turns, after the
+        // budget checks; the summary call's tokens count toward them.
+        compactor.before_turn(&mut storage, &mut *provider);
         let outcome = match run_turn(&mut storage, &mut provider, &registry, &prompt) {
             Ok(o) => o,
             Err(e) => {
@@ -541,5 +558,78 @@ mod budget_tests {
             (mixed.max_steps, mixed.max_minutes, mixed.max_tokens),
             (10, 30, 1_000)
         );
+    }
+}
+
+#[cfg(test)]
+mod verify_error_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn a_spawn_failure_is_not_reported_as_a_timeout() {
+        let e = verify_run_error(
+            "failed to spawn subprocess (is it on PATH?): No such file or directory",
+            Duration::from_secs(300),
+        );
+        assert!(e.contains("failed to spawn subprocess"), "{e}");
+        assert!(!e.contains("timed out"), "{e}");
+        assert!(e.contains("--verify-timeout is 300s"), "{e}");
+    }
+
+    /// cora 0.19 scan MAJOR: the mission system prompt pinned in the
+    /// session header must reach the wire — on a fresh run and, after
+    /// reopening the file, on `--resume`.
+    #[test]
+    fn mission_provider_sends_the_pinned_system_prompt_on_resume() {
+        use tole_core::openai::{OpenAiConfig, OpenAiProvider};
+        let d = std::env::temp_dir().join(format!("tole-mission-sys-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let sys = format!("base{}", mission_prompt("ship it", None));
+        let fresh = JsonlStorage::create_with(&d, "m1", None, Some(&sys)).unwrap();
+        let cfg = || OpenAiConfig::new("https://x/v1", "m", "k");
+        for storage in [fresh, JsonlStorage::open(d.join("m1.jsonl")).unwrap()] {
+            let body = tole_cli::turn_runner::configure_provider(
+                OpenAiProvider::new(cfg()),
+                vec![],
+                storage.system_prompt(),
+                None,
+            )
+            .request_body(&[]);
+            let first = &body["messages"][0];
+            assert_eq!(first["role"], json!("system"), "{body}");
+            assert!(
+                first["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains(MISSION_COMPLETE_MARKER),
+                "{body}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn resume_id_must_be_a_plain_session_stem() {
+        let id = tole_cli::session_host::new_session_id("mission");
+        assert!(validate_session_id(&id).is_ok(), "{id}");
+        for bad in ["", "../x", "a/b", "a\\b", "..", "x.jsonl", "/etc/passwd"] {
+            assert!(validate_session_id(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn huge_max_minutes_is_capped_not_wrapped() {
+        let d = max_minutes_duration(u64::MAX);
+        assert_eq!(d.as_secs(), MAX_MINUTES_CAP * 60);
+        // Instant arithmetic must not overflow either.
+        let _ = std::time::Instant::now() + d;
+        assert_eq!(max_minutes_duration(2).as_secs(), 120);
+    }
+
+    #[test]
+    fn a_real_timeout_still_says_so() {
+        let e = run_verify("sleep 5", Duration::from_secs(1)).unwrap_err();
+        assert!(e.contains("timed out after 1s"), "{e}");
     }
 }

@@ -9,7 +9,6 @@
 //! absent). Everything else — the jail, the registry, the memory loop —
 //! is identical.
 
-use crate::tools::WriteFileTool;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc as StdArc, Mutex};
@@ -39,6 +38,34 @@ pub struct SessionState {
     pub cancel: tole_core::cancel::CancelToken,
 }
 
+/// Why a soft interrupt was not queued (#377).
+#[derive(Debug, PartialEq, Eq)]
+pub enum InterruptRefusal {
+    /// No turn is running: there is nothing to steer, and a stale message
+    /// must not wait around to hijack the next, unrelated turn.
+    NotBusy,
+    /// Blank, oversized, or the queue is full (see `tole_core::interrupt`).
+    Invalid(String),
+}
+
+/// Queue a soft interrupt for the session's in-flight turn (#377). Shared
+/// by the REST and MCP faces. The turn loop delivers it at its next safe
+/// point; a turn that ends first leaves it queued for the next turn's
+/// first safe point (the check below is a best-effort guard, not a lock).
+pub fn interrupt_session(
+    st: &SessionState,
+    text: &str,
+    urgent: bool,
+) -> Result<(), InterruptRefusal> {
+    if !*st.busy.lock().expect("busy lock") {
+        return Err(InterruptRefusal::NotBusy);
+    }
+    st.cancel
+        .interrupts()
+        .push(text, urgent)
+        .map_err(|e| InterruptRefusal::Invalid(e.to_string()))
+}
+
 /// Marks a session busy for its whole lifetime; Drop un-marks even on
 /// panic, so one failed turn cannot brick the session.
 pub struct BusyGuard(StdArc<Mutex<bool>>);
@@ -48,9 +75,13 @@ impl Drop for BusyGuard {
     }
 }
 
+/// The live session registry shared by every server face (REST, MCP,
+/// ACP). It owns the map's invariants — the capacity cap and eviction,
+/// the admission rule, and the per-turn busy claim — so the faces never
+/// touch the map itself.
 #[derive(Default)]
 pub struct Sessions {
-    pub map: HashMap<String, SessionState>,
+    map: HashMap<String, SessionState>,
 }
 
 pub type SharedSessions = StdArc<Mutex<Sessions>>;
@@ -64,7 +95,120 @@ pub const MAX_SESSIONS: usize = 256;
 #[derive(Debug, PartialEq, Eq)]
 pub struct AllSessionsBusy;
 
+/// Why [`Sessions::admit`] refused a session.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AdmitError {
+    /// At capacity and every live session is mid-turn.
+    AtCapacity,
+    /// The id is already live and running a turn; replacing it would
+    /// orphan that turn.
+    Busy,
+}
+
+/// The faces' one wording for an omitted `session_id` with zero or several
+/// sessions open.
+pub const AMBIGUOUS_SESSION: &str =
+    "missing 'session_id': pass it explicitly (or keep exactly one session open)";
+
 impl Sessions {
+    /// The live session `id`, if any.
+    pub fn get(&self, id: &str) -> Option<&SessionState> {
+        self.map.get(id)
+    }
+
+    /// Every live session, in no particular order.
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &SessionState)> {
+        self.map.iter()
+    }
+
+    /// True when `id` is live and running a turn.
+    pub fn is_busy(&self, id: &str) -> bool {
+        self.map
+            .get(id)
+            .is_some_and(|st| *st.busy.lock().expect("busy lock"))
+    }
+
+    /// Number of live sessions.
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// True when no session is live.
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    /// The session a request addresses: the explicit id, or the only live
+    /// session when none was given. Refused with [`AMBIGUOUS_SESSION`]
+    /// otherwise.
+    pub fn resolve_id(&self, explicit: Option<&str>) -> Result<String, String> {
+        match explicit {
+            Some(id) => Ok(id.to_string()),
+            None if self.map.len() == 1 => Ok(self.map.keys().next().expect("len == 1").clone()),
+            None => Err(AMBIGUOUS_SESSION.to_string()),
+        }
+    }
+
+    /// Request cancellation of `id`'s in-flight turn; false for an unknown
+    /// session.
+    pub fn cancel(&self, id: &str) -> bool {
+        self.map.get(id).map(|st| st.cancel.cancel()).is_some()
+    }
+
+    /// Make room for a new session BEFORE it is opened (opening creates
+    /// its file on disk, so refusing afterwards would orphan it). Returns
+    /// the evicted ids; [`Sessions::admit`] re-checks under the same lock
+    /// as the insert, for a concurrent creator.
+    pub fn ensure_room(&mut self) -> Result<Vec<String>, AllSessionsBusy> {
+        self.evict_for_insert(MAX_SESSIONS)
+    }
+
+    /// Admit an opened session under `id`. A live, idle session with the
+    /// same id is replaced in place (a re-open); a busy one is refused. A
+    /// new id evicts an idle session when the map is at capacity
+    /// ([`MAX_SESSIONS`]). Returns the evicted ids so callers can prune
+    /// their side maps.
+    pub fn admit(&mut self, id: String, state: SessionState) -> Result<Vec<String>, AdmitError> {
+        self.admit_capped(id, state, MAX_SESSIONS)
+    }
+
+    fn admit_capped(
+        &mut self,
+        id: String,
+        state: SessionState,
+        max: usize,
+    ) -> Result<Vec<String>, AdmitError> {
+        let evicted = match self.map.get(&id) {
+            Some(live) if *live.busy.lock().expect("busy lock") => return Err(AdmitError::Busy),
+            Some(_) => Vec::new(),
+            None => self
+                .evict_for_insert(max)
+                .map_err(|AllSessionsBusy| AdmitError::AtCapacity)?,
+        };
+        self.map.insert(id, state);
+        Ok(evicted)
+    }
+
+    /// Claim `id` for one turn: mark it busy and clear a stale cancel in
+    /// the same critical section (#178) — a cancel that lands after the
+    /// claim targets THIS turn; one that landed before had no turn to
+    /// target. The returned guard un-marks the session when dropped, even
+    /// on panic.
+    pub fn claim_turn(&self, id: &str) -> Result<(SessionState, BusyGuard), String> {
+        let state = self
+            .map
+            .get(id)
+            .ok_or_else(|| format!("unknown session: {id}"))?;
+        let mut busy = state.busy.lock().expect("busy lock");
+        if *busy {
+            return Err("session is busy running a turn".into());
+        }
+        *busy = true;
+        state.cancel.reset();
+        drop(busy);
+        Ok((state.clone(), BusyGuard(StdArc::clone(&state.busy))))
+    }
+
     /// Make room for one more session: while the map is at `max`, evict
     /// one NON-busy session. A busy flag that is itself locked means a
     /// turn is mid-flight on that session, so it is skipped via
@@ -72,7 +216,7 @@ impl Sessions {
     /// round-2). Returns the evicted ids so callers can prune any side
     /// maps keyed by session id; `Err(AllSessionsBusy)` when at capacity
     /// with nothing evictable.
-    pub fn evict_for_insert(&mut self, max: usize) -> Result<Vec<String>, AllSessionsBusy> {
+    fn evict_for_insert(&mut self, max: usize) -> Result<Vec<String>, AllSessionsBusy> {
         let mut evicted = Vec::new();
         while self.map.len() >= max {
             let oldest = self
@@ -259,99 +403,19 @@ pub fn open_session(
         .filter(|s| !s.trim().is_empty())
         .or_else(crate::config_apply::config_system_prompt);
 
-    let interactive = approver.interactive();
-    let mut reg = tole_core::tool::ToolRegistry::with_approver(approver);
-    use tole_core::cora_search::CoraSearchTool;
-    use tole_core::file_tools::{DeleteFileTool, EditFileTool};
-    use tole_core::gh::GhTool;
-    use tole_core::git::GitTool;
-    use tole_core::jobs::{JobPollTool, JobStartTool};
-    use tole_core::read_file::ReadFileTool;
-    use tole_core::run_command::RunCommandTool;
-    use tole_core::uteke::{UtekeDocumentTool, UtekeRecallTool};
-    if tole_cli_binary_available("cora") {
-        reg.register(Box::new(CoraSearchTool::new()))?;
-    }
-    if tole_cli_binary_available("uteke") {
-        reg.register(Box::new(UtekeRecallTool::new()))?;
-        if !plan_mode {
-            reg.register(Box::new(UtekeDocumentTool::new(None)))?;
-        }
-    }
-    // Write-tier tools: skipped entirely under --plan-mode (read-only
-    // sessions — the model cannot even attempt a write). The earlier
-    // draft registered everything and "filtered" afterwards, which
-    // CodeCora rightly called out: the full registry under --yes broke
-    // the read-only contract.
-    let agent_depth: u32 = std::env::var("TOLE_AGENT_DEPTH")
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(0);
-    if !plan_mode {
-        let run_cmd = if agent_depth >= 1 {
-            RunCommandTool::new(workspace_canon.clone()).in_child_agent_mode()
-        } else {
-            RunCommandTool::new(workspace_canon.clone())
-        };
-        reg.register(Box::new(run_cmd))?;
-        let job_start = if agent_depth >= 1 {
-            JobStartTool::new(workspace_canon.clone()).in_child_agent_mode()
-        } else {
-            JobStartTool::new(workspace_canon.clone())
-        };
-        reg.register(Box::new(job_start))?;
-        reg.register(Box::new(WriteFileTool::new(workspace_canon.clone())))?;
-        reg.register(Box::new(EditFileTool::new(workspace_canon.clone())))?;
-        {
-            // Issue #254 (rescan #24): probe-gated like the gitea tool —
-            // when GitHub detection fails, NO gh tool (a hardcoded
-            // fallback repo invited wrong-repo writes from any
-            // unrelated workspace). Absent legs degrade, never a
-            // phantom.
-            if let Some(repo) = detect_github_repo(&workspace_canon) {
-                reg.register(Box::new(GhTool::new(repo)))?;
-            }
-            register_gitea(&mut reg, &workspace_canon);
-        }
-        reg.register(Box::new(GitTool::new().in_dir(workspace_canon.clone())))?;
-        // delete_file (Destructive) registers ONLY behind an interactive
-        // approver — in serve mode (allowlist) it is skipped: Destructive
-        // is never allowlistable, and a server has no human to ask.
-        if interactive {
-            reg.register(Box::new(DeleteFileTool::new(workspace_canon.clone())))?;
-        }
-    }
-    reg.register(Box::new(JobPollTool::new(workspace_canon.clone())))?;
-    reg.register(Box::new(ReadFileTool::new(workspace_canon.clone())))?;
-    // Web tools (issue #215): fetch always (direct HTTPS); search only
-    // when a backend is configured (TOLE_WEB_SEARCH_URL) — probe-first:
-    // no backend, no tool, never a phantom.
-    reg.register(Box::new(tole_core::web::WebFetchTool))?;
-    if tole_core::web::WebSearchTool::from_env().is_some() {
-        reg.register(Box::new(tole_core::web::WebSearchTool::from_env().unwrap()))?;
-    }
-    // Plan publishing (issue #196 phase 4): model-facing tool, present
-    // only when the transport has a client that renders plans (ACP).
-    if let Some(emitter) = plan_emitter {
-        reg.register(Box::new(UpdatePlanTool::new(emitter)))?;
-    }
-    // systemone_decide (#172): probe-gated on SYSTEMONE_API_KEY.
-    if let Some(t) = tole_core::systemone::SystemOneTool::from_env() {
-        reg.register(Box::new(t))?;
-    }
-    // Child agents (#171): parent sessions only — a child (depth >= 1)
-    // gets no agent tools at all (the structural depth cap).
-    if agent_depth == 0 && !plan_mode {
-        if let Ok(bin) = std::env::current_exe() {
-            let _ = reg.register(Box::new(
-                tole_core::agents::AgentStartTool::new(bin, workspace_canon.clone())
-                    .with_parent_allows(parent_allows.clone()),
-            ));
-            let _ = reg.register(Box::new(tole_core::agents::AgentPollTool::new(
-                workspace_canon.clone(),
-            )));
-        }
-    }
+    // The shared tool roster (#420): server faces jail files AND shell
+    // tools to the session workspace, may start child agents (not in
+    // plan mode, never from a child), and publish plans when the
+    // transport renders them. delete_file follows the approver: only an
+    // interactive one (ACP) gets it.
+    let mut roster = crate::tool_roster::Roster::new(workspace_canon);
+    roster.plan_mode = plan_mode;
+    roster.agents = Some(crate::tool_roster::AgentTools {
+        worktrees: false,
+        parent_allows,
+    });
+    roster.plan_emitter = plan_emitter;
+    let mut reg = crate::tool_roster::build(approver, roster).map_err(|e| e.to_string())?;
     // Turn-end stop gates (#145): the same registry-level wiring the
     // run/chat hosts use, applied to server-face sessions.
     if !turnend.is_empty() {
@@ -374,29 +438,21 @@ pub fn open_session(
         tole_core::storage::JsonlStorage::open(dir.join(format!("{session_id}.jsonl")))
             .map_err(|e| format!("loading session: {e}"))?
     } else {
-        tole_core::storage::JsonlStorage::create_with(
+        let storage = tole_core::storage::JsonlStorage::create_with(
             &dir,
             session_id,
             None,
             system_prompt.as_deref(),
         )
-        .map_err(|e| format!("creating session: {e}"))?
+        .map_err(|e| format!("creating session: {e}"))?;
+        crate::session_index::record(&dir, session_id, "server");
+        storage
     };
     // Task-list tools (issue #198): registered after the storage open —
-    // the state is seeded from the replayed transcript (settled
-    // todo_write outputs), so crash-resume restores the last list.
-    // todo_read is ReadOnly (plan-mode safe); todo_write joins the other
-    // Write tools in being absent under --plan-mode.
-    let todo_state = tole_core::todo::TodoState::new();
-    todo_state.hydrate(storage.entries());
-    reg.register(Box::new(tole_core::todo::TodoReadTool::new(StdArc::clone(
-        &todo_state,
-    ))))?;
-    if !plan_mode {
-        reg.register(Box::new(tole_core::todo::TodoWriteTool::new(
-            StdArc::clone(&todo_state),
-        )))?;
-    }
+    // the state is seeded from the replayed transcript, so crash-resume
+    // restores the last list; todo_write is absent under --plan-mode.
+    crate::tool_roster::register_todo(&mut reg, storage.entries(), plan_mode)
+        .map_err(|e| e.to_string())?;
 
     Ok(SessionState {
         storage: StdArc::new(Mutex::new(storage)),
@@ -416,21 +472,7 @@ pub fn sessions_dir_for(cwd: &str) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
-pub fn tole_cli_binary_available(name: &str) -> bool {
-    if name.contains('/') {
-        return std::path::Path::new(name).is_file();
-    }
-    if let Ok(path) = std::env::var("PATH") {
-        for dir in std::env::split_paths(&path) {
-            if dir.join(name).is_file() {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-pub fn detect_github_repo(cwd: &PathBuf) -> Option<String> {
+pub fn detect_github_repo(cwd: &std::path::Path) -> Option<String> {
     let mut cmd = std::process::Command::new("git");
     cmd.args(["config", "--get", "remote.origin.url"])
         .current_dir(cwd);
@@ -496,56 +538,27 @@ pub fn run_session_turn(
     prompt: &str,
     observer: Option<StdArc<dyn tole_core::turn::TurnObserver>>,
 ) -> Result<(String, Option<String>), String> {
-    // Brief map lock: take the session's handles and reject a busy
-    // session. The MAP lock is released here — a running turn holds only
-    // its OWN storage lock, so the transport loop stays live (CodeCora
-    // deadlock finding).
-    let (storage, registry, memory, system_prompt, first_prompt_done, busy_guard, cancel) = {
-        let mut sessions = lock_sessions(&sessions);
-        let Some(state) = sessions.map.get_mut(session_id) else {
-            return Err(format!("unknown session: {session_id}"));
-        };
-        {
-            let mut busy = state.busy.lock().expect("busy lock");
-            if *busy {
-                return Err("session is busy running a turn".into());
-            }
-            *busy = true;
-            // Wipe a stale cancel flag in the SAME critical section as
-            // the busy claim (#178): a cancel that lands after this
-            // point targets THIS turn; one that landed before it had no
-            // in-flight turn to target and must not kill the new one.
-            state.cancel.reset();
-        }
-        (
-            state.storage.clone(),
-            state.registry.clone(),
-            state.memory.clone(),
-            state.system_prompt.clone(),
-            state.first_prompt_done.clone(),
-            std::sync::Arc::clone(&state.busy),
-            state.cancel.clone(),
-        )
-    };
-    // Panic-safe un-busy: Drop clears the flag even if the turn unwinds.
-    let _busy_guard = BusyGuard(busy_guard);
+    // Brief map lock: claim the session for this turn. The MAP lock is
+    // released here — a running turn holds only its OWN storage lock, so
+    // the transport loop stays live (CodeCora deadlock finding).
+    let (state, _busy_guard) = lock_sessions(&sessions).claim_turn(session_id)?;
+    let SessionState {
+        storage,
+        registry,
+        memory,
+        system_prompt,
+        first_prompt_done,
+        cancel,
+        ..
+    } = state;
     let mut final_text: Option<String> = None;
 
     // Memory loop, pre-turn (first prompt of a fresh session only).
-    let mut effective = prompt.to_string();
-    {
-        let done = *first_prompt_done.lock().expect("fpd lock");
-        if !done {
-            if let Some(mem) = &memory {
-                if let Ok(block) = tole_core::memory::recall_block(mem, prompt) {
-                    if !block.is_empty() {
-                        eprintln!("tole: memory: recalled context injected");
-                        effective = format!("{prompt}{block}");
-                    }
-                }
-            }
-        }
-    }
+    let effective = if *first_prompt_done.lock().expect("fpd lock") {
+        prompt.to_string()
+    } else {
+        crate::turn_runner::with_recalled_memory(memory.as_ref(), prompt)
+    };
 
     // Lock the storage for the rest of the turn. The provider is built
     // fresh every turn (issue #176): a `fact/model` register override —
@@ -553,35 +566,18 @@ pub fn run_session_turn(
     // the env default. serve sessions have no setter today, so this is
     // a no-op there.
     let mut storage = storage.lock().unwrap_or_else(|p| p.into_inner());
-    let Some(mut cfg) = crate::config_apply::provider_config() else {
-        return Err(
-            "missing provider config: set TOLE_BASE_URL / TOLE_MODEL / TOLE_API_KEY              (or the OPENAI_* equivalents)"
-                .into(),
-        );
-    };
-    if let Some(model) = storage
-        .get_register("fact", "model")
-        .and_then(serde_json::Value::as_str)
-        .filter(|m| !m.trim().is_empty())
-    {
-        cfg.model = model.to_string();
-    }
-    let mut provider =
-        tole_core::openai::OpenAiProvider::new(cfg).with_tool_specs(registry.specs());
-    if let Some(sys) = system_prompt.as_deref() {
-        provider = provider.with_system_prompt(sys);
-    }
+    let cfg = crate::turn_runner::provider_config()?;
     // Live-token sinks (issue #196 phase 3): when an observer is wired
     // (ACP), streamed reasoning/content deltas flow to it DURING the
-    // provider call; the decisive output semantics are unchanged.
-    if let Some(o) = observer.as_ref() {
-        let ot = StdArc::clone(o);
-        let or = StdArc::clone(o);
-        provider = provider.with_delta_sinks(
-            Some(StdArc::new(move |t: &str| ot.text_delta(t))),
-            Some(StdArc::new(move |r: &str| or.reasoning(r))),
-        );
-    }
+    // provider call; the decisive output semantics are unchanged. The same
+    // configuration applies to a reserve provider (#209).
+    let mut provider = crate::turn_runner::session_provider(
+        cfg,
+        &*storage,
+        registry.specs(),
+        system_prompt.as_deref(),
+        observer.as_ref(),
+    )?;
 
     let outcome = tole_core::turn::run_turn_with_observer(
         &mut *storage,
@@ -595,9 +591,7 @@ pub fn run_session_turn(
 
     #[cfg(feature = "shell-tools")]
     if let tole_core::turn::TurnOutcome::Final { text, wrote } = &outcome {
-        if let Some(mem) = &memory {
-            let _ = tole_core::memory::remember_session(mem, session_id, prompt, text, *wrote);
-        }
+        crate::turn_runner::remember(memory.as_ref(), session_id, prompt, text, *wrote);
     }
     *first_prompt_done.lock().expect("fpd lock") = true;
 
@@ -619,47 +613,23 @@ pub fn resume_session_turn(
     sessions: SharedSessions,
     session_id: &str,
 ) -> Result<(String, Option<String>), String> {
-    let (storage, registry, system_prompt, busy_guard, cancel) = {
-        let mut sessions = lock_sessions(&sessions);
-        let Some(state) = sessions.map.get_mut(session_id) else {
-            return Err(format!("unknown session: {session_id}"));
-        };
-        {
-            let mut busy = state.busy.lock().expect("busy lock");
-            if *busy {
-                return Err("session is busy running a turn".into());
-            }
-            *busy = true;
-            state.cancel.reset();
-        }
-        (
-            state.storage.clone(),
-            state.registry.clone(),
-            state.system_prompt.clone(),
-            StdArc::clone(&state.busy),
-            state.cancel.clone(),
-        )
-    };
-    let _busy_guard = BusyGuard(busy_guard);
+    let (state, _busy_guard) = lock_sessions(&sessions).claim_turn(session_id)?;
+    let SessionState {
+        storage,
+        registry,
+        system_prompt,
+        cancel,
+        ..
+    } = state;
     let mut storage = storage.lock().unwrap_or_else(|p| p.into_inner());
-    let Some(mut cfg) = crate::config_apply::provider_config() else {
-        return Err(
-            "missing provider config: set TOLE_BASE_URL / TOLE_MODEL / TOLE_API_KEY              (or the OPENAI_* equivalents)"
-                .into(),
-        );
-    };
-    if let Some(model) = storage
-        .get_register("fact", "model")
-        .and_then(serde_json::Value::as_str)
-        .filter(|m| !m.trim().is_empty())
-    {
-        cfg.model = model.to_string();
-    }
-    let mut provider =
-        tole_core::openai::OpenAiProvider::new(cfg).with_tool_specs(registry.specs());
-    if let Some(sys) = system_prompt.as_deref() {
-        provider = provider.with_system_prompt(sys);
-    }
+    let cfg = crate::turn_runner::provider_config()?;
+    let mut provider = crate::turn_runner::session_provider(
+        cfg,
+        &*storage,
+        registry.specs(),
+        system_prompt.as_deref(),
+        None,
+    )?;
     // #318: the session token is wired into the replan loop, so
     // `/cancel` during an approval-resume settles the turn as cancelled.
     // The `reset()` above stays: like `run_session_turn`, it runs inside
@@ -833,6 +803,72 @@ mod eviction_tests {
     }
 
     #[test]
+    fn admit_replaces_an_idle_id_refuses_a_busy_one_and_evicts_for_a_new_one() {
+        let dir = TmpDir::new("admit");
+        let mut s = Sessions::default();
+        assert_eq!(
+            s.admit_capped("a".into(), state(dir.path(), "a", false), 2),
+            Ok(vec![])
+        );
+        // Re-open of an idle id: replaced in place, nothing evicted.
+        assert_eq!(
+            s.admit_capped("a".into(), state(dir.path(), "a2", false), 2),
+            Ok(vec![])
+        );
+        assert_eq!(s.len(), 1);
+        assert_eq!(
+            s.admit_capped("b".into(), state(dir.path(), "b", true), 2),
+            Ok(vec![])
+        );
+        // A busy live id is never swapped out from under its turn.
+        assert_eq!(
+            s.admit_capped("b".into(), state(dir.path(), "b2", false), 2),
+            Err(AdmitError::Busy)
+        );
+        // A new id at capacity evicts the idle one, never the busy one.
+        assert_eq!(
+            s.admit_capped("c".into(), state(dir.path(), "c", true), 2),
+            Ok(vec!["a".to_string()])
+        );
+        assert!(s.get("b").is_some() && s.get("c").is_some());
+        assert_eq!(
+            s.admit_capped("d".into(), state(dir.path(), "d", false), 2),
+            Err(AdmitError::AtCapacity)
+        );
+    }
+
+    #[test]
+    fn claim_turn_marks_busy_resets_a_stale_cancel_and_releases_on_drop() {
+        let dir = TmpDir::new("claim");
+        let mut s = Sessions::default();
+        s.admit("a".into(), state(dir.path(), "a", false)).unwrap();
+        assert!(s.claim_turn("nope").is_err());
+        assert!(s.cancel("a"), "a stale cancel before the turn");
+        let (st, guard) = s.claim_turn("a").unwrap();
+        assert!(!st.cancel.is_cancelled(), "the claim clears it");
+        assert!(s.is_busy("a"));
+        assert_eq!(
+            s.claim_turn("a").err().as_deref(),
+            Some("session is busy running a turn")
+        );
+        drop(guard);
+        assert!(!s.is_busy("a"));
+        assert!(!s.cancel("nope"));
+    }
+
+    #[test]
+    fn resolve_id_uses_the_explicit_id_or_the_only_session() {
+        let dir = TmpDir::new("resolve");
+        let mut s = Sessions::default();
+        assert_eq!(s.resolve_id(None), Err(AMBIGUOUS_SESSION.to_string()));
+        s.admit("a".into(), state(dir.path(), "a", false)).unwrap();
+        assert_eq!(s.resolve_id(None), Ok("a".to_string()));
+        assert_eq!(s.resolve_id(Some("x")), Ok("x".to_string()));
+        s.admit("b".into(), state(dir.path(), "b", false)).unwrap();
+        assert_eq!(s.resolve_id(None), Err(AMBIGUOUS_SESSION.to_string()));
+    }
+
+    #[test]
     fn below_cap_evicts_nothing() {
         let dir = TmpDir::new("below");
         let mut s = Sessions::default();
@@ -906,5 +942,57 @@ mod stop_reason_tests {
         ] {
             assert_eq!(s(o), "refusal");
         }
+    }
+}
+
+#[cfg(test)]
+mod roster_tests {
+    use super::*;
+    use tole_core::approval::AllowlistApprover;
+    use tole_core::tool::Risk;
+
+    fn open(tag: &str, plan_mode: bool) -> SessionState {
+        let ws = std::env::temp_dir().join(format!("tole-sh-roster-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(&ws).unwrap();
+        open_session(
+            "s-roster",
+            ws.to_str().unwrap(),
+            false,
+            plan_mode,
+            AllowlistApprover::allow_only(vec![]),
+            None,
+            Some(&ws.join("sessions")),
+            Vec::new(),
+            Vec::new(),
+            tole_core::cancel::CancelToken::default(),
+            None,
+        )
+        .unwrap()
+    }
+
+    /// #420: server sessions build their tools through the shared roster —
+    /// the same rules as the CLI (verify_package present; delete_file absent
+    /// behind a non-interactive approver; plan mode leaves ReadOnly only).
+    #[test]
+    fn server_sessions_use_the_shared_roster() {
+        let s = open("full", false);
+        assert!(s.registry.get("verify_package").is_some());
+        assert!(s.registry.get("write_file").is_some());
+        assert!(s.registry.get("todo_write").is_some());
+        assert!(s.registry.get("delete_file").is_none());
+
+        let p = open("plan", true);
+        assert!(p.registry.get("read_file").is_some());
+        assert!(p.registry.get("todo_read").is_some());
+        for name in ["write_file", "run_command", "agent_start", "todo_write"] {
+            assert!(p.registry.get(name).is_none(), "{name} in plan mode");
+        }
+        assert!(p
+            .registry
+            .specs()
+            .iter()
+            .filter_map(|s| s["function"]["name"].as_str().or(s["name"].as_str()))
+            .all(|n| p.registry.get(n).map(|t| t.risk()) == Some(Risk::ReadOnly)));
     }
 }
