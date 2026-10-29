@@ -242,6 +242,35 @@ fn torn_final_line_is_discarded_whole() {
 }
 
 #[test]
+fn a_read_only_open_never_truncates_a_torn_tail() {
+    // Scan 2026-10-28: listings replayed sessions with `open`, whose torn-tail
+    // repair could cut a line another process was still appending.
+    let dir = tmpdir("torn-ro");
+    let mut s = JsonlStorage::create(&dir, "t", None).unwrap();
+    s.commit(Commit::new().entry(message(json!({"ok":1}))))
+        .unwrap();
+    drop(s);
+    let path = dir.join("t.jsonl");
+    let mut partial = std::fs::read(&path).unwrap();
+    partial.extend_from_slice(b"{\"half\":");
+    std::fs::write(&path, &partial).unwrap();
+
+    let mut ro = JsonlStorage::open_read_only(&path).unwrap();
+    assert_eq!(ro.entries().len(), 1, "the torn tail is skipped in memory");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        partial,
+        "the file is untouched"
+    );
+    // A commit through a read-only replay fails instead of writing.
+    assert!(ro
+        .commit(Commit::new().entry(message(json!({"x":1}))))
+        .is_err());
+    drop(ro);
+    assert_eq!(std::fs::read(&path).unwrap(), partial);
+}
+
+#[test]
 fn stale_transition_is_rejected_not_overwritten() {
     let dir = tmpdir("stale");
     let mut s = JsonlStorage::create(&dir, "st", None).unwrap();

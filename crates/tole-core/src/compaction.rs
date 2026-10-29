@@ -156,7 +156,8 @@ pub fn last_prompt_tokens(s: &dyn Storage) -> Option<u64> {
 /// when there is at least one settled turn before it (after the last
 /// compaction's kept tail) to summarize.
 fn cut_index(entries: &[Entry], keep_turns: usize) -> Option<usize> {
-    let floor = last_compaction(entries)
+    let last = last_compaction(entries);
+    let floor = last
         .and_then(|ci| entries[ci].payload[FROM_KEY].as_str())
         .and_then(|from| entries.iter().position(|e| e.id == from))
         .unwrap_or(0);
@@ -168,7 +169,12 @@ fn cut_index(entries: &[Entry], keep_turns: usize) -> Option<usize> {
     if starts.len() <= keep {
         return None;
     }
-    Some(starts[starts.len() - keep])
+    let cut = starts[starts.len() - keep];
+    // The cut must lie AFTER the last compaction entry: the summary call
+    // reads `view(&entries[..cut])`, which needs that entry, or it would
+    // replay the whole raw transcript and drop the earlier summary
+    // (keep_turns >= 2; scan 2026-10-28).
+    last.is_none_or(|ci| cut > ci).then_some(cut)
 }
 
 /// Should the session compact before its next turn? The last call's prompt
@@ -449,6 +455,36 @@ mod tests {
         assert!(shown[0].contains("SUMMARY-2") && !shown[0].contains("SUMMARY-1"));
         assert_eq!(&shown[1..], ["q4", "a4"]);
         assert_eq!(history(s.entries()).len(), 2);
+    }
+
+    #[test]
+    fn keeping_two_turns_never_cuts_before_the_last_summary() {
+        // Scan 2026-10-28: with keep_turns 2 the next cut could land on a
+        // turn kept by the first compaction, BEFORE its entry — the summary
+        // call then replayed the raw transcript and lost SUMMARY-1.
+        let mut s = storage();
+        turn(&mut s, "q1", "a1", 3_000);
+        turn(&mut s, "q2", "a2", 5_000);
+        turn(&mut s, "q3", "a3", 8_500);
+        let mut p = recorder(vec![final_text("SUMMARY-1"), final_text("SUMMARY-2")]);
+        compact(&mut s, &mut p, 2).unwrap().unwrap();
+        // One turn after it: the kept-two cut would precede the entry.
+        turn(&mut s, "q4", "a4", 9_000);
+        assert!(!due(
+            &Policy {
+                keep_turns: 2,
+                ..Policy::new(10_000)
+            },
+            &s
+        ));
+        assert_eq!(compact(&mut s, &mut p, 2).unwrap(), None);
+        // Two turns after it: the cut lies past the entry, summary 1 is in.
+        turn(&mut s, "q5", "a5", 9_000);
+        compact(&mut s, &mut p, 2).unwrap().unwrap();
+        let asked = texts(&p.seen[1]);
+        assert!(asked[0].contains("SUMMARY-1"), "{asked:?}");
+        assert!(!asked.iter().any(|t| t == "q1" || t == "q4"), "{asked:?}");
+        assert_eq!(&asked[1..5], ["q2", "a2", "q3", "a3"]);
     }
 
     #[test]

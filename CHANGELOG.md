@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Approval prompts now also escape the Arabic letter mark (U+061C), the Mongolian vowel separator (U+180E), the word joiner and invisible math operators (U+2060–U+2064) and the deprecated format characters (U+206A–U+206F); they could visually reorder or hide text (pre-tag scan of 0.9.0).
+- The API key is redacted from replayed tool-call arguments on the wire, as it already was from message text and tool results (E11).
+- Compaction with `keep_turns` of 2 or more no longer cuts before the previous summary, which made the summary call replay the raw transcript and drop that summary. Only embedders could hit it; the CLI keeps one turn.
+- `tole sessions`, `sessions --all`, `tole status` and session-name lookup replay session files read-only (`JsonlStorage::open_read_only`): they no longer truncate a torn last line that another process may still be appending.
+
 ## [0.9.0] — 2026-10-28
 
 Includes the 0.8.2 hardening patch below, which was never tagged or published on its own.
