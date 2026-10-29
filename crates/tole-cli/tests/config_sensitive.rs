@@ -86,29 +86,14 @@ fn base_cmd(cwd: &Path, home: &Path, args: &[&str]) -> Command {
     c
 }
 
-/// Run to completion; a hung child is a test failure, not a hang. Both
-/// pipes are drained while polling, so a chatty child can never block on a
-/// full pipe and read as a hang.
+/// Run to completion; a hung child is a test failure, not a hang.
 fn finish(mut c: Command) -> Output {
     c.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = c.spawn().unwrap();
-    let drain = |mut r: Box<dyn Read + Send>| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = r.read_to_end(&mut buf);
-            buf
-        })
-    };
-    let out = drain(Box::new(child.stdout.take().unwrap()));
-    let err = drain(Box::new(child.stderr.take().unwrap()));
     let start = Instant::now();
     loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            return Output {
-                status,
-                stdout: out.join().unwrap(),
-                stderr: err.join().unwrap(),
-            };
+        if child.try_wait().unwrap().is_some() {
+            return child.wait_with_output().unwrap();
         }
         if start.elapsed() > Duration::from_secs(60) {
             let _ = child.kill();

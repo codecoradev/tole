@@ -334,7 +334,10 @@ fn agent_alive(pid: u32, id: &str) -> Result<bool, String> {
     if !pid_alive(pid)? {
         return Ok(false);
     }
-    Ok(process_command(pid).is_none_or(|cmd| cmd.contains(id)))
+    // The whole path segment: a bare `contains(id)` would let agent `a-12`
+    // pass for a dead `a-1`.
+    let sessions = format!("/{id}/sessions");
+    Ok(process_command(pid).is_none_or(|cmd| cmd.contains(&sessions)))
 }
 
 /// One agent's durable state (meta.json in its dir).
@@ -1620,6 +1623,10 @@ mod tests {
             !agent_alive(pid, "a-someone-else").unwrap(),
             "a process that is not this agent"
         );
+        // Ids that are a prefix or a suffix of this agent's id are not it.
+        for other in ["a-live", "live-agent", "a-live-agen"] {
+            assert!(!agent_alive(pid, other).unwrap(), "{other}");
+        }
 
         std::fs::write(dir.join("pid"), pid.to_string()).unwrap();
         let meta = AgentMeta {
