@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The API key is redacted from replayed tool-call arguments on the wire, as it already was from message text and tool results (E11).
 - Compaction with `keep_turns` of 2 or more no longer cuts before the previous summary, which made the summary call replay the raw transcript and drop that summary. Only embedders could hit it; the CLI keeps one turn.
 - `tole sessions`, `sessions --all`, `tole status` and session-name lookup replay session files read-only (`JsonlStorage::open_read_only`): they no longer truncate a torn last line that another process may still be appending.
+- `agent_poll` and the concurrent-agent cap no longer treat a recycled pid as the agent: a live pid whose command line does not name the agent (every child is launched with `--sessions-dir <agents>/<id>/sessions`) is another process, so a dead child whose number was reused no longer holds a cap slot or reads as "running" forever (pre-tag scan of 0.9.0). Identity, not clocks or executable names: a wall-clock age check would read a live agent as dead after a clock jump, and a launcher changes the process name. An unreadable command line keeps the plain liveness check.
 
 ## [0.9.0] — 2026-10-28
 
