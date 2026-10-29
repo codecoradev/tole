@@ -354,7 +354,8 @@ impl OpenAiProvider {
                             "type": "function",
                             "function": {
                                 "name": tool,
-                                "arguments": input.to_string(),
+                                // E11 covers the tool-call arguments too.
+                                "arguments": scrub(&input.to_string(), &self.cfg.api_key),
                             },
                         }],
                     }));
@@ -1246,6 +1247,26 @@ mod transcript_tests {
             serialized.contains("<redacted>"),
             "redaction marker missing: {serialized}"
         );
+    }
+
+    #[test]
+    fn request_body_redacts_api_key_from_tool_call_arguments() {
+        // E11 (scan 2026-10-28): the replayed intent's arguments are wire
+        // text too.
+        let key = "sk-super-secret-789";
+        let p = OpenAiProvider::new(OpenAiConfig::new("https://x.example/v1", "m", key));
+        let mut intent = msg("intent_1", "assistant", "");
+        intent.kind = EntryType::new("intent");
+        intent.payload = json!({
+            "tool": "write_file",
+            "input": { "path": ".env", "content": "KEY=sk-super-secret-789" }
+        });
+        let body = p.request_body(&[intent]);
+        let args = body["messages"][0]["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .unwrap();
+        assert!(!args.contains(key), "api key leaked in arguments: {args}");
+        assert!(args.contains("<redacted>"), "{args}");
     }
 
     #[test]

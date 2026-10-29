@@ -1765,7 +1765,7 @@ fn resume_command(
             if !valid_session_id(stem) {
                 continue;
             }
-            let Ok(s) = JsonlStorage::open(entry.path()) else {
+            let Ok(s) = JsonlStorage::open_read_only(entry.path()) else {
                 continue;
             };
             if s.session_name() == Some(id) {
@@ -1893,7 +1893,7 @@ fn status_command(sessions_dir: &Path, id: &str) -> Result<()> {
     if !path.exists() {
         anyhow::bail!("session {id} not found at {}", path.display());
     }
-    let storage = JsonlStorage::open(&path).context("replaying session log")?;
+    let storage = JsonlStorage::open_read_only(&path).context("replaying session log")?;
     println!("session: {id}");
     println!("entries: {}", storage.entries().len());
     println!("pc:      {:?}", storage.state().pc);
@@ -1977,7 +1977,7 @@ fn sessions_command(sessions_dir: &Path) -> Result<()> {
             .unwrap_or(0);
         let id = stem.to_string();
         // Read-only peek: replay the file to surface pc + turn count.
-        let s = match JsonlStorage::open(entry.path()) {
+        let s = match JsonlStorage::open_read_only(entry.path()) {
             Ok(s) => s,
             Err(_) => continue, // unreadable/corrupt: skip, don't fail the listing
         };

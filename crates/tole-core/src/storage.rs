@@ -420,7 +420,19 @@ impl JsonlStorage {
     /// Older format versions replay cleanly; a newer version is a hard
     /// error. A torn final line (crash mid-append) is discarded whole.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
-        let path = path.as_ref().to_path_buf();
+        Self::open_with(path.as_ref(), true)
+    }
+
+    /// Replays a session file for READING only (listings, status): a torn
+    /// final line is skipped in memory but never truncated on disk, so a
+    /// reader can never cut a line another process is still appending
+    /// (scan 2026-10-28). Do not commit through the result.
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self, StorageError> {
+        Self::open_with(path.as_ref(), false)
+    }
+
+    fn open_with(path: &Path, repair: bool) -> Result<Self, StorageError> {
+        let path = path.to_path_buf();
         let file = File::open(&path)?;
         let mut reader = BufReader::new(file);
 
@@ -469,7 +481,14 @@ impl JsonlStorage {
         let mut out = Self {
             session_id: header.id.clone(),
             path: path.clone(),
-            writer: BufWriter::new(OpenOptions::new().append(true).open(&path)?),
+            // Read-only replays get a read-only handle: a commit through
+            // them fails instead of writing.
+            writer: BufWriter::new(
+                OpenOptions::new()
+                    .append(repair)
+                    .read(!repair)
+                    .open(&path)?,
+            ),
             created_at: header.created_at,
             cwd: header.cwd.clone(),
             name: header.name.clone(),
@@ -555,7 +574,7 @@ impl JsonlStorage {
         // A torn tail was discarded during replay. Physically truncate the
         // partial bytes NOW, before the append handle concatenates a new
         // commit line onto the fragment (would corrupt the file forever).
-        if good_bytes < file_len(&out.path)? {
+        if repair && good_bytes < file_len(&out.path)? {
             truncate_file(&out.path, good_bytes)?;
             sync_dir(&out.path)?;
         }

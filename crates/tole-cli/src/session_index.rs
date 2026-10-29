@@ -171,7 +171,7 @@ pub fn rows(index: &Path, grep: Option<&str>) -> Vec<Row> {
     load(index)
         .into_iter()
         .filter_map(|entry| {
-            let s = JsonlStorage::open(&entry.file).ok()?;
+            let s = JsonlStorage::open_read_only(&entry.file).ok()?;
             let first = s
                 .entries()
                 .iter()
