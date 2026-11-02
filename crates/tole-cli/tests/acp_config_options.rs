@@ -435,7 +435,9 @@ fn set_config_option_switches_validates_and_persists() {
         assert!(err.get("error").is_some(), "{why} must error: {err}");
     }
 
-    // Fresh process, session/load: the override is still model-b.
+    // Fresh process, session/load: the override is still model-b. The first
+    // process must be gone: it holds the session's writer lock.
+    drop(acp);
     let mut acp2 = AcpProcess::spawn_with(&[
         ("TOLE_MODEL", "model-a"),
         ("TOLE_MODELS", "model-a,model-b"),

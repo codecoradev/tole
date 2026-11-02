@@ -586,9 +586,14 @@ mod verify_error_tests {
         let d = std::env::temp_dir().join(format!("tole-mission-sys-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         let sys = format!("base{}", mission_prompt("ship it", None));
-        let fresh = JsonlStorage::create_with(&d, "m1", None, Some(&sys)).unwrap();
         let cfg = || OpenAiConfig::new("https://x/v1", "m", "k");
-        for storage in [fresh, JsonlStorage::open(d.join("m1.jsonl")).unwrap()] {
+        // One handle at a time: a writable open holds the session lock.
+        for reopen in [false, true] {
+            let storage = if reopen {
+                JsonlStorage::open(d.join("m1.jsonl")).unwrap()
+            } else {
+                JsonlStorage::create_with(&d, "m1", None, Some(&sys)).unwrap()
+            };
             let body = tole_cli::turn_runner::configure_provider(
                 OpenAiProvider::new(cfg()),
                 vec![],
