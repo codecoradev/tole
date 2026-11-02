@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Release builds use thin LTO, a single codegen unit and `strip = true` (#482): the `tole` binary shrinks from 16.7 MB to about 9 MB. The profile is also set in `crates/tole-cli/Cargo.toml` so `cargo install tole-cli` gets it (the workspace-root profile is not packaged). `panic = "abort"` is deliberately not set: Mutex poison recovery and the serve/ACP/MCP daemons rely on unwinding.
+
 ### Fixed
 - Approval prompts now also escape the Arabic letter mark (U+061C), the Mongolian vowel separator (U+180E), the word joiner and invisible math operators (U+2060–U+2064) and the deprecated format characters (U+206A–U+206F); they could visually reorder or hide text (pre-tag scan of 0.9.0).
 - The API key is redacted from replayed tool-call arguments on the wire, as it already was from message text and tool results (E11).
