@@ -948,9 +948,19 @@ fn settle_cancelled(s: &mut dyn Storage) -> Result<TurnOutcome, StorageError> {
 /// Gateway timeouts and rate-limit rejections are transient (#58 + live
 /// 429 evidence). After a failover only the last provider's error counts:
 /// an earlier "timeout" must not make a fail-loud 401 look retryable.
+/// `http status: ` messages are classified by the parsed code only, so a
+/// provider body snippet ("token timeout", "142900 tokens") cannot flip the
+/// decision. 5xx stays non-transient here (bounded retry is #478).
 fn is_transient_provider_error(msg: &str) -> bool {
     const TRANSIENT: [&str; 2] = ["timeout", "429"];
     let lead = crate::failover::leading_error(msg);
+    if let Some(rest) = lead.strip_prefix("http status: ") {
+        let code = rest
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>();
+        return code.parse::<u16>().unwrap_or(0) == 429;
+    }
     TRANSIENT.iter().any(|k| lead.contains(k))
 }
 
@@ -970,5 +980,38 @@ mod transient_tests {
         assert!(is_transient_provider_error(
             "timeout: global [after failover from primary: http status: 502 Bad Gateway — a]"
         ));
+    }
+
+    #[test]
+    fn http_status_errors_are_classified_by_code_not_body() {
+        for (msg, want) in [
+            ("http status: 429 Too Many Requests — rate limited", true),
+            ("http status: 429", true),
+            (
+                r#"http status: 400 Bad Request — {"error":{"message":"resulted in 142900 tokens"}}"#,
+                false,
+            ),
+            (
+                r#"http status: 422 Unprocessable — {"error":{"message":"invalid timeout value"}}"#,
+                false,
+            ),
+            ("http status: 401 Unauthorized — token timeout, re-login", false),
+            ("http status: 400 Bad Request — unknown model id gpt-4290", false),
+            // 5xx retry is a separate issue (#478).
+            ("http status: 503 Service Unavailable — upstream", false),
+            ("http status: 4290 Weird", false),
+            ("timeout: global", true),
+            ("stream read: timeout reading", true),
+            (
+                "http status: 429 Too Many Requests — x [after failover from primary: http status: 401 Unauthorized — y]",
+                true,
+            ),
+            (
+                "http status: 400 Bad Request — token timeout [after failover from primary: timeout: global]",
+                false,
+            ),
+        ] {
+            assert_eq!(is_transient_provider_error(msg), want, "{msg}");
+        }
     }
 }
