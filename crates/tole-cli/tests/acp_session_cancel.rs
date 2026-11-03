@@ -332,7 +332,8 @@ fn acp_cancel_mid_provider_settles_cancelled_and_resumable() {
     let mut found_session = None;
     let dirs = std::fs::read_dir(cwd.join(".tole/sessions")).unwrap();
     for e in dirs.flatten() {
-        if e.file_name().to_string_lossy().contains(&session_id) {
+        let name = e.file_name().to_string_lossy().to_string();
+        if name.contains(&session_id) && name.ends_with(".jsonl") {
             found_session = Some(e.path());
         }
     }

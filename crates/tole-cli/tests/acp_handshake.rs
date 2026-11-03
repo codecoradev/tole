@@ -143,7 +143,9 @@ fn acp_load_returns_existing_session() {
         .to_string();
 
     // Load the SAME session id in a fresh process-backed state: the
-    // durable JSONL is the source of truth (D2 acceptance).
+    // durable JSONL is the source of truth (D2 acceptance). The first
+    // process must be gone: it holds the session's writer lock.
+    drop(acp);
     let mut acp2 = AcpProcess::spawn();
     acp2.send(&json!({
         "jsonrpc": "2.0", "id": 1, "method": "initialize",

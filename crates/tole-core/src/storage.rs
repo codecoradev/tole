@@ -69,6 +69,16 @@ pub enum StorageError {
     /// An effect-sandwich invariant was violated (machine.rs guards).
     #[error("effect sandwich violation: {0}")]
     Effect(String),
+    /// Another process holds the session's writer lock.
+    #[error("session is open for writing by {}", match .holder { Some(pid) => format!("pid {pid}"), None => "another process".to_string() })]
+    Locked {
+        /// Pid recorded in the lock file (best effort).
+        holder: Option<u32>,
+    },
+    /// The file changed under this handle (a writer that ignored the lock);
+    /// appending would duplicate or interleave records.
+    #[error("session file changed under this handle: {0}; re-open the session")]
+    StaleHandle(String),
     /// Underlying I/O failure.
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -313,6 +323,13 @@ pub struct JsonlStorage {
     session_id: String,
     path: PathBuf,
     writer: BufWriter<File>,
+    /// Exclusive advisory lock on the sidecar `<id>.jsonl.lock` (never
+    /// renamed, so it survives `compact()`); `None` for read-only handles.
+    /// Released by the OS on drop or crash.
+    _lock: Option<File>,
+    /// File length after the last append this handle made or replayed;
+    /// a mismatch before an append means someone else wrote.
+    good_len: u64,
     created_at: u64,
     cwd: String,
     system_prompt: Option<String>,
@@ -395,12 +412,16 @@ impl JsonlStorage {
                 .create_new(true)
                 .open(&path)?,
         );
-        writeln!(writer, "{}", serde_json::to_string(&header)?)?;
+        let lock = lock_writer(&path)?;
+        let header_line = serde_json::to_string(&header)?;
+        writeln!(writer, "{header_line}")?;
         writer.flush()?;
         Ok(Self {
             session_id,
             path,
             writer,
+            _lock: Some(lock),
+            good_len: header_line.len() as u64 + 1,
             created_at,
             cwd,
             name: name.map(str::to_string),
@@ -433,6 +454,13 @@ impl JsonlStorage {
 
     fn open_with(path: &Path, repair: bool) -> Result<Self, StorageError> {
         let path = path.to_path_buf();
+        // Lock BEFORE reading or repairing: the torn-tail truncation below
+        // would cut a line another process is still appending.
+        let lock = if repair {
+            Some(lock_writer(&path)?)
+        } else {
+            None
+        };
         let file = File::open(&path)?;
         let mut reader = BufReader::new(file);
 
@@ -489,6 +517,8 @@ impl JsonlStorage {
                     .read(!repair)
                     .open(&path)?,
             ),
+            _lock: lock,
+            good_len: 0,
             created_at: header.created_at,
             cwd: header.cwd.clone(),
             name: header.name.clone(),
@@ -580,6 +610,7 @@ impl JsonlStorage {
         }
         // The global seq advances with every record, transition or not.
         out.state.seq = out.state.seq.max(last_seq);
+        out.good_len = good_bytes;
         Ok(out)
     }
 
@@ -671,6 +702,14 @@ impl JsonlStorage {
     /// record. (A crash mid-line leaves a torn tail, which open() discards
     /// whole — see the torn-tail test.)
     fn append_line(&mut self, line: &str) -> Result<(), StorageError> {
+        // One fstat: the file must still end where our last append did.
+        let actual = self.writer.get_ref().metadata()?.len();
+        if actual != self.good_len {
+            return Err(StorageError::StaleHandle(format!(
+                "expected {} bytes, found {actual}",
+                self.good_len
+            )));
+        }
         let res = (|| -> Result<(), StorageError> {
             writeln!(self.writer, "{line}")?;
             self.writer.flush()?;
@@ -687,6 +726,7 @@ impl JsonlStorage {
             self.poisoned = Some(StorageError::Io(std::io::Error::other(e.to_string())));
             return Err(e);
         }
+        self.good_len += line.len() as u64 + 1;
         Ok(())
     }
 
@@ -758,6 +798,46 @@ impl JsonlStorage {
 fn is_at_eof(reader: &mut BufReader<File>) -> bool {
     let mut probe = [0u8; 1];
     matches!(reader.read(&mut probe), Ok(0))
+}
+
+/// Takes the exclusive writer lock on the sidecar `<path>.lock` and records
+/// our pid in it (best effort). A sidecar, not the session file: `compact()`
+/// renames a new file over the live path, which would drop a lock held on
+/// the old inode.
+fn lock_writer(path: &Path) -> Result<File, StorageError> {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".lock");
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut b = OpenOptions::new();
+    b.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        // CLOEXEC: a spawned child must not inherit the writer lock. Without
+        // it, an flock held on the fd survives into every child until it
+        // exits (run_command, job_start, nohup-style wrappers), and a later
+        // `resume` is refused with a pid that no longer holds the session.
+        b.custom_flags(libc::O_CLOEXEC);
+    }
+    let mut f = b.open(Path::new(&name))?;
+    match f.try_lock() {
+        Ok(()) => {
+            // The pid is advisory text; a failed write never blocks the open.
+            let _ = f
+                .set_len(0)
+                .and_then(|()| write!(f, "{}", std::process::id()));
+            Ok(f)
+        }
+        Err(std::fs::TryLockError::WouldBlock) => {
+            let mut text = String::new();
+            let _ = f.read_to_string(&mut text);
+            Err(StorageError::Locked {
+                holder: text.trim().parse().ok(),
+            })
+        }
+        Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
+    }
 }
 
 /// File length in bytes (used to detect a discarded torn tail on open).
@@ -1057,6 +1137,7 @@ impl Storage for JsonlStorage {
                 return Err(e.into());
             }
         });
+        self.good_len = self.writer.get_ref().metadata()?.len();
         self.state.seq = seq;
         // The file was atomically rewritten from COMPLETE records only —
         // any torn fragment that justified the poison no longer exists.
@@ -1143,7 +1224,10 @@ mod poison_tests {
         // FreeBSD where /dev/full does not exist) — skip honestly there
         // instead of panicking (CodeCora CI annotation).
         match OpenOptions::new().write(true).open("/dev/full") {
-            Ok(f) => s.writer = BufWriter::new(f),
+            Ok(f) => {
+                s.writer = BufWriter::new(f);
+                s.good_len = 0; // /dev/full is empty: keep the stale-handle check quiet
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 eprintln!("/dev/full unavailable on this platform — poison path untested here");
                 let _ = std::fs::remove_dir_all(&dir);
