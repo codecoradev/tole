@@ -200,7 +200,13 @@ pub fn run_turn_with_observer(
     // (previous turn delivered; B1 chat re-opens it). Anything else means a
     // turn is mid-flight (e.g. after ProviderFailed) and must be resolved
     // via resume/finish first — driving two turns concurrently is a host bug.
-    let current = s.state().pc;
+    let mut current = s.state().pc;
+    // #476: a turn parked after a denied call is settled by the new prompt
+    // (the denial note stays in the transcript, so the model still sees it).
+    if current == Pc::Planning && transcript::parked_after_denial(s.entries()) {
+        settle_final(s)?;
+        current = Pc::Final;
+    }
     if !matches!(current, Pc::Idle | Pc::Final) {
         return Err(StorageError::Invalid(format!(
             "run_turn requires pc Idle or Final, found {current:?} — resolve the session first (resume/finish)"
@@ -385,7 +391,7 @@ fn replay_intent(
             settle_err(
                 s,
                 &handle,
-                "replay denied: no fresh approval for a guarded effect",
+                &format!("replay denied: no fresh approval for a guarded effect{REPLAY_UNKNOWN}"),
             )?;
             // #178: a cancel that landed while the fresh approval was
             // pending fails closed to Deny, but the turn is CANCELLED, not
@@ -398,14 +404,28 @@ fn replay_intent(
                 "approval required",
                 &format!("guarded intent {intent_id} replay denied (no fresh approval)"),
             )?;
+            append_denial_note(
+                s,
+                &tool,
+                &format!("approval refused on resume{REPLAY_UNKNOWN}"),
+            )?;
             return Ok(Some(TurnOutcome::ApprovalRequired { name: tool }));
         }
         #[cfg(feature = "shell-tools")]
         Err(Denied::PreHook { reason }) => {
             // scan-3: a hook-deny must not be bypassable by crashing
             // before settlement (mirrors the fresh-path check).
-            settle_err(s, &handle, &format!("replay denied by pre-hook: {reason}"))?;
+            settle_err(
+                s,
+                &handle,
+                &format!("replay denied by pre-hook: {reason}{REPLAY_UNKNOWN}"),
+            )?;
             append_turn_error(s, "pre-hook denial", &format!("{tool}: {reason}"))?;
+            append_denial_note(
+                s,
+                &tool,
+                &format!("pre-tool hook on resume: {reason}{REPLAY_UNKNOWN}"),
+            )?;
             return Ok(Some(TurnOutcome::ApprovalRequired { name: tool }));
         }
     };
@@ -825,6 +845,7 @@ fn drive(
                             return settle_cancelled(s);
                         }
                         append_turn_error(s, "approval required", &tool)?;
+                        append_denial_note(s, &tool, "approval refused")?;
                         return Ok(TurnOutcome::ApprovalRequired { name: tool });
                     }
                     #[cfg(feature = "shell-tools")]
@@ -832,6 +853,7 @@ fn drive(
                         // Pre-hook deny (issue #110) settles like an approval
                         // denial: durable turn error + ApprovalRequired.
                         append_turn_error(s, "pre-hook denial", &format!("{tool}: {reason}"))?;
+                        append_denial_note(s, &tool, &format!("pre-tool hook: {reason}"))?;
                         return Ok(TurnOutcome::ApprovalRequired { name: tool });
                     }
                 };
@@ -1003,6 +1025,30 @@ fn append_turn_error(s: &mut dyn Storage, error: &str, detail: &str) -> Result<(
         payload: json!({ "error": error, "detail": detail }),
         timestamp: 0,
     }))?;
+    Ok(())
+}
+
+/// Suffix for a denied REPLAY (#476): the interrupted effect may already
+/// have run, so a denial there is not "it did not happen".
+const REPLAY_UNKNOWN: &str = " — the outcome is UNKNOWN: the effect may have run before the \
+interruption; check state before retrying";
+
+/// Synthetic user-role note (the stop-gate feedback pattern) so the denial
+/// reaches the model's next request: a denied call leaves no intent, so
+/// the error entry alone is an orphan the wire drops (#476). Marked so it
+/// never opens a turn, and it parks the turn for `run_turn` to settle.
+fn append_denial_note(s: &mut dyn Storage, tool: &str, why: &str) -> Result<(), StorageError> {
+    s.commit(Commit::new().entry(NewEntry::root(
+        EntryType::new(EntryType::MESSAGE),
+        json!({
+            "role": "user",
+            "text": format!(
+                "[tole] Your call to `{tool}` was denied ({why}). Do not repeat it \
+                 unchanged — use another approach or say what is blocked."
+            ),
+            transcript::DENIAL_NOTE: true,
+        }),
+    )))?;
     Ok(())
 }
 
