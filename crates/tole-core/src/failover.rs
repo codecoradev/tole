@@ -211,6 +211,12 @@ impl Provider for FailoverProvider {
         self.answered().and_then(Provider::last_wire_stats)
     }
 
+    fn last_extra_tool_calls(&self) -> Vec<(String, Value)> {
+        self.answered()
+            .map(Provider::last_extra_tool_calls)
+            .unwrap_or_default()
+    }
+
     fn last_route(&self) -> Option<Value> {
         let i = self.last_answered?;
         let mut route = json!({ "provider": self.chain[i].label });
