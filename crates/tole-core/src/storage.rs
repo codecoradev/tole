@@ -807,12 +807,20 @@ fn is_at_eof(reader: &mut BufReader<File>) -> bool {
 fn lock_writer(path: &Path) -> Result<File, StorageError> {
     let mut name = path.as_os_str().to_owned();
     name.push(".lock");
-    let mut f = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(Path::new(&name))?;
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut b = OpenOptions::new();
+    b.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        // CLOEXEC: a spawned child must not inherit the writer lock. Without
+        // it, an flock held on the fd survives into every child until it
+        // exits (run_command, job_start, nohup-style wrappers), and a later
+        // `resume` is refused with a pid that no longer holds the session.
+        b.custom_flags(libc::O_CLOEXEC);
+    }
+    let mut f = b.open(Path::new(&name))?;
     match f.try_lock() {
         Ok(()) => {
             // The pid is advisory text; a failed write never blocks the open.

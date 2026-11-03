@@ -5,6 +5,7 @@
 
 use serde_json::{json, Value};
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use tole_core::entry::Entry;
 use tole_core::provider::{Provider, ProviderError, ProviderOutput};
 use tole_core::storage::JsonlStorage;
@@ -37,6 +38,16 @@ impl Provider for Fixture {
     }
 }
 
+/// A child forked while a session's writer-lock fd is open keeps the lock
+/// (flock is per open file description) until it execs. Tests run on
+/// parallel threads, so every spawn and every storage handle's lifetime
+/// is serialized: no fork can overlap a held lock.
+static SPAWN: Mutex<()> = Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SPAWN.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn tmp(tag: &str) -> std::path::PathBuf {
     let d = std::env::temp_dir().join(format!(
         "tole-usage-report-{tag}-{}-{:x}",
@@ -52,6 +63,7 @@ fn tmp(tag: &str) -> std::path::PathBuf {
 }
 
 fn status(dir: &std::path::Path, id: &str) -> String {
+    let _g = serial();
     let out = Command::new(env!("CARGO_BIN_EXE_tole"))
         .args(["status", "-s", dir.to_str().unwrap(), id])
         .stdin(Stdio::null())
@@ -66,6 +78,7 @@ fn status(dir: &std::path::Path, id: &str) -> String {
 }
 
 fn fixture(dir: &std::path::Path, id: &str, wire: bool, usage: Value) {
+    let _g = serial();
     let mut s = JsonlStorage::create(dir, id, None).unwrap();
     let mut p = Fixture {
         step: 0,
@@ -141,6 +154,7 @@ fn status_and_sessions_count_turns_by_the_transcript_rule() {
 
     let dir = tmp("turns");
     fixture(&dir, "turns", false, json!({"prompt_tokens": 1}));
+    let g = serial();
     let mut s = JsonlStorage::open(dir.join("turns.jsonl")).unwrap();
     for flag in [STOP_GATE_FEEDBACK, INTERRUPT] {
         s.commit(Commit::new().entry(NewEntry::root(
@@ -150,15 +164,18 @@ fn status_and_sessions_count_turns_by_the_transcript_rule() {
         .unwrap();
     }
     drop(s);
+    drop(g);
 
     let out = status(&dir, "turns");
     assert!(out.contains("turns:   2 (user messages)"), "{out}");
 
+    let g = serial();
     let out = Command::new(env!("CARGO_BIN_EXE_tole"))
         .args(["sessions", "-s", dir.to_str().unwrap()])
         .stdin(Stdio::null())
         .output()
         .expect("run tole sessions");
+    drop(g);
     assert!(out.status.success());
     let out = String::from_utf8_lossy(&out.stdout);
     let row = out
