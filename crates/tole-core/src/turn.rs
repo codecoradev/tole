@@ -129,6 +129,11 @@ pub enum TurnOutcome {
     /// #178): the token fired between steps; the turn settled durably
     /// to pc=Final, so the session stays prompt-resumable.
     Cancelled,
+    /// The owner detached the turn (#217): nothing was aborted — the
+    /// in-flight call settled, the turn stopped waiting and settled to
+    /// pc=Final with a durable `detached` record. Background jobs keep
+    /// running; their completion arrives as a notice on the next turn.
+    Detached,
 }
 
 /// Progress sink for host UIs (issue #196): the turn loop fires these at
@@ -573,6 +578,11 @@ fn drive(
         // (settle_cancelled) — no further tokens burn, no tool runs.
         if cancel.is_cancelled() {
             return settle_cancelled(s);
+        }
+        // Detach checkpoint (#217): the previous tool has settled and its
+        // result is committed; stop here instead of calling the provider.
+        if cancel.is_detached() {
+            return settle_detached(s);
         }
         // Soft-interrupt safe point (#377): the previous tool has settled
         // and the next provider call has not started.
@@ -1154,6 +1164,18 @@ fn settle_cancelled(s: &mut dyn Storage) -> Result<TurnOutcome, StorageError> {
     let seq = s.state().seq;
     s.commit(Commit::new().transition(StateTransition::from(seq, Pc::Final)))?;
     Ok(TurnOutcome::Cancelled)
+}
+
+/// Settle a detached turn (#217): the audit record + pc=Final, exactly the
+/// cancelled shape — but nothing was aborted, so the outcome differs.
+fn settle_detached(s: &mut dyn Storage) -> Result<TurnOutcome, StorageError> {
+    append_turn_error(
+        s,
+        "detached",
+        "owner detached the turn; in-flight work was not aborted",
+    )?;
+    settle_final(s)?;
+    Ok(TurnOutcome::Detached)
 }
 
 /// Gateway timeouts, rate limits (429), server errors (5xx), connection

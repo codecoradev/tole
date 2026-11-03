@@ -66,6 +66,18 @@ pub fn interrupt_session(
         .map_err(|e| InterruptRefusal::Invalid(e.to_string()))
 }
 
+/// Detach the session's in-flight turn (#217): stop waiting, keep the work.
+/// Shared by the REST and MCP faces. `false` when no turn is running (a
+/// stale flag must not detach the next, unrelated turn; `reset` also clears
+/// it when a turn is claimed).
+pub fn detach_session(st: &SessionState) -> bool {
+    if !*st.busy.lock().expect("busy lock") {
+        return false;
+    }
+    st.cancel.detach();
+    true
+}
+
 /// Marks a session busy for its whole lifetime; Drop un-marks even on
 /// panic, so one failed turn cannot brick the session.
 pub struct BusyGuard(StdArc<Mutex<bool>>);
@@ -415,6 +427,8 @@ pub fn open_session(
         parent_allows,
     });
     roster.plan_emitter = plan_emitter;
+    // #217: a job that exits nudges this session at its next safe point.
+    roster.job_notices = Some(cancel.interrupts().clone());
     let mut reg = crate::tool_roster::build(approver, roster).map_err(|e| e.to_string())?;
     // Turn-end stop gates (#145): the same registry-level wiring the
     // run/chat hosts use, applied to server-face sessions.
@@ -656,6 +670,7 @@ fn stop_reason(outcome: &tole_core::turn::TurnOutcome) -> Result<String, String>
         O::Final { .. } => "end_turn",
         O::BudgetExhausted => "max_tokens",
         O::Cancelled => "cancelled",
+        O::Detached => "detached",
         O::StopGateBlocked { .. }
         | O::ApprovalRequired { .. }
         | O::UnknownTool { .. }

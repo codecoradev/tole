@@ -188,6 +188,9 @@ pub struct JobStartTool {
     /// Child-agent mode (#171): refuse spawning the tole binary —
     /// closes the depth-cap bypass via detached jobs.
     child_agent_mode: bool,
+    /// Where to nudge when a job exits (#217): the session's soft-interrupt
+    /// queue, so the finished job surfaces at the next safe point.
+    notify: Option<crate::interrupt::InterruptQueue>,
 }
 
 impl JobStartTool {
@@ -195,7 +198,14 @@ impl JobStartTool {
         Self {
             root,
             child_agent_mode: false,
+            notify: None,
         }
+    }
+
+    /// Queue a notice on `q` when a started job exits (#217).
+    pub fn with_completion_notice(mut self, q: crate::interrupt::InterruptQueue) -> Self {
+        self.notify = Some(q);
+        self
     }
 
     pub fn in_child_agent_mode(mut self) -> Self {
@@ -319,6 +329,20 @@ impl Tool for JobStartTool {
             let _ = child.wait();
             return Err(format!("job_start: pid file: {e}"));
         }
+        if let Some(q) = self.notify.clone() {
+            let id = id.clone();
+            // ponytail: one polling thread per job (lives as long as the
+            // job); a shared watcher if job counts ever matter.
+            std::thread::spawn(move || {
+                while JobPollTool::pid_alive(pid).unwrap_or(false) {
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+                // A full queue drops the nudge; job_poll still has the result.
+                let _ = q.push_notice(&format!(
+                    "[tole] background job {id} finished; read {JOBS_DIR}/{id}/log or job_poll it"
+                ));
+            });
+        }
         Ok(json!({
             "job": id,
             "pid": pid,
@@ -427,5 +451,27 @@ mod tests {
         let dir = tmpdir("risk");
         assert_eq!(JobStartTool::new(dir.clone()).risk(), Risk::Write);
         assert_eq!(JobPollTool::new(dir).risk(), Risk::ReadOnly);
+    }
+
+    #[test]
+    fn completion_notice_is_queued_when_the_job_exits() {
+        let dir = tmpdir("notice");
+        let q = crate::interrupt::InterruptQueue::default();
+        let start = JobStartTool::new(dir.clone()).with_completion_notice(q.clone());
+        let out = start
+            .execute(json!({ "command": "sh -c 'sleep 0.3'" }))
+            .unwrap();
+        let job = out["job"].as_str().unwrap().to_string();
+        // Nothing yet: the job is still running.
+        assert!(q.is_empty());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while q.is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let got = q.drain();
+        assert_eq!(got.len(), 1, "exactly one notice per job");
+        assert_eq!(got[0].source, crate::interrupt::Source::Notice);
+        assert!(got[0].text.contains(&job), "{}", got[0].text);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

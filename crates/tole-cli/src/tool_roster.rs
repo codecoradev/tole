@@ -48,6 +48,8 @@ pub struct Roster {
     pub mcp_servers: Vec<tole_core::mcp::McpServerConfig>,
     /// Plan publishing (#196): only for a transport that renders plans.
     pub plan_emitter: Option<PlanEmitter>,
+    /// Where finished background jobs nudge the session (#217).
+    pub job_notices: Option<tole_core::interrupt::InterruptQueue>,
 }
 
 impl Roster {
@@ -62,6 +64,7 @@ impl Roster {
             #[cfg(feature = "mcp")]
             mcp_servers: Vec::new(),
             plan_emitter: None,
+            job_notices: None,
         }
     }
 }
@@ -158,7 +161,10 @@ pub fn build(approver: impl Approver + 'static, roster: Roster) -> Result<ToolRe
             // A child's command tools refuse to spawn tole itself (the
             // spawn-yourself bypass of the depth cap).
             let run_cmd = RunCommandTool::new(shell_dir.clone());
-            let job_start = JobStartTool::new(root.clone());
+            let mut job_start = JobStartTool::new(root.clone());
+            if let Some(q) = roster.job_notices.clone() {
+                job_start = job_start.with_completion_notice(q);
+            }
             let (run_cmd, job_start) = if depth >= 1 {
                 (
                     run_cmd.in_child_agent_mode(),
