@@ -34,9 +34,12 @@ pub struct ProcessHook {
 pub type DenyReason = String;
 
 impl ProcessHook {
-    /// Five seconds per hook: a hook slower than that is a broken
-    /// policy endpoint, and the loop must not stall behind it.
-    pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+    /// Thirty seconds per hook, matching the turn-end budget: a hook may be
+    /// a verification gate (lint/tests), and a timeout is a non-blocking
+    /// failure, so a too-short budget on a loaded host silently skips the
+    /// hook (a deny becomes an allow). Slower than that is a broken policy
+    /// endpoint, and the loop must not stall behind it.
+    pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
     pub fn new(command_line: &str) -> Self {
         let mut parts = command_line.split_whitespace().map(str::to_string);
@@ -132,8 +135,8 @@ impl ToolHooks {
 }
 
 /// Default per-hook timeout for turn-end gates: a verification gate that
-/// runs `cargo check` / lint legitimately needs more than the 5s tool
-/// budget; 30s is the documented #145 contract.
+/// runs `cargo check` / lint legitimately needs a long budget; 30s is the
+/// documented #145 contract (pre/post hooks now share it).
 pub const TURNEND_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Build a turn-end gate hook from a CLI command line (30s timeout).
