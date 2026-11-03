@@ -21,6 +21,7 @@ use crate::state::{Pc, StateTransition};
 use crate::storage::{Commit, Storage, StorageError, UsageRecord};
 use crate::tool::{Risk, ToolRegistry};
 use crate::transcript;
+use std::time::{Duration, Instant};
 
 /// Hard ceiling on provider steps in one turn (loop-guard).
 pub const MAX_STEPS: usize = 32;
@@ -48,13 +49,58 @@ pub fn is_poll_tool(registry: &ToolRegistry, name: &str) -> bool {
     registry.get(name).is_some_and(|t| t.is_poll())
 }
 
-/// One automatic retry for a timeout-classified provider failure per
-/// turn (issue #58): missions have died to a transient gateway timeout
-/// before any tool ran, while the same session completed end-to-end on a
-/// manual resume. The retry is a pure re-read — a failed provider step
-/// commits nothing, so the transcript is unchanged and the durable log
-/// records the retry decision before it happens.
-pub const PROVIDER_TIMEOUT_RETRIES: usize = 1;
+/// Automatic retries for a transient provider failure per turn (issues #58,
+/// #478): missions have died to a transient gateway failure before any tool
+/// ran, while the same session completed end-to-end on a manual resume. The
+/// retry is a pure re-read — a failed provider step commits nothing, so the
+/// transcript is unchanged and the durable log records the retry decision
+/// before it happens. Waits back off 1/2/4 s (plus jitter) unless the
+/// provider sent `Retry-After`.
+pub const PROVIDER_TIMEOUT_RETRIES: usize = 3;
+
+/// Longest single backoff wait, `Retry-After` included (#478).
+const MAX_RETRY_WAIT: Duration = Duration::from_secs(30);
+
+/// Backoff slice: a cancel is noticed within this long during a wait.
+const RETRY_SLICE: Duration = Duration::from_secs(1);
+
+/// Wait before retry number `used + 1` (`used` = retries already spent this
+/// turn). A `(retry-after: N)` marker in the error (seconds form, put there
+/// by the provider) wins, capped at 30 s; otherwise 1/2/4 s plus up to 25%
+/// jitter so parallel sessions do not retry in lockstep.
+fn retry_delay(msg: &str, used: usize) -> Duration {
+    let hint = crate::failover::leading_error(msg)
+        .split_once("(retry-after: ")
+        .and_then(|(_, rest)| {
+            let n = rest
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>();
+            n.parse::<u64>().ok()
+        });
+    if let Some(secs) = hint {
+        return Duration::from_secs(secs).min(MAX_RETRY_WAIT);
+    }
+    let base = Duration::from_secs(1u64 << used.min(5)).min(MAX_RETRY_WAIT);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    base + base * (nanos % 251) / 1000
+}
+
+/// Sleep `total`, waking every [`RETRY_SLICE`] to re-check the token.
+/// Returns early (without error) once cancelled; the caller's loop-top
+/// checkpoint then settles the turn as cancelled.
+fn sleep_unless_cancelled(total: Duration, cancel: &CancelToken) {
+    let end = Instant::now() + total;
+    while !cancel.is_cancelled() {
+        let left = end.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        std::thread::sleep(left.min(RETRY_SLICE));
+    }
+}
 
 /// Why a turn ended.
 #[derive(Debug)]
@@ -493,19 +539,25 @@ fn drive(
         let next = match p.complete(&crate::compaction::view(s.entries())) {
             Ok(o) => o,
             Err(ProviderError(msg)) => {
-                // Retry classification (#58 + live 429 evidence): gateway
-                // timeouts AND rate-limit rejections are both transient.
+                // Retry classification (#58, #478): timeouts, 429, 5xx and
+                // empty completions are transient; request errors are not.
                 if is_transient_provider_error(&msg) && timeout_retries_left > 0 {
+                    let delay = retry_delay(&msg, PROVIDER_TIMEOUT_RETRIES - timeout_retries_left);
                     timeout_retries_left -= 1;
                     // Durable, replay-visible decision record BEFORE the
-                    // retry fires (same contract as append_turn_error).
+                    // wait and the retry (same contract as append_turn_error).
                     append_turn_error(
                         s,
                         "provider transient failure, retrying",
                         &format!(
-                            "gateway timeout or 429 rate limit; {timeout_retries_left} automatic retry left this turn"
+                            "{}; retrying in {:.1}s, {timeout_retries_left} automatic retries left this turn",
+                            crate::failover::leading_error(&msg),
+                            delay.as_secs_f32()
                         ),
                     )?;
+                    // The loop-top checkpoint settles a cancel that ends the
+                    // wait early.
+                    sleep_unless_cancelled(delay, cancel);
                     continue;
                 }
                 // Durable record, same contract as BudgetExhausted: the
@@ -945,22 +997,36 @@ fn settle_cancelled(s: &mut dyn Storage) -> Result<TurnOutcome, StorageError> {
     Ok(TurnOutcome::Cancelled)
 }
 
-/// Gateway timeouts and rate-limit rejections are transient (#58 + live
-/// 429 evidence). After a failover only the last provider's error counts:
-/// an earlier "timeout" must not make a fail-loud 401 look retryable.
-/// `http status: ` messages are classified by the parsed code only, so a
-/// provider body snippet ("token timeout", "142900 tokens") cannot flip the
-/// decision. 5xx stays non-transient here (bounded retry is #478).
+/// Gateway timeouts, rate limits (429), server errors (5xx), connection
+/// failures and empty completions are transient (#58, #478). After a
+/// failover only the last provider's error counts: an earlier "timeout"
+/// must not make a fail-loud 401 look retryable. `http status: ` messages
+/// are classified by the parsed code only, so a provider body snippet
+/// ("token timeout", "142900 tokens") cannot flip the decision.
+///
+/// An empty completion retries here but stays fail-loud for FAILOVER
+/// (`is_failover_error`): when retries run out the turn fails without
+/// trying the reserve.
 pub(crate) fn is_transient_provider_error(msg: &str) -> bool {
-    const TRANSIENT: [&str; 2] = ["timeout", "429"];
+    const TRANSIENT: [&str; 5] = [
+        "timeout",
+        "429",
+        "connection",
+        "stream read",
+        crate::openai::EMPTY_COMPLETION,
+    ];
     let lead = crate::failover::leading_error(msg);
     if let Some(rest) = lead.strip_prefix("http status: ") {
         let code = rest
             .chars()
             .take_while(char::is_ascii_digit)
-            .collect::<String>();
-        return code.parse::<u16>().unwrap_or(0) == 429;
+            .collect::<String>()
+            .parse::<u16>()
+            .unwrap_or(0);
+        return code == 429 || (500..600).contains(&code);
     }
+    // "io: Connection refused" is capitalised by the OS error text.
+    let lead = lead.to_ascii_lowercase();
     TRANSIENT.iter().any(|k| lead.contains(k))
 }
 
@@ -997,8 +1063,14 @@ mod transient_tests {
             ),
             ("http status: 401 Unauthorized — token timeout, re-login", false),
             ("http status: 400 Bad Request — unknown model id gpt-4290", false),
-            // 5xx retry is a separate issue (#478).
-            ("http status: 503 Service Unavailable — upstream", false),
+            ("http status: 503 Service Unavailable — upstream", true),
+            ("http status: 500", true),
+            ("http status: 599 x", true),
+            ("http status: 600 x", false),
+            ("http status: 404 Not Found — 503 upstream", false),
+            ("malformed response: empty stream (no content, no tool calls)", true),
+            ("malformed response: no choices[0].message", false),
+            ("io: Connection refused (os error 111)", true),
             ("http status: 4290 Weird", false),
             ("timeout: global", true),
             ("stream read: timeout reading", true),
@@ -1013,5 +1085,28 @@ mod transient_tests {
         ] {
             assert_eq!(is_transient_provider_error(msg), want, "{msg}");
         }
+    }
+
+    #[test]
+    fn retry_delay_backs_off_honors_and_caps_retry_after() {
+        use super::retry_delay;
+        use std::time::Duration;
+        for (used, base) in [(0, 1.0), (1, 2.0), (2, 4.0)] {
+            let d = retry_delay("timeout: global", used).as_secs_f64();
+            assert!((base..=base * 1.25).contains(&d), "retry {used}: {d}");
+        }
+        let hdr = |n: &str| format!("http status: 429 Too Many Requests (retry-after: {n}) — x");
+        assert_eq!(retry_delay(&hdr("7"), 0), Duration::from_secs(7));
+        assert_eq!(retry_delay(&hdr("0"), 2), Duration::ZERO);
+        assert_eq!(retry_delay(&hdr("3600"), 0), Duration::from_secs(30));
+        // HTTP-date form is not parsed: plain backoff.
+        let d = retry_delay(&hdr("Wed, 21 Oct 2026 07:28:00 GMT"), 0);
+        assert!(d >= Duration::from_secs(1) && d < Duration::from_secs(2));
+        // A hint on an earlier failover error does not count.
+        let d = retry_delay(
+            "timeout: global [after failover from primary: http status: 429 (retry-after: 9)]",
+            0,
+        );
+        assert!(d < Duration::from_secs(2));
     }
 }

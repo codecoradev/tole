@@ -282,7 +282,7 @@ fn no_usage_rows_without_provider_usage() {
 }
 
 // ---------------------------------------------------------------------------
-// Issue #58: harness-level retry-once on timeout-classified provider failure
+// Issue #58: harness-level bounded retry on transient provider failure (#478: 3 retries)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -290,7 +290,7 @@ fn provider_timeout_retried_once_then_succeeds() {
     let dir = tmpdir("t58-retry");
     let mut s = JsonlStorage::create(&dir, "t58r", None).unwrap();
     let mut p = MockProvider::scripted_with_failures(vec![
-        Err("provider failed: timeout: global".into()),
+        Err("provider failed: timeout: global (retry-after: 0)".into()),
         Ok(ProviderOutput::Final {
             text: "done".into(),
         }),
@@ -320,12 +320,14 @@ fn provider_timeout_retried_once_then_succeeds() {
 }
 
 #[test]
-fn provider_timeout_second_failure_aborts() {
+fn provider_timeout_aborts_after_three_retries() {
     let dir = tmpdir("t58-second");
     let mut s = JsonlStorage::create(&dir, "t58s", None).unwrap();
     let mut p = MockProvider::scripted_with_failures(vec![
-        Err("provider failed: timeout: global".into()),
-        Err("provider failed: timeout: global".into()),
+        Err("provider failed: timeout: global (retry-after: 0)".into()),
+        Err("provider failed: timeout: global (retry-after: 0)".into()),
+        Err("provider failed: timeout: global (retry-after: 0)".into()),
+        Err("provider failed: timeout: global (retry-after: 0)".into()),
     ]);
     let mut reg = ToolRegistry::new();
     reg.register(Box::new(EchoTool)).unwrap();
@@ -337,26 +339,28 @@ fn provider_timeout_second_failure_aborts() {
         }
         other => panic!("expected ProviderFailed, got {other:?}"),
     }
-    // One retry record + one final failure record.
+    // Three retry records + one final failure record.
     let errs: Vec<&Entry> = s
         .entries()
         .iter()
         .filter(|e| e.kind.as_str() == "error")
         .collect();
-    assert_eq!(errs.len(), 2);
-    assert_eq!(
-        errs[0].payload["error"],
-        json!("provider transient failure, retrying")
-    );
-    assert_eq!(errs[1].payload["error"], json!("provider failed"));
+    assert_eq!(errs.len(), 4);
+    for e in &errs[..3] {
+        assert_eq!(
+            e.payload["error"],
+            json!("provider transient failure, retrying")
+        );
+    }
+    assert_eq!(errs[3].payload["error"], json!("provider failed"));
 }
 
 #[test]
-fn provider_429_rate_limit_retried_once() {
+fn provider_429_rate_limit_retried() {
     let dir = tmpdir("t58-429");
     let mut s = JsonlStorage::create(&dir, "t58q", None).unwrap();
     let mut p = MockProvider::scripted_with_failures(vec![
-        Err("provider failed: http status: 429".into()),
+        Err("provider failed: http status: 429 (retry-after: 0)".into()),
         Ok(ProviderOutput::Final {
             text: "after-429".into(),
         }),
@@ -412,18 +416,20 @@ fn non_timeout_provider_error_not_retried() {
 }
 
 #[test]
-fn flapping_timeout_retries_only_once_per_turn() {
+fn flapping_timeout_shares_one_retry_budget_per_turn() {
     let dir = tmpdir("t58-flap");
     let mut s = JsonlStorage::create(&dir, "t58f", None).unwrap();
-    // Timeout, success, then another timeout: the second timeout must NOT
-    // get a second retry (budget is per turn, not per step).
+    // Retries are budgeted per turn, not per step: a retry spent at step 1
+    // is gone at step 2 (1 + 2 = 3 retries, the fourth failure aborts).
     let mut p = MockProvider::scripted_with_failures(vec![
-        Err("provider failed: timeout: global".into()),
+        Err("provider failed: timeout: global (retry-after: 0)".into()),
         Ok(ProviderOutput::ToolCall {
             tool: "echo".into(),
             input: json!({"n": 1}),
         }),
-        Err("provider failed: timeout: global".into()),
+        Err("provider failed: timeout: global (retry-after: 0)".into()),
+        Err("provider failed: timeout: global (retry-after: 0)".into()),
+        Err("provider failed: timeout: global (retry-after: 0)".into()),
         Ok(ProviderOutput::Final {
             text: "never".into(),
         }),
@@ -444,7 +450,7 @@ fn flapping_timeout_retries_only_once_per_turn() {
                 && e.payload["error"] == json!("provider transient failure, retrying")
         })
         .collect();
-    assert_eq!(retry_records.len(), 1);
+    assert_eq!(retry_records.len(), 3);
 }
 
 #[test]

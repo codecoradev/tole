@@ -148,6 +148,21 @@ Not a sandbox: review what it wrote before you run it), `--skill <path>` (load a
 | `TOLE_VERBOSE` | `1` prints the startup probe misses (uteke / cora binary not found, no GitHub origin), which are silent by default; `tole doctor` reports the sibling binaries either way |
 | `TOLE_MEMORY_NAMESPACE` | override the loop's uteke room (default: `repo-<directory name>`; the name predates rooms) |
 
+### Provider retries
+
+A transient provider failure is retried inside the turn, up to 3 times
+(4 attempts), before the turn fails: HTTP 429, any 5xx, connection or
+timeout errors, a stream read failure and an empty completion (no content and
+no tool calls, streaming or not). Waits are 1 s, 2 s, 4 s plus up to 25%
+jitter; a `Retry-After` header in seconds replaces the wait, capped at 30 s.
+Other 4xx errors (auth, model, invalid request) fail immediately. Each retry
+is written to the session log as a `provider transient failure, retrying`
+error entry before the wait, the wait ends early on cancel (Esc, ACP
+`session/cancel`), and the budget is per turn, not per step. With a reserve
+provider (#209) a failed step still fails over first; retries run when every
+provider in the chain has failed. An empty completion that outlasts its
+retries fails the turn without trying the reserve.
+
 ## Provider doctor
 
 `tole doctor` answers "is this provider/model actually usable?" in tiers:

@@ -499,11 +499,21 @@ impl OpenAiProvider {
         let text = msg.get("content").and_then(Value::as_str).ok_or_else(|| {
             ProviderError("malformed response: no content and no tool_calls".into())
         })?;
+        // Parity with the stream path (#478): an empty completion is the
+        // same transient error in both modes, not a silent empty `Final`.
+        if text.is_empty() {
+            return Err(ProviderError(EMPTY_COMPLETION.into()));
+        }
         Ok(ProviderOutput::Final {
             text: text.to_string(),
         })
     }
 }
+
+/// Error text of a completion with neither content nor tool calls; the turn
+/// loop classifies it as transient (#478).
+pub(crate) const EMPTY_COMPLETION: &str =
+    "malformed response: empty stream (no content, no tool calls)";
 
 impl OpenAiProvider {
     /// Issue #196 phase 3: drive one streamed completion to [DONE].
@@ -636,9 +646,7 @@ impl OpenAiProvider {
         // No tool calls: the answer must have content (GLM emits an
         // empty content:"" chunk at the end — empty total = malformed).
         if text.is_empty() {
-            return Err(ProviderError(
-                "malformed response: empty stream (no content, no tool calls)".into(),
-            ));
+            return Err(ProviderError(EMPTY_COMPLETION.into()));
         }
         // Deltas already delivered the reasoning when a sink was wired;
         // otherwise surface the accumulated thought once, turn-end.
@@ -1279,6 +1287,12 @@ mod transcript_tests {
         // Tool call missing function.name → malformed.
         let bad = json!({ "choices": [{ "message": { "tool_calls": [{ "id": "x" }] } }] });
         assert!(OpenAiProvider::parse_completion(&bad).is_err());
+        // Empty content and no tool calls → the same error as a stream (#478).
+        let empty = json!({ "choices": [{ "message": { "content": "" } }] });
+        assert_eq!(
+            OpenAiProvider::parse_completion(&empty).unwrap_err().0,
+            EMPTY_COMPLETION
+        );
         // Empty tool_calls array + content → Final by content.
         let empty_calls = json!({
             "choices": [{ "message": { "content": "hi", "tool_calls": [] } }],
