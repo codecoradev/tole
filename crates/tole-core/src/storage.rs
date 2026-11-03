@@ -485,8 +485,8 @@ impl JsonlStorage {
     /// Issue #210: starts session `new_id` in `dir` as a fork of the
     /// session file `src`: a copy of its lineage up to and including the
     /// settled entry `at` (default: the last settled entry). Settled = a
-    /// final assistant message, the only point where the machine rests at
-    /// `Final` with no open tool sandwich. The source is only read, never
+    /// final assistant message (no tool call hangs off it), the only point
+    /// where the machine rests at `Final` with no open tool sandwich. The source is only read, never
     /// touched; entry ids and parents are kept, so every reader (replay,
     /// todo hydration) works on the fork unchanged. Usage rows and
     /// registers are NOT copied: a fork starts with a clean ledger.
@@ -498,8 +498,11 @@ impl JsonlStorage {
     ) -> Result<Self, StorageError> {
         let new_id = new_id.into();
         let from = Self::open_read_only(src)?;
-        let settled =
-            |e: &Entry| e.kind.as_str() == EntryType::MESSAGE && e.payload["role"] == "assistant";
+        let settled = |e: &Entry| {
+            e.kind.as_str() == EntryType::MESSAGE
+                && e.payload["role"] == "assistant"
+                && from.children(&e.id).is_empty()
+        };
         let cut = match at {
             Some(id) => {
                 let e = from
@@ -507,7 +510,7 @@ impl JsonlStorage {
                     .ok_or_else(|| StorageError::Invalid(format!("unknown entry: {id}")))?;
                 if !settled(e) {
                     return Err(StorageError::Invalid(format!(
-                        "entry {id} is not a settled point (a final assistant message)"
+                        "entry {id} is not a settled point (a final assistant message with no open tool calls)"
                     )));
                 }
                 from.by_id[id]

@@ -199,3 +199,50 @@ fn tool_state_hydrates_per_branch() {
     assert!(!on_fork.contains("later"), "{on_fork}");
     assert!(on_src.contains("later"), "{on_src}");
 }
+
+#[test]
+fn fork_refuses_a_mid_turn_assistant_message() {
+    let dir = tmpdir("midturn");
+    let mut src = JsonlStorage::create(&dir, "src", None).unwrap();
+    src.commit(Commit::new().entry(msg("user", "go"))).unwrap();
+    let mid = src
+        .commit(Commit::new().entry(msg("assistant", "let me look")))
+        .unwrap()[0]
+        .id
+        .clone();
+    let intent = src
+        .commit(Commit::new().entry(NewEntry::with_parent(
+            &mid,
+            EntryType::new(EntryType::INTENT),
+            json!({"tool": "read_file"}),
+        )))
+        .unwrap()[0]
+        .id
+        .clone();
+    src.commit(Commit::new().entry(NewEntry::with_parent(
+        &intent,
+        EntryType::new(EntryType::TOOL_RESULT),
+        json!({"ok": true, "output": "x"}),
+    )))
+    .unwrap();
+    let last = src
+        .commit(Commit::new().entry(msg("assistant", "done")))
+        .unwrap()[0]
+        .id
+        .clone();
+    drop(src);
+    let p = dir.join("src.jsonl");
+
+    let Err(err) = JsonlStorage::fork(&p, &dir, "f1", Some(&mid)) else {
+        panic!("mid-turn assistant message must not be a fork point");
+    };
+    assert!(err.to_string().contains("not a settled point"), "{err}");
+    assert!(!dir.join("f1.jsonl").exists());
+
+    // Default cut and explicit cut both land on the final message.
+    let f = JsonlStorage::fork(&p, &dir, "f2", None).unwrap();
+    assert_eq!(f.entries().last().unwrap().id, last);
+    let f = JsonlStorage::fork(&p, &dir, "f3", Some(&last)).unwrap();
+    assert_eq!(f.entries().last().unwrap().payload["text"], json!("done"));
+    assert_eq!(f.state().pc, Pc::Final);
+}
