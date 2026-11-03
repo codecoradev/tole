@@ -17,6 +17,7 @@ pub mod session_host;
 pub mod session_index;
 pub mod session_tools;
 pub mod sibling;
+pub mod status;
 pub mod tool_roster;
 pub mod tools;
 pub mod trust;
