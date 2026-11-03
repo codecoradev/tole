@@ -96,8 +96,10 @@ struct Cli {
     /// Write/Destructive tool executes. Receives one JSON object on
     /// stdin (`{"event":"pretool","tool":...,"input":...}`); exit code
     /// 2 = DENY the call (durable — the turn parks at the denial like
-    /// an approval denial and is resumable; on resume WITH a new prompt
-    /// the model sees the denial and replans); any other non-zero exit
+    /// an approval denial and is resumable: `tole resume <id>` re-asks
+    /// the model, `tole resume <id> "<prompt>"` settles the parked turn
+    /// and runs the new prompt; either way the model sees the denial and
+    /// replans); any other non-zero exit
     /// / timeout is a logged non-blocking hook failure.
     /// Example: --on-pretool /usr/local/bin/tole-guard.sh. Repeatable;
     /// default OFF.
@@ -277,8 +279,10 @@ enum Command {
     /// Resume an interrupted session. With an optional
     /// PROMPT, appends it as a new user message and runs one full turn
     /// (issue #55): headless flows can continue a mission without a
-    /// separate `run` session. Without PROMPT, behaves as before:
-    /// approvals-only recovery of a mid-flight turn.
+    /// separate `run` session (a turn parked at a denied approval or
+    /// pre-tool hook is settled first; the model sees the denial).
+    /// Without PROMPT, behaves as before: approvals-only recovery of a
+    /// mid-flight turn.
     Resume {
         /// Session id to resume.
         id: String,
@@ -1442,6 +1446,15 @@ fn build_registry(
     host: &HostConfig,
     allow_patterns: &[String],
 ) -> Result<ToolRegistry> {
+    // Hook wiring (run/chat/resume) is shell-tools-gated; without it these
+    // flags would be silently ignored — refuse loudly instead.
+    #[cfg(not(feature = "shell-tools"))]
+    if host.on_pretool_non_empty() || host.on_posttool_non_empty() || !host.on_turnend.is_empty() {
+        bail!(
+            "--on-pretool/--on-posttool/--on-turnend require the shell-tools feature \
+             (this build lacks it); rebuild with default features"
+        );
+    }
     let mut roster = Roster::new(resolve_workspace_root(host.workspace.as_ref())?);
     // CLI faces run shell tools in the process cwd; files stay jailed to
     // the workspace.
