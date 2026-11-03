@@ -237,7 +237,8 @@ Everything below is merged; CHANGELOG entries carry the detail.
     `web_search` method, auth headers and field mapping (#436); `--trust workspace`
     (#437); command-level allow/deny patterns for `run_command` (#438); global session
     index and `sessions --all`, `resume` names the owning project's command (#439);
-    context compaction for `chat`, `resume` and `mission` (#440).
+    context compaction for `chat`, `resume` and `mission` (#440), its overflow recovery
+    and the `doctor` missing-window warning (#481).
 - **0.10.0 (planned):** `tole-tui`, a pi-style terminal UI — bare `tole` opens it; model,
   reasoning effort, context size and tokens in the footer (epic #464, issues #457–#463).
 - **Open backlog:** session branching (#210), multimodal

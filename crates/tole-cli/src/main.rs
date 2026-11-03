@@ -1108,8 +1108,14 @@ fn dispatch(cli: Cli) -> Result<()> {
                 bail!("--tier must be offline, catalog or full (got {tier:?})");
             };
             let cfg = config_apply::provider_config();
-            let ok =
-                tole_cli::doctor::run_cli(cfg.as_ref(), &config_apply::real_env, tier, no_ledger);
+            let window = settings.context_window.as_ref().map(|w| w.value);
+            let ok = tole_cli::doctor::run_cli(
+                cfg.as_ref(),
+                &config_apply::real_env,
+                tier,
+                no_ledger,
+                window,
+            );
             if !ok {
                 std::process::exit(1);
             }
@@ -2376,7 +2382,10 @@ fn chat_command(
                 eprintln!("tole> (unknown tool '{name}' — recorded; your next message continues)")
             }
             Ok(TurnOutcome::ProviderFailed { message }) => {
-                eprintln!("tole> (provider failed: {message}; next message retries via resume)")
+                eprintln!(
+                    "tole> (provider failed: {message}{}; next message retries via resume)",
+                    tole_cli::compaction_host::overflow_hint(&message)
+                )
             }
             Ok(TurnOutcome::BudgetExhausted) => {
                 eprintln!("tole> (step budget exhausted — turn aborted; next message resumes)")
@@ -2539,7 +2548,10 @@ fn report_outcome(session_id: &str, outcome: TurnOutcome) {
             std::process::exit(3);
         }
         TurnOutcome::ProviderFailed { message } => {
-            eprintln!("tole: provider failed: {message} (resume with: tole resume {session_id})");
+            eprintln!(
+                "tole: provider failed: {message}{} (resume with: tole resume {session_id})",
+                tole_cli::compaction_host::overflow_hint(&message)
+            );
             std::process::exit(4);
         }
         TurnOutcome::BudgetExhausted => {

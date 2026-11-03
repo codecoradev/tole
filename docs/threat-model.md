@@ -461,6 +461,11 @@ model's own earlier answers. The window lookup is one `GET /models` on the sessi
 with the same base URL and credentials as chat completions (no new host or
 secret), at most once per process and only after a prompt passes 8k tokens;
 an explicit `TOLE_CONTEXT_WINDOW` / config `context_window` skips it.
+A provider context-overflow error (#481) sets a durable `fact/context_overflow`
+register in the commit that settles the failed turn; the next prompt then forces
+one ordinary compaction pass (same atomic, between-turns, fenced-summary path) and
+clears it. Classification reads only HTTP 400/413/422 error text, so a tool output
+or model text can neither set nor suppress the flag.
 
 ### Global session index (#439)
 

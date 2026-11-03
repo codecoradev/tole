@@ -117,37 +117,74 @@ impl<W: WindowSource> Compactor<W> {
     }
 
     /// Call between turns (the previous turn settled, the next prompt not
-    /// yet committed). Compacts when due; reports what happened on stderr.
+    /// yet committed). Compacts when due — or when the session recorded a
+    /// context overflow (#481), whatever the window says — and reports what
+    /// happened on stderr.
     pub fn before_turn(&mut self, s: &mut dyn Storage, p: &mut dyn Provider) {
         if !self.settings.enabled {
             return;
         }
-        let Some(tokens) = compaction::last_prompt_tokens(s) else {
-            return;
-        };
-        if self.settings.window.is_none() && tokens < DETECT_FLOOR {
+        let forced = compaction::overflow_pending(s);
+        let trigger = if forced { None } else { self.due(s) };
+        if !forced && trigger.is_none() {
             return;
         }
-        let Some(window) = self.window() else {
-            return;
-        };
+        match compaction::compact(s, p, 1) {
+            Ok(Some(c)) => match trigger {
+                Some((tokens, window)) => eprintln!(
+                    "tole: context compacted: {} earlier entries summarized \
+                     ({tokens} of {window} prompt tokens)",
+                    c.compacted_entries
+                ),
+                None => eprintln!(
+                    "tole: context compacted after a context-overflow error: {} earlier \
+                     entries summarized",
+                    c.compacted_entries
+                ),
+            },
+            Ok(None) if forced => eprintln!(
+                "tole: context overflow recorded but there is no earlier turn to summarize; \
+                 start a new session or ask for less output per turn"
+            ),
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("tole: {e} (continuing uncompacted)");
+                return;
+            }
+        }
+        // The flag is spent by a pass that ran (or had nothing to do); a
+        // failed summary call keeps it for the next attempt.
+        if forced {
+            if let Err(e) = compaction::clear_overflow(s) {
+                eprintln!("tole: could not clear the context-overflow flag: {e}");
+            }
+        }
+    }
+
+    /// The ordinary trigger: `(prompt tokens, window)` when the last call
+    /// reached the threshold and a settled turn can be summarized.
+    fn due(&mut self, s: &dyn Storage) -> Option<(u64, u64)> {
+        let tokens = compaction::last_prompt_tokens(s)?;
+        if self.settings.window.is_none() && tokens < DETECT_FLOOR {
+            return None;
+        }
+        let window = self.window()?;
         let policy = Policy {
             window,
             at: self.settings.at,
             keep_turns: 1,
         };
-        if !compaction::due(&policy, s) {
-            return;
-        }
-        match compaction::compact(s, p, policy.keep_turns) {
-            Ok(Some(c)) => eprintln!(
-                "tole: context compacted: {} earlier entries summarized \
-                 ({tokens} of {window} prompt tokens)",
-                c.compacted_entries
-            ),
-            Ok(None) => {}
-            Err(e) => eprintln!("tole: {e} (continuing uncompacted)"),
-        }
+        compaction::due(&policy, s).then_some((tokens, window))
+    }
+}
+
+/// The operator hint for a provider failure that is a context overflow
+/// (#481); empty otherwise.
+pub fn overflow_hint(message: &str) -> &'static str {
+    if compaction::is_context_overflow(message) {
+        " (compaction will run on the next resume)"
+    } else {
+        ""
     }
 }
 
@@ -287,6 +324,56 @@ mod tests {
         let mut c = Compactor::new(off, Fixed(Some(128_000), 0));
         c.before_turn(&mut s, &mut Summarizer(0));
         assert_eq!((compactions(&s), c.source.1), (0, 0));
+    }
+
+    /// #481: an overflow flag forces the pass whatever the window says
+    /// (none known, far below the threshold), once, and is then cleared.
+    #[test]
+    fn an_overflow_flag_forces_one_compaction_and_clears() {
+        let mut s = session(&[1_000, 2_000]);
+        let mut c = Compactor::new(CompactionSettings::default(), Fixed(None, 0));
+        c.before_turn(&mut s, &mut Summarizer(0));
+        assert_eq!(compactions(&s), 0, "no flag, no window: nothing");
+        compaction::mark_overflow(&mut s).unwrap();
+        let mut p = Summarizer(0);
+        c.before_turn(&mut s, &mut p);
+        assert_eq!((compactions(&s), p.0), (1, 1));
+        assert!(!compaction::overflow_pending(&s));
+        assert_eq!(c.source.1, 0, "forced: the catalog is not consulted");
+        c.before_turn(&mut s, &mut p);
+        assert_eq!(compactions(&s), 1, "cleared: not forced again");
+    }
+
+    #[test]
+    fn a_forced_pass_respects_off_and_keeps_the_flag_on_failure() {
+        let mut s = session(&[1_000, 2_000]);
+        compaction::mark_overflow(&mut s).unwrap();
+        let off = CompactionSettings {
+            enabled: false,
+            ..CompactionSettings::default()
+        };
+        Compactor::new(off, Fixed(None, 0)).before_turn(&mut s, &mut Summarizer(0));
+        assert_eq!(compactions(&s), 0);
+        assert!(
+            compaction::overflow_pending(&s),
+            "--no-compaction: untouched"
+        );
+        // A failing summary call: the flag stays for the next attempt.
+        struct Down;
+        impl Provider for Down {
+            fn complete(&mut self, _t: &[Entry]) -> Result<ProviderOutput, ProviderError> {
+                Err(ProviderError("down".into()))
+            }
+        }
+        let mut c = Compactor::new(CompactionSettings::default(), Fixed(None, 0));
+        c.before_turn(&mut s, &mut Down);
+        assert!(compaction::overflow_pending(&s));
+        // One settled turn only: nothing to summarize, the flag is dropped.
+        let mut one = session(&[1_000]);
+        compaction::mark_overflow(&mut one).unwrap();
+        c.before_turn(&mut one, &mut Summarizer(0));
+        assert_eq!(compactions(&one), 0);
+        assert!(!compaction::overflow_pending(&one));
     }
 
     #[test]

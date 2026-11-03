@@ -606,7 +606,18 @@ fn drive(
                 // plain-resumable: `tole resume <id> "continue"` just
                 // works, matching the E5 crash-resume guarantee.
                 let seq = s.state().seq;
-                s.commit(Commit::new().transition(StateTransition::from(seq, Pc::Final)))?;
+                let mut settle = Commit::new().transition(StateTransition::from(seq, Pc::Final));
+                // #481: a context overflow is flagged in the same commit that
+                // settles the turn, so the next prompt compacts first
+                // (between turns — never inside this one).
+                if crate::compaction::is_context_overflow(&msg) {
+                    settle = settle.register(RegisterWrite::set(
+                        crate::compaction::OVERFLOW_NS,
+                        crate::compaction::OVERFLOW_KEY,
+                        json!(true),
+                    ));
+                }
+                s.commit(settle)?;
                 return Ok(TurnOutcome::ProviderFailed { message: msg });
             }
         };
