@@ -583,7 +583,15 @@ mod verify_error_tests {
     #[test]
     fn mission_provider_sends_the_pinned_system_prompt_on_resume() {
         use tole_core::openai::{OpenAiConfig, OpenAiProvider};
-        let d = std::env::temp_dir().join(format!("tole-mission-sys-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!(
+            "tole-mission-sys-{}-{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         let sys = format!("base{}", mission_prompt("ship it", None));
         let cfg = || OpenAiConfig::new("https://x/v1", "m", "k");
