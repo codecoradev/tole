@@ -11,10 +11,63 @@ use tole_core::storage::{JsonlStorage, Storage};
 const FIXTURE: &str = include_str!("fixtures/cc_session.jsonl");
 
 fn tmpdir(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("tole-ccimport-{tag}-{}", std::process::id()));
+    // pid + nanos: a recycled pid must not collide with a live dir (#493).
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .subsec_nanos();
+    let d = std::env::temp_dir().join(format!(
+        "tole-ccimport-{tag}-{}-{nanos}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     d
+}
+
+/// A transcript where a tool call was interrupted (tool_use with no
+/// tool_result — the user pressed Esc) must not poison every later cut
+/// point: at the next prompt the call is abandoned with a synthetic error
+/// entry, so the session settles again and the rest of the conversation
+/// survives the import.
+#[test]
+fn an_interrupted_tool_call_does_not_poison_later_cut_points() {
+    let interrupted = concat!(
+        r#"{"type":"assistant","sessionId":"aaaa2222-3333-4444-5555-666666666666","timestamp":"2026-11-03T10:00:00.000Z","message":{"content":[{"type":"text","text":"let me check"}]}}"#,
+        "\n",
+        r#"{"type":"assistant","sessionId":"aaaa2222-3333-4444-5555-666666666666","timestamp":"2026-11-03T10:00:01.000Z","message":{"content":[{"type":"tool_use","id":"toolu_01","name":"Read","input":{"path":"x"}}]}}"#,
+        "\n",
+        // Interruption: no tool_result for toolu_01; a new prompt follows.
+        r#"{"type":"user","sessionId":"aaaa2222-3333-4444-5555-666666666666","timestamp":"2026-11-03T10:00:05.000Z","message":{"content":[{"type":"text","text":"stop, never mind"}]}}"#,
+        "\n",
+        r#"{"type":"assistant","sessionId":"aaaa2222-3333-4444-5555-666666666666","timestamp":"2026-11-03T10:00:06.000Z","message":{"content":[{"type":"text","text":"understood"}]}}"#,
+        "\n",
+    );
+    let dir = tmpdir("interrupt");
+    let r = import_str(interrupted, &dir).unwrap();
+    assert_eq!(r.session_id, "cc-aaaa2222-3333-4444-5555-666666666666");
+    assert!(
+        r.warnings.iter().any(|w| w.contains("abandoned tool call")),
+        "{:?}",
+        r.warnings
+    );
+    let s = JsonlStorage::open_read_only(dir.join(format!("{}.jsonl", r.session_id))).unwrap();
+    let e = s.entries();
+    // The interrupted intent, its synthetic error, BOTH user texts and the
+    // final answer survive — nothing beyond the pre-call point was dropped.
+    assert!(e.iter().any(|x| x.id == "cc_toolu_01"));
+    assert_eq!(e.iter().filter(|x| x.kind.as_str() == "error").count(), 1);
+    let texts: Vec<&str> = e
+        .iter()
+        .filter(|x| x.kind.as_str() == "message")
+        .filter_map(|x| x.payload["text"].as_str())
+        .collect();
+    assert_eq!(
+        texts,
+        vec!["let me check", "stop, never mind", "understood"]
+    );
+    assert_eq!(r.dropped, 0, "the whole tail must not be dropped");
+    assert_eq!(s.state().pc, Pc::Final);
 }
 
 #[test]

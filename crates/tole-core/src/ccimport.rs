@@ -131,6 +131,22 @@ impl Builder {
             match (kind, blk["type"].as_str().unwrap_or_default()) {
                 ("user", "text") => {
                     if !prompt_open {
+                        // An interrupted tool call (user pressed Esc / the
+                        // process died) never gets its tool_result. At the
+                        // next prompt it is abandoned, not left open forever:
+                        // record a synthetic error (mirrors the denial-note
+                        // shape of #476) so the session can settle again.
+                        for id in std::mem::take(&mut self.open_intents) {
+                            self.warnings
+                                .push(format!("abandoned tool call {id} (no tool_result)"));
+                            self.entries.push(NewEntry {
+                                id: None,
+                                parent_id: Some(id),
+                                kind: EntryType::new(EntryType::ERROR),
+                                payload: json!({"error": "abandoned: interrupted without a tool_result"}),
+                                timestamp: ts,
+                            });
+                        }
                         self.mark_if_settled();
                         prompt_open = true;
                     }
