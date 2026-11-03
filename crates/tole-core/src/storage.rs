@@ -1182,6 +1182,19 @@ mod poison_tests {
     use crate::entry::{EntryType, NewEntry};
     use serde_json::json;
 
+    /// Unique per invocation: pid alone collides across concurrent or
+    /// pid-reusing runs sharing the temp dir.
+    fn uniq_dir(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "tole-{tag}-{}-{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
     fn msg(v: Value) -> NewEntry {
         NewEntry::root(EntryType::new(EntryType::MESSAGE), v)
     }
@@ -1199,7 +1212,7 @@ mod poison_tests {
     /// validation by forgetting it upstream.
     #[test]
     fn create_named_refuses_unsafe_session_ids() {
-        let dir = std::env::temp_dir().join(format!("tole-sid-{}", std::process::id()));
+        let dir = uniq_dir("sid");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         for bad in [
@@ -1238,7 +1251,7 @@ mod poison_tests {
 
     #[test]
     fn failed_append_poisons_until_reopen() {
-        let dir = std::env::temp_dir().join(format!("tole-poison-{}", std::process::id()));
+        let dir = uniq_dir("poison");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let mut s = JsonlStorage::create(&dir, "p", None).unwrap();
@@ -1306,7 +1319,7 @@ mod poison_tests {
     /// the local new-id set, duplicates across commits still rejected.
     #[test]
     fn intra_commit_parents_and_duplicate_ids_still_validated() {
-        let dir = std::env::temp_dir().join(format!("tole-p_ids-{}", std::process::id()));
+        let dir = uniq_dir("p_ids");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let mut s = JsonlStorage::create(&dir, "ids", None).unwrap();
