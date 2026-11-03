@@ -168,6 +168,14 @@ struct Cli {
     #[arg(long, global = true)]
     no_compaction: bool,
 
+    /// Reasoning effort sent as `reasoning_effort` on chat completions
+    /// (#457): minimal | low | medium | high. Unset (default) sends
+    /// nothing. Precedence: flag > TOLE_REASONING_EFFORT > config
+    /// `reasoning_effort` > user config. A session's `fact/reasoning_effort`
+    /// register overrides it on resume.
+    #[arg(long, global = true, value_name = "LEVEL", value_parser = tole_core::openai::parse_reasoning_effort)]
+    effort: Option<String>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -591,6 +599,7 @@ fn config_flags(cli: &Cli) -> tole_cli::config_apply::Flags {
         no_skills: cli.no_skills,
         compact_at: cli.compact_at,
         no_compaction: cli.no_compaction,
+        reasoning_effort: cli.effort.clone(),
         ..Default::default()
     };
     #[cfg(feature = "shell-tools")]
@@ -749,6 +758,10 @@ fn dispatch(cli: Cli) -> Result<()> {
         cfg.as_ref().unwrap_or(&Default::default()),
         &config_apply::real_env,
     );
+    if let Some(msg) = settings.effort_error() {
+        anyhow::bail!(msg);
+    }
+    config_apply::install_effort(settings.reasoning_effort.as_ref().map(|e| e.value.clone()));
     // Startup update notification (issue #220): banner is best-effort,
     // cache-backed, and skipped entirely for `tole upgrade` (which does
     // its own check) and for TOLE_NO_UPDATE_CHECK=1 (checked inside).

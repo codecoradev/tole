@@ -154,6 +154,9 @@ pub const SKILL_ENV: &str = "TOLE_SKILL";
 /// The model's context window in tokens (#440); overrides `/models`.
 pub const CONTEXT_WINDOW_ENV: &str = "TOLE_CONTEXT_WINDOW";
 
+/// Reasoning effort sent as `reasoning_effort` (#457).
+pub const REASONING_EFFORT_ENV: &str = "TOLE_REASONING_EFFORT";
+
 /// Real environment lookup for [`Settings::resolve`].
 pub fn real_env(name: &str) -> Option<String> {
     std::env::var(name).ok()
@@ -311,6 +314,21 @@ pub fn provider_config() -> Option<OpenAiConfig> {
     resolve_provider(f.base_url.as_deref(), f.model.as_deref(), &real_env).config
 }
 
+static EFFORT: OnceLock<Option<String>> = OnceLock::new();
+
+/// Install the process-wide default reasoning effort (first call wins):
+/// the resolved flag > env > config value, set once at startup so every
+/// session-building site sees it without a new parameter (#457).
+pub fn install_effort(effort: Option<String>) {
+    let _ = EFFORT.set(effort);
+}
+
+/// The default reasoning effort; a session's `fact/reasoning_effort`
+/// register overrides it ([`crate::turn_runner::session_effort`]).
+pub fn default_effort() -> Option<String> {
+    EFFORT.get().cloned().flatten()
+}
+
 /// The config's `model`, for hosts that need the model name without a
 /// full provider (the ACP advertised "current model").
 pub fn config_model() -> Option<String> {
@@ -361,6 +379,8 @@ pub struct Flags {
     pub compact_at: Option<f64>,
     /// `--no-compaction` (#440).
     pub no_compaction: bool,
+    /// `--effort` (#457; already validated by the flag parser).
+    pub reasoning_effort: Option<String>,
 }
 
 /// `tole mission --verify-timeout` default.
@@ -400,9 +420,21 @@ pub struct Settings {
     /// `--compact-at` > config > [`tole_core::compaction::Policy::DEFAULT_AT`].
     pub compact_at: Eff<f64>,
     pub no_compaction: Eff<bool>,
+    /// `--effort` > `TOLE_REASONING_EFFORT` > config `reasoning_effort`
+    /// (#457), canonical lowercase; `None` = not sent. An invalid ENV value
+    /// is kept as typed so [`Settings::effort_error`] can name it.
+    pub reasoning_effort: Option<Eff<String>>,
 }
 
 impl Settings {
+    /// The startup error for an invalid `reasoning_effort` (the flag and the
+    /// config file are validated when parsed; only the env needs this).
+    pub fn effort_error(&self) -> Option<String> {
+        let e = self.reasoning_effort.as_ref()?;
+        let err = tole_core::openai::parse_reasoning_effort(&e.value).err()?;
+        Some(format!("{} {err}", e.env.unwrap_or(REASONING_EFFORT_ENV)))
+    }
+
     /// THE resolution: startup and `config check` both call this. `cfg` is
     /// the LAYERED config ([`crate::config::layered`]); a value it took
     /// from the user layer is reported as [`Source::UserConfig`].
@@ -512,6 +544,15 @@ impl Settings {
                 Eff::new(v, s)
             },
             no_compaction: boolean(flags.no_compaction, cfg.no_compaction),
+            reasoning_effort: resolve_string(
+                flags.reasoning_effort.clone(),
+                env(REASONING_EFFORT_ENV),
+                cfg.reasoning_effort.clone(),
+            )
+            .map(|(v, s)| {
+                let canonical = tole_core::openai::parse_reasoning_effort(&v).unwrap_or(v);
+                Eff::from_pair((canonical, s), REASONING_EFFORT_ENV)
+            }),
         }
     }
 
@@ -556,6 +597,7 @@ impl Settings {
         opt(&mut self.context_window, "context_window", user);
         one(&mut self.compact_at, "compact_at", user);
         one(&mut self.no_compaction, "no_compaction", user);
+        opt(&mut self.reasoning_effort, "reasoning_effort", user);
     }
 
     /// The fill to install for the deep server faces: ONLY the config's own
@@ -678,6 +720,13 @@ pub fn annotations(s: &Settings) -> BTreeMap<&'static str, String> {
         ),
     );
     m.insert("no_compaction", boolean(&s.no_compaction));
+    m.insert(
+        "reasoning_effort",
+        match (&s.reasoning_effort, s.effort_error()) {
+            (_, Some(err)) => format!("  INVALID: {err}"),
+            (e, None) => eff(e, &show_str),
+        },
+    );
     m.insert(
         "mission.verify_timeout",
         format!(

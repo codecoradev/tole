@@ -68,6 +68,19 @@ pub fn session_model(storage: &impl Storage, default: &str) -> String {
         .to_string()
 }
 
+/// The reasoning effort a session turn sends (#457): the session's durable
+/// `fact/reasoning_effort` register wins over the process default (flag >
+/// env > config), exactly as `fact/model` does for the model. An empty or
+/// invalid register value counts as unset, so it can clear an override
+/// back to the default.
+pub fn session_effort(storage: &impl Storage, default: Option<&str>) -> Option<String> {
+    storage
+        .get_register("fact", "reasoning_effort")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|v| tole_core::openai::parse_reasoning_effort(v).ok())
+        .or_else(|| default.map(str::to_string))
+}
+
 /// Configure one provider of the chain for a session turn: the
 /// registry's tool specs, the session's pinned system prompt (fresh and
 /// resumed sessions alike read it from the header), and, when an
@@ -110,8 +123,10 @@ pub fn session_provider(
     observer: Option<&Arc<dyn TurnObserver>>,
 ) -> Result<Box<dyn Provider>, String> {
     cfg.model = session_model(storage, &cfg.model);
+    let effort = session_effort(storage, crate::config_apply::default_effort().as_deref());
     crate::provider_chain::build(cfg, &crate::config_apply::real_env, |p| {
         configure_provider(p, specs.clone(), system_prompt, observer)
+            .with_reasoning_effort(effort.clone())
     })
 }
 
@@ -275,6 +290,32 @@ mod tests {
             argv.contains("--room repo-x") && argv.contains("--type decision"),
             "{argv}"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn session_effort_register_wins_over_the_default() {
+        let dir = std::env::temp_dir().join(format!("tole-effort-reg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut st = tole_core::storage::JsonlStorage::create(&dir, "e1", None).unwrap();
+        assert_eq!(session_effort(&st, Some("low")).as_deref(), Some("low"));
+        assert_eq!(session_effort(&st, None), None);
+        let set = |st: &mut tole_core::storage::JsonlStorage, v: serde_json::Value| {
+            st.commit(tole_core::storage::Commit::new().register(
+                tole_core::register::RegisterWrite::set("fact", "reasoning_effort", v),
+            ))
+            .unwrap();
+        };
+        set(&mut st, serde_json::json!(" High "));
+        assert_eq!(session_effort(&st, Some("low")).as_deref(), Some("high"));
+        set(&mut st, serde_json::json!("turbo"));
+        assert_eq!(
+            session_effort(&st, Some("low")).as_deref(),
+            Some("low"),
+            "an invalid register value falls back to the default"
+        );
+        set(&mut st, serde_json::json!(""));
+        assert_eq!(session_effort(&st, Some("low")).as_deref(), Some("low"));
         let _ = std::fs::remove_dir_all(dir);
     }
 }

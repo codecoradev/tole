@@ -78,6 +78,9 @@ pub struct Config {
     pub compact_at: Option<f64>,
     /// Turn context compaction off (#440).
     pub no_compaction: Option<bool>,
+    /// `reasoning_effort` sent on chat completions (#457):
+    /// `minimal | low | medium | high`.
+    pub reasoning_effort: Option<String>,
     pub mission: Option<MissionConfig>,
     /// Keys (rendered names, e.g. `model`, `mission.verify`) whose value
     /// came from the user layer; set by [`layered`], never by the file.
@@ -253,6 +256,10 @@ pub fn parse(src: &str, path: &Path) -> Result<Config, ConfigError> {
             )));
         }
     }
+    if let Some(level) = &cfg.reasoning_effort {
+        tole_core::openai::parse_reasoning_effort(level)
+            .map_err(|e| range(format!("reasoning_effort: {e}")))?;
+    }
     if cfg.context_window == Some(0) {
         return Err(range(
             "context_window must be a positive number of tokens".into(),
@@ -373,6 +380,13 @@ pub fn layered(project: &Config, user: &Config) -> Config {
             any,
             u,
         ),
+        reasoning_effort: pick(
+            "reasoning_effort",
+            &project.reasoning_effort,
+            &user.reasoning_effort,
+            text,
+            u,
+        ),
         mission: (project.mission.is_some() || user.mission.is_some()).then_some(mission),
         user_keys: BTreeSet::new(),
     };
@@ -475,6 +489,11 @@ pub fn render_with(cfg: &Config, tag: &str, ann: &Annotations) -> Vec<String> {
         &mut out,
         "no_compaction",
         cfg.no_compaction.map(|b| b.to_string()),
+    );
+    scalar(
+        &mut out,
+        "reasoning_effort",
+        cfg.reasoning_effort.as_deref().map(quote),
     );
     if let Some(m) = &cfg.mission {
         scalar(
@@ -627,6 +646,26 @@ verify_timeout = 60
         assert!(lines.contains(&"model = \"m\"  [config]".to_string()));
         assert!(lines.contains(&"  - \"internal\"".to_string()));
         assert!(lines.contains(&"mission.max_tokens = 1000  [config]".to_string()));
+    }
+
+    #[test]
+    fn reasoning_effort_is_validated_and_layered() {
+        let c = parse("reasoning_effort = \"high\"\n", &p()).unwrap();
+        assert_eq!(c.reasoning_effort.as_deref(), Some("high"));
+        let lines = render(&c);
+        assert!(lines.contains(&"reasoning_effort = \"high\"  [config]".to_string()));
+        let e = parse("reasoning_effort = \"max\"\n", &p()).unwrap_err();
+        assert!(e.message.contains("minimal | low | medium | high"), "{e}");
+        let user = parse("reasoning_effort = \"low\"\n", &p()).unwrap();
+        let none = Config::default();
+        let m = layered(&none, &user);
+        assert_eq!(m.reasoning_effort.as_deref(), Some("low"));
+        assert!(m.user_keys.contains("reasoning_effort"));
+        assert_eq!(
+            layered(&c, &user).reasoning_effort.as_deref(),
+            Some("high"),
+            "project wins key by key"
+        );
     }
 
     #[test]

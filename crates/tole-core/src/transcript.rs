@@ -23,6 +23,9 @@ pub const INTERRUPT: &str = "interrupt";
 pub const WIRE_KEY: &str = "tole_wire";
 /// Usage-row key holding the provider route / failover record (#209).
 pub const ROUTE_KEY: &str = "tole_route";
+/// Usage-row key recording that a step ran with a rejected parameter
+/// dropped (#457).
+pub const DEGRADED_KEY: &str = "tole_degraded";
 /// Prefix of every usage-row key tole writes itself.
 const TOLE_KEY_PREFIX: &str = "tole_";
 
