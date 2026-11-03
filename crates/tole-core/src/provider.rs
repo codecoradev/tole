@@ -107,6 +107,16 @@ pub trait Provider {
         None
     }
 
+    /// Set when the LAST `complete()` call only succeeded (or failed)
+    /// after the provider dropped a parameter it rejected (#457:
+    /// `reasoning_effort`): `{param, level, rejected}`. Stored by the turn
+    /// loop under the namespaced `tole_degraded` key of the step's usage
+    /// record, so a degraded step is durable. Describes THIS call only.
+    /// Default None.
+    fn last_degraded(&self) -> Option<Value> {
+        None
+    }
+
     /// Which provider answered the LAST `complete()` call, and whether it
     /// took a failover to get there (#209, `failover::FailoverProvider`).
     /// Stored by the turn loop under the namespaced `tole_route` key of the
@@ -144,5 +154,8 @@ impl<P: Provider + ?Sized> Provider for Box<P> {
     }
     fn last_route(&self) -> Option<Value> {
         (**self).last_route()
+    }
+    fn last_degraded(&self) -> Option<Value> {
+        (**self).last_degraded()
     }
 }

@@ -679,6 +679,12 @@ fn drive(
                 obj.insert(transcript::ROUTE_KEY.to_string(), route);
             }
         }
+        // #457: a step that ran with a rejected parameter dropped is durable.
+        if let Some(degraded) = p.last_degraded() {
+            if let Some(obj) = usage.get_or_insert_with(|| json!({})).as_object_mut() {
+                obj.insert(transcript::DEGRADED_KEY.to_string(), degraded);
+            }
+        }
         if let Some(u) = usage {
             if let Some(last) = s.entries().last() {
                 // #483: fsync deferred — every path after this point commits

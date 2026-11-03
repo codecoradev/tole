@@ -211,6 +211,10 @@ impl Provider for FailoverProvider {
         self.answered().and_then(Provider::last_wire_stats)
     }
 
+    fn last_degraded(&self) -> Option<Value> {
+        self.answered().and_then(Provider::last_degraded)
+    }
+
     fn last_extra_tool_calls(&self) -> Vec<(String, Value)> {
         self.answered()
             .map(Provider::last_extra_tool_calls)

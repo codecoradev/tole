@@ -128,6 +128,23 @@ pub const ENV_MODEL: &str = "TOLE_MODEL";
 // cora-ignore: sec-hardcoded-secret
 pub const ENV_API_KEY: &str = "TOLE_API_KEY";
 
+/// The accepted `reasoning_effort` levels, lowest first (#457).
+pub const REASONING_EFFORTS: [&str; 4] = ["minimal", "low", "medium", "high"];
+
+/// Validate a reasoning-effort level (case and surrounding space are
+/// forgiven) and return its canonical lowercase form.
+pub fn parse_reasoning_effort(raw: &str) -> Result<String, String> {
+    let level = raw.trim().to_ascii_lowercase();
+    if REASONING_EFFORTS.contains(&level.as_str()) {
+        Ok(level)
+    } else {
+        Err(format!(
+            "invalid reasoning effort {raw:?}: expected one of {}",
+            REASONING_EFFORTS.join(" | ")
+        ))
+    }
+}
+
 /// Prefixes tried by [`OpenAiConfig::from_env`], in order. The first
 /// prefix whose full triple (`_BASE_URL`, `_MODEL`, `_API_KEY`) is
 /// present and non-empty wins; prefixes are never mixed, so a
@@ -238,6 +255,16 @@ pub struct OpenAiProvider {
     /// Declared vision capability (#212): `Some(false)` refuses image
     /// input before any request; `None` = unknown, the server decides.
     vision: Option<bool>,
+    /// `reasoning_effort` on the wire (#457); `None` = absent from the body.
+    reasoning_effort: Option<String>,
+    /// The provider rejected `reasoning_effort` once: later calls of this
+    /// provider omit it instead of paying a rejected round trip each step.
+    effort_rejected: bool,
+    /// The last call's 400 body named `reasoning_effort` (set by the HTTP
+    /// path, read by [`Provider::complete`] to decide on the degraded retry).
+    effort_named_in_400: bool,
+    /// Describes the LAST `complete()` call only: it ran degraded.
+    last_degraded_obj: Option<Value>,
 }
 
 impl std::fmt::Debug for OpenAiProvider {
@@ -275,6 +302,10 @@ impl OpenAiProvider {
             abort: None,
             image_roots: Vec::new(),
             vision: None,
+            reasoning_effort: None,
+            effort_rejected: false,
+            effort_named_in_400: false,
+            last_degraded_obj: None,
             streaming: std::env::var("TOLE_STREAM")
                 .map(|v| v != "0")
                 .unwrap_or(true),
@@ -342,6 +373,14 @@ impl OpenAiProvider {
     /// image input into a model-capability error before any request.
     pub fn with_vision(mut self, vision: bool) -> Self {
         self.vision = Some(vision);
+        self
+    }
+
+    /// Send `reasoning_effort` with every request (#457). `None` keeps the
+    /// body byte-identical to a provider without the setting. The level is
+    /// the caller's to validate ([`parse_reasoning_effort`]).
+    pub fn with_reasoning_effort(mut self, effort: Option<String>) -> Self {
+        self.reasoning_effort = effort;
         self
     }
 
@@ -500,6 +539,9 @@ impl OpenAiProvider {
         });
         if !self.tool_specs.is_empty() {
             body["tools"] = json!(self.tool_specs);
+        }
+        if let (Some(effort), false) = (&self.reasoning_effort, self.effort_rejected) {
+            body["reasoning_effort"] = json!(effort);
         }
         body
     }
@@ -824,53 +866,9 @@ const CANCELLED_CALL: &str = "cancelled: in-flight provider call abandoned";
 /// How often a cancel-aware call re-checks the token while waiting.
 const CANCEL_POLL: Duration = Duration::from_millis(100);
 
-impl Provider for OpenAiProvider {
-    /// #484: run the blocking HTTP call on a helper thread (a clone: the
-    /// agent's connection pool is shared) and wait in short slices. On
-    /// cancel the thread is abandoned — it stops at its next stream line or
-    /// when the HTTP timeout fires — and nothing it produces is used.
-    fn complete_with_cancel(
-        &mut self,
-        transcript: &[Entry],
-        cancel: &CancelToken,
-    ) -> Result<ProviderOutput, ProviderError> {
-        if cancel.is_cancelled() {
-            return Err(ProviderError(CANCELLED_CALL.into()));
-        }
-        let mut worker = self.clone();
-        worker.abort = Some(cancel.clone());
-        let owned = transcript.to_vec();
-        let (tx, rx) = std::sync::mpsc::channel();
-        let spawned = std::thread::Builder::new()
-            .name("tole-provider-call".into())
-            .spawn(move || {
-                let out = worker.complete(&owned);
-                let _ = tx.send((out, worker));
-            });
-        if spawned.is_err() {
-            return self.complete(transcript);
-        }
-        loop {
-            match rx.recv_timeout(CANCEL_POLL) {
-                Ok((out, mut worker)) => {
-                    // Adopt the per-call state (usage, reasoning, wire stats).
-                    worker.abort = None;
-                    *self = worker;
-                    return out;
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    if cancel.is_cancelled() {
-                        return Err(ProviderError(CANCELLED_CALL.into()));
-                    }
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err(ProviderError("provider call thread died".into()));
-                }
-            }
-        }
-    }
-
-    fn complete(&mut self, transcript: &[Entry]) -> Result<ProviderOutput, ProviderError> {
+impl OpenAiProvider {
+    fn complete_once(&mut self, transcript: &[Entry]) -> Result<ProviderOutput, ProviderError> {
+        self.effort_named_in_400 = false;
         // Issue #232 (scan #106): last_usage / last_reasoning describe
         // THIS response only. Reset per call — a tool-call step (which
         // returns early) or a gateway that omits usage must never leave
@@ -938,6 +936,7 @@ impl Provider for OpenAiProvider {
             let body_text = scrub(&body_text, &self.cfg.api_key);
             let snippet: String = body_text.chars().take(200).collect();
             let lower = body_text.to_ascii_lowercase();
+            self.effort_named_in_400 = status.as_u16() == 400 && lower.contains("reasoning_effort");
             if has_images
                 && matches!(status.as_u16(), 400 | 415 | 422)
                 && ["image", "vision", "multimodal", "multi-modal"]
@@ -986,6 +985,85 @@ impl Provider for OpenAiProvider {
             .filter(|r| !r.trim().is_empty());
         self.last_extra_calls = Self::extra_calls(&resp_body);
         Self::parse_completion(&resp_body)
+    }
+}
+
+impl Provider for OpenAiProvider {
+    /// #484: run the blocking HTTP call on a helper thread (a clone: the
+    /// agent's connection pool is shared) and wait in short slices. On
+    /// cancel the thread is abandoned — it stops at its next stream line or
+    /// when the HTTP timeout fires — and nothing it produces is used.
+    fn complete_with_cancel(
+        &mut self,
+        transcript: &[Entry],
+        cancel: &CancelToken,
+    ) -> Result<ProviderOutput, ProviderError> {
+        if cancel.is_cancelled() {
+            return Err(ProviderError(CANCELLED_CALL.into()));
+        }
+        let mut worker = self.clone();
+        worker.abort = Some(cancel.clone());
+        let owned = transcript.to_vec();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("tole-provider-call".into())
+            .spawn(move || {
+                let out = worker.complete(&owned);
+                let _ = tx.send((out, worker));
+            });
+        if spawned.is_err() {
+            return self.complete(transcript);
+        }
+        loop {
+            match rx.recv_timeout(CANCEL_POLL) {
+                Ok((out, mut worker)) => {
+                    // Adopt the per-call state (usage, reasoning, wire stats).
+                    worker.abort = None;
+                    *self = worker;
+                    return out;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if cancel.is_cancelled() {
+                        return Err(ProviderError(CANCELLED_CALL.into()));
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(ProviderError("provider call thread died".into()));
+                }
+            }
+        }
+    }
+
+    /// One logical call. A 400 naming `reasoning_effort` earns exactly ONE
+    /// retry WITHOUT the parameter (#457) — a degraded retry, not a replay
+    /// of the same body: the rejection is remembered (later calls omit the
+    /// parameter) and reported through [`Provider::last_degraded`]. Any
+    /// other failure, and a failed degraded retry, is returned as is for
+    /// the turn loop's transient classification (#474/#478).
+    fn complete(&mut self, transcript: &[Entry]) -> Result<ProviderOutput, ProviderError> {
+        self.last_degraded_obj = None;
+        let first = self.complete_once(transcript);
+        let Err(rejection) = &first else {
+            return first;
+        };
+        if !self.effort_named_in_400 || self.effort_rejected {
+            return first;
+        }
+        let Some(level) = self.reasoning_effort.clone() else {
+            return first;
+        };
+        self.effort_rejected = true;
+        let retried = self.complete_once(transcript);
+        self.last_degraded_obj = Some(json!({
+            "param": "reasoning_effort",
+            "level": level,
+            "rejected": rejection.0.chars().take(200).collect::<String>(),
+        }));
+        retried
+    }
+
+    fn last_degraded(&self) -> Option<Value> {
+        self.last_degraded_obj.clone()
     }
 
     fn last_usage(&self) -> Option<Value> {
@@ -1284,6 +1362,39 @@ mod tests {
         let clean = fence_tool_result("no marker here");
         assert_eq!(clean.matches(TOOL_RESULT_END).count(), 1);
         assert_eq!(clean.matches(TOOL_RESULT_BEGIN).count(), 1);
+    }
+
+    #[test]
+    fn reasoning_effort_parses_the_four_levels_only() {
+        for (raw, want) in [("minimal", "minimal"), (" High ", "high"), ("LOW", "low")] {
+            assert_eq!(parse_reasoning_effort(raw).as_deref(), Ok(want));
+        }
+        for bad in ["", "max", "xhigh", "none", "1"] {
+            let e = parse_reasoning_effort(bad).unwrap_err();
+            assert!(e.contains("minimal | low | medium | high"), "{e}");
+        }
+    }
+
+    #[test]
+    fn request_body_carries_reasoning_effort_exactly_when_set() {
+        let cfg = OpenAiConfig::new("https://x.example/v1", "m", "k");
+        let t = vec![crate::entry::Entry {
+            id: "e1".into(),
+            parent_id: None,
+            seq: 0,
+            kind: crate::entry::EntryType::new(crate::entry::EntryType::MESSAGE),
+            payload: json!({ "role": "user", "text": "hello" }),
+            timestamp: 0,
+        }];
+        let unset = OpenAiProvider::new(cfg.clone()).request_body(&t);
+        assert!(unset.get("reasoning_effort").is_none(), "{unset}");
+        let set = OpenAiProvider::new(cfg)
+            .with_reasoning_effort(Some("high".into()))
+            .request_body(&t);
+        assert_eq!(set["reasoning_effort"], json!("high"));
+        let mut stripped = set.clone();
+        stripped.as_object_mut().unwrap().remove("reasoning_effort");
+        assert_eq!(stripped, unset, "the key is the ONLY difference");
     }
 
     #[test]
@@ -1832,6 +1943,144 @@ mod http_error_tests {
             crate::turn::is_transient_provider_error(bare),
             "{msg}"
         );
+    }
+
+    /// Serves `replies` (status, body) one connection each, in order;
+    /// returns the base url and every request body it saw.
+    fn serve_script(
+        replies: Vec<(&'static str, String)>,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = std::sync::Arc::clone(&seen);
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for (status, body) in replies {
+                let Ok((mut s, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 8192];
+                loop {
+                    let n = s.read(&mut chunk).unwrap_or(0);
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(h) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        if let Ok(v) = serde_json::from_slice::<Value>(&buf[h + 4..]) {
+                            log.lock().unwrap().push(v);
+                            break;
+                        }
+                    }
+                    if n == 0 {
+                        break;
+                    }
+                }
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+        (format!("http://{addr}/v1"), seen)
+    }
+
+    fn ok_body() -> String {
+        json!({"choices": [{"index": 0, "finish_reason": "stop",
+            "message": {"role": "assistant", "content": "done"}}]})
+        .to_string()
+    }
+
+    fn user_turn() -> Vec<Entry> {
+        vec![Entry {
+            id: "u1".into(),
+            parent_id: None,
+            seq: 0,
+            kind: EntryType::new(EntryType::MESSAGE),
+            payload: json!({ "role": "user", "text": "hi" }),
+            timestamp: 0,
+        }]
+    }
+
+    fn effort_provider(url: String, effort: Option<&str>) -> OpenAiProvider {
+        let cfg = OpenAiConfig::new(url, "m", "sk-secret");
+        OpenAiProvider::new(cfg)
+            .with_streaming(false)
+            .with_reasoning_effort(effort.map(str::to_string))
+    }
+
+    #[test]
+    fn rejected_reasoning_effort_gets_one_degraded_retry_that_is_recorded() {
+        let rejection = json!({"error": {"message":
+            "Unrecognized request argument supplied: reasoning_effort"}})
+        .to_string();
+        let (url, seen) = serve_script(vec![
+            ("400 Bad Request", rejection),
+            ("200 OK", ok_body()),
+            ("200 OK", ok_body()),
+        ]);
+        let mut p = effort_provider(url, Some("high"));
+        let t = user_turn();
+        let out = p.complete(&t).expect("the degraded retry succeeds");
+        assert_eq!(
+            out,
+            ProviderOutput::Final {
+                text: "done".into()
+            }
+        );
+        {
+            let bodies = seen.lock().unwrap();
+            assert_eq!(bodies.len(), 2, "one rejected call + ONE retry");
+            assert_eq!(bodies[0]["reasoning_effort"], json!("high"));
+            assert!(bodies[1].get("reasoning_effort").is_none(), "{}", bodies[1]);
+        }
+        let rec = p.last_degraded().expect("the rejection is recorded");
+        assert_eq!(rec["param"], json!("reasoning_effort"));
+        assert_eq!(rec["level"], json!("high"));
+        // The rejection is remembered: later calls do not re-send it.
+        p.complete(&t).unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 3, "no second rejected call");
+        assert!(seen.lock().unwrap()[2].get("reasoning_effort").is_none());
+        assert!(p.last_degraded().is_none(), "describes THIS call only");
+    }
+
+    #[test]
+    fn a_400_that_does_not_name_the_parameter_is_not_retried() {
+        let (url, seen) = serve_script(vec![
+            ("400 Bad Request", r#"{"error":"bad messages"}"#.into()),
+            ("200 OK", ok_body()),
+        ]);
+        let mut p = effort_provider(url, Some("high"));
+        let err = p.complete(&user_turn()).unwrap_err().0;
+        assert!(err.starts_with("http status: 400"), "{err}");
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert!(p.last_degraded().is_none());
+    }
+
+    #[test]
+    fn a_400_naming_it_without_an_effort_set_is_not_retried() {
+        let (url, seen) = serve_script(vec![
+            ("400 Bad Request", "reasoning_effort is odd".into()),
+            ("200 OK", ok_body()),
+        ]);
+        let mut p = effort_provider(url, None);
+        assert!(p.complete(&user_turn()).is_err());
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_failed_degraded_retry_surfaces_its_own_error() {
+        let (url, seen) = serve_script(vec![
+            (
+                "400 Bad Request",
+                "unknown parameter: reasoning_effort".into(),
+            ),
+            ("429 Too Many Requests", "slow down".into()),
+        ]);
+        let mut p = effort_provider(url, Some("low"));
+        let err = p.complete(&user_turn()).unwrap_err().0;
+        assert!(err.starts_with("http status: 429"), "{err}");
+        assert_eq!(seen.lock().unwrap().len(), 2, "still bounded to one retry");
     }
 
     #[test]

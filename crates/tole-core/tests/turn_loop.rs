@@ -270,6 +270,33 @@ fn stored_wire_numbers_equal_wire_stats_of_the_request_body() {
     );
 }
 
+/// #457: a degraded step (the provider dropped a rejected parameter) is
+/// durable under the namespaced `tole_degraded` key, and that key alone
+/// never makes a row count as a provider step.
+#[test]
+fn degraded_step_is_recorded_under_tole_degraded() {
+    struct Degraded;
+    impl Provider for Degraded {
+        fn complete(&mut self, _t: &[Entry]) -> Result<ProviderOutput, ProviderError> {
+            Ok(ProviderOutput::Final { text: "ok".into() })
+        }
+        fn last_degraded(&self) -> Option<Value> {
+            Some(json!({"param": "reasoning_effort", "level": "high"}))
+        }
+    }
+    let dir = tmpdir("usage-degraded");
+    let mut s = JsonlStorage::create(&dir, "ud", None).unwrap();
+    let reg = ToolRegistry::new();
+    run_turn(&mut s, &mut Degraded, &reg, "hi").unwrap();
+    let usages = s.usages();
+    assert_eq!(usages.len(), 1);
+    assert_eq!(
+        usages[0].usage["tole_degraded"],
+        json!({"param": "reasoning_effort", "level": "high"})
+    );
+    assert_eq!(tole_core::transcript::provider_steps(usages), 0);
+}
+
 #[test]
 fn no_usage_rows_without_provider_usage() {
     let dir = tmpdir("usage-none");
