@@ -13,8 +13,8 @@ use crate::gate::{self, Denied};
 use serde_json::{json, Value};
 
 use crate::machine::{
-    begin, finish, resume, settle_err, settle_ok, settle_ok_deferred, EffectHandle, ReplaySafety,
-    Resume,
+    begin, begin_batch_member, finish, resume, settle_err, settle_ok, settle_ok_deferred,
+    EffectHandle, ReplaySafety, Resume,
 };
 use crate::provider::{Provider, ProviderError, ProviderOutput};
 use crate::register::RegisterWrite;
@@ -780,161 +780,198 @@ fn drive(
                 return Ok(TurnOutcome::Final { text, wrote });
             }
             ProviderOutput::ToolCall { tool, input } => {
-                // E10: fingerprint before anything else — the guard must
-                // see every call, including ones the registry will refuse.
-                let fp = call_fingerprint(&tool, &input);
-                streak = if Some(fp) == last_fp { streak + 1 } else { 1 };
-                last_fp = Some(fp);
-                // Poll-style exemption (#85): for polling tools identical
-                // CONSECUTIVE INPUT is the correct calling pattern — the
-                // arguments name the same job; the expected change is in
-                // the RESULT (running → progress → done). A 14-minute
-                // render legitimately polls the same id dozens of times;
-                // tripping the guard there aborted healthy missions. The
-                // guard still applies once the results stop changing AND
-                // the model keeps polling past the patience budget — a
-                // much higher ceiling for polls only.
-                let poll = is_poll_tool(registry, &tool);
-                // Issue #231: a poll step is attached waiting, not
-                // mission progress — refund the model-step debit and
-                // draw from the dedicated poll budget instead.
-                if poll {
-                    steps = steps.saturating_sub(1);
-                    poll_steps += 1;
+                // #480: one response may carry several calls. They run
+                // sequentially, in model order, each as its own sandwich,
+                // inside THIS one step — but only when the whole batch is
+                // ReadOnly. Anything else keeps the first-call-only rule
+                // (the model re-asks), so the approval UX is unchanged.
+                let mut batch = vec![(tool, input)];
+                let extras = p.last_extra_tool_calls();
+                if !extras.is_empty() && is_read_only_batch(registry, &batch[0].0, &extras) {
+                    batch.extend(extras);
                 }
-                let trip_at = if poll {
-                    POLL_LOOP_TRIP_AFTER
-                } else {
-                    LOOP_TRIP_AFTER
-                };
-                if streak >= trip_at {
-                    append_turn_error(
+                let mut calls = batch.into_iter().enumerate();
+                while let Some((i, (tool, input))) = calls.next() {
+                    // A call that has not started yet yields to an URGENT
+                    // interrupt, like a fresh call does above (#377). Its
+                    // calls stay unrecorded; the next step delivers it.
+                    if i > 0 && cancel.interrupts().has_urgent() {
+                        break;
+                    }
+                    // E10: fingerprint before anything else — the guard must
+                    // see every call, including ones the registry will refuse.
+                    let fp = call_fingerprint(&tool, &input);
+                    streak = if Some(fp) == last_fp { streak + 1 } else { 1 };
+                    last_fp = Some(fp);
+                    // Poll-style exemption (#85): for polling tools identical
+                    // CONSECUTIVE INPUT is the correct calling pattern — the
+                    // arguments name the same job; the expected change is in
+                    // the RESULT (running → progress → done). A 14-minute
+                    // render legitimately polls the same id dozens of times;
+                    // tripping the guard there aborted healthy missions. The
+                    // guard still applies once the results stop changing AND
+                    // the model keeps polling past the patience budget — a
+                    // much higher ceiling for polls only.
+                    let poll = is_poll_tool(registry, &tool);
+                    // Issue #231: a poll step is attached waiting, not
+                    // mission progress — refund the model-step debit and
+                    // draw from the dedicated poll budget instead.
+                    if poll {
+                        // One model step, one refund: only the first call of a
+                        // batch carries the step debit.
+                        if i == 0 {
+                            steps = steps.saturating_sub(1);
+                        }
+                        poll_steps += 1;
+                    }
+                    let trip_at = if poll {
+                        POLL_LOOP_TRIP_AFTER
+                    } else {
+                        LOOP_TRIP_AFTER
+                    };
+                    if streak >= trip_at {
+                        append_turn_error(
                         s,
                         "loop detected",
                         &format!(
                             "tool {tool} called with identical input {streak} times in a row (guard trips at {trip_at})"
                         ),
                     )?;
-                    // #84 consistency: a loop trip is terminal for this
-                    // turn — settle to Final so a prompt-resume works.
-                    let seq = s.state().seq;
-                    s.commit(Commit::new().transition(StateTransition::from(seq, Pc::Final)))?;
-                    return Ok(TurnOutcome::LoopDetected {
-                        tool,
-                        count: streak,
-                    });
-                }
-                // Authorization (PDP, see gate.rs): approver, then opt-in
-                // pre-hooks. The denial is mapped to the durable record here.
-                let auth = match gate::authorize(registry, &tool, &input, gate::Mode::Fresh) {
-                    Ok(a) => a,
-                    Err(Denied::UnknownTool) => {
-                        // Durable record + terminal pc=Final, the same #84
-                        // contract as the other abort paths (#316): without
-                        // it the next run_turn is refused (pc=Planning).
-                        append_turn_error(s, "unknown tool", &tool)?;
-                        settle_final(s)?;
-                        return Ok(TurnOutcome::UnknownTool { name: tool });
+                        // #84 consistency: a loop trip is terminal for this
+                        // turn — settle to Final so a prompt-resume works.
+                        let seq = s.state().seq;
+                        s.commit(Commit::new().transition(StateTransition::from(seq, Pc::Final)))?;
+                        return Ok(TurnOutcome::LoopDetected {
+                            tool,
+                            count: streak,
+                        });
                     }
-                    Err(Denied::Approver) => {
-                        // #178: a cancel that landed while the permission
-                        // was pending fails closed to Deny AND must settle
-                        // the turn as CANCELLED, not refusal (the denial is
-                        // the cancel's side effect, not a model refusal).
-                        if cancel.is_cancelled() {
-                            return settle_cancelled(s);
+                    // Authorization (PDP, see gate.rs): approver, then opt-in
+                    // pre-hooks. The denial is mapped to the durable record here.
+                    let auth = match gate::authorize(registry, &tool, &input, gate::Mode::Fresh) {
+                        Ok(a) => a,
+                        Err(Denied::UnknownTool) => {
+                            // Durable record + terminal pc=Final, the same #84
+                            // contract as the other abort paths (#316): without
+                            // it the next run_turn is refused (pc=Planning).
+                            append_turn_error(s, "unknown tool", &tool)?;
+                            settle_final(s)?;
+                            return Ok(TurnOutcome::UnknownTool { name: tool });
                         }
-                        append_turn_error(s, "approval required", &tool)?;
-                        append_denial_note(s, &tool, "approval refused")?;
-                        return Ok(TurnOutcome::ApprovalRequired { name: tool });
-                    }
-                    #[cfg(feature = "shell-tools")]
-                    Err(Denied::PreHook { reason }) => {
-                        // Pre-hook deny (issue #110) settles like an approval
-                        // denial: durable turn error + ApprovalRequired.
-                        append_turn_error(s, "pre-hook denial", &format!("{tool}: {reason}"))?;
-                        append_denial_note(s, &tool, &format!("pre-tool hook: {reason}"))?;
-                        return Ok(TurnOutcome::ApprovalRequired { name: tool });
-                    }
-                };
-                let is_write = auth.is_write();
-                // Planning → ToolCall, then the sandwich. The replay
-                // contract derives from RISK, not a blanket Idempotent
-                // (CodeCora scan #33): a crash after a Write/Destructive
-                // effect ran but before settlement must NOT blindly
-                // re-execute on resume — Guarded forces re-consultation
-                // of the approver before any replay.
-                let safety = if is_write {
-                    ReplaySafety::Guarded
-                } else {
-                    ReplaySafety::Idempotent
-                };
-                let seq = s.state().seq;
-                // #483: fsync deferred; `begin`'s durable intent commit
-                // (the barrier before any effect) persists it.
-                s.commit(
-                    Commit::new()
-                        .transition(StateTransition::from(seq, Pc::ToolCall))
-                        .defer_sync(),
-                )?;
-                let handle = begin(s, &tool, input.clone(), safety, None)?;
-                // Cancellation checkpoint (issue #178): cancel while the
-                // turn was settling/planning stops the effect BEFORE it
-                // runs — spec: "stop model requests and tool
-                // invocations as soon as possible". The fresh intent is
-                // settled as failed first (no pending cell survives a
-                // cancelled turn), then the turn unwinds durably.
-                if cancel.is_cancelled() {
-                    settle_err(s, &handle, "cancelled before execution")?;
-                    return settle_cancelled(s);
-                }
-                // Post-hook input snapshot (issue #110): execute consumes
-                // `input` by value; hooks observe the exact call input.
-                // Write/Destructive ONLY — ReadOnly stays zero-overhead
-                // (the documented hook contract; cora-caught).
-                #[cfg(feature = "shell-tools")]
-                let hook_input = if is_write && registry.has_post_hooks() {
-                    Some(input.clone())
-                } else {
-                    None
-                };
-                // Issue #196 phase 1: every gate has passed (approval,
-                // hooks, loop guard, cancel) — the host sees the card
-                // exactly when real work begins.
-                if let Some(o) = observer {
-                    o.tool_started(&tool, &input);
-                }
-                let out = match auth.execute(input) {
-                    Ok(o) => o,
-                    Err(e) => {
-                        // settle_err lands in Planning directly (§10) —
-                        // no finish() hop on the failure path.
+                        Err(Denied::Approver) => {
+                            // #178: a cancel that landed while the permission
+                            // was pending fails closed to Deny AND must settle
+                            // the turn as CANCELLED, not refusal (the denial is
+                            // the cancel's side effect, not a model refusal).
+                            if cancel.is_cancelled() {
+                                return settle_cancelled(s);
+                            }
+                            append_turn_error(s, "approval required", &tool)?;
+                            append_denial_note(s, &tool, "approval refused")?;
+                            return Ok(TurnOutcome::ApprovalRequired { name: tool });
+                        }
                         #[cfg(feature = "shell-tools")]
-                        if let Some(i) = &hook_input {
-                            registry.post_hook_notify(&tool, i, false);
+                        Err(Denied::PreHook { reason }) => {
+                            // Pre-hook deny (issue #110) settles like an approval
+                            // denial: durable turn error + ApprovalRequired.
+                            append_turn_error(s, "pre-hook denial", &format!("{tool}: {reason}"))?;
+                            append_denial_note(s, &tool, &format!("pre-tool hook: {reason}"))?;
+                            return Ok(TurnOutcome::ApprovalRequired { name: tool });
                         }
-                        if let Some(o) = observer {
-                            o.tool_finished(&tool, false, &short_preview(&e));
-                        }
-                        settle_err(s, &handle, &e)?;
-                        continue;
+                    };
+                    let is_write = auth.is_write();
+                    // Planning → ToolCall, then the sandwich. The replay
+                    // contract derives from RISK, not from a blanket Idempotent
+                    // (CodeCora scan #33): a crash after a Write/Destructive
+                    // effect ran but before settlement must NOT blindly
+                    // re-execute on resume — Guarded forces re-consultation
+                    // of the approver before any replay.
+                    let safety = if is_write {
+                        ReplaySafety::Guarded
+                    } else {
+                        ReplaySafety::Idempotent
+                    };
+                    let seq = s.state().seq;
+                    // #483: fsync deferred; `begin`'s durable intent commit
+                    // (the barrier before any effect) persists it.
+                    s.commit(
+                        Commit::new()
+                            .transition(StateTransition::from(seq, Pc::ToolCall))
+                            .defer_sync(),
+                    )?;
+                    let handle = if i == 0 {
+                        begin(s, &tool, input.clone(), safety, None)?
+                    } else {
+                        begin_batch_member(s, &tool, input.clone(), safety, None)?
+                    };
+                    // Cancellation checkpoint (issue #178): cancel while the
+                    // turn was settling/planning stops the effect BEFORE it
+                    // runs — spec: "stop model requests and tool
+                    // invocations as soon as possible". The fresh intent is
+                    // settled as failed first (no pending cell survives a
+                    // cancelled turn), then the turn unwinds durably.
+                    if cancel.is_cancelled() {
+                        settle_err(s, &handle, "cancelled before execution")?;
+                        return settle_cancelled(s);
                     }
-                };
-                #[cfg(feature = "shell-tools")]
-                if let Some(i) = &hook_input {
-                    registry.post_hook_notify(&tool, i, true);
+                    // Post-hook input snapshot (issue #110): execute consumes
+                    // `input` by value; hooks observe the exact call input.
+                    // Write/Destructive ONLY — ReadOnly stays zero-overhead
+                    // (the documented hook contract; cora-caught).
+                    #[cfg(feature = "shell-tools")]
+                    let hook_input = if is_write && registry.has_post_hooks() {
+                        Some(input.clone())
+                    } else {
+                        None
+                    };
+                    // Issue #196 phase 1: every gate has passed (approval,
+                    // hooks, loop guard, cancel) — the host sees the card
+                    // exactly when real work begins.
+                    if let Some(o) = observer {
+                        o.tool_started(&tool, &input);
+                    }
+                    let out = match auth.execute(input) {
+                        Ok(o) => o,
+                        Err(e) => {
+                            // settle_err lands in Planning directly (§10) —
+                            // no finish() hop on the failure path.
+                            #[cfg(feature = "shell-tools")]
+                            if let Some(i) = &hook_input {
+                                registry.post_hook_notify(&tool, i, false);
+                            }
+                            if let Some(o) = observer {
+                                o.tool_finished(&tool, false, &short_preview(&e));
+                            }
+                            settle_err(s, &handle, &e)?;
+                            // First failure stops the batch; every remaining
+                            // call still gets a result (API rule).
+                            for (_, (t, inp)) in calls.by_ref() {
+                                stub_call(
+                                    s,
+                                    &t,
+                                    inp,
+                                    "not executed: an earlier call in this batch failed",
+                                )?;
+                            }
+                            break;
+                        }
+                    };
+                    #[cfg(feature = "shell-tools")]
+                    if let Some(i) = &hook_input {
+                        registry.post_hook_notify(&tool, i, true);
+                    }
+                    if is_write {
+                        wrote = true;
+                        record_wrote(s)?;
+                    }
+                    if let Some(o) = observer {
+                        o.tool_finished(&tool, true, &short_preview(&out));
+                    }
+                    // #483: settlement fsync deferred to `finish`'s durable
+                    // commit; nothing but the observer callback runs between.
+                    settle_ok_deferred(s, &handle, out)?;
+                    finish(s)?;
                 }
-                if is_write {
-                    wrote = true;
-                    record_wrote(s)?;
-                }
-                if let Some(o) = observer {
-                    o.tool_finished(&tool, true, &short_preview(&out));
-                }
-                // #483: settlement fsync deferred to `finish`'s durable
-                // commit; nothing but the observer callback runs between.
-                settle_ok_deferred(s, &handle, out)?;
-                finish(s)?;
             }
             ProviderOutput::InvalidToolArgs { tool, raw, reason } => {
                 // Malformed `arguments` from the model: record the intent
@@ -980,6 +1017,26 @@ fn drive(
     let seq = s.state().seq;
     s.commit(Commit::new().transition(StateTransition::from(seq, Pc::Final)))?;
     Ok(TurnOutcome::BudgetExhausted)
+}
+
+/// A batch runs in full only when every call is a registered ReadOnly tool
+/// (#480): the first call and each extra. Unknown names fall back to the
+/// first-call-only path, which owns their terminal handling.
+fn is_read_only_batch(registry: &ToolRegistry, first: &str, extras: &[(String, Value)]) -> bool {
+    std::iter::once(first)
+        .chain(extras.iter().map(|(t, _)| t.as_str()))
+        .all(|t| registry.get(t).is_some_and(|t| t.risk() == Risk::ReadOnly))
+}
+
+/// Result for a batch call that was never executed: a full sandwich (so the
+/// call has an intent id and a settlement) settled as an error. Lands in
+/// Planning, like any failed call.
+fn stub_call(s: &mut dyn Storage, tool: &str, input: Value, why: &str) -> Result<(), StorageError> {
+    let seq = s.state().seq;
+    s.commit(Commit::new().transition(StateTransition::from(seq, Pc::ToolCall)))?;
+    let handle = begin_batch_member(s, tool, input, ReplaySafety::Idempotent, None)?;
+    settle_err(s, &handle, why)?;
+    Ok(())
 }
 
 /// Appends a durable ERROR entry under the turn's user message. No

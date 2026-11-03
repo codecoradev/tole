@@ -66,7 +66,7 @@ Current LLM agents (pi, Claude Code, etc.) are **ephemeral**: state lives in mem
 |---|---|
 | Multi-lane (parallel lanes) | v0 = **single lane**; lane register is prepared but only 1 active. Multi-lane post-MVP. |
 | TUI / interactive UI | Host provides the UI; the core makes no UI assumptions. |
-| Parallel tool execution | Tool calls are sequential per turn; simplifies the state machine. |
+| Concurrent tool execution | No concurrent execution: tools run one at a time on the single turn thread. Sequential batches are supported (#480): one response's ReadOnly-only tool calls run in model order inside one step — see [tool-batches.md](tool-batches.md). |
 | Deferred redemption | Approvals must resolve synchronously at the gate; no redemption queue. |
 | Cross-build CI (macOS/Windows) | Linux-only until **Phase 3**; Linux lint+test CI first. |
 

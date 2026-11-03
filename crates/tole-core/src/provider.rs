@@ -84,6 +84,18 @@ pub trait Provider {
         None
     }
 
+    /// The tool calls that FOLLOWED the one `complete()` returned, in model
+    /// order, when the model emitted several in one response (#480). Only
+    /// calls whose arguments parsed are listed; the first malformed one ends
+    /// the list. The turn loop runs them sequentially after the returned
+    /// call, and only when the whole batch is ReadOnly — otherwise it
+    /// ignores them (the model re-asks, as before). Like `last_usage` it
+    /// describes THIS call only. Default empty: mocks and one-call
+    /// providers are unchanged, and `ProviderOutput` keeps its single call.
+    fn last_extra_tool_calls(&self) -> Vec<(String, Value)> {
+        Vec::new()
+    }
+
     /// Request-size breakdown for the LAST `complete()` call (issue
     /// #211): `{system_chars, tools_chars, history_chars, messages}`,
     /// measured on the request body before any streaming envelope (see
@@ -126,6 +138,9 @@ impl<P: Provider + ?Sized> Provider for Box<P> {
     }
     fn last_wire_stats(&self) -> Option<Value> {
         (**self).last_wire_stats()
+    }
+    fn last_extra_tool_calls(&self) -> Vec<(String, Value)> {
+        (**self).last_extra_tool_calls()
     }
     fn last_route(&self) -> Option<Value> {
         (**self).last_route()

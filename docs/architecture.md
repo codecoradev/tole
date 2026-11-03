@@ -167,7 +167,7 @@ The turn loop remains the enforcement point: it maps each `Denied` to the existi
 
 ## 9. Concurrency Model
 
-- **Single-threaded turn loop.** One session = one execution thread; no parallel tool calls in Phase 1.
+- **Single-threaded turn loop.** One session = one execution thread; no concurrent tool execution. A response's read-only tool calls run as a sequential batch ([tool-batches.md](tool-batches.md), #480).
 - SQLite as the serialization point (optional backend): WAL allows concurrent readers (UI/host preview) without blocking the writer. The default JSONL backend serializes naturally (one append at a time; readers tail the file).
 - CAS on `state.seq` protects against double-drive **inside one process** only (it compares against the in-memory seq). Across processes the JSONL backend takes an exclusive advisory lock (`File::try_lock`) on a sidecar `<id>.jsonl.lock` for the lifetime of every writable handle: a second writer (CLI `resume` vs a `serve`/ACP/MCP daemon or another terminal) is refused with `session is open for writing by pid N` (the pid is written into the lock file, best effort). The lock lives on a sidecar that is never renamed, so it survives `compact()` (which renames a new file over the live path); it is taken before the torn-tail repair on open, and the OS releases it on crash/SIGKILL. `open_read_only` stays lock-free. Belt and braces: before each append the file length is compared with the last known good length and a mismatch fails with a stale-handle error instead of appending. Advisory only: a process that ignores the lock is caught by the length check, not prevented.
 

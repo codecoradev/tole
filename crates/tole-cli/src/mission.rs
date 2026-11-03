@@ -595,20 +595,24 @@ mod verify_error_tests {
         std::fs::create_dir_all(&d).unwrap();
         let sys = format!("base{}", mission_prompt("ship it", None));
         let cfg = || OpenAiConfig::new("https://x/v1", "m", "k");
-        // One handle at a time: a writable open holds the session lock.
+        // One handle at a time: a writable open holds the session lock, and
+        // the handle must be DROPPED before the loop's next iteration opens
+        // the same file again (the writer-lock contract, #488).
         for reopen in [false, true] {
-            let storage = if reopen {
-                JsonlStorage::open(d.join("m1.jsonl")).unwrap()
-            } else {
-                JsonlStorage::create_with(&d, "m1", None, Some(&sys)).unwrap()
+            let body = {
+                let storage = if reopen {
+                    JsonlStorage::open(d.join("m1.jsonl")).unwrap()
+                } else {
+                    JsonlStorage::create_with(&d, "m1", None, Some(&sys)).unwrap()
+                };
+                tole_cli::turn_runner::configure_provider(
+                    OpenAiProvider::new(cfg()),
+                    vec![],
+                    storage.system_prompt(),
+                    None,
+                )
+                .request_body(&[])
             };
-            let body = tole_cli::turn_runner::configure_provider(
-                OpenAiProvider::new(cfg()),
-                vec![],
-                storage.system_prompt(),
-                None,
-            )
-            .request_body(&[]);
             let first = &body["messages"][0];
             assert_eq!(first["role"], json!("system"), "{body}");
             assert!(

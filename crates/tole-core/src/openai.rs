@@ -203,6 +203,7 @@ pub struct OpenAiProvider {
     /// Request-size breakdown of the last call (issue #211), reset per
     /// call like usage/reasoning.
     last_wire_stats_obj: Option<Value>,
+    last_extra_calls: Vec<(String, Value)>,
     /// Live-token sinks (issue #196 phase 3): present on host faces
     /// that render progress (ACP). When set, reasoning arrives via
     /// deltas and `last_reasoning` stays None — no double emission.
@@ -246,6 +247,7 @@ impl OpenAiProvider {
             last_usage_obj: None,
             last_reasoning_obj: None,
             last_wire_stats_obj: None,
+            last_extra_calls: Vec::new(),
             on_text_delta: None,
             on_reasoning_delta: None,
             drain_live: Arc::new(AtomicUsize::new(0)),
@@ -368,19 +370,33 @@ impl OpenAiProvider {
                     };
                     // The intent id doubles as the wire tool_call_id —
                     // deterministic and unique per sandwich.
-                    messages.push(json!({
-                        "role": "assistant",
-                        "content": null,
-                        "tool_calls": [{
-                            "id": e.id,
-                            "type": "function",
-                            "function": {
-                                "name": tool,
-                                // E11 covers the tool-call arguments too.
-                                "arguments": scrub(&input.to_string(), &self.cfg.api_key),
-                            },
-                        }],
-                    }));
+                    let call = json!({
+                        "id": e.id,
+                        "type": "function",
+                        "function": {
+                            "name": tool,
+                            // E11 covers the tool-call arguments too.
+                            "arguments": scrub(&input.to_string(), &self.cfg.api_key),
+                        },
+                    });
+                    // #480: a batch member joins the assistant message that
+                    // carries the previous call; its result still follows
+                    // in call order. Unmarked intents stay one message each.
+                    let joined = e.payload.get("batch") == Some(&json!(true))
+                        && messages
+                            .iter_mut()
+                            .rev()
+                            .find(|m| m["role"] != json!("tool"))
+                            .and_then(|m| m.get_mut("tool_calls")?.as_array_mut())
+                            .map(|calls| calls.push(call.clone()))
+                            .is_some();
+                    if !joined {
+                        messages.push(json!({
+                            "role": "assistant",
+                            "content": null,
+                            "tool_calls": [call],
+                        }));
+                    }
                 }
                 "tool_result" | "error" => {
                     // Settlement of the intent this entry hangs under.
@@ -433,7 +449,9 @@ impl OpenAiProvider {
     /// state machine understands (E4.5). Precedence: a non-empty
     /// `tool_calls` array wins over content text — the model asked for a
     /// tool, and the loop must run it before any prose is meaningful.
-    /// First call only: the machine is single-path (§5).
+    /// The step is the FIRST call; the rest of a batch is exposed through
+    /// [`Provider::last_extra_tool_calls`] (#480), so `ProviderOutput`
+    /// keeps its single call.
     fn parse_completion(resp: &Value) -> Result<ProviderOutput, ProviderError> {
         let msg = resp
             .get("choices")
@@ -512,6 +530,50 @@ impl OpenAiProvider {
         Ok(ProviderOutput::Final {
             text: text.to_string(),
         })
+    }
+}
+
+/// One extra batch call (#480): `None` for a blank name, blank arguments or
+/// arguments that are not JSON — the batch ends there.
+fn batch_call(name: &str, args: Option<String>) -> Option<(String, Value)> {
+    let args = args?;
+    if name.is_empty() || args.trim().is_empty() {
+        return None;
+    }
+    serde_json::from_str(args.trim())
+        .ok()
+        .map(|input| (name.to_string(), input))
+}
+
+impl OpenAiProvider {
+    /// The calls AFTER the first in a non-stream response, in model order
+    /// (#480). Empty when the first call is itself malformed (that step is
+    /// an `InvalidToolArgs` and runs alone); the list ends at the first
+    /// malformed extra, so a batch never reorders or skips a call.
+    fn extra_calls(resp: &Value) -> Vec<(String, Value)> {
+        if !matches!(
+            Self::parse_completion(resp),
+            Ok(ProviderOutput::ToolCall { .. })
+        ) {
+            return Vec::new();
+        }
+        let calls = resp["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        calls
+            .iter()
+            .skip(1)
+            .map_while(|c| {
+                let f = &c["function"];
+                let args = match f.get("arguments") {
+                    Some(Value::String(s)) => Some(s.clone()),
+                    Some(v @ (Value::Object(_) | Value::Array(_))) => Some(v.to_string()),
+                    _ => None,
+                };
+                batch_call(f["name"].as_str()?, args)
+            })
+            .collect()
     }
 }
 
@@ -623,7 +685,8 @@ impl OpenAiProvider {
         }
         // Decisive output from the accumulation — same contract as the
         // non-stream parse: one tool call per step, or the final text.
-        if let Some((_, (id, name, args))) = tool_calls.into_iter().next() {
+        let mut ordered = tool_calls.into_iter();
+        if let Some((_, (id, name, args))) = ordered.next() {
             if args.trim().is_empty() {
                 return Ok(ProviderOutput::InvalidToolArgs {
                     tool: name,
@@ -642,6 +705,10 @@ impl OpenAiProvider {
                 }
             };
             let _ = id;
+            // #480: the calls after the first, in stream index order.
+            self.last_extra_calls = ordered
+                .map_while(|(_, (_, n, a))| batch_call(&n, Some(a)))
+                .collect();
             // Issue #232: settle THIS step's reasoning exactly like the
             // text path below — without a sink the accumulated thought
             // surfaces once at turn end; with a sink the deltas were
@@ -754,6 +821,7 @@ impl Provider for OpenAiProvider {
         self.last_usage_obj = None;
         self.last_reasoning_obj = None;
         self.last_wire_stats_obj = None;
+        self.last_extra_calls.clear();
         let mut body = self.request_body(transcript);
         // Issue #211: measure BEFORE the streaming envelope is layered
         // on — the same body the Tier-1 golden pins. Read-only.
@@ -834,6 +902,7 @@ impl Provider for OpenAiProvider {
             .as_str()
             .map(str::to_string)
             .filter(|r| !r.trim().is_empty());
+        self.last_extra_calls = Self::extra_calls(&resp_body);
         Self::parse_completion(&resp_body)
     }
 
@@ -847,6 +916,10 @@ impl Provider for OpenAiProvider {
 
     fn last_wire_stats(&self) -> Option<Value> {
         self.last_wire_stats_obj.clone()
+    }
+
+    fn last_extra_tool_calls(&self) -> Vec<(String, Value)> {
+        self.last_extra_calls.clone()
     }
 }
 
@@ -1244,6 +1317,118 @@ mod transcript_tests {
         assert_eq!(msgs[3]["role"], json!("tool"));
         assert_eq!(msgs[3]["tool_call_id"], json!("intent_5"));
         assert!(msgs[3]["content"].as_str().unwrap().contains("boom"));
+    }
+
+    fn intent(id: &str, tool: &str, batch: bool) -> Entry {
+        let mut e = msg(id, "assistant", "");
+        e.kind = EntryType::new("intent");
+        e.payload = json!({ "tool": tool, "input": { "p": id }, "replay": "idempotent" });
+        if batch {
+            e.payload["batch"] = json!(true);
+        }
+        e
+    }
+
+    fn settled(id: &str, parent: &str) -> Entry {
+        let mut e = msg(id, "tool", "");
+        e.kind = EntryType::new("tool_result");
+        e.parent_id = Some(parent.into());
+        e.payload = json!({ "ok": true, "output": { "from": parent } });
+        e
+    }
+
+    #[test]
+    fn a_batch_flattens_to_one_assistant_message_with_results_in_call_order() {
+        let p = OpenAiProvider::new(OpenAiConfig::new("https://x.example/v1", "m", "k"));
+        let body = p.request_body(&[
+            intent("i1", "read_file", false),
+            settled("r1", "i1"),
+            intent("i2", "read_file", true),
+            settled("r2", "i2"),
+            intent("i3", "grep", true),
+            settled("r3", "i3"),
+        ]);
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 4, "1 assistant + 3 tool messages: {msgs:?}");
+        let calls = msgs[0]["tool_calls"].as_array().unwrap();
+        let ids: Vec<_> = calls.iter().map(|c| c["id"].clone()).collect();
+        assert_eq!(ids, vec![json!("i1"), json!("i2"), json!("i3")]);
+        let tool_ids: Vec<_> = msgs[1..]
+            .iter()
+            .map(|m| m["tool_call_id"].clone())
+            .collect();
+        assert_eq!(tool_ids, ids);
+        assert!(msgs[1..].iter().all(|m| m["role"] == json!("tool")));
+    }
+
+    #[test]
+    fn consecutive_unmarked_intents_stay_separate_assistant_messages() {
+        // History written before batches (or one call per response) must
+        // flatten byte-identically: cache-prefix stability.
+        let p = OpenAiProvider::new(OpenAiConfig::new("https://x.example/v1", "m", "k"));
+        let body = p.request_body(&[
+            intent("i1", "read_file", false),
+            settled("r1", "i1"),
+            intent("i2", "read_file", false),
+            settled("r2", "i2"),
+        ]);
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs[0]["tool_calls"].as_array().unwrap().len(), 1);
+        assert_eq!(msgs[2]["tool_calls"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_batch_member_without_a_prior_assistant_call_starts_its_own_message() {
+        let p = OpenAiProvider::new(OpenAiConfig::new("https://x.example/v1", "m", "k"));
+        let body = p.request_body(&[intent("i2", "read_file", true), settled("r2", "i2")]);
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0]["tool_calls"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn parse_completion_extras_keep_model_order_and_stop_at_a_malformed_call() {
+        let resp = json!({ "choices": [{ "message": { "tool_calls": [
+            { "function": { "name": "a", "arguments": "{\"x\":1}" } },
+            { "function": { "name": "b", "arguments": "{\"x\":2}" } },
+            { "function": { "name": "c", "arguments": { "x": 3 } } },
+            { "function": { "name": "d", "arguments": "{oops" } },
+            { "function": { "name": "e", "arguments": "{}" } },
+        ] } }] });
+        assert!(matches!(
+            OpenAiProvider::parse_completion(&resp),
+            Ok(ProviderOutput::ToolCall { .. })
+        ));
+        assert_eq!(
+            OpenAiProvider::extra_calls(&resp),
+            vec![
+                ("b".to_string(), json!({"x": 2})),
+                ("c".to_string(), json!({"x": 3}))
+            ]
+        );
+        // A malformed FIRST call means no batch at all.
+        let bad_first = json!({ "choices": [{ "message": { "tool_calls": [
+            { "function": { "name": "a", "arguments": "{oops" } },
+            { "function": { "name": "b", "arguments": "{}" } },
+        ] } }] });
+        assert!(OpenAiProvider::extra_calls(&bad_first).is_empty());
+    }
+
+    #[test]
+    fn streaming_exposes_the_calls_after_the_first_as_extras() {
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"a\",\"arguments\":\"{\\\"x\\\":1}\"}},{\"index\":1,\"id\":\"c2\",\"function\":{\"name\":\"b\",\"arguments\":\"{\\\"x\\\"\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"function\":{\"arguments\":\":2}\"}}]}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let mut p = OpenAiProvider::new(OpenAiConfig::new("https://x.example/v1", "m", "k"));
+        let out = p.complete_streaming(std::io::Cursor::new(sse)).unwrap();
+        assert!(matches!(out, ProviderOutput::ToolCall { ref tool, .. } if tool == "a"));
+        assert_eq!(
+            p.last_extra_tool_calls(),
+            vec![("b".to_string(), json!({"x": 2}))]
+        );
     }
 
     #[test]
