@@ -249,6 +249,23 @@ struct HeaderLine {
     /// skipped when absent, so pre-name files replay unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     name: Option<String>,
+    /// Issue #210: where a forked session was cut from. Optional +
+    /// skipped when absent, so pre-fork files replay unchanged.
+    #[serde(
+        default,
+        rename = "forkedFrom",
+        skip_serializing_if = "Option::is_none"
+    )]
+    forked_from: Option<ForkOrigin>,
+}
+
+/// Where a forked session was cut from (issue #210).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForkOrigin {
+    /// The source session id.
+    pub session: String,
+    /// The settled entry the fork was cut at (the last one it carries).
+    pub entry: String,
 }
 
 /// Discriminated record inside a commit line (array element or solo object).
@@ -346,6 +363,8 @@ pub struct JsonlStorage {
     system_prompt: Option<String>,
     /// Operator alias (issue #216), pinned in the header.
     name: Option<String>,
+    /// Issue #210: the fork origin pinned in the header.
+    forked_from: Option<ForkOrigin>,
     /// Set when an append previously failed mid-write (cora full-scan
     /// #53): the file may now end in a newline-less fragment, so ANY
     /// further commit could glue its line onto the fragment and brick
@@ -394,6 +413,17 @@ impl JsonlStorage {
         system_prompt: Option<&str>,
         name: Option<&str>,
     ) -> Result<Self, StorageError> {
+        Self::create_inner(dir, session_id, cwd, system_prompt, name, None)
+    }
+
+    fn create_inner(
+        dir: impl AsRef<Path>,
+        session_id: impl Into<String>,
+        cwd: Option<String>,
+        system_prompt: Option<&str>,
+        name: Option<&str>,
+        forked_from: Option<ForkOrigin>,
+    ) -> Result<Self, StorageError> {
         let session_id = session_id.into();
         // Issue #248 (rescan #145): the id is joined into a file path —
         // the storage layer enforces the safe charset itself instead of
@@ -418,6 +448,7 @@ impl JsonlStorage {
             cwd: cwd.clone(),
             system_prompt: system_prompt.map(str::to_string),
             name: name.map(str::to_string),
+            forked_from: forked_from.clone(),
         };
         let mut writer = BufWriter::new(
             OpenOptions::new()
@@ -438,6 +469,7 @@ impl JsonlStorage {
             created_at,
             cwd,
             name: name.map(str::to_string),
+            forked_from,
             system_prompt: system_prompt.map(str::to_string),
             entries: Vec::new(),
             by_id: BTreeMap::new(),
@@ -448,6 +480,87 @@ impl JsonlStorage {
             poisoned: None,
             syncs: 0,
         })
+    }
+
+    /// Issue #210: starts session `new_id` in `dir` as a fork of the
+    /// session file `src`: a copy of its lineage up to and including the
+    /// settled entry `at` (default: the last settled entry). Settled = a
+    /// final assistant message, the only point where the machine rests at
+    /// `Final` with no open tool sandwich. The source is only read, never
+    /// touched; entry ids and parents are kept, so every reader (replay,
+    /// todo hydration) works on the fork unchanged. Usage rows and
+    /// registers are NOT copied: a fork starts with a clean ledger.
+    pub fn fork(
+        src: impl AsRef<Path>,
+        dir: impl AsRef<Path>,
+        new_id: impl Into<String>,
+        at: Option<&str>,
+    ) -> Result<Self, StorageError> {
+        let new_id = new_id.into();
+        let from = Self::open_read_only(src)?;
+        let settled =
+            |e: &Entry| e.kind.as_str() == EntryType::MESSAGE && e.payload["role"] == "assistant";
+        let cut = match at {
+            Some(id) => {
+                let e = from
+                    .entry(id)
+                    .ok_or_else(|| StorageError::Invalid(format!("unknown entry: {id}")))?;
+                if !settled(e) {
+                    return Err(StorageError::Invalid(format!(
+                        "entry {id} is not a settled point (a final assistant message)"
+                    )));
+                }
+                from.by_id[id]
+            }
+            None => from
+                .entries
+                .iter()
+                .rposition(settled)
+                .ok_or_else(|| StorageError::Invalid("no settled entry to fork from".into()))?,
+        };
+        let origin = ForkOrigin {
+            session: from.session_id.clone(),
+            entry: from.entries[cut].id.clone(),
+        };
+        let mut out = Self::create_inner(
+            dir,
+            new_id,
+            Some(from.cwd.clone()),
+            from.system_prompt.as_deref(),
+            None,
+            Some(origin),
+        )?;
+        let copied: Result<(), StorageError> = (|| {
+            let mut c = Commit::new();
+            for e in &from.entries[..=cut] {
+                c = c.entry(NewEntry {
+                    id: Some(e.id.clone()),
+                    parent_id: e.parent_id.clone(),
+                    kind: e.kind.clone(),
+                    payload: e.payload.clone(),
+                    timestamp: e.timestamp,
+                });
+            }
+            out.commit(c)?;
+            // Idle -> Planning -> Final: the fork rests where a finished
+            // turn rests, so `resume <id> "<prompt>"` re-opens it.
+            for pc in [Pc::Planning, Pc::Final] {
+                let seq = out.state.seq;
+                out.commit(Commit::new().transition(StateTransition::from(seq, pc)))?;
+            }
+            Ok(())
+        })();
+        if let Err(e) = copied {
+            // Never leave a half-written fork behind.
+            let _ = std::fs::remove_file(&out.path);
+            return Err(e);
+        }
+        Ok(out)
+    }
+
+    /// Issue #210: where this session was forked from, if it is a fork.
+    pub fn forked_from(&self) -> Option<&ForkOrigin> {
+        self.forked_from.as_ref()
     }
 
     /// Opens and replays an existing session file.
@@ -536,6 +649,7 @@ impl JsonlStorage {
             created_at: header.created_at,
             cwd: header.cwd.clone(),
             name: header.name.clone(),
+            forked_from: header.forked_from.clone(),
             system_prompt: header.system_prompt.clone(),
             entries: Vec::new(),
             by_id: BTreeMap::new(),
@@ -1138,6 +1252,7 @@ impl Storage for JsonlStorage {
                 created_at: self.created_at,
                 cwd: self.cwd.clone(),
                 name: self.name.clone(),
+                forked_from: self.forked_from.clone(),
                 system_prompt: self.system_prompt.clone(),
             };
             writeln!(w, "{}", serde_json::to_string(&header)?)?;

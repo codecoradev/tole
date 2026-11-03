@@ -328,6 +328,21 @@ enum Command {
         /// contains this text (case-insensitive).
         #[arg(long, requires = "all")]
         grep: Option<String>,
+        /// Show forks (#210) nested under the session they were cut
+        /// from instead of a flat list.
+        #[arg(long, conflicts_with = "all")]
+        tree: bool,
+    },
+    /// Fork a session (#210): a NEW session holding the source's history
+    /// up to a settled entry, to try another approach without touching
+    /// the original. Continue it with `tole resume <new-id> "<prompt>"`.
+    Branch {
+        /// Session id to fork.
+        id: String,
+        /// Entry id to cut at (a final assistant answer; see `status`).
+        /// Default: the last settled entry.
+        #[arg(long)]
+        at: Option<String>,
     },
 
     /// Is the configured provider/model actually usable? Tiered checks —
@@ -1093,8 +1108,12 @@ fn dispatch(cli: Cli) -> Result<()> {
                 turnend: host.on_turnend.clone(),
             })
         }
+        Command::Sessions { tree: true, .. } => sessions_tree_command(&sessions_dir),
         Command::Sessions { all: false, .. } => sessions_command(&sessions_dir),
-        Command::Sessions { all: true, grep } => all_sessions_command(grep.as_deref()),
+        Command::Sessions {
+            all: true, grep, ..
+        } => all_sessions_command(grep.as_deref()),
+        Command::Branch { id, at } => branch_command(&sessions_dir, &id, at.as_deref()),
         Command::Doctor {
             tier,
             no_ledger,
@@ -2026,6 +2045,60 @@ fn sessions_command(sessions_dir: &Path) -> Result<()> {
             "{:<26} {:<18} {:<12} {:>5} {:>6}  {mtime}",
             row.1, name, row.2, row.3, row.4
         );
+    }
+    Ok(())
+}
+
+/// `tole branch` (#210): fork `id` at a settled entry into a new session.
+fn branch_command(sessions_dir: &Path, id: &str, at: Option<&str>) -> Result<()> {
+    if !valid_session_id(id) {
+        anyhow::bail!("invalid session id {id:?} (allowed: [A-Za-z0-9_-], max 64)");
+    }
+    let src = session_path(sessions_dir, id);
+    if !src.exists() {
+        anyhow::bail!("session {id} not found at {}", src.display());
+    }
+    let new_id = new_session_id();
+    let f = JsonlStorage::fork(&src, sessions_dir, &new_id, at).context("forking session")?;
+    let cut = f.forked_from().map(|o| o.entry.clone()).unwrap_or_default();
+    drop(f);
+    tole_cli::session_index::record(sessions_dir, &new_id, "branch");
+    println!("branched: {new_id}");
+    println!("from:     {id} @ {cut}");
+    println!("continue: tole resume {new_id} \"<prompt>\"");
+    Ok(())
+}
+
+/// `tole sessions --tree` (#210): sessions with their forks nested.
+fn sessions_tree_command(sessions_dir: &Path) -> Result<()> {
+    let mut nodes = Vec::new();
+    if sessions_dir.exists() {
+        for entry in std::fs::read_dir(sessions_dir)?.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let Some(stem) = name.strip_suffix(".jsonl") else {
+                continue;
+            };
+            if !valid_session_id(stem) {
+                continue;
+            }
+            let Ok(s) = JsonlStorage::open_read_only(entry.path()) else {
+                continue;
+            };
+            nodes.push(tole_cli::session_index::TreeNode {
+                id: stem.to_string(),
+                parent: s.forked_from().map(|o| o.session.clone()),
+                at: s.forked_from().map(|o| o.entry.clone()),
+                pc: format!("{:?}", s.state().pc),
+                turns: tole_core::transcript::turn_count(s.entries()),
+            });
+        }
+    }
+    if nodes.is_empty() {
+        println!("no sessions in {}", sessions_dir.display());
+        return Ok(());
+    }
+    for line in tole_cli::session_index::tree_lines(nodes) {
+        println!("{line}");
     }
     Ok(())
 }

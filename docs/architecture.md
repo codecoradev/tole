@@ -91,6 +91,8 @@ Invariants (all backends):
 - `entries` are never modified or deleted — corrections = append a new entry. Registers are the only mutable state.
 - `state.seq` is monotonic; a transition is valid only if `seq == expected`.
 
+**Session forks (#210).** A fork is a NEW session file: the header carries `forkedFrom: {session, entry}` and the body is the source's lineage up to a settled entry (a final assistant answer), with entry ids and parents kept; the machine rests at `Final`. The source is only read. Because the copied prefix is an ordinary linear transcript, every reader (replay, compaction, todo hydration) is correct per branch with no lineage-aware folding. Usage rows and registers are not copied (the fork starts with a clean ledger). `tole branch <id> [--at <entry>]` creates one; `tole sessions --tree` nests forks under their source. In-file branching (several leaves in one file, lineage-following readers, resume by branch head) is deferred.
+
 **Optional SQLite backend** (`feature = "sqlite"`): one `.db` file per session, WAL mode, all writes via `BEGIN IMMEDIATE`; same 3-store schema (entries WITHOUT ROWID + registers + usage_ledger). Chosen only when consumers need indexed queries (e.g. branch index scans); not used by the CLI in v0.
 
 ## 5. State Machine
