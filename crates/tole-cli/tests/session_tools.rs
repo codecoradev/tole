@@ -350,18 +350,25 @@ fn session_detach_tool_flags_only_a_running_turn_and_jobs_nudge_the_session() {
     *busy.lock().unwrap() = false;
 
     // A job started by the session nudges the session's soft-interrupt queue.
-    let job = registry
-        .get("job_start")
-        .expect("job_start registered")
-        .execute(json!({"command": "sh -c 'sleep 0.2'"}))
-        .unwrap();
-    let id = job["job"].as_str().unwrap().to_string();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while token.interrupts().is_empty() && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(50));
+    // `job_start` is only registered under shell-tools, so the bare
+    // no-mcp profile has no job tools to observe a nudge from.
+    #[cfg(feature = "shell-tools")]
+    {
+        let job = registry
+            .get("job_start")
+            .expect("job_start registered")
+            .execute(json!({"command": "sh -c 'sleep 0.2'"}))
+            .unwrap();
+        let id = job["job"].as_str().unwrap().to_string();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while token.interrupts().is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let q = token.interrupts().drain();
+        assert_eq!(q.len(), 1, "{q:?}");
+        assert!(q[0].text.contains(&id), "{}", q[0].text);
     }
-    let q = token.interrupts().drain();
-    assert_eq!(q.len(), 1, "{q:?}");
-    assert!(q[0].text.contains(&id), "{}", q[0].text);
+    #[cfg(not(feature = "shell-tools"))]
+    let _ = registry;
     let _ = std::fs::remove_dir_all(&dir);
 }
