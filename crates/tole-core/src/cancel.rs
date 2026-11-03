@@ -3,7 +3,9 @@
 //! ACP clients MUST be able to stop a generating turn (`session/cancel`
 //! is a protocol baseline MUST). The turn loop is synchronous, so the
 //! token is a checkpoint flag: it is checked between steps and before
-//! each tool execution — never mid-step. A set token unwinds the turn
+//! each tool execution. A provider call already in flight is interrupted
+//! by `Provider::complete_with_cancel` (#484; the abandoned request may
+//! still be billed). A set token unwinds the turn
 //! into a durable `TurnOutcome::Cancelled` settlement (pc = Final, the
 //! session stays prompt-resumable) and the transport answers the
 //! original prompt request with `stopReason: "cancelled"`.
