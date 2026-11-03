@@ -49,7 +49,10 @@ tole is the agent harness of the CodeCora ecosystem — the hands:
   `tole doctor` reports each one as supported, too old (with the upgrade
   command) or not installed.
 - Anything else that speaks **MCP over stdio** joins the same registry via
-  repeatable `--mcp-server name=command [args...]` flags.
+  repeatable `--mcp-server name=command [args...]` flags. Servers that
+  offer prompts show up in `tole chat` as `/mcp:<server>:<prompt> [k=v ...]`
+  (rendered server-side, sent as your next message); servers that offer
+  resources add a ReadOnly `mcp_read` tool. Servers with neither add nothing.
 - **tole as an MCP server**: `tole mcp` serves the registry's hardened tools
   (jailed file ops, git, jobs, memory) to any MCP client. ReadOnly tools are
   always callable; Write tools require `--allow` patterns; Destructive tools
