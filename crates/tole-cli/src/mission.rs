@@ -27,7 +27,7 @@ use serde_json::{json, Value};
 use tole_core::storage::{JsonlStorage, Storage};
 use tole_core::subprocess::run_with_timeout;
 use tole_core::tool::ToolRegistry;
-use tole_core::turn::{run_turn, TurnOutcome};
+use tole_core::turn::{run_turn_with_images, TurnOutcome};
 
 /// The completion marker the mission system prompt pins: a final
 /// message containing this line declares the goal fully achieved.
@@ -97,6 +97,8 @@ pub struct MissionConfig {
     pub verify_timeout_secs: u64,
     /// Context compaction between chained turns (#440).
     pub compaction: tole_cli::compaction_host::CompactionSettings,
+    /// Images attached to the first turn only (#212).
+    pub images: Vec<tole_core::image::ImageRef>,
 }
 
 /// The mission addendum appended to the default system prompt.
@@ -307,7 +309,20 @@ pub fn run_mission(
         // Context compaction (#440): between chained turns, after the
         // budget checks; the summary call's tokens count toward them.
         compactor.before_turn(&mut storage, &mut *provider);
-        let outcome = match run_turn(&mut storage, &mut provider, &registry, &prompt) {
+        let first_images = if turns == 0 {
+            cfg.images.as_slice()
+        } else {
+            &[]
+        };
+        let outcome = match run_turn_with_images(
+            &mut storage,
+            &mut provider,
+            &registry,
+            &prompt,
+            first_images,
+            &tole_core::cancel::CancelToken::default(),
+            None,
+        ) {
             Ok(o) => o,
             Err(e) => {
                 // Storage-class failure: still summarize (the "either

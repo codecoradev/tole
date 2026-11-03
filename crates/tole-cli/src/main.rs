@@ -25,7 +25,8 @@ mod upgrade;
 use tole_core::storage::{JsonlStorage, Storage};
 use tole_core::tool::ToolRegistry;
 use tole_core::turn::{
-    resume_turn_with_cancel, run_turn_with_cancel, TurnOutcome, LOOP_TRIP_AFTER,
+    resume_turn_with_cancel, run_turn_with_cancel, run_turn_with_images, TurnOutcome,
+    LOOP_TRIP_AFTER,
 };
 
 /// Session id → path (`<dir>/<id>.jsonl`).
@@ -213,6 +214,13 @@ enum Command {
         /// mode. Destructive tools still prompt).
         #[arg(long)]
         yes: bool,
+
+        /// Attach an image to the first message: a file path inside the
+        /// workspace jail, or an inline `data:image/…;base64,…` URL (png,
+        /// jpeg, gif, webp; 10 MiB max). Needs a vision-capable model;
+        /// repeatable (#212).
+        #[arg(long = "image")]
+        images: Vec<String>,
     },
     /// Run an autonomous mission: budgeted turn-chaining toward a goal
     /// (issue #199). Every chained turn is a normal durable turn —
@@ -265,6 +273,11 @@ enum Command {
         /// mode. Destructive tools still prompt).
         #[arg(long)]
         yes: bool,
+
+        /// Attach an image to the first message/turn (#212); same
+        /// semantics as `run --image`.
+        #[arg(long = "image")]
+        images: Vec<String>,
     },
     /// Check for updates and self-upgrade via cargo (issue #220).
     Upgrade {
@@ -467,6 +480,11 @@ enum Command {
         /// Same semantics as `run --yes`.
         #[arg(long)]
         yes: bool,
+
+        /// Attach an image to the first message/turn (#212); same
+        /// semantics as `run --image`.
+        #[arg(long = "image")]
+        images: Vec<String>,
     },
     /// Project config file `.tole/config.toml` (#208): `check` validates
     /// it and shows the effective values, `trust`/`untrust` manage the
@@ -781,6 +799,9 @@ fn dispatch(cli: Cli) -> Result<()> {
             window: settings.context_window.as_ref().map(|w| w.value),
         },
     };
+    // #212: where attached images may be read from; best effort — a bad
+    // --workspace is reported by the commands that need it.
+    tole_cli::turn_runner::set_image_roots(resolve_workspace_root(host.workspace.as_ref()).ok());
     // Trust presets (issue #159): expand once, before dispatch — every
     // allow_patterns-consuming subcommand appends these. --trust >
     // TOLE_TRUST > config `trust`, the higher layer replacing the whole
@@ -816,6 +837,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             system: _,
             allow_patterns: _,
             yes,
+            images,
         } => {
             let allow_patterns = with_trust(config_apply::values(&settings.allow), &trust_extra);
             // Prompt resolution (issue #216): exactly one of positional
@@ -849,6 +871,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                 &host,
                 name.as_deref(),
                 timeout,
+                &images,
             )
         }
         Command::Upgrade { check, yes } => {
@@ -934,8 +957,10 @@ fn dispatch(cli: Cli) -> Result<()> {
             resume,
             allow_patterns: _,
             yes,
+            images,
         } => {
             let allow_patterns = with_trust(config_apply::values(&settings.allow), &trust_extra);
+            let images = tole_cli::turn_runner::resolve_images(&images)?;
             if host.plan_mode {
                 return Err(refuse(
                     "--plan-mode has no meaning for a mission (missions mutate by definition)",
@@ -1000,6 +1025,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                     verify_timeout_secs: settings.verify_timeout.value,
                     resume_id: resume,
                     compaction: host.compaction,
+                    images,
                 },
                 registry,
                 &sessions_dir,
@@ -1147,8 +1173,10 @@ fn dispatch(cli: Cli) -> Result<()> {
             last,
             allow_patterns: _,
             yes,
+            images,
         } => {
             let allow_patterns = with_trust(config_apply::values(&settings.allow), &trust_extra);
+            let images = tole_cli::turn_runner::resolve_images(&images)?;
             chat_command(
                 &sessions_dir,
                 settings.system_prompt.as_ref().map(|e| e.value.as_str()),
@@ -1157,6 +1185,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                 &allow_patterns,
                 yes,
                 &host,
+                images,
             )
         }
     }
@@ -1663,8 +1692,11 @@ fn run_command(
     host: &HostConfig,
     name: Option<&str>,
     timeout_secs: Option<u64>,
+    images: &[String],
 ) -> Result<()> {
     let cfg = tole_cli::turn_runner::provider_config().map_err(anyhow::Error::msg)?;
+    // Resolve (jail-check) images before the session file exists.
+    let images = tole_cli::turn_runner::resolve_images(images)?;
     // Build everything that can fail BEFORE the session file exists, so a
     // failed startup does not leave a stray empty session polluting
     // `sessions` / `--last` (CodeCora scan 2026-09-18).
@@ -1750,7 +1782,15 @@ fn run_command(
             token.cancel();
         })
     });
-    let outcome = run_turn_with_cancel(&mut storage, &mut provider, &registry, &prompt, &cancel)?;
+    let outcome = run_turn_with_images(
+        &mut storage,
+        &mut provider,
+        &registry,
+        &prompt,
+        &images,
+        &cancel,
+        None,
+    )?;
     // Join ONLY when the timer fired (cora MAJOR): join otherwise blocks
     // for the remaining budget after the turn already finished. Detach —
     // the process exits right after run_command anyway.
@@ -2204,6 +2244,7 @@ fn latest_session_id(dir: &Path) -> Option<String> {
 /// `resume_turn` on the next line, keeping the conversation alive without
 /// losing durable context. Ctrl-C / EOF exit cleanly — every commit is
 /// already durable, `tole chat --resume <id>` picks the thread back up.
+#[allow(clippy::too_many_arguments)]
 fn chat_command(
     sessions_dir: &Path,
     system: Option<&str>,
@@ -2212,6 +2253,8 @@ fn chat_command(
     allow_patterns: &[String],
     yes: bool,
     host: &HostConfig,
+    // Attached to the first message only (#212).
+    mut pending_images: Vec<tole_core::image::ImageRef>,
 ) -> Result<()> {
     use std::io::{BufRead, Write};
 
@@ -2380,18 +2423,21 @@ fn chat_command(
         };
         #[cfg(not(feature = "shell-tools"))]
         let turn_prompt = text.to_string();
+        let turn_images = std::mem::take(&mut pending_images);
         let outcome = loop {
             match storage.state().pc {
                 tole_core::state::Pc::Idle | tole_core::state::Pc::Final => {
                     // Context compaction (#440): only here, between
                     // settled turns.
                     compactor.before_turn(&mut storage, &mut *provider);
-                    break run_turn_with_cancel(
+                    break run_turn_with_images(
                         &mut storage,
                         &mut provider,
                         &registry,
                         &turn_prompt,
+                        &turn_images,
                         &cancel,
+                        None,
                     );
                 }
                 _ => {

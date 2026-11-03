@@ -46,6 +46,20 @@ impl WireStats {
     }
 }
 
+/// The `images` references on a user message payload (#212); malformed
+/// elements are skipped.
+fn image_refs(payload: &Value) -> Vec<crate::image::ImageRef> {
+    payload
+        .get("images")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(crate::image::ImageRef::from_value)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Measure a request body as built by `OpenAiProvider::request_body`
 /// (before the `stream`/`stream_options` envelope). Pure: the body is
 /// only read.
@@ -217,6 +231,13 @@ pub struct OpenAiProvider {
     /// Set only on the helper-thread copy of a cancel-aware call (#484):
     /// the stream reader stops (and stays silent on the sinks) once set.
     abort: Option<CancelToken>,
+    /// Roots an attached image may live under (#212): the workspace, plus
+    /// the host's spill dir for inline images. Empty = images unreadable
+    /// (they degrade to a text note on the wire).
+    image_roots: Vec<std::path::PathBuf>,
+    /// Declared vision capability (#212): `Some(false)` refuses image
+    /// input before any request; `None` = unknown, the server decides.
+    vision: Option<bool>,
 }
 
 impl std::fmt::Debug for OpenAiProvider {
@@ -252,6 +273,8 @@ impl OpenAiProvider {
             on_reasoning_delta: None,
             drain_live: Arc::new(AtomicUsize::new(0)),
             abort: None,
+            image_roots: Vec::new(),
+            vision: None,
             streaming: std::env::var("TOLE_STREAM")
                 .map(|v| v != "0")
                 .unwrap_or(true),
@@ -309,6 +332,19 @@ impl OpenAiProvider {
         self
     }
 
+    /// Roots attached images are loaded from (#212); see `image::data_url`.
+    pub fn with_image_roots(mut self, roots: Vec<std::path::PathBuf>) -> Self {
+        self.image_roots = roots;
+        self
+    }
+
+    /// Declare whether the model accepts image input (#212). `false` turns
+    /// image input into a model-capability error before any request.
+    pub fn with_vision(mut self, vision: bool) -> Self {
+        self.vision = Some(vision);
+        self
+    }
+
     /// Inject tool specs (from `ToolRegistry::specs()`). Non-empty specs
     /// enable tool-calling on the wire (E4.5).
     pub fn with_tool_specs(mut self, specs: Vec<Value>) -> Self {
@@ -359,7 +395,30 @@ impl OpenAiProvider {
                     if !matches!(role, "user" | "assistant" | "system") {
                         continue;
                     }
-                    messages.push(json!({ "role": role, "content": text }));
+                    let images = if role == "user" {
+                        image_refs(&e.payload)
+                    } else {
+                        vec![]
+                    };
+                    if images.is_empty() {
+                        messages.push(json!({ "role": role, "content": text }));
+                        continue;
+                    }
+                    // #212: OpenAI-compatible content parts. The log holds
+                    // references; the blob is re-read (jail + hash checked)
+                    // per request. A failed load stays visible as a text
+                    // note instead of dropping the image silently.
+                    let mut parts = vec![json!({ "type": "text", "text": text })];
+                    for r in &images {
+                        parts.push(match crate::image::data_url(r, &self.image_roots) {
+                            Ok(url) => json!({ "type": "image_url", "image_url": { "url": url } }),
+                            Err(err) => json!({
+                                "type": "text",
+                                "text": format!("[image unavailable: {err}]"),
+                            }),
+                        });
+                    }
+                    messages.push(json!({ "role": role, "content": parts }));
                 }
                 "intent" => {
                     let (Some(tool), Some(input)) = (
@@ -822,6 +881,16 @@ impl Provider for OpenAiProvider {
         self.last_reasoning_obj = None;
         self.last_wire_stats_obj = None;
         self.last_extra_calls.clear();
+        let has_images = transcript
+            .iter()
+            .any(|e| !image_refs(&e.payload).is_empty());
+        if has_images && self.vision == Some(false) {
+            return Err(ProviderError(format!(
+                "model-capability error: the transcript has image input but model {} is \
+                 declared non-vision (TOLE_VISION=0) — use a vision-capable model or drop the image",
+                self.cfg.model
+            )));
+        }
         let mut body = self.request_body(transcript);
         // Issue #211: measure BEFORE the streaming envelope is layered
         // on — the same body the Tier-1 golden pins. Read-only.
@@ -868,6 +937,19 @@ impl Provider for OpenAiProvider {
                 .unwrap_or_else(|_| "<unreadable body>".to_string());
             let body_text = scrub(&body_text, &self.cfg.api_key);
             let snippet: String = body_text.chars().take(200).collect();
+            let lower = body_text.to_ascii_lowercase();
+            if has_images
+                && matches!(status.as_u16(), 400 | 415 | 422)
+                && ["image", "vision", "multimodal", "multi-modal"]
+                    .iter()
+                    .any(|k| lower.contains(k))
+            {
+                return Err(ProviderError(format!(
+                    "model-capability error: model {} rejected image input — use a \
+                     vision-capable model (http status: {status} — {snippet})",
+                    self.cfg.model
+                )));
+            }
             return Err(ProviderError(format!(
                 "http status: {status}{retry_after} — {snippet}"
             )));
@@ -1607,6 +1689,20 @@ mod transcript_tests {
             "durable log must keep the original text"
         );
     }
+    #[test]
+    fn user_message_with_a_missing_image_degrades_to_a_text_note() {
+        let p = OpenAiProvider::new(OpenAiConfig::new("https://x.example/v1", "m", "k"));
+        let mut e = msg("e1", "user", "hi");
+        e.payload["images"] =
+            json!([{"path": "/nope/a.png", "mime": "image/png", "bytes": 1, "fnv1a64": "0"}]);
+        let body = p.request_body(&[e]);
+        let parts = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(parts[0]["text"], json!("hi"));
+        assert!(parts[1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("image unavailable"));
+    }
 }
 
 #[cfg(test)]
@@ -1840,6 +1936,35 @@ mod http_error_tests {
                 fetch_context_window(&url, "sk-secret", "m", Duration::from_secs(3)).unwrap_err();
             assert_eq!(err, format!("models probe: http status: {code}"));
         }
+    }
+    #[test]
+    fn image_rejection_from_the_server_becomes_a_capability_error() {
+        let url = serve_raw(
+            "400 Bad Request",
+            "Content-Type: application/json\r\n",
+            r#"{"error":{"message":"image_url content is not supported by this model"}}"#,
+            68,
+        );
+        let ws = std::env::temp_dir().join(format!("tole-cap-{}", std::process::id()));
+        std::fs::create_dir_all(&ws).unwrap();
+        let ws = ws.canonicalize().unwrap();
+        let png = [0x89u8, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3];
+        std::fs::write(ws.join("a.png"), png).unwrap();
+        let r = crate::image::resolve("a.png", std::slice::from_ref(&ws), None).unwrap();
+        let mut e = Entry {
+            id: "e1".into(),
+            parent_id: None,
+            seq: 0,
+            kind: EntryType::new(EntryType::MESSAGE),
+            payload: json!({ "role": "user", "text": "hi" }),
+            timestamp: 0,
+        };
+        e.payload["images"] = json!([r.to_value()]);
+        let mut p = OpenAiProvider::new(OpenAiConfig::new(url, "m", "k"))
+            .with_streaming(false)
+            .with_image_roots(vec![ws]);
+        let err = p.complete(&[e]).unwrap_err();
+        assert!(err.0.contains("model-capability"), "{err}");
     }
 }
 
