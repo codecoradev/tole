@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Release builds use thin LTO, a single codegen unit and `strip = true` (#482): the `tole` binary shrinks from 16.7 MB to about 9 MB. The profile is also set in `crates/tole-cli/Cargo.toml` so `cargo install tole-cli` gets it (the workspace-root profile is not packaged). `panic = "abort"` is deliberately not set: Mutex poison recovery and the serve/ACP/MCP daemons rely on unwinding.
 
 ### Fixed
+- A provider HTTP error now carries its body: `http status: 400 Bad Request — <scrubbed 200-char snippet>`, plus `(retry-after: N)` when the header is present (#474). The chat-completions client no longer lets ureq drop the body of a 4xx/5xx (`http_status_as_error(false)`, that request only); the `/models` probes keep their `Err` on non-2xx. The `http status: N` prefix is unchanged and a snippet never changes retry or failover classification.
 - Approval prompts now also escape the Arabic letter mark (U+061C), the Mongolian vowel separator (U+180E), the word joiner and invisible math operators (U+2060–U+2064) and the deprecated format characters (U+206A–U+206F); they could visually reorder or hide text (pre-tag scan of 0.9.0).
 - The API key is redacted from replayed tool-call arguments on the wire, as it already was from message text and tool results (E11).
 - Compaction with `keep_turns` of 2 or more no longer cuts before the previous summary, which made the summary call replay the raw transcript and drop that summary. Only embedders could hit it; the CLI keeps one turn.

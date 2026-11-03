@@ -228,7 +228,7 @@ impl std::fmt::Debug for OpenAiProvider {
 impl OpenAiProvider {
     pub fn new(cfg: OpenAiConfig) -> Self {
         let timeout = Duration::from_secs(120);
-        let agent = Self::build_agent(timeout);
+        let agent = Self::build_chat_agent(timeout);
         Self {
             cfg,
             timeout,
@@ -272,9 +272,21 @@ impl OpenAiProvider {
             .new_agent()
     }
 
+    /// Agent for the chat-completions request only: 4xx/5xx arrive as
+    /// `Ok(resp)` so `complete()` can read the error body (#474). ureq's
+    /// default turns them into `Error::StatusCode(code)`, which drops it.
+    /// The `/models` probes keep `build_agent` and its `Err` on non-2xx.
+    fn build_chat_agent(timeout: Duration) -> ureq::Agent {
+        ureq::Agent::config_builder()
+            .timeout_global(Some(timeout))
+            .http_status_as_error(false)
+            .build()
+            .new_agent()
+    }
+
     /// Override the default 120s timeout.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.agent = Self::build_agent(timeout);
+        self.agent = Self::build_chat_agent(timeout);
         self.timeout = timeout;
         self
     }
@@ -668,18 +680,32 @@ impl Provider for OpenAiProvider {
             .map_err(|e| ProviderError(scrub(&e.to_string(), &self.cfg.api_key)))?;
         // HTTP status FIRST (cora full-scan #46): a non-2xx body is often
         // HTML/error JSON that read_json would mangle into a misleading
-        // "malformed response". Surface status + scrubbed body snippet;
-        // the "http status: N" phrasing is load-bearing — the turn loop's
-        // transient-retry classification (#66) matches on it.
+        // "malformed response". Surface status + Retry-After + scrubbed
+        // body snippet; the leading "http status: N" is load-bearing — the
+        // failover and transient-retry classification parse it.
         if !resp.status().is_success() {
             let status = resp.status();
+            let retry_after = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .map(|v| {
+                    scrub(v, &self.cfg.api_key)
+                        .chars()
+                        .take(64)
+                        .collect::<String>()
+                })
+                .map(|v| format!(" (retry-after: {v})"))
+                .unwrap_or_default();
             let body_text = resp
                 .into_body()
                 .read_to_string()
                 .unwrap_or_else(|_| "<unreadable body>".to_string());
             let body_text = scrub(&body_text, &self.cfg.api_key);
             let snippet: String = body_text.chars().take(200).collect();
-            return Err(ProviderError(format!("http status: {status} — {snippet}")));
+            return Err(ProviderError(format!(
+                "http status: {status}{retry_after} — {snippet}"
+            )));
         }
         // Issue #196 phase 3: SSE streaming — deltas flow to the sinks
         // while the stream is read; complete() returns one decisive
@@ -1356,6 +1382,168 @@ mod models_probe_tests {
         // error text (the same scrub contract as chat completions).
         let err = fetch_model_ids("http://127.0.0.1:9/v1", "sk-secret").unwrap_err();
         assert!(!err.contains("sk-secret"));
+    }
+}
+
+#[cfg(test)]
+mod http_error_tests {
+    use super::*;
+    use crate::entry::{Entry, EntryType};
+
+    /// One-shot mock answering with a raw HTTP response (status line,
+    /// extra headers and body supplied by the caller; `content_length`
+    /// may lie to simulate a cut body).
+    fn serve_raw(status: &str, headers: &str, body: &str, content_length: usize) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let resp = format!(
+            "HTTP/1.1 {status}\r\n{headers}Content-Length: {content_length}\r\nConnection: close\r\n\r\n{body}"
+        );
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                use std::io::{Read, Write};
+                let mut buf = [0u8; 8192];
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+        format!("http://{addr}/v1")
+    }
+
+    fn complete_err(base_url: String, streaming: bool) -> String {
+        let cfg = OpenAiConfig {
+            base_url,
+            api_key: "sk-secret".into(),
+            model: "m".into(),
+        };
+        let mut p = OpenAiProvider::new(cfg).with_streaming(streaming);
+        let t = vec![Entry {
+            id: "u1".into(),
+            parent_id: None,
+            seq: 0,
+            kind: EntryType::new(EntryType::MESSAGE),
+            payload: json!({ "role": "user", "text": "hi" }),
+            timestamp: 0,
+        }];
+        p.complete(&t).unwrap_err().0
+    }
+
+    /// The same message without the body must classify identically.
+    fn assert_classified_like_bare(msg: &str, bare: &str) {
+        assert_eq!(
+            crate::failover::is_failover_error(msg),
+            crate::failover::is_failover_error(bare),
+            "{msg}"
+        );
+        assert_eq!(
+            crate::turn::is_transient_provider_error(msg),
+            crate::turn::is_transient_provider_error(bare),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn json_error_body_reaches_the_error_text() {
+        let body = r#"{"error":{"message":"maximum context length is 131072 tokens","code":"context_length_exceeded"}}"#;
+        for streaming in [false, true] {
+            let url = serve_raw(
+                "400 Bad Request",
+                "Content-Type: application/json\r\n",
+                body,
+                body.len(),
+            );
+            let err = complete_err(url, streaming);
+            assert_eq!(err, format!("http status: 400 Bad Request — {body}"));
+            assert_classified_like_bare(&err, "http status: 400 Bad Request");
+            assert!(!crate::turn::is_transient_provider_error(&err));
+        }
+    }
+
+    #[test]
+    fn retry_after_is_surfaced_and_429_stays_transient() {
+        let body = "rate limited";
+        let url = serve_raw(
+            "429 Too Many Requests",
+            "Retry-After: 7\r\n",
+            body,
+            body.len(),
+        );
+        let err = complete_err(url, false);
+        assert_eq!(
+            err,
+            "http status: 429 Too Many Requests (retry-after: 7) — rate limited"
+        );
+        assert_classified_like_bare(&err, "http status: 429 Too Many Requests");
+        assert!(crate::turn::is_transient_provider_error(&err));
+        assert!(crate::failover::is_failover_error(&err));
+    }
+
+    #[test]
+    fn html_body_is_capped_and_the_key_scrubbed() {
+        let body = format!("<html>key sk-secret {}</html>", "x".repeat(500));
+        let url = serve_raw(
+            "503 Service Unavailable",
+            "Content-Type: text/html\r\n",
+            &body,
+            body.len(),
+        );
+        let err = complete_err(url, false);
+        assert!(err.starts_with("http status: 503 Service Unavailable — <html>key <redacted> xxx"));
+        assert!(!err.contains("sk-secret"));
+        let snippet = err.split_once(" — ").unwrap().1;
+        assert_eq!(snippet.chars().count(), 200);
+        assert_classified_like_bare(&err, "http status: 503 Service Unavailable");
+        assert!(crate::failover::is_failover_error(&err));
+    }
+
+    #[test]
+    fn unreadable_body_is_marked() {
+        // Content-Length promises 100 bytes, 5 arrive, then the socket closes.
+        let url = serve_raw("500 Internal Server Error", "", "oops!", 100);
+        let err = complete_err(url, false);
+        assert_eq!(
+            err,
+            "http status: 500 Internal Server Error — <unreadable body>"
+        );
+        assert_classified_like_bare(&err, "http status: 500 Internal Server Error");
+    }
+
+    #[test]
+    fn body_text_cannot_flip_transient_classification() {
+        for (status, body) in [
+            ("400 Bad Request", "resulted in 142900 tokens"),
+            ("422 Unprocessable Entity", "invalid timeout value"),
+            ("401 Unauthorized", "token timeout"),
+        ] {
+            let url = serve_raw(status, "", body, body.len());
+            let err = complete_err(url, false);
+            assert!(err.ends_with(body), "{err}");
+            assert!(!crate::turn::is_transient_provider_error(&err), "{err}");
+        }
+    }
+
+    #[test]
+    fn models_probes_keep_their_non_2xx_behaviour() {
+        for (status, code) in [("401 Unauthorized", "401"), ("404 Not Found", "404")] {
+            let body = r#"{"error":"nope"}"#;
+            let url = serve_raw(
+                status,
+                "Content-Type: application/json\r\n",
+                body,
+                body.len(),
+            );
+            let err = fetch_model_ids(&url, "sk-secret").unwrap_err();
+            assert_eq!(err, format!("models probe: http status: {code}"));
+            let url = serve_raw(
+                status,
+                "Content-Type: application/json\r\n",
+                body,
+                body.len(),
+            );
+            let err =
+                fetch_context_window(&url, "sk-secret", "m", Duration::from_secs(3)).unwrap_err();
+            assert_eq!(err, format!("models probe: http status: {code}"));
+        }
     }
 }
 
