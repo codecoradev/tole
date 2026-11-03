@@ -74,9 +74,13 @@ tole is the agent harness of the CodeCora ecosystem — the hands:
   without losing its work: the `{"text", "urgent"}` message is injected at
   the turn's next safe point as an attributed entry (`409` when no turn
   is running).
+  `POST /sessions/{id}/detach` (#217) stops waiting without aborting: the
+  running tool settles, the turn ends `stopReason: "detached"` (resumable),
+  and background jobs keep running and nudge the session when they finish
+  (`409` when no turn is running).
   `--transport mcp` (issue #137) serves **multi-session MCP over
   Streamable HTTP** instead: one authenticated MCP connection addresses N
-  durable tole sessions (`tole_session_new/prompt/cancel/interrupt/status/list` +
+  durable tole sessions (`tole_session_new/prompt/cancel/interrupt/detach/status/list` +
   the registry tools routed to each session's workspace jail).
 
 Every ecosystem integration is probe-first: a missing binary degrades to a

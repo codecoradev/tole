@@ -105,6 +105,7 @@ impl SessionToolState {
             Box::new(SessionPromptTool(self.clone())),
             Box::new(SessionCancelTool(self.clone())),
             Box::new(SessionInterruptTool(self.clone())),
+            Box::new(SessionDetachTool(self.clone())),
             Box::new(SessionStatusTool(self.clone())),
             Box::new(SessionListTool(self.clone())),
         ]
@@ -304,6 +305,56 @@ impl Tool for SessionInterruptTool {
                 Err("no turn is running in this session".into())
             }
             Err(crate::session_host::InterruptRefusal::Invalid(e)) => Err(e),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// tole_session_detach — stop waiting, keep the work (#217)
+// ---------------------------------------------------------------------------
+
+/// Detaches the target session's in-flight turn: nothing is aborted — the
+/// running tool settles, the turn ends `detached` (resumable), background
+/// jobs keep running and nudge the session when they finish.
+struct SessionDetachTool(SessionToolState);
+
+impl Tool for SessionDetachTool {
+    fn name(&self) -> &str {
+        "tole_session_detach"
+    }
+    fn risk(&self) -> Risk {
+        Risk::ReadOnly
+    }
+    fn summary(&self) -> String {
+        "Detach the in-flight turn of a tole session: stop waiting without aborting its work."
+            .into()
+    }
+    fn describe(&self, input: &Value) -> String {
+        format!(
+            "detach session {:?}",
+            input
+                .get("session_id")
+                .and_then(Value::as_str)
+                .unwrap_or("<implicit>")
+        )
+    }
+    fn spec(&self) -> Option<Value> {
+        Some(json!({
+            "type": "object",
+            "properties": {
+                "session_id": { "type": "string", "description": "Target session (optional when exactly one is open)" }
+            }
+        }))
+    }
+    fn execute(&self, input: Value) -> Result<Value, String> {
+        let st = self.0.resolve(&input)?;
+        if crate::session_host::detach_session(&st) {
+            Ok(json!({
+                "detached": true,
+                "note": "the running tool settles, then the turn ends 'detached'; resume with a new prompt"
+            }))
+        } else {
+            Err("no turn is running in this session".into())
         }
     }
 }

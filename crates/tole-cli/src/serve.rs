@@ -718,6 +718,23 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                         }
                     }
                 }
+                ("POST", id, Some("detach")) => {
+                    // Detach (#217): stop waiting without aborting; the turn
+                    // ends "detached". 409 when no turn is running.
+                    let st = {
+                        let sessions = lock_sessions(&state.sessions);
+                        sessions.get(id).cloned()
+                    };
+                    let Some(st) = st else {
+                        return (404, json!({"error": "unknown session"}));
+                    };
+                    if tole_cli::session_host::detach_session(&st) {
+                        eprintln!("tole: session/{id} detach requested (serve)");
+                        (202, json!({"detached": true, "sessionId": id}))
+                    } else {
+                        (409, json!({"error": "no turn is running in this session"}))
+                    }
+                }
                 _ => (404, json!({"error": "not found"})),
             }
         }

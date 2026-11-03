@@ -23,6 +23,9 @@ use std::sync::Arc;
 #[derive(Clone, Default)]
 pub struct CancelToken {
     flag: Arc<AtomicBool>,
+    /// Detach request (#217): stop waiting, keep the work. Separate from
+    /// `flag` so a cancel (abort) always outranks it.
+    detached: Arc<AtomicBool>,
     /// Soft-interrupt queue (#377): the same per-session turn handle that
     /// carries the cancel flag also carries steering messages. Never
     /// cleared by `reset`: an interrupt waits for the next safe point.
@@ -58,6 +61,18 @@ impl CancelToken {
     /// at which point no turn was in flight and wiping is correct.
     pub fn reset(&self) {
         self.flag.store(false, Ordering::SeqCst);
+        self.detached.store(false, Ordering::SeqCst);
+    }
+
+    /// Ask the running turn to stop waiting WITHOUT aborting anything
+    /// (#217): the in-flight call settles normally, then the turn ends
+    /// `Detached` (pc = Final, resumable). Idempotent; any thread.
+    pub fn detach(&self) {
+        self.detached.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_detached(&self) -> bool {
+        self.detached.load(Ordering::SeqCst)
     }
 }
 
@@ -102,5 +117,16 @@ mod tests {
         }
         h.join().unwrap();
         assert!(t.is_cancelled());
+    }
+
+    #[test]
+    fn detach_is_separate_from_cancel_and_reset_clears_it() {
+        let t = CancelToken::new();
+        let c = t.clone();
+        assert!(!c.is_detached());
+        t.detach();
+        assert!(c.is_detached() && !c.is_cancelled());
+        t.reset();
+        assert!(!c.is_detached());
     }
 }

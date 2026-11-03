@@ -1937,3 +1937,92 @@ fn new_poll_tool_opts_in_via_trait_not_name() {
         "6 identical render_poll calls must not trip LOOP_TRIP_AFTER: {out:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #217 — detach: stop waiting, keep the work, settle resumable
+// ---------------------------------------------------------------------------
+
+/// Detach set BEFORE run_turn: no provider call is made, the turn settles
+/// `Detached` (pc = Final) with a durable audit entry, and a follow-up
+/// prompt on the same storage runs normally.
+#[test]
+fn detach_before_first_step_settles_detached_and_resumable() {
+    let dir = tmpdir("detach-early");
+    let mut s = JsonlStorage::create(&dir, "dt1", None).unwrap();
+    let mut p = MockProvider::scripted(vec![ProviderOutput::Final { text: "f".into() }]);
+    let reg = ToolRegistry::new();
+    let cancel = CancelToken::new();
+    cancel.detach();
+    let out = run_turn_with_cancel(&mut s, &mut p, &reg, "hello", &cancel).unwrap();
+    assert!(matches!(out, TurnOutcome::Detached), "got {out:?}");
+    assert_eq!(s.state().pc, Pc::Final);
+    let dump = serde_json::to_string(&s.entries()).unwrap();
+    assert!(dump.contains("detached"), "audit entry missing");
+    // Detach is not a cancel: the token says so.
+    assert!(!cancel.is_cancelled());
+    // Resumable with a fresh token.
+    let mut p2 = MockProvider::scripted(vec![ProviderOutput::Final {
+        text: "after".into(),
+    }]);
+    let out2 = run_turn_with_cancel(&mut s, &mut p2, &reg, "again", &CancelToken::new()).unwrap();
+    assert!(matches!(out2, TurnOutcome::Final { .. }), "got {out2:?}");
+}
+
+/// Detach arriving while a tool runs does NOT abort it: the tool's result
+/// is committed, then the turn settles `Detached` before the next
+/// provider call (which is never made).
+#[test]
+fn detach_during_tool_keeps_the_result_then_settles_detached() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static RAN: AtomicUsize = AtomicUsize::new(0);
+    struct DetachingTool(CancelToken);
+    impl Tool for DetachingTool {
+        fn name(&self) -> &str {
+            "slow"
+        }
+        fn risk(&self) -> Risk {
+            Risk::ReadOnly
+        }
+        fn execute(&self, _input: Value) -> Result<Value, String> {
+            self.0.detach();
+            RAN.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({"done": true}))
+        }
+    }
+    let dir = tmpdir("detach-tool");
+    let mut s = JsonlStorage::create(&dir, "dt2", None).unwrap();
+    let cancel = CancelToken::new();
+    let mut reg = ToolRegistry::new();
+    reg.register(Box::new(DetachingTool(cancel.clone())))
+        .unwrap();
+    let mut p = MockProvider::scripted(vec![
+        ProviderOutput::ToolCall {
+            tool: "slow".into(),
+            input: json!({}),
+        },
+        ProviderOutput::Final {
+            text: "never".into(),
+        },
+    ]);
+    let out = run_turn_with_cancel(&mut s, &mut p, &reg, "go", &cancel).unwrap();
+    assert!(matches!(out, TurnOutcome::Detached), "got {out:?}");
+    assert_eq!(RAN.load(Ordering::SeqCst), 1);
+    assert_eq!(s.state().pc, Pc::Final);
+    let dump = serde_json::to_string(&s.entries()).unwrap();
+    assert!(dump.contains("\"done\":true"), "tool result lost: {dump}");
+    assert!(!dump.contains("never"), "provider was called after detach");
+}
+
+/// Cancel outranks detach: both set → `Cancelled`.
+#[test]
+fn cancel_outranks_detach() {
+    let dir = tmpdir("detach-vs-cancel");
+    let mut s = JsonlStorage::create(&dir, "dt3", None).unwrap();
+    let mut p = MockProvider::scripted(vec![]);
+    let reg = ToolRegistry::new();
+    let cancel = CancelToken::new();
+    cancel.detach();
+    cancel.cancel();
+    let out = run_turn_with_cancel(&mut s, &mut p, &reg, "x", &cancel).unwrap();
+    assert!(matches!(out, TurnOutcome::Cancelled), "got {out:?}");
+}

@@ -2562,6 +2562,9 @@ fn chat_command(
             Ok(TurnOutcome::Cancelled) => {
                 eprintln!("tole> (turn cancelled — next message resumes)")
             }
+            Ok(TurnOutcome::Detached) => {
+                eprintln!("tole> (turn detached — next message resumes)")
+            }
             Ok(TurnOutcome::LoopDetected { .. }) => eprintln!(
                 "tole> (loop guard tripped — identical tool calls repeated; next message resumes)"
             ),
@@ -2725,6 +2728,10 @@ fn report_outcome(session_id: &str, outcome: TurnOutcome) {
         TurnOutcome::Cancelled => {
             eprintln!("tole: turn cancelled (resume with: tole resume {session_id})");
             std::process::exit(8);
+        }
+        TurnOutcome::Detached => {
+            eprintln!("tole: turn detached (resume with: tole resume {session_id})");
+            std::process::exit(9);
         }
         TurnOutcome::LoopDetected { tool, count } => {
             eprintln!(
