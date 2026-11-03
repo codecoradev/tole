@@ -10,6 +10,8 @@
 
 use crate::provider::{Provider, ProviderError, ProviderOutput};
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Serialized size of one provider request, in CHARACTERS (Unicode
@@ -208,6 +210,8 @@ pub struct OpenAiProvider {
     /// `stream: true` on the wire. Default on; `TOLE_STREAM=0` is the
     /// escape hatch for gateways that reject the streaming envelope.
     streaming: bool,
+    /// Live `tole-sse-drain` threads of this provider (issue #479).
+    drain_live: Arc<AtomicUsize>,
 }
 
 impl std::fmt::Debug for OpenAiProvider {
@@ -240,6 +244,7 @@ impl OpenAiProvider {
             last_wire_stats_obj: None,
             on_text_delta: None,
             on_reasoning_delta: None,
+            drain_live: Arc::new(AtomicUsize::new(0)),
             streaming: std::env::var("TOLE_STREAM")
                 .map(|v| v != "0")
                 .unwrap_or(true),
@@ -646,6 +651,31 @@ impl OpenAiProvider {
     }
 }
 
+/// Most drain threads alive per provider (issue #479). A server that never
+/// ends the body parks one thread and socket per request until the agent
+/// timeout; past the cap the reader is dropped and its connection closes.
+const MAX_DRAIN_THREADS: usize = 2;
+
+/// Read `reader` to EOF on a detached thread so the connection returns to
+/// the pool. Bounded by `MAX_DRAIN_THREADS`; a failed spawn is ignored
+/// (no reuse, as before).
+fn drain_detached<R: std::io::Read + Send + 'static>(mut reader: R, live: &Arc<AtomicUsize>) {
+    if live.fetch_add(1, Ordering::SeqCst) >= MAX_DRAIN_THREADS {
+        live.fetch_sub(1, Ordering::SeqCst);
+        return;
+    }
+    let slot = Arc::clone(live);
+    let spawned = std::thread::Builder::new()
+        .name("tole-sse-drain".into())
+        .spawn(move || {
+            let _ = std::io::copy(&mut reader, &mut std::io::sink());
+            slot.fetch_sub(1, Ordering::SeqCst);
+        });
+    if spawned.is_err() {
+        live.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 impl Provider for OpenAiProvider {
     fn complete(&mut self, transcript: &[Entry]) -> Result<ProviderOutput, ProviderError> {
         // Issue #232 (scan #106): last_usage / last_reasoning describe
@@ -711,8 +741,16 @@ impl Provider for OpenAiProvider {
         // while the stream is read; complete() returns one decisive
         // output built from the accumulation.
         if self.streaming {
-            return self
-                .complete_streaming(std::io::BufReader::new(resp.into_body().into_reader()));
+            let mut reader = std::io::BufReader::new(resp.into_body().into_reader());
+            let out = self.complete_streaming(&mut reader);
+            // Issue #479: `complete_streaming` stops at `[DONE]`, leaving
+            // the chunked terminator unread, so the agent cannot pool the
+            // connection. Read the rest off-thread (never delay the turn),
+            // and only after a clean end; an error drops the reader as before.
+            if out.is_ok() {
+                drain_detached(reader, &self.drain_live);
+            }
+            return out;
         }
         let mut resp = resp;
         let resp_body = resp
@@ -1767,6 +1805,177 @@ mod streaming_tests {
             }
         });
         format!("http://{addr}/v1")
+    }
+
+    /// Keep-alive SSE mock for connection-reuse tests (issue #479).
+    /// Serves a chunked `[DONE]` stream per request on each connection.
+    /// `hold` = never send the chunked terminator (the body stays open
+    /// until `release`); otherwise the terminator follows at once.
+    struct KeepAliveMock {
+        url: String,
+        /// Accepted TCP connections. Every one is a chat connection:
+        /// there is no side channel, the counters are read in process.
+        conns: Arc<std::sync::atomic::AtomicUsize>,
+        /// Connections the client closed while the mock still held them.
+        closed: Arc<std::sync::atomic::AtomicUsize>,
+        release: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    fn serve_keepalive(body: &'static str, hold: bool) -> KeepAliveMock {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let conns = Arc::new(AtomicUsize::new(0));
+        let closed = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let (c, cl, rel) = (conns.clone(), closed.clone(), release.clone());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { break };
+                c.fetch_add(1, SeqCst);
+                let (cl, rel) = (cl.clone(), rel.clone());
+                std::thread::spawn(move || {
+                    s.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+                    let mut buf: Vec<u8> = Vec::new();
+                    let mut chunk = [0u8; 8192];
+                    loop {
+                        // One full request (headers + content-length body).
+                        loop {
+                            if let Some(h) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                let head = String::from_utf8_lossy(&buf[..h]).to_string();
+                                let clen: usize = head
+                                    .lines()
+                                    .find_map(|l| {
+                                        let (k, v) = l.split_once(':')?;
+                                        k.eq_ignore_ascii_case("content-length")
+                                            .then(|| v.trim().parse().ok())?
+                                    })
+                                    .unwrap_or(0);
+                                if buf.len() >= h + 4 + clen {
+                                    buf.drain(..h + 4 + clen);
+                                    break;
+                                }
+                            }
+                            match s.read(&mut chunk) {
+                                Ok(0) => return,
+                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                                Err(e)
+                                    if e.kind() == std::io::ErrorKind::WouldBlock
+                                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                                {
+                                    if rel.load(SeqCst) {
+                                        return;
+                                    }
+                                }
+                                Err(_) => return,
+                            }
+                        }
+                        let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+                        let mut resp = format!("{head}{:x}\r\n{body}\r\n", body.len());
+                        if !hold {
+                            resp.push_str("0\r\n\r\n");
+                        }
+                        if s.write_all(resp.as_bytes()).is_err() {
+                            return;
+                        }
+                        if hold {
+                            // Body never ends: wait for the client to close.
+                            loop {
+                                match s.read(&mut chunk) {
+                                    Ok(0) => {
+                                        cl.fetch_add(1, SeqCst);
+                                        return;
+                                    }
+                                    Ok(_) => {}
+                                    Err(_) if rel.load(SeqCst) => return,
+                                    Err(_) => {}
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        KeepAliveMock {
+            url,
+            conns,
+            closed,
+            release,
+        }
+    }
+
+    const DONE_BODY: &str = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    /// Valid stream that ends in `Err` (empty answer) with the body open.
+    const EMPTY_BODY: &str = "data: [DONE]\n\n";
+
+    fn count(a: &Arc<std::sync::atomic::AtomicUsize>) -> usize {
+        a.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Poll until `cond` holds (up to 2 s).
+    fn wait_for(cond: impl Fn() -> bool) -> bool {
+        for _ in 0..100 {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        cond()
+    }
+
+    #[test]
+    fn streamed_requests_reuse_one_connection() {
+        let mock = serve_keepalive(DONE_BODY, false);
+        let mut p = OpenAiProvider::new(OpenAiConfig::new(mock.url.clone(), "m", "sk-test"));
+        for _ in 0..9 {
+            let out = p.complete(&[]).unwrap();
+            assert!(matches!(out, ProviderOutput::Final { ref text } if text == "hi"));
+            // The drain reads the terminator off-thread; give it a beat so
+            // the next request finds the connection back in the pool.
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(count(&mock.conns), 1, "9 streamed requests, 1 connection");
+    }
+
+    #[test]
+    fn a_held_open_body_does_not_delay_the_turn() {
+        let mock = serve_keepalive(DONE_BODY, true);
+        let mut p = OpenAiProvider::new(OpenAiConfig::new(mock.url.clone(), "m", "sk-test"));
+        let t = std::time::Instant::now();
+        p.complete(&[]).unwrap();
+        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+        mock.release
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[test]
+    fn drain_threads_are_bounded_and_the_overflow_closes() {
+        let mock = serve_keepalive(DONE_BODY, true);
+        let mut p = OpenAiProvider::new(OpenAiConfig::new(mock.url.clone(), "m", "sk-test"));
+        for _ in 0..3 {
+            p.complete(&[]).unwrap();
+        }
+        assert_eq!(count(&mock.conns), 3);
+        // The 3rd request is over the cap: its connection closes at once.
+        assert!(wait_for(|| count(&mock.closed) >= 1), "overflow not closed");
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(count(&mock.closed), 1, "2 drains stay parked, 1 closed");
+        mock.release
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[test]
+    fn a_failed_stream_is_not_drained() {
+        let mock = serve_keepalive(EMPTY_BODY, true);
+        let mut p = OpenAiProvider::new(OpenAiConfig::new(mock.url.clone(), "m", "sk-test"));
+        assert!(p.complete(&[]).is_err());
+        assert!(wait_for(|| count(&mock.closed) == 1), "connection kept");
+        mock.release
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Issue #232 regression: each response's usage/reasoning stand
