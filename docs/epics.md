@@ -238,19 +238,11 @@ Everything below is merged; CHANGELOG entries carry the detail.
     (#437); command-level allow/deny patterns for `run_command` (#438); global session
     index and `sessions --all`, `resume` names the owning project's command (#439);
     context compaction for `chat`, `resume` and `mission` (#440), its overflow recovery
-<<<<<<< HEAD
     and the `doctor` missing-window warning (#481); session forks, `tole branch` and
-    `sessions --tree` (#210).
+    `sessions --tree` (#210); image input via `--image` (#212).
 - **0.10.0 (planned):** `tole-tui`, a pi-style terminal UI — bare `tole` opens it; model,
   reasoning effort, context size and tokens in the footer (epic #464, issues #457–#463).
-- **Open backlog:** in-file session branching (#210 follow-up), multimodal
-  input (#212), MCP prompts/resources as quick commands (#213), background detach (#217),
-=======
-    and the `doctor` missing-window warning (#481); image input via `--image` (#212).
-- **0.10.0 (planned):** `tole-tui`, a pi-style terminal UI — bare `tole` opens it; model,
-  reasoning effort, context size and tokens in the footer (epic #464, issues #457–#463).
-- **Open backlog:** session branching (#210), MCP prompts/resources as quick commands (#213), background detach (#217),
->>>>>>> 9670761 (feat(provider): accept image parts in chat messages (vision on the wire))
+- **Open backlog:** in-file session branching (#210 follow-up), MCP prompts/resources as quick commands (#213), background detach (#217),
   Claude Code session resume (#381); the multi-client daemon note (#382) is parked.
 
 ---
