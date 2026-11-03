@@ -106,6 +106,8 @@ tole chat --resume <id>                     # pick the thread back up (also: --l
 tole resume <id> "next instruction"         # continue a settled session
 tole sessions                               # list durable sessions
 tole sessions --all [--grep <text>]         # every project's sessions + where they live
+tole sessions --tree                        # sessions with their forks nested
+tole branch <id> [--at <entry>]             # fork a session at a settled entry, then resume the fork
 tole status <id>                            # pc / seq / turns / token + cache usage / request-size split
 ```
 

@@ -199,6 +199,51 @@ pub fn rows(index: &Path, grep: Option<&str>) -> Vec<Row> {
         .collect()
 }
 
+/// One session as the fork tree sees it (#210).
+pub struct TreeNode {
+    pub id: String,
+    /// The session this one was forked from, if it is a fork.
+    pub parent: Option<String>,
+    /// The entry it was cut at.
+    pub at: Option<String>,
+    pub pc: String,
+    pub turns: usize,
+}
+
+/// The `sessions --tree` lines: roots (and forks whose source is gone)
+/// sorted by id, each fork nested under its source with `└─`.
+pub fn tree_lines(mut nodes: Vec<TreeNode>) -> Vec<String> {
+    nodes.sort_by(|a, b| a.id.cmp(&b.id));
+    let known: std::collections::HashSet<String> = nodes.iter().map(|n| n.id.clone()).collect();
+    let is_root = |n: &TreeNode| n.parent.as_ref().is_none_or(|p| !known.contains(p));
+    fn walk(n: &TreeNode, all: &[TreeNode], depth: usize, out: &mut Vec<String>) {
+        let label = match &n.at {
+            Some(at) => format!("{} (@{at})", n.id),
+            None => n.id.clone(),
+        };
+        let pad = if depth == 0 {
+            String::new()
+        } else {
+            format!("{}└─ ", "   ".repeat(depth - 1))
+        };
+        out.push(format!("{pad}{label}  {}  {} turns", n.pc, n.turns));
+        // A forked file cannot cycle (its id is new), but bound the walk anyway.
+        if depth < 64 {
+            for c in all
+                .iter()
+                .filter(|c| c.parent.as_deref() == Some(n.id.as_str()))
+            {
+                walk(c, all, depth + 1, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for n in nodes.iter().filter(|n| is_root(n)) {
+        walk(n, &nodes, 0, &mut out);
+    }
+    out
+}
+
 /// One-line, control-free, bounded preview.
 fn preview(text: &str) -> String {
     // Control, bidi and separator characters become spaces, runs collapse:

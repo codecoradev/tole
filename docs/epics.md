@@ -82,7 +82,7 @@ edit) · gh read ops · TOLE_* env canonical.
 ### B3 — Session UX — ✅ DONE (v0.3.0, as `tole sessions` + `tole status <id>`)
 - **What:** `tole sessions list` (id, age, turn count, last-message
   preview, usage) and `tole sessions show <id>` (timeline view). Branching
-  deferred.
+  shipped later as forks (#210).
 - **Acceptance:** list + inspect without opening JSONL by hand.
 - **Est:** S
 
@@ -238,10 +238,11 @@ Everything below is merged; CHANGELOG entries carry the detail.
     (#437); command-level allow/deny patterns for `run_command` (#438); global session
     index and `sessions --all`, `resume` names the owning project's command (#439);
     context compaction for `chat`, `resume` and `mission` (#440), its overflow recovery
-    and the `doctor` missing-window warning (#481).
+    and the `doctor` missing-window warning (#481); session forks, `tole branch` and
+    `sessions --tree` (#210).
 - **0.10.0 (planned):** `tole-tui`, a pi-style terminal UI — bare `tole` opens it; model,
   reasoning effort, context size and tokens in the footer (epic #464, issues #457–#463).
-- **Open backlog:** session branching (#210), multimodal
+- **Open backlog:** in-file session branching (#210 follow-up), multimodal
   input (#212), MCP prompts/resources as quick commands (#213), background detach (#217),
   Claude Code session resume (#381); the multi-client daemon note (#382) is parked.
 
