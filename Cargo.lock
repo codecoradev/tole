@@ -1450,6 +1450,7 @@ dependencies = [
 name = "tole-core"
 version = "0.9.0"
 dependencies = [
+ "base64",
  "libc",
  "rmcp",
  "serde",

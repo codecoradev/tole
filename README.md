@@ -144,11 +144,25 @@ Not a sandbox: review what it wrote before you run it), `--skill <path>` (load a
 | `TOLE_FALLBACK_BASE_URL`, `TOLE_FALLBACK_API_KEY`, `TOLE_FALLBACK_MODEL` | optional reserve provider (#209): a step that fails because the primary is unavailable (connection failure, timeout, 5xx, 429) is retried on the reserve, and the switch is recorded in the session log (`tole_route`). The reserve needs its own key (the primary's is never sent to another host); the model defaults to the primary's. Request errors (401/403/404/400) never fail over |
 | `TOLE_SYSTEM_PROMPT` | default persona when `--system` is absent |
 | `TOLE_CONTEXT_WINDOW` | the model's context window in tokens, for context compaction (#440). Without it, tole reads the window from the provider's `/models` (`context_length`, `max_model_len`, ...) once a prompt passes 8k tokens; with neither, compaction stays off. `chat`, `resume` and `mission` compact between turns once a prompt reaches `--compact-at` (default 0.8) of the window: the settled turns before the last one become one durable `compaction` entry (a fenced summary), the session file keeps everything, and `tole status` lists each compaction. `--no-compaction` (or config `no_compaction = true`) turns it off; config keys `context_window`, `compact_at`. **Gateways whose `/models` carries no window** (the fleet gateway lists only `id`, `created`, `owned_by`) never compact on their own: set `TOLE_CONTEXT_WINDOW` (e.g. `200000`); `tole doctor --tier catalog` warns when no window is known. **Overflow recovery:** if the provider rejects a request as larger than its context window (HTTP 400/413/422 `context_length_exceeded`, "maximum context length", ...) the turn ends with the provider's message and `(compaction will run on the next resume)`; the next `resume <id> "<prompt>"` (or the next `chat` message) first forces one compaction pass — whatever the window or threshold — then runs the prompt. Compaction stays between turns, never inside one; `--no-compaction` also disables the recovery pass. The turn that overflowed is kept verbatim, so if it alone exceeds the window, ask for less output per turn |
+| `TOLE_VISION` | `0` declares the model non-vision: image input (`--image`) fails with a model-capability error before any request; `1` declares it vision-capable. Unset = the server decides (a 400/415/422 that names images becomes the same capability error) |
 | `TOLE_SKILL` | skill files to preload (`SKILL.md` paths, separated like `PATH`); same as repeated `--skill`, which replaces it; refused by the server faces like `--skill` |
 | `TOLE_MEMORY` | memory loop backend (`uteke`) — same as `--memory uteke` |
 | `TOLE_NO_UPDATE_CHECK` | `1` disables the startup update-check banner (issue #220) |
 | `TOLE_VERBOSE` | `1` prints the startup probe misses (uteke / cora binary not found, no GitHub origin), which are silent by default; `tole doctor` reports the sibling binaries either way |
 | `TOLE_MEMORY_NAMESPACE` | override the loop's uteke room (default: `repo-<directory name>`; the name predates rooms) |
+
+### Image input
+
+`tole run|chat|mission --image <path|data-url>` (repeatable) attaches images to the first message
+(#212). A path must resolve **inside the workspace jail** (symlinks and `..` escapes are refused);
+an inline `data:image/…;base64,…` URL is spilled to `~/.codecora/tole/images/` first. PNG, JPEG,
+GIF and WebP (sniffed from the bytes), 10 MiB each. The wire carries OpenAI-compatible
+`image_url` content parts; the session log stores only the reference (`path`, `mime`, `bytes`,
+`fnv1a64`), and every later step — including `resume` — re-reads the file, re-checking the jail and
+the hash (a changed or missing file reaches the model as an `[image unavailable: …]` note, never
+silently). Images are input, not tools: no approval is involved. They cost tokens on every step
+(the data URL counts in the request's `tole_wire.history_chars`). Needs a vision model; a
+non-vision model is a loud `model-capability` error, not a dropped image.
 
 ### Provider retries
 

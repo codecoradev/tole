@@ -195,6 +195,22 @@ pub fn run_turn_with_observer(
     cancel: &CancelToken,
     observer: Option<&dyn TurnObserver>,
 ) -> Result<TurnOutcome, StorageError> {
+    run_turn_with_images(s, p, registry, user_input, &[], cancel, observer)
+}
+
+/// [`run_turn_with_observer`] with image input (#212): the user message
+/// records the images as durable references (`payload.images`, never the
+/// blob); the provider re-loads them per request. Empty `images` is
+/// exactly the text-only turn.
+pub fn run_turn_with_images(
+    s: &mut dyn Storage,
+    p: &mut dyn Provider,
+    registry: &ToolRegistry,
+    user_input: &str,
+    images: &[crate::image::ImageRef],
+    cancel: &CancelToken,
+    observer: Option<&dyn TurnObserver>,
+) -> Result<TurnOutcome, StorageError> {
     // Precondition enforced, not just documented: the session must be at a
     // turn boundary — Idle (never started / E1 initial state) or Final
     // (previous turn delivered; B1 chat re-opens it). Anything else means a
@@ -218,12 +234,13 @@ pub fn run_turn_with_observer(
     // decision session, including after an abort (post-#84 pc=Final) and
     // across prompt-resumes into fresh run_turn calls.
     let seq = s.state().seq;
+    let mut payload = json!({ "role": "user", "text": user_input });
+    if !images.is_empty() {
+        payload["images"] = images.iter().map(|i| i.to_value()).collect();
+    }
     s.commit(
         Commit::new()
-            .entry(NewEntry::root(
-                EntryType::new(EntryType::MESSAGE),
-                json!({ "role": "user", "text": user_input }),
-            ))
+            .entry(NewEntry::root(EntryType::new(EntryType::MESSAGE), payload))
             .transition(StateTransition::from(seq, Pc::Planning)),
     )?;
     drive(s, p, registry, cancel, observer)
