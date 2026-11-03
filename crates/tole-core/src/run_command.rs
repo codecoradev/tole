@@ -190,12 +190,41 @@ impl Tool for RunCommandTool {
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
         let status = out.status.code().unwrap_or(-1);
+        let (stdout, stdout_truncated) = cap_output(&stdout, 4000);
+        let (stderr, stderr_truncated) = cap_output(&stderr, 2000);
         Ok(json!({
             "status": status,
-            "stdout": stdout.chars().take(4000).collect::<String>(),
-            "stderr": stderr.chars().take(2000).collect::<String>(),
+            "stdout": stdout,
+            "stderr": stderr,
+            "stdout_truncated": stdout_truncated,
+            "stderr_truncated": stderr_truncated,
         }))
     }
+}
+
+/// Cap `s` to `budget` chars. Over budget, keep head and tail (build and
+/// test failures sit at the END) joined by a marker stating the omitted
+/// count; the marker counts against the budget. Returns (text, truncated).
+fn cap_output(s: &str, budget: usize) -> (String, bool) {
+    let total = s.chars().count();
+    if total <= budget {
+        return (s.to_owned(), false);
+    }
+    // Reserve room for the widest possible count so the result never
+    // exceeds the budget.
+    let overhead = "\n[...  characters omitted ...]\n".chars().count() + total.to_string().len();
+    let Some(kept) = budget.checked_sub(overhead).filter(|k| *k > 0) else {
+        // Budget too small for a marker: plain head truncation.
+        return (s.chars().take(budget).collect(), true);
+    };
+    let (head, tail) = (kept / 2, kept - kept / 2);
+    let mut out: String = s.chars().take(head).collect();
+    out.push_str(&format!(
+        "\n[... {} characters omitted ...]\n",
+        total - kept
+    ));
+    out.extend(s.chars().skip(total - tail));
+    (out, true)
 }
 
 /// Re-quote a single argv token for DISPLAY (cora full-scan #16):
@@ -379,5 +408,76 @@ mod tests {
             .unwrap_or_default();
         let want = jail.canonicalize().unwrap_or_default();
         assert_eq!(got, want);
+    }
+
+    fn n(c: char, k: usize) -> String {
+        std::iter::repeat_n(c, k).collect()
+    }
+
+    #[test]
+    fn cap_exact_budget_unchanged_one_over_flagged() {
+        assert_eq!(cap_output(&n('a', 4000), 4000), (n('a', 4000), false));
+        assert!(cap_output(&n('a', 4001), 4000).1);
+    }
+
+    #[test]
+    fn cap_keeps_head_tail_and_exact_omitted_count() {
+        let s = format!("HEAD_MARK{}TAIL_MARK", n('y', 40_000));
+        let total = s.chars().count();
+        let (out, cut) = cap_output(&s, 4000);
+        assert!(cut);
+        assert!(out.starts_with("HEAD_MARK") && out.ends_with("TAIL_MARK"));
+        assert!(out.chars().count() <= 4000);
+        let kept = out.chars().count() - out.split('\n').nth(1).unwrap().chars().count() - 2;
+        let want = format!("[... {} characters omitted ...]", total - kept);
+        assert_eq!(out.split('\n').nth(1).unwrap(), want);
+    }
+
+    #[test]
+    fn cap_multibyte_cuts_on_char_boundaries() {
+        for c in ['é', '😀'] {
+            let (out, cut) = cap_output(&n(c, 10_000), 2000);
+            assert!(cut && out.chars().count() <= 2000);
+            assert!(out.starts_with(c) && out.ends_with(c));
+        }
+    }
+
+    #[test]
+    fn cap_tiny_budget_falls_back_to_head() {
+        assert_eq!(cap_output("abcdef", 3), ("abc".to_owned(), true));
+        assert_eq!(cap_output("abcdef", 0), (String::new(), true));
+    }
+
+    #[test]
+    fn execute_caps_streams_independently_and_flags() {
+        let t = RunCommandTool::new(std::env::temp_dir());
+        let out = t
+            .execute(json!({"command": "sh -c 'echo ok; echo ok >&2'"}))
+            .unwrap();
+        assert_eq!(out["stdout_truncated"], false);
+        assert_eq!(out["stderr_truncated"], false);
+        assert_eq!(out["stdout"], "ok\n");
+        // 3000 chars: over the stderr budget (2000), under stdout's (4000).
+        let out = t
+            .execute(json!({"command": "sh -c 'head -c 3000 /dev/zero | tr \"\\0\" x | tee /dev/stderr'"}))
+            .unwrap();
+        assert_eq!(out["stdout_truncated"], false);
+        assert_eq!(out["stderr_truncated"], true);
+        assert!(out["stderr"].as_str().unwrap().chars().count() <= 2000);
+    }
+
+    #[test]
+    fn execute_long_output_keeps_head_and_tail() {
+        let t = RunCommandTool::new(std::env::temp_dir());
+        let cmd =
+            r#"sh -c 'printf HEAD_MARK; head -c 40000 /dev/zero | tr "\0" y; printf TAIL_MARK'"#;
+        let out = t.execute(json!({ "command": cmd })).unwrap();
+        let s = out["stdout"].as_str().unwrap();
+        assert!(
+            s.starts_with("HEAD_MARK") && s.ends_with("TAIL_MARK"),
+            "{s}"
+        );
+        assert!(s.contains("characters omitted"));
+        assert_eq!(out["stdout_truncated"], true);
     }
 }
