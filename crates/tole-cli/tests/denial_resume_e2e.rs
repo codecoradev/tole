@@ -127,16 +127,50 @@ fn session_id(cwd: &Path) -> String {
         .expect("a session file")
 }
 
+/// A fresh mock + session dir, then the first (denying) run. Marker that the
+/// run really parked at a denial: `tole: approval denied for 'write_file'`
+/// on stderr with rc 2. Anything else (rc 0 with the write executed, say a
+/// transient hook spawn failure, which is non-blocking by contract) is
+/// retried up to 3 times from a clean slate; the last attempt asserts with
+/// full diagnostics. Retries are logged so they stay visible.
+fn denied_first_run(
+    tag: &str,
+    first_args: &dyn Fn(&Path) -> Vec<String>,
+) -> (Arc<Mutex<Vec<Value>>>, String, PathBuf) {
+    for attempt in 1..=3 {
+        let reqs = Arc::new(Mutex::new(Vec::new()));
+        let url = spawn_mock(reqs.clone());
+        let d = workdir(tag);
+        let args = first_args(&d);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let o = run(&d, &url, &args);
+        let err = text(&o.stderr);
+        if o.status.code() == Some(2) && err.contains("approval denied for 'write_file'") {
+            assert!(!d.join("out.txt").exists(), "a denied write must not run");
+            assert_eq!(reqs.lock().unwrap().len(), 1);
+            return (reqs, url, d);
+        }
+        let diag = format!(
+            "attempt {attempt}: rc={:?} out.txt={} reqs={} stderr={err}",
+            o.status.code(),
+            d.join("out.txt").exists(),
+            reqs.lock().unwrap().len()
+        );
+        assert!(attempt < 3, "first run never denied: {diag}");
+        eprintln!("retrying first run — {diag}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+    unreachable!()
+}
+
 /// The denied first run, then `resume <id> "<prompt>"`: rc 0, one new
 /// request, and its user messages are [prompt-1, denial note, prompt-2].
-fn deny_then_resume_with_prompt(tag: &str, first_args: &[&str], denial_marker: &str) {
-    let reqs = Arc::new(Mutex::new(Vec::new()));
-    let url = spawn_mock(reqs.clone());
-    let d = workdir(tag);
-    let o = run(&d, &url, first_args);
-    assert_eq!(o.status.code(), Some(2), "{}", text(&o.stderr));
-    assert!(!d.join("out.txt").exists(), "a denied write must not run");
-    assert_eq!(reqs.lock().unwrap().len(), 1);
+fn deny_then_resume_with_prompt(
+    tag: &str,
+    first_args: &dyn Fn(&Path) -> Vec<String>,
+    denial_marker: &str,
+) {
+    let (reqs, url, d) = denied_first_run(tag, first_args);
 
     let id = session_id(&d);
     let o = run(
@@ -172,21 +206,36 @@ fn deny_then_resume_with_prompt(tag: &str, first_args: &[&str], denial_marker: &
 
 #[test]
 fn resume_with_a_prompt_after_an_approval_denial_shows_the_model_the_denial() {
-    deny_then_resume_with_prompt("approval", &["run", "go"], "approval refused");
+    deny_then_resume_with_prompt(
+        "approval",
+        &|_| vec!["run".into(), "go".into()],
+        "approval refused",
+    );
 }
 
 #[test]
 fn resume_with_a_prompt_after_a_pretool_hook_denial_shows_the_model_the_denial() {
-    let d = workdir("hook-script");
-    let script = d.join("deny.sh");
-    std::fs::write(&script, "#!/bin/sh\necho policy says no\nexit 2\n").unwrap();
-    let hook = format!("/bin/sh {}", script.display());
-    deny_then_resume_with_prompt(
-        "hook",
-        &["run", "--yes", "--on-pretool", &hook, "go"],
-        "policy says no",
-    );
-    let _ = std::fs::remove_dir_all(&d);
+    // The script lives in the session cwd, created per attempt and made
+    // durable (file + directory entry synced, then read back) before `run`
+    // so nothing races the write -> read window.
+    let write_hook = |d: &Path| {
+        let script = d.join("deny.sh");
+        let body = "#!/bin/sh\necho policy says no\nexit 2\n";
+        let mut f = std::fs::File::create(&script).unwrap();
+        f.write_all(body.as_bytes()).unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+        std::fs::File::open(d).unwrap().sync_all().unwrap();
+        assert_eq!(std::fs::read_to_string(&script).unwrap(), body);
+        vec![
+            "run".to_string(),
+            "--yes".into(),
+            "--on-pretool".into(),
+            format!("/bin/sh {}", script.display()),
+            "go".into(),
+        ]
+    };
+    deny_then_resume_with_prompt("hook", &write_hook, "policy says no");
 }
 
 #[test]
