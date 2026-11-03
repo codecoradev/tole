@@ -561,6 +561,11 @@ impl JsonlStorage {
         Ok(out)
     }
 
+    /// Working directory recorded in the session header (empty if none).
+    pub fn cwd(&self) -> &str {
+        &self.cwd
+    }
+
     /// Issue #210: where this session was forked from, if it is a fork.
     pub fn forked_from(&self) -> Option<&ForkOrigin> {
         self.forked_from.as_ref()

@@ -358,6 +358,16 @@ enum Command {
         at: Option<String>,
     },
 
+    /// Import a Claude Code session transcript (#381) as a NEW tole
+    /// session (`cc-<claude-session-id>`); continue it with
+    /// `tole resume <new-id> "<prompt>"`. Accepts the `~/.claude/projects`
+    /// JSONL or `claude -p --output-format stream-json` output. Existing
+    /// sessions are untouched; importing the same session twice is refused.
+    ImportClaude {
+        /// Path to the Claude Code transcript (JSONL).
+        path: PathBuf,
+    },
+
     /// Is the configured provider/model actually usable? Tiered checks —
     /// offline (wiring), catalog (live /models), full (chat + streaming +
     /// a real tool-call loop), recorded in a coverage ledger. Exits
@@ -1140,6 +1150,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             all: true, grep, ..
         } => all_sessions_command(grep.as_deref()),
         Command::Branch { id, at } => branch_command(&sessions_dir, &id, at.as_deref()),
+        Command::ImportClaude { path } => import_claude_command(&sessions_dir, &path),
         Command::Doctor {
             tier,
             no_ledger,
@@ -2106,6 +2117,22 @@ fn branch_command(sessions_dir: &Path, id: &str, at: Option<&str>) -> Result<()>
     println!("branched: {new_id}");
     println!("from:     {id} @ {cut}");
     println!("continue: tole resume {new_id} \"<prompt>\"");
+    Ok(())
+}
+
+/// `tole import-claude` (#381): Claude Code transcript → new tole session.
+fn import_claude_command(sessions_dir: &Path, path: &Path) -> Result<()> {
+    std::fs::create_dir_all(sessions_dir)?;
+    let r = tole_core::ccimport::import_file(path, sessions_dir).context("importing transcript")?;
+    for w in &r.warnings {
+        eprintln!("warning: {w}");
+    }
+    tole_cli::session_index::record(sessions_dir, &r.session_id, "import");
+    println!("imported: {} ({} entries)", r.session_id, r.imported);
+    if r.dropped > 0 {
+        println!("dropped:  {} unsettled trailing entries", r.dropped);
+    }
+    println!("continue: tole resume {} \"<prompt>\"", r.session_id);
     Ok(())
 }
 
