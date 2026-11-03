@@ -32,3 +32,7 @@ ureq = { workspace = true }
 [[test]]
 name = "mcp_tests"
 required-features = ["mcp"]
+
+[[test]]
+name = "mcp_prompts"
+required-features = ["mcp"]

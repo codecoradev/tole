@@ -102,6 +102,19 @@ lives) / **gap** (tracked) / **N/A** (with rationale).
   are `tole serve --transport mcp` (#96/#137, hardened in #136) — see the
   Server surfaces section below. Resource subscriptions remain unshipped;
   that would re-open this document.
+- MCP prompts and resources (#213): a prompt template is
+  **server-controlled content** — same trust tier as a tool description,
+  but it lands as the next *user* message when the operator types
+  `/mcp:<server>:<prompt>`, so tole prints the rendered text before it is
+  sent, caps it (256k chars) and keeps only text parts. It adds no
+  authority: every tool call it provokes still passes the approver.
+  `mcp_read` (`resources/read`) is a ReadOnly tool registered only for
+  servers that advertised the `resources` capability; the server list is
+  fixed at startup (the model cannot name another), URIs are server-side
+  (no jail), results are capped and fenced like any tool result. Residual:
+  a malicious server can put prompt-injection text in either surface —
+  server config stays operator trust, and `mcp_read` assumes a server's
+  `resources/read` has no side effects (a spec expectation, not enforced).
 
 ## Server surfaces — `tole serve`, `tole mcp`, `tole acp` (#94–#96, #137)
 

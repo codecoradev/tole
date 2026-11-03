@@ -2309,6 +2309,24 @@ fn chat_command(
         None,
     )
     .map_err(anyhow::Error::msg)?;
+    // Server prompts (#213): probe-first, silent when no server offers any.
+    #[cfg(feature = "mcp")]
+    {
+        let cmds: Vec<String> = host
+            .mcp_server
+            .iter()
+            .filter_map(|spec| tole_core::mcp::McpServerConfig::parse(spec).ok())
+            .flat_map(|cfg| {
+                tole_core::mcp::probe_server_extras(&cfg)
+                    .prompts
+                    .into_iter()
+                    .map(move |p| format!("/mcp:{}:{}", cfg.name, p.name))
+            })
+            .collect();
+        if !cmds.is_empty() {
+            println!("mcp prompts: {}", cmds.join(" "));
+        }
+    }
     // One token for the whole chat session: sibling notices (#380) reach
     // a child running `tole chat` at each turn's next safe point.
     let (cancel, _sibling_watcher) = tole_cli::turn_runner::cli_turn_token();
@@ -2341,6 +2359,33 @@ fn chat_command(
             Err(e) => anyhow::bail!("reading stdin: {e}"),
         }
         let text = line.trim();
+        // `/mcp:<server>:<prompt> [k=v ...]` (#213): the server renders the
+        // prompt; the result is shown, then sent as this turn's user
+        // message. Server-controlled text — same trust tier as a tool
+        // description; tool calls it provokes still hit the approval gate.
+        #[cfg(feature = "mcp")]
+        let rendered: String;
+        #[cfg(feature = "mcp")]
+        let text = match tole_core::mcp::parse_prompt_command(text) {
+            None => text,
+            Some(parsed) => {
+                match parsed.and_then(|(s, p, a)| tole_core::mcp::get_server_prompt(&s, &p, a)) {
+                    Ok(t) if !t.is_empty() => {
+                        println!("tole> (mcp prompt)\n{t}");
+                        rendered = t;
+                        rendered.as_str()
+                    }
+                    Ok(_) => {
+                        eprintln!("tole> mcp prompt rendered no text");
+                        continue;
+                    }
+                    Err(e) => {
+                        eprintln!("tole> {e}");
+                        continue;
+                    }
+                }
+            }
+        };
         // Bound auto-resolve attempts per message so a wedged session
         // can't spin forever (each retry is a full provider round-trip).
         let mut retries_left: u8 = 2;
