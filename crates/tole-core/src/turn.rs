@@ -13,7 +13,8 @@ use crate::gate::{self, Denied};
 use serde_json::{json, Value};
 
 use crate::machine::{
-    begin, finish, resume, settle_err, settle_ok, EffectHandle, ReplaySafety, Resume,
+    begin, finish, resume, settle_err, settle_ok, settle_ok_deferred, EffectHandle, ReplaySafety,
+    Resume,
 };
 use crate::provider::{Provider, ProviderError, ProviderOutput};
 use crate::register::RegisterWrite;
@@ -328,8 +329,15 @@ pub fn resume_turn_with_cancel(
 
 /// Sets the session-scoped `wrote_this_turn` fact (#143). Shared by the
 /// fresh and replay paths — a Write that settles on either must be seen.
+///
+/// Its fsync is deferred (#483): both callers settle the intent durably in
+/// the very next commit.
 fn record_wrote(s: &mut dyn Storage) -> Result<(), StorageError> {
-    s.commit(Commit::new().register(RegisterWrite::set("fact", "wrote_this_turn", json!(true))))?;
+    s.commit(
+        Commit::new()
+            .register(RegisterWrite::set("fact", "wrote_this_turn", json!(true)))
+            .defer_sync(),
+    )?;
     Ok(())
 }
 
@@ -615,12 +623,19 @@ fn drive(
         }
         if let Some(u) = usage {
             if let Some(last) = s.entries().last() {
-                s.commit(Commit::new().usage(UsageRecord {
-                    id: String::new(),
-                    entry_id: last.id.clone(),
-                    usage: u,
-                    cost_usd: None,
-                }))?;
+                // #483: fsync deferred — every path after this point commits
+                // durably (settle/final/error) before returning or running
+                // an effect, and one fdatasync covers the earlier line.
+                s.commit(
+                    Commit::new()
+                        .usage(UsageRecord {
+                            id: String::new(),
+                            entry_id: last.id.clone(),
+                            usage: u,
+                            cost_usd: None,
+                        })
+                        .defer_sync(),
+                )?;
             }
         }
         // Cancellation checkpoint AFTER the provider call (issue #178):
@@ -833,7 +848,13 @@ fn drive(
                     ReplaySafety::Idempotent
                 };
                 let seq = s.state().seq;
-                s.commit(Commit::new().transition(StateTransition::from(seq, Pc::ToolCall)))?;
+                // #483: fsync deferred; `begin`'s durable intent commit
+                // (the barrier before any effect) persists it.
+                s.commit(
+                    Commit::new()
+                        .transition(StateTransition::from(seq, Pc::ToolCall))
+                        .defer_sync(),
+                )?;
                 let handle = begin(s, &tool, input.clone(), safety, None)?;
                 // Cancellation checkpoint (issue #178): cancel while the
                 // turn was settling/planning stops the effect BEFORE it
@@ -888,7 +909,9 @@ fn drive(
                 if let Some(o) = observer {
                     o.tool_finished(&tool, true, &short_preview(&out));
                 }
-                settle_ok(s, &handle, out)?;
+                // #483: settlement fsync deferred to `finish`'s durable
+                // commit; nothing but the observer callback runs between.
+                settle_ok_deferred(s, &handle, out)?;
                 finish(s)?;
             }
             ProviderOutput::InvalidToolArgs { tool, raw, reason } => {

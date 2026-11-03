@@ -151,6 +151,25 @@ pub fn settle_ok(
     handle: &EffectHandle,
     output: Value,
 ) -> Result<String, StorageError> {
+    settle_ok_with(s, handle, output, false)
+}
+
+/// [`settle_ok`] with its fsync deferred to the [`finish`] commit that the
+/// turn loop always issues next (#483): same line, one fewer `fdatasync`.
+pub(crate) fn settle_ok_deferred(
+    s: &mut dyn Storage,
+    handle: &EffectHandle,
+    output: Value,
+) -> Result<String, StorageError> {
+    settle_ok_with(s, handle, output, true)
+}
+
+fn settle_ok_with(
+    s: &mut dyn Storage,
+    handle: &EffectHandle,
+    output: Value,
+    defer: bool,
+) -> Result<String, StorageError> {
     verify_pending(s, handle)?;
     let seq = s.state().seq;
     let commit = Commit::new()
@@ -161,6 +180,7 @@ pub fn settle_ok(
         ))
         .register(RegisterWrite::delete("pending", PENDING_KEY))
         .transition(StateTransition::from(seq, Pc::Settling));
+    let commit = if defer { commit.defer_sync() } else { commit };
     let committed = s.commit(commit)?;
     Ok(committed[0].id.clone())
 }

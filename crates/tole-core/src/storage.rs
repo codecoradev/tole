@@ -119,6 +119,11 @@ pub struct Commit {
     pub transition: Option<StateTransition>,
     /// Optional usage ledger row.
     pub usage: Option<UsageRecord>,
+    /// When set, the line is written and flushed but its `sync_data` is
+    /// deferred to the next durable commit (#483): one `fdatasync` covers
+    /// every earlier appended byte. Only for commits the caller always
+    /// follows with a durable one before any effect or return.
+    pub defer_sync: bool,
 }
 
 impl Commit {
@@ -142,6 +147,12 @@ impl Commit {
     /// Sets the CAS state transition.
     pub fn transition(mut self, t: StateTransition) -> Self {
         self.transition = Some(t);
+        self
+    }
+
+    /// Defers this commit's `sync_data` to the next durable commit.
+    pub fn defer_sync(mut self) -> Self {
+        self.defer_sync = true;
         self
     }
 
@@ -341,6 +352,8 @@ pub struct JsonlStorage {
     /// the session. Poisoned storage rejects commits with a fatal error
     /// until the host re-opens/re-creates the session.
     poisoned: Option<StorageError>,
+    /// `sync_data` calls issued by appends (measurement hook, #483).
+    syncs: u64,
     // In-memory state (the file is a replay recipe, not the state):
     entries: Vec<Entry>,
     by_id: BTreeMap<String, usize>,
@@ -433,6 +446,7 @@ impl JsonlStorage {
             usage: Vec::new(),
             state: MachineState::default(),
             poisoned: None,
+            syncs: 0,
         })
     }
 
@@ -530,6 +544,7 @@ impl JsonlStorage {
             usage: Vec::new(),
             state: MachineState::default(),
             poisoned: None,
+            syncs: 0,
         };
 
         // Body lines: solo object or array (one transaction per line).
@@ -696,12 +711,20 @@ impl JsonlStorage {
         }
     }
 
+    /// Number of `sync_data` calls this handle's appends have issued
+    /// (measurement hook for the #483 fsync-budget test).
+    #[doc(hidden)]
+    pub fn sync_count(&self) -> u64 {
+        self.syncs
+    }
+
     /// Durably appends one physical line.
     ///
     /// The line is flushed and fsynced so a crash never loses a *committed*
     /// record. (A crash mid-line leaves a torn tail, which open() discards
-    /// whole — see the torn-tail test.)
-    fn append_line(&mut self, line: &str) -> Result<(), StorageError> {
+    /// whole — see the torn-tail test.) With `durable == false` the fsync is
+    /// skipped; the next durable append's `sync_data` persists it too.
+    fn append_line(&mut self, line: &str, durable: bool) -> Result<(), StorageError> {
         // One fstat: the file must still end where our last append did.
         let actual = self.writer.get_ref().metadata()?.len();
         if actual != self.good_len {
@@ -713,7 +736,10 @@ impl JsonlStorage {
         let res = (|| -> Result<(), StorageError> {
             writeln!(self.writer, "{line}")?;
             self.writer.flush()?;
-            self.writer.get_ref().sync_data()?;
+            if durable {
+                self.writer.get_ref().sync_data()?;
+                self.syncs += 1;
+            }
             Ok(())
         })();
         if let Err(e) = res {
@@ -1013,7 +1039,7 @@ impl Storage for JsonlStorage {
 
         // Encode + append (single physical line = atomic transaction).
         let (line, final_seq) = self.encode_commit(&c, &committed, next)?;
-        self.append_line(&line)?;
+        self.append_line(&line, !c.defer_sync)?;
 
         // Apply to memory only after the byte hit the file.
         for e in committed.iter() {
