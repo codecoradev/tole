@@ -8,6 +8,7 @@
 //! Config resolution order: explicit struct fields > env (`TOLE_*`, then
 //! `OPENAI_*`).
 
+use crate::cancel::CancelToken;
 use crate::provider::{Provider, ProviderError, ProviderOutput};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -212,6 +213,9 @@ pub struct OpenAiProvider {
     streaming: bool,
     /// Live `tole-sse-drain` threads of this provider (issue #479).
     drain_live: Arc<AtomicUsize>,
+    /// Set only on the helper-thread copy of a cancel-aware call (#484):
+    /// the stream reader stops (and stays silent on the sinks) once set.
+    abort: Option<CancelToken>,
 }
 
 impl std::fmt::Debug for OpenAiProvider {
@@ -245,6 +249,7 @@ impl OpenAiProvider {
             on_text_delta: None,
             on_reasoning_delta: None,
             drain_live: Arc::new(AtomicUsize::new(0)),
+            abort: None,
             streaming: std::env::var("TOLE_STREAM")
                 .map(|v| v != "0")
                 .unwrap_or(true),
@@ -554,6 +559,9 @@ impl OpenAiProvider {
                 };
                 ProviderError(scrub(&format!("{head}: {e}"), &self.cfg.api_key))
             })?;
+            if self.abort.as_ref().is_some_and(CancelToken::is_cancelled) {
+                return Err(ProviderError(CANCELLED_CALL.into()));
+            }
             if n == 0 {
                 break; // EOF without [DONE]: treat like end-of-stream.
             }
@@ -684,7 +692,58 @@ fn drain_detached<R: std::io::Read + Send + 'static>(mut reader: R, live: &Arc<A
     }
 }
 
+/// Error text of an in-flight call abandoned on cancel (#484).
+const CANCELLED_CALL: &str = "cancelled: in-flight provider call abandoned";
+
+/// How often a cancel-aware call re-checks the token while waiting.
+const CANCEL_POLL: Duration = Duration::from_millis(100);
+
 impl Provider for OpenAiProvider {
+    /// #484: run the blocking HTTP call on a helper thread (a clone: the
+    /// agent's connection pool is shared) and wait in short slices. On
+    /// cancel the thread is abandoned — it stops at its next stream line or
+    /// when the HTTP timeout fires — and nothing it produces is used.
+    fn complete_with_cancel(
+        &mut self,
+        transcript: &[Entry],
+        cancel: &CancelToken,
+    ) -> Result<ProviderOutput, ProviderError> {
+        if cancel.is_cancelled() {
+            return Err(ProviderError(CANCELLED_CALL.into()));
+        }
+        let mut worker = self.clone();
+        worker.abort = Some(cancel.clone());
+        let owned = transcript.to_vec();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("tole-provider-call".into())
+            .spawn(move || {
+                let out = worker.complete(&owned);
+                let _ = tx.send((out, worker));
+            });
+        if spawned.is_err() {
+            return self.complete(transcript);
+        }
+        loop {
+            match rx.recv_timeout(CANCEL_POLL) {
+                Ok((out, mut worker)) => {
+                    // Adopt the per-call state (usage, reasoning, wire stats).
+                    worker.abort = None;
+                    *self = worker;
+                    return out;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if cancel.is_cancelled() {
+                        return Err(ProviderError(CANCELLED_CALL.into()));
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(ProviderError("provider call thread died".into()));
+                }
+            }
+        }
+    }
+
     fn complete(&mut self, transcript: &[Entry]) -> Result<ProviderOutput, ProviderError> {
         // Issue #232 (scan #106): last_usage / last_reasoning describe
         // THIS response only. Reset per call — a tool-call step (which

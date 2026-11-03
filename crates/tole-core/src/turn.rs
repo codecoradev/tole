@@ -536,9 +536,14 @@ fn drive(
         // to_vec() allocated the whole transcript every provider step.)
         // After a compaction (#440) the provider sees the summary plus the
         // kept tail instead; without one this borrows the slice as before.
-        let next = match p.complete(&crate::compaction::view(s.entries())) {
+        let next = match p.complete_with_cancel(&crate::compaction::view(s.entries()), cancel) {
             Ok(o) => o,
             Err(ProviderError(msg)) => {
+                // #484: a cancel that interrupted the in-flight call is not
+                // a provider failure — settle it as cancelled, no retry.
+                if cancel.is_cancelled() {
+                    return settle_cancelled(s);
+                }
                 // Retry classification (#58, #478): timeouts, 429, 5xx and
                 // empty completions are transient; request errors are not.
                 if is_transient_provider_error(&msg) && timeout_retries_left > 0 {

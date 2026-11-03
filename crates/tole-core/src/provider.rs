@@ -5,6 +5,7 @@
 //! testable without a network or API key (Tier A). The real HTTP client
 //! (E4) implements the same trait — the turn loop cannot tell them apart.
 
+use crate::cancel::CancelToken;
 use crate::entry::Entry;
 use serde_json::Value;
 
@@ -48,6 +49,21 @@ pub trait Provider {
     /// Produce the next step given the full materialized transcript
     /// (entries in commit order — user, assistant, intent, results...).
     fn complete(&mut self, transcript: &[Entry]) -> Result<ProviderOutput, ProviderError>;
+
+    /// [`complete`](Provider::complete) that may return early once `cancel`
+    /// is set (#484). The turn loop calls this variant so a cancel (Esc,
+    /// `--timeout`, ACP `session/cancel`) interrupts a call already in
+    /// flight; on cancel it returns an error and the loop settles the turn
+    /// as cancelled, committing nothing for the abandoned call. The default
+    /// ignores the token (mocks and embedders keep working unchanged). An
+    /// abandoned request may still be billed by the provider.
+    fn complete_with_cancel(
+        &mut self,
+        transcript: &[Entry],
+        _cancel: &CancelToken,
+    ) -> Result<ProviderOutput, ProviderError> {
+        self.complete(transcript)
+    }
 
     /// Provider-reported usage for the LAST completed `complete()` call,
     /// if the provider exposes it (OpenAI-compatible: the response body's
@@ -94,6 +110,13 @@ pub trait Provider {
 impl<P: Provider + ?Sized> Provider for Box<P> {
     fn complete(&mut self, transcript: &[Entry]) -> Result<ProviderOutput, ProviderError> {
         (**self).complete(transcript)
+    }
+    fn complete_with_cancel(
+        &mut self,
+        transcript: &[Entry],
+        cancel: &CancelToken,
+    ) -> Result<ProviderOutput, ProviderError> {
+        (**self).complete_with_cancel(transcript, cancel)
     }
     fn last_usage(&self) -> Option<Value> {
         (**self).last_usage()
