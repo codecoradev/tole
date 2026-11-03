@@ -18,3 +18,14 @@ uuid = { version = "1", features = ["v7"] }
 anyhow = "1"
 ureq = { version = "3", features = ["json"] }
 clap = { version = "4", features = ["derive"] }
+
+# Size-focused release profile (default release was 16.7 MB, this ~9 MB).
+# panic = "abort" is deliberately NOT set: tole relies on unwinding (Mutex
+# poison recovery via `lock().unwrap_or_else(|p| p.into_inner())`, turns run on
+# threads / spawn_blocking), and abort would kill every session of a
+# serve/ACP/MCP daemon on a single tool-thread panic.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

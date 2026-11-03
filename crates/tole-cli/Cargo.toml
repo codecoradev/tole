@@ -58,3 +58,13 @@ http = { version = "1", optional = true }
 name = "tole-replay"
 path = "../../evals/replay/replay.rs"
 required-features = ["replay"]
+
+# Mirror of the workspace-root [profile.release]. Cargo ignores this for
+# workspace builds, but the root profile is not packaged, so `cargo install
+# tole-cli` only gets the size-focused profile from here. Keep both in sync;
+# no panic = "abort" (see the root Cargo.toml).
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
