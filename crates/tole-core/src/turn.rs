@@ -951,7 +951,7 @@ fn settle_cancelled(s: &mut dyn Storage) -> Result<TurnOutcome, StorageError> {
 /// `http status: ` messages are classified by the parsed code only, so a
 /// provider body snippet ("token timeout", "142900 tokens") cannot flip the
 /// decision. 5xx stays non-transient here (bounded retry is #478).
-fn is_transient_provider_error(msg: &str) -> bool {
+pub(crate) fn is_transient_provider_error(msg: &str) -> bool {
     const TRANSIENT: [&str; 2] = ["timeout", "429"];
     let lead = crate::failover::leading_error(msg);
     if let Some(rest) = lead.strip_prefix("http status: ") {
