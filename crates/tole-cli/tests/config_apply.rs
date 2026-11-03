@@ -404,7 +404,8 @@ fn h_security_sensitive_keys_are_applied_now() {
 
 // ------------------------------------------------- model / base_url
 
-/// A mock that records the `model` of the first request and answers 500.
+/// A mock that records the `model` of each request and answers 401 (a
+/// fail-loud error: a 5xx would be retried, #478).
 fn spawn_model_probe() -> (String, std::sync::mpsc::Receiver<String>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -429,7 +430,7 @@ fn spawn_model_probe() -> (String, std::sync::mpsc::Receiver<String>) {
                 }
             }
             let _ = s.write_all(
-                b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
             );
         }
     });

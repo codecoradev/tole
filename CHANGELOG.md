@@ -7,10 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Bounded provider retry (#478): a turn now retries 429, any 5xx, connection/timeout errors, stream read failures and empty completions up to 3 times (was one retry for timeout/429 only), waiting 1/2/4 s with jitter or the `Retry-After` seconds from the error text (`(retry-after: N)`, #474), capped at 30 s. The wait is cancel-aware (1 s slices on the `CancelToken`) and each retry is a durable `provider transient failure, retrying` entry written before the wait. Other 4xx stay fail-loud. An empty completion that outlasts its retries still does not fail over to the reserve.
+
 ### Changed
 - Release builds use thin LTO, a single codegen unit and `strip = true` (#482): the `tole` binary shrinks from 16.7 MB to about 9 MB. The profile is also set in `crates/tole-cli/Cargo.toml` so `cargo install tole-cli` gets it (the workspace-root profile is not packaged). `panic = "abort"` is deliberately not set: Mutex poison recovery and the serve/ACP/MCP daemons rely on unwinding.
 
 ### Fixed
+- A non-stream completion with empty content and no tool calls now fails with `malformed response: empty stream (no content, no tool calls)`, like stream mode, instead of returning an empty `Final` with exit code 0 (#478).
 - A provider HTTP error now carries its body: `http status: 400 Bad Request — <scrubbed 200-char snippet>`, plus `(retry-after: N)` when the header is present (#474). The chat-completions client no longer lets ureq drop the body of a 4xx/5xx (`http_status_as_error(false)`, that request only); the `/models` probes keep their `Err` on non-2xx. The `http status: N` prefix is unchanged and a snippet never changes retry or failover classification.
 - Streaming provider requests reuse one connection (#479): `complete_streaming` stops at `data: [DONE]` and left the chunked terminator unread, so every streamed request opened a new TCP+TLS connection (26 requests, 26 connections; non-stream mode used 1). After a clean end of stream the rest of the body is now read to EOF on a detached `tole-sse-drain` thread, so the turn never waits for it. At most 2 drain threads live per provider (a server that never ends the body parks a thread and socket until the agent timeout); past that, and after an error, the reader is dropped and the connection closes as before. No change to what `complete_streaming` returns.
 - Approval prompts now also escape the Arabic letter mark (U+061C), the Mongolian vowel separator (U+180E), the word joiner and invisible math operators (U+2060–U+2064) and the deprecated format characters (U+206A–U+206F); they could visually reorder or hide text (pre-tag scan of 0.9.0).
