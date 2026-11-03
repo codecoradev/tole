@@ -22,7 +22,9 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tole_core::approval::{Approver, ToolRequest, Verdict};
-use tole_core::openai::{fetch_model_ids_with_timeout, OpenAiConfig, OpenAiProvider, ENV_PREFIXES};
+use tole_core::openai::{
+    fetch_context_window, fetch_model_ids_with_timeout, OpenAiConfig, OpenAiProvider, ENV_PREFIXES,
+};
 use tole_core::storage::JsonlStorage;
 use tole_core::tool::{Risk, Tool, ToolRegistry};
 use tole_core::turn::{run_turn, TurnOutcome};
@@ -98,6 +100,11 @@ impl Outcome {
 
     fn pass(&mut self, line: String) {
         self.lines.push(format!("  ✓ {line}"));
+    }
+
+    /// A non-fatal finding: shown, never a blocker, never in the ledger.
+    fn warn(&mut self, line: String) {
+        self.lines.push(format!("  ! {line}"));
     }
 
     fn fail(&mut self, tier: Tier, check: &'static str, message: String, fix: String) {
@@ -378,6 +385,24 @@ fn sanitize(text: &str, cfg: &OpenAiConfig) -> String {
     t
 }
 
+/// Catalog tier, #481: compaction and the context meter need the model's
+/// window. Reported, never a blocker — the model is served and usable.
+fn context_window_check(cfg: &OpenAiConfig, configured: Option<u64>, out: &mut Outcome) {
+    if let Some(w) = configured {
+        out.pass(format!("context window: {w} tokens (set explicitly)"));
+        return;
+    }
+    match fetch_context_window(&cfg.base_url, &cfg.api_key, &cfg.model, CATALOG_TIMEOUT) {
+        Ok(Some(w)) => out.pass(format!("context window: {w} tokens (from /models)")),
+        Ok(None) | Err(_) => out.warn(
+            "context window: none known for this model (/models reports no window); \
+             compaction stays off — set TOLE_CONTEXT_WINDOW=<tokens> (or context_window \
+             in the config file)"
+                .into(),
+        ),
+    }
+}
+
 /// Run the diagnosis up to `requested`, stopping at the first blocker.
 /// `cfg` is the resolved provider (None = incomplete); `env` is only used
 /// to name what is missing.
@@ -386,7 +411,19 @@ pub fn diagnose(
     env: &dyn Fn(&str) -> Option<String>,
     requested: Tier,
 ) -> Outcome {
-    let mut out = diagnose_raw(cfg, env, requested);
+    diagnose_with_window(cfg, env, requested, None)
+}
+
+/// [`diagnose`] told about an explicitly configured context window
+/// (`TOLE_CONTEXT_WINDOW` / config): the catalog tier then has nothing to
+/// warn about (#481).
+pub fn diagnose_with_window(
+    cfg: Option<&OpenAiConfig>,
+    env: &dyn Fn(&str) -> Option<String>,
+    requested: Tier,
+    configured_window: Option<u64>,
+) -> Outcome {
+    let mut out = diagnose_raw(cfg, env, requested, configured_window);
     if let Some(cfg) = cfg {
         for l in &mut out.lines {
             *l = sanitize(l, cfg);
@@ -403,6 +440,7 @@ fn diagnose_raw(
     cfg: Option<&OpenAiConfig>,
     env: &dyn Fn(&str) -> Option<String>,
     requested: Tier,
+    configured_window: Option<u64>,
 ) -> Outcome {
     let mut out = Outcome::new();
 
@@ -466,6 +504,7 @@ fn diagnose_raw(
                 cfg.model,
                 ids.len()
             ));
+            context_window_check(cfg, configured_window, &mut out);
         }
         Ok(ids) => {
             let some: Vec<&str> = ids.iter().take(5).map(String::as_str).collect();
@@ -670,8 +709,9 @@ pub fn run_cli(
     env: &dyn Fn(&str) -> Option<String>,
     requested: Tier,
     no_ledger: bool,
+    configured_window: Option<u64>,
 ) -> bool {
-    let outcome = diagnose(cfg, env, requested);
+    let outcome = diagnose_with_window(cfg, env, requested, configured_window);
     println!("tole doctor — tier {}", requested.as_str());
     for l in &outcome.lines {
         println!("{l}");
@@ -886,6 +926,61 @@ mod tests {
         assert_eq!((b.tier, b.check), (Tier::Catalog, "model"));
         assert!(b.fix.contains("alpha, beta"), "{}", b.fix);
         assert_eq!(o.reached, Some(Tier::Offline));
+    }
+
+    /// A provider whose `/models` lists `m`, with `window` when given (#481).
+    fn models_provider(window: Option<u64>) -> String {
+        serve(Arc::new(move |_, _, _| {
+            let mut m = json!({"id": "m"});
+            if let Some(w) = window {
+                m["context_length"] = json!(w);
+            }
+            (200, "application/json", json!({"data": [m]}).to_string())
+        }))
+    }
+
+    #[test]
+    fn catalog_warns_when_no_context_window_is_known() {
+        let url = models_provider(None);
+        let o = diagnose(Some(&cfg_for(url, "m")), &no_env, Tier::Catalog);
+        // Non-fatal: the tier is still reached, nothing blocks.
+        assert!(o.blocker.is_none(), "{:?}", o.blocker);
+        assert_eq!(o.reached, Some(Tier::Catalog));
+        let w = o
+            .lines
+            .iter()
+            .find(|l| l.contains("context window"))
+            .unwrap();
+        assert!(w.contains("TOLE_CONTEXT_WINDOW=<tokens>"), "{w}");
+        assert!(w.contains("compaction stays off"), "{w}");
+    }
+
+    #[test]
+    fn catalog_is_quiet_when_a_window_is_known() {
+        // Reported by the catalog...
+        let url = models_provider(Some(131_072));
+        let o = diagnose(Some(&cfg_for(url, "m")), &no_env, Tier::Catalog);
+        assert_eq!(o.reached, Some(Tier::Catalog));
+        assert!(o.lines.iter().all(|l| !l.contains("  ! ")), "{:?}", o.lines);
+        assert!(
+            o.lines.iter().any(|l| l.contains("131072")),
+            "{:?}",
+            o.lines
+        );
+        // ...or set explicitly (the catalog is then not consulted at all).
+        let url = models_provider(None);
+        let o = diagnose_with_window(
+            Some(&cfg_for(url, "m")),
+            &no_env,
+            Tier::Catalog,
+            Some(200_000),
+        );
+        assert!(o.lines.iter().all(|l| !l.contains("  ! ")), "{:?}", o.lines);
+        assert!(
+            o.lines.iter().any(|l| l.contains("200000")),
+            "{:?}",
+            o.lines
+        );
     }
 
     #[test]

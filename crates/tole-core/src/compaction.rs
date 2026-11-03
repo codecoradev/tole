@@ -21,6 +21,7 @@
 
 use crate::entry::{Entry, EntryType, NewEntry};
 use crate::provider::{Provider, ProviderOutput};
+use crate::register::RegisterWrite;
 use crate::storage::{Commit, Storage, UsageRecord};
 use crate::transcript;
 use serde_json::{json, Value};
@@ -70,6 +71,57 @@ impl Policy {
     pub fn threshold(&self) -> u64 {
         (self.window as f64 * self.at.clamp(0.0, 1.0)) as u64
     }
+}
+
+/// Register (namespace, key) of the context-overflow flag (#481): set when
+/// a provider rejected a request as larger than its context window, spent by
+/// the compaction pass the next prompt forces.
+pub const OVERFLOW_NS: &str = "fact";
+pub const OVERFLOW_KEY: &str = "context_overflow";
+
+/// Is this provider error "the request exceeded the context window" (#481)?
+/// Deliberately narrow: an HTTP 400/413/422 whose own error text (after a
+/// failover, only the last provider's) carries a known overflow phrasing.
+/// A miss only costs the safety net, a false hit would force a needless
+/// summary call.
+pub fn is_context_overflow(msg: &str) -> bool {
+    const PHRASES: [&str; 5] = [
+        "context_length_exceeded",
+        "maximum context length",
+        "context length exceeded",
+        "exceeds the context window",
+        "prompt is too long",
+    ];
+    let lead = crate::failover::leading_error(msg).to_ascii_lowercase();
+    let Some(rest) = lead.strip_prefix("http status: ") else {
+        return false;
+    };
+    let code: u16 = rest
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .unwrap_or(0);
+    matches!(code, 400 | 413 | 422) && PHRASES.iter().any(|p| rest.contains(p))
+}
+
+/// Record durably that the session hit a context overflow.
+pub fn mark_overflow(s: &mut dyn Storage) -> Result<(), crate::storage::StorageError> {
+    s.commit(Commit::new().register(RegisterWrite::set(OVERFLOW_NS, OVERFLOW_KEY, json!(true))))?;
+    Ok(())
+}
+
+/// Has a context overflow been recorded and not yet compacted away?
+pub fn overflow_pending(s: &dyn Storage) -> bool {
+    s.get_register(OVERFLOW_NS, OVERFLOW_KEY)
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// Spend the overflow flag (after the forced pass ran).
+pub fn clear_overflow(s: &mut dyn Storage) -> Result<(), crate::storage::StorageError> {
+    s.commit(Commit::new().register(RegisterWrite::delete(OVERFLOW_NS, OVERFLOW_KEY)))?;
+    Ok(())
 }
 
 /// Index of the last compaction entry.
@@ -541,6 +593,75 @@ mod tests {
         )))
         .unwrap();
         assert!(matches!(view(s.entries()), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn context_overflow_is_classified_conservatively() {
+        for yes in [
+            r#"http status: 400 Bad Request — {"error":{"code":"context_length_exceeded"}}"#,
+            "http status: 400 Bad Request — This model's maximum context length is 131072 tokens",
+            "http status: 413 Payload Too Large — prompt is too long: 210000 tokens > 200000",
+            "http status: 400 Bad Request — the request exceeds the context window",
+            "http status: 400 Bad Request — Context_Length_Exceeded [after failover from primary: timeout: global]",
+        ] {
+            assert!(is_context_overflow(yes), "{yes}");
+        }
+        for no in [
+            "http status: 400 Bad Request — unknown model id gpt-4290",
+            "http status: 400 Bad Request — {\"error\":\"too many tokens per minute\"}",
+            "http status: 401 Unauthorized — context_length_exceeded",
+            "http status: 503 Service Unavailable — maximum context length",
+            "timeout: global [after failover from primary: http status: 400 — context_length_exceeded]",
+            "maximum context length",
+        ] {
+            assert!(!is_context_overflow(no), "{no}");
+        }
+    }
+
+    #[test]
+    fn the_overflow_flag_is_durable_and_clearable() {
+        let d = std::env::temp_dir().join(format!(
+            "tole-compaction-flag-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        let mut s = JsonlStorage::create(&d, "s", None).unwrap();
+        assert!(!overflow_pending(&s));
+        mark_overflow(&mut s).unwrap();
+        assert!(overflow_pending(&s));
+        // Replay-visible: a reopened session sees it.
+        let reopened = JsonlStorage::open_read_only(d.join("s.jsonl")).unwrap();
+        assert!(overflow_pending(&reopened));
+        clear_overflow(&mut s).unwrap();
+        assert!(!overflow_pending(&s));
+    }
+
+    /// #481: a context-overflow provider error ends the turn (no retry, no
+    /// compaction mid-turn) and leaves the durable flag; any other provider
+    /// failure does not.
+    #[test]
+    fn an_overflow_failure_flags_the_session_other_failures_do_not() {
+        use crate::mock::MockProvider;
+        let reg = crate::tool::ToolRegistry::default();
+        let overflow =
+            "http status: 400 Bad Request — {\"error\":{\"code\":\"context_length_exceeded\"}}";
+        let mut s = storage();
+        let mut p = MockProvider::scripted_with_failures(vec![Err(overflow.into())]);
+        let out = crate::turn::run_turn(&mut s, &mut p, &reg, "q1").unwrap();
+        assert!(
+            matches!(&out, crate::turn::TurnOutcome::ProviderFailed { message } if message == overflow),
+            "{out:?}"
+        );
+        assert!(overflow_pending(&s));
+        assert_eq!(history(s.entries()).len(), 0, "no compaction mid-turn");
+
+        let mut s = storage();
+        let mut p = MockProvider::scripted_with_failures(vec![Err(
+            "http status: 400 Bad Request — unknown model".into(),
+        )]);
+        crate::turn::run_turn(&mut s, &mut p, &reg, "q1").unwrap();
+        assert!(!overflow_pending(&s));
     }
 
     /// The turn loop sends the VIEW: after a compaction the next turn's
