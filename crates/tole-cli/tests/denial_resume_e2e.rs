@@ -213,6 +213,7 @@ fn resume_with_a_prompt_after_an_approval_denial_shows_the_model_the_denial() {
     );
 }
 
+#[cfg(feature = "shell-tools")]
 #[test]
 fn resume_with_a_prompt_after_a_pretool_hook_denial_shows_the_model_the_denial() {
     // The script lives in the session cwd, created per attempt and made
@@ -236,6 +237,30 @@ fn resume_with_a_prompt_after_a_pretool_hook_denial_shows_the_model_the_denial()
         ]
     };
     deny_then_resume_with_prompt("hook", &write_hook, "policy says no");
+}
+
+/// Builds without shell-tools cannot wire hooks: the flag must fail loudly,
+/// never be silently ignored (the write would run under --yes).
+#[cfg(not(feature = "shell-tools"))]
+#[test]
+fn bare_build_refuses_hook_flags_loudly() {
+    let reqs = Arc::new(Mutex::new(Vec::new()));
+    let url = spawn_mock(reqs.clone());
+    let d = workdir("bare-refuse");
+    let o = run(
+        &d,
+        &url,
+        &["run", "--yes", "--on-pretool", "/bin/true", "go"],
+    );
+    assert_ne!(o.status.code(), Some(0));
+    assert!(
+        text(&o.stderr).contains("shell-tools"),
+        "{}",
+        text(&o.stderr)
+    );
+    assert!(!d.join("out.txt").exists());
+    assert!(reqs.lock().unwrap().is_empty());
+    let _ = std::fs::remove_dir_all(&d);
 }
 
 #[test]

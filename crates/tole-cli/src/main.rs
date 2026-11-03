@@ -1446,6 +1446,15 @@ fn build_registry(
     host: &HostConfig,
     allow_patterns: &[String],
 ) -> Result<ToolRegistry> {
+    // Hook wiring (run/chat/resume) is shell-tools-gated; without it these
+    // flags would be silently ignored — refuse loudly instead.
+    #[cfg(not(feature = "shell-tools"))]
+    if host.on_pretool_non_empty() || host.on_posttool_non_empty() || !host.on_turnend.is_empty() {
+        bail!(
+            "--on-pretool/--on-posttool/--on-turnend require the shell-tools feature \
+             (this build lacks it); rebuild with default features"
+        );
+    }
     let mut roster = Roster::new(resolve_workspace_root(host.workspace.as_ref())?);
     // CLI faces run shell tools in the process cwd; files stay jailed to
     // the workspace.
