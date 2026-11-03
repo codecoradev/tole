@@ -695,7 +695,7 @@ pub type PromptCommand = (String, String, std::collections::BTreeMap<String, Str
 
 /// Parse a chat line `/mcp:<server>:<prompt> [key=value ...]`. `None` =
 /// not a prompt command; `Some(Err)` = malformed. Values cannot contain
-/// whitespace (ponytail: no quoting; add when a real prompt needs it).
+/// whitespace (no quoting yet; add when a real prompt needs it).
 pub fn parse_prompt_command(line: &str) -> Option<Result<PromptCommand, String>> {
     let rest = line.strip_prefix("/mcp:")?;
     let mut tokens = rest.split_whitespace();

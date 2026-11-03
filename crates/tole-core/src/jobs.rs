@@ -331,7 +331,7 @@ impl Tool for JobStartTool {
         }
         if let Some(q) = self.notify.clone() {
             let id = id.clone();
-            // ponytail: one polling thread per job (lives as long as the
+            // One polling thread per job (lives as long as the job):
             // job); a shared watcher if job counts ever matter.
             std::thread::spawn(move || {
                 while JobPollTool::pid_alive(pid).unwrap_or(false) {
