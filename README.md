@@ -9,7 +9,7 @@ Durable Rust agent harness: a conversational agent with risk-tiered approval
 gates, a write-once JSONL session log, and a register state machine — resumable
 after crashes, replayable forever.
 
-**Status:** v0.9.0 is the latest release: `tole doctor`, soft interrupts, per-turn token stats, sibling change notices and the typed child-agent handoff, a provider failover chain, the user config layer, `--trust workspace`, command-level allow/deny patterns, a global session index (`sessions --all`) and context compaction, plus the 0.8.2 `tole serve` hardening (see the CHANGELOG). `develop` is working toward 0.10.0, a pi-style terminal UI: the `tole-tui` MVP is in (bare `tole` on a TTY opens an inline UI with a streaming transcript, multi-line editor, footer and inline approvals; slash commands, the model picker and the thinking level, #461; steering, a follow-up queue, `@file`, collapsible output and markdown/diff styling, #462), `--effort` reasoning effort and the `tole status [id]` snapshot (model, effort, context used/window, tokens, compactions) shipped, and the multi-client daemon is design-only and parked ([docs/daemon-design.md](docs/daemon-design.md)). v0.8.1 itself brought token-usage reporting and a capped, resumable `read_file` (#211), on top of v0.8.0, which added the per-project config `.tole/config.toml`
+**Status:** v0.9.0 is the latest release: `tole doctor`, soft interrupts, per-turn token stats, sibling change notices and the typed child-agent handoff, a provider failover chain, the user config layer, `--trust workspace`, command-level allow/deny patterns, a global session index (`sessions --all`) and context compaction, plus the 0.8.2 `tole serve` hardening (see the CHANGELOG). `develop` is working toward 0.10.0, a pi-style terminal UI: the `tole-tui` is in and daily-usable — bare `tole` on a TTY opens an inline UI with a streaming transcript, a multi-line editor, a footer, inline approvals and Esc-cancel; slash commands (`/compact` `/new` `/resume` `/session` `/name`), the model picker and thinking-level cycling (#461); steering, a follow-up queue, `@file`, collapsible tool output and markdown/diff styling (#462), `--effort` reasoning effort and the `tole status [id]` snapshot (model, effort, context used/window, tokens, compactions) shipped, and the multi-client daemon is design-only and parked ([docs/daemon-design.md](docs/daemon-design.md)). v0.8.1 itself brought token-usage reporting and a capped, resumable `read_file` (#211), on top of v0.8.0, which added the per-project config `.tole/config.toml`
 (trusted before it applies; see the Configuration section) on top of v0.7.x
 (rescan-2 hardening, one tool-call authorization gate; see the CHANGELOG for
 the behavior changes). Five faces on one durable core: the CLI (run / chat /
@@ -108,6 +108,7 @@ export TOLE_MODEL=gpt-4o-mini
 export TOLE_API_KEY=...
 
 tole run "summarize the last commit"        # one durable turn
+tole                                        # terminal UI: bare `tole` on a TTY opens it (streaming transcript, approvals, slash commands)
 tole chat                                   # multi-turn REPL on one durable session
 tole chat --memory uteke                    # …with cross-session memory
 tole chat --resume <id>                     # pick the thread back up (also: --last)
@@ -133,7 +134,9 @@ arguments", the program is matched literally; a leading `!` denies and wins
 over every allow and `--yes`, e.g. `--allow '!run_command:rm *'`; with a
 command deny set, only commands an explicit `run_command:` allow names run
 unattended — everything else asks),
-`--yes` (auto-allow every Write; Destructive still prompts), `--mcp-server`,
+`--yes` (auto-allow every Write; Destructive still prompts), `--effort <minimal|low|medium|high>`
+(reasoning effort sent as `reasoning_effort`; session register beats it across resumes),
+`--mcp-server`,
 `--no-auto-mcp` (skip the cora auto-preset), `--trust <preset>` (one-word
 trust: `internal` / `read_only` / `workspace` — `read_only` plus
 `write_file`/`edit_file` auto-allowed only inside an explicit
