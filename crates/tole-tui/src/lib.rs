@@ -8,6 +8,7 @@
 //! live stream line, the editor and the footer.
 
 mod editor;
+mod files;
 mod menu;
 mod sanitize;
 mod transcript;
@@ -233,11 +234,10 @@ impl TurnObserver for ChanObserver {
         self.send(Msg::Tool(tool_line(tool, input)));
     }
     fn tool_finished(&self, _tool: &str, ok: bool, preview: &str) {
-        let first = clip(&one_line(preview.lines().next().unwrap_or("")), 80);
-        self.send(Msg::Tool(format!(
-            "  {} {first}",
-            if ok { "✓" } else { "✗" }
-        )));
+        self.send(Msg::ToolResult {
+            ok,
+            preview: preview.to_string(),
+        });
     }
     fn reasoning(&self, text: &str) {
         self.send(Msg::Reasoning(text.to_string()));
@@ -251,6 +251,11 @@ pub enum Msg {
     Text(String),
     Reasoning(String),
     Tool(String),
+    /// A finished tool call; collapsing/diff styling happen in the transcript.
+    ToolResult {
+        ok: bool,
+        preview: String,
+    },
     Approval(Pending),
     Done(TurnEnd),
 }
@@ -262,6 +267,8 @@ pub enum Action {
     Redraw,
     Quit,
     Submit(String),
+    /// Enter while a turn runs: a soft interrupt (#377) for the running turn.
+    Steer(String),
     Cancel,
     /// A slash command or hotkey for the host; the loop runs it.
     Host(HostCmd),
@@ -284,7 +291,18 @@ pub struct App {
     menu_sel: usize,
     /// Models used in this process, current first (Ctrl+P rotates it).
     recent: Vec<String>,
+    /// Follow-ups queued with Alt+Enter while a turn runs (#462).
+    queue: Vec<String>,
+    /// Steering the turn never picked up (set by the loop at settle).
+    leftover: Vec<String>,
+    /// Lazily listed files for the `@` panel.
+    files: Option<Vec<String>>,
+    at_sel: usize,
 }
+
+/// Follow-ups that may wait, and queue rows shown above the editor.
+const MAX_QUEUE: usize = 16;
+const QUEUE_ROWS: usize = 3;
 
 impl App {
     pub fn new(footer: Footer) -> Self {
@@ -302,6 +320,129 @@ impl App {
             return Vec::new();
         }
         menu::matching(t)
+    }
+
+    /// Replace the `@` file list (tests; the loop lists the cwd lazily).
+    pub fn set_files(&mut self, files: Vec<String>) {
+        self.files = Some(files);
+    }
+
+    /// The `@word` being typed (last whitespace-separated word), minus `@`.
+    fn at_filter(&self) -> Option<&str> {
+        let t = self.editor.text();
+        let word = t.rsplit(char::is_whitespace).next().unwrap_or("");
+        word.strip_prefix('@')
+    }
+
+    /// Files matching the `@word` under the cursor (empty when none/closed).
+    pub fn at_matches(&self) -> Vec<&str> {
+        match (self.at_filter(), &self.files) {
+            (Some(f), Some(files)) => files::matching(files, f),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Panel rows: a window around the selection, sanitized and clipped.
+    pub fn at_lines(&self, width: usize) -> Vec<String> {
+        let m = self.at_matches();
+        let sel = self.at_sel.min(m.len().saturating_sub(1));
+        let start = sel.saturating_sub(LIVE_ROWS as usize - 2);
+        m.iter()
+            .enumerate()
+            .skip(start)
+            .take(LIVE_ROWS as usize - 1)
+            .map(|(i, p)| {
+                clip(
+                    &format!("{}{}", if i == sel { "▸ " } else { "  " }, one_line(p)),
+                    width,
+                )
+            })
+            .collect()
+    }
+
+    /// Tab/Enter on the panel: replace the `@word` with the chosen path.
+    fn at_insert(&mut self) -> bool {
+        let m = self.at_matches();
+        if m.is_empty() {
+            return false;
+        }
+        let path = m[self.at_sel.min(m.len() - 1)].to_string();
+        let t = self.editor.text();
+        let cut = t
+            .rfind(char::is_whitespace)
+            .map_or(0, |i| i + t[i..].chars().next().map_or(1, char::len_utf8));
+        let new = format!("{}{path} ", &t[..cut]);
+        self.editor.set(&new);
+        self.at_sel = 0;
+        true
+    }
+
+    /// Compact rows of the follow-up queue (empty when nothing waits).
+    pub fn queue_rows(&self, width: usize) -> Vec<String> {
+        let mut rows: Vec<String> = self
+            .queue
+            .iter()
+            .take(QUEUE_ROWS)
+            .map(|q| clip(&format!("queued: {}", one_line(q)), width.saturating_sub(1)))
+            .collect();
+        if self.queue.len() > QUEUE_ROWS {
+            rows[QUEUE_ROWS - 1] = clip(
+                &format!("+{} more queued", self.queue.len() - QUEUE_ROWS + 1),
+                width.saturating_sub(1),
+            );
+        }
+        rows
+    }
+
+    /// Put queued (and `extra`) messages back in front of the draft; nothing
+    /// is lost on cancel or on a turn that did not end in an answer.
+    fn return_queue(&mut self, extra: Vec<String>) {
+        let mut back = extra;
+        back.append(&mut self.queue);
+        self.prepend_draft(back);
+    }
+
+    fn prepend_draft(&mut self, back: Vec<String>) {
+        if back.is_empty() {
+            return;
+        }
+        let draft = self.editor.text().to_string();
+        let mut text = back.join("\n");
+        if !draft.is_empty() {
+            text = format!("{text}\n{draft}");
+        }
+        self.editor.set(&text);
+    }
+
+    /// The head of the queue, when idle: becomes the next prompt (one at a time).
+    pub fn start_queued(&mut self) -> Option<String> {
+        if self.running || self.queue.is_empty() {
+            return None;
+        }
+        let text = self.queue.remove(0);
+        self.running = true;
+        self.saw_text = false;
+        let echoed = self.transcript.line(Kind::User, &format!("> {text}"));
+        self.out.extend(echoed);
+        Some(text)
+    }
+
+    /// Steering text the settled turn never consumed (the loop drains it).
+    pub fn leftover(&mut self, texts: Vec<String>) {
+        self.leftover = texts;
+    }
+
+    /// Echo a steering message the turn accepted.
+    pub fn steered(&mut self, text: &str) {
+        let echoed = self
+            .transcript
+            .line(Kind::User, &format!("> {text}  [steer]"));
+        self.out.extend(echoed);
+    }
+
+    /// Give a draft back to the editor (a refused steer).
+    pub fn restore_draft(&mut self, text: &str) {
+        self.editor.set(text);
     }
 
     pub fn open_picker(&mut self, kind: PickKind, items: Vec<Item>) {
@@ -447,6 +588,34 @@ impl App {
         // `BackTab`, a different key code from Enter, so Shift+Enter keeps
         // its newline meaning below.
         match key.code {
+            KeyCode::Char('o') if ctrl => {
+                let mut v = self.transcript.toggle_tools();
+                let state = if self.transcript.expand_tools {
+                    "expanded"
+                } else {
+                    "collapsed"
+                };
+                v.extend(
+                    self.transcript
+                        .line(Kind::Note, &format!("(tool output {state})")),
+                );
+                self.out.extend(v);
+                return Action::Redraw;
+            }
+            KeyCode::Char('t') if ctrl => {
+                let mut v = self.transcript.toggle_reasoning();
+                let state = if self.transcript.hide_reasoning {
+                    "hidden"
+                } else {
+                    "shown"
+                };
+                v.extend(
+                    self.transcript
+                        .line(Kind::Note, &format!("(reasoning {state})")),
+                );
+                self.out.extend(v);
+                return Action::Redraw;
+            }
             KeyCode::Char('l') if ctrl => {
                 return if self.running {
                     Action::None
@@ -470,6 +639,30 @@ impl App {
             }
             _ => {}
         }
+        if !self.at_matches().is_empty() {
+            let n = self.at_matches().len();
+            match key.code {
+                KeyCode::Tab | KeyCode::Enter if self.at_insert() => return Action::Redraw,
+                KeyCode::Up if !key.modifiers.contains(KeyModifiers::ALT) => {
+                    self.at_sel = self.at_sel.min(n - 1).saturating_sub(1);
+                    return Action::Redraw;
+                }
+                KeyCode::Down => {
+                    self.at_sel = (self.at_sel + 1).min(n - 1);
+                    return Action::Redraw;
+                }
+                _ => {}
+            }
+        }
+        if key.code == KeyCode::Up && key.modifiers.contains(KeyModifiers::ALT) {
+            return match self.queue.pop() {
+                Some(last) => {
+                    self.prepend_draft(vec![last]);
+                    Action::Redraw
+                }
+                None => Action::None,
+            };
+        }
         let menu = self.menu();
         match key.code {
             KeyCode::Tab if !menu.is_empty() => {
@@ -482,6 +675,20 @@ impl App {
                 self.menu_sel = (self.menu_sel + 1).min(menu.len() - 1)
             }
             KeyCode::Esc if self.running => return self.cancel(),
+            // Alt+Enter while a turn runs queues a follow-up; idle it is a newline.
+            KeyCode::Enter if self.running && key.modifiers.contains(KeyModifiers::ALT) => {
+                let t = self.editor.text().trim();
+                if t.is_empty() || t.starts_with('/') {
+                    return Action::None;
+                }
+                if self.queue.len() >= MAX_QUEUE {
+                    self.note(&format!("({MAX_QUEUE} follow-ups are already queued)"));
+                    return Action::Redraw;
+                }
+                if let Some(text) = self.editor.submit() {
+                    self.queue.push(text);
+                }
+            }
             KeyCode::Enter
                 if key
                     .modifiers
@@ -491,7 +698,12 @@ impl App {
             }
             KeyCode::Enter => {
                 if self.running {
-                    return Action::None;
+                    // Steer: a non-empty, non-slash draft becomes a soft interrupt.
+                    let t = self.editor.text().trim();
+                    if t.is_empty() || t.starts_with('/') {
+                        return Action::None;
+                    }
+                    return self.editor.submit().map_or(Action::None, Action::Steer);
                 }
                 if self.editor.text().trim_start().starts_with('/') {
                     let text = self.editor.submit().unwrap_or_default();
@@ -513,10 +725,17 @@ impl App {
             KeyCode::Char('j') if ctrl => self.editor.newline(),
             KeyCode::Char(c) if !ctrl => {
                 self.menu_sel = 0;
+                self.at_sel = 0;
+                if c == '@' && self.files.is_none() {
+                    self.files = Some(
+                        std::env::current_dir().map_or_else(|_| Vec::new(), |d| files::list(&d)),
+                    );
+                }
                 self.editor.insert(c)
             }
             KeyCode::Backspace => {
                 self.menu_sel = 0;
+                self.at_sel = 0;
                 self.editor.backspace()
             }
             KeyCode::Up => self.editor.prev(),
@@ -535,6 +754,7 @@ impl App {
                 let _ = p.reply.send(Verdict::Deny);
                 let lines = self.transcript.line(Kind::Note, "  denied");
                 self.out.extend(lines);
+                self.return_queue(Vec::new());
                 return Action::Cancel;
             }
             _ => {
@@ -551,6 +771,7 @@ impl App {
     fn cancel(&mut self) -> Action {
         // A pending approval is dropped unanswered: the turn thread sees Deny.
         self.approval = None;
+        self.return_queue(Vec::new());
         Action::Cancel
     }
 
@@ -562,6 +783,7 @@ impl App {
             }
             Msg::Reasoning(t) => self.transcript.push(Kind::Reasoning, &t),
             Msg::Tool(t) => self.transcript.line(Kind::Tool, &t),
+            Msg::ToolResult { ok, preview } => self.transcript.tool_result(ok, &preview),
             Msg::Approval(p) => {
                 let mut v = self.transcript.flush();
                 let tag = if p.destructive {
@@ -581,6 +803,13 @@ impl App {
                 self.approval = None;
                 self.footer_stale = true;
                 let mut v = self.transcript.flush();
+                let left = std::mem::take(&mut self.leftover);
+                if matches!(end, TurnEnd::Final(_)) {
+                    // steering that arrived too late runs next, ahead of the queue
+                    self.queue.splice(0..0, left);
+                } else {
+                    self.return_queue(left);
+                }
                 match end {
                     TurnEnd::Final(text) if !self.saw_text => {
                         v.extend(self.transcript.line(Kind::Text, &text))
@@ -619,6 +848,7 @@ impl App {
 
         let mut live_lines = Vec::new();
         let menu = self.menu();
+        let at = self.at_lines(w);
         if let Some(p) = &self.picker {
             live_lines.extend(p.lines(w).into_iter().map(Line::from));
         } else if let Some(p) = &self.approval {
@@ -627,6 +857,15 @@ impl App {
                 Style::new().fg(Color::Yellow),
             ));
             live_lines.push(Line::from("[y] allow  [n] deny  [Esc] deny + cancel"));
+        } else if !at.is_empty() {
+            live_lines.extend(
+                at.into_iter()
+                    .map(|l| Line::styled(l, Style::new().fg(Color::Cyan))),
+            );
+            live_lines.push(Line::styled(
+                "Tab/Enter inserts the path · Up/Down select · keep typing to filter",
+                Style::new().add_modifier(Modifier::DIM),
+            ));
         } else if !menu.is_empty() {
             let sel = self.menu_sel.min(menu.len() - 1);
             for (i, name) in menu.iter().enumerate().take(LIVE_ROWS as usize) {
@@ -651,13 +890,18 @@ impl App {
                 .map(|(k, t)| styled(k, &tail(t, w)))
                 .unwrap_or_default();
             live_lines.push(partial);
+            live_lines.extend(
+                self.queue_rows(w)
+                    .into_iter()
+                    .map(|r| Line::styled(r, Style::new().fg(Color::Magenta))),
+            );
             live_lines.push(Line::styled(
                 if self.running {
-                    "working… (Esc cancels)"
+                    "working… Enter steers · Alt+Enter queues · Alt+Up unqueues · Esc cancels"
                 } else if self.armed {
                     "press Ctrl+C again to quit"
                 } else {
-                    "Enter sends · / commands · Ctrl+L model · Shift+Tab thinking · Shift+Enter newline"
+                    "Enter sends · / commands · @ file · Ctrl+L model · Shift+Tab thinking · Shift+Enter newline"
                 },
                 Style::new().add_modifier(Modifier::DIM),
             ));
@@ -701,9 +945,69 @@ fn styled(kind: Kind, text: &str) -> Line<'static> {
         Kind::Text => Style::new(),
         Kind::Reasoning => Style::new().fg(Color::DarkGray).add_modifier(Modifier::DIM),
         Kind::Tool => Style::new().fg(Color::Cyan),
+        Kind::ToolOut => diff_style(text),
+        Kind::Heading => Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
+        Kind::Code => Style::new().add_modifier(Modifier::DIM),
         Kind::Note => Style::new().fg(Color::Yellow),
     };
+    if kind == Kind::Text {
+        return Line::from(inline_spans(text));
+    }
     Line::from(Span::styled(text.to_string(), style))
+}
+
+/// Unified-diff rows in a tool result: `+` green, `-` red, `@@`/headers dim.
+/// The text is already sanitized by the transcript.
+fn diff_style(text: &str) -> Style {
+    let t = text.trim_start();
+    if t.starts_with("+++") || t.starts_with("---") || t.starts_with("@@") {
+        Style::new().add_modifier(Modifier::DIM)
+    } else if t.starts_with('+') {
+        Style::new().fg(Color::Green)
+    } else if t.starts_with('-') {
+        Style::new().fg(Color::Red)
+    } else {
+        Style::new().fg(Color::Cyan).add_modifier(Modifier::DIM)
+    }
+}
+
+/// Minimal inline markdown: `**bold**` and `` `code` ``; an unclosed marker
+/// stays literal. (Not a renderer: no italics, links, lists or tables.)
+fn inline_spans(text: &str) -> Vec<Span<'static>> {
+    let mut out = Vec::new();
+    let mut plain = String::new();
+    let mut rest = text;
+    while let Some(c) = rest.chars().next() {
+        let (open, style) = if rest.starts_with("**") {
+            ("**", Style::new().add_modifier(Modifier::BOLD))
+        } else if c == '`' {
+            ("`", Style::new().fg(Color::Cyan))
+        } else {
+            plain.push(c);
+            rest = &rest[c.len_utf8()..];
+            continue;
+        };
+        match rest[open.len()..].find(open) {
+            Some(end) if end > 0 => {
+                if !plain.is_empty() {
+                    out.push(Span::raw(std::mem::take(&mut plain)));
+                }
+                out.push(Span::styled(
+                    rest[open.len()..open.len() + end].to_string(),
+                    style,
+                ));
+                rest = &rest[open.len() * 2 + end..];
+            }
+            _ => {
+                plain.push_str(open);
+                rest = &rest[open.len()..];
+            }
+        }
+    }
+    if !plain.is_empty() {
+        out.push(Span::raw(plain));
+    }
+    out
 }
 
 /// Wrap a committed line to `width` chars per row (char count, not cell width).
@@ -881,8 +1185,33 @@ where
         let mut cancel = CancelToken::default();
         let mut quitting = false;
         let mut dirty = true;
+        // One turn on a worker thread; a fresh token per turn.
+        let start = |prompt: String| -> CancelToken {
+            let cancel = CancelToken::default();
+            let (c, tx) = (cancel.clone(), tx.clone());
+            scope.spawn(move || {
+                let obs: Arc<dyn TurnObserver> = Arc::new(ChanObserver(Mutex::new(tx.clone())));
+                let end = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    host.run_turn(&prompt, &c, obs)
+                }))
+                .unwrap_or_else(|_| TurnEnd::Stopped("turn thread panicked".into()));
+                let _ = tx.send(Msg::Done(end));
+            });
+            cancel
+        };
         loop {
             while let Ok(m) = rx.try_recv() {
+                if matches!(m, Msg::Done(_)) {
+                    // steering the turn never reached a safe point for
+                    app.leftover(
+                        cancel
+                            .interrupts()
+                            .drain()
+                            .into_iter()
+                            .map(|i| i.text)
+                            .collect(),
+                    );
+                }
                 app.on_msg(m);
                 dirty = true;
             }
@@ -892,6 +1221,12 @@ where
             }
             if std::mem::take(&mut app.footer_stale) {
                 app.footer = host.footer();
+            }
+            if !quitting {
+                if let Some(prompt) = app.start_queued() {
+                    cancel = start(prompt);
+                    dirty = true;
+                }
             }
             if quitting && !app.running() {
                 commit(term, app)?;
@@ -918,22 +1253,14 @@ where
                         return Ok(());
                     }
                     Action::Cancel => cancel.cancel(),
-                    Action::Submit(prompt) => {
-                        cancel = CancelToken::default();
-                        let (cancel, tx) = (cancel.clone(), tx.clone());
-                        scope.spawn(move || {
-                            let obs: Arc<dyn TurnObserver> =
-                                Arc::new(ChanObserver(Mutex::new(tx.clone())));
-                            let end =
-                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    host.run_turn(&prompt, &cancel, obs)
-                                }))
-                                .unwrap_or_else(|_| {
-                                    TurnEnd::Stopped("turn thread panicked".into())
-                                });
-                            let _ = tx.send(Msg::Done(end));
-                        });
-                    }
+                    Action::Submit(prompt) => cancel = start(prompt),
+                    Action::Steer(text) => match cancel.interrupts().push(&text, false) {
+                        Ok(()) => app.steered(&text),
+                        Err(e) => {
+                            app.note(&format!("(steer refused: {e})"));
+                            app.restore_draft(&text);
+                        }
+                    },
                     Action::Host(cmd) => run_host_cmd(host, app, cmd),
                     Action::Redraw | Action::None => {}
                 },
@@ -948,6 +1275,7 @@ where
 mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
+    use std::time::Instant;
 
     fn key(c: KeyCode) -> KeyEvent {
         KeyEvent::new(c, KeyModifiers::NONE)
@@ -1029,7 +1357,9 @@ mod tests {
         assert_eq!(app.on_key(key(KeyCode::Enter)), Action::Redraw);
         type_str(&mut app, "go");
         app.on_key(key(KeyCode::Enter));
-        type_str(&mut app, "more");
+        // blank and slash drafts are ignored while running (nothing to steer)
+        assert_eq!(app.on_key(key(KeyCode::Enter)), Action::None);
+        type_str(&mut app, "/new");
         assert_eq!(app.on_key(key(KeyCode::Enter)), Action::None);
     }
 
@@ -1134,10 +1464,15 @@ mod tests {
         assert!(!line.chars().any(|c| c.is_control()), "{line:?}");
         let (tx, rx) = mpsc::channel();
         ChanObserver(Mutex::new(tx)).tool_finished("t", true, evil);
-        let Ok(Msg::Tool(done)) = rx.try_recv() else {
+        let Ok(Msg::ToolResult { ok, preview }) = rx.try_recv() else {
             panic!("no tool msg")
         };
-        assert!(!done.chars().any(|c| c.is_control()), "{done:?}");
+        assert!(ok);
+        let mut app = App::default();
+        app.on_msg(Msg::ToolResult { ok, preview });
+        for o in app.take_out() {
+            assert!(!o.text.chars().any(|c| c.is_control()), "{:?}", o.text);
+        }
     }
 
     #[test]
@@ -1447,5 +1782,378 @@ mod tests {
         let text = format!("{}", term.backend());
         assert!(text.contains("effort: minimal"), "{text}");
         assert!(text.contains("thinking: minimal"), "editor border: {text}");
+    }
+
+    // ---- #462: steering, follow-up queue, toggles, @file, markdown/diff ----
+
+    fn alt(c: KeyCode) -> KeyEvent {
+        KeyEvent::new(c, KeyModifiers::ALT)
+    }
+    fn running_app() -> App {
+        let mut app = App::default();
+        typed(&mut app, "go");
+        app.take_out();
+        assert!(app.running());
+        app
+    }
+    fn texts(app: &mut App) -> Vec<String> {
+        app.take_out().into_iter().map(|o| o.text).collect()
+    }
+
+    #[test]
+    fn enter_while_running_steers_and_idle_enter_still_submits() {
+        let mut app = running_app();
+        type_str(&mut app, "use rust");
+        assert_eq!(
+            app.on_key(key(KeyCode::Enter)),
+            Action::Steer("use rust".into())
+        );
+        assert_eq!(app.editor.text(), "");
+        app.steered("use rust");
+        assert!(texts(&mut app)[0].contains("use rust"));
+        let mut idle = App::default();
+        assert_eq!(typed(&mut idle, "hi"), Action::Submit("hi".into()));
+    }
+
+    #[test]
+    fn a_refused_steer_goes_back_to_the_editor() {
+        let mut app = running_app();
+        app.restore_draft("lost?");
+        assert_eq!(app.editor.text(), "lost?");
+    }
+
+    #[test]
+    fn alt_enter_queues_while_running_but_is_a_newline_when_idle() {
+        let mut idle = App::default();
+        type_str(&mut idle, "a");
+        idle.on_key(alt(KeyCode::Enter));
+        type_str(&mut idle, "b");
+        assert_eq!(idle.editor.text(), "a\nb");
+
+        let mut app = running_app();
+        type_str(&mut app, "one");
+        assert_eq!(app.on_key(alt(KeyCode::Enter)), Action::Redraw);
+        type_str(&mut app, "two");
+        app.on_key(alt(KeyCode::Enter));
+        assert_eq!(app.editor.text(), "");
+        assert_eq!(app.queue_rows(80), ["queued: one", "queued: two"]);
+        // blank draft queues nothing
+        app.on_key(alt(KeyCode::Enter));
+        assert_eq!(app.queue_rows(80).len(), 2);
+    }
+
+    #[test]
+    fn queue_rows_are_sanitized_clipped_and_capped() {
+        let mut app = running_app();
+        for m in ["a\x1b[2J\rb", "c", "d", "e", "f"] {
+            type_str(&mut app, m);
+            app.on_key(alt(KeyCode::Enter));
+        }
+        let rows = app.queue_rows(80);
+        assert_eq!(rows.len(), 3);
+        assert!(rows[2].contains("+3 more"), "{rows:?}");
+        assert!(rows.iter().all(|r| !r.chars().any(|c| c.is_control())));
+        assert_eq!(rows[0], "queued: a\\u{1b}[2J\\u{d}b");
+        assert!(app.queue_rows(6)[0].chars().count() <= 6);
+    }
+
+    #[test]
+    fn alt_up_pops_the_last_queued_message_into_the_editor() {
+        let mut app = running_app();
+        for m in ["one", "two"] {
+            type_str(&mut app, m);
+            app.on_key(alt(KeyCode::Enter));
+        }
+        app.on_key(alt(KeyCode::Up));
+        assert_eq!(app.editor.text(), "two");
+        assert_eq!(app.queue_rows(80), ["queued: one"]);
+        // with a draft present the popped message goes before it
+        type_str(&mut app, "!");
+        app.on_key(alt(KeyCode::Up));
+        assert_eq!(app.editor.text(), "one\ntwo!");
+        assert_eq!(app.on_key(alt(KeyCode::Up)), Action::None);
+    }
+
+    #[test]
+    fn cancel_returns_every_queued_message_to_the_editor() {
+        for cancel in [key(KeyCode::Esc), ctrl('c')] {
+            let mut app = running_app();
+            for m in ["one", "two"] {
+                type_str(&mut app, m);
+                app.on_key(alt(KeyCode::Enter));
+            }
+            assert_eq!(app.on_key(cancel), Action::Cancel);
+            assert_eq!(app.editor.text(), "one\ntwo");
+            assert!(app.queue_rows(80).is_empty());
+        }
+    }
+
+    #[test]
+    fn queue_head_auto_starts_after_a_final_one_at_a_time() {
+        let mut app = running_app();
+        for m in ["one", "two"] {
+            type_str(&mut app, m);
+            app.on_key(alt(KeyCode::Enter));
+        }
+        assert_eq!(app.start_queued(), None, "not while running");
+        app.on_msg(Msg::Done(TurnEnd::Final("ok".into())));
+        app.take_out();
+        assert_eq!(app.start_queued(), Some("one".into()));
+        assert!(app.running());
+        assert_eq!(texts(&mut app), ["> one"]);
+        assert_eq!(app.queue_rows(80), ["queued: two"]);
+        assert_eq!(app.start_queued(), None, "one at a time");
+        app.on_msg(Msg::Done(TurnEnd::Final("ok".into())));
+        assert_eq!(app.start_queued(), Some("two".into()));
+    }
+
+    #[test]
+    fn a_stopped_turn_returns_the_queue_instead_of_running_it() {
+        let mut app = running_app();
+        type_str(&mut app, "one");
+        app.on_key(alt(KeyCode::Enter));
+        app.on_msg(Msg::Done(TurnEnd::Stopped("provider failed".into())));
+        assert_eq!(app.start_queued(), None);
+        assert_eq!(app.editor.text(), "one");
+    }
+
+    #[test]
+    fn unconsumed_steering_is_not_lost_when_the_turn_settles() {
+        let mut app = running_app();
+        app.leftover(vec!["steer-a".into()]);
+        app.on_msg(Msg::Done(TurnEnd::Final("ok".into())));
+        assert_eq!(app.start_queued(), Some("steer-a".into()));
+        let mut app = running_app();
+        app.leftover(vec!["steer-b".into()]);
+        app.on_msg(Msg::Done(TurnEnd::Cancelled));
+        assert_eq!(app.editor.text(), "steer-b");
+    }
+
+    #[test]
+    fn ctrl_t_hides_and_shows_reasoning_for_new_output() {
+        let mut app = App::default();
+        app.on_msg(Msg::Reasoning("shown\n".into()));
+        app.on_key(ctrl('t'));
+        app.on_msg(Msg::Reasoning("secret\n".into()));
+        app.on_msg(Msg::Text("ans\n".into()));
+        app.on_key(ctrl('t'));
+        app.on_msg(Msg::Reasoning("again\n".into()));
+        let t = texts(&mut app).join("|");
+        assert!(t.contains("shown") && t.contains("again"), "{t}");
+        assert!(!t.contains("secret"), "{t}");
+        assert!(
+            t.contains("reasoning hidden") && t.contains("reasoning shown"),
+            "{t}"
+        );
+    }
+
+    #[test]
+    fn tool_output_is_collapsed_with_a_hint_and_ctrl_o_expands_the_last_block() {
+        let mut app = App::default();
+        app.on_msg(Msg::ToolResult {
+            ok: true,
+            preview: "first\nsecond\nthird".into(),
+        });
+        let t = texts(&mut app);
+        assert_eq!(t[0], "  ✓ first");
+        assert!(
+            t[1].contains("[+2 lines") && t[1].contains("Ctrl+O"),
+            "{t:?}"
+        );
+        assert_eq!(t.len(), 2);
+        app.on_key(ctrl('o'));
+        let t = texts(&mut app);
+        assert!(t.iter().any(|l| l.ends_with("second")), "{t:?}");
+        assert!(t.iter().any(|l| l.ends_with("third")), "{t:?}");
+        // expanded: the next block prints in full, no hint
+        app.on_msg(Msg::ToolResult {
+            ok: true,
+            preview: "a\nb".into(),
+        });
+        let t = texts(&mut app);
+        assert!(t.iter().any(|l| l.ends_with('b')) && !t.iter().any(|l| l.contains("[+")));
+        app.on_key(ctrl('o'));
+        app.take_out();
+        app.on_msg(Msg::ToolResult {
+            ok: true,
+            preview: "a\nb".into(),
+        });
+        assert!(texts(&mut app).iter().any(|l| l.contains("[+1 line")));
+    }
+
+    #[test]
+    fn at_panel_filters_files_and_tab_inserts_the_path() {
+        let mut app = App::default();
+        app.set_files(vec![
+            "src/main.rs".into(),
+            "src/lib.rs".into(),
+            "README.md".into(),
+        ]);
+        type_str(&mut app, "see @li");
+        assert_eq!(app.at_matches(), ["src/lib.rs"]);
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.editor.text(), "see src/lib.rs ");
+        assert!(app.at_matches().is_empty());
+        // Enter inserts too (no submit) and Down selects
+        let mut app = App::default();
+        app.set_files(vec!["a.rs".into(), "b.rs".into()]);
+        type_str(&mut app, "@");
+        assert_eq!(app.at_matches().len(), 2);
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(app.on_key(key(KeyCode::Enter)), Action::Redraw);
+        assert_eq!(app.editor.text(), "b.rs ");
+        // no match: Enter sends the draft as typed
+        let mut app = App::default();
+        app.set_files(vec!["a.rs".into()]);
+        assert_eq!(typed(&mut app, "@zzz"), Action::Submit("@zzz".into()));
+    }
+
+    #[test]
+    fn at_panel_caps_results_and_sanitizes_rows() {
+        let mut app = App::default();
+        app.set_files((0..80).map(|i| format!("f{i}.rs")).collect());
+        type_str(&mut app, "@f");
+        assert_eq!(app.at_matches().len(), files::MAX_RESULTS);
+        assert!(app
+            .at_lines(80)
+            .iter()
+            .all(|l| !l.chars().any(char::is_control)));
+    }
+
+    #[test]
+    fn file_walk_is_shallow_skips_noise_and_unsafe_names() {
+        let d = std::env::temp_dir().join(format!("tole-tui-files-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        for p in [
+            "a.rs",
+            "src/b.rs",
+            "src/x/y/z/deep.rs",
+            "target/t.rs",
+            ".git/c",
+            "node_modules/n.js",
+        ] {
+            let f = d.join(p);
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(f, "").unwrap();
+        }
+        std::fs::write(d.join("bad\x1bname"), "").unwrap();
+        assert_eq!(files::list(&d), ["a.rs", "src/b.rs"]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn markdown_headings_code_and_inline_spans() {
+        let mut t = Transcript::default();
+        let out = t.push(
+            Kind::Text,
+            "# Title\nplain **bold** and `code`\n```rust\nlet x = 1;\n```\nafter\n",
+        );
+        let kinds: Vec<_> = out.iter().map(|o| (o.kind, o.text.as_str())).collect();
+        assert_eq!(
+            kinds,
+            [
+                (Kind::Heading, "Title"),
+                (Kind::Text, "plain **bold** and `code`"),
+                (Kind::Code, "    let x = 1;"),
+                (Kind::Text, "after"),
+            ]
+        );
+        let spans = inline_spans("plain **bold** and `code` **open");
+        let shown: Vec<_> = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(shown, ["plain ", "bold", " and ", "code", " **open"]);
+        assert!(spans[1].style.add_modifier.contains(Modifier::BOLD));
+        assert_ne!(spans[3].style, Style::new());
+    }
+
+    #[test]
+    fn diff_lines_in_tool_output_are_styled_after_sanitizing() {
+        let mut app = App::default();
+        app.on_msg(Msg::ToolResult {
+            ok: true,
+            preview: "edited\n@@ -1 +1 @@\n-old\x1b[2J\n+new".into(),
+        });
+        app.on_key(ctrl('o'));
+        let out = app.take_out();
+        assert!(out.iter().all(|o| !o.text.chars().any(char::is_control)));
+        let style_of = |needle: &str| {
+            let o = out.iter().find(|o| o.text.contains(needle)).unwrap();
+            styled(o.kind, &o.text).spans[0].style
+        };
+        assert_eq!(style_of("+new").fg, Some(Color::Green));
+        assert_eq!(style_of("-old").fg, Some(Color::Red));
+        assert!(style_of("@@").add_modifier.contains(Modifier::DIM));
+    }
+
+    /// Steering reaches the running turn through the existing #377
+    /// soft-interrupt queue: the host sees the text on `cancel.interrupts()`.
+    struct SteerHost;
+    impl TuiHost for SteerHost {
+        fn footer(&self) -> Footer {
+            footer()
+        }
+        fn run_turn(&self, p: &str, c: &CancelToken, _o: Arc<dyn TurnObserver>) -> TurnEnd {
+            if p == "first" {
+                let end = Instant::now() + Duration::from_secs(3);
+                while c.interrupts().is_empty() && Instant::now() < end {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                let got: Vec<_> = c.interrupts().drain().into_iter().map(|i| i.text).collect();
+                return TurnEnd::Final(format!("steered-with {}", got.join("+")));
+            }
+            std::thread::sleep(Duration::from_millis(60));
+            TurnEnd::Final(format!("ran {p}"))
+        }
+    }
+
+    fn run_script(host: &dyn TuiHost, script: Vec<Option<Event>>) -> String {
+        let mut term = Terminal::with_options(
+            TestBackend::new(80, 14),
+            TerminalOptions {
+                viewport: Viewport::Inline(VIEWPORT_HEIGHT),
+            },
+        )
+        .unwrap();
+        let (_p, rx) = approval_channel();
+        let mut it = script.into_iter();
+        event_loop(&mut term, host, &mut App::new(footer()), &rx, |_| {
+            std::thread::sleep(Duration::from_millis(5));
+            Ok(it.next().unwrap_or(None))
+        })
+        .unwrap();
+        format!("{}", term.backend())
+    }
+    fn keys(s: &str) -> Vec<Option<Event>> {
+        s.chars()
+            .map(|c| Some(Event::Key(key(KeyCode::Char(c)))))
+            .collect()
+    }
+
+    #[test]
+    fn loop_steer_reaches_the_interrupt_queue_of_the_running_turn() {
+        let mut script = keys("first");
+        script.push(Some(Event::Key(key(KeyCode::Enter))));
+        script.extend(keys("go left"));
+        script.push(Some(Event::Key(key(KeyCode::Enter))));
+        script.extend(std::iter::repeat_n(None, 40));
+        script.push(Some(Event::Key(ctrl('c'))));
+        script.push(Some(Event::Key(ctrl('c'))));
+        let text = run_script(&SteerHost, script);
+        assert!(text.contains("steered-with go left"), "{text}");
+    }
+
+    #[test]
+    fn loop_runs_queued_follow_ups_after_the_turn_settles_in_order() {
+        let mut script = keys("slowish");
+        script.push(Some(Event::Key(key(KeyCode::Enter))));
+        for m in ["q1", "q2"] {
+            script.extend(keys(m));
+            script.push(Some(Event::Key(alt(KeyCode::Enter))));
+        }
+        script.extend(std::iter::repeat_n(None, 120));
+        script.push(Some(Event::Key(ctrl('c'))));
+        script.push(Some(Event::Key(ctrl('c'))));
+        let text = run_script(&SteerHost, script);
+        let (a, b) = (text.find("ran q1"), text.find("ran q2"));
+        assert!(a.is_some() && b.is_some() && a < b, "{text}");
     }
 }

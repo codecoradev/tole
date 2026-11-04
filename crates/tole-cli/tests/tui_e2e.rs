@@ -93,6 +93,9 @@ fn serve(mut s: std::net::TcpStream, bodies: Bodies) {
         vec![json!({"tool_calls": [call]})]
     } else if said.contains("evil") {
         vec![json!({"content": "EV\x1b[2J\rIL"})]
+    } else if said.contains("hold") {
+        std::thread::sleep(Duration::from_millis(1500));
+        vec![json!({"content": "HELD-ANSWER"})]
     } else if said.contains("slow") {
         std::thread::sleep(Duration::from_secs(20));
         vec![json!({"content": "LATE"})]
@@ -466,4 +469,76 @@ fn tui_model_picker_and_thinking_reach_the_next_request_and_survive_resume() {
         "{}",
         String::from_utf8_lossy(&listed.stdout)
     );
+}
+
+/// #462 acceptance: steer a running turn (soft interrupt, #377), queue
+/// follow-ups that run one by one after it settles, and get the queue back in
+/// the editor on cancel: all on a pty against the mock provider.
+#[test]
+fn tui_steers_queues_and_returns_the_queue_on_cancel() {
+    let bodies = Bodies::default();
+    let (url, dir) = (spawn_mock_recording(bodies.clone()), workdir());
+    let mut t = Pty::spawn(&dir, &url);
+    t.expect("effort:");
+
+    // 1. Enter while the turn runs steers: the first answer is withdrawn at
+    //    the safe point and the next provider call carries the steering text.
+    t.send("hold-a\r");
+    t.expect("working");
+    t.send("go-left\r");
+    t.expect("[steer]");
+    t.expect("STREAM-ANSWER");
+    t.idle();
+
+    // 2. Alt+Enter (ESC CR) queues; the rows show; after the turn settles the
+    //    head runs, then the next, one at a time.
+    t.send("hold-b\r");
+    t.expect("working");
+    t.send("qa\x1b\r");
+    t.send("qb\x1b\r");
+    t.expect("queued: qb");
+    t.expect("HELD-ANSWER");
+    t.expect("> qa");
+    t.expect("> qb");
+    t.idle();
+
+    // 3. Esc cancels and puts the queue back in the editor (not lost).
+    t.send("slow\r");
+    t.expect("working");
+    t.send("qc\x1b\r");
+    t.expect("queued: qc");
+    t.send("\x1b");
+    t.expect("(turn cancelled)");
+    t.send("\r"); // the editor holds "qc" again: sending it runs it
+    t.expect("STREAM-ANSWER");
+    t.send("/quit\r");
+    assert_eq!(t.wait_exit(), Some(0));
+
+    let all = bodies.lock().unwrap();
+    // the steering text reached a provider call as the last (user) message
+    assert!(
+        all.iter().any(|b| {
+            let last = b["messages"].as_array().and_then(|m| m.last()).unwrap();
+            last["role"] == "user"
+                && last["content"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("owner interrupt") && c.contains("go-left"))
+        }),
+        "steering text never reached the provider: {all:?}"
+    );
+    // the last request carries every prompt, in the order they ran
+    let last = all.last().unwrap()["messages"].as_array().unwrap();
+    let users: Vec<&str> = last
+        .iter()
+        .filter(|m| m["role"] == "user")
+        .filter_map(|m| m["content"].as_str())
+        .collect();
+    let mut at = 0;
+    for want in ["hold-a", "go-left", "hold-b", "qa", "qb", "slow", "qc"] {
+        let i = users[at..]
+            .iter()
+            .position(|u| u.contains(want))
+            .unwrap_or_else(|| panic!("{want} missing/out of order in {users:?}"));
+        at += i + 1;
+    }
 }
