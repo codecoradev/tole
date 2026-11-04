@@ -18,17 +18,25 @@ use std::time::{Duration, Instant};
 /// "write" -> a write_file call; "evil" -> an answer carrying ESC/CR; "slow" -> silence for 20s; else a two-chunk
 /// streamed answer. Always SSE when the request streams.
 fn spawn_mock() -> String {
+    spawn_mock_recording(Arc::default())
+}
+
+/// Every chat request body the mock received, in order.
+type Bodies = Arc<Mutex<Vec<Value>>>;
+
+fn spawn_mock_recording(bodies: Bodies) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
-            std::thread::spawn(move || serve(stream));
+            let bodies = bodies.clone();
+            std::thread::spawn(move || serve(stream, bodies));
         }
     });
     format!("http://{addr}/v1")
 }
 
-fn serve(mut s: std::net::TcpStream) {
+fn serve(mut s: std::net::TcpStream, bodies: Bodies) {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 65536];
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -65,8 +73,12 @@ fn serve(mut s: std::net::TcpStream) {
         let _ = s.write_all(r.as_bytes());
     };
     if path_is_models {
-        return reply("application/json", json!({"data": []}).to_string());
+        return reply(
+            "application/json",
+            json!({"data": [{"id": "m"}, {"id": "alt-model"}, {"id": "other-one"}]}).to_string(),
+        );
     }
+    bodies.lock().unwrap().push(body.clone());
     let last = body["messages"]
         .as_array()
         .and_then(|m| m.last())
@@ -219,6 +231,12 @@ impl Pty {
         }
     }
 
+    /// The turn is over: the idle hint (redrawn when `working…` goes away)
+    /// is back, so hotkeys and commands are accepted again.
+    fn idle(&mut self) {
+        self.expect("Shift+Tab thinking");
+    }
+
     fn wait_exit(&mut self) -> Option<i32> {
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
@@ -351,4 +369,101 @@ fn tui_never_passes_escape_sequences_from_provider_text() {
         "raw injection reached the pty"
     );
     assert!(!seen.contains("[2J\rIL"), "raw injection reached the pty");
+}
+
+/// #461 acceptance: switch the model through the picker (Ctrl+L) and the
+/// thinking level through `/thinking`; the NEXT provider request carries
+/// both, the status shows them, and a later `tole resume` still sends them
+/// (they are session registers, not process state).
+#[test]
+fn tui_model_picker_and_thinking_reach_the_next_request_and_survive_resume() {
+    let bodies = Bodies::default();
+    let (url, dir) = (spawn_mock_recording(bodies.clone()), workdir());
+    let mut t = Pty::spawn(&dir, &url);
+    t.expect("effort:");
+    t.send("hello\r");
+    t.expect("STREAM-ANSWER");
+    t.idle();
+
+    // Ctrl+L: picker over /models, filter as you type, Enter picks
+    t.send("\x0c");
+    t.expect("model>");
+    t.send("alt");
+    t.expect("alt-model");
+    t.send("\r");
+    t.expect("model → alt-model");
+
+    // /thinking low (the editor border shows the level)
+    t.send("/thinking low\r");
+    t.expect("thinking → low");
+    t.expect("thinking: low");
+
+    // unknown commands are refused with a hint and nothing is sent
+    t.send("/mod\r");
+    t.expect("did you mean /model");
+
+    t.send("second\r");
+    t.expect("STREAM-ANSWER");
+    t.idle();
+    {
+        let b = bodies.lock().unwrap();
+        assert_eq!(b.len(), 2, "only the two prompts reached the provider");
+        assert_eq!(b[0]["model"], "m");
+        assert!(b[0].get("reasoning_effort").is_none(), "{}", b[0]);
+        assert_eq!(
+            b[1]["model"], "alt-model",
+            "next call carries the new model"
+        );
+        assert_eq!(b[1]["reasoning_effort"], "low", "and the new effort");
+    }
+
+    t.send("/name e2e-run\r");
+    t.expect("named e2e-run");
+    t.send("/session\r");
+    t.expect("alt-model");
+    t.send("/quit\r");
+    assert_eq!(t.wait_exit(), Some(0));
+
+    let file = std::fs::read_dir(dir.join(".tole/sessions"))
+        .unwrap()
+        .flatten()
+        .find(|e| e.file_name().to_string_lossy().ends_with(".jsonl"))
+        .expect("session file");
+    let id = file
+        .file_name()
+        .to_string_lossy()
+        .trim_end_matches(".jsonl")
+        .to_string();
+    let tole = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_tole"))
+            .args(args)
+            .current_dir(&dir)
+            .env("CODECORA_HOME", dir.join("home"))
+            .env("TOLE_BASE_URL", &url)
+            .env("TOLE_MODEL", "m")
+            .env("TOLE_API_KEY", "k")
+            .env("TOLE_NO_UPDATE_CHECK", "1")
+            .output()
+            .unwrap()
+    };
+    let out = tole(&["resume", &id, "third"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let b = bodies.lock().unwrap();
+    let last = b.last().unwrap();
+    assert_eq!(last["model"], "alt-model", "model register survives resume");
+    assert_eq!(
+        last["reasoning_effort"], "low",
+        "effort register survives resume"
+    );
+    drop(b);
+    let listed = tole(&["sessions", "--all"]);
+    assert!(
+        String::from_utf8_lossy(&listed.stdout).contains("e2e-run"),
+        "{}",
+        String::from_utf8_lossy(&listed.stdout)
+    );
 }

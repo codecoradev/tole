@@ -1035,8 +1035,14 @@ impl Storage for JsonlStorage {
         self.system_prompt.as_deref()
     }
 
+    /// A `fact/session_name` register (TUI `/name`, #461) wins over the
+    /// header alias: the header is append-only history, the register is the
+    /// rename.
     fn session_name(&self) -> Option<&str> {
-        self.name.as_deref()
+        self.get_register("fact", "session_name")
+            .and_then(Value::as_str)
+            .filter(|n| !n.is_empty())
+            .or(self.name.as_deref())
     }
 
     fn state(&self) -> MachineState {
