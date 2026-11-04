@@ -16,6 +16,12 @@ impl Editor {
         self.text.push(c);
     }
 
+    /// Replace the buffer (Tab completion).
+    pub fn set(&mut self, text: &str) {
+        self.edited();
+        self.text = text.to_string();
+    }
+
     pub fn newline(&mut self) {
         self.insert('\n');
     }

@@ -1,8 +1,8 @@
 # Terminal UI (`tole-tui`)
 
-Status: **MVP** (#460, in `develop`, not yet released). Bare `tole` on an
-interactive terminal opens an inline UI over one ordinary tole session. Next:
-#461 (slash commands, pickers), #464 (`/thinking`, detach key).
+Status: **MVP + pickers** (#460, #461, in `develop`, not yet released). Bare
+`tole` on an interactive terminal opens an inline UI over one ordinary tole
+session. Next: #464 (detach key).
 
 - Bare `tole` (no arguments, stdin and stdout are TTYs) runs the hidden
   `tole tui` subcommand, so it goes through the same config gate, `--allow` /
@@ -35,10 +35,36 @@ interactive terminal opens an inline UI over one ordinary tole session. Next:
 | `Shift+Enter`, `Alt+Enter`, `Ctrl+J` | newline in the editor |
 | `Up` / `Down` | input history (the draft is restored after the newest entry) |
 | `Backspace` | delete the last character |
+| `/` | open the command menu; `Tab` completes, `Up`/`Down` select |
+| `Ctrl+L` | model picker (`/models`); type to filter, `Enter` picks, `Esc` closes |
+| `Ctrl+P` | cycle the models used in this run |
+| `Shift+Tab` | cycle thinking: `minimal → low → medium → high → unset` |
 | `y` / `n` | answer an approval prompt (other keys are ignored) |
 | `Esc` | cancel the running turn; at an approval prompt: deny and cancel |
 | `Ctrl+C` | cancel the running turn; when idle, twice to quit |
-| `/quit` + `Enter` | quit |
+
+Hotkeys and commands wait while a turn runs (they take the session lock).
+
+## Commands
+
+| Command | Effect |
+|---|---|
+| `/model [id]` | picker over `/models`, or pin `id` (`fact/model`) |
+| `/thinking [level]` | set `minimal\|low\|medium\|high\|unset`; no argument cycles (`fact/reasoning_effort`) |
+| `/compact [instructions]` | the next prompt compacts first (the forced pass of #481); **not** a mid-turn compaction; instructions are not supported yet and reported as ignored |
+| `/new` | fresh session in place (the old handle is closed) |
+| `/resume` | picker over the global session index (newest 50, current excluded) |
+| `/session` | the `tole status` lines |
+| `/name <text>` | rename (`fact/session_name`; shown by `sessions --all`, `resume <name>`) |
+| `/quit` | quit |
+
+An unknown command is refused with a prefix hint and nothing is sent. Model,
+effort and name are session registers: the next provider call uses them and
+they survive `tole resume`. `unset` clears the override, so the footer then
+shows the process default (`--effort` / env / config) if one is set, and
+`Shift+Tab` continues from that value. `/new` and `/resume` swap the session in
+place (one open handle per session) but do not replay the old transcript on
+screen; the todo list tool keeps the launch session's state.
 
 **Shift+Enter limitation:** most terminals send the same byte for `Enter` and
 `Shift+Enter`. tole asks for the kitty keyboard protocol (kitty, WezTerm,
@@ -49,8 +75,9 @@ everywhere.
 ## Not in the MVP
 
 The editor has no in-buffer cursor movement (Left/Right/Home/End, `Up`/`Down`
-always browse history); no slash commands beyond `/quit`; no memory loop, MCP
-prompt commands or sibling notices; no soft-interrupt steering (#377/#383).
+always browse history); no memory loop, MCP prompt commands or sibling
+notices; no soft-interrupt steering (#377/#383); no `/resume` paging and no
+transcript replay after `/new` / `/resume`.
 Wide characters wrap by character count, not cell width.
 
 ## Architecture

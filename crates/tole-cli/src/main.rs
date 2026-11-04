@@ -2781,6 +2781,12 @@ fn tui_command(
             .collect();
         registry.set_hooks(hooks);
     }
+    // The pinned prompt of a fresh session; `/new` inside the TUI reuses it.
+    let prompt = system
+        .map(str::to_string)
+        .or_else(resolve_system_prompt)
+        .unwrap_or_else(|| build_default_prompt(host.plan_mode));
+    let prompt = format!("{prompt}{}{skill_sections}", review_section(&registry));
     let storage = match &resume {
         Some(id) => {
             JsonlStorage::open(session_path(sessions_dir, id)).context("replaying session log")?
@@ -2789,11 +2795,6 @@ fn tui_command(
             std::fs::create_dir_all(sessions_dir)
                 .with_context(|| format!("creating {}", sessions_dir.display()))?;
             let id = new_session_id();
-            let prompt = system
-                .map(str::to_string)
-                .or_else(resolve_system_prompt)
-                .unwrap_or_else(|| build_default_prompt(host.plan_mode));
-            let prompt = format!("{prompt}{}{skill_sections}", review_section(&registry));
             let s = JsonlStorage::create_with(sessions_dir, &id, None, Some(&prompt))
                 .with_context(|| format!("creating session {id}"))?;
             tole_cli::session_index::record(sessions_dir, &id, "tui");
@@ -2801,9 +2802,10 @@ fn tui_command(
         }
     };
     tool_roster::register_todo(&mut registry, storage.entries(), host.plan_mode)?;
-    let session = tole_cli::tui_host::TuiSession::new(storage, registry, cfg, host.compaction);
-    let id = session.session_id().to_string();
+    let session = tole_cli::tui_host::TuiSession::new(storage, registry, cfg, host.compaction)
+        .with_sessions(sessions_dir.to_path_buf(), Some(prompt));
     tole_tui::run(&session, approvals).context("terminal ui")?;
+    let id = session.session_id();
     println!("session {id} closed (resume: tole resume {id} \"…\")");
     Ok(())
 }
