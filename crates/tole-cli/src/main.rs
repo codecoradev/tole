@@ -535,7 +535,40 @@ enum ConfigAction {
     Untrust,
 }
 
+/// Bare `tole` (no arguments at all) on an interactive terminal opens the
+/// TUI (#459). Anything else, including a non-TTY, falls through to clap
+/// and behaves exactly as before.
+#[cfg(feature = "tui")]
+fn run_tui_if_bare() {
+    use std::io::IsTerminal;
+    if std::env::args_os().count() != 1
+        || !std::io::stdout().is_terminal()
+        || !std::io::stdin().is_terminal()
+    {
+        return;
+    }
+    struct Host(tole_core::approval::AllowlistApprover);
+    impl tole_tui::TuiHost for Host {
+        fn label(&self) -> String {
+            format!("tole {}", env!("CARGO_PKG_VERSION"))
+        }
+        fn approver(&self) -> &dyn tole_core::approval::Approver {
+            &self.0
+        }
+    }
+    let code = match tole_tui::run(&Host(tole_core::approval::AllowlistApprover::default())) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("tole: {e}");
+            1
+        }
+    };
+    std::process::exit(code);
+}
+
 fn main() {
+    #[cfg(feature = "tui")]
+    run_tui_if_bare();
     let cli = Cli::parse();
     if let Err(e) = dispatch(cli) {
         eprintln!("tole: {e:#}");

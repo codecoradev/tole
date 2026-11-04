@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/tole-core", "crates/tole-cli"]
+members = ["crates/tole-core", "crates/tole-cli", "crates/tole-tui"]
 
 [workspace.package]
 version = "0.9.0"
