@@ -2770,6 +2770,17 @@ fn tui_command(
         host.no_skills,
         &mut registry,
     )?;
+    // Opt-in tool-boundary hooks (issue #110): same wiring as `chat`.
+    #[cfg(feature = "shell-tools")]
+    if !host.on_pretool.is_empty() || !host.on_posttool.is_empty() || !host.on_turnend.is_empty() {
+        let mut hooks = tole_core::hooks::ToolHooks::from_cli(&host.on_pretool, &host.on_posttool);
+        hooks.turnend = host
+            .on_turnend
+            .iter()
+            .map(|c| tole_core::hooks::turnend_hook(c))
+            .collect();
+        registry.set_hooks(hooks);
+    }
     let storage = match &resume {
         Some(id) => {
             JsonlStorage::open(session_path(sessions_dir, id)).context("replaying session log")?

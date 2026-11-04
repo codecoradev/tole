@@ -127,6 +127,10 @@ struct Pty {
 
 impl Pty {
     fn spawn(cwd: &Path, url: &str) -> Pty {
+        Pty::spawn_with(cwd, url, &[])
+    }
+
+    fn spawn_with(cwd: &Path, url: &str, args: &[String]) -> Pty {
         let (mut m, mut sl) = (0, 0);
         let ws = libc::winsize {
             ws_row: 30,
@@ -139,7 +143,8 @@ impl Pty {
         assert_eq!(rc, 0, "openpty");
         let (master, slave) = unsafe { (OwnedFd::from_raw_fd(m), OwnedFd::from_raw_fd(sl)) };
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
-        cmd.current_dir(cwd)
+        cmd.args(args)
+            .current_dir(cwd)
             .env("CODECORA_HOME", cwd.join("home"))
             .env("TOLE_BASE_URL", url)
             .env("TOLE_MODEL", "m")
@@ -301,4 +306,27 @@ fn tui_streams_approves_cancels_and_leaves_an_ordinary_session() {
         "sessions lists {id}: {}",
         String::from_utf8_lossy(&listed.stdout)
     );
+}
+
+/// The TUI face must wire `--on-pretool` like every other command: a deny
+/// (exit 2) stops the write even under `--yes`, and the denial is shown.
+#[cfg(feature = "shell-tools")]
+#[test]
+fn tui_enforces_a_deny_only_pretool_hook() {
+    let (url, dir) = (spawn_mock(), workdir());
+    let script = dir.join("deny.sh");
+    std::fs::write(&script, "#!/bin/sh\necho policy says no\nexit 2\n").unwrap();
+    let args = [
+        "--on-pretool".to_string(),
+        format!("/bin/sh {}", script.display()),
+        "tui".into(),
+        "--yes".into(),
+    ];
+    let mut t = Pty::spawn_with(&dir, &url, &args);
+    t.expect("effort:");
+    t.send("write it\r");
+    t.expect("approval denied for 'write_file'");
+    assert!(!dir.join("out.txt").exists(), "denied write must not run");
+    t.send("/quit\r");
+    assert_eq!(t.wait_exit(), Some(0));
 }
