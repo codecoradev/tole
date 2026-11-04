@@ -397,8 +397,8 @@ enum Command {
 
     /// Show durable state of a session.
     Status {
-        /// Session id to inspect.
-        id: String,
+        /// Session id to inspect (default: the most recently modified).
+        id: Option<String>,
     },
     /// Serve tole's tools over MCP stdio (issue #94): ReadOnly tools are
     /// always callable; Write tools require --allow patterns (server mode
@@ -1190,7 +1190,15 @@ fn dispatch(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
-        Command::Status { id } => status_command(&sessions_dir, &id),
+        Command::Status { id } => {
+            let id = match id {
+                Some(id) => id,
+                None => latest_session_id(&sessions_dir)
+                    .ok_or_else(|| anyhow!("no sessions found in {}", sessions_dir.display()))?,
+            };
+            let window = settings.context_window.as_ref().map(|w| w.value);
+            status_command(&sessions_dir, &id, window)
+        }
         Command::Chat {
             system: _,
             resume,
@@ -1987,7 +1995,7 @@ fn resume_command(
     Ok(())
 }
 
-fn status_command(sessions_dir: &Path, id: &str) -> Result<()> {
+fn status_command(sessions_dir: &Path, id: &str, window: Option<u64>) -> Result<()> {
     if !valid_session_id(id) {
         anyhow::bail!("invalid session id {id:?} (allowed: [a-z0-9-], max 64)");
     }
@@ -2042,7 +2050,34 @@ fn status_command(sessions_dir: &Path, id: &str) -> Result<()> {
     for line in tole_cli::usage_report::turn_lines(storage.entries(), usage) {
         println!("{line}");
     }
+    // #458: model / effort / context / token lines from the one status
+    // snapshot, appended last so the pre-existing lines keep their order.
+    let cfg = tole_cli::config_apply::provider_config();
+    let configured = cfg.as_ref().map(|c| c.model.as_str());
+    let settings = tole_cli::compaction_host::CompactionSettings {
+        window,
+        ..Default::default()
+    };
+    let snap = match &cfg {
+        Some(c) => {
+            let model = tole_cli::turn_runner::session_model(&storage, &c.model);
+            let mut src = tole_cli::compaction_host::ModelsCatalog::new(c, &model);
+            tole_cli::status::session_status(&storage, configured, &settings, &mut src)
+        }
+        None => tole_cli::status::session_status(&storage, None, &settings, &mut NoWindow),
+    };
+    for line in snap.lines() {
+        println!("{line}");
+    }
     Ok(())
+}
+
+/// Window source for `tole status` without a provider config: never knows.
+struct NoWindow;
+impl tole_cli::compaction_host::WindowSource for NoWindow {
+    fn window(&mut self) -> Option<u64> {
+        None
+    }
 }
 
 /// B3: list every session in the dir, newest first, one line each.
