@@ -153,8 +153,13 @@ jobs:
         run: |
           TAG_VERSION="${GITHUB_REF#refs/tags/}"
           SEMVER="${TAG_VERSION#v}"
+          # Stable tags only (no -rc/-beta suffix): tole's release line has
+          # always cut stable tags, and the CHANGELOG section lookup below
+          # keys on the plain X.Y.Z header. If a pre-release lane is ever
+          # needed, relax this regex AND derive the changelog key from the
+          # suffix-free part — and re-add `prerelease:` to the release step.
           if ! echo "$SEMVER" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-            echo "ERROR: Invalid semver format: $SEMVER"
+            echo "ERROR: Invalid tag format: $TAG_VERSION (stable X.Y.Z only — no pre-release suffix)"
             exit 1
           fi
           echo "TAG=$TAG_VERSION" >> $GITHUB_OUTPUT
@@ -190,7 +195,9 @@ jobs:
           name: Release ${{ steps.version.outputs.TAG }}
           body_path: release-notes.md
           files: release-artifacts/*
+          # Stable-only tags are enforced above, so this release is never a
+          # prerelease; the flag is pinned false explicitly for clarity.
           draft: false
-          prerelease: ${{ contains(steps.version.outputs.TAG, '-') }}
+          prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
