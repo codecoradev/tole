@@ -201,3 +201,12 @@ jobs:
           prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Chain crates.io publishing into the SAME tag run. The Release this
+      # workflow creates via softprops does NOT fire publish.yml's own
+      # `release: published` trigger (the event belongs to the run that
+      # created it), so without this call a tag alone published binaries
+      # but left crates.io behind (v0.10.1 needed a manual dispatch).
+      # Already-published versions are absorbed idempotently by publish.yml.
+      - name: Publish to crates.io (chained)
+        uses: ./.github/workflows/publish.yml
