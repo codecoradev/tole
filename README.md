@@ -9,13 +9,14 @@ Durable Rust agent harness: a conversational agent with risk-tiered approval
 gates, a write-once JSONL session log, and a register state machine — resumable
 after crashes, replayable forever.
 
-**Status:** v0.9.0 is the latest release: `tole doctor`, soft interrupts, per-turn token stats, sibling change notices and the typed child-agent handoff, a provider failover chain, the user config layer, `--trust workspace`, command-level allow/deny patterns, a global session index (`sessions --all`) and context compaction, plus the 0.8.2 `tole serve` hardening (see the CHANGELOG). `develop` is working toward 0.10.0, a pi-style terminal UI (`tole-tui`, #464). v0.8.1 itself brought token-usage reporting and a capped, resumable `read_file` (#211), on top of v0.8.0, which added the per-project config `.tole/config.toml`
+**Status:** v0.9.0 is the latest release: `tole doctor`, soft interrupts, per-turn token stats, sibling change notices and the typed child-agent handoff, a provider failover chain, the user config layer, `--trust workspace`, command-level allow/deny patterns, a global session index (`sessions --all`) and context compaction, plus the 0.8.2 `tole serve` hardening (see the CHANGELOG). `develop` is working toward 0.10.0, a pi-style terminal UI: the `tole-tui` skeleton is in (bare `tole` on a TTY opens a placeholder inline UI; the MVP transcript / editor / footer lands next, #460), `--effort` reasoning effort and the `tole status [id]` snapshot (model, effort, context used/window, tokens, compactions) shipped, and the multi-client daemon is design-only and parked ([docs/daemon-design.md](docs/daemon-design.md)). v0.8.1 itself brought token-usage reporting and a capped, resumable `read_file` (#211), on top of v0.8.0, which added the per-project config `.tole/config.toml`
 (trusted before it applies; see the Configuration section) on top of v0.7.x
 (rescan-2 hardening, one tool-call authorization gate; see the CHANGELOG for
-the behavior changes). Four faces on one durable core: the CLI (run / chat /
+the behavior changes). Five faces on one durable core: the CLI (run / chat /
 resume / sessions / jobs / **mission**), `tole mcp` (tool server),
-`tole acp` (editor agent), and `tole serve` (REST + multi-session
-MCP-over-HTTP daemon). Identity (owner-approved): a chat-first
+`tole acp` (editor agent), `tole serve` (REST + multi-session
+MCP-over-HTTP daemon), and the inline terminal UI (`tole-tui`, bare
+`tole` on a TTY; skeleton stage, [docs/tui.md](docs/tui.md)). Identity (owner-approved): a chat-first
 personal assistant WITH a mission mode for autonomous work —
 budgeted turn-chaining (`tole mission --max-steps/--max-minutes/
 --max-tokens/--verify`), durable task-list tools (`todo_write`/
@@ -116,7 +117,7 @@ tole sessions --all [--grep <text>]         # every project's sessions + where t
 tole sessions --tree                        # sessions with their forks nested
 tole branch <id> [--at <entry>]             # fork a session at a settled entry, then resume the fork
 tole import-claude <transcript.jsonl>       # import a Claude Code session as cc-<id>, then resume it
-tole status <id>                            # pc / seq / turns / token + cache usage / request-size split
+tole status [id]                            # pc / seq / turns / token + cache usage / request-size split; model, effort, context used/window, tokens, compactions (default: latest session)
 ```
 
 Sessions live in `.tole/sessions/<id>.jsonl` (override with
