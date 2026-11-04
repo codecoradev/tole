@@ -1626,6 +1626,13 @@ mod tests {
     }
 
     #[test]
+    fn unknown_hint_never_panics_on_empty_or_multibyte_input() {
+        assert!(menu::unknown("").contains("unknown command"));
+        assert!(menu::unknown("日本語").contains("unknown command"));
+        assert!(menu::unknown("/日本語").contains("unknown command"));
+    }
+
+    #[test]
     fn commands_map_to_host_actions() {
         let host = |c| Action::Host(c);
         let mut app = App::default();
@@ -2037,6 +2044,7 @@ mod tests {
             std::fs::write(f, "").unwrap();
         }
         std::fs::write(d.join("bad\x1bname"), "").unwrap();
+        std::fs::write(d.join("two\nlines"), "").unwrap();
         assert_eq!(files::list(&d), ["a.rs", "src/b.rs"]);
         let _ = std::fs::remove_dir_all(&d);
     }

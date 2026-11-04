@@ -28,7 +28,11 @@ fn walk(dir: &Path, prefix: &str, depth: usize, out: &mut Vec<String>) {
             return;
         }
         let name = e.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') || SKIP.contains(&name.as_str()) || crate::sanitize(&name) != name
+        // sanitize keeps '\n', which would split one entry across panel rows
+        if name.starts_with('.')
+            || SKIP.contains(&name.as_str())
+            || name.contains('\n')
+            || crate::sanitize(&name) != name
         {
             continue;
         }

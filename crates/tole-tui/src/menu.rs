@@ -145,10 +145,11 @@ fn clip(s: &str, max: usize) -> String {
 
 /// Refusal text for an unknown command, with prefix matches as the hint.
 pub fn unknown(cmd: &str) -> String {
+    let tail = cmd.strip_prefix('/').unwrap_or(cmd);
     let close: Vec<&str> = COMMANDS
         .iter()
         .map(|c| c.0)
-        .filter(|n| n.starts_with(cmd) || cmd.starts_with(n) || n.contains(&cmd[1..]))
+        .filter(|n| n.starts_with(cmd) || cmd.starts_with(n) || n.contains(tail))
         .collect();
     let hint = if close.is_empty() {
         "type / to list the commands".to_string()

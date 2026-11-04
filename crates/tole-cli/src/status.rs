@@ -34,19 +34,17 @@ impl SessionStatus {
     /// `context: 41k / 128k (32%)`, or `context: 41k / unknown`.
     pub fn context_line(&self) -> String {
         let used = short(self.last_prompt_tokens);
-        match (self.window, self.fraction_used()) {
+        match self.window.filter(|w| *w > 0) {
             // Integer half-up rounding: float `{:.0}` rounds halves to even.
-            (Some(w), Some(_)) => format!(
+            Some(w) => format!(
                 "context: {used} / {} ({}%)",
                 short(w),
                 (self.last_prompt_tokens * 100 + w / 2) / w
             ),
-            _ => format!("context: {used} / unknown"),
+            None => format!("context: {used} / unknown"),
         }
     }
-}
 
-impl SessionStatus {
     /// Human lines for `tole status`: model, effort, context, tokens, compactions.
     pub fn lines(&self) -> Vec<String> {
         vec![
