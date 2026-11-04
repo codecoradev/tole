@@ -1,0 +1,203 @@
+name: Release
+
+# Release is triggered by pushing a vX.Y.Z tag (mirrors codecoradev/cora-code).
+#
+# PREREQUISITE: Before tagging, merge develop → main via PR.
+# The tag must point to a commit on main, NOT develop.
+# GitFlow: develop (default) → PR → main → tag → release.
+#
+# This workflow does NOT sync main — main must already be up to date.
+#
+# NOTE: crates.io publishing stays in publish.yml (release: published +
+# workflow_dispatch, order core -> tui -> cli). This workflow adds the
+# prebuilt binary archives + checksums to the GitHub Release.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  verify-main:
+    name: Verify tag is on main
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Check tag is on main
+        run: |
+          git fetch origin main
+          TAG_SHA=$(git rev-parse "${{ github.ref }}^{commit}")
+          MAIN_SHA=$(git rev-parse origin/main)
+          echo "Tag: $TAG_SHA"
+          echo "main: $MAIN_SHA"
+          if [ "$TAG_SHA" = "$MAIN_SHA" ]; then
+            echo "✅ Tag is main HEAD"
+          elif git merge-base --is-ancestor "$TAG_SHA" origin/main 2>/dev/null; then
+            echo "✅ Tag commit $TAG_SHA is in main history"
+          else
+            echo "::error::Tag commit $TAG_SHA is NOT on main."
+            echo "Merge develop → main via PR before tagging."
+            exit 1
+          fi
+
+  build-release:
+    needs: [verify-main]
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x86_64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: tole-x86_64-unknown-linux-gnu
+            ext: tar.gz
+          # Linux ARM64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact: tole-aarch64-unknown-linux-gnu
+            ext: tar.gz
+          # macOS Apple Silicon
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: tole-aarch64-apple-darwin
+            ext: tar.gz
+          # Windows x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: tole-x86_64-pc-windows-msvc
+            ext: zip
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # Linux ARM64 runner has no cross toolchain preinstalled; the
+      # target std ships with rustup, the linker (gcc) is native there.
+      - name: Build release binary (default features; includes the TUI)
+        run: cargo build --release --target ${{ matrix.target }} -p tole-cli
+
+      - name: Strip binary (Unix)
+        if: runner.os != 'Windows'
+        run: strip target/${{ matrix.target }}/release/tole
+
+      - name: Extract version
+        id: version
+        shell: bash
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p release
+          cp target/${{ matrix.target }}/release/tole release/tole
+          cd release
+          tar czf ${{ matrix.artifact }}-${{ steps.version.outputs.VERSION }}.${{ matrix.ext }} tole
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          mkdir release
+          cp target/${{ matrix.target }}/release/tole.exe release/${{ matrix.artifact }}.exe
+          cd release
+          7z a ${{ matrix.artifact }}-${{ steps.version.outputs.VERSION }}.${{ matrix.ext }} ${{ matrix.artifact }}.exe
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}-${{ steps.version.outputs.VERSION }}
+          path: release/${{ matrix.artifact }}-${{ steps.version.outputs.VERSION }}.${{ matrix.ext }}
+
+  release:
+    name: Create GitHub Release
+    needs: [build-release]
+    runs-on: ubuntu-latest
+    # Least privilege, scoped to this job only:
+    #   contents: write -> create the GitHub Release and upload assets.
+    # (No sigstore step yet — cora-code signs its checksums keylessly; add
+    # when tole ships a binary install path that verifies signatures.)
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la release-artifacts/
+
+      - name: Generate SHA256 checksums
+        run: |
+          cd release-artifacts
+          sha256sum * > checksums-sha256.txt
+          cat checksums-sha256.txt
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          TAG_VERSION="${GITHUB_REF#refs/tags/}"
+          SEMVER="${TAG_VERSION#v}"
+          # Stable tags only (no -rc/-beta suffix): tole's release line has
+          # always cut stable tags, and the CHANGELOG section lookup below
+          # keys on the plain X.Y.Z header. If a pre-release lane is ever
+          # needed, relax this regex AND derive the changelog key from the
+          # suffix-free part — and re-add `prerelease:` to the release step.
+          if ! echo "$SEMVER" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "ERROR: Invalid tag format: $TAG_VERSION (stable X.Y.Z only — no pre-release suffix)"
+            exit 1
+          fi
+          echo "TAG=$TAG_VERSION" >> $GITHUB_OUTPUT
+          echo "VERSION=$SEMVER" >> $GITHUB_OUTPUT
+
+      - name: Extract changelog for this version
+        id: changelog
+        run: |
+          CHANGELOG_EXCERPT=$(sed -n '/^## \['"${{ steps.version.outputs.VERSION }}"'\]/,/^## \[/p' CHANGELOG.md | sed '$d' | tail -n +2)
+          {
+            printf '## What'\''s New in %s\n\n' "${{ steps.version.outputs.TAG }}"
+            printf '%s\n\n' "$CHANGELOG_EXCERPT"
+            printf '### 📦 Platforms\n\n'
+            printf '| Platform | File |\n'
+            printf '|----------|------|\n'
+            printf '| Linux (x86_64) | `tole-x86_64-unknown-linux-gnu-%s.tar.gz` |\n' "${{ steps.version.outputs.TAG }}"
+            printf '| Linux (ARM64) | `tole-aarch64-unknown-linux-gnu-%s.tar.gz` |\n' "${{ steps.version.outputs.TAG }}"
+            printf '| macOS (Apple Silicon) | `tole-aarch64-apple-darwin-%s.tar.gz` |\n' "${{ steps.version.outputs.TAG }}"
+            printf '| Windows (x86_64) | `tole-x86_64-pc-windows-msvc-%s.zip` |\n\n' "${{ steps.version.outputs.TAG }}"
+            printf '### 🚀 Install\n\n'
+            printf '```bash\n'
+            printf '# From crates.io (canonical — `tole upgrade` tracks it)\n'
+            printf 'cargo install tole-cli\n'
+            printf '```\n\n'
+            printf 'Or download a binary archive below, verify it against `checksums-sha256.txt`, and put `tole` on your PATH.\n\n'
+            printf '**Full changelog:** https://github.com/codecoradev/tole/blob/main/CHANGELOG.md\n'
+          } > release-notes.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.TAG }}
+          name: Release ${{ steps.version.outputs.TAG }}
+          body_path: release-notes.md
+          files: release-artifacts/*
+          # Stable-only tags are enforced above, so this release is never a
+          # prerelease; the flag is pinned false explicitly for clarity.
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
