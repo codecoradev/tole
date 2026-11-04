@@ -1858,6 +1858,7 @@ version = "0.9.0"
 dependencies = [
  "crossterm",
  "ratatui",
+ "serde_json",
  "tole-core",
 ]
 
