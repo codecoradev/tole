@@ -1,6 +1,6 @@
 # Terminal UI (`tole-tui`)
 
-Status: **skeleton** (#459). The usable MVP lands with #460/#461.
+Status: **skeleton** (#459, in `develop`, not yet released). It renders a 3-row placeholder (header with `tole <version>`, hint, input line) and only handles quitting; typed text is echoed but never sent. Next: #460 (transcript / editor / footer MVP), then #461.
 
 - Bare `tole` (no arguments) on an interactive terminal (stdin and stdout
   are TTYs) opens the TUI. On a non-TTY it prints help as before.
