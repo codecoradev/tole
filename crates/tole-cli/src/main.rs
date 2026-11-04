@@ -476,6 +476,20 @@ enum Command {
         #[arg(long)]
         memory: Option<String>,
     },
+    /// Interactive terminal UI (what bare `tole` opens on a TTY).
+    #[cfg(feature = "tui")]
+    #[command(hide = true)]
+    Tui {
+        /// Resume an existing session by id instead of starting new.
+        #[arg(long)]
+        resume: Option<String>,
+        /// Same semantics as `run --allow`.
+        #[arg(long = "allow")]
+        allow_patterns: Vec<String>,
+        /// Same semantics as `run --yes`.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Interactive multi-turn chat on one durable session.
     Chat {
         /// System prompt for a fresh session (ignored when resuming —
@@ -536,39 +550,25 @@ enum ConfigAction {
 }
 
 /// Bare `tole` (no arguments at all) on an interactive terminal opens the
-/// TUI (#459). Anything else, including a non-TTY, falls through to clap
-/// and behaves exactly as before.
+/// TUI (#459/#460) through the hidden `tui` subcommand, so it shares the
+/// config gate and settings resolution with every other command. Anything
+/// else, including a non-TTY, falls through to clap unchanged.
 #[cfg(feature = "tui")]
-fn run_tui_if_bare() {
+fn bare_tui_args() -> Option<Vec<std::ffi::OsString>> {
     use std::io::IsTerminal;
-    if std::env::args_os().count() != 1
-        || !std::io::stdout().is_terminal()
-        || !std::io::stdin().is_terminal()
-    {
-        return;
-    }
-    struct Host(tole_core::approval::AllowlistApprover);
-    impl tole_tui::TuiHost for Host {
-        fn label(&self) -> String {
-            format!("tole {}", env!("CARGO_PKG_VERSION"))
-        }
-        fn approver(&self) -> &dyn tole_core::approval::Approver {
-            &self.0
-        }
-    }
-    let code = match tole_tui::run(&Host(tole_core::approval::AllowlistApprover::default())) {
-        Ok(()) => 0,
-        Err(e) => {
-            eprintln!("tole: {e}");
-            1
-        }
-    };
-    std::process::exit(code);
+    (std::env::args_os().count() == 1
+        && std::io::stdout().is_terminal()
+        && std::io::stdin().is_terminal())
+    .then(|| vec!["tole".into(), "tui".into()])
 }
 
 fn main() {
     #[cfg(feature = "tui")]
-    run_tui_if_bare();
+    let cli = match bare_tui_args() {
+        Some(args) => Cli::parse_from(args),
+        None => Cli::parse(),
+    };
+    #[cfg(not(feature = "tui"))]
     let cli = Cli::parse();
     if let Err(e) = dispatch(cli) {
         eprintln!("tole: {e:#}");
@@ -603,6 +603,8 @@ fn gate_policy(cmd: &Command) -> GatePolicy {
         | Command::Chat { .. }
         | Command::Resume { .. }
         | Command::Mission { .. } => GatePolicy::MayPrompt,
+        #[cfg(feature = "tui")]
+        Command::Tui { .. } => GatePolicy::MayPrompt,
         _ => GatePolicy::NoPrompt,
     }
 }
@@ -661,6 +663,8 @@ fn config_flags(cli: &Cli) -> tole_cli::config_apply::Flags {
             f.allow = allow_patterns.clone();
         }
         Command::Resume { allow_patterns, .. } => f.allow = allow_patterns.clone(),
+        #[cfg(feature = "tui")]
+        Command::Tui { allow_patterns, .. } => f.allow = allow_patterns.clone(),
         Command::Mission {
             max_steps,
             max_minutes,
@@ -1232,6 +1236,22 @@ fn dispatch(cli: Cli) -> Result<()> {
             let window = settings.context_window.as_ref().map(|w| w.value);
             status_command(&sessions_dir, &id, window)
         }
+        #[cfg(feature = "tui")]
+        Command::Tui {
+            resume,
+            allow_patterns: _,
+            yes,
+        } => {
+            let allow_patterns = with_trust(config_apply::values(&settings.allow), &trust_extra);
+            tui_command(
+                &sessions_dir,
+                settings.system_prompt.as_ref().map(|e| e.value.as_str()),
+                resume,
+                &allow_patterns,
+                yes,
+                &host,
+            )
+        }
         Command::Chat {
             system: _,
             resume,
@@ -1561,7 +1581,7 @@ fn check_server_face_flags(
 /// The CLI faces' registry: the shared tool roster behind the
 /// interactive approver.
 fn build_registry(
-    approver: InteractiveApprover<StdioPrompt>,
+    approver: impl tole_core::approval::Approver + 'static,
     host: &HostConfig,
     allow_patterns: &[String],
 ) -> Result<ToolRegistry> {
@@ -2715,6 +2735,76 @@ fn chat_command(
         "session {session_id} closed — entries: {}",
         storage.entries().len()
     );
+    Ok(())
+}
+
+/// `tole` / `tole tui` (#460): the TUI over one ordinary durable session
+/// (same JSONL as `chat`, so `tole resume` / `sessions --all` see it).
+/// Memory loop, MCP prompt commands and sibling notices are not wired here yet.
+#[cfg(feature = "tui")]
+fn tui_command(
+    sessions_dir: &Path,
+    system: Option<&str>,
+    resume: Option<String>,
+    allow_patterns: &[String],
+    yes: bool,
+    host: &HostConfig,
+) -> Result<()> {
+    let cfg = tole_cli::turn_runner::provider_config().map_err(anyhow::Error::msg)?;
+    if let Some(id) = &resume {
+        if !valid_session_id(id) || !session_path(sessions_dir, id).exists() {
+            anyhow::bail!("session {id} not found in {}", sessions_dir.display());
+        }
+    }
+    let (prompter, approvals) = tole_tui::approval_channel();
+    let approver = InteractiveApprover::new(tole_cli::tui_host::TuiPrompt(prompter))
+        .with_allow_patterns(allow_patterns.to_vec())
+        .with_auto_write(yes);
+    let mut registry = build_registry(approver, host, allow_patterns)?;
+    if host.plan_mode {
+        registry.retain_read_only();
+    }
+    let skill_sections = apply_skills(
+        &host.skills,
+        host.workspace.as_ref(),
+        host.no_skills,
+        &mut registry,
+    )?;
+    // Opt-in tool-boundary hooks (issue #110): same wiring as `chat`.
+    #[cfg(feature = "shell-tools")]
+    if !host.on_pretool.is_empty() || !host.on_posttool.is_empty() || !host.on_turnend.is_empty() {
+        let mut hooks = tole_core::hooks::ToolHooks::from_cli(&host.on_pretool, &host.on_posttool);
+        hooks.turnend = host
+            .on_turnend
+            .iter()
+            .map(|c| tole_core::hooks::turnend_hook(c))
+            .collect();
+        registry.set_hooks(hooks);
+    }
+    let storage = match &resume {
+        Some(id) => {
+            JsonlStorage::open(session_path(sessions_dir, id)).context("replaying session log")?
+        }
+        None => {
+            std::fs::create_dir_all(sessions_dir)
+                .with_context(|| format!("creating {}", sessions_dir.display()))?;
+            let id = new_session_id();
+            let prompt = system
+                .map(str::to_string)
+                .or_else(resolve_system_prompt)
+                .unwrap_or_else(|| build_default_prompt(host.plan_mode));
+            let prompt = format!("{prompt}{}{skill_sections}", review_section(&registry));
+            let s = JsonlStorage::create_with(sessions_dir, &id, None, Some(&prompt))
+                .with_context(|| format!("creating session {id}"))?;
+            tole_cli::session_index::record(sessions_dir, &id, "tui");
+            s
+        }
+    };
+    tool_roster::register_todo(&mut registry, storage.entries(), host.plan_mode)?;
+    let session = tole_cli::tui_host::TuiSession::new(storage, registry, cfg, host.compaction);
+    let id = session.session_id().to_string();
+    tole_tui::run(&session, approvals).context("terminal ui")?;
+    println!("session {id} closed (resume: tole resume {id} \"…\")");
     Ok(())
 }
 

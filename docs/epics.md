@@ -242,7 +242,7 @@ Everything below is merged; CHANGELOG entries carry the detail.
     `sessions --tree` (#210); image input via `--image` (#212); Claude Code transcript
     import, `tole import-claude` (#381, import only).
 - **0.10.0 (planned):** `tole-tui`, a pi-style terminal UI — bare `tole` opens it; model,
-  reasoning effort, context size and tokens in the footer (epic #464, issues #457–#463).
+  reasoning effort, context size and tokens in the footer (epic #464, issues #457–#463). In `develop`: skeleton (#459) and the MVP (#460: streaming transcript, editor, footer, inline approvals, Esc cancel).
 - **Open backlog:** in-file session branching (#210 follow-up), MCP prompts/resources as quick commands (#213), background detach (#217; serve/MCP faces + job-completion nudge shipped, Ctrl-B/chat key waits for the TUI),
   attaching to a *running* Claude Code process (#381 remainder); the multi-client daemon note ([#382](daemon-design.md)) is parked.
 
