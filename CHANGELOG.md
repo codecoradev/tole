@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.10.0] — 2026-11-04
 
 ### Added
 - TUI steering, follow-up queue, collapsible output, `@file`, markdown and diff styling (#462): `Enter` while a turn runs pushes the draft on the existing soft-interrupt queue (#377), so the turn commits it as an attributed user message at its next safe point and continues (nothing is cancelled; a steer the turn never reached runs next, or returns to the editor after a cancel); `Alt+Enter` queues a follow-up shown as `queued: …` rows above the editor, the head runs after the turn ends with an answer (one at a time), `Alt+Up` pops the last back into the editor, and `Esc` / `Ctrl+C` cancel and return the whole queue to the editor. `Ctrl+O` expands/collapses tool output (multi-line results are collapsed to the first line plus `[+n lines · Ctrl+O]`), `Ctrl+T` hides/shows reasoning; both are UI state only. Typing `@` opens a file panel (depth ≤ 3, ≤ 2000 files listed, 50 shown, `Tab`/`Enter` insert the path); answers get minimal markdown styling (headings, `**bold**`, inline code, fenced code) and `+`/`-`/`@@` rows of tool output are green/red/dim, all sanitized before styling. Not included (deferred): tables, nested lists, italics and links in markdown; retroactive collapse of already-printed scrollback; diffs beyond the 200-character tool preview; `@` insertion at an in-buffer cursor.

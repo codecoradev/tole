@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-tole-core = { version = "0.9.0", path = "../tole-core", default-features = false }
+tole-core = { version = "0.10.0", path = "../tole-core", default-features = false }
 # Inline viewport only: no alternate screen, no widgets beyond the basics.
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 crossterm = { version = "0.29", default-features = false, features = ["events"] }
