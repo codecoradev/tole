@@ -27,7 +27,7 @@ use serde_json::{json, Value};
 use tole_core::storage::{JsonlStorage, Storage};
 use tole_core::subprocess::run_with_timeout;
 use tole_core::tool::ToolRegistry;
-use tole_core::turn::{run_turn, TurnOutcome};
+use tole_core::turn::{run_turn_with_images, TurnOutcome};
 
 /// The completion marker the mission system prompt pins: a final
 /// message containing this line declares the goal fully achieved.
@@ -97,6 +97,8 @@ pub struct MissionConfig {
     pub verify_timeout_secs: u64,
     /// Context compaction between chained turns (#440).
     pub compaction: tole_cli::compaction_host::CompactionSettings,
+    /// Images attached to the first turn only (#212).
+    pub images: Vec<tole_core::image::ImageRef>,
 }
 
 /// The mission addendum appended to the default system prompt.
@@ -307,7 +309,20 @@ pub fn run_mission(
         // Context compaction (#440): between chained turns, after the
         // budget checks; the summary call's tokens count toward them.
         compactor.before_turn(&mut storage, &mut *provider);
-        let outcome = match run_turn(&mut storage, &mut provider, &registry, &prompt) {
+        let first_images = if turns == 0 {
+            cfg.images.as_slice()
+        } else {
+            &[]
+        };
+        let outcome = match run_turn_with_images(
+            &mut storage,
+            &mut provider,
+            &registry,
+            &prompt,
+            first_images,
+            &tole_core::cancel::CancelToken::default(),
+            None,
+        ) {
             Ok(o) => o,
             Err(e) => {
                 // Storage-class failure: still summarize (the "either
@@ -583,19 +598,36 @@ mod verify_error_tests {
     #[test]
     fn mission_provider_sends_the_pinned_system_prompt_on_resume() {
         use tole_core::openai::{OpenAiConfig, OpenAiProvider};
-        let d = std::env::temp_dir().join(format!("tole-mission-sys-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!(
+            "tole-mission-sys-{}-{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         let sys = format!("base{}", mission_prompt("ship it", None));
-        let fresh = JsonlStorage::create_with(&d, "m1", None, Some(&sys)).unwrap();
         let cfg = || OpenAiConfig::new("https://x/v1", "m", "k");
-        for storage in [fresh, JsonlStorage::open(d.join("m1.jsonl")).unwrap()] {
-            let body = tole_cli::turn_runner::configure_provider(
-                OpenAiProvider::new(cfg()),
-                vec![],
-                storage.system_prompt(),
-                None,
-            )
-            .request_body(&[]);
+        // One handle at a time: a writable open holds the session lock, and
+        // the handle must be DROPPED before the loop's next iteration opens
+        // the same file again (the writer-lock contract, #488).
+        for reopen in [false, true] {
+            let body = {
+                let storage = if reopen {
+                    JsonlStorage::open(d.join("m1.jsonl")).unwrap()
+                } else {
+                    JsonlStorage::create_with(&d, "m1", None, Some(&sys)).unwrap()
+                };
+                tole_cli::turn_runner::configure_provider(
+                    OpenAiProvider::new(cfg()),
+                    vec![],
+                    storage.system_prompt(),
+                    None,
+                )
+                .request_body(&[])
+            };
             let first = &body["messages"][0];
             assert_eq!(first["role"], json!("system"), "{body}");
             assert!(

@@ -9,7 +9,7 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -30,6 +30,16 @@ fn tmpdir(tag: &str) -> PathBuf {
 /// `/models` lists model `m` with `models_window` (if any). Every chat
 /// request body is recorded.
 fn spawn_mock(models_window: Option<u64>) -> (String, Arc<Mutex<Vec<Value>>>) {
+    spawn_mock_with(models_window, Arc::new(AtomicBool::new(false)))
+}
+
+/// [`spawn_mock`] with an overflow switch (#481): while `overflow` is set,
+/// the next NON-summary chat request answers HTTP 400 `context_length_exceeded`
+/// (and the switch resets).
+fn spawn_mock_with(
+    models_window: Option<u64>,
+    overflow: Arc<AtomicBool>,
+) -> (String, Arc<Mutex<Vec<Value>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let seen = Arc::new(Mutex::new(Vec::new()));
@@ -37,6 +47,7 @@ fn spawn_mock(models_window: Option<u64>) -> (String, Arc<Mutex<Vec<Value>>>) {
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             let log = log.clone();
+            let overflow = overflow.clone();
             std::thread::spawn(move || {
                 let mut s = stream;
                 let mut buf = Vec::new();
@@ -75,6 +86,17 @@ fn spawn_mock(models_window: Option<u64>) -> (String, Arc<Mutex<Vec<Value>>>) {
                 } else {
                     log.lock().unwrap().push(body.clone());
                     let summarize = body.to_string().contains("Summarize the conversation");
+                    if !summarize && overflow.swap(false, Ordering::SeqCst) {
+                        let err = json!({"error": {"message": "This model's maximum context \
+                            length is 10000 tokens", "code": "context_length_exceeded"}})
+                        .to_string();
+                        let resp = format!(
+                            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{err}",
+                            err.len()
+                        );
+                        let _ = s.write_all(resp.as_bytes());
+                        return;
+                    }
                     let text = if summarize { "SUMMARY-TEXT" } else { "answer" };
                     if body["stream"].as_bool() == Some(true) {
                         let mut out = String::new();
@@ -220,4 +242,100 @@ fn no_compaction_and_no_window_leave_the_wire_whole() {
         &[],
     );
     assert!(!o.status.success());
+}
+
+/// #481 acceptance: the provider answers `context_length_exceeded` mid-way
+/// (no window is known anywhere, so ordinary compaction is off). The turn
+/// ends with the provider's message and the recovery hint; the NEXT
+/// `resume <id> "<prompt>"` compacts first, then runs the prompt and
+/// succeeds. Compaction never happens inside the failed turn.
+#[test]
+fn an_overflow_ends_the_turn_and_the_next_resume_compacts_first() {
+    let overflow = Arc::new(AtomicBool::new(false));
+    let (url, seen) = spawn_mock_with(None, overflow.clone());
+    let d = tmpdir("overflow");
+    let o = tole(&d, &url, &["run", "first question about apples"], &[]);
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    let id = text(&o.stdout)
+        .lines()
+        .find_map(|l| l.strip_prefix("session: ").map(str::to_string))
+        .unwrap();
+    let o = tole(&d, &url, &["resume", &id, "second question"], &[]);
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    let file = || std::fs::read_to_string(d.join(format!(".tole/sessions/{id}.jsonl"))).unwrap();
+
+    // Turn 3 overflows.
+    overflow.store(true, Ordering::SeqCst);
+    let before = seen.lock().unwrap().len();
+    let o = tole(&d, &url, &["resume", &id, "third question"], &[]);
+    let err = text(&o.stderr);
+    assert_eq!(o.status.code(), Some(4), "{err}");
+    assert!(
+        err.contains("context_length_exceeded"),
+        "provider message: {err}"
+    );
+    assert!(
+        err.contains("compaction will run on the next resume"),
+        "{err}"
+    );
+    assert!(!file().contains("\"compaction\""), "no mid-turn compaction");
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        before + 1,
+        "no retry, no summary call"
+    );
+    assert!(file().contains("context_overflow"), "the flag is durable");
+
+    // Next resume with a prompt: compacts FIRST, then answers.
+    let o = tole(&d, &url, &["resume", &id, "fourth question"], &[]);
+    let err = text(&o.stderr);
+    assert!(o.status.success(), "{err}");
+    assert!(err.contains("tole: context compacted"), "{err}");
+    let f = file();
+    assert!(f.contains("\"compaction\""), "the pass is durable");
+    let sent = seen.lock().unwrap();
+    let wire = sent.last().unwrap().to_string();
+    assert!(
+        wire.contains("SUMMARY-TEXT") && wire.contains("fourth question"),
+        "{wire}"
+    );
+    assert!(!wire.contains("apples"), "turn 1 left the wire: {wire}");
+    drop(sent);
+
+    // The flag is spent: a further resume does not compact again.
+    let o = tole(&d, &url, &["resume", &id, "fifth question"], &[]);
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    assert!(!text(&o.stderr).contains("context compacted"));
+    assert_eq!(file().matches("\"type\":\"compaction\"").count(), 1);
+}
+
+/// #481: `doctor --tier catalog` warns (exit 0) when no window is known,
+/// and is quiet when the catalog or the setting supplies one.
+#[test]
+fn doctor_warns_non_fatally_about_a_missing_window() {
+    let run = |window: Option<u64>, extra: &[(&str, &str)]| {
+        let (url, _) = spawn_mock(window);
+        let o = tole(
+            &tmpdir("doctor"),
+            &url,
+            &["doctor", "--tier", "catalog", "--no-ledger"],
+            extra,
+        );
+        (o.status.code(), text(&o.stdout))
+    };
+    let (code, out) = run(None, &[]);
+    assert_eq!(code, Some(0), "{out}");
+    assert!(out.contains("catalog: m is served"), "{out}");
+    assert!(
+        out.contains("context window") && out.contains("TOLE_CONTEXT_WINDOW"),
+        "{out}"
+    );
+    for (w, extra) in [
+        (Some(10_000), vec![]),
+        (None, vec![("TOLE_CONTEXT_WINDOW", "10000")]),
+    ] {
+        let (code, out) = run(w, &extra);
+        assert_eq!(code, Some(0), "{out}");
+        assert!(!out.contains("  ! "), "{out}");
+    }
 }

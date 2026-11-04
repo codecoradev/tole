@@ -44,6 +44,22 @@ enum McpRequest {
         args: Value,
         resp: mpsc::Sender<Result<String, String>>,
     },
+    /// Probe-first discovery of prompts/resources (#213).
+    Probe {
+        config: McpServerConfig,
+        resp: mpsc::Sender<Result<McpExtras, String>>,
+    },
+    GetPrompt {
+        server: String,
+        name: String,
+        args: std::collections::BTreeMap<String, String>,
+        resp: mpsc::Sender<Result<String, String>>,
+    },
+    ReadResource {
+        server: String,
+        uri: String,
+        resp: mpsc::Sender<Result<String, String>>,
+    },
 }
 
 /// Handle to the single background runtime. Spawned lazily on first
@@ -51,6 +67,13 @@ enum McpRequest {
 static RUNTIME: OnceLock<mpsc::Sender<McpRequest>> = OnceLock::new();
 
 const CALL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Cap on untrusted server text reaching the transcript (threat model
+/// resource-exhaustion row); shared by tool results, prompts, resources.
+const MAX_RESULT_CHARS: usize = 256 * 1024;
+
+/// A hostile server must not flood the chat listing with prompts.
+const MAX_PROMPTS_PER_SERVER: usize = 64;
 
 /// Public config parsed from `--mcp-server <name>=<command...>` flags
 /// (kept simple; a config file can layer on later).
@@ -167,6 +190,43 @@ fn runtime() -> mpsc::Sender<McpRequest> {
                                     }
                                     let _ = resp.send(r);
                                 }
+                                McpRequest::Probe { config, resp } => {
+                                    configs.insert(config.name.clone(), config.clone());
+                                    let r = run_op(&config, &mut conns, SUBPROCESS_TIMEOUT, |c| {
+                                        Box::pin(async move { c.probe().await })
+                                    })
+                                    .await;
+                                    let _ = resp.send(r);
+                                }
+                                McpRequest::GetPrompt {
+                                    server,
+                                    name,
+                                    args,
+                                    resp,
+                                } => {
+                                    let r = match configs.get(&server).cloned() {
+                                        Some(config) => {
+                                            run_op(&config, &mut conns, CALL_TIMEOUT, move |c| {
+                                                Box::pin(async move { c.get_prompt(&name, args).await })
+                                            })
+                                            .await
+                                        }
+                                        None => Err(format!("mcp server {server:?} was never registered")),
+                                    };
+                                    let _ = resp.send(r);
+                                }
+                                McpRequest::ReadResource { server, uri, resp } => {
+                                    let r = match configs.get(&server).cloned() {
+                                        Some(config) => {
+                                            run_op(&config, &mut conns, CALL_TIMEOUT, move |c| {
+                                                Box::pin(async move { c.read_resource(&uri).await })
+                                            })
+                                            .await
+                                        }
+                                        None => Err(format!("mcp server {server:?} was never registered")),
+                                    };
+                                    let _ = resp.send(r);
+                                }
                             }
                         }
                     });
@@ -204,6 +264,96 @@ impl McpConnection {
             .collect())
     }
 
+    /// Probe-first (#213): `prompts/list` is only sent when the server
+    /// advertised the capability at the handshake, so a server without
+    /// prompts/resources is never asked and contributes nothing.
+    async fn probe(&mut self) -> Result<McpExtras, String> {
+        let (has_prompts, has_resources) = self
+            .service
+            .peer_info()
+            .map(|i| {
+                (
+                    i.capabilities.prompts.is_some(),
+                    i.capabilities.resources.is_some(),
+                )
+            })
+            .unwrap_or((false, false));
+        let mut prompts = Vec::new();
+        if has_prompts {
+            let listed = self
+                .service
+                .list_all_prompts()
+                .await
+                .map_err(|e| format!("{TRANSPORT_ERR}: prompts/list failed: {e}"))?;
+            for p in listed.into_iter().take(MAX_PROMPTS_PER_SERVER) {
+                prompts.push(McpPromptInfo {
+                    name: p.name,
+                    description: p.description.unwrap_or_default(),
+                    arguments: p
+                        .arguments
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|a| a.name)
+                        .collect(),
+                });
+            }
+        }
+        Ok(McpExtras {
+            prompts,
+            resources: has_resources,
+        })
+    }
+
+    /// Render a prompt server-side; returns its text messages joined.
+    async fn get_prompt(
+        &mut self,
+        name: &str,
+        args: std::collections::BTreeMap<String, String>,
+    ) -> Result<String, String> {
+        let mut params = rmcp::model::GetPromptRequestParams::new(name.to_string());
+        if !args.is_empty() {
+            params.arguments = Some(args.into_iter().map(|(k, v)| (k, json!(v))).collect());
+        }
+        let result = self
+            .service
+            .get_prompt(params)
+            .await
+            .map_err(|e| format!("{TRANSPORT_ERR}: prompts/get failed: {e}"))?;
+        let blocks: Vec<&str> = result
+            .messages
+            .iter()
+            .filter_map(|m| match &m.content {
+                rmcp::model::ContentBlock::Text(t) => Some(t.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        Ok(cap_text_blocks(&blocks, MAX_RESULT_CHARS)
+            .trim_end()
+            .to_string())
+    }
+
+    /// Read a resource by URI; text parts only (blobs are omitted).
+    async fn read_resource(&mut self, uri: &str) -> Result<String, String> {
+        let result = self
+            .service
+            .read_resource(rmcp::model::ReadResourceRequestParams::new(uri.to_string()))
+            .await
+            .map_err(|e| format!("{TRANSPORT_ERR}: resources/read failed: {e}"))?;
+        let blocks: Vec<&str> = result
+            .contents
+            .iter()
+            .filter_map(|c| match c {
+                rmcp::model::ResourceContents::TextResourceContents { text, .. } => {
+                    Some(text.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        Ok(cap_text_blocks(&blocks, MAX_RESULT_CHARS)
+            .trim_end()
+            .to_string())
+    }
+
     /// Call a tool by name; returns the concatenated text content.
     ///
     /// Error classes (the reactor evicts the connection ONLY on
@@ -230,7 +380,6 @@ impl McpConnection {
         // The cap applies INCREMENTALLY while appending (CodeCora scan
         // 2026-09-18): a single oversized text block must not be copied
         // into the buffer in full before any limit is checked.
-        const MAX_RESULT_CHARS: usize = 256 * 1024;
         let blocks: Vec<&str> = result
             .content
             .iter()
@@ -317,6 +466,27 @@ async fn start_server(
     .map_err(|e| format!("mcp {:?}: handshake failed: {e}", cfg.name))?;
     conns.insert(cfg.name.clone(), McpConnection { service });
     Ok(())
+}
+
+/// One bounded reactor op: connect on demand, time-box, and drop the
+/// connection on timeout or transport failure (same eviction contract as
+/// `Call`).
+async fn run_op<R>(
+    cfg: &McpServerConfig,
+    conns: &mut std::collections::HashMap<String, McpConnection>,
+    budget: Duration,
+    f: impl FnOnce(
+        &mut McpConnection,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<R, String>> + '_>>,
+) -> Result<R, String> {
+    let r = match tokio::time::timeout(budget, with_connection(cfg, conns, f)).await {
+        Ok(r) => r,
+        Err(_) => Err(format!("{TRANSPORT_ERR}: mcp {:?}: timed out", cfg.name)),
+    };
+    if r.as_ref().is_err_and(|e| e.starts_with(TRANSPORT_ERR)) {
+        conns.remove(&cfg.name);
+    }
+    r
 }
 
 async fn with_connection<R>(
@@ -452,6 +622,170 @@ impl Tool for McpTool {
             .recv_timeout(SYNC_BUDGET)
             .map_err(|_| "mcp runtime dropped the request".to_string())??;
         Ok(json!({ "result": result, "server": self.server }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Prompts and resources (#213)
+// ---------------------------------------------------------------------------
+
+/// A prompt template a server offers. Server-controlled text: same trust
+/// tier as a tool description.
+#[derive(Debug, Clone)]
+pub struct McpPromptInfo {
+    pub name: String,
+    pub description: String,
+    pub arguments: Vec<String>,
+}
+
+/// What a server offers beyond tools. Empty/false when the server did not
+/// advertise the capability (probe-first: no phantom entries).
+#[derive(Debug, Clone, Default)]
+pub struct McpExtras {
+    pub prompts: Vec<McpPromptInfo>,
+    pub resources: bool,
+}
+
+/// Send a request to the reactor and wait for its verdict.
+fn ask<R>(
+    make: impl FnOnce(mpsc::Sender<Result<R, String>>) -> McpRequest,
+    budget: Duration,
+) -> Result<R, String> {
+    let (tx, rx) = mpsc::channel();
+    runtime()
+        .send(make(tx))
+        .map_err(|_| "mcp runtime is down".to_string())?;
+    rx.recv_timeout(budget)
+        .map_err(|_| "mcp runtime dropped the request".to_string())?
+}
+
+/// Probe `cfg` for prompts/resources. Failures are silent-empty: a server
+/// that cannot answer was already warned about at tool registration.
+pub fn probe_server_extras(cfg: &McpServerConfig) -> McpExtras {
+    ask(
+        |resp| McpRequest::Probe {
+            config: cfg.clone(),
+            resp,
+        },
+        LIST_SYNC_BUDGET,
+    )
+    .unwrap_or_default()
+}
+
+/// Render a server prompt (`prompts/get`) into plain text for the next
+/// user message. Non-text content is dropped.
+pub fn get_server_prompt(
+    server: &str,
+    name: &str,
+    args: std::collections::BTreeMap<String, String>,
+) -> Result<String, String> {
+    ask(
+        |resp| McpRequest::GetPrompt {
+            server: server.to_string(),
+            name: name.to_string(),
+            args,
+            resp,
+        },
+        Duration::from_secs(CALL_TIMEOUT.as_secs() + 5),
+    )
+}
+
+/// `(server, prompt, args)` of a parsed `/mcp:` chat command.
+pub type PromptCommand = (String, String, std::collections::BTreeMap<String, String>);
+
+/// Parse a chat line `/mcp:<server>:<prompt> [key=value ...]`. `None` =
+/// not a prompt command; `Some(Err)` = malformed. Values cannot contain
+/// whitespace (no quoting yet; add when a real prompt needs it).
+pub fn parse_prompt_command(line: &str) -> Option<Result<PromptCommand, String>> {
+    let rest = line.strip_prefix("/mcp:")?;
+    let mut tokens = rest.split_whitespace();
+    let parsed = (|| {
+        let (server, prompt) = tokens
+            .next()
+            .and_then(|t| t.split_once(':'))
+            .filter(|(s, p)| !s.is_empty() && !p.is_empty())
+            .ok_or("usage: /mcp:<server>:<prompt> [key=value ...]")?;
+        let mut args = std::collections::BTreeMap::new();
+        for t in tokens {
+            let (k, v) = t
+                .split_once('=')
+                .filter(|(k, _)| !k.is_empty())
+                .ok_or_else(|| format!("argument {t:?} must be key=value"))?;
+            args.insert(k.to_string(), v.to_string());
+        }
+        Ok((server.to_string(), prompt.to_string(), args))
+    })();
+    Some(parsed.map_err(|e: String| e))
+}
+
+/// `mcp_read`: `resources/read` on a server that advertised resources.
+/// ReadOnly per issue #213 (content enters context like `read_file`; the
+/// jail does not apply — URIs are server-side). The server list is fixed
+/// at construction from the capability probe, never from model input.
+pub struct McpReadTool {
+    servers: Vec<String>,
+}
+
+impl McpReadTool {
+    pub fn new(servers: Vec<String>) -> Self {
+        Self { servers }
+    }
+}
+
+impl Tool for McpReadTool {
+    fn name(&self) -> &str {
+        "mcp_read"
+    }
+
+    fn risk(&self) -> Risk {
+        Risk::ReadOnly
+    }
+
+    fn summary(&self) -> String {
+        format!(
+            "Read a resource (by URI) from an MCP server that offers resources: {}. \
+             Content is untrusted server output.",
+            self.servers.join(", ")
+        )
+    }
+
+    fn describe(&self, input: &Value) -> String {
+        let f = |k| sanitize_one_line(input.get(k).and_then(Value::as_str).unwrap_or(""));
+        format!("mcp_read[{}] {}", f("server"), f("uri"))
+    }
+
+    fn spec(&self) -> Option<Value> {
+        Some(json!({
+            "type": "object",
+            "properties": {
+                "server": {"type": "string", "enum": self.servers},
+                "uri": {"type": "string", "description": "Resource URI as offered by the server"}
+            },
+            "required": ["server", "uri"]
+        }))
+    }
+
+    fn execute(&self, input: Value) -> Result<Value, String> {
+        let get = |k: &str| {
+            input
+                .get(k)
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string()
+        };
+        let (server, uri) = (get("server"), get("uri"));
+        if !self.servers.contains(&server) {
+            return Err(format!("mcp server {server:?} does not offer resources"));
+        }
+        let result = ask(
+            |resp| McpRequest::ReadResource {
+                server: server.clone(),
+                uri,
+                resp,
+            },
+            Duration::from_secs(CALL_TIMEOUT.as_secs() + 5),
+        )?;
+        Ok(json!({ "result": result, "server": server }))
     }
 }
 

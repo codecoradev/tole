@@ -31,6 +31,7 @@
 pub mod agents;
 pub mod approval;
 pub mod cancel;
+pub mod ccimport;
 pub mod child_env;
 pub mod compaction;
 #[cfg(feature = "shell-tools")]
@@ -46,6 +47,7 @@ pub mod gh;
 pub mod git;
 pub mod gitea;
 pub mod handoff;
+pub mod image;
 pub mod interrupt;
 pub mod systemone;
 pub mod todo;

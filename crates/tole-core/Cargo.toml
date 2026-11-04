@@ -27,8 +27,13 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
+base64 = "0.23"
 ureq = { workspace = true }
 
 [[test]]
 name = "mcp_tests"
+required-features = ["mcp"]
+
+[[test]]
+name = "mcp_prompts"
 required-features = ["mcp"]

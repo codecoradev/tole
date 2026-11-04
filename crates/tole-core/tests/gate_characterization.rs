@@ -31,6 +31,11 @@ use tole_core::turn::{
     resume_turn, resume_turn_with_cancel, run_turn, run_turn_with_cancel, TurnOutcome,
 };
 
+/// Replay-denied settlement wording (#476): the outcome is UNKNOWN.
+const REPLAY_DENIED: &str = "replay denied: no fresh approval for a guarded effect — the outcome is UNKNOWN: the effect may have run before the interruption; check state before retrying";
+#[cfg(feature = "shell-tools")]
+const REPLAY_HOOK_DENIED: &str = "replay denied by pre-hook: denied by pretool hook: nope — the outcome is UNKNOWN: the effect may have run before the interruption; check state before retrying";
+
 // ---------------------------------------------------------------------------
 // Fixtures
 // ---------------------------------------------------------------------------
@@ -530,10 +535,7 @@ fn gate_char_replay_guarded_deny_settles_err_and_records_approval_required() {
     );
     assert_eq!(r.consulted(), 1);
     assert_eq!(r.runs(), 0);
-    assert_eq!(
-        settle_errors(&s),
-        vec!["replay denied: no fresh approval for a guarded effect"]
-    );
+    assert_eq!(settle_errors(&s), vec![REPLAY_DENIED]);
     assert_eq!(
         turn_errors(&s),
         vec![(
@@ -584,10 +586,7 @@ fn gate_char_replay_idempotent_recorded_but_now_write_still_hits_the_gate() {
     );
     assert_eq!(r.consulted(), 1, "approver must be asked");
     assert_eq!(r.runs(), 0);
-    assert_eq!(
-        settle_errors(&s),
-        vec!["replay denied: no fresh approval for a guarded effect"]
-    );
+    assert_eq!(settle_errors(&s), vec![REPLAY_DENIED]);
     assert_eq!(
         turn_errors(&s),
         vec![(
@@ -746,10 +745,7 @@ fn gate_char_replay_pre_hook_deny_after_approval() {
     assert!(marker.exists());
     assert_eq!(r.consulted(), 1);
     assert_eq!(r.runs(), 0);
-    assert_eq!(
-        settle_errors(&s),
-        vec!["replay denied by pre-hook: denied by pretool hook: nope"]
-    );
+    assert_eq!(settle_errors(&s), vec![REPLAY_HOOK_DENIED]);
     assert_eq!(
         turn_errors(&s),
         vec![(
@@ -774,10 +770,7 @@ fn gate_char_replay_order_approver_before_pre_hook() {
         "{out:?}"
     );
     assert!(!marker.exists(), "hook ran despite denied approval");
-    assert_eq!(
-        settle_errors(&s),
-        vec!["replay denied: no fresh approval for a guarded effect"]
-    );
+    assert_eq!(settle_errors(&s), vec![REPLAY_DENIED]);
     assert_eq!(
         turn_errors(&s),
         vec![(

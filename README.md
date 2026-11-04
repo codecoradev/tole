@@ -9,13 +9,14 @@ Durable Rust agent harness: a conversational agent with risk-tiered approval
 gates, a write-once JSONL session log, and a register state machine — resumable
 after crashes, replayable forever.
 
-**Status:** v0.9.0 is the latest release: `tole doctor`, soft interrupts, per-turn token stats, sibling change notices and the typed child-agent handoff, a provider failover chain, the user config layer, `--trust workspace`, command-level allow/deny patterns, a global session index (`sessions --all`) and context compaction, plus the 0.8.2 `tole serve` hardening (see the CHANGELOG). `develop` is working toward 0.10.0, a pi-style terminal UI (`tole-tui`, #464). v0.8.1 itself brought token-usage reporting and a capped, resumable `read_file` (#211), on top of v0.8.0, which added the per-project config `.tole/config.toml`
+**Status:** v0.9.0 is the latest release: `tole doctor`, soft interrupts, per-turn token stats, sibling change notices and the typed child-agent handoff, a provider failover chain, the user config layer, `--trust workspace`, command-level allow/deny patterns, a global session index (`sessions --all`) and context compaction, plus the 0.8.2 `tole serve` hardening (see the CHANGELOG). `develop` is working toward 0.10.0, a pi-style terminal UI: the `tole-tui` is in and daily-usable — bare `tole` on a TTY opens an inline UI with a streaming transcript, a multi-line editor, a footer, inline approvals and Esc-cancel; slash commands (`/compact` `/new` `/resume` `/session` `/name`), the model picker and thinking-level cycling (#461); steering, a follow-up queue, `@file`, collapsible tool output and markdown/diff styling (#462), `--effort` reasoning effort and the `tole status [id]` snapshot (model, effort, context used/window, tokens, compactions) shipped, and the multi-client daemon is design-only and parked ([docs/daemon-design.md](docs/daemon-design.md)). v0.8.1 itself brought token-usage reporting and a capped, resumable `read_file` (#211), on top of v0.8.0, which added the per-project config `.tole/config.toml`
 (trusted before it applies; see the Configuration section) on top of v0.7.x
 (rescan-2 hardening, one tool-call authorization gate; see the CHANGELOG for
-the behavior changes). Four faces on one durable core: the CLI (run / chat /
+the behavior changes). Five faces on one durable core: the CLI (run / chat /
 resume / sessions / jobs / **mission**), `tole mcp` (tool server),
-`tole acp` (editor agent), and `tole serve` (REST + multi-session
-MCP-over-HTTP daemon). Identity (owner-approved): a chat-first
+`tole acp` (editor agent), `tole serve` (REST + multi-session
+MCP-over-HTTP daemon), and the inline terminal UI (`tole-tui`, bare
+`tole` on a TTY; MVP stage, [docs/tui.md](docs/tui.md)). Identity (owner-approved): a chat-first
 personal assistant WITH a mission mode for autonomous work —
 budgeted turn-chaining (`tole mission --max-steps/--max-minutes/
 --max-tokens/--verify`), durable task-list tools (`todo_write`/
@@ -49,7 +50,10 @@ tole is the agent harness of the CodeCora ecosystem — the hands:
   `tole doctor` reports each one as supported, too old (with the upgrade
   command) or not installed.
 - Anything else that speaks **MCP over stdio** joins the same registry via
-  repeatable `--mcp-server name=command [args...]` flags.
+  repeatable `--mcp-server name=command [args...]` flags. Servers that
+  offer prompts show up in `tole chat` as `/mcp:<server>:<prompt> [k=v ...]`
+  (rendered server-side, sent as your next message); servers that offer
+  resources add a ReadOnly `mcp_read` tool. Servers with neither add nothing.
 - **tole as an MCP server**: `tole mcp` serves the registry's hardened tools
   (jailed file ops, git, jobs, memory) to any MCP client. ReadOnly tools are
   always callable; Write tools require `--allow` patterns; Destructive tools
@@ -71,9 +75,13 @@ tole is the agent harness of the CodeCora ecosystem — the hands:
   without losing its work: the `{"text", "urgent"}` message is injected at
   the turn's next safe point as an attributed entry (`409` when no turn
   is running).
+  `POST /sessions/{id}/detach` (#217) stops waiting without aborting: the
+  running tool settles, the turn ends `stopReason: "detached"` (resumable),
+  and background jobs keep running and nudge the session when they finish
+  (`409` when no turn is running).
   `--transport mcp` (issue #137) serves **multi-session MCP over
   Streamable HTTP** instead: one authenticated MCP connection addresses N
-  durable tole sessions (`tole_session_new/prompt/cancel/interrupt/status/list` +
+  durable tole sessions (`tole_session_new/prompt/cancel/interrupt/detach/status/list` +
   the registry tools routed to each session's workspace jail).
 
 Every ecosystem integration is probe-first: a missing binary degrades to a
@@ -100,13 +108,17 @@ export TOLE_MODEL=gpt-4o-mini
 export TOLE_API_KEY=...
 
 tole run "summarize the last commit"        # one durable turn
+tole                                        # terminal UI: bare `tole` on a TTY opens it (streaming transcript, approvals, slash commands)
 tole chat                                   # multi-turn REPL on one durable session
 tole chat --memory uteke                    # …with cross-session memory
 tole chat --resume <id>                     # pick the thread back up (also: --last)
 tole resume <id> "next instruction"         # continue a settled session
 tole sessions                               # list durable sessions
 tole sessions --all [--grep <text>]         # every project's sessions + where they live
-tole status <id>                            # pc / seq / turns / token + cache usage / request-size split
+tole sessions --tree                        # sessions with their forks nested
+tole branch <id> [--at <entry>]             # fork a session at a settled entry, then resume the fork
+tole import-claude <transcript.jsonl>       # import a Claude Code session as cc-<id>, then resume it
+tole status [id]                            # pc / seq / turns / token + cache usage / request-size split; model, effort, context used/window, tokens, compactions (default: latest session)
 ```
 
 Sessions live in `.tole/sessions/<id>.jsonl` (override with
@@ -122,7 +134,9 @@ arguments", the program is matched literally; a leading `!` denies and wins
 over every allow and `--yes`, e.g. `--allow '!run_command:rm *'`; with a
 command deny set, only commands an explicit `run_command:` allow names run
 unattended — everything else asks),
-`--yes` (auto-allow every Write; Destructive still prompts), `--mcp-server`,
+`--yes` (auto-allow every Write; Destructive still prompts), `--effort <minimal|low|medium|high>`
+(reasoning effort sent as `reasoning_effort`; session register beats it across resumes),
+`--mcp-server`,
 `--no-auto-mcp` (skip the cora auto-preset), `--trust <preset>` (one-word
 trust: `internal` / `read_only` / `workspace` — `read_only` plus
 `write_file`/`edit_file` auto-allowed only inside an explicit
@@ -141,12 +155,42 @@ Not a sandbox: review what it wrote before you run it), `--skill <path>` (load a
 | `TOLE_BASE_URL`, `TOLE_MODEL`, `TOLE_API_KEY` | LLM provider — any OpenAI-compatible endpoint (`OPENAI_*` equivalents read as fallback) |
 | `TOLE_FALLBACK_BASE_URL`, `TOLE_FALLBACK_API_KEY`, `TOLE_FALLBACK_MODEL` | optional reserve provider (#209): a step that fails because the primary is unavailable (connection failure, timeout, 5xx, 429) is retried on the reserve, and the switch is recorded in the session log (`tole_route`). The reserve needs its own key (the primary's is never sent to another host); the model defaults to the primary's. Request errors (401/403/404/400) never fail over |
 | `TOLE_SYSTEM_PROMPT` | default persona when `--system` is absent |
-| `TOLE_CONTEXT_WINDOW` | the model's context window in tokens, for context compaction (#440). Without it, tole reads the window from the provider's `/models` (`context_length`, `max_model_len`, ...) once a prompt passes 8k tokens; with neither, compaction stays off. `chat`, `resume` and `mission` compact between turns once a prompt reaches `--compact-at` (default 0.8) of the window: the settled turns before the last one become one durable `compaction` entry (a fenced summary), the session file keeps everything, and `tole status` lists each compaction. `--no-compaction` (or config `no_compaction = true`) turns it off; config keys `context_window`, `compact_at` |
+| `TOLE_CONTEXT_WINDOW` | the model's context window in tokens, for context compaction (#440). Without it, tole reads the window from the provider's `/models` (`context_length`, `max_model_len`, ...) once a prompt passes 8k tokens; with neither, compaction stays off. `chat`, `resume` and `mission` compact between turns once a prompt reaches `--compact-at` (default 0.8) of the window: the settled turns before the last one become one durable `compaction` entry (a fenced summary), the session file keeps everything, and `tole status` lists each compaction. `--no-compaction` (or config `no_compaction = true`) turns it off; config keys `context_window`, `compact_at`. **Gateways whose `/models` carries no window** (the fleet gateway lists only `id`, `created`, `owned_by`) never compact on their own: set `TOLE_CONTEXT_WINDOW` (e.g. `200000`); `tole doctor --tier catalog` warns when no window is known. **Overflow recovery:** if the provider rejects a request as larger than its context window (HTTP 400/413/422 `context_length_exceeded`, "maximum context length", ...) the turn ends with the provider's message and `(compaction will run on the next resume)`; the next `resume <id> "<prompt>"` (or the next `chat` message) first forces one compaction pass — whatever the window or threshold — then runs the prompt. Compaction stays between turns, never inside one; `--no-compaction` also disables the recovery pass. The turn that overflowed is kept verbatim, so if it alone exceeds the window, ask for less output per turn |
+| `TOLE_REASONING_EFFORT` | reasoning effort sent as `reasoning_effort` on chat completions (#457): `minimal`, `low`, `medium` or `high`; unset (default) sends nothing, so the request body is unchanged. Also `--effort <level>` (flag > env > config `reasoning_effort` > user config). A session's durable `fact/reasoning_effort` register overrides it, so a session keeps its level on resume. A provider that answers HTTP 400 naming `reasoning_effort` gets ONE retry without it (remembered for the rest of the turn and recorded under `tole_degraded` in the step's usage row); an invalid level is a startup error. `tole config check` shows the effective value and its source |
+| `TOLE_VISION` | `0` declares the model non-vision: image input (`--image`) fails with a model-capability error before any request; `1` declares it vision-capable. Unset = the server decides (a 400/415/422 that names images becomes the same capability error) |
 | `TOLE_SKILL` | skill files to preload (`SKILL.md` paths, separated like `PATH`); same as repeated `--skill`, which replaces it; refused by the server faces like `--skill` |
 | `TOLE_MEMORY` | memory loop backend (`uteke`) — same as `--memory uteke` |
 | `TOLE_NO_UPDATE_CHECK` | `1` disables the startup update-check banner (issue #220) |
 | `TOLE_VERBOSE` | `1` prints the startup probe misses (uteke / cora binary not found, no GitHub origin), which are silent by default; `tole doctor` reports the sibling binaries either way |
 | `TOLE_MEMORY_NAMESPACE` | override the loop's uteke room (default: `repo-<directory name>`; the name predates rooms) |
+
+### Image input
+
+`tole run|chat|mission --image <path|data-url>` (repeatable) attaches images to the first message
+(#212). A path must resolve **inside the workspace jail** (symlinks and `..` escapes are refused);
+an inline `data:image/…;base64,…` URL is spilled to `~/.codecora/tole/images/` first. PNG, JPEG,
+GIF and WebP (sniffed from the bytes), 10 MiB each. The wire carries OpenAI-compatible
+`image_url` content parts; the session log stores only the reference (`path`, `mime`, `bytes`,
+`fnv1a64`), and every later step — including `resume` — re-reads the file, re-checking the jail and
+the hash (a changed or missing file reaches the model as an `[image unavailable: …]` note, never
+silently). Images are input, not tools: no approval is involved. They cost tokens on every step
+(the data URL counts in the request's `tole_wire.history_chars`). Needs a vision model; a
+non-vision model is a loud `model-capability` error, not a dropped image.
+
+### Provider retries
+
+A transient provider failure is retried inside the turn, up to 3 times
+(4 attempts), before the turn fails: HTTP 429, any 5xx, connection or
+timeout errors, a stream read failure and an empty completion (no content and
+no tool calls, streaming or not). Waits are 1 s, 2 s, 4 s plus up to 25%
+jitter; a `Retry-After` header in seconds replaces the wait, capped at 30 s.
+Other 4xx errors (auth, model, invalid request) fail immediately. Each retry
+is written to the session log as a `provider transient failure, retrying`
+error entry before the wait, the wait ends early on cancel (Esc, ACP
+`session/cancel`), and the budget is per turn, not per step. With a reserve
+provider (#209) a failed step still fails over first; retries run when every
+provider in the chain has failed. An empty completion that outlasts its
+retries fails the turn without trying the reserve.
 
 ## Provider doctor
 
@@ -155,7 +199,7 @@ Not a sandbox: review what it wrote before you run it), `--skill <path>` (load a
 | `--tier` | Checks |
 |----------|--------|
 | `offline` | config resolves, base URL shape, key present (no network) |
-| `catalog` (default) | live `GET /models`; the configured model must be served |
+| `catalog` (default) | live `GET /models`; the configured model must be served. Also warns (`!`, exit code unchanged) when no context window is known for it — compaction then stays off until `TOLE_CONTEXT_WINDOW` / `context_window` is set |
 | `full` | a chat call, a streamed call and a real tool-call loop (spends a few tokens) |
 
 Tiers are cumulative and stop at the first blocker, which is printed with

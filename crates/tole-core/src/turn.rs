@@ -13,7 +13,8 @@ use crate::gate::{self, Denied};
 use serde_json::{json, Value};
 
 use crate::machine::{
-    begin, finish, resume, settle_err, settle_ok, EffectHandle, ReplaySafety, Resume,
+    begin, begin_batch_member, finish, resume, settle_err, settle_ok, settle_ok_deferred,
+    EffectHandle, ReplaySafety, Resume,
 };
 use crate::provider::{Provider, ProviderError, ProviderOutput};
 use crate::register::RegisterWrite;
@@ -21,6 +22,7 @@ use crate::state::{Pc, StateTransition};
 use crate::storage::{Commit, Storage, StorageError, UsageRecord};
 use crate::tool::{Risk, ToolRegistry};
 use crate::transcript;
+use std::time::{Duration, Instant};
 
 /// Hard ceiling on provider steps in one turn (loop-guard).
 pub const MAX_STEPS: usize = 32;
@@ -48,13 +50,58 @@ pub fn is_poll_tool(registry: &ToolRegistry, name: &str) -> bool {
     registry.get(name).is_some_and(|t| t.is_poll())
 }
 
-/// One automatic retry for a timeout-classified provider failure per
-/// turn (issue #58): missions have died to a transient gateway timeout
-/// before any tool ran, while the same session completed end-to-end on a
-/// manual resume. The retry is a pure re-read — a failed provider step
-/// commits nothing, so the transcript is unchanged and the durable log
-/// records the retry decision before it happens.
-pub const PROVIDER_TIMEOUT_RETRIES: usize = 1;
+/// Automatic retries for a transient provider failure per turn (issues #58,
+/// #478): missions have died to a transient gateway failure before any tool
+/// ran, while the same session completed end-to-end on a manual resume. The
+/// retry is a pure re-read — a failed provider step commits nothing, so the
+/// transcript is unchanged and the durable log records the retry decision
+/// before it happens. Waits back off 1/2/4 s (plus jitter) unless the
+/// provider sent `Retry-After`.
+pub const PROVIDER_TIMEOUT_RETRIES: usize = 3;
+
+/// Longest single backoff wait, `Retry-After` included (#478).
+const MAX_RETRY_WAIT: Duration = Duration::from_secs(30);
+
+/// Backoff slice: a cancel is noticed within this long during a wait.
+const RETRY_SLICE: Duration = Duration::from_secs(1);
+
+/// Wait before retry number `used + 1` (`used` = retries already spent this
+/// turn). A `(retry-after: N)` marker in the error (seconds form, put there
+/// by the provider) wins, capped at 30 s; otherwise 1/2/4 s plus up to 25%
+/// jitter so parallel sessions do not retry in lockstep.
+fn retry_delay(msg: &str, used: usize) -> Duration {
+    let hint = crate::failover::leading_error(msg)
+        .split_once("(retry-after: ")
+        .and_then(|(_, rest)| {
+            let n = rest
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>();
+            n.parse::<u64>().ok()
+        });
+    if let Some(secs) = hint {
+        return Duration::from_secs(secs).min(MAX_RETRY_WAIT);
+    }
+    let base = Duration::from_secs(1u64 << used.min(5)).min(MAX_RETRY_WAIT);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    base + base * (nanos % 251) / 1000
+}
+
+/// Sleep `total`, waking every [`RETRY_SLICE`] to re-check the token.
+/// Returns early (without error) once cancelled; the caller's loop-top
+/// checkpoint then settles the turn as cancelled.
+fn sleep_unless_cancelled(total: Duration, cancel: &CancelToken) {
+    let end = Instant::now() + total;
+    while !cancel.is_cancelled() {
+        let left = end.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        std::thread::sleep(left.min(RETRY_SLICE));
+    }
+}
 
 /// Why a turn ended.
 #[derive(Debug)]
@@ -82,6 +129,11 @@ pub enum TurnOutcome {
     /// #178): the token fired between steps; the turn settled durably
     /// to pc=Final, so the session stays prompt-resumable.
     Cancelled,
+    /// The owner detached the turn (#217): nothing was aborted — the
+    /// in-flight call settled, the turn stopped waiting and settled to
+    /// pc=Final with a durable `detached` record. Background jobs keep
+    /// running; their completion arrives as a notice on the next turn.
+    Detached,
 }
 
 /// Progress sink for host UIs (issue #196): the turn loop fires these at
@@ -148,12 +200,34 @@ pub fn run_turn_with_observer(
     cancel: &CancelToken,
     observer: Option<&dyn TurnObserver>,
 ) -> Result<TurnOutcome, StorageError> {
+    run_turn_with_images(s, p, registry, user_input, &[], cancel, observer)
+}
+
+/// [`run_turn_with_observer`] with image input (#212): the user message
+/// records the images as durable references (`payload.images`, never the
+/// blob); the provider re-loads them per request. Empty `images` is
+/// exactly the text-only turn.
+pub fn run_turn_with_images(
+    s: &mut dyn Storage,
+    p: &mut dyn Provider,
+    registry: &ToolRegistry,
+    user_input: &str,
+    images: &[crate::image::ImageRef],
+    cancel: &CancelToken,
+    observer: Option<&dyn TurnObserver>,
+) -> Result<TurnOutcome, StorageError> {
     // Precondition enforced, not just documented: the session must be at a
     // turn boundary — Idle (never started / E1 initial state) or Final
     // (previous turn delivered; B1 chat re-opens it). Anything else means a
     // turn is mid-flight (e.g. after ProviderFailed) and must be resolved
     // via resume/finish first — driving two turns concurrently is a host bug.
-    let current = s.state().pc;
+    let mut current = s.state().pc;
+    // #476: a turn parked after a denied call is settled by the new prompt
+    // (the denial note stays in the transcript, so the model still sees it).
+    if current == Pc::Planning && transcript::parked_after_denial(s.entries()) {
+        settle_final(s)?;
+        current = Pc::Final;
+    }
     if !matches!(current, Pc::Idle | Pc::Final) {
         return Err(StorageError::Invalid(format!(
             "run_turn requires pc Idle or Final, found {current:?} — resolve the session first (resume/finish)"
@@ -165,12 +239,13 @@ pub fn run_turn_with_observer(
     // decision session, including after an abort (post-#84 pc=Final) and
     // across prompt-resumes into fresh run_turn calls.
     let seq = s.state().seq;
+    let mut payload = json!({ "role": "user", "text": user_input });
+    if !images.is_empty() {
+        payload["images"] = images.iter().map(|i| i.to_value()).collect();
+    }
     s.commit(
         Commit::new()
-            .entry(NewEntry::root(
-                EntryType::new(EntryType::MESSAGE),
-                json!({ "role": "user", "text": user_input }),
-            ))
+            .entry(NewEntry::root(EntryType::new(EntryType::MESSAGE), payload))
             .transition(StateTransition::from(seq, Pc::Planning)),
     )?;
     drive(s, p, registry, cancel, observer)
@@ -282,8 +357,15 @@ pub fn resume_turn_with_cancel(
 
 /// Sets the session-scoped `wrote_this_turn` fact (#143). Shared by the
 /// fresh and replay paths — a Write that settles on either must be seen.
+///
+/// Its fsync is deferred (#483): both callers settle the intent durably in
+/// the very next commit.
 fn record_wrote(s: &mut dyn Storage) -> Result<(), StorageError> {
-    s.commit(Commit::new().register(RegisterWrite::set("fact", "wrote_this_turn", json!(true))))?;
+    s.commit(
+        Commit::new()
+            .register(RegisterWrite::set("fact", "wrote_this_turn", json!(true)))
+            .defer_sync(),
+    )?;
     Ok(())
 }
 
@@ -331,7 +413,7 @@ fn replay_intent(
             settle_err(
                 s,
                 &handle,
-                "replay denied: no fresh approval for a guarded effect",
+                &format!("replay denied: no fresh approval for a guarded effect{REPLAY_UNKNOWN}"),
             )?;
             // #178: a cancel that landed while the fresh approval was
             // pending fails closed to Deny, but the turn is CANCELLED, not
@@ -344,14 +426,28 @@ fn replay_intent(
                 "approval required",
                 &format!("guarded intent {intent_id} replay denied (no fresh approval)"),
             )?;
+            append_denial_note(
+                s,
+                &tool,
+                &format!("approval refused on resume{REPLAY_UNKNOWN}"),
+            )?;
             return Ok(Some(TurnOutcome::ApprovalRequired { name: tool }));
         }
         #[cfg(feature = "shell-tools")]
         Err(Denied::PreHook { reason }) => {
             // scan-3: a hook-deny must not be bypassable by crashing
             // before settlement (mirrors the fresh-path check).
-            settle_err(s, &handle, &format!("replay denied by pre-hook: {reason}"))?;
+            settle_err(
+                s,
+                &handle,
+                &format!("replay denied by pre-hook: {reason}{REPLAY_UNKNOWN}"),
+            )?;
             append_turn_error(s, "pre-hook denial", &format!("{tool}: {reason}"))?;
+            append_denial_note(
+                s,
+                &tool,
+                &format!("pre-tool hook on resume: {reason}{REPLAY_UNKNOWN}"),
+            )?;
             return Ok(Some(TurnOutcome::ApprovalRequired { name: tool }));
         }
     };
@@ -483,6 +579,11 @@ fn drive(
         if cancel.is_cancelled() {
             return settle_cancelled(s);
         }
+        // Detach checkpoint (#217): the previous tool has settled and its
+        // result is committed; stop here instead of calling the provider.
+        if cancel.is_detached() {
+            return settle_detached(s);
+        }
         // Soft-interrupt safe point (#377): the previous tool has settled
         // and the next provider call has not started.
         deliver_interrupts(s, cancel)?;
@@ -490,22 +591,33 @@ fn drive(
         // to_vec() allocated the whole transcript every provider step.)
         // After a compaction (#440) the provider sees the summary plus the
         // kept tail instead; without one this borrows the slice as before.
-        let next = match p.complete(&crate::compaction::view(s.entries())) {
+        let next = match p.complete_with_cancel(&crate::compaction::view(s.entries()), cancel) {
             Ok(o) => o,
             Err(ProviderError(msg)) => {
-                // Retry classification (#58 + live 429 evidence): gateway
-                // timeouts AND rate-limit rejections are both transient.
+                // #484: a cancel that interrupted the in-flight call is not
+                // a provider failure — settle it as cancelled, no retry.
+                if cancel.is_cancelled() {
+                    return settle_cancelled(s);
+                }
+                // Retry classification (#58, #478): timeouts, 429, 5xx and
+                // empty completions are transient; request errors are not.
                 if is_transient_provider_error(&msg) && timeout_retries_left > 0 {
+                    let delay = retry_delay(&msg, PROVIDER_TIMEOUT_RETRIES - timeout_retries_left);
                     timeout_retries_left -= 1;
                     // Durable, replay-visible decision record BEFORE the
-                    // retry fires (same contract as append_turn_error).
+                    // wait and the retry (same contract as append_turn_error).
                     append_turn_error(
                         s,
                         "provider transient failure, retrying",
                         &format!(
-                            "gateway timeout or 429 rate limit; {timeout_retries_left} automatic retry left this turn"
+                            "{}; retrying in {:.1}s, {timeout_retries_left} automatic retries left this turn",
+                            crate::failover::leading_error(&msg),
+                            delay.as_secs_f32()
                         ),
                     )?;
+                    // The loop-top checkpoint settles a cancel that ends the
+                    // wait early.
+                    sleep_unless_cancelled(delay, cancel);
                     continue;
                 }
                 // Durable record, same contract as BudgetExhausted: the
@@ -521,7 +633,18 @@ fn drive(
                 // plain-resumable: `tole resume <id> "continue"` just
                 // works, matching the E5 crash-resume guarantee.
                 let seq = s.state().seq;
-                s.commit(Commit::new().transition(StateTransition::from(seq, Pc::Final)))?;
+                let mut settle = Commit::new().transition(StateTransition::from(seq, Pc::Final));
+                // #481: a context overflow is flagged in the same commit that
+                // settles the turn, so the next prompt compacts first
+                // (between turns — never inside this one).
+                if crate::compaction::is_context_overflow(&msg) {
+                    settle = settle.register(RegisterWrite::set(
+                        crate::compaction::OVERFLOW_NS,
+                        crate::compaction::OVERFLOW_KEY,
+                        json!(true),
+                    ));
+                }
+                s.commit(settle)?;
                 return Ok(TurnOutcome::ProviderFailed { message: msg });
             }
         };
@@ -556,14 +679,27 @@ fn drive(
                 obj.insert(transcript::ROUTE_KEY.to_string(), route);
             }
         }
+        // #457: a step that ran with a rejected parameter dropped is durable.
+        if let Some(degraded) = p.last_degraded() {
+            if let Some(obj) = usage.get_or_insert_with(|| json!({})).as_object_mut() {
+                obj.insert(transcript::DEGRADED_KEY.to_string(), degraded);
+            }
+        }
         if let Some(u) = usage {
             if let Some(last) = s.entries().last() {
-                s.commit(Commit::new().usage(UsageRecord {
-                    id: String::new(),
-                    entry_id: last.id.clone(),
-                    usage: u,
-                    cost_usd: None,
-                }))?;
+                // #483: fsync deferred — every path after this point commits
+                // durably (settle/final/error) before returning or running
+                // an effect, and one fdatasync covers the earlier line.
+                s.commit(
+                    Commit::new()
+                        .usage(UsageRecord {
+                            id: String::new(),
+                            entry_id: last.id.clone(),
+                            usage: u,
+                            cost_usd: None,
+                        })
+                        .defer_sync(),
+                )?;
             }
         }
         // Cancellation checkpoint AFTER the provider call (issue #178):
@@ -688,151 +824,198 @@ fn drive(
                 return Ok(TurnOutcome::Final { text, wrote });
             }
             ProviderOutput::ToolCall { tool, input } => {
-                // E10: fingerprint before anything else — the guard must
-                // see every call, including ones the registry will refuse.
-                let fp = call_fingerprint(&tool, &input);
-                streak = if Some(fp) == last_fp { streak + 1 } else { 1 };
-                last_fp = Some(fp);
-                // Poll-style exemption (#85): for polling tools identical
-                // CONSECUTIVE INPUT is the correct calling pattern — the
-                // arguments name the same job; the expected change is in
-                // the RESULT (running → progress → done). A 14-minute
-                // render legitimately polls the same id dozens of times;
-                // tripping the guard there aborted healthy missions. The
-                // guard still applies once the results stop changing AND
-                // the model keeps polling past the patience budget — a
-                // much higher ceiling for polls only.
-                let poll = is_poll_tool(registry, &tool);
-                // Issue #231: a poll step is attached waiting, not
-                // mission progress — refund the model-step debit and
-                // draw from the dedicated poll budget instead.
-                if poll {
-                    steps = steps.saturating_sub(1);
-                    poll_steps += 1;
+                // #480: one response may carry several calls. They run
+                // sequentially, in model order, each as its own sandwich,
+                // inside THIS one step — but only when the whole batch is
+                // ReadOnly. Anything else keeps the first-call-only rule
+                // (the model re-asks), so the approval UX is unchanged.
+                let mut batch = vec![(tool, input)];
+                let extras = p.last_extra_tool_calls();
+                if !extras.is_empty() && is_read_only_batch(registry, &batch[0].0, &extras) {
+                    batch.extend(extras);
                 }
-                let trip_at = if poll {
-                    POLL_LOOP_TRIP_AFTER
-                } else {
-                    LOOP_TRIP_AFTER
-                };
-                if streak >= trip_at {
-                    append_turn_error(
+                let mut calls = batch.into_iter().enumerate();
+                while let Some((i, (tool, input))) = calls.next() {
+                    // A call that has not started yet yields to an URGENT
+                    // interrupt, like a fresh call does above (#377). Its
+                    // calls stay unrecorded; the next step delivers it.
+                    if i > 0 && cancel.interrupts().has_urgent() {
+                        break;
+                    }
+                    // E10: fingerprint before anything else — the guard must
+                    // see every call, including ones the registry will refuse.
+                    let fp = call_fingerprint(&tool, &input);
+                    streak = if Some(fp) == last_fp { streak + 1 } else { 1 };
+                    last_fp = Some(fp);
+                    // Poll-style exemption (#85): for polling tools identical
+                    // CONSECUTIVE INPUT is the correct calling pattern — the
+                    // arguments name the same job; the expected change is in
+                    // the RESULT (running → progress → done). A 14-minute
+                    // render legitimately polls the same id dozens of times;
+                    // tripping the guard there aborted healthy missions. The
+                    // guard still applies once the results stop changing AND
+                    // the model keeps polling past the patience budget — a
+                    // much higher ceiling for polls only.
+                    let poll = is_poll_tool(registry, &tool);
+                    // Issue #231: a poll step is attached waiting, not
+                    // mission progress — refund the model-step debit and
+                    // draw from the dedicated poll budget instead.
+                    if poll {
+                        // One model step, one refund: only the first call of a
+                        // batch carries the step debit.
+                        if i == 0 {
+                            steps = steps.saturating_sub(1);
+                        }
+                        poll_steps += 1;
+                    }
+                    let trip_at = if poll {
+                        POLL_LOOP_TRIP_AFTER
+                    } else {
+                        LOOP_TRIP_AFTER
+                    };
+                    if streak >= trip_at {
+                        append_turn_error(
                         s,
                         "loop detected",
                         &format!(
                             "tool {tool} called with identical input {streak} times in a row (guard trips at {trip_at})"
                         ),
                     )?;
-                    // #84 consistency: a loop trip is terminal for this
-                    // turn — settle to Final so a prompt-resume works.
-                    let seq = s.state().seq;
-                    s.commit(Commit::new().transition(StateTransition::from(seq, Pc::Final)))?;
-                    return Ok(TurnOutcome::LoopDetected {
-                        tool,
-                        count: streak,
-                    });
-                }
-                // Authorization (PDP, see gate.rs): approver, then opt-in
-                // pre-hooks. The denial is mapped to the durable record here.
-                let auth = match gate::authorize(registry, &tool, &input, gate::Mode::Fresh) {
-                    Ok(a) => a,
-                    Err(Denied::UnknownTool) => {
-                        // Durable record + terminal pc=Final, the same #84
-                        // contract as the other abort paths (#316): without
-                        // it the next run_turn is refused (pc=Planning).
-                        append_turn_error(s, "unknown tool", &tool)?;
-                        settle_final(s)?;
-                        return Ok(TurnOutcome::UnknownTool { name: tool });
+                        // #84 consistency: a loop trip is terminal for this
+                        // turn — settle to Final so a prompt-resume works.
+                        let seq = s.state().seq;
+                        s.commit(Commit::new().transition(StateTransition::from(seq, Pc::Final)))?;
+                        return Ok(TurnOutcome::LoopDetected {
+                            tool,
+                            count: streak,
+                        });
                     }
-                    Err(Denied::Approver) => {
-                        // #178: a cancel that landed while the permission
-                        // was pending fails closed to Deny AND must settle
-                        // the turn as CANCELLED, not refusal (the denial is
-                        // the cancel's side effect, not a model refusal).
-                        if cancel.is_cancelled() {
-                            return settle_cancelled(s);
+                    // Authorization (PDP, see gate.rs): approver, then opt-in
+                    // pre-hooks. The denial is mapped to the durable record here.
+                    let auth = match gate::authorize(registry, &tool, &input, gate::Mode::Fresh) {
+                        Ok(a) => a,
+                        Err(Denied::UnknownTool) => {
+                            // Durable record + terminal pc=Final, the same #84
+                            // contract as the other abort paths (#316): without
+                            // it the next run_turn is refused (pc=Planning).
+                            append_turn_error(s, "unknown tool", &tool)?;
+                            settle_final(s)?;
+                            return Ok(TurnOutcome::UnknownTool { name: tool });
                         }
-                        append_turn_error(s, "approval required", &tool)?;
-                        return Ok(TurnOutcome::ApprovalRequired { name: tool });
-                    }
-                    #[cfg(feature = "shell-tools")]
-                    Err(Denied::PreHook { reason }) => {
-                        // Pre-hook deny (issue #110) settles like an approval
-                        // denial: durable turn error + ApprovalRequired.
-                        append_turn_error(s, "pre-hook denial", &format!("{tool}: {reason}"))?;
-                        return Ok(TurnOutcome::ApprovalRequired { name: tool });
-                    }
-                };
-                let is_write = auth.is_write();
-                // Planning → ToolCall, then the sandwich. The replay
-                // contract derives from RISK, not a blanket Idempotent
-                // (CodeCora scan #33): a crash after a Write/Destructive
-                // effect ran but before settlement must NOT blindly
-                // re-execute on resume — Guarded forces re-consultation
-                // of the approver before any replay.
-                let safety = if is_write {
-                    ReplaySafety::Guarded
-                } else {
-                    ReplaySafety::Idempotent
-                };
-                let seq = s.state().seq;
-                s.commit(Commit::new().transition(StateTransition::from(seq, Pc::ToolCall)))?;
-                let handle = begin(s, &tool, input.clone(), safety, None)?;
-                // Cancellation checkpoint (issue #178): cancel while the
-                // turn was settling/planning stops the effect BEFORE it
-                // runs — spec: "stop model requests and tool
-                // invocations as soon as possible". The fresh intent is
-                // settled as failed first (no pending cell survives a
-                // cancelled turn), then the turn unwinds durably.
-                if cancel.is_cancelled() {
-                    settle_err(s, &handle, "cancelled before execution")?;
-                    return settle_cancelled(s);
-                }
-                // Post-hook input snapshot (issue #110): execute consumes
-                // `input` by value; hooks observe the exact call input.
-                // Write/Destructive ONLY — ReadOnly stays zero-overhead
-                // (the documented hook contract; cora-caught).
-                #[cfg(feature = "shell-tools")]
-                let hook_input = if is_write && registry.has_post_hooks() {
-                    Some(input.clone())
-                } else {
-                    None
-                };
-                // Issue #196 phase 1: every gate has passed (approval,
-                // hooks, loop guard, cancel) — the host sees the card
-                // exactly when real work begins.
-                if let Some(o) = observer {
-                    o.tool_started(&tool, &input);
-                }
-                let out = match auth.execute(input) {
-                    Ok(o) => o,
-                    Err(e) => {
-                        // settle_err lands in Planning directly (§10) —
-                        // no finish() hop on the failure path.
+                        Err(Denied::Approver) => {
+                            // #178: a cancel that landed while the permission
+                            // was pending fails closed to Deny AND must settle
+                            // the turn as CANCELLED, not refusal (the denial is
+                            // the cancel's side effect, not a model refusal).
+                            if cancel.is_cancelled() {
+                                return settle_cancelled(s);
+                            }
+                            append_turn_error(s, "approval required", &tool)?;
+                            append_denial_note(s, &tool, "approval refused")?;
+                            return Ok(TurnOutcome::ApprovalRequired { name: tool });
+                        }
                         #[cfg(feature = "shell-tools")]
-                        if let Some(i) = &hook_input {
-                            registry.post_hook_notify(&tool, i, false);
+                        Err(Denied::PreHook { reason }) => {
+                            // Pre-hook deny (issue #110) settles like an approval
+                            // denial: durable turn error + ApprovalRequired.
+                            append_turn_error(s, "pre-hook denial", &format!("{tool}: {reason}"))?;
+                            append_denial_note(s, &tool, &format!("pre-tool hook: {reason}"))?;
+                            return Ok(TurnOutcome::ApprovalRequired { name: tool });
                         }
-                        if let Some(o) = observer {
-                            o.tool_finished(&tool, false, &short_preview(&e));
-                        }
-                        settle_err(s, &handle, &e)?;
-                        continue;
+                    };
+                    let is_write = auth.is_write();
+                    // Planning → ToolCall, then the sandwich. The replay
+                    // contract derives from RISK, not from a blanket Idempotent
+                    // (CodeCora scan #33): a crash after a Write/Destructive
+                    // effect ran but before settlement must NOT blindly
+                    // re-execute on resume — Guarded forces re-consultation
+                    // of the approver before any replay.
+                    let safety = if is_write {
+                        ReplaySafety::Guarded
+                    } else {
+                        ReplaySafety::Idempotent
+                    };
+                    let seq = s.state().seq;
+                    // #483: fsync deferred; `begin`'s durable intent commit
+                    // (the barrier before any effect) persists it.
+                    s.commit(
+                        Commit::new()
+                            .transition(StateTransition::from(seq, Pc::ToolCall))
+                            .defer_sync(),
+                    )?;
+                    let handle = if i == 0 {
+                        begin(s, &tool, input.clone(), safety, None)?
+                    } else {
+                        begin_batch_member(s, &tool, input.clone(), safety, None)?
+                    };
+                    // Cancellation checkpoint (issue #178): cancel while the
+                    // turn was settling/planning stops the effect BEFORE it
+                    // runs — spec: "stop model requests and tool
+                    // invocations as soon as possible". The fresh intent is
+                    // settled as failed first (no pending cell survives a
+                    // cancelled turn), then the turn unwinds durably.
+                    if cancel.is_cancelled() {
+                        settle_err(s, &handle, "cancelled before execution")?;
+                        return settle_cancelled(s);
                     }
-                };
-                #[cfg(feature = "shell-tools")]
-                if let Some(i) = &hook_input {
-                    registry.post_hook_notify(&tool, i, true);
+                    // Post-hook input snapshot (issue #110): execute consumes
+                    // `input` by value; hooks observe the exact call input.
+                    // Write/Destructive ONLY — ReadOnly stays zero-overhead
+                    // (the documented hook contract; cora-caught).
+                    #[cfg(feature = "shell-tools")]
+                    let hook_input = if is_write && registry.has_post_hooks() {
+                        Some(input.clone())
+                    } else {
+                        None
+                    };
+                    // Issue #196 phase 1: every gate has passed (approval,
+                    // hooks, loop guard, cancel) — the host sees the card
+                    // exactly when real work begins.
+                    if let Some(o) = observer {
+                        o.tool_started(&tool, &input);
+                    }
+                    let out = match auth.execute(input) {
+                        Ok(o) => o,
+                        Err(e) => {
+                            // settle_err lands in Planning directly (§10) —
+                            // no finish() hop on the failure path.
+                            #[cfg(feature = "shell-tools")]
+                            if let Some(i) = &hook_input {
+                                registry.post_hook_notify(&tool, i, false);
+                            }
+                            if let Some(o) = observer {
+                                o.tool_finished(&tool, false, &short_preview(&e));
+                            }
+                            settle_err(s, &handle, &e)?;
+                            // First failure stops the batch; every remaining
+                            // call still gets a result (API rule).
+                            for (_, (t, inp)) in calls.by_ref() {
+                                stub_call(
+                                    s,
+                                    &t,
+                                    inp,
+                                    "not executed: an earlier call in this batch failed",
+                                )?;
+                            }
+                            break;
+                        }
+                    };
+                    #[cfg(feature = "shell-tools")]
+                    if let Some(i) = &hook_input {
+                        registry.post_hook_notify(&tool, i, true);
+                    }
+                    if is_write {
+                        wrote = true;
+                        record_wrote(s)?;
+                    }
+                    if let Some(o) = observer {
+                        o.tool_finished(&tool, true, &short_preview(&out));
+                    }
+                    // #483: settlement fsync deferred to `finish`'s durable
+                    // commit; nothing but the observer callback runs between.
+                    settle_ok_deferred(s, &handle, out)?;
+                    finish(s)?;
                 }
-                if is_write {
-                    wrote = true;
-                    record_wrote(s)?;
-                }
-                if let Some(o) = observer {
-                    o.tool_finished(&tool, true, &short_preview(&out));
-                }
-                settle_ok(s, &handle, out)?;
-                finish(s)?;
             }
             ProviderOutput::InvalidToolArgs { tool, raw, reason } => {
                 // Malformed `arguments` from the model: record the intent
@@ -878,6 +1061,26 @@ fn drive(
     let seq = s.state().seq;
     s.commit(Commit::new().transition(StateTransition::from(seq, Pc::Final)))?;
     Ok(TurnOutcome::BudgetExhausted)
+}
+
+/// A batch runs in full only when every call is a registered ReadOnly tool
+/// (#480): the first call and each extra. Unknown names fall back to the
+/// first-call-only path, which owns their terminal handling.
+fn is_read_only_batch(registry: &ToolRegistry, first: &str, extras: &[(String, Value)]) -> bool {
+    std::iter::once(first)
+        .chain(extras.iter().map(|(t, _)| t.as_str()))
+        .all(|t| registry.get(t).is_some_and(|t| t.risk() == Risk::ReadOnly))
+}
+
+/// Result for a batch call that was never executed: a full sandwich (so the
+/// call has an intent id and a settlement) settled as an error. Lands in
+/// Planning, like any failed call.
+fn stub_call(s: &mut dyn Storage, tool: &str, input: Value, why: &str) -> Result<(), StorageError> {
+    let seq = s.state().seq;
+    s.commit(Commit::new().transition(StateTransition::from(seq, Pc::ToolCall)))?;
+    let handle = begin_batch_member(s, tool, input, ReplaySafety::Idempotent, None)?;
+    settle_err(s, &handle, why)?;
+    Ok(())
 }
 
 /// Appends a durable ERROR entry under the turn's user message. No
@@ -926,6 +1129,30 @@ fn append_turn_error(s: &mut dyn Storage, error: &str, detail: &str) -> Result<(
     Ok(())
 }
 
+/// Suffix for a denied REPLAY (#476): the interrupted effect may already
+/// have run, so a denial there is not "it did not happen".
+const REPLAY_UNKNOWN: &str = " — the outcome is UNKNOWN: the effect may have run before the \
+interruption; check state before retrying";
+
+/// Synthetic user-role note (the stop-gate feedback pattern) so the denial
+/// reaches the model's next request: a denied call leaves no intent, so
+/// the error entry alone is an orphan the wire drops (#476). Marked so it
+/// never opens a turn, and it parks the turn for `run_turn` to settle.
+fn append_denial_note(s: &mut dyn Storage, tool: &str, why: &str) -> Result<(), StorageError> {
+    s.commit(Commit::new().entry(NewEntry::root(
+        EntryType::new(EntryType::MESSAGE),
+        json!({
+            "role": "user",
+            "text": format!(
+                "[tole] Your call to `{tool}` was denied ({why}). Do not repeat it \
+                 unchanged — use another approach or say what is blocked."
+            ),
+            transcript::DENIAL_NOTE: true,
+        }),
+    )))?;
+    Ok(())
+}
+
 /// Terminal settlement shared by abort paths that already wrote their
 /// durable error record: commit `pc → Final` (legal only from Planning).
 fn settle_final(s: &mut dyn Storage) -> Result<(), StorageError> {
@@ -945,12 +1172,48 @@ fn settle_cancelled(s: &mut dyn Storage) -> Result<TurnOutcome, StorageError> {
     Ok(TurnOutcome::Cancelled)
 }
 
-/// Gateway timeouts and rate-limit rejections are transient (#58 + live
-/// 429 evidence). After a failover only the last provider's error counts:
-/// an earlier "timeout" must not make a fail-loud 401 look retryable.
-fn is_transient_provider_error(msg: &str) -> bool {
-    const TRANSIENT: [&str; 2] = ["timeout", "429"];
+/// Settle a detached turn (#217): the audit record + pc=Final, exactly the
+/// cancelled shape — but nothing was aborted, so the outcome differs.
+fn settle_detached(s: &mut dyn Storage) -> Result<TurnOutcome, StorageError> {
+    append_turn_error(
+        s,
+        "detached",
+        "owner detached the turn; in-flight work was not aborted",
+    )?;
+    settle_final(s)?;
+    Ok(TurnOutcome::Detached)
+}
+
+/// Gateway timeouts, rate limits (429), server errors (5xx), connection
+/// failures and empty completions are transient (#58, #478). After a
+/// failover only the last provider's error counts: an earlier "timeout"
+/// must not make a fail-loud 401 look retryable. `http status: ` messages
+/// are classified by the parsed code only, so a provider body snippet
+/// ("token timeout", "142900 tokens") cannot flip the decision.
+///
+/// An empty completion retries here but stays fail-loud for FAILOVER
+/// (`is_failover_error`): when retries run out the turn fails without
+/// trying the reserve.
+pub(crate) fn is_transient_provider_error(msg: &str) -> bool {
+    const TRANSIENT: [&str; 5] = [
+        "timeout",
+        "429",
+        "connection",
+        "stream read",
+        crate::openai::EMPTY_COMPLETION,
+    ];
     let lead = crate::failover::leading_error(msg);
+    if let Some(rest) = lead.strip_prefix("http status: ") {
+        let code = rest
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>()
+            .parse::<u16>()
+            .unwrap_or(0);
+        return code == 429 || (500..600).contains(&code);
+    }
+    // "io: Connection refused" is capitalised by the OS error text.
+    let lead = lead.to_ascii_lowercase();
     TRANSIENT.iter().any(|k| lead.contains(k))
 }
 
@@ -970,5 +1233,67 @@ mod transient_tests {
         assert!(is_transient_provider_error(
             "timeout: global [after failover from primary: http status: 502 Bad Gateway — a]"
         ));
+    }
+
+    #[test]
+    fn http_status_errors_are_classified_by_code_not_body() {
+        for (msg, want) in [
+            ("http status: 429 Too Many Requests — rate limited", true),
+            ("http status: 429", true),
+            (
+                r#"http status: 400 Bad Request — {"error":{"message":"resulted in 142900 tokens"}}"#,
+                false,
+            ),
+            (
+                r#"http status: 422 Unprocessable — {"error":{"message":"invalid timeout value"}}"#,
+                false,
+            ),
+            ("http status: 401 Unauthorized — token timeout, re-login", false),
+            ("http status: 400 Bad Request — unknown model id gpt-4290", false),
+            ("http status: 503 Service Unavailable — upstream", true),
+            ("http status: 500", true),
+            ("http status: 599 x", true),
+            ("http status: 600 x", false),
+            ("http status: 404 Not Found — 503 upstream", false),
+            ("malformed response: empty stream (no content, no tool calls)", true),
+            ("malformed response: no choices[0].message", false),
+            ("io: Connection refused (os error 111)", true),
+            ("http status: 4290 Weird", false),
+            ("timeout: global", true),
+            ("stream read: timeout reading", true),
+            (
+                "http status: 429 Too Many Requests — x [after failover from primary: http status: 401 Unauthorized — y]",
+                true,
+            ),
+            (
+                "http status: 400 Bad Request — token timeout [after failover from primary: timeout: global]",
+                false,
+            ),
+        ] {
+            assert_eq!(is_transient_provider_error(msg), want, "{msg}");
+        }
+    }
+
+    #[test]
+    fn retry_delay_backs_off_honors_and_caps_retry_after() {
+        use super::retry_delay;
+        use std::time::Duration;
+        for (used, base) in [(0, 1.0), (1, 2.0), (2, 4.0)] {
+            let d = retry_delay("timeout: global", used).as_secs_f64();
+            assert!((base..=base * 1.25).contains(&d), "retry {used}: {d}");
+        }
+        let hdr = |n: &str| format!("http status: 429 Too Many Requests (retry-after: {n}) — x");
+        assert_eq!(retry_delay(&hdr("7"), 0), Duration::from_secs(7));
+        assert_eq!(retry_delay(&hdr("0"), 2), Duration::ZERO);
+        assert_eq!(retry_delay(&hdr("3600"), 0), Duration::from_secs(30));
+        // HTTP-date form is not parsed: plain backoff.
+        let d = retry_delay(&hdr("Wed, 21 Oct 2026 07:28:00 GMT"), 0);
+        assert!(d >= Duration::from_secs(1) && d < Duration::from_secs(2));
+        // A hint on an earlier failover error does not count.
+        let d = retry_delay(
+            "timeout: global [after failover from primary: http status: 429 (retry-after: 9)]",
+            0,
+        );
+        assert!(d < Duration::from_secs(2));
     }
 }

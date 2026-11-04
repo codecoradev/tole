@@ -25,7 +25,8 @@ mod upgrade;
 use tole_core::storage::{JsonlStorage, Storage};
 use tole_core::tool::ToolRegistry;
 use tole_core::turn::{
-    resume_turn_with_cancel, run_turn_with_cancel, TurnOutcome, LOOP_TRIP_AFTER,
+    resume_turn_with_cancel, run_turn_with_cancel, run_turn_with_images, TurnOutcome,
+    LOOP_TRIP_AFTER,
 };
 
 /// Session id → path (`<dir>/<id>.jsonl`).
@@ -96,8 +97,10 @@ struct Cli {
     /// Write/Destructive tool executes. Receives one JSON object on
     /// stdin (`{"event":"pretool","tool":...,"input":...}`); exit code
     /// 2 = DENY the call (durable — the turn parks at the denial like
-    /// an approval denial and is resumable; on resume WITH a new prompt
-    /// the model sees the denial and replans); any other non-zero exit
+    /// an approval denial and is resumable: `tole resume <id>` re-asks
+    /// the model, `tole resume <id> "<prompt>"` settles the parked turn
+    /// and runs the new prompt; either way the model sees the denial and
+    /// replans); any other non-zero exit
     /// / timeout is a logged non-blocking hook failure.
     /// Example: --on-pretool /usr/local/bin/tole-guard.sh. Repeatable;
     /// default OFF.
@@ -165,6 +168,14 @@ struct Cli {
     #[arg(long, global = true)]
     no_compaction: bool,
 
+    /// Reasoning effort sent as `reasoning_effort` on chat completions
+    /// (#457): minimal | low | medium | high. Unset (default) sends
+    /// nothing. Precedence: flag > TOLE_REASONING_EFFORT > config
+    /// `reasoning_effort` > user config. A session's `fact/reasoning_effort`
+    /// register overrides it on resume.
+    #[arg(long, global = true, value_name = "LEVEL", value_parser = tole_core::openai::parse_reasoning_effort)]
+    effort: Option<String>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -211,6 +222,13 @@ enum Command {
         /// mode. Destructive tools still prompt).
         #[arg(long)]
         yes: bool,
+
+        /// Attach an image to the first message: a file path inside the
+        /// workspace jail, or an inline `data:image/…;base64,…` URL (png,
+        /// jpeg, gif, webp; 10 MiB max). Needs a vision-capable model;
+        /// repeatable (#212).
+        #[arg(long = "image")]
+        images: Vec<String>,
     },
     /// Run an autonomous mission: budgeted turn-chaining toward a goal
     /// (issue #199). Every chained turn is a normal durable turn —
@@ -263,6 +281,11 @@ enum Command {
         /// mode. Destructive tools still prompt).
         #[arg(long)]
         yes: bool,
+
+        /// Attach an image to the first message/turn (#212); same
+        /// semantics as `run --image`.
+        #[arg(long = "image")]
+        images: Vec<String>,
     },
     /// Check for updates and self-upgrade via cargo (issue #220).
     Upgrade {
@@ -277,8 +300,10 @@ enum Command {
     /// Resume an interrupted session. With an optional
     /// PROMPT, appends it as a new user message and runs one full turn
     /// (issue #55): headless flows can continue a mission without a
-    /// separate `run` session. Without PROMPT, behaves as before:
-    /// approvals-only recovery of a mid-flight turn.
+    /// separate `run` session (a turn parked at a denied approval or
+    /// pre-tool hook is settled first; the model sees the denial).
+    /// Without PROMPT, behaves as before: approvals-only recovery of a
+    /// mid-flight turn.
     Resume {
         /// Session id to resume.
         id: String,
@@ -324,6 +349,31 @@ enum Command {
         /// contains this text (case-insensitive).
         #[arg(long, requires = "all")]
         grep: Option<String>,
+        /// Show forks (#210) nested under the session they were cut
+        /// from instead of a flat list.
+        #[arg(long, conflicts_with = "all")]
+        tree: bool,
+    },
+    /// Fork a session (#210): a NEW session holding the source's history
+    /// up to a settled entry, to try another approach without touching
+    /// the original. Continue it with `tole resume <new-id> "<prompt>"`.
+    Branch {
+        /// Session id to fork.
+        id: String,
+        /// Entry id to cut at (a final assistant answer; see `status`).
+        /// Default: the last settled entry.
+        #[arg(long)]
+        at: Option<String>,
+    },
+
+    /// Import a Claude Code session transcript (#381) as a NEW tole
+    /// session (`cc-<claude-session-id>`); continue it with
+    /// `tole resume <new-id> "<prompt>"`. Accepts the `~/.claude/projects`
+    /// JSONL or `claude -p --output-format stream-json` output. Existing
+    /// sessions are untouched; importing the same session twice is refused.
+    ImportClaude {
+        /// Path to the Claude Code transcript (JSONL).
+        path: PathBuf,
     },
 
     /// Is the configured provider/model actually usable? Tiered checks —
@@ -347,8 +397,8 @@ enum Command {
 
     /// Show durable state of a session.
     Status {
-        /// Session id to inspect.
-        id: String,
+        /// Session id to inspect (default: the most recently modified).
+        id: Option<String>,
     },
     /// Serve tole's tools over MCP stdio (issue #94): ReadOnly tools are
     /// always callable; Write tools require --allow patterns (server mode
@@ -426,6 +476,20 @@ enum Command {
         #[arg(long)]
         memory: Option<String>,
     },
+    /// Interactive terminal UI (what bare `tole` opens on a TTY).
+    #[cfg(feature = "tui")]
+    #[command(hide = true)]
+    Tui {
+        /// Resume an existing session by id instead of starting new.
+        #[arg(long)]
+        resume: Option<String>,
+        /// Same semantics as `run --allow`.
+        #[arg(long = "allow")]
+        allow_patterns: Vec<String>,
+        /// Same semantics as `run --yes`.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Interactive multi-turn chat on one durable session.
     Chat {
         /// System prompt for a fresh session (ignored when resuming —
@@ -448,6 +512,11 @@ enum Command {
         /// Same semantics as `run --yes`.
         #[arg(long)]
         yes: bool,
+
+        /// Attach an image to the first message/turn (#212); same
+        /// semantics as `run --image`.
+        #[arg(long = "image")]
+        images: Vec<String>,
     },
     /// Project config file `.tole/config.toml` (#208): `check` validates
     /// it and shows the effective values, `trust`/`untrust` manage the
@@ -480,7 +549,26 @@ enum ConfigAction {
     Untrust,
 }
 
+/// Bare `tole` (no arguments at all) on an interactive terminal opens the
+/// TUI (#459/#460) through the hidden `tui` subcommand, so it shares the
+/// config gate and settings resolution with every other command. Anything
+/// else, including a non-TTY, falls through to clap unchanged.
+#[cfg(feature = "tui")]
+fn bare_tui_args() -> Option<Vec<std::ffi::OsString>> {
+    use std::io::IsTerminal;
+    (std::env::args_os().count() == 1
+        && std::io::stdout().is_terminal()
+        && std::io::stdin().is_terminal())
+    .then(|| vec!["tole".into(), "tui".into()])
+}
+
 fn main() {
+    #[cfg(feature = "tui")]
+    let cli = match bare_tui_args() {
+        Some(args) => Cli::parse_from(args),
+        None => Cli::parse(),
+    };
+    #[cfg(not(feature = "tui"))]
     let cli = Cli::parse();
     if let Err(e) = dispatch(cli) {
         eprintln!("tole: {e:#}");
@@ -515,6 +603,8 @@ fn gate_policy(cmd: &Command) -> GatePolicy {
         | Command::Chat { .. }
         | Command::Resume { .. }
         | Command::Mission { .. } => GatePolicy::MayPrompt,
+        #[cfg(feature = "tui")]
+        Command::Tui { .. } => GatePolicy::MayPrompt,
         _ => GatePolicy::NoPrompt,
     }
 }
@@ -544,6 +634,7 @@ fn config_flags(cli: &Cli) -> tole_cli::config_apply::Flags {
         no_skills: cli.no_skills,
         compact_at: cli.compact_at,
         no_compaction: cli.no_compaction,
+        reasoning_effort: cli.effort.clone(),
         ..Default::default()
     };
     #[cfg(feature = "shell-tools")]
@@ -572,6 +663,8 @@ fn config_flags(cli: &Cli) -> tole_cli::config_apply::Flags {
             f.allow = allow_patterns.clone();
         }
         Command::Resume { allow_patterns, .. } => f.allow = allow_patterns.clone(),
+        #[cfg(feature = "tui")]
+        Command::Tui { allow_patterns, .. } => f.allow = allow_patterns.clone(),
         Command::Mission {
             max_steps,
             max_minutes,
@@ -702,6 +795,10 @@ fn dispatch(cli: Cli) -> Result<()> {
         cfg.as_ref().unwrap_or(&Default::default()),
         &config_apply::real_env,
     );
+    if let Some(msg) = settings.effort_error() {
+        anyhow::bail!(msg);
+    }
+    config_apply::install_effort(settings.reasoning_effort.as_ref().map(|e| e.value.clone()));
     // Startup update notification (issue #220): banner is best-effort,
     // cache-backed, and skipped entirely for `tole upgrade` (which does
     // its own check) and for TOLE_NO_UPDATE_CHECK=1 (checked inside).
@@ -762,6 +859,9 @@ fn dispatch(cli: Cli) -> Result<()> {
             window: settings.context_window.as_ref().map(|w| w.value),
         },
     };
+    // #212: where attached images may be read from; best effort — a bad
+    // --workspace is reported by the commands that need it.
+    tole_cli::turn_runner::set_image_roots(resolve_workspace_root(host.workspace.as_ref()).ok());
     // Trust presets (issue #159): expand once, before dispatch — every
     // allow_patterns-consuming subcommand appends these. --trust >
     // TOLE_TRUST > config `trust`, the higher layer replacing the whole
@@ -797,6 +897,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             system: _,
             allow_patterns: _,
             yes,
+            images,
         } => {
             let allow_patterns = with_trust(config_apply::values(&settings.allow), &trust_extra);
             // Prompt resolution (issue #216): exactly one of positional
@@ -830,6 +931,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                 &host,
                 name.as_deref(),
                 timeout,
+                &images,
             )
         }
         Command::Upgrade { check, yes } => {
@@ -915,8 +1017,10 @@ fn dispatch(cli: Cli) -> Result<()> {
             resume,
             allow_patterns: _,
             yes,
+            images,
         } => {
             let allow_patterns = with_trust(config_apply::values(&settings.allow), &trust_extra);
+            let images = tole_cli::turn_runner::resolve_images(&images)?;
             if host.plan_mode {
                 return Err(refuse(
                     "--plan-mode has no meaning for a mission (missions mutate by definition)",
@@ -981,6 +1085,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                     verify_timeout_secs: settings.verify_timeout.value,
                     resume_id: resume,
                     compaction: host.compaction,
+                    images,
                 },
                 registry,
                 &sessions_dir,
@@ -1089,8 +1194,13 @@ fn dispatch(cli: Cli) -> Result<()> {
                 turnend: host.on_turnend.clone(),
             })
         }
+        Command::Sessions { tree: true, .. } => sessions_tree_command(&sessions_dir),
         Command::Sessions { all: false, .. } => sessions_command(&sessions_dir),
-        Command::Sessions { all: true, grep } => all_sessions_command(grep.as_deref()),
+        Command::Sessions {
+            all: true, grep, ..
+        } => all_sessions_command(grep.as_deref()),
+        Command::Branch { id, at } => branch_command(&sessions_dir, &id, at.as_deref()),
+        Command::ImportClaude { path } => import_claude_command(&sessions_dir, &path),
         Command::Doctor {
             tier,
             no_ledger,
@@ -1104,22 +1214,54 @@ fn dispatch(cli: Cli) -> Result<()> {
                 bail!("--tier must be offline, catalog or full (got {tier:?})");
             };
             let cfg = config_apply::provider_config();
-            let ok =
-                tole_cli::doctor::run_cli(cfg.as_ref(), &config_apply::real_env, tier, no_ledger);
+            let window = settings.context_window.as_ref().map(|w| w.value);
+            let ok = tole_cli::doctor::run_cli(
+                cfg.as_ref(),
+                &config_apply::real_env,
+                tier,
+                no_ledger,
+                window,
+            );
             if !ok {
                 std::process::exit(1);
             }
             Ok(())
         }
-        Command::Status { id } => status_command(&sessions_dir, &id),
+        Command::Status { id } => {
+            let id = match id {
+                Some(id) => id,
+                None => latest_session_id(&sessions_dir)
+                    .ok_or_else(|| anyhow!("no sessions found in {}", sessions_dir.display()))?,
+            };
+            let window = settings.context_window.as_ref().map(|w| w.value);
+            status_command(&sessions_dir, &id, window)
+        }
+        #[cfg(feature = "tui")]
+        Command::Tui {
+            resume,
+            allow_patterns: _,
+            yes,
+        } => {
+            let allow_patterns = with_trust(config_apply::values(&settings.allow), &trust_extra);
+            tui_command(
+                &sessions_dir,
+                settings.system_prompt.as_ref().map(|e| e.value.as_str()),
+                resume,
+                &allow_patterns,
+                yes,
+                &host,
+            )
+        }
         Command::Chat {
             system: _,
             resume,
             last,
             allow_patterns: _,
             yes,
+            images,
         } => {
             let allow_patterns = with_trust(config_apply::values(&settings.allow), &trust_extra);
+            let images = tole_cli::turn_runner::resolve_images(&images)?;
             chat_command(
                 &sessions_dir,
                 settings.system_prompt.as_ref().map(|e| e.value.as_str()),
@@ -1128,6 +1270,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                 &allow_patterns,
                 yes,
                 &host,
+                images,
             )
         }
     }
@@ -1438,10 +1581,19 @@ fn check_server_face_flags(
 /// The CLI faces' registry: the shared tool roster behind the
 /// interactive approver.
 fn build_registry(
-    approver: InteractiveApprover<StdioPrompt>,
+    approver: impl tole_core::approval::Approver + 'static,
     host: &HostConfig,
     allow_patterns: &[String],
 ) -> Result<ToolRegistry> {
+    // Hook wiring (run/chat/resume) is shell-tools-gated; without it these
+    // flags would be silently ignored — refuse loudly instead.
+    #[cfg(not(feature = "shell-tools"))]
+    if host.on_pretool_non_empty() || host.on_posttool_non_empty() || !host.on_turnend.is_empty() {
+        bail!(
+            "--on-pretool/--on-posttool/--on-turnend require the shell-tools feature \
+             (this build lacks it); rebuild with default features"
+        );
+    }
     let mut roster = Roster::new(resolve_workspace_root(host.workspace.as_ref())?);
     // CLI faces run shell tools in the process cwd; files stay jailed to
     // the workspace.
@@ -1625,8 +1777,11 @@ fn run_command(
     host: &HostConfig,
     name: Option<&str>,
     timeout_secs: Option<u64>,
+    images: &[String],
 ) -> Result<()> {
     let cfg = tole_cli::turn_runner::provider_config().map_err(anyhow::Error::msg)?;
+    // Resolve (jail-check) images before the session file exists.
+    let images = tole_cli::turn_runner::resolve_images(images)?;
     // Build everything that can fail BEFORE the session file exists, so a
     // failed startup does not leave a stray empty session polluting
     // `sessions` / `--last` (CodeCora scan 2026-09-18).
@@ -1712,7 +1867,15 @@ fn run_command(
             token.cancel();
         })
     });
-    let outcome = run_turn_with_cancel(&mut storage, &mut provider, &registry, &prompt, &cancel)?;
+    let outcome = run_turn_with_images(
+        &mut storage,
+        &mut provider,
+        &registry,
+        &prompt,
+        &images,
+        &cancel,
+        None,
+    )?;
     // Join ONLY when the timer fired (cora MAJOR): join otherwise blocks
     // for the remaining budget after the turn already finished. Detach —
     // the process exits right after run_command anyway.
@@ -1765,7 +1928,7 @@ fn resume_command(
             if !valid_session_id(stem) {
                 continue;
             }
-            let Ok(s) = JsonlStorage::open(entry.path()) else {
+            let Ok(s) = JsonlStorage::open_read_only(entry.path()) else {
                 continue;
             };
             if s.session_name() == Some(id) {
@@ -1885,7 +2048,7 @@ fn resume_command(
     Ok(())
 }
 
-fn status_command(sessions_dir: &Path, id: &str) -> Result<()> {
+fn status_command(sessions_dir: &Path, id: &str, window: Option<u64>) -> Result<()> {
     if !valid_session_id(id) {
         anyhow::bail!("invalid session id {id:?} (allowed: [a-z0-9-], max 64)");
     }
@@ -1893,7 +2056,7 @@ fn status_command(sessions_dir: &Path, id: &str) -> Result<()> {
     if !path.exists() {
         anyhow::bail!("session {id} not found at {}", path.display());
     }
-    let storage = JsonlStorage::open(&path).context("replaying session log")?;
+    let storage = JsonlStorage::open_read_only(&path).context("replaying session log")?;
     println!("session: {id}");
     println!("entries: {}", storage.entries().len());
     println!("pc:      {:?}", storage.state().pc);
@@ -1940,7 +2103,34 @@ fn status_command(sessions_dir: &Path, id: &str) -> Result<()> {
     for line in tole_cli::usage_report::turn_lines(storage.entries(), usage) {
         println!("{line}");
     }
+    // #458: model / effort / context / token lines from the one status
+    // snapshot, appended last so the pre-existing lines keep their order.
+    let cfg = tole_cli::config_apply::provider_config();
+    let configured = cfg.as_ref().map(|c| c.model.as_str());
+    let settings = tole_cli::compaction_host::CompactionSettings {
+        window,
+        ..Default::default()
+    };
+    let snap = match &cfg {
+        Some(c) => {
+            let model = tole_cli::turn_runner::session_model(&storage, &c.model);
+            let mut src = tole_cli::compaction_host::ModelsCatalog::new(c, &model);
+            tole_cli::status::session_status(&storage, configured, &settings, &mut src)
+        }
+        None => tole_cli::status::session_status(&storage, None, &settings, &mut NoWindow),
+    };
+    for line in snap.lines() {
+        println!("{line}");
+    }
     Ok(())
+}
+
+/// Window source for `tole status` without a provider config: never knows.
+struct NoWindow;
+impl tole_cli::compaction_host::WindowSource for NoWindow {
+    fn window(&mut self) -> Option<u64> {
+        None
+    }
 }
 
 /// B3: list every session in the dir, newest first, one line each.
@@ -1977,7 +2167,7 @@ fn sessions_command(sessions_dir: &Path) -> Result<()> {
             .unwrap_or(0);
         let id = stem.to_string();
         // Read-only peek: replay the file to surface pc + turn count.
-        let s = match JsonlStorage::open(entry.path()) {
+        let s = match JsonlStorage::open_read_only(entry.path()) {
             Ok(s) => s,
             Err(_) => continue, // unreadable/corrupt: skip, don't fail the listing
         };
@@ -2007,6 +2197,76 @@ fn sessions_command(sessions_dir: &Path) -> Result<()> {
             "{:<26} {:<18} {:<12} {:>5} {:>6}  {mtime}",
             row.1, name, row.2, row.3, row.4
         );
+    }
+    Ok(())
+}
+
+/// `tole branch` (#210): fork `id` at a settled entry into a new session.
+fn branch_command(sessions_dir: &Path, id: &str, at: Option<&str>) -> Result<()> {
+    if !valid_session_id(id) {
+        anyhow::bail!("invalid session id {id:?} (allowed: [A-Za-z0-9_-], max 64)");
+    }
+    let src = session_path(sessions_dir, id);
+    if !src.exists() {
+        anyhow::bail!("session {id} not found at {}", src.display());
+    }
+    let new_id = new_session_id();
+    let f = JsonlStorage::fork(&src, sessions_dir, &new_id, at).context("forking session")?;
+    let cut = f.forked_from().map(|o| o.entry.clone()).unwrap_or_default();
+    drop(f);
+    tole_cli::session_index::record(sessions_dir, &new_id, "branch");
+    println!("branched: {new_id}");
+    println!("from:     {id} @ {cut}");
+    println!("continue: tole resume {new_id} \"<prompt>\"");
+    Ok(())
+}
+
+/// `tole import-claude` (#381): Claude Code transcript → new tole session.
+fn import_claude_command(sessions_dir: &Path, path: &Path) -> Result<()> {
+    std::fs::create_dir_all(sessions_dir)?;
+    let r = tole_core::ccimport::import_file(path, sessions_dir).context("importing transcript")?;
+    for w in &r.warnings {
+        eprintln!("warning: {w}");
+    }
+    tole_cli::session_index::record(sessions_dir, &r.session_id, "import");
+    println!("imported: {} ({} entries)", r.session_id, r.imported);
+    if r.dropped > 0 {
+        println!("dropped:  {} unsettled trailing entries", r.dropped);
+    }
+    println!("continue: tole resume {} \"<prompt>\"", r.session_id);
+    Ok(())
+}
+
+/// `tole sessions --tree` (#210): sessions with their forks nested.
+fn sessions_tree_command(sessions_dir: &Path) -> Result<()> {
+    let mut nodes = Vec::new();
+    if sessions_dir.exists() {
+        for entry in std::fs::read_dir(sessions_dir)?.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let Some(stem) = name.strip_suffix(".jsonl") else {
+                continue;
+            };
+            if !valid_session_id(stem) {
+                continue;
+            }
+            let Ok(s) = JsonlStorage::open_read_only(entry.path()) else {
+                continue;
+            };
+            nodes.push(tole_cli::session_index::TreeNode {
+                id: stem.to_string(),
+                parent: s.forked_from().map(|o| o.session.clone()),
+                at: s.forked_from().map(|o| o.entry.clone()),
+                pc: format!("{:?}", s.state().pc),
+                turns: tole_core::transcript::turn_count(s.entries()),
+            });
+        }
+    }
+    if nodes.is_empty() {
+        println!("no sessions in {}", sessions_dir.display());
+        return Ok(());
+    }
+    for line in tole_cli::session_index::tree_lines(nodes) {
+        println!("{line}");
     }
     Ok(())
 }
@@ -2112,6 +2372,7 @@ fn latest_session_id(dir: &Path) -> Option<String> {
 /// `resume_turn` on the next line, keeping the conversation alive without
 /// losing durable context. Ctrl-C / EOF exit cleanly — every commit is
 /// already durable, `tole chat --resume <id>` picks the thread back up.
+#[allow(clippy::too_many_arguments)]
 fn chat_command(
     sessions_dir: &Path,
     system: Option<&str>,
@@ -2120,6 +2381,8 @@ fn chat_command(
     allow_patterns: &[String],
     yes: bool,
     host: &HostConfig,
+    // Attached to the first message only (#212).
+    mut pending_images: Vec<tole_core::image::ImageRef>,
 ) -> Result<()> {
     use std::io::{BufRead, Write};
 
@@ -2217,6 +2480,24 @@ fn chat_command(
         None,
     )
     .map_err(anyhow::Error::msg)?;
+    // Server prompts (#213): probe-first, silent when no server offers any.
+    #[cfg(feature = "mcp")]
+    {
+        let cmds: Vec<String> = host
+            .mcp_server
+            .iter()
+            .filter_map(|spec| tole_core::mcp::McpServerConfig::parse(spec).ok())
+            .flat_map(|cfg| {
+                tole_core::mcp::probe_server_extras(&cfg)
+                    .prompts
+                    .into_iter()
+                    .map(move |p| format!("/mcp:{}:{}", cfg.name, p.name))
+            })
+            .collect();
+        if !cmds.is_empty() {
+            println!("mcp prompts: {}", cmds.join(" "));
+        }
+    }
     // One token for the whole chat session: sibling notices (#380) reach
     // a child running `tole chat` at each turn's next safe point.
     let (cancel, _sibling_watcher) = tole_cli::turn_runner::cli_turn_token();
@@ -2249,6 +2530,33 @@ fn chat_command(
             Err(e) => anyhow::bail!("reading stdin: {e}"),
         }
         let text = line.trim();
+        // `/mcp:<server>:<prompt> [k=v ...]` (#213): the server renders the
+        // prompt; the result is shown, then sent as this turn's user
+        // message. Server-controlled text — same trust tier as a tool
+        // description; tool calls it provokes still hit the approval gate.
+        #[cfg(feature = "mcp")]
+        let rendered: String;
+        #[cfg(feature = "mcp")]
+        let text = match tole_core::mcp::parse_prompt_command(text) {
+            None => text,
+            Some(parsed) => {
+                match parsed.and_then(|(s, p, a)| tole_core::mcp::get_server_prompt(&s, &p, a)) {
+                    Ok(t) if !t.is_empty() => {
+                        println!("tole> (mcp prompt)\n{t}");
+                        rendered = t;
+                        rendered.as_str()
+                    }
+                    Ok(_) => {
+                        eprintln!("tole> mcp prompt rendered no text");
+                        continue;
+                    }
+                    Err(e) => {
+                        eprintln!("tole> {e}");
+                        continue;
+                    }
+                }
+            }
+        };
         // Bound auto-resolve attempts per message so a wedged session
         // can't spin forever (each retry is a full provider round-trip).
         let mut retries_left: u8 = 2;
@@ -2288,18 +2596,21 @@ fn chat_command(
         };
         #[cfg(not(feature = "shell-tools"))]
         let turn_prompt = text.to_string();
+        let turn_images = std::mem::take(&mut pending_images);
         let outcome = loop {
             match storage.state().pc {
                 tole_core::state::Pc::Idle | tole_core::state::Pc::Final => {
                     // Context compaction (#440): only here, between
                     // settled turns.
                     compactor.before_turn(&mut storage, &mut *provider);
-                    break run_turn_with_cancel(
+                    break run_turn_with_images(
                         &mut storage,
                         &mut provider,
                         &registry,
                         &turn_prompt,
+                        &turn_images,
                         &cancel,
+                        None,
                     );
                 }
                 _ => {
@@ -2363,7 +2674,10 @@ fn chat_command(
                 eprintln!("tole> (unknown tool '{name}' — recorded; your next message continues)")
             }
             Ok(TurnOutcome::ProviderFailed { message }) => {
-                eprintln!("tole> (provider failed: {message}; next message retries via resume)")
+                eprintln!(
+                    "tole> (provider failed: {message}{}; next message retries via resume)",
+                    tole_cli::compaction_host::overflow_hint(&message)
+                )
             }
             Ok(TurnOutcome::BudgetExhausted) => {
                 eprintln!("tole> (step budget exhausted — turn aborted; next message resumes)")
@@ -2375,6 +2689,9 @@ fn chat_command(
             }
             Ok(TurnOutcome::Cancelled) => {
                 eprintln!("tole> (turn cancelled — next message resumes)")
+            }
+            Ok(TurnOutcome::Detached) => {
+                eprintln!("tole> (turn detached — next message resumes)")
             }
             Ok(TurnOutcome::LoopDetected { .. }) => eprintln!(
                 "tole> (loop guard tripped — identical tool calls repeated; next message resumes)"
@@ -2418,6 +2735,78 @@ fn chat_command(
         "session {session_id} closed — entries: {}",
         storage.entries().len()
     );
+    Ok(())
+}
+
+/// `tole` / `tole tui` (#460): the TUI over one ordinary durable session
+/// (same JSONL as `chat`, so `tole resume` / `sessions --all` see it).
+/// Memory loop, MCP prompt commands and sibling notices are not wired here yet.
+#[cfg(feature = "tui")]
+fn tui_command(
+    sessions_dir: &Path,
+    system: Option<&str>,
+    resume: Option<String>,
+    allow_patterns: &[String],
+    yes: bool,
+    host: &HostConfig,
+) -> Result<()> {
+    let cfg = tole_cli::turn_runner::provider_config().map_err(anyhow::Error::msg)?;
+    if let Some(id) = &resume {
+        if !valid_session_id(id) || !session_path(sessions_dir, id).exists() {
+            anyhow::bail!("session {id} not found in {}", sessions_dir.display());
+        }
+    }
+    let (prompter, approvals) = tole_tui::approval_channel();
+    let approver = InteractiveApprover::new(tole_cli::tui_host::TuiPrompt(prompter))
+        .with_allow_patterns(allow_patterns.to_vec())
+        .with_auto_write(yes);
+    let mut registry = build_registry(approver, host, allow_patterns)?;
+    if host.plan_mode {
+        registry.retain_read_only();
+    }
+    let skill_sections = apply_skills(
+        &host.skills,
+        host.workspace.as_ref(),
+        host.no_skills,
+        &mut registry,
+    )?;
+    // Opt-in tool-boundary hooks (issue #110): same wiring as `chat`.
+    #[cfg(feature = "shell-tools")]
+    if !host.on_pretool.is_empty() || !host.on_posttool.is_empty() || !host.on_turnend.is_empty() {
+        let mut hooks = tole_core::hooks::ToolHooks::from_cli(&host.on_pretool, &host.on_posttool);
+        hooks.turnend = host
+            .on_turnend
+            .iter()
+            .map(|c| tole_core::hooks::turnend_hook(c))
+            .collect();
+        registry.set_hooks(hooks);
+    }
+    // The pinned prompt of a fresh session; `/new` inside the TUI reuses it.
+    let prompt = system
+        .map(str::to_string)
+        .or_else(resolve_system_prompt)
+        .unwrap_or_else(|| build_default_prompt(host.plan_mode));
+    let prompt = format!("{prompt}{}{skill_sections}", review_section(&registry));
+    let storage = match &resume {
+        Some(id) => {
+            JsonlStorage::open(session_path(sessions_dir, id)).context("replaying session log")?
+        }
+        None => {
+            std::fs::create_dir_all(sessions_dir)
+                .with_context(|| format!("creating {}", sessions_dir.display()))?;
+            let id = new_session_id();
+            let s = JsonlStorage::create_with(sessions_dir, &id, None, Some(&prompt))
+                .with_context(|| format!("creating session {id}"))?;
+            tole_cli::session_index::record(sessions_dir, &id, "tui");
+            s
+        }
+    };
+    tool_roster::register_todo(&mut registry, storage.entries(), host.plan_mode)?;
+    let session = tole_cli::tui_host::TuiSession::new(storage, registry, cfg, host.compaction)
+        .with_sessions(sessions_dir.to_path_buf(), Some(prompt));
+    tole_tui::run(&session, approvals).context("terminal ui")?;
+    let id = session.session_id();
+    println!("session {id} closed (resume: tole resume {id} \"…\")");
     Ok(())
 }
 
@@ -2526,7 +2915,10 @@ fn report_outcome(session_id: &str, outcome: TurnOutcome) {
             std::process::exit(3);
         }
         TurnOutcome::ProviderFailed { message } => {
-            eprintln!("tole: provider failed: {message} (resume with: tole resume {session_id})");
+            eprintln!(
+                "tole: provider failed: {message}{} (resume with: tole resume {session_id})",
+                tole_cli::compaction_host::overflow_hint(&message)
+            );
             std::process::exit(4);
         }
         TurnOutcome::BudgetExhausted => {
@@ -2536,6 +2928,10 @@ fn report_outcome(session_id: &str, outcome: TurnOutcome) {
         TurnOutcome::Cancelled => {
             eprintln!("tole: turn cancelled (resume with: tole resume {session_id})");
             std::process::exit(8);
+        }
+        TurnOutcome::Detached => {
+            eprintln!("tole: turn detached (resume with: tole resume {session_id})");
+            std::process::exit(9);
         }
         TurnOutcome::LoopDetected { tool, count } => {
             eprintln!(

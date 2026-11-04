@@ -15,6 +15,7 @@
 //! the turn loop stores under `tole_route` in the step's usage row, so a
 //! switch is durable and auditable.
 
+use crate::cancel::CancelToken;
 use crate::entry::Entry;
 use crate::provider::{Provider, ProviderError, ProviderOutput};
 use serde_json::{json, Value};
@@ -131,6 +132,14 @@ fn short(s: &str) -> String {
 
 impl Provider for FailoverProvider {
     fn complete(&mut self, transcript: &[Entry]) -> Result<ProviderOutput, ProviderError> {
+        self.complete_with_cancel(transcript, &CancelToken::default())
+    }
+
+    fn complete_with_cancel(
+        &mut self,
+        transcript: &[Entry],
+        cancel: &CancelToken,
+    ) -> Result<ProviderOutput, ProviderError> {
         // Back to the primary once the cooldown has passed.
         if self.active > 0
             && self
@@ -149,7 +158,10 @@ impl Provider for FailoverProvider {
         let order: Vec<usize> = (0..n).map(|k| (self.active + k) % n).collect();
         for (pos, &i) in order.iter().enumerate() {
             let has_next = pos + 1 < n;
-            match self.chain[i].provider.complete(transcript) {
+            match self.chain[i]
+                .provider
+                .complete_with_cancel(transcript, cancel)
+            {
                 Ok(out) => {
                     if i != self.active {
                         if i == 0 {
@@ -162,7 +174,7 @@ impl Provider for FailoverProvider {
                     self.last_answered = Some(i);
                     return Ok(out);
                 }
-                Err(e) if has_next && is_failover_error(&e.0) => {
+                Err(e) if has_next && !cancel.is_cancelled() && is_failover_error(&e.0) => {
                     self.last_failed
                         .push((self.chain[i].label.clone(), short(&e.0)));
                 }
@@ -197,6 +209,16 @@ impl Provider for FailoverProvider {
 
     fn last_wire_stats(&self) -> Option<Value> {
         self.answered().and_then(Provider::last_wire_stats)
+    }
+
+    fn last_degraded(&self) -> Option<Value> {
+        self.answered().and_then(Provider::last_degraded)
+    }
+
+    fn last_extra_tool_calls(&self) -> Vec<(String, Value)> {
+        self.answered()
+            .map(Provider::last_extra_tool_calls)
+            .unwrap_or_default()
     }
 
     fn last_route(&self) -> Option<Value> {

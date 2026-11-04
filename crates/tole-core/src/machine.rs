@@ -105,6 +105,32 @@ pub fn begin(
     safety: ReplaySafety,
     parent: Option<&str>,
 ) -> Result<EffectHandle, StorageError> {
+    begin_inner(s, tool, input, safety, parent, false)
+}
+
+/// [`begin`] for the 2nd..Nth call of one model response (#480): the
+/// intent carries `"batch": true`, which the wire flattening reads to put
+/// it in the same assistant `tool_calls` array as the call before it.
+/// Otherwise identical — each member is its own sandwich with its own
+/// [`ReplaySafety`].
+pub fn begin_batch_member(
+    s: &mut dyn Storage,
+    tool: &str,
+    input: Value,
+    safety: ReplaySafety,
+    parent: Option<&str>,
+) -> Result<EffectHandle, StorageError> {
+    begin_inner(s, tool, input, safety, parent, true)
+}
+
+fn begin_inner(
+    s: &mut dyn Storage,
+    tool: &str,
+    input: Value,
+    safety: ReplaySafety,
+    parent: Option<&str>,
+    batch_member: bool,
+) -> Result<EffectHandle, StorageError> {
     let seq = s.state().seq;
     // One sandwich at a time: a set pending cell means a previous effect
     // never settled (crash or host bug) — refuse rather than overwrite.
@@ -121,11 +147,17 @@ pub fn begin(
             id: Some(intent_id.clone()),
             parent_id: parent.map(str::to_string),
             kind: EntryType::new(EntryType::INTENT),
-            payload: json!({
-                "tool": tool,
-                "input": input,
-                "replay": safety.as_str(),
-            }),
+            payload: {
+                let mut p = json!({
+                    "tool": tool,
+                    "input": input,
+                    "replay": safety.as_str(),
+                });
+                if batch_member {
+                    p["batch"] = json!(true);
+                }
+                p
+            },
             timestamp: 0,
         })
         .register(RegisterWrite::set(
@@ -151,6 +183,25 @@ pub fn settle_ok(
     handle: &EffectHandle,
     output: Value,
 ) -> Result<String, StorageError> {
+    settle_ok_with(s, handle, output, false)
+}
+
+/// [`settle_ok`] with its fsync deferred to the [`finish`] commit that the
+/// turn loop always issues next (#483): same line, one fewer `fdatasync`.
+pub(crate) fn settle_ok_deferred(
+    s: &mut dyn Storage,
+    handle: &EffectHandle,
+    output: Value,
+) -> Result<String, StorageError> {
+    settle_ok_with(s, handle, output, true)
+}
+
+fn settle_ok_with(
+    s: &mut dyn Storage,
+    handle: &EffectHandle,
+    output: Value,
+    defer: bool,
+) -> Result<String, StorageError> {
     verify_pending(s, handle)?;
     let seq = s.state().seq;
     let commit = Commit::new()
@@ -161,6 +212,7 @@ pub fn settle_ok(
         ))
         .register(RegisterWrite::delete("pending", PENDING_KEY))
         .transition(StateTransition::from(seq, Pc::Settling));
+    let commit = if defer { commit.defer_sync() } else { commit };
     let committed = s.commit(commit)?;
     Ok(committed[0].id.clone())
 }

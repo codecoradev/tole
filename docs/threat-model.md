@@ -74,6 +74,14 @@ lives) / **gap** (tracked) / **N/A** (with rationale).
   possible future hardening; none is planned or promised. Non-unix hosts
   have no `O_NOFOLLOW` equivalent wired (best-effort `symlink_metadata`
   check only).
+- **`edit_file` read-modify-write window** — `edit_file` checks the
+  quoted content hash against the file it just read, then writes the edit
+  through a temp file and an atomic rename. A write by ANOTHER process
+  between that read and the rename is overwritten. The window is the
+  duration of one temp-file write; closing it would need a lock every
+  other writer honours, which editors and build tools do not. Within one
+  session tool calls are sequential, so only concurrent outside writers
+  are affected.
 - **`git status`/`diff` are repo-wide by design** — they take no
   pathspec and run with cwd = the tool's workdir, so they show the whole
   repository containing it; in a monorepo subdirectory that includes
@@ -94,6 +102,19 @@ lives) / **gap** (tracked) / **N/A** (with rationale).
   are `tole serve --transport mcp` (#96/#137, hardened in #136) — see the
   Server surfaces section below. Resource subscriptions remain unshipped;
   that would re-open this document.
+- MCP prompts and resources (#213): a prompt template is
+  **server-controlled content** — same trust tier as a tool description,
+  but it lands as the next *user* message when the operator types
+  `/mcp:<server>:<prompt>`, so tole prints the rendered text before it is
+  sent, caps it (256k chars) and keeps only text parts. It adds no
+  authority: every tool call it provokes still passes the approver.
+  `mcp_read` (`resources/read`) is a ReadOnly tool registered only for
+  servers that advertised the `resources` capability; the server list is
+  fixed at startup (the model cannot name another), URIs are server-side
+  (no jail), results are capped and fenced like any tool result. Residual:
+  a malicious server can put prompt-injection text in either surface —
+  server config stays operator trust, and `mcp_read` assumes a server's
+  `resources/read` has no side effects (a spec expectation, not enforced).
 
 ## Server surfaces — `tole serve`, `tole mcp`, `tole acp` (#94–#96, #137)
 
@@ -225,7 +246,7 @@ failing gate cannot livelock the loop — the turn settles durably as
 
 All three server faces expose cooperative turn cancellation: ACP
 clients send `session/cancel`, REST callers `POST /sessions/{id}/cancel`,
-MCP clients call `tole_session_cancel`. Steering (soft interrupt, #377) goes through the same authenticated faces (`POST /sessions/{id}/interrupt`, `tole_session_interrupt`) and adds no authority: the message is ordinary user-role input to the session, so every tool the steered turn runs still passes the session's approver. Every path sets the same
+MCP clients call `tole_session_cancel`. Steering (soft interrupt, #377) goes through the same authenticated faces (`POST /sessions/{id}/interrupt`, `tole_session_interrupt`; detaching, #217, via `POST /sessions/{id}/detach` / `tole_session_detach`, only stops waiting — it never runs or approves anything) and adds no authority: the message is ordinary user-role input to the session, so every tool the steered turn runs still passes the session's approver. Every path sets the same
 per-session token; a blocking turn observes it at checkpoints (between
 provider calls and tool executions) and settles
 `stopReason: "cancelled"` as a normal, durable turn end — the session
@@ -263,6 +284,15 @@ names), and any handoff or sibling-log text shown to another model is
 escaped and bounded. The shared sibling log is a same-user channel between
 processes that already share the parent's authority; a forged line can only
 add notices, and ids read from it must match the agent-id charset.
+
+The verify gate is cooperative, not adversarial: a child that shares the
+parent's workspace can write files under `tole-agents/<id>/`, including
+`meta.json` (role, `keep_mailbox`, prompt) and its own handoff, so a
+deliberately hostile child can make its gate read `closed`. It gains no
+authority from that — it already runs with the parent's approvals and could
+report a passing handoff directly. What a forged `meta.json` must never
+reach is anything outside the child's own agent dir: the mailbox room is
+derived from the validated agent id, never read from the file.
 
 ## `systemone_decide` (#172/#173)
 
@@ -444,6 +474,11 @@ model's own earlier answers. The window lookup is one `GET /models` on the sessi
 with the same base URL and credentials as chat completions (no new host or
 secret), at most once per process and only after a prompt passes 8k tokens;
 an explicit `TOLE_CONTEXT_WINDOW` / config `context_window` skips it.
+A provider context-overflow error (#481) sets a durable `fact/context_overflow`
+register in the commit that settles the failed turn; the next prompt then forces
+one ordinary compaction pass (same atomic, between-turns, fenced-summary path) and
+clears it. Classification reads only HTTP 400/413/422 error text, so a tool output
+or model text can neither set nor suppress the flag.
 
 ### Global session index (#439)
 

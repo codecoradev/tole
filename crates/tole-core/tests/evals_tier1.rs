@@ -150,6 +150,29 @@ fn tier1_wire_shape_stability() {
     assert_eq!(rendered, expected);
 }
 
+/// #457: `reasoning_effort` rides on the body exactly when set; unset is
+/// today's golden body (the test above), byte for byte.
+#[test]
+fn tier1_wire_shape_reasoning_effort_only_when_set() {
+    let dir = tmpdir("wire-effort");
+    let s = canonical_session(&dir, "wire-effort");
+    let base = OpenAiProvider::new(cfg()).with_system_prompt("You are tole, a careful assistant.");
+    let unset = base.request_body(s.entries());
+    assert!(unset.get("reasoning_effort").is_none());
+    let none = base
+        .clone()
+        .with_reasoning_effort(None)
+        .request_body(s.entries());
+    assert_eq!(none.to_string(), unset.to_string());
+    let set = base
+        .with_reasoning_effort(Some("medium".into()))
+        .request_body(s.entries());
+    assert_eq!(set["reasoning_effort"], json!("medium"));
+    let mut without = set;
+    without.as_object_mut().unwrap().remove("reasoning_effort");
+    assert_eq!(without.to_string(), unset.to_string());
+}
+
 // ---------------------------------------------------------------------------
 // 2. RESUME EQUIVALENCE
 // ---------------------------------------------------------------------------

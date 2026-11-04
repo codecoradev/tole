@@ -48,6 +48,8 @@ pub struct Roster {
     pub mcp_servers: Vec<tole_core::mcp::McpServerConfig>,
     /// Plan publishing (#196): only for a transport that renders plans.
     pub plan_emitter: Option<PlanEmitter>,
+    /// Where finished background jobs nudge the session (#217).
+    pub job_notices: Option<tole_core::interrupt::InterruptQueue>,
 }
 
 impl Roster {
@@ -62,6 +64,7 @@ impl Roster {
             #[cfg(feature = "mcp")]
             mcp_servers: Vec::new(),
             plan_emitter: None,
+            job_notices: None,
         }
     }
 }
@@ -158,7 +161,10 @@ pub fn build(approver: impl Approver + 'static, roster: Roster) -> Result<ToolRe
             // A child's command tools refuse to spawn tole itself (the
             // spawn-yourself bypass of the depth cap).
             let run_cmd = RunCommandTool::new(shell_dir.clone());
-            let job_start = JobStartTool::new(root.clone());
+            let mut job_start = JobStartTool::new(root.clone());
+            if let Some(q) = roster.job_notices.clone() {
+                job_start = job_start.with_completion_notice(q);
+            }
             let (run_cmd, job_start) = if depth >= 1 {
                 (
                     run_cmd.in_child_agent_mode(),
@@ -236,6 +242,10 @@ pub fn build(approver: impl Approver + 'static, roster: Roster) -> Result<ToolRe
     // native tool availability.
     #[cfg(feature = "mcp")]
     let mut cora_mcp_ok = false;
+    // Servers that advertised `resources` (#213): one ReadOnly `mcp_read`
+    // tool, registered only when at least one server offers any.
+    #[cfg(feature = "mcp")]
+    let mut resource_servers = Vec::new();
     #[cfg(feature = "mcp")]
     for cfg in &roster.mcp_servers {
         let names = tole_core::mcp::register_server_tools(&mut reg, cfg);
@@ -245,6 +255,16 @@ pub fn build(approver: impl Approver + 'static, roster: Roster) -> Result<ToolRe
         if names.is_empty() {
             eprintln!("tole: mcp[{}]: no tools registered", cfg.name);
         }
+        if tole_core::mcp::probe_server_extras(cfg).resources {
+            resource_servers.push(cfg.name.clone());
+        }
+    }
+    #[cfg(feature = "mcp")]
+    if !resource_servers.is_empty() {
+        add(
+            &mut reg,
+            Box::new(tole_core::mcp::McpReadTool::new(resource_servers)),
+        )?;
     }
     #[cfg(not(feature = "mcp"))]
     let cora_mcp_ok = false;

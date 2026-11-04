@@ -298,6 +298,48 @@ fn pid_alive(pid: u32) -> Result<bool, String> {
     Ok(!state.is_empty() && !state.starts_with('Z'))
 }
 
+/// The full command line `ps` reports for `pid` (`ps -ww -o command=`:
+/// `-ww` = never truncated), `None` when unknown.
+fn process_command(pid: u32) -> Option<String> {
+    let out = crate::subprocess::run_with_timeout(
+        Command::new("ps")
+            .arg("-ww")
+            .arg("-p")
+            .arg(pid.to_string())
+            .arg("-o")
+            .arg("command="),
+        crate::subprocess::SUBPROCESS_TIMEOUT,
+    )
+    .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let cmd = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!cmd.is_empty()).then_some(cmd)
+}
+
+/// Is agent `id`, with its pid file saying `pid`, still running?
+/// [`pid_alive`] alone counts a recycled pid — an unrelated process that
+/// got the dead child's number — as the child forever, wedging the
+/// concurrency cap and keeping `agent_poll` at "running" (scan
+/// 2026-10-28). The agent was launched with `--sessions-dir
+/// <agents>/<id>/sessions`, so its command line names its own id; a live
+/// pid whose command line does not is another process. This compares
+/// identity, never clocks (a wall-clock age check would read a live agent
+/// as dead after a clock jump — NTP, VM resume — and wipe its mailbox) and
+/// never the executable name (a launcher or an interpreter changes it). An
+/// unreadable command line keeps the plain liveness answer: a failed
+/// lookup is never read as "dead".
+fn agent_alive(pid: u32, id: &str) -> Result<bool, String> {
+    if !pid_alive(pid)? {
+        return Ok(false);
+    }
+    // The whole path segment: a bare `contains(id)` would let agent `a-12`
+    // pass for a dead `a-1`.
+    let sessions = format!("/{id}/sessions");
+    Ok(process_command(pid).is_none_or(|cmd| cmd.contains(&sessions)))
+}
+
 /// One agent's durable state (meta.json in its dir).
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct AgentMeta {
@@ -359,7 +401,8 @@ fn live_agents(root: &std::path::Path) -> Result<usize, String> {
             continue;
         };
         if let Ok(pid) = pid.trim().parse::<u32>() {
-            if pid_alive(pid)? {
+            let id = dir.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            if agent_alive(pid, id)? {
                 n += 1;
             }
         }
@@ -908,7 +951,7 @@ impl Tool for AgentPollTool {
             .map_err(|_| format!("agent_poll: corrupt pid file for {id}"))?;
         let mut meta = read_meta(&dir)?;
         let running =
-            pid_alive(pid).map_err(|e| format!("agent_poll: liveness check failed: {e}"))?;
+            agent_alive(pid, id).map_err(|e| format!("agent_poll: liveness check failed: {e}"))?;
         let elapsed_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
@@ -1547,6 +1590,81 @@ mod tests {
         assert!(
             !agents_root(&d).exists() || std::fs::read_dir(agents_root(&d)).unwrap().count() == 0
         );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Scan 2026-10-28: a live pid whose command line does not name the
+    /// agent is a RECYCLED number — it must neither hold a cap slot nor keep
+    /// `agent_poll` at "running". No clocks and no executable names are
+    /// involved, so a clock jump or a launcher cannot make a live agent look
+    /// recycled.
+    #[cfg(unix)]
+    #[test]
+    fn a_recycled_pid_is_not_the_agent() {
+        let d = tmp("pid-reuse");
+        let id = "a-live-agent";
+        let dir = agents_root(&d).join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        // The real launch shape: an interpreter running a script, with the
+        // agent's own sessions dir on its command line.
+        let script = d.join("fake-launcher");
+        std::fs::write(&script, "#!/bin/sh\nsleep 30\ntrue\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut live = Command::new(&script)
+            .args(["run", "--sessions-dir"])
+            .arg(dir.join("sessions"))
+            .spawn()
+            .unwrap();
+        let pid = live.id();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(agent_alive(pid, id).unwrap(), "the agent itself");
+        assert!(
+            !agent_alive(pid, "a-someone-else").unwrap(),
+            "a process that is not this agent"
+        );
+        // Ids that are a prefix or a suffix of this agent's id are not it.
+        for other in ["a-live", "live-agent", "a-live-agen"] {
+            assert!(!agent_alive(pid, other).unwrap(), "{other}");
+        }
+
+        std::fs::write(dir.join("pid"), pid.to_string()).unwrap();
+        let meta = AgentMeta {
+            prompt: "p".into(),
+            mailbox_ns: "agent-x".into(),
+            keep_mailbox: true,
+            // Far in the past: a wall-clock age check would call the live
+            // agent dead. The identity check must not care.
+            spawned_at_ms: 1,
+            worktree: None,
+            branch: None,
+            mailbox_consumed: true,
+            role: None,
+        };
+        write_meta(&dir, &meta).unwrap();
+        assert_eq!(live_agents(&d).unwrap(), 1, "the real agent, however old");
+        let polled = AgentPollTool::new(d.clone())
+            .execute(json!({"agent": id}))
+            .unwrap();
+        assert_eq!(polled["running"], json!(true));
+
+        // The same pid under another agent's dir: recycled.
+        let other = agents_root(&d).join("a-dead-agent");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("pid"), pid.to_string()).unwrap();
+        write_meta(&other, &meta).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(
+            live_agents(&d).unwrap(),
+            0,
+            "no cap slot for a recycled pid"
+        );
+        let polled = AgentPollTool::new(d.clone())
+            .execute(json!({"agent": "a-dead-agent"}))
+            .unwrap();
+        assert_eq!(polled["running"], json!(false));
+        let _ = live.kill();
+        let _ = live.wait();
         let _ = std::fs::remove_dir_all(&d);
     }
 

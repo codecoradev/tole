@@ -957,3 +957,85 @@ fn compaction_settings_resolve_flag_env_config_default() {
     let s = Settings::resolve(&Flags::default(), &cfg, &bad);
     assert_eq!(s.context_window.unwrap().source, Source::Config);
 }
+
+// ------------------------------------------------- reasoning effort (#457)
+
+fn effort(flags: &Flags, cfg_src: &str, env: &[(&str, &str)]) -> Option<(String, Source)> {
+    Settings::resolve(flags, &cfg(cfg_src), &env_of(env))
+        .reasoning_effort
+        .map(|e| (e.value, e.source))
+}
+
+#[test]
+fn reasoning_effort_precedence_flag_env_config_default() {
+    let flag = Flags {
+        reasoning_effort: s("minimal"),
+        ..Default::default()
+    };
+    let env = [("TOLE_REASONING_EFFORT", "low")];
+    let c = "reasoning_effort = \"medium\"\n";
+    assert_eq!(
+        effort(&flag, c, &env),
+        Some(("minimal".into(), Source::Flag))
+    );
+    let none = Flags::default();
+    assert_eq!(effort(&none, c, &env), Some(("low".into(), Source::Env)));
+    assert_eq!(
+        effort(&none, c, &[]),
+        Some(("medium".into(), Source::Config))
+    );
+    assert_eq!(effort(&none, "", &[]), None, "default = unset");
+    assert_eq!(effort(&none, "", &[("TOLE_REASONING_EFFORT", "  ")]), None);
+}
+
+#[test]
+fn reasoning_effort_from_the_user_layer_is_labelled() {
+    let user = cfg("reasoning_effort = \"high\"\n");
+    let merged = crate::config::layered(&Config::default(), &user);
+    let e = Settings::resolve(&Flags::default(), &merged, &env_of(&[]))
+        .reasoning_effort
+        .unwrap();
+    assert_eq!((e.value.as_str(), e.source), ("high", Source::UserConfig));
+}
+
+#[test]
+fn invalid_env_effort_is_reported_not_swallowed() {
+    let st = Settings::resolve(
+        &Flags::default(),
+        &Config::default(),
+        &env_of(&[("TOLE_REASONING_EFFORT", "turbo")]),
+    );
+    let msg = st.effort_error().expect("invalid env value is an error");
+    assert!(
+        msg.contains("TOLE_REASONING_EFFORT") && msg.contains("turbo"),
+        "{msg}"
+    );
+    let ok = Settings::resolve(
+        &Flags::default(),
+        &Config::default(),
+        &env_of(&[("TOLE_REASONING_EFFORT", " HIGH ")]),
+    );
+    assert_eq!(ok.effort_error(), None);
+    assert_eq!(ok.reasoning_effort.unwrap().value, "high", "canonical form");
+}
+
+#[test]
+fn config_check_shows_effective_effort_and_source() {
+    let dir = tmpdir();
+    let p = dir.join(CONFIG_REL_PATH);
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(&p, "reasoning_effort = \"medium\"\n").unwrap();
+    let out = check(
+        &dir,
+        None,
+        None,
+        &Flags::default(),
+        &env_of(&[("TOLE_REASONING_EFFORT", "low")]),
+    )
+    .unwrap();
+    assert!(
+        out.contains("reasoning_effort = \"medium\"  [config]  effective: \"low\"  (env TOLE_REASONING_EFFORT)"),
+        "{out}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}

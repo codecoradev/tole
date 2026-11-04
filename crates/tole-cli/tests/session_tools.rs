@@ -298,3 +298,77 @@ fn session_interrupt_tool_queues_only_for_a_running_turn() {
     *busy.lock().unwrap() = false;
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// #217 MCP face: `tole_session_detach` flags the session's turn handle
+/// only while a turn is running (idle/unknown are clear errors), and a job
+/// started through the session's registry nudges THE session's queue when
+/// it exits.
+#[test]
+fn session_detach_tool_flags_only_a_running_turn_and_jobs_nudge_the_session() {
+    let dir = ws("detach-tool");
+    let state = SessionToolState::new(
+        vec!["job_start".into()],
+        false,
+        None,
+        std::path::PathBuf::from(&dir),
+        None,
+        vec![],
+    );
+    let tools = state.tools();
+    let tool = tool_by_name(&tools, "tole_session_detach");
+
+    let err = tool.execute(json!({"session_id": "nope"})).unwrap_err();
+    assert!(err.contains("unknown session"), "{err}");
+
+    let a = std::path::Path::new(&dir).join("a");
+    let sid = tool_by_name(&tools, "tole_session_new")
+        .execute(json!({"cwd": a.to_string_lossy()}))
+        .unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (token, busy, registry) = {
+        let sessions = tole_cli::session_host::lock_sessions(&state.sessions);
+        let st = sessions.get(&sid).unwrap();
+        (
+            st.cancel.clone(),
+            std::sync::Arc::clone(&st.busy),
+            std::sync::Arc::clone(&st.registry),
+        )
+    };
+
+    // Idle: nothing to detach.
+    let err = tool.execute(json!({})).unwrap_err();
+    assert!(err.contains("no turn is running"), "{err}");
+    assert!(!token.is_detached());
+
+    // Running: THE session's handle is flagged — detached, not cancelled.
+    *busy.lock().unwrap() = true;
+    let out = tool.execute(json!({})).unwrap();
+    assert_eq!(out["detached"], json!(true));
+    assert!(token.is_detached() && !token.is_cancelled());
+    *busy.lock().unwrap() = false;
+
+    // A job started by the session nudges the session's soft-interrupt queue.
+    // `job_start` is only registered under shell-tools, so the bare
+    // no-mcp profile has no job tools to observe a nudge from.
+    #[cfg(feature = "shell-tools")]
+    {
+        let job = registry
+            .get("job_start")
+            .expect("job_start registered")
+            .execute(json!({"command": "sh -c 'sleep 0.2'"}))
+            .unwrap();
+        let id = job["job"].as_str().unwrap().to_string();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while token.interrupts().is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let q = token.interrupts().drain();
+        assert_eq!(q.len(), 1, "{q:?}");
+        assert!(q[0].text.contains(&id), "{}", q[0].text);
+    }
+    #[cfg(not(feature = "shell-tools"))]
+    let _ = registry;
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -138,6 +138,7 @@ fn resume_replay_under_budget() {
         "expected >= {} entries, got {written}",
         2 * CALLS
     );
+    drop(s); // a writable open takes the session lock
     let start = Instant::now();
     let reopened = JsonlStorage::open(dir.join("perf-replay.jsonl")).unwrap();
     let elapsed = start.elapsed();

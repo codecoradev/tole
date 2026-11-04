@@ -21,8 +21,10 @@ path = "src/main.rs"
 # crates.io install must expose every documented face (#163 follow-up,
 # 2026-10-05); embedders use tole-core directly with their own feature
 # choices and are unaffected by this crate's defaults.
-default = ["shell-tools", "mcp", "mcp-http"]
+default = ["shell-tools", "mcp", "mcp-http", "tui"]
 shell-tools = ["tole-core/shell-tools"]
+# Interactive terminal UI (#459): bare `tole` on a TTY. Off = plain help as before.
+tui = ["dep:tole-tui"]
 mcp = ["tole-core/mcp"]
 # MCP-over-HTTP host (#137): rmcp streamable-http server + hyper serving.
 mcp-http = ["mcp", "shell-tools", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:tower-service", "dep:rmcp", "dep:http", "tole-core/mcp-http"]
@@ -33,7 +35,8 @@ mcp-http = ["mcp", "shell-tools", "dep:hyper", "dep:hyper-util", "dep:http-body-
 replay = []
 
 [dependencies]
-tole-core = { version = "0.9.0", path = "../tole-core" }
+tole-core = { version = "0.10.0", path = "../tole-core" }
+tole-tui = { version = "0.10.0", path = "../tole-tui", optional = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
@@ -58,3 +61,13 @@ http = { version = "1", optional = true }
 name = "tole-replay"
 path = "../../evals/replay/replay.rs"
 required-features = ["replay"]
+
+# Mirror of the workspace-root [profile.release]. Cargo ignores this for
+# workspace builds, but the root profile is not packaged, so `cargo install
+# tole-cli` only gets the size-focused profile from here. Keep both in sync;
+# no panic = "abort" (see the root Cargo.toml).
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

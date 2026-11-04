@@ -17,8 +17,11 @@ pub mod session_host;
 pub mod session_index;
 pub mod session_tools;
 pub mod sibling;
+pub mod status;
 pub mod tool_roster;
 pub mod tools;
 pub mod trust;
+#[cfg(feature = "tui")]
+pub mod tui_host;
 pub mod turn_runner;
 pub mod usage_report;

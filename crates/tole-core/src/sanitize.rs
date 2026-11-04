@@ -8,14 +8,19 @@
 
 /// True for characters that must never reach an approval surface raw:
 /// C0 controls (incl. ESC, CR, LF, TAB), DEL, C1 controls, line/paragraph
-/// separators, bidi marks/overrides/isolates and zero-width invisibles.
+/// separators, bidi marks/overrides/isolates and zero-width invisibles
+/// (incl. the Arabic letter mark, the Mongolian vowel separator, the word
+/// joiner and the invisible math operators — scan 2026-10-28).
 fn is_unsafe(c: char) -> bool {
     c.is_control()
         || matches!(
             c,
-            '\u{200B}'..='\u{200F}'
+            '\u{061C}'
+                | '\u{180E}'
+                | '\u{200B}'..='\u{200F}'
                 | '\u{2028}'..='\u{202E}'
-                | '\u{2066}'..='\u{2069}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{206F}'
                 | '\u{FEFF}'
         )
 }
@@ -70,6 +75,12 @@ mod tests {
             ("\u{200C}", "\\u{200c}"),
             ("\u{200D}", "\\u{200d}"),
             ("\u{FEFF}", "\\u{feff}"),
+            ("\u{061C}", "\\u{61c}"),
+            ("\u{180E}", "\\u{180e}"),
+            ("\u{2060}", "\\u{2060}"),
+            ("\u{2064}", "\\u{2064}"),
+            ("\u{206A}", "\\u{206a}"),
+            ("\u{206F}", "\\u{206f}"),
         ] {
             assert_eq!(sanitize_one_line(&format!("a{raw}b")), format!("a{want}b"));
         }

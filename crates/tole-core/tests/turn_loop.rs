@@ -270,6 +270,33 @@ fn stored_wire_numbers_equal_wire_stats_of_the_request_body() {
     );
 }
 
+/// #457: a degraded step (the provider dropped a rejected parameter) is
+/// durable under the namespaced `tole_degraded` key, and that key alone
+/// never makes a row count as a provider step.
+#[test]
+fn degraded_step_is_recorded_under_tole_degraded() {
+    struct Degraded;
+    impl Provider for Degraded {
+        fn complete(&mut self, _t: &[Entry]) -> Result<ProviderOutput, ProviderError> {
+            Ok(ProviderOutput::Final { text: "ok".into() })
+        }
+        fn last_degraded(&self) -> Option<Value> {
+            Some(json!({"param": "reasoning_effort", "level": "high"}))
+        }
+    }
+    let dir = tmpdir("usage-degraded");
+    let mut s = JsonlStorage::create(&dir, "ud", None).unwrap();
+    let reg = ToolRegistry::new();
+    run_turn(&mut s, &mut Degraded, &reg, "hi").unwrap();
+    let usages = s.usages();
+    assert_eq!(usages.len(), 1);
+    assert_eq!(
+        usages[0].usage["tole_degraded"],
+        json!({"param": "reasoning_effort", "level": "high"})
+    );
+    assert_eq!(tole_core::transcript::provider_steps(usages), 0);
+}
+
 #[test]
 fn no_usage_rows_without_provider_usage() {
     let dir = tmpdir("usage-none");
@@ -282,7 +309,7 @@ fn no_usage_rows_without_provider_usage() {
 }
 
 // ---------------------------------------------------------------------------
-// Issue #58: harness-level retry-once on timeout-classified provider failure
+// Issue #58: harness-level bounded retry on transient provider failure (#478: 3 retries)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -290,7 +317,7 @@ fn provider_timeout_retried_once_then_succeeds() {
     let dir = tmpdir("t58-retry");
     let mut s = JsonlStorage::create(&dir, "t58r", None).unwrap();
     let mut p = MockProvider::scripted_with_failures(vec![
-        Err("provider failed: timeout: global".into()),
+        Err("provider failed: timeout: global (retry-after: 0)".into()),
         Ok(ProviderOutput::Final {
             text: "done".into(),
         }),
@@ -320,12 +347,14 @@ fn provider_timeout_retried_once_then_succeeds() {
 }
 
 #[test]
-fn provider_timeout_second_failure_aborts() {
+fn provider_timeout_aborts_after_three_retries() {
     let dir = tmpdir("t58-second");
     let mut s = JsonlStorage::create(&dir, "t58s", None).unwrap();
     let mut p = MockProvider::scripted_with_failures(vec![
-        Err("provider failed: timeout: global".into()),
-        Err("provider failed: timeout: global".into()),
+        Err("provider failed: timeout: global (retry-after: 0)".into()),
+        Err("provider failed: timeout: global (retry-after: 0)".into()),
+        Err("provider failed: timeout: global (retry-after: 0)".into()),
+        Err("provider failed: timeout: global (retry-after: 0)".into()),
     ]);
     let mut reg = ToolRegistry::new();
     reg.register(Box::new(EchoTool)).unwrap();
@@ -337,26 +366,28 @@ fn provider_timeout_second_failure_aborts() {
         }
         other => panic!("expected ProviderFailed, got {other:?}"),
     }
-    // One retry record + one final failure record.
+    // Three retry records + one final failure record.
     let errs: Vec<&Entry> = s
         .entries()
         .iter()
         .filter(|e| e.kind.as_str() == "error")
         .collect();
-    assert_eq!(errs.len(), 2);
-    assert_eq!(
-        errs[0].payload["error"],
-        json!("provider transient failure, retrying")
-    );
-    assert_eq!(errs[1].payload["error"], json!("provider failed"));
+    assert_eq!(errs.len(), 4);
+    for e in &errs[..3] {
+        assert_eq!(
+            e.payload["error"],
+            json!("provider transient failure, retrying")
+        );
+    }
+    assert_eq!(errs[3].payload["error"], json!("provider failed"));
 }
 
 #[test]
-fn provider_429_rate_limit_retried_once() {
+fn provider_429_rate_limit_retried() {
     let dir = tmpdir("t58-429");
     let mut s = JsonlStorage::create(&dir, "t58q", None).unwrap();
     let mut p = MockProvider::scripted_with_failures(vec![
-        Err("provider failed: http status: 429".into()),
+        Err("provider failed: http status: 429 (retry-after: 0)".into()),
         Ok(ProviderOutput::Final {
             text: "after-429".into(),
         }),
@@ -412,18 +443,20 @@ fn non_timeout_provider_error_not_retried() {
 }
 
 #[test]
-fn flapping_timeout_retries_only_once_per_turn() {
+fn flapping_timeout_shares_one_retry_budget_per_turn() {
     let dir = tmpdir("t58-flap");
     let mut s = JsonlStorage::create(&dir, "t58f", None).unwrap();
-    // Timeout, success, then another timeout: the second timeout must NOT
-    // get a second retry (budget is per turn, not per step).
+    // Retries are budgeted per turn, not per step: a retry spent at step 1
+    // is gone at step 2 (1 + 2 = 3 retries, the fourth failure aborts).
     let mut p = MockProvider::scripted_with_failures(vec![
-        Err("provider failed: timeout: global".into()),
+        Err("provider failed: timeout: global (retry-after: 0)".into()),
         Ok(ProviderOutput::ToolCall {
             tool: "echo".into(),
             input: json!({"n": 1}),
         }),
-        Err("provider failed: timeout: global".into()),
+        Err("provider failed: timeout: global (retry-after: 0)".into()),
+        Err("provider failed: timeout: global (retry-after: 0)".into()),
+        Err("provider failed: timeout: global (retry-after: 0)".into()),
         Ok(ProviderOutput::Final {
             text: "never".into(),
         }),
@@ -444,7 +477,7 @@ fn flapping_timeout_retries_only_once_per_turn() {
                 && e.payload["error"] == json!("provider transient failure, retrying")
         })
         .collect();
-    assert_eq!(retry_records.len(), 1);
+    assert_eq!(retry_records.len(), 3);
 }
 
 #[test]
@@ -1930,4 +1963,93 @@ fn new_poll_tool_opts_in_via_trait_not_name() {
         matches!(out, TurnOutcome::Final { .. }),
         "6 identical render_poll calls must not trip LOOP_TRIP_AFTER: {out:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #217 — detach: stop waiting, keep the work, settle resumable
+// ---------------------------------------------------------------------------
+
+/// Detach set BEFORE run_turn: no provider call is made, the turn settles
+/// `Detached` (pc = Final) with a durable audit entry, and a follow-up
+/// prompt on the same storage runs normally.
+#[test]
+fn detach_before_first_step_settles_detached_and_resumable() {
+    let dir = tmpdir("detach-early");
+    let mut s = JsonlStorage::create(&dir, "dt1", None).unwrap();
+    let mut p = MockProvider::scripted(vec![ProviderOutput::Final { text: "f".into() }]);
+    let reg = ToolRegistry::new();
+    let cancel = CancelToken::new();
+    cancel.detach();
+    let out = run_turn_with_cancel(&mut s, &mut p, &reg, "hello", &cancel).unwrap();
+    assert!(matches!(out, TurnOutcome::Detached), "got {out:?}");
+    assert_eq!(s.state().pc, Pc::Final);
+    let dump = serde_json::to_string(&s.entries()).unwrap();
+    assert!(dump.contains("detached"), "audit entry missing");
+    // Detach is not a cancel: the token says so.
+    assert!(!cancel.is_cancelled());
+    // Resumable with a fresh token.
+    let mut p2 = MockProvider::scripted(vec![ProviderOutput::Final {
+        text: "after".into(),
+    }]);
+    let out2 = run_turn_with_cancel(&mut s, &mut p2, &reg, "again", &CancelToken::new()).unwrap();
+    assert!(matches!(out2, TurnOutcome::Final { .. }), "got {out2:?}");
+}
+
+/// Detach arriving while a tool runs does NOT abort it: the tool's result
+/// is committed, then the turn settles `Detached` before the next
+/// provider call (which is never made).
+#[test]
+fn detach_during_tool_keeps_the_result_then_settles_detached() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static RAN: AtomicUsize = AtomicUsize::new(0);
+    struct DetachingTool(CancelToken);
+    impl Tool for DetachingTool {
+        fn name(&self) -> &str {
+            "slow"
+        }
+        fn risk(&self) -> Risk {
+            Risk::ReadOnly
+        }
+        fn execute(&self, _input: Value) -> Result<Value, String> {
+            self.0.detach();
+            RAN.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({"done": true}))
+        }
+    }
+    let dir = tmpdir("detach-tool");
+    let mut s = JsonlStorage::create(&dir, "dt2", None).unwrap();
+    let cancel = CancelToken::new();
+    let mut reg = ToolRegistry::new();
+    reg.register(Box::new(DetachingTool(cancel.clone())))
+        .unwrap();
+    let mut p = MockProvider::scripted(vec![
+        ProviderOutput::ToolCall {
+            tool: "slow".into(),
+            input: json!({}),
+        },
+        ProviderOutput::Final {
+            text: "never".into(),
+        },
+    ]);
+    let out = run_turn_with_cancel(&mut s, &mut p, &reg, "go", &cancel).unwrap();
+    assert!(matches!(out, TurnOutcome::Detached), "got {out:?}");
+    assert_eq!(RAN.load(Ordering::SeqCst), 1);
+    assert_eq!(s.state().pc, Pc::Final);
+    let dump = serde_json::to_string(&s.entries()).unwrap();
+    assert!(dump.contains("\"done\":true"), "tool result lost: {dump}");
+    assert!(!dump.contains("never"), "provider was called after detach");
+}
+
+/// Cancel outranks detach: both set → `Cancelled`.
+#[test]
+fn cancel_outranks_detach() {
+    let dir = tmpdir("detach-vs-cancel");
+    let mut s = JsonlStorage::create(&dir, "dt3", None).unwrap();
+    let mut p = MockProvider::scripted(vec![]);
+    let reg = ToolRegistry::new();
+    let cancel = CancelToken::new();
+    cancel.detach();
+    cancel.cancel();
+    let out = run_turn_with_cancel(&mut s, &mut p, &reg, "x", &cancel).unwrap();
+    assert!(matches!(out, TurnOutcome::Cancelled), "got {out:?}");
 }

@@ -8,8 +8,11 @@
 //! Config resolution order: explicit struct fields > env (`TOLE_*`, then
 //! `OPENAI_*`).
 
+use crate::cancel::CancelToken;
 use crate::provider::{Provider, ProviderError, ProviderOutput};
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Serialized size of one provider request, in CHARACTERS (Unicode
@@ -41,6 +44,20 @@ impl WireStats {
             "messages": self.messages,
         })
     }
+}
+
+/// The `images` references on a user message payload (#212); malformed
+/// elements are skipped.
+fn image_refs(payload: &Value) -> Vec<crate::image::ImageRef> {
+    payload
+        .get("images")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(crate::image::ImageRef::from_value)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Measure a request body as built by `OpenAiProvider::request_body`
@@ -110,6 +127,23 @@ pub const ENV_MODEL: &str = "TOLE_MODEL";
 // The env var NAME, not a secret value.
 // cora-ignore: sec-hardcoded-secret
 pub const ENV_API_KEY: &str = "TOLE_API_KEY";
+
+/// The accepted `reasoning_effort` levels, lowest first (#457).
+pub const REASONING_EFFORTS: [&str; 4] = ["minimal", "low", "medium", "high"];
+
+/// Validate a reasoning-effort level (case and surrounding space are
+/// forgiven) and return its canonical lowercase form.
+pub fn parse_reasoning_effort(raw: &str) -> Result<String, String> {
+    let level = raw.trim().to_ascii_lowercase();
+    if REASONING_EFFORTS.contains(&level.as_str()) {
+        Ok(level)
+    } else {
+        Err(format!(
+            "invalid reasoning effort {raw:?}: expected one of {}",
+            REASONING_EFFORTS.join(" | ")
+        ))
+    }
+}
 
 /// Prefixes tried by [`OpenAiConfig::from_env`], in order. The first
 /// prefix whose full triple (`_BASE_URL`, `_MODEL`, `_API_KEY`) is
@@ -200,6 +234,7 @@ pub struct OpenAiProvider {
     /// Request-size breakdown of the last call (issue #211), reset per
     /// call like usage/reasoning.
     last_wire_stats_obj: Option<Value>,
+    last_extra_calls: Vec<(String, Value)>,
     /// Live-token sinks (issue #196 phase 3): present on host faces
     /// that render progress (ACP). When set, reasoning arrives via
     /// deltas and `last_reasoning` stays None — no double emission.
@@ -208,6 +243,28 @@ pub struct OpenAiProvider {
     /// `stream: true` on the wire. Default on; `TOLE_STREAM=0` is the
     /// escape hatch for gateways that reject the streaming envelope.
     streaming: bool,
+    /// Live `tole-sse-drain` threads of this provider (issue #479).
+    drain_live: Arc<AtomicUsize>,
+    /// Set only on the helper-thread copy of a cancel-aware call (#484):
+    /// the stream reader stops (and stays silent on the sinks) once set.
+    abort: Option<CancelToken>,
+    /// Roots an attached image may live under (#212): the workspace, plus
+    /// the host's spill dir for inline images. Empty = images unreadable
+    /// (they degrade to a text note on the wire).
+    image_roots: Vec<std::path::PathBuf>,
+    /// Declared vision capability (#212): `Some(false)` refuses image
+    /// input before any request; `None` = unknown, the server decides.
+    vision: Option<bool>,
+    /// `reasoning_effort` on the wire (#457); `None` = absent from the body.
+    reasoning_effort: Option<String>,
+    /// The provider rejected `reasoning_effort` once: later calls of this
+    /// provider omit it instead of paying a rejected round trip each step.
+    effort_rejected: bool,
+    /// The last call's 400 body named `reasoning_effort` (set by the HTTP
+    /// path, read by [`Provider::complete`] to decide on the degraded retry).
+    effort_named_in_400: bool,
+    /// Describes the LAST `complete()` call only: it ran degraded.
+    last_degraded_obj: Option<Value>,
 }
 
 impl std::fmt::Debug for OpenAiProvider {
@@ -228,7 +285,7 @@ impl std::fmt::Debug for OpenAiProvider {
 impl OpenAiProvider {
     pub fn new(cfg: OpenAiConfig) -> Self {
         let timeout = Duration::from_secs(120);
-        let agent = Self::build_agent(timeout);
+        let agent = Self::build_chat_agent(timeout);
         Self {
             cfg,
             timeout,
@@ -238,8 +295,17 @@ impl OpenAiProvider {
             last_usage_obj: None,
             last_reasoning_obj: None,
             last_wire_stats_obj: None,
+            last_extra_calls: Vec::new(),
             on_text_delta: None,
             on_reasoning_delta: None,
+            drain_live: Arc::new(AtomicUsize::new(0)),
+            abort: None,
+            image_roots: Vec::new(),
+            vision: None,
+            reasoning_effort: None,
+            effort_rejected: false,
+            effort_named_in_400: false,
+            last_degraded_obj: None,
             streaming: std::env::var("TOLE_STREAM")
                 .map(|v| v != "0")
                 .unwrap_or(true),
@@ -272,9 +338,21 @@ impl OpenAiProvider {
             .new_agent()
     }
 
+    /// Agent for the chat-completions request only: 4xx/5xx arrive as
+    /// `Ok(resp)` so `complete()` can read the error body (#474). ureq's
+    /// default turns them into `Error::StatusCode(code)`, which drops it.
+    /// The `/models` probes keep `build_agent` and its `Err` on non-2xx.
+    fn build_chat_agent(timeout: Duration) -> ureq::Agent {
+        ureq::Agent::config_builder()
+            .timeout_global(Some(timeout))
+            .http_status_as_error(false)
+            .build()
+            .new_agent()
+    }
+
     /// Override the default 120s timeout.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.agent = Self::build_agent(timeout);
+        self.agent = Self::build_chat_agent(timeout);
         self.timeout = timeout;
         self
     }
@@ -282,6 +360,27 @@ impl OpenAiProvider {
     /// Set a system prompt (prepended as the first message).
     pub fn with_system_prompt(mut self, prompt: impl Into<String>) -> Self {
         self.system_prompt = Some(prompt.into());
+        self
+    }
+
+    /// Roots attached images are loaded from (#212); see `image::data_url`.
+    pub fn with_image_roots(mut self, roots: Vec<std::path::PathBuf>) -> Self {
+        self.image_roots = roots;
+        self
+    }
+
+    /// Declare whether the model accepts image input (#212). `false` turns
+    /// image input into a model-capability error before any request.
+    pub fn with_vision(mut self, vision: bool) -> Self {
+        self.vision = Some(vision);
+        self
+    }
+
+    /// Send `reasoning_effort` with every request (#457). `None` keeps the
+    /// body byte-identical to a provider without the setting. The level is
+    /// the caller's to validate ([`parse_reasoning_effort`]).
+    pub fn with_reasoning_effort(mut self, effort: Option<String>) -> Self {
+        self.reasoning_effort = effort;
         self
     }
 
@@ -335,7 +434,30 @@ impl OpenAiProvider {
                     if !matches!(role, "user" | "assistant" | "system") {
                         continue;
                     }
-                    messages.push(json!({ "role": role, "content": text }));
+                    let images = if role == "user" {
+                        image_refs(&e.payload)
+                    } else {
+                        vec![]
+                    };
+                    if images.is_empty() {
+                        messages.push(json!({ "role": role, "content": text }));
+                        continue;
+                    }
+                    // #212: OpenAI-compatible content parts. The log holds
+                    // references; the blob is re-read (jail + hash checked)
+                    // per request. A failed load stays visible as a text
+                    // note instead of dropping the image silently.
+                    let mut parts = vec![json!({ "type": "text", "text": text })];
+                    for r in &images {
+                        parts.push(match crate::image::data_url(r, &self.image_roots) {
+                            Ok(url) => json!({ "type": "image_url", "image_url": { "url": url } }),
+                            Err(err) => json!({
+                                "type": "text",
+                                "text": format!("[image unavailable: {err}]"),
+                            }),
+                        });
+                    }
+                    messages.push(json!({ "role": role, "content": parts }));
                 }
                 "intent" => {
                     let (Some(tool), Some(input)) = (
@@ -346,18 +468,33 @@ impl OpenAiProvider {
                     };
                     // The intent id doubles as the wire tool_call_id —
                     // deterministic and unique per sandwich.
-                    messages.push(json!({
-                        "role": "assistant",
-                        "content": null,
-                        "tool_calls": [{
-                            "id": e.id,
-                            "type": "function",
-                            "function": {
-                                "name": tool,
-                                "arguments": input.to_string(),
-                            },
-                        }],
-                    }));
+                    let call = json!({
+                        "id": e.id,
+                        "type": "function",
+                        "function": {
+                            "name": tool,
+                            // E11 covers the tool-call arguments too.
+                            "arguments": scrub(&input.to_string(), &self.cfg.api_key),
+                        },
+                    });
+                    // #480: a batch member joins the assistant message that
+                    // carries the previous call; its result still follows
+                    // in call order. Unmarked intents stay one message each.
+                    let joined = e.payload.get("batch") == Some(&json!(true))
+                        && messages
+                            .iter_mut()
+                            .rev()
+                            .find(|m| m["role"] != json!("tool"))
+                            .and_then(|m| m.get_mut("tool_calls")?.as_array_mut())
+                            .map(|calls| calls.push(call.clone()))
+                            .is_some();
+                    if !joined {
+                        messages.push(json!({
+                            "role": "assistant",
+                            "content": null,
+                            "tool_calls": [call],
+                        }));
+                    }
                 }
                 "tool_result" | "error" => {
                     // Settlement of the intent this entry hangs under.
@@ -403,6 +540,9 @@ impl OpenAiProvider {
         if !self.tool_specs.is_empty() {
             body["tools"] = json!(self.tool_specs);
         }
+        if let (Some(effort), false) = (&self.reasoning_effort, self.effort_rejected) {
+            body["reasoning_effort"] = json!(effort);
+        }
         body
     }
 
@@ -410,7 +550,9 @@ impl OpenAiProvider {
     /// state machine understands (E4.5). Precedence: a non-empty
     /// `tool_calls` array wins over content text — the model asked for a
     /// tool, and the loop must run it before any prose is meaningful.
-    /// First call only: the machine is single-path (§5).
+    /// The step is the FIRST call; the rest of a batch is exposed through
+    /// [`Provider::last_extra_tool_calls`] (#480), so `ProviderOutput`
+    /// keeps its single call.
     fn parse_completion(resp: &Value) -> Result<ProviderOutput, ProviderError> {
         let msg = resp
             .get("choices")
@@ -481,11 +623,65 @@ impl OpenAiProvider {
         let text = msg.get("content").and_then(Value::as_str).ok_or_else(|| {
             ProviderError("malformed response: no content and no tool_calls".into())
         })?;
+        // Parity with the stream path (#478): an empty completion is the
+        // same transient error in both modes, not a silent empty `Final`.
+        if text.is_empty() {
+            return Err(ProviderError(EMPTY_COMPLETION.into()));
+        }
         Ok(ProviderOutput::Final {
             text: text.to_string(),
         })
     }
 }
+
+/// One extra batch call (#480): `None` for a blank name, blank arguments or
+/// arguments that are not JSON — the batch ends there.
+fn batch_call(name: &str, args: Option<String>) -> Option<(String, Value)> {
+    let args = args?;
+    if name.is_empty() || args.trim().is_empty() {
+        return None;
+    }
+    serde_json::from_str(args.trim())
+        .ok()
+        .map(|input| (name.to_string(), input))
+}
+
+impl OpenAiProvider {
+    /// The calls AFTER the first in a non-stream response, in model order
+    /// (#480). Empty when the first call is itself malformed (that step is
+    /// an `InvalidToolArgs` and runs alone); the list ends at the first
+    /// malformed extra, so a batch never reorders or skips a call.
+    fn extra_calls(resp: &Value) -> Vec<(String, Value)> {
+        if !matches!(
+            Self::parse_completion(resp),
+            Ok(ProviderOutput::ToolCall { .. })
+        ) {
+            return Vec::new();
+        }
+        let calls = resp["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        calls
+            .iter()
+            .skip(1)
+            .map_while(|c| {
+                let f = &c["function"];
+                let args = match f.get("arguments") {
+                    Some(Value::String(s)) => Some(s.clone()),
+                    Some(v @ (Value::Object(_) | Value::Array(_))) => Some(v.to_string()),
+                    _ => None,
+                };
+                batch_call(f["name"].as_str()?, args)
+            })
+            .collect()
+    }
+}
+
+/// Error text of a completion with neither content nor tool calls; the turn
+/// loop classifies it as transient (#478).
+pub(crate) const EMPTY_COMPLETION: &str =
+    "malformed response: empty stream (no content, no tool calls)";
 
 impl OpenAiProvider {
     /// Issue #196 phase 3: drive one streamed completion to [DONE].
@@ -526,6 +722,9 @@ impl OpenAiProvider {
                 };
                 ProviderError(scrub(&format!("{head}: {e}"), &self.cfg.api_key))
             })?;
+            if self.abort.as_ref().is_some_and(CancelToken::is_cancelled) {
+                return Err(ProviderError(CANCELLED_CALL.into()));
+            }
             if n == 0 {
                 break; // EOF without [DONE]: treat like end-of-stream.
             }
@@ -587,7 +786,8 @@ impl OpenAiProvider {
         }
         // Decisive output from the accumulation — same contract as the
         // non-stream parse: one tool call per step, or the final text.
-        if let Some((_, (id, name, args))) = tool_calls.into_iter().next() {
+        let mut ordered = tool_calls.into_iter();
+        if let Some((_, (id, name, args))) = ordered.next() {
             if args.trim().is_empty() {
                 return Ok(ProviderOutput::InvalidToolArgs {
                     tool: name,
@@ -606,6 +806,10 @@ impl OpenAiProvider {
                 }
             };
             let _ = id;
+            // #480: the calls after the first, in stream index order.
+            self.last_extra_calls = ordered
+                .map_while(|(_, (_, n, a))| batch_call(&n, Some(a)))
+                .collect();
             // Issue #232: settle THIS step's reasoning exactly like the
             // text path below — without a sink the accumulated thought
             // surfaces once at turn end; with a sink the deltas were
@@ -618,9 +822,7 @@ impl OpenAiProvider {
         // No tool calls: the answer must have content (GLM emits an
         // empty content:"" chunk at the end — empty total = malformed).
         if text.is_empty() {
-            return Err(ProviderError(
-                "malformed response: empty stream (no content, no tool calls)".into(),
-            ));
+            return Err(ProviderError(EMPTY_COMPLETION.into()));
         }
         // Deltas already delivered the reasoning when a sink was wired;
         // otherwise surface the accumulated thought once, turn-end.
@@ -633,8 +835,40 @@ impl OpenAiProvider {
     }
 }
 
-impl Provider for OpenAiProvider {
-    fn complete(&mut self, transcript: &[Entry]) -> Result<ProviderOutput, ProviderError> {
+/// Most drain threads alive per provider (issue #479). A server that never
+/// ends the body parks one thread and socket per request until the agent
+/// timeout; past the cap the reader is dropped and its connection closes.
+const MAX_DRAIN_THREADS: usize = 2;
+
+/// Read `reader` to EOF on a detached thread so the connection returns to
+/// the pool. Bounded by `MAX_DRAIN_THREADS`; a failed spawn is ignored
+/// (no reuse, as before).
+fn drain_detached<R: std::io::Read + Send + 'static>(mut reader: R, live: &Arc<AtomicUsize>) {
+    if live.fetch_add(1, Ordering::SeqCst) >= MAX_DRAIN_THREADS {
+        live.fetch_sub(1, Ordering::SeqCst);
+        return;
+    }
+    let slot = Arc::clone(live);
+    let spawned = std::thread::Builder::new()
+        .name("tole-sse-drain".into())
+        .spawn(move || {
+            let _ = std::io::copy(&mut reader, &mut std::io::sink());
+            slot.fetch_sub(1, Ordering::SeqCst);
+        });
+    if spawned.is_err() {
+        live.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Error text of an in-flight call abandoned on cancel (#484).
+const CANCELLED_CALL: &str = "cancelled: in-flight provider call abandoned";
+
+/// How often a cancel-aware call re-checks the token while waiting.
+const CANCEL_POLL: Duration = Duration::from_millis(100);
+
+impl OpenAiProvider {
+    fn complete_once(&mut self, transcript: &[Entry]) -> Result<ProviderOutput, ProviderError> {
+        self.effort_named_in_400 = false;
         // Issue #232 (scan #106): last_usage / last_reasoning describe
         // THIS response only. Reset per call — a tool-call step (which
         // returns early) or a gateway that omits usage must never leave
@@ -644,6 +878,17 @@ impl Provider for OpenAiProvider {
         self.last_usage_obj = None;
         self.last_reasoning_obj = None;
         self.last_wire_stats_obj = None;
+        self.last_extra_calls.clear();
+        let has_images = transcript
+            .iter()
+            .any(|e| !image_refs(&e.payload).is_empty());
+        if has_images && self.vision == Some(false) {
+            return Err(ProviderError(format!(
+                "model-capability error: the transcript has image input but model {} is \
+                 declared non-vision (TOLE_VISION=0) — use a vision-capable model or drop the image",
+                self.cfg.model
+            )));
+        }
         let mut body = self.request_body(transcript);
         // Issue #211: measure BEFORE the streaming envelope is layered
         // on — the same body the Tier-1 golden pins. Read-only.
@@ -667,25 +912,61 @@ impl Provider for OpenAiProvider {
             .map_err(|e| ProviderError(scrub(&e.to_string(), &self.cfg.api_key)))?;
         // HTTP status FIRST (cora full-scan #46): a non-2xx body is often
         // HTML/error JSON that read_json would mangle into a misleading
-        // "malformed response". Surface status + scrubbed body snippet;
-        // the "http status: N" phrasing is load-bearing — the turn loop's
-        // transient-retry classification (#66) matches on it.
+        // "malformed response". Surface status + Retry-After + scrubbed
+        // body snippet; the leading "http status: N" is load-bearing — the
+        // failover and transient-retry classification parse it.
         if !resp.status().is_success() {
             let status = resp.status();
+            let retry_after = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .map(|v| {
+                    scrub(v, &self.cfg.api_key)
+                        .chars()
+                        .take(64)
+                        .collect::<String>()
+                })
+                .map(|v| format!(" (retry-after: {v})"))
+                .unwrap_or_default();
             let body_text = resp
                 .into_body()
                 .read_to_string()
                 .unwrap_or_else(|_| "<unreadable body>".to_string());
             let body_text = scrub(&body_text, &self.cfg.api_key);
             let snippet: String = body_text.chars().take(200).collect();
-            return Err(ProviderError(format!("http status: {status} — {snippet}")));
+            let lower = body_text.to_ascii_lowercase();
+            self.effort_named_in_400 = status.as_u16() == 400 && lower.contains("reasoning_effort");
+            if has_images
+                && matches!(status.as_u16(), 400 | 415 | 422)
+                && ["image", "vision", "multimodal", "multi-modal"]
+                    .iter()
+                    .any(|k| lower.contains(k))
+            {
+                return Err(ProviderError(format!(
+                    "model-capability error: model {} rejected image input — use a \
+                     vision-capable model (http status: {status} — {snippet})",
+                    self.cfg.model
+                )));
+            }
+            return Err(ProviderError(format!(
+                "http status: {status}{retry_after} — {snippet}"
+            )));
         }
         // Issue #196 phase 3: SSE streaming — deltas flow to the sinks
         // while the stream is read; complete() returns one decisive
         // output built from the accumulation.
         if self.streaming {
-            return self
-                .complete_streaming(std::io::BufReader::new(resp.into_body().into_reader()));
+            let mut reader = std::io::BufReader::new(resp.into_body().into_reader());
+            let out = self.complete_streaming(&mut reader);
+            // Issue #479: `complete_streaming` stops at `[DONE]`, leaving
+            // the chunked terminator unread, so the agent cannot pool the
+            // connection. Read the rest off-thread (never delay the turn),
+            // and only after a clean end; an error drops the reader as before.
+            if out.is_ok() {
+                drain_detached(reader, &self.drain_live);
+            }
+            return out;
         }
         let mut resp = resp;
         let resp_body = resp
@@ -702,7 +983,87 @@ impl Provider for OpenAiProvider {
             .as_str()
             .map(str::to_string)
             .filter(|r| !r.trim().is_empty());
+        self.last_extra_calls = Self::extra_calls(&resp_body);
         Self::parse_completion(&resp_body)
+    }
+}
+
+impl Provider for OpenAiProvider {
+    /// #484: run the blocking HTTP call on a helper thread (a clone: the
+    /// agent's connection pool is shared) and wait in short slices. On
+    /// cancel the thread is abandoned — it stops at its next stream line or
+    /// when the HTTP timeout fires — and nothing it produces is used.
+    fn complete_with_cancel(
+        &mut self,
+        transcript: &[Entry],
+        cancel: &CancelToken,
+    ) -> Result<ProviderOutput, ProviderError> {
+        if cancel.is_cancelled() {
+            return Err(ProviderError(CANCELLED_CALL.into()));
+        }
+        let mut worker = self.clone();
+        worker.abort = Some(cancel.clone());
+        let owned = transcript.to_vec();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("tole-provider-call".into())
+            .spawn(move || {
+                let out = worker.complete(&owned);
+                let _ = tx.send((out, worker));
+            });
+        if spawned.is_err() {
+            return self.complete(transcript);
+        }
+        loop {
+            match rx.recv_timeout(CANCEL_POLL) {
+                Ok((out, mut worker)) => {
+                    // Adopt the per-call state (usage, reasoning, wire stats).
+                    worker.abort = None;
+                    *self = worker;
+                    return out;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if cancel.is_cancelled() {
+                        return Err(ProviderError(CANCELLED_CALL.into()));
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(ProviderError("provider call thread died".into()));
+                }
+            }
+        }
+    }
+
+    /// One logical call. A 400 naming `reasoning_effort` earns exactly ONE
+    /// retry WITHOUT the parameter (#457) — a degraded retry, not a replay
+    /// of the same body: the rejection is remembered (later calls omit the
+    /// parameter) and reported through [`Provider::last_degraded`]. Any
+    /// other failure, and a failed degraded retry, is returned as is for
+    /// the turn loop's transient classification (#474/#478).
+    fn complete(&mut self, transcript: &[Entry]) -> Result<ProviderOutput, ProviderError> {
+        self.last_degraded_obj = None;
+        let first = self.complete_once(transcript);
+        let Err(rejection) = &first else {
+            return first;
+        };
+        if !self.effort_named_in_400 || self.effort_rejected {
+            return first;
+        }
+        let Some(level) = self.reasoning_effort.clone() else {
+            return first;
+        };
+        self.effort_rejected = true;
+        let retried = self.complete_once(transcript);
+        self.last_degraded_obj = Some(json!({
+            "param": "reasoning_effort",
+            "level": level,
+            "rejected": rejection.0.chars().take(200).collect::<String>(),
+        }));
+        retried
+    }
+
+    fn last_degraded(&self) -> Option<Value> {
+        self.last_degraded_obj.clone()
     }
 
     fn last_usage(&self) -> Option<Value> {
@@ -715,6 +1076,10 @@ impl Provider for OpenAiProvider {
 
     fn last_wire_stats(&self) -> Option<Value> {
         self.last_wire_stats_obj.clone()
+    }
+
+    fn last_extra_tool_calls(&self) -> Vec<(String, Value)> {
+        self.last_extra_calls.clone()
     }
 }
 
@@ -1000,6 +1365,39 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_effort_parses_the_four_levels_only() {
+        for (raw, want) in [("minimal", "minimal"), (" High ", "high"), ("LOW", "low")] {
+            assert_eq!(parse_reasoning_effort(raw).as_deref(), Ok(want));
+        }
+        for bad in ["", "max", "xhigh", "none", "1"] {
+            let e = parse_reasoning_effort(bad).unwrap_err();
+            assert!(e.contains("minimal | low | medium | high"), "{e}");
+        }
+    }
+
+    #[test]
+    fn request_body_carries_reasoning_effort_exactly_when_set() {
+        let cfg = OpenAiConfig::new("https://x.example/v1", "m", "k");
+        let t = vec![crate::entry::Entry {
+            id: "e1".into(),
+            parent_id: None,
+            seq: 0,
+            kind: crate::entry::EntryType::new(crate::entry::EntryType::MESSAGE),
+            payload: json!({ "role": "user", "text": "hello" }),
+            timestamp: 0,
+        }];
+        let unset = OpenAiProvider::new(cfg.clone()).request_body(&t);
+        assert!(unset.get("reasoning_effort").is_none(), "{unset}");
+        let set = OpenAiProvider::new(cfg)
+            .with_reasoning_effort(Some("high".into()))
+            .request_body(&t);
+        assert_eq!(set["reasoning_effort"], json!("high"));
+        let mut stripped = set.clone();
+        stripped.as_object_mut().unwrap().remove("reasoning_effort");
+        assert_eq!(stripped, unset, "the key is the ONLY difference");
+    }
+
+    #[test]
     fn scrub_removes_secret_from_errors() {
         let out = scrub(
             "request to https://x failed with sk-secret-abc",
@@ -1114,6 +1512,118 @@ mod transcript_tests {
         assert!(msgs[3]["content"].as_str().unwrap().contains("boom"));
     }
 
+    fn intent(id: &str, tool: &str, batch: bool) -> Entry {
+        let mut e = msg(id, "assistant", "");
+        e.kind = EntryType::new("intent");
+        e.payload = json!({ "tool": tool, "input": { "p": id }, "replay": "idempotent" });
+        if batch {
+            e.payload["batch"] = json!(true);
+        }
+        e
+    }
+
+    fn settled(id: &str, parent: &str) -> Entry {
+        let mut e = msg(id, "tool", "");
+        e.kind = EntryType::new("tool_result");
+        e.parent_id = Some(parent.into());
+        e.payload = json!({ "ok": true, "output": { "from": parent } });
+        e
+    }
+
+    #[test]
+    fn a_batch_flattens_to_one_assistant_message_with_results_in_call_order() {
+        let p = OpenAiProvider::new(OpenAiConfig::new("https://x.example/v1", "m", "k"));
+        let body = p.request_body(&[
+            intent("i1", "read_file", false),
+            settled("r1", "i1"),
+            intent("i2", "read_file", true),
+            settled("r2", "i2"),
+            intent("i3", "grep", true),
+            settled("r3", "i3"),
+        ]);
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 4, "1 assistant + 3 tool messages: {msgs:?}");
+        let calls = msgs[0]["tool_calls"].as_array().unwrap();
+        let ids: Vec<_> = calls.iter().map(|c| c["id"].clone()).collect();
+        assert_eq!(ids, vec![json!("i1"), json!("i2"), json!("i3")]);
+        let tool_ids: Vec<_> = msgs[1..]
+            .iter()
+            .map(|m| m["tool_call_id"].clone())
+            .collect();
+        assert_eq!(tool_ids, ids);
+        assert!(msgs[1..].iter().all(|m| m["role"] == json!("tool")));
+    }
+
+    #[test]
+    fn consecutive_unmarked_intents_stay_separate_assistant_messages() {
+        // History written before batches (or one call per response) must
+        // flatten byte-identically: cache-prefix stability.
+        let p = OpenAiProvider::new(OpenAiConfig::new("https://x.example/v1", "m", "k"));
+        let body = p.request_body(&[
+            intent("i1", "read_file", false),
+            settled("r1", "i1"),
+            intent("i2", "read_file", false),
+            settled("r2", "i2"),
+        ]);
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs[0]["tool_calls"].as_array().unwrap().len(), 1);
+        assert_eq!(msgs[2]["tool_calls"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_batch_member_without_a_prior_assistant_call_starts_its_own_message() {
+        let p = OpenAiProvider::new(OpenAiConfig::new("https://x.example/v1", "m", "k"));
+        let body = p.request_body(&[intent("i2", "read_file", true), settled("r2", "i2")]);
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0]["tool_calls"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn parse_completion_extras_keep_model_order_and_stop_at_a_malformed_call() {
+        let resp = json!({ "choices": [{ "message": { "tool_calls": [
+            { "function": { "name": "a", "arguments": "{\"x\":1}" } },
+            { "function": { "name": "b", "arguments": "{\"x\":2}" } },
+            { "function": { "name": "c", "arguments": { "x": 3 } } },
+            { "function": { "name": "d", "arguments": "{oops" } },
+            { "function": { "name": "e", "arguments": "{}" } },
+        ] } }] });
+        assert!(matches!(
+            OpenAiProvider::parse_completion(&resp),
+            Ok(ProviderOutput::ToolCall { .. })
+        ));
+        assert_eq!(
+            OpenAiProvider::extra_calls(&resp),
+            vec![
+                ("b".to_string(), json!({"x": 2})),
+                ("c".to_string(), json!({"x": 3}))
+            ]
+        );
+        // A malformed FIRST call means no batch at all.
+        let bad_first = json!({ "choices": [{ "message": { "tool_calls": [
+            { "function": { "name": "a", "arguments": "{oops" } },
+            { "function": { "name": "b", "arguments": "{}" } },
+        ] } }] });
+        assert!(OpenAiProvider::extra_calls(&bad_first).is_empty());
+    }
+
+    #[test]
+    fn streaming_exposes_the_calls_after_the_first_as_extras() {
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"a\",\"arguments\":\"{\\\"x\\\":1}\"}},{\"index\":1,\"id\":\"c2\",\"function\":{\"name\":\"b\",\"arguments\":\"{\\\"x\\\"\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"function\":{\"arguments\":\":2}\"}}]}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let mut p = OpenAiProvider::new(OpenAiConfig::new("https://x.example/v1", "m", "k"));
+        let out = p.complete_streaming(std::io::Cursor::new(sse)).unwrap();
+        assert!(matches!(out, ProviderOutput::ToolCall { ref tool, .. } if tool == "a"));
+        assert_eq!(
+            p.last_extra_tool_calls(),
+            vec![("b".to_string(), json!({"x": 2}))]
+        );
+    }
+
     #[test]
     fn request_body_sends_tools_when_specs_present() {
         let cfg = OpenAiConfig::new("https://x.example/v1", "m", "k");
@@ -1214,6 +1724,12 @@ mod transcript_tests {
         // Tool call missing function.name → malformed.
         let bad = json!({ "choices": [{ "message": { "tool_calls": [{ "id": "x" }] } }] });
         assert!(OpenAiProvider::parse_completion(&bad).is_err());
+        // Empty content and no tool calls → the same error as a stream (#478).
+        let empty = json!({ "choices": [{ "message": { "content": "" } }] });
+        assert_eq!(
+            OpenAiProvider::parse_completion(&empty).unwrap_err().0,
+            EMPTY_COMPLETION
+        );
         // Empty tool_calls array + content → Final by content.
         let empty_calls = json!({
             "choices": [{ "message": { "content": "hi", "tool_calls": [] } }],
@@ -1249,6 +1765,26 @@ mod transcript_tests {
     }
 
     #[test]
+    fn request_body_redacts_api_key_from_tool_call_arguments() {
+        // E11 (scan 2026-10-28): the replayed intent's arguments are wire
+        // text too.
+        let key = "sk-super-secret-789";
+        let p = OpenAiProvider::new(OpenAiConfig::new("https://x.example/v1", "m", key));
+        let mut intent = msg("intent_1", "assistant", "");
+        intent.kind = EntryType::new("intent");
+        intent.payload = json!({
+            "tool": "write_file",
+            "input": { "path": ".env", "content": "KEY=sk-super-secret-789" }
+        });
+        let body = p.request_body(&[intent]);
+        let args = body["messages"][0]["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .unwrap();
+        assert!(!args.contains(key), "api key leaked in arguments: {args}");
+        assert!(args.contains("<redacted>"), "{args}");
+    }
+
+    #[test]
     fn request_body_keeps_durable_log_text_untouched() {
         // E11: redaction happens on the wire only — the durable entry
         // passed in must not be mutated by request_body.
@@ -1263,6 +1799,20 @@ mod transcript_tests {
             json!("key: sk-super-secret-456"),
             "durable log must keep the original text"
         );
+    }
+    #[test]
+    fn user_message_with_a_missing_image_degrades_to_a_text_note() {
+        let p = OpenAiProvider::new(OpenAiConfig::new("https://x.example/v1", "m", "k"));
+        let mut e = msg("e1", "user", "hi");
+        e.payload["images"] =
+            json!([{"path": "/nope/a.png", "mime": "image/png", "bytes": 1, "fnv1a64": "0"}]);
+        let body = p.request_body(&[e]);
+        let parts = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(parts[0]["text"], json!("hi"));
+        assert!(parts[1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("image unavailable"));
     }
 }
 
@@ -1335,6 +1885,335 @@ mod models_probe_tests {
         // error text (the same scrub contract as chat completions).
         let err = fetch_model_ids("http://127.0.0.1:9/v1", "sk-secret").unwrap_err();
         assert!(!err.contains("sk-secret"));
+    }
+}
+
+#[cfg(test)]
+mod http_error_tests {
+    use super::*;
+    use crate::entry::{Entry, EntryType};
+
+    /// One-shot mock answering with a raw HTTP response (status line,
+    /// extra headers and body supplied by the caller; `content_length`
+    /// may lie to simulate a cut body).
+    fn serve_raw(status: &str, headers: &str, body: &str, content_length: usize) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let resp = format!(
+            "HTTP/1.1 {status}\r\n{headers}Content-Length: {content_length}\r\nConnection: close\r\n\r\n{body}"
+        );
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                use std::io::{Read, Write};
+                let mut buf = [0u8; 8192];
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+        format!("http://{addr}/v1")
+    }
+
+    fn complete_err(base_url: String, streaming: bool) -> String {
+        let cfg = OpenAiConfig {
+            base_url,
+            api_key: "sk-secret".into(),
+            model: "m".into(),
+        };
+        let mut p = OpenAiProvider::new(cfg).with_streaming(streaming);
+        let t = vec![Entry {
+            id: "u1".into(),
+            parent_id: None,
+            seq: 0,
+            kind: EntryType::new(EntryType::MESSAGE),
+            payload: json!({ "role": "user", "text": "hi" }),
+            timestamp: 0,
+        }];
+        p.complete(&t).unwrap_err().0
+    }
+
+    /// The same message without the body must classify identically.
+    fn assert_classified_like_bare(msg: &str, bare: &str) {
+        assert_eq!(
+            crate::failover::is_failover_error(msg),
+            crate::failover::is_failover_error(bare),
+            "{msg}"
+        );
+        assert_eq!(
+            crate::turn::is_transient_provider_error(msg),
+            crate::turn::is_transient_provider_error(bare),
+            "{msg}"
+        );
+    }
+
+    /// Serves `replies` (status, body) one connection each, in order;
+    /// returns the base url and every request body it saw.
+    fn serve_script(
+        replies: Vec<(&'static str, String)>,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = std::sync::Arc::clone(&seen);
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for (status, body) in replies {
+                let Ok((mut s, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 8192];
+                loop {
+                    let n = s.read(&mut chunk).unwrap_or(0);
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(h) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        if let Ok(v) = serde_json::from_slice::<Value>(&buf[h + 4..]) {
+                            log.lock().unwrap().push(v);
+                            break;
+                        }
+                    }
+                    if n == 0 {
+                        break;
+                    }
+                }
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+        (format!("http://{addr}/v1"), seen)
+    }
+
+    fn ok_body() -> String {
+        json!({"choices": [{"index": 0, "finish_reason": "stop",
+            "message": {"role": "assistant", "content": "done"}}]})
+        .to_string()
+    }
+
+    fn user_turn() -> Vec<Entry> {
+        vec![Entry {
+            id: "u1".into(),
+            parent_id: None,
+            seq: 0,
+            kind: EntryType::new(EntryType::MESSAGE),
+            payload: json!({ "role": "user", "text": "hi" }),
+            timestamp: 0,
+        }]
+    }
+
+    fn effort_provider(url: String, effort: Option<&str>) -> OpenAiProvider {
+        let cfg = OpenAiConfig::new(url, "m", "sk-secret");
+        OpenAiProvider::new(cfg)
+            .with_streaming(false)
+            .with_reasoning_effort(effort.map(str::to_string))
+    }
+
+    #[test]
+    fn rejected_reasoning_effort_gets_one_degraded_retry_that_is_recorded() {
+        let rejection = json!({"error": {"message":
+            "Unrecognized request argument supplied: reasoning_effort"}})
+        .to_string();
+        let (url, seen) = serve_script(vec![
+            ("400 Bad Request", rejection),
+            ("200 OK", ok_body()),
+            ("200 OK", ok_body()),
+        ]);
+        let mut p = effort_provider(url, Some("high"));
+        let t = user_turn();
+        let out = p.complete(&t).expect("the degraded retry succeeds");
+        assert_eq!(
+            out,
+            ProviderOutput::Final {
+                text: "done".into()
+            }
+        );
+        {
+            let bodies = seen.lock().unwrap();
+            assert_eq!(bodies.len(), 2, "one rejected call + ONE retry");
+            assert_eq!(bodies[0]["reasoning_effort"], json!("high"));
+            assert!(bodies[1].get("reasoning_effort").is_none(), "{}", bodies[1]);
+        }
+        let rec = p.last_degraded().expect("the rejection is recorded");
+        assert_eq!(rec["param"], json!("reasoning_effort"));
+        assert_eq!(rec["level"], json!("high"));
+        // The rejection is remembered: later calls do not re-send it.
+        p.complete(&t).unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 3, "no second rejected call");
+        assert!(seen.lock().unwrap()[2].get("reasoning_effort").is_none());
+        assert!(p.last_degraded().is_none(), "describes THIS call only");
+    }
+
+    #[test]
+    fn a_400_that_does_not_name_the_parameter_is_not_retried() {
+        let (url, seen) = serve_script(vec![
+            ("400 Bad Request", r#"{"error":"bad messages"}"#.into()),
+            ("200 OK", ok_body()),
+        ]);
+        let mut p = effort_provider(url, Some("high"));
+        let err = p.complete(&user_turn()).unwrap_err().0;
+        assert!(err.starts_with("http status: 400"), "{err}");
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert!(p.last_degraded().is_none());
+    }
+
+    #[test]
+    fn a_400_naming_it_without_an_effort_set_is_not_retried() {
+        let (url, seen) = serve_script(vec![
+            ("400 Bad Request", "reasoning_effort is odd".into()),
+            ("200 OK", ok_body()),
+        ]);
+        let mut p = effort_provider(url, None);
+        assert!(p.complete(&user_turn()).is_err());
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_failed_degraded_retry_surfaces_its_own_error() {
+        let (url, seen) = serve_script(vec![
+            (
+                "400 Bad Request",
+                "unknown parameter: reasoning_effort".into(),
+            ),
+            ("429 Too Many Requests", "slow down".into()),
+        ]);
+        let mut p = effort_provider(url, Some("low"));
+        let err = p.complete(&user_turn()).unwrap_err().0;
+        assert!(err.starts_with("http status: 429"), "{err}");
+        assert_eq!(seen.lock().unwrap().len(), 2, "still bounded to one retry");
+    }
+
+    #[test]
+    fn json_error_body_reaches_the_error_text() {
+        let body = r#"{"error":{"message":"maximum context length is 131072 tokens","code":"context_length_exceeded"}}"#;
+        for streaming in [false, true] {
+            let url = serve_raw(
+                "400 Bad Request",
+                "Content-Type: application/json\r\n",
+                body,
+                body.len(),
+            );
+            let err = complete_err(url, streaming);
+            assert_eq!(err, format!("http status: 400 Bad Request — {body}"));
+            assert_classified_like_bare(&err, "http status: 400 Bad Request");
+            assert!(!crate::turn::is_transient_provider_error(&err));
+        }
+    }
+
+    #[test]
+    fn retry_after_is_surfaced_and_429_stays_transient() {
+        let body = "rate limited";
+        let url = serve_raw(
+            "429 Too Many Requests",
+            "Retry-After: 7\r\n",
+            body,
+            body.len(),
+        );
+        let err = complete_err(url, false);
+        assert_eq!(
+            err,
+            "http status: 429 Too Many Requests (retry-after: 7) — rate limited"
+        );
+        assert_classified_like_bare(&err, "http status: 429 Too Many Requests");
+        assert!(crate::turn::is_transient_provider_error(&err));
+        assert!(crate::failover::is_failover_error(&err));
+    }
+
+    #[test]
+    fn html_body_is_capped_and_the_key_scrubbed() {
+        let body = format!("<html>key sk-secret {}</html>", "x".repeat(500));
+        let url = serve_raw(
+            "503 Service Unavailable",
+            "Content-Type: text/html\r\n",
+            &body,
+            body.len(),
+        );
+        let err = complete_err(url, false);
+        assert!(err.starts_with("http status: 503 Service Unavailable — <html>key <redacted> xxx"));
+        assert!(!err.contains("sk-secret"));
+        let snippet = err.split_once(" — ").unwrap().1;
+        assert_eq!(snippet.chars().count(), 200);
+        assert_classified_like_bare(&err, "http status: 503 Service Unavailable");
+        assert!(crate::failover::is_failover_error(&err));
+    }
+
+    #[test]
+    fn unreadable_body_is_marked() {
+        // Content-Length promises 100 bytes, 5 arrive, then the socket closes.
+        let url = serve_raw("500 Internal Server Error", "", "oops!", 100);
+        let err = complete_err(url, false);
+        assert_eq!(
+            err,
+            "http status: 500 Internal Server Error — <unreadable body>"
+        );
+        assert_classified_like_bare(&err, "http status: 500 Internal Server Error");
+    }
+
+    #[test]
+    fn body_text_cannot_flip_transient_classification() {
+        for (status, body) in [
+            ("400 Bad Request", "resulted in 142900 tokens"),
+            ("422 Unprocessable Entity", "invalid timeout value"),
+            ("401 Unauthorized", "token timeout"),
+        ] {
+            let url = serve_raw(status, "", body, body.len());
+            let err = complete_err(url, false);
+            assert!(err.ends_with(body), "{err}");
+            assert!(!crate::turn::is_transient_provider_error(&err), "{err}");
+        }
+    }
+
+    #[test]
+    fn models_probes_keep_their_non_2xx_behaviour() {
+        for (status, code) in [("401 Unauthorized", "401"), ("404 Not Found", "404")] {
+            let body = r#"{"error":"nope"}"#;
+            let url = serve_raw(
+                status,
+                "Content-Type: application/json\r\n",
+                body,
+                body.len(),
+            );
+            let err = fetch_model_ids(&url, "sk-secret").unwrap_err();
+            assert_eq!(err, format!("models probe: http status: {code}"));
+            let url = serve_raw(
+                status,
+                "Content-Type: application/json\r\n",
+                body,
+                body.len(),
+            );
+            let err =
+                fetch_context_window(&url, "sk-secret", "m", Duration::from_secs(3)).unwrap_err();
+            assert_eq!(err, format!("models probe: http status: {code}"));
+        }
+    }
+    #[test]
+    fn image_rejection_from_the_server_becomes_a_capability_error() {
+        let url = serve_raw(
+            "400 Bad Request",
+            "Content-Type: application/json\r\n",
+            r#"{"error":{"message":"image_url content is not supported by this model"}}"#,
+            68,
+        );
+        let ws = std::env::temp_dir().join(format!("tole-cap-{}", std::process::id()));
+        std::fs::create_dir_all(&ws).unwrap();
+        let ws = ws.canonicalize().unwrap();
+        let png = [0x89u8, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3];
+        std::fs::write(ws.join("a.png"), png).unwrap();
+        let r = crate::image::resolve("a.png", std::slice::from_ref(&ws), None).unwrap();
+        let mut e = Entry {
+            id: "e1".into(),
+            parent_id: None,
+            seq: 0,
+            kind: EntryType::new(EntryType::MESSAGE),
+            payload: json!({ "role": "user", "text": "hi" }),
+            timestamp: 0,
+        };
+        e.payload["images"] = json!([r.to_value()]);
+        let mut p = OpenAiProvider::new(OpenAiConfig::new(url, "m", "k"))
+            .with_streaming(false)
+            .with_image_roots(vec![ws]);
+        let err = p.complete(&[e]).unwrap_err();
+        assert!(err.0.contains("model-capability"), "{err}");
     }
 }
 
@@ -1558,6 +2437,177 @@ mod streaming_tests {
             }
         });
         format!("http://{addr}/v1")
+    }
+
+    /// Keep-alive SSE mock for connection-reuse tests (issue #479).
+    /// Serves a chunked `[DONE]` stream per request on each connection.
+    /// `hold` = never send the chunked terminator (the body stays open
+    /// until `release`); otherwise the terminator follows at once.
+    struct KeepAliveMock {
+        url: String,
+        /// Accepted TCP connections. Every one is a chat connection:
+        /// there is no side channel, the counters are read in process.
+        conns: Arc<std::sync::atomic::AtomicUsize>,
+        /// Connections the client closed while the mock still held them.
+        closed: Arc<std::sync::atomic::AtomicUsize>,
+        release: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    fn serve_keepalive(body: &'static str, hold: bool) -> KeepAliveMock {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let conns = Arc::new(AtomicUsize::new(0));
+        let closed = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let (c, cl, rel) = (conns.clone(), closed.clone(), release.clone());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { break };
+                c.fetch_add(1, SeqCst);
+                let (cl, rel) = (cl.clone(), rel.clone());
+                std::thread::spawn(move || {
+                    s.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+                    let mut buf: Vec<u8> = Vec::new();
+                    let mut chunk = [0u8; 8192];
+                    loop {
+                        // One full request (headers + content-length body).
+                        loop {
+                            if let Some(h) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                let head = String::from_utf8_lossy(&buf[..h]).to_string();
+                                let clen: usize = head
+                                    .lines()
+                                    .find_map(|l| {
+                                        let (k, v) = l.split_once(':')?;
+                                        k.eq_ignore_ascii_case("content-length")
+                                            .then(|| v.trim().parse().ok())?
+                                    })
+                                    .unwrap_or(0);
+                                if buf.len() >= h + 4 + clen {
+                                    buf.drain(..h + 4 + clen);
+                                    break;
+                                }
+                            }
+                            match s.read(&mut chunk) {
+                                Ok(0) => return,
+                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                                Err(e)
+                                    if e.kind() == std::io::ErrorKind::WouldBlock
+                                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                                {
+                                    if rel.load(SeqCst) {
+                                        return;
+                                    }
+                                }
+                                Err(_) => return,
+                            }
+                        }
+                        let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+                        let mut resp = format!("{head}{:x}\r\n{body}\r\n", body.len());
+                        if !hold {
+                            resp.push_str("0\r\n\r\n");
+                        }
+                        if s.write_all(resp.as_bytes()).is_err() {
+                            return;
+                        }
+                        if hold {
+                            // Body never ends: wait for the client to close.
+                            loop {
+                                match s.read(&mut chunk) {
+                                    Ok(0) => {
+                                        cl.fetch_add(1, SeqCst);
+                                        return;
+                                    }
+                                    Ok(_) => {}
+                                    Err(_) if rel.load(SeqCst) => return,
+                                    Err(_) => {}
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        KeepAliveMock {
+            url,
+            conns,
+            closed,
+            release,
+        }
+    }
+
+    const DONE_BODY: &str = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    /// Valid stream that ends in `Err` (empty answer) with the body open.
+    const EMPTY_BODY: &str = "data: [DONE]\n\n";
+
+    fn count(a: &Arc<std::sync::atomic::AtomicUsize>) -> usize {
+        a.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Poll until `cond` holds (up to 2 s).
+    fn wait_for(cond: impl Fn() -> bool) -> bool {
+        for _ in 0..100 {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        cond()
+    }
+
+    #[test]
+    fn streamed_requests_reuse_one_connection() {
+        let mock = serve_keepalive(DONE_BODY, false);
+        let mut p = OpenAiProvider::new(OpenAiConfig::new(mock.url.clone(), "m", "sk-test"));
+        for _ in 0..9 {
+            let out = p.complete(&[]).unwrap();
+            assert!(matches!(out, ProviderOutput::Final { ref text } if text == "hi"));
+            // The drain reads the terminator off-thread; give it a beat so
+            // the next request finds the connection back in the pool.
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(count(&mock.conns), 1, "9 streamed requests, 1 connection");
+    }
+
+    #[test]
+    fn a_held_open_body_does_not_delay_the_turn() {
+        let mock = serve_keepalive(DONE_BODY, true);
+        let mut p = OpenAiProvider::new(OpenAiConfig::new(mock.url.clone(), "m", "sk-test"));
+        let t = std::time::Instant::now();
+        p.complete(&[]).unwrap();
+        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+        mock.release
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[test]
+    fn drain_threads_are_bounded_and_the_overflow_closes() {
+        let mock = serve_keepalive(DONE_BODY, true);
+        let mut p = OpenAiProvider::new(OpenAiConfig::new(mock.url.clone(), "m", "sk-test"));
+        for _ in 0..3 {
+            p.complete(&[]).unwrap();
+        }
+        assert_eq!(count(&mock.conns), 3);
+        // The 3rd request is over the cap: its connection closes at once.
+        assert!(wait_for(|| count(&mock.closed) >= 1), "overflow not closed");
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(count(&mock.closed), 1, "2 drains stay parked, 1 closed");
+        mock.release
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[test]
+    fn a_failed_stream_is_not_drained() {
+        let mock = serve_keepalive(EMPTY_BODY, true);
+        let mut p = OpenAiProvider::new(OpenAiConfig::new(mock.url.clone(), "m", "sk-test"));
+        assert!(p.complete(&[]).is_err());
+        assert!(wait_for(|| count(&mock.closed) == 1), "connection kept");
+        mock.release
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Issue #232 regression: each response's usage/reasoning stand

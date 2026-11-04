@@ -69,6 +69,16 @@ pub enum StorageError {
     /// An effect-sandwich invariant was violated (machine.rs guards).
     #[error("effect sandwich violation: {0}")]
     Effect(String),
+    /// Another process holds the session's writer lock.
+    #[error("session is open for writing by {}", match .holder { Some(pid) => format!("pid {pid}"), None => "another process".to_string() })]
+    Locked {
+        /// Pid recorded in the lock file (best effort).
+        holder: Option<u32>,
+    },
+    /// The file changed under this handle (a writer that ignored the lock);
+    /// appending would duplicate or interleave records.
+    #[error("session file changed under this handle: {0}; re-open the session")]
+    StaleHandle(String),
     /// Underlying I/O failure.
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -109,6 +119,11 @@ pub struct Commit {
     pub transition: Option<StateTransition>,
     /// Optional usage ledger row.
     pub usage: Option<UsageRecord>,
+    /// When set, the line is written and flushed but its `sync_data` is
+    /// deferred to the next durable commit (#483): one `fdatasync` covers
+    /// every earlier appended byte. Only for commits the caller always
+    /// follows with a durable one before any effect or return.
+    pub defer_sync: bool,
 }
 
 impl Commit {
@@ -132,6 +147,12 @@ impl Commit {
     /// Sets the CAS state transition.
     pub fn transition(mut self, t: StateTransition) -> Self {
         self.transition = Some(t);
+        self
+    }
+
+    /// Defers this commit's `sync_data` to the next durable commit.
+    pub fn defer_sync(mut self) -> Self {
+        self.defer_sync = true;
         self
     }
 
@@ -228,6 +249,23 @@ struct HeaderLine {
     /// skipped when absent, so pre-name files replay unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     name: Option<String>,
+    /// Issue #210: where a forked session was cut from. Optional +
+    /// skipped when absent, so pre-fork files replay unchanged.
+    #[serde(
+        default,
+        rename = "forkedFrom",
+        skip_serializing_if = "Option::is_none"
+    )]
+    forked_from: Option<ForkOrigin>,
+}
+
+/// Where a forked session was cut from (issue #210).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForkOrigin {
+    /// The source session id.
+    pub session: String,
+    /// The settled entry the fork was cut at (the last one it carries).
+    pub entry: String,
 }
 
 /// Discriminated record inside a commit line (array element or solo object).
@@ -313,17 +351,28 @@ pub struct JsonlStorage {
     session_id: String,
     path: PathBuf,
     writer: BufWriter<File>,
+    /// Exclusive advisory lock on the sidecar `<id>.jsonl.lock` (never
+    /// renamed, so it survives `compact()`); `None` for read-only handles.
+    /// Released by the OS on drop or crash.
+    _lock: Option<File>,
+    /// File length after the last append this handle made or replayed;
+    /// a mismatch before an append means someone else wrote.
+    good_len: u64,
     created_at: u64,
     cwd: String,
     system_prompt: Option<String>,
     /// Operator alias (issue #216), pinned in the header.
     name: Option<String>,
+    /// Issue #210: the fork origin pinned in the header.
+    forked_from: Option<ForkOrigin>,
     /// Set when an append previously failed mid-write (cora full-scan
     /// #53): the file may now end in a newline-less fragment, so ANY
     /// further commit could glue its line onto the fragment and brick
     /// the session. Poisoned storage rejects commits with a fatal error
     /// until the host re-opens/re-creates the session.
     poisoned: Option<StorageError>,
+    /// `sync_data` calls issued by appends (measurement hook, #483).
+    syncs: u64,
     // In-memory state (the file is a replay recipe, not the state):
     entries: Vec<Entry>,
     by_id: BTreeMap<String, usize>,
@@ -364,6 +413,17 @@ impl JsonlStorage {
         system_prompt: Option<&str>,
         name: Option<&str>,
     ) -> Result<Self, StorageError> {
+        Self::create_inner(dir, session_id, cwd, system_prompt, name, None)
+    }
+
+    fn create_inner(
+        dir: impl AsRef<Path>,
+        session_id: impl Into<String>,
+        cwd: Option<String>,
+        system_prompt: Option<&str>,
+        name: Option<&str>,
+        forked_from: Option<ForkOrigin>,
+    ) -> Result<Self, StorageError> {
         let session_id = session_id.into();
         // Issue #248 (rescan #145): the id is joined into a file path —
         // the storage layer enforces the safe charset itself instead of
@@ -388,6 +448,7 @@ impl JsonlStorage {
             cwd: cwd.clone(),
             system_prompt: system_prompt.map(str::to_string),
             name: name.map(str::to_string),
+            forked_from: forked_from.clone(),
         };
         let mut writer = BufWriter::new(
             OpenOptions::new()
@@ -395,15 +456,20 @@ impl JsonlStorage {
                 .create_new(true)
                 .open(&path)?,
         );
-        writeln!(writer, "{}", serde_json::to_string(&header)?)?;
+        let lock = lock_writer(&path)?;
+        let header_line = serde_json::to_string(&header)?;
+        writeln!(writer, "{header_line}")?;
         writer.flush()?;
         Ok(Self {
             session_id,
             path,
             writer,
+            _lock: Some(lock),
+            good_len: header_line.len() as u64 + 1,
             created_at,
             cwd,
             name: name.map(str::to_string),
+            forked_from,
             system_prompt: system_prompt.map(str::to_string),
             entries: Vec::new(),
             by_id: BTreeMap::new(),
@@ -412,7 +478,97 @@ impl JsonlStorage {
             usage: Vec::new(),
             state: MachineState::default(),
             poisoned: None,
+            syncs: 0,
         })
+    }
+
+    /// Issue #210: starts session `new_id` in `dir` as a fork of the
+    /// session file `src`: a copy of its lineage up to and including the
+    /// settled entry `at` (default: the last settled entry). Settled = a
+    /// final assistant message (no tool call hangs off it), the only point
+    /// where the machine rests at `Final` with no open tool sandwich. The source is only read, never
+    /// touched; entry ids and parents are kept, so every reader (replay,
+    /// todo hydration) works on the fork unchanged. Usage rows and
+    /// registers are NOT copied: a fork starts with a clean ledger.
+    pub fn fork(
+        src: impl AsRef<Path>,
+        dir: impl AsRef<Path>,
+        new_id: impl Into<String>,
+        at: Option<&str>,
+    ) -> Result<Self, StorageError> {
+        let new_id = new_id.into();
+        let from = Self::open_read_only(src)?;
+        let settled = |e: &Entry| {
+            e.kind.as_str() == EntryType::MESSAGE
+                && e.payload["role"] == "assistant"
+                && from.children(&e.id).is_empty()
+        };
+        let cut = match at {
+            Some(id) => {
+                let e = from
+                    .entry(id)
+                    .ok_or_else(|| StorageError::Invalid(format!("unknown entry: {id}")))?;
+                if !settled(e) {
+                    return Err(StorageError::Invalid(format!(
+                        "entry {id} is not a settled point (a final assistant message with no open tool calls)"
+                    )));
+                }
+                from.by_id[id]
+            }
+            None => from
+                .entries
+                .iter()
+                .rposition(settled)
+                .ok_or_else(|| StorageError::Invalid("no settled entry to fork from".into()))?,
+        };
+        let origin = ForkOrigin {
+            session: from.session_id.clone(),
+            entry: from.entries[cut].id.clone(),
+        };
+        let mut out = Self::create_inner(
+            dir,
+            new_id,
+            Some(from.cwd.clone()),
+            from.system_prompt.as_deref(),
+            None,
+            Some(origin),
+        )?;
+        let copied: Result<(), StorageError> = (|| {
+            let mut c = Commit::new();
+            for e in &from.entries[..=cut] {
+                c = c.entry(NewEntry {
+                    id: Some(e.id.clone()),
+                    parent_id: e.parent_id.clone(),
+                    kind: e.kind.clone(),
+                    payload: e.payload.clone(),
+                    timestamp: e.timestamp,
+                });
+            }
+            out.commit(c)?;
+            // Idle -> Planning -> Final: the fork rests where a finished
+            // turn rests, so `resume <id> "<prompt>"` re-opens it.
+            for pc in [Pc::Planning, Pc::Final] {
+                let seq = out.state.seq;
+                out.commit(Commit::new().transition(StateTransition::from(seq, pc)))?;
+            }
+            Ok(())
+        })();
+        if let Err(e) = copied {
+            // Never leave a half-written fork behind.
+            let _ = std::fs::remove_file(&out.path);
+            return Err(e);
+        }
+        Ok(out)
+    }
+
+    /// Working directory recorded in the session header (empty if none).
+    pub fn cwd(&self) -> &str {
+        &self.cwd
+    }
+
+    /// Issue #210: where this session was forked from, if it is a fork.
+    pub fn forked_from(&self) -> Option<&ForkOrigin> {
+        self.forked_from.as_ref()
     }
 
     /// Opens and replays an existing session file.
@@ -420,7 +576,26 @@ impl JsonlStorage {
     /// Older format versions replay cleanly; a newer version is a hard
     /// error. A torn final line (crash mid-append) is discarded whole.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
-        let path = path.as_ref().to_path_buf();
+        Self::open_with(path.as_ref(), true)
+    }
+
+    /// Replays a session file for READING only (listings, status): a torn
+    /// final line is skipped in memory but never truncated on disk, so a
+    /// reader can never cut a line another process is still appending
+    /// (scan 2026-10-28). Do not commit through the result.
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self, StorageError> {
+        Self::open_with(path.as_ref(), false)
+    }
+
+    fn open_with(path: &Path, repair: bool) -> Result<Self, StorageError> {
+        let path = path.to_path_buf();
+        // Lock BEFORE reading or repairing: the torn-tail truncation below
+        // would cut a line another process is still appending.
+        let lock = if repair {
+            Some(lock_writer(&path)?)
+        } else {
+            None
+        };
         let file = File::open(&path)?;
         let mut reader = BufReader::new(file);
 
@@ -469,10 +644,20 @@ impl JsonlStorage {
         let mut out = Self {
             session_id: header.id.clone(),
             path: path.clone(),
-            writer: BufWriter::new(OpenOptions::new().append(true).open(&path)?),
+            // Read-only replays get a read-only handle: a commit through
+            // them fails instead of writing.
+            writer: BufWriter::new(
+                OpenOptions::new()
+                    .append(repair)
+                    .read(!repair)
+                    .open(&path)?,
+            ),
+            _lock: lock,
+            good_len: 0,
             created_at: header.created_at,
             cwd: header.cwd.clone(),
             name: header.name.clone(),
+            forked_from: header.forked_from.clone(),
             system_prompt: header.system_prompt.clone(),
             entries: Vec::new(),
             by_id: BTreeMap::new(),
@@ -481,6 +666,7 @@ impl JsonlStorage {
             usage: Vec::new(),
             state: MachineState::default(),
             poisoned: None,
+            syncs: 0,
         };
 
         // Body lines: solo object or array (one transaction per line).
@@ -555,12 +741,13 @@ impl JsonlStorage {
         // A torn tail was discarded during replay. Physically truncate the
         // partial bytes NOW, before the append handle concatenates a new
         // commit line onto the fragment (would corrupt the file forever).
-        if good_bytes < file_len(&out.path)? {
+        if repair && good_bytes < file_len(&out.path)? {
             truncate_file(&out.path, good_bytes)?;
             sync_dir(&out.path)?;
         }
         // The global seq advances with every record, transition or not.
         out.state.seq = out.state.seq.max(last_seq);
+        out.good_len = good_bytes;
         Ok(out)
     }
 
@@ -646,16 +833,35 @@ impl JsonlStorage {
         }
     }
 
+    /// Number of `sync_data` calls this handle's appends have issued
+    /// (measurement hook for the #483 fsync-budget test).
+    #[doc(hidden)]
+    pub fn sync_count(&self) -> u64 {
+        self.syncs
+    }
+
     /// Durably appends one physical line.
     ///
     /// The line is flushed and fsynced so a crash never loses a *committed*
     /// record. (A crash mid-line leaves a torn tail, which open() discards
-    /// whole — see the torn-tail test.)
-    fn append_line(&mut self, line: &str) -> Result<(), StorageError> {
+    /// whole — see the torn-tail test.) With `durable == false` the fsync is
+    /// skipped; the next durable append's `sync_data` persists it too.
+    fn append_line(&mut self, line: &str, durable: bool) -> Result<(), StorageError> {
+        // One fstat: the file must still end where our last append did.
+        let actual = self.writer.get_ref().metadata()?.len();
+        if actual != self.good_len {
+            return Err(StorageError::StaleHandle(format!(
+                "expected {} bytes, found {actual}",
+                self.good_len
+            )));
+        }
         let res = (|| -> Result<(), StorageError> {
             writeln!(self.writer, "{line}")?;
             self.writer.flush()?;
-            self.writer.get_ref().sync_data()?;
+            if durable {
+                self.writer.get_ref().sync_data()?;
+                self.syncs += 1;
+            }
             Ok(())
         })();
         if let Err(e) = res {
@@ -668,6 +874,7 @@ impl JsonlStorage {
             self.poisoned = Some(StorageError::Io(std::io::Error::other(e.to_string())));
             return Err(e);
         }
+        self.good_len += line.len() as u64 + 1;
         Ok(())
     }
 
@@ -741,6 +948,46 @@ fn is_at_eof(reader: &mut BufReader<File>) -> bool {
     matches!(reader.read(&mut probe), Ok(0))
 }
 
+/// Takes the exclusive writer lock on the sidecar `<path>.lock` and records
+/// our pid in it (best effort). A sidecar, not the session file: `compact()`
+/// renames a new file over the live path, which would drop a lock held on
+/// the old inode.
+fn lock_writer(path: &Path) -> Result<File, StorageError> {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".lock");
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut b = OpenOptions::new();
+    b.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        // CLOEXEC: a spawned child must not inherit the writer lock. Without
+        // it, an flock held on the fd survives into every child until it
+        // exits (run_command, job_start, nohup-style wrappers), and a later
+        // `resume` is refused with a pid that no longer holds the session.
+        b.custom_flags(libc::O_CLOEXEC);
+    }
+    let mut f = b.open(Path::new(&name))?;
+    match f.try_lock() {
+        Ok(()) => {
+            // The pid is advisory text; a failed write never blocks the open.
+            let _ = f
+                .set_len(0)
+                .and_then(|()| write!(f, "{}", std::process::id()));
+            Ok(f)
+        }
+        Err(std::fs::TryLockError::WouldBlock) => {
+            let mut text = String::new();
+            let _ = f.read_to_string(&mut text);
+            Err(StorageError::Locked {
+                holder: text.trim().parse().ok(),
+            })
+        }
+        Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
+    }
+}
+
 /// File length in bytes (used to detect a discarded torn tail on open).
 fn file_len(path: &Path) -> std::io::Result<u64> {
     Ok(std::fs::metadata(path)?.len())
@@ -788,8 +1035,14 @@ impl Storage for JsonlStorage {
         self.system_prompt.as_deref()
     }
 
+    /// A `fact/session_name` register (TUI `/name`, #461) wins over the
+    /// header alias: the header is append-only history, the register is the
+    /// rename.
     fn session_name(&self) -> Option<&str> {
-        self.name.as_deref()
+        self.get_register("fact", "session_name")
+            .and_then(Value::as_str)
+            .filter(|n| !n.is_empty())
+            .or(self.name.as_deref())
     }
 
     fn state(&self) -> MachineState {
@@ -914,7 +1167,7 @@ impl Storage for JsonlStorage {
 
         // Encode + append (single physical line = atomic transaction).
         let (line, final_seq) = self.encode_commit(&c, &committed, next)?;
-        self.append_line(&line)?;
+        self.append_line(&line, !c.defer_sync)?;
 
         // Apply to memory only after the byte hit the file.
         for e in committed.iter() {
@@ -1013,6 +1266,7 @@ impl Storage for JsonlStorage {
                 created_at: self.created_at,
                 cwd: self.cwd.clone(),
                 name: self.name.clone(),
+                forked_from: self.forked_from.clone(),
                 system_prompt: self.system_prompt.clone(),
             };
             writeln!(w, "{}", serde_json::to_string(&header)?)?;
@@ -1038,6 +1292,7 @@ impl Storage for JsonlStorage {
                 return Err(e.into());
             }
         });
+        self.good_len = self.writer.get_ref().metadata()?.len();
         self.state.seq = seq;
         // The file was atomically rewritten from COMPLETE records only —
         // any torn fragment that justified the poison no longer exists.
@@ -1056,6 +1311,19 @@ mod poison_tests {
     use crate::entry::{EntryType, NewEntry};
     use serde_json::json;
 
+    /// Unique per invocation: pid alone collides across concurrent or
+    /// pid-reusing runs sharing the temp dir.
+    fn uniq_dir(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "tole-{tag}-{}-{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
     fn msg(v: Value) -> NewEntry {
         NewEntry::root(EntryType::new(EntryType::MESSAGE), v)
     }
@@ -1073,7 +1341,7 @@ mod poison_tests {
     /// validation by forgetting it upstream.
     #[test]
     fn create_named_refuses_unsafe_session_ids() {
-        let dir = std::env::temp_dir().join(format!("tole-sid-{}", std::process::id()));
+        let dir = uniq_dir("sid");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         for bad in [
@@ -1112,7 +1380,7 @@ mod poison_tests {
 
     #[test]
     fn failed_append_poisons_until_reopen() {
-        let dir = std::env::temp_dir().join(format!("tole-poison-{}", std::process::id()));
+        let dir = uniq_dir("poison");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let mut s = JsonlStorage::create(&dir, "p", None).unwrap();
@@ -1124,7 +1392,10 @@ mod poison_tests {
         // FreeBSD where /dev/full does not exist) — skip honestly there
         // instead of panicking (CodeCora CI annotation).
         match OpenOptions::new().write(true).open("/dev/full") {
-            Ok(f) => s.writer = BufWriter::new(f),
+            Ok(f) => {
+                s.writer = BufWriter::new(f);
+                s.good_len = 0; // /dev/full is empty: keep the stale-handle check quiet
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 eprintln!("/dev/full unavailable on this platform — poison path untested here");
                 let _ = std::fs::remove_dir_all(&dir);
@@ -1177,7 +1448,7 @@ mod poison_tests {
     /// the local new-id set, duplicates across commits still rejected.
     #[test]
     fn intra_commit_parents_and_duplicate_ids_still_validated() {
-        let dir = std::env::temp_dir().join(format!("tole-p_ids-{}", std::process::id()));
+        let dir = uniq_dir("p_ids");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let mut s = JsonlStorage::create(&dir, "ids", None).unwrap();
