@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Reply by the last message: a tool result -> "WROTE-OK"; a prompt with
-/// "write" -> a write_file call; "slow" -> silence for 20s; else a two-chunk
+/// "write" -> a write_file call; "evil" -> an answer carrying ESC/CR; "slow" -> silence for 20s; else a two-chunk
 /// streamed answer. Always SSE when the request streams.
 fn spawn_mock() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -79,6 +79,8 @@ fn serve(mut s: std::net::TcpStream) {
         vec![json!({"content": "WROTE-OK"})]
     } else if said.contains("write") {
         vec![json!({"tool_calls": [call]})]
+    } else if said.contains("evil") {
+        vec![json!({"content": "EV\x1b[2J\rIL"})]
     } else if said.contains("slow") {
         std::thread::sleep(Duration::from_secs(20));
         vec![json!({"content": "LATE"})]
@@ -329,4 +331,24 @@ fn tui_enforces_a_deny_only_pretool_hook() {
     assert!(!dir.join("out.txt").exists(), "denied write must not run");
     t.send("/quit\r");
     assert_eq!(t.wait_exit(), Some(0));
+}
+
+/// Provider text with ESC/CR must reach the terminal only as visible
+/// `\u{..}` escapes, never as the raw sequence (terminal injection).
+#[test]
+fn tui_never_passes_escape_sequences_from_provider_text() {
+    let (url, dir) = (spawn_mock(), workdir());
+    let mut t = Pty::spawn(&dir, &url);
+    t.expect("effort:");
+    t.send("evil\r");
+    t.expect("EV\\u{1b}[2J\\u{d}IL");
+    t.send("/quit\r");
+    assert_eq!(t.wait_exit(), Some(0));
+    let o = t.out.lock().unwrap();
+    let seen = String::from_utf8_lossy(&o);
+    assert!(
+        !seen.contains("\x1b[2J\rIL"),
+        "raw injection reached the pty"
+    );
+    assert!(!seen.contains("[2J\rIL"), "raw injection reached the pty");
 }

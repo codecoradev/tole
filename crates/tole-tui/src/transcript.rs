@@ -31,7 +31,7 @@ impl Transcript {
             out.extend(self.flush());
             self.cur = Some(kind);
         }
-        self.partial.push_str(chunk);
+        self.partial.push_str(&crate::sanitize(chunk));
         while let Some(i) = self.partial.find('\n') {
             let text: String = self.partial.drain(..=i).collect();
             out.push(Out {
@@ -45,7 +45,7 @@ impl Transcript {
     /// A whole line (tool line, note, user echo): flushes the partial first.
     pub fn line(&mut self, kind: Kind, text: &str) -> Vec<Out> {
         let mut out = self.flush();
-        out.extend(text.split('\n').map(|t| Out {
+        out.extend(crate::sanitize(text).split('\n').map(|t| Out {
             kind,
             text: t.to_string(),
         }));

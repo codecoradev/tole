@@ -8,6 +8,7 @@
 //! live stream line, the editor and the footer.
 
 mod editor;
+mod sanitize;
 mod transcript;
 
 use std::io::{self, Stdout};
@@ -33,6 +34,7 @@ use tole_core::cancel::CancelToken;
 use tole_core::turn::TurnObserver;
 
 pub use editor::Editor;
+pub(crate) use sanitize::{one_line, sanitize};
 pub use transcript::{Kind, Out, Transcript};
 
 /// live stream (2) + editor (4) + footer (1).
@@ -63,7 +65,7 @@ impl Footer {
             self.context.clone(),
             self.tokens.clone(),
         ];
-        let line = parts.join(" · ");
+        let line = one_line(&parts.join(" · "));
         if line.chars().count() <= width {
             return line;
         }
@@ -108,6 +110,7 @@ pub struct Prompter(Arc<Mutex<Sender<Pending>>>);
 
 impl Prompter {
     pub fn ask(&self, text: String, destructive: bool) -> Verdict {
+        let text = one_line(&text);
         let (reply, answer) = mpsc::channel();
         let sent = self
             .0
@@ -144,7 +147,7 @@ pub fn tool_line(tool: &str, input: &Value) -> String {
     let arg = input
         .as_object()
         .and_then(|o| o.values().find_map(Value::as_str))
-        .map(|s| clip(s.lines().next().unwrap_or(""), 60))
+        .map(|s| clip(&one_line(s.lines().next().unwrap_or("")), 60))
         .unwrap_or_default();
     format!("▸ {tool} {arg}").trim_end().to_string()
 }
@@ -162,7 +165,7 @@ impl TurnObserver for ChanObserver {
         self.send(Msg::Tool(tool_line(tool, input)));
     }
     fn tool_finished(&self, _tool: &str, ok: bool, preview: &str) {
-        let first = clip(preview.lines().next().unwrap_or(""), 80);
+        let first = clip(&one_line(preview.lines().next().unwrap_or("")), 80);
         self.send(Msg::Tool(format!(
             "  {} {first}",
             if ok { "✓" } else { "✗" }
@@ -785,6 +788,43 @@ mod tests {
         assert_eq!(tool_line("todo", &serde_json::json!({})), "▸ todo");
         let long = serde_json::json!({"command": "a".repeat(200)});
         assert!(tool_line("run_command", &long).chars().count() < 80);
+    }
+
+    #[test]
+    fn tool_line_and_finished_carry_no_escape_bytes() {
+        let evil = "a\x1b[2J\rb\u{9b}c";
+        let line = tool_line("read_file", &serde_json::json!({ "path": evil }));
+        assert!(!line.chars().any(|c| c.is_control()), "{line:?}");
+        let (tx, rx) = mpsc::channel();
+        ChanObserver(Mutex::new(tx)).tool_finished("t", true, evil);
+        let Ok(Msg::Tool(done)) = rx.try_recv() else {
+            panic!("no tool msg")
+        };
+        assert!(!done.chars().any(|c| c.is_control()), "{done:?}");
+    }
+
+    #[test]
+    fn stream_note_approval_and_footer_are_sanitized() {
+        let mut app = App::default();
+        app.on_msg(Msg::Text("ok\x1b[2J\rx\nnext".into()));
+        app.on_msg(Msg::Done(TurnEnd::Stopped("bad\x1b]0;t\x07".into())));
+        let (reply, _rx) = mpsc::channel();
+        app.on_msg(Msg::Approval(Pending {
+            text: "w\x1b[2K".into(),
+            destructive: false,
+            reply,
+        }));
+        for o in app.take_out() {
+            assert!(!o.text.chars().any(|c| c.is_control()), "{:?}", o.text);
+        }
+        let f = Footer {
+            model: Some("m\x1b[2J".into()),
+            ..footer()
+        };
+        assert!(!f.render(200).chars().any(|c| c.is_control()));
+        let (p, rx) = approval_channel();
+        std::thread::spawn(move || p.ask("a\x1b\nb".into(), false));
+        assert_eq!(rx.recv().unwrap().text, "a\\u{1b} ⏎ b");
     }
 
     #[test]
