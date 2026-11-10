@@ -20,7 +20,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -969,24 +969,44 @@ fn lock_writer(path: &Path) -> Result<File, StorageError> {
         b.custom_flags(libc::O_CLOEXEC);
     }
     let mut f = b.open(Path::new(&name))?;
-    match f.try_lock() {
-        Ok(()) => {
-            // The pid is advisory text; a failed write never blocks the open.
-            let _ = f
-                .set_len(0)
-                .and_then(|()| write!(f, "{}", std::process::id()));
-            Ok(f)
+    let mut waited = std::time::Duration::ZERO;
+    loop {
+        match f.try_lock() {
+            Ok(()) => {
+                // The pid is advisory text; a failed write never blocks the open.
+                let _ = f
+                    .set_len(0)
+                    .and_then(|()| write!(f, "{}", std::process::id()));
+                return Ok(f);
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                let mut text = String::new();
+                let _ = f.seek(SeekFrom::Start(0));
+                let _ = f.read_to_string(&mut text);
+                let holder: Option<u32> = text.trim().parse().ok();
+                // #552: an flock belongs to the open file description, so a
+                // child forked by ANOTHER thread of this process briefly
+                // holds a duplicate of a descriptor we just closed (until it
+                // execs). A hold that names OUR pid is either that transient
+                // or a genuine second open in this process (#475): retry for
+                // a bounded moment, which costs the genuine case almost
+                // nothing. Any other holder fails at once, as before.
+                if holder == Some(std::process::id()) && waited < SELF_HOLD_RETRY {
+                    std::thread::sleep(SELF_HOLD_STEP);
+                    waited += SELF_HOLD_STEP;
+                    continue;
+                }
+                return Err(StorageError::Locked { holder });
+            }
+            Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
         }
-        Err(std::fs::TryLockError::WouldBlock) => {
-            let mut text = String::new();
-            let _ = f.read_to_string(&mut text);
-            Err(StorageError::Locked {
-                holder: text.trim().parse().ok(),
-            })
-        }
-        Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
     }
 }
+
+/// How long [`lock_writer`] keeps retrying a lock that names our own pid
+/// (see #552), in steps of [`SELF_HOLD_STEP`].
+const SELF_HOLD_RETRY: std::time::Duration = std::time::Duration::from_millis(150);
+const SELF_HOLD_STEP: std::time::Duration = std::time::Duration::from_millis(5);
 
 /// File length in bytes (used to detect a discarded torn tail on open).
 fn file_len(path: &Path) -> std::io::Result<u64> {
