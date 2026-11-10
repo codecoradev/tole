@@ -11,7 +11,7 @@ use tole_core::openai::OpenAiConfig;
 use tole_core::storage::{is_valid_session_id, JsonlStorage, Storage};
 use tole_core::tool::{Risk, ToolRegistry};
 use tole_core::turn::{TurnObserver, TurnOutcome};
-use tole_tui::{Footer, Prompter, SessionItem, TuiHost, TurnEnd};
+use tole_tui::{Footer, HostCmd, HostReply, Prompter, SessionItem, TuiHost, TurnEnd};
 
 use crate::approver::PromptFn;
 use crate::compaction_host::{CompactionSettings, ModelsCatalog, WindowSource};
@@ -212,11 +212,35 @@ impl TuiHost for TuiSession {
         }
     }
 
-    fn models(&self) -> Result<Vec<String>, String> {
+    /// The TUI's single host call for slash commands and hotkeys (#526): each
+    /// command is dispatched to the session operation below, and the reply is
+    /// data only (the wording is the UI's).
+    fn apply(&self, cmd: HostCmd) -> Result<HostReply, String> {
+        match cmd {
+            HostCmd::PickModel => self.models().map(HostReply::Models),
+            HostCmd::SetModel(id) => self.set_model(&id).map(|()| HostReply::Done),
+            HostCmd::SetEffort(level) => {
+                self.set_effort(level.as_deref()).map(|()| HostReply::Done)
+            }
+            // `/compact` instructions are not supported yet (the UI says so).
+            HostCmd::Compact(_) => self.request_compaction().map(|()| HostReply::Done),
+            HostCmd::New => self.new_session().map(HostReply::Session),
+            HostCmd::PickSession => self.sessions().map(HostReply::Sessions),
+            HostCmd::Switch(id) => self.switch_session(&id).map(HostReply::Session),
+            HostCmd::Status => Ok(HostReply::Lines(self.status_lines())),
+            HostCmd::Name(n) => self.set_name(&n).map(|()| HostReply::Done),
+        }
+    }
+}
+
+/// The session operations behind [`TuiHost::apply`]: plain methods, so the
+/// session can be driven (and tested) without going through a command.
+impl TuiSession {
+    pub fn models(&self) -> Result<Vec<String>, String> {
         tole_core::openai::fetch_model_ids(&self.cfg.base_url, &self.cfg.api_key)
     }
 
-    fn set_model(&self, id: &str) -> Result<(), String> {
+    pub fn set_model(&self, id: &str) -> Result<(), String> {
         let mut g = self.lock();
         crate::session_settings::set_model(&mut g.storage, id)?;
         // the context window belongs to the model: look it up again
@@ -224,17 +248,17 @@ impl TuiHost for TuiSession {
         Ok(())
     }
 
-    fn set_effort(&self, level: Option<&str>) -> Result<(), String> {
+    pub fn set_effort(&self, level: Option<&str>) -> Result<(), String> {
         crate::session_settings::set_effort(&mut self.lock().storage, level)
     }
 
     /// The forced pass of #481: the next prompt compacts first (when
     /// compaction is enabled). Not a mid-turn compaction.
-    fn request_compaction(&self) -> Result<(), String> {
+    pub fn request_compaction(&self) -> Result<(), String> {
         crate::session_settings::request_compaction(&mut self.lock().storage)
     }
 
-    fn new_session(&self) -> Result<String, String> {
+    pub fn new_session(&self) -> Result<String, String> {
         std::fs::create_dir_all(&self.sessions_dir).map_err(|e| e.to_string())?;
         let id = crate::session_host::new_session_id("s");
         let s = crate::session_host::create_session(
@@ -248,12 +272,12 @@ impl TuiHost for TuiSession {
         Ok(self.swap(s))
     }
 
-    fn sessions(&self) -> Result<Vec<SessionItem>, String> {
+    pub fn sessions(&self) -> Result<Vec<SessionItem>, String> {
         let index = self.index.as_deref().ok_or("no session index")?;
         Ok(sessions_from(index, &self.session_id()))
     }
 
-    fn switch_session(&self, id: &str) -> Result<String, String> {
+    pub fn switch_session(&self, id: &str) -> Result<String, String> {
         if !is_valid_session_id(id) {
             return Err(format!("invalid session id {id:?}"));
         }
@@ -273,7 +297,7 @@ impl TuiHost for TuiSession {
         Ok(self.swap(s))
     }
 
-    fn status_lines(&self) -> Vec<String> {
+    pub fn status_lines(&self) -> Vec<String> {
         let mut g = self.lock();
         let Inner { storage, window } = &mut *g;
         let model = crate::turn_runner::session_model(&*storage, &self.cfg.model);
@@ -288,7 +312,7 @@ impl TuiHost for TuiSession {
         out
     }
 
-    fn set_name(&self, name: &str) -> Result<(), String> {
+    pub fn set_name(&self, name: &str) -> Result<(), String> {
         crate::session_settings::set_name(&mut self.lock().storage, name)
     }
 }
@@ -451,6 +475,71 @@ mod tests {
             s.footer().session,
             "s-1",
             "a failed switch keeps the session"
+        );
+    }
+
+    /// The single host call the UI makes (#526): every command reaches the
+    /// session operation it names, with a data-only reply.
+    #[test]
+    fn apply_dispatches_each_command_to_its_session_operation() {
+        let dir = tmp("apply");
+        let s = session(&dir, "s-1");
+
+        assert_eq!(s.apply(HostCmd::SetModel("m2".into())), Ok(HostReply::Done));
+        assert_eq!(
+            s.apply(HostCmd::SetEffort(Some("low".into()))),
+            Ok(HostReply::Done)
+        );
+        assert_eq!(
+            s.apply(HostCmd::Name("nightly".into())),
+            Ok(HostReply::Done)
+        );
+        assert_eq!(s.apply(HostCmd::Compact(None)), Ok(HostReply::Done));
+        // what each one wrote, read back through the session's own readers
+        let footer = s.footer();
+        assert_eq!(footer.model.as_deref(), Some("m2"));
+        assert_eq!(footer.effort.as_deref(), Some("low"));
+        {
+            let g = s.lock();
+            assert_eq!(g.storage.session_name(), Some("nightly"));
+            assert!(tole_core::compaction::overflow_pending(&g.storage));
+        }
+        // `/compact <instructions>` is accepted and the instructions ignored.
+        assert_eq!(
+            s.apply(HostCmd::Compact(Some("keep tests".into()))),
+            Ok(HostReply::Done)
+        );
+
+        // clearing the effort goes back to the process default
+        assert_eq!(s.apply(HostCmd::SetEffort(None)), Ok(HostReply::Done));
+
+        // bad input is refused with the operation's own error, nothing replied
+        assert!(s.apply(HostCmd::SetModel("bad\x1b[2Jid".into())).is_err());
+        assert!(s.apply(HostCmd::SetEffort(Some("loud".into()))).is_err());
+        assert!(s.apply(HostCmd::Name("a\x1bb".into())).is_err());
+
+        // sessions: New and Switch answer with the session now in use
+        let Ok(HostReply::Session(two)) = s.apply(HostCmd::New) else {
+            panic!("New answers with the new session id");
+        };
+        assert_ne!(two, "s-1");
+        assert_eq!(s.session_id(), two);
+        assert_eq!(
+            s.apply(HostCmd::Switch("s-1".into())),
+            Ok(HostReply::Session("s-1".into()))
+        );
+        assert!(s.apply(HostCmd::Switch("s-missing".into())).is_err());
+        assert_eq!(s.session_id(), "s-1", "a failed switch keeps the session");
+
+        // status is lines; the picker needs the index, which this session was
+        // built without
+        let Ok(HostReply::Lines(lines)) = s.apply(HostCmd::Status) else {
+            panic!("Status answers with lines");
+        };
+        assert!(lines.iter().any(|l| l == "session: s-1"), "{lines:?}");
+        assert_eq!(
+            s.apply(HostCmd::PickSession),
+            Err("no session index".to_string())
         );
     }
 
