@@ -21,6 +21,7 @@ mod mcp_http;
 mod mission;
 #[cfg(feature = "shell-tools")]
 mod serve;
+mod setup;
 mod upgrade;
 use tole_core::storage::{JsonlStorage, Storage};
 use tole_core::tool::ToolRegistry;
@@ -292,6 +293,22 @@ enum Command {
     /// Check for updates and self-upgrade via cargo (issue #220).
     Upgrade {
         /// Only report whether an update is available; do not install.
+        #[arg(long)]
+        check: bool,
+
+        /// Skip the confirmation prompt (CI/automation).
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Install or upgrade the cora binary the review flow needs (#535).
+    /// Runs `cargo install cora-code --locked` after a confirmation; never
+    /// silent. `tole doctor` reports whether it is needed.
+    Setup {
+        /// What to set up.
+        #[arg(value_enum)]
+        tool: setup::Tool,
+
+        /// Only report whether an install or upgrade is needed.
         #[arg(long)]
         check: bool,
 
@@ -581,7 +598,7 @@ fn main() {
 /// How the startup config gate treats a command (#208).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GatePolicy {
-    /// `config`, `upgrade`, `approvals`: no config is loaded.
+    /// `config`, `upgrade`, `setup`, `approvals`: no config is loaded.
     Skip,
     /// Interactive CLI commands: an untrusted config may be reviewed and
     /// approved at the terminal (still needs stdin AND stderr to be ttys).
@@ -593,9 +610,10 @@ enum GatePolicy {
 
 fn gate_policy(cmd: &Command) -> GatePolicy {
     match cmd {
-        Command::Config { .. } | Command::Upgrade { .. } | Command::Approvals { .. } => {
-            GatePolicy::Skip
-        }
+        Command::Config { .. }
+        | Command::Upgrade { .. }
+        | Command::Setup { .. }
+        | Command::Approvals { .. } => GatePolicy::Skip,
         // `--prompt-file -` consumes stdin as the prompt: a question on
         // the same stream would eat prompt text.
         Command::Run { prompt_file, .. } if prompt_file.as_deref() == Some("-") => {
@@ -938,6 +956,13 @@ fn dispatch(cli: Cli) -> Result<()> {
         }
         Command::Upgrade { check, yes } => {
             let code = upgrade::run(check, yes)?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
+        Command::Setup { tool, check, yes } => {
+            let code = setup::run(tool, check, yes)?;
             if code != 0 {
                 std::process::exit(code);
             }

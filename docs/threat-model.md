@@ -405,6 +405,30 @@ they trust. What the transport adds:
   stack. TLS is rustls with the `ring` provider already used by `ureq`
   (installed once, process-wide, unless the embedder installed another).
 
+### `tole setup cora` (#535)
+
+`tole setup cora` runs the fixed command `cargo install cora-code --locked`
+(the one constant `tole doctor` also prints; never assembled from user input)
+so the review flow can be set up without hunting for the install line. Trust
+is that of `tole upgrade`: crates.io is the source, cargo verifies the registry
+checksum, tole downloads and executes nothing itself, and `cargo install`
+compiles the crate and its dependencies (their build scripts run on the
+operator's machine, as for any `cargo install`).
+
+- **Never unprompted.** It needs a `y` at a terminal or an explicit `--yes`;
+  without a terminal and without `--yes` it refuses (exit 2). It is a CLI
+  subcommand only: no tool exposes it, so a model cannot trigger an install,
+  and it is skipped by the config gate like `upgrade`.
+- **Idempotent and bounded.** A supported cora is left alone; `--check` only
+  reports. The result is verified at `$CARGO_HOME/bin/cora` (not on PATH
+  yet, or an older copy may come first), and a result that is still too old
+  or does not answer `--version` is an error, not a success.
+- **Residual.** Whatever `cora` resolves first on PATH is what tole runs,
+  including the auto-attached `cora mcp`; setup warns when PATH still resolves
+  a missing or too-old copy but does not rewrite PATH. A prebuilt-archive
+  download path is not implemented: `cora-code`'s release layout was not
+  verified, and cargo already gives checksum-verified installs.
+
 ### Web tools (#215)
 
 `web_fetch`/`web_search` are ReadOnly: results enter context as model
@@ -457,7 +481,7 @@ applies the security-sensitive ones (`trust`, `allow`, `mcp_server`,
 - **Explicit path = intent.** A file named on the command line (`--config`) is
   user intent and does not consult the store. `--no-config` skips discovery,
   the gate and any output.
-- **Startup gating.** Every command except `config`, `upgrade` and `approvals`
+- **Startup gating.** Every command except `config`, `upgrade`, `setup` and `approvals`
   runs the gate before anything else (before the update banner, session
   creation or provider access). Only `run`/`chat`/`resume`/`mission` with a
   terminal on stdin AND stderr (and not `--prompt-file -`) may ask; `sessions`,
