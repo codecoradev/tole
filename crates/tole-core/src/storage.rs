@@ -974,8 +974,12 @@ fn lock_writer(path: &Path) -> Result<File, StorageError> {
         match f.try_lock() {
             Ok(()) => {
                 // The pid is advisory text; a failed write never blocks the open.
+                // Rewind first: an earlier attempt read the file, and
+                // `set_len` does not move the cursor, so without this the pid
+                // would land past the old end and the file be NUL-padded.
                 let _ = f
                     .set_len(0)
+                    .and_then(|()| f.seek(SeekFrom::Start(0)).map(|_| ()))
                     .and_then(|()| write!(f, "{}", std::process::id()));
                 return Ok(f);
             }

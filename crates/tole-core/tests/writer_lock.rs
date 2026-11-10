@@ -247,3 +247,33 @@ fn real_second_opens_are_still_refused_within_the_bound() {
     );
     drop(own);
 }
+
+/// The retry reads the lock file between attempts, which moves its cursor.
+/// The pid written once the lock IS taken must still land at offset 0, or
+/// the file is NUL-padded and the next refusal cannot name its holder.
+#[test]
+fn the_pid_is_written_cleanly_after_a_retried_acquisition() {
+    let dir = tmpdir("retry-pid");
+    let held = JsonlStorage::create(&dir, "r", None).unwrap();
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        drop(held);
+    });
+    // Blocks (retrying: the holder is our own pid) until the other thread
+    // drops its writer, then takes the lock.
+    let reopened = JsonlStorage::open(dir.join("r.jsonl")).expect("retry rides out the release");
+    releaser.join().unwrap();
+    let text = std::fs::read(dir.join("r.jsonl.lock")).unwrap();
+    assert_eq!(
+        text,
+        std::process::id().to_string().into_bytes(),
+        "the lock file holds exactly our pid, no padding"
+    );
+    // And a real refusal now still names us.
+    let err = open_err(&dir.join("r.jsonl"));
+    assert!(
+        matches!(err, StorageError::Locked { holder: Some(p) } if p == std::process::id()),
+        "{err:?}"
+    );
+    drop(reopened);
+}
