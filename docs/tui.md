@@ -174,6 +174,7 @@ Wide characters wrap by character count, not cell width.
   press (it disarms a pending `Ctrl+C`) but triggers nothing. The key table above
   is the behavior contract for both entry points, so a second front end (a GPUI
   desktop, a remote client) feeds the same state machine with `Input`s.
+- **Render split (#526):** drawing (`App::draw` and the markdown/diff styling helpers) lives in the private `render` module, which only reads `App`. State and input handling stay in `lib.rs`, so another front end can reuse the state machine without the ratatui drawing.
 - Terminal state (raw mode, keyboard enhancement) is restored by a drop
   guard, so it is also restored on panic. SIGINT is just a `Ctrl+C` key event
   in raw mode.
