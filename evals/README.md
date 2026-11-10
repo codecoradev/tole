@@ -42,6 +42,28 @@ Run locally: `python3 evals/tier2/run.py --all` (requires provider env
 and the freshly built release binary — see CONTRIBUTING binary
 hygiene).
 
+### Shell-feature usage report (`evals/shell_usage.py`, issue #531)
+
+`run_command` runs argv with no shell, so `a | b`, `cd sub && cmd` and
+`cmd > file` are literal characters. This read-only script scans session
+JSONL (any directory or file, recursively) and counts how often
+`run_command` / `job_start` inputs use those features (pipe, chain,
+redirect, substitution, leading `cd`, `bash -c` wrapper; quoted operators
+are not counted), how many of those calls failed, and how many directly
+follow a failed one.
+
+```
+python3 evals/shell_usage.py ~/.local/share/tole/sessions evals/traces [--examples N] [--json]
+python3 evals/test_shell_usage.py
+```
+
+First run (2026-11-10) over everything in this repository: 8 session
+files, 9 `run_command` calls, 5 shell-shaped (4 `bash -c` wrappers, 1
+redirect), 0 failures. That sample comes from scripted Tier 2 missions that
+were written to use `bash -c`, so it says nothing about real use. Run it on
+real daily-use sessions before deciding anything about `workdir` or
+pipeline support; until then `run_command` is unchanged.
+
 ### Tier 2.5 — offline trace replay (`evals/replay/`, issue #107)
 
 The Dream-RSI replay-evaluation pattern (arXiv:2609.14858) applied to
