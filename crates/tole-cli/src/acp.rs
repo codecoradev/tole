@@ -828,7 +828,7 @@ pub fn run_acp(
                 // Plan publishing (issue #196 phase 4): ACP clients
                 // render the standard `plan` session/update (Termul's
                 // PlanPanel, full-replace semantics).
-                let plan_emitter: tole_cli::session_host::PlanEmitter = {
+                let plan_emitter: tole_cli::tool_roster::PlanEmitter = {
                     let conn = conn.clone();
                     let sid = session_id.clone();
                     Arc::new(move |entries| {
