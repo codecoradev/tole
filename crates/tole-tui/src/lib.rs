@@ -9,8 +9,10 @@
 
 mod editor;
 mod files;
+mod input;
 mod menu;
 mod sanitize;
+mod term_input;
 mod transcript;
 
 use std::io::{self, Stdout};
@@ -19,8 +21,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    self, Event, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use crossterm::{execute, queue};
@@ -36,6 +38,7 @@ use tole_core::cancel::CancelToken;
 use tole_core::turn::TurnObserver;
 
 pub use editor::Editor;
+pub use input::{Input, Key, Mods};
 pub use menu::{Item, PickKind};
 pub(crate) use sanitize::{one_line, sanitize};
 pub use transcript::{Kind, Out, Transcript};
@@ -481,17 +484,17 @@ impl App {
         Action::Host(HostCmd::SetModel(self.recent[0].clone()))
     }
 
-    fn picker_key(&mut self, code: KeyCode) -> Action {
+    fn picker_key(&mut self, key: Key) -> Action {
         let Some(p) = self.picker.as_mut() else {
             return Action::None;
         };
-        match code {
-            KeyCode::Esc => self.picker = None,
-            KeyCode::Up => p.up(),
-            KeyCode::Down => p.down(),
-            KeyCode::Backspace => p.backspace(),
-            KeyCode::Char(c) => p.type_char(c),
-            KeyCode::Enter => {
+        match key {
+            Key::Esc => self.picker = None,
+            Key::Up => p.up(),
+            Key::Down => p.down(),
+            Key::Backspace => p.backspace(),
+            Key::Char(c) => p.type_char(c),
+            Key::Enter => {
                 let kind = p.kind;
                 let chosen = p.chosen();
                 self.picker = None;
@@ -562,12 +565,11 @@ impl App {
         std::mem::take(&mut self.out)
     }
 
-    pub fn on_key(&mut self, key: KeyEvent) -> Action {
-        if key.kind == KeyEventKind::Release {
-            return Action::None;
-        }
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        if ctrl && key.code == KeyCode::Char('c') {
+    /// One key press (UI-neutral, #526). The terminal adapter in
+    /// `term_input` maps crossterm events onto this.
+    pub fn on_input(&mut self, key: Input) -> Action {
+        let ctrl = key.mods.ctrl;
+        if ctrl && key.key == Key::Char('c') {
             if self.running {
                 return self.cancel();
             }
@@ -579,16 +581,16 @@ impl App {
         }
         self.armed = false;
         if let Some(p) = self.approval.take() {
-            return self.answer(p, key.code);
+            return self.answer(p, key.key);
         }
         if self.picker.is_some() {
-            return self.picker_key(key.code);
+            return self.picker_key(key.key);
         }
         // Hotkeys wait for idle (they take the session lock). Shift+Tab is
         // `BackTab`, a different key code from Enter, so Shift+Enter keeps
         // its newline meaning below.
-        match key.code {
-            KeyCode::Char('o') if ctrl => {
+        match key.key {
+            Key::Char('o') if ctrl => {
                 let mut v = self.transcript.toggle_tools();
                 let state = if self.transcript.expand_tools {
                     "expanded"
@@ -602,7 +604,7 @@ impl App {
                 self.out.extend(v);
                 return Action::Redraw;
             }
-            KeyCode::Char('t') if ctrl => {
+            Key::Char('t') if ctrl => {
                 let mut v = self.transcript.toggle_reasoning();
                 let state = if self.transcript.hide_reasoning {
                     "hidden"
@@ -616,21 +618,21 @@ impl App {
                 self.out.extend(v);
                 return Action::Redraw;
             }
-            KeyCode::Char('l') if ctrl => {
+            Key::Char('l') if ctrl => {
                 return if self.running {
                     Action::None
                 } else {
                     Action::Host(HostCmd::PickModel)
                 }
             }
-            KeyCode::Char('p') if ctrl => {
+            Key::Char('p') if ctrl => {
                 return if self.running {
                     Action::None
                 } else {
                     self.cycle_model()
                 }
             }
-            KeyCode::BackTab => {
+            Key::BackTab => {
                 return if self.running {
                     Action::None
                 } else {
@@ -641,20 +643,20 @@ impl App {
         }
         if !self.at_matches().is_empty() {
             let n = self.at_matches().len();
-            match key.code {
-                KeyCode::Tab | KeyCode::Enter if self.at_insert() => return Action::Redraw,
-                KeyCode::Up if !key.modifiers.contains(KeyModifiers::ALT) => {
+            match key.key {
+                Key::Tab | Key::Enter if self.at_insert() => return Action::Redraw,
+                Key::Up if !key.mods.alt => {
                     self.at_sel = self.at_sel.min(n - 1).saturating_sub(1);
                     return Action::Redraw;
                 }
-                KeyCode::Down => {
+                Key::Down => {
                     self.at_sel = (self.at_sel + 1).min(n - 1);
                     return Action::Redraw;
                 }
                 _ => {}
             }
         }
-        if key.code == KeyCode::Up && key.modifiers.contains(KeyModifiers::ALT) {
+        if key.key == Key::Up && key.mods.alt {
             return match self.queue.pop() {
                 Some(last) => {
                     self.prepend_draft(vec![last]);
@@ -664,19 +666,19 @@ impl App {
             };
         }
         let menu = self.menu();
-        match key.code {
-            KeyCode::Tab if !menu.is_empty() => {
+        match key.key {
+            Key::Tab if !menu.is_empty() => {
                 let pick = menu[self.menu_sel.min(menu.len() - 1)];
                 self.editor.set(&format!("{pick} "));
                 self.menu_sel = 0;
             }
-            KeyCode::Up if !menu.is_empty() => self.menu_sel = self.menu_sel.saturating_sub(1),
-            KeyCode::Down if !menu.is_empty() => {
+            Key::Up if !menu.is_empty() => self.menu_sel = self.menu_sel.saturating_sub(1),
+            Key::Down if !menu.is_empty() => {
                 self.menu_sel = (self.menu_sel + 1).min(menu.len() - 1)
             }
-            KeyCode::Esc if self.running => return self.cancel(),
+            Key::Esc if self.running => return self.cancel(),
             // Alt+Enter while a turn runs queues a follow-up; idle it is a newline.
-            KeyCode::Enter if self.running && key.modifiers.contains(KeyModifiers::ALT) => {
+            Key::Enter if self.running && key.mods.alt => {
                 let t = self.editor.text().trim();
                 if t.is_empty() || t.starts_with('/') {
                     return Action::None;
@@ -689,14 +691,8 @@ impl App {
                     self.queue.push(text);
                 }
             }
-            KeyCode::Enter
-                if key
-                    .modifiers
-                    .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
-            {
-                self.editor.newline()
-            }
-            KeyCode::Enter => {
+            Key::Enter if key.mods.shift || key.mods.alt => self.editor.newline(),
+            Key::Enter => {
                 if self.running {
                     // Steer: a non-empty, non-slash draft becomes a soft interrupt.
                     let t = self.editor.text().trim();
@@ -722,8 +718,8 @@ impl App {
                 };
             }
             // Fallback for terminals that cannot report Shift+Enter.
-            KeyCode::Char('j') if ctrl => self.editor.newline(),
-            KeyCode::Char(c) if !ctrl => {
+            Key::Char('j') if ctrl => self.editor.newline(),
+            Key::Char(c) if !ctrl => {
                 self.menu_sel = 0;
                 self.at_sel = 0;
                 if c == '@' && self.files.is_none() {
@@ -733,24 +729,24 @@ impl App {
                 }
                 self.editor.insert(c)
             }
-            KeyCode::Backspace => {
+            Key::Backspace => {
                 self.menu_sel = 0;
                 self.at_sel = 0;
                 self.editor.backspace()
             }
-            KeyCode::Up => self.editor.prev(),
-            KeyCode::Down => self.editor.next(),
+            Key::Up => self.editor.prev(),
+            Key::Down => self.editor.next(),
             _ => return Action::None,
         }
         Action::Redraw
     }
 
     /// y/n answer; Esc denies AND cancels the turn; anything else re-asks.
-    fn answer(&mut self, p: Pending, code: KeyCode) -> Action {
-        let (verdict, note) = match code {
-            KeyCode::Char('y' | 'Y') => (Verdict::Allow, "allowed"),
-            KeyCode::Char('n' | 'N') => (Verdict::Deny, "denied"),
-            KeyCode::Esc => {
+    fn answer(&mut self, p: Pending, key: Key) -> Action {
+        let (verdict, note) = match key {
+            Key::Char('y' | 'Y') => (Verdict::Allow, "allowed"),
+            Key::Char('n' | 'N') => (Verdict::Deny, "denied"),
+            Key::Esc => {
                 let _ = p.reply.send(Verdict::Deny);
                 let lines = self.transcript.line(Kind::Note, "  denied");
                 self.out.extend(lines);
@@ -1274,6 +1270,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::backend::TestBackend;
     use std::time::Instant;
 
@@ -1317,6 +1314,69 @@ mod tests {
         assert_eq!(cut.chars().count(), 20);
         assert!(cut.ends_with('…'));
         assert!(Footer::default().render(80).contains("effort: -"));
+    }
+
+    // ---- the UI-neutral input seam (#526): no crossterm types below ----
+
+    fn typed_input(app: &mut App, s: &str) {
+        for c in s.chars() {
+            app.on_input(Input::new(Key::Char(c)));
+        }
+    }
+
+    #[test]
+    fn a_draft_is_typed_and_submitted_through_inputs_alone() {
+        let mut app = App::default();
+        typed_input(&mut app, "hello");
+        assert_eq!(
+            app.on_input(Input::new(Key::Enter)),
+            Action::Submit("hello".into())
+        );
+        assert!(app.running());
+    }
+
+    #[test]
+    fn modifiers_change_enter_exactly_as_the_key_table_says() {
+        // Shift+Enter and Alt+Enter (idle) are newlines; plain Enter submits.
+        let mut app = App::default();
+        typed_input(&mut app, "a");
+        app.on_input(Input::shift(Key::Enter));
+        typed_input(&mut app, "b");
+        app.on_input(Input::alt(Key::Enter));
+        typed_input(&mut app, "c");
+        assert_eq!(
+            app.on_input(Input::new(Key::Enter)),
+            Action::Submit("a\nb\nc".into())
+        );
+        // Ctrl+J is the newline fallback for terminals without Shift+Enter.
+        let mut app = App::default();
+        typed_input(&mut app, "x");
+        app.on_input(Input::ctrl(Key::Char('j')));
+        typed_input(&mut app, "y");
+        assert_eq!(
+            app.on_input(Input::new(Key::Enter)),
+            Action::Submit("x\ny".into())
+        );
+    }
+
+    #[test]
+    fn a_key_the_logic_ignores_still_disarms_ctrl_c() {
+        // Ctrl+C once arms; any other key press disarms; Ctrl+C again only
+        // arms again. This is why unmapped keys are `Key::Other`, not dropped.
+        let mut app = App::default();
+        assert_eq!(app.on_input(Input::ctrl(Key::Char('c'))), Action::Redraw);
+        assert_eq!(app.on_input(Input::new(Key::Other)), Action::None);
+        assert_eq!(app.on_input(Input::ctrl(Key::Char('c'))), Action::Redraw);
+        assert_eq!(app.on_input(Input::ctrl(Key::Char('c'))), Action::Quit);
+    }
+
+    #[test]
+    fn shift_tab_is_its_own_key_not_shift_plus_tab() {
+        let mut app = App::new(Footer::default());
+        match app.on_input(Input::new(Key::BackTab)) {
+            Action::Host(HostCmd::SetEffort(_)) => {}
+            other => panic!("BackTab cycles the effort, got {other:?}"),
+        }
     }
 
     #[test]
