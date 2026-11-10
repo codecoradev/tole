@@ -149,6 +149,14 @@ Wide characters wrap by character count, not cell width.
   provider- and network-adjacent host types.
 - Approvals: `tole_tui::approval_channel()` gives the host a `Prompter`; the
   CLI wraps it as a `PromptFn` inside the regular `InteractiveApprover`.
+- **Host seam (#526):** `TuiHost` has three methods: `footer`, `run_turn` and
+  `apply(HostCmd) -> Result<HostReply, String>`, which covers every slash command
+  and hotkey (`/model`, `/effort`, `/compact`, `/new`, `/resume`, `/session`,
+  `/name`, the pickers). The reply is data only (`Done`, `Session(id)`,
+  `Models`, `Sessions`, `Lines`); the wording shown to the user and the pickers
+  are the UI's, so a remote adapter writes three methods and no UI text. The default
+  `apply` supports `Status` (no lines) and refuses the rest with "not supported by
+  this host"; a reply of the wrong kind is reported, never a panic.
 - **Input seam (#526):** the app logic does not see terminal key types.
   `App::on_input(Input)` takes a UI-neutral `Input` (`Key` plus ctrl/alt/shift);
   the crossterm adapter (`term_input`: `input_from`, and `App::on_key` as the

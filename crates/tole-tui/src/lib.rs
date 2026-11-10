@@ -103,46 +103,25 @@ pub trait TuiHost: Sync {
         observer: Arc<dyn TurnObserver>,
     ) -> TurnEnd;
 
-    // Slash-command surface (#461). Called only while no turn runs, so a
-    // host may take its session lock without blocking the UI.
-    /// Model ids for the picker (`/models`).
-    fn models(&self) -> Result<Vec<String>, String> {
-        unsupported()
-    }
-    /// Pin the session model (`fact/model`); applies from the next call.
-    fn set_model(&self, _id: &str) -> Result<(), String> {
-        unsupported()
-    }
-    /// Set (`Some`) or clear (`None`) the session reasoning effort.
-    fn set_effort(&self, _level: Option<&str>) -> Result<(), String> {
-        unsupported()
-    }
-    /// Ask for a compaction pass before the next prompt.
-    fn request_compaction(&self) -> Result<(), String> {
-        unsupported()
-    }
-    /// Start a fresh session; returns its id.
-    fn new_session(&self) -> Result<String, String> {
-        unsupported()
-    }
-    fn sessions(&self) -> Result<Vec<SessionItem>, String> {
-        unsupported()
-    }
-    /// Swap the session turns run against; returns its id.
-    fn switch_session(&self, _id: &str) -> Result<String, String> {
-        unsupported()
-    }
-    fn status_lines(&self) -> Vec<String> {
-        Vec::new()
-    }
-    fn set_name(&self, _name: &str) -> Result<(), String> {
-        unsupported()
+    /// Apply a slash command or hotkey to the session (#461, #526): the one
+    /// call a host implements for everything beyond a turn and the footer, so
+    /// a remote adapter has three methods to write. Called only while no turn
+    /// runs, so a host may take its session lock without blocking the UI. The
+    /// reply carries data only; the wording shown to the user is the UI's.
+    ///
+    /// The default supports nothing but `Status` (no lines).
+    fn apply(&self, cmd: HostCmd) -> Result<HostReply, String> {
+        match cmd {
+            HostCmd::Status => Ok(HostReply::Lines(Vec::new())),
+            _ => unsupported(),
+        }
     }
 }
 
 /// What the loop asks of the host for a slash command or hotkey (#461). The
-/// host applies it to the session (registers, storage); the loop then
-/// refreshes the footer, so a switch shows on the next draw.
+/// host applies it to the session (registers, storage) through
+/// [`TuiHost::apply`]; the loop then refreshes the footer, so a switch shows
+/// on the next draw.
 #[derive(Debug, PartialEq, Eq)]
 pub enum HostCmd {
     PickModel,
@@ -156,6 +135,21 @@ pub enum HostCmd {
     Switch(String),
     Status,
     Name(String),
+}
+
+/// What the host answers to a [`HostCmd`] (#526): data, never wording.
+#[derive(Debug, PartialEq, Eq)]
+pub enum HostReply {
+    /// The change was applied (`SetModel`, `SetEffort`, `Compact`, `Name`).
+    Done,
+    /// The session turns now run against (`New`, `Switch`).
+    Session(String),
+    /// Model ids for the picker (`PickModel`).
+    Models(Vec<String>),
+    /// Sessions for the picker (`PickSession`).
+    Sessions(Vec<SessionItem>),
+    /// Lines to show (`Status`).
+    Lines(Vec<String>),
 }
 
 /// A past session for the `/resume` picker.
@@ -1100,67 +1094,73 @@ use ratatui::widgets::Widget as _;
 /// emits these while idle). Every outcome is a transcript note, and a
 /// successful change marks the footer stale so the next loop turn re-reads it.
 fn run_host_cmd(host: &dyn TuiHost, app: &mut App, cmd: HostCmd) {
-    let done = |app: &mut App, r: Result<String, String>| match r {
-        Ok(m) => {
-            app.footer_stale = true;
-            app.note(&format!("({m})"));
-        }
-        Err(e) => app.note(&format!("(failed: {e})")),
-    };
-    match cmd {
-        HostCmd::PickModel => match host.models() {
-            Ok(ids) if ids.is_empty() => {
-                app.note("(the provider lists no models; use /model <id>)")
-            }
-            Ok(ids) => app.open_picker(
-                PickKind::Model,
-                ids.into_iter().map(|i| Item::new(i.clone(), i)).collect(),
-            ),
-            Err(e) => app.note(&format!("(models: {e}; use /model <id>)")),
-        },
-        HostCmd::SetModel(id) => done(app, host.set_model(&id).map(|()| format!("model → {id}"))),
-        HostCmd::SetEffort(l) => {
-            let shown = l.clone().unwrap_or_else(|| "unset".into());
-            done(
-                app,
-                host.set_effort(l.as_deref())
-                    .map(|()| format!("thinking → {shown}")),
-            )
-        }
+    // What to say, decided before the command is handed over (the host
+    // gets it by value and answers with data only).
+    #[derive(Clone, Copy)]
+    enum Cmd {
+        PickModel,
+        PickSession,
+        New,
+        Switch,
+        Status,
+        Change,
+    }
+    let (kind, ok_note) = match &cmd {
+        HostCmd::PickModel => (Cmd::PickModel, String::new()),
+        HostCmd::PickSession => (Cmd::PickSession, String::new()),
+        HostCmd::New => (Cmd::New, String::new()),
+        HostCmd::Switch(_) => (Cmd::Switch, String::new()),
+        HostCmd::Status => (Cmd::Status, String::new()),
+        HostCmd::SetModel(id) => (Cmd::Change, format!("model → {id}")),
+        HostCmd::SetEffort(l) => (
+            Cmd::Change,
+            format!("thinking → {}", l.as_deref().unwrap_or("unset")),
+        ),
         HostCmd::Compact(instructions) => {
             let extra = if instructions.is_some() {
                 "; instructions are not supported yet and were ignored"
             } else {
                 ""
             };
-            done(
-                app,
-                host.request_compaction()
-                    .map(|()| format!("compaction runs before your next prompt{extra}")),
+            (
+                Cmd::Change,
+                format!("compaction runs before your next prompt{extra}"),
             )
         }
-        HostCmd::New => done(
-            app,
-            host.new_session().map(|id| format!("new session {id}")),
+        HostCmd::Name(n) => (Cmd::Change, format!("named {n}")),
+    };
+    let done = |app: &mut App, msg: String| {
+        app.footer_stale = true;
+        app.note(&format!("({msg})"));
+    };
+    match (kind, host.apply(cmd)) {
+        (Cmd::PickModel, Ok(HostReply::Models(ids))) if ids.is_empty() => {
+            app.note("(the provider lists no models; use /model <id>)")
+        }
+        (Cmd::PickModel, Ok(HostReply::Models(ids))) => app.open_picker(
+            PickKind::Model,
+            ids.into_iter().map(|i| Item::new(i.clone(), i)).collect(),
         ),
-        HostCmd::PickSession => match host.sessions() {
-            Ok(v) if v.is_empty() => app.note("(no other sessions)"),
-            Ok(v) => app.open_picker(
-                PickKind::Session,
-                v.into_iter().map(|s| Item::new(s.id, s.label)).collect(),
-            ),
-            Err(e) => app.note(&format!("(sessions: {e})")),
-        },
-        HostCmd::Switch(id) => done(
-            app,
-            host.switch_session(&id).map(|id| format!("resumed {id}")),
+        (Cmd::PickModel, Err(e)) => app.note(&format!("(models: {e}; use /model <id>)")),
+        (Cmd::PickSession, Ok(HostReply::Sessions(v))) if v.is_empty() => {
+            app.note("(no other sessions)")
+        }
+        (Cmd::PickSession, Ok(HostReply::Sessions(v))) => app.open_picker(
+            PickKind::Session,
+            v.into_iter().map(|s| Item::new(s.id, s.label)).collect(),
         ),
-        HostCmd::Status => {
-            for l in host.status_lines() {
+        (Cmd::PickSession, Err(e)) => app.note(&format!("(sessions: {e})")),
+        (Cmd::New, Ok(HostReply::Session(id))) => done(app, format!("new session {id}")),
+        (Cmd::Switch, Ok(HostReply::Session(id))) => done(app, format!("resumed {id}")),
+        (Cmd::Status, Ok(HostReply::Lines(lines))) => {
+            for l in lines {
                 app.note(&l);
             }
         }
-        HostCmd::Name(n) => done(app, host.set_name(&n).map(|()| format!("named {n}"))),
+        (Cmd::Change, Ok(HostReply::Done)) => done(app, ok_note),
+        (_, Err(e)) => app.note(&format!("(failed: {e})")),
+        // A host answered with the wrong kind of reply: say so, never panic.
+        (_, Ok(other)) => app.note(&format!("(failed: unexpected host reply {other:?})")),
     }
 }
 
@@ -1817,10 +1817,204 @@ mod tests {
         fn run_turn(&self, _: &str, _: &CancelToken, _: Arc<dyn TurnObserver>) -> TurnEnd {
             TurnEnd::Final(String::new())
         }
-        fn set_effort(&self, level: Option<&str>) -> Result<(), String> {
-            *self.0.lock().unwrap() = level.map(str::to_string);
-            Ok(())
+        fn apply(&self, cmd: HostCmd) -> Result<HostReply, String> {
+            match cmd {
+                HostCmd::SetEffort(level) => {
+                    *self.0.lock().unwrap() = level;
+                    Ok(HostReply::Done)
+                }
+                _ => unsupported(),
+            }
         }
+    }
+
+    // ---- the host interface a remote adapter implements (#526) ----
+
+    /// A host with only the three methods the trait asks for: it records
+    /// every command it is given and answers with scripted replies. Nothing in
+    /// it knows about sessions, storage or a terminal.
+    struct FakeHost {
+        seen: Mutex<Vec<String>>,
+        replies: Mutex<std::collections::VecDeque<Result<HostReply, String>>>,
+    }
+
+    impl FakeHost {
+        fn answering(replies: Vec<Result<HostReply, String>>) -> Self {
+            FakeHost {
+                seen: Mutex::new(Vec::new()),
+                replies: Mutex::new(replies.into()),
+            }
+        }
+        fn seen(&self) -> Vec<String> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    impl TuiHost for FakeHost {
+        fn footer(&self) -> Footer {
+            footer()
+        }
+        fn run_turn(&self, _: &str, _: &CancelToken, _: Arc<dyn TurnObserver>) -> TurnEnd {
+            TurnEnd::Final(String::new())
+        }
+        fn apply(&self, cmd: HostCmd) -> Result<HostReply, String> {
+            self.seen.lock().unwrap().push(format!("{cmd:?}"));
+            self.replies
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Err("no scripted reply".into()))
+        }
+    }
+
+    /// Run `cmd` against a host that answers `reply`; the UI's notes and
+    /// whether the footer was marked stale.
+    fn host_says(cmd: HostCmd, reply: Result<HostReply, String>) -> (Vec<String>, bool, App) {
+        let host = FakeHost::answering(vec![reply]);
+        let mut app = App {
+            footer_stale: false,
+            ..App::default()
+        };
+        run_host_cmd(&host, &mut app, cmd);
+        assert_eq!(host.seen().len(), 1, "exactly one host call per command");
+        let stale = app.footer_stale;
+        (texts(&mut app), stale, app)
+    }
+
+    #[test]
+    fn a_change_is_one_apply_call_and_the_wording_is_the_uis() {
+        let done = || Ok(HostReply::Done);
+        let cases: Vec<(HostCmd, &str)> = vec![
+            (HostCmd::SetModel("m1".into()), "(model → m1)"),
+            (HostCmd::SetEffort(Some("low".into())), "(thinking → low)"),
+            (HostCmd::SetEffort(None), "(thinking → unset)"),
+            (
+                HostCmd::Compact(None),
+                "(compaction runs before your next prompt)",
+            ),
+            (HostCmd::Name("nightly".into()), "(named nightly)"),
+        ];
+        for (cmd, want) in cases {
+            let (notes, stale, _) = host_says(cmd, done());
+            assert!(notes.iter().any(|n| n.contains(want)), "{want}: {notes:?}");
+            assert!(stale, "a change refreshes the footer: {want}");
+        }
+        let (notes, _, _) = host_says(HostCmd::Compact(Some("keep tests".into())), done());
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("instructions are not supported yet")),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn new_and_switch_report_the_session_the_host_names() {
+        let (notes, stale, _) = host_says(HostCmd::New, Ok(HostReply::Session("s-9".into())));
+        assert!(
+            notes.iter().any(|n| n.contains("new session s-9")),
+            "{notes:?}"
+        );
+        assert!(stale);
+        let (notes, _, _) = host_says(
+            HostCmd::Switch("s-1".into()),
+            Ok(HostReply::Session("s-1".into())),
+        );
+        assert!(notes.iter().any(|n| n.contains("resumed s-1")), "{notes:?}");
+    }
+
+    #[test]
+    fn pickers_open_from_the_hosts_data_and_empty_or_failed_ones_say_so() {
+        let ids = vec!["gpt-a".to_string(), "gpt-b".to_string()];
+        let (_, stale, app) = host_says(HostCmd::PickModel, Ok(HostReply::Models(ids)));
+        assert!(!stale, "a picker changes nothing");
+        let shown = app.picker_lines().join("\n");
+        assert!(
+            shown.contains("gpt-a") && shown.contains("gpt-b"),
+            "{shown}"
+        );
+        let (notes, _, app) = host_says(HostCmd::PickModel, Ok(HostReply::Models(vec![])));
+        assert!(app.picker_lines().is_empty());
+        assert!(
+            notes.iter().any(|n| n.contains("lists no models")),
+            "{notes:?}"
+        );
+        let (notes, _, _) = host_says(HostCmd::PickModel, Err("offline".into()));
+        assert!(notes
+            .iter()
+            .any(|n| n.contains("(models: offline; use /model <id>)")));
+
+        let rows = vec![SessionItem {
+            id: "s-2".into(),
+            label: "fix parser".into(),
+        }];
+        let (_, _, app) = host_says(HostCmd::PickSession, Ok(HostReply::Sessions(rows)));
+        let shown = app.picker_lines().join("\n");
+        assert!(shown.contains("fix parser"), "{shown}");
+        let (notes, _, _) = host_says(HostCmd::PickSession, Ok(HostReply::Sessions(vec![])));
+        assert!(
+            notes.iter().any(|n| n.contains("no other sessions")),
+            "{notes:?}"
+        );
+        let (notes, _, _) = host_says(HostCmd::PickSession, Err("no index".into()));
+        assert!(notes.iter().any(|n| n.contains("(sessions: no index)")));
+    }
+
+    #[test]
+    fn status_lines_are_shown_as_given() {
+        let lines = vec!["session: s-1".to_string(), "model: m".to_string()];
+        let (notes, stale, _) = host_says(HostCmd::Status, Ok(HostReply::Lines(lines)));
+        assert!(notes.contains(&"session: s-1".to_string()), "{notes:?}");
+        assert!(notes.contains(&"model: m".to_string()));
+        assert!(!stale);
+    }
+
+    #[test]
+    fn a_failing_host_is_reported_and_leaves_the_footer_alone() {
+        let (notes, stale, _) = host_says(HostCmd::SetModel("x".into()), Err("nope".into()));
+        assert!(
+            notes.iter().any(|n| n.contains("(failed: nope)")),
+            "{notes:?}"
+        );
+        assert!(!stale, "nothing changed, nothing to refresh");
+    }
+
+    #[test]
+    fn a_reply_of_the_wrong_kind_is_reported_not_a_panic() {
+        // A remote adapter that answers a model change with a model list.
+        let (notes, stale, _) = host_says(
+            HostCmd::SetModel("x".into()),
+            Ok(HostReply::Models(vec!["a".into()])),
+        );
+        assert!(
+            notes.iter().any(|n| n.contains("unexpected host reply")),
+            "{notes:?}"
+        );
+        assert!(!stale);
+    }
+
+    #[test]
+    fn a_host_that_implements_nothing_supports_status_and_refuses_the_rest() {
+        // `Host` (the echo host above) overrides only footer and run_turn.
+        let mut app = App::default();
+        run_host_cmd(&Host, &mut app, HostCmd::Status);
+        assert!(texts(&mut app).is_empty(), "no status lines, no error");
+        for cmd in [
+            HostCmd::PickModel,
+            HostCmd::SetModel("x".into()),
+            HostCmd::New,
+            HostCmd::PickSession,
+        ] {
+            run_host_cmd(&Host, &mut app, cmd);
+        }
+        let notes = texts(&mut app);
+        assert_eq!(notes.len(), 4, "{notes:?}");
+        assert!(
+            notes
+                .iter()
+                .all(|n| n.contains("not supported by this host")),
+            "{notes:?}"
+        );
     }
 
     #[test]
