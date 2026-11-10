@@ -52,7 +52,11 @@ tole is the agent harness of the CodeCora ecosystem — the hands:
   the optional [memory loop](#memory-loop) closes the circle.
 - **Supported versions:** cora ≥ 0.19.0 and uteke ≥ 0.21.1 (both optional).
   `tole doctor` reports each one as supported, too old (with the upgrade
-  command) or not installed.
+  command) or not installed. `tole setup cora` (#535) installs or upgrades
+  cora for you: it runs `cargo install cora-code --locked` after a `[y/N]`
+  at a terminal (or `--yes`; with neither it refuses and exits 2), does
+  nothing when cora is already supported, and `--check` only reports.
+  Cargo verifies the registry checksum; tole downloads nothing itself.
 - Anything else that speaks **MCP over stdio** joins the same registry via
   repeatable `--mcp-server name=command [args...]` flags. Servers that
   offer prompts show up in `tole chat` as `/mcp:<server>:<prompt> [k=v ...]`

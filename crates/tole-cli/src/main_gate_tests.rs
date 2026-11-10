@@ -14,6 +14,7 @@ fn policy(args: &[&str]) -> GatePolicy {
 fn skip_list_is_config_upgrade_approvals() {
     assert_eq!(policy(&["config", "check"]), GatePolicy::Skip);
     assert_eq!(policy(&["upgrade", "--check"]), GatePolicy::Skip);
+    assert_eq!(policy(&["setup", "cora", "--check"]), GatePolicy::Skip);
     assert_eq!(policy(&["approvals", "list"]), GatePolicy::Skip);
 }
 

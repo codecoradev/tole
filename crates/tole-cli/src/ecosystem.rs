@@ -19,6 +19,9 @@ pub struct Sibling {
     pub role: &'static str,
     /// Install / upgrade command.
     pub install: &'static str,
+    /// The `tole setup <tool>` shortcut that runs `install` (#535), when one
+    /// exists.
+    pub setup: Option<&'static str>,
 }
 
 /// cora 0.19.0 adds the agent-as-reviewer MCP tools; uteke 0.21.1 is the
@@ -29,12 +32,14 @@ pub const SIBLINGS: &[Sibling] = &[
         min: (0, 19, 0),
         role: "code intelligence and review (mcp_cora_*, cora_search)",
         install: "cargo install cora-code --locked",
+        setup: Some("tole setup cora"),
     },
     Sibling {
         bin: "uteke",
         min: (0, 21, 1),
         role: "memory (uteke_*, --memory uteke)",
         install: "cargo install uteke-cli --locked",
+        setup: None,
     },
 ];
 
@@ -94,24 +99,32 @@ fn fmt(v: (u64, u64, u64)) -> String {
     format!("{}.{}.{}", v.0, v.1, v.2)
 }
 
+/// ` (or: tole setup cora)` when the sibling has a setup shortcut.
+fn setup_hint(s: &Sibling) -> String {
+    s.setup
+        .map(|c| format!(" (or run `{c}`)"))
+        .unwrap_or_default()
+}
+
 /// One report line, in `tole doctor`'s `✓`/`✗` style. Never a blocker:
 /// both siblings are optional.
 pub fn line(s: &Sibling, status: &Status) -> String {
     let min = fmt(s.min);
+    let hint = setup_hint(s);
     match status {
         Status::Supported(v) => format!("  ✓ {} {} (supported ≥ {min})", s.bin, fmt(*v)),
         Status::TooOld(v) => format!(
-            "  ✗ {} {} is older than the supported {min} — upgrade: {}",
+            "  ✗ {} {} is older than the supported {min} — upgrade: {}{hint}",
             s.bin,
             fmt(*v),
             s.install
         ),
         Status::Missing => format!(
-            "  - {} not installed (optional: {}) — install: {}",
+            "  - {} not installed (optional: {}) — install: {}{hint}",
             s.bin, s.role, s.install
         ),
         Status::Unknown(why) => format!(
-            "  ? {} version unknown ({why}); supported ≥ {min} — upgrade: {}",
+            "  ? {} version unknown ({why}); supported ≥ {min} — upgrade: {}{hint}",
             s.bin, s.install
         ),
     }
@@ -165,5 +178,12 @@ mod tests {
             "{l}"
         );
         assert!(l.contains("cargo install cora-code --locked"), "{l}");
+        assert!(l.contains("tole setup cora"), "{l}");
+    }
+
+    #[test]
+    fn only_cora_has_a_setup_shortcut() {
+        assert!(line(&SIBLINGS[0], &Status::Missing).contains("tole setup cora"));
+        assert!(!line(&SIBLINGS[1], &Status::Missing).contains("tole setup"));
     }
 }
