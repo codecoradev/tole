@@ -96,7 +96,8 @@ lives) / **gap** (tracked) / **N/A** (with rationale).
 
 - Per-call Destructive classification heuristics (from RC-1) — needs a
   design discussion before code.
-- MCP (#74, SHIPPED): stdio client live; trust-model extensions applied
+- MCP (#74, SHIPPED): stdio client live (and a Streamable HTTP client,
+  #530, see "Remote MCP servers" below); trust-model extensions applied
   (metadata never trusted for risk, scrubbed env, fenced results). The
   former "remaining surface" items shipped: HTTP transport + server auth
   are `tole serve --transport mcp` (#96/#137, hardened in #136) — see the
@@ -349,6 +350,47 @@ authenticated REST face. Scoped device tokens (per-device, revocable,
 read-only vs approver roles) are the recognized follow-up; until then
 the deployment guidance is a dedicated OS user + minimal
 `--allow`/`--trust` on the serve process.
+
+### Remote MCP servers (#530)
+
+`--mcp-server name=https://…` connects the MCP client to a remote
+Streamable HTTP endpoint instead of a child process. The trust model of
+the tools is unchanged: every tool is `Write`, server metadata is never
+trusted for risk, results are capped (256k chars) and fenced, and
+`--allow 'mcp_<name>_*'` is the operator's way to pre-authorize a server
+they trust. What the transport adds:
+
+- **Token handling.** The bearer token is read from `TOLE_MCP_<NAME>_TOKEN`
+  only (never from a spec, flag or config file, which get committed and
+  printed), re-read on every (re)connect, and sent only to that server's
+  endpoint. `TOKEN` in the name also makes the child-process environment
+  scrub (ENV-1) drop it from the processes tole spawns. Errors and the
+  warnings tole prints never carry it: every reactor error is scrubbed of the
+  token, the url and its host (transport errors echo them, and a sloppy
+  server may echo the `Authorization` header in an error body).
+- **Transport safety.** `https` is required; plain `http` only for
+  `localhost`, `127.0.0.0/8` and `::1` (lookalikes such as
+  `127.0.0.1.evil.com` are refused). A url with embedded credentials is
+  refused. A redirect to another origin is not followed (rmcp's same-origin
+  redirect policy), so a server cannot bounce the token to a third host. The
+  url is re-validated at connect time because the config type is public.
+- **Disclosure.** Tool arguments and results go to the remote operator, like
+  any hosted API; use `--allow` only for servers you would send that data to.
+- **Residual: the token is bound to the server NAME, not the url.** A config
+  that points an existing name at a different url sends that name's token
+  there. The place where that can be abused is a cloned repository's
+  `.tole/config.toml`; `mcp_server` is already behind the content-bound
+  project-config trust gate above (a changed file is untrusted again), so a
+  repo cannot add or repoint a server without the operator approving the
+  exact bytes. User-level config and flags are operator trust.
+- **Residual: availability.** A remote server can hang or stream slowly; the
+  handshake and per-call timeouts and the connection-eviction contract are
+  the same as for stdio, and a transport failure drops the connection so
+  the next call reconnects (and re-reads the token).
+- **Build.** The HTTP client lives behind the existing `mcp` feature, so an
+  embedder or mobile build without it links neither `reqwest` nor the HTTP
+  stack. TLS is rustls with the `ring` provider already used by `ureq`
+  (installed once, process-wide, unless the embedder installed another).
 
 ### Web tools (#215)
 

@@ -54,9 +54,11 @@ struct Cli {
     #[arg(long, global = true)]
     workspace: Option<String>,
 
-    /// Register an external MCP server over stdio: name=command [args...].
-    /// Repeatable. Every MCP tool joins the registry as Risk::Write and
-    /// goes through the normal approval gate. Requires the `mcp` feature.
+    /// Register an external MCP server: name=command [args...] (stdio) or
+    /// name=https://host/path (Streamable HTTP; the bearer token comes from
+    /// TOLE_MCP_<NAME>_TOKEN, never from the spec). Repeatable. Every MCP
+    /// tool joins the registry as Risk::Write and goes through the normal
+    /// approval gate. Requires the `mcp` feature.
     #[cfg(feature = "mcp")]
     #[arg(long, global = true)]
     mcp_server: Vec<String>,
