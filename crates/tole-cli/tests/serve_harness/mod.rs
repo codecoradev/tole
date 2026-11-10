@@ -37,6 +37,29 @@ impl Serve {
     /// A serve process over an existing workspace (a restart, or a second
     /// process contending for the same session files).
     pub fn spawn_in(base: &str, dir: std::path::PathBuf, own_dir: bool) -> Self {
+        Self::spawn_in_env(base, dir, own_dir, &[])
+    }
+
+    /// A fresh workspace with extra environment for the serve process.
+    pub fn spawn_with_env(base: &str, env: &[(&str, &str)]) -> Self {
+        let dir = std::env::temp_dir().join(format!(
+            "tole-entries-{}-{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        Self::spawn_in_env(base, dir, true, env)
+    }
+
+    pub fn spawn_in_env(
+        base: &str,
+        dir: std::path::PathBuf,
+        own_dir: bool,
+        env: &[(&str, &str)],
+    ) -> Self {
         let (child, port) = common::spawn_listening(|port| {
             let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
             cmd.args(["serve", "--port", &port.to_string(), "--token", "t0ken"])
@@ -45,6 +68,7 @@ impl Serve {
                 .env("TOLE_BASE_URL", base)
                 .env("TOLE_MODEL", "mock-model")
                 .env("TOLE_API_KEY", "sk-test")
+                .envs(env.iter().copied())
                 .stdin(Stdio::null())
                 .stdout(Stdio::null());
             cmd
@@ -318,7 +342,15 @@ impl Sse {
                     event = v.to_string();
                 } else if let Some(v) = line.strip_prefix("data: ") {
                     data.push_str(v);
-                } // lines starting with ':' are comments (heartbeat)
+                } else if line.starts_with(':') {
+                    // A comment line: the server's heartbeat. Surfaced as a
+                    // frame so tests can wait for it.
+                    let _ = tx.send(Frame {
+                        id: None,
+                        event: "ping".into(),
+                        data: Value::Null,
+                    });
+                }
             }
         });
         Ok(Sse { rx, sock: s })

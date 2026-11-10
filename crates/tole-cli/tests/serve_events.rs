@@ -242,3 +242,20 @@ fn approval_frames_reach_the_stream() {
     );
     assert!(serve.dir.join("approved.txt").exists(), "the work executed");
 }
+
+/// An idle stream must heartbeat: that is how a dead peer is found (the
+/// write fails) and its slot freed. The interval is shortened to 1 s here.
+#[test]
+fn an_idle_stream_sends_heartbeats() {
+    let serve = Serve::spawn_with_env(&spawn_mock(0), &[("TOLE_SERVE_HEARTBEAT_SECS", "1")]);
+    let id = new_session(&serve);
+    let sse = Sse::open(&serve, &events_path(&id), "", true).unwrap();
+    sse.until(WAIT, |f| f.event == "ready");
+    // Nothing happens on the session: only heartbeats may arrive, and more
+    // than one (the clock restarts after each real write).
+    let first = sse.until(Duration::from_secs(5), |f| f.event == "ping");
+    assert!(first
+        .iter()
+        .all(|f| f.event == "ping" || f.event == "approval_requested"));
+    sse.until(Duration::from_secs(5), |f| f.event == "ping");
+}

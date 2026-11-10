@@ -443,9 +443,7 @@ fn serve_events(
     query: &str,
     last_event_id: Option<&str>,
 ) {
-    use tole_cli::events::{
-        entry_frame, frame, ApprovalWatch, EntryTail, HEARTBEAT, HEARTBEAT_SECS,
-    };
+    use tole_cli::events::{entry_frame, frame, ApprovalWatch, EntryTail, Heartbeat, HEARTBEAT};
     let param = |name: &str| {
         query
             .split('&')
@@ -500,21 +498,34 @@ fn serve_events(
     let mut tail = EntryTail::new(path, after);
     let mut approvals = ApprovalWatch::default();
     let mut ready_sent = false;
-    let mut last_write = Instant::now();
+    let mut hb = Heartbeat::new(
+        tole_cli::events::heartbeat_interval(
+            std::env::var(tole_cli::events::HEARTBEAT_ENV)
+                .ok()
+                .as_deref(),
+        ),
+        Instant::now(),
+    );
     // Approval state changes go out BEFORE the durable entries of the same
     // pass, so a decision is announced ahead of the effects it caused.
-    let send_approvals = |stream: &mut TcpStream, approvals: &mut ApprovalWatch| -> bool {
-        approvals
-            .poll(&state.approvals.list(Some(id)))
-            .into_iter()
-            .all(|(name, data)| write_all(stream, &frame(name, None, &data)))
+    // `Some(n)`: n frames written (0 is normal); `None`: the peer is gone.
+    let send_approvals = |stream: &mut TcpStream, approvals: &mut ApprovalWatch| -> Option<usize> {
+        let mut n = 0;
+        for (name, data) in approvals.poll(&state.approvals.list(Some(id))) {
+            if !write_all(stream, &frame(name, None, &data)) {
+                return None;
+            }
+            n += 1;
+        }
+        Some(n)
     };
     loop {
         if ready_sent {
-            if !send_approvals(&mut stream, &mut approvals) {
-                return;
+            match send_approvals(&mut stream, &mut approvals) {
+                None => return,
+                Some(0) => {}
+                Some(_) => hb.note_write(Instant::now()),
             }
-            last_write = Instant::now();
         }
         // Durable frames (a transient read error just retries).
         if let Ok(entries) = tail.poll() {
@@ -522,7 +533,7 @@ fn serve_events(
                 if !write_all(&mut stream, &entry_frame(&e)) {
                     return;
                 }
-                last_write = Instant::now();
+                hb.note_write(Instant::now());
             }
         }
         if !ready_sent {
@@ -534,19 +545,23 @@ fn serve_events(
                         "busy": live_busy(state).unwrap_or(false)}),
             );
             // The replay is complete; then what is pending right now.
-            if !write_all(&mut stream, &ready) || !send_approvals(&mut stream, &mut approvals) {
+            if !write_all(&mut stream, &ready) {
                 return;
             }
-            last_write = Instant::now();
+            hb.note_write(Instant::now());
+            if send_approvals(&mut stream, &mut approvals).is_none() {
+                return;
+            }
         }
         let dropped = sub.take_dropped();
-        if dropped > 0
-            && !write_all(
+        if dropped > 0 {
+            if !write_all(
                 &mut stream,
                 &frame("resync", None, &json!({"dropped": dropped})),
-            )
-        {
-            return;
+            ) {
+                return;
+            }
+            hb.note_write(Instant::now());
         }
         // Ephemeral frames: wait briefly for one (this is also the poll
         // interval for the durable tail), then drain what queued up.
@@ -557,7 +572,7 @@ fn serve_events(
                     if !write_all(&mut stream, &e.to_frame()) {
                         return;
                     }
-                    last_write = Instant::now();
+                    hb.note_write(Instant::now());
                     next = sub.rx.try_recv().ok();
                 }
             }
@@ -573,11 +588,13 @@ fn serve_events(
             let _ = write_all(&mut stream, &frame("closed", None, &json!({"id": id})));
             return;
         }
-        if last_write.elapsed() >= Duration::from_secs(HEARTBEAT_SECS) {
+        // Silence for HEARTBEAT_SECS: write a comment. This is also how a
+        // dead peer is found (the write fails) and its slot freed.
+        if hb.due(Instant::now()) {
             if !write_all(&mut stream, HEARTBEAT) {
                 return;
             }
-            last_write = Instant::now();
+            hb.note_write(Instant::now());
         }
     }
 }

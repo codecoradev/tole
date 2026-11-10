@@ -50,6 +50,49 @@ pub fn frame(event: &str, id: Option<u64>, data: &Value) -> String {
     out
 }
 
+/// Env var overriding [`HEARTBEAT_SECS`] (whole seconds, 1 to 3600): for a
+/// proxy with a short idle timeout in front of `tole serve`, and for tests.
+pub const HEARTBEAT_ENV: &str = "TOLE_SERVE_HEARTBEAT_SECS";
+
+/// The heartbeat interval for `value` of [`HEARTBEAT_ENV`]: the default for
+/// an unset, blank or unparsable value, otherwise clamped to 1..=3600 s.
+pub fn heartbeat_interval(value: Option<&str>) -> std::time::Duration {
+    let secs = value
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|n| n.clamp(1, 3600))
+        .unwrap_or(HEARTBEAT_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
+/// When the next heartbeat is due: `every` after the last time bytes were
+/// ACTUALLY written to the peer. Only a real write calls [`Self::note_write`];
+/// a pass that wrote nothing must not, or an idle stream would never
+/// heartbeat and a dead peer would go unnoticed. Time is injected so the rule
+/// is unit-testable without waiting.
+pub struct Heartbeat {
+    last_write: std::time::Instant,
+    every: std::time::Duration,
+}
+
+impl Heartbeat {
+    pub fn new(every: std::time::Duration, now: std::time::Instant) -> Self {
+        Self {
+            last_write: now,
+            every,
+        }
+    }
+
+    /// Bytes reached the socket at `now`.
+    pub fn note_write(&mut self, now: std::time::Instant) {
+        self.last_write = now;
+    }
+
+    /// A heartbeat should be written at `now`.
+    pub fn due(&self, now: std::time::Instant) -> bool {
+        now.saturating_duration_since(self.last_write) >= self.every
+    }
+}
+
 /// A comment frame: ignored by clients, keeps the connection alive and lets
 /// a dead peer surface as a write error.
 pub const HEARTBEAT: &str = ": ping\n\n";
@@ -402,6 +445,43 @@ mod tests {
         assert!(!e.starts_with("id:"), "ephemeral frames carry no id");
         assert_eq!(e, "event: text_delta\ndata: {\"text\":\"hi\"}\n\n");
         assert!(HEARTBEAT.starts_with(':') && HEARTBEAT.ends_with("\n\n"));
+    }
+
+    #[test]
+    fn the_heartbeat_is_due_after_silence_and_only_a_real_write_resets_it() {
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let mut hb = Heartbeat::new(Duration::from_secs(15), t0);
+        assert!(!hb.due(t0 + Duration::from_secs(14)));
+        assert!(hb.due(t0 + Duration::from_secs(15)));
+        // Polls that wrote nothing never call note_write, so the deadline
+        // does not move however many passes happen in between.
+        for s in 1..60 {
+            let _ = hb.due(t0 + Duration::from_secs(s));
+        }
+        assert!(hb.due(t0 + Duration::from_secs(60)));
+        // A real write at t=20 pushes the deadline out to t=35.
+        hb.note_write(t0 + Duration::from_secs(20));
+        assert!(!hb.due(t0 + Duration::from_secs(34)));
+        assert!(hb.due(t0 + Duration::from_secs(35)));
+        // A clock that appears to go backwards is never "due".
+        assert!(!hb.due(t0));
+    }
+
+    #[test]
+    fn the_heartbeat_interval_defaults_and_clamps() {
+        use std::time::Duration;
+        let d = Duration::from_secs(HEARTBEAT_SECS);
+        assert_eq!(heartbeat_interval(None), d);
+        assert_eq!(heartbeat_interval(Some("")), d);
+        assert_eq!(heartbeat_interval(Some("soon")), d);
+        assert_eq!(heartbeat_interval(Some("-3")), d);
+        assert_eq!(heartbeat_interval(Some(" 2 ")), Duration::from_secs(2));
+        assert_eq!(heartbeat_interval(Some("0")), Duration::from_secs(1));
+        assert_eq!(
+            heartbeat_interval(Some("999999")),
+            Duration::from_secs(3600)
+        );
     }
 
     #[test]
