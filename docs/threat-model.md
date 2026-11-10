@@ -489,6 +489,23 @@ is the same as every other untrusted input: tool-result fencing,
 approval gates on anything that matters, and mission budgets bounding
 the blast radius.
 
+Fetch backend (#532): with `TOLE_WEB_FETCH_URL` set, `web_fetch` sends the
+target to that backend instead of fetching directly (backend only, no
+fallback, so behavior is predictable). It stays ReadOnly with the same
+model-content-never-executed trust as search. What changes: the **target
+URL is disclosed to the backend operator**, and the backend, not tole,
+makes the request. tole therefore vets the target first and sends nothing
+if it fails: https only, no credentials in the URL, and a host that
+resolves to public addresses (`TOLE_WEB_ALLOW_PRIVATE=1` opts out as for
+direct fetch). The backend resolves the host again itself, so this keeps
+internal addresses from being *asked about*; it is not a defense against
+DNS rebinding at the backend, which is the operator's to enforce. Headers
+(`TOLE_WEB_FETCH_HEADERS`, same rules as the search headers) go only to the
+backend, redirects from the backend are not followed, and errors never
+carry a value. The backend's JSON envelope is bounded (1 MiB) and its text
+is truncated to the direct-fetch limits. Not covered: what the backend
+returns is arbitrary text from the internet (prompt injection as above).
+
 Search backend credentials (#436): `TOLE_WEB_SEARCH_HEADERS` values (with
 `${VAR}` references expanded from the environment) are sent only to the
 `TOLE_WEB_SEARCH_URL` backend: the search agent follows no redirects, so a
