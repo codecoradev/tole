@@ -12,6 +12,7 @@ pub mod config_trust;
 pub mod doctor;
 pub mod ecosystem;
 pub mod handoff;
+pub mod protocol;
 pub mod provider_chain;
 #[cfg(feature = "shell-tools")]
 pub mod review_gate;
