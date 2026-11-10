@@ -9,9 +9,11 @@ use tole_core::approval::{ToolRequest, Verdict};
 use tole_core::cancel::CancelToken;
 use tole_core::openai::OpenAiConfig;
 use tole_core::storage::{is_valid_session_id, JsonlStorage, Storage};
-use tole_core::tool::{Risk, ToolRegistry};
+use tole_core::tool::ToolRegistry;
 use tole_core::turn::{TurnObserver, TurnOutcome};
-use tole_tui::{Footer, HostCmd, HostReply, Prompter, SessionItem, TuiHost, TurnEnd};
+use tole_tui::{
+    ApprovalRequest, Footer, HostCmd, HostReply, Prompter, SessionItem, TuiHost, TurnEnd,
+};
 
 use crate::approver::PromptFn;
 use crate::compaction_host::{CompactionSettings, ModelsCatalog, WindowSource};
@@ -24,15 +26,15 @@ pub struct TuiPrompt(pub Prompter);
 impl PromptFn for TuiPrompt {
     fn prompt(&self, req: &ToolRequest<'_>) -> Verdict {
         let target = req.target.as_deref().map(|t| format!(" → {t}"));
-        self.0.ask(
+        self.0.ask(ApprovalRequest::new(
             format!(
                 "{} — {}{}",
                 req.tool,
                 req.description,
                 target.unwrap_or_default()
             ),
-            req.risk == Risk::Destructive,
-        )
+            req.risk,
+        ))
     }
 }
 

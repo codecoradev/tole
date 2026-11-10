@@ -149,6 +149,15 @@ Wide characters wrap by character count, not cell width.
   provider- and network-adjacent host types.
 - Approvals: `tole_tui::approval_channel()` gives the host a `Prompter`; the
   CLI wraps it as a `PromptFn` inside the regular `InteractiveApprover`.
+  A pending approval is source-agnostic UI state (#526): an `ApprovalRequest`
+  (one sanitized line plus the `Risk` tier) and a one-shot reply. An in-process
+  turn blocks on `Prompter::ask(request)`; a remote source (a server's
+  `/approvals` queue) calls `Prompter::post(request, reply)` without blocking and
+  `reply` is where the verdict goes (for example the decision `POST`). The verdict
+  is delivered exactly once, and a request that is dropped unanswered (turn
+  ended, a newer request, the UI gone) is **denied**. The risk tier is carried so
+  the rule that a `Destructive` call is never "allowed always"
+  (`ApprovalRequest::can_allow_always`) lives in one place for every UI.
 - **Host seam (#526):** `TuiHost` has three methods: `footer`, `run_turn` and
   `apply(HostCmd) -> Result<HostReply, String>`, which covers every slash command
   and hotkey (`/model`, `/effort`, `/compact`, `/new`, `/resume`, `/session`,
