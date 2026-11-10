@@ -15,12 +15,21 @@ default = ["shell-tools"]
 shell-tools = []
 # MCP client (issue #74): register external MCP servers' tools into the
 # registry over stdio. Mobile/embedder profiles stay MCP-free.
-mcp = ["dep:rmcp", "dep:tokio", "shell-tools"]
+mcp = ["dep:rmcp", "dep:tokio", "dep:rustls", "dep:url", "shell-tools"]
 # rmcp streamable-http-server pulls tower/http types for the HTTP transport.
 mcp-http = ["mcp", "rmcp/transport-streamable-http-server"]
 
 [dependencies]
-rmcp = { version = "3.3", features = ["client", "server", "transport-io", "transport-child-process", "transport-streamable-http-server"], optional = true }
+# transport-streamable-http-client-reqwest: the HTTP(S) MCP client transport (#530).
+# reqwest-tls-no-provider: rustls without a bundled crypto provider, so the
+# `ring` provider ureq already pulls in is the only one (no aws-lc).
+rmcp = { version = "3.9", features = ["client", "server", "transport-io", "transport-child-process", "transport-streamable-http-server", "transport-streamable-http-client-reqwest", "reqwest-tls-no-provider"], optional = true }
+# reqwest-tls-no-provider needs a process-level crypto provider before it
+# builds a client: install `ring` (already in the tree via ureq), see mcp.rs.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
+# The url crate is the parser reqwest uses: validate_http_url runs it so a url that passes
+# validation can never be one the client later refuses (or panics on).
+url = { version = "2", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "process", "time"], optional = true }
 libc = "0.2"
 serde = { workspace = true }
@@ -36,4 +45,8 @@ required-features = ["mcp"]
 
 [[test]]
 name = "mcp_prompts"
+required-features = ["mcp"]
+
+[[test]]
+name = "mcp_http"
 required-features = ["mcp"]

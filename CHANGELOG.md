@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Streamable HTTP MCP client (#530): `--mcp-server name=https://host/path` (and the `mcp_server` config key) connects to a remote MCP server next to the existing stdio form, inside the existing `mcp` feature of `tole-core`. The bearer token is read from `TOLE_MCP_<NAME>_TOKEN` only (name upper-cased, `-` becomes `_`), re-read on every reconnect and sent only to that endpoint; it and the url are scrubbed from every error. `https` is required (plain `http` only for loopback), a url with credentials is refused, and a redirect to another origin is not followed. Tools register as `mcp_<name>_<tool>` and stay `Risk::Write` (pre-authorize with `--allow 'mcp_<name>_*'`); results stay capped and fenced. Build without the `mcp` feature links no HTTP client. **API change in `tole-core`:** `McpServerConfig` now holds `transport: McpTransport` (`Stdio { command, args }` | `Http { url }`) instead of `command` / `args`; new `mcp::{McpTransport, token_env_name}`. Not included (deferred): server-initiated notifications and SSE resumption, OAuth.
+
 ## [0.10.1] — 2026-11-04
 
 ### Fixed

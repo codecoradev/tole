@@ -54,6 +54,18 @@ tole is the agent harness of the CodeCora ecosystem — the hands:
   offer prompts show up in `tole chat` as `/mcp:<server>:<prompt> [k=v ...]`
   (rendered server-side, sent as your next message); servers that offer
   resources add a ReadOnly `mcp_read` tool. Servers with neither add nothing.
+- **Remote MCP servers over Streamable HTTP** (#530) use the same flag with a
+  bare url: `--mcp-server research=https://mcp.example.com/mcp`. The bearer
+  token comes from the environment only, `TOLE_MCP_<NAME>_TOKEN` (name
+  upper-cased, `-` becomes `_`, e.g. `TOLE_MCP_RESEARCH_TOKEN`), is re-read on
+  every (re)connect and is sent only to that endpoint; it is never accepted in
+  the spec or a config file, and it and the url are scrubbed from errors. The
+  url must be `https` (plain `http` only for `localhost` / `127.0.0.0/8` /
+  `::1`), may not contain credentials, and a redirect to another origin is not
+  followed. The tools register as `mcp_<name>_<tool>` and are **always
+  `Write`** like every MCP tool; pre-authorize a trusted read-only server with
+  `--allow 'mcp_research_*'`. Needs the `mcp` feature (on by default in
+  `tole-cli`); embedders without it link no HTTP client.
 - **tole as an MCP server**: `tole mcp` serves the registry's hardened tools
   (jailed file ops, git, jobs, memory) to any MCP client. ReadOnly tools are
   always callable; Write tools require `--allow` patterns; Destructive tools
@@ -340,7 +352,7 @@ hard error.
 | `job_start`, `job_poll` | Write / RO | detached long-running jobs with log tailing |
 | `cora_search` | RO | hybrid codebase search via `cora brain`; native fallback — skipped when the cora MCP surface is attached |
 | `uteke_recall`, `uteke_document` | RO / Write | semantic memory recall / markdown → room |
-| `mcp_*` (from `--mcp-server`) | Write | server metadata is **never** trusted for risk; approval gate always applies |
+| `mcp_*` (from `--mcp-server`, stdio or `https://` url) | Write | server metadata is **never** trusted for risk; approval gate always applies |
 | `web_fetch`, `web_search` | RO | text-only internet (no JS/browser): fetch is direct HTTPS, size-capped, content-type allowlisted, HTML→text; search needs `TOLE_WEB_SEARCH_URL` (default contract `GET ?q=` → `{"results":[{title,url,snippet}]}`; `TOLE_WEB_SEARCH_METHOD=POST` sends `{"query","limit"}`, `TOLE_WEB_SEARCH_HEADERS='Authorization=Bearer ${KEY}'` adds headers sent only to the backend, `TOLE_WEB_SEARCH_FIELDS='snippet=description,results=items'` maps fields; a malformed value fails startup) — no backend, no tool; results are model content, never executed |
 | `todo_write`, `todo_read` | Write / RO | durable mission task list (at most one `in_progress`); state lives in session entries — write results are the record, crash-resume restores the last settled list; covered by `--trust internal` |
 
