@@ -26,6 +26,8 @@ const SNIPPET_CAP_CHARS: usize = 400;
 
 /// Redirect hops allowed before refusing (each hop re-validated).
 const MAX_REDIRECTS: usize = 5;
+/// Characters of fetched text returned to the model.
+const TEXT_CAP_CHARS: usize = 20_000;
 
 /// Resolve `host` to addresses via the OS resolver (same source the
 /// request itself would use).
@@ -1055,11 +1057,14 @@ impl Tool for WebBackendFetchTool {
         } else {
             text
         };
+        // Truncated means cut by EITHER cap: the byte cap above or the
+        // character cap the model sees, so `false` always means complete.
+        let truncated = truncated || text.chars().count() > TEXT_CAP_CHARS;
         Ok(json!({
             "url": target,
             "content_type": "text/plain (via fetch backend)",
             "truncated": truncated,
-            "text": cap_chars(text, 20_000),
+            "text": cap_chars(text, TEXT_CAP_CHARS),
         }))
     }
 }
@@ -1767,6 +1772,19 @@ mod tests {
             .unwrap();
         assert_eq!(out["truncated"], true);
         assert!(out["text"].as_str().unwrap().chars().count() <= 20_001);
+        // Between the character cap and the byte cap: still truncated.
+        let mid = "a".repeat(TEXT_CAP_CHARS + 500);
+        let (addr, _rx) = mock_backend(200, json!({"content": mid}).to_string());
+        let out = fetch_tool(addr, &[])
+            .execute(json!({"url": "https://127.0.0.1/p"}))
+            .unwrap();
+        assert_eq!(out["truncated"], true, "cut to 20k chars must say so");
+        // Under both caps: complete.
+        let (addr, _rx) = mock_backend(200, json!({"content": "short"}).to_string());
+        let out = fetch_tool(addr, &[])
+            .execute(json!({"url": "https://127.0.0.1/p"}))
+            .unwrap();
+        assert_eq!(out["truncated"], false);
         // No such field, not JSON, and an oversize envelope are errors.
         for (body, needle) in [
             (
