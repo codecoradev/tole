@@ -7,7 +7,7 @@
 resume-by-id and an event stream from `tole serve`. That is additive REST/SSE on the
 existing token-authenticated face, not this document's socket daemon; the daemon
 itself (client registry, idle timeout, hot-reload) stays parked. Shipped so far:
-`GET /sessions/{id}/entries` ([mobile-control.md](mobile-control.md#transcript-read-524)).
+`GET /sessions/{id}/entries` ([mobile-control.md](mobile-control.md#transcript-read-524)) and resume-by-id ([mobile-control.md](mobile-control.md#resume-by-id-524)).
 
 **Park decision:** tole has no multi-client need today. This note records the
 jcode daemon design so a future need can be evaluated against a written
