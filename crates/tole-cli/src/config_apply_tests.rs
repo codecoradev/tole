@@ -958,6 +958,36 @@ fn compaction_settings_resolve_flag_env_config_default() {
     assert_eq!(s.context_window.unwrap().source, Source::Config);
 }
 
+// ------------------------------------------------- review gate (#534)
+
+fn gate(cfg_src: &str, env: &[(&str, &str)]) -> Option<(String, Source)> {
+    Settings::resolve(&Flags::default(), &cfg(cfg_src), &env_of(env))
+        .review_gate
+        .map(|e| (e.value, e.source))
+}
+
+#[test]
+fn review_gate_precedence_env_config_default() {
+    let c = "review_gate = \"warn\"\n";
+    assert_eq!(
+        gate(c, &[("TOLE_REVIEW_GATE", "OFF")]),
+        Some(("off".into(), Source::Env)),
+        "env wins and is normalized"
+    );
+    assert_eq!(gate(c, &[]), Some(("warn".into(), Source::Config)));
+    assert_eq!(gate("", &[]), None, "default = the built-in block");
+    assert_eq!(gate("", &[("TOLE_REVIEW_GATE", " ")]), None);
+}
+
+#[cfg(feature = "shell-tools")]
+#[test]
+fn the_review_gate_env_name_matches_the_gate_module() {
+    assert_eq!(
+        crate::config_apply::REVIEW_GATE_ENV,
+        crate::review_gate::ENV
+    );
+}
+
 // ------------------------------------------------- reasoning effort (#457)
 
 fn effort(flags: &Flags, cfg_src: &str, env: &[(&str, &str)]) -> Option<(String, Source)> {

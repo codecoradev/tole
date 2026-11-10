@@ -196,7 +196,7 @@ Not a sandbox: review what it wrote before you run it), `--skill <path>` (load a
 | `TOLE_SKILL` | skill files to preload (`SKILL.md` paths, separated like `PATH`); same as repeated `--skill`, which replaces it; refused by the server faces like `--skill` |
 | `TOLE_MEMORY` | memory loop backend (`uteke`) — same as `--memory uteke` |
 | `TOLE_NO_UPDATE_CHECK` | `1` disables the startup update-check banner (issue #220) |
-| `TOLE_REVIEW_GATE` | `off` / `warn` / `block` (default): what a `git commit` does while the cora review tools are attached and its staged diff has no validated review (#534); `--review-gate` sets it and wins; anything else fails startup. Not a config key yet, so a cloned project's config cannot weaken it |
+| `TOLE_REVIEW_GATE` | `off` / `warn` / `block` (default): what a `git commit` does while the cora review tools are attached and its staged diff has no validated review (#534); `--review-gate` sets it and wins; anything else fails startup. Also a config key `review_gate` (flag > env > config > user config); a project's `.tole/config.toml` can keep or tighten the gate but never loosen what your user config sets (the stricter of the two layers applies), and the key is covered by the project-config trust gate |
 | `TOLE_VERBOSE` | `1` prints the startup probe misses (uteke / cora binary not found, no GitHub origin), which are silent by default; `tole doctor` reports the sibling binaries either way |
 | `TOLE_MEMORY_NAMESPACE` | override the loop's uteke room (default: `repo-<directory name>`; the name predates rooms) |
 

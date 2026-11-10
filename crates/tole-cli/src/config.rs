@@ -81,6 +81,9 @@ pub struct Config {
     /// `reasoning_effort` sent on chat completions (#457):
     /// `minimal | low | medium | high`.
     pub reasoning_effort: Option<String>,
+    /// Review gate before `git commit` (#534): `off | warn | block`. A
+    /// project file can only keep or tighten the gate: see [`layered`].
+    pub review_gate: Option<String>,
     pub mission: Option<MissionConfig>,
     /// Keys (rendered names, e.g. `model`, `mission.verify`) whose value
     /// came from the user layer; set by [`layered`], never by the file.
@@ -260,6 +263,13 @@ pub fn parse(src: &str, path: &Path) -> Result<Config, ConfigError> {
         tole_core::openai::parse_reasoning_effort(level)
             .map_err(|e| range(format!("reasoning_effort: {e}")))?;
     }
+    if let Some(v) = &cfg.review_gate {
+        if gate_strictness(v).is_none() {
+            return Err(range(format!(
+                "review_gate must be off, warn or block, got {v:?}"
+            )));
+        }
+    }
     if cfg.context_window == Some(0) {
         return Err(range(
             "context_window must be a positive number of tokens".into(),
@@ -272,6 +282,17 @@ pub fn parse(src: &str, path: &Path) -> Result<Config, ConfigError> {
 pub fn load(path: &Path) -> Result<Config, ConfigError> {
     let src = read_source(path)?;
     parse(&src, path)
+}
+
+/// Strictness of a `review_gate` value (`block` > `warn` > `off`); `None`
+/// when it is not one of the three.
+fn gate_strictness(v: &str) -> Option<u8> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "off" => Some(0),
+        "warn" => Some(1),
+        "block" => Some(2),
+        _ => None,
+    }
 }
 
 /// Merge the two layers key by key: the project value wins when it is set
@@ -387,9 +408,26 @@ pub fn layered(project: &Config, user: &Config) -> Config {
             text,
             u,
         ),
+        // The one key where the project layer does NOT simply win: a cloned
+        // repository must not be able to loosen the review gate the user
+        // chose, so the STRICTER of the two layers applies (a project may
+        // only keep or tighten it).
+        review_gate: match (&project.review_gate, &user.review_gate) {
+            (Some(p), Some(u)) => {
+                if gate_strictness(u) > gate_strictness(p) {
+                    u.clone().into()
+                } else {
+                    p.clone().into()
+                }
+            }
+            (p, u) => p.clone().or_else(|| u.clone()),
+        },
         mission: (project.mission.is_some() || user.mission.is_some()).then_some(mission),
         user_keys: BTreeSet::new(),
     };
+    if out.review_gate.is_some() && out.review_gate != project.review_gate {
+        from_user.insert("review_gate");
+    }
     out.user_keys = from_user;
     out
 }
@@ -494,6 +532,11 @@ pub fn render_with(cfg: &Config, tag: &str, ann: &Annotations) -> Vec<String> {
         &mut out,
         "reasoning_effort",
         cfg.reasoning_effort.as_deref().map(quote),
+    );
+    scalar(
+        &mut out,
+        "review_gate",
+        cfg.review_gate.as_deref().map(quote),
     );
     if let Some(m) = &cfg.mission {
         scalar(
@@ -646,6 +689,37 @@ verify_timeout = 60
         assert!(lines.contains(&"model = \"m\"  [config]".to_string()));
         assert!(lines.contains(&"  - \"internal\"".to_string()));
         assert!(lines.contains(&"mission.max_tokens = 1000  [config]".to_string()));
+    }
+
+    #[test]
+    fn review_gate_is_validated_and_a_project_can_only_tighten_it() {
+        assert_eq!(
+            parse("review_gate = \"warn\"\n", &p())
+                .unwrap()
+                .review_gate
+                .as_deref(),
+            Some("warn")
+        );
+        let e = parse("review_gate = \"maybe\"\n", &p()).unwrap_err();
+        assert!(e.message.contains("review_gate must be"), "{e}");
+        let with = |v: &str| parse(&format!("review_gate = \"{v}\"\n"), &p()).unwrap();
+        let eff = |proj: Option<&str>, user: Option<&str>| {
+            let proj = proj.map(with).unwrap_or_default();
+            let user = user.map(with).unwrap_or_default();
+            let m = layered(&proj, &user);
+            (m.review_gate.clone(), m.user_keys.contains("review_gate"))
+        };
+        let s = |v: &str| Some(v.to_string());
+        // A project that loosens what the user chose loses to the user.
+        assert_eq!(eff(Some("off"), Some("block")), (s("block"), true));
+        assert_eq!(eff(Some("warn"), Some("block")), (s("block"), true));
+        // A project that tightens wins; equal is the project's.
+        assert_eq!(eff(Some("block"), Some("off")), (s("block"), false));
+        assert_eq!(eff(Some("warn"), Some("warn")), (s("warn"), false));
+        // One layer only: used as given (the project file is trust-gated).
+        assert_eq!(eff(None, Some("off")), (s("off"), true));
+        assert_eq!(eff(Some("off"), None), (s("off"), false));
+        assert_eq!(eff(None, None), (None, false));
     }
 
     #[test]

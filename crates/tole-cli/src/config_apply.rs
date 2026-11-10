@@ -157,6 +157,10 @@ pub const CONTEXT_WINDOW_ENV: &str = "TOLE_CONTEXT_WINDOW";
 /// Reasoning effort sent as `reasoning_effort` (#457).
 pub const REASONING_EFFORT_ENV: &str = "TOLE_REASONING_EFFORT";
 
+/// Review gate policy (#534). Same name as `review_gate::ENV`, which only
+/// exists with `shell-tools`; a test below keeps the two equal.
+pub const REVIEW_GATE_ENV: &str = "TOLE_REVIEW_GATE";
+
 /// Real environment lookup for [`Settings::resolve`].
 pub fn real_env(name: &str) -> Option<String> {
     std::env::var(name).ok()
@@ -424,6 +428,10 @@ pub struct Settings {
     /// (#457), canonical lowercase; `None` = not sent. An invalid ENV value
     /// is kept as typed so [`Settings::effort_error`] can name it.
     pub reasoning_effort: Option<Eff<String>>,
+    /// `--review-gate` / `TOLE_REVIEW_GATE` > config `review_gate` (#534);
+    /// `None` = the built-in default (`block`). The flag reaches here as
+    /// the env var `main` exports it to.
+    pub review_gate: Option<Eff<String>>,
 }
 
 impl Settings {
@@ -553,6 +561,8 @@ impl Settings {
                 let canonical = tole_core::openai::parse_reasoning_effort(&v).unwrap_or(v);
                 Eff::from_pair((canonical, s), REASONING_EFFORT_ENV)
             }),
+            review_gate: resolve_string(None, env(REVIEW_GATE_ENV), cfg.review_gate.clone())
+                .map(|(v, s)| Eff::from_pair((v.trim().to_ascii_lowercase(), s), REVIEW_GATE_ENV)),
         }
     }
 
@@ -598,6 +608,7 @@ impl Settings {
         one(&mut self.compact_at, "compact_at", user);
         one(&mut self.no_compaction, "no_compaction", user);
         opt(&mut self.reasoning_effort, "reasoning_effort", user);
+        opt(&mut self.review_gate, "review_gate", user);
     }
 
     /// The fill to install for the deep server faces: ONLY the config's own
@@ -727,6 +738,7 @@ pub fn annotations(s: &Settings) -> BTreeMap<&'static str, String> {
             (e, None) => eff(e, &show_str),
         },
     );
+    m.insert("review_gate", eff(&s.review_gate, &show_str));
     m.insert(
         "mission.verify_timeout",
         format!(
