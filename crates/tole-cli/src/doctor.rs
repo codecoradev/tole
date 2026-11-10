@@ -729,6 +729,15 @@ pub fn run_cli(
             crate::ecosystem::line(sib, &crate::ecosystem::probe(sib))
         );
     }
+    // Review gate (#534): what a `git commit` needs while cora is attached.
+    #[cfg(feature = "shell-tools")]
+    println!(
+        "{}",
+        crate::review_gate::doctor_line(
+            &crate::config_apply::real_env,
+            &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+        )
+    );
     // Only a configured provider has a ledger identity.
     if let (Some(cfg), false) = (cfg, no_ledger) {
         let saved = ledger_path().and_then(|p| {

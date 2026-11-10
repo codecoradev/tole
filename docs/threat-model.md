@@ -405,6 +405,46 @@ they trust. What the transport adds:
   stack. TLS is rustls with the `ring` provider already used by `ureq`
   (installed once, process-wide, unless the embedder installed another).
 
+### Review gate before `git commit` (#534)
+
+While the cora review tools are attached, the `git` tool's `commit` op and
+`run_command` / `job_start` running `git commit` ask cora's own commit gate
+(`cora hook verify`, cora >= 0.20.0) first and are refused when the staged
+diff has no validated review (exit 11) or a blocking one (exit 10). cora owns
+the record: its marker is bound to the exact change set of the staged diff, so
+tole computes and trusts no hash of its own, and a verdict for another diff
+(or an edited index, or a marker older than 24 h) does not unlock the commit.
+
+- **A guardrail, not a boundary.** The approver is the security boundary. The
+  gate makes a cooperating agent do the review step; it does not stop one that
+  is trying to avoid it: `sh -c "git commit"`, a script written then run, a git
+  alias (`git -c alias.x=commit x`), or other commit-creating porcelain
+  (`merge`, `cherry-pick`, `am`, `revert`) are not recognized. Each of those
+  still goes through the approver like any other Write call (which `--yes`
+  pre-approves). A direct `git commit`
+  by a human is not gated by tole (cora's own pre-commit hook is the tool for
+  that).
+- **The review is self-review.** The reviewer is the model that wrote the
+  change (cora's agent-as-reviewer has no LLM of its own). The gate guarantees
+  the review ran on this exact diff, not that its judgement is sound, and it
+  does not replace the independent CI review.
+- **Fails open on tooling trouble, on purpose.** A cora without `hook verify`
+  (usage error), a missing or broken binary, or a 15 s timeout produces ONE
+  warning and the commit proceeds; locking an agent out because a tool broke
+  would only teach operators to turn the gate off. `tole doctor` shows whether
+  the gate can work.
+- **Only when a review is possible.** The gate activates after both review
+  tools are registered. With `--no-auto-mcp`, no cora, or any face without MCP
+  servers (`serve`, `acp`, `mcp`), there is no gate.
+- **Operator control.** `TOLE_REVIEW_GATE=off|warn|block` or `--review-gate`
+  (the flag wins). It is deliberately not a config key yet: a project's
+  `.tole/config.toml` is untrusted input, and a `review_gate = "off"` there
+  would let a cloned repo switch the gate off. When it becomes one it joins the
+  security-sensitive keys behind the content-bound trust gate. The model cannot
+  change it (the environment is not model-writable and `cora hook verify` runs
+  with the child-env scrub). Child agents inherit the environment, so they are
+  gated the same way.
+
 ### `tole setup cora` (#535)
 
 `tole setup cora` runs the fixed command `cargo install cora-code --locked`

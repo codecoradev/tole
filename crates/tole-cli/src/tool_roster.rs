@@ -118,6 +118,38 @@ fn verbose(env: &dyn Fn(&str) -> Option<String>) -> bool {
     env(VERBOSE_ENV).is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes"))
 }
 
+/// The review gate for this session (#534): `Some` only when the policy is
+/// not `off` AND MCP servers are attached (without the cora review tools
+/// there is no way to get a review, so there is nothing to gate). It starts
+/// inactive; [`build`] activates it once both review tools are registered.
+/// A malformed `TOLE_REVIEW_GATE` fails the build loudly.
+#[cfg(feature = "shell-tools")]
+fn review_gate_for(
+    roster: &Roster,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<Option<std::sync::Arc<crate::review_gate::Gate>>> {
+    use crate::review_gate::{Gate, Policy};
+    let policy = Policy::from_env(env).map_err(anyhow::Error::msg)?;
+    #[cfg(feature = "mcp")]
+    let has_servers = !roster.mcp_servers.is_empty();
+    #[cfg(not(feature = "mcp"))]
+    let has_servers = false;
+    Ok((policy != Policy::Off && has_servers).then(|| Gate::new(policy, roster.shell_dir.clone())))
+}
+
+/// Wrap a commit-capable tool in the gate when there is one.
+#[cfg(feature = "shell-tools")]
+fn gated(
+    tool: Box<dyn Tool>,
+    kind: crate::review_gate::Kind,
+    gate: &Option<std::sync::Arc<crate::review_gate::Gate>>,
+) -> Box<dyn Tool> {
+    match gate {
+        Some(g) => Box::new(crate::review_gate::Gated::new(tool, g.clone(), kind)),
+        None => tool,
+    }
+}
+
 fn add(reg: &mut ToolRegistry, tool: Box<dyn Tool>) -> Result<()> {
     let name = tool.name().to_string();
     reg.register(tool)
@@ -140,6 +172,8 @@ pub fn build(approver: impl Approver + 'static, roster: Roster) -> Result<ToolRe
     let tracking = crate::sibling::tracking_from_env(env);
     let tracked = |tool: Box<dyn Tool>| crate::sibling::track(tool, tracking.as_ref(), root);
 
+    #[cfg(feature = "shell-tools")]
+    let review_gate = review_gate_for(&roster, env)?;
     // Role children (#383) get the handoff tool; everyone else does not.
     if let Some(tool) = crate::handoff::tool_from_env(env) {
         add(&mut reg, Box::new(tool))?;
@@ -173,8 +207,15 @@ pub fn build(approver: impl Approver + 'static, roster: Roster) -> Result<ToolRe
             } else {
                 (run_cmd, job_start)
             };
-            add(&mut reg, Box::new(run_cmd))?;
-            add(&mut reg, Box::new(job_start))?;
+            use crate::review_gate::Kind;
+            add(
+                &mut reg,
+                gated(Box::new(run_cmd), Kind::Command, &review_gate),
+            )?;
+            add(
+                &mut reg,
+                gated(Box::new(job_start), Kind::Command, &review_gate),
+            )?;
         }
         add(
             &mut reg,
@@ -222,7 +263,11 @@ pub fn build(approver: impl Approver + 'static, roster: Roster) -> Result<ToolRe
             crate::session_host::register_gitea(&mut reg, shell_dir);
             add(
                 &mut reg,
-                Box::new(tole_core::git::GitTool::new().in_dir(shell_dir.clone())),
+                gated(
+                    Box::new(tole_core::git::GitTool::new().in_dir(shell_dir.clone())),
+                    crate::review_gate::Kind::Git,
+                    &review_gate,
+                ),
             )?;
         }
         // Destructive: only behind an interactive approver — every call
@@ -265,6 +310,15 @@ pub fn build(approver: impl Approver + 'static, roster: Roster) -> Result<ToolRe
             &mut reg,
             Box::new(tole_core::mcp::McpReadTool::new(resource_servers)),
         )?;
+    }
+    // Review gate (#534): on only when the agent can actually get a review.
+    #[cfg(all(feature = "shell-tools", feature = "mcp"))]
+    if let Some(gate) = &review_gate {
+        if reg.get("mcp_cora_cora_review_prepare").is_some()
+            && reg.get("mcp_cora_cora_review_finalize").is_some()
+        {
+            gate.activate();
+        }
     }
     #[cfg(not(feature = "mcp"))]
     let cora_mcp_ok = false;
