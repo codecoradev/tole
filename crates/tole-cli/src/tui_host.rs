@@ -8,8 +8,7 @@ use std::sync::{Arc, Mutex};
 use tole_core::approval::{ToolRequest, Verdict};
 use tole_core::cancel::CancelToken;
 use tole_core::openai::OpenAiConfig;
-use tole_core::register::RegisterWrite;
-use tole_core::storage::{is_valid_session_id, Commit, JsonlStorage, Storage};
+use tole_core::storage::{is_valid_session_id, JsonlStorage, Storage};
 use tole_core::tool::{Risk, ToolRegistry};
 use tole_core::turn::{TurnObserver, TurnOutcome};
 use tole_tui::{Footer, Prompter, SessionItem, TuiHost, TurnEnd};
@@ -116,14 +115,6 @@ impl TuiSession {
         self.inner.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    fn commit(&self, w: RegisterWrite) -> Result<(), String> {
-        self.lock()
-            .storage
-            .commit(Commit::new().register(w))
-            .map(|_| ())
-            .map_err(|e| format!("storage error: {e}"))
-    }
-
     /// Swap the session in place. The new handle is opened BEFORE the old
     /// one is dropped, and never for the id already open (that would
     /// self-lock, #475): one open handle per session at all times.
@@ -151,16 +142,6 @@ pub fn sessions_from(index: &std::path::Path, current: &str) -> Vec<SessionItem>
             }
         })
         .collect()
-}
-
-/// A model id or session name that is safe to store and show: non-blank,
-/// bounded, no control characters.
-fn clean_label(what: &str, raw: &str) -> Result<String, String> {
-    let v = raw.trim();
-    if v.is_empty() || v.chars().count() > 120 || v.chars().any(char::is_control) {
-        return Err(format!("invalid {what}"));
-    }
-    Ok(v.to_string())
 }
 
 /// Footer fields from the status snapshot; `effort` is the effective value
@@ -236,33 +217,21 @@ impl TuiHost for TuiSession {
     }
 
     fn set_model(&self, id: &str) -> Result<(), String> {
-        let id = clean_label("model id", id)?;
-        self.commit(RegisterWrite::set("fact", "model", serde_json::json!(id)))?;
+        let mut g = self.lock();
+        crate::session_settings::set_model(&mut g.storage, id)?;
         // the context window belongs to the model: look it up again
-        self.lock().window = None;
+        g.window = None;
         Ok(())
     }
 
     fn set_effort(&self, level: Option<&str>) -> Result<(), String> {
-        match level {
-            Some(l) => {
-                let l = tole_core::openai::parse_reasoning_effort(l)?;
-                self.commit(RegisterWrite::set(
-                    "fact",
-                    "reasoning_effort",
-                    serde_json::json!(l),
-                ))
-            }
-            None => self.commit(RegisterWrite::delete("fact", "reasoning_effort")),
-        }
+        crate::session_settings::set_effort(&mut self.lock().storage, level)
     }
 
     /// The forced pass of #481: the next prompt compacts first (when
     /// compaction is enabled). Not a mid-turn compaction.
     fn request_compaction(&self) -> Result<(), String> {
-        let mut g = self.lock();
-        tole_core::compaction::mark_overflow(&mut g.storage)
-            .map_err(|e| format!("storage error: {e}"))
+        crate::session_settings::request_compaction(&mut self.lock().storage)
     }
 
     fn new_session(&self) -> Result<String, String> {
@@ -320,12 +289,7 @@ impl TuiHost for TuiSession {
     }
 
     fn set_name(&self, name: &str) -> Result<(), String> {
-        let n = clean_label("name", name)?;
-        self.commit(RegisterWrite::set(
-            "fact",
-            "session_name",
-            serde_json::json!(n),
-        ))
+        crate::session_settings::set_name(&mut self.lock().storage, name)
     }
 }
 

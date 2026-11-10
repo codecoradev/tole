@@ -65,7 +65,10 @@ pub fn resolve_images(specs: &[String]) -> anyhow::Result<Vec<tole_core::image::
 /// default, so a session keeps its model across faces and resumes.
 pub fn session_model(storage: &impl Storage, default: &str) -> String {
     storage
-        .get_register("fact", "model")
+        .get_register(
+            crate::session_settings::MODEL.0,
+            crate::session_settings::MODEL.1,
+        )
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
         .filter(|m| !m.is_empty())
@@ -80,7 +83,10 @@ pub fn session_model(storage: &impl Storage, default: &str) -> String {
 /// back to the default.
 pub fn session_effort(storage: &impl Storage, default: Option<&str>) -> Option<String> {
     storage
-        .get_register("fact", "reasoning_effort")
+        .get_register(
+            crate::session_settings::EFFORT.0,
+            crate::session_settings::EFFORT.1,
+        )
         .and_then(serde_json::Value::as_str)
         .and_then(|v| tole_core::openai::parse_reasoning_effort(v).ok())
         .or_else(|| default.map(str::to_string))

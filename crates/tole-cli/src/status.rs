@@ -83,7 +83,10 @@ pub fn session_status(
         .filter(|m| !m.is_empty())
         .or_else(|| default_model.map(str::to_string));
     let effort = storage
-        .get_register("fact", "reasoning_effort")
+        .get_register(
+            crate::session_settings::EFFORT.0,
+            crate::session_settings::EFFORT.1,
+        )
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
         .filter(|e| !e.is_empty())

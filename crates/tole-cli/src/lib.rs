@@ -19,6 +19,7 @@ pub mod provider_chain;
 pub mod review_gate;
 pub mod session_host;
 pub mod session_index;
+pub mod session_settings;
 pub mod session_tools;
 pub mod sibling;
 pub mod status;
