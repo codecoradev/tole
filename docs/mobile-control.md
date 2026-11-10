@@ -23,6 +23,7 @@ rate-limited per source IP).
 | Cancel a turn | `POST /sessions/{id}/cancel` (#178) | the turn settles `cancelled`, durably |
 | Steer a turn | `POST /sessions/{id}/interrupt` `{text, urgent?}` (#377) | `202` queued; delivered at the turn's next safe point (after the running tool, before the next model call) as an attributed user-role entry, nothing is lost. `urgent` also withdraws a tool call that has not started. `409` when no turn is running, `400` for blank/oversized text or a full queue (16 pending) |
 | Detach a turn | `POST /sessions/{id}/detach` (#217) | `202`; the running tool settles, the turn ends `detached` (resumable) and background jobs keep running, nudging the session when they finish. `409` when no turn is running |
+| Resume a session | `POST /sessions` `{"resume": "<id>"}` (#524) | reopen an existing session, see [Resume by id](#resume-by-id-524) |
 | Read the transcript | `GET /sessions/{id}/entries?after=<seq>&limit=<n>` (#524) | one page of the session's log, see [Transcript read](#transcript-read-524); works while a turn runs |
 | Cost report | `GET /sessions/{id}/status` | the `mission` register: turns, steps, tokens, wall time, per-risk-tier tool calls |
 
@@ -81,11 +82,33 @@ session's log, so a client that connects late or reconnects can render history:
   truncated), not the live storage handle, so it works while a turn is in flight and
   shows entries as soon as they are durable. Cost is a replay of the file per call.
 - `400` for a bad `after`/`limit`, `404` for an unknown (not live) session, `401`
-  without the token. Sessions that are not live (after a serve restart) are not readable
-  yet; resume-by-id (next in #524) makes them live.
+  without the token. A session that is not live (after a serve restart) is not readable
+  until it is resumed (see below).
 - Entries carry tool inputs and outputs. The token already grants approval authority
   and `POST …/prompt`; the read route adds no new trust, but anything printed into a
   session is readable by every holder of the token.
+
+## Resume by id (#524)
+
+`POST /sessions {"resume": "<id>", "cwd"?: "..."}` makes an existing session live
+again, for example after a `tole serve` restart (the live map is in memory; the
+session's JSONL is what survives).
+
+- The id must be a valid session id and is only ever joined into the session directory
+  (`--sessions-dir`, else `<cwd>/.tole/sessions`); a client never supplies a path.
+  `cwd` defaults to the server workspace and goes through the same jail check as a new
+  session (`403` outside it). A session lives under the workspace it was created in, so
+  resuming it from another directory is a `404`.
+- Success: `200 {"sessionId", "workspace", "resumed": true, "alreadyLive": false}`; the
+  session keeps its history (read it with `GET …/entries`) and takes new prompts.
+- **Already live**: `200 {"sessionId", "resumed": false, "alreadyLive": true, "busy": <bool>}`.
+  Nothing is reopened or replaced, so a running turn is never disturbed; a client that
+  reconnects mid-turn gets its id back together with the `busy` flag.
+- `404` no such session in that directory; `400` bad id or a `resume` that is not a string;
+  `409` another process (a TUI, a second `tole serve`) holds the session's writer lock;
+  `503` at the live-session cap with every session busy.
+- Approvals: a resumed session queues non-preauthorized Writes exactly like a new one.
+  Nothing about resuming grants authority; the token is the same.
 
 ## Auth model
 

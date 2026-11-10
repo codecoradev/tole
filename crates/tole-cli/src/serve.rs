@@ -8,6 +8,8 @@
 //! - `GET  /sessions`              → list session ids + busy flags
 //! - `GET  /sessions/{id}`         → session status
 //! - `POST /sessions/{id}/prompt`  → run one turn (`{"text": "..."}`)
+//! - `POST /sessions` also takes `{"resume": "<id>"}` to reopen an existing
+//!   session (#524)
 //! - `GET  /sessions/{id}/entries?after=<seq>&limit=<n>` → one page of the
 //!   session log (#524; see `tole_cli::protocol`)
 //! - `POST /sessions/{id}/interrupt` → steer the running turn without
@@ -442,6 +444,113 @@ fn write_approval_audit(
         .map_err(|e| e.to_string())
 }
 
+/// Open (or reopen, `loading`) a serve session and admit it to the live map.
+/// Shared by create and resume so both get the same approver, jail and
+/// capacity rules. `Err` is the HTTP answer.
+fn open_serve_session(
+    state: &State,
+    session_id: &str,
+    cwd: &str,
+    loading: bool,
+) -> Result<(), (u16, serde_json::Value)> {
+    // Issue #200: non-preauthorized Writes queue for a remote
+    // decision (deny now, resumable; allow = one-shot replay).
+    // Queue-time storage path (cora MAJOR): an evicted session's
+    // audit fallback must reopen the EXACT durable file — with
+    // no --sessions-dir the log lives under the session's cwd.
+    let storage_dir = serve_storage_dir(state, cwd);
+    let approver = tole_cli::approvals::QueueApprover::new(
+        state.allow_patterns.clone(),
+        Arc::clone(&state.approvals),
+        session_id,
+        storage_dir.join(format!("{session_id}.jsonl")),
+    );
+    match open_session(
+        session_id,
+        cwd,
+        loading,
+        state.plan_mode,
+        approver,
+        state.memory.clone(),
+        state.sessions_dir.as_deref(),
+        state.turnend.clone(),
+        state.allow_patterns.clone(),
+        // No REST cancel endpoint today (#178): a never-fired
+        // token keeps serve behavior unchanged.
+        tole_core::cancel::CancelToken::default(),
+        // No plan UI on the REST face.
+        None,
+    ) {
+        Ok(session_state) => {
+            // Cap the live map (the registry's admission rule): a
+            // long-running daemon must not grow without bound
+            // (CodeCora scan-3). Eviction drops only the in-memory
+            // handle, never the file; busy sessions are never
+            // evicted, and all-busy at capacity is a 503.
+            if lock_sessions(&state.sessions)
+                .admit(session_id.to_string(), session_state)
+                .is_err()
+            {
+                return Err((503, json!({"error": "all sessions busy — at capacity"})));
+            }
+            Ok(())
+        }
+        // Another process (a TUI, a second serve) holds the writer lock.
+        Err(e) if e.contains("open for writing") => Err((409, json!({"error": e}))),
+        Err(e) => Err((500, json!({"error": e}))),
+    }
+}
+
+/// Where this serve process keeps the session files of `cwd`.
+fn serve_storage_dir(state: &State, cwd: &str) -> std::path::PathBuf {
+    match &state.sessions_dir {
+        Some(d) => d.clone(),
+        None => std::path::Path::new(cwd).join(".tole/sessions"),
+    }
+}
+
+/// `POST /sessions {"resume": "<id>"}` (#524): make an existing session live
+/// again. `cwd` has already passed the jail check, and the id is validated
+/// and only ever joined into the session directory (no client-supplied path),
+/// so a client cannot open a file outside the jail.
+///
+/// - an already-live session is returned as is (200, `alreadyLive`): nothing
+///   is reopened or replaced, so a busy turn is never disturbed, and a client
+///   that reconnects mid-turn gets its id back plus the `busy` flag;
+/// - no such file in that directory is a 404;
+/// - another process holding the session's writer lock is a 409.
+fn resume_session(state: &State, id: &str, cwd: &str) -> (u16, serde_json::Value) {
+    if tole_cli::session_host::validate_session_id(id).is_none() {
+        return (400, json!({"error": "invalid session id"}));
+    }
+    // Live first: the writer lock is held by this very process, so a second
+    // open of the same file would be refused as "locked".
+    {
+        let sessions = lock_sessions(&state.sessions);
+        if let Some(st) = sessions.get(id) {
+            let busy = *st.busy.lock().expect("busy lock");
+            return (
+                200,
+                json!({"sessionId": id, "resumed": false, "alreadyLive": true, "busy": busy}),
+            );
+        }
+    }
+    let file = serve_storage_dir(state, cwd).join(format!("{id}.jsonl"));
+    if !file.is_file() {
+        return (404, json!({"error": "unknown session"}));
+    }
+    if lock_sessions(&state.sessions).ensure_room().is_err() {
+        return (503, json!({"error": "all sessions busy — at capacity"}));
+    }
+    match open_serve_session(state, id, cwd, true) {
+        Ok(()) => (
+            200,
+            json!({"sessionId": id, "workspace": cwd, "resumed": true, "alreadyLive": false}),
+        ),
+        Err(resp) => resp,
+    }
+}
+
 fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_json::Value) {
     match (method, path) {
         ("GET", "/health") => (200, json!({"status": "ok"})),
@@ -477,6 +586,13 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                 Err(e) => return (403, json!({"error": e})),
             };
             let cwd = jailed.as_str();
+            // Resume-by-id (#524): reopen an existing session instead of
+            // creating one. Same jail, same capacity and approval rules.
+            match req.get("resume") {
+                None | Some(serde_json::Value::Null) => {}
+                Some(serde_json::Value::String(id)) => return resume_session(state, id, cwd),
+                Some(_) => return (400, json!({"error": "resume must be a session id string"})),
+            }
             // Capacity first: `open_session` creates the session file on
             // disk, so refusing AFTER it (503) would orphan that file. The
             // re-check at insert time below still guards a concurrent
@@ -485,52 +601,9 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                 return (503, json!({"error": "all sessions busy — at capacity"}));
             }
             let session_id = tole_cli::session_host::new_session_id("srv");
-            // Issue #200: non-preauthorized Writes queue for a remote
-            // decision (deny now, resumable; allow = one-shot replay).
-            // Queue-time storage path (cora MAJOR): an evicted session's
-            // audit fallback must reopen the EXACT durable file — with
-            // no --sessions-dir the log lives under the session's cwd.
-            let storage_dir: std::path::PathBuf = match &state.sessions_dir {
-                Some(d) => d.clone(),
-                None => std::path::Path::new(cwd).join(".tole/sessions"),
-            };
-            let approver = tole_cli::approvals::QueueApprover::new(
-                state.allow_patterns.clone(),
-                Arc::clone(&state.approvals),
-                &session_id,
-                storage_dir.join(format!("{session_id}.jsonl")),
-            );
-            match open_session(
-                &session_id,
-                cwd,
-                false,
-                state.plan_mode,
-                approver,
-                state.memory.clone(),
-                state.sessions_dir.as_deref(),
-                state.turnend.clone(),
-                state.allow_patterns.clone(),
-                // No REST cancel endpoint today (#178): a never-fired
-                // token keeps serve behavior unchanged.
-                tole_core::cancel::CancelToken::default(),
-                // No plan UI on the REST face.
-                None,
-            ) {
-                Ok(session_state) => {
-                    // Cap the live map (the registry's admission rule): a
-                    // long-running daemon must not grow without bound
-                    // (CodeCora scan-3). Eviction drops only the in-memory
-                    // handle, never the file; busy sessions are never
-                    // evicted, and all-busy at capacity is a 503.
-                    if lock_sessions(&state.sessions)
-                        .admit(session_id.clone(), session_state)
-                        .is_err()
-                    {
-                        return (503, json!({"error": "all sessions busy — at capacity"}));
-                    }
-                    (200, json!({"sessionId": session_id, "workspace": cwd}))
-                }
-                Err(e) => (500, json!({"error": e})),
+            match open_serve_session(state, &session_id, cwd, false) {
+                Ok(()) => (200, json!({"sessionId": session_id, "workspace": cwd})),
+                Err(resp) => resp,
             }
         }
         // Remote approvals (issue #200): list + decide.

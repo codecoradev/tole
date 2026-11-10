@@ -1,8 +1,10 @@
-//! #524 transcript read — end to end over the REAL serve face:
-//! `GET /sessions/{id}/entries` pages through exactly what the session's
-//! JSONL replays, needs the token, refuses bad queries, and keeps working
-//! while a turn is in flight (it reads the file, not the storage lock a
-//! running turn holds).
+//! #524 transcript read and resume-by-id — end to end over the REAL serve
+//! face. `GET /sessions/{id}/entries` pages through exactly what the
+//! session's JSONL replays, needs the token, refuses bad queries, and keeps
+//! working while a turn is in flight (it reads the file, not the storage
+//! lock a running turn holds). `POST /sessions {"resume": id}` makes a
+//! session live again after a restart, never disturbs a live one, and
+//! respects the jail and the writer lock.
 
 // Spawns the real `tole serve` binary (`shell-tools` feature, #349).
 #![cfg(feature = "shell-tools")]
@@ -19,6 +21,8 @@ struct Serve {
     child: Child,
     port: u16,
     dir: std::path::PathBuf,
+    /// Remove `dir` on drop (only the process that created it).
+    own_dir: bool,
 }
 
 impl Serve {
@@ -32,6 +36,12 @@ impl Serve {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
+        Self::spawn_in(base, dir, true)
+    }
+
+    /// A serve process over an existing workspace (a restart, or a second
+    /// process contending for the same session files).
+    fn spawn_in(base: &str, dir: std::path::PathBuf, own_dir: bool) -> Self {
         let (child, port) = common::spawn_listening(|port| {
             let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
             cmd.args(["serve", "--port", &port.to_string(), "--token", "t0ken"])
@@ -44,7 +54,18 @@ impl Serve {
                 .stdout(Stdio::null());
             cmd
         });
-        Self { child, port, dir }
+        Self {
+            child,
+            port,
+            dir,
+            own_dir,
+        }
+    }
+
+    /// Stop the process (its writer locks are released by the OS).
+    fn kill(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 
     fn http_with(&self, method: &str, path: &str, auth: bool, body: Option<&str>) -> (u16, Value) {
@@ -98,9 +119,10 @@ impl Serve {
 
 impl Drop for Serve {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.dir);
+        self.kill();
+        if self.own_dir {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
     }
 }
 
@@ -304,4 +326,133 @@ fn the_transcript_is_readable_while_a_turn_is_running() {
     assert!(texts.iter().any(|t| t == "before"), "{texts:?}");
     let reply = turn.join().unwrap();
     assert!(reply.contains("200"), "{reply}");
+}
+
+fn entry_count(serve: &Serve, id: &str) -> usize {
+    let (code, page) = serve.http("GET", &format!("/sessions/{id}/entries?limit=500"), None);
+    assert_eq!(code, 200, "{page}");
+    page["entries"].as_array().unwrap().len()
+}
+
+/// A session is not live after a restart; resume-by-id brings it back with
+/// its history, and a new turn extends the same log.
+#[test]
+fn resume_brings_a_session_back_after_a_restart() {
+    let base = spawn_mock(0);
+    let mut first = Serve::spawn(&base);
+    let id = new_session(&first);
+    prompt(&first, &id, "before the restart");
+    let before = entry_count(&first, &id);
+    assert!(before >= 2);
+    first.kill();
+
+    let second = Serve::spawn_in(&base, first.dir.clone(), false);
+    // Not live yet: the transcript route has nothing to read it from.
+    assert_eq!(
+        second
+            .http("GET", &format!("/sessions/{id}/entries"), None)
+            .0,
+        404
+    );
+    let (code, body) = second.http(
+        "POST",
+        "/sessions",
+        Some(&json!({"resume": id}).to_string()),
+    );
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(body["sessionId"], id);
+    assert_eq!(body["resumed"], true);
+    assert_eq!(body["alreadyLive"], false);
+    assert_eq!(entry_count(&second, &id), before, "history is intact");
+
+    // It is a working session again: a new turn appends to the same log.
+    prompt(&second, &id, "after the restart");
+    assert!(entry_count(&second, &id) > before);
+    let (_, list) = second.http("GET", "/sessions", None);
+    assert_eq!(list["sessions"].as_array().unwrap().len(), 1);
+}
+
+/// Resuming a live session changes nothing: it is not reopened (the lock
+/// is held by this very process) and a running turn is not disturbed.
+#[test]
+fn resuming_a_live_session_is_a_no_op_even_mid_turn() {
+    let serve = Serve::spawn(&spawn_mock(2500));
+    let id = new_session(&serve);
+    let resume = json!({"resume": id}).to_string();
+
+    let (code, body) = serve.http("POST", "/sessions", Some(&resume));
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(
+        (body["resumed"].clone(), body["alreadyLive"].clone()),
+        (json!(false), json!(true))
+    );
+    assert_eq!(body["busy"], false);
+
+    let port = serve.port;
+    let id2 = id.clone();
+    let turn = std::thread::spawn(move || {
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+        let body = json!({"text": "slow please"}).to_string();
+        write!(
+            s,
+            "POST /sessions/{id2}/prompt HTTP/1.1\r\nAuthorization: Bearer t0ken\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        let mut out = String::new();
+        let _ = s.read_to_string(&mut out);
+        out
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while serve.http("GET", "/sessions", None).1["sessions"][0]["busy"] != json!(true) {
+        assert!(Instant::now() < deadline, "turn never became busy");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let (code, body) = serve.http("POST", "/sessions", Some(&resume));
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(
+        (body["alreadyLive"].clone(), body["busy"].clone()),
+        (json!(true), json!(true))
+    );
+    // The turn still finishes normally.
+    assert!(turn.join().unwrap().contains("ENTRIES-ANSWER"));
+}
+
+#[test]
+fn resume_refuses_bad_ids_unknown_sessions_other_dirs_and_a_held_lock() {
+    let base = spawn_mock(0);
+    let mut first = Serve::spawn(&base);
+    let id = new_session(&first);
+    prompt(&first, &id, "hi");
+    let post = |s: &Serve, v: Value| s.http("POST", "/sessions", Some(&v.to_string()));
+
+    // Malformed / unknown / wrong type.
+    assert_eq!(post(&first, json!({"resume": "../etc/passwd"})).0, 400);
+    assert_eq!(post(&first, json!({"resume": ""})).0, 400);
+    assert_eq!(post(&first, json!({"resume": 7})).0, 400);
+    assert_eq!(post(&first, json!({"resume": "srv-nope"})).0, 404);
+    // The jail still applies: a cwd outside the workspace is refused even
+    // when the id is valid.
+    assert_eq!(post(&first, json!({"resume": id, "cwd": "/"})).0, 403);
+    // A second serve process over the same workspace while the first still
+    // holds the session's writer lock: refused, nothing opened.
+    let second = Serve::spawn_in(&base, first.dir.clone(), false);
+    let (code, body) = post(&second, json!({"resume": id}));
+    assert_eq!(code, 409, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("open for writing"),
+        "{body}"
+    );
+    let (_, list) = second.http("GET", "/sessions", None);
+    assert_eq!(list["sessions"].as_array().unwrap().len(), 0);
+    // Once the holder is gone the same call succeeds.
+    first.kill();
+    // A session lives under ITS workspace: another (jailed) directory has no
+    // such file, so a session that is not live is unknown there.
+    std::fs::create_dir_all(first.dir.join("sub")).unwrap();
+    let sub = first.dir.join("sub").to_string_lossy().into_owned();
+    assert_eq!(post(&second, json!({"resume": id, "cwd": sub})).0, 404);
+
+    assert_eq!(post(&second, json!({"resume": id})).0, 200);
 }
