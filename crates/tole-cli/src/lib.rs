@@ -11,6 +11,7 @@ pub mod config_apply;
 pub mod config_trust;
 pub mod doctor;
 pub mod ecosystem;
+pub mod events;
 pub mod handoff;
 pub mod protocol;
 pub mod provider_chain;

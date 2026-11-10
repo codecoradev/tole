@@ -23,6 +23,7 @@ rate-limited per source IP).
 | Cancel a turn | `POST /sessions/{id}/cancel` (#178) | the turn settles `cancelled`, durably |
 | Steer a turn | `POST /sessions/{id}/interrupt` `{text, urgent?}` (#377) | `202` queued; delivered at the turn's next safe point (after the running tool, before the next model call) as an attributed user-role entry, nothing is lost. `urgent` also withdraws a tool call that has not started. `409` when no turn is running, `400` for blank/oversized text or a full queue (16 pending) |
 | Detach a turn | `POST /sessions/{id}/detach` (#217) | `202`; the running tool settles, the turn ends `detached` (resumable) and background jobs keep running, nudging the session when they finish. `409` when no turn is running |
+| Live events | `GET /sessions/{id}/events?after=<seq>` (#524) | Server-Sent Events, see [Event stream](#event-stream-524); replays the log from a `seq`, then follows it |
 | Resume a session | `POST /sessions` `{"resume": "<id>"}` (#524) | reopen an existing session, see [Resume by id](#resume-by-id-524) |
 | Read the transcript | `GET /sessions/{id}/entries?after=<seq>&limit=<n>` (#524) | one page of the session's log, see [Transcript read](#transcript-read-524); works while a turn runs |
 | Cost report | `GET /sessions/{id}/status` | the `mission` register: turns, steps, tokens, wall time, per-risk-tier tool calls |
@@ -109,6 +110,51 @@ session's JSONL is what survives).
   `503` at the live-session cap with every session busy.
 - Approvals: a resumed session queues non-preauthorized Writes exactly like a new one.
   Nothing about resuming grants authority; the token is the same.
+
+## Event stream (#524)
+
+`GET /sessions/{id}/events?after=<seq>` is a Server-Sent Events stream (`text/event-stream`,
+same bearer token). `curl -N -H "Authorization: Bearer $TOKEN" …/events` shows it.
+
+Two kinds of frames, deliberately separate:
+
+| Kind | `event:` | `id:` | Replayable | Data |
+|---|---|---|---|---|
+| **Durable** | `entry` | the entry's `seq` | yes | the log entry exactly as `GET …/entries` returns it |
+| Marker | `ready` | none | no | `{id, after, lastSeq, busy}`, sent once the replay is complete |
+| Ephemeral | `text_delta`, `reasoning` | none | no | `{text}` |
+| Ephemeral | `tool_started` | none | no | `{tool, input}` |
+| Ephemeral | `tool_finished` | none | no | `{tool, ok, preview}` |
+| Ephemeral | `approval_requested`, `approval_resolved` | none | no | the `GET /approvals` row (`id`, `tool`, `status`, …) |
+| Ephemeral | `resync` | none | no | `{dropped}`: this client was too slow and `dropped` frames were skipped |
+| Ephemeral | `closed` | none | no | `{id}`: the session left the live map; the stream ends |
+
+- **Lossless replay.** The durable frames come from the append-only log, so a client that
+  reconnects with `?after=<last seq seen>` (or the `Last-Event-ID` header, which `EventSource`
+  sends by itself; an explicit `after` wins) receives exactly the entries it missed, once each,
+  in order, then `ready`. No `after` means from the start of the log. Ephemeral frames carry no
+  `id`, so a reconnect can never skip a real entry.
+- **Ephemeral frames are best-effort.** Streamed text, reasoning and tool start/finish are
+  never stored, so they are not replayed; the final answer is always an `entry`. A slow client
+  loses ephemeral frames (never the turn: the server's per-stream queue is bounded and never
+  blocks) and gets a `resync` marker. A decision (`approval_resolved`) is announced before the
+  durable entries it causes.
+- **When text deltas and tool events appear.** Only for a turn that starts while a stream is
+  open on that session (with no stream open a turn runs exactly as it did before streams
+  existed). A stream opened mid-turn gets the durable entries but no deltas for that turn. The
+  turn that resumes after an approval `allow` has no live observer either: its entries arrive
+  as durable frames.
+- **Limits.** At most 8 streams are open per server (the 9th gets `429`); streams count within
+  the server's overall connection cap but cannot starve `/approvals` and `/prompt`. A comment
+  heartbeat (`: ping`) goes out after 15 s of silence and ends a stream whose peer is gone.
+  `401` without the token, `404` for a session that is not live (resume it first), `400` for a
+  bad `after`.
+- **Cost.** Following the log is one `stat` per poll (about every 150 ms) while nothing
+  changes, and a read-only replay of the session file when it did, so a very large session
+  costs more per change.
+- **Browsers.** `EventSource` cannot send an `Authorization` header: a web client reads the
+  stream with `fetch` and its own SSE parser (or the token has to be passed another way, a
+  decision left to the web client, #529).
 
 ## Auth model
 

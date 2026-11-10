@@ -336,6 +336,20 @@ writes a durable audit register naming the approval id, tool, and
 verdict. The phone/CLI holder is therefore a full approver: treat the
 token as approval authority and scope it accordingly.
 
+### Event streams (#524)
+
+`GET /sessions/{id}/events` is read-only and behind the same bearer token and per-IP auth
+limiter as every route; it adds no authority. What it adds is **long-lived connections**: each
+open stream pins a connection thread, so streams are capped at 8 per server (the 9th is `429`)
+and count within the 32-connection cap, which keeps `/approvals` and `/prompt` reachable while
+streams are open. A stuck client cannot stall a turn: ephemeral frames go through a bounded,
+non-blocking per-stream queue (a full queue drops frames and reports `resync`), and writes carry
+the existing 30 s write timeout. What flows is what the token holder could already read:
+durable frames are the log's entries (the same as `GET …/entries`), and ephemeral frames carry
+streamed model text, tool inputs and previews, and the pending-approval rows `GET /approvals`
+returns. Approvals are still decided only through `POST /approvals/{id}/decision`; the stream
+only reports them, and nothing about it can approve, deny or run a tool.
+
 ### Phone as approval surface (#202)
 
 uteke-mobile consumes the #200 queue: the phone becomes a remote

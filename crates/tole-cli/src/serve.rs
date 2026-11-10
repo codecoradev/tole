@@ -10,6 +10,9 @@
 //! - `POST /sessions/{id}/prompt`  → run one turn (`{"text": "..."}`)
 //! - `POST /sessions` also takes `{"resume": "<id>"}` to reopen an existing
 //!   session (#524)
+//! - `GET  /sessions/{id}/events?after=<seq>` → Server-Sent Events: durable
+//!   `entry` frames replayed from a `seq`, ephemeral text/tool/approval
+//!   frames (#524; see `tole_cli::events`)
 //! - `GET  /sessions/{id}/entries?after=<seq>&limit=<n>` → one page of the
 //!   session log (#524; see `tole_cli::protocol`)
 //! - `POST /sessions/{id}/interrupt` → steer the running turn without
@@ -73,6 +76,10 @@ struct State {
     sessions_dir: Option<std::path::PathBuf>,
     turnend: Vec<String>,
     live_connections: std::sync::atomic::AtomicUsize,
+    /// Per-session ephemeral event buses for `GET /sessions/{id}/events`.
+    buses: tole_cli::events::BusRegistry,
+    /// Caps open event streams apart from (and within) the connection cap.
+    streams: Arc<tole_cli::events::StreamLimiter>,
     /// Per-source-IP failed-auth limiter (brute-force hardening), shared
     /// logic with the MCP transport.
     auth_failures: tole_cli::auth::AuthLimiter,
@@ -106,6 +113,8 @@ pub fn run_serve(cfg: ServeConfig) -> Result<()> {
         sessions_dir: cfg.sessions_dir.clone(),
         turnend: cfg.turnend.clone(),
         live_connections: std::sync::atomic::AtomicUsize::new(0),
+        buses: tole_cli::events::BusRegistry::default(),
+        streams: tole_cli::events::StreamLimiter::new(tole_cli::events::MAX_STREAMS),
         auth_failures: tole_cli::auth::AuthLimiter::new(),
     });
     eprintln!(
@@ -156,6 +165,9 @@ struct Request {
     method: String,
     path: String,
     authorization: Option<String>,
+    /// `Last-Event-ID`: where an SSE client left off (`EventSource` sends it
+    /// on reconnect).
+    last_event_id: Option<String>,
     body: String,
 }
 
@@ -221,6 +233,7 @@ fn read_request(stream: &TcpStream) -> Result<Request, ReadError> {
         .ok_or(ReadError::Bad("malformed request line"))?;
     let (method, path) = (method.to_string(), path.to_string());
     let mut authorization = None;
+    let mut last_event_id = None;
     let mut content_length: Option<usize> = None;
     let mut expect_continue = false;
     // The request line counts against the same ceiling as the headers:
@@ -270,6 +283,8 @@ fn read_request(stream: &TcpStream) -> Result<Request, ReadError> {
             return Err(ReadError::Bad("Transfer-Encoding is not supported"));
         } else if name.eq_ignore_ascii_case("authorization") {
             authorization = Some(value.to_string());
+        } else if name.eq_ignore_ascii_case("last-event-id") {
+            last_event_id = Some(value.to_string());
         } else if name.eq_ignore_ascii_case("expect") && value.eq_ignore_ascii_case("100-continue")
         {
             expect_continue = true;
@@ -294,6 +309,7 @@ fn read_request(stream: &TcpStream) -> Result<Request, ReadError> {
         method,
         path,
         authorization,
+        last_event_id,
         body: String::from_utf8_lossy(&body).to_string(),
     })
 }
@@ -384,8 +400,186 @@ fn handle_conn(mut stream: TcpStream, state: Arc<State>) {
         return;
     }
 
+    // The event stream owns its connection for as long as it is open, so it
+    // is served here rather than through `route` (which returns one JSON
+    // body).
+    if req.method == "GET" {
+        if let Some((id, query)) = events_target(&req.path) {
+            serve_events(stream, &state, id, query, req.last_event_id.as_deref());
+            return;
+        }
+    }
+
     let (status, payload) = route(&state, &req.method, &req.path, &req.body);
     respond(&mut stream, status, &payload);
+}
+
+/// `/sessions/{id}/events[?query]` -> `(id, query)`.
+fn events_target(path: &str) -> Option<(&str, &str)> {
+    let (path, query) = path.split_once('?').unwrap_or((path, ""));
+    let id = path.strip_prefix("/sessions/")?.strip_suffix("/events")?;
+    (!id.is_empty() && !id.contains('/')).then_some((id, query))
+}
+
+fn write_all(stream: &mut TcpStream, text: &str) -> bool {
+    stream
+        .write_all(text.as_bytes())
+        .and_then(|()| stream.flush())
+        .is_ok()
+}
+
+/// `GET /sessions/{id}/events?after=<seq>` (#524): Server-Sent Events.
+///
+/// Durable `entry` frames replay from `after` (or `Last-Event-ID`) and then
+/// follow the log; ephemeral frames (`text_delta`, `reasoning`,
+/// `tool_started`, `tool_finished`, `approval_*`) are best-effort and not
+/// replayable. See `tole_cli::events` for the model. The stream ends when
+/// the client goes away (a write fails, or the heartbeat finds it dead) or
+/// the session leaves the live map (`closed`).
+fn serve_events(
+    mut stream: TcpStream,
+    state: &Arc<State>,
+    id: &str,
+    query: &str,
+    last_event_id: Option<&str>,
+) {
+    use tole_cli::events::{
+        entry_frame, frame, ApprovalWatch, EntryTail, HEARTBEAT, HEARTBEAT_SECS,
+    };
+    let param = |name: &str| {
+        query
+            .split('&')
+            .find_map(|kv| kv.strip_prefix(name).and_then(|v| v.strip_prefix('=')))
+    };
+    // An explicit `after` wins over the header; both are a `seq`.
+    let after = match param("after") {
+        Some(a) => match a.parse::<u64>() {
+            Ok(n) => n,
+            Err(_) => {
+                respond(
+                    &mut stream,
+                    400,
+                    &json!({"error": "after must be a non-negative integer"}),
+                );
+                return;
+            }
+        },
+        None => last_event_id
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0),
+    };
+    let path = {
+        let sessions = lock_sessions(&state.sessions);
+        sessions.get(id).map(|st| st.path.clone())
+    };
+    let Some(path) = path else {
+        respond(&mut stream, 404, &json!({"error": "unknown session"}));
+        return;
+    };
+    let Some(_slot) = state.streams.try_acquire() else {
+        respond(
+            &mut stream,
+            429,
+            &json!({"error": "too many open event streams"}),
+        );
+        return;
+    };
+    // Subscribe BEFORE replaying so no ephemeral frame falls in the gap.
+    let sub = state.buses.subscribe(id);
+    let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nX-Accel-Buffering: no\r\nConnection: close\r\n\r\n";
+    if !write_all(&mut stream, head) {
+        return;
+    }
+
+    let live_busy = |state: &State| -> Option<bool> {
+        let sessions = lock_sessions(&state.sessions);
+        sessions
+            .get(id)
+            .map(|st| *st.busy.lock().expect("busy lock"))
+    };
+    let mut tail = EntryTail::new(path, after);
+    let mut approvals = ApprovalWatch::default();
+    let mut ready_sent = false;
+    let mut last_write = Instant::now();
+    // Approval state changes go out BEFORE the durable entries of the same
+    // pass, so a decision is announced ahead of the effects it caused.
+    let send_approvals = |stream: &mut TcpStream, approvals: &mut ApprovalWatch| -> bool {
+        approvals
+            .poll(&state.approvals.list(Some(id)))
+            .into_iter()
+            .all(|(name, data)| write_all(stream, &frame(name, None, &data)))
+    };
+    loop {
+        if ready_sent {
+            if !send_approvals(&mut stream, &mut approvals) {
+                return;
+            }
+            last_write = Instant::now();
+        }
+        // Durable frames (a transient read error just retries).
+        if let Ok(entries) = tail.poll() {
+            for e in entries {
+                if !write_all(&mut stream, &entry_frame(&e)) {
+                    return;
+                }
+                last_write = Instant::now();
+            }
+        }
+        if !ready_sent {
+            ready_sent = true;
+            let ready = frame(
+                "ready",
+                None,
+                &json!({"id": id, "after": after, "lastSeq": tail.last_seq(),
+                        "busy": live_busy(state).unwrap_or(false)}),
+            );
+            // The replay is complete; then what is pending right now.
+            if !write_all(&mut stream, &ready) || !send_approvals(&mut stream, &mut approvals) {
+                return;
+            }
+            last_write = Instant::now();
+        }
+        let dropped = sub.take_dropped();
+        if dropped > 0
+            && !write_all(
+                &mut stream,
+                &frame("resync", None, &json!({"dropped": dropped})),
+            )
+        {
+            return;
+        }
+        // Ephemeral frames: wait briefly for one (this is also the poll
+        // interval for the durable tail), then drain what queued up.
+        match sub.rx.recv_timeout(Duration::from_millis(150)) {
+            Ok(first) => {
+                let mut next = Some(first);
+                while let Some(e) = next {
+                    if !write_all(&mut stream, &e.to_frame()) {
+                        return;
+                    }
+                    last_write = Instant::now();
+                    next = sub.rx.try_recv().ok();
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+        }
+        if live_busy(state).is_none() {
+            // Evicted from the live map: say so and end cleanly. Entries
+            // written before the end have been sent (one last poll above).
+            let _ = tail
+                .poll()
+                .map(|rest| rest.iter().all(|e| write_all(&mut stream, &entry_frame(e))));
+            let _ = write_all(&mut stream, &frame("closed", None, &json!({"id": id})));
+            return;
+        }
+        if last_write.elapsed() >= Duration::from_secs(HEARTBEAT_SECS) {
+            if !write_all(&mut stream, HEARTBEAT) {
+                return;
+            }
+            last_write = Instant::now();
+        }
+    }
 }
 
 /// Write the decision audit register onto the session's durable log:
@@ -772,7 +966,11 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                     let Some(text) = req.get("text").and_then(|v| v.as_str()) else {
                         return (400, json!({"error": "missing text"}));
                     };
-                    match run_session_turn(Arc::clone(&state.sessions), id, text, None) {
+                    // An observer (text deltas, tool events) only while an event
+                    // stream is open on this session: with nobody watching the
+                    // turn runs exactly as before streams existed.
+                    let observer = state.buses.observer_for(id);
+                    match run_session_turn(Arc::clone(&state.sessions), id, text, observer) {
                         Ok((stop, Some(final_text))) => {
                             (200, json!({"stopReason": stop, "text": final_text}))
                         }
@@ -882,6 +1080,8 @@ mod tests {
             sessions_dir: Some(sessions_dir),
             turnend: vec![],
             live_connections: std::sync::atomic::AtomicUsize::new(0),
+            buses: tole_cli::events::BusRegistry::default(),
+            streams: tole_cli::events::StreamLimiter::new(tole_cli::events::MAX_STREAMS),
             auth_failures: tole_cli::auth::AuthLimiter::new(),
         }
     }
