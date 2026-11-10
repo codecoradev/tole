@@ -41,6 +41,21 @@ tole is the agent harness of the CodeCora ecosystem — the hands:
   prompt names cora's agent-as-reviewer flow — the model passes a diff to
   `mcp_cora_cora_review_prepare`, judges it itself (no LLM key in cora), then
   calls `mcp_cora_cora_review_finalize` with the same diff and its findings.
+  **Review gate before commit** (#534, cora ≥ 0.20.0): while both review tools
+  are attached, a `git commit` is refused until the STAGED diff has a
+  validated review. tole records and hashes nothing itself: cora's own commit
+  gate does (`mcp_cora_cora_review_finalize` leaves a marker bound to the
+  exact change set; `cora hook verify` answers 0 validated / 10 blocking / 11
+  not validated), and tole asks it before the commit runs. It covers the `git`
+  tool and `run_command` / `job_start` running `git commit` (a `git -C <dir>
+  commit` is checked in `<dir>`; one that redirects git's git dir or work tree,
+  such as `--git-dir`, `GIT_DIR=` or `-c core.worktree=`, cannot be checked and
+  is refused under `block`); `TOLE_REVIEW_GATE=warn`
+  lets the commit through with a note, `off` (or `--review-gate off`) never
+  gates, and with no review tools attached (`--no-auto-mcp`, no cora) there is
+  no gate. A cora too old for `hook verify` fails open with one warning;
+  `tole doctor` reports the state. It is a guardrail for a cooperating agent,
+  not a security boundary: see the threat model for what it does not see.
   `--trust internal` allows the `mcp_cora_*` tools without prompting. The
   guidance is in the pinned prompt of `run`, `chat`, the TUI and `mission`
   (#536). `serve`, `acp` and `mcp` sessions serve their own registry and attach
@@ -181,6 +196,7 @@ Not a sandbox: review what it wrote before you run it), `--skill <path>` (load a
 | `TOLE_SKILL` | skill files to preload (`SKILL.md` paths, separated like `PATH`); same as repeated `--skill`, which replaces it; refused by the server faces like `--skill` |
 | `TOLE_MEMORY` | memory loop backend (`uteke`) — same as `--memory uteke` |
 | `TOLE_NO_UPDATE_CHECK` | `1` disables the startup update-check banner (issue #220) |
+| `TOLE_REVIEW_GATE` | `off` / `warn` / `block` (default): what a `git commit` does while the cora review tools are attached and its staged diff has no validated review (#534); `--review-gate` sets it and wins; anything else fails startup. Not a config key yet, so a cloned project's config cannot weaken it |
 | `TOLE_VERBOSE` | `1` prints the startup probe misses (uteke / cora binary not found, no GitHub origin), which are silent by default; `tole doctor` reports the sibling binaries either way |
 | `TOLE_MEMORY_NAMESPACE` | override the loop's uteke room (default: `repo-<directory name>`; the name predates rooms) |
 
@@ -349,7 +365,7 @@ hard error.
 |------|------|-------|
 | `read_file`, `write_file`, `edit_file` | RO / Write | jailed to `--workspace` (TOCTOU-safe, symlink-refusing); `read_file` returns at most 20,000 chars per call (`offset`/`limit` in chars, `next_offset` to continue) |
 | `delete_file` | Destructive | always prompts; never allowlistable, even with `--yes` |
-| `git` | Write | `status` / `diff` / `add` / `commit` only — **push stays human** |
+| `git` | Write | `status` / `diff` / `add` / `commit` only — **push stays human**; while the cora review tools are attached, `commit` needs a reviewed staged diff (see the review gate under [Ecosystem position](#ecosystem-position), #534) |
 | `gh` | Write | read-only ops, argv-validated per op; `repo` defaults to the checkout's GitHub remote, optional per-call override (validated) |
 | `run_command` | Write | argv-split (no shell), cwd-jailed, timeout + output cap |
 | `verify_package` | RO | crates.io / npm registry check before any install — hallucinated names get NOT FOUND + candidates, edit-distance-1 candidates get a typo-squat warning |

@@ -13,6 +13,8 @@ pub mod doctor;
 pub mod ecosystem;
 pub mod handoff;
 pub mod provider_chain;
+#[cfg(feature = "shell-tools")]
+pub mod review_gate;
 pub mod session_host;
 pub mod session_index;
 pub mod session_tools;
