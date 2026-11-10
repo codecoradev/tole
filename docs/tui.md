@@ -149,6 +149,14 @@ Wide characters wrap by character count, not cell width.
   provider- and network-adjacent host types.
 - Approvals: `tole_tui::approval_channel()` gives the host a `Prompter`; the
   CLI wraps it as a `PromptFn` inside the regular `InteractiveApprover`.
+- **Input seam (#526):** the app logic does not see terminal key types.
+  `App::on_input(Input)` takes a UI-neutral `Input` (`Key` plus ctrl/alt/shift);
+  the crossterm adapter (`term_input`: `input_from`, and `App::on_key` as the
+  terminal entry point) maps key events onto it and drops key releases. Every
+  key the logic does not distinguish is `Key::Other`: it still counts as a key
+  press (it disarms a pending `Ctrl+C`) but triggers nothing. The key table above
+  is the behavior contract for both entry points, so a second front end (a GPUI
+  desktop, a remote client) feeds the same state machine with `Input`s.
 - Terminal state (raw mode, keyboard enhancement) is restored by a drop
   guard, so it is also restored on panic. SIGINT is just a `Ctrl+C` key event
   in raw mode.
