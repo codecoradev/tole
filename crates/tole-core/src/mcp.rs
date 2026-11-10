@@ -200,9 +200,19 @@ fn validate_http_url(url: &str) -> Result<(), String> {
     {
         return Err("url must not contain whitespace, control characters or backslashes".into());
     }
+    // The parser the HTTP client uses has the last word: a port above 65535,
+    // `1.2.3.4.5`, an encoded host and the like pass the checks below but
+    // would be refused (or worse) at connect time. Its error text never
+    // echoes the url.
+    url::Url::parse(url).map_err(|e| format!("not a valid url: {e}"))?;
     let authority = url_authority(url).unwrap_or_default();
     if authority.is_empty() {
         return Err("url has no host".into());
+    }
+    if authority.contains('%') {
+        // The parser decodes an encoded host, so the host contacted would not
+        // be the one that was written (and validated) here.
+        return Err("percent-encoded hosts are refused".into());
     }
     if authority.contains('@') {
         return Err(
@@ -298,6 +308,22 @@ fn scrub_err(cfg: &McpServerConfig, mut msg: String) -> String {
             .unwrap_or_default();
         let path_query = after_authority.split('#').next().unwrap_or_default();
         let without_fragment = url.split('#').next().unwrap_or(url);
+        // What the client really echoes is the parsed, normalized url: scrub
+        // those exact forms too (decoded host, elided port, dropped fragment).
+        if let Ok(parsed) = url::Url::parse(url) {
+            msg = replace_ci(&msg, parsed.as_str(), "<url>");
+            msg = replace_ci(&msg, parsed.as_str().trim_end_matches('/'), "<url>");
+            let mut tail = parsed.path().to_string();
+            if let Some(q) = parsed.query() {
+                tail = format!("{tail}?{q}");
+            }
+            if tail.len() > 1 {
+                msg = replace_ci(&msg, &tail, "<path>");
+            }
+            if let Some(host) = parsed.host_str() {
+                msg = replace_ci(&msg, host, "<host>");
+            }
+        }
         msg = replace_ci(&msg, url, "<url>");
         msg = replace_ci(&msg, without_fragment, "<url>");
         msg = replace_ci(&msg, url.trim_end_matches('/'), "<url>");
@@ -680,12 +706,7 @@ async fn start_server(
             validate_http_url(url).map_err(|e| format!("mcp {:?}: {e}", cfg.name))?;
             // Re-read at every (re)connect, so a rotated token is picked up
             // without restarting tole.
-            let mut tcfg = rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(
-                url.as_str(),
-            );
-            if let Some(token) = mcp_token(&cfg.name) {
-                tcfg = tcfg.auth_header(token);
-            }
+            let token = mcp_token(&cfg.name);
             ensure_tls_provider();
             // rmcp builds its default reqwest client with `.expect(..)`, which
             // can panic (for example when no TLS roots can be loaded). A panic
@@ -693,6 +714,13 @@ async fn start_server(
             // server of the process, stdio ones included, so degrade to an
             // ordinary startup warning instead.
             let transport = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut tcfg =
+                    rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(
+                        url.as_str(),
+                    );
+                if let Some(token) = token {
+                    tcfg = tcfg.auth_header(token);
+                }
                 rmcp::transport::StreamableHttpClientTransport::from_config(tcfg)
             }))
             .map_err(|_| {
@@ -1287,6 +1315,29 @@ mod scrub_tests {
         let stdio = McpServerConfig::parse("fs=npx x").unwrap();
         let msg = "mcp \"fs\": handshake failed: example.com".to_string();
         assert_eq!(scrub_err(&stdio, msg.clone()), msg);
+    }
+
+    /// The parser rewrites more than case and ports: an IDNA host becomes
+    /// punycode, a dotted-decimal-with-leading-zeros host an address. The echo
+    /// carries the rewritten form, which only the parsed url knows.
+    #[test]
+    fn scrubs_hosts_the_parser_rewrites() {
+        let cfg = http("scrub-e", "https://M\u{fc}nchen.example/mcp");
+        let out = scrub_err(&cfg, "failed to lookup xn--mnchen-3ya.example".into());
+        assert!(!out.contains("xn--mnchen-3ya"), "{out}");
+
+        let cfg = http(
+            "scrub-f",
+            "https://a.example/mcp?q=a b".replace(' ', "%20").as_str(),
+        );
+        let out = scrub_err(&cfg, "error for url (https://a.example/mcp?q=a%20b)".into());
+        assert!(!out.contains("a%20b"), "{out}");
+    }
+
+    #[test]
+    fn percent_encoded_hosts_are_refused() {
+        assert!(McpServerConfig::parse("a=https://ex%41mple.com/mcp").is_err());
+        assert!(McpServerConfig::parse("a=http://%6c%6f%63alhost/mcp").is_err());
     }
 
     #[test]

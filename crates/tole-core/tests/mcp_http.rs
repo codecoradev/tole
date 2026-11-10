@@ -353,3 +353,38 @@ fn connection_error_hides_the_normalized_url_the_client_echoes() {
         assert!(!lower.contains(secret), "error leaks {secret:?}: {err}");
     }
 }
+
+#[test]
+fn an_unparseable_url_built_without_parse_is_an_error_and_the_reactor_survives() {
+    env();
+    // `McpTransport` is public, so a config can skip `parse`. The url is
+    // validated again at connect time and must yield an error, never a panic
+    // on the shared reactor thread (which every MCP server of the process uses).
+    for (i, bad) in [
+        "https://example.com:99999/mcp",
+        "https://1.2.3.4.5/mcp",
+        "https://ex%41mple.com/mcp",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let name = format!("httpbad{i}");
+        let c = McpServerConfig {
+            name: name.clone(),
+            transport: tole_core::mcp::McpTransport::Http {
+                url: (*bad).to_string(),
+            },
+        };
+        probe_server_extras(&c);
+        let err = get_server_prompt(&name, "p", Default::default()).unwrap_err();
+        assert!(
+            !err.contains("handshake failed"),
+            "{bad} must be refused before any connection: {err}"
+        );
+    }
+    // The reactor still serves a healthy server afterwards.
+    let fake = start(Behavior::default());
+    let mut reg = registry();
+    let names = register_server_tools(&mut reg, &cfg("httpb", &fake));
+    assert_eq!(names, vec!["mcp_httpb_echo".to_string()]);
+}

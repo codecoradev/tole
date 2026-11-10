@@ -374,8 +374,9 @@ they trust. What the transport adds:
   must not surface as `example.com`).
 - **Transport safety.** `https` is required; plain `http` only for
   `localhost`, `127.0.0.0/8` and `::1` (lookalikes such as
-  `127.0.0.1.evil.com` are refused). A url with embedded credentials, whitespace
-  or a backslash is refused (parsers read `\` as `/`, so the host that was
+  `127.0.0.1.evil.com` are refused). A url the client's own parser (the `url`
+  crate) refuses, one with embedded credentials, whitespace, a percent-encoded
+  host or a backslash is refused (parsers read `\` as `/`, so the host that was
   validated could differ from the host contacted). A redirect to another origin is not followed (rmcp's same-origin
   redirect policy), so a server cannot bounce the token to a third host. The
   url is re-validated at connect time because the config type is public.

@@ -109,3 +109,18 @@ fn mcp_tool_is_always_write_risk() {
     );
     assert_eq!(t.risk(), Risk::Write, "MCP tools must never be ReadOnly");
 }
+
+#[test]
+fn http_specs_the_url_parser_refuses_are_config_errors() {
+    // Each of these passes a hand-rolled host/port check but not the url
+    // parser the HTTP client uses (port above 65535, a numeric last label
+    // that is not an IPv4 address, an encoded host).
+    for bad in [
+        "a=https://example.com:99999/mcp",
+        "a=https://1.2.3.4.5/mcp",
+        "a=https://ex%41mple.com/mcp",
+        "a=https://exa mple.com/mcp",
+    ] {
+        assert!(McpServerConfig::parse(bad).is_err(), "{bad}");
+    }
+}
