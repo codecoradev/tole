@@ -9,10 +9,9 @@ use tole_core::approval::{ToolRequest, Verdict};
 use tole_core::cancel::CancelToken;
 use tole_core::openai::OpenAiConfig;
 use tole_core::register::RegisterWrite;
-use tole_core::state::Pc;
 use tole_core::storage::{is_valid_session_id, Commit, JsonlStorage, Storage};
 use tole_core::tool::{Risk, ToolRegistry};
-use tole_core::turn::{self, TurnObserver, TurnOutcome};
+use tole_core::turn::{TurnObserver, TurnOutcome};
 use tole_tui::{Footer, Prompter, SessionItem, TuiHost, TurnEnd};
 
 use crate::approver::PromptFn;
@@ -211,36 +210,24 @@ impl TuiHost for TuiSession {
         let mut g = self.lock();
         let storage = &mut g.storage;
         let system_prompt = storage.system_prompt().map(str::to_string);
-        let mut provider = match crate::turn_runner::session_provider(
-            self.cfg.clone(),
-            &*storage,
-            self.registry.specs(),
-            system_prompt.as_deref(),
-            Some(&observer),
-        ) {
-            Ok(p) => p,
-            Err(e) => return TurnEnd::Stopped(e),
-        };
-        // A turn parked mid-flight (provider failure, ...) is resolved first.
-        if !matches!(storage.state().pc, Pc::Idle | Pc::Final) {
-            match turn::resume_turn_with_cancel(storage, &mut *provider, &self.registry, cancel) {
-                Ok(TurnOutcome::Final { .. }) => {}
-                Ok(other) => return map(other),
-                Err(e) => return TurnEnd::Stopped(format!("storage error: {e}")),
-            }
-        }
-        crate::compaction_host::for_session(self.compaction, &self.cfg, &*storage)
-            .before_turn(storage, &mut *provider);
-        match turn::run_turn_with_observer(
-            storage,
-            &mut *provider,
-            &self.registry,
-            prompt,
+        // The TUI's differences from the server faces are explicit in the
+        // plan: settle a turn parked mid-flight (provider failure, ...) first,
+        // and compact when due. The turn itself is the shared runner (#525).
+        let plan = crate::turn_runner::TurnPlan {
+            cfg: self.cfg.clone(),
+            registry: &self.registry,
+            system_prompt: system_prompt.as_deref(),
             cancel,
-            Some(&*observer),
-        ) {
+            observer: Some(&observer),
+            resolve_parked: true,
+            compaction: Some(self.compaction),
+        };
+        match crate::turn_runner::run_turn_on(storage, &plan, prompt) {
             Ok(o) => map(o),
-            Err(e) => TurnEnd::Stopped(format!("storage error: {e}")),
+            Err(crate::turn_runner::TurnRunError::Provider(e)) => TurnEnd::Stopped(e),
+            Err(crate::turn_runner::TurnRunError::Storage(e)) => {
+                TurnEnd::Stopped(format!("storage error: {e}"))
+            }
         }
     }
 

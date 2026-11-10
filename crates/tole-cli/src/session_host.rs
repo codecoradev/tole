@@ -450,28 +450,22 @@ pub fn run_session_turn(
     // the env default. serve sessions have no setter today, so this is
     // a no-op there.
     let mut storage = storage.lock().unwrap_or_else(|p| p.into_inner());
-    let cfg = crate::turn_runner::provider_config()?;
     // Live-token sinks (issue #196 phase 3): when an observer is wired
-    // (ACP), streamed reasoning/content deltas flow to it DURING the
-    // provider call; the decisive output semantics are unchanged. The same
-    // configuration applies to a reserve provider (#209).
-    let mut provider = crate::turn_runner::session_provider(
-        cfg,
-        &*storage,
-        registry.specs(),
-        system_prompt.as_deref(),
-        observer.as_ref(),
-    )?;
-
-    let outcome = tole_core::turn::run_turn_with_observer(
-        &mut *storage,
-        &mut provider,
-        &registry,
-        &effective,
-        &cancel,
-        observer.as_ref().map(StdArc::as_ref),
-    )
-    .map_err(|e| e.to_string())?;
+    // (ACP, serve with an open event stream), streamed reasoning/content
+    // deltas flow to it DURING the provider call; the decisive output
+    // semantics are unchanged. The same configuration applies to a reserve
+    // provider (#209). The turn itself is the shared runner (#525).
+    let plan = crate::turn_runner::TurnPlan {
+        cfg: crate::turn_runner::provider_config()?,
+        registry: &registry,
+        system_prompt: system_prompt.as_deref(),
+        cancel: &cancel,
+        observer: observer.as_ref(),
+        resolve_parked: false,
+        compaction: None,
+    };
+    let outcome = crate::turn_runner::run_turn_on(&mut *storage, &plan, &effective)
+        .map_err(|e| e.into_message())?;
 
     #[cfg(feature = "shell-tools")]
     if let tole_core::turn::TurnOutcome::Final { text, wrote } = &outcome {
@@ -506,23 +500,23 @@ pub fn resume_session_turn(
         ..
     } = state;
     let mut storage = storage.lock().unwrap_or_else(|p| p.into_inner());
-    let cfg = crate::turn_runner::provider_config()?;
-    let mut provider = crate::turn_runner::session_provider(
-        cfg,
-        &*storage,
-        registry.specs(),
-        system_prompt.as_deref(),
-        None,
-    )?;
     // #318: the session token is wired into the replan loop, so
     // `/cancel` during an approval-resume settles the turn as cancelled.
     // The `reset()` above stays: like `run_session_turn`, it runs inside
     // the busy claim, so a cancel landing after the claim targets this
     // resume, while one that landed earlier had no in-flight turn to
     // target (cancel is unconditional) and must not kill it.
+    let plan = crate::turn_runner::TurnPlan {
+        cfg: crate::turn_runner::provider_config()?,
+        registry: &registry,
+        system_prompt: system_prompt.as_deref(),
+        cancel: &cancel,
+        observer: None,
+        resolve_parked: false,
+        compaction: None,
+    };
     let outcome =
-        tole_core::turn::resume_turn_with_cancel(&mut *storage, &mut provider, &registry, &cancel)
-            .map_err(|e| e.to_string())?;
+        crate::turn_runner::resume_turn_on(&mut *storage, &plan).map_err(|e| e.into_message())?;
     let final_text = match &outcome {
         tole_core::turn::TurnOutcome::Final { text, .. } => Some(text.clone()),
         _ => None,
