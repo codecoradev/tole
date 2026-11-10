@@ -453,3 +453,104 @@ fn mission_register_reports_cached_tokens_without_touching_budget_fields() {
     assert!(status_out.contains("(hit rate 100.0%)"), "{status_out}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A stand-in `cora` that speaks just enough MCP over stdio (`cora mcp`) to
+/// list the two review tools, so the auto-preset attaches them.
+#[cfg(all(unix, feature = "mcp"))]
+fn fake_cora_dir(dir: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let script = r#"#!/usr/bin/env python3
+import json, sys
+def reply(i, result=None, error=None):
+    m = {"jsonrpc": "2.0", "id": i}
+    m["error" if error else "result"] = error or result
+    sys.stdout.write(json.dumps(m) + "\n"); sys.stdout.flush()
+for line in sys.stdin:
+    try:
+        r = json.loads(line)
+    except Exception:
+        continue
+    i, m = r.get("id"), r.get("method")
+    if i is None:
+        continue
+    if m == "initialize":
+        reply(i, {"protocolVersion": r["params"]["protocolVersion"],
+                  "capabilities": {"tools": {}}, "serverInfo": {"name": "cora", "version": "0"}})
+    elif m == "tools/list":
+        schema = {"type": "object", "properties": {"diff": {"type": "string"}}}
+        reply(i, {"tools": [
+            {"name": "cora_review_prepare", "description": "prepare", "inputSchema": schema},
+            {"name": "cora_review_finalize", "description": "finalize", "inputSchema": schema}]})
+    else:
+        reply(i, error={"code": -32601, "message": "method not found"})
+"#;
+    let path = bin.join("cora");
+    std::fs::write(&path, script).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    bin
+}
+
+/// #536: a mission builds its registry like `run`, so with `cora` on PATH it
+/// has the review tools; its PINNED prompt must then name the review flow
+/// (it used not to), and without the tools it must not. Needs the `mcp`
+/// feature: the `cora mcp` auto-preset does not exist in a build without it.
+#[cfg(all(unix, feature = "mcp"))]
+#[test]
+fn mission_prompt_names_the_cora_review_flow_when_cora_is_attached() {
+    let base = spawn_mock("NONE".into());
+    let dir = temp_dir("review");
+    let bin = fake_cora_dir(&dir);
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let env = [
+        ("TOLE_BASE_URL".to_string(), base),
+        ("TOLE_MODEL".to_string(), "mock-model".to_string()),
+        ("TOLE_API_KEY".to_string(), "sk-test".to_string()),
+        ("PATH".to_string(), path),
+    ];
+    let env_ref: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+
+    let pinned = |extra: &[&str], tag: &str| -> String {
+        let sessions = dir.join(tag);
+        let mut args = vec![
+            "mission",
+            "-s",
+            sessions.to_str().unwrap(),
+            "--yes",
+            "--max-steps",
+            "12",
+        ];
+        args.extend_from_slice(extra);
+        args.push("accomplish the thing");
+        let (_out, err, code) = run_tole(&env_ref, &args);
+        assert_eq!(code, 0, "mission failed: {err}");
+        let file = std::fs::read_dir(&sessions)
+            .unwrap()
+            .flatten()
+            .find(|e| e.file_name().to_string_lossy().ends_with(".jsonl"))
+            .expect("session file");
+        std::fs::read_to_string(file.path()).unwrap()
+    };
+
+    let with = pinned(&[], "with");
+    assert!(
+        with.contains("# Code review"),
+        "review section pinned: {with}"
+    );
+    assert!(with.contains("mcp_cora_cora_review_prepare"), "{with}");
+    assert!(
+        with.contains("MISSION MODE"),
+        "mission contract kept: {with}"
+    );
+
+    // Control: the same mission without the auto-preset has no review text.
+    let without = pinned(&["--no-auto-mcp"], "without");
+    assert!(!without.contains("# Code review"), "{without}");
+    assert!(without.contains("MISSION MODE"), "{without}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

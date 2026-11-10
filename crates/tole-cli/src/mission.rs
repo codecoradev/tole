@@ -126,6 +126,35 @@ fn mission_prompt(goal: &str, verify: Option<&str>) -> String {
     p
 }
 
+/// The cora agent-as-reviewer guidance for a mission (#536). A mission gets
+/// the same `build_registry` tools as `run`, including the auto-attached
+/// `mcp_cora_*` surface, but its pinned prompt never named the review flow, so
+/// the one command meant to run unattended was the one that never learned it
+/// exists. Present only when both review tools are registered (no tools, no
+/// instruction). Guidance, not enforcement: a gate before `git commit` is a
+/// separate change.
+fn mission_review_section(registry: &ToolRegistry) -> String {
+    let review = crate::review_section(registry);
+    if review.is_empty() {
+        return String::new();
+    }
+    format!(
+        "{review} Before you end the mission, review the change you made with this \
+         flow, address what it blocks, and include the verdict in your final message."
+    )
+}
+
+/// The system prompt pinned in the header of a FRESH mission session: the
+/// default prompt, the mission addendum, then the review flow when attached.
+fn fresh_mission_prompt(goal: &str, verify: Option<&str>, registry: &ToolRegistry) -> String {
+    format!(
+        "{}{}{}",
+        crate::default_prompt_for(false),
+        mission_prompt(goal, verify),
+        mission_review_section(registry)
+    )
+}
+
 /// Upper bound for `--max-minutes` (10 years): a huge value must neither
 /// wrap `minutes * 60` nor overflow the `Instant` arithmetic.
 const MAX_MINUTES_CAP: u64 = 60 * 24 * 365 * 10;
@@ -226,11 +255,7 @@ pub fn run_mission(
             // The mission system prompt pins the completion-marker
             // contract and the todo discipline in the session header —
             // resume re-applies it exactly (same as run's pinned prompt).
-            let system_prompt = format!(
-                "{}{}",
-                crate::default_prompt_for(false),
-                mission_prompt(&cfg.goal, cfg.verify.as_deref())
-            );
+            let system_prompt = fresh_mission_prompt(&cfg.goal, cfg.verify.as_deref(), &registry);
             let storage =
                 JsonlStorage::create_with(sessions_dir, &session_id, None, Some(&system_prompt))
                     .with_context(|| format!("creating mission session {session_id}"))?;
@@ -578,6 +603,46 @@ mod budget_tests {
 
 #[cfg(test)]
 mod verify_error_tests {
+    /// #536: the mission prompt names the cora review flow exactly when both
+    /// review tools are registered, and keeps the completion contract.
+    #[test]
+    fn fresh_mission_prompt_names_the_review_flow_only_when_the_tools_are_attached() {
+        use tole_core::tool::{Risk, Tool};
+        struct Named(&'static str);
+        impl Tool for Named {
+            fn name(&self) -> &str {
+                self.0
+            }
+            fn risk(&self) -> Risk {
+                Risk::ReadOnly
+            }
+            fn execute(&self, _input: serde_json::Value) -> Result<serde_json::Value, String> {
+                Ok(serde_json::Value::Null)
+            }
+        }
+        let mut reg =
+            ToolRegistry::with_approver(tole_core::approval::AllowlistApprover::allow_only(vec![]));
+        let none = fresh_mission_prompt("ship it", Some("cargo test"), &reg);
+        assert!(!none.contains("Code review"), "{none}");
+        assert!(none.contains(MISSION_COMPLETE_MARKER), "{none}");
+
+        reg.register(Box::new(Named("mcp_cora_cora_review_prepare")))
+            .unwrap();
+        let half = fresh_mission_prompt("ship it", None, &reg);
+        assert!(!half.contains("Code review"), "finalize missing: {half}");
+
+        reg.register(Box::new(Named("mcp_cora_cora_review_finalize")))
+            .unwrap();
+        let both = fresh_mission_prompt("ship it", Some("cargo test"), &reg);
+        assert!(both.contains("mcp_cora_cora_review_prepare"), "{both}");
+        assert!(both.contains("should_block"), "{both}");
+        assert!(both.contains("review the change you made"), "{both}");
+        // The mission contract and the goal are untouched, and the review
+        // text comes AFTER them so it cannot displace the marker rules.
+        assert!(both.contains("ship it") && both.contains(MISSION_COMPLETE_MARKER));
+        assert!(both.rfind("# Code review").unwrap() > both.find("MISSION MODE").unwrap());
+    }
+
     use super::*;
     use std::time::Duration;
 

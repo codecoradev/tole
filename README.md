@@ -41,7 +41,11 @@ tole is the agent harness of the CodeCora ecosystem — the hands:
   prompt names cora's agent-as-reviewer flow — the model passes a diff to
   `mcp_cora_cora_review_prepare`, judges it itself (no LLM key in cora), then
   calls `mcp_cora_cora_review_finalize` with the same diff and its findings.
-  `--trust internal` allows the `mcp_cora_*` tools without prompting.
+  `--trust internal` allows the `mcp_cora_*` tools without prompting. The
+  guidance is in the pinned prompt of `run`, `chat`, the TUI and `mission`
+  (#536). `serve`, `acp` and `mcp` sessions serve their own registry and attach
+  no external MCP server (the flag is refused there), so they have no review
+  tools and no review section.
 - **[uteke](https://github.com/codecoradev/uteke)** (`uteke`) — semantic
   memory. `uteke_recall` (recall) and `uteke_document` (markdown → durable
   knowledge) register automatically when the `uteke` binary is on PATH, and
