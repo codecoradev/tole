@@ -456,7 +456,7 @@ fn mission_register_reports_cached_tokens_without_touching_budget_fields() {
 
 /// A stand-in `cora` that speaks just enough MCP over stdio (`cora mcp`) to
 /// list the two review tools, so the auto-preset attaches them.
-#[cfg(unix)]
+#[cfg(all(unix, feature = "mcp"))]
 fn fake_cora_dir(dir: &std::path::Path) -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let bin = dir.join("bin");
@@ -494,8 +494,9 @@ for line in sys.stdin:
 
 /// #536: a mission builds its registry like `run`, so with `cora` on PATH it
 /// has the review tools; its PINNED prompt must then name the review flow
-/// (it used not to), and without the tools it must not.
-#[cfg(unix)]
+/// (it used not to), and without the tools it must not. Needs the `mcp`
+/// feature: the `cora mcp` auto-preset does not exist in a build without it.
+#[cfg(all(unix, feature = "mcp"))]
 #[test]
 fn mission_prompt_names_the_cora_review_flow_when_cora_is_attached() {
     let base = spawn_mock("NONE".into());
