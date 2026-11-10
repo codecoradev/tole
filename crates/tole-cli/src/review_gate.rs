@@ -277,7 +277,14 @@ pub fn git_commit_call(argv: &[String]) -> Option<CommitCall> {
         if base == "env" {
             i += 1;
             while let Some(t) = argv.get(i) {
-                if t == "-u" || t == "--unset" || t == "-C" || t == "--chdir" || t == "-S" {
+                if t == "-C" || t == "--chdir" || t == "-S" {
+                    // The commit would land in a directory we cannot resolve.
+                    note("env -C");
+                    i += 2;
+                } else if t.starts_with("-C") || t.starts_with("--chdir=") || t.starts_with("-S") {
+                    note("env -C");
+                    i += 1;
+                } else if t == "-u" || t == "--unset" {
                     i += 2;
                 } else if t.starts_with('-') {
                     i += 1;
@@ -345,6 +352,10 @@ pub fn git_commit_call(argv: &[String]) -> Option<CommitCall> {
                 i += 1;
             }
             "--namespace" | "--super-prefix" | "--exec-path" => i += 2,
+            t if t.starts_with("-C") && t.len() > 2 => {
+                c_paths.push(t[2..].to_string());
+                i += 1;
+            }
             _ => i += 1,
         }
     }
@@ -817,6 +828,26 @@ mod tests {
     /// `git -C sub commit` commits in `sub`: cora must be asked about THAT
     /// repository, not about the session one (a validated session repo must
     /// not unlock a commit into a nested repo).
+    #[test]
+    fn attached_c_and_env_chdir_forms_are_not_missed() {
+        let v = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
+        assert_eq!(
+            git_commit_call(&v("git -Cnested commit -m x")),
+            Some(CommitCall::In(vec!["nested".into()]))
+        );
+        for cmd in [
+            "env -C nested git commit -m x",
+            "env -Cnested git commit -m x",
+            "env --chdir=nested git commit -m x",
+            "env --chdir nested git commit -m x",
+        ] {
+            assert!(
+                matches!(git_commit_call(&v(cmd)), Some(CommitCall::Redirected(_))),
+                "{cmd}"
+            );
+        }
+    }
+
     #[test]
     fn a_commit_in_another_directory_is_verified_there() {
         let f = fake_cora("cdir");
