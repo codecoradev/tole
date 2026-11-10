@@ -164,3 +164,116 @@ fn stale_handle_refuses_to_append_after_foreign_write() {
         "nothing appended"
     );
 }
+
+/// #552: `flock` belongs to the open file description, so a child forked by
+/// ANOTHER thread briefly holds a duplicate of our lock descriptor until it
+/// execs (CLOEXEC only closes it AT exec). A reopen right after `drop` could
+/// then see `Locked`, with our own pid as the holder. The reopen must ride
+/// that out.
+#[test]
+fn a_reopen_after_drop_survives_children_forked_by_other_threads() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let dir = tmpdir("fork-race");
+    let stop = Arc::new(AtomicBool::new(false));
+    let spawners: Vec<_> = (0..3)
+        .map(|_| {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = Command::new("true").status();
+                }
+            })
+        })
+        .collect();
+
+    let mut failures = Vec::new();
+    for i in 0..6000 {
+        let id = format!("race-{}", i % 8);
+        let path = dir.join(format!("{id}.jsonl"));
+        let s = if path.exists() {
+            JsonlStorage::open(&path)
+        } else {
+            JsonlStorage::create(&dir, &id, None)
+        };
+        match s {
+            Ok(s) => drop(s),
+            Err(e) => failures.push(format!("round {i}: {e:?}")),
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    for t in spawners {
+        t.join().unwrap();
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of 6000 reopens failed, first: {:?}",
+        failures.len(),
+        failures.first()
+    );
+}
+
+/// The retry must not blur the two real refusals: another process holding
+/// the session fails at once, and a second open in THIS process (#475) still
+/// fails, after at most the bounded retry.
+#[test]
+fn real_second_opens_are_still_refused_within_the_bound() {
+    let dir = tmpdir("bound");
+    let mut child = spawn_holder(&dir, "plain");
+    let path = dir.join("held.jsonl");
+    let t = std::time::Instant::now();
+    let err = open_err(&path);
+    assert!(matches!(err, StorageError::Locked { .. }), "{err:?}");
+    assert!(
+        t.elapsed() < std::time::Duration::from_millis(50),
+        "a holder with another pid fails immediately, took {:?}",
+        t.elapsed()
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    let own = JsonlStorage::create(&dir, "own", None).unwrap();
+    let t = std::time::Instant::now();
+    let err = open_err(&dir.join("own.jsonl"));
+    assert!(
+        matches!(err, StorageError::Locked { holder: Some(p) } if p == std::process::id()),
+        "{err:?}"
+    );
+    assert!(
+        t.elapsed() < std::time::Duration::from_millis(1000),
+        "the same-process refusal is bounded, took {:?}",
+        t.elapsed()
+    );
+    drop(own);
+}
+
+/// The retry reads the lock file between attempts, which moves its cursor.
+/// The pid written once the lock IS taken must still land at offset 0, or
+/// the file is NUL-padded and the next refusal cannot name its holder.
+#[test]
+fn the_pid_is_written_cleanly_after_a_retried_acquisition() {
+    let dir = tmpdir("retry-pid");
+    let held = JsonlStorage::create(&dir, "r", None).unwrap();
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        drop(held);
+    });
+    // Blocks (retrying: the holder is our own pid) until the other thread
+    // drops its writer, then takes the lock.
+    let reopened = JsonlStorage::open(dir.join("r.jsonl")).expect("retry rides out the release");
+    releaser.join().unwrap();
+    let text = std::fs::read(dir.join("r.jsonl.lock")).unwrap();
+    assert_eq!(
+        text,
+        std::process::id().to_string().into_bytes(),
+        "the lock file holds exactly our pid, no padding"
+    );
+    // And a real refusal now still names us.
+    let err = open_err(&dir.join("r.jsonl"));
+    assert!(
+        matches!(err, StorageError::Locked { holder: Some(p) } if p == std::process::id()),
+        "{err:?}"
+    );
+    drop(reopened);
+}
