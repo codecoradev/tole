@@ -367,11 +367,16 @@ they trust. What the transport adds:
   scrub (ENV-1) drop it from the processes tole spawns. Errors and the
   warnings tole prints never carry it: every reactor error is scrubbed of the
   token, the url and its host (transport errors echo them, and a sloppy
-  server may echo the `Authorization` header in an error body).
+  server may echo the `Authorization` header in an error body). The client
+  echoes the NORMALIZED url (lowercased host, default port dropped), not the
+  string the operator typed, so the url, its path and query, the authority and
+  the bare host are each scrubbed case-insensitively (a server `https://Example.COM:443/x`
+  must not surface as `example.com`).
 - **Transport safety.** `https` is required; plain `http` only for
   `localhost`, `127.0.0.0/8` and `::1` (lookalikes such as
-  `127.0.0.1.evil.com` are refused). A url with embedded credentials is
-  refused. A redirect to another origin is not followed (rmcp's same-origin
+  `127.0.0.1.evil.com` are refused). A url with embedded credentials, whitespace
+  or a backslash is refused (parsers read `\` as `/`, so the host that was
+  validated could differ from the host contacted). A redirect to another origin is not followed (rmcp's same-origin
   redirect policy), so a server cannot bounce the token to a third host. The
   url is re-validated at connect time because the config type is public.
 - **Disclosure.** Tool arguments and results go to the remote operator, like

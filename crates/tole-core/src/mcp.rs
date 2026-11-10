@@ -192,8 +192,13 @@ fn is_loopback_host(host: &str) -> bool {
 /// but loopback (the bearer token would cross the network in clear).
 fn validate_http_url(url: &str) -> Result<(), String> {
     let (https, _) = split_scheme(url).ok_or("url must start with http:// or https://")?;
-    if url.chars().any(|c| c.is_control() || c.is_whitespace()) {
-        return Err("url must not contain whitespace or control characters".into());
+    // `\` is read as `/` by URL parsers, so the host validated here could
+    // differ from the host that is contacted.
+    if url
+        .chars()
+        .any(|c| c.is_control() || c.is_whitespace() || c == '\\')
+    {
+        return Err("url must not contain whitespace, control characters or backslashes".into());
     }
     let authority = url_authority(url).unwrap_or_default();
     if authority.is_empty() {
@@ -246,16 +251,61 @@ fn is_port(s: &str) -> bool {
     !s.is_empty() && s.len() <= 5 && s.bytes().all(|b| b.is_ascii_digit())
 }
 
+/// The host of an `authority` (`host[:port]`, or `[v6][:port]`), without
+/// brackets and port; lenient (validation already ran).
+fn host_part(authority: &str) -> &str {
+    if let Some(inner) = authority.strip_prefix('[') {
+        return inner.split(']').next().unwrap_or_default();
+    }
+    match authority.rsplit_once(':') {
+        Some((host, port)) if is_port(port) => host,
+        _ => authority,
+    }
+}
+
+/// ASCII case-insensitive `str::replace`. URL parsers lowercase the scheme
+/// and host and drop default ports, so the string the operator typed is not
+/// what transport errors echo. Lowercasing ASCII keeps every byte offset.
+fn replace_ci(hay: &str, needle: &str, with: &str) -> String {
+    if needle.is_empty() {
+        return hay.to_string();
+    }
+    let (h, n) = (hay.to_ascii_lowercase(), needle.to_ascii_lowercase());
+    let mut out = String::with_capacity(hay.len());
+    let mut at = 0;
+    while let Some(pos) = h[at..].find(&n) {
+        out.push_str(&hay[at..at + pos]);
+        out.push_str(with);
+        at += pos + n.len();
+    }
+    out.push_str(&hay[at..]);
+    out
+}
+
 /// Scrub what must not reach the transcript, `tole status` or logs from an
 /// error string of a remote server: the bearer token, the url and its
 /// host (a url can be a capability, and transport errors echo it).
+///
+/// Transport errors echo the NORMALIZED url (lowercased scheme and host,
+/// default port elided, fragment dropped), so besides the url as typed the
+/// path and query, the authority and the bare host are scrubbed on their
+/// own, case-insensitively.
 fn scrub_err(cfg: &McpServerConfig, mut msg: String) -> String {
     if let McpTransport::Http { url } = &cfg.transport {
-        msg = msg.replace(url.as_str(), "<url>");
-        msg = msg.replace(url.trim_end_matches('/'), "<url>");
-        if let Some(authority) = url_authority(url) {
-            msg = msg.replace(authority, "<host>");
+        let authority = url_authority(url).unwrap_or_default();
+        let after_authority = split_scheme(url)
+            .map(|(_, rest)| &rest[authority.len()..])
+            .unwrap_or_default();
+        let path_query = after_authority.split('#').next().unwrap_or_default();
+        let without_fragment = url.split('#').next().unwrap_or(url);
+        msg = replace_ci(&msg, url, "<url>");
+        msg = replace_ci(&msg, without_fragment, "<url>");
+        msg = replace_ci(&msg, url.trim_end_matches('/'), "<url>");
+        if path_query.len() > 1 {
+            msg = replace_ci(&msg, path_query, "<path>");
         }
+        msg = replace_ci(&msg, authority, "<host>");
+        msg = replace_ci(&msg, host_part(authority), "<host>");
         if let Some(token) = mcp_token(&cfg.name) {
             msg = msg.replace(&token, "<token>");
         }
@@ -1179,5 +1229,76 @@ mod cap_tests {
             "got {}",
             out2.chars().count()
         );
+    }
+}
+
+#[cfg(test)]
+mod scrub_tests {
+    use super::*;
+
+    fn http(name: &str, url: &str) -> McpServerConfig {
+        McpServerConfig::parse(&format!("{name}={url}")).unwrap()
+    }
+
+    /// What reqwest/url echo for a spec: the URL NORMALIZED (scheme and host
+    /// lowercased, default port elided), not the string the operator typed.
+    #[test]
+    fn scrubs_the_normalized_form_of_the_url_too() {
+        let cfg = http(
+            "scrub-a",
+            "https://Example.COM:443/Cap/Path?Key=Sekret#frag",
+        );
+        let leaked = "error sending request for url (https://example.com/Cap/Path?Key=Sekret)";
+        let out = scrub_err(&cfg, leaked.to_string());
+        for secret in ["example.com", "Example", "Sekret", "Cap/Path"] {
+            assert!(
+                !out.to_ascii_lowercase()
+                    .contains(&secret.to_ascii_lowercase()),
+                "{secret:?} leaked: {out}"
+            );
+        }
+        assert!(out.contains("error sending request"), "context kept: {out}");
+    }
+
+    #[test]
+    fn scrubs_host_only_mentions_ports_and_ipv6() {
+        let cfg = http("scrub-b", "https://MCP.Internal.Example:8443/mcp");
+        let out = scrub_err(
+            &cfg,
+            "dns error: failed to lookup mcp.internal.example".into(),
+        );
+        assert!(
+            !out.to_ascii_lowercase().contains("internal.example"),
+            "{out}"
+        );
+
+        let cfg = http("scrub-c", "http://[::1]:7801/mcp");
+        let out = scrub_err(&cfg, "connect error to [::1]:7801 refused".into());
+        assert!(!out.contains("::1"), "{out}");
+    }
+
+    #[test]
+    fn scrubs_the_token_and_leaves_stdio_messages_alone() {
+        std::env::set_var("TOLE_MCP_SCRUB_D_TOKEN", "tok-abcdef-123");
+        let cfg = http("scrub-d", "https://example.com/mcp");
+        let out = scrub_err(&cfg, "401: bad bearer tok-abcdef-123".into());
+        assert!(!out.contains("tok-abcdef-123"), "{out}");
+
+        let stdio = McpServerConfig::parse("fs=npx x").unwrap();
+        let msg = "mcp \"fs\": handshake failed: example.com".to_string();
+        assert_eq!(scrub_err(&stdio, msg.clone()), msg);
+    }
+
+    #[test]
+    fn urls_with_backslashes_are_refused() {
+        // Parsers treat `\` as `/` in http urls, so the host that was
+        // validated could differ from the host that is contacted.
+        for bad in [
+            "a=https://example.com\\@evil.com/mcp",
+            "a=http://localhost\\.evil.com/mcp",
+            "a=https://example.com/mcp\\x",
+        ] {
+            assert!(McpServerConfig::parse(bad).is_err(), "{bad}");
+        }
     }
 }

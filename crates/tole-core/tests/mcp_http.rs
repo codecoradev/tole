@@ -329,3 +329,27 @@ fn dropped_connection_evicts_and_the_next_call_reconnects() {
         "the evicted connection is re-established on the next call"
     );
 }
+
+#[test]
+fn connection_error_hides_the_normalized_url_the_client_echoes() {
+    env();
+    // A closed port: the client's own error text names the url it tried,
+    // lowercased (`localhost`) and without anything the operator typed in
+    // upper case, so a plain string replace of the spec would miss it.
+    let port = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let c = McpServerConfig::parse(&format!(
+        "httpf=http://LOCALHOST:{port}/Cap/Path?Key=Sekret"
+    ))
+    .unwrap();
+    probe_server_extras(&c);
+    let err = get_server_prompt("httpf", "p", Default::default()).unwrap_err();
+    assert!(!err.is_empty());
+    let lower = err.to_ascii_lowercase();
+    for secret in ["sekret", "cap/path", "localhost"] {
+        assert!(!lower.contains(secret), "error leaks {secret:?}: {err}");
+    }
+}
