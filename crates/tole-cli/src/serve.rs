@@ -8,6 +8,8 @@
 //! - `GET  /sessions`              → list session ids + busy flags
 //! - `GET  /sessions/{id}`         → session status
 //! - `POST /sessions/{id}/prompt`  → run one turn (`{"text": "..."}`)
+//! - `GET  /sessions/{id}/entries?after=<seq>&limit=<n>` → one page of the
+//!   session log (#524; see `tole_cli::protocol`)
 //! - `POST /sessions/{id}/interrupt` → steer the running turn without
 //!   cancelling it (`{"text": "...", "urgent": false}`, #377)
 //!
@@ -605,6 +607,9 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
             }
         }
         (method, path) if path.starts_with("/sessions/") => {
+            // The query string belongs to the route, not to the action
+            // name (`entries?after=5` is the `entries` action).
+            let (path, query) = path.split_once('?').unwrap_or((path, ""));
             let rest = &path["/sessions/".len()..];
             // Split once; a bare id (no trailing slash) is the status route.
             let (id, action) = match rest.split_once('/') {
@@ -649,6 +654,43 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                             "usage_report": report,
                         }),
                     )
+                }
+                ("GET", id, Some("entries")) => {
+                    // Paginated transcript read (#524). Replays the
+                    // session's FILE, so it works while a turn runs.
+                    let param = |name: &str| {
+                        query
+                            .split('&')
+                            .find_map(|kv| kv.strip_prefix(name).and_then(|v| v.strip_prefix('=')))
+                    };
+                    let (after, limit) = match tole_cli::protocol::parse_entries_query(
+                        param("after"),
+                        param("limit"),
+                    ) {
+                        Ok(v) => v,
+                        Err(tole_cli::protocol::EntriesError::BadQuery(m)) => {
+                            return (400, json!({"error": m}))
+                        }
+                        Err(tole_cli::protocol::EntriesError::Read(m)) => {
+                            return (500, json!({"error": m}))
+                        }
+                    };
+                    let path = {
+                        let sessions = lock_sessions(&state.sessions);
+                        sessions.get(id).map(|st| st.path.clone())
+                    };
+                    let Some(path) = path else {
+                        return (404, json!({"error": "unknown session"}));
+                    };
+                    match tole_cli::protocol::entries_page(&path, id, after, limit) {
+                        Ok(page) => (200, serde_json::to_value(&page).unwrap_or(json!(null))),
+                        Err(tole_cli::protocol::EntriesError::Read(m)) => {
+                            (500, json!({"error": m}))
+                        }
+                        Err(tole_cli::protocol::EntriesError::BadQuery(m)) => {
+                            (400, json!({"error": m}))
+                        }
+                    }
                 }
                 ("POST", id, Some("prompt")) => {
                     let Ok(req) = serde_json::from_str::<serde_json::Value>(body) else {

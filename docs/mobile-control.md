@@ -3,8 +3,9 @@
 The 0.8.0 remote-approval surface (#200) is the entire backend a phone
 needs: missions run on the box under `tole serve`, the phone lists
 running missions, receives pending Write approvals, and approves/denies
-from anywhere. No new backend exists or is planned — the phone is a
-client of the token-authenticated serve face.
+from anywhere. The phone is a client of the token-authenticated serve face.
+(Graphical clients need more than polling: a transcript read ships with #524,
+resume-by-id and an event stream follow; see the UI epic #523.)
 
 ## The surface uteke-mobile consumes
 
@@ -22,6 +23,7 @@ rate-limited per source IP).
 | Cancel a turn | `POST /sessions/{id}/cancel` (#178) | the turn settles `cancelled`, durably |
 | Steer a turn | `POST /sessions/{id}/interrupt` `{text, urgent?}` (#377) | `202` queued; delivered at the turn's next safe point (after the running tool, before the next model call) as an attributed user-role entry, nothing is lost. `urgent` also withdraws a tool call that has not started. `409` when no turn is running, `400` for blank/oversized text or a full queue (16 pending) |
 | Detach a turn | `POST /sessions/{id}/detach` (#217) | `202`; the running tool settles, the turn ends `detached` (resumable) and background jobs keep running, nudging the session when they finish. `409` when no turn is running |
+| Read the transcript | `GET /sessions/{id}/entries?after=<seq>&limit=<n>` (#524) | one page of the session's log, see [Transcript read](#transcript-read-524); works while a turn runs |
 | Cost report | `GET /sessions/{id}/status` | the `mission` register: turns, steps, tokens, wall time, per-risk-tier tool calls |
 
 The round trip the app must support (the cross-repo acceptance):
@@ -56,6 +58,34 @@ The mission cost report (`fact/mission`) is rendered by `tole status`; it
 gained an additive `cached_tokens` (`null` when no step reported it). The
 MCP/ACP `tole_session_status` tool returns the same `usage_report` next to
 `busy` and `entries`.
+
+## Transcript read (#524)
+
+`GET /sessions/{id}/entries?after=<seq>&limit=<n>` returns one page of a live
+session's log, so a client that connects late or reconnects can render history:
+
+```json
+{"id": "srv-…", "entries": [{"seq": 1, "id": "e_1", "parentId": null, "type": "message",
+ "timestamp": 1787807227226, "payload": {"role": "user", "text": "…"}}],
+ "nextAfter": 1, "hasMore": false, "lastSeq": 1}
+```
+
+- `entries` are exactly the session JSONL's entries with `seq > after` (the same
+  entries `tole resume` replays; nothing is reformatted). `after` defaults to 0.
+- `limit` defaults to 100 and is clamped to 500; a page also stops once its
+  serialized entries pass about 1 MiB (it always carries at least one entry), so
+  `hasMore` can be true with fewer than `limit` entries.
+- Page through with `after = nextAfter` while `hasMore` is true. `seq` is strictly
+  increasing but not dense (other log lines share the counter): never assume `+1`.
+- It reads the session **file** (replayed read-only, a torn tail is skipped, never
+  truncated), not the live storage handle, so it works while a turn is in flight and
+  shows entries as soon as they are durable. Cost is a replay of the file per call.
+- `400` for a bad `after`/`limit`, `404` for an unknown (not live) session, `401`
+  without the token. Sessions that are not live (after a serve restart) are not readable
+  yet; resume-by-id (next in #524) makes them live.
+- Entries carry tool inputs and outputs. The token already grants approval authority
+  and `POST …/prompt`; the read route adds no new trust, but anything printed into a
+  session is readable by every holder of the token.
 
 ## Auth model
 

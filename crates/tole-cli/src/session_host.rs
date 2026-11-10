@@ -21,6 +21,10 @@ pub struct SessionState {
     /// lock), so the reader loop stays live for permission routing while
     /// a prompt runs (CodeCora scan deadlock finding).
     pub storage: StdArc<Mutex<tole_core::storage::JsonlStorage>>,
+    /// The session's JSONL file. Read-only consumers (the transcript
+    /// route, #524) replay THIS instead of taking the storage lock a turn
+    /// holds for its whole duration.
+    pub path: PathBuf,
     pub registry: StdArc<tole_core::tool::ToolRegistry>,
     pub system_prompt: Option<String>,
     pub memory: Option<MemoryConfig>,
@@ -470,6 +474,7 @@ pub fn open_session(
 
     Ok(SessionState {
         storage: StdArc::new(Mutex::new(storage)),
+        path: dir.join(format!("{session_id}.jsonl")),
         registry: StdArc::new(reg),
         system_prompt,
         memory,
@@ -807,6 +812,7 @@ mod eviction_tests {
         let storage = tole_core::storage::JsonlStorage::create(dir, name, None).unwrap();
         SessionState {
             storage: StdArc::new(Mutex::new(storage)),
+            path: dir.join(format!("{name}.jsonl")),
             registry: StdArc::new(tole_core::tool::ToolRegistry::new()),
             system_prompt: None,
             memory: None,
