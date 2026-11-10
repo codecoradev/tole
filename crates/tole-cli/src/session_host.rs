@@ -9,6 +9,7 @@
 //! absent). Everything else — the jail, the registry, the memory loop —
 //! is identical.
 
+use crate::tool_roster::PlanEmitter;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc as StdArc, Mutex};
@@ -253,104 +254,6 @@ impl Sessions {
     }
 }
 
-/// Callback publishing a plan payload to the session's client (issue
-/// #196 phase 4). ACP wires a closure sending the standard `plan`
-/// session/update (Termul's PlanPanel renders it, full-replace); the
-/// serve/MCP faces pass None — no UI to render plans there.
-pub type PlanEmitter = StdArc<dyn Fn(&serde_json::Value) + Send + Sync>;
-
-/// The model-facing `update_plan` tool (issue #196 phase 4): publishes
-/// the execution plan to the host's plan panel. Structurally
-/// ReadOnly — it mutates nothing durable and has no side effects
-/// beyond the notification. Validation is strict-but-lenient: required
-/// `content`, enum-checked `priority`/`status` with spec defaults, so
-/// the model self-corrects from the error text on malformed input.
-pub struct UpdatePlanTool {
-    emitter: PlanEmitter,
-}
-
-impl UpdatePlanTool {
-    pub fn new(emitter: PlanEmitter) -> Self {
-        Self { emitter }
-    }
-}
-
-impl tole_core::tool::Tool for UpdatePlanTool {
-    fn name(&self) -> &str {
-        "update_plan"
-    }
-    fn risk(&self) -> tole_core::tool::Risk {
-        tole_core::tool::Risk::ReadOnly
-    }
-    fn summary(&self) -> String {
-        "Publish or replace the execution plan shown in the user's plan panel.".into()
-    }
-
-    fn describe(&self, _input: &serde_json::Value) -> String {
-        "publish the execution plan to the user's plan panel".into()
-    }
-    fn spec(&self) -> Option<serde_json::Value> {
-        Some(serde_json::json!({
-            "type": "object",
-            "properties": {
-                "entries": {
-                    "type": "array",
-                    "description": "The FULL plan, replacing any previous one",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "content": {"type": "string"},
-                            "priority": {"enum": ["high", "medium", "low"]},
-                            "status": {"enum": ["pending", "in_progress", "completed"]}
-                        },
-                        "required": ["content"]
-                    }
-                }
-            },
-            "required": ["entries"]
-        }))
-    }
-    fn execute(&self, input: serde_json::Value) -> Result<serde_json::Value, String> {
-        let entries = normalize_plan(&input)?;
-        (self.emitter)(&entries);
-        Ok(serde_json::json!({
-            "ok": true,
-            "entries": entries.as_array().map(|a| a.len()).unwrap_or(0)
-        }))
-    }
-}
-
-/// Validate + normalize plan entries into the ACP `plan` update shape.
-fn normalize_plan(input: &serde_json::Value) -> Result<serde_json::Value, String> {
-    let arr = input["entries"]
-        .as_array()
-        .ok_or("update_plan: 'entries' (array) is required")?;
-    let mut out: Vec<serde_json::Value> = Vec::new();
-    for e in arr {
-        let content = e["content"]
-            .as_str()
-            .map(str::trim)
-            .filter(|c| !c.is_empty())
-            .ok_or("update_plan: each entry needs a non-empty 'content' string")?;
-        let priority = e["priority"].as_str().unwrap_or("medium");
-        if !matches!(priority, "high" | "medium" | "low") {
-            return Err(format!(
-                "update_plan: invalid priority '{priority}' (high | medium | low)"
-            ));
-        }
-        let status = e["status"].as_str().unwrap_or("pending");
-        if !matches!(status, "pending" | "in_progress" | "completed") {
-            return Err(format!(
-                "update_plan: invalid status '{status}' (pending | in_progress | completed)"
-            ));
-        }
-        out.push(serde_json::json!({
-            "content": content, "priority": priority, "status": status
-        }));
-    }
-    Ok(serde_json::Value::Array(out))
-}
-
 /// Poisoning-tolerant lock: one panicking turn must not brick the whole
 /// server (CodeCora scan finding — mutex poisoning).
 pub fn lock_sessions(sessions: &SharedSessions) -> std::sync::MutexGuard<'_, Sessions> {
@@ -489,63 +392,6 @@ pub fn sessions_dir_for(cwd: &str) -> Result<PathBuf, String> {
     let dir = PathBuf::from(cwd).join(".tole/sessions");
     std::fs::create_dir_all(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
     Ok(dir)
-}
-
-pub fn detect_github_repo(cwd: &std::path::Path) -> Option<String> {
-    let mut cmd = std::process::Command::new("git");
-    cmd.args(["config", "--get", "remote.origin.url"])
-        .current_dir(cwd);
-    let out = tole_core::subprocess::run_with_timeout(&mut cmd, std::time::Duration::from_secs(5))
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    crate::session_host::github_repo_from_remote_url(&String::from_utf8_lossy(&out.stdout))
-}
-
-/// Register the `gitea` tool when BOTH probe legs hold: the checkout's
-/// origin remote points at a Gitea instance (not GitHub — that's `gh`)
-/// and a token env exists (`TOLE_GITEA_TOKEN` or `GITEA_TOKEN`).
-/// Absent legs degrade to one warning line, never a phantom tool — the
-/// same probe contract as uteke/cora.
-pub fn register_gitea(reg: &mut tole_core::tool::ToolRegistry, cwd: &std::path::Path) {
-    use tole_core::gitea::{gitea_from_remote, GiteaRemote, GiteaTool};
-    let mut cmd = std::process::Command::new("git");
-    cmd.args(["config", "--get", "remote.origin.url"])
-        .current_dir(cwd);
-    let Ok(out) =
-        tole_core::subprocess::run_with_timeout(&mut cmd, std::time::Duration::from_secs(5))
-    else {
-        return;
-    };
-    if !out.status.success() {
-        return;
-    }
-    let remote = gitea_from_remote(&String::from_utf8_lossy(&out.stdout));
-    let (base, repo) = match remote {
-        GiteaRemote::Ok { base, repo } => (base, repo),
-        GiteaRemote::InsecureHttp { host } => {
-            eprintln!(
-                "tole: origin is a Gitea remote over plain http ({host}) — refusing to send the \
-                 token unencrypted; use an https remote (loopback http is allowed)"
-            );
-            return;
-        }
-        GiteaRemote::NotGitea => return,
-    };
-    let token = std::env::var("TOLE_GITEA_TOKEN")
-        .or_else(|_| std::env::var("GITEA_TOKEN"))
-        .ok()
-        .filter(|t| !t.trim().is_empty());
-    let Some(token) = token else {
-        eprintln!(
-            "tole: origin is a Gitea remote ({repo}) but no TOLE_GITEA_TOKEN/GITEA_TOKEN is set — gitea tool disabled"
-        );
-        return;
-    };
-    if let Err(e) = reg.register(Box::new(GiteaTool::new(base, token, repo))) {
-        eprintln!("tole: registering gitea: {e}");
-    }
 }
 
 /// One prompt = one full tole turn. Returns `(stop_reason, final_text)`;
@@ -696,94 +542,6 @@ fn log_outcome(outcome: &tole_core::turn::TurnOutcome) {
         O::ProviderFailed { message } => eprintln!("tole: provider failed: {message}"),
         O::LoopDetected { tool, .. } => eprintln!("tole: loop detected on '{tool}'"),
         _ => {}
-    }
-}
-
-/// Best-effort `owner/name` from a git remote URL, for gh tool targeting.
-///
-/// The host must be EXACTLY `github.com` (case-insensitive): the URL is split
-/// into authority and path first, so `github.com` appearing inside a longer
-/// hostname (`github.com.evil.io`, `notgithub.com`), in the userinfo or in the
-/// path of another forge never redirects the gh tool to an attacker-named repo
-/// (#352). Handles `scheme://[user[:pass]@]host[:port]/owner/name` and the
-/// scp-like `[user@]host:owner/name`.
-pub fn github_repo_from_remote_url(url: &str) -> Option<String> {
-    let url = url.trim().trim_end_matches('/');
-    let url = url.strip_suffix(".git").unwrap_or(url);
-    let (host, path) = if let Some((_, rest)) = url.split_once("://") {
-        let (authority, path) = rest.split_once('/')?;
-        // Strip userinfo (everything up to the LAST '@'), then an optional
-        // numeric port.
-        let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-        let host = match host_port.rsplit_once(':') {
-            Some((h, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => h,
-            _ => host_port,
-        };
-        (host, path)
-    } else {
-        // scp-like: `[user@]host:path` (no scheme, no `//`).
-        let (left, path) = url.split_once(':')?;
-        let host = left.rsplit_once('@').map_or(left, |(_, h)| h);
-        (host, path)
-    };
-    if !host.eq_ignore_ascii_case("github.com") {
-        return None;
-    }
-    let rest = path.trim_start_matches('/');
-    let mut parts = rest.split('/');
-    let owner = parts.next()?;
-    let name = parts.next()?;
-    let valid = |s: &str| {
-        !s.is_empty()
-            && !s.starts_with('-')
-            && s.chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-    };
-    if valid(owner) && valid(name) {
-        Some(format!("{owner}/{name}"))
-    } else {
-        None
-    }
-}
-
-#[cfg(test)]
-mod plan_tests {
-    use super::*;
-
-    #[test]
-    fn normalize_plan_validates_enums_and_defaults() {
-        let plan = normalize_plan(&serde_json::json!({
-            "entries": [
-                {"content": "step one", "status": "in_progress"},
-                {"content": "step two", "priority": "high"},
-            ]
-        }))
-        .unwrap();
-        assert_eq!(
-            plan,
-            serde_json::json!([
-                {"content": "step one", "priority": "medium", "status": "in_progress"},
-                {"content": "step two", "priority": "high", "status": "pending"},
-            ])
-        );
-    }
-
-    #[test]
-    fn normalize_plan_rejects_malformed_input_loudly() {
-        // Missing array.
-        assert!(normalize_plan(&serde_json::json!({})).is_err());
-        // Empty content.
-        assert!(normalize_plan(&serde_json::json!({"entries": [{"content": " "}]})).is_err());
-        // Out-of-enum values are refused, not silently coerced — the
-        // model sees the error text and self-corrects.
-        assert!(normalize_plan(
-            &serde_json::json!({"entries": [{"content": "x", "priority": "urgent"}]})
-        )
-        .is_err());
-        assert!(normalize_plan(
-            &serde_json::json!({"entries": [{"content": "x", "status": "done"}]})
-        )
-        .is_err());
     }
 }
 

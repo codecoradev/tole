@@ -3004,22 +3004,22 @@ mod gh_repo_tests {
     #[test]
     fn parses_https_ssh_and_git_suffix() {
         assert_eq!(
-            tole_cli::session_host::github_repo_from_remote_url("https://github.com/foo/bar.git")
+            tole_cli::tool_roster::github_repo_from_remote_url("https://github.com/foo/bar.git")
                 .as_deref(),
             Some("foo/bar")
         );
         assert_eq!(
-            tole_cli::session_host::github_repo_from_remote_url("https://github.com/foo/bar")
+            tole_cli::tool_roster::github_repo_from_remote_url("https://github.com/foo/bar")
                 .as_deref(),
             Some("foo/bar")
         );
         assert_eq!(
-            tole_cli::session_host::github_repo_from_remote_url("git@github.com:foo/bar.git")
+            tole_cli::tool_roster::github_repo_from_remote_url("git@github.com:foo/bar.git")
                 .as_deref(),
             Some("foo/bar")
         );
         assert_eq!(
-            tole_cli::session_host::github_repo_from_remote_url(
+            tole_cli::tool_roster::github_repo_from_remote_url(
                 "https://user:token@github.com/Foo/Bar.git"
             )
             .as_deref(),
@@ -3029,19 +3029,19 @@ mod gh_repo_tests {
 
     #[test]
     fn rejects_non_github_and_garbage() {
-        assert!(tole_cli::session_host::github_repo_from_remote_url(
+        assert!(tole_cli::tool_roster::github_repo_from_remote_url(
             "https://gitlab.com/foo/bar.git"
         )
         .is_none());
-        assert!(tole_cli::session_host::github_repo_from_remote_url(
+        assert!(tole_cli::tool_roster::github_repo_from_remote_url(
             "https://github.com/only-owner"
         )
         .is_none());
-        assert!(tole_cli::session_host::github_repo_from_remote_url("not a url").is_none());
-        assert!(tole_cli::session_host::github_repo_from_remote_url(
-            "https://github.com/-bad/name"
-        )
-        .is_none());
+        assert!(tole_cli::tool_roster::github_repo_from_remote_url("not a url").is_none());
+        assert!(
+            tole_cli::tool_roster::github_repo_from_remote_url("https://github.com/-bad/name")
+                .is_none()
+        );
     }
 
     /// #352: only a host that is EXACTLY github.com counts; the string
@@ -3049,7 +3049,7 @@ mod gh_repo_tests {
     /// redirect the gh tool to an attacker-named repo.
     #[test]
     fn host_must_be_exactly_github_com() {
-        let parse = tole_cli::session_host::github_repo_from_remote_url;
+        let parse = tole_cli::tool_roster::github_repo_from_remote_url;
         for bad in [
             "https://notgithub.com/owner/name",
             "https://github.com.evil.io/owner/name",
@@ -3072,7 +3072,7 @@ mod gh_repo_tests {
 
     #[test]
     fn accepts_the_real_github_forms() {
-        let parse = tole_cli::session_host::github_repo_from_remote_url;
+        let parse = tole_cli::tool_roster::github_repo_from_remote_url;
         for (url, want) in [
             ("https://github.com/o/r", "o/r"),
             ("https://github.com/o/r/", "o/r"),
@@ -3125,7 +3125,7 @@ mod gh_repo_tests {
             "origin",
             "https://github.com/detected/owner-name.git",
         ]);
-        let detected = tole_cli::session_host::detect_github_repo(&dir);
+        let detected = tole_cli::tool_roster::detect_github_repo(&dir);
         assert_eq!(detected.as_deref(), Some("detected/owner-name"));
         let _ = std::fs::remove_dir_all(&dir);
     }

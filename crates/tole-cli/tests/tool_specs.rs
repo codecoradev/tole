@@ -8,8 +8,8 @@
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tole_cli::session_host::UpdatePlanTool;
 use tole_cli::session_tools::SessionToolState;
+use tole_cli::tool_roster::UpdatePlanTool;
 use tole_cli::tools::WriteFileTool;
 use tole_core::approval::{Approver, ToolRequest, Verdict};
 use tole_core::tool::{Tool, ToolRegistry};
