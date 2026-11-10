@@ -64,6 +64,15 @@ struct Cli {
     #[arg(long, global = true)]
     mcp_server: Vec<String>,
 
+    /// Review gate before `git commit` (#534), active while the cora review
+    /// tools are attached: `block` (default) refuses a commit whose staged
+    /// diff was not reviewed, `warn` lets it through with a note, `off`
+    /// never gates. Same as TOLE_REVIEW_GATE; the flag wins. Needs cora
+    /// >= 0.20.0 (`cora hook verify`).
+    #[cfg(feature = "shell-tools")]
+    #[arg(long, global = true, value_enum)]
+    review_gate: Option<tole_cli::review_gate::Policy>,
+
     /// Skip the auto-detected MCP presets (currently: the local `cora mcp`
     /// server attached when the `cora` binary is on PATH). Explicit
     /// --mcp-server flags are unaffected. Requires the `mcp` feature.
@@ -589,6 +598,12 @@ fn main() {
     };
     #[cfg(not(feature = "tui"))]
     let cli = Cli::parse();
+    // `--review-gate` travels as the env var the roster reads, so child
+    // agents (which inherit the environment) are gated the same way.
+    #[cfg(feature = "shell-tools")]
+    if let Some(p) = cli.review_gate {
+        std::env::set_var(tole_cli::review_gate::ENV, p.as_str());
+    }
     if let Err(e) = dispatch(cli) {
         eprintln!("tole: {e:#}");
         std::process::exit(1);
