@@ -49,7 +49,7 @@ const PERMISSION_TIMEOUT: Duration = Duration::from_secs(600);
 /// state, so the override survives `session/load` in a fresh process
 /// and `run_session_turn` (shared with `tole serve`) applies it when
 /// building the provider.
-const MODEL_REGISTER: (&str, &str) = ("fact", "model");
+const MODEL_REGISTER: (&str, &str) = tole_cli::session_settings::MODEL;
 
 // ---------------------------------------------------------------------------
 // Model picker: ACP session config options (issue #176)
@@ -1189,13 +1189,7 @@ fn set_model_option(
         // Durable write (append-only register entry), replayed by
         // session/load and honored by run_session_turn on every turn.
         let mut storage = state.storage.lock().unwrap_or_else(|p| p.into_inner());
-        let commit =
-            tole_core::storage::Commit::new().register(tole_core::register::RegisterWrite::set(
-                MODEL_REGISTER.0,
-                MODEL_REGISTER.1,
-                json!(value),
-            ));
-        if let Err(e) = storage.commit(commit) {
+        if let Err(e) = tole_cli::session_settings::write_model(&mut *storage, value) {
             reply_error(conn, id, &format!("storing model override: {e}"));
             return;
         }
