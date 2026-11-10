@@ -834,6 +834,18 @@ fn dispatch(cli: Cli) -> Result<()> {
         anyhow::bail!(msg);
     }
     config_apply::install_effort(settings.reasoning_effort.as_ref().map(|e| e.value.clone()));
+    // A config `review_gate` reaches the roster the same way the flag does:
+    // as the env var (child agents inherit it). Flag and env already won
+    // inside `Settings::resolve`, so only a config value is exported here.
+    #[cfg(feature = "shell-tools")]
+    if let Some(g) = &settings.review_gate {
+        if matches!(
+            g.source,
+            config_apply::Source::Config | config_apply::Source::UserConfig
+        ) {
+            std::env::set_var(tole_cli::review_gate::ENV, &g.value);
+        }
+    }
     // Startup update notification (issue #220): banner is best-effort,
     // cache-backed, and skipped entirely for `tole upgrade` (which does
     // its own check) and for TOLE_NO_UPDATE_CHECK=1 (checked inside).

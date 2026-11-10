@@ -459,10 +459,14 @@ tole computes and trusts no hash of its own, and a verdict for another diff
   tools are registered. With `--no-auto-mcp`, no cora, or any face without MCP
   servers (`serve`, `acp`, `mcp`), there is no gate.
 - **Operator control.** `TOLE_REVIEW_GATE=off|warn|block` or `--review-gate`
-  (the flag wins). It is deliberately not a config key yet: a project's
-  `.tole/config.toml` is untrusted input, and a `review_gate = "off"` there
-  would let a cloned repo switch the gate off. When it becomes one it joins the
-  security-sensitive keys behind the content-bound trust gate. The model cannot
+  (the flag wins), or the config key `review_gate`. A project's
+  `.tole/config.toml` is untrusted input, so the key is merged differently from
+  every other one: the STRICTER of the project and user values applies
+  (`block` > `warn` > `off`), so a cloned repo can keep or tighten the gate but
+  never switch off what the user chose. With only the project layer set, the
+  value is used as given, behind the same content-bound trust gate as the other
+  security-sensitive keys (a trusted file that says `off` is the user's own
+  decision). Flag and env still win over config. The model cannot
   change it (the environment is not model-writable and `cora hook verify` runs
   with the child-env scrub). Child agents inherit the environment, so they are
   gated the same way.
