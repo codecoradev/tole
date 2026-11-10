@@ -193,6 +193,10 @@ fn handle(mut stream: TcpStream, behavior: &Behavior, seen: &Mutex<Vec<Seen>>, d
     }
 }
 
+// NOTE: every test must use its OWN server name (httpa, httpb, ...). The MCP
+// reactor is one per process and keeps connections keyed by name, so two tests
+// sharing a name would talk to each other's fake server.
+
 /// Write tools (every MCP tool) only register behind an approval gate.
 fn registry() -> ToolRegistry {
     ToolRegistry::with_approver(AllowlistApprover::allow_only(vec!["mcp_*".into()]))
@@ -385,6 +389,6 @@ fn an_unparseable_url_built_without_parse_is_an_error_and_the_reactor_survives()
     // The reactor still serves a healthy server afterwards.
     let fake = start(Behavior::default());
     let mut reg = registry();
-    let names = register_server_tools(&mut reg, &cfg("httpb", &fake));
-    assert_eq!(names, vec!["mcp_httpb_echo".to_string()]);
+    let names = register_server_tools(&mut reg, &cfg("httpg", &fake));
+    assert_eq!(names, vec!["mcp_httpg_echo".to_string()]);
 }
