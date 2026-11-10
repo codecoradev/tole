@@ -616,7 +616,7 @@ const RESERVED_HEADERS: [&str; 5] = [
 /// `${NAME}` references in a header value, expanded from `env`. A
 /// reference to an unset variable is an error naming the variable (never
 /// the value). No other syntax: `$NAME` and `$$` stay literal.
-fn expand_vars(v: &str, env: &dyn Fn(&str) -> Option<String>) -> Result<String, String> {
+fn expand_vars(var: &str, v: &str, env: &dyn Fn(&str) -> Option<String>) -> Result<String, String> {
     let mut out = String::with_capacity(v.len());
     let mut rest = v;
     while let Some(start) = rest.find("${") {
@@ -624,16 +624,14 @@ fn expand_vars(v: &str, env: &dyn Fn(&str) -> Option<String>) -> Result<String, 
         let after = &rest[start + 2..];
         let end = after
             .find('}')
-            .ok_or_else(|| format!("{SEARCH_HEADERS_ENV}: unterminated `${{` in a header value"))?;
+            .ok_or_else(|| format!("{var}: unterminated `${{` in a header value"))?;
         let name = &after[..end];
         if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
-            return Err(format!(
-                "{SEARCH_HEADERS_ENV}: `${{{name}}}` is not a variable name"
-            ));
+            return Err(format!("{var}: `${{{name}}}` is not a variable name"));
         }
         let value = env(name)
             .filter(|v| !v.is_empty())
-            .ok_or_else(|| format!("{SEARCH_HEADERS_ENV}: `${{{name}}}` is not set"))?;
+            .ok_or_else(|| format!("{var}: `${{{name}}}` is not set"))?;
         out.push_str(&value);
         rest = &after[end + 1..];
     }
@@ -652,29 +650,28 @@ fn is_token(name: &str) -> bool {
 /// Parse `TOLE_WEB_SEARCH_HEADERS`. Errors name the header, never its
 /// value (it usually carries a credential).
 fn parse_headers(
+    var: &str,
     raw: &str,
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Result<Vec<(String, String)>, String> {
     let mut out = Vec::new();
     for pair in raw.split(',').map(str::trim).filter(|p| !p.is_empty()) {
-        let (name, value) = pair.split_once('=').ok_or_else(|| {
-            format!("{SEARCH_HEADERS_ENV}: expected `Name=Value`, got a pair without `=`")
-        })?;
+        let (name, value) = pair
+            .split_once('=')
+            .ok_or_else(|| format!("{var}: expected `Name=Value`, got a pair without `=`"))?;
         let name = name.trim();
         if !is_token(name) {
-            return Err(format!(
-                "{SEARCH_HEADERS_ENV}: `{name}` is not a header name"
-            ));
+            return Err(format!("{var}: `{name}` is not a header name"));
         }
         if RESERVED_HEADERS.contains(&name.to_ascii_lowercase().as_str()) {
             return Err(format!(
-                "{SEARCH_HEADERS_ENV}: `{name}` is set by tole itself and cannot be configured"
+                "{var}: `{name}` is set by tole itself and cannot be configured"
             ));
         }
-        let value = expand_vars(value.trim(), env)?;
+        let value = expand_vars(var, value.trim(), env)?;
         if value.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0) {
             return Err(format!(
-                "{SEARCH_HEADERS_ENV}: the value of `{name}` contains a line break"
+                "{var}: the value of `{name}` contains a line break"
             ));
         }
         out.push((name.to_string(), value));
@@ -762,7 +759,7 @@ impl WebSearchTool {
             }
         };
         let headers = match env(SEARCH_HEADERS_ENV) {
-            Some(raw) => parse_headers(&raw, env)?,
+            Some(raw) => parse_headers(SEARCH_HEADERS_ENV, &raw, env)?,
             None => Vec::new(),
         };
         let fields = match env(SEARCH_FIELDS_ENV) {
@@ -849,6 +846,221 @@ impl Tool for WebSearchTool {
             })
             .unwrap_or_default();
         Ok(json!({"query": query, "results": results}))
+    }
+}
+
+/// Fetch backend URL (#532). Unset: `web_fetch` is the direct fetcher.
+pub const FETCH_URL_ENV: &str = "TOLE_WEB_FETCH_URL";
+/// `GET` (default) or `POST`.
+pub const FETCH_METHOD_ENV: &str = "TOLE_WEB_FETCH_METHOD";
+/// Extra request headers, `Name=Value` pairs separated by commas; sent
+/// only to the backend.
+pub const FETCH_HEADERS_ENV: &str = "TOLE_WEB_FETCH_HEADERS";
+/// Response field mapping: `content=<backend field>`.
+pub const FETCH_FIELDS_ENV: &str = "TOLE_WEB_FETCH_FIELDS";
+
+/// `web_fetch` through a configured backend (`TOLE_WEB_FETCH_URL`), for
+/// pages that need a real browser. Default contract:
+/// `GET {url}?url=<target>` -> `{"content": "<text>"}`; `POST {url}` sends
+/// `{"url": "<target>"}`. Same name, risk and trust model as the direct
+/// fetcher and as `web_search`: ReadOnly, the output is model content and
+/// is never executed.
+///
+/// tole vets the target before anything leaves the machine: https only, no
+/// credentials in the URL, and a host that resolves to public addresses
+/// (`TOLE_WEB_ALLOW_PRIVATE=1` opts out, as for the direct fetcher). The
+/// backend resolves the host again on its own, so this is a guard against
+/// asking a remote service about internal addresses, not a defense against
+/// DNS rebinding at the backend. The target URL is disclosed to the backend
+/// operator. Backend headers are sent only to the backend; redirects from
+/// the backend are not followed; header values never appear in errors.
+pub struct WebBackendFetchTool {
+    backend: String,
+    method: SearchMethod,
+    headers: Vec<(String, String)>,
+    content_field: String,
+}
+
+impl WebBackendFetchTool {
+    /// The default contract for `backend`, no extra headers.
+    pub fn new(backend: impl Into<String>) -> Self {
+        WebBackendFetchTool {
+            backend: backend.into(),
+            method: SearchMethod::Get,
+            headers: Vec::new(),
+            content_field: "content".into(),
+        }
+    }
+
+    /// `Ok(None)` when `TOLE_WEB_FETCH_URL` is unset or blank; an error
+    /// naming the variable when the URL, method, headers or fields are
+    /// malformed (startup fails, as for `web_search`).
+    pub fn from_env() -> Result<Option<Self>, String> {
+        Self::from_lookup(&|k| std::env::var(k).ok())
+    }
+
+    /// [`Self::from_env`] over an injected lookup.
+    pub fn from_lookup(env: &dyn Fn(&str) -> Option<String>) -> Result<Option<Self>, String> {
+        let Some(backend) = env(FETCH_URL_ENV)
+            .map(|b| b.trim().to_string())
+            .filter(|b| !b.is_empty())
+        else {
+            return Ok(None);
+        };
+        if !(backend.starts_with("http://") || backend.starts_with("https://")) {
+            return Err(format!("{FETCH_URL_ENV}: expected an http(s) URL"));
+        }
+        let method = match env(FETCH_METHOD_ENV)
+            .map(|m| m.trim().to_ascii_uppercase())
+            .filter(|m| !m.is_empty())
+            .as_deref()
+        {
+            None | Some("GET") => SearchMethod::Get,
+            Some("POST") => SearchMethod::Post,
+            Some(other) => {
+                return Err(format!(
+                    "{FETCH_METHOD_ENV}: expected GET or POST, got `{other}`"
+                ))
+            }
+        };
+        let headers = match env(FETCH_HEADERS_ENV) {
+            Some(raw) => parse_headers(FETCH_HEADERS_ENV, &raw, env)?,
+            None => Vec::new(),
+        };
+        let mut content_field = "content".to_string();
+        if let Some(raw) = env(FETCH_FIELDS_ENV) {
+            for pair in raw.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+                let (wire, backend_field) = pair.split_once('=').ok_or_else(|| {
+                    format!("{FETCH_FIELDS_ENV}: expected `content=<field>`, got `{pair}`")
+                })?;
+                if wire.trim() != "content" {
+                    return Err(format!(
+                        "{FETCH_FIELDS_ENV}: unknown field `{}` (expected content)",
+                        wire.trim()
+                    ));
+                }
+                let f = backend_field.trim();
+                if f.is_empty() {
+                    return Err(format!(
+                        "{FETCH_FIELDS_ENV}: `{pair}` names no backend field"
+                    ));
+                }
+                content_field = f.to_string();
+            }
+        }
+        Ok(Some(WebBackendFetchTool {
+            backend,
+            method,
+            headers,
+            content_field,
+        }))
+    }
+
+    /// Refuse a target that must not be sent to a remote backend.
+    fn vet_target(url: &str) -> Result<(), String> {
+        let rest = url
+            .strip_prefix("https://")
+            .ok_or("web_fetch: only https URLs go through the fetch backend")?;
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+        if authority.contains('@') {
+            return Err("web_fetch: URLs with credentials are not fetchable".into());
+        }
+        host_is_public_opt(url, ssrf_opt_out())
+    }
+}
+
+impl Tool for WebBackendFetchTool {
+    fn name(&self) -> &str {
+        "web_fetch"
+    }
+    fn risk(&self) -> Risk {
+        Risk::ReadOnly
+    }
+    fn summary(&self) -> String {
+        "Fetch an https URL through the configured fetch backend (it may render JavaScript-heavy \
+         pages) and return its text, size-capped."
+            .into()
+    }
+    fn describe(&self, input: &Value) -> String {
+        format!(
+            "fetch {} via the fetch backend (text-only, size-capped)",
+            input["url"].as_str().unwrap_or("?")
+        )
+    }
+    fn spec(&self) -> Option<Value> {
+        Some(json!({
+            "type": "object",
+            "properties": {"url": {"type": "string",
+                "description": "https URL to fetch"}},
+            "required": ["url"]
+        }))
+    }
+    fn execute(&self, input: Value) -> Result<Value, String> {
+        let target = input["url"]
+            .as_str()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .ok_or("web_fetch: 'url' is required")?;
+        Self::vet_target(target)?;
+        let agent = agent();
+        let sent = match self.method {
+            SearchMethod::Get => {
+                let url = format!(
+                    "{}{}url={}",
+                    self.backend,
+                    if self.backend.contains('?') { "&" } else { "?" },
+                    urlencoding_lite(target)
+                );
+                let mut req = agent.get(&url);
+                for (k, v) in &self.headers {
+                    req = req.header(k.as_str(), v.as_str());
+                }
+                req.call()
+            }
+            SearchMethod::Post => {
+                let mut req = agent.post(&self.backend);
+                for (k, v) in &self.headers {
+                    req = req.header(k.as_str(), v.as_str());
+                }
+                req.send_json(json!({"url": target}))
+            }
+        };
+        let mut res = sent.map_err(|e| format!("web_fetch: backend: {e}"))?;
+        use std::io::Read;
+        // The backend's JSON envelope is read under a bound of its own.
+        let mut buf = Vec::new();
+        res.body_mut()
+            .as_reader()
+            .take((FETCH_CAP_BYTES * 2 + 1) as u64)
+            .read_to_end(&mut buf)
+            .map_err(|e| format!("web_fetch: backend read: {e}"))?;
+        if buf.len() > FETCH_CAP_BYTES * 2 {
+            return Err("web_fetch: backend response is too large".into());
+        }
+        let body: Value = serde_json::from_slice(&buf)
+            .map_err(|e| format!("web_fetch: backend returned non-JSON: {e}"))?;
+        let text = body[self.content_field.as_str()].as_str().ok_or_else(|| {
+            format!(
+                "web_fetch: backend response has no string field `{}`",
+                self.content_field
+            )
+        })?;
+        let truncated = text.len() > FETCH_CAP_BYTES;
+        let text = if truncated {
+            let mut end = FETCH_CAP_BYTES;
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            &text[..end]
+        } else {
+            text
+        };
+        Ok(json!({
+            "url": target,
+            "content_type": "text/plain (via fetch backend)",
+            "truncated": truncated,
+            "text": cap_chars(text, 20_000),
+        }))
     }
 }
 
@@ -1359,5 +1571,218 @@ mod tests {
         );
         // The description of the call never carries a header value.
         assert!(!t.describe(&json!({"query": "q"})).contains("k-1"));
+    }
+
+    // ---- fetch backend (#532) ----
+
+    /// One-shot backend: replies `status` with `body`, sends the raw
+    /// request (headers and body) back on the channel.
+    fn mock_backend(
+        status: u16,
+        body: String,
+    ) -> (std::net::SocketAddr, std::sync::mpsc::Receiver<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut s, _) = listener.accept().unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(5))).ok();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let n = s.read(&mut chunk).unwrap_or(0);
+                buf.extend_from_slice(&chunk[..n]);
+                let text = String::from_utf8_lossy(&buf).to_string();
+                if let Some(h) = text.find("\r\n\r\n") {
+                    let want = text[..h]
+                        .to_ascii_lowercase()
+                        .split("content-length:")
+                        .nth(1)
+                        .and_then(|v| v.split("\r\n").next())
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if text.len() >= h + 4 + want {
+                        break;
+                    }
+                }
+                if n == 0 {
+                    break;
+                }
+            }
+            let _ = tx.send(String::from_utf8_lossy(&buf).to_string());
+            let _ = s.write_all(
+                format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+        });
+        (addr, rx)
+    }
+
+    fn fetch_tool(addr: std::net::SocketAddr, extra: &[(&str, &str)]) -> WebBackendFetchTool {
+        let url = format!("http://{addr}/fetch");
+        let mut pairs = vec![(FETCH_URL_ENV, url.as_str())];
+        pairs.extend_from_slice(extra);
+        WebBackendFetchTool::from_lookup(&lookup(&pairs))
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn fetch_backend_is_off_unless_configured_and_bad_config_fails() {
+        assert!(WebBackendFetchTool::from_lookup(&lookup(&[]))
+            .unwrap()
+            .is_none());
+        assert!(
+            WebBackendFetchTool::from_lookup(&lookup(&[(FETCH_URL_ENV, "  ")]))
+                .unwrap()
+                .is_none()
+        );
+        for (k, v, needle) in [
+            (FETCH_URL_ENV, "ftp://x", "expected an http(s) URL"),
+            (FETCH_METHOD_ENV, "PUT", "expected GET or POST"),
+            (FETCH_HEADERS_ENV, "Host=x", "cannot be configured"),
+            (FETCH_HEADERS_ENV, "A=${NOPE}", "`${NOPE}` is not set"),
+            (FETCH_FIELDS_ENV, "text=body", "unknown field `text`"),
+            (FETCH_FIELDS_ENV, "content=", "names no backend field"),
+        ] {
+            let mut pairs = vec![(FETCH_URL_ENV, "http://b/f")];
+            pairs.push((k, v));
+            let e = WebBackendFetchTool::from_lookup(&lookup(&pairs))
+                .err()
+                .unwrap();
+            assert!(
+                e.contains(needle) && e.contains("TOLE_WEB_FETCH"),
+                "{v:?} -> {e}"
+            );
+        }
+    }
+
+    /// Targets that must never reach a remote backend are refused first:
+    /// the mock backend must not even see a connection.
+    #[test]
+    fn fetch_backend_refuses_bad_targets_before_sending_anything() {
+        let _env = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("TOLE_WEB_ALLOW_PRIVATE");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let t = fetch_tool(addr, &[]);
+        for target in [
+            "http://example.com/",
+            "https://user:pw@example.com/",
+            "https://u@example.com/",
+            "https://127.0.0.1/x",
+            "https://localhost/x",
+            "https://10.1.2.3/x",
+            "https://169.254.169.254/latest",
+            "file:///etc/passwd",
+            "ftp://example.com/",
+        ] {
+            assert!(t.execute(json!({"url": target})).is_err(), "{target}");
+        }
+        assert!(t.execute(json!({})).is_err());
+        assert!(
+            listener.accept().is_err(),
+            "a refused target reached the backend"
+        );
+    }
+
+    #[test]
+    fn fetch_backend_get_sends_encoded_target_and_headers_only_to_backend() {
+        let _env = ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOLE_WEB_ALLOW_PRIVATE", "1");
+        let (addr, rx) = mock_backend(200, json!({"page": "hello <b>world</b>"}).to_string());
+        let t = fetch_tool(
+            addr,
+            &[
+                (FETCH_HEADERS_ENV, "Authorization=Bearer ${KEY}"),
+                (FETCH_FIELDS_ENV, "content=page"),
+                ("KEY", "sekret-1"),
+            ],
+        );
+        let out = t.execute(json!({"url": "https://127.0.0.1/a?x=1&y=2"}));
+        std::env::remove_var("TOLE_WEB_ALLOW_PRIVATE");
+        let out = out.unwrap();
+        assert_eq!(out["text"], "hello <b>world</b>");
+        assert_eq!(out["truncated"], false);
+        assert_eq!(out["url"], "https://127.0.0.1/a?x=1&y=2");
+        let req = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let line = req.lines().next().unwrap();
+        assert!(line.starts_with("GET /fetch?url=https"), "{line}");
+        assert!(
+            line.contains("%26y%3D2") && !line.contains("&y=2"),
+            "{line}"
+        );
+        assert!(req
+            .to_ascii_lowercase()
+            .contains("authorization: bearer sekret-1"));
+        // Neither the description nor the spec carries the credential.
+        let shown = format!(
+            "{} {}",
+            t.describe(&json!({"url": "https://x"})),
+            t.summary()
+        );
+        assert!(!shown.contains("sekret-1"));
+    }
+
+    #[test]
+    fn fetch_backend_post_sends_json_and_errors_never_echo_headers() {
+        let _env = ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOLE_WEB_ALLOW_PRIVATE", "1");
+        let (addr, rx) = mock_backend(200, json!({"content": "ok"}).to_string());
+        let t = fetch_tool(addr, &[(FETCH_METHOD_ENV, "POST")]);
+        let out = t.execute(json!({"url": "https://127.0.0.1/p"})).unwrap();
+        assert_eq!(out["text"], "ok");
+        let req = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(req.starts_with("POST /fetch "), "{req}");
+        let body: Value = serde_json::from_str(&req[req.find("\r\n\r\n").unwrap() + 4..]).unwrap();
+        assert_eq!(body, json!({"url": "https://127.0.0.1/p"}));
+        // A failing backend: the error names the status, not the secret.
+        let (addr, _rx) = mock_backend(500, "{}".into());
+        let t = fetch_tool(
+            addr,
+            &[(FETCH_HEADERS_ENV, "X-Key=${K}"), ("K", "sekret-2")],
+        );
+        let e = t
+            .execute(json!({"url": "https://127.0.0.1/p"}))
+            .err()
+            .unwrap();
+        std::env::remove_var("TOLE_WEB_ALLOW_PRIVATE");
+        assert!(e.contains("500") && !e.contains("sekret-2"), "{e}");
+    }
+
+    #[test]
+    fn fetch_backend_output_is_capped_and_shape_checked() {
+        let _env = ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOLE_WEB_ALLOW_PRIVATE", "1");
+        // Over the byte cap but inside the envelope bound: truncated.
+        let big = "é".repeat(FETCH_CAP_BYTES / 2 + 1000);
+        let (addr, _rx) = mock_backend(200, json!({"content": big}).to_string());
+        let out = fetch_tool(addr, &[])
+            .execute(json!({"url": "https://127.0.0.1/p"}))
+            .unwrap();
+        assert_eq!(out["truncated"], true);
+        assert!(out["text"].as_str().unwrap().chars().count() <= 20_001);
+        // No such field, not JSON, and an oversize envelope are errors.
+        for (body, needle) in [
+            (
+                json!({"other": "x"}).to_string(),
+                "no string field `content`",
+            ),
+            ("<html>".to_string(), "non-JSON"),
+            ("x".repeat(FETCH_CAP_BYTES * 2 + 10), "too large"),
+        ] {
+            let (addr, _rx) = mock_backend(200, body);
+            let e = fetch_tool(addr, &[])
+                .execute(json!({"url": "https://127.0.0.1/p"}))
+                .err()
+                .unwrap();
+            assert!(e.contains(needle), "{needle}: {e}");
+        }
+        std::env::remove_var("TOLE_WEB_ALLOW_PRIVATE");
     }
 }

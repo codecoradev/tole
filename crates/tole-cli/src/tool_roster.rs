@@ -242,7 +242,10 @@ pub fn build(approver: impl Approver + 'static, roster: Roster) -> Result<ToolRe
     }
     add(&mut reg, tracked(Box::new(ReadFileTool::new(root.clone()))))?;
     // Web tools (#215): fetch always; search only with a backend.
-    add(&mut reg, Box::new(tole_core::web::WebFetchTool))?;
+    match tole_core::web::WebBackendFetchTool::from_env().map_err(anyhow::Error::msg)? {
+        Some(fetch) => add(&mut reg, Box::new(fetch))?,
+        None => add(&mut reg, Box::new(tole_core::web::WebFetchTool))?,
+    }
     // A malformed search config (#436) fails startup loudly.
     if let Some(search) = tole_core::web::WebSearchTool::from_env().map_err(anyhow::Error::msg)? {
         add(&mut reg, Box::new(search))?;
