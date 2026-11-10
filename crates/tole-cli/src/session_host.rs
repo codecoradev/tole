@@ -359,15 +359,14 @@ pub fn open_session(
         tole_core::storage::JsonlStorage::open(dir.join(format!("{session_id}.jsonl")))
             .map_err(|e| format!("loading session: {e}"))?
     } else {
-        let storage = tole_core::storage::JsonlStorage::create_with(
+        create_session(
             &dir,
             session_id,
-            None,
             system_prompt.as_deref(),
+            None,
+            Some("server"),
         )
-        .map_err(|e| format!("creating session: {e}"))?;
-        crate::session_index::record(&dir, session_id, "server");
-        storage
+        .map_err(|e| format!("creating session: {e}"))?
     };
     // Task-list tools (issue #198): registered after the storage open —
     // the state is seeded from the replayed transcript, so crash-resume
@@ -386,6 +385,26 @@ pub fn open_session(
         cancel,
         tool_ids: StdArc::new(Mutex::new(0)),
     })
+}
+
+/// Create a session file in `dir` and register it in the global session
+/// index under `face` (`None` = do not index, e.g. tests that must stay off
+/// the user's index). The one place a new session is created AND registered,
+/// so a face cannot create one and forget the other (#525). Errors are the
+/// storage's own; each caller adds its own context.
+pub fn create_session(
+    dir: &std::path::Path,
+    id: &str,
+    system_prompt: Option<&str>,
+    name: Option<&str>,
+    face: Option<&str>,
+) -> Result<tole_core::storage::JsonlStorage, tole_core::storage::StorageError> {
+    let storage =
+        tole_core::storage::JsonlStorage::create_named(dir, id, None, system_prompt, name)?;
+    if let Some(face) = face {
+        crate::session_index::record(dir, id, face);
+    }
+    Ok(storage)
 }
 
 pub fn sessions_dir_for(cwd: &str) -> Result<PathBuf, String> {

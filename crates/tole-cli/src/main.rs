@@ -1864,15 +1864,14 @@ fn run_command(
     // after the cora review flow when its tools are attached (#422).
     let review = review_section(&registry);
     let system_prompt = system_prompt.map(|p| format!("{p}{review}{skill_sections}"));
-    let mut storage = JsonlStorage::create_named(
+    let mut storage = tole_cli::session_host::create_session(
         sessions_dir,
         &session_id,
-        None,
         system_prompt.as_deref(),
         name,
+        Some("run"),
     )
     .with_context(|| format!("creating session {session_id}"))?;
-    tole_cli::session_index::record(sessions_dir, &session_id, "run");
     println!("session: {session_id}");
     if let Some(alias) = name {
         println!("name: {alias}");
@@ -2492,11 +2491,14 @@ fn chat_command(
         // after the cora review flow when its tools are attached (#422).
         let review = review_section(&registry);
         let system_prompt = system_prompt.map(|p| format!("{p}{review}{skill_sections}"));
-        let storage =
-            JsonlStorage::create_with(sessions_dir, &session_id, None, system_prompt.as_deref())
-                .with_context(|| format!("creating session {session_id}"))?;
-        tole_cli::session_index::record(sessions_dir, &session_id, "chat");
-        storage
+        tole_cli::session_host::create_session(
+            sessions_dir,
+            &session_id,
+            system_prompt.as_deref(),
+            None,
+            Some("chat"),
+        )
+        .with_context(|| format!("creating session {session_id}"))?
     } else {
         JsonlStorage::open(&path).context("replaying session log")?
     };
@@ -2837,10 +2839,14 @@ fn tui_command(
             std::fs::create_dir_all(sessions_dir)
                 .with_context(|| format!("creating {}", sessions_dir.display()))?;
             let id = new_session_id();
-            let s = JsonlStorage::create_with(sessions_dir, &id, None, Some(&prompt))
-                .with_context(|| format!("creating session {id}"))?;
-            tole_cli::session_index::record(sessions_dir, &id, "tui");
-            s
+            tole_cli::session_host::create_session(
+                sessions_dir,
+                &id,
+                Some(&prompt),
+                None,
+                Some("tui"),
+            )
+            .with_context(|| format!("creating session {id}"))?
         }
     };
     tool_roster::register_todo(&mut registry, storage.entries(), host.plan_mode)?;

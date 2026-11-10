@@ -281,12 +281,14 @@ impl TuiHost for TuiSession {
     fn new_session(&self) -> Result<String, String> {
         std::fs::create_dir_all(&self.sessions_dir).map_err(|e| e.to_string())?;
         let id = crate::session_host::new_session_id("s");
-        let s =
-            JsonlStorage::create_with(&self.sessions_dir, &id, None, self.fresh_prompt.as_deref())
-                .map_err(|e| format!("creating session {id}: {e}"))?;
-        if self.index.is_some() {
-            crate::session_index::record(&self.sessions_dir, &id, "tui");
-        }
+        let s = crate::session_host::create_session(
+            &self.sessions_dir,
+            &id,
+            self.fresh_prompt.as_deref(),
+            None,
+            self.index.as_ref().map(|_| "tui"),
+        )
+        .map_err(|e| format!("creating session {id}: {e}"))?;
         Ok(self.swap(s))
     }
 

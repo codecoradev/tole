@@ -256,10 +256,14 @@ pub fn run_mission(
             // contract and the todo discipline in the session header —
             // resume re-applies it exactly (same as run's pinned prompt).
             let system_prompt = fresh_mission_prompt(&cfg.goal, cfg.verify.as_deref(), &registry);
-            let storage =
-                JsonlStorage::create_with(sessions_dir, &session_id, None, Some(&system_prompt))
-                    .with_context(|| format!("creating mission session {session_id}"))?;
-            tole_cli::session_index::record(sessions_dir, &session_id, "mission");
+            let storage = tole_cli::session_host::create_session(
+                sessions_dir,
+                &session_id,
+                Some(&system_prompt),
+                None,
+                Some("mission"),
+            )
+            .with_context(|| format!("creating mission session {session_id}"))?;
             eprintln!("mission: session {session_id}");
             (storage, session_id, Some(cfg.goal.clone()))
         }
