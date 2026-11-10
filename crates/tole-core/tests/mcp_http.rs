@@ -209,7 +209,23 @@ fn echo(tool: &dyn Tool, text: &str) -> Result<String, String> {
         .to_string())
 }
 
+/// The tokens every test relies on, set exactly once before any test touches
+/// the MCP reactor: its thread reads the environment, and changing the
+/// environment while another thread reads it is a data race. Servers `httpb`
+/// and `httpe` deliberately have no token.
+fn env() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        std::env::set_var("TOLE_MCP_HTTPA_TOKEN", "s3cr3t-token-a");
+        std::env::set_var("TOLE_MCP_HTTPC_TOKEN", "wrong-token-value");
+        std::env::set_var("TOLE_MCP_HTTPD_TOKEN", "redirect-token");
+        std::env::remove_var("TOLE_MCP_HTTPB_TOKEN");
+        std::env::remove_var("TOLE_MCP_HTTPE_TOKEN");
+    });
+}
+
 fn cfg(name: &str, fake: &Fake) -> McpServerConfig {
+    env();
     McpServerConfig::parse(&format!("{name}={}", fake.url())).unwrap()
 }
 
@@ -219,7 +235,6 @@ fn http_server_registers_tools_and_sends_the_env_token() {
         require_bearer: Some("s3cr3t-token-a".into()),
         ..Default::default()
     });
-    std::env::set_var("TOLE_MCP_HTTPA_TOKEN", "s3cr3t-token-a");
     let mut reg = registry();
     let names = register_server_tools(&mut reg, &cfg("httpa", &fake));
     assert_eq!(names, vec!["mcp_httpa_echo".to_string()]);
@@ -243,7 +258,6 @@ fn http_server_registers_tools_and_sends_the_env_token() {
 #[test]
 fn http_server_without_a_token_sends_no_authorization() {
     let fake = start(Behavior::default());
-    std::env::remove_var("TOLE_MCP_HTTPB_TOKEN");
     let mut reg = registry();
     let names = register_server_tools(&mut reg, &cfg("httpb", &fake));
     assert_eq!(names, vec!["mcp_httpb_echo".to_string()]);
@@ -260,7 +274,6 @@ fn rejected_connection_error_hides_token_url_and_host() {
         require_bearer: Some("the-right-token".into()),
         ..Default::default()
     });
-    std::env::set_var("TOLE_MCP_HTTPC_TOKEN", "wrong-token-value");
     let c = cfg("httpc", &fake);
     // The probe registers the config in the reactor (and degrades silently);
     // the next op surfaces the connection error.
@@ -284,7 +297,6 @@ fn cross_origin_redirect_is_not_followed() {
         redirect_to: Some(target.url()),
         ..Default::default()
     });
-    std::env::set_var("TOLE_MCP_HTTPD_TOKEN", "redirect-token");
     let c = cfg("httpd", &origin);
     probe_server_extras(&c);
     assert!(
@@ -301,7 +313,6 @@ fn cross_origin_redirect_is_not_followed() {
 #[test]
 fn dropped_connection_evicts_and_the_next_call_reconnects() {
     let fake = start(Behavior::default());
-    std::env::remove_var("TOLE_MCP_HTTPE_TOKEN");
     let mut reg = registry();
     register_server_tools(&mut reg, &cfg("httpe", &fake));
     let tool = reg.get("mcp_httpe_echo").unwrap();

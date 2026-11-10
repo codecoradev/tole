@@ -637,7 +637,20 @@ async fn start_server(
                 tcfg = tcfg.auth_header(token);
             }
             ensure_tls_provider();
-            let transport = rmcp::transport::StreamableHttpClientTransport::from_config(tcfg);
+            // rmcp builds its default reqwest client with `.expect(..)`, which
+            // can panic (for example when no TLS roots can be loaded). A panic
+            // here would kill the shared reactor thread, and with it every MCP
+            // server of the process, stdio ones included, so degrade to an
+            // ordinary startup warning instead.
+            let transport = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                rmcp::transport::StreamableHttpClientTransport::from_config(tcfg)
+            }))
+            .map_err(|_| {
+                format!(
+                    "mcp {:?}: could not build the HTTP client (are TLS root certificates installed?)",
+                    cfg.name
+                )
+            })?;
             tokio::time::timeout(
                 SUBPROCESS_TIMEOUT,
                 rmcp::service::serve_client(rmcp::model::ClientConfig::default(), transport),

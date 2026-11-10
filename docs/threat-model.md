@@ -383,6 +383,13 @@ they trust. What the transport adds:
   project-config trust gate above (a changed file is untrusted again), so a
   repo cannot add or repoint a server without the operator approving the
   exact bytes. User-level config and flags are operator trust.
+- **Residual: the env name folds case.** `Nginjen` and `nginjen` are two
+  server names but one variable (`TOLE_MCP_NGINJEN_TOKEN`), so they would
+  share a token. Name servers distinctly; a trusted config is operator trust.
+- **Residual: system proxy.** The HTTP client honors `HTTPS_PROXY` /
+  `HTTP_PROXY`. An `https` token stays end-to-end encrypted through a CONNECT
+  proxy, but a loopback `http` url reaches a proxy in clear unless
+  `NO_PROXY` lists loopback.
 - **Residual: availability.** A remote server can hang or stream slowly; the
   handshake and per-call timeouts and the connection-eviction contract are
   the same as for stdio, and a transport failure drops the connection so
