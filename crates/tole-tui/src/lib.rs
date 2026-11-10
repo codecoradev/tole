@@ -35,6 +35,7 @@ use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 use serde_json::Value;
 use tole_core::approval::Verdict;
 use tole_core::cancel::CancelToken;
+use tole_core::tool::Risk;
 use tole_core::turn::TurnObserver;
 
 pub use editor::Editor;
@@ -163,34 +164,111 @@ fn unsupported<T>() -> Result<T, String> {
     Err("not supported by this host".into())
 }
 
-/// A tool call waiting for y/n. Dropping it unanswered denies (fail closed).
-pub struct Pending {
+/// What a UI shows and decides on for one approval, whoever asked (#526): an
+/// in-process turn ([`Prompter::ask`]) or a remote source such as a server's
+/// `/approvals` queue ([`Prompter::post`]). It carries the risk tier, so the
+/// rule that a `Destructive` call is never "allowed always" lives in one place
+/// instead of in each UI.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApprovalRequest {
     text: String,
-    destructive: bool,
-    reply: Sender<Verdict>,
+    risk: Risk,
 }
 
-/// Handed to the host's approver; blocks the turn thread until the UI answers.
+impl ApprovalRequest {
+    /// `text` is reduced to one safe line (control characters removed).
+    pub fn new(text: impl AsRef<str>, risk: Risk) -> Self {
+        Self {
+            text: one_line(text.as_ref()),
+            risk,
+        }
+    }
+
+    /// What is being asked, as one line.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub fn risk(&self) -> Risk {
+        self.risk
+    }
+
+    pub fn is_destructive(&self) -> bool {
+        self.risk == Risk::Destructive
+    }
+
+    /// Whether a UI may offer to allow this kind of call from now on. Never for
+    /// `Destructive`: it is asked every time (the approver never allowlists it).
+    pub fn can_allow_always(&self) -> bool {
+        !self.is_destructive()
+    }
+}
+
+/// An approval waiting for an answer: the request plus where the verdict goes.
+/// The verdict is delivered exactly once, and **dropping the `Pending`
+/// unanswered denies** (fail closed), so a cancelled turn, a vanished UI or a
+/// dropped connection can never leave a call allowed.
+pub struct Pending {
+    request: ApprovalRequest,
+    reply: Option<Box<dyn FnOnce(Verdict) + Send>>,
+}
+
+impl Pending {
+    pub fn new(request: ApprovalRequest, reply: impl FnOnce(Verdict) + Send + 'static) -> Self {
+        Self {
+            request,
+            reply: Some(Box::new(reply)),
+        }
+    }
+
+    pub fn request(&self) -> &ApprovalRequest {
+        &self.request
+    }
+
+    /// Answer and consume.
+    fn resolve(mut self, verdict: Verdict) {
+        if let Some(reply) = self.reply.take() {
+            reply(verdict);
+        }
+    }
+}
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        if let Some(reply) = self.reply.take() {
+            reply(Verdict::Deny);
+        }
+    }
+}
+
+/// Handed to an approval source; puts requests in front of the UI.
 #[derive(Clone)]
 pub struct Prompter(Arc<Mutex<Sender<Pending>>>);
 
 impl Prompter {
-    pub fn ask(&self, text: String, destructive: bool) -> Verdict {
-        let text = one_line(&text);
-        let (reply, answer) = mpsc::channel();
-        let sent = self
-            .0
+    /// Hand a request to the UI without waiting; `reply` gets the verdict once.
+    /// Returns `false` when the UI is gone, in which case `reply` has already
+    /// been called with `Deny`.
+    pub fn post(
+        &self,
+        request: ApprovalRequest,
+        reply: impl FnOnce(Verdict) + Send + 'static,
+    ) -> bool {
+        let pending = Pending::new(request, reply);
+        self.0
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .send(Pending {
-                text,
-                destructive,
-                reply,
-            });
-        if sent.is_err() {
-            return Verdict::Deny;
-        }
-        answer.recv().unwrap_or(Verdict::Deny)
+            .send(pending)
+            .is_ok()
+    }
+
+    /// Ask and block until the UI answers (the in-process turn thread).
+    pub fn ask(&self, request: ApprovalRequest) -> Verdict {
+        let (tx, rx) = mpsc::channel();
+        self.post(request, move |v| {
+            let _ = tx.send(v);
+        });
+        rx.recv().unwrap_or(Verdict::Deny)
     }
 }
 
@@ -741,7 +819,7 @@ impl App {
             Key::Char('y' | 'Y') => (Verdict::Allow, "allowed"),
             Key::Char('n' | 'N') => (Verdict::Deny, "denied"),
             Key::Esc => {
-                let _ = p.reply.send(Verdict::Deny);
+                p.resolve(Verdict::Deny);
                 let lines = self.transcript.line(Kind::Note, "  denied");
                 self.out.extend(lines);
                 self.return_queue(Vec::new());
@@ -752,7 +830,7 @@ impl App {
                 return Action::None;
             }
         };
-        let _ = p.reply.send(verdict);
+        p.resolve(verdict);
         let lines = self.transcript.line(Kind::Note, &format!("  {note}"));
         self.out.extend(lines);
         Action::Redraw
@@ -776,14 +854,14 @@ impl App {
             Msg::ToolResult { ok, preview } => self.transcript.tool_result(ok, &preview),
             Msg::Approval(p) => {
                 let mut v = self.transcript.flush();
-                let tag = if p.destructive {
+                let tag = if p.request.is_destructive() {
                     "destructive"
                 } else {
                     "write"
                 };
                 v.extend(
                     self.transcript
-                        .line(Kind::Note, &format!("? {tag}: {}", p.text)),
+                        .line(Kind::Note, &format!("? {tag}: {}", p.request.text())),
                 );
                 self.approval = Some(p);
                 v
@@ -843,7 +921,7 @@ impl App {
             live_lines.extend(p.lines(w).into_iter().map(Line::from));
         } else if let Some(p) = &self.approval {
             live_lines.push(Line::styled(
-                format!("? {}", clip(&p.text, w.saturating_sub(2))),
+                format!("? {}", clip(p.request.text(), w.saturating_sub(2))),
                 Style::new().fg(Color::Yellow),
             ));
             live_lines.push(Line::from("[y] allow  [n] deny  [Esc] deny + cancel"));
@@ -1467,12 +1545,18 @@ mod tests {
     }
 
     fn pending(app: &mut App, destructive: bool) -> Receiver<Verdict> {
-        let (reply, rx) = mpsc::channel();
-        app.on_msg(Msg::Approval(Pending {
-            text: "write_file out.txt".into(),
-            destructive,
-            reply,
-        }));
+        let (tx, rx) = mpsc::channel();
+        let risk = if destructive {
+            Risk::Destructive
+        } else {
+            Risk::Write
+        };
+        app.on_msg(Msg::Approval(Pending::new(
+            ApprovalRequest::new("write_file out.txt", risk),
+            move |v| {
+                let _ = tx.send(v);
+            },
+        )));
         rx
     }
 
@@ -1498,14 +1582,136 @@ mod tests {
         let rx = pending(&mut app, false);
         app.running = true;
         assert_eq!(app.on_key(ctrl('c')), Action::Cancel);
-        assert!(rx.recv().is_err(), "dropped sender = Prompter sees Deny");
+        // The cancelled approval is dropped unanswered: the drop itself delivers
+        // the Deny (fail closed), once, whoever the source is.
+        assert_eq!(rx.recv().unwrap(), Verdict::Deny);
+        assert!(rx.try_recv().is_err(), "exactly one verdict");
     }
 
     #[test]
     fn prompter_denies_when_ui_is_gone() {
         let (p, rx) = approval_channel();
         drop(rx);
-        assert_eq!(p.ask("x".into(), false), Verdict::Deny);
+        assert_eq!(p.ask(ApprovalRequest::new("x", Risk::Write)), Verdict::Deny);
+    }
+
+    // ---- approvals as source-agnostic state (#526) ----
+
+    #[test]
+    fn an_approval_request_is_one_safe_line_and_carries_its_risk_tier() {
+        let r = ApprovalRequest::new("write_file a\x1b[2J\nb", Risk::Write);
+        assert_eq!(r.text(), "write_file a\\u{1b}[2J ⏎ b");
+        assert_eq!(r.risk(), Risk::Write);
+        assert!(!r.is_destructive());
+    }
+
+    #[test]
+    fn allow_always_is_never_offered_for_a_destructive_call() {
+        for (risk, offered) in [
+            (Risk::ReadOnly, true),
+            (Risk::Write, true),
+            (Risk::Destructive, false),
+        ] {
+            let r = ApprovalRequest::new("x", risk);
+            assert_eq!(r.can_allow_always(), offered, "{risk:?}");
+            assert_eq!(r.is_destructive(), risk == Risk::Destructive);
+        }
+    }
+
+    /// A source that is not a turn thread: it posts a request with a reply
+    /// closure (a remote adapter would POST the decision there) and never
+    /// blocks. Everything the UI does with it is observable on `verdicts`.
+    fn remote_source() -> (Prompter, Receiver<Pending>, Arc<Mutex<Vec<Verdict>>>) {
+        let (p, rx) = approval_channel();
+        (p, rx, Arc::new(Mutex::new(Vec::new())))
+    }
+
+    fn post_remote(p: &Prompter, risk: Risk, verdicts: &Arc<Mutex<Vec<Verdict>>>) -> bool {
+        let sink = Arc::clone(verdicts);
+        p.post(ApprovalRequest::new("remote: deploy", risk), move |v| {
+            sink.lock().unwrap().push(v)
+        })
+    }
+
+    #[test]
+    fn a_remote_source_gets_the_users_verdict_exactly_once() {
+        for (k, want) in [('y', Verdict::Allow), ('n', Verdict::Deny)] {
+            let (p, rx, verdicts) = remote_source();
+            assert!(post_remote(&p, Risk::Write, &verdicts));
+            let mut app = App::default();
+            app.on_msg(Msg::Approval(rx.recv().unwrap()));
+            assert!(
+                verdicts.lock().unwrap().is_empty(),
+                "nothing before the user answers"
+            );
+            app.on_key(key(KeyCode::Char(k)));
+            assert_eq!(*verdicts.lock().unwrap(), [want], "{k}");
+            // keys after the answer change nothing
+            app.on_key(key(KeyCode::Char('y')));
+            assert_eq!(verdicts.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn esc_denies_and_cancels_for_a_remote_source_too() {
+        let (p, rx, verdicts) = remote_source();
+        post_remote(&p, Risk::Destructive, &verdicts);
+        let mut app = App::default();
+        app.on_msg(Msg::Approval(rx.recv().unwrap()));
+        assert_eq!(app.on_key(key(KeyCode::Esc)), Action::Cancel);
+        assert_eq!(*verdicts.lock().unwrap(), [Verdict::Deny]);
+    }
+
+    #[test]
+    fn a_destructive_request_is_shown_as_destructive() {
+        let (p, rx, verdicts) = remote_source();
+        post_remote(&p, Risk::Destructive, &verdicts);
+        let mut app = App::default();
+        app.on_msg(Msg::Approval(rx.recv().unwrap()));
+        let notes = texts(&mut app);
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.starts_with("? destructive: remote: deploy")),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn an_approval_that_never_gets_an_answer_is_denied_once_whatever_ended_it() {
+        // 1. the turn ends (or is cancelled) while the approval is open
+        let (p, rx, verdicts) = remote_source();
+        post_remote(&p, Risk::Write, &verdicts);
+        let mut app = App::default();
+        app.on_msg(Msg::Approval(rx.recv().unwrap()));
+        app.on_msg(Msg::Done(TurnEnd::Cancelled));
+        assert_eq!(*verdicts.lock().unwrap(), [Verdict::Deny], "turn ended");
+
+        // 2. a newer approval replaces an unanswered one
+        let (p, rx, verdicts) = remote_source();
+        post_remote(&p, Risk::Write, &verdicts);
+        post_remote(&p, Risk::Write, &verdicts);
+        let mut app = App::default();
+        app.on_msg(Msg::Approval(rx.recv().unwrap()));
+        app.on_msg(Msg::Approval(rx.recv().unwrap()));
+        assert_eq!(
+            *verdicts.lock().unwrap(),
+            [Verdict::Deny],
+            "the replaced one is denied"
+        );
+
+        // 3. the UI goes away with requests still queued
+        let (p, rx, verdicts) = remote_source();
+        post_remote(&p, Risk::Write, &verdicts);
+        post_remote(&p, Risk::Write, &verdicts);
+        drop(rx);
+        assert_eq!(*verdicts.lock().unwrap(), [Verdict::Deny, Verdict::Deny]);
+
+        // 4. posting to a UI that is already gone: refused, denied at once
+        let (p, rx, verdicts) = remote_source();
+        drop(rx);
+        assert!(!post_remote(&p, Risk::Write, &verdicts));
+        assert_eq!(*verdicts.lock().unwrap(), [Verdict::Deny]);
     }
 
     #[test]
@@ -1540,12 +1746,10 @@ mod tests {
         let mut app = App::default();
         app.on_msg(Msg::Text("ok\x1b[2J\rx\nnext".into()));
         app.on_msg(Msg::Done(TurnEnd::Stopped("bad\x1b]0;t\x07".into())));
-        let (reply, _rx) = mpsc::channel();
-        app.on_msg(Msg::Approval(Pending {
-            text: "w\x1b[2K".into(),
-            destructive: false,
-            reply,
-        }));
+        app.on_msg(Msg::Approval(Pending::new(
+            ApprovalRequest::new("w\x1b[2K", Risk::Write),
+            |_| {},
+        )));
         for o in app.take_out() {
             assert!(!o.text.chars().any(|c| c.is_control()), "{:?}", o.text);
         }
@@ -1555,8 +1759,8 @@ mod tests {
         };
         assert!(!f.render(200).chars().any(|c| c.is_control()));
         let (p, rx) = approval_channel();
-        std::thread::spawn(move || p.ask("a\x1b\nb".into(), false));
-        assert_eq!(rx.recv().unwrap().text, "a\\u{1b} ⏎ b");
+        std::thread::spawn(move || p.ask(ApprovalRequest::new("a\x1b\nb", Risk::Write)));
+        assert_eq!(rx.recv().unwrap().request().text(), "a\\u{1b} ⏎ b");
     }
 
     #[test]
