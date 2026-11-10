@@ -47,7 +47,10 @@ tole is the agent harness of the CodeCora ecosystem — the hands:
   gate does (`mcp_cora_cora_review_finalize` leaves a marker bound to the
   exact change set; `cora hook verify` answers 0 validated / 10 blocking / 11
   not validated), and tole asks it before the commit runs. It covers the `git`
-  tool and `run_command` / `job_start` running `git commit`; `TOLE_REVIEW_GATE=warn`
+  tool and `run_command` / `job_start` running `git commit` (a `git -C <dir>
+  commit` is checked in `<dir>`; one that redirects git's git dir or work tree,
+  such as `--git-dir`, `GIT_DIR=` or `-c core.worktree=`, cannot be checked and
+  is refused under `block`); `TOLE_REVIEW_GATE=warn`
   lets the commit through with a note, `off` (or `--review-gate off`) never
   gates, and with no review tools attached (`--no-auto-mcp`, no cora) there is
   no gate. A cora too old for `hook verify` fails open with one warning;

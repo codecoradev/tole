@@ -415,6 +415,14 @@ the record: its marker is bound to the exact change set of the staged diff, so
 tole computes and trusts no hash of its own, and a verdict for another diff
 (or an edited index, or a marker older than 24 h) does not unlock the commit.
 
+- **Which repository is asked.** `cora hook verify` reads the staged diff of
+  the repository it runs in, so the gate runs it where the commit really
+  happens: `git -C <dir> commit` is verified in `<dir>` (each `-C` relative to
+  the previous one), never in the session repository. A commit that redirects
+  git's git dir or work tree (`--git-dir`, `--work-tree`, `GIT_DIR=`,
+  `GIT_WORK_TREE=`, `GIT_INDEX_FILE=`, `-c core.worktree=`) has no directory
+  cora can be asked about, so it is refused under `block` rather than verified
+  against the wrong index.
 - **A guardrail, not a boundary.** The approver is the security boundary. The
   gate makes a cooperating agent do the review step; it does not stop one that
   is trying to avoid it: `sh -c "git commit"`, a script written then run, a git
