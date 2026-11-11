@@ -10,5 +10,6 @@ repository.workspace = true
 tole-core = { version = "0.10.1", path = "../tole-core", default-features = false }
 # Inline viewport only: no alternate screen, no widgets beyond the basics.
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
-crossterm = { version = "0.29", default-features = false, features = ["events"] }
+# `bracketed-paste`: a pasted block arrives as one `Event::Paste` (#560).
+crossterm = { version = "0.29", default-features = false, features = ["events", "bracketed-paste"] }
 serde_json = { workspace = true }

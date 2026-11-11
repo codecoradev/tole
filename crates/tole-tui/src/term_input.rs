@@ -1,10 +1,22 @@
-//! The crossterm adapter (#526): maps a terminal key event to the UI-neutral
-//! [`Input`] the app logic consumes. All crossterm key types of the input path
-//! stay here; `App::on_input` never sees them.
+//! The crossterm adapter (#526): maps a terminal key event (or a bracketed
+//! paste, #560) to the UI-neutral [`Input`] the app logic consumes. All
+//! crossterm types of the input path stay here; `App::on_input` never sees
+//! them.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-use crate::{Action, App, Input, Key, Mods};
+use crate::{Action, App, Input, Key, KeyPress, Mods};
+
+/// The input for a terminal event: a key press or a bracketed paste. `None`
+/// for everything the app logic does not consume (key releases, resize,
+/// focus, mouse).
+pub fn input_from_event(ev: Event) -> Option<Input> {
+    match ev {
+        Event::Key(k) => input_from(k),
+        Event::Paste(text) => Some(Input::Paste(text)),
+        _ => None,
+    }
+}
 
 /// The input for a key event, or `None` for a key release (terminals that
 /// report releases send both; only presses act).
@@ -23,14 +35,14 @@ pub fn input_from(ev: KeyEvent) -> Option<Input> {
         KeyCode::Down => Key::Down,
         _ => Key::Other,
     };
-    Some(Input {
+    Some(Input::Key(KeyPress {
         key,
         mods: Mods {
             ctrl: ev.modifiers.contains(KeyModifiers::CONTROL),
             alt: ev.modifiers.contains(KeyModifiers::ALT),
             shift: ev.modifiers.contains(KeyModifiers::SHIFT),
         },
-    })
+    }))
 }
 
 impl App {
@@ -117,15 +129,35 @@ mod tests {
             press(KeyCode::Enter, KeyModifiers::SHIFT),
             Some(Input::shift(Key::Enter))
         );
-        let both = press(KeyCode::Up, KeyModifiers::ALT | KeyModifiers::SHIFT).unwrap();
         assert_eq!(
-            both.mods,
-            Mods {
-                ctrl: false,
-                alt: true,
-                shift: true
-            }
+            press(KeyCode::Up, KeyModifiers::ALT | KeyModifiers::SHIFT),
+            Some(Input::Key(KeyPress {
+                key: Key::Up,
+                mods: Mods {
+                    ctrl: false,
+                    alt: true,
+                    shift: true
+                }
+            }))
         );
+    }
+
+    #[test]
+    fn a_bracketed_paste_is_one_paste_input_and_other_events_are_dropped() {
+        assert_eq!(
+            input_from_event(Event::Paste("a\r\nb".into())),
+            Some(Input::Paste("a\r\nb".into())),
+            "the raw block; normalizing is the app's job"
+        );
+        assert_eq!(
+            input_from_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE
+            ))),
+            Some(Input::new(Key::Enter))
+        );
+        assert_eq!(input_from_event(Event::Resize(80, 24)), None);
+        assert_eq!(input_from_event(Event::FocusGained), None);
     }
 
     #[test]

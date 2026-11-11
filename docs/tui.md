@@ -1,6 +1,6 @@
 # Terminal UI (`tole-tui`)
 
-Status: **MVP + pickers + steering** (#460, #461, #462, in `develop`, not yet released). Bare
+Status: **MVP + pickers + steering + paste/images** (#460, #461, #462, #560, in `develop`, not yet released). Bare
 `tole` on an interactive terminal opens an inline UI over one ordinary tole
 session. Next: #464 (detach key).
 
@@ -26,6 +26,9 @@ session. Next: #464 (detach key).
   styled; tole does not diff files itself).
 - **Queue rows:** follow-ups waiting behind the running turn show as
   `queued: …` rows above the editor (three, then `+n more queued`).
+- **Image row:** images attached to the next message (#560) show as one
+  `image: shot.png (image/png, 12 KiB) · next message` row above the editor
+  (`images (n): …` for several); it shares the three rows with the queue.
 - **Footer:** `folder · session · model · effort · context used / window (%) ·
   tokens`. Context and tokens come from the `tole status` snapshot, refreshed
   after every turn.
@@ -47,6 +50,7 @@ session. Next: #464 (detach key).
 | `@` | file panel: type to filter, `Up`/`Down` select, `Tab` / `Enter` insert the path |
 | `Up` / `Down` | input history (the draft is restored after the newest entry) |
 | `Backspace` | delete the last character |
+| paste | the whole block is inserted as one edit, never sent: newlines stay newlines, `Enter` sends (see Paste) |
 | `/` | open the command menu; `Tab` completes, `Up`/`Down` select |
 | `Ctrl+L` | model picker (`/models`); type to filter, `Enter` picks, `Esc` closes |
 | `Ctrl+P` | cycle the models used in this run |
@@ -80,6 +84,45 @@ the session lock). `Ctrl+O`, `Ctrl+T`, `@`, steering and queueing do not.
   `Esc` + key; on those the sequence is read as Alt only when it arrives as one
   burst.
 
+## Paste and images (#560)
+
+- **Bracketed paste.** The TUI turns the terminal's bracketed-paste mode on
+  at start and off again on exit (also when a panic unwinds: same drop guard
+  as raw mode). A pasted block then arrives as one event and is inserted into
+  the editor as one edit: CRLF and lone CR become LF, control characters other
+  than newline and tab are dropped, and nothing is submitted until `Enter`
+  (while a turn runs, `Enter` steers with it as usual). A paste never answers
+  an approval prompt (it is ignored there) and only filters an open picker.
+  Before #560 a multi-line paste arrived as keys: its first line was sent at
+  the first line break and the next line steered that turn. Terminals without
+  bracketed paste still behave that way.
+- **`/image <path|data-url>`** queues an image for the next message, like
+  `chat`'s `/image` (#559): same workspace jail, 10 MiB cap and type sniffing
+  as `--image`. `/image` lists the queue, `/image clear` empties it. A refused
+  image shows the host's error (`(/image: image: … outside the workspace jail
+  — refused)`). Like other commands, `/image` is ignored while a turn runs (the
+  host holds the session for the turn).
+- **Pasting an image.** A paste that is exactly ONE image reference is
+  attached instead of inserted, when no turn is running: a `data:image/…` URL,
+  or a single path ending in `.png .jpg .jpeg .gif .webp` (any case), possibly
+  wrapped in quotes or with `\ `-escaped spaces (what terminals send for a
+  dropped file). The host decides: a file that does not exist, lies outside
+  the jail or is not an image is inserted as text after all, with a note
+  saying why. Anything else (several words or lines) is text.
+- **Non-vision models:** the image rides on the message and the provider
+  refuses it like `--image` does: with `TOLE_VISION=0` (or a server that
+  rejects image input) the turn stops with the `model-capability error: …`
+  note. The message is recorded with its image, so later messages in that
+  session hit the same error (as in `chat`); switch to a vision model.
+- **No clipboard images (decision).** The TUI does not read images from the OS
+  clipboard: a terminal only delivers text, and reading the clipboard would
+  need a native, platform-specific dependency. Graphical clients (#527–#529)
+  own clipboard images. In a terminal, paste or drop the file's path, or use
+  `/image`.
+- No `@`-panel entry for images: the `@` panel inserts a path into the draft
+  as text, and turning a selection into an attach would give one key two
+  meanings. Use `/image <path>`.
+
 ## `@` file search
 
 Typing a word that starts with `@` opens a panel of files under the working
@@ -109,6 +152,7 @@ tole-core, so a long diff is cut there.
 | `/resume` | picker over the global session index (newest 50, current excluded) |
 | `/session` | the `tole status` lines |
 | `/name <text>` | rename (`fact/session_name`; shown by `sessions --all`, `resume <name>`) |
+| `/image [path\|data-url\|clear]` | queue an image for the next message; no argument lists the queue, `clear` empties it (#560) |
 | `/quit` | quit |
 
 An unknown command is refused with a prefix hint and nothing is sent. Model,
@@ -161,22 +205,34 @@ Wide characters wrap by character count, not cell width.
 - **Host seam (#526):** `TuiHost` has three methods: `footer`, `run_turn` and
   `apply(HostCmd) -> Result<HostReply, String>`, which covers every slash command
   and hotkey (`/model`, `/effort`, `/compact`, `/new`, `/resume`, `/session`,
-  `/name`, the pickers). The reply is data only (`Done`, `Session(id)`,
-  `Models`, `Sessions`, `Lines`); the wording shown to the user and the pickers
+  `/name`, the pickers, and #560's `AttachImage(spec)` / `ClearImages` /
+  `Images`). The reply is data only (`Done`, `Session(id)`,
+  `Models`, `Sessions`, `Lines`, `Images(Vec<ImageItem>)`: the queue after the
+  command); the wording shown to the user and the pickers
   are the UI's, so a remote adapter writes three methods and no UI text. The default
-  `apply` supports `Status` (no lines) and refuses the rest with "not supported by
-  this host"; a reply of the wrong kind is reported, never a panic.
+  `apply` supports `Status` (no lines) and `Images` (none queued) and refuses the
+  rest with "not supported by this host"; a reply of the wrong kind is reported, never a panic.
 - **Input seam (#526):** the app logic does not see terminal key types.
-  `App::on_input(Input)` takes a UI-neutral `Input` (`Key` plus ctrl/alt/shift);
-  the crossterm adapter (`term_input`: `input_from`, and `App::on_key` as the
-  terminal entry point) maps key events onto it and drops key releases. Every
+  `App::on_input(Input)` takes a UI-neutral `Input`: `Input::Key(KeyPress)`
+  (`Key` plus ctrl/alt/shift) or `Input::Paste(String)` (#560, one pasted
+  block). The crossterm adapter (`term_input`: `input_from_event`,
+  `input_from`, and `App::on_key` as the key entry point) maps key events and
+  `Event::Paste` onto it and drops key releases. A GUI front end feeds its
+  clipboard text as `Input::Paste`. Every
   key the logic does not distinguish is `Key::Other`: it still counts as a key
   press (it disarms a pending `Ctrl+C`) but triggers nothing. The key table above
   is the behavior contract for both entry points, so a second front end (a GPUI
   desktop, a remote client) feeds the same state machine with `Input`s.
 - **Render split (#526):** drawing (`App::draw` and the markdown/diff styling helpers) lives in the private `render` module, which only reads `App`. State and input handling stay in `lib.rs`, so another front end can reuse the state machine without the ratatui drawing.
-- Terminal state (raw mode, keyboard enhancement) is restored by a drop
-  guard, so it is also restored on panic. SIGINT is just a `Ctrl+C` key event
+- **Image queue (#560):** the queue lives in the host (`TuiSession`'s #559
+  pending images, taken by the next `run_turn`). The UI keeps the list the host
+  last reported for the image row; it clears it when a message starts a turn
+  and, after a turn that took images, asks the host again (`HostCmd::Images`),
+  because a message that was never recorded hands its images back. Whether a
+  paste "looks like" an image is decided by the UI (`paste::image_spec`); the
+  file checks (exists, jail, size, type) are the host's.
+- Terminal state (raw mode, keyboard enhancement, bracketed paste) is restored
+  by a drop guard, so it is also restored on panic. SIGINT is just a `Ctrl+C` key event
   in raw mode.
 - `cargo build -p tole-cli --no-default-features` builds without the TUI.
 - Tests: unit tests for the editor, transcript, footer and approval state

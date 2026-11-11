@@ -205,7 +205,8 @@ Not a sandbox: review what it wrote before you run it), `--skill <path>` (load a
 `tole run|chat|mission --image <path|data-url>` (repeatable) attaches images to the first message
 (#212). Any later message can carry images too (#559): in `tole chat`, type `/image <path|data-url>`
 to queue one for your next message (`/image` lists the queue, `/image clear` empties it; a message
-that could not be recorded keeps its images queued). `tole acp` accepts ACP `image` content blocks
+that could not be recorded keeps its images queued). The TUI has the same `/image`, and pasting a
+single image path or `data:image/…` URL attaches it (#560; no OS clipboard images in a terminal). `tole acp` accepts ACP `image` content blocks
 (base64 `data`), advertises `promptCapabilities.image`, and runs an image-only prompt; the blocks
 take the same spill-and-reference path as a `data:` URL, the declared `mimeType` is not trusted
 (the bytes are sniffed), the optional `uri` is never read, and audio or embedded-resource blocks are
