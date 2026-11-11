@@ -356,6 +356,14 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
+    /// Skills: the owner's approvals of skill content (#591: `approve`,
+    /// `revoke`, `list`; enforced with `TOLE_SKILL_APPROVAL=required`) and,
+    /// in shell-tools builds, the uteke skill index (#590: `index`,
+    /// `retire`, `search`; used with `TOLE_SKILL_INDEX=uteke`).
+    Skills {
+        #[command(subcommand)]
+        action: tole_cli::skill_approve::SkillsAction,
+    },
     /// Remote approvals (issue #200): list pending Write-approval
     /// requests on a `tole serve` instance and allow/deny them. URL
     /// defaults to TOLE_SERVE_URL or http://127.0.0.1:7801; token to
@@ -570,14 +578,6 @@ enum Command {
         #[command(subcommand)]
         action: tole_cli::cron::CronAction,
     },
-    /// The uteke skill index (#590): `index` the discovered skills,
-    /// `retire` one, or `search` it the way a task would. Sessions use it
-    /// with `TOLE_SKILL_INDEX=uteke`.
-    #[cfg(feature = "shell-tools")]
-    Skills {
-        #[command(subcommand)]
-        action: tole_cli::skill_recall::SkillsAction,
-    },
     /// Project config file `.tole/config.toml` (#208): `check` validates
     /// it and shows the effective values, `trust`/`untrust` manage the
     /// trust record. Every key is applied after trust (flag > env > config
@@ -660,11 +660,10 @@ fn gate_policy(cmd: &Command) -> GatePolicy {
         Command::Config { .. }
         | Command::Upgrade { .. }
         | Command::Setup { .. }
-        | Command::Approvals { .. } => GatePolicy::Skip,
+        | Command::Approvals { .. }
+        | Command::Skills { .. } => GatePolicy::Skip,
         #[cfg(feature = "shell-tools")]
         Command::Cron { .. } => GatePolicy::Skip,
-        #[cfg(feature = "shell-tools")]
-        Command::Skills { .. } => GatePolicy::Skip,
         // `--prompt-file -` consumes stdin as the prompt: a question on
         // the same stream would eat prompt text.
         Command::Run { prompt_file, .. } if prompt_file.as_deref() == Some("-") => {
@@ -1113,8 +1112,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         }
         #[cfg(feature = "shell-tools")]
         Command::Cron { action } => tole_cli::cron::cli(action),
-        #[cfg(feature = "shell-tools")]
-        Command::Skills { action } => tole_cli::skill_recall::cli(action),
+        Command::Skills { action } => tole_cli::skill_approve::cli(action),
         Command::Approvals {
             action,
             id,
@@ -1881,14 +1879,22 @@ fn apply_skills(
         return Ok(String::new());
     }
     let ws_root = resolve_workspace_root(workspace)?;
-    let recall =
-        tole_cli::skill_recall::SkillRecall::from_env(brief).map_err(anyhow::Error::msg)?;
+    let (gate, notes) = tole_cli::skill_approve::gate_from_env().map_err(anyhow::Error::msg)?;
+    for note in notes {
+        eprintln!("tole: {note}");
+    }
+    let recall = tole_cli::skill_recall::SkillRecall {
+        gate,
+        ..tole_cli::skill_recall::SkillRecall::from_env(brief).map_err(anyhow::Error::msg)?
+    };
     apply_skills_in(skills, Some(ws_root), false, registry, &recall)
 }
 
 /// Testable core of [`apply_skills`] taking the RESOLVED discovery
 /// root (None = caller already resolved to cwd; kept Option so tests
-/// can pass a tmpdir without changing the process cwd).
+/// can pass a tmpdir without changing the process cwd). `recall.gate`
+/// decides which discovered skills may load (#591); `--skill` files are
+/// the owner's own choice and are not gated.
 fn apply_skills_in(
     skills: &[PathBuf],
     ws_root: Option<PathBuf>,

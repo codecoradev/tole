@@ -23,10 +23,13 @@
 //! Trust: the index only *finds* names. Every listed description and every
 //! loaded body comes from the local skill files ([`crate::skills`]); a name
 //! the index returns that has no local skill is dropped. An index entry can
-//! therefore never inject text into the prompt (§4.2; approved-hash
-//! loading follows in #591).
+//! therefore never inject text into the prompt (§4.2). Under an approval
+//! [`Gate`] (#591) only owner-approved bytes load; a selected or searched
+//! skill that is not approved is named as unavailable, with no description.
 
-use crate::skills::{available_skills, load_skill, Skill};
+#[cfg(test)]
+use crate::skills::load_skill;
+use crate::skills::{available_skills, Gate, LoadError, Skill};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -262,6 +265,9 @@ pub struct Selection {
     pub pinned: Vec<Skill>,
     /// Recalled by meaning, best first, with the index's score.
     pub recalled: Vec<(Skill, f32)>,
+    /// Pinned or recalled names the gate refused as not approved: shown by
+    /// name only, never loaded.
+    pub unavailable: Vec<String>,
     /// One-line notes for the startup log (missing pins, index errors).
     pub notes: Vec<String>,
 }
@@ -270,7 +276,9 @@ pub struct Selection {
 /// most [`MAX_PINNED`]) plus up to `k` (at most [`MAX_RECALL_K`]) recalled
 /// for `query`. Every skill is loaded from the local files; a name with no
 /// local skill is dropped. An index failure is a note, not an error: the
-/// task still gets its pinned core and the `skill_search` tool.
+/// task still gets its pinned core and the `skill_search` tool. Every skill
+/// goes through `gate`; one it refuses as not approved is listed in
+/// [`Selection::unavailable`] and does not use up the K.
 pub fn select(
     index: &dyn SkillIndex,
     workspace: Option<&Path>,
@@ -278,6 +286,7 @@ pub fn select(
     query: Option<&RecallQuery>,
     filter: &SkillFilter,
     k: usize,
+    gate: &Gate,
 ) -> Selection {
     let mut sel = Selection::default();
     let mut seen = std::collections::HashSet::new();
@@ -291,8 +300,12 @@ pub fn select(
         if !seen.insert(name.clone()) {
             continue;
         }
-        match load_skill(workspace, name) {
+        match gate.load(workspace, name) {
             Ok(s) => sel.pinned.push(s),
+            Err(e @ LoadError::NotApproved { .. }) => {
+                sel.notes.push(format!("pinned skill not loadable: {e}"));
+                sel.unavailable.push(name.clone());
+            }
             Err(e) => sel.notes.push(format!("pinned skill skipped: {e}")),
         }
     }
@@ -303,6 +316,7 @@ pub fn select(
     // Ask for extra so pinned or locally-missing names do not eat the K.
     match index.search(query.as_str(), filter, k + sel.pinned.len()) {
         Ok(cands) => {
+            let mut refused = 0;
             for c in cands {
                 if sel.recalled.len() >= k {
                     break;
@@ -310,8 +324,13 @@ pub fn select(
                 if !seen.insert(c.name.clone()) {
                     continue;
                 }
-                if let Ok(s) = load_skill(workspace, &c.name) {
-                    sel.recalled.push((s, c.score));
+                match gate.load(workspace, &c.name) {
+                    Ok(s) => sel.recalled.push((s, c.score)),
+                    Err(LoadError::NotApproved { .. }) if refused < k => {
+                        refused += 1;
+                        sel.unavailable.push(c.name);
+                    }
+                    Err(_) => {}
                 }
             }
         }
@@ -332,6 +351,7 @@ pub fn selection_block(sel: &Selection) -> String {
             "No skill was preselected for this task. Call skill_search with a short \
              description of what you need to find one, then load_skill to load it.\n",
         );
+        push_unavailable(&mut out, &sel.unavailable);
         return out;
     }
     out.push_str(
@@ -344,18 +364,30 @@ pub fn selection_block(sel: &Selection) -> String {
     for (s, _) in &sel.recalled {
         out.push_str(&format!("- {}\n", s.index_line()));
     }
+    push_unavailable(&mut out, &sel.unavailable);
     out
+}
+
+fn push_unavailable(out: &mut String, names: &[String]) {
+    if !names.is_empty() {
+        out.push_str(&format!(
+            "Not approved by the owner, so they cannot be loaded: {}\n",
+            names.join(", ")
+        ));
+    }
 }
 
 /// The ReadOnly `skill_search` tool: on-demand discovery through the
 /// configured index (the Tool Search pattern). Returns names and
 /// descriptions from the local skill files; bodies still come through
-/// `load_skill`.
+/// `load_skill`. A hit the gate refuses as not approved comes back as
+/// `{"name", "available": false}`, with no description.
 #[derive(Clone)]
 pub struct SkillSearchTool {
     index: Arc<dyn SkillIndex>,
     workspace: Option<PathBuf>,
     filter: SkillFilter,
+    gate: Gate,
 }
 
 impl SkillSearchTool {
@@ -363,11 +395,13 @@ impl SkillSearchTool {
         index: Arc<dyn SkillIndex>,
         workspace: Option<PathBuf>,
         filter: SkillFilter,
+        gate: Gate,
     ) -> Self {
         Self {
             index,
             workspace,
             filter,
+            gate,
         }
     }
 }
@@ -415,10 +449,20 @@ impl crate::tool::Tool for SkillSearchTool {
         let cands = self.index.search(&query, &self.filter, limit)?;
         let skills: Vec<Value> = cands
             .into_iter()
-            .filter_map(|c| {
-                let s = load_skill(self.workspace.as_deref(), &c.name).ok()?;
-                Some(json!({ "name": s.name, "description": s.description, "score": c.score }))
-            })
+            .filter_map(
+                |c| match self.gate.load(self.workspace.as_deref(), &c.name) {
+                    Ok(s) => Some(
+                        json!({ "name": s.name, "description": s.description, "score": c.score }),
+                    ),
+                    Err(LoadError::NotApproved { name, .. }) => Some(json!({
+                        "name": name,
+                        "available": false,
+                        "reason": "not approved by the owner",
+                        "score": c.score
+                    })),
+                    Err(LoadError::Other(_)) => None,
+                },
+            )
             .collect();
         Ok(json!({ "index": self.index.label(), "skills": skills }))
     }
@@ -880,6 +924,7 @@ mod tests {
             Some(&q),
             &SkillFilter::default(),
             2,
+            &Gate::Open,
         );
         assert_eq!(names(&sel.pinned), ["a", "b"]);
         let recalled: Vec<&str> = sel.recalled.iter().map(|(s, _)| s.name.as_str()).collect();
@@ -926,6 +971,7 @@ mod tests {
             Some(&q),
             &SkillFilter::default(),
             50,
+            &Gate::Open,
         );
         assert_eq!(sel.pinned.len(), MAX_PINNED);
         assert!(sel.recalled.is_empty());
@@ -943,9 +989,25 @@ mod tests {
         assert_eq!(idx.asked.lock().unwrap()[0].1, MAX_RECALL_K + MAX_PINNED);
         // No brief, or K = 0: the index is not asked at all.
         let idx = Scripted::new(Ok(vec![("a", 0.9)]));
-        let sel = select(&idx, Some(&dir), &[], None, &SkillFilter::default(), 5);
+        let sel = select(
+            &idx,
+            Some(&dir),
+            &[],
+            None,
+            &SkillFilter::default(),
+            5,
+            &Gate::Open,
+        );
         assert!(sel.recalled.is_empty());
-        let sel = select(&idx, Some(&dir), &[], Some(&q), &SkillFilter::default(), 0);
+        let sel = select(
+            &idx,
+            Some(&dir),
+            &[],
+            Some(&q),
+            &SkillFilter::default(),
+            0,
+            &Gate::Open,
+        );
         assert!(sel.recalled.is_empty());
         assert!(idx.asked.lock().unwrap().is_empty());
         // Nothing selected: the block still points at skill_search.
@@ -1017,7 +1079,7 @@ mod tests {
         let dir = ws("tool", &[("deploy", "Local description")]);
         let idx: Arc<dyn SkillIndex> =
             Arc::new(Scripted::new(Ok(vec![("deploy", 0.9), ("ghost", 0.8)])));
-        let tool = SkillSearchTool::new(idx, Some(dir.clone()), SkillFilter::default());
+        let tool = SkillSearchTool::new(idx, Some(dir.clone()), SkillFilter::default(), Gate::Open);
         assert_eq!(tool.risk(), crate::tool::Risk::ReadOnly);
         let out = tool.execute(json!({"query": "ship", "limit": 99})).unwrap();
         assert_eq!(out["index"], json!("scripted"));
@@ -1027,6 +1089,69 @@ mod tests {
         );
         assert!(tool.execute(json!({"query": "-x"})).is_err());
         assert!(tool.execute(json!({})).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #591: under an approval gate, a pinned, recalled or searched skill
+    /// that is not approved is named as unavailable (no description, no
+    /// body) and does not use up the K.
+    #[test]
+    fn the_gate_names_unapproved_skills_as_unavailable() {
+        use crate::skill_approval::{read_package, Approvals};
+        let dir = ws(
+            "gate",
+            &[("a", "A"), ("b", "INJECTED"), ("c", "C"), ("d", "D")],
+        );
+        let mut ok = Approvals::default();
+        for n in ["a", "c", "d"] {
+            ok.approve(&read_package(Some(&dir), n).unwrap(), 1);
+        }
+        let gate = Gate::Approved(Arc::new(ok));
+        let idx = Scripted::new(Ok(vec![("b", 0.9), ("c", 0.8), ("d", 0.7)]));
+        let q = RecallQuery::new("task", None).unwrap();
+        let sel = select(
+            &idx,
+            Some(&dir),
+            &["a".into(), "b".into()],
+            Some(&q),
+            &SkillFilter::default(),
+            2,
+            &gate,
+        );
+        assert_eq!(names(&sel.pinned), ["a"]);
+        let recalled: Vec<&str> = sel.recalled.iter().map(|(s, _)| s.name.as_str()).collect();
+        assert_eq!(
+            recalled,
+            ["c", "d"],
+            "a refused skill does not use up the K"
+        );
+        assert_eq!(sel.unavailable, ["b"]);
+        let block = selection_block(&sel);
+        assert!(block.contains("cannot be loaded: b\n"), "{block}");
+        assert!(!block.contains("INJECTED"), "{block}");
+        // Recalled (not pinned) and refused: also named.
+        let idx2 = Scripted::new(Ok(vec![("b", 0.9)]));
+        let sel = select(
+            &idx2,
+            Some(&dir),
+            &[],
+            Some(&q),
+            &SkillFilter::default(),
+            2,
+            &gate,
+        );
+        assert_eq!(sel.unavailable, ["b"]);
+        assert!(selection_block(&sel).contains("No skill was preselected"));
+        assert!(selection_block(&sel).contains("cannot be loaded: b"));
+        // skill_search: the refused hit has no description.
+        let idx3: Arc<dyn SkillIndex> = Arc::new(Scripted::new(Ok(vec![("b", 0.9), ("c", 0.8)])));
+        let tool = SkillSearchTool::new(idx3, Some(dir.clone()), SkillFilter::default(), gate);
+        let out = tool.execute(json!({"query": "x"})).unwrap();
+        assert_eq!(out["skills"][0]["name"], json!("b"));
+        assert_eq!(out["skills"][0]["available"], json!(false));
+        assert!(out["skills"][0].get("description").is_none());
+        assert_eq!(out["skills"][1]["description"], json!("C"));
+        assert!(!out.to_string().contains("INJECTED"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

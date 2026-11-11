@@ -164,7 +164,25 @@ forward it to a cloud store. `tole skills index` sends only
 each skill's name, description, status and content hash to uteke, never the
 body. Only entries tagged `skill`, with status `approved` and in scope for
 the active `--profile`, are recalled; `tole skills retire` keeps a skill on disk
-but stops its recall. Loading only owner-approved content hashes is #591.
+but stops its recall. With `TOLE_SKILL_APPROVAL=required` only owner-approved
+content loads (below).
+
+**Approved-hash loading (#591).** With `TOLE_SKILL_APPROVAL=required` that
+trust is no longer "whatever is on disk": a discovered skill loads only when
+its package (SKILL.md plus every other file of its directory, paths and
+bytes) hashes to the owner's approval, recorded by `tole skills approve` in
+`$CODECORA_HOME/tole/skill-approvals.json`, outside every workspace. A
+skill that is new, edited (any file), or added by a cloned repo is listed
+by name only, marked unavailable, with no description, and `load_skill`
+refuses it; the body that loads is parsed from the exact bytes that were
+hashed. A symlink in a package makes it unloadable. A malformed approvals
+file fails startup. `approve --hash` pins the hash the owner reviewed, so a
+file changed between review and approval is refused. The approvals file is
+as strong as the user's home directory: a process that can write it can
+approve anything. Skills the owner names directly (`--skill`, a profile's
+`skills`) are not gated. With `TOLE_SKILL_INDEX=uteke` the same gate covers
+the pinned core, the recalled skills and every `skill_search` hit. The
+default is `off` (today's behavior).
 
 ## verify_package (#144)
 
