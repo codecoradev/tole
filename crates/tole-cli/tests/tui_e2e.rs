@@ -371,6 +371,9 @@ fn tui_never_passes_escape_sequences_from_provider_text() {
     t.expect("effort:");
     t.send("evil\r");
     t.expect("EV\\u{1b}[2J\\u{d}IL");
+    // Slash commands are ignored while a turn runs: `/quit` sent before the
+    // turn settles is dropped and the process never exits (a CI flake).
+    t.idle();
     t.send("/quit\r");
     assert_eq!(t.wait_exit(), Some(0));
     let o = t.out.lock().unwrap();
