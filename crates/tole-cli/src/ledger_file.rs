@@ -1,11 +1,13 @@
-//! File adapter for the automation ledger (#579): `<dir>/jobs.jsonl`
-//! behind the core [`LedgerStore`] trait, plus the host lock and the
-//! process lease the core ledger asks for (`docs/automation-design.md` §4).
+//! File adapter for the append-only ledgers behind the core
+//! [`LedgerStore`] trait — the cron job store `<dir>/jobs.jsonl` (#579) and
+//! the delegation log (#585) — plus the host lock and the process lease the
+//! core asks for (`docs/automation-design.md` §4). Reached as
+//! `crate::cron::store` too.
 //!
 //! The core contract: an exclusive lock around every mutating ledger call,
-//! whole-line appends, torn-tail repair only under that lock. The lock is
-//! `<dir>/jobs.lock` (an advisory `flock`-style `File::lock`), held for
-//! milliseconds — never around a run's execution.
+//! whole-line appends, torn-tail repair only under that lock. For cron the
+//! lock is `<dir>/jobs.lock` (an advisory `flock`-style `File::lock`), held
+//! for milliseconds — never around a run's execution.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -96,6 +98,14 @@ pub fn with_lock<R>(
 /// ticks; 0 where the platform does not expose it).
 pub fn own_lease() -> Lease {
     let pid = std::process::id();
+    Lease {
+        pid,
+        start_time: start_time(pid).unwrap_or(0),
+    }
+}
+
+/// The lease of process `pid` (pid plus its start time where known).
+pub fn lease_of(pid: u32) -> Lease {
     Lease {
         pid,
         start_time: start_time(pid).unwrap_or(0),

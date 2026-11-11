@@ -310,6 +310,7 @@ type or a secret-like key is an error with `file:line`; the file is capped at
 | `[tui]` `theme`, `[tui.colors]` | `TOLE_THEME`, `NO_COLOR` | **user config only** (a project's `[tui]` is ignored with a warning): env > user config > `NO_COLOR` (`mono`) > `default`; see docs/tui.md |
 | `[mission]` `verify`, `verify_timeout` | `mission --verify`, `--verify-timeout` | flag > config > default (`300`) |
 | `[cron]` `daily_token_cap` | (none) | **user config only** (a project's `[cron]` is ignored): tokens all cron agent runs of one UTC day may spend; past it they settle `budget` |
+| `[delegation]` `max_depth`, `max_live_processes`, `goal_budget`, `goal_steps`, `goal_minutes` | (none) | **user config only** (a project's `[delegation]` is ignored): depth below the orchestrator (1–3, default 2), delegated processes live at once before spawns queue (default 8), and a goal's default budget (1,000,000 tokens, 400 steps, 120 minutes; used by the `delegate` tool, next PR) |
 | `[cron]` `max_concurrent` | `4` | **user config only**: runs one tick (`tole cron tick`, the `tole serve --cron` ticker) executes at once, 1 to 64; `tole cron tick --max-concurrent N` overrides it for that tick |
 | `trust` (list of presets) | `--trust` | flag > `TOLE_TRUST` env > config |
 | `allow` (list of globs) | the subcommand's own `--allow` | flag > config |
