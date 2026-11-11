@@ -82,6 +82,7 @@ pub mod run_command;
 pub(crate) mod sanitize;
 pub mod secrets;
 pub mod sibling_watch;
+pub mod skill_index;
 pub mod skills;
 pub mod state;
 pub mod storage;

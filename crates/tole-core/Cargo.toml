@@ -37,6 +37,8 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 base64 = "0.23"
+# SKILL.md content hashes for the skill index (#590); already in the tree via rmcp.
+sha2 = "0.11"
 ureq = { workspace = true }
 
 [[test]]

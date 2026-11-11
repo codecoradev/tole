@@ -124,6 +124,18 @@ pub fn load_skill(workspace: Option<&Path>, name: &str) -> Result<Skill, String>
     ))
 }
 
+/// The SKILL.md file `load_skill` would read for `name` (same resolution
+/// order), or `None` when there is none.
+pub fn skill_file(workspace: Option<&Path>, name: &str) -> Option<PathBuf> {
+    if name.is_empty() || name.contains("..") || name.contains('/') || name.contains('\\') {
+        return None;
+    }
+    candidate_dirs(workspace, name)
+        .into_iter()
+        .map(|d| d.join("SKILL.md"))
+        .find(|p| p.is_file())
+}
+
 fn truncate_to_char_boundary(s: &mut String, max: usize) {
     if s.len() <= max {
         return;
@@ -332,6 +344,21 @@ mod tests {
                 assert!(!err.contains(".codecora"), "{err}");
             });
         }
+    }
+
+    #[test]
+    fn skill_file_follows_the_load_order() {
+        let tmp = std::env::temp_dir().join(format!("tole-skills-file-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        write_skill(&tmp, "demo", "demo", "d", "b");
+        assert_eq!(
+            skill_file(Some(&tmp), "demo"),
+            Some(tmp.join("skills").join("demo").join("SKILL.md"))
+        );
+        assert_eq!(skill_file(Some(&tmp), "absent-xyz"), None);
+        assert_eq!(skill_file(Some(&tmp), "../demo"), None);
+        assert_eq!(skill_file(Some(&tmp), ""), None);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
