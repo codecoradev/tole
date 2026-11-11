@@ -30,7 +30,10 @@ pub(crate) fn image_spec(text: &str) -> Option<String> {
     if t.is_empty() || t.contains('\n') {
         return None;
     }
-    if t.len() > 5 && t[..5].eq_ignore_ascii_case("data:") {
+    // `get` rather than indexing: byte 5 can fall inside a multi-byte
+    // character ("日本", emoji), and slicing there would panic. When the
+    // prefix matches it is ASCII, so `t[5..]` is on a char boundary.
+    if t.len() > 5 && t.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("data:")) {
         return t[5..]
             .to_ascii_lowercase()
             .starts_with("image/")
@@ -99,6 +102,15 @@ mod tests {
     }
 
     #[test]
+    fn non_ascii_image_paths_are_image_specs() {
+        assert_eq!(image_spec("画像.png").as_deref(), Some("画像.png"));
+        assert_eq!(
+            image_spec("'スクリーン ショット.webp'").as_deref(),
+            Some("スクリーン ショット.webp")
+        );
+    }
+
+    #[test]
     fn anything_else_is_text() {
         for paste in [
             "",
@@ -110,6 +122,12 @@ mod tests {
             "'unterminated.png",
             "'a.png' 'b.png'",
             "fn main() {}",
+            // Non-ASCII: byte 5 inside a multi-byte character must not panic.
+            "日本",
+            "ééé",
+            "😀😀",
+            "日本語のテキスト",
+            "Ünïcödé.txt",
         ] {
             assert_eq!(image_spec(paste), None, "{paste:?}");
         }
