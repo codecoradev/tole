@@ -176,6 +176,8 @@ impl Pty {
             .env_remove("TOLE_MEMORY")
             .env_remove("TOLE_TRUST")
             .env_remove("TOLE_VISION")
+            .env_remove("TOLE_THEME")
+            .env_remove("NO_COLOR")
             .envs(envs.iter().copied())
             .stdin(Stdio::from(slave.try_clone().unwrap()))
             .stdout(Stdio::from(slave.try_clone().unwrap()))
@@ -913,4 +915,98 @@ fn tui_export_writes_the_transcript_and_refuses_to_overwrite() {
         .lines()
         .all(|l| serde_json::from_str::<Value>(l).is_ok()));
     assert!(jsonl.contains("STREAM-ANSWER"));
+}
+
+/// Every SGR parameter in `seen` that selects a foreground or background
+/// color (`30-38`, `40-48`, `90-97`, `100-107`); `39`/`49` only reset.
+fn sgr_colors(seen: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut rest = seen;
+    while let Some(i) = rest.find("\x1b[") {
+        rest = &rest[i + 2..];
+        let end = rest
+            .find(|c: char| !(c.is_ascii_digit() || c == ';' || c == ':'))
+            .unwrap_or(rest.len());
+        if rest[end..].starts_with('m') {
+            for p in rest[..end].split([';', ':']) {
+                match p.parse::<u16>() {
+                    Ok(38 | 48) => {
+                        found.push(rest[..end].to_string());
+                        break; // extended color: the rest are its operands
+                    }
+                    Ok(30..=37 | 40..=47 | 90..=97 | 100..=107) => found.push(p.to_string()),
+                    _ => {}
+                }
+            }
+        }
+    }
+    found
+}
+
+/// One approval prompt, denied, then quit; returns everything printed.
+fn approval_screen(envs: &[(&str, &str)]) -> String {
+    let (url, dir) = (spawn_mock(), workdir());
+    let mut t = Pty::spawn_full(&dir, &url, &[], envs);
+    t.expect("effort:");
+    t.send("write it\r");
+    t.expect("write file out.txt");
+    t.send("n");
+    t.expect("approval denied");
+    t.idle();
+    t.send("/");
+    t.expect("/thinking");
+    t.send("\x7f/quit\r");
+    assert_eq!(t.wait_exit(), Some(0));
+    let o = t.out.lock().unwrap();
+    String::from_utf8_lossy(&o).into_owned()
+}
+
+/// #463 themes: `TOLE_THEME=mono` (and `NO_COLOR`) leave no color sequence on
+/// the screen, the default theme still colors it, and an unknown theme falls
+/// back to the default with one note.
+#[test]
+fn tui_mono_theme_emits_no_color_sequences_and_default_still_does() {
+    let default = approval_screen(&[]);
+    assert!(
+        !sgr_colors(&default).is_empty(),
+        "the default theme must color the screen: {default:?}"
+    );
+    for envs in [
+        &[("TOLE_THEME", "mono")][..],
+        &[("NO_COLOR", "1")][..],
+        &[("NO_COLOR", "1"), ("TOLE_THEME", "MONO")][..],
+    ] {
+        let mono = approval_screen(envs);
+        assert_eq!(sgr_colors(&mono), Vec::<String>::new(), "{envs:?}");
+        assert!(!mono.contains("\x1b[38;"), "{envs:?}");
+        // Still readable: the approval prompt is on screen, and bold.
+        assert!(mono.contains("write file out.txt"), "{mono:?}");
+        assert!(
+            mono.contains("\x1b[1m"),
+            "bold carries the prompt: {mono:?}"
+        );
+    }
+    // An explicit theme is selected over NO_COLOR, but crossterm (the
+    // terminal backend) itself drops color escapes while NO_COLOR is set, so
+    // the screen stays color-free and the prompt stays bold.
+    let both = approval_screen(&[("NO_COLOR", "1"), ("TOLE_THEME", "light")]);
+    assert_eq!(sgr_colors(&both), Vec::<String>::new(), "{both:?}");
+    assert!(both.contains("\x1b[1m"), "{both:?}");
+    // Without NO_COLOR the light theme colors the screen.
+    let light = approval_screen(&[("TOLE_THEME", "light")]);
+    assert!(!sgr_colors(&light).is_empty(), "{light:?}");
+}
+
+#[test]
+fn tui_unknown_theme_shows_one_note_and_uses_the_default() {
+    let (url, dir) = (spawn_mock(), workdir());
+    let mut t = Pty::spawn_full(&dir, &url, &[], &[("TOLE_THEME", "neon")]);
+    t.expect("TOLE_THEME = \"neon\" is not a theme");
+    t.expect("effort:");
+    t.send("/quit\r");
+    assert_eq!(t.wait_exit(), Some(0));
+    let o = t.out.lock().unwrap();
+    let seen = String::from_utf8_lossy(&o).into_owned();
+    assert_eq!(seen.matches("is not a theme").count(), 1, "{seen:?}");
+    assert!(!sgr_colors(&seen).is_empty(), "default theme colors");
 }

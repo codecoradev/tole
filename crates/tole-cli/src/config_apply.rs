@@ -161,6 +161,20 @@ pub const REASONING_EFFORT_ENV: &str = "TOLE_REASONING_EFFORT";
 /// exists with `shell-tools`; a test below keeps the two equal.
 pub const REVIEW_GATE_ENV: &str = "TOLE_REVIEW_GATE";
 
+/// TUI theme name (#463): between the (absent) flag and the user config.
+pub const THEME_ENV: &str = "TOLE_THEME";
+
+/// <https://no-color.org>: a set, non-empty `NO_COLOR` asks for no color; here
+/// it selects the `mono` theme unless the user chose a theme explicitly.
+///
+/// Checked 2026-11-11: no-color.org itself was NOT reachable from this
+/// session (host outside the network allowlist), so its text is not quoted
+/// here. The condition (set AND non-empty, any value) is the one crossterm
+/// 0.29 implements and cites that page for, in `Colored::ansi_color_disabled`:
+/// `!std::env::var("NO_COLOR").unwrap_or("".to_string()).is_empty()`. Verify
+/// against the page when the network allows.
+pub const NO_COLOR_ENV: &str = "NO_COLOR";
+
 /// Real environment lookup for [`Settings::resolve`].
 pub fn real_env(name: &str) -> Option<String> {
     std::env::var(name).ok()
@@ -432,6 +446,12 @@ pub struct Settings {
     /// `None` = the built-in default (`block`). The flag reaches here as
     /// the env var `main` exports it to.
     pub review_gate: Option<Eff<String>>,
+    /// TUI theme name (#463): `TOLE_THEME` > user config `tui.theme` >
+    /// `NO_COLOR` (-> `mono`) > `default`. The project config is not a
+    /// source (see [`crate::config::layered`]).
+    pub tui_theme: Eff<String>,
+    /// Per-role color overrides from the user config's `tui.colors`.
+    pub tui_colors: Option<Eff<BTreeMap<String, String>>>,
 }
 
 impl Settings {
@@ -563,6 +583,24 @@ impl Settings {
             }),
             review_gate: resolve_string(None, env(REVIEW_GATE_ENV), cfg.review_gate.clone())
                 .map(|(v, s)| Eff::from_pair((v.trim().to_ascii_lowercase(), s), REVIEW_GATE_ENV)),
+            tui_theme: match resolve_string(
+                None,
+                env(THEME_ENV),
+                cfg.tui.as_ref().and_then(|t| t.theme.clone()),
+            ) {
+                Some(p) => Eff::from_pair((p.0.trim().to_string(), p.1), THEME_ENV),
+                // The no-color.org rule: set AND non-empty (not trimmed).
+                None if env(NO_COLOR_ENV).is_some_and(|v| !v.is_empty()) => {
+                    Eff::env("mono".to_string(), NO_COLOR_ENV)
+                }
+                None => Eff::new("default".to_string(), Source::Default),
+            },
+            tui_colors: cfg
+                .tui
+                .as_ref()
+                .and_then(|t| t.colors.clone())
+                .filter(|c| !c.is_empty())
+                .map(|c| Eff::new(c, Source::Config)),
         }
     }
 
@@ -609,6 +647,46 @@ impl Settings {
         one(&mut self.no_compaction, "no_compaction", user);
         opt(&mut self.reasoning_effort, "reasoning_effort", user);
         opt(&mut self.review_gate, "review_gate", user);
+        one(&mut self.tui_theme, "tui.theme", user);
+        opt(&mut self.tui_colors, "tui.colors", user);
+    }
+
+    /// The theme the TUI will use and the one-line note when the configured
+    /// theme was refused (#463). An invalid theme name or color never aborts:
+    /// the result is the `default` theme plus a note naming the key and the
+    /// problem.
+    #[cfg(feature = "tui")]
+    pub fn theme(&self) -> (tole_tui::Theme, Option<String>) {
+        match self.try_theme() {
+            Ok(t) => (t, None),
+            Err(e) => (
+                tole_tui::Theme::default(),
+                Some(format!("theme: {e}; using the default theme")),
+            ),
+        }
+    }
+
+    #[cfg(feature = "tui")]
+    fn try_theme(&self) -> Result<tole_tui::Theme, String> {
+        let key = match (self.tui_theme.source, self.tui_theme.env) {
+            (Source::Env, Some(name)) => name,
+            _ => "tui.theme",
+        };
+        let name = &self.tui_theme.value;
+        let mut theme = tole_tui::Theme::named(name).ok_or_else(|| {
+            format!(
+                "{key} = {name:?} is not a theme (built-in: {})",
+                tole_tui::BUILTIN_THEMES.join(", ")
+            )
+        })?;
+        if let Some(colors) = &self.tui_colors {
+            for (role, spec) in &colors.value {
+                theme
+                    .set_role(role, spec)
+                    .map_err(|e| format!("tui.colors: {e}"))?;
+            }
+        }
+        Ok(theme)
     }
 
     /// The fill to install for the deep server faces: ONLY the config's own
@@ -739,6 +817,40 @@ pub fn annotations(s: &Settings) -> BTreeMap<&'static str, String> {
         },
     );
     m.insert("review_gate", eff(&s.review_gate, &show_str));
+    let theme_problem = |what: &str| -> Option<String> {
+        #[cfg(feature = "tui")]
+        if let Err(e) = s.try_theme() {
+            // Name the key the problem is about; one problem is reported.
+            if e.starts_with(what) {
+                return Some(e);
+            }
+        }
+        let _ = what;
+        None
+    };
+    m.insert(
+        "tui.theme",
+        match theme_problem("tui.theme").or_else(|| theme_problem(THEME_ENV)) {
+            Some(e) => format!("  INVALID: {e}; the default theme is used"),
+            None => format!(
+                "  effective: {}  {}",
+                show_str(&s.tui_theme.value),
+                s.tui_theme.describe()
+            ),
+        },
+    );
+    m.insert(
+        "tui.colors",
+        match (&s.tui_colors, theme_problem("tui.colors")) {
+            (_, Some(e)) => format!("  INVALID: {e}; the default theme is used"),
+            (Some(c), None) => format!(
+                "  effective: {} override(s)  {}",
+                c.value.len(),
+                c.describe()
+            ),
+            (None, None) => "  effective: (none)".to_string(),
+        },
+    );
     m.insert(
         "mission.verify_timeout",
         format!(
@@ -878,6 +990,11 @@ pub fn load_project_config(
     let outcome = config_trust::gate(&subject, origin, &store, io)?;
     let shown = subject.shown();
     let config = crate::config::parse(&outcome.content, &shown).map_err(|e| anyhow!("{e}"))?;
+    if config.tui.is_some() {
+        io.warn(&crate::config::tui_ignored_warning(
+            &config_trust::sanitize(&shown.display().to_string()),
+        ));
+    }
     io.inform(&format!(
         "tole: using config {}",
         config_trust::sanitize(&shown.display().to_string())

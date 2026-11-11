@@ -19,7 +19,9 @@ fn tmpdir() -> PathBuf {
     d.canonicalize().unwrap()
 }
 
-const SCRUBBED: [&str; 11] = [
+const SCRUBBED: [&str; 13] = [
+    "TOLE_THEME",
+    "NO_COLOR",
     "TOLE_MODEL",
     "TOLE_BASE_URL",
     "TOLE_API_KEY",
@@ -614,4 +616,57 @@ fn a_user_config_hook_is_refused_on_a_server_face_naming_the_user_config() {
     let err = text(&o.stderr);
     assert!(err.contains("--on-turnend is not supported"), "{err}");
     assert!(err.contains("comes from the user config"), "{err}");
+}
+
+// ------------------------------------------------------ tui theme (#463)
+
+#[test]
+fn a_project_config_theme_is_ignored_with_one_startup_warning() {
+    let (d, home) = project("[tui]\ntheme = \"mono\"\n[tui.colors]\napproval = \"black\"\n");
+    trust(&d, &home);
+    let o = tole(&d, &home, &["sessions"]);
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    let err = text(&o.stderr);
+    assert_eq!(
+        err.matches("ignoring `tui` in project config").count(),
+        1,
+        "{err}"
+    );
+    assert!(err.contains("warning: "), "{err}");
+    // `config check` shows the project keys as ignored, never as effective.
+    let o = tole(&d, &home, &["config", "check"]);
+    let out = text(&o.stdout);
+    assert!(o.status.success(), "{out}");
+    assert!(
+        out.contains("tui.theme = \"mono\"  [config]  IGNORED"),
+        "{out}"
+    );
+    assert!(
+        out.contains("tui.colors = [1 entries]  [config]  IGNORED"),
+        "{out}"
+    );
+    assert!(!out.contains("effective: \"mono\""), "{out}");
+}
+
+#[test]
+fn an_invalid_user_theme_never_aborts_a_command_and_check_flags_it() {
+    let home = user_home("[tui]\ntheme = \"neon\"\n[tui.colors]\ntool = \"nope\"\n");
+    let d = tmpdir();
+    let o = tole(&d, &home, &["sessions"]);
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    let o = tole(&d, &home, &["config", "check"]);
+    let out = text(&o.stdout);
+    assert!(o.status.success(), "{out} {}", text(&o.stderr));
+    assert!(out.contains("tui.theme = \"neon\"  [user config]"), "{out}");
+    assert!(out.contains("INVALID: tui.theme = \"neon\""), "{out}");
+    // The env wins over the user config, with its source shown.
+    let o = cmd(&d, &home, &["config", "check"])
+        .env("TOLE_THEME", "light")
+        .output()
+        .unwrap();
+    let out = text(&o.stdout);
+    assert!(
+        out.contains("effective: \"light\"  (env TOLE_THEME)"),
+        "{out}"
+    );
 }

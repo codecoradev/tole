@@ -16,6 +16,7 @@ mod paste;
 mod render;
 mod sanitize;
 mod term_input;
+mod theme;
 mod transcript;
 
 use std::io::{self, Stdout};
@@ -44,6 +45,7 @@ pub use input::{Input, Key, KeyPress, Mods};
 pub use menu::{Item, PickKind};
 use render::{styled, wrap};
 pub(crate) use sanitize::{one_line, sanitize};
+pub use theme::{parse_color, parse_spec, Role, Theme, BUILTIN as BUILTIN_THEMES};
 pub use transcript::{Kind, Out, Transcript};
 
 /// live area (5: stream + hint, or a picker/menu) + editor (top border + 4) + footer (1).
@@ -97,6 +99,17 @@ pub enum TurnEnd {
 pub trait TuiHost: Sync {
     /// Current footer fields (called at start and after every turn).
     fn footer(&self) -> Footer;
+    /// The color theme (#463). Read once at start; the scrollback is
+    /// append-only, so it is not switched live. The default is the built-in
+    /// `default` theme.
+    fn theme(&self) -> Theme {
+        Theme::default()
+    }
+    /// One note line shown at start (for example why a configured theme was
+    /// not used).
+    fn startup_note(&self) -> Option<String> {
+        None
+    }
     /// Run one full turn (blocking). Streamed output goes through `observer`;
     /// `cancel` is set by Esc.
     fn run_turn(
@@ -446,6 +459,8 @@ pub struct App {
     /// The OSC 52 sequence `/copy` built; the loop writes it to the terminal
     /// (the only escape sequence the UI ever emits) via [`App::take_osc52`].
     osc52: Option<String>,
+    /// Colors (#463); the host supplies it, the UI reads no file or env.
+    theme: Theme,
 }
 
 /// Follow-ups that may wait, and queue rows shown above the editor.
@@ -458,6 +473,13 @@ impl App {
             recent: footer.model.iter().cloned().collect(),
             footer,
             ..Self::default()
+        }
+    }
+
+    pub fn with_theme(footer: Footer, theme: Theme) -> Self {
+        Self {
+            theme,
+            ..Self::new(footer)
         }
     }
 
@@ -1129,7 +1151,10 @@ pub fn run(host: &dyn TuiHost, approvals: Receiver<Pending>) -> io::Result<()> {
             viewport: Viewport::Inline(VIEWPORT_HEIGHT),
         },
     )?;
-    let mut app = App::new(host.footer());
+    let mut app = App::with_theme(host.footer(), host.theme());
+    if let Some(n) = host.startup_note() {
+        app.note(&format!("({n})"));
+    }
     event_loop(&mut term, host, &mut app, &approvals, |d| {
         if event::poll(d)? {
             event::read().map(Some)
@@ -1158,12 +1183,13 @@ where
         return Ok(());
     }
     let width = term.size().map_err(io_err::<B>)?.width as usize;
+    let theme = &app.theme;
     let lines: Vec<Line> = out
         .iter()
         .flat_map(|o| {
             wrap(&o.text, width)
                 .into_iter()
-                .map(move |t| styled(o.kind, &t))
+                .map(|t| styled(o.kind, &t, theme))
         })
         .collect();
     let h = lines.len().min(u16::MAX as usize) as u16;
@@ -3102,7 +3128,7 @@ mod tests {
                 (Kind::Text, "after"),
             ]
         );
-        let spans = inline_spans("plain **bold** and `code` **open");
+        let spans = inline_spans("plain **bold** and `code` **open", &Theme::default());
         let shown: Vec<_> = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(shown, ["plain ", "bold", " and ", "code", " **open"]);
         assert!(spans[1].style.add_modifier.contains(Modifier::BOLD));
@@ -3121,7 +3147,7 @@ mod tests {
         assert!(out.iter().all(|o| !o.text.chars().any(char::is_control)));
         let style_of = |needle: &str| {
             let o = out.iter().find(|o| o.text.contains(needle)).unwrap();
-            styled(o.kind, &o.text).spans[0].style
+            styled(o.kind, &o.text, &Theme::default()).spans[0].style
         };
         assert_eq!(style_of("+new").fg, Some(Color::Green));
         assert_eq!(style_of("-old").fg, Some(Color::Red));
