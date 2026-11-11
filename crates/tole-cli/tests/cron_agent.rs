@@ -324,6 +324,16 @@ fn a_cancelled_agent_run_settles_cancelled() {
 }
 
 #[test]
+fn run_now_runs_an_agent_job_in_this_process() {
+    provider();
+    let dir = tmp("runnow");
+    cron::create(&dir, agent(&dir, "n", "say HELLO now"), T).unwrap();
+    let r = cron::run_now(&dir, "n", T + 30, &TickOptions::standalone(1)).unwrap();
+    assert_eq!(r.ran.len(), 1);
+    assert_eq!(r.ran[0].1, RunStatus::Ok);
+}
+
+#[test]
 fn a_huge_minute_budget_saturates_and_is_capped_on_save() {
     assert_eq!(
         cron::agent::wall_budget(u64::MAX),

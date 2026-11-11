@@ -295,6 +295,19 @@ pub fn check_destructive_argv(argv: &[String]) -> Result<(), String> {
 /// (~64KB) would otherwise block on write while we only poll its status,
 /// and we'd time out on a perfectly valid run.
 pub fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> Result<Output, String> {
+    run_with_timeout_or_cancel(cmd, timeout, &crate::cancel::CancelToken::new())
+}
+
+/// Error text of a child killed because `cancel` was set.
+pub const CANCELLED: &str = "subprocess cancelled and was killed";
+
+/// [`run_with_timeout`] that also kills the child once `cancel` is set
+/// (checked at the same 50 ms poll), returning [`CANCELLED`].
+pub fn run_with_timeout_or_cancel(
+    cmd: &mut Command,
+    timeout: Duration,
+    cancel: &crate::cancel::CancelToken,
+) -> Result<Output, String> {
     use std::process::Stdio;
     cmd.stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -313,6 +326,11 @@ pub fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> Result<Output, 
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {
+                if cancel.is_cancelled() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(CANCELLED.into());
+                }
                 if start.elapsed() > timeout {
                     let _ = child.kill();
                     let _ = child.wait();
@@ -397,6 +415,23 @@ pub fn run_with_timeout_stdin(
         stdout,
         stderr,
     })
+}
+
+#[cfg(all(test, unix))]
+mod cancel_tests {
+    use super::*;
+
+    #[test]
+    fn a_set_cancel_token_kills_the_child() {
+        let cancel = crate::cancel::CancelToken::new();
+        cancel.cancel();
+        let start = std::time::Instant::now();
+        let mut cmd = Command::new("sleep");
+        cmd.arg("5");
+        let r = run_with_timeout_or_cancel(&mut cmd, Duration::from_secs(30), &cancel);
+        assert_eq!(r.unwrap_err(), CANCELLED);
+        assert!(start.elapsed() < Duration::from_secs(4));
+    }
 }
 
 #[cfg(test)]
