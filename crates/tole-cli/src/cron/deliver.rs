@@ -181,13 +181,12 @@ fn append_file(run: &RunInfo<'_>, rel: &str) -> Result<(), String> {
         .canonicalize()
         .map_err(|e| format!("workdir {workdir}: {e}"))?;
     let path = root.join(rel);
-    let parent = path.parent().unwrap_or(&root);
-    std::fs::create_dir_all(parent).map_err(|e| format!("{rel}: {e}"))?;
-    let parent = parent.canonicalize().map_err(|e| format!("{rel}: {e}"))?;
-    if !parent.starts_with(&root) {
-        return Err(format!("{rel}: resolves outside the workdir"));
-    }
-    let target = parent.join(path.file_name().unwrap_or_default());
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| format!("{rel}: names no file"))?;
+    let parent =
+        safe_parent(&root, path.parent().unwrap_or(&root)).map_err(|e| format!("{rel}: {e}"))?;
+    let target = parent.join(file_name);
     if std::fs::symlink_metadata(&target).is_ok_and(|m| m.file_type().is_symlink()) {
         return Err(format!("{rel}: is a symlink"));
     }
@@ -200,12 +199,51 @@ fn append_file(run: &RunInfo<'_>, rel: &str) -> Result<(), String> {
         run.output,
         if run.output.ends_with('\n') { "" } else { "\n" }
     );
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&target)
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    // A symlink swapped in after the check above must not be followed.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    opts.open(&target)
         .and_then(|mut f| f.write_all(block.as_bytes()))
         .map_err(|e| format!("{rel}: {e}"))
+}
+
+/// Resolve `dir` (under `root`, the canonical workdir) to a canonical
+/// directory inside `root`, creating what is missing. The deepest EXISTING
+/// ancestor is canonicalized and checked first, and the missing components
+/// are then made one at a time below that checked directory, so nothing is
+/// ever created through a symlink that leads out of the workdir.
+fn safe_parent(root: &Path, dir: &Path) -> Result<std::path::PathBuf, String> {
+    let mut existing = dir;
+    let mut missing = Vec::new();
+    while std::fs::symlink_metadata(existing).is_err() {
+        let (Some(name), Some(up)) = (existing.file_name(), existing.parent()) else {
+            return Err("no existing parent directory".into());
+        };
+        missing.push(name);
+        existing = up;
+    }
+    let mut cur = existing.canonicalize().map_err(|e| e.to_string())?;
+    if !cur.starts_with(root) {
+        return Err("resolves outside the workdir".into());
+    }
+    for name in missing.into_iter().rev() {
+        cur.push(name);
+        match std::fs::create_dir(&cur) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e.to_string()),
+        }
+        // `symlink_metadata` does not follow: a link raced in here is refused.
+        if !std::fs::symlink_metadata(&cur).is_ok_and(|m| m.is_dir()) {
+            return Err(format!("{} is not a directory", cur.display()));
+        }
+    }
+    Ok(cur)
 }
 
 fn run_command(run: &RunInfo<'_>, line: &str) -> Result<(), String> {

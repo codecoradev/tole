@@ -98,6 +98,67 @@ fn a_file_target_symlinked_out_of_the_workdir_fails_delivery_not_the_run() {
 }
 
 #[test]
+fn a_file_target_under_a_symlinked_directory_creates_nothing_outside_the_workdir() {
+    // A cloned repo can ship `out -> /elsewhere`; a target below it must not
+    // make directories through the link before the check refuses it.
+    let dir = tmp("symlink-dir");
+    let outside = tmp("symlink-dir-outside");
+    std::os::unix::fs::symlink(&outside, dir.join("out")).unwrap();
+    cron::create(
+        &dir,
+        script(
+            &dir,
+            "s",
+            "* * * * *",
+            "echo x",
+            &["file:out/sub/deep/x.md"],
+        ),
+        T,
+    )
+    .unwrap();
+    let r = cron::tick(&dir, T + 60, &OPTS).unwrap();
+    assert_eq!(r.ran[0].1, RunStatus::Ok);
+    let d = deliveries(&dir, &r.ran[0].0);
+    assert_eq!(d[0].1, DeliveryStatus::Failed, "{d:?}");
+    let left: Vec<_> = std::fs::read_dir(&outside).unwrap().collect();
+    assert!(left.is_empty(), "created outside the workdir: {left:?}");
+}
+
+#[test]
+fn a_file_target_that_is_itself_a_symlink_is_not_followed() {
+    let dir = tmp("symlink-file");
+    let outside = tmp("symlink-file-outside");
+    std::os::unix::fs::symlink(outside.join("x.md"), dir.join("x.md")).unwrap();
+    cron::create(
+        &dir,
+        script(&dir, "s", "* * * * *", "echo x", &["file:x.md"]),
+        T,
+    )
+    .unwrap();
+    let r = cron::tick(&dir, T + 60, &OPTS).unwrap();
+    let d = deliveries(&dir, &r.ran[0].0);
+    assert_eq!(d[0].1, DeliveryStatus::Failed, "{d:?}");
+    assert!(!outside.join("x.md").exists());
+}
+
+#[test]
+fn a_file_target_with_missing_directories_inside_the_workdir_is_created() {
+    let dir = tmp("nested");
+    cron::create(
+        &dir,
+        script(&dir, "s", "* * * * *", "echo x", &["file:a/b/c.md"]),
+        T,
+    )
+    .unwrap();
+    let r = cron::tick(&dir, T + 60, &OPTS).unwrap();
+    let d = deliveries(&dir, &r.ran[0].0);
+    assert_eq!(d[0].1, DeliveryStatus::Sent, "{d:?}");
+    assert!(std::fs::read_to_string(dir.join("a/b/c.md"))
+        .unwrap()
+        .ends_with("x\n"));
+}
+
+#[test]
 fn command_target_gets_the_output_on_stdin_and_its_failure_is_separate() {
     let dir = tmp("command");
     let spec = script(
