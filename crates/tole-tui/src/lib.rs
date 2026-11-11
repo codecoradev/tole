@@ -137,6 +137,12 @@ pub enum HostCmd {
     New,
     PickSession,
     Switch(String),
+    /// `/fork [entry]` (#463): fork the current session at a settled entry
+    /// (`None` = the last one) and switch to the fork. Answers `Session`.
+    Fork(Option<String>),
+    /// `/tree` (#463): the current session's fork family for the picker.
+    /// Answers `Sessions`; picking a row sends `Switch`.
+    PickTree,
     Status,
     Name(String),
     /// `/image <spec>` or a pasted image path / `data:image/…` URL (#560):
@@ -155,11 +161,11 @@ pub enum HostCmd {
 pub enum HostReply {
     /// The change was applied (`SetModel`, `SetEffort`, `Compact`, `Name`).
     Done,
-    /// The session turns now run against (`New`, `Switch`).
+    /// The session turns now run against (`New`, `Switch`, `Fork`).
     Session(String),
     /// Model ids for the picker (`PickModel`).
     Models(Vec<String>),
-    /// Sessions for the picker (`PickSession`).
+    /// Sessions for the picker (`PickSession`, `PickTree`).
     Sessions(Vec<SessionItem>),
     /// Lines to show (`Status`).
     Lines(Vec<String>),
@@ -678,6 +684,12 @@ impl App {
                         Action::Host(HostCmd::SetModel(id))
                     }
                     (PickKind::Session, Some(id)) => Action::Host(HostCmd::Switch(id)),
+                    // /tree lists the open session too: picking it is a no-op.
+                    (PickKind::Tree, Some(id)) if id == self.footer.session => {
+                        self.note(&format!("(already in {id})"));
+                        Action::Redraw
+                    }
+                    (PickKind::Tree, Some(id)) => Action::Host(HostCmd::Switch(id)),
                     _ => Action::Redraw,
                 };
             }
@@ -715,6 +727,8 @@ impl App {
             "/compact" => host(HostCmd::Compact(arg_opt)),
             "/new" => host(HostCmd::New),
             "/resume" => host(HostCmd::PickSession),
+            "/fork" => host(HostCmd::Fork(arg_opt)),
+            "/tree" => host(HostCmd::PickTree),
             "/session" => host(HostCmd::Status),
             "/image" => match arg {
                 "" => host(HostCmd::Images),
@@ -1145,6 +1159,8 @@ fn run_host_cmd(host: &dyn TuiHost, app: &mut App, cmd: HostCmd) {
     enum Cmd {
         PickModel,
         PickSession,
+        Tree,
+        Fork,
         New,
         Switch,
         Status,
@@ -1156,6 +1172,8 @@ fn run_host_cmd(host: &dyn TuiHost, app: &mut App, cmd: HostCmd) {
     let (kind, ok_note) = match &cmd {
         HostCmd::PickModel => (Cmd::PickModel, String::new()),
         HostCmd::PickSession => (Cmd::PickSession, String::new()),
+        HostCmd::PickTree => (Cmd::Tree, String::new()),
+        HostCmd::Fork(_) => (Cmd::Fork, String::new()),
         HostCmd::New => (Cmd::New, String::new()),
         HostCmd::Switch(_) => (Cmd::Switch, String::new()),
         HostCmd::Status => (Cmd::Status, String::new()),
@@ -1202,6 +1220,22 @@ fn run_host_cmd(host: &dyn TuiHost, app: &mut App, cmd: HostCmd) {
             v.into_iter().map(|s| Item::new(s.id, s.label)).collect(),
         ),
         (Cmd::PickSession, Err(e)) => app.note(&format!("(sessions: {e})")),
+        (Cmd::Tree, Ok(HostReply::Sessions(v))) => {
+            if v.len() <= 1 {
+                app.note("(this session has no parent and no forks)");
+            }
+            let current = app.footer.session.clone();
+            app.open_picker(
+                PickKind::Tree,
+                v.into_iter().map(|s| Item::new(s.id, s.label)).collect(),
+            );
+            if let Some(p) = app.picker.as_mut() {
+                p.select(&current);
+            }
+        }
+        (Cmd::Tree, Err(e)) => app.note(&format!("(tree: {e})")),
+        (Cmd::Fork, Ok(HostReply::Session(id))) => done(app, format!("forked → {id}")),
+        (Cmd::Fork, Err(e)) => app.note(&format!("(fork: {e})")),
         (Cmd::New, Ok(HostReply::Session(id))) => done(app, format!("new session {id}")),
         (Cmd::Switch, Ok(HostReply::Session(id))) => done(app, format!("resumed {id}")),
         (Cmd::Status, Ok(HostReply::Lines(lines))) => {
@@ -2357,6 +2391,133 @@ mod tests {
             Ok(HostReply::Session("s-1".into())),
         );
         assert!(notes.iter().any(|n| n.contains("resumed s-1")), "{notes:?}");
+    }
+
+    #[test]
+    fn fork_and_tree_commands_map_to_host_actions() {
+        let host = |c| Action::Host(c);
+        let mut app = App::default();
+        assert_eq!(typed(&mut app, "/fork"), host(HostCmd::Fork(None)));
+        assert_eq!(
+            typed(&mut app, "/fork  e-12 "),
+            host(HostCmd::Fork(Some("e-12".into())))
+        );
+        assert_eq!(typed(&mut app, "/tree"), host(HostCmd::PickTree));
+        // the command menu lists both
+        type_str(&mut app, "/f");
+        assert!(app.menu().contains(&"/fork"));
+        app.on_key(key(KeyCode::Esc));
+        // while a turn runs a command is ignored, like /new and /resume
+        let mut app = running_app();
+        for c in ["/fork", "/tree", "/new", "/resume"] {
+            type_str(&mut app, c);
+            assert_eq!(app.on_key(key(KeyCode::Enter)), Action::None, "{c}");
+        }
+    }
+
+    #[test]
+    fn fork_reports_the_new_session_and_refusals_with_the_hosts_error() {
+        let (notes, stale, _) =
+            host_says(HostCmd::Fork(None), Ok(HostReply::Session("s-fork".into())));
+        assert!(
+            notes.iter().any(|n| n.contains("forked → s-fork")),
+            "{notes:?}"
+        );
+        assert!(stale, "the footer is re-read after the switch");
+        let (notes, stale, _) = host_says(
+            HostCmd::Fork(Some("e-9".into())),
+            Err("forking s-1: entry e-9 is not a settled point".into()),
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("(fork: forking s-1: entry e-9 is not a settled point)")),
+            "{notes:?}"
+        );
+        assert!(!stale);
+    }
+
+    fn tree_rows() -> Vec<SessionItem> {
+        vec![
+            SessionItem {
+                id: "s-1".into(),
+                label: "s-1  2 turns".into(),
+            },
+            SessionItem {
+                id: "s-2".into(),
+                label: "└─ s-2 (@e-4)  3 turns  (current)".into(),
+            },
+            SessionItem {
+                id: "s-3".into(),
+                label: "   └─ s-3 (@e-6)  4 turns".into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn tree_picker_shows_the_family_preselects_the_current_and_switches() {
+        let mut app = App::default();
+        app.footer.session = "s-2".into();
+        let host = FakeHost::answering(vec![Ok(HostReply::Sessions(tree_rows()))]);
+        run_host_cmd(&host, &mut app, HostCmd::PickTree);
+        assert_eq!(host.seen(), vec!["PickTree"]);
+        let shown = app.picker_lines();
+        assert!(shown[0].starts_with("tree> "), "{shown:?}");
+        assert!(
+            shown.iter().any(|l| l.contains("▸ └─ s-2 (@e-4)")),
+            "{shown:?}"
+        );
+        assert!(
+            shown.iter().any(|l| l.contains("   └─ s-3")),
+            "indented: {shown:?}"
+        );
+        assert!(shown.iter().any(|l| l.ends_with("(current)")), "{shown:?}");
+        // a family of three: no "alone" note
+        assert!(!texts(&mut app).iter().any(|n| n.contains("no parent")));
+        // Enter on the preselected (current) row switches nowhere
+        assert_eq!(app.on_key(key(KeyCode::Enter)), Action::Redraw);
+        assert!(texts(&mut app).iter().any(|n| n.contains("already in s-2")));
+        // another row switches to exactly that id
+        run_host_cmd(
+            &FakeHost::answering(vec![Ok(HostReply::Sessions(tree_rows()))]),
+            &mut app,
+            HostCmd::PickTree,
+        );
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(
+            app.on_key(key(KeyCode::Enter)),
+            Action::Host(HostCmd::Switch("s-3".into()))
+        );
+        // and the first row goes to the root
+        run_host_cmd(
+            &FakeHost::answering(vec![Ok(HostReply::Sessions(tree_rows()))]),
+            &mut app,
+            HostCmd::PickTree,
+        );
+        app.on_key(key(KeyCode::Up));
+        assert_eq!(
+            app.on_key(key(KeyCode::Enter)),
+            Action::Host(HostCmd::Switch("s-1".into()))
+        );
+    }
+
+    #[test]
+    fn a_lone_session_in_tree_is_shown_with_a_note() {
+        let one = vec![SessionItem {
+            id: "s-1".into(),
+            label: "s-1  1 turns  (current)".into(),
+        }];
+        let (notes, _, app) = host_says(HostCmd::PickTree, Ok(HostReply::Sessions(one)));
+        assert!(
+            notes.iter().any(|n| n.contains("no parent and no forks")),
+            "{notes:?}"
+        );
+        assert!(app.picker_lines().iter().any(|l| l.contains("s-1")));
+        let (notes, _, _) = host_says(HostCmd::PickTree, Err("boom".into()));
+        assert!(
+            notes.iter().any(|n| n.contains("(tree: boom)")),
+            "{notes:?}"
+        );
     }
 
     #[test]

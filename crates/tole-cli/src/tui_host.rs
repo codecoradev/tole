@@ -150,6 +150,30 @@ pub fn sessions_from(index: &std::path::Path, current: &str) -> Vec<SessionItem>
         .collect()
 }
 
+/// Picker rows for the family of `current`: `└─ ` nesting by depth, the cut
+/// entry as `(@entry)`, the open session marked `(current)`.
+pub fn tree_items(nodes: Vec<crate::session_index::TreeNode>, current: &str) -> Vec<SessionItem> {
+    crate::session_index::family(nodes, current)
+        .into_iter()
+        .map(|(depth, n)| {
+            let pad = if depth == 0 {
+                String::new()
+            } else {
+                format!("{}└─ ", "   ".repeat(depth - 1))
+            };
+            let at =
+                n.at.as_ref()
+                    .map(|a| format!(" (@{a})"))
+                    .unwrap_or_default();
+            let mark = if n.id == current { "  (current)" } else { "" };
+            SessionItem {
+                label: format!("{pad}{}{at}  {} turns{mark}", n.id, n.turns),
+                id: n.id,
+            }
+        })
+        .collect()
+}
+
 /// Footer fields from the status snapshot; `effort` is the effective value
 /// (register, else the process default).
 pub fn footer_from(
@@ -246,6 +270,8 @@ impl TuiHost for TuiSession {
             HostCmd::New => self.new_session().map(HostReply::Session),
             HostCmd::PickSession => self.sessions().map(HostReply::Sessions),
             HostCmd::Switch(id) => self.switch_session(&id).map(HostReply::Session),
+            HostCmd::Fork(at) => self.fork_session(at.as_deref()).map(HostReply::Session),
+            HostCmd::PickTree => self.tree().map(HostReply::Sessions),
             HostCmd::Status => Ok(HostReply::Lines(self.status_lines())),
             HostCmd::Name(n) => self.set_name(&n).map(|()| HostReply::Done),
             // #560: `/image`, a pasted image path / data URL. Same resolution
@@ -313,17 +339,67 @@ impl TuiSession {
         if self.session_id() == id {
             return Ok(id.to_string());
         }
-        let file = self
-            .index
-            .as_deref()
-            .and_then(|i| crate::session_index::find(i, id))
-            .map(|e| e.file)
-            .unwrap_or_else(|| self.sessions_dir.join(format!("{id}.jsonl")));
+        let file = self.session_file(id);
         if !file.is_file() {
             return Err(format!("session {id} not found"));
         }
         let s = JsonlStorage::open(&file).map_err(|e| format!("opening {id}: {e}"))?;
         Ok(self.swap(s))
+    }
+
+    /// Where session `id` lives: its index record, else the sessions dir.
+    fn session_file(&self, id: &str) -> PathBuf {
+        self.index
+            .as_deref()
+            .and_then(|i| crate::session_index::find(i, id))
+            .map(|e| e.file)
+            .unwrap_or_else(|| self.sessions_dir.join(format!("{id}.jsonl")))
+    }
+
+    /// `/fork [entry]` (#463, over #210): fork the CURRENT session at the
+    /// settled entry `at` (default: the last settled one, as `tole branch`
+    /// does) into a new session in the sessions dir, and switch to it.
+    ///
+    /// Safe while this process holds the source's writer lock:
+    /// `JsonlStorage::fork` only replays the source read-only (no lock, no
+    /// repair, never a write) and the new file takes its own sidecar lock,
+    /// so there is no self-lock (#475) and the source is not touched. The
+    /// turn lock is held across the whole operation, so no turn appends to
+    /// the source while it is read. An unknown or unsettled entry, or a
+    /// source with nothing settled yet, is refused with the core's error and
+    /// the session stays as it was (a failed fork leaves no file behind).
+    pub fn fork_session(&self, at: Option<&str>) -> Result<String, String> {
+        let g = self.lock();
+        let src_id = g.storage.session_id().to_string();
+        let src = self.session_file(&src_id);
+        std::fs::create_dir_all(&self.sessions_dir).map_err(|e| e.to_string())?;
+        let id = crate::session_host::new_session_id("s");
+        let s = JsonlStorage::fork(&src, &self.sessions_dir, &id, at)
+            .map_err(|e| format!("forking {src_id}: {e}"))?;
+        if self.index.is_some() {
+            crate::session_index::record(&self.sessions_dir, &id, "branch");
+        }
+        drop(g);
+        Ok(self.swap(s))
+    }
+
+    /// `/tree` (#463): the current session's family (its parent chain up to
+    /// the root and every fork below it), one picker row per session,
+    /// indented by depth with the open one marked. Built from the same
+    /// `forked_from` data as `sessions --tree`, over the sessions dir; the
+    /// open session is read from the live handle, not its file.
+    pub fn tree(&self) -> Result<Vec<SessionItem>, String> {
+        let me = {
+            let g = self.lock();
+            crate::session_index::TreeNode::of(g.storage.session_id(), &g.storage)
+        };
+        let current = me.id.clone();
+        let mut nodes: Vec<_> = crate::session_index::tree_nodes(&self.sessions_dir)
+            .into_iter()
+            .filter(|n| n.id != current)
+            .collect();
+        nodes.push(me);
+        Ok(tree_items(nodes, &current))
     }
 
     pub fn status_lines(&self) -> Vec<String> {
@@ -775,5 +851,216 @@ mod tests {
         let lines = s.status_lines();
         assert!(lines.iter().any(|l| l == "effort:  high"), "{lines:?}");
         assert!(lines.iter().any(|l| l.starts_with("model:")));
+    }
+
+    // ---- /fork and /tree (#463) ----
+
+    use tole_core::entry::{EntryType, NewEntry};
+    use tole_core::state::{Pc, StateTransition};
+    use tole_core::storage::Commit;
+
+    fn msg(role: &str, text: &str) -> NewEntry {
+        NewEntry::root(
+            EntryType::new(EntryType::MESSAGE),
+            serde_json::json!({"role": role, "text": text}),
+        )
+    }
+
+    /// One settled turn (user message, final answer) on `s`; the answer's id.
+    fn settle(s: &mut JsonlStorage, user: &str, answer: &str) -> String {
+        s.commit(Commit::new().entry(msg("user", user))).unwrap();
+        let seq = s.state().seq;
+        s.commit(Commit::new().transition(StateTransition::from(seq, Pc::Planning)))
+            .unwrap();
+        let seq = s.state().seq;
+        let added = s
+            .commit(
+                Commit::new()
+                    .entry(msg("assistant", answer))
+                    .transition(StateTransition::from(seq, Pc::Final)),
+            )
+            .unwrap();
+        added[0].id.clone()
+    }
+
+    fn texts(s: &JsonlStorage) -> Vec<String> {
+        s.entries()
+            .iter()
+            .map(|e| e.payload["text"].as_str().unwrap_or("").to_string())
+            .collect()
+    }
+
+    fn jsonl_files(dir: &std::path::Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".jsonl"))
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// A TUI session `id` holding two settled turns; the two answer ids.
+    fn two_turns(dir: &std::path::Path, id: &str) -> (TuiSession, String, String) {
+        let s = session(dir, id);
+        let (a, b) = {
+            let mut g = s.lock();
+            let a = settle(&mut g.storage, "q1", "a1");
+            let b = settle(&mut g.storage, "q2", "a2");
+            (a, b)
+        };
+        (s, a, b)
+    }
+
+    #[test]
+    fn fork_defaults_to_the_last_settled_entry_while_this_process_holds_the_lock() {
+        let dir = tmp("fork-default");
+        let (s, _a, b) = two_turns(&dir, "s-1");
+        let src_bytes = std::fs::read(dir.join("s-1.jsonl")).unwrap();
+        // s-1 is open (writer lock held by THIS process) while it is forked.
+        let reply = s.apply(HostCmd::Fork(None));
+        let Ok(HostReply::Session(new_id)) = reply else {
+            panic!("fork refused: {reply:?}");
+        };
+        assert_ne!(new_id, "s-1");
+        assert_eq!(s.session_id(), new_id, "the TUI switched to the fork");
+        assert_eq!(s.footer().session, new_id);
+        {
+            let g = s.lock();
+            let o = g.storage.forked_from().expect("a fork");
+            assert_eq!((o.session.as_str(), o.entry.as_str()), ("s-1", b.as_str()));
+            assert_eq!(texts(&g.storage), ["q1", "a1", "q2", "a2"]);
+            assert_eq!(g.storage.state().pc, Pc::Final);
+        }
+        // the original is byte-identical, released, and resumable
+        assert_eq!(std::fs::read(dir.join("s-1.jsonl")).unwrap(), src_bytes);
+        let re = JsonlStorage::open(dir.join("s-1.jsonl")).expect("source released, not locked");
+        assert!(re.forked_from().is_none());
+        drop(re);
+        assert_eq!(s.switch_session("s-1").unwrap(), "s-1");
+        assert_eq!(
+            s.apply(HostCmd::Switch(new_id.clone())),
+            Ok(HostReply::Session(new_id))
+        );
+    }
+
+    #[test]
+    fn fork_at_an_earlier_settled_entry_cuts_there_and_new_work_stays_on_the_fork() {
+        let dir = tmp("fork-at");
+        let (s, a, _b) = two_turns(&dir, "s-1");
+        let src_bytes = std::fs::read(dir.join("s-1.jsonl")).unwrap();
+        let Ok(HostReply::Session(new_id)) = s.apply(HostCmd::Fork(Some(a.clone()))) else {
+            panic!("fork refused");
+        };
+        {
+            let mut g = s.lock();
+            let o = g.storage.forked_from().unwrap().clone();
+            assert_eq!((o.session.as_str(), o.entry.as_str()), ("s-1", a.as_str()));
+            assert_eq!(texts(&g.storage), ["q1", "a1"]);
+            // the branch diverges: new work lands in the fork, never the source
+            settle(&mut g.storage, "q3", "a3");
+        }
+        assert_eq!(std::fs::read(dir.join("s-1.jsonl")).unwrap(), src_bytes);
+        assert_eq!(
+            texts(&JsonlStorage::open_read_only(dir.join(format!("{new_id}.jsonl"))).unwrap()),
+            ["q1", "a1", "q3", "a3"]
+        );
+    }
+
+    #[test]
+    fn fork_of_an_unsettled_unknown_or_empty_source_is_refused_and_leaves_nothing() {
+        let dir = tmp("fork-refuse");
+        let (s, _a, _b) = two_turns(&dir, "s-1");
+        let user_msg = s.lock().storage.entries()[0].id.clone();
+        let before = jsonl_files(&dir);
+        let e = s.apply(HostCmd::Fork(Some(user_msg))).unwrap_err();
+        assert!(e.contains("not a settled point"), "{e}");
+        let e = s.apply(HostCmd::Fork(Some("nope".into()))).unwrap_err();
+        assert!(e.contains("unknown entry"), "{e}");
+        assert_eq!(s.session_id(), "s-1", "a refused fork keeps the session");
+        assert_eq!(
+            jsonl_files(&dir),
+            before,
+            "no half-written fork left behind"
+        );
+        // a fresh session has nothing settled to fork from
+        let e = s
+            .new_session()
+            .and_then(|_| s.fork_session(None))
+            .unwrap_err();
+        assert!(e.contains("no settled entry"), "{e}");
+        assert_eq!(
+            jsonl_files(&dir).len(),
+            before.len() + 1,
+            "only /new added a file"
+        );
+    }
+
+    #[test]
+    fn tree_lists_parent_siblings_and_grandchildren_indented_with_the_current_marked() {
+        let dir = tmp("tree");
+        let mut root = JsonlStorage::create_with(&dir, "r", None, Some("sys")).unwrap();
+        let cut = settle(&mut root, "q1", "a1");
+        drop(root);
+        // r -> {b, c}; b -> d
+        for (id, from) in [("b", "r"), ("c", "r"), ("d", "b")] {
+            drop(JsonlStorage::fork(dir.join(format!("{from}.jsonl")), &dir, id, None).unwrap());
+        }
+        // an unrelated session never shows
+        drop(JsonlStorage::create_with(&dir, "z", None, Some("sys")).unwrap());
+
+        let s = session_reopen(&dir, "b");
+        let Ok(HostReply::Sessions(rows)) = s.apply(HostCmd::PickTree) else {
+            panic!("no tree");
+        };
+        let at = format!("(@{cut})");
+        let want = [
+            ("r", "r  1 turns".to_string()),
+            ("b", format!("└─ b {at}  1 turns  (current)")),
+            ("d", format!("   └─ d {at}  1 turns")),
+            ("c", format!("└─ c {at}  1 turns")),
+        ];
+        let got: Vec<(&str, &str)> = rows
+            .iter()
+            .map(|r| (r.id.as_str(), r.label.as_str()))
+            .collect();
+        let want: Vec<(&str, &str)> = want.iter().map(|(i, l)| (*i, l.as_str())).collect();
+        assert_eq!(got, want);
+        // the same family from a leaf and from the root
+        let leaf = session_reopen(&dir, "d");
+        drop(s);
+        let ids = |v: Vec<SessionItem>| v.into_iter().map(|r| r.id).collect::<Vec<_>>();
+        assert_eq!(ids(leaf.tree().unwrap()), ["r", "b", "d", "c"]);
+        // a session with no parent and no forks is just itself
+        let z = session_reopen(&dir, "z");
+        let rows = z.tree().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "z");
+        assert!(rows[0].label.ends_with("(current)"));
+    }
+
+    #[test]
+    fn tree_after_fork_shows_the_new_session_under_the_source_and_switches_back() {
+        let dir = tmp("tree-fork");
+        let (s, _a, b) = two_turns(&dir, "s-1");
+        let Ok(HostReply::Session(f1)) = s.apply(HostCmd::Fork(None)) else {
+            panic!("fork refused");
+        };
+        let Ok(HostReply::Sessions(rows)) = s.apply(HostCmd::PickTree) else {
+            panic!("no tree");
+        };
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, "s-1");
+        assert!(rows[0].label.starts_with("s-1  "), "{}", rows[0].label);
+        assert_eq!(rows[1].id, f1);
+        assert_eq!(rows[1].label, format!("└─ {f1} (@{b})  2 turns  (current)"));
+        // picking the parent switches there (Switch), and the tree still has both
+        assert_eq!(
+            s.apply(HostCmd::Switch("s-1".into())),
+            Ok(HostReply::Session("s-1".into()))
+        );
+        let ids: Vec<_> = s.tree().unwrap().into_iter().map(|r| r.id).collect();
+        assert_eq!(ids, ["s-1".to_string(), f1]);
     }
 }
