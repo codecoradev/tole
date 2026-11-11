@@ -829,7 +829,15 @@ are read from the user config only, so a cloned repository cannot raise
 them. A job's skills (`--skill`) and profile (`--profile`) are validated on
 save and again when a run is claimed: a skill that is gone or broken, or a
 profile the user config no longer defines, records the run `blocked` before
-any token is spent. A profiled run auto-approves a Write only when both the
+any token is spent. Saving a job also pins each skill's content (a hash of
+the skill package for a name, of the file for a SKILL.md path, and of each
+profile skill): an unattended run never follows instructions that changed
+after the owner chose them (a `git pull` in the workdir, a cloned repo's
+`skills/`). A changed skill blocks the run (`skill_changed`) until the
+owner re-pins it with `tole cron edit --skill` (or `--profile`); editing any
+other field keeps the pins. Under `TOLE_SKILL_APPROVAL=required` a skill
+named by name must also be an owner-approved package (#591), else the run is
+`blocked` (`skill_not_approved`). A profiled run auto-approves a Write only when both the
 job's `allow` and the profile's `allow` cover it (never wider than either),
 and gets the secrets `Profile::granted(job grants)`: a job grants none, so
 a profile's `grants` give a cron run nothing. `GET /cron/runs` sits

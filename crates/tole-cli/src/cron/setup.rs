@@ -6,6 +6,18 @@
 //! longer defines, records the occurrence `blocked` before any token is
 //! spent (never a silent run without them).
 //!
+//! **Pinned content:** an unattended run must follow the instructions the
+//! owner chose, not whatever a `git pull` or a cloned repo put there later.
+//! Saving a job records a content hash per skill entry (`skill_hashes`,
+//! beside `skills`: the #591 package hash for a name entry, the file's
+//! bytes hash for a file entry) and per profile skill
+//! (`profile_skill_hashes`). A run whose skill no longer matches is
+//! `blocked` (`skill_changed`); `tole cron edit --skill` (or `--profile`)
+//! re-pins, editing anything else keeps the pins. With
+//! `TOLE_SKILL_APPROVAL=required` a name entry must also be owner-approved
+//! (#591), else the run is `blocked` (`skill_not_approved`). The skill text
+//! a run uses is parsed from the bytes that were hashed.
+//!
 //! A profile applies its persona, model, skills and memory room, under the
 //! unattended rules:
 //! - **Writes:** a run auto-approves a Write only when BOTH the job's
@@ -17,10 +29,11 @@
 //! - **Model:** the job's `--model` pin, else the profile's default tier,
 //!   else the environment's model.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use tole_core::ledger::Job;
-use tole_core::skills::Skill;
+use tole_core::skills::{Gate, Skill};
 
 use crate::config::Config;
 use crate::profile::Profile;
@@ -31,40 +44,90 @@ pub fn is_file_entry(entry: &str) -> bool {
     entry.contains('/') || entry.ends_with(".md")
 }
 
-/// Load one `--skill` entry: a SKILL.md file (its directory names the
-/// skill) or a skill name found from `workdir` (project, then user-global).
-pub fn load_entry(entry: &str, workdir: &Path) -> Result<Skill, String> {
+/// Largest skill file a cron job reads (bytes).
+const MAX_ENTRY_BYTES: u64 = 1024 * 1024;
+
+/// `path`, refused when over [`MAX_ENTRY_BYTES`] without reading it whole.
+fn read_small(path: &Path) -> Result<Vec<u8>, String> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let meta = file.metadata().map_err(|e| e.to_string())?;
+    if !meta.is_file() || meta.len() > MAX_ENTRY_BYTES {
+        return Err(format!(
+            "not a regular file of at most {MAX_ENTRY_BYTES} bytes"
+        ));
+    }
+    let mut buf = Vec::new();
+    file.take(MAX_ENTRY_BYTES + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| e.to_string())?;
+    if buf.len() as u64 > MAX_ENTRY_BYTES {
+        return Err(format!("over {MAX_ENTRY_BYTES} bytes"));
+    }
+    Ok(buf)
+}
+
+/// Read one `--skill` entry as it is now: the skill and the hash of the
+/// bytes it was parsed from. A file entry (its directory names the skill)
+/// hashes the file; a name entry (found from `workdir`, project then
+/// user-global) hashes its whole package, as #591 approvals do.
+pub fn read_entry(entry: &str, workdir: &Path) -> Result<(Skill, String), String> {
     if is_file_entry(entry) {
         let path = Path::new(entry);
-        let content = std::fs::read_to_string(path).map_err(|e| format!("{entry}: {e}"))?;
+        let bytes = read_small(path).map_err(|e| format!("{entry}: {e}"))?;
         let name = path
             .parent()
             .and_then(|p| p.file_name())
             .and_then(|n| n.to_str())
             .unwrap_or("skill");
-        tole_core::skills::parse_skill(&content, name).map_err(|e| format!("{entry}: {e}"))
+        let text = std::str::from_utf8(&bytes).map_err(|_| format!("{entry}: not UTF-8"))?;
+        let skill =
+            tole_core::skills::parse_loaded(text, name).map_err(|e| format!("{entry}: {e}"))?;
+        Ok((skill, tole_core::skill_index::content_hash(&bytes)))
     } else {
-        tole_core::skills::load_skill(Some(workdir), entry)
+        let pkg = tole_core::skill_approval::read_package(Some(workdir), entry)?;
+        let text = std::str::from_utf8(pkg.skill_md())
+            .map_err(|_| format!("{entry}: SKILL.md is not UTF-8"))?;
+        let skill = tole_core::skills::parse_loaded(text, entry)?;
+        Ok((skill, pkg.hash))
     }
 }
 
-/// Validate the `--skill` entries of a job being saved; a file entry is
-/// made absolute so the run finds it from any directory.
-pub fn normalize_skills(entries: &[String], workdir: &Path) -> Result<Vec<String>, String> {
-    entries
+/// Validate and pin the `--skill` entries of a job being saved: the
+/// entries as saved (a file entry made absolute, so the run finds it from
+/// any directory) and their content hashes, in the same order.
+pub fn pin_skills(
+    entries: &[String],
+    workdir: &Path,
+) -> Result<(Vec<String>, Vec<String>), String> {
+    let mut saved = Vec::new();
+    let mut hashes = Vec::new();
+    for e in entries {
+        let e = e.trim();
+        let entry = if is_file_entry(e) {
+            std::fs::canonicalize(e)
+                .map_err(|err| format!("{e}: {err}"))?
+                .display()
+                .to_string()
+        } else {
+            e.to_string()
+        };
+        let (_, hash) = read_entry(&entry, workdir)?;
+        saved.push(entry);
+        hashes.push(hash);
+    }
+    Ok((saved, hashes))
+}
+
+/// Pin a profile's skills (file paths): path → content hash.
+pub fn pin_profile(profile: &Profile, workdir: &Path) -> Result<BTreeMap<String, String>, String> {
+    profile
+        .skills
         .iter()
-        .map(|e| {
-            let e = e.trim();
-            let saved = if is_file_entry(e) {
-                std::fs::canonicalize(e)
-                    .map_err(|err| format!("{e}: {err}"))?
-                    .display()
-                    .to_string()
-            } else {
-                e.to_string()
-            };
-            load_entry(&saved, workdir)?;
-            Ok(saved)
+        .map(|p| {
+            let entry = p.display().to_string();
+            let (_, hash) = read_entry(&entry, workdir)?;
+            Ok((entry, hash))
         })
         .collect()
 }
@@ -95,21 +158,77 @@ pub struct AgentSetup {
     pub skills: Vec<Skill>,
 }
 
-/// Resolve a job's skills and profile for a run. The error is the
-/// `blocked` reason code and its detail.
+/// Resolve a job's skills and profile for a run, under the session's
+/// approval setting (`TOLE_SKILL_APPROVAL`). The error is the `blocked`
+/// reason code and its detail.
 pub fn resolve(job: &Job) -> Result<AgentSetup, (&'static str, String)> {
+    let (gate, _) = crate::skill_approve::gate_from_env().map_err(|e| ("skill_not_approved", e))?;
+    resolve_with(job, &gate)
+}
+
+/// [`resolve`] with an explicit approval gate.
+pub fn resolve_with(job: &Job, gate: &Gate) -> Result<AgentSetup, (&'static str, String)> {
     let workdir = PathBuf::from(super::field(job, "workdir").unwrap_or_default());
     let profile = match super::field(job, "profile") {
         Some(name) => Some(resolve_profile(name).map_err(|e| ("profile_missing", e))?),
         None => None,
     };
-    let mut skills = Vec::new();
-    for entry in list(job, "skills") {
-        skills.push(load_entry(&entry, &workdir).map_err(|e| ("skill_missing", e))?);
+    let changed = |entry: &str, pinned: &str, now: &str| {
+        (
+            "skill_changed",
+            format!(
+                "skill {entry} changed since the job was saved (pinned {pinned}, now {now}); \
+                 review it, then re-pin with `tole cron edit <job> --skill …` (or --profile)"
+            ),
+        )
+    };
+    let entries = list(job, "skills");
+    let pins = list(job, "skill_hashes");
+    if pins.len() != entries.len() {
+        return Err((
+            "skill_changed",
+            "the job's skills are not pinned; re-save them with `tole cron edit <job> --skill …`"
+                .into(),
+        ));
     }
+    let mut skills = Vec::new();
+    for (entry, pinned) in entries.iter().zip(&pins) {
+        let (skill, hash) = read_entry(entry, &workdir).map_err(|e| ("skill_missing", e))?;
+        if &hash != pinned {
+            return Err(changed(entry, pinned, &hash));
+        }
+        if let Gate::Approved(approvals) = gate {
+            if !is_file_entry(entry) && !approvals.is_approved(entry, &hash) {
+                return Err((
+                    "skill_not_approved",
+                    format!(
+                        "skill {entry} ({hash}) is not approved and TOLE_SKILL_APPROVAL=required; \
+                         the owner can run `tole skills approve {entry}`"
+                    ),
+                ));
+            }
+        }
+        skills.push(skill);
+    }
+    let profile_pins: BTreeMap<String, String> = job
+        .extra
+        .get("profile_skill_hashes")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
     for path in profile.iter().flat_map(|p| p.skills.iter()) {
         let entry = path.display().to_string();
-        skills.push(load_entry(&entry, &workdir).map_err(|e| ("skill_missing", e))?);
+        let (skill, hash) = read_entry(&entry, &workdir).map_err(|e| ("skill_missing", e))?;
+        match profile_pins.get(&entry) {
+            Some(pinned) if *pinned == hash => skills.push(skill),
+            Some(pinned) => return Err(changed(&entry, pinned, &hash)),
+            None => {
+                return Err(changed(
+                    &entry,
+                    "nothing (not in the profile when saved)",
+                    &hash,
+                ))
+            }
+        }
     }
     Ok(AgentSetup { profile, skills })
 }
@@ -214,12 +333,15 @@ mod tests {
         skill(&ws, "lint", "run the linters");
         let other = tmp("skills-other");
         let file = skill(&other, "deploy", "ship it");
-        let saved = normalize_skills(&["lint".into(), file.display().to_string()], &ws).unwrap();
+        let (saved, hashes) =
+            pin_skills(&["lint".into(), file.display().to_string()], &ws).unwrap();
         assert_eq!(saved, ["lint".to_string(), file.display().to_string()]);
-        assert!(normalize_skills(&["absent".into()], &ws).is_err());
-        assert!(normalize_skills(&["/no/such/SKILL.md".into()], &ws).is_err());
+        assert_eq!(hashes.len(), 2);
+        assert!(hashes.iter().all(|h| h.starts_with("sha256:")));
+        assert!(pin_skills(&["absent".into()], &ws).is_err());
+        assert!(pin_skills(&["/no/such/SKILL.md".into()], &ws).is_err());
         std::fs::write(ws.join("skills/lint/SKILL.md"), "no frontmatter").unwrap();
-        assert!(normalize_skills(&["lint".into()], &ws).is_err());
+        assert!(pin_skills(&["lint".into()], &ws).is_err());
         let _ = std::fs::remove_dir_all(&ws);
         let _ = std::fs::remove_dir_all(&other);
     }
@@ -228,17 +350,44 @@ mod tests {
     fn a_run_gets_its_skills_in_the_system_prompt_and_is_blocked_when_one_is_gone() {
         let ws = tmp("run");
         skill(&ws, "lint", "run the linters");
-        let j = job(json!({"workdir": ws.display().to_string(), "skills": ["lint"]}));
-        let setup = resolve(&j).unwrap();
+        let (_, hashes) = pin_skills(&["lint".into()], &ws).unwrap();
+        let j = job(
+            json!({"workdir": ws.display().to_string(), "skills": ["lint"],
+                           "skill_hashes": hashes}),
+        );
+        let setup = resolve_with(&j, &Gate::Open).unwrap();
         assert_eq!(
             setup.system_prompt().as_deref(),
             Some("# Skill: lint\nrun the linters")
         );
         // No skills, no profile: the run is unchanged.
         let plain = job(json!({"workdir": ws.display().to_string()}));
-        assert_eq!(resolve(&plain).unwrap().system_prompt(), None);
+        assert_eq!(
+            resolve_with(&plain, &Gate::Open).unwrap().system_prompt(),
+            None
+        );
+        // Skills without pins (a hand-edited record) never run.
+        let unpinned = job(json!({"workdir": ws.display().to_string(), "skills": ["lint"]}));
+        assert_eq!(
+            resolve_with(&unpinned, &Gate::Open).unwrap_err().0,
+            "skill_changed"
+        );
+        // Approval required: a name entry must be an approved package.
+        let mut approvals = tole_core::skill_approval::Approvals::default();
+        let gate = Gate::Approved(std::sync::Arc::new(approvals.clone()));
+        assert_eq!(resolve_with(&j, &gate).unwrap_err().0, "skill_not_approved");
+        approvals.approve(
+            &tole_core::skill_approval::read_package(Some(&ws), "lint").unwrap(),
+            1,
+        );
+        assert!(resolve_with(&j, &Gate::Approved(std::sync::Arc::new(approvals))).is_ok());
+        // Changed after save: blocked; gone: blocked.
+        skill(&ws, "lint", "something else");
+        let (code, detail) = resolve_with(&j, &Gate::Open).unwrap_err();
+        assert_eq!(code, "skill_changed");
+        assert!(detail.contains("cron edit"), "{detail}");
         std::fs::remove_dir_all(ws.join("skills/lint")).unwrap();
-        let (code, detail) = resolve(&j).unwrap_err();
+        let (code, detail) = resolve_with(&j, &Gate::Open).unwrap_err();
         assert_eq!(code, "skill_missing");
         assert!(detail.contains("lint"), "{detail}");
         let _ = std::fs::remove_dir_all(&ws);

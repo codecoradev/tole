@@ -155,7 +155,7 @@ tole branch <id> [--at <entry>]             # fork a session at a settled entry,
 tole import-claude <transcript.jsonl>       # import a Claude Code session as cc-<id>, then resume it
 tole cron create "@daily" --script "backup.sh"  # scheduled job; `tole cron tick` (every minute from cron/systemd) runs what is due; list|pause|resume|remove|runs
 tole cron create "0 9 * * 1-5" "Summarize open PRs" --allow write_file --model M  # agent job; `tole serve --cron` hosts the ticker
-tole cron create "@daily" "Triage new issues" --skill triage --profile ops  # agent job with a skill (name or SKILL.md) and a user-config profile; Writes need --allow AND the profile's allow
+tole cron create "@daily" "Triage new issues" --skill triage --profile ops  # agent job with a skill (name or SKILL.md, content pinned on save: a changed skill blocks the run until `cron edit --skill` re-pins) and a user-config profile; Writes need --allow AND the profile's allow
 tole cron edit NAME --deliver file:reports/prs.md   # also: run NAME (now), cancel NAME, status (ticker alive?)
 tole status [id]                            # pc / seq / turns / token + cache usage / request-size split; model, effort, context used/window, tokens, compactions (default: latest session)
 ```

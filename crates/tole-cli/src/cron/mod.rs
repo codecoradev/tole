@@ -200,6 +200,10 @@ pub struct CreateSpec {
     pub deliver: Vec<String>,
     pub skills: Vec<String>,
     pub profile: Option<String>,
+    /// Pinned content hashes of `skills`, same order (`None`: pin now).
+    pub skill_hashes: Option<Vec<String>>,
+    /// Pinned hashes of the profile's skills (`None`: pin now).
+    pub profile_skill_hashes: Option<std::collections::BTreeMap<String, String>>,
     pub paused: bool,
 }
 
@@ -344,13 +348,26 @@ fn build_job(spec: CreateSpec, id: String, now: i64) -> anyhow::Result<Job> {
         bail!("--skill and --profile apply to agent jobs only, not --script");
     }
     if !spec.skills.is_empty() {
-        let saved = setup::normalize_skills(&spec.skills, &spec.workdir)
-            .map_err(|e| anyhow!("--skill: {e}"))?;
+        let (saved, hashes) = match spec.skill_hashes {
+            // An edit that did not touch --skill keeps the owner's pins.
+            Some(h) if h.len() == spec.skills.len() => (spec.skills.clone(), h),
+            _ => setup::pin_skills(&spec.skills, &spec.workdir)
+                .map_err(|e| anyhow!("--skill: {e}"))?,
+        };
         extra.insert("skills".into(), json!(saved));
+        extra.insert("skill_hashes".into(), json!(hashes));
     }
     if let Some(name) = spec.profile.as_deref().map(str::trim) {
-        setup::resolve_profile(name).map_err(|e| anyhow!("--profile: {e}"))?;
+        let profile = setup::resolve_profile(name).map_err(|e| anyhow!("--profile: {e}"))?;
+        let pins = match spec.profile_skill_hashes {
+            Some(p) => p,
+            None => setup::pin_profile(&profile, &spec.workdir)
+                .map_err(|e| anyhow!("--profile: {e}"))?,
+        };
         extra.insert("profile".into(), name.into());
+        if !pins.is_empty() {
+            extra.insert("profile_skill_hashes".into(), json!(pins));
+        }
     }
     if let Some(p) = &spec.prompt {
         extra.insert("prompt".into(), p.clone().into());
@@ -443,6 +460,13 @@ fn spec_of(job: &Job) -> CreateSpec {
         deliver: list("deliver"),
         skills: list("skills"),
         profile: s("profile"),
+        skill_hashes: Some(list("skill_hashes")),
+        profile_skill_hashes: Some(
+            job.extra
+                .get("profile_skill_hashes")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default(),
+        ),
         paused: job.paused,
     }
 }
@@ -490,11 +514,15 @@ pub fn edit(dir: &Path, key: &str, change: EditSpec, now: i64) -> anyhow::Result
         if !change.deliver.is_empty() {
             spec.deliver = change.deliver;
         }
+        // `--skill` / `--profile` re-pin (the owner chose the content now);
+        // any other edit keeps the pins taken when they were last chosen.
         if !change.skills.is_empty() {
             spec.skills = change.skills;
+            spec.skill_hashes = None;
         }
         if change.profile.is_some() {
             spec.profile = change.profile;
+            spec.profile_skill_hashes = None;
         }
         let mut job = build_job(spec, old.id.clone(), now)?;
         if let Some(by) = old.extra.get("created_by") {
@@ -796,6 +824,8 @@ pub fn cli(action: CronAction, globals: JobGlobals) -> anyhow::Result<()> {
                     deliver,
                     skills: skill,
                     profile,
+                    skill_hashes: None,
+                    profile_skill_hashes: None,
                     paused,
                 },
                 t,
