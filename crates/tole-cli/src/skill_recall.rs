@@ -193,7 +193,7 @@ pub fn skills_section(
     ws: Option<&Path>,
     registry: &mut ToolRegistry,
 ) -> Result<(String, Vec<String>), String> {
-    let mut notes = Vec::new();
+    let mut notes = tole_core::skills::listing_notes(ws);
     let index = match (recall.settings.mode, &recall.index) {
         (IndexMode::Uteke, Some(index)) => Some(index.clone()),
         (IndexMode::Uteke, None) => {
@@ -256,7 +256,10 @@ pub fn index_all(index: &dyn SkillIndex, ws: Option<&Path>) -> (usize, Vec<Strin
     for skill in tole_core::skills::available_skills(ws) {
         let raw = tole_core::skills::skill_file(ws, &skill.name)
             .ok_or_else(|| "SKILL.md not found".to_string())
-            .and_then(|p| std::fs::read(&p).map_err(|e| format!("{}: {e}", p.display())));
+            .and_then(|p| {
+                tole_core::skills::read_file_capped(&p, tole_core::skills::MAX_SKILL_FILE_BYTES)
+                    .map_err(|e| format!("{}: {e}", p.display()))
+            });
         let res = raw.and_then(|raw| index.upsert(&SkillEntry::from_local(&skill, &raw)));
         match res {
             Ok(()) => done += 1,
@@ -664,6 +667,42 @@ mod tests {
             .unwrap()
             .execute(serde_json::json!({"name": "gamma"}))
             .is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An oversized SKILL.md is left out of the session listing with a
+    /// startup note, and `tole skills index` never reads or indexes it.
+    #[test]
+    fn an_oversized_skill_is_noted_and_never_indexed() {
+        let dir = ws("cap");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join("skills/beta/SKILL.md"))
+            .unwrap()
+            .set_len(tole_core::skills::MAX_SKILL_FILE_BYTES + 1)
+            .unwrap();
+        let mut reg = ToolRegistry::new();
+        let (block, notes) = skills_section(&SkillRecall::default(), Some(&dir), &mut reg).unwrap();
+        assert!(!block.contains("beta"), "{block}");
+        assert!(
+            notes.iter().any(|n| n.contains("\"beta\" skipped")),
+            "{notes:?}"
+        );
+        let rec = Recording(Default::default());
+        let (done, _) = index_all(&rec, Some(&dir));
+        let got: Vec<String> = rec
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|e| e.name.clone())
+            .collect();
+        assert_eq!(
+            got,
+            ["alpha"],
+            "gamma is refused by Recording, beta is skipped"
+        );
+        assert_eq!(done, 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
