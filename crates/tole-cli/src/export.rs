@@ -478,7 +478,9 @@ mod tests {
 
     #[test]
     fn paths_outside_the_workspace_are_refused() {
-        let w = ws("jail");
+        let base = ws("jail");
+        let w = base.join("work");
+        std::fs::create_dir(&w).unwrap();
         let outside = ws("jail-out");
         for bad in [
             "../x.html".to_string(),
@@ -493,7 +495,7 @@ mod tests {
             );
         }
         assert!(!outside.join("x.html").exists());
-        assert!(!w.parent().unwrap().join("x.html").exists());
+        assert!(!base.join("x.html").exists());
     }
 
     #[cfg(unix)]
