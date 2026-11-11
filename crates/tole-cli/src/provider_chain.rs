@@ -57,6 +57,17 @@ pub fn label(role: &str, cfg: &OpenAiConfig) -> String {
     )
 }
 
+/// The known secrets of this process (#595): every secret-named env var
+/// plus the values the web backend headers expand from `${NAME}`, whatever
+/// their names. One set for every egress sink a session has.
+pub fn process_secrets(env: &dyn Fn(&str) -> Option<String>) -> SecretSet {
+    tole_core::web::header_secrets(env)
+        .into_iter()
+        .fold(SecretSet::from_env(), |set, (name, value)| {
+            set.with(&name, &value)
+        })
+}
+
 /// Build the session's provider: `configure` is applied to the primary and,
 /// when configured, to the reserve.
 pub fn build(
@@ -66,7 +77,7 @@ pub fn build(
 ) -> Result<Box<dyn Provider>, String> {
     // #595: every known secret of this process is redacted from what the
     // provider sees, not only its own key. Collected once per session build.
-    let secrets = SecretSet::from_env();
+    let secrets = process_secrets(env);
     let make = |cfg: OpenAiConfig| configure(OpenAiProvider::new(cfg).with_secrets(&secrets));
     let Some(reserve) = fallback_config(&primary, env)? else {
         return Ok(Box::new(make(primary)));

@@ -31,6 +31,9 @@ use std::time::Duration;
 const API_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_ENDPOINT: &str = "https://api.typesafe.ai/v1/systemone";
 const HOSTED_HOST: &str = "api.typesafe.ai";
+// The env var NAME, not a secret value.
+// cora-ignore: sec-hardcoded-secret
+const KEY_ENV: &str = "SYSTEMONE_API_KEY";
 
 /// Backend capability caps. The hosted endpoint is the reference; any
 /// other base URL (self-hosted laya, fine-tunes, proxies) gets the
@@ -79,6 +82,9 @@ pub struct SystemOneTool {
     /// Bearer key. Never rendered in describe() output.
     pub api_key: String,
     agent: ureq::Agent,
+    /// Known secrets redacted from the decision request (#595). Always
+    /// holds this tool's own key.
+    secrets: crate::secrets::SecretSet,
 }
 
 impl SystemOneTool {
@@ -90,11 +96,21 @@ impl SystemOneTool {
             .http_status_as_error(false)
             .build()
             .new_agent();
+        let api_key = api_key.into();
+        let secrets = crate::secrets::SecretSet::default().with(KEY_ENV, &api_key);
         Self {
             endpoint: endpoint.into(),
-            api_key: api_key.into(),
+            api_key,
             agent,
+            secrets,
         }
+    }
+
+    /// Redact these secrets (and this tool's own key) from the decision
+    /// request: `state`, questions and instructions are model-written (#595).
+    pub fn with_secrets(mut self, secrets: &crate::secrets::SecretSet) -> Self {
+        self.secrets = secrets.with(KEY_ENV, &self.api_key);
+        self
     }
 
     /// Probe-gated construction (the uteke/cora contract): active iff
@@ -103,7 +119,7 @@ impl SystemOneTool {
     /// Absent key → None → tool simply not registered (owner decision
     /// 2026-10-05: automatic on key presence, silent off otherwise).
     pub fn from_env() -> Option<Self> {
-        let key = std::env::var("SYSTEMONE_API_KEY")
+        let key = std::env::var(KEY_ENV)
             .ok()
             .filter(|k| !k.trim().is_empty())?;
         let endpoint = std::env::var("SYSTEMONE_BASE_URL")
@@ -256,7 +272,8 @@ impl SystemOneTool {
             _ => {}
         }
         body.insert("questions".into(), Value::Object(questions));
-        Ok(Value::Object(body))
+        // #595: everything here is model-written and leaves the process.
+        Ok(self.secrets.redact_value(&Value::Object(body)))
     }
 
     /// One POST → `(status, body)`. The agent is configured with
@@ -587,6 +604,37 @@ mod tests {
             }
         });
         format!("http://{addr}/decide")
+    }
+
+    /// #595: model-written `state`, question ids and instructions never
+    /// carry a known secret (nor the tool's own key) to the backend.
+    #[test]
+    fn decision_request_is_redacted() {
+        let secrets = crate::secrets::SecretSet::collect(
+            [(
+                "TOLE_TEST_S1_TOKEN".to_string(),
+                "s1-other-secret-99".to_string(),
+            )],
+            std::iter::empty(),
+        );
+        let tool = SystemOneTool::new("https://api.typesafe.ai/v1/systemone", "sk-s1-own-key-1")
+            .with_secrets(&secrets);
+        let body = tool
+            .build_request(&json!({
+                "state": {"note": "s1-other-secret-99 and sk-s1-own-key-1"},
+                "questions": [{"id": "q", "type": "noul", "instructions": "use s1-other-secret-99"}]
+            }))
+            .unwrap()
+            .to_string();
+        assert!(
+            !body.contains("s1-other-secret-99") && !body.contains("sk-s1-own-key-1"),
+            "{body}"
+        );
+        assert!(
+            body.contains("«TOLE_TEST_S1_TOKEN» and «SYSTEMONE_API_KEY»"),
+            "{body}"
+        );
+        assert!(body.contains("use «TOLE_TEST_S1_TOKEN»"), "{body}");
     }
 
     fn q() -> Value {

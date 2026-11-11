@@ -139,11 +139,25 @@ pub struct UtekeDocumentTool {
     /// Default room to link into when the caller does not specify one.
     /// When `None`, documents are created unlinked (host decides).
     pub default_room: Option<String>,
+    /// Known secrets redacted from the markdown before it is stored (#595).
+    secrets: crate::secrets::SecretSet,
+    /// The uteke binary (`uteke` on PATH; a fake in tests).
+    bin: String,
 }
 
 impl UtekeDocumentTool {
     pub fn new(default_room: Option<String>) -> Self {
-        Self { default_room }
+        Self {
+            default_room,
+            secrets: crate::secrets::SecretSet::default(),
+            bin: "uteke".into(),
+        }
+    }
+
+    /// Redact these secrets from every document written (#595).
+    pub fn with_secrets(mut self, secrets: &crate::secrets::SecretSet) -> Self {
+        self.secrets = secrets.clone();
+        self
     }
 }
 
@@ -236,13 +250,16 @@ impl Tool for UtekeDocumentTool {
         //    Uses run_with_timeout_stdin: drain threads on all three
         //    pipes — no deadlock on large documents — and the hard
         //    subprocess timeout every other invocation gets.
-        let mut cmd = Command::new("uteke");
+        let mut cmd = Command::new(&self.bin);
         crate::subprocess::scrub_env_for_child(&mut cmd);
         cmd.arg("doc")
             .arg("create")
             .arg(slug)
             .arg("--file")
             .arg("-");
+        // #595: the document leaves the process (uteke cloud when
+        // configured); a known secret value never does.
+        let markdown = self.secrets.redact(markdown);
         let out = run_with_timeout_stdin(&mut cmd, SUBPROCESS_TIMEOUT, markdown.as_bytes())?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
@@ -256,7 +273,7 @@ impl Tool for UtekeDocumentTool {
         // 2) Link to the room when one is resolved.
         let mut linked = false;
         if let Some(room) = &room {
-            let mut link = Command::new("uteke");
+            let mut link = Command::new(&self.bin);
             // ENV-1: same secret scrubbing as every other spawn point
             // (CodeCora scan 2026-09-18 — this spawn point missed it).
             crate::subprocess::scrub_env_for_child(&mut link);
@@ -289,6 +306,46 @@ impl Tool for UtekeDocumentTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #595: the stored document never carries a known secret value.
+    #[cfg(unix)]
+    #[test]
+    fn document_markdown_is_redacted_before_it_leaves_the_process() {
+        let dir = std::env::temp_dir().join(format!("tole-uteke-595-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("uteke");
+        let stored = dir.join("stored.md");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh
+cat > {}
+echo ok
+",
+                stored.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let secrets = crate::secrets::SecretSet::collect(
+            [(
+                "TOLE_TEST_DOC_TOKEN".to_string(),
+                "doc-secret-0123456".to_string(),
+            )],
+            std::iter::empty(),
+        );
+        let mut t = UtekeDocumentTool::new(None).with_secrets(&secrets);
+        t.bin = bin.display().to_string();
+        t.execute(json!({"slug": "notes", "markdown": "# Notes\nkey: doc-secret-0123456\n"}))
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&stored).unwrap(),
+            "# Notes\nkey: «TOLE_TEST_DOC_TOKEN»\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn recall_classified_readonly() {

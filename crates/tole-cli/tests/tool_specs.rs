@@ -53,7 +53,7 @@ fn all_tools() -> Vec<Box<dyn Tool>> {
         Box::new(tole_core::read_file::ReadFileTool::new(root.clone())),
         Box::new(tole_core::file_tools::EditFileTool::new(root.clone())),
         Box::new(tole_core::file_tools::DeleteFileTool::new(root.clone())),
-        Box::new(tole_core::web::WebFetchTool),
+        Box::new(tole_core::web::WebFetchTool::default()),
         Box::new(tole_core::skills::LoadSkillTool::new(None)),
         Box::new(WriteFileTool::new(root.clone())),
         Box::new(UpdatePlanTool::new(Arc::new(|_| {}))),

@@ -496,7 +496,7 @@ impl OpenAiProvider {
                         "function": {
                             "name": tool,
                             // E11 covers the tool-call arguments too.
-                            "arguments": self.secrets.redact(&input.to_string()),
+                            "arguments": self.secrets.redact_value(input).to_string(),
                         },
                     });
                     // #480: a batch member joins the assistant message that
@@ -546,7 +546,7 @@ impl OpenAiProvider {
                     messages.push(json!({
                         "role": "tool",
                         "tool_call_id": parent,
-                        "content": fence_tool_result(&self.secrets.redact(&content.to_string())),
+                        "content": fence_tool_result(&self.secrets.redact_value(&content).to_string()),
                     }));
                 }
                 _ => {}
@@ -1824,6 +1824,38 @@ mod transcript_tests {
             json!("key: sk-super-secret-456"),
             "durable log must keep the original text"
         );
+    }
+
+    #[test]
+    fn request_body_keeps_tool_arguments_valid_json_when_a_secret_is_a_number() {
+        // #595 review: text redaction of the serialized arguments turned
+        // `{"pin":12345678}` into `{"pin":«PIN_SECRET»}`, invalid JSON.
+        let set = crate::secrets::SecretSet::collect(
+            [("PIN_SECRET".to_string(), "12345678".to_string())],
+            std::iter::empty(),
+        );
+        let p = OpenAiProvider::new(OpenAiConfig::new(
+            "https://x/v1",
+            "m",
+            "sk-super-secret-123",
+        ))
+        .with_secrets(&set);
+        let mut intent = msg("intent_1", "assistant", "");
+        intent.kind = EntryType::new("intent");
+        intent.payload = json!({ "tool": "t", "input": { "pin": 12345678 } });
+        let mut result = msg("r1", "assistant", "");
+        result.kind = EntryType::new("tool_result");
+        result.parent_id = Some("intent_1".into());
+        result.payload = json!({ "output": { "echo": 12345678 } });
+        let body = p.request_body(&[intent, result]);
+        let args = body["messages"][0]["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .unwrap();
+        let parsed: Value = serde_json::from_str(args).expect("arguments stay valid JSON");
+        assert_eq!(parsed, json!({ "pin": "«PIN_SECRET»" }));
+        let tool = body["messages"][1]["content"].as_str().unwrap();
+        assert!(tool.contains(r#"{"echo":"«PIN_SECRET»"}"#), "{tool}");
+        assert!(!body.to_string().contains("12345678"));
     }
 
     #[test]

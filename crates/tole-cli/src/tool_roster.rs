@@ -167,6 +167,8 @@ pub fn build(approver: impl Approver + 'static, roster: Roster) -> Result<ToolRe
     #[cfg_attr(not(feature = "shell-tools"), allow(unused_variables))]
     let shell_dir = &roster.shell_dir;
     let env = &crate::config_apply::real_env;
+    // Known secrets, redacted at every egress sink of these tools (#595).
+    let secrets = crate::provider_chain::process_secrets(env);
     // Child agents (#380): file tools record touches for sibling notices.
     let tracking = crate::sibling::tracking_from_env(env);
     let tracked = |tool: Box<dyn Tool>| crate::sibling::track(tool, tracking.as_ref(), root);
@@ -185,7 +187,10 @@ pub fn build(approver: impl Approver + 'static, roster: Roster) -> Result<ToolRe
         if binary_available("uteke") {
             add(&mut reg, Box::new(UtekeRecallTool::new()))?;
             if !plan {
-                add(&mut reg, Box::new(UtekeDocumentTool::new(None)))?;
+                add(
+                    &mut reg,
+                    Box::new(UtekeDocumentTool::new(None).with_secrets(&secrets)),
+                )?;
             }
         } else {
             probe_notice("uteke binary not found — uteke_recall/uteke_document disabled");
@@ -224,7 +229,7 @@ pub fn build(approver: impl Approver + 'static, roster: Roster) -> Result<ToolRe
     add(&mut reg, Box::new(VerifyPackageTool::new()))?;
     // systemone_decide (#172): present iff SYSTEMONE_API_KEY is set.
     if let Some(t) = tole_core::systemone::SystemOneTool::from_env() {
-        add(&mut reg, Box::new(t))?;
+        add(&mut reg, Box::new(t.with_secrets(&secrets)))?;
     }
     // Child agents (#171): parent sessions only, never in plan mode. Not
     // behind this crate's shell-tools gate: every CLI profile had them.
@@ -242,12 +247,15 @@ pub fn build(approver: impl Approver + 'static, roster: Roster) -> Result<ToolRe
     add(&mut reg, tracked(Box::new(ReadFileTool::new(root.clone()))))?;
     // Web tools (#215): fetch always; search only with a backend.
     match tole_core::web::WebBackendFetchTool::from_env().map_err(anyhow::Error::msg)? {
-        Some(fetch) => add(&mut reg, Box::new(fetch))?,
-        None => add(&mut reg, Box::new(tole_core::web::WebFetchTool))?,
+        Some(fetch) => add(&mut reg, Box::new(fetch.with_secrets(&secrets)))?,
+        None => add(
+            &mut reg,
+            Box::new(tole_core::web::WebFetchTool::default().with_secrets(&secrets)),
+        )?,
     }
     // A malformed search config (#436) fails startup loudly.
     if let Some(search) = tole_core::web::WebSearchTool::from_env().map_err(anyhow::Error::msg)? {
-        add(&mut reg, Box::new(search))?;
+        add(&mut reg, Box::new(search.with_secrets(&secrets)))?;
     }
     if !plan {
         add(
@@ -295,7 +303,7 @@ pub fn build(approver: impl Approver + 'static, roster: Roster) -> Result<ToolRe
     let mut resource_servers = Vec::new();
     #[cfg(feature = "mcp")]
     for cfg in &roster.mcp_servers {
-        let names = tole_core::mcp::register_server_tools(&mut reg, cfg);
+        let names = tole_core::mcp::register_server_tools(&mut reg, cfg, &secrets);
         if cfg.name == "cora" && !names.is_empty() {
             cora_mcp_ok = true;
         }
