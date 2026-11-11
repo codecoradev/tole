@@ -24,6 +24,14 @@ pub const COMMANDS: [(&str, &str); 11] = [
         "/image",
         "attach an image to the next message: /image <path> | clear",
     ),
+    (
+        "/copy",
+        "copy the last answer to the terminal clipboard (OSC 52)",
+    ),
+    (
+        "/export",
+        "write the transcript: /export [path.html|path.jsonl]",
+    ),
     ("/quit", "quit"),
 ];
 

@@ -69,6 +69,8 @@ pub struct TuiSession {
     fresh_prompt: Option<String>,
     /// The global session index (`None` = no index: nothing recorded or looked up).
     index: Option<PathBuf>,
+    /// The workspace `/export` is jailed to (#463).
+    workspace: PathBuf,
 }
 
 impl TuiSession {
@@ -95,7 +97,14 @@ impl TuiSession {
             sessions_dir: PathBuf::from(".tole/sessions"),
             fresh_prompt: None,
             index: crate::session_index::index_path(),
+            workspace: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         }
+    }
+
+    /// The workspace root `/export` writes under (default: the cwd).
+    pub fn with_workspace(mut self, root: PathBuf) -> Self {
+        self.workspace = root;
+        self
     }
 
     /// Replace the session index (tests pass `None` to stay off the user's).
@@ -284,6 +293,8 @@ impl TuiHost for TuiSession {
                 Ok(HostReply::Images(Vec::new()))
             }
             HostCmd::Images => Ok(HostReply::Images(self.image_items())),
+            HostCmd::LastAnswer => Ok(HostReply::Answer(self.last_answer())),
+            HostCmd::Export(path) => self.export(path.as_deref()).map(HostReply::Path),
         }
     }
 }
@@ -417,6 +428,25 @@ impl TuiSession {
             session_status(&*storage, Some(&self.cfg.model), &self.compaction, &mut src).lines(),
         );
         out
+    }
+
+    /// `/copy` (#463): the last assistant answer of the open session.
+    pub fn last_answer(&self) -> Option<String> {
+        crate::export::last_answer(self.lock().storage.entries())
+    }
+
+    /// `/export [path]` (#463): write the open session's transcript under
+    /// the workspace (jailed, never overwriting); returns the path written.
+    /// Reads the in-memory replay; the session file is not touched.
+    pub fn export(&self, path: Option<&str>) -> Result<String, String> {
+        let g = self.lock();
+        crate::export::export(
+            g.storage.entries(),
+            g.storage.session_id(),
+            &self.workspace,
+            path,
+        )
+        .map(|p| p.display().to_string())
     }
 
     pub fn set_name(&self, name: &str) -> Result<(), String> {
@@ -807,6 +837,53 @@ mod tests {
         assert_eq!(s.apply(HostCmd::Images), Ok(HostReply::Images(want)));
         assert_eq!(s.apply(HostCmd::ClearImages), Ok(HostReply::Images(vec![])));
         assert!(s.pending_images().is_empty());
+    }
+
+    #[test]
+    fn copy_and_export_read_the_open_session_without_touching_its_file() {
+        use tole_core::entry::{EntryType, NewEntry};
+        use tole_core::storage::Commit;
+        let dir = tmp("export");
+        let ws = dir.canonicalize().unwrap();
+        let s = session(&dir, "s-1").with_workspace(ws.clone());
+        assert_eq!(s.apply(HostCmd::LastAnswer), Ok(HostReply::Answer(None)));
+        for (role, text) in [("user", "q <b>"), ("assistant", "the answer")] {
+            let payload = serde_json::json!({ "role": role, "text": text });
+            s.lock()
+                .storage
+                .commit(
+                    Commit::new()
+                        .entry(NewEntry::root(EntryType::new(EntryType::MESSAGE), payload)),
+                )
+                .unwrap();
+        }
+        let file = dir.join("s-1.jsonl");
+        let before = std::fs::read(&file).unwrap();
+        assert_eq!(
+            s.apply(HostCmd::LastAnswer),
+            Ok(HostReply::Answer(Some("the answer".into())))
+        );
+        let want = ws.join(".tole/exports/s-1.html");
+        assert_eq!(
+            s.apply(HostCmd::Export(None)),
+            Ok(HostReply::Path(want.display().to_string()))
+        );
+        let html = std::fs::read_to_string(&want).unwrap();
+        assert!(html.contains("q &lt;b&gt;") && html.contains("the answer"));
+        // JSONL equals the stored entries.
+        let j = s.apply(HostCmd::Export(Some("t.jsonl".into())));
+        assert!(matches!(j, Ok(HostReply::Path(_))), "{j:?}");
+        let lines: Vec<tole_core::entry::Entry> = std::fs::read_to_string(ws.join("t.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines, s.lock().storage.entries());
+        // A second run to the same path is refused; the session file is untouched.
+        let again = s.apply(HostCmd::Export(Some("t.jsonl".into())));
+        assert!(again.unwrap_err().contains("already exists"));
+        assert!(s.apply(HostCmd::Export(Some("../x.html".into()))).is_err());
+        assert_eq!(std::fs::read(&file).unwrap(), before);
     }
 
     #[test]

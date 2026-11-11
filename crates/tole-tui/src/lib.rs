@@ -7,6 +7,7 @@
 //! lines are committed to the terminal scrollback, the viewport only holds the
 //! live stream line, the editor and the footer.
 
+mod clipboard;
 mod editor;
 mod files;
 mod input;
@@ -154,6 +155,12 @@ pub enum HostCmd {
     /// The images queued for the next message (`/image`, and after a turn
     /// that may have handed them back).
     Images,
+    /// `/copy` (#463): the text of the session's last assistant answer.
+    LastAnswer,
+    /// `/export [path]` (#463): write the transcript to a file (format by
+    /// extension, `.html` or `.jsonl`; `None` = the host's default path).
+    /// The host jails the path and refuses to overwrite.
+    Export(Option<String>),
 }
 
 /// What the host answers to a [`HostCmd`] (#526): data, never wording.
@@ -172,6 +179,11 @@ pub enum HostReply {
     /// The images now queued for the next message, in attach order
     /// (`AttachImage`, `ClearImages`, `Images`).
     Images(Vec<ImageItem>),
+    /// The last assistant answer, `None` when the session has none
+    /// (`LastAnswer`).
+    Answer(Option<String>),
+    /// Where the transcript was written (`Export`).
+    Path(String),
 }
 
 /// One image queued for the next message, as the host resolved it.
@@ -431,6 +443,9 @@ pub struct App {
     images_in_flight: bool,
     /// Set at the end of such a turn: the loop re-reads the host's queue.
     pub images_stale: bool,
+    /// The OSC 52 sequence `/copy` built; the loop writes it to the terminal
+    /// (the only escape sequence the UI ever emits) via [`App::take_osc52`].
+    osc52: Option<String>,
 }
 
 /// Follow-ups that may wait, and queue rows shown above the editor.
@@ -643,6 +658,11 @@ impl App {
         self.recent.insert(0, id.to_string());
     }
 
+    /// The pending `/copy` sequence, if any (drains).
+    pub fn take_osc52(&mut self) -> Option<String> {
+        self.osc52.take()
+    }
+
     /// A one-line note in the transcript (command feedback).
     pub fn note(&mut self, text: &str) {
         let lines = self.transcript.line(Kind::Note, text);
@@ -735,6 +755,12 @@ impl App {
                 "clear" => host(HostCmd::ClearImages),
                 spec => host(HostCmd::AttachImage(spec.to_string())),
             },
+            "/copy" if arg.is_empty() => host(HostCmd::LastAnswer),
+            "/copy" => {
+                self.note("(usage: /copy; it takes no argument, /export [path] writes a file)");
+                Action::Redraw
+            }
+            "/export" => host(HostCmd::Export(arg_opt)),
             "/name" => match arg_opt {
                 Some(n) => host(HostCmd::Name(n)),
                 None => {
@@ -1168,6 +1194,8 @@ fn run_host_cmd(host: &dyn TuiHost, app: &mut App, cmd: HostCmd) {
         Attach,
         Clear,
         Images,
+        Copy,
+        Export,
     }
     let (kind, ok_note) = match &cmd {
         HostCmd::PickModel => (Cmd::PickModel, String::new()),
@@ -1197,6 +1225,8 @@ fn run_host_cmd(host: &dyn TuiHost, app: &mut App, cmd: HostCmd) {
         HostCmd::AttachImage(_) => (Cmd::Attach, String::new()),
         HostCmd::ClearImages => (Cmd::Clear, String::new()),
         HostCmd::Images => (Cmd::Images, String::new()),
+        HostCmd::LastAnswer => (Cmd::Copy, String::new()),
+        HostCmd::Export(_) => (Cmd::Export, String::new()),
     };
     let had = app.images.len();
     let done = |app: &mut App, msg: String| {
@@ -1259,12 +1289,39 @@ fn run_host_cmd(host: &dyn TuiHost, app: &mut App, cmd: HostCmd) {
             }
             app.set_images(v);
         }
+        (Cmd::Copy, Ok(HostReply::Answer(answer))) => copy_answer(app, answer),
+        (Cmd::Copy, Err(e)) => app.note(&format!("(/copy: {e})")),
+        (Cmd::Export, Ok(HostReply::Path(p))) => app.note(&format!("(transcript written to {p})")),
+        (Cmd::Export, Err(e)) => app.note(&format!("(/export: {e})")),
         // The host's own error (jail, size cap, not an image), as chat shows it.
         (Cmd::Attach | Cmd::Clear | Cmd::Images, Err(e)) => app.note(&format!("(/image: {e})")),
         (_, Err(e)) => app.note(&format!("(failed: {e})")),
         // A host answered with the wrong kind of reply: say so, never panic.
         (_, Ok(other)) => app.note(&format!("(failed: unexpected host reply {other:?})")),
     }
+}
+
+/// `/copy`: build the OSC 52 sequence for the answer (the loop writes it) and
+/// say what was attempted. A terminal cannot confirm OSC 52, so the note never
+/// claims the clipboard changed.
+fn copy_answer(app: &mut App, answer: Option<String>) {
+    let Some(text) = answer.filter(|t| !t.trim().is_empty()) else {
+        app.note("(nothing to copy: this session has no assistant answer yet)");
+        return;
+    };
+    if text.len() > clipboard::MAX_COPY_BYTES {
+        app.note(&format!(
+            "(the last answer is {} KiB, over the {} KiB /copy limit; use /export to write the transcript to a file)",
+            text.len().div_ceil(1024),
+            clipboard::MAX_COPY_BYTES / 1024
+        ));
+        return;
+    }
+    app.note(&format!(
+        "(sent {} characters to the terminal clipboard; needs OSC 52 support, tmux needs `set -g set-clipboard on`)",
+        text.chars().count()
+    ));
+    app.osc52 = Some(clipboard::osc52(&text));
 }
 
 /// The host accepted an image: show the queue and name the new one.
@@ -1400,7 +1457,13 @@ where
                             app.restore_draft(&text);
                         }
                     },
-                    Action::Host(cmd) => run_host_cmd(host, app, cmd),
+                    Action::Host(cmd) => {
+                        run_host_cmd(host, app, cmd);
+                        if let Some(seq) = app.take_osc52() {
+                            // Between frames, on the real terminal: never part of a frame.
+                            let _ = clipboard::emit(&mut io::stdout(), &seq);
+                        }
+                    }
                     Action::PasteImage { spec, text } => attach_pasted(host, app, spec, &text),
                     Action::Redraw | Action::None => {}
                 }
@@ -1694,6 +1757,91 @@ mod tests {
             ]
         );
         assert_eq!(app.images().len(), 1);
+    }
+
+    fn submit(draft: &str) -> Action {
+        let mut app = App::default();
+        typed_input(&mut app, draft);
+        app.on_input(Input::new(Key::Enter))
+    }
+
+    #[test]
+    fn copy_and_export_map_to_host_commands() {
+        assert_eq!(submit("/copy"), Action::Host(HostCmd::LastAnswer));
+        assert_eq!(submit("/export"), Action::Host(HostCmd::Export(None)));
+        assert_eq!(
+            submit("/export  out/my run.html "),
+            Action::Host(HostCmd::Export(Some("out/my run.html".into())))
+        );
+        // `/copy` takes no argument: refused locally, nothing sent.
+        let mut app = App::default();
+        typed_input(&mut app, "/copy now");
+        assert_eq!(app.on_input(Input::new(Key::Enter)), Action::Redraw);
+        assert!(texts(&mut app)[0].contains("usage: /copy"));
+        assert!(menu::matching("/co").contains(&"/copy"));
+        assert!(menu::matching("/ex").contains(&"/export"));
+    }
+
+    #[test]
+    fn copy_notes_what_was_attempted_and_queues_only_the_osc52_sequence() {
+        let answer = "hi \u{e9}\x1b[2J\x07 ]52; end".to_string();
+        let (notes, _, mut app) = host_says(
+            HostCmd::LastAnswer,
+            Ok(HostReply::Answer(Some(answer.clone()))),
+        );
+        assert_eq!(notes.len(), 1);
+        let n = answer.chars().count();
+        assert!(notes[0].contains(&format!("sent {n} characters to the terminal clipboard")));
+        assert!(notes[0].contains("OSC 52") && notes[0].contains("set-clipboard on"));
+        assert!(
+            !notes[0].contains("copied"),
+            "never claims success: {}",
+            notes[0]
+        );
+        assert_eq!(app.take_osc52(), Some(clipboard::osc52(&answer)));
+        assert_eq!(app.take_osc52(), None, "drains");
+    }
+
+    #[test]
+    fn copy_with_no_answer_or_too_large_an_answer_sends_nothing() {
+        for reply in [None, Some("  \n".to_string())] {
+            let (notes, _, mut app) = host_says(HostCmd::LastAnswer, Ok(HostReply::Answer(reply)));
+            assert!(notes[0].contains("nothing to copy"), "{notes:?}");
+            assert_eq!(app.take_osc52(), None);
+        }
+        let at_cap = "a".repeat(clipboard::MAX_COPY_BYTES);
+        let (_, _, mut app) = host_says(HostCmd::LastAnswer, Ok(HostReply::Answer(Some(at_cap))));
+        assert!(app.take_osc52().is_some(), "exactly the cap is allowed");
+        let over = "a".repeat(clipboard::MAX_COPY_BYTES + 1);
+        let (notes, _, mut app) = host_says(HostCmd::LastAnswer, Ok(HostReply::Answer(Some(over))));
+        assert_eq!(app.take_osc52(), None);
+        assert!(
+            notes[0].contains("/export") && notes[0].contains("64 KiB"),
+            "{notes:?}"
+        );
+        let (notes, _, mut app) = host_says(HostCmd::LastAnswer, Err("boom".into()));
+        assert_eq!(notes, vec!["(/copy: boom)"]);
+        assert_eq!(app.take_osc52(), None);
+    }
+
+    #[test]
+    fn export_reports_the_written_path_or_the_hosts_refusal() {
+        let (notes, _, _) = host_says(
+            HostCmd::Export(None),
+            Ok(HostReply::Path("/w/.tole/exports/s-1.html".into())),
+        );
+        assert_eq!(
+            notes,
+            vec!["(transcript written to /w/.tole/exports/s-1.html)"]
+        );
+        let (notes, _, _) = host_says(
+            HostCmd::Export(Some("a.html".into())),
+            Err("a.html exists; pick another path".into()),
+        );
+        assert_eq!(notes, vec!["(/export: a.html exists; pick another path)"]);
+        // A wrong-kind reply is reported, never a panic.
+        let (notes, _, _) = host_says(HostCmd::Export(None), Ok(HostReply::Done));
+        assert!(notes[0].contains("unexpected host reply"));
     }
 
     #[test]
@@ -2129,7 +2277,7 @@ mod tests {
         assert!(app.menu().is_empty(), "no menu without a slash");
         type_str(&mut app, "/");
         assert_eq!(app.menu().len(), menu::COMMANDS.len());
-        type_str(&mut app, "co");
+        type_str(&mut app, "com");
         assert_eq!(app.menu(), ["/compact"]);
         app.on_key(key(KeyCode::Tab));
         assert_eq!(app.editor.text(), "/compact ");

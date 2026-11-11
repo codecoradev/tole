@@ -2884,7 +2884,8 @@ fn tui_command(
     };
     tool_roster::register_todo(&mut registry, storage.entries(), host.plan_mode)?;
     let session = tole_cli::tui_host::TuiSession::new(storage, registry, cfg, host.compaction)
-        .with_sessions(sessions_dir.to_path_buf(), Some(prompt));
+        .with_sessions(sessions_dir.to_path_buf(), Some(prompt))
+        .with_workspace(resolve_workspace_root(host.workspace.as_ref())?);
     tole_tui::run(&session, approvals).context("terminal ui")?;
     let id = session.session_id();
     println!("session {id} closed (resume: tole resume {id} \"…\")");

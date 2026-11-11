@@ -835,3 +835,82 @@ fn tui_fork_continues_in_the_new_session_and_tree_switches_back() {
     let tree = tole(&["sessions", "--tree"]);
     assert!(tree.contains(&format!("└─ {fork}")), "{tree}");
 }
+
+/// #463 `/copy`: the last answer reaches the terminal clipboard as ONE
+/// OSC 52 sequence whose payload is base64 only; hostile answer text never
+/// appears raw, and the note says what was attempted, not that it worked.
+#[test]
+fn tui_copy_sends_the_last_answer_as_osc52_base64() {
+    let (url, dir) = (spawn_mock(), workdir());
+    let mut t = Pty::spawn(&dir, &url);
+    t.expect("effort:");
+    t.send("/copy\r");
+    t.expect("nothing to copy");
+    t.send("hello\r");
+    t.expect("STREAM-ANSWER");
+    t.idle();
+    t.send("/copy\r");
+    t.expect("\x1b]52;c;U1RSRUFNLUFOU1dFUg==\x07");
+    t.expect("characters to the terminal clipboard");
+    // An answer with ESC / CR bytes: only its base64 is sent.
+    t.send("evil\r");
+    t.expect("EV\\u{1b}[2J\\u{d}IL");
+    t.idle();
+    t.send("/copy\r");
+    t.expect("\x1b]52;c;RVYbWzJKDUlM\x07");
+    t.send("/quit\r");
+    assert_eq!(t.wait_exit(), Some(0));
+    let o = t.out.lock().unwrap();
+    let seen = String::from_utf8_lossy(&o);
+    assert!(
+        !seen.contains("[2J\rIL"),
+        "raw answer bytes reached the pty"
+    );
+    assert!(!seen.contains("copied"), "never claims success");
+}
+
+/// #463 `/export`: the transcript is written under the workspace, escaped,
+/// and a second run to the same path is refused instead of overwriting.
+#[test]
+fn tui_export_writes_the_transcript_and_refuses_to_overwrite() {
+    let (url, dir) = (spawn_mock(), workdir());
+    let mut t = Pty::spawn(&dir, &url);
+    t.expect("effort:");
+    t.send("hello\r");
+    t.expect("STREAM-ANSWER");
+    t.idle();
+    t.send("/export\r");
+    t.expect("transcript written to");
+    t.idle();
+    let exports = dir.join(".tole/exports");
+    let html = std::fs::read_dir(&exports)
+        .unwrap()
+        .flatten()
+        .find(|e| e.file_name().to_string_lossy().ends_with(".html"))
+        .expect("exported page")
+        .path();
+    let page = std::fs::read_to_string(&html).unwrap();
+    assert!(page.contains("STREAM-ANSWER") && page.contains("Content-Security-Policy"));
+    assert!(!page.contains("<script"));
+    t.send("/export\r");
+    t.expect("pick another path");
+    t.idle();
+    t.send("/export ../escape.html\r");
+    t.expect("outside the workspace jail");
+    t.idle();
+    t.send("/export t.jsonl\r");
+    t.expect("transcript written to");
+    t.send("/quit\r");
+    assert_eq!(t.wait_exit(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(&html).unwrap(),
+        page,
+        "not overwritten"
+    );
+    assert!(!dir.parent().unwrap().join("escape.html").exists());
+    let jsonl = std::fs::read_to_string(dir.join("t.jsonl")).unwrap();
+    assert!(jsonl
+        .lines()
+        .all(|l| serde_json::from_str::<Value>(l).is_ok()));
+    assert!(jsonl.contains("STREAM-ANSWER"));
+}

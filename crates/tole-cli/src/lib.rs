@@ -12,6 +12,8 @@ pub mod config_trust;
 pub mod doctor;
 pub mod ecosystem;
 pub mod events;
+#[cfg(feature = "tui")]
+pub mod export;
 pub mod handoff;
 pub mod protocol;
 pub mod provider_chain;
