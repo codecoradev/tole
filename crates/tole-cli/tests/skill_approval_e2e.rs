@@ -151,12 +151,32 @@ fn required_approval_lists_unapproved_skills_by_name_only() {
     let out = text(&o.stdout);
     assert!(out.contains("evil  not approved  sha256:"), "{out}");
     assert!(out.contains("good  not approved  sha256:"), "{out}");
+    // Without a terminal and without --hash: the package is shown, then
+    // refused; nothing is recorded.
     let o = finish(cmd(
         &work,
         &home,
         &url,
         None,
         &["skills", "approve", "good"],
+    ));
+    assert!(!o.status.success());
+    assert!(text(&o.stdout).contains("SKILL.md"), "{}", text(&o.stdout));
+    assert!(text(&o.stderr).contains("--hash"), "{}", text(&o.stderr));
+    assert!(!home.join("tole").join("skill-approvals.json").exists());
+    // With the reviewed hash (from `list`), a script can approve.
+    let hash = out
+        .lines()
+        .find(|l| l.starts_with("good  "))
+        .and_then(|l| l.split_whitespace().find(|w| w.starts_with("sha256:")))
+        .unwrap()
+        .to_string();
+    let o = finish(cmd(
+        &work,
+        &home,
+        &url,
+        None,
+        &["skills", "approve", "good", "--hash", &hash],
     ));
     assert!(o.status.success(), "{}", text(&o.stderr));
     assert!(text(&o.stdout).contains("SKILL.md"), "{}", text(&o.stdout));
