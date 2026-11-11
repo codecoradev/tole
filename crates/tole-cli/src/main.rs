@@ -188,6 +188,15 @@ struct Cli {
     #[arg(long, global = true, value_name = "LEVEL", value_parser = tole_core::openai::parse_reasoning_effort)]
     effort: Option<String>,
 
+    /// Run as a profile (#584): a `[profiles.<name>]` table of the USER
+    /// config with a persona file, allow list, skills, memory room and model
+    /// tiers. Its values sit below the per-key flags (`--system`, `--allow`,
+    /// `--skill`) and above the environment and the config files; its
+    /// `default` tier's model beats TOLE_MODEL. Profiles are dormant:
+    /// selecting one only reads its persona file.
+    #[arg(long, global = true, value_name = "NAME")]
+    profile: Option<String>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -824,6 +833,26 @@ fn dispatch(cli: Cli) -> Result<()> {
             &u.map(|l| l.config).unwrap_or_default(),
         )),
     };
+    // The selected profile (#584): resolved once, from the layered config
+    // (the user layer is its only source). Reads its persona file and
+    // nothing else; an unknown name is a startup error.
+    let profile = match &cli.profile {
+        None => None,
+        Some(name) => {
+            let base = tole_cli::config::user_config_path()
+                .and_then(|p| p.parent().map(Path::to_path_buf));
+            let home = std::env::var_os("HOME").map(PathBuf::from);
+            Some(
+                tole_cli::profile::Profile::resolve(
+                    cfg.as_ref().unwrap_or(&Default::default()),
+                    name,
+                    base.as_deref(),
+                    home.as_deref(),
+                )
+                .map_err(anyhow::Error::msg)?,
+            )
+        }
+    };
     if let Some(cfg) = &cfg {
         // A key this build cannot honor is a loud startup error, never a
         // silent ignore (the matching flag does not exist here).
@@ -834,10 +863,13 @@ fn dispatch(cli: Cli) -> Result<()> {
         ) {
             anyhow::bail!(msg);
         }
-        config_apply::install_fill(Settings::fill_from(cfg));
+        config_apply::install_fill(Settings::fill_with_profile(cfg, profile.as_ref()));
     }
     let settings = Settings::resolve(
-        &config_flags(&cli),
+        &config_apply::Flags {
+            profile: profile.clone(),
+            ..config_flags(&cli)
+        },
         cfg.as_ref().unwrap_or(&Default::default()),
         &config_apply::real_env,
     );
@@ -908,7 +940,10 @@ fn dispatch(cli: Cli) -> Result<()> {
         on_posttool: config_apply::values(&settings.on_posttool),
         on_turnend: config_apply::values(&settings.on_turnend),
         #[cfg(feature = "shell-tools")]
-        memory: resolve_memory(settings.memory.as_ref().map(|m| m.value.as_str()))?,
+        memory: resolve_memory(
+            settings.memory.as_ref().map(|m| m.value.as_str()),
+            settings.memory_room.as_ref().map(|r| r.value.as_str()),
+        )?,
         #[cfg(not(feature = "shell-tools"))]
         memory: (),
         compaction: tole_cli::compaction_host::CompactionSettings {
@@ -1153,6 +1188,8 @@ fn dispatch(cli: Cli) -> Result<()> {
                     resume_id: resume,
                     compaction: host.compaction,
                     images,
+                    // A profile's persona replaces the default base prompt.
+                    persona: profile.as_ref().and_then(|p| p.system_prompt.clone()),
                 },
                 registry,
                 &sessions_dir,
@@ -1181,7 +1218,10 @@ fn dispatch(cli: Cli) -> Result<()> {
                 eprintln!("tole acp: --plan-mode is active — serving read-only tools only");
             }
             let memory = match memory.as_deref().filter(|s| !s.trim().is_empty()) {
-                Some(m) => resolve_memory(Some(m))?,
+                Some(m) => resolve_memory(
+                    Some(m),
+                    settings.memory_room.as_ref().map(|r| r.value.as_str()),
+                )?,
                 None => host.memory.clone(),
             };
             let workspace = workspace.or_else(|| host.workspace.clone());
@@ -1218,7 +1258,10 @@ fn dispatch(cli: Cli) -> Result<()> {
             }
             check_server_face_flags("serve", &host, &settings, explicit_mcp)?;
             let memory = match memory.as_deref().filter(|s| !s.trim().is_empty()) {
-                Some(m) => resolve_memory(Some(m))?,
+                Some(m) => resolve_memory(
+                    Some(m),
+                    settings.memory_room.as_ref().map(|r| r.value.as_str()),
+                )?,
                 None => host.memory.clone(),
             };
             let workspace = workspace.or_else(|| host.workspace.clone());
@@ -1419,7 +1462,10 @@ impl HostConfig {
 /// (kept under its old name) overrides it. A missing uteke binary degrades to a warning + no-op
 /// (the same probe contract as the uteke tools).
 #[cfg(feature = "shell-tools")]
-fn resolve_memory(chosen: Option<&str>) -> Result<Option<tole_core::memory::MemoryConfig>> {
+fn resolve_memory(
+    chosen: Option<&str>,
+    profile_room: Option<&str>,
+) -> Result<Option<tole_core::memory::MemoryConfig>> {
     let chosen = chosen
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
@@ -1436,13 +1482,27 @@ fn resolve_memory(chosen: Option<&str>) -> Result<Option<tole_core::memory::Memo
         return Ok(None);
     }
     let mut cfg = tole_core::memory::MemoryConfig::for_cwd("uteke", &std::env::current_dir()?);
-    if let Ok(ns) = std::env::var(tole_core::child_env::MEMORY_ROOM) {
-        let ns = ns.trim();
-        if !ns.is_empty() {
-            cfg.room = tole_core::memory::sanitize_namespace(ns);
-        }
-    }
+    cfg.room = memory_room(
+        &cfg.room,
+        profile_room,
+        std::env::var(tole_core::child_env::MEMORY_ROOM)
+            .ok()
+            .as_deref(),
+    );
     Ok(Some(cfg))
+}
+
+/// The memory loop's room: a child's mailbox (TOLE_MEMORY_NAMESPACE) >
+/// the selected profile's room (#584) > the `repo-<dir>` default.
+#[cfg(feature = "shell-tools")]
+fn memory_room(default: &str, profile_room: Option<&str>, env_room: Option<&str>) -> String {
+    fn pick(r: Option<&str>) -> Option<&str> {
+        r.map(str::trim).filter(|r| !r.is_empty())
+    }
+    match pick(env_room).or(pick(profile_room)) {
+        Some(r) => tole_core::memory::sanitize_namespace(r),
+        None => default.to_string(),
+    }
 }
 
 fn build_approver(allow_patterns: &[String], yes: bool) -> InteractiveApprover<StdioPrompt> {
@@ -3187,6 +3247,24 @@ mod gh_repo_tests {
         let detected = tole_cli::tool_roster::detect_github_repo(&dir);
         assert_eq!(detected.as_deref(), Some("detected/owner-name"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(all(test, feature = "shell-tools"))]
+mod memory_room_tests {
+    /// #584: a profile moves the memory loop to its own room, but a child's
+    /// mailbox room (the result channel back to its parent) always wins.
+    #[test]
+    fn child_mailbox_beats_profile_room_beats_repo_default() {
+        let r = super::memory_room;
+        assert_eq!(r("repo-tole", None, None), "repo-tole");
+        assert_eq!(r("repo-tole", Some("profile-coder"), None), "profile-coder");
+        assert_eq!(r("repo-tole", Some("  "), None), "repo-tole");
+        assert_eq!(
+            r("repo-tole", Some("profile-coder"), Some("agent-a-1")),
+            "agent-a-1"
+        );
+        assert_eq!(r("repo-tole", None, Some("-bad room")), "_-bad_room");
     }
 }
 
