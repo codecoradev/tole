@@ -546,11 +546,11 @@ mod tests {
     #[ignore]
     fn throughput() {
         let s = set(&[
-            ("TOLE_API_KEY", "sk-proj-a1B2c3D4e5F6g7H8i9J0kLmNoPqRsTuV"),
+            ("TOLE_API_KEY", "test-provider-key-a1B2c3D4e5F6g7H8"),
             ("TOLE_MCP_X_TOKEN", "mcp-tok-0123456789abcdef"),
             ("SYSTEMONE_API_KEY", "s1-ZZZZyyyyXXXXwwww"),
             ("NGINJEN_API_KEY", "ngx_live_5f3e2d1c"),
-            ("GITHUB_TOKEN", "ghp_abcdefghijklmnopqrstuvwxyz0123456789"),
+            ("GITHUB_TOKEN", "test-gh-token-abcdefghijklmnopqrstu"),
         ]);
         let unit = "fn main() { let s = \"some text, json {\\\"k\\\": 1}\"; println!(\"{s}\"); } // émoji ✓\n";
         for size in [4 * 1024, 64 * 1024, 1024 * 1024] {
