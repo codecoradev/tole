@@ -226,6 +226,81 @@ fn catch_up_skip_and_one_always_record_missed() {
     assert_eq!(one.state().accounted("h"), Some(T + 3 * 3_600));
 }
 
+fn missed_total(l: &Ledger<MemoryStore>) -> u64 {
+    l.state().missed().map(|m| m.count).sum()
+}
+
+#[test]
+fn editing_an_active_job_records_what_it_still_owed() {
+    // Daily 09:00 job created day 0 08:00; nothing ticks until day 3 09:30.
+    let (created, now) = (T + 8 * 3_600, T + 3 * 86_400 + 9 * 3_600 + 1_800);
+    let daily = || job("d", "0 9 * * *", created);
+    let mut control = fresh(&[daily()]);
+    let due = control.ready(now).unwrap();
+    control.claim(&due[0], P1, now).unwrap();
+    assert_eq!(missed_total(&control), 4, "control: four late occurrences");
+
+    // Same job, only a host field edited a minute before the tick.
+    let mut edited = fresh(&[daily()]);
+    let mut v2 = Job {
+        at: now - 60,
+        ..daily()
+    };
+    v2.extra.insert("prompt".into(), "new prompt".into());
+    edited.put_job(v2).unwrap();
+    assert!(edited.ready(now).unwrap().is_empty());
+    assert_eq!(
+        missed_total(&edited),
+        missed_total(&control),
+        "no silent skip"
+    );
+    let m = edited.state().missed().next().unwrap();
+    assert_eq!(
+        (m.scheduled_for, m.last, m.reason),
+        (
+            T + 9 * 3_600,
+            T + 3 * 86_400 + 9 * 3_600,
+            MissReason::Edited
+        )
+    );
+}
+
+#[test]
+fn edit_accounting_uses_the_previous_version_only() {
+    // A fresh job edited before anything is owed: no spurious record.
+    let mut l = fresh(&[job("f", "0 * * * *", T)]);
+    l.put_job(job("f", "0 * * * *", T + 10)).unwrap();
+    assert_eq!(l.state().missed().count(), 0);
+
+    // A schedule change accounts the old schedule's owed occurrences
+    // (hourly: T+1h..T+3h), not the new one's (daily: none in the window).
+    let mut l = fresh(&[job("s", "0 * * * *", T)]);
+    l.put_job(job("s", "@daily", T + 3 * 3_600 + 1_800))
+        .unwrap();
+    let m: Vec<_> = l.state().missed().cloned().collect();
+    assert_eq!(m.len(), 1);
+    assert_eq!(
+        (m[0].scheduled_for, m[0].last, m[0].count),
+        (T + 3_600, T + 3 * 3_600, 3)
+    );
+
+    // Pausing an active job records what it owed; the paused period itself
+    // is not owed, so resuming records nothing more.
+    let mut l = fresh(&[job("p", "0 * * * *", T)]);
+    l.put_job(Job {
+        paused: true,
+        ..job("p", "0 * * * *", T + 2 * 3_600 + 5)
+    })
+    .unwrap();
+    assert_eq!(missed_total(&l), 2);
+    l.put_job(job("p", "0 * * * *", T + 9 * 3_600 + 5)).unwrap();
+    assert_eq!(missed_total(&l), 2, "resume from paused records nothing");
+    assert_eq!(
+        l.ready(T + 10 * 3_600).unwrap()[0].fire,
+        Some(T + 10 * 3_600)
+    );
+}
+
 #[test]
 fn pause_resume_and_remove_are_new_records() {
     let mut l = fresh(&[job("p", "0 * * * *", T)]);

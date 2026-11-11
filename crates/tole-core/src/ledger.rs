@@ -18,7 +18,9 @@
 //!   ignores later ones. Delivery is a separate record that cannot touch
 //!   `done.status` (#105861, P2).
 //! - **No silent skip.** Every owed occurrence that does not run becomes a
-//!   `missed` record with a machine-readable reason (#9086, P1).
+//!   `missed` record with a machine-readable reason (#9086, P1) — including
+//!   occurrences still owed when an active job is edited, paused or removed
+//!   (`edited`, accounted under the previous version by [`Ledger::put_job`]).
 //! - **No heartbeats, no lock timeouts.** Ownership is a `{pid, start_time}`
 //!   lease checked only by [`Ledger::recover`], which turns a `fire` without
 //!   `done` whose lease is dead into an `interrupted` `done`.
@@ -228,6 +230,9 @@ pub enum MissReason {
     Late,
     /// A more recent occurrence ran instead (runs never stack).
     Superseded,
+    /// The job was re-saved (edited, paused or removed) while these
+    /// occurrences were still owed by the previous version.
+    Edited,
 }
 
 /// A contiguous range of owed occurrences that did not run.
@@ -729,6 +734,30 @@ impl<S: LedgerStore> Ledger<S> {
         }
         if let Some(k) = job.extra.keys().find(|k| RESERVED.contains(&k.as_str())) {
             return bad(format!("host field `{k}` collides with a ledger field"));
+        }
+        // The new version owes only occurrences after its `at`. Whatever the
+        // previous ACTIVE version still owed up to then is recorded first
+        // (`edited`), under the previous schedule — even one only seconds
+        // old — so an edit, pause or removal never skips silently. A paused
+        // or removed previous version owed nothing (resume stays clean).
+        self.sync(true)?;
+        let owed = self.state.job(&job.id).and_then(|prev| {
+            let p = &prev.job;
+            let s = prev.schedule.as_ref().ok()?;
+            if p.paused || p.removed {
+                return None;
+            }
+            s.span(self.state.cursor(p), job.at, p.at)
+        });
+        if let Some(span) = owed {
+            self.append(&Record::Missed(Missed {
+                job_id: job.id.clone(),
+                scheduled_for: span.first,
+                last: span.last,
+                count: span.count,
+                reason: MissReason::Edited,
+                at: job.at,
+            }))?;
         }
         self.append(&Record::Job(job))
     }
