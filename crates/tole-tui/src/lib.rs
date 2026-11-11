@@ -11,6 +11,7 @@ mod clipboard;
 mod editor;
 mod files;
 mod input;
+mod keymap;
 mod menu;
 mod paste;
 mod render;
@@ -42,6 +43,7 @@ use tole_core::turn::TurnObserver;
 
 pub use editor::Editor;
 pub use input::{Input, Key, KeyPress, Mods};
+pub use keymap::{KeyAction, KeySpec, Keymap};
 pub use menu::{Item, PickKind};
 use render::{styled, wrap};
 pub(crate) use sanitize::{one_line, sanitize};
@@ -105,8 +107,13 @@ pub trait TuiHost: Sync {
     fn theme(&self) -> Theme {
         Theme::default()
     }
-    /// One note line shown at start (for example why a configured theme was
-    /// not used).
+    /// The key bindings (#463). Read once at start. The default is the
+    /// built-in keymap (today's keys).
+    fn keymap(&self) -> Keymap {
+        Keymap::default()
+    }
+    /// One note line shown at start (for example why a configured theme or
+    /// keymap was not used).
     fn startup_note(&self) -> Option<String> {
         None
     }
@@ -461,6 +468,8 @@ pub struct App {
     osc52: Option<String>,
     /// Colors (#463); the host supplies it, the UI reads no file or env.
     theme: Theme,
+    /// Key bindings (#463); the host supplies it, the UI reads no file or env.
+    keymap: Keymap,
 }
 
 /// Follow-ups that may wait, and queue rows shown above the editor.
@@ -481,6 +490,13 @@ impl App {
             theme,
             ..Self::new(footer)
         }
+    }
+
+    /// Use `keymap` for the rebindable actions (and for the key hints).
+    pub fn with_keymap(mut self, keymap: Keymap) -> Self {
+        self.transcript.tools_key = keymap.label(KeyAction::ToggleTools);
+        self.keymap = keymap;
+        self
     }
 
     /// Command names matching the draft while it is a bare `/word`.
@@ -869,11 +885,14 @@ impl App {
         if self.picker.is_some() {
             return self.picker_key(key.key);
         }
+        // Everything below is reached only after the approval prompt, the
+        // picker and Ctrl+C had their say: a keymap cannot intercept them.
         // Hotkeys wait for idle (they take the session lock). Shift+Tab is
         // `BackTab`, a different key code from Enter, so Shift+Enter keeps
         // its newline meaning below.
-        match key.key {
-            Key::Char('o') if ctrl => {
+        let act = self.keymap.action(&key);
+        match act {
+            Some(KeyAction::ToggleTools) => {
                 let mut v = self.transcript.toggle_tools();
                 let state = if self.transcript.expand_tools {
                     "expanded"
@@ -887,7 +906,7 @@ impl App {
                 self.out.extend(v);
                 return Action::Redraw;
             }
-            Key::Char('t') if ctrl => {
+            Some(KeyAction::ToggleReasoning) => {
                 let mut v = self.transcript.toggle_reasoning();
                 let state = if self.transcript.hide_reasoning {
                     "hidden"
@@ -901,21 +920,21 @@ impl App {
                 self.out.extend(v);
                 return Action::Redraw;
             }
-            Key::Char('l') if ctrl => {
+            Some(KeyAction::ModelPicker) => {
                 return if self.running {
                     Action::None
                 } else {
                     Action::Host(HostCmd::PickModel)
                 }
             }
-            Key::Char('p') if ctrl => {
+            Some(KeyAction::CycleModel) => {
                 return if self.running {
                     Action::None
                 } else {
                     self.cycle_model()
                 }
             }
-            Key::BackTab => {
+            Some(KeyAction::CycleThinking) => {
                 return if self.running {
                     Action::None
                 } else {
@@ -928,18 +947,18 @@ impl App {
             let n = self.at_matches().len();
             match key.key {
                 Key::Tab | Key::Enter if self.at_insert() => return Action::Redraw,
-                Key::Up if !key.mods.alt => {
+                Key::Up if !ctrl && !key.mods.alt => {
                     self.at_sel = self.at_sel.min(n - 1).saturating_sub(1);
                     return Action::Redraw;
                 }
-                Key::Down => {
+                Key::Down if !ctrl && !key.mods.alt => {
                     self.at_sel = (self.at_sel + 1).min(n - 1);
                     return Action::Redraw;
                 }
                 _ => {}
             }
         }
-        if key.key == Key::Up && key.mods.alt {
+        if act == Some(KeyAction::PopQueue) {
             return match self.queue.pop() {
                 Some(last) => {
                     self.prepend_draft(vec![last]);
@@ -961,7 +980,7 @@ impl App {
             }
             Key::Esc if self.running => return self.cancel(),
             // Alt+Enter while a turn runs queues a follow-up; idle it is a newline.
-            Key::Enter if self.running && key.mods.alt => {
+            _ if act == Some(KeyAction::QueueFollowUp) && self.running => {
                 let t = self.editor.text().trim();
                 if t.is_empty() || t.starts_with('/') {
                     return Action::None;
@@ -974,7 +993,12 @@ impl App {
                     self.queue.push(text);
                 }
             }
-            Key::Enter if key.mods.shift || key.mods.alt => self.editor.newline(),
+            // Idle, the follow-up key is a newline (as Alt+Enter always was).
+            _ if matches!(act, Some(KeyAction::Newline | KeyAction::QueueFollowUp)) => {
+                self.editor.newline()
+            }
+            // Shift/Alt+Enter never send, whatever is (not) bound to them.
+            Key::Enter if key.mods.shift || key.mods.alt => return Action::None,
             Key::Enter => {
                 if self.running {
                     // Steer: a non-empty, non-slash draft becomes a soft interrupt.
@@ -1001,8 +1025,8 @@ impl App {
                     None => Action::Redraw,
                 };
             }
-            // Fallback for terminals that cannot report Shift+Enter.
-            Key::Char('j') if ctrl => self.editor.newline(),
+            _ if act == Some(KeyAction::HistoryPrev) => self.editor.prev(),
+            _ if act == Some(KeyAction::HistoryNext) => self.editor.next(),
             Key::Char(c) if !ctrl => {
                 self.menu_sel = 0;
                 self.at_sel = 0;
@@ -1018,8 +1042,6 @@ impl App {
                 self.at_sel = 0;
                 self.editor.backspace()
             }
-            Key::Up => self.editor.prev(),
-            Key::Down => self.editor.next(),
             _ => return Action::None,
         }
         Action::Redraw
@@ -1151,7 +1173,7 @@ pub fn run(host: &dyn TuiHost, approvals: Receiver<Pending>) -> io::Result<()> {
             viewport: Viewport::Inline(VIEWPORT_HEIGHT),
         },
     )?;
-    let mut app = App::with_theme(host.footer(), host.theme());
+    let mut app = App::with_theme(host.footer(), host.theme()).with_keymap(host.keymap());
     if let Some(n) = host.startup_note() {
         app.note(&format!("({n})"));
     }

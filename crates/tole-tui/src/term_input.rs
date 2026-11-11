@@ -33,6 +33,9 @@ pub fn input_from(ev: KeyEvent) -> Option<Input> {
         KeyCode::Backspace => Key::Backspace,
         KeyCode::Up => Key::Up,
         KeyCode::Down => Key::Down,
+        KeyCode::Left => Key::Left,
+        KeyCode::Right => Key::Right,
+        KeyCode::F(n @ 1..=12) => Key::F(n),
         _ => Key::Other,
     };
     Some(Input::Key(KeyPress {
@@ -87,6 +90,9 @@ mod tests {
             (KeyCode::Backspace, Key::Backspace),
             (KeyCode::Up, Key::Up),
             (KeyCode::Down, Key::Down),
+            (KeyCode::Left, Key::Left),
+            (KeyCode::Right, Key::Right),
+            (KeyCode::F(5), Key::F(5)),
         ];
         for (code, want) in table {
             assert_eq!(press(code, none), Some(Input::new(want)), "{code:?}");
@@ -98,13 +104,11 @@ mod tests {
         // They still count as a key press (they disarm Ctrl+C), so they must
         // reach `on_input` as `Key::Other`.
         for code in [
-            KeyCode::Left,
-            KeyCode::Right,
             KeyCode::Home,
             KeyCode::End,
             KeyCode::Delete,
             KeyCode::PageUp,
-            KeyCode::F(5),
+            KeyCode::F(13),
         ] {
             assert_eq!(
                 press(code, KeyModifiers::NONE),
@@ -185,7 +189,7 @@ mod tests {
             Action::Redraw
         );
         assert_eq!(
-            app.on_key(ev(KeyCode::Left, KeyModifiers::NONE, KeyEventKind::Release)),
+            app.on_key(ev(KeyCode::Home, KeyModifiers::NONE, KeyEventKind::Release)),
             Action::None
         );
         assert_eq!(

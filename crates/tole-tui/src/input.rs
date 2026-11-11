@@ -20,6 +20,10 @@ pub enum Key {
     Backspace,
     Up,
     Down,
+    Left,
+    Right,
+    /// A function key, `F(1)` to `F(12)` (other numbers are `Other`).
+    F(u8),
     /// Any key the logic does not distinguish.
     Other,
 }

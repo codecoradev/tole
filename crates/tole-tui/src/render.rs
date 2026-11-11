@@ -10,7 +10,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 use crate::theme::{Role, Theme};
-use crate::{clip, menu, one_line, App, Kind, EDITOR_ROWS, LIVE_ROWS};
+use crate::{clip, menu, one_line, App, KeyAction, Kind, EDITOR_ROWS, LIVE_ROWS};
 
 impl App {
     pub fn draw(&self, f: &mut Frame) {
@@ -82,13 +82,23 @@ impl App {
                     .into_iter()
                     .map(|r| Line::styled(r, th.get(Role::Queue))),
             );
+            let key = |a| self.keymap.label(a);
             live_lines.push(Line::styled(
                 if self.running {
-                    "working… Enter steers · Alt+Enter queues · Alt+Up unqueues · Esc cancels"
+                    format!(
+                        "working… Enter steers · {} queues · {} unqueues · Esc cancels",
+                        key(KeyAction::QueueFollowUp),
+                        key(KeyAction::PopQueue)
+                    )
                 } else if self.armed {
-                    "press Ctrl+C again to quit"
+                    "press Ctrl+C again to quit".to_string()
                 } else {
-                    "Enter sends · / commands · @ file · Ctrl+L model · Shift+Tab thinking · Shift+Enter newline"
+                    format!(
+                        "Enter sends · / commands · @ file · {} model · {} thinking · {} newline",
+                        key(KeyAction::ModelPicker),
+                        key(KeyAction::CycleThinking),
+                        key(KeyAction::Newline)
+                    )
                 },
                 th.get(Role::Hint),
             ));
