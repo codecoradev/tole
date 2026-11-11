@@ -186,7 +186,12 @@ file fails startup. `approve --hash` pins the hash the owner reviewed, so a
 file changed between review and approval is refused. The approvals file is
 as strong as the user's home directory: a process that can write it can
 approve anything. Skills the owner names directly (`--skill`, a profile's
-`skills`) are not gated. With `TOLE_SKILL_INDEX=uteke` the same gate covers
+`skills`) are not gated. An approval covers the bytes of the package as
+they are when a session starts and loads the skill; it does not vet what a
+`references/` or `scripts/` file does when a skill later tells the model to
+read or run it (those reads and commands go through the normal tool
+approvals). `tole skills approve` shows the files, their sizes and the hash
+before it asks; without a terminal it requires `--hash`. With `TOLE_SKILL_INDEX=uteke` the same gate covers
 the pinned core, the recalled skills and every `skill_search` hit. The
 default is `off` (today's behavior).
 

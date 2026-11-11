@@ -58,8 +58,10 @@ pub enum SkillsAction {
     #[cfg(feature = "shell-tools")]
     #[command(flatten)]
     Index(crate::skill_recall::IndexAction),
-    /// Approve a skill as it is on disk now: records the hash of every file
-    /// in its directory. Any later change to any file needs a new approval.
+    /// Approve a skill as it is on disk now: shows every file in its
+    /// directory with its size and the package hash, then asks. Without a
+    /// terminal (a script), --hash is required. Any later change to any
+    /// file needs a new approval.
     Approve {
         name: String,
         /// Approve only if the content hash is still this one (the hash
@@ -101,6 +103,41 @@ pub fn status_line(ws: Option<&Path>, name: &str, approvals: &Approvals) -> Stri
         ),
         None => format!("{name}  not approved  {}", pkg.hash),
     }
+}
+
+/// Whether the owner consents to approving a package with hash `hash`:
+/// `--hash` must match it; without `--hash` an interactive owner is asked
+/// (`ask` returns their answer) and a non-interactive run is refused.
+pub fn consent(
+    hash: &str,
+    expect: Option<&str>,
+    interactive: bool,
+    ask: impl FnOnce() -> Option<String>,
+) -> Result<(), String> {
+    match expect.map(str::trim) {
+        Some(want) if want == hash => Ok(()),
+        Some(want) => Err(format!(
+            "the package is now {hash}, not the reviewed {want}: review it again"
+        )),
+        None if !interactive => Err(format!(
+            "stdin is not a terminal, so nobody can confirm: pass --hash {hash} \
+             (the hash `tole skills list` shows) after reviewing the files above"
+        )),
+        None => match ask().as_deref().map(str::trim) {
+            Some("y" | "Y" | "yes" | "YES" | "Yes") => Ok(()),
+            _ => Err("not approved".into()),
+        },
+    }
+}
+
+/// Print the package the owner is about to approve: directory, each file
+/// with its size, and the hash.
+fn show_package(pkg: &tole_core::skill_approval::SkillPackage) {
+    println!("skill {} in {}", pkg.name, pkg.dir.display());
+    for (f, bytes) in &pkg.files {
+        println!("  {f} ({} bytes)", bytes.len());
+    }
+    println!("hash {}", pkg.hash);
 }
 
 /// Approve `name` in `approvals` (not saved). Refuses when `expect` is
@@ -151,19 +188,32 @@ pub fn cli(action: SkillsAction) -> anyhow::Result<()> {
             hash,
             workspace,
         } => {
+            use std::io::{BufRead as _, IsTerminal as _, Write as _};
             let ws = root(workspace)?;
             let (path, mut approvals) = store()?;
+            // Show what would be approved first, then ask (or require the
+            // reviewed --hash when nobody is at a terminal).
+            let shown = read_package(Some(&ws), &name).map_err(anyhow::Error::msg)?;
+            show_package(&shown);
+            let interactive = std::io::stdin().is_terminal();
+            consent(&shown.hash, hash.as_deref(), interactive, || {
+                print!("approve these exact bytes? [y/N] ");
+                let _ = std::io::stdout().flush();
+                let mut line = String::new();
+                std::io::stdin().lock().read_line(&mut line).ok()?;
+                Some(line)
+            })
+            .map_err(anyhow::Error::msg)?;
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            let pkg = approve(Some(&ws), &name, hash.as_deref(), &mut approvals, now)
+            // Approve exactly what was shown: the package read again must
+            // still hash to it.
+            let pkg = approve(Some(&ws), &name, Some(&shown.hash), &mut approvals, now)
                 .map_err(anyhow::Error::msg)?;
             approvals.save(&path).map_err(anyhow::Error::msg)?;
-            println!("approved {name} ({}) from {}", pkg.hash, pkg.dir.display());
-            for (f, bytes) in &pkg.files {
-                println!("  {f} ({} bytes)", bytes.len());
-            }
+            println!("approved {name} ({})", pkg.hash);
         }
         SkillsAction::Revoke { name } => {
             let (path, mut approvals) = store()?;
@@ -231,6 +281,26 @@ mod tests {
         std::fs::write(&path, "nope").unwrap();
         assert!(gate_from(&env(Some("required")), Some(&path)).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review note on #617: approving without `--hash` needs an owner at
+    /// a terminal who says yes; a script must pass the reviewed hash.
+    #[test]
+    fn approval_needs_the_reviewed_hash_or_an_interactive_yes() {
+        let h = "sha256:aa";
+        let never = || -> Option<String> { panic!("must not prompt") };
+        assert!(consent(h, Some(h), false, never).is_ok());
+        assert!(consent(h, Some(h), true, never).is_ok());
+        assert!(consent(h, Some("sha256:bb"), false, never).is_err());
+        let err = consent(h, None, false, never).unwrap_err();
+        assert!(err.contains("--hash"), "{err}");
+        for yes in ["y", "Y", "yes", " yes\n"] {
+            assert!(consent(h, None, true, || Some(yes.into())).is_ok(), "{yes}");
+        }
+        for no in ["", "n", "no", "maybe"] {
+            assert!(consent(h, None, true, || Some(no.into())).is_err(), "{no}");
+        }
+        assert!(consent(h, None, true, || None).is_err(), "EOF is a no");
     }
 
     #[test]

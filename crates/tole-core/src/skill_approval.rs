@@ -34,6 +34,9 @@ pub const APPROVALS_FILE: &str = "skill-approvals.json";
 pub const MAX_PACKAGE_FILES: usize = 256;
 /// Most bytes a skill package may hold, all files together.
 pub const MAX_PACKAGE_BYTES: u64 = 4 * 1024 * 1024;
+/// Most directory entries (files and directories, at any depth) a skill
+/// package walk visits.
+pub const MAX_PACKAGE_ENTRIES: usize = 1024;
 /// Largest approvals file read.
 pub const MAX_APPROVALS_BYTES: u64 = 1024 * 1024;
 
@@ -43,11 +46,14 @@ pub const MAX_APPROVALS_BYTES: u64 = 1024 * 1024;
 struct Limits {
     files: usize,
     bytes: u64,
+    /// Directory entries (files and directories) walked.
+    entries: usize,
 }
 
 const LIMITS: Limits = Limits {
     files: MAX_PACKAGE_FILES,
     bytes: MAX_PACKAGE_BYTES,
+    entries: MAX_PACKAGE_ENTRIES,
 };
 
 /// The owner's approval of one skill.
@@ -169,7 +175,8 @@ pub fn read_package(workspace: Option<&Path>, name: &str) -> Result<SkillPackage
 fn read_dir_files(dir: &Path, limits: Limits) -> Result<Vec<(String, Vec<u8>)>, String> {
     let mut files = Vec::new();
     let mut total = 0u64;
-    walk(dir, "", &mut files, &mut total, limits)?;
+    let mut seen = 0usize;
+    walk(dir, "", &mut files, &mut total, &mut seen, limits)?;
     files.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(files)
 }
@@ -179,6 +186,7 @@ fn walk(
     prefix: &str,
     files: &mut Vec<(String, Vec<u8>)>,
     total: &mut u64,
+    seen: &mut usize,
     limits: Limits,
 ) -> Result<(), String> {
     let over = || {
@@ -192,6 +200,16 @@ fn walk(
     let entries = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     for entry in entries {
         let entry = entry.map_err(|e| format!("{}: {e}", dir.display()))?;
+        // Every entry counts, directories too: a package of countless
+        // (empty) directories is refused before it costs a long walk.
+        *seen += 1;
+        if *seen > limits.entries {
+            return Err(format!(
+                "{}: skill package over {} entries",
+                dir.display(),
+                limits.entries
+            ));
+        }
         let path = entry.path();
         let file_name = entry.file_name();
         let name = file_name
@@ -208,7 +226,7 @@ fn walk(
         if kind.is_symlink() {
             return Err(format!("{}: symlink in a skill package", path.display()));
         } else if kind.is_dir() {
-            walk(&path, &rel, files, total, limits)?;
+            walk(&path, &rel, files, total, seen, limits)?;
         } else if kind.is_file() {
             // Refuse before reading: the file count, then the length the
             // directory entry reports (lstat: a symlink is not followed).
@@ -496,6 +514,7 @@ mod tests {
         let tiny = Limits {
             files: 8,
             bytes: 64,
+            entries: 64,
         };
         assert!(read_dir_files(&dir, tiny).is_ok());
         let big = std::fs::File::create(dir.join("big.bin")).unwrap();
@@ -515,10 +534,40 @@ mod tests {
         let one_file = Limits {
             files: 1,
             bytes: 64,
+            entries: 64,
         };
         assert!(read_dir_files(&dir, one_file)
             .unwrap_err()
             .ends_with("over 1 files or 64 bytes"));
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// Review note on #617: directories count against the limits, so a
+    /// package of countless empty directories is refused quickly.
+    #[test]
+    fn empty_directories_count_against_the_entry_limit() {
+        let ws = tmp("entries");
+        skill(&ws, "demo", "b");
+        let dir = ws.join("skills/demo");
+        for i in 0..6 {
+            std::fs::create_dir_all(dir.join(format!("d{i}/e"))).unwrap();
+        }
+        let few = Limits {
+            files: 8,
+            bytes: 1024,
+            entries: 8,
+        };
+        let err = read_dir_files(&dir, few).unwrap_err();
+        assert!(err.contains("over 8 entries"), "{err}");
+        let enough = Limits {
+            files: 8,
+            bytes: 1024,
+            entries: 13,
+        };
+        assert!(
+            read_dir_files(&dir, enough).is_ok(),
+            "1 file + 12 directories"
+        );
         let _ = std::fs::remove_dir_all(&ws);
     }
 
