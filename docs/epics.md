@@ -264,9 +264,9 @@ Bot and Nakama; BMAD for collaboration). Design notes:
   `tole cron create|list|pause|resume|remove|runs|tick` with script mode
   landed, then agent mode (session per run, model pin, step/minute
   budgets), the `tole serve --cron` ticker and approvals parking, then
-  delivery targets (`log`, `session`, `file:`, trust-gated `command:`), the
-  token budget and `cron.daily_token_cap`; `run`/`cancel`/`edit`/`status`,
-  `GET /cron/runs` and the `doctor` ticker check follow.
+  delivery targets (`log`, `session`, `file:`, trust-gated `command:`,
+  `GET /cron/runs`), `run`/`cancel`/`edit`/`status`, the token budget and
+  `cron.daily_token_cap`, and the `doctor` ticker check.
 - **E2 — Profiles, delegation, discussion, routing, epic #583:**
   - profiles (#584; config, `--profile`, tiers, room and persona done in
     the PR for #584; `tole cron create --profile` follows);

@@ -312,8 +312,22 @@ fn cli_create_list_tick_round_trip() {
         t.contains("tick: ran 0"),
         "not due within the first minute: {t}"
     );
-    assert!(tole(&["cron", "pause", "ping"]).contains("paused ping"));
     assert!(tole(&["cron", "runs"]).is_empty());
+    let status = tole(&["cron", "status"]);
+    assert!(status.contains("ticker alive (tick pid"), "{status}");
+    assert!(status.contains("jobs: 1 active, 0 paused"), "{status}");
+    let edited = tole(&["cron", "edit", "ping", "--deliver", "file:pong.md"]);
+    assert!(edited.starts_with("edited ping"), "{edited}");
+    let ran = tole(&["cron", "run", "ping"]);
+    assert!(
+        ran.starts_with("run: ran 1") && ran.contains(" ok"),
+        "{ran}"
+    );
+    assert!(std::fs::read_to_string(dir.join("pong.md"))
+        .unwrap()
+        .contains("pong\n"));
+    assert!(tole(&["cron", "runs", "ping"]).contains("file:pong.md:sent"));
+    assert!(tole(&["cron", "pause", "ping"]).contains("paused ping"));
 }
 
 #[test]

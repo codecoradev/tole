@@ -825,4 +825,5 @@ argv (no shell, destructive argv refused, scrubbed env, 60 s timeout) and is
 trust-gated: only a job whose record says `created_by = cli` (saved by a
 human with `tole cron create`/`edit`) may run one, any other job is
 `blocked` before it runs. `cron.daily_token_cap` is read from the user
-config only, so a cloned repository cannot raise it.
+config only, so a cloned repository cannot raise it. `GET /cron/runs` sits
+behind the `tole serve` bearer token like every other route.

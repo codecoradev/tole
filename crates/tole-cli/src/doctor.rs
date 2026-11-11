@@ -738,6 +738,16 @@ pub fn run_cli(
             &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
         )
     );
+    // Scheduler (#579, P5): a stale ticker while jobs are active fails.
+    #[cfg(feature = "shell-tools")]
+    let ok = {
+        let (lines, cron_ok) = match crate::cron::default_dir() {
+            Ok(dir) => crate::cron::status::doctor(&dir, crate::cron::now()),
+            Err(e) => (vec![format!("  ! cron: {e}")], true),
+        };
+        lines.iter().for_each(|l| println!("{l}"));
+        ok && cron_ok
+    };
     // Only a configured provider has a ledger identity.
     if let (Some(cfg), false) = (cfg, no_ledger) {
         let saved = ledger_path().and_then(|p| {
