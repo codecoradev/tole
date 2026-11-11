@@ -75,7 +75,7 @@ impl App {
                 .unwrap_or_default();
             live_lines.push(partial);
             live_lines.extend(
-                self.queue_rows(w)
+                self.pending_rows(w)
                     .into_iter()
                     .map(|r| Line::styled(r, Style::new().fg(Color::Magenta))),
             );
@@ -92,7 +92,14 @@ impl App {
         }
         f.render_widget(Paragraph::new(live_lines), live);
 
-        let lines = self.editor.lines();
+        // A pasted tab would be dropped by the cell renderer (and throw the
+        // cursor column off): show it as spaces; the text keeps the tab.
+        let lines: Vec<String> = self
+            .editor
+            .lines()
+            .iter()
+            .map(|l| l.replace('\t', "    "))
+            .collect();
         let shown = &lines[lines.len().saturating_sub(EDITOR_ROWS)..];
         let first = lines.len() - shown.len();
         let rows: Vec<Line> = shown

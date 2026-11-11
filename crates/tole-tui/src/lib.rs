@@ -11,6 +11,7 @@ mod editor;
 mod files;
 mod input;
 mod menu;
+mod paste;
 mod render;
 mod sanitize;
 mod term_input;
@@ -22,8 +23,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crossterm::event::{
-    self, Event, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use crossterm::{execute, queue};
@@ -38,7 +39,7 @@ use tole_core::tool::Risk;
 use tole_core::turn::TurnObserver;
 
 pub use editor::Editor;
-pub use input::{Input, Key, Mods};
+pub use input::{Input, Key, KeyPress, Mods};
 pub use menu::{Item, PickKind};
 use render::{styled, wrap};
 pub(crate) use sanitize::{one_line, sanitize};
@@ -110,10 +111,12 @@ pub trait TuiHost: Sync {
     /// runs, so a host may take its session lock without blocking the UI. The
     /// reply carries data only; the wording shown to the user is the UI's.
     ///
-    /// The default supports nothing but `Status` (no lines).
+    /// The default supports nothing but `Status` (no lines) and `Images`
+    /// (none pending).
     fn apply(&self, cmd: HostCmd) -> Result<HostReply, String> {
         match cmd {
             HostCmd::Status => Ok(HostReply::Lines(Vec::new())),
+            HostCmd::Images => Ok(HostReply::Images(Vec::new())),
             _ => unsupported(),
         }
     }
@@ -136,6 +139,15 @@ pub enum HostCmd {
     Switch(String),
     Status,
     Name(String),
+    /// `/image <spec>` or a pasted image path / `data:image/…` URL (#560):
+    /// queue an image for the NEXT message. The host resolves `spec` (jail,
+    /// size cap, type sniffing) and refuses what it cannot attach.
+    AttachImage(String),
+    /// `/image clear`: drop every queued image.
+    ClearImages,
+    /// The images queued for the next message (`/image`, and after a turn
+    /// that may have handed them back).
+    Images,
 }
 
 /// What the host answers to a [`HostCmd`] (#526): data, never wording.
@@ -151,6 +163,31 @@ pub enum HostReply {
     Sessions(Vec<SessionItem>),
     /// Lines to show (`Status`).
     Lines(Vec<String>),
+    /// The images now queued for the next message, in attach order
+    /// (`AttachImage`, `ClearImages`, `Images`).
+    Images(Vec<ImageItem>),
+}
+
+/// One image queued for the next message, as the host resolved it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImageItem {
+    pub path: String,
+    /// Sniffed from the bytes: `image/png|jpeg|gif|webp`.
+    pub mime: String,
+    pub bytes: u64,
+}
+
+impl ImageItem {
+    /// `shot.png (image/png, 12 KiB)`: the file name, not the whole path.
+    fn label(&self) -> String {
+        let name = self.path.rsplit(['/', '\\']).next().unwrap_or(&self.path);
+        let size = match self.bytes {
+            b if b < 1024 => format!("{b} B"),
+            b if b < 1024 * 1024 => format!("{} KiB", b.div_ceil(1024)),
+            b => format!("{:.1} MiB", b as f64 / (1024.0 * 1024.0)),
+        };
+        one_line(&format!("{name} ({}, {size})", self.mime))
+    }
 }
 
 /// A past session for the `/resume` picker.
@@ -347,6 +384,13 @@ pub enum Action {
     Cancel,
     /// A slash command or hotkey for the host; the loop runs it.
     Host(HostCmd),
+    /// A paste that is exactly one image reference (#560): the loop asks the
+    /// host to attach `spec`; if the host refuses, `text` is inserted into the
+    /// editor as an ordinary paste.
+    PasteImage {
+        spec: String,
+        text: String,
+    },
 }
 
 #[derive(Default)]
@@ -373,6 +417,14 @@ pub struct App {
     /// Lazily listed files for the `@` panel.
     files: Option<Vec<String>>,
     at_sel: usize,
+    /// Images the host has queued for the next message (#560), as last
+    /// reported by it.
+    images: Vec<ImageItem>,
+    /// The running turn took queued images; when it ends the loop asks the
+    /// host again (a message that was never recorded hands them back).
+    images_in_flight: bool,
+    /// Set at the end of such a turn: the loop re-reads the host's queue.
+    pub images_stale: bool,
 }
 
 /// Follow-ups that may wait, and queue rows shown above the editor.
@@ -454,19 +506,68 @@ impl App {
 
     /// Compact rows of the follow-up queue (empty when nothing waits).
     pub fn queue_rows(&self, width: usize) -> Vec<String> {
+        self.queue_rows_max(width, QUEUE_ROWS)
+    }
+
+    fn queue_rows_max(&self, width: usize, max: usize) -> Vec<String> {
+        if max == 0 {
+            return Vec::new();
+        }
         let mut rows: Vec<String> = self
             .queue
             .iter()
-            .take(QUEUE_ROWS)
+            .take(max)
             .map(|q| clip(&format!("queued: {}", one_line(q)), width.saturating_sub(1)))
             .collect();
-        if self.queue.len() > QUEUE_ROWS {
-            rows[QUEUE_ROWS - 1] = clip(
-                &format!("+{} more queued", self.queue.len() - QUEUE_ROWS + 1),
+        if self.queue.len() > max {
+            rows[max - 1] = clip(
+                &format!("+{} more queued", self.queue.len() - max + 1),
                 width.saturating_sub(1),
             );
         }
         rows
+    }
+
+    /// The images queued for the next message, as the host last reported.
+    pub fn images(&self) -> &[ImageItem] {
+        &self.images
+    }
+
+    /// Replace the queued-image list with what the host reports.
+    pub fn set_images(&mut self, images: Vec<ImageItem>) {
+        self.images = images;
+    }
+
+    /// The row for queued images (#560), or `None` when nothing is attached.
+    pub fn image_row(&self, width: usize) -> Option<String> {
+        let row = match self.images.as_slice() {
+            [] => return None,
+            [one] => format!("image: {} · next message", one.label()),
+            many => format!(
+                "images ({}): {} · next message",
+                many.len(),
+                many.iter()
+                    .map(ImageItem::label)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
+        Some(clip(&row, width.saturating_sub(1)))
+    }
+
+    /// Rows above the editor: the image row, then the follow-up queue, at
+    /// most `QUEUE_ROWS` together.
+    pub fn pending_rows(&self, width: usize) -> Vec<String> {
+        let mut rows: Vec<String> = self.image_row(width).into_iter().collect();
+        let left = QUEUE_ROWS - rows.len();
+        rows.extend(self.queue_rows_max(width, left));
+        rows
+    }
+
+    /// The host's queue goes with the message that starts a turn.
+    fn images_sent(&mut self) {
+        self.images_in_flight = !self.images.is_empty();
+        self.images.clear();
     }
 
     /// Put queued (and `extra`) messages back in front of the draft; nothing
@@ -497,6 +598,7 @@ impl App {
         let text = self.queue.remove(0);
         self.running = true;
         self.saw_text = false;
+        self.images_sent();
         let echoed = self.transcript.line(Kind::User, &format!("> {text}"));
         self.out.extend(echoed);
         Some(text)
@@ -614,6 +716,11 @@ impl App {
             "/new" => host(HostCmd::New),
             "/resume" => host(HostCmd::PickSession),
             "/session" => host(HostCmd::Status),
+            "/image" => match arg {
+                "" => host(HostCmd::Images),
+                "clear" => host(HostCmd::ClearImages),
+                spec => host(HostCmd::AttachImage(spec.to_string())),
+            },
             "/name" => match arg_opt {
                 Some(n) => host(HostCmd::Name(n)),
                 None => {
@@ -637,9 +744,51 @@ impl App {
         std::mem::take(&mut self.out)
     }
 
-    /// One key press (UI-neutral, #526). The terminal adapter in
-    /// `term_input` maps crossterm events onto this.
-    pub fn on_input(&mut self, key: Input) -> Action {
+    /// One input (UI-neutral, #526): a key press or a paste. The terminal
+    /// adapter in `term_input` maps crossterm events onto this.
+    pub fn on_input(&mut self, input: Input) -> Action {
+        match input {
+            Input::Key(key) => self.on_key_press(key),
+            Input::Paste(text) => self.on_paste(&text),
+        }
+    }
+
+    /// A pasted block (#560). It never submits, steers or answers anything:
+    /// at an approval prompt it is ignored, in a picker it filters, otherwise
+    /// it lands in the editor as one edit — unless, while idle, it is exactly
+    /// one image reference, which the loop offers to the host to attach.
+    fn on_paste(&mut self, raw: &str) -> Action {
+        self.armed = false;
+        if self.approval.is_some() {
+            return Action::None;
+        }
+        let text = paste::normalize(raw);
+        if let Some(p) = self.picker.as_mut() {
+            for c in text.chars().filter(|c| !c.is_control()) {
+                p.type_char(c);
+            }
+            return Action::Redraw;
+        }
+        if text.is_empty() {
+            return Action::None;
+        }
+        if !self.running {
+            if let Some(spec) = paste::image_spec(&text) {
+                return Action::PasteImage { spec, text };
+            }
+        }
+        self.paste_text(&text);
+        Action::Redraw
+    }
+
+    /// Insert an (already normalized) paste into the editor as one edit.
+    pub fn paste_text(&mut self, text: &str) {
+        self.menu_sel = 0;
+        self.at_sel = 0;
+        self.editor.paste(text);
+    }
+
+    fn on_key_press(&mut self, key: KeyPress) -> Action {
         let ctrl = key.mods.ctrl;
         if ctrl && key.key == Key::Char('c') {
             if self.running {
@@ -782,6 +931,7 @@ impl App {
                     Some(text) => {
                         self.running = true;
                         self.saw_text = false;
+                        self.images_sent();
                         let echoed = self.transcript.line(Kind::User, &format!("> {text}"));
                         self.out.extend(echoed);
                         Action::Submit(text)
@@ -870,6 +1020,7 @@ impl App {
                 self.running = false;
                 self.approval = None;
                 self.footer_stale = true;
+                self.images_stale = std::mem::take(&mut self.images_in_flight);
                 let mut v = self.transcript.flush();
                 let left = std::mem::take(&mut self.leftover);
                 if matches!(end, TurnEnd::Final(_)) {
@@ -898,8 +1049,10 @@ impl App {
 }
 
 /// Raw mode (+ keyboard enhancement, so Shift+Enter is reported on terminals
-/// that speak the kitty protocol; others ignore the sequence) for the guard's
-/// lifetime; Drop restores both even when a panic unwinds through `run`.
+/// that speak the kitty protocol; others ignore the sequence; + bracketed
+/// paste, #560, so a pasted block arrives as one event instead of keys) for
+/// the guard's lifetime; Drop restores all three even when a panic unwinds
+/// through `run`.
 pub struct TerminalGuard;
 
 impl TerminalGuard {
@@ -908,7 +1061,8 @@ impl TerminalGuard {
         let mut out = io::stdout();
         let _ = queue!(
             out,
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
+            EnableBracketedPaste
         );
         let _ = io::Write::flush(&mut out);
         Ok(Self)
@@ -917,7 +1071,11 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+        let _ = execute!(
+            io::stdout(),
+            DisableBracketedPaste,
+            PopKeyboardEnhancementFlags
+        );
         let _ = disable_raw_mode();
     }
 }
@@ -991,6 +1149,9 @@ fn run_host_cmd(host: &dyn TuiHost, app: &mut App, cmd: HostCmd) {
         Switch,
         Status,
         Change,
+        Attach,
+        Clear,
+        Images,
     }
     let (kind, ok_note) = match &cmd {
         HostCmd::PickModel => (Cmd::PickModel, String::new()),
@@ -1015,7 +1176,11 @@ fn run_host_cmd(host: &dyn TuiHost, app: &mut App, cmd: HostCmd) {
             )
         }
         HostCmd::Name(n) => (Cmd::Change, format!("named {n}")),
+        HostCmd::AttachImage(_) => (Cmd::Attach, String::new()),
+        HostCmd::ClearImages => (Cmd::Clear, String::new()),
+        HostCmd::Images => (Cmd::Images, String::new()),
     };
+    let had = app.images.len();
     let done = |app: &mut App, msg: String| {
         app.footer_stale = true;
         app.note(&format!("({msg})"));
@@ -1045,9 +1210,55 @@ fn run_host_cmd(host: &dyn TuiHost, app: &mut App, cmd: HostCmd) {
             }
         }
         (Cmd::Change, Ok(HostReply::Done)) => done(app, ok_note),
+        (Cmd::Attach, Ok(HostReply::Images(v))) => attached(app, v),
+        (Cmd::Clear, Ok(HostReply::Images(v))) => {
+            app.set_images(v);
+            app.note(&format!("({had} queued image(s) dropped)"));
+        }
+        (Cmd::Images, Ok(HostReply::Images(v))) => {
+            app.note(&format!(
+                "({} image(s) queued for your next message)",
+                v.len()
+            ));
+            for i in &v {
+                app.note(&format!("  {}", i.label()));
+            }
+            app.set_images(v);
+        }
+        // The host's own error (jail, size cap, not an image), as chat shows it.
+        (Cmd::Attach | Cmd::Clear | Cmd::Images, Err(e)) => app.note(&format!("(/image: {e})")),
         (_, Err(e)) => app.note(&format!("(failed: {e})")),
         // A host answered with the wrong kind of reply: say so, never panic.
         (_, Ok(other)) => app.note(&format!("(failed: unexpected host reply {other:?})")),
+    }
+}
+
+/// The host accepted an image: show the queue and name the new one.
+fn attached(app: &mut App, images: Vec<ImageItem>) {
+    if let Some(last) = images.last() {
+        app.note(&format!(
+            "(image attached to your next message: {})",
+            last.label()
+        ));
+    }
+    app.set_images(images);
+}
+
+/// A paste that looked like one image reference (#560): attach it, or, when
+/// the host refuses, insert the text after all and say why it was not attached.
+fn attach_pasted(host: &dyn TuiHost, app: &mut App, spec: String, text: &str) {
+    match host.apply(HostCmd::AttachImage(spec)) {
+        Ok(HostReply::Images(v)) => attached(app, v),
+        Ok(other) => {
+            app.paste_text(text);
+            app.note(&format!(
+                "(pasted as text: unexpected host reply {other:?})"
+            ));
+        }
+        Err(e) => {
+            app.paste_text(text);
+            app.note(&format!("(pasted as text, not attached: {e})"));
+        }
     }
 }
 
@@ -1105,6 +1316,13 @@ where
             if std::mem::take(&mut app.footer_stale) {
                 app.footer = host.footer();
             }
+            // A turn that took queued images ended: a message that was never
+            // recorded hands them back, so show what the host queues now.
+            if !app.running() && std::mem::take(&mut app.images_stale) {
+                if let Ok(HostReply::Images(v)) = host.apply(HostCmd::Images) {
+                    app.set_images(v);
+                }
+            }
             if !quitting {
                 if let Some(prompt) = app.start_queued() {
                     cancel = start(prompt);
@@ -1124,8 +1342,12 @@ where
                 continue;
             };
             dirty = true;
-            match ev {
-                Event::Key(k) => match app.on_key(k) {
+            if let Event::Resize(..) = ev {
+                term.autoresize().map_err(io_err::<B>)?;
+                continue;
+            }
+            if let Some(input) = term_input::input_from_event(ev) {
+                match app.on_input(input) {
                     Action::Quit if app.running() => {
                         // Unreachable via keys today (quit needs idle), kept safe.
                         cancel.cancel();
@@ -1145,10 +1367,9 @@ where
                         }
                     },
                     Action::Host(cmd) => run_host_cmd(host, app, cmd),
+                    Action::PasteImage { spec, text } => attach_pasted(host, app, spec, &text),
                     Action::Redraw | Action::None => {}
-                },
-                Event::Resize(..) => term.autoresize().map_err(io_err::<B>)?,
-                _ => {}
+                }
             }
         }
     })
@@ -1266,6 +1487,206 @@ mod tests {
             Action::Host(HostCmd::SetEffort(_)) => {}
             other => panic!("BackTab cycles the effort, got {other:?}"),
         }
+    }
+
+    // ---- #560: pasted text and image attach, through `Input::Paste` ----
+
+    fn item(name: &str) -> ImageItem {
+        ImageItem {
+            path: format!("/ws/{name}"),
+            mime: "image/png".into(),
+            bytes: 1000,
+        }
+    }
+
+    #[test]
+    fn a_paste_is_one_edit_that_never_submits_or_steers() {
+        let mut app = App::default();
+        typed_input(&mut app, "intro ");
+        assert_eq!(
+            app.on_input(Input::Paste("one\r\ntwo\rthree\x1b[2J\n".into())),
+            Action::Redraw,
+            "the newlines in a paste do not submit"
+        );
+        assert_eq!(app.editor.text(), "intro one\ntwo\nthree[2J\n");
+        assert!(!app.running());
+        assert_eq!(
+            app.on_input(Input::new(Key::Enter)),
+            Action::Submit("intro one\ntwo\nthree[2J".into())
+        );
+        // While a turn runs a paste is still only an edit: Enter steers.
+        assert_eq!(
+            app.on_input(Input::Paste("more\nlines".into())),
+            Action::Redraw
+        );
+        assert_eq!(app.editor.text(), "more\nlines");
+        assert_eq!(
+            app.on_input(Input::new(Key::Enter)),
+            Action::Steer("more\nlines".into())
+        );
+        // An empty (or all-control) paste changes nothing.
+        assert_eq!(app.on_input(Input::Paste("\x1b\x07".into())), Action::None);
+    }
+
+    #[test]
+    fn a_paste_never_answers_an_approval_and_disarms_ctrl_c() {
+        let mut app = App::default();
+        let (tx, rx) = mpsc::channel();
+        app.on_msg(Msg::Approval(Pending::new(
+            ApprovalRequest::new("write_file a", Risk::Write),
+            move |v| {
+                let _ = tx.send(v);
+            },
+        )));
+        assert_eq!(app.on_input(Input::Paste("y".into())), Action::None);
+        assert!(rx.try_recv().is_err(), "a pasted `y` is not an answer");
+        assert_eq!(app.editor.text(), "", "nor typed into the draft");
+        app.on_input(Input::new(Key::Char('n')));
+        assert_eq!(rx.try_recv(), Ok(Verdict::Deny));
+
+        let mut app = App::default();
+        assert_eq!(app.on_input(Input::ctrl(Key::Char('c'))), Action::Redraw);
+        app.on_input(Input::Paste("x".into()));
+        assert_eq!(
+            app.on_input(Input::ctrl(Key::Char('c'))),
+            Action::Redraw,
+            "a paste disarms a pending Ctrl+C like any key"
+        );
+    }
+
+    #[test]
+    fn a_paste_filters_an_open_picker() {
+        let mut app = App::default();
+        app.open_picker(
+            PickKind::Model,
+            vec![Item::new("alpha", "alpha"), Item::new("beta", "beta")],
+        );
+        assert_eq!(app.on_input(Input::Paste("bet\n".into())), Action::Redraw);
+        assert_eq!(
+            app.on_input(Input::new(Key::Enter)),
+            Action::Host(HostCmd::SetModel("beta".into()))
+        );
+    }
+
+    #[test]
+    fn only_a_lone_image_reference_pasted_while_idle_is_offered_to_the_host() {
+        let mut app = App::default();
+        assert_eq!(
+            app.on_input(Input::Paste(" 'my shot.png'\r\n".into())),
+            Action::PasteImage {
+                spec: "my shot.png".into(),
+                text: " 'my shot.png'\n".into()
+            }
+        );
+        assert_eq!(app.editor.text(), "", "not inserted (yet)");
+        for text in ["see shot.png", "a.png\nb.png", "notes.txt"] {
+            assert_eq!(app.on_input(Input::Paste(text.into())), Action::Redraw);
+        }
+        // While a turn runs the host is busy: an image path is plain text.
+        let mut app = App::default();
+        typed_input(&mut app, "go");
+        app.on_input(Input::new(Key::Enter));
+        assert_eq!(
+            app.on_input(Input::Paste("shot.png".into())),
+            Action::Redraw
+        );
+        assert_eq!(app.editor.text(), "shot.png");
+    }
+
+    #[test]
+    fn a_pasted_image_is_attached_or_inserted_as_text_with_the_hosts_reason() {
+        let host = FakeHost::answering(vec![Ok(HostReply::Images(vec![item("a.png")]))]);
+        let mut app = App::default();
+        attach_pasted(&host, &mut app, "a.png".into(), "a.png");
+        assert_eq!(host.seen(), vec!["AttachImage(\"a.png\")"]);
+        assert_eq!(app.editor.text(), "");
+        assert_eq!(
+            app.image_row(80).as_deref(),
+            Some("image: a.png (image/png, 1000 B) · next message")
+        );
+        assert!(texts(&mut app)
+            .iter()
+            .any(|n| n == "(image attached to your next message: a.png (image/png, 1000 B))"));
+
+        let host = FakeHost::answering(vec![Err(
+            "image: /x.png: outside the workspace jail — refused".into(),
+        )]);
+        let mut app = App::default();
+        attach_pasted(&host, &mut app, "/x.png".into(), "/x.png");
+        assert_eq!(app.editor.text(), "/x.png", "inserted after all");
+        assert!(app.images().is_empty());
+        assert!(texts(&mut app).iter().any(|n| {
+            n
+            == "(pasted as text, not attached: image: /x.png: outside the workspace jail — refused)"
+        }));
+    }
+
+    #[test]
+    fn slash_image_maps_to_the_three_image_commands() {
+        for (draft, want) in [
+            ("/image shot.png", HostCmd::AttachImage("shot.png".into())),
+            ("/image  clear ", HostCmd::ClearImages),
+            ("/image", HostCmd::Images),
+        ] {
+            let mut app = App::default();
+            typed_input(&mut app, draft);
+            assert_eq!(
+                app.on_input(Input::new(Key::Enter)),
+                Action::Host(want),
+                "{draft}"
+            );
+        }
+        let (notes, _, _) = host_says(
+            HostCmd::AttachImage("/etc/x.png".into()),
+            Err("image: /etc/x.png: outside the workspace jail — refused".into()),
+        );
+        assert_eq!(
+            notes,
+            vec!["(/image: image: /etc/x.png: outside the workspace jail — refused)"]
+        );
+        let host = FakeHost::answering(vec![Ok(HostReply::Images(vec![]))]);
+        let mut app = App::default();
+        app.set_images(vec![item("a.png"), item("b.png")]);
+        run_host_cmd(&host, &mut app, HostCmd::ClearImages);
+        assert!(app.images().is_empty());
+        assert_eq!(texts(&mut app), vec!["(2 queued image(s) dropped)"]);
+        let (notes, _, app) =
+            host_says(HostCmd::Images, Ok(HostReply::Images(vec![item("a.png")])));
+        assert_eq!(
+            notes,
+            vec![
+                "(1 image(s) queued for your next message)",
+                "  a.png (image/png, 1000 B)"
+            ]
+        );
+        assert_eq!(app.images().len(), 1);
+    }
+
+    #[test]
+    fn queued_images_leave_with_the_message_and_are_reread_after_the_turn() {
+        let mut app = App::default();
+        app.set_images(vec![item("a.png"), item("b.png")]);
+        assert_eq!(
+            app.pending_rows(200),
+            vec!["images (2): a.png (image/png, 1000 B), b.png (image/png, 1000 B) · next message"]
+        );
+        typed_input(&mut app, "look");
+        app.on_input(Input::new(Key::Enter));
+        assert!(
+            app.images().is_empty(),
+            "the host took them with the message"
+        );
+        assert!(app.pending_rows(200).is_empty());
+        app.on_msg(Msg::Done(TurnEnd::Stopped("provider failed".into())));
+        assert!(
+            std::mem::take(&mut app.images_stale),
+            "the loop asks the host what is queued now"
+        );
+        // A turn without images does not ask.
+        typed_input(&mut app, "plain");
+        app.on_input(Input::new(Key::Enter));
+        app.on_msg(Msg::Done(TurnEnd::Final("ok".into())));
+        assert!(!app.images_stale);
     }
 
     #[test]
@@ -1673,7 +2094,7 @@ mod tests {
         let mut app = App::default();
         assert!(app.menu().is_empty(), "no menu without a slash");
         type_str(&mut app, "/");
-        assert_eq!(app.menu().len(), 8);
+        assert_eq!(app.menu().len(), menu::COMMANDS.len());
         type_str(&mut app, "co");
         assert_eq!(app.menu(), ["/compact"]);
         app.on_key(key(KeyCode::Tab));
@@ -2029,6 +2450,43 @@ mod tests {
                 .iter()
                 .all(|n| n.contains("not supported by this host")),
             "{notes:?}"
+        );
+    }
+
+    /// #560 through the loop: a terminal paste event becomes one host
+    /// attach call and the image row; a multi-line paste is only drawn.
+    #[test]
+    fn the_loop_attaches_a_pasted_image_and_draws_a_pasted_block() {
+        let host = FakeHost::answering(vec![Ok(HostReply::Images(vec![item("shot.png")]))]);
+        let mut term = Terminal::with_options(
+            TestBackend::new(100, 14),
+            TerminalOptions {
+                viewport: Viewport::Inline(VIEWPORT_HEIGHT),
+            },
+        )
+        .unwrap();
+        let (_p, rx) = approval_channel();
+        let mut script = vec![
+            Some(Event::Paste("shot.png".into())),
+            Some(Event::Paste("first\r\nsecond".into())),
+        ];
+        script.extend(std::iter::repeat_n(None, 3));
+        let mut it = script.into_iter();
+        let mut app = App::new(footer());
+        event_loop(&mut term, &host, &mut app, &rx, |_| {
+            Ok(it.next().unwrap_or(Some(Event::Key(ctrl('c')))))
+        })
+        .unwrap();
+        assert_eq!(host.seen(), vec!["AttachImage(\"shot.png\")"]);
+        assert_eq!(app.editor.text(), "first\nsecond");
+        let text = format!("{}", term.backend());
+        assert!(
+            text.contains("image: shot.png (image/png, 1000 B) · next message"),
+            "{text}"
+        );
+        assert!(
+            text.contains("> first") && text.contains("  second"),
+            "{text}"
         );
     }
 

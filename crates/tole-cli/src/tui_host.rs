@@ -13,7 +13,7 @@ use tole_core::storage::{is_valid_session_id, JsonlStorage, Storage};
 use tole_core::tool::ToolRegistry;
 use tole_core::turn::{TurnObserver, TurnOutcome};
 use tole_tui::{
-    ApprovalRequest, Footer, HostCmd, HostReply, Prompter, SessionItem, TuiHost, TurnEnd,
+    ApprovalRequest, Footer, HostCmd, HostReply, ImageItem, Prompter, SessionItem, TuiHost, TurnEnd,
 };
 
 use crate::approver::PromptFn;
@@ -248,6 +248,16 @@ impl TuiHost for TuiSession {
             HostCmd::Switch(id) => self.switch_session(&id).map(HostReply::Session),
             HostCmd::Status => Ok(HostReply::Lines(self.status_lines())),
             HostCmd::Name(n) => self.set_name(&n).map(|()| HostReply::Done),
+            // #560: `/image`, a pasted image path / data URL. Same resolution
+            // as `--image` and chat's `/image`; the reply is the whole queue.
+            HostCmd::AttachImage(spec) => self
+                .attach_image(&spec)
+                .map(|_| HostReply::Images(self.image_items())),
+            HostCmd::ClearImages => {
+                self.clear_pending_images();
+                Ok(HostReply::Images(Vec::new()))
+            }
+            HostCmd::Images => Ok(HostReply::Images(self.image_items())),
         }
     }
 }
@@ -357,6 +367,18 @@ impl TuiSession {
     /// The images the next user message will carry, in attach order.
     pub fn pending_images(&self) -> Vec<ImageRef> {
         self.lock().pending_images.clone()
+    }
+
+    /// The pending images as the UI shows them.
+    fn image_items(&self) -> Vec<ImageItem> {
+        self.pending_images()
+            .into_iter()
+            .map(|r| ImageItem {
+                path: r.path,
+                mime: r.mime,
+                bytes: r.bytes,
+            })
+            .collect()
     }
 
     /// Drop every queued image; returns how many were queued.
@@ -684,6 +706,30 @@ mod tests {
 
         s.attach_image_ref(img("c"));
         assert_eq!(s.clear_pending_images(), 1);
+        assert!(s.pending_images().is_empty());
+    }
+
+    /// #560: the TUI's image commands reach the #559 queue and answer with
+    /// the whole queue; a refused attach is the resolver's own error.
+    #[test]
+    fn apply_maps_the_image_commands_onto_the_pending_queue() {
+        let dir = tmp("apply-img");
+        let s = session(&dir, "s-ai");
+        assert_eq!(s.apply(HostCmd::Images), Ok(HostReply::Images(vec![])));
+        let refused = s.apply(HostCmd::AttachImage("/definitely/not/here.png".into()));
+        assert!(
+            matches!(&refused, Err(e) if e.starts_with("image: ")),
+            "{refused:?}"
+        );
+        assert!(s.pending_images().is_empty());
+        s.attach_image_ref(img("a"));
+        let want = vec![ImageItem {
+            path: "/ws/a.png".into(),
+            mime: "image/png".into(),
+            bytes: 33,
+        }];
+        assert_eq!(s.apply(HostCmd::Images), Ok(HostReply::Images(want)));
+        assert_eq!(s.apply(HostCmd::ClearImages), Ok(HostReply::Images(vec![])));
         assert!(s.pending_images().is_empty());
     }
 
