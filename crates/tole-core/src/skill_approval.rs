@@ -32,6 +32,19 @@ pub const MAX_PACKAGE_FILES: usize = 256;
 /// Most bytes a skill package may hold, all files together.
 pub const MAX_PACKAGE_BYTES: u64 = 4 * 1024 * 1024;
 
+/// The size limits of a package walk ([`MAX_PACKAGE_FILES`],
+/// [`MAX_PACKAGE_BYTES`] outside tests).
+#[derive(Debug, Clone, Copy)]
+struct Limits {
+    files: usize,
+    bytes: u64,
+}
+
+const LIMITS: Limits = Limits {
+    files: MAX_PACKAGE_FILES,
+    bytes: MAX_PACKAGE_BYTES,
+};
+
 /// The owner's approval of one skill.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Approval {
@@ -133,10 +146,7 @@ pub fn read_package(workspace: Option<&Path>, name: &str) -> Result<SkillPackage
     let dir = skill_file(workspace, name)
         .and_then(|f| f.parent().map(Path::to_path_buf))
         .ok_or_else(|| format!("skill {name:?} not found"))?;
-    let mut files = Vec::new();
-    let mut total = 0u64;
-    walk(&dir, "", &mut files, &mut total)?;
-    files.sort_by(|a, b| a.0.cmp(&b.0));
+    let files = read_dir_files(&dir, LIMITS)?;
     let hash = package_hash(&files);
     Ok(SkillPackage {
         name: name.to_string(),
@@ -146,12 +156,43 @@ pub fn read_package(workspace: Option<&Path>, name: &str) -> Result<SkillPackage
     })
 }
 
+/// Every file under `dir` (relative path, bytes), sorted by path, within
+/// `limits`. A file is never read past what is left of the byte budget:
+/// its length is checked first (lstat), and the read itself is capped.
+fn read_dir_files(dir: &Path, limits: Limits) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let mut files = Vec::new();
+    let mut total = 0u64;
+    walk(dir, "", &mut files, &mut total, limits)?;
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(files)
+}
+
+/// Read at most `remaining` bytes from `r`: `Ok(None)` when it holds more.
+/// Never asks `r` for more than `remaining + 1` bytes, so a file that grew
+/// (or lied about its length) after the size check cannot allocate past
+/// the budget.
+fn read_capped(r: impl std::io::Read, remaining: u64) -> std::io::Result<Option<Vec<u8>>> {
+    use std::io::Read as _;
+    let mut buf = Vec::new();
+    r.take(remaining.saturating_add(1)).read_to_end(&mut buf)?;
+    Ok((buf.len() as u64 <= remaining).then_some(buf))
+}
+
 fn walk(
     dir: &Path,
     prefix: &str,
     files: &mut Vec<(String, Vec<u8>)>,
     total: &mut u64,
+    limits: Limits,
 ) -> Result<(), String> {
+    let over = || {
+        format!(
+            "{}: skill package over {} files or {} bytes",
+            dir.display(),
+            limits.files,
+            limits.bytes
+        )
+    };
     let entries = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     for entry in entries {
         let entry = entry.map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -171,22 +212,46 @@ fn walk(
         if kind.is_symlink() {
             return Err(format!("{}: symlink in a skill package", path.display()));
         } else if kind.is_dir() {
-            walk(&path, &rel, files, total)?;
+            walk(&path, &rel, files, total, limits)?;
         } else if kind.is_file() {
-            let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            // Refuse before reading: the file count, then the length the
+            // directory entry reports (lstat: a symlink is not followed).
+            let remaining = limits.bytes.saturating_sub(*total);
+            let len = entry
+                .metadata()
+                .map_err(|e| format!("{}: {e}", path.display()))?
+                .len();
+            if files.len() >= limits.files || len > remaining {
+                return Err(over());
+            }
+            let file = open_no_follow(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            let bytes = read_capped(file, remaining)
+                .map_err(|e| format!("{}: {e}", path.display()))?
+                .ok_or_else(over)?;
             *total += bytes.len() as u64;
             files.push((rel, bytes));
-            if files.len() > MAX_PACKAGE_FILES || *total > MAX_PACKAGE_BYTES {
-                return Err(format!(
-                    "{}: skill package over {MAX_PACKAGE_FILES} files or {MAX_PACKAGE_BYTES} bytes",
-                    dir.display()
-                ));
-            }
         } else {
             return Err(format!("{}: not a regular file", path.display()));
         }
     }
     Ok(())
+}
+
+/// Open `path` for reading without following a symlink swapped in after
+/// the directory walk saw a regular file.
+fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = opts.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other("not a regular file"));
+    }
+    Ok(file)
 }
 
 /// `sha256:<hex>` over each file's relative path, length and bytes, in
@@ -388,6 +453,71 @@ mod tests {
             Gate::Open.load(Some(&ws), "other").unwrap().body,
             "never approved"
         );
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// A reader that panics when asked for more than `cap` bytes in total:
+    /// proof that an over-budget file is never read in full.
+    struct Bounded {
+        cap: usize,
+        served: usize,
+    }
+
+    impl std::io::Read for Bounded {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            assert!(
+                self.served + buf.len().min(1) <= self.cap,
+                "read past the cap ({} bytes)",
+                self.cap
+            );
+            let n = buf.len().min(self.cap - self.served).min(4096);
+            buf[..n].fill(0);
+            self.served += n;
+            Ok(n)
+        }
+    }
+
+    /// Cora finding on #617: a huge file must be refused without reading
+    /// it into memory. The read stops one byte past the remaining budget.
+    #[test]
+    fn an_over_budget_file_is_refused_without_a_full_read() {
+        use std::io::Read as _;
+        // An endless source: only the cap keeps the read bounded.
+        let endless = Bounded { cap: 11, served: 0 };
+        assert_eq!(read_capped(endless, 10).unwrap(), None);
+        let exact = Bounded { cap: 11, served: 0 };
+        assert_eq!(read_capped(exact.take(10), 10).unwrap(), Some(vec![0; 10]));
+        // The walk refuses on the reported length before opening the file,
+        // and on the file count, with the over-limit error.
+        let ws = tmp("limits");
+        skill(&ws, "demo", "b");
+        let dir = ws.join("skills/demo");
+        let tiny = Limits {
+            files: 8,
+            bytes: 64,
+        };
+        assert!(read_dir_files(&dir, tiny).is_ok());
+        let big = std::fs::File::create(dir.join("big.bin")).unwrap();
+        big.set_len(1 << 40).unwrap(); // sparse: 1 TiB reported, nothing stored
+        let err = read_dir_files(&dir, tiny).unwrap_err();
+        assert!(
+            err.ends_with("skill package over 8 files or 64 bytes"),
+            "{err}"
+        );
+        assert!(read_package(Some(&ws), "demo")
+            .unwrap_err()
+            .ends_with(&format!(
+                "skill package over {MAX_PACKAGE_FILES} files or {MAX_PACKAGE_BYTES} bytes"
+            )));
+        std::fs::remove_file(dir.join("big.bin")).unwrap();
+        write(&ws, "demo/a.md", "a");
+        let one_file = Limits {
+            files: 1,
+            bytes: 64,
+        };
+        assert!(read_dir_files(&dir, one_file)
+            .unwrap_err()
+            .ends_with("over 1 files or 64 bytes"));
         let _ = std::fs::remove_dir_all(&ws);
     }
 
