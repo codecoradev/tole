@@ -9,7 +9,7 @@ Durable Rust agent harness: a conversational agent with risk-tiered approval
 gates, a write-once JSONL session log, and a register state machine — resumable
 after crashes, replayable forever.
 
-**Status:** v0.9.0 is the latest release: `tole doctor`, soft interrupts, per-turn token stats, sibling change notices and the typed child-agent handoff, a provider failover chain, the user config layer, `--trust workspace`, command-level allow/deny patterns, a global session index (`sessions --all`) and context compaction, plus the 0.8.2 `tole serve` hardening (see the CHANGELOG). `develop` is working toward 0.10.0, a pi-style terminal UI: the `tole-tui` is in and daily-usable — bare `tole` on a TTY opens an inline UI with a streaming transcript, a multi-line editor, a footer, inline approvals and Esc-cancel; slash commands (`/compact` `/new` `/resume` `/session` `/name`, and `/fork` `/tree` over session forks, #463), the model picker and thinking-level cycling (#461); steering, a follow-up queue, `@file`, collapsible tool output and markdown/diff styling (#462), `/export` and `/copy` (#463), color themes (`default`, `light`, `mono`, `NO_COLOR`; #463), a keybinding config (`[tui.keys]` in the user config; #463), `--effort` reasoning effort and the `tole status [id]` snapshot (model, effort, context used/window, tokens, compactions) shipped, and the multi-client daemon (jcode-style socket server) stays design-only ([docs/daemon-design.md](docs/daemon-design.md)), while the UI-client seam of `tole serve` has started (epic #523): `GET /sessions/{id}/entries` reads a transcript page by page `POST /sessions {"resume": id}` reopens a session and `GET /sessions/{id}/events` streams it live over SSE with a lossless replay from a `seq` (#524); images are uploaded with `POST /sessions/{id}/images`, attached with `"images"` on a prompt and read back from `GET /sessions/{id}/images/{fnv1a64}` (#558). The automation epic (#577) has started: `tole-core` carries the scheduler's ledger core — an in-tree 5-field cron / `@every` parser and an append-only claim/fold/recovery log where a run is claimed before it starts, a terminal record is never overwritten and every skipped occurrence is recorded (#578); `tole cron create|edit|list|status|pause|resume|remove|run|cancel|runs|tick` stores jobs in an append-only `jobs.jsonl` and runs script jobs (argv, no shell, secret-shaped env scrubbed, zero tokens) from one `tick` pass that cron(8) or a systemd timer can host, and agent jobs (one durable session per run, per-job `--model`, `--max-steps`/`--max-minutes`/`--max-tokens` budgets and the user config's `[cron] daily_token_cap`); results go to `--deliver` targets (`log`, `session`, `file:PATH` inside the workdir, `command:ARGV` for CLI-saved jobs only) and `GET /cron/runs` on `tole serve`; `tole cron status` and `tole doctor` report a stale ticker; unattended Writes run only from the job's `--allow` list — under `tole serve --cron` (the in-process ticker) anything else is parked in `/approvals`, a standalone `tole cron tick` refuses it, and the run settles `awaiting_approval`; nothing is auto-approved (#579). v0.8.1 itself brought token-usage reporting and a capped, resumable `read_file` (#211), on top of v0.8.0, which added the per-project config `.tole/config.toml`
+**Status:** v0.9.0 is the latest release: `tole doctor`, soft interrupts, per-turn token stats, sibling change notices and the typed child-agent handoff, a provider failover chain, the user config layer, `--trust workspace`, command-level allow/deny patterns, a global session index (`sessions --all`) and context compaction, plus the 0.8.2 `tole serve` hardening (see the CHANGELOG). `develop` is working toward 0.10.0, a pi-style terminal UI: the `tole-tui` is in and daily-usable — bare `tole` on a TTY opens an inline UI with a streaming transcript, a multi-line editor, a footer, inline approvals and Esc-cancel; slash commands (`/compact` `/new` `/resume` `/session` `/name`, and `/fork` `/tree` over session forks, #463), the model picker and thinking-level cycling (#461); steering, a follow-up queue, `@file`, collapsible tool output and markdown/diff styling (#462), `/export` and `/copy` (#463), color themes (`default`, `light`, `mono`, `NO_COLOR`; #463), a keybinding config (`[tui.keys]` in the user config; #463), `--effort` reasoning effort and the `tole status [id]` snapshot (model, effort, context used/window, tokens, compactions) shipped, and the multi-client daemon (jcode-style socket server) stays design-only ([docs/daemon-design.md](docs/daemon-design.md)), while the UI-client seam of `tole serve` has started (epic #523): `GET /sessions/{id}/entries` reads a transcript page by page `POST /sessions {"resume": id}` reopens a session and `GET /sessions/{id}/events` streams it live over SSE with a lossless replay from a `seq` (#524); images are uploaded with `POST /sessions/{id}/images`, attached with `"images"` on a prompt and read back from `GET /sessions/{id}/images/{fnv1a64}` (#558). The automation epic (#577) has started: `tole-core` carries the scheduler's ledger core — an in-tree 5-field cron / `@every` parser and an append-only claim/fold/recovery log where a run is claimed before it starts, a terminal record is never overwritten and every skipped occurrence is recorded (#578); `tole cron create|edit|list|status|pause|resume|remove|run|cancel|runs|tick` stores jobs in an append-only `jobs.jsonl` and runs script jobs (argv, no shell, secret-shaped env scrubbed, zero tokens) from one `tick` pass that cron(8) or a systemd timer can host, and agent jobs (one durable session per run, per-job `--model`, `--max-steps`/`--max-minutes`/`--max-tokens` budgets and the user config's `[cron] daily_token_cap`); results go to `--deliver` targets (`log`, `session`, `file:PATH` inside the workdir, `command:ARGV` for CLI-saved jobs only) and `GET /cron/runs` on `tole serve`; `tole cron status` and `tole doctor` report a stale ticker; unattended Writes run only from the job's `--allow` list — under `tole serve --cron` (the in-process ticker) anything else is parked in `/approvals`, a standalone `tole cron tick` refuses it, and the run settles `awaiting_approval`; nothing is auto-approved (#579). The profiles epic (#583) has started: dormant `[profiles.<name>]` personas in the user config (persona file, allow list, skills, memory room, model tiers), selected with `--profile <name>` (#584). v0.8.1 itself brought token-usage reporting and a capped, resumable `read_file` (#211), on top of v0.8.0, which added the per-project config `.tole/config.toml`
 (trusted before it applies; see the Configuration section) on top of v0.7.x
 (rescan-2 hardening, one tool-call authorization gate; see the CHANGELOG for
 the behavior changes). Five faces on one durable core: the CLI (run / chat /
@@ -310,6 +310,7 @@ type or a secret-like key is an error with `file:line`; the file is capped at
 | `on_pretool`, `on_posttool`, `on_turnend` (lists) | `--on-pretool` / `--on-posttool` / `--on-turnend` | flag > config |
 | `skill` (list of paths) | `--skill` | flag > config (paths resolve against the cwd) |
 | `plan_mode`, `no_auto_mcp`, `no_skills` (booleans) | `--plan-mode`, `--no-auto-mcp`, `--no-skills` | `flag \|\| config` |
+| `[profiles.<name>]` | `--profile <name>` | **user config only** (a project's `[profiles]` is ignored with a warning); see Profiles below |
 
 The API key only ever comes from the environment (a secret-like key in the file
 is an error). An empty env variable counts as unset.
@@ -322,6 +323,37 @@ is an error). An empty env variable counts as unset.
 - **Booleans can only be turned on.** `effective = flag || config`: a flag can
   turn a setting on but there is no flag that forces it off, so a config `true`
   is dropped only with `--no-config` (or by editing / untrusting the file).
+
+**Profiles (#584).** A profile is a dormant persona in the user config: a
+persona file, an allow list, skills, a memory room and model tiers. Nothing
+runs for it and nothing is read for it until a command selects it with the
+global `--profile <name>`; then only its persona file is read.
+
+```toml
+[profiles.coder]
+system_prompt_file = "~/.codecora/tole/profiles/coder.md"  # or relative to the user config's directory
+allow = ["write_*"]
+skills = ["~/skills/rust/SKILL.md"]
+memory_room = "profile-coder"          # default: profile-<name>
+grants = ["GITHUB_TOKEN"]              # secret NAMES only, never values (used by #585/#598)
+[profiles.coder.models]
+light = "small-model"
+standard = "mid-model"
+heavy = "big-model"
+advisor = "big-model"                  # consulted, never executes (#587)
+default = "standard"                   # light | standard | heavy
+```
+
+A selected profile is one layer of the usual precedence: **per-key flag
+(`--system`, `--allow`, `--skill`) > profile > env > config > user config**.
+The `default` tier's model replaces the model of the provider triple (it beats
+`TOLE_MODEL`); the persona replaces the system prompt (for `mission`, the
+default base prompt); the memory loop uses the profile's room, except in a
+child agent, whose mailbox room always wins. A non-empty profile `allow`
+list **replaces** the config `allow` list rather than merging with it, exactly
+as a non-empty `--allow` does: while the profile is selected, the config's
+patterns do not apply. Names are `[a-z0-9_-]`; an unknown
+name is a startup error that lists the defined ones.
   `tole config check` says so next to each boolean.
 - **Same effect as the flag.** `plan_mode = true` removes the write/delete/run
   tools from the wire like `--plan-mode`; `allow`/`trust` feed the same

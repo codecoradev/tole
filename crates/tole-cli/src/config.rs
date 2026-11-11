@@ -98,6 +98,124 @@ pub struct CronConfig {
     pub daily_token_cap: Option<u64>,
 }
 
+/// `[profiles.<name>.models]` (#584): model names per task-weight tier.
+/// `default` names the tier a session uses unless something picks another
+/// (the router of #586 is that something; today only `default` is used).
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelTiers {
+    pub light: Option<String>,
+    pub standard: Option<String>,
+    pub heavy: Option<String>,
+    /// Consulted, never executes (#587).
+    pub advisor: Option<String>,
+    /// `light | standard | heavy`; default `standard`.
+    pub default: Option<String>,
+}
+
+/// The executing tiers a `default` may name (`advisor` never executes).
+pub const EXEC_TIERS: [&str; 3] = ["light", "standard", "heavy"];
+
+impl ModelTiers {
+    /// The model of an executing tier, when that tier is set.
+    pub fn tier(&self, name: &str) -> Option<&str> {
+        match name {
+            "light" => self.light.as_deref(),
+            "standard" => self.standard.as_deref(),
+            "heavy" => self.heavy.as_deref(),
+            _ => None,
+        }
+        .filter(|m| !m.trim().is_empty())
+    }
+
+    /// The `default` tier's name (`standard` when unset).
+    pub fn default_tier(&self) -> &str {
+        self.default.as_deref().map(str::trim).unwrap_or("standard")
+    }
+}
+
+/// One `[profiles.<name>]` table (#584): a dormant persona. It holds
+/// configuration only; selecting it (`--profile <name>`) is the only thing
+/// that reads its persona file, and nothing is ever started for it.
+/// USER LAYER ONLY, like `[tui]`: a project config may not define who the
+/// agent is or what it may do without asking (see [`layered`]).
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileConfig {
+    /// Persona file (`~/` expanded; relative to the user config's directory).
+    pub system_prompt_file: Option<String>,
+    /// Tool patterns pre-authorized for this profile (same syntax as `allow`).
+    pub allow: Option<Vec<String>>,
+    /// uteke room of this profile's memory loop (default `profile-<name>`).
+    pub memory_room: Option<String>,
+    /// Skill files preloaded for this profile (same syntax as `skill`).
+    pub skills: Option<Vec<String>>,
+    /// NAMES of the environment secrets this profile may be granted
+    /// (never values; #598 releases them, #585 intersects with the parent).
+    pub grants: Option<Vec<String>>,
+    pub models: Option<ModelTiers>,
+}
+
+/// Profile names: `[a-z0-9_-]`, 1 to 64 chars, not starting with `-`
+/// (they become `--profile` values and the `profile-<name>` room).
+pub fn valid_profile_name(name: &str) -> bool {
+    (1..=64).contains(&name.len())
+        && !name.starts_with('-')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+}
+
+/// An environment variable NAME as a grant: `[A-Z0-9_]`, not starting with
+/// a digit. Anything else (a value pasted by mistake) is refused.
+fn valid_grant_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.as_bytes()[0].is_ascii_digit()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+}
+
+fn check_profile(name: &str, p: &ProfileConfig) -> Result<(), String> {
+    if !valid_profile_name(name) {
+        return Err(format!(
+            "profile name `{name}` must be 1-64 chars of a-z, 0-9, `_` or `-`, not starting with `-`"
+        ));
+    }
+    if let Some(room) = &p.memory_room {
+        let ok = !room.is_empty()
+            && !room.starts_with('-')
+            && room
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+        if !ok {
+            return Err(format!(
+                "profiles.{name}.memory_room must be [a-zA-Z0-9._-], not starting with `-`"
+            ));
+        }
+    }
+    // Never echo the entry: it may be a value pasted by mistake.
+    if p.grants.iter().flatten().any(|g| !valid_grant_name(g)) {
+        return Err(format!(
+            "profiles.{name}.grants: every entry must be an environment variable NAME              ([A-Z0-9_]), never a value"
+        ));
+    }
+    if let Some(m) = &p.models {
+        let tier = m.default_tier();
+        if !EXEC_TIERS.contains(&tier) {
+            return Err(format!(
+                "profiles.{name}.models.default must be light, standard or heavy, got {tier:?}"
+            ));
+        }
+        if m.tier(tier).is_none() {
+            return Err(format!(
+                "profiles.{name}.models.default is {tier:?} but profiles.{name}.models.{tier} is not set"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The whole file: flat snake_case keys mirroring the global flags, all
 /// optional, plus the single `[mission]` table.
 #[derive(Debug, Default, Clone, PartialEq, Deserialize)]
@@ -136,6 +254,8 @@ pub struct Config {
     pub tui: Option<TuiConfig>,
     /// Scheduler limits (#579); user layer only, see [`CronConfig`].
     pub cron: Option<CronConfig>,
+    /// Dormant profiles (#584); user layer only, see [`ProfileConfig`].
+    pub profiles: Option<std::collections::BTreeMap<String, ProfileConfig>>,
     /// Keys (rendered names, e.g. `model`, `mission.verify`) whose value
     /// came from the user layer; set by [`layered`], never by the file.
     #[serde(skip)]
@@ -330,6 +450,9 @@ pub fn parse(src: &str, path: &Path) -> Result<Config, ConfigError> {
             "context_window must be a positive number of tokens".into(),
         ));
     }
+    for (name, p) in cfg.profiles.iter().flatten() {
+        check_profile(name, p).map_err(range)?;
+    }
     Ok(cfg)
 }
 
@@ -482,6 +605,9 @@ pub fn layered(project: &Config, user: &Config) -> Config {
         tui: user.tui.clone(),
         // Nor the scheduler limits (#579).
         cron: user.cron.clone(),
+        // Nor profiles (#584): a cloned repository must not define personas,
+        // their allow lists or their models.
+        profiles: user.profiles.clone(),
         user_keys: BTreeSet::new(),
     };
     if user
@@ -534,6 +660,17 @@ pub const TUI_IGNORED_NOTE: &str =
 /// Suffix of a project config's `cron` lines in `config check` (#579).
 pub const CRON_IGNORED_NOTE: &str =
     "  IGNORED: a project config cannot set scheduler limits (user config only)";
+/// Suffix of a project config's `profiles` line in `config check` (#584).
+pub const PROFILES_IGNORED_NOTE: &str =
+    "  IGNORED: a project config cannot define profiles (user config only)";
+
+/// The warning printed at startup when a project config carries `[profiles]`.
+pub fn profiles_ignored_warning(shown: &str) -> String {
+    format!(
+        "ignoring `profiles` in project config {shown}: profiles can only be defined in the \
+         user config"
+    )
+}
 
 /// The warning printed at startup when a project config carries `[tui]`.
 pub fn tui_ignored_warning(shown: &str) -> String {
@@ -558,6 +695,9 @@ pub fn render_with(cfg: &Config, tag: &str, ann: &Annotations) -> Vec<String> {
         }
         if tag == PROJECT_TAG && key.starts_with("cron.") {
             return CRON_IGNORED_NOTE;
+        }
+        if tag == PROJECT_TAG && key == "profiles" {
+            return PROFILES_IGNORED_NOTE;
         }
         ann.get(key).map_or("", String::as_str)
     };
@@ -661,6 +801,17 @@ pub fn render_with(cfg: &Config, tag: &str, ann: &Annotations) -> Vec<String> {
                 let shown: Vec<String> = keys.to_vec().iter().map(|s| quote(s)).collect();
                 out.push(format!("  - {action} = [{}]", shown.join(", ")));
             }
+        }
+    }
+    if let Some(p) = cfg.profiles.as_ref().filter(|p| !p.is_empty()) {
+        // Names only: a profile is shown by `config check --profile <name>`.
+        out.push(format!(
+            "profiles = [{} entries]  [{src}]{}",
+            p.len(),
+            note("profiles")
+        ));
+        for name in p.keys() {
+            out.push(format!("  - {}", quote(name)));
         }
     }
     if let Some(m) = &cfg.mission {
@@ -864,6 +1015,53 @@ verify_timeout = 60
         assert!(m.user_keys.contains("cron.daily_token_cap"));
         let shown = render(&project).join("\n");
         assert!(shown.contains("cron.daily_token_cap = 999999999") && shown.contains("IGNORED"));
+    }
+
+    #[test]
+    fn profiles_parse_strictly_and_only_the_user_layer_survives_layering() {
+        let src = "[profiles.coder]\nallow = [\"write_*\"]\nmemory_room = \"profile-code\"\n\
+                   grants = [\"GITHUB_TOKEN\"]\n[profiles.coder.models]\nstandard = \"m\"\n";
+        let c = parse(src, &p()).unwrap();
+        let coder = &c.profiles.as_ref().unwrap()["coder"];
+        assert_eq!(coder.allow.as_deref(), Some(&["write_*".to_string()][..]));
+        assert_eq!(coder.models.as_ref().unwrap().default_tier(), "standard");
+        // Unknown keys, bad names, bad rooms and impossible defaults are loud.
+        for (bad, want) in [
+            ("[profiles.coder]\nmodel = \"m\"\n", "unknown field"),
+            ("[profiles.Coder]\n", "profile name `Coder`"),
+            ("[profiles.\"-x\"]\n", "profile name `-x`"),
+            ("[profiles.a]\nmemory_room = \"a b\"\n", "memory_room"),
+            (
+                "[profiles.a.models]\nlight = \"s\"\n",
+                "models.standard is not set",
+            ),
+            (
+                "[profiles.a.models]\nadvisor = \"s\"\ndefault = \"advisor\"\n",
+                "light, standard or heavy",
+            ),
+        ] {
+            let e = parse(bad, &p()).unwrap_err().to_string();
+            assert!(e.contains(want), "{bad:?}: {e}");
+        }
+        // A grant is a NAME; a value pasted by mistake is refused and never echoed.
+        let e = parse("[profiles.a]\ngrants = [\"ghp-abcdef123456\"]\n", &p())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("environment variable NAME") && !e.contains("ghp-abcdef"),
+            "{e}"
+        );
+        // The secret-key guard still applies inside a profile.
+        assert!(parse("[profiles.a]\napi_key = \"x\"\n", &p()).is_err());
+        // The project layer never supplies profiles.
+        let m = layered(&c, &Config::default());
+        assert_eq!(m.profiles, None);
+        let m = layered(&Config::default(), &c);
+        assert_eq!(m.profiles, c.profiles);
+        let lines = render(&c);
+        assert!(lines.iter().any(|l| l
+            == "profiles = [1 entries]  [config]  IGNORED: a project config cannot define profiles (user config only)"));
+        assert!(lines.contains(&"  - \"coder\"".to_string()));
     }
 
     #[test]
