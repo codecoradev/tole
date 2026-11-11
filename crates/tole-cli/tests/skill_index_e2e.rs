@@ -150,7 +150,10 @@ fn run(dir: &Path, url: &str, envs: &[(&str, &str)]) -> (String, String, i32) {
     .env_remove("TOLE_SKILL_INDEX")
     .env_remove("TOLE_SKILLS_PINNED")
     .env_remove("TOLE_SKILL_RECALL_K")
-    .env_remove("TOLE_SKILL_FLOOR");
+    .env_remove("TOLE_SKILL_FLOOR")
+    // These tests are about the index; skill approval (required by
+    // default) is opted out explicitly.
+    .env("TOLE_SKILL_APPROVAL", "off");
     for (k, v) in envs {
         cmd.env(k, v);
     }

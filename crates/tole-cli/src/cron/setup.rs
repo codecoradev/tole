@@ -14,7 +14,7 @@
 //! (`profile_skill_hashes`). A run whose skill no longer matches is
 //! `blocked` (`skill_changed`); `tole cron edit --skill` (or `--profile`)
 //! re-pins, editing anything else keeps the pins. With
-//! `TOLE_SKILL_APPROVAL=required` a name entry must also be owner-approved
+//! skill approval (required by default) a name entry must also be owner-approved
 //! (#591), else the run is `blocked` (`skill_not_approved`). The skill text
 //! a run uses is parsed from the bytes that were hashed.
 //!
@@ -202,8 +202,9 @@ pub fn resolve_with(job: &Job, gate: &Gate) -> Result<AgentSetup, (&'static str,
                 return Err((
                     "skill_not_approved",
                     format!(
-                        "skill {entry} ({hash}) is not approved and TOLE_SKILL_APPROVAL=required; \
-                         the owner can run `tole skills approve {entry}`"
+                        "skill {entry} ({hash}) is not approved (skill approval is required); \
+                         review it with `tole skills list`, then run \
+                         `tole skills approve {entry} --hash {hash}`"
                     ),
                 ));
             }
@@ -375,7 +376,10 @@ mod tests {
         // Approval required: a name entry must be an approved package.
         let mut approvals = tole_core::skill_approval::Approvals::default();
         let gate = Gate::Approved(std::sync::Arc::new(approvals.clone()));
-        assert_eq!(resolve_with(&j, &gate).unwrap_err().0, "skill_not_approved");
+        let (code, detail) = resolve_with(&j, &gate).unwrap_err();
+        assert_eq!(code, "skill_not_approved");
+        let fix = format!("tole skills approve lint --hash {}", hashes[0]);
+        assert!(detail.contains(&fix), "{detail}");
         approvals.approve(
             &tole_core::skill_approval::read_package(Some(&ws), "lint").unwrap(),
             1,

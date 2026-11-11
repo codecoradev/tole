@@ -200,6 +200,7 @@ pub fn skills_section(
     registry: &mut ToolRegistry,
 ) -> Result<(String, Vec<String>), String> {
     let mut notes = tole_core::skills::listing_notes(ws);
+    notes.extend(crate::skill_approve::startup_note(ws, &recall.gate));
     let index = match (recall.settings.mode, &recall.index) {
         (IndexMode::Uteke, Some(index)) => Some(index.clone()),
         (IndexMode::Uteke, None) => {

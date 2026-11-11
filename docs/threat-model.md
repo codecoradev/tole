@@ -170,11 +170,11 @@ forward it to a cloud store. `tole skills index` sends only
 each skill's name, description, status and content hash to uteke, never the
 body. Only entries tagged `skill`, with status `approved` and in scope for
 the active `--profile`, are recalled; `tole skills retire` keeps a skill on disk
-but stops its recall. With `TOLE_SKILL_APPROVAL=required` only owner-approved
-content loads (below).
+but stops its recall. Skill approval is required by default, so only
+owner-approved content loads (below).
 
-**Approved-hash loading (#591).** With `TOLE_SKILL_APPROVAL=required` that
-trust is no longer "whatever is on disk": a discovered skill loads only when
+**Approved-hash loading (#591).** Required by default since 2026-11-11 (owner
+decision), so the trust is no longer "whatever is on disk": a discovered skill loads only when
 its package (SKILL.md plus every other file of its directory, paths and
 bytes) hashes to the owner's approval, recorded by `tole skills approve` in
 `$CODECORA_HOME/tole/skill-approvals.json`, outside every workspace. A
@@ -192,8 +192,14 @@ they are when a session starts and loads the skill; it does not vet what a
 read or run it (those reads and commands go through the normal tool
 approvals). `tole skills approve` shows the files, their sizes and the hash
 before it asks; without a terminal it requires `--hash`. With `TOLE_SKILL_INDEX=uteke` the same gate covers
-the pinned core, the recalled skills and every `skill_search` hit. The
-default is `off` (today's behavior).
+the pinned core, the recalled skills and every `skill_search` hit. The only
+opt-out is `TOLE_SKILL_APPROVAL=off` in the environment: there is no config
+key for it, and the config schema refuses unknown keys, so a project config
+(`.tole/config.toml`) in a cloned repository can never loosen the gate. A
+session with unapproved skills prints one startup note (the count and the
+fix command, never a description); `tole doctor` warns when approval is
+required but the CodeCora home is unresolvable, which means no skill can
+ever be approved.
 
 ## verify_package (#144)
 
@@ -895,7 +901,7 @@ profile skill): an unattended run never follows instructions that changed
 after the owner chose them (a `git pull` in the workdir, a cloned repo's
 `skills/`). A changed skill blocks the run (`skill_changed`) until the
 owner re-pins it with `tole cron edit --skill` (or `--profile`); editing any
-other field keeps the pins. Under `TOLE_SKILL_APPROVAL=required` a skill
+other field keeps the pins. Under skill approval (required by default) a skill
 named by name must also be an owner-approved package (#591), else the run is
 `blocked` (`skill_not_approved`). A profiled run auto-approves a Write only when both the
 job's `allow` and the profile's `allow` cover it (never wider than either),
