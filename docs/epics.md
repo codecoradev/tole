@@ -253,12 +253,13 @@ Owner discussion 2026-11-11 (competitor audit of OpenClaw, Hermes, Grok
 Bot and Nakama; BMAD for collaboration). Design notes:
 `docs/automation-design.md`, `docs/profiles-collaboration-secrets.md`,
 `docs/skills-registry-design.md`, `docs/secrets-integrations-design.md`,
-`docs/third-party-plugins-design.md`. Implementation started (status per item); 1 issue =
-1 branch = 1 PR.
+`docs/third-party-plugins-design.md`. 1 issue = 1 branch = 1 PR.
 
 - **E1 — Automation, epic #577:** ledger core (#578), `tole cron` (#579),
   time zones (#580), unattended approvals (#581), webhooks on `tole serve`
-  (#582). The scheduler lives inside tole.
+  (#582). The scheduler lives inside tole. Status: #578 in progress — the
+  in-tree cron/`@every` parser is in `tole-core` (`cron`); the ledger
+  (claim/fold/recovery) follows.
 - **E2 — Profiles, delegation, discussion, routing, epic #583:**
   - profiles (#584);
   - delegation with budget carve, depth 2 (max 3), write lease and a
