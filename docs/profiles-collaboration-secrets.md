@@ -371,6 +371,131 @@ goal-<id>                      contract + final report (linked to the project ro
   no `parent`. It needs one (verify that the uteke CLI exposes it; the uteke
   cloud API does).
 
+Decided (2026-11-11): default max rounds **4**; the scribe runs on a
+**cheap model**. The `parent` gap is tracked in codecoradev/tole#576.
+
+### A9. Model options per profile, task-weight routing, laya as the selector
+
+Owner direction: the orchestrator and every profile carry **several model
+options** and switch between them; the choice can be made by laya (or
+hosted Jev), based on how heavy the task is. laya/Jev stay **optional**.
+Dormant profiles free memory that a local laya can use.
+
+#### A9.1 What laya is (read from `codecoradev/laya-service`)
+
+- Sidecar over the Laya decision engine: a **non-autoregressive System-1
+  model** answering typed questions (`choice` 2–20 options, `score` 2–10
+  ordered levels, `noul` 0–1) over a state, with **calibrated confidence**;
+  the service's suggested policy is auto-act at ≥ 0.85, escalate below.
+- Stateless and policy-free; **deterministic** (identical payloads gave
+  identical answers; a result cache is valid, PERFORMANCE.md).
+- Cost: ~0.2–0.6 s per short decision on CPU; ~3.3 s p50 for a ~1k-token
+  state; tole's client notes ~17 s on ~2.5k tokens (1024-token context).
+  Throughput is CPU-bound and flat beyond ~2 concurrent; admission control
+  answers `503` + `Retry-After` beyond the queue.
+- Memory: Python service measured 2.0–2.8 GB RSS (`mem_limit: 4g`); the
+  Rust/ONNX port is a 31 MB binary plus a ~1.29 GB fp32 checkpoint.
+- Jev-wire compatible, so tole's existing `systemone_decide` client
+  (`SYSTEMONE_BASE_URL`) already talks to it; hosted Jev is the same wire.
+- Limit stated in tole's client: **not adversarial-resistant**; pass
+  filtered state, never raw tool results.
+
+**Memory reading of "dormant profiles free memory":** a dormant profile
+costs nothing, so the box's RAM goes to the orchestrator, the live children
+and **one** laya process shared by every profile (it is stateless, so it is
+not per profile). Budget ~1.3 GB (Rust) to ~2.8 GB (Python) for it; on a
+small VPS, hosted Jev or the rule router (below) is the fallback.
+
+#### A9.2 Evidence on routing by task weight
+
+| Source | Finding |
+|---|---|
+| FrugalGPT (Chen, Zaharia, Zou, 2023) | cascades matched the best single model with up to 98% lower cost on their benchmarks |
+| Hybrid LLM (Ding et al., ICLR 2024) | a router on predicted query difficulty cut large-model calls by up to 40% with no quality drop |
+| RouteLLM (Ong et al., 2024, arXiv 2406.18665) | routers trained on preference data cut cost by over 2× in some settings without hurting quality |
+| Anthropic advisor strategy (2026) | Sonnet executor + Opus advisor: +2.7 pp on SWE-bench Multilingual at 11.9% lower cost per task; Haiku + Opus advisor on BrowseComp 41.2% vs 19.7% solo, 85% cheaper than Sonnet solo (but 29% below its score) |
+| Cognition, *Multi-Agents: What's Actually Working* (2026) | a weaker primary often does not know when to escalate; across frontier models the router becomes a capability router, not only a difficulty escalator |
+| **LLMRouterBench** (ACL Findings 2026; 400K instances, 33 models) | many routers perform alike; several, including commercial routers, **fail to reliably beat a simple baseline**; bigger model pools give diminishing returns versus careful curation |
+| **Routing collapse** (NeurIPS 2026, arXiv 2602.03478) | under loose budgets routers **over-select the strongest, most expensive model** even when a cheaper one is equivalent |
+
+Conclusion: routing by weight pays off, **if** the pool is small and
+curated, a simple rule baseline exists and is beaten before a learned
+router is trusted, ties go to the cheaper model, and a failure can
+escalate (cascade).
+
+#### A9.3 Design
+
+**Model options as tiers, not names.** Each profile (and the orchestrator)
+declares tiers in its config; the router picks a tier, which keeps laya's
+`choice` at 3–4 options (far under its 20 limit) and lets the owner change
+models without touching routing:
+
+```toml
+[profiles.coder.models]
+light    = "…"     # summaries, scribe, simple edits
+standard = "…"     # default
+heavy    = "…"     # multi-file design, hard debugging
+advisor  = "…"     # optional: consulted, never executes (advisor pattern)
+default  = "standard"
+```
+
+**Precedence** (first that applies wins): owner's explicit choice in the
+prompt or flag → a role pin (the scribe is always `light`) → the router →
+the profile's `default`.
+
+**Deep module `ModelRouter`**, two adapters (a real seam):
+
+```
+route(task_brief, profile, budget_left) -> Route { tier, source, confidence, reason }
+  RuleRouter   always available: role, risk tier of the tools the task
+               needs, files expected to change, owner keywords; the baseline
+  LayaRouter   systemone backend (local laya or hosted Jev); used only when
+               its confidence ≥ 0.85, otherwise RuleRouter decides
+```
+
+LayaRouter asks a fixed, literal question set over a **short, owner-side
+task brief** (the goal contract and profile role, never raw tool output or
+web text: laya is not adversarial-resistant, and short states keep it
+sub-second):
+- `score` weight: light / standard / heavy, each level described literally;
+- `noul` "changes more than one file or a public interface";
+- `noul` "needs a plan before acting".
+
+Rules around it:
+- **Tie or doubt → cheaper tier** (the routing-collapse lesson); the budget
+  caps the tier the router may pick.
+- **Route per delegation and per discussion participant, not per turn.**
+  A model switch mid-session discards the cached prompt prefix and changes
+  behaviour; tole's `usage_report` already measures the cache-hit rate to
+  verify this.
+- **Cascade, bounded:** a run that fails its checks, hits its step budget
+  or reports `blocked` may retry once, one tier up; never an automatic
+  downgrade mid-task.
+- **Advisor instead of escalation** where it fits: an executor on
+  `standard` may consult `advisor` a capped number of times, mirroring the
+  advisor strategy.
+- **Audit:** every routing decision is a ledger entry (brief hash,
+  answers, confidence, tier, source); laya is deterministic, so decisions
+  are cached by that hash and replayable.
+- **Fail-safe:** laya down or `503` ⇒ RuleRouter, never a blocked task.
+  Hosted Jev sends the brief off-host (a threat-model data flow); a local
+  laya keeps it on the box.
+
+**Adoption gate:** before LayaRouter becomes a default, the eval harness
+(`evals/`, Tier 2 missions) compares always-`heavy`, RuleRouter and
+LayaRouter on success rate and cost. LayaRouter ships as the default only if
+it beats the rule baseline (LLMRouterBench shows many routers do not).
+
+#### A9.4 Other cheap decisions laya can take (later, same seam)
+
+All on sanitized or owner-written text only, never raw payloads:
+- which dormant profile fits a task (`choice`; above 20 profiles, choose a
+  group first);
+- the discussion gate's "is this round's delta new information" (`noul`),
+  feeding stall detection; the claim-checker stays an LLM role;
+- relevance of an incoming webhook event before any LLM run (automation
+  design §6 filters).
+
 ## Part B — Secrets leaking to the LLM
 
 ### B1. How secrets actually leak (evidence)
