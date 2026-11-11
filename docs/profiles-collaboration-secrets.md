@@ -496,6 +496,60 @@ All on sanitized or owner-written text only, never raw payloads:
 - relevance of an incoming webhook event before any LLM run (automation
   design §6 filters).
 
+### A10. Decisions round 3 (2026-11-11) and validation
+
+**Decided:**
+1. **laya runs as a separately hosted service**, and its presence is the
+   feature's on/off switch. Deployment: the Docker Hub image
+   `codecoradev/laya-service-rust`.
+2. **The advisor tier is enabled.**
+
+**Validation (checked 2026-11-11):**
+
+| Claim | Result |
+|---|---|
+| Rust image exists | yes: Docker Hub `codecoradev/laya-service-rust`, tags `latest`, `2026-10-28c`, `rust`, amd64 + arm64 |
+| Image contents | **binary only** (~23 MB compressed, 31 MB binary, distroless, non-root). The ONNX checkpoint is **not** baked in: mount it at `/model` (fused export, ~1.29 GB fp32, exported once with upstream `tools/export_onnx.py`). The Python image `codecoradev/laya-service` downloads weights itself (~360 MB image) |
+| Contract | same four endpoints as the Python service; 15/15 exact parity verified by the laya project; model load 3–6 s from disk |
+| Auth | `BEARER_TOKEN` required, fail-closed; `/healthz` open; listens on `0.0.0.0:8080` |
+| tole client fits | yes, no new client: `systemone_decide` is active only when `SYSTEMONE_API_KEY` is set (owner decision 2026-10-05: on by key presence, silent off otherwise); `SYSTEMONE_BASE_URL` is the full POST URL (`https://<host>/v1/systemone`); any non-hosted backend gets the conservative caps (≤ 20 options, 4 KiB state), which a routing brief fits |
+| Advisor via Anthropic's advisor tool | **not directly usable**: it is a Claude Platform server-side beta tool (`advisor_20260301`), while tole's provider speaks OpenAI-compatible `/chat/completions` |
+| uteke CLI `--parent` | yes: `uteke doc create <slug> --parent <slug>` plus children / descendants / move / breadcrumbs, max depth 10 (uteke `docs/cli-reference.md`, CHANGELOG). #576 is unblocked |
+
+**Resulting design:**
+- **On/off = configuration only.** `SYSTEMONE_API_KEY` (= the laya
+  `BEARER_TOKEN`) + `SYSTEMONE_BASE_URL` set ⇒ `LayaRouter` and
+  `systemone_decide` are active; unset ⇒ `RuleRouter` only, nothing else
+  changes. No new flag, no new env name. `tole doctor` reports the state and
+  calls `/healthz`.
+- `LayaRouter` reuses the `systemone` client internally; it is not the
+  model-facing tool, so the model cannot steer its own routing.
+- Deployment note: put the service behind TLS on a private network; the
+  routing brief leaves the tole process (threat-model data flow, kept inside
+  the owner's infrastructure).
+- **Advisor, host-side and provider-agnostic:** when a profile declares an
+  `advisor` tier, tole registers a ReadOnly `consult_advisor` tool. tole
+  makes a separate provider call on the advisor model with a curated context
+  (the task contract plus the recent transcript window, after secret
+  redaction) and returns a short plan, correction or stop signal. The
+  advisor never calls tools and never talks to the owner. Uses are capped
+  per run (`advisor_max_uses`, default 3), its tokens are recorded
+  separately in the usage ledger and carved from the run's budget, and each
+  consultation is a ledger entry.
+
+**Conflicts with earlier recorded context (need an explicit owner
+acknowledgement):**
+1. The 2026-10-06 competitor research marked "multi-agent without a cap"
+   as anti-DNA and kept depth 1. A8 now allows any number of profiles and
+   depth 2 (max 3). This note treats A8 as superseding it, with the budget
+   carve (A8.1) as the cap that replaces the count cap.
+2. The 2026-11-09 proposal (not yet decided) put the scheduler and gateway
+   in a **separate repository**, with tole as a narrow kernel and the
+   scheduler calling `tole mission` as a subprocess.
+   [automation-design.md](automation-design.md) instead places the
+   scheduler inside tole. Open: where the scheduler host lives. The ledger
+   core can live in `tole-core` either way.
+
 ## Part B — Secrets leaking to the LLM
 
 ### B1. How secrets actually leak (evidence)
