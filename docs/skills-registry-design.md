@@ -165,3 +165,104 @@ trigger (correction by owner | dead end then working path | repeated workflow)
 3. Growth mode: **propose-only with owner approval** (recommended, given
    SkillsBench and SkillJack), or auto-promote untainted drafts that pass an
    eval?
+
+## 6. Round 2 (2026-11-11): decisions, uteke in OSS, embedding dedup
+
+**Decided:** K = 5 by default (max 10) with a similarity floor and a
+pinned core of 3–5 per profile; growth is **propose-only with owner
+approval**, plus meaning-based dedup that turns a near-duplicate into a
+patch or a `references/` file instead of a new skill.
+
+**Owner proposal:** move `uteke skill` into uteke **OSS** so everyone can
+use it and tole can build on it directly.
+
+### 6.1 What uteke OSS already has (read from `codecoradev/uteke` @ c98ff38)
+
+- Embedding backends `onnx` (local, default), `openai` (any
+  OpenAI-compatible `base_url`, e.g. the fleet's embor), `ollama`, `cohere`,
+  plus an `embed_fallback` endpoint; precedence via `UTEKE_EMBEDDING_*`.
+- Documents with a parent tree (max depth 10), hybrid/semantic search.
+- Similarity machinery: after `remember`, `auto_link_cosine` adds
+  `similar_to` edges at cosine ≥ 0.80 and `possible_duplicate` at ≥ 0.92;
+  the dream cycle merges at `dedup_threshold` 0.92 and scans
+  contradictions. **These run on memories, not on document chunks**
+  (chunk keys are explicitly excluded as link targets), so skill dedup on
+  documents is not automatic today.
+- No skill-library feature in OSS (the only "skill" code ships uteke's own
+  usage SKILL.md).
+
+### 6.2 Should `uteke skill` move to OSS?
+
+It reverses the 2026-11-10 uteke decision "Uteke Cloud only", so it is a
+**uteke decision** to record there; tole should not block on it.
+
+- Open-core rule of thumb (GitLab's buyer-based open core): features for
+  an *individual* contributor are open; features a *team or organisation*
+  buys are paid.
+- A **personal skill library** fits OSS: index local skill directories,
+  hybrid search, similarity report, validity lint, approved-hash records.
+  It is useful to every uteke user and costs nothing to run.
+- The **registry** stays Cloud: the shared pool, GitHub ingest with
+  scanning at scale, private-repo sync, team sharing, yank notifications,
+  quotas. These need runtime, cost money, and carry the legal exposure
+  (DMCA/DSA) the uteke plan already describes. This matches the recorded
+  uteke direction to monetise runtime services, not features.
+- Caution from the same uteke analysis: the OSS feature surface is already
+  large for one maintainer (a one-cycle OSS feature freeze was proposed), so
+  a small, well-bounded OSS subset is safer than porting the registry.
+
+**Recommendation for decision 1:** do **not** wait. tole builds against a
+`SkillIndex` seam with a `uteke doc` adapter now (works with today's OSS
+and Cloud). When an OSS `uteke skill` library lands, it becomes the second
+adapter: a real seam, two adapters. Keep the CLI/HTTP boundary: embedding
+`uteke-core` (~100k LOC, vector engines, ONNX runtime) into tole would cost
+binary size and coupling, the same reasons cora was not embedded. Recall
+runs once per task, not per turn, so a CLI or `uteke-server` call is
+affordable; measure it. Without uteke, tole falls back to today's local
+index.
+
+### 6.3 Meaning-based dedup, made safe
+
+Embedding similarity **finds candidates; it does not decide.** Embedding
+models are weakly sensitive to negation (the Jina Embeddings paper built a
+dedicated negation set for this reason), so "deploy to staging" vs "deploy to
+production", or "always X" vs "never X", can score as near-duplicates.
+
+| Cosine (calibrated per embedder) | Proposed action (owner approves) |
+|---|---|
+| ≥ 0.92 | **patch** the existing skill (new lesson into its procedure); no new skill |
+| 0.80–0.92 | **reference**: add as `references/<topic>.md` of the closer skill, or propose an umbrella if two existing skills overlap; respect the 2–3 module limit (SkillsBench) |
+| < 0.80 | new skill candidate |
+| similar but contradictory | **conflict**: never merged automatically, shown side by side |
+
+The verdict (patch / reference / new / conflict) comes from the curator
+profile on the `light` tier (or a laya `choice` over the two short
+descriptions), and the owner approves. The thresholds start at uteke's
+memory values (0.80 / 0.92) and are recalibrated on our own library.
+
+Embedding hygiene (from the embor notes): one embedder per store (local
+ONNX and an API model are different vector spaces, and so are different
+ONNX Runtime builds), so record the embedder id with each vector and
+re-embed everything when switching. Texts above ~2048 tokens are silently
+truncated, so embed the frontmatter + main procedure, and each reference
+file separately. Skill text sent to an API embedder leaves the machine:
+prefer local ONNX or the owner's own embor.
+
+### 6.4 Lessons adopted from the Hermes curator
+
+- Deterministic lifecycle without an LLM: active → stale → archived by
+  inactivity (Hermes defaults 14 / 30 days); never-used skills get a grace
+  period; skills referenced by a cron job are protected; archived is
+  restorable.
+- **pin** (no archiving) vs **lock** (no agent edits).
+- LLM consolidation is **off by default** in Hermes: a sweep costs 50–100
+  API calls and makes broad structural changes. Here it runs as a weekly
+  proposal on the `light` tier, never applying changes itself.
+- Package-aware moves: a skill with `references/`, `scripts/` or `assets/`
+  moves as a whole package; never flatten only its SKILL.md into another
+  skill's references.
+- An append-only mutation ledger with before/after content hashes, a
+  snapshot before any consolidation, single-entry rollback, a rename map,
+  and `--dry-run`.
+- The curator manages only agent-grown skills by default; hand-written and
+  third-party skills are untouched unless the owner adopts them.
