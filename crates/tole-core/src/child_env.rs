@@ -30,6 +30,13 @@ pub const MEMORY: &str = "TOLE_MEMORY";
 /// (`agent-<id>`). The name predates rooms.
 pub const MEMORY_ROOM: &str = "TOLE_MEMORY_NAMESPACE";
 
+/// The secret-shaped variables a child agent keeps (#595): the provider
+/// keys its own provider chain reads (`TOLE_*`, `OPENAI_*`, the #209
+/// reserve). Non-secret provider and memory settings (`TOLE_BASE_URL`,
+/// `TOLE_MODEL`, `TOLE_MEMORY*`, ...) survive the ENV-1 scrub anyway; every
+/// other secret is removed from the child's environment.
+pub const PROVIDER_SECRETS: [&str; 3] = ["TOLE_API_KEY", "OPENAI_API_KEY", "TOLE_FALLBACK_API_KEY"];
+
 /// Everything a parent passes to one child.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChildLaunch {

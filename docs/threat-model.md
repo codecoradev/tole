@@ -39,7 +39,8 @@ lives) / **gap** (tracked) / **N/A** (with rationale).
 | Prompt injection (direct/indirect) | **control + documented residual** | Tool results on the wire are wrapped in `TOOL_RESULT_BEGIN/END` fences with inner fence markers neutralized (this fix); secrets scrubbed (E11). Residual: an injected instruction inside data can still steer the model — no framework fully solves this; delimiters + user-visible tool audit lines (`what: …`) limit blast radius. |
 | Insecure output handling | **control** | Same fence treatment; result sizes capped (read_file 1 MiB file cap and 20,000-char head cap per call, run_command 4000/2000 chars, job_poll 8 KiB window). |
 | Excessive agency / tool misuse | **control (defense-in-depth) + documented residual** | Primary control: the per-call approval gate (every non-ReadOnly spawn needs consent). Secondary: `check_destructive_argv` blocklist refuses headline catastrophic patterns (teardown tools, recursive rm escaping the workspace, wrapper-nested variants) in BOTH `run_command` and `job_start`. The blocklist is best-effort by nature — wrapper/interpreter bypasses (`sudo apt ...`, `timeout 5 dd ...`, `find / -delete`, `python -c rmtree`) are expected and accepted residual risk; a real argv sandbox is a different product and explicitly out of scope. |
-| Sensitive data disclosure (env) | **gap → fixed here (ENV-1)** | Children now inherit a scrubbed env: any var whose name contains `API_KEY`, `_SECRET`, `_TOKEN`, or `PASSWORD` is removed (`GITHUB_TOKEN` kept for gh/git auth — documented trade-off). |
+| Sensitive data disclosure (env) | **control (ENV-1, #595)** | Children inherit a scrubbed env: any var whose name contains `API_KEY`, `APIKEY`, `SECRET`, `TOKEN`, `PASSWORD`, `PASSWD`, `CREDENTIAL` or `PRIVATE_KEY` (case-insensitive) is removed (`GITHUB_TOKEN` kept for gh/git auth — documented trade-off, revisited by #598). The name rule is `secrets::is_secret_name`, shared with the redactor below. Child agents get the same scrubbed env plus only their provider keys (`TOLE_API_KEY`, `OPENAI_API_KEY`, `TOLE_FALLBACK_API_KEY`); before #595 they inherited the full env. |
+| Sensitive data disclosure (egress) | **control (E11 → #595) + documented residual** | `SecretSet` collects the values of every secret-named env var (plus the provider key and its base-URL password) and replaces each value, and its base64 / percent-encoded / JSON-escaped forms, with `«NAME»` in the provider request body (system prompt, messages, tool arguments, tool results) and in provider errors. Values under 8 characters are not redacted (false-positive guard); they are reported by name only. Residual: the other egress sinks (MCP tool arguments, `web_search` / `web_fetch`, `systemone` state, memory-loop summary, `uteke_document`) are wired in a follow-up PR of #595; secrets tole never knew (pasted, printed by a command) need the shape detector (#597); the durable log keeps the original text until #596; the provider redacts tool-call arguments as serialized text, so a secret of 8+ digits that appears as a bare JSON number (`{"pin":12345678}`) turns the replayed arguments into invalid JSON (`{"pin":«NAME»}`) — the structural `SecretSet::redact_value` of #595 part 2 is the fix. |
 | Supply chain (deps) | **control** | Cargo Audit + Trivy FS Scan required by rulesets on every PR and push. |
 | Resource exhaustion | **control + fixed here (JOB-2)** | Provider 120 s timeout, subprocess 30 s ceiling, step budget 32, loop guard, read caps; job logs are read via bounded windows on poll (never a whole-log load). Since the 2026-09-18 scan triage, a ReadOnly poll no longer rewrites the log file — runaway log disk growth is bounded by the job's lifetime and clearing a runaway log is an operator action. |
 | Session/message tampering | **control** | Append-only JSONL, CAS state transitions, seq monotonicity, torn-line recovery with truncation (#68); compaction never drops entries. |
@@ -272,7 +273,13 @@ parent-only `--agents-worktree` flag gives each child its own git
 worktree. A child's prompt is model/operator-supplied — the same trust
 tier as the session system prompt. Child sessions are ordinary durable
 sessions: approval gates, risk tiers, and secret redaction apply
-unchanged inside them.
+unchanged inside them. Since #595 a child does not inherit the parent's
+whole environment: it gets the ENV-1-scrubbed env plus only its provider keys
+(`child_env::PROVIDER_SECRETS`), so MCP tokens, the serve token and other
+secrets of the parent never reach it (`GITHUB_TOKEN` stays, as for every
+child process). Consequence: a child cannot use an integration whose secret
+lives only in the parent's environment (HTTP MCP servers, `systemone`, web
+backend headers).
 
 Typed handoff (#383) and sibling notices (#380) add two child-to-agent
 channels, both carrying model-authored text that is treated as untrusted. A
@@ -468,7 +475,7 @@ tole computes and trusts no hash of its own, and a verdict for another diff
   security-sensitive keys (a trusted file that says `off` is the user's own
   decision). Flag and env still win over config. The model cannot
   change it (the environment is not model-writable and `cora hook verify` runs
-  with the child-env scrub). Child agents inherit the environment, so they are
+  with the child-env scrub). Child agents inherit the non-secret environment, so they are
   gated the same way.
 
 ### `tole setup cora` (#535)
