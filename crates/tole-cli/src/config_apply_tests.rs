@@ -842,6 +842,7 @@ fn fill_carries_only_low_risk_provider_values() {
             system_prompt: s("p"),
             profile_model: None,
             profile_system_prompt: None,
+            profile_name: None,
         }
     );
     assert_eq!(
@@ -922,8 +923,13 @@ fn fill_with_profile_carries_the_profile_model_and_persona() {
     prof.system_prompt = s("persona");
     let f = Settings::fill_with_profile(&c, Some(&prof));
     assert_eq!(
-        (f.model, f.profile_model, f.profile_system_prompt),
-        (s("m"), s("pm"), s("persona"))
+        (
+            f.model,
+            f.profile_model,
+            f.profile_system_prompt,
+            f.profile_name
+        ),
+        (s("m"), s("pm"), s("persona"), s("p"))
     );
     assert_eq!(
         Settings::fill_with_profile(&c, None),
