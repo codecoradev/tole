@@ -150,6 +150,22 @@ another name. Frontmatter is validated loudly (name/dir mismatch is a
 hard error) and bodies are capped (16 KiB) — but content itself is
 trusted by definition, same tier as the system prompt.
 
+**Skill index (#590).** With `TOLE_SKILL_INDEX=uteke` a session lists a
+pinned core plus the skills a `uteke doc` index recalls by meaning. The index
+only finds NAMES: every listed description and every loaded body is read
+from the local skill files, and a name with no local skill is dropped, so a
+tampered or shared index entry cannot put text into the prompt; at worst it
+changes which local skills are listed. The recall query is the owner-written
+`run` prompt, never tool output, so a fetched page cannot steer which
+instructions get listed. Every query (that prompt, a model-written
+`skill_search` query, a `tole skills search` query) is redacted against the
+process secrets before it reaches the index, because `uteke doc search` may
+forward it to a cloud store. `tole skills index` sends only
+each skill's name, description, status and content hash to uteke, never the
+body. Only entries tagged `skill`, with status `approved` and in scope for
+the active `--profile`, are recalled; `tole skills retire` keeps a skill on disk
+but stops its recall. Loading only owner-approved content hashes is #591.
+
 ## verify_package (#144)
 
 The ReadOnly registry check before any install answers the
