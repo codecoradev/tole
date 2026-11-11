@@ -959,6 +959,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             base: tole_cli::config::user_config_path()
                 .and_then(|p| p.parent().map(Path::to_path_buf)),
             home: std::env::var_os("HOME").map(PathBuf::from),
+            data_dir: tole_core::paths::tole_data_dir(),
         },
 
         on_pretool: config_apply::values(&settings.on_pretool),

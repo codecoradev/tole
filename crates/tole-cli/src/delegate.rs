@@ -23,7 +23,9 @@
 //! - **Usage:** a settled child is charged what its session usage records
 //!   say; when they cannot be read, its whole carve.
 //! - **Machine guard:** past `max_live_processes` a spawn is recorded
-//!   `queued` with its launch spec and started by a later delegate or poll.
+//!   `queued` and started by a later delegate or poll, from the recorded node.
+//! - **Location:** the log and its queue live in the tole data dir
+//!   ([`log_path`]), outside every workspace; children get its absolute path.
 //!
 //! `agent_start` / `agent_poll` stay for one release as aliases of
 //! `delegate` / `delegate_poll`. Part b of #585 adds the completion report;
@@ -59,6 +61,28 @@ pub struct Setup {
     pub cfg: Config,
     pub base: Option<PathBuf>,
     pub home: Option<PathBuf>,
+    /// The tole data dir (`<codecora home>/tole`). The delegation log and
+    /// its queue live there, OUTSIDE every workspace, so no child's file
+    /// tools can reach them. `None`: no delegation.
+    pub data_dir: Option<PathBuf>,
+}
+
+/// The delegation log of the session rooted at `root`:
+/// `<data dir>/delegation/<hash of the canonical root>/delegation.jsonl`.
+pub fn log_path(data_dir: &Path, root: &Path) -> Option<PathBuf> {
+    let canon = root.canonicalize().ok()?;
+    // FNV-1a 64: a stable, short directory name per workspace.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in canon.as_os_str().as_encoded_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    Some(
+        data_dir
+            .join("delegation")
+            .join(format!("{h:016x}"))
+            .join(LOG_FILE),
+    )
 }
 
 /// What a queued spawn keeps next to the log: only what carries no
@@ -172,11 +196,7 @@ impl Delegator {
                 (log, Some(node), true)
             }
             None if tole_core::child_env::depth(env) >= 1 => return None,
-            None => (
-                tole_core::agents::agents_dir(&root).join(LOG_FILE),
-                None,
-                false,
-            ),
+            None => (log_path(setup.data_dir.as_deref()?, &root)?, None, false),
         };
         Some(Self {
             bin,

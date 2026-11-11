@@ -848,6 +848,14 @@ all. All the caps sit in one module so no caller can skip one:
 - **Audit.** The tree is an append-only log (spawns, budgets, allowlists,
   workspaces, sessions, leases, reports); dead processes settle `interrupted`
   and queued children of a settled parent `cancelled` on recovery.
+- **The fold re-checks every spawn.** The host launches what the log records,
+  so the fold itself ignores a spawn record that breaks a cap: an unknown or
+  settled parent, an id that is not the parent's next, a depth past the goal's
+  limit, `execute` under a `consult` parent, an allow pattern no parent
+  pattern covers or a parent deny missing, an empty budget, or a budget or
+  deadline past what the parent can still carve at that point of the log. A
+  settle is never charged below the node's reported own spend, and a budget
+  stop always its whole carve.
 
 The report and the summary are model-authored text: they are recorded and
 shown, never executed or trusted as instructions.
@@ -891,7 +899,18 @@ The delegate tool (#585 part 3, `crates/tole-cli/src/delegate.rs`) adds:
   log for it holds only what carries no authority (role, artifacts to read,
   mailbox choice): allow list, budget, depth, mode, task, workspace and profile
   are read back from the node the tree recorded and the secrets are recomputed,
-  so a child that can write that file cannot widen a queued sibling.
+  so a queued sibling cannot be widened through that file.
+- **Where the files live.** The log, its lock and the queue files live in the
+  tole data dir, `<codecora home>/tole/delegation/<hash of the canonical
+  workspace root>/`, outside every workspace, so a child's jailed file tools
+  cannot reach them; children get the log's absolute path in
+  `TOLE_DELEGATION_LOG`. What a child can still write is its own agent dir
+  under `<workspace>/tole-agents/<id>/` (its meta, log and session records:
+  usage understatement within its carve, see Budget) and, like any session,
+  whatever its allow list and approvals let it touch. A child with an approved
+  or allowlisted `run_command` could write the data dir like any other path
+  outside the jail; that is the same authority it already holds, and the fold
+  still refuses any spawn wider than its parent.
 
 ### User config (#433)
 

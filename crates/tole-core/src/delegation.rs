@@ -473,6 +473,13 @@ impl State {
                 if self.nodes.contains_key(&node_id) {
                     return;
                 }
+                // The log is the authority the host launches from, so the
+                // fold re-checks every cap a spawn must respect; a record
+                // that breaks one (forged, or from a buggy writer) is
+                // ignored, never launched.
+                if !self.spawn_allowed(&node_id, &parent_id, mode, &budget, &allow, parent_own) {
+                    return;
+                }
                 let Some(parent) = self.nodes.get_mut(&parent_id) else {
                     return;
                 };
@@ -548,6 +555,12 @@ impl State {
                 if n.status.is_terminal() || !status.is_terminal() {
                     return; // the first terminal record is final
                 }
+                // A settle never charges below what the node reported, and
+                // a budget stop always spent its whole carve.
+                let mut used = used.max(n.own);
+                if status == NodeStatus::Budget {
+                    used = used.max(Spend::all_of(n.budget));
+                }
                 n.status = status;
                 n.used = Some(used);
                 n.report = report;
@@ -555,6 +568,45 @@ impl State {
                 self.leases.retain(|_, holder| *holder != node_id);
             }
         }
+    }
+
+    /// Does a spawn record respect every cap at this point of the log? The
+    /// parent is live, the id is the next one under it, the depth is within
+    /// the goal's, a consult parent spawns consult work only, each allow
+    /// pattern is covered by the parent's and every parent deny is kept, and
+    /// the budget fits what the parent can still carve, deadline included.
+    fn spawn_allowed(
+        &self,
+        node_id: &str,
+        parent_id: &str,
+        mode: Mode,
+        budget: &Budget,
+        allow: &[String],
+        parent_own: Spend,
+    ) -> bool {
+        let Some(p) = self.nodes.get(parent_id) else {
+            return false;
+        };
+        let max_depth = self
+            .goals
+            .get(&p.goal_id)
+            .map_or(DEFAULT_MAX_DEPTH, |g| g.max_depth);
+        let is_deny = |a: &String| a.starts_with(DENY_PREFIX);
+        let left = self.available(p, p.own.max(parent_own));
+        !p.status.is_terminal()
+            && node_id == format!("{}.{}", p.id, p.children.len() + 1)
+            && p.depth < max_depth
+            && !(p.mode == Mode::Consult && mode == Mode::Execute)
+            && allow.iter().all(|a| is_deny(a) || list_covers(&p.allow, a))
+            && p.allow
+                .iter()
+                .filter(|d| is_deny(d))
+                .all(|d| allow.contains(d))
+            && budget.tokens >= 1
+            && budget.steps >= 1
+            && budget.tokens <= left.tokens
+            && budget.steps <= left.steps
+            && budget.deadline <= p.budget.deadline
     }
 
     /// What `id`'s subtree has used or reserved, as charged to its parent:

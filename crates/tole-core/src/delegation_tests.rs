@@ -682,3 +682,105 @@ fn a_budget_stop_is_charged_the_whole_carve_and_own_spend_only_grows() {
     assert!(fresh.delegate("g", &r, lower, T).is_err());
     assert_eq!(fresh.poll("g").unwrap().own, fifty);
 }
+
+/// Appends a raw spawn record, as a forger with write access to the log would.
+fn raw_spawn(store: &MemoryStore, node: &str, parent: &str, allow: &[&str], tokens: u64) {
+    let rec = Rec::Spawn {
+        node_id: node.into(),
+        parent_id: parent.into(),
+        profile: "forged".into(),
+        task: "forged".into(),
+        mode: Mode::Execute,
+        budget: Budget {
+            tokens,
+            steps: 1,
+            deadline: T + 60,
+        },
+        allow: s(allow),
+        dropped: vec![],
+        workspace: Some("/w".into()),
+        parent_own: Spend::default(),
+        at: T,
+    };
+    let mut raw = store.clone();
+    raw.append(format!("{}\n", rec.to_line()).as_bytes())
+        .unwrap();
+}
+
+#[test]
+fn the_fold_ignores_a_spawn_that_breaks_a_cap() {
+    let store = MemoryStore::default();
+    let mut d = goal_on(store.clone(), 2, 8);
+    let a = spawn(&mut d, "g", 600);
+    let a1 = spawn(&mut d, &a.node_id, 100);
+    let b = spawn(&mut d, "g", 100);
+    d.settle(&b.node_id, Outcome::Failed, Spend::default(), None, None, T)
+        .unwrap();
+    let keep = "!write_file:secrets/*";
+    for (node, parent, allow, tokens, why) in [
+        (
+            "g.3",
+            "g",
+            vec!["*", keep],
+            10,
+            "allow wider than the parent",
+        ),
+        (
+            "g.3",
+            "g",
+            vec!["run_command", keep],
+            10,
+            "uncovered pattern",
+        ),
+        ("g.3", "g", vec!["write_file"], 10, "parent deny dropped"),
+        (
+            "g.3",
+            "g",
+            vec![keep],
+            1_000_000_000,
+            "budget past the carve",
+        ),
+        ("g.1.1.1", "g.1.1", vec![keep], 1, "depth past the cap"),
+        ("zz.1", "zz", vec![keep], 1, "unknown parent"),
+        ("g.2.1", "g.2", vec![keep], 1, "terminal parent"),
+        ("g.9", "g", vec![keep], 1, "not the next id"),
+        ("g.3", "g", vec![keep], 0, "empty budget"),
+    ] {
+        raw_spawn(&store, node, parent, &allow, tokens);
+        d.refresh().unwrap();
+        assert!(d.poll(node).is_none(), "{why}: {node} was accepted");
+    }
+    assert!(d.next_queued("g").is_none(), "nothing forged is queued");
+    assert_eq!(d.poll(&a1.node_id).unwrap().children.len(), 0);
+    // A spawn within every cap is still accepted (the legitimate shape).
+    raw_spawn(&store, "g.3", "g", &["write_file", keep], 10);
+    d.refresh().unwrap();
+    assert_eq!(d.poll("g.3").unwrap().status, NodeStatus::Queued);
+}
+
+#[test]
+fn a_raw_settle_cannot_charge_below_the_rules() {
+    let store = MemoryStore::default();
+    let mut d = goal_on(store.clone(), 2, 8);
+    let a = spawn(&mut d, "g", 600);
+    let late = Rec::Settle {
+        node_id: a.node_id.clone(),
+        status: NodeStatus::Budget,
+        used: Spend::default(),
+        report: None,
+        reason: None,
+        at: T,
+    };
+    let mut raw = store.clone();
+    raw.append(format!("{}\n", late.to_line()).as_bytes())
+        .unwrap();
+    d.refresh().unwrap();
+    assert_eq!(
+        d.poll(&a.node_id).unwrap().used,
+        Some(Spend {
+            tokens: 600,
+            steps: 50
+        }),
+        "a budget stop is its whole carve"
+    );
+}

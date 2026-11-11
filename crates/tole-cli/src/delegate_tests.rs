@@ -32,7 +32,19 @@ fn setup(src: &str) -> Setup {
         cfg: crate::config::parse(src, Path::new("user.toml")).unwrap(),
         base: None,
         home: None,
+        data_dir: Some(data_dir()),
     }
+}
+
+/// A data dir outside every test workspace.
+fn data_dir() -> PathBuf {
+    let d = std::env::temp_dir().join(format!("tole-delegate-data-{}", std::process::id()));
+    std::fs::create_dir_all(&d).unwrap();
+    d.canonicalize().unwrap()
+}
+
+fn log_file(root: &Path) -> PathBuf {
+    log_path(&data_dir(), root).unwrap()
 }
 
 fn host(root: &Path, secs: u64, allow: &[&str], src: &str) -> std::sync::Arc<Delegator> {
@@ -90,10 +102,7 @@ fn poll_done(poll: &DelegatePollTool, out: &Value) -> Value {
 }
 
 fn log_of(root: &Path) -> Delegation<FileStore> {
-    Delegation::open(FileStore::new(
-        tole_core::agents::agents_dir(root).join(LOG_FILE),
-    ))
-    .unwrap()
+    Delegation::open(FileStore::new(log_file(root))).unwrap()
 }
 
 const PROFILE: &str = "[delegation]\ngoal_budget = 1000\ngoal_steps = 100\n\
@@ -256,8 +265,7 @@ fn the_machine_guard_queues_and_a_poll_starts_the_queued_child() {
     assert!(b.get("agent").is_none(), "nothing spawned yet");
     // A child that can write the queue file tries to widen its sibling:
     // the launch takes allow, budget and secrets from the log instead.
-    let qfile = tole_core::agents::agents_dir(&root)
-        .join(LOG_FILE)
+    let qfile = log_file(&root)
         .with_extension("queued")
         .join(format!("{}.json", b["node"].as_str().unwrap()));
     let mut forged: Value = serde_json::from_slice(&std::fs::read(&qfile).unwrap()).unwrap();
@@ -318,7 +326,7 @@ fn only_a_session_the_tree_lets_delegate_gets_the_tool() {
     let out = start
         .execute(json!({"task": "t", "mode": "consult"}))
         .unwrap();
-    let log = tole_core::agents::agents_dir(&root).join(LOG_FILE);
+    let log = log_file(&root);
     let node = out["node"].as_str().unwrap().to_string();
     let child_env = |k: &str| match k {
         "TOLE_AGENT_DEPTH" => Some("1".to_string()),
@@ -332,7 +340,7 @@ fn only_a_session_the_tree_lets_delegate_gets_the_tool() {
             root.clone(),
             false,
             vec![],
-            Setup::default(),
+            setup(""),
             env,
         )
     };
@@ -343,5 +351,79 @@ fn only_a_session_the_tree_lets_delegate_gets_the_tool() {
     // A classic agent_start child (depth 1, no delegation) gets none either.
     assert!(make(&|k: &str| (k == "TOLE_AGENT_DEPTH").then(|| "1".into())).is_none());
     assert!(make(&|_| None).is_some(), "a root session does");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn the_log_is_outside_the_workspace_and_forged_spawns_launch_nothing() {
+    let root = tmp("forged");
+    let h = host(
+        &root,
+        0,
+        &["write_*"],
+        "[delegation]\nmax_live_processes = 1\n",
+    );
+    let (start, poll) = tools(&h, &root);
+    let a = start
+        .execute(json!({"task": "a", "mode": "consult"}))
+        .unwrap();
+    let log = log_file(&root);
+    assert!(
+        !log.starts_with(&root),
+        "{} is inside the workspace",
+        log.display()
+    );
+    assert!(log.is_file());
+    // Someone with write access to the log appends spawns that break caps:
+    // a wider allow list, a budget past the carve, an unknown parent.
+    let goal = a["node"]
+        .as_str()
+        .unwrap()
+        .rsplit_once('.')
+        .unwrap()
+        .0
+        .to_string();
+    let forged = |node: &str, parent: &str, allow: Value, tokens: u64| {
+        json!({"v": 1, "kind": "spawn", "node_id": node, "parent_id": parent,
+            "profile": "x", "task": "forged", "mode": "execute",
+            "budget": {"tokens": tokens, "steps": 1, "deadline": now() + 60},
+            "allow": allow, "dropped": [], "workspace": root.to_str().unwrap(), "at": 0})
+        .to_string()
+    };
+    let mut lines = String::new();
+    for l in [
+        forged(&format!("{goal}.2"), &goal, json!(["*"]), 10),
+        forged(
+            &format!("{goal}.2"),
+            &goal,
+            json!(["write_file"]),
+            1_000_000_000,
+        ),
+        forged("zz.1", "zz", json!(["write_file"]), 10),
+    ] {
+        lines.push_str(&l);
+        lines.push('\n');
+    }
+    use std::io::Write as _;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&log)
+        .unwrap()
+        .write_all(lines.as_bytes())
+        .unwrap();
+    wait_for(&agent_dir_of(&root, &a).join("env"));
+    let p = poll_done(&poll, &a);
+    assert_eq!(
+        p["delegation"]["started_from_queue"],
+        json!([]),
+        "nothing forged is launched: {p}"
+    );
+    let d = log_of(&root);
+    assert!(d.poll(&format!("{goal}.2")).is_none() && d.poll("zz.1").is_none());
+    // The legitimate flow still works after the forged lines.
+    let b = start
+        .execute(json!({"task": "b", "mode": "consult"}))
+        .unwrap();
+    assert_eq!(b["node"], json!(format!("{goal}.2")));
     let _ = std::fs::remove_dir_all(&root);
 }
