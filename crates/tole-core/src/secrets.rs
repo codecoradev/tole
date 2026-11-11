@@ -217,6 +217,33 @@ impl SecretSet {
         Cow::Owned(out)
     }
 
+    /// [`SecretSet::redact`] over every string (object keys included) of a
+    /// JSON value. Structure-preserving: a redaction can never break the
+    /// JSON, which redacting its serialized text could (a value containing
+    /// `","` would match across two fields).
+    pub fn redact_value(&self, value: &serde_json::Value) -> serde_json::Value {
+        use serde_json::Value;
+        if self.is_empty() {
+            return value.clone();
+        }
+        match value {
+            Value::String(s) => Value::String(self.redact(s).into_owned()),
+            Value::Array(a) => Value::Array(a.iter().map(|v| self.redact_value(v)).collect()),
+            Value::Object(o) => Value::Object(
+                o.iter()
+                    .map(|(k, v)| (self.redact(k).into_owned(), self.redact_value(v)))
+                    .collect(),
+            ),
+            // A secret of digits can be a bare JSON number; it becomes the
+            // marker string, which keeps the JSON valid.
+            Value::Number(n) => match self.redact(&n.to_string()) {
+                Cow::Owned(r) => Value::String(r),
+                Cow::Borrowed(_) => value.clone(),
+            },
+            other => other.clone(),
+        }
+    }
+
     fn build(entries: impl IntoIterator<Item = (String, String)>) -> Self {
         let mut inner = Inner::default();
         for (name, value) in entries {
@@ -565,6 +592,29 @@ mod tests {
                 "{url}"
             );
         }
+    }
+
+    #[test]
+    fn redact_value_keeps_the_json_structure() {
+        // A value that spans two fields if the serialized text were redacted.
+        let s = set(&[("X_TOKEN", r#"a","b":"c"#)]);
+        let v = serde_json::json!({"a": "x", "b": ["c", {"k a\",\"b\":\"c": r#"pre a","b":"c post"#}], "n": 1});
+        let out = s.redact_value(&v);
+        assert_eq!(
+            out,
+            serde_json::json!({"a": "x", "b": ["c", {"k «X_TOKEN»": "pre «X_TOKEN» post"}], "n": 1})
+        );
+        assert_eq!(SecretSet::default().redact_value(&v), v);
+    }
+
+    #[test]
+    fn redact_value_turns_a_secret_number_into_the_marker_string() {
+        let s = set(&[("PIN_SECRET", "12345678")]);
+        let v = serde_json::json!({"pin": 12345678, "other": 87654321, "f": 1.5});
+        assert_eq!(
+            s.redact_value(&v),
+            serde_json::json!({"pin": "«PIN_SECRET»", "other": 87654321, "f": 1.5})
+        );
     }
 
     /// Throughput measurement, not a gate (no timing assertion): run with

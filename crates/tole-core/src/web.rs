@@ -14,6 +14,7 @@
 //! text-only (no JS, no browser), size-capped, content-type
 //! allowlisted.
 
+use crate::secrets::SecretSet;
 use crate::tool::{Risk, Tool};
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -438,7 +439,54 @@ fn cap_chars(s: &str, cap: usize) -> String {
 /// `web_fetch`: GET a public http(s) URL, allowlist the content type,
 /// cap the body, HTML → text. Read-only and jail-free by design: the
 /// internet is not the workspace.
-pub struct WebFetchTool;
+#[derive(Default)]
+pub struct WebFetchTool {
+    /// A URL carrying a known secret is refused (#595). Empty by default.
+    secrets: SecretSet,
+}
+
+impl WebFetchTool {
+    /// Refuse URLs that carry any of these secrets (#595).
+    pub fn with_secrets(mut self, secrets: &SecretSet) -> Self {
+        self.secrets = secrets.clone();
+        self
+    }
+}
+
+/// #595: a URL is where an exfiltration hides (`https://x/?k=<secret>`), and
+/// a redacted URL would fetch something else, so a URL that carries a known
+/// secret is refused. The error shows the redacted form only.
+fn refuse_secret_url(secrets: &SecretSet, url: &str) -> Result<(), String> {
+    match secrets.redact(url) {
+        std::borrow::Cow::Borrowed(_) => Ok(()),
+        std::borrow::Cow::Owned(r) => Err(format!(
+            "web_fetch: refused, the URL contains a known secret value: {r}"
+        )),
+    }
+}
+
+/// The `(NAME, value)` of every `${NAME}` referenced by the web backend
+/// header settings (`TOLE_WEB_SEARCH_HEADERS`, `TOLE_WEB_FETCH_HEADERS`),
+/// for [`SecretSet::collect`]: a header value is a secret bound to its
+/// backend whatever its variable is called (#595). Unset variables and
+/// malformed settings are skipped here (tool construction reports them).
+pub fn header_secrets(env: &dyn Fn(&str) -> Option<String>) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for var in [SEARCH_HEADERS_ENV, FETCH_HEADERS_ENV] {
+        let Some(raw) = env(var) else { continue };
+        let mut rest = raw.as_str();
+        while let Some(start) = rest.find("${") {
+            let after = &rest[start + 2..];
+            let Some(end) = after.find('}') else { break };
+            let name = &after[..end];
+            if let Some(value) = env(name).filter(|v| !v.is_empty()) {
+                out.push((name.to_string(), value));
+            }
+            rest = &after[end + 1..];
+        }
+    }
+    out
+}
 
 impl Tool for WebFetchTool {
     fn name(&self) -> &str {
@@ -472,6 +520,7 @@ impl Tool for WebFetchTool {
             .filter(|u| !u.is_empty())
             .ok_or("web_fetch: 'url' is required")?
             .to_string();
+        refuse_secret_url(&self.secrets, &url)?;
         if !(url.starts_with("http://") || url.starts_with("https://")) {
             return Err("web_fetch: only http(s) URLs".into());
         }
@@ -719,6 +768,8 @@ pub struct WebSearchTool {
     method: SearchMethod,
     headers: Vec<(String, String)>,
     fields: SearchFields,
+    /// Known secrets redacted from the query (#595). Empty by default.
+    secrets: SecretSet,
 }
 
 impl WebSearchTool {
@@ -729,7 +780,14 @@ impl WebSearchTool {
             method: SearchMethod::Get,
             headers: Vec::new(),
             fields: SearchFields::default(),
+            secrets: SecretSet::default(),
         }
+    }
+
+    /// Redact these secrets from every query sent to the backend (#595).
+    pub fn with_secrets(mut self, secrets: &SecretSet) -> Self {
+        self.secrets = secrets.clone();
+        self
     }
 
     /// Probe-gated construction from the process environment: `Ok(None)`
@@ -773,6 +831,7 @@ impl WebSearchTool {
             method,
             headers,
             fields,
+            secrets: SecretSet::default(),
         }))
     }
 }
@@ -804,6 +863,9 @@ impl Tool for WebSearchTool {
             .map(str::trim)
             .filter(|q| !q.is_empty())
             .ok_or("web_search: 'query' is required")?;
+        // #595: the query is model-written and goes to a third party.
+        let redacted = self.secrets.redact(query);
+        let query = redacted.as_ref();
         let agent = agent();
         let sent = match self.method {
             SearchMethod::Get => {
@@ -881,6 +943,8 @@ pub struct WebBackendFetchTool {
     method: SearchMethod,
     headers: Vec<(String, String)>,
     content_field: String,
+    /// A target URL carrying a known secret is refused (#595).
+    secrets: SecretSet,
 }
 
 impl WebBackendFetchTool {
@@ -891,7 +955,14 @@ impl WebBackendFetchTool {
             method: SearchMethod::Get,
             headers: Vec::new(),
             content_field: "content".into(),
+            secrets: SecretSet::default(),
         }
+    }
+
+    /// Refuse target URLs that carry any of these secrets (#595).
+    pub fn with_secrets(mut self, secrets: &SecretSet) -> Self {
+        self.secrets = secrets.clone();
+        self
     }
 
     /// `Ok(None)` when `TOLE_WEB_FETCH_URL` is unset or blank; an error
@@ -955,6 +1026,7 @@ impl WebBackendFetchTool {
             method,
             headers,
             content_field,
+            secrets: SecretSet::default(),
         }))
     }
 
@@ -1003,6 +1075,7 @@ impl Tool for WebBackendFetchTool {
             .map(str::trim)
             .filter(|u| !u.is_empty())
             .ok_or("web_fetch: 'url' is required")?;
+        refuse_secret_url(&self.secrets, target)?;
         Self::vet_target(target)?;
         let agent = agent();
         let sent = match self.method {
@@ -1243,7 +1316,7 @@ mod tests {
         );
 
         // Fetch an HTML page: text extracted.
-        let fetch = WebFetchTool;
+        let fetch = WebFetchTool::default();
         let out = fetch
             .execute(json!({"url": format!("{base}/page")}))
             .unwrap();
@@ -1634,6 +1707,74 @@ mod tests {
         WebBackendFetchTool::from_lookup(&lookup(&pairs))
             .unwrap()
             .unwrap()
+    }
+
+    // ---- known-secret redaction (#595) ----
+
+    fn web_secrets() -> SecretSet {
+        SecretSet::collect(
+            [(
+                "TOLE_TEST_WEB_TOKEN".to_string(),
+                "web-secret/0123456".to_string(),
+            )],
+            std::iter::empty(),
+        )
+    }
+
+    #[test]
+    fn search_query_reaches_the_backend_redacted() {
+        let (addr, rx) = mock_backend(200, json!({"results": []}).to_string());
+        let t = WebSearchTool::new(format!("http://{addr}/search")).with_secrets(&web_secrets());
+        let out = t
+            .execute(json!({"query": "leak web-secret/0123456 now"}))
+            .unwrap();
+        let req = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let line = req.lines().next().unwrap();
+        assert!(!req.contains("web-secret"), "{req}");
+        // `«`/`»` are percent-encoded on the wire.
+        assert!(line.contains("TOLE_TEST_WEB_TOKEN"), "{line}");
+        assert_eq!(out["query"], "leak «TOLE_TEST_WEB_TOKEN» now");
+    }
+
+    #[test]
+    fn fetch_urls_carrying_a_known_secret_are_refused_before_any_request() {
+        let direct = WebFetchTool::default().with_secrets(&web_secrets());
+        // Unroutable on purpose: a refusal must happen before any I/O.
+        let err = direct
+            .execute(json!({"url": "http://192.0.2.1/?k=web-secret/0123456"}))
+            .unwrap_err();
+        assert!(
+            err.contains("known secret") && err.contains("«TOLE_TEST_WEB_TOKEN»"),
+            "{err}"
+        );
+        assert!(!err.contains("web-secret"), "{err}");
+        let backend =
+            WebBackendFetchTool::new("http://192.0.2.1/fetch").with_secrets(&web_secrets());
+        // Percent-encoded form of the value is caught too.
+        let err = backend
+            .execute(json!({"url": "https://example.com/p?k=web-secret%2F0123456"}))
+            .unwrap_err();
+        assert!(err.contains("known secret"), "{err}");
+    }
+
+    #[test]
+    fn header_secrets_are_the_expanded_header_variables() {
+        let env = lookup(&[
+            (
+                SEARCH_HEADERS_ENV,
+                "Authorization=Bearer ${NGX_KEY}, X-Other=${UNSET}",
+            ),
+            (FETCH_HEADERS_ENV, "X-Key=${FETCH_KEY}"),
+            ("NGX_KEY", "ngx-value-0123"),
+            ("FETCH_KEY", "fetch-value-0123"),
+        ]);
+        assert_eq!(
+            header_secrets(&env),
+            vec![
+                ("NGX_KEY".to_string(), "ngx-value-0123".to_string()),
+                ("FETCH_KEY".to_string(), "fetch-value-0123".to_string()),
+            ]
+        );
     }
 
     #[test]

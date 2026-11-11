@@ -347,7 +347,16 @@ pub fn remember(
     let Some(mem) = memory else {
         return;
     };
-    match tole_core::memory::remember_session(mem, session_id, first_prompt, last_answer, wrote) {
+    // #595: the summary leaves the process; known secrets never do.
+    let secrets = crate::provider_chain::process_secrets(&crate::config_apply::real_env);
+    match tole_core::memory::remember_session(
+        mem,
+        session_id,
+        first_prompt,
+        last_answer,
+        wrote,
+        &secrets,
+    ) {
         Ok(_) => eprintln!("tole: memory: session summary stored in room {}", mem.room),
         Err(e) => eprintln!("tole: memory remember failed (session unaffected): {e}"),
     }

@@ -794,6 +794,9 @@ pub struct McpTool {
     /// The SERVER-side tool name (what the wire call must use).
     server_tool: String,
     description: String,
+    /// Known secrets redacted from the arguments before they are sent to
+    /// the server (#595). Empty by default.
+    secrets: crate::secrets::SecretSet,
 }
 
 impl McpTool {
@@ -803,7 +806,14 @@ impl McpTool {
             name,
             server_tool,
             description,
+            secrets: crate::secrets::SecretSet::default(),
         }
+    }
+
+    /// Redact these secrets from the arguments sent to the server (#595).
+    pub fn with_secrets(mut self, secrets: &crate::secrets::SecretSet) -> Self {
+        self.secrets = secrets.clone();
+        self
     }
 }
 
@@ -880,7 +890,11 @@ impl Tool for McpTool {
     }
 
     fn execute(&self, input: Value) -> Result<Value, String> {
-        let args = input.get("arguments").cloned().unwrap_or(json!({}));
+        // #595: a server never receives a known secret value, whatever the
+        // model put in the arguments.
+        let args = self
+            .secrets
+            .redact_value(input.get("arguments").unwrap_or(&json!({})));
         let (tx, rx) = mpsc::channel();
         runtime()
             .send(McpRequest::Call {
@@ -1082,10 +1096,12 @@ const LIST_SYNC_BUDGET: Duration =
 
 /// Register tools from `cfg` into `reg`. Startup-degrading: any failure
 /// is a warning, never an error (same contract as the uteke probe).
-/// Returns the names registered (empty on failure).
+/// Returns the names registered (empty on failure). Every tool redacts
+/// `secrets` from the arguments it sends (#595).
 pub fn register_server_tools(
     reg: &mut crate::tool::ToolRegistry,
     cfg: &McpServerConfig,
+    secrets: &crate::secrets::SecretSet,
 ) -> Vec<String> {
     let mut registered = Vec::new();
     let start = Instant::now();
@@ -1123,12 +1139,15 @@ pub fn register_server_tools(
                 let mut mcp_name = format!("mcp_{}_{}", cfg.name, sanitized);
                 mcp_name.truncate(64);
                 if reg
-                    .register(Box::new(McpTool::new(
-                        cfg.name.clone(),
-                        mcp_name.clone(),
-                        server_tool.clone(),
-                        description,
-                    )))
+                    .register(Box::new(
+                        McpTool::new(
+                            cfg.name.clone(),
+                            mcp_name.clone(),
+                            server_tool.clone(),
+                            description,
+                        )
+                        .with_secrets(secrets),
+                    ))
                     .is_ok()
                 {
                     registered.push(mcp_name);

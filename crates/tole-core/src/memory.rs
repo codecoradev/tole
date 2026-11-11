@@ -230,13 +230,15 @@ pub fn recall_block(cfg: &MemoryConfig, query: &str) -> Result<String, String> {
 const MAX_REMEMBER_CHARS: usize = 2000;
 
 /// Store the post-session summary. Returns the raw CLI output (id line)
-/// on success.
+/// on success. Known `secrets` are redacted from the summary before it
+/// leaves the process (#595): the store may be a cloud one.
 pub fn remember_session(
     cfg: &MemoryConfig,
     session_id: &str,
     first_prompt: &str,
     last_answer: &str,
     wrote: bool,
+    secrets: &crate::secrets::SecretSet,
 ) -> Result<String, String> {
     fn cap(s: &str, max: usize) -> String {
         let t = s.trim();
@@ -247,11 +249,13 @@ pub fn remember_session(
         }
         out
     }
+    // Redact before capping: a cap must never cut a secret in half and
+    // leave a prefix the redactor no longer recognizes.
     let content = format!(
         "[tole session {}] {} → {}",
         session_id,
-        cap(first_prompt, 300),
-        cap(last_answer, 1200)
+        cap(&secrets.redact(first_prompt), 300),
+        cap(&secrets.redact(last_answer), 1200)
     );
     if content.chars().count() > MAX_REMEMBER_CHARS {
         // Belt-and-suspenders: never dump oversized payloads into the
@@ -491,8 +495,15 @@ mod tests {
             room: "repo-tole".into(),
             limit: 3,
         };
-        let out =
-            remember_session(&cfg, "s-abc", "fix the jail", "done — tests added", false).unwrap();
+        let out = remember_session(
+            &cfg,
+            "s-abc",
+            "fix the jail",
+            "done — tests added",
+            false,
+            &Default::default(),
+        )
+        .unwrap();
         assert!(out.contains("id: mem-123"));
         let argv = std::fs::read_to_string(&log).unwrap();
         assert!(argv.contains("remember [tole session s-abc] fix the jail → done — tests added"));
@@ -528,7 +539,15 @@ mod tests {
             room: "repo-tole".into(),
             limit: 3,
         };
-        remember_session(&cfg, "s-def", "add the jail", "done", true).unwrap();
+        remember_session(
+            &cfg,
+            "s-def",
+            "add the jail",
+            "done",
+            true,
+            &Default::default(),
+        )
+        .unwrap();
         let argv = std::fs::read_to_string(&log).unwrap();
         assert!(argv.contains("--type decision"));
         assert!(argv.contains("--tags tole,session,wrote"));
@@ -557,10 +576,67 @@ mod tests {
             room: "repo-tole".into(),
             limit: 3,
         };
-        remember_session(&cfg, "s-abc", "multi\nline\nprompt", "answer", false).unwrap();
+        remember_session(
+            &cfg,
+            "s-abc",
+            "multi\nline\nprompt",
+            "answer",
+            false,
+            &Default::default(),
+        )
+        .unwrap();
         let argv = std::fs::read_to_string(&log).unwrap();
         assert!(!argv.contains('\n') || argv.lines().count() == 1);
         assert!(argv.contains("multi line prompt"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #595: the session summary leaves the process (uteke cloud when
+    /// configured) without any known secret value, even one the 1200-char
+    /// cap would otherwise cut in half.
+    #[test]
+    fn remember_redacts_known_secrets_before_capping() {
+        let dir = std::env::temp_dir().join(format!("tole-mem-595-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("uteke");
+        let log = dir.join("argv.log");
+        std::fs::write(
+            &bin,
+            format!("#!/bin/sh\necho \"$@\" > {}\necho ok\n", log.display()),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let cfg = MemoryConfig {
+            bin: bin.display().to_string(),
+            room: "repo-tole".into(),
+            limit: 3,
+        };
+        let secret = "mem-secret-abcdefgh";
+        let secrets = crate::secrets::SecretSet::collect(
+            [("TOLE_TEST_MEM_TOKEN".to_string(), secret.to_string())],
+            std::iter::empty(),
+        );
+        // The secret straddles the answer's 1200-char cap.
+        // The cap keeps 1200 chars: 1190 + "mem-secret", a prefix the redactor
+        // could no longer recognize if it ran after the cap.
+        let answer = format!("{}{secret}", "a".repeat(1190));
+        remember_session(
+            &cfg,
+            "s-595",
+            &format!("use {secret}"),
+            &answer,
+            false,
+            &secrets,
+        )
+        .unwrap();
+        let argv = std::fs::read_to_string(&log).unwrap();
+        assert!(argv.contains("use «TOLE_TEST_MEM_TOKEN»"), "{argv}");
+        assert!(!argv.contains("mem-secret"), "{argv}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

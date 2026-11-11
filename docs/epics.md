@@ -275,8 +275,9 @@ Bot and Nakama; BMAD for collaboration). Design notes:
   pinned core (#590), approved-hash loading (#591), propose-only growth with
   meaning dedup (#592), curator on by default (#593).
 - **E4 — Secrets and third-party plugins, epic #594:**
-  - `SecretSet` at every sink (#595; in progress: module, provider body and
-    child minimum env done, remaining sinks next);
+  - `SecretSet` at every sink (#595; module, provider body, child minimum
+    env, MCP arguments, web, `systemone`, memory loop and `uteke_document`
+    done; export, handoff, digests and skill drafts reuse it as they land);
   - redacted session log (#596);
   - shared ruleset with uteke (#597);
   - scoped release, with no secrets for `run_command` (#598, breaking);

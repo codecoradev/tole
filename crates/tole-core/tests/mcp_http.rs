@@ -14,6 +14,7 @@ use tole_core::approval::AllowlistApprover;
 use tole_core::mcp::{
     get_server_prompt, probe_server_extras, register_server_tools, McpServerConfig,
 };
+use tole_core::secrets::SecretSet;
 use tole_core::tool::{Risk, Tool, ToolRegistry};
 
 #[derive(Clone, Debug)]
@@ -240,7 +241,7 @@ fn http_server_registers_tools_and_sends_the_env_token() {
         ..Default::default()
     });
     let mut reg = registry();
-    let names = register_server_tools(&mut reg, &cfg("httpa", &fake));
+    let names = register_server_tools(&mut reg, &cfg("httpa", &fake), &SecretSet::default());
     assert_eq!(names, vec!["mcp_httpa_echo".to_string()]);
 
     let tool = reg.get("mcp_httpa_echo").unwrap();
@@ -263,7 +264,7 @@ fn http_server_registers_tools_and_sends_the_env_token() {
 fn http_server_without_a_token_sends_no_authorization() {
     let fake = start(Behavior::default());
     let mut reg = registry();
-    let names = register_server_tools(&mut reg, &cfg("httpb", &fake));
+    let names = register_server_tools(&mut reg, &cfg("httpb", &fake), &SecretSet::default());
     assert_eq!(names, vec!["mcp_httpb_echo".to_string()]);
     assert!(!fake.seen().is_empty());
     assert!(fake
@@ -318,7 +319,7 @@ fn cross_origin_redirect_is_not_followed() {
 fn dropped_connection_evicts_and_the_next_call_reconnects() {
     let fake = start(Behavior::default());
     let mut reg = registry();
-    register_server_tools(&mut reg, &cfg("httpe", &fake));
+    register_server_tools(&mut reg, &cfg("httpe", &fake), &SecretSet::default());
     let tool = reg.get("mcp_httpe_echo").unwrap();
     assert_eq!(echo(tool, "one").unwrap(), "echo:one");
 
@@ -389,6 +390,27 @@ fn an_unparseable_url_built_without_parse_is_an_error_and_the_reactor_survives()
     // The reactor still serves a healthy server afterwards.
     let fake = start(Behavior::default());
     let mut reg = registry();
-    let names = register_server_tools(&mut reg, &cfg("httpg", &fake));
+    let names = register_server_tools(&mut reg, &cfg("httpg", &fake), &SecretSet::default());
     assert_eq!(names, vec!["mcp_httpg_echo".to_string()]);
+}
+
+/// #595: a known secret in the model's arguments never reaches the server;
+/// the echo proves what the server received.
+#[test]
+fn known_secrets_are_redacted_from_tool_arguments() {
+    let fake = start(Behavior::default());
+    let mut reg = registry();
+    let secrets = SecretSet::collect(
+        [(
+            "TOLE_TEST_ARG_TOKEN".to_string(),
+            "mcp-arg-secret-12345".to_string(),
+        )],
+        std::iter::empty(),
+    );
+    register_server_tools(&mut reg, &cfg("httph", &fake), &secrets);
+    let tool = reg.get("mcp_httph_echo").unwrap();
+    assert_eq!(
+        echo(tool, "key=mcp-arg-secret-12345").unwrap(),
+        "echo:key=«TOLE_TEST_ARG_TOKEN»"
+    );
 }
