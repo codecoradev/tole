@@ -26,9 +26,11 @@
 //! - the run_command/job_start bypass (spawning `tole` by name) is
 //!   closed in child mode by `check_child_agent_argv` (wired via
 //!   `in_child_mode` on those tools).
-//! - env: the child INHERITS the parent env (it needs the provider
-//!   key) — the normal secret scrub is deliberately NOT applied here;
-//!   isolation comes from depth + jail + policy visibility instead.
+//! - env: the child gets the ENV-1-scrubbed parent env plus only the
+//!   provider keys it needs (`child_env::PROVIDER_SECRETS`, #595); every
+//!   other secret-shaped variable (MCP tokens, the serve token, ...) is
+//!   removed. `GITHUB_TOKEN` stays, as for every child process (#598
+//!   revisits it).
 
 use crate::tool::{Risk, Tool};
 use serde_json::{json, Value};
@@ -805,9 +807,13 @@ impl Tool for AgentStartTool {
             .map_err(|e| format!("agent_start: log: {e}"))?;
 
         let mut cmd = Command::new(&self.bin);
-        // Deliberately NO env scrub: the child IS a tole session and
-        // needs the provider key. Isolation = depth cap + jail + the
-        // approved child allowlist (see the module doc).
+        // The child IS a tole session: it gets the scrubbed env plus its
+        // provider keys and nothing else secret (#595). Isolation beyond
+        // that = depth cap + jail + the approved child allowlist.
+        crate::subprocess::scrub_env_for_child_keeping(
+            &mut cmd,
+            &crate::child_env::PROVIDER_SECRETS,
+        );
         // The launch contract (child_env): depth 1, the child's identity
         // and the touch log shared with its siblings (#380), its mailbox
         // room, and for a role child its role and handoff file (#383).
@@ -1457,6 +1463,50 @@ mod tests {
                 "all siblings of one parent share one log"
             );
         }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// #595: the child keeps its provider key and plain settings, but no
+    /// other secret of the parent (it inherited the full env before).
+    #[cfg(unix)]
+    #[test]
+    fn child_env_has_its_provider_key_but_no_other_secret() {
+        let d = tmp("minenv");
+        // TOLE_FALLBACK_API_KEY stands in for the provider keys: nothing in
+        // tole-core reads it, so setting it cannot disturb parallel tests.
+        std::env::set_var("TOLE_FALLBACK_API_KEY", "sk-child-needs-this");
+        std::env::set_var("TOLE_TEST_595_MCP_TOKEN", "parent-only-secret");
+        std::env::set_var("TOLE_TEST_595_PLAIN", "plain-setting");
+        let p = d.join("dump-env");
+        let dump = d.join("env.txt");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n%s\\n%s\\n' \"$TOLE_FALLBACK_API_KEY\" \"$TOLE_TEST_595_MCP_TOKEN\" \"$TOLE_TEST_595_PLAIN\" > \"{}.tmp\" && mv \"{0}.tmp\" \"{0}\"\nexit 0\n",
+            dump.display()
+        );
+        std::fs::write(&p, script).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755));
+        AgentStartTool::new(&p, d.clone())
+            .execute(json!({"prompt": "x"}))
+            .unwrap();
+        std::env::remove_var("TOLE_FALLBACK_API_KEY");
+        std::env::remove_var("TOLE_TEST_595_MCP_TOKEN");
+        std::env::remove_var("TOLE_TEST_595_PLAIN");
+        let mut dumped = None;
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if let Ok(t) = std::fs::read_to_string(&dump) {
+                dumped = Some(t);
+                break;
+            }
+        }
+        let dumped = dumped.expect("child never dumped its env");
+        let lines: Vec<&str> = dumped.lines().collect();
+        assert_eq!(
+            lines,
+            vec!["sk-child-needs-this", "", "plain-setting"],
+            "provider key kept, other secret removed, plain var kept"
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 

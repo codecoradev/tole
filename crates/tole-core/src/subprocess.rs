@@ -53,28 +53,25 @@ fn recv_with_grace<T>(rx: &mpsc::Receiver<T>) -> Option<T> {
 /// means the name contains API_KEY/APIKEY, SECRET, TOKEN, PASSWORD/PASSWD,
 /// CREDENTIAL, or PRIVATE_KEY (case-insensitive substring, so
 /// `SECRET_KEY`, `AUTHTOKEN`, `DB_PASSWD` are covered — #284).
-/// Exceptions: GITHUB_TOKEN is kept — gh/git push
+/// The name rule is [`crate::secrets::is_secret_name`], shared with the
+/// egress redactor (#595).
+/// Exception: GITHUB_TOKEN is kept — gh/git push
 /// auth needs it, and its scope is documented in the threat model.
 pub fn scrub_env_for_child(cmd: &mut Command) -> &mut Command {
-    // TOKENIZERS_PARALLELISM is a non-secret HF tuning knob that the
-    // broader TOKEN match would otherwise sweep up.
-    const KEEP: [&str; 2] = ["GITHUB_TOKEN", "TOKENIZERS_PARALLELISM"];
+    scrub_env_for_child_keeping(cmd, &[])
+}
+
+/// [`scrub_env_for_child`] that also keeps the secret-shaped names in
+/// `keep` (exact, case-insensitive). Child agents use it to receive their
+/// provider key and nothing else (#595).
+pub fn scrub_env_for_child_keeping<'a>(cmd: &'a mut Command, keep: &[&str]) -> &'a mut Command {
+    const KEEP: [&str; 1] = ["GITHUB_TOKEN"];
     for (k, _) in std::env::vars_os() {
         let Some(name) = k.to_str() else { continue };
         let upper = name.to_ascii_uppercase();
-        let secret_shaped = [
-            "API_KEY",
-            "APIKEY",
-            "SECRET",
-            "TOKEN",
-            "PASSWORD",
-            "PASSWD",
-            "CREDENTIAL",
-            "PRIVATE_KEY",
-        ]
-        .iter()
-        .any(|m| upper.contains(m));
-        if secret_shaped && !KEEP.contains(&upper.as_str()) {
+        let kept =
+            KEEP.contains(&upper.as_str()) || keep.iter().any(|n| n.eq_ignore_ascii_case(&upper));
+        if crate::secrets::is_secret_name(name) && !kept {
             cmd.env_remove(name);
         }
     }

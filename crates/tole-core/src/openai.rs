@@ -10,6 +10,7 @@
 
 use crate::cancel::CancelToken;
 use crate::provider::{Provider, ProviderError, ProviderOutput};
+use crate::secrets::SecretSet;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -265,6 +266,9 @@ pub struct OpenAiProvider {
     effort_named_in_400: bool,
     /// Describes the LAST `complete()` call only: it ran degraded.
     last_degraded_obj: Option<Value>,
+    /// Known secret values redacted from the request body and from every
+    /// error (E11, generalized by #595). Always holds the provider key.
+    secrets: SecretSet,
 }
 
 impl std::fmt::Debug for OpenAiProvider {
@@ -286,6 +290,7 @@ impl OpenAiProvider {
     pub fn new(cfg: OpenAiConfig) -> Self {
         let timeout = Duration::from_secs(120);
         let agent = Self::build_chat_agent(timeout);
+        let secrets = provider_secrets(&SecretSet::default(), &cfg);
         Self {
             cfg,
             timeout,
@@ -306,10 +311,20 @@ impl OpenAiProvider {
             effort_rejected: false,
             effort_named_in_400: false,
             last_degraded_obj: None,
+            secrets,
             streaming: std::env::var("TOLE_STREAM")
                 .map(|v| v != "0")
                 .unwrap_or(true),
         }
+    }
+
+    /// Redact these known secrets (#595: env secrets, header expansions,
+    /// URL passwords) from every request body and error, in addition to
+    /// this provider's own key and base-URL password, which are always
+    /// redacted.
+    pub fn with_secrets(mut self, secrets: &SecretSet) -> Self {
+        self.secrets = provider_secrets(secrets, &self.cfg);
+        self
     }
 
     /// Override the streaming default (tests; `TOLE_STREAM=0` sets the
@@ -400,16 +415,18 @@ impl OpenAiProvider {
     /// the child `tool_result`/`error` settlement becomes the matching
     /// `role:"tool"` message. State records stay in the durable log only.
     ///
-    /// E11: any occurrence of the API key inside message text is redacted
-    /// before the body goes over the wire — the durable log keeps the
-    /// original (local), the provider never sees the key.
+    /// E11 / #595: every known secret value (the API key, plus the set
+    /// given to [`OpenAiProvider::with_secrets`]) inside message text, tool
+    /// arguments, tool results and the system prompt becomes `«NAME»` before
+    /// the body goes over the wire — the durable log keeps the original
+    /// (local), the provider never sees the value.
     /// Public for the eval harness (issue #73): wire-shape stability is
     /// a behavioral contract that must be assertable from outside the
     /// crate. Production code paths keep using it internally.
     pub fn request_body(&self, transcript: &[Entry]) -> Value {
         let mut messages: Vec<Value> = Vec::new();
         if let Some(sys) = &self.system_prompt {
-            messages.push(json!({ "role": "system", "content": sys }));
+            messages.push(json!({ "role": "system", "content": self.secrets.redact(sys) }));
         }
         // Intent ids, for the tool-message parent check below (scan-3: a
         // tool_result/error whose parent is NOT an intent must never
@@ -427,7 +444,7 @@ impl OpenAiProvider {
                         e.payload
                             .get("text")
                             .and_then(Value::as_str)
-                            .map(|t| scrub(t, &self.cfg.api_key)),
+                            .map(|t| self.secrets.redact(t)),
                     ) else {
                         continue;
                     };
@@ -479,7 +496,7 @@ impl OpenAiProvider {
                         "function": {
                             "name": tool,
                             // E11 covers the tool-call arguments too.
-                            "arguments": scrub(&input.to_string(), &self.cfg.api_key),
+                            "arguments": self.secrets.redact(&input.to_string()),
                         },
                     });
                     // #480: a batch member joins the assistant message that
@@ -529,10 +546,7 @@ impl OpenAiProvider {
                     messages.push(json!({
                         "role": "tool",
                         "tool_call_id": parent,
-                        "content": fence_tool_result(&scrub(
-                            &content.to_string(),
-                            &self.cfg.api_key,
-                        )),
+                        "content": fence_tool_result(&self.secrets.redact(&content.to_string())),
                     }));
                 }
                 _ => {}
@@ -725,7 +739,7 @@ impl OpenAiProvider {
                 } else {
                     "stream read"
                 };
-                ProviderError(scrub(&format!("{head}: {e}"), &self.cfg.api_key))
+                ProviderError(self.secrets.redact(&format!("{head}: {e}")).into_owned())
             })?;
             if self.abort.as_ref().is_some_and(CancelToken::is_cancelled) {
                 return Err(ProviderError(CANCELLED_CALL.into()));
@@ -745,10 +759,11 @@ impl OpenAiProvider {
                 break;
             }
             let chunk: Value = serde_json::from_str(data).map_err(|e| {
-                ProviderError(scrub(
-                    &format!("malformed stream chunk: {e}"),
-                    &self.cfg.api_key,
-                ))
+                ProviderError(
+                    self.secrets
+                        .redact(&format!("malformed stream chunk: {e}"))
+                        .into_owned(),
+                )
             })?;
             if let Some(u) = chunk.get("usage").filter(|u| u.is_object()) {
                 self.last_usage_obj = Some(u.clone());
@@ -914,7 +929,7 @@ impl OpenAiProvider {
             .post(&url)
             .header("Authorization", format!("Bearer {}", self.cfg.api_key))
             .send_json(&body)
-            .map_err(|e| ProviderError(scrub(&e.to_string(), &self.cfg.api_key)))?;
+            .map_err(|e| ProviderError(self.secrets.redact(&e.to_string()).into_owned()))?;
         // HTTP status FIRST (cora full-scan #46): a non-2xx body is often
         // HTML/error JSON that read_json would mangle into a misleading
         // "malformed response". Surface status + Retry-After + scrubbed
@@ -927,7 +942,9 @@ impl OpenAiProvider {
                 .get("retry-after")
                 .and_then(|v| v.to_str().ok())
                 .map(|v| {
-                    scrub(v, &self.cfg.api_key)
+                    self.secrets
+                        .redact(v)
+                        .into_owned()
                         .chars()
                         .take(64)
                         .collect::<String>()
@@ -938,7 +955,7 @@ impl OpenAiProvider {
                 .into_body()
                 .read_to_string()
                 .unwrap_or_else(|_| "<unreadable body>".to_string());
-            let body_text = scrub(&body_text, &self.cfg.api_key);
+            let body_text = self.secrets.redact(&body_text).into_owned();
             let snippet: String = body_text.chars().take(200).collect();
             let lower = body_text.to_ascii_lowercase();
             self.effort_named_in_400 = status.as_u16() == 400 && lower.contains("reasoning_effort");
@@ -977,7 +994,7 @@ impl OpenAiProvider {
         let resp_body = resp
             .body_mut()
             .read_json::<Value>()
-            .map_err(|e| ProviderError(scrub(&e.to_string(), &self.cfg.api_key)))?;
+            .map_err(|e| ProviderError(self.secrets.redact(&e.to_string()).into_owned()))?;
         // Capture provider-reported usage (issue: status showed 0/0) —
         // exposed via `last_usage` for the turn loop's durable ledger.
         self.last_usage_obj = resp_body.get("usage").cloned().filter(Value::is_object);
@@ -1106,19 +1123,22 @@ pub(crate) fn fence_tool_result(content: &str) -> String {
 pub(crate) const TOOL_RESULT_BEGIN: &str = "<<<TOOL_RESULT_BEGIN>>>";
 pub(crate) const TOOL_RESULT_END: &str = "<<<TOOL_RESULT_END>>>";
 
-/// Remove any accidental occurrence of the secret from an error string.
-/// An empty secret is a no-op: `contains("")` is always true and
-/// `replace("", …)` would splice the redaction marker between every
-/// character, mangling the whole message (CodeCora scan 2026-09-18).
+/// The provider's own redaction set: `base` plus its key and any password
+/// in its base URL. The key is always redacted, whatever `base` holds.
+fn provider_secrets(base: &SecretSet, cfg: &OpenAiConfig) -> SecretSet {
+    base.with(ENV_API_KEY, &cfg.api_key)
+        .with_url_password("TOLE_BASE_URL_PASSWORD", &cfg.base_url)
+}
+
+/// Remove any accidental occurrence of `secret` from an error string; a
+/// caller of [`SecretSet`] (#595), so an empty or short (< 8 chars) secret
+/// is a no-op instead of splicing markers everywhere (CodeCora scan
+/// 2026-09-18).
 fn scrub(msg: &str, secret: &str) -> String {
-    if secret.is_empty() {
-        return msg.to_string();
-    }
-    if msg.contains(secret) {
-        msg.replace(secret, "<redacted>")
-    } else {
-        msg.to_string()
-    }
+    SecretSet::default()
+        .with(ENV_API_KEY, secret)
+        .redact(msg)
+        .into_owned()
 }
 
 /// Probe the provider's `GET /models` endpoint (issue #195): the model
@@ -1408,7 +1428,7 @@ mod tests {
             "request to https://x failed with sk-secret-abc",
             "sk-secret-abc",
         );
-        assert_eq!(out, "request to https://x failed with <redacted>");
+        assert_eq!(out, "request to https://x failed with «TOLE_API_KEY»");
     }
 }
 
@@ -1764,7 +1784,7 @@ mod transcript_tests {
             "api key leaked in request body: {serialized}"
         );
         assert!(
-            serialized.contains("<redacted>"),
+            serialized.contains("«TOLE_API_KEY»"),
             "redaction marker missing: {serialized}"
         );
     }
@@ -1786,7 +1806,7 @@ mod transcript_tests {
             .as_str()
             .unwrap();
         assert!(!args.contains(key), "api key leaked in arguments: {args}");
-        assert!(args.contains("<redacted>"), "{args}");
+        assert!(args.contains("«TOLE_API_KEY»"), "{args}");
     }
 
     #[test]
@@ -1804,6 +1824,61 @@ mod transcript_tests {
             json!("key: sk-super-secret-456"),
             "durable log must keep the original text"
         );
+    }
+
+    #[test]
+    fn request_body_redacts_every_known_secret_at_every_wire_field() {
+        // #595: not only the provider key: any secret of the injected set,
+        // in its raw and base64 forms, in the system prompt, message text,
+        // tool arguments and tool results.
+        let other = "mcp-tok-0123456789abcdef";
+        let set = crate::secrets::SecretSet::collect(
+            [("TOLE_MCP_X_TOKEN".to_string(), other.to_string())],
+            std::iter::empty(),
+        );
+        let p = OpenAiProvider::new(OpenAiConfig::new(
+            "https://u:pw-in-the-url-1@x.example/v1",
+            "m",
+            "sk-super-secret-123",
+        ))
+        .with_secrets(&set)
+        .with_system_prompt(format!("system knows {other}"));
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(other);
+        let mut intent = msg("intent_1", "assistant", "");
+        intent.kind = EntryType::new("intent");
+        intent.payload = json!({ "tool": "mcp_x_call", "input": { "q": other } });
+        let mut result = msg("r1", "assistant", "");
+        result.kind = EntryType::new("tool_result");
+        result.parent_id = Some("intent_1".into());
+        result.payload = json!({ "output": { "basic": b64, "key": "sk-super-secret-123" } });
+        let transcript = vec![
+            msg("e1", "user", &format!("{other} and pw-in-the-url-1")),
+            intent,
+            result,
+        ];
+        let wire = p.request_body(&transcript).to_string();
+        for leaked in [
+            other,
+            b64.trim_end_matches('='),
+            "sk-super-secret-123",
+            "pw-in-the-url-1",
+        ] {
+            assert!(!wire.contains(leaked), "{leaked} leaked: {wire}");
+        }
+        assert_eq!(wire.matches("«TOLE_MCP_X_TOKEN»").count(), 4, "{wire}");
+        assert!(wire.contains("«TOLE_API_KEY»") && wire.contains("«TOLE_BASE_URL_PASSWORD»"));
+        // The provider key stays redacted even when the injected set is empty.
+        let bare = OpenAiProvider::new(OpenAiConfig::new(
+            "https://x/v1",
+            "m",
+            "sk-super-secret-123",
+        ))
+        .with_secrets(&crate::secrets::SecretSet::default());
+        let wire = bare
+            .request_body(&[msg("e1", "user", "sk-super-secret-123")])
+            .to_string();
+        assert!(!wire.contains("sk-super-secret-123"), "{wire}");
     }
     #[test]
     fn user_message_with_a_missing_image_degrades_to_a_text_note() {
@@ -2150,7 +2225,9 @@ mod http_error_tests {
             body.len(),
         );
         let err = complete_err(url, false);
-        assert!(err.starts_with("http status: 503 Service Unavailable — <html>key <redacted> xxx"));
+        assert!(
+            err.starts_with("http status: 503 Service Unavailable — <html>key «TOLE_API_KEY» xxx")
+        );
         assert!(!err.contains("sk-secret"));
         let snippet = err.split_once(" — ").unwrap().1;
         assert_eq!(snippet.chars().count(), 200);

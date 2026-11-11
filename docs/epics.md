@@ -253,7 +253,7 @@ Owner discussion 2026-11-11 (competitor audit of OpenClaw, Hermes, Grok
 Bot and Nakama; BMAD for collaboration). Design notes:
 `docs/automation-design.md`, `docs/profiles-collaboration-secrets.md`,
 `docs/skills-registry-design.md`, `docs/secrets-integrations-design.md`,
-`docs/third-party-plugins-design.md`. Nothing implemented yet; 1 issue =
+`docs/third-party-plugins-design.md`. Implementation started (status per item); 1 issue =
 1 branch = 1 PR.
 
 - **E1 — Automation, epic #577:** ledger core (#578), `tole cron` (#579),
@@ -272,7 +272,8 @@ Bot and Nakama; BMAD for collaboration). Design notes:
   pinned core (#590), approved-hash loading (#591), propose-only growth with
   meaning dedup (#592), curator on by default (#593).
 - **E4 — Secrets and third-party plugins, epic #594:**
-  - `SecretSet` at every sink (#595);
+  - `SecretSet` at every sink (#595; in progress: module, provider body and
+    child minimum env done, remaining sinks next);
   - redacted session log (#596);
   - shared ruleset with uteke (#597);
   - scoped release, with no secrets for `run_command` (#598, breaking);

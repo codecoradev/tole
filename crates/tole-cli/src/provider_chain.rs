@@ -13,6 +13,7 @@
 use tole_core::failover::{FailoverProvider, Link};
 use tole_core::openai::{OpenAiConfig, OpenAiProvider};
 use tole_core::provider::Provider;
+use tole_core::secrets::SecretSet;
 
 pub const ENV_FALLBACK_BASE_URL: &str = "TOLE_FALLBACK_BASE_URL";
 pub const ENV_FALLBACK_MODEL: &str = "TOLE_FALLBACK_MODEL";
@@ -63,17 +64,21 @@ pub fn build(
     env: &dyn Fn(&str) -> Option<String>,
     configure: impl Fn(OpenAiProvider) -> OpenAiProvider,
 ) -> Result<Box<dyn Provider>, String> {
+    // #595: every known secret of this process is redacted from what the
+    // provider sees, not only its own key. Collected once per session build.
+    let secrets = SecretSet::from_env();
+    let make = |cfg: OpenAiConfig| configure(OpenAiProvider::new(cfg).with_secrets(&secrets));
     let Some(reserve) = fallback_config(&primary, env)? else {
-        return Ok(Box::new(configure(OpenAiProvider::new(primary))));
+        return Ok(Box::new(make(primary)));
     };
     let chain = vec![
         Link {
             label: label("primary", &primary),
-            provider: Box::new(configure(OpenAiProvider::new(primary))),
+            provider: Box::new(make(primary)),
         },
         Link {
             label: label("fallback", &reserve),
-            provider: Box::new(configure(OpenAiProvider::new(reserve))),
+            provider: Box::new(make(reserve)),
         },
     ];
     Ok(Box::new(FailoverProvider::new(chain)))
