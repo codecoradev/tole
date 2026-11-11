@@ -3,12 +3,24 @@
 //!
 //! OSC 52 ("Manipulate Selection Data") is `ESC ] 52 ; Pc ; Pd ST`, where
 //! `Pc` names the selection (`c` = clipboard) and `Pd` is the data in
-//! base64; xterm accepts BEL as well as `ESC \` as the terminator. Source:
-//! xterm "Control Sequences" (ctlseqs), OSC Ps = 52, and the kitty / WezTerm
-//! clipboard docs. NOTE: the sandbox this was written in could not reach
-//! those sites, so the format is from the author's knowledge of that
-//! document and was NOT re-read on 2026-11-11; it is the one sequence every
-//! OSC 52 terminal documents, and the e2e test pins the exact bytes.
+//! base64; xterm accepts BEL as well as `ESC \` as the terminator.
+//!
+//! Sources, read on 2026-11-11:
+//! - Ghostty, "Query or change data on clipboards (OSC 52)": the sequence is
+//!   `ESC ] 52 ; t ; d ESC \`; `t` lists clipboard types "as defined by
+//!   xterm" (`c` standard clipboard, `p` primary, `q` secondary, `s`
+//!   selection, `0`-`7` cut buffers); `d` is base64 for the new data, and a
+//!   `d` that is neither valid base64 nor `?` CLEARS the listed clipboards
+//!   (so this module never sends an empty or invalid payload).
+//! - foot, `foot-ctlseqs(7)`: `ESC ] 52 ; Pc ; Pd ESC \` "Copy Pd (base64
+//!   encoded text) to the clipboard", `c` targets the clipboard.
+//! - xterm's own ctlseqs page (invisible-island.net) was NOT read directly:
+//!   that host is outside the session's network allowlist. The xterm side
+//!   (`Ps = 5 2`, `Pt` parsed as `Pc ; Pd`, BEL and ST both accepted as the
+//!   OSC terminator) rests on search excerpts of that document and on the
+//!   charmbracelet `x/ansi` docs, which list both `ST` and `BEL` forms.
+//!   BEL is kept as the terminator for the widest compatibility; the e2e
+//!   test pins the exact bytes.
 //!
 //! Safety: the payload is ONLY base64 of the answer (alphabet `A-Za-z0-9+/=`),
 //! so answer text can never carry an ESC, BEL or `]52;` into the stream.
