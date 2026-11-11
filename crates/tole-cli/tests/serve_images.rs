@@ -344,17 +344,12 @@ fn bad_uploads_and_prompts_are_refused() {
         PNG,
     );
     assert_eq!(r.code, 401);
-    // Without the token the upload ceiling is the plain 1 MiB body cap.
-    let mut s = std::net::TcpStream::connect(("127.0.0.1", serve.port)).unwrap();
-    write!(
-        s,
-        "POST /sessions/{id}/images HTTP/1.1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        2 * 1024 * 1024
-    )
-    .unwrap();
-    let mut out = String::new();
-    let _ = s.read_to_string(&mut out);
-    assert!(out.starts_with("HTTP/1.1 413"), "{out}");
+    // Over the plain 1 MiB body cap without the token: still 401, not 413,
+    // so the answer does not depend on the token outside the limiter.
+    assert!(
+        oversized_upload(&serve, &id, None).starts_with("HTTP/1.1 401"),
+        "unauthenticated oversized upload"
+    );
     assert_eq!(get_image(&serve, &id, "0123456789abcdef", false).code, 401);
     // Nothing was stored by any refused upload (the 415 above included).
     let stored = std::fs::read_dir(home(&serve).join("tole/images/serve").join(&id))
@@ -376,6 +371,42 @@ fn bad_uploads_and_prompts_are_refused() {
         );
         assert_eq!(code, want, "{images}: {body}");
     }
+}
+
+/// Declares a 2 MiB upload body (over the 1 MiB pre-auth cap, under the
+/// 10 MiB image cap) with `bearer` as the token and returns the raw answer.
+fn oversized_upload(serve: &Serve, id: &str, bearer: Option<&str>) -> String {
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", serve.port)).unwrap();
+    let auth = bearer
+        .map(|t| format!("Authorization: Bearer {t}\r\n"))
+        .unwrap_or_default();
+    write!(
+        s,
+        "POST /sessions/{id}/images HTTP/1.1\r\n{auth}Content-Length: {}\r\nConnection: close\r\n\r\n",
+        2 * 1024 * 1024
+    )
+    .unwrap();
+    let mut out = String::new();
+    let _ = s.read_to_string(&mut out);
+    out
+}
+
+/// The upload ceiling depends on the token, so an oversized declared body
+/// must not become a token-validity oracle: a wrong token gets the same 401
+/// as any request, counts as an auth failure, and hits the per-IP limiter.
+#[test]
+fn an_oversized_upload_with_a_wrong_token_is_401_and_rate_limited() {
+    let (base, _seen) = recording_mock();
+    let serve = spawn(&base, &[]);
+    let id = new_session(&serve);
+    for i in 0..tole_cli::auth::MAX_AUTH_FAILURES {
+        let out = oversized_upload(&serve, &id, Some("wrong-token"));
+        assert!(out.starts_with("HTTP/1.1 401"), "attempt {i}: {out}");
+    }
+    // The limiter now refuses this IP, even for the right token.
+    let out = oversized_upload(&serve, &id, Some("wrong-token"));
+    assert!(out.starts_with("HTTP/1.1 429"), "{out}");
+    assert_eq!(get_image(&serve, &id, "0123456789abcdef", true).code, 429);
 }
 
 #[test]

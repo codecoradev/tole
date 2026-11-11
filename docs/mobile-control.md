@@ -193,7 +193,10 @@ curl -H "Authorization: Bearer $TOKEN" -o shot.png \
   `X-Content-Type-Options: nosniff` and `Cache-Control: private, no-store`.
 - **Limits.** An upload body may be up to 10 MiB, and only once the headers carry the right
   token: without it the plain 1 MiB body cap applies, so nothing larger is buffered before
-  auth. An authenticated upload body gets 120 s instead of the usual 15 s read budget. Uploads
+  auth. A declared body over the cap is authenticated before it is answered: a wrong or
+  missing token gets the usual `401` and counts against the per-IP auth limiter (`429` after
+  10 failures a minute), and only the right token gets `413`, so the size answer is never a
+  token check outside the limiter. An authenticated upload body gets 120 s instead of the usual 15 s read budget. Uploads
   count within the server's 32-connection cap. Quotas on the stored uploads, in bytes:
   `TOLE_SERVE_IMAGE_SESSION_QUOTA` per session (default 64 MiB) and
   `TOLE_SERVE_IMAGE_TOTAL_QUOTA` across all serve sessions (default 512 MiB); `0` disables

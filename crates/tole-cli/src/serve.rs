@@ -189,8 +189,12 @@ enum ReadError {
     Io,
     /// Syntactically unacceptable request: answered with 400.
     Bad(&'static str),
-    /// Declared body over the ceiling: answered with 413.
-    TooLarge,
+    /// Declared body over the ceiling. Carries the `Authorization` header
+    /// so the caller authenticates (and rate-limits) before answering: a
+    /// 413 only for the right token, otherwise the same 401 a small body
+    /// gets. The ceiling depends on the token, so answering 413 before
+    /// auth would be a token-validity oracle outside the limiter (#558).
+    TooLarge { authorization: Option<String> },
 }
 
 /// Ceiling for the request line + all header bytes combined: a client
@@ -317,7 +321,8 @@ fn read_request(stream: &TcpStream, token: &str) -> Result<Request, ReadError> {
         MAX_BODY_BYTES
     };
     if content_length > ceiling {
-        return Err(ReadError::TooLarge); // refuse rather than buffer it
+        // Refuse rather than buffer it.
+        return Err(ReadError::TooLarge { authorization });
     }
     if upload {
         reader.get_mut().deadline = Instant::now() + UPLOAD_READ_DEADLINE;
@@ -395,12 +400,29 @@ fn handle_conn(mut stream: TcpStream, state: Arc<State>) {
             respond(&mut stream, 400, &json!({"error": msg}));
             return;
         }
-        Err(ReadError::TooLarge) => {
-            respond(
-                &mut stream,
-                413,
-                &json!({"error": "request body too large"}),
-            );
+        Err(ReadError::TooLarge { authorization }) => {
+            // Authenticate first, through the same limiter as every other
+            // request, so the answer never tells a wrong token from a right
+            // one without a recorded failure.
+            let peer_ip = stream.peer_addr().ok().map(|a| a.ip());
+            if peer_ip.is_some_and(|ip| state.auth_failures.is_limited(ip)) {
+                respond(
+                    &mut stream,
+                    429,
+                    &json!({"error": "too many failed auth attempts"}),
+                );
+            } else if !tole_cli::auth::bearer_matches(authorization.as_deref(), &state.token) {
+                if let Some(ip) = peer_ip {
+                    state.auth_failures.record_failure(ip);
+                }
+                respond(&mut stream, 401, &json!({"error": "unauthorized"}));
+            } else {
+                respond(
+                    &mut stream,
+                    413,
+                    &json!({"error": "request body too large"}),
+                );
+            }
             return;
         }
     };
