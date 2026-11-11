@@ -203,7 +203,13 @@ Not a sandbox: review what it wrote before you run it), `--skill <path>` (load a
 ### Image input
 
 `tole run|chat|mission --image <path|data-url>` (repeatable) attaches images to the first message
-(#212). A path must resolve **inside the workspace jail** (symlinks and `..` escapes are refused);
+(#212). Any later message can carry images too (#559): in `tole chat`, type `/image <path|data-url>`
+to queue one for your next message (`/image` lists the queue, `/image clear` empties it; a message
+that could not be recorded keeps its images queued). `tole acp` accepts ACP `image` content blocks
+(base64 `data`), advertises `promptCapabilities.image`, and runs an image-only prompt; the blocks
+take the same spill-and-reference path as a `data:` URL, the declared `mimeType` is not trusted
+(the bytes are sniffed), the optional `uri` is never read, and audio or embedded-resource blocks are
+still ignored. A path must resolve **inside the workspace jail** (symlinks and `..` escapes are refused);
 an inline `data:image/…;base64,…` URL is spilled to `~/.codecora/tole/images/` first. PNG, JPEG,
 GIF and WebP (sniffed from the bytes), 10 MiB each. The wire carries OpenAI-compatible
 `image_url` content parts; the session log stores only the reference (`path`, `mime`, `bytes`,
@@ -211,7 +217,9 @@ GIF and WebP (sniffed from the bytes), 10 MiB each. The wire carries OpenAI-comp
 the hash (a changed or missing file reaches the model as an `[image unavailable: …]` note, never
 silently). Images are input, not tools: no approval is involved. They cost tokens on every step
 (the data URL counts in the request's `tole_wire.history_chars`). Needs a vision model; a
-non-vision model is a loud `model-capability` error, not a dropped image.
+non-vision model is a loud `model-capability` error, not a dropped image. Image content is
+untrusted input (text inside an image can carry instructions, like a fetched web page). There is
+**no model-callable image tool**: images are always supplied by the user (see the threat model).
 
 ### Provider retries
 

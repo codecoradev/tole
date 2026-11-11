@@ -541,8 +541,8 @@ enum Command {
         #[arg(long)]
         yes: bool,
 
-        /// Attach an image to the first message/turn (#212); same
-        /// semantics as `run --image`.
+        /// Attach an image to the first message (#212); same semantics as
+        /// `run --image`. Later messages: type `/image <path>` in the chat.
         #[arg(long = "image")]
         images: Vec<String>,
     },
@@ -2434,7 +2434,8 @@ fn chat_command(
     allow_patterns: &[String],
     yes: bool,
     host: &HostConfig,
-    // Attached to the first message only (#212).
+    // `--image`: attached to the first message (#212); `/image` queues more
+    // for any later message (#559).
     mut pending_images: Vec<tole_core::image::ImageRef>,
 ) -> Result<()> {
     use std::io::{BufRead, Write};
@@ -2521,7 +2522,7 @@ fn chat_command(
         tool_roster::register_todo(&mut registry, storage.entries(), host.plan_mode)?;
     }
     println!(
-        "tole chat — session {session_id} (Ctrl-D exits, resume: tole chat --resume {session_id})"
+        "tole chat — session {session_id} (Ctrl-D exits, /image <path> attaches to the next message, resume: tole chat --resume {session_id})"
     );
 
     // B2: fresh sessions pin the resolved prompt; resumed sessions re-apply
@@ -2626,6 +2627,38 @@ fn chat_command(
                     storage.state().seq,
                     storage.entries().len()
                 );
+                continue;
+            }
+            // #559: `/image <path|data: URL>` queues an image for the NEXT
+            // message (same jail, cap and sniffing as `--image`); a bare
+            // `/image` lists the queue, `/image clear` empties it.
+            t if t == "/image" || t.starts_with("/image ") => {
+                match t["/image".len()..].trim() {
+                    "" => {
+                        println!(
+                            "tole> {} image(s) queued for your next message",
+                            pending_images.len()
+                        );
+                        for r in &pending_images {
+                            println!("  {} ({}, {} bytes)", r.path, r.mime, r.bytes);
+                        }
+                    }
+                    "clear" => {
+                        let n = pending_images.len();
+                        pending_images.clear();
+                        println!("tole> {n} queued image(s) dropped");
+                    }
+                    spec => match tole_cli::turn_runner::resolve_image(spec) {
+                        Ok(r) => {
+                            println!(
+                                "tole> image attached to your next message: {} ({}, {} bytes)",
+                                r.path, r.mime, r.bytes
+                            );
+                            pending_images.push(r);
+                        }
+                        Err(e) => eprintln!("tole> /image: {e}"),
+                    },
+                }
                 continue;
             }
             _ => {}
@@ -2767,6 +2800,15 @@ fn chat_command(
             // "your next message resumes" alone would let the operator
             // believe it was recorded (CodeCora scan 2026-09-18).
             eprintln!("tole> (note: the message you just typed was NOT recorded — resolve the session state, then resend it)");
+            // Its images were not recorded either: keep them queued for
+            // the resend (#559).
+            if !turn_images.is_empty() {
+                eprintln!(
+                    "tole> ({} image(s) stay queued for your next message)",
+                    turn_images.len()
+                );
+                pending_images.splice(0..0, turn_images);
+            }
         }
         // #143 (cora): a writing turn that ABORTED (provider failure,
         // loop guard, budget) still wrote to disk — the durable

@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use tole_core::approval::{ToolRequest, Verdict};
 use tole_core::cancel::CancelToken;
+use tole_core::image::ImageRef;
 use tole_core::openai::OpenAiConfig;
 use tole_core::storage::{is_valid_session_id, JsonlStorage, Storage};
 use tole_core::tool::ToolRegistry;
@@ -53,6 +54,8 @@ impl WindowSource for CachedWindow<'_> {
 struct Inner {
     storage: JsonlStorage,
     window: Option<Option<u64>>,
+    /// Images queued for the NEXT user message (#559); taken by `run_turn`.
+    pending_images: Vec<ImageRef>,
 }
 
 pub struct TuiSession {
@@ -83,6 +86,7 @@ impl TuiSession {
             inner: Mutex::new(Inner {
                 storage,
                 window: None,
+                pending_images: Vec::new(),
             }),
             registry,
             cfg,
@@ -170,7 +174,9 @@ pub fn footer_from(
 impl TuiHost for TuiSession {
     fn footer(&self) -> Footer {
         let mut g = self.lock();
-        let Inner { storage, window } = &mut *g;
+        let Inner {
+            storage, window, ..
+        } = &mut *g;
         let model = crate::turn_runner::session_model(&*storage, &self.cfg.model);
         let mut src = CachedWindow {
             catalog: ModelsCatalog::new(&self.cfg, &model),
@@ -191,6 +197,8 @@ impl TuiHost for TuiSession {
         observer: Arc<dyn TurnObserver>,
     ) -> TurnEnd {
         let mut g = self.lock();
+        // #559: images queued since the last message ride on this one.
+        let images = std::mem::take(&mut g.pending_images);
         let storage = &mut g.storage;
         let system_prompt = storage.system_prompt().map(str::to_string);
         // The TUI's differences from the server faces are explicit in the
@@ -205,7 +213,16 @@ impl TuiHost for TuiSession {
             resolve_parked: true,
             compaction: Some(self.compaction),
         };
-        match crate::turn_runner::run_turn_on(storage, &plan, prompt) {
+        let before = storage.entries().len();
+        let result = crate::turn_runner::run_turn_on_with_images(storage, &plan, prompt, &images);
+        // The message did not reach the log (a parked turn that did not
+        // settle, a provider that could not be built, ...): keep its images
+        // queued for the next message instead of losing them.
+        if !images.is_empty() && !records_images(&storage.entries()[before..]) {
+            let later = std::mem::replace(&mut g.pending_images, images);
+            g.pending_images.extend(later);
+        }
+        match result {
             Ok(o) => map(o),
             Err(crate::turn_runner::TurnRunError::Provider(e)) => TurnEnd::Stopped(e),
             Err(crate::turn_runner::TurnRunError::Storage(e)) => {
@@ -301,7 +318,9 @@ impl TuiSession {
 
     pub fn status_lines(&self) -> Vec<String> {
         let mut g = self.lock();
-        let Inner { storage, window } = &mut *g;
+        let Inner {
+            storage, window, ..
+        } = &mut *g;
         let model = crate::turn_runner::session_model(&*storage, &self.cfg.model);
         let mut src = CachedWindow {
             catalog: ModelsCatalog::new(&self.cfg, &model),
@@ -317,6 +336,45 @@ impl TuiSession {
     pub fn set_name(&self, name: &str) -> Result<(), String> {
         crate::session_settings::set_name(&mut self.lock().storage, name)
     }
+
+    /// Queue an image for the NEXT user message (#559): `spec` is a path
+    /// inside the workspace jail or an inline `data:image/…;base64,…` URL
+    /// (spilled to the data dir), exactly like `--image`. It is resolved
+    /// NOW, so a bad path is refused at attach time, and the reference
+    /// (never the blob) is what the next turn records. Returns the resolved
+    /// reference for the UI to show.
+    pub fn attach_image(&self, spec: &str) -> Result<ImageRef, String> {
+        let r = crate::turn_runner::resolve_image(spec)?;
+        self.attach_image_ref(r.clone());
+        Ok(r)
+    }
+
+    /// Queue an already-resolved reference for the next user message.
+    pub fn attach_image_ref(&self, image: ImageRef) {
+        self.lock().pending_images.push(image);
+    }
+
+    /// The images the next user message will carry, in attach order.
+    pub fn pending_images(&self) -> Vec<ImageRef> {
+        self.lock().pending_images.clone()
+    }
+
+    /// Drop every queued image; returns how many were queued.
+    pub fn clear_pending_images(&self) -> usize {
+        std::mem::take(&mut self.lock().pending_images).len()
+    }
+}
+
+/// Whether one of `entries` (those a turn just appended) is a user message
+/// carrying images.
+fn records_images(entries: &[tole_core::entry::Entry]) -> bool {
+    entries.iter().any(|e| {
+        e.payload["role"] == "user"
+            && e.payload
+                .get("images")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|a| !a.is_empty())
+    })
 }
 
 fn map(o: TurnOutcome) -> TurnEnd {
@@ -543,6 +601,90 @@ mod tests {
             s.apply(HostCmd::PickSession),
             Err("no session index".to_string())
         );
+    }
+
+    struct Quiet;
+    impl TurnObserver for Quiet {}
+
+    fn img(tag: &str) -> ImageRef {
+        ImageRef {
+            path: format!("/ws/{tag}.png"),
+            mime: "image/png".into(),
+            bytes: 33,
+            fnv1a64: format!("{tag:0>16}"),
+        }
+    }
+
+    fn user_messages(dir: &std::path::Path, id: &str) -> Vec<serde_json::Value> {
+        let raw = std::fs::read_to_string(dir.join(format!("{id}.jsonl"))).unwrap();
+        raw.lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .flat_map(|v| match v {
+                serde_json::Value::Array(a) => a,
+                one => vec![one],
+            })
+            .map(|v| v["payload"].clone())
+            .filter(|p| p["role"] == "user")
+            .collect()
+    }
+
+    /// #559: images queued on the host ride on the NEXT message only, and a
+    /// message that never reached the log keeps its images queued.
+    #[test]
+    fn pending_images_ride_on_the_next_message_only() {
+        let dir = tmp("images");
+        let s = session(&dir, "s-img");
+        let cancel = CancelToken::default();
+        let quiet: Arc<dyn TurnObserver> = Arc::new(Quiet);
+
+        // A path outside the (unset) jail is refused at attach time.
+        assert!(s.attach_image("/definitely/not/here.png").is_err());
+        assert!(s.pending_images().is_empty());
+
+        // A turn parked mid-flight (as after a crash): the next turn settles
+        // it first, which fails (the provider on port 9 is unreachable), so
+        // the new message is never recorded — and its image stays queued
+        // instead of being lost.
+        {
+            use tole_core::entry::{EntryType, NewEntry};
+            use tole_core::state::{Pc, StateTransition};
+            use tole_core::storage::Commit;
+            let mut g = s.lock();
+            let seq = g.storage.state().seq;
+            g.storage
+                .commit(
+                    Commit::new()
+                        .entry(NewEntry::root(
+                            EntryType::new(EntryType::MESSAGE),
+                            serde_json::json!({"role": "user", "text": "parked"}),
+                        ))
+                        .transition(StateTransition::from(seq, Pc::Planning)),
+                )
+                .unwrap();
+        }
+        s.attach_image_ref(img("a"));
+        let _ = s.run_turn("dropped", &cancel, Arc::clone(&quiet));
+        assert_eq!(user_messages(&dir, "s-img").len(), 1, "only the parked one");
+        assert_eq!(s.pending_images(), vec![img("a")], "kept for the resend");
+
+        // The failed settle closed the parked turn: the next message runs,
+        // and carries everything queued so far — the kept image first.
+        s.attach_image_ref(img("b"));
+        assert_eq!(s.pending_images(), vec![img("a"), img("b")]);
+        let _ = s.run_turn("look", &cancel, Arc::clone(&quiet));
+        assert!(s.pending_images().is_empty(), "taken by the turn");
+        let users = user_messages(&dir, "s-img");
+        assert_eq!(users.len(), 2);
+        assert!(users[0].get("images").is_none());
+        assert_eq!(users[1]["text"], "look");
+        assert_eq!(
+            users[1]["images"],
+            serde_json::json!([img("a").to_value(), img("b").to_value()])
+        );
+
+        s.attach_image_ref(img("c"));
+        assert_eq!(s.clear_pending_images(), 1);
+        assert!(s.pending_images().is_empty());
     }
 
     #[test]
