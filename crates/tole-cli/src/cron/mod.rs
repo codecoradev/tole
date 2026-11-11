@@ -11,13 +11,17 @@
 //! auto-approved), delivery targets ([`deliver`]), budgets (steps, minutes,
 //! tokens, and the user config's `cron.daily_token_cap`) and ticker
 //! liveness ([`status`]). A job that fails pre-dispatch validation (no
-//! provider, a bad or untrusted delivery target) is recorded as `blocked`
-//! before it runs.
+//! provider, a bad or untrusted delivery target, a skill that is gone, a
+//! profile the user config no longer defines) is recorded as `blocked`
+//! before it runs. Agent jobs take `--skill` and `--profile` ([`setup`]).
+//! A tick runs at most `cron.max_concurrent` (user config, default 4) at
+//! once.
 //!
 //! The cron dir is `$TOLE_CRON_DIR`, else `<codecora home>/tole/cron`.
 
 pub mod agent;
 pub mod deliver;
+pub mod setup;
 pub mod status;
 pub mod store;
 pub mod tick;
@@ -34,6 +38,8 @@ pub use tick::{tick, TickOptions, TickReport};
 
 /// Default per-run timeout of a script job, in seconds.
 pub const DEFAULT_TIMEOUT_SECS: u64 = 300;
+/// Runs one tick executes at once when `cron.max_concurrent` is unset.
+pub const DEFAULT_MAX_CONCURRENT: usize = 4;
 
 /// `tole cron <action>`. Parsed once per process, so the size difference
 /// between `Create` and the other variants costs nothing worth boxing.
@@ -45,6 +51,11 @@ pub enum CronAction {
     /// command (argv, no shell, zero tokens); otherwise PROMPT is an agent
     /// job: one session per run, Writes only via --allow (anything else is
     /// parked under `tole serve --cron`, refused by `tole cron tick`).
+    /// Agent jobs also take the global --skill (repeatable: a skill name
+    /// found from the workdir, or a SKILL.md file) and --profile NAME (a
+    /// user-config profile: persona, model, skills, memory room; Writes then
+    /// need both --allow and the profile's allow list). Both are validated
+    /// on save and before every run (a run without them is `blocked`).
     Create {
         schedule: String,
         /// The agent prompt (agent mode) or a free-text note (script mode).
@@ -149,8 +160,9 @@ pub enum CronAction {
     /// occurrences, run what is due (bounded concurrency), then exit.
     /// Host it from cron(8) or a systemd timer, e.g. every minute.
     Tick {
-        #[arg(long, default_value_t = 4)]
-        max_concurrent: usize,
+        /// [default: the user config's `cron.max_concurrent`, else 4]
+        #[arg(long)]
+        max_concurrent: Option<usize>,
     },
 }
 
@@ -158,6 +170,14 @@ pub enum CronAction {
 pub enum CatchUpArg {
     Skip,
     One,
+}
+
+/// The global `--skill` / `--profile` flags, which `cron create` and
+/// `cron edit` record in the job (#579).
+#[derive(Debug, Clone, Default)]
+pub struct JobGlobals {
+    pub skills: Vec<String>,
+    pub profile: Option<String>,
 }
 
 /// What `create` saves.
@@ -178,6 +198,12 @@ pub struct CreateSpec {
     pub max_minutes: Option<u64>,
     pub max_tokens: Option<u64>,
     pub deliver: Vec<String>,
+    pub skills: Vec<String>,
+    pub profile: Option<String>,
+    /// Pinned content hashes of `skills`, same order (`None`: pin now).
+    pub skill_hashes: Option<Vec<String>>,
+    /// Pinned hashes of the profile's skills (`None`: pin now).
+    pub profile_skill_hashes: Option<std::collections::BTreeMap<String, String>>,
     pub paused: bool,
 }
 
@@ -198,6 +224,8 @@ pub struct EditSpec {
     pub max_minutes: Option<u64>,
     pub max_tokens: Option<u64>,
     pub deliver: Vec<String>,
+    pub skills: Vec<String>,
+    pub profile: Option<String>,
 }
 
 /// The cron dir: `$TOLE_CRON_DIR`, else `<codecora home>/tole/cron`.
@@ -243,17 +271,29 @@ pub fn mode(job: &Job) -> &str {
     field(job, "mode").unwrap_or("agent")
 }
 
-/// The user config's `cron.daily_token_cap` (`None` when unset or the
-/// user config cannot be read; a broken file is reported).
-pub fn daily_token_cap() -> Option<u64> {
-    let path = crate::config::user_config_path().filter(|p| p.exists())?;
-    match crate::config::load(&path) {
-        Ok(c) => c.cron?.daily_token_cap,
+/// The user config's `[cron]` table (`None` when unset or the user config
+/// cannot be read; a broken file is reported).
+fn cron_config() -> Option<crate::config::CronConfig> {
+    match setup::user_config() {
+        Ok(c) => c?.cron,
         Err(e) => {
             eprintln!("tole cron: user config not applied: {e}");
             None
         }
     }
+}
+
+/// The user config's `cron.daily_token_cap`.
+pub fn daily_token_cap() -> Option<u64> {
+    cron_config()?.daily_token_cap
+}
+
+/// Runs one tick executes at once: `flag`, else the user config's
+/// `cron.max_concurrent`, else [`DEFAULT_MAX_CONCURRENT`].
+pub fn max_concurrent(flag: Option<usize>) -> usize {
+    flag.or_else(|| cron_config()?.max_concurrent)
+        .unwrap_or(DEFAULT_MAX_CONCURRENT)
+        .max(1)
 }
 
 /// Validates and saves a new job. Returns the saved record.
@@ -302,6 +342,31 @@ fn build_job(spec: CreateSpec, id: String, now: i64) -> anyhow::Result<Job> {
                 bail!("an agent job needs a PROMPT (or use --script)");
             }
             extra.insert("mode".into(), "agent".into());
+        }
+    }
+    if spec.script.is_some() && (!spec.skills.is_empty() || spec.profile.is_some()) {
+        bail!("--skill and --profile apply to agent jobs only, not --script");
+    }
+    if !spec.skills.is_empty() {
+        let (saved, hashes) = match spec.skill_hashes {
+            // An edit that did not touch --skill keeps the owner's pins.
+            Some(h) if h.len() == spec.skills.len() => (spec.skills.clone(), h),
+            _ => setup::pin_skills(&spec.skills, &spec.workdir)
+                .map_err(|e| anyhow!("--skill: {e}"))?,
+        };
+        extra.insert("skills".into(), json!(saved));
+        extra.insert("skill_hashes".into(), json!(hashes));
+    }
+    if let Some(name) = spec.profile.as_deref().map(str::trim) {
+        let profile = setup::resolve_profile(name).map_err(|e| anyhow!("--profile: {e}"))?;
+        let pins = match spec.profile_skill_hashes {
+            Some(p) => p,
+            None => setup::pin_profile(&profile, &spec.workdir)
+                .map_err(|e| anyhow!("--profile: {e}"))?,
+        };
+        extra.insert("profile".into(), name.into());
+        if !pins.is_empty() {
+            extra.insert("profile_skill_hashes".into(), json!(pins));
         }
     }
     if let Some(p) = &spec.prompt {
@@ -393,6 +458,15 @@ fn spec_of(job: &Job) -> CreateSpec {
         max_minutes: n("max_minutes"),
         max_tokens: n("max_tokens"),
         deliver: list("deliver"),
+        skills: list("skills"),
+        profile: s("profile"),
+        skill_hashes: Some(list("skill_hashes")),
+        profile_skill_hashes: Some(
+            job.extra
+                .get("profile_skill_hashes")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default(),
+        ),
         paused: job.paused,
     }
 }
@@ -439,6 +513,16 @@ pub fn edit(dir: &Path, key: &str, change: EditSpec, now: i64) -> anyhow::Result
         }
         if !change.deliver.is_empty() {
             spec.deliver = change.deliver;
+        }
+        // `--skill` / `--profile` re-pin (the owner chose the content now);
+        // any other edit keeps the pins taken when they were last chosen.
+        if !change.skills.is_empty() {
+            spec.skills = change.skills;
+            spec.skill_hashes = None;
+        }
+        if change.profile.is_some() {
+            spec.profile = change.profile;
+            spec.profile_skill_hashes = None;
         }
         let mut job = build_job(spec, old.id.clone(), now)?;
         if let Some(by) = old.extra.get("created_by") {
@@ -684,10 +768,19 @@ fn print_report(verb: &str, r: &TickReport) {
     }
 }
 
-/// Dispatch for `tole cron <action>` (prints to stdout).
-pub fn cli(action: CronAction) -> anyhow::Result<()> {
+/// Dispatch for `tole cron <action>` (prints to stdout). `globals` are the
+/// global `--skill` / `--profile` flags; only `create` and `edit` take them.
+pub fn cli(action: CronAction, globals: JobGlobals) -> anyhow::Result<()> {
     let dir = default_dir()?;
     let t = now();
+    let takes_globals = matches!(action, CronAction::Create { .. } | CronAction::Edit { .. });
+    if !takes_globals && (!globals.skills.is_empty() || globals.profile.is_some()) {
+        bail!("--skill and --profile apply to `cron create` and `cron edit` only");
+    }
+    let JobGlobals {
+        skills: skill,
+        profile,
+    } = globals;
     match action {
         CronAction::Create {
             schedule,
@@ -729,6 +822,10 @@ pub fn cli(action: CronAction) -> anyhow::Result<()> {
                     max_minutes,
                     max_tokens,
                     deliver,
+                    skills: skill,
+                    profile,
+                    skill_hashes: None,
+                    profile_skill_hashes: None,
                     paused,
                 },
                 t,
@@ -819,6 +916,8 @@ pub fn cli(action: CronAction) -> anyhow::Result<()> {
                 max_minutes,
                 max_tokens,
                 deliver,
+                skills: skill,
+                profile,
             };
             let j = edit(&dir, &job, change, t)?;
             let next = store::open_read(&dir)?.state().next_run(&j.id);
@@ -840,6 +939,7 @@ pub fn cli(action: CronAction) -> anyhow::Result<()> {
                 .map(|c| c.to_string())
                 .unwrap_or_else(|| "none".into());
             println!("tokens today (UTC): {} (daily cap: {cap})", st.tokens_today);
+            println!("runs per tick: at most {}", max_concurrent(None));
         }
         CronAction::Run { job } => {
             let opts = TickOptions {
@@ -853,10 +953,12 @@ pub fn cli(action: CronAction) -> anyhow::Result<()> {
                 println!("cancel requested: {f}");
             }
         }
-        CronAction::Tick { max_concurrent } => {
+        CronAction::Tick {
+            max_concurrent: flag,
+        } => {
             let opts = TickOptions {
                 daily_token_cap: daily_token_cap(),
-                ..TickOptions::standalone(max_concurrent)
+                ..TickOptions::standalone(max_concurrent(flag))
             };
             print_report("tick", &tick(&dir, t, &opts)?);
         }
@@ -873,7 +975,7 @@ pub fn cli(action: CronAction) -> anyhow::Result<()> {
 pub fn serve_ticker(dir: &Path, approvals: std::sync::Arc<crate::approvals::ApprovalQueue>) {
     loop {
         let opts = TickOptions {
-            max_concurrent: 4,
+            max_concurrent: max_concurrent(None),
             approvals: Some(std::sync::Arc::clone(&approvals)),
             daily_token_cap: daily_token_cap(),
         };

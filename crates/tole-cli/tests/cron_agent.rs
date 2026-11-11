@@ -319,7 +319,7 @@ fn a_cancelled_agent_run_settles_cancelled() {
     let job = cron::create(&dir, agent(&dir, "c", "LOOP forever"), T).unwrap();
     let cancel = tole_core::cancel::CancelToken::new();
     cancel.cancel();
-    let run = cron::agent::run_agent(&job, None, &cancel, 1_000);
+    let run = cron::agent::run_agent(&job, &Default::default(), None, &cancel, 1_000);
     assert_eq!(run.status, RunStatus::Cancelled, "{run:?}");
 }
 

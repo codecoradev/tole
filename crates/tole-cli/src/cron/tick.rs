@@ -113,6 +113,8 @@ pub struct Claimed {
     job: Job,
     /// Token budget of this run (agent mode).
     max_tokens: u64,
+    /// The job's skills and profile, resolved at claim time (agent mode).
+    setup: super::setup::AgentSetup,
 }
 
 /// What the claim phase knows (computed once per pass).
@@ -147,14 +149,27 @@ pub fn claim_one<S: tole_core::ledger::LedgerStore>(
     report: &mut TickReport,
 ) -> Result<Option<Claimed>, LedgerError> {
     let agent = mode(job) != "script";
+    let mut setup = super::setup::AgentSetup::default();
     if due.fire.is_some() {
         let invalid = if agent && !ctx.provider_ready {
             Some((
                 "provider_missing",
                 crate::turn_runner::MISSING_PROVIDER_CONFIG.to_string(),
             ))
+        } else if let Err(e) = deliver::check(job) {
+            Some(e)
+        } else if agent {
+            // A skill that is gone or a profile no longer defined blocks
+            // the run: it never runs without them.
+            match super::setup::resolve(job) {
+                Ok(s) => {
+                    setup = s;
+                    None
+                }
+                Err(e) => Some(e),
+            }
         } else {
-            deliver::check(job).err()
+            None
         };
         if let Some((code, detail)) = invalid {
             l.block(due, code, Some(detail), now)?;
@@ -181,6 +196,7 @@ pub fn claim_one<S: tole_core::ledger::LedgerStore>(
         max_tokens: left.map_or(job_max, |left| left.min(job_max)),
         fire,
         job: job.clone(),
+        setup,
     }))
 }
 
@@ -223,7 +239,13 @@ fn execute(dir: &Path, c: &Claimed, opts: &TickOptions) -> RunResult {
             output: out.stdout,
         }
     } else {
-        let run = super::agent::run_agent(&c.job, opts.approvals.as_ref(), &cancel, c.max_tokens);
+        let run = super::agent::run_agent(
+            &c.job,
+            &c.setup,
+            opts.approvals.as_ref(),
+            &cancel,
+            c.max_tokens,
+        );
         RunResult {
             status: run.status,
             usage: json!({

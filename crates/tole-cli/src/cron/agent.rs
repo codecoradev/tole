@@ -18,6 +18,11 @@
 //! turn and the run settles `budget`. The model pin overrides the env
 //! model for this run only. The caller's cancel token (`tole cron cancel`)
 //! settles `cancelled`.
+//!
+//! Skills and profile ([`super::setup`]): the run's system prompt is the
+//! profile's persona plus one section per skill; with a profile, a Write is
+//! auto-approved only when both the job's and the profile's allow lists
+//! cover it.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -68,9 +73,13 @@ enum Inner {
 }
 
 /// The unattended approver: the job's allowlist, else park (serve) or
-/// refuse (standalone). Remembers whether anything was refused.
+/// refuse (standalone). With a profile, a Write is auto-approved only when
+/// the job's AND the profile's allow lists both cover it. Remembers whether
+/// anything was refused.
 pub struct CronApprover {
     inner: Inner,
+    /// `[job, profile]` allowlists, both required (profiled jobs only).
+    both: Option<[AllowlistApprover; 2]>,
     refused: Arc<AtomicBool>,
 }
 
@@ -84,6 +93,11 @@ impl Approver for CronApprover {
     fn decide(&self, req: &ToolRequest<'_>) -> Verdict {
         if req.risk == Risk::ReadOnly {
             return Verdict::Allow;
+        }
+        if let Some(lists) = &self.both {
+            if lists.iter().all(|a| a.decide(req) == Verdict::Allow) {
+                return Verdict::Allow;
+            }
         }
         let v = match &self.inner {
             Inner::Allow(a) => a.decide(req),
@@ -100,18 +114,28 @@ impl Approver for CronApprover {
     }
 }
 
-/// Builds the approver for one run of `job` in session `session_id`.
+/// Builds the approver for one run of `job` in session `session_id`;
+/// `profile_allow` is the job's profile's allow list, if it has a profile.
 pub fn approver(
     job: &Job,
+    profile_allow: Option<&[String]>,
     queue: Option<&Arc<ApprovalQueue>>,
     session_id: &str,
     session_path: &Path,
 ) -> CronApprover {
-    let allow: Vec<String> = job
-        .extra
-        .get("allow")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default();
+    let job_allow = super::setup::list(job, "allow");
+    // With a profile the allowlists are checked together in `decide`; the
+    // inner approver then allows nothing on its own (park or refuse).
+    let (allow, both) = match profile_allow {
+        Some(p) => (
+            Vec::new(),
+            Some([
+                AllowlistApprover::allow_only(job_allow),
+                AllowlistApprover::allow_only(p.to_vec()),
+            ]),
+        ),
+        None => (job_allow, None),
+    };
     let inner = match queue {
         Some(q) => Inner::Queue(QueueApprover::new(
             allow,
@@ -123,6 +147,7 @@ pub fn approver(
     };
     CronApprover {
         inner,
+        both,
         refused: Arc::new(AtomicBool::new(false)),
     }
 }
@@ -224,9 +249,11 @@ fn u64_field(job: &Job, key: &str, default: u64) -> u64 {
 
 /// Runs one agent job to its terminal status with at most `max_tokens`
 /// tokens; `cancel` (shared with the caller) stops it as `cancelled`.
-/// Never panics on a broken job: every failure is an `error` with a reason.
+/// `setup` is the job's resolved skills and profile. Never panics on a
+/// broken job: every failure is an `error` with a reason.
 pub fn run_agent(
     job: &Job,
+    setup: &super::setup::AgentSetup,
     queue: Option<&Arc<ApprovalQueue>>,
     cancel: &CancelToken,
     max_tokens: u64,
@@ -244,9 +271,10 @@ pub fn run_agent(
         Ok(c) => c,
         Err(e) => return fail(None, e),
     };
-    if let Some(m) = field(job, "model") {
-        cfg.model = m.to_string();
+    if let Some(m) = setup.model(job) {
+        cfg.model = m;
     }
+    let system_prompt = setup.system_prompt();
     let canon = match Path::new(workdir).canonicalize() {
         Ok(p) => p,
         Err(e) => return fail(None, format!("workdir {workdir}: {e}")),
@@ -257,13 +285,14 @@ pub fn run_agent(
     };
     let session_id = crate::session_host::new_session_id("cron");
     let path = dir.join(format!("{session_id}.jsonl"));
-    let approver = approver(job, queue, &session_id, &path);
+    let profile_allow = setup.profile.as_ref().map(|p| p.allow.as_slice());
+    let approver = approver(job, profile_allow, queue, &session_id, &path);
     let refused = approver.refused();
-    let mut reg = match crate::tool_roster::build(approver, crate::tool_roster::Roster::new(canon))
-    {
-        Ok(r) => r,
-        Err(e) => return fail(None, e.to_string()),
-    };
+    let mut reg =
+        match crate::tool_roster::build(approver, crate::tool_roster::Roster::new(canon.clone())) {
+            Ok(r) => r,
+            Err(e) => return fail(None, e.to_string()),
+        };
     let name = field(job, "name").unwrap_or(&job.id).to_string();
     let mut storage = match crate::session_host::create_session(
         &dir,
@@ -291,14 +320,19 @@ pub fn run_agent(
     let plan = crate::turn_runner::TurnPlan {
         cfg: cfg.clone(),
         registry: &reg,
-        system_prompt: None,
+        system_prompt: system_prompt.as_deref(),
         cancel,
         observer: Some(&observer),
         resolve_parked: false,
         compaction: None,
     };
-    let provider =
-        crate::turn_runner::session_provider(cfg, &storage, reg.specs(), None, Some(&observer));
+    let provider = crate::turn_runner::session_provider(
+        cfg,
+        &storage,
+        reg.specs(),
+        system_prompt.as_deref(),
+        Some(&observer),
+    );
     let mut meter = match provider {
         Ok(inner) => TokenMeter {
             inner,
@@ -318,7 +352,9 @@ pub fn run_agent(
             trip(&timer_tripped, "time budget exceeded", &timer_cancel);
         }
     });
-    let outcome = crate::turn_runner::run_turn_with(&mut storage, &mut meter, &plan, prompt);
+    let memory = setup.memory(&canon);
+    let sent = crate::turn_runner::with_recalled_memory(memory.as_ref(), prompt);
+    let outcome = crate::turn_runner::run_turn_with(&mut storage, &mut meter, &plan, &sent);
     drop(done_tx);
     let _ = timer.join();
     let tokens = tole_core::transcript::tokens_in_out(storage.usages());
@@ -331,6 +367,9 @@ pub fn run_agent(
             }
         }
     };
+    if let TurnOutcome::Final { text, wrote } = &outcome {
+        crate::turn_runner::remember(memory.as_ref(), &session_id, prompt, text, *wrote);
+    }
     let refused = refused.load(Ordering::SeqCst);
     let tripped = *tripped.lock().unwrap_or_else(|p| p.into_inner());
     let (status, text, error) = match outcome {

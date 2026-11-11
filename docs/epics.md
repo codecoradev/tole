@@ -266,10 +266,11 @@ Bot and Nakama; BMAD for collaboration). Design notes:
   budgets), the `tole serve --cron` ticker and approvals parking, then
   delivery targets (`log`, `session`, `file:`, trust-gated `command:`,
   `GET /cron/runs`), `run`/`cancel`/`edit`/`status`, the token budget and
-  `cron.daily_token_cap`, and the `doctor` ticker check.
+  `cron.daily_token_cap`, and the `doctor` ticker check; the closing PR adds
+  `--skill` and `--profile` on `create`/`edit` and `cron.max_concurrent`.
 - **E2 — Profiles, delegation, discussion, routing, epic #583:**
   - profiles (#584; config, `--profile`, tiers, room and persona done in
-    the PR for #584; `tole cron create --profile` follows);
+    the PR for #584; `tole cron create --profile` in the #579 closing PR);
   - delegation with budget carve, depth 2 (max 3), write lease and a
     mandatory report (#585; the `tole_core::delegation` tree with all the
     caps is in, the delegate tool, `tole audit` and the profile wiring

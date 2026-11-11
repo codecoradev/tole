@@ -224,7 +224,7 @@ pub fn skill_file(workspace: Option<&Path>, name: &str) -> Option<PathBuf> {
 
 /// [`parse_skill`] plus the [`MAX_SKILL_CHARS`] cap: a skill as it enters
 /// the context.
-pub(crate) fn parse_loaded(content: &str, name: &str) -> Result<Skill, String> {
+pub fn parse_loaded(content: &str, name: &str) -> Result<Skill, String> {
     let mut skill = parse_skill(content, name)?;
     truncate_to_char_boundary(&mut skill.body, MAX_SKILL_CHARS);
     Ok(skill)
