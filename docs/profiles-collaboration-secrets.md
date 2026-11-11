@@ -237,6 +237,140 @@ write-up), issue #2211 (parallel execution request), and the v7 source of
 **Do not adopt:** stay-in-character theatrics, keepsake HTML, menus of
 two-letter codes, and an unrestricted persona running in the main context.
 
+### A8. Owner decisions round 2 (2026-11-11) and deeper analysis
+
+Decisions (supersede A6 where they differ):
+1. **No fixed count** of live profiles under the orchestrator; the owner's
+   prompt sets how many.
+2. **Depth: default 2, configurable up to 3** below the orchestrator.
+   **Every level may execute (write)**, but every action must be reported
+   and auditable; control returns to the owner and the orchestrator.
+3. **Discussion** runs as many rounds as the goal needs, chosen
+   dynamically. Each round passes through a **sanitizer**; profiles see only
+   the sanitized result of the previous round, never the raw exchange. The
+   orchestrator decides after each round: report to the owner, or continue
+   automatically. Round results go into a **hierarchy of uteke documents**.
+
+#### A8.1 What replaces the count limit
+
+Without a count cap something still has to bound cost and machine load, or
+"no limit" turns into the 15× token bill silently:
+- **Budget is the limiter.** Every delegation carves its budget (tokens,
+  minutes, steps) from the parent's remaining budget; the owner's prompt
+  (or the orchestrator's default) sets the root budget. N profiles share
+  one pot; they cannot multiply it.
+- **A machine guard**, not a policy limit: `delegation.max_live_processes`
+  (generous default, owner-configurable) only queues extra spawns so a
+  laptop is not overrun. Queued work starts when a slot frees, and the
+  queueing is visible.
+
+#### A8.2 Every level can write — made safe by isolation and reports, not by read-only
+
+The risk of several writers is real (Cognition: parallel writers make
+conflicting implicit decisions; MAST FM-2.6 reasoning–action mismatch).
+The controls:
+
+| Control | Rule |
+|---|---|
+| Physical isolation | parallel writers each get their **own git worktree** (the existing `--agents-worktree` mechanism); writers in the **same** workspace are serialized by a write lease (ledger claim) |
+| Merge back | only the orchestrator (with owner approval) merges a worktree; children never merge into each other |
+| Approvals | a child's non-allowlisted Write bubbles up to the orchestrator's single approval surface; allowlist = parent ∩ profile; `Destructive` unreachable |
+| Mandatory report | a delegated run cannot settle `done` without a **completion report** (what changed, files, diff ref, checks run, open risks); missing report ⇒ `incomplete`, never silently done (Hermes: "a commit alone never completes a task") |
+| Audit trail | every delegated run is an ordinary durable session (JSONL); the ledger records the tree (who spawned whom, budget, allowlist, worktree). `tole audit <goal>` prints it top-down with drill-down into any session |
+| Depth | `delegation.max_depth` default 2, hard ceiling 3; the delegate tool is registered only where `depth < max_depth` (keeps today's structural enforcement, moves the number) |
+
+Depth 3 is allowed but not recommended: each hop passes a lossy summary, so
+context loss compounds (MAST FM-1.4 loss of history, FM-2.4 information
+withholding).
+
+#### A8.3 Multi-round discussion with a per-round sanitizer
+
+Evidence:
+- MAST (150+ traces): premature termination 7.82%, no or incomplete
+  verification 6.82%, incorrect verification 6.66%, proceeding on wrong
+  assumptions 11.65%, plus step repetition and "unaware of termination
+  conditions" as named modes. A round loop needs explicit stop rules and
+  verification that is not just the orchestrator grading itself.
+- MAD survey (arXiv 2607.26212): 86% of systems pass messages verbatim, ~11%
+  summarize; summarizing "can substantially cut communication overhead while
+  remaining competitive" but "risks information loss when critical details
+  are omitted". Hybrids (verbatim for local reasoning, summary for
+  coordination) exist.
+- Minority Sentinel (arXiv 2606.29270): models share training data, so
+  errors correlate; in ~1 of 4 divergent cases the **minority was right**,
+  and majority voting suppressed it.
+- Sparse-topology debate (Li et al., EMNLP Findings 2024): not everyone needs
+  to see everyone; comparable or better quality at lower cost.
+
+Loop (all state in the ledger, so a crash resumes mid-discussion):
+
+```
+Goal contract   question, acceptance criteria, participants (from the
+                owner's prompt), budget, max rounds
+Round n         each participant gets: contract + digest(n-1) + its OWN
+                previous contribution  → contribution(n) [raw, ledger]
+Sanitizer       deterministic pass, then digest pass → digest(n)
+Gate            orchestrator: report | continue | escalate
+```
+
+**The sanitizer has two passes:**
+1. *Deterministic, always on, cheap:* secret redaction (`SecretSet`, Part
+   B), control/bidi character neutralization (the existing `sanitize.rs`
+   rules), tool-result fence neutralization, size caps. This is a security
+   step: raw contributions can carry text from web pages and tool output, and
+   the digest must not turn an injected instruction into an authoritative
+   line.
+2. *Digest, cheap model:* a fixed schema, not free prose:
+   - decisions made, each with the round and participant that made it;
+   - claims, each attributed and **linked to its raw ledger entry**
+     (provenance, so an auditor can drill down);
+   - **open disagreements, minority positions kept** (agreement may be
+     compressed, dissent may not be dropped);
+   - open questions, actions taken (writes, with diff/worktree refs);
+   - **delta**: what is new versus the previous digest.
+
+   Small rounds skip it: below a threshold, the raw round is passed through
+   verbatim (the hybrid the survey describes). The digest is written by a
+   dedicated cheap "scribe" profile, not by the orchestrator, so the party
+   that decides is not also the one that summarizes.
+
+**The gate, deterministic checks first, judgment second:**
+
+| Outcome | When |
+|---|---|
+| **Report to owner** | acceptance criteria met, checked as a checklist by a claim-checker role (not the orchestrator alone) |
+| **Escalate to owner** | budget or max rounds reached; no new information in the delta for 2 rounds (stalled); a disagreement that only the owner can decide; a pending Write approval |
+| **Continue automatically** | otherwise; the orchestrator may change the roster for the next round (dynamic), within the budget |
+
+Token effect (input tokens spent re-reading history, N participants, R rounds,
+c tokens per contribution, d tokens per digest):
+- verbatim, everyone sees everything: N²·c·R(R−1)/2
+- with digests: N·R·(d + c) + R·N·c (scribe)
+- example N=3, c=800, d=600: R=4 → 43.2k vs 26.4k; R=8 → 201.6k vs 52.8k.
+  The saving grows quadratically with the number of rounds.
+
+#### A8.4 Hierarchical uteke documents
+
+uteke documents support a `parent` (max depth 10), so the hierarchy fits:
+
+```
+goal-<id>                      contract + final report (linked to the project room)
+├── goal-<id>-r1               round digest
+│   └── goal-<id>-r1-<profile> per-profile digest (only when useful)
+├── goal-<id>-r2
+└── …
+```
+
+- Raw contributions stay in tole's JSONL ledger, **not** in uteke: indexing
+  raw debate would cost embedding work and pollute semantic recall with
+  superseded positions. uteke holds the digests and the final report; every
+  digest line links back to the raw entry.
+- Only the final report and recorded decisions are linked into the shared
+  project room; round documents stay under their parent.
+- Gap: tole's `uteke_document` tool takes `slug`, `markdown` and `room`, but
+  no `parent`. It needs one (verify that the uteke CLI exposes it; the uteke
+  cloud API does).
+
 ## Part B — Secrets leaking to the LLM
 
 ### B1. How secrets actually leak (evidence)
