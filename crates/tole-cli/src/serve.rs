@@ -17,6 +17,10 @@
 //!   session log (#524; see `tole_cli::protocol`)
 //! - `POST /sessions/{id}/interrupt` → steer the running turn without
 //!   cancelling it (`{"text": "...", "urgent": false}`, #377)
+//! - `POST /sessions/{id}/images` → upload one image as the raw body (#558);
+//!   `POST /sessions/{id}/prompt` takes `"images": [<id>]` next to `text`
+//! - `GET  /sessions/{id}/images/{fnv1a64}` → the bytes of an image recorded
+//!   in that session's log (#558; see `tole_cli::serve_images`)
 //!
 //! v1 scope: REST only (MCP-over-HTTP is the follow-up; the engine calls
 //! are identical). Auth is a static bearer token (env `TOLE_SERVE_TOKEN`
@@ -36,7 +40,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tole_cli::session_host::{
-    lock_sessions, open_session, run_session_turn, Sessions, SharedSessions,
+    lock_sessions, open_session, run_session_turn_with_images, Sessions, SharedSessions,
 };
 use tole_core::memory::MemoryConfig;
 use tole_core::storage::Storage;
@@ -83,6 +87,8 @@ struct State {
     /// Per-source-IP failed-auth limiter (brute-force hardening), shared
     /// logic with the MCP transport.
     auth_failures: tole_cli::auth::AuthLimiter,
+    /// Image uploads (#558); `None` when no data directory resolves.
+    uploads: Option<tole_cli::serve_images::UploadStore>,
 }
 
 /// Read/write ceilings per connection: a client that opens a socket and
@@ -94,6 +100,10 @@ const SERVE_IO_TIMEOUT: Duration = Duration::from_secs(30);
 /// few seconds pin a connection slot indefinitely (slow-loris); this
 /// deadline bounds the whole read.
 const REQUEST_READ_DEADLINE: Duration = Duration::from_secs(15);
+/// Body budget of an authenticated image upload (#558): up to 10 MiB from a
+/// phone link needs more than [`REQUEST_READ_DEADLINE`]. Only granted once the
+/// headers carried the right token.
+const UPLOAD_READ_DEADLINE: Duration = Duration::from_secs(120);
 
 pub fn run_serve(cfg: ServeConfig) -> Result<()> {
     let token = resolve_token(&cfg.token)?;
@@ -116,6 +126,7 @@ pub fn run_serve(cfg: ServeConfig) -> Result<()> {
         buses: tole_cli::events::BusRegistry::default(),
         streams: tole_cli::events::StreamLimiter::new(tole_cli::events::MAX_STREAMS),
         auth_failures: tole_cli::auth::AuthLimiter::new(),
+        uploads: tole_cli::serve_images::UploadStore::from_env(),
     });
     eprintln!(
         "tole serve: listening on http://{addr} ({} allow pattern(s), plan_mode={})",
@@ -168,7 +179,8 @@ struct Request {
     /// `Last-Event-ID`: where an SSE client left off (`EventSource` sends it
     /// on reconnect).
     last_event_id: Option<String>,
-    body: String,
+    /// Raw body bytes (an image upload is binary; JSON routes decode it).
+    body: Vec<u8>,
 }
 
 /// Why a request could not be read; decides the response (if any).
@@ -187,6 +199,9 @@ enum ReadError {
 const MAX_HEADER_BYTES: usize = 32 * 1024;
 /// Ceiling for a request body.
 const MAX_BODY_BYTES: usize = 1024 * 1024;
+/// Ceiling for an authenticated image upload body (#558): the core's
+/// per-image cap. Unauthenticated requests keep [`MAX_BODY_BYTES`].
+const MAX_UPLOAD_BYTES: usize = tole_core::image::MAX_IMAGE_BYTES as usize;
 
 /// A reader that re-arms the socket read timeout before every read so the
 /// remaining time until `deadline` — not just the per-read timeout —
@@ -208,7 +223,7 @@ impl Read for DeadlineReader<'_> {
     }
 }
 
-fn read_request(stream: &TcpStream) -> Result<Request, ReadError> {
+fn read_request(stream: &TcpStream, token: &str) -> Result<Request, ReadError> {
     let mut reader = BufReader::new(DeadlineReader {
         stream,
         deadline: Instant::now() + REQUEST_READ_DEADLINE,
@@ -291,8 +306,21 @@ fn read_request(stream: &TcpStream) -> Result<Request, ReadError> {
         }
     }
     let content_length = content_length.unwrap_or(0);
-    if content_length > MAX_BODY_BYTES {
+    // The larger upload ceiling only for an image upload that already
+    // carries the right token: pre-auth buffering stays at MAX_BODY_BYTES.
+    let upload = method == "POST"
+        && upload_target(&path).is_some()
+        && tole_cli::auth::bearer_matches(authorization.as_deref(), token);
+    let ceiling = if upload {
+        MAX_UPLOAD_BYTES
+    } else {
+        MAX_BODY_BYTES
+    };
+    if content_length > ceiling {
         return Err(ReadError::TooLarge); // refuse rather than buffer it
+    }
+    if upload {
+        reader.get_mut().deadline = Instant::now() + UPLOAD_READ_DEADLINE;
     }
     if content_length > 0 && expect_continue {
         // curl sends `Expect: 100-continue` for bodies over ~1 KiB and
@@ -310,7 +338,7 @@ fn read_request(stream: &TcpStream) -> Result<Request, ReadError> {
         path,
         authorization,
         last_event_id,
-        body: String::from_utf8_lossy(&body).to_string(),
+        body,
     })
 }
 
@@ -325,9 +353,11 @@ fn reason_phrase(status: u16) -> &'static str {
         405 => "Method Not Allowed",
         409 => "Conflict",
         413 => "Payload Too Large",
+        415 => "Unsupported Media Type",
         429 => "Too Many Requests",
         500 => "Internal Server Error",
         503 => "Service Unavailable",
+        507 => "Insufficient Storage",
         _ => "Unknown",
     }
 }
@@ -358,7 +388,7 @@ impl Drop for ConnGuard {
 
 fn handle_conn(mut stream: TcpStream, state: Arc<State>) {
     let _guard = ConnGuard(Arc::clone(&state));
-    let req = match read_request(&stream) {
+    let req = match read_request(&stream, &state.token) {
         Ok(r) => r,
         Err(ReadError::Io) => return,
         Err(ReadError::Bad(msg)) => {
@@ -410,8 +440,98 @@ fn handle_conn(mut stream: TcpStream, state: Arc<State>) {
         }
     }
 
-    let (status, payload) = route(&state, &req.method, &req.path, &req.body);
+    // Images (#558): a binary body in, binary bytes out.
+    if req.method == "POST" {
+        if let Some(id) = upload_target(&req.path) {
+            let (status, payload) = upload_image(&state, id, &req.body);
+            respond(&mut stream, status, &payload);
+            return;
+        }
+    }
+    if req.method == "GET" {
+        if let Some((id, hash)) = image_target(&req.path) {
+            match read_image(&state, id, hash) {
+                Ok((mime, data)) => respond_image(&mut stream, &mime, &data),
+                Err((status, payload)) => respond(&mut stream, status, &payload),
+            }
+            return;
+        }
+    }
+
+    let body = String::from_utf8_lossy(&req.body);
+    let (status, payload) = route(&state, &req.method, &req.path, &body);
     respond(&mut stream, status, &payload);
+}
+
+/// `/sessions/{id}/images` -> `id` (the upload route).
+fn upload_target(path: &str) -> Option<&str> {
+    let id = path.strip_prefix("/sessions/")?.strip_suffix("/images")?;
+    (!id.is_empty() && !id.contains('/') && !id.contains('?')).then_some(id)
+}
+
+/// `/sessions/{id}/images/{hash}` -> `(id, hash)` (the read route).
+fn image_target(path: &str) -> Option<(&str, &str)> {
+    let rest = path.strip_prefix("/sessions/")?;
+    let (id, hash) = rest.split_once("/images/")?;
+    let ok = |s: &str| !s.is_empty() && !s.contains('/') && !s.contains('?');
+    (ok(id) && ok(hash)).then_some((id, hash))
+}
+
+fn image_error(e: tole_cli::serve_images::ImageApiError) -> (u16, serde_json::Value) {
+    (e.status(), json!({"error": e.message()}))
+}
+
+/// The JSONL file of a live session, or the 404 answer.
+fn live_session_path(
+    state: &State,
+    id: &str,
+) -> Result<std::path::PathBuf, (u16, serde_json::Value)> {
+    let sessions = lock_sessions(&state.sessions);
+    sessions
+        .get(id)
+        .map(|st| st.path.clone())
+        .ok_or_else(|| (404, json!({"error": "unknown session"})))
+}
+
+/// `POST /sessions/{id}/images` (#558): store the raw body as an image of
+/// a live session; answers the reference (`id`, `mime`, `bytes`, `fnv1a64`).
+fn upload_image(state: &State, id: &str, body: &[u8]) -> (u16, serde_json::Value) {
+    if let Err(resp) = live_session_path(state, id) {
+        return resp;
+    }
+    let Some(store) = state.uploads.as_ref() else {
+        return (
+            503,
+            json!({"error": "image uploads need a data directory (set CODECORA_HOME or HOME)"}),
+        );
+    };
+    match store.store(id, body) {
+        Ok(r) => (200, tole_cli::serve_images::upload_json(&r)),
+        Err(e) => image_error(e),
+    }
+}
+
+/// `GET /sessions/{id}/images/{fnv1a64}` (#558): only an image the session's
+/// log records, re-checked against the jail, its size and its hash.
+fn read_image(
+    state: &State,
+    id: &str,
+    hash: &str,
+) -> Result<(String, Vec<u8>), (u16, serde_json::Value)> {
+    let path = live_session_path(state, id)?;
+    tole_cli::serve_images::read_recorded_in_jail(&path, hash).map_err(image_error)
+}
+
+/// An image body with a fixed type: the recorded mime, never sniffed by
+/// the client (`nosniff`), never cached by a shared cache.
+fn respond_image(stream: &mut TcpStream, mime: &str, data: &[u8]) {
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nX-Content-Type-Options: nosniff\r\nCache-Control: private, no-store\r\nConnection: close\r\n\r\n",
+        data.len()
+    );
+    let _ = stream.write_all(head.as_bytes());
+    let _ = stream.write_all(data);
+    let _ = stream.flush();
 }
 
 /// `/sessions/{id}/events[?query]` -> `(id, query)`.
@@ -983,11 +1103,37 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                     let Some(text) = req.get("text").and_then(|v| v.as_str()) else {
                         return (400, json!({"error": "missing text"}));
                     };
+                    // Images (#558): ids of this session's uploads, resolved
+                    // to durable references before the turn starts.
+                    let images = match req.get("images") {
+                        None | Some(serde_json::Value::Null) => vec![],
+                        Some(v) => {
+                            if lock_sessions(&state.sessions).get(id).is_none() {
+                                return (404, json!({"error": "unknown session"}));
+                            }
+                            let Some(store) = state.uploads.as_ref() else {
+                                return (
+                                    503,
+                                    json!({"error": "image uploads need a data directory"}),
+                                );
+                            };
+                            match store.lookup_all(id, Some(v)) {
+                                Ok(refs) => refs,
+                                Err(e) => return image_error(e),
+                            }
+                        }
+                    };
                     // An observer (text deltas, tool events) only while an event
                     // stream is open on this session: with nobody watching the
                     // turn runs exactly as before streams existed.
                     let observer = state.buses.observer_for(id);
-                    match run_session_turn(Arc::clone(&state.sessions), id, text, observer) {
+                    match run_session_turn_with_images(
+                        Arc::clone(&state.sessions),
+                        id,
+                        text,
+                        &images,
+                        observer,
+                    ) {
                         Ok((stop, Some(final_text))) => {
                             (200, json!({"stopReason": stop, "text": final_text}))
                         }
@@ -1100,6 +1246,7 @@ mod tests {
             buses: tole_cli::events::BusRegistry::default(),
             streams: tole_cli::events::StreamLimiter::new(tole_cli::events::MAX_STREAMS),
             auth_failures: tole_cli::auth::AuthLimiter::new(),
+            uploads: None,
         }
     }
 

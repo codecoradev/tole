@@ -9,7 +9,7 @@ Durable Rust agent harness: a conversational agent with risk-tiered approval
 gates, a write-once JSONL session log, and a register state machine — resumable
 after crashes, replayable forever.
 
-**Status:** v0.9.0 is the latest release: `tole doctor`, soft interrupts, per-turn token stats, sibling change notices and the typed child-agent handoff, a provider failover chain, the user config layer, `--trust workspace`, command-level allow/deny patterns, a global session index (`sessions --all`) and context compaction, plus the 0.8.2 `tole serve` hardening (see the CHANGELOG). `develop` is working toward 0.10.0, a pi-style terminal UI: the `tole-tui` is in and daily-usable — bare `tole` on a TTY opens an inline UI with a streaming transcript, a multi-line editor, a footer, inline approvals and Esc-cancel; slash commands (`/compact` `/new` `/resume` `/session` `/name`), the model picker and thinking-level cycling (#461); steering, a follow-up queue, `@file`, collapsible tool output and markdown/diff styling (#462), `--effort` reasoning effort and the `tole status [id]` snapshot (model, effort, context used/window, tokens, compactions) shipped, and the multi-client daemon (jcode-style socket server) stays design-only ([docs/daemon-design.md](docs/daemon-design.md)), while the UI-client seam of `tole serve` has started (epic #523): `GET /sessions/{id}/entries` reads a transcript page by page `POST /sessions {"resume": id}` reopens a session and `GET /sessions/{id}/events` streams it live over SSE with a lossless replay from a `seq` (#524). v0.8.1 itself brought token-usage reporting and a capped, resumable `read_file` (#211), on top of v0.8.0, which added the per-project config `.tole/config.toml`
+**Status:** v0.9.0 is the latest release: `tole doctor`, soft interrupts, per-turn token stats, sibling change notices and the typed child-agent handoff, a provider failover chain, the user config layer, `--trust workspace`, command-level allow/deny patterns, a global session index (`sessions --all`) and context compaction, plus the 0.8.2 `tole serve` hardening (see the CHANGELOG). `develop` is working toward 0.10.0, a pi-style terminal UI: the `tole-tui` is in and daily-usable — bare `tole` on a TTY opens an inline UI with a streaming transcript, a multi-line editor, a footer, inline approvals and Esc-cancel; slash commands (`/compact` `/new` `/resume` `/session` `/name`), the model picker and thinking-level cycling (#461); steering, a follow-up queue, `@file`, collapsible tool output and markdown/diff styling (#462), `--effort` reasoning effort and the `tole status [id]` snapshot (model, effort, context used/window, tokens, compactions) shipped, and the multi-client daemon (jcode-style socket server) stays design-only ([docs/daemon-design.md](docs/daemon-design.md)), while the UI-client seam of `tole serve` has started (epic #523): `GET /sessions/{id}/entries` reads a transcript page by page `POST /sessions {"resume": id}` reopens a session and `GET /sessions/{id}/events` streams it live over SSE with a lossless replay from a `seq` (#524); images are uploaded with `POST /sessions/{id}/images`, attached with `"images"` on a prompt and read back from `GET /sessions/{id}/images/{fnv1a64}` (#558). v0.8.1 itself brought token-usage reporting and a capped, resumable `read_file` (#211), on top of v0.8.0, which added the per-project config `.tole/config.toml`
 (trusted before it applies; see the Configuration section) on top of v0.7.x
 (rescan-2 hardening, one tool-call authorization gate; see the CHANGELOG for
 the behavior changes). Five faces on one durable core: the CLI (run / chat /
@@ -220,6 +220,13 @@ silently). Images are input, not tools: no approval is involved. They cost token
 non-vision model is a loud `model-capability` error, not a dropped image. Image content is
 untrusted input (text inside an image can carry instructions, like a fetched web page). There is
 **no model-callable image tool**: images are always supplied by the user (see the threat model).
+
+`tole serve` takes images too (#558): `POST /sessions/{id}/images` (raw body) stores an upload
+under `~/.codecora/tole/images/serve/`, a prompt references it with `"images": [<id>]`, and
+`GET /sessions/{id}/images/{fnv1a64}` reads back an image the session's log records. Quotas:
+`TOLE_SERVE_IMAGE_SESSION_QUOTA` (bytes, default 64 MiB per session) and
+`TOLE_SERVE_IMAGE_TOTAL_QUOTA` (bytes, default 512 MiB). See
+[docs/mobile-control.md](docs/mobile-control.md#images-558).
 
 ### Provider retries
 

@@ -39,11 +39,11 @@ pub fn set_image_roots(workspace: Option<std::path::PathBuf>) {
     let _ = IMAGE_ROOTS.set(roots);
 }
 
-fn image_roots() -> Vec<std::path::PathBuf> {
+pub(crate) fn image_roots() -> Vec<std::path::PathBuf> {
     IMAGE_ROOTS.get().cloned().unwrap_or_default()
 }
 
-fn spill_dir() -> Option<std::path::PathBuf> {
+pub(crate) fn spill_dir() -> Option<std::path::PathBuf> {
     tole_core::paths::tole_data_dir().map(|d| d.join("images"))
 }
 
