@@ -50,14 +50,48 @@ fn spill_dir() -> Option<std::path::PathBuf> {
 /// Resolve `--image` specs (workspace-jailed paths or `data:` URLs) to
 /// durable references. Fails loudly on the first bad one.
 pub fn resolve_images(specs: &[String]) -> anyhow::Result<Vec<tole_core::image::ImageRef>> {
-    let roots = image_roots();
     specs
         .iter()
-        .map(|s| {
-            tole_core::image::resolve(s, &roots, spill_dir().as_deref())
-                .map_err(|e| anyhow::anyhow!("--image: {e}"))
-        })
+        .map(|s| resolve_image(s).map_err(|e| anyhow::anyhow!("--image: {e}")))
         .collect()
+}
+
+/// Resolve ONE image spec — a workspace-jailed path or a `data:` URL — to
+/// a durable reference (#559): what `chat`'s `/image` and the TUI host's
+/// pending images use for a later message. Same jail, cap and sniffing as
+/// `--image`.
+pub fn resolve_image(spec: &str) -> Result<tole_core::image::ImageRef, String> {
+    tole_core::image::resolve(spec.trim(), &image_roots(), spill_dir().as_deref())
+        .map_err(|e| e.to_string())
+}
+
+/// Resolve inline base64 image bytes (an ACP `image` content block, #559)
+/// through the same spill-and-reference path as a CLI `data:` URL. The
+/// client's declared MIME type is not trusted: the bytes are sniffed, and
+/// only png/jpeg/gif/webp within the size cap are accepted.
+pub fn resolve_inline_image(base64: &str) -> Result<tole_core::image::ImageRef, String> {
+    // Refuse an oversize payload BEFORE decoding it: 4 base64 chars carry 3
+    // bytes, so anything longer than this cannot fit the cap.
+    let max_b64 = tole_core::image::MAX_IMAGE_BYTES.div_ceil(3) * 4;
+    if base64.trim().len() as u64 > max_b64 {
+        return Err(format!(
+            "image: inline image exceeds the {}-byte cap",
+            tole_core::image::MAX_IMAGE_BYTES
+        ));
+    }
+    tole_core::image::resolve(
+        &format!("data:image;base64,{}", base64.trim()),
+        &[],
+        spill_dir().as_deref(),
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// Whether inline images can be accepted at all: they are spilled to the
+/// data dir, so without one (no HOME / CODECORA_HOME) they are refused.
+/// ACP advertises `promptCapabilities.image` from this.
+pub fn inline_images_supported() -> bool {
+    spill_dir().is_some()
 }
 
 /// The model a session turn uses: the session's durable `fact/model`
@@ -205,8 +239,19 @@ pub fn run_turn_on<S: Storage>(
     plan: &TurnPlan<'_>,
     prompt: &str,
 ) -> Result<TurnOutcome, TurnRunError> {
+    run_turn_on_with_images(storage, plan, prompt, &[])
+}
+
+/// [`run_turn_on`] with images attached to THIS turn's user message (#559):
+/// any turn of a session can carry images, not only the first.
+pub fn run_turn_on_with_images<S: Storage>(
+    storage: &mut S,
+    plan: &TurnPlan<'_>,
+    prompt: &str,
+    images: &[tole_core::image::ImageRef],
+) -> Result<TurnOutcome, TurnRunError> {
     let mut provider = plan.provider(&*storage)?;
-    run_turn_with(storage, &mut *provider, plan, prompt)
+    run_turn_with_images(storage, &mut *provider, plan, prompt, images)
 }
 
 /// The turn itself, with a provider already built: settle a parked turn
@@ -217,6 +262,19 @@ pub fn run_turn_with<S: Storage>(
     provider: &mut dyn Provider,
     plan: &TurnPlan<'_>,
     prompt: &str,
+) -> Result<TurnOutcome, TurnRunError> {
+    run_turn_with_images(storage, provider, plan, prompt, &[])
+}
+
+/// [`run_turn_with`] with images on the new user message (#559). When a
+/// parked turn does not settle `Final`, the prompt is not run and the
+/// images are not recorded either.
+pub fn run_turn_with_images<S: Storage>(
+    storage: &mut S,
+    provider: &mut dyn Provider,
+    plan: &TurnPlan<'_>,
+    prompt: &str,
+    images: &[tole_core::image::ImageRef],
 ) -> Result<TurnOutcome, TurnRunError> {
     if plan.resolve_parked && !matches!(storage.state().pc, Pc::Idle | Pc::Final) {
         match turn::resume_turn_with_cancel(storage, provider, plan.registry, plan.cancel)
@@ -230,11 +288,12 @@ pub fn run_turn_with<S: Storage>(
         crate::compaction_host::for_session(settings, &plan.cfg, &*storage)
             .before_turn(storage, provider);
     }
-    turn::run_turn_with_observer(
+    turn::run_turn_with_images(
         storage,
         provider,
         plan.registry,
         prompt,
+        images,
         plan.cancel,
         plan.observer.map(|o| o.as_ref()),
     )
@@ -503,6 +562,59 @@ mod tests {
         assert!(
             s.entries().len() >= 2,
             "user message and answer are durable"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn image(tag: &str) -> tole_core::image::ImageRef {
+        tole_core::image::ImageRef {
+            path: format!("/ws/{tag}.png"),
+            mime: "image/png".into(),
+            bytes: 33,
+            fnv1a64: format!("{tag:0>16}"),
+        }
+    }
+
+    /// #559: an oversize inline image is refused before it is decoded.
+    #[test]
+    fn an_oversize_inline_image_is_refused_before_decoding() {
+        let cap = tole_core::image::MAX_IMAGE_BYTES as usize;
+        let huge = "A".repeat(cap.div_ceil(3) * 4 + 4);
+        let e = resolve_inline_image(&huge).unwrap_err();
+        assert!(e.contains("cap"), "{e}");
+    }
+
+    /// #559: images ride on ANY turn — the second turn's user message
+    /// records its own references, and the first keeps only its own.
+    #[test]
+    fn each_turn_records_its_own_images() {
+        let (mut s, dir) = storage("images");
+        let reg = ToolRegistry::new();
+        let cancel = CancelToken::default();
+        let mut p = MockProvider::scripted(vec![final_out("one"), final_out("two")]);
+        run_turn_with(&mut s, &mut p, &plan(&reg, &cancel, false), "first").unwrap();
+        let (a, b) = (image("a"), image("b"));
+        let out = run_turn_with_images(
+            &mut s,
+            &mut p,
+            &plan(&reg, &cancel, false),
+            "second",
+            &[a.clone(), b.clone()],
+        )
+        .unwrap();
+        assert_eq!(text_of(&out), "two");
+        let users: Vec<_> = s
+            .entries()
+            .iter()
+            .filter(|e| e.payload["role"] == "user")
+            .collect();
+        assert_eq!(users.len(), 2);
+        assert_eq!(users[0].payload["text"], "first");
+        assert!(users[0].payload.get("images").is_none());
+        assert_eq!(users[1].payload["text"], "second");
+        assert_eq!(
+            users[1].payload["images"],
+            serde_json::json!([a.to_value(), b.to_value()])
         );
         let _ = std::fs::remove_dir_all(dir);
     }

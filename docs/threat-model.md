@@ -656,6 +656,35 @@ jail, project config and trust were resolved for the current directory and
 would otherwise act on the wrong tree. Anyone who can write the index can
 already write the session files it points to (same home).
 
+### Image input (#212, #559)
+
+Images are **user-supplied input, never a tool**. Input paths: `--image` on
+`run|chat|mission`, `/image` in `chat` and the TUI host's pending images (any
+turn, #559), and ACP `image` content blocks (#559). Every path ends in the
+same resolver: a file path must canonicalize inside the workspace jail
+(symlink and `..` escapes refused), inline bytes (a `data:` URL or an ACP
+block's base64 `data`) are decoded, capped at 10 MiB and spilled
+content-addressed to `$CODECORA_HOME/tole/images/`, and the type is sniffed
+from the bytes (PNG/JPEG/GIF/WebP only). An ACP client's declared `mimeType`
+is not trusted and its optional `uri` is never read, so a remote client
+cannot name a host path; one bad image refuses the whole prompt instead of
+being dropped silently. The log records only the reference (path, mime,
+size, FNV-1a hash); every request re-reads the file and re-checks jail and
+hash, so a swapped file is reported, not sent.
+
+The image **content** is untrusted: text rendered inside an image can carry
+instructions exactly like a fetched web page or a tool result, and the same
+mitigations apply (approval gates on anything that matters, budgets). The
+spill dir grows with each distinct inline image and is not pruned (same
+home as the session logs; an operator cleanup).
+
+**No model-callable image tool (decision, #559).** Tool results are text in
+the OpenAI-compatible format, so a `read_image` tool would need an
+attributed user message committed by the harness at a safe point, plus its
+own threat-model entry (a model-chosen path, an injection channel the user
+did not pick). Until a follow-up issue makes that case, the model cannot
+pull images on its own.
+
 ### User config (#433)
 
 `$CODECORA_HOME/tole/config.toml` (default `~/.codecora/tole/config.toml`) has

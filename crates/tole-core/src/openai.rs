@@ -447,7 +447,12 @@ impl OpenAiProvider {
                     // references; the blob is re-read (jail + hash checked)
                     // per request. A failed load stays visible as a text
                     // note instead of dropping the image silently.
-                    let mut parts = vec![json!({ "type": "text", "text": text })];
+                    // An image-only message (#559) sends no empty text part.
+                    let mut parts = if text.is_empty() {
+                        vec![]
+                    } else {
+                        vec![json!({ "type": "text", "text": text })]
+                    };
                     for r in &images {
                         parts.push(match crate::image::data_url(r, &self.image_roots) {
                             Ok(url) => json!({ "type": "image_url", "image_url": { "url": url } }),
@@ -1810,6 +1815,22 @@ mod transcript_tests {
         let parts = body["messages"][0]["content"].as_array().unwrap();
         assert_eq!(parts[0]["text"], json!("hi"));
         assert!(parts[1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("image unavailable"));
+    }
+
+    #[test]
+    fn an_image_only_user_message_sends_no_empty_text_part() {
+        // #559: an ACP prompt may carry only an image block.
+        let p = OpenAiProvider::new(OpenAiConfig::new("https://x.example/v1", "m", "k"));
+        let mut e = msg("e1", "user", "");
+        e.payload["images"] =
+            json!([{"path": "/nope/a.png", "mime": "image/png", "bytes": 1, "fnv1a64": "0"}]);
+        let body = p.request_body(&[e]);
+        let parts = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 1, "{parts:?}");
+        assert!(parts[0]["text"]
             .as_str()
             .unwrap()
             .contains("image unavailable"));

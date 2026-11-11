@@ -422,6 +422,18 @@ pub fn run_session_turn(
     prompt: &str,
     observer: Option<StdArc<dyn tole_core::turn::TurnObserver>>,
 ) -> Result<(String, Option<String>), String> {
+    run_session_turn_with_images(sessions, session_id, prompt, &[], observer)
+}
+
+/// [`run_session_turn`] with images on this turn's user message (#559):
+/// ACP `image` content blocks, already resolved to durable references.
+pub fn run_session_turn_with_images(
+    sessions: SharedSessions,
+    session_id: &str,
+    prompt: &str,
+    images: &[tole_core::image::ImageRef],
+    observer: Option<StdArc<dyn tole_core::turn::TurnObserver>>,
+) -> Result<(String, Option<String>), String> {
     // Brief map lock: claim the session for this turn. The MAP lock is
     // released here — a running turn holds only its OWN storage lock, so
     // the transport loop stays live (CodeCora deadlock finding).
@@ -437,8 +449,9 @@ pub fn run_session_turn(
     } = state;
     let mut final_text: Option<String> = None;
 
-    // Memory loop, pre-turn (first prompt of a fresh session only).
-    let effective = if *first_prompt_done.lock().expect("fpd lock") {
+    // Memory loop, pre-turn (first prompt of a fresh session only). An
+    // image-only prompt (#559) has no text to recall on.
+    let effective = if *first_prompt_done.lock().expect("fpd lock") || prompt.trim().is_empty() {
         prompt.to_string()
     } else {
         crate::turn_runner::with_recalled_memory(memory.as_ref(), prompt)
@@ -464,8 +477,9 @@ pub fn run_session_turn(
         resolve_parked: false,
         compaction: None,
     };
-    let outcome = crate::turn_runner::run_turn_on(&mut *storage, &plan, &effective)
-        .map_err(|e| e.into_message())?;
+    let outcome =
+        crate::turn_runner::run_turn_on_with_images(&mut *storage, &plan, &effective, images)
+            .map_err(|e| e.into_message())?;
 
     #[cfg(feature = "shell-tools")]
     if let tole_core::turn::TurnOutcome::Final { text, wrote } = &outcome {
