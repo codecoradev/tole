@@ -496,6 +496,50 @@ fn the_log_replays_to_the_same_tree_and_renders_the_audit() {
 }
 
 #[test]
+fn only_normalized_absolute_lease_paths_are_accepted() {
+    let mut d = goal(2, 8);
+    let a = spawn(&mut d, "g", 100);
+    let b = spawn(&mut d, "g", 100);
+    d.lease_write(&a.node_id, "/work/src/a.rs", T).unwrap();
+    // Other spellings of the same file are refused, not let through.
+    for bad in [
+        "/work/src/../src/a.rs",
+        "/work/src/./a.rs",
+        "//work/src/a.rs",
+        "/work/src/a.rs/",
+        "/work//src/a.rs",
+        "work/src/a.rs",
+        "",
+    ] {
+        let e = d.lease_write(&b.node_id, bad, T).unwrap_err();
+        assert!(matches!(e, DelegationError::Invalid(_)), "{bad:?}: {e}");
+        let e = d.release(&a.node_id, bad, T).unwrap_err();
+        assert!(matches!(e, DelegationError::Invalid(_)), "{bad:?}: {e}");
+    }
+    // Normalized equal, ancestor and descendant paths still conflict.
+    for path in ["/work/src/a.rs", "/work", "/work/src/a.rs/x", "/"] {
+        let e = d.lease_write(&b.node_id, path, T).unwrap_err();
+        assert!(
+            matches!(e, DelegationError::LeaseBusy { .. }),
+            "{path}: {e}"
+        );
+    }
+    d.lease_write(&a.node_id, "/work/src/a.rs", T).unwrap(); // re-entrant
+    d.lease_write(&b.node_id, "/work/src/b.rs", T).unwrap();
+    // A forged record with a non-normal path never becomes a lease.
+    let mut raw = d.store.clone();
+    let rec = Rec::WriteLease {
+        node_id: b.node_id.clone(),
+        path: "//other/".into(),
+        at: T,
+    };
+    raw.append(format!("{}\n", rec.to_line()).as_bytes())
+        .unwrap();
+    d.refresh().unwrap();
+    assert!(!d.state.leases.contains_key("//other/"));
+}
+
+#[test]
 fn a_second_settle_that_raced_past_the_check_does_not_overwrite_the_first() {
     let store = MemoryStore::default();
     let mut d = goal_on(store.clone(), 2, 8);

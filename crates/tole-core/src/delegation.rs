@@ -17,7 +17,10 @@
 //! - **One writer per path.** An `execute` node takes a write lease on a
 //!   path before writing; a lease conflicts with any live lease on the same
 //!   path, an ancestor or a descendant of it. Leases end when the node
-//!   settles.
+//!   settles. A lease path must be absolute and lexically normal (`/a/b`);
+//!   any other spelling is refused, never rewritten. Nothing here touches the
+//!   filesystem, so the host canonicalizes paths (symlinks, `..`, case
+//!   folding) before calling.
 //! - **Machine guard.** `max_live_processes` only queues: a spawn over it is
 //!   recorded `queued` and starts when a slot frees ([`Delegation::start`]).
 //! - **Mandatory report.** An `ok` run settles `done` only with a complete
@@ -351,7 +354,20 @@ struct State {
     leases: BTreeMap<String, String>,
 }
 
+/// Is `path` absolute and lexically normal: `/` or `/a/b`, with no empty,
+/// `.` or `..` component (so no `//` and no trailing slash)? Lease paths
+/// must be; anything else is refused, never rewritten. This module does no
+/// filesystem access: the host canonicalizes (symlinks, case folding) first.
+fn is_normal_path(path: &str) -> bool {
+    path == "/"
+        || path.strip_prefix('/').is_some_and(|rest| {
+            rest.split('/')
+                .all(|c| !c.is_empty() && c != "." && c != "..")
+        })
+}
+
 /// Does `a` equal `b`, or contain it, or sit inside it (by path component)?
+/// Both are [`is_normal_path`].
 fn paths_overlap(a: &str, b: &str) -> bool {
     let inside = |x: &str, y: &str| {
         x == y || x.strip_prefix(y).is_some_and(|r| r.starts_with('/')) || y == "/"
@@ -470,6 +486,9 @@ impl State {
                 }
             }
             Rec::WriteLease { node_id, path, .. } => {
+                if !is_normal_path(&path) {
+                    return; // never written by the API; a forged record
+                }
                 let live = self
                     .nodes
                     .get(&node_id)
@@ -573,6 +592,16 @@ pub fn child_allow(parent: &[String], profile: &[String]) -> (Vec<String>, Vec<S
         }
     }
     (allow, dropped)
+}
+
+fn check_lease_path(path: &str) -> Result<()> {
+    if is_normal_path(path) {
+        return Ok(());
+    }
+    Err(DelegationError::Invalid(format!(
+        "lease path {path:?} must be absolute and normalized (no empty, `.` or `..` \
+         component, no trailing slash); canonicalize it first"
+    )))
 }
 
 fn valid_id(id: &str) -> bool {
@@ -855,11 +884,7 @@ impl<S: LedgerStore> Delegation<S> {
                 want: "a running execute node",
             });
         }
-        if path.is_empty() || !path.starts_with('/') {
-            return Err(DelegationError::Invalid(format!(
-                "lease path {path:?} must be absolute"
-            )));
-        }
+        check_lease_path(path)?;
         let busy = |s: &State| {
             s.lease_holder(path, id)
                 .map(|(p, h)| DelegationError::LeaseBusy {
@@ -893,6 +918,7 @@ impl<S: LedgerStore> Delegation<S> {
     /// Gives a write lease back before the node settles.
     pub fn release(&mut self, id: &str, path: &str, now: i64) -> Result<()> {
         self.sync(true)?;
+        check_lease_path(path)?;
         if self.state.leases.get(path).map(String::as_str) != Some(id) {
             return Ok(());
         }

@@ -799,7 +799,12 @@ skip one:
   a write lease.
 - **One writer per path.** An `execute` node takes a write lease before
   writing; a lease conflicts with any live lease on the same path, an ancestor
-  or a descendant, and the first lease in log order wins a race.
+  or a descendant, and the first lease in log order wins a race. A lease path
+  must be absolute and lexically normal (`/a/b`: no empty, `.` or `..`
+  component, no trailing slash); any other spelling is refused, never
+  rewritten, so `/w/src/../src/a.rs` cannot dodge a lease on `/w/src/a.rs`.
+  The module does no filesystem access: the host must canonicalize paths
+  (symlinks, `..`, case folding) before asking for a lease.
 - **Mandatory report.** A run settles `done` only with a report (summary;
   changed files need a diff ref and the checks run) and no unsettled children;
   otherwise `incomplete`, with the reasons in the log. A terminal record is
