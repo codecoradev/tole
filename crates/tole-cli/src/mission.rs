@@ -99,6 +99,9 @@ pub struct MissionConfig {
     pub compaction: tole_cli::compaction_host::CompactionSettings,
     /// Images attached to the first turn only (#212).
     pub images: Vec<tole_core::image::ImageRef>,
+    /// The selected profile's persona (#584): replaces the default base
+    /// prompt of a fresh mission (the mission section is still appended).
+    pub persona: Option<String>,
 }
 
 /// The mission addendum appended to the default system prompt.
@@ -146,10 +149,15 @@ fn mission_review_section(registry: &ToolRegistry) -> String {
 
 /// The system prompt pinned in the header of a FRESH mission session: the
 /// default prompt, the mission addendum, then the review flow when attached.
-fn fresh_mission_prompt(goal: &str, verify: Option<&str>, registry: &ToolRegistry) -> String {
+fn fresh_mission_prompt(
+    goal: &str,
+    verify: Option<&str>,
+    registry: &ToolRegistry,
+    persona: Option<&str>,
+) -> String {
     format!(
         "{}{}{}",
-        crate::default_prompt_for(false),
+        persona.map_or_else(|| crate::default_prompt_for(false), str::to_string),
         mission_prompt(goal, verify),
         mission_review_section(registry)
     )
@@ -255,7 +263,12 @@ pub fn run_mission(
             // The mission system prompt pins the completion-marker
             // contract and the todo discipline in the session header —
             // resume re-applies it exactly (same as run's pinned prompt).
-            let system_prompt = fresh_mission_prompt(&cfg.goal, cfg.verify.as_deref(), &registry);
+            let system_prompt = fresh_mission_prompt(
+                &cfg.goal,
+                cfg.verify.as_deref(),
+                &registry,
+                cfg.persona.as_deref(),
+            );
             let storage = tole_cli::session_host::create_session(
                 sessions_dir,
                 &session_id,
@@ -626,18 +639,18 @@ mod verify_error_tests {
         }
         let mut reg =
             ToolRegistry::with_approver(tole_core::approval::AllowlistApprover::allow_only(vec![]));
-        let none = fresh_mission_prompt("ship it", Some("cargo test"), &reg);
+        let none = fresh_mission_prompt("ship it", Some("cargo test"), &reg, None);
         assert!(!none.contains("Code review"), "{none}");
         assert!(none.contains(MISSION_COMPLETE_MARKER), "{none}");
 
         reg.register(Box::new(Named("mcp_cora_cora_review_prepare")))
             .unwrap();
-        let half = fresh_mission_prompt("ship it", None, &reg);
+        let half = fresh_mission_prompt("ship it", None, &reg, None);
         assert!(!half.contains("Code review"), "finalize missing: {half}");
 
         reg.register(Box::new(Named("mcp_cora_cora_review_finalize")))
             .unwrap();
-        let both = fresh_mission_prompt("ship it", Some("cargo test"), &reg);
+        let both = fresh_mission_prompt("ship it", Some("cargo test"), &reg, None);
         assert!(both.contains("mcp_cora_cora_review_prepare"), "{both}");
         assert!(both.contains("should_block"), "{both}");
         assert!(both.contains("review the change you made"), "{both}");
@@ -645,6 +658,13 @@ mod verify_error_tests {
         // text comes AFTER them so it cannot displace the marker rules.
         assert!(both.contains("ship it") && both.contains(MISSION_COMPLETE_MARKER));
         assert!(both.rfind("# Code review").unwrap() > both.find("MISSION MODE").unwrap());
+
+        // #584: a profile's persona replaces the default base prompt; the
+        // mission contract still follows it.
+        let p = fresh_mission_prompt("ship it", None, &reg, Some("You are the coder."));
+        assert!(p.starts_with("You are the coder."), "{p}");
+        assert!(!p.contains(&crate::default_prompt_for(false)));
+        assert!(p.contains("MISSION MODE") && p.contains(MISSION_COMPLETE_MARKER));
     }
 
     use super::*;

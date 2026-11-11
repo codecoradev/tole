@@ -315,11 +315,15 @@ pub fn open_session(
     let workspace_canon = workspace
         .canonicalize()
         .map_err(|e| format!("session workspace {}: {e}", workspace.display()))?;
-    // TOLE_SYSTEM_PROMPT env > project config (#208; absent unless a
-    // trusted config installed it) > none.
-    let system_prompt = std::env::var("TOLE_SYSTEM_PROMPT")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
+    // The selected profile's persona (#584) > TOLE_SYSTEM_PROMPT env >
+    // project config (#208; absent unless a trusted config installed it) >
+    // none.
+    let system_prompt = crate::config_apply::profile_system_prompt()
+        .or_else(|| {
+            std::env::var("TOLE_SYSTEM_PROMPT")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        })
         .or_else(crate::config_apply::config_system_prompt);
 
     // The shared tool roster (#420): server faces jail files AND shell
