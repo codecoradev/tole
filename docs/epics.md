@@ -282,6 +282,9 @@ Bot and Nakama; BMAD for collaboration). Design notes:
 
 Suggested order: E4 #595 first (other epics reuse it), then E1 #578 → #579,
 E2 #584 → #585, E3 #590 → #591; the rest per each epic's order.
+Cross-repo in uteke OSS: document similarity (codecoradev/uteke#1730), personal
+skill library (codecoradev/uteke#1731), shared secret-detector crate
+(codecoradev/uteke#1732).
 
 ---
 
