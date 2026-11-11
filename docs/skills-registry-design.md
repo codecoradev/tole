@@ -1,6 +1,9 @@
 # Skills: retrieval through uteke, growth with curation — design note
 
-Status: **research + proposal, nothing implemented.** Part of the
+Status: **research + proposal; #590 part 1 implemented:** the
+`SkillIndex` seam, the `uteke doc` adapter, pinned + top-K selection and
+`skill_search` in `crates/tole-core/src/skill_index.rs` (not yet wired into
+sessions). Part of the
 integration/plugin track (scope order decided 2026-11-11: **own
 integrations first, third-party second**). Related:
 [profiles-collaboration-secrets.md](profiles-collaboration-secrets.md),
