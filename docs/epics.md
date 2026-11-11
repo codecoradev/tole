@@ -260,8 +260,10 @@ Bot and Nakama; BMAD for collaboration). Design notes:
   (#582). The scheduler lives inside tole. Status: the ledger core is in
   `tole-core` (`cron`, `ledger`: cron/`@every` parser, append-only
   claim/fold/recovery, catch-up with `missed` records, crash-injection and
-  property tests; UTC only, no CLI or file adapter yet — those land with
-  #579).
+  property tests; UTC only). #579 in progress: the file adapter and
+  `tole cron create|list|pause|resume|remove|runs|tick` with script mode
+  landed; agent mode, the `tole serve` ticker, approvals parking, delivery
+  targets, budgets and `doctor` checks follow.
 - **E2 — Profiles, delegation, discussion, routing, epic #583:**
   - profiles (#584);
   - delegation with budget carve, depth 2 (max 3), write lease and a
