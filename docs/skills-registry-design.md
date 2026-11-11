@@ -280,9 +280,7 @@ prefer local ONNX or the owner's own embor.
      the uteke side.
 3. **Similarity detection must cover documents**, not only memories. Today
    `auto_link_cosine` (similar_to ≥ 0.80, possible_duplicate ≥ 0.92) and the
-   dream dedup run on memories; document chunks are excluded. An issue for
-   uteke is drafted (see 7.2); this session could not create it because
-   push access to `codecoradev/uteke` was refused.
+   dream dedup run on memories; document chunks are excluded. Filed as codecoradev/uteke#1730.
 4. **The curator is on by default and can be switched off** (config and
    per-run), and it can be paused, as in Hermes.
 
@@ -314,7 +312,7 @@ tag gets search for free, but a skill is more than one markdown document:
 - tole's phase-1 adapter uses a `skill` tag on plain documents; the
   phase-2 adapter talks to the new `uteke skill` commands.
 
-### 7.2 Drafted uteke issues (to file in `codecoradev/uteke`)
+### 7.2 uteke issues (filed 2026-11-11: codecoradev/uteke#1730, #1731, #1732)
 
 1. **feat(docs): similarity edges and duplicate report for documents.**
    - Extend the cosine auto-link to documents: one document-level
