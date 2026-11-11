@@ -426,7 +426,8 @@ pub fn run_session_turn(
 }
 
 /// [`run_session_turn`] with images on this turn's user message (#559):
-/// ACP `image` content blocks, already resolved to durable references.
+/// ACP `image` content blocks and `serve`'s prompt route (#558), already
+/// resolved to durable references.
 pub fn run_session_turn_with_images(
     sessions: SharedSessions,
     session_id: &str,

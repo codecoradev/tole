@@ -4,8 +4,8 @@ The 0.8.0 remote-approval surface (#200) is the entire backend a phone
 needs: missions run on the box under `tole serve`, the phone lists
 running missions, receives pending Write approvals, and approves/denies
 from anywhere. The phone is a client of the token-authenticated serve face.
-(Graphical clients need more than polling: a transcript read ships with #524,
-resume-by-id and an event stream follow; see the UI epic #523.)
+(Graphical clients need more than polling: a transcript read, resume-by-id and an
+event stream ship with #524, image upload and read with #558; see the UI epic #523.)
 
 ## The surface uteke-mobile consumes
 
@@ -26,6 +26,9 @@ rate-limited per source IP).
 | Live events | `GET /sessions/{id}/events?after=<seq>` (#524) | Server-Sent Events, see [Event stream](#event-stream-524); replays the log from a `seq`, then follows it |
 | Resume a session | `POST /sessions` `{"resume": "<id>"}` (#524) | reopen an existing session, see [Resume by id](#resume-by-id-524) |
 | Read the transcript | `GET /sessions/{id}/entries?after=<seq>&limit=<n>` (#524) | one page of the session's log, see [Transcript read](#transcript-read-524); works while a turn runs |
+| Upload an image | `POST /sessions/{id}/images` (raw body, #558) | returns `{id, mime, bytes, fnv1a64}`; see [Images](#images-558) |
+| Prompt with images | `POST /sessions/{id}/prompt` `{text, images: [<id>]}` (#558) | the turn records the references, never the blob |
+| Read an image | `GET /sessions/{id}/images/{fnv1a64}` (#558) | only images recorded in that session's log |
 | Cost report | `GET /sessions/{id}/status` | the `mission` register: turns, steps, tokens, wall time, per-risk-tier tool calls |
 
 The round trip the app must support (the cross-repo acceptance):
@@ -157,6 +160,57 @@ Two kinds of frames, deliberately separate:
 - **Browsers.** `EventSource` cannot send an `Authorization` header: a web client reads the
   stream with `fetch` and its own SSE parser (or the token has to be passed another way, a
   decision left to the web client, #529).
+
+## Images (#558)
+
+A graphical client attaches images in two steps: upload, then reference the upload in a prompt.
+
+```sh
+curl -H "Authorization: Bearer $TOKEN" --data-binary @shot.png \
+  http://127.0.0.1:7801/sessions/$ID/images
+# {"id":"9f2c…","mime":"image/png","bytes":48213,"fnv1a64":"9f2c…"}
+curl -H "Authorization: Bearer $TOKEN" -d '{"text":"what is wrong here?","images":["9f2c…"]}' \
+  http://127.0.0.1:7801/sessions/$ID/prompt
+curl -H "Authorization: Bearer $TOKEN" -o shot.png \
+  http://127.0.0.1:7801/sessions/$ID/images/9f2c…
+```
+
+- **Upload.** `POST /sessions/{id}/images` takes the image as the raw request body (no
+  multipart, no inline `data:` URL in the prompt JSON). The type is sniffed from the bytes
+  (PNG, JPEG, GIF, WebP); the request's `Content-Type` is ignored. The file goes through the
+  same core resolve path as `--image` (jail, 10 MiB cap, sniff, FNV-1a 64) and is stored
+  content-addressed under `~/.codecora/tole/images/serve/<session id>/<fnv1a64>.<ext>` (inside
+  the spill dir the provider already reads `--image` data URLs from). The `id` is the content
+  hash, so uploading the same bytes twice returns the same reference and costs no quota. The
+  session must be live (resume it first). The answer never contains a server path.
+- **Prompt.** `images` is an optional array of upload ids next to `text`. Only uploads of the
+  same session resolve; each is re-checked against its hash before the turn starts. The user
+  message records the references (`path`, `mime`, `bytes`, `fnv1a64`) exactly like `--image`,
+  so the provider re-reads the file on every step, including after a restart and `resume`.
+- **Read.** `GET /sessions/{id}/images/{fnv1a64}` answers the bytes only for an image that the
+  session's log records. The jail, the recorded size and the hash of the bytes served are
+  re-checked on every read. The answer has the recorded `Content-Type`,
+  `X-Content-Type-Options: nosniff` and `Cache-Control: private, no-store`.
+- **Limits.** An upload body may be up to 10 MiB, and only once the headers carry the right
+  token: without it the plain 1 MiB body cap applies, so nothing larger is buffered before
+  auth. A declared body over the cap is authenticated before it is answered: a wrong or
+  missing token gets the usual `401` and counts against the per-IP auth limiter (`429` after
+  10 failures a minute), and only the right token gets `413`, so the size answer is never a
+  token check outside the limiter. An authenticated upload body gets 120 s instead of the usual 15 s read budget. Uploads
+  count within the server's 32-connection cap. Quotas on the stored uploads, in bytes:
+  `TOLE_SERVE_IMAGE_SESSION_QUOTA` per session (default 64 MiB) and
+  `TOLE_SERVE_IMAGE_TOTAL_QUOTA` across all serve sessions (default 512 MiB); `0` disables
+  uploads, an unparsable value keeps the default (with a warning on stderr).
+- **Errors.** `400` empty body, malformed id or `images` that is not an array of ids; `401`
+  without the token; `404` unknown or not-live session, unknown upload id, or an image that the
+  log does not record (or whose file is gone); `403` a recorded image outside the image jail;
+  `409` a stored or recorded file that no longer matches its hash, size or type (reported,
+  never served or sent); `413` over 10 MiB; `415` not a PNG/JPEG/GIF/WebP image; `503` no data
+  directory (`CODECORA_HOME` / `HOME` unset); `507` a quota would be exceeded (the message
+  names the variable).
+- **Known limitation.** Uploads that no prompt references are not garbage-collected, and
+  removing a session does not remove its uploads; they keep counting against the quotas until
+  removed by hand from the directory above. A cleanup is a follow-up.
 
 ## Auth model
 
