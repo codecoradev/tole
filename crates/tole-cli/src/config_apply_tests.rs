@@ -1159,31 +1159,48 @@ fn config_check_shows_the_effective_theme_and_ignores_a_project_theme() {
     std::fs::create_dir_all(p.parent().unwrap()).unwrap();
     std::fs::write(&p, "[tui]\ntheme = \"mono\"\n").unwrap();
     let out = check(&dir, None, Some(&up), &Flags::default(), &env_of(&[])).unwrap();
+    #[cfg(feature = "tui")]
     assert!(
         out.contains("tui.theme = \"light\"  [user config]  effective: \"light\"  (user config)"),
+        "{out}"
+    );
+    // A build without the TUI cannot validate a theme: it says so and never
+    // reports an effective value or a verdict.
+    #[cfg(not(feature = "tui"))]
+    assert!(
+        out.contains("tui.theme = \"light\"  [user config]  (not validated: this build has no TUI")
+            && !out.contains("effective: \"light\""),
         "{out}"
     );
     assert!(
         out.contains("tui.theme = \"mono\"  [config]  IGNORED: a project config cannot set"),
         "{out}"
     );
-    let out = check(
-        &dir,
-        None,
-        Some(&up),
-        &Flags::default(),
-        &env_of(&[("TOLE_THEME", "mono")]),
-    )
-    .unwrap();
-    assert!(
-        out.contains("effective: \"mono\"  (env TOLE_THEME)"),
-        "{out}"
-    );
+    #[cfg(feature = "tui")]
+    {
+        let out = check(
+            &dir,
+            None,
+            Some(&up),
+            &Flags::default(),
+            &env_of(&[("TOLE_THEME", "mono")]),
+        )
+        .unwrap();
+        assert!(
+            out.contains("effective: \"mono\"  (env TOLE_THEME)"),
+            "{out}"
+        );
+    }
     // An invalid value is flagged in the check output.
     std::fs::write(&up, "[tui]\ntheme = \"neon\"\n").unwrap();
     let out = check(&dir, None, Some(&up), &Flags::default(), &env_of(&[])).unwrap();
     #[cfg(feature = "tui")]
     assert!(out.contains("INVALID: tui.theme = \"neon\""), "{out}");
+    #[cfg(not(feature = "tui"))]
+    assert!(
+        out.contains("not validated") && !out.contains("INVALID"),
+        "{out}"
+    );
     let _ = std::fs::remove_dir_all(dir);
     let _ = std::fs::remove_dir_all(user);
 }

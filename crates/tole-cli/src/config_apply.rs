@@ -851,6 +851,12 @@ pub fn annotations(s: &Settings) -> BTreeMap<&'static str, String> {
             (None, None) => "  effective: (none)".to_string(),
         },
     );
+    // A build without the TUI cannot validate a theme and does not use one:
+    // say so instead of reporting an effective value or a verdict.
+    #[cfg(not(feature = "tui"))]
+    for k in ["tui.theme", "tui.colors"] {
+        m.insert(k, NEEDS_TUI.to_string());
+    }
     m.insert(
         "mission.verify_timeout",
         format!(
@@ -865,6 +871,9 @@ pub fn annotations(s: &Settings) -> BTreeMap<&'static str, String> {
 #[cfg(not(feature = "shell-tools"))]
 const NEEDS_SHELL_TOOLS: &str =
     "  (not supported by this build: needs the shell-tools feature; startup refuses it)";
+#[cfg(not(feature = "tui"))]
+const NEEDS_TUI: &str =
+    "  (not validated: this build has no TUI, so the theme is not used; the file is checked only for its TOML shape)";
 #[cfg(not(feature = "mcp"))]
 const NEEDS_MCP: &str =
     "  (not supported by this build: needs the mcp feature; startup refuses it)";

@@ -658,15 +658,25 @@ fn an_invalid_user_theme_never_aborts_a_command_and_check_flags_it() {
     let out = text(&o.stdout);
     assert!(o.status.success(), "{out} {}", text(&o.stderr));
     assert!(out.contains("tui.theme = \"neon\"  [user config]"), "{out}");
-    assert!(out.contains("INVALID: tui.theme = \"neon\""), "{out}");
-    // The env wins over the user config, with its source shown.
-    let o = cmd(&d, &home, &["config", "check"])
-        .env("TOLE_THEME", "light")
-        .output()
-        .unwrap();
-    let out = text(&o.stdout);
+    // Only a build with the TUI can validate a theme; the bare profile says
+    // so instead of giving a verdict.
+    #[cfg(feature = "tui")]
+    {
+        assert!(out.contains("INVALID: tui.theme = \"neon\""), "{out}");
+        // The env wins over the user config, with its source shown.
+        let o = cmd(&d, &home, &["config", "check"])
+            .env("TOLE_THEME", "light")
+            .output()
+            .unwrap();
+        let out = text(&o.stdout);
+        assert!(
+            out.contains("effective: \"light\"  (env TOLE_THEME)"),
+            "{out}"
+        );
+    }
+    #[cfg(not(feature = "tui"))]
     assert!(
-        out.contains("effective: \"light\"  (env TOLE_THEME)"),
+        out.contains("not validated: this build has no TUI") && !out.contains("INVALID"),
         "{out}"
     );
 }
