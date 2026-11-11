@@ -247,6 +247,45 @@ Everything below is merged; CHANGELOG entries carry the detail.
 - **Open backlog:** in-file session branching (#210 follow-up), MCP prompts/resources as quick commands (#213), background detach (#217; serve/MCP faces + job-completion nudge shipped, Ctrl-B/chat key waits for the TUI),
   attaching to a *running* Claude Code process (#381 remainder); the multi-client daemon note ([#382](daemon-design.md)) is parked.
 
+## Track E — Agentic automation (approved 2026-11-11)
+
+Owner discussion 2026-11-11 (competitor audit of OpenClaw, Hermes, Grok
+Bot and Nakama; BMAD for collaboration). Design notes:
+`docs/automation-design.md`, `docs/profiles-collaboration-secrets.md`,
+`docs/skills-registry-design.md`, `docs/secrets-integrations-design.md`,
+`docs/third-party-plugins-design.md`. Nothing implemented yet; 1 issue =
+1 branch = 1 PR.
+
+- **E1 — Automation, epic #577:** ledger core (#578), `tole cron` (#579),
+  time zones (#580), unattended approvals (#581), webhooks on `tole serve`
+  (#582). The scheduler lives inside tole.
+- **E2 — Profiles, delegation, discussion, routing, epic #583:**
+  - profiles (#584);
+  - delegation with budget carve, depth 2 (max 3), write lease and a
+    mandatory report (#585);
+  - model routing with RuleRouter plus LayaRouter, on/off by the
+    `SYSTEMONE_*` env (#586);
+  - advisor (#587);
+  - multi-round discussion with a sanitizer (#588);
+  - `uteke_document` parent (#576).
+- **E3 — Skills, epic #589:** `SkillIndex` + uteke doc adapter, K = 5 with
+  pinned core (#590), approved-hash loading (#591), propose-only growth with
+  meaning dedup (#592), curator on by default (#593).
+- **E4 — Secrets and third-party plugins, epic #594:**
+  - `SecretSet` at every sink (#595);
+  - redacted session log (#596);
+  - shared ruleset with uteke (#597);
+  - scoped release, with no secrets for `run_command` (#598, breaking);
+  - plugin lock and rug-pull guard (#599);
+  - `tole plugin` commands and trust tiers (#600);
+  - external sandbox wrapper and lazy start (#601).
+
+Suggested order: E4 #595 first (other epics reuse it), then E1 #578 → #579,
+E2 #584 → #585, E3 #590 → #591; the rest per each epic's order.
+Cross-repo in uteke OSS: document similarity (codecoradev/uteke#1730), personal
+skill library (codecoradev/uteke#1731), shared secret-detector crate
+(codecoradev/uteke#1732).
+
 ---
 
 ## Execution order
