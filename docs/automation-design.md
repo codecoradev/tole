@@ -13,10 +13,18 @@ design rules win.
 
 | Goal | Concrete budget (proposed; measure against `docs/perf.md` before merge) |
 |---|---|
-| Light | No new async runtime, no SQLite, no tz database crate, no `chrono`. Binary growth ≤ ~150 KB. Idle cost = one sleeping timer armed for the next due job; zero polling. |
-| Auditable | Scheduler core small enough to read in one sitting (target ≲ 1.5k LOC incl. tests), one module, deterministic (injected clock, no hidden globals). All state is JSONL readable with `jq`. |
+| Light | No new async runtime, no SQLite, no `chrono`. Idle cost = one sleeping timer armed for the next due job; zero polling. |
+| Auditable | Scheduler core readable in one sitting, one module, deterministic (injected clock, no hidden globals). All state is JSONL readable with `jq`. |
 | Durable | Crash at any byte boundary loses no job and double-fires none. Proven by a crash-injection test (kill between every append). |
 | Safe | Unattended ≠ unapproved. Same three enforcement layers; no new bypass path. |
+
+**Priority order when goals conflict:** correctness and durability, then
+runtime performance (latency, idle and per-run overhead), then auditability,
+then binary size and LOC. Size and line counts are **reported, not gated**:
+each PR records measured binary delta, idle wakeups/RSS and scheduler
+latency against `docs/perf.md`, and a larger or longer design is accepted
+when it is measurably faster or safer. Shrinking at the cost of performance
+or correctness is not a goal.
 
 ## 2. Problem → guardrail reference (so it does not repeat)
 
@@ -82,10 +90,25 @@ and process spawning live in `tole-cli`.
   or leave for the operator. No automatic infinite retry.
 - **Catch-up:** `catch_up=skip` (default) records `missed`; `one` fires a
   single late run within `grace_minutes`. Always logged (P1).
-- **Time zones:** v1 = UTC and fixed offsets only (no tz database, keeps the
-  binary small). IANA zones with DST are an explicit follow-up decision, not a
-  silent gap — a DST-sensitive schedule must be rejected with a clear error,
-  not misfire. *(Open question 1.)*
+- **Time zones: explicit, and pluggable.** Every job has an explicit
+  `timezone` (default: `cron.timezone` from config, else `UTC`); `tole cron
+  list` always prints it next to `next_run` (local and UTC). Accepted forms:
+  `UTC`, a fixed offset (`+07:00`), or an IANA name (`Asia/Jakarta`). The
+  source of zone rules is a config choice, `cron.tz_source`:
+  - `system` (default on Unix): parse TZif files from the host's
+    `/usr/share/zoneinfo` at runtime — a few hundred lines, **no embedded
+    database**, so zero binary cost and rules follow OS updates.
+  - `bundled` (cargo feature `tz-bundled`, for Windows/minimal containers/
+    embedders without zoneinfo): ships rules inside the binary at a measured size cost.
+  - `offset-only`: UTC and fixed offsets only; an IANA name is rejected.
+  A name that cannot be resolved by the chosen source is rejected **on save**
+  with a message naming the source, never silently treated as UTC.
+  DST semantics (Hermes-compatible: wall clock is preserved, `0 9 * * *`
+  stays 09:00 local across changes), recorded in each `fire`:
+  a local time that does not exist (spring-forward gap) fires once at the
+  first valid instant after the gap; an ambiguous local time (fall-back)
+  fires once, on the first occurrence. `every <dur>` jobs are plain
+  durations and unaffected. These cases get table-driven tests.
 - **Cron parsing:** small in-tree parser for 5-field cron (+ `@every`),
   property-tested against a brute-force minute walker. Prefer this over a
   dependency; revisit only if the audit cost of ~200 LOC exceeds a vetted crate
@@ -200,8 +223,8 @@ Each PR updates the README status line and `docs/epics.md` in the same PR
 
 ## 11. Open questions
 
-1. IANA time zones: accept a small tz dependency, or stay UTC/offset-only until
-   a user story demands it? (Recommendation: offset-only first.)
+1. ~~IANA time zones~~ — decided: explicit per-job zone, pluggable source
+   (§4). Remaining detail: default `cron.tz_source` on Windows (`bundled`).
 2. Should `tole cron` own a lockfile-based "singleton ticker" so `serve` and a
    system timer cannot both tick? (Recommendation: yes; the `fire` claim already
    makes double-ticking safe, the lock only avoids wasted wakeups.)
