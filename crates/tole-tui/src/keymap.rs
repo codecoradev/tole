@@ -308,8 +308,22 @@ impl Keymap {
         Ok(map)
     }
 
-    /// The action a key press triggers, if any.
+    /// The action a key press triggers, if any. Typing, Enter, Esc, Tab,
+    /// Backspace and Ctrl+C never trigger one, whatever the table says: a
+    /// second layer behind the parse-time rules, so even a table that skipped
+    /// them could not swallow those keys.
     pub fn action(&self, p: &KeyPress) -> Option<KeyAction> {
+        let m = p.mods;
+        let never = match p.key {
+            Key::Char('c' | 'C') if m.ctrl => true,
+            Key::Char(_) => !m.ctrl && !m.alt,
+            Key::Esc | Key::Backspace | Key::Tab => true,
+            Key::Enter => !(m.ctrl || m.alt || m.shift),
+            _ => false,
+        };
+        if never {
+            return None;
+        }
         self.binds
             .iter()
             .find(|(_, keys)| keys.iter().any(|k| k.matches(p)))
@@ -534,5 +548,60 @@ mod tests {
         // One action listing the same key twice.
         let e = err(&[("toggle_tools", &["ctrl+x", "CTRL+X"])]);
         assert!(e.contains("`toggle_tools`"), "{e}");
+    }
+
+    /// Defense in depth: even a table that skipped the parse-time rules
+    /// (built here by hand) cannot take the protected keys.
+    #[test]
+    fn a_hostile_table_cannot_take_the_protected_keys() {
+        let spec = |key, ctrl| KeySpec {
+            key,
+            mods: Mods {
+                ctrl,
+                alt: false,
+                shift: false,
+            },
+        };
+        let hostile = Keymap {
+            binds: vec![(
+                KeyAction::ToggleTools,
+                vec![
+                    spec(Key::Char('y'), false),
+                    spec(Key::Char('n'), false),
+                    spec(Key::Esc, false),
+                    spec(Key::Char('c'), true),
+                    spec(Key::Enter, false),
+                    spec(Key::Backspace, false),
+                    spec(Key::Char('x'), false),
+                    spec(Key::Tab, false),
+                ],
+            )],
+        };
+        for p in [
+            press(Key::Char('y'), false, false, false),
+            press(Key::Char('n'), false, false, false),
+            press(Key::Esc, false, false, false),
+            press(Key::Char('c'), true, false, false),
+            press(Key::Enter, false, false, false),
+            press(Key::Backspace, false, false, false),
+            press(Key::Char('x'), false, false, false),
+            press(Key::Tab, false, false, false),
+        ] {
+            assert_eq!(hostile.action(&p), None, "{p:?}");
+        }
+        // The approval prompt itself, under that table.
+        let mut app = crate::App::default().with_keymap(hostile);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let pend = |tx: std::sync::mpsc::Sender<tole_core::approval::Verdict>| {
+            crate::Pending::new(
+                crate::ApprovalRequest::new("write_file a", tole_core::tool::Risk::Write),
+                move |v| {
+                    let _ = tx.send(v);
+                },
+            )
+        };
+        app.on_msg(crate::Msg::Approval(pend(tx)));
+        app.on_input(crate::Input::new(Key::Char('y')));
+        assert_eq!(rx.try_recv(), Ok(tole_core::approval::Verdict::Allow));
     }
 }

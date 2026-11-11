@@ -12,6 +12,8 @@ mod editor;
 mod files;
 mod input;
 mod keymap;
+#[cfg(test)]
+mod keymap_tests;
 mod menu;
 mod paste;
 mod render;
@@ -880,7 +882,7 @@ impl App {
         }
         self.armed = false;
         if let Some(p) = self.approval.take() {
-            return self.answer(p, key.key);
+            return self.answer(p, key);
         }
         if self.picker.is_some() {
             return self.picker_key(key.key);
@@ -1047,11 +1049,14 @@ impl App {
         Action::Redraw
     }
 
-    /// y/n answer; Esc denies AND cancels the turn; anything else re-asks.
-    fn answer(&mut self, p: Pending, key: Key) -> Action {
-        let (verdict, note) = match key {
-            Key::Char('y' | 'Y') => (Verdict::Allow, "allowed"),
-            Key::Char('n' | 'N') => (Verdict::Deny, "denied"),
+    /// y/n answer (plain keys only); Esc denies AND cancels the turn; anything else re-asks.
+    fn answer(&mut self, p: Pending, key: KeyPress) -> Action {
+        // y / n are the plain keys: Alt+Y or Ctrl+N (a user may bind those to
+        // something else) never answer a prompt by accident.
+        let plain = !key.mods.ctrl && !key.mods.alt;
+        let (verdict, note) = match key.key {
+            Key::Char('y' | 'Y') if plain => (Verdict::Allow, "allowed"),
+            Key::Char('n' | 'N') if plain => (Verdict::Deny, "denied"),
             Key::Esc => {
                 p.resolve(Verdict::Deny);
                 let lines = self.transcript.line(Kind::Note, "  denied");
