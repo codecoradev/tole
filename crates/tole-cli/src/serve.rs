@@ -58,6 +58,8 @@ pub struct ServeConfig {
     pub sessions_dir: Option<std::path::PathBuf>,
     /// `--on-turnend` stop gates wired onto every session registry.
     pub turnend: Vec<String>,
+    /// `--cron`: host the cron ticker in-process (#579).
+    pub cron: bool,
 }
 
 /// Max concurrently open connections: each pinned thread holds ~8 KiB
@@ -133,6 +135,12 @@ pub fn run_serve(cfg: ServeConfig) -> Result<()> {
         cfg.allow_patterns.len(),
         cfg.plan_mode
     );
+    if cfg.cron {
+        let dir = tole_cli::cron::default_dir()?;
+        eprintln!("tole serve: cron ticker on {}", dir.display());
+        let queue = Arc::clone(&state.approvals);
+        std::thread::spawn(move || tole_cli::cron::serve_ticker(&dir, queue));
+    }
     use std::sync::atomic::Ordering;
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };

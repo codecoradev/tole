@@ -4,28 +4,46 @@
 //!    dead, compute what is `ready`, record `missed`/`blocked` and `claim`
 //!    each due occurrence (the claim is durable before anything runs).
 //! 2. Without the lock: execute the claimed runs, at most
-//!    `max_concurrent` at a time.
-//! 3. Under the lock again: `settle` each run, then record its delivery.
+//!    `max_concurrent` at a time — script jobs as argv, agent jobs as one
+//!    durable session each (see [`super::agent`]).
+//! 3. Under the lock again: `settle` every run, then record its delivery.
 //!
 //! A crash anywhere leaves either no claim (nothing ran) or a claim that
 //! the next tick's `recover` turns into `interrupted` — never a re-run.
+//! Run output is passed through the `SecretSet` redactor (#595) before it
+//! is written to disk.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use serde_json::json;
+use serde_json::{json, Value};
 use tole_core::ledger::{DeliveryStatus, Fire, Job, LedgerError, RunStatus};
 
 use super::{field, mode, store, DEFAULT_TIMEOUT_SECS};
+use crate::approvals::ApprovalQueue;
 
 /// Largest run output kept (bytes); the rest is cut with a marker.
 const MAX_OUTPUT: usize = 1 << 20;
 
 /// Tick tuning.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TickOptions {
     pub max_concurrent: usize,
+    /// `tole serve --cron`: the `/approvals` queue agent runs park
+    /// non-allowlisted Writes in. `None` (standalone tick): refused.
+    pub approvals: Option<Arc<ApprovalQueue>>,
+}
+
+impl TickOptions {
+    /// A standalone tick (no approvals queue).
+    pub const fn standalone(max_concurrent: usize) -> Self {
+        Self {
+            max_concurrent,
+            approvals: None,
+        }
+    }
 }
 
 /// What one tick did.
@@ -50,10 +68,51 @@ pub fn output_path(dir: &Path, fire_id: &str) -> PathBuf {
     dir.join("runs").join(format!("{safe}.out"))
 }
 
+/// One finished run, ready to settle.
+struct RunResult {
+    status: RunStatus,
+    session_id: Option<String>,
+    output: String,
+    usage: Value,
+    target: &'static str,
+}
+
+fn execute(job: &Job, opts: &TickOptions) -> RunResult {
+    if mode(job) == "script" {
+        let out = run_script(job);
+        return RunResult {
+            status: out.status,
+            session_id: None,
+            usage: json!({
+                "tokens": 0,
+                "exit_code": out.exit_code,
+                "duration_ms": out.duration_ms,
+                "error": out.error,
+            }),
+            output: out.stdout,
+            target: "log",
+        };
+    }
+    let started = Instant::now();
+    let run = super::agent::run_agent(job, opts.approvals.as_ref());
+    RunResult {
+        status: run.status,
+        usage: json!({
+            "duration_ms": started.elapsed().as_millis(),
+            "error": run.error,
+            "approvals": if opts.approvals.is_some() { "parked" } else { "refused" },
+        }),
+        session_id: run.session_id,
+        output: run.text,
+        target: "session",
+    }
+}
+
 /// One scheduler pass at `now` (Unix seconds).
 pub fn tick(dir: &Path, now: i64, opts: &TickOptions) -> anyhow::Result<TickReport> {
     let lease = store::own_lease();
     let mut report = TickReport::default();
+    let provider_ready = crate::turn_runner::provider_config().is_ok();
     let claimed: Vec<(Fire, Job)> = store::with_lock(dir, |l| {
         report.recovered = l.recover(now, store::lease_alive)?.len();
         let mut claimed = Vec::new();
@@ -62,11 +121,13 @@ pub fn tick(dir: &Path, now: i64, opts: &TickOptions) -> anyhow::Result<TickRepo
             let Some(job) = l.state().job(&due.job_id).map(|j| j.job.clone()) else {
                 continue;
             };
-            if due.fire.is_some() && mode(&job) != "script" {
+            // Pre-dispatch validation (P10): an agent job without a
+            // provider is blocked before it can spend anything.
+            if due.fire.is_some() && mode(&job) != "script" && !provider_ready {
                 l.block(
                     &due,
-                    "agent_mode_unavailable",
-                    Some("agent runs land in a follow-up of #579; nothing was spent".into()),
+                    "provider_missing",
+                    Some(crate::turn_runner::MISSING_PROVIDER_CONFIG.into()),
                     now,
                 )?;
                 report.blocked += 1;
@@ -86,35 +147,55 @@ pub fn tick(dir: &Path, now: i64, opts: &TickOptions) -> anyhow::Result<TickRepo
 
     let started = Instant::now();
     let results = run_bounded(claimed, opts.max_concurrent, |(fire, job)| {
-        let out = run_script(&job);
+        let out = execute(&job, opts);
         (fire, out)
     });
-
     let end = now + started.elapsed().as_secs() as i64;
-    std::fs::create_dir_all(dir.join("runs"))?;
-    for (fire, out) in &results {
-        std::fs::write(output_path(dir, &fire.fire_id), &out.stdout)?;
-    }
+
+    // Keep the output (redacted). A failed write is recorded on the run,
+    // never a reason to leave a claim unsettled.
+    let secrets = tole_core::secrets::SecretSet::from_env();
+    let results: Vec<(Fire, RunResult)> = results
+        .into_iter()
+        .map(|(fire, mut r)| {
+            r.output = secrets.redact(&r.output).into_owned();
+            let path = output_path(dir, &fire.fire_id);
+            let written = std::fs::create_dir_all(dir.join("runs"))
+                .and_then(|()| std::fs::write(&path, &r.output));
+            if let (Err(e), Some(u)) = (written, r.usage.as_object_mut()) {
+                u.insert("output_error".into(), e.to_string().into());
+            }
+            (fire, r)
+        })
+        .collect();
+
     store::with_lock(dir, |l| {
-        for (fire, out) in results {
-            let usage = json!({
-                "tokens": 0,
-                "exit_code": out.exit_code,
-                "duration_ms": out.duration_ms,
-                "error": out.error,
-            });
-            let done = l.settle(&fire.fire_id, out.status, None, Some(usage), end)?;
-            let silent = out.stdout.trim().is_empty()
-                || out.stdout.lines().next().map(str::trim) == Some("[SILENT]");
+        let mut first_err = None;
+        for (fire, r) in results {
+            let settled = l.settle(&fire.fire_id, r.status, r.session_id, Some(r.usage), end);
+            let done = match settled {
+                Ok(d) => d,
+                Err(e) => {
+                    first_err.get_or_insert(e);
+                    continue;
+                }
+            };
+            let silent = r.output.trim().is_empty()
+                || r.output.lines().next().map(str::trim) == Some("[SILENT]");
             let delivery = if silent {
                 DeliveryStatus::Skipped
             } else {
                 DeliveryStatus::Sent
             };
-            l.deliver(&fire.fire_id, "log", delivery, None, end)?;
+            if let Err(e) = l.deliver(&fire.fire_id, r.target, delivery, None, end) {
+                first_err.get_or_insert(e);
+            }
             report.ran.push((fire.fire_id, done.status));
         }
-        Ok(())
+        match first_err {
+            Some(e) => Err(e.into()),
+            None => Ok(()),
+        }
     })?;
     Ok(report)
 }

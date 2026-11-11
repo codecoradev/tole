@@ -262,8 +262,10 @@ Bot and Nakama; BMAD for collaboration). Design notes:
   claim/fold/recovery, catch-up with `missed` records, crash-injection and
   property tests; UTC only). #579 in progress: the file adapter and
   `tole cron create|list|pause|resume|remove|runs|tick` with script mode
-  landed; agent mode, the `tole serve` ticker, approvals parking, delivery
-  targets, budgets and `doctor` checks follow.
+  landed, then agent mode (session per run, model pin, step/minute
+  budgets), the `tole serve --cron` ticker and approvals parking; delivery
+  targets, `run`/`cancel`/`edit`/`status`, the token budget and daily cap
+  and `doctor` checks follow.
 - **E2 — Profiles, delegation, discussion, routing, epic #583:**
   - profiles (#584; config, `--profile`, tiers, room and persona done in
     the PR for #584; `tole cron create --profile` follows);
