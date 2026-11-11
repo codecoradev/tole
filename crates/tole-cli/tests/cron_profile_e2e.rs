@@ -463,7 +463,13 @@ fn required_approval_blocks_an_unapproved_name_entry() {
     e.required.set(true);
     assert!(e.ok(&["cron", "run", "n"]).contains("blocked 1"));
     assert!(seen.lock().unwrap().is_empty());
-    e.ok(&["skills", "approve", "lint"]);
+    let listed = e.ok(&["skills", "list"]);
+    let hash = listed
+        .split_whitespace()
+        .find(|w| w.starts_with("sha256:"))
+        .unwrap()
+        .to_string();
+    e.ok(&["skills", "approve", "lint", "--hash", &hash]);
     std::thread::sleep(std::time::Duration::from_millis(1100));
     assert!(e.ok(&["cron", "run", "n"]).contains(" ok"));
 }

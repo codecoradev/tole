@@ -155,8 +155,14 @@ impl SkillIndex for RedactingIndex {
     ) -> Result<Vec<Candidate>, String> {
         self.inner.search(&self.secrets.redact(query), filter, k)
     }
+    /// The description leaves the process too: redacted, while the content
+    /// hash stays the real file's.
     fn upsert(&self, entry: &SkillEntry) -> Result<(), String> {
-        self.inner.upsert(entry)
+        let entry = SkillEntry {
+            description: self.secrets.redact(&entry.description).into_owned(),
+            ..entry.clone()
+        };
+        self.inner.upsert(&entry)
     }
     fn retire(&self, name: &str) -> Result<(), String> {
         self.inner.retire(name)
@@ -566,6 +572,28 @@ mod tests {
         fn retire(&self, _: &str) -> Result<(), String> {
             Ok(())
         }
+    }
+
+    /// Review note on #616: an upserted entry leaves the process too; its
+    /// description is redacted, its content hash stays the real file's.
+    #[test]
+    fn upserted_descriptions_are_redacted_and_keep_their_hash() {
+        let secret = "ghp_0123456789abcdefSECRET";
+        let rec = Arc::new(Recording(Default::default()));
+        let idx = RedactingIndex::new(rec.clone(), SecretSet::default().with("GH_TOKEN", secret));
+        let entry = SkillEntry {
+            name: "deploy".into(),
+            description: format!("push with {secret}"),
+            profiles: vec![],
+            status: tole_core::skill_index::SkillStatus::Approved,
+            content_hash: "sha256:real".into(),
+        };
+        idx.upsert(&entry).unwrap();
+        let got = rec.0.lock().unwrap()[0].clone();
+        assert!(!got.description.contains(secret), "{got:?}");
+        assert!(got.description.contains("«GH_TOKEN»"), "{got:?}");
+        assert_eq!(got.content_hash, "sha256:real");
+        assert_eq!(got.name, "deploy");
     }
 
     /// A query may leave the process (uteke against a cloud store): the
