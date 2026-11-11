@@ -4,6 +4,11 @@ Status: **proposal, nothing implemented.** Scope: unattended runs of tole
 (scheduled and event-triggered). Chat channels (Telegram, Slack, …) are
 explicitly **out of scope** for this note.
 
+**Placement (owner decision 2026-11-11):** the scheduler lives **inside
+tole**, not in a separate repository: the ledger core in `tole-core`, the
+host (ticker in `tole serve`, `tole cron tick`) in `tole-cli`. This
+supersedes the 2026-11-09 proposal to put the scheduler in a new repository.
+
 Model to follow: [Hermes Agent](https://hermes-agent.nousresearch.com/docs/user-guide/features/cron)
 (`cron`, `webhook subscribe`, `no_agent` jobs, per-job model pin, catch-up
 window). Where Hermes and tole's design rules (`AGENTS.md` §6) disagree, the

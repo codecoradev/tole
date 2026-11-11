@@ -537,18 +537,18 @@ All on sanitized or owner-written text only, never raw payloads:
   separately in the usage ledger and carved from the run's budget, and each
   consultation is a ledger entry.
 
-**Conflicts with earlier recorded context (need an explicit owner
-acknowledgement):**
+**Conflicts with earlier recorded context, resolved by the owner
+(2026-11-11):**
 1. The 2026-10-06 competitor research marked "multi-agent without a cap"
-   as anti-DNA and kept depth 1. A8 now allows any number of profiles and
-   depth 2 (max 3). This note treats A8 as superseding it, with the budget
-   carve (A8.1) as the cap that replaces the count cap.
-2. The 2026-11-09 proposal (not yet decided) put the scheduler and gateway
-   in a **separate repository**, with tole as a narrow kernel and the
-   scheduler calling `tole mission` as a subprocess.
-   [automation-design.md](automation-design.md) instead places the
-   scheduler inside tole. Open: where the scheduler host lives. The ledger
-   core can live in `tole-core` either way.
+   as anti-DNA and kept depth 1. **Superseded:** A8 stands (any number of
+   profiles, depth 2 by default, max 3), with the budget carve (A8.1) as
+   the cap that replaces the count cap.
+2. The 2026-11-09 proposal put the scheduler and gateway in a separate
+   repository, with tole as a narrow kernel. **Decided: the scheduler stays
+   inside tole** (the ledger core in `tole-core`, the ticker in `tole serve`,
+   and `tole cron tick`), as in [automation-design.md](automation-design.md).
+   The gateway (chat channels) is out of scope for now; where it lives
+   stays open.
 
 ## Part B — Secrets leaking to the LLM
 
