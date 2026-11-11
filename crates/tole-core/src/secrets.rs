@@ -309,21 +309,28 @@ fn forms(value: &str) -> Vec<String> {
     }
     v.push(base64::engine::general_purpose::STANDARD_NO_PAD.encode(value));
     v.push(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value));
-    let pct = percent_encode(value);
-    v.push(pct.to_ascii_lowercase());
-    v.push(pct);
+    // Only the hex digits differ between the two encodings; literal
+    // characters keep their case (lowercasing the whole string would miss
+    // `Ab%2fcd` and match unrelated lowercase text).
+    v.push(percent_encode(value, true));
+    v.push(percent_encode(value, false));
     v.dedup();
     v
 }
 
-/// RFC 3986 percent-encoding of everything outside the unreserved set.
-fn percent_encode(value: &str) -> String {
+/// RFC 3986 percent-encoding of everything outside the unreserved set,
+/// with upper- or lowercase hex digits.
+fn percent_encode(value: &str, upper: bool) -> String {
     let mut out = String::with_capacity(value.len());
     for &b in value.as_bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
             out.push(b as char);
         } else {
-            out.push_str(&format!("%{b:02X}"));
+            out.push_str(&if upper {
+                format!("%{b:02X}")
+            } else {
+                format!("%{b:02x}")
+            });
         }
     }
     out
@@ -434,6 +441,26 @@ mod tests {
             assert!(out.contains("«DB_PASSWORD»"), "{enc} -> {out}");
             assert!(!out.contains(&enc[..enc.len().min(12)]), "{enc} -> {out}");
         }
+    }
+
+    #[test]
+    fn percent_forms_keep_the_case_of_literal_characters() {
+        // Mixed case plus a reserved character: only the hex digits of the
+        // escape may change case between encoders.
+        let s = set(&[("MIX_TOKEN", "Ab/cdEFGHIJ")]);
+        for url in [
+            "https://x.example/?k=Ab%2FcdEFGHIJ",
+            "https://x.example/?k=Ab%2fcdEFGHIJ",
+        ] {
+            assert_eq!(s.redact(url), "https://x.example/?k=«MIX_TOKEN»", "{url}");
+        }
+    }
+
+    #[test]
+    fn the_lowercased_copy_of_a_mixed_case_secret_is_not_a_needle() {
+        let s = set(&[("MIX_TOKEN", "AbCdEfGh1234")]);
+        assert_eq!(s.redact("abcdefgh1234"), "abcdefgh1234");
+        assert_eq!(s.redact("AbCdEfGh1234"), "«MIX_TOKEN»");
     }
 
     #[test]
