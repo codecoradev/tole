@@ -105,6 +105,8 @@ struct Env {
     url: String,
     /// Run the child with TOLE_SKILL_APPROVAL=required.
     required: std::cell::Cell<bool>,
+    /// Leave TOLE_SKILL_APPROVAL unset (the default: required).
+    default_approval: std::cell::Cell<bool>,
 }
 
 impl Env {
@@ -117,6 +119,7 @@ impl Env {
             bin: root.join("bin"),
             url: url.to_string(),
             required: std::cell::Cell::new(false),
+            default_approval: std::cell::Cell::new(false),
         };
         for d in [&e.home, &e.cron, &e.work, &e.bin] {
             std::fs::create_dir_all(d).unwrap();
@@ -168,8 +171,14 @@ impl Env {
         ] {
             c.env_remove(k);
         }
-        if self.required.get() {
+        // Skill approval is required by default; the profile and pinning
+        // tests opt out explicitly, the approval test keeps the default.
+        if self.default_approval.get() {
+            // Unset: the default applies.
+        } else if self.required.get() {
             c.env("TOLE_SKILL_APPROVAL", "required");
+        } else {
+            c.env("TOLE_SKILL_APPROVAL", "off");
         }
         if self.bin.join("uteke").exists() {
             c.env("TOLE_MEMORY", "uteke");
@@ -472,6 +481,31 @@ fn required_approval_blocks_an_unapproved_name_entry() {
     e.ok(&["skills", "approve", "lint", "--hash", &hash]);
     std::thread::sleep(std::time::Duration::from_millis(1100));
     assert!(e.ok(&["cron", "run", "n"]).contains(" ok"));
+}
+
+/// Required is the default: an existing job whose name skill is not
+/// approved is `blocked` (`skill_not_approved`), and the recorded detail
+/// names the exact command that fixes it.
+#[test]
+fn by_default_an_unapproved_name_skill_blocks_with_the_fix_command() {
+    let (url, seen) = spawn_mock();
+    let e = Env::new(&url);
+    e.skill("lint", "v1");
+    e.default_approval.set(true);
+    e.ok(&[
+        "cron", "create", "@daily", "p", "--id", "d", "--skill", "lint",
+    ]);
+    assert!(e.ok(&["cron", "run", "d"]).contains("blocked 1"));
+    assert!(seen.lock().unwrap().is_empty());
+    let ledger = std::fs::read_to_string(tole_cli::cron::store::ledger_path(&e.cron)).unwrap();
+    let block = ledger
+        .lines()
+        .find(|l| l.contains("skill_not_approved"))
+        .unwrap_or_else(|| panic!("{ledger}"));
+    assert!(
+        block.contains("tole skills approve lint --hash sha256:"),
+        "{block}"
+    );
 }
 
 #[test]

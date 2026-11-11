@@ -4,8 +4,9 @@ Status: **research + proposal; phase 1 (#590) implemented:** the
 `SkillIndex` seam (`crates/tole-core/src/skill_index.rs`), the `uteke doc`
 adapter, pinned + top-K selection, `skill_search` and `tole skills`, opt-in
 with `TOLE_SKILL_INDEX=uteke`; **#591 implemented:** approved-hash loading
-(§4.2) in `crates/tole-core/src/skill_approval.rs`, opt-in with
-`TOLE_SKILL_APPROVAL=required`, plus `tole skills approve|revoke|list`.
+(§4.2) in `crates/tole-core/src/skill_approval.rs`, required by default
+(§7, decision 5; `TOLE_SKILL_APPROVAL=off` opts out), plus
+`tole skills approve|revoke|list`.
 Part of the
 integration/plugin track (scope order decided 2026-11-11: **own
 integrations first, third-party second**). Related:
@@ -300,6 +301,13 @@ prefer local ONNX or the owner's own embor.
    dream dedup run on memories; document chunks are excluded. Filed as codecoradev/uteke#1730.
 4. **The curator is on by default and can be switched off** (config and
    per-run), and it can be paused, as in Hermes.
+5. **Skill approval is required by default** (owner, 2026-11-11: "TOLE_SKILL_APPROVAL
+   required wajib di set"). A discovered skill loads only when its package
+   hashes to the owner's approval (§4.2); `TOLE_SKILL_APPROVAL=off` in the
+   environment is the only opt-out (no config key, so a cloned repository
+   cannot loosen it). Skills the owner names directly (`--skill <file>`, a
+   profile's `skills`) stay ungated. Unapproved skills produce one startup
+   note and a `tole doctor` line with the fix.
 
 ### 7.1 OSS skill storage: a `skill` tag on documents, or new tables?
 

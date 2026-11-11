@@ -738,6 +738,14 @@ pub fn run_cli(
             &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
         )
     );
+    // Skill approval (#591; required by default): what a session can load.
+    for l in crate::skill_approve::doctor_lines(
+        &crate::config_apply::real_env,
+        tole_core::skill_approval::Approvals::default_path().as_deref(),
+        std::env::current_dir().ok().as_deref(),
+    ) {
+        println!("{l}");
+    }
     // Scheduler (#579, P5): a stale ticker while jobs are active fails.
     #[cfg(feature = "shell-tools")]
     let ok = {

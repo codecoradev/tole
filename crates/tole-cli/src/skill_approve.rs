@@ -1,13 +1,16 @@
 //! Owner approval of skill content (#591): the `TOLE_SKILL_APPROVAL`
 //! setting and `tole skills approve|revoke|list`.
 //!
-//! - `TOLE_SKILL_APPROVAL=off` (default): every skill on disk loads, as
-//!   before.
-//! - `TOLE_SKILL_APPROVAL=required`: a session loads a skill only when its
-//!   package (SKILL.md plus every other file of its directory) hashes to the
-//!   owner's approval in `$CODECORA_HOME/tole/skill-approvals.json`. Any
-//!   other skill is listed by name as unavailable and `load_skill` refuses
-//!   it. A malformed approvals file fails startup.
+//! - `required` (the default, owner decision 2026-11-11): a session loads a
+//!   skill only when its package (SKILL.md plus every other file of its
+//!   directory) hashes to the owner's approval in
+//!   `$CODECORA_HOME/tole/skill-approvals.json`. Any other skill is listed
+//!   by name as unavailable and `load_skill` refuses it. A malformed
+//!   approvals file fails startup.
+//! - `TOLE_SKILL_APPROVAL=off`: every skill on disk loads (the pre-default
+//!   behavior). Only the environment can opt out: there is no config key,
+//!   and the config schema refuses unknown keys, so a project config can
+//!   never loosen the gate.
 //!
 //! Skills the owner names directly (`--skill <file>`, a profile's `skills`)
 //! are not gated: naming the file is the approval.
@@ -27,18 +30,81 @@ pub fn gate_from(
 ) -> Result<(Gate, Vec<String>), String> {
     let mode = env(APPROVAL_ENV).map(|v| v.trim().to_string());
     match mode.as_deref() {
-        None | Some("") | Some("off") => Ok((Gate::Open, Vec::new())),
-        Some("required") => match path {
+        Some("off") => Ok((Gate::Open, Vec::new())),
+        None | Some("") | Some("required") => match path {
             Some(p) => Ok((Gate::Approved(Arc::new(Approvals::load(p)?)), Vec::new())),
             None => Ok((
                 Gate::Approved(Arc::new(Approvals::default())),
                 vec![format!(
-                    "{APPROVAL_ENV}=required but the CodeCora home is unresolvable: \
-                     no skill is approved"
+                    "skill approval is required but the CodeCora home is unresolvable: \
+                     no skill can be approved (set CODECORA_HOME or HOME, or \
+                     {APPROVAL_ENV}=off)"
                 )],
             )),
         },
         Some(v) => Err(format!("{APPROVAL_ENV}={v:?}: expected off or required")),
+    }
+}
+
+/// How many discovered skills `gate` refuses as not approved.
+pub fn unapproved_count(workspace: Option<&Path>, gate: &Gate) -> usize {
+    if *gate == Gate::Open {
+        return 0;
+    }
+    tole_core::skills::skill_names(workspace)
+        .iter()
+        .filter(|n| {
+            matches!(
+                gate.load(workspace, n),
+                Err(tole_core::skills::LoadError::NotApproved { .. })
+            )
+        })
+        .count()
+}
+
+/// The fix an owner runs for unapproved skills.
+pub const APPROVE_HINT: &str = "tole skills list; tole skills approve <name> --hash <h>";
+
+/// The one startup note for unapproved skills (`None` when there are
+/// none). It never names a description.
+pub fn startup_note(workspace: Option<&Path>, gate: &Gate) -> Option<String> {
+    match unapproved_count(workspace, gate) {
+        0 => None,
+        n => Some(format!(
+            "{n} skill(s) unavailable until approved ({APPROVE_HINT})"
+        )),
+    }
+}
+
+/// `tole doctor` lines for skill approval.
+pub fn doctor_lines(
+    env: &dyn Fn(&str) -> Option<String>,
+    path: Option<&Path>,
+    workspace: Option<&Path>,
+) -> Vec<String> {
+    let gate = match gate_from(env, path) {
+        Ok((g, _)) => g,
+        Err(e) => return vec![format!("  ! skills: {e}")],
+    };
+    if gate == Gate::Open {
+        return vec![format!(
+            "  skills: approval off ({APPROVAL_ENV}=off): every discovered skill loads"
+        )];
+    }
+    if path.is_none() {
+        return vec![format!(
+            "  ! skills: approval is required but the CodeCora home is unresolvable, so no \
+             skill can ever be approved (set CODECORA_HOME or HOME, or {APPROVAL_ENV}=off)"
+        )];
+    }
+    let total = tole_core::skills::skill_names(workspace).len();
+    match unapproved_count(workspace, &gate) {
+        0 => vec![format!(
+            "  skills: approval required, all {total} discovered skill(s) approved"
+        )],
+        n => vec![format!(
+            "  ! skills: {n} skill(s) unavailable until approved ({APPROVE_HINT})"
+        )],
     }
 }
 
@@ -263,12 +329,22 @@ mod tests {
     }
 
     #[test]
-    fn the_setting_is_off_by_default_and_required_reads_the_approvals() {
+    fn the_setting_is_required_by_default_and_off_is_explicit() {
         let dir = ws("env");
         let path = dir.join("approvals.json");
-        for off in [None, Some(""), Some(" off ")] {
-            assert_eq!(gate_from(&env(off), Some(&path)).unwrap().0, Gate::Open);
+        // Owner decision 2026-11-11: required unless the environment opts
+        // out explicitly.
+        for unset in [None, Some(""), Some(" ")] {
+            assert_eq!(
+                gate_from(&env(unset), Some(&path)).unwrap().0,
+                Gate::Approved(Arc::new(Approvals::default())),
+                "{unset:?}"
+            );
         }
+        assert_eq!(
+            gate_from(&env(Some(" off ")), Some(&path)).unwrap().0,
+            Gate::Open
+        );
         let (gate, notes) = gate_from(&env(Some("required")), Some(&path)).unwrap();
         assert_eq!(gate, Gate::Approved(Arc::new(Approvals::default())));
         assert!(notes.is_empty());
@@ -280,6 +356,74 @@ mod tests {
         assert!(gate_from(&env(Some("yes")), Some(&path)).is_err());
         std::fs::write(&path, "nope").unwrap();
         assert!(gate_from(&env(Some("required")), Some(&path)).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Only the environment can opt out: no config key exists for it, and
+    /// the config schema refuses unknown keys, so a project config cannot
+    /// loosen the gate.
+    #[test]
+    fn a_project_config_cannot_turn_approval_off() {
+        let p = Path::new("/repo/.tole/config.toml");
+        for src in [
+            "skill_approval = \"off\"\n",
+            "skills_approval = \"off\"\n",
+            "[skills]\napproval = \"off\"\n",
+            "TOLE_SKILL_APPROVAL = \"off\"\n",
+        ] {
+            assert!(crate::config::parse(src, p).is_err(), "{src}");
+        }
+    }
+
+    /// Migration UX: one note with the count and the fix, no description.
+    #[test]
+    fn unapproved_skills_get_one_note_and_a_doctor_line() {
+        let dir = ws("note");
+        let s = dir.join("skills").join("other");
+        std::fs::create_dir_all(&s).unwrap();
+        std::fs::write(
+            s.join("SKILL.md"),
+            "---\nname: other\ndescription: \"SECRET PLAN\"\n---\nb",
+        )
+        .unwrap();
+        let mut a = Approvals::default();
+        a.approve(&read_package(Some(&dir), "demo").unwrap(), 1);
+        let gate = Gate::Approved(Arc::new(a.clone()));
+        assert_eq!(unapproved_count(Some(&dir), &gate), 1);
+        let note = startup_note(Some(&dir), &gate).unwrap();
+        assert_eq!(
+            note,
+            "1 skill(s) unavailable until approved \
+             (tole skills list; tole skills approve <name> --hash <h>)"
+        );
+        assert_eq!(startup_note(Some(&dir), &Gate::Open), None);
+        a.approve(&read_package(Some(&dir), "other").unwrap(), 1);
+        assert_eq!(
+            startup_note(Some(&dir), &Gate::Approved(Arc::new(a.clone()))),
+            None
+        );
+        // doctor: the same count and hint; a warning when nothing can ever
+        // be approved; the explicit opt-out is reported.
+        let path = dir.join("approvals.json");
+        let lines = doctor_lines(&env(None), Some(&path), Some(&dir)).join("\n");
+        assert!(
+            lines.contains("! skills: 2 skill(s) unavailable until approved"),
+            "{lines}"
+        );
+        assert!(!lines.contains("SECRET"), "{lines}");
+        let lines = doctor_lines(&env(None), None, Some(&dir)).join("\n");
+        assert!(
+            lines.contains("! skills:") && lines.contains("unresolvable"),
+            "{lines}"
+        );
+        let lines = doctor_lines(&env(Some("off")), Some(&path), Some(&dir)).join("\n");
+        assert!(lines.contains("TOLE_SKILL_APPROVAL=off"), "{lines}");
+        a.save(&path).unwrap();
+        let lines = doctor_lines(&env(None), Some(&path), Some(&dir)).join("\n");
+        assert!(
+            lines.contains("all 2 discovered skill(s) approved"),
+            "{lines}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
