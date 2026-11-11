@@ -266,3 +266,68 @@ prefer local ONNX or the owner's own embor.
   and `--dry-run`.
 - The curator manages only agent-grown skills by default; hand-written and
   third-party skills are untouched unless the owner adopts them.
+
+## 7. Round 3 decisions (2026-11-11)
+
+1. **Start now:** tole builds against the `SkillIndex` seam with a
+   `uteke doc` adapter (tag `skill` plus metadata), without waiting for an
+   OSS skill library.
+2. **Open-core split agreed** (uteke Cloud is heading toward teams):
+   - OSS gets the personal skill library.
+   - Cloud keeps the registry (pool, ingest and scanning, private sync,
+     sharing, yank, quotas).
+   - This changes the 2026-11-10 "Cloud only" decision; it is recorded on
+     the uteke side.
+3. **Similarity detection must cover documents**, not only memories. Today
+   `auto_link_cosine` (similar_to ≥ 0.80, possible_duplicate ≥ 0.92) and the
+   dream dedup run on memories; document chunks are excluded. An issue for
+   uteke is drafted (see 7.2); this session could not create it because
+   push access to `codecoradev/uteke` was refused.
+4. **The curator is on by default and can be switched off** (config and
+   per-run), and it can be paused, as in Hermes.
+
+### 7.1 OSS skill storage: a `skill` tag on documents, or new tables?
+
+The OSS `documents` table already has `tags` (JSON), `metadata` (JSON),
+`content_type`, a parent tree, and `document_chunks` with embeddings. A
+tag gets search for free, but a skill is more than one markdown document:
+
+- it is a **package** (`references/`, `scripts/`, `assets/`);
+- it has **lifecycle state** (draft, approved, stale, archived, pinned,
+  locked);
+- it has **approved content hashes per version**, **usage counters**, and a
+  **mutation ledger**;
+- the Cloud design already decided on a separate entity (`skills`,
+  `skill_versions`, …).
+
+**Recommendation: hybrid.**
+- New tables in OSS for identity and lifecycle, with the same names and
+  fields as the Cloud sketch so moving a library to Cloud is a copy, not a
+  migration: `skills`, `skill_versions` (hash, status, validity), `skill_usage`,
+  and a mutation ledger.
+- The existing document/chunk/embedding engine stays the **only** search
+  engine: each approved version's SKILL.md and reference files are indexed
+  as documents with `content_type = 'skill'`, linked to the version.
+- Those documents are hidden from ordinary `doc list` / `doc search` and
+  recall unless asked for, so skills do not pollute document recall.
+- One search engine, one embedding pipeline, and a clean lifecycle model.
+- tole's phase-1 adapter uses a `skill` tag on plain documents; the
+  phase-2 adapter talks to the new `uteke skill` commands.
+
+### 7.2 Drafted uteke issues (to file in `codecoradev/uteke`)
+
+1. **feat(docs): similarity edges and duplicate report for documents.**
+   - Extend the cosine auto-link to documents: one document-level
+     embedding (title + first section, or the mean of chunk vectors),
+     `similar_to` / `possible_duplicate` edges between documents.
+   - Add `uteke doc similar <slug> [--threshold]` and a namespace-scoped
+     duplicate report.
+   - Make the thresholds configurable (the code notes "configurable in
+     future via graph config").
+   - Keep contradiction checks out of scope for v1.
+2. **feat: personal skill library in OSS (open-core split).**
+   - The tables of 7.1, plus `uteke skill index <dir>`, `search`, `show`,
+     `similar`, `lint`, and an approved-hash record.
+   - Reuses the document engine.
+   - No pool, no GitHub ingest, no sharing: those stay in Cloud.
+
