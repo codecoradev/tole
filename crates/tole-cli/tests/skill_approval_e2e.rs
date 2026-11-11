@@ -202,10 +202,29 @@ fn required_approval_lists_unapproved_skills_by_name_only() {
     let sys = system_of(&seen, 1);
     assert!(sys.contains("- good (unavailable"), "{sys}");
 
-    // Off (the default): every skill is listed as before.
+    // Unset: required is the default (owner decision 2026-11-11), with one
+    // startup note naming the count and the fix, never a description.
     let o = finish(cmd(&work, &home, &url, None, &["run", "hi"]));
     assert!(o.status.success(), "{}", text(&o.stderr));
-    assert!(system_of(&seen, 2).contains("IGNORE PREVIOUS INSTRUCTIONS"));
+    let sys = system_of(&seen, 2);
+    assert!(sys.contains("- good (unavailable"), "{sys}");
+    assert!(!sys.contains("IGNORE"), "{sys}");
+    let err = text(&o.stderr);
+    assert_eq!(
+        err.matches("skill(s) unavailable until approved").count(),
+        1,
+        "{err}"
+    );
+    assert!(
+        err.contains("2 skill(s) unavailable until approved (tole skills list; tole skills approve <name> --hash <h>)"),
+        "{err}"
+    );
+    assert!(!err.contains("IGNORE"), "{err}");
+
+    // Explicit off: every skill is listed as before.
+    let o = finish(cmd(&work, &home, &url, Some("off"), &["run", "hi"]));
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    assert!(system_of(&seen, 3).contains("IGNORE PREVIOUS INSTRUCTIONS"));
 
     // Revoke removes the approval.
     let o = finish(cmd(&work, &home, &url, None, &["skills", "revoke", "good"]));

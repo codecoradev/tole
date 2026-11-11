@@ -357,7 +357,7 @@ enum Command {
         yes: bool,
     },
     /// Skills: the owner's approvals of skill content (#591: `approve`,
-    /// `revoke`, `list`; enforced with `TOLE_SKILL_APPROVAL=required`) and,
+    /// `revoke`, `list`; required by default, `TOLE_SKILL_APPROVAL=off` opts out) and,
     /// in shell-tools builds, the uteke skill index (#590: `index`,
     /// `retire`, `search`; used with `TOLE_SKILL_INDEX=uteke`).
     Skills {
