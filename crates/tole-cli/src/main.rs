@@ -546,6 +546,15 @@ enum Command {
         #[arg(long = "image")]
         images: Vec<String>,
     },
+    /// Scheduled jobs (#579): `create`, `list`, `pause`, `resume`,
+    /// `remove`, `runs`, and `tick` (one scheduler pass, for cron(8) or a
+    /// systemd timer). Script jobs run argv without a shell and spend zero
+    /// tokens. Jobs live in `$TOLE_CRON_DIR` (default `<codecora home>/tole/cron`).
+    #[cfg(feature = "shell-tools")]
+    Cron {
+        #[command(subcommand)]
+        action: tole_cli::cron::CronAction,
+    },
     /// Project config file `.tole/config.toml` (#208): `check` validates
     /// it and shows the effective values, `trust`/`untrust` manage the
     /// trust record. Every key is applied after trust (flag > env > config
@@ -629,6 +638,8 @@ fn gate_policy(cmd: &Command) -> GatePolicy {
         | Command::Upgrade { .. }
         | Command::Setup { .. }
         | Command::Approvals { .. } => GatePolicy::Skip,
+        #[cfg(feature = "shell-tools")]
+        Command::Cron { .. } => GatePolicy::Skip,
         // `--prompt-file -` consumes stdin as the prompt: a question on
         // the same stream would eat prompt text.
         Command::Run { prompt_file, .. } if prompt_file.as_deref() == Some("-") => {
@@ -1049,6 +1060,8 @@ fn dispatch(cli: Cli) -> Result<()> {
                 host.plan_mode,
             )
         }
+        #[cfg(feature = "shell-tools")]
+        Command::Cron { action } => tole_cli::cron::cli(action),
         Command::Approvals {
             action,
             id,

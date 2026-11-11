@@ -9,6 +9,8 @@ pub mod compaction_host;
 pub mod config;
 pub mod config_apply;
 pub mod config_trust;
+#[cfg(feature = "shell-tools")]
+pub mod cron;
 pub mod doctor;
 pub mod ecosystem;
 pub mod events;
