@@ -7,7 +7,9 @@
 //!    at once, without calling the provider.
 //! 2. Without the lock: execute the claimed runs, at most
 //!    `max_concurrent` at a time — script jobs as argv, agent jobs as one
-//!    durable session each (see [`super::agent`]).
+//!    durable session each (see [`super::agent`]). `tole cron cancel`
+//!    drops a marker file next to the run's output; a watcher cancels the
+//!    run when it appears.
 //! 3. Under the lock: `settle` every run. Then, without the lock, deliver
 //!    it to each target ([`super::deliver`]) and record each delivery under
 //!    the lock.
@@ -19,7 +21,8 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -32,6 +35,9 @@ use crate::approvals::ApprovalQueue;
 
 /// Largest run output kept (bytes); the rest is cut with a marker.
 const MAX_OUTPUT: usize = 1 << 20;
+
+/// How often a running job looks for its cancel marker.
+const CANCEL_POLL: Duration = Duration::from_millis(250);
 
 /// Tick tuning.
 #[derive(Clone)]
@@ -79,6 +85,12 @@ fn safe_name(fire_id: &str) -> String {
 /// Where a run's output is kept (`<dir>/runs/<fire id, path-safe>.out`).
 pub fn output_path(dir: &Path, fire_id: &str) -> PathBuf {
     dir.join("runs").join(format!("{}.out", safe_name(fire_id)))
+}
+
+/// The marker `tole cron cancel` drops for a running fire.
+pub fn cancel_path(dir: &Path, fire_id: &str) -> PathBuf {
+    dir.join("runs")
+        .join(format!("{}.cancel", safe_name(fire_id)))
 }
 
 /// Start of the UTC day containing `t`.
@@ -180,10 +192,25 @@ struct RunResult {
     usage: Value,
 }
 
-fn execute(c: &Claimed, opts: &TickOptions) -> RunResult {
+fn execute(dir: &Path, c: &Claimed, opts: &TickOptions) -> RunResult {
+    // `tole cron cancel` → marker file → this watcher → the cancel token.
+    let cancel = CancelToken::new();
+    let requested = Arc::new(AtomicBool::new(false));
+    let (stop_tx, stop_rx) = mpsc::channel::<()>();
+    let marker = cancel_path(dir, &c.fire.fire_id);
+    let (w_cancel, w_requested) = (cancel.clone(), Arc::clone(&requested));
+    let watcher = std::thread::spawn(move || {
+        while stop_rx.recv_timeout(CANCEL_POLL) == Err(mpsc::RecvTimeoutError::Timeout) {
+            if marker.exists() {
+                w_requested.store(true, Ordering::SeqCst);
+                w_cancel.cancel();
+                return;
+            }
+        }
+    });
     let started = Instant::now();
-    if mode(&c.job) == "script" {
-        let out = run_script(&c.job);
+    let mut r = if mode(&c.job) == "script" {
+        let out = run_script(&c.job, &cancel);
         RunResult {
             status: out.status,
             session_id: None,
@@ -196,7 +223,6 @@ fn execute(c: &Claimed, opts: &TickOptions) -> RunResult {
             output: out.stdout,
         }
     } else {
-        let cancel = CancelToken::new();
         let run = super::agent::run_agent(&c.job, opts.approvals.as_ref(), &cancel, c.max_tokens);
         RunResult {
             status: run.status,
@@ -210,12 +236,19 @@ fn execute(c: &Claimed, opts: &TickOptions) -> RunResult {
             session_id: run.session_id,
             output: run.text,
         }
+    };
+    drop(stop_tx);
+    let _ = watcher.join();
+    if requested.load(Ordering::SeqCst) && r.status != RunStatus::Ok {
+        r.status = RunStatus::Cancelled;
     }
+    r
 }
 
 /// One scheduler pass at `now` (Unix seconds).
 pub fn tick(dir: &Path, now: i64, opts: &TickOptions) -> anyhow::Result<TickReport> {
     let mut report = TickReport::default();
+    super::status::beat(dir, now, opts.approvals.is_some());
     let claimed: Vec<Claimed> = store::with_lock(dir, |l| {
         report.recovered = l.recover(now, store::lease_alive)?.len();
         let ctx = ClaimCtx::new(l, now, opts);
@@ -250,7 +283,7 @@ pub fn run_claimed(
 ) -> anyhow::Result<()> {
     let started = Instant::now();
     let results = run_bounded(claimed, opts.max_concurrent, |c| {
-        let r = execute(&c, opts);
+        let r = execute(dir, &c, opts);
         (c, r)
     });
     let end = now + started.elapsed().as_secs() as i64;
@@ -293,6 +326,7 @@ pub fn run_claimed(
     // Deliver without the lock (a command target may take seconds).
     let mut records = Vec::new();
     for (c, r) in &settled {
+        let _ = std::fs::remove_file(cancel_path(dir, &c.fire.fire_id));
         let info = RunInfo {
             job: &c.job,
             fire_id: &c.fire.fire_id,
@@ -331,8 +365,9 @@ pub struct ScriptOutput {
 }
 
 /// Runs a script job: argv (no shell), cwd = the job's workdir, the
-/// secret-shaped environment scrubbed, a hard timeout. Zero tokens.
-pub fn run_script(job: &Job) -> ScriptOutput {
+/// secret-shaped environment scrubbed, a hard timeout, killed when
+/// `cancel` is set. Zero tokens.
+pub fn run_script(job: &Job, cancel: &CancelToken) -> ScriptOutput {
     let start = Instant::now();
     let fail = |status: RunStatus, error: String| ScriptOutput {
         status,
@@ -362,7 +397,12 @@ pub fn run_script(job: &Job) -> ScriptOutput {
         cmd.current_dir(w);
     }
     tole_core::subprocess::scrub_env_for_child(&mut cmd);
-    match tole_core::subprocess::run_with_timeout(&mut cmd, Duration::from_secs(timeout)) {
+    let ran = tole_core::subprocess::run_with_timeout_or_cancel(
+        &mut cmd,
+        Duration::from_secs(timeout),
+        cancel,
+    );
+    match ran {
         Ok(out) => {
             let mut stdout = String::from_utf8_lossy(&out.stdout).into_owned();
             if stdout.len() > MAX_OUTPUT {
@@ -385,6 +425,7 @@ pub fn run_script(job: &Job) -> ScriptOutput {
                 error: None,
             }
         }
+        Err(e) if e == tole_core::subprocess::CANCELLED => fail(RunStatus::Cancelled, e),
         Err(e) => fail(RunStatus::Error, e),
     }
 }
