@@ -30,6 +30,7 @@ use tole_core::skill_index::{
     select, selection_block, Candidate, RecallQuery, SkillEntry, SkillFilter, SkillIndex,
     SkillSearchTool, DEFAULT_RECALL_K, DEFAULT_SIMILARITY_FLOOR, MAX_RECALL_K,
 };
+use tole_core::skills::Gate;
 use tole_core::tool::ToolRegistry;
 
 pub const INDEX_ENV: &str = "TOLE_SKILL_INDEX";
@@ -123,6 +124,9 @@ pub struct SkillRecall {
     pub index: Option<Arc<dyn SkillIndex>>,
     /// Redacted from every query before it reaches the index.
     pub secrets: SecretSet,
+    /// What may load (#591): every listed, recalled, searched or loaded
+    /// skill goes through it. `Open` by default.
+    pub gate: Gate,
 }
 
 /// An index whose queries are redacted first: a query may leave the
@@ -176,6 +180,7 @@ impl SkillRecall {
             profile: crate::config_apply::profile_name(),
             index,
             secrets: crate::provider_chain::process_secrets(&crate::config_apply::real_env),
+            gate: Gate::Open,
         })
     }
 }
@@ -201,12 +206,15 @@ pub fn skills_section(
     };
     let ws_buf = ws.map(Path::to_path_buf);
     registry
-        .register(Box::new(tole_core::skills::LoadSkillTool::new(
-            ws_buf.clone(),
-        )))
+        .register(Box::new(
+            tole_core::skills::LoadSkillTool::new(ws_buf.clone()).with_gate(recall.gate.clone()),
+        ))
         .map_err(|e| format!("registering load_skill: {e}"))?;
     let Some(index) = index else {
-        return Ok((tole_core::skills::index_block(ws), notes));
+        return Ok((
+            tole_core::skills::index_block_gated(ws, &recall.gate),
+            notes,
+        ));
     };
     let index: Arc<dyn SkillIndex> = Arc::new(RedactingIndex::new(index, recall.secrets.clone()));
     let filter = SkillFilter {
@@ -225,10 +233,16 @@ pub fn skills_section(
         query.as_ref(),
         &filter,
         recall.settings.k,
+        &recall.gate,
     );
     notes.extend(sel.notes.iter().cloned());
     registry
-        .register(Box::new(SkillSearchTool::new(index, ws_buf, filter)))
+        .register(Box::new(SkillSearchTool::new(
+            index,
+            ws_buf,
+            filter,
+            recall.gate.clone(),
+        )))
         .map_err(|e| format!("registering skill_search: {e}"))?;
     Ok((selection_block(&sel), notes))
 }
@@ -252,10 +266,11 @@ pub fn index_all(index: &dyn SkillIndex, ws: Option<&Path>) -> (usize, Vec<Strin
     (done, failed)
 }
 
-/// `tole skills <action>`: maintain and inspect the uteke skill index.
+/// The uteke-index actions of `tole skills` (shell-tools builds; the
+/// approval actions are in [`crate::skill_approve`]).
 #[cfg(feature = "shell-tools")]
 #[derive(Debug, clap::Subcommand)]
-pub enum SkillsAction {
+pub enum IndexAction {
     /// Index every discovered skill in uteke (tag `skill`, slug
     /// `skill-<name>`): name, description, status `approved` and the
     /// SKILL.md content hash. The body is not sent.
@@ -283,7 +298,7 @@ pub enum SkillsAction {
 }
 
 #[cfg(feature = "shell-tools")]
-pub fn cli(action: SkillsAction) -> anyhow::Result<()> {
+pub fn cli(action: IndexAction) -> anyhow::Result<()> {
     use anyhow::Context as _;
     if !crate::tool_roster::binary_available("uteke") {
         anyhow::bail!("the uteke binary is not on PATH; the skill index needs it");
@@ -299,7 +314,7 @@ pub fn cli(action: SkillsAction) -> anyhow::Result<()> {
         }
     };
     match action {
-        SkillsAction::Index { workspace } => {
+        IndexAction::Index { workspace } => {
             let ws = root(workspace)?;
             let (done, failed) = index_all(&index, Some(&ws));
             println!("indexed {done} skill(s) in uteke");
@@ -310,11 +325,11 @@ pub fn cli(action: SkillsAction) -> anyhow::Result<()> {
                 anyhow::bail!("{} skill(s) not indexed", failed.len());
             }
         }
-        SkillsAction::Retire { name } => {
+        IndexAction::Retire { name } => {
             index.retire(&name).map_err(anyhow::Error::msg)?;
             println!("retired {name}: it stays on disk and is no longer recalled");
         }
-        SkillsAction::Search {
+        IndexAction::Search {
             query,
             limit,
             profile,
@@ -462,6 +477,7 @@ mod tests {
             profile: None,
             index: Some(Arc::new(Fixed(vec!["beta", "gamma"]))),
             secrets: SecretSet::default(),
+            gate: Gate::Open,
         };
         let (block, _) = skills_section(&recall, Some(&dir), &mut reg).unwrap();
         assert!(
@@ -566,6 +582,7 @@ mod tests {
             profile: Some("coder".into()),
             index: Some(seen.clone()),
             secrets: SecretSet::default().with("DEPLOY_TOKEN", secret),
+            gate: Gate::Open,
         };
         let mut reg = ToolRegistry::new();
         skills_section(&recall, Some(&dir), &mut reg).unwrap();
@@ -581,6 +598,72 @@ mod tests {
             assert_eq!(profile.as_deref(), Some("coder"));
         }
         assert!(got[0].0.starts_with("deploy with key"), "{got:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #591: the approval gate covers both modes. Local: the full listing
+    /// names unapproved skills only. Uteke: pinned, recalled and searched
+    /// skills that are not approved are named as unavailable, and
+    /// load_skill refuses them.
+    #[test]
+    fn the_approval_gate_covers_local_and_uteke_sessions() {
+        use tole_core::skill_approval::{read_package, Approvals};
+        let dir = ws("gate");
+        let mut ok = Approvals::default();
+        ok.approve(&read_package(Some(&dir), "alpha").unwrap(), 1);
+        let gate = Gate::Approved(Arc::new(ok));
+        // Local mode.
+        let mut reg = ToolRegistry::new();
+        let local = SkillRecall {
+            gate: gate.clone(),
+            ..SkillRecall::default()
+        };
+        let (block, _) = skills_section(&local, Some(&dir), &mut reg).unwrap();
+        assert!(block.contains("- alpha — alpha d\n"), "{block}");
+        assert!(block.contains("- beta (unavailable"), "{block}");
+        assert!(!block.contains("beta d"), "{block}");
+        let load = reg.get("load_skill").unwrap();
+        assert!(load.execute(serde_json::json!({"name": "beta"})).is_err());
+        // Uteke mode: beta is pinned and recalled, gamma recalled.
+        let mut reg = ToolRegistry::new();
+        let uteke = SkillRecall {
+            settings: RecallSettings {
+                mode: IndexMode::Uteke,
+                pinned: vec!["beta".into()],
+                ..RecallSettings::default()
+            },
+            brief: Some("task".into()),
+            index: Some(Arc::new(Fixed(vec!["gamma", "alpha"]))),
+            gate,
+            ..SkillRecall::default()
+        };
+        let (block, notes) = skills_section(&uteke, Some(&dir), &mut reg).unwrap();
+        assert!(block.contains("- alpha — alpha d\n"), "{block}");
+        assert!(block.contains("cannot be loaded: beta, gamma"), "{block}");
+        assert!(
+            !block.contains("beta d") && !block.contains("gamma d"),
+            "{block}"
+        );
+        assert!(
+            notes.iter().any(|n| n.contains("not approved")),
+            "{notes:?}"
+        );
+        let out = reg
+            .get("skill_search")
+            .unwrap()
+            .execute(serde_json::json!({"query": "x"}))
+            .unwrap();
+        assert_eq!(
+            out["skills"][0]["available"],
+            serde_json::json!(false),
+            "{out}"
+        );
+        assert!(!out.to_string().contains("gamma d"), "{out}");
+        assert!(reg
+            .get("load_skill")
+            .unwrap()
+            .execute(serde_json::json!({"name": "gamma"}))
+            .is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
