@@ -284,9 +284,13 @@ pub fn agents_dir(root: &std::path::Path) -> PathBuf {
     agents_root(root)
 }
 
-/// One child agent's dir (its meta, log, pid and `sessions/`).
-pub fn agent_dir(root: &std::path::Path, id: &str) -> PathBuf {
-    agents_root(root).join(id)
+/// One child agent's dir (its meta, log, pid and `sessions/`). `None` for
+/// an id that is not one plain path component: empty, `.`, `..`, a leading
+/// dot, or a `/` or `\\` anywhere, so no id can name a directory outside
+/// (or hidden inside) the agents dir.
+pub fn agent_dir(root: &std::path::Path, id: &str) -> Option<PathBuf> {
+    let plain = !id.is_empty() && !id.starts_with('.') && !id.contains(['/', '\\']);
+    plain.then(|| agents_root(root).join(id))
 }
 
 /// Result<bool> like jobs.rs (CodeCora PR #174 round 2): a ps failure
@@ -769,7 +773,8 @@ impl Tool for AgentStartTool {
         }
 
         let id = new_agent_id();
-        let dir = agents_root(&self.root).join(&id);
+        let dir = agent_dir(&self.root, &id)
+            .ok_or_else(|| format!("agent_start: invalid agent id {id:?}"))?;
         std::fs::create_dir_all(&dir)
             .map_err(|e| format!("agent_start: creating {}: {e}", dir.display()))?;
         #[cfg(unix)]
@@ -2195,5 +2200,20 @@ mod tests {
         assert!(poll.execute(json!({"agent": "nope"})).is_err());
         assert!(poll.execute(json!({"agent": "../escape"})).is_err());
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// #621 review: an agent dir is always one plain component under the
+    /// agents dir.
+    #[test]
+    fn agent_dir_takes_only_one_plain_component() {
+        let root = std::path::Path::new("/w");
+        assert_eq!(
+            agent_dir(root, "a-1f-2-0"),
+            Some(PathBuf::from("/w").join(AGENTS_DIR).join("a-1f-2-0"))
+        );
+        assert!(agent_dir(root, "g.1.2").is_some(), "dots inside are fine");
+        for bad in ["", ".", "..", ".hidden", "a/b", "../x", "a\\b", "/abs"] {
+            assert_eq!(agent_dir(root, bad), None, "{bad:?}");
+        }
     }
 }

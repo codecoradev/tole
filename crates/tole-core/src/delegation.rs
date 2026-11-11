@@ -896,6 +896,28 @@ impl<S: LedgerStore> Delegation<S> {
         })
     }
 
+    /// The live lease `path` would conflict with, as `(path, holder)`,
+    /// ignoring `node`'s own; for a pre-check before spawning a writer.
+    pub fn lease_conflict(&self, path: &str, node: &str) -> Option<(String, String)> {
+        self.state
+            .lease_holder(path, node)
+            .map(|(p, h)| (p.to_string(), h.to_string()))
+    }
+
+    /// Delegated processes running now in `goal`.
+    pub fn live(&self, goal: &str) -> u32 {
+        self.state.live_in(goal)
+    }
+
+    /// The node whose recorded session is `session` (the host stores the
+    /// child's agent id there).
+    pub fn by_session(&self, session: &str) -> Option<&Node> {
+        self.state
+            .nodes
+            .values()
+            .find(|n| n.session.as_deref() == Some(session))
+    }
+
     /// The oldest queued node of `goal` whose parent is still live.
     pub fn next_queued(&self, goal: &str) -> Option<&Node> {
         self.state
