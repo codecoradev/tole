@@ -36,6 +36,7 @@ pub mod child_env;
 pub mod compaction;
 #[cfg(feature = "shell-tools")]
 pub mod cora_search;
+pub mod cron;
 pub mod entry;
 pub mod failover;
 pub mod file_tools;
