@@ -51,13 +51,31 @@ pub struct MissionConfig {
     pub verify_timeout: Option<u64>,
 }
 
-/// The `[tui]` table (#463): theme name and per-role color overrides. USER
-/// LAYER AND ENVIRONMENT ONLY: a project config may carry the table (so the
-/// file still parses) but [`layered`] drops it, because a cloned repository
-/// must not control how the approval prompt looks. Values are validated by
-/// `tole-tui` when the theme is built; a bad value falls back to the default
-/// theme with a startup note and never aborts, so only the TOML types are
-/// checked here.
+/// One `[tui.keys]` value: a key spec or a list of them.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(untagged)]
+pub enum KeyList {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl KeyList {
+    pub fn to_vec(&self) -> Vec<String> {
+        match self {
+            KeyList::One(s) => vec![s.clone()],
+            KeyList::Many(v) => v.clone(),
+        }
+    }
+}
+
+/// The `[tui]` table (#463): theme name, per-role color overrides and key
+/// bindings. USER LAYER (and, for the theme, the environment) ONLY: a project
+/// config may carry the table (so the file still parses) but [`layered`]
+/// drops it, because a cloned repository must not control how the approval
+/// prompt looks or which keys do what. Values are validated by `tole-tui`
+/// when the theme / keymap is built; a bad value falls back to the default
+/// with a startup note and never aborts, so only the TOML types are checked
+/// here.
 #[derive(Debug, Default, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TuiConfig {
@@ -65,6 +83,8 @@ pub struct TuiConfig {
     pub theme: Option<String>,
     /// Role name -> style spec, e.g. `tool = "blue bold"`.
     pub colors: Option<std::collections::BTreeMap<String, String>>,
+    /// Action name -> key spec(s), e.g. `toggle_tools = ["ctrl+o", "alt+o"]`.
+    pub keys: Option<std::collections::BTreeMap<String, KeyList>>,
 }
 
 /// The whole file: flat snake_case keys mirroring the global flags, all
@@ -441,7 +461,7 @@ pub fn layered(project: &Config, user: &Config) -> Config {
             (p, u) => p.clone().or_else(|| u.clone()),
         },
         mission: (project.mission.is_some() || user.mission.is_some()).then_some(mission),
-        // The project layer NEVER supplies the theme or colors (#463).
+        // The project layer NEVER supplies the theme, colors or keys (#463).
         tui: user.tui.clone(),
         user_keys: BTreeSet::new(),
     };
@@ -451,6 +471,9 @@ pub fn layered(project: &Config, user: &Config) -> Config {
         }
         if t.colors.as_ref().is_some_and(|c| !c.is_empty()) {
             from_user.insert("tui.colors");
+        }
+        if t.keys.as_ref().is_some_and(|k| !k.is_empty()) {
+            from_user.insert("tui.keys");
         }
     }
     if out.review_gate.is_some() && out.review_gate != project.review_gate {
@@ -480,13 +503,13 @@ pub fn render(cfg: &Config) -> Vec<String> {
 
 /// Suffix of a project config's `tui` lines in `config check` (#463).
 pub const TUI_IGNORED_NOTE: &str =
-    "  IGNORED: a project config cannot set the theme or colors (user config or TOLE_THEME only)";
+    "  IGNORED: a project config cannot set the theme, colors or keys (user config only; the theme also TOLE_THEME)";
 
 /// The warning printed at startup when a project config carries `[tui]`.
 pub fn tui_ignored_warning(shown: &str) -> String {
     format!(
-        "ignoring `tui` in project config {shown}: the theme and colors can only be set in \
-         the user config or with TOLE_THEME"
+        "ignoring `tui` in project config {shown}: the theme, colors and keys can only be set in \
+         the user config (the theme also with TOLE_THEME)"
     )
 }
 
@@ -593,6 +616,17 @@ pub fn render_with(cfg: &Config, tag: &str, ann: &Annotations) -> Vec<String> {
             ));
             for (role, spec) in c {
                 out.push(format!("  - {role} = {}", quote(spec)));
+            }
+        }
+        if let Some(k) = &t.keys {
+            out.push(format!(
+                "tui.keys = [{} entries]  [{src}]{}",
+                k.len(),
+                note("tui.keys")
+            ));
+            for (action, keys) in k {
+                let shown: Vec<String> = keys.to_vec().iter().map(|s| quote(s)).collect();
+                out.push(format!("  - {action} = [{}]", shown.join(", ")));
             }
         }
     }
@@ -772,6 +806,38 @@ verify_timeout = 60
         let m = layered(&project, &c);
         assert_eq!(m.tui, c.tui);
         assert!(m.user_keys.contains("tui.theme") && m.user_keys.contains("tui.colors"));
+    }
+
+    #[test]
+    fn tui_keys_parse_as_string_or_list_are_type_strict_and_user_layer_only() {
+        let c = parse(
+            "[tui.keys]\ntoggle_tools = \"ctrl+o\"\nnewline = [\"shift+enter\", \"alt+n\"]\n",
+            &p(),
+        )
+        .unwrap();
+        let k = c.tui.as_ref().unwrap().keys.as_ref().unwrap();
+        assert_eq!(k["toggle_tools"].to_vec(), vec!["ctrl+o"]);
+        assert_eq!(k["newline"].to_vec(), vec!["shift+enter", "alt+n"]);
+        // Wrong types are loud; a bad action NAME or spec is not (it is
+        // checked, with a note, when the keymap is built).
+        assert!(parse("[tui.keys]\ntoggle_tools = 3\n", &p()).is_err());
+        assert!(parse("[tui.keys]\ntoggle_tools = [1]\n", &p()).is_err());
+        assert!(parse("[tui]\nkeys = \"x\"\n", &p()).is_err());
+        assert!(parse("[tui.keys]\nno_such_action = \"ctrl+o\"\n", &p()).is_ok());
+        // The project layer never reaches the merged config.
+        let project = parse("[tui.keys]\ntoggle_tools = \"f5\"\n", &p()).unwrap();
+        let m = layered(&project, &Config::default());
+        assert_eq!(m.tui, None);
+        assert!(m.user_keys.is_empty());
+        let m = layered(&project, &c);
+        assert_eq!(m.tui, c.tui);
+        assert!(m.user_keys.contains("tui.keys"));
+        // `config check` rendering lists the entries.
+        let lines = render(&c);
+        assert!(lines
+            .iter()
+            .any(|l| l.starts_with("tui.keys = [2 entries]  [config]")));
+        assert!(lines.contains(&"  - newline = [\"shift+enter\", \"alt+n\"]".to_string()));
     }
 
     #[test]

@@ -718,6 +718,27 @@ is the user's. Theme values are plain config strings: no code runs, and the
 values shown in notes pass through the TUI sanitizer. An invalid value falls
 back to the built-in default instead of aborting.
 
+### TUI keybindings (#463)
+
+A key map decides what a key does, so it is an input an attacker would like to
+control: rebinding `y`, `n`, Esc or Ctrl+C would intercept an approval answer
+or the cancel key, and a project config that rebinds keys could make a
+familiar keystroke do something else. Four rules close that: (1) the keys are
+read from the **user** config only (no environment variable): `config::layered`
+drops a project config's `[tui]` table, startup prints one warning and `tole
+config check` marks `tui.keys` `IGNORED`. (2) The set of actions is closed and
+convenience only (tool-output and reasoning toggles, pickers, cycling,
+newline, queue, history); sending, cancelling, approval answers and typing are
+not actions. A binding must carry Ctrl or Alt (or be a function key), and
+`y`, `n`, Esc, Ctrl+C, Enter, Backspace, Tab and the keys a terminal cannot
+tell apart are refused. (3) At an approval prompt (and in a picker) the keymap
+is not consulted: only `y`, `n` (plain, no Ctrl/Alt), Esc and Ctrl+C act, so no
+table can intercept or swallow them; the dispatcher also refuses to map those
+keys, bare characters, Tab and bare Enter whatever the table holds. (4) An
+invalid or clashing table falls back to the whole default keymap with one
+note; it never aborts and never leaves a key half-bound. Key values are plain
+config strings; they pass through the TUI sanitizer when shown in a note.
+
 ### User config (#433)
 
 `$CODECORA_HOME/tole/config.toml` (default `~/.codecora/tole/config.toml`) has

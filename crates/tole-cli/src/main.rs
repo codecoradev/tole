@@ -1304,7 +1304,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                 &allow_patterns,
                 yes,
                 &host,
-                settings.theme(),
+                &settings,
             )
         }
         Command::Chat {
@@ -2827,8 +2827,10 @@ fn tui_command(
     allow_patterns: &[String],
     yes: bool,
     host: &HostConfig,
-    (theme, theme_note): (tole_tui::Theme, Option<String>),
+    settings: &tole_cli::config_apply::Settings,
 ) -> Result<()> {
+    let (theme, theme_note) = settings.theme();
+    let (keymap, keymap_note) = settings.keymap();
     let cfg = tole_cli::turn_runner::provider_config().map_err(anyhow::Error::msg)?;
     if let Some(id) = &resume {
         if !valid_session_id(id) || !session_path(sessions_dir, id).exists() {
@@ -2888,7 +2890,8 @@ fn tui_command(
     let session = tole_cli::tui_host::TuiSession::new(storage, registry, cfg, host.compaction)
         .with_sessions(sessions_dir.to_path_buf(), Some(prompt))
         .with_workspace(resolve_workspace_root(host.workspace.as_ref())?)
-        .with_theme(theme, theme_note);
+        .with_theme(theme, theme_note)
+        .with_keymap(keymap, keymap_note);
     tole_tui::run(&session, approvals).context("terminal ui")?;
     let id = session.session_id();
     println!("session {id} closed (resume: tole resume {id} \"…\")");

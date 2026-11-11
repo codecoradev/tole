@@ -1013,3 +1013,81 @@ fn tui_unknown_theme_shows_one_note_and_uses_the_default() {
     assert_eq!(seen.matches("is not a theme").count(), 1, "{seen:?}");
     assert!(!sgr_colors(&seen).is_empty(), "default theme colors");
 }
+
+/// The user config (`$CODECORA_HOME/tole/config.toml`; the pty fixture sets
+/// `CODECORA_HOME` to `<cwd>/home`).
+fn write_user_config(dir: &Path, body: &str) {
+    std::fs::create_dir_all(dir.join("home/tole")).unwrap();
+    std::fs::write(dir.join("home/tole/config.toml"), body).unwrap();
+}
+
+fn printed(t: &Pty) -> String {
+    String::from_utf8_lossy(&t.out.lock().unwrap()).into_owned()
+}
+
+/// #463 keybindings: with a user config that rebinds two actions the new keys
+/// act, the old key does not, and the footer hint names the new key.
+#[test]
+fn tui_user_keybinding_acts_on_the_new_key_and_not_the_old_one() {
+    let (url, dir) = (spawn_mock(), workdir());
+    write_user_config(
+        &dir,
+        "[tui.keys]\ntoggle_tools = \"alt+o\"\nmodel_picker = \"f4\"\n",
+    );
+    let mut t = Pty::spawn(&dir, &url);
+    // The hint is built from the effective binding, and the idle marker the
+    // other tests rely on is unchanged (cycle_thinking keeps its default).
+    t.expect("F4 model");
+    t.idle();
+
+    // The old keys do nothing: Ctrl+L must not open the picker (it would
+    // swallow the next keys) and Ctrl+O must not toggle: two Alt+O presses
+    // give exactly two notes, "expanded" then "collapsed".
+    t.send("\x0c\x0f");
+    t.send("\x1bo"); // Alt+O
+    t.expect("(tool output expanded)");
+    t.send("\x1bo");
+    t.expect("(tool output collapsed)");
+    let seen = printed(&t);
+    assert_eq!(seen.matches("(tool output").count(), 2, "{seen:?}");
+    assert!(!seen.contains("model>"), "Ctrl+L opened the picker");
+
+    // F4 (xterm: ESC O S) opens the picker.
+    t.send("\x1bOS");
+    t.expect("model>");
+    t.send("\x1b");
+    t.idle();
+    t.send("/quit\r");
+    assert_eq!(t.wait_exit(), Some(0));
+}
+
+/// An invalid keymap never aborts the TUI: it starts with the default keys
+/// and shows ONE note naming the key and the problem.
+#[test]
+fn tui_invalid_keymap_falls_back_to_default_with_one_note() {
+    let (url, dir) = (spawn_mock(), workdir());
+    write_user_config(
+        &dir,
+        "[tui.keys]\ntoggle_tools = \"o\"\nmodel_picker = \"f4\"\n",
+    );
+    let mut t = Pty::spawn(&dir, &url);
+    t.expect("tui.keys.toggle_tools");
+    t.expect("using the default keys");
+    t.idle();
+    // The whole keymap is the default: Ctrl+O toggles, and the valid
+    // `model_picker = f4` of the same table was not applied either.
+    t.send("\x0f");
+    t.expect("(tool output expanded)");
+    t.send("\x1bOS\x0f"); // F4 is not bound: it must not open the picker
+    t.expect("(tool output collapsed)");
+    assert!(!printed(&t).contains("model>"), "F4 opened the picker");
+    t.send("\x0c");
+    t.expect("model>");
+    t.send("\x1b");
+    t.idle();
+    t.send("/quit\r");
+    assert_eq!(t.wait_exit(), Some(0));
+    let seen = printed(&t);
+    assert_eq!(seen.matches("tui.keys.toggle_tools").count(), 1, "{seen:?}");
+    assert!(seen.contains("Ctrl+L model"), "{seen:?}");
+}

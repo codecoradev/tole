@@ -74,6 +74,9 @@ pub struct TuiSession {
     /// Colors and the note about a refused theme (#463).
     theme: tole_tui::Theme,
     theme_note: Option<String>,
+    /// Key bindings and the note about a refused keymap (#463).
+    keymap: tole_tui::Keymap,
+    keymap_note: Option<String>,
 }
 
 impl TuiSession {
@@ -103,6 +106,8 @@ impl TuiSession {
             workspace: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             theme: tole_tui::Theme::default(),
             theme_note: None,
+            keymap: tole_tui::Keymap::default(),
+            keymap_note: None,
         }
     }
 
@@ -110,6 +115,13 @@ impl TuiSession {
     pub fn with_theme(mut self, theme: tole_tui::Theme, note: Option<String>) -> Self {
         self.theme = theme;
         self.theme_note = note;
+        self
+    }
+
+    /// The key bindings the UI uses, and a note to show at start (#463).
+    pub fn with_keymap(mut self, keymap: tole_tui::Keymap, note: Option<String>) -> Self {
+        self.keymap = keymap;
+        self.keymap_note = note;
         self
     }
 
@@ -221,8 +233,17 @@ impl TuiHost for TuiSession {
         self.theme.clone()
     }
 
+    fn keymap(&self) -> tole_tui::Keymap {
+        self.keymap.clone()
+    }
+
     fn startup_note(&self) -> Option<String> {
-        self.theme_note.clone()
+        let notes: Vec<&str> = [&self.theme_note, &self.keymap_note]
+            .into_iter()
+            .flatten()
+            .map(String::as_str)
+            .collect();
+        (!notes.is_empty()).then(|| notes.join(" | "))
     }
 
     fn footer(&self) -> Footer {

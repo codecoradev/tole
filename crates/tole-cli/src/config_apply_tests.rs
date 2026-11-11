@@ -1225,3 +1225,125 @@ fn config_check_shows_effective_effort_and_source() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+// -------------------------------------------------------- tui keys (#463)
+
+fn keys_of(c: &Config) -> Option<std::collections::BTreeMap<String, Vec<String>>> {
+    Settings::resolve(&Flags::default(), c, &env_of(&[]))
+        .tui_keys
+        .map(|e| e.value)
+}
+
+#[test]
+fn a_project_config_cannot_set_keys_and_the_user_layer_can() {
+    let project = "[tui.keys]\ntoggle_tools = \"f5\"\n";
+    // Layering drops the project table: no keys reach Settings.
+    let c = layered_cfg(project, "");
+    assert_eq!(c.tui, None);
+    assert_eq!(keys_of(&c), None);
+    // The user layer supplies them, as a string or a list, and only it.
+    let c = layered_cfg(
+        project,
+        "[tui.keys]\ntoggle_tools = [\"alt+o\", \"f6\"]\nnewline = \"alt+n\"\n",
+    );
+    let k = keys_of(&c).unwrap();
+    assert_eq!(k["toggle_tools"], vec!["alt+o", "f6"]);
+    assert_eq!(k["newline"], vec!["alt+n"]);
+    let st = Settings::resolve(&Flags::default(), &c, &env_of(&[]));
+    assert_eq!(st.tui_keys.unwrap().source, Source::UserConfig);
+}
+
+#[cfg(feature = "tui")]
+#[test]
+fn an_invalid_keymap_falls_back_to_default_with_one_note_naming_the_key() {
+    use tole_tui::Keymap;
+    let keymap = |user: &str| {
+        let c = layered_cfg("", user);
+        Settings::resolve(&Flags::default(), &c, &env_of(&[])).keymap()
+    };
+    assert_eq!(keymap(""), (Keymap::default(), None));
+    let (k, note) = keymap("[tui.keys]\ntoggle_tools = \"alt+o\"\n");
+    assert_eq!(note, None);
+    assert_ne!(k, Keymap::default());
+    for (user, needles) in [
+        (
+            "[tui.keys]\nnope = \"ctrl+o\"\n",
+            &["unknown action", "nope"][..],
+        ),
+        (
+            "[tui.keys]\ncycle_model = \"ctrl+q\"\n",
+            &["cycle_model", "ctrl+q"][..],
+        ),
+        (
+            "[tui.keys]\ncycle_model = \"y\"\n",
+            &["cycle_model", "bare character"][..],
+        ),
+        (
+            "[tui.keys]\ncycle_model = \"esc\"\n",
+            &["cycle_model", "protected"][..],
+        ),
+        (
+            "[tui.keys]\ncycle_model = \"ctrl+x\"\ntoggle_tools = \"ctrl+x\"\n",
+            &["cycle_model", "toggle_tools", "Ctrl+X"][..],
+        ),
+        // A valid binding next to a bad one: the WHOLE keymap is the default.
+        (
+            "[tui.keys]\nnewline = \"alt+n\"\ncycle_model = \"ctrl+i\"\n",
+            &["cycle_model", "Tab"][..],
+        ),
+    ] {
+        let (k, note) = keymap(user);
+        assert_eq!(k, Keymap::default(), "{user}");
+        let note = note.unwrap();
+        assert!(note.starts_with("keys: ") && !note.contains('\n'), "{note}");
+        assert!(note.ends_with("using the default keys"), "{note}");
+        for n in needles {
+            assert!(note.contains(n), "{user}: {note}");
+        }
+    }
+}
+
+#[test]
+fn config_check_shows_keys_ignores_a_project_table_and_flags_a_bad_one() {
+    let user = tmpdir();
+    let up = user.join("config.toml");
+    std::fs::write(&up, "[tui.keys]\ntoggle_tools = [\"alt+o\", \"f6\"]\n").unwrap();
+    let dir = tmpdir();
+    let p = dir.join(CONFIG_REL_PATH);
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(&p, "[tui.keys]\nnewline = \"f5\"\n").unwrap();
+    let out = check(&dir, None, Some(&up), &Flags::default(), &env_of(&[])).unwrap();
+    #[cfg(feature = "tui")]
+    assert!(
+        out.contains("tui.keys = [1 entries]  [user config]  effective: 1 action(s) rebound")
+            && out.contains("(user config)")
+            && out.contains("  - toggle_tools = [\"alt+o\", \"f6\"]"),
+        "{out}"
+    );
+    #[cfg(not(feature = "tui"))]
+    assert!(
+        out.contains(
+            "tui.keys = [1 entries]  [user config]  (not validated: this build has no TUI"
+        ) && !out.contains("effective: 1 action"),
+        "{out}"
+    );
+    assert!(
+        out.contains("tui.keys = [1 entries]  [config]  IGNORED: a project config cannot set"),
+        "{out}"
+    );
+    std::fs::write(&up, "[tui.keys]\ntoggle_tools = \"o\"\n").unwrap();
+    let out = check(&dir, None, Some(&up), &Flags::default(), &env_of(&[])).unwrap();
+    #[cfg(feature = "tui")]
+    assert!(
+        out.contains("INVALID: tui.keys.toggle_tools: \"o\": a bare character")
+            && out.contains("the default keys are used"),
+        "{out}"
+    );
+    #[cfg(not(feature = "tui"))]
+    assert!(
+        out.contains("not validated") && !out.contains("INVALID"),
+        "{out}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+    let _ = std::fs::remove_dir_all(user);
+}

@@ -452,6 +452,9 @@ pub struct Settings {
     pub tui_theme: Eff<String>,
     /// Per-role color overrides from the user config's `tui.colors`.
     pub tui_colors: Option<Eff<BTreeMap<String, String>>>,
+    /// Key bindings from the user config's `tui.keys` (#463): action ->
+    /// key specs. No env var; the project config is not a source.
+    pub tui_keys: Option<Eff<BTreeMap<String, Vec<String>>>>,
 }
 
 impl Settings {
@@ -601,6 +604,15 @@ impl Settings {
                 .and_then(|t| t.colors.clone())
                 .filter(|c| !c.is_empty())
                 .map(|c| Eff::new(c, Source::Config)),
+            tui_keys: cfg
+                .tui
+                .as_ref()
+                .and_then(|t| t.keys.as_ref())
+                .filter(|k| !k.is_empty())
+                .map(|k| {
+                    let k = k.iter().map(|(a, v)| (a.clone(), v.to_vec())).collect();
+                    Eff::new(k, Source::Config)
+                }),
         }
     }
 
@@ -649,6 +661,7 @@ impl Settings {
         opt(&mut self.review_gate, "review_gate", user);
         one(&mut self.tui_theme, "tui.theme", user);
         opt(&mut self.tui_colors, "tui.colors", user);
+        opt(&mut self.tui_keys, "tui.keys", user);
     }
 
     /// The theme the TUI will use and the one-line note when the configured
@@ -664,6 +677,31 @@ impl Settings {
                 Some(format!("theme: {e}; using the default theme")),
             ),
         }
+    }
+
+    /// The key bindings the TUI will use and the one-line note when the
+    /// configured keymap was refused (#463). Like the theme, an invalid
+    /// keymap never aborts: the WHOLE keymap falls back to the default.
+    #[cfg(feature = "tui")]
+    pub fn keymap(&self) -> (tole_tui::Keymap, Option<String>) {
+        match self.try_keymap() {
+            Ok(k) => (k, None),
+            Err(e) => (
+                tole_tui::Keymap::default(),
+                Some(format!("keys: {e}; using the default keys")),
+            ),
+        }
+    }
+
+    #[cfg(feature = "tui")]
+    fn try_keymap(&self) -> Result<tole_tui::Keymap, String> {
+        let over: Vec<(String, Vec<String>)> = self.tui_keys.as_ref().map_or_else(Vec::new, |k| {
+            k.value
+                .iter()
+                .map(|(a, v)| (a.clone(), v.clone()))
+                .collect()
+        });
+        tole_tui::Keymap::from_overrides(&over)
     }
 
     #[cfg(feature = "tui")]
@@ -851,10 +889,22 @@ pub fn annotations(s: &Settings) -> BTreeMap<&'static str, String> {
             (None, None) => "  effective: (none)".to_string(),
         },
     );
-    // A build without the TUI cannot validate a theme and does not use one:
-    // say so instead of reporting an effective value or a verdict.
+    m.insert(
+        "tui.keys",
+        match (&s.tui_keys, keys_problem(s)) {
+            (_, Some(e)) => format!("  INVALID: {e}; the default keys are used"),
+            (Some(k), None) => format!(
+                "  effective: {} action(s) rebound, the rest default  {}",
+                k.value.len(),
+                k.describe()
+            ),
+            (None, None) => "  effective: (default keys)".to_string(),
+        },
+    );
+    // A build without the TUI cannot validate a theme or keymap and does not
+    // use them: say so instead of reporting an effective value or a verdict.
     #[cfg(not(feature = "tui"))]
-    for k in ["tui.theme", "tui.colors"] {
+    for k in ["tui.theme", "tui.colors", "tui.keys"] {
         m.insert(k, NEEDS_TUI.to_string());
     }
     m.insert(
@@ -868,12 +918,24 @@ pub fn annotations(s: &Settings) -> BTreeMap<&'static str, String> {
     m
 }
 
+/// The problem with the configured keymap, if any (always `None` in a build
+/// without the TUI, which cannot validate it).
+fn keys_problem(s: &Settings) -> Option<String> {
+    #[cfg(feature = "tui")]
+    return s.try_keymap().err();
+    #[cfg(not(feature = "tui"))]
+    {
+        let _ = s;
+        None
+    }
+}
+
 #[cfg(not(feature = "shell-tools"))]
 const NEEDS_SHELL_TOOLS: &str =
     "  (not supported by this build: needs the shell-tools feature; startup refuses it)";
 #[cfg(not(feature = "tui"))]
 const NEEDS_TUI: &str =
-    "  (not validated: this build has no TUI, so the theme is not used; the file is checked only for its TOML shape)";
+    "  (not validated: this build has no TUI, so the theme and keys are not used; the file is checked only for its TOML shape)";
 #[cfg(not(feature = "mcp"))]
 const NEEDS_MCP: &str =
     "  (not supported by this build: needs the mcp feature; startup refuses it)";

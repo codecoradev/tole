@@ -34,6 +34,9 @@ pub struct Transcript {
     /// Rows of the last tool block that the collapsed view left out.
     last_tool: Vec<String>,
     last_shown: bool,
+    /// Label of the expand-tool-output key for the `[+n lines]` hint
+    /// (empty = `Ctrl+O`); set from the keymap by the app.
+    pub(crate) tools_key: String,
 }
 
 /// Most continuation rows kept per tool block, and their width.
@@ -121,9 +124,14 @@ impl Transcript {
             out.extend(rows(&rest));
         } else if !rest.is_empty() {
             let n = rest.len();
+            let key = if self.tools_key.is_empty() {
+                "Ctrl+O"
+            } else {
+                &self.tools_key
+            };
             out.push(Out {
                 kind: Kind::Tool,
-                text: format!("    [+{n} line{} · Ctrl+O]", if n == 1 { "" } else { "s" }),
+                text: format!("    [+{n} line{} · {key}]", if n == 1 { "" } else { "s" }),
             });
         }
         self.last_tool = rest;
