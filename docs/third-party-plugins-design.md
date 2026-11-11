@@ -188,7 +188,17 @@ bundle):
    and unattended runs.
 4. Tool retrieval by meaning (shared seam with skills); lazy start.
 
-## 7. Open decisions
+## 7. Decisions (owner, 2026-11-11)
+
+1. The third-party surface is **MCP servers + skills only**; no in-process
+   plugin code.
+2. Sandbox: **detect and use an external wrapper** (`srt` or bubblewrap).
+3. **Unverified third-party plugins are allowed only in interactive
+   sessions, with the sandbox.**
+
+Tracked in epic #594 (#599–#601).
+
+## 7a. Former open decisions (resolved above)
 
 1. Limit the third-party surface to MCP servers + skills, with no in-process
    plugin code (recommended)?
