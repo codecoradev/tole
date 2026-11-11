@@ -5,6 +5,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+# std `File::lock` (the cron job-store lock, #579) is stable since 1.89.
+rust-version = "1.89"
 
 [lib]
 name = "tole_cli"

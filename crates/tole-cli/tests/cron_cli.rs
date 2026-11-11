@@ -9,7 +9,7 @@ use tole_core::ledger::{DeliveryStatus, Due, Lease, RunStatus};
 
 /// 2026-01-01T00:00:00Z.
 const T: i64 = 1_767_225_600;
-const OPTS: TickOptions = TickOptions { max_concurrent: 4 };
+const OPTS: TickOptions = TickOptions::standalone(4);
 
 fn tmp(tag: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("tole-cron-{tag}-{}", std::process::id()));
@@ -88,7 +88,17 @@ fn silent_or_empty_output_delivers_nothing_and_failures_are_errors() {
 }
 
 #[test]
-fn agent_jobs_are_blocked_until_the_agent_runner_lands() {
+fn agent_job_without_a_provider_is_blocked_before_spending() {
+    // No provider in this test binary's environment (agent runs with a
+    // mock provider live in tests/cron_agent.rs).
+    for k in [
+        "TOLE_BASE_URL",
+        "OPENAI_BASE_URL",
+        "TOLE_MODEL",
+        "OPENAI_MODEL",
+    ] {
+        std::env::remove_var(k);
+    }
     let dir = tmp("agent");
     cron::create(
         &dir,
@@ -107,8 +117,39 @@ fn agent_jobs_are_blocked_until_the_agent_runner_lands() {
     assert_eq!(r.blocked, 1);
     let l = store::open_read(&dir).unwrap();
     let b = l.state().blocked().next().unwrap();
-    assert_eq!(b.reason, "agent_mode_unavailable");
+    assert_eq!(b.reason, "provider_missing");
     assert_eq!(cron::list(&dir).unwrap()[0].blocked, 1);
+}
+
+#[test]
+fn a_failed_output_write_is_recorded_and_every_claim_still_settles() {
+    let dir = tmp("outerr");
+    cron::create(&dir, script(&dir, "a", "* * * * *", "echo one"), T).unwrap();
+    cron::create(&dir, script(&dir, "b", "* * * * *", "echo two"), T).unwrap();
+    // `runs` is a file, so no output file can be written under it.
+    std::fs::write(dir.join("runs"), b"not a dir").unwrap();
+    let r = cron::tick(&dir, T + 60, &OPTS).unwrap();
+    assert_eq!(r.ran.len(), 2, "both claims settled");
+    let l = store::open_read(&dir).unwrap();
+    for (fire, status) in &r.ran {
+        assert_eq!(*status, RunStatus::Ok);
+        let usage = l.state().done(fire).unwrap().usage.clone().unwrap();
+        assert!(usage["output_error"].is_string(), "{usage}");
+    }
+    assert!(l.state().pending().next().is_none(), "no dangling claim");
+}
+
+#[test]
+fn run_output_is_redacted_before_it_reaches_disk() {
+    let secret = "sk-cron-redact-0123456789abcdef";
+    std::env::set_var("CRON_REDACT_TEST_API_KEY", secret);
+    let dir = tmp("redact");
+    let line = format!("echo token={secret}");
+    cron::create(&dir, script(&dir, "leak", "* * * * *", &line), T).unwrap();
+    let r = cron::tick(&dir, T + 60, &OPTS).unwrap();
+    let out = output(&dir, &r.ran[0].0);
+    assert!(out.starts_with("token="), "{out}");
+    assert!(!out.contains(secret), "secret written to disk: {out}");
 }
 
 #[test]
