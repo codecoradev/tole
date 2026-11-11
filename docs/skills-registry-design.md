@@ -3,7 +3,10 @@
 Status: **research + proposal; phase 1 (#590) implemented:** the
 `SkillIndex` seam (`crates/tole-core/src/skill_index.rs`), the `uteke doc`
 adapter, pinned + top-K selection, `skill_search` and `tole skills`, opt-in
-with `TOLE_SKILL_INDEX=uteke`. Part of the
+with `TOLE_SKILL_INDEX=uteke`; **#591 implemented:** approved-hash loading
+(§4.2) in `crates/tole-core/src/skill_approval.rs`, opt-in with
+`TOLE_SKILL_APPROVAL=required`, plus `tole skills approve|revoke|list`.
+Part of the
 integration/plugin track (scope order decided 2026-11-11: **own
 integrations first, third-party second**). Related:
 [profiles-collaboration-secrets.md](profiles-collaboration-secrets.md),
@@ -107,6 +110,14 @@ is meant to be followed. This is also an open question in
 
 The trust anchor is therefore the owner's approval of exact bytes, not the
 fact that uteke returned it.
+
+As built (#591): the record is a per-user file
+(`$CODECORA_HOME/tole/skill-approvals.json`), one approval per skill name
+(approving new bytes replaces the old approval). The hash covers the whole
+skill directory (each file's relative path and bytes), so a changed
+reference needs a new approval too. An unapproved skill is listed by name
+only, as unavailable; its description is not shown either, since it is
+text from the same untrusted file.
 
 ### 4.3 Where skills live
 
