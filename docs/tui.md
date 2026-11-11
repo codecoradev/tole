@@ -150,6 +150,8 @@ tole-core, so a long diff is cut there.
 | `/compact [instructions]` | the next prompt compacts first (the forced pass of #481); **not** a mid-turn compaction; instructions are not supported yet and reported as ignored |
 | `/new` | fresh session in place (the old handle is closed) |
 | `/resume` | picker over the global session index (newest 50, current excluded) |
+| `/fork [entry-id]` | fork this session at a settled entry (default: the last) into a new session and switch to it (see Forking) |
+| `/tree` | picker over this session's family (parents and forks, indented, current marked); picking switches (see Forking) |
 | `/session` | the `tole status` lines |
 | `/name <text>` | rename (`fact/session_name`; shown by `sessions --all`, `resume <name>`) |
 | `/image [path\|data-url\|clear]` | queue an image for the next message; no argument lists the queue, `clear` empties it (#560) |
@@ -159,9 +161,43 @@ An unknown command is refused with a prefix hint and nothing is sent. Model,
 effort and name are session registers: the next provider call uses them and
 they survive `tole resume`. `unset` clears the override, so the footer then
 shows the process default (`--effort` / env / config) if one is set, and
-`Shift+Tab` continues from that value. `/new` and `/resume` swap the session in
+`Shift+Tab` continues from that value. `/new`, `/resume`, `/fork` and picking
+from `/tree` swap the session in
 place (one open handle per session) but do not replay the old transcript on
 screen; the todo list tool keeps the launch session's state.
+
+## Forking (`/fork`, `/tree`, #463)
+
+A UI over the session branching of #210 (`tole branch`, `tole sessions
+--tree`); nothing new is stored beyond what `branch` writes.
+
+- **`/fork [entry-id]`** cuts the open session at a *settled* entry (a final
+  assistant message with no tool call hanging off it; default: the last one,
+  as `tole branch` does) into a new session file in the sessions directory,
+  and switches the TUI to it in place. The fork carries the history up to the
+  cut, so the next message continues from there; it does not touch the
+  original, which stays resumable (`tole resume <id>`). The new session is
+  recorded in the session index (face `branch`), so `/resume` and `sessions
+  --all` list it, and its header names the source and the entry
+  (`forkedFrom`). An unknown entry, an unsettled one (a user message, a tool
+  call) or a session with nothing settled yet is refused with the core's
+  error (`(fork: forking s-1: entry … is not a settled point …)`), and the
+  session stays as it was. Forking while the TUI holds the session's writer
+  lock is safe: the source is replayed read-only, the new file takes its own
+  lock.
+- **`/tree`** opens a picker like `/resume` over the family of the open
+  session: its parent chain up to the root and every fork below that root
+  (siblings and grandchildren included), nested with `└─ ` by depth, each fork
+  showing the entry it was cut at (`(@entry)`), the open session marked
+  `(current)` and preselected. `Enter` on another row switches to it (as
+  `/resume` does); on the current row it only says so. A session with no
+  parent and no forks shows just itself, with a note. The data is the same as
+  `sessions --tree` (the `forkedFrom` headers of the files in the sessions
+  directory); sessions whose source file is gone are roots.
+- While a turn runs both are ignored, like `/new` and `/resume`. There is no
+  transcript replay after the switch (the new session's earlier turns are not
+  redrawn), and in-file branching (several branches inside one file) is a
+  separate, still-deferred follow-up.
 
 **Shift+Enter limitation:** most terminals send the same byte for `Enter` and
 `Shift+Enter`. tole asks for the kitty keyboard protocol (kitty, WezTerm,
@@ -174,7 +210,7 @@ everywhere.
 The editor has no in-buffer cursor movement (Left/Right/Home/End, `Up`/`Down`
 always browse history); no memory loop, MCP prompt commands or sibling
 notices; no `/resume` paging and no transcript replay after `/new` /
-`/resume`. Markdown is inline styling only: no tables, nested lists, links,
+`/resume` / `/fork` / `/tree`; no in-file branching. Markdown is inline styling only: no tables, nested lists, links,
 italics; a `**` or `` ` `` pair split by line wrapping is not styled.
 `@` inserts a path at the end of the draft (there is no in-buffer cursor).
 Wide characters wrap by character count, not cell width.

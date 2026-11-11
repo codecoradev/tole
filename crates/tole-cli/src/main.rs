@@ -2292,28 +2292,7 @@ fn import_claude_command(sessions_dir: &Path, path: &Path) -> Result<()> {
 
 /// `tole sessions --tree` (#210): sessions with their forks nested.
 fn sessions_tree_command(sessions_dir: &Path) -> Result<()> {
-    let mut nodes = Vec::new();
-    if sessions_dir.exists() {
-        for entry in std::fs::read_dir(sessions_dir)?.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            let Some(stem) = name.strip_suffix(".jsonl") else {
-                continue;
-            };
-            if !valid_session_id(stem) {
-                continue;
-            }
-            let Ok(s) = JsonlStorage::open_read_only(entry.path()) else {
-                continue;
-            };
-            nodes.push(tole_cli::session_index::TreeNode {
-                id: stem.to_string(),
-                parent: s.forked_from().map(|o| o.session.clone()),
-                at: s.forked_from().map(|o| o.entry.clone()),
-                pc: format!("{:?}", s.state().pc),
-                turns: tole_core::transcript::turn_count(s.entries()),
-            });
-        }
-    }
+    let nodes = tole_cli::session_index::tree_nodes(sessions_dir);
     if nodes.is_empty() {
         println!("no sessions in {}", sessions_dir.display());
         return Ok(());

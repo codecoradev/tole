@@ -4,12 +4,20 @@
 use crate::sanitize::one_line;
 
 /// `(name, one-line help)`; the order is the menu order.
-pub const COMMANDS: [(&str, &str); 9] = [
+pub const COMMANDS: [(&str, &str); 11] = [
     ("/model", "pick the model (Ctrl+L), or /model <id>"),
     ("/thinking", "set reasoning effort (Shift+Tab cycles)"),
     ("/compact", "summarize earlier turns before the next prompt"),
     ("/new", "start a fresh session"),
     ("/resume", "switch to an earlier session"),
+    (
+        "/fork",
+        "fork this session at a settled entry: /fork [entry]",
+    ),
+    (
+        "/tree",
+        "this session's forks and parents; pick one to switch",
+    ),
     ("/session", "model, effort, context and token status"),
     ("/name", "name this session: /name <text>"),
     (
@@ -60,6 +68,8 @@ impl Item {
 pub enum PickKind {
     Model,
     Session,
+    /// `/tree` (#463): the fork family; the open session is preselected.
+    Tree,
 }
 
 /// Rows shown at once (the live area has a header row plus these).
@@ -108,6 +118,13 @@ impl Picker {
         self.sel = (self.sel + 1).min(self.visible().len().saturating_sub(1));
     }
 
+    /// Move the selection to the row whose value is `value` (no-op if absent).
+    pub fn select(&mut self, value: &str) {
+        if let Some(i) = self.visible().iter().position(|i| i.value == value) {
+            self.sel = i;
+        }
+    }
+
     pub fn chosen(&self) -> Option<String> {
         self.visible().get(self.sel).map(|i| i.value.clone())
     }
@@ -119,6 +136,7 @@ impl Picker {
         let what = match self.kind {
             PickKind::Model => "model",
             PickKind::Session => "session",
+            PickKind::Tree => "tree",
         };
         let vis = self.visible();
         let mut out = vec![clip(
