@@ -51,6 +51,22 @@ pub struct MissionConfig {
     pub verify_timeout: Option<u64>,
 }
 
+/// The `[tui]` table (#463): theme name and per-role color overrides. USER
+/// LAYER AND ENVIRONMENT ONLY: a project config may carry the table (so the
+/// file still parses) but [`layered`] drops it, because a cloned repository
+/// must not control how the approval prompt looks. Values are validated by
+/// `tole-tui` when the theme is built; a bad value falls back to the default
+/// theme with a startup note and never aborts, so only the TOML types are
+/// checked here.
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TuiConfig {
+    /// `default | light | mono`.
+    pub theme: Option<String>,
+    /// Role name -> style spec, e.g. `tool = "blue bold"`.
+    pub colors: Option<std::collections::BTreeMap<String, String>>,
+}
+
 /// The whole file: flat snake_case keys mirroring the global flags, all
 /// optional, plus the single `[mission]` table.
 #[derive(Debug, Default, Clone, PartialEq, Deserialize)]
@@ -85,6 +101,8 @@ pub struct Config {
     /// project file can only keep or tighten the gate: see [`layered`].
     pub review_gate: Option<String>,
     pub mission: Option<MissionConfig>,
+    /// Theme and colors (#463); user layer only, see [`TuiConfig`].
+    pub tui: Option<TuiConfig>,
     /// Keys (rendered names, e.g. `model`, `mission.verify`) whose value
     /// came from the user layer; set by [`layered`], never by the file.
     #[serde(skip)]
@@ -423,8 +441,18 @@ pub fn layered(project: &Config, user: &Config) -> Config {
             (p, u) => p.clone().or_else(|| u.clone()),
         },
         mission: (project.mission.is_some() || user.mission.is_some()).then_some(mission),
+        // The project layer NEVER supplies the theme or colors (#463).
+        tui: user.tui.clone(),
         user_keys: BTreeSet::new(),
     };
+    if let Some(t) = &user.tui {
+        if t.theme.as_deref().is_some_and(|v| !v.trim().is_empty()) {
+            from_user.insert("tui.theme");
+        }
+        if t.colors.as_ref().is_some_and(|c| !c.is_empty()) {
+            from_user.insert("tui.colors");
+        }
+    }
     if out.review_gate.is_some() && out.review_gate != project.review_gate {
         from_user.insert("review_gate");
     }
@@ -450,6 +478,18 @@ pub fn render(cfg: &Config) -> Vec<String> {
     render_with(cfg, PROJECT_TAG, &Annotations::new())
 }
 
+/// Suffix of a project config's `tui` lines in `config check` (#463).
+pub const TUI_IGNORED_NOTE: &str =
+    "  IGNORED: a project config cannot set the theme or colors (user config or TOLE_THEME only)";
+
+/// The warning printed at startup when a project config carries `[tui]`.
+pub fn tui_ignored_warning(shown: &str) -> String {
+    format!(
+        "ignoring `tui` in project config {shown}: the theme and colors can only be set in \
+         the user config or with TOLE_THEME"
+    )
+}
+
 /// The `[tag]` on a project config line.
 pub const PROJECT_TAG: &str = "config";
 /// The `[tag]` on a user config line.
@@ -459,7 +499,12 @@ pub const USER_TAG: &str = "user config";
 pub fn render_with(cfg: &Config, tag: &str, ann: &Annotations) -> Vec<String> {
     let src = tag;
     let mut out = Vec::new();
-    let note = |key: &str| ann.get(key).map_or("", String::as_str);
+    let note = |key: &str| {
+        if tag == PROJECT_TAG && key.starts_with("tui.") {
+            return TUI_IGNORED_NOTE;
+        }
+        ann.get(key).map_or("", String::as_str)
+    };
     let scalar = |out: &mut Vec<String>, key: &str, v: Option<String>| {
         if let Some(v) = v {
             out.push(format!("{key} = {v}  [{src}]{}", note(key)));
@@ -538,6 +583,19 @@ pub fn render_with(cfg: &Config, tag: &str, ann: &Annotations) -> Vec<String> {
         "review_gate",
         cfg.review_gate.as_deref().map(quote),
     );
+    if let Some(t) = &cfg.tui {
+        scalar(&mut out, "tui.theme", t.theme.as_deref().map(quote));
+        if let Some(c) = &t.colors {
+            out.push(format!(
+                "tui.colors = [{} entries]  [{src}]{}",
+                c.len(),
+                note("tui.colors")
+            ));
+            for (role, spec) in c {
+                out.push(format!("  - {role} = {}", quote(spec)));
+            }
+        }
+    }
     if let Some(m) = &cfg.mission {
         scalar(
             &mut out,
@@ -689,6 +747,31 @@ verify_timeout = 60
         assert!(lines.contains(&"model = \"m\"  [config]".to_string()));
         assert!(lines.contains(&"  - \"internal\"".to_string()));
         assert!(lines.contains(&"mission.max_tokens = 1000  [config]".to_string()));
+    }
+
+    #[test]
+    fn tui_table_parses_is_strict_and_only_the_user_layer_survives_layering() {
+        let c = parse(
+            "[tui]\ntheme = \"light\"\n[tui.colors]\ntool = \"blue bold\"\n",
+            &p(),
+        )
+        .unwrap();
+        let t = c.tui.as_ref().unwrap();
+        assert_eq!(t.theme.as_deref(), Some("light"));
+        assert_eq!(t.colors.as_ref().unwrap()["tool"], "blue bold");
+        // Unknown keys and wrong types are loud, like any other key; a bad
+        // VALUE is not (it is checked when the theme is built).
+        assert!(parse("[tui]\nthemes = \"x\"\n", &p()).is_err());
+        assert!(parse("[tui]\ntheme = 3\n", &p()).is_err());
+        assert!(parse("[tui]\ntheme = \"neon\"\n", &p()).is_ok());
+        // The project layer never reaches the merged config.
+        let project = parse("[tui]\ntheme = \"mono\"\n", &p()).unwrap();
+        let m = layered(&project, &Config::default());
+        assert_eq!(m.tui, None);
+        assert!(m.user_keys.is_empty());
+        let m = layered(&project, &c);
+        assert_eq!(m.tui, c.tui);
+        assert!(m.user_keys.contains("tui.theme") && m.user_keys.contains("tui.colors"));
     }
 
     #[test]

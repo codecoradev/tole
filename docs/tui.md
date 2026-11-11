@@ -1,6 +1,6 @@
 # Terminal UI (`tole-tui`)
 
-Status: **MVP + pickers + steering + paste/images + export/copy** (#460, #461, #462, #560, #463 part 1, in `develop`, not yet released). Bare
+Status: **MVP + pickers + steering + paste/images + export/copy + fork/tree + themes** (#460, #461, #462, #560, #463 parts 1-3, in `develop`, not yet released). Bare
 `tole` on an interactive terminal opens an inline UI over one ordinary tole
 session. Next: #464 (detach key).
 
@@ -171,6 +171,69 @@ skipped. `Tab` / `Enter` replace the `@word` with the path; with no match,
   every command; `/export` could read the log safely during a turn, but it
   would be the only command that did.
 
+## Themes (#463)
+
+Colors come from a theme: a table from semantic roles to a foreground color
+plus bold / italic / underline / dim. Three are built in.
+
+- `default` is the look tole always had (cyan tool lines, yellow notes and
+  approval prompt, green / red diff rows, dim hints and footer).
+- `light` avoids colors that vanish on a light background (no yellow, white or
+  cyan text; tools and code in blue, notes and the approval prompt in a dark
+  amber).
+- `mono` uses no color at all, only bold, dim, italic and underline.
+
+**Choosing one.** `TOLE_THEME=<name>` (env) beats `[tui] theme = "<name>"` in
+the **user** config (`~/.codecora/tole/config.toml`), which beats `NO_COLOR`
+(a set, non-empty `NO_COLOR` selects `mono`, see <https://no-color.org>), which
+beats `default`. `tole config check` shows the effective theme and which of
+these supplied it. Note that the terminal backend (crossterm) itself drops
+color escapes whenever `NO_COLOR` is set, so an explicitly chosen colored
+theme still prints without color until `NO_COLOR` is unset (bold, dim and
+underline stay).
+
+**Custom colors.** The user config may override single roles; a value is an
+optional color and any of `bold italic underline dim`, in any order:
+
+```toml
+[tui]
+theme = "light"          # optional; default | light | mono
+
+[tui.colors]
+tool = "blue"            # a color name
+heading = "#5f00af bold" # #rrggbb
+reasoning = "244 italic" # 0-255 indexed
+```
+
+Colors are `black red green yellow blue magenta cyan gray darkgray lightred
+lightgreen lightyellow lightblue lightmagenta lightcyan white`, a number
+`0`-`255`, or `#rrggbb`. Roles: `user text reasoning tool tool_output heading
+code note diff_add diff_remove diff_hunk inline_code inline_bold queue menu
+picker hint border footer approval`. An override replaces the role's whole
+style. There is no theme file format; the table above is the whole surface.
+
+**What a theme can never do.** It has no background colors, and `hidden`,
+`reversed`, `blink` and the like do not exist in the vocabulary, so text cannot
+be made invisible by a theme. The approval prompt (`approval`) and notes
+(`note`, which also carry errors) are *critical*: never dim, and any custom
+style for them is forced bold. A color is rejected only when it can never be
+valid (unknown name, index above 255, malformed hex); choosing a color close to
+your own background is your call.
+
+**Bad values never stop the UI.** An unknown theme name or an invalid color
+makes the TUI use `default` and print one note at start naming the key and the
+problem (`theme: tui.colors: role `tool`: invalid color `x` ...; using the
+default theme`). `tole config check` flags the same value as `INVALID`.
+
+**Project config is not a source.** A `[tui]` table in `.tole/config.toml` is
+ignored: a cloned repository must not control how the approval prompt looks.
+tole prints one `warning: ignoring `tui` in project config ...` at startup and
+`tole config check` marks the project's keys `IGNORED`.
+
+**No `/theme` command.** A live switch could not restyle the append-only
+scrollback (lines already printed keep their colors), so the theme is read once
+at start; change the setting and restart.
+
 ## Scrollback is append-only
 
 Finished lines live in the terminal's own scrollback, so `Ctrl+O` / `Ctrl+T`
@@ -280,6 +343,7 @@ Wide characters wrap by character count, not cell width.
   ended, a newer request, the UI gone) is **denied**. The risk tier is carried so
   the rule that a `Destructive` call is never "allowed always"
   (`ApprovalRequest::can_allow_always`) lives in one place for every UI.
+- **Theme (#463):** `tole-tui` owns the `Theme` type (role -> `Style`, built-ins, color parsing and the safety rules) and reads no file or env; the host hands it over through the defaulted `TuiHost::theme` / `startup_note`. `tole-cli` resolves the name and overrides (`TOLE_THEME` > user config > `NO_COLOR` > `default`; the project layer is dropped in `config::layered`).
 - **Host seam (#526):** `TuiHost` has three methods: `footer`, `run_turn` and
   `apply(HostCmd) -> Result<HostReply, String>`, which covers every slash command
   and hotkey (`/model`, `/effort`, `/compact`, `/new`, `/resume`, `/session`,

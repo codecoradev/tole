@@ -701,6 +701,23 @@ is only base64 of the last answer (capped at 64 KiB), so answer text cannot
 inject terminal escapes; what the terminal does with the clipboard write is
 outside tole (some terminals ask first or ignore it).
 
+### TUI themes (#463)
+
+A theme decides how the approval prompt and error notes look, so it is an
+input an attacker would like to control (a prompt drawn invisible, or styled
+like a harmless line, gets a Write approved by accident). Three rules close
+that: (1) the theme is read from the **user** config and the environment only;
+`config::layered` drops a project config's `[tui]` table (which still parses,
+so the file loads), startup prints one warning and `tole config check` marks
+the keys `IGNORED`. (2) The theme vocabulary cannot hide text: no background
+colors at all, no hidden / reversed / blink modifier, so the worst a user-set
+theme does is choose a foreground color. (3) The approval and note roles are
+critical: never dim and bold in every custom style. A foreground color close to
+the user's own background cannot be detected and is not rejected; that choice
+is the user's. Theme values are plain config strings: no code runs, and the
+values shown in notes pass through the TUI sanitizer. An invalid value falls
+back to the built-in default instead of aborting.
+
 ### User config (#433)
 
 `$CODECORA_HOME/tole/config.toml` (default `~/.codecora/tole/config.toml`) has

@@ -71,6 +71,9 @@ pub struct TuiSession {
     index: Option<PathBuf>,
     /// The workspace `/export` is jailed to (#463).
     workspace: PathBuf,
+    /// Colors and the note about a refused theme (#463).
+    theme: tole_tui::Theme,
+    theme_note: Option<String>,
 }
 
 impl TuiSession {
@@ -98,7 +101,16 @@ impl TuiSession {
             fresh_prompt: None,
             index: crate::session_index::index_path(),
             workspace: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            theme: tole_tui::Theme::default(),
+            theme_note: None,
         }
+    }
+
+    /// The theme the UI draws with, and a note to show at start (#463).
+    pub fn with_theme(mut self, theme: tole_tui::Theme, note: Option<String>) -> Self {
+        self.theme = theme;
+        self.theme_note = note;
+        self
     }
 
     /// The workspace root `/export` writes under (default: the cwd).
@@ -205,6 +217,14 @@ pub fn footer_from(
 }
 
 impl TuiHost for TuiSession {
+    fn theme(&self) -> tole_tui::Theme {
+        self.theme.clone()
+    }
+
+    fn startup_note(&self) -> Option<String> {
+        self.theme_note.clone()
+    }
+
     fn footer(&self) -> Footer {
         let mut g = self.lock();
         let Inner {
