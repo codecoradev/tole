@@ -202,7 +202,7 @@ ideas, not architecture:
 ```
 tole cron create "<schedule>" "<prompt>" [--name N] [--script CMD] [--allow write:tool]
          [--model M] [--budget-steps N --budget-minutes N --budget-tokens N]
-         [--workdir D] [--skill S] [--catch-up skip|one --grace-minutes N] [--paused]
+         [--workdir D] [--skill S] [--profile P] [--catch-up skip|one --grace-minutes N] [--paused]
 tole cron list | status | runs [job] | pause|resume|remove|run|cancel <job> | edit <job> … | tick
 tole hook add|list|remove|test <route> …
 ```

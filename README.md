@@ -155,6 +155,7 @@ tole branch <id> [--at <entry>]             # fork a session at a settled entry,
 tole import-claude <transcript.jsonl>       # import a Claude Code session as cc-<id>, then resume it
 tole cron create "@daily" --script "backup.sh"  # scheduled job; `tole cron tick` (every minute from cron/systemd) runs what is due; list|pause|resume|remove|runs
 tole cron create "0 9 * * 1-5" "Summarize open PRs" --allow write_file --model M  # agent job; `tole serve --cron` hosts the ticker
+tole cron create "@daily" "Triage new issues" --skill triage --profile ops  # agent job with a skill (name or SKILL.md) and a user-config profile; Writes need --allow AND the profile's allow
 tole cron edit NAME --deliver file:reports/prs.md   # also: run NAME (now), cancel NAME, status (ticker alive?)
 tole status [id]                            # pc / seq / turns / token + cache usage / request-size split; model, effort, context used/window, tokens, compactions (default: latest session)
 ```
@@ -308,6 +309,7 @@ type or a secret-like key is an error with `file:line`; the file is capped at
 | `[tui]` `theme`, `[tui.colors]` | `TOLE_THEME`, `NO_COLOR` | **user config only** (a project's `[tui]` is ignored with a warning): env > user config > `NO_COLOR` (`mono`) > `default`; see docs/tui.md |
 | `[mission]` `verify`, `verify_timeout` | `mission --verify`, `--verify-timeout` | flag > config > default (`300`) |
 | `[cron]` `daily_token_cap` | (none) | **user config only** (a project's `[cron]` is ignored): tokens all cron agent runs of one UTC day may spend; past it they settle `budget` |
+| `[cron]` `max_concurrent` | `4` | **user config only**: runs one tick (`tole cron tick`, the `tole serve --cron` ticker) executes at once, 1 to 64; `tole cron tick --max-concurrent N` overrides it for that tick |
 | `trust` (list of presets) | `--trust` | flag > `TOLE_TRUST` env > config |
 | `allow` (list of globs) | the subcommand's own `--allow` | flag > config |
 | `mcp_server` (list) | `--mcp-server` | flag > config |

@@ -96,7 +96,13 @@ pub struct CronConfig {
     /// Tokens all agent runs of one UTC day may spend together; past it
     /// agent runs settle `budget` without calling the provider.
     pub daily_token_cap: Option<u64>,
+    /// Runs one tick (`tole cron tick`, the `tole serve --cron` ticker)
+    /// executes at once, 1 to [`MAX_CRON_CONCURRENT`] (default 4).
+    pub max_concurrent: Option<usize>,
 }
+
+/// Upper bound of `cron.max_concurrent`.
+pub const MAX_CRON_CONCURRENT: usize = 64;
 
 /// `[profiles.<name>.models]` (#584): model names per task-weight tier.
 /// `default` names the tier a session uses unless something picks another
@@ -453,6 +459,13 @@ pub fn parse(src: &str, path: &Path) -> Result<Config, ConfigError> {
     for (name, p) in cfg.profiles.iter().flatten() {
         check_profile(name, p).map_err(range)?;
     }
+    if let Some(n) = cfg.cron.as_ref().and_then(|c| c.max_concurrent) {
+        if !(1..=MAX_CRON_CONCURRENT).contains(&n) {
+            return Err(range(format!(
+                "cron.max_concurrent must be 1 to {MAX_CRON_CONCURRENT}, got {n}"
+            )));
+        }
+    }
     Ok(cfg)
 }
 
@@ -610,12 +623,13 @@ pub fn layered(project: &Config, user: &Config) -> Config {
         profiles: user.profiles.clone(),
         user_keys: BTreeSet::new(),
     };
-    if user
-        .cron
-        .as_ref()
-        .is_some_and(|c| c.daily_token_cap.is_some())
-    {
-        from_user.insert("cron.daily_token_cap");
+    if let Some(c) = &user.cron {
+        if c.daily_token_cap.is_some() {
+            from_user.insert("cron.daily_token_cap");
+        }
+        if c.max_concurrent.is_some() {
+            from_user.insert("cron.max_concurrent");
+        }
     }
     if let Some(t) = &user.tui {
         if t.theme.as_deref().is_some_and(|v| !v.trim().is_empty()) {
@@ -843,6 +857,11 @@ pub fn render_with(cfg: &Config, tag: &str, ann: &Annotations) -> Vec<String> {
             "cron.daily_token_cap",
             c.daily_token_cap.map(|n| n.to_string()),
         );
+        scalar(
+            &mut out,
+            "cron.max_concurrent",
+            c.max_concurrent.map(|n| n.to_string()),
+        );
     }
     out
 }
@@ -1015,6 +1034,26 @@ verify_timeout = 60
         assert!(m.user_keys.contains("cron.daily_token_cap"));
         let shown = render(&project).join("\n");
         assert!(shown.contains("cron.daily_token_cap = 999999999") && shown.contains("IGNORED"));
+    }
+
+    /// #579: `cron.max_concurrent` is a bounded, user-layer-only key.
+    #[test]
+    fn cron_max_concurrent_is_bounded_and_user_layer_only() {
+        let user = parse("[cron]\nmax_concurrent = 8\n", &p()).unwrap();
+        assert_eq!(user.cron.as_ref().unwrap().max_concurrent, Some(8));
+        for bad in ["0", "65", "-1", "\"4\""] {
+            assert!(
+                parse(&format!("[cron]\nmax_concurrent = {bad}\n"), &p()).is_err(),
+                "{bad}"
+            );
+        }
+        let project = parse("[cron]\nmax_concurrent = 64\n", &p()).unwrap();
+        assert_eq!(layered(&project, &Config::default()).cron, None);
+        let m = layered(&project, &user);
+        assert_eq!(m.cron, user.cron);
+        assert!(m.user_keys.contains("cron.max_concurrent"));
+        let shown = render(&project).join("\n");
+        assert!(shown.contains("cron.max_concurrent = 64") && shown.contains("IGNORED"));
     }
 
     #[test]

@@ -851,9 +851,13 @@ fn dispatch(cli: Cli) -> Result<()> {
     };
     // The selected profile (#584): resolved once, from the layered config
     // (the user layer is its only source). Reads its persona file and
-    // nothing else; an unknown name is a startup error.
+    // nothing else; an unknown name is a startup error. `tole cron`
+    // records --profile in a job instead and checks it against the user
+    // config itself (#579).
     let profile = match &cli.profile {
         None => None,
+        #[cfg(feature = "shell-tools")]
+        Some(_) if matches!(cli.command, Command::Cron { .. }) => None,
         Some(name) => {
             let base = tole_cli::config::user_config_path()
                 .and_then(|p| p.parent().map(Path::to_path_buf));
@@ -1112,7 +1116,13 @@ fn dispatch(cli: Cli) -> Result<()> {
             )
         }
         #[cfg(feature = "shell-tools")]
-        Command::Cron { action } => tole_cli::cron::cli(action),
+        Command::Cron { action } => tole_cli::cron::cli(
+            action,
+            tole_cli::cron::JobGlobals {
+                skills: cli.skill.iter().map(|p| p.display().to_string()).collect(),
+                profile: cli.profile.clone(),
+            },
+        ),
         #[cfg(feature = "shell-tools")]
         Command::Skills { action } => tole_cli::skill_recall::cli(action),
         Command::Approvals {

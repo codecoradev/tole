@@ -806,6 +806,13 @@ target, the parent re-checked after canonicalizing); a `command:` target is
 argv (no shell, destructive argv refused, scrubbed env, 60 s timeout) and is
 trust-gated: only a job whose record says `created_by = cli` (saved by a
 human with `tole cron create`/`edit`) may run one, any other job is
-`blocked` before it runs. `cron.daily_token_cap` is read from the user
-config only, so a cloned repository cannot raise it. `GET /cron/runs` sits
+`blocked` before it runs. `cron.daily_token_cap` and `cron.max_concurrent`
+are read from the user config only, so a cloned repository cannot raise
+them. A job's skills (`--skill`) and profile (`--profile`) are validated on
+save and again when a run is claimed: a skill that is gone or broken, or a
+profile the user config no longer defines, records the run `blocked` before
+any token is spent. A profiled run auto-approves a Write only when both the
+job's `allow` and the profile's `allow` cover it (never wider than either),
+and gets the secrets `Profile::granted(job grants)`: a job grants none, so
+a profile's `grants` give a cron run nothing. `GET /cron/runs` sits
 behind the `tole serve` bearer token like every other route.
