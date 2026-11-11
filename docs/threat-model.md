@@ -781,6 +781,36 @@ process, provider call or memory read happens for any profile. The persona
 becomes the system prompt and reaches the provider like any other system
 prompt (secret redaction applies, #595).
 
+### Delegation tree (#585)
+
+`tole_core::delegation` holds the caps that replace the depth-1 rule once it
+is wired to the delegate tool (follow-up PR; until then `agent_start` keeps the
+depth-1 cap above, unchanged). All of them sit in one module so no caller can
+skip one:
+- **No budget multiplication.** A child's tokens and steps are carved from its
+  parent's remaining budget and its deadline is never later than the parent's;
+  a running child's whole carve stays reserved, so any number of children
+  share one root pot. A spawn with nothing left is refused.
+- **Depth** is 2 by default and can never exceed 3 (`max_depth` outside 1–3 is
+  refused when the goal opens); a node at the limit cannot delegate.
+- **Authority only narrows.** The child allowlist is the profile's patterns
+  that a parent pattern covers, plus every deny of both; uncovered patterns are
+  dropped and recorded. A `consult` node cannot spawn an `execute` node or take
+  a write lease.
+- **One writer per path.** An `execute` node takes a write lease before
+  writing; a lease conflicts with any live lease on the same path, an ancestor
+  or a descendant, and the first lease in log order wins a race.
+- **Mandatory report.** A run settles `done` only with a report (summary;
+  changed files need a diff ref and the checks run) and no unsettled children;
+  otherwise `incomplete`, with the reasons in the log. A terminal record is
+  never overwritten.
+- **Audit.** The tree is an append-only log (spawns, budgets, allowlists,
+  workspaces, sessions, leases, reports); dead processes settle `interrupted`
+  and queued children of a settled parent `cancelled` on recovery.
+
+The report and the summary are model-authored text: they are recorded and
+shown, never executed or trusted as instructions.
+
 ### User config (#433)
 
 `$CODECORA_HOME/tole/config.toml` (default `~/.codecora/tole/config.toml`) has
