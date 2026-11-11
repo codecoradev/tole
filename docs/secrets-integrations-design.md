@@ -153,7 +153,20 @@ decision: it changes a documented behaviour.
 Third-party plugins (MCP servers and skills from others) follow, on the
 same principles plus supply-chain controls.
 
-## 8. Open decisions
+## 8. Decisions (owner, 2026-11-11)
+
+1. **The session log stores the redacted form**, plus the names (never the
+   values) of the secrets that were redacted. This changes E11's "the
+   durable log keeps the original"; it matches the replay rule "the log
+   stores what the provider saw".
+2. **One shape-detector ruleset**, shared with uteke through a small common
+   crate extracted from `uteke-core/src/privacy.rs`.
+3. **`run_command` / `job_start` receive no secrets by default**, including
+   `GITHUB_TOKEN`. The `gh` / `git` tools are the supported path, and an
+   explicit `[secrets]` grant restores a token for a project. This is a
+   behaviour change: a CHANGELOG entry and migration note are required.
+
+## 8a. Former open decisions (resolved above)
 
 1. Session log: store the redacted form (recommended), or keep it raw?
 2. Share uteke's `privacy.rs` ruleset through a small common crate
