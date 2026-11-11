@@ -967,6 +967,29 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                 Err(resp) => resp,
             }
         }
+        // Cron run results (#579, design §9): the pull delivery target.
+        ("GET", p) if p == "/cron/runs" || p.starts_with("/cron/runs?") => {
+            let query = |key: &str| {
+                p.split_once('?').and_then(|(_, q)| {
+                    q.split('&')
+                        .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))
+                })
+            };
+            let limit = match query("limit").map(str::parse::<usize>) {
+                None => None,
+                Some(Ok(n)) => Some(n),
+                Some(Err(_)) => return (400, json!({"error": "limit must be a number"})),
+            };
+            let runs = tole_cli::cron::default_dir()
+                .and_then(|dir| tole_cli::cron::runs_json(&dir, query("job"), limit));
+            match runs {
+                Ok(v) => (200, v),
+                Err(e) if e.to_string().starts_with("no job") => {
+                    (404, json!({"error": e.to_string()}))
+                }
+                Err(e) => (500, json!({"error": format!("{e:#}")})),
+            }
+        }
         // Remote approvals (issue #200): list + decide.
         ("GET", p) if p == "/approvals" || p.starts_with("/approvals?") => {
             let session = p.split_once('?').and_then(|(_, q)| {

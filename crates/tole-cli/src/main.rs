@@ -561,9 +561,9 @@ enum Command {
         #[arg(long = "image")]
         images: Vec<String>,
     },
-    /// Scheduled jobs (#579): `create`, `list`, `pause`, `resume`,
-    /// `remove`, `runs`, and `tick` (one scheduler pass, for cron(8) or a
-    /// systemd timer). Script jobs run argv without a shell and spend zero
+    /// Scheduled jobs (#579): `create`, `edit`, `list`, `status`, `pause`,
+    /// `resume`, `remove`, `run`, `cancel`, `runs`, and `tick` (one
+    /// scheduler pass, for cron(8) or a systemd timer). Script jobs run argv without a shell and spend zero
     /// tokens. Jobs live in `$TOLE_CRON_DIR` (default `<codecora home>/tole/cron`).
     #[cfg(feature = "shell-tools")]
     Cron {
