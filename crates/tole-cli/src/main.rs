@@ -570,6 +570,14 @@ enum Command {
         #[command(subcommand)]
         action: tole_cli::cron::CronAction,
     },
+    /// The uteke skill index (#590): `index` the discovered skills,
+    /// `retire` one, or `search` it the way a task would. Sessions use it
+    /// with `TOLE_SKILL_INDEX=uteke`.
+    #[cfg(feature = "shell-tools")]
+    Skills {
+        #[command(subcommand)]
+        action: tole_cli::skill_recall::SkillsAction,
+    },
     /// Project config file `.tole/config.toml` (#208): `check` validates
     /// it and shows the effective values, `trust`/`untrust` manage the
     /// trust record. Every key is applied after trust (flag > env > config
@@ -655,6 +663,8 @@ fn gate_policy(cmd: &Command) -> GatePolicy {
         | Command::Approvals { .. } => GatePolicy::Skip,
         #[cfg(feature = "shell-tools")]
         Command::Cron { .. } => GatePolicy::Skip,
+        #[cfg(feature = "shell-tools")]
+        Command::Skills { .. } => GatePolicy::Skip,
         // `--prompt-file -` consumes stdin as the prompt: a question on
         // the same stream would eat prompt text.
         Command::Run { prompt_file, .. } if prompt_file.as_deref() == Some("-") => {
@@ -1103,6 +1113,8 @@ fn dispatch(cli: Cli) -> Result<()> {
         }
         #[cfg(feature = "shell-tools")]
         Command::Cron { action } => tole_cli::cron::cli(action),
+        #[cfg(feature = "shell-tools")]
+        Command::Skills { action } => tole_cli::skill_recall::cli(action),
         Command::Approvals {
             action,
             id,
@@ -1854,17 +1866,24 @@ fn review_section(registry: &ToolRegistry) -> &'static str {
 /// back to the CURRENT DIRECTORY — the same default the file-tools
 /// jail uses (found by the 2026-10-05 sweep: a project with
 /// `<cwd>/skills/` and no flag silently got no discovery).
+///
+/// `brief` is the owner-written task (the `run` prompt): with
+/// `TOLE_SKILL_INDEX=uteke` it is the recall query for the skills shown
+/// (#590); interactive sessions pass `None` and get the pinned core.
 fn apply_skills(
     skills: &[PathBuf],
     workspace: Option<&String>,
     no_skills: bool,
     registry: &mut ToolRegistry,
+    brief: Option<&str>,
 ) -> Result<String> {
     if no_skills {
         return Ok(String::new());
     }
     let ws_root = resolve_workspace_root(workspace)?;
-    apply_skills_in(skills, Some(ws_root), false, registry)
+    let recall =
+        tole_cli::skill_recall::SkillRecall::from_env(brief).map_err(anyhow::Error::msg)?;
+    apply_skills_in(skills, Some(ws_root), false, registry, &recall)
 }
 
 /// Testable core of [`apply_skills`] taking the RESOLVED discovery
@@ -1875,6 +1894,7 @@ fn apply_skills_in(
     ws_root: Option<PathBuf>,
     no_skills: bool,
     registry: &mut ToolRegistry,
+    recall: &tole_cli::skill_recall::SkillRecall,
 ) -> Result<String> {
     let mut sections = String::new();
     if no_skills {
@@ -1895,10 +1915,13 @@ fn apply_skills_in(
         sections.push_str(&format!("\n\n# Skill: {}\n{}", skill.name, skill.body));
     }
     if !tole_core::skills::available_skills(ws_path.as_deref()).is_empty() {
-        sections.push_str(&tole_core::skills::index_block(ws_path.as_deref()));
-        registry
-            .register(Box::new(tole_core::skills::LoadSkillTool::new(ws_path)))
-            .map_err(|e| anyhow::anyhow!("registering load_skill: {e}"))?;
+        let (block, notes) =
+            tole_cli::skill_recall::skills_section(recall, ws_path.as_deref(), registry)
+                .map_err(anyhow::Error::msg)?;
+        for note in notes {
+            eprintln!("tole: {note}");
+        }
+        sections.push_str(&block);
     }
     Ok(sections)
 }
@@ -1933,6 +1956,7 @@ fn run_command(
         host.workspace.as_ref(),
         host.no_skills,
         &mut registry,
+        Some(prompt),
     )?;
     // Opt-in tool-boundary hooks (issue #110): deny-only policy
     // injection for Write/Destructive calls, default OFF.
@@ -2124,6 +2148,7 @@ fn resume_command(
         host.workspace.as_ref(),
         host.no_skills,
         &mut registry,
+        None,
     )?;
     // Opt-in tool-boundary hooks (issue #110): deny-only policy
     // injection for Write/Destructive calls, default OFF.
@@ -2537,6 +2562,7 @@ fn chat_command(
         host.workspace.as_ref(),
         host.no_skills,
         &mut registry,
+        None,
     )?;
     // Opt-in tool-boundary hooks (issue #110): deny-only policy
     // injection for Write/Destructive calls, default OFF.
@@ -2931,6 +2957,7 @@ fn tui_command(
         host.workspace.as_ref(),
         host.no_skills,
         &mut registry,
+        None,
     )?;
     // Opt-in tool-boundary hooks (issue #110): same wiring as `chat`.
     #[cfg(feature = "shell-tools")]
@@ -3687,6 +3714,7 @@ mod skills_wiring_tests {
             Some(&dir.to_string_lossy().to_string()),
             false,
             &mut reg,
+            None,
         )
         .unwrap();
         assert!(sections.contains("# Skill: demo"));
@@ -3710,6 +3738,7 @@ mod skills_wiring_tests {
             Some(&dir.to_string_lossy().to_string()),
             true,
             &mut reg,
+            None,
         )
         .unwrap();
         assert!(sections.is_empty());
@@ -3735,7 +3764,8 @@ mod skills_wiring_tests {
         )
         .unwrap();
         let mut reg = ToolRegistry::new();
-        let sections = apply_skills_in(&[], Some(dir.clone()), false, &mut reg).unwrap();
+        let sections =
+            apply_skills_in(&[], Some(dir.clone()), false, &mut reg, &Default::default()).unwrap();
         assert!(
             sections.contains("demo"),
             "discovery index must list the skill: {sections}"

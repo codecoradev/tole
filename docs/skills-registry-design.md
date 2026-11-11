@@ -1,9 +1,9 @@
 # Skills: retrieval through uteke, growth with curation — design note
 
-Status: **research + proposal; #590 part 1 implemented:** the
-`SkillIndex` seam, the `uteke doc` adapter, pinned + top-K selection and
-`skill_search` in `crates/tole-core/src/skill_index.rs` (not yet wired into
-sessions). Part of the
+Status: **research + proposal; phase 1 (#590) implemented:** the
+`SkillIndex` seam (`crates/tole-core/src/skill_index.rs`), the `uteke doc`
+adapter, pinned + top-K selection, `skill_search` and `tole skills`, opt-in
+with `TOLE_SKILL_INDEX=uteke`. Part of the
 integration/plugin track (scope order decided 2026-11-11: **own
 integrations first, third-party second**). Related:
 [profiles-collaboration-secrets.md](profiles-collaboration-secrets.md),
@@ -82,7 +82,10 @@ per task (start of a run, each delegation, each discussion participant):
   Never raw tool output: a web page must not steer which instructions get
   loaded.
 - **Similarity floor:** below it, return fewer (zero is fine). Irrelevant
-  skills are not free; SkillsBench shows regressions.
+  skills are not free; SkillsBench shows regressions. The default, 0.35
+  (`TOLE_SKILL_FLOOR`), is a documented starting value, not a calibrated
+  one: check it with `tole skills search` on a real store before relying
+  on it.
 - **Filters by meaning *and* by metadata:** status `approved`, profile
   scope, tags/domain, platform, and not `retired`.
 - **Prompt cache:** the list is fixed at task start. Additions mid-task

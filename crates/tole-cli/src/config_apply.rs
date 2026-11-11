@@ -320,6 +320,9 @@ pub struct ProviderFill {
     pub profile_model: Option<String>,
     /// The selected profile's persona (#584): beats `TOLE_SYSTEM_PROMPT`.
     pub profile_system_prompt: Option<String>,
+    /// The selected profile's name (#584): the scope of recalled skills
+    /// (#590).
+    pub profile_name: Option<String>,
 }
 
 static FILL: OnceLock<ProviderFill> = OnceLock::new();
@@ -348,6 +351,12 @@ pub fn provider_config() -> Option<OpenAiConfig> {
 /// `TOLE_SYSTEM_PROMPT` and the config (#584).
 pub fn profile_system_prompt() -> Option<String> {
     nonblank(fill().profile_system_prompt)
+}
+
+/// The selected profile's name (`--profile`), `None` without one: the
+/// profile scope of the skills a session recalls (#590).
+pub fn profile_name() -> Option<String> {
+    nonblank(fill().profile_name)
 }
 
 static EFFORT: OnceLock<Option<String>> = OnceLock::new();
@@ -815,6 +824,7 @@ impl Settings {
             system_prompt: nonblank(cfg.system_prompt.clone()),
             profile_model: None,
             profile_system_prompt: None,
+            profile_name: None,
         }
     }
 
@@ -828,6 +838,7 @@ impl Settings {
         if let Some(p) = profile {
             f.profile_model = nonblank(p.model.clone());
             f.profile_system_prompt = nonblank(p.system_prompt.clone());
+            f.profile_name = nonblank(Some(p.name.clone()));
         }
         f
     }
