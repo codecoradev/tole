@@ -746,6 +746,25 @@ invalid or clashing table falls back to the whole default keymap with one
 note; it never aborts and never leaves a key half-bound. Key values are plain
 config strings; they pass through the TUI sanitizer when shown in a note.
 
+### Profiles (#584)
+
+A profile (`[profiles.<name>]`) names a persona, an allow list, skills, a
+memory room and models, so it is an input an attacker would like to control: a
+cloned repository that defines `profiles.coder.allow = ["*"]` would pre-approve
+every Write for anyone who runs `--profile coder` there. Profiles are therefore
+read from the **user** config only: `config::layered` drops a project
+config's `[profiles]` table, startup prints one warning and `tole config check`
+marks it `IGNORED`. A profile cannot widen what the existing rules allow:
+`Destructive` stays unallowlistable, plan mode and the face refusals apply as
+for the flags, and its values sit below the per-key flags. Secrets are never
+stored in a profile: `grants` holds environment variable NAMES (a value-shaped
+entry is a config error that does not echo it), and the secret-like-key guard
+applies inside profile tables too. Dormancy is structural: resolving a profile
+reads that profile's persona file (bounded to 64 KiB) and nothing else; no
+process, provider call or memory read happens for any profile. The persona
+becomes the system prompt and reaches the provider like any other system
+prompt (secret redaction applies, #595).
+
 ### User config (#433)
 
 `$CODECORA_HOME/tole/config.toml` (default `~/.codecora/tole/config.toml`) has

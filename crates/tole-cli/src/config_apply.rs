@@ -38,6 +38,9 @@ pub const DEFAULT_SESSIONS_DIR: &str = ".tole/sessions";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
     Flag,
+    /// The profile selected with `--profile` (#584): below the per-key
+    /// flags, above the environment and the config files.
+    Profile,
     Env,
     /// The project config.
     Config,
@@ -50,6 +53,7 @@ impl fmt::Display for Source {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Source::Flag => "flag",
+            Source::Profile => "profile",
             Source::Env => "env",
             Source::Config => "config",
             Source::UserConfig => "user config",
@@ -312,6 +316,10 @@ pub struct ProviderFill {
     pub base_url: Option<String>,
     pub model: Option<String>,
     pub system_prompt: Option<String>,
+    /// The selected profile's model (#584): beats the env model.
+    pub profile_model: Option<String>,
+    /// The selected profile's persona (#584): beats `TOLE_SYSTEM_PROMPT`.
+    pub profile_system_prompt: Option<String>,
 }
 
 static FILL: OnceLock<ProviderFill> = OnceLock::new();
@@ -329,7 +337,17 @@ fn fill() -> ProviderFill {
 /// `OpenAiConfig::from_env()`: identical when no config was installed.
 pub fn provider_config() -> Option<OpenAiConfig> {
     let f = fill();
-    resolve_provider(f.base_url.as_deref(), f.model.as_deref(), &real_env).config
+    let mut cfg = resolve_provider(f.base_url.as_deref(), f.model.as_deref(), &real_env).config;
+    if let (Some(c), Some(m)) = (cfg.as_mut(), nonblank(f.profile_model)) {
+        c.model = m;
+    }
+    cfg
+}
+
+/// The selected profile's persona, for the server faces: above
+/// `TOLE_SYSTEM_PROMPT` and the config (#584).
+pub fn profile_system_prompt() -> Option<String> {
+    nonblank(fill().profile_system_prompt)
 }
 
 static EFFORT: OnceLock<Option<String>> = OnceLock::new();
@@ -399,6 +417,8 @@ pub struct Flags {
     pub no_compaction: bool,
     /// `--effort` (#457; already validated by the flag parser).
     pub reasoning_effort: Option<String>,
+    /// The profile `--profile` selected, already resolved (#584).
+    pub profile: Option<crate::profile::Profile>,
 }
 
 /// `tole mission --verify-timeout` default.
@@ -455,6 +475,9 @@ pub struct Settings {
     /// Key bindings from the user config's `tui.keys` (#463): action ->
     /// key specs. No env var; the project config is not a source.
     pub tui_keys: Option<Eff<BTreeMap<String, Vec<String>>>>,
+    /// The memory loop's uteke room from the selected profile (#584);
+    /// `TOLE_MEMORY_NAMESPACE` (a child's mailbox) still wins over it.
+    pub memory_room: Option<Eff<String>>,
 }
 
 impl Settings {
@@ -496,6 +519,48 @@ impl Settings {
             let (v, s) = resolve_bool(flag, c);
             Eff::new(v, s)
         };
+        // The profile layer (#584): a value the selected profile sets takes
+        // the flag's slot when the flag is absent, then is relabeled.
+        let prof = flags.profile.as_ref();
+        let profiled = |flag: Option<String>, p: Option<String>| match flag {
+            Some(f) => (Some(f), false),
+            None => {
+                let p = nonblank(p);
+                let from = p.is_some();
+                (p, from)
+            }
+        };
+        let relabel = |e: Option<Eff<String>>, from_profile: bool| {
+            e.map(|mut e| {
+                if from_profile && e.source == Source::Flag {
+                    e.source = Source::Profile;
+                }
+                e
+            })
+        };
+        let (system_flag, system_from_profile) = profiled(
+            flags.system.clone(),
+            prof.and_then(|p| p.system_prompt.clone()),
+        );
+        let (allow_flag, allow_source) = match prof {
+            Some(p) if flags.allow.is_empty() && !p.allow.is_empty() => {
+                (p.allow.clone(), Source::Profile)
+            }
+            _ => (flags.allow.clone(), Source::Flag),
+        };
+        let (skill_flag, skill_source) = match prof {
+            Some(p) if flags.skill.is_empty() && !p.skills.is_empty() => {
+                (p.skills.clone(), Source::Profile)
+            }
+            _ => (flags.skill.clone(), Source::Flag),
+        };
+        let mut provider = resolve_provider(cfg.base_url.as_deref(), cfg.model.as_deref(), env);
+        if let Some(m) = prof.and_then(|p| nonblank(p.model.clone())) {
+            if let Some(c) = provider.config.as_mut() {
+                c.model = m.clone();
+            }
+            provider.model = Some(Eff::new(m, Source::Profile));
+        }
         let env_trust = env("TOLE_TRUST")
             .map(|v| split_env_list(&v))
             .unwrap_or_default();
@@ -517,20 +582,28 @@ impl Settings {
                 cfg.memory.clone(),
             )
             .map(|(v, s)| Eff::from_pair((v.trim().to_string(), s), "TOLE_MEMORY")),
-            system_prompt: resolve_string(
-                // `--system ""` stays an explicit (empty) prompt, as before.
-                flags.system.clone(),
-                env("TOLE_SYSTEM_PROMPT"),
-                cfg.system_prompt.clone(),
-            )
-            .map(|p| Eff::from_pair(p, "TOLE_SYSTEM_PROMPT")),
-            provider: resolve_provider(cfg.base_url.as_deref(), cfg.model.as_deref(), env),
+            system_prompt: relabel(
+                resolve_string(
+                    // `--system ""` stays an explicit (empty) prompt, as before.
+                    system_flag,
+                    env("TOLE_SYSTEM_PROMPT"),
+                    cfg.system_prompt.clone(),
+                )
+                .map(|p| Eff::from_pair(p, "TOLE_SYSTEM_PROMPT")),
+                system_from_profile,
+            ),
+            provider,
             max_steps: num(flags.max_steps, mission.max_steps),
             max_minutes: num(flags.max_minutes, mission.max_minutes),
             max_tokens: num(flags.max_tokens, mission.max_tokens),
             trust: resolve_list(&flags.trust, &env_trust, cfg.trust.as_deref())
                 .map(|p| Eff::from_pair(p, "TOLE_TRUST")),
-            allow: list(&flags.allow, &cfg.allow),
+            allow: list(&allow_flag, &cfg.allow).map(|mut e| {
+                if e.source == Source::Flag {
+                    e.source = allow_source;
+                }
+                e
+            }),
             mcp_server: list(&flags.mcp_server, &cfg.mcp_server),
             on_pretool: list(&flags.on_pretool, &cfg.on_pretool),
             on_posttool: list(&flags.on_posttool, &cfg.on_posttool),
@@ -540,8 +613,13 @@ impl Settings {
                     .skill
                     .as_ref()
                     .map(|v| v.iter().map(PathBuf::from).collect());
-                resolve_list(&flags.skill, &env_skill, cfg_skill.as_deref())
-                    .map(|p| Eff::from_pair(p, SKILL_ENV))
+                resolve_list(&skill_flag, &env_skill, cfg_skill.as_deref()).map(|p| {
+                    let mut e = Eff::from_pair(p, SKILL_ENV);
+                    if e.source == Source::Flag {
+                        e.source = skill_source;
+                    }
+                    e
+                })
             },
             plan_mode: boolean(flags.plan_mode, cfg.plan_mode),
             no_auto_mcp: boolean(flags.no_auto_mcp, cfg.no_auto_mcp),
@@ -613,6 +691,7 @@ impl Settings {
                     let k = k.iter().map(|(a, v)| (a.clone(), v.to_vec())).collect();
                     Eff::new(k, Source::Config)
                 }),
+            memory_room: prof.map(|p| Eff::new(p.memory_room.clone(), Source::Profile)),
         }
     }
 
@@ -734,7 +813,23 @@ impl Settings {
             base_url: nonblank(cfg.base_url.clone()),
             model: nonblank(cfg.model.clone()),
             system_prompt: nonblank(cfg.system_prompt.clone()),
+            profile_model: None,
+            profile_system_prompt: None,
         }
+    }
+
+    /// [`Settings::fill_from`] plus the selected profile's model and
+    /// persona (#584), which the server faces apply above the env.
+    pub fn fill_with_profile(
+        cfg: &Config,
+        profile: Option<&crate::profile::Profile>,
+    ) -> ProviderFill {
+        let mut f = Self::fill_from(cfg);
+        if let Some(p) = profile {
+            f.profile_model = nonblank(p.model.clone());
+            f.profile_system_prompt = nonblank(p.system_prompt.clone());
+        }
+        f
     }
 }
 
@@ -1063,6 +1158,11 @@ pub fn load_project_config(
     let config = crate::config::parse(&outcome.content, &shown).map_err(|e| anyhow!("{e}"))?;
     if config.tui.is_some() {
         io.warn(&crate::config::tui_ignored_warning(
+            &config_trust::sanitize(&shown.display().to_string()),
+        ));
+    }
+    if config.profiles.is_some() {
+        io.warn(&crate::config::profiles_ignored_warning(
             &config_trust::sanitize(&shown.display().to_string()),
         ));
     }

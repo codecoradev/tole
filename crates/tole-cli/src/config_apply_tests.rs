@@ -64,6 +64,7 @@ fn generic_resolve_works_for_numbers() {
 #[test]
 fn source_display() {
     assert_eq!(Source::Flag.to_string(), "flag");
+    assert_eq!(Source::Profile.to_string(), "profile");
     assert_eq!(Source::Env.to_string(), "env");
     assert_eq!(Source::Config.to_string(), "config");
     assert_eq!(Source::Default.to_string(), "default");
@@ -838,12 +839,95 @@ fn fill_carries_only_low_risk_provider_values() {
         ProviderFill {
             base_url: s("u"),
             model: s("m"),
-            system_prompt: s("p")
+            system_prompt: s("p"),
+            profile_model: None,
+            profile_system_prompt: None,
         }
     );
     assert_eq!(
         Settings::fill_from(&Config::default()),
         ProviderFill::default()
+    );
+}
+
+/// #584: a selected profile sits between the per-key flags and the env.
+#[test]
+fn profile_layer_is_below_flags_and_above_env_and_config() {
+    let user = cfg(
+        "model = \"cfg-model\"\nsystem_prompt = \"cfg prompt\"\nallow = [\"cfg_*\"]\n\
+         skill = [\"/cfg/SKILL.md\"]\n\
+         [profiles.coder]\nallow = [\"write_*\"]\nskills = [\"/p/SKILL.md\"]\n\
+         [profiles.coder.models]\nstandard = \"profile-model\"\n",
+    );
+    let mut profile = crate::profile::Profile::resolve(&user, "coder", None, None).unwrap();
+    profile.system_prompt = s("persona");
+    let env = env_of(&[
+        ("TOLE_BASE_URL", "https://x/v1"),
+        ("TOLE_MODEL", "env-model"),
+        ("TOLE_API_KEY", "sk-env"),
+        ("TOLE_SYSTEM_PROMPT", "env prompt"),
+        ("TOLE_SKILL", "/env/SKILL.md"),
+    ]);
+    let flags = Flags {
+        profile: Some(profile),
+        ..Flags::default()
+    };
+    let st = Settings::resolve(&flags, &user, &env);
+    let m = st.provider.model.as_ref().unwrap();
+    assert_eq!(
+        (m.value.as_str(), m.source),
+        ("profile-model", Source::Profile)
+    );
+    assert_eq!(st.provider.config.as_ref().unwrap().model, "profile-model");
+    let p = st.system_prompt.as_ref().unwrap();
+    assert_eq!((p.value.as_str(), p.source), ("persona", Source::Profile));
+    let a = st.allow.as_ref().unwrap();
+    assert_eq!(
+        (a.value.clone(), a.source),
+        (vec!["write_*".to_string()], Source::Profile)
+    );
+    let k = st.skill.as_ref().unwrap();
+    assert_eq!(
+        (k.value.clone(), k.source),
+        (vec![PathBuf::from("/p/SKILL.md")], Source::Profile)
+    );
+    let r = st.memory_room.as_ref().unwrap();
+    assert_eq!(
+        (r.value.as_str(), r.source),
+        ("profile-coder", Source::Profile)
+    );
+    // Explicit per-key flags still win over the profile.
+    let flags = Flags {
+        system: s("flag prompt"),
+        allow: vec!["flag_*".into()],
+        skill: vec![PathBuf::from("/flag/SKILL.md")],
+        ..flags
+    };
+    let st = Settings::resolve(&flags, &user, &env);
+    assert_eq!(st.system_prompt.unwrap().source, Source::Flag);
+    assert_eq!(st.allow.unwrap().value, vec!["flag_*".to_string()]);
+    assert_eq!(st.skill.unwrap().source, Source::Flag);
+    // Without a profile nothing changes: env model, env prompt, config allow.
+    let st = Settings::resolve(&Flags::default(), &user, &env);
+    assert_eq!(st.provider.model.unwrap().value, "env-model");
+    assert_eq!(st.system_prompt.unwrap().value, "env prompt");
+    assert_eq!(st.allow.unwrap().source, Source::Config);
+    assert_eq!(st.memory_room, None);
+}
+
+#[test]
+fn fill_with_profile_carries_the_profile_model_and_persona() {
+    let c = cfg("model = \"m\"\n[profiles.p.models]\nstandard = \"pm\"\n");
+    let mut prof = crate::profile::Profile::resolve(&c, "p", None, None).unwrap();
+    prof.system_prompt = s("persona");
+    let f = Settings::fill_with_profile(&c, Some(&prof));
+    assert_eq!(
+        (f.model, f.profile_model, f.profile_system_prompt),
+        (s("m"), s("pm"), s("persona"))
+    );
+    assert_eq!(
+        Settings::fill_with_profile(&c, None),
+        Settings::fill_from(&c)
     );
 }
 
