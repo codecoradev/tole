@@ -712,3 +712,126 @@ fn tui_image_on_a_non_vision_model_reports_the_capability_error() {
         "refused before any request"
     );
 }
+
+/// The user-message texts recorded in a session file, and its `forkedFrom`
+/// header (`session`, `entry`) if it is a fork.
+fn session_facts(path: &Path) -> (Vec<String>, Option<(String, String)>) {
+    let text = std::fs::read_to_string(path).unwrap();
+    let mut lines = text.lines();
+    let header: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+    let origin = header.get("forkedFrom").map(|f| {
+        (
+            f["session"].as_str().unwrap().to_string(),
+            f["entry"].as_str().unwrap().to_string(),
+        )
+    });
+    let mut users = Vec::new();
+    for l in lines {
+        let v: Value = serde_json::from_str(l).unwrap();
+        let recs = v.as_array().cloned().unwrap_or_else(|| vec![v]);
+        for r in recs {
+            if r["kind"] == "entry" && r["payload"]["role"] == "user" {
+                users.push(r["payload"]["text"].as_str().unwrap_or("").to_string());
+            }
+        }
+    }
+    (users, origin)
+}
+
+/// #463: `/fork` cuts the open session at its last settled entry into a new
+/// session and switches to it (the next message lands there, with the
+/// history, and not in the original); `/tree` lists the family with the open
+/// session marked and picking the parent switches back to it.
+#[test]
+fn tui_fork_continues_in_the_new_session_and_tree_switches_back() {
+    let bodies = Bodies::default();
+    let (url, dir) = (spawn_mock_recording(bodies.clone()), workdir());
+    let sessions = dir.join(".tole/sessions");
+    let tole = |args: &[&str]| {
+        let o = Command::new(env!("CARGO_BIN_EXE_tole"))
+            .args(args)
+            .current_dir(&dir)
+            .env("CODECORA_HOME", dir.join("home"))
+            .env("TOLE_NO_UPDATE_CHECK", "1")
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&o.stdout).into_owned()
+    };
+    let mut t = Pty::spawn(&dir, &url);
+    t.expect("effort:");
+    t.send("first\r");
+    t.expect("STREAM-ANSWER");
+    t.idle();
+
+    // a bogus entry is refused with the core's error
+    t.send("/fork no-such-entry\r");
+    t.expect("(fork: forking");
+    t.idle();
+
+    t.send("/fork\r");
+    t.expect("forked → ");
+    t.idle();
+    let mut all: Vec<String> = std::fs::read_dir(&sessions)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter_map(|n| n.strip_suffix(".jsonl").map(str::to_string))
+        .collect();
+    all.sort();
+    assert_eq!(all.len(), 2, "the original and one fork: {all:?}");
+    let file = |id: &str| sessions.join(format!("{id}.jsonl"));
+    let (orig, fork) = if session_facts(&file(&all[0])).1.is_some() {
+        (all[1].clone(), all[0].clone())
+    } else {
+        (all[0].clone(), all[1].clone())
+    };
+    let (src, _entry) = session_facts(&file(&fork)).1.expect("fork header");
+    assert_eq!(src, orig, "forkedFrom names the original");
+
+    // the next message lands in the fork, with the carried history
+    t.send("second\r");
+    t.expect("STREAM-ANSWER");
+    t.idle();
+    {
+        let b = bodies.lock().unwrap();
+        assert_eq!(
+            user_contents(b.last().unwrap()),
+            [json!("first"), json!("second")],
+            "the fork carries the history"
+        );
+    }
+    assert_eq!(
+        session_facts(&file(&orig)).0,
+        ["first"],
+        "original untouched"
+    );
+    assert_eq!(session_facts(&file(&fork)).0, ["first", "second"]);
+
+    // /tree: both sessions, the open one marked and preselected
+    t.send("/tree\r");
+    t.expect("tree>");
+    t.expect(&orig);
+    t.expect("(current)");
+    // Up to the parent, Enter switches there
+    t.send("\x1b[A");
+    t.send("\r");
+    t.expect(&format!("resumed {orig}"));
+    t.idle();
+    t.send("third\r");
+    t.expect("STREAM-ANSWER");
+    t.idle();
+    t.send("/quit\r");
+    assert_eq!(t.wait_exit(), Some(0));
+    assert_eq!(session_facts(&file(&orig)).0, ["first", "third"]);
+    assert_eq!(
+        session_facts(&file(&fork)).0,
+        ["first", "second"],
+        "nothing sent after switching back reached the fork"
+    );
+
+    // the fork is listed like any session (face "branch") and nests in the tree
+    let listed = tole(&["sessions", "--all"]);
+    assert!(listed.contains(&fork), "{listed}");
+    let tree = tole(&["sessions", "--tree"]);
+    assert!(tree.contains(&format!("└─ {fork}")), "{tree}");
+}
