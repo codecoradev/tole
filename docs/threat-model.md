@@ -882,8 +882,11 @@ The delegate tool (#585 part 3, `crates/tole-cli/src/delegate.rs`) adds:
   spawns; a second writer in the same workspace is refused (use
   `--agents-worktree` for parallel writers).
 - **Machine guard.** Past `[delegation] max_live_processes` a spawn is recorded
-  `queued` with its launch spec (next to the log) and started by a later
-  delegate or poll.
+  `queued` and started by a later delegate or poll. The file kept next to the
+  log for it holds only what carries no authority (role, artifacts to read,
+  mailbox choice): allow list, budget, depth, mode, task, workspace and profile
+  are read back from the node the tree recorded and the secrets are recomputed,
+  so a child that can write that file cannot widen a queued sibling.
 
 ### User config (#433)
 

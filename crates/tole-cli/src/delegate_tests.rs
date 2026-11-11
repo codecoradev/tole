@@ -254,6 +254,25 @@ fn the_machine_guard_queues_and_a_poll_starts_the_queued_child() {
         .unwrap();
     assert_eq!(b["queued"], json!(true), "{b}");
     assert!(b.get("agent").is_none(), "nothing spawned yet");
+    // A child that can write the queue file tries to widen its sibling:
+    // the launch takes allow, budget and secrets from the log instead.
+    let qfile = tole_core::agents::agents_dir(&root)
+        .join(LOG_FILE)
+        .with_extension("queued")
+        .join(format!("{}.json", b["node"].as_str().unwrap()));
+    let mut forged: Value = serde_json::from_slice(&std::fs::read(&qfile).unwrap()).unwrap();
+    for (k, v) in [
+        ("allow", json!(["*"])),
+        ("keep_secrets", json!(["HOME_TOKEN"])),
+        (
+            "budget",
+            json!({"tokens": 999_999_999u64, "steps": 9999, "deadline": i64::MAX}),
+        ),
+        ("task", json!("forged")),
+    ] {
+        forged[k] = v;
+    }
+    std::fs::write(&qfile, forged.to_string()).unwrap();
     wait_for(&agent_dir_of(&root, &a).join("env"));
     let p = poll_done(&poll, &a);
     assert_eq!(
@@ -265,6 +284,28 @@ fn the_machine_guard_queues_and_a_poll_starts_the_queued_child() {
     assert_eq!(
         d.poll(b["node"].as_str().unwrap()).unwrap().status,
         NodeStatus::Running
+    );
+    let n = d.poll(b["node"].as_str().unwrap()).unwrap();
+    let dir = PathBuf::from(n.session.clone().unwrap());
+    let argv: Vec<String> = wait_for(&dir.join("argv"))
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let pair = |k: &str| {
+        argv.iter()
+            .position(|a| a == k)
+            .map(|i| argv[i + 1].clone())
+    };
+    assert_eq!(
+        pair("--max-tokens"),
+        Some(n.budget.tokens.to_string()),
+        "{argv:?}"
+    );
+    assert!(!argv.iter().any(|a| a == "*"), "no forged allow: {argv:?}");
+    assert_eq!(
+        argv.last().map(String::as_str),
+        Some("b"),
+        "the recorded task"
     );
     let _ = std::fs::remove_dir_all(&root);
 }

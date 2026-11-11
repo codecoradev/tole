@@ -61,8 +61,21 @@ pub struct Setup {
     pub home: Option<PathBuf>,
 }
 
-/// Everything needed to start one child, kept for a queued spawn.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// What a queued spawn keeps next to the log: only what carries no
+/// authority. Allow list, budget, depth, mode, task, workspace and profile
+/// are read back from the node the tree recorded, and the secrets are
+/// recomputed, so a child that can write the queue file cannot widen a
+/// queued sibling.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct Extras {
+    node: String,
+    role: Option<String>,
+    consumes: Option<Value>,
+    keep_mailbox: bool,
+}
+
+/// Everything needed to start one child, built from the recorded node.
+#[derive(Debug, Clone)]
 struct Spec {
     node: String,
     bin: PathBuf,
@@ -297,10 +310,6 @@ impl Delegator {
             steps: num("steps").map(|n| u32::try_from(n).unwrap_or(u32::MAX)),
             minutes: num("minutes"),
         };
-        let keep_secrets = profile
-            .as_ref()
-            .map(|p| p.granted(&held_secrets()))
-            .unwrap_or_default();
         let workspace = canonical(&self.root)?;
         self.locked(|d| {
             Self::recover(d)?;
@@ -337,18 +346,8 @@ impl Delegator {
                 workspace: Some(&workspace),
             };
             let h = d.delegate(&node, &req, own, now()).map_err(|e| e.to_string())?;
-            let spec = Spec {
+            let extras = Extras {
                 node: h.node_id.clone(),
-                bin: self.bin.clone(),
-                root: self.root.clone(),
-                worktrees: self.worktrees,
-                task: task.clone(),
-                mode,
-                profile: profile.as_ref().map(|p| p.name.clone()),
-                allow: h.allow.clone(),
-                keep_secrets: keep_secrets.clone(),
-                depth: h.depth,
-                budget: h.budget,
                 role: s("role"),
                 consumes: input.get("consumes").cloned(),
                 keep_mailbox: input.get("keep_mailbox").and_then(Value::as_bool) == Some(true),
@@ -361,11 +360,12 @@ impl Delegator {
             });
             let (_, max_live) = self.limits();
             if d.live(&goal) >= max_live.max(1) {
-                self.queue(&spec)?;
+                self.queue(&extras)?;
                 out["queued"] = json!(true);
                 out["note"] = json!("queued: the machine guard's live-process limit is reached; it starts when a delegated run ends");
                 return Ok(out);
             }
+            let spec = self.spec_for(d, &extras)?;
             let started = launch(d, &spec, &self.log)?;
             for (k, v) in started.as_object().into_iter().flatten() {
                 out[k] = v.clone();
@@ -374,15 +374,52 @@ impl Delegator {
         })
     }
 
+    /// The launch spec of a recorded node: authority from the log, secrets
+    /// recomputed (parent grant ∩ the profile's grants), extras from `x`.
+    fn spec_for(&self, d: &Delegation<FileStore>, x: &Extras) -> Result<Spec, String> {
+        let n = d.poll(&x.node).ok_or("delegate: node missing")?;
+        let profile = n.profile.clone().filter(|p| p != "-");
+        let keep_secrets = match &profile {
+            None => Vec::new(),
+            Some(name) => crate::profile::Profile::resolve(
+                &self.setup.cfg,
+                name,
+                self.setup.base.as_deref(),
+                self.setup.home.as_deref(),
+            )?
+            .granted(&held_secrets()),
+        };
+        Ok(Spec {
+            node: n.id.clone(),
+            bin: self.bin.clone(),
+            root: PathBuf::from(
+                n.workspace
+                    .as_deref()
+                    .ok_or("delegate: node has no workspace")?,
+            ),
+            worktrees: self.worktrees,
+            task: n.task.clone(),
+            mode: n.mode,
+            profile,
+            allow: n.allow.clone(),
+            keep_secrets,
+            depth: n.depth,
+            budget: n.budget,
+            role: x.role.clone(),
+            consumes: x.consumes.clone(),
+            keep_mailbox: x.keep_mailbox,
+        })
+    }
+
     fn queue_dir(&self) -> PathBuf {
         self.log.with_extension("queued")
     }
 
-    fn queue(&self, spec: &Spec) -> Result<(), String> {
+    fn queue(&self, extras: &Extras) -> Result<(), String> {
         let dir = self.queue_dir();
         std::fs::create_dir_all(&dir).map_err(|e| format!("delegate: queue: {e}"))?;
-        let body = serde_json::to_vec(spec).map_err(|e| e.to_string())?;
-        std::fs::write(dir.join(format!("{}.json", spec.node)), body)
+        let body = serde_json::to_vec(extras).map_err(|e| e.to_string())?;
+        std::fs::write(dir.join(format!("{}.json", extras.node)), body)
             .map_err(|e| format!("delegate: queue: {e}"))
     }
 
@@ -395,12 +432,13 @@ impl Delegator {
                 break;
             };
             let file = self.queue_dir().join(format!("{next}.json"));
-            let spec = std::fs::read(&file)
+            let extras = std::fs::read(&file)
                 .ok()
-                .and_then(|b| serde_json::from_slice::<Spec>(&b).ok());
+                .and_then(|b| serde_json::from_slice::<Extras>(&b).ok());
             let _ = std::fs::remove_file(&file);
-            match spec {
-                Some(spec) if spec.node == next => {
+            match extras {
+                Some(extras) if extras.node == next => {
+                    let spec = self.spec_for(d, &extras)?;
                     launch(d, &spec, &self.log)?;
                     started.push(next);
                 }
