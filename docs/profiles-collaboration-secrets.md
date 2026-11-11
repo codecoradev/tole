@@ -134,6 +134,109 @@ Tools exposed to the model (small surface): `task_list`, `task_show`,
 is a human/CLI action (`tole task …`) in v1 — an agent that can create work
 for other agents is the swarm we are avoiding.
 
+### A6. Owner direction (2026-11-11) — dormant profiles, one orchestrator
+
+Supersedes the open-ended shape of A5 where they disagree.
+
+- **One always-on profile: the orchestrator** (also the maintainer). Every
+  other profile is **dormant**: a config entry and a persona file, no
+  process, no tokens, no memory reads. Motivation from real use: of five
+  configured Hermes profiles only a few are used, yet each costs a running
+  gateway. A dormant profile costs only disk, so the number of profiles can
+  grow freely.
+- **Activation only through the orchestrator.** A user `@mention` is a hint
+  the orchestrator routes, not a direct line, so there is one conversation and
+  one approval surface.
+- **Depth ≤ 2 below the orchestrator:** orchestrator (0) → profile (1) →
+  sub-profile (2). Depth 2 cannot delegate (structural, like today's depth-1
+  cap: the tool is not registered there).
+- **Concurrency cap** *(interpretation, to confirm)*: at most **2 delegated
+  profiles live at once** across the whole tree, and at most **1 executor**,
+  meaning one write lease per workspace. Every other live profile runs
+  read-only (consult/review).
+
+Invariants the caps need to stay safe (today's depth-1 cap exists to stop
+silent budget multiplication, see `agents.rs`):
+
+| Invariant | Rule |
+|---|---|
+| Live count | one global counter held by the orchestrator, never per parent, so depth 2 cannot fan out |
+| Budget | a child's budget is carved from its parent's *remaining* budget, never added |
+| Authority | child allowlist = parent allowlist ∩ profile allowlist; `Destructive` unreachable at every depth |
+| Writer | the executor lease is a ledger claim (one per workspace); a second `execute` waits or is refused |
+| Results | flow up one level only, through the existing mailbox room; the orchestrator is the only one that answers the user |
+
+Deep module: **`Delegation`**. Small interface, all caps enforced inside:
+
+```
+delegate(profile, task, mode: consult | execute) -> Handle   // refuses on any cap
+poll(handle) -> Status | Result
+```
+
+Callers: the orchestrator's tool, `@mention` routing, cron jobs that run as a
+profile. `agent_start` becomes the depth/lease-free special case, or is
+replaced by it.
+
+### A7. BMAD Method — analysis and what to adopt
+
+Sources read: README (v7 preview, v6.12 stable), issue #1629 (v6 architecture
+write-up), issue #2211 (parallel execution request), and the v7 source of
+`bmad-party-mode` (SKILL.md, `mode-*.md`, `party-memory.md`,
+`customize.toml`) plus the agent persona skills (`bmad-agent-*`).
+
+**How BMAD works.**
+- An agent is a **persona file** (name, icon, role, identity, communication
+  style, principles, a menu of skills) with a base → team → user
+  customization merge. Shipped extra personas "cost nothing until summoned".
+  This is the dormant-profile idea, already proven.
+- **Party mode** is a discussion the orchestrator hosts, in four modes:
+  `session` (default: one model voices every persona inline, no spawn),
+  `auto` (voice inline, spawn real agents *only when independent thinking
+  changes the outcome*: reviews, critique, divergent conclusions),
+  `subagent` (one real agent per persona per round), `agent-team` (standing
+  team). Its own docs say one model voicing every persona "tends to make them
+  agree"; independent agents cost more tokens and time.
+- **One shared room.** In spawned modes every member receives the whole
+  exchange each round, not just its slice; otherwise they "drift out of
+  sync — separate consultations wearing a party's clothes".
+- **Anti-consensus personas** ship as a party: Option Generator, Claim
+  Checker (evidence and confidence), Loop Stopper (ends repetition), Consensus
+  Challenger. Rule: the room supports the human's judgment, **does not vote
+  or declare consensus**.
+- **Memory** is per party, append-only (`.memlog.md`), read on entry through a
+  reader that **distills it to a few hundred tokens**, written silently only
+  for beats that would change a future session; correction = a superseding
+  entry.
+- **Durable context**: tickets/stories are the single source of truth;
+  workflow steps load just-in-time; progress lives in the artifact's
+  frontmatter, so work resumes after compaction.
+- **Weak spots** (from #1629/#2211): personas are prompt engineering in the
+  main context (no tool restriction, no context isolation, "stay in
+  character" is only an instruction), and execution is sequential.
+
+**Adopt in tole:**
+1. Profile = persona + allowlist + model + memory room, **dormant by
+   default** (A6). Unlike BMAD, the allowlist and model are enforced by the
+   host, not requested in the prompt.
+2. Discussion modes mapped to the caps: `inline` (orchestrator voices dormant
+   personas from their files; zero processes, profiles stay dormant) as the
+   default; `independent` (spawn a real read-only profile) only for review,
+   critique and genuinely divergent questions. This is BMAD's `auto` mode,
+   and it fits the "2 live" cap.
+3. One shared thread: a spawned participant receives the full discussion log
+   from the ledger, not a slice.
+4. Ship anti-consensus roles (claim checker, loop stopper) as dormant
+   profiles; the orchestrator never reports a vote as a decision, the owner
+   decides.
+5. Memory: a uteke room per profile (`profile-<name>`) and per discussion
+   group, read through a distilled brief at activation, written only for
+   decisions and outcomes.
+6. Handoff by artifact: the task's handoff document (#383) is the single
+   source of truth between levels, matching BMAD tickets.
+
+**Do not adopt:** stay-in-character theatrics, keepsake HTML, menus of
+two-letter codes, and an unrestricted persona running in the main context.
+
 ## Part B — Secrets leaking to the LLM
 
 ### B1. How secrets actually leak (evidence)
