@@ -1,6 +1,6 @@
 # Terminal UI (`tole-tui`)
 
-Status: **MVP + pickers + steering + paste/images + export/copy + fork/tree + themes** (#460, #461, #462, #560, #463 parts 1-3, in `develop`, not yet released). Bare
+Status: **MVP + pickers + steering + paste/images + export/copy + fork/tree + themes + keybinding config** (#460, #461, #462, #560, #463 parts 1-4, in `develop`, not yet released). Bare
 `tole` on an interactive terminal opens an inline UI over one ordinary tole
 session. Next: #464 (detach key).
 
@@ -39,23 +39,26 @@ session. Next: #464 (detach key).
 
 ## Keys
 
+Keys marked *(action)* can be rebound with `[tui.keys]` (see
+[Keybindings](#keybindings-463)); the others are fixed.
+
 | Key | Action |
 |---|---|
 | `Enter` | send the message; **while a turn runs: steer it** (see below) |
-| `Alt+Enter` | **while a turn runs: queue the draft as a follow-up**; idle: newline |
-| `Alt+Up` | pop the last queued follow-up back into the editor |
-| `Shift+Enter`, `Ctrl+J` | newline in the editor (`Alt+Enter` too when idle) |
-| `Ctrl+O` | expand / collapse tool output (last block now, new blocks from then on) |
-| `Ctrl+T` | show / hide reasoning for output that has not been printed yet |
+| `Alt+Enter` | *(`queue_follow_up`)* **while a turn runs: queue the draft as a follow-up**; idle: newline |
+| `Alt+Up` | *(`pop_queue`)* pop the last queued follow-up back into the editor |
+| `Shift+Enter`, `Ctrl+J` | *(`newline`)* newline in the editor (`Alt+Enter` too when idle) |
+| `Ctrl+O` | *(`toggle_tools`)* expand / collapse tool output (last block now, new blocks from then on) |
+| `Ctrl+T` | *(`toggle_reasoning`)* show / hide reasoning for output that has not been printed yet |
 | `@` | file panel: type to filter, `Up`/`Down` select, `Tab` / `Enter` insert the path |
-| `Up` / `Down` | input history (the draft is restored after the newest entry) |
+| `Up` / `Down` | *(`history_prev` / `history_next`)* input history (the draft is restored after the newest entry) |
 | `Backspace` | delete the last character |
 | paste | the whole block is inserted as one edit, never sent: newlines stay newlines, `Enter` sends (see Paste) |
 | `/` | open the command menu; `Tab` completes, `Up`/`Down` select |
-| `Ctrl+L` | model picker (`/models`); type to filter, `Enter` picks, `Esc` closes |
-| `Ctrl+P` | cycle the models used in this run |
-| `Shift+Tab` | cycle thinking: `minimal → low → medium → high → unset` |
-| `y` / `n` | answer an approval prompt (other keys are ignored) |
+| `Ctrl+L` | *(`model_picker`)* model picker (`/models`); type to filter, `Enter` picks, `Esc` closes |
+| `Ctrl+P` | *(`cycle_model`)* cycle the models used in this run |
+| `Shift+Tab` | *(`cycle_thinking`)* cycle thinking: `minimal → low → medium → high → unset` |
+| `y` / `n` | answer an approval prompt: the plain keys only (`Alt+Y`, `Ctrl+N` and every other key are ignored) |
 | `Esc` | cancel the running turn **and return the queue to the editor**; at an approval prompt: deny and cancel |
 | `Ctrl+C` | cancel the running turn (queue returned); when idle, twice to quit |
 
@@ -234,6 +237,77 @@ tole prints one `warning: ignoring `tui` in project config ...` at startup and
 scrollback (lines already printed keep their colors), so the theme is read once
 at start; change the setting and restart.
 
+## Keybindings (#463)
+
+The ten convenience actions marked above can be rebound in the **user** config
+(`~/.codecora/tole/config.toml`), next to `[tui] theme`:
+
+```toml
+[tui.keys]
+toggle_tools = "alt+o"                 # one key
+newline = ["shift+enter", "alt+n"]     # or several; a list replaces the defaults
+history_prev = ["up", "ctrl+k"]        # keep the default Up and add Ctrl+K
+```
+
+Actions: `toggle_tools`, `toggle_reasoning`, `model_picker`, `cycle_model`,
+`cycle_thinking`, `newline`, `queue_follow_up`, `pop_queue`, `history_prev`,
+`history_next`. An action that is not listed keeps its default; listing it
+replaces ALL of its default keys. Defaults: `ctrl+o`, `ctrl+t`, `ctrl+l`,
+`ctrl+p`, `shift+tab`, `shift+enter` and `ctrl+j`, `alt+enter`, `alt+up`, `up`,
+`down` (`queue_follow_up` is a newline when no turn is running, as `Alt+Enter`
+always was).
+
+**Key syntax**, case-insensitive: any of `ctrl+` `alt+` `shift+` in any order,
+then a letter or digit, `enter`, `up`, `down`, `left`, `right`, `f1` to `f12`,
+or `shift+tab` (the only form of Tab). `Shift+` goes with Enter and the
+arrows; `shift+tab` is its own key; letters take `ctrl+` or `alt+`, never
+`shift+` (a terminal reports Shift+O as a capital O).
+
+**Never rebindable.** Typing (every bare character, so `/` and `@` too),
+`y` / `n` at an approval prompt, `Esc`, `Ctrl+C`, `Enter` (send / steer),
+`Backspace` and `Tab` (completion). A binding must use `ctrl+` or `alt+`, or be
+a function key; bare `Enter`, bare arrows (except `up` for `history_prev` and
+`down` for `history_next`, the defaults) and every protected key are refused.
+Also refused, because a terminal cannot tell them apart from another key or
+reserves them: `Ctrl+I` (is Tab), `Ctrl+M` (Enter), `Ctrl+H` (Backspace; some
+terminals send it for Backspace), `Ctrl+[` (Esc), `Ctrl+S` / `Ctrl+Q` (flow
+control), `Ctrl+Z` (suspend), `Ctrl+\`, and `Ctrl+digit` (a terminal sends
+`Ctrl+4` to `Ctrl+7` as the codes of `Ctrl+\ ] ^ _`, the other digits as
+nothing distinct). In raw mode crossterm 0.29 does deliver Ctrl+S, Ctrl+Q,
+Ctrl+Z and Ctrl+\ as ordinary keys (flow control and signals are off), so
+they would work, but a terminal, multiplexer or SSH client in between may eat
+them, so they are refused anyway. `Ctrl+J` is allowed (it is the newline
+fallback).
+
+**Shielded at the approval prompt.** At an approval prompt the keymap is not
+consulted at all: nothing but `y`, `n`, `Esc` and `Ctrl+C` does anything, so a
+rebinding can neither intercept nor swallow them. The same holds in a picker.
+As a second layer, the dispatcher itself never maps a bare character, Esc,
+Tab, Backspace, bare Enter or Ctrl+C to an action, whatever the table says.
+
+**Bad values never stop the UI.** An unknown action, a bad key, a protected or
+ambiguous key, or one key on two actions makes the TUI use the whole default
+keymap and print one note at start naming the key and the problem
+(`keys: tui.keys.cycle_model: "y": a bare character ...; using the default
+keys`; a clash names both actions). `tole config check` shows `tui.keys` with
+the effective result (`effective: N action(s) rebound ... (user config)`) or
+`INVALID: ...`, and in a build without the TUI `not validated: this build has
+no TUI ...`.
+
+**Project config is not a source**, and there is no environment variable: a
+`[tui.keys]` table in `.tole/config.toml` is ignored (the same single
+`warning: ignoring `tui` in project config ...` at startup, `IGNORED` in
+`tole config check`), so a cloned repository cannot change what a key does.
+
+**Hints follow the binding.** The footer hint (`Ctrl+L model`,
+`Shift+Tab thinking`, `Shift+Enter newline`, `Alt+Enter queues`, `Alt+Up
+unqueues`) and the `[+n lines · Ctrl+O]` marker show the first key of the
+effective binding. The slash-menu descriptions name no key. Terminal limits
+still apply: `Alt+` combinations arrive as `Esc` + key, some terminals and
+window managers keep `F11` or `Alt+` shortcuts for themselves, and
+`Shift+Enter` needs the kitty keyboard protocol (see below). An unbound
+`Shift+Enter` or `Alt+Enter` never sends the message.
+
 ## Scrollback is append-only
 
 Finished lines live in the terminal's own scrollback, so `Ctrl+O` / `Ctrl+T`
@@ -344,6 +418,7 @@ Wide characters wrap by character count, not cell width.
   the rule that a `Destructive` call is never "allowed always"
   (`ApprovalRequest::can_allow_always`) lives in one place for every UI.
 - **Theme (#463):** `tole-tui` owns the `Theme` type (role -> `Style`, built-ins, color parsing and the safety rules) and reads no file or env; the host hands it over through the defaulted `TuiHost::theme` / `startup_note`. `tole-cli` resolves the name and overrides (`TOLE_THEME` > user config > `NO_COLOR` > `default`; the project layer is dropped in `config::layered`).
+- **Keymap (#463):** `tole-tui` owns the `Keymap` type (closed `KeyAction` set, key-spec parsing, the binding rules and the clash check) and reads no file or env; the host hands it over through the defaulted `TuiHost::keymap` (note via `startup_note`, joined with the theme note). `tole-cli` reads `[tui.keys]` from the user layer only (`config::layered` drops the project table) and calls `Keymap::from_overrides`; an error is the default keymap plus one note. `App::on_key_press` consults the keymap only after Ctrl+C, the approval prompt and the picker.
 - **Host seam (#526):** `TuiHost` has three methods: `footer`, `run_turn` and
   `apply(HostCmd) -> Result<HostReply, String>`, which covers every slash command
   and hotkey (`/model`, `/effort`, `/compact`, `/new`, `/resume`, `/session`,

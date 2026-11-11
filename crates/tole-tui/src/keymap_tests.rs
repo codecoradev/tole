@@ -147,7 +147,11 @@ fn a_rebinding_acts_on_the_new_key_and_no_longer_on_the_old_one() {
     assert_eq!(a.on_input(Input::shift(Key::Enter)), Action::None);
     assert_eq!(a.on_input(Input::ctrl(Key::Char('j'))), Action::None);
     assert_eq!(a.on_input(Input::alt(Key::Enter)), Action::None);
-    assert_eq!(a.editor.text(), "x\n\n", "no old newline key, and none sent");
+    assert_eq!(
+        a.editor.text(),
+        "x\n\n",
+        "no old newline key, and none sent"
+    );
     a.editor.submit();
 
     // History moves on the new keys only.

@@ -1322,8 +1322,9 @@ fn config_check_shows_keys_ignores_a_project_table_and_flags_a_bad_one() {
     );
     #[cfg(not(feature = "tui"))]
     assert!(
-        out.contains("tui.keys = [1 entries]  [user config]  (not validated: this build has no TUI")
-            && !out.contains("effective: 1 action"),
+        out.contains(
+            "tui.keys = [1 entries]  [user config]  (not validated: this build has no TUI"
+        ) && !out.contains("effective: 1 action"),
         "{out}"
     );
     assert!(

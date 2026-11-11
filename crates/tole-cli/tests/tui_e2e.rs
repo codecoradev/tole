@@ -1066,7 +1066,10 @@ fn tui_user_keybinding_acts_on_the_new_key_and_not_the_old_one() {
 #[test]
 fn tui_invalid_keymap_falls_back_to_default_with_one_note() {
     let (url, dir) = (spawn_mock(), workdir());
-    write_user_config(&dir, "[tui.keys]\ntoggle_tools = \"o\"\nmodel_picker = \"f4\"\n");
+    write_user_config(
+        &dir,
+        "[tui.keys]\ntoggle_tools = \"o\"\nmodel_picker = \"f4\"\n",
+    );
     let mut t = Pty::spawn(&dir, &url);
     t.expect("tui.keys.toggle_tools");
     t.expect("using the default keys");

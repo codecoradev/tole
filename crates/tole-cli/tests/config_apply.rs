@@ -715,7 +715,10 @@ fn an_invalid_user_keymap_never_aborts_a_command_and_check_flags_it() {
     let o = tole(&d, &home, &["config", "check"]);
     let out = text(&o.stdout);
     assert!(o.status.success(), "{out} {}", text(&o.stderr));
-    assert!(out.contains("tui.keys = [1 entries]  [user config]"), "{out}");
+    assert!(
+        out.contains("tui.keys = [1 entries]  [user config]"),
+        "{out}"
+    );
     #[cfg(feature = "tui")]
     assert!(
         out.contains("INVALID: tui.keys.toggle_tools: \"y\": a bare character"),

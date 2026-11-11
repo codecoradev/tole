@@ -187,9 +187,8 @@ fn parse(spec: &str) -> Result<KeySpec, String> {
             Key::Char(c)
         }
         n => {
-            return Err(format!(
-                "unknown key `{n}` (a letter or digit, enter, tab, up, down, left, right, f1 to f12)"
-            ))
+            let known = "a letter or digit, enter, tab, up, down, left, right, f1 to f12";
+            return Err(format!("unknown key `{n}` ({known})"));
         }
     };
     Ok(KeySpec { key, mods })
@@ -273,7 +272,10 @@ impl Keymap {
         for (name, specs) in overrides {
             let action = KeyAction::from_name(name).ok_or_else(|| {
                 let all: Vec<&str> = KeyAction::ALL.iter().map(|a| a.name()).collect();
-                format!("tui.keys: unknown action {name:?} (actions: {})", all.join(", "))
+                format!(
+                    "tui.keys: unknown action {name:?} (actions: {})",
+                    all.join(", ")
+                )
             })?;
             if specs.is_empty() {
                 return Err(format!("tui.keys.{name}: needs at least one key"));
@@ -375,7 +377,10 @@ mod tests {
         let k = Keymap::default();
         let table: [(KeyAction, KeyPress); 11] = [
             (KeyAction::ToggleTools, press(Char('o'), true, false, false)),
-            (KeyAction::ToggleReasoning, press(Char('t'), true, false, false)),
+            (
+                KeyAction::ToggleReasoning,
+                press(Char('t'), true, false, false),
+            ),
             (KeyAction::ModelPicker, press(Char('l'), true, false, false)),
             (KeyAction::CycleModel, press(Char('p'), true, false, false)),
             (KeyAction::CycleThinking, press(BackTab, false, false, true)),
@@ -477,9 +482,29 @@ mod tests {
     #[test]
     fn bare_characters_and_protected_keys_are_rejected() {
         for s in [
-            "o", "y", "n", "/", "@", "9", "shift+o", "enter", "esc", "escape", "backspace",
-            "alt+esc", "ctrl+backspace", "tab", "ctrl+tab", "alt+tab", "ctrl+c", "Ctrl+C",
-            "up", "down", "left", "right", "ctrl+/",
+            "o",
+            "y",
+            "n",
+            "/",
+            "@",
+            "9",
+            "shift+o",
+            "enter",
+            "esc",
+            "escape",
+            "backspace",
+            "alt+esc",
+            "ctrl+backspace",
+            "tab",
+            "ctrl+tab",
+            "alt+tab",
+            "ctrl+c",
+            "Ctrl+C",
+            "up",
+            "down",
+            "left",
+            "right",
+            "ctrl+/",
         ] {
             assert!(
                 Keymap::from_overrides(&over(&[("toggle_tools", &[s])])).is_err(),
@@ -523,9 +548,15 @@ mod tests {
             assert!(e.contains(&format!("{s:?}")), "{s}: {e}");
         }
         let e = err(&[("flip", &["ctrl+o"])]);
-        assert!(e.contains("unknown action \"flip\"") && e.contains("toggle_tools"), "{e}");
+        assert!(
+            e.contains("unknown action \"flip\"") && e.contains("toggle_tools"),
+            "{e}"
+        );
         let e = err(&[("toggle_tools", &[])]);
-        assert!(e.contains("toggle_tools") && e.contains("at least one key"), "{e}");
+        assert!(
+            e.contains("toggle_tools") && e.contains("at least one key"),
+            "{e}"
+        );
     }
 
     #[test]
@@ -538,7 +569,10 @@ mod tests {
         );
         // Onto another action's untouched default.
         let e = err(&[("cycle_model", &["ctrl+o"])]);
-        assert!(e.contains("`toggle_tools`") && e.contains("`cycle_model`"), "{e}");
+        assert!(
+            e.contains("`toggle_tools`") && e.contains("`cycle_model`"),
+            "{e}"
+        );
         // Swapping two defaults is fine.
         assert!(Keymap::from_overrides(&over(&[
             ("toggle_tools", &["ctrl+t"]),

@@ -696,7 +696,10 @@ impl Settings {
     #[cfg(feature = "tui")]
     fn try_keymap(&self) -> Result<tole_tui::Keymap, String> {
         let over: Vec<(String, Vec<String>)> = self.tui_keys.as_ref().map_or_else(Vec::new, |k| {
-            k.value.iter().map(|(a, v)| (a.clone(), v.clone())).collect()
+            k.value
+                .iter()
+                .map(|(a, v)| (a.clone(), v.clone()))
+                .collect()
         });
         tole_tui::Keymap::from_overrides(&over)
     }

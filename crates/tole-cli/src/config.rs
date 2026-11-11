@@ -834,7 +834,9 @@ verify_timeout = 60
         assert!(m.user_keys.contains("tui.keys"));
         // `config check` rendering lists the entries.
         let lines = render(&c);
-        assert!(lines.iter().any(|l| l.starts_with("tui.keys = [2 entries]  [config]")));
+        assert!(lines
+            .iter()
+            .any(|l| l.starts_with("tui.keys = [2 entries]  [config]")));
         assert!(lines.contains(&"  - newline = [\"shift+enter\", \"alt+n\"]".to_string()));
     }
 
