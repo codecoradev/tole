@@ -19,10 +19,25 @@ scenarios complete in **< 50 ms** — the budgets are ~40× above observed,
 so a failure means a real regression (e.g. an accidental O(n²) on the
 transcript path), never machine noise.
 
+## Automation ledger (#578, 2026-11-11)
+
+| Scenario | Budget | What it covers |
+|---|---|---|
+| Fold of a 100k-record ledger (10k `job` + 30k × `fire`/`done`/`delivery`) | < 30,000 ms | opening the append-only automation log — the cost every `tole cron tick` pays |
+| `ready(now)` over 10k jobs | < 2,000 ms | computing what is due, including the catch-up spans |
+
+Observed on the dev container (Linux x86_64): fold **~1.2–1.4 s** in the
+unoptimized test build that CI runs, **~220 ms** in release (≈2.2 µs per
+record; 200k records ≈ 510 ms, so linear); `ready` over 10k jobs **~16 ms**
+unoptimized, **~6–8 ms** release. The fold budget is ~20× the unoptimized
+observation: it exists to catch complexity regressions (an O(n²) fold of
+100k records would take minutes), not to race.
+
 ## Method
 
 - `crates/tole-core/tests/perf_threshold.rs` — deterministic, no timing
-  flakiness mitigation needed at the 40× margin.
+  flakiness mitigation needed at the 40× margin (the ledger fold gate keeps
+  ~20× over the unoptimized build; see above).
 - If a budget must move, change it HERE and in the test in the same PR,
   with the measurement that justifies it.
 

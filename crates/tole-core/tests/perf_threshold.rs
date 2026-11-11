@@ -153,3 +153,92 @@ fn resume_replay_under_budget() {
         "reopen must replay every entry that was written"
     );
 }
+
+/// docs/perf.md: fold of the 100k-record ledger fixture (#578). Unoptimized
+/// CI build; observed far below (see docs/perf.md for the numbers).
+const LEDGER_FOLD_BUDGET_MS: u128 = 30_000;
+
+/// Automation ledger (#578): fold of a 100k-record log and `ready` over
+/// 10k jobs. Both must stay linear-ish; same regression-gate spirit as
+/// the turn scenarios (docs/perf.md).
+#[test]
+fn ledger_fold_and_ready_under_budget() {
+    use tole_core::ledger::{
+        CatchUp, Delivery, DeliveryStatus, Done, Fire, Job, Lease, Ledger, LedgerStore,
+        MemoryStore, Record, RunStatus,
+    };
+    const JOBS: usize = 10_000;
+    const RUNS: usize = 30_000; // x3 records (fire, done, delivery)
+    const T: i64 = 1_767_225_600;
+    let mut store = MemoryStore::default();
+    let mut put = |r: Record| {
+        let mut line = r.to_line().into_bytes();
+        line.push(b'\n');
+        store.append(&line).unwrap();
+    };
+    for i in 0..JOBS {
+        put(Record::Job(Job {
+            id: format!("job-{i}"),
+            schedule: "*/5 * * * *".into(),
+            timezone: None,
+            catch_up: CatchUp::Skip,
+            grace_minutes: 0,
+            paused: false,
+            removed: false,
+            at: T,
+            extra: [("prompt".to_string(), "summarize the inbox".into())]
+                .into_iter()
+                .collect(),
+        }));
+    }
+    for n in 0..RUNS {
+        let job_id = format!("job-{}", n % JOBS);
+        let at = T + 300 * (1 + (n / JOBS) as i64);
+        let fire_id = format!("{job_id}@{at}/1.1");
+        put(Record::Fire(Fire {
+            fire_id: fire_id.clone(),
+            job_id: job_id.clone(),
+            scheduled_for: at,
+            claimed_at: at,
+            lease: Lease {
+                pid: 1,
+                start_time: 1,
+            },
+        }));
+        put(Record::Done(Done {
+            fire_id: fire_id.clone(),
+            job_id,
+            status: RunStatus::Ok,
+            session_id: Some(format!("s-{n}")),
+            reason: None,
+            usage: None,
+            at,
+        }));
+        put(Record::Delivery(Delivery {
+            fire_id,
+            target: "session".into(),
+            attempt: 1,
+            status: DeliveryStatus::Sent,
+            error: None,
+            at,
+        }));
+    }
+    let start = Instant::now();
+    let mut l = Ledger::open(store.clone()).unwrap();
+    let fold = start.elapsed();
+    let start = Instant::now();
+    let due = l.ready(T + 4 * 300).unwrap();
+    let ready = start.elapsed();
+    println!(
+        "ledger: fold of {} records in {fold:?}, ready over {JOBS} jobs in {ready:?}",
+        JOBS + 3 * RUNS
+    );
+    assert_eq!(due.len(), JOBS, "every job owes the T+20min occurrence");
+    assert!(due
+        .iter()
+        .all(|d| d.fire == Some(T + 1_200) && d.missed.is_none()));
+    assert!(
+        fold.as_millis() < LEDGER_FOLD_BUDGET_MS && ready.as_millis() < TURN_BUDGET_MS,
+        "fold {fold:?} (budget {LEDGER_FOLD_BUDGET_MS}ms), ready {ready:?} (budget {TURN_BUDGET_MS}ms)"
+    );
+}
