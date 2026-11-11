@@ -1,6 +1,6 @@
 # Terminal UI (`tole-tui`)
 
-Status: **MVP + pickers + steering + paste/images** (#460, #461, #462, #560, in `develop`, not yet released). Bare
+Status: **MVP + pickers + steering + paste/images + export/copy** (#460, #461, #462, #560, #463 part 1, in `develop`, not yet released). Bare
 `tole` on an interactive terminal opens an inline UI over one ordinary tole
 session. Next: #464 (detach key).
 
@@ -132,6 +132,45 @@ entries, `target/`, `node_modules/` and names with control characters
 skipped. `Tab` / `Enter` replace the `@word` with the path; with no match,
 `Enter` sends the text as typed.
 
+## `/copy` and `/export` (#463)
+
+- **`/copy`** sends the text of the session's LAST ASSISTANT ANSWER (the newest
+  assistant message in the log, read by the host) to the terminal clipboard
+  with an OSC 52 sequence, `ESC ] 52 ; c ; <base64> BEL`, written by the TUI
+  process itself. There is no OS clipboard dependency (decision of #560). The
+  payload is only base64 of the answer, so answer text can never put an escape
+  byte on the terminal; the sequence is built and written in one place
+  (`clipboard.rs`) and provider text still reaches the screen only through the
+  sanitizer. A terminal never confirms OSC 52, so the note says what was
+  attempted (`sent N characters to the terminal clipboard; needs OSC 52
+  support, tmux needs set -g set-clipboard on`) and never that it worked.
+  Terminals differ: some need OSC 52 write enabled in their settings, and over
+  ssh or in tmux it works only if each hop passes it. An answer over **64 KiB**
+  is refused (terminals and multiplexers cap the payload, and a truncated copy
+  is worse than none) with a pointer to `/export`; with no answer yet, `/copy`
+  says so and sends nothing.
+- **`/export [path]`** writes the transcript of the open session. The format
+  follows the extension: `.html` is a self-contained static page (every text
+  escaped, no script, no external resource, a
+  `default-src 'none'; style-src 'unsafe-inline'` CSP meta, light and dark);
+  `.jsonl` is the session's entries exactly as stored, one JSON object per
+  line. Any other extension is refused with the supported list. Reasoning is
+  not part of the log, so it is not exported. With no path the file is
+  `<workspace>/.tole/exports/<session id>.html` (only that directory is
+  created). The path, absolute or relative to the workspace, must resolve
+  inside the workspace jail (`..`, outside paths and symlinks that lead out
+  are refused, like `/image` and the file tools); its directory must exist. An
+  existing file, or a symlink at the target, is **never overwritten or
+  followed**: pick another path. The session file is only read, never changed.
+- **Secrets:** a transcript contains whatever tools printed (file contents,
+  command output, environment dumps), including secrets. The export is
+  created owner-only (`0600`) on Unix, but treat it like the session log:
+  review it before sharing, and keep `.tole/exports/` out of version control.
+- **While a turn runs:** like `/image` and the other commands, both are
+  ignored (the UI only runs commands when idle), which keeps one rule for
+  every command; `/export` could read the log safely during a turn, but it
+  would be the only command that did.
+
 ## Scrollback is append-only
 
 Finished lines live in the terminal's own scrollback, so `Ctrl+O` / `Ctrl+T`
@@ -155,6 +194,8 @@ tole-core, so a long diff is cut there.
 | `/session` | the `tole status` lines |
 | `/name <text>` | rename (`fact/session_name`; shown by `sessions --all`, `resume <name>`) |
 | `/image [path\|data-url\|clear]` | queue an image for the next message; no argument lists the queue, `clear` empties it (#560) |
+| `/copy` | copy the last assistant answer to the terminal clipboard via OSC 52 (#463) |
+| `/export [path]` | write the transcript to a file: `.html` or `.jsonl`; no path = `.tole/exports/<session id>.html` (#463) |
 | `/quit` | quit |
 
 An unknown command is refused with a prefix hint and nothing is sent. Model,
@@ -207,6 +248,7 @@ everywhere.
 
 ## Not implemented
 
+`/export` writes no Markdown or PDF and does not redact secrets; `/copy` cannot confirm the terminal accepted the clipboard write.
 The editor has no in-buffer cursor movement (Left/Right/Home/End, `Up`/`Down`
 always browse history); no memory loop, MCP prompt commands or sibling
 notices; no `/resume` paging and no transcript replay after `/new` /
@@ -242,9 +284,9 @@ Wide characters wrap by character count, not cell width.
   `apply(HostCmd) -> Result<HostReply, String>`, which covers every slash command
   and hotkey (`/model`, `/effort`, `/compact`, `/new`, `/resume`, `/session`,
   `/name`, the pickers, and #560's `AttachImage(spec)` / `ClearImages` /
-  `Images`). The reply is data only (`Done`, `Session(id)`,
+  `Images`, and #463's `LastAnswer` / `Export(path)`). The reply is data only (`Done`, `Session(id)`,
   `Models`, `Sessions`, `Lines`, `Images(Vec<ImageItem>)`: the queue after the
-  command); the wording shown to the user and the pickers
+  command, `Answer(Option<String>)`, `Path(String)`); the wording shown to the user and the pickers
   are the UI's, so a remote adapter writes three methods and no UI text. The default
   `apply` supports `Status` (no lines) and `Images` (none queued) and refuses the
   rest with "not supported by this host"; a reply of the wrong kind is reported, never a panic.

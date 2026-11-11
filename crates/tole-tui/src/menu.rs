@@ -4,7 +4,7 @@
 use crate::sanitize::one_line;
 
 /// `(name, one-line help)`; the order is the menu order.
-pub const COMMANDS: [(&str, &str); 11] = [
+pub const COMMANDS: [(&str, &str); 13] = [
     ("/model", "pick the model (Ctrl+L), or /model <id>"),
     ("/thinking", "set reasoning effort (Shift+Tab cycles)"),
     ("/compact", "summarize earlier turns before the next prompt"),
@@ -23,6 +23,14 @@ pub const COMMANDS: [(&str, &str); 11] = [
     (
         "/image",
         "attach an image to the next message: /image <path> | clear",
+    ),
+    (
+        "/copy",
+        "copy the last answer to the terminal clipboard (OSC 52)",
+    ),
+    (
+        "/export",
+        "write the transcript: /export [path.html|path.jsonl]",
     ),
     ("/quit", "quit"),
 ];

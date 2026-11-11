@@ -685,6 +685,22 @@ own threat-model entry (a model-chosen path, an injection channel the user
 did not pick). Until a follow-up issue makes that case, the model cannot
 pull images on its own.
 
+### TUI `/export` and `/copy` (#463)
+
+`/export` writes the session transcript to a file. Transcripts hold tool
+output and can therefore hold secrets, so the file is created owner-only
+(`0600`) and the docs say so; tole does not redact. The target is
+workspace-jailed (canonicalized parent, symlink-safe, `..` and outside paths
+refused), an existing file or symlink is never overwritten or followed
+(`create_new`), and the only directory it creates is `.tole/exports/`, level
+by level with a jail check each time. The HTML page escapes every piece of log
+text, carries no script and no external resource, and sets a
+`default-src 'none'` CSP, so a hostile tool result or model answer is inert
+text when the page is opened. `/copy` writes one OSC 52 sequence whose payload
+is only base64 of the last answer (capped at 64 KiB), so answer text cannot
+inject terminal escapes; what the terminal does with the clipboard write is
+outside tole (some terminals ask first or ignore it).
+
 ### User config (#433)
 
 `$CODECORA_HOME/tole/config.toml` (default `~/.codecora/tole/config.toml`) has
