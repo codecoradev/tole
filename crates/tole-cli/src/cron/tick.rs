@@ -2,16 +2,20 @@
 //!
 //! 1. Under the host lock (milliseconds): `recover` claims whose lease is
 //!    dead, compute what is `ready`, record `missed`/`blocked` and `claim`
-//!    each due occurrence (the claim is durable before anything runs).
+//!    each due occurrence (the claim is durable before anything runs). An
+//!    agent run past `cron.daily_token_cap` is claimed and settled `budget`
+//!    at once, without calling the provider.
 //! 2. Without the lock: execute the claimed runs, at most
 //!    `max_concurrent` at a time — script jobs as argv, agent jobs as one
 //!    durable session each (see [`super::agent`]).
-//! 3. Under the lock again: `settle` every run, then record its delivery.
+//! 3. Under the lock: `settle` every run. Then, without the lock, deliver
+//!    it to each target ([`super::deliver`]) and record each delivery under
+//!    the lock.
 //!
 //! A crash anywhere leaves either no claim (nothing ran) or a claim that
 //! the next tick's `recover` turns into `interrupted` — never a re-run.
-//! Run output is passed through the `SecretSet` redactor (#595) before it
-//! is written to disk.
+//! Run output is passed through the process's secret redactor (#595: env
+//! secrets and web-header secrets) before it is written to disk.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -19,8 +23,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
-use tole_core::ledger::{DeliveryStatus, Fire, Job, LedgerError, RunStatus};
+use tole_core::cancel::CancelToken;
+use tole_core::ledger::{Due, Fire, Job, Ledger, LedgerError, RunStatus};
 
+use super::deliver::{self, RunInfo};
 use super::{field, mode, store, DEFAULT_TIMEOUT_SECS};
 use crate::approvals::ApprovalQueue;
 
@@ -34,14 +40,18 @@ pub struct TickOptions {
     /// `tole serve --cron`: the `/approvals` queue agent runs park
     /// non-allowlisted Writes in. `None` (standalone tick): refused.
     pub approvals: Option<Arc<ApprovalQueue>>,
+    /// `cron.daily_token_cap` (user config): tokens all agent runs of one
+    /// UTC day may spend.
+    pub daily_token_cap: Option<u64>,
 }
 
 impl TickOptions {
-    /// A standalone tick (no approvals queue).
+    /// A standalone tick (no approvals queue, no daily cap).
     pub const fn standalone(max_concurrent: usize) -> Self {
         Self {
             max_concurrent,
             approvals: None,
+            daily_token_cap: None,
         }
     }
 }
@@ -52,20 +62,114 @@ pub struct TickReport {
     pub recovered: usize,
     pub missed: u64,
     pub blocked: usize,
-    /// `(fire_id, status)` of every run this tick executed.
+    /// `(fire_id, status)` of every run this tick settled.
     pub ran: Vec<(String, RunStatus)>,
 }
 
-/// Where a run's output is kept (`<dir>/runs/<fire id, path-safe>`).
-pub fn output_path(dir: &Path, fire_id: &str) -> PathBuf {
-    let safe: String = fire_id
+fn safe_name(fire_id: &str) -> String {
+    fire_id
         .chars()
         .map(|c| match c {
             'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' => c,
             _ => '_',
         })
-        .collect();
-    dir.join("runs").join(format!("{safe}.out"))
+        .collect()
+}
+
+/// Where a run's output is kept (`<dir>/runs/<fire id, path-safe>.out`).
+pub fn output_path(dir: &Path, fire_id: &str) -> PathBuf {
+    dir.join("runs").join(format!("{}.out", safe_name(fire_id)))
+}
+
+/// Start of the UTC day containing `t`.
+pub fn day_start(t: i64) -> i64 {
+    t - t.rem_euclid(86_400)
+}
+
+/// Tokens agent runs settled since `since` recorded.
+pub fn tokens_since(state: &tole_core::ledger::LedgerState, since: i64) -> u64 {
+    state
+        .dones()
+        .filter(|d| d.at >= since)
+        .filter_map(|d| d.usage.as_ref()?.get("tokens")?.as_u64())
+        .fold(0, u64::saturating_add)
+}
+
+/// A claimed occurrence, ready to execute.
+pub struct Claimed {
+    fire: Fire,
+    job: Job,
+    /// Token budget of this run (agent mode).
+    max_tokens: u64,
+}
+
+/// What the claim phase knows (computed once per pass).
+pub struct ClaimCtx {
+    provider_ready: bool,
+    cap: Option<u64>,
+    used_today: u64,
+}
+
+impl ClaimCtx {
+    pub fn new<S: tole_core::ledger::LedgerStore>(
+        l: &Ledger<S>,
+        now: i64,
+        opts: &TickOptions,
+    ) -> Self {
+        Self {
+            provider_ready: crate::turn_runner::provider_config().is_ok(),
+            cap: opts.daily_token_cap,
+            used_today: tokens_since(l.state(), day_start(now)),
+        }
+    }
+}
+
+/// Validates, then claims `due` (P10: a broken job is `blocked` and
+/// spends nothing; past the daily cap an agent run settles `budget`).
+pub fn claim_one<S: tole_core::ledger::LedgerStore>(
+    l: &mut Ledger<S>,
+    due: &Due,
+    job: &Job,
+    now: i64,
+    ctx: &ClaimCtx,
+    report: &mut TickReport,
+) -> Result<Option<Claimed>, LedgerError> {
+    let agent = mode(job) != "script";
+    if due.fire.is_some() {
+        let invalid = if agent && !ctx.provider_ready {
+            Some((
+                "provider_missing",
+                crate::turn_runner::MISSING_PROVIDER_CONFIG.to_string(),
+            ))
+        } else {
+            deliver::check(job).err()
+        };
+        if let Some((code, detail)) = invalid {
+            l.block(due, code, Some(detail), now)?;
+            report.blocked += 1;
+            return Ok(None);
+        }
+    }
+    let Some(fire) = l.claim(due, store::own_lease(), now)? else {
+        return Ok(None);
+    };
+    let job_max = job
+        .extra
+        .get("max_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(super::agent::DEFAULT_MAX_TOKENS);
+    let left = ctx.cap.map(|c| c.saturating_sub(ctx.used_today));
+    if agent && left == Some(0) {
+        let usage = json!({"tokens": 0, "error": "daily token cap reached"});
+        let done = l.settle(&fire.fire_id, RunStatus::Budget, None, Some(usage), now)?;
+        report.ran.push((fire.fire_id, done.status));
+        return Ok(None);
+    }
+    Ok(Some(Claimed {
+        max_tokens: left.map_or(job_max, |left| left.min(job_max)),
+        fire,
+        job: job.clone(),
+    }))
 }
 
 /// One finished run, ready to settle.
@@ -74,13 +178,13 @@ struct RunResult {
     session_id: Option<String>,
     output: String,
     usage: Value,
-    target: &'static str,
 }
 
-fn execute(job: &Job, opts: &TickOptions) -> RunResult {
-    if mode(job) == "script" {
-        let out = run_script(job);
-        return RunResult {
+fn execute(c: &Claimed, opts: &TickOptions) -> RunResult {
+    let started = Instant::now();
+    if mode(&c.job) == "script" {
+        let out = run_script(&c.job);
+        RunResult {
             status: out.status,
             session_id: None,
             usage: json!({
@@ -90,51 +194,39 @@ fn execute(job: &Job, opts: &TickOptions) -> RunResult {
                 "error": out.error,
             }),
             output: out.stdout,
-            target: "log",
-        };
-    }
-    let started = Instant::now();
-    let run = super::agent::run_agent(job, opts.approvals.as_ref());
-    RunResult {
-        status: run.status,
-        usage: json!({
-            "duration_ms": started.elapsed().as_millis(),
-            "error": run.error,
-            "approvals": if opts.approvals.is_some() { "parked" } else { "refused" },
-        }),
-        session_id: run.session_id,
-        output: run.text,
-        target: "session",
+        }
+    } else {
+        let cancel = CancelToken::new();
+        let run = super::agent::run_agent(&c.job, opts.approvals.as_ref(), &cancel, c.max_tokens);
+        RunResult {
+            status: run.status,
+            usage: json!({
+                "tokens": run.tokens,
+                "max_tokens": c.max_tokens,
+                "duration_ms": started.elapsed().as_millis(),
+                "error": run.error,
+                "approvals": if opts.approvals.is_some() { "parked" } else { "refused" },
+            }),
+            session_id: run.session_id,
+            output: run.text,
+        }
     }
 }
 
 /// One scheduler pass at `now` (Unix seconds).
 pub fn tick(dir: &Path, now: i64, opts: &TickOptions) -> anyhow::Result<TickReport> {
-    let lease = store::own_lease();
     let mut report = TickReport::default();
-    let provider_ready = crate::turn_runner::provider_config().is_ok();
-    let claimed: Vec<(Fire, Job)> = store::with_lock(dir, |l| {
+    let claimed: Vec<Claimed> = store::with_lock(dir, |l| {
         report.recovered = l.recover(now, store::lease_alive)?.len();
+        let ctx = ClaimCtx::new(l, now, opts);
         let mut claimed = Vec::new();
         for due in l.ready(now)? {
             report.missed += due.missed.as_ref().map_or(0, |m| m.count);
             let Some(job) = l.state().job(&due.job_id).map(|j| j.job.clone()) else {
                 continue;
             };
-            // Pre-dispatch validation (P10): an agent job without a
-            // provider is blocked before it can spend anything.
-            if due.fire.is_some() && mode(&job) != "script" && !provider_ready {
-                l.block(
-                    &due,
-                    "provider_missing",
-                    Some(crate::turn_runner::MISSING_PROVIDER_CONFIG.into()),
-                    now,
-                )?;
-                report.blocked += 1;
-                continue;
-            }
-            match l.claim(&due, lease, now) {
-                Ok(Some(fire)) => claimed.push((fire, job)),
+            match claim_one(l, &due, &job, now, &ctx, &mut report) {
+                Ok(Some(c)) => claimed.push(c),
                 Ok(None) => {}
                 // Another tick got there first: nothing to do here.
                 Err(LedgerError::AlreadyClaimed { .. } | LedgerError::LostRace { .. }) => {}
@@ -144,60 +236,88 @@ pub fn tick(dir: &Path, now: i64, opts: &TickOptions) -> anyhow::Result<TickRepo
         }
         Ok(claimed)
     })?;
+    run_claimed(dir, claimed, now, opts, &mut report)?;
+    Ok(report)
+}
 
+/// Executes claimed runs (bounded), then settles and delivers each.
+pub fn run_claimed(
+    dir: &Path,
+    claimed: Vec<Claimed>,
+    now: i64,
+    opts: &TickOptions,
+    report: &mut TickReport,
+) -> anyhow::Result<()> {
     let started = Instant::now();
-    let results = run_bounded(claimed, opts.max_concurrent, |(fire, job)| {
-        let out = execute(&job, opts);
-        (fire, out)
+    let results = run_bounded(claimed, opts.max_concurrent, |c| {
+        let r = execute(&c, opts);
+        (c, r)
     });
     let end = now + started.elapsed().as_secs() as i64;
 
     // Keep the output (redacted). A failed write is recorded on the run,
     // never a reason to leave a claim unsettled.
-    let secrets = tole_core::secrets::SecretSet::from_env();
-    let results: Vec<(Fire, RunResult)> = results
+    let secrets = crate::provider_chain::process_secrets(&crate::config_apply::real_env);
+    let results: Vec<(Claimed, RunResult)> = results
         .into_iter()
-        .map(|(fire, mut r)| {
+        .map(|(c, mut r)| {
             r.output = secrets.redact(&r.output).into_owned();
-            let path = output_path(dir, &fire.fire_id);
+            let path = output_path(dir, &c.fire.fire_id);
             let written = std::fs::create_dir_all(dir.join("runs"))
                 .and_then(|()| std::fs::write(&path, &r.output));
             if let (Err(e), Some(u)) = (written, r.usage.as_object_mut()) {
                 u.insert("output_error".into(), e.to_string().into());
             }
-            (fire, r)
+            (c, r)
         })
         .collect();
 
-    store::with_lock(dir, |l| {
-        let mut first_err = None;
-        for (fire, r) in results {
-            let settled = l.settle(&fire.fire_id, r.status, r.session_id, Some(r.usage), end);
-            let done = match settled {
-                Ok(d) => d,
-                Err(e) => {
-                    first_err.get_or_insert(e);
-                    continue;
+    let mut first_err: Option<anyhow::Error> = None;
+    let settled: Vec<(Claimed, RunResult)> = store::with_lock(dir, |l| {
+        let mut settled = Vec::new();
+        for (c, r) in results {
+            let usage = Some(r.usage.clone());
+            match l.settle(&c.fire.fire_id, r.status, r.session_id.clone(), usage, end) {
+                Ok(d) => {
+                    report.ran.push((c.fire.fire_id.clone(), d.status));
+                    settled.push((c, r));
                 }
-            };
-            let silent = r.output.trim().is_empty()
-                || r.output.lines().next().map(str::trim) == Some("[SILENT]");
-            let delivery = if silent {
-                DeliveryStatus::Skipped
-            } else {
-                DeliveryStatus::Sent
-            };
-            if let Err(e) = l.deliver(&fire.fire_id, r.target, delivery, None, end) {
-                first_err.get_or_insert(e);
+                Err(e) => {
+                    first_err.get_or_insert(e.into());
+                }
             }
-            report.ran.push((fire.fire_id, done.status));
         }
-        match first_err {
-            Some(e) => Err(e.into()),
-            None => Ok(()),
-        }
+        Ok(settled)
     })?;
-    Ok(report)
+
+    // Deliver without the lock (a command target may take seconds).
+    let mut records = Vec::new();
+    for (c, r) in &settled {
+        let info = RunInfo {
+            job: &c.job,
+            fire_id: &c.fire.fire_id,
+            scheduled_for: c.fire.scheduled_for,
+            status: r.status,
+            output: &r.output,
+        };
+        // Checked before the claim; an error here means a hand-edited log.
+        for t in deliver::targets(&c.job).unwrap_or_default() {
+            let (status, error) = deliver::deliver(&t, &info, &secrets);
+            records.push((c.fire.fire_id.clone(), t.spec(), status, error));
+        }
+    }
+    store::with_lock(dir, |l| {
+        for (fire_id, target, status, error) in records {
+            if let Err(e) = l.deliver(&fire_id, &target, status, error, end) {
+                first_err.get_or_insert(e.into());
+            }
+        }
+        Ok(())
+    })?;
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 /// The outcome of one script run.
@@ -214,8 +334,8 @@ pub struct ScriptOutput {
 /// secret-shaped environment scrubbed, a hard timeout. Zero tokens.
 pub fn run_script(job: &Job) -> ScriptOutput {
     let start = Instant::now();
-    let fail = |error: String| ScriptOutput {
-        status: RunStatus::Error,
+    let fail = |status: RunStatus, error: String| ScriptOutput {
+        status,
         stdout: String::new(),
         exit_code: None,
         duration_ms: start.elapsed().as_millis(),
@@ -224,12 +344,12 @@ pub fn run_script(job: &Job) -> ScriptOutput {
     let line = field(job, "script").unwrap_or_default();
     let argv = match tole_core::run_command::RunCommandTool::split_argv(line) {
         Ok(a) if !a.is_empty() => a,
-        Ok(_) => return fail("empty script".into()),
-        Err(e) => return fail(e),
+        Ok(_) => return fail(RunStatus::Error, "empty script".into()),
+        Err(e) => return fail(RunStatus::Error, e),
     };
     // Re-checked at run time: the log may have been edited by hand.
     if let Err(e) = tole_core::subprocess::check_destructive_argv(&argv) {
-        return fail(e);
+        return fail(RunStatus::Error, e);
     }
     let timeout = job
         .extra
@@ -265,7 +385,7 @@ pub fn run_script(job: &Job) -> ScriptOutput {
                 error: None,
             }
         }
-        Err(e) => fail(e),
+        Err(e) => fail(RunStatus::Error, e),
     }
 }
 

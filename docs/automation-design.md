@@ -138,7 +138,10 @@ and process spawning live in `tole-cli`.
   LLM tokens**. Empty output or a `[SILENT]` first line = nothing delivered.
 - Per-job `budget` reuses mission budgets (`--max-steps/--max-minutes/--max-tokens`);
   a global daily token ceiling (`cron.daily_token_cap`) stops all agent jobs
-  and records `budget`. Model pin per job so cheap work never inherits the chat
+  and records `budget`. **As implemented (#579):** the cap is a user-config
+  key (a project config cannot set it), counted per UTC day from the `tokens`
+  of settled runs and checked when a run is claimed; a run gets at most what
+  is left, so runs in flight together can overshoot it by their own usage. Model pin per job so cheap work never inherits the chat
   model.
 - Agent-created jobs: created `paused`, `created_by` recorded, `allow[]` ⊆
   creator's; enabling is a human action. Config-sourced jobs follow the
@@ -213,7 +216,8 @@ counts, webhook routes without secrets.
 
 Targets in v1: `session` (the run's own transcript — default), `file`
 (append to a path under the workspace), `command` (argv, trust-gated like
-other config commands), and the pull route `GET /cron/runs` on `tole serve`
+other config commands; as implemented, only a job saved with `tole cron
+create` may carry one, any other job is `blocked` with `delivery_untrusted`), and the pull route `GET /cron/runs` on `tole serve`
 so uteke-mobile or any client can read results. Telegram/Slack-style targets
 plug into the same `delivery` record later without changing the core.
 

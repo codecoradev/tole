@@ -87,6 +87,17 @@ pub struct TuiConfig {
     pub keys: Option<std::collections::BTreeMap<String, KeyList>>,
 }
 
+/// The `[cron]` table (#579). USER LAYER ONLY, like [`TuiConfig`]: the
+/// scheduler is global (one job store per user), so a cloned repository's
+/// config must not raise the spending ceiling of every job.
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CronConfig {
+    /// Tokens all agent runs of one UTC day may spend together; past it
+    /// agent runs settle `budget` without calling the provider.
+    pub daily_token_cap: Option<u64>,
+}
+
 /// `[profiles.<name>.models]` (#584): model names per task-weight tier.
 /// `default` names the tier a session uses unless something picks another
 /// (the router of #586 is that something; today only `default` is used).
@@ -241,6 +252,8 @@ pub struct Config {
     pub mission: Option<MissionConfig>,
     /// Theme and colors (#463); user layer only, see [`TuiConfig`].
     pub tui: Option<TuiConfig>,
+    /// Scheduler limits (#579); user layer only, see [`CronConfig`].
+    pub cron: Option<CronConfig>,
     /// Dormant profiles (#584); user layer only, see [`ProfileConfig`].
     pub profiles: Option<std::collections::BTreeMap<String, ProfileConfig>>,
     /// Keys (rendered names, e.g. `model`, `mission.verify`) whose value
@@ -321,9 +334,10 @@ pub fn read_source(path: &Path) -> Result<String, ConfigError> {
 
 /// Does this key name look like a secret? Case-insensitive substring
 /// match over `secret`, `password`, `token`, `api_key` (`-` ≙ `_`).
-/// The one schema key that legitimately contains such a word is
-/// `mission.max_tokens` (a budget, not a credential); it is exempted by
-/// exact position in [`check_forbidden`], never by name alone.
+/// The schema keys that legitimately contain such a word are
+/// `mission.max_tokens` and `cron.daily_token_cap` (budgets, not
+/// credentials); they are exempted by exact position in
+/// [`check_forbidden`], never by name alone.
 fn is_secret_name(key: &str) -> bool {
     let k = key.to_ascii_lowercase().replace('-', "_");
     ["secret", "password", "token", "api_key"]
@@ -341,7 +355,10 @@ fn check_forbidden(
 ) -> Result<(), ConfigError> {
     for (k, v) in table.iter() {
         let name: &str = k.get_ref();
-        let allowed = parent == Some("mission") && name == "max_tokens";
+        let allowed = matches!(
+            (parent, name),
+            (Some("mission"), "max_tokens") | (Some("cron"), "daily_token_cap")
+        );
         if !allowed && is_secret_name(name) {
             return Err(ConfigError {
                 path: path.to_path_buf(),
@@ -586,11 +603,20 @@ pub fn layered(project: &Config, user: &Config) -> Config {
         mission: (project.mission.is_some() || user.mission.is_some()).then_some(mission),
         // The project layer NEVER supplies the theme, colors or keys (#463).
         tui: user.tui.clone(),
+        // Nor the scheduler limits (#579).
+        cron: user.cron.clone(),
         // Nor profiles (#584): a cloned repository must not define personas,
         // their allow lists or their models.
         profiles: user.profiles.clone(),
         user_keys: BTreeSet::new(),
     };
+    if user
+        .cron
+        .as_ref()
+        .is_some_and(|c| c.daily_token_cap.is_some())
+    {
+        from_user.insert("cron.daily_token_cap");
+    }
     if let Some(t) = &user.tui {
         if t.theme.as_deref().is_some_and(|v| !v.trim().is_empty()) {
             from_user.insert("tui.theme");
@@ -631,6 +657,9 @@ pub fn render(cfg: &Config) -> Vec<String> {
 pub const TUI_IGNORED_NOTE: &str =
     "  IGNORED: a project config cannot set the theme, colors or keys (user config only; the theme also TOLE_THEME)";
 
+/// Suffix of a project config's `cron` lines in `config check` (#579).
+pub const CRON_IGNORED_NOTE: &str =
+    "  IGNORED: a project config cannot set scheduler limits (user config only)";
 /// Suffix of a project config's `profiles` line in `config check` (#584).
 pub const PROFILES_IGNORED_NOTE: &str =
     "  IGNORED: a project config cannot define profiles (user config only)";
@@ -663,6 +692,9 @@ pub fn render_with(cfg: &Config, tag: &str, ann: &Annotations) -> Vec<String> {
     let note = |key: &str| {
         if tag == PROJECT_TAG && key.starts_with("tui.") {
             return TUI_IGNORED_NOTE;
+        }
+        if tag == PROJECT_TAG && key.starts_with("cron.") {
+            return CRON_IGNORED_NOTE;
         }
         if tag == PROJECT_TAG && key == "profiles" {
             return PROFILES_IGNORED_NOTE;
@@ -803,6 +835,13 @@ pub fn render_with(cfg: &Config, tag: &str, ann: &Annotations) -> Vec<String> {
             &mut out,
             "mission.verify_timeout",
             m.verify_timeout.map(|n| n.to_string()),
+        );
+    }
+    if let Some(c) = &cfg.cron {
+        scalar(
+            &mut out,
+            "cron.daily_token_cap",
+            c.daily_token_cap.map(|n| n.to_string()),
         );
     }
     out
@@ -958,6 +997,24 @@ verify_timeout = 60
         let m = layered(&project, &c);
         assert_eq!(m.tui, c.tui);
         assert!(m.user_keys.contains("tui.theme") && m.user_keys.contains("tui.colors"));
+    }
+
+    #[test]
+    fn cron_table_is_strict_and_user_layer_only() {
+        let user = parse("[cron]\ndaily_token_cap = 50000\n", &p()).unwrap();
+        assert_eq!(user.cron.as_ref().unwrap().daily_token_cap, Some(50_000));
+        assert!(parse("[cron]\ndaily_cap = 1\n", &p()).is_err());
+        // Exempt from the secret-name rule only at that exact position.
+        assert!(parse("[cron]\napi_token = \"x\"\n", &p()).is_err());
+        assert!(parse("[mission]\ndaily_token_cap = 1\n", &p()).is_err());
+        assert!(parse("[cron]\ndaily_token_cap = \"1\"\n", &p()).is_err());
+        let project = parse("[cron]\ndaily_token_cap = 999999999\n", &p()).unwrap();
+        assert_eq!(layered(&project, &Config::default()).cron, None);
+        let m = layered(&project, &user);
+        assert_eq!(m.cron, user.cron);
+        assert!(m.user_keys.contains("cron.daily_token_cap"));
+        let shown = render(&project).join("\n");
+        assert!(shown.contains("cron.daily_token_cap = 999999999") && shown.contains("IGNORED"));
     }
 
     #[test]

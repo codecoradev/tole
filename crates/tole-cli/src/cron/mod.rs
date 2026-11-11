@@ -7,12 +7,16 @@
 //! **script** mode (argv, no shell, zero LLM tokens) and the **agent** mode
 //! (one durable session per run, see [`agent`]: non-allowlisted Writes are
 //! parked in `/approvals` under `tole serve --cron` and refused by a
-//! standalone tick; never auto-approved). An agent job with no provider
-//! configured is recorded as `blocked` (`provider_missing`) before it runs.
+//! standalone tick; never auto-approved), delivery targets ([`deliver`])
+//! and budgets (steps, minutes, tokens, and the user config's
+//! `cron.daily_token_cap`). A job that fails pre-dispatch validation (no
+//! provider, a bad or untrusted delivery target) is recorded as `blocked`
+//! before it runs.
 //!
 //! The cron dir is `$TOLE_CRON_DIR`, else `<codecora home>/tole/cron`.
 
 pub mod agent;
+pub mod deliver;
 pub mod store;
 pub mod tick;
 
@@ -74,9 +78,18 @@ pub enum CronAction {
         /// settles `budget`.
         #[arg(long)]
         max_steps: Option<u64>,
-        /// Agent runs: wall-clock budget in minutes [default: 15].
+        /// Agent runs: wall-clock budget in minutes [default: 15, max: 10080].
         #[arg(long)]
         max_minutes: Option<u64>,
+        /// Agent runs: token budget [default: 200000]; past it the run
+        /// settles `budget`.
+        #[arg(long)]
+        max_tokens: Option<u64>,
+        /// Delivery target, repeatable: `log`, `session`, `file:PATH`
+        /// (inside the workdir) or `command:ARGV` (output on stdin)
+        /// [default: session for agent jobs, log for scripts].
+        #[arg(long = "deliver")]
+        deliver: Vec<String>,
         /// Save the job paused.
         #[arg(long)]
         paused: bool,
@@ -122,6 +135,8 @@ pub struct CreateSpec {
     pub timeout_secs: Option<u64>,
     pub max_steps: Option<u64>,
     pub max_minutes: Option<u64>,
+    pub max_tokens: Option<u64>,
+    pub deliver: Vec<String>,
     pub paused: bool,
 }
 
@@ -168,8 +183,39 @@ pub fn mode(job: &Job) -> &str {
     field(job, "mode").unwrap_or("agent")
 }
 
+/// The user config's `cron.daily_token_cap` (`None` when unset or the
+/// user config cannot be read; a broken file is reported).
+pub fn daily_token_cap() -> Option<u64> {
+    let path = crate::config::user_config_path().filter(|p| p.exists())?;
+    match crate::config::load(&path) {
+        Ok(c) => c.cron?.daily_token_cap,
+        Err(e) => {
+            eprintln!("tole cron: user config not applied: {e}");
+            None
+        }
+    }
+}
+
 /// Validates and saves a new job. Returns the saved record.
 pub fn create(dir: &Path, spec: CreateSpec, now: i64) -> anyhow::Result<Job> {
+    let id = match &spec.id {
+        Some(id) => id.clone(),
+        None => format!("j{now:x}{:04x}", std::process::id() & 0xffff),
+    };
+    let mut job = build_job(spec, id, now)?;
+    job.extra.insert("created_by".into(), "cli".into());
+    store::with_lock(dir, |l| {
+        if l.state().job(&job.id).is_some_and(|j| !j.job.removed) {
+            bail!("job `{}` already exists", job.id);
+        }
+        l.put_job(job.clone())?;
+        Ok(())
+    })?;
+    Ok(job)
+}
+
+/// Validates a spec into a job record (without `created_by`).
+fn build_job(spec: CreateSpec, id: String, now: i64) -> anyhow::Result<Job> {
     Schedule::parse(&spec.schedule)?;
     if !spec.workdir.is_absolute() || !spec.workdir.is_dir() {
         bail!(
@@ -201,10 +247,15 @@ pub fn create(dir: &Path, spec: CreateSpec, now: i64) -> anyhow::Result<Job> {
     if let Some(p) = &spec.prompt {
         extra.insert("prompt".into(), p.clone().into());
     }
-    let id = match spec.id {
-        Some(id) => id,
-        None => format!("j{now:x}{:04x}", std::process::id() & 0xffff),
+    let mode = if spec.script.is_some() {
+        "script"
+    } else {
+        "agent"
     };
+    deliver::validate(mode, &spec.deliver).map_err(|e| anyhow!("--deliver: {e}"))?;
+    if !spec.deliver.is_empty() {
+        extra.insert("deliver".into(), json!(spec.deliver));
+    }
     extra.insert(
         "name".into(),
         spec.name.unwrap_or_else(|| id.clone()).into(),
@@ -223,17 +274,23 @@ pub fn create(dir: &Path, spec: CreateSpec, now: i64) -> anyhow::Result<Job> {
     for (key, v) in [
         ("max_steps", spec.max_steps),
         ("max_minutes", spec.max_minutes),
+        ("max_tokens", spec.max_tokens),
     ] {
         match v {
             Some(0) => bail!("--{} must be at least 1", key.replace('_', "-")),
+            Some(n) if key == "max_minutes" && n > agent::MAX_MINUTES => {
+                bail!(
+                    "--max-minutes must be at most {} (one week)",
+                    agent::MAX_MINUTES
+                )
+            }
             Some(n) => {
                 extra.insert(key.into(), n.into());
             }
             None => {}
         }
     }
-    extra.insert("created_by".into(), "cli".into());
-    let job = Job {
+    Ok(Job {
         id,
         schedule: spec.schedule,
         timezone: None,
@@ -247,15 +304,7 @@ pub fn create(dir: &Path, spec: CreateSpec, now: i64) -> anyhow::Result<Job> {
         removed: false,
         at: now,
         extra,
-    };
-    store::with_lock(dir, |l| {
-        if l.state().job(&job.id).is_some_and(|j| !j.job.removed) {
-            bail!("job `{}` already exists", job.id);
-        }
-        l.put_job(job.clone())?;
-        Ok(())
-    })?;
-    Ok(job)
+    })
 }
 
 /// Resolves a job by id, else by case-insensitive name (ambiguous names
@@ -378,6 +427,24 @@ pub fn runs(dir: &Path, job: Option<&str>) -> anyhow::Result<Vec<RunRow>> {
     Ok(rows)
 }
 
+fn status_word(s: Option<RunStatus>, none: &str) -> String {
+    s.map(|s| format!("{s:?}").to_lowercase())
+        .unwrap_or_else(|| none.into())
+}
+
+fn print_report(verb: &str, r: &TickReport) {
+    println!(
+        "{verb}: ran {}, recovered {}, missed {}, blocked {}",
+        r.ran.len(),
+        r.recovered,
+        r.missed,
+        r.blocked
+    );
+    for (fire, st) in &r.ran {
+        println!("  {fire}  {}", status_word(Some(*st), "-"));
+    }
+}
+
 /// Dispatch for `tole cron <action>` (prints to stdout).
 pub fn cli(action: CronAction) -> anyhow::Result<()> {
     let dir = default_dir()?;
@@ -397,6 +464,8 @@ pub fn cli(action: CronAction) -> anyhow::Result<()> {
             timeout,
             max_steps,
             max_minutes,
+            max_tokens,
+            deliver,
             paused,
         } => {
             let workdir = match workdir {
@@ -419,6 +488,8 @@ pub fn cli(action: CronAction) -> anyhow::Result<()> {
                     timeout_secs: timeout,
                     max_steps,
                     max_minutes,
+                    max_tokens,
+                    deliver,
                     paused,
                 },
                 t,
@@ -472,22 +543,17 @@ pub fn cli(action: CronAction) -> anyhow::Result<()> {
                     r.fire_id,
                     r.job_id,
                     fmt_utc(r.scheduled_for),
-                    r.status
-                        .map(|s| format!("{s:?}").to_lowercase())
-                        .unwrap_or_else(|| "running".into()),
+                    status_word(r.status, "running"),
                     r.delivery.unwrap_or_else(|| "-".into())
                 );
             }
         }
         CronAction::Tick { max_concurrent } => {
-            let r = tick(&dir, t, &TickOptions::standalone(max_concurrent))?;
-            println!(
-                "tick: ran {}, recovered {}, missed {}, blocked {}",
-                r.ran.len(),
-                r.recovered,
-                r.missed,
-                r.blocked
-            );
+            let opts = TickOptions {
+                daily_token_cap: daily_token_cap(),
+                ..TickOptions::standalone(max_concurrent)
+            };
+            print_report("tick", &tick(&dir, t, &opts)?);
         }
     }
     Ok(())
@@ -499,13 +565,13 @@ pub fn cli(action: CronAction) -> anyhow::Result<()> {
 /// non-allowlisted Writes in `approvals`. Never returns; a failed pass is
 /// logged and retried at the next minute.
 pub fn serve_ticker(dir: &Path, approvals: std::sync::Arc<crate::approvals::ApprovalQueue>) {
-    let opts = TickOptions {
-        max_concurrent: 4,
-        approvals: Some(approvals),
-    };
     loop {
-        let t = now();
-        match tick(dir, t, &opts) {
+        let opts = TickOptions {
+            max_concurrent: 4,
+            approvals: Some(std::sync::Arc::clone(&approvals)),
+            daily_token_cap: daily_token_cap(),
+        };
+        match tick(dir, now(), &opts) {
             Ok(r) if !r.ran.is_empty() || r.recovered > 0 || r.blocked > 0 || r.missed > 0 => {
                 eprintln!(
                     "tole serve: cron tick ran {}, recovered {}, missed {}, blocked {}",

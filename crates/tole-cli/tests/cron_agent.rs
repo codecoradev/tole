@@ -215,8 +215,8 @@ fn serve_hosted_runs_park_unlisted_writes_in_the_approvals_queue() {
     cron::create(&dir, agent(&dir, "w", "please WRITE a file"), T).unwrap();
     let queue = ApprovalQueue::shared();
     let opts = TickOptions {
-        max_concurrent: 2,
         approvals: Some(Arc::clone(&queue)),
+        ..TickOptions::standalone(2)
     };
     let (status, session, _) = run_once(&dir, &opts);
     assert_eq!(status, RunStatus::AwaitingApproval);
@@ -238,7 +238,7 @@ fn the_step_budget_settles_budget() {
     let l = store::open_read(&dir).unwrap();
     let usage = l.state().done(&fire).unwrap().usage.clone().unwrap();
     assert_eq!(
-        usage["error"], "budget exceeded",
+        usage["error"], "step budget exceeded",
         "the job's own budget, not the turn cap"
     );
 }
@@ -257,4 +257,80 @@ fn the_model_pin_is_sent_to_the_provider() {
         .unwrap()
         .iter()
         .any(|m| m == "pinned-model-xyz"));
+}
+
+fn usage_of(dir: &Path, fire: &str) -> Value {
+    let l = store::open_read(dir).unwrap();
+    l.state().done(fire).unwrap().usage.clone().unwrap()
+}
+
+#[test]
+fn the_token_budget_settles_budget() {
+    provider();
+    let dir = tmp("tokens");
+    let mut spec = agent(&dir, "t", "LOOP forever");
+    spec.max_tokens = Some(1);
+    cron::create(&dir, spec, T).unwrap();
+    let (status, _, fire) = run_once(&dir, &TickOptions::standalone(2));
+    assert_eq!(status, RunStatus::Budget);
+    let usage = usage_of(&dir, &fire);
+    assert_eq!(usage["error"], "token budget exceeded");
+    assert!(usage["tokens"].as_u64().unwrap() >= 1, "{usage}");
+}
+
+#[test]
+fn the_daily_token_cap_limits_then_stops_agent_runs_until_the_next_day() {
+    provider();
+    let dir = tmp("cap");
+    cron::create(&dir, agent(&dir, "d", "say HELLO capped"), T).unwrap();
+    let opts = TickOptions {
+        daily_token_cap: Some(3),
+        ..TickOptions::standalone(2)
+    };
+    let tick = |at: i64| {
+        let r = cron::tick(&dir, at, &opts).unwrap();
+        assert_eq!(r.ran.len(), 1, "{r:?}");
+        let (fire, status) = r.ran[0].clone();
+        (status, usage_of(&dir, &fire))
+    };
+    let (s1, u1) = tick(T + 60);
+    assert_eq!(
+        (s1, u1["tokens"].as_u64()),
+        (RunStatus::Ok, Some(2)),
+        "{u1}"
+    );
+    let (_, u2) = tick(T + 120);
+    assert_eq!(u2["max_tokens"], 1, "only what is left of the cap: {u2}");
+    let (s3, u3) = tick(T + 180);
+    assert_eq!(s3, RunStatus::Budget);
+    assert_eq!(
+        (u3["tokens"].as_u64(), u3["error"].as_str()),
+        (Some(0), Some("daily token cap reached"))
+    );
+    // A new UTC day starts from zero.
+    let (s4, _) = tick(T + 86_400 + 60);
+    assert_eq!(s4, RunStatus::Ok);
+}
+
+#[test]
+fn a_cancelled_agent_run_settles_cancelled() {
+    provider();
+    let dir = tmp("cancel");
+    let job = cron::create(&dir, agent(&dir, "c", "LOOP forever"), T).unwrap();
+    let cancel = tole_core::cancel::CancelToken::new();
+    cancel.cancel();
+    let run = cron::agent::run_agent(&job, None, &cancel, 1_000);
+    assert_eq!(run.status, RunStatus::Cancelled, "{run:?}");
+}
+
+#[test]
+fn a_huge_minute_budget_saturates_and_is_capped_on_save() {
+    assert_eq!(
+        cron::agent::wall_budget(u64::MAX),
+        std::time::Duration::from_secs(u64::MAX)
+    );
+    let dir = tmp("minutes");
+    let mut spec = agent(&dir, "m", "hi");
+    spec.max_minutes = Some(cron::agent::MAX_MINUTES + 1);
+    assert!(cron::create(&dir, spec, T).is_err());
 }
