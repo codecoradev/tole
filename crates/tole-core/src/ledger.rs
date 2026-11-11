@@ -535,6 +535,10 @@ impl LedgerState {
             .map(|(_, d)| d)
             .take_while(move |d| d.fire_id == fire_id)
     }
+    /// Every settled run, in `fire_id` order (no log order implied).
+    pub fn dones(&self) -> impl Iterator<Item = &Done> {
+        self.done.values()
+    }
     pub fn missed(&self) -> impl Iterator<Item = &Missed> {
         self.missed.values()
     }

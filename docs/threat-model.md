@@ -756,3 +756,20 @@ It is still bounded and validated like a project file (64 KiB, strict
 schema, secret-like keys refused), `--no-config` ignores it, and every face
 that refuses a hook / skill / MCP server from the command line refuses it
 from the user config too, naming the user config as the origin.
+
+### Scheduled jobs (#579)
+
+Cron jobs live in the user's data dir (`$TOLE_CRON_DIR`, default
+`<codecora home>/tole/cron`), never in a repository. Unattended agent runs
+pre-authorize Writes only through the job's `allow` list; anything else is
+parked in `/approvals` (`tole serve --cron`) or refused (`tole cron tick`),
+never auto-approved. Run output is redacted with the process's secret set
+(env secrets and web-header secrets, #595) before it is written or
+delivered. Delivery targets: a `file:` target is a relative path that must
+stay inside the job's workdir (no `..`, no absolute path, no symlinked
+target, the parent re-checked after canonicalizing); a `command:` target is
+argv (no shell, destructive argv refused, scrubbed env, 60 s timeout) and is
+trust-gated: only a job whose record says `created_by = cli` (saved by a
+human with `tole cron create`/`edit`) may run one, any other job is
+`blocked` before it runs. `cron.daily_token_cap` is read from the user
+config only, so a cloned repository cannot raise it.
