@@ -257,9 +257,11 @@ Bot and Nakama; BMAD for collaboration). Design notes:
 
 - **E1 — Automation, epic #577:** ledger core (#578), `tole cron` (#579),
   time zones (#580), unattended approvals (#581), webhooks on `tole serve`
-  (#582). The scheduler lives inside tole. Status: #578 in progress — the
-  in-tree cron/`@every` parser is in `tole-core` (`cron`); the ledger
-  (claim/fold/recovery) follows.
+  (#582). The scheduler lives inside tole. Status: the ledger core is in
+  `tole-core` (`cron`, `ledger`: cron/`@every` parser, append-only
+  claim/fold/recovery, catch-up with `missed` records, crash-injection and
+  property tests; UTC only, no CLI or file adapter yet — those land with
+  #579).
 - **E2 — Profiles, delegation, discussion, routing, epic #583:**
   - profiles (#584);
   - delegation with budget carve, depth 2 (max 3), write lease and a

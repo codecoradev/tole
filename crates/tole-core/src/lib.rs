@@ -50,6 +50,7 @@ pub mod gitea;
 pub mod handoff;
 pub mod image;
 pub mod interrupt;
+pub mod ledger;
 pub mod systemone;
 pub mod todo;
 pub mod transcript;
