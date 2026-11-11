@@ -7,7 +7,10 @@
 //!   its parent's REMAINING budget, and its deadline is never later than the
 //!   parent's. While a child runs, its whole carve is reserved; once it
 //!   settles, the parent is charged what its subtree spent. N children share
-//!   one pot, so delegating can never multiply the root budget.
+//!   one pot, so delegating can never multiply the root budget. Unknown
+//!   usage is charged in full: a crashed child is charged its whole carve
+//!   unless the host measured less, a budget stop is charged its whole
+//!   carve, and a node's reported own spend can only grow.
 //! - **Depth.** The root is depth 0; a node may delegate only while
 //!   `depth < max_depth` (default 2, hard ceiling 3). The host registers the
 //!   delegate tool only where [`Delegation::may_delegate`] says so.
@@ -67,6 +70,24 @@ pub struct Budget {
 pub struct Spend {
     pub tokens: u64,
     pub steps: u32,
+}
+
+impl Spend {
+    /// Componentwise maximum.
+    pub fn max(self, o: Spend) -> Spend {
+        Spend {
+            tokens: self.tokens.max(o.tokens),
+            steps: self.steps.max(o.steps),
+        }
+    }
+
+    /// The whole of `b`'s tokens and steps.
+    pub fn all_of(b: Budget) -> Spend {
+        Spend {
+            tokens: b.tokens,
+            steps: b.steps,
+        }
+    }
 }
 
 /// A child's requested budget; `None` takes half of what is left.
@@ -254,6 +275,9 @@ pub struct Node {
     pub report: Option<Report>,
     pub reason: Option<String>,
     pub children: Vec<String>,
+    /// The highest own spend this node reported when delegating; a later,
+    /// lower report is refused.
+    pub own: Spend,
     pub at: i64,
 }
 
@@ -279,6 +303,9 @@ enum Rec {
         allow: Vec<String>,
         dropped: Vec<String>,
         workspace: Option<String>,
+        /// The parent's own spend as reported for this spawn.
+        #[serde(default)]
+        parent_own: Spend,
         at: i64,
     },
     Start {
@@ -425,6 +452,7 @@ impl State {
                         report: None,
                         reason: None,
                         children: Vec::new(),
+                        own: Spend::default(),
                         at,
                     },
                 );
@@ -439,6 +467,7 @@ impl State {
                 allow,
                 dropped,
                 workspace,
+                parent_own,
                 at,
             } => {
                 if self.nodes.contains_key(&node_id) {
@@ -447,6 +476,7 @@ impl State {
                 let Some(parent) = self.nodes.get_mut(&parent_id) else {
                     return;
                 };
+                parent.own = parent.own.max(parent_own);
                 parent.children.push(node_id.clone());
                 let node = Node {
                     id: node_id.clone(),
@@ -467,6 +497,7 @@ impl State {
                     report: None,
                     reason: None,
                     children: Vec::new(),
+                    own: Spend::default(),
                     at,
                 };
                 self.nodes.insert(node_id, node);
@@ -782,6 +813,12 @@ impl<S: LedgerStore> Delegation<S> {
         if b.tokens == Some(0) || b.steps == Some(0) || b.minutes == Some(0) {
             return Err(DelegationError::Invalid("a requested budget of 0".into()));
         }
+        if own.tokens < p.own.tokens || own.steps < p.own.steps {
+            return Err(DelegationError::Invalid(format!(
+                "own spend {own:?} is lower than the {:?} `{}` reported before",
+                p.own, p.id
+            )));
+        }
         let left = self.state.available(&p, own);
         let exhausted = |what| DelegationError::BudgetExhausted {
             node: p.id.clone(),
@@ -822,6 +859,7 @@ impl<S: LedgerStore> Delegation<S> {
             allow: allow.clone(),
             dropped: dropped.clone(),
             workspace: req.workspace.map(str::to_string),
+            parent_own: own,
             at: now,
         })?;
         Ok(Handle {
@@ -931,6 +969,13 @@ impl<S: LedgerStore> Delegation<S> {
 
     /// Settles a node. `Outcome::Ok` becomes `done` only with a complete
     /// report and every child settled; otherwise `incomplete`.
+    ///
+    /// `used` must be the node's MEASURED own usage (its session's usage
+    /// records), for every outcome: it is what the parent is charged, and
+    /// the rest of the carve goes back to the parent. It is never taken
+    /// below the highest own spend the node reported while delegating, and
+    /// `Outcome::Budget` is always charged the whole carve. A host that
+    /// cannot measure passes the whole carve ([`Spend::all_of`]).
     pub fn settle(
         &mut self,
         id: &str,
@@ -946,6 +991,12 @@ impl<S: LedgerStore> Delegation<S> {
             return Err(DelegationError::Settled(id.to_string()));
         }
         let mut why: Vec<String> = reason.map(str::to_string).into_iter().collect();
+        // Never below what the node already reported; a budget stop spent
+        // its whole carve.
+        let mut used = used.max(n.own);
+        if outcome == Outcome::Budget {
+            used = used.max(Spend::all_of(n.budget));
+        }
         let status = match outcome {
             Outcome::Failed => NodeStatus::Failed,
             Outcome::Cancelled => NodeStatus::Cancelled,
@@ -989,7 +1040,17 @@ impl<S: LedgerStore> Delegation<S> {
 
     /// Settles running nodes whose process is gone (`interrupted`) and
     /// queued nodes whose parent settled (`cancelled`). Returns their ids.
-    pub fn recover(&mut self, now: i64, alive: impl Fn(&Lease) -> bool) -> Result<Vec<String>> {
+    ///
+    /// A dead node's usage is unknown, so it is charged its whole carve
+    /// unless `measured` gives what it really spent (e.g. from its session's
+    /// usage records): a crash must never refund a budget it may have burned.
+    /// A queued node never started, so it spent nothing.
+    pub fn recover(
+        &mut self,
+        now: i64,
+        alive: impl Fn(&Lease) -> bool,
+        measured: impl Fn(&Node) -> Option<Spend>,
+    ) -> Result<Vec<String>> {
         self.sync(true)?;
         let mut todo = Vec::new();
         for n in self.state.nodes.values() {
@@ -1000,21 +1061,28 @@ impl<S: LedgerStore> Delegation<S> {
                 .is_some_and(|p| p.status.is_terminal());
             match (n.status, n.lease) {
                 (NodeStatus::Running, Some(l)) if !alive(&l) => {
-                    todo.push((n.id.clone(), NodeStatus::Interrupted, "process gone"))
+                    let used = measured(n).unwrap_or_else(|| Spend::all_of(n.budget));
+                    todo.push((
+                        n.id.clone(),
+                        NodeStatus::Interrupted,
+                        used.max(n.own),
+                        "process gone",
+                    ))
                 }
                 (NodeStatus::Queued, _) if parent_done => todo.push((
                     n.id.clone(),
                     NodeStatus::Cancelled,
+                    Spend::default(),
                     "parent settled before it started",
                 )),
                 _ => {}
             }
         }
-        for (id, status, reason) in &todo {
+        for (id, status, used, reason) in &todo {
             self.append(&Rec::Settle {
                 node_id: id.clone(),
                 status: *status,
-                used: Spend::default(),
+                used: *used,
                 report: None,
                 reason: Some((*reason).to_string()),
                 at: now,

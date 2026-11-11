@@ -808,7 +808,12 @@ skip one:
 - **No budget multiplication.** A child's tokens and steps are carved from its
   parent's remaining budget and its deadline is never later than the parent's;
   a running child's whole carve stays reserved, so any number of children
-  share one root pot. A spawn with nothing left is refused.
+  share one root pot. A spawn with nothing left is refused. Unknown usage is
+  charged in full, so a crash cannot refund a budget it may have burned: a
+  child whose process is gone is charged its whole carve unless the host
+  measured less, a budget stop is charged its whole carve, a settle never
+  goes below what the node already reported, and a node's reported own
+  spend can only grow. Only a child that never started refunds everything.
 - **Depth** is 2 by default and can never exceed 3 (`max_depth` outside 1–3 is
   refused when the goal opens); a node at the limit cannot delegate.
 - **Authority only narrows.** The child allowlist is the profile's patterns

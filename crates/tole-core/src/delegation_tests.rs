@@ -421,7 +421,7 @@ fn the_live_process_guard_queues_and_recovery_settles_the_gone() {
     );
     assert_eq!(d.next_queued("g").unwrap().id, b.node_id);
     // `a`'s process died: recovery settles it and frees the slot.
-    let gone = d.recover(T, |l| l.pid != 7).unwrap();
+    let gone = d.recover(T, |l| l.pid != 7, |_| None).unwrap();
     assert_eq!(gone, vec![a.node_id.clone()]);
     assert_eq!(d.poll(&a.node_id).unwrap().status, NodeStatus::Interrupted);
     d.start(
@@ -445,7 +445,10 @@ fn the_live_process_guard_queues_and_recovery_settles_the_gone() {
         .unwrap();
     d.settle(&b.node_id, Outcome::Failed, Spend::default(), None, None, T)
         .unwrap();
-    assert_eq!(d.recover(T, |_| true).unwrap(), vec![c.node_id.clone()]);
+    assert_eq!(
+        d.recover(T, |_| true, |_| None).unwrap(),
+        vec![c.node_id.clone()]
+    );
     assert_eq!(d.poll(&c.node_id).unwrap().status, NodeStatus::Cancelled);
 }
 
@@ -561,4 +564,121 @@ fn a_second_settle_that_raced_past_the_check_does_not_overwrite_the_first() {
     assert_eq!(d.poll(&a.node_id).unwrap().status, NodeStatus::Failed);
     let fresh = Delegation::open(store).unwrap();
     assert_eq!(fresh.poll(&a.node_id).unwrap().status, NodeStatus::Failed);
+}
+
+/// What `g` can still carve: a probe request for more than everything.
+fn left(d: &mut Delegation<MemoryStore>) -> u64 {
+    let probe = DelegateRequest {
+        profile: "probe",
+        ..req(Mode::Consult, Some(u64::MAX), &[])
+    };
+    match d.delegate("g", &probe, Spend::default(), T) {
+        Ok(h) => {
+            // Give the probe back as never started.
+            d.settle(
+                &h.node_id,
+                Outcome::Cancelled,
+                Spend::default(),
+                None,
+                None,
+                T,
+            )
+            .unwrap();
+            h.budget.tokens
+        }
+        Err(DelegationError::BudgetExhausted { .. }) => 0,
+        Err(e) => panic!("{e}"),
+    }
+}
+
+#[test]
+fn a_crashed_child_is_charged_its_whole_carve_unless_measured() {
+    let mut d = goal(2, 8);
+    let a = spawn(&mut d, "g", 600);
+    assert_eq!(left(&mut d), 400);
+    // The process is gone and nobody measured it: nothing comes back.
+    d.recover(T, |_| false, |_| None).unwrap();
+    assert_eq!(d.poll(&a.node_id).unwrap().status, NodeStatus::Interrupted);
+    assert_eq!(left(&mut d), 400, "a crash must not refund its carve");
+    // A measured spend lower than the carve refunds the difference.
+    let b = spawn(&mut d, "g", 300);
+    let b_id = b.node_id.clone();
+    d.recover(
+        T,
+        |_| false,
+        move |n| {
+            (n.id == b_id).then_some(Spend {
+                tokens: 100,
+                steps: 1,
+            })
+        },
+    )
+    .unwrap();
+    assert_eq!(left(&mut d), 400 - 100);
+}
+
+#[test]
+fn spawn_and_crash_cycles_run_out_of_budget() {
+    let mut d = goal(2, 8);
+    let mut cycles = 0;
+    loop {
+        let mut r = req(Mode::Execute, Some(100), &[]);
+        r.budget.steps = Some(10);
+        match d.delegate("g", &r, Spend::default(), T) {
+            Ok(h) => {
+                d.start(&h.node_id, L, None, T).unwrap();
+                d.recover(T, |_| false, |_| None).unwrap();
+                cycles += 1;
+                assert!(cycles <= 10, "spawn+crash outlived a 1000-token goal");
+            }
+            Err(DelegationError::BudgetExhausted { .. }) => break,
+            Err(e) => panic!("{e}"),
+        }
+    }
+    assert_eq!(cycles, 10);
+}
+
+#[test]
+fn a_queued_child_cancelled_before_it_started_refunds_in_full() {
+    let mut d = goal(3, 8);
+    let a = spawn(&mut d, "g", 600);
+    let r = req(Mode::Execute, Some(300), &[]);
+    let a1 = d.delegate(&a.node_id, &r, Spend::default(), T).unwrap();
+    // `a` measured nothing spent and stopped; its queued child never ran.
+    d.settle(&a.node_id, Outcome::Failed, Spend::default(), None, None, T)
+        .unwrap();
+    let gone = d.recover(T, |_| true, |_| None).unwrap();
+    assert_eq!(gone, vec![a1.node_id.clone()]);
+    assert_eq!(d.poll(&a1.node_id).unwrap().status, NodeStatus::Cancelled);
+    assert_eq!(left(&mut d), 1000);
+}
+
+#[test]
+fn a_budget_stop_is_charged_the_whole_carve_and_own_spend_only_grows() {
+    let mut d = goal(2, 8);
+    let a = spawn(&mut d, "g", 600);
+    let small = Spend {
+        tokens: 5,
+        steps: 1,
+    };
+    d.settle(&a.node_id, Outcome::Budget, small, None, None, T)
+        .unwrap();
+    assert_eq!(left(&mut d), 400, "budget means the carve was spent");
+    // The parent's own spend: a lower report than before is refused.
+    let r = req(Mode::Execute, Some(10), &[]);
+    let fifty = Spend {
+        tokens: 50,
+        steps: 5,
+    };
+    d.delegate("g", &r, fifty, T).unwrap();
+    let lower = Spend {
+        tokens: 10,
+        steps: 5,
+    };
+    let e = d.delegate("g", &r, lower, T).unwrap_err();
+    assert!(matches!(e, DelegationError::Invalid(_)), "{e}");
+    // It survives a reopen of the log.
+    let mut fresh = Delegation::open(d.store.clone()).unwrap();
+    assert!(fresh.delegate("g", &r, lower, T).is_err());
+    assert_eq!(fresh.poll("g").unwrap().own, fifty);
 }
