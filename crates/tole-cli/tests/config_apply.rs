@@ -680,3 +680,50 @@ fn an_invalid_user_theme_never_aborts_a_command_and_check_flags_it() {
         "{out}"
     );
 }
+
+// ------------------------------------------------------ tui keys (#463)
+
+#[test]
+fn a_project_config_keys_table_is_ignored_with_one_startup_warning() {
+    let (d, home) = project("[tui.keys]\ntoggle_tools = \"f5\"\n");
+    trust(&d, &home);
+    let o = tole(&d, &home, &["sessions"]);
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    let err = text(&o.stderr);
+    assert_eq!(
+        err.matches("ignoring `tui` in project config").count(),
+        1,
+        "{err}"
+    );
+    assert!(err.contains("keys"), "{err}");
+    let o = tole(&d, &home, &["config", "check"]);
+    let out = text(&o.stdout);
+    assert!(o.status.success(), "{out}");
+    assert!(
+        out.contains("tui.keys = [1 entries]  [config]  IGNORED"),
+        "{out}"
+    );
+    assert!(!out.contains("effective: 1 action"), "{out}");
+}
+
+#[test]
+fn an_invalid_user_keymap_never_aborts_a_command_and_check_flags_it() {
+    let home = user_home("[tui.keys]\ntoggle_tools = \"y\"\n");
+    let d = tmpdir();
+    let o = tole(&d, &home, &["sessions"]);
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    let o = tole(&d, &home, &["config", "check"]);
+    let out = text(&o.stdout);
+    assert!(o.status.success(), "{out} {}", text(&o.stderr));
+    assert!(out.contains("tui.keys = [1 entries]  [user config]"), "{out}");
+    #[cfg(feature = "tui")]
+    assert!(
+        out.contains("INVALID: tui.keys.toggle_tools: \"y\": a bare character"),
+        "{out}"
+    );
+    #[cfg(not(feature = "tui"))]
+    assert!(
+        out.contains("not validated: this build has no TUI") && !out.contains("INVALID"),
+        "{out}"
+    );
+}
