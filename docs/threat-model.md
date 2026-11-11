@@ -148,7 +148,13 @@ workspace `skills/` dir or `~/.codecora/tole/skills/` controls prompt
 content; discovery from a compromised repo is prompt injection by
 another name. Frontmatter is validated loudly (name/dir mismatch is a
 hard error) and bodies are capped (16 KiB) — but content itself is
-trusted by definition, same tier as the system prompt.
+trusted by definition, same tier as the system prompt. A SKILL.md over
+1 MiB is never read (its length is checked first and the read stops one
+byte past the cap): it is left out of every listing with a startup note
+and `load_skill` refuses it, so a cloned repo cannot exhaust memory with
+one huge skill file. A FIFO or other non-regular SKILL.md is refused
+without blocking. The approvals file (#591) is capped at 1 MiB the same
+way.
 
 **Skill index (#590).** With `TOLE_SKILL_INDEX=uteke` a session lists a
 pinned core plus the skills a `uteke doc` index recalls by meaning. The index

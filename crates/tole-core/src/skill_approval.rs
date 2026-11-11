@@ -18,7 +18,10 @@
 //!   any other skill is reported as unavailable, with no description and no
 //!   body.
 
-use crate::skills::{parse_loaded, skill_file, Skill};
+use crate::skills::{
+    parse_loaded, read_capped, read_file_capped, skill_file, ReadCapError, Skill,
+    MAX_SKILL_FILE_BYTES,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -31,6 +34,8 @@ pub const APPROVALS_FILE: &str = "skill-approvals.json";
 pub const MAX_PACKAGE_FILES: usize = 256;
 /// Most bytes a skill package may hold, all files together.
 pub const MAX_PACKAGE_BYTES: u64 = 4 * 1024 * 1024;
+/// Largest approvals file read.
+pub const MAX_APPROVALS_BYTES: u64 = 1024 * 1024;
 
 /// The size limits of a package walk ([`MAX_PACKAGE_FILES`],
 /// [`MAX_PACKAGE_BYTES`] outside tests).
@@ -73,10 +78,12 @@ impl Approvals {
     /// Read `path`. A missing file is no approvals; an unreadable or
     /// malformed one is an error (fail closed, loudly).
     pub fn load(path: &Path) -> Result<Self, String> {
-        match std::fs::read(path) {
+        match read_file_capped(path, MAX_APPROVALS_BYTES) {
             Ok(raw) => serde_json::from_slice(&raw)
                 .map_err(|e| format!("{}: malformed skill approvals: {e}", path.display())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(ReadCapError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                Ok(Self::default())
+            }
             Err(e) => Err(format!("{}: {e}", path.display())),
         }
     }
@@ -165,17 +172,6 @@ fn read_dir_files(dir: &Path, limits: Limits) -> Result<Vec<(String, Vec<u8>)>, 
     walk(dir, "", &mut files, &mut total, limits)?;
     files.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(files)
-}
-
-/// Read at most `remaining` bytes from `r`: `Ok(None)` when it holds more.
-/// Never asks `r` for more than `remaining + 1` bytes, so a file that grew
-/// (or lied about its length) after the size check cannot allocate past
-/// the budget.
-fn read_capped(r: impl std::io::Read, remaining: u64) -> std::io::Result<Option<Vec<u8>>> {
-    use std::io::Read as _;
-    let mut buf = Vec::new();
-    r.take(remaining.saturating_add(1)).read_to_end(&mut buf)?;
-    Ok((buf.len() as u64 <= remaining).then_some(buf))
 }
 
 fn walk(
@@ -315,6 +311,11 @@ impl Gate {
                         name: name.to_string(),
                         hash: pkg.hash,
                     });
+                }
+                if pkg.skill_md().len() as u64 > MAX_SKILL_FILE_BYTES {
+                    return Err(LoadError::Other(format!(
+                        "skill {name:?}: SKILL.md is over {MAX_SKILL_FILE_BYTES} bytes"
+                    )));
                 }
                 let text = std::str::from_utf8(pkg.skill_md()).map_err(|_| {
                     LoadError::Other(format!("skill {name:?}: SKILL.md is not UTF-8"))
@@ -546,6 +547,13 @@ mod tests {
         // A malformed file is an error, never "no approvals" or "all".
         std::fs::write(&path, "{not json").unwrap();
         assert!(Approvals::load(&path).unwrap_err().contains("malformed"));
+        // An oversized one is refused without reading it in full.
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(MAX_APPROVALS_BYTES + 1)
+            .unwrap();
+        let err = Approvals::load(&path).unwrap_err();
+        assert!(err.contains("over 1048576 bytes"), "{err}");
         assert_eq!(format_time(1_700_000_000), "2023-11-14 22:13 UTC");
         let _ = std::fs::remove_dir_all(&ws);
     }
