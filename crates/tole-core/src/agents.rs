@@ -279,6 +279,16 @@ fn agents_root(root: &std::path::Path) -> PathBuf {
     root.join(AGENTS_DIR)
 }
 
+/// The directory child agent dirs live in, under a session's root.
+pub fn agents_dir(root: &std::path::Path) -> PathBuf {
+    agents_root(root)
+}
+
+/// One child agent's dir (its meta, log, pid and `sessions/`).
+pub fn agent_dir(root: &std::path::Path, id: &str) -> PathBuf {
+    agents_root(root).join(id)
+}
+
 /// Result<bool> like jobs.rs (CodeCora PR #174 round 2): a ps failure
 /// must NOT be read as "process dead" — on ps-less hosts that would
 /// consume-and-wipe a live child's mailbox and undercount the cap.
@@ -524,6 +534,28 @@ pub struct AgentStartTool {
     /// parent's list (CodeCora PR #174 round 2 — a non-interactive
     /// parent must not let the model hand a child broader writes).
     pub parent_allows: Vec<String>,
+    /// How the child is launched; [`ChildOpts::default`] is the classic
+    /// `tole run` child at depth 1.
+    pub opts: ChildOpts,
+}
+
+/// Launch options a delegating host (#585) sets on top of the classic
+/// child: the caps there were already enforced by `tole_core::delegation`.
+#[derive(Debug, Clone, Default)]
+pub struct ChildOpts {
+    /// The child subcommand and its own flags (`["mission", "--max-steps",
+    /// ...]`); empty means `run`.
+    pub command: Vec<std::ffi::OsString>,
+    /// The child's depth; 0 means 1.
+    pub depth: u32,
+    /// Set by the delegate tool: the depth refusal and the allow-subset
+    /// check were done by the delegation tree, which may go deeper than 1.
+    pub delegated: bool,
+    /// The delegation log and node id passed to the child.
+    pub delegation: Option<(PathBuf, String)>,
+    /// Secret NAMES the child keeps besides its provider keys (the
+    /// parent grant ∩ the profile's grants).
+    pub keep_secrets: Vec<String>,
 }
 
 impl AgentStartTool {
@@ -536,6 +568,7 @@ impl AgentStartTool {
             max_concurrent: DEFAULT_MAX_CONCURRENT,
             timeout_secs: DEFAULT_TIMEOUT_SECS,
             parent_allows: Vec::new(),
+            opts: ChildOpts::default(),
         }
     }
 
@@ -628,7 +661,7 @@ impl Tool for AgentStartTool {
     }
 
     fn execute(&self, input: Value) -> Result<Value, String> {
-        if self.depth >= 1 {
+        if self.depth >= 1 && !self.opts.delegated {
             return Err(
                 "agent_start: child agents cannot spawn children — the agent tree is capped at \
                  one level (issue #171)"
@@ -810,10 +843,9 @@ impl Tool for AgentStartTool {
         // The child IS a tole session: it gets the scrubbed env plus its
         // provider keys and nothing else secret (#595). Isolation beyond
         // that = depth cap + jail + the approved child allowlist.
-        crate::subprocess::scrub_env_for_child_keeping(
-            &mut cmd,
-            &crate::child_env::PROVIDER_SECRETS,
-        );
+        let mut keep: Vec<&str> = crate::child_env::PROVIDER_SECRETS.to_vec();
+        keep.extend(self.opts.keep_secrets.iter().map(String::as_str));
+        crate::subprocess::scrub_env_for_child_keeping(&mut cmd, &keep);
         // The launch contract (child_env): depth 1, the child's identity
         // and the touch log shared with its siblings (#380), its mailbox
         // room, and for a role child its role and handoff file (#383).
@@ -822,10 +854,16 @@ impl Tool for AgentStartTool {
             touch_log: agents_root(&self.root).join("touch.log"),
             mailbox_room: mailbox_ns.clone(),
             role: role.map(|r| (r, dir.join(HANDOFF_FILE))),
+            depth: self.opts.depth,
+            delegation: self.opts.delegation.clone(),
         };
-        cmd.envs(launch.vars())
-            .arg("run")
-            .arg("--sessions-dir")
+        cmd.envs(launch.vars());
+        if self.opts.command.is_empty() {
+            cmd.arg("run");
+        } else {
+            cmd.args(&self.opts.command);
+        }
+        cmd.arg("--sessions-dir")
             .arg(&sessions_dir)
             .arg("--workspace")
             .arg(&child_cwd);
@@ -1881,6 +1919,7 @@ mod tests {
             max_concurrent: 1,
             timeout_secs: start.timeout_secs,
             parent_allows: Vec::new(),
+            opts: ChildOpts::default(),
         };
         let (r1, r2) = std::thread::scope(|s| {
             let h1 = s.spawn(|| start.execute(json!({"prompt": "a"})));

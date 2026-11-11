@@ -104,6 +104,24 @@ pub struct CronConfig {
 /// Upper bound of `cron.max_concurrent`.
 pub const MAX_CRON_CONCURRENT: usize = 64;
 
+/// The `[delegation]` table (#585). USER LAYER ONLY, like [`CronConfig`]:
+/// it sets how deep and how wide delegation may go and the default budget
+/// of a goal, so a cloned repository must not raise it.
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DelegationConfig {
+    /// Depth below the orchestrator, 1 to 3 (default 2).
+    pub max_depth: Option<u32>,
+    /// Machine guard: delegated processes live at once before spawns queue.
+    pub max_live_processes: Option<u32>,
+    /// A goal's default budget: prompt + completion units of the provider.
+    pub goal_budget: Option<u64>,
+    /// A goal's default provider steps.
+    pub goal_steps: Option<u32>,
+    /// A goal's default wall-clock minutes.
+    pub goal_minutes: Option<u64>,
+}
+
 /// `[profiles.<name>.models]` (#584): model names per task-weight tier.
 /// `default` names the tier a session uses unless something picks another
 /// (the router of #586 is that something; today only `default` is used).
@@ -260,6 +278,8 @@ pub struct Config {
     pub tui: Option<TuiConfig>,
     /// Scheduler limits (#579); user layer only, see [`CronConfig`].
     pub cron: Option<CronConfig>,
+    /// Delegation limits (#585); user layer only, see [`DelegationConfig`].
+    pub delegation: Option<DelegationConfig>,
     /// Dormant profiles (#584); user layer only, see [`ProfileConfig`].
     pub profiles: Option<std::collections::BTreeMap<String, ProfileConfig>>,
     /// Keys (rendered names, e.g. `model`, `mission.verify`) whose value
@@ -466,6 +486,23 @@ pub fn parse(src: &str, path: &Path) -> Result<Config, ConfigError> {
             )));
         }
     }
+    if let Some(d) = &cfg.delegation {
+        let ceiling = tole_core::delegation::MAX_DEPTH_CEILING;
+        if d.max_depth.is_some_and(|n| !(1..=ceiling).contains(&n)) {
+            return Err(range(format!(
+                "delegation.max_depth must be 1 to {ceiling}"
+            )));
+        }
+        let zero = [
+            ("max_live_processes", d.max_live_processes.map(u64::from)),
+            ("goal_budget", d.goal_budget),
+            ("goal_steps", d.goal_steps.map(u64::from)),
+            ("goal_minutes", d.goal_minutes),
+        ];
+        if let Some((k, _)) = zero.iter().find(|(_, v)| *v == Some(0)) {
+            return Err(range(format!("delegation.{k} must be at least 1")));
+        }
+    }
     Ok(cfg)
 }
 
@@ -618,6 +655,8 @@ pub fn layered(project: &Config, user: &Config) -> Config {
         tui: user.tui.clone(),
         // Nor the scheduler limits (#579).
         cron: user.cron.clone(),
+        // Nor the delegation limits (#585).
+        delegation: user.delegation.clone(),
         // Nor profiles (#584): a cloned repository must not define personas,
         // their allow lists or their models.
         profiles: user.profiles.clone(),
@@ -674,6 +713,9 @@ pub const TUI_IGNORED_NOTE: &str =
 /// Suffix of a project config's `cron` lines in `config check` (#579).
 pub const CRON_IGNORED_NOTE: &str =
     "  IGNORED: a project config cannot set scheduler limits (user config only)";
+/// Suffix of a project config's `delegation` lines in `config check` (#585).
+pub const DELEGATION_IGNORED_NOTE: &str =
+    "  IGNORED: a project config cannot set delegation limits (user config only)";
 /// Suffix of a project config's `profiles` line in `config check` (#584).
 pub const PROFILES_IGNORED_NOTE: &str =
     "  IGNORED: a project config cannot define profiles (user config only)";
@@ -709,6 +751,9 @@ pub fn render_with(cfg: &Config, tag: &str, ann: &Annotations) -> Vec<String> {
         }
         if tag == PROJECT_TAG && key.starts_with("cron.") {
             return CRON_IGNORED_NOTE;
+        }
+        if tag == PROJECT_TAG && key.starts_with("delegation.") {
+            return DELEGATION_IGNORED_NOTE;
         }
         if tag == PROJECT_TAG && key == "profiles" {
             return PROFILES_IGNORED_NOTE;
@@ -863,6 +908,26 @@ pub fn render_with(cfg: &Config, tag: &str, ann: &Annotations) -> Vec<String> {
             c.max_concurrent.map(|n| n.to_string()),
         );
     }
+    if let Some(d) = &cfg.delegation {
+        let n = |v: Option<u64>| v.map(|n| n.to_string());
+        scalar(
+            &mut out,
+            "delegation.max_depth",
+            n(d.max_depth.map(u64::from)),
+        );
+        scalar(
+            &mut out,
+            "delegation.max_live_processes",
+            n(d.max_live_processes.map(u64::from)),
+        );
+        scalar(&mut out, "delegation.goal_budget", n(d.goal_budget));
+        scalar(
+            &mut out,
+            "delegation.goal_steps",
+            n(d.goal_steps.map(u64::from)),
+        );
+        scalar(&mut out, "delegation.goal_minutes", n(d.goal_minutes));
+    }
     out
 }
 
@@ -1016,6 +1081,40 @@ verify_timeout = 60
         let m = layered(&project, &c);
         assert_eq!(m.tui, c.tui);
         assert!(m.user_keys.contains("tui.theme") && m.user_keys.contains("tui.colors"));
+    }
+
+    #[test]
+    fn delegation_table_is_bounded_and_user_layer_only() {
+        let user = parse(
+            "[delegation]\nmax_depth = 3\nmax_live_processes = 2\ngoal_budget = 9\n",
+            &p(),
+        )
+        .unwrap();
+        let d = user.delegation.clone().unwrap();
+        assert_eq!(
+            (d.max_depth, d.max_live_processes, d.goal_budget),
+            (Some(3), Some(2), Some(9))
+        );
+        for bad in [
+            "max_depth = 4",
+            "max_depth = 0",
+            "max_live_processes = 0",
+            "goal_steps = 0",
+            "depth = 2",
+        ] {
+            assert!(
+                parse(&format!("[delegation]\n{bad}\n"), &p()).is_err(),
+                "{bad}"
+            );
+        }
+        let project = parse("[delegation]\nmax_depth = 3\n", &p()).unwrap();
+        assert_eq!(layered(&project, &Config::default()).delegation, None);
+        assert_eq!(layered(&project, &user).delegation, user.delegation);
+        let shown = render(&project).join("\n");
+        assert!(
+            shown.contains("delegation.max_depth = 3") && shown.contains("IGNORED"),
+            "{shown}"
+        );
     }
 
     #[test]

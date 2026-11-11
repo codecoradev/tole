@@ -853,6 +853,42 @@ fn fill_carries_only_low_risk_provider_values() {
 
 /// #584: a selected profile sits between the per-key flags and the env.
 #[test]
+fn a_delegated_child_takes_allow_and_trust_only_from_its_flags() {
+    let user = cfg(
+        "allow = [\"cfg_*\"]\ntrust = [\"workspace\"]\n[profiles.coder]\nallow = [\"write_*\"]\n",
+    );
+    let profile = crate::profile::Profile::resolve(&user, "coder", None, None).unwrap();
+    let env = env_of(&[
+        ("TOLE_TRUST", "internal"),
+        ("TOLE_DELEGATION_LOG", "/a/delegation.jsonl"),
+        ("TOLE_DELEGATION_NODE", "g-1.1"),
+    ]);
+    let flags = Flags {
+        profile: Some(profile.clone()),
+        ..Flags::default()
+    };
+    let st = Settings::resolve(&flags, &user, &env);
+    assert_eq!(st.allow, None, "no profile, config or env allow");
+    assert_eq!(st.trust, None, "no config or env trust");
+    let flags = Flags {
+        profile: Some(profile),
+        allow: vec!["write_file".into()],
+        ..Flags::default()
+    };
+    let st = Settings::resolve(&flags, &user, &env);
+    assert_eq!(st.allow.unwrap().value, vec!["write_file".to_string()]);
+    // Not delegated: the profile's allow applies as before.
+    let plain = env_of(&[("TOLE_TRUST", "internal")]);
+    let flags = Flags {
+        profile: Some(crate::profile::Profile::resolve(&user, "coder", None, None).unwrap()),
+        ..Flags::default()
+    };
+    let st = Settings::resolve(&flags, &user, &plain);
+    assert_eq!(st.allow.unwrap().value, vec!["write_*".to_string()]);
+    assert!(st.trust.is_some());
+}
+
+#[test]
 fn profile_layer_is_below_flags_and_above_env_and_config() {
     let user = cfg(
         "model = \"cfg-model\"\nsystem_prompt = \"cfg prompt\"\nallow = [\"cfg_*\"]\n\

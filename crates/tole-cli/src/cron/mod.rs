@@ -23,7 +23,7 @@ pub mod agent;
 pub mod deliver;
 pub mod setup;
 pub mod status;
-pub mod store;
+pub use crate::ledger_file as store;
 pub mod tick;
 
 use std::path::{Path, PathBuf};

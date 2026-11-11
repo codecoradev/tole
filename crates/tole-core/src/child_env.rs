@@ -29,6 +29,10 @@ pub const MEMORY: &str = "TOLE_MEMORY";
 /// The uteke room of the memory loop; for a child, its mailbox room
 /// (`agent-<id>`). The name predates rooms.
 pub const MEMORY_ROOM: &str = "TOLE_MEMORY_NAMESPACE";
+/// The delegation log a delegated child shares with its whole tree (#585).
+pub const DELEGATION_LOG: &str = "TOLE_DELEGATION_LOG";
+/// The delegated child's node id in that log (#585).
+pub const DELEGATION_NODE: &str = "TOLE_DELEGATION_NODE";
 
 /// The secret-shaped variables a child agent keeps (#595): the provider
 /// keys its own provider chain reads (`TOLE_*`, `OPENAI_*`, the #209
@@ -48,13 +52,18 @@ pub struct ChildLaunch {
     pub mailbox_room: String,
     /// The handoff role and the handoff file, for a role child.
     pub role: Option<(Role, PathBuf)>,
+    /// The child's depth (1 for `agent_start`; the node depth when
+    /// delegated).
+    pub depth: u32,
+    /// The delegation log and the child's node id, when delegated (#585).
+    pub delegation: Option<(PathBuf, String)>,
 }
 
 impl ChildLaunch {
     /// The environment variables to set on the child process.
     pub fn vars(&self) -> Vec<(&'static str, OsString)> {
         let mut vars = vec![
-            (DEPTH, OsString::from("1")),
+            (DEPTH, OsString::from(self.depth.max(1).to_string())),
             (AGENT_ID, OsString::from(&self.id)),
             (TOUCH_LOG, self.touch_log.clone().into_os_string()),
             (MEMORY_ROOM, OsString::from(&self.mailbox_room)),
@@ -63,6 +72,10 @@ impl ChildLaunch {
         if let Some((role, handoff)) = &self.role {
             vars.push((ROLE, OsString::from(role.as_str())));
             vars.push((HANDOFF, handoff.clone().into_os_string()));
+        }
+        if let Some((log, node)) = &self.delegation {
+            vars.push((DELEGATION_LOG, log.clone().into_os_string()));
+            vars.push((DELEGATION_NODE, OsString::from(node)));
         }
         vars
     }
@@ -83,6 +96,19 @@ pub fn sibling(env: &dyn Fn(&str) -> Option<String>) -> Option<(String, PathBuf)
         return None;
     }
     Some((agent, PathBuf::from(log)))
+}
+
+/// This delegated child's log and node id (#585): both present, the log
+/// absolute and the node id in the delegation id charset.
+pub fn delegation(env: &dyn Fn(&str) -> Option<String>) -> Option<(PathBuf, String)> {
+    let log = PathBuf::from(env(DELEGATION_LOG)?.trim());
+    let node = env(DELEGATION_NODE)?.trim().to_string();
+    let ok = !node.is_empty()
+        && node.len() <= 128
+        && node
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "-_.".contains(c));
+    (log.is_absolute() && ok).then_some((log, node))
 }
 
 /// This child's handoff role and handoff file (#383). Both must be present
@@ -115,6 +141,8 @@ mod tests {
             touch_log: PathBuf::from("/agents/touch.log"),
             mailbox_room: "agent-a-1f-2-0".into(),
             role,
+            depth: 1,
+            delegation: None,
         }
     }
 
@@ -137,6 +165,23 @@ mod tests {
 
         let plain = env_of(launch(None).vars());
         assert_eq!(role(&plain), None, "no role without a role launch");
+        assert_eq!(delegation(&plain), None);
+
+        let mut deep = launch(None);
+        deep.depth = 2;
+        deep.delegation = Some((PathBuf::from("/a/delegation.jsonl"), "g-1.2.1".into()));
+        let env = env_of(deep.vars());
+        assert_eq!(depth(&env), 2);
+        assert_eq!(
+            delegation(&env),
+            Some((PathBuf::from("/a/delegation.jsonl"), "g-1.2.1".into()))
+        );
+        let rel = |k: &str| match k {
+            DELEGATION_LOG => Some("rel.jsonl".into()),
+            DELEGATION_NODE => Some("g.1".into()),
+            _ => None,
+        };
+        assert_eq!(delegation(&rel), None, "a relative log is not trusted");
     }
 
     #[test]

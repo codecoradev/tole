@@ -845,6 +845,15 @@ skip one:
 The report and the summary are model-authored text: they are recorded and
 shown, never executed or trusted as instructions.
 
+Launch contract (#585 part 2, used by the delegate tool in the next PR): a
+delegated child carries the log path and its node id (`TOLE_DELEGATION_LOG`,
+`TOLE_DELEGATION_NODE`, the log absolute and the id charset-checked) and its
+real depth. It takes allow patterns and trust presets ONLY from the flags its
+parent passed (parent ∩ profile): its profile's `allow`, the config's
+`allow`/`trust` and `TOLE_TRUST` are ignored, since any of them could be wider
+than what the parent granted. `[delegation]` limits come from the user config
+only.
+
 ### User config (#433)
 
 `$CODECORA_HOME/tole/config.toml` (default `~/.codecora/tole/config.toml`) has

@@ -273,7 +273,8 @@ Bot and Nakama; BMAD for collaboration). Design notes:
     the PR for #584; `tole cron create --profile` in the #579 closing PR);
   - delegation with budget carve, depth 2 (max 3), write lease and a
     mandatory report (#585; the `tole_core::delegation` tree with all the
-    caps is in, the delegate tool, `tole audit` and the profile wiring
+    caps is in, and the `[delegation]` limits and the delegated-child
+    launch contract; the delegate tool, `tole audit` and the profile wiring
     follow);
   - model routing with RuleRouter plus LayaRouter, on/off by the
     `SYSTEMONE_*` env (#586);

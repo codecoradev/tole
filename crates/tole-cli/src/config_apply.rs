@@ -551,7 +551,12 @@ impl Settings {
             flags.system.clone(),
             prof.and_then(|p| p.system_prompt.clone()),
         );
+        // A delegated child (#585) gets exactly the allow patterns and trust
+        // presets its parent passed as flags (parent ∩ profile): never the
+        // profile's, the config's or the environment's, which could be wider.
+        let delegated = tole_core::child_env::delegation(env).is_some();
         let (allow_flag, allow_source) = match prof {
+            _ if delegated => (flags.allow.clone(), Source::Flag),
             Some(p) if flags.allow.is_empty() && !p.allow.is_empty() => {
                 (p.allow.clone(), Source::Profile)
             }
@@ -605,9 +610,13 @@ impl Settings {
             max_steps: num(flags.max_steps, mission.max_steps),
             max_minutes: num(flags.max_minutes, mission.max_minutes),
             max_tokens: num(flags.max_tokens, mission.max_tokens),
-            trust: resolve_list(&flags.trust, &env_trust, cfg.trust.as_deref())
-                .map(|p| Eff::from_pair(p, "TOLE_TRUST")),
-            allow: list(&allow_flag, &cfg.allow).map(|mut e| {
+            trust: if delegated {
+                resolve_list(&flags.trust, &[], None).map(|p| Eff::from_pair(p, "TOLE_TRUST"))
+            } else {
+                resolve_list(&flags.trust, &env_trust, cfg.trust.as_deref())
+                    .map(|p| Eff::from_pair(p, "TOLE_TRUST"))
+            },
+            allow: list(&allow_flag, if delegated { &None } else { &cfg.allow }).map(|mut e| {
                 if e.source == Source::Flag {
                     e.source = allow_source;
                 }
