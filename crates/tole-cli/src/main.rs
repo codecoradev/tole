@@ -503,6 +503,12 @@ enum Command {
         /// run/chat. Falls back to the TOLE_MEMORY env.
         #[arg(long)]
         memory: Option<String>,
+
+        /// Host the cron ticker in-process (#579): one scheduler pass per
+        /// minute over `$TOLE_CRON_DIR`. Agent runs park non-allowlisted
+        /// Writes in this server's `/approvals` queue (never auto-approved).
+        #[arg(long)]
+        cron: bool,
     },
     /// Interactive terminal UI (what bare `tole` opens on a TTY).
     #[cfg(feature = "tui")]
@@ -1204,6 +1210,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             allow_patterns: _,
             workspace,
             memory,
+            cron,
         } => {
             let allow_patterns = with_trust(config_apply::values(&settings.allow), &trust_extra);
             // Loud bails, same rule as `tole mcp`/`tole acp`: these host
@@ -1259,6 +1266,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                 memory,
                 sessions_dir: sessions_dir_override,
                 turnend: host.on_turnend.clone(),
+                cron,
             })
         }
         Command::Sessions { tree: true, .. } => sessions_tree_command(&sessions_dir),

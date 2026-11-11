@@ -2,15 +2,17 @@
 //! ledger core (`tole_core::ledger`, #578). Design: `docs/automation-design.md`
 //! §4–5, §8.
 //!
-//! This part ships the job store (`<dir>/jobs.jsonl`, see [`store`]), the
-//! `create | list | pause | resume | remove | runs | tick` surface and the
-//! **script** mode (argv, no shell, zero LLM tokens). Agent-mode jobs can be
-//! saved, but until the agent runner lands a due agent job is recorded as
-//! `blocked` (`agent_mode_unavailable`) — visible, zero tokens, never run
-//! with a weaker approver.
+//! The job store (`<dir>/jobs.jsonl`, see [`store`]), the
+//! `create | list | pause | resume | remove | runs | tick` surface, the
+//! **script** mode (argv, no shell, zero LLM tokens) and the **agent** mode
+//! (one durable session per run, see [`agent`]: non-allowlisted Writes are
+//! parked in `/approvals` under `tole serve --cron` and refused by a
+//! standalone tick; never auto-approved). An agent job with no provider
+//! configured is recorded as `blocked` (`provider_missing`) before it runs.
 //!
 //! The cron dir is `$TOLE_CRON_DIR`, else `<codecora home>/tole/cron`.
 
+pub mod agent;
 pub mod store;
 pub mod tick;
 
@@ -27,14 +29,16 @@ pub use tick::{tick, TickOptions, TickReport};
 /// Default per-run timeout of a script job, in seconds.
 pub const DEFAULT_TIMEOUT_SECS: u64 = 300;
 
-/// `tole cron <action>`.
+/// `tole cron <action>`. Parsed once per process, so the size difference
+/// between `Create` and the other variants costs nothing worth boxing.
 #[derive(Subcommand, Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum CronAction {
     /// Save a job. SCHEDULE is 5-field cron (`0 9 * * 1-5`), a macro
     /// (`@daily`) or `@every 30m`, in UTC. With --script the job runs that
     /// command (argv, no shell, zero tokens); otherwise PROMPT is an agent
-    /// job (agent runs land in a follow-up; until then they are recorded
-    /// as blocked).
+    /// job: one session per run, Writes only via --allow (anything else is
+    /// parked under `tole serve --cron`, refused by `tole cron tick`).
     Create {
         schedule: String,
         /// The agent prompt (agent mode) or a free-text note (script mode).
@@ -63,9 +67,16 @@ pub enum CronAction {
         catch_up: CatchUpArg,
         #[arg(long, default_value_t = 0)]
         grace_minutes: u32,
-        /// Per-run timeout in seconds [default: 300].
+        /// Per-run timeout of a script job in seconds [default: 300].
         #[arg(long)]
         timeout: Option<u64>,
+        /// Agent runs: tool-call budget [default: 32]; past it the run
+        /// settles `budget`.
+        #[arg(long)]
+        max_steps: Option<u64>,
+        /// Agent runs: wall-clock budget in minutes [default: 15].
+        #[arg(long)]
+        max_minutes: Option<u64>,
         /// Save the job paused.
         #[arg(long)]
         paused: bool,
@@ -109,6 +120,8 @@ pub struct CreateSpec {
     pub catch_up_one: bool,
     pub grace_minutes: u32,
     pub timeout_secs: Option<u64>,
+    pub max_steps: Option<u64>,
+    pub max_minutes: Option<u64>,
     pub paused: bool,
 }
 
@@ -206,6 +219,18 @@ pub fn create(dir: &Path, spec: CreateSpec, now: i64) -> anyhow::Result<Job> {
     }
     if let Some(m) = spec.model {
         extra.insert("model".into(), m.into());
+    }
+    for (key, v) in [
+        ("max_steps", spec.max_steps),
+        ("max_minutes", spec.max_minutes),
+    ] {
+        match v {
+            Some(0) => bail!("--{} must be at least 1", key.replace('_', "-")),
+            Some(n) => {
+                extra.insert(key.into(), n.into());
+            }
+            None => {}
+        }
     }
     extra.insert("created_by".into(), "cli".into());
     let job = Job {
@@ -370,6 +395,8 @@ pub fn cli(action: CronAction) -> anyhow::Result<()> {
             catch_up,
             grace_minutes,
             timeout,
+            max_steps,
+            max_minutes,
             paused,
         } => {
             let workdir = match workdir {
@@ -390,6 +417,8 @@ pub fn cli(action: CronAction) -> anyhow::Result<()> {
                     catch_up_one: matches!(catch_up, CatchUpArg::One),
                     grace_minutes,
                     timeout_secs: timeout,
+                    max_steps,
+                    max_minutes,
                     paused,
                 },
                 t,
@@ -451,7 +480,7 @@ pub fn cli(action: CronAction) -> anyhow::Result<()> {
             }
         }
         CronAction::Tick { max_concurrent } => {
-            let r = tick(&dir, t, &TickOptions { max_concurrent })?;
+            let r = tick(&dir, t, &TickOptions::standalone(max_concurrent))?;
             println!(
                 "tick: ran {}, recovered {}, missed {}, blocked {}",
                 r.ran.len(),
@@ -462,4 +491,34 @@ pub fn cli(action: CronAction) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// The `tole serve --cron` ticker: one tick per minute, just after the
+/// minute boundary (cron occurrences are minute-aligned; jobs saved by
+/// another process are seen at the next pass). Agent runs park
+/// non-allowlisted Writes in `approvals`. Never returns; a failed pass is
+/// logged and retried at the next minute.
+pub fn serve_ticker(dir: &Path, approvals: std::sync::Arc<crate::approvals::ApprovalQueue>) {
+    let opts = TickOptions {
+        max_concurrent: 4,
+        approvals: Some(approvals),
+    };
+    loop {
+        let t = now();
+        match tick(dir, t, &opts) {
+            Ok(r) if !r.ran.is_empty() || r.recovered > 0 || r.blocked > 0 || r.missed > 0 => {
+                eprintln!(
+                    "tole serve: cron tick ran {}, recovered {}, missed {}, blocked {}",
+                    r.ran.len(),
+                    r.recovered,
+                    r.missed,
+                    r.blocked
+                );
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("tole serve: cron tick failed: {e:#}"),
+        }
+        let wait = 60 - now().rem_euclid(60) + 1;
+        std::thread::sleep(std::time::Duration::from_secs(wait as u64));
+    }
 }

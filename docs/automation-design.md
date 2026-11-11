@@ -128,6 +128,11 @@ and process spawning live in `tole-cli`.
   a pending approval in the existing `/approvals` queue (15-min expiry →
   denied), the run ends `awaiting_approval`, and approve/deny resumes it
   through the shipped remote-approval path.
+  **As implemented (#579):** parking needs the in-memory queue of a
+  running server, so it applies to runs hosted by `tole serve --cron`. A
+  standalone `tole cron tick` has no queue: it refuses a Write the job's
+  `allow` list does not cover, and the run settles `awaiting_approval`.
+  Neither path ever auto-approves; resuming an approved run is #581.
 - `mode: script` (Hermes `no_agent`): argv via the `run_command` machinery
   (no shell, cwd jail, timeout, output cap), stdout is the result, **zero
   LLM tokens**. Empty output or a `[SILENT]` first line = nothing delivered.
