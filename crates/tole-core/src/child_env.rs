@@ -33,6 +33,8 @@ pub const MEMORY_ROOM: &str = "TOLE_MEMORY_NAMESPACE";
 pub const DELEGATION_LOG: &str = "TOLE_DELEGATION_LOG";
 /// The delegated child's node id in that log (#585).
 pub const DELEGATION_NODE: &str = "TOLE_DELEGATION_NODE";
+/// Where a delegated child writes its one completion report (#585).
+pub const DELEGATION_REPORT: &str = "TOLE_DELEGATION_REPORT";
 
 /// The secret-shaped variables a child agent keeps (#595): the provider
 /// keys its own provider chain reads (`TOLE_*`, `OPENAI_*`, the #209
@@ -57,6 +59,8 @@ pub struct ChildLaunch {
     pub depth: u32,
     /// The delegation log and the child's node id, when delegated (#585).
     pub delegation: Option<(PathBuf, String)>,
+    /// The completion report file, for a delegated child (#585).
+    pub report: Option<PathBuf>,
 }
 
 impl ChildLaunch {
@@ -77,6 +81,9 @@ impl ChildLaunch {
             vars.push((DELEGATION_LOG, log.clone().into_os_string()));
             vars.push((DELEGATION_NODE, OsString::from(node)));
         }
+        if let Some(report) = &self.report {
+            vars.push((DELEGATION_REPORT, report.clone().into_os_string()));
+        }
         vars
     }
 }
@@ -96,6 +103,16 @@ pub fn sibling(env: &dyn Fn(&str) -> Option<String>) -> Option<(String, PathBuf)
         return None;
     }
     Some((agent, PathBuf::from(log)))
+}
+
+/// This delegated child's report file (#585): set, absolute and named
+/// [`crate::delegation_report::REPORT_FILE`].
+pub fn delegation_report(env: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    let p = PathBuf::from(env(DELEGATION_REPORT)?.trim());
+    let named = p
+        .file_name()
+        .is_some_and(|n| n == crate::delegation_report::REPORT_FILE);
+    (p.is_absolute() && named).then_some(p)
 }
 
 /// This delegated child's log and node id (#585): both present, the log
@@ -148,6 +165,7 @@ mod tests {
             role,
             depth: 1,
             delegation: None,
+            report: None,
         }
     }
 
@@ -171,6 +189,18 @@ mod tests {
         let plain = env_of(launch(None).vars());
         assert_eq!(role(&plain), None, "no role without a role launch");
         assert_eq!(delegation(&plain), None);
+        assert_eq!(delegation_report(&plain), None);
+        let mut rep = launch(None);
+        rep.report = Some(PathBuf::from("/a/tole-agents/x/report.json"));
+        let env = env_of(rep.vars());
+        assert_eq!(
+            delegation_report(&env),
+            Some(PathBuf::from("/a/tole-agents/x/report.json"))
+        );
+        for bad in ["rel/report.json", "/a/other.json"] {
+            let env = |k: &str| (k == DELEGATION_REPORT).then(|| bad.to_string());
+            assert_eq!(delegation_report(&env), None, "{bad}");
+        }
 
         let mut deep = launch(None);
         deep.depth = 2;

@@ -759,6 +759,11 @@ impl Tool for AgentStartTool {
         if role.is_some() && !allows.iter().any(|a| a == "handoff_submit") {
             allows.push("handoff_submit".to_string());
         }
+        // Likewise a delegated child's `delegate_report` (#585): one capped
+        // file at the path chosen here.
+        if self.opts.delegated && !allows.iter().any(|a| a == "delegate_report") {
+            allows.push("delegate_report".to_string());
+        }
         // Issue #234: hold the flock across count + register — the
         // count-then-spawn window is the TOCTOU the scan flagged. The
         // guard releases when `_lock` drops (spawn errors included).
@@ -861,6 +866,10 @@ impl Tool for AgentStartTool {
             role: role.map(|r| (r, dir.join(HANDOFF_FILE))),
             depth: self.opts.depth,
             delegation: self.opts.delegation.clone(),
+            report: self
+                .opts
+                .delegated
+                .then(|| dir.join(crate::delegation_report::REPORT_FILE)),
         };
         cmd.envs(launch.vars());
         if self.opts.command.is_empty() {

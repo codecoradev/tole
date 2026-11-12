@@ -909,15 +909,30 @@ The delegate tool (#585 part 3, `crates/tole-cli/src/delegate.rs`) adds:
   new spawn joins the queue behind older ones, and a queued writer whose
   workspace lease is taken holds the queue until it frees. An exited but
   unreaped child process (a zombie) counts as gone, so its slot frees on the
-  next delegate without a poll.
+  next delegate without a poll. The file kept next to the log for a queued
+  spawn holds only what carries no authority (role, artifacts to read, mailbox
+  choice): allow list, budget, depth, mode, task, workspace and profile are
+  read back from the node the tree recorded and the secrets are recomputed, so
+  a queued sibling cannot be widened through that file.
 - **One canonical root.** The host canonicalizes the session root once; the
   log key, the agents dir, the agent dirs recorded in the log and every poll
   lookup use that one value, so a symlinked or `..` workspace path still
-  finds and settles its children. The file kept next to the
-  log for it holds only what carries no authority (role, artifacts to read,
-  mailbox choice): allow list, budget, depth, mode, task, workspace and profile
-  are read back from the node the tree recorded and the secrets are recomputed,
-  so a queued sibling cannot be widened through that file.
+  finds and settles its children.
+- **Completion report (#585 part 4).** A delegated child gets the
+  harness-owned `delegate_report` tool (its parent adds exactly that name to
+  its allow list, like `handoff_submit`). It writes ONE report, at most 64 KiB,
+  to `<agent dir>/report.json` (`TOLE_DELEGATION_REPORT`): created new, never
+  through a symlink, a second submission refused. Every field is capped and
+  control or invisible characters are escaped. The PARENT reads the file when
+  it settles the child (on poll, or on the next delegate for a child whose
+  process is gone): only through a plain agent dir at its canonical path,
+  without following a symlink, with the size cap applied before parsing, and
+  cleaned again. It records the report in the log itself; the child never
+  writes the log. A child that ends without a complete report settles
+  `incomplete` with the reasons; a missing, oversized, symlinked or invalid
+  report counts as none, and a child whose agent dir is not plain is charged
+  its whole carve. The report reaches the parent model only between fence
+  markers it cannot contain, labeled as data, not instructions.
 - **Where the files live.** The log, its lock and the queue files live in the
   tole data dir, `<codecora home>/tole/delegation/<hash of the canonical
   workspace root>/`, outside every workspace, so a child's jailed file tools
