@@ -25,9 +25,10 @@ pub struct Gate {
     /// Project-lock notes and lock read errors.
     pub notes: Vec<String>,
     user_path: Option<PathBuf>,
-    /// The user lock could not be read: nothing is trusted, and nothing is
-    /// written over it.
-    user_broken: bool,
+    /// The lock that could not be read when the session started (user or
+    /// project): nothing is trusted, and no approval is written until it is
+    /// fixed and the session restarted, even if the file reads fine later.
+    broken: Option<PathBuf>,
 }
 
 fn now() -> u64 {
@@ -41,11 +42,11 @@ impl Gate {
     /// project lock of `workspace`. An unreadable lock trusts nothing.
     pub fn load(user: Option<PathBuf>, workspace: &Path) -> Self {
         let mut notes = Vec::new();
-        let mut user_broken = false;
+        let mut broken = None;
         let user_lock = match user.as_deref().map(Lockfile::load) {
             Some(Ok(l)) => l,
             Some(Err(e)) => {
-                user_broken = true;
+                broken = user.clone();
                 notes.push(format!(
                     "plugin lock: {e}; no MCP server is trusted until it is fixed"
                 ));
@@ -53,7 +54,8 @@ impl Gate {
             }
             None => Lockfile::default(),
         };
-        let project = match Lockfile::load(&Lockfile::project_path(workspace)) {
+        let project_path = Lockfile::project_path(workspace);
+        let project = match Lockfile::load(&project_path) {
             Ok(l) => l,
             Err(e) => {
                 notes.push(format!(
@@ -63,7 +65,7 @@ impl Gate {
                     lock: BTreeMap::new(),
                     notes,
                     user_path: user,
-                    user_broken: true,
+                    broken: Some(project_path),
                 };
             }
         };
@@ -73,7 +75,7 @@ impl Gate {
             lock,
             notes,
             user_path: user,
-            user_broken,
+            broken,
         }
     }
 
@@ -107,10 +109,11 @@ impl Gate {
             .user_path
             .clone()
             .ok_or("plugin lock: no tole data dir to write the user lock to")?;
-        if self.user_broken {
+        if let Some(b) = &self.broken {
             return Err(format!(
-                "plugin lock: {} is unreadable; fix or remove it before approving",
-                path.display()
+                "plugin lock: {} was unreadable when this session started; fix or remove it \
+                 and start again before approving",
+                b.display()
             ));
         }
         let mut lock = Lockfile::load(&path)?;

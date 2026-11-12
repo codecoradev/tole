@@ -126,3 +126,43 @@ fn the_approval_text_is_complete_and_terminal_safe() {
         assert!(!text.contains(bad), "{bad:?} in {text}");
     }
 }
+
+#[test]
+fn a_lock_unreadable_at_start_blocks_approval_even_once_it_reads_again() {
+    // The explicit check, on its own: the session started on a broken user
+    // lock, which is repaired before the prompt is answered. Re-reading it
+    // would now succeed, but this session trusted nothing and must not
+    // approve over a file it never validated.
+    let dir = tmp("repaired");
+    let user = dir.join(plugin_lock::LOCK_FILE);
+    std::fs::write(&user, "{broken").unwrap();
+    let ws = tmp("repaired-ws");
+    let mut gate = Gate::load(Some(user.clone()), &ws);
+    Lockfile::default().save(&user).unwrap();
+    let repaired = std::fs::read_to_string(&user).unwrap();
+    let e = gate
+        .approve("cora", "stdio:cora mcp", "1", &tools())
+        .unwrap_err();
+    assert!(
+        e.contains(&user.display().to_string()) && e.contains("start again"),
+        "{e}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&user).unwrap(),
+        repaired,
+        "nothing written"
+    );
+    assert!(gate.check("cora", "1", &tools()).is_err());
+    // A broken PROJECT lock blocks approval too, and the error names it
+    // (it may hold a revocation this session could not see).
+    let ws2 = tmp("broken-project-ws");
+    std::fs::create_dir_all(ws2.join(".tole")).unwrap();
+    std::fs::write(Lockfile::project_path(&ws2), "{broken").unwrap();
+    let user2 = tmp("broken-project").join(plugin_lock::LOCK_FILE);
+    let mut gate = Gate::load(Some(user2.clone()), &ws2);
+    let e = gate
+        .approve("cora", "stdio:cora mcp", "1", &tools())
+        .unwrap_err();
+    assert!(e.contains(".tole"), "names the project lock: {e}");
+    assert!(!user2.exists(), "no user lock written");
+}
