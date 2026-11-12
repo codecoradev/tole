@@ -296,9 +296,11 @@ pub fn build(approver: impl Approver + 'static, roster: Roster) -> Result<ToolRe
     ) = (&roster.agents, depth, plan)
     {
         let bin = std::env::current_exe().context("resolving the tole binary for child agents")?;
-        let start = tole_core::agents::AgentStartTool::new(bin, root.clone())
+        let mut start = tole_core::agents::AgentStartTool::new(bin, root.clone())
             .with_worktrees(agents.worktrees)
             .with_parent_allows(agents.parent_allows.clone());
+        // The child session gets this session's grant, no more (#598).
+        start.opts.keep_secrets = tole_core::secret_release::release().held_grants();
         add(&mut reg, Box::new(start))?;
         add(
             &mut reg,

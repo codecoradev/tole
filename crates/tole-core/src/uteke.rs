@@ -90,7 +90,7 @@ impl Tool for UtekeRecallTool {
             return Err("query must not start with '-'".into());
         }
         let mut cmd = Command::new("uteke");
-        crate::subprocess::scrub_env_for_child(&mut cmd);
+        crate::subprocess::scrub_env_for(&mut cmd, "uteke");
         match input.get("room").and_then(Value::as_str) {
             Some(room) if !room.trim().is_empty() => {
                 // Same argv-flag-injection defense as UtekeDocumentTool:
@@ -251,7 +251,7 @@ impl Tool for UtekeDocumentTool {
         //    pipes — no deadlock on large documents — and the hard
         //    subprocess timeout every other invocation gets.
         let mut cmd = Command::new(&self.bin);
-        crate::subprocess::scrub_env_for_child(&mut cmd);
+        crate::subprocess::scrub_env_for(&mut cmd, "uteke");
         cmd.arg("doc")
             .arg("create")
             .arg(slug)
@@ -276,7 +276,7 @@ impl Tool for UtekeDocumentTool {
             let mut link = Command::new(&self.bin);
             // ENV-1: same secret scrubbing as every other spawn point
             // (CodeCora scan 2026-09-18 — this spawn point missed it).
-            crate::subprocess::scrub_env_for_child(&mut link);
+            crate::subprocess::scrub_env_for(&mut link, "uteke");
             link.arg("room")
                 .arg("add-document")
                 .arg(room)

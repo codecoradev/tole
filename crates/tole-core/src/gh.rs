@@ -371,7 +371,7 @@ impl Tool for GhTool {
         let argv = op.argv(&input)?;
         let repo = resolve_repo(&input, &self.repo)?;
         let mut cmd = Command::new(&self.bin);
-        crate::subprocess::scrub_env_for_child(&mut cmd);
+        crate::subprocess::scrub_env_for(&mut cmd, "gh");
         cmd.args(&argv).arg("--repo").arg(&repo);
         if let Some(dir) = &self.workdir {
             cmd.current_dir(dir);

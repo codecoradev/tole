@@ -14,7 +14,7 @@
 //! state.
 
 use serde::Deserialize;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -216,6 +216,111 @@ pub struct ProfileConfig {
     pub models: Option<ModelTiers>,
 }
 
+/// One `[secrets]` entry (#598): the tools (and tole launchers) whose
+/// child processes may receive this secret. The KEY is the environment
+/// variable's NAME; a value never belongs in a config file.
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecretBinding {
+    pub tools: Vec<String>,
+}
+
+/// A `[secrets]` key: a secret-shaped environment variable NAME.
+fn check_secret(name: &str, b: &SecretBinding) -> Result<(), String> {
+    // Never echo the key or an entry: either may be a value pasted by mistake.
+    if !valid_grant_name(name) || !tole_core::secrets::is_secret_name(name) {
+        return Err(
+            "secrets: every key must be the NAME of a secret environment variable \
+                    ([A-Z0-9_], containing TOKEN, SECRET, API_KEY, PASSWORD, ...), e.g. \
+                    GITHUB_TOKEN; other variables already reach every child"
+                .into(),
+        );
+    }
+    let tool_ok = |t: &str| {
+        !t.is_empty()
+            && t.len() <= 64
+            && t.bytes()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_')
+    };
+    if !b.tools.iter().all(|t| tool_ok(t)) {
+        return Err(format!(
+            "secrets.{name}.tools: every entry must be a tool name of a-z, 0-9 or `_` \
+             (e.g. \"gh\", \"git\", \"run_command\")"
+        ));
+    }
+    Ok(())
+}
+
+/// The consumers a layer leaves `name` bound to: its own entry, else the
+/// built-in default (`GITHUB_TOKEN` for gh, git, hook and mcp).
+fn bound_tools(layer: &Option<BTreeMap<String, SecretBinding>>, name: &str) -> Vec<String> {
+    match layer.as_ref().and_then(|m| m.get(name)) {
+        Some(b) => b.tools.clone(),
+        None => tole_core::secret_release::Release::default()
+            .tools(name)
+            .map(|t| t.iter().cloned().collect())
+            .unwrap_or_default(),
+    }
+}
+
+/// The `[secrets]` of the layered config (#598): the user layer's entries,
+/// where a project entry may only NARROW a binding (its tools ∩ the user's
+/// or the default's). A project file comes from a cloned repository; it
+/// must never hand a secret to a tool the user did not.
+fn layered_secrets(
+    project: &Option<BTreeMap<String, SecretBinding>>,
+    user: &Option<BTreeMap<String, SecretBinding>>,
+) -> Option<BTreeMap<String, SecretBinding>> {
+    let mut out = user.clone().unwrap_or_default();
+    for (name, b) in project.iter().flatten() {
+        let allowed = bound_tools(user, name);
+        let tools = b
+            .tools
+            .iter()
+            .filter(|t| allowed.contains(t))
+            .cloned()
+            .collect();
+        out.insert(name.clone(), SecretBinding { tools });
+    }
+    (project.is_some() || user.is_some()).then_some(out)
+}
+
+/// One warning per project `[secrets]` entry that tries to WIDEN a binding
+/// (those tools are refused), naming the remedy.
+pub fn secrets_widening_warnings(project: &Config, user: &Config, shown: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for (name, b) in project.secrets.iter().flatten() {
+        let allowed = bound_tools(&user.secrets, name);
+        let refused: Vec<&str> = b
+            .tools
+            .iter()
+            .filter(|t| !allowed.contains(t))
+            .map(String::as_str)
+            .collect();
+        if !refused.is_empty() {
+            out.push(format!(
+                "ignoring the grant of {name} to {} in project config {shown}: a project config \
+                 can only narrow a secret's tools. To grant it, add the tools to `{name}` under \
+                 [secrets] in your user config",
+                refused.join(", ")
+            ));
+        }
+    }
+    out
+}
+
+impl Config {
+    /// The secret release this config sets (#598): the defaults, with each
+    /// `[secrets]` entry replacing its name's binding.
+    pub fn release(&self) -> tole_core::secret_release::Release {
+        let mut r = tole_core::secret_release::Release::default();
+        for (name, b) in self.secrets.iter().flatten() {
+            r = r.with(name, b.tools.iter().cloned());
+        }
+        r
+    }
+}
+
 /// Profile names: `[a-z0-9_-]`, 1 to 64 chars, not starting with `-`
 /// (they become `--profile` values and the `profile-<name>` room).
 pub fn valid_profile_name(name: &str) -> bool {
@@ -318,6 +423,9 @@ pub struct Config {
     pub delegation: Option<DelegationConfig>,
     /// Dormant profiles (#584); user layer only, see [`ProfileConfig`].
     pub profiles: Option<std::collections::BTreeMap<String, ProfileConfig>>,
+    /// Scoped secret release (#598), see [`SecretBinding`]; a project
+    /// layer can only narrow it.
+    pub secrets: Option<BTreeMap<String, SecretBinding>>,
     /// Keys (rendered names, e.g. `model`, `mission.verify`) whose value
     /// came from the user layer; set by [`layered`], never by the file.
     #[serde(skip)]
@@ -419,7 +527,12 @@ fn check_forbidden(
         let name: &str = k.get_ref();
         let allowed = matches!(
             (parent, name),
-            (Some("mission"), "max_tokens") | (Some("cron"), "daily_token_cap")
+            (Some("mission"), "max_tokens")
+                | (Some("cron"), "daily_token_cap")
+                | (None, "secrets")
+                // `[secrets]` keys are secret NAMES; their values are checked
+                // below and by `check_secret` (never a value).
+                | (Some("secrets"), _)
         );
         if !allowed && is_secret_name(name) {
             return Err(ConfigError {
@@ -514,6 +627,9 @@ pub fn parse(src: &str, path: &Path) -> Result<Config, ConfigError> {
     }
     for (name, p) in cfg.profiles.iter().flatten() {
         check_profile(name, p).map_err(range)?;
+    }
+    for (name, b) in cfg.secrets.iter().flatten() {
+        check_secret(name, b).map_err(range)?;
     }
     if let Some(n) = cfg.cron.as_ref().and_then(|c| c.max_concurrent) {
         if !(1..=MAX_CRON_CONCURRENT).contains(&n) {
@@ -697,6 +813,8 @@ pub fn layered(project: &Config, user: &Config) -> Config {
         // Nor profiles (#584): a cloned repository must not define personas,
         // their allow lists or their models.
         profiles: user.profiles.clone(),
+        // A project may only narrow the secret release (#598).
+        secrets: layered_secrets(&project.secrets, &user.secrets),
         user_keys: BTreeSet::new(),
     };
     if let Some(c) = &user.cron {
@@ -756,6 +874,10 @@ pub const DELEGATION_IGNORED_NOTE: &str =
 /// Suffix of a project config's `profiles` line in `config check` (#584).
 pub const PROFILES_IGNORED_NOTE: &str =
     "  IGNORED: a project config cannot define profiles (user config only)";
+
+/// Suffix of a project config's `secrets` lines in `config check` (#598).
+pub const SECRETS_PROJECT_NOTE: &str =
+    "  a project config can only narrow a secret's tools (widening is ignored)";
 
 /// The warning printed at startup when a project config carries `[profiles]`.
 pub fn profiles_ignored_warning(shown: &str) -> String {
@@ -909,6 +1031,22 @@ pub fn render_with(cfg: &Config, tag: &str, ann: &Annotations) -> Vec<String> {
         for name in p.keys() {
             out.push(format!("  - {}", quote(name)));
         }
+    }
+    for (name, b) in cfg.secrets.iter().flatten() {
+        let key = format!("secrets.{name}");
+        let note = if tag == PROJECT_TAG {
+            SECRETS_PROJECT_NOTE
+        } else {
+            ""
+        };
+        out.push(format!(
+            "{key} = [{}]  [{src}]{note}",
+            b.tools
+                .iter()
+                .map(|t| quote(t))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     }
     if let Some(m) = &cfg.mission {
         scalar(
@@ -1636,5 +1774,72 @@ verify_timeout = 60
         let line = &render(&c)[0];
         assert!(line.contains("… (200 chars)"), "{line}");
         assert!(line.len() < 150, "{line}");
+    }
+
+    #[test]
+    fn secrets_bind_names_to_tools_and_a_project_can_only_narrow_them() {
+        let p = |src: &str| parse(src, Path::new("c.toml"));
+        let user = p(
+            "[secrets]\nGITHUB_TOKEN = { tools = [\"gh\", \"git\", \"run_command\"] }\n\
+                      NPM_TOKEN = { tools = [\"run_command\"] }\n",
+        )
+        .unwrap();
+        // A key that is a secret NAME is not a forbidden key.
+        let r = user.release();
+        assert!(r.allows("GITHUB_TOKEN", "run_command"));
+        assert!(r.allows("NPM_TOKEN", "run_command"));
+        // A project tries to widen (job_start, a new secret) and narrows git.
+        let project = p(
+            "[secrets]\nGITHUB_TOKEN = { tools = [\"gh\", \"job_start\"] }\n\
+                         AWS_SECRET_ACCESS_KEY = { tools = [\"run_command\"] }\n",
+        )
+        .unwrap();
+        let l = layered(&project, &user).release();
+        assert!(l.allows("GITHUB_TOKEN", "gh"));
+        assert!(!l.allows("GITHUB_TOKEN", "job_start"), "widening refused");
+        assert!(!l.allows("GITHUB_TOKEN", "run_command"), "narrowed");
+        assert!(!l.allows("AWS_SECRET_ACCESS_KEY", "run_command"));
+        let w = secrets_widening_warnings(&project, &user, "p").join("\n");
+        assert!(w.contains("GITHUB_TOKEN to job_start"), "{w}");
+        assert!(w.contains("AWS_SECRET_ACCESS_KEY to run_command"), "{w}");
+        assert!(w.contains("in your user config"), "{w}");
+        // Without a user entry, the default binding is the ceiling.
+        let l = layered(&project, &Config::default()).release();
+        assert!(l.allows("GITHUB_TOKEN", "gh"));
+        assert!(!l.allows("GITHUB_TOKEN", "git"));
+        assert!(!l.allows("GITHUB_TOKEN", "job_start"));
+        // Bad entries name the remedy and never echo a key or value.
+        for (src, needle) in [
+            (
+                "[secrets]\nPATH = { tools = [\"gh\"] }\n",
+                "NAME of a secret",
+            ),
+            (
+                "[secrets]\nghp_abcdefTOKEN = { tools = [\"gh\"] }\n",
+                "NAME of a secret",
+            ),
+            (
+                "[secrets]\nGITHUB_TOKEN = { tools = [\"Run Command\"] }\n",
+                "tool name",
+            ),
+            (
+                "[secrets]\nGITHUB_TOKEN = { tools = [\"gh\"], value = \"x\" }\n",
+                "unknown field",
+            ),
+        ] {
+            let e = p(src).unwrap_err().to_string();
+            assert!(e.contains(needle), "{src}: {e}");
+            assert!(!e.contains("ghp_abcdef"), "{e}");
+        }
+        // A secret-like key anywhere else is still forbidden.
+        let e = p("[mission]\napi_token = \"x\"\n").unwrap_err().to_string();
+        assert!(e.contains("forbidden key"), "{e}");
+        // `config check` shows the binding, and on a project line the rule.
+        let lines = render_with(&project, PROJECT_TAG, &Annotations::new()).join("\n");
+        assert!(
+            lines.contains("secrets.GITHUB_TOKEN = [\"gh\", \"job_start\"]"),
+            "{lines}"
+        );
+        assert!(lines.contains("can only narrow"), "{lines}");
     }
 }

@@ -302,7 +302,7 @@ impl Tool for JobStartTool {
 
         let mut cmd = Command::new(program);
         // Secret env never reaches children (threat-model ENV-1).
-        crate::subprocess::scrub_env_for_child(&mut cmd);
+        crate::subprocess::scrub_env_for(&mut cmd, "job_start");
         cmd.args(&argv[1..])
             .current_dir(&self.root)
             .stdin(Stdio::null())

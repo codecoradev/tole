@@ -13,10 +13,11 @@
 //!   requested patterns a parent pattern covers). A delegated child takes
 //!   allow and trust from its flags only (`config_apply`), never from its
 //!   profile, config or environment.
-//! - **Secrets:** the child keeps its provider keys plus the parent grant ∩
-//!   the profile's grants (`Profile::granted`); every other secret-named
-//!   variable is scrubbed. The parent grant is the set of secret-named
-//!   variables this process holds.
+//! - **Secrets:** the child keeps its provider keys plus the parent grant
+//!   (∩ the profile's grants, with a profile); every other secret-named
+//!   variable is scrubbed. The parent grant is the secret-named variables
+//!   this process holds that its `[secrets]` release binds to some tool
+//!   (#598), so a child never gains a secret its parent may not use.
 //! - **Writers:** an `execute` child takes a write lease on the
 //!   CANONICALIZED directory it works in (the worktree, else the workspace),
 //!   checked before it spawns.
@@ -215,14 +216,6 @@ fn usage_records(bytes: &[u8]) -> Vec<tole_core::storage::UsageRecord> {
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
         .filter(|v| v.get("kind").and_then(Value::as_str) == Some("usage"))
         .filter_map(|v| serde_json::from_value(v).ok())
-        .collect()
-}
-
-/// Secret-named variables this process holds: its grant to pass down.
-fn held_secrets() -> Vec<String> {
-    std::env::vars_os()
-        .filter_map(|(k, _)| k.into_string().ok())
-        .filter(|k| tole_core::secrets::is_secret_name(k))
         .collect()
 }
 
@@ -516,15 +509,18 @@ impl Delegator {
     fn spec_for(&self, d: &Delegation<FileStore>, x: &Extras) -> Result<Spec, String> {
         let n = d.poll(&x.node).ok_or("delegate: node missing")?;
         let profile = n.profile.clone().filter(|p| p != "-");
+        // This session's grant: the secrets it holds that its `[secrets]`
+        // release binds to some tool (#598); a profile narrows it.
+        let held = self.setup.cfg.release().held_grants();
         let keep_secrets = match &profile {
-            None => Vec::new(),
+            None => held,
             Some(name) => crate::profile::Profile::resolve(
                 &self.setup.cfg,
                 name,
                 self.setup.base.as_deref(),
                 self.setup.home.as_deref(),
             )?
-            .granted(&held_secrets()),
+            .granted(&held),
         };
         Ok(Spec {
             node: n.id.clone(),

@@ -245,7 +245,7 @@ impl Tool for GitTool {
             return Err("git: arguments must not contain NUL bytes".into());
         }
         let mut cmd = Command::new(&self.bin);
-        crate::subprocess::scrub_env_for_child(&mut cmd);
+        crate::subprocess::scrub_env_for(&mut cmd, "git");
         cmd.args(&argv);
         if let Some(dir) = &self.workdir {
             cmd.current_dir(dir);

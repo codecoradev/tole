@@ -477,9 +477,7 @@ pub use uteke_doc::UtekeDocIndex;
 #[cfg(feature = "shell-tools")]
 mod uteke_doc {
     use super::*;
-    use crate::subprocess::{
-        run_with_timeout, run_with_timeout_stdin, scrub_env_for_child, SUBPROCESS_TIMEOUT,
-    };
+    use crate::subprocess::{run_with_timeout, run_with_timeout_stdin, SUBPROCESS_TIMEOUT};
     use std::process::Command;
 
     /// Upper bound on candidates fetched from `uteke doc search` per call.
@@ -522,7 +520,7 @@ mod uteke_doc {
 
         fn run(&self, args: &[&str], stdin: Option<&[u8]>) -> Result<String, String> {
             let mut cmd = Command::new(&self.bin);
-            scrub_env_for_child(&mut cmd);
+            crate::subprocess::scrub_env_for(&mut cmd, "skills");
             cmd.args(args);
             let out = match stdin {
                 Some(bytes) => run_with_timeout_stdin(&mut cmd, SUBPROCESS_TIMEOUT, bytes)?,

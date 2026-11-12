@@ -212,14 +212,19 @@ fn log_of(root: &Path) -> Delegation<FileStore> {
 
 const PROFILE: &str = "[delegation]\ngoal_budget = 1000\ngoal_steps = 100\n\
     [profiles.coder]\nallow = [\"write_file\", \"run_command\"]\n\
-    grants = [\"TOLE_DLG_A_TOKEN\", \"TOLE_DLG_B_TOKEN\"]\n";
+    grants = [\"TOLE_DLG_A_TOKEN\", \"TOLE_DLG_B_TOKEN\", \"TOLE_DLG_D_TOKEN\"]\n\
+    [secrets]\nTOLE_DLG_A_TOKEN = { tools = [\"gh\"] }\nTOLE_DLG_B_TOKEN = { tools = [\"gh\"] }\n\
+    TOLE_DLG_C_TOKEN = { tools = [\"git\"] }\n";
 
 #[test]
 fn a_profile_child_is_a_budgeted_mission_with_parent_intersect_profile_and_its_grants() {
-    // Held by this process: A (granted) and C (not granted); B is granted
-    // but not held, so it cannot be passed on.
+    // The parent's grant (#598) is what it holds AND its [secrets] binds to
+    // a tool: A and C. B is bound and in the profile but not held; D is
+    // held and in the profile but bound to nothing, so the parent may not
+    // use it and no profile can hand it on.
     std::env::set_var("TOLE_DLG_A_TOKEN", "value-a");
     std::env::set_var("TOLE_DLG_C_TOKEN", "value-c");
+    std::env::set_var("TOLE_DLG_D_TOKEN", "value-d");
     let root = tmp("profile");
     let h = host(&root, 0, &["write_*"], PROFILE);
     let (start, _) = tools(&h, &root);
@@ -260,7 +265,11 @@ fn a_profile_child_is_a_budgeted_mission_with_parent_intersect_profile_and_its_g
     );
     assert!(
         !env.contains("TOLE_DLG_C_TOKEN"),
-        "held but not granted: scrubbed"
+        "the parent's but not the profile's: scrubbed"
+    );
+    assert!(
+        !env.contains("TOLE_DLG_D_TOKEN"),
+        "the profile's but not the parent's grant: scrubbed"
     );
     // The log: started with its agent dir, and a lease on the canonical root.
     let d = log_of(&root);
@@ -272,6 +281,14 @@ fn a_profile_child_is_a_budgeted_mission_with_parent_intersect_profile_and_its_g
         held,
         Some((root.to_str().unwrap().to_string(), node.to_string()))
     );
+    // Without a profile a child gets the parent's grant, still never D.
+    let plain = start
+        .execute(json!({"task": "look", "mode": "consult"}))
+        .unwrap();
+    let env = wait_for(&agent_dir_of(&root, &plain).join("env"));
+    assert!(env.contains("TOLE_DLG_A_TOKEN=value-a\n"), "{env}");
+    assert!(env.contains("TOLE_DLG_C_TOKEN=value-c\n"), "{env}");
+    assert!(!env.contains("TOLE_DLG_D_TOKEN"), "{env}");
     let _ = std::fs::remove_dir_all(&root);
 }
 
