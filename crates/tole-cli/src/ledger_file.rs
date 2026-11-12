@@ -112,6 +112,18 @@ pub fn lease_of(pid: u32) -> Lease {
     }
 }
 
+/// A process that has exited but was not reaped yet (state `Z` in
+/// `/proc/<pid>/stat`) is not alive: it runs nothing and never will.
+fn zombie(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|s| {
+            let rest = &s[s.rfind(')')? + 1..];
+            rest.split_whitespace().next().map(|st| st == "Z")
+        })
+        .unwrap_or(false)
+}
+
 /// Process start time in clock ticks since boot (field 22 of
 /// `/proc/<pid>/stat`), when available.
 fn start_time(pid: u32) -> Option<u64> {
@@ -127,7 +139,7 @@ pub fn lease_alive(lease: &Lease) -> bool {
     if lease.pid == std::process::id() {
         return start_time(lease.pid).unwrap_or(0) == lease.start_time;
     }
-    if !pid_exists(lease.pid) {
+    if !pid_exists(lease.pid) || zombie(lease.pid) {
         return false;
     }
     match start_time(lease.pid) {
@@ -149,4 +161,28 @@ fn pid_exists(pid: u32) -> bool {
 #[cfg(not(unix))]
 fn pid_exists(_pid: u32) -> bool {
     true // conservative: an unknown owner is treated as alive
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    /// An exited child its parent never reaped (a detached delegated or
+    /// agent child) is a zombie: not alive, so recovery can settle it.
+    #[test]
+    fn an_unreaped_exited_child_is_not_alive() {
+        let child = std::process::Command::new("true").spawn().unwrap();
+        let lease = lease_of(child.id());
+        let mut gone = false;
+        for _ in 0..200 {
+            if !lease_alive(&lease) {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(gone, "a zombie counted as alive");
+        assert!(lease_alive(&own_lease()), "this process is alive");
+        drop(child); // never waited: stays a zombie until the test ends
+    }
 }

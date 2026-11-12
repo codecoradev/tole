@@ -26,6 +26,10 @@ pub struct AgentTools {
     pub worktrees: bool,
     /// The parent's `--allow` patterns, inherited by its children.
     pub parent_allows: Vec<String>,
+    /// Delegation (#585): `Some` turns the agent tools into `delegate` /
+    /// `delegate_poll` (with `agent_start` / `agent_poll` as aliases),
+    /// registered wherever the delegation tree lets this session delegate.
+    pub delegation: Option<crate::delegate::Setup>,
 }
 
 /// What a face asks of the roster.
@@ -233,7 +237,57 @@ pub fn build(approver: impl Approver + 'static, roster: Roster) -> Result<ToolRe
     }
     // Child agents (#171): parent sessions only, never in plan mode. Not
     // behind this crate's shell-tools gate: every CLI profile had them.
-    if let (Some(agents), 0, false) = (&roster.agents, depth, plan) {
+    let delegator = match (&roster.agents, plan) {
+        (
+            Some(AgentTools {
+                delegation: Some(setup),
+                worktrees,
+                parent_allows,
+            }),
+            false,
+        ) => {
+            let bin =
+                std::env::current_exe().context("resolving the tole binary for delegation")?;
+            crate::delegate::Delegator::for_session(
+                bin,
+                root.clone(),
+                *worktrees,
+                parent_allows.clone(),
+                setup.clone(),
+                &crate::config_apply::real_env,
+            )
+        }
+        _ => None,
+    };
+    if let Some(host) = delegator {
+        let host = std::sync::Arc::new(host);
+        for (start, poll) in [("delegate", "delegate_poll"), ("agent_start", "agent_poll")] {
+            add(
+                &mut reg,
+                Box::new(crate::delegate::DelegateTool {
+                    name: start,
+                    host: host.clone(),
+                }),
+            )?;
+            add(
+                &mut reg,
+                Box::new(crate::delegate::DelegatePollTool {
+                    name: poll,
+                    host: host.clone(),
+                    inner: tole_core::agents::AgentPollTool::new(host.root().to_path_buf()),
+                }),
+            )?;
+        }
+    } else if let (
+        Some(
+            agents @ AgentTools {
+                delegation: None, ..
+            },
+        ),
+        0,
+        false,
+    ) = (&roster.agents, depth, plan)
+    {
         let bin = std::env::current_exe().context("resolving the tole binary for child agents")?;
         let start = tole_core::agents::AgentStartTool::new(bin, root.clone())
             .with_worktrees(agents.worktrees)

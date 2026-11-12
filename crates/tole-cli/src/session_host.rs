@@ -336,6 +336,8 @@ pub fn open_session(
     roster.agents = Some(crate::tool_roster::AgentTools {
         worktrees: false,
         parent_allows,
+        // `tole serve` keeps the classic depth-1 agent tools for now.
+        delegation: None,
     });
     roster.plan_emitter = plan_emitter;
     // #217: a job that exits nudges this session at its next safe point.
