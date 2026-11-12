@@ -972,6 +972,8 @@ fn dispatch(cli: Cli) -> Result<()> {
                 .and_then(|p| p.parent().map(Path::to_path_buf)),
             home: std::env::var_os("HOME").map(PathBuf::from),
             data_dir: tole_core::paths::tole_data_dir(),
+            probe: None,
+            thresholds: None,
         },
 
         on_pretool: config_apply::values(&settings.on_pretool),
@@ -1379,6 +1381,14 @@ fn dispatch(cli: Cli) -> Result<()> {
                 no_ledger,
                 window,
             );
+            // The delegation resource guard: headroom against its thresholds.
+            let cwd = std::env::current_dir().ok();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs() as i64);
+            for l in tole_cli::machine_guard::doctor_lines(&host.delegation, cwd.as_deref(), now) {
+                println!("{l}");
+            }
             if !ok {
                 std::process::exit(1);
             }

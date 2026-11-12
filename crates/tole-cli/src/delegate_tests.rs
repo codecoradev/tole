@@ -20,6 +20,7 @@ fn fake_tole(dir: &Path, secs: u64) -> PathBuf {
     let body = format!(
         "#!/bin/sh\nprev=\"\"\nfor a in \"$@\"; do [ \"$prev\" = \"--sessions-dir\" ] && D=\"$a\"; \
          prev=\"$a\"; done\nmkdir -p \"$D\"\nprintf '%s\\n' \"$@\" > \"$D/../argv\"\n\
+         cut -d' ' -f19 /proc/$$/stat > \"$D/../nice\" 2>/dev/null\n\
          env > \"$D/../env\"\nsleep {secs}\n"
     );
     std::fs::write(&p, body).unwrap();
@@ -33,7 +34,96 @@ fn setup(src: &str) -> Setup {
         base: None,
         home: None,
         data_dir: Some(data_dir()),
+        // The machine guard never holds these tests back: they share one
+        // registry and run in parallel.
+        probe: Some(SharedProbe(std::sync::Arc::new(Dial::roomy()))),
+        thresholds: Some(open_thresholds()),
     }
+}
+
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use tole_core::resource_guard::{Disk, Load, Mem, Pids, Probe};
+
+/// A probe whose free memory a test turns; everything else is roomy.
+struct Dial(AtomicU64);
+
+impl Dial {
+    fn roomy() -> Self {
+        Self(AtomicU64::new(1 << 20))
+    }
+}
+
+impl Probe for Dial {
+    fn memory(&self) -> Option<Mem> {
+        Some(Mem {
+            available_mb: self.0.load(Relaxed),
+        })
+    }
+    fn load(&self) -> Option<Load> {
+        Some(Load {
+            one_min: 0.0,
+            cpus: 4,
+        })
+    }
+    fn disk(&self, _: &Path) -> Option<Disk> {
+        Some(Disk { free_mb: 1 << 20 })
+    }
+    fn pids(&self) -> Option<Pids> {
+        Some(Pids {
+            current: 1,
+            max: 1 << 20,
+        })
+    }
+}
+
+fn open_thresholds() -> Thresholds {
+    Thresholds {
+        spawn_interval_secs: 0,
+        machine_max_live: 1024,
+        ..Thresholds::default()
+    }
+}
+
+/// A host on its own data dir (its own machine registry), guarded by
+/// `probe` and either `thresholds` or the config's `[delegation]` keys.
+fn guarded(
+    root: &Path,
+    data: &Path,
+    probe: std::sync::Arc<Dial>,
+    thresholds: Option<Thresholds>,
+    src: &str,
+) -> std::sync::Arc<Delegator> {
+    let setup = Setup {
+        data_dir: Some(data.to_path_buf()),
+        probe: Some(SharedProbe(probe)),
+        thresholds,
+        ..setup(src)
+    };
+    std::sync::Arc::new(
+        Delegator::for_session(
+            fake_tole(root, 30),
+            root.to_path_buf(),
+            false,
+            Vec::new(),
+            setup,
+            &|_| None,
+        )
+        .unwrap(),
+    )
+}
+
+fn pid_of(out: &Value) -> u32 {
+    u32::try_from(out["pid"].as_u64().unwrap()).unwrap()
+}
+
+fn wait_dead(pid: u32) {
+    for _ in 0..200 {
+        if !crate::ledger_file::lease_alive(&crate::ledger_file::lease_of(pid)) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    panic!("{pid} never died");
 }
 
 /// A data dir outside every test workspace.
@@ -580,6 +670,196 @@ fn a_new_delegate_never_starts_ahead_of_an_older_queued_one() {
         NodeStatus::Queued
     );
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn low_memory_queues_in_order_and_a_later_delegate_starts_them_when_it_recovers() {
+    let root = tmp("guard-mem");
+    let data = tmp("guard-mem-data");
+    let dial = std::sync::Arc::new(Dial(AtomicU64::new(100)));
+    let h = guarded(&root, &data, dial.clone(), Some(open_thresholds()), "");
+    let (start, _) = tools(&h, &root);
+    let c = |t: &str| json!({"task": t, "mode": "consult"});
+    let a = start.execute(c("a")).unwrap();
+    assert_eq!(a["queued"], json!(true), "{a}");
+    assert!(a.get("agent").is_none(), "nothing spawned: {a}");
+    let why = a["queued_reason"].as_str().unwrap();
+    assert!(why.contains("memory 100 MB free"), "{a}");
+    assert!(a["waited_secs"].as_i64().unwrap() <= 1, "{a}");
+    std::thread::sleep(std::time::Duration::from_millis(2100));
+    // The head waits, so the queue holds: B waits behind A.
+    let b = start.execute(c("b")).unwrap();
+    assert_eq!(b["queued"], json!(true), "{b}");
+    assert!(
+        b["queue"][0]["waited_secs"].as_i64().unwrap() >= 2,
+        "A's wait shows: {b}"
+    );
+    assert_eq!(b["queue"][0]["node"], a["node"], "{b}");
+    assert!(b["queue"][0]["queued_reason"]
+        .as_str()
+        .unwrap()
+        .contains("memory"));
+    assert!(
+        b["queued_reason"].as_str().unwrap().contains("behind"),
+        "{b}"
+    );
+    // Memory recovers: the next delegate starts A, then B, then itself.
+    dial.0.store(1 << 20, Relaxed);
+    let c3 = start.execute(c("c")).unwrap();
+    let order: Vec<&Value> = c3["started_from_queue"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| &v["node"])
+        .collect();
+    assert_eq!(order, vec![&a["node"], &b["node"]], "{c3}");
+    assert!(c3.get("agent").is_some(), "C started too: {c3}");
+    // Every delegated child runs at least at child_nice (10).
+    #[cfg(target_os = "linux")]
+    {
+        let nice: i64 = wait_for(&agent_dir_of(&root, &c3).join("nice"))
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(nice >= 10, "nice {nice}");
+    }
+    for v in c3["started_from_queue"].as_array().unwrap() {
+        kill(pid_of(&v["result"]));
+    }
+    kill(pid_of(&c3));
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&data);
+}
+
+#[test]
+fn two_goals_share_the_machine_count_and_a_dead_child_frees_its_slot() {
+    let data = tmp("guard-machine-data");
+    let (ra, rb) = (tmp("guard-machine-a"), tmp("guard-machine-b"));
+    let one = Thresholds {
+        machine_max_live: 1,
+        ..open_thresholds()
+    };
+    let ha = guarded(
+        &ra,
+        &data,
+        std::sync::Arc::new(Dial::roomy()),
+        Some(one),
+        "",
+    );
+    // B takes its thresholds from the user config, through Setup.
+    let hb = guarded(
+        &rb,
+        &data,
+        std::sync::Arc::new(Dial::roomy()),
+        None,
+        "[delegation]\nmachine_max_live = 1\nspawn_interval_secs = 1\n",
+    );
+    let (sa, _) = tools(&ha, &ra);
+    let (sb, _) = tools(&hb, &rb);
+    let a = sa.execute(json!({"task": "a", "mode": "consult"})).unwrap();
+    assert!(a.get("agent").is_some(), "{a}");
+    // Another goal, another log: it still sees A on this machine.
+    let b1 = sb
+        .execute(json!({"task": "b1", "mode": "consult"}))
+        .unwrap();
+    assert_eq!(b1["queued"], json!(true), "{b1}");
+    let why = b1["queued_reason"].as_str().unwrap();
+    assert!(
+        why.contains("1 delegated children live on this machine (max 1)"),
+        "{b1}"
+    );
+    // A dies without anyone settling it: its registered lease is dead, so
+    // its slot frees for B's head; B's second spawn waits behind it.
+    kill(pid_of(&a));
+    wait_dead(pid_of(&a));
+    std::thread::sleep(std::time::Duration::from_millis(2100)); // spawn interval
+    let b2 = sb
+        .execute(json!({"task": "b2", "mode": "consult"}))
+        .unwrap();
+    assert_eq!(b2["started_from_queue"][0]["node"], b1["node"], "{b2}");
+    assert_eq!(b2["queued"], json!(true), "{b2}");
+    assert!(
+        b2["queued_reason"].as_str().unwrap().contains("max 1"),
+        "{b2}"
+    );
+    kill(pid_of(&b2["started_from_queue"][0]["result"]));
+    for d in [&ra, &rb, &data] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
+#[test]
+fn doctor_shows_the_headroom_and_a_spawn_stuck_in_the_queue() {
+    let data = tmp("guard-doctor-data");
+    let root = tmp("guard-doctor");
+    let log = log_path(&data, &root).unwrap();
+    std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+    let mut d = Delegation::open(FileStore::new(log)).unwrap();
+    let t0 = now() - 1000;
+    let allow = vec!["read_file".to_string()];
+    d.begin(
+        &Goal {
+            id: "g",
+            task: "orchestrator",
+            budget: Budget {
+                tokens: 100,
+                steps: 10,
+                deadline: t0 + 5000,
+            },
+            allow: &allow,
+            max_depth: 2,
+            max_live: 1,
+        },
+        t0,
+    )
+    .unwrap();
+    let ws = root.to_string_lossy().into_owned();
+    let req = DelegateRequest {
+        profile: "-",
+        task: "stuck",
+        mode: Mode::Consult,
+        budget: BudgetRequest::default(),
+        profile_allow: &allow,
+        workspace: Some(&ws),
+    };
+    let h = d.delegate("g", &req, Spend::default(), t0).unwrap();
+    let setup = Setup {
+        data_dir: Some(data.clone()),
+        probe: Some(SharedProbe(std::sync::Arc::new(Dial(AtomicU64::new(100))))),
+        thresholds: Some(open_thresholds()),
+        ..setup("")
+    };
+    let lines = crate::machine_guard::doctor_lines(&setup, Some(&root), now()).join("\n");
+    assert!(
+        lines.contains("! memory 100 MB free (a spawn needs 1536 MB)"),
+        "{lines}"
+    );
+    assert!(lines.contains("✓ load 0.00 per CPU (max 1.50)"), "{lines}");
+    assert!(
+        lines.contains(&format!("✓ disk 1048576 MB free on {}", root.display())),
+        "{lines}"
+    );
+    assert!(
+        lines.contains("✓ 0 of 1024 delegated children live"),
+        "{lines}"
+    );
+    assert!(
+        lines.contains(&format!("spawn `{}` has waited 16 min", h.node_id)),
+        "{lines}"
+    );
+    // A data dir not made yet is checked on the filesystem it will live on,
+    // with the real probe: no "cannot read disk" note.
+    let fresh = Setup {
+        data_dir: Some(data.join("not-yet")),
+        probe: None,
+        ..setup
+    };
+    let lines = crate::machine_guard::doctor_lines(&fresh, Some(&root), now()).join("\n");
+    assert!(lines.contains("disk"), "{lines}");
+    #[cfg(target_os = "linux")]
+    assert!(!lines.contains("cannot read"), "{lines}");
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&data);
 }
 
 /// A stand-in child that records its env and argv, then hands in `report`

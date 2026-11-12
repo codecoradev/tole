@@ -573,6 +573,9 @@ pub struct ChildOpts {
     /// Secret NAMES the child keeps besides its provider keys (the
     /// parent grant ∩ the profile's grants).
     pub keep_secrets: Vec<String>,
+    /// Set by the delegate tool: the child starts at least this nice
+    /// ([`crate::resource_guard::apply_child_nice`]).
+    pub nice: Option<u32>,
 }
 
 impl AgentStartTool {
@@ -911,6 +914,9 @@ impl Tool for AgentStartTool {
         {
             use std::os::unix::process::CommandExt;
             cmd.process_group(0);
+        }
+        if let Some(nice) = self.opts.nice {
+            crate::resource_guard::apply_child_nice(&mut cmd, nice);
         }
         let mut child = cmd
             .spawn()
