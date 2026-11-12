@@ -25,6 +25,8 @@ pub mod setup;
 pub mod status;
 pub use crate::ledger_file as store;
 pub mod tick;
+pub mod tool;
+pub mod trust;
 
 use std::path::{Path, PathBuf};
 
@@ -150,7 +152,8 @@ pub enum CronAction {
     Cancel { job: String },
     /// Pause a job (by id or name).
     Pause { job: String },
-    /// Resume a paused job.
+    /// Resume a paused job. For a job an agent created (`cron_create`) this
+    /// is the owner's enable: review it first (`tole cron list`).
     Resume { job: String },
     /// Remove a job (a new record; history stays in the log).
     Remove { job: String },
@@ -312,6 +315,46 @@ pub fn create(dir: &Path, spec: CreateSpec, now: i64) -> anyhow::Result<Job> {
         Ok(())
     })?;
     Ok(job)
+}
+
+/// Validates and saves a job an agent asked for through the `cron_create`
+/// tool (#581): saved paused, `created_by = agent`, with the creator's
+/// grant `creator_allow`, and an `allow` within it ([`trust::within`]).
+/// A human enables it with `tole cron resume` ([`enable`]).
+pub fn create_by_agent(
+    dir: &Path,
+    mut spec: CreateSpec,
+    creator_allow: &[String],
+    now: i64,
+) -> anyhow::Result<Job> {
+    spec.allow = trust::within(&spec.allow, creator_allow).map_err(|e| anyhow!(e))?;
+    spec.paused = true;
+    if spec.deliver.iter().any(|d| d.starts_with("command:")) {
+        bail!("a `command:` delivery needs a job saved with `tole cron create`");
+    }
+    let id = crate::session_host::new_session_id("job");
+    let mut job = build_job(spec, id, now)?;
+    job.extra.insert("created_by".into(), trust::AGENT.into());
+    job.extra
+        .insert("creator_allow".into(), json!(creator_allow));
+    store::with_lock(dir, |l| {
+        if l.state().job(&job.id).is_some_and(|j| !j.job.removed) {
+            bail!("job `{}` already exists", job.id);
+        }
+        l.put_job(job.clone())?;
+        Ok(())
+    })?;
+    Ok(job)
+}
+
+/// `tole cron resume`: unpauses a job and records that its owner enabled
+/// it (`enabled_by = cli`), which a job not saved through the CLI needs
+/// before it runs (#581).
+pub fn enable(dir: &Path, key: &str, now: i64) -> anyhow::Result<Job> {
+    update(dir, key, now, |j| {
+        j.paused = false;
+        j.extra.insert("enabled_by".into(), trust::CLI.into());
+    })
 }
 
 /// Validates a spec into a job record (without `created_by`).
@@ -524,9 +567,14 @@ pub fn edit(dir: &Path, key: &str, change: EditSpec, now: i64) -> anyhow::Result
             spec.profile = change.profile;
             spec.profile_skill_hashes = None;
         }
+        if !trust::by_owner(&old) {
+            // An agent's job never gets more than its creator held (#581).
+            spec.allow = trust::within(&spec.allow, &trust::list(&old, "creator_allow"))
+                .map_err(|e| anyhow!("--allow: {e}"))?;
+        }
         let mut job = build_job(spec, old.id.clone(), now)?;
-        if let Some(by) = old.extra.get("created_by") {
-            job.extra.insert("created_by".into(), by.clone());
+        for (k, v) in trust::carried(&old) {
+            job.extra.insert(k.into(), v);
         }
         l.put_job(job.clone())?;
         Ok(job)
@@ -559,7 +607,7 @@ pub fn run_now(dir: &Path, key: &str, now: i64, opts: &TickOptions) -> anyhow::R
             },
         };
         report.missed += due.missed.as_ref().map_or(0, |m| m.count);
-        let ctx = tick::ClaimCtx::new(l, now, opts);
+        let ctx = tick::ClaimCtx::new(dir, l, now, opts);
         Ok(tick::claim_one(l, &due, &job, now, &ctx, &mut report)?)
     })?;
     tick::run_claimed(dir, claimed.into_iter().collect(), now, opts, &mut report)?;
@@ -865,7 +913,7 @@ pub fn cli(action: CronAction, globals: JobGlobals) -> anyhow::Result<()> {
             println!("paused {}", j.id);
         }
         CronAction::Resume { job } => {
-            let j = update(&dir, &job, t, |j| j.paused = false)?;
+            let j = enable(&dir, &job, t)?;
             println!("resumed {}", j.id);
         }
         CronAction::Remove { job } => {

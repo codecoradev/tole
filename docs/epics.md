@@ -268,6 +268,13 @@ Bot and Nakama; BMAD for collaboration). Design notes:
   `GET /cron/runs`), `run`/`cancel`/`edit`/`status`, the token budget and
   `cron.daily_token_cap`, and the `doctor` ticker check; the closing PR adds
   `--skill` and `--profile` on `create`/`edit` and `cron.max_concurrent`.
+  #581: part 1 (an `/approvals` allow resumes the parked run, #638) is
+  done; part 2 adds agent-created jobs. An agent creates a job only
+  through the `cron_create` tool: the job is saved paused with
+  `created_by` and `creator_allow`, within the creator's allow list.
+  `tole cron resume` is the human enable. A job not saved through the CLI
+  runs only enabled, within its creator's grant and never as a script, and
+  an agent run whose workdir holds the cron dir is blocked.
 - **E2 — Profiles, delegation, discussion, routing, epic #583:**
   - profiles (#584; config, `--profile`, tiers, room and persona done in
     the PR for #584; `tole cron create --profile` in the #579 closing PR);

@@ -125,10 +125,13 @@ pub struct ClaimCtx {
     provider_ready: bool,
     cap: Option<u64>,
     used_today: u64,
+    /// The cron dir (an agent run's jail must not hold it, #581).
+    dir: std::path::PathBuf,
 }
 
 impl ClaimCtx {
     pub fn new<S: tole_core::ledger::LedgerStore>(
+        dir: &Path,
         l: &Ledger<S>,
         now: i64,
         opts: &TickOptions,
@@ -137,6 +140,7 @@ impl ClaimCtx {
             provider_ready: crate::turn_runner::provider_config().is_ok(),
             cap: opts.daily_token_cap,
             used_today: tokens_since(l.state(), day_start(now)),
+            dir: dir.to_path_buf(),
         }
     }
 }
@@ -154,13 +158,17 @@ pub fn claim_one<S: tole_core::ledger::LedgerStore>(
     let agent = mode(job) != "script";
     let mut setup = super::setup::AgentSetup::default();
     if due.fire.is_some() {
-        let invalid = if agent && !ctx.provider_ready {
+        // Who the job's power comes from is checked first (#581), then what
+        // it may deliver to: both before the provider.
+        let invalid = if let Err(e) = super::trust::check(job, &ctx.dir) {
+            Some(e)
+        } else if let Err(e) = deliver::check(job) {
+            Some(e)
+        } else if agent && !ctx.provider_ready {
             Some((
                 "provider_missing",
                 crate::turn_runner::MISSING_PROVIDER_CONFIG.to_string(),
             ))
-        } else if let Err(e) = deliver::check(job) {
-            Some(e)
         } else if agent {
             // A skill that is gone or a profile no longer defined blocks
             // the run: it never runs without them.
@@ -279,7 +287,10 @@ pub fn resume_parked(
         // The checks a claim makes, before the `resume` record: a refused
         // continuation writes nothing, so the run stays resumable once the
         // owner fixes the cause.
-        let ctx = ClaimCtx::new(l, now, opts);
+        let ctx = ClaimCtx::new(dir, l, now, opts);
+        if let Err((code, detail)) = super::trust::check(&job, dir) {
+            anyhow::bail!("{code}: {detail}");
+        }
         if !ctx.provider_ready {
             anyhow::bail!("{}", crate::turn_runner::MISSING_PROVIDER_CONFIG);
         }
@@ -388,7 +399,7 @@ pub fn tick(dir: &Path, now: i64, opts: &TickOptions) -> anyhow::Result<TickRepo
     super::status::beat(dir, now, opts.approvals.is_some());
     let claimed: Vec<Claimed> = store::with_lock(dir, |l| {
         report.recovered = l.recover(now, store::lease_alive)?.len();
-        let ctx = ClaimCtx::new(l, now, opts);
+        let ctx = ClaimCtx::new(dir, l, now, opts);
         let mut claimed = Vec::new();
         for due in l.ready(now)? {
             report.missed += due.missed.as_ref().map_or(0, |m| m.count);

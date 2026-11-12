@@ -100,13 +100,16 @@ fn agent_job_without_a_provider_is_blocked_before_spending() {
         std::env::remove_var(k);
     }
     let dir = tmp("agent");
+    // A workdir that does not hold the cron dir (#581).
+    let work = dir.join("w");
+    std::fs::create_dir_all(&work).unwrap();
     cron::create(
         &dir,
         CreateSpec {
             id: Some("ask".into()),
             schedule: "* * * * *".into(),
             prompt: Some("summarize the inbox".into()),
-            workdir: dir.clone(),
+            workdir: work,
             ..CreateSpec::default()
         },
         T,

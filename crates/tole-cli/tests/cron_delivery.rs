@@ -4,6 +4,7 @@
 
 use std::path::{Path, PathBuf};
 
+use serde_json::json;
 use tole_cli::cron::{self, store, CreateSpec, TickOptions};
 use tole_core::ledger::{DeliveryStatus, RunStatus};
 
@@ -196,20 +197,39 @@ fn command_target_gets_the_output_on_stdin_and_its_failure_is_separate() {
 #[test]
 fn a_command_target_on_a_job_not_saved_by_the_cli_is_blocked() {
     let dir = tmp("untrusted");
-    let spec = script(&dir, "u", "* * * * *", "echo x", &["command:tee got.txt"]);
+    let work = dir.join("w");
+    std::fs::create_dir_all(&work).unwrap();
+    // The owner's paused agent job, then an agent's job written as a new
+    // line that passes the trust check (#581: enabled by its owner, within
+    // its creator's grant) but names a command target. A later line cannot
+    // turn an existing job into an agent's: the fold keeps its creator.
+    let spec = CreateSpec {
+        id: Some("u".into()),
+        schedule: "* * * * *".into(),
+        prompt: Some("hi".into()),
+        workdir: work.clone(),
+        deliver: vec!["command:tee got.txt".into()],
+        paused: true,
+        ..CreateSpec::default()
+    };
     let mut job = cron::create(&dir, spec, T).unwrap();
-    job.extra.insert("created_by".into(), "agent".into());
+    job.id = "agents".into();
+    job.paused = false;
     job.at = T + 1;
+    job.extra.insert("created_by".into(), "agent".into());
+    job.extra.insert("creator_allow".into(), json!([]));
+    job.extra.insert("enabled_by".into(), "cli".into());
     store::with_lock(&dir, |l| Ok(l.put_job(job)?)).unwrap();
     let r = cron::tick(&dir, T + 60, &OPTS).unwrap();
     assert!(r.ran.is_empty());
     assert_eq!(r.blocked, 1);
     let l = store::open_read(&dir).unwrap();
+    let b = l.state().blocked().next().unwrap();
     assert_eq!(
-        l.state().blocked().next().unwrap().reason,
-        "delivery_untrusted"
+        (b.job_id.as_str(), b.reason.as_str()),
+        ("agents", "delivery_untrusted")
     );
-    assert!(!dir.join("got.txt").exists());
+    assert!(!work.join("got.txt").exists());
 }
 
 #[test]

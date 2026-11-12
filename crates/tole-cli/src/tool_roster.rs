@@ -307,6 +307,21 @@ pub fn build(approver: impl Approver + 'static, roster: Roster) -> Result<ToolRe
             Box::new(tole_core::agents::AgentPollTool::new(root.clone())),
         )?;
     }
+    // Agent-created cron jobs (#581): a session face's tool, never a cron
+    // run's (no agents), a child's or a plan-mode session's. The job is
+    // held to this session's own allow list. The scheduler is a
+    // shell-tools module, like `tole cron`.
+    #[cfg(feature = "shell-tools")]
+    if let (Some(agents), 0, false) = (&roster.agents, depth, plan) {
+        add(
+            &mut reg,
+            Box::new(crate::cron::tool::CronCreateTool::new(
+                None,
+                root.clone(),
+                agents.parent_allows.clone(),
+            )),
+        )?;
+    }
     add(&mut reg, tracked(Box::new(ReadFileTool::new(root.clone()))))?;
     // The verbatim read of a sensitive file (#598 part b): Risk::Write, so
     // each call needs approval. Registered in plan mode too: it writes
@@ -528,6 +543,25 @@ mod tests {
         // A test process is never a child (no TOLE_AGENT_DEPTH).
         assert!(parent.get("agent_start").is_some());
         assert!(parent.get("agent_poll").is_some());
+    }
+
+    /// #581: `cron_create` is a session face's tool. A cron run (no
+    /// agents) and a plan-mode session never have it.
+    #[cfg(feature = "shell-tools")]
+    #[test]
+    fn cron_create_only_where_a_face_allows_agents() {
+        let ws = workspace("cron-create");
+        assert!(build(Human, Roster::new(ws.clone()))
+            .unwrap()
+            .get("cron_create")
+            .is_none());
+        let mut roster = Roster::new(ws.clone());
+        roster.agents = Some(AgentTools::default());
+        assert!(build(Human, roster).unwrap().get("cron_create").is_some());
+        let mut plan = Roster::new(ws);
+        plan.agents = Some(AgentTools::default());
+        plan.plan_mode = true;
+        assert!(build(Human, plan).unwrap().get("cron_create").is_none());
     }
 
     #[test]
