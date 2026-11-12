@@ -954,6 +954,13 @@ fn dispatch(cli: Cli) -> Result<()> {
         mcp_server: mcp_specs,
         plan_mode: settings.plan_mode.value,
         agents_worktree: cli.agents_worktree,
+        delegation: tole_cli::delegate::Setup {
+            cfg: cfg.clone().unwrap_or_default(),
+            base: tole_cli::config::user_config_path()
+                .and_then(|p| p.parent().map(Path::to_path_buf)),
+            home: std::env::var_os("HOME").map(PathBuf::from),
+            data_dir: tole_core::paths::tole_data_dir(),
+        },
 
         on_pretool: config_apply::values(&settings.on_pretool),
         on_posttool: config_apply::values(&settings.on_posttool),
@@ -1436,6 +1443,8 @@ struct HostConfig {
     /// into per-child git worktrees. Default false; the model cannot
     /// flip this per call (storage boomerang, owner decision 2026-10-05).
     agents_worktree: bool,
+    /// Delegation (#585): profiles and `[delegation]` for the delegate tool.
+    delegation: tole_cli::delegate::Setup,
 
     /// Tool-boundary hook command lines (issue #110), default empty.
     on_pretool: Vec<String>,
@@ -1758,6 +1767,7 @@ fn build_registry(
     roster.agents = Some(AgentTools {
         worktrees: host.agents_worktree,
         parent_allows: allow_patterns.to_vec(),
+        delegation: Some(host.delegation.clone()),
     });
     #[cfg(feature = "mcp")]
     {

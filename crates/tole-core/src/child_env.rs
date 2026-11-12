@@ -103,8 +103,13 @@ pub fn sibling(env: &dyn Fn(&str) -> Option<String>) -> Option<(String, PathBuf)
 pub fn delegation(env: &dyn Fn(&str) -> Option<String>) -> Option<(PathBuf, String)> {
     let log = PathBuf::from(env(DELEGATION_LOG)?.trim());
     let node = env(DELEGATION_NODE)?.trim().to_string();
+    // Node ids look like `g-1f.2.1`: dots separate levels, so a leading,
+    // trailing or doubled dot (and so `.` and `..`) is never one.
     let ok = !node.is_empty()
         && node.len() <= 128
+        && !node.starts_with('.')
+        && !node.ends_with('.')
+        && !node.contains("..")
         && node
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "-_.".contains(c));
@@ -182,6 +187,14 @@ mod tests {
             _ => None,
         };
         assert_eq!(delegation(&rel), None, "a relative log is not trusted");
+        for bad in [".", "..", ".g", "g.", "g..1", "G.1", "g/1"] {
+            let env = |k: &str| match k {
+                DELEGATION_LOG => Some("/a/delegation.jsonl".into()),
+                DELEGATION_NODE => Some(bad.to_string()),
+                _ => None,
+            };
+            assert_eq!(delegation(&env), None, "{bad:?}");
+        }
     }
 
     #[test]

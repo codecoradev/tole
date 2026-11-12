@@ -818,10 +818,12 @@ prompt (secret redaction applies, #595).
 
 ### Delegation tree (#585)
 
-`tole_core::delegation` holds the caps that replace the depth-1 rule once it
-is wired to the delegate tool (follow-up PR; until then `agent_start` keeps the
-depth-1 cap above, unchanged). All of them sit in one module so no caller can
-skip one:
+`tole_core::delegation` holds the caps that replace the depth-1 rule for the
+CLI faces (`run`, `chat`, `mission`): there the agent tools are `delegate` /
+`delegate_poll`, with `agent_start` / `agent_poll` kept as deprecated aliases
+for one release. `tole serve` keeps the classic depth-1 `agent_start` for now,
+and cron jobs register no agent tools, so an unattended run cannot delegate at
+all. All the caps sit in one module so no caller can skip one:
 - **No budget multiplication.** A child's tokens and steps are carved from its
   parent's remaining budget and its deadline is never later than the parent's;
   a running child's whole carve stays reserved, so any number of children
@@ -852,18 +854,81 @@ skip one:
 - **Audit.** The tree is an append-only log (spawns, budgets, allowlists,
   workspaces, sessions, leases, reports); dead processes settle `interrupted`
   and queued children of a settled parent `cancelled` on recovery.
+- **The fold re-checks every spawn.** The host launches what the log records,
+  so the fold itself ignores a spawn record that breaks a cap: an unknown or
+  settled parent, an id that is not the parent's next, a depth past the goal's
+  limit, `execute` under a `consult` parent, an allow pattern no parent
+  pattern covers or a parent deny missing, an empty budget, or a budget or
+  deadline past what the parent can still carve at that point of the log. A
+  settle is never charged below the node's reported own spend, and a budget
+  stop always its whole carve.
 
 The report and the summary are model-authored text: they are recorded and
 shown, never executed or trusted as instructions.
 
-Launch contract (#585 part 2, used by the delegate tool in the next PR): a
-delegated child carries the log path and its node id (`TOLE_DELEGATION_LOG`,
-`TOLE_DELEGATION_NODE`, the log absolute and the id charset-checked) and its
-real depth. It takes allow patterns and trust presets ONLY from the flags its
+Launch contract (#585 part 2): a delegated child carries the log path and its
+node id (`TOLE_DELEGATION_LOG`, `TOLE_DELEGATION_NODE`; the log must be
+absolute, the id charset-checked, with no leading, trailing or doubled dot) and
+its real depth. An agent dir is only ever one plain component under the agents
+dir (`agents::agent_dir` refuses empty, `.`, `..`, leading-dot and
+separator-bearing ids). It takes allow patterns and trust presets ONLY from the flags its
 parent passed (parent ∩ profile): its profile's `allow`, the config's
 `allow`/`trust` and `TOLE_TRUST` are ignored, since any of them could be wider
 than what the parent granted. `[delegation]` limits come from the user config
 only.
+
+The delegate tool (#585 part 3, `crates/tole-cli/src/delegate.rs`) adds:
+- **Structural depth.** The tool is registered only where the tree says the
+  session's node may delegate; a classic `agent_start` child and a delegated
+  child at the goal's depth get no agent tools.
+- **Authority.** The child runs as `tole mission` with `--allow` = parent ∩
+  profile (and, per the launch contract, nothing else).
+- **Secrets.** The child keeps its provider keys plus the parent grant ∩ the
+  profile's `grants`; the parent grant is the set of secret-named variables
+  the parent process holds. Every other secret-named variable is scrubbed.
+- **Budget.** The carve becomes the child's `--max-steps`, `--max-minutes`
+  and `--max-tokens`. A settled or recovered child is charged what its session
+  usage records say, and its whole carve when they cannot be read. The records
+  live in the child's agent dir, which the child can write: a hostile child
+  could understate its usage there, within its carve (the same cooperative
+  model as the handoff file).
+- **Known limit: the root session's own usage is outside the goal budget.**
+  The tool cannot read the root session's usage records, so the root reports
+  zero own spend when it delegates; only its children's usage is carved and
+  charged. A child's own spend is measured.
+- **Writers.** An `execute` child's write lease is taken on the canonicalized
+  directory it works in (its worktree, else the workspace), checked before it
+  spawns. In place, the pre-check refuses a writer when any lease overlaps the
+  workspace (a second writer in the same workspace is refused). With
+  `--agents-worktree` each writer gets a fresh worktree under
+  `.tole-worktrees`, so the pre-check refuses it only when that directory or an
+  ancestor of it is leased (someone writing the whole workspace); sibling
+  worktrees run in parallel.
+- **Machine guard.** Past `[delegation] max_live_processes` a spawn is recorded
+  `queued` and started by a later delegate or poll, strictly in log order: a
+  new spawn joins the queue behind older ones, and a queued writer whose
+  workspace lease is taken holds the queue until it frees. An exited but
+  unreaped child process (a zombie) counts as gone, so its slot frees on the
+  next delegate without a poll.
+- **One canonical root.** The host canonicalizes the session root once; the
+  log key, the agents dir, the agent dirs recorded in the log and every poll
+  lookup use that one value, so a symlinked or `..` workspace path still
+  finds and settles its children. The file kept next to the
+  log for it holds only what carries no authority (role, artifacts to read,
+  mailbox choice): allow list, budget, depth, mode, task, workspace and profile
+  are read back from the node the tree recorded and the secrets are recomputed,
+  so a queued sibling cannot be widened through that file.
+- **Where the files live.** The log, its lock and the queue files live in the
+  tole data dir, `<codecora home>/tole/delegation/<hash of the canonical
+  workspace root>/`, outside every workspace, so a child's jailed file tools
+  cannot reach them; children get the log's absolute path in
+  `TOLE_DELEGATION_LOG`. What a child can still write is its own agent dir
+  under `<workspace>/tole-agents/<id>/` (its meta, log and session records:
+  usage understatement within its carve, see Budget) and, like any session,
+  whatever its allow list and approvals let it touch. A child with an approved
+  or allowlisted `run_command` could write the data dir like any other path
+  outside the jail; that is the same authority it already holds, and the fold
+  still refuses any spawn wider than its parent.
 
 ### User config (#433)
 

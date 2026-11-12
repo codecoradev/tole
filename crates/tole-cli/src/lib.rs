@@ -11,6 +11,7 @@ pub mod config_apply;
 pub mod config_trust;
 #[cfg(feature = "shell-tools")]
 pub mod cron;
+pub mod delegate;
 pub mod doctor;
 pub mod ecosystem;
 pub mod events;
