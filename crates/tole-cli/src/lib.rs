@@ -21,6 +21,8 @@ pub mod export;
 pub mod handoff;
 pub mod ledger_file;
 pub mod machine_guard;
+#[cfg(feature = "mcp")]
+pub mod plugin_cmd;
 pub mod plugin_gate;
 pub mod profile;
 pub mod protocol;

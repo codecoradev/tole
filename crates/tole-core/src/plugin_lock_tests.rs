@@ -208,3 +208,52 @@ fn ledger_lines_carry_names_and_hashes_only() {
     assert_eq!(v["server"], json!("cora"));
     assert!(l.ends_with('\n'));
 }
+
+#[test]
+fn a_snapshot_redacts_before_it_caps_and_stays_under_the_lock_cap() {
+    let secrets = crate::secrets::SecretSet::default().with("TOLE_T599_TOKEN", "tok-0599-secret");
+    // The secret straddles the field cap: capping first would keep its head.
+    let desc = format!("{}tok-0599-secret", "x".repeat(SNAPSHOT_FIELD_CAP - 5));
+    let snap = snapshot(&[tool("a", &desc, json!({}))], &secrets);
+    assert!(
+        !snap[0].description.contains("tok-0"),
+        "redacted before the cap"
+    );
+    assert!(snap[0].description.ends_with("…[cut]"));
+    // Hashes are exact even where the text is cut, so a change past the cap shows.
+    let mut other = desc.clone();
+    other.push('!');
+    let changes = tool_changes(&snap, &[tool("a", &other, json!({}))], &secrets);
+    assert!(
+        matches!(changes[..], [ToolChange::Description { .. }]),
+        "{changes:?}"
+    );
+    // Many large tools: the budget keeps the lock under its read cap; the
+    // rest keep only their hashes.
+    let big: Vec<ManifestTool> = (0..300)
+        .map(|i| tool(&format!("t{i:03}"), &"d".repeat(10_000), json!({})))
+        .collect();
+    let snap = snapshot(&big, &secrets);
+    assert!(snap
+        .iter()
+        .all(|t| t.description_hash.starts_with("sha256:")));
+    assert_eq!(snap.last().unwrap().description, NOT_STORED);
+    let lock = Lockfile {
+        servers: [(
+            "s".to_string(),
+            LockEntry {
+                manifest_hash: manifest_hash(&big),
+                manifest: snap,
+                ..Default::default()
+            },
+        )]
+        .into(),
+        ..Default::default()
+    };
+    let dir = tmp("budget");
+    lock.save(&dir.join(LOCK_FILE)).unwrap();
+    assert_eq!(
+        Lockfile::load(&dir.join(LOCK_FILE)).unwrap().version,
+        LOCK_VERSION
+    );
+}

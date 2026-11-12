@@ -131,6 +131,7 @@ impl Gate {
             sandbox: None,
             approved_at: now(),
             revoked: false,
+            manifest: plugin_lock::snapshot(tools, &tole_core::secrets::process_secrets()),
         };
         lock.servers.insert(server.to_string(), entry.clone());
         lock.save(&path)?;
@@ -140,13 +141,8 @@ impl Gate {
     }
 
     fn record(&self, event: &str, server: &str, hash: &str) {
-        let Some(dir) = self.user_path.as_deref().and_then(Path::parent) else {
-            return;
-        };
-        let line = plugin_lock::ledger_line(event, server, hash, now());
-        let mut store = crate::ledger_file::FileStore::new(dir.join(plugin_lock::LEDGER_FILE));
-        if let Err(e) = store.append(line.as_bytes()) {
-            eprintln!("tole: plugin ledger: {e}");
+        if let Some(user) = self.user_path.as_deref() {
+            record_event(user, event, server, hash);
         }
     }
 
@@ -173,6 +169,19 @@ impl Gate {
     }
 }
 
+/// Appends one ledger line next to the user lock `user` (names and
+/// hashes only).
+pub fn record_event(user: &Path, event: &str, server: &str, hash: &str) {
+    let Some(dir) = user.parent() else {
+        return;
+    };
+    let line = plugin_lock::ledger_line(event, server, hash, now());
+    let mut store = crate::ledger_file::FileStore::new(dir.join(plugin_lock::LEDGER_FILE));
+    if let Err(e) = store.append(line.as_bytes()) {
+        eprintln!("tole: plugin ledger: {e}");
+    }
+}
+
 /// Why `server`'s tools were not registered, and what to do.
 pub fn refusal(server: &str, a: &Admission) -> String {
     match a {
@@ -195,7 +204,7 @@ pub fn refusal(server: &str, a: &Admission) -> String {
 
 /// `sha256:<hex>` of a stdio server's resolved program (empty for HTTP or
 /// when it cannot be read).
-fn integrity(source: &str) -> String {
+pub fn integrity(source: &str) -> String {
     let Some(cmd) = source
         .strip_prefix("stdio:")
         .and_then(|c| c.split_whitespace().next())
@@ -215,17 +224,7 @@ fn integrity(source: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Terminal-safe text: control characters (newline and tab kept), bidi
-/// overrides and zero-width characters dropped. Never shortened.
-pub fn terminal_safe(s: &str) -> String {
-    s.chars()
-        .filter(|c| {
-            (!c.is_control() || matches!(c, '\n' | '\t'))
-                && !matches!(*c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
-                    | '\u{2066}'..='\u{2069}' | '\u{FEFF}')
-        })
-        .collect()
-}
+pub use tole_core::plugin_lock::terminal_safe;
 
 /// The full model-visible text of a server's tools, for approval.
 pub fn render_manifest(server: &str, version: &str, tools: &[ManifestTool]) -> String {

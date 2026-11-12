@@ -364,6 +364,13 @@ enum Command {
         #[command(subcommand)]
         action: tole_cli::skill_approve::SkillsAction,
     },
+    /// The plugin lock of your MCP servers (#599): list their state, diff a
+    /// changed server, approve or revoke one. Never starts a session.
+    #[cfg(feature = "mcp")]
+    Plugin {
+        #[command(subcommand)]
+        action: tole_cli::plugin_cmd::PluginAction,
+    },
     /// Remote approvals (issue #200): list pending Write-approval
     /// requests on a `tole serve` instance and allow/deny them. URL
     /// defaults to TOLE_SERVE_URL or http://127.0.0.1:7801; token to
@@ -689,6 +696,13 @@ fn gate_policy(cmd: &Command) -> GatePolicy {
         Command::Tui { .. } => GatePolicy::MayPrompt,
         _ => GatePolicy::NoPrompt,
     }
+}
+
+/// An error of `tole plugin`, redacted and terminal-safe.
+#[cfg(feature = "mcp")]
+fn ctx_clean(e: &str) -> String {
+    let set = tole_cli::provider_chain::process_secrets(&tole_cli::config_apply::real_env);
+    tole_core::plugin_lock::terminal_safe(&set.redact(e))
 }
 
 /// What the command line supplied for the config-applied keys. ONE place,
@@ -1197,6 +1211,42 @@ fn dispatch(cli: Cli) -> Result<()> {
             },
         ),
         Command::Skills { action } => tole_cli::skill_approve::cli(action),
+        #[cfg(feature = "mcp")]
+        Command::Plugin { action } => {
+            use std::io::IsTerminal;
+            let specs = host
+                .mcp_server
+                .iter()
+                .filter_map(|s| tole_core::mcp::McpServerConfig::parse(s).ok())
+                .collect();
+            let mut ask = |q: &str| {
+                use std::io::Write;
+                eprint!("{q}");
+                let _ = std::io::stderr().flush();
+                let mut line = String::new();
+                std::io::stdin().read_line(&mut line).is_ok()
+                    && matches!(line.trim(), "y" | "Y" | "yes")
+            };
+            let mut ctx = tole_cli::plugin_cmd::Ctx {
+                specs,
+                user: tole_core::plugin_lock::Lockfile::user_path(),
+                workspace: resolve_workspace_root(host.workspace.as_ref())?,
+                list: &tole_core::mcp::list_manifest,
+                interactive: std::io::stdin().is_terminal() && std::io::stderr().is_terminal(),
+                ask: &mut ask,
+                secrets: tole_cli::provider_chain::process_secrets(&config_apply::real_env),
+            };
+            match tole_cli::plugin_cmd::run(action, &mut ctx) {
+                Ok(out) => {
+                    print!("{out}");
+                    Ok(())
+                }
+                Err(e) => {
+                    eprintln!("tole plugin: {}", ctx_clean(&e));
+                    std::process::exit(1);
+                }
+            }
+        }
         Command::Approvals {
             action,
             id,

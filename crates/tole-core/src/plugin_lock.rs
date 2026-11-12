@@ -29,8 +29,17 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-/// Current lock format version; a newer one is refused.
-pub const LOCK_VERSION: u32 = 1;
+/// Current lock format version; a newer one is refused. Version 2 adds the
+/// per-tool manifest snapshot (`manifest`); version 1 entries load without
+/// one.
+pub const LOCK_VERSION: u32 = 2;
+/// Text a lock entry's snapshot may hold for one server, all tools
+/// together; past it a tool keeps only its hashes.
+pub const SNAPSHOT_BUDGET: usize = 128 * 1024;
+/// Most characters of one description or schema kept in a snapshot.
+pub const SNAPSHOT_FIELD_CAP: usize = 8 * 1024;
+/// What a snapshot holds instead of text it did not store.
+pub const NOT_STORED: &str = "«not stored in the lock»";
 /// The lock file name (user: in the tole data dir; project: under `.tole/`).
 pub const LOCK_FILE: &str = "plugins.lock";
 /// The plugin audit ledger in the tole data dir.
@@ -106,6 +115,131 @@ pub fn file_sha256(path: &Path) -> Option<String> {
     Some(format!("sha256:{hex}"))
 }
 
+/// Terminal-safe text: control characters (newline and tab kept), bidi
+/// overrides and zero-width characters dropped. Never shortened.
+pub fn terminal_safe(s: &str) -> String {
+    s.chars()
+        .filter(|c| {
+            (!c.is_control() || matches!(c, '\n' | '\t'))
+                && !matches!(*c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
+                    | '\u{2066}'..='\u{2069}' | '\u{FEFF}')
+        })
+        .collect()
+}
+
+fn sha(bytes: &[u8]) -> String {
+    let hex: String = Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    format!("sha256:{hex}")
+}
+
+/// One tool as the lock remembers it: exact hashes of its description and
+/// schema, and their text redacted, made terminal-safe and capped (in that
+/// order), for `tole plugin diff`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SnapshotTool {
+    pub name: String,
+    pub description_hash: String,
+    pub schema_hash: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub schema: String,
+}
+
+fn shown(text: &str, secrets: &crate::secrets::SecretSet, budget: &mut usize) -> String {
+    let safe = terminal_safe(&secrets.redact(text));
+    let cap = SNAPSHOT_FIELD_CAP.min(*budget);
+    let n = safe.chars().count();
+    if n <= cap {
+        *budget -= n;
+        return safe;
+    }
+    if cap < 64 {
+        return NOT_STORED.to_string();
+    }
+    *budget -= cap;
+    let mut cut: String = safe.chars().take(cap).collect();
+    cut.push_str("…[cut]");
+    cut
+}
+
+/// The snapshot of `tools` stored with an approval (sorted by name).
+pub fn snapshot(tools: &[ManifestTool], secrets: &crate::secrets::SecretSet) -> Vec<SnapshotTool> {
+    let mut sorted: Vec<&ManifestTool> = tools.iter().collect();
+    sorted.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut budget = SNAPSHOT_BUDGET;
+    sorted
+        .into_iter()
+        .map(|t| {
+            let schema = canonical_json(&t.input_schema);
+            SnapshotTool {
+                name: terminal_safe(&secrets.redact(&t.name)),
+                description_hash: sha(t.description.as_bytes()),
+                schema_hash: sha(schema.as_bytes()),
+                description: shown(&t.description, secrets, &mut budget),
+                schema: shown(&schema, secrets, &mut budget),
+            }
+        })
+        .collect()
+}
+
+/// One difference between a locked snapshot and the live tool list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolChange {
+    Added(SnapshotTool),
+    Removed(SnapshotTool),
+    Description {
+        old: SnapshotTool,
+        new: SnapshotTool,
+    },
+    Schema {
+        old: SnapshotTool,
+        new: SnapshotTool,
+    },
+}
+
+/// Tool by tool, what changed from the locked snapshot `old` to `live`
+/// (compared by exact hashes, so a change past the stored text still
+/// shows).
+pub fn tool_changes(
+    old: &[SnapshotTool],
+    live: &[ManifestTool],
+    secrets: &crate::secrets::SecretSet,
+) -> Vec<ToolChange> {
+    let new = snapshot(live, secrets);
+    let find = |set: &[SnapshotTool], name: &str| set.iter().find(|t| t.name == name).cloned();
+    let mut out = Vec::new();
+    for n in &new {
+        match find(old, &n.name) {
+            None => out.push(ToolChange::Added(n.clone())),
+            Some(o) => {
+                if o.description_hash != n.description_hash {
+                    out.push(ToolChange::Description {
+                        old: o.clone(),
+                        new: n.clone(),
+                    });
+                }
+                if o.schema_hash != n.schema_hash {
+                    out.push(ToolChange::Schema {
+                        old: o,
+                        new: n.clone(),
+                    });
+                }
+            }
+        }
+    }
+    for o in old {
+        if find(&new, &o.name).is_none() {
+            out.push(ToolChange::Removed(o.clone()));
+        }
+    }
+    out
+}
+
 /// One approved server.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -133,6 +267,10 @@ pub struct LockEntry {
     /// Revoked entries stay (append-only intent): never connected again.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub revoked: bool,
+    /// The approved tools, for `tole plugin diff` (empty in a version 1
+    /// entry: then only the hash is known).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub manifest: Vec<SnapshotTool>,
 }
 
 /// A lock file.
@@ -189,7 +327,11 @@ impl Lockfile {
     pub fn save(&self, path: &Path) -> Result<(), String> {
         let dir = path.parent().unwrap_or_else(|| Path::new("."));
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        let json = serde_json::to_vec_pretty(self).map_err(|e| e.to_string())?;
+        let current = Self {
+            version: LOCK_VERSION,
+            servers: self.servers.clone(),
+        };
+        let json = serde_json::to_vec_pretty(&current).map_err(|e| e.to_string())?;
         let tmp = dir.join(format!(".{LOCK_FILE}.{}.tmp", std::process::id()));
         std::fs::write(&tmp, json).map_err(|e| format!("{}: {e}", tmp.display()))?;
         std::fs::rename(&tmp, path).map_err(|e| {
