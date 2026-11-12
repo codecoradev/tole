@@ -596,6 +596,14 @@ enum Command {
         #[command(subcommand)]
         action: tole_cli::cron::CronAction,
     },
+    /// Webhook routes of `tole serve` (#582): `add`, `list`, `remove` and
+    /// `test` (a local dry run; `--fire` to a loopback serve). Routes live
+    /// in the user config only; keys are never given or shown.
+    #[cfg(feature = "shell-tools")]
+    Hook {
+        #[command(subcommand)]
+        action: tole_cli::hook_cli::HookAction,
+    },
     /// Project config file `.tole/config.toml` (#208): `check` validates
     /// it and shows the effective values, `trust`/`untrust` manage the
     /// trust record. Every key is applied after trust (flag > env > config
@@ -682,7 +690,7 @@ fn gate_policy(cmd: &Command) -> GatePolicy {
         | Command::Skills { .. }
         | Command::Audit { .. } => GatePolicy::Skip,
         #[cfg(feature = "shell-tools")]
-        Command::Cron { .. } => GatePolicy::Skip,
+        Command::Cron { .. } | Command::Hook { .. } => GatePolicy::Skip,
         // `--prompt-file -` consumes stdin as the prompt: a question on
         // the same stream would eat prompt text.
         Command::Run { prompt_file, .. } if prompt_file.as_deref() == Some("-") => {
@@ -1210,6 +1218,8 @@ fn dispatch(cli: Cli) -> Result<()> {
                 profile: cli.profile.clone(),
             },
         ),
+        #[cfg(feature = "shell-tools")]
+        Command::Hook { action } => tole_cli::hook_cli::cli(action),
         Command::Skills { action } => tole_cli::skill_approve::cli(action),
         #[cfg(feature = "mcp")]
         Command::Plugin { action } => {

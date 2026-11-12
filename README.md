@@ -166,6 +166,8 @@ tole cron create "@daily" --script "backup.sh"  # scheduled job; `tole cron tick
 tole cron create "0 9 * * 1-5" "Summarize open PRs" --allow write_file --model M  # agent job; `tole serve --cron` hosts the ticker
 tole cron create "@daily" "Triage new issues" --skill triage --profile ops  # agent job with a skill (name or SKILL.md, content pinned on save: a changed skill blocks the run until `cron edit --skill` re-pins) and a user-config profile; Writes need --allow AND the profile's allow
 tole cron edit NAME --deliver file:reports/prs.md   # also: run NAME (now), cancel NAME, status (ticker alive?)
+tole hook add gh --key-env GH_HOOK_KEY --job triage --event push --template "commit: {head_commit.message}"  # webhook route in the USER config (never a project one); the key is named, never given or shown; allow_writes/filters are hand edits
+tole hook test gh --event push --payload push.json  # local dry run: sign, filter, print the fenced context; fires nothing (--fire --url http://127.0.0.1:PORT posts it to a loopback serve); also: list, remove ROUTE
 tole status [id]                            # pc / seq / turns / token + cache usage / request-size split; model, effort, context used/window, tokens, compactions (default: latest session)
 tole audit [goal] [--json]                  # this workspace's delegation tree, read-only, capped and redacted (default: list the goals)
 ```

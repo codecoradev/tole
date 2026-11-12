@@ -411,6 +411,44 @@ delivery:
 - **`contains`** is a substring match on a string and a whole-element match
   on an array.
 
+**As implemented, part 3 of #582 (`tole hook`):**
+- **`tole hook add ROUTE`** appends one `[hooks.ROUTE]` section to the
+  user config, never a project config.
+  - The rest of the file, comments included, is kept, and the file is
+    replaced through a temporary file and a rename.
+  - The route is checked with `hooks::load`, the loader `tole serve` uses,
+    before anything is written. A key variable unset in the current shell
+    is checked with a stand-in, and `add` notes that serve will refuse to
+    start until it is set.
+  - An existing route is refused (remove it first).
+- **The key is never on the command line.** `add` takes exactly one of
+  `--key-env NAME` or `--key-file /absolute/path`, and there is no flag for
+  the key value. No `tole hook` output shows a key, and `list` does not
+  show where one comes from (a load error may name the variable or file,
+  as serve's does).
+- **P8 holds.** `allow_writes`, `insecure_loopback` and the filter have no
+  flags. Widening a route stays a manual edit of the user config.
+- **`list`** shows each route's job, events, the filter's shape (paths and
+  operators only, never the compared values), `writes: yes|no` and
+  `signed` or `insecure (loopback only)`.
+- **`remove ROUTE`** cuts the route's `[hooks.ROUTE]` and
+  `[hooks.ROUTE.*]` sections and keeps the rest. If the route is still there
+  afterwards (an inline table, for example), it refuses and asks for a
+  hand edit.
+- **`test ROUTE`** is a local dry run.
+  - It loads the route with the real key, reads `--payload` (default
+    `{}`, capped at `max_body_bytes`), signs it with the native scheme and
+    verifies the signature.
+  - It applies the events allowlist and the filter, then prints the fenced
+    rendering of the template, redacted with the process secrets and
+    capped as serve does.
+  - It fires nothing and writes no ledger line.
+- **`test ROUTE --fire --url http://127.0.0.1:PORT`** posts the same signed
+  delivery to that `tole serve`. Serve verifies it and fires through
+  `cron::claim_now` like any delivery. Only a loopback `http://` host
+  (`127.0.0.0/8`, `[::1]`, `localhost`) is accepted, so the command never
+  sends a signed delivery off the machine.
+
 ## 7. Adoptable from Nakama (withnakama.com)
 
 Nakama is team-oriented (multi-tenant dashboard, channels, ~200 MB idle
