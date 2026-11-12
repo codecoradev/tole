@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::Map;
 use tole_core::ledger::{
     CatchUp, Delivery, DeliveryStatus, Done, Due, Fire, HookSeen, Job, Lease, Ledger, LedgerError,
-    LedgerState, LedgerStore, MemoryStore, MissReason, Missed, Record, RunStatus,
+    LedgerState, LedgerStore, MemoryStore, MissReason, Missed, Record, Resume, RunStatus,
 };
 
 /// 2026-01-01T00:00:00Z.
@@ -810,4 +810,109 @@ fn crash_at_every_append_boundary_loses_nothing_and_fires_once() {
             assert!(s.pending().next().is_none(), "{ctx}: dangling claim");
         }
     }
+}
+
+/// #581: a parked run is continued once, under its own `fire_id`; the
+/// parked `done` stays, and only an `awaiting_approval` run can be resumed.
+#[test]
+fn a_parked_run_resumes_once_as_a_new_pending_run() {
+    let mut l = fresh(&[job("a", "*/5 * * * *", T)]);
+    let due = l.ready(T + 300).unwrap();
+    let fire = l.claim(&due[0], P1, T + 301).unwrap().unwrap();
+    let parked = Some("s1".to_string());
+    l.settle(
+        &fire.fire_id,
+        RunStatus::AwaitingApproval,
+        parked.clone(),
+        None,
+        T + 302,
+    )
+    .unwrap();
+    let cont = l.resume(&fire.fire_id, P2, T + 400).unwrap();
+    assert_ne!(cont.fire_id, fire.fire_id);
+    assert_eq!(
+        l.state().resumed_by(&fire.fire_id),
+        Some(cont.fire_id.as_str())
+    );
+    assert!(l.state().pending().any(|f| f.fire_id == cont.fire_id));
+    let e = l.resume(&fire.fire_id, P2, T + 401).unwrap_err();
+    assert!(e.to_string().contains("resumed already"), "{e}");
+    // The continuation settles like any run; the parked done stays.
+    l.settle(&cont.fire_id, RunStatus::Ok, parked, None, T + 410)
+        .unwrap();
+    assert_eq!(
+        l.state().done(&fire.fire_id).unwrap().status,
+        RunStatus::AwaitingApproval
+    );
+    assert_eq!(l.state().last_outcome("a").unwrap().status, RunStatus::Ok);
+    // A finished run, and an unsettled one, cannot be resumed.
+    let e = l.resume(&cont.fire_id, P2, T + 420).unwrap_err();
+    assert!(e.to_string().contains("not awaiting approval"), "{e}");
+    let due = l.ready(T + 600).unwrap();
+    let running = l.claim(&due[0], P1, T + 601).unwrap().unwrap();
+    assert!(l.resume(&running.fire_id, P2, T + 602).is_err());
+}
+
+/// A hand-written `resume` line for a run that is not parked, or a second
+/// one for a resumed run, is ignored by the fold: it never runs.
+#[test]
+fn a_forged_resume_line_never_revives_a_run() {
+    let mut l = fresh(&[job("a", "*/5 * * * *", T)]);
+    let due = l.ready(T + 300).unwrap();
+    let fire = l.claim(&due[0], P1, T + 301).unwrap().unwrap();
+    l.settle(&fire.fire_id, RunStatus::Ok, None, None, T + 302)
+        .unwrap();
+    let forged = Record::Resume(Resume {
+        fire_id: "forged".into(),
+        resumes: fire.fire_id.clone(),
+        job_id: "a".into(),
+        claimed_at: T + 303,
+        lease: P2,
+    });
+    let st = LedgerState::fold(&[
+        Record::Job(job("a", "*/5 * * * *", T)),
+        Record::Fire(fire.clone()),
+        Record::Done(l.state().done(&fire.fire_id).unwrap().clone()),
+        forged,
+    ]);
+    assert!(st.fire("forged").is_none(), "an ok run is not resumable");
+    assert!(st.pending().next().is_none());
+    // A pending continuation dies with its lease like any run.
+    let due = l.ready(T + 600).unwrap();
+    let f2 = l.claim(&due[0], P1, T + 601).unwrap().unwrap();
+    l.settle(
+        &f2.fire_id,
+        RunStatus::AwaitingApproval,
+        None,
+        None,
+        T + 602,
+    )
+    .unwrap();
+    let cont = l.resume(&f2.fire_id, P2, T + 603).unwrap();
+    // A second, hand-written resume of the same parked run is ignored.
+    let second = Record::Resume(Resume {
+        fire_id: "forged-second".into(),
+        resumes: f2.fire_id.clone(),
+        job_id: "a".into(),
+        claimed_at: T + 604,
+        lease: P1,
+    });
+    let st = LedgerState::fold(&[
+        Record::Job(job("a", "*/5 * * * *", T)),
+        Record::Fire(f2.clone()),
+        Record::Done(l.state().done(&f2.fire_id).unwrap().clone()),
+        Record::Resume(Resume {
+            fire_id: cont.fire_id.clone(),
+            resumes: f2.fire_id.clone(),
+            job_id: "a".into(),
+            claimed_at: T + 603,
+            lease: P2,
+        }),
+        second,
+    ]);
+    assert_eq!(st.resumed_by(&f2.fire_id), Some(cont.fire_id.as_str()));
+    assert!(st.fire("forged-second").is_none());
+    let done = l.recover(T + 700, |lease| lease.pid != P2.pid).unwrap();
+    assert_eq!(done[0].fire_id, cont.fire_id);
+    assert_eq!(done[0].status, RunStatus::Interrupted);
 }

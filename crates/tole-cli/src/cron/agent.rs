@@ -5,7 +5,9 @@
 //! - **`tole serve --cron`** (in-process ticker): a Write that the job's
 //!   `allow` list does not cover is parked in serve's `/approvals` queue
 //!   (the `QueueApprover`, 15-min expiry → denied) and the run settles
-//!   `awaiting_approval`. Resuming an approved run is #581.
+//!   `awaiting_approval`. An allow resumes it (#581, [`super::tick::resume_parked`]):
+//!   a `resume` claim, the same session reopened, the parked turn resumed
+//!   (the one-shot lets exactly the approved call run), and a new `done`.
 //! - **standalone `tole cron tick`**: there is no queue, so such a Write is
 //!   refused and the run settles `awaiting_approval`.
 //!
@@ -257,6 +259,7 @@ pub fn run_agent(
     queue: Option<&Arc<ApprovalQueue>>,
     cancel: &CancelToken,
     max_tokens: u64,
+    resume: Option<&str>,
 ) -> AgentRun {
     let fail = |session_id: Option<String>, e: String| AgentRun {
         status: RunStatus::Error,
@@ -283,7 +286,10 @@ pub fn run_agent(
         Ok(d) => d,
         Err(e) => return fail(None, e),
     };
-    let session_id = crate::session_host::new_session_id("cron");
+    let session_id = match resume {
+        Some(sid) => sid.to_string(),
+        None => crate::session_host::new_session_id("cron"),
+    };
     let path = dir.join(format!("{session_id}.jsonl"));
     let profile_allow = setup.profile.as_ref().map(|p| p.allow.as_slice());
     let approver = approver(job, profile_allow, queue, &session_id, &path);
@@ -294,15 +300,19 @@ pub fn run_agent(
             Err(e) => return fail(None, e.to_string()),
         };
     let name = field(job, "name").unwrap_or(&job.id).to_string();
-    let mut storage = match crate::session_host::create_session(
-        &dir,
-        &session_id,
-        None,
-        Some(&name),
-        Some("cron"),
-    ) {
+    let opened = match resume {
+        // Checked again right before the reopen: the session file sits in
+        // the job's workdir (see `tick::parked_pc`).
+        Some(_) => super::tick::parked_pc(&path)
+            .and_then(|_| tole_core::storage::JsonlStorage::open(&path).map_err(|e| e.to_string())),
+        None => {
+            crate::session_host::create_session(&dir, &session_id, None, Some(&name), Some("cron"))
+                .map_err(|e| e.to_string())
+        }
+    };
+    let mut storage = match opened {
         Ok(s) => s,
-        Err(e) => return fail(None, e.to_string()),
+        Err(e) => return fail(resume.map(str::to_string), e),
     };
     let sid = Some(session_id.clone());
     use tole_core::storage::Storage;
@@ -354,7 +364,12 @@ pub fn run_agent(
     });
     let memory = setup.memory(&canon);
     let sent = crate::turn_runner::with_recalled_memory(memory.as_ref(), prompt);
-    let outcome = crate::turn_runner::run_turn_with(&mut storage, &mut meter, &plan, &sent);
+    let outcome = match resume {
+        // The parked turn, continued: no new prompt.
+        Some(_) => tole_core::turn::resume_turn_with_cancel(&mut storage, &mut meter, &reg, cancel)
+            .map_err(crate::turn_runner::TurnRunError::Storage),
+        None => crate::turn_runner::run_turn_with(&mut storage, &mut meter, &plan, &sent),
+    };
     drop(done_tx);
     let _ = timer.join();
     let tokens = tole_core::transcript::tokens_in_out(storage.usages());

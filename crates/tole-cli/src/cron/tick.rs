@@ -115,6 +115,9 @@ pub struct Claimed {
     max_tokens: u64,
     /// The job's skills and profile, resolved at claim time (agent mode).
     setup: super::setup::AgentSetup,
+    /// A continuation (#581): the parked run's session, reopened instead
+    /// of a new one.
+    resume: Option<String>,
 }
 
 /// What the claim phase knows (computed once per pass).
@@ -197,7 +200,118 @@ pub fn claim_one<S: tole_core::ledger::LedgerStore>(
         fire,
         job: job.clone(),
         setup,
+        resume: None,
     }))
+}
+
+/// Largest run session a resume reopens (the run's workdir is writable by
+/// the job, so its session file is read as untrusted).
+pub const MAX_RESUME_SESSION_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The `pc` of a parked run's session: its last `state` line. The file
+/// lives in the job's workdir, which the job can write, so it is opened
+/// without following a symlink or blocking (a FIFO), must be a regular file
+/// and at most [`MAX_RESUME_SESSION_BYTES`].
+pub fn parked_pc(path: &Path) -> Result<tole_core::state::Pc, String> {
+    let bytes = tole_core::delegation_report::read_plain_file(path, MAX_RESUME_SESSION_BYTES)
+        .map_err(|e| format!("the session file is {e}"))?
+        .ok_or("the session file is gone")?;
+    // A line is one record or one commit's array of records.
+    String::from_utf8_lossy(&bytes)
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .flat_map(|v| match v {
+            Value::Array(records) => records,
+            one => vec![one],
+        })
+        .rfind(|v| v["kind"] == "state")
+        .and_then(|v| serde_json::from_value(v["pc"].clone()).ok())
+        .ok_or_else(|| "the session file has no state".to_string())
+}
+
+/// After an `/approvals` allow (#581): continues the parked agent run whose
+/// session is `session_id`, under a new `resume` claim (once per parked
+/// run), through the same execute / settle / deliver path as a tick. The
+/// continuation reopens the session and resumes the parked turn: the
+/// approver's one-shot lets the approved call run, then the model replans.
+/// `Ok(None)` when no unresumed parked run has that session.
+pub fn resume_parked(
+    dir: &Path,
+    session_id: &str,
+    now: i64,
+    opts: &TickOptions,
+) -> anyhow::Result<Option<(String, RunStatus)>> {
+    let claimed = store::with_lock(dir, |l| {
+        let parked = l
+            .state()
+            .dones()
+            .filter(|d| d.session_id.as_deref() == Some(session_id))
+            .filter(|d| d.status == RunStatus::AwaitingApproval)
+            .find(|d| l.state().resumed_by(&d.fire_id).is_none())
+            .cloned();
+        let Some(parked) = parked else {
+            return Ok(None);
+        };
+        let Some(job) = l.state().job(&parked.job_id).map(|j| j.job.clone()) else {
+            anyhow::bail!("job `{}` is gone", parked.job_id);
+        };
+        if job.removed {
+            anyhow::bail!(
+                "job `{}` was removed; the parked run is not resumed",
+                job.id
+            );
+        }
+        // Only a turn still parked on the call can take the approval: one
+        // that went on after the denial (the model answered) has nothing to
+        // resume.
+        let workdir = super::field(&job, "workdir").unwrap_or_default();
+        let path = crate::session_host::sessions_dir_for(workdir)
+            .map_err(|e| anyhow::anyhow!(e))?
+            .join(format!("{session_id}.jsonl"));
+        let pc = parked_pc(&path).map_err(|e| anyhow::anyhow!("session {session_id}: {e}"))?;
+        if matches!(pc, tole_core::state::Pc::Idle | tole_core::state::Pc::Final) {
+            anyhow::bail!(
+                "the run's turn went on after the denial and ended, so the approval cannot \
+                 apply; re-run the job (`tole cron run {}`)",
+                job.id
+            );
+        }
+        // The checks a claim makes, before the `resume` record: a refused
+        // continuation writes nothing, so the run stays resumable once the
+        // owner fixes the cause.
+        let ctx = ClaimCtx::new(l, now, opts);
+        if !ctx.provider_ready {
+            anyhow::bail!("{}", crate::turn_runner::MISSING_PROVIDER_CONFIG);
+        }
+        if let Err((code, detail)) = deliver::check(&job) {
+            anyhow::bail!("{code}: {detail}");
+        }
+        let setup = super::setup::resolve(&job)
+            .map_err(|(code, detail)| anyhow::anyhow!("{code}: {detail}"))?;
+        let left = ctx.cap.map(|c| c.saturating_sub(ctx.used_today));
+        if left == Some(0) {
+            anyhow::bail!("daily token cap reached; resume the run after it resets");
+        }
+        let fire = l.resume(&parked.fire_id, store::own_lease(), now)?;
+        let job_max = job
+            .extra
+            .get("max_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(super::agent::DEFAULT_MAX_TOKENS);
+        Ok(Some(Claimed {
+            max_tokens: left.map_or(job_max, |left| left.min(job_max)),
+            fire,
+            job,
+            setup,
+            resume: Some(session_id.to_string()),
+        }))
+    })?;
+    let Some(c) = claimed else {
+        return Ok(None);
+    };
+    let mut report = TickReport::default();
+    run_claimed(dir, vec![c], now, opts, &mut report)?;
+    Ok(report.ran.into_iter().next())
 }
 
 /// One finished run, ready to settle.
@@ -245,6 +359,7 @@ fn execute(dir: &Path, c: &Claimed, opts: &TickOptions) -> RunResult {
             opts.approvals.as_ref(),
             &cancel,
             c.max_tokens,
+            c.resume.as_deref(),
         );
         RunResult {
             status: run.status,
