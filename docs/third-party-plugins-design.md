@@ -1,8 +1,8 @@
 # Third-party plugins (MCP servers, skills) — design note
 
 Status: **research + proposal; the lockfile, tool-manifest hash and
-connect-time guard of §4.1–4.2 are implemented by #599 part 1** (the
-`tole plugin` commands follow in part 2). Second half of the
+connect-time guard of §4.1–4.2 are implemented by #599 part 1, and
+`tole plugin list|diff|approve|revoke` (§4.5) by part 2.** Second half of the
 integration track (own integrations first, see
 [secrets-integrations-design.md](secrets-integrations-design.md)).
 Related: [skills-registry-design.md](skills-registry-design.md).
@@ -238,3 +238,15 @@ a machine with the same server version, copied into the job's
 `$CODECORA_HOME/tole/`). Re-approve after upgrading a server. A project lock
 (`.tole/plugins.lock`) in the repository cannot stand in for it: it can only
 narrow what the user lock approves.
+
+**`tole plugin` (#599 part 2).** `tole plugin list` shows each server's
+state, version, manifest hash, approval date and lock; `tole plugin diff
+<name>` shows what changed since approval, tool by tool; `tole plugin
+approve <name>` approves from a terminal, or from a script with
+`--hash <manifest hash>` (cron and CI can approve this way once the hash is
+reviewed); `tole plugin revoke <name>` blocks a server until it is approved
+again. An approval made before part 2 (lock version 1) has no tool
+snapshot: `diff` shows the live list in full instead, and approving again
+stores one. The binary integrity hash recorded at approval is checked by
+`list` and `diff` only; a changed binary is reported, not blocked at
+connect (the manifest and version still are).
