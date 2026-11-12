@@ -114,6 +114,24 @@ and process spawning live in `tole-cli`.
   first valid instant after the gap; an ambiguous local time (fall-back)
   fires once, on the first occurrence. `every <dur>` jobs are plain
   durations and unaffected. These cases get table-driven tests.
+  **As implemented, part 1 of #580:** the zone layer is in `tole-core`
+  (`tz`):
+  - UTC, fixed offsets (at most ±14:00) and rules from TZif data. TZif
+    versions 1 to 4 are read, and the POSIX TZ footer that slim zoneinfo
+    files use for every future date is evaluated. A POSIX TZ string can
+    also be used alone.
+  - `Zone::from_local` gives one instant, the first instant after a gap,
+    or both instants of an overlap.
+  - Sources are a trait, `ZoneSource`. `OffsetOnly` is the default with no
+    data; `ZoneinfoDir` reads `/usr/share/zoneinfo` at run time. It follows
+    alias links only inside the directory, refuses anything but a regular
+    file of at most 512 KiB, and never waits on a FIFO.
+  - Leap-second zones are refused.
+  - `bundled` is not built: an embedder or a later feature plugs bundled
+    data in as another `ZoneSource`, so core embeds no database.
+  - Part 2 wires schedules (`Zoned`), the ledger (a `fire` records its zone
+    and DST case), `cron.timezone`, `cron.tz_source` and `tole cron
+    --timezone`.
 - **Cron parsing:** small in-tree parser for 5-field cron (+ `@every`),
   property-tested against a brute-force minute walker. Prefer this over a
   dependency; revisit only if the audit cost of ~200 LOC exceeds a vetted crate
