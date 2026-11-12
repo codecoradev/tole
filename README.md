@@ -358,7 +358,11 @@ default = "standard"                   # light | standard | heavy
 may receive it; every other secret-shaped variable is scrubbed from them.
 **`run_command`, `job_start` and cron scripts get no secret by default**;
 `GITHUB_TOKEN` defaults to the `gh` and `git` tools and your hooks and MCP
-servers. A project config can only narrow a binding. Migration note:
+servers. A project config can only narrow a binding. Sensitive files
+(`.env*`, `*.pem`, `id_*`, `.npmrc`, `.netrc`, `*.key`) read as
+`KEY=«redacted»`; to read one verbatim, approve a `read_file_raw` call (or
+`--allow read_file_raw`). `tole doctor` lists which secrets are set and which
+tools may receive each. Migration note:
 [docs/secrets-integrations-design.md §9](docs/secrets-integrations-design.md).
 
 ```toml

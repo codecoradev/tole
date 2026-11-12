@@ -2,6 +2,11 @@
 //! `write_file`. The agent can read files inside the working tree but
 //! never traverse out of it (no `..`, no absolute paths, no symlink
 //! escapes).
+//!
+//! A sensitive file (`.env*`, keys, `.npmrc`, `.netrc`: see
+//! [`crate::sensitive`]) comes back redacted, with no content hash. The
+//! same tool built with [`ReadFileTool::raw`] is `read_file_raw`,
+//! `Risk::Write`: the approved, verbatim read (#598 part b).
 
 use crate::tool::{Risk, Tool};
 use serde_json::{json, Value};
@@ -31,11 +36,19 @@ fn opt_uint(input: &Value, key: &str) -> Result<Option<u64>, String> {
 #[derive(Debug, Clone)]
 pub struct ReadFileTool {
     root: PathBuf,
+    /// `read_file_raw`: verbatim, and approval-gated.
+    raw: bool,
 }
 
 impl ReadFileTool {
     pub fn new(root: PathBuf) -> Self {
-        Self { root }
+        Self { root, raw: false }
+    }
+
+    /// `read_file_raw`: reads a sensitive file verbatim; `Risk::Write`, so
+    /// every call needs approval (or an explicit allow entry).
+    pub fn raw(root: PathBuf) -> Self {
+        Self { root, raw: true }
     }
 
     /// Resolve `rel` inside the jail. Mirrors `WriteFileTool::jailed`
@@ -80,16 +93,30 @@ impl ReadFileTool {
 
 impl Tool for ReadFileTool {
     fn name(&self) -> &str {
-        "read_file"
+        if self.raw {
+            "read_file_raw"
+        } else {
+            "read_file"
+        }
     }
 
     fn risk(&self) -> Risk {
-        Risk::ReadOnly
+        if self.raw {
+            Risk::Write
+        } else {
+            Risk::ReadOnly
+        }
     }
 
     fn summary(&self) -> String {
+        if self.raw {
+            return "Read a sensitive file (.env*, *.pem, id_*, .npmrc, .netrc, *.key) VERBATIM, \
+                    values included. Needs the user's approval; use read_file for anything else."
+                .into();
+        }
         "Read a text file inside the workspace. Returns at most 20000 chars; if `truncated`, \
-         continue with offset=`next_offset` (offset/limit are in chars)."
+         continue with offset=`next_offset` (offset/limit are in chars). Sensitive files \
+         (.env*, keys) come back as KEY=«redacted»."
             .into()
     }
 
@@ -98,6 +125,9 @@ impl Tool for ReadFileTool {
             .get("path")
             .and_then(Value::as_str)
             .unwrap_or("<missing path>");
+        if self.raw {
+            return format!("read file {path} VERBATIM, secret values included");
+        }
         format!("read file {path}")
     }
 
@@ -123,36 +153,21 @@ impl Tool for ReadFileTool {
             return Err("read_file: 'limit' must be at least 1".into());
         }
         let target = self.jailed(path)?;
-        let meta = std::fs::metadata(&target)
-            .map_err(|e| format!("read_file: stat {}: {e}", target.display()))?;
-        if meta.is_dir() {
-            return Err(format!("read_file: is a directory: {path}"));
-        }
-        // Regular files ONLY (cora full-scan #21): FIFOs block on open
-        // until a writer appears, sockets/devices error opaquely — and a
-        // FIFO reports len() == 0 so the size cap below never fires. A
-        // hang inside a ReadOnly tool freezes the whole turn loop.
-        if !meta.is_file() {
-            return Err(format!(
-                "read_file: not a regular file (refusing to read): {path}"
-            ));
-        }
-        if meta.len() > MAX_READ_BYTES {
-            return Err(format!(
-                "read_file: {} is {} bytes (max {})",
-                path,
-                meta.len(),
-                MAX_READ_BYTES
-            ));
-        }
-        let bytes =
-            std::fs::read(&target).map_err(|e| format!("read_file: {}: {e}", target.display()))?;
+        let bytes = read_regular(&target, path)?;
         // Lossy decode: source files are UTF-8; anything else still gets
         // a readable form instead of a hard error.
-        let content = String::from_utf8_lossy(&bytes).into_owned();
+        let mut content = String::from_utf8_lossy(&bytes).into_owned();
         // Content hash (E12): the model quotes this in `edit_file.old_hash`
-        // so stale anchors are refused before they corrupt a file.
-        let hash = crate::file_tools::content_hash(&content);
+        // so stale anchors are refused before they corrupt a file. A
+        // sensitive file gets none: a 64-bit hash of a short secret could be
+        // brute-forced, and editing it needs the verbatim read anyway.
+        let sensitive = !self.raw && crate::sensitive::is_sensitive_path(Path::new(path), &target);
+        let hash = if sensitive {
+            content = crate::sensitive::redact_content(Path::new(path), &target, &content);
+            Value::Null
+        } else {
+            json!(crate::file_tools::content_hash(&content))
+        };
         // Slice in CHARACTERS on the decoded text (boundary-safe: byte
         // positions come from `char_indices`, never from arithmetic).
         // `hash`/`bytes` always describe the WHOLE file.
@@ -184,8 +199,58 @@ impl Tool for ReadFileTool {
         if truncated {
             out["next_offset"] = json!(end_chars);
         }
+        if sensitive {
+            out["redacted"] = json!(true);
+            out["note"] = json!(
+                "a sensitive file: values are hidden. To read it verbatim, call read_file_raw \
+                 (the user must approve it)"
+            );
+        }
         Ok(out)
     }
+}
+
+/// The bytes of the regular file `target`, at most [`MAX_READ_BYTES`].
+/// Regular files ONLY (cora full-scan #21): a FIFO blocks on open until a
+/// writer appears and reports len() == 0, so the file is opened without
+/// blocking or following a final symlink, checked on the open handle, and
+/// read with a cap (a file swapped in after the check cannot hang or bloat
+/// the read).
+fn read_regular(target: &Path, path: &str) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let mut o = std::fs::OpenOptions::new();
+    o.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    let f = o
+        .open(target)
+        .map_err(|e| format!("read_file: {}: {e}", target.display()))?;
+    let meta = f
+        .metadata()
+        .map_err(|e| format!("read_file: stat {}: {e}", target.display()))?;
+    if meta.is_dir() {
+        return Err(format!("read_file: is a directory: {path}"));
+    }
+    if !meta.is_file() {
+        return Err(format!(
+            "read_file: not a regular file (refusing to read): {path}"
+        ));
+    }
+    let too_big = |n: u64| format!("read_file: {path} is {n} bytes (max {MAX_READ_BYTES})");
+    if meta.len() > MAX_READ_BYTES {
+        return Err(too_big(meta.len()));
+    }
+    let mut bytes = Vec::new();
+    f.take(MAX_READ_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("read_file: {}: {e}", target.display()))?;
+    if bytes.len() as u64 > MAX_READ_BYTES {
+        return Err(too_big(bytes.len() as u64));
+    }
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -452,5 +517,68 @@ mod tests {
             ),
             Err(_) => panic!("read_file worker thread panicked"),
         }
+    }
+
+    /// #598 part b: a sensitive file reads as `KEY=«redacted»`, also through
+    /// a symlink and whatever the case of its name; only the approval-gated
+    /// `read_file_raw` returns it verbatim.
+    #[test]
+    fn sensitive_files_read_redacted_and_raw_only_with_approval() {
+        let dir = tmpdir("sensitive");
+        std::fs::write(dir.join(".env"), "DB_PASSWORD=hunter2hunter2\n# note\n").unwrap();
+        std::fs::write(dir.join("Server.PEM"), "key material\nline two\n").unwrap();
+        std::fs::write(dir.join(".ENV.Local"), "TOKEN=abcdefgh123\n").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.join(".env"), dir.join("notes.txt")).unwrap();
+        let t = ReadFileTool::new(dir.clone());
+        assert_eq!(t.risk(), Risk::ReadOnly);
+        let out = t.execute(json!({"path": ".env"})).unwrap();
+        assert_eq!(
+            out["content"],
+            json!("DB_PASSWORD=«redacted»\n«redacted»\n")
+        );
+        assert_eq!(out["redacted"], json!(true));
+        assert_eq!(out["hash"], Value::Null, "no hash of a secret");
+        assert!(out["note"].as_str().unwrap().contains("read_file_raw"));
+        let out = t.execute(json!({"path": "Server.PEM"})).unwrap();
+        assert_eq!(out["content"], json!("«redacted»"));
+        let out = t.execute(json!({"path": ".ENV.Local"})).unwrap();
+        assert_eq!(out["content"], json!("TOKEN=«redacted»\n"));
+        #[cfg(unix)]
+        {
+            let out = t.execute(json!({"path": "notes.txt"})).unwrap();
+            assert!(!out.to_string().contains("hunter2"), "{out}");
+        }
+        // The raw read: its own tool, Risk::Write, so it needs approval.
+        let raw = ReadFileTool::raw(dir.clone());
+        assert_eq!((raw.name(), raw.risk()), ("read_file_raw", Risk::Write));
+        let out = raw.execute(json!({"path": ".env"})).unwrap();
+        assert!(out["content"].as_str().unwrap().contains("hunter2hunter2"));
+        assert!(out["hash"].is_string(), "editing needs the hash");
+        // An ordinary file is untouched.
+        std::fs::write(dir.join("a.rs"), "fn a() {}\n").unwrap();
+        let out = t.execute(json!({"path": "a.rs"})).unwrap();
+        assert_eq!(out["content"], json!("fn a() {}\n"));
+        assert!(out.get("redacted").is_none());
+    }
+
+    /// A FIFO named like a secret never hangs the read (opened without
+    /// blocking, checked on the handle).
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_never_hangs_the_read() {
+        let dir = tmpdir("fifo-env");
+        let p = dir.join(".env");
+        let c = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(ReadFileTool::raw(dir).execute(json!({"path": ".env"})));
+        });
+        let got = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the read blocked on a FIFO");
+        assert!(got.unwrap_err().contains("not a regular file"));
     }
 }

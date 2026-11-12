@@ -308,6 +308,10 @@ pub fn build(approver: impl Approver + 'static, roster: Roster) -> Result<ToolRe
         )?;
     }
     add(&mut reg, tracked(Box::new(ReadFileTool::new(root.clone()))))?;
+    // The verbatim read of a sensitive file (#598 part b): Risk::Write, so
+    // each call needs approval. Registered in plan mode too: it writes
+    // nothing.
+    add(&mut reg, tracked(Box::new(ReadFileTool::raw(root.clone()))))?;
     // Web tools (#215): fetch always; search only with a backend.
     match tole_core::web::WebBackendFetchTool::from_env().map_err(anyhow::Error::msg)? {
         Some(fetch) => add(&mut reg, Box::new(fetch.with_secrets(&secrets)))?,

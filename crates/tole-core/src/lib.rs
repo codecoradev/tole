@@ -85,6 +85,7 @@ pub mod run_command;
 pub(crate) mod sanitize;
 pub mod secret_release;
 pub mod secrets;
+pub mod sensitive;
 pub mod sibling_watch;
 pub mod skill_approval;
 pub mod skill_index;

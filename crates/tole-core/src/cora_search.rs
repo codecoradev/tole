@@ -111,8 +111,10 @@ impl Tool for CoraSearchTool {
             return Err(format!("cora brain exited {}: {}", out.status, snippet));
         }
         let stdout = String::from_utf8_lossy(&out.stdout);
-        let parsed: Value = serde_json::from_str(&stdout)
+        let mut parsed: Value = serde_json::from_str(&stdout)
             .map_err(|e| format!("cora brain output was not valid JSON: {e}"))?;
+        // A hit in a sensitive file shows its path, never its text (#598).
+        crate::sensitive::redact_hits(&mut parsed);
         Ok(parsed)
     }
 }
