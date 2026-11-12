@@ -48,6 +48,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Missions now learn about cora's agent-as-reviewer flow (#536): `tole mission` builds its registry like `run` (including the auto-attached `mcp_cora_*` tools) but its pinned system prompt never named the review tools, so the unattended command was the one that did not know the flow existed. When both `mcp_cora_cora_review_prepare` and `mcp_cora_cora_review_finalize` are registered, a fresh mission's prompt now carries the same review section as `run` / `chat` / the TUI plus one sentence asking for a review (and its verdict in the final message) before the mission ends; without the tools nothing is added. Guidance only: a gate before `git commit` is tracked separately. `serve`, `acp` and `mcp` sessions are unchanged on purpose: they attach no external MCP servers, so they have no review tools. Resumed missions keep their pinned prompt.
 
 ### Added
+- Webhook filters and templates, part 2a of #582: the new module `tole_cli::hook_filter`. Routes start using it in part 2b, where it runs before any LLM work.
+  - **Filters:** `equals`, `contains`, `in`, `regex` and `exists` on a `dot.path`, joined by `all`, `any` and `not`. Each node has exactly one operator, and a tree is at most 8 deep and 64 nodes.
+  - **Regex** uses `regex-lite`, which does not backtrack. A pattern is at most 256 bytes and its compiled program at most 32 KiB, and a string over 16 KiB is never scanned.
+  - **`{dot.path}` templates** render scalar values only. Each value is neutralized (control characters and fence markers), redacted with the process secrets, then capped at 1024 characters; the whole rendering is capped at 8 KiB.
+  - **`fenced`** wraps the rendering as untrusted data, and **`event_allowed`** applies a route's events allowlist.
+  - **New dependency:** `regex-lite` 0.1, in `tole-cli` only. It has no dependencies of its own, so `tole-cli` goes from 207 to 208 unique crates, and `tole-core` stays at 50 (`--no-default-features`).
 - Webhook signature checks in `tole-core`, part 1a of #582. Nothing serves webhooks yet; `POST /hooks/<route>` on `tole serve` follows in the next part.
   - New module `webhook`: `hmac_sha256` (RFC 2104, built on the `sha2` crate already in the tree, so no new dependency), `ct_eq`, `sign` and `verify`.
   - `verify` accepts two schemes:

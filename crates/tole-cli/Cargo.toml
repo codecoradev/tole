@@ -54,6 +54,10 @@ http-body-util = { version = "0.1", optional = true }
 tower-service = { version = "0.3", optional = true }
 rmcp = { version = "3.3", default-features = false, features = ["server", "transport-streamable-http-server"], optional = true }
 http = { version = "1", optional = true }
+# Webhook `regex` filters (#582 part 2): no dependencies, and matching is
+# linear in pattern and input (no backtracking); patterns and inputs are
+# capped in `hook_filter`. Serve side only: tole-core does not use it.
+regex-lite = "0.1"
 
 # Offline trace replay scorer (issue #107, gated behind the `replay`
 # feature since #118). Lives under evals/ and is operator-built for
