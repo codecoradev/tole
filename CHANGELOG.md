@@ -48,6 +48,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Missions now learn about cora's agent-as-reviewer flow (#536): `tole mission` builds its registry like `run` (including the auto-attached `mcp_cora_*` tools) but its pinned system prompt never named the review tools, so the unattended command was the one that did not know the flow existed. When both `mcp_cora_cora_review_prepare` and `mcp_cora_cora_review_finalize` are registered, a fresh mission's prompt now carries the same review section as `run` / `chat` / the TUI plus one sentence asking for a review (and its verdict in the final message) before the mission ends; without the tools nothing is added. Guidance only: a gate before `git commit` is tracked separately. `serve`, `acp` and `mcp` sessions are unchanged on purpose: they attach no external MCP servers, so they have no review tools. Resumed missions keep their pinned prompt.
 
 ### Added
+- Model routing wired into runs, part 2 of #586. Off unless the user config says `[router] enabled = true`; with routing off nothing changes.
+  - **Where:** a new `tole run`, `tole chat`, TUI session, `tole mission`, delegated child (a mission with `TOLE_AGENT_DEPTH` of 1 or more routes as `delegate`) and cron agent run is routed once, before its first provider call. Never per turn: a resumed session or a continued cron run keeps its model.
+  - **An explicit model wins:** a session that already has a model (`/model`, ACP) and a cron job with a `--model` pin are not routed.
+  - **What changes:** the routed model is stored as the session's `fact/model`, and the decision (tier, model, source, reason, redacted then capped) as `fact/route`. The run's budget, allow list, plan mode and secrets are untouched; the tools sent to the provider are the same.
+  - **The brief:**
+    - the task text: the prompt or goal; a cron run uses the job's own prompt, never a webhook payload;
+    - the highest risk among the run's tools (new `ToolRegistry::max_risk`);
+    - the profile, the job's name and the token budget.
+  - **A broken router** (an undeclared tier, an unknown profile) stops `run`, `chat`, the TUI and `mission` before the session file exists, and fails a cron run with the remedy, before any provider call.
 - Model routing config, dry run and doctor, part 1b of #586. Nothing routes runs yet: part 2 wires the router into runs, cron runs and delegated children, off by default.
   - **`[router]` in the user config:**
     - `enabled` (off unless `true`), `allow_tiers`, `[router.tiers]` (the models of runs without a profile; a profile resolves through `profiles.<name>.models`) and `[[router.rules]]`.

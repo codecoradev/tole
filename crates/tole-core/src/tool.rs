@@ -274,6 +274,21 @@ impl ToolRegistry {
         self.tools.retain(|_, t| t.risk() == Risk::ReadOnly);
     }
 
+    /// The highest risk among the registered tools (`ReadOnly` when
+    /// empty): the model router's (#586) view of what a run can touch.
+    pub fn max_risk(&self) -> Risk {
+        let rank = |r: Risk| match r {
+            Risk::ReadOnly => 0,
+            Risk::Write => 1,
+            Risk::Destructive => 2,
+        };
+        self.tools
+            .values()
+            .map(|t| t.risk())
+            .max_by_key(|r| rank(*r))
+            .unwrap_or(Risk::ReadOnly)
+    }
+
     /// OpenAI-format `tools` array for every registered tool (E4.5).
     /// Sorted by name so the wire payload is deterministic — the same
     /// registry always serializes to the same request body.

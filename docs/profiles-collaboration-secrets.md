@@ -512,11 +512,28 @@ it beats the rule baseline (LLMRouterBench shows many routers do not).
     start in part 2).
 - **`tole route`** is the dry run: the tier, model and reason for a prompt,
   with no provider call. `tole doctor` shows names only.
-- **Part 2** wires the route into run start, cron runs and delegated
-  children. An explicit model (a flag, a job's `--model`, a session's
-  `/model`) wins over the router. The decision is recorded, redacted, in
-  the session or the cron ledger. Routing happens once per run, never per
-  turn.
+**As implemented, part 2 of #586 (the wiring):**
+- **Once per run, at its start:** `run`, `chat`, the TUI, `mission`, a
+  delegated child (a mission at `TOLE_AGENT_DEPTH` ≥ 1, routed as
+  `delegate`) and a cron agent run. A resumed session or a continued cron
+  run keeps its model, so the prompt cache is never discarded mid-session.
+- **Precedence:** an explicit model wins. A session that already has
+  `fact/model` (`/model`, ACP) and a cron job's `--model` pin are never
+  routed. Otherwise the router replaces the configured model (environment,
+  config or profile default) only when a rule matches.
+- **Recorded in the session:** the routed model as `fact/model` (every face
+  and resume reads it), the decision as `fact/route` (tier, model, source,
+  reason; redacted, then capped). A cron run's session holds it too.
+- **Nothing else moves:** budgets, allow lists, plan mode and secrets are
+  built as before; the test suite checks that the tools sent to the
+  provider are identical with and without a route.
+- **Brief inputs:** the prompt or goal (a cron run uses the job's prompt,
+  never the webhook context), `ToolRegistry::max_risk`, the profile, the
+  job and the token budget.
+- **Load time:** a broken router stops `run`, `chat`, the TUI and `mission`
+  before their session file exists, and fails a cron run with its remedy.
+- **Not routed:** `tole serve` / ACP sessions and the TUI's `/new`; they
+  keep the configured model.
 
 #### A9.4 Other cheap decisions laya can take (later, same seam)
 

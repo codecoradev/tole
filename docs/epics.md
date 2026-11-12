@@ -290,7 +290,11 @@ Bot and Nakama; BMAD for collaboration). Design notes:
     leases, grants and measured usage, and the completion report
     (`delegate_report`), and `tole audit`; done);
   - model routing with RuleRouter plus LayaRouter, on/off by the
-    `SYSTEMONE_*` env (#586);
+    `SYSTEMONE_*` env (#586; the `Router` seam and the RuleRouter
+    baseline, `[router]` in the user config, `tole route` and the doctor
+    lines are in, and new runs, missions, delegated children and cron runs
+    are routed once when `[router] enabled = true`. LayaRouter waits for
+    the eval gate);
   - advisor (#587);
   - multi-round discussion with a sanitizer (#588);
   - `uteke_document` parent (#576).

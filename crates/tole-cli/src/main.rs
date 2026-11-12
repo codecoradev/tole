@@ -1014,6 +1014,8 @@ fn dispatch(cli: Cli) -> Result<()> {
     // the subcommand-level flags are absent (previously they were
     // silently ignored by those subcommands).
     let host = HostConfig {
+        profile_name: profile.as_ref().map(|p| p.name.clone()),
+        max_tokens: settings.max_tokens.as_ref().map(|t| t.value),
         workspace: settings.workspace.as_ref().map(|w| w.value.clone()),
         skills: config_apply::values(&settings.skill),
         no_skills: settings.no_skills.value,
@@ -1355,6 +1357,17 @@ fn dispatch(cli: Cli) -> Result<()> {
                 .with_context(|| format!("creating {}", sessions_dir.display()))?;
             let registry =
                 build_registry(build_approver(&allow_patterns, yes), &host, &allow_patterns)?;
+            // Model routing (#586): a delegated child (TOLE_AGENT_DEPTH >= 1)
+            // routes as `delegate`; a broken router fails before the
+            // mission's session exists.
+            tole_cli::routing::Routing::from_config(&host.delegation.cfg)
+                .map_err(anyhow::Error::msg)?;
+            let route_kind = tole_cli::routing::mission_kind(&config_apply::real_env);
+            let route_goal = goal.clone();
+            let route = |s: &mut dyn tole_core::storage::Storage,
+                         r: &tole_core::tool::ToolRegistry| {
+                host.route(s, route_kind, &route_goal, r, false, Some(tier.max_tokens))
+            };
             mission::run_mission(
                 mission::MissionConfig {
                     goal,
@@ -1372,6 +1385,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                 },
                 registry,
                 &sessions_dir,
+                &route,
             )
         }
         #[cfg(feature = "shell-tools")]
@@ -1665,6 +1679,11 @@ struct HostConfig {
     agents_worktree: bool,
     /// Delegation (#585): profiles and `[delegation]` for the delegate tool.
     delegation: tole_cli::delegate::Setup,
+    /// The selected profile's name (#586): the model router's brief.
+    profile_name: Option<String>,
+    /// The run's token budget (`--max-tokens` / `mission.max_tokens`), for
+    /// the router's `budget_below` (#586).
+    max_tokens: Option<u64>,
 
     /// Tool-boundary hook command lines (issue #110), default empty.
     on_pretool: Vec<String>,
@@ -1683,6 +1702,38 @@ struct HostConfig {
 }
 
 impl HostConfig {
+    /// Routes a NEW session once (#586), before its provider is built: off
+    /// unless `[router] enabled = true`; a session that already has a model
+    /// is left alone. A broken router fails the start with its remedy. The
+    /// one-line decision goes to stderr unless `quiet` (the TUI owns the
+    /// screen).
+    fn route(
+        &self,
+        storage: &mut dyn tole_core::storage::Storage,
+        kind: tole_core::router::TaskKind,
+        prompt: &str,
+        registry: &tole_core::tool::ToolRegistry,
+        quiet: bool,
+        budget_left: Option<u64>,
+    ) -> Result<()> {
+        let brief = tole_core::router::Brief {
+            kind,
+            prompt,
+            max_risk: registry.max_risk(),
+            profile: self.profile_name.as_deref(),
+            job: None,
+            budget_left,
+        };
+        let secrets = tole_cli::provider_chain::process_secrets(&tole_cli::config_apply::real_env);
+        let line =
+            tole_cli::routing::route_new_session(storage, &self.delegation.cfg, &brief, &secrets)
+                .map_err(|e| anyhow!(secrets.redact(&e).into_owned()))?;
+        if let (Some(l), false) = (line, quiet) {
+            eprintln!("{l}");
+        }
+        Ok(())
+    }
+
     fn on_pretool_non_empty(&self) -> bool {
         !self.on_pretool.is_empty()
     }
@@ -2185,6 +2236,8 @@ fn run_command(
     images: &[String],
 ) -> Result<()> {
     let cfg = tole_cli::turn_runner::provider_config().map_err(anyhow::Error::msg)?;
+    // A broken router (#586) fails before the session file exists.
+    tole_cli::routing::Routing::from_config(&host.delegation.cfg).map_err(anyhow::Error::msg)?;
     // Resolve (jail-check) images before the session file exists.
     let images = tole_cli::turn_runner::resolve_images(images)?;
     // Build everything that can fail BEFORE the session file exists, so a
@@ -2242,6 +2295,15 @@ fn run_command(
     }
     // Task-list tools (issue #198): a fresh session starts with an empty list.
     tool_roster::register_todo(&mut registry, storage.entries(), host.plan_mode)?;
+    // Model routing (#586): once, before the provider reads `fact/model`.
+    host.route(
+        &mut storage,
+        tole_core::router::TaskKind::Run,
+        prompt,
+        &registry,
+        false,
+        host.max_tokens,
+    )?;
 
     let mut provider = tole_cli::turn_runner::session_provider(
         cfg,
@@ -2824,6 +2886,9 @@ fn chat_command(
     }
 
     if fresh {
+        // A broken router (#586) fails before the session file exists.
+        tole_cli::routing::Routing::from_config(&host.delegation.cfg)
+            .map_err(anyhow::Error::msg)?;
         std::fs::create_dir_all(sessions_dir)
             .with_context(|| format!("creating {}", sessions_dir.display()))?;
     }
@@ -2853,6 +2918,18 @@ fn chat_command(
     {
         use tole_core::storage::Storage;
         tool_roster::register_todo(&mut registry, storage.entries(), host.plan_mode)?;
+    }
+    // Model routing (#586): a fresh chat is routed once; a resumed one
+    // keeps its model.
+    if fresh {
+        host.route(
+            &mut storage,
+            tole_core::router::TaskKind::Chat,
+            "",
+            &registry,
+            false,
+            host.max_tokens,
+        )?;
     }
     println!(
         "tole chat — session {session_id} (Ctrl-D exits, /image <path> attaches to the next message, resume: tole chat --resume {session_id})"
@@ -3222,11 +3299,14 @@ fn tui_command(
         .or_else(resolve_system_prompt)
         .unwrap_or_else(|| build_default_prompt(host.plan_mode));
     let prompt = format!("{prompt}{}{skill_sections}", review_section(&registry));
-    let storage = match &resume {
+    let mut storage = match &resume {
         Some(id) => {
             JsonlStorage::open(session_path(sessions_dir, id)).context("replaying session log")?
         }
         None => {
+            // A broken router (#586) fails before the session file exists.
+            tole_cli::routing::Routing::from_config(&host.delegation.cfg)
+                .map_err(anyhow::Error::msg)?;
             std::fs::create_dir_all(sessions_dir)
                 .with_context(|| format!("creating {}", sessions_dir.display()))?;
             let id = new_session_id();
@@ -3241,6 +3321,18 @@ fn tui_command(
         }
     };
     tool_roster::register_todo(&mut registry, storage.entries(), host.plan_mode)?;
+    // Model routing (#586): a fresh session is routed once, quietly (the
+    // decision is in its `fact/route` register).
+    if resume.is_none() {
+        host.route(
+            &mut storage,
+            tole_core::router::TaskKind::Chat,
+            "",
+            &registry,
+            true,
+            host.max_tokens,
+        )?;
+    }
     let session = tole_cli::tui_host::TuiSession::new(storage, registry, cfg, host.compaction)
         .with_sessions(sessions_dir.to_path_buf(), Some(prompt))
         .with_workspace(resolve_workspace_root(host.workspace.as_ref())?)
