@@ -34,6 +34,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Missions now learn about cora's agent-as-reviewer flow (#536): `tole mission` builds its registry like `run` (including the auto-attached `mcp_cora_*` tools) but its pinned system prompt never named the review tools, so the unattended command was the one that did not know the flow existed. When both `mcp_cora_cora_review_prepare` and `mcp_cora_cora_review_finalize` are registered, a fresh mission's prompt now carries the same review section as `run` / `chat` / the TUI plus one sentence asking for a review (and its verdict in the final message) before the mission ends; without the tools nothing is added. Guidance only: a gate before `git commit` is tracked separately. `serve`, `acp` and `mcp` sessions are unchanged on purpose: they attach no external MCP servers, so they have no review tools. Resumed missions keep their pinned prompt.
 
 ### Added
+- Webhook signature checks in `tole-core`, part 1a of #582. Nothing serves webhooks yet; `POST /hooks/<route>` on `tole serve` follows in the next part.
+  - New module `webhook`: `hmac_sha256` (RFC 2104, built on the `sha2` crate already in the tree, so no new dependency), `ct_eq`, `sign` and `verify`.
+  - `verify` accepts two schemes:
+    - native: `X-Tole-Timestamp` and `X-Tole-Signature: sha256=<hex>` over `<timestamp>.<body>`, within ±300 s;
+    - GitHub: `X-Hub-Signature-256` over the body.
+  - Every delivery needs an id (`X-Tole-Delivery` / `X-GitHub-Delivery`, 1 to 128 of `[A-Za-z0-9._:-]`). A refusal (`Reject`) gives a status and a reason, never a header value.
+  - The ledger's `hook_seen` fold keeps seen deliveries for 7 days, so its memory is bounded. The new `LedgerState::hooks_since(route, since)` counts a route's deliveries from the log, so a rate limit built on it survives a restart. `LedgerState::hooks_tracked` reports how many are kept.
 - Per-job time zones for cron, part 2 of #580.
   - `tole cron create|edit --timezone` takes `UTC`, a fixed offset like `+07:00` or an IANA name like `Asia/Jakarta`. The schedule then runs on that zone's wall clock: `0 9 * * *` stays 09:00 local across DST changes.
   - A local time that DST skips runs once, right after the gap. A local time that happens twice runs once, the first time. `@every` is a plain duration and ignores the zone.
