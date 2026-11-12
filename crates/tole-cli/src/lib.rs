@@ -19,6 +19,7 @@ pub mod events;
 #[cfg(feature = "tui")]
 pub mod export;
 pub mod handoff;
+pub mod hook_cli;
 pub mod hook_filter;
 pub mod hooks;
 pub mod ledger_file;

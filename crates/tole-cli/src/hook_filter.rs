@@ -191,6 +191,32 @@ pub fn matches(f: &Filter, payload: &Value) -> bool {
     }
 }
 
+/// A short shape of a filter for listings, `all(action equals,
+/// not(draft equals))`: paths and operators, never the compared values.
+pub fn summary(c: &FilterConfig) -> String {
+    let path = c.path.as_deref().unwrap_or("?");
+    let list = |fs: &[FilterConfig]| fs.iter().map(summary).collect::<Vec<_>>().join(", ");
+    if c.equals.is_some() {
+        format!("{path} equals")
+    } else if c.contains.is_some() {
+        format!("{path} contains")
+    } else if c.one_of.is_some() {
+        format!("{path} in")
+    } else if c.regex.is_some() {
+        format!("{path} regex")
+    } else if c.exists.is_some() {
+        format!("{path} exists")
+    } else if let Some(fs) = &c.all {
+        format!("all({})", list(fs))
+    } else if let Some(fs) = &c.any {
+        format!("any({})", list(fs))
+    } else if let Some(f) = &c.not {
+        format!("not({})", summary(f))
+    } else {
+        "?".into()
+    }
+}
+
 /// Is `event` admitted by the route's `events` list (no list: every event)?
 pub fn event_allowed(events: Option<&[String]>, event: Option<&str>) -> bool {
     match events {
