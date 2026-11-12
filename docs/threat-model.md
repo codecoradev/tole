@@ -933,6 +933,13 @@ The delegate tool (#585 part 3, `crates/tole-cli/src/delegate.rs`) adds:
   report counts as none, and a child whose agent dir is not plain is charged
   its whole carve. The report reaches the parent model only between fence
   markers it cannot contain, labeled as data, not instructions.
+  Every file the parent reads from a child's agent dir (the report, its
+  session files for usage, and `agent_poll`'s pid, meta, log and handoff) is
+  opened with `O_NOFOLLOW | O_NONBLOCK` and checked to be a regular file on the
+  open descriptor, with a size cap before reading: a FIFO or symlink planted
+  there is refused at once, so a child cannot block its parent (which settles
+  children under the delegation log's exclusive lock) or point it at another
+  file.
 - **Where the files live.** The log, its lock and the queue files live in the
   tole data dir, `<codecora home>/tole/delegation/<hash of the canonical
   workspace root>/`, outside every workspace, so a child's jailed file tools

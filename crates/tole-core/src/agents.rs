@@ -386,9 +386,22 @@ fn mailbox_ns_for(id: &str) -> String {
     format!("agent-{id}")
 }
 
+/// Largest child-written file (meta, handoff) the parent reads.
+const MAX_CHILD_FILE: u64 = 64 * 1024;
+
+/// A file in a child's agent dir, which the child can replace: read
+/// without blocking (a FIFO), without following a symlink, regular files
+/// only, at most `cap` bytes. `Ok(None)` when it does not exist.
+fn read_child_text(path: &std::path::Path, cap: u64) -> Result<Option<String>, String> {
+    crate::delegation_report::read_plain_file(path, cap)?
+        .map(|b| String::from_utf8(b).map_err(|_| "not UTF-8".to_string()))
+        .transpose()
+}
+
 fn read_meta(dir: &std::path::Path) -> Result<AgentMeta, String> {
-    let raw =
-        std::fs::read_to_string(dir.join("meta.json")).map_err(|e| format!("agent meta: {e}"))?;
+    let raw = read_child_text(&dir.join("meta.json"), MAX_CHILD_FILE)
+        .map_err(|e| format!("agent meta: {e}"))?
+        .ok_or("agent meta: missing")?;
     serde_json::from_str(&raw).map_err(|e| format!("agent meta parse: {e}"))
 }
 
@@ -413,7 +426,7 @@ fn live_agents(root: &std::path::Path) -> Result<usize, String> {
     };
     for e in root_dir.flatten() {
         let dir = e.path();
-        let Ok(pid) = std::fs::read_to_string(dir.join("pid")) else {
+        let Ok(Some(pid)) = read_child_text(&dir.join("pid"), 64) else {
             continue;
         };
         if let Ok(pid) = pid.trim().parse::<u32>() {
@@ -1002,8 +1015,10 @@ impl Tool for AgentPollTool {
             return Err(format!("agent_poll: invalid agent id {id:?}"));
         }
         let dir = agents_root(&self.root).join(id);
-        let pid: u32 = std::fs::read_to_string(dir.join("pid"))
-            .map_err(|_| format!("agent_poll: unknown agent {id}"))?
+        let pid: u32 = read_child_text(&dir.join("pid"), 64)
+            .ok()
+            .flatten()
+            .ok_or_else(|| format!("agent_poll: unknown agent {id}"))?
             .trim()
             .parse()
             .map_err(|_| format!("agent_poll: corrupt pid file for {id}"))?;
@@ -1019,7 +1034,20 @@ impl Tool for AgentPollTool {
 
         // Bounded log tail (same read-window discipline as job_poll).
         let mut tail = String::new();
-        if let Ok(mut f) = std::fs::File::open(dir.join("log")) {
+        let mut log = std::fs::OpenOptions::new();
+        log.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // The child can replace its log: never block on a FIFO or follow
+            // a symlink, and read regular files only.
+            log.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let log = log
+            .open(dir.join("log"))
+            .ok()
+            .filter(|f| f.metadata().is_ok_and(|m| m.is_file()));
+        if let Some(mut f) = log {
             use std::io::{Read, Seek, SeekFrom};
             let len = f.metadata().map(|m| m.len()).unwrap_or(0);
             let start = len.saturating_sub(READ_WINDOW);
@@ -1079,9 +1107,9 @@ fn attach_handoff(dir: &std::path::Path, meta: &AgentMeta, out: &mut Value) {
         return;
     };
     out["role"] = json!(role.as_str());
-    let raw = match std::fs::read_to_string(dir.join(HANDOFF_FILE)) {
-        Ok(raw) => raw,
-        Err(_) => {
+    let raw = match read_child_text(&dir.join(HANDOFF_FILE), MAX_CHILD_FILE) {
+        Ok(Some(raw)) => raw,
+        _ => {
             // Nothing submitted.
             if role.requires_verification() {
                 out["gate"] = json!("unverified");

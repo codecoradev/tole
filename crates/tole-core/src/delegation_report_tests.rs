@@ -91,3 +91,36 @@ fn the_parent_read_refuses_what_the_child_could_plant() {
     }
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// Runs `f` on a thread and fails if it does not return within 2 s.
+#[cfg(unix)]
+fn within_2s<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(2))
+        .expect("blocked: did not return within 2 s")
+}
+
+#[cfg(unix)]
+fn mkfifo(p: &std::path::Path) {
+    let c = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: a valid NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_fifo_report_is_refused_without_blocking() {
+    let d = tmp("fifo");
+    let path = d.join(REPORT_FILE);
+    mkfifo(&path);
+    let p = path.clone();
+    let r = within_2s(move || read(&p));
+    assert!(r.unwrap_err().contains("not a regular file"));
+    let p = path.clone();
+    let r = within_2s(move || read_plain_file(&p, 1024));
+    assert!(r.is_err());
+    let _ = std::fs::remove_dir_all(&d);
+}

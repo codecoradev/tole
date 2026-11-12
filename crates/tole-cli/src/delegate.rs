@@ -46,7 +46,6 @@ use tole_core::delegation::{
     Budget, BudgetRequest, DelegateRequest, Delegation, Goal, Mode, Node, Outcome, Spend,
     DEFAULT_MAX_DEPTH, DEFAULT_MAX_LIVE_PROCESSES,
 };
-use tole_core::storage::Storage as _;
 use tole_core::tool::{Risk, Tool};
 
 use crate::config::Config;
@@ -167,17 +166,33 @@ pub fn measured(agent_dir: &Path) -> Option<Spend> {
         if !meta.is_file() || total > MAX_MEASURED_BYTES {
             return None;
         }
-        let st = tole_core::storage::JsonlStorage::open_read_only(&p).ok()?;
+        // Opened without blocking or following a link, and checked again
+        // on the open file: the child may swap the entry after the stat.
+        let bytes = tole_core::delegation_report::read_plain_file(&p, MAX_MEASURED_BYTES)
+            .ok()
+            .flatten()?;
+        let usages = usage_records(&bytes);
         s.tokens = s
             .tokens
-            .saturating_add(tole_core::transcript::tokens_in_out(st.usages()));
-        let steps = tole_core::transcript::provider_steps(st.usages());
+            .saturating_add(tole_core::transcript::tokens_in_out(&usages));
+        let steps = tole_core::transcript::provider_steps(&usages);
         s.steps = s
             .steps
             .saturating_add(u32::try_from(steps).unwrap_or(u32::MAX));
         found = true;
     }
     found.then_some(s)
+}
+
+/// The usage rows of a session file's bytes (`{"kind":"usage",...}` lines);
+/// any other or malformed line is skipped.
+fn usage_records(bytes: &[u8]) -> Vec<tole_core::storage::UsageRecord> {
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|v| v.get("kind").and_then(Value::as_str) == Some("usage"))
+        .filter_map(|v| serde_json::from_value(v).ok())
+        .collect()
 }
 
 /// Secret-named variables this process holds: its grant to pass down.

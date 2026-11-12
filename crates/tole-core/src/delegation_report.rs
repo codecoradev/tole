@@ -77,34 +77,50 @@ pub fn validate(r: &Report) -> Result<Report, String> {
     })
 }
 
-/// Reads the report at `path`: `Ok(None)` when there is none, `Err` when it
-/// is not a valid report (a symlink, too large, not UTF-8 JSON, over a cap).
-pub fn read(path: &Path) -> Result<Option<Report>, String> {
+/// Reads at most `cap` bytes of a file a CHILD can replace, without ever
+/// blocking or following a symlink: opened `O_NOFOLLOW | O_NONBLOCK` (a FIFO
+/// with no writer would otherwise block the open forever), then refused
+/// unless the opened file is a regular file no larger than `cap`.
+/// `Ok(None)` when it does not exist.
+pub fn read_plain_file(path: &Path, cap: u64) -> Result<Option<Vec<u8>>, String> {
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NOFOLLOW);
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     let f = match opts.open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!("the report cannot be read: {e}")),
+        Err(e) => return Err(format!("cannot be read: {e}")),
     };
-    if !f.metadata().is_ok_and(|m| m.is_file()) {
-        return Err("the report is not a regular file".into());
+    let meta = f.metadata().map_err(|e| format!("cannot be read: {e}"))?;
+    if !meta.is_file() {
+        return Err("not a regular file".into());
+    }
+    if meta.len() > cap {
+        return Err(format!("larger than {} KiB", cap / 1024));
     }
     let mut buf = Vec::new();
-    f.take(MAX_REPORT_BYTES + 1)
+    f.take(cap + 1)
         .read_to_end(&mut buf)
-        .map_err(|e| format!("the report cannot be read: {e}"))?;
-    if buf.len() as u64 > MAX_REPORT_BYTES {
-        return Err(format!(
-            "the report is larger than {} KiB",
-            MAX_REPORT_BYTES / 1024
-        ));
+        .map_err(|e| format!("cannot be read: {e}"))?;
+    if buf.len() as u64 > cap {
+        return Err(format!("larger than {} KiB", cap / 1024));
     }
+    Ok(Some(buf))
+}
+
+/// Reads the report at `path`: `Ok(None)` when there is none, `Err` when it
+/// is not a valid report (a symlink, a FIFO or other non-file, too large,
+/// not UTF-8 JSON, over a cap).
+pub fn read(path: &Path) -> Result<Option<Report>, String> {
+    let Some(buf) =
+        read_plain_file(path, MAX_REPORT_BYTES).map_err(|e| format!("the report is {e}"))?
+    else {
+        return Ok(None);
+    };
     let text = String::from_utf8(buf).map_err(|_| "the report is not UTF-8".to_string())?;
     let r: Report =
         serde_json::from_str(&text).map_err(|e| format!("the report is not valid: {e}"))?;

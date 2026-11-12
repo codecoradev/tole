@@ -3,7 +3,7 @@
 use super::*;
 use tole_core::delegation::NodeStatus;
 use tole_core::entry::{EntryType, NewEntry};
-use tole_core::storage::{Commit, JsonlStorage, UsageRecord};
+use tole_core::storage::{Commit, JsonlStorage, Storage as _, UsageRecord};
 
 fn tmp(tag: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("tole-delegate-{tag}-{}", std::process::id()));
@@ -773,5 +773,65 @@ fn a_planted_session_file_is_never_read_and_costs_the_whole_carve() {
         json!({"tokens": 300, "steps": 10}),
         "{p}"
     );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+fn mkfifo(p: &Path) {
+    let c = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: a valid NUL-terminated path.
+    assert_eq!(
+        unsafe { libc::mkfifo(c.as_ptr(), 0o600) },
+        0,
+        "{}",
+        p.display()
+    );
+}
+
+/// Runs `f` on a thread and fails if it does not return within 5 s.
+fn within_5s<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(5))
+        .expect("blocked: did not return within 5 s")
+}
+
+#[test]
+fn fifos_planted_in_the_agent_dir_never_block_the_parent() {
+    let root = tmp("fifo-planted");
+    // The child leaves FIFOs where the parent reads: its report, its log
+    // and a session file. None may block a poll or hold the log lock.
+    let h = host(
+        &root,
+        0,
+        &[],
+        "[delegation]\ngoal_budget = 1000\ngoal_steps = 100\n",
+    );
+    let (start, poll) = tools(&h, &root);
+    let out = start
+        .execute(json!({"task": "t", "mode": "consult", "budget": {"tokens": 300, "steps": 10}}))
+        .unwrap();
+    let dir = agent_dir_of(&root, &out);
+    wait_for(&dir.join("env"));
+    mkfifo(&dir.join(tole_core::delegation_report::REPORT_FILE));
+    mkfifo(&dir.join("sessions").join("s.jsonl"));
+    std::fs::remove_file(dir.join("log")).unwrap();
+    mkfifo(&dir.join("log"));
+    let poll = std::sync::Arc::new(poll);
+    let (p2, o2) = (poll.clone(), out.clone());
+    let p = within_5s(move || poll_done(&p2, &o2));
+    let v = &p["delegation"];
+    assert_eq!(v["status"], json!("incomplete"), "{p}");
+    assert!(
+        v["reason"].as_str().unwrap().contains("not a regular file"),
+        "{p}"
+    );
+    assert_eq!(v["used"], json!({"tokens": 300, "steps": 10}), "{p}");
+    // The log lock is free: another delegate goes through.
+    let start = std::sync::Arc::new(start);
+    let s2 = start.clone();
+    let again = within_5s(move || s2.execute(json!({"task": "u", "mode": "consult"})));
+    assert!(again.is_ok(), "{again:?}");
     let _ = std::fs::remove_dir_all(&root);
 }
