@@ -48,6 +48,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Missions now learn about cora's agent-as-reviewer flow (#536): `tole mission` builds its registry like `run` (including the auto-attached `mcp_cora_*` tools) but its pinned system prompt never named the review tools, so the unattended command was the one that did not know the flow existed. When both `mcp_cora_cora_review_prepare` and `mcp_cora_cora_review_finalize` are registered, a fresh mission's prompt now carries the same review section as `run` / `chat` / the TUI plus one sentence asking for a review (and its verdict in the final message) before the mission ends; without the tools nothing is added. Guidance only: a gate before `git commit` is tracked separately. `serve`, `acp` and `mcp` sessions are unchanged on purpose: they attach no external MCP servers, so they have no review tools. Resumed missions keep their pinned prompt.
 
 ### Added
+- Model routing by task weight, part 1a of #586: the `Router` seam and the rule baseline in `tole-core`. Nothing routes yet. The `[router]` config, `tole route` and doctor lines come in part 1b; wiring into runs, cron runs and delegated children comes in part 2, off by default.
+  - **`tole_core::router`** (platform-agnostic, no new dependency, builds with `--no-default-features`):
+    - `Router` returns a `Route` with a tier (`light`, `standard` or `heavy`), its source and a reason. It never returns a model name, a budget, an allow list or a secret.
+    - `RuleRouter` is deterministic. Every matching rule is a candidate, the cheapest tier wins, and among rules of that tier the first declared one names the route.
+    - An allowed-tier set can only narrow the pick. No match keeps the configured model.
+    - `RuleRouter::check` refuses, with a remedy, a rule whose tier is not declared where it resolves, or an unknown profile.
+    - `Route::model` errors on an undeclared tier, never falling back to another model. `Route::record` redacts with the process secrets, then caps at 300 characters.
+
+  Design: `docs/profiles-collaboration-secrets.md` A9.3.
 - `tole hook add|list|remove|test`, part 3 of #582 (built with the `shell-tools` feature, like `tole cron`).
   - **`add ROUTE`** appends one `[hooks.ROUTE]` section to the user config and never touches a project config. It keeps the rest of the file, comments included, and replaces it atomically. It refuses an existing route, and it checks the new route with the loader `tole serve` uses before writing.
   - **Keys:** `add` needs exactly one key source, `--key-env NAME` or `--key-file /absolute/path`. No flag takes the key itself, and no `tole hook` output shows a key. `list` does not show where a key comes from either.
