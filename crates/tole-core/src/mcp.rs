@@ -39,11 +39,14 @@ use std::time::{Duration, Instant};
 /// 2026-09-18: brittle string-prefix matching).
 const TRANSPORT_ERR: &str = "mcp transport";
 
+/// A server's reported version and its full tool list (#599).
+pub type Listed = (String, Vec<crate::plugin_lock::ManifestTool>);
+
 /// Request into the background tokio reactor.
 enum McpRequest {
     ListTools {
         config: McpServerConfig,
-        resp: mpsc::Sender<Result<Vec<(String, String)>, String>>,
+        resp: mpsc::Sender<Result<Listed, String>>,
     },
     Call {
         server: String,
@@ -477,24 +480,32 @@ struct McpConnection {
 }
 
 impl McpConnection {
-    /// List tool (name, description) pairs from the server.
-    async fn list_tools(&mut self) -> Result<Vec<(String, String)>, String> {
+    /// The server's reported version and every tool it lists, with the
+    /// full description and input schema (the manifest #599 hashes).
+    async fn list_tools(&mut self) -> Result<Listed, String> {
         let tools = self
             .service
             .list_all_tools()
             .await
             .map_err(|e| format!("tools/list failed: {e}"))?;
-        Ok(tools
+        let version = self
+            .service
+            .peer_info()
+            .and_then(|i| i.server_info.as_ref().map(|s| s.version.clone()))
+            .unwrap_or_default();
+        let tools = tools
             .into_iter()
-            .map(|t| {
-                let description = t
+            .map(|t| crate::plugin_lock::ManifestTool {
+                name: t.name.to_string(),
+                description: t
                     .description
                     .as_ref()
                     .map(|d| d.to_string())
-                    .unwrap_or_default();
-                (t.name.to_string(), description)
+                    .unwrap_or_default(),
+                input_schema: serde_json::Value::Object((*t.input_schema).clone()),
             })
-            .collect())
+            .collect();
+        Ok((version, tools))
     }
 
     /// Probe-first (#213): `prompts/list` is only sent when the server
@@ -1094,31 +1105,47 @@ use crate::sanitize::sanitize_one_line;
 const LIST_SYNC_BUDGET: Duration =
     Duration::from_secs(CALL_TIMEOUT.as_secs() + SUBPROCESS_TIMEOUT.as_secs() + 5);
 
-/// Register tools from `cfg` into `reg`. Startup-degrading: any failure
-/// is a warning, never an error (same contract as the uteke probe).
-/// Returns the names registered (empty on failure). Every tool redacts
-/// `secrets` from the arguments it sends (#595).
-pub fn register_server_tools(
-    reg: &mut crate::tool::ToolRegistry,
-    cfg: &McpServerConfig,
-    secrets: &crate::secrets::SecretSet,
-) -> Vec<String> {
-    let mut registered = Vec::new();
-    let start = Instant::now();
-    // The reactor's ListTools handler connects on demand (startup is
-    // expected fast; bounded by the subprocess ceiling).
-    let runtime_tx = runtime();
-
+/// `cfg`'s reported version and full tool list (connecting on demand).
+pub fn list_manifest(cfg: &McpServerConfig) -> Result<Listed, String> {
     let (ltx, lrx) = mpsc::channel();
-    runtime_tx
+    runtime()
         .send(McpRequest::ListTools {
             config: cfg.clone(),
             resp: ltx,
         })
-        .map_err(|_| ())
-        .ok();
+        .map_err(|_| "mcp reactor is gone".to_string())?;
     match lrx.recv_timeout(LIST_SYNC_BUDGET) {
-        Ok(Ok(tools)) => {
+        Ok(r) => r,
+        Err(_) => Err("timed out listing tools".into()),
+    }
+}
+
+/// The connect-time guard (#599): given the server name, its reported
+/// version and its full tool list, `Ok` lets its tools register; `Err`
+/// carries the note shown instead (never registered).
+pub type Admit<'a> =
+    &'a dyn Fn(&str, &str, &[crate::plugin_lock::ManifestTool]) -> Result<(), String>;
+
+/// Register tools from `cfg` into `reg`. Startup-degrading: any failure
+/// is a warning, never an error (same contract as the uteke probe).
+/// Returns the names registered (empty on failure). Every tool redacts
+/// `secrets` from the arguments it sends (#595). `admit` sees the whole
+/// live manifest (before the per-server cap) and decides first (#599).
+pub fn register_server_tools(
+    reg: &mut crate::tool::ToolRegistry,
+    cfg: &McpServerConfig,
+    secrets: &crate::secrets::SecretSet,
+    admit: Admit<'_>,
+) -> Vec<String> {
+    let mut registered = Vec::new();
+    let start = Instant::now();
+    match list_manifest(cfg) {
+        Ok((version, manifest)) => {
+            if let Err(note) = admit(&cfg.name, &version, &manifest) {
+                eprintln!("tole: mcp[{}]: {note}", cfg.name);
+                return registered;
+            }
+            let tools = manifest.into_iter().map(|t| (t.name, t.description));
             // Cap registered tools per server: a hostile/buggy server
             // must not flood the registry (and provider tool specs).
             const MAX_TOOLS_PER_SERVER: usize = 64;
@@ -1165,12 +1192,8 @@ pub fn register_server_tools(
                 start.elapsed()
             );
         }
-        Ok(Err(e)) => eprintln!(
+        Err(e) => eprintln!(
             "tole: mcp[{}]: listing failed: {e} — server skipped",
-            cfg.name
-        ),
-        Err(_) => eprintln!(
-            "tole: mcp[{}]: timed out listing tools — server skipped",
             cfg.name
         ),
     }
