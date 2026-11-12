@@ -207,6 +207,52 @@ impl DelegationConfig {
     }
 }
 
+/// `[router]` (#586): the RuleRouter, OFF unless `enabled = true`. Tiers and
+/// rules come from the user config only; a project config can only turn
+/// it off or narrow `allow_tiers` (see [`layered`]). Checked by
+/// [`crate::routing`].
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouterConfig {
+    pub enabled: Option<bool>,
+    /// The tiers rules may pick (unset: all).
+    pub allow_tiers: Option<Vec<String>>,
+    /// Models of runs without a profile (a profile's own come from
+    /// `profiles.<name>.models`).
+    pub tiers: Option<RouterTiers>,
+    pub rules: Option<Vec<RouterRule>>,
+}
+
+/// `[router.tiers]`: a model name per tier.
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouterTiers {
+    pub light: Option<String>,
+    pub standard: Option<String>,
+    pub heavy: Option<String>,
+}
+
+/// One `[[router.rules]]` entry; every set condition must hold.
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouterRule {
+    pub name: String,
+    /// `light | standard | heavy`.
+    pub tier: String,
+    /// `chat | run | mission | cron | delegate`.
+    pub kinds: Option<Vec<String>>,
+    pub min_chars: Option<usize>,
+    pub max_chars: Option<usize>,
+    /// `read_only | write | destructive`.
+    pub min_risk: Option<String>,
+    pub max_risk: Option<String>,
+    /// Profiles the rule applies to (unset: runs without a profile only).
+    pub profiles: Option<Vec<String>>,
+    pub jobs: Option<Vec<String>>,
+    pub budget_below: Option<u64>,
+    pub keywords: Option<Vec<String>>,
+}
+
 /// `[profiles.<name>.models]` (#584): model names per task-weight tier.
 /// `default` names the tier a session uses unless something picks another
 /// (the router of #586 is that something; today only `default` is used).
@@ -475,6 +521,9 @@ pub struct Config {
     /// Webhook routes of `tole serve` (#582); user layer only, see
     /// [`HookConfig`].
     pub hooks: Option<BTreeMap<String, HookConfig>>,
+    /// Model routing (#586); tiers and rules from the user layer only, see
+    /// [`RouterConfig`].
+    pub router: Option<RouterConfig>,
     /// Scoped secret release (#598), see [`SecretBinding`]; a project
     /// layer can only narrow it.
     pub secrets: Option<BTreeMap<String, SecretBinding>>,
@@ -683,6 +732,9 @@ pub fn parse(src: &str, path: &Path) -> Result<Config, ConfigError> {
     for (name, b) in cfg.secrets.iter().flatten() {
         check_secret(name, b).map_err(range)?;
     }
+    if let Some(r) = &cfg.router {
+        crate::routing::compile(r).map_err(range)?;
+    }
     if let Some(n) = cfg.cron.as_ref().and_then(|c| c.max_concurrent) {
         if !(1..=MAX_CRON_CONCURRENT).contains(&n) {
             return Err(range(format!(
@@ -868,6 +920,9 @@ pub fn layered(project: &Config, user: &Config) -> Config {
         // Nor webhook routes (#582): a repository must not open or widen
         // an endpoint.
         hooks: user.hooks.clone(),
+        // Routing (#586): tiers and rules from the user only; a project can
+        // only turn it off or narrow the allowed tiers.
+        router: crate::routing::layered(&project.router, &user.router),
         // A project may only narrow the secret release (#598).
         secrets: layered_secrets(&project.secrets, &user.secrets),
         user_keys: BTreeSet::new(),
@@ -1111,6 +1166,38 @@ pub fn render_with(cfg: &Config, tag: &str, ann: &Annotations) -> Vec<String> {
         out.push(format!("hooks = [{} entries]  [{src}]{ignored}", h.len()));
         for name in h.keys() {
             out.push(format!("  - {}", quote(name)));
+        }
+    }
+    if let Some(r) = &cfg.router {
+        // Names only (#586): never models or keywords.
+        let narrow = if tag == PROJECT_TAG {
+            "  a project config can only set enabled = false or narrow allow_tiers (tiers and rules are ignored)"
+        } else {
+            ""
+        };
+        let on = if r.enabled == Some(true) { "on" } else { "off" };
+        out.push(format!("router = {on}  [{src}]{narrow}"));
+        if let Some(a) = &r.allow_tiers {
+            out.push(format!("  allow_tiers = [{}]", a.join(", ")));
+        }
+        if let Some(t) = &r.tiers {
+            let set: Vec<&str> = [
+                ("light", &t.light),
+                ("standard", &t.standard),
+                ("heavy", &t.heavy),
+            ]
+            .into_iter()
+            .filter(|(_, m)| m.is_some())
+            .map(|(n, _)| n)
+            .collect();
+            out.push(format!("  tiers = [{}]", set.join(", ")));
+        }
+        for rule in r.rules.iter().flatten() {
+            out.push(format!(
+                "  - rule {} -> {}",
+                quote(&rule.name),
+                quote(&rule.tier)
+            ));
         }
     }
     for (name, b) in cfg.secrets.iter().flatten() {
