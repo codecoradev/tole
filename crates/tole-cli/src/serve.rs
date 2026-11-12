@@ -91,6 +91,10 @@ struct State {
     auth_failures: tole_cli::auth::AuthLimiter,
     /// Image uploads (#558); `None` when no data directory resolves.
     uploads: Option<tole_cli::serve_images::UploadStore>,
+    /// Webhook routes (#582) from the user config.
+    hooks: std::collections::BTreeMap<String, tole_cli::hooks::Route>,
+    /// The cron dir, whose ledger records seen deliveries (`hook_seen`).
+    hook_dir: Option<std::path::PathBuf>,
 }
 
 /// Read/write ceilings per connection: a client that opens a socket and
@@ -111,6 +115,28 @@ pub fn run_serve(cfg: ServeConfig) -> Result<()> {
     let token = resolve_token(&cfg.token)?;
     let workspace_root = crate::resolve_workspace_root(cfg.workspace.as_ref())
         .context("resolving --workspace for the session jail root")?;
+    // Webhook routes (#582), user config only: a route that cannot load
+    // stops the server here, before it listens.
+    let hook_cfg = match tole_cli::config::user_config_path().filter(|p| p.exists()) {
+        Some(p) => tole_cli::config::load(&p)
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .hooks
+            .unwrap_or_default(),
+        None => Default::default(),
+    };
+    let loopback = cfg.bind == "localhost"
+        || cfg
+            .bind
+            .trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    let hooks = tole_cli::hooks::load(&hook_cfg, loopback, &|k| std::env::var(k).ok())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let hook_dir = if hooks.is_empty() {
+        None
+    } else {
+        Some(tole_cli::cron::default_dir()?)
+    };
     let addr = format!("{}:{}", cfg.bind, cfg.port);
     let listener = TcpListener::bind(&addr)
         .with_context(|| format!("binding {addr} (in use? change --port)"))?;
@@ -129,7 +155,13 @@ pub fn run_serve(cfg: ServeConfig) -> Result<()> {
         streams: tole_cli::events::StreamLimiter::new(tole_cli::events::MAX_STREAMS),
         auth_failures: tole_cli::auth::AuthLimiter::new(),
         uploads: tole_cli::serve_images::UploadStore::from_env(),
+        hooks,
+        hook_dir,
     });
+    if !state.hooks.is_empty() {
+        let names: Vec<&str> = state.hooks.keys().map(String::as_str).collect();
+        eprintln!("tole serve: webhook routes: {}", names.join(", "));
+    }
     eprintln!(
         "tole serve: listening on http://{addr} ({} allow pattern(s), plan_mode={})",
         cfg.allow_patterns.len(),
@@ -189,6 +221,8 @@ struct Request {
     last_event_id: Option<String>,
     /// Raw body bytes (an image upload is binary; JSON routes decode it).
     body: Vec<u8>,
+    /// Signature and delivery headers of a webhook (#582).
+    hook: tole_core::webhook::Headers,
 }
 
 /// Why a request could not be read; decides the response (if any).
@@ -203,6 +237,17 @@ enum ReadError {
     /// gets. The ceiling depends on the token, so answering 413 before
     /// auth would be a token-validity oracle outside the limiter (#558).
     TooLarge { authorization: Option<String> },
+    /// `/hooks/<route>` for a route that does not exist (404, body unread).
+    NoHookRoute,
+    /// A webhook body over its route's cap (413, body unread). Webhooks do
+    /// not use the token, so this is no token oracle.
+    HookTooLarge,
+}
+
+/// The route of a `/hooks/<route>` path.
+fn hook_target(path: &str) -> Option<&str> {
+    path.strip_prefix("/hooks/")
+        .map(|r| r.split('?').next().unwrap_or(r))
 }
 
 /// Ceiling for the request line + all header bytes combined: a client
@@ -235,7 +280,11 @@ impl Read for DeadlineReader<'_> {
     }
 }
 
-fn read_request(stream: &TcpStream, token: &str) -> Result<Request, ReadError> {
+fn read_request(
+    stream: &TcpStream,
+    token: &str,
+    hooks: &std::collections::BTreeMap<String, tole_cli::hooks::Route>,
+) -> Result<Request, ReadError> {
     let mut reader = BufReader::new(DeadlineReader {
         stream,
         deadline: Instant::now() + REQUEST_READ_DEADLINE,
@@ -263,6 +312,7 @@ fn read_request(stream: &TcpStream, token: &str) -> Result<Request, ReadError> {
     let mut last_event_id = None;
     let mut content_length: Option<usize> = None;
     let mut expect_continue = false;
+    let mut hook = tole_core::webhook::Headers::default();
     // The request line counts against the same ceiling as the headers:
     // the documented limit is 32 KiB for both combined.
     let mut header_bytes = request_line.len();
@@ -312,12 +362,30 @@ fn read_request(stream: &TcpStream, token: &str) -> Result<Request, ReadError> {
             authorization = Some(value.to_string());
         } else if name.eq_ignore_ascii_case("last-event-id") {
             last_event_id = Some(value.to_string());
+        } else if name.eq_ignore_ascii_case("x-tole-timestamp") {
+            hook.timestamp = Some(value.to_string());
+        } else if name.eq_ignore_ascii_case("x-tole-signature") {
+            hook.signature = Some(value.to_string());
+        } else if name.eq_ignore_ascii_case("x-tole-delivery") {
+            hook.delivery = Some(value.to_string());
+        } else if name.eq_ignore_ascii_case("x-hub-signature-256") {
+            hook.github_signature = Some(value.to_string());
+        } else if name.eq_ignore_ascii_case("x-github-delivery") {
+            hook.github_delivery = Some(value.to_string());
         } else if name.eq_ignore_ascii_case("expect") && value.eq_ignore_ascii_case("100-continue")
         {
             expect_continue = true;
         }
     }
     let content_length = content_length.unwrap_or(0);
+    // A webhook: an unknown route or a body over the route's cap is
+    // answered before a byte of the body is read (#582).
+    if let Some(route) = hook_target(&path) {
+        let cap = hooks.get(route).ok_or(ReadError::NoHookRoute)?.max_body;
+        if content_length > cap {
+            return Err(ReadError::HookTooLarge);
+        }
+    }
     // The larger upload ceiling only for an image upload that already
     // carries the right token: pre-auth buffering stays at MAX_BODY_BYTES.
     let upload = method == "POST"
@@ -352,6 +420,7 @@ fn read_request(stream: &TcpStream, token: &str) -> Result<Request, ReadError> {
         authorization,
         last_event_id,
         body,
+        hook,
     })
 }
 
@@ -401,7 +470,7 @@ impl Drop for ConnGuard {
 
 fn handle_conn(mut stream: TcpStream, state: Arc<State>) {
     let _guard = ConnGuard(Arc::clone(&state));
-    let req = match read_request(&stream, &state.token) {
+    let req = match read_request(&stream, &state.token, &state.hooks) {
         Ok(r) => r,
         Err(ReadError::Io) => return,
         Err(ReadError::Bad(msg)) => {
@@ -433,6 +502,18 @@ fn handle_conn(mut stream: TcpStream, state: Arc<State>) {
             }
             return;
         }
+        Err(ReadError::NoHookRoute) => {
+            respond(&mut stream, 404, &json!({"error": "no such hook route"}));
+            return;
+        }
+        Err(ReadError::HookTooLarge) => {
+            respond(
+                &mut stream,
+                413,
+                &json!({"error": "request body too large"}),
+            );
+            return;
+        }
     };
 
     // Auth: bearer token on everything except /health (which carries no
@@ -448,6 +529,15 @@ fn handle_conn(mut stream: TcpStream, state: Arc<State>) {
             &json!({"error": "too many failed auth attempts"}),
         );
         return;
+    }
+
+    // Webhooks (#582) authenticate by signature, never by the token.
+    if req.method == "POST" {
+        if let Some(route) = hook_target(&req.path) {
+            let (status, payload) = handle_hook(&state, route, &req, peer_ip);
+            respond(&mut stream, status, &payload);
+            return;
+        }
     }
 
     let authorized = req.path == "/health"
@@ -912,6 +1002,68 @@ fn resume_session(state: &State, id: &str, cwd: &str) -> (u16, serde_json::Value
     }
 }
 
+/// `POST /hooks/<route>` (#582): the signature check, then the route's rate
+/// limit and the delivery's idempotency, both kept in the cron ledger so
+/// they survive a restart. A failed signature counts toward the source's
+/// failed-auth limit. Answers never echo a header value but the delivery
+/// id, which passed validation.
+fn handle_hook(
+    state: &State,
+    name: &str,
+    req: &Request,
+    peer: Option<std::net::IpAddr>,
+) -> (u16, serde_json::Value) {
+    use tole_core::webhook::{self, Reject};
+    let Some(route) = state.hooks.get(name) else {
+        return (404, json!({"error": "no such hook route"}));
+    };
+    let now = tole_cli::cron::now();
+    let checked = match route.key() {
+        Some(key) => webhook::verify(key, &req.hook, &req.body, now),
+        // An insecure route answers loopback clients only (and loads only
+        // on a loopback bind).
+        None if peer.is_some_and(|ip| ip.is_loopback()) => req
+            .hook
+            .delivery
+            .clone()
+            .filter(|d| webhook::valid_delivery(d))
+            .ok_or(Reject::BadDelivery),
+        None => Err(Reject::Unsigned),
+    };
+    let id = match checked {
+        Ok(id) => id,
+        Err(r) => {
+            if r.status() == 401 {
+                if let Some(ip) = peer {
+                    state.auth_failures.record_failure(ip);
+                }
+            }
+            return (r.status(), json!({"error": r.reason()}));
+        }
+    };
+    let Some(dir) = &state.hook_dir else {
+        return (503, json!({"error": "no cron dir for webhook state"}));
+    };
+    let rate = route.rate_per_minute as usize;
+    let outcome = tole_cli::cron::store::with_lock(dir, |l| {
+        if l.state().hooks_since(name, now - 59) >= rate {
+            return Ok(None);
+        }
+        Ok(Some(l.record_hook(name, &id, now)?))
+    });
+    match outcome {
+        Ok(None) => (429, json!({"error": "rate limit for this route"})),
+        Ok(Some(false)) => (200, json!({"status": "duplicate", "delivery": id})),
+        // Part 1 of #582: the gate only. The action (filters, firing a job)
+        // follows in part 2.
+        Ok(Some(true)) => (202, json!({"status": "accepted", "delivery": id})),
+        Err(e) => {
+            eprintln!("tole serve: webhook state: {e}");
+            (500, json!({"error": "webhook state unavailable"}))
+        }
+    }
+}
+
 fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_json::Value) {
     match (method, path) {
         ("GET", "/health") => (200, json!({"status": "ok"})),
@@ -1315,6 +1467,8 @@ mod tests {
             streams: tole_cli::events::StreamLimiter::new(tole_cli::events::MAX_STREAMS),
             auth_failures: tole_cli::auth::AuthLimiter::new(),
             uploads: None,
+            hooks: Default::default(),
+            hook_dir: None,
         }
     }
 

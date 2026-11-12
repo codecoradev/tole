@@ -108,6 +108,26 @@ pub struct CronConfig {
     pub tz_source: Option<TzSource>,
 }
 
+/// One `[hooks.<route>]` table (#582): a `POST /hooks/<route>` on `tole
+/// serve`. USER LAYER ONLY: a cloned repository must not open an endpoint
+/// or change one. The route key itself never lives here: only the name of
+/// the environment variable or the path of the file that holds it.
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HookConfig {
+    /// Environment variable holding the HMAC key.
+    pub hmac_key_env: Option<String>,
+    /// File holding the HMAC key (a regular file, not a link, at most 4 KiB).
+    pub hmac_key_file: Option<String>,
+    /// No signature check; only when `tole serve` binds a loopback address,
+    /// and only for loopback clients.
+    pub insecure_loopback: Option<bool>,
+    /// Deliveries accepted per minute (default 30, 1 to 600).
+    pub rate_per_minute: Option<u32>,
+    /// Largest body (default 262144, at most 1048576).
+    pub max_body_bytes: Option<u64>,
+}
+
 /// `cron.tz_source`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -441,6 +461,9 @@ pub struct Config {
     pub delegation: Option<DelegationConfig>,
     /// Dormant profiles (#584); user layer only, see [`ProfileConfig`].
     pub profiles: Option<std::collections::BTreeMap<String, ProfileConfig>>,
+    /// Webhook routes of `tole serve` (#582); user layer only, see
+    /// [`HookConfig`].
+    pub hooks: Option<BTreeMap<String, HookConfig>>,
     /// Scoped secret release (#598), see [`SecretBinding`]; a project
     /// layer can only narrow it.
     pub secrets: Option<BTreeMap<String, SecretBinding>>,
@@ -831,6 +854,9 @@ pub fn layered(project: &Config, user: &Config) -> Config {
         // Nor profiles (#584): a cloned repository must not define personas,
         // their allow lists or their models.
         profiles: user.profiles.clone(),
+        // Nor webhook routes (#582): a repository must not open or widen
+        // an endpoint.
+        hooks: user.hooks.clone(),
         // A project may only narrow the secret release (#598).
         secrets: layered_secrets(&project.secrets, &user.secrets),
         user_keys: BTreeSet::new(),
@@ -908,6 +934,14 @@ pub fn profiles_ignored_warning(shown: &str) -> String {
     format!(
         "ignoring `profiles` in project config {shown}: profiles can only be defined in the \
          user config"
+    )
+}
+
+/// The warning printed at startup when a project config carries `[hooks]`.
+pub fn hooks_ignored_warning(shown: &str) -> String {
+    format!(
+        "ignoring `hooks` in project config {shown}: webhook routes can only be defined in \
+         the user config"
     )
 }
 
@@ -1053,6 +1087,18 @@ pub fn render_with(cfg: &Config, tag: &str, ann: &Annotations) -> Vec<String> {
             note("profiles")
         ));
         for name in p.keys() {
+            out.push(format!("  - {}", quote(name)));
+        }
+    }
+    if let Some(h) = cfg.hooks.as_ref().filter(|h| !h.is_empty()) {
+        // Route names only (#582): never where a key comes from.
+        let ignored = if tag == PROJECT_TAG {
+            "  IGNORED: a project config cannot define webhook routes (user config only)"
+        } else {
+            ""
+        };
+        out.push(format!("hooks = [{} entries]  [{src}]{ignored}", h.len()));
+        for name in h.keys() {
             out.push(format!("  - {}", quote(name)));
         }
     }
@@ -1442,6 +1488,33 @@ verify_timeout = 60
         assert!(m.user_keys.contains("cron.daily_token_cap"));
         let shown = render(&project).join("\n");
         assert!(shown.contains("cron.daily_token_cap = 999999999") && shown.contains("IGNORED"));
+    }
+
+    /// #582: webhook routes come from the user config only. A project
+    /// config can neither define a route nor change a user route, and
+    /// `config check` shows route names, never where a key comes from.
+    #[test]
+    fn hooks_are_user_layer_only_and_shown_by_name() {
+        let user = parse(
+            "[hooks.gh]\nhmac_key_env = \"GH_HOOK_KEY\"\nrate_per_minute = 5\n",
+            &p(),
+        )
+        .unwrap();
+        let project = parse(
+            "[hooks.gh]\ninsecure_loopback = true\nrate_per_minute = 600\n[hooks.evil]\nhmac_key_env = \"X\"\n",
+            &p(),
+        )
+        .unwrap();
+        assert_eq!(layered(&project, &Config::default()).hooks, None);
+        assert_eq!(layered(&project, &user).hooks, user.hooks);
+        assert!(parse("[hooks.gh]\nsecret = \"x\"\n", &p()).is_err());
+        let shown = render(&user).join("\n");
+        assert!(
+            shown.contains("hooks = [1 entries]") && shown.contains("gh"),
+            "{shown}"
+        );
+        assert!(!shown.contains("GH_HOOK_KEY"), "{shown}");
+        assert!(render(&project).join("\n").contains("IGNORED"));
     }
 
     /// #579: `cron.max_concurrent` is a bounded, user-layer-only key.

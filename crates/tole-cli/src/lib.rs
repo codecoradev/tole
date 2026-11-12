@@ -19,6 +19,7 @@ pub mod events;
 #[cfg(feature = "tui")]
 pub mod export;
 pub mod handoff;
+pub mod hooks;
 pub mod ledger_file;
 pub mod machine_guard;
 #[cfg(feature = "mcp")]
