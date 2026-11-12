@@ -5,7 +5,9 @@
 //! - **`tole serve --cron`** (in-process ticker): a Write that the job's
 //!   `allow` list does not cover is parked in serve's `/approvals` queue
 //!   (the `QueueApprover`, 15-min expiry → denied) and the run settles
-//!   `awaiting_approval`. Resuming an approved run is #581.
+//!   `awaiting_approval`. An allow resumes it (#581, [`super::tick::resume_parked`]):
+//!   a `resume` claim, the same session reopened, the parked turn resumed
+//!   (the one-shot lets exactly the approved call run), and a new `done`.
 //! - **standalone `tole cron tick`**: there is no queue, so such a Write is
 //!   refused and the run settles `awaiting_approval`.
 //!
@@ -257,6 +259,7 @@ pub fn run_agent(
     queue: Option<&Arc<ApprovalQueue>>,
     cancel: &CancelToken,
     max_tokens: u64,
+    resume: Option<&str>,
 ) -> AgentRun {
     let fail = |session_id: Option<String>, e: String| AgentRun {
         status: RunStatus::Error,
@@ -283,7 +286,10 @@ pub fn run_agent(
         Ok(d) => d,
         Err(e) => return fail(None, e),
     };
-    let session_id = crate::session_host::new_session_id("cron");
+    let session_id = match resume {
+        Some(sid) => sid.to_string(),
+        None => crate::session_host::new_session_id("cron"),
+    };
     let path = dir.join(format!("{session_id}.jsonl"));
     let profile_allow = setup.profile.as_ref().map(|p| p.allow.as_slice());
     let approver = approver(job, profile_allow, queue, &session_id, &path);
@@ -294,15 +300,34 @@ pub fn run_agent(
             Err(e) => return fail(None, e.to_string()),
         };
     let name = field(job, "name").unwrap_or(&job.id).to_string();
-    let mut storage = match crate::session_host::create_session(
-        &dir,
-        &session_id,
-        None,
-        Some(&name),
-        Some("cron"),
-    ) {
+    let opened = match resume {
+        // The session file sits in the job's workdir, which the job can
+        // write, and it may have been swapped since `resume_parked` checked
+        // it. So the checks are made on the one handle the turn then reads
+        // and appends through: no symlink, no FIFO, a regular file within
+        // the cap (`open_bounded`), and a turn still parked mid-turn.
+        Some(_) => tole_core::storage::JsonlStorage::open_bounded(
+            &path,
+            super::tick::MAX_RESUME_SESSION_BYTES,
+        )
+        .map_err(|e| format!("the session file cannot be resumed: {e}"))
+        .and_then(|s| {
+            use tole_core::state::Pc;
+            match tole_core::storage::Storage::state(&s).pc {
+                Pc::Idle | Pc::Final => {
+                    Err("the session file cannot be resumed: its turn already ended".into())
+                }
+                _ => Ok(s),
+            }
+        }),
+        None => {
+            crate::session_host::create_session(&dir, &session_id, None, Some(&name), Some("cron"))
+                .map_err(|e| e.to_string())
+        }
+    };
+    let mut storage = match opened {
         Ok(s) => s,
-        Err(e) => return fail(None, e.to_string()),
+        Err(e) => return fail(resume.map(str::to_string), e),
     };
     let sid = Some(session_id.clone());
     use tole_core::storage::Storage;
@@ -354,10 +379,20 @@ pub fn run_agent(
     });
     let memory = setup.memory(&canon);
     let sent = crate::turn_runner::with_recalled_memory(memory.as_ref(), prompt);
-    let outcome = crate::turn_runner::run_turn_with(&mut storage, &mut meter, &plan, &sent);
+    // A continuation's session already holds the parked run's usage, which
+    // that run's `done` reported: this run reports only its own.
+    let tokens_before = tole_core::transcript::tokens_in_out(storage.usages());
+    // Both arms run under the same plan and metered provider: the job's
+    // model pin, step budget (counted per run), token budget and cancel.
+    let outcome = match resume {
+        // The parked turn, continued: no new prompt.
+        Some(_) => crate::turn_runner::resume_turn_with(&mut storage, &mut meter, &plan),
+        None => crate::turn_runner::run_turn_with(&mut storage, &mut meter, &plan, &sent),
+    };
     drop(done_tx);
     let _ = timer.join();
-    let tokens = tole_core::transcript::tokens_in_out(storage.usages());
+    let tokens =
+        tole_core::transcript::tokens_in_out(storage.usages()).saturating_sub(tokens_before);
     let outcome = match outcome {
         Ok(o) => o,
         Err(e) => {

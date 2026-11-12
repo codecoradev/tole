@@ -132,7 +132,52 @@ and process spawning live in `tole-cli`.
   running server, so it applies to runs hosted by `tole serve --cron`. A
   standalone `tole cron tick` has no queue: it refuses a Write the job's
   `allow` list does not cover, and the run settles `awaiting_approval`.
-  Neither path ever auto-approves; resuming an approved run is #581.
+  Neither path ever auto-approves.
+  **Resume (#581):** an `allow` on a parked cron call (`POST
+  /approvals/{id}/decision` for a session `tole serve` does not host)
+  continues the run in place:
+  1. Under the ledger lock, a new `resume` record `{fire_id, resumes,
+     job_id, claimed_at, lease}` claims the continuation. The fold accepts
+     it only when the `resumes` run settled `awaiting_approval` for the same
+     job and has no earlier `resume`, so a parked run resumes at most once
+     and a hand-written `resume` line for any other run is ignored. The
+     continuation is an ordinary pending fire (same `scheduled_for`): it
+     settles with its own `done`, dies with its lease like any run
+     (`recover` → `interrupted`), and its outcome becomes the job's latest.
+     The parked `done` is never changed (append-only).
+  2. The run's session is reopened (it must still be parked mid-turn, not
+     at `final`) and the parked turn is resumed, with no new prompt. The
+     session file sits in the job's workdir, which the job can write, so
+     it is opened once with `JsonlStorage::open_bounded`: on unix no
+     symlink is followed and a FIFO is not waited on, the handle must be a
+     regular file within 64 MiB, and the parked-turn check, the replay and
+     every append use that one handle. A file swapped after an earlier
+     check is refused at that open. The
+     turn replans from the denial; the approval is a one-shot for exactly
+     the approved call (same tool, same input), so the model can repeat that
+     call once and nothing else. A model that takes another way runs nothing
+     the approval did not cover.
+     **An allow does not run the call by itself.** The approved call runs
+     only if the resumed model makes that same call again. If the model
+     changes the input or does something else, the approved call never
+     runs, and the run settles on whatever the model does instead.
+  3. The continuation goes through the same run, settle and deliver path
+     as a tick (budget, daily cap, skill pins and profile re-checked). It
+     runs under the same turn plan as a fresh run: the job's model pin, its
+     `max_steps` step budget, its token budget and its `max_minutes` limit.
+     Each budget is counted for the continuation alone, not for the whole
+     run: the continuation is a run of its own with its own `done`, and a
+     resume needs a human allow each time. Its `done` reports only the
+     continuation's tokens, so the daily cap does not count the parked
+     run's tokens twice.
+
+  Not resumable: script jobs (they never park); runs parked by a
+  standalone `tole cron tick` (no queue, so no approval to give: re-run
+  them); a denied or expired approval (a resume without an allow parks
+  again, it never runs the call); approvals lost with a `tole serve`
+  restart (the queue is in memory); a run whose session already ended;
+  a run of a removed job; and a parked run that was already resumed (its
+  continuation can park and be resumed in turn).
 - `mode: script` (Hermes `no_agent`): argv via the `run_command` machinery
   (no shell, cwd jail, timeout, output cap), stdout is the result, **zero
   LLM tokens**. Empty output or a `[SILENT]` first line = nothing delivered.

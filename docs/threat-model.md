@@ -49,6 +49,7 @@ lives) / **gap** (tracked) / **N/A** (with rationale).
 | Injection via config | **control (MCP shipped)** | `.cora.yaml`/session headers are owner-controlled. MCP servers (#74) add an untrusted surface: server-supplied tool metadata is never trusted for risk tier (everything is Write → approval gate), tool results flow through the same fence/scrub path as native results, and the connection env is scrubbed. Residual: a malicious MCP server controls its own tool descriptions (model-visible) — treat server config as operator trust. |
 | Identity & authz of sub-agents | **N/A** | tole v0 is single-agent, single-tenant. MCP servers are external tools, not sub-agents. |
 | Human oversight | **control** | Risk-tiered approval gate (every non-ReadOnly call; Destructive never auto-allowed), #68 closed the replay-without-consent hole. |
+| Unattended approval resume (cron) | **control (#581)** | A parked cron Write runs only after an `/approvals` allow (serve bearer token): the run resumes once, through a `resume` ledger record the fold accepts only for an `awaiting_approval` run of the same job not resumed before (forged or repeated lines are ignored), and the one-shot approval covers exactly the approved call. Denied, expired or lost approvals never run it. Residual: approvals live in serve's memory, so a restart drops them (the run stays `awaiting_approval`; re-run it). |
 
 ## Deliberate limitations (documented, not fixed)
 
@@ -1047,3 +1048,26 @@ job's `allow` and the profile's `allow` cover it (never wider than either),
 and gets the secrets `Profile::granted(job grants)`: a job grants none, so
 a profile's `grants` give a cron run nothing. `GET /cron/runs` sits
 behind the `tole serve` bearer token like every other route.
+
+An `allow` on a parked cron call resumes the run (#581) through a
+`resume` ledger record. The ledger fold accepts it only for a run that
+settled `awaiting_approval` for the same job and was not resumed before, so
+a hand-written `resume` line cannot revive a finished run or run a parked
+one twice. The resumed turn gets no new prompt and the approval is a
+one-shot for exactly the approved call; without an allow (denied, expired,
+lost with a restart) the call parks again and never runs. An allow does
+not run the call by itself: the call runs only if the resumed model makes
+that same call again, otherwise it never runs. The continuation runs
+under the job's model pin, step budget, token budget and time limit, each
+counted for the continuation alone. The session file sits in the job's
+workdir, which the job can write. `JsonlStorage::open` therefore opens it
+once and uses that handle for the replay, the torn-tail repair and every
+append, never re-opening the path. On unix that open never follows a
+symlink at the last path component and never waits on a FIFO, and on
+every platform the handle must be a regular file. The `.lock` sidecar and
+compaction's temp file and reopen are opened the same way. The resume uses
+`open_bounded` (64 MiB cap on the handle), so a file swapped for a symlink
+or a FIFO after an earlier check is refused at the open. Not covered: a
+directory on the path (`.tole` or `.tole/sessions`) swapped for a symlink.
+That only leads to a file of the same random session id in another
+directory, but the `.lock` sidecar would be created there.

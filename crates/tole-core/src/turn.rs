@@ -286,6 +286,21 @@ pub fn resume_turn_with_cancel(
     registry: &ToolRegistry,
     cancel: &CancelToken,
 ) -> Result<TurnOutcome, StorageError> {
+    resume_turn_with_observer(s, p, registry, cancel, None)
+}
+
+/// [`resume_turn_with_cancel`] with a progress observer: the replan loop
+/// reports tool and reasoning events, as [`run_turn_with_observer`] does.
+/// A host that budgets a turn by its observer (cron's step budget, #581)
+/// keeps that budget on a resumed turn. A replayed crash intent is not
+/// reported; only the calls the replan loop makes are.
+pub fn resume_turn_with_observer(
+    s: &mut dyn Storage,
+    p: &mut dyn Provider,
+    registry: &ToolRegistry,
+    cancel: &CancelToken,
+    observer: Option<&dyn TurnObserver>,
+) -> Result<TurnOutcome, StorageError> {
     match resume(s)? {
         Resume::Clean => {
             let pc_now = s.state().pc;
@@ -350,9 +365,9 @@ pub fn resume_turn_with_cancel(
             settle_err(s, &handle, &reason)?;
         }
     }
-    // No observer: recovery is an interactive host flow. `resume_turn`
-    // passes a never-cancelled token; serve passes the session's (#318).
-    drive(s, p, registry, cancel, None)
+    // `resume_turn` passes a never-cancelled token; serve passes the
+    // session's (#318). The observer is the caller's (none for recovery).
+    drive(s, p, registry, cancel, observer)
 }
 
 /// Sets the session-scoped `wrote_this_turn` fact (#143). Shared by the

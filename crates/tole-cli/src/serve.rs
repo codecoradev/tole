@@ -1050,9 +1050,24 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                 // from the capped, one-turn-per-session map.
                 let sessions = Arc::clone(&state.sessions);
                 let sid = session_id.clone();
+                // A session this server does not host is a parked cron run
+                // (#581): it resumes through the cron ledger instead.
+                let serve_session = lock_sessions(&state.sessions).get(&sid).is_some();
+                let queue = Arc::clone(&state.approvals);
                 std::thread::spawn(move || {
-                    if let Err(e) = tole_cli::session_host::resume_session_turn(sessions, &sid) {
-                        eprintln!("tole serve: approval resume failed: {e}");
+                    if serve_session {
+                        if let Err(e) = tole_cli::session_host::resume_session_turn(sessions, &sid)
+                        {
+                            eprintln!("tole serve: approval resume failed: {e}");
+                        }
+                        return;
+                    }
+                    match tole_cli::cron::resume_after_approval(queue, &sid) {
+                        Ok(Some((fire, status))) => {
+                            eprintln!("tole serve: cron run {fire} resumed: {status:?}")
+                        }
+                        Ok(None) => eprintln!("tole serve: no parked cron run for session {sid}"),
+                        Err(e) => eprintln!("tole serve: cron resume failed: {e}"),
                     }
                 });
                 (

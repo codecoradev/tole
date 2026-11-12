@@ -986,6 +986,20 @@ pub fn serve_ticker(dir: &Path, approvals: std::sync::Arc<crate::approvals::Appr
     }
 }
 
+/// `/approvals` allow on a cron run's session (#581, serve route): resumes
+/// the parked run with the same options as the in-process ticker.
+pub fn resume_after_approval(
+    approvals: std::sync::Arc<crate::approvals::ApprovalQueue>,
+    session_id: &str,
+) -> anyhow::Result<Option<(String, RunStatus)>> {
+    let opts = TickOptions {
+        max_concurrent: 1,
+        approvals: Some(approvals),
+        daily_token_cap: daily_token_cap(),
+    };
+    tick::resume_parked(&default_dir()?, session_id, now(), &opts)
+}
+
 fn pass(dir: &Path, opts: &TickOptions) {
     match tick(dir, now(), opts) {
         Ok(r) if !r.ran.is_empty() || r.recovered > 0 || r.blocked > 0 || r.missed > 0 => {

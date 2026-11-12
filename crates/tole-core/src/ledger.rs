@@ -173,6 +173,22 @@ pub struct Fire {
     pub lease: Lease,
 }
 
+/// The claim to continue a parked run (#581): appended before the
+/// continuation executes, like a [`Fire`]. It is valid only for a run whose
+/// `done` is `awaiting_approval` and that was not resumed before (the first
+/// `resume` per run wins); the fold ignores any other, so a hand-written
+/// line cannot revive a finished run. The continuation settles with an
+/// ordinary `done` under its own `fire_id`; the parked run's `done` stays.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Resume {
+    pub fire_id: String,
+    /// The parked run's `fire_id`.
+    pub resumes: String,
+    pub job_id: String,
+    pub claimed_at: i64,
+    pub lease: Lease,
+}
+
 /// Outcome of a run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -279,6 +295,7 @@ pub enum Record {
     Missed(Missed),
     Blocked(Blocked),
     HookSeen(HookSeen),
+    Resume(Resume),
 }
 
 const KINDS: &[&str] = &[
@@ -289,6 +306,7 @@ const KINDS: &[&str] = &[
     "missed",
     "blocked",
     "hook_seen",
+    "resume",
 ];
 
 impl Record {
@@ -395,6 +413,8 @@ pub struct LedgerState {
     missed: BTreeMap<(String, i64), Missed>,
     blocked: BTreeMap<(String, i64), Blocked>,
     hooks: HashMap<(String, String), i64>,
+    /// Parked run → the continuation that resumed it.
+    resumed: HashMap<String, String>,
     /// Records of kinds this build does not know (skipped).
     pub unknown: u64,
 }
@@ -480,6 +500,39 @@ impl LedgerState {
                 let key = (h.route.clone(), h.delivery_id.clone());
                 self.hooks.entry(key).or_insert(h.at);
             }
+            Record::Resume(r) => {
+                let Some(parked) = self.fires.get(&r.resumes).cloned() else {
+                    return;
+                };
+                let parked_ok = self.done.get(&r.resumes).is_some_and(|d| {
+                    d.status == RunStatus::AwaitingApproval && d.job_id == r.job_id
+                });
+                if !parked_ok
+                    || parked.job_id != r.job_id
+                    || self.resumed.contains_key(&r.resumes)
+                    || self.fires.contains_key(&r.fire_id)
+                {
+                    return; // forged, stale or a lost race: never runs
+                }
+                self.resumed.insert(r.resumes.clone(), r.fire_id.clone());
+                let f = Fire {
+                    fire_id: r.fire_id.clone(),
+                    job_id: r.job_id.clone(),
+                    scheduled_for: parked.scheduled_for,
+                    claimed_at: r.claimed_at,
+                    lease: r.lease,
+                };
+                self.fires.insert(f.fire_id.clone(), f.clone());
+                match self.done.contains_key(&f.fire_id) {
+                    true => self.note_done(&f, f.fire_id.clone()),
+                    false => {
+                        self.pending
+                            .entry(f.job_id.clone())
+                            .or_default()
+                            .insert(f.fire_id.clone());
+                    }
+                }
+            }
         }
     }
 
@@ -493,7 +546,7 @@ impl LedgerState {
             .last_done
             .entry(f.job_id.clone())
             .or_insert((f.scheduled_for, fire_id.clone()));
-        if f.scheduled_for > e.0 {
+        if f.scheduled_for >= e.0 {
             *e = (f.scheduled_for, fire_id);
         }
     }
@@ -506,6 +559,10 @@ impl LedgerState {
     }
     pub fn fire(&self, fire_id: &str) -> Option<&Fire> {
         self.fires.get(fire_id)
+    }
+    /// The continuation that resumed a parked run, if any.
+    pub fn resumed_by(&self, fire_id: &str) -> Option<&str> {
+        self.resumed.get(fire_id).map(String::as_str)
     }
     /// The winning `fire_id` for an occurrence.
     pub fn claim_of(&self, job_id: &str, scheduled_for: i64) -> Option<&str> {
@@ -976,6 +1033,43 @@ impl<S: LedgerStore> Ledger<S> {
             }
         }
         Ok(out)
+    }
+
+    /// Claims the continuation of the parked run `parked` (#581): it must be
+    /// settled `awaiting_approval` and not resumed before. Re-checked after
+    /// appending, like [`Ledger::claim`]. The continuation is a pending run
+    /// under a new `fire_id` (settle it with [`Ledger::settle`]; recovery
+    /// interrupts it when its lease dies).
+    pub fn resume(&mut self, parked: &str, lease: Lease, now: i64) -> Result<Fire, LedgerError> {
+        self.sync(true)?;
+        let refuse = |why: &str| {
+            Err(LedgerError::InvalidJob(format!(
+                "run `{parked}` cannot be resumed: {why}"
+            )))
+        };
+        let Some(d) = self.state.done(parked).cloned() else {
+            return refuse("it is not settled");
+        };
+        if d.status != RunStatus::AwaitingApproval {
+            return refuse("it is not awaiting approval");
+        }
+        if let Some(by) = self.state.resumed_by(parked) {
+            return refuse(&format!("it was resumed already by `{by}`"));
+        }
+        let fire_id = format!("{parked}/resume.{}.{}", lease.pid, lease.start_time);
+        self.append(&Record::Resume(Resume {
+            fire_id: fire_id.clone(),
+            resumes: parked.to_string(),
+            job_id: d.job_id,
+            claimed_at: now,
+            lease,
+        }))?;
+        match self.state.resumed_by(parked) {
+            Some(w) if w == fire_id => Ok(self.state.fire(&fire_id).cloned().expect("folded")),
+            w => Err(LedgerError::LostRace {
+                winner: w.unwrap_or_default().to_string(),
+            }),
+        }
     }
 
     /// Marks a webhook delivery as seen; `false` when it was seen before.
