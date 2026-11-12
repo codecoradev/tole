@@ -48,6 +48,11 @@ cron_job = "sleeper"
 [hooks.forged]
 hmac_key_env = "TOLE_TEST_HOOK_KEY"
 cron_job = "forged"
+
+[hooks.agentic]
+hmac_key_env = "TOLE_TEST_HOOK_KEY"
+cron_job = "writer"
+template = "commit: {head_commit.message}"
 "#;
 
 /// A home with the routes, a cron dir with the jobs, a workdir.
@@ -74,10 +79,25 @@ fn setup(tag: &str) -> PathBuf {
     forged.extra.insert("created_by".into(), "agent".into());
     forged.extra.insert("enabled_by".into(), "cli".into());
     store::with_lock(&dir, |l| Ok(l.put_job(forged)?)).unwrap();
+    // An agent job that may write; a webhook run is ReadOnly all the same.
+    let writer = CreateSpec {
+        id: Some("writer".into()),
+        schedule: "@yearly".into(),
+        prompt: Some("summarize the push".into()),
+        workdir: base.join("w"),
+        allow: vec!["write_file".into()],
+        ..CreateSpec::default()
+    };
+    cron::create(&dir, writer, 1).unwrap();
     base
 }
 
 fn spawn(base: &Path) -> Serve {
+    spawn_with(base, None)
+}
+
+/// `tole serve` with the provider at `provider` (a mock), if any.
+fn spawn_with(base: &Path, provider: Option<&str>) -> Serve {
     let (child, port) = common::spawn_listening(|port| {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
         cmd.args(["serve", "--port", &port.to_string(), "--token", "t0ken"])
@@ -86,9 +106,64 @@ fn spawn(base: &Path) -> Serve {
             .env("TOLE_TEST_HOOK_KEY", KEY)
             .stdin(Stdio::null())
             .stdout(Stdio::null());
+        if let Some(url) = provider {
+            cmd.env("TOLE_BASE_URL", url)
+                .env("TOLE_MODEL", "mock-model")
+                .env("TOLE_API_KEY", "sk-test-hook-fire");
+        }
         cmd
     });
     Serve { child, port }
+}
+
+/// A provider that answers every request with a short final text and
+/// records each request body.
+fn mock_provider() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    use std::io::BufRead;
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let log = std::sync::Arc::clone(&seen);
+    std::thread::spawn(move || {
+        for s in listener.incoming().flatten() {
+            let mut r = std::io::BufReader::new(s.try_clone().unwrap());
+            let mut len = 0usize;
+            loop {
+                let mut line = String::new();
+                if r.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+                    break;
+                }
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    len = v.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut body = vec![0; len];
+            let _ = r.read_exact(&mut body);
+            let body = String::from_utf8_lossy(&body).into_owned();
+            let stream = serde_json::from_str::<serde_json::Value>(&body)
+                .is_ok_and(|v| v["stream"].as_bool() == Some(true));
+            log.lock().unwrap().push(body);
+            let (kind, payload) = if stream {
+                let delta =
+                    r#"{"choices":[{"index":0,"delta":{"content":"done"},"finish_reason":null}]}"#;
+                let usage = r#"{"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+                (
+                    "text/event-stream",
+                    format!("data: {delta}\n\ndata: {usage}\n\ndata: [DONE]\n\n"),
+                )
+            } else {
+                let c = r#"{"id":"c","object":"chat.completion","created":1,"model":"mock","choices":[{"index":0,"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+                ("application/json", c.to_string())
+            };
+            let mut s = s;
+            let _ = write!(
+                s,
+                "HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                payload.len()
+            );
+        }
+    });
+    (url, seen)
 }
 
 fn now() -> i64 {
@@ -181,4 +256,53 @@ fn a_paused_or_untrusted_job_is_not_fired() {
     let l = store::open_read(&base.join("cron")).unwrap();
     let b = l.state().blocked().find(|b| b.job_id == "forged").unwrap();
     assert_eq!(b.reason, "script_untrusted", "the #640 trust check ran");
+}
+
+/// The fired agent run, end to end: serve renders the route's template
+/// from the payload, fences it and appends it to that run's prompt, and
+/// the run is offered no Write tool although its job allowlists one.
+#[test]
+fn a_fired_agent_run_sees_the_rendered_template_and_no_write_tools() {
+    let base = setup("agent");
+    let (url, seen) = mock_provider();
+    let s = spawn_with(&base, Some(&url));
+    let (st, b) = deliver(s.port, "agentic", "push", "a-1", PUSH);
+    assert!(st.contains("202"), "{st} {b}");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let request = loop {
+        if let Some(r) = seen.lock().unwrap().first().cloned() {
+            break r;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the fired run never called the provider"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert!(
+        request.contains("summarize the push"),
+        "the job's prompt: {request}"
+    );
+    assert!(request.contains("UNTRUSTED WEBHOOK DATA"), "{request}");
+    assert!(
+        request.contains("commit: bump version"),
+        "the rendered template: {request}"
+    );
+    assert!(
+        request.contains("read_file"),
+        "tools are offered: {request}"
+    );
+    assert!(
+        !request.contains("\"write_file\""),
+        "no Write tool: {request}"
+    );
+    loop {
+        let l = store::open_read(&base.join("cron")).unwrap();
+        if let Some(d) = l.state().dones().find(|d| d.job_id == "writer") {
+            assert_eq!(d.status, RunStatus::Ok, "{:?}", d.usage);
+            break;
+        }
+        assert!(Instant::now() < deadline, "the fired run never settled");
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
