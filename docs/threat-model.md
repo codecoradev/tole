@@ -1031,9 +1031,11 @@ target, the parent re-checked after canonicalizing); a `command:` target is
 argv (no shell, destructive argv refused, scrubbed env, 60 s timeout) and is
 trust-gated: only a job whose record says `created_by = cli` (saved by a
 human with `tole cron create`/`edit`) may run one, any other job is
-`blocked` before it runs. `cron.daily_token_cap` and `cron.max_concurrent`
-are read from the user config only, so a cloned repository cannot raise
-them. A job's skills (`--skill`) and profile (`--profile`) are validated on
+`blocked` before it runs. `cron.daily_token_cap`, `cron.max_concurrent`,
+`cron.timezone` and `cron.tz_source` are read from the user config only, so
+a cloned repository cannot change them. A job's zone name is validated
+before any file is read and resolves only inside the zoneinfo directory
+(alias links included, nothing outside, no FIFO, at most 512 KiB). A job's skills (`--skill`) and profile (`--profile`) are validated on
 save and again when a run is claimed: a skill that is gone or broken, or a
 profile the user config no longer defines, records the run `blocked` before
 any token is spent. Saving a job also pins each skill's content (a hash of

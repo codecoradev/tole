@@ -2,9 +2,11 @@
 //!
 //! A small in-tree parser for 5-field cron and `@every <duration>`, plus the
 //! next-occurrence math. Pure: times are Unix seconds passed in by the
-//! caller, nothing reads a clock. **UTC only** for now; time zones (#580)
-//! will add a zone parameter to [`Schedule::next_after`] — the expression
-//! text and the ledger format do not change.
+//! caller, nothing reads a clock. A [`Schedule`] runs in UTC; a [`Zoned`]
+//! schedule runs a cron expression on a zone's wall clock (#580): a local
+//! time skipped by DST fires once at the first instant after the gap, a
+//! local time that happens twice fires once, on its first occurrence, and
+//! `@every` stays a plain duration.
 //!
 //! Grammar (`minute hour day-of-month month day-of-week`):
 //! - each field is a comma list of items; an item is `*`, `N`, `A-B`, `*/S`
@@ -137,30 +139,130 @@ impl Schedule {
     /// The occurrences in `(after, until]`, or `None` when there are none.
     /// Linear in the number of occurrences for cron, O(1) for `@every`.
     pub fn span(&self, after: i64, until: i64, anchor: i64) -> Option<Span> {
-        let first = self.next_after(after, anchor).filter(|t| *t <= until)?;
-        if let Schedule::Every(p) = self {
-            let count = (until - first) / p + 1;
-            let last = first + (count - 1) * p;
-            let before_last = (count > 1).then(|| last - p);
-            return Some(Span {
-                first,
-                last,
-                before_last,
-                count: count as u64,
-            });
+        span_by(|t| self.next_after(t, anchor), self.period(), after, until)
+    }
+
+    fn period(&self) -> Option<i64> {
+        match self {
+            Schedule::Every(p) => Some(*p),
+            Schedule::Cron(_) => None,
         }
-        let (mut last, mut before_last, mut count) = (first, None, 1u64);
-        while let Some(t) = self.next_after(last, anchor).filter(|t| *t <= until) {
-            before_last = Some(last);
-            last = t;
-            count += 1;
-        }
-        Some(Span {
+    }
+}
+
+/// The occurrences of `next` in `(after, until]`; `period` makes it O(1).
+fn span_by(
+    next: impl Fn(i64) -> Option<i64>,
+    period: Option<i64>,
+    after: i64,
+    until: i64,
+) -> Option<Span> {
+    let first = next(after).filter(|t| *t <= until)?;
+    if let Some(p) = period {
+        let count = (until - first) / p + 1;
+        let last = first + (count - 1) * p;
+        let before_last = (count > 1).then(|| last - p);
+        return Some(Span {
             first,
             last,
             before_last,
-            count,
-        })
+            count: count as u64,
+        });
+    }
+    let (mut last, mut before_last, mut count) = (first, None, 1u64);
+    while let Some(t) = next(last).filter(|t| *t <= until) {
+        before_last = Some(last);
+        last = t;
+        count += 1;
+    }
+    Some(Span {
+        first,
+        last,
+        before_last,
+        count,
+    })
+}
+
+/// A schedule on a zone's wall clock (#580). With UTC (or `+00:00`) it is
+/// exactly the plain [`Schedule`]; `@every` ignores the zone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Zoned {
+    pub schedule: Schedule,
+    pub zone: crate::tz::Zone,
+}
+
+impl Zoned {
+    /// A schedule in UTC.
+    pub fn utc(schedule: Schedule) -> Self {
+        Zoned {
+            schedule,
+            zone: crate::tz::Zone::utc(),
+        }
+    }
+
+    /// First occurrence strictly after `after` (see [`Schedule::next_after`]).
+    pub fn next_after(&self, after: i64, anchor: i64) -> Option<i64> {
+        match &self.schedule {
+            Schedule::Cron(c) if !self.zone.is_utc() => self.next_local(c, after),
+            s => s.next_after(after, anchor),
+        }
+    }
+
+    /// The occurrences in `(after, until]` (see [`Schedule::span`]).
+    pub fn span(&self, after: i64, until: i64, anchor: i64) -> Option<Span> {
+        span_by(
+            |t| self.next_after(t, anchor),
+            self.schedule.period(),
+            after,
+            until,
+        )
+    }
+
+    /// Walks matching wall-clock minutes after the local time of `after`
+    /// and returns the first whose instant (a gap's end, an overlap's first
+    /// occurrence) is after `after`. An instant already passed is skipped,
+    /// so no wall-clock time fires twice.
+    fn next_local(&self, c: &Cron, after: i64) -> Option<i64> {
+        if !(MIN_TIME..MAX_TIME).contains(&after) {
+            return None;
+        }
+        let mut local = after.checked_add(i64::from(self.zone.offset_at(after)))?;
+        // Skips happen only inside one overlap (at most a day of minutes).
+        for _ in 0..2_000 {
+            let l = c.next_after(local)?;
+            let t = match self.zone.from_local(l) {
+                crate::tz::Local::Single(t)
+                | crate::tz::Local::Gap(t)
+                | crate::tz::Local::Ambiguous(t, _) => t,
+            };
+            if t > after {
+                return (t <= MAX_TIME).then_some(t);
+            }
+            local = l;
+        }
+        None
+    }
+
+    /// How DST shaped the occurrence at `at`, for the `fire` record: `gap`
+    /// (it stands for a skipped local time) or `first_of_two` (its local
+    /// time happens again later).
+    pub fn dst_case(&self, at: i64) -> Option<&'static str> {
+        let Schedule::Cron(c) = &self.schedule else {
+            return None;
+        };
+        if self.zone.is_utc() {
+            return None;
+        }
+        let l = at.checked_add(i64::from(self.zone.offset_at(at)))?;
+        let (_, m, d) = civil_from_days(l.div_euclid(DAY));
+        let secs = l.rem_euclid(DAY);
+        let wd = weekday(l.div_euclid(DAY));
+        let hit = secs % 60 == 0
+            && c.matches(m, d, wd, (secs / 3_600) as u32, (secs % 3_600 / 60) as u32);
+        if !hit {
+            return Some("gap");
+        }
+        matches!(self.zone.from_local(l), crate::tz::Local::Ambiguous(..)).then_some("first_of_two")
     }
 }
 

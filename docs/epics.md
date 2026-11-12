@@ -260,7 +260,7 @@ Bot and Nakama; BMAD for collaboration). Design notes:
   (#582). The scheduler lives inside tole. Status: the ledger core is in
   `tole-core` (`cron`, `ledger`: cron/`@every` parser, append-only
   claim/fold/recovery, catch-up with `missed` records, crash-injection and
-  property tests; UTC only). #579 in progress: the file adapter and
+  property tests; per-job time zones since #580). #579 in progress: the file adapter and
   `tole cron create|list|pause|resume|remove|runs|tick` with script mode
   landed, then agent mode (session per run, model pin, step/minute
   budgets), the `tole serve --cron` ticker and approvals parking, then
@@ -275,6 +275,11 @@ Bot and Nakama; BMAD for collaboration). Design notes:
   `tole cron resume` is the human enable. A job not saved through the CLI
   runs only enabled, within its creator's grant and never as a script, and
   an agent run whose workdir holds the cron dir is blocked.
+  #580 is done in two parts: the `tz` zone layer (#641), then per-job time
+  zones. `tole cron create|edit --timezone`, `cron.timezone`, and
+  `cron.tz_source` (`system` zoneinfo at run time, or `offset-only`). DST
+  gaps and overlaps fire once, `list` shows local time and UTC, and jobs
+  without a zone are unchanged. The `bundled` source is not built.
 - **E2 — Profiles, delegation, discussion, routing, epic #583:**
   - profiles (#584; config, `--profile`, tiers, room and persona done in
     the PR for #584; `tole cron create --profile` in the #579 closing PR);

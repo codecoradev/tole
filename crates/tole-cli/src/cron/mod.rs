@@ -108,6 +108,12 @@ pub enum CronAction {
         /// Save the job paused.
         #[arg(long)]
         paused: bool,
+        /// Time zone of the schedule: `UTC`, a fixed offset like `+07:00`
+        /// or an IANA name like `Asia/Jakarta` [default: `cron.timezone`,
+        /// else UTC]. A local time skipped by DST runs once right after the
+        /// gap; one that happens twice runs once, the first time.
+        #[arg(long)]
+        timezone: Option<String>,
     },
     /// Change a job; only the given fields change (lists are replaced).
     /// The mode stays: a script job keeps --script, an agent job its prompt.
@@ -141,8 +147,11 @@ pub enum CronAction {
         max_tokens: Option<u64>,
         #[arg(long = "deliver")]
         deliver: Vec<String>,
+        /// Time zone of the schedule (`UTC`, `+07:00`, `Asia/Jakarta`).
+        #[arg(long)]
+        timezone: Option<String>,
     },
-    /// List jobs with their next run (UTC) and last outcome.
+    /// List jobs with their next run (local time and UTC) and last outcome.
     List,
     /// Ticker liveness (last tick, host) and job, run and token counts.
     Status,
@@ -208,6 +217,8 @@ pub struct CreateSpec {
     /// Pinned hashes of the profile's skills (`None`: pin now).
     pub profile_skill_hashes: Option<std::collections::BTreeMap<String, String>>,
     pub paused: bool,
+    /// `None`: `cron.timezone`, else no zone (plain UTC, as before #580).
+    pub timezone: Option<String>,
 }
 
 /// What `edit` changes (`None` / empty = keep).
@@ -229,6 +240,7 @@ pub struct EditSpec {
     pub deliver: Vec<String>,
     pub skills: Vec<String>,
     pub profile: Option<String>,
+    pub timezone: Option<String>,
 }
 
 /// The cron dir: `$TOLE_CRON_DIR`, else `<codecora home>/tole/cron`.
@@ -255,13 +267,41 @@ pub fn now() -> i64 {
 
 /// `YYYY-MM-DD HH:MMZ` for Unix seconds.
 pub fn fmt_utc(t: i64) -> String {
+    format!("{}Z", fmt_wall(t))
+}
+
+/// `YYYY-MM-DD HH:MM` for seconds read as a wall clock.
+fn fmt_wall(t: i64) -> String {
     let (y, m, d) = civil_from_days(t.div_euclid(86_400));
     let s = t.rem_euclid(86_400);
     format!(
-        "{y:04}-{m:02}-{d:02} {:02}:{:02}Z",
+        "{y:04}-{m:02}-{d:02} {:02}:{:02}",
         s / 3_600,
         s % 3_600 / 60
     )
+}
+
+/// `t` in the job's zone and in UTC, `2026-01-01 09:00 Asia/Jakarta
+/// (2026-01-01 02:00Z)`; UTC only for a job without a zone (#580).
+pub fn fmt_next(state: &tole_core::ledger::LedgerState, job: &Job, t: i64) -> String {
+    match state
+        .job(&job.id)
+        .and_then(|js| js.schedule.as_ref().ok())
+        .filter(|_| job.timezone.is_some())
+    {
+        Some(z) => format!(
+            "{} {} ({})",
+            fmt_wall(t.saturating_add(i64::from(z.zone.offset_at(t)))),
+            z.zone.name(),
+            fmt_utc(t)
+        ),
+        None => fmt_utc(t),
+    }
+}
+
+/// The user config's `cron.timezone`: the zone of a job saved without one.
+pub fn default_timezone() -> Option<String> {
+    cron_config()?.timezone
 }
 
 /// A host-owned string field of a job.
@@ -300,11 +340,13 @@ pub fn max_concurrent(flag: Option<usize>) -> usize {
 }
 
 /// Validates and saves a new job. Returns the saved record.
-pub fn create(dir: &Path, spec: CreateSpec, now: i64) -> anyhow::Result<Job> {
+pub fn create(dir: &Path, mut spec: CreateSpec, now: i64) -> anyhow::Result<Job> {
     let id = match &spec.id {
         Some(id) => id.clone(),
         None => format!("j{now:x}{:04x}", std::process::id() & 0xffff),
     };
+    // Only a new job takes the configured zone; an edit keeps the job's.
+    spec.timezone = spec.timezone.or_else(default_timezone);
     let mut job = build_job(spec, id, now)?;
     job.extra.insert("created_by".into(), "cli".into());
     store::with_lock(dir, |l| {
@@ -333,6 +375,7 @@ pub fn create_by_agent(
         bail!("a `command:` delivery needs a job saved with `tole cron create`");
     }
     let id = crate::session_host::new_session_id("job");
+    spec.timezone = spec.timezone.or_else(default_timezone);
     let mut job = build_job(spec, id, now)?;
     job.extra.insert("created_by".into(), trust::AGENT.into());
     job.extra
@@ -360,6 +403,10 @@ pub fn enable(dir: &Path, key: &str, now: i64) -> anyhow::Result<Job> {
 /// Validates a spec into a job record (without `created_by`).
 fn build_job(spec: CreateSpec, id: String, now: i64) -> anyhow::Result<Job> {
     Schedule::parse(&spec.schedule)?;
+    // Resolved on save with the configured source; never silently UTC.
+    if let Some(z) = &spec.timezone {
+        tole_core::tz::resolve(&*store::zones(), z).map_err(|e| anyhow!("--timezone: {e}"))?;
+    }
     if !spec.workdir.is_absolute() || !spec.workdir.is_dir() {
         bail!(
             "workdir `{}` must be an existing absolute directory",
@@ -461,7 +508,7 @@ fn build_job(spec: CreateSpec, id: String, now: i64) -> anyhow::Result<Job> {
     Ok(Job {
         id,
         schedule: spec.schedule,
-        timezone: None,
+        timezone: spec.timezone,
         catch_up: if spec.catch_up_one {
             CatchUp::One
         } else {
@@ -511,6 +558,7 @@ fn spec_of(job: &Job) -> CreateSpec {
                 .unwrap_or_default(),
         ),
         paused: job.paused,
+        timezone: job.timezone.clone(),
     }
 }
 
@@ -537,7 +585,8 @@ pub fn edit(dir: &Path, key: &str, change: EditSpec, now: i64) -> anyhow::Result
             timeout_secs,
             max_steps,
             max_minutes,
-            max_tokens
+            max_tokens,
+            timezone
         );
         if let Some(sch) = change.schedule {
             spec.schedule = sch;
@@ -682,6 +731,10 @@ pub struct JobRow {
     pub mode: String,
     pub state: &'static str,
     pub next_run: Option<i64>,
+    /// `next_run` in the job's zone and UTC ([`fmt_next`]), or `-`.
+    pub next: String,
+    /// The job's zone, `UTC` when it has none.
+    pub timezone: String,
     pub last: Option<RunStatus>,
     pub missed: u64,
     pub blocked: usize,
@@ -701,6 +754,10 @@ pub fn list(dir: &Path) -> anyhow::Result<Vec<JobRow>> {
                 mode: mode(job).to_string(),
                 state: if job.paused { "paused" } else { "active" },
                 next_run: s.next_run(&job.id),
+                next: s
+                    .next_run(&job.id)
+                    .map_or_else(|| "-".into(), |t| fmt_next(s, job, t)),
+                timezone: job.timezone.clone().unwrap_or_else(|| "UTC".into()),
                 last: s.last_outcome(&job.id).map(|d| d.status),
                 missed: s
                     .missed()
@@ -847,6 +904,7 @@ pub fn cli(action: CronAction, globals: JobGlobals) -> anyhow::Result<()> {
             max_tokens,
             deliver,
             paused,
+            timezone,
         } => {
             let workdir = match workdir {
                 Some(w) => w,
@@ -875,15 +933,17 @@ pub fn cli(action: CronAction, globals: JobGlobals) -> anyhow::Result<()> {
                     skill_hashes: None,
                     profile_skill_hashes: None,
                     paused,
+                    timezone,
                 },
                 t,
             )?;
-            let next = store::open_read(&dir)?.state().next_run(&job.id);
+            let l = store::open_read(&dir)?;
+            let next = l.state().next_run(&job.id);
             println!(
                 "created {} ({}), next run: {}",
                 job.id,
                 mode(&job),
-                next.map(fmt_utc).unwrap_or_else(|| "paused".into())
+                next.map_or_else(|| "paused".into(), |n| fmt_next(l.state(), &job, n))
             );
         }
         CronAction::List => {
@@ -893,13 +953,14 @@ pub fn cli(action: CronAction, globals: JobGlobals) -> anyhow::Result<()> {
             }
             for r in rows {
                 println!(
-                    "{}  {}  [{}] {} {}  next: {}  last: {}  missed: {}  blocked: {}",
+                    "{}  {}  [{}] {} ({}) {}  next: {}  last: {}  missed: {}  blocked: {}",
                     r.id,
                     r.name,
                     r.mode,
                     r.schedule,
+                    r.timezone,
                     r.state,
-                    r.next_run.map(fmt_utc).unwrap_or_else(|| "-".into()),
+                    r.next,
                     r.last
                         .map(|s| format!("{s:?}").to_lowercase())
                         .unwrap_or_else(|| "-".into()),
@@ -948,6 +1009,7 @@ pub fn cli(action: CronAction, globals: JobGlobals) -> anyhow::Result<()> {
             max_minutes,
             max_tokens,
             deliver,
+            timezone,
         } => {
             let change = EditSpec {
                 schedule,
@@ -966,13 +1028,15 @@ pub fn cli(action: CronAction, globals: JobGlobals) -> anyhow::Result<()> {
                 deliver,
                 skills: skill,
                 profile,
+                timezone,
             };
             let j = edit(&dir, &job, change, t)?;
-            let next = store::open_read(&dir)?.state().next_run(&j.id);
+            let l = store::open_read(&dir)?;
+            let next = l.state().next_run(&j.id);
             println!(
                 "edited {}, next run: {}",
                 j.id,
-                next.map(fmt_utc).unwrap_or_else(|| "paused".into())
+                next.map_or_else(|| "paused".into(), |n| fmt_next(l.state(), &j, n))
             );
         }
         CronAction::Status => {
