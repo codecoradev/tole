@@ -5,6 +5,14 @@
 //! queries run in RAM. Writes append one physical line per commit (an array
 //! line groups one atomic transaction); a torn final line is discarded whole.
 //!
+//! **Redacted at the seam (#596):** every entry payload, and the pinned
+//! system prompt, is redacted with the process [`SecretSet`] before its line
+//! is written, and the committed in-memory entry is that same redacted
+//! form. The provider is fed from these entries, so the log stores exactly
+//! what the provider saw and a replay reproduces it. An entry that hid a
+//! secret carries `"redacted": ["NAME", ...]` on the wire (names only).
+//! Older logs, written raw, load unchanged; nothing is rewritten.
+//!
 //! See `docs/architecture.md` §4 for the format rationale and the full line
 //! grammar. Format versions are bumped only on breaking changes; opening a
 //! file written by a **newer** format version is a hard error (refuse to
@@ -29,6 +37,7 @@ use serde_json::Value;
 
 use crate::entry::{Entry, EntryType, NewEntry};
 use crate::register::{is_valid_namespace, RegisterOp, RegisterWrite};
+use crate::secrets::SecretSet;
 use crate::state::{MachineState, Pc, StateTransition};
 use crate::STORAGE_VERSION;
 
@@ -282,6 +291,10 @@ enum Record {
         entry_type: String,
         timestamp: u64,
         payload: Value,
+        /// Names of the secrets this entry's payload hid (#596); absent in
+        /// older logs and when nothing was redacted.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        redacted: Vec<String>,
     },
     #[serde(rename = "register")]
     Register {
@@ -380,9 +393,49 @@ pub struct JsonlStorage {
     registers: BTreeMap<(String, String), Value>,
     usage: Vec<UsageRecord>,
     state: MachineState,
+    /// Per entry id, the names its payload hid (kept for `compact()`).
+    redacted: BTreeMap<String, Vec<String>>,
+    /// The redaction set; `None`: the process set, read per commit.
+    secrets: Option<SecretSet>,
+}
+
+/// The redacted form of an entry payload and the names of the secrets it
+/// hid (#596). Every string is redacted structurally, keys included (and a
+/// secret that is a bare number becomes the marker string), in every form
+/// the set knows: as is, JSON-escaped, base64 and percent-encoded.
+fn redact_payload(set: &SecretSet, payload: &Value) -> (Value, Vec<String>) {
+    if set.is_empty() {
+        return (payload.clone(), Vec::new());
+    }
+    let out = set.redact_value(payload);
+    if out == *payload {
+        return (out, Vec::new());
+    }
+    let (before, after) = (payload.to_string(), out.to_string());
+    let names = set
+        .names()
+        .into_iter()
+        .filter(|n| {
+            let m = format!("«{n}»");
+            after.matches(&m).count() > before.matches(&m).count()
+        })
+        .map(str::to_string)
+        .collect();
+    (out, names)
 }
 
 impl JsonlStorage {
+    /// Redacts with `set` instead of the process set (tests, embedders).
+    pub fn set_secrets(&mut self, set: SecretSet) {
+        self.secrets = Some(set);
+    }
+
+    fn redaction_set(&self) -> SecretSet {
+        self.secrets
+            .clone()
+            .unwrap_or_else(crate::secrets::process_secrets)
+    }
+
     /// Creates a new session file (fails if the path already exists).
     pub fn create(
         dir: impl AsRef<Path>,
@@ -439,6 +492,11 @@ impl JsonlStorage {
         let path = dir.as_ref().join(format!("{session_id}.jsonl"));
         let created_at = now_ms();
         let cwd = cwd.unwrap_or_default();
+        // The pinned prompt is re-sent on resume: store what the provider
+        // is shown (#596).
+        let system_prompt =
+            system_prompt.map(|p| crate::secrets::process_secrets().redact(p).into_owned());
+        let system_prompt = system_prompt.as_deref();
         let header = HeaderLine {
             v: 1,
             kind: "header".into(),
@@ -477,6 +535,8 @@ impl JsonlStorage {
             registers: BTreeMap::new(),
             usage: Vec::new(),
             state: MachineState::default(),
+            redacted: BTreeMap::new(),
+            secrets: None,
             poisoned: None,
             syncs: 0,
         })
@@ -665,6 +725,8 @@ impl JsonlStorage {
             registers: BTreeMap::new(),
             usage: Vec::new(),
             state: MachineState::default(),
+            redacted: BTreeMap::new(),
+            secrets: None,
             poisoned: None,
             syncs: 0,
         };
@@ -761,7 +823,11 @@ impl JsonlStorage {
                 entry_type,
                 timestamp,
                 payload,
+                redacted,
             } => {
+                if !redacted.is_empty() {
+                    self.redacted.insert(id.clone(), redacted.clone());
+                }
                 let idx = self.entries.len();
                 self.entries.push(Entry {
                     seq: *seq,
@@ -886,11 +952,12 @@ impl JsonlStorage {
         &self,
         c: &Commit,
         committed: &[Entry],
+        names: &[Vec<String>],
         seq_after_entries: u64,
     ) -> Result<(String, u64), StorageError> {
         let mut records: Vec<Record> = Vec::new();
         let mut next = seq_after_entries;
-        for e in committed {
+        for (e, redacted) in committed.iter().zip(names) {
             records.push(Record::Entry {
                 seq: e.seq,
                 id: e.id.clone(),
@@ -898,6 +965,7 @@ impl JsonlStorage {
                 entry_type: e.kind.as_str().to_string(),
                 timestamp: e.timestamp,
                 payload: e.payload.clone(),
+                redacted: redacted.clone(),
             });
         }
         for w in &c.registers {
@@ -1162,6 +1230,9 @@ impl Storage for JsonlStorage {
         // whole by_id index per commit made sessions O(N²) overall.
         let mut new_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut committed: Vec<Entry> = Vec::with_capacity(c.entries.len());
+        // #596: redacted BEFORE encoding; memory keeps the same form.
+        let set = self.redaction_set();
+        let mut names: Vec<Vec<String>> = Vec::with_capacity(c.entries.len());
         let mut next = self.state.seq;
         for e in &c.entries {
             if let Some(p) = &e.parent_id {
@@ -1175,12 +1246,14 @@ impl Storage for JsonlStorage {
             if self.by_id.contains_key(&id) || !new_ids.insert(id.clone()) {
                 return Err(StorageError::Invalid(format!("duplicate entry id: {id}")));
             }
+            let (payload, hid) = redact_payload(&set, &e.payload);
+            names.push(hid);
             committed.push(Entry {
                 seq: next,
                 id,
                 parent_id: e.parent_id.clone(),
                 kind: e.kind.clone(),
-                payload: e.payload.clone(),
+                payload,
                 timestamp: if e.timestamp == 0 {
                     now_ms()
                 } else {
@@ -1190,11 +1263,14 @@ impl Storage for JsonlStorage {
         }
 
         // Encode + append (single physical line = atomic transaction).
-        let (line, final_seq) = self.encode_commit(&c, &committed, next)?;
+        let (line, final_seq) = self.encode_commit(&c, &committed, &names, next)?;
         self.append_line(&line, !c.defer_sync)?;
 
         // Apply to memory only after the byte hit the file.
-        for e in committed.iter() {
+        for (e, hid) in committed.iter().zip(names) {
+            if !hid.is_empty() {
+                self.redacted.insert(e.id.clone(), hid);
+            }
             let idx = self.entries.len();
             self.entries.push(e.clone());
             if let Some(p) = &e.parent_id {
@@ -1248,6 +1324,7 @@ impl Storage for JsonlStorage {
                 entry_type: e.kind.as_str().to_string(),
                 timestamp: e.timestamp,
                 payload: e.payload.clone(),
+                redacted: self.redacted.get(&e.id).cloned().unwrap_or_default(),
             });
         }
         for ((ns, k), v) in &self.registers {
