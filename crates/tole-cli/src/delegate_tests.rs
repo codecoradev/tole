@@ -358,7 +358,7 @@ fn a_settled_child_is_charged_its_measured_usage_or_its_whole_carve() {
 #[test]
 fn the_machine_guard_queues_and_a_poll_starts_the_queued_child() {
     let root = tmp("queue");
-    let h = host(&root, 0, &[], "[delegation]\nmax_live_processes = 1\n");
+    let h = host(&root, 1, &[], "[delegation]\nmax_live_processes = 1\n");
     let (start, poll) = tools(&h, &root);
     let a = start
         .execute(json!({"task": "a", "mode": "consult"}))
@@ -638,7 +638,7 @@ fn a_symlinked_or_dotted_root_still_settles_its_children() {
 #[test]
 fn a_new_delegate_never_starts_ahead_of_an_older_queued_one() {
     let root = tmp("fifo");
-    let h = host(&root, 0, &[], "[delegation]\nmax_live_processes = 1\n");
+    let h = host(&root, 1, &[], "[delegation]\nmax_live_processes = 1\n");
     let (start, _) = tools(&h, &root);
     let c = |t: &str| json!({"task": t, "mode": "consult", "budget": {"tokens": 10, "steps": 2}});
     let a = start.execute(c("a")).unwrap();
