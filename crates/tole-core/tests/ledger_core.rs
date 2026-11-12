@@ -301,6 +301,43 @@ fn edit_accounting_uses_the_previous_version_only() {
     );
 }
 
+/// #581: who created a job and the grant it was created under are fixed by
+/// the line that created it. A later line for the same live job, hand
+/// written or not, cannot change them; a job saved again after its removal
+/// starts afresh.
+#[test]
+fn a_later_line_cannot_change_who_created_a_job() {
+    let with = |at: i64, by: &str, grant: &[&str], removed: bool| {
+        let mut j = job("g", "0 * * * *", at);
+        j.extra.insert("created_by".into(), by.into());
+        j.extra
+            .insert("creator_allow".into(), serde_json::json!(grant));
+        j.removed = removed;
+        j
+    };
+    let mut l = fresh(&[with(T, "agent", &["write_file"], false)]);
+    l.put_job(with(T + 10, "cli", &["write_file", "edit_file"], false))
+        .unwrap();
+    let extra = |l: &Ledger<MemoryStore>| l.state().job("g").unwrap().job.extra.clone();
+    assert_eq!(extra(&l)["created_by"], "agent");
+    assert_eq!(
+        extra(&l)["creator_allow"],
+        serde_json::json!(["write_file"])
+    );
+    // A line that drops the fields does not drop them either.
+    l.put_job(job("g", "0 * * * *", T + 20)).unwrap();
+    assert_eq!(extra(&l)["created_by"], "agent");
+    // The fold gives the same answer on replay.
+    let replayed = LedgerState::fold(&lines(l.store()));
+    assert_eq!(replayed.job("g").unwrap().job.extra["created_by"], "agent");
+    // Removed, then saved again: a new job.
+    l.put_job(with(T + 30, "agent", &["write_file"], true))
+        .unwrap();
+    l.put_job(with(T + 40, "cli", &[], false)).unwrap();
+    assert_eq!(extra(&l)["created_by"], "cli");
+    assert_eq!(extra(&l)["creator_allow"], serde_json::json!([]));
+}
+
 #[test]
 fn pause_resume_and_remove_are_new_records() {
     let mut l = fresh(&[job("p", "0 * * * *", T)]);

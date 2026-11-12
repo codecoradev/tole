@@ -192,6 +192,55 @@ and process spawning live in `tole-cli`.
   creator's; enabling is a human action. Config-sourced jobs follow the
   existing rule that faces refuse config-sourced hooks/skills/MCP unless the
   config is trusted.
+  **As implemented (#581 part 2):**
+  - **The agent path.** An agent creates a job only through the
+    `cron_create` tool, a Write tool approved like any other. It is
+    registered for the session faces (`run`, `chat`, `serve` sessions) at
+    depth 0 outside plan mode. A cron run, a child agent and the MCP server
+    face do not have it.
+  - **What the host sets.** The host, not the tool input, sets the job's
+    workdir (the session workspace), `paused = true`, `created_by = agent`
+    and `creator_allow` (the session's own allow list). The input type
+    refuses every other field by name: an id, a script, skills, a profile,
+    a pause state or any provenance field. `allow` may name only the
+    creator's allow patterns, and the creator's deny (`!`) patterns are
+    always kept. A `command:` delivery is refused.
+  - **Enabling.** `tole cron resume` is the enable. It records
+    `enabled_by = cli`, and only the CLI writes that field.
+  - **Every job not saved through `tole cron create`** (`created_by` other
+    than `cli`, including a hand-written line with none) is checked before
+    each run and is `blocked` unless:
+    - it was enabled by its owner (`not_enabled`);
+    - its `allow` stays within `creator_allow` and keeps its deny patterns
+      (`allow_exceeds_creator`);
+    - it is an agent job, not a script (`script_untrusted`).
+  - **`tole cron edit` of an agent's job** keeps its creator, grant and
+    enable, and refuses an `--allow` beyond the creator's.
+  - **Provenance is fixed by the creating line.** The ledger fold
+    (`tole_core::ledger::PROVENANCE`) keeps a live job's `created_by` and
+    `creator_allow` from the line that created it. A later line, an edit or
+    a hand-written line cannot change or drop them; a job saved again after
+    its removal is a new job.
+  - **A run's jail must not hold the cron dir.** For every agent job, a run
+    whose workdir holds the cron dir is `blocked` (`ledger_in_workdir`),
+    because its file tools could write job records.
+  - **The trust root.** The ledger file itself is the trust root: a
+    process that can write `jobs.jsonl` directly (the owner, or a tool the
+    owner allowlisted to run commands) can write a line claiming
+    `created_by = cli`, as it can edit any of the owner's files.
+  - **Config-sourced jobs do not exist.** No config defines jobs:
+    `[cron]` takes only `daily_token_cap` and `max_concurrent`, unknown keys
+    are an error, and a project config's `[cron]` is ignored. A cron run
+    reads no project config from its workdir: its settings come from the
+    job, the user config and the process config (a project config of the
+    directory `tole cron tick` or `tole serve` started in reaches it only
+    through the existing trust gate).
+  - **MCP servers (#636).** A cron run attaches no MCP servers today. When
+    jobs gain MCP servers, they go through the plugin lock like every face:
+    a server runs only when the owner approved it with
+    `tole plugin approve`, pinned to its tool-manifest hash, and its tools
+    stay `Risk::Write`, so they park in `/approvals` unless the job's
+    `allow` names them.
 
 ## 6. Webhook (on `tole serve`, not a new server)
 
@@ -240,7 +289,8 @@ ideas, not architecture:
   first run (P9), a separate worker process that must be babysat (P11).
 - **Composio:** Nakama and Composio expose SaaS via MCP; tole already is an
   MCP client, and per `AGENTS.md` §6 those tools stay `Risk::Write`. No tole
-  work needed beyond cron jobs being able to attach MCP servers.
+  work needed beyond cron jobs being able to attach MCP servers; those
+  servers go through the plugin lock (#636, see §5).
 
 ## 8. Surface (mirror Hermes naming)
 

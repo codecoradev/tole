@@ -74,6 +74,13 @@ const RESERVED: &[&str] = &[
     "at",
 ];
 
+/// Host-owned `extra` fields that record who created a job and under what
+/// grant (#581): `created_by` and `creator_allow`. The line that creates a
+/// job sets them; while the job is live, a later line for the same id (an
+/// edit, a pause, or a hand-written line) cannot change or drop them. A job
+/// saved again after its removal is a new job.
+pub const PROVENANCE: &[&str] = &["created_by", "creator_allow"];
+
 /// Errors from the ledger.
 #[derive(Debug, thiserror::Error)]
 pub enum LedgerError {
@@ -444,13 +451,18 @@ impl LedgerState {
             Record::Job(j) => {
                 let schedule = validate_timezone(j)
                     .and_then(|_| Schedule::parse(&j.schedule).map_err(|e| e.to_string()));
-                self.jobs.insert(
-                    j.id.clone(),
-                    JobState {
-                        job: j.clone(),
-                        schedule,
-                    },
-                );
+                let mut job = j.clone();
+                // Who created a live job is fixed by the line that created
+                // it (#581): a later line keeps the first line's values.
+                if let Some(prev) = self.jobs.get(&j.id).filter(|p| !p.job.removed) {
+                    for key in PROVENANCE {
+                        match prev.job.extra.get(*key) {
+                            Some(v) => job.extra.insert(key.to_string(), v.clone()),
+                            None => job.extra.remove(*key),
+                        };
+                    }
+                }
+                self.jobs.insert(j.id.clone(), JobState { job, schedule });
             }
             Record::Fire(f) => {
                 let key = (f.job_id.clone(), f.scheduled_for);
