@@ -325,6 +325,7 @@ type or a secret-like key is an error with `file:line`; the file is capped at
 | `[cron]` `max_concurrent` | `4` | **user config only**: runs one tick (`tole cron tick`, the `tole serve --cron` ticker) executes at once, 1 to 64; `tole cron tick --max-concurrent N` overrides it for that tick |
 | `[cron]` `timezone` | (none: plain UTC) | **user config only**: the time zone of a job saved without `tole cron create --timezone` (`UTC`, `+07:00` or an IANA name like `Asia/Jakarta`). Jobs saved earlier keep no zone |
 | `[cron]` `tz_source` | `system` on unix, else `offset-only` | **user config only**: where IANA zone names resolve. `system` reads the host's zoneinfo at run time (`$TZDIR`, else `/usr/share/zoneinfo`; no zone data in the binary); `offset-only` takes only `UTC` and fixed offsets |
+| `[hooks.<route>]` `hmac_key_env` / `hmac_key_file`, `insecure_loopback`, `rate_per_minute`, `max_body_bytes` | (none), `false`, `30`, `262144` | **user config only**: a `POST /hooks/<route>` on `tole serve`. Each route has an HMAC key, named by an environment variable or held in a file (a regular file, at most 4 KiB, at least 16 bytes); the key is never shown. A route without a key stops `tole serve` at startup, and `insecure_loopback` loads on a loopback bind only. Limits: 1–600 deliveries per minute and at most 1 MiB per body |
 | `trust` (list of presets) | `--trust` | flag > `TOLE_TRUST` env > config |
 | `allow` (list of globs) | the subcommand's own `--allow` | flag > config |
 | `mcp_server` (list) | `--mcp-server` | flag > config |

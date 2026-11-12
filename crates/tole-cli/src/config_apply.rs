@@ -1186,6 +1186,11 @@ pub fn load_project_config(
             &config_trust::sanitize(&shown.display().to_string()),
         ));
     }
+    if config.hooks.is_some() {
+        io.warn(&crate::config::hooks_ignored_warning(
+            &config_trust::sanitize(&shown.display().to_string()),
+        ));
+    }
     io.inform(&format!(
         "tole: using config {}",
         config_trust::sanitize(&shown.display().to_string())

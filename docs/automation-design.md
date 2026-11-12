@@ -306,6 +306,48 @@ delivery:
 - **Coalescing** (debounce bursts per entity key) is phase 2; script
   transforms are deliberately **not** in v1 (more attack surface to audit).
 
+**As implemented, part 1 of #582 (the security gate):**
+- **Routes are `[hooks.<route>]` in the user config only.** A project
+  config's `hooks` is ignored with a warning, so a repository can neither
+  open nor change an endpoint.
+- **Each route has a key.** It is named by `hmac_key_env` or
+  `hmac_key_file` (a regular file, not a link or a FIFO, at most 4 KiB, at
+  least 16 bytes) and is never shown: not in errors, logs, responses,
+  `config check` or the ledger.
+- **A route that cannot load stops `tole serve` before it listens,** naming
+  the route and the fix. That covers no key, both key sources, a key
+  variable that is not set, a key that is too short, bad limits, or
+  `insecure_loopback` on a non-loopback bind.
+- **`insecure_loopback = true`** (no signature) loads only on a loopback
+  bind and answers only loopback clients.
+- **`POST /hooks/<route>` needs no bearer token; it is authenticated by
+  signature.**
+  - An unknown route gets 404, and a body over the route's
+    `max_body_bytes` (default 256 KiB, at most 1 MiB) gets 413. Both
+    answers come before a byte of the body is read.
+  - **Signature schemes (`tole_core::webhook`):** native `X-Tole-Timestamp`
+    + `X-Tole-Signature: sha256=<hex>` over `<timestamp>.<body>` within
+    ±300 s, or GitHub `X-Hub-Signature-256` over the body. Both use
+    HMAC-SHA256 on the `sha2` already in the tree and a constant-time
+    compare.
+  - **Delivery ids:** `X-Tole-Delivery` / `X-GitHub-Delivery`, required,
+    1 to 128 of `[A-Za-z0-9._:-]`.
+  - A failed signature counts toward the source IP's failed-auth limit.
+- **Idempotency and rate limit:** a delivery is recorded as `hook_seen` in
+  the cron ledger under its lock. A repeat answers `200 duplicate`, even
+  after a restart. The per-route rate (`rate_per_minute`, default 30, at
+  most 600) counts those records, so it also survives a restart. Requests
+  with a bad or missing signature are limited per source IP by the existing
+  failed-auth limiter instead, which is in memory and resets on restart.
+- **Bounded state:** the fold keeps seen deliveries for 7 days only, which
+  bounds memory. **Accepted (owner decision 2026-11-12):** the ledger file
+  is append-only and not rotated, so it grows by one line per accepted
+  delivery, at most the route's rate per minute. A GitHub delivery replayed
+  after the 7 days verifies again, since GitHub signs no timestamp.
+- **Part 1 records an accepted delivery and answers `202`; it fires
+  nothing yet.** Filters, the action and `tole hook` follow in parts 2 and
+  3.
+
 ## 7. Adoptable from Nakama (withnakama.com)
 
 Nakama is team-oriented (multi-tenant dashboard, channels, ~200 MB idle
