@@ -459,6 +459,10 @@ pub struct LedgerState {
     missed: BTreeMap<(String, i64), Missed>,
     blocked: BTreeMap<(String, i64), Blocked>,
     hooks: HashMap<(String, String), i64>,
+    /// The cutoff of the last prune of `hooks` (#582): seen deliveries older
+    /// than [`crate::webhook::HOOK_RETENTION_SECS`] are dropped, so the
+    /// state stays bounded however long the log grows.
+    hooks_pruned: Option<i64>,
     /// Parked run → the continuation that resumed it.
     resumed: HashMap<String, String>,
     /// Where job time zones are resolved (#580).
@@ -562,6 +566,15 @@ impl LedgerState {
             Record::HookSeen(h) => {
                 let key = (h.route.clone(), h.delivery_id.clone());
                 self.hooks.entry(key).or_insert(h.at);
+                // Prune at most once an hour of log time (amortized).
+                let cutoff = h.at.saturating_sub(crate::webhook::HOOK_RETENTION_SECS);
+                if self
+                    .hooks_pruned
+                    .is_none_or(|p| cutoff > p.saturating_add(3_600))
+                {
+                    self.hooks.retain(|_, at| *at >= cutoff);
+                    self.hooks_pruned = Some(cutoff);
+                }
             }
             Record::Resume(r) => {
                 let Some(parked) = self.fires.get(&r.resumes).cloned() else {
@@ -669,6 +682,20 @@ impl LedgerState {
     pub fn hook_seen(&self, route: &str, delivery_id: &str) -> bool {
         self.hooks
             .contains_key(&(route.to_string(), delivery_id.to_string()))
+    }
+
+    /// Deliveries of `route` recorded at or after `since` (#582): the
+    /// per-route rate limit, folded from the log so it survives a restart.
+    pub fn hooks_since(&self, route: &str, since: i64) -> usize {
+        self.hooks
+            .iter()
+            .filter(|((r, _), at)| r == route && **at >= since)
+            .count()
+    }
+
+    /// Seen deliveries currently remembered (bounded by the retention).
+    pub fn hooks_tracked(&self) -> usize {
+        self.hooks.len()
     }
 
     /// Next occurrence the job is owed after everything accounted.
