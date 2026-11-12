@@ -118,6 +118,30 @@ pub struct Claimed {
     /// A continuation (#581): the parked run's session, reopened instead
     /// of a new one.
     resume: Option<String>,
+    /// A webhook delivery that fired this run (#582).
+    trigger: Option<Trigger>,
+}
+
+/// What a webhook delivery adds to the one run it fires (#582).
+#[derive(Debug, Clone)]
+pub struct Trigger {
+    /// The fenced, rendered payload, appended to the job's prompt.
+    pub context: String,
+    /// Write tools absent (the default for webhook runs).
+    pub read_only: bool,
+}
+
+impl Claimed {
+    /// The claimed fire.
+    pub fn fire_id(&self) -> &str {
+        &self.fire.fire_id
+    }
+
+    /// This run only: a webhook's context and tool limit.
+    pub fn with_trigger(mut self, t: Trigger) -> Self {
+        self.trigger = Some(t);
+        self
+    }
 }
 
 /// What the claim phase knows (computed once per pass).
@@ -209,6 +233,7 @@ pub fn claim_one<S: tole_core::ledger::LedgerStore>(
         job: job.clone(),
         setup,
         resume: None,
+        trigger: None,
     }))
 }
 
@@ -315,6 +340,7 @@ pub fn resume_parked(
             job,
             setup,
             resume: Some(session_id.to_string()),
+            trigger: None,
         }))
     })?;
     let Some(c) = claimed else {
@@ -371,6 +397,7 @@ fn execute(dir: &Path, c: &Claimed, opts: &TickOptions) -> RunResult {
             &cancel,
             c.max_tokens,
             c.resume.as_deref(),
+            c.trigger.as_ref(),
         );
         RunResult {
             status: run.status,

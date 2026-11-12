@@ -30,6 +30,14 @@ pub struct Route {
     key: Option<Vec<u8>>,
     pub rate_per_minute: u32,
     pub max_body: usize,
+    /// The job a matching delivery fires (#582 part 2).
+    pub cron_job: Option<String>,
+    /// Admitted events; `None`: all.
+    pub events: Option<Vec<String>>,
+    pub filter: Option<crate::hook_filter::Filter>,
+    pub template: Option<crate::hook_filter::Template>,
+    /// The fired run may use the job's Write tools (else ReadOnly).
+    pub allow_writes: bool,
 }
 
 impl Route {
@@ -114,12 +122,49 @@ pub fn load(
         if !(1..=MAX_BODY).contains(&body) {
             return Err(err(format!("max_body_bytes must be 1-{MAX_BODY}")));
         }
+        // The action (#582 part 2), compiled now: a bad filter or template
+        // stops the server like a missing key.
+        let job_ok = |j: &String| {
+            (1..=64).contains(&j.len())
+                && j.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+        };
+        if h.cron_job.as_ref().is_some_and(|j| !job_ok(j)) {
+            return Err(err(
+                "cron_job must be a job id (1-64 of [A-Za-z0-9._-])".into()
+            ));
+        }
+        let event_ok = |e: &String| {
+            (1..=64).contains(&e.len())
+                && e.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+        };
+        if h.events.iter().flatten().any(|e| !event_ok(e)) {
+            return Err(err("each event must be 1-64 of [A-Za-z0-9._-]".into()));
+        }
+        let filter = h
+            .filter
+            .as_ref()
+            .map(crate::hook_filter::compile)
+            .transpose()
+            .map_err(|e| err(format!("filter: {e}")))?;
+        let template = h
+            .template
+            .as_deref()
+            .map(crate::hook_filter::Template::parse)
+            .transpose()
+            .map_err(&err)?;
         out.insert(
             name.clone(),
             Route {
                 key,
                 rate_per_minute: rate,
                 max_body: body as usize,
+                cron_job: h.cron_job.clone(),
+                events: h.events.clone(),
+                filter,
+                template,
+                allow_writes: h.allow_writes == Some(true),
             },
         );
     }
@@ -259,6 +304,67 @@ mod tests {
         });
         assert!(load(&open, true, &env).unwrap()["gh"].key().is_none());
         assert!(load(&open, false, &env).is_err());
+    }
+
+    /// #582 part 2: the action keys are compiled with the route; a bad one
+    /// stops the server like a missing key. Writes are off by default.
+    #[test]
+    fn the_action_keys_load_or_name_the_route() {
+        let base = || HookConfig {
+            hmac_key_env: Some("HOOK_KEY".into()),
+            ..HookConfig::default()
+        };
+        let ok = load(
+            &one(HookConfig {
+                cron_job: Some("pr-review".into()),
+                events: Some(vec!["pull_request".into()]),
+                template: Some("PR {number}".into()),
+                filter: Some(crate::hook_filter::FilterConfig {
+                    path: Some("action".into()),
+                    equals: Some("opened".into()),
+                    ..Default::default()
+                }),
+                ..base()
+            }),
+            false,
+            &env,
+        )
+        .unwrap();
+        let r = &ok["gh"];
+        assert!(r.filter.is_some() && r.template.is_some() && !r.allow_writes);
+        for (h, want) in [
+            (
+                HookConfig {
+                    cron_job: Some("bad job".into()),
+                    ..base()
+                },
+                "cron_job",
+            ),
+            (
+                HookConfig {
+                    events: Some(vec!["a b".into()]),
+                    ..base()
+                },
+                "event",
+            ),
+            (
+                HookConfig {
+                    template: Some("{".into()),
+                    ..base()
+                },
+                "template",
+            ),
+            (
+                HookConfig {
+                    filter: Some(crate::hook_filter::FilterConfig::default()),
+                    ..base()
+                },
+                "filter",
+            ),
+        ] {
+            let e = load(&one(h), false, &env).unwrap_err();
+            assert!(e.contains("`gh`") && e.contains(want), "{want}: {e}");
+        }
     }
 
     #[test]

@@ -126,6 +126,17 @@ pub struct HookConfig {
     pub rate_per_minute: Option<u32>,
     /// Largest body (default 262144, at most 1048576).
     pub max_body_bytes: Option<u64>,
+    /// The job a matching delivery fires (#582 part 2). Unset: deliveries
+    /// are only verified and recorded.
+    pub cron_job: Option<String>,
+    /// Events admitted (`X-GitHub-Event` / `X-Tole-Event`); unset: all.
+    pub events: Option<Vec<String>>,
+    /// The filter a delivery's JSON body must pass.
+    pub filter: Option<crate::hook_filter::FilterConfig>,
+    /// `{dot.path}` template of the context the fired run sees.
+    pub template: Option<String>,
+    /// Let the fired run use the job's Write tools (default: ReadOnly).
+    pub allow_writes: Option<bool>,
 }
 
 /// `cron.tz_source`.

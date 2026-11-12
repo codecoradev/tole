@@ -355,8 +355,49 @@ fn a_cancelled_agent_run_settles_cancelled() {
     let job = cron::create(&dir, agent(&dir, "c", "LOOP forever"), T).unwrap();
     let cancel = tole_core::cancel::CancelToken::new();
     cancel.cancel();
-    let run = cron::agent::run_agent(&job, &Default::default(), None, &cancel, 1_000, None);
+    let run = cron::agent::run_agent(&job, &Default::default(), None, &cancel, 1_000, None, None);
     assert_eq!(run.status, RunStatus::Cancelled, "{run:?}");
+}
+
+/// #582: a run a webhook fired sees the fenced payload in its prompt, for
+/// that run only, and is ReadOnly by default: the Write tools are absent
+/// even when the job's allow list names them. `allow_writes` lifts that.
+#[test]
+fn a_webhook_run_is_read_only_and_sees_its_context_once() {
+    provider();
+    let dir = tmp("hook-run");
+    let mut spec = agent(&dir, "w", "please WRITE a file");
+    spec.allow = vec!["write_file".into()];
+    let job = cron::create(&dir, spec, T).unwrap();
+    let context = tole_cli::hook_filter::fenced("gh", Some("push"), "d-1", "release 1.2 is out");
+    let run = |t: Option<&cron::tick::Trigger>| {
+        let cancel = tole_core::cancel::CancelToken::new();
+        cron::agent::run_agent(&job, &Default::default(), None, &cancel, 100_000, None, t)
+    };
+    let log = |r: &cron::agent::AgentRun| {
+        let sid = r.session_id.clone().unwrap();
+        std::fs::read_to_string(work(&dir).join(format!(".tole/sessions/{sid}.jsonl"))).unwrap()
+    };
+    let read_only = cron::tick::Trigger {
+        context: context.clone(),
+        read_only: true,
+    };
+    let r = run(Some(&read_only));
+    assert!(!work(&dir).join("out.txt").exists(), "read-only: {r:?}");
+    let l = log(&r);
+    assert!(
+        l.contains("UNTRUSTED WEBHOOK DATA") && l.contains("release 1.2 is out"),
+        "{l}"
+    );
+    let writable = cron::tick::Trigger {
+        read_only: false,
+        ..read_only
+    };
+    run(Some(&writable));
+    assert!(work(&dir).join("out.txt").exists(), "allow_writes");
+    // The next run has no trigger: no payload in its prompt.
+    let plain = run(None);
+    assert!(!log(&plain).contains("UNTRUSTED WEBHOOK DATA"));
 }
 
 #[test]
@@ -733,6 +774,7 @@ fn a_session_swapped_after_the_resume_check_is_refused_at_the_open() {
                 &cancel,
                 1_000,
                 Some(&s),
+                None,
             ));
         });
         let run = rx

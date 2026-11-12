@@ -635,7 +635,24 @@ pub fn edit(dir: &Path, key: &str, change: EditSpec, now: i64) -> anyhow::Result
 /// is claimed at `now`. Refused while the job is paused or running.
 pub fn run_now(dir: &Path, key: &str, now: i64, opts: &TickOptions) -> anyhow::Result<TickReport> {
     let mut report = TickReport::default();
-    let claimed = store::with_lock(dir, |l| {
+    let claimed = claim_now(dir, key, now, opts, &mut report)?;
+    tick::run_claimed(dir, claimed.into_iter().collect(), now, opts, &mut report)?;
+    Ok(report)
+}
+
+/// Claims a run of a job now, through the checks a tick makes (the
+/// trust check, delivery, provider, skills, the daily cap): `None` when
+/// the job was `blocked` or settled `budget` instead. Refused while the
+/// job is paused or running. The caller executes the claim
+/// ([`tick::run_claimed`]); a webhook adds its trigger first (#582).
+pub fn claim_now(
+    dir: &Path,
+    key: &str,
+    now: i64,
+    opts: &TickOptions,
+    report: &mut TickReport,
+) -> anyhow::Result<Option<tick::Claimed>> {
+    store::with_lock(dir, |l| {
         let job = resolve(l.state(), key)?;
         if job.paused {
             bail!("`{}` is paused; resume it first", job.id);
@@ -657,10 +674,8 @@ pub fn run_now(dir: &Path, key: &str, now: i64, opts: &TickOptions) -> anyhow::R
         };
         report.missed += due.missed.as_ref().map_or(0, |m| m.count);
         let ctx = tick::ClaimCtx::new(dir, l, now, opts);
-        Ok(tick::claim_one(l, &due, &job, now, &ctx, &mut report)?)
-    })?;
-    tick::run_claimed(dir, claimed.into_iter().collect(), now, opts, &mut report)?;
-    Ok(report)
+        Ok(tick::claim_one(l, &due, &job, now, &ctx, report)?)
+    })
 }
 
 /// Asks the job's running run(s) to stop. Returns the fire ids.
