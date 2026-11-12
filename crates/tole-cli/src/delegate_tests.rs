@@ -48,12 +48,27 @@ fn log_file(root: &Path) -> PathBuf {
 }
 
 fn host(root: &Path, secs: u64, allow: &[&str], src: &str) -> std::sync::Arc<Delegator> {
+    host_wt(root, secs, allow, src, false)
+}
+
+fn host_wt(
+    root: &Path,
+    secs: u64,
+    allow: &[&str],
+    src: &str,
+    worktrees: bool,
+) -> std::sync::Arc<Delegator> {
     let bin = fake_tole(root, secs);
     let allows = allow.iter().map(|s| s.to_string()).collect();
     std::sync::Arc::new(
-        Delegator::for_session(bin, root.to_path_buf(), false, allows, setup(src), &|_| {
-            None
-        })
+        Delegator::for_session(
+            bin,
+            root.to_path_buf(),
+            worktrees,
+            allows,
+            setup(src),
+            &|_| None,
+        )
         .unwrap(),
     )
 }
@@ -425,5 +440,44 @@ fn the_log_is_outside_the_workspace_and_forged_spawns_launch_nothing() {
         .execute(json!({"task": "b", "mode": "consult"}))
         .unwrap();
     assert_eq!(b["node"], json!(format!("{goal}.2")));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn with_worktrees_two_writers_run_in_parallel_each_on_its_own_lease() {
+    let root = tmp("worktrees");
+    let git = |args: &[&str]| {
+        let ok = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&root)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "git {args:?}");
+    };
+    git(&["init", "-q"]);
+    git(&["commit", "-q", "--allow-empty", "-m", "init"]);
+    let h = host_wt(&root, 5, &["write_*"], "", true);
+    let (start, _) = tools(&h, &root);
+    let a = start.execute(json!({"task": "one"})).unwrap();
+    let b = start.execute(json!({"task": "two"})).unwrap();
+    let d = log_of(&root);
+    let leased = |out: &Value| {
+        let wt = PathBuf::from(out["worktree"].as_str().unwrap());
+        let wt = wt.canonicalize().unwrap();
+        let node = out["node"].as_str().unwrap().to_string();
+        assert_eq!(
+            d.lease_conflict(wt.to_str().unwrap(), ""),
+            Some((wt.to_string_lossy().into_owned(), node))
+        );
+    };
+    leased(&a);
+    leased(&b);
+    assert_ne!(a["worktree"], b["worktree"]);
     let _ = std::fs::remove_dir_all(&root);
 }

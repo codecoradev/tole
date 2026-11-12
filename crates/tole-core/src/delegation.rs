@@ -948,8 +948,31 @@ impl<S: LedgerStore> Delegation<S> {
         })
     }
 
-    /// The live lease `path` would conflict with, as `(path, holder)`,
-    /// ignoring `node`'s own; for a pre-check before spawning a writer.
+    /// A live lease on `path` itself or on one of its ancestors, as
+    /// `(path, holder)`, ignoring `node`'s own. Unlike [`Self::lease_conflict`]
+    /// a lease BELOW `path` does not count: the pre-check for a writer that
+    /// will get a fresh directory under `path` (a new git worktree) must not
+    /// be blocked by its sibling worktrees, only by a writer holding the
+    /// whole tree above it.
+    pub fn lease_ancestor_conflict(&self, path: &str, node: &str) -> Option<(String, String)> {
+        self.state
+            .leases
+            .iter()
+            .find(|(p, h)| {
+                h.as_str() != node
+                    && (p.as_str() == "/"
+                        || path == p.as_str()
+                        || path
+                            .strip_prefix(p.as_str())
+                            .is_some_and(|r| r.starts_with('/')))
+            })
+            .map(|(p, h)| (p.clone(), h.clone()))
+    }
+
+    /// The live lease `path` would conflict with (the same path, an ancestor
+    /// or a descendant), as `(path, holder)`, ignoring `node`'s own; for the
+    /// pre-check of a writer on the whole of `path`, where a lease anywhere
+    /// inside it already blocks.
     pub fn lease_conflict(&self, path: &str, node: &str) -> Option<(String, String)> {
         self.state
             .lease_holder(path, node)

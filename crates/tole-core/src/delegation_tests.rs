@@ -784,3 +784,40 @@ fn a_raw_settle_cannot_charge_below_the_rules() {
         "a budget stop is its whole carve"
     );
 }
+
+#[test]
+fn an_ancestor_check_ignores_leases_below_the_path() {
+    let mut d = goal(2, 8);
+    let a = spawn(&mut d, "g", 100);
+    let b = spawn(&mut d, "g", 100);
+    d.lease_write(&a.node_id, "/w/.tole-worktrees/wt-1", T)
+        .unwrap();
+    // A sibling worktree under the same parent dir is not a conflict...
+    assert_eq!(d.lease_ancestor_conflict("/w/.tole-worktrees", ""), None);
+    // ...while the plain overlap check (whole-workspace writers) sees it.
+    assert!(d.lease_conflict("/w/.tole-worktrees", "").is_some());
+    // A lease on an ancestor, or on the path itself, is a conflict.
+    d.lease_write(&b.node_id, "/w", T).unwrap_err(); // overlaps wt-1
+    d.release(&a.node_id, "/w/.tole-worktrees/wt-1", T).unwrap();
+    d.lease_write(&b.node_id, "/w", T).unwrap();
+    assert_eq!(
+        d.lease_ancestor_conflict("/w/.tole-worktrees", ""),
+        Some(("/w".to_string(), b.node_id.clone()))
+    );
+    assert_eq!(
+        d.lease_ancestor_conflict("/w/.tole-worktrees", &b.node_id),
+        None
+    );
+    d.release(&b.node_id, "/w", T).unwrap();
+    d.lease_write(&b.node_id, "/", T).unwrap();
+    assert!(d
+        .lease_ancestor_conflict("/w/.tole-worktrees", "")
+        .is_some());
+    d.release(&b.node_id, "/", T).unwrap();
+    d.lease_write(&b.node_id, "/w/.tole-worktrees", T).unwrap();
+    assert!(
+        d.lease_ancestor_conflict("/w/.tole-worktrees", "")
+            .is_some(),
+        "equal path"
+    );
+}

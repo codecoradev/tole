@@ -898,8 +898,12 @@ The delegate tool (#585 part 3, `crates/tole-cli/src/delegate.rs`) adds:
   charged. A child's own spend is measured.
 - **Writers.** An `execute` child's write lease is taken on the canonicalized
   directory it works in (its worktree, else the workspace), checked before it
-  spawns; a second writer in the same workspace is refused (use
-  `--agents-worktree` for parallel writers).
+  spawns. In place, the pre-check refuses a writer when any lease overlaps the
+  workspace (a second writer in the same workspace is refused). With
+  `--agents-worktree` each writer gets a fresh worktree under
+  `.tole-worktrees`, so the pre-check refuses it only when that directory or an
+  ancestor of it is leased (someone writing the whole workspace); sibling
+  worktrees run in parallel.
 - **Machine guard.** Past `[delegation] max_live_processes` a spawn is recorded
   `queued` and started by a later delegate or poll. The file kept next to the
   log for it holds only what carries no authority (role, artifacts to read,

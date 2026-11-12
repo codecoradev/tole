@@ -344,13 +344,18 @@ impl Delegator {
             };
             let goal = me.goal_id.clone();
             // A writer in this workspace must be free to lease it.
-            let lease_at = if self.worktrees {
-                format!("{workspace}/.tole-worktrees")
+            // In-place, the writer leases the whole workspace: any lease
+            // inside it conflicts. With worktrees it gets a fresh directory
+            // under `.tole-worktrees`: only a lease on that dir or above it
+            // (someone holding the whole workspace) conflicts; sibling
+            // worktrees do not.
+            let held = if self.worktrees {
+                d.lease_ancestor_conflict(&format!("{workspace}/.tole-worktrees"), "")
             } else {
-                workspace.clone()
+                d.lease_conflict(&workspace, "")
             };
             if mode == Mode::Execute {
-                if let Some((p, h)) = d.lease_conflict(&lease_at, "") {
+                if let Some((p, h)) = held {
                     return Err(format!(
                         "delegate: `{p}` is write-leased by `{h}`; wait for it, delegate \
                          `consult` work, or run with --agents-worktree"
