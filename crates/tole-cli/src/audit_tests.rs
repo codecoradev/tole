@@ -202,3 +202,134 @@ fn audit_writes_nothing_and_refuses_an_unknown_goal() {
     assert!(none.starts_with("no delegation goals"), "{none}");
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// A goal with one queued child whose task is `task`.
+fn one_task(log: &Path, task: &str) {
+    let mut d = Delegation::open(FileStore::new(log.to_path_buf())).unwrap();
+    d.begin(
+        &Goal {
+            id: "g",
+            task: "orchestrator",
+            budget: Budget {
+                tokens: 1000,
+                steps: 100,
+                deadline: T + 3600,
+            },
+            allow: &[],
+            max_depth: 2,
+            max_live: 8,
+        },
+        T,
+    )
+    .unwrap();
+    d.delegate(
+        "g",
+        &DelegateRequest {
+            profile: "-",
+            task,
+            mode: Mode::Consult,
+            budget: BudgetRequest::default(),
+            profile_allow: &[],
+            workspace: Some("/w"),
+        },
+        Spend::default(),
+        T,
+    )
+    .unwrap();
+}
+
+/// Text and JSON audit of a goal whose child task is `task`, with one
+/// secret named `name`.
+fn shown(tag: &str, task: &str, name: &str, secret: &str) -> String {
+    let d = tmp(tag);
+    let log = d.join("delegation.jsonl");
+    one_task(&log, task);
+    let set = SecretSet::collect([(name.to_string(), secret.to_string())], []);
+    let text = audit(&log, Some("g"), false, &set).unwrap();
+    let json = audit(&log, Some("g"), true, &set).unwrap();
+    let _ = std::fs::remove_dir_all(&d);
+    format!("{text}\n{json}")
+}
+
+#[test]
+fn a_secret_across_the_task_cut_never_leaks_a_prefix() {
+    // The secret starts 10 characters before the 120-character cut.
+    let task = format!("{}{SECRET} tail", "x".repeat(TASK_CHARS - 10));
+    let out = shown("straddle", &task, "AUDIT_API_KEY", SECRET);
+    assert!(!out.contains(&SECRET[..8]), "{out}");
+    // A cut never splits a marker either: a marker is whole or absent.
+    for line in out.lines() {
+        assert_eq!(
+            line.matches('«').count(),
+            line.matches('»').count(),
+            "{line}"
+        );
+    }
+}
+
+#[test]
+fn a_secret_with_whitespace_or_control_characters_is_redacted() {
+    let spaced = "open  sesame 0123456789";
+    let out = shown(
+        "spaced",
+        &format!("use {spaced} now"),
+        "SPACED_TOKEN",
+        spaced,
+    );
+    assert!(!out.contains("sesame"), "{out}");
+    assert!(out.contains("«SPACED_TOKEN»"), "{out}");
+    let esc = "esc\u{1b}key-0123456789";
+    let out = shown("esc", &format!("use {esc} now"), "ESC_TOKEN", esc);
+    assert!(!out.contains("key-0123456789"), "{out}");
+    assert!(out.contains("«ESC_TOKEN»"), "{out}");
+}
+
+#[test]
+fn audit_and_poll_never_settle_or_write_even_with_work_pending() {
+    let d = tmp("pending");
+    let log = d.join("delegation.jsonl");
+    tree(&log);
+    // Add a running child whose process is gone; g.1.1 is queued already.
+    let mut w = Delegation::open(FileStore::new(log.clone())).unwrap();
+    let h = w
+        .delegate(
+            "g",
+            &DelegateRequest {
+                profile: "-",
+                task: "dead",
+                mode: Mode::Consult,
+                budget: BudgetRequest {
+                    tokens: Some(10),
+                    steps: Some(1),
+                    minutes: None,
+                },
+                profile_allow: &[],
+                workspace: Some("/w"),
+            },
+            Spend::default(),
+            T,
+        )
+        .unwrap();
+    w.start(
+        &h.node_id,
+        Lease {
+            pid: u32::MAX - 1,
+            start_time: 1,
+        },
+        None,
+        T,
+    )
+    .unwrap();
+    drop(w);
+    let before = std::fs::read(&log).unwrap();
+    let r = Delegation::open(FileStore::new(log.clone())).unwrap();
+    assert_eq!(r.poll(&h.node_id).unwrap().status, NodeStatus::Running);
+    assert_eq!(r.poll("g.1.1").unwrap().status, NodeStatus::Queued);
+    let out = audit(&log, Some("g"), true, &secrets()).unwrap();
+    assert!(
+        out.contains("\"running\"") && out.contains("\"queued\""),
+        "{out}"
+    );
+    assert_eq!(std::fs::read(&log).unwrap(), before, "nothing was written");
+    let _ = std::fs::remove_dir_all(&d);
+}

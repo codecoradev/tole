@@ -25,20 +25,30 @@ pub const TASK_CHARS: usize = 120;
 /// Longest report summary or reason shown, in characters.
 pub const TEXT_CHARS: usize = 400;
 
-/// One line, control characters dropped, at most `max` characters.
-fn line(s: &str, max: usize) -> String {
-    let clean: String = s
+/// One line for display: secrets redacted FIRST (on the raw text, so a
+/// secret with whitespace or control characters, or one that would straddle
+/// the cut, is matched whole), then control characters dropped, whitespace
+/// collapsed and the result cut at `max` characters. A cut never splits a
+/// `«NAME»` marker: a marker the cut would split is dropped whole.
+fn line(secrets: &SecretSet, s: &str, max: usize) -> String {
+    let redacted = secrets.redact(s);
+    let clean: String = redacted
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
     let clean = clean.split_whitespace().collect::<Vec<_>>().join(" ");
-    if clean.chars().count() > max {
-        let mut cut: String = clean.chars().take(max).collect();
-        cut.push('…');
-        cut
-    } else {
-        clean
+    if clean.chars().count() <= max {
+        return clean;
     }
+    let mut cut: String = clean.chars().take(max).collect();
+    // An opening marker with no closing one before the cut: drop it whole.
+    if let Some(open) = cut.rfind('«') {
+        if !cut[open..].contains('»') {
+            cut.truncate(open);
+        }
+    }
+    cut.push('…');
+    cut
 }
 
 fn status(s: NodeStatus) -> &'static str {
@@ -54,7 +64,7 @@ fn status(s: NodeStatus) -> &'static str {
     }
 }
 
-fn node_json(d: &Delegation<FileStore>, n: &Node) -> Value {
+fn node_json(d: &Delegation<FileStore>, n: &Node, secrets: &SecretSet) -> Value {
     let charged = d.charged(&n.id);
     json!({
         "node": n.id,
@@ -63,7 +73,7 @@ fn node_json(d: &Delegation<FileStore>, n: &Node) -> Value {
         "profile": n.profile.as_deref().filter(|p| *p != "-"),
         "mode": match n.mode { Mode::Consult => "consult", Mode::Execute => "execute" },
         "status": status(n.status),
-        "task": line(&n.task, TASK_CHARS),
+        "task": line(secrets, &n.task, TASK_CHARS),
         "budget": {"tokens": n.budget.tokens, "steps": n.budget.steps, "deadline": n.budget.deadline},
         "used": n.used.map(|u| json!({"tokens": u.tokens, "steps": u.steps})),
         "charged": {"tokens": charged.tokens, "steps": charged.steps},
@@ -73,12 +83,12 @@ fn node_json(d: &Delegation<FileStore>, n: &Node) -> Value {
         "leases": d.leases_of(&n.id),
         "session": n.session,
         "report": n.report.as_ref().map(|r| json!({
-            "summary": line(&r.summary, TEXT_CHARS),
+            "summary": line(secrets, &r.summary, TEXT_CHARS),
             "files": r.files.len(),
             "checks": r.checks.len(),
             "risks": r.risks.len(),
         })),
-        "reason": n.reason.as_deref().map(|r| line(r, TEXT_CHARS)),
+        "reason": n.reason.as_deref().map(|r| line(secrets, r, TEXT_CHARS)),
     })
 }
 
@@ -166,7 +176,7 @@ pub fn audit(
                 .goals()
                 .into_iter()
                 .map(|g| {
-                    let mut v = node_json(&d, g);
+                    let mut v = node_json(&d, g, secrets);
                     v["nodes"] = json!(d.tree(&g.id).len());
                     v
                 })
@@ -177,10 +187,16 @@ pub fn audit(
             if d.poll(goal).is_none_or(|n| n.parent.is_some()) {
                 return Err(format!("no goal `{goal}` in {}", log.display()));
             }
-            let nodes: Vec<Value> = d.tree(goal).into_iter().map(|n| node_json(&d, n)).collect();
+            let nodes: Vec<Value> = d
+                .tree(goal)
+                .into_iter()
+                .map(|n| node_json(&d, n, secrets))
+                .collect();
             json!({ "log": log, "goal": goal, "nodes": nodes })
         }
     };
+    // Second pass over everything (ids, paths, allow patterns): the capped
+    // fields were already redacted before they were cut.
     let value = secrets.redact_value(&value);
     if as_json {
         return Ok(format!(

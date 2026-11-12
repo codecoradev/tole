@@ -774,7 +774,8 @@ impl<S: LedgerStore> Delegation<S> {
             .ok_or_else(|| DelegationError::UnknownNode(id.to_string()))
     }
 
-    /// A node, as folded.
+    /// A node, as folded: a pure lookup in the folded state; it reads, settles
+    /// or writes nothing.
     pub fn poll(&self, id: &str) -> Option<&Node> {
         self.state.nodes.get(id)
     }
