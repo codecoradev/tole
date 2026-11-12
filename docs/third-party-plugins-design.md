@@ -1,8 +1,8 @@
 # Third-party plugins (MCP servers, skills) — design note
 
-Status: **research + proposal; the lock format, tool-manifest hash and
-connect-time guard hook of §4.1–4.2 are in place (#599 part 1a), enforced
-from part 1b.** Second half of the
+Status: **research + proposal; the lockfile, tool-manifest hash and
+connect-time guard of §4.1–4.2 are implemented by #599 part 1** (the
+`tole plugin` commands follow in part 2). Second half of the
 integration track (own integrations first, see
 [secrets-integrations-design.md](secrets-integrations-design.md)).
 Related: [skills-registry-design.md](skills-registry-design.md).
@@ -209,3 +209,32 @@ Tracked in epic #594 (#599–#601).
    third-party stdio servers?
 3. Unverified third-party plugins: allowed in interactive sessions only,
    with a sandbox (recommended), or not at all?
+
+## 8. Migration: the plugin lock (#599 part 1, BREAKING)
+
+**What changed.** An MCP server, the auto-attached `cora` included, only
+registers its tools when the owner approved its exact tool manifest and
+version in the user plugin lock (`$CODECORA_HOME/tole/plugins.lock`,
+default `~/.codecora/tole/plugins.lock`). There is no bypass.
+
+**Approve cora once.** Start an interactive session in a terminal on that
+machine (`tole`, `tole chat` or `tole run "..."`). Before the session
+starts, tole prints cora's full tool list (every name, description and
+input schema) and asks `Approve these tools? [y/N]`; answer `y`. The entry
+is written to the user lock and tole uses cora from then on, in every
+session and mission of that user. `tole doctor` shows the state of each
+configured server. A cora upgrade (new version or new tools) asks again.
+
+**Until then, a mission** (and `serve`, a delegated or child agent) runs
+without cora: its tools are not registered, stderr says
+`not approved in the plugin lock` with the remedy, the review gate stays
+off and the mission prompt has no code-review section. It never asks and
+never approves on its own.
+
+**Cron and CI** never prompt, so approve ahead of time: run one interactive
+session as the same user on that machine, or provide the user lock in the
+`CODECORA_HOME` the job runs with (for example a `plugins.lock` approved on
+a machine with the same server version, copied into the job's
+`$CODECORA_HOME/tole/`). Re-approve after upgrading a server. A project lock
+(`.tole/plugins.lock`) in the repository cannot stand in for it: it can only
+narrow what the user lock approves.

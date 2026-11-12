@@ -368,11 +368,24 @@ pub fn build(approver: impl Approver + 'static, roster: Roster) -> Result<ToolRe
     // tool, registered only when at least one server offers any.
     #[cfg(feature = "mcp")]
     let mut resource_servers = Vec::new();
+    // The rug-pull guard (#599): a server registers only when its live
+    // manifest matches its lock entry.
+    #[cfg(feature = "mcp")]
+    let plugin_gate = crate::plugin_gate::Gate::load(
+        tole_core::plugin_lock::Lockfile::user_path(),
+        &roster.workspace,
+    );
+    #[cfg(feature = "mcp")]
+    if !roster.mcp_servers.is_empty() {
+        for n in &plugin_gate.notes {
+            eprintln!("tole: {n}");
+        }
+    }
     #[cfg(feature = "mcp")]
     for cfg in &roster.mcp_servers {
-        // The connect-time guard hook (#599); the plugin lock enforces
-        // through it in the next part, until then every server registers.
-        let admit = |_: &str, _: &str, _: &[tole_core::plugin_lock::ManifestTool]| Ok(());
+        let admit = |s: &str, v: &str, t: &[tole_core::plugin_lock::ManifestTool]| {
+            plugin_gate.check(s, v, t)
+        };
         let names = tole_core::mcp::register_server_tools(&mut reg, cfg, &secrets, &admit);
         if cfg.name == "cora" && !names.is_empty() {
             cora_mcp_ok = true;

@@ -74,6 +74,33 @@ for line in sys.stdin:
     bin
 }
 
+/// #599: the owner's approval of the fake `cora` server (its exact tool
+/// manifest and version) in the user plugin lock of `home`, so the guard
+/// lets it register in an unattended run.
+fn approve_fake_cora(home: &std::path::Path) {
+    use tole_core::plugin_lock::{manifest_hash, LockEntry, Lockfile, ManifestTool, LOCK_FILE};
+    let s = json!({"type": "object", "properties": {"diff": {"type": "string"}}});
+    let tools: Vec<ManifestTool> = ["prepare", "finalize"]
+        .iter()
+        .map(|d| ManifestTool {
+            name: format!("cora_review_{d}"),
+            description: d.to_string(),
+            input_schema: s.clone(),
+        })
+        .collect();
+    let entry = LockEntry {
+        source: "stdio:cora mcp".into(),
+        version: "0".into(),
+        manifest_hash: manifest_hash(&tools),
+        ..Default::default()
+    };
+    let lock = Lockfile {
+        servers: [("cora".to_string(), entry)].into(),
+        ..Default::default()
+    };
+    lock.save(&home.join("tole").join(LOCK_FILE)).unwrap();
+}
+
 fn set_verify(bin: &Path, code: i32) {
     std::fs::write(bin.join("exit"), code.to_string()).unwrap();
 }
@@ -243,6 +270,7 @@ fn run_tole_with(
 ) -> Out {
     let (base, bodies) = spawn_provider(tool, args);
     let home = tmpdir("home");
+    approve_fake_cora(&home);
     let sessions = home.join("sessions");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
     cmd.args(["run", "--yes", "-s", sessions.to_str().unwrap()])

@@ -1033,6 +1033,45 @@ fn dispatch(cli: Cli) -> Result<()> {
         )?;
     }
 
+    // The plugin lock (#599): before an interactive terminal session starts
+    // (never a mission, a child agent or a non-TTY), every MCP server that
+    // is unapproved or changed is shown in full and the owner is asked.
+    #[cfg(feature = "mcp")]
+    {
+        use std::io::IsTerminal;
+        let interactive = match &cli.command {
+            Command::Run { prompt_file, .. } => prompt_file.as_deref() != Some("-"),
+            Command::Chat { .. } | Command::Resume { .. } => true,
+            #[cfg(feature = "tui")]
+            Command::Tui { .. } => true,
+            _ => false,
+        };
+        if interactive
+            && std::io::stdin().is_terminal()
+            && std::io::stderr().is_terminal()
+            && tole_core::child_env::depth(&|k| std::env::var(k).ok()) == 0
+        {
+            let specs: Vec<_> = host
+                .mcp_server
+                .iter()
+                .filter_map(|s| tole_core::mcp::McpServerConfig::parse(s).ok())
+                .collect();
+            let root = resolve_workspace_root(host.workspace.as_ref())?;
+            let mut gate = tole_cli::plugin_gate::Gate::load(
+                tole_core::plugin_lock::Lockfile::user_path(),
+                &root,
+            );
+            tole_cli::plugin_gate::preflight(&specs, &mut gate, &mut |text| {
+                use std::io::Write;
+                eprint!("{text}");
+                let _ = std::io::stderr().flush();
+                let mut line = String::new();
+                std::io::stdin().read_line(&mut line).is_ok()
+                    && matches!(line.trim(), "y" | "Y" | "yes")
+            });
+        }
+    }
+
     match cli.command {
         // Handled at the top of `dispatch`, before any session/env state.
         Command::Config { .. } => unreachable!("`tole config` returns early"),
@@ -1402,6 +1441,22 @@ fn dispatch(cli: Cli) -> Result<()> {
                 .map_or(0, |d| d.as_secs() as i64);
             for l in tole_cli::machine_guard::doctor_lines(&host.delegation, cwd.as_deref(), now) {
                 println!("{l}");
+            }
+            // The plugin lock (#599): each configured server's approval.
+            #[cfg(feature = "mcp")]
+            if let Some(cwd) = &cwd {
+                let names: Vec<String> = host
+                    .mcp_server
+                    .iter()
+                    .filter_map(|s| s.split('=').next().map(str::to_string))
+                    .collect();
+                let gate = tole_cli::plugin_gate::Gate::load(
+                    tole_core::plugin_lock::Lockfile::user_path(),
+                    cwd,
+                );
+                for l in gate.doctor_lines(&names) {
+                    println!("{l}");
+                }
             }
             if !ok {
                 std::process::exit(1);

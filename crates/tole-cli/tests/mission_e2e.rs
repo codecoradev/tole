@@ -492,6 +492,34 @@ for line in sys.stdin:
     bin
 }
 
+#[cfg(all(unix, feature = "mcp"))]
+/// #599: the owner's approval of the fake `cora` server (its exact tool
+/// manifest and version) in the user plugin lock of `home`, so the guard
+/// lets it register in an unattended run.
+fn approve_fake_cora(home: &std::path::Path) {
+    use tole_core::plugin_lock::{manifest_hash, LockEntry, Lockfile, ManifestTool, LOCK_FILE};
+    let s = json!({"type": "object", "properties": {"diff": {"type": "string"}}});
+    let tools: Vec<ManifestTool> = ["prepare", "finalize"]
+        .iter()
+        .map(|d| ManifestTool {
+            name: format!("cora_review_{d}"),
+            description: d.to_string(),
+            input_schema: s.clone(),
+        })
+        .collect();
+    let entry = LockEntry {
+        source: "stdio:cora mcp".into(),
+        version: "0".into(),
+        manifest_hash: manifest_hash(&tools),
+        ..Default::default()
+    };
+    let lock = Lockfile {
+        servers: [("cora".to_string(), entry)].into(),
+        ..Default::default()
+    };
+    lock.save(&home.join("tole").join(LOCK_FILE)).unwrap();
+}
+
 /// #536: a mission builds its registry like `run`, so with `cora` on PATH it
 /// has the review tools; its PINNED prompt must then name the review flow
 /// (it used not to), and without the tools it must not. Needs the `mcp`
@@ -507,11 +535,13 @@ fn mission_prompt_names_the_cora_review_flow_when_cora_is_attached() {
         bin.display(),
         std::env::var("PATH").unwrap_or_default()
     );
+    let home = dir.join("home");
     let env = [
         ("TOLE_BASE_URL".to_string(), base),
         ("TOLE_MODEL".to_string(), "mock-model".to_string()),
         ("TOLE_API_KEY".to_string(), "sk-test".to_string()),
         ("PATH".to_string(), path),
+        ("CODECORA_HOME".to_string(), home.display().to_string()),
     ];
     let env_ref: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
 
@@ -537,6 +567,32 @@ fn mission_prompt_names_the_cora_review_flow_when_cora_is_attached() {
         std::fs::read_to_string(file.path()).unwrap()
     };
 
+    // #599: unapproved, the server is unavailable to an unattended mission:
+    // no review tools, and a note naming the remedy.
+    let sessions = dir.join("unapproved");
+    let (_out, err, code) = run_tole(
+        &env_ref,
+        &[
+            "mission",
+            "-s",
+            sessions.to_str().unwrap(),
+            "--yes",
+            "--max-steps",
+            "12",
+            "go",
+        ],
+    );
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("not approved in the plugin lock"), "{err}");
+    let file = std::fs::read_dir(&sessions)
+        .unwrap()
+        .flatten()
+        .find(|e| e.file_name().to_string_lossy().ends_with(".jsonl"))
+        .unwrap();
+    let log = std::fs::read_to_string(file.path()).unwrap();
+    assert!(!log.contains("mcp_cora_cora_review_prepare"), "{log}");
+
+    approve_fake_cora(&home);
     let with = pinned(&[], "with");
     assert!(
         with.contains("# Code review"),
