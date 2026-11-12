@@ -644,3 +644,70 @@ fn a_planted_session_symlink_or_fifo_refuses_the_resume() {
         assert!(l.state().resumed_by(&parked).is_none());
     }
 }
+
+/// The race: `resume_parked` checked the session file, then the job swaps
+/// it for a symlink (to a valid parked copy outside) or a FIFO before the
+/// agent opens it. The agent run is entered directly after the swap, as it
+/// would be after the check. The open itself refuses: nothing is appended
+/// through the link, nothing blocks, and the approved write never runs.
+#[cfg(unix)]
+#[test]
+fn a_session_swapped_after_the_resume_check_is_refused_at_the_open() {
+    provider();
+    for planted in ["symlink", "fifo"] {
+        let dir = tmp(&format!("resume-race-{planted}"));
+        cron::create(&dir, agent(&dir, "w", "please WRITE a file"), T).unwrap();
+        let queue = ApprovalQueue::shared();
+        let opts = TickOptions {
+            approvals: Some(Arc::clone(&queue)),
+            ..TickOptions::standalone(2)
+        };
+        let (_, session, _) = run_once(&dir, &opts);
+        let session = session.unwrap();
+        queue.decide(&queue.list(Some(&session))[0].id, true);
+        let file = dir.join(format!(".tole/sessions/{session}.jsonl"));
+        // The swap, after the check.
+        let outside = tmp(&format!("resume-race-{planted}-outside")).join("parked.jsonl");
+        std::fs::rename(&file, &outside).unwrap();
+        let _ = std::fs::remove_file(dir.join(format!(".tole/sessions/{session}.jsonl.lock")));
+        if planted == "symlink" {
+            std::os::unix::fs::symlink(&outside, &file).unwrap();
+        } else {
+            let made = std::process::Command::new("mkfifo")
+                .arg(&file)
+                .status()
+                .unwrap();
+            assert!(made.success());
+        }
+        let before = std::fs::read(&outside).unwrap();
+        let job = store::open_read(&dir)
+            .unwrap()
+            .state()
+            .job("w")
+            .unwrap()
+            .job
+            .clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (q, s) = (Arc::clone(&queue), session.clone());
+        std::thread::spawn(move || {
+            let cancel = tole_core::cancel::CancelToken::new();
+            let setup = Default::default();
+            let _ = tx.send(cron::agent::run_agent(
+                &job,
+                &setup,
+                Some(&q),
+                &cancel,
+                1_000,
+                Some(&s),
+            ));
+        });
+        let run = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("never blocks");
+        assert_eq!(run.status, RunStatus::Error, "{planted}: {run:?}");
+        let e = run.error.unwrap_or_default();
+        assert!(e.contains("cannot be resumed"), "{planted}: {e}");
+        assert_eq!(std::fs::read(&outside).unwrap(), before, "{planted}");
+        assert!(!dir.join("out.txt").exists(), "{planted}");
+    }
+}

@@ -1059,4 +1059,15 @@ lost with a restart) the call parks again and never runs. An allow does
 not run the call by itself: the call runs only if the resumed model makes
 that same call again, otherwise it never runs. The continuation runs
 under the job's model pin, step budget, token budget and time limit, each
-counted for the continuation alone.
+counted for the continuation alone. The session file sits in the job's
+workdir, which the job can write. `JsonlStorage::open` therefore opens it
+once and uses that handle for the replay, the torn-tail repair and every
+append, never re-opening the path. On unix that open never follows a
+symlink at the last path component and never waits on a FIFO, and on
+every platform the handle must be a regular file. The `.lock` sidecar and
+compaction's temp file and reopen are opened the same way. The resume uses
+`open_bounded` (64 MiB cap on the handle), so a file swapped for a symlink
+or a FIFO after an earlier check is refused at the open. Not covered: a
+directory on the path (`.tole` or `.tole/sessions`) swapped for a symlink.
+That only leads to a file of the same random session id in another
+directory, but the `.lock` sidecar would be created there.

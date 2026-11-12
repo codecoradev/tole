@@ -635,8 +635,23 @@ impl JsonlStorage {
     ///
     /// Older format versions replay cleanly; a newer version is a hard
     /// error. A torn final line (crash mid-append) is discarded whole.
+    ///
+    /// The file is opened once: the replay, the torn-tail repair and every
+    /// later append use that one handle, never the path again. On unix the
+    /// open does not follow a symlink at the last path component and does
+    /// not block on a FIFO, and the handle must be a regular file, so a
+    /// file swapped between a caller's check and this open is refused here
+    /// (#581).
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
-        Self::open_with(path.as_ref(), true)
+        Self::open_with(path.as_ref(), true, None)
+    }
+
+    /// [`JsonlStorage::open`] for a session file in a directory another
+    /// process can write (a cron job's workdir, #581): also refuses a file
+    /// longer than `max_bytes`, checked on the opened handle, and stops
+    /// reading at the cap if the file grows during the replay.
+    pub fn open_bounded(path: impl AsRef<Path>, max_bytes: u64) -> Result<Self, StorageError> {
+        Self::open_with(path.as_ref(), true, Some(max_bytes))
     }
 
     /// Replays a session file for READING only (listings, status): a torn
@@ -644,10 +659,10 @@ impl JsonlStorage {
     /// reader can never cut a line another process is still appending
     /// (scan 2026-10-28). Do not commit through the result.
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self, StorageError> {
-        Self::open_with(path.as_ref(), false)
+        Self::open_with(path.as_ref(), false, None)
     }
 
-    fn open_with(path: &Path, repair: bool) -> Result<Self, StorageError> {
+    fn open_with(path: &Path, repair: bool, cap: Option<u64>) -> Result<Self, StorageError> {
         let path = path.to_path_buf();
         // Lock BEFORE reading or repairing: the torn-tail truncation below
         // would cut a line another process is still appending.
@@ -656,8 +671,22 @@ impl JsonlStorage {
         } else {
             None
         };
-        let file = File::open(&path)?;
-        let mut reader = BufReader::new(file);
+        // One handle for the whole life of this storage. Read-only replays
+        // get a read-only handle: a commit through them fails instead of
+        // writing.
+        let file = open_plain(OpenOptions::new().read(true).append(repair), &path)?;
+        let too_large =
+            |cap: u64| StorageError::Invalid(format!("session file larger than {cap} bytes"));
+        if let Some(cap) = cap {
+            if file.metadata()?.len() > cap {
+                return Err(too_large(cap));
+            }
+        }
+        // The reader is a duplicate of the handle (same open file); appends
+        // go to the end whatever the read offset. Reading stops one byte past
+        // the cap, so a file that grows during the replay is caught below.
+        let limit = cap.map_or(u64::MAX, |c| c.saturating_add(1));
+        let mut reader = BufReader::new(file.try_clone()?.take(limit));
 
         // Header (line 1, mandatory). Read with read_until: a header line
         // WITHOUT its trailing newline (crash mid-header-write) is a torn
@@ -704,14 +733,7 @@ impl JsonlStorage {
         let mut out = Self {
             session_id: header.id.clone(),
             path: path.clone(),
-            // Read-only replays get a read-only handle: a commit through
-            // them fails instead of writing.
-            writer: BufWriter::new(
-                OpenOptions::new()
-                    .append(repair)
-                    .read(!repair)
-                    .open(&path)?,
-            ),
+            writer: BufWriter::new(file),
             _lock: lock,
             good_len: 0,
             created_at: header.created_at,
@@ -803,8 +825,17 @@ impl JsonlStorage {
         // A torn tail was discarded during replay. Physically truncate the
         // partial bytes NOW, before the append handle concatenates a new
         // commit line onto the fragment (would corrupt the file forever).
-        if repair && good_bytes < file_len(&out.path)? {
-            truncate_file(&out.path, good_bytes)?;
+        if let Some(cap) = cap {
+            if reader.get_ref().limit() == 0 {
+                return Err(too_large(cap));
+            }
+        }
+        // Through the handle, not the path: the file truncated is the one
+        // replayed.
+        let handle = out.writer.get_ref();
+        if repair && good_bytes < handle.metadata()?.len() {
+            handle.set_len(good_bytes)?;
+            handle.sync_data()?;
             sync_dir(&out.path)?;
         }
         // The global seq advances with every record, transition or not.
@@ -1011,7 +1042,7 @@ impl JsonlStorage {
 
 /// Returns `true` when the reader is at EOF (used to classify a parse
 /// failure on the final line as a torn write rather than corruption).
-fn is_at_eof(reader: &mut BufReader<File>) -> bool {
+fn is_at_eof(reader: &mut impl Read) -> bool {
     let mut probe = [0u8; 1];
     matches!(reader.read(&mut probe), Ok(0))
 }
@@ -1023,20 +1054,21 @@ fn is_at_eof(reader: &mut BufReader<File>) -> bool {
 fn lock_writer(path: &Path) -> Result<File, StorageError> {
     let mut name = path.as_os_str().to_owned();
     name.push(".lock");
-    #[cfg(unix)]
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let mut b = OpenOptions::new();
-    b.read(true).write(true).create(true).truncate(false);
-    #[cfg(unix)]
-    {
-        // CLOEXEC: a spawned child must not inherit the writer lock. Without
-        // it, an flock held on the fd survives into every child until it
-        // exits (run_command, job_start, nohup-style wrappers), and a later
-        // `resume` is refused with a pid that no longer holds the session.
-        b.custom_flags(libc::O_CLOEXEC);
-    }
-    let mut f = b.open(Path::new(&name))?;
+    // CLOEXEC (set by `open_plain`): a spawned child must not inherit the
+    // writer lock. Without it, an flock held on the fd survives into every
+    // child until it exits (run_command, job_start, nohup-style wrappers),
+    // and a later `resume` is refused with a pid that no longer holds the
+    // session. NOFOLLOW and the regular-file check: the pid write below
+    // truncates the file, so a planted symlink must not lead it elsewhere
+    // (#581).
+    let mut f = open_plain(
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false),
+        Path::new(&name),
+    )?;
     let mut waited = std::time::Duration::ZERO;
     loop {
         match f.try_lock() {
@@ -1080,17 +1112,28 @@ fn lock_writer(path: &Path) -> Result<File, StorageError> {
 const SELF_HOLD_RETRY: std::time::Duration = std::time::Duration::from_millis(150);
 const SELF_HOLD_STEP: std::time::Duration = std::time::Duration::from_millis(5);
 
-/// File length in bytes (used to detect a discarded torn tail on open).
-fn file_len(path: &Path) -> std::io::Result<u64> {
-    Ok(std::fs::metadata(path)?.len())
-}
-
-/// Truncates the file to `len` bytes and fsyncs it.
-fn truncate_file(path: &Path, len: u64) -> std::io::Result<()> {
-    let f = OpenOptions::new().write(true).truncate(false).open(path)?;
-    f.set_len(len)?;
-    f.sync_data()?;
-    Ok(())
+/// Opens `path` with `opts` for a session handle (#581). On unix the open
+/// does not follow a symlink at the last path component (`O_NOFOLLOW`) and
+/// does not wait for a FIFO's other end (`O_NONBLOCK`, which has no effect
+/// on a regular file's reads and writes). On every platform the handle must
+/// be a regular file: the check is an `fstat` of the opened handle, so the
+/// file checked is the file used.
+fn open_plain(opts: &mut OpenOptions, path: &Path) -> Result<File, StorageError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // CLOEXEC: a spawned child must not inherit a session handle or the
+        // writer lock (std sets it too; kept explicit for the lock).
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    let f = opts.open(path)?;
+    if !f.metadata()?.is_file() {
+        return Err(StorageError::Invalid(format!(
+            "{} is not a regular file",
+            path.display()
+        )));
+    }
+    Ok(f)
 }
 
 /// Durability: flush a rename into the parent directory so the directory
@@ -1358,7 +1401,11 @@ impl Storage for JsonlStorage {
         // then fsync the directory so the rename itself survives a crash.
         let tmp = self.path.with_extension("jsonl.tmp");
         {
-            let mut w = BufWriter::new(File::create(&tmp)?);
+            // Never through a symlink planted at the temp path (#581).
+            let mut w = BufWriter::new(open_plain(
+                OpenOptions::new().write(true).create(true).truncate(true),
+                &tmp,
+            )?);
             let header = HeaderLine {
                 v: 1,
                 kind: "header".into(),
@@ -1384,15 +1431,17 @@ impl Storage for JsonlStorage {
         // unlinked inode, so any further commit would vanish silently.
         // Mark the session poisoned — every subsequent commit fails
         // LOUDLY instead of losing data (CodeCora scan-3: silent loss).
-        self.writer = BufWriter::new(match OpenOptions::new().append(true).open(&self.path) {
-            Ok(w) => w,
-            Err(e) => {
-                self.poisoned = Some(StorageError::Invalid(format!(
-                    "compact(): reopen after rename failed: {e}"
-                )));
-                return Err(e.into());
-            }
-        });
+        self.writer = BufWriter::new(
+            match open_plain(OpenOptions::new().append(true), &self.path) {
+                Ok(w) => w,
+                Err(e) => {
+                    self.poisoned = Some(StorageError::Invalid(format!(
+                        "compact(): reopen after rename failed: {e}"
+                    )));
+                    return Err(e);
+                }
+            },
+        );
         self.good_len = self.writer.get_ref().metadata()?.len();
         self.state.seq = seq;
         // The file was atomically rewritten from COMPLETE records only —

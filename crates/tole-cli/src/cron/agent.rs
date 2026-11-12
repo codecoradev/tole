@@ -301,10 +301,25 @@ pub fn run_agent(
         };
     let name = field(job, "name").unwrap_or(&job.id).to_string();
     let opened = match resume {
-        // Checked again right before the reopen: the session file sits in
-        // the job's workdir (see `tick::parked_pc`).
-        Some(_) => super::tick::parked_pc(&path)
-            .and_then(|_| tole_core::storage::JsonlStorage::open(&path).map_err(|e| e.to_string())),
+        // The session file sits in the job's workdir, which the job can
+        // write, and it may have been swapped since `resume_parked` checked
+        // it. So the checks are made on the one handle the turn then reads
+        // and appends through: no symlink, no FIFO, a regular file within
+        // the cap (`open_bounded`), and a turn still parked mid-turn.
+        Some(_) => tole_core::storage::JsonlStorage::open_bounded(
+            &path,
+            super::tick::MAX_RESUME_SESSION_BYTES,
+        )
+        .map_err(|e| format!("the session file cannot be resumed: {e}"))
+        .and_then(|s| {
+            use tole_core::state::Pc;
+            match tole_core::storage::Storage::state(&s).pc {
+                Pc::Idle | Pc::Final => {
+                    Err("the session file cannot be resumed: its turn already ended".into())
+                }
+                _ => Ok(s),
+            }
+        }),
         None => {
             crate::session_host::create_session(&dir, &session_id, None, Some(&name), Some("cron"))
                 .map_err(|e| e.to_string())

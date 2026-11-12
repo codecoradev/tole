@@ -147,6 +147,12 @@ and process spawning live in `tole-cli`.
      The parked `done` is never changed (append-only).
   2. The run's session is reopened (it must still be parked mid-turn, not
      at `final`) and the parked turn is resumed, with no new prompt. The
+     session file sits in the job's workdir, which the job can write, so
+     it is opened once with `JsonlStorage::open_bounded`: on unix no
+     symlink is followed and a FIFO is not waited on, the handle must be a
+     regular file within 64 MiB, and the parked-turn check, the replay and
+     every append use that one handle. A file swapped after an earlier
+     check is refused at that open. The
      turn replans from the denial; the approval is a one-shot for exactly
      the approved call (same tool, same input), so the model can repeat that
      call once and nothing else. A model that takes another way runs nothing
