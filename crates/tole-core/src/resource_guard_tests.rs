@@ -296,108 +296,41 @@ fn overrides_are_bounded() {
     .unwrap();
     assert_eq!(ok.child_memory_mb, MB_MAX);
     assert_eq!(ok.child_nice, 0);
-    let bad: Vec<(Overrides, &str)> = vec![
-        (
-            Overrides {
-                min_free_memory_mb: Some(0),
-                ..Default::default()
-            },
-            "min_free_memory_mb",
-        ),
-        (
-            Overrides {
-                child_memory_mb: Some(MB_MAX + 1),
-                ..Default::default()
-            },
-            "child_memory_mb",
-        ),
-        (
-            Overrides {
-                min_free_disk_mb: Some(0),
-                ..Default::default()
-            },
-            "min_free_disk_mb",
-        ),
-        (
-            Overrides {
-                min_free_pids_percent: Some(0),
-                ..Default::default()
-            },
-            "min_free_pids_percent",
-        ),
-        (
-            Overrides {
-                min_free_pids_percent: Some(91),
-                ..Default::default()
-            },
-            "min_free_pids_percent",
-        ),
-        (
-            Overrides {
-                spawn_interval_secs: Some(0),
-                ..Default::default()
-            },
-            "spawn_interval_secs",
-        ),
-        (
-            Overrides {
-                spawn_interval_secs: Some(3601),
-                ..Default::default()
-            },
-            "spawn_interval_secs",
-        ),
-        (
-            Overrides {
-                machine_max_live: Some(0),
-                ..Default::default()
-            },
-            "machine_max_live",
-        ),
-        (
-            Overrides {
-                machine_max_live: Some(1025),
-                ..Default::default()
-            },
-            "machine_max_live",
-        ),
-        (
-            Overrides {
-                max_load_per_cpu: Some(0.0),
-                ..Default::default()
-            },
-            "max_load_per_cpu",
-        ),
-        (
-            Overrides {
-                max_load_per_cpu: Some(-1.0),
-                ..Default::default()
-            },
-            "max_load_per_cpu",
-        ),
-        (
-            Overrides {
-                max_load_per_cpu: Some(f64::NAN),
-                ..Default::default()
-            },
-            "max_load_per_cpu",
-        ),
-        (
-            Overrides {
-                max_load_per_cpu: Some(64.5),
-                ..Default::default()
-            },
-            "max_load_per_cpu",
-        ),
-        (
-            Overrides {
-                child_nice: Some(20),
-                ..Default::default()
-            },
-            "child_nice",
-        ),
+    // One override per case, by key name: (key, value).
+    let one = |key: &str, v: f64| {
+        let n = v as u64;
+        let mut o = Overrides::default();
+        match key {
+            "min_free_memory_mb" => o.min_free_memory_mb = Some(n),
+            "child_memory_mb" => o.child_memory_mb = Some(n),
+            "min_free_disk_mb" => o.min_free_disk_mb = Some(n),
+            "min_free_pids_percent" => o.min_free_pids_percent = Some(n),
+            "spawn_interval_secs" => o.spawn_interval_secs = Some(n),
+            "machine_max_live" => o.machine_max_live = Some(n as u32),
+            "max_load_per_cpu" => o.max_load_per_cpu = Some(v),
+            "child_nice" => o.child_nice = Some(n as u32),
+            _ => unreachable!("{key}"),
+        }
+        o
+    };
+    let bad = [
+        ("min_free_memory_mb", 0.0),
+        ("child_memory_mb", (MB_MAX + 1) as f64),
+        ("min_free_disk_mb", 0.0),
+        ("min_free_pids_percent", 0.0),
+        ("min_free_pids_percent", 91.0),
+        ("spawn_interval_secs", 0.0),
+        ("spawn_interval_secs", 3601.0),
+        ("machine_max_live", 0.0),
+        ("machine_max_live", 1025.0),
+        ("max_load_per_cpu", 0.0),
+        ("max_load_per_cpu", -1.0),
+        ("max_load_per_cpu", f64::NAN),
+        ("max_load_per_cpu", 64.5),
+        ("child_nice", 20.0),
     ];
-    for (o, key) in bad {
-        let err = Thresholds::with(&o).unwrap_err();
+    for (key, v) in bad {
+        let err = Thresholds::with(&one(key, v)).unwrap_err();
         assert!(err.contains(&format!("delegation.{key}")), "{err}");
     }
 }
