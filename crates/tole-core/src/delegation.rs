@@ -774,7 +774,8 @@ impl<S: LedgerStore> Delegation<S> {
             .ok_or_else(|| DelegationError::UnknownNode(id.to_string()))
     }
 
-    /// A node, as folded.
+    /// A node, as folded: a pure lookup in the folded state; it reads, settles
+    /// or writes nothing.
     pub fn poll(&self, id: &str) -> Option<&Node> {
         self.state.nodes.get(id)
     }
@@ -995,6 +996,30 @@ impl<S: LedgerStore> Delegation<S> {
     /// Every node, in id order.
     pub fn nodes(&self) -> impl Iterator<Item = &Node> {
         self.state.nodes.values()
+    }
+
+    /// The roots (goals) of the log, in log order.
+    pub fn goals(&self) -> Vec<&Node> {
+        let mut g: Vec<&Node> = self.nodes().filter(|n| n.parent.is_none()).collect();
+        g.sort_by_key(|n| n.seq);
+        g
+    }
+
+    /// What `id`'s subtree is charged to its parent: its whole carve while
+    /// it runs, its own and its children's usage once settled, capped at the
+    /// carve.
+    pub fn charged(&self, id: &str) -> Spend {
+        self.state.charge(id)
+    }
+
+    /// The paths `id` holds a write lease on.
+    pub fn leases_of(&self, id: &str) -> Vec<String> {
+        self.state
+            .leases
+            .iter()
+            .filter(|(_, h)| h.as_str() == id)
+            .map(|(p, _)| p.clone())
+            .collect()
     }
 
     /// The node whose recorded session is `session` (the host stores the

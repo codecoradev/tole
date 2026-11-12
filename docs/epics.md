@@ -276,7 +276,7 @@ Bot and Nakama; BMAD for collaboration). Design notes:
     caps is in, the `[delegation]` limits, the delegated-child launch
     contract and the `delegate` tool with profiles, carved mission budgets,
     leases, grants and measured usage, and the completion report
-    (`delegate_report`); `tole audit` follows);
+    (`delegate_report`), and `tole audit`; done);
   - model routing with RuleRouter plus LayaRouter, on/off by the
     `SYSTEMONE_*` env (#586);
   - advisor (#587);

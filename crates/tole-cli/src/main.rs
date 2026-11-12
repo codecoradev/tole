@@ -445,6 +445,17 @@ enum Command {
         /// Session id to inspect (default: the most recently modified).
         id: Option<String>,
     },
+    /// Print this workspace's delegation tree (#585), read-only: goals, or
+    /// one goal's nodes with profile, mode, status, budget and use, allow
+    /// lists (and dropped patterns), leases, report summary and reason.
+    /// Output is capped and redacted; nothing is written.
+    Audit {
+        /// The goal to show (default: list the goals).
+        goal: Option<String>,
+        /// Print JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
     /// Serve tole's tools over MCP stdio (issue #94): ReadOnly tools are
     /// always callable; Write tools require --allow patterns (server mode
     /// has no stdin human — stdin IS the protocol); Destructive tools are
@@ -661,7 +672,8 @@ fn gate_policy(cmd: &Command) -> GatePolicy {
         | Command::Upgrade { .. }
         | Command::Setup { .. }
         | Command::Approvals { .. }
-        | Command::Skills { .. } => GatePolicy::Skip,
+        | Command::Skills { .. }
+        | Command::Audit { .. } => GatePolicy::Skip,
         #[cfg(feature = "shell-tools")]
         Command::Cron { .. } => GatePolicy::Skip,
         // `--prompt-file -` consumes stdin as the prompt: a question on
@@ -1380,6 +1392,23 @@ fn dispatch(cli: Cli) -> Result<()> {
             if !ok {
                 std::process::exit(1);
             }
+            Ok(())
+        }
+        Command::Audit { goal, json } => {
+            let root = resolve_workspace_root(host.workspace.as_ref())?;
+            let data = tole_core::paths::tole_data_dir().ok_or_else(|| {
+                anyhow!("cannot resolve the tole data dir (set CODECORA_HOME or HOME)")
+            })?;
+            let log = tole_cli::delegate::log_path(&data, &root)
+                .ok_or_else(|| anyhow!("cannot canonicalize the workspace {}", root.display()))?;
+            let out = tole_cli::audit::audit(
+                &log,
+                goal.as_deref(),
+                json,
+                &tole_core::secrets::SecretSet::from_env(),
+            )
+            .map_err(anyhow::Error::msg)?;
+            print!("{out}");
             Ok(())
         }
         Command::Status { id } => {
