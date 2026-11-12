@@ -165,6 +165,7 @@ fn claim_that_loses_a_race_past_the_lock_is_refused() {
         scheduled_for: T + 60,
         claimed_at: T + 60,
         lease: P2,
+        tz: None,
     });
     let mut l = Ledger::open(RacingStore {
         inner: inner.clone(),
@@ -375,7 +376,8 @@ fn invalid_jobs_are_rejected_on_save() {
                 timezone: Some("Asia/Jakarta".into()),
                 ..job("x", "@hourly", T)
             },
-            "#580",
+            // The default source takes UTC and fixed offsets only (#580).
+            "offset-only",
         ),
         (
             Job {
@@ -549,6 +551,7 @@ fn random_records(r: &mut Rng) -> Vec<Record> {
             scheduled_for: at,
             claimed_at: at,
             lease: P1,
+            tz: None,
         }));
         if r.below(3) > 0 {
             v.push(Record::Done(Done {
@@ -619,6 +622,7 @@ fn fold_keeps_first_done_and_first_claim() {
             scheduled_for: T,
             claimed_at: T,
             lease: P1,
+            tz: None,
         })
     };
     let d = |st| {

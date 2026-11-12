@@ -47,11 +47,31 @@
 //! (refuse to guess). A torn or unparseable final line is discarded.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::cron::Schedule;
+use crate::cron::{Schedule, Zoned};
+use crate::tz::{OffsetOnly, ZoneSource};
+
+/// Where the fold resolves a job's `timezone` (#580). The default takes
+/// UTC and fixed offsets only; a host passes its configured source to
+/// [`Ledger::open_with_zones`].
+#[derive(Clone)]
+pub struct Zones(pub Arc<dyn ZoneSource>);
+
+impl Default for Zones {
+    fn default() -> Self {
+        Zones(Arc::new(OffsetOnly))
+    }
+}
+
+impl std::fmt::Debug for Zones {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Zones({})", self.0.label())
+    }
+}
 
 /// Version of the ledger record format.
 pub const LEDGER_VERSION: u32 = 1;
@@ -178,6 +198,23 @@ pub struct Fire {
     pub scheduled_for: i64,
     pub claimed_at: i64,
     pub lease: Lease,
+    /// The zone of a job that has a `timezone` (#580); absent otherwise,
+    /// so a job without one writes the same record as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tz: Option<FireZone>,
+}
+
+/// How a zoned occurrence was placed (#580).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FireZone {
+    /// The job's `timezone`.
+    pub zone: String,
+    /// The UTC offset in effect at `scheduled_for`, seconds east.
+    pub offset: i32,
+    /// `gap` (it stands for a local time DST skipped) or `first_of_two`
+    /// (its local time happens again later and will not fire again).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub case: Option<String>,
 }
 
 /// The claim to continue a parked run (#581): appended before the
@@ -402,8 +439,10 @@ impl LedgerStore for MemoryStore {
 #[derive(Debug, Clone)]
 pub struct JobState {
     pub job: Job,
-    /// `Err` only for a hand-edited or newer-build record (save validates).
-    pub schedule: Result<Schedule, String>,
+    /// `Err` for a hand-edited or newer-build record, or a zone the source
+    /// cannot resolve any more (save validates). The schedule runs in the
+    /// job's `timezone`; UTC when it has none.
+    pub schedule: Result<Zoned, String>,
 }
 
 /// Current state: a pure fold over the records.
@@ -422,6 +461,8 @@ pub struct LedgerState {
     hooks: HashMap<(String, String), i64>,
     /// Parked run → the continuation that resumed it.
     resumed: HashMap<String, String>,
+    /// Where job time zones are resolved (#580).
+    zones: Zones,
     /// Records of kinds this build does not know (skipped).
     pub unknown: u64,
 }
@@ -444,13 +485,23 @@ impl LedgerState {
         s
     }
 
+    /// A job's schedule in its `timezone`, resolved through the zone
+    /// source (UTC when it has none).
+    pub fn zoned(&self, j: &Job) -> Result<Zoned, String> {
+        let zone = match j.timezone.as_deref() {
+            None => crate::tz::Zone::utc(),
+            Some(name) => crate::tz::resolve(&*self.zones.0, name).map_err(|e| e.to_string())?,
+        };
+        let schedule = Schedule::parse(&j.schedule).map_err(|e| e.to_string())?;
+        Ok(Zoned { schedule, zone })
+    }
+
     /// Applies one record. Idempotent per record identity; first `fire`
     /// per occurrence and first `done` per fire win.
     pub fn apply(&mut self, rec: &Record) {
         match rec {
             Record::Job(j) => {
-                let schedule = validate_timezone(j)
-                    .and_then(|_| Schedule::parse(&j.schedule).map_err(|e| e.to_string()));
+                let schedule = self.zoned(j);
                 let mut job = j.clone();
                 // Who created a live job is fixed by the line that created
                 // it (#581): a later line keeps the first line's values.
@@ -533,6 +584,7 @@ impl LedgerState {
                     scheduled_for: parked.scheduled_for,
                     claimed_at: r.claimed_at,
                     lease: r.lease,
+                    tz: None,
                 };
                 self.fires.insert(f.fire_id.clone(), f.clone());
                 match self.done.contains_key(&f.fire_id) {
@@ -683,15 +735,6 @@ impl LedgerState {
     }
 }
 
-fn validate_timezone(j: &Job) -> Result<(), String> {
-    match j.timezone.as_deref() {
-        None | Some("UTC") => Ok(()),
-        Some(z) => Err(format!(
-            "time zone `{z}` is not supported yet (UTC only until #580)"
-        )),
-    }
-}
-
 fn valid_code(s: &str, max: usize) -> bool {
     !s.is_empty() && s.len() <= max
 }
@@ -705,11 +748,20 @@ pub struct Ledger<S: LedgerStore> {
 }
 
 impl<S: LedgerStore> Ledger<S> {
-    /// Reads and folds the log (read-only: never truncates).
+    /// Reads and folds the log (read-only: never truncates). Job time
+    /// zones resolve with the default source (UTC and fixed offsets).
     pub fn open(store: S) -> Result<Self, LedgerError> {
+        Self::open_with_zones(store, Arc::new(OffsetOnly))
+    }
+
+    /// [`open`](Self::open) resolving IANA zone names through `zones`.
+    pub fn open_with_zones(store: S, zones: Arc<dyn ZoneSource>) -> Result<Self, LedgerError> {
         let mut l = Ledger {
             store,
-            state: LedgerState::default(),
+            state: LedgerState {
+                zones: Zones(zones),
+                ..LedgerState::default()
+            },
             offset: 0,
         };
         l.sync(false)?;
@@ -797,8 +849,9 @@ impl<S: LedgerStore> Ledger<S> {
         {
             return bad(format!("id `{}` must be 1-64 of [A-Za-z0-9._-]", job.id));
         }
-        Schedule::parse(&job.schedule).map_err(|e| LedgerError::InvalidJob(e.to_string()))?;
-        validate_timezone(&job).map_err(LedgerError::InvalidJob)?;
+        // The schedule and the zone (an unresolvable name is refused here,
+        // naming the source; never silently UTC).
+        self.state.zoned(&job).map_err(LedgerError::InvalidJob)?;
         if job.grace_minutes > MAX_GRACE_MINUTES {
             return bad(format!(
                 "grace_minutes {} exceeds {MAX_GRACE_MINUTES}",
@@ -855,12 +908,25 @@ impl<S: LedgerStore> Ledger<S> {
         let Some(at) = due.fire else { return Ok(None) };
         self.check_claimable(&due.job_id, at)?;
         let fire_id = format!("{}@{at}/{}.{}", due.job_id, lease.pid, lease.start_time);
+        // A job with a `timezone` records how the occurrence was placed.
+        let tz = self
+            .state
+            .jobs
+            .get(&due.job_id)
+            .filter(|js| js.job.timezone.is_some())
+            .and_then(|js| js.schedule.as_ref().ok())
+            .map(|z| FireZone {
+                zone: z.zone.name().to_string(),
+                offset: z.zone.offset_at(at),
+                case: z.dst_case(at).map(str::to_string),
+            });
         self.append(&Record::Fire(Fire {
             fire_id: fire_id.clone(),
             job_id: due.job_id.clone(),
             scheduled_for: at,
             claimed_at: now,
             lease,
+            tz,
         }))?;
         match self.state.claim_of(&due.job_id, at) {
             Some(w) if w == fire_id => Ok(self.state.fire(&fire_id).cloned()),

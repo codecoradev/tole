@@ -12,8 +12,12 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 
 use tole_core::ledger::{Lease, Ledger, LedgerError, LedgerStore};
+use tole_core::tz::{OffsetOnly, ZoneSource, ZoneinfoDir};
+
+use crate::config::TzSource;
 
 /// The ledger file inside a cron dir.
 pub fn ledger_path(dir: &Path) -> PathBuf {
@@ -70,9 +74,40 @@ impl LedgerStore for FileStore {
     }
 }
 
+/// Where job time zones resolve (#580): the user config's
+/// `cron.tz_source`, by default `system` on unix (`$TZDIR`, else
+/// `/usr/share/zoneinfo`, read at run time) and `offset-only` elsewhere.
+/// Read once per process.
+pub fn zones() -> Arc<dyn ZoneSource> {
+    static ZONES: OnceLock<Arc<dyn ZoneSource>> = OnceLock::new();
+    ZONES
+        .get_or_init(|| {
+            let configured = crate::config::user_config_path()
+                .filter(|p| p.exists())
+                .and_then(|p| crate::config::load(&p).ok())
+                .and_then(|c| c.cron?.tz_source);
+            let system = || -> Arc<dyn ZoneSource> {
+                match std::env::var_os("TZDIR").filter(|d| !d.is_empty()) {
+                    Some(d) => Arc::new(ZoneinfoDir::new(PathBuf::from(d))),
+                    None => Arc::new(ZoneinfoDir::system()),
+                }
+            };
+            match configured {
+                Some(TzSource::System) => system(),
+                Some(TzSource::OffsetOnly) => Arc::new(OffsetOnly),
+                None if cfg!(unix) => system(),
+                None => Arc::new(OffsetOnly),
+            }
+        })
+        .clone()
+}
+
 /// Opens the ledger read-only (listings): no lock, never truncates.
 pub fn open_read(dir: &Path) -> anyhow::Result<Ledger<FileStore>> {
-    Ok(Ledger::open(FileStore::new(ledger_path(dir)))?)
+    Ok(Ledger::open_with_zones(
+        FileStore::new(ledger_path(dir)),
+        zones(),
+    )?)
 }
 
 /// Runs `f` on the ledger under the exclusive host lock.
@@ -88,7 +123,7 @@ pub fn with_lock<R>(
         .truncate(false)
         .open(dir.join("jobs.lock"))?;
     lock.lock()?;
-    let mut ledger = Ledger::open(FileStore::new(ledger_path(dir)))?;
+    let mut ledger = Ledger::open_with_zones(FileStore::new(ledger_path(dir)), zones())?;
     let out = f(&mut ledger);
     drop(lock); // closing the handle releases the lock
     out

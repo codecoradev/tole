@@ -34,6 +34,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Missions now learn about cora's agent-as-reviewer flow (#536): `tole mission` builds its registry like `run` (including the auto-attached `mcp_cora_*` tools) but its pinned system prompt never named the review tools, so the unattended command was the one that did not know the flow existed. When both `mcp_cora_cora_review_prepare` and `mcp_cora_cora_review_finalize` are registered, a fresh mission's prompt now carries the same review section as `run` / `chat` / the TUI plus one sentence asking for a review (and its verdict in the final message) before the mission ends; without the tools nothing is added. Guidance only: a gate before `git commit` is tracked separately. `serve`, `acp` and `mcp` sessions are unchanged on purpose: they attach no external MCP servers, so they have no review tools. Resumed missions keep their pinned prompt.
 
 ### Added
+- Per-job time zones for cron, part 2 of #580.
+  - `tole cron create|edit --timezone` takes `UTC`, a fixed offset like `+07:00` or an IANA name like `Asia/Jakarta`. The schedule then runs on that zone's wall clock: `0 9 * * *` stays 09:00 local across DST changes.
+  - A local time that DST skips runs once, right after the gap. A local time that happens twice runs once, the first time. `@every` is a plain duration and ignores the zone.
+  - `tole cron list` shows each job's zone and its next run in local time and UTC, for example `2026-01-01 09:00 Asia/Jakarta (2026-01-01 02:00Z)`. `create` and `edit` print the next run the same way.
+  - A run of a zoned job records its zone, its UTC offset and its DST case (`gap` or `first_of_two`) in the `fire` record.
+  - Two new user-config keys (a project config cannot set either):
+    - `cron.timezone`: the zone of a job created without `--timezone`. Existing jobs and edits never gain one.
+    - `cron.tz_source`: where IANA names resolve. `system` is the default on unix: the host's zoneinfo, read at run time (`$TZDIR` honored), with no zone data in the binary. `offset-only` takes only `UTC` and fixed offsets.
+  - A name the source cannot resolve, a malformed offset or a path-like name is refused on save with the remedy, never silently treated as UTC. A job without a zone keeps plain UTC and writes the same records as before.
+  - `tole-core` API: `cron::Zoned`, `Ledger::open_with_zones`, `ledger::{Zones, FireZone}`, `Fire::tz`, and `JobState::schedule` is now a `Result<Zoned, String>`.
 - Time zones, part 1 of #580: the new `tole-core` module `tz`. Schedules do not use it yet; part 2 brings per-job time zones and `tole cron --timezone`.
   - A `Zone` is UTC, a fixed offset (`+07:00`, at most 14 hours) or zone rules read from TZif bytes (RFC 8536, versions 1 to 4, including the POSIX TZ footer that modern zoneinfo files use for future dates) or from a POSIX TZ string.
   - `Zone::from_local` maps a wall-clock time to one instant, to the first instant after a DST gap, or to both instants of a DST overlap.

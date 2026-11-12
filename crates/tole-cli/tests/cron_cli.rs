@@ -307,7 +307,7 @@ fn cli_create_list_tick_round_trip() {
     );
     let list = tole(&["cron", "list"]);
     assert!(
-        list.contains("ping  ping  [script] @every 1m active"),
+        list.contains("ping  ping  [script] @every 1m (UTC) active"),
         "{list}"
     );
     let t = tole(&["cron", "tick"]);

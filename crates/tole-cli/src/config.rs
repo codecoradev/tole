@@ -99,6 +99,24 @@ pub struct CronConfig {
     /// Runs one tick (`tole cron tick`, the `tole serve --cron` ticker)
     /// executes at once, 1 to [`MAX_CRON_CONCURRENT`] (default 4).
     pub max_concurrent: Option<usize>,
+    /// The time zone of a job saved without `--timezone` (#580): `UTC`, a
+    /// fixed offset like `+07:00` or an IANA name. Unset: such a job keeps
+    /// plain UTC.
+    pub timezone: Option<String>,
+    /// Where IANA zone names are resolved (#580) [default: `system` on
+    /// unix, else `offset-only`].
+    pub tz_source: Option<TzSource>,
+}
+
+/// `cron.tz_source`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TzSource {
+    /// The host's zoneinfo (`$TZDIR`, else `/usr/share/zoneinfo`), read at
+    /// run time; no zone data in the binary.
+    System,
+    /// UTC and fixed offsets only.
+    OffsetOnly,
 }
 
 /// Upper bound of `cron.max_concurrent`.
@@ -824,6 +842,12 @@ pub fn layered(project: &Config, user: &Config) -> Config {
         if c.max_concurrent.is_some() {
             from_user.insert("cron.max_concurrent");
         }
+        if c.timezone.is_some() {
+            from_user.insert("cron.timezone");
+        }
+        if c.tz_source.is_some() {
+            from_user.insert("cron.tz_source");
+        }
     }
     if let Some(t) = &user.tui {
         if t.theme.as_deref().is_some_and(|v| !v.trim().is_empty()) {
@@ -1081,6 +1105,18 @@ pub fn render_with(cfg: &Config, tag: &str, ann: &Annotations) -> Vec<String> {
             &mut out,
             "cron.max_concurrent",
             c.max_concurrent.map(|n| n.to_string()),
+        );
+        scalar(&mut out, "cron.timezone", c.timezone.as_deref().map(quote));
+        scalar(
+            &mut out,
+            "cron.tz_source",
+            c.tz_source.map(|s| {
+                match s {
+                    TzSource::System => "\"system\"",
+                    TzSource::OffsetOnly => "\"offset-only\"",
+                }
+                .to_string()
+            }),
         );
     }
     if let Some(d) = &cfg.delegation {
@@ -1383,6 +1419,22 @@ verify_timeout = 60
         assert!(parse("[cron]\napi_token = \"x\"\n", &p()).is_err());
         assert!(parse("[mission]\ndaily_token_cap = 1\n", &p()).is_err());
         assert!(parse("[cron]\ndaily_token_cap = \"1\"\n", &p()).is_err());
+        // #580: the zone keys; an unknown source names the accepted ones.
+        let tz = parse(
+            "[cron]\ntimezone = \"Asia/Jakarta\"\ntz_source = \"offset-only\"\n",
+            &p(),
+        )
+        .unwrap()
+        .cron
+        .unwrap();
+        assert_eq!(
+            (tz.timezone.as_deref(), tz.tz_source),
+            (Some("Asia/Jakarta"), Some(TzSource::OffsetOnly))
+        );
+        let e = parse("[cron]\ntz_source = \"bundled\"\n", &p())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("system") && e.contains("offset-only"), "{e}");
         let project = parse("[cron]\ndaily_token_cap = 999999999\n", &p()).unwrap();
         assert_eq!(layered(&project, &Config::default()).cron, None);
         let m = layered(&project, &user);

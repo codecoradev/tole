@@ -129,9 +129,27 @@ and process spawning live in `tole-cli`.
   - Leap-second zones are refused.
   - `bundled` is not built: an embedder or a later feature plugs bundled
     data in as another `ZoneSource`, so core embeds no database.
-  - Part 2 wires schedules (`Zoned`), the ledger (a `fire` records its zone
-    and DST case), `cron.timezone`, `cron.tz_source` and `tole cron
-    --timezone`.
+  **Part 2 (schedules and the CLI):**
+  - **Schedules.** A `Zoned` schedule walks matching wall-clock minutes. A
+    minute in a gap fires at the gap's end, and a minute in an overlap fires
+    at its first instant. A minute whose instant has already passed is
+    skipped, so nothing fires twice, even when the cursor sits inside the
+    repeated hour. `@every` ignores the zone.
+  - **The ledger** resolves each job's `timezone` through its
+    `ZoneSource` (`Ledger::open_with_zones`). A `fire` of a zoned job
+    records `tz {zone, offset, case}`, where `case` is `gap` or
+    `first_of_two`.
+  - **Old jobs are untouched.** A job without `timezone` uses the plain UTC
+    code path and writes byte-identical records.
+  - **Bad zones.** A zone the source cannot resolve is refused on save,
+    naming the source. A hand-written one leaves the job unscheduled and
+    shown without a next run, never silently UTC.
+  - **CLI.** `tole cron create|edit --timezone`. `cron.timezone` is the zone
+    of a job created without one; an edit never adds one. `cron.tz_source`
+    is `system` (default on unix, `$TZDIR` honoured) or `offset-only`, and
+    both are user-config only. `tole cron list` shows each job's zone and
+    its next run as local time and UTC.
+  - **Not built:** `bundled`; the source is pluggable for it.
 - **Cron parsing:** small in-tree parser for 5-field cron (+ `@every`),
   property-tested against a brute-force minute walker. Prefer this over a
   dependency; revisit only if the audit cost of ~200 LOC exceeds a vetted crate
@@ -247,7 +265,8 @@ and process spawning live in `tole-cli`.
     owner allowlisted to run commands) can write a line claiming
     `created_by = cli`, as it can edit any of the owner's files.
   - **Config-sourced jobs do not exist.** No config defines jobs:
-    `[cron]` takes only `daily_token_cap` and `max_concurrent`, unknown keys
+    `[cron]` takes only scheduler settings (`daily_token_cap`,
+    `max_concurrent`, `timezone`, `tz_source`), unknown keys
     are an error, and a project config's `[cron]` is ignored. A cron run
     reads no project config from its workdir: its settings come from the
     job, the user config and the process config (a project config of the

@@ -204,6 +204,7 @@ fn ledger_fold_and_ready_under_budget() {
                 pid: 1,
                 start_time: 1,
             },
+            tz: None,
         }));
         put(Record::Done(Done {
             fire_id: fire_id.clone(),
