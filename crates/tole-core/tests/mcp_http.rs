@@ -241,7 +241,12 @@ fn http_server_registers_tools_and_sends_the_env_token() {
         ..Default::default()
     });
     let mut reg = registry();
-    let names = register_server_tools(&mut reg, &cfg("httpa", &fake), &SecretSet::default());
+    let names = register_server_tools(
+        &mut reg,
+        &cfg("httpa", &fake),
+        &SecretSet::default(),
+        &|_, _, _| Ok(()),
+    );
     assert_eq!(names, vec!["mcp_httpa_echo".to_string()]);
 
     let tool = reg.get("mcp_httpa_echo").unwrap();
@@ -264,7 +269,12 @@ fn http_server_registers_tools_and_sends_the_env_token() {
 fn http_server_without_a_token_sends_no_authorization() {
     let fake = start(Behavior::default());
     let mut reg = registry();
-    let names = register_server_tools(&mut reg, &cfg("httpb", &fake), &SecretSet::default());
+    let names = register_server_tools(
+        &mut reg,
+        &cfg("httpb", &fake),
+        &SecretSet::default(),
+        &|_, _, _| Ok(()),
+    );
     assert_eq!(names, vec!["mcp_httpb_echo".to_string()]);
     assert!(!fake.seen().is_empty());
     assert!(fake
@@ -319,7 +329,12 @@ fn cross_origin_redirect_is_not_followed() {
 fn dropped_connection_evicts_and_the_next_call_reconnects() {
     let fake = start(Behavior::default());
     let mut reg = registry();
-    register_server_tools(&mut reg, &cfg("httpe", &fake), &SecretSet::default());
+    register_server_tools(
+        &mut reg,
+        &cfg("httpe", &fake),
+        &SecretSet::default(),
+        &|_, _, _| Ok(()),
+    );
     let tool = reg.get("mcp_httpe_echo").unwrap();
     assert_eq!(echo(tool, "one").unwrap(), "echo:one");
 
@@ -390,7 +405,12 @@ fn an_unparseable_url_built_without_parse_is_an_error_and_the_reactor_survives()
     // The reactor still serves a healthy server afterwards.
     let fake = start(Behavior::default());
     let mut reg = registry();
-    let names = register_server_tools(&mut reg, &cfg("httpg", &fake), &SecretSet::default());
+    let names = register_server_tools(
+        &mut reg,
+        &cfg("httpg", &fake),
+        &SecretSet::default(),
+        &|_, _, _| Ok(()),
+    );
     assert_eq!(names, vec!["mcp_httpg_echo".to_string()]);
 }
 
@@ -407,10 +427,38 @@ fn known_secrets_are_redacted_from_tool_arguments() {
         )],
         std::iter::empty(),
     );
-    register_server_tools(&mut reg, &cfg("httph", &fake), &secrets);
+    register_server_tools(&mut reg, &cfg("httph", &fake), &secrets, &|_, _, _| Ok(()));
     let tool = reg.get("mcp_httph_echo").unwrap();
     assert_eq!(
         echo(tool, "key=mcp-arg-secret-12345").unwrap(),
         "echo:key=«TOLE_TEST_ARG_TOKEN»"
+    );
+}
+
+/// #599: the guard sees the live manifest (descriptions and input schemas
+/// included) before anything registers, and a refusal registers nothing.
+#[test]
+fn the_connect_time_guard_sees_the_manifest_and_a_refusal_registers_nothing() {
+    let fake = start(Behavior::default());
+    let seen = std::sync::Mutex::new(Vec::new());
+    let refuse = |s: &str, _v: &str, t: &[tole_core::plugin_lock::ManifestTool]| {
+        seen.lock().unwrap().push((s.to_string(), t.to_vec()));
+        Err("not approved".to_string())
+    };
+    let mut reg = registry();
+    let names = register_server_tools(
+        &mut reg,
+        &cfg("httpz", &fake),
+        &SecretSet::default(),
+        &refuse,
+    );
+    assert!(names.is_empty());
+    assert!(reg.get("mcp_httpz_echo").is_none());
+    let seen = seen.into_inner().unwrap();
+    assert_eq!(seen[0].0, "httpz");
+    let echo = seen[0].1.iter().find(|t| t.name == "echo").unwrap();
+    assert!(
+        echo.input_schema.is_object(),
+        "the schema is part of the manifest"
     );
 }

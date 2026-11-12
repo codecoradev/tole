@@ -370,7 +370,10 @@ pub fn build(approver: impl Approver + 'static, roster: Roster) -> Result<ToolRe
     let mut resource_servers = Vec::new();
     #[cfg(feature = "mcp")]
     for cfg in &roster.mcp_servers {
-        let names = tole_core::mcp::register_server_tools(&mut reg, cfg, &secrets);
+        // The connect-time guard hook (#599); the plugin lock enforces
+        // through it in the next part, until then every server registers.
+        let admit = |_: &str, _: &str, _: &[tole_core::plugin_lock::ManifestTool]| Ok(());
+        let names = tole_core::mcp::register_server_tools(&mut reg, cfg, &secrets, &admit);
         if cfg.name == "cora" && !names.is_empty() {
             cora_mcp_ok = true;
         }

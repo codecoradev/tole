@@ -1,6 +1,8 @@
 # Third-party plugins (MCP servers, skills) — design note
 
-Status: **research + proposal, nothing implemented.** Second half of the
+Status: **research + proposal; the lock format, tool-manifest hash and
+connect-time guard hook of §4.1–4.2 are in place (#599 part 1a), enforced
+from part 1b.** Second half of the
 integration track (own integrations first, see
 [secrets-integrations-design.md](secrets-integrations-design.md)).
 Related: [skills-registry-design.md](skills-registry-design.md).
