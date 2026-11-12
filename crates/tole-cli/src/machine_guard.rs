@@ -155,6 +155,21 @@ impl Guard {
     }
 }
 
+/// The disk paths to check for `paths`: each one's nearest existing
+/// ancestor (a data dir or worktree dir not made yet lives on its
+/// parent's filesystem), without duplicates.
+pub fn disk_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for p in paths {
+        if let Some(e) = p.ancestors().find(|a| a.exists()) {
+            if !out.iter().any(|o| o == e) {
+                out.push(e.to_path_buf());
+            }
+        }
+    }
+    out
+}
+
 fn census_of(entries: &[Entry], now: u64, alive: &dyn Fn(&Lease) -> bool) -> Census {
     let live: Vec<&Entry> = entries.iter().filter(|e| alive(&e.lease())).collect();
     Census {
@@ -238,6 +253,7 @@ pub fn doctor_lines(setup: &crate::delegate::Setup, cwd: Option<&Path>, now: i64
     }
     let mut paths = vec![data.to_path_buf()];
     paths.extend(cwd.map(Path::to_path_buf));
+    let paths = disk_paths(&paths);
     for path in &paths {
         if let Some(d) = p.disk(path) {
             out.push(format!(

@@ -690,7 +690,10 @@ fn low_memory_queues_in_order_and_a_later_delegate_starts_them_when_it_recovers(
     // The head waits, so the queue holds: B waits behind A.
     let b = start.execute(c("b")).unwrap();
     assert_eq!(b["queued"], json!(true), "{b}");
-    assert!(b["queue"][0]["waited_secs"].as_i64().unwrap() >= 2, "A's wait shows: {b}");
+    assert!(
+        b["queue"][0]["waited_secs"].as_i64().unwrap() >= 2,
+        "A's wait shows: {b}"
+    );
     assert_eq!(b["queue"][0]["node"], a["node"], "{b}");
     assert!(b["queue"][0]["queued_reason"]
         .as_str()
@@ -844,6 +847,17 @@ fn doctor_shows_the_headroom_and_a_spawn_stuck_in_the_queue() {
         lines.contains(&format!("spawn `{}` has waited 16 min", h.node_id)),
         "{lines}"
     );
+    // A data dir not made yet is checked on the filesystem it will live on,
+    // with the real probe: no "cannot read disk" note.
+    let fresh = Setup {
+        data_dir: Some(data.join("not-yet")),
+        probe: None,
+        ..setup
+    };
+    let lines = crate::machine_guard::doctor_lines(&fresh, Some(&root), now()).join("\n");
+    assert!(lines.contains("disk"), "{lines}");
+    #[cfg(target_os = "linux")]
+    assert!(!lines.contains("cannot read"), "{lines}");
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&data);
 }

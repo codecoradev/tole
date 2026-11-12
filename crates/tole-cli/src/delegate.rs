@@ -515,14 +515,13 @@ impl Delegator {
     }
 
     /// Disk paths the guard checks: the data dir, the workspace and, with
-    /// worktrees, their directory once it exists.
+    /// worktrees, their directory.
     fn guard_paths(&self) -> Vec<PathBuf> {
         let mut p = vec![self.guard.dir.clone(), self.root.clone()];
-        let wt = self.root.join(".tole-worktrees");
-        if self.worktrees && wt.is_dir() {
-            p.push(wt);
+        if self.worktrees {
+            p.push(self.root.join(".tole-worktrees"));
         }
-        p
+        crate::machine_guard::disk_paths(&p)
     }
 
     /// Starts queued children of `goal` in log order while the goal's
@@ -531,11 +530,7 @@ impl Delegator {
     /// returns why as the second value. Returns each started node with its
     /// launch output, or `{"error": ...}` when its launch failed (that node
     /// is settled `failed` and the drain goes on).
-    fn drain(
-        &self,
-        d: &mut Delegation<FileStore>,
-        goal: &str,
-    ) -> Result<(Vec<(String, Value)>, Option<String>), String> {
+    fn drain(&self, d: &mut Delegation<FileStore>, goal: &str) -> Result<Drained, String> {
         let (_, max_live) = self.limits();
         let paths = self.guard_paths();
         let refs: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
@@ -659,6 +654,10 @@ impl Delegator {
         Ok(out)
     }
 }
+
+/// What a drain started (each node with its launch output) and, when it
+/// stopped at a queued node, why.
+type Drained = (Vec<(String, Value)>, Option<String>);
 
 /// The goal's queued nodes, oldest first, with how long each has waited
 /// and why: the head carries the reason the drain stopped (`held`), the
