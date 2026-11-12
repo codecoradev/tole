@@ -4,6 +4,7 @@
 //! drift from production behavior (CodeCora scan 2026-09-18).
 pub mod approvals;
 pub mod approver;
+pub mod audit;
 pub mod auth;
 pub mod compaction_host;
 pub mod config;

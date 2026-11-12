@@ -997,6 +997,30 @@ impl<S: LedgerStore> Delegation<S> {
         self.state.nodes.values()
     }
 
+    /// The roots (goals) of the log, in log order.
+    pub fn goals(&self) -> Vec<&Node> {
+        let mut g: Vec<&Node> = self.nodes().filter(|n| n.parent.is_none()).collect();
+        g.sort_by_key(|n| n.seq);
+        g
+    }
+
+    /// What `id`'s subtree is charged to its parent: its whole carve while
+    /// it runs, its own and its children's usage once settled, capped at the
+    /// carve.
+    pub fn charged(&self, id: &str) -> Spend {
+        self.state.charge(id)
+    }
+
+    /// The paths `id` holds a write lease on.
+    pub fn leases_of(&self, id: &str) -> Vec<String> {
+        self.state
+            .leases
+            .iter()
+            .filter(|(_, h)| h.as_str() == id)
+            .map(|(p, _)| p.clone())
+            .collect()
+    }
+
     /// The node whose recorded session is `session` (the host stores the
     /// child's agent id there).
     pub fn by_session(&self, session: &str) -> Option<&Node> {

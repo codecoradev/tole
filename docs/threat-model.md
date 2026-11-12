@@ -940,6 +940,13 @@ The delegate tool (#585 part 3, `crates/tole-cli/src/delegate.rs`) adds:
   there is refused at once, so a child cannot block its parent (which settles
   children under the delegation log's exclusive lock) or point it at another
   file.
+- **`tole audit` (#585 part 5).** Read-only: it opens only the delegation log
+  in the data dir (never child-writable), without the host lock and without
+  repairing a torn line, writes nothing, reads nothing from the children's
+  agent dirs and makes no network call. Its output is bounded and redacted:
+  the task is one capped line (never the full prompt), report summaries and
+  reasons are capped, control characters are dropped, and every string passes
+  through the process `SecretSet`.
 - **Where the files live.** The log, its lock and the queue files live in the
   tole data dir, `<codecora home>/tole/delegation/<hash of the canonical
   workspace root>/`, outside every workspace, so a child's jailed file tools
