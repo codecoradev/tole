@@ -1006,6 +1006,18 @@ impl<S: LedgerStore> Delegation<S> {
             .find(|n| n.session.as_deref() == Some(session))
     }
 
+    /// Every queued node of every goal, oldest first.
+    pub fn queued(&self) -> Vec<&Node> {
+        let mut q: Vec<&Node> = self
+            .state
+            .nodes
+            .values()
+            .filter(|n| n.status == NodeStatus::Queued)
+            .collect();
+        q.sort_by_key(|n| n.seq);
+        q
+    }
+
     /// The oldest queued node of `goal` whose parent is still live.
     pub fn next_queued(&self, goal: &str) -> Option<&Node> {
         self.state
