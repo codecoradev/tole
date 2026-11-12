@@ -58,5 +58,6 @@ observation: it exists to catch complexity regressions (an O(n²) fold of
 
 ## Cross-build CI
 
-`aarch64-apple-ios` (macos-14) + `aarch64-linux-android` (ubuntu + NDK)
-compile-checks per PR (`cross-compile` job) since #82.
+`aarch64-linux-android` (ubuntu + NDK) compile-checks per PR (`cross-compile`
+job) since #82. The `aarch64-apple-ios` (macos-14) check is commented out in
+`ci.yml` until an Apple runner is available to this repository.
