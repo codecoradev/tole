@@ -50,6 +50,11 @@ pub trait Probe {
     fn load(&self) -> Option<Load>;
     fn disk(&self, path: &Path) -> Option<Disk>;
     fn pids(&self) -> Option<Pids>;
+    /// Checks that run here, but less precisely than they should (for
+    /// example memory counting reclaimable page cache as used).
+    fn notes(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// What the machine looks like to one spawn decision.
@@ -250,7 +255,9 @@ impl Thresholds {
         if let Some(p) = probe.pids() {
             let free = p.max.saturating_sub(p.current);
             // free / max < percent / 100, in integers.
-            if p.max > 0 && free.saturating_mul(100) < self.min_free_pids_percent * p.max {
+            if p.max > 0
+                && free.saturating_mul(100) < self.min_free_pids_percent.saturating_mul(p.max)
+            {
                 return wait(format!(
                     "process ids {} of {} in use (< {}% free)",
                     p.current, p.max, self.min_free_pids_percent
@@ -289,13 +296,20 @@ pub fn startup_notes(probe: &dyn Probe, paths: &[&Path]) -> Vec<String> {
     if paths.iter().any(|p| probe.disk(p).is_none()) {
         missing.push("disk");
     }
-    if missing.is_empty() {
-        return Vec::new();
+    let mut notes = Vec::new();
+    if !missing.is_empty() {
+        notes.push(format!(
+            "delegation resource guard: cannot read {} here; those checks are skipped",
+            missing.join(", ")
+        ));
     }
-    vec![format!(
-        "delegation resource guard: cannot read {} here; those checks are skipped",
-        missing.join(", ")
-    )]
+    notes.extend(
+        probe
+            .notes()
+            .into_iter()
+            .map(|n| format!("delegation resource guard: {n}")),
+    );
+    notes
 }
 
 // ------------------------------------------------------------ Linux probes
@@ -337,14 +351,65 @@ pub fn parse_loadavg(text: &str) -> Option<f64> {
     text.split_whitespace().next()?.parse().ok()
 }
 
-/// Memory headroom: the cgroup's (limit − current) when it has a limit,
-/// else the host's `MemAvailable`; the smaller when both are known.
-pub fn memory_headroom(meminfo_mb: Option<u64>, cgroup: Option<(Option<u64>, u64)>) -> Option<u64> {
-    let cg = cgroup.and_then(|(limit, current)| limit.map(|l| l.saturating_sub(current) / MIB));
+/// Reclaimable page cache of a cgroup v2 `memory.stat`, in bytes:
+/// `inactive_file`, else `file` when the kernel has no `inactive_file`.
+pub fn parse_memory_stat_inactive_file(text: &str) -> Option<u64> {
+    let field = |name: &str| {
+        text.lines().find_map(|l| {
+            let mut it = l.split_whitespace();
+            if it.next()? != name {
+                return None;
+            }
+            it.next()?.parse::<u64>().ok()
+        })
+    };
+    field("inactive_file").or_else(|| field("file"))
+}
+
+/// Memory headroom: the cgroup's (limit − working set) when it has a limit,
+/// else the host's `MemAvailable`; the smaller when both are known. The
+/// working set is `memory.current` minus the reclaimable page cache
+/// (`reclaimable`), as Kubernetes counts it: after heavy file IO
+/// `memory.current` sits near the limit while most of it is cache the
+/// kernel frees on demand. With `None` all of `memory.current` counts
+/// (conservative).
+pub fn memory_headroom(
+    meminfo_mb: Option<u64>,
+    cgroup: Option<(Option<u64>, u64)>,
+    reclaimable: Option<u64>,
+) -> Option<u64> {
+    let cg = cgroup.and_then(|(limit, current)| {
+        let working_set = current.saturating_sub(reclaimable.unwrap_or(0));
+        limit.map(|l| l.saturating_sub(working_set) / MIB)
+    });
     match (meminfo_mb, cg) {
         (Some(a), Some(b)) => Some(a.min(b)),
         (a, b) => a.or(b),
     }
+}
+
+/// The note when a cgroup memory limit is set but its `memory.stat` gives
+/// no page cache figure, so headroom falls back to (limit − current).
+pub const MEMORY_STAT_NOTE: &str =
+    "cannot read the cgroup memory.stat; memory headroom counts reclaimable page cache as used";
+
+/// Memory headroom in MiB from the raw texts of `/proc/meminfo` and the
+/// cgroup's `memory.max`, `memory.current` and `memory.stat`, plus
+/// [`MEMORY_STAT_NOTE`] when the conservative fallback was taken.
+pub fn memory_from_files(
+    meminfo: Option<&str>,
+    max: Option<&str>,
+    current: Option<&str>,
+    stat: Option<&str>,
+) -> (Option<u64>, Option<&'static str>) {
+    let meminfo = meminfo.and_then(parse_meminfo);
+    let cgroup = max
+        .and_then(parse_cgroup_limit)
+        .zip(current.and_then(parse_cgroup_counter));
+    let limited = matches!(cgroup, Some((Some(_), _)));
+    let reclaimable = stat.and_then(parse_memory_stat_inactive_file);
+    let note = (limited && reclaimable.is_none()).then_some(MEMORY_STAT_NOTE);
+    (memory_headroom(meminfo, cgroup, reclaimable), note)
 }
 
 /// Probes the running Linux machine (cgroup v2 and `/proc`).
@@ -352,6 +417,19 @@ pub fn memory_headroom(meminfo_mb: Option<u64>, cgroup: Option<(Option<u64>, u64
 pub struct LinuxProbe;
 
 impl LinuxProbe {
+    fn memory_read() -> (Option<u64>, Option<&'static str>) {
+        let meminfo = std::fs::read_to_string("/proc/meminfo").ok();
+        let max = Self::cgroup_file("memory.max");
+        let current = Self::cgroup_file("memory.current");
+        let stat = Self::cgroup_file("memory.stat");
+        memory_from_files(
+            meminfo.as_deref(),
+            max.as_deref(),
+            current.as_deref(),
+            stat.as_deref(),
+        )
+    }
+
     fn cgroup_file(name: &str) -> Option<String> {
         let rel = std::fs::read_to_string("/proc/self/cgroup")
             .ok()
@@ -366,13 +444,9 @@ impl LinuxProbe {
 
 impl Probe for LinuxProbe {
     fn memory(&self) -> Option<Mem> {
-        let meminfo = std::fs::read_to_string("/proc/meminfo")
-            .ok()
-            .and_then(|t| parse_meminfo(&t));
-        let cgroup = Self::cgroup_file("memory.max")
-            .and_then(|t| parse_cgroup_limit(&t))
-            .zip(Self::cgroup_file("memory.current").and_then(|t| parse_cgroup_counter(&t)));
-        memory_headroom(meminfo, cgroup).map(|available_mb| Mem { available_mb })
+        Self::memory_read()
+            .0
+            .map(|available_mb| Mem { available_mb })
     }
 
     fn load(&self) -> Option<Load> {
@@ -408,8 +482,22 @@ impl Probe for LinuxProbe {
                     .to_str()
                     .is_some_and(|n| n.bytes().all(|b| b.is_ascii_digit()))
             })
-            .count() as u64;
+            // pid_max bounds thread ids too: count each process's threads
+            // (`/proc/<pid>/task`), one when that cannot be read.
+            .map(|e| {
+                std::fs::read_dir(e.path().join("task"))
+                    .map(|t| t.count().max(1) as u64)
+                    .unwrap_or(1)
+            })
+            .sum();
         Some(Pids { current, max })
+    }
+
+    fn notes(&self) -> Vec<String> {
+        Self::memory_read()
+            .1
+            .map(|n| vec![n.to_string()])
+            .unwrap_or_default()
     }
 }
 

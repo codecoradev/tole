@@ -371,23 +371,136 @@ fn memory_headroom_takes_the_cgroup_limit_when_there_is_one() {
     // A container capped at 1 GiB using 512 MiB: 512 MiB left, even with
     // 9 GiB available on the host.
     assert_eq!(
-        memory_headroom(Some(9216), Some((Some(1 << 30), 1 << 29))),
+        memory_headroom(Some(9216), Some((Some(1 << 30), 1 << 29)), None),
         Some(512)
     );
     // `memory.max` = max: no limit, the host's figure.
     assert_eq!(
-        memory_headroom(Some(9216), Some((None, 1 << 29))),
+        memory_headroom(Some(9216), Some((None, 1 << 29)), None),
         Some(9216)
     );
     // The smaller headroom wins either way.
     assert_eq!(
-        memory_headroom(Some(100), Some((Some(1 << 30), 0))),
+        memory_headroom(Some(100), Some((Some(1 << 30), 0)), None),
         Some(100)
     );
-    assert_eq!(memory_headroom(None, Some((Some(1 << 30), 0))), Some(1024));
+    assert_eq!(
+        memory_headroom(None, Some((Some(1 << 30), 0)), None),
+        Some(1024)
+    );
     // Over the limit: zero, never an underflow.
-    assert_eq!(memory_headroom(None, Some((Some(1), 5))), Some(0));
-    assert_eq!(memory_headroom(None, None), None);
+    assert_eq!(memory_headroom(None, Some((Some(1), 5)), None), Some(0));
+    assert_eq!(memory_headroom(None, None, None), None);
+}
+
+// A cgroup v2 memory.stat as the kernel writes it (trimmed).
+const STAT_3G_INACTIVE: &str = "anon 734003200\nfile 3489660928\nkernel 52428800\nshmem 0\n\
+active_anon 0\ninactive_anon 734003200\nactive_file 268435456\ninactive_file 3221225472\n\
+unevictable 0\n";
+const GIB: u64 = 1 << 30;
+
+#[test]
+fn memory_stat_gives_the_reclaimable_page_cache() {
+    assert_eq!(
+        parse_memory_stat_inactive_file(STAT_3G_INACTIVE),
+        Some(3 * GIB)
+    );
+    // An older kernel without inactive_file: the file field.
+    assert_eq!(
+        parse_memory_stat_inactive_file("anon 1\nfile 4096\n"),
+        Some(4096)
+    );
+    // A longer name is not the field; a garbled value is no value.
+    assert_eq!(parse_memory_stat_inactive_file("inactive_file_x 5\n"), None);
+    assert_eq!(parse_memory_stat_inactive_file("inactive_file x\n"), None);
+    assert_eq!(parse_memory_stat_inactive_file(""), None);
+}
+
+#[test]
+fn headroom_is_the_limit_minus_the_working_set() {
+    let limit = (4 * GIB).to_string();
+    let current = (39 * GIB / 10).to_string();
+    let host = "MemTotal: 67108864 kB\nMemAvailable: 50331648 kB\n";
+    // 4 GiB limit, 3.9 GiB current of which 3.0 GiB is inactive file cache:
+    // a 0.9 GiB working set, about 3.1 GiB free, so a child starts.
+    let (mb, note) = memory_from_files(
+        Some(host),
+        Some(&limit),
+        Some(&current),
+        Some(STAT_3G_INACTIVE),
+    );
+    let mb = mb.unwrap();
+    assert!((3170..=3175).contains(&mb), "{mb}");
+    assert_eq!(note, None);
+    let probe = Fixed {
+        mem: Some(mb),
+        ..roomy()
+    };
+    assert_eq!(admit(&t(), &probe, census()), Admit::Go);
+    // The same current with no inactive cache: about 102 MiB, so it waits.
+    let stat0 = "anon 4187593113\nfile 0\ninactive_file 0\n";
+    let (mb, note) = memory_from_files(Some(host), Some(&limit), Some(&current), Some(stat0));
+    let mb = mb.unwrap();
+    assert!(mb < 110, "{mb}");
+    assert_eq!(note, None);
+    let probe = Fixed {
+        mem: Some(mb),
+        ..roomy()
+    };
+    assert!(reason(admit(&t(), &probe, census())).contains("memory"));
+}
+
+struct Noting;
+impl Probe for Noting {
+    fn memory(&self) -> Option<Mem> {
+        roomy().memory()
+    }
+    fn load(&self) -> Option<Load> {
+        roomy().load()
+    }
+    fn disk(&self, p: &Path) -> Option<Disk> {
+        roomy().disk(p)
+    }
+    fn pids(&self) -> Option<Pids> {
+        roomy().pids()
+    }
+    fn notes(&self) -> Vec<String> {
+        vec![MEMORY_STAT_NOTE.to_string()]
+    }
+}
+
+#[test]
+fn an_unreadable_memory_stat_falls_back_to_limit_minus_current_with_a_note() {
+    let limit = (4 * GIB).to_string();
+    let current = (39 * GIB / 10).to_string();
+    for stat in [None, Some("garbage\n"), Some("inactive_file lots\n")] {
+        let (mb, note) = memory_from_files(None, Some(&limit), Some(&current), stat);
+        assert!(mb.unwrap() < 110, "{stat:?}");
+        assert_eq!(note, Some(MEMORY_STAT_NOTE), "{stat:?}");
+    }
+    // No cgroup limit: MemAvailable alone, and memory.stat is not needed.
+    let (mb, note) = memory_from_files(
+        Some("MemAvailable: 2097152 kB\n"),
+        Some("max\n"),
+        Some(&current),
+        None,
+    );
+    assert_eq!((mb, note), (Some(2048), None));
+    // The note reaches the startup notes.
+    let notes = startup_notes(&Noting, &[]);
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(notes[0].contains("memory.stat"), "{notes:?}");
+}
+
+#[test]
+fn a_huge_pid_limit_does_not_overflow() {
+    let mut th = t();
+    th.min_free_pids_percent = 90;
+    let probe = Fixed {
+        pids: Some((0, u64::MAX)),
+        ..roomy()
+    };
+    assert_eq!(admit(&th, &probe, census()), Admit::Go);
 }
 
 #[test]
