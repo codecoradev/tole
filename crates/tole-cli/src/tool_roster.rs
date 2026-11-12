@@ -309,7 +309,9 @@ pub fn build(approver: impl Approver + 'static, roster: Roster) -> Result<ToolRe
     }
     // Agent-created cron jobs (#581): a session face's tool, never a cron
     // run's (no agents), a child's or a plan-mode session's. The job is
-    // held to this session's own allow list.
+    // held to this session's own allow list. The scheduler is a
+    // shell-tools module, like `tole cron`.
+    #[cfg(feature = "shell-tools")]
     if let (Some(agents), 0, false) = (&roster.agents, depth, plan) {
         add(
             &mut reg,
@@ -545,6 +547,7 @@ mod tests {
 
     /// #581: `cron_create` is a session face's tool. A cron run (no
     /// agents) and a plan-mode session never have it.
+    #[cfg(feature = "shell-tools")]
     #[test]
     fn cron_create_only_where_a_face_allows_agents() {
         let ws = workspace("cron-create");

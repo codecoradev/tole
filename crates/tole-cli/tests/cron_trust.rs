@@ -6,6 +6,8 @@
 //! its creator held, and never as a script. Hand-written ledger lines are
 //! held to the same rules.
 
+#![cfg(feature = "shell-tools")]
+
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
