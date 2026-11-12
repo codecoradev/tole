@@ -481,3 +481,103 @@ fn with_worktrees_two_writers_run_in_parallel_each_on_its_own_lease() {
     assert_ne!(a["worktree"], b["worktree"]);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// A host whose root is spelled `root_as` (a symlink, a `..` path): every
+/// key must still be the canonical root.
+fn host_at(real: &Path, root_as: &Path, src: &str) -> std::sync::Arc<Delegator> {
+    let bin = fake_tole(real, 0);
+    std::sync::Arc::new(
+        Delegator::for_session(
+            bin,
+            root_as.to_path_buf(),
+            false,
+            vec![],
+            setup(src),
+            &|_| None,
+        )
+        .unwrap(),
+    )
+}
+
+#[test]
+fn a_symlinked_or_dotted_root_still_settles_its_children() {
+    let base = tmp("spelled");
+    let real = base.join("real");
+    std::fs::create_dir_all(&real).unwrap();
+    let link = base.join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let dotted = base.join("real").join("..").join("real");
+    for (i, spelled) in [link, dotted].into_iter().enumerate() {
+        let h = host_at(
+            &real,
+            &spelled,
+            "[delegation]\ngoal_budget = 1000\ngoal_steps = 100\n",
+        );
+        assert_eq!(h.root(), real.as_path(), "one canonical root");
+        let start = DelegateTool {
+            name: "delegate",
+            host: h.clone(),
+        };
+        let poll = DelegatePollTool {
+            name: "delegate_poll",
+            host: h.clone(),
+            inner: AgentPollTool::new(spelled.clone()),
+        };
+        let task = format!("t{i}");
+        let out = start
+            .execute(
+                json!({"task": task, "mode": "consult", "budget": {"tokens": 300, "steps": 10}}),
+            )
+            .unwrap();
+        let dir = agent_dir_of(&real, &out);
+        wait_for(&dir.join("env"));
+        write_usage(&dir, 30, 20);
+        let p = poll_done(&poll, &out);
+        assert_eq!(
+            p["delegation"]["used"],
+            json!({"tokens": 50, "steps": 1}),
+            "{spelled:?}: {p}"
+        );
+        let d = log_of(&real);
+        let node = d.poll(out["node"].as_str().unwrap()).unwrap();
+        assert!(node.status.is_terminal(), "{:?}", node.status);
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn a_new_delegate_never_starts_ahead_of_an_older_queued_one() {
+    let root = tmp("fifo");
+    let h = host(&root, 0, &[], "[delegation]\nmax_live_processes = 1\n");
+    let (start, _) = tools(&h, &root);
+    let c = |t: &str| json!({"task": t, "mode": "consult", "budget": {"tokens": 10, "steps": 2}});
+    let a = start.execute(c("a")).unwrap();
+    let b = start.execute(c("b")).unwrap();
+    assert_eq!(b["queued"], json!(true));
+    // A exits; nobody polls. The next delegate recovers A, starts B first
+    // and queues C behind it.
+    wait_for(&agent_dir_of(&root, &a).join("env"));
+    let pid = u32::try_from(a["pid"].as_u64().unwrap()).unwrap();
+    for _ in 0..200 {
+        if !crate::ledger_file::lease_alive(&crate::ledger_file::lease_of(pid)) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    let c_out = start.execute(c("c")).unwrap();
+    assert_eq!(c_out["queued"], json!(true), "C waits behind B: {c_out}");
+    assert_eq!(
+        c_out["started_from_queue"][0]["node"], b["node"],
+        "B started first: {c_out}"
+    );
+    let d = log_of(&root);
+    assert_eq!(
+        d.poll(b["node"].as_str().unwrap()).unwrap().status,
+        NodeStatus::Running
+    );
+    assert_eq!(
+        d.poll(c_out["node"].as_str().unwrap()).unwrap().status,
+        NodeStatus::Queued
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

@@ -278,6 +278,8 @@ pub struct Node {
     /// The highest own spend this node reported when delegating; a later,
     /// lower report is refused.
     pub own: Spend,
+    /// Position in the log among nodes: queued nodes start in this order.
+    pub seq: u64,
     pub at: i64,
 }
 
@@ -453,6 +455,7 @@ impl State {
                         reason: None,
                         children: Vec::new(),
                         own: Spend::default(),
+                        seq: self.nodes.len() as u64,
                         at,
                     },
                 );
@@ -505,7 +508,12 @@ impl State {
                     reason: None,
                     children: Vec::new(),
                     own: Spend::default(),
+                    seq: 0,
                     at,
+                };
+                let node = Node {
+                    seq: self.nodes.len() as u64,
+                    ..node
                 };
                 self.nodes.insert(node_id, node);
             }
@@ -1005,7 +1013,7 @@ impl<S: LedgerStore> Delegation<S> {
                     .and_then(|p| self.state.nodes.get(p))
                     .is_some_and(|p| !p.status.is_terminal())
             })
-            .min_by_key(|n| n.at)
+            .min_by_key(|n| n.seq)
     }
 
     /// Takes the write lease on `path` (re-entrant for its holder).

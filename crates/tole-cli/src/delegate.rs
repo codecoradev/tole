@@ -187,6 +187,10 @@ impl Delegator {
         setup: Setup,
         env: &dyn Fn(&str) -> Option<String>,
     ) -> Option<Self> {
+        // ONE canonical root for every key: the log path, the agents dir,
+        // the agent dirs recorded as sessions and the poll lookups. A
+        // workspace that cannot be canonicalized gets no delegate tool.
+        let root = root.canonicalize().ok()?;
         let (log, node, child) = match tole_core::child_env::delegation(env) {
             Some((log, node)) => {
                 let d = Delegation::open(FileStore::new(log.clone())).ok()?;
@@ -208,6 +212,11 @@ impl Delegator {
             node: Mutex::new(node),
             child,
         })
+    }
+
+    /// The canonical workspace root every path of this host is keyed on.
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
     /// Runs `f` on the log under its exclusive lock (milliseconds plus a
@@ -249,7 +258,10 @@ impl Delegator {
         }
         let c = self.setup.cfg.delegation.clone().unwrap_or_default();
         let (max_depth, max_live) = self.limits();
-        let id = format!("g-{:x}-{:x}", now(), std::process::id());
+        // Unique per process too: two hosts in one process may share a log.
+        static GOALS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = GOALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let id = format!("g-{:x}-{:x}-{n:x}", now(), std::process::id());
         let minutes = c.goal_minutes.unwrap_or(DEFAULT_GOAL_MINUTES);
         d.begin(
             &Goal {
@@ -343,19 +355,8 @@ impl Delegator {
                 _ => me.own,
             };
             let goal = me.goal_id.clone();
-            // A writer in this workspace must be free to lease it.
-            // In-place, the writer leases the whole workspace: any lease
-            // inside it conflicts. With worktrees it gets a fresh directory
-            // under `.tole-worktrees`: only a lease on that dir or above it
-            // (someone holding the whole workspace) conflicts; sibling
-            // worktrees do not.
-            let held = if self.worktrees {
-                d.lease_ancestor_conflict(&format!("{workspace}/.tole-worktrees"), "")
-            } else {
-                d.lease_conflict(&workspace, "")
-            };
             if mode == Mode::Execute {
-                if let Some((p, h)) = held {
+                if let Some((p, h)) = lease_blocked(d, &workspace, self.worktrees) {
                     return Err(format!(
                         "delegate: `{p}` is write-leased by `{h}`; wait for it, delegate \
                          `consult` work, or run with --agents-worktree"
@@ -370,7 +371,9 @@ impl Delegator {
                 profile_allow: &profile_allow,
                 workspace: Some(&workspace),
             };
-            let h = d.delegate(&node, &req, own, now()).map_err(|e| e.to_string())?;
+            let h = d
+                .delegate(&node, &req, own, now())
+                .map_err(|e| e.to_string())?;
             let extras = Extras {
                 node: h.node_id.clone(),
                 role: s("role"),
@@ -383,19 +386,39 @@ impl Delegator {
                            "deadline": h.budget.deadline},
                 "allow": h.allow, "dropped": h.dropped,
             });
-            let (_, max_live) = self.limits();
-            if d.live(&goal) >= max_live.max(1) {
-                self.queue(&extras)?;
-                out["queued"] = json!(true);
-                out["note"] = json!("queued: the machine guard's live-process limit is reached; it starts when a delegated run ends");
-                return Ok(out);
+            // Strict FIFO: the new node joins the queue and the queue drains in
+            // log order, so it never starts ahead of an older queued node.
+            self.queue(&extras)?;
+            let mut others = Vec::new();
+            let mut mine = None;
+            for (id, v) in self.drain(d, &goal)? {
+                if id == h.node_id {
+                    mine = Some(v);
+                } else {
+                    others.push(json!({"node": id, "result": v}));
+                }
             }
-            let spec = self.spec_for(d, &extras)?;
-            let started = launch(d, &spec, &self.log)?;
-            for (k, v) in started.as_object().into_iter().flatten() {
-                out[k] = v.clone();
+            out["started_from_queue"] = json!(others);
+            match mine {
+                Some(v) if v.get("error").is_some() => Err(format!(
+                    "delegate: starting `{}` failed: {}",
+                    h.node_id, v["error"]
+                )),
+                Some(v) => {
+                    for (k, v) in v.as_object().into_iter().flatten() {
+                        out[k] = v.clone();
+                    }
+                    Ok(out)
+                }
+                None => {
+                    out["queued"] = json!(true);
+                    out["note"] = json!(
+                        "queued: it starts, in order, when the live-process limit and the \
+                         workspace lease allow (on a later delegate or poll)"
+                    );
+                    Ok(out)
+                }
             }
-            Ok(out)
         })
     }
 
@@ -448,8 +471,16 @@ impl Delegator {
             .map_err(|e| format!("delegate: queue: {e}"))
     }
 
-    /// Starts queued children of `goal` while the machine guard allows.
-    fn drain(&self, d: &mut Delegation<FileStore>, goal: &str) -> Result<Vec<String>, String> {
+    /// Starts queued children of `goal` in log order while the machine
+    /// guard allows. It stops at the first one whose workspace lease is
+    /// taken (FIFO: nothing jumps ahead of it). Returns each started node
+    /// with its launch output, or `{"error": ...}` when its launch failed
+    /// (that node is settled `failed` and the drain goes on).
+    fn drain(
+        &self,
+        d: &mut Delegation<FileStore>,
+        goal: &str,
+    ) -> Result<Vec<(String, Value)>, String> {
         let (_, max_live) = self.limits();
         let mut started = Vec::new();
         while d.live(goal) < max_live.max(1) {
@@ -459,27 +490,49 @@ impl Delegator {
             let file = self.queue_dir().join(format!("{next}.json"));
             let extras = std::fs::read(&file)
                 .ok()
-                .and_then(|b| serde_json::from_slice::<Extras>(&b).ok());
-            let _ = std::fs::remove_file(&file);
-            match extras {
-                Some(extras) if extras.node == next => {
-                    let spec = self.spec_for(d, &extras)?;
-                    launch(d, &spec, &self.log)?;
-                    started.push(next);
-                }
-                _ => {
-                    // Never started: it spent nothing.
+                .and_then(|b| serde_json::from_slice::<Extras>(&b).ok())
+                .filter(|x| x.node == next);
+            let Some(extras) = extras else {
+                let _ = std::fs::remove_file(&file);
+                // Never started: it spent nothing.
+                d.settle(
+                    &next,
+                    Outcome::Cancelled,
+                    Spend::default(),
+                    None,
+                    Some("launch spec lost"),
+                    now(),
+                )
+                .map_err(|e| e.to_string())?;
+                continue;
+            };
+            let spec = match self.spec_for(d, &extras) {
+                Ok(spec) => spec,
+                Err(e) => {
+                    // e.g. its profile is gone from the config: it never
+                    // started, so it spent nothing.
+                    let _ = std::fs::remove_file(&file);
                     d.settle(
                         &next,
                         Outcome::Cancelled,
                         Spend::default(),
                         None,
-                        Some("launch spec lost"),
+                        Some(&e),
                         now(),
                     )
                     .map_err(|e| e.to_string())?;
+                    continue;
+                }
+            };
+            if spec.mode == Mode::Execute {
+                let ws = spec.root.to_string_lossy().into_owned();
+                if lease_blocked(d, &ws, spec.worktrees).is_some() {
+                    break; // waits for the writer ahead of it
                 }
             }
+            let _ = std::fs::remove_file(&file);
+            let out = launch(d, &spec, &self.log).unwrap_or_else(|e| json!({ "error": e }));
+            started.push((next, out));
         }
         Ok(started)
     }
@@ -497,16 +550,24 @@ impl Delegator {
         };
         let session = dir.to_string_lossy().into_owned();
         let view = self.locked(|d| {
-            Self::recover(d)?;
             let Some(n) = d.by_session(&session).cloned() else {
+                Self::recover(d)?;
                 return Ok(None);
             };
+            // The polled child ended as a run (settled here, before
+            // recovery would call its exited process `interrupted`); then
+            // every other child whose process is gone is recovered.
             if !n.status.is_terminal() {
                 let used = measured(&dir).unwrap_or_else(|| Spend::all_of(n.budget));
                 d.settle(&n.id, Outcome::Ok, used, None, None, now())
                     .map_err(|e| e.to_string())?;
             }
-            let started = self.drain(d, &n.goal_id)?;
+            Self::recover(d)?;
+            let started: Vec<String> = self
+                .drain(d, &n.goal_id)?
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
             let n = d.poll(&n.id).ok_or("delegate: node vanished")?;
             Ok(Some(json!({
                 "node": n.id, "status": n.status, "reason": n.reason,
@@ -518,6 +579,23 @@ impl Delegator {
             out["delegation"] = v;
         }
         Ok(out)
+    }
+}
+
+/// The live lease that blocks a new writer in `workspace` (canonical), as
+/// `(path, holder)`. In place, the writer leases the whole workspace, so any
+/// lease overlapping it blocks. With worktrees it gets a fresh directory
+/// under `.tole-worktrees`, so only a lease on that dir or above it (someone
+/// holding the whole workspace) blocks; sibling worktrees do not.
+fn lease_blocked(
+    d: &Delegation<FileStore>,
+    workspace: &str,
+    worktrees: bool,
+) -> Option<(String, String)> {
+    if worktrees {
+        d.lease_ancestor_conflict(&format!("{workspace}/.tole-worktrees"), "")
+    } else {
+        d.lease_conflict(workspace, "")
     }
 }
 

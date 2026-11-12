@@ -274,7 +274,7 @@ pub fn build(approver: impl Approver + 'static, roster: Roster) -> Result<ToolRe
                 Box::new(crate::delegate::DelegatePollTool {
                     name: poll,
                     host: host.clone(),
-                    inner: tole_core::agents::AgentPollTool::new(root.clone()),
+                    inner: tole_core::agents::AgentPollTool::new(host.root().to_path_buf()),
                 }),
             )?;
         }

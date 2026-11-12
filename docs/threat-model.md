@@ -905,7 +905,15 @@ The delegate tool (#585 part 3, `crates/tole-cli/src/delegate.rs`) adds:
   ancestor of it is leased (someone writing the whole workspace); sibling
   worktrees run in parallel.
 - **Machine guard.** Past `[delegation] max_live_processes` a spawn is recorded
-  `queued` and started by a later delegate or poll. The file kept next to the
+  `queued` and started by a later delegate or poll, strictly in log order: a
+  new spawn joins the queue behind older ones, and a queued writer whose
+  workspace lease is taken holds the queue until it frees. An exited but
+  unreaped child process (a zombie) counts as gone, so its slot frees on the
+  next delegate without a poll.
+- **One canonical root.** The host canonicalizes the session root once; the
+  log key, the agents dir, the agent dirs recorded in the log and every poll
+  lookup use that one value, so a symlinked or `..` workspace path still
+  finds and settles its children. The file kept next to the
   log for it holds only what carries no authority (role, artifacts to read,
   mailbox choice): allow list, budget, depth, mode, task, workspace and profile
   are read back from the node the tree recorded and the secrets are recomputed,
