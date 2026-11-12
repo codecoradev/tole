@@ -3,7 +3,7 @@
 use super::*;
 use tole_core::delegation::NodeStatus;
 use tole_core::entry::{EntryType, NewEntry};
-use tole_core::storage::{Commit, JsonlStorage, UsageRecord};
+use tole_core::storage::{Commit, JsonlStorage, Storage as _, UsageRecord};
 
 fn tmp(tag: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("tole-delegate-{tag}-{}", std::process::id()));
@@ -860,4 +860,258 @@ fn doctor_shows_the_headroom_and_a_spawn_stuck_in_the_queue() {
     assert!(!lines.contains("cannot read"), "{lines}");
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&data);
+}
+
+/// A stand-in child that records its env and argv, then hands in `report`
+/// (raw text written to `$TOLE_DELEGATION_REPORT`, as a hostile child
+/// could too) and exits.
+fn fake_reporter(dir: &Path, name: &str, report: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let body_file = dir.join(format!("{name}.json"));
+    std::fs::write(&body_file, report).unwrap();
+    let p = dir.join(name);
+    let body = format!(
+        "#!/bin/sh\nprev=\"\"\nfor a in \"$@\"; do [ \"$prev\" = \"--sessions-dir\" ] && D=\"$a\"; \
+         prev=\"$a\"; done\nmkdir -p \"$D\"\nprintf '%s\\n' \"$@\" > \"$D/../argv\"\n\
+         cp '{}' \"$TOLE_DELEGATION_REPORT\"\nenv > \"$D/../env\"\n",
+        body_file.display()
+    );
+    std::fs::write(&p, body).unwrap();
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    p
+}
+
+fn reporting_host(root: &Path, name: &str, report: &str) -> std::sync::Arc<Delegator> {
+    let bin = fake_reporter(root, name, report);
+    std::sync::Arc::new(
+        Delegator::for_session(
+            bin,
+            root.to_path_buf(),
+            false,
+            vec!["write_*".into()],
+            setup("[delegation]\ngoal_budget = 1000\ngoal_steps = 100\n"),
+            &|_| None,
+        )
+        .unwrap(),
+    )
+}
+
+#[test]
+fn a_child_with_a_complete_report_settles_done_and_the_parent_sees_it_fenced() {
+    let root = tmp("report-done");
+    let h = reporting_host(
+        &root,
+        "rep",
+        r#"{"summary":"the API is fine","risks":["rate limits"]}"#,
+    );
+    let (start, poll) = tools(&h, &root);
+    let out = start
+        .execute(json!({"task": "review", "mode": "consult"}))
+        .unwrap();
+    let dir = agent_dir_of(&root, &out);
+    let env = wait_for(&dir.join("env"));
+    let report = dir.join(tole_core::delegation_report::REPORT_FILE);
+    assert!(
+        env.contains(&format!("TOLE_DELEGATION_REPORT={}\n", report.display())),
+        "{env}"
+    );
+    let argv = std::fs::read_to_string(dir.join("argv")).unwrap();
+    assert!(argv.lines().any(|l| l == "delegate_report"), "{argv}");
+    let p = poll_done(&poll, &out);
+    let v = &p["delegation"];
+    assert_eq!(v["status"], json!("done"), "{p}");
+    let shown = v["report"].as_str().unwrap();
+    assert!(
+        shown.starts_with("<<<BEGIN UNTRUSTED CHILD REPORT"),
+        "{shown}"
+    );
+    assert!(shown.contains("the API is fine"));
+    // Recorded in the log by the parent.
+    let d = log_of(&root);
+    let n = d.poll(out["node"].as_str().unwrap()).unwrap();
+    assert_eq!(n.report.as_ref().unwrap().summary, "the API is fine");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn an_incomplete_or_planted_report_leaves_the_run_incomplete() {
+    let root = tmp("report-bad");
+    // Execute work that changed files but names no diff ref or checks.
+    let h = reporting_host(&root, "rep", r#"{"summary":"done","files":["src/a.rs"]}"#);
+    let (start, poll) = tools(&h, &root);
+    let out = start.execute(json!({"task": "change"})).unwrap();
+    wait_for(&agent_dir_of(&root, &out).join("env"));
+    let p = poll_done(&poll, &out);
+    let why = p["delegation"]["reason"].as_str().unwrap().to_string();
+    assert_eq!(p["delegation"]["status"], json!("incomplete"), "{p}");
+    assert!(
+        why.contains("no diff ref") && why.contains("no checks"),
+        "{why}"
+    );
+    // A report that is a symlink to another file is never followed.
+    let root2 = tmp("report-link");
+    let secret = root2.join("secret.json");
+    std::fs::write(&secret, r#"{"summary":"TOP SECRET"}"#).unwrap();
+    let h = reporting_host(&root2, "rep", r#"{"summary":"x"}"#);
+    let (start, poll) = tools(&h, &root2);
+    let out = start
+        .execute(json!({"task": "t", "mode": "consult"}))
+        .unwrap();
+    let dir = agent_dir_of(&root2, &out);
+    wait_for(&dir.join("env"));
+    let report = dir.join(tole_core::delegation_report::REPORT_FILE);
+    std::fs::remove_file(&report).unwrap();
+    std::os::unix::fs::symlink(&secret, &report).unwrap();
+    let p = poll_done(&poll, &out);
+    assert_eq!(p["delegation"]["status"], json!("incomplete"), "{p}");
+    assert!(!p.to_string().contains("TOP SECRET"), "{p}");
+    assert!(p["delegation"]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("report refused"));
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&root2);
+}
+
+#[test]
+fn an_unpolled_finished_child_is_settled_with_its_report_on_the_next_delegate() {
+    let root = tmp("report-reap");
+    let h = reporting_host(&root, "rep", r#"{"summary":"checked"}"#);
+    let (start, _) = tools(&h, &root);
+    let a = start
+        .execute(json!({"task": "a", "mode": "consult"}))
+        .unwrap();
+    wait_for(&agent_dir_of(&root, &a).join("env"));
+    let pid = u32::try_from(a["pid"].as_u64().unwrap()).unwrap();
+    for _ in 0..200 {
+        if !crate::ledger_file::lease_alive(&crate::ledger_file::lease_of(pid)) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    start
+        .execute(json!({"task": "b", "mode": "consult"}))
+        .unwrap();
+    let d = log_of(&root);
+    let n = d.poll(a["node"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        n.status,
+        NodeStatus::Done,
+        "not interrupted: {:?}",
+        n.reason
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_child_that_swaps_its_agent_dir_for_a_symlink_gets_no_report_and_full_charge() {
+    let root = tmp("report-dirlink");
+    let elsewhere = tmp("report-dirlink-elsewhere");
+    let h = reporting_host(&root, "rep", r#"{"summary":"fine"}"#);
+    let (start, poll) = tools(&h, &root);
+    let out = start
+        .execute(json!({"task": "t", "mode": "consult", "budget": {"tokens": 200, "steps": 10}}))
+        .unwrap();
+    let dir = agent_dir_of(&root, &out);
+    wait_for(&dir.join("env"));
+    // The child moves its agent dir away and leaves a symlink to a copy.
+    let moved = elsewhere.join("moved");
+    std::fs::rename(&dir, &moved).unwrap();
+    std::os::unix::fs::symlink(&moved, &dir).unwrap();
+    let p = poll_done(&poll, &out);
+    let v = &p["delegation"];
+    assert_eq!(v["status"], json!("incomplete"), "{p}");
+    assert_eq!(v["used"], json!({"tokens": 200, "steps": 10}), "{p}");
+    assert!(v["reason"]
+        .as_str()
+        .unwrap()
+        .contains("not a plain directory"));
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&elsewhere);
+}
+
+#[test]
+fn a_planted_session_file_is_never_read_and_costs_the_whole_carve() {
+    let root = tmp("planted-session");
+    let h = host(
+        &root,
+        0,
+        &[],
+        "[delegation]\ngoal_budget = 1000\ngoal_steps = 100\n",
+    );
+    let (start, poll) = tools(&h, &root);
+    let out = start
+        .execute(json!({"task": "t", "mode": "consult", "budget": {"tokens": 300, "steps": 10}}))
+        .unwrap();
+    let dir = agent_dir_of(&root, &out);
+    wait_for(&dir.join("env"));
+    // An endless "session" the parent must not read.
+    std::os::unix::fs::symlink("/dev/zero", dir.join("sessions").join("s.jsonl")).unwrap();
+    let p = poll_done(&poll, &out);
+    assert_eq!(
+        p["delegation"]["used"],
+        json!({"tokens": 300, "steps": 10}),
+        "{p}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+fn mkfifo(p: &Path) {
+    let c = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: a valid NUL-terminated path.
+    assert_eq!(
+        unsafe { libc::mkfifo(c.as_ptr(), 0o600) },
+        0,
+        "{}",
+        p.display()
+    );
+}
+
+/// Runs `f` on a thread and fails if it does not return within 5 s.
+fn within_5s<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(5))
+        .expect("blocked: did not return within 5 s")
+}
+
+#[test]
+fn fifos_planted_in_the_agent_dir_never_block_the_parent() {
+    let root = tmp("fifo-planted");
+    // The child leaves FIFOs where the parent reads: its report, its log
+    // and a session file. None may block a poll or hold the log lock.
+    let h = host(
+        &root,
+        0,
+        &[],
+        "[delegation]\ngoal_budget = 1000\ngoal_steps = 100\n",
+    );
+    let (start, poll) = tools(&h, &root);
+    let out = start
+        .execute(json!({"task": "t", "mode": "consult", "budget": {"tokens": 300, "steps": 10}}))
+        .unwrap();
+    let dir = agent_dir_of(&root, &out);
+    wait_for(&dir.join("env"));
+    mkfifo(&dir.join(tole_core::delegation_report::REPORT_FILE));
+    mkfifo(&dir.join("sessions").join("s.jsonl"));
+    std::fs::remove_file(dir.join("log")).unwrap();
+    mkfifo(&dir.join("log"));
+    let poll = std::sync::Arc::new(poll);
+    let (p2, o2) = (poll.clone(), out.clone());
+    let p = within_5s(move || poll_done(&p2, &o2));
+    let v = &p["delegation"];
+    assert_eq!(v["status"], json!("incomplete"), "{p}");
+    assert!(
+        v["reason"].as_str().unwrap().contains("not a regular file"),
+        "{p}"
+    );
+    assert_eq!(v["used"], json!({"tokens": 300, "steps": 10}), "{p}");
+    // The log lock is free: another delegate goes through.
+    let start = std::sync::Arc::new(start);
+    let s2 = start.clone();
+    let again = within_5s(move || s2.execute(json!({"task": "u", "mode": "consult"})));
+    assert!(again.is_ok(), "{again:?}");
+    let _ = std::fs::remove_dir_all(&root);
 }
