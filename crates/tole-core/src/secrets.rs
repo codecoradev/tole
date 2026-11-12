@@ -27,7 +27,29 @@
 
 use base64::Engine;
 use std::borrow::Cow;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, RwLock};
+
+static PROCESS: RwLock<Option<SecretSet>> = RwLock::new(None);
+static FROM_ENV: OnceLock<SecretSet> = OnceLock::new();
+
+/// Installs the process's secret set (#596): the host does this once, with
+/// every secret its egress sinks know (the provider's included), so the
+/// session log redacts exactly what the provider is shown.
+pub fn set_process_secrets(set: SecretSet) {
+    if let Ok(mut g) = PROCESS.write() {
+        *g = Some(set);
+    }
+}
+
+/// The process's secret set: what [`set_process_secrets`] installed, else
+/// [`SecretSet::from_env`], built once and cached. Cheap to call (an `Arc`
+/// clone): the matcher is never rebuilt per use.
+pub fn process_secrets() -> SecretSet {
+    if let Some(s) = PROCESS.read().ok().and_then(|g| g.clone()) {
+        return s;
+    }
+    FROM_ENV.get_or_init(SecretSet::from_env).clone()
+}
 
 /// Values with fewer characters than this are not collected: an 8-char
 /// floor keeps `true`, `1`, `admin` and similar from redacting ordinary text.

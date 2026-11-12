@@ -1125,7 +1125,9 @@ pub(crate) const TOOL_RESULT_END: &str = "<<<TOOL_RESULT_END>>>";
 
 /// The provider's own redaction set: `base` plus its key and any password
 /// in its base URL. The key is always redacted, whatever `base` holds.
-fn provider_secrets(base: &SecretSet, cfg: &OpenAiConfig) -> SecretSet {
+/// `base` plus this provider's key and base-URL password: the set its
+/// request body is redacted with.
+pub fn provider_secrets(base: &SecretSet, cfg: &OpenAiConfig) -> SecretSet {
     base.with(ENV_API_KEY, &cfg.api_key)
         .with_url_password("TOLE_BASE_URL_PASSWORD", &cfg.base_url)
 }
@@ -1811,8 +1813,8 @@ mod transcript_tests {
 
     #[test]
     fn request_body_keeps_durable_log_text_untouched() {
-        // E11: redaction happens on the wire only — the durable entry
-        // passed in must not be mutated by request_body.
+        // request_body redacts a copy: the entries passed in are never
+        // mutated (since #596 the log itself already holds the redacted form).
         let key = "sk-super-secret-456";
         let cfg = OpenAiConfig::new("https://x.example/v1", "m", key);
         let p = OpenAiProvider::new(cfg);
@@ -1822,7 +1824,7 @@ mod transcript_tests {
         assert_eq!(
             transcript[0].payload["text"],
             json!("key: sk-super-secret-456"),
-            "durable log must keep the original text"
+            "request_body never mutates its input"
         );
     }
 

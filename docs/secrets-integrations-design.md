@@ -129,6 +129,23 @@ secret *names* were redacted in an entry field (never values). Replay stays
 exact, because the provider saw the same redacted text. This is an owner
 decision: it changes a documented behaviour.
 
+**Implemented (#596).** `JsonlStorage::commit` redacts every entry payload
+(structurally, every string and key, in every encoded form `SecretSet`
+knows) before encoding the line, records the hidden names as the wire
+field `"redacted"`, and keeps the same redacted entry in memory. The provider
+is fed from those entries, so the request a replay rebuilds from the log is
+the one the provider got. The set is the process set the host installs
+(`secrets::set_process_secrets`: everything a provider request is redacted
+with); without one, the environment's set, built once. Streaming deltas only
+feed the live display: the log gets the assembled message in one entry, so a
+value split across two chunks is whole there and redacted. The TUI
+`/export` (tole has no separate export command) renders these entries, and the memory-loop summary is built from
+them (and redacted again before its length cap), so neither carries a known
+secret. Old logs load unchanged; nothing is rewritten. Residuals: a value
+tole never knew needs the shape detector (#597), and register cells
+(control state such as the model, mission and pending intent) are stored as
+they are.
+
 ## 6. Storage of the secrets themselves
 
 - Keep environment variables as the baseline (servers, CI, systemd
