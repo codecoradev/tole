@@ -934,8 +934,9 @@ The delegate tool (#585 part 3, `crates/tole-cli/src/delegate.rs`) adds:
 
 `tole_core::resource_guard` (owner requirement: delegation must never
 overload or crash the server) decides whether a delegated child may start on
-this machine; the `delegate` tool calls it on both spawn levels (depth 0 and
-1) in a follow-up PR. A child waits in the queue, never fails, while: the
+this machine. The `delegate` tool calls it before every launch, in the drain
+that `delegate` and `delegate_poll` share, so both spawn levels (depth 0 and
+1) get it. A child waits in the queue, never fails, while: the
 machine-wide count of live delegated children (every goal and session) is at
 `machine_max_live`; the last start was less than `spawn_interval_secs` ago;
 free memory is under `min_free_memory_mb` plus `child_memory_mb` for the new
@@ -954,6 +955,21 @@ rules instead of blocking forever. Delegated children run at niceness
 `child_nice` (never lowered below the parent's). The thresholds are
 `[delegation]` keys of the user config only, bounded (zero, negative or
 absurd values are config errors), so a cloned repository cannot loosen them.
+
+The census comes from one registry per machine,
+`<data dir>/delegation/machine.jsonl` (`crates/tole-cli/src/machine_guard.rs`):
+every delegated child registers its `{pid, start_time}` lease when it starts,
+under `machine.lock`, which is only taken while a delegation log's lock is
+held (one order, so no deadlock) and held for the census, the probes and the
+spawn. A lease that is dead (including an unreaped zombie) no longer counts,
+so a child that died without being settled frees its slot; "ramping" means
+started less than 30 seconds ago. The registry is opened without following
+symlinks or blocking and read up to 256 KiB. Like the log, it is outside every
+workspace; a child allowed to run commands could forge entries, which can only
+make spawns wait. A wait on the head of the queue holds the queue (strict
+FIFO). The `delegate` and `delegate_poll` replies carry each queued spawn's
+`queued_reason` and `waited_secs`, and `tole doctor` prints the headroom
+against every threshold and warns about a spawn queued longer than 10 minutes.
 
 ### User config (#433)
 

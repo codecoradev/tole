@@ -19,6 +19,7 @@ pub mod events;
 pub mod export;
 pub mod handoff;
 pub mod ledger_file;
+pub mod machine_guard;
 pub mod profile;
 pub mod protocol;
 pub mod provider_chain;

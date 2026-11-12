@@ -22,8 +22,10 @@
 //!   checked before it spawns.
 //! - **Usage:** a settled child is charged what its session usage records
 //!   say; when they cannot be read, its whole carve.
-//! - **Machine guard:** past `max_live_processes` a spawn is recorded
-//!   `queued` and started by a later delegate or poll, from the recorded node.
+//! - **Machine guard:** past `max_live_processes`, or while the machine
+//!   resource guard ([`crate::machine_guard`]) says wait, a spawn is recorded
+//!   `queued` and started by a later delegate or poll, from the recorded
+//!   node, strictly in log order. Children start at `child_nice`.
 //! - **Location:** the log and its queue live in the tole data dir
 //!   ([`log_path`]), outside every workspace; children get its absolute path.
 //!
@@ -46,6 +48,8 @@ use tole_core::tool::{Risk, Tool};
 
 use crate::config::Config;
 use crate::ledger_file::{lease_alive, lease_of, FileStore};
+use crate::machine_guard::{Gate, Guard, SharedProbe};
+use tole_core::resource_guard::Thresholds;
 
 /// The delegation log, next to the agent dirs of the root session.
 pub const LOG_FILE: &str = "delegation.jsonl";
@@ -65,6 +69,22 @@ pub struct Setup {
     /// its queue live there, OUTSIDE every workspace, so no child's file
     /// tools can reach them. `None`: no delegation.
     pub data_dir: Option<PathBuf>,
+    /// The machine probe; `None`: this machine's (`LinuxProbe`).
+    pub probe: Option<SharedProbe>,
+    /// The guard thresholds; `None`: the `[delegation]` keys of `cfg`.
+    pub thresholds: Option<Thresholds>,
+}
+
+impl Setup {
+    /// The machine guard with its registry in `dir`.
+    pub fn guard(&self, dir: PathBuf) -> Guard {
+        let t = self.thresholds.clone().unwrap_or_else(|| {
+            let d = self.cfg.delegation.clone().unwrap_or_default();
+            // Validated when the config was parsed.
+            d.resource_thresholds().unwrap_or_default()
+        });
+        Guard::new(t, self.probe.clone(), dir)
+    }
 }
 
 /// The delegation log of the session rooted at `root`:
@@ -128,6 +148,9 @@ pub struct Delegator {
     /// This session's node: set in a delegated child, begun lazily at root.
     node: Mutex<Option<String>>,
     child: bool,
+    guard: Guard,
+    /// The guard's startup notes are shown once, on the first delegate.
+    noted: std::sync::atomic::AtomicBool,
 }
 
 fn now() -> i64 {
@@ -202,6 +225,9 @@ impl Delegator {
             None if tole_core::child_env::depth(env) >= 1 => return None,
             None => (log_path(setup.data_dir.as_deref()?, &root)?, None, false),
         };
+        // One registry per machine: `<data dir>/delegation`, the log's
+        // grandparent for the root and every delegated child alike.
+        let guard = setup.guard(log.parent()?.parent()?.to_path_buf());
         Some(Self {
             bin,
             root,
@@ -211,6 +237,8 @@ impl Delegator {
             log,
             node: Mutex::new(node),
             child,
+            guard,
+            noted: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -391,7 +419,17 @@ impl Delegator {
             self.queue(&extras)?;
             let mut others = Vec::new();
             let mut mine = None;
-            for (id, v) in self.drain(d, &goal)? {
+            let (started, held) = self.drain(d, &goal)?;
+            let queue = queue_view(d, &goal, held.as_deref());
+            if !self.noted.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                let paths = self.guard_paths();
+                let refs: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
+                let notes = tole_core::resource_guard::startup_notes(&*self.guard.probe.0, &refs);
+                if !notes.is_empty() {
+                    out["guard_notes"] = json!(notes);
+                }
+            }
+            for (id, v) in started {
                 if id == h.node_id {
                     mine = Some(v);
                 } else {
@@ -413,9 +451,14 @@ impl Delegator {
                 None => {
                     out["queued"] = json!(true);
                     out["note"] = json!(
-                        "queued: it starts, in order, when the live-process limit and the \
-                         workspace lease allow (on a later delegate or poll)"
+                        "queued: it starts, in order, when the live-process limit, the machine \
+                         guard and the workspace lease allow (on a later delegate or poll)"
                     );
+                    if let Some(me) = queue.iter().find(|q| q["node"] == json!(h.node_id)) {
+                        out["queued_reason"] = me["queued_reason"].clone();
+                        out["waited_secs"] = me["waited_secs"].clone();
+                    }
+                    out["queue"] = json!(queue);
                     Ok(out)
                 }
             }
@@ -471,21 +514,42 @@ impl Delegator {
             .map_err(|e| format!("delegate: queue: {e}"))
     }
 
-    /// Starts queued children of `goal` in log order while the machine
-    /// guard allows. It stops at the first one whose workspace lease is
-    /// taken (FIFO: nothing jumps ahead of it). Returns each started node
-    /// with its launch output, or `{"error": ...}` when its launch failed
-    /// (that node is settled `failed` and the drain goes on).
+    /// Disk paths the guard checks: the data dir, the workspace and, with
+    /// worktrees, their directory once it exists.
+    fn guard_paths(&self) -> Vec<PathBuf> {
+        let mut p = vec![self.guard.dir.clone(), self.root.clone()];
+        let wt = self.root.join(".tole-worktrees");
+        if self.worktrees && wt.is_dir() {
+            p.push(wt);
+        }
+        p
+    }
+
+    /// Starts queued children of `goal` in log order while the goal's
+    /// live-process limit and the machine guard allow. It stops at the
+    /// first one that must wait (FIFO: nothing jumps ahead of it) and
+    /// returns why as the second value. Returns each started node with its
+    /// launch output, or `{"error": ...}` when its launch failed (that node
+    /// is settled `failed` and the drain goes on).
     fn drain(
         &self,
         d: &mut Delegation<FileStore>,
         goal: &str,
-    ) -> Result<Vec<(String, Value)>, String> {
+    ) -> Result<(Vec<(String, Value)>, Option<String>), String> {
         let (_, max_live) = self.limits();
+        let paths = self.guard_paths();
+        let refs: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
         let mut started = Vec::new();
-        while d.live(goal) < max_live.max(1) {
+        let held = loop {
+            let live = d.live(goal);
+            if live >= max_live.max(1) {
+                break Some(format!(
+                    "queued: {live} children of this goal are running (max_live_processes {})",
+                    max_live.max(1)
+                ));
+            }
             let Some(next) = d.next_queued(goal).map(|n| n.id.clone()) else {
-                break;
+                break None;
             };
             let file = self.queue_dir().join(format!("{next}.json"));
             let extras = std::fs::read(&file)
@@ -526,15 +590,30 @@ impl Delegator {
             };
             if spec.mode == Mode::Execute {
                 let ws = spec.root.to_string_lossy().into_owned();
-                if lease_blocked(d, &ws, spec.worktrees).is_some() {
-                    break; // waits for the writer ahead of it
+                if let Some((p, h)) = lease_blocked(d, &ws, spec.worktrees) {
+                    // Waits for the writer ahead of it.
+                    break Some(format!("queued: `{p}` is write-leased by `{h}`"));
                 }
             }
-            let _ = std::fs::remove_file(&file);
-            let out = launch(d, &spec, &self.log).unwrap_or_else(|e| json!({ "error": e }));
-            started.push((next, out));
-        }
-        Ok(started)
+            let nice = self.guard.thresholds.child_nice;
+            let gate = self
+                .guard
+                .gate(&refs, now().max(0) as u64, &lease_alive, || {
+                    let _ = std::fs::remove_file(&file);
+                    match launch(d, &spec, &self.log, nice) {
+                        Ok(out) => {
+                            let pid = out["pid"].as_u64().and_then(|p| u32::try_from(p).ok());
+                            (out, pid.map(lease_of))
+                        }
+                        Err(e) => (json!({ "error": e }), None),
+                    }
+                })?;
+            match gate {
+                Gate::Started(out) => started.push((next, out)),
+                Gate::Wait(reason) => break Some(reason),
+            }
+        };
+        Ok((started, held))
     }
 
     fn poll(&self, inner: &AgentPollTool, input: Value) -> Result<Value, String> {
@@ -563,16 +642,15 @@ impl Delegator {
                     .map_err(|e| e.to_string())?;
             }
             Self::recover(d)?;
-            let started: Vec<String> = self
-                .drain(d, &n.goal_id)?
-                .into_iter()
-                .map(|(id, _)| id)
-                .collect();
+            let (started, held) = self.drain(d, &n.goal_id)?;
+            let started: Vec<String> = started.into_iter().map(|(id, _)| id).collect();
+            let queue = queue_view(d, &n.goal_id, held.as_deref());
             let n = d.poll(&n.id).ok_or("delegate: node vanished")?;
             Ok(Some(json!({
                 "node": n.id, "status": n.status, "reason": n.reason,
                 "used": n.used.map(|u| json!({"tokens": u.tokens, "steps": u.steps})),
                 "started_from_queue": started,
+                "queue": queue,
             })))
         })?;
         if let Some(v) = view {
@@ -580,6 +658,30 @@ impl Delegator {
         }
         Ok(out)
     }
+}
+
+/// The goal's queued nodes, oldest first, with how long each has waited
+/// and why: the head carries the reason the drain stopped (`held`), the
+/// rest wait behind it.
+fn queue_view(d: &Delegation<FileStore>, goal: &str, held: Option<&str>) -> Vec<Value> {
+    let q: Vec<_> = d
+        .queued()
+        .into_iter()
+        .filter(|n| n.goal_id == goal)
+        .collect();
+    let head = q.first().map(|n| n.id.clone()).unwrap_or_default();
+    q.iter()
+        .enumerate()
+        .map(|(i, n)| {
+            let reason = match (i, held) {
+                (0, Some(r)) => r.to_string(),
+                (0, None) => "queued: its parent has ended".to_string(),
+                _ => format!("queued: behind `{head}` in the queue"),
+            };
+            json!({"node": n.id, "waited_secs": now().saturating_sub(n.at).max(0),
+                   "queued_reason": reason})
+        })
+        .collect()
 }
 
 /// The live lease that blocks a new writer in `workspace` (canonical), as
@@ -602,7 +704,12 @@ fn lease_blocked(
 /// Spawns the child of `spec` (under the log lock), records its start and,
 /// for an `execute` child, its write lease on the canonical directory it
 /// works in.
-fn launch(d: &mut Delegation<FileStore>, spec: &Spec, log: &Path) -> Result<Value, String> {
+fn launch(
+    d: &mut Delegation<FileStore>,
+    spec: &Spec,
+    log: &Path,
+    nice: u32,
+) -> Result<Value, String> {
     let minutes = ((spec.budget.deadline - now()).max(60) + 59) / 60;
     let mut command: Vec<std::ffi::OsString> = vec![
         "mission".into(),
@@ -626,6 +733,7 @@ fn launch(d: &mut Delegation<FileStore>, spec: &Spec, log: &Path) -> Result<Valu
         delegated: true,
         delegation: Some((log.to_path_buf(), spec.node.clone())),
         keep_secrets: spec.keep_secrets.clone(),
+        nice: Some(nice),
     };
     let mut input = json!({"prompt": spec.task, "keep_mailbox": spec.keep_mailbox});
     if let Some(r) = &spec.role {
