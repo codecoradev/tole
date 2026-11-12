@@ -685,7 +685,7 @@ async fn start_server(
             let mut std_cmd = std::process::Command::new(command);
             std_cmd.args(args);
             // ENV-1: same secret scrubbing as every other spawn point.
-            crate::subprocess::scrub_env_for_child(&mut std_cmd);
+            crate::subprocess::scrub_env_for(&mut std_cmd, "mcp");
             let mut tokio_cmd = tokio::process::Command::from(std_cmd);
             // Evicted/hung connections must not leak orphaned server processes
             // (CodeCora): kill the child when the connection struct is dropped.

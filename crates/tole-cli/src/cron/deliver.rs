@@ -254,7 +254,7 @@ fn run_command(run: &RunInfo<'_>, line: &str) -> Result<(), String> {
     if let Some(w) = field(run.job, "workdir") {
         cmd.current_dir(w);
     }
-    tole_core::subprocess::scrub_env_for_child(&mut cmd);
+    tole_core::subprocess::scrub_env_for(&mut cmd, "cron");
     cmd.env("TOLE_CRON_JOB", &run.job.id)
         .env("TOLE_CRON_FIRE", run.fire_id)
         .env("TOLE_CRON_STATUS", status_text(run.status));

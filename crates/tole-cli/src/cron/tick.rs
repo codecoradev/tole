@@ -418,7 +418,7 @@ pub fn run_script(job: &Job, cancel: &CancelToken) -> ScriptOutput {
     if let Some(w) = field(job, "workdir") {
         cmd.current_dir(w);
     }
-    tole_core::subprocess::scrub_env_for_child(&mut cmd);
+    tole_core::subprocess::scrub_env_for(&mut cmd, "cron");
     let ran = tole_core::subprocess::run_with_timeout_or_cancel(
         &mut cmd,
         Duration::from_secs(timeout),

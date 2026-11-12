@@ -93,7 +93,7 @@ impl Tool for CoraSearchTool {
             return Err("query must not start with '-'".into());
         }
         let mut cmd = Command::new("cora");
-        crate::subprocess::scrub_env_for_child(&mut cmd);
+        crate::subprocess::scrub_env_for(&mut cmd, "cora");
         cmd.arg("brain")
             .arg(query)
             .arg("--json")

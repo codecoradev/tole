@@ -1,6 +1,7 @@
 # Secrets across tole's own integrations — design note
 
-Status: **research + proposal, nothing implemented.** Scope (owner
+Status: **research + proposal; scoped release (§4, §8.3) implemented by
+#598 part a, migration note in §9.** Scope (owner
 decision 2026-11-11): tole's **own** integrations first (LLM providers,
 `tole serve`, nginjen web backends, MCP over HTTP including Composio and
 uteke cloud, laya/Jev, uteke CLI and the memory loop, cora, gh/git/gitea);
@@ -173,3 +174,53 @@ same principles plus supply-chain controls.
    (recommended), or keep separate copies?
 3. Remove `GITHUB_TOKEN` from `run_command` by default (recommended, with
    the `gh` tool as the supported path), or keep the current trade-off?
+
+## 9. Migration: scoped release (#598 part a)
+
+**What changed.** A command the model runs (`run_command`, `job_start`) and
+a cron script no longer see any secret-shaped environment variable,
+`GITHUB_TOKEN` included. Before, ENV-1 removed every secret except
+`GITHUB_TOKEN`, so any command could read it. Each launcher now keeps only
+the secrets the `[secrets]` release binds to it:
+
+| Consumer | Who starts the child | Default |
+|---|---|---|
+| `gh`, `git` | the gh and git tools | `GITHUB_TOKEN` |
+| `hook`, `mcp` | your own hooks and stdio MCP servers | `GITHUB_TOKEN` |
+| `run_command`, `job_start`, `cron` | model commands, background jobs, cron scripts and delivery commands | nothing |
+| `uteke`, `memory`, `cora`, `skills` | tole's helper processes | nothing |
+
+A child session (agent_start or delegate) receives its provider keys plus
+its parent's grant: the secrets the parent holds that its release binds to
+some consumer, narrowed by the profile's `grants` when it runs as one. A
+child therefore never holds a secret its parent may not use.
+
+**How to restore the old behaviour for one token.** In the user config
+(`~/.codecora/tole/config.toml`):
+
+```toml
+[secrets]
+GITHUB_TOKEN = { tools = ["gh", "git", "hook", "mcp", "run_command"] }
+```
+
+An entry replaces that name's default binding, so list every consumer that
+should keep it. Prefer the `gh` and `git` tools over `gh` inside
+`run_command`: they are the supported path and keep the token out of
+arbitrary commands.
+
+**Project configs.** A project `[secrets]` entry can only narrow a binding
+(its tools ∩ the user's, or the default's). A tool it adds is ignored and a
+startup warning names the remedy (add it in the user config): the file comes
+from a cloned repository and must not hand a secret to a command.
+
+**Why.** Any command the model writes, including one steered by a prompt
+injection in a file or web page, could read a token from its environment
+and send it anywhere. Scoping each secret to the tool that needs it closes
+that without losing `gh`/`git` auth. Release is about what enters a child;
+redaction (`SecretSet`) still removes every known secret, granted or not,
+from what leaves the process.
+
+Not yet covered (part b): redacted reads of `.env*` and key files, and the
+`tole doctor` report of secrets and their bindings. A binding to an
+in-process tool (`web_search`) is accepted but has no effect yet: release
+only governs child processes.

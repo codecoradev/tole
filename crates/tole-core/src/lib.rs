@@ -83,6 +83,7 @@ pub mod resource_guard;
 pub mod run_command;
 // Approval-surface text sanitizer (#327): crate-internal, no public API.
 pub(crate) mod sanitize;
+pub mod secret_release;
 pub mod secrets;
 pub mod sibling_watch;
 pub mod skill_approval;

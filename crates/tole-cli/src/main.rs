@@ -855,11 +855,25 @@ fn dispatch(cli: Cli) -> Result<()> {
     };
     let cfg = match (project_config, user_config) {
         (None, None) => None,
-        (p, u) => Some(tole_cli::config::layered(
-            &p.map(|l| l.config).unwrap_or_default(),
-            &u.map(|l| l.config).unwrap_or_default(),
-        )),
+        (p, u) => {
+            let shown = p
+                .as_ref()
+                .map(|l| tole_cli::config_trust::sanitize(&l.shown.display().to_string()));
+            let (p, u) = (
+                p.map(|l| l.config).unwrap_or_default(),
+                u.map(|l| l.config).unwrap_or_default(),
+            );
+            if let Some(shown) = shown {
+                for w in tole_cli::config::secrets_widening_warnings(&p, &u, &shown) {
+                    eprintln!("warning: {w}");
+                }
+            }
+            Some(tole_cli::config::layered(&p, &u))
+        }
     };
+    // Scoped secret release (#598): which tools may hand which secret to
+    // the processes they start. Every launcher reads it from here.
+    tole_core::secret_release::set_release(cfg.as_ref().map(|c| c.release()).unwrap_or_default());
     // The selected profile (#584): resolved once, from the layered config
     // (the user layer is its only source). Reads its persona file and
     // nothing else; an unknown name is a startup error. `tole cron`

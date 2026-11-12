@@ -152,7 +152,7 @@ impl Gate {
     fn verify(&self, dir: &Path) -> Outcome {
         let mut cmd = Command::new(&self.cora_bin);
         cmd.args(["hook", "verify", "--quiet"]).current_dir(dir);
-        tole_core::subprocess::scrub_env_for_child(&mut cmd);
+        tole_core::subprocess::scrub_env_for(&mut cmd, "cora");
         match tole_core::subprocess::run_with_timeout(&mut cmd, VERIFY_TIMEOUT) {
             Ok(out) => match out.status.code() {
                 Some(0) => Outcome::Validated,

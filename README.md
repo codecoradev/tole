@@ -354,6 +354,19 @@ advisor = "big-model"                  # consulted, never executes (#587)
 default = "standard"                   # light | standard | heavy
 ```
 
+`[secrets]` (#598) binds each secret NAME to the tools whose child processes
+may receive it; every other secret-shaped variable is scrubbed from them.
+**`run_command`, `job_start` and cron scripts get no secret by default**;
+`GITHUB_TOKEN` defaults to the `gh` and `git` tools and your hooks and MCP
+servers. A project config can only narrow a binding. Migration note:
+[docs/secrets-integrations-design.md §9](docs/secrets-integrations-design.md).
+
+```toml
+[secrets]
+GITHUB_TOKEN = { tools = ["gh", "git", "hook", "mcp", "run_command"] }  # restore it for commands
+NPM_TOKEN = { tools = ["run_command"] }
+```
+
 A selected profile is one layer of the usual precedence: **per-key flag
 (`--system`, `--allow`, `--skill`) > profile > env > config > user config**.
 The `default` tier's model replaces the model of the provider triple (it beats

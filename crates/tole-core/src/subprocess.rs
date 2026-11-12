@@ -54,24 +54,43 @@ fn recv_with_grace<T>(rx: &mpsc::Receiver<T>) -> Option<T> {
 /// CREDENTIAL, or PRIVATE_KEY (case-insensitive substring, so
 /// `SECRET_KEY`, `AUTHTOKEN`, `DB_PASSWD` are covered — #284).
 /// The name rule is [`crate::secrets::is_secret_name`], shared with the
-/// egress redactor (#595).
-/// Exception: GITHUB_TOKEN is kept — gh/git push
-/// auth needs it, and its scope is documented in the threat model.
+/// egress redactor (#595). This form keeps NO secret; tole's own launchers
+/// use [`scrub_env_for`], which keeps what the release grants them (#598).
 pub fn scrub_env_for_child(cmd: &mut Command) -> &mut Command {
-    scrub_env_for_child_keeping(cmd, &[])
+    scrub_env_keeping(cmd, &|_| false)
 }
 
-/// [`scrub_env_for_child`] that also keeps the secret-shaped names in
-/// `keep` (exact, case-insensitive). Child agents use it to receive their
-/// provider key and nothing else (#595).
+/// The ENV-1 scrub for a child started by `consumer` (a tool name such as
+/// `run_command`, or a launcher such as `hook`): it keeps only the secrets
+/// the process's release ([`crate::secret_release::release`]) binds to
+/// `consumer` (#598). `run_command`, `job_start` and `cron` get none by
+/// default, `GITHUB_TOKEN` included.
+pub fn scrub_env_for<'a>(cmd: &'a mut Command, consumer: &str) -> &'a mut Command {
+    scrub_env_with(cmd, consumer, &crate::secret_release::release())
+}
+
+/// [`scrub_env_for`] under an explicit release.
+pub fn scrub_env_with<'a>(
+    cmd: &'a mut Command,
+    consumer: &str,
+    release: &crate::secret_release::Release,
+) -> &'a mut Command {
+    scrub_env_keeping(cmd, &|name| release.allows(name, consumer))
+}
+
+/// [`scrub_env_for_child`] that keeps the secret-shaped names in `keep`
+/// (exact, case-insensitive) and nothing else. Child agents use it to
+/// receive their provider key plus their grant (#595, #598).
 pub fn scrub_env_for_child_keeping<'a>(cmd: &'a mut Command, keep: &[&str]) -> &'a mut Command {
-    const KEEP: [&str; 1] = ["GITHUB_TOKEN"];
+    scrub_env_keeping(cmd, &|name| {
+        keep.iter().any(|n| n.eq_ignore_ascii_case(name))
+    })
+}
+
+fn scrub_env_keeping<'a>(cmd: &'a mut Command, keep: &dyn Fn(&str) -> bool) -> &'a mut Command {
     for (k, _) in std::env::vars_os() {
         let Some(name) = k.to_str() else { continue };
-        let upper = name.to_ascii_uppercase();
-        let kept =
-            KEEP.contains(&upper.as_str()) || keep.iter().any(|n| n.eq_ignore_ascii_case(&upper));
-        if crate::secrets::is_secret_name(name) && !kept {
+        if crate::secrets::is_secret_name(name) && !keep(name) {
             cmd.env_remove(name);
         }
     }

@@ -29,8 +29,9 @@
 //! - env: the child gets the ENV-1-scrubbed parent env plus only the
 //!   provider keys it needs (`child_env::PROVIDER_SECRETS`, #595); every
 //!   other secret-shaped variable (MCP tokens, the serve token, ...) is
-//!   removed. `GITHUB_TOKEN` stays, as for every child process (#598
-//!   revisits it).
+//!   removed, `GITHUB_TOKEN` included, unless `ChildOpts::keep_secrets`
+//!   carries it: the host passes its grant there (#598, the secrets its
+//!   release binds to some consumer, narrowed by a profile).
 
 use crate::tool::{Risk, Tool};
 use serde_json::{json, Value};
@@ -867,7 +868,7 @@ impl Tool for AgentStartTool {
 
         let mut cmd = Command::new(&self.bin);
         // The child IS a tole session: it gets the scrubbed env plus its
-        // provider keys and nothing else secret (#595). Isolation beyond
+        // provider keys and its grant, nothing else secret (#595, #598). Isolation beyond
         // that = depth cap + jail + the approved child allowlist.
         let mut keep: Vec<&str> = crate::child_env::PROVIDER_SECRETS.to_vec();
         keep.extend(self.opts.keep_secrets.iter().map(String::as_str));
