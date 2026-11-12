@@ -78,6 +78,7 @@ pub mod provider;
 pub mod read_file;
 pub mod register;
 pub mod replay;
+pub mod resource_guard;
 #[cfg(feature = "shell-tools")]
 pub mod run_command;
 // Approval-surface text sanitizer (#327): crate-internal, no public API.

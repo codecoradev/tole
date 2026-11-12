@@ -120,6 +120,42 @@ pub struct DelegationConfig {
     pub goal_steps: Option<u32>,
     /// A goal's default wall-clock minutes.
     pub goal_minutes: Option<u64>,
+    /// Resource guard (`tole_core::resource_guard`): memory that must stay
+    /// free after a child is reserved, in MiB (default 1024).
+    pub min_free_memory_mb: Option<u64>,
+    /// MiB reserved per child started but not yet ramped up (default 512).
+    pub child_memory_mb: Option<u64>,
+    /// Highest one-minute load per CPU at which a child starts (default 1.5).
+    pub max_load_per_cpu: Option<f64>,
+    /// MiB that must stay free on the data dir, workspace and worktree
+    /// filesystems (default 2048).
+    pub min_free_disk_mb: Option<u64>,
+    /// Percent of the process-id limit that must stay free (default 10).
+    pub min_free_pids_percent: Option<u64>,
+    /// Least seconds between two child starts (default 2).
+    pub spawn_interval_secs: Option<u64>,
+    /// Delegated children live at once on the machine, all goals and
+    /// sessions together (default max(2, CPUs)).
+    pub machine_max_live: Option<u32>,
+    /// Niceness of a delegated child, 0 to 19 (default 10).
+    pub child_nice: Option<u32>,
+}
+
+impl DelegationConfig {
+    /// The resource-guard thresholds this table sets (defaults for the
+    /// rest); an out-of-bounds value is an error naming its key.
+    pub fn resource_thresholds(&self) -> Result<tole_core::resource_guard::Thresholds, String> {
+        tole_core::resource_guard::Thresholds::with(&tole_core::resource_guard::Overrides {
+            min_free_memory_mb: self.min_free_memory_mb,
+            child_memory_mb: self.child_memory_mb,
+            max_load_per_cpu: self.max_load_per_cpu,
+            min_free_disk_mb: self.min_free_disk_mb,
+            min_free_pids_percent: self.min_free_pids_percent,
+            spawn_interval_secs: self.spawn_interval_secs,
+            machine_max_live: self.machine_max_live,
+            child_nice: self.child_nice,
+        })
+    }
 }
 
 /// `[profiles.<name>.models]` (#584): model names per task-weight tier.
@@ -502,6 +538,7 @@ pub fn parse(src: &str, path: &Path) -> Result<Config, ConfigError> {
         if let Some((k, _)) = zero.iter().find(|(_, v)| *v == Some(0)) {
             return Err(range(format!("delegation.{k} must be at least 1")));
         }
+        d.resource_thresholds().map_err(range)?;
     }
     Ok(cfg)
 }
@@ -927,6 +964,22 @@ pub fn render_with(cfg: &Config, tag: &str, ann: &Annotations) -> Vec<String> {
             n(d.goal_steps.map(u64::from)),
         );
         scalar(&mut out, "delegation.goal_minutes", n(d.goal_minutes));
+        for (key, v) in [
+            ("min_free_memory_mb", d.min_free_memory_mb),
+            ("child_memory_mb", d.child_memory_mb),
+            ("min_free_disk_mb", d.min_free_disk_mb),
+            ("min_free_pids_percent", d.min_free_pids_percent),
+            ("spawn_interval_secs", d.spawn_interval_secs),
+            ("machine_max_live", d.machine_max_live.map(u64::from)),
+            ("child_nice", d.child_nice.map(u64::from)),
+        ] {
+            scalar(&mut out, &format!("delegation.{key}"), n(v));
+        }
+        scalar(
+            &mut out,
+            "delegation.max_load_per_cpu",
+            d.max_load_per_cpu.map(|v| v.to_string()),
+        );
     }
     out
 }
@@ -1113,6 +1166,72 @@ verify_timeout = 60
         let shown = render(&project).join("\n");
         assert!(
             shown.contains("delegation.max_depth = 3") && shown.contains("IGNORED"),
+            "{shown}"
+        );
+    }
+
+    /// The resource-guard keys: bounded, user layer only, shown by
+    /// `config check`.
+    #[test]
+    fn delegation_resource_keys_are_bounded_and_user_layer_only() {
+        let user = parse(
+            "[delegation]\nmin_free_memory_mb = 2048\nchild_memory_mb = 256\n\
+             max_load_per_cpu = 2.5\nmin_free_disk_mb = 4096\nmin_free_pids_percent = 20\n\
+             spawn_interval_secs = 5\nmachine_max_live = 3\nchild_nice = 15\n",
+            &p(),
+        )
+        .unwrap();
+        let t = user
+            .delegation
+            .as_ref()
+            .unwrap()
+            .resource_thresholds()
+            .unwrap();
+        assert_eq!(
+            (
+                t.min_free_memory_mb,
+                t.child_memory_mb,
+                t.max_load_per_cpu,
+                t.min_free_disk_mb,
+                t.min_free_pids_percent,
+                t.spawn_interval_secs,
+                t.machine_max_live,
+                t.child_nice
+            ),
+            (2048, 256, 2.5, 4096, 20, 5, 3, 15)
+        );
+        for bad in [
+            "min_free_memory_mb = 0",
+            "min_free_memory_mb = -1",
+            "child_memory_mb = 0",
+            "max_load_per_cpu = 0.0",
+            "max_load_per_cpu = -2.0",
+            "max_load_per_cpu = 1000.0",
+            "min_free_disk_mb = 0",
+            "min_free_pids_percent = 0",
+            "min_free_pids_percent = 95",
+            "spawn_interval_secs = 0",
+            "machine_max_live = 0",
+            "machine_max_live = 100000",
+            "child_nice = 20",
+            "child_nice = -5",
+            "max_load_per_cpu = \"high\"",
+        ] {
+            assert!(
+                parse(&format!("[delegation]\n{bad}\n"), &p()).is_err(),
+                "{bad}"
+            );
+        }
+        let project = parse("[delegation]\nmachine_max_live = 64\n", &p()).unwrap();
+        assert_eq!(layered(&project, &Config::default()).delegation, None);
+        let shown = render(&project).join("\n");
+        assert!(
+            shown.contains("delegation.machine_max_live = 64") && shown.contains("IGNORED"),
+            "{shown}"
+        );
+        let shown = render(&user).join("\n");
+        assert!(
+            shown.contains("delegation.max_load_per_cpu = 2.5"),
             "{shown}"
         );
     }

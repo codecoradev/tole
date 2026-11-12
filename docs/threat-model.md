@@ -952,6 +952,31 @@ The delegate tool (#585 part 3, `crates/tole-cli/src/delegate.rs`) adds:
   outside the jail; that is the same authority it already holds, and the fold
   still refuses any spawn wider than its parent.
 
+### Delegation resource guard
+
+`tole_core::resource_guard` (owner requirement: delegation must never
+overload or crash the server) decides whether a delegated child may start on
+this machine; the `delegate` tool calls it on both spawn levels (depth 0 and
+1) in a follow-up PR. A child waits in the queue, never fails, while: the
+machine-wide count of live delegated children (every goal and session) is at
+`machine_max_live`; the last start was less than `spawn_interval_secs` ago;
+free memory is under `min_free_memory_mb` plus `child_memory_mb` for the new
+child and each one still ramping up (a cgroup v2 `memory.max` counts, so a
+container's limit wins over the host's free memory; its use is the working
+set, `memory.current` minus `inactive_file` of `memory.stat`, so page cache
+left by builds does not starve the queue, and all of `memory.current` with
+a startup note when `memory.stat` is unreadable); the one-minute load per
+CPU is over `max_load_per_cpu`; less than `min_free_pids_percent` of the
+process-id limit (cgroup `pids.max`, else `pid_max` against the threads in
+`/proc`) is free; or the data
+dir, workspace or worktree filesystem has less than `min_free_disk_mb` free
+for an unprivileged user. A probe that cannot be read is skipped with one
+startup note, so on another OS the guard degrades to the count and interval
+rules instead of blocking forever. Delegated children run at niceness
+`child_nice` (never lowered below the parent's). The thresholds are
+`[delegation]` keys of the user config only, bounded (zero, negative or
+absurd values are config errors), so a cloned repository cannot loosen them.
+
 ### User config (#433)
 
 `$CODECORA_HOME/tole/config.toml` (default `~/.codecora/tole/config.toml`) has
