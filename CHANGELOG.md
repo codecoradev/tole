@@ -48,6 +48,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Missions now learn about cora's agent-as-reviewer flow (#536): `tole mission` builds its registry like `run` (including the auto-attached `mcp_cora_*` tools) but its pinned system prompt never named the review tools, so the unattended command was the one that did not know the flow existed. When both `mcp_cora_cora_review_prepare` and `mcp_cora_cora_review_finalize` are registered, a fresh mission's prompt now carries the same review section as `run` / `chat` / the TUI plus one sentence asking for a review (and its verdict in the final message) before the mission ends; without the tools nothing is added. Guidance only: a gate before `git commit` is tracked separately. `serve`, `acp` and `mcp` sessions are unchanged on purpose: they attach no external MCP servers, so they have no review tools. Resumed missions keep their pinned prompt.
 
 ### Added
+- Webhook routes fire cron jobs, part 2b of #582. `tole hook` comes in part 3.
+  - **New route keys:** `cron_job`, `events`, `[hooks.<route>.filter]`, `template` and `allow_writes`, compiled when the route loads. A bad value stops `tole serve`, naming the route.
+  - **Before any LLM work**, for a verified, first-seen delivery: the events allowlist (`X-GitHub-Event` / `X-Tole-Event`), then the JSON body, then the filter. A miss is `200 ignored`.
+  - **A match fires `cron_job`** through the same claim path as `tole cron run`: the trust check from #640, delivery, provider, skills, the daily cap, and the job's model, budgets and allowlist. It answers `202` with the fire id once the run is claimed. A paused, running, blocked or out-of-budget job gets `409`.
+  - **The fired run** gets the rendered `template` as fenced untrusted data appended to its prompt, for that run only. It is ReadOnly by default (its Write tools are absent) unless the route says `allow_writes = true`.
+  - **Filters:** `contains` is a substring match on a string and a whole-element match on an array.
+  - **`tole-cli` API:** `cron::claim_now`, `cron::tick::Trigger`, `Claimed::with_trigger` / `fire_id`, and `run_agent` takes a trigger.
 - Webhook filters and templates, part 2a of #582: the new module `tole_cli::hook_filter`. Routes start using it in part 2b, where it runs before any LLM work.
   - **Filters:** `equals`, `contains`, `in`, `regex` and `exists` on a `dot.path`, joined by `all`, `any` and `not`. Each node has exactly one operator, and a tree is at most 8 deep and 64 nodes.
   - **Regex** uses `regex-lite`, which does not backtrack. A pattern is at most 256 bytes and its compiled program at most 32 KiB, and a string over 16 KiB is never scanned.

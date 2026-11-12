@@ -377,6 +377,40 @@ delivery:
   `template` and `allow_writes`, the `202` / `200 ignored` answers, and
   ReadOnly webhook runs.
 
+**As implemented, part 2b of #582 (the action):**
+- **Compiled with the route.** The route keys `cron_job`, `events`,
+  `[hooks.<route>.filter]`, `template` and `allow_writes` are compiled when
+  the route loads. A bad job id, event name, filter or template stops
+  `tole serve` like a missing key.
+- **Order of work for a verified, first-seen delivery:**
+  1. events allowlist;
+  2. JSON body (a non-JSON body gets 400 when the route has a filter or a
+     template);
+  3. filter;
+
+  A miss at step 1 or 3 is `200 ignored`, before any LLM work. A route
+  without `cron_job` only verifies and records (`202`).
+- **Firing.** A match claims a run of `cron_job` through `cron::claim_now`,
+  the same path `tole cron run` and a tick use. That path applies the #640
+  trust check, the delivery check, the provider and skills checks and the
+  daily cap. It refuses a paused or running job and records `blocked`.
+  - A claimed run answers `202` with its fire id and runs on a background
+    thread. Anything else answers `409` and fires nothing.
+  - The run keeps the job's model pin, budgets and allowlist. Under `tole
+    serve` a Write the allowlist does not cover parks in `/approvals`.
+- **The trigger, this run only.** The fenced rendering of `template` is
+  appended to the job's prompt for this one run; the job record never
+  changes.
+- **ReadOnly by default.** Unless the route says `allow_writes = true`
+  (a manual edit of the user config), the run's roster is built in plan
+  mode, so its Write tools are absent, not merely denied. The job's
+  allowlist cannot bring them back.
+- **Script jobs** can be fired too. They take no context (a script has no
+  prompt), and the trust check refuses a script job not saved through the
+  CLI.
+- **`contains`** is a substring match on a string and a whole-element match
+  on an array.
+
 ## 7. Adoptable from Nakama (withnakama.com)
 
 Nakama is team-oriented (multi-tenant dashboard, channels, ~200 MB idle

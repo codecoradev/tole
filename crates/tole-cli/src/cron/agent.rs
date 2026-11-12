@@ -251,7 +251,10 @@ fn u64_field(job: &Job, key: &str, default: u64) -> u64 {
 
 /// Runs one agent job to its terminal status with at most `max_tokens`
 /// tokens; `cancel` (shared with the caller) stops it as `cancelled`.
-/// `setup` is the job's resolved skills and profile. Never panics on a
+/// `setup` is the job's resolved skills and profile. `trigger` is a webhook
+/// delivery that fired this run (#582): its fenced context is appended to
+/// this run's prompt only, and a read-only trigger leaves the Write tools
+/// out of the roster (they are absent, not just denied). Never panics on a
 /// broken job: every failure is an `error` with a reason.
 pub fn run_agent(
     job: &Job,
@@ -260,6 +263,7 @@ pub fn run_agent(
     cancel: &CancelToken,
     max_tokens: u64,
     resume: Option<&str>,
+    trigger: Option<&super::tick::Trigger>,
 ) -> AgentRun {
     let fail = |session_id: Option<String>, e: String| AgentRun {
         status: RunStatus::Error,
@@ -294,11 +298,12 @@ pub fn run_agent(
     let profile_allow = setup.profile.as_ref().map(|p| p.allow.as_slice());
     let approver = approver(job, profile_allow, queue, &session_id, &path);
     let refused = approver.refused();
-    let mut reg =
-        match crate::tool_roster::build(approver, crate::tool_roster::Roster::new(canon.clone())) {
-            Ok(r) => r,
-            Err(e) => return fail(None, e.to_string()),
-        };
+    let mut roster = crate::tool_roster::Roster::new(canon.clone());
+    roster.plan_mode = trigger.is_some_and(|t| t.read_only);
+    let mut reg = match crate::tool_roster::build(approver, roster) {
+        Ok(r) => r,
+        Err(e) => return fail(None, e.to_string()),
+    };
     let name = field(job, "name").unwrap_or(&job.id).to_string();
     let opened = match resume {
         // The session file sits in the job's workdir, which the job can
@@ -378,7 +383,11 @@ pub fn run_agent(
         }
     });
     let memory = setup.memory(&canon);
-    let sent = crate::turn_runner::with_recalled_memory(memory.as_ref(), prompt);
+    let mut sent = crate::turn_runner::with_recalled_memory(memory.as_ref(), prompt);
+    if let Some(t) = trigger {
+        sent.push_str("\n\n");
+        sent.push_str(&t.context);
+    }
     // A continuation's session already holds the parked run's usage, which
     // that run's `done` reported: this run reports only its own.
     let tokens_before = tole_core::transcript::tokens_in_out(storage.usages());

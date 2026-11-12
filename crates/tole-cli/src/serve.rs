@@ -223,6 +223,8 @@ struct Request {
     body: Vec<u8>,
     /// Signature and delivery headers of a webhook (#582).
     hook: tole_core::webhook::Headers,
+    /// `X-GitHub-Event` or `X-Tole-Event` of a webhook (#582 part 2).
+    event: Option<String>,
 }
 
 /// Why a request could not be read; decides the response (if any).
@@ -313,6 +315,7 @@ fn read_request(
     let mut content_length: Option<usize> = None;
     let mut expect_continue = false;
     let mut hook = tole_core::webhook::Headers::default();
+    let mut event = None;
     // The request line counts against the same ceiling as the headers:
     // the documented limit is 32 KiB for both combined.
     let mut header_bytes = request_line.len();
@@ -372,6 +375,10 @@ fn read_request(
             hook.github_signature = Some(value.to_string());
         } else if name.eq_ignore_ascii_case("x-github-delivery") {
             hook.github_delivery = Some(value.to_string());
+        } else if name.eq_ignore_ascii_case("x-github-event")
+            || name.eq_ignore_ascii_case("x-tole-event")
+        {
+            event = Some(value.to_string());
         } else if name.eq_ignore_ascii_case("expect") && value.eq_ignore_ascii_case("100-continue")
         {
             expect_continue = true;
@@ -421,6 +428,7 @@ fn read_request(
         last_event_id,
         body,
         hook,
+        event,
     })
 }
 
@@ -1054,13 +1062,94 @@ fn handle_hook(
     match outcome {
         Ok(None) => (429, json!({"error": "rate limit for this route"})),
         Ok(Some(false)) => (200, json!({"status": "duplicate", "delivery": id})),
-        // Part 1 of #582: the gate only. The action (filters, firing a job)
-        // follows in part 2.
-        Ok(Some(true)) => (202, json!({"status": "accepted", "delivery": id})),
+        Ok(Some(true)) => hook_action(state, name, route, req, &id, dir, now),
         Err(e) => {
             eprintln!("tole serve: webhook state: {e}");
             (500, json!({"error": "webhook state unavailable"}))
         }
+    }
+}
+
+/// A verified, first-seen delivery (#582 part 2): the events allowlist and
+/// the filter run on the payload before any LLM work (`200 ignored`); a
+/// match fires the route's `cron_job` through the claim path a tick uses
+/// (the #640 trust check, delivery, provider, skills, the daily cap) and
+/// answers `202` once the run is claimed. The run gets the fenced, rendered
+/// payload as context for this run only, and no Write tools unless the
+/// route says `allow_writes`.
+fn hook_action(
+    state: &State,
+    name: &str,
+    route: &tole_cli::hooks::Route,
+    req: &Request,
+    id: &str,
+    dir: &std::path::Path,
+    now: i64,
+) -> (u16, serde_json::Value) {
+    use tole_cli::hook_filter;
+    let event = req.event.as_deref();
+    if !hook_filter::event_allowed(route.events.as_deref(), event) {
+        return (
+            200,
+            json!({"status": "ignored", "reason": "event", "delivery": id}),
+        );
+    }
+    let payload = match serde_json::from_slice::<serde_json::Value>(&req.body) {
+        Ok(v) => v,
+        Err(_) if route.filter.is_none() && route.template.is_none() => serde_json::Value::Null,
+        Err(_) => return (400, json!({"error": "the body is not JSON"})),
+    };
+    if route
+        .filter
+        .as_ref()
+        .is_some_and(|f| !hook_filter::matches(f, &payload))
+    {
+        return (
+            200,
+            json!({"status": "ignored", "reason": "filter", "delivery": id}),
+        );
+    }
+    let Some(job) = &route.cron_job else {
+        return (202, json!({"status": "accepted", "delivery": id}));
+    };
+    let secrets = tole_cli::provider_chain::process_secrets(&tole_cli::config_apply::real_env);
+    let rendered = route
+        .template
+        .as_ref()
+        .map(|t| t.render(&payload, &secrets))
+        .unwrap_or_default();
+    let trigger = tole_cli::cron::tick::Trigger {
+        context: hook_filter::fenced(name, event, id, &rendered),
+        read_only: !route.allow_writes,
+    };
+    let opts = tole_cli::cron::TickOptions {
+        approvals: Some(Arc::clone(&state.approvals)),
+        daily_token_cap: tole_cli::cron::daily_token_cap(),
+        ..tole_cli::cron::TickOptions::standalone(1)
+    };
+    let mut report = tole_cli::cron::TickReport::default();
+    match tole_cli::cron::claim_now(dir, job, now, &opts, &mut report) {
+        Ok(Some(c)) => {
+            let fire = c.fire_id().to_string();
+            let claimed = vec![c.with_trigger(trigger)];
+            let dir = dir.to_path_buf();
+            std::thread::spawn(move || {
+                let mut r = tole_cli::cron::TickReport::default();
+                if let Err(e) = tole_cli::cron::tick::run_claimed(&dir, claimed, now, &opts, &mut r)
+                {
+                    eprintln!("tole serve: webhook run: {e}");
+                }
+            });
+            (
+                202,
+                json!({"status": "accepted", "delivery": id, "fire": fire}),
+            )
+        }
+        Ok(None) => (
+            409,
+            json!({"error": "the job did not run (blocked or out of budget; see tole cron list)", "delivery": id}),
+        ),
+        Err(e) => (409, json!({"error": e.to_string(), "delivery": id})),
     }
 }
 
