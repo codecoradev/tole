@@ -153,7 +153,7 @@ pub fn load(
             .as_deref()
             .map(crate::hook_filter::Template::parse)
             .transpose()
-            .map_err(&err)?;
+            .map_err(err)?;
         out.insert(
             name.clone(),
             Route {
