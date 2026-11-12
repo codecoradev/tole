@@ -1419,6 +1419,22 @@ verify_timeout = 60
         assert!(parse("[cron]\napi_token = \"x\"\n", &p()).is_err());
         assert!(parse("[mission]\ndaily_token_cap = 1\n", &p()).is_err());
         assert!(parse("[cron]\ndaily_token_cap = \"1\"\n", &p()).is_err());
+        // #580: the zone keys; an unknown source names the accepted ones.
+        let tz = parse(
+            "[cron]\ntimezone = \"Asia/Jakarta\"\ntz_source = \"offset-only\"\n",
+            &p(),
+        )
+        .unwrap()
+        .cron
+        .unwrap();
+        assert_eq!(
+            (tz.timezone.as_deref(), tz.tz_source),
+            (Some("Asia/Jakarta"), Some(TzSource::OffsetOnly))
+        );
+        let e = parse("[cron]\ntz_source = \"bundled\"\n", &p())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("system") && e.contains("offset-only"), "{e}");
         let project = parse("[cron]\ndaily_token_cap = 999999999\n", &p()).unwrap();
         assert_eq!(layered(&project, &Config::default()).cron, None);
         let m = layered(&project, &user);
