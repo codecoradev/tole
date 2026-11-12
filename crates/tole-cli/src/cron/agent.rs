@@ -364,15 +364,20 @@ pub fn run_agent(
     });
     let memory = setup.memory(&canon);
     let sent = crate::turn_runner::with_recalled_memory(memory.as_ref(), prompt);
+    // A continuation's session already holds the parked run's usage, which
+    // that run's `done` reported: this run reports only its own.
+    let tokens_before = tole_core::transcript::tokens_in_out(storage.usages());
+    // Both arms run under the same plan and metered provider: the job's
+    // model pin, step budget (counted per run), token budget and cancel.
     let outcome = match resume {
         // The parked turn, continued: no new prompt.
-        Some(_) => tole_core::turn::resume_turn_with_cancel(&mut storage, &mut meter, &reg, cancel)
-            .map_err(crate::turn_runner::TurnRunError::Storage),
+        Some(_) => crate::turn_runner::resume_turn_with(&mut storage, &mut meter, &plan),
         None => crate::turn_runner::run_turn_with(&mut storage, &mut meter, &plan, &sent),
     };
     drop(done_tx);
     let _ = timer.join();
-    let tokens = tole_core::transcript::tokens_in_out(storage.usages());
+    let tokens =
+        tole_core::transcript::tokens_in_out(storage.usages()).saturating_sub(tokens_before);
     let outcome = match outcome {
         Ok(o) => o,
         Err(e) => {

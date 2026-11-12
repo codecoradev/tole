@@ -151,8 +151,19 @@ and process spawning live in `tole-cli`.
      the approved call (same tool, same input), so the model can repeat that
      call once and nothing else. A model that takes another way runs nothing
      the approval did not cover.
+     **An allow does not run the call by itself.** The approved call runs
+     only if the resumed model makes that same call again. If the model
+     changes the input or does something else, the approved call never
+     runs, and the run settles on whatever the model does instead.
   3. The continuation goes through the same run, settle and deliver path
-     as a tick (budget, daily cap, skill pins and profile re-checked).
+     as a tick (budget, daily cap, skill pins and profile re-checked). It
+     runs under the same turn plan as a fresh run: the job's model pin, its
+     `max_steps` step budget, its token budget and its `max_minutes` limit.
+     Each budget is counted for the continuation alone, not for the whole
+     run: the continuation is a run of its own with its own `done`, and a
+     resume needs a human allow each time. Its `done` reports only the
+     continuation's tokens, so the daily cap does not count the parked
+     run's tokens twice.
 
   Not resumable: script jobs (they never park); runs parked by a
   standalone `tole cron tick` (no queue, so no approval to give: re-run

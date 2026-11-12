@@ -399,6 +399,81 @@ fn an_allowed_parked_write_resumes_the_run_once() {
         .is_none());
 }
 
+/// Parks a run of `spec` in a queue, allows the parked call and resumes it.
+/// Returns the continuation's fire and status.
+fn park_allow_resume(dir: &Path, spec: CreateSpec) -> (String, RunStatus) {
+    cron::create(dir, spec, T).unwrap();
+    let queue = ApprovalQueue::shared();
+    let opts = TickOptions {
+        approvals: Some(Arc::clone(&queue)),
+        ..TickOptions::standalone(2)
+    };
+    let (status, session, _) = run_once(dir, &opts);
+    assert_eq!(status, RunStatus::AwaitingApproval);
+    let session = session.unwrap();
+    queue.decide(&queue.list(Some(&session))[0].id, true);
+    cron::tick::resume_parked(dir, &session, T + 120, &opts)
+        .unwrap()
+        .expect("the parked run resumes")
+}
+
+/// A continuation has the job's step budget, counted over its own steps:
+/// the repeated write is step 1 and the next call is step 2.
+#[test]
+fn a_resumed_run_stops_at_the_jobs_max_steps() {
+    provider();
+    let dir = tmp("resume-steps");
+    let mut spec = agent(&dir, "w", "please WRITE then LOOP");
+    spec.max_steps = Some(2);
+    let (fire, status) = park_allow_resume(&dir, spec);
+    assert_eq!(status, RunStatus::Budget);
+    assert_eq!(usage_of(&dir, &fire)["error"], "step budget exceeded");
+    assert!(dir.join("out.txt").exists(), "the approved write ran first");
+}
+
+/// A continuation sends the job's pinned model.
+#[test]
+fn a_resumed_run_uses_the_jobs_pinned_model() {
+    provider();
+    let dir = tmp("resume-model");
+    let mut spec = agent(&dir, "w", "please WRITE a file, pinned resume");
+    spec.model = Some("pinned-resume-model".into());
+    let sent = || {
+        let m = models().lock().unwrap();
+        m.iter().filter(|m| *m == "pinned-resume-model").count()
+    };
+    cron::create(&dir, spec, T).unwrap();
+    let queue = ApprovalQueue::shared();
+    let opts = TickOptions {
+        approvals: Some(Arc::clone(&queue)),
+        ..TickOptions::standalone(2)
+    };
+    let (_, session, _) = run_once(&dir, &opts);
+    let session = session.unwrap();
+    let before = sent();
+    queue.decide(&queue.list(Some(&session))[0].id, true);
+    let (_, status) = cron::tick::resume_parked(&dir, &session, T + 120, &opts)
+        .unwrap()
+        .unwrap();
+    assert_eq!(status, RunStatus::Ok);
+    assert!(sent() > before, "the continuation used the pin");
+}
+
+/// A continuation has the job's token budget, and its `done` reports only
+/// its own tokens (the parked run's are already counted).
+#[test]
+fn a_resumed_run_keeps_the_token_budget() {
+    provider();
+    let dir = tmp("resume-tokens");
+    let mut spec = agent(&dir, "w", "please WRITE then LOOP");
+    spec.max_tokens = Some(3);
+    let (fire, status) = park_allow_resume(&dir, spec);
+    assert_eq!(status, RunStatus::Budget);
+    let usage = usage_of(&dir, &fire);
+    assert_eq!(usage["error"], "token budget exceeded");
+    assert_eq!(usage["tokens"].as_u64(), Some(4), "{usage}");
+}
+
 /// Without an allow (a denied or expired approval), a resume never runs
 /// the Write: it parks again. Nothing is auto-approved.
 #[test]

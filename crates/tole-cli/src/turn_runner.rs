@@ -311,6 +311,24 @@ pub fn resume_turn_on<S: Storage>(
         .map_err(TurnRunError::Storage)
 }
 
+/// [`resume_turn_on`] with a provider already built, and with the plan's
+/// observer: a parked turn continued under the same plan as a fresh one
+/// (cron's continuation keeps its step budget, #581).
+pub fn resume_turn_with<S: Storage>(
+    storage: &mut S,
+    provider: &mut dyn Provider,
+    plan: &TurnPlan<'_>,
+) -> Result<TurnOutcome, TurnRunError> {
+    turn::resume_turn_with_observer(
+        storage,
+        provider,
+        plan.registry,
+        plan.cancel,
+        plan.observer.map(|o| o.as_ref()),
+    )
+    .map_err(TurnRunError::Storage)
+}
+
 /// Pre-turn recall (memory loop): the prompt with the recalled block
 /// appended — what the provider sees and the durable log records. No
 /// memory configured, nothing recalled, or a failed recall (reported on

@@ -1055,4 +1055,8 @@ settled `awaiting_approval` for the same job and was not resumed before, so
 a hand-written `resume` line cannot revive a finished run or run a parked
 one twice. The resumed turn gets no new prompt and the approval is a
 one-shot for exactly the approved call; without an allow (denied, expired,
-lost with a restart) the call parks again and never runs.
+lost with a restart) the call parks again and never runs. An allow does
+not run the call by itself: the call runs only if the resumed model makes
+that same call again, otherwise it never runs. The continuation runs
+under the job's model pin, step budget, token budget and time limit, each
+counted for the continuation alone.
