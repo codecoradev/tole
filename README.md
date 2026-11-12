@@ -73,7 +73,13 @@ tole is the agent harness of the CodeCora ecosystem — the hands:
   nothing when cora is already supported, and `--check` only reports.
   Cargo verifies the registry checksum; tole downloads nothing itself.
 - Anything else that speaks **MCP over stdio** joins the same registry via
-  repeatable `--mcp-server name=command [args...]` flags. Servers that
+  repeatable `--mcp-server name=command [args...]` flags. **Every MCP server,
+  cora included, needs your approval** (#599): on a terminal, `tole` shows
+  its full tool list once and asks, and the approval pins a hash of its tool
+  names, descriptions and schemas in `$CODECORA_HOME/tole/plugins.lock`. A
+  server whose tools change later, or that you never approved, is not
+  registered (missions, cron and `serve` never ask); `tole doctor` shows the
+  state. Servers that
   offer prompts show up in `tole chat` as `/mcp:<server>:<prompt> [k=v ...]`
   (rendered server-side, sent as your next message); servers that offer
   resources add a ReadOnly `mcp_read` tool. Servers with neither add nothing.
