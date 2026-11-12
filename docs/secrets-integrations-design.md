@@ -1,7 +1,8 @@
 # Secrets across tole's own integrations — design note
 
 Status: **research + proposal; scoped release (§4, §8.3) implemented by
-#598 part a, migration note in §9.** Scope (owner
+#598 part a, migration note in §9; sensitive-file reads and the doctor
+report by part b, §10.** Scope (owner
 decision 2026-11-11): tole's **own** integrations first (LLM providers,
 `tole serve`, nginjen web backends, MCP over HTTP including Composio and
 uteke cloud, laya/Jev, uteke CLI and the memory loop, cora, gh/git/gitea);
@@ -220,7 +221,38 @@ that without losing `gh`/`git` auth. Release is about what enters a child;
 redaction (`SecretSet`) still removes every known secret, granted or not,
 from what leaves the process.
 
-Not yet covered (part b): redacted reads of `.env*` and key files, and the
-`tole doctor` report of secrets and their bindings. A binding to an
-in-process tool (`web_search`) is accepted but has no effect yet: release
-only governs child processes.
+A binding to an in-process tool (`web_search`) is accepted but has no
+effect yet: release only governs child processes.
+
+## 10. Sensitive files and the doctor report (#598 part b)
+
+**Which files.** `.env*`, `*.pem`, `id_*`, `.npmrc`, `.netrc`, `*.key`,
+matched on the file name, case-insensitive, by the name a tool was asked
+for OR the resolved real path (`notes.txt -> .env` counts).
+
+**Every tool that can return file bytes:**
+
+| Tool | What it returns for a sensitive file |
+|---|---|
+| `read_file` | `KEY=«redacted»` lines (blank lines kept, any other line the marker alone); a key or pem file one `«redacted»`; no content hash (a 64-bit hash of a short secret could be brute-forced), a `note` naming `read_file_raw` |
+| `read_file_raw` (new, `Risk::Write`) | the verbatim content and its hash, after approval |
+| `git` (`diff`) | file headers and hunk ranges; every hunk line `+«redacted»` / `-«redacted»` / ` «redacted»`, and the text after a hunk range dropped |
+| `cora_search` | a hit naming a sensitive file keeps its path, every other text field becomes `«redacted»` |
+| `edit_file`, `write_file`, `delete_file` | never return file content (`edit_file` needs the hash, so editing a sensitive file needs `read_file_raw` first) |
+| `git status` | names only |
+| `run_command`, `job_start` / `job_poll` | a command's output is not filtered by path: any command can read any file. They are approval-gated, and `SecretSet` still redacts every known secret value on egress |
+| MCP tools, `web_fetch` | content from a server or URL, not workspace files |
+
+There is no separate search, grep or list tool: searching goes through
+`cora_search` (above) or a command.
+
+**How to approve a verbatim read.** Approve the `read_file_raw` call at the
+prompt, or start the session with `--allow read_file_raw` (in a mission,
+which has no prompt, that is the only way). It is a risk tier, not an
+environment switch: each verbatim read is an approved, logged tool call.
+
+**`tole doctor`** prints the secrets report, names only and never values:
+each secret-named variable that is set and the tools its release lets
+receive it (`!` when that includes `run_command`, `job_start` or `cron`),
+what the children of model commands receive, what a child session
+receives, and how to approve a verbatim read.

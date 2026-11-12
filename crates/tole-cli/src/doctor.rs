@@ -357,6 +357,82 @@ fn tools_check(cfg: &OpenAiConfig, out: &mut Outcome) -> bool {
 
 /// `scheme://host[:port]/path` only: userinfo, query and fragment can carry
 /// credentials and never belong in output or on disk.
+/// The consumers whose children are model-driven commands (#598).
+const COMMAND_CONSUMERS: [&str; 3] = ["run_command", "job_start", "cron"];
+
+/// `tole doctor`'s secrets report (#598 part b), NAMES only, never values:
+/// each secret set in `env` and the tools the release lets receive it, what
+/// reaches the children of model commands and of a child session, and how
+/// to approve a verbatim read of a sensitive file.
+pub fn secrets_lines(
+    env: &[(String, String)],
+    release: &tole_core::secret_release::Release,
+) -> Vec<String> {
+    let mut names: Vec<&str> = env
+        .iter()
+        .filter(|(k, v)| tole_core::secrets::is_secret_name(k) && !v.trim().is_empty())
+        .map(|(k, _)| k.as_str())
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    let mut out = vec!["secrets (names only):".to_string()];
+    if names.is_empty() {
+        out.push("  - no secret-named variable is set".into());
+    }
+    let mut to_commands = Vec::new();
+    let mut to_children = Vec::new();
+    for n in &names {
+        let tools: Vec<&str> = release
+            .tools(n)
+            .map(|t| t.iter().map(String::as_str).collect())
+            .unwrap_or_default();
+        if tools.is_empty() {
+            out.push(format!(
+                "  - {n}: no tool (scrubbed from every child process)"
+            ));
+            continue;
+        }
+        to_children.push(*n);
+        let risky = tools.iter().any(|t| COMMAND_CONSUMERS.contains(t));
+        if risky {
+            to_commands.push(*n);
+        }
+        out.push(format!(
+            "  {} {n}: {}{}",
+            if risky { "!" } else { "-" },
+            tools.join(", "),
+            if risky {
+                " (every command the model runs can read it)"
+            } else {
+                ""
+            }
+        ));
+    }
+    out.push(format!(
+        "  {} children of run_command, job_start and cron receive: {}",
+        if to_commands.is_empty() { "✓" } else { "!" },
+        if to_commands.is_empty() {
+            "no secret".to_string()
+        } else {
+            to_commands.join(", ")
+        }
+    ));
+    out.push(format!(
+        "  - a child session (agent_start, delegate) receives its provider keys and: {}",
+        if to_children.is_empty() {
+            "nothing else".to_string()
+        } else {
+            to_children.join(", ")
+        }
+    ));
+    out.push(
+        "  - sensitive files (.env*, *.pem, id_*, .npmrc, .netrc, *.key) read as KEY=«redacted»; \
+         to read one verbatim, approve its read_file_raw call (or start with --allow read_file_raw)"
+            .into(),
+    );
+    out
+}
+
 pub fn redact_url(url: &str) -> String {
     let (scheme, rest) = match url.split_once("://") {
         Some((s, r)) => (format!("{s}://"), r),
@@ -746,6 +822,11 @@ pub fn run_cli(
     ) {
         println!("{l}");
     }
+    // Secrets (#598): names and the tools that may receive them, never values.
+    let env: Vec<(String, String)> = std::env::vars().collect();
+    for l in secrets_lines(&env, &tole_core::secret_release::release()) {
+        println!("{l}");
+    }
     // Scheduler (#579, P5): a stale ticker while jobs are active fails.
     #[cfg(feature = "shell-tools")]
     let ok = {
@@ -1115,6 +1196,51 @@ mod tests {
         std::fs::write(&path, "{not json").unwrap();
         assert!(Ledger::load(&path).unwrap_err().contains("corrupt"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_secrets_report_names_secrets_and_their_tools_never_values() {
+        let env: Vec<(String, String)> = [
+            ("GITHUB_TOKEN", "ghp-value-0001"),
+            ("NPM_TOKEN", "npm-value-0002"),
+            ("AWS_SECRET_ACCESS_KEY", "aws-value-0003"),
+            ("PATH", "/usr/bin"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let release = tole_core::secret_release::Release::default()
+            .with("NPM_TOKEN", ["run_command".to_string()]);
+        let text = secrets_lines(&env, &release).join("\n");
+        for v in ["ghp-value", "npm-value", "aws-value"] {
+            assert!(!text.contains(v), "a value leaked: {text}");
+        }
+        assert!(
+            text.contains("- GITHUB_TOKEN: gh, git, hook, mcp"),
+            "{text}"
+        );
+        assert!(
+            text.contains("! NPM_TOKEN: run_command (every command"),
+            "{text}"
+        );
+        assert!(text.contains("AWS_SECRET_ACCESS_KEY: no tool"), "{text}");
+        assert!(
+            text.contains("! children of run_command, job_start and cron receive: NPM_TOKEN"),
+            "{text}"
+        );
+        assert!(
+            text.contains("receives its provider keys and: GITHUB_TOKEN, NPM_TOKEN"),
+            "{text}"
+        );
+        assert!(text.contains("read_file_raw"), "{text}");
+        assert!(!text.contains("PATH"), "{text}");
+        // The defaults: nothing reaches a model command.
+        let text =
+            secrets_lines(&env[..1], &tole_core::secret_release::Release::default()).join("\n");
+        assert!(
+            text.contains("✓ children of run_command, job_start and cron receive: no secret"),
+            "{text}"
+        );
     }
 
     #[test]
