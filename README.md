@@ -78,8 +78,10 @@ tole is the agent harness of the CodeCora ecosystem — the hands:
   its full tool list once and asks, and the approval pins a hash of its tool
   names, descriptions and schemas in `$CODECORA_HOME/tole/plugins.lock`. A
   server whose tools change later, or that you never approved, is not
-  registered (missions, cron and `serve` never ask); `tole doctor` shows the
-  state. Servers that
+  registered (missions, cron and `serve` never ask; approve once interactively,
+  or give cron and CI a user lock ahead of time, see the migration note in
+  [docs/third-party-plugins-design.md §8](docs/third-party-plugins-design.md));
+  `tole doctor` shows the state. Servers that
   offer prompts show up in `tole chat` as `/mcp:<server>:<prompt> [k=v ...]`
   (rendered server-side, sent as your next message); servers that offer
   resources add a ReadOnly `mcp_read` tool. Servers with neither add nothing.
