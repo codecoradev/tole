@@ -992,6 +992,11 @@ impl<S: LedgerStore> Delegation<S> {
         self.state.live_in(goal)
     }
 
+    /// Every node, in id order.
+    pub fn nodes(&self) -> impl Iterator<Item = &Node> {
+        self.state.nodes.values()
+    }
+
     /// The node whose recorded session is `session` (the host stores the
     /// child's agent id there).
     pub fn by_session(&self, session: &str) -> Option<&Node> {

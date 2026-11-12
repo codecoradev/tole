@@ -183,6 +183,13 @@ pub fn build(approver: impl Approver + 'static, roster: Roster) -> Result<ToolRe
     if let Some(tool) = crate::handoff::tool_from_env(env) {
         add(&mut reg, Box::new(tool))?;
     }
+    // Delegated children (#585) hand in their one completion report.
+    if let Some(path) = tole_core::child_env::delegation_report(env) {
+        add(
+            &mut reg,
+            Box::new(tole_core::delegation_report::DelegateReportTool::new(path)),
+        )?;
+    }
     #[cfg(feature = "shell-tools")]
     {
         use tole_core::jobs::JobStartTool;

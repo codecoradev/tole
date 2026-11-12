@@ -28,8 +28,13 @@
 //!   ([`log_path`]), outside every workspace; children get its absolute path.
 //!
 //! `agent_start` / `agent_poll` stay for one release as aliases of
-//! `delegate` / `delegate_poll`. Part b of #585 adds the completion report;
-//! until then an `ok` child settles `incomplete` ("no completion report").
+//! `delegate` / `delegate_poll`.
+//!
+//! A child that ended is settled by the PARENT ([`settle_finished`]): its
+//! measured usage (its whole carve when unreadable) and the completion report
+//! it handed in with `delegate_report`, read from its plain agent dir with
+//! the caps of `tole_core::delegation_report`. `done` needs a complete
+//! report; otherwise `incomplete` with the reasons.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -38,10 +43,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tole_core::agents::{AgentPollTool, AgentStartTool, ChildOpts};
 use tole_core::delegation::{
-    Budget, BudgetRequest, DelegateRequest, Delegation, Goal, Mode, Outcome, Spend,
+    Budget, BudgetRequest, DelegateRequest, Delegation, Goal, Mode, Node, Outcome, Spend,
     DEFAULT_MAX_DEPTH, DEFAULT_MAX_LIVE_PROCESSES,
 };
-use tole_core::storage::Storage as _;
 use tole_core::tool::{Risk, Tool};
 
 use crate::config::Config;
@@ -136,27 +140,59 @@ fn now() -> i64 {
         .map_or(0, |d| d.as_secs() as i64)
 }
 
+/// Largest total of session files the parent reads to measure a child.
+pub const MAX_MEASURED_BYTES: u64 = 256 * 1024 * 1024;
+
 /// A node's measured own usage: its agent dir's session usage records.
-/// `None` when no session file can be read (the caller charges the carve).
+/// `None` when they cannot be read safely (the caller charges the carve):
+/// a session entry that is not a regular file (a symlink, a device) or
+/// session files larger than [`MAX_MEASURED_BYTES`] together; the child
+/// can write its own agent dir, so sizes are checked before any read.
 pub fn measured(agent_dir: &Path) -> Option<Spend> {
     let mut found = false;
     let mut s = Spend::default();
-    for e in std::fs::read_dir(agent_dir.join("sessions")).ok()? {
+    let mut total: u64 = 0;
+    let sessions = agent_dir.join("sessions");
+    if !std::fs::symlink_metadata(&sessions).ok()?.is_dir() {
+        return None;
+    }
+    for e in std::fs::read_dir(&sessions).ok()? {
         let p = e.ok()?.path();
         if p.extension().is_none_or(|x| x != "jsonl") {
             continue;
         }
-        let st = tole_core::storage::JsonlStorage::open_read_only(&p).ok()?;
+        let meta = std::fs::symlink_metadata(&p).ok()?;
+        total = total.saturating_add(meta.len());
+        if !meta.is_file() || total > MAX_MEASURED_BYTES {
+            return None;
+        }
+        // Opened without blocking or following a link, and checked again
+        // on the open file: the child may swap the entry after the stat.
+        let bytes = tole_core::delegation_report::read_plain_file(&p, MAX_MEASURED_BYTES)
+            .ok()
+            .flatten()?;
+        let usages = usage_records(&bytes);
         s.tokens = s
             .tokens
-            .saturating_add(tole_core::transcript::tokens_in_out(st.usages()));
-        let steps = tole_core::transcript::provider_steps(st.usages());
+            .saturating_add(tole_core::transcript::tokens_in_out(&usages));
+        let steps = tole_core::transcript::provider_steps(&usages);
         s.steps = s
             .steps
             .saturating_add(u32::try_from(steps).unwrap_or(u32::MAX));
         found = true;
     }
     found.then_some(s)
+}
+
+/// The usage rows of a session file's bytes (`{"kind":"usage",...}` lines);
+/// any other or malformed line is skipped.
+fn usage_records(bytes: &[u8]) -> Vec<tole_core::storage::UsageRecord> {
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|v| v.get("kind").and_then(Value::as_str) == Some("usage"))
+        .filter_map(|v| serde_json::from_value(v).ok())
+        .collect()
 }
 
 /// Secret-named variables this process holds: its grant to pass down.
@@ -283,9 +319,19 @@ impl Delegator {
         Ok(id)
     }
 
-    /// Settles children whose process is gone, charging measured usage or
-    /// the whole carve.
+    /// Settles every running child whose process is gone as a finished run
+    /// ([`settle_finished`]), then lets the tree cancel queued children of
+    /// settled parents.
     fn recover(d: &mut Delegation<FileStore>) -> Result<(), String> {
+        let gone: Vec<Node> = d
+            .nodes()
+            .filter(|n| n.status == tole_core::delegation::NodeStatus::Running)
+            .filter(|n| n.lease.is_some_and(|l| !lease_alive(&l)))
+            .cloned()
+            .collect();
+        for n in &gone {
+            settle_finished(d, n)?;
+        }
         d.recover(now(), lease_alive, |n| {
             n.session.as_deref().map(Path::new).and_then(measured)
         })
@@ -554,13 +600,10 @@ impl Delegator {
                 Self::recover(d)?;
                 return Ok(None);
             };
-            // The polled child ended as a run (settled here, before
-            // recovery would call its exited process `interrupted`); then
-            // every other child whose process is gone is recovered.
+            // The polled child is settled with its report and usage, then
+            // every other child whose process is gone the same way.
             if !n.status.is_terminal() {
-                let used = measured(&dir).unwrap_or_else(|| Spend::all_of(n.budget));
-                d.settle(&n.id, Outcome::Ok, used, None, None, now())
-                    .map_err(|e| e.to_string())?;
+                settle_finished(d, &n)?;
             }
             Self::recover(d)?;
             let started: Vec<String> = self
@@ -572,6 +615,7 @@ impl Delegator {
             Ok(Some(json!({
                 "node": n.id, "status": n.status, "reason": n.reason,
                 "used": n.used.map(|u| json!({"tokens": u.tokens, "steps": u.steps})),
+                "report": n.report.as_ref().map(tole_core::delegation_report::fenced),
                 "started_from_queue": started,
             })))
         })?;
@@ -580,6 +624,46 @@ impl Delegator {
         }
         Ok(out)
     }
+}
+
+/// Is `dir` a plain directory at its canonical path (no symlink anywhere in
+/// it)? The parent reads a child's report and usage only through such a
+/// path, so a child cannot point them at another file.
+fn plain_dir(dir: &Path) -> bool {
+    dir.canonicalize().is_ok_and(|c| c == dir)
+        && std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir())
+}
+
+/// Settles a child that has ended as a run: charged its measured session
+/// usage (its whole carve when that cannot be read), with the report the
+/// PARENT reads from the child's agent dir (capped, cleaned, never through
+/// a symlink). The tree makes it `done` only with a complete report, else
+/// `incomplete` with the reasons.
+fn settle_finished(d: &mut Delegation<FileStore>, n: &Node) -> Result<(), String> {
+    let dir = n
+        .session
+        .as_deref()
+        .map(PathBuf::from)
+        .filter(|p| plain_dir(p));
+    let (report, why) = match &dir {
+        None => (
+            None,
+            Some("its agent dir is missing or not a plain directory".to_string()),
+        ),
+        Some(dir) => match tole_core::delegation_report::read(
+            &dir.join(tole_core::delegation_report::REPORT_FILE),
+        ) {
+            Ok(r) => (r, None),
+            Err(e) => (None, Some(format!("report refused: {e}"))),
+        },
+    };
+    let used = dir
+        .as_deref()
+        .and_then(measured)
+        .unwrap_or_else(|| Spend::all_of(n.budget));
+    d.settle(&n.id, Outcome::Ok, used, report, why.as_deref(), now())
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 /// The live lease that blocks a new writer in `workspace` (canonical), as
