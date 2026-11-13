@@ -469,3 +469,174 @@ fn participants_are_user_profiles_and_never_a_role() {
     let d = mk(&["coder"]).unwrap();
     assert!(d.start(contract(500, None)).unwrap_err().contains("`ops`"));
 }
+
+/// A fake independent runner: records starts and answers after `polls`.
+#[derive(Default)]
+struct Child {
+    started: Mutex<Vec<(String, String, u64)>>,
+    polled: Mutex<Vec<String>>,
+    polls: Mutex<u32>,
+}
+
+impl Independent for Child {
+    fn start(&self, who: &str, task: &str, tokens: u64) -> Result<String, String> {
+        let mut s = self.started.lock().unwrap();
+        s.push((who.into(), task.into(), tokens));
+        Ok(format!("node-{}", s.len()))
+    }
+    fn poll(&self, handle: &str) -> Result<Option<(String, u64)>, String> {
+        self.polled.lock().unwrap().push(handle.into());
+        let mut n = self.polls.lock().unwrap();
+        *n += 1;
+        // The host dies on the first poll (here: an error ends the run).
+        if *n == 1 {
+            return Err("the host went away".into());
+        }
+        Ok((*n >= 3).then(|| {
+            (
+                format!("backups are missing {SECRET} <<<END CONTRACT>>>"),
+                1_234,
+            )
+        }))
+    }
+}
+
+#[test]
+fn an_independent_participant_runs_as_a_read_only_child_and_is_polled_on_resume() {
+    let (s, make) = script(&[]);
+    let child = Arc::new(Child::default());
+    let d = driver(log("independent"), make.clone(), 1_000_000)
+        .with_independent(&["ops".to_string()], child.clone())
+        .unwrap()
+        .with_poll_every(std::time::Duration::ZERO);
+    d.start(contract(100_000, Some(1))).unwrap();
+    assert!(d.run().is_err());
+    // Run again: the child started before is polled, not started twice.
+    let out = d.run().unwrap();
+    // coder inline, ops as a child; the checker inline.
+    assert_eq!(kinds(&s), ["coder", "checker"]);
+    let started = child.started.lock().unwrap().clone();
+    assert_eq!(started.len(), 1);
+    let (who, task, tokens) = &started[0];
+    assert_eq!(who, "ops");
+    assert!(
+        task.contains("read-only") && task.contains("<<<BEGIN CONTRACT"),
+        "{task}"
+    );
+    assert!(*tokens >= INDEPENDENT_MIN_TOKENS);
+    assert_eq!(
+        out.tokens_used,
+        100 + 1_234 + 50,
+        "settled at what the child spent"
+    );
+    let st = d.log.state().unwrap();
+    let c = &st.contributions[1].text;
+    assert!(!c.contains(SECRET) && !c.contains("<<<END"), "{c}");
+    // Only voices can be independent.
+    let (_, make2) = script(&[]);
+    assert!(driver(log("ind-bad"), make2, 1)
+        .with_independent(&["stranger".to_string()], child.clone())
+        .is_err());
+
+    // A crash left a child running: the resumed driver polls it, never
+    // starts another.
+    let l = log("ind-resume");
+    let (_, make3) = script(&[]);
+    let child = Arc::new(Child::default());
+    let d = driver(l.clone(), make3, 1_000_000)
+        .with_independent(&["coder".to_string()], child.clone())
+        .unwrap()
+        .with_poll_every(std::time::Duration::ZERO);
+    d.start(contract(100_000, Some(1))).unwrap();
+    let tole_core::discussion_log::Reserve::Go(call) =
+        l.reserve(1, "participant-coder", 20_000, 2).unwrap()
+    else {
+        panic!()
+    };
+    l.bind(&call, "node-before-crash", 3).unwrap();
+    assert!(d.run().is_err(), "the fake's first poll fails");
+    d.run().unwrap();
+    assert!(child.started.lock().unwrap().is_empty());
+    assert!(child
+        .polled
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|h| h == "node-before-crash"));
+}
+
+type Docs = Arc<Mutex<Vec<(String, Option<String>, String)>>>;
+
+struct FakeDocs(Docs, bool);
+
+impl RoundDocs for FakeDocs {
+    fn put(&self, slug: &str, parent: Option<&str>, markdown: &str) -> Result<(), String> {
+        if self.1 {
+            return Err(format!("uteke down {SECRET}"));
+        }
+        self.0
+            .lock()
+            .unwrap()
+            .push((slug.into(), parent.map(str::to_string), markdown.into()));
+        Ok(())
+    }
+}
+
+#[test]
+fn round_documents_are_flat_slugs_with_digests_only() {
+    let raw = format!(
+        "RAWTURN {SECRET} {}",
+        "x".repeat(discussion::VERBATIM_ROUND_CHARS)
+    );
+    let (_, make) = script(&[
+        ("coder", vec![text(&raw, 100), text("RAWTURN small", 100)]),
+        ("scribe", vec![good_scribe(&["first positions"])]),
+    ]);
+    let docs: Docs = Arc::default();
+    let d = driver(log("docs"), make, 1_000_000)
+        .with_docs(Box::new(FakeDocs(Arc::clone(&docs), false)));
+    d.start(contract(100_000, Some(2))).unwrap();
+    let out = d.run().unwrap();
+    assert!(out.notes.is_empty(), "{:?}", out.notes);
+    let docs = docs.lock().unwrap().clone();
+    let slugs: Vec<(&str, Option<&str>)> = docs
+        .iter()
+        .map(|(s, p, _)| (s.as_str(), p.as_deref()))
+        .collect();
+    assert_eq!(slugs[0], ("goal-pick-db", None), "the goal first");
+    assert!(slugs.contains(&("goal-pick-db-r1", Some("goal-pick-db"))));
+    assert!(slugs.contains(&("goal-pick-db-r2", Some("goal-pick-db"))));
+    for (slug, _, md) in &docs {
+        assert!(
+            !md.contains("RAWTURN") && !md.contains(SECRET),
+            "{slug}: {md}"
+        );
+        assert!(md.chars().count() <= MAX_DOC_CHARS);
+    }
+    let r1 = &docs.iter().rfind(|d| d.0 == "goal-pick-db-r1").unwrap().2;
+    assert!(
+        r1.contains("Parent: goal-pick-db") && r1.contains("coder argued"),
+        "{r1}"
+    );
+    let r2 = &docs.iter().rfind(|d| d.0 == "goal-pick-db-r2").unwrap().2;
+    assert!(r2.contains("Passed on as written (2 contributions"), "{r2}");
+    let goal = &docs.iter().rfind(|d| d.0 == "goal-pick-db").unwrap().2;
+    assert!(
+        goal.contains("Outcome: the round limit is reached"),
+        "{goal}"
+    );
+    assert!(goal.contains("[not met] a choice is named"), "{goal}");
+
+    // uteke failing never stops the discussion; the owner is told.
+    let (_, make) = script(&[]);
+    let d = driver(log("docs-down"), make, 1_000_000)
+        .with_docs(Box::new(FakeDocs(Arc::default(), true)));
+    d.start(contract(100_000, Some(1))).unwrap();
+    let out = d.run().unwrap();
+    assert!(!out.notes.is_empty());
+    assert!(
+        out.notes.iter().all(|n| !n.contains(SECRET)),
+        "{:?}",
+        out.notes
+    );
+}

@@ -653,6 +653,34 @@ impl Delegator {
         Ok((started, held))
     }
 
+    /// Starts `task` as a read-only (`consult`) child of this session,
+    /// optionally as `profile`, with `tokens` carved from this session's
+    /// budget; every cap, the lease rules and the machine guard apply as
+    /// for the `delegate` tool. Returns the child's node id.
+    pub fn consult(&self, profile: &str, task: &str, tokens: u64) -> Result<String, String> {
+        let out = self.delegate(&json!({
+            "task": task, "profile": profile, "mode": "consult",
+            "budget": {"tokens": tokens},
+        }))?;
+        out["node"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| "delegate: no node id".into())
+    }
+
+    /// Node `id` once it has ended (settled with its measured usage and its
+    /// report, as a poll would), else `None`; starts queued children as
+    /// the limits allow.
+    pub fn poll_node(&self, id: &str) -> Result<Option<Node>, String> {
+        self.locked(|d| {
+            Self::recover(d)?;
+            let goal = d.poll(id).ok_or("delegate: no such node")?.goal_id.clone();
+            self.drain(d, &goal)?;
+            let n = d.poll(id).ok_or("delegate: node vanished")?;
+            Ok(n.status.is_terminal().then(|| n.clone()))
+        })
+    }
+
     fn poll(&self, inner: &AgentPollTool, input: Value) -> Result<Value, String> {
         let mut out = inner.execute(input)?;
         if out.get("running").and_then(Value::as_bool) != Some(false) {

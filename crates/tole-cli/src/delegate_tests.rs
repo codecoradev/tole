@@ -1132,3 +1132,54 @@ fn fifos_planted_in_the_agent_dir_never_block_the_parent() {
     assert!(again.is_ok(), "{again:?}");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// An independent discussion participant (#588) is a read-only child of the
+/// delegation tree, carved and settled like any other.
+#[test]
+fn an_independent_participant_is_a_consult_child_settled_with_its_report() {
+    use crate::discussion_host::{DelegateIndependent, Independent};
+    let root = tmp("independent");
+    let bin = fake_reporter(
+        &root,
+        "critic-bin",
+        r#"{"summary":"the plan misses backups","risks":["data loss"]}"#,
+    );
+    let h = std::sync::Arc::new(
+        Delegator::for_session(
+            bin,
+            root.clone(),
+            false,
+            vec!["write_*".into()],
+            setup("[delegation]\ngoal_budget = 100000\ngoal_steps = 100\n[profiles.critic]\n"),
+            &|_| None,
+        )
+        .unwrap(),
+    );
+    let ind = DelegateIndependent(h.clone());
+    let node = ind.start("critic", "review the plan", 20_000).unwrap();
+    let n = log_of(&root).poll(&node).cloned().unwrap();
+    assert_eq!(
+        (n.mode, n.profile.as_deref(), n.budget.tokens),
+        (Mode::Consult, Some("critic"), 20_000),
+        "read-only, as the profile, with the carve"
+    );
+    assert!(n.allow.is_empty(), "a profile without allow gets none");
+    let mut got = None;
+    for _ in 0..200 {
+        if let Some(r) = ind.poll(&node).unwrap() {
+            got = Some(r);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    let (text, spent) = got.expect("the child never ended");
+    assert!(
+        text.contains("the plan misses backups") && text.contains("Risks: data loss"),
+        "{text}"
+    );
+    // No readable session usage: charged its whole carve.
+    assert_eq!(spent, 20_000);
+    assert_eq!(log_of(&root).poll(&node).unwrap().status, NodeStatus::Done);
+    assert!(ind.start("stranger", "x", 10).is_err(), "profiles only");
+    let _ = std::fs::remove_dir_all(&root);
+}
