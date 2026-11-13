@@ -114,8 +114,13 @@ pub struct Outcome {
 /// A participant that runs as its own read-only process, offered only for
 /// review and critique (independent thinking), never for work.
 pub trait Independent: Send + Sync {
-    /// Starts `who` on `task`, read-only, within `tokens`; its handle.
-    fn start(&self, who: &str, task: &str, tokens: u64) -> Result<String, String>;
+    /// Starts `who` on `task`, read-only, within `tokens`, tagged with
+    /// `key` (the reserved call); its handle.
+    fn start(&self, who: &str, task: &str, tokens: u64, key: &str) -> Result<String, String>;
+    /// The handle of a child started with `key`, if one was: what a resumed
+    /// driver finds of a start a crash interrupted before its handle was
+    /// recorded.
+    fn find(&self, key: &str) -> Result<Option<String>, String>;
     /// `None` while it runs; once ended, its contribution and what it spent.
     fn poll(&self, handle: &str) -> Result<Option<(String, u64)>, String>;
 }
@@ -127,8 +132,12 @@ pub trait Independent: Send + Sync {
 pub struct DelegateIndependent(pub Arc<crate::delegate::Delegator>);
 
 impl Independent for DelegateIndependent {
-    fn start(&self, who: &str, task: &str, tokens: u64) -> Result<String, String> {
-        self.0.consult(who, task, tokens)
+    fn start(&self, who: &str, task: &str, tokens: u64, key: &str) -> Result<String, String> {
+        self.0
+            .consult(who, &format!("{}\n\n{task}", call_marker(key)), tokens)
+    }
+    fn find(&self, key: &str) -> Result<Option<String>, String> {
+        self.0.find_child(&call_marker(key))
     }
     fn poll(&self, handle: &str) -> Result<Option<(String, u64)>, String> {
         let Some(n) = self.0.poll_node(handle)? else {
@@ -150,6 +159,12 @@ impl Independent for DelegateIndependent {
         };
         Ok(Some((text, spent)))
     }
+}
+
+/// The first line of an independent child's task: which reserved call
+/// started it, so a resumed driver can find it.
+fn call_marker(key: &str) -> String {
+    format!("[tole discussion call {key}]")
 }
 
 /// Least tokens carved for an independent participant (a child mission
@@ -410,9 +425,12 @@ impl Driver {
         })
     }
 
-    /// An independent participant's turn: started once (its handle bound to
-    /// the reserved call), then polled until it ends; a resumed driver
-    /// polls the child a crash left running instead of starting another.
+    /// An independent participant's turn, started at most once: the
+    /// reservation is written to the ledger BEFORE the child starts (the
+    /// intent), the child is tagged with that call, and its handle is bound
+    /// after. A resumed driver polls a bound child; for an unbound intent it
+    /// first looks for a child tagged with the call and starts one only when
+    /// there is none, under the same reservation.
     fn independent_turn(
         &self,
         st: &State,
@@ -422,15 +440,31 @@ impl Driver {
         runner: &dyn Independent,
     ) -> Result<Option<String>, String> {
         let what = format!("participant-{who}");
+        let id = st.contract.as_ref().map_or("", |c| c.id.as_str());
         let (call, handle) = match st.open_call(round, &what) {
             Some((call, Some(handle))) => (call, handle),
-            _ => {
+            open => {
                 let task = format!("{}\n\n{}\n\n{INDEPENDENT_NOTE}", req[0].1, req[1].1);
-                let need = (task.len() as u64 / 4).max(INDEPENDENT_MIN_TOKENS);
-                let Some(call) = self.admit(round, &what, need)? else {
-                    return Ok(None);
+                let (call, need) = match open {
+                    Some((call, None)) => {
+                        let need = st.reservations.get(&call).map_or(0, |r| r.tokens);
+                        (call, need)
+                    }
+                    _ => {
+                        let need = (task.len() as u64 / 4).max(INDEPENDENT_MIN_TOKENS);
+                        let Some(call) = self.admit(round, &what, need)? else {
+                            return Ok(None);
+                        };
+                        (call, need)
+                    }
                 };
-                let handle = runner.start(who, &task, need).map_err(|e| {
+                let key = format!("{id}-{call}");
+                let found = runner.find(&key)?;
+                let handle = match found {
+                    Some(h) => Ok(h),
+                    None => runner.start(who, &task, need, &key),
+                }
+                .map_err(|e| {
                     format!(
                         "{who}'s turn in round {round}: {}",
                         discussion::sanitize(&e, &self.secrets, 300).text

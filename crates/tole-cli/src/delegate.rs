@@ -668,6 +668,32 @@ impl Delegator {
             .ok_or_else(|| "delegate: no node id".into())
     }
 
+    /// The newest child of this session whose task starts with `marker`:
+    /// in a delegated child, a direct child of its own node; at the root
+    /// (whose goal is new in every process), a direct child of any goal of
+    /// this workspace's log. A child's own children (depth 2 and below) are
+    /// never searched, so a child cannot plant a match.
+    pub fn find_child(&self, marker: &str) -> Result<Option<String>, String> {
+        let me = self.node.lock().map_err(|_| "delegate: poisoned")?.clone();
+        if self.child && me.is_none() {
+            return Ok(None);
+        }
+        self.locked(|d| {
+            let mine = |n: &Node| match (&me, self.child) {
+                (Some(me), true) => n.parent.as_deref() == Some(me.as_str()),
+                _ => n
+                    .parent
+                    .as_deref()
+                    .and_then(|p| d.poll(p))
+                    .is_some_and(|p| p.parent.is_none()),
+            };
+            Ok(d.nodes()
+                .filter(|n| mine(n) && n.task.starts_with(marker))
+                .max_by_key(|n| n.seq)
+                .map(|n| n.id.clone()))
+        })
+    }
+
     /// Node `id` once it has ended (settled with its measured usage and its
     /// report, as a poll would), else `None`; starts queued children as
     /// the limits allow.

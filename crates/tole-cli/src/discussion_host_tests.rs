@@ -476,13 +476,25 @@ struct Child {
     started: Mutex<Vec<(String, String, u64)>>,
     polled: Mutex<Vec<String>>,
     polls: Mutex<u32>,
+    keys: Mutex<Vec<(String, String)>>,
 }
 
 impl Independent for Child {
-    fn start(&self, who: &str, task: &str, tokens: u64) -> Result<String, String> {
+    fn start(&self, who: &str, task: &str, tokens: u64, key: &str) -> Result<String, String> {
         let mut s = self.started.lock().unwrap();
         s.push((who.into(), task.into(), tokens));
-        Ok(format!("node-{}", s.len()))
+        let node = format!("node-{}", s.len());
+        self.keys.lock().unwrap().push((key.into(), node.clone()));
+        Ok(node)
+    }
+    fn find(&self, key: &str) -> Result<Option<String>, String> {
+        Ok(self
+            .keys
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, n)| n.clone()))
     }
     fn poll(&self, handle: &str) -> Result<Option<(String, u64)>, String> {
         self.polled.lock().unwrap().push(handle.into());
@@ -563,6 +575,65 @@ fn an_independent_participant_runs_as_a_read_only_child_and_is_polled_on_resume(
         .unwrap()
         .iter()
         .all(|h| h == "node-before-crash"));
+
+    // A crash between the child's start and the bind of its handle: the
+    // intent (the reservation) is in the ledger, the child is found by its
+    // call, bound and polled; no second child, no second reservation.
+    let l = log("ind-unbound");
+    let (_, make4) = script(&[]);
+    let child = Arc::new(Child::default());
+    let d = driver(l.clone(), make4, 1_000_000)
+        .with_independent(&["coder".to_string()], child.clone())
+        .unwrap()
+        .with_poll_every(std::time::Duration::ZERO);
+    d.start(contract(100_000, Some(1))).unwrap();
+    let tole_core::discussion_log::Reserve::Go(call) =
+        l.reserve(1, "participant-coder", 20_000, 2).unwrap()
+    else {
+        panic!()
+    };
+    let key = format!("pick-db-{call}");
+    let before = child.start("coder", "task", 20_000, &key).unwrap();
+    assert!(d.run().is_err(), "the fake's first poll fails");
+    let out = d.run().unwrap();
+    assert_eq!(
+        child.started.lock().unwrap().len(),
+        1,
+        "never started twice"
+    );
+    assert!(child.polled.lock().unwrap().iter().all(|h| *h == before));
+    assert_eq!(
+        l.state()
+            .unwrap()
+            .reservations
+            .values()
+            .filter(|r| r.what == "participant-coder")
+            .count(),
+        1
+    );
+    assert_eq!(out.tokens_used, 1_234 + 100 + 50);
+    // An intent with no child behind it starts one, under the same call.
+    let l = log("ind-intent");
+    let (_, make5) = script(&[]);
+    let child = Arc::new(Child::default());
+    let d = driver(l.clone(), make5, 1_000_000)
+        .with_independent(&["coder".to_string()], child.clone())
+        .unwrap()
+        .with_poll_every(std::time::Duration::ZERO);
+    d.start(contract(100_000, Some(1))).unwrap();
+    l.reserve(1, "participant-coder", 20_000, 2).unwrap();
+    assert!(d.run().is_err());
+    d.run().unwrap();
+    assert_eq!(child.started.lock().unwrap().len(), 1);
+    assert_eq!(
+        l.state()
+            .unwrap()
+            .reservations
+            .values()
+            .filter(|r| r.what == "participant-coder")
+            .count(),
+        1
+    );
 }
 
 type Docs = Arc<Mutex<Vec<(String, Option<String>, String)>>>;

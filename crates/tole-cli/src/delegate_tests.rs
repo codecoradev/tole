@@ -1144,19 +1144,31 @@ fn an_independent_participant_is_a_consult_child_settled_with_its_report() {
         "critic-bin",
         r#"{"summary":"the plan misses backups","risks":["data loss"]}"#,
     );
-    let h = std::sync::Arc::new(
-        Delegator::for_session(
-            bin,
-            root.clone(),
-            false,
-            vec!["write_*".into()],
-            setup("[delegation]\ngoal_budget = 100000\ngoal_steps = 100\n[profiles.critic]\n"),
-            &|_| None,
+    let mk = || {
+        std::sync::Arc::new(
+            Delegator::for_session(
+                bin.clone(),
+                root.clone(),
+                false,
+                vec!["write_*".into()],
+                setup("[delegation]\ngoal_budget = 100000\ngoal_steps = 100\n[profiles.critic]\n"),
+                &|_| None,
+            )
+            .unwrap(),
         )
-        .unwrap(),
+    };
+    let ind = DelegateIndependent(mk());
+    assert_eq!(ind.find("pick-db-c7").unwrap(), None);
+    let node = ind
+        .start("critic", "review the plan", 20_000, "pick-db-c7")
+        .unwrap();
+    // A restarted host (a new root goal) finds it by its call.
+    let again = DelegateIndependent(mk());
+    assert_eq!(
+        again.find("pick-db-c7").unwrap().as_deref(),
+        Some(node.as_str())
     );
-    let ind = DelegateIndependent(h.clone());
-    let node = ind.start("critic", "review the plan", 20_000).unwrap();
+    assert_eq!(again.find("pick-db-c8").unwrap(), None);
     let n = log_of(&root).poll(&node).cloned().unwrap();
     assert_eq!(
         (n.mode, n.profile.as_deref(), n.budget.tokens),
@@ -1180,6 +1192,9 @@ fn an_independent_participant_is_a_consult_child_settled_with_its_report() {
     // No readable session usage: charged its whole carve.
     assert_eq!(spent, 20_000);
     assert_eq!(log_of(&root).poll(&node).unwrap().status, NodeStatus::Done);
-    assert!(ind.start("stranger", "x", 10).is_err(), "profiles only");
+    assert!(
+        ind.start("stranger", "x", 10, "k").is_err(),
+        "profiles only"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
