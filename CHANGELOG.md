@@ -48,6 +48,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Missions now learn about cora's agent-as-reviewer flow (#536): `tole mission` builds its registry like `run` (including the auto-attached `mcp_cora_*` tools) but its pinned system prompt never named the review tools, so the unattended command was the one that did not know the flow existed. When both `mcp_cora_cora_review_prepare` and `mcp_cora_cora_review_finalize` are registered, a fresh mission's prompt now carries the same review section as `run` / `chat` / the TUI plus one sentence asking for a review (and its verdict in the final message) before the mission ends; without the tools nothing is added. Guidance only: a gate before `git commit` is tracked separately. `serve`, `acp` and `mcp` sessions are unchanged on purpose: they attach no external MCP servers, so they have no review tools. Resumed missions keep their pinned prompt.
 
 ### Added
+- `consult_advisor` in runs, part 2b of #587: a run whose profile declares `models.advisor` can consult that model on a hard decision.
+  - **Where:** `tole mission`, a delegated child (a mission, so only when its own profile declares an advisor) and cron agent runs. These are the faces with a token budget the advisor can share. `run`, `chat`, the TUI, `serve` and ACP have none, so the tool is not registered there; there is never an uncounted advisor. The tool is ReadOnly, so plan-mode runs keep it, under the same cap.
+  - **What it sees:** the task contract (the profile and the mission goal or job prompt), the executor's question, and the last 12 transcript entries. The entries come from an in-memory copy of what the turn loop sends the run's provider, never from a file. Everything is redacted, neutralized and capped (`tole_core::advisor::request`).
+  - **The call:** one request on the advisor model, on the run's provider connection with no fallback chain (a fallback would be another model). It sends no tools and does not stream.
+  - **What it returns:** only the parsed verdict (`plan`, `correction` or `stop`, plus capped text), fenced as advisory data, with the use number and tokens. An advisor that answers with a tool call gets an error, and nothing runs.
+  - **Budget:**
+    - The run's token budget is shared: the mission's provider, or the cron job's meter, charges each step, and the advisor charges its call.
+    - A consultation the budget cannot fit, or past `advisor_max_uses`, is refused before any call.
+    - What a call spent is counted even when it fails, and written to the session as a usage record with `"role": "advisor"`. A resumed mission and a cron job's reported tokens and daily cap therefore include it.
 - `consult_advisor` on the host side, part 2a of #587: the new module `tole_cli::advisor_host`. No run registers the tool yet; part 2b wires it into missions, delegated children and cron runs.
   - **`ConsultAdvisor`** (ReadOnly): one advisor call per consultation, with no tools, no streaming and no fallback chain.
     - The request is built from the task contract, the question and the window, redacted, neutralized and capped (`tole_core::advisor::request`).
