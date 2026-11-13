@@ -5,8 +5,9 @@
 //! - [`is_secret_name`] is the single name rule: the child-process env scrub
 //!   (ENV-1, `subprocess::scrub_env_for_child`) and [`SecretSet::collect`]
 //!   both use it, so "secret-shaped" cannot mean two things.
-//! - [`SecretSet::collect`] takes the values of secret-named env vars plus
-//!   values handed in explicitly (the provider key, `${NAME}` header
+//! - [`SecretSet::collect`] takes the values of secret-named env vars, the
+//!   password of any env value that is a URL with one, plus values handed in
+//!   explicitly (the provider key, `${NAME}` header
 //!   expansions, URL userinfo passwords). A value shorter than
 //!   [`MIN_SECRET_LEN`] characters is NOT collected (it would redact ordinary
 //!   words); its NAME is reported through [`SecretSet::skipped`] so a
@@ -57,26 +58,98 @@ pub const MIN_SECRET_LEN: usize = 8;
 
 /// Name substrings that make an env var secret-shaped (case-insensitive):
 /// `SECRET_KEY`, `AUTHTOKEN`, `DB_PASSWD` all match (#284).
-const SECRET_NAME_MARKERS: [&str; 8] = [
+const SECRET_NAME_MARKERS: [&str; 9] = [
     "API_KEY",
     "APIKEY",
     "SECRET",
     "TOKEN",
     "PASSWORD",
     "PASSWD",
+    "PASSPHRASE",
     "CREDENTIAL",
     "PRIVATE_KEY",
 ];
 
-/// Names the markers sweep up that are not secrets: a non-secret HF tuning
-/// knob that the broad `TOKEN` match would otherwise catch.
-const NOT_SECRET: [&str; 1] = ["TOKENIZERS_PARALLELISM"];
+/// Name endings that make an env var secret-shaped (#682): `DB_PASS`,
+/// `PGPASS`, `OPENAI_KEY`, `GH_HOOK_KEY`, `SENTRY_DSN`, `STRIPE_SK`,
+/// `SESSION_COOKIE`, `NPM_AUTH`, `AUTH_BEARER`, and the connection-string
+/// name `DATABASE_URL` (`TEST_DATABASE_URL` too).
+const SECRET_NAME_ENDINGS: [&str; 8] = [
+    "PASS",
+    "_KEY",
+    "_DSN",
+    "_SK",
+    "_COOKIE",
+    "_AUTH",
+    "_BEARER",
+    "DATABASE_URL",
+];
+
+/// Name beginnings that make an env var secret-shaped (#682): `AUTH_BEARER`,
+/// `AUTH_TOKEN`-style names whose first word is the credential kind.
+const SECRET_NAME_BEGINNINGS: [&str; 2] = ["AUTH_", "BEARER_"];
+
+/// Names the rules sweep up that are not secrets: a non-secret HF tuning
+/// knob that the broad `TOKEN` match would otherwise catch, the ssh-agent
+/// socket path (`SSH_AUTH_SOCK`, which the `git` tool needs), and the
+/// release-signing key FINGERPRINT that official language images export.
+const NOT_SECRET: [&str; 3] = ["TOKENIZERS_PARALLELISM", "SSH_AUTH_SOCK", "GPG_KEY"];
+
+/// Name endings that are never secrets although a rule above matches them:
+/// public keys, and `BYPASS` (a proxy or feature switch, not a password).
+const NOT_SECRET_ENDINGS: [&str; 4] = ["PUBLIC_KEY", "PUB_KEY", "PUBKEY", "BYPASS"];
 
 /// Whether an env var NAME is secret-shaped. The single name rule for the
-/// child-env scrub and for [`SecretSet::collect`].
+/// child-env scrub and for [`SecretSet::collect`]. A variable can also be a
+/// secret by its VALUE ([`is_secret_var`]).
 pub fn is_secret_name(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
-    SECRET_NAME_MARKERS.iter().any(|m| upper.contains(m)) && !NOT_SECRET.contains(&upper.as_str())
+    let shaped = SECRET_NAME_MARKERS.iter().any(|m| upper.contains(m))
+        || SECRET_NAME_ENDINGS.iter().any(|e| upper.ends_with(e))
+        || SECRET_NAME_BEGINNINGS.iter().any(|b| upper.starts_with(b));
+    shaped
+        && !NOT_SECRET.contains(&upper.as_str())
+        && !NOT_SECRET_ENDINGS.iter().any(|e| upper.ends_with(e))
+}
+
+/// Whether an environment variable holds a secret (#682), the rule of the
+/// child-env scrub: its name is secret-shaped ([`is_secret_name`]), its
+/// value carries a URL password (`postgres://user:pw@host`, whatever the
+/// variable is called), or its value is one `known` holds, a secret tole
+/// knows by role (a webhook key, the serve token, a `${NAME}` header
+/// expansion) under any name.
+///
+/// Proxy settings (`HTTPS_PROXY`, `https_proxy`, `ALL_PROXY`, any name
+/// ending in `_PROXY`) are not removed for their URL password: every
+/// network command behind an authenticated proxy needs them. The password
+/// is still redacted on egress ([`SecretSet::collect`]).
+pub fn is_secret_var(name: &str, value: &str, known: &SecretSet) -> bool {
+    let proxy = name.to_ascii_uppercase().ends_with("_PROXY");
+    is_secret_name(name) || (!proxy && url_password(value).is_some()) || known.holds(value)
+}
+
+/// Secrets this process holds by ROLE rather than by an env var name
+/// (#682): webhook keys, the serve token. [`add_role_secret`] records them.
+static ROLE: RwLock<Vec<(String, String)>> = RwLock::new(Vec::new());
+
+/// Records a secret the process holds by role, under `name` (an env var
+/// name or a label such as `hooks.gh`): it joins the process set
+/// ([`process_secrets`], so every egress sink redacts it, and the child
+/// scrub removes any variable holding it) and every set a host builds later
+/// from [`role_secrets`].
+pub fn add_role_secret(name: &str, value: &str) {
+    if let Ok(mut g) = ROLE.write() {
+        if g.iter().any(|(_, v)| v == value) {
+            return;
+        }
+        g.push((name.to_string(), value.to_string()));
+    }
+    set_process_secrets(process_secrets().with(name, value));
+}
+
+/// The secrets recorded with [`add_role_secret`], in order.
+pub fn role_secrets() -> Vec<(String, String)> {
+    ROLE.read().map(|g| g.clone()).unwrap_or_default()
 }
 
 /// Why a named value was not collected. Carries no value.
@@ -142,18 +215,33 @@ impl SecretSet {
         E: IntoIterator<Item = (String, String)>,
         X: IntoIterator<Item = (String, String)>,
     {
-        let mut from_env: Vec<(String, String)> =
-            env.into_iter().filter(|(k, _)| is_secret_name(k)).collect();
+        // A secret-shaped name holds a secret; any other variable whose
+        // value is a URL with a password (`REDIS_URL=redis://:pw@host`)
+        // contributes that password (#682).
+        let mut from_env: Vec<(String, String)> = env
+            .into_iter()
+            .filter_map(|(k, v)| {
+                if is_secret_name(&k) {
+                    Some((k, v))
+                } else {
+                    let pw = url_password(&v)?.to_string();
+                    Some((k, pw))
+                }
+            })
+            .collect();
         from_env.sort();
         Self::build(from_env.into_iter().chain(explicit))
     }
 
     /// [`SecretSet::collect`] over the process environment (non-UTF-8
     /// entries are skipped: they cannot appear in `&str` text anyway).
+    /// The values the web backend headers expand from `${NAME}` count too,
+    /// whatever their names (#595).
     pub fn from_env() -> Self {
         let env = std::env::vars_os()
             .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)));
-        Self::collect(env, std::iter::empty())
+        let headers = crate::web::header_secrets(&|k| std::env::var(k).ok());
+        Self::collect(env, headers)
     }
 
     /// This set plus one explicitly named value. A value already known
@@ -176,6 +264,12 @@ impl SecretSet {
             Some(pw) => self.with(name, pw),
             None => self.clone(),
         }
+    }
+
+    /// Whether `value` (trimmed) is one of the collected secrets.
+    pub fn holds(&self, value: &str) -> bool {
+        let v = value.trim();
+        !v.is_empty() && self.inner.entries.iter().any(|(_, e)| e == v)
     }
 
     /// The names of the collected secrets (never values).
@@ -423,6 +517,104 @@ mod tests {
         for n in ["PATH", "HOME", "TOLE_MODEL", "TOKENIZERS_PARALLELISM"] {
             assert!(!is_secret_name(n), "{n}");
         }
+    }
+
+    /// #682: secret-bearing names the first rule missed (the audit's list,
+    /// less the `*_URL` ones, which are secrets by value).
+    #[test]
+    fn the_name_rule_covers_the_pass_key_dsn_and_auth_families() {
+        for n in [
+            "DB_PASS",
+            "PGPASS",
+            "DATABASE_URL",
+            "TEST_DATABASE_URL",
+            "SENTRY_DSN",
+            "NGINJEN_KEY",
+            "GH_HOOK_KEY",
+            "HOOK_KEY",
+            "STRIPE_SK",
+            "OPENAI_KEY",
+            "AWS_SECRET",
+            "NPM_AUTH",
+            "SESSION_COOKIE",
+            "AUTH_BEARER",
+            "GPG_PASSPHRASE",
+            "ssh_key_pass",
+        ] {
+            assert!(is_secret_name(n), "{n}");
+        }
+        // Ordinary names stay ordinary, including the near misses.
+        for n in [
+            "SSH_AUTH_SOCK",
+            "GPG_KEY",
+            "SSH_PUBLIC_KEY",
+            "GIT_AUTHOR_NAME",
+            "GIT_AUTHOR_EMAIL",
+            "MONKEY",
+            "KEYBOARD",
+            "TOLE_BASE_URL",
+            "REDIS_URL",
+            "NO_PROXY",
+            "PROXY_BYPASS",
+            "XDG_SESSION_TYPE",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "TERM",
+            "LANG",
+            "PWD",
+            "OLDPWD",
+        ] {
+            assert!(!is_secret_name(n), "{n}");
+        }
+    }
+
+    /// #682: a variable is a secret by its value too: a URL password under
+    /// any name (not for proxy settings, whose password is still redacted),
+    /// or a value tole holds by role.
+    #[test]
+    fn a_variable_is_a_secret_by_its_value() {
+        let held = SecretSet::default().with("hooks.gh", "route-key-0123456789abcdef");
+        let pw_url = "redis://:redis-pw-0123456789@cache:6379/0";
+        assert!(is_secret_var("REDIS_URL", pw_url, &held));
+        assert!(is_secret_var(
+            "WHATEVER",
+            "route-key-0123456789abcdef",
+            &held
+        ));
+        assert!(is_secret_var(
+            "WHATEVER",
+            "  route-key-0123456789abcdef\n",
+            &held
+        ));
+        assert!(!is_secret_var(
+            "HTTPS_PROXY",
+            "http://u:proxy-pw-123@p:3128",
+            &held
+        ));
+        assert!(!is_secret_var(
+            "https_proxy",
+            "http://u:proxy-pw-123@p:3128",
+            &held
+        ));
+        assert!(!is_secret_var("REDIS_URL", "redis://cache:6379/0", &held));
+        assert!(!is_secret_var("EDITOR", "vim", &held));
+
+        // The password of any URL-valued variable is collected, proxies
+        // included: redaction covers what the scrub leaves.
+        let s = SecretSet::collect(
+            [
+                ("REDIS_URL".to_string(), pw_url.to_string()),
+                (
+                    "HTTPS_PROXY".to_string(),
+                    "http://u:proxy-pw-123@p:3128".to_string(),
+                ),
+                ("EDITOR".to_string(), "vim-but-longer".to_string()),
+            ],
+            [],
+        );
+        assert_eq!(
+            s.redact("redis-pw-0123456789 proxy-pw-123 vim-but-longer"),
+            "«REDIS_URL» «HTTPS_PROXY» vim-but-longer"
+        );
     }
 
     #[test]
