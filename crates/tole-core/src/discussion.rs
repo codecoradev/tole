@@ -259,17 +259,29 @@ pub enum RoundSummary {
     },
     /// A scribe's validated digest.
     Digest(Digest),
+    /// A big round whose digest was refused (the scribe failed or its reply
+    /// did not pass [`parse_digest`]): passed on as written after pass 1,
+    /// with why. Nothing of the refused reply is kept.
+    Fallback {
+        round: u32,
+        contributions: Vec<Contribution>,
+        reason: String,
+    },
 }
+
+/// Longest reason a [`RoundSummary::Fallback`] keeps, in characters.
+pub const MAX_FALLBACK_REASON_CHARS: usize = 300;
 
 impl RoundSummary {
     pub fn round(&self) -> u32 {
         match self {
-            RoundSummary::Verbatim { round, .. } => *round,
+            RoundSummary::Verbatim { round, .. } | RoundSummary::Fallback { round, .. } => *round,
             RoundSummary::Digest(d) => d.round,
         }
     }
 
-    /// Whether the round added nothing: only a digest can say so.
+    /// Whether the round added nothing: only a digest can say so (a fallback
+    /// never stalls a discussion).
     pub fn delta_empty(&self) -> bool {
         matches!(self, RoundSummary::Digest(d) if d.delta.is_empty())
     }
@@ -569,6 +581,11 @@ fn summary_block(s: &RoundSummary) -> String {
         RoundSummary::Verbatim {
             round,
             contributions,
+        }
+        | RoundSummary::Fallback {
+            round,
+            contributions,
+            ..
         } => fence(
             "PREVIOUS ROUND",
             &contributions
