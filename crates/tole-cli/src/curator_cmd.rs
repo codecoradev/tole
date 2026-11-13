@@ -71,6 +71,18 @@ pub enum CuratorAction {
     Unadopt {
         name: String,
     },
+    /// Run `tole curator run` every week on the built-in scheduler (a
+    /// script job `curator-weekly`, zero tokens). Needs a scheduler tick:
+    /// `tole serve --cron`, or cron(8) calling `tole cron tick`.
+    #[cfg(feature = "shell-tools")]
+    Schedule {
+        /// 5-field cron in UTC [default: `0 4 * * 1`, Mondays 04:00].
+        #[arg(long)]
+        cron: Option<String>,
+    },
+    /// Remove the weekly job.
+    #[cfg(feature = "shell-tools")]
+    Unschedule,
 }
 
 /// A managed skill with the directory its package lives in.
@@ -92,6 +104,8 @@ pub struct Env<'a> {
     /// Discovery root for adopted skills.
     pub ws: Option<&'a Path>,
     pub thresholds: Thresholds,
+    /// `[curator] enabled` of the user config (default on).
+    pub enabled: bool,
     pub now: u64,
 }
 
@@ -210,8 +224,12 @@ pub fn sweep(env: &Env<'_>, dry_run: bool) -> Result<Report, String> {
         .iter()
         .filter(|a| a.lifecycle == Lifecycle::Archived)
         .collect();
-    if state.paused && !due.is_empty() && !dry_run {
-        report.held = Some("the curator is paused: nothing was changed".into());
+    if (state.paused || !env.enabled) && !due.is_empty() && !dry_run {
+        report.held = Some(if state.paused {
+            "the curator is paused: nothing was changed".into()
+        } else {
+            "the curator is switched off (curator.enabled = false in the user config): nothing was changed".into()
+        });
         report.would_archive = due.iter().map(|a| a.name.clone()).collect();
         return Ok(report);
     }
@@ -312,7 +330,16 @@ pub fn render_status(env: &Env<'_>) -> Result<String, String> {
         }
     };
     let mut out = vec![
-        format!("curator: {}", if state.paused { "paused" } else { "on" }),
+        format!(
+            "curator: {}",
+            if !env.enabled {
+                "off (curator.enabled = false in the user config)"
+            } else if state.paused {
+                "paused"
+            } else {
+                "on"
+            }
+        ),
         format!(
             "managed: {} ({} active, {} stale, {} due for archive; {} pinned or cron-named left alone)",
             managed.len(),
@@ -376,6 +403,136 @@ pub fn edit_state(
     ))
 }
 
+/// The user config's `[curator]` table. A user config that cannot be read
+/// is reported and the defaults apply, as `tole cron` does.
+fn curator_config() -> Option<crate::config::CuratorConfig> {
+    let path = crate::config::user_config_path().filter(|p| p.exists())?;
+    match crate::config::load(&path) {
+        Ok(c) => c.curator,
+        Err(e) => {
+            eprintln!("tole curator: user config not applied: {e}");
+            None
+        }
+    }
+}
+
+/// The weekly sweep as a job on the built-in scheduler (#593).
+#[cfg(feature = "shell-tools")]
+pub mod schedule {
+    use super::*;
+
+    /// The job's id.
+    pub const JOB_ID: &str = "curator-weekly";
+    /// Mondays 04:00 UTC.
+    pub const DEFAULT_SCHEDULE: &str = "0 4 * * 1";
+
+    /// The live job, if any.
+    pub fn find(dir: &Path) -> Option<crate::cron::JobRow> {
+        crate::cron::list(dir)
+            .ok()?
+            .into_iter()
+            .find(|j| j.id == JOB_ID)
+    }
+
+    /// Save the weekly script job `tole curator run`. The scheduler runs a
+    /// script as argv with no shell and no tokens, and refuses a
+    /// path-qualified program, so `tole` is found on the scheduler's PATH.
+    /// Refuses when the job exists.
+    pub fn install(
+        dir: &Path,
+        schedule: Option<&str>,
+        workdir: &Path,
+        now: i64,
+    ) -> anyhow::Result<String> {
+        if let Some(j) = find(dir) {
+            anyhow::bail!(
+                "{JOB_ID} already exists ({}, {}); `tole curator unschedule` first to change it",
+                j.schedule,
+                j.state
+            );
+        }
+        let schedule = schedule.unwrap_or(DEFAULT_SCHEDULE).to_string();
+        let spec = crate::cron::CreateSpec {
+            id: Some(JOB_ID.into()),
+            name: Some("skill curator".into()),
+            schedule: schedule.clone(),
+            script: Some("tole curator run".into()),
+            workdir: workdir.to_path_buf(),
+            ..Default::default()
+        };
+        crate::cron::create(dir, spec, now)?;
+        Ok(format!(
+            "scheduled {JOB_ID}: `tole curator run` on `{schedule}` (UTC). It runs when the \
+             scheduler ticks: `tole serve --cron`, or cron(8) calling `tole cron tick`."
+        ))
+    }
+
+    /// Remove the weekly job.
+    pub fn remove(dir: &Path, now: i64) -> anyhow::Result<String> {
+        if find(dir).is_none() {
+            anyhow::bail!("{JOB_ID} is not scheduled");
+        }
+        crate::cron::update(dir, JOB_ID, now, |j| j.removed = true)?;
+        Ok(format!("removed {JOB_ID}"))
+    }
+
+    /// One status line.
+    pub fn line(dir: &Path) -> String {
+        match find(dir) {
+            Some(j) => format!("schedule: {JOB_ID} on `{}` ({})", j.schedule, j.state),
+            None => "schedule: not scheduled (`tole curator schedule` adds a weekly sweep)".into(),
+        }
+    }
+
+    pub fn status_line() -> String {
+        match crate::cron::default_dir() {
+            Ok(d) => line(&d),
+            Err(e) => format!("schedule: unknown ({e})"),
+        }
+    }
+
+    pub fn install_cli(cron: Option<&str>) -> anyhow::Result<String> {
+        use anyhow::Context as _;
+        let dir = crate::cron::default_dir()?;
+        let workdir = tole_core::paths::tole_data_dir()
+            .context("the CodeCora home is unresolvable (set CODECORA_HOME or HOME)")?;
+        std::fs::create_dir_all(&workdir)
+            .with_context(|| format!("creating {}", workdir.display()))?;
+        let mut msg = install(&dir, cron, &workdir, crate::cron::now())?;
+        if !crate::tool_roster::binary_available("tole") {
+            msg.push_str(
+                "\nWarning: `tole` is not on this PATH. The job runs `tole curator run`, so the \
+                 scheduler's PATH must hold it or the run fails (see `tole cron runs`).",
+            );
+        }
+        Ok(msg)
+    }
+
+    pub fn remove_cli() -> anyhow::Result<String> {
+        remove(&crate::cron::default_dir()?, crate::cron::now())
+    }
+}
+
+/// The doctor line: whether the curator is on and scheduled.
+pub fn doctor_line() -> String {
+    let cfg = curator_config();
+    if cfg.as_ref().and_then(|c| c.enabled) == Some(false) {
+        return "curator: off (curator.enabled = false)".into();
+    }
+    #[cfg(feature = "shell-tools")]
+    {
+        let sched = match crate::cron::default_dir() {
+            Ok(d) => schedule::find(&d)
+                .map(|j| format!("scheduled on `{}`", j.schedule))
+                .unwrap_or_else(|| "not scheduled (`tole curator schedule`)".into()),
+            Err(_) => "schedule unknown".into(),
+        };
+        format!("curator: on, {sched}")
+    }
+    #[cfg(not(feature = "shell-tools"))]
+    "curator: on".to_string()
+}
+
 /// The owned pieces an [`Env`] borrows from.
 struct Parts<'p> {
     drafts: &'p DraftStore,
@@ -384,6 +541,8 @@ struct Parts<'p> {
     archive: &'p Archive,
     lock_path: &'p Path,
     cron_skills: BTreeSet<String>,
+    thresholds: Thresholds,
+    enabled: bool,
 }
 
 impl<'p> Parts<'p> {
@@ -396,7 +555,8 @@ impl<'p> Parts<'p> {
             lock_path: self.lock_path,
             cron_skills: self.cron_skills.clone(),
             ws,
-            thresholds: Thresholds::default(),
+            thresholds: self.thresholds,
+            enabled: self.enabled,
             now: now_secs(),
         }
     }
@@ -431,6 +591,7 @@ pub fn cli(action: CuratorAction) -> anyhow::Result<()> {
         .unwrap_or_default();
     #[cfg(not(feature = "shell-tools"))]
     let cron_skills = BTreeSet::new();
+    let cfg = curator_config();
     let parts = Parts {
         drafts: &drafts,
         state_path: &state_path,
@@ -438,12 +599,16 @@ pub fn cli(action: CuratorAction) -> anyhow::Result<()> {
         archive: &archive,
         lock_path: &lock_path,
         cron_skills,
+        thresholds: crate::config::curator_thresholds(cfg.as_ref()),
+        enabled: cfg.as_ref().and_then(|c| c.enabled).unwrap_or(true),
     };
     let msg = |r: Result<String, String>| r.map_err(anyhow::Error::msg);
     match action {
         CuratorAction::Status { workspace } => {
             let ws = ws_of(workspace)?;
             println!("{}", msg(render_status(&parts.env(Some(&ws))))?);
+            #[cfg(feature = "shell-tools")]
+            println!("{}", schedule::status_line());
         }
         CuratorAction::Run { dry_run, workspace } => {
             let ws = ws_of(workspace)?;
@@ -525,6 +690,14 @@ pub fn cli(action: CuratorAction) -> anyhow::Result<()> {
                     "adopted"
                 ))?
             )
+        }
+        #[cfg(feature = "shell-tools")]
+        CuratorAction::Schedule { cron } => {
+            println!("{}", schedule::install_cli(cron.as_deref())?);
+        }
+        #[cfg(feature = "shell-tools")]
+        CuratorAction::Unschedule => {
+            println!("{}", schedule::remove_cli()?);
         }
         CuratorAction::Unadopt { name } => {
             println!(

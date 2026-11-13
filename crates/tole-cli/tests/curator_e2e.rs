@@ -191,3 +191,109 @@ fn a_locked_skill_and_a_bad_name_are_handled() {
     let o = tole(&home, &["curator", "status"]);
     assert!(out(&o).contains("locked: demo"), "{}", out(&o));
 }
+
+fn write_config(home: &Path, toml: &str) {
+    let dir = home.join("tole");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("config.toml"), toml).unwrap();
+}
+
+#[test]
+fn the_user_config_can_switch_the_curator_off_and_set_the_thresholds() {
+    let home = tmpdir();
+    grown(&home, "idle", 12);
+
+    // Defaults: used 12 days ago is still active.
+    let o = tole(&home, &["curator", "run"]);
+    assert!(
+        o.status.success() && !out(&o).contains("archived idle"),
+        "{}",
+        out(&o)
+    );
+
+    // Shorter thresholds from the user config archive it.
+    write_config(&home, "[curator]\nstale_days = 5\narchive_days = 10\n");
+    let o = tole(&home, &["curator", "run", "--dry-run"]);
+    assert!(out(&o).contains("would archive: idle"), "{}", out(&o));
+
+    // Switched off: nothing changes and it says why.
+    write_config(
+        &home,
+        "[curator]\nenabled = false\nstale_days = 5\narchive_days = 10\n",
+    );
+    let o = tole(&home, &["curator", "run"]);
+    assert!(
+        o.status.success() && out(&o).contains("switched off"),
+        "{}",
+        out(&o)
+    );
+    assert!(skill_dir(&home, "idle").exists());
+    let o = tole(&home, &["curator", "status"]);
+    assert!(
+        out(&o).contains("curator: off (curator.enabled = false"),
+        "{}",
+        out(&o)
+    );
+
+    // A bad pair is a config error, not a silent default.
+    write_config(&home, "[curator]\narchive_days = 10\nstale_days = 20\n");
+    let o = tole(&home, &["curator", "status"]);
+    assert!(out(&o).contains("user config not applied"), "{}", out(&o));
+}
+
+// `schedule` needs the built-in scheduler (shell-tools).
+#[cfg(feature = "shell-tools")]
+#[test]
+fn schedule_saves_one_weekly_script_job_and_unschedule_removes_it() {
+    let home = tmpdir();
+    let o = tole(&home, &["curator", "status"]);
+    assert!(out(&o).contains("schedule: not scheduled"), "{}", out(&o));
+
+    let o = tole(&home, &["curator", "schedule"]);
+    assert!(o.status.success(), "{}", out(&o));
+    assert!(
+        out(&o).contains("scheduled curator-weekly") && out(&o).contains("0 4 * * 1"),
+        "{}",
+        out(&o)
+    );
+    let o = tole(&home, &["cron", "list"]);
+    assert!(
+        out(&o).contains("curator-weekly") && out(&o).contains("script"),
+        "{}",
+        out(&o)
+    );
+    let o = tole(&home, &["curator", "status"]);
+    assert!(
+        out(&o).contains("schedule: curator-weekly on `0 4 * * 1`"),
+        "{}",
+        out(&o)
+    );
+
+    let o = tole(&home, &["curator", "schedule"]);
+    assert!(
+        !o.status.success() && out(&o).contains("already exists"),
+        "{}",
+        out(&o)
+    );
+    let o = tole(&home, &["curator", "schedule", "--cron", "garbage"]);
+    assert!(!o.status.success(), "{}", out(&o));
+
+    let o = tole(&home, &["curator", "unschedule"]);
+    assert!(
+        o.status.success() && out(&o).contains("removed curator-weekly"),
+        "{}",
+        out(&o)
+    );
+    let o = tole(&home, &["curator", "unschedule"]);
+    assert!(
+        !o.status.success() && out(&o).contains("not scheduled"),
+        "{}",
+        out(&o)
+    );
+    let o = tole(&home, &["curator", "schedule", "--cron", "30 3 * * 0"]);
+    assert!(
+        o.status.success() && out(&o).contains("30 3 * * 0"),
+        "{}",
+        out(&o)
+    );
+}
