@@ -286,13 +286,17 @@ fn verify_gate_overrides_the_completion_marker() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// Stop gates (`--on-turnend`) need the shell-tools feature.
+#[cfg(feature = "shell-tools")]
 const PROVIDER_KEY: &str = "sk-mission-provider-key-0123456789";
+#[cfg(feature = "shell-tools")]
 const GH_TOKEN: &str = "ghp_missionGithubToken0123456789";
 
 /// A hermetic `tole` command in `dir` with the two secrets in its
 /// environment. Root reads every process's /proc files whatever tole does,
 /// so under root tole runs as `nobody`: the guard is about same-user
 /// children.
+#[cfg(feature = "shell-tools")]
 fn secret_holding_tole(dir: &std::path::Path, base: &str, args: &[&str]) -> Command {
     let home = dir.join("home");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
@@ -339,6 +343,7 @@ fn secret_holding_tole(dir: &std::path::Path, base: &str, args: &[&str]) -> Comm
 /// (`/proc/$PPID/environ`). `user_config` is the hermetic user config.
 /// Returns [verify env, tole's environ read by verify, gate env, tole's
 /// environ read by the gate].
+#[cfg(feature = "shell-tools")]
 fn children_see(tag: &str, user_config: &str) -> [String; 4] {
     use std::os::unix::fs::PermissionsExt;
     let dir = temp_dir(tag);
@@ -362,15 +367,7 @@ fn children_see(tag: &str, user_config: &str) -> [String; 4] {
         gate.to_str().unwrap(),
     );
     let verify = probe("verify");
-    let mission = [
-        "mission",
-        "-s",
-        s,
-        "--workspace",
-        w,
-        "--yes",
-        "--no-auto-mcp",
-    ];
+    let mission = ["mission", "-s", s, "--workspace", w, "--yes"];
     let mission = [&mission[..], &["--verify", &verify, "do it"]].concat();
     let run = [
         "run",
@@ -378,7 +375,6 @@ fn children_see(tag: &str, user_config: &str) -> [String; 4] {
         s,
         "--workspace",
         w,
-        "--no-auto-mcp",
         "--allow",
         "todo_write",
         "--on-turnend",
@@ -415,6 +411,7 @@ fn children_see(tag: &str, user_config: &str) -> [String; 4] {
 /// wrote, unattended. By default they get no secret, and they cannot read
 /// the secrets out of tole's own environment through /proc either.
 #[test]
+#[cfg(feature = "shell-tools")]
 fn verify_and_stop_gates_get_no_secret_by_default() {
     let seen = children_see("noscrt", "");
     let what = [
@@ -439,6 +436,7 @@ fn verify_and_stop_gates_get_no_secret_by_default() {
 /// An explicit `[secrets]` grant to `verify` and `turnend` restores a token
 /// for them, and only that token.
 #[test]
+#[cfg(feature = "shell-tools")]
 fn a_secrets_grant_restores_a_token_for_verify_and_stop_gates() {
     let seen = children_see(
         "grant",
