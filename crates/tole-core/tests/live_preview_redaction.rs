@@ -11,10 +11,14 @@ use tole_core::provider::{Provider, ProviderError, ProviderOutput};
 use tole_core::secrets::SecretSet;
 use tole_core::storage::JsonlStorage;
 
-const GH: &str = "ghp_0123456789abcdefghijklmnopqrstuvwxyzAB";
+/// A fake GitHub-token-shaped value, assembled at run time so no token
+/// literal sits in the source.
+fn gh() -> String {
+    ["ghp", "_0123456789abcdefghijklmnopqrstuvwxyzAB"].concat()
+}
 
 fn set() -> SecretSet {
-    SecretSet::collect([("GITHUB_TOKEN".to_string(), GH.to_string())], [])
+    SecretSet::collect([("GITHUB_TOKEN".to_string(), gh())], [])
 }
 
 /// Returns the secret in its output, or fails with it in the error.
@@ -35,11 +39,11 @@ impl tole_core::tool::Tool for LeakyTool {
     }
     fn execute(&self, _input: Value) -> Result<Value, String> {
         if self.fail {
-            Err(format!("auth failed for {GH}"))
+            Err(format!("auth failed for {}", gh()))
         } else {
             // The secret straddles the 200-character preview cut: a cut
             // before redaction would leave a partial, unmatchable value.
-            Ok(json!({ "stdout": format!("{}{GH}", "x".repeat(180)) }))
+            Ok(json!({ "stdout": format!("{}{}", "x".repeat(180), gh()) }))
         }
     }
 }
@@ -73,7 +77,7 @@ impl Provider for Reasoning {
         self.0.complete(transcript)
     }
     fn last_reasoning(&self) -> Option<String> {
-        Some(format!("the token is {GH}"))
+        Some(format!("the token is {}", gh()))
     }
 }
 
@@ -87,7 +91,7 @@ fn every_live_observer_event_is_redacted_like_the_log() {
     let mut p = Reasoning(tole_core::mock::MockProvider::scripted(vec![
         ProviderOutput::ToolCall {
             tool: "leaky".into(),
-            input: json!({ "token": GH }),
+            input: json!({ "token": gh() }),
         },
         ProviderOutput::ToolCall {
             tool: "leaky_err".into(),
@@ -110,7 +114,7 @@ fn every_live_observer_event_is_redacted_like_the_log() {
     .unwrap();
 
     let log = std::fs::read_to_string(dir.join("s.jsonl")).unwrap();
-    assert!(!log.contains(GH), "the durable log is redacted (#596)");
+    assert!(!log.contains(&gh()), "the durable log is redacted (#596)");
     let events = rec.0.lock().unwrap().join("\n");
     for kind in [
         "started leaky",
@@ -121,12 +125,12 @@ fn every_live_observer_event_is_redacted_like_the_log() {
         assert!(events.contains(kind), "no {kind:?} event: {events}");
     }
     assert!(
-        !events.contains(GH),
+        !events.contains(&gh()),
         "a live event leaks the secret: {events}"
     );
     // Not even the part before the cut.
     assert!(
-        !events.contains(&GH[..6]),
+        !events.contains(&gh()[..6]),
         "a partial secret leaks: {events}"
     );
     assert!(events.contains("«GITHUB_TOKEN»"), "{events}");
