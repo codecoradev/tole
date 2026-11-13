@@ -1382,6 +1382,13 @@ fn dispatch(cli: Cli) -> Result<()> {
                     images,
                     // A profile's persona replaces the default base prompt.
                     persona: profile.as_ref().and_then(|p| p.system_prompt.clone()),
+                    // The profile's advisor (#587); a child agent gets one
+                    // only when its own profile declares it.
+                    advisor: profile.as_ref().and_then(|p| {
+                        p.advisor
+                            .clone()
+                            .map(|m| (p.name.clone(), m, p.advisor_max_uses))
+                    }),
                 },
                 registry,
                 &sessions_dir,

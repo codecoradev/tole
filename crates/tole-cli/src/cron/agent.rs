@@ -174,8 +174,8 @@ impl TurnObserver for StepBudget {
 /// once they reach the run's token budget.
 struct TokenMeter {
     inner: Box<dyn Provider>,
-    used: u64,
-    max: u64,
+    /// The run's token budget, shared with `consult_advisor` (#587).
+    budget: Arc<tole_core::advisor::Budget>,
     tripped: Tripped,
     cancel: CancelToken,
 }
@@ -185,12 +185,8 @@ impl TokenMeter {
         let Some(u) = self.inner.last_usage() else {
             return;
         };
-        let at = |k: &str| u.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
-        self.used = self
-            .used
-            .saturating_add(at("prompt_tokens"))
-            .saturating_add(at("completion_tokens"));
-        if self.used >= self.max {
+        self.budget.charge(crate::advisor_host::tokens(&u));
+        if self.budget.left() == 0 {
             trip(&self.tripped, "token budget exceeded", &self.cancel);
         }
     }
@@ -305,6 +301,31 @@ pub fn run_agent(
         Err(e) => return fail(None, e.to_string()),
     };
     let name = field(job, "name").unwrap_or(&job.id).to_string();
+    // The advisor (#587), when the job's profile declares one: its tokens
+    // come out of this run's budget, which the meter below shares.
+    let budget = Arc::new(tole_core::advisor::Budget::new(max_tokens));
+    let advisor = match setup
+        .profile
+        .as_ref()
+        .and_then(|p| p.advisor.clone().map(|m| (p, m)))
+    {
+        Some((p, model)) => {
+            let shared = crate::advisor_host::Shared::new(Arc::clone(&budget));
+            let secrets = crate::provider_chain::process_secrets(&crate::config_apply::real_env);
+            let tool = crate::advisor_host::ConsultAdvisor::new(
+                Arc::clone(&shared),
+                p.advisor_max_uses,
+                format!("Profile: {}\nScheduled job `{name}`: {prompt}", p.name),
+                secrets.clone(),
+                crate::advisor_host::factory(cfg.clone(), &model, secrets),
+            );
+            if let Err(e) = reg.register(Box::new(tool)) {
+                return fail(None, e);
+            }
+            Some(shared)
+        }
+        None => None,
+    };
     let opened = match resume {
         // The session file sits in the job's workdir, which the job can
         // write, and it may have been swapped since `resume_parked` checked
@@ -392,9 +413,15 @@ pub fn run_agent(
     );
     let mut meter = match provider {
         Ok(inner) => TokenMeter {
-            inner,
-            used: 0,
-            max: max_tokens,
+            inner: match &advisor {
+                Some(shared) => Box::new(crate::advisor_host::Tap::new(
+                    inner,
+                    Arc::clone(shared),
+                    false,
+                )),
+                None => inner,
+            },
+            budget: Arc::clone(&budget),
             tripped: Arc::clone(&tripped),
             cancel: cancel.clone(),
         },
@@ -427,6 +454,13 @@ pub fn run_agent(
     };
     drop(done_tx);
     let _ = timer.join();
+    // The advisor's usage becomes session usage records, so the run's
+    // tokens (and the daily cap) include it.
+    if let Some(shared) = &advisor {
+        if let Err(e) = crate::advisor_host::record_usage(shared, &mut storage) {
+            return fail(sid, e);
+        }
+    }
     let tokens =
         tole_core::transcript::tokens_in_out(storage.usages()).saturating_sub(tokens_before);
     let outcome = match outcome {

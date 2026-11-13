@@ -154,7 +154,7 @@ pub fn advisor_doctor_lines(cfg: &Config) -> Vec<String> {
         return vec!["advisor: off (no profile declares models.advisor)".into()];
     }
     vec![format!(
-        "advisor: {} (consult_advisor is not wired into runs yet, #587 part 2)",
+        "advisor: {} (consult_advisor in missions, delegated children and cron runs)",
         with.join(", ")
     )]
 }

@@ -102,6 +102,9 @@ pub struct MissionConfig {
     /// The selected profile's persona (#584): replaces the default base
     /// prompt of a fresh mission (the mission section is still appended).
     pub persona: Option<String>,
+    /// The profile's advisor (#587): `(profile, model, max uses)`. `Some`
+    /// registers `consult_advisor`, whose tokens come out of `max_tokens`.
+    pub advisor: Option<(String, String, u32)>,
 }
 
 /// The mission addendum appended to the default system prompt.
@@ -291,6 +294,30 @@ pub fn run_mission(
         route(&mut storage, &registry)?;
     }
 
+    // The advisor (#587): its tokens come out of this mission's budget,
+    // which starts at what the session already spent (a resume included).
+    let advisor = match &cfg.advisor {
+        Some((name, model, max_uses)) => {
+            let budget = std::sync::Arc::new(tole_core::advisor::Budget::new(cfg.max_tokens));
+            budget.charge(tokens_used(&storage));
+            let shared = tole_cli::advisor_host::Shared::new(budget);
+            let secrets =
+                tole_cli::provider_chain::process_secrets(&tole_cli::config_apply::real_env);
+            let tool = tole_cli::advisor_host::ConsultAdvisor::new(
+                std::sync::Arc::clone(&shared),
+                *max_uses,
+                format!("Profile: {name}\nMission goal: {}", cfg.goal),
+                secrets.clone(),
+                tole_cli::advisor_host::factory(provider_cfg.clone(), model, secrets),
+            );
+            registry
+                .register(Box::new(tool))
+                .map_err(anyhow::Error::msg)?;
+            Some(shared)
+        }
+        None => None,
+    };
+
     let system_prompt = storage.system_prompt().map(str::to_owned);
     let mut compactor =
         tole_cli::compaction_host::for_session(cfg.compaction, &provider_cfg, &storage);
@@ -302,6 +329,13 @@ pub fn run_mission(
         None,
     )
     .map_err(anyhow::Error::msg)?;
+    if let Some(shared) = &advisor {
+        provider = Box::new(tole_cli::advisor_host::Tap::new(
+            provider,
+            std::sync::Arc::clone(shared),
+            true,
+        ));
+    }
 
     let mut turns: u64 = 0;
     let mut verify_failures: u32 = 0;
@@ -381,6 +415,15 @@ pub fn run_mission(
             }
         };
         turns += 1;
+        // The advisor's usage becomes session usage records, so the next
+        // budget check (and a resume) counts it.
+        if let Some(shared) = &advisor {
+            if let Err(e) = tole_cli::advisor_host::record_usage(shared, &mut storage) {
+                eprintln!("mission: {e}");
+                status = "error";
+                break;
+            }
+        }
         match &outcome {
             TurnOutcome::Final { text, .. } => {
                 // Line-exact per the pinned contract ("a line containing

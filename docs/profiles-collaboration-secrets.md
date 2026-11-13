@@ -626,6 +626,30 @@ All on sanitized or owner-written text only, never raw payloads:
     transcript, never from a path the model or a child can write.
   - The tool stays available in plan-mode runs (ReadOnly, same cap).
 
+**As implemented, part 2 of #587 (`consult_advisor`):**
+- **Faces.** Registered in `tole mission` (a delegated child is a
+  mission, so it gets the tool only when its own profile declares
+  `models.advisor`) and in cron agent runs, the faces with a token budget.
+  `run`, `chat`, the TUI, `serve` and ACP have no token budget for the
+  advisor to come out of, so the tool is **not registered** there.
+- **Window.** `advisor_host::Tap` wraps the run's provider and keeps, in
+  memory, the last 12 entries of each transcript the turn loop sends. No
+  file is read.
+- **Budget.**
+  - A mission's budget starts at what its session has already spent; the
+    `Tap` charges each provider step, and the advisor charges its call.
+  - A cron job's `TokenMeter` charges the same `Budget`, which can trip the
+    run once the advisor has spent the rest.
+  - A consultation that cannot fit (its request plus 600 tokens for the
+    reply) is refused before any call, without spending a use.
+- **Records.** The tool result is the record of the consultation: the
+  fenced verdict, the use number and the tokens. Its usage (counted even
+  when the call fails) is written to the session as a usage record tagged
+  `"role": "advisor"` after the turn, so a mission's next budget check, a
+  resume and a cron run's reported tokens include it.
+- **Call.** The advisor model on the run's provider connection, with the
+  process secrets, no tools, no streaming and no fallback chain.
+
 **Conflicts with earlier recorded context, resolved by the owner
 (2026-11-11):**
 1. The 2026-10-06 competitor research marked "multi-agent without a cap"
