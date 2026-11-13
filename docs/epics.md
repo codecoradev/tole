@@ -298,7 +298,10 @@ Bot and Nakama; BMAD for collaboration). Design notes:
   - advisor (#587; the core seam, `advisor_max_uses`, the doctor line and
     `consult_advisor` in missions, delegated children and cron runs are in;
     done);
-  - multi-round discussion with a sanitizer (#588);
+  - multi-round discussion with a sanitizer (#588; part 1a is the pure core
+    in `tole-core`: contract, sanitizer, digest validator, checker verdicts,
+    gate and the fixed prompts; the append-only ledger (1b) and the
+    orchestration that calls the models follow);
   - `uteke_document` parent (#576; done).
 - **E3 — Skills, epic #589:** `SkillIndex` + uteke doc adapter, K = 5 with
   pinned core (#590), approved-hash loading (#591), propose-only growth with
