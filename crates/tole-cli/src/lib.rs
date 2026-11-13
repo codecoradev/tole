@@ -6,6 +6,7 @@ pub mod advisor_host;
 pub mod approvals;
 pub mod approver;
 pub mod audit;
+pub mod audit_discussion;
 pub mod auth;
 pub mod compaction_host;
 pub mod config;

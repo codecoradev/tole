@@ -375,9 +375,10 @@ default = "standard"                   # light | standard | heavy
 
 `[secrets]` (#598) binds each secret NAME to the tools whose child processes
 may receive it; every other secret-shaped variable is scrubbed from them.
-**`run_command`, `job_start` and cron scripts get no secret by default**;
-`GITHUB_TOKEN` defaults to the `gh` and `git` tools and your hooks and MCP
-servers. A project config can only narrow a binding. Sensitive files
+**`run_command`, `job_start`, cron scripts, the mission `--verify` command
+(`verify`) and the `--on-turnend` stop gates (`turnend`) get no secret by
+default** (#676); `GITHUB_TOKEN` defaults to the `gh` and `git` tools and your
+pre/post tool hooks and MCP servers. A project config can only narrow a binding. Sensitive files
 (`.env*`, `*.pem`, `id_*`, `.npmrc`, `.netrc`, `*.key`) read as
 `KEY=«redacted»`; to read one verbatim, approve a `read_file_raw` call (or
 `--allow read_file_raw`). `tole doctor` lists which secrets are set and which

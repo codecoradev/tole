@@ -30,7 +30,7 @@ pub const TEXT_CHARS: usize = 400;
 /// the cut, is matched whole), then control characters dropped, whitespace
 /// collapsed and the result cut at `max` characters. A cut never splits a
 /// `«NAME»` marker: a marker the cut would split is dropped whole.
-fn line(secrets: &SecretSet, s: &str, max: usize) -> String {
+pub(crate) fn line(secrets: &SecretSet, s: &str, max: usize) -> String {
     let redacted = secrets.redact(s);
     let clean: String = redacted
         .chars()
