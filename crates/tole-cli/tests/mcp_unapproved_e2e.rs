@@ -151,3 +151,52 @@ fn a_changed_server_offers_no_prompts_in_chat() {
     );
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// Writes a user lock approving `spy` as `source` with `integrity`.
+fn approve_spy(dir: &Path, source: String, integrity: String) {
+    let mut lock = tole_core::plugin_lock::Lockfile::default();
+    lock.servers.insert(
+        "spy".into(),
+        tole_core::plugin_lock::LockEntry {
+            source,
+            integrity,
+            manifest_hash: tole_core::plugin_lock::manifest_hash(&[]),
+            ..Default::default()
+        },
+    );
+    lock.save(
+        &dir.join("home/tole")
+            .join(tole_core::plugin_lock::LOCK_FILE),
+    )
+    .unwrap();
+}
+
+/// #679: an approved NAME pointed at another command is not started, so the
+/// program the owner never approved cannot run or replay the manifest.
+#[test]
+fn an_approved_name_pointing_at_another_command_is_never_started() {
+    let d = tmp("moved");
+    let spec = spy(&d);
+    approve_spy(
+        &d,
+        "stdio:npx -y @modelcontextprotocol/server-github".into(),
+        String::new(),
+    );
+    let err = run(&d, &spec);
+    assert!(err.contains("not the one you approved"), "{err}");
+    assert!(!d.join("started").exists(), "the server process ran");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// #679: another program file at the approved path is not started.
+#[test]
+fn a_swapped_binary_at_the_approved_path_is_never_started() {
+    let d = tmp("rebuilt");
+    let spec = spy(&d);
+    let source = format!("stdio:{}", d.join("spy.sh").display());
+    approve_spy(&d, source, "sha256:0000".into());
+    let err = run(&d, &spec);
+    assert!(err.contains("not the binary you approved"), "{err}");
+    assert!(!d.join("started").exists(), "the server process ran");
+    let _ = std::fs::remove_dir_all(&d);
+}

@@ -113,16 +113,33 @@ impl Gate {
         }
     }
 
-    /// The refusal for `server` when the lock decides without the live
-    /// manifest (#680): no entry (or an unreadable lock, which trusts
-    /// nothing) or revoked. Such a server is not connected at all, so an
-    /// unapproved or revoked stdio server never runs.
-    pub fn refuse_unseen(&self, server: &str) -> Option<String> {
-        match self.lock.get(server) {
-            None => Some(refusal(server, &Admission::Unlocked)),
-            Some(e) if e.revoked => Some(refusal(server, &Admission::Revoked)),
-            Some(_) => None,
-        }
+    /// The refusal for `server`, configured as `source`, when the lock
+    /// decides without connecting (#680, #679): no entry (or an unreadable
+    /// lock, which trusts nothing), revoked, another command line or URL than
+    /// the approved one, or another program file than the approved binary.
+    /// Such a server is not started at all, so a program the owner never
+    /// approved under this name never runs. Source and binary changes are
+    /// recorded in the ledger.
+    pub fn refuse_unseen(&self, server: &str, source: &str) -> Option<String> {
+        let e = match self.lock.get(server) {
+            None => return Some(refusal(server, &Admission::Unlocked)),
+            Some(e) if e.revoked => return Some(refusal(server, &Admission::Revoked)),
+            Some(e) => e,
+        };
+        let a = if e.source != source {
+            Admission::Moved
+        } else if !e.integrity.is_empty() && integrity(source) != e.integrity {
+            Admission::Rebuilt
+        } else {
+            return None;
+        };
+        let event = if a == Admission::Moved {
+            "source_change"
+        } else {
+            "binary_change"
+        };
+        self.record(event, server, &e.manifest_hash);
+        Some(refusal(server, &a))
     }
 
     /// The secret NAMES `server`'s approval granted it (#679), for its

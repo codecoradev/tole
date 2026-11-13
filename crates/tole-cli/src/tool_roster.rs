@@ -548,15 +548,16 @@ pub fn build(approver: impl Approver + 'static, roster: Roster) -> Result<ToolRe
     }
     #[cfg(feature = "mcp")]
     for cfg in &roster.mcp_servers {
-        // #680: an unapproved or revoked server is not connected at all.
-        if let Some(note) = plugin_gate.refuse_unseen(&cfg.name) {
+        // #680, #679: an unapproved or revoked server, or an approved name
+        // now pointing at another command, URL or binary, is not started.
+        // The lock also binds them after connect (`check`), and the
+        // server's process gets only the secrets its approval granted.
+        let source = crate::plugin_gate::source_of(cfg);
+        if let Some(note) = plugin_gate.refuse_unseen(&cfg.name, &source) {
             eprintln!("tole: mcp[{}]: {note}", cfg.name);
             eprintln!("tole: mcp[{}]: no tools registered", cfg.name);
             continue;
         }
-        // #679: the lock binds the configured source and binary, and the
-        // server's process gets only the secrets its approval granted.
-        let source = crate::plugin_gate::source_of(cfg);
         let admit = |s: &str, v: &str, t: &[tole_core::plugin_lock::ManifestTool]| {
             plugin_gate.check(s, &source, v, t)
         };
