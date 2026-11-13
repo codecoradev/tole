@@ -571,12 +571,45 @@ operator's machine, as for any `cargo install`).
 `web_fetch`/`web_search` are ReadOnly: results enter context as model
 content and are never executed — the exfiltration framing is identical
 to any tool output. Fetch is text-only (no JS, no browser), size-capped
-(512 KB), content-type allowlisted; search requires an explicit
-`TOLE_WEB_SEARCH_URL` backend (probe-first — no keyless scraping). A
+(512 KB), content-type allowlisted; search used to require an explicit
+`TOLE_WEB_SEARCH_URL` backend (no keyless scraping); since #625 the default
+build has built-in keyless search (below), and a build without `web-builtin`
+keeps the old rule. A
 crafted page CAN steer a mission via prompt injection; the mitigation
 is the same as every other untrusted input: tool-result fencing,
 approval gates on anything that matters, and mission budgets bounding
 the blast radius.
+
+Built-in web tools (#625, the default `web-builtin` feature of tole-cli):
+without a `TOLE_WEB_*` backend, `web_search` uses nginjen-lite's keyless
+engines (DuckDuckGo Lite, then Bing, then Brave; a non-2xx answer moves to
+the next) and `web_fetch` uses its HTML converters, both on tole's own HTTP
+client (one client, one TLS stack). The guards stay in tole:
+- **Every hop is vetted.** The client follows redirects one hop at a time
+  (`get_following_redirects`); each hop goes through `web::vetted_get`,
+  which checks the host up front and again in the connection's own
+  resolver (pinned, so a DNS rebinding between the two fails closed). An
+  https request never hops to plain http, and a hop whose URL carries a
+  known secret is refused before it is sent.
+- **Fetch:** http(s) only, a URL carrying a known secret is refused, a
+  private or loopback host is refused before anything is sent
+  (`TOLE_WEB_ALLOW_PRIVATE=1` opts out), robots.txt is honoured (a robots
+  failure is fail-open, as in lite), the content type must be text, JSON or
+  XML, and the body is capped at 512 KiB (truncated and flagged) and the
+  text at 20,000 characters.
+- **Search:** the query is redacted with the process secrets and capped
+  (512 characters) before it leaves; engine answers are capped at 2 MiB,
+  results at 8.
+- **Politeness:** `web_fetch` and its robots.txt requests send
+  `tole/<version> (+https://github.com/codecoradev/tole)`. The search
+  engines get nginjen-lite's own browser-like User-Agent, because they
+  block other agents. A host gets at most one request per second.
+- **Memory:** the robots cache (64 origins) and the per-host pacer
+  (64 hosts) are bounded; no threads.
+- **Residual:** the engines see the (redacted) query, and their results
+  and every fetched page are untrusted text (prompt injection as above).
+  There is no domain allowlist (owner decision): unattended runs use the
+  same tools.
 
 Fetch backend (#532): with `TOLE_WEB_FETCH_URL` set, `web_fetch` sends the
 target to that backend instead of fetching directly (backend only, no

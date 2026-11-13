@@ -51,6 +51,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Missions now learn about cora's agent-as-reviewer flow (#536): `tole mission` builds its registry like `run` (including the auto-attached `mcp_cora_*` tools) but its pinned system prompt never named the review tools, so the unattended command was the one that did not know the flow existed. When both `mcp_cora_cora_review_prepare` and `mcp_cora_cora_review_finalize` are registered, a fresh mission's prompt now carries the same review section as `run` / `chat` / the TUI plus one sentence asking for a review (and its verdict in the final message) before the mission ends; without the tools nothing is added. Guidance only: a gate before `git commit` is tracked separately. `serve`, `acp` and `mcp` sessions are unchanged on purpose: they attach no external MCP servers, so they have no review tools. Resumed missions keep their pinned prompt.
 
 ### Added
+- Built-in `web_search` and `web_fetch` (#625), on nginjen-lite 0.1.0 and tole's own HTTP client, behind the default `web-builtin` feature of tole-cli. A configured `TOLE_WEB_*` backend still wins, and a build without the feature keeps today's tools.
+  - **`web_search`** works out of the box: DuckDuckGo Lite, then Bing, then Brave (keyless; a non-2xx answer moves to the next).
+    - The query is redacted with the process secrets and capped at 512 characters.
+    - 8 results, each field capped; the answer names the engine and whether it was a fallback.
+    - The engines get nginjen-lite's browser-like User-Agent, because they block other agents.
+  - **`web_fetch`** gains `format`: `markdown` (default), `compact`, `text`, `html` or `links`. `compact` is shortest but drops the text of inline bold, italic and code and image alt text, so it is not the default.
+    - It honours robots.txt (fail-open when robots.txt cannot be read) and sends `tole/<version> (+https://github.com/codecoradev/tole)`.
+  - **Guards, unchanged and now on every redirect hop:** http(s) only, refusal of URLs carrying a known secret, the SSRF check (up front and in the pinned resolver), no https-to-http hop, the content-type allowlist, and the 512 KiB body and 20,000-character text caps.
+  - **Politeness:** at most one request per second per host (robots.txt included).
+  - **Memory:** the robots cache (64 origins) and the per-host pacer (64 hosts) are bounded per tool, with no threads.
+  - **Dependencies:** tole-cli gains 30 crates (nginjen-lite's `scraper` HTML stack, 4 of them build-time proc-macros); tole-core is unchanged at 58 (`--no-default-features`). Release binary sizes are in `docs/perf.md`.
 - Multi-round discussion, the pure core, part 1a of #588 (`tole_core::discussion`, design `profiles-collaboration-secrets.md` A8.3). No model is called and there is no command yet; the ledger (1b) and the orchestration that calls the participants, the scribe and the checker are built on these parts.
   - **Contract**: question, 1 to 12 acceptance criteria (the gate checks them), 1 to 8 participants (profile names), a token budget and max rounds (default 4, at most 10).
   - **Sanitizer pass 1**, deterministic: secrets redacted, control and invisible characters removed, the `<<<` `>>>` fence markers neutralized, sizes capped. Applied to the question, the criteria, every contribution and every digest line.
