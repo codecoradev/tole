@@ -520,6 +520,44 @@ Each PR updates the README status line and `docs/epics.md` in the same PR
 3. Retention: how long to keep `jobs.jsonl` before rotation? (Rotation must
    write a new segment, not rewrite — keeps the append-only rule.)
 
+### Entry point: open question
+
+This one is about the multi-round discussion (#588, design
+[profiles-collaboration-secrets.md](profiles-collaboration-secrets.md)
+A8.3), not the scheduler. The discussion runs as a host library
+(`tole_cli::discussion_host`): inline participants, the scribe and the
+claim-checker, the gate, the budget and crash resume all work, but
+**nothing starts a discussion yet**. The owner wants the mode open to agents
+too, not only to the owner. The options and what each costs in security:
+
+| | (a) owner-only `tole discuss` | (b) model-facing tool | (c) both |
+|---|---|---|---|
+| Who starts one | the owner, from a shell | any agent that has the tool, and so whatever text steers that agent | both |
+| Prompt injection | none: the owner types the contract | a web page, issue or tool result can ask the agent to open one, and the contract (question, criteria, participants) is model-written | as (b) |
+| Budget | the owner names it | carved from the caller's **remaining** budget, never added (A8.1) | as (b) for agents |
+| Who may speak | user-config profiles | the same, and only profiles the caller may delegate to (a subset of its allow list) | as (b) for agents |
+| Authority | read-only: inline voices have no tools | read-only participants by default; any Write a participant wants goes to the **owner's** approval surface, never to the caller's allowlist | as (b) |
+| Depth | 0 | a discussion is one delegation level: the tool exists only where `depth < max_depth`, and its participants cannot start another | as (b) |
+| Power | the owner's | never more than the creator holds: no new secrets, allow patterns, profiles or budget | as (b) |
+| Approval | none (the owner typed it) | the tool is `Risk::Write` (it spends budget and may start children), approved or allowlisted like `delegate` | as (b) |
+| Cost of a mistake | the owner's budget | bounded by the carve and `max_rounds`; an agent cannot loop discussions past its own budget | as (b) |
+
+Every option keeps what the library already enforces: only the gate decides
+report, escalate or continue; no digest or contribution text can trigger a
+report, a write, a roster change or a tool call; the budget and
+`max_rounds` stop with an escalation to the owner; dissent is never dropped;
+participants are user-config profiles; the scribe and the claim-checker are
+built-in or owner-overridden roles.
+
+**Recommendation: (c), in two steps.** Ship (a) first: it needs no new trust
+decision, shows the owner what a discussion costs, and exercises the library
+end to end. Then add (b) under the same rules as `delegate` (it is a
+delegation with several voices): carve from the caller, depth cap,
+participants within the caller's allow list, read-only participants by
+default, any Write approval escalated to the owner. (b) alone makes the
+first discussion an agent's, which is the injection path; (a) alone closes
+the mode to agents, which the owner asked to keep open.
+
 ## 12. Non-goals
 
 Chat channels; a public skill marketplace; hosted cloud; heartbeat/"proactive"
