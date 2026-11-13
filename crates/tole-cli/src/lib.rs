@@ -54,3 +54,5 @@ pub mod trust;
 pub mod tui_host;
 pub mod turn_runner;
 pub mod usage_report;
+#[cfg(feature = "web-builtin")]
+pub mod web_builtin;

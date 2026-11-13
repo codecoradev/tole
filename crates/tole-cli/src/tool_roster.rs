@@ -356,17 +356,41 @@ pub fn build(approver: impl Approver + 'static, roster: Roster) -> Result<ToolRe
     // each call needs approval. Registered in plan mode too: it writes
     // nothing.
     add(&mut reg, tracked(Box::new(ReadFileTool::raw(root.clone()))))?;
-    // Web tools (#215): fetch always; search only with a backend.
+    // Web tools (#215, #625): a configured `TOLE_WEB_*` backend wins; else
+    // the built-in tools (`web-builtin`); without that feature, the direct
+    // text fetcher and no search.
+    #[cfg(feature = "web-builtin")]
+    let builtin = std::sync::Arc::new(crate::web_builtin::TolHttp::new(
+        &secrets,
+        tole_core::web::allow_private_from_env(),
+    ));
     match tole_core::web::WebBackendFetchTool::from_env().map_err(anyhow::Error::msg)? {
         Some(fetch) => add(&mut reg, Box::new(fetch.with_secrets(&secrets)))?,
+        #[cfg(feature = "web-builtin")]
+        None => add(
+            &mut reg,
+            Box::new(crate::web_builtin::BuiltinFetchTool::new(
+                std::sync::Arc::clone(&builtin),
+            )),
+        )?,
+        #[cfg(not(feature = "web-builtin"))]
         None => add(
             &mut reg,
             Box::new(tole_core::web::WebFetchTool::default().with_secrets(&secrets)),
         )?,
     }
     // A malformed search config (#436) fails startup loudly.
-    if let Some(search) = tole_core::web::WebSearchTool::from_env().map_err(anyhow::Error::msg)? {
-        add(&mut reg, Box::new(search.with_secrets(&secrets)))?;
+    match tole_core::web::WebSearchTool::from_env().map_err(anyhow::Error::msg)? {
+        Some(search) => add(&mut reg, Box::new(search.with_secrets(&secrets)))?,
+        #[cfg(feature = "web-builtin")]
+        None => add(
+            &mut reg,
+            Box::new(crate::web_builtin::BuiltinSearchTool::new(
+                builtin, &secrets,
+            )),
+        )?,
+        #[cfg(not(feature = "web-builtin"))]
+        None => {}
     }
     if !plan {
         add(
