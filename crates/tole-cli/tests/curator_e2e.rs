@@ -241,6 +241,8 @@ fn the_user_config_can_switch_the_curator_off_and_set_the_thresholds() {
     assert!(out(&o).contains("user config not applied"), "{}", out(&o));
 }
 
+// `schedule` needs the built-in scheduler (shell-tools).
+#[cfg(feature = "shell-tools")]
 #[test]
 fn schedule_saves_one_weekly_script_job_and_unschedule_removes_it() {
     let home = tmpdir();
