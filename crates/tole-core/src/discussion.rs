@@ -76,23 +76,25 @@ pub struct Sanitized {
     pub truncated: bool,
 }
 
-/// Sanitizer pass 1.
+/// Sanitizer pass 1. Control and invisible characters go first, so a secret
+/// split by a zero-width character cannot dodge the redaction and re-form
+/// afterwards; then secrets are redacted, then the fence markers are
+/// neutralized (a redaction marker never holds one), then the text is capped.
 pub fn sanitize(raw: &str, secrets: &SecretSet, max: usize) -> Sanitized {
-    let red = secrets.redact(raw);
-    let redacted = red != raw;
     let mut removed = 0usize;
-    let kept: String = red
+    let stripped: String = raw
         .chars()
         .filter(|c| {
-            let drop = (c.is_control() && !matches!(c, '\n' | '\t')) || is_hidden(*c);
-            let drop = drop && !matches!(c, '\n' | '\t');
+            let drop = !matches!(c, '\n' | '\t') && (c.is_control() || is_hidden(*c));
             if drop {
                 removed += 1;
             }
             !drop
         })
         .collect();
-    let safe = kept
+    let red = secrets.redact(&stripped);
+    let redacted = red != stripped;
+    let safe = red
         .replace("<<<", "\u{2039}\u{2039}\u{2039}")
         .replace(">>>", "\u{203a}\u{203a}\u{203a}");
     let truncated = safe.chars().count() > max;

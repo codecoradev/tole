@@ -109,6 +109,21 @@ fn the_sanitizer_redacts_neutralizes_and_caps() {
         s.text
     );
     assert!(s.text.contains("a\tb\nc"), "layout is kept");
+    // A secret split by invisible characters is redacted, not rebuilt.
+    for split in [
+        "tok\u{200b}-abcdef-0123456789",
+        "tok-abc\u{202e}def-0123456789",
+        "t\u{00ad}o\u{feff}k-abcdef-0123456789",
+        "tok-abcdef-\u{1b}0123456789",
+    ] {
+        let s = sanitize(&format!("key {split} end"), &secrets(), 200);
+        assert!(s.redacted, "{split:?}");
+        assert!(
+            !s.text.contains("abcdef") && !s.text.contains("0123456789"),
+            "{split:?}: {}",
+            s.text
+        );
+    }
     let long = sanitize(&"x".repeat(500), &SecretSet::default(), 100);
     assert!(long.truncated && long.text.chars().count() == 100 && long.text.ends_with('\u{2026}'));
     let plain = sanitize("plain", &SecretSet::default(), 100);
