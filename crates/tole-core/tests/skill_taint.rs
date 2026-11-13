@@ -95,3 +95,27 @@ fn a_resumed_session_keeps_the_taint_of_what_it_fetched_before() {
     run_turn(&mut c2, &mut script("read_file"), &registry(&third), "more").unwrap();
     assert!(third.sources().is_empty());
 }
+
+#[test]
+fn one_registry_reused_across_sessions_tracks_the_session_in_front() {
+    let dir = std::env::temp_dir().join(format!("tole-taint-swap-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let tracker = TaintTracker::default();
+    tracker.mark("webhook");
+    let reg = registry(&tracker);
+
+    let mut dirty = JsonlStorage::create(&dir, "dirty", None).unwrap();
+    run_turn(&mut dirty, &mut script("web_fetch"), &reg, "go").unwrap();
+    assert_eq!(tracker.sources(), ["web_fetch", "webhook"]);
+
+    // A new session in the same registry starts without the old taint, but
+    // keeps what the host marked.
+    let mut clean = JsonlStorage::create(&dir, "clean", None).unwrap();
+    run_turn(&mut clean, &mut script("read_file"), &reg, "go").unwrap();
+    assert_eq!(tracker.sources(), ["webhook"]);
+
+    // Going back to the tainted session restores its taint.
+    run_turn(&mut dirty, &mut script("read_file"), &reg, "again").unwrap();
+    assert_eq!(tracker.sources(), ["web_fetch", "webhook"]);
+}
