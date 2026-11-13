@@ -548,6 +548,12 @@ pub fn build(approver: impl Approver + 'static, roster: Roster) -> Result<ToolRe
     }
     #[cfg(feature = "mcp")]
     for cfg in &roster.mcp_servers {
+        // #680: an unapproved or revoked server is not connected at all.
+        if let Some(note) = plugin_gate.refuse_unseen(&cfg.name) {
+            eprintln!("tole: mcp[{}]: {note}", cfg.name);
+            eprintln!("tole: mcp[{}]: no tools registered", cfg.name);
+            continue;
+        }
         let admit = |s: &str, v: &str, t: &[tole_core::plugin_lock::ManifestTool]| {
             plugin_gate.check(s, v, t)
         };
@@ -558,7 +564,11 @@ pub fn build(approver: impl Approver + 'static, roster: Roster) -> Result<ToolRe
         if names.is_empty() {
             eprintln!("tole: mcp[{}]: no tools registered", cfg.name);
         }
-        if tole_core::mcp::probe_server_extras(cfg).resources {
+        // #680: only an admitted server is asked for resources (and the
+        // core refuses the others anyway).
+        if tole_core::mcp::is_admitted(&cfg.name)
+            && tole_core::mcp::probe_server_extras(cfg).resources
+        {
             resource_servers.push(cfg.name.clone());
         }
     }

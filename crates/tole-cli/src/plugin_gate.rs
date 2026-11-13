@@ -96,6 +96,18 @@ impl Gate {
         }
     }
 
+    /// The refusal for `server` when the lock decides without the live
+    /// manifest (#680): no entry (or an unreadable lock, which trusts
+    /// nothing) or revoked. Such a server is not connected at all, so an
+    /// unapproved or revoked stdio server never runs.
+    pub fn refuse_unseen(&self, server: &str) -> Option<String> {
+        match self.lock.get(server) {
+            None => Some(refusal(server, &Admission::Unlocked)),
+            Some(e) if e.revoked => Some(refusal(server, &Admission::Revoked)),
+            Some(_) => None,
+        }
+    }
+
     /// Writes `server`'s approval (as it is now) to the user lock and the
     /// ledger.
     pub fn approve(
