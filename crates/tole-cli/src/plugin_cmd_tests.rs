@@ -227,7 +227,9 @@ fn revoke_blocks_the_next_connect_and_writes_the_ledger() {
     );
     h.run(&v1(), revoke("cora", Some(&hash(&v1())))).unwrap();
     let gate = Gate::load(Some(h.user()), &h.dir.join("ws"));
-    let e = gate.check("cora", &v1().0, &v1().1).unwrap_err();
+    let e = gate
+        .check("cora", "stdio:true", &v1().0, &v1().1)
+        .unwrap_err();
     assert!(e.contains("revoked"), "{e}");
     let ledger =
         std::fs::read_to_string(h.user().with_file_name(plugin_lock::LEDGER_FILE)).unwrap();
@@ -309,7 +311,8 @@ fn list_and_diff_say_when_the_binary_no_longer_matches_its_approval() {
         r[0]["binary"].as_str().unwrap().contains("binary changed"),
         "{r:?}"
     );
-    assert_eq!(r[0]["state"], json!("approved"), "not enforced at connect");
+    // #679: enforced at connect, so `list` reports the server as changed.
+    assert_eq!(r[0]["state"], json!("changed (another program file)"));
     let d = h.run(&v1(), diff("srv")).unwrap();
     assert!(d.contains("binary changed since approval"), "{d}");
 }

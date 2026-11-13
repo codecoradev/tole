@@ -111,7 +111,7 @@ fn binary_note(e: &LockEntry) -> Option<&'static str> {
         return None;
     }
     (integrity(&e.source) != e.integrity)
-        .then_some("binary changed since approval (not enforced at connect)")
+        .then_some("binary changed since approval: refused at connect until re-approved")
 }
 
 fn list(ctx: &Ctx<'_>, as_json: bool) -> String {
@@ -148,12 +148,24 @@ fn list(ctx: &Ctx<'_>, as_json: bool) -> String {
             Some(cfg) => match (ctx.list)(cfg) {
                 Err(e) => format!("unreachable: {e}"),
                 Ok(_) if broken => "unapproved (a lock is unreadable)".to_string(),
-                Ok((v, tools)) => match admit(&eff, name, &v, &tools) {
-                    Admission::Trusted => "approved".into(),
-                    Admission::Changed { .. } => "changed".into(),
-                    Admission::Unlocked => "unapproved".into(),
-                    Admission::Revoked => "revoked".into(),
-                },
+                Ok((v, tools)) => {
+                    let source = crate::plugin_gate::source_of(cfg);
+                    let integrity = crate::plugin_gate::integrity(&source);
+                    let live = tole_core::plugin_lock::Live {
+                        source: &source,
+                        integrity: &integrity,
+                        version: &v,
+                        tools: &tools,
+                    };
+                    match admit(&eff, name, &live) {
+                        Admission::Trusted => "approved".into(),
+                        Admission::Changed { .. } => "changed".into(),
+                        Admission::Moved => "changed (another command or URL)".into(),
+                        Admission::Rebuilt => "changed (another program file)".into(),
+                        Admission::Unlocked => "unapproved".into(),
+                        Admission::Revoked => "revoked".into(),
+                    }
+                }
             },
         };
         let lock = match (

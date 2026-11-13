@@ -250,12 +250,16 @@ pub struct LockEntry {
     #[serde(default)]
     pub version: String,
     /// `sha256:<hex>` of the resolved stdio binary at approval (empty for
-    /// HTTP); recorded, verified by `tole plugin` (part 2).
+    /// HTTP or an unresolvable program). Checked at every connect (#679):
+    /// a different binary at the same path is not admitted.
     #[serde(default)]
     pub integrity: String,
     /// [`manifest_hash`] of the approved tool list.
     pub manifest_hash: String,
-    /// Secret NAMES granted to this server.
+    /// Secret NAMES granted to this server: the `mcp` grants held when it
+    /// was approved. Its stdio process receives only these, and only while
+    /// the `[secrets]` release still binds them to `mcp` (#679); a project
+    /// lock can drop names.
     #[serde(default)]
     pub secrets: Vec<String>,
     /// Sandbox profile (recorded; enforcement is a later part).
@@ -406,7 +410,8 @@ pub fn effective(
 /// The connect-time decision for one server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Admission {
-    /// Locked, not revoked, and the live manifest and version match.
+    /// Locked, not revoked, and the live source, binary, manifest and
+    /// version match.
     Trusted,
     /// No lock entry.
     Unlocked,
@@ -414,22 +419,46 @@ pub enum Admission {
     Revoked,
     /// The live manifest or version differs from the approval.
     Changed { locked: String, live: String },
+    /// The configured command line or URL is not the approved one (#679):
+    /// the name now points at another server, whatever it reports.
+    Moved,
+    /// The stdio program's file is not the approved binary (#679).
+    Rebuilt,
 }
 
-/// Decides whether `server`'s live tools (and reported version) may be
-/// registered under `lock`.
-pub fn admit(
-    lock: &BTreeMap<String, LockEntry>,
-    server: &str,
-    version: &str,
-    tools: &[ManifestTool],
-) -> Admission {
+/// What a connect sees of a server, compared against its lock entry.
+#[derive(Debug, Clone, Copy)]
+pub struct Live<'a> {
+    /// `stdio:<command line>` or the url, as configured now.
+    pub source: &'a str,
+    /// `sha256:<hex>` of the stdio program as it resolves now (empty when it
+    /// cannot be read, or for HTTP).
+    pub integrity: &'a str,
+    /// The version the server reports.
+    pub version: &'a str,
+    /// The tools the server lists.
+    pub tools: &'a [ManifestTool],
+}
+
+/// Decides whether `server` may be registered under `lock`: its source and
+/// binary (the host's own facts, #679), then its manifest and version (the
+/// server's claims, which any process can replay).
+pub fn admit(lock: &BTreeMap<String, LockEntry>, server: &str, live: &Live<'_>) -> Admission {
     let Some(e) = lock.get(server) else {
         return Admission::Unlocked;
     };
     if e.revoked {
         return Admission::Revoked;
     }
+    if e.source != live.source {
+        return Admission::Moved;
+    }
+    // An approval that recorded a binary hash binds it; one that could not
+    // (HTTP, an unresolvable program) has nothing to compare.
+    if !e.integrity.is_empty() && e.integrity != live.integrity {
+        return Admission::Rebuilt;
+    }
+    let (version, tools) = (live.version, live.tools);
     let live = manifest_hash(tools);
     if live != e.manifest_hash || version != e.version {
         return Admission::Changed {

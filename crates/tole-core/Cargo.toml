@@ -50,5 +50,13 @@ name = "mcp_prompts"
 required-features = ["mcp"]
 
 [[test]]
+name = "mcp_admission"
+required-features = ["mcp"]
+
+[[test]]
+name = "mcp_secret_grant"
+required-features = ["mcp"]
+
+[[test]]
 name = "mcp_http"
 required-features = ["mcp"]

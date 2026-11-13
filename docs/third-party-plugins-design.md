@@ -247,6 +247,9 @@ approve <name>` approves from a terminal, or from a script with
 reviewed); `tole plugin revoke <name>` blocks a server until it is approved
 again. An approval made before part 2 (lock version 1) has no tool
 snapshot: `diff` shows the live list in full instead, and approving again
-stores one. The binary integrity hash recorded at approval is checked by
-`list` and `diff` only; a changed binary is reported, not blocked at
-connect (the manifest and version still are).
+stores one. Since #679 an approval is also bound to the configured command
+line or URL and, for a stdio program that resolved to a file, to its
+SHA-256: a different source or binary is refused at connect (and reported
+by `list` and `diff`) until it is approved again. The entry's `secrets`
+(the `mcp` grants held at approval) are the server's launch grant,
+intersected with the current `[secrets]` release.

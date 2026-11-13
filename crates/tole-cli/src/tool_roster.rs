@@ -548,9 +548,22 @@ pub fn build(approver: impl Approver + 'static, roster: Roster) -> Result<ToolRe
     }
     #[cfg(feature = "mcp")]
     for cfg in &roster.mcp_servers {
+        // #680, #679: an unapproved or revoked server, or an approved name
+        // now pointing at another command, URL or binary, is not started.
+        // The lock also binds them after connect (`check`), and the
+        // server's process gets only the secrets its approval granted.
+        let source = crate::plugin_gate::source_of(cfg);
+        if let Some(note) = plugin_gate.refuse_unseen(&cfg.name, &source) {
+            eprintln!("tole: mcp[{}]: {note}", cfg.name);
+            eprintln!("tole: mcp[{}]: no tools registered", cfg.name);
+            continue;
+        }
         let admit = |s: &str, v: &str, t: &[tole_core::plugin_lock::ManifestTool]| {
-            plugin_gate.check(s, v, t)
+            plugin_gate.check(s, &source, v, t)
         };
+        let mut cfg = cfg.clone();
+        cfg.secret_grant = plugin_gate.secret_grant(&cfg.name);
+        let cfg = &cfg;
         let names = tole_core::mcp::register_server_tools(&mut reg, cfg, &secrets, &admit);
         if cfg.name == "cora" && !names.is_empty() {
             cora_mcp_ok = true;
@@ -558,7 +571,8 @@ pub fn build(approver: impl Approver + 'static, roster: Roster) -> Result<ToolRe
         if names.is_empty() {
             eprintln!("tole: mcp[{}]: no tools registered", cfg.name);
         }
-        if tole_core::mcp::probe_server_extras(cfg).resources {
+        // #680: only a server this session admitted is asked for resources.
+        if reg.mcp_admitted(&cfg.name) && tole_core::mcp::probe_server_extras(cfg).resources {
             resource_servers.push(cfg.name.clone());
         }
     }
