@@ -1079,7 +1079,15 @@ symlink at the last path component and never waits on a FIFO, and on
 every platform the handle must be a regular file. The `.lock` sidecar and
 compaction's temp file and reopen are opened the same way. The resume uses
 `open_bounded` (64 MiB cap on the handle), so a file swapped for a symlink
-or a FIFO after an earlier check is refused at the open. Not covered: a
-directory on the path (`.tole` or `.tole/sessions`) swapped for a symlink.
-That only leads to a file of the same random session id in another
-directory, but the `.lock` sidecar would be created there.
+or a FIFO after an earlier check is refused at the open. A directory on
+the path (`.tole` or `.tole/sessions`) swapped for a symlink is covered on
+unix too (#639): the storage resolves its directory once, walks the
+canonical path from `/` with `O_NOFOLLOW | O_DIRECTORY` at every
+component (a component swapped for a link in between is an error) and holds
+that directory handle. The session file, the `.lock` sidecar, compaction's
+temp file, the rename over the live file and the directory sync are all
+relative to the handle, so a swap after the open redirects nothing. Still
+not covered: a path that already goes through a link when it is opened (it
+is resolved once, as the path says; the host cannot tell a legitimate link
+such as `/tmp` from a planted one), and non-unix targets, which keep the
+path-based behavior.

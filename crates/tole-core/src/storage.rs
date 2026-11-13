@@ -27,7 +27,8 @@
 //! ```
 
 use std::collections::BTreeMap;
-use std::fs::{File, OpenOptions};
+use std::ffi::{OsStr, OsString};
+use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -37,6 +38,7 @@ use serde_json::Value;
 
 use crate::entry::{Entry, EntryType, NewEntry};
 use crate::register::{is_valid_namespace, RegisterOp, RegisterWrite};
+use crate::safe_dir::{Mode, SafeDir};
 use crate::secrets::SecretSet;
 use crate::state::{MachineState, Pc, StateTransition};
 use crate::STORAGE_VERSION;
@@ -363,6 +365,12 @@ pub fn is_valid_session_id(id: &str) -> bool {
 pub struct JsonlStorage {
     session_id: String,
     path: PathBuf,
+    /// The session directory, held without following a symlink (#639), and
+    /// the file's name in it: every later open, rename and sync goes through
+    /// the handle, so swapping a directory on `path` for a link cannot
+    /// redirect the session file, its sidecar or the compaction temp file.
+    dir: SafeDir,
+    file_name: OsString,
     writer: BufWriter<File>,
     /// Exclusive advisory lock on the sidecar `<id>.jsonl.lock` (never
     /// renamed, so it survives `compact()`); `None` for read-only handles.
@@ -489,7 +497,10 @@ impl JsonlStorage {
                 format!("invalid session id: {session_id:?}"),
             )));
         }
-        let path = dir.as_ref().join(format!("{session_id}.jsonl"));
+        let file_name = OsString::from(format!("{session_id}.jsonl"));
+        let path = dir.as_ref().join(&file_name);
+        // Resolved once; every file below is opened relative to it (#639).
+        let dir_h = SafeDir::open(dir.as_ref())?;
         let created_at = now_ms();
         let cwd = cwd.unwrap_or_default();
         // The pinned prompt is re-sent on resume: store what the provider
@@ -508,19 +519,24 @@ impl JsonlStorage {
             name: name.map(str::to_string),
             forked_from: forked_from.clone(),
         };
-        let mut writer = BufWriter::new(
-            OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)?,
-        );
-        let lock = lock_writer(&path)?;
+        let mut writer = BufWriter::new(open_in(
+            &dir_h,
+            &file_name,
+            Mode {
+                write: true,
+                create_new: true,
+                ..Mode::default()
+            },
+        )?);
+        let lock = lock_writer(&dir_h, &file_name)?;
         let header_line = serde_json::to_string(&header)?;
         writeln!(writer, "{header_line}")?;
         writer.flush()?;
         Ok(Self {
             session_id,
             path,
+            dir: dir_h,
+            file_name,
             writer,
             _lock: Some(lock),
             good_len: header_line.len() as u64 + 1,
@@ -664,17 +680,28 @@ impl JsonlStorage {
 
     fn open_with(path: &Path, repair: bool, cap: Option<u64>) -> Result<Self, StorageError> {
         let path = path.to_path_buf();
+        // The directory is resolved once and held without following a link
+        // (#639); the session file and its sidecar open relative to it.
+        let (dir_h, file_name) = SafeDir::for_file(&path)?;
         // Lock BEFORE reading or repairing: the torn-tail truncation below
         // would cut a line another process is still appending.
         let lock = if repair {
-            Some(lock_writer(&path)?)
+            Some(lock_writer(&dir_h, &file_name)?)
         } else {
             None
         };
         // One handle for the whole life of this storage. Read-only replays
         // get a read-only handle: a commit through them fails instead of
         // writing.
-        let file = open_plain(OpenOptions::new().read(true).append(repair), &path)?;
+        let file = open_in(
+            &dir_h,
+            &file_name,
+            Mode {
+                read: true,
+                append: repair,
+                ..Mode::default()
+            },
+        )?;
         let too_large =
             |cap: u64| StorageError::Invalid(format!("session file larger than {cap} bytes"));
         if let Some(cap) = cap {
@@ -733,6 +760,8 @@ impl JsonlStorage {
         let mut out = Self {
             session_id: header.id.clone(),
             path: path.clone(),
+            dir: dir_h,
+            file_name,
             writer: BufWriter::new(file),
             _lock: lock,
             good_len: 0,
@@ -836,7 +865,7 @@ impl JsonlStorage {
         if repair && good_bytes < handle.metadata()?.len() {
             handle.set_len(good_bytes)?;
             handle.sync_data()?;
-            sync_dir(&out.path)?;
+            out.dir.sync()?;
         }
         // The global seq advances with every record, transition or not.
         out.state.seq = out.state.seq.max(last_seq);
@@ -1051,8 +1080,8 @@ fn is_at_eof(reader: &mut impl Read) -> bool {
 /// our pid in it (best effort). A sidecar, not the session file: `compact()`
 /// renames a new file over the live path, which would drop a lock held on
 /// the old inode.
-fn lock_writer(path: &Path) -> Result<File, StorageError> {
-    let mut name = path.as_os_str().to_owned();
+fn lock_writer(dir: &SafeDir, file_name: &OsStr) -> Result<File, StorageError> {
+    let mut name = file_name.to_owned();
     name.push(".lock");
     // CLOEXEC (set by `open_plain`): a spawned child must not inherit the
     // writer lock. Without it, an flock held on the fd survives into every
@@ -1061,13 +1090,15 @@ fn lock_writer(path: &Path) -> Result<File, StorageError> {
     // session. NOFOLLOW and the regular-file check: the pid write below
     // truncates the file, so a planted symlink must not lead it elsewhere
     // (#581).
-    let mut f = open_plain(
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false),
-        Path::new(&name),
+    let mut f = open_in(
+        dir,
+        &name,
+        Mode {
+            read: true,
+            write: true,
+            create: true,
+            ..Mode::default()
+        },
     )?;
     let mut waited = std::time::Duration::ZERO;
     loop {
@@ -1112,46 +1143,18 @@ fn lock_writer(path: &Path) -> Result<File, StorageError> {
 const SELF_HOLD_RETRY: std::time::Duration = std::time::Duration::from_millis(150);
 const SELF_HOLD_STEP: std::time::Duration = std::time::Duration::from_millis(5);
 
-/// Opens `path` with `opts` for a session handle (#581). On unix the open
-/// does not follow a symlink at the last path component (`O_NOFOLLOW`) and
+/// Opens `name` in `dir` for a session handle (#581, #639). The open is
+/// relative to the directory handle, so no directory on the way can be a
+/// swapped link; it does not follow a symlink at `name` (`O_NOFOLLOW`) and
 /// does not wait for a FIFO's other end (`O_NONBLOCK`, which has no effect
-/// on a regular file's reads and writes). On every platform the handle must
-/// be a regular file: the check is an `fstat` of the opened handle, so the
-/// file checked is the file used.
-fn open_plain(opts: &mut OpenOptions, path: &Path) -> Result<File, StorageError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        // CLOEXEC: a spawned child must not inherit a session handle or the
-        // writer lock (std sets it too; kept explicit for the lock).
-        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
-    }
-    let f = opts.open(path)?;
-    if !f.metadata()?.is_file() {
-        return Err(StorageError::Invalid(format!(
-            "{} is not a regular file",
-            path.display()
-        )));
-    }
-    Ok(f)
-}
-
-/// Durability: flush a rename into the parent directory so the directory
-/// entry itself survives a crash. POSIX-only; on non-Unix targets opening
-/// the directory is not possible and we accept the platform's guarantees.
-#[cfg(unix)]
-fn sync_dir(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::ffi::OsStrExt;
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().as_bytes().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    File::open(parent)?.sync_all()
-}
-
-#[cfg(not(unix))]
-fn sync_dir(_path: &Path) -> std::io::Result<()> {
-    Ok(())
+/// on a regular file's reads and writes). The handle must be a regular file:
+/// the check is an `fstat` of the opened handle, so the file checked is the
+/// file used.
+fn open_in(dir: &SafeDir, name: &OsStr, mode: Mode) -> Result<File, StorageError> {
+    dir.open_file(name, mode).map_err(|e| match e.kind() {
+        std::io::ErrorKind::InvalidInput => StorageError::Invalid(e.to_string()),
+        _ => StorageError::Io(e),
+    })
 }
 
 fn now_ms() -> u64 {
@@ -1399,12 +1402,19 @@ impl Storage for JsonlStorage {
 
         // Write to temp file, fsync, then atomic rename over the live path,
         // then fsync the directory so the rename itself survives a crash.
-        let tmp = self.path.with_extension("jsonl.tmp");
+        let tmp = PathBuf::from(&self.file_name).with_extension("jsonl.tmp");
         {
-            // Never through a symlink planted at the temp path (#581).
-            let mut w = BufWriter::new(open_plain(
-                OpenOptions::new().write(true).create(true).truncate(true),
-                &tmp,
+            // Never through a symlink planted at the temp path (#581), and
+            // in the held directory whatever happened to the path (#639).
+            let mut w = BufWriter::new(open_in(
+                &self.dir,
+                tmp.as_os_str(),
+                Mode {
+                    write: true,
+                    create: true,
+                    truncate: true,
+                    ..Mode::default()
+                },
             )?);
             let header = HeaderLine {
                 v: 1,
@@ -1424,15 +1434,22 @@ impl Storage for JsonlStorage {
             w.flush()?;
             w.get_ref().sync_data()?;
         }
-        std::fs::rename(&tmp, &self.path)?;
-        sync_dir(&self.path)?;
+        self.dir.rename(tmp.as_os_str(), &self.file_name)?;
+        self.dir.sync()?;
         // Reopen the writer on the new file. If THIS reopen fails, the
         // rename has already happened: the old writer now points at an
         // unlinked inode, so any further commit would vanish silently.
         // Mark the session poisoned — every subsequent commit fails
         // LOUDLY instead of losing data (CodeCora scan-3: silent loss).
         self.writer = BufWriter::new(
-            match open_plain(OpenOptions::new().append(true), &self.path) {
+            match open_in(
+                &self.dir,
+                &self.file_name,
+                Mode {
+                    append: true,
+                    ..Mode::default()
+                },
+            ) {
                 Ok(w) => w,
                 Err(e) => {
                     self.poisoned = Some(StorageError::Invalid(format!(
@@ -1460,6 +1477,7 @@ mod poison_tests {
     use super::*;
     use crate::entry::{EntryType, NewEntry};
     use serde_json::json;
+    use std::fs::OpenOptions;
 
     /// Unique per invocation: pid alone collides across concurrent or
     /// pid-reusing runs sharing the temp dir.

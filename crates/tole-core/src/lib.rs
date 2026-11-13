@@ -83,6 +83,7 @@ pub mod resource_guard;
 pub mod router;
 #[cfg(feature = "shell-tools")]
 pub mod run_command;
+pub(crate) mod safe_dir;
 // Approval-surface text sanitizer (#327): crate-internal, no public API.
 pub mod plugin_lock;
 pub(crate) mod sanitize;
