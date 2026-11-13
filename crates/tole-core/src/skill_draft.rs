@@ -325,7 +325,7 @@ fn secret_shape(text: &str) -> Option<&'static str> {
 /// treats as unsafe, plus the ranges it leaves alone because they are legal
 /// in a prompt but can smuggle text into a skill (Unicode tag characters,
 /// variation selectors, the soft hyphen, Hangul and Braille fillers).
-fn is_hidden(c: char) -> bool {
+pub fn is_hidden(c: char) -> bool {
     crate::sanitize::is_unsafe(c)
         || matches!(
             c,

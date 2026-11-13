@@ -94,6 +94,9 @@ pub struct ToolRegistry {
     /// policy injection at the tool boundary. `None` = off, zero cost.
     #[cfg(feature = "shell-tools")]
     hooks: Option<crate::hooks::ToolHooks>,
+    /// Records the untrusted tools a session ran (#592): web and MCP output
+    /// taints a skill draft. `None` = nothing is recorded.
+    taint: Option<crate::skill_draft::TaintTracker>,
 }
 
 impl ToolRegistry {
@@ -111,7 +114,19 @@ impl ToolRegistry {
             approver: Some(Box::new(approver)),
             #[cfg(feature = "shell-tools")]
             hooks: None,
+            taint: None,
         }
+    }
+
+    /// Record every untrusted tool this registry executes into `tracker`
+    /// (#592). The turn loop's execute funnel does the recording, so no
+    /// tool can run without being seen.
+    pub fn set_taint_tracker(&mut self, tracker: crate::skill_draft::TaintTracker) {
+        self.taint = Some(tracker);
+    }
+
+    pub(crate) fn taint_tracker(&self) -> Option<&crate::skill_draft::TaintTracker> {
+        self.taint.as_ref()
     }
 
     /// Attach opt-in tool-boundary hooks (issue #110). Default OFF.

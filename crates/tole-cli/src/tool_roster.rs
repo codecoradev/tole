@@ -53,6 +53,9 @@ pub struct Roster {
     pub plan_emitter: Option<PlanEmitter>,
     /// Where finished background jobs nudge the session (#217).
     pub job_notices: Option<tole_core::interrupt::InterruptQueue>,
+    /// The session's id when the face knows it before building the roster
+    /// (server faces do); recorded as a skill draft's provenance (#592).
+    pub session: Option<String>,
 }
 
 impl Roster {
@@ -68,6 +71,7 @@ impl Roster {
             mcp_servers: Vec::new(),
             plan_emitter: None,
             job_notices: None,
+            session: None,
         }
     }
 }
@@ -319,6 +323,31 @@ pub fn build(approver: impl Approver + 'static, roster: Roster) -> Result<ToolRe
                 None,
                 root.clone(),
                 agents.parent_allows.clone(),
+            )),
+        )?;
+    }
+    // Skill growth (#592): a session face's tool, never a child's or a
+    // plan-mode session's. It writes a draft only; the taint tracker
+    // records what this session fetched from outside, at the execute funnel.
+    if let (Some(_), 0, false) = (&roster.agents, depth, plan) {
+        let taint = tole_core::skill_draft::TaintTracker::default();
+        reg.set_taint_tracker(taint.clone());
+        #[cfg(feature = "shell-tools")]
+        let index: Option<std::sync::Arc<dyn tole_core::skill_index::SkillIndex>> =
+            crate::skill_recall::SkillRecall::from_env(None)
+                .ok()
+                .and_then(|r| r.index);
+        #[cfg(not(feature = "shell-tools"))]
+        let index = None;
+        add(
+            &mut reg,
+            Box::new(crate::skill_propose::SkillProposeTool::new(
+                None,
+                taint,
+                roster.session.clone(),
+                crate::config_apply::provider_config().map(|c| c.model),
+                secrets.clone(),
+                index,
             )),
         )?;
     }
