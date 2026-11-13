@@ -138,6 +138,12 @@ pub enum SkillsAction {
         #[arg(long)]
         workspace: Option<PathBuf>,
     },
+    /// Skill drafts the agent proposed with `skill_propose` (#592): list,
+    /// show, reject, record a reviewer's verdict. A draft never loads.
+    Drafts {
+        #[command(subcommand)]
+        action: Option<crate::skill_drafts_cli::DraftsAction>,
+    },
     /// Remove a skill's approval; it stays on disk.
     Revoke { name: String },
     /// Every discovered skill with its approval status, content hash and
@@ -280,6 +286,11 @@ pub fn cli(action: SkillsAction) -> anyhow::Result<()> {
                 .map_err(anyhow::Error::msg)?;
             approvals.save(&path).map_err(anyhow::Error::msg)?;
             println!("approved {name} ({})", pkg.hash);
+        }
+        SkillsAction::Drafts { action } => {
+            let store = tole_core::skill_draft::DraftStore::default_store()
+                .context("the CodeCora home is unresolvable (set CODECORA_HOME or HOME)")?;
+            return crate::skill_drafts_cli::run(action, &store);
         }
         SkillsAction::Revoke { name } => {
             let (path, mut approvals) = store()?;

@@ -164,10 +164,26 @@ fn bands_follow_the_documented_thresholds() {
 fn taint_records_only_untrusted_tools_and_is_shared_by_clones() {
     let t = TaintTracker::default();
     let clone = t.clone();
-    for tool in ["read_file", "run_command", "load_skill", "uteke_recall"] {
+    for tool in [
+        "read_file",
+        "run_command",
+        "load_skill",
+        "todo_write",
+        "git",
+    ] {
         t.observe_tool(tool);
     }
     assert!(clone.sources().is_empty());
+    for outside in [
+        "gh",
+        "gitea",
+        "agent_poll",
+        "delegate_poll",
+        "uteke_recall",
+        "tole_session_prompt",
+    ] {
+        assert!(is_untrusted_tool(outside), "{outside}");
+    }
     clone.observe_tool("web_fetch");
     t.observe_tool("mcp_github_search");
     t.mark("webhook");

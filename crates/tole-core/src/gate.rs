@@ -64,6 +64,8 @@ pub(crate) struct Authorized<'a> {
     tool: &'a dyn Tool,
     risk: Risk,
     permit: Option<Permit>,
+    /// Where an untrusted tool's run is recorded (#592).
+    taint: Option<&'a crate::skill_draft::TaintTracker>,
 }
 
 impl Authorized<'_> {
@@ -74,8 +76,18 @@ impl Authorized<'_> {
 
     /// The crate-internal execute funnel: consumes the authorization.
     pub(crate) fn execute(self, input: Value) -> Result<Value, String> {
-        let Authorized { tool, risk, permit } = self;
+        let Authorized {
+            tool,
+            risk,
+            permit,
+            taint,
+        } = self;
         debug_assert_eq!(risk != Risk::ReadOnly, permit.is_some());
+        // Recorded before the call, so a failed fetch still counts: the
+        // request itself reached outside.
+        if let Some(t) = taint {
+            t.observe_tool(tool.name());
+        }
         tool.execute(input)
     }
 }
@@ -107,6 +119,7 @@ pub(crate) fn authorize<'a>(
             tool,
             risk,
             permit: Some(Permit(())),
+            taint: registry.taint_tracker(),
         });
     }
     // A non-ReadOnly tool is always gated in both modes, so only ReadOnly
@@ -116,6 +129,7 @@ pub(crate) fn authorize<'a>(
         tool,
         risk,
         permit: None,
+        taint: registry.taint_tracker(),
     })
 }
 
@@ -149,6 +163,44 @@ mod tests {
         fn interactive(&self) -> bool {
             true
         }
+    }
+
+    struct Named(&'static str);
+    impl Tool for Named {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn risk(&self) -> Risk {
+            Risk::ReadOnly
+        }
+        fn execute(&self, _: Value) -> Result<Value, String> {
+            Err("offline".into())
+        }
+    }
+
+    /// #592: an untrusted tool's run is recorded at the execute funnel,
+    /// failed or not; a trusted one leaves no mark; no tracker, no record.
+    #[test]
+    fn executing_an_untrusted_tool_marks_the_taint_tracker() {
+        let tracker = crate::skill_draft::TaintTracker::default();
+        let mut r = ToolRegistry::new();
+        r.set_taint_tracker(tracker.clone());
+        r.register(Box::new(Named("web_fetch"))).unwrap();
+        r.register(Box::new(Named("read_file"))).unwrap();
+        let run = |name: &str| {
+            let a = authorize(&r, name, &json!({}), Mode::Fresh).unwrap();
+            let _ = a.execute(json!({}));
+        };
+        run("read_file");
+        assert!(tracker.sources().is_empty());
+        run("web_fetch");
+        assert_eq!(tracker.sources(), ["web_fetch"]);
+
+        let mut bare = ToolRegistry::new();
+        bare.register(Box::new(Named("web_fetch"))).unwrap();
+        let a = authorize(&bare, "web_fetch", &json!({}), Mode::Fresh).unwrap();
+        let _ = a.execute(json!({}));
+        assert_eq!(tracker.sources(), ["web_fetch"]);
     }
 
     fn reg(verdict: Verdict, risk: Risk) -> (ToolRegistry, Arc<AtomicUsize>) {

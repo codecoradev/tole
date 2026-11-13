@@ -94,6 +94,9 @@ pub struct ToolRegistry {
     /// policy injection at the tool boundary. `None` = off, zero cost.
     #[cfg(feature = "shell-tools")]
     hooks: Option<crate::hooks::ToolHooks>,
+    /// Records the untrusted tools a session ran (#592): web and MCP output
+    /// taints a skill draft. `None` = nothing is recorded.
+    taint: Option<crate::skill_draft::TaintTracker>,
 }
 
 impl ToolRegistry {
@@ -111,7 +114,34 @@ impl ToolRegistry {
             approver: Some(Box::new(approver)),
             #[cfg(feature = "shell-tools")]
             hooks: None,
+            taint: None,
         }
+    }
+
+    /// Record every untrusted tool this registry executes into `tracker`
+    /// (#592). The turn loop's execute funnel does the recording, so no
+    /// tool can run without being seen.
+    pub fn set_taint_tracker(&mut self, tracker: crate::skill_draft::TaintTracker) {
+        self.taint = Some(tracker);
+    }
+
+    pub(crate) fn taint_tracker(&self) -> Option<&crate::skill_draft::TaintTracker> {
+        self.taint.as_ref()
+    }
+
+    /// Recompute the tool taint from the tool calls in `entries`, the
+    /// session about to run a turn (#592). It runs at the start of every
+    /// turn, so a resumed or forked session that fetched from outside
+    /// before this process started is not clean, and a registry reused for
+    /// another session (`/new`, `/resume`) never carries the wrong
+    /// session's taint. Intents carry the tool name in `payload.tool`.
+    pub(crate) fn seed_taint(&self, entries: &[crate::entry::Entry]) {
+        let Some(t) = &self.taint else { return };
+        t.reseed(
+            entries
+                .iter()
+                .filter_map(|e| e.payload.get("tool")?.as_str()),
+        );
     }
 
     /// Attach opt-in tool-boundary hooks (issue #110). Default OFF.

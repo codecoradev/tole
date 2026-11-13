@@ -340,6 +340,7 @@ pub fn open_session(
         delegation: None,
     });
     roster.plan_emitter = plan_emitter;
+    roster.session = Some(session_id.to_string());
     // #217: a job that exits nudges this session at its next safe point.
     roster.job_notices = Some(cancel.interrupts().clone());
     let mut reg = crate::tool_roster::build(approver, roster).map_err(|e| e.to_string())?;

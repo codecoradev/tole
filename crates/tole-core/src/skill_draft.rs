@@ -216,39 +216,86 @@ impl Draft {
     }
 }
 
-/// Tools whose output is content from outside the owner's trust: a web page,
-/// an MCP server's result.
+/// Tools whose output is text written by someone outside the owner's trust:
+/// a web page, an MCP server's result, an issue or PR body (`gh`, `gitea`),
+/// what a child agent or another session produced, and shared memory.
+///
+/// Deliberately not listed: `read_file` and `run_command`. A coding session
+/// reads files and runs commands all the time, so counting them would taint
+/// every draft and `--accept-taint` would become a reflex. The tradeoff is
+/// written down: a draft from a session that curled a page through
+/// `run_command` is not marked.
 pub fn is_untrusted_tool(name: &str) -> bool {
-    matches!(name, "web_fetch" | "web_search") || name.starts_with("mcp_")
+    matches!(
+        name,
+        "web_fetch"
+            | "web_search"
+            | "gh"
+            | "gitea"
+            | "agent_start"
+            | "agent_poll"
+            | "delegate"
+            | "delegate_poll"
+            | "tole_session_prompt"
+            | "tole_session_status"
+            | "tole_session_list"
+            | "uteke_recall"
+            | "uteke_document"
+    ) || name.starts_with("mcp_")
 }
 
-/// What a session consumed from outside. Shared by clones, so a tool wrapper
+/// What a session consumed from outside. Shared by clones, so a registry
 /// records and `skill_propose` reads the same set.
+///
+/// Two parts: the untrusted tools the session ran (recomputed from the
+/// session's own entries at the start of every turn, so a registry reused
+/// for another session never carries the wrong session's taint) and marks
+/// the host sets directly (`webhook`, ...), which a reseed leaves alone.
 #[derive(Debug, Clone, Default)]
 pub struct TaintTracker {
-    sources: Arc<Mutex<BTreeSet<String>>>,
+    inner: Arc<Mutex<TaintSets>>,
+}
+
+#[derive(Debug, Default)]
+struct TaintSets {
+    tools: BTreeSet<String>,
+    marks: BTreeSet<String>,
 }
 
 impl TaintTracker {
-    /// Record a source by label (a tool name, `webhook`, ...).
+    /// Record a host-set source by label (`webhook`, ...).
     pub fn mark(&self, source: &str) {
-        if let Ok(mut s) = self.sources.lock() {
-            s.insert(source.chars().take(MAX_LABEL).collect());
+        if let Ok(mut s) = self.inner.lock() {
+            s.marks.insert(source.chars().take(MAX_LABEL).collect());
         }
     }
 
     /// Record `tool` when its output is untrusted.
     pub fn observe_tool(&self, tool: &str) {
         if is_untrusted_tool(tool) {
-            self.mark(tool);
+            if let Ok(mut s) = self.inner.lock() {
+                s.tools.insert(tool.chars().take(MAX_LABEL).collect());
+            }
+        }
+    }
+
+    /// Replace the tool part with the untrusted tools among `names` (the
+    /// tool names of one session's entries). Marks are kept.
+    pub fn reseed<'a>(&self, names: impl IntoIterator<Item = &'a str>) {
+        if let Ok(mut s) = self.inner.lock() {
+            s.tools = names
+                .into_iter()
+                .filter(|n| is_untrusted_tool(n))
+                .map(|n| n.chars().take(MAX_LABEL).collect())
+                .collect();
         }
     }
 
     /// The sources seen so far, sorted.
     pub fn sources(&self) -> Vec<String> {
-        self.sources
+        self.inner
             .lock()
-            .map(|s| s.iter().cloned().collect())
+            .map(|s| s.tools.union(&s.marks).cloned().collect())
             .unwrap_or_default()
     }
 }
@@ -325,7 +372,7 @@ fn secret_shape(text: &str) -> Option<&'static str> {
 /// treats as unsafe, plus the ranges it leaves alone because they are legal
 /// in a prompt but can smuggle text into a skill (Unicode tag characters,
 /// variation selectors, the soft hyphen, Hangul and Braille fillers).
-fn is_hidden(c: char) -> bool {
+pub fn is_hidden(c: char) -> bool {
     crate::sanitize::is_unsafe(c)
         || matches!(
             c,
