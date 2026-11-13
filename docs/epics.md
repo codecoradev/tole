@@ -304,7 +304,10 @@ Bot and Nakama; BMAD for collaboration). Design notes:
   pinned core (#590), approved-hash loading (#591), propose-only growth with
   meaning dedup (#592), curator on by default (#593). Status: #590's seam,
   adapters, selection, `skill_search` and `tole skills` are in, opt-in by
-  `TOLE_SKILL_INDEX=uteke`; config and profile keys follow #584.
+  `TOLE_SKILL_INDEX=uteke`; config and profile keys follow #584. #592 in
+  progress: part 1 is the `skill_draft` gate and draft store in `tole-core`
+  (lint, secret and injection scan, taint, provenance, dedup bands); the
+  `skill_propose` tool, `tole skills drafts` and promotion follow.
 - **E4 — Secrets and third-party plugins, epic #594:**
   - `SecretSet` at every sink (#595; module, provider body, child minimum
     env, MCP arguments, web, `systemone`, memory loop and `uteke_document`
