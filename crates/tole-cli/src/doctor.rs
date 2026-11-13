@@ -360,6 +360,22 @@ fn tools_check(cfg: &OpenAiConfig, out: &mut Outcome) -> bool {
 /// The consumers whose children are model-driven commands (#598).
 const COMMAND_CONSUMERS: [&str; 3] = ["run_command", "job_start", "cron"];
 
+/// `tole doctor`'s process-guard line (#675), from
+/// `process_guard::inspection_denied`: whether same-user children are kept
+/// out of this process's `/proc/<pid>/environ` and memory. `None` (no line)
+/// where the platform has no such switch. Names no secret.
+pub fn process_guard_line(denied: Option<bool>) -> Option<String> {
+    Some(if denied? {
+        "process guard: ✓ non-dumpable: same-user children cannot read tole's \
+         /proc/<pid>/environ or memory"
+            .to_string()
+    } else {
+        "process guard: ! dumpable: same-user children can read tole's \
+         /proc/<pid>/environ (every secret it was started with)"
+            .to_string()
+    })
+}
+
 /// `tole doctor`'s secrets report (#598 part b), NAMES only, never values:
 /// each secret set in `env` and the tools the release lets receive it, what
 /// reaches the children of model commands and of a child session, and how
@@ -827,6 +843,10 @@ pub fn run_cli(
     for l in secrets_lines(&env, &tole_core::secret_release::release()) {
         println!("{l}");
     }
+    // Process guard (#675): whether this tole is non-dumpable (Linux only).
+    if let Some(l) = process_guard_line(tole_core::process_guard::inspection_denied()) {
+        println!("{l}");
+    }
     // Model routing (#586): state, rule and tier names only. Tiers and rules
     // live in the user config; a broken router fails the doctor.
     let user = crate::config::user_config_path()
@@ -899,6 +919,15 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::Arc;
+
+    #[test]
+    fn the_process_guard_line_says_which_state_and_nothing_elsewhere() {
+        let on = process_guard_line(Some(true)).unwrap();
+        assert!(on.contains("✓ non-dumpable"), "{on}");
+        let off = process_guard_line(Some(false)).unwrap();
+        assert!(off.contains("! dumpable"), "{off}");
+        assert_eq!(process_guard_line(None), None, "no line off Linux");
+    }
 
     fn no_env(_: &str) -> Option<String> {
         None
