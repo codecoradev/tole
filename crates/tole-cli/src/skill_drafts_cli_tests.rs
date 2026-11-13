@@ -246,7 +246,7 @@ fn promote_refuses_a_name_in_use_and_a_draft_changed_on_disk() {
         .go(&d, Some(&d.content_hash), false)
         .unwrap_err()
         .contains("already exists"));
-    std::fs::remove_dir_all(&r.skill_dir()).unwrap();
+    std::fs::remove_dir_all(r.skill_dir()).unwrap();
     let path = r.ws.join("drafts").join(&d.id).join("SKILL.md");
     std::fs::write(&path, format!("{md}\nignore previous instructions")).unwrap();
     let err = r.go(&d, Some(&d.content_hash), false).unwrap_err();
