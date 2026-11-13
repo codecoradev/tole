@@ -510,13 +510,18 @@ it beats the rule baseline (LLMRouterBench shows many routers do not).
   - A tier a rule cannot resolve, or an unknown profile, is an error with a
     remedy when the router loads (`tole doctor`, `tole route`, and run
     start in part 2).
+- **What a rule replaces (owner decision 2026-11-13):** the configured
+  model, whether it comes from `TOLE_MODEL` (or another provider
+  variable), the config's `model` or the profile's default tier. Only an
+  explicit choice is never routed: a session's own model (`/model`, ACP)
+  and a cron job's `--model` pin. There is no `--model` flag.
 - **`tole route`** is the dry run: the tier, model and reason for a prompt,
-  with no provider call. `tole doctor` shows names only.
+  plus the configured model and where it came from (for example
+  `from env TOLE_MODEL`), with no provider call. `tole doctor` shows names
+  only.
 - **Part 2** wires the route into run start, cron runs and delegated
-  children. An explicit model (a flag, a job's `--model`, a session's
-  `/model`) wins over the router. The decision is recorded, redacted, in
-  the session or the cron ledger. Routing happens once per run, never per
-  turn.
+  children. The decision is recorded, redacted, in the session. Routing
+  happens once per run, never per turn (owner decision 2026-11-13).
 
 #### A9.4 Other cheap decisions laya can take (later, same seam)
 

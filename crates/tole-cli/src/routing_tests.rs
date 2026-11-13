@@ -221,20 +221,30 @@ fn the_dry_run_redacts_and_calls_no_provider() {
         max_risk: Risk::ReadOnly,
         ..brief("digest")
     };
-    let out = explain(&cfg(&leaky), &cron, Some("cfg-model"), &secrets).unwrap();
+    let base = Some(("cfg-model", "env TOLE_MODEL"));
+    let out = explain(&cfg(&leaky), &cron, base, &secrets).unwrap();
     assert!(
         out.contains("tier: light") && out.contains("short-cron"),
         "{out}"
     );
     assert!(!out.contains("tok-secret"), "{out}");
-    let out = explain(&cfg(USER), &brief("hi"), Some("cfg-model"), &secrets).unwrap();
-    assert!(out.contains("cfg-model (configured)"), "{out}");
-    let out = explain(
-        &Config::default(),
-        &brief("hi"),
-        Some("cfg-model"),
-        &secrets,
-    )
-    .unwrap();
-    assert!(out.contains("router: off"), "{out}");
+    // Every answer names the configured model and where it came from, and a
+    // routed answer says the rule replaces it.
+    let base_line = "configured model: cfg-model (from env TOLE_MODEL)";
+    assert!(
+        out.contains(base_line) && out.contains("replaces the configured model"),
+        "{out}"
+    );
+    let out = explain(&cfg(USER), &brief("hi"), base, &secrets).unwrap();
+    assert!(
+        out.contains("model: cfg-model (configured") && out.contains(base_line),
+        "{out}"
+    );
+    let out = explain(&Config::default(), &brief("hi"), base, &secrets).unwrap();
+    assert!(
+        out.contains("router: off") && out.contains(base_line),
+        "{out}"
+    );
+    let out = explain(&cfg(USER), &brief("hi"), None, &secrets).unwrap();
+    assert!(out.contains("configured model: unset"), "{out}");
 }

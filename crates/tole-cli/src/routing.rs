@@ -288,28 +288,35 @@ pub fn doctor_lines(cfg: &Config) -> Vec<String> {
 }
 
 /// What `tole route` prints: the decision for `b`, without calling a
-/// provider. `configured` is the model the run would use without routing.
+/// provider. `configured` is the model the run would use without routing
+/// and where it came from (`env TOLE_MODEL`, `config`, `profile`, ...): a
+/// matching rule replaces it. Only a session's own model or a cron job's
+/// `--model` pin is never routed.
 pub fn explain(
     cfg: &Config,
     b: &Brief<'_>,
-    configured: Option<&str>,
+    configured: Option<(&str, &str)>,
     secrets: &tole_core::secrets::SecretSet,
 ) -> Result<String, String> {
     let s = |v: &str| router::redact_cap(v, secrets, router::MAX_REASON_CHARS);
+    let base = match configured {
+        Some((m, from)) => format!("configured model: {} (from {})", s(m), s(from)),
+        None => "configured model: unset".to_string(),
+    };
     let Some(rt) = Routing::from_config(cfg)? else {
         return Ok(format!(
-            "router: off; the run uses the configured model ({})\n",
-            configured.map_or("unset".into(), s)
+            "router: off; the run uses the configured model\n{base}\n"
         ));
     };
     let (route, model) = rt.decide(b)?;
     let chosen = match (&model, configured) {
-        (Some(m), _) => s(m),
-        (None, Some(c)) => format!("{} (configured)", s(c)),
+        (Some(m), _) => format!("{} (the rule replaces the configured model)", s(m)),
+        (None, Some((c, _))) => format!("{} (configured; no rule matched)", s(c)),
         (None, None) => "the configured model (unset)".into(),
     };
     Ok(format!(
-        "tier: {}\nmodel: {chosen}\nreason: {}\n(dry run: no provider was called)\n",
+        "tier: {}\nmodel: {chosen}\n{base}\nreason: {}\n(dry run: no provider was called; a \
+         session's own model or a cron job's --model pin is never routed)\n",
         route.tier.map_or("- (default)", Tier::as_str),
         s(&route.reason)
     ))
