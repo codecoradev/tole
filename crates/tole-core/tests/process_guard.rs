@@ -115,5 +115,8 @@ fn the_guard_keeps_proc_self_and_stat_readable() {
         .expect("spawn sh");
     assert!(out.status.success(), "a child reads the parent's stat");
     let stat = String::from_utf8_lossy(&out.stdout);
-    assert!(stat.starts_with(&format!("{} ", std::process::id())), "{stat}");
+    assert!(
+        stat.starts_with(&format!("{} ", std::process::id())),
+        "{stat}"
+    );
 }

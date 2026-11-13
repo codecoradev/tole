@@ -286,6 +286,173 @@ fn verify_gate_overrides_the_completion_marker() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+const PROVIDER_KEY: &str = "sk-mission-provider-key-0123456789";
+const GH_TOKEN: &str = "ghp_missionGithubToken0123456789";
+
+/// A hermetic `tole` command in `dir` with the two secrets in its
+/// environment. Root reads every process's /proc files whatever tole does,
+/// so under root tole runs as `nobody`: the guard is about same-user
+/// children.
+fn secret_holding_tole(dir: &std::path::Path, base: &str, args: &[&str]) -> Command {
+    let home = dir.join("home");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
+    cmd.args(args)
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .env_remove("TOLE_MEMORY")
+        .env_remove("TOLE_MEMORY_NAMESPACE")
+        .env_remove("TOLE_SYSTEM_PROMPT")
+        .env_remove("TOLE_TRUST")
+        .env_remove("TOLE_AGENT_DEPTH")
+        .env_remove("TOLE_STREAM")
+        .env("CODECORA_HOME", &home)
+        .env("HOME", &home)
+        .env("TOLE_BASE_URL", base)
+        .env("TOLE_MODEL", "mock-model")
+        .env("TOLE_API_KEY", PROVIDER_KEY)
+        .env("GITHUB_TOKEN", GH_TOKEN);
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        use std::os::unix::process::CommandExt;
+        let _ = Command::new("chmod")
+            .args(["-R", "a+rwX"])
+            .arg(dir)
+            .status();
+        // SAFETY: only async-signal-safe calls between fork and exec.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setgroups(0, std::ptr::null()) != 0
+                    || libc::setgid(65534) != 0
+                    || libc::setuid(65534) != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    cmd
+}
+
+/// A mission whose verify command, and a `tole run` whose turn-end stop
+/// gate, record what they can see: their own environment and tole's
+/// (`/proc/$PPID/environ`). `user_config` is the hermetic user config.
+/// Returns [verify env, tole's environ read by verify, gate env, tole's
+/// environ read by the gate].
+fn children_see(tag: &str, user_config: &str) -> [String; 4] {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = temp_dir(tag);
+    let home = dir.join("home");
+    std::fs::create_dir_all(home.join("tole")).unwrap();
+    std::fs::write(home.join("tole/config.toml"), user_config).unwrap();
+    let probe = |name: &str| {
+        format!(
+            "printenv > {d}/{name}_env.txt; \
+             tr '\\0' '\\n' < /proc/$PPID/environ > {d}/{name}_proc.txt; true",
+            d = dir.display()
+        )
+    };
+    let gate = dir.join("gate.sh");
+    std::fs::write(&gate, format!("#!/bin/sh\n{}\n", probe("gate"))).unwrap();
+    std::fs::set_permissions(&gate, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let sessions = dir.join("sessions");
+    let (s, w, g) = (
+        sessions.to_str().unwrap(),
+        dir.to_str().unwrap(),
+        gate.to_str().unwrap(),
+    );
+    let verify = probe("verify");
+    let mission = [
+        "mission",
+        "-s",
+        s,
+        "--workspace",
+        w,
+        "--yes",
+        "--no-auto-mcp",
+    ];
+    let mission = [&mission[..], &["--verify", &verify, "do it"]].concat();
+    let run = [
+        "run",
+        "-s",
+        s,
+        "--workspace",
+        w,
+        "--no-auto-mcp",
+        "--allow",
+        "todo_write",
+        "--on-turnend",
+        g,
+        "do it",
+    ];
+    for args in [&mission[..], &run[..]] {
+        let base = spawn_mock("NONE".into());
+        let out = secret_holding_tole(&dir, &base, args)
+            .output()
+            .expect("run tole");
+        assert!(
+            out.status.success(),
+            "{args:?} failed: {}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let read = |f: &str| std::fs::read_to_string(dir.join(f)).unwrap_or_default();
+    let seen = [
+        "verify_env.txt",
+        "verify_proc.txt",
+        "gate_env.txt",
+        "gate_proc.txt",
+    ]
+    .map(read);
+    assert!(!seen[0].is_empty(), "the verify command ran");
+    assert!(!seen[2].is_empty(), "the stop gate ran");
+    let _ = std::fs::remove_dir_all(&dir);
+    seen
+}
+
+/// #676 and #675: the verify command and the stop gates run code the agent
+/// wrote, unattended. By default they get no secret, and they cannot read
+/// the secrets out of tole's own environment through /proc either.
+#[test]
+fn verify_and_stop_gates_get_no_secret_by_default() {
+    let seen = children_see("noscrt", "");
+    let what = [
+        "verify env",
+        "tole's environ read by verify",
+        "gate env",
+        "tole's environ read by the gate",
+    ];
+    for (what, seen) in what.iter().zip(&seen) {
+        assert!(
+            !seen.contains(PROVIDER_KEY),
+            "{what} holds the provider key"
+        );
+        assert!(!seen.contains(GH_TOKEN), "{what} holds GITHUB_TOKEN");
+    }
+    assert!(
+        seen[0].contains("TOLE_MODEL=mock-model"),
+        "non-secret env stays"
+    );
+}
+
+/// An explicit `[secrets]` grant to `verify` and `turnend` restores a token
+/// for them, and only that token.
+#[test]
+fn a_secrets_grant_restores_a_token_for_verify_and_stop_gates() {
+    let seen = children_see(
+        "grant",
+        "[secrets]\nGITHUB_TOKEN = { tools = [\"verify\", \"turnend\"] }\n",
+    );
+    for (what, seen) in [("verify env", &seen[0]), ("gate env", &seen[2])] {
+        assert!(seen.contains(GH_TOKEN), "{what} lacks the granted token");
+        assert!(
+            !seen.contains(PROVIDER_KEY),
+            "{what} holds the provider key"
+        );
+    }
+}
+
 /// Budget exhaustion: `--max-steps 1` settles after one turn with a
 /// summary — and the session STAYS resumable (never a dead session).
 #[test]
