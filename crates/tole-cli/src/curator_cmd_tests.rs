@@ -104,6 +104,7 @@ impl Rig {
             cron_skills: BTreeSet::new(),
             ws: Some(&self.root),
             thresholds: Thresholds::default(),
+            enabled: true,
             now: NOW,
         }
     }
@@ -322,4 +323,85 @@ fn a_skill_doing_worse_than_skill_less_runs_is_proposed_never_archived() {
         ),
         "{text}"
     );
+}
+
+#[test]
+fn a_switched_off_curator_changes_nothing_and_says_why() {
+    let mut r = Rig::new("off");
+    r.grown("old", 90, Some(40));
+    let mut env = r.env();
+    env.enabled = false;
+    let rep = sweep(&env, false).unwrap();
+    assert!(
+        rep.held.as_deref().unwrap().contains("switched off"),
+        "{:?}",
+        rep.held
+    );
+    assert_eq!(rep.would_archive, ["old"]);
+    assert!(r.skill_dir("old").exists() && r.archive.mutations().is_empty());
+    assert!(render_status(&env)
+        .unwrap()
+        .contains("curator: off (curator.enabled = false"));
+    // A dry run still reports.
+    assert_eq!(sweep(&env, true).unwrap().would_archive, ["old"]);
+}
+
+#[cfg(feature = "shell-tools")]
+mod scheduling {
+    use super::*;
+    use crate::curator_cmd::schedule;
+
+    fn dirs(tag: &str) -> (PathBuf, PathBuf) {
+        let root =
+            std::env::temp_dir().join(format!("tole-curator-sched-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (cron, work) = (root.join("cron"), root.join("work"));
+        std::fs::create_dir_all(&cron).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+        (cron, work)
+    }
+
+    #[test]
+    fn the_weekly_job_is_a_zero_token_script_saved_once_and_removable() {
+        let (cron, work) = dirs("once");
+        assert!(schedule::line(&cron).contains("not scheduled"));
+        let msg = schedule::install(&cron, None, &work, 1_700_000_000).unwrap();
+        assert!(
+            msg.contains("0 4 * * 1") && msg.contains("tole serve --cron"),
+            "{msg}"
+        );
+        let job = schedule::find(&cron).unwrap();
+        assert_eq!(
+            (job.id.as_str(), job.mode.as_str(), job.state),
+            ("curator-weekly", "script", "active")
+        );
+        assert!(schedule::line(&cron).contains("0 4 * * 1"));
+        // argv, no shell, no path: the scheduler refuses a path-qualified program.
+        let l = crate::cron::store::open_read(&cron).unwrap();
+        let live = crate::cron::resolve(l.state(), "curator-weekly").unwrap();
+        let script = crate::cron::field(&live, "script").unwrap().to_string();
+        assert_eq!(script, "tole curator run");
+        let argv = tole_core::run_command::RunCommandTool::split_argv(&script).unwrap();
+        assert_eq!(argv, ["tole", "curator", "run"]);
+        // Saved once.
+        let again = schedule::install(&cron, None, &work, 1_700_000_001).unwrap_err();
+        assert!(again.to_string().contains("already exists"), "{again}");
+        // Removed, then it can be saved again with another schedule.
+        assert_eq!(
+            schedule::remove(&cron, 1_700_000_002).unwrap(),
+            "removed curator-weekly"
+        );
+        assert!(schedule::find(&cron).is_none());
+        assert!(schedule::remove(&cron, 1_700_000_003).is_err());
+        schedule::install(&cron, Some("30 3 * * 0"), &work, 1_700_000_004).unwrap();
+        assert!(schedule::line(&cron).contains("30 3 * * 0"));
+    }
+
+    #[test]
+    fn a_bad_schedule_or_a_relative_workdir_is_refused() {
+        let (cron, work) = dirs("bad");
+        assert!(schedule::install(&cron, Some("not a cron"), &work, 1).is_err());
+        assert!(schedule::install(&cron, None, Path::new("relative"), 1).is_err());
+        assert!(schedule::find(&cron).is_none());
+    }
 }

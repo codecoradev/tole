@@ -315,8 +315,10 @@ Bot and Nakama; BMAD for collaboration). Design notes:
   (usage ledger, derived lifecycle, underperformers, package-aware archive
   and restore with a mutation ledger); part 2 is `tole curator`
   (run/status/pause/restore/pin/lock/adopt) and the recall and load
-  recording; run outcomes, the `[curator]` config and the weekly schedule
-  follow.
+  recording; part 3a is the `[curator]` config table, `tole curator
+  schedule` (a weekly script job) and a doctor line; run outcomes (success
+  or failure of runs that used a skill, and the skill-less baseline) are
+  the last piece.
 - **E4 — Secrets and third-party plugins, epic #594:**
   - `SecretSet` at every sink (#595; module, provider body, child minimum
     env, MCP arguments, web, `systemone`, memory loop and `uteke_document`

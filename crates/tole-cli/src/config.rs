@@ -108,6 +108,37 @@ pub struct CronConfig {
     pub tz_source: Option<TzSource>,
 }
 
+/// The `[curator]` table (#593). USER LAYER ONLY, like [`CronConfig`]: the
+/// skill library is the user's, so a cloned repository's config must not
+/// switch the curator off or shorten how long a skill lives.
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CuratorConfig {
+    /// `false` turns `tole curator run` (and the weekly job) into a no-op
+    /// that says so. Unset: on, the owner's default.
+    pub enabled: Option<bool>,
+    /// Days without use before an agent-grown skill is stale [default 14].
+    pub stale_days: Option<u64>,
+    /// Days without use before it is archived [default 30].
+    pub archive_days: Option<u64>,
+    /// Days a skill that was never used is left alone [default 30].
+    pub grace_days: Option<u64>,
+}
+
+/// The curator's thresholds with the defaults filled in.
+pub fn curator_thresholds(c: Option<&CuratorConfig>) -> tole_core::skill_curator::Thresholds {
+    use tole_core::skill_curator::Thresholds;
+    let d = Thresholds::default();
+    Thresholds {
+        stale_days: c.and_then(|c| c.stale_days).unwrap_or(d.stale_days),
+        archive_days: c.and_then(|c| c.archive_days).unwrap_or(d.archive_days),
+        grace_days: c.and_then(|c| c.grace_days).unwrap_or(d.grace_days),
+    }
+}
+
+/// Upper bound of the curator's day counts (ten years).
+pub const MAX_CURATOR_DAYS: u64 = 3650;
+
 /// One `[hooks.<route>]` table (#582): a `POST /hooks/<route>` on `tole
 /// serve`. USER LAYER ONLY: a cloned repository must not open an endpoint
 /// or change one. The route key itself never lives here: only the name of
@@ -538,6 +569,8 @@ pub struct Config {
     pub tui: Option<TuiConfig>,
     /// Scheduler limits (#579); user layer only, see [`CronConfig`].
     pub cron: Option<CronConfig>,
+    /// The skill curator (#593); user layer only, see [`CuratorConfig`].
+    pub curator: Option<CuratorConfig>,
     /// Delegation limits (#585); user layer only, see [`DelegationConfig`].
     pub delegation: Option<DelegationConfig>,
     /// Dormant profiles (#584); user layer only, see [`ProfileConfig`].
@@ -766,6 +799,23 @@ pub fn parse(src: &str, path: &Path) -> Result<Config, ConfigError> {
             )));
         }
     }
+    if let Some(c) = &cfg.curator {
+        for (key, v) in [
+            ("stale_days", c.stale_days),
+            ("archive_days", c.archive_days),
+            ("grace_days", c.grace_days),
+        ] {
+            if v.is_some_and(|n| n > MAX_CURATOR_DAYS) {
+                return Err(range(format!(
+                    "curator.{key} must be at most {MAX_CURATOR_DAYS}"
+                )));
+            }
+        }
+        // The effective pair, defaults filled in, so one key alone cannot
+        // leave `archive_days` at or below `stale_days`.
+        let th = curator_thresholds(Some(c));
+        th.check().map_err(|e| range(format!("curator: {e}")))?;
+    }
     if let Some(d) = &cfg.delegation {
         let ceiling = tole_core::delegation::MAX_DEPTH_CEILING;
         if d.max_depth.is_some_and(|n| !(1..=ceiling).contains(&n)) {
@@ -936,6 +986,8 @@ pub fn layered(project: &Config, user: &Config) -> Config {
         tui: user.tui.clone(),
         // Nor the scheduler limits (#579).
         cron: user.cron.clone(),
+        // Nor the curator's settings (#593).
+        curator: user.curator.clone(),
         // Nor the delegation limits (#585).
         delegation: user.delegation.clone(),
         // Nor profiles (#584): a cloned repository must not define personas,
@@ -963,6 +1015,20 @@ pub fn layered(project: &Config, user: &Config) -> Config {
         }
         if c.tz_source.is_some() {
             from_user.insert("cron.tz_source");
+        }
+    }
+    if let Some(c) = &user.curator {
+        if c.enabled.is_some() {
+            from_user.insert("curator.enabled");
+        }
+        if c.stale_days.is_some() {
+            from_user.insert("curator.stale_days");
+        }
+        if c.archive_days.is_some() {
+            from_user.insert("curator.archive_days");
+        }
+        if c.grace_days.is_some() {
+            from_user.insert("curator.grace_days");
         }
     }
     if let Some(t) = &user.tui {
@@ -1008,6 +1074,9 @@ pub const TUI_IGNORED_NOTE: &str =
 /// Suffix of a project config's `cron` lines in `config check` (#579).
 pub const CRON_IGNORED_NOTE: &str =
     "  IGNORED: a project config cannot set scheduler limits (user config only)";
+/// Suffix of a project config's `curator` lines in `config check` (#593).
+pub const CURATOR_IGNORED_NOTE: &str =
+    "  IGNORED: a project config cannot change the skill curator (user config only)";
 /// Suffix of a project config's `delegation` lines in `config check` (#585).
 pub const DELEGATION_IGNORED_NOTE: &str =
     "  IGNORED: a project config cannot set delegation limits (user config only)";
@@ -1058,6 +1127,9 @@ pub fn render_with(cfg: &Config, tag: &str, ann: &Annotations) -> Vec<String> {
         }
         if tag == PROJECT_TAG && key.starts_with("cron.") {
             return CRON_IGNORED_NOTE;
+        }
+        if tag == PROJECT_TAG && key.starts_with("curator.") {
+            return CURATOR_IGNORED_NOTE;
         }
         if tag == PROJECT_TAG && key.starts_with("delegation.") {
             return DELEGATION_IGNORED_NOTE;
@@ -1286,6 +1358,20 @@ pub fn render_with(cfg: &Config, tag: &str, ann: &Annotations) -> Vec<String> {
                 .to_string()
             }),
         );
+    }
+    if let Some(c) = &cfg.curator {
+        scalar(
+            &mut out,
+            "curator.enabled",
+            c.enabled.map(|b| b.to_string()),
+        );
+        for (key, v) in [
+            ("curator.stale_days", c.stale_days),
+            ("curator.archive_days", c.archive_days),
+            ("curator.grace_days", c.grace_days),
+        ] {
+            scalar(&mut out, key, v.map(|n| n.to_string()));
+        }
     }
     if let Some(d) = &cfg.delegation {
         let n = |v: Option<u64>| v.map(|n| n.to_string());
@@ -1657,6 +1743,65 @@ verify_timeout = 60
         assert!(m.user_keys.contains("cron.max_concurrent"));
         let shown = render(&project).join("\n");
         assert!(shown.contains("cron.max_concurrent = 64") && shown.contains("IGNORED"));
+    }
+
+    /// #593: `[curator]` is strict, bounded, and user layer only.
+    #[test]
+    fn curator_table_is_strict_bounded_and_user_layer_only() {
+        let user = parse(
+            "[curator]\nenabled = false\nstale_days = 7\narchive_days = 21\ngrace_days = 5\n",
+            &p(),
+        )
+        .unwrap();
+        let c = user.curator.as_ref().unwrap();
+        assert_eq!(
+            (c.enabled, c.stale_days, c.archive_days, c.grace_days),
+            (Some(false), Some(7), Some(21), Some(5))
+        );
+        let th = curator_thresholds(Some(c));
+        assert_eq!((th.stale_days, th.archive_days, th.grace_days), (7, 21, 5));
+        let d = curator_thresholds(None);
+        assert_eq!((d.stale_days, d.archive_days, d.grace_days), (14, 30, 30));
+
+        assert!(
+            parse("[curator]\nenable = true\n", &p()).is_err(),
+            "unknown key"
+        );
+        assert!(parse("[curator]\nenabled = \"yes\"\n", &p()).is_err());
+        assert!(parse("[curator]\nstale_days = -1\n", &p()).is_err());
+        assert!(
+            parse("[curator]\nstale_days = 3651\n", &p()).is_err(),
+            "too long"
+        );
+        // The pair is checked with defaults filled in: one key alone can
+        // leave archive_days at or below stale_days.
+        for bad in [
+            "stale_days = 30",
+            "archive_days = 14",
+            "stale_days = 0",
+            "stale_days = 20\narchive_days = 20",
+        ] {
+            let e = parse(&format!("[curator]\n{bad}\n"), &p()).unwrap_err();
+            assert!(e.to_string().contains("archive_days"), "{bad}: {e}");
+        }
+        assert!(parse("[curator]\nstale_days = 20\narchive_days = 21\n", &p()).is_ok());
+
+        // A project config can neither switch it off nor shorten a skill's life.
+        let project = parse(
+            "[curator]\nenabled = false\nstale_days = 1\narchive_days = 2\n",
+            &p(),
+        )
+        .unwrap();
+        assert_eq!(layered(&project, &Config::default()).curator, None);
+        let m = layered(&project, &user);
+        assert_eq!(m.curator, user.curator);
+        assert!(m.user_keys.contains("curator.enabled"));
+        assert!(m.user_keys.contains("curator.archive_days"));
+        let shown = render(&project).join("\n");
+        assert!(
+            shown.contains("curator.enabled = false") && shown.contains("IGNORED"),
+            "{shown}"
+        );
     }
 
     #[test]
