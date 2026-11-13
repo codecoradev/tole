@@ -91,6 +91,7 @@ pub mod secrets;
 pub mod sensitive;
 pub mod sibling_watch;
 pub mod skill_approval;
+pub mod skill_curator;
 pub mod skill_draft;
 pub mod skill_index;
 pub mod skills;

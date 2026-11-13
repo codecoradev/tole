@@ -169,6 +169,20 @@ pub fn read_package(workspace: Option<&Path>, name: &str) -> Result<SkillPackage
     })
 }
 
+/// The package of the skill directory `dir` (the curator moves packages by
+/// directory, outside the workspace/user-global resolution of
+/// [`read_package`]).
+pub fn read_dir_package(name: &str, dir: &Path) -> Result<SkillPackage, String> {
+    let files = read_dir_files(dir, LIMITS)?;
+    let hash = package_hash(&files);
+    Ok(SkillPackage {
+        name: name.to_string(),
+        dir: dir.to_path_buf(),
+        files,
+        hash,
+    })
+}
+
 /// Every file under `dir` (relative path, bytes), sorted by path, within
 /// `limits`. A file is never read past what is left of the byte budget:
 /// its length is checked first (lstat), and the read itself is capped.
