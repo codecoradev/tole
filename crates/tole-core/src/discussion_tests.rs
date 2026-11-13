@@ -354,5 +354,15 @@ fn a_summary_knows_its_round_and_only_a_digest_can_be_empty_of_news() {
         contributions: vec![],
     };
     assert_eq!((v.round(), v.delta_empty()), (3, false));
+    // A refused digest's round is passed on as written, fenced like any
+    // other, and never counts as a round without news.
+    let f = RoundSummary::Fallback {
+        round: 4,
+        contributions: vec![c(4, "ops", "e9", "keep SQLite")],
+        reason: "the digest drops ops".into(),
+    };
+    assert_eq!((f.round(), f.delta_empty()), (4, false));
+    let m = participant_request(&contract(), 5, "coder", Some(&f), None);
+    assert!(m[1].1.contains("<<<BEGIN PREVIOUS ROUND") && m[1].1.contains("[4 / ops] keep SQLite"));
     assert!(id_ok("a-1") && !id_ok("") && !id_ok("-a") && !id_ok("A") && !id_ok(&"a".repeat(49)));
 }
