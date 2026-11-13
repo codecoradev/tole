@@ -80,6 +80,16 @@ pub fn scrub_env_with<'a>(
     scrub_env_keeping(cmd, &|name| release.allows(name, consumer))
 }
 
+/// The ENV-1 scrub keeping exactly the secrets `keep` accepts (by name).
+/// Launchers with a per-instance grant use it (#679: each MCP server keeps
+/// only its approval's secrets).
+pub fn scrub_env_with_keep<'a>(
+    cmd: &'a mut Command,
+    keep: &dyn Fn(&str) -> bool,
+) -> &'a mut Command {
+    scrub_env_keeping(cmd, keep)
+}
+
 /// [`scrub_env_for_child`] that keeps the secret-shaped names in `keep`
 /// (exact, case-insensitive) and nothing else. Child agents use it to
 /// receive their provider key plus their grant (#595, #598).

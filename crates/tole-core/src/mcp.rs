@@ -135,6 +135,10 @@ pub enum McpTransport {
 pub struct McpServerConfig {
     pub name: String,
     pub transport: McpTransport,
+    /// The secret NAMES this server's stdio process may receive (#679): the
+    /// grant its plugin-lock approval recorded. `None` (an embedder without
+    /// a lock): whatever the `[secrets]` release binds to `mcp`.
+    pub secret_grant: Option<Vec<String>>,
 }
 
 impl McpServerConfig {
@@ -163,6 +167,7 @@ impl McpServerConfig {
             return Ok(Self {
                 name: name.to_string(),
                 transport: McpTransport::Http { url: command },
+                secret_grant: None,
             });
         }
         Ok(Self {
@@ -171,6 +176,7 @@ impl McpServerConfig {
                 command,
                 args: parts.map(str::to_string).collect(),
             },
+            secret_grant: None,
         })
     }
 }
@@ -728,8 +734,16 @@ async fn start_server(
         McpTransport::Stdio { command, args } => {
             let mut std_cmd = std::process::Command::new(command);
             std_cmd.args(args);
-            // ENV-1: same secret scrubbing as every other spawn point.
-            crate::subprocess::scrub_env_for(&mut std_cmd, "mcp");
+            // ENV-1: same secret scrubbing as every other spawn point, and
+            // only the secrets this server's approval granted (#679).
+            let release = crate::secret_release::release();
+            let grant = cfg.secret_grant.clone();
+            crate::subprocess::scrub_env_with_keep(&mut std_cmd, &|name| {
+                release.allows(name, "mcp")
+                    && grant
+                        .as_ref()
+                        .is_none_or(|g| g.iter().any(|n| n.eq_ignore_ascii_case(name)))
+            });
             let mut tokio_cmd = tokio::process::Command::from(std_cmd);
             // Evicted/hung connections must not leak orphaned server processes
             // (CodeCora): kill the child when the connection struct is dropped.

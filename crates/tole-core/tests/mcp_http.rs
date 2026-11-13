@@ -394,6 +394,7 @@ fn an_unparseable_url_built_without_parse_is_an_error_and_the_reactor_survives()
             transport: tole_core::mcp::McpTransport::Http {
                 url: (*bad).to_string(),
             },
+            secret_grant: None,
         };
         probe_server_extras(&c);
         let err = get_server_prompt(&name, "p", Default::default()).unwrap_err();

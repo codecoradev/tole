@@ -554,9 +554,15 @@ pub fn build(approver: impl Approver + 'static, roster: Roster) -> Result<ToolRe
             eprintln!("tole: mcp[{}]: no tools registered", cfg.name);
             continue;
         }
+        // #679: the lock binds the configured source and binary, and the
+        // server's process gets only the secrets its approval granted.
+        let source = crate::plugin_gate::source_of(cfg);
         let admit = |s: &str, v: &str, t: &[tole_core::plugin_lock::ManifestTool]| {
-            plugin_gate.check(s, v, t)
+            plugin_gate.check(s, &source, v, t)
         };
+        let mut cfg = cfg.clone();
+        cfg.secret_grant = plugin_gate.secret_grant(&cfg.name);
+        let cfg = &cfg;
         let names = tole_core::mcp::register_server_tools(&mut reg, cfg, &secrets, &admit);
         if cfg.name == "cora" && !names.is_empty() {
             cora_mcp_ok = true;

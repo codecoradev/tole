@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use tole_core::ledger::LedgerStore as _;
-use tole_core::plugin_lock::{self, admit, Admission, LockEntry, Lockfile, ManifestTool};
+use tole_core::plugin_lock::{self, admit, Admission, Live, LockEntry, Lockfile, ManifestTool};
 
 /// The layered lock of one session.
 pub struct Gate {
@@ -79,16 +79,33 @@ impl Gate {
         }
     }
 
-    /// The connect-time guard: `Ok` only for an exact match. A change is
-    /// recorded in the ledger; every refusal names the remedy.
-    pub fn check(&self, server: &str, version: &str, tools: &[ManifestTool]) -> Result<(), String> {
-        let a = admit(&self.lock, server, version, tools);
-        if let Admission::Changed { .. } = &a {
-            self.record(
-                "manifest_change",
-                server,
-                &plugin_lock::manifest_hash(tools),
-            );
+    /// The connect-time guard: `Ok` only for an exact match of the
+    /// configured `source` (and the stdio binary it resolves to, #679), the
+    /// live manifest and the version. A change is recorded in the ledger;
+    /// every refusal names the remedy.
+    pub fn check(
+        &self,
+        server: &str,
+        source: &str,
+        version: &str,
+        tools: &[ManifestTool],
+    ) -> Result<(), String> {
+        let integrity = integrity(source);
+        let live = Live {
+            source,
+            integrity: &integrity,
+            version,
+            tools,
+        };
+        let a = admit(&self.lock, server, &live);
+        let event = match &a {
+            Admission::Changed { .. } => Some("manifest_change"),
+            Admission::Moved => Some("source_change"),
+            Admission::Rebuilt => Some("binary_change"),
+            _ => None,
+        };
+        if let Some(event) = event {
+            self.record(event, server, &plugin_lock::manifest_hash(tools));
         }
         match a {
             Admission::Trusted => Ok(()),
@@ -106,6 +123,12 @@ impl Gate {
             Some(e) if e.revoked => Some(refusal(server, &Admission::Revoked)),
             Some(_) => None,
         }
+    }
+
+    /// The secret NAMES `server`'s approval granted it (#679), for its
+    /// launcher; `None` without an entry (such a server is not started).
+    pub fn secret_grant(&self, server: &str) -> Option<Vec<String>> {
+        self.lock.get(server).map(|e| e.secrets.clone())
     }
 
     /// Writes `server`'s approval (as it is now) to the user lock and the
@@ -211,6 +234,16 @@ pub fn refusal(server: &str, a: &Admission) -> String {
         Admission::Revoked => {
             format!("revoked in the plugin lock: its tools are not registered ({server})")
         }
+        Admission::Moved => format!(
+            "its command line or URL is not the one you approved: not registered. If you moved \
+             it on purpose, start `tole` in a terminal to review and re-approve it, or run \
+             `tole plugin approve {server}` ({server})"
+        ),
+        Admission::Rebuilt => format!(
+            "its program file is not the binary you approved (an upgrade or a swap): not \
+             registered. Start `tole` in a terminal to review and re-approve it, or run \
+             `tole plugin approve {server}` ({server})"
+        ),
     }
 }
 
@@ -290,10 +323,19 @@ pub fn preflight(
         let Ok((version, tools)) = tole_core::mcp::list_manifest(cfg) else {
             continue; // the registration reports the failure
         };
-        let a = admit(&gate.lock, &cfg.name, &version, &tools);
-        let why = match a {
+        let source = source_of(cfg);
+        let integrity = integrity(&source);
+        let live = Live {
+            source: &source,
+            integrity: &integrity,
+            version: &version,
+            tools: &tools,
+        };
+        let why = match admit(&gate.lock, &cfg.name, &live) {
             Admission::Unlocked => "is not approved yet",
             Admission::Changed { .. } => "CHANGED since you approved it",
+            Admission::Moved => "now runs ANOTHER command or URL than the one you approved",
+            Admission::Rebuilt => "now runs ANOTHER program file than the one you approved",
             Admission::Trusted | Admission::Revoked => continue,
         };
         let text = format!(
