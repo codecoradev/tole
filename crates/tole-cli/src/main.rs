@@ -676,6 +676,13 @@ fn bare_tui_args() -> Option<Vec<std::ffi::OsString>> {
 }
 
 fn main() {
+    // First, before any thread or child exists (#675): a same-user child
+    // must not read this process's environment through /proc/<ppid>/environ
+    // or its memory. Every tole process (serve, mission, cron, child
+    // agents) starts here.
+    if let Err(e) = tole_core::process_guard::deny_inspection() {
+        eprintln!("tole: warning: could not deny same-user inspection of this process: {e}");
+    }
     #[cfg(feature = "tui")]
     let cli = match bare_tui_args() {
         Some(args) => Cli::parse_from(args),

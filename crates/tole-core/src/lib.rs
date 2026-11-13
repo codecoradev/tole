@@ -77,6 +77,7 @@ pub mod memory;
 pub mod mock;
 pub mod openai;
 pub mod paths;
+pub mod process_guard;
 pub mod provider;
 pub mod read_file;
 pub mod register;

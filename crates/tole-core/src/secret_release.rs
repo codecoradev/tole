@@ -4,13 +4,16 @@
 //!
 //! A consumer is a tool name (`gh`, `git`, `run_command`, `job_start`) or one
 //! of tole's own process launchers (`hook`, `mcp`, `cron`, `uteke`,
-//! `memory`, `cora`, `skills`). Every launcher scrubs the secret-shaped
-//! variables ([`crate::secrets::is_secret_name`], ENV-1) that the release
-//! does not bind to it ([`crate::subprocess::scrub_env_for`]).
+//! `memory`, `cora`, `skills`, [`VERIFY`], [`TURNEND`]). Every launcher
+//! scrubs the secret-shaped variables ([`crate::secrets::is_secret_name`],
+//! ENV-1) that the release does not bind to it
+//! ([`crate::subprocess::scrub_env_for`]).
 //!
 //! The default binds only `GITHUB_TOKEN`, to the `gh` and `git` tools and to
 //! the owner's own hooks and MCP servers. `run_command`, `job_start` and cron
-//! scripts receive NO secret unless a `[secrets]` entry grants one to them.
+//! scripts receive NO secret unless a `[secrets]` entry grants one to them,
+//! and neither do the mission verify command and the turn-end stop gates
+//! (#676): both usually run code the agent just wrote (`cargo test`).
 //!
 //! Release decides what ENTERS a child; it never changes redaction
 //! ([`crate::secrets::SecretSet`]), which covers every secret, granted or
@@ -18,6 +21,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::RwLock;
+
+/// The consumer of the `tole mission --verify` command (#676).
+pub const VERIFY: &str = "verify";
+
+/// The consumer of the `on_turnend` stop gates (#676). Separate from `hook`
+/// (pre/post tool hooks), which keeps `GITHUB_TOKEN` by default.
+pub const TURNEND: &str = "turnend";
 
 /// The bindings used when no `[secrets]` entry names a secret.
 pub const DEFAULT_RELEASE: [(&str, &[&str]); 1] = [("GITHUB_TOKEN", &["gh", "git", "hook", "mcp"])];
@@ -117,6 +127,8 @@ mod tests {
             "memory",
             "cora",
             "skills",
+            VERIFY,
+            TURNEND,
         ] {
             assert!(!r.allows("GITHUB_TOKEN", c), "{c}");
         }
