@@ -283,6 +283,13 @@ pub fn promote(
     let mut approvals = Approvals::load(env.approvals_path)?;
 
     let root = skills_root(env.ws)?;
+    // A skills dir that is a link could send the write anywhere.
+    if std::fs::symlink_metadata(&root).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(format!(
+            "{} is a symlink; refusing to write there",
+            root.display()
+        ));
+    }
     let dir = root.join(&d.name);
     std::fs::create_dir_all(&root).map_err(|e| format!("{}: {e}", root.display()))?;
     std::fs::create_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -297,11 +304,20 @@ pub fn promote(
         f.write_all(md.as_bytes())
             .map_err(|e| format!("{}: {e}", path.display()))?;
     }
+    // What gets approved is exactly the one file the owner confirmed: the
+    // package on disk must hash like `[SKILL.md]` and nothing else, so a
+    // file that appeared in the new directory meanwhile is never approved.
     let pkg = read_package(env.ws, &d.name)?;
-    if pkg.skill_md() != md.as_bytes() {
+    let expected = tole_core::skill_approval::package_hash(&[(
+        "SKILL.md".to_string(),
+        md.as_bytes().to_vec(),
+    )]);
+    if pkg.hash != expected {
         return Err(format!(
-            "{}: written bytes differ from the draft",
-            dir.display()
+            "{}: the directory holds more than the confirmed SKILL.md (or other bytes); \
+             nothing was approved, review it and run `tole skills approve {}`",
+            dir.display(),
+            d.name
         ));
     }
     approvals.approve(&pkg, env.now);

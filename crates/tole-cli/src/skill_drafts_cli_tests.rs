@@ -338,3 +338,19 @@ fn promote_distrusts_a_tampered_record_and_a_broken_approvals_file() {
     assert!(!r.skill_dir().exists());
     assert_eq!(r.store.get(&d.id).unwrap().status, DraftStatus::Pending);
 }
+
+#[cfg(unix)]
+#[test]
+fn promote_refuses_to_write_through_a_symlinked_skills_dir() {
+    let r = Rig::new("symlink");
+    let (d, md) = draft(&[], None);
+    r.seed(&d, &md);
+    let elsewhere = r.ws.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, r.ws.join("skills")).unwrap();
+    let err = r.go(&d, Some(&d.content_hash), false).unwrap_err();
+    assert!(err.contains("symlink"), "{err}");
+    assert!(std::fs::read_dir(&elsewhere).unwrap().next().is_none());
+    assert_eq!(r.store.get(&d.id).unwrap().status, DraftStatus::Pending);
+    assert!(!r.approvals.exists());
+}
