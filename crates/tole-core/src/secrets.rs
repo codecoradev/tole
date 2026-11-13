@@ -519,6 +519,104 @@ mod tests {
         }
     }
 
+    /// #682: secret-bearing names the first rule missed (the audit's list,
+    /// less the `*_URL` ones, which are secrets by value).
+    #[test]
+    fn the_name_rule_covers_the_pass_key_dsn_and_auth_families() {
+        for n in [
+            "DB_PASS",
+            "PGPASS",
+            "DATABASE_URL",
+            "TEST_DATABASE_URL",
+            "SENTRY_DSN",
+            "NGINJEN_KEY",
+            "GH_HOOK_KEY",
+            "HOOK_KEY",
+            "STRIPE_SK",
+            "OPENAI_KEY",
+            "AWS_SECRET",
+            "NPM_AUTH",
+            "SESSION_COOKIE",
+            "AUTH_BEARER",
+            "GPG_PASSPHRASE",
+            "ssh_key_pass",
+        ] {
+            assert!(is_secret_name(n), "{n}");
+        }
+        // Ordinary names stay ordinary, including the near misses.
+        for n in [
+            "SSH_AUTH_SOCK",
+            "GPG_KEY",
+            "SSH_PUBLIC_KEY",
+            "GIT_AUTHOR_NAME",
+            "GIT_AUTHOR_EMAIL",
+            "MONKEY",
+            "KEYBOARD",
+            "TOLE_BASE_URL",
+            "REDIS_URL",
+            "NO_PROXY",
+            "PROXY_BYPASS",
+            "XDG_SESSION_TYPE",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "TERM",
+            "LANG",
+            "PWD",
+            "OLDPWD",
+        ] {
+            assert!(!is_secret_name(n), "{n}");
+        }
+    }
+
+    /// #682: a variable is a secret by its value too: a URL password under
+    /// any name (not for proxy settings, whose password is still redacted),
+    /// or a value tole holds by role.
+    #[test]
+    fn a_variable_is_a_secret_by_its_value() {
+        let held = SecretSet::default().with("hooks.gh", "route-key-0123456789abcdef");
+        let pw_url = "redis://:redis-pw-0123456789@cache:6379/0";
+        assert!(is_secret_var("REDIS_URL", pw_url, &held));
+        assert!(is_secret_var(
+            "WHATEVER",
+            "route-key-0123456789abcdef",
+            &held
+        ));
+        assert!(is_secret_var(
+            "WHATEVER",
+            "  route-key-0123456789abcdef\n",
+            &held
+        ));
+        assert!(!is_secret_var(
+            "HTTPS_PROXY",
+            "http://u:proxy-pw-123@p:3128",
+            &held
+        ));
+        assert!(!is_secret_var(
+            "https_proxy",
+            "http://u:proxy-pw-123@p:3128",
+            &held
+        ));
+        assert!(!is_secret_var("REDIS_URL", "redis://cache:6379/0", &held));
+        assert!(!is_secret_var("EDITOR", "vim", &held));
+
+        // The password of any URL-valued variable is collected, proxies
+        // included: redaction covers what the scrub leaves.
+        let s = SecretSet::collect(
+            [
+                ("REDIS_URL".to_string(), pw_url.to_string()),
+                (
+                    "HTTPS_PROXY".to_string(),
+                    "http://u:proxy-pw-123@p:3128".to_string(),
+                ),
+                ("EDITOR".to_string(), "vim-but-longer".to_string()),
+            ],
+            [],
+        );
+        assert_eq!(
+            s.redact("redis-pw-0123456789 proxy-pw-123 vim-but-longer"),
+            "«REDIS_URL» «HTTPS_PROXY» vim-but-longer"
+        );
+    }
+
     #[test]
     fn collect_takes_secret_named_env_and_explicit_values_only() {
         let s = SecretSet::collect(

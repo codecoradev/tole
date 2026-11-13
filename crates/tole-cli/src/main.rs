@@ -1497,9 +1497,6 @@ fn dispatch(cli: Cli) -> Result<()> {
                 std::env::var("TOLE_SERVE_TOKEN").ok(),
             )
             .map_err(anyhow::Error::msg)?;
-            // #682: the token is a secret by role, whatever carried it:
-            // redacted on egress, and removed from any child's environment.
-            tole_core::secrets::add_role_secret("TOLE_SERVE_TOKEN", &token);
             if transport == "mcp" {
                 #[cfg(feature = "mcp-http")]
                 {

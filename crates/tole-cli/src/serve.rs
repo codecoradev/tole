@@ -216,6 +216,9 @@ const MAX_TOKEN_FILE: u64 = 4096;
 /// or FIFO, at most 4 KiB, surrounding whitespace dropped; an empty file is
 /// an error), else `--token`, else `TOLE_SERVE_TOKEN` (blank counts as
 /// unset). Errors never carry the token.
+///
+/// The token becomes a secret held by role, whatever carried it: redacted
+/// on egress, and removed from any child's environment.
 pub fn serve_token(
     flag: Option<String>,
     file: Option<&std::path::Path>,
@@ -235,7 +238,7 @@ pub fn serve_token(
         }
         None => None,
     };
-    [from_file, flag, env]
+    let token = [from_file, flag, env]
         .into_iter()
         .flatten()
         .map(|t| t.trim().to_string())
@@ -244,7 +247,9 @@ pub fn serve_token(
             "refusing to start an unauthenticated server: set TOLE_SERVE_TOKEN, --token-file \
              or --token"
                 .to_string()
-        })
+        })?;
+    tole_core::secrets::add_role_secret("TOLE_SERVE_TOKEN", &token);
+    Ok(token)
 }
 
 // ---------------------------------------------------------------------------
@@ -1569,6 +1574,43 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #682: the token comes from a file first, then the flag, then the
+    /// environment; an empty file is an error, and no error shows a token.
+    #[test]
+    fn the_serve_token_prefers_the_file_and_never_echoes_a_value() {
+        let dir = std::env::temp_dir().join(format!("tole-serve-token-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("token");
+        std::fs::write(&file, "file-token-0682\n").unwrap();
+        let s = |v: &str| Some(v.to_string());
+        assert_eq!(
+            serve_token(None, Some(&file), s("env-token")).unwrap(),
+            "file-token-0682"
+        );
+        assert_eq!(
+            tole_core::secrets::process_secrets().redact("t=file-token-0682"),
+            "t=«TOLE_SERVE_TOKEN»",
+            "the token is a secret held by role"
+        );
+        assert_eq!(
+            serve_token(s(" flag-token "), None, s("env-token")).unwrap(),
+            "flag-token"
+        );
+        assert_eq!(
+            serve_token(s("  "), None, s("env-token")).unwrap(),
+            "env-token"
+        );
+        let empty = dir.join("empty");
+        std::fs::write(&empty, "\n").unwrap();
+        let e = serve_token(None, Some(&empty), s("env-token-0682")).unwrap_err();
+        assert!(e.contains("is empty") && !e.contains("env-token"), "{e}");
+        let e = serve_token(None, Some(&dir.join("missing")), None).unwrap_err();
+        assert!(e.contains("does not exist"), "{e}");
+        let e = serve_token(None, None, s(" ")).unwrap_err();
+        assert!(e.contains("TOLE_SERVE_TOKEN"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn reason_phrases_cover_every_status_the_routes_emit() {

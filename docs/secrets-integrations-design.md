@@ -208,6 +208,22 @@ the secrets the `[secrets]` release binds to it:
 | `run_command`, `job_start`, `cron` | model commands, background jobs, cron scripts and delivery commands | nothing |
 | `uteke`, `memory`, `cora`, `skills` | tole's helper processes | nothing |
 
+**Secret by name or by value (#682).** The scrub removes a variable when its
+name is secret-shaped (the markers above plus names ending in `PASS`, `_KEY`,
+`_DSN`, `_SK`, `_COOKIE`, `_AUTH`, `_BEARER` or `DATABASE_URL`, or starting
+with `AUTH_` or `BEARER_`; `SSH_AUTH_SOCK`, `GPG_KEY`, public keys and
+`*BYPASS` stay ordinary), when its value is a URL with a password (proxy
+settings excepted), or when its value is a secret tole holds by role (a
+webhook key, the serve token, a `${NAME}` header expansion). To give such a
+variable back to a consumer, grant it by name; `[secrets]` keys may also be
+`*_URL` or `*_URI` names for that reason:
+
+```toml
+[secrets]
+DATABASE_URL = { tools = ["run_command"] }
+REDIS_URL = { tools = ["run_command", "job_start"] }
+```
+
 A child session (agent_start or delegate) receives its provider keys plus
 its parent's grant: the secrets the parent holds that its release binds to
 some consumer, narrowed by the profile's `grants` when it runs as one. A
