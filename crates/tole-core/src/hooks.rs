@@ -60,7 +60,9 @@ impl ProcessHook {
     pub fn run_raw(&self, payload: &Value) -> Result<(i32, String), String> {
         let mut cmd = Command::new(&self.program);
         cmd.args(&self.args);
-        crate::subprocess::scrub_env_for(&mut cmd, "hook");
+        // A stop gate usually runs code the agent wrote (`cargo test`): its
+        // own consumer, which gets no secret by default (#676).
+        crate::subprocess::scrub_env_for(&mut cmd, crate::secret_release::TURNEND);
         let out = run_with_timeout_stdin(&mut cmd, self.timeout, payload.to_string().as_bytes())?;
         let mut stdout = out.stdout;
         stdout.truncate(32 * 1024);

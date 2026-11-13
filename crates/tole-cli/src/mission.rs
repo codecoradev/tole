@@ -203,9 +203,15 @@ fn verify_run_error(cause: &str, timeout: std::time::Duration) -> String {
 
 /// Run the `--verify` command (sh -c, operator-budgeted timeout).
 /// Returns Ok(()) on exit-0, Err(output tail) otherwise.
+///
+/// The command is the owner's, but what it runs is usually code the agent
+/// just wrote (`cargo test` runs build scripts and tests), with no
+/// approval: it gets the ENV-1 scrub as its own consumer, which receives no
+/// secret unless a `[secrets]` entry grants one to `verify` (#676).
 fn run_verify(cmd: &str, timeout: std::time::Duration) -> Result<(), String> {
     let mut c = std::process::Command::new("sh");
     c.arg("-c").arg(cmd);
+    tole_core::subprocess::scrub_env_for(&mut c, tole_core::secret_release::VERIFY);
     let out = run_with_timeout(&mut c, timeout).map_err(|e| verify_run_error(&e, timeout))?;
     if out.status.success() {
         return Ok(());
