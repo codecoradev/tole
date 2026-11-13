@@ -570,11 +570,8 @@ pub fn build(approver: impl Approver + 'static, roster: Roster) -> Result<ToolRe
         if names.is_empty() {
             eprintln!("tole: mcp[{}]: no tools registered", cfg.name);
         }
-        // #680: only an admitted server is asked for resources (and the
-        // core refuses the others anyway).
-        if tole_core::mcp::is_admitted(&cfg.name)
-            && tole_core::mcp::probe_server_extras(cfg).resources
-        {
+        // #680: only a server this session admitted is asked for resources.
+        if reg.mcp_admitted(&cfg.name) && tole_core::mcp::probe_server_extras(cfg).resources {
             resource_servers.push(cfg.name.clone());
         }
     }

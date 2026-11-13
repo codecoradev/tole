@@ -3027,6 +3027,8 @@ fn chat_command(
             .mcp_server
             .iter()
             .filter_map(|spec| tole_core::mcp::McpServerConfig::parse(spec).ok())
+            // #680: only a server this session admitted offers prompts.
+            .filter(|cfg| registry.mcp_admitted(&cfg.name))
             .flat_map(|cfg| {
                 tole_core::mcp::probe_server_extras(&cfg)
                     .prompts
@@ -3080,7 +3082,16 @@ fn chat_command(
         let text = match tole_core::mcp::parse_prompt_command(text) {
             None => text,
             Some(parsed) => {
-                match parsed.and_then(|(s, p, a)| tole_core::mcp::get_server_prompt(&s, &p, a)) {
+                let admitted = parsed.and_then(|(s, p, a)| {
+                    if registry.mcp_admitted(&s) {
+                        Ok((s, p, a))
+                    } else {
+                        Err(format!(
+                            "mcp server {s:?} is not admitted by the plugin lock: it offers no prompts"
+                        ))
+                    }
+                });
+                match admitted.and_then(|(s, p, a)| tole_core::mcp::get_server_prompt(&s, &p, a)) {
                     Ok(t) if !t.is_empty() => {
                         println!("tole> (mcp prompt)\n{t}");
                         rendered = t;
