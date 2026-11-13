@@ -451,3 +451,84 @@ fn concurrent_writers_never_share_a_turn_or_an_entry_id() {
         );
     }
 }
+
+#[test]
+fn the_step_after_a_crash_is_not_glued_onto_the_torn_line() {
+    let l = log("torn-append");
+    l.start(contract(None, 10_000), 1).unwrap();
+    l.contribute(1, "coder", "before the crash", 2).unwrap();
+    // The process died mid-write of ops's line: bytes with no newline.
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&l.path)
+        .unwrap();
+    f.write_all(br#"{"seq":3,"t":3,"event":"contribution","round":1,"part"#)
+        .unwrap();
+    drop(f);
+    // The resumed process takes the same step again.
+    let c = l.contribute(1, "ops", "after the crash", 4).unwrap();
+    assert_eq!(c.entry, "e3", "the torn line never took a sequence number");
+    let st = l.state().unwrap();
+    assert_eq!(st.contributions.len(), 2);
+    assert_eq!(
+        st.next(),
+        Next::Summarize {
+            round: 1,
+            verbatim: true
+        }
+    );
+    // Every physical line parses; the torn bytes are gone.
+    let text = std::fs::read_to_string(&l.path).unwrap();
+    assert!(text.ends_with('\n'));
+    for line in text.lines() {
+        serde_json::from_str::<serde_json::Value>(line).unwrap();
+    }
+    assert!(
+        !text.contains("\"t\":3,"),
+        "the torn bytes are gone: {text}"
+    );
+}
+
+#[test]
+fn a_tear_inside_a_multibyte_character_does_not_make_the_log_unreadable() {
+    let l = log("torn-utf8");
+    l.start(contract(None, 10_000), 1).unwrap();
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&l.path)
+        .unwrap();
+    // "é" is two bytes; the write stopped after the first.
+    f.write_all(b"{\"seq\":2,\"t\":2,\"event\":\"usage\",\"note\":\"caf\xC3")
+        .unwrap();
+    drop(f);
+    let st = l.state().unwrap();
+    assert_eq!(
+        st.next(),
+        Next::Contribute {
+            round: 1,
+            missing: strs(&["coder", "ops"])
+        }
+    );
+    // And a step still works, replacing the torn bytes.
+    l.contribute(1, "coder", "ok", 3).unwrap();
+    assert!(String::from_utf8(std::fs::read(&l.path).unwrap()).is_ok());
+    assert_eq!(l.state().unwrap().contributions.len(), 1);
+}
+
+#[test]
+fn a_log_that_is_only_a_torn_line_restarts_clean() {
+    let l = log("torn-only");
+    std::fs::create_dir_all(l.path.parent().unwrap()).unwrap();
+    std::fs::write(&l.path, br#"{"seq":1,"t":1,"event":"contr"#).unwrap();
+    assert_eq!(l.state().unwrap().next(), Next::NeedContract);
+    l.start(contract(None, 10_000), 2).unwrap();
+    let text = std::fs::read_to_string(&l.path).unwrap();
+    assert_eq!(text.lines().count(), 1, "{text}");
+    assert_eq!(
+        l.state().unwrap().next(),
+        Next::Contribute {
+            round: 1,
+            missing: strs(&["coder", "ops"])
+        }
+    );
+}

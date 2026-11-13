@@ -336,8 +336,11 @@ impl DiscussionLog {
                 self.path.display()
             ));
         }
-        let text = std::fs::read_to_string(&self.path)
-            .map_err(|e| format!("{}: {e}", self.path.display()))?;
+        // Bytes, then lossy: a crash can tear the last line inside a
+        // multi-byte character, which must not make the whole file unreadable.
+        let bytes =
+            std::fs::read(&self.path).map_err(|e| format!("{}: {e}", self.path.display()))?;
+        let text = String::from_utf8_lossy(&bytes);
         let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
         let mut out = Vec::new();
         for (i, l) in lines.iter().enumerate() {
@@ -373,12 +376,40 @@ impl DiscussionLog {
         line.push('\n');
         let mut f = std::fs::OpenOptions::new()
             .create(true)
+            .read(true)
             .append(true)
             .open(&self.path)
             .map_err(|e| format!("{}: {e}", self.path.display()))?;
+        self.drop_torn_tail(&f)?;
         f.write_all(line.as_bytes())
             .map_err(|e| format!("{}: {e}", self.path.display()))?;
         Ok(seq)
+    }
+
+    /// A crash mid-write leaves bytes after the last newline: a step that
+    /// never completed (reads already ignore it). Cut them off before the
+    /// next line is appended, or the new line would be glued onto the torn
+    /// one and the log would no longer parse. Runs under the step's lock.
+    fn drop_torn_tail(&self, f: &std::fs::File) -> Result<(), String> {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+        let err = |e: std::io::Error| format!("{}: {e}", self.path.display());
+        let len = f.metadata().map_err(err)?.len();
+        if len == 0 {
+            return Ok(());
+        }
+        let mut f = f;
+        let mut last = [0u8; 1];
+        f.seek(SeekFrom::Start(len - 1)).map_err(err)?;
+        f.read_exact(&mut last).map_err(err)?;
+        if last[0] == b'\n' {
+            return Ok(());
+        }
+        // The log is capped, so reading it to find the last newline is cheap.
+        f.seek(SeekFrom::Start(0)).map_err(err)?;
+        let mut all = Vec::new();
+        f.read_to_end(&mut all).map_err(err)?;
+        let keep = all.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+        f.set_len(keep as u64).map_err(err)
     }
 
     fn refuse(next: &Next, what: &str) -> String {
