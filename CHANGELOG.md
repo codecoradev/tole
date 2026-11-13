@@ -48,6 +48,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Missions now learn about cora's agent-as-reviewer flow (#536): `tole mission` builds its registry like `run` (including the auto-attached `mcp_cora_*` tools) but its pinned system prompt never named the review tools, so the unattended command was the one that did not know the flow existed. When both `mcp_cora_cora_review_prepare` and `mcp_cora_cora_review_finalize` are registered, a fresh mission's prompt now carries the same review section as `run` / `chat` / the TUI plus one sentence asking for a review (and its verdict in the final message) before the mission ends; without the tools nothing is added. Guidance only: a gate before `git commit` is tracked separately. `serve`, `acp` and `mcp` sessions are unchanged on purpose: they attach no external MCP servers, so they have no review tools. Resumed missions keep their pinned prompt.
 
 ### Added
+- `consult_advisor` on the host side, part 2a of #587: the new module `tole_cli::advisor_host`. No run registers the tool yet; part 2b wires it into missions, delegated children and cron runs.
+  - **`ConsultAdvisor`** (ReadOnly): one advisor call per consultation, with no tools, no streaming and no fallback chain.
+    - The request is built from the task contract, the question and the window, redacted, neutralized and capped (`tole_core::advisor::request`).
+    - It returns only the fenced verdict from `parse_reply`, the use number and the tokens. An advisor's own tool call is answered with an error, and nothing runs.
+  - **Window:** `Tap` wraps the run's provider and keeps, in memory, the last 12 entries of each transcript the turn loop sends; no file is read. With `charge`, it also charges each step to the run's shared `Budget`.
+  - **Budget:** a consultation that the budget cannot fit, or past the cap, is refused before any call and without spending a use. What a call spent is charged and queued even when it fails.
+  - **`record_usage`** writes the queued usage to the session as usage records tagged `"role": "advisor"`.
 - Advisor tier, part 1 of #587: the core seam, the profile key and doctor lines. No run consults an advisor yet; `consult_advisor` comes in part 2.
   - **`tole_core::advisor`** (no I/O, builds with `--no-default-features`):
     - `request` builds the advisor call: a fixed system prompt, then the task contract, the last 12 transcript entries and the executor's question. Each is redacted with the process secrets, neutralized and capped before it is fenced as data.
