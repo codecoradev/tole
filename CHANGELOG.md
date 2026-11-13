@@ -51,6 +51,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Missions now learn about cora's agent-as-reviewer flow (#536): `tole mission` builds its registry like `run` (including the auto-attached `mcp_cora_*` tools) but its pinned system prompt never named the review tools, so the unattended command was the one that did not know the flow existed. When both `mcp_cora_cora_review_prepare` and `mcp_cora_cora_review_finalize` are registered, a fresh mission's prompt now carries the same review section as `run` / `chat` / the TUI plus one sentence asking for a review (and its verdict in the final message) before the mission ends; without the tools nothing is added. Guidance only: a gate before `git commit` is tracked separately. `serve`, `acp` and `mcp` sessions are unchanged on purpose: they attach no external MCP servers, so they have no review tools. Resumed missions keep their pinned prompt.
 
 ### Added
+- The nginjen backend for `web_search` and `web_fetch`, and `tole doctor` web lines, part 2 of #625.
+  - **Configuration:** set both `NGINJEN_BASE_URL` and `NGINJEN_API_KEY` to use a full nginjen service for both tools.
+    - Search is `POST {base}/search` and fetch is `POST {base}/scrape` with `{url, format}`, each with the key as a bearer token.
+    - The order per tool: a `TOLE_WEB_*` backend, then nginjen, then the built-in tools; without `web-builtin`, the direct fetcher and no search.
+    - A base URL that is not http(s) fails startup, naming the variable.
+  - **The key** is sent only to that backend. It is redacted with the process secrets, and no error, spec or doctor line shows it.
+  - **Fetch through the backend** vets the target first and sends nothing if it fails: http(s), no credentials, no known secret, a public host. Formats are `markdown` (default), `compact`, `text`, `html` and `links`.
+  - **Jina:** a result the backend produced through its Jina Reader fallback (`engine_used: "jina"`) is discarded with an error. tole never asks for it.
+  - **`tole doctor`** prints which lane `web_search` and `web_fetch` use: built-in, nginjen backend, generic backend, direct fetch or off. It shows names only.
+  - **Memory:** none resident; one HTTP agent per call.
 - Built-in `web_search` and `web_fetch` (#625), on nginjen-lite 0.1.0 and tole's own HTTP client, behind the default `web-builtin` feature of tole-cli. A configured `TOLE_WEB_*` backend still wins, and a build without the feature keeps today's tools.
   - **`web_search`** works out of the box: DuckDuckGo Lite, then Bing, then Brave (keyless; a non-2xx answer moves to the next).
     - The query is redacted with the process secrets and capped at 512 characters.
