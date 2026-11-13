@@ -847,6 +847,14 @@ pub fn run_cli(
         Some(Err(_)) => Vec::new(),
     };
     advisor_lines.iter().for_each(|l| println!("{l}"));
+    // Discussion roles (#588): where the scribe's and the claim-checker's
+    // models come from, names only.
+    let role_lines = match &user {
+        None => crate::discussion_roles::doctor_lines(&crate::config::Config::default()),
+        Some(Ok(c)) => crate::discussion_roles::doctor_lines(c),
+        Some(Err(_)) => Vec::new(),
+    };
+    role_lines.iter().for_each(|l| println!("{l}"));
     // Web tools (#625): which lane each tool uses, names only.
     for l in crate::tool_roster::web_doctor_lines(&|k: &str| std::env::var(k).ok()) {
         println!("{l}");
