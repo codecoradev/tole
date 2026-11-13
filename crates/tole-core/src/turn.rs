@@ -542,6 +542,8 @@ fn drive(
     cancel: &CancelToken,
     observer: Option<&dyn TurnObserver>,
 ) -> Result<TurnOutcome, StorageError> {
+    // #592: a resumed session keeps the taint of what it fetched before.
+    registry.seed_taint(s.entries());
     // E10 loop guard: fingerprint of the last tool call (tool + canonical
     // input), with its consecutive repeat count. Identical calls are
     // never progress.

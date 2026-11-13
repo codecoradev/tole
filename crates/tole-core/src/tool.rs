@@ -97,6 +97,8 @@ pub struct ToolRegistry {
     /// Records the untrusted tools a session ran (#592): web and MCP output
     /// taints a skill draft. `None` = nothing is recorded.
     taint: Option<crate::skill_draft::TaintTracker>,
+    /// True once the tracker was folded over the session's past entries.
+    taint_seeded: std::sync::atomic::AtomicBool,
 }
 
 impl ToolRegistry {
@@ -115,6 +117,7 @@ impl ToolRegistry {
             #[cfg(feature = "shell-tools")]
             hooks: None,
             taint: None,
+            taint_seeded: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -127,6 +130,24 @@ impl ToolRegistry {
 
     pub(crate) fn taint_tracker(&self) -> Option<&crate::skill_draft::TaintTracker> {
         self.taint.as_ref()
+    }
+
+    /// Fold the tracker over the tool calls already in the session, once: a
+    /// resumed or forked session that fetched from outside before this
+    /// process started must not look clean (#592). Intents carry the tool
+    /// name in `payload.tool`.
+    pub(crate) fn seed_taint(&self, entries: &[crate::entry::Entry]) {
+        use std::sync::atomic::Ordering;
+        let Some(t) = &self.taint else { return };
+        if self.taint_seeded.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        for name in entries
+            .iter()
+            .filter_map(|e| e.payload.get("tool")?.as_str())
+        {
+            t.observe_tool(name);
+        }
     }
 
     /// Attach opt-in tool-boundary hooks (issue #110). Default OFF.
