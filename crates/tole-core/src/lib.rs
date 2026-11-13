@@ -45,6 +45,7 @@ pub mod file_tools;
 pub mod delegation;
 pub mod delegation_report;
 pub mod discussion;
+pub mod discussion_log;
 pub(crate) mod gate;
 #[cfg(feature = "shell-tools")]
 pub mod gh;
