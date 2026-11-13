@@ -46,6 +46,8 @@ pub struct SkillProposeTool {
     secrets: SecretSet,
     /// The index for meaning dedup; only a `uteke` index scores by cosine.
     index: Option<Arc<dyn SkillIndex>>,
+    /// The curator state file (`None`: the default at call time).
+    curator_state: Option<std::path::PathBuf>,
 }
 
 impl SkillProposeTool {
@@ -64,7 +66,14 @@ impl SkillProposeTool {
             model,
             secrets,
             index,
+            curator_state: None,
         }
+    }
+
+    /// Read the locked skills from `path` instead of the default state file.
+    pub fn with_curator_state(mut self, path: std::path::PathBuf) -> Self {
+        self.curator_state = Some(path);
+        self
     }
 
     /// The nearest existing skill and a note when meaning dedup did not run.
@@ -174,6 +183,21 @@ impl Tool for SkillProposeTool {
             None => DraftStore::default_store()
                 .ok_or("skill_propose: the CodeCora home is unresolvable")?,
         };
+        // A locked skill (`tole curator lock`) takes no agent proposals.
+        if let Some(path) = self
+            .curator_state
+            .clone()
+            .or_else(tole_core::skill_curator::CuratorState::default_path)
+        {
+            let state = tole_core::skill_curator::CuratorState::load(&path)
+                .map_err(|e| format!("skill_propose: {e}"))?;
+            if state.locked.contains(&i.name) {
+                return Err(format!(
+                    "skill_propose: skill {:?} is locked by the owner; no agent proposals",
+                    i.name
+                ));
+            }
+        }
         let (dedup, note) = self.dedup(&i.name, &i.skill_md);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

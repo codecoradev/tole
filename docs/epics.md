@@ -313,8 +313,10 @@ Bot and Nakama; BMAD for collaboration). Design notes:
   drafts gated) and `revoke` (what grew from a poisoned source). #592 is
   done. #593 in progress: part 1 is the `skill_curator` core in `tole-core`
   (usage ledger, derived lifecycle, underperformers, package-aware archive
-  and restore with a mutation ledger); `tole curator`, the usage recording
-  and the weekly sweep follow.
+  and restore with a mutation ledger); part 2 is `tole curator`
+  (run/status/pause/restore/pin/lock/adopt) and the recall and load
+  recording; run outcomes, the `[curator]` config and the weekly schedule
+  follow.
 - **E4 — Secrets and third-party plugins, epic #594:**
   - `SecretSet` at every sink (#595; module, provider body, child minimum
     env, MCP arguments, web, `systemone`, memory loop and `uteke_document`

@@ -127,6 +127,10 @@ pub struct SkillRecall {
     /// What may load (#591): every listed, recalled, searched or loaded
     /// skill goes through it. `Open` by default.
     pub gate: Gate,
+    /// Where recalls and loads are counted for the curator (#593). `None`
+    /// by default, so a test or an embedder never writes the user's ledger;
+    /// [`SkillRecall::from_env`] sets the default one.
+    pub usage: Option<tole_core::skill_curator::UsageLedger>,
 }
 
 /// An index whose queries are redacted first: a query may leave the
@@ -187,6 +191,7 @@ impl SkillRecall {
             index,
             secrets: crate::provider_chain::process_secrets(&crate::config_apply::real_env),
             gate: Gate::Open,
+            usage: tole_core::skill_curator::UsageLedger::default_ledger(),
         })
     }
 }
@@ -214,7 +219,9 @@ pub fn skills_section(
     let ws_buf = ws.map(Path::to_path_buf);
     registry
         .register(Box::new(
-            tole_core::skills::LoadSkillTool::new(ws_buf.clone()).with_gate(recall.gate.clone()),
+            tole_core::skills::LoadSkillTool::new(ws_buf.clone())
+                .with_gate(recall.gate.clone())
+                .with_usage(recall.usage.clone()),
         ))
         .map_err(|e| format!("registering load_skill: {e}"))?;
     let Some(index) = index else {
@@ -243,6 +250,7 @@ pub fn skills_section(
         &recall.gate,
     );
     notes.extend(sel.notes.iter().cloned());
+    record_recalled(recall.usage.as_ref(), &sel);
     registry
         .register(Box::new(SkillSearchTool::new(
             index,
@@ -252,6 +260,29 @@ pub fn skills_section(
         )))
         .map_err(|e| format!("registering skill_search: {e}"))?;
     Ok((selection_block(&sel), notes))
+}
+
+/// Count each recalled skill in the usage ledger (#593). A recall alone is
+/// not use, so it never keeps a skill alive; it shows the curator which
+/// skills are offered but never loaded. Best effort.
+fn record_recalled(
+    ledger: Option<&tole_core::skill_curator::UsageLedger>,
+    sel: &tole_core::skill_index::Selection,
+) {
+    let Some(ledger) = ledger else {
+        return;
+    };
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    for (skill, _) in &sel.recalled {
+        let _ = ledger.append(&tole_core::skill_curator::UsageRecord {
+            t,
+            skill: Some(skill.name.clone()),
+            kind: tole_core::skill_curator::UsageKind::Recalled,
+        });
+    }
 }
 
 /// Upsert every skill discovered from `ws` (the same discovery as a
@@ -488,6 +519,7 @@ mod tests {
             index: Some(Arc::new(Fixed(vec!["beta", "gamma"]))),
             secrets: SecretSet::default(),
             gate: Gate::Open,
+            usage: None,
         };
         let (block, _) = skills_section(&recall, Some(&dir), &mut reg).unwrap();
         assert!(
@@ -615,6 +647,7 @@ mod tests {
             index: Some(seen.clone()),
             secrets: SecretSet::default().with("DEPLOY_TOKEN", secret),
             gate: Gate::Open,
+            usage: None,
         };
         let mut reg = ToolRegistry::new();
         skills_section(&recall, Some(&dir), &mut reg).unwrap();

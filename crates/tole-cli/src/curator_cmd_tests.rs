@@ -1,0 +1,325 @@
+use super::*;
+use tole_core::secrets::SecretSet;
+use tole_core::skill_curator::{UsageKind, UsageRecord, MUTATION_FILE};
+use tole_core::skill_draft::{gate, Dedup, HostContext, Promotion, Proposal, Trigger};
+
+const DAY: u64 = 86_400;
+const NOW: u64 = 200 * DAY;
+
+struct Rig {
+    root: PathBuf,
+    drafts: DraftStore,
+    usage: UsageLedger,
+    archive: Archive,
+    state: PathBuf,
+    lock: PathBuf,
+    n: u64,
+}
+
+impl Rig {
+    fn new(tag: &str) -> Self {
+        let root =
+            std::env::temp_dir().join(format!("tole-curator-cli-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        Self {
+            drafts: DraftStore::new(root.join("drafts")),
+            usage: UsageLedger::new(root.join("usage.jsonl")),
+            archive: Archive::new(root.join(MUTATION_FILE), root.join("archive")),
+            state: root.join("state.json"),
+            lock: root.join("curator.lock"),
+            root,
+            n: 0,
+        }
+    }
+
+    fn skill_dir(&self, name: &str) -> PathBuf {
+        self.root.join("skills").join(name)
+    }
+
+    fn write_skill(&self, name: &str) {
+        let d = self.skill_dir(name);
+        std::fs::create_dir_all(d.join("references")).unwrap();
+        std::fs::write(
+            d.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: d\n---\nbody\n"),
+        )
+        .unwrap();
+        std::fs::write(d.join("references/a.md"), "ref").unwrap();
+    }
+
+    /// An agent-grown skill: a promoted draft, `age` days old, last loaded
+    /// `used` days ago (`None` = never).
+    fn grown(&mut self, name: &str, age: u64, used: Option<u64>) {
+        self.write_skill(name);
+        self.n += 1;
+        let md = format!("---\nname: {name}\ndescription: d\n---\nbody\n");
+        let ctx = HostContext {
+            session: Some("s".into()),
+            model: None,
+            taint: Vec::new(),
+            dedup: Dedup::from_nearest(None),
+            now: 1000 + self.n,
+        };
+        let p = Proposal {
+            name: name.into(),
+            skill_md: md,
+            trigger: Trigger::DeadEnd,
+            sources: Vec::new(),
+        };
+        let (d, md) = gate(&p, &ctx, &SecretSet::default()).unwrap();
+        self.drafts.create(&d, &md).unwrap();
+        self.drafts
+            .promote(
+                &d.id,
+                Promotion {
+                    package_hash: "sha256:x".into(),
+                    dir: self.skill_dir(name).display().to_string(),
+                    at: NOW - age * DAY,
+                },
+            )
+            .unwrap();
+        if let Some(days) = used {
+            self.load(name, days);
+        }
+    }
+
+    fn load(&self, name: &str, days_ago: u64) {
+        self.usage
+            .append(&UsageRecord {
+                t: NOW - days_ago * DAY,
+                skill: Some(name.into()),
+                kind: UsageKind::Loaded,
+            })
+            .unwrap();
+    }
+
+    fn env(&self) -> Env<'_> {
+        Env {
+            drafts: &self.drafts,
+            state_path: &self.state,
+            usage: &self.usage,
+            archive: &self.archive,
+            lock_path: &self.lock,
+            cron_skills: BTreeSet::new(),
+            ws: Some(&self.root),
+            thresholds: Thresholds::default(),
+            now: NOW,
+        }
+    }
+}
+
+fn names(v: &[Mutation]) -> Vec<&str> {
+    v.iter().map(|m| m.skill.as_str()).collect()
+}
+
+#[test]
+fn a_sweep_archives_only_what_is_unused_past_the_threshold() {
+    let mut r = Rig::new("sweep");
+    r.grown("old", 90, Some(40));
+    r.grown("recent", 90, Some(3));
+    r.grown("fresh", 5, None);
+    r.grown("stale", 90, Some(20));
+    let rep = sweep(&r.env(), false).unwrap();
+    assert_eq!(names(&rep.archived), ["old"]);
+    assert!(!r.skill_dir("old").exists());
+    for kept in ["recent", "fresh", "stale"] {
+        assert!(r.skill_dir(kept).join("SKILL.md").exists(), "{kept}");
+    }
+    let text = render_report(&rep, false);
+    assert!(
+        text.contains("archived old (entry 1, restore with `tole curator restore old`)"),
+        "{text}"
+    );
+    assert!(text.contains("stale  stale  unused for 20 days"), "{text}");
+    // The package moved whole, references included.
+    let to = PathBuf::from(&rep.archived[0].to);
+    assert!(to.join("references/a.md").is_file());
+    // Restoring puts it back exactly.
+    r.archive.restore("old", NOW).unwrap();
+    assert!(r.skill_dir("old").join("references/a.md").is_file());
+}
+
+#[test]
+fn a_dry_run_and_a_paused_curator_change_nothing() {
+    let mut r = Rig::new("dry");
+    r.grown("old", 90, Some(40));
+    let rep = sweep(&r.env(), true).unwrap();
+    assert_eq!(rep.would_archive, ["old"]);
+    assert!(rep.archived.is_empty() && r.skill_dir("old").exists());
+    assert!(render_report(&rep, true).contains("would archive: old"));
+
+    CuratorState {
+        paused: true,
+        ..CuratorState::default()
+    }
+    .save(&r.state)
+    .unwrap();
+    let rep = sweep(&r.env(), false).unwrap();
+    assert!(rep.held.as_deref().unwrap().contains("paused"));
+    assert_eq!(rep.would_archive, ["old"]);
+    assert!(r.skill_dir("old").exists() && r.archive.mutations().is_empty());
+}
+
+#[test]
+fn pinned_cron_named_and_unmanaged_skills_are_left_alone() {
+    let mut r = Rig::new("protect");
+    r.grown("pinned", 90, Some(60));
+    r.grown("cron", 90, Some(60));
+    r.grown("open", 90, Some(60));
+    r.write_skill("hand"); // hand-written: not a promoted draft
+    let mut st = CuratorState::default();
+    st.pinned.insert("pinned".into());
+    st.save(&r.state).unwrap();
+    let mut env = r.env();
+    env.cron_skills.insert("cron".into());
+    let rep = sweep(&env, false).unwrap();
+    assert_eq!(names(&rep.archived), ["open"]);
+    for kept in ["pinned", "cron", "hand"] {
+        assert!(r.skill_dir(kept).exists(), "{kept}");
+    }
+
+    // Adopting the hand-written skill puts it under curation.
+    let msg = edit_state(&r.state, "hand", |s| &mut s.adopted, true, "adopted").unwrap();
+    assert_eq!(msg, "hand is adopted");
+    let rep = sweep(&r.env(), false).unwrap();
+    assert!(
+        rep.assessments.iter().any(|a| a.name == "hand"),
+        "{:?}",
+        rep.assessments
+    );
+}
+
+#[test]
+fn only_one_sweep_runs_at_a_time_and_a_stale_lock_is_taken_over() {
+    let mut r = Rig::new("lock");
+    r.grown("old", 90, Some(40));
+    std::fs::write(&r.lock, "").unwrap();
+    assert!(sweep(&r.env(), false)
+        .unwrap_err()
+        .contains("another curator sweep"));
+    assert!(r.skill_dir("old").exists());
+
+    let old = std::time::SystemTime::UNIX_EPOCH
+        + std::time::Duration::from_secs(NOW - 2 * LOCK_STALE_SECS);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&r.lock)
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    // `now` is synthetic; the lock's mtime is compared against it.
+    let rep = sweep(&r.env(), false).unwrap();
+    assert_eq!(names(&rep.archived), ["old"]);
+    assert!(!r.lock.exists(), "the lock is released");
+}
+
+#[test]
+fn an_archive_failure_is_reported_not_hidden() {
+    let mut r = Rig::new("fail");
+    r.grown("old", 90, Some(40));
+    r.grown("ok", 90, Some(40));
+    // `old` becomes a symlink: the archive refuses it.
+    #[cfg(unix)]
+    {
+        let real = r.skill_dir("old");
+        let moved = r.root.join("moved");
+        std::fs::rename(&real, &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, &real).unwrap();
+        let rep = sweep(&r.env(), false).unwrap();
+        assert_eq!(names(&rep.archived), ["ok"]);
+        assert_eq!(rep.errors.len(), 1, "{:?}", rep.errors);
+        assert!(render_report(&rep, false).contains("error: old"));
+    }
+}
+
+#[test]
+fn status_summarises_the_library_and_the_state() {
+    let mut r = Rig::new("status");
+    r.grown("a", 90, Some(1));
+    r.grown("b", 90, Some(20));
+    r.grown("c", 90, Some(50));
+    r.grown("p", 90, Some(50));
+    let mut st = CuratorState::default();
+    st.pinned.insert("p".into());
+    st.save(&r.state).unwrap();
+    sweep(&r.env(), false).unwrap();
+    let text = render_status(&r.env()).unwrap();
+    assert!(text.contains("curator: on"), "{text}");
+    assert!(
+        text.contains(
+            "managed: 3 (1 active, 1 stale, 0 due for archive; 1 pinned or cron-named left alone)"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("pinned: p") && text.contains("archived: c (entry 1"),
+        "{text}"
+    );
+    assert!(
+        text.contains("stale after 14 days, archive after 30 days"),
+        "{text}"
+    );
+}
+
+#[test]
+fn state_edits_are_idempotent_and_refuse_a_bad_name() {
+    let r = Rig::new("state");
+    let pin = |add| edit_state(&r.state, "demo", |s| &mut s.pinned, add, "pinned");
+    assert_eq!(pin(true).unwrap(), "demo is pinned");
+    assert_eq!(pin(true).unwrap(), "demo is already pinned");
+    assert_eq!(pin(false).unwrap(), "demo is no longer pinned");
+    assert_eq!(pin(false).unwrap(), "demo is already not pinned");
+    assert!(edit_state(&r.state, "../x", |s| &mut s.locked, true, "locked").is_err());
+    assert!(CuratorState::load(&r.state).unwrap().pinned.is_empty());
+}
+
+#[test]
+fn invalid_thresholds_stop_the_sweep() {
+    let mut r = Rig::new("thr");
+    r.grown("old", 90, Some(40));
+    let mut env = r.env();
+    env.thresholds = Thresholds {
+        stale_days: 30,
+        archive_days: 14,
+        grace_days: 0,
+    };
+    assert!(sweep(&env, false).is_err());
+    assert!(r.skill_dir("old").exists());
+}
+
+#[test]
+fn a_skill_doing_worse_than_skill_less_runs_is_proposed_never_archived() {
+    let mut r = Rig::new("under");
+    r.grown("weak", 90, Some(1));
+    let rec = |skill: Option<&str>, kind| UsageRecord {
+        t: NOW - DAY,
+        skill: skill.map(String::from),
+        kind,
+    };
+    for _ in 0..8 {
+        r.usage.append(&rec(None, UsageKind::Success)).unwrap();
+    }
+    for _ in 0..2 {
+        r.usage.append(&rec(None, UsageKind::Failure)).unwrap();
+    }
+    for _ in 0..2 {
+        r.usage
+            .append(&rec(Some("weak"), UsageKind::Success))
+            .unwrap();
+    }
+    for _ in 0..8 {
+        r.usage
+            .append(&rec(Some("weak"), UsageKind::Failure))
+            .unwrap();
+    }
+    let rep = sweep(&r.env(), false).unwrap();
+    assert!(rep.archived.is_empty() && r.skill_dir("weak").exists());
+    let text = render_report(&rep, false);
+    assert!(
+        text.contains(
+            "proposal: review weak: it succeeds 20% of 10 runs, runs without a skill 80%"
+        ),
+        "{text}"
+    );
+}

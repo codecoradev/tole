@@ -148,3 +148,21 @@ fn it_is_a_write_tool_with_a_closed_schema() {
     assert_eq!(spec["additionalProperties"], false);
     assert!(t.describe(&input()).contains("ship-release"));
 }
+
+#[test]
+fn a_locked_skill_takes_no_agent_proposal() {
+    let (t, store) = tool("locked", None, TaintTracker::default());
+    let state = dir("locked-state").join("curator.json");
+    let mut st = tole_core::skill_curator::CuratorState::default();
+    st.locked.insert("ship-release".into());
+    st.save(&state).unwrap();
+    let t = t.with_curator_state(state.clone());
+    let err = t.execute(input()).unwrap_err();
+    assert!(err.contains("locked by the owner"), "{err}");
+    assert!(store.list().is_empty());
+    // Unlocked, the same proposal is accepted.
+    tole_core::skill_curator::CuratorState::default()
+        .save(&state)
+        .unwrap();
+    assert!(t.execute(input()).is_ok());
+}
