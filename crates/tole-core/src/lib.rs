@@ -44,6 +44,7 @@ pub mod file_tools;
 // Tool-call authorization gate (#303): crate-internal, no public API.
 pub mod delegation;
 pub mod delegation_report;
+pub mod discussion;
 pub(crate) mod gate;
 #[cfg(feature = "shell-tools")]
 pub mod gh;
