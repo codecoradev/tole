@@ -832,13 +832,21 @@ pub fn run_cli(
     let user = crate::config::user_config_path()
         .filter(|p| p.exists())
         .map(|p| crate::config::load(&p));
-    let router_lines = match user {
+    let router_lines = match &user {
         None => crate::routing::doctor_lines(&crate::config::Config::default()),
-        Some(Ok(c)) => crate::routing::doctor_lines(&c),
+        Some(Ok(c)) => crate::routing::doctor_lines(c),
         Some(Err(e)) => vec![format!("router: ERROR in the user config: {e}")],
     };
     let ok = ok && !router_lines.iter().any(|l| l.starts_with("router: ERROR"));
     router_lines.iter().for_each(|l| println!("{l}"));
+    // Advisor tier (#587): the profiles that declare one, names only. A
+    // broken user config is already reported (and failed) above.
+    let advisor_lines = match &user {
+        None => crate::profile::advisor_doctor_lines(&crate::config::Config::default()),
+        Some(Ok(c)) => crate::profile::advisor_doctor_lines(c),
+        Some(Err(_)) => Vec::new(),
+    };
+    advisor_lines.iter().for_each(|l| println!("{l}"));
     // Scheduler (#579, P5): a stale ticker while jobs are active fails.
     #[cfg(feature = "shell-tools")]
     let ok = {

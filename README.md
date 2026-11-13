@@ -363,6 +363,7 @@ allow = ["write_*"]
 skills = ["~/skills/rust/SKILL.md"]
 memory_room = "profile-coder"          # default: profile-<name>
 grants = ["GITHUB_TOKEN"]              # secret NAMES only, never values (used by #585/#598)
+advisor_max_uses = 3                   # consultations of the advisor per run, 1-20 (#587; needs models.advisor)
 [profiles.coder.models]
 light = "small-model"
 standard = "mid-model"

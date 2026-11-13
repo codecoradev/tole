@@ -309,6 +309,9 @@ pub struct ProfileConfig {
     /// (never values; #598 releases them, #585 intersects with the parent).
     pub grants: Option<Vec<String>>,
     pub models: Option<ModelTiers>,
+    /// `consult_advisor` calls per run (#587; default 3, 1 to 20). Only with
+    /// `models.advisor` set.
+    pub advisor_max_uses: Option<u32>,
 }
 
 /// One `[secrets]` entry (#598): the tools (and tole launchers) whose
@@ -459,6 +462,27 @@ fn check_profile(name: &str, p: &ProfileConfig) -> Result<(), String> {
         return Err(format!(
             "profiles.{name}.grants: every entry must be an environment variable NAME              ([A-Z0-9_]), never a value"
         ));
+    }
+    // The advisor tier (#587): a model that is consulted, never executes.
+    let advisor = p.models.as_ref().and_then(|m| m.advisor.as_deref());
+    if advisor.is_some_and(|a| a.trim().is_empty()) {
+        return Err(format!(
+            "profiles.{name}.models.advisor is blank: name the advisor model or remove the key"
+        ));
+    }
+    if let Some(n) = p.advisor_max_uses {
+        let max = tole_core::advisor::MAX_USES_CEILING;
+        if !(1..=max).contains(&n) {
+            return Err(format!(
+                "profiles.{name}.advisor_max_uses must be 1 to {max}, got {n}"
+            ));
+        }
+        if advisor.is_none() {
+            return Err(format!(
+                "profiles.{name}.advisor_max_uses is set but profiles.{name}.models.advisor is \
+                 not set: declare the advisor model or drop advisor_max_uses"
+            ));
+        }
     }
     if let Some(m) = &p.models {
         let tier = m.default_tier();

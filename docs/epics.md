@@ -295,7 +295,8 @@ Bot and Nakama; BMAD for collaboration). Design notes:
     lines are in, and new runs, missions, delegated children and cron runs
     are routed once when `[router] enabled = true`. LayaRouter waits for
     the eval gate);
-  - advisor (#587);
+  - advisor (#587; the core seam, `advisor_max_uses` and the doctor line
+    are in, `consult_advisor` in runs is next);
   - multi-round discussion with a sanitizer (#588);
   - `uteke_document` parent (#576).
 - **E3 — Skills, epic #589:** `SkillIndex` + uteke doc adapter, K = 5 with
