@@ -611,6 +611,26 @@ client (one client, one TLS stack). The guards stay in tole:
   There is no domain allowlist (owner decision): unattended runs use the
   same tools.
 
+nginjen backend (#625 part 2): with `NGINJEN_BASE_URL` and
+`NGINJEN_API_KEY` both set, both tools go to that service. The search query
+(redacted) and the fetch target are disclosed to its operator, as with the
+generic backends.
+- **The key** is a bearer token sent only to that backend. No redirect is
+  followed, so it never reaches another host. It is a secret-named
+  variable, so the process `SecretSet` redacts it everywhere; no error,
+  spec or doctor line carries it.
+- **The fetch target** is vetted before anything leaves: http(s), no
+  credentials, no known secret, and a public host
+  (`TOLE_WEB_ALLOW_PRIVATE=1` opts out). The backend resolves the host
+  again itself, so as for the generic backend this keeps internal
+  addresses from being asked about; it is not a defense against DNS
+  rebinding at the backend.
+- **Jina:** a result marked `engine_used: "jina"` is discarded, so text
+  from a third party tole did not choose never reaches the model.
+
+The order per tool is a `TOLE_WEB_*` backend, then nginjen, then the
+built-in tools. `tole doctor` names the lane, never the URL or the key.
+
 Fetch backend (#532): with `TOLE_WEB_FETCH_URL` set, `web_fetch` sends the
 target to that backend instead of fetching directly (backend only, no
 fallback, so behavior is predictable). It stays ReadOnly with the same
