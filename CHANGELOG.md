@@ -56,6 +56,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Missions now learn about cora's agent-as-reviewer flow (#536): `tole mission` builds its registry like `run` (including the auto-attached `mcp_cora_*` tools) but its pinned system prompt never named the review tools, so the unattended command was the one that did not know the flow existed. When both `mcp_cora_cora_review_prepare` and `mcp_cora_cora_review_finalize` are registered, a fresh mission's prompt now carries the same review section as `run` / `chat` / the TUI plus one sentence asking for a review (and its verdict in the final message) before the mission ends; without the tools nothing is added. Guidance only: a gate before `git commit` is tracked separately. `serve`, `acp` and `mcp` sessions are unchanged on purpose: they attach no external MCP servers, so they have no review tools. Resumed missions keep their pinned prompt.
 
 ### Added
+- `tole doctor` reports the process guard (#675): `process guard: ✓ non-dumpable` when same-user children cannot read tole's `/proc/<pid>/environ` or memory, `! dumpable` otherwise. Linux only; the line names no secret.
 - The nginjen backend for `web_search` and `web_fetch`, and `tole doctor` web lines, part 2 of #625.
   - **Configuration:** set both `NGINJEN_BASE_URL` and `NGINJEN_API_KEY` to use a full nginjen service for both tools.
     - Search is `POST {base}/search` and fetch is `POST {base}/scrape` with `{url, format}`, each with the key as a bearer token.

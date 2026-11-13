@@ -95,3 +95,23 @@ fn doctor_names_the_advisor_profiles_but_not_their_models() {
     assert!(!stdout.contains("wise-model"), "{stdout}");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// #675: the doctor shows that the process guard is in force (Linux).
+#[cfg(target_os = "linux")]
+#[test]
+fn doctor_reports_the_process_guard() {
+    let home = tmpdir("guard");
+    let out = Command::new(env!("CARGO_BIN_EXE_tole"))
+        .args(["doctor", "--tier", "offline", "--no-ledger"])
+        .env("CODECORA_HOME", &home)
+        .env("TOLE_NO_UPDATE_CHECK", "1")
+        .env("TOLE_BASE_URL", "http://127.0.0.1:9/v1")
+        .env("TOLE_MODEL", "m")
+        .env("TOLE_API_KEY", "k")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run tole doctor");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("process guard: ✓ non-dumpable"), "{stdout}");
+    let _ = std::fs::remove_dir_all(&home);
+}
