@@ -610,3 +610,52 @@ fn mission_prompt_names_the_cora_review_flow_when_cora_is_attached() {
     assert!(without.contains("MISSION MODE"), "{without}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// #593: how a mission ends is recorded for the skill curator. A completed
+/// mission that loaded no skill is a baseline success; an exhausted one is a
+/// baseline failure.
+#[test]
+fn a_mission_records_its_outcome_for_the_curator() {
+    let dir = temp_dir("curator-outcome");
+    let home = dir.join("home");
+    // A user the curator has something to manage for: a draft was made.
+    std::fs::create_dir_all(home.join("tole").join("skill-drafts")).unwrap();
+    let ledger =
+        tole_core::skill_curator::UsageLedger::new(home.join("tole").join("skill-usage.jsonl"));
+    for (max_steps, goal) in [
+        ("12", "accomplish the thing"),
+        ("1", "impossible in one turn"),
+    ] {
+        let base = spawn_mock("NONE".into());
+        let env = [
+            ("TOLE_BASE_URL".to_string(), base),
+            ("TOLE_MODEL".to_string(), "mock-model".to_string()),
+            ("TOLE_API_KEY".to_string(), "sk-test".to_string()),
+            ("CODECORA_HOME".to_string(), home.display().to_string()),
+            ("HOME".to_string(), home.display().to_string()),
+        ];
+        let env_ref: Vec<(&str, &str)> =
+            env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let sessions = dir.join(format!("sessions-{max_steps}"));
+        run_tole(
+            &env_ref,
+            &[
+                "mission",
+                "-s",
+                sessions.to_str().unwrap(),
+                "--yes",
+                "--max-steps",
+                max_steps,
+                goal,
+            ],
+        );
+    }
+    let s = ledger.summary();
+    assert_eq!(
+        (s.baseline.success, s.baseline.failure),
+        (1, 1),
+        "one complete and one exhausted mission: {s:?}"
+    );
+    assert!(s.skills.is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}

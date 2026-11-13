@@ -191,7 +191,7 @@ impl SkillRecall {
             index,
             secrets: crate::provider_chain::process_secrets(&crate::config_apply::real_env),
             gate: Gate::Open,
-            usage: tole_core::skill_curator::UsageLedger::default_ledger(),
+            usage: tole_core::skill_curator::UsageLedger::default_if_curated(),
         })
     }
 }

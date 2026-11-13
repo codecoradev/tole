@@ -297,3 +297,165 @@ fn schedule_saves_one_weekly_script_job_and_unschedule_removes_it() {
         out(&o)
     );
 }
+
+// ---- run outcomes: `tole run` against a scripted mock provider -----------
+
+mod outcomes {
+    use super::*;
+    use serde_json::{json, Value};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    /// Answers request n with `replies[min(n, last)]`; a reply is either a
+    /// final text or a `load_skill` tool call.
+    fn spawn_mock(replies: Vec<Value>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let n = Arc::new(Mutex::new(0usize));
+        std::thread::spawn(move || {
+            for mut s in listener.incoming().flatten() {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 16384];
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while Instant::now() < deadline {
+                    let got = s.read(&mut chunk).unwrap_or(0);
+                    buf.extend_from_slice(&chunk[..got]);
+                    if let Some(h) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        if serde_json::from_slice::<Value>(&buf[h + 4..]).is_ok() {
+                            break;
+                        }
+                    }
+                    if got == 0 {
+                        break;
+                    }
+                }
+                let i = {
+                    let mut g = n.lock().unwrap();
+                    let i = (*g).min(replies.len() - 1);
+                    *g += 1;
+                    i
+                };
+                let data = replies[i].to_string();
+                let _ = s.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{data}",
+                        data.len()
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+        format!("http://{addr}/v1")
+    }
+
+    fn final_reply(text: &str) -> Value {
+        json!({"id": "c", "object": "chat.completion", "created": 1, "model": "mock",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": text},
+                "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}})
+    }
+
+    fn load_reply(skill: &str) -> Value {
+        json!({"id": "c", "object": "chat.completion", "created": 1, "model": "mock",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": null,
+                "tool_calls": [{"id": "call_1", "type": "function",
+                    "function": {"name": "load_skill",
+                        "arguments": json!({"name": skill}).to_string()}}]},
+                "finish_reason": "tool_calls"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}})
+    }
+
+    /// A user the curator has something to manage for: a draft was made.
+    fn curated(home: &Path) {
+        std::fs::create_dir_all(home.join("tole").join("skill-drafts")).unwrap();
+    }
+
+    fn run(home: &Path, work: &Path, url: &str, prompt: &str) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_tole"))
+            .args(["run", prompt])
+            .current_dir(work)
+            .env("TOLE_NO_UPDATE_CHECK", "1")
+            .env("CODECORA_HOME", home)
+            .env("HOME", home)
+            .env("TOLE_STREAM", "0")
+            .env("TOLE_BASE_URL", url)
+            .env("TOLE_MODEL", "m")
+            .env("TOLE_API_KEY", "k")
+            .env("TOLE_SKILL_APPROVAL", "off")
+            .env_remove("TOLE_SKILL_INDEX")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    }
+
+    fn ledger(home: &Path) -> tole_core::skill_curator::UsageSummary {
+        UsageLedger::new(home.join("tole").join("skill-usage.jsonl")).summary()
+    }
+
+    #[test]
+    fn a_run_that_loaded_no_skill_records_a_baseline_success() {
+        let home = tmpdir();
+        curated(&home);
+        let work = home.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let url = spawn_mock(vec![final_reply("done")]);
+        let o = run(&home, &work, &url, "say done");
+        assert!(o.status.success(), "{}", out(&o));
+        let s = ledger(&home);
+        assert_eq!((s.baseline.success, s.baseline.failure), (1, 0));
+        assert!(s.skills.is_empty());
+    }
+
+    #[test]
+    fn a_run_that_loaded_a_skill_credits_it_and_a_failed_run_blames_it() {
+        let home = tmpdir();
+        curated(&home);
+        let work = home.join("work");
+        let dir = work.join("skills").join("demo");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: demo\ndescription: a demo\n---\nbody of demo\n",
+        )
+        .unwrap();
+
+        let url = spawn_mock(vec![load_reply("demo"), final_reply("done")]);
+        let o = run(&home, &work, &url, "use the demo skill");
+        assert!(o.status.success(), "{}", out(&o));
+        let s = ledger(&home);
+        let d = &s.skills["demo"];
+        assert_eq!((d.loaded, d.success, d.failure), (1, 1, 0), "{s:?}");
+        assert_eq!(
+            s.baseline.outcomes(),
+            0,
+            "a run that used a skill is not the baseline"
+        );
+
+        // The provider is gone: the run fails, and no skill was loaded.
+        let o = run(&home, &work, "http://127.0.0.1:1/v1", "again");
+        assert!(!o.status.success());
+        let s = ledger(&home);
+        assert_eq!((s.baseline.success, s.baseline.failure), (0, 1), "{s:?}");
+        assert_eq!(
+            s.skills["demo"].outcomes(),
+            1,
+            "demo is untouched by the other run"
+        );
+    }
+
+    #[test]
+    fn a_plain_run_leaves_no_ledger_behind() {
+        let home = tmpdir();
+        let work = home.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let url = spawn_mock(vec![final_reply("done")]);
+        let o = run(&home, &work, &url, "say done");
+        assert!(o.status.success(), "{}", out(&o));
+        assert!(
+            !home.join("tole").join("skill-usage.jsonl").exists(),
+            "nobody to curate for, nothing recorded"
+        );
+    }
+}

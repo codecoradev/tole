@@ -43,6 +43,7 @@ pub mod session_tools;
 pub mod sibling;
 pub mod skill_approve;
 pub mod skill_drafts_cli;
+pub mod skill_outcome;
 pub mod skill_propose;
 pub mod skill_recall;
 pub mod status;
