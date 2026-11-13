@@ -35,6 +35,10 @@ pub struct Profile {
     pub models: ModelTiers,
     /// The `default` tier's model, used for the session.
     pub model: Option<String>,
+    /// The advisor tier's model (#587): consulted, never executes.
+    pub advisor: Option<String>,
+    /// `consult_advisor` calls per run (default 3).
+    pub advisor_max_uses: u32,
 }
 
 impl Profile {
@@ -104,6 +108,10 @@ impl Profile {
                 .unwrap_or_else(|| format!("profile-{name}")),
             skills,
             grants: p.grants.clone().unwrap_or_default(),
+            advisor: models.advisor.clone().filter(|a| !a.trim().is_empty()),
+            advisor_max_uses: p
+                .advisor_max_uses
+                .unwrap_or(tole_core::advisor::DEFAULT_MAX_USES),
             models,
             model,
         })
@@ -120,6 +128,35 @@ impl Profile {
             .cloned()
             .collect()
     }
+}
+
+/// `tole doctor` lines for the advisor tier (#587): the profiles that
+/// declare one and their per-run cap. Names only, never the model.
+pub fn advisor_doctor_lines(cfg: &Config) -> Vec<String> {
+    let with: Vec<String> = cfg
+        .profiles
+        .iter()
+        .flatten()
+        .filter(|(_, p)| {
+            p.models
+                .as_ref()
+                .and_then(|m| m.advisor.as_deref())
+                .is_some_and(|a| !a.trim().is_empty())
+        })
+        .map(|(name, p)| {
+            let n = p
+                .advisor_max_uses
+                .unwrap_or(tole_core::advisor::DEFAULT_MAX_USES);
+            format!("{name} ({n} uses per run)")
+        })
+        .collect();
+    if with.is_empty() {
+        return vec!["advisor: off (no profile declares models.advisor)".into()];
+    }
+    vec![format!(
+        "advisor: {} (consult_advisor is not wired into runs yet, #587 part 2)",
+        with.join(", ")
+    )]
 }
 
 /// `~/x` against `home`, an absolute path as is, anything else against
@@ -225,6 +262,70 @@ system_prompt_file = "missing-on-purpose.md"
         assert!(p.allow.is_empty() && p.skills.is_empty() && p.grants.is_empty());
         assert_eq!(p.memory_room, "profile-min");
         assert_eq!(p.model, None);
+    }
+
+    #[test]
+    fn the_advisor_is_declared_per_profile_with_a_use_cap() {
+        let src = "[profiles.a]\nadvisor_max_uses = 5\n[profiles.a.models]\nstandard = \"m\"\n\
+                   advisor = \"wise\"\n[profiles.b.models]\nstandard = \"m\"\nadvisor = \"wise\"\n\
+                   [profiles.c.models]\nstandard = \"m\"\n";
+        let c = cfg(src);
+        let a = Profile::resolve(&c, "a", None, None).unwrap();
+        assert_eq!(
+            (a.advisor.as_deref(), a.advisor_max_uses),
+            (Some("wise"), 5)
+        );
+        let b = Profile::resolve(&c, "b", None, None).unwrap();
+        assert_eq!(
+            b.advisor_max_uses,
+            tole_core::advisor::DEFAULT_MAX_USES,
+            "default cap"
+        );
+        assert_eq!(Profile::resolve(&c, "c", None, None).unwrap().advisor, None);
+        // Load-time errors name the remedy.
+        for (bad, want) in [
+            (
+                "[profiles.a]\nadvisor_max_uses = 0\n[profiles.a.models]\nadvisor = \"w\"\n",
+                "advisor_max_uses must be 1 to 20",
+            ),
+            (
+                "[profiles.a]\nadvisor_max_uses = 21\n[profiles.a.models]\nadvisor = \"w\"\n",
+                "advisor_max_uses must be 1 to 20",
+            ),
+            (
+                "[profiles.a]\nadvisor_max_uses = 2\n",
+                "profiles.a.models.advisor is not set",
+            ),
+            (
+                "[profiles.a.models]\nadvisor = \"  \"\n",
+                "profiles.a.models.advisor is blank",
+            ),
+        ] {
+            let e = crate::config::parse(bad, Path::new("user.toml"))
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains(want), "{bad}: {e}");
+        }
+    }
+
+    #[test]
+    fn doctor_names_the_profiles_with_an_advisor_never_the_model() {
+        let c = cfg(
+            "[profiles.a]\nadvisor_max_uses = 5\n[profiles.a.models]\nstandard = \"m\"\n\
+             advisor = \"wise-model\"\n[profiles.z.models]\nstandard = \"m\"\n\
+             advisor = \"wise-model\"\n[profiles.n]\n",
+        );
+        let text = advisor_doctor_lines(&c).join("\n");
+        assert!(
+            text.contains("advisor: a (5 uses per run), z (3 uses per run)"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("wise-model") && !text.contains(" n "),
+            "{text}"
+        );
+        let off = advisor_doctor_lines(&Config::default()).join("\n");
+        assert!(off.contains("advisor: off"), "{off}");
     }
 
     #[test]

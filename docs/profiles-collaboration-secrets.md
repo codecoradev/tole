@@ -594,6 +594,38 @@ All on sanitized or owner-written text only, never raw payloads:
   separately in the usage ledger and carved from the run's budget, and each
   consultation is a ledger entry.
 
+**As implemented, part 1 of #587 (core seam, config, doctor):**
+- **`tole_core::advisor`** has no I/O and no provider call; it builds
+  with `--no-default-features`.
+  - `request` builds the advisor call from the host's own view of the run:
+    the fixed `SYSTEM_PROMPT`, then one user message with the task
+    contract, the last 12 transcript entries and the executor's question.
+    Each part is redacted with the process secrets, neutralized (fence
+    markers, control characters) and then capped (contract 4,000
+    characters, each entry 1,500, the window 12,000, the question 2,000)
+    before it is fenced as data.
+  - `parse_reply` reads one verdict word, `plan`, `correction` or `stop`,
+    and capped text (2,000 characters). Nothing else in a reply is parsed,
+    so an advisor cannot name a tool, grant or budget for the host to act
+    on. A reply without a verdict word is a `plan`, never a `stop`.
+    `Verdict::fenced` returns it to the executor as advisory data.
+  - `Uses` caps consultations per run. `Budget` is the run's token budget,
+    shared by the run's meter and the advisor (`admit` before a call,
+    `charge` after), so advisor tokens come out of the run's budget.
+  - `usage_value` tags a consultation's usage `"role": "advisor"`.
+- **Config:** `profiles.<name>.advisor_max_uses` (default 3, 1 to 20).
+  It is refused without `models.advisor`, and a blank `models.advisor` is
+  refused. Both are user config only, like every profile key.
+- **`tole doctor`** names the profiles that declare an advisor and their
+  caps, never the model.
+- **Part 2 (owner decisions 2026-11-13):**
+  - `consult_advisor` is registered only in faces whose meter can share
+    the `Budget`; elsewhere it is not registered and the docs say so.
+    There is never an uncounted advisor.
+  - The window comes from the turn loop's in-memory view of the
+    transcript, never from a path the model or a child can write.
+  - The tool stays available in plan-mode runs (ReadOnly, same cap).
+
 **Conflicts with earlier recorded context, resolved by the owner
 (2026-11-11):**
 1. The 2026-10-06 competitor research marked "multi-agent without a cap"

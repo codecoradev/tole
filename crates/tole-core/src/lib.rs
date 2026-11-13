@@ -27,6 +27,7 @@
 //! - `memory`   — harness-level uteke memory loop (recall/remember)
 //! - `transcript` — read-side view of turn and usage-row conventions
 
+pub mod advisor;
 #[cfg(feature = "shell-tools")]
 pub mod agents;
 pub mod approval;

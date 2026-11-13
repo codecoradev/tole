@@ -48,6 +48,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Missions now learn about cora's agent-as-reviewer flow (#536): `tole mission` builds its registry like `run` (including the auto-attached `mcp_cora_*` tools) but its pinned system prompt never named the review tools, so the unattended command was the one that did not know the flow existed. When both `mcp_cora_cora_review_prepare` and `mcp_cora_cora_review_finalize` are registered, a fresh mission's prompt now carries the same review section as `run` / `chat` / the TUI plus one sentence asking for a review (and its verdict in the final message) before the mission ends; without the tools nothing is added. Guidance only: a gate before `git commit` is tracked separately. `serve`, `acp` and `mcp` sessions are unchanged on purpose: they attach no external MCP servers, so they have no review tools. Resumed missions keep their pinned prompt.
 
 ### Added
+- Advisor tier, part 1 of #587: the core seam, the profile key and doctor lines. No run consults an advisor yet; `consult_advisor` comes in part 2.
+  - **`tole_core::advisor`** (no I/O, builds with `--no-default-features`):
+    - `request` builds the advisor call: a fixed system prompt, then the task contract, the last 12 transcript entries and the executor's question. Each is redacted with the process secrets, neutralized and capped before it is fenced as data.
+    - `parse_reply` reads only a verdict (`plan`, `correction` or `stop`) and capped text, so a reply cannot name a tool, grant or budget for the host to act on. A reply without a verdict word is a `plan`, never a `stop`. `Verdict::fenced` hands it back as advisory data.
+    - `Uses` caps consultations per run. `Budget` is the run's token budget shared with the advisor, so advisor tokens come out of it. `usage_value` tags usage `"role": "advisor"`.
+  - **`profiles.<name>.advisor_max_uses`** (default 3, 1 to 20) is refused without `models.advisor`, and a blank `models.advisor` is refused.
+  - **`tole doctor`** names the profiles with an advisor and their caps, never the model.
 - Model routing wired into runs, part 2 of #586. Off unless the user config says `[router] enabled = true`; with routing off nothing changes.
   - **Where:** a new `tole run`, `tole chat`, TUI session, `tole mission`, delegated child (a mission with `TOLE_AGENT_DEPTH` of 1 or more routes as `delegate`) and cron agent run is routed once, before its first provider call. Never per turn: a resumed session or a continued cron run keeps its model.
   - **An explicit model wins:** a session that already has a model (`/model`, ACP) and a cron job with a `--model` pin are not routed.
