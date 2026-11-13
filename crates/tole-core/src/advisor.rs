@@ -75,18 +75,27 @@ pub struct Verdict {
     pub text: String,
 }
 
-/// Fence markers and control characters cannot pass through a fenced field.
-fn neutralize(s: &str) -> String {
-    s.replace("<<<", "‹‹‹")
-        .replace(">>>", "›››")
-        .chars()
-        .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
+/// Control and invisible characters (newline and tab kept) are removed.
+fn strip_invisible(s: &str) -> String {
+    s.chars()
+        .filter(|c| {
+            matches!(c, '\n' | '\t') || !(c.is_control() || crate::skill_draft::is_hidden(*c))
+        })
         .collect()
 }
 
-/// `s` redacted, then neutralized, then capped at `max` characters.
+/// Fence markers cannot pass through a fenced field.
+fn neutralize_fences(s: &str) -> String {
+    s.replace("<<<", "‹‹‹").replace(">>>", "›››")
+}
+
+/// `s` with control and invisible characters stripped, then secrets
+/// redacted, then fence markers neutralized, then capped at `max`
+/// characters. The strip comes first: a secret split by a zero-width or
+/// control character would otherwise dodge the redaction and re-form once
+/// the character is removed.
 pub fn clean(s: &str, secrets: &SecretSet, max: usize) -> String {
-    let safe = neutralize(&secrets.redact(s));
+    let safe = neutralize_fences(&secrets.redact(&strip_invisible(s)));
     if safe.chars().count() <= max {
         return safe;
     }

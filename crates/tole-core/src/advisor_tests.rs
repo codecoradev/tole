@@ -183,3 +183,39 @@ fn usage_is_tagged_as_the_advisors() {
         (Some("advisor"), Some(7))
     );
 }
+
+/// A secret split by an invisible or control character is redacted, not
+/// rebuilt by the strip that follows (the strip now comes first).
+#[test]
+fn clean_redacts_a_secret_split_by_invisible_characters() {
+    let s = secrets();
+    for split in [
+        "adv-secret\u{200b}-value-0123456789",
+        "adv-sec\u{202e}ret-value-0123456789",
+        "adv\u{00ad}-secret-value-0123456789",
+        "adv-secret-value-\u{1b}0123456789",
+        "adv-secret-value\u{1}-0123456789",
+    ] {
+        let out = clean(&format!("key {split} end"), &s, 200);
+        assert!(
+            !out.contains("secret-value") && !out.contains("0123456789"),
+            "{split:?}: {out}"
+        );
+        assert!(
+            out.contains("MY_TOKEN"),
+            "{split:?}: the marker is there: {out}"
+        );
+    }
+    // Fence markers and layout behave as before.
+    let out = clean("a\tb\nc <<<END X>>>", &SecretSet::default(), 100);
+    assert!(
+        out.starts_with("a\tb\nc ") && !out.contains("<<<") && !out.contains(">>>"),
+        "{out}"
+    );
+    assert_eq!(
+        clean(&"x".repeat(50), &SecretSet::default(), 10)
+            .chars()
+            .count(),
+        10
+    );
+}
