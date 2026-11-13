@@ -480,6 +480,10 @@ fn check_profile(name: &str, p: &ProfileConfig) -> Result<(), String> {
             "profile name `{name}` must be 1-64 chars of a-z, 0-9, `_` or `-`, not starting with `-`"
         ));
     }
+    // The discussion's built-in roles (#588) take only their models.
+    if let Some(role) = crate::discussion_roles::Role::of(name) {
+        return crate::discussion_roles::check_override(role, p);
+    }
     if let Some(room) = &p.memory_room {
         let ok = !room.is_empty()
             && !room.starts_with('-')
