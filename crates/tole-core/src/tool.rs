@@ -97,6 +97,11 @@ pub struct ToolRegistry {
     /// Records the untrusted tools a session ran (#592): web and MCP output
     /// taints a skill draft. `None` = nothing is recorded.
     taint: Option<crate::skill_draft::TaintTracker>,
+    /// MCP servers whose tools this registry's admission check accepted
+    /// (#680). Only these may offer resources and prompts to this session.
+    /// Per registry, so sessions with different plugin locks in one process
+    /// (serve, the cron loop) never share a decision.
+    mcp_admitted: std::collections::BTreeSet<String>,
 }
 
 impl ToolRegistry {
@@ -115,7 +120,24 @@ impl ToolRegistry {
             #[cfg(feature = "shell-tools")]
             hooks: None,
             taint: None,
+            mcp_admitted: Default::default(),
         }
+    }
+
+    /// Records whether the MCP server `name` passed this registry's
+    /// admission check (#680).
+    pub fn set_mcp_admitted(&mut self, name: &str, admitted: bool) {
+        if admitted {
+            self.mcp_admitted.insert(name.to_string());
+        } else {
+            self.mcp_admitted.remove(name);
+        }
+    }
+
+    /// Whether the MCP server `name` passed this registry's admission check
+    /// (#680): only such a server may offer resources and prompts.
+    pub fn mcp_admitted(&self, name: &str) -> bool {
+        self.mcp_admitted.contains(name)
     }
 
     /// Record every untrusted tool this registry executes into `tracker`

@@ -12,20 +12,6 @@ fn mock(name: &str, mode: &str) -> McpServerConfig {
     McpServerConfig::parse(&format!("{name}=python3 {script} {mode}")).unwrap()
 }
 
-/// The host's admission check accepts `cfg` (#680: only an admitted server
-/// offers resources and prompts).
-fn admitted(cfg: &McpServerConfig) -> &McpServerConfig {
-    let accept = |_: &str, _: &str, _: &[tole_core::plugin_lock::ManifestTool]| Ok(());
-    let mut reg = tole_core::tool::ToolRegistry::new();
-    tole_core::mcp::register_server_tools(
-        &mut reg,
-        cfg,
-        &tole_core::secrets::SecretSet::default(),
-        &accept,
-    );
-    cfg
-}
-
 #[test]
 fn prompt_command_parses_server_prompt_and_args() {
     let (s, p, a) = parse_prompt_command("/mcp:cora:review topic=auth depth=2")
@@ -58,7 +44,7 @@ fn mcp_read_is_read_only_and_rejects_unlisted_servers() {
 #[test]
 fn live_server_prompts_and_resources_are_probed_rendered_and_read() {
     let cfg = mock("mockfull", "full");
-    let extras = probe_server_extras(admitted(&cfg));
+    let extras = probe_server_extras(&cfg);
     assert!(extras.resources);
     assert_eq!(extras.prompts.len(), 1);
     assert_eq!(extras.prompts[0].name, "review");
@@ -78,7 +64,7 @@ fn live_server_prompts_and_resources_are_probed_rendered_and_read() {
 
 #[test]
 fn server_without_capabilities_contributes_nothing() {
-    let extras = probe_server_extras(admitted(&mock("mockbare", "bare")));
+    let extras = probe_server_extras(&mock("mockbare", "bare"));
     assert!(extras.prompts.is_empty());
     assert!(!extras.resources);
 }

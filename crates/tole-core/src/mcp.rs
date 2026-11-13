@@ -76,39 +76,6 @@ enum McpRequest {
 /// MCP tool registration.
 static RUNTIME: OnceLock<mpsc::Sender<McpRequest>> = OnceLock::new();
 
-/// Servers whose tools the host's admission check accepted in
-/// [`register_server_tools`] (#680). Only these may contribute any other
-/// model-visible text: resources ([`McpReadTool`]), prompts
-/// ([`get_server_prompt`]) and the extras probe ([`probe_server_extras`]).
-/// A server the plugin lock refuses (unapproved, changed, revoked) is never
-/// asked for them.
-static ADMITTED: std::sync::Mutex<std::collections::BTreeSet<String>> =
-    std::sync::Mutex::new(std::collections::BTreeSet::new());
-
-fn set_admitted(server: &str, admitted: bool) {
-    let mut g = ADMITTED.lock().unwrap_or_else(|p| p.into_inner());
-    if admitted {
-        g.insert(server.to_string());
-    } else {
-        g.remove(server);
-    }
-}
-
-/// Whether `server`'s tools passed the host's admission check in this
-/// process (#680).
-pub fn is_admitted(server: &str) -> bool {
-    ADMITTED
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .contains(server)
-}
-
-fn not_admitted(server: &str) -> String {
-    format!(
-        "mcp server {server:?} is not admitted by the plugin lock: it offers no resources or prompts"
-    )
-}
-
 const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Cap on untrusted server text reaching the transcript (threat model
@@ -999,10 +966,6 @@ fn ask<R>(
 /// Probe `cfg` for prompts/resources. Failures are silent-empty: a server
 /// that cannot answer was already warned about at tool registration.
 pub fn probe_server_extras(cfg: &McpServerConfig) -> McpExtras {
-    // #680: a server the lock refused is not even asked.
-    if !is_admitted(&cfg.name) {
-        return McpExtras::default();
-    }
     ask(
         |resp| McpRequest::Probe {
             config: cfg.clone(),
@@ -1020,9 +983,6 @@ pub fn get_server_prompt(
     name: &str,
     args: std::collections::BTreeMap<String, String>,
 ) -> Result<String, String> {
-    if !is_admitted(server) {
-        return Err(not_admitted(server));
-    }
     ask(
         |resp| McpRequest::GetPrompt {
             server: server.to_string(),
@@ -1121,9 +1081,6 @@ impl Tool for McpReadTool {
         if !self.servers.contains(&server) {
             return Err(format!("mcp server {server:?} does not offer resources"));
         }
-        if !is_admitted(&server) {
-            return Err(not_admitted(&server));
-        }
         let result = ask(
             |resp| McpRequest::ReadResource {
                 server: server.clone(),
@@ -1185,11 +1142,12 @@ pub fn register_server_tools(
     match list_manifest(cfg) {
         Ok((version, manifest)) => {
             if let Err(note) = admit(&cfg.name, &version, &manifest) {
-                set_admitted(&cfg.name, false);
+                reg.set_mcp_admitted(&cfg.name, false);
                 eprintln!("tole: mcp[{}]: {note}", cfg.name);
                 return registered;
             }
-            set_admitted(&cfg.name, true);
+            // #680: recorded on this registry, the session's own decision.
+            reg.set_mcp_admitted(&cfg.name, true);
             let tools = manifest.into_iter().map(|t| (t.name, t.description));
             // Cap registered tools per server: a hostile/buggy server
             // must not flood the registry (and provider tool specs).
@@ -1238,7 +1196,7 @@ pub fn register_server_tools(
             );
         }
         Err(e) => {
-            set_admitted(&cfg.name, false);
+            reg.set_mcp_admitted(&cfg.name, false);
             eprintln!(
                 "tole: mcp[{}]: listing failed: {e} — server skipped",
                 cfg.name
