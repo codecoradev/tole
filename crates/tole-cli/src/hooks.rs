@@ -171,6 +171,18 @@ pub fn load(
     Ok(out)
 }
 
+/// Records every route's key as a secret tole holds by role (#682): from
+/// then on it is redacted wherever text leaves the process, and the child
+/// scrub removes any variable holding it (`hmac_key_env` may name any
+/// variable). A key that is not UTF-8 cannot appear in text and is skipped.
+pub fn hold_keys(routes: &BTreeMap<String, Route>) {
+    for (name, route) in routes {
+        if let Some(key) = route.key().and_then(|k| std::str::from_utf8(k).ok()) {
+            tole_core::secrets::add_role_secret(&format!("hooks.{name}"), key);
+        }
+    }
+}
+
 /// The key file: a regular file (no link, no FIFO), at most
 /// [`MAX_KEY_FILE`] bytes, one trailing newline dropped.
 fn read_key_file(path: &str) -> Result<Vec<u8>, String> {
@@ -221,6 +233,27 @@ mod tests {
         assert_eq!(route.key(), Some(KEY.as_bytes()));
         assert_eq!((route.rate_per_minute, route.max_body), (30, 256 * 1024));
         assert!(!format!("{route:?}").contains(KEY));
+    }
+
+    /// #682: a loaded key is a secret held by role, whatever variable or
+    /// file it came from: redacted, and known to the child scrub.
+    #[test]
+    fn hold_keys_makes_every_route_key_a_process_secret() {
+        const ODD: &str = "odd-variable-route-key-0682";
+        let odd_env = |k: &str| (k == "SOME_SETTING").then(|| ODD.to_string());
+        let r = load(
+            &one(HookConfig {
+                hmac_key_env: Some("SOME_SETTING".into()),
+                ..HookConfig::default()
+            }),
+            false,
+            &odd_env,
+        )
+        .unwrap();
+        hold_keys(&r);
+        let set = tole_core::secrets::process_secrets();
+        assert_eq!(set.redact(&format!("key={ODD}")), "key=«hooks.gh»");
+        assert!(tole_core::secrets::is_secret_var("SOME_SETTING", ODD, &set));
     }
 
     #[test]

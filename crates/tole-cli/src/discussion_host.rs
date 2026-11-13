@@ -106,7 +106,99 @@ pub struct Outcome {
     pub text: String,
     pub tokens_used: u64,
     pub rounds: u32,
+    /// What did not stop the discussion but the owner should know (a uteke
+    /// document that could not be written).
+    pub notes: Vec<String>,
 }
+
+/// A participant that runs as its own read-only process, offered only for
+/// review and critique (independent thinking), never for work.
+pub trait Independent: Send + Sync {
+    /// Starts `who` on `task`, read-only, within `tokens`, tagged with
+    /// `key` (the reserved call); its handle.
+    fn start(&self, who: &str, task: &str, tokens: u64, key: &str) -> Result<String, String>;
+    /// The handle of a child started with `key`, if one was: what a resumed
+    /// driver finds of a start a crash interrupted before its handle was
+    /// recorded.
+    fn find(&self, key: &str) -> Result<Option<String>, String>;
+    /// `None` while it runs; once ended, its contribution and what it spent.
+    fn poll(&self, handle: &str) -> Result<Option<(String, u64)>, String>;
+}
+
+/// Independent participants as delegated `consult` children (#585): the
+/// carve, the depth and live-process caps, the leases and the machine
+/// guard all apply; the contribution is the child's completion report,
+/// read by the parent with its caps.
+pub struct DelegateIndependent(pub Arc<crate::delegate::Delegator>);
+
+impl Independent for DelegateIndependent {
+    fn start(&self, who: &str, task: &str, tokens: u64, key: &str) -> Result<String, String> {
+        self.0
+            .consult(who, &format!("{}\n\n{task}", call_marker(key)), tokens)
+    }
+    fn find(&self, key: &str) -> Result<Option<String>, String> {
+        self.0.find_child(&call_marker(key))
+    }
+    fn poll(&self, handle: &str) -> Result<Option<(String, u64)>, String> {
+        let Some(n) = self.0.poll_node(handle)? else {
+            return Ok(None);
+        };
+        let spent = n.used.map_or(n.budget.tokens, |u| u.tokens);
+        let text = match &n.report {
+            Some(r) => {
+                let mut t = r.summary.clone();
+                if !r.risks.is_empty() {
+                    t.push_str(&format!("\nRisks: {}", r.risks.join("; ")));
+                }
+                t
+            }
+            None => format!(
+                "(no report: {})",
+                n.reason.as_deref().unwrap_or("the child handed in none")
+            ),
+        };
+        Ok(Some((text, spent)))
+    }
+}
+
+/// The first line of an independent child's task: which reserved call
+/// started it, so a resumed driver can find it.
+fn call_marker(key: &str) -> String {
+    format!("[tole discussion call {key}]")
+}
+
+/// Least tokens carved for an independent participant (a child mission
+/// takes several provider steps).
+pub const INDEPENDENT_MIN_TOKENS: u64 = 20_000;
+
+const INDEPENDENT_NOTE: &str = "You take part in this discussion as an independent, read-only \
+reviewer. Do not change anything. Hand in your contribution with delegate_report: its summary is \
+your contribution, its risks your objections.";
+
+/// Where round documents go (uteke in production).
+pub trait RoundDocs: Send + Sync {
+    fn put(&self, slug: &str, parent: Option<&str>, markdown: &str) -> Result<(), String>;
+}
+
+/// The uteke seam: `uteke_document`, which redacts again before the
+/// document leaves the process.
+#[cfg(feature = "shell-tools")]
+pub struct UtekeDocs(pub tole_core::uteke::UtekeDocumentTool);
+
+#[cfg(feature = "shell-tools")]
+impl RoundDocs for UtekeDocs {
+    fn put(&self, slug: &str, parent: Option<&str>, markdown: &str) -> Result<(), String> {
+        use tole_core::tool::Tool as _;
+        let mut input = json!({"slug": slug, "markdown": markdown});
+        if let Some(p) = parent {
+            input["parent"] = json!(p);
+        }
+        self.0.execute(input).map(|_| ())
+    }
+}
+
+/// Longest round or goal document, in characters (after redaction).
+pub const MAX_DOC_CHARS: usize = 16_000;
 
 /// One discussion's driver.
 pub struct Driver {
@@ -118,6 +210,10 @@ pub struct Driver {
     make: Factory,
     pot: Arc<Budget>,
     now: fn() -> u64,
+    independent: BTreeMap<String, Arc<dyn Independent>>,
+    poll_every: std::time::Duration,
+    docs: Option<Box<dyn RoundDocs>>,
+    notes: std::sync::Mutex<Vec<String>>,
 }
 
 fn now_secs() -> u64 {
@@ -164,7 +260,40 @@ impl Driver {
             make,
             pot,
             now: now_secs,
+            independent: BTreeMap::new(),
+            poll_every: std::time::Duration::from_secs(5),
+            docs: None,
+            notes: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    /// Runs `names` (some of this driver's voices) as independent read-only
+    /// participants through `runner`. Only for review and critique: every
+    /// other participant stays inline.
+    pub fn with_independent(
+        mut self,
+        names: &[String],
+        runner: Arc<dyn Independent>,
+    ) -> Result<Driver, String> {
+        for n in names {
+            if !self.voices.contains_key(n) {
+                return Err(format!("`{n}` is not a participant of this discussion"));
+            }
+            self.independent.insert(n.clone(), Arc::clone(&runner));
+        }
+        Ok(self)
+    }
+
+    /// Writes round digests and the goal document through `docs`.
+    pub fn with_docs(mut self, docs: Box<dyn RoundDocs>) -> Driver {
+        self.docs = Some(docs);
+        self
+    }
+
+    /// How long to wait between polls of an independent participant.
+    pub fn with_poll_every(mut self, every: std::time::Duration) -> Driver {
+        self.poll_every = every;
+        self
     }
 
     /// The driver for `participants` from the layered config: each a
@@ -232,7 +361,9 @@ impl Driver {
                 self.pot.left()
             ));
         }
-        self.log.start(contract, (self.now)())
+        self.log.start(contract, (self.now)())?;
+        self.write_goal_doc();
+        Ok(())
     }
 
     /// Runs the discussion to its end, from wherever the ledger is. An
@@ -247,13 +378,22 @@ impl Driver {
                     let who = missing.first().ok_or("no participant is missing")?;
                     self.contribute(&st, round, who)?;
                 }
-                Next::Summarize { round, verbatim } => self.summarize(&st, round, verbatim)?,
+                Next::Summarize { round, verbatim } => {
+                    self.summarize(&st, round, verbatim)?;
+                    self.write_round_doc(round);
+                }
                 Next::Check { round } => self.check(&st, round)?,
                 Next::Decide { round } => {
                     self.log.decide(round, (self.now)())?;
                 }
                 Next::Finish { outcome } => {
                     self.log.close(&self.report(&st, outcome), (self.now)())?;
+                    // The final goal document, and every round again (a
+                    // crash may have skipped one; uteke documents upsert).
+                    self.write_goal_doc();
+                    for r in st.summaries.keys() {
+                        self.write_round_doc(*r);
+                    }
                 }
                 Next::Done => {
                     let (gate, text) = st.closed.clone().ok_or("closed without an outcome")?;
@@ -262,9 +402,85 @@ impl Driver {
                         text,
                         tokens_used: st.tokens_used,
                         rounds: st.summaries.keys().max().copied().unwrap_or(0),
+                        notes: self.notes.lock().map(|n| n.clone()).unwrap_or_default(),
                     });
                 }
             }
+        }
+    }
+
+    /// Reserves `need` tokens for a call in the ledger: its call id, or
+    /// `None` when it does not fit (the escalation is then recorded).
+    fn admit(&self, round: u32, what: &str, need: u64) -> Result<Option<String>, String> {
+        // The pot cannot fit it: ask for more than any budget, so the ledger
+        // records the escalation.
+        let ask = if need > self.pot.left() {
+            u64::MAX
+        } else {
+            need
+        };
+        Ok(match self.log.reserve(round, what, ask, (self.now)())? {
+            Reserve::Go(call) => Some(call),
+            Reserve::Stop(_) => None,
+        })
+    }
+
+    /// An independent participant's turn, started at most once: the
+    /// reservation is written to the ledger BEFORE the child starts (the
+    /// intent), the child is tagged with that call, and its handle is bound
+    /// after. A resumed driver polls a bound child; for an unbound intent it
+    /// first looks for a child tagged with the call and starts one only when
+    /// there is none, under the same reservation.
+    fn independent_turn(
+        &self,
+        st: &State,
+        round: u32,
+        who: &str,
+        req: &[(&'static str, String)],
+        runner: &dyn Independent,
+    ) -> Result<Option<String>, String> {
+        let what = format!("participant-{who}");
+        let id = st.contract.as_ref().map_or("", |c| c.id.as_str());
+        let (call, handle) = match st.open_call(round, &what) {
+            Some((call, Some(handle))) => (call, handle),
+            open => {
+                let task = format!("{}\n\n{}\n\n{INDEPENDENT_NOTE}", req[0].1, req[1].1);
+                let (call, need) = match open {
+                    Some((call, None)) => {
+                        let need = st.reservations.get(&call).map_or(0, |r| r.tokens);
+                        (call, need)
+                    }
+                    _ => {
+                        let need = (task.len() as u64 / 4).max(INDEPENDENT_MIN_TOKENS);
+                        let Some(call) = self.admit(round, &what, need)? else {
+                            return Ok(None);
+                        };
+                        (call, need)
+                    }
+                };
+                let key = format!("{id}-{call}");
+                let found = runner.find(&key)?;
+                let handle = match found {
+                    Some(h) => Ok(h),
+                    None => runner.start(who, &task, need, &key),
+                }
+                .map_err(|e| {
+                    format!(
+                        "{who}'s turn in round {round}: {}",
+                        discussion::sanitize(&e, &self.secrets, 300).text
+                    )
+                })?;
+                self.log.bind(&call, &handle, (self.now)())?;
+                (call, handle)
+            }
+        };
+        loop {
+            if let Some((text, spent)) = runner.poll(&handle)? {
+                self.log.settle(&call, spent, (self.now)())?;
+                self.pot.charge(spent);
+                return Ok(Some(text));
+            }
+            std::thread::sleep(self.poll_every);
         }
     }
 
@@ -286,16 +502,8 @@ impl Driver {
             .find(|(r, _)| *r == "user")
             .map_or("", |(_, s)| s);
         let need = ((system.len() + user.len()) / 4) as u64 + reply;
-        // The pot cannot fit it: ask for more than any budget, so the ledger
-        // records the escalation.
-        let ask = if need > self.pot.left() {
-            u64::MAX
-        } else {
-            need
-        };
-        let call = match self.log.reserve(round, what, ask, (self.now)())? {
-            Reserve::Go(call) => call,
-            Reserve::Stop(_) => return Ok(Ok(Called::Stopped)),
+        let Some(call) = self.admit(round, what, need)? else {
+            return Ok(Ok(Called::Stopped));
         };
         let sent = Entry {
             seq: 1,
@@ -345,6 +553,12 @@ impl Driver {
                 self.secrets.redact(persona)
             );
         }
+        if let Some(runner) = self.independent.get(who) {
+            let Some(text) = self.independent_turn(st, round, who, &req, runner.as_ref())? else {
+                return Ok(());
+            };
+            return self.record(round, who, &text);
+        }
         let text = match self.call(
             round,
             &format!("participant-{who}"),
@@ -359,7 +573,12 @@ impl Driver {
             Err(Failed::Provider(e)) => return Err(format!("{who}'s turn in round {round}: {e}")),
             Err(Failed::ToolCall) => format!("(no contribution: {})", Failed::TOOL_CALL),
         };
-        let clean = discussion::sanitize(&text, &self.secrets, MAX_CONTRIBUTION_CHARS).text;
+        self.record(round, who, &text)
+    }
+
+    /// Pass 1 on a turn's text, then the ledger.
+    fn record(&self, round: u32, who: &str, text: &str) -> Result<(), String> {
+        let clean = discussion::sanitize(text, &self.secrets, MAX_CONTRIBUTION_CHARS).text;
         let clean = if clean.trim().is_empty() {
             "(an empty reply)".to_string()
         } else {
@@ -491,6 +710,177 @@ impl Driver {
         }
         out.join("\n")
     }
+}
+
+impl Driver {
+    fn note(&self, n: String) {
+        if let Ok(mut v) = self.notes.lock() {
+            v.push(n);
+        }
+    }
+
+    fn put_doc(&self, slug: &str, parent: Option<&str>, markdown: String) {
+        let Some(docs) = &self.docs else { return };
+        // Redacted, then capped.
+        let md = discussion::sanitize(&markdown, &self.secrets, MAX_DOC_CHARS).text;
+        if let Err(e) = docs.put(slug, parent, &md) {
+            self.note(format!(
+                "uteke document {slug} was not written: {}",
+                discussion::sanitize(&e, &self.secrets, 300).text
+            ));
+        }
+    }
+
+    fn write_goal_doc(&self) {
+        if self.docs.is_none() {
+            return;
+        }
+        match self.log.state() {
+            Ok(st) => {
+                if let Some((slug, md)) = goal_doc(&st) {
+                    self.put_doc(&slug, None, md);
+                }
+            }
+            Err(e) => self.note(format!("the goal document was not written: {e}")),
+        }
+    }
+
+    fn write_round_doc(&self, round: u32) {
+        if self.docs.is_none() {
+            return;
+        }
+        if let Ok(st) = self.log.state() {
+            if let Some((slug, parent, md)) = round_doc(&st, round) {
+                self.put_doc(&slug, Some(&parent), md);
+            }
+        }
+    }
+}
+
+/// The goal document `goal-<id>`: the contract, the status and, once
+/// closed, the outcome and the checklist. Never a raw contribution.
+pub fn goal_doc(st: &State) -> Option<(String, String)> {
+    let c = st.contract.as_ref()?;
+    let slug = format!("goal-{}", c.id);
+    let mut md = vec![
+        format!("# Discussion {}", c.id),
+        String::new(),
+        format!("Question: {}", c.question),
+        String::new(),
+        "Acceptance criteria:".to_string(),
+    ];
+    md.extend(
+        c.criteria
+            .iter()
+            .enumerate()
+            .map(|(i, t)| format!("{}. {t}", i + 1)),
+    );
+    md.push(String::new());
+    md.push(format!(
+        "Participants: {}. Budget: {} tokens, {} used. Max rounds: {}.",
+        c.participants.join(", "),
+        c.budget_tokens,
+        st.tokens_used,
+        c.max_rounds
+    ));
+    let rounds: Vec<String> = st
+        .summaries
+        .keys()
+        .map(|r| format!("{slug}-r{r}"))
+        .collect();
+    if !rounds.is_empty() {
+        md.push(format!("Rounds: {}", rounds.join(", ")));
+    }
+    match &st.closed {
+        None => md.push("Status: open.".into()),
+        Some((g, _)) => {
+            md.push(format!("Outcome: {}.", describe(*g)));
+            if let Some((round, v)) = st.verdicts.iter().next_back() {
+                md.push(format!("Checklist (claim-checker, round {round}):"));
+                for (i, (crit, v)) in c.criteria.iter().zip(v).enumerate() {
+                    let met = if v.met { "met" } else { "not met" };
+                    md.push(format!("- {}. [{met}] {crit}", i + 1));
+                }
+            }
+        }
+    }
+    md.push(String::new());
+    md.push("Raw contributions stay in the tole discussion ledger.".into());
+    Some((slug, md.join("\n")))
+}
+
+/// The round document `goal-<id>-r<n>` under `goal-<id>`: the digest, or
+/// that the round was passed on as written. Never a raw contribution.
+pub fn round_doc(st: &State, round: u32) -> Option<(String, String, String)> {
+    let c = st.contract.as_ref()?;
+    let s = st.summaries.get(&round)?;
+    let parent = format!("goal-{}", c.id);
+    let slug = format!("{parent}-r{round}");
+    let mut md = vec![
+        format!("# Discussion {} round {round}", c.id),
+        String::new(),
+        format!("Parent: {parent}"),
+        String::new(),
+    ];
+    let items = |md: &mut Vec<String>, title: &str, list: &[discussion::Item]| {
+        if !list.is_empty() {
+            md.push(format!("## {title}"));
+            md.extend(
+                list.iter()
+                    .map(|i| format!("- {} ({}, {})", i.text, i.by, i.entry)),
+            );
+        }
+    };
+    match s {
+        RoundSummary::Digest(d) => {
+            items(&mut md, "Decisions", &d.decisions);
+            items(&mut md, "Claims", &d.claims);
+            if !d.disagreements.is_empty() {
+                md.push("## Disagreements".into());
+                for x in &d.disagreements {
+                    md.push(format!("- {}", x.topic));
+                    md.extend(
+                        x.positions
+                            .iter()
+                            .map(|p| format!("  - {} ({}, {})", p.text, p.by, p.entry)),
+                    );
+                }
+            }
+            for (title, list) in [("Open questions", &d.open_questions), ("New", &d.delta)] {
+                if !list.is_empty() {
+                    md.push(format!("## {title}"));
+                    md.extend(list.iter().map(|t| format!("- {t}")));
+                }
+            }
+            items(&mut md, "Actions", &d.actions);
+        }
+        RoundSummary::Verbatim { contributions, .. } => md.push(format!(
+            "Passed on as written ({} contributions, from {}); no digest.",
+            contributions.len(),
+            speakers(contributions)
+        )),
+        RoundSummary::Fallback {
+            contributions,
+            reason,
+            ..
+        } => md.push(format!(
+            "Passed on as written ({} contributions, from {}): {reason}",
+            contributions.len(),
+            speakers(contributions)
+        )),
+    }
+    if let Some(g) = st.gates.get(&round) {
+        md.push(String::new());
+        md.push(format!("Gate: {}.", describe(*g)));
+    }
+    Some((slug, parent, md.join("\n")))
+}
+
+fn speakers(cs: &[discussion::Contribution]) -> String {
+    cs.iter()
+        .map(|c| c.participant.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[cfg(test)]
