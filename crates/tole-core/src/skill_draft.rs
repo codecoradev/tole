@@ -321,8 +321,33 @@ fn secret_shape(text: &str) -> Option<&'static str> {
     None
 }
 
+/// Characters a reviewer cannot see: everything the approval sanitizer
+/// treats as unsafe, plus the ranges it leaves alone because they are legal
+/// in a prompt but can smuggle text into a skill (Unicode tag characters,
+/// variation selectors, the soft hyphen, Hangul and Braille fillers).
+fn is_hidden(c: char) -> bool {
+    crate::sanitize::is_unsafe(c)
+        || matches!(
+            c,
+            '\u{00AD}'
+                | '\u{115F}'
+                | '\u{1160}'
+                | '\u{2800}'
+                | '\u{3164}'
+                | '\u{FE00}'..='\u{FE0F}'
+                | '\u{FFA0}'
+                | '\u{E0000}'..='\u{E007F}'
+                | '\u{E0100}'..='\u{E01EF}'
+        )
+}
+
+/// Lowercased, hidden characters removed and whitespace collapsed, so
+/// `ig\u{00AD}nore previous instructions` still matches a phrase.
 fn collapse(text: &str) -> String {
-    text.to_lowercase()
+    text.chars()
+        .filter(|c| !is_hidden(*c) || c.is_whitespace())
+        .collect::<String>()
+        .to_lowercase()
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
@@ -478,7 +503,7 @@ pub fn scan_injection(content: &str) -> Vec<Finding> {
     }
     let hidden = content
         .chars()
-        .filter(|c| crate::sanitize::is_unsafe(*c) && !matches!(c, '\n' | '\r' | '\t'))
+        .filter(|c| is_hidden(*c) && !matches!(c, '\n' | '\r' | '\t'))
         .count();
     if hidden > 0 {
         out.push(block(
