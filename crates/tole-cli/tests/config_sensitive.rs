@@ -569,24 +569,31 @@ fn mcp_server_from_config_is_attempted_and_the_flag_replaces_the_list() {
         stub.display(),
         m_cfg.display()
     ));
+    // The config's server is attempted: the plugin gate names it. Since
+    // #680 an unapproved server is refused before it is started, so the
+    // gate's note is the signal, and the stub must not have run.
     let o = finish(with_provider(base_cmd(&d, &home, &["run", "hi"]), &url));
     assert!(o.status.success(), "{}", text(&o.stderr));
-    assert!(m_cfg.exists(), "config mcp server never spawned");
     assert!(
-        text(&o.stderr).contains("mcp[cfgsrv]"),
+        text(&o.stderr).contains("mcp[cfgsrv]: not approved"),
         "{}",
         text(&o.stderr)
     );
+    assert!(!m_cfg.exists(), "an unapproved server is never started");
     // A non-empty flag list replaces the config list wholesale.
-    std::fs::remove_file(&m_cfg).unwrap();
     let flag_spec = format!("flagsrv={} {}", stub.display(), m_flag.display());
     let o = finish(with_provider(
         base_cmd(&d, &home, &["--mcp-server", &flag_spec, "run", "hi"]),
         &url,
     ));
     assert!(o.status.success(), "{}", text(&o.stderr));
-    assert!(m_flag.exists(), "flag mcp server never spawned");
-    assert!(!m_cfg.exists(), "config list must be replaced, not merged");
+    let err = text(&o.stderr);
+    assert!(err.contains("mcp[flagsrv]: not approved"), "{err}");
+    assert!(
+        !err.contains("mcp[cfgsrv]"),
+        "config list must be replaced, not merged: {err}"
+    );
+    assert!(!m_flag.exists(), "an unapproved server is never started");
 }
 
 #[cfg(all(unix, feature = "mcp"))]
@@ -609,16 +616,21 @@ fn no_auto_mcp_from_config_suppresses_the_cora_preset() {
     let o = finish(with_fake_cora(&["run", "hi"]));
     assert!(o.status.success(), "{}", text(&o.stderr));
     assert!(
-        !marker.exists(),
-        "no_auto_mcp = true must stop the cora preset"
+        !marker.exists() && !text(&o.stderr).contains("mcp[cora]"),
+        "no_auto_mcp = true must stop the cora preset: {}",
+        text(&o.stderr)
     );
-    // Control: without the key (--no-config) the preset spawns the fake cora.
+    // Control: without the key (--no-config) the preset is attempted. Since
+    // #680 an unapproved cora is refused before it is started, so the
+    // plugin gate's note is the signal.
     let o = finish(with_fake_cora(&["--no-config", "run", "hi"]));
     assert!(o.status.success(), "{}", text(&o.stderr));
     assert!(
-        marker.exists(),
-        "control: the preset should have been attempted"
+        text(&o.stderr).contains("mcp[cora]: not approved"),
+        "control: the preset should have been attempted: {}",
+        text(&o.stderr)
     );
+    assert!(!marker.exists(), "an unapproved server is never started");
 }
 
 // ------------------------------------------------------- skill / no_skills
