@@ -148,10 +148,12 @@ pub enum TurnOutcome {
 #[allow(unused_variables)]
 pub trait TurnObserver: Send + Sync {
     /// A tool call passed every gate (approval, hooks, loop guard) and
-    /// is about to execute. `input` is the exact call input.
+    /// is about to execute. `input` is the call input, redacted with the
+    /// session's secrets (#677) like everything an observer receives.
     fn tool_started(&self, tool: &str, input: &Value) {}
     /// The tool settled. `preview` is a short output/error excerpt for
-    /// display — never a replacement for the durable settlement.
+    /// display, redacted before it is cut (#677) — never a replacement for
+    /// the durable settlement.
     fn tool_finished(&self, tool: &str, ok: bool, preview: &str) {}
     /// The model's reasoning for the provider step that just completed,
     /// when the provider supplies one (`Provider::last_reasoning`).
@@ -498,9 +500,10 @@ pub fn call_fingerprint(tool: &str, input: &Value) -> u64 {
 
 /// Bounded display excerpt for observer events (issue #196): the first
 /// ~200 chars of a tool output/error. Display only — the durable
-/// settlement always carries the full value.
-fn short_preview(v: &impl std::fmt::Display) -> String {
-    let raw = v.to_string();
+/// settlement always carries the full value. `raw` is already redacted
+/// (#677): redact first, then cut, so the cut never leaves part of a
+/// secret.
+fn short_preview(raw: &str) -> String {
     let mut out: String = raw.chars().take(200).collect();
     if raw.chars().count() > 200 {
         out.push('…');
@@ -760,7 +763,8 @@ fn drive(
         // effect lands — thought first, action after.
         if let Some(o) = observer {
             if let Some(r) = p.last_reasoning() {
-                o.reasoning(&r);
+                // #677: redacted like the log, as every observer event is.
+                o.reasoning(&s.egress_secrets().redact(&r));
             }
         }
         match next {
@@ -988,8 +992,11 @@ fn drive(
                     // Issue #196 phase 1: every gate has passed (approval,
                     // hooks, loop guard, cancel) — the host sees the card
                     // exactly when real work begins.
-                    if let Some(o) = observer {
-                        o.tool_started(&tool, &input);
+                    // #677: observers (serve SSE, ACP, TUI) get what the log
+                    // gets: the redacted form, redacted before any cut.
+                    let live_secrets = observer.map(|_| s.egress_secrets());
+                    if let (Some(o), Some(set)) = (observer, &live_secrets) {
+                        o.tool_started(&tool, &set.redact_value(&input));
                     }
                     let out = match auth.execute(input) {
                         Ok(o) => o,
@@ -1000,8 +1007,8 @@ fn drive(
                             if let Some(i) = &hook_input {
                                 registry.post_hook_notify(&tool, i, false);
                             }
-                            if let Some(o) = observer {
-                                o.tool_finished(&tool, false, &short_preview(&e));
+                            if let (Some(o), Some(set)) = (observer, &live_secrets) {
+                                o.tool_finished(&tool, false, &short_preview(&set.redact(&e)));
                             }
                             settle_err(s, &handle, &e)?;
                             // First failure stops the batch; every remaining
@@ -1025,8 +1032,9 @@ fn drive(
                         wrote = true;
                         record_wrote(s)?;
                     }
-                    if let Some(o) = observer {
-                        o.tool_finished(&tool, true, &short_preview(&out));
+                    if let (Some(o), Some(set)) = (observer, &live_secrets) {
+                        let shown = set.redact_value(&out).to_string();
+                        o.tool_finished(&tool, true, &short_preview(&shown));
                     }
                     // #483: settlement fsync deferred to `finish`'s durable
                     // commit; nothing but the observer callback runs between.
