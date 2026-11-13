@@ -80,7 +80,11 @@ fn route_names_the_tier_and_model_without_a_provider() {
     assert!(t.contains("no provider was called"), "{t}");
     // No rule matches: the configured model stays.
     let t = text(&tole(&base, &["route", "digest the inbox"]));
-    assert!(t.contains("configured-model (configured)"), "{t}");
+    assert!(
+        t.contains("model: configured-model (configured; no rule matched)")
+            && t.contains("configured model: configured-model (from env TOLE_MODEL)"),
+        "{t}"
+    );
     // --profile uses that profile's tiers.
     let t = text(&tole(&base, &["--profile", "coder", "route", "anything"]));
     assert!(t.contains("model: coder-big"), "{t}");

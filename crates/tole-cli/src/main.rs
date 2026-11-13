@@ -1576,13 +1576,21 @@ fn dispatch(cli: Cli) -> Result<()> {
                 job: job.as_deref(),
                 budget_left,
             };
-            let configured = config_apply::provider_config().map(|c| c.model);
+            // The model a run would use without routing, and its source: a
+            // matching rule replaces it (#586).
+            let configured = settings.provider.model.as_ref().map(|m| {
+                let from = match (m.source, m.env) {
+                    (config_apply::Source::Env, Some(name)) => format!("env {name}"),
+                    (source, _) => source.to_string(),
+                };
+                (m.value.clone(), from)
+            });
             let secrets =
                 tole_cli::provider_chain::process_secrets(&tole_cli::config_apply::real_env);
             let out = tole_cli::routing::explain(
                 cfg.as_ref().unwrap_or(&Default::default()),
                 &brief,
-                configured.as_deref(),
+                configured.as_ref().map(|(m, f)| (m.as_str(), f.as_str())),
                 &secrets,
             )
             .map_err(|e| anyhow!(secrets.redact(&e).into_owned()))?;

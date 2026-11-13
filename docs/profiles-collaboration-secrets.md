@@ -510,8 +510,16 @@ it beats the rule baseline (LLMRouterBench shows many routers do not).
   - A tier a rule cannot resolve, or an unknown profile, is an error with a
     remedy when the router loads (`tole doctor`, `tole route`, and run
     start in part 2).
+- **What a rule replaces (owner decision 2026-11-13):** the configured
+  model, whether it comes from `TOLE_MODEL` (or another provider
+  variable), the config's `model` or the profile's default tier. Only an
+  explicit choice is never routed: a session's own model (`/model`, ACP)
+  and a cron job's `--model` pin. There is no `--model` flag.
 - **`tole route`** is the dry run: the tier, model and reason for a prompt,
-  with no provider call. `tole doctor` shows names only.
+  plus the configured model and where it came from (for example
+  `from env TOLE_MODEL`), with no provider call. `tole doctor` shows names
+  only.
+
 **As implemented, part 2 of #586 (the wiring):**
 - **Once per run, at its start:** `run`, `chat`, the TUI, `mission`, a
   delegated child (a mission at `TOLE_AGENT_DEPTH` ≥ 1, routed as
