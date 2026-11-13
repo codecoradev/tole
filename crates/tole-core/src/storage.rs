@@ -194,6 +194,14 @@ pub trait Storage {
         None
     }
 
+    /// The secrets this session's entries are redacted with (#596). The
+    /// turn loop redacts the live observer events with the same set (#677),
+    /// so a live preview never shows what the log hides. Default: the
+    /// process set.
+    fn egress_secrets(&self) -> SecretSet {
+        crate::secrets::process_secrets()
+    }
+
     /// In-memory snapshot of the machine state (pc + seq).
     fn state(&self) -> MachineState;
 
@@ -1165,6 +1173,10 @@ fn now_ms() -> u64 {
 }
 
 impl Storage for JsonlStorage {
+    fn egress_secrets(&self) -> SecretSet {
+        self.redaction_set()
+    }
+
     fn session_id(&self) -> &str {
         &self.session_id
     }
