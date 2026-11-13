@@ -204,9 +204,17 @@ the secrets the `[secrets]` release binds to it:
 | Consumer | Who starts the child | Default |
 |---|---|---|
 | `gh`, `git` | the gh and git tools | `GITHUB_TOKEN` |
-| `hook`, `mcp` | your own hooks and stdio MCP servers | `GITHUB_TOKEN` |
+| `hook`, `mcp` | your own pre/post tool hooks and stdio MCP servers | `GITHUB_TOKEN` |
 | `run_command`, `job_start`, `cron` | model commands, background jobs, cron scripts and delivery commands | nothing |
 | `uteke`, `memory`, `cora`, `skills` | tole's helper processes | nothing |
+| `verify`, `turnend` | the mission `--verify` command and the `on_turnend` stop gates (#676) | nothing |
+
+The `verify` and `turnend` consumers (#676) are separate from `hook` because
+the mission verify command and the stop gates run unattended and usually
+execute code the agent just wrote: a test or build script the model added
+would otherwise read the token. Grant them a secret explicitly when a check
+needs it, e.g. `GITHUB_TOKEN = { tools = ["gh", "git", "hook", "mcp",
+"verify", "turnend"] }`.
 
 **Secret by name or by value (#682).** The scrub removes a variable when its
 name is secret-shaped (the markers above plus names ending in `PASS`, `_KEY`,
