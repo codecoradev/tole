@@ -211,6 +211,7 @@ fn the_store_keeps_drafts_apart_from_skills_and_decides_once() {
     let r = store.decide(&d.id, DraftStatus::Rejected).unwrap();
     assert_eq!(r.status, DraftStatus::Rejected);
     assert!(store.decide(&d.id, DraftStatus::Promoted).is_err());
+    assert!(store.promote(&d.id, promotion()).is_err(), "decided once");
     assert!(store.set_verdict(&d.id, Verdict::New).is_err());
     assert!(store.decide("../x", DraftStatus::Rejected).is_err());
     assert!(store.get("A/b").is_err());
@@ -225,4 +226,57 @@ fn an_unreadable_draft_is_skipped_by_list() {
     std::fs::create_dir_all(root.join("dbroken")).unwrap();
     std::fs::write(root.join("dbroken").join(DRAFT_FILE), "{").unwrap();
     assert_eq!(store.list().len(), 1);
+}
+
+fn promotion() -> Promotion {
+    Promotion {
+        package_hash: "sha256:abc".into(),
+        dir: "/skills/ship-release".into(),
+        at: 2000,
+    }
+}
+
+#[test]
+fn promote_and_revoke_move_a_draft_along_one_path() {
+    let store = DraftStore::new(tmp("promote").join(DRAFTS_DIR));
+    let (d, md) = gate(&proposal(good()), &ctx(), &SecretSet::default()).unwrap();
+    store.create(&d, &md).unwrap();
+    assert!(store.decide(&d.id, DraftStatus::Promoted).is_err());
+    assert!(store.revoke(&d.id).is_err(), "only a promoted draft");
+    let p = store.promote(&d.id, promotion()).unwrap();
+    assert_eq!(p.status, DraftStatus::Promoted);
+    assert_eq!(store.get(&d.id).unwrap().promotion, Some(promotion()));
+    assert!(store.decide(&d.id, DraftStatus::Rejected).is_err());
+    assert!(store.promote(&d.id, promotion()).is_err());
+    let r = store.revoke(&d.id).unwrap();
+    assert_eq!(r.status, DraftStatus::Revoked);
+    assert!(store.revoke(&d.id).is_err());
+}
+
+#[test]
+fn drafts_are_found_by_a_source_session() {
+    let store = DraftStore::new(tmp("bysession").join(DRAFTS_DIR));
+    let (a, am) = gate(&proposal(good()), &ctx(), &SecretSet::default()).unwrap();
+    store.create(&a, &am).unwrap();
+    let mut c = ctx();
+    c.session = Some("s-9".into());
+    c.now = 1001;
+    let mut p = proposal(good());
+    p.sources = Vec::new();
+    let (b, bm) = gate(&p, &c, &SecretSet::default()).unwrap();
+    store.create(&b, &bm).unwrap();
+    let ids = |v: Vec<Draft>| v.into_iter().map(|d| d.id).collect::<Vec<_>>();
+    assert_eq!(ids(store.by_session("s-0")), std::slice::from_ref(&a.id));
+    assert_eq!(ids(store.by_session("s-1")), std::slice::from_ref(&a.id));
+    assert_eq!(ids(store.by_session("s-9")), std::slice::from_ref(&b.id));
+    assert!(store.by_session("nobody").is_empty());
+}
+
+#[test]
+fn an_old_record_without_a_promotion_still_loads() {
+    let (d, _) = gate(&proposal(good()), &ctx(), &SecretSet::default()).unwrap();
+    let mut v = serde_json::to_value(&d).unwrap();
+    v.as_object_mut().unwrap().remove("promotion");
+    let back: Draft = serde_json::from_value(v).unwrap();
+    assert_eq!(back.promotion, None);
 }

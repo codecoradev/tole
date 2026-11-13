@@ -112,3 +112,88 @@ fn a_draft_is_listed_shown_rejected_and_never_loadable() {
         out(&o)
     );
 }
+
+#[test]
+fn promote_makes_an_approved_skill_and_revoke_takes_the_approval_back() {
+    let home = tmpdir();
+    let ws = home.join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let ws_arg = ws.to_str().unwrap();
+    let id = seed(&home);
+    let hash = tole_core::skill_index::content_hash(SKILL.as_bytes());
+
+    // The draft is tainted, so promotion needs the explicit accept.
+    let o = tole(
+        &home,
+        &[
+            "skills",
+            "drafts",
+            "promote",
+            &id,
+            "--hash",
+            &hash,
+            "--workspace",
+            ws_arg,
+        ],
+    );
+    assert!(
+        !o.status.success() && out(&o).contains("--accept-taint"),
+        "{}",
+        out(&o)
+    );
+    // Without a terminal the reviewed hash is required.
+    let o = tole(
+        &home,
+        &[
+            "skills",
+            "drafts",
+            "promote",
+            &id,
+            "--accept-taint",
+            "--workspace",
+            ws_arg,
+        ],
+    );
+    assert!(
+        !o.status.success() && out(&o).contains("--hash"),
+        "{}",
+        out(&o)
+    );
+
+    let o = tole(
+        &home,
+        &[
+            "skills",
+            "drafts",
+            "promote",
+            &id,
+            "--hash",
+            &hash,
+            "--accept-taint",
+            "--workspace",
+            ws_arg,
+        ],
+    );
+    assert!(o.status.success(), "{}", out(&o));
+    assert!(out(&o).contains("promoted"), "{}", out(&o));
+    assert_eq!(
+        std::fs::read_to_string(ws.join("skills/ship-release/SKILL.md")).unwrap(),
+        SKILL
+    );
+    let o = tole(&home, &["skills", "list", "--workspace", ws_arg]);
+    assert!(out(&o).contains("ship-release  approved"), "{}", out(&o));
+
+    // The source session turns out poisoned.
+    let o = tole(&home, &["skills", "drafts", "revoke", "s-1"]);
+    assert!(o.status.success(), "{}", out(&o));
+    assert!(out(&o).contains("withdrawn"), "{}", out(&o));
+    let o = tole(&home, &["skills", "list", "--workspace", ws_arg]);
+    assert!(
+        out(&o).contains("ship-release  not approved"),
+        "{}",
+        out(&o)
+    );
+    assert!(ws.join("skills/ship-release/SKILL.md").exists());
+    let o = tole(&home, &["skills", "drafts", "list", "--all"]);
+    assert!(out(&o).contains("revoked"), "{}", out(&o));
+}
