@@ -92,7 +92,10 @@ fn signed(id: &str, ts: i64, body: &[u8]) -> Vec<(&'static str, String)> {
     let ts = ts.to_string();
     vec![
         ("X-Tole-Timestamp", ts.clone()),
-        ("X-Tole-Signature", webhook::sign(KEY.as_bytes(), &ts, body)),
+        (
+            "X-Tole-Signature",
+            webhook::sign(KEY.as_bytes(), &ts, id, None, body),
+        ),
         ("X-Tole-Delivery", id.to_string()),
     ]
 }
@@ -130,6 +133,21 @@ fn a_signed_delivery_is_accepted_once_even_across_a_restart() {
     ];
     let (st, _) = send(s.port, "/hooks/gh", &gh, body);
     assert!(st.contains("202"), "{st}");
+
+    // #678: the same captured GitHub delivery under a fresh id is a
+    // duplicate (the key is the signed body), and a native capture with a
+    // fresh id fails its signature (the id is signed).
+    let mut replay = gh.clone();
+    replay[1].1 = "gh-2-fresh".to_string();
+    let (st, b) = send(s.port, "/hooks/gh", &replay, body);
+    assert!(
+        st.contains("200") && b.contains("duplicate") && b.contains("gh-2-fresh"),
+        "{st} {b}"
+    );
+    let mut native = signed("d-1", now(), body);
+    native[2].1 = "d-1-fresh".to_string();
+    let (st, b) = send(s.port, "/hooks/gh", &native, body);
+    assert!(st.contains("401"), "{st} {b}");
 }
 
 #[test]
@@ -138,7 +156,13 @@ fn bad_stale_unsigned_or_unknown_deliveries_are_refused() {
     let s = spawn(&base);
     let body = br#"{"a":1}"#;
     let mut bad = signed("d", now(), body);
-    bad[1].1 = webhook::sign(b"another-key-another-key-another!", &bad[0].1, body);
+    bad[1].1 = webhook::sign(
+        b"another-key-another-key-another!",
+        &bad[0].1,
+        "d",
+        None,
+        body,
+    );
     assert!(send(s.port, "/hooks/gh", &bad, body).0.contains("401"));
     let stale = signed("d", now() - 301, body);
     assert!(send(s.port, "/hooks/gh", &stale, body).0.contains("401"));

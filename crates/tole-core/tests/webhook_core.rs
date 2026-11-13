@@ -10,6 +10,11 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
+fn sha2_digest(b: &[u8]) -> Vec<u8> {
+    use sha2::Digest;
+    sha2::Sha256::digest(b).to_vec()
+}
+
 #[test]
 fn hmac_sha256_matches_rfc_4231() {
     // Test case 1.
@@ -41,7 +46,7 @@ const NOW: i64 = 1_767_225_600;
 fn native(ts: i64, body: &[u8], id: &str) -> Headers {
     Headers {
         timestamp: Some(ts.to_string()),
-        signature: Some(webhook::sign(KEY, &ts.to_string(), body)),
+        signature: Some(webhook::sign(KEY, &ts.to_string(), id, None, body)),
         delivery: Some(id.into()),
         ..Headers::default()
     }
@@ -51,8 +56,12 @@ fn native(ts: i64, body: &[u8], id: &str) -> Headers {
 fn a_native_signature_inside_the_window_is_accepted() {
     let body = br#"{"action":"opened"}"#;
     for skew in [0, WINDOW_SECS, -WINDOW_SECS] {
-        let id = webhook::verify(KEY, &native(NOW + skew, body, "d-1"), body, NOW);
-        assert_eq!(id, Ok("d-1".to_string()), "skew {skew}");
+        let v = webhook::verify(KEY, &native(NOW + skew, body, "d-1"), body, NOW).unwrap();
+        assert_eq!(
+            (v.key.as_str(), v.delivery.as_str()),
+            ("d-1", "d-1"),
+            "skew {skew}"
+        );
     }
 }
 
@@ -75,18 +84,13 @@ fn stale_tampered_or_wrongly_keyed_deliveries_are_rejected() {
         webhook::verify(KEY, &moved, body, NOW),
         Err(Reject::BadSignature)
     );
-    // Another key, a truncated or non-hex signature, no `sha256=` prefix.
+    // Another key, a truncated or non-hex signature, no `v2=` prefix.
     assert_eq!(
         webhook::verify(b"another-key-another-key-another!", &h, body, NOW),
         Err(Reject::BadSignature)
     );
     let sig = h.signature.clone().unwrap();
-    for bad in [
-        &sig[..sig.len() - 2],
-        "sha256=zz",
-        &sig["sha256=".len()..],
-        "",
-    ] {
+    for bad in [&sig[..sig.len() - 2], "v2=zz", &sig["v2=".len()..], ""] {
         let mut b = h.clone();
         b.signature = Some(bad.to_string());
         assert_eq!(
@@ -118,10 +122,9 @@ fn a_github_signature_is_checked_over_the_body() {
         github_delivery: Some("72d3162e-cc78-11e3-81ab-4c9367dc0958".into()),
         ..Headers::default()
     };
-    assert_eq!(
-        webhook::verify(KEY, &h, body, NOW),
-        Ok("72d3162e-cc78-11e3-81ab-4c9367dc0958".to_string())
-    );
+    let v = webhook::verify(KEY, &h, body, NOW).unwrap();
+    assert_eq!(v.delivery, "72d3162e-cc78-11e3-81ab-4c9367dc0958");
+    assert_eq!(v.key, format!("gh:{}", hex(&sha2_digest(body))));
     assert_eq!(
         webhook::verify(KEY, &h, b"{}", NOW),
         Err(Reject::BadSignature)
@@ -138,7 +141,8 @@ fn a_delivery_id_is_required_and_bounded() {
         "bad/slash",
         "nul\0",
     ] {
-        let h = native(NOW, body, bad);
+        let mut h = native(NOW, body, "ok");
+        h.delivery = Some(bad.to_string());
         assert_eq!(
             webhook::verify(KEY, &h, body, NOW),
             Err(Reject::BadDelivery),
@@ -156,6 +160,116 @@ fn a_delivery_id_is_required_and_bounded() {
     assert_eq!(Reject::Stale.status(), 401);
     assert_eq!(Reject::Unsigned.status(), 401);
     assert_eq!(Reject::BadDelivery.status(), 400);
+}
+
+/// #678 (the audit's reproduction): the delivery id was outside both
+/// signatures, so one captured delivery replayed as new under a fresh id:
+/// native within the window, GitHub forever. Now the native id is signed,
+/// and a GitHub delivery's idempotency key is the signed body.
+#[test]
+fn a_captured_delivery_cannot_be_replayed_under_a_new_id() {
+    let body = br#"{"action":"opened"}"#;
+    // Native: the captured headers with a new id no longer verify.
+    let captured = native(NOW, body, "orig-1");
+    let mut replay = captured.clone();
+    replay.delivery = Some("replay-2".into());
+    assert!(webhook::verify(KEY, &captured, body, NOW + 200).is_ok());
+    assert_eq!(
+        webhook::verify(KEY, &replay, body, NOW + 200),
+        Err(Reject::BadSignature)
+    );
+    // GitHub: a new delivery header still verifies (GitHub signs only the
+    // body), but the idempotency key is the same, so the ledger answers
+    // `duplicate` within the retention.
+    let gh = |id: &str| Headers {
+        github_signature: Some(format!("sha256={}", hex(&webhook::hmac_sha256(KEY, body)))),
+        github_delivery: Some(id.into()),
+        ..Headers::default()
+    };
+    let first = webhook::verify(KEY, &gh("g-1"), body, NOW).unwrap();
+    let again = webhook::verify(KEY, &gh("g-2"), body, NOW + 86_400).unwrap();
+    assert_eq!(first.key, again.key);
+    assert_ne!(first.delivery, again.delivery);
+    let mut l = Ledger::open(MemoryStore::default()).unwrap();
+    assert!(l.record_hook("gh", &first.key, NOW).unwrap());
+    assert!(
+        !l.record_hook("gh", &again.key, NOW + 86_400).unwrap(),
+        "a replay under a new id is a duplicate"
+    );
+}
+
+/// #678: the native event is signed, so a capture cannot be relabelled to
+/// pass a route's `events` list; the fields cannot shift into each other.
+#[test]
+fn the_native_event_is_signed_and_the_fields_cannot_shift() {
+    let body = b"{}";
+    let ts = NOW.to_string();
+    let signed = |id: &str, event: Option<&str>| Headers {
+        timestamp: Some(ts.clone()),
+        signature: Some(webhook::sign(KEY, &ts, id, event, body)),
+        delivery: Some(id.into()),
+        event: event.map(str::to_string),
+        ..Headers::default()
+    };
+    let h = signed("d-1", Some("push"));
+    assert_eq!(
+        webhook::verify(KEY, &h, body, NOW)
+            .unwrap()
+            .event
+            .as_deref(),
+        Some("push")
+    );
+    for relabel in [Some("release".to_string()), None] {
+        let mut r = h.clone();
+        r.event = relabel;
+        assert_eq!(
+            webhook::verify(KEY, &r, body, NOW),
+            Err(Reject::BadSignature)
+        );
+    }
+    // An unsigned event added to a delivery signed without one.
+    let mut added = signed("d-2", None);
+    added.event = Some("push".into());
+    assert_eq!(
+        webhook::verify(KEY, &added, body, NOW),
+        Err(Reject::BadSignature)
+    );
+    // Moving a `.` between the id and the event changes the message.
+    let a = signed("a.b", Some("c"));
+    let mut shifted = a.clone();
+    shifted.delivery = Some("a".into());
+    shifted.event = Some("b.c".into());
+    assert_eq!(
+        webhook::verify(KEY, &shifted, body, NOW),
+        Err(Reject::BadSignature)
+    );
+    // An event that could carry a separator is refused before any check.
+    let mut bad = signed("d-3", Some("push"));
+    bad.event = Some("push\nx".into());
+    assert_eq!(webhook::verify(KEY, &bad, body, NOW), Err(Reject::BadEvent));
+    assert_eq!(Reject::BadEvent.status(), 400);
+}
+
+/// #678: the v1 native form signed neither the id nor the event; it is
+/// refused with a reason naming the v2 form, as a signature failure.
+#[test]
+fn a_v1_native_signature_is_refused_as_outdated() {
+    let body = br#"{"a":1}"#;
+    let ts = NOW.to_string();
+    let mut msg = format!("{ts}.").into_bytes();
+    msg.extend_from_slice(body);
+    let h = Headers {
+        timestamp: Some(ts),
+        signature: Some(format!("sha256={}", hex(&webhook::hmac_sha256(KEY, &msg)))),
+        delivery: Some("d".into()),
+        ..Headers::default()
+    };
+    assert_eq!(
+        webhook::verify(KEY, &h, body, NOW),
+        Err(Reject::OutdatedScheme)
+    );
+    assert_eq!(Reject::OutdatedScheme.status(), 401);
+    assert!(Reject::OutdatedScheme.reason().contains("v2="));
 }
 
 #[test]

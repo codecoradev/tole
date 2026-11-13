@@ -307,6 +307,7 @@ fn fire_sends_a_signed_delivery_only_to_a_loopback_server() {
         timestamp: get("x-tole-timestamp"),
         signature: get("x-tole-signature"),
         delivery: get("x-tole-delivery"),
+        event: get("x-tole-event"),
         ..Default::default()
     };
     let now = std::time::SystemTime::now()

@@ -181,7 +181,7 @@ fn deliver(port: u16, route: &str, event: &str, id: &str, body: &[u8]) -> (Strin
          X-Tole-Timestamp: {ts}\r\nX-Tole-Signature: {}\r\nX-Tole-Delivery: {id}\r\n\
          X-GitHub-Event: {event}\r\n\r\n",
         body.len(),
-        webhook::sign(KEY.as_bytes(), &ts, body)
+        webhook::sign(KEY.as_bytes(), &ts, id, Some(event), body)
     );
     let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();

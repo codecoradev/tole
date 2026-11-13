@@ -223,8 +223,6 @@ struct Request {
     body: Vec<u8>,
     /// Signature and delivery headers of a webhook (#582).
     hook: tole_core::webhook::Headers,
-    /// `X-GitHub-Event` or `X-Tole-Event` of a webhook (#582 part 2).
-    event: Option<String>,
 }
 
 /// Why a request could not be read; decides the response (if any).
@@ -315,7 +313,6 @@ fn read_request(
     let mut content_length: Option<usize> = None;
     let mut expect_continue = false;
     let mut hook = tole_core::webhook::Headers::default();
-    let mut event = None;
     // The request line counts against the same ceiling as the headers:
     // the documented limit is 32 KiB for both combined.
     let mut header_bytes = request_line.len();
@@ -378,7 +375,7 @@ fn read_request(
         } else if name.eq_ignore_ascii_case("x-github-event")
             || name.eq_ignore_ascii_case("x-tole-event")
         {
-            event = Some(value.to_string());
+            hook.event = Some(value.to_string());
         } else if name.eq_ignore_ascii_case("expect") && value.eq_ignore_ascii_case("100-continue")
         {
             expect_continue = true;
@@ -428,7 +425,6 @@ fn read_request(
         last_event_id,
         body,
         hook,
-        event,
     })
 }
 
@@ -1010,6 +1006,27 @@ fn resume_session(state: &State, id: &str, cwd: &str) -> (u16, serde_json::Value
     }
 }
 
+/// An insecure loopback route's delivery: no signature, so the delivery id
+/// and the event are taken as sent (still validated).
+fn insecure_delivery(
+    h: &tole_core::webhook::Headers,
+) -> Result<tole_core::webhook::Verified, tole_core::webhook::Reject> {
+    use tole_core::webhook::{self, Reject};
+    if h.event.as_deref().is_some_and(|e| !webhook::valid_event(e)) {
+        return Err(Reject::BadEvent);
+    }
+    let id = h
+        .delivery
+        .clone()
+        .filter(|d| webhook::valid_delivery(d))
+        .ok_or(Reject::BadDelivery)?;
+    Ok(webhook::Verified {
+        key: id.clone(),
+        delivery: id,
+        event: h.event.clone(),
+    })
+}
+
 /// `POST /hooks/<route>` (#582): the signature check, then the route's rate
 /// limit and the delivery's idempotency, both kept in the cron ledger so
 /// they survive a restart. A failed signature counts toward the source's
@@ -1030,16 +1047,11 @@ fn handle_hook(
         Some(key) => webhook::verify(key, &req.hook, &req.body, now),
         // An insecure route answers loopback clients only (and loads only
         // on a loopback bind).
-        None if peer.is_some_and(|ip| ip.is_loopback()) => req
-            .hook
-            .delivery
-            .clone()
-            .filter(|d| webhook::valid_delivery(d))
-            .ok_or(Reject::BadDelivery),
+        None if peer.is_some_and(|ip| ip.is_loopback()) => insecure_delivery(&req.hook),
         None => Err(Reject::Unsigned),
     };
-    let id = match checked {
-        Ok(id) => id,
+    let verified = match checked {
+        Ok(v) => v,
         Err(r) => {
             if r.status() == 401 {
                 if let Some(ip) = peer {
@@ -1057,12 +1069,16 @@ fn handle_hook(
         if l.state().hooks_since(name, now - 59) >= rate {
             return Ok(None);
         }
-        Ok(Some(l.record_hook(name, &id, now)?))
+        // #678: the key is signed material (the native delivery id, or the
+        // GitHub body's digest), so a capture re-sent under a fresh
+        // delivery header is a duplicate.
+        Ok(Some(l.record_hook(name, &verified.key, now)?))
     });
+    let id = verified.delivery.as_str();
     match outcome {
         Ok(None) => (429, json!({"error": "rate limit for this route"})),
         Ok(Some(false)) => (200, json!({"status": "duplicate", "delivery": id})),
-        Ok(Some(true)) => hook_action(state, name, route, req, &id, dir, now),
+        Ok(Some(true)) => hook_action(state, name, route, req, &verified, dir, now),
         Err(e) => {
             eprintln!("tole serve: webhook state: {e}");
             (500, json!({"error": "webhook state unavailable"}))
@@ -1082,12 +1098,12 @@ fn hook_action(
     name: &str,
     route: &tole_cli::hooks::Route,
     req: &Request,
-    id: &str,
+    verified: &tole_core::webhook::Verified,
     dir: &std::path::Path,
     now: i64,
 ) -> (u16, serde_json::Value) {
     use tole_cli::hook_filter;
-    let event = req.event.as_deref();
+    let (id, event) = (verified.delivery.as_str(), verified.event.as_deref());
     if !hook_filter::event_allowed(route.events.as_deref(), event) {
         return (
             200,

@@ -354,8 +354,9 @@ pub fn test(
         Some(key) => {
             let signed = webhook::Headers {
                 timestamp: Some(ts.clone()),
-                signature: Some(webhook::sign(key, &ts, &body)),
+                signature: Some(webhook::sign(key, &ts, &id, event, &body)),
                 delivery: Some(id.clone()),
+                event: event.map(str::to_string),
                 ..Default::default()
             };
             webhook::verify(key, &signed, &body, now)
