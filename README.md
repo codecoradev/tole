@@ -485,7 +485,7 @@ hard error.
 ## Remote approvals
 
 ```bash
-tole serve --token $TOLE_SERVE_TOKEN          # on the box
+TOLE_SERVE_TOKEN=... tole serve                # on the box (or --token-file <path>)
 tole approvals list --url http://box:7801 --token $TOKEN
 tole approvals allow apr-... --url http://box:7801 --token $TOKEN
 ```

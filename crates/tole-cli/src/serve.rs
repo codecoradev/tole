@@ -132,6 +132,7 @@ pub fn run_serve(cfg: ServeConfig) -> Result<()> {
             .is_ok_and(|ip| ip.is_loopback());
     let hooks = tole_cli::hooks::load(&hook_cfg, loopback, &|k| std::env::var(k).ok())
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+    tole_cli::hooks::hold_keys(&hooks);
     let hook_dir = if hooks.is_empty() {
         None
     } else {
@@ -206,6 +207,49 @@ fn resolve_token(flag: &Option<String>) -> Result<String> {
         }
     }
     anyhow::bail!("refusing to start an unauthenticated server: set --token or TOLE_SERVE_TOKEN")
+}
+
+/// Largest `--token-file`.
+const MAX_TOKEN_FILE: u64 = 4096;
+
+/// The serve bearer token (#682): `--token-file` (a regular file, no link
+/// or FIFO, at most 4 KiB, surrounding whitespace dropped; an empty file is
+/// an error), else `--token`, else `TOLE_SERVE_TOKEN` (blank counts as
+/// unset). Errors never carry the token.
+///
+/// The token becomes a secret held by role, whatever carried it: redacted
+/// on egress, and removed from any child's environment.
+pub fn serve_token(
+    flag: Option<String>,
+    file: Option<&std::path::Path>,
+    env: Option<String>,
+) -> std::result::Result<String, String> {
+    let from_file = match file {
+        Some(p) => {
+            let bytes = tole_core::delegation_report::read_plain_file(p, MAX_TOKEN_FILE)
+                .map_err(|e| format!("--token-file {}: {e}", p.display()))?
+                .ok_or_else(|| format!("--token-file {}: does not exist", p.display()))?;
+            let text = String::from_utf8(bytes)
+                .map_err(|_| format!("--token-file {}: not UTF-8", p.display()))?;
+            if text.trim().is_empty() {
+                return Err(format!("--token-file {}: is empty", p.display()));
+            }
+            Some(text)
+        }
+        None => None,
+    };
+    let token = [from_file, flag, env]
+        .into_iter()
+        .flatten()
+        .map(|t| t.trim().to_string())
+        .find(|t| !t.is_empty())
+        .ok_or_else(|| {
+            "refusing to start an unauthenticated server: set TOLE_SERVE_TOKEN, --token-file \
+             or --token"
+                .to_string()
+        })?;
+    tole_core::secrets::add_role_secret("TOLE_SERVE_TOKEN", &token);
+    Ok(token)
 }
 
 // ---------------------------------------------------------------------------
@@ -1530,6 +1574,43 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #682: the token comes from a file first, then the flag, then the
+    /// environment; an empty file is an error, and no error shows a token.
+    #[test]
+    fn the_serve_token_prefers_the_file_and_never_echoes_a_value() {
+        let dir = std::env::temp_dir().join(format!("tole-serve-token-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("token");
+        std::fs::write(&file, "file-token-0682\n").unwrap();
+        let s = |v: &str| Some(v.to_string());
+        assert_eq!(
+            serve_token(None, Some(&file), s("env-token")).unwrap(),
+            "file-token-0682"
+        );
+        assert_eq!(
+            tole_core::secrets::process_secrets().redact("t=file-token-0682"),
+            "t=«TOLE_SERVE_TOKEN»",
+            "the token is a secret held by role"
+        );
+        assert_eq!(
+            serve_token(s(" flag-token "), None, s("env-token")).unwrap(),
+            "flag-token"
+        );
+        assert_eq!(
+            serve_token(s("  "), None, s("env-token")).unwrap(),
+            "env-token"
+        );
+        let empty = dir.join("empty");
+        std::fs::write(&empty, "\n").unwrap();
+        let e = serve_token(None, Some(&empty), s("env-token-0682")).unwrap_err();
+        assert!(e.contains("is empty") && !e.contains("env-token"), "{e}");
+        let e = serve_token(None, Some(&dir.join("missing")), None).unwrap_err();
+        assert!(e.contains("does not exist"), "{e}");
+        let e = serve_token(None, None, s(" ")).unwrap_err();
+        assert!(e.contains("TOLE_SERVE_TOKEN"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn reason_phrases_cover_every_status_the_routes_emit() {

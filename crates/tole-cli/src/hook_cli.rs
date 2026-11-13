@@ -331,6 +331,7 @@ pub fn test(
         [(name.to_string(), cfg.clone())].into_iter().collect();
     let routes =
         crate::hooks::load(&one, true, &|k| std::env::var(k).ok()).map_err(|e| anyhow!(e))?;
+    crate::hooks::hold_keys(&routes);
     let route = &routes[name];
     let body = match payload {
         Some(p) => tole_core::delegation_report::read_plain_file(p, route.max_body as u64)

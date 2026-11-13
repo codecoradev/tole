@@ -354,14 +354,18 @@ pub struct SecretBinding {
     pub tools: Vec<String>,
 }
 
-/// A `[secrets]` key: a secret-shaped environment variable NAME.
+/// A `[secrets]` key: a secret-shaped environment variable NAME, or a
+/// `*_URL` / `*_URI` name (a connection string with a password is scrubbed
+/// for its value, #682, so it must be grantable).
 fn check_secret(name: &str, b: &SecretBinding) -> Result<(), String> {
     // Never echo the key or an entry: either may be a value pasted by mistake.
-    if !valid_grant_name(name) || !tole_core::secrets::is_secret_name(name) {
+    let url_name = name.ends_with("_URL") || name.ends_with("_URI");
+    if !valid_grant_name(name) || !(tole_core::secrets::is_secret_name(name) || url_name) {
         return Err(
             "secrets: every key must be the NAME of a secret environment variable \
-                    ([A-Z0-9_], containing TOKEN, SECRET, API_KEY, PASSWORD, ...), e.g. \
-                    GITHUB_TOKEN; other variables already reach every child"
+                    ([A-Z0-9_], containing TOKEN, SECRET, API_KEY, PASSWORD, ... or ending \
+                    in _KEY, _URL, ...), e.g. GITHUB_TOKEN or REDIS_URL; other variables \
+                    already reach every child"
                 .into(),
         );
     }
