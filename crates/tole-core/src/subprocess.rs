@@ -54,7 +54,9 @@ fn recv_with_grace<T>(rx: &mpsc::Receiver<T>) -> Option<T> {
 /// CREDENTIAL, or PRIVATE_KEY (case-insensitive substring, so
 /// `SECRET_KEY`, `AUTHTOKEN`, `DB_PASSWD` are covered — #284).
 /// The name rule is [`crate::secrets::is_secret_name`], shared with the
-/// egress redactor (#595). This form keeps NO secret; tole's own launchers
+/// egress redactor (#595); a variable whose value is a secret tole knows, or
+/// a URL with a password, is removed too ([`crate::secrets::is_secret_var`],
+/// #682). This form keeps NO secret; tole's own launchers
 /// use [`scrub_env_for`], which keeps what the release grants them (#598).
 pub fn scrub_env_for_child(cmd: &mut Command) -> &mut Command {
     scrub_env_keeping(cmd, &|_| false)
@@ -88,9 +90,17 @@ pub fn scrub_env_for_child_keeping<'a>(cmd: &'a mut Command, keep: &[&str]) -> &
 }
 
 fn scrub_env_keeping<'a>(cmd: &'a mut Command, keep: &dyn Fn(&str) -> bool) -> &'a mut Command {
-    for (k, _) in std::env::vars_os() {
+    // #682: a variable is also a secret by its value (a URL with a password,
+    // or a value tole holds by role: a webhook key, the serve token, a
+    // `${NAME}` header expansion), whatever it is called.
+    let known = crate::secrets::process_secrets();
+    for (k, v) in std::env::vars_os() {
         let Some(name) = k.to_str() else { continue };
-        if crate::secrets::is_secret_name(name) && !keep(name) {
+        let secret = match v.to_str() {
+            Some(value) => crate::secrets::is_secret_var(name, value, &known),
+            None => crate::secrets::is_secret_name(name),
+        };
+        if secret && !keep(name) {
             cmd.env_remove(name);
         }
     }

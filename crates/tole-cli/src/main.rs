@@ -549,9 +549,16 @@ enum Command {
         bind: String,
 
         /// Bearer token required on every request (or TOLE_SERVE_TOKEN
-        /// env). Refuses to start without one.
-        #[arg(long)]
+        /// env, or --token-file). Refuses to start without one. Prefer the
+        /// env or the file: a command-line value is visible to every local
+        /// process (`ps`, /proc/<pid>/cmdline).
+        #[arg(long, conflicts_with = "token_file")]
         token: Option<String>,
+
+        /// Read the bearer token from this file (a regular file, at most
+        /// 4 KiB, one trailing newline dropped).
+        #[arg(long)]
+        token_file: Option<std::path::PathBuf>,
 
         /// Same semantics as `run --allow` (Write pre-authorization).
         #[arg(long = "allow")]
@@ -1451,6 +1458,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             bind,
             transport,
             token,
+            token_file,
             allow_patterns: _,
             workspace,
             memory,
@@ -1477,13 +1485,21 @@ fn dispatch(cli: Cli) -> Result<()> {
             };
             let workspace = workspace.or_else(|| host.workspace.clone());
             // Both transports refuse to start without a token (#96/#137).
-            let token = token
-                .or_else(|| std::env::var("TOLE_SERVE_TOKEN").ok())
-                .map(|t| t.trim().to_string())
-                .filter(|t| !t.is_empty())
-                .context(
-                    "refusing to start an unauthenticated server: set --token or TOLE_SERVE_TOKEN",
-                )?;
+            if token.is_some() {
+                eprintln!(
+                    "tole serve: warning: --token on the command line is visible to every local \
+                     process (ps, /proc/<pid>/cmdline); use TOLE_SERVE_TOKEN or --token-file"
+                );
+            }
+            let token = crate::serve::serve_token(
+                token,
+                token_file.as_deref(),
+                std::env::var("TOLE_SERVE_TOKEN").ok(),
+            )
+            .map_err(anyhow::Error::msg)?;
+            // #682: the token is a secret by role, whatever carried it:
+            // redacted on egress, and removed from any child's environment.
+            tole_core::secrets::add_role_secret("TOLE_SERVE_TOKEN", &token);
             if transport == "mcp" {
                 #[cfg(feature = "mcp-http")]
                 {

@@ -59,10 +59,12 @@ pub fn label(role: &str, cfg: &OpenAiConfig) -> String {
 
 /// The known secrets of this process (#595): every secret-named env var
 /// plus the values the web backend headers expand from `${NAME}`, whatever
-/// their names. One set for every egress sink a session has.
+/// their names, and the secrets tole holds by role (webhook keys, the serve
+/// token, #682). One set for every egress sink a session has.
 pub fn process_secrets(env: &dyn Fn(&str) -> Option<String>) -> SecretSet {
     tole_core::web::header_secrets(env)
         .into_iter()
+        .chain(tole_core::secrets::role_secrets())
         .fold(SecretSet::from_env(), |set, (name, value)| {
             set.with(&name, &value)
         })

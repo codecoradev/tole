@@ -171,6 +171,18 @@ pub fn load(
     Ok(out)
 }
 
+/// Records every route's key as a secret tole holds by role (#682): from
+/// then on it is redacted wherever text leaves the process, and the child
+/// scrub removes any variable holding it (`hmac_key_env` may name any
+/// variable). A key that is not UTF-8 cannot appear in text and is skipped.
+pub fn hold_keys(routes: &BTreeMap<String, Route>) {
+    for (name, route) in routes {
+        if let Some(key) = route.key().and_then(|k| std::str::from_utf8(k).ok()) {
+            tole_core::secrets::add_role_secret(&format!("hooks.{name}"), key);
+        }
+    }
+}
+
 /// The key file: a regular file (no link, no FIFO), at most
 /// [`MAX_KEY_FILE`] bytes, one trailing newline dropped.
 fn read_key_file(path: &str) -> Result<Vec<u8>, String> {

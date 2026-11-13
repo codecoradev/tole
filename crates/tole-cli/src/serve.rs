@@ -132,6 +132,7 @@ pub fn run_serve(cfg: ServeConfig) -> Result<()> {
             .is_ok_and(|ip| ip.is_loopback());
     let hooks = tole_cli::hooks::load(&hook_cfg, loopback, &|k| std::env::var(k).ok())
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+    tole_cli::hooks::hold_keys(&hooks);
     let hook_dir = if hooks.is_empty() {
         None
     } else {
@@ -206,6 +207,44 @@ fn resolve_token(flag: &Option<String>) -> Result<String> {
         }
     }
     anyhow::bail!("refusing to start an unauthenticated server: set --token or TOLE_SERVE_TOKEN")
+}
+
+/// Largest `--token-file`.
+const MAX_TOKEN_FILE: u64 = 4096;
+
+/// The serve bearer token (#682): `--token-file` (a regular file, no link
+/// or FIFO, at most 4 KiB, surrounding whitespace dropped; an empty file is
+/// an error), else `--token`, else `TOLE_SERVE_TOKEN` (blank counts as
+/// unset). Errors never carry the token.
+pub fn serve_token(
+    flag: Option<String>,
+    file: Option<&std::path::Path>,
+    env: Option<String>,
+) -> std::result::Result<String, String> {
+    let from_file = match file {
+        Some(p) => {
+            let bytes = tole_core::delegation_report::read_plain_file(p, MAX_TOKEN_FILE)
+                .map_err(|e| format!("--token-file {}: {e}", p.display()))?
+                .ok_or_else(|| format!("--token-file {}: does not exist", p.display()))?;
+            let text = String::from_utf8(bytes)
+                .map_err(|_| format!("--token-file {}: not UTF-8", p.display()))?;
+            if text.trim().is_empty() {
+                return Err(format!("--token-file {}: is empty", p.display()));
+            }
+            Some(text)
+        }
+        None => None,
+    };
+    [from_file, flag, env]
+        .into_iter()
+        .flatten()
+        .map(|t| t.trim().to_string())
+        .find(|t| !t.is_empty())
+        .ok_or_else(|| {
+            "refusing to start an unauthenticated server: set TOLE_SERVE_TOKEN, --token-file \
+             or --token"
+                .to_string()
+        })
 }
 
 // ---------------------------------------------------------------------------
