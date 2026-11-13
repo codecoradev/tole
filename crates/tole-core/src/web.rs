@@ -260,6 +260,134 @@ fn fetch_agent_vetted() -> ureq::Agent {
     )
 }
 
+/// One GET of a host-side HTTP client (#625, the built-in web tools): no
+/// redirect is followed (the caller sees the 3xx and decides), and the
+/// connection goes through the same vet-and-pin resolver as `web_fetch`.
+#[derive(Debug, Clone)]
+pub struct Hop<'a> {
+    pub url: &'a str,
+    pub headers: &'a [(String, String)],
+    /// Total time for this hop (at most 30 s is used).
+    pub timeout: Duration,
+    /// Body cap in bytes.
+    pub max_bytes: usize,
+    /// `TOLE_WEB_ALLOW_PRIVATE=1`: private and loopback addresses allowed.
+    pub allow_private: bool,
+    /// Over the cap: `true` truncates (and says so), `false` is an error.
+    pub truncate: bool,
+}
+
+/// A hop's response. Header names are lower-case; a redirect (301, 302,
+/// 303, 307, 308 with a `location`) has an empty, unread body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HopResponse {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+    pub truncated: bool,
+}
+
+/// Why a hop produced no response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HopError {
+    /// Not an http(s) URL.
+    InvalidUrl,
+    /// The host resolves to a private or loopback address (SSRF guard).
+    Private(String),
+    /// The body was over the cap (with `truncate: false`).
+    TooLarge(usize),
+    Timeout,
+    Transport(String),
+}
+
+/// `TOLE_WEB_ALLOW_PRIVATE=1`, for [`Hop::allow_private`].
+pub fn allow_private_from_env() -> bool {
+    ssrf_opt_out()
+}
+
+/// The SSRF check on its own, before anything is fetched: `url`'s host must
+/// resolve to public addresses unless `allow_private`.
+pub fn vet_public_url(url: &str, allow_private: bool) -> Result<(), String> {
+    if !redirect_scheme_allowed(url) {
+        return Err("web_fetch: only http(s) URLs".into());
+    }
+    host_is_public_opt(url, allow_private)
+}
+
+/// Performs one hop (see [`Hop`]). The address check runs twice: up front,
+/// so a private host is refused before any connection with a clear error,
+/// and in the connection's own resolver, which pins what it vetted (a DNS
+/// rebinding between the two fails closed).
+pub fn vetted_get(hop: &Hop<'_>) -> Result<HopResponse, HopError> {
+    if !redirect_scheme_allowed(hop.url) {
+        return Err(HopError::InvalidUrl);
+    }
+    vet_public_url(hop.url, hop.allow_private).map_err(HopError::Private)?;
+    let config = ureq::Agent::config_builder()
+        .timeout_global(Some(hop.timeout.min(Duration::from_secs(30))))
+        .max_redirects(0)
+        .http_status_as_error(false)
+        .proxy(None)
+        .build();
+    let agent = ureq::Agent::with_parts(
+        config,
+        ureq::unversioned::transport::DefaultConnector::default(),
+        SsrfResolver {
+            opt_out: hop.allow_private,
+        },
+    );
+    let mut req = agent.get(hop.url);
+    for (k, v) in hop.headers {
+        req = req.header(k.as_str(), v.as_str());
+    }
+    let mut res = req.call().map_err(|e| match e {
+        ureq::Error::Timeout(_) => HopError::Timeout,
+        other => HopError::Transport(other.to_string()),
+    })?;
+    let status = res.status().as_u16();
+    let headers: Vec<(String, String)> = res
+        .headers()
+        .iter()
+        .filter_map(|(k, v)| {
+            Some((
+                k.as_str().to_ascii_lowercase(),
+                v.to_str().ok()?.to_string(),
+            ))
+        })
+        .collect();
+    let redirect = matches!(status, 301 | 302 | 303 | 307 | 308)
+        && headers.iter().any(|(k, _)| k == "location");
+    if redirect {
+        return Ok(HopResponse {
+            status,
+            headers,
+            body: Vec::new(),
+            truncated: false,
+        });
+    }
+    use std::io::Read;
+    let mut body = Vec::new();
+    res.body_mut()
+        .as_reader()
+        .take(hop.max_bytes as u64 + 1)
+        .read_to_end(&mut body)
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::TimedOut => HopError::Timeout,
+            _ => HopError::Transport(e.to_string()),
+        })?;
+    let over = body.len() > hop.max_bytes;
+    if over && !hop.truncate {
+        return Err(HopError::TooLarge(hop.max_bytes));
+    }
+    body.truncate(hop.max_bytes);
+    Ok(HopResponse {
+        status,
+        headers,
+        body,
+        truncated: over,
+    })
+}
+
 /// Search-only plumbing (no user URL → no SSRF surface): a 30 s agent
 /// with AUTO-REDIRECTS OFF.
 fn agent() -> ureq::Agent {
