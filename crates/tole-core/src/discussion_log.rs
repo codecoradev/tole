@@ -3,6 +3,15 @@
 //! folded from it. A crash mid-discussion resumes from the file; a line is
 //! never rewritten.
 //!
+//! Every provider call is paid for in two steps: [`DiscussionLog::reserve`]
+//! before the call counts its estimate against the budget (or, when it does
+//! not fit, records the budget escalation: a hard stop, never a silent end),
+//! and [`DiscussionLog::settle`] after it replaces the estimate with what was
+//! spent. A call a crash interrupted stays counted at its estimate, so a
+//! resumed discussion never spends more than its budget allows, and a
+//! finished step is never run again because the ledger's [`Next`] has moved
+//! past it.
+//!
 //! The log is also the state machine's referee. Each step is checked against
 //! [`Next`], what the log says must happen now: a contribution only from a
 //! participant who has not spoken this round, a summary only once everyone has,
@@ -12,15 +21,26 @@
 //! discussion.
 
 use crate::discussion::{
-    gate, is_small, Contract, Contribution, CriterionVerdict, Gate, GateInput, Reason, RoundSummary,
+    gate, is_small, Contract, Contribution, CriterionVerdict, Gate, GateInput, Reason,
+    RoundSummary, MAX_FALLBACK_REASON_CHARS,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-/// Largest log read back.
+/// Largest log read back or written: the per-discussion cap.
 pub const MAX_LOG_BYTES: u64 = 16 * 1024 * 1024;
+/// Largest single record (one line).
+pub const MAX_RECORD_BYTES: usize = 512 * 1024;
+/// Room kept at the end of a full log for the gate and the closing record,
+/// so a discussion can always be stopped and closed.
+pub const CLOSE_RESERVE: u64 = 128 * 1024;
+/// Longest closing text kept, in characters.
+pub const MAX_CLOSE_CHARS: usize = 16_000;
+/// Longest call kind (`what`) and handle of a reservation.
+pub const MAX_WHAT_CHARS: usize = 64;
+pub const MAX_HANDLE_CHARS: usize = 128;
 /// The discussions directory in the tole data dir.
 pub const DISCUSSIONS_DIR: &str = "discussions";
 
@@ -43,6 +63,27 @@ pub enum Event {
     /// Tokens the discussion spent (any role).
     Usage {
         round: u32,
+        tokens: u64,
+    },
+    /// A provider call about to run in `round`, counted at its estimate
+    /// until settled. `what` says which call (`participant-<name>`,
+    /// `scribe`, `checker`).
+    Reserve {
+        round: u32,
+        call: String,
+        what: String,
+        tokens: u64,
+    },
+    /// The host's handle of a reserved call that runs elsewhere (a
+    /// delegated child's node), so a resumed host polls it instead of
+    /// starting it again.
+    Bind {
+        call: String,
+        handle: String,
+    },
+    /// What a reserved call spent; it replaces the estimate.
+    Settle {
+        call: String,
         tokens: u64,
     },
     /// What the host saw after `round` that only it can see.
@@ -102,6 +143,26 @@ pub enum Next {
     Done,
 }
 
+/// A reserved call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reservation {
+    pub round: u32,
+    pub what: String,
+    pub tokens: u64,
+    pub handle: Option<String>,
+    pub settled: Option<u64>,
+}
+
+/// The answer to [`DiscussionLog::reserve`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reserve {
+    /// Reserved under this call id: run the call, then settle it.
+    Go(String),
+    /// It did not fit what is left: the gate's escalation is recorded and
+    /// the discussion goes to [`Next::Finish`].
+    Stop(Gate),
+}
+
 /// The folded log.
 #[derive(Debug, Clone, Default)]
 pub struct State {
@@ -110,7 +171,9 @@ pub struct State {
     pub contributions: Vec<Contribution>,
     pub summaries: BTreeMap<u32, RoundSummary>,
     pub verdicts: BTreeMap<u32, Vec<CriterionVerdict>>,
+    /// Settled spend, plus every unsettled reservation at its estimate.
     pub tokens_used: u64,
+    pub reservations: BTreeMap<String, Reservation>,
     flags: BTreeMap<u32, (bool, bool)>,
     pub gates: BTreeMap<u32, Gate>,
     pub closed: Option<(Gate, String)>,
@@ -145,6 +208,40 @@ impl State {
             }
             Event::Usage { tokens, .. } => {
                 self.tokens_used = self.tokens_used.saturating_add(tokens)
+            }
+            Event::Reserve {
+                round,
+                call,
+                what,
+                tokens,
+            } => {
+                self.tokens_used = self.tokens_used.saturating_add(tokens);
+                self.reservations.insert(
+                    call,
+                    Reservation {
+                        round,
+                        what,
+                        tokens,
+                        handle: None,
+                        settled: None,
+                    },
+                );
+            }
+            Event::Bind { call, handle } => {
+                if let Some(r) = self.reservations.get_mut(&call) {
+                    r.handle = Some(handle);
+                }
+            }
+            Event::Settle { call, tokens } => {
+                if let Some(r) = self.reservations.get_mut(&call) {
+                    if r.settled.is_none() {
+                        self.tokens_used = self
+                            .tokens_used
+                            .saturating_sub(r.tokens)
+                            .saturating_add(tokens);
+                        r.settled = Some(tokens);
+                    }
+                }
             }
             Event::Flags {
                 round,
@@ -208,6 +305,27 @@ impl State {
             .unwrap_or(1)
     }
 
+    /// The newest unsettled call of kind `what` in `round`, with its handle:
+    /// what a resumed host finds of a call a crash interrupted.
+    pub fn open_call(&self, round: u32, what: &str) -> Option<(String, Option<String>)> {
+        self.reservations
+            .iter()
+            .filter(|(_, r)| r.round == round && r.what == what && r.settled.is_none())
+            .max_by_key(|(id, _)| id.get(1..).and_then(|n| n.parse::<u64>().ok()))
+            .map(|(id, r)| (id.clone(), r.handle.clone()))
+    }
+
+    /// The round a call may be reserved for: the one being worked on.
+    fn open_round(&self) -> Option<u32> {
+        match self.next() {
+            Next::Contribute { round, .. }
+            | Next::Summarize { round, .. }
+            | Next::Check { round }
+            | Next::Decide { round } => Some(round),
+            Next::NeedContract | Next::Finish { .. } | Next::Done => None,
+        }
+    }
+
     /// Rounds in a row, ending at the latest summarized one, whose digest
     /// added nothing.
     pub fn stalled_rounds(&self) -> u32 {
@@ -244,6 +362,13 @@ impl State {
         }
         if self.contract.is_none() {
             return Next::NeedContract;
+        }
+        // A stop recorded mid-round (a call that did not fit the budget)
+        // ends the discussion wherever it was.
+        if let Some((_, g)) = self.gates.iter().next_back() {
+            if *g != Gate::Continue {
+                return Next::Finish { outcome: *g };
+            }
         }
         let round = self.current_round();
         let spoke: BTreeSet<&str> = self
@@ -313,33 +438,34 @@ impl DiscussionLog {
         }
         let mut name = self.path.as_os_str().to_owned();
         name.push(".lock");
-        let f = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&name)
-            .map_err(|e| format!("{}: {e}", std::path::Path::new(&name).display()))?;
+        let f = nofollow(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true),
+        )
+        .open(&name)
+        .map_err(|e| format!("{}: {e}", std::path::Path::new(&name).display()))?;
         f.lock()
             .map_err(|e| format!("{}: {e}", std::path::Path::new(&name).display()))?;
         Ok(f)
     }
 
     fn events(&self) -> Result<Vec<Event>, String> {
-        let meta = match std::fs::metadata(&self.path) {
-            Ok(m) => m,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(format!("{}: {e}", self.path.display())),
+        // Never through a symlink, never blocking on a FIFO, never past the
+        // cap, checked on the opened file.
+        let bytes = match crate::delegation_report::read_plain_file(&self.path, MAX_LOG_BYTES) {
+            Ok(Some(b)) => b,
+            Ok(None) => return Ok(Vec::new()),
+            Err(e) => {
+                return Err(format!(
+                    "{}: {e} (the cap is {MAX_LOG_BYTES} bytes, over it is refused)",
+                    self.path.display()
+                ))
+            }
         };
-        if meta.len() > MAX_LOG_BYTES {
-            return Err(format!(
-                "{}: over {MAX_LOG_BYTES} bytes",
-                self.path.display()
-            ));
-        }
         // Bytes, then lossy: a crash can tear the last line inside a
         // multi-byte character, which must not make the whole file unreadable.
-        let bytes =
-            std::fs::read(&self.path).map_err(|e| format!("{}: {e}", self.path.display()))?;
         let text = String::from_utf8_lossy(&bytes);
         let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
         let mut out = Vec::new();
@@ -371,16 +497,41 @@ impl DiscussionLog {
             std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         }
         let seq = st.last_seq + 1;
+        // Only the stop and the end may use the room kept for them.
+        let ending = matches!(event, Event::Gate { .. } | Event::Closed { .. });
         let mut line =
             serde_json::to_string(&Line { seq, t: now, event }).map_err(|e| e.to_string())?;
         line.push('\n');
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(&self.path)
-            .map_err(|e| format!("{}: {e}", self.path.display()))?;
+        if line.len() > MAX_RECORD_BYTES {
+            return Err(format!(
+                "a discussion record is {} bytes, over the {MAX_RECORD_BYTES}-byte cap; nothing was written",
+                line.len()
+            ));
+        }
+        let mut f = nofollow(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .append(true),
+        )
+        .open(&self.path)
+        .map_err(|e| format!("{}: {e}", self.path.display()))?;
+        if !f.metadata().map_err(|e| e.to_string())?.is_file() {
+            return Err(format!("{}: not a regular file", self.path.display()));
+        }
         self.drop_torn_tail(&f)?;
+        let len = f.metadata().map_err(|e| e.to_string())?.len();
+        let room = if ending {
+            MAX_LOG_BYTES
+        } else {
+            MAX_LOG_BYTES - CLOSE_RESERVE
+        };
+        if len.saturating_add(line.len() as u64) > room {
+            return Err(format!(
+                "{}: the discussion log is full ({len} of {MAX_LOG_BYTES} bytes); stop and close it",
+                self.path.display()
+            ));
+        }
         f.write_all(line.as_bytes())
             .map_err(|e| format!("{}: {e}", self.path.display()))?;
         Ok(seq)
@@ -410,6 +561,97 @@ impl DiscussionLog {
         f.read_to_end(&mut all).map_err(err)?;
         let keep = all.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
         f.set_len(keep as u64).map_err(err)
+    }
+
+    /// Reserve `tokens` for a provider call of kind `what` (a short id such
+    /// as `participant-<name>`, `scribe` or `checker`) in the round being
+    /// worked on, before the call runs. When it does not fit what is left of
+    /// the budget, nothing is reserved and the budget escalation is recorded
+    /// instead ([`Reserve::Stop`]).
+    pub fn reserve(
+        &self,
+        round: u32,
+        what: &str,
+        tokens: u64,
+        now: u64,
+    ) -> Result<Reserve, String> {
+        if !short_id(what, MAX_WHAT_CHARS, false) {
+            return Err(format!(
+                "call kind {what:?}: a short id of a-z, 0-9 and '-'"
+            ));
+        }
+        let _guard = self.lock()?;
+        let st = self.state()?;
+        let next = st.next();
+        if st.open_round() != Some(round) {
+            return Err(Self::refuse(&next, &format!("a call in round {round}")));
+        }
+        let c = st.contract.as_ref().ok_or("no contract")?;
+        if st.tokens_used.saturating_add(tokens) > c.budget_tokens {
+            let outcome = Gate::Escalate(Reason::Budget);
+            self.append(&st, Event::Gate { round, outcome }, now)?;
+            return Ok(Reserve::Stop(outcome));
+        }
+        let call = format!("c{}", st.last_seq + 1);
+        self.append(
+            &st,
+            Event::Reserve {
+                round,
+                call: call.clone(),
+                what: what.to_string(),
+                tokens,
+            },
+            now,
+        )?;
+        Ok(Reserve::Go(call))
+    }
+
+    /// Record the handle of a reserved call that runs elsewhere, once.
+    pub fn bind(&self, call: &str, handle: &str, now: u64) -> Result<(), String> {
+        if !short_id(handle, MAX_HANDLE_CHARS, true) {
+            return Err(format!(
+                "handle {handle:?}: a short id of letters, digits, '.', '_' and '-'"
+            ));
+        }
+        let _guard = self.lock()?;
+        let st = self.state()?;
+        match st.reservations.get(call) {
+            Some(r) if r.settled.is_none() && r.handle.is_none() => {}
+            Some(_) => return Err(format!("call {call} is settled or already bound")),
+            None => return Err(format!("no reserved call {call}")),
+        }
+        self.append(
+            &st,
+            Event::Bind {
+                call: call.to_string(),
+                handle: handle.to_string(),
+            },
+            now,
+        )
+        .map(|_| ())
+    }
+
+    /// Record what a reserved call spent, once; it replaces the estimate.
+    pub fn settle(&self, call: &str, tokens: u64, now: u64) -> Result<(), String> {
+        let _guard = self.lock()?;
+        let st = self.state()?;
+        if st.closed.is_some() {
+            return Err("the discussion is closed".into());
+        }
+        match st.reservations.get(call) {
+            Some(r) if r.settled.is_none() => {}
+            Some(_) => return Err(format!("call {call} is already settled")),
+            None => return Err(format!("no reserved call {call}")),
+        }
+        self.append(
+            &st,
+            Event::Settle {
+                call: call.to_string(),
+                tokens,
+            },
+            now,
+        )
+        .map(|_| ())
     }
 
     fn refuse(next: &Next, what: &str) -> String {
@@ -519,6 +761,21 @@ impl DiscussionLog {
                 let got: BTreeSet<String> = contributions.iter().map(|c| c.entry.clone()).collect();
                 if got != known || !is_small(&st.round_contributions(round)) {
                     return Err("a verbatim summary holds exactly the round's contributions, and only a small round is passed on".into());
+                }
+            }
+            RoundSummary::Fallback {
+                contributions,
+                reason,
+                ..
+            } => {
+                let got: BTreeSet<String> = contributions.iter().map(|c| c.entry.clone()).collect();
+                if got != known || is_small(&st.round_contributions(round)) {
+                    return Err("a fallback holds exactly the round's contributions, and only a big round (one the scribe digests) has one".into());
+                }
+                if reason.chars().count() > MAX_FALLBACK_REASON_CHARS {
+                    return Err(format!(
+                        "a fallback's reason is over {MAX_FALLBACK_REASON_CHARS} characters"
+                    ));
                 }
             }
             RoundSummary::Digest(d) => {
@@ -632,16 +889,41 @@ impl DiscussionLog {
         let Next::Finish { outcome } = next else {
             return Err(Self::refuse(&next, "closing"));
         };
-        self.append(
-            &st,
-            Event::Closed {
-                outcome,
-                text: text.to_string(),
-            },
-            now,
-        )?;
+        let text = if text.chars().count() > MAX_CLOSE_CHARS {
+            let mut t: String = text.chars().take(MAX_CLOSE_CHARS - 1).collect();
+            t.push('\u{2026}');
+            t
+        } else {
+            text.to_string()
+        };
+        self.append(&st, Event::Closed { outcome, text }, now)?;
         Ok(outcome)
     }
+}
+
+/// Opens never follow a symlink at the last component (the log and its
+/// lock are host files, but a refused symlink costs nothing).
+fn nofollow(o: &mut std::fs::OpenOptions) -> &mut std::fs::OpenOptions {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    o
+}
+
+/// A call kind (`a-z 0-9 -`) or, with `handle`, a handle (letters, digits,
+/// `.`, `_`, `-`): short, never starting with `-` or `.`.
+fn short_id(s: &str, max: usize, handle: bool) -> bool {
+    !s.is_empty()
+        && s.len() <= max
+        && !s.starts_with(['-', '.'])
+        && s.bytes().all(|b| {
+            b.is_ascii_lowercase()
+                || b.is_ascii_digit()
+                || b == b'-'
+                || (handle && (b.is_ascii_uppercase() || b == b'.' || b == b'_'))
+        })
 }
 
 /// Why a closed discussion was handed back, for display.

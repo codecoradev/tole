@@ -532,3 +532,194 @@ fn a_log_that_is_only_a_torn_line_restarts_clean() {
         }
     );
 }
+
+fn go(r: Reserve) -> String {
+    match r {
+        Reserve::Go(call) => call,
+        Reserve::Stop(g) => panic!("expected a reservation, got {g:?}"),
+    }
+}
+
+#[test]
+fn a_call_is_reserved_before_it_runs_and_settled_after() {
+    let l = log("reserve");
+    l.start(contract(None, 10_000), 1).unwrap();
+    let call = go(l.reserve(1, "participant-coder", 3_000, 2).unwrap());
+    let st = l.state().unwrap();
+    assert_eq!(st.tokens_used, 3_000, "a reservation counts until settled");
+    assert_eq!(
+        st.open_call(1, "participant-coder"),
+        Some((call.clone(), None))
+    );
+    l.bind(&call, "node-7", 3).unwrap();
+    assert!(l.bind(&call, "node-8", 3).is_err(), "bound once");
+    assert_eq!(
+        l.state().unwrap().open_call(1, "participant-coder"),
+        Some((call.clone(), Some("node-7".into())))
+    );
+    l.settle(&call, 1_200, 4).unwrap();
+    let st = l.state().unwrap();
+    assert_eq!(st.tokens_used, 1_200, "settled at what it spent");
+    assert_eq!(st.open_call(1, "participant-coder"), None);
+    assert!(l.settle(&call, 5, 5).is_err(), "settled once");
+    assert!(l.settle("c999", 5, 5).is_err(), "unknown call");
+    assert!(
+        l.bind(&call, "late", 5).is_err(),
+        "a settled call takes no handle"
+    );
+    // A spend above the reservation is recorded as spent.
+    let c2 = go(l.reserve(1, "participant-ops", 100, 6).unwrap());
+    l.settle(&c2, 400, 7).unwrap();
+    assert_eq!(l.state().unwrap().tokens_used, 1_600);
+    // What a call is and its handle are short ids, never free text.
+    assert!(l.reserve(1, "has space", 1, 8).is_err());
+    assert!(l.reserve(1, &"x".repeat(65), 1, 8).is_err());
+    let c3 = go(l.reserve(1, "scribe", 1, 8).unwrap());
+    assert!(l.bind(&c3, "../evil", 9).is_err());
+}
+
+#[test]
+fn a_call_that_does_not_fit_stops_the_discussion_with_an_escalation() {
+    let l = log("halt");
+    l.start(contract(None, 1_000), 1).unwrap();
+    l.contribute(1, "coder", "first", 2).unwrap();
+    // Mid-round: the next call does not fit what is left.
+    let r = l.reserve(1, "participant-ops", 1_001, 3).unwrap();
+    assert_eq!(r, Reserve::Stop(Gate::Escalate(Reason::Budget)));
+    let st = l.state().unwrap();
+    assert_eq!(
+        st.next(),
+        Next::Finish {
+            outcome: Gate::Escalate(Reason::Budget)
+        },
+        "a hard stop, never a silent end"
+    );
+    assert_eq!(st.tokens_used, 0, "nothing was reserved");
+    assert!(l.contribute(1, "ops", "too late", 4).is_err());
+    assert!(l.reserve(1, "participant-ops", 1, 4).is_err());
+    assert_eq!(
+        l.close("budget spent", 5).unwrap(),
+        Gate::Escalate(Reason::Budget)
+    );
+    assert_eq!(l.state().unwrap().next(), Next::Done);
+}
+
+#[test]
+fn a_reservation_is_only_for_the_round_in_progress() {
+    let l = log("reserveround");
+    assert!(l.reserve(1, "scribe", 1, 1).is_err(), "no contract yet");
+    l.start(contract(Some(1), 10_000), 1).unwrap();
+    assert!(l.reserve(2, "scribe", 1, 2).is_err());
+    assert!(l.reserve(0, "scribe", 1, 2).is_err());
+    play_round(&l, 1, false, 3);
+    go(l.reserve(1, "checker", 1, 4).unwrap());
+    // Round 1 of 1: the gate escalates and nothing more can be reserved.
+    assert_eq!(l.decide(1, 5).unwrap(), Gate::Escalate(Reason::MaxRounds));
+    assert!(l.reserve(2, "participant-coder", 1, 6).is_err());
+    assert!(l.reserve(1, "participant-coder", 1, 6).is_err());
+}
+
+#[test]
+fn an_unsettled_reservation_survives_a_crash_and_stays_counted() {
+    let l = log("reservecrash");
+    l.start(contract(None, 10_000), 1).unwrap();
+    let call = go(l.reserve(1, "participant-coder", 2_500, 2).unwrap());
+    // The process died during the call: a restarted one sees it open, and
+    // counts it whole, since the provider may have charged it.
+    let again = DiscussionLog::at(l.path.parent().unwrap(), "pick-db").unwrap();
+    let st = again.state().unwrap();
+    assert_eq!(st.tokens_used, 2_500);
+    assert_eq!(st.open_call(1, "participant-coder"), Some((call, None)));
+    // Retried with a fresh reservation, the old one stays counted.
+    let retry = go(again.reserve(1, "participant-coder", 2_500, 3).unwrap());
+    again.settle(&retry, 900, 4).unwrap();
+    again.contribute(1, "coder", "after the crash", 5).unwrap();
+    assert_eq!(again.state().unwrap().tokens_used, 3_400);
+}
+
+#[test]
+fn a_refused_digest_falls_back_to_the_round_as_written() {
+    let fb = |cs: Vec<Contribution>, reason: &str| RoundSummary::Fallback {
+        round: 1,
+        contributions: cs,
+        reason: reason.into(),
+    };
+    let l = log("fallback");
+    l.start(contract(None, 10_000), 1).unwrap();
+    let big = "y".repeat(crate::discussion::VERBATIM_ROUND_CHARS);
+    let a = l.contribute(1, "coder", &big, 2).unwrap();
+    let b = l.contribute(1, "ops", "short", 2).unwrap();
+    assert!(l.summarize(fb(vec![a.clone()], "bad json"), 3).is_err());
+    assert!(l
+        .summarize(fb(vec![a.clone(), b.clone()], &"r".repeat(301)), 3)
+        .is_err());
+    l.summarize(fb(vec![a, b], "the digest drops ops"), 3)
+        .unwrap();
+    let st = l.state().unwrap();
+    assert_eq!(st.next(), Next::Check { round: 1 });
+    assert!(!st.summaries[&1].delta_empty(), "a fallback never stalls");
+    // A small round has no fallback: it is passed on as written anyway.
+    let l = log("fallbacksmall");
+    l.start(contract(None, 10_000), 1).unwrap();
+    let a = l.contribute(1, "coder", "a", 2).unwrap();
+    let b = l.contribute(1, "ops", "b", 2).unwrap();
+    assert!(l.summarize(fb(vec![a, b], "x"), 3).is_err());
+}
+
+#[test]
+fn records_and_the_log_are_capped() {
+    let l = log("caps");
+    l.start(contract(None, 100_000), 1).unwrap();
+    let huge = "z".repeat(MAX_RECORD_BYTES);
+    let e = l.contribute(1, "coder", &huge, 2).unwrap_err();
+    assert!(e.contains("record"), "{e}");
+    assert_eq!(
+        l.state().unwrap().next(),
+        Next::Contribute {
+            round: 1,
+            missing: strs(&["coder", "ops"])
+        },
+        "nothing was written"
+    );
+    // A log near its cap takes no more steps, but keeps room to stop and
+    // close.
+    let mut text = std::fs::read_to_string(&l.path).unwrap();
+    let pad = MAX_LOG_BYTES as usize - text.len() - CLOSE_RESERVE as usize;
+    text.push_str(&" ".repeat(pad - 2));
+    text.push('\n');
+    std::fs::write(&l.path, text).unwrap();
+    let e = l.contribute(1, "coder", "one more", 3).unwrap_err();
+    assert!(e.contains("full"), "{e}");
+    assert_eq!(
+        l.reserve(1, "participant-coder", 200_000, 4).unwrap(),
+        Reserve::Stop(Gate::Escalate(Reason::Budget))
+    );
+    l.close(&"c".repeat(MAX_CLOSE_CHARS * 2), 5).unwrap();
+    let st = l.state().unwrap();
+    assert_eq!(
+        st.closed.as_ref().unwrap().1.chars().count(),
+        MAX_CLOSE_CHARS,
+        "the closing text is capped"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_log_reached_through_a_symlink_is_refused() {
+    let d = dir("symlink");
+    let target = d.join("elsewhere.jsonl");
+    let l = DiscussionLog::at(&d, "pick-db").unwrap();
+    l.start(contract(None, 10_000), 1).unwrap();
+    std::fs::rename(&l.path, &target).unwrap();
+    std::os::unix::fs::symlink(&target, &l.path).unwrap();
+    assert!(l.state().is_err(), "read");
+    assert!(l.contribute(1, "coder", "x", 2).is_err(), "append");
+    let after = std::fs::read_to_string(&target).unwrap();
+    assert_eq!(after.lines().count(), 1, "the target was not written");
+    // Nor is the lock taken through one.
+    let d = dir("symlink-lock");
+    let l = DiscussionLog::at(&d, "pick-db").unwrap();
+    std::os::unix::fs::symlink(&target, d.join("pick-db.jsonl.lock")).unwrap();
+    assert!(l.start(contract(None, 10_000), 1).is_err(), "lock");
+    assert_eq!(l.state().unwrap().next(), Next::NeedContract);
+}
