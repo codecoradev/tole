@@ -61,3 +61,22 @@ observation: it exists to catch complexity regressions (an O(n²) fold of
 `aarch64-linux-android` (ubuntu + NDK) compile-checks per PR (`cross-compile`
 job) since #82. The `aarch64-apple-ios` (macos-14) check is commented out in
 `ci.yml` until an Apple runner is available to this repository.
+
+## Binary size and dependencies
+
+Reported, not gated. Release build of `tole` (`cargo build --release -p
+tole-cli`, Linux x86_64), unique crates from `cargo tree -e normal --prefix
+none | sort -u | wc -l`.
+
+| Build (2026-11-13) | `tole` bytes | tole-cli crates | tole-core crates (`--no-default-features`) |
+|---|---|---|---|
+| develop before #625 | 18,184,632 | 264 | 58 |
+| #625, without `web-builtin` | 18,185,208 | 264 | 58 |
+| #625, default (`web-builtin`) | 19,482,712 (+1,297,504, +7.1%) | 299 (30 distinct new crates; 4 build-time proc-macros) | 58 |
+
+The crate counts were measured again after develop moved on (the #588
+discussion ledger landed) and did not change. The `web-builtin` delta is
+nginjen-lite and its `scraper` HTML stack
+(html5ever, cssparser, selectors, phf, string_cache, tendril and helpers).
+A slim build turns it off with `--no-default-features --features
+shell-tools,mcp,mcp-http,tui`.

@@ -23,13 +23,17 @@ path = "src/main.rs"
 # crates.io install must expose every documented face (#163 follow-up,
 # 2026-10-05); embedders use tole-core directly with their own feature
 # choices and are unaffected by this crate's defaults.
-default = ["shell-tools", "mcp", "mcp-http", "tui"]
+default = ["shell-tools", "mcp", "mcp-http", "tui", "web-builtin"]
 shell-tools = ["tole-core/shell-tools"]
 # Interactive terminal UI (#459): bare `tole` on a TTY. Off = plain help as before.
 tui = ["dep:tole-tui"]
 mcp = ["tole-core/mcp"]
 # MCP-over-HTTP host (#137): rmcp streamable-http server + hyper serving.
 mcp-http = ["mcp", "shell-tools", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:tower-service", "dep:rmcp", "dep:http", "tole-core/mcp-http"]
+# Built-in web search and fetch (#625) over nginjen-lite: keyless engines,
+# robots.txt and HTML converters. Off = today's tools: the direct text
+# fetcher, and search only with a configured backend.
+web-builtin = ["dep:nginjen-lite", "dep:url"]
 # Offline trace replay scorer (issue #107/#118): eval-only bin, NOT in
 # the default build. `cargo install tole-cli` and plain `cargo build`
 # never produce it; eval sessions opt in explicitly:
@@ -58,6 +62,14 @@ http = { version = "1", optional = true }
 # linear in pattern and input (no backtracking); patterns and inputs are
 # capped in `hook_filter`. Serve side only: tole-core does not use it.
 regex-lite = "0.1"
+# Built-in web search and fetch (#625, the `web-builtin` feature): keyless
+# engines and HTML converters, no async runtime and no HTTP stack of its own
+# (tole's ureq client is plugged in through its `HttpClient` trait). `robots`
+# adds robots.txt support at no crate cost; `pdf`, `readability` and `ureq`
+# stay off.
+nginjen-lite = { version = "0.1.0", features = ["robots"], optional = true }
+# Already in the tree through nginjen-lite; named for its link resolver.
+url = { version = "2", optional = true }
 
 # Offline trace replay scorer (issue #107, gated behind the `replay`
 # feature since #118). Lives under evals/ and is operator-built for
