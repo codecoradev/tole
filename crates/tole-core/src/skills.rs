@@ -318,6 +318,8 @@ pub struct LoadSkillTool {
     pub workspace: Option<PathBuf>,
     /// What it may load (default: every skill on disk).
     pub gate: Gate,
+    /// Where each successful load is counted (#593); `None` = not counted.
+    pub usage: Option<crate::skill_curator::UsageLedger>,
 }
 
 impl LoadSkillTool {
@@ -325,7 +327,15 @@ impl LoadSkillTool {
         Self {
             workspace,
             gate: Gate::Open,
+            usage: None,
         }
+    }
+
+    /// Count each successful load in `ledger` (best effort: a ledger that
+    /// cannot be written never fails a load).
+    pub fn with_usage(mut self, ledger: Option<crate::skill_curator::UsageLedger>) -> Self {
+        self.usage = ledger;
+        self
     }
 
     /// Load only what `gate` allows.
@@ -372,6 +382,17 @@ impl crate::tool::Tool for LoadSkillTool {
             .gate
             .load(self.workspace.as_deref(), name)
             .map_err(|e| e.to_string())?;
+        if let Some(ledger) = &self.usage {
+            let t = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let _ = ledger.append(&crate::skill_curator::UsageRecord {
+                t,
+                skill: Some(skill.name.clone()),
+                kind: crate::skill_curator::UsageKind::Loaded,
+            });
+        }
         Ok(json!({
             "name": skill.name,
             "description": skill.description,
@@ -394,6 +415,26 @@ mod tests {
             format!("---\nname: {fm_name}\ndescription: \"{desc}\"\n---\n{body}"),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn a_successful_load_is_counted_and_a_failed_one_is_not() {
+        let dir = std::env::temp_dir().join(format!("tole-load-usage-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        write_skill(&dir, "demo", "demo", "d", "body");
+        let ledger = crate::skill_curator::UsageLedger::new(dir.join("usage.jsonl"));
+        let tool = LoadSkillTool::new(Some(dir.clone())).with_usage(Some(ledger.clone()));
+        assert!(tool.execute(json!({"name": "missing"})).is_err());
+        assert!(ledger.summary().skills.is_empty());
+        tool.execute(json!({"name": "demo"})).unwrap();
+        tool.execute(json!({"name": "demo"})).unwrap();
+        let u = &ledger.summary().skills["demo"];
+        assert_eq!((u.loaded, u.recalled), (2, 0));
+        assert!(u.last_used > 0);
+        // Without a ledger nothing is written and nothing fails.
+        assert!(LoadSkillTool::new(Some(dir))
+            .execute(json!({"name": "demo"}))
+            .is_ok());
     }
 
     #[test]

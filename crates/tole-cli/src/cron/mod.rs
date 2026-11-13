@@ -304,6 +304,21 @@ pub fn default_timezone() -> Option<String> {
     cron_config()?.timezone
 }
 
+/// The skill names the live jobs run with (`--skill NAME`): the curator
+/// never archives one of them (#593). A file entry (a path or `.md`) names no
+/// library skill. An unreadable store counts as none.
+pub fn skill_names(dir: &Path) -> std::collections::BTreeSet<String> {
+    let Ok(l) = store::open_read(dir) else {
+        return Default::default();
+    };
+    l.state()
+        .jobs()
+        .filter(|j| !j.job.removed)
+        .flat_map(|j| setup::list(&j.job, "skills"))
+        .filter(|e| !e.contains('/') && !e.ends_with(".md"))
+        .collect()
+}
+
 /// A host-owned string field of a job.
 pub fn field<'a>(job: &'a Job, key: &str) -> Option<&'a str> {
     job.extra.get(key).and_then(Value::as_str)

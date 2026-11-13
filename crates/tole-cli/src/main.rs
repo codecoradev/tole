@@ -364,6 +364,14 @@ enum Command {
         #[command(subcommand)]
         action: tole_cli::skill_approve::SkillsAction,
     },
+    /// Keep the skill library small (#593): what the curator manages, the
+    /// sweep that archives skills unused past the thresholds (`run
+    /// --dry-run` to look first), restore, pin, lock, adopt, pause. It
+    /// never edits a skill's text.
+    Curator {
+        #[command(subcommand)]
+        action: tole_cli::curator_cmd::CuratorAction,
+    },
     /// The plugin lock of your MCP servers (#599): list their state, diff a
     /// changed server, approve or revoke one. Never starts a session.
     #[cfg(feature = "mcp")]
@@ -707,6 +715,7 @@ fn gate_policy(cmd: &Command) -> GatePolicy {
         | Command::Setup { .. }
         | Command::Approvals { .. }
         | Command::Skills { .. }
+        | Command::Curator { .. }
         | Command::Audit { .. } => GatePolicy::Skip,
         #[cfg(feature = "shell-tools")]
         Command::Cron { .. } | Command::Hook { .. } => GatePolicy::Skip,
@@ -1242,6 +1251,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         #[cfg(feature = "shell-tools")]
         Command::Hook { action } => tole_cli::hook_cli::cli(action),
         Command::Skills { action } => tole_cli::skill_approve::cli(action),
+        Command::Curator { action } => tole_cli::curator_cmd::cli(action),
         #[cfg(feature = "mcp")]
         Command::Plugin { action } => {
             use std::io::IsTerminal;
