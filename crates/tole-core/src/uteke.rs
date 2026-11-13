@@ -185,9 +185,15 @@ impl Tool for UtekeDocumentTool {
             .and_then(Value::as_str)
             .map(str::to_string)
             .or_else(|| self.default_room.clone());
+        let under = input
+            .get("parent")
+            .and_then(Value::as_str)
+            .filter(|p| !p.trim().is_empty())
+            .map(|p| format!(" under {p}"))
+            .unwrap_or_default();
         match room {
-            Some(r) => format!("uteke doc create {slug} (linked to room {r})"),
-            None => format!("uteke doc create {slug} (unlinked)"),
+            Some(r) => format!("uteke doc create {slug}{under} (linked to room {r})"),
+            None => format!("uteke doc create {slug}{under} (unlinked)"),
         }
     }
 
@@ -202,7 +208,8 @@ impl Tool for UtekeDocumentTool {
                 // the tool silently drops is a spec lie (cora scan-3
                 // #33) — models waste turns filling dead fields.
                 "markdown": { "type": "string", "description": "Full markdown content of the document (title = first '# ' heading)" },
-                "room": { "type": "string", "description": "Optional room id to link the document into" }
+                "room": { "type": "string", "description": "Optional room id to link the document into" },
+                "parent": { "type": "string", "description": "Optional slug of an existing document to nest this one under (a tree up to 10 deep)" }
             },
             "required": ["slug", "markdown"]
         }))
@@ -221,6 +228,17 @@ impl Tool for UtekeDocumentTool {
         // as a flag by the CLI. Blocks argv flag injection.
         if slug.starts_with('-') || !slug.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
             return Err("slug must be [a-zA-Z0-9-] and not start with a hyphen".into());
+        }
+        // `parent` is a slug and is checked exactly like one: it reaches the
+        // argv as the value of `--parent`. A blank one means none.
+        let parent = input
+            .get("parent")
+            .and_then(Value::as_str)
+            .filter(|p| !p.trim().is_empty());
+        if let Some(p) = parent {
+            if p.starts_with('-') || !p.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+                return Err("parent must be [a-zA-Z0-9-] and not start with a hyphen".into());
+            }
         }
         let markdown = input
             .get("markdown")
@@ -252,11 +270,13 @@ impl Tool for UtekeDocumentTool {
         //    subprocess timeout every other invocation gets.
         let mut cmd = Command::new(&self.bin);
         crate::subprocess::scrub_env_for(&mut cmd, "uteke");
-        cmd.arg("doc")
-            .arg("create")
-            .arg(slug)
-            .arg("--file")
-            .arg("-");
+        cmd.arg("doc").arg("create").arg(slug);
+        if let Some(p) = parent {
+            // An unknown parent or a tree past 10 deep is uteke's error,
+            // surfaced unchanged below: no client-side guessing.
+            cmd.arg("--parent").arg(p);
+        }
+        cmd.arg("--file").arg("-");
         // #595: the document leaves the process (uteke cloud when
         // configured); a known secret value never does.
         let markdown = self.secrets.redact(markdown);
@@ -296,6 +316,7 @@ impl Tool for UtekeDocumentTool {
 
         Ok(json!({
             "slug": slug,
+            "parent": parent,
             "room": room,
             "linked": linked,
             "chars": markdown.chars().count(),
@@ -345,6 +366,100 @@ echo ok
             "# Notes\nkey: «TOLE_TEST_DOC_TOKEN»\n"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fake uteke that logs its argv, one call per line, and stdin.
+    #[cfg(unix)]
+    fn fake_uteke(tag: &str, exit: i32) -> (UtekeDocumentTool, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("tole-uteke-576-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("uteke");
+        let d = dir.display();
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\necho \"$*\" >> {d}/argv.log\ncat > /dev/null\n\
+                 [ {exit} -ne 0 ] && echo 'parent not found: nope' >&2\nexit {exit}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut t = UtekeDocumentTool::new(None);
+        t.bin = bin.display().to_string();
+        (t, dir)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn document_passes_parent_to_the_cli_only_when_given() {
+        let (t, dir) = fake_uteke("argv", 0);
+        t.execute(json!({"slug": "goal-1-r1", "markdown": "# r1", "parent": "goal-1"}))
+            .unwrap();
+        t.execute(json!({"slug": "plain", "markdown": "# p"}))
+            .unwrap();
+        t.execute(json!({"slug": "blank", "markdown": "# b", "parent": "  "}))
+            .unwrap();
+        let log = std::fs::read_to_string(dir.join("argv.log")).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(
+            lines,
+            [
+                "doc create goal-1-r1 --parent goal-1 --file -",
+                "doc create plain --file -",
+                "doc create blank --file -",
+            ]
+        );
+        let out = t
+            .execute(json!({"slug": "goal-2", "markdown": "# g", "parent": "goal-1"}))
+            .unwrap();
+        assert_eq!(out["parent"], "goal-1");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn document_rejects_a_bad_parent_before_any_spawn() {
+        let (t, dir) = fake_uteke("bad", 0);
+        for bad in ["--json", "-x", "has space", "a/b", "a_b", "ünï"] {
+            let err = t
+                .execute(json!({"slug": "ok", "markdown": "# x", "parent": bad}))
+                .unwrap_err();
+            assert!(err.contains("parent must be"), "{bad}: {err}");
+        }
+        assert!(!dir.join("argv.log").exists(), "nothing was spawned");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn document_surfaces_the_cli_error_for_an_unknown_parent_unchanged() {
+        let (t, dir) = fake_uteke("unknown", 2);
+        let err = t
+            .execute(json!({"slug": "child", "markdown": "# c", "parent": "nope"}))
+            .unwrap_err();
+        assert!(err.contains("parent not found: nope"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn document_describe_shows_the_parent_and_the_spec_offers_it() {
+        let t = UtekeDocumentTool::new(Some("ops".into()));
+        assert_eq!(
+            t.describe(&json!({"slug": "goal-1-r1", "parent": "goal-1"})),
+            "uteke doc create goal-1-r1 under goal-1 (linked to room ops)"
+        );
+        let t = UtekeDocumentTool::new(None);
+        assert_eq!(
+            t.describe(&json!({"slug": "x", "parent": "p"})),
+            "uteke doc create x under p (unlinked)"
+        );
+        assert_eq!(
+            t.describe(&json!({"slug": "x", "parent": " "})),
+            "uteke doc create x (unlinked)"
+        );
+        assert!(t.spec().unwrap()["properties"]["parent"].is_object());
     }
 
     #[test]

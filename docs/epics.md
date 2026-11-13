@@ -299,7 +299,7 @@ Bot and Nakama; BMAD for collaboration). Design notes:
     `consult_advisor` in missions, delegated children and cron runs are in;
     done);
   - multi-round discussion with a sanitizer (#588);
-  - `uteke_document` parent (#576).
+  - `uteke_document` parent (#576; done).
 - **E3 — Skills, epic #589:** `SkillIndex` + uteke doc adapter, K = 5 with
   pinned core (#590), approved-hash loading (#591), propose-only growth with
   meaning dedup (#592), curator on by default (#593). Status: #590's seam,
