@@ -52,6 +52,69 @@ pub const MAX_LEDGER_BYTES: u64 = 8 * 1024 * 1024;
 pub const MAX_STATE_BYTES: u64 = 256 * 1024;
 const DAY: u64 = 86_400;
 
+/// The skills this process's run loaded, so the run's outcome can be
+/// attributed to them when it ends. A CLI face runs one task per process;
+/// a server face never records outcomes, so the process-wide instance
+/// ([`RunTracker::global`]) is only read by `run` and `mission`.
+#[derive(Debug, Clone, Default)]
+pub struct RunTracker {
+    loaded: std::sync::Arc<std::sync::Mutex<BTreeSet<String>>>,
+}
+
+impl RunTracker {
+    /// The process-wide tracker.
+    pub fn global() -> &'static RunTracker {
+        static GLOBAL: std::sync::OnceLock<RunTracker> = std::sync::OnceLock::new();
+        GLOBAL.get_or_init(RunTracker::default)
+    }
+
+    /// Note that `skill` was loaded in this run.
+    pub fn note(&self, skill: &str) {
+        if let Ok(mut s) = self.loaded.lock() {
+            s.insert(skill.to_string());
+        }
+    }
+
+    /// The skills loaded so far, sorted.
+    pub fn loaded(&self) -> Vec<String> {
+        self.loaded
+            .lock()
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+}
+
+/// Record how a run ended: a success or failure line for each skill it
+/// loaded, or one baseline line (`skill: null`) when it loaded none. The
+/// baseline is what an underperforming skill is compared against.
+pub fn record_outcome(
+    ledger: &UsageLedger,
+    loaded: &[String],
+    ok: bool,
+    now: u64,
+) -> Result<(), String> {
+    let kind = if ok {
+        UsageKind::Success
+    } else {
+        UsageKind::Failure
+    };
+    if loaded.is_empty() {
+        return ledger.append(&UsageRecord {
+            t: now,
+            skill: None,
+            kind,
+        });
+    }
+    for name in loaded {
+        ledger.append(&UsageRecord {
+            t: now,
+            skill: Some(name.clone()),
+            kind,
+        })?;
+    }
+    Ok(())
+}
+
 /// What happened to a skill in a run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -120,6 +183,22 @@ impl UsageLedger {
     /// `$CODECORA_HOME/tole/skill-usage.jsonl`.
     pub fn default_ledger() -> Option<Self> {
         crate::paths::tole_data_dir().map(|d| Self::new(d.join(USAGE_FILE)))
+    }
+
+    /// The default ledger, only where the curator has something to manage
+    /// (see [`UsageLedger::curated_in`]).
+    pub fn default_if_curated() -> Option<Self> {
+        crate::paths::tole_data_dir().and_then(|d| Self::curated_in(&d))
+    }
+
+    /// The ledger in `data`, only when the user has something to curate: a
+    /// skill draft was made, or the curator has state (pinned, adopted,
+    /// paused). Nothing is recorded for a user with no agent-grown or adopted
+    /// skill, so a plain `tole run` leaves no file behind.
+    pub fn curated_in(data: &Path) -> Option<Self> {
+        let curated =
+            data.join(crate::skill_draft::DRAFTS_DIR).is_dir() || data.join(STATE_FILE).is_file();
+        curated.then(|| Self::new(data.join(USAGE_FILE)))
     }
 
     /// Append one record as one line, in one write.

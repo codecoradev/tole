@@ -383,6 +383,8 @@ impl crate::tool::Tool for LoadSkillTool {
             .load(self.workspace.as_deref(), name)
             .map_err(|e| e.to_string())?;
         if let Some(ledger) = &self.usage {
+            // The run's outcome is attributed to what it loaded (#593).
+            crate::skill_curator::RunTracker::global().note(&skill.name);
             let t = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())

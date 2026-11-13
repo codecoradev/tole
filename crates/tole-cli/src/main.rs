@@ -3452,6 +3452,8 @@ fn build_default_prompt(plan_mode: bool) -> String {
 /// Human-readable exit summary. Non-Final outcomes exit non-zero so
 /// scripts notice.
 fn report_outcome(session_id: &str, outcome: TurnOutcome) {
+    // How the run ended, for the skill curator (#593), before any exit below.
+    tole_cli::skill_outcome::record_turn(&outcome);
     match outcome {
         TurnOutcome::Final { text, .. } => {
             println!("{text}");

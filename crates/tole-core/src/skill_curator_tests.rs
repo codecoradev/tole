@@ -336,3 +336,50 @@ fn a_restore_whose_ledger_write_fails_is_undone_too() {
         "the ledger still says archived, and it is"
     );
 }
+
+#[test]
+fn a_run_outcome_goes_to_each_loaded_skill_or_to_the_baseline() {
+    let l = UsageLedger::new(tmp("outcome").join(USAGE_FILE));
+    let two = ["a".to_string(), "b".to_string()];
+    record_outcome(&l, &two, true, 10).unwrap();
+    record_outcome(&l, &two[..1], false, 20).unwrap();
+    record_outcome(&l, &[], true, 30).unwrap();
+    record_outcome(&l, &[], false, 40).unwrap();
+    let s = l.summary();
+    assert_eq!((s.skills["a"].success, s.skills["a"].failure), (1, 1));
+    assert_eq!((s.skills["b"].success, s.skills["b"].failure), (1, 0));
+    assert_eq!((s.baseline.success, s.baseline.failure), (1, 1));
+    assert_eq!(s.skills["a"].last_used, 20, "an outcome is use");
+}
+
+#[test]
+fn the_run_tracker_collects_each_loaded_skill_once_and_clones_share() {
+    let t = RunTracker::default();
+    let c = t.clone();
+    t.note("b");
+    c.note("a");
+    t.note("b");
+    assert_eq!(c.loaded(), ["a", "b"]);
+    assert!(RunTracker::default().loaded().is_empty());
+    // The global instance is one per process.
+    assert!(std::ptr::eq(RunTracker::global(), RunTracker::global()));
+}
+
+#[test]
+fn the_ledger_exists_only_for_a_user_with_something_to_curate() {
+    let data = tmp("curated");
+    assert!(UsageLedger::curated_in(&data).is_none(), "a plain user");
+    std::fs::create_dir_all(data.join(crate::skill_draft::DRAFTS_DIR)).unwrap();
+    let l = UsageLedger::curated_in(&data).expect("a user with a draft");
+    l.append(&rec(1, None, UsageKind::Success)).unwrap();
+    assert!(data.join(USAGE_FILE).is_file());
+    std::fs::remove_dir_all(data.join(crate::skill_draft::DRAFTS_DIR)).unwrap();
+    assert!(UsageLedger::curated_in(&data).is_none());
+    CuratorState::default()
+        .save(&data.join(STATE_FILE))
+        .unwrap();
+    assert!(
+        UsageLedger::curated_in(&data).is_some(),
+        "curator state counts"
+    );
+}

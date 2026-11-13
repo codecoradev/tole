@@ -554,6 +554,8 @@ pub fn run_mission(
             .map_err(|e| anyhow::anyhow!("writing mission summary: {e}"))?;
     }
     println!("mission: {session_id}");
+    // How the mission ended, for the skill curator (#593).
+    tole_cli::skill_outcome::record_mission(status);
     println!("status: {status}");
     println!(
         "turns: {turns}  steps: {}  verify failures: {verify_failures}  wall: {wall_secs}s",
