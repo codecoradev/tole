@@ -1270,6 +1270,200 @@ impl Tool for WebBackendFetchTool {
     }
 }
 
+/// The nginjen backend's base URL (#625): with [`NGINJEN_API_KEY_ENV`] set
+/// too, `web_search` and `web_fetch` use the full nginjen service.
+pub const NGINJEN_BASE_URL_ENV: &str = "NGINJEN_BASE_URL";
+/// The nginjen backend's API key, sent as a bearer token to that backend
+/// only; never printed (it is a secret-named variable, so the process
+/// `SecretSet` redacts it everywhere).
+pub const NGINJEN_API_KEY_ENV: &str = "NGINJEN_API_KEY";
+
+/// `(base_url, api_key)` when both nginjen variables are set (non-blank);
+/// `Ok(None)` otherwise. A base URL that is not http(s) is an error naming
+/// the variable, never the key.
+pub fn nginjen_backend(
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<Option<(String, String)>, String> {
+    let nonblank = |k: &str| {
+        env(k)
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    let (Some(base), Some(key)) = (
+        nonblank(NGINJEN_BASE_URL_ENV),
+        nonblank(NGINJEN_API_KEY_ENV),
+    ) else {
+        return Ok(None);
+    };
+    if !redirect_scheme_allowed(&base) {
+        return Err(format!("{NGINJEN_BASE_URL_ENV}: expected an http(s) URL"));
+    }
+    Ok(Some((base.trim_end_matches('/').to_string(), key)))
+}
+
+impl WebSearchTool {
+    /// `web_search` through the nginjen backend: `POST {base}/search` with
+    /// `{"query", "limit"}` and the key as a bearer token, answering
+    /// `{"results":[{title,url,snippet}]}` (the default contract).
+    pub fn nginjen(base: &str, api_key: &str) -> Self {
+        WebSearchTool {
+            backend: format!("{}/search", base.trim_end_matches('/')),
+            method: SearchMethod::Post,
+            headers: vec![("Authorization".into(), format!("Bearer {api_key}"))],
+            fields: SearchFields::default(),
+            secrets: SecretSet::default(),
+        }
+    }
+}
+
+/// `web_fetch` through the nginjen backend (#625): `POST {base}/scrape` with
+/// `{"url", "format"}` and the key as a bearer token.
+///
+/// - The target is vetted before anything leaves: http(s), no credentials,
+///   no known secret, a public host (`TOLE_WEB_ALLOW_PRIVATE=1` opts out).
+/// - A result the backend produced through its Jina Reader fallback
+///   (`"engine_used": "jina"`) is discarded: tole keeps Jina off.
+/// - Redirects from the backend are not followed; its envelope is bounded
+///   and the text capped like the other fetchers.
+pub struct NginjenFetchTool {
+    scrape: String,
+    api_key: String,
+    allow_private: bool,
+    secrets: SecretSet,
+}
+
+impl NginjenFetchTool {
+    pub fn new(base: &str, api_key: &str, allow_private: bool) -> Self {
+        NginjenFetchTool {
+            scrape: format!("{}/scrape", base.trim_end_matches('/')),
+            api_key: api_key.to_string(),
+            allow_private,
+            secrets: SecretSet::default(),
+        }
+    }
+
+    /// Refuse targets that carry any of these secrets (#595).
+    pub fn with_secrets(mut self, secrets: &SecretSet) -> Self {
+        self.secrets = secrets.clone();
+        self
+    }
+}
+
+impl Tool for NginjenFetchTool {
+    fn name(&self) -> &str {
+        "web_fetch"
+    }
+    fn risk(&self) -> Risk {
+        Risk::ReadOnly
+    }
+    fn summary(&self) -> String {
+        "Fetch an http(s) URL through the nginjen backend (it may render JavaScript-heavy pages) \
+         as markdown (default), compact text, plain text, raw HTML or a link list, size-capped. \
+         `compact` is shortest but drops the text of inline bold, italic and code and image alt \
+         text."
+            .into()
+    }
+    fn spec(&self) -> Option<Value> {
+        Some(json!({
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "http(s) URL to fetch"},
+                "format": {"type": "string",
+                    "enum": ["markdown", "compact", "text", "html", "links"],
+                    "description": "Output format (default markdown)"}
+            },
+            "required": ["url"]
+        }))
+    }
+    fn execute(&self, input: Value) -> Result<Value, String> {
+        let target = input["url"]
+            .as_str()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .ok_or("web_fetch: 'url' is required")?;
+        let format = input["format"].as_str().unwrap_or("markdown");
+        let wire = match format {
+            "markdown" => "markdown",
+            "compact" => "compact",
+            "text" => "content",
+            "html" => "rawHtml",
+            "links" => "links",
+            other => {
+                return Err(format!(
+                    "web_fetch: unknown format `{other}` (markdown, compact, text, html or links)"
+                ))
+            }
+        };
+        refuse_secret_url(&self.secrets, target)?;
+        if !redirect_scheme_allowed(target) {
+            return Err("web_fetch: only http(s) URLs".into());
+        }
+        let authority = target
+            .split_once("://")
+            .map(|(_, rest)| rest.split(['/', '?', '#']).next().unwrap_or(""))
+            .unwrap_or("");
+        if authority.contains('@') {
+            return Err("web_fetch: URLs with credentials are not fetchable".into());
+        }
+        host_is_public_opt(target, self.allow_private)?;
+        let mut res = agent()
+            .post(&self.scrape)
+            .header("Authorization", &format!("Bearer {}", self.api_key))
+            .send_json(json!({"url": target, "format": wire}))
+            .map_err(|e| {
+                format!(
+                    "web_fetch: nginjen backend: {}",
+                    self.secrets.redact(&e.to_string())
+                )
+            })?;
+        use std::io::Read;
+        let mut buf = Vec::new();
+        res.body_mut()
+            .as_reader()
+            .take((FETCH_CAP_BYTES * 2 + 1) as u64)
+            .read_to_end(&mut buf)
+            .map_err(|e| format!("web_fetch: nginjen backend read: {e}"))?;
+        if buf.len() > FETCH_CAP_BYTES * 2 {
+            return Err("web_fetch: nginjen backend response is too large".into());
+        }
+        let body: Value = serde_json::from_slice(&buf)
+            .map_err(|_| "web_fetch: nginjen backend returned non-JSON".to_string())?;
+        if body["engine_used"] == "jina" {
+            return Err(
+                "web_fetch: the nginjen backend answered through its Jina Reader fallback, which \
+                 tole keeps off; the result was discarded"
+                    .into(),
+            );
+        }
+        let content = body["content"]
+            .as_str()
+            .ok_or("web_fetch: nginjen backend response has no `content`")?;
+        let mut out = json!({
+            "url": target,
+            "content_type": "via nginjen backend",
+            "format": format,
+        });
+        if format == "links" {
+            let links: Vec<Value> = serde_json::from_str::<Vec<Value>>(content)
+                .unwrap_or_default()
+                .into_iter()
+                .take(200)
+                .map(|l| {
+                    json!({
+                        "url": cap_chars(l["url"].as_str().unwrap_or(""), 2_000),
+                        "text": cap_chars(l["text"].as_str().unwrap_or(""), 200),
+                    })
+                })
+                .collect();
+            out["links"] = json!(links);
+            return Ok(out);
+        }
+        out["truncated"] = json!(content.chars().count() > TEXT_CAP_CHARS);
+        out["text"] = json!(cap_chars(content, TEXT_CAP_CHARS));
+        Ok(out)
+    }
+}
+
 /// Percent-encode the reserved characters a query string actually hits
 /// (the fleet backend tolerates the rest verbatim). No new dependency.
 fn urlencoding_lite(s: &str) -> String {

@@ -847,6 +847,10 @@ pub fn run_cli(
         Some(Err(_)) => Vec::new(),
     };
     advisor_lines.iter().for_each(|l| println!("{l}"));
+    // Web tools (#625): which lane each tool uses, names only.
+    for l in crate::tool_roster::web_doctor_lines(&|k: &str| std::env::var(k).ok()) {
+        println!("{l}");
+    }
     // Skill curator (#593): on or off, and whether the weekly sweep exists.
     println!("{}", crate::curator_cmd::doctor_line());
     // Scheduler (#579, P5): a stale ticker while jobs are active fails.

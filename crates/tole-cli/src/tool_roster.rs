@@ -163,6 +163,84 @@ fn add(reg: &mut ToolRegistry, tool: Box<dyn Tool>) -> Result<()> {
         .map_err(|e| anyhow!("registering {name}: {e}"))
 }
 
+/// Where a web tool's requests go (#625).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WebLane {
+    /// A `TOLE_WEB_SEARCH_URL` / `TOLE_WEB_FETCH_URL` backend.
+    Generic,
+    /// The nginjen backend: `(base URL, API key)`.
+    Nginjen(String, String),
+    /// nginjen-lite inside tole (`web-builtin`).
+    Builtin,
+    /// The direct text fetcher (fetch without `web-builtin`).
+    Direct,
+    /// No tool (search without a backend or `web-builtin`).
+    Absent,
+}
+
+impl WebLane {
+    /// The lane's name for `tole doctor`: never a URL or a key.
+    pub fn label(&self, tool: &str) -> &'static str {
+        match (self, tool) {
+            (WebLane::Generic, _) => "generic backend (TOLE_WEB_*)",
+            (WebLane::Nginjen(..), _) => "nginjen backend (NGINJEN_BASE_URL)",
+            (WebLane::Builtin, "web_search") => "built-in (DuckDuckGo Lite, then Bing, then Brave)",
+            (WebLane::Builtin, _) => "built-in (nginjen-lite, robots.txt honoured)",
+            (WebLane::Direct, _) => "direct text fetch",
+            (WebLane::Absent, _) => "off (no search backend)",
+        }
+    }
+}
+
+/// The `(web_search, web_fetch)` lanes: a `TOLE_WEB_*` backend wins, then
+/// the nginjen backend (both `NGINJEN_BASE_URL` and `NGINJEN_API_KEY`
+/// set), then the built-in tools; without `web-builtin`, the direct
+/// fetcher and no search.
+pub fn web_lanes(env: &dyn Fn(&str) -> Option<String>) -> Result<(WebLane, WebLane), String> {
+    let set = |k: &str| env(k).is_some_and(|v| !v.trim().is_empty());
+    let nginjen = tole_core::web::nginjen_backend(env)?;
+    let pick = |generic: bool, fallback: WebLane| {
+        if generic {
+            WebLane::Generic
+        } else if let Some((base, key)) = &nginjen {
+            WebLane::Nginjen(base.clone(), key.clone())
+        } else {
+            fallback
+        }
+    };
+    let builtin = cfg!(feature = "web-builtin");
+    Ok((
+        pick(
+            set(tole_core::web::SEARCH_URL_ENV),
+            if builtin {
+                WebLane::Builtin
+            } else {
+                WebLane::Absent
+            },
+        ),
+        pick(
+            set(tole_core::web::FETCH_URL_ENV),
+            if builtin {
+                WebLane::Builtin
+            } else {
+                WebLane::Direct
+            },
+        ),
+    ))
+}
+
+/// `tole doctor` lines for the web tools: lane names only, never a URL or
+/// a key.
+pub fn web_doctor_lines(env: &dyn Fn(&str) -> Option<String>) -> Vec<String> {
+    match web_lanes(env) {
+        Ok((search, fetch)) => vec![
+            format!("web_search: {}", search.label("web_search")),
+            format!("web_fetch: {}", fetch.label("web_fetch")),
+        ],
+        Err(e) => vec![format!("web: ERROR {e}")],
+    }
+}
+
 /// Build the session's registry. Probe-gated tools (uteke, cora, gh,
 /// gitea, web search, systemone) are absent when their backend is, never
 /// phantoms; a miss is reported on stderr only with `TOLE_VERBOSE=1`.
@@ -356,41 +434,60 @@ pub fn build(approver: impl Approver + 'static, roster: Roster) -> Result<ToolRe
     // each call needs approval. Registered in plan mode too: it writes
     // nothing.
     add(&mut reg, tracked(Box::new(ReadFileTool::raw(root.clone()))))?;
-    // Web tools (#215, #625): a configured `TOLE_WEB_*` backend wins; else
-    // the built-in tools (`web-builtin`); without that feature, the direct
-    // text fetcher and no search.
+    // Web tools (#215, #625): one lane per tool, see [`web_lanes`].
+    let (search_lane, fetch_lane) =
+        web_lanes(&|k: &str| std::env::var(k).ok()).map_err(anyhow::Error::msg)?;
+    let allow_private = tole_core::web::allow_private_from_env();
     #[cfg(feature = "web-builtin")]
-    let builtin = std::sync::Arc::new(crate::web_builtin::TolHttp::new(
-        &secrets,
-        tole_core::web::allow_private_from_env(),
-    ));
-    match tole_core::web::WebBackendFetchTool::from_env().map_err(anyhow::Error::msg)? {
-        Some(fetch) => add(&mut reg, Box::new(fetch.with_secrets(&secrets)))?,
+    let builtin = std::sync::Arc::new(crate::web_builtin::TolHttp::new(&secrets, allow_private));
+    match fetch_lane {
+        WebLane::Generic => {
+            if let Some(fetch) =
+                tole_core::web::WebBackendFetchTool::from_env().map_err(anyhow::Error::msg)?
+            {
+                add(&mut reg, Box::new(fetch.with_secrets(&secrets)))?;
+            }
+        }
+        WebLane::Nginjen(base, key) => add(
+            &mut reg,
+            Box::new(
+                tole_core::web::NginjenFetchTool::new(&base, &key, allow_private)
+                    .with_secrets(&secrets),
+            ),
+        )?,
         #[cfg(feature = "web-builtin")]
-        None => add(
+        WebLane::Builtin => add(
             &mut reg,
             Box::new(crate::web_builtin::BuiltinFetchTool::new(
                 std::sync::Arc::clone(&builtin),
             )),
         )?,
-        #[cfg(not(feature = "web-builtin"))]
-        None => add(
+        _ => add(
             &mut reg,
             Box::new(tole_core::web::WebFetchTool::default().with_secrets(&secrets)),
         )?,
     }
-    // A malformed search config (#436) fails startup loudly.
-    match tole_core::web::WebSearchTool::from_env().map_err(anyhow::Error::msg)? {
-        Some(search) => add(&mut reg, Box::new(search.with_secrets(&secrets)))?,
+    match search_lane {
+        // A malformed search config (#436) fails startup loudly.
+        WebLane::Generic => {
+            if let Some(search) =
+                tole_core::web::WebSearchTool::from_env().map_err(anyhow::Error::msg)?
+            {
+                add(&mut reg, Box::new(search.with_secrets(&secrets)))?;
+            }
+        }
+        WebLane::Nginjen(base, key) => add(
+            &mut reg,
+            Box::new(tole_core::web::WebSearchTool::nginjen(&base, &key).with_secrets(&secrets)),
+        )?,
         #[cfg(feature = "web-builtin")]
-        None => add(
+        WebLane::Builtin => add(
             &mut reg,
             Box::new(crate::web_builtin::BuiltinSearchTool::new(
                 builtin, &secrets,
             )),
         )?,
-        #[cfg(not(feature = "web-builtin"))]
-        None => {}
+        _ => {}
     }
     if !plan {
         add(
