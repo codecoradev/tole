@@ -1191,6 +1191,12 @@ pub fn load_project_config(
             &config_trust::sanitize(&shown.display().to_string()),
         ));
     }
+    if let Some(w) = crate::routing::project_warning(
+        &config,
+        &config_trust::sanitize(&shown.display().to_string()),
+    ) {
+        io.warn(&w);
+    }
     io.inform(&format!(
         "tole: using config {}",
         config_trust::sanitize(&shown.display().to_string())

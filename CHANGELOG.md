@@ -48,6 +48,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Missions now learn about cora's agent-as-reviewer flow (#536): `tole mission` builds its registry like `run` (including the auto-attached `mcp_cora_*` tools) but its pinned system prompt never named the review tools, so the unattended command was the one that did not know the flow existed. When both `mcp_cora_cora_review_prepare` and `mcp_cora_cora_review_finalize` are registered, a fresh mission's prompt now carries the same review section as `run` / `chat` / the TUI plus one sentence asking for a review (and its verdict in the final message) before the mission ends; without the tools nothing is added. Guidance only: a gate before `git commit` is tracked separately. `serve`, `acp` and `mcp` sessions are unchanged on purpose: they attach no external MCP servers, so they have no review tools. Resumed missions keep their pinned prompt.
 
 ### Added
+- Model routing config, dry run and doctor, part 1b of #586. Nothing routes runs yet: part 2 wires the router into runs, cron runs and delegated children, off by default.
+  - **`[router]` in the user config:**
+    - `enabled` (off unless `true`), `allow_tiers`, `[router.tiers]` (the models of runs without a profile; a profile resolves through `profiles.<name>.models`) and `[[router.rules]]`.
+    - Rule conditions: `kinds`, `min_chars` / `max_chars`, `min_risk` / `max_risk`, `profiles`, `jobs`, `budget_below` and `keywords`.
+    - **A rule without `profiles` applies only to runs without a profile**, and resolves its tier through `[router.tiers]`. A rule with `profiles` applies only to those profiles and resolves through `profiles.<name>.models`.
+    - At most 64 rules and 32 keywords per rule; rule names are unique.
+  - **A matching rule replaces the configured model**, whether it comes from `TOLE_MODEL` (or another provider variable), the config's `model` or the profile's default tier. Only an explicit choice is never routed: a session's own model (`/model`, ACP) and a cron job's `--model` pin. No match keeps the configured model.
+  - **Load-time errors with a remedy:** an unknown tier, kind or risk, a rule whose tier is not declared where it resolves, or an unknown profile. There is never a fallback to another model.
+  - **A project config** can only set `enabled = false` or narrow `allow_tiers`. Its tiers, rules and `enabled = true` are ignored with a warning.
+  - **`tole route PROMPT [--kind K] [--risk R] [--job J] [--budget-left N]`** (with the global `--profile`) prints the tier, model and reason a run would get. It also prints the configured model and its source (for example `from env TOLE_MODEL`), which a matching rule replaces. It is a dry run that calls no provider, and its output is redacted.
+  - **Visibility:** `tole doctor` shows the router's state, rule names and tier names, and fails on a broken router. `config check` shows names only, never models or keywords.
 - Model routing by task weight, part 1a of #586: the `Router` seam and the rule baseline in `tole-core`. Nothing routes yet. The `[router]` config, `tole route` and doctor lines come in part 1b; wiring into runs, cron runs and delegated children comes in part 2, off by default.
   - **`tole_core::router`** (platform-agnostic, no new dependency, builds with `--no-default-features`):
     - `Router` returns a `Route` with a tier (`light`, `standard` or `heavy`), its source and a reason. It never returns a model name, a budget, an allow list or a secret.

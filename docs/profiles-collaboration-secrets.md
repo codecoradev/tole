@@ -486,6 +486,43 @@ Rules around it:
 LayaRouter on success rate and cost. LayaRouter ships as the default only if
 it beats the rule baseline (LLMRouterBench shows many routers do not).
 
+**As implemented, part 1 of #586 (the seam and the rule baseline):**
+- **`tole_core::router`** holds `Router`, `RuleRouter`, `Brief`, `Route`,
+  `Tier` and `Tiers`. It is platform-agnostic, does no I/O and adds no
+  dependency. A route carries only a tier, its source (a rule name or
+  `default`) and a reason, so routing cannot change a run's budget, allow
+  list or secrets.
+- **Brief:** kind (`chat`, `run`, `mission`, `cron`, `delegate`), the task
+  text (its size and the owner's keywords only), the highest tool risk, the
+  profile, the job and the budget left. LayaRouter's literal questions come
+  later, behind the same seam, and only after the eval gate.
+- **Pick:** every matching rule is a candidate, and the cheapest tier wins
+  (tie or doubt goes cheaper); the first declared rule of that tier names
+  the route. No match keeps the configured model.
+- **Config.** `[router]` lives in the user config, off unless
+  `enabled = true`.
+  - `[router.tiers]` maps the tiers of runs without a profile. A rule that
+    names `profiles` applies to those profiles only and resolves through
+    `profiles.<name>.models`. A rule without `profiles` applies only to runs
+    without one.
+  - A project config can only set `enabled = false` or narrow
+    `allow_tiers`.
+  - A tier a rule cannot resolve, or an unknown profile, is an error with a
+    remedy when the router loads (`tole doctor`, `tole route`, and run
+    start in part 2).
+- **What a rule replaces (owner decision 2026-11-13):** the configured
+  model, whether it comes from `TOLE_MODEL` (or another provider
+  variable), the config's `model` or the profile's default tier. Only an
+  explicit choice is never routed: a session's own model (`/model`, ACP)
+  and a cron job's `--model` pin. There is no `--model` flag.
+- **`tole route`** is the dry run: the tier, model and reason for a prompt,
+  plus the configured model and where it came from (for example
+  `from env TOLE_MODEL`), with no provider call. `tole doctor` shows names
+  only.
+- **Part 2** wires the route into run start, cron runs and delegated
+  children. The decision is recorded, redacted, in the session. Routing
+  happens once per run, never per turn (owner decision 2026-11-13).
+
 #### A9.4 Other cheap decisions laya can take (later, same seam)
 
 All on sanitized or owner-written text only, never raw payloads:

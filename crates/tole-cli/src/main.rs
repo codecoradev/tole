@@ -463,6 +463,25 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Show which model tier `[router]` would pick for a task (#586): a dry
+    /// run, no provider is called. `--profile` selects the profile's tiers.
+    Route {
+        /// The task text (only its size and the rules' keywords are read).
+        prompt: String,
+        /// chat, run, mission, cron or delegate.
+        #[arg(long, default_value = "run")]
+        kind: String,
+        /// The cron job's name.
+        #[arg(long)]
+        job: Option<String>,
+        /// The highest tool risk the run may use: read_only, write or
+        /// destructive.
+        #[arg(long, default_value = "write")]
+        risk: String,
+        /// Tokens the run may still spend.
+        #[arg(long)]
+        budget_left: Option<u64>,
+    },
     /// Serve tole's tools over MCP stdio (issue #94): ReadOnly tools are
     /// always callable; Write tools require --allow patterns (server mode
     /// has no stdin human — stdin IS the protocol); Destructive tools are
@@ -1521,6 +1540,47 @@ fn dispatch(cli: Cli) -> Result<()> {
             if !ok {
                 std::process::exit(1);
             }
+            Ok(())
+        }
+        Command::Route {
+            prompt,
+            kind,
+            job,
+            risk,
+            budget_left,
+        } => {
+            use tole_core::router;
+            let kind = router::TaskKind::parse(&kind)
+                .ok_or_else(|| anyhow!("--kind must be chat, run, mission, cron or delegate"))?;
+            let max_risk = router::parse_risk(&risk)
+                .ok_or_else(|| anyhow!("--risk must be read_only, write or destructive"))?;
+            let brief = router::Brief {
+                kind,
+                prompt: &prompt,
+                max_risk,
+                profile: profile.as_ref().map(|p| p.name.as_str()),
+                job: job.as_deref(),
+                budget_left,
+            };
+            // The model a run would use without routing, and its source: a
+            // matching rule replaces it (#586).
+            let configured = settings.provider.model.as_ref().map(|m| {
+                let from = match (m.source, m.env) {
+                    (config_apply::Source::Env, Some(name)) => format!("env {name}"),
+                    (source, _) => source.to_string(),
+                };
+                (m.value.clone(), from)
+            });
+            let secrets =
+                tole_cli::provider_chain::process_secrets(&tole_cli::config_apply::real_env);
+            let out = tole_cli::routing::explain(
+                cfg.as_ref().unwrap_or(&Default::default()),
+                &brief,
+                configured.as_ref().map(|(m, f)| (m.as_str(), f.as_str())),
+                &secrets,
+            )
+            .map_err(|e| anyhow!(secrets.redact(&e).into_owned()))?;
+            print!("{out}");
             Ok(())
         }
         Command::Audit { goal, json } => {
