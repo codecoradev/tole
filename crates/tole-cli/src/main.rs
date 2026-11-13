@@ -464,12 +464,21 @@ enum Command {
     /// one goal's nodes with profile, mode, status, budget and use, allow
     /// lists (and dropped patterns), leases, report summary and reason.
     /// Output is capped and redacted; nothing is written.
+    /// With `--discussions` or `--discussion <ID>`, the multi-round
+    /// discussions (#588) instead: goal, rounds, digests, gate decisions
+    /// and tokens used, never a raw contribution.
     Audit {
         /// The goal to show (default: list the goals).
         goal: Option<String>,
         /// Print JSON instead of text.
         #[arg(long)]
         json: bool,
+        /// List the multi-round discussions.
+        #[arg(long, conflicts_with_all = ["goal", "discussion"])]
+        discussions: bool,
+        /// Show one multi-round discussion.
+        #[arg(long, value_name = "ID", conflicts_with = "goal")]
+        discussion: Option<String>,
     },
     /// Show which model tier `[router]` would pick for a task (#586): a dry
     /// run, no provider is called. `--profile` selects the profile's tiers.
@@ -1621,7 +1630,26 @@ fn dispatch(cli: Cli) -> Result<()> {
             print!("{out}");
             Ok(())
         }
-        Command::Audit { goal, json } => {
+        Command::Audit {
+            discussions,
+            discussion,
+            json,
+            ..
+        } if discussions || discussion.is_some() => {
+            let dir = tole_core::discussion_log::DiscussionLog::default_dir().ok_or_else(|| {
+                anyhow!("cannot resolve the tole data dir (set CODECORA_HOME or HOME)")
+            })?;
+            let out = tole_cli::audit_discussion::discussions(
+                &dir,
+                discussion.as_deref(),
+                json,
+                &tole_core::secrets::SecretSet::from_env(),
+            )
+            .map_err(anyhow::Error::msg)?;
+            print!("{out}");
+            Ok(())
+        }
+        Command::Audit { goal, json, .. } => {
             let root = resolve_workspace_root(host.workspace.as_ref())?;
             let data = tole_core::paths::tole_data_dir().ok_or_else(|| {
                 anyhow!("cannot resolve the tole data dir (set CODECORA_HOME or HOME)")
