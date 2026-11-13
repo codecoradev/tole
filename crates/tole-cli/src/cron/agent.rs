@@ -339,6 +339,33 @@ pub fn run_agent(
     if let Err(e) = crate::tool_roster::register_todo(&mut reg, storage.entries(), false) {
         return fail(sid, e.to_string());
     }
+    // Model routing (#586): a new run of a job without a `--model` pin is
+    // routed once, from the user config, before the provider reads
+    // `fact/model`. A broken router fails the run with its remedy. The
+    // job's budgets, allow list and secrets are untouched.
+    if resume.is_none() && field(job, "model").is_none() {
+        let routed = super::setup::user_config().and_then(|cfg| {
+            let brief = tole_core::router::Brief {
+                kind: tole_core::router::TaskKind::Cron,
+                prompt,
+                max_risk: reg.max_risk(),
+                profile: setup.profile.as_ref().map(|p| p.name.as_str()),
+                job: Some(&name),
+                budget_left: Some(max_tokens),
+            };
+            let secrets = crate::provider_chain::process_secrets(&crate::config_apply::real_env);
+            crate::routing::route_new_session(
+                &mut storage,
+                &cfg.unwrap_or_default(),
+                &brief,
+                &secrets,
+            )
+            .map_err(|e| secrets.redact(&e).into_owned())
+        });
+        if let Err(e) = routed {
+            return fail(sid, e);
+        }
+    }
 
     let tripped: Tripped = Arc::new(Mutex::new(None));
     let observer: Arc<dyn TurnObserver> = Arc::new(StepBudget {

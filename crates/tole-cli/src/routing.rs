@@ -245,6 +245,79 @@ impl Routing {
     }
 }
 
+/// The session register that holds a run's routing decision (#586).
+pub const ROUTE: (&str, &str) = ("fact", "route");
+
+/// Routes a NEW run once, before its first provider call (#586 part 2).
+///
+/// - Off (`Ok(None)`) unless the config enables routing.
+/// - An explicit model wins: a session that already has `fact/model` is
+///   left alone, and the cron caller skips a job with a `--model` pin.
+/// - A broken router is an error here (the run's load time), naming the
+///   remedy; the run must not start on some other model.
+/// - Otherwise the decision is recorded in `fact/route`, redacted then
+///   capped, and a routed model is stored as `fact/model`, so every face
+///   and every resume uses it. Only the model changes: budget, allow list
+///   and secrets are untouched.
+///
+/// Returns a one-line summary for stderr.
+pub fn route_new_session(
+    storage: &mut dyn tole_core::storage::Storage,
+    cfg: &Config,
+    brief: &Brief<'_>,
+    secrets: &tole_core::secrets::SecretSet,
+) -> Result<Option<String>, String> {
+    let Some(rt) = Routing::from_config(cfg)? else {
+        return Ok(None);
+    };
+    let pinned = storage
+        .get_register(
+            crate::session_settings::MODEL.0,
+            crate::session_settings::MODEL.1,
+        )
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|m| !m.trim().is_empty());
+    if pinned {
+        return Ok(None);
+    }
+    let (route, model) = rt.decide(brief)?;
+    let commit = |s: &mut dyn tole_core::storage::Storage, w| {
+        s.commit(tole_core::storage::Commit::new().register(w))
+            .map(|_| ())
+            .map_err(|e| format!("recording the route: {e}"))
+    };
+    if let Some(m) = &model {
+        crate::session_settings::write_model(storage, m)
+            .map_err(|e| format!("recording the routed model: {e}"))?;
+    }
+    commit(
+        storage,
+        tole_core::register::RegisterWrite::set(
+            ROUTE.0,
+            ROUTE.1,
+            route.record(model.as_deref(), secrets),
+        ),
+    )?;
+    let s = |v: &str| router::redact_cap(v, secrets, router::MAX_REASON_CHARS);
+    Ok(Some(match (&route.tier, &model) {
+        (Some(t), Some(m)) => format!("router: {} -> {} ({})", t.as_str(), s(m), s(&route.reason)),
+        _ => format!("router: the configured model ({})", s(&route.reason)),
+    }))
+}
+
+/// The kind of a `tole mission`: a delegated child (`TOLE_AGENT_DEPTH` of
+/// 1 or more) or a top-level mission.
+pub fn mission_kind(env: &dyn Fn(&str) -> Option<String>) -> router::TaskKind {
+    let depth = env("TOLE_AGENT_DEPTH")
+        .and_then(|d| d.trim().parse::<u32>().ok())
+        .unwrap_or(0);
+    if depth >= 1 {
+        router::TaskKind::Delegate
+    } else {
+        router::TaskKind::Mission
+    }
+}
+
 /// `tole doctor` lines: state, rule and tier NAMES only (never models or
 /// keywords).
 pub fn doctor_lines(cfg: &Config) -> Vec<String> {

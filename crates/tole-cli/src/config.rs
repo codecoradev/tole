@@ -255,7 +255,7 @@ pub struct RouterRule {
 
 /// `[profiles.<name>.models]` (#584): model names per task-weight tier.
 /// `default` names the tier a session uses unless something picks another
-/// (the router of #586 is that something; today only `default` is used).
+/// (the `[router]` of #586, when enabled, for rules that name the profile).
 #[derive(Debug, Default, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelTiers {

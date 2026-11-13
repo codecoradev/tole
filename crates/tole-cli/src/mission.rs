@@ -241,6 +241,8 @@ pub fn run_mission(
     cfg: MissionConfig,
     mut registry: ToolRegistry,
     sessions_dir: &std::path::Path,
+    // Model routing (#586) of a fresh mission, before its provider exists.
+    route: &dyn Fn(&mut dyn tole_core::storage::Storage, &ToolRegistry) -> Result<()>,
 ) -> Result<()> {
     let started = std::time::Instant::now();
     let deadline = started + max_minutes_duration(cfg.max_minutes);
@@ -284,6 +286,10 @@ pub fn run_mission(
     // Task-list tools (#198): hydrated from the transcript on resume.
     // Missions refuse --plan-mode, so todo_write is always present.
     tole_cli::tool_roster::register_todo(&mut registry, storage.entries(), false)?;
+    // A fresh mission is routed once; a resumed one keeps its model.
+    if cfg.resume_id.is_none() {
+        route(&mut storage, &registry)?;
+    }
 
     let system_prompt = storage.system_prompt().map(str::to_owned);
     let mut compactor =
