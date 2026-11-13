@@ -285,3 +285,54 @@ fn the_curator_state_round_trips_and_fails_loud_when_malformed() {
     std::fs::write(&path, "{}").unwrap();
     assert_eq!(CuratorState::load(&path).unwrap(), CuratorState::default());
 }
+
+#[test]
+fn a_ledger_that_cannot_be_written_undoes_the_move() {
+    let root = tmp("noledger");
+    let dir = skill_pkg(&root, "demo");
+    // The ledger path is a directory: every append fails.
+    let ledger = root.join("ledger-is-a-dir");
+    std::fs::create_dir_all(&ledger).unwrap();
+    let a = Archive::new(&ledger, root.join(ARCHIVE_DIR));
+    let err = a.archive("demo", &dir, "r", NOW).unwrap_err();
+    assert!(err.contains("the move was undone"), "{err}");
+    assert!(dir.join("SKILL.md").is_file() && dir.join("references/a.md").is_file());
+    assert!(a.archived().is_empty());
+    // Nothing is left behind in the archive either.
+    let left = std::fs::read_dir(root.join(ARCHIVE_DIR))
+        .map(|d| d.count())
+        .unwrap_or(0);
+    assert_eq!(left, 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_restore_whose_ledger_write_fails_is_undone_too() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tmp("norestoreledger");
+    let dir = skill_pkg(&root, "demo");
+    let ledger = root.join(MUTATION_FILE);
+    let a = Archive::new(&ledger, root.join(ARCHIVE_DIR));
+    let m = a.archive("demo", &dir, "r", NOW).unwrap();
+    // Reads still work, appends fail.
+    std::fs::set_permissions(&ledger, std::fs::Permissions::from_mode(0o444)).unwrap();
+    if std::fs::OpenOptions::new()
+        .append(true)
+        .open(&ledger)
+        .is_ok()
+    {
+        return; // running as a user the mode does not bind (root)
+    }
+    let err = a.restore("demo", NOW + 1).unwrap_err();
+    assert!(err.contains("the move was undone"), "{err}");
+    assert!(
+        PathBuf::from(&m.to).join("references/a.md").is_file(),
+        "back in the archive"
+    );
+    assert!(!dir.exists(), "not half restored");
+    assert_eq!(
+        a.archived().len(),
+        1,
+        "the ledger still says archived, and it is"
+    );
+}

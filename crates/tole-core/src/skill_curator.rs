@@ -491,7 +491,13 @@ impl Archive {
         let id = self.next_id();
         let to = self.root.join(format!("{name}-{now}-{id}"));
         move_dir(dir, &to)?;
-        let after = read_dir_package(name, &to)?;
+        // The move and its ledger line go together: when either the check of
+        // the moved package or the ledger write fails, the move is undone,
+        // so a skill never sits in the archive without a record of it.
+        let after = match read_dir_package(name, &to) {
+            Ok(a) => a,
+            Err(e) => return Err(undo(&to, dir, e)),
+        };
         let m = Mutation {
             id,
             t: now,
@@ -503,7 +509,9 @@ impl Archive {
             after_hash: after.hash,
             reason: reason.chars().take(200).collect(),
         };
-        append_line(&self.ledger, &m)?;
+        if let Err(e) = append_line(&self.ledger, &m) {
+            return Err(undo(&to, dir, e));
+        }
         Ok(m)
     }
 
@@ -530,7 +538,12 @@ impl Archive {
             ));
         }
         move_dir(&from, &to)?;
-        let back = read_dir_package(name, &to)?;
+        // As in `archive`: no move without its ledger line, or the ledger
+        // would still call the skill archived after it moved back.
+        let back = match read_dir_package(name, &to) {
+            Ok(b) => b,
+            Err(e) => return Err(undo(&to, &from, e)),
+        };
         let m = Mutation {
             id: self.next_id(),
             t: now,
@@ -542,8 +555,22 @@ impl Archive {
             after_hash: back.hash,
             reason: format!("restored archive entry {}", a.id),
         };
-        append_line(&self.ledger, &m)?;
+        if let Err(e) = append_line(&self.ledger, &m) {
+            return Err(undo(&to, &from, e));
+        }
         Ok(m)
+    }
+}
+
+/// Move `moved` back to `origin` after a failure and say so in the error. If
+/// even that fails the error names where the package is.
+fn undo(moved: &Path, origin: &Path, cause: String) -> String {
+    match move_dir(moved, origin) {
+        Ok(()) => format!("{cause} (the move was undone)"),
+        Err(e) => format!(
+            "{cause}; the move could not be undone ({e}): the package is at {}",
+            moved.display()
+        ),
     }
 }
 
