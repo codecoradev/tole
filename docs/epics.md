@@ -308,8 +308,10 @@ Bot and Nakama; BMAD for collaboration). Design notes:
   progress: part 1 is the `skill_draft` gate and draft store in `tole-core`
   (lint, secret and injection scan, taint, provenance, dedup bands); part 2
   is the `skill_propose` tool (host-stamped taint, session, model and dedup)
-  and `tole skills drafts list|show|reject|verdict`; promotion into an
-  approved skill, and revoking what grew from a poisoned source, follow.
+  and `tole skills drafts list|show|reject|verdict`; part 3 is `promote`
+  (exact bytes, the owner's confirmation, tainted and near-duplicate
+  drafts gated) and `revoke` (what grew from a poisoned source). #592 is
+  done; the curator (#593) is next.
 - **E4 — Secrets and third-party plugins, epic #594:**
   - `SecretSet` at every sink (#595; module, provider body, child minimum
     env, MCP arguments, web, `systemone`, memory loop and `uteke_document`

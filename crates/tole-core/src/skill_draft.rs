@@ -189,6 +189,20 @@ pub enum DraftStatus {
     Pending,
     Rejected,
     Promoted,
+    /// Was promoted; its source turned out poisoned and its approval was
+    /// withdrawn (#592). The skill stays on disk, restorable by the owner.
+    Revoked,
+}
+
+/// Where a promoted draft went, so a later revoke can find its skill.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Promotion {
+    /// The approved package hash of the skill written (`sha256:<hex>`).
+    pub package_hash: String,
+    /// The skill's directory.
+    pub dir: String,
+    /// Seconds since the Unix epoch.
+    pub at: u64,
 }
 
 /// A stored draft record (the SKILL.md sits beside it).
@@ -208,6 +222,9 @@ pub struct Draft {
     /// Warnings kept for the owner (blocking findings never get here).
     pub warnings: Vec<Finding>,
     pub dedup: Dedup,
+    /// Set when the owner promotes the draft.
+    #[serde(default)]
+    pub promotion: Option<Promotion>,
 }
 
 impl Draft {
@@ -631,6 +648,7 @@ pub fn gate(
         taint: ctx.taint.clone(),
         warnings: findings,
         dedup: ctx.dedup.clone(),
+        promotion: None,
     };
     Ok((draft, p.skill_md.clone()))
 }
@@ -705,19 +723,50 @@ impl DraftStore {
         out
     }
 
-    /// Move a draft out of `Pending` (the owner's call). A decided draft does
-    /// not move again.
+    /// Reject a pending draft (the owner's call). A decided draft does not
+    /// move again; promoting and revoking have their own methods.
     pub fn decide(&self, id: &str, status: DraftStatus) -> Result<Draft, String> {
+        if status != DraftStatus::Rejected {
+            return Err("decide only rejects; use promote or revoke".into());
+        }
         let mut d = self.get(id)?;
         if d.status != DraftStatus::Pending {
             return Err(format!("draft {id} is already {:?}", d.status));
         }
-        if status == DraftStatus::Pending {
-            return Err("a draft cannot go back to pending".into());
-        }
         d.status = status;
         write_record(&self.draft_dir(id)?, &d)?;
         Ok(d)
+    }
+
+    /// Record that the owner promoted a pending draft into a skill.
+    pub fn promote(&self, id: &str, promotion: Promotion) -> Result<Draft, String> {
+        let mut d = self.get(id)?;
+        if d.status != DraftStatus::Pending {
+            return Err(format!("draft {id} is already {:?}", d.status));
+        }
+        d.status = DraftStatus::Promoted;
+        d.promotion = Some(promotion);
+        write_record(&self.draft_dir(id)?, &d)?;
+        Ok(d)
+    }
+
+    /// Record that a promoted draft's approval was withdrawn.
+    pub fn revoke(&self, id: &str) -> Result<Draft, String> {
+        let mut d = self.get(id)?;
+        if d.status != DraftStatus::Promoted {
+            return Err(format!("draft {id} is {:?}, not promoted", d.status));
+        }
+        d.status = DraftStatus::Revoked;
+        write_record(&self.draft_dir(id)?, &d)?;
+        Ok(d)
+    }
+
+    /// Every draft that names `session` among its sources.
+    pub fn by_session(&self, session: &str) -> Vec<Draft> {
+        self.list()
+            .into_iter()
+            .filter(|d| d.provenance.sessions.iter().any(|s| s == session))
+            .collect()
     }
 
     /// Record a reviewer's verdict on the draft's nearest skill.

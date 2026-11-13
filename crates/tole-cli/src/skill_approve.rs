@@ -136,7 +136,7 @@ pub enum SkillsAction {
         hash: Option<String>,
         /// Discovery root (default: the current directory).
         #[arg(long)]
-        workspace: Option<PathBuf>,
+        workspace: Option<String>,
     },
     /// Skill drafts the agent proposed with `skill_propose` (#592): list,
     /// show, reject, record a reviewer's verdict. A draft never loads.
@@ -151,7 +151,7 @@ pub enum SkillsAction {
     List {
         /// Discovery root (default: the current directory).
         #[arg(long)]
-        workspace: Option<PathBuf>,
+        workspace: Option<String>,
     },
 }
 
@@ -246,9 +246,9 @@ pub fn cli(action: SkillsAction) -> anyhow::Result<()> {
         let approvals = Approvals::load(&path).map_err(anyhow::Error::msg)?;
         Ok((path, approvals))
     };
-    let root = |ws: Option<PathBuf>| -> anyhow::Result<PathBuf> {
+    let root = |ws: Option<String>| -> anyhow::Result<PathBuf> {
         match ws {
-            Some(p) => Ok(p),
+            Some(p) => Ok(PathBuf::from(p)),
             None => std::env::current_dir().context("reading the current directory"),
         }
     };
