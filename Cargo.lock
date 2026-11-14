@@ -2488,7 +2488,6 @@ dependencies = [
  "tokio",
  "ureq",
  "url",
- "uuid",
 ]
 
 [[package]]
