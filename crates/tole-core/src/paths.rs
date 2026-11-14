@@ -35,7 +35,7 @@ pub fn tole_data_dir() -> Option<PathBuf> {
 
 /// `p` made absolute and symlink-free as far as it exists: the longest
 /// existing ancestor is canonicalized and the rest appended.
-fn canon_lenient(p: &std::path::Path) -> PathBuf {
+pub(crate) fn canon_lenient(p: &std::path::Path) -> PathBuf {
     let mut tail = Vec::new();
     let mut cur = p;
     loop {

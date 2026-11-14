@@ -92,6 +92,7 @@ pub(crate) mod safe_dir;
 pub mod session_guard;
 // Approval-surface text sanitizer (#327): crate-internal, no public API.
 pub mod plugin_lock;
+pub mod sandbox;
 pub(crate) mod sanitize;
 pub mod secret_release;
 pub mod secrets;
