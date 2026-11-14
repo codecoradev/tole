@@ -1016,7 +1016,7 @@ mod tests {
         );
     }
 
-    const GH: &str = "ghp_0123456789abcdefghijklmnopqrstuvwxyzAB";
+    const GH: &str = "tok_0123456789abcdefghijklmnopqrstuvwxyzAB";
 
     #[test]
     fn base64_of_an_embedded_secret_is_redacted() {
@@ -1074,7 +1074,7 @@ mod tests {
         let lower = hex_encode(GH, false);
         let upper = hex_encode(GH, true);
         assert_ne!(lower, upper);
-        assert!(lower.starts_with("67687"), "sanity: hex of ghp_");
+        assert!(lower.starts_with("746f6b5f"), "sanity: hex of tok_");
         for hex in [lower, upper] {
             assert_eq!(s.redact(&format!("od: {hex}.")), "od: «GITHUB_TOKEN».");
         }
@@ -1208,7 +1208,7 @@ mod tests {
             out.matches("«GITHUB_TOKEN»").count(),
             text.matches('\n').count()
         );
-        assert!(!out.contains("ghp_"));
+        assert!(!out.contains("tok_"));
     }
 
     /// Throughput measurement, not a gate (no timing assertion): run with

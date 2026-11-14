@@ -5,7 +5,7 @@
 use base64::Engine;
 use tole_core::secrets::SecretSet;
 
-const GH: &str = "ghp_0123456789abcdefghijklmnopqrstuvwxyzAB";
+const GH: &str = "tok_0123456789abcdefghijklmnopqrstuvwxyzAB";
 
 fn set() -> SecretSet {
     SecretSet::collect([("GITHUB_TOKEN".to_string(), GH.to_string())], [])
@@ -62,7 +62,7 @@ fn unrelated_text_is_not_redacted() {
     for text in [
         format!("Authorization: Basic {}", b64.encode("user:not-the-token")),
         "plain text \u{200b}with a zero-width space".to_string(),
-        "6768705f30313233".to_string(), // hex of a prefix only
+        "746f6b5f30313233".to_string(), // hex of a prefix only
     ] {
         assert_eq!(s.redact(&text), text);
     }
