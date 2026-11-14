@@ -35,8 +35,24 @@ pub mod cancel;
 pub mod ccimport;
 pub mod child_env;
 pub mod compaction;
+pub mod integrations;
+// `integrations/` holds these modules; the re-exports keep the old top-level paths working.
+#[doc(inline)]
 #[cfg(feature = "shell-tools")]
-pub mod cora_search;
+pub use integrations::cora_search;
+#[doc(inline)]
+#[cfg(feature = "shell-tools")]
+pub use integrations::gh;
+#[doc(inline)]
+#[cfg(feature = "shell-tools")]
+pub use integrations::git;
+#[doc(inline)]
+pub use integrations::gitea;
+#[doc(inline)]
+#[cfg(feature = "shell-tools")]
+pub use integrations::uteke;
+#[doc(inline)]
+pub use integrations::verify_package;
 pub mod entry;
 pub mod failover;
 pub mod file_tools;
@@ -56,11 +72,6 @@ pub mod discussion;
 #[doc(inline)]
 pub use discussion::log as discussion_log;
 pub(crate) mod gate;
-#[cfg(feature = "shell-tools")]
-pub mod gh;
-#[cfg(feature = "shell-tools")]
-pub mod git;
-pub mod gitea;
 pub mod handoff;
 pub mod image;
 pub mod interrupt;
@@ -135,9 +146,6 @@ pub mod subprocess;
 pub mod tool;
 pub mod turn;
 pub mod update_check;
-#[cfg(feature = "shell-tools")]
-pub mod uteke;
-pub mod verify_package;
 
 /// Semantic version of the durable schema (see storage module docs).
 pub const STORAGE_VERSION: u32 = 1;
