@@ -93,7 +93,7 @@ A request in any of these classes skips every agent level (each recorded as
 | New allow patterns | **there is no allow-always verdict**: every decision is one call. A request to widen a list is not an approval at all: `delegate` drops patterns the parent does not cover (`dropped`, recorded) and that is never escalated |
 | Profile or budget changes | likewise not approvals: a `delegate` budget above what is left is refused by the carve (`DelegationError`), never escalated |
 | Plugin and skill approvals, external effects | tools supplied by a plugin, an MCP server or a skill (their effect is unknowable to a level); `skill_propose` stays a draft write, promotion stays `tole skills drafts promote` |
-| Write outside the workspace | `target` absent, outside the canonical root, or failing the `@workspace` guard (executed-by-another-tool files such as `.git/hooks`, `build.rs`, `Makefile`, CI files, `.envrc`), including any `..` or symlink escape |
+| Write outside the workspace | a **path-writing tool** (one that reports an `approval_target`) whose `target` is absent, outside the canonical root, or failing the `@workspace` guard (executed-by-another-tool files such as `.git/hooks`, `build.rs`, `Makefile`, CI files, `.envrc`), including any `..` or symlink escape. A command tool (`run_command`) has no path target and is not in this class: it is decidable by a level only through a matching command pattern of that level's list (2.2.5), otherwise it goes up |
 | Oversized | display truncated, or input over the record cap (16 KiB) |
 
 The "external effects" and "oversized" rows go slightly beyond the list in
