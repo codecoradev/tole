@@ -356,7 +356,8 @@ Bot and Nakama; BMAD for collaboration). Design notes:
   - owner-only records and the tole binary refused under a session (#684;
     done) and the non-dumpable process guard (#675; done);
   - `tole plugin add`, the description scanner, grants and trust tiers (#600; open: only `list|diff|approve|revoke` shipped, under #599);
-  - external sandbox wrapper and lazy start (#601; open).
+  - external sandbox wrapper and lazy start (#601; open; design and owner
+    decisions in `docs/sandbox-design.md`).
 
 Suggested order: E4 #595 first (other epics reuse it), then E1 #578 → #579,
 E2 #584 → #585, E3 #590 → #591; the rest per each epic's order.
