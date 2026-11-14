@@ -1300,12 +1300,23 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                 q.split('&')
                     .find_map(|kv| kv.strip_prefix("session=").map(str::to_string))
             });
-            let list = state
+            let mut list = state
                 .approvals
                 .list(session.as_deref())
                 .iter()
                 .map(tole_cli::approvals::approval_json)
                 .collect::<Vec<_>>();
+            // The durable queue of delegated children (#714): no serve
+            // session owns those, so a `?session=` filter leaves them out.
+            if session.is_none() {
+                if let Some(data) = tole_core::paths::tole_data_dir() {
+                    let sx = tole_cli::provider_chain::process_secrets(
+                        &tole_cli::config_apply::real_env,
+                    );
+                    let now = tole_cli::delegated_approver::real_now();
+                    list.extend(tole_cli::serve_delegation::list(&data, &sx, now));
+                }
+            }
             (200, json!({"approvals": list}))
         }
         (method, p)
@@ -1315,6 +1326,20 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                 .trim_start_matches("/approvals/")
                 .trim_end_matches("/decision")
                 .to_string();
+            // A delegated child's request (#714): the durable queue, not
+            // serve's in-memory one. The child is already waiting: no resume.
+            if id.starts_with("dap-") {
+                let sx =
+                    tole_cli::provider_chain::process_secrets(&tole_cli::config_apply::real_env);
+                return tole_cli::serve_delegation::decide_route(
+                    tole_core::paths::tole_data_dir().as_deref(),
+                    &sx,
+                    tole_cli::delegated_approver::real_now(),
+                    &tole_cli::config_apply::real_env,
+                    &id,
+                    body,
+                );
+            }
             let Ok(req) = serde_json::from_str::<serde_json::Value>(body) else {
                 return (400, json!({"error": "invalid JSON body"}));
             };
