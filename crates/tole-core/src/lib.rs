@@ -27,8 +27,12 @@
 //! - `memory`   — harness-level uteke memory loop (recall/remember)
 //! - `transcript` — read-side view of turn and usage-row conventions
 
+// Test-only scratch directory shared with the integration tests (#781).
 pub mod advisor;
 pub mod children;
+#[cfg(test)]
+#[path = "../tests/support/test_dir.rs"]
+pub(crate) mod test_dir;
 // `children/` holds these modules; the re-exports keep the old top-level paths working.
 #[doc(inline)]
 #[cfg(feature = "shell-tools")]

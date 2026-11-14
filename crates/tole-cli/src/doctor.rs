@@ -889,6 +889,8 @@ pub fn run_cli(
         Some(Err(_)) => Vec::new(),
     };
     role_lines.iter().for_each(|l| println!("{l}"));
+    // Discussion request timeout (#786): the effective value and its source.
+    println!("{}", crate::config_apply::discussion_timeout_line());
     // Web tools (#625): which lane each tool uses, names only.
     for l in crate::tool_roster::web_doctor_lines(&|k: &str| std::env::var(k).ok()) {
         println!("{l}");

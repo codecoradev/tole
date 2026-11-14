@@ -2,9 +2,13 @@
 //! tests exercise the REAL implementations — the approval flow and the
 //! jailed file tools — instead of test-local re-implementations that
 //! drift from production behavior (CodeCora scan 2026-09-18).
+// Test-only scratch directory shared with the integration tests (#781).
 pub mod advisor_host;
 pub mod approvals;
 pub mod delegation;
+#[cfg(test)]
+#[path = "../tests/common/test_dir.rs"]
+pub(crate) mod test_dir;
 // `delegation/` holds these modules; the re-exports keep the old top-level paths working.
 #[doc(inline)]
 pub use delegation::approvals_owner;
