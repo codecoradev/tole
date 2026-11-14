@@ -880,6 +880,27 @@ impl DiscussionLog {
         Ok(outcome)
     }
 
+    /// Stop the discussion wherever it is: the stop is recorded as the
+    /// gate's escalation ([`Reason::Stopped`]), so the driver closes it with
+    /// the usual report and nothing in a participant's text can start or
+    /// prevent it. A discussion that is already ending or closed keeps its
+    /// outcome. Returns the outcome.
+    pub fn stop(&self, now: u64) -> Result<Gate, String> {
+        let _guard = self.lock()?;
+        let st = self.state()?;
+        match st.next() {
+            Next::NeedContract => Err("the discussion has no contract".into()),
+            Next::Finish { outcome } => Ok(outcome),
+            Next::Done => Ok(st.closed.map_or(Gate::Continue, |(g, _)| g)),
+            _ => {
+                let round = st.open_round().ok_or("no round is open")?;
+                let outcome = Gate::Escalate(Reason::Stopped);
+                self.append(&st, Event::Gate { round, outcome }, now)?;
+                Ok(outcome)
+            }
+        }
+    }
+
     /// Close the discussion with the text for the owner, after the gate said
     /// report or escalate.
     pub fn close(&self, text: &str, now: u64) -> Result<Gate, String> {
@@ -935,6 +956,7 @@ pub fn describe(outcome: Gate) -> &'static str {
         Gate::Escalate(Reason::Budget) => "the token budget is spent",
         Gate::Escalate(Reason::MaxRounds) => "the round limit is reached",
         Gate::Escalate(Reason::Stalled) => "two rounds in a row added nothing new",
+        Gate::Escalate(Reason::Stopped) => "it was stopped before it finished",
         Gate::Continue => "the discussion continues",
     }
 }

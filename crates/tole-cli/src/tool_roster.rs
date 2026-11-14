@@ -367,6 +367,30 @@ pub fn build(approver: impl Approver + 'static, roster: Roster) -> Result<ToolRe
                 }),
             )?;
         }
+        // The discussion tools (#588) exist exactly where `delegate` does:
+        // the same host, so the same depth limit, and they need a provider.
+        if let (Some(data), Some(pc)) = (
+            host.setup().data_dir.clone(),
+            crate::config_apply::provider_config(),
+        ) {
+            let secrets = crate::provider_chain::process_secrets(&crate::config_apply::real_env);
+            let make = crate::discussion_host::factory(pc, secrets.clone());
+            let d = crate::discuss_tool::DiscussHost::new(
+                host.clone(),
+                data.join(tole_core::discussion_log::DISCUSSIONS_DIR),
+                secrets,
+                make,
+            );
+            add(
+                &mut reg,
+                Box::new(crate::discuss_tool::DiscussTool(d.clone())),
+            )?;
+            add(
+                &mut reg,
+                Box::new(crate::discuss_tool::DiscussStatusTool(d.clone())),
+            )?;
+            add(&mut reg, Box::new(crate::discuss_tool::DiscussStopTool(d)))?;
+        }
     } else if let (
         Some(
             agents @ AgentTools {
@@ -707,6 +731,43 @@ mod tests {
         // A test process is never a child (no TOLE_AGENT_DEPTH).
         assert!(parent.get("agent_start").is_some());
         assert!(parent.get("agent_poll").is_some());
+    }
+
+    /// #588: the discussion tools exist exactly where `delegate` does (and
+    /// with a provider to run on), never with the classic agent tools or none.
+    #[test]
+    fn discussion_tools_come_only_with_delegate_and_a_provider() {
+        let ws = workspace("discuss-roster");
+        let all = ["discuss", "discuss_status", "discuss_stop"];
+        for roster in [Roster::new(ws.clone()), {
+            let mut r = Roster::new(ws.clone());
+            r.agents = Some(AgentTools::default());
+            r
+        }] {
+            let reg = build(Human, roster).unwrap();
+            assert!(all.iter().all(|t| reg.get(t).is_none()));
+        }
+        let mut roster = Roster::new(ws.clone());
+        roster.agents = Some(AgentTools {
+            delegation: Some(crate::delegate::Setup {
+                data_dir: Some(ws.join("data")),
+                ..Default::default()
+            }),
+            ..AgentTools::default()
+        });
+        let reg = build(Human, roster).unwrap();
+        assert!(reg.get("delegate").is_some());
+        let provider = crate::config_apply::provider_config().is_some();
+        assert!(all.iter().all(|t| reg.get(t).is_some() == provider));
+        // Plan mode registers no agent tools at all, so no discussion.
+        let mut plan = Roster::new(ws);
+        plan.agents = Some(AgentTools {
+            delegation: Some(crate::delegate::Setup::default()),
+            ..AgentTools::default()
+        });
+        plan.plan_mode = true;
+        let reg = build(Human, plan).unwrap();
+        assert!(all.iter().all(|t| reg.get(t).is_none()));
     }
 
     /// #581: `cron_create` is a session face's tool. A cron run (no

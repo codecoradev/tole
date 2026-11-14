@@ -8,7 +8,7 @@ const SECRET: &str = "discuss-cli-secret-0123456789";
 
 /// How the fake answers: by kind of call (`scribe`, `checker`, or the
 /// participant's name).
-type Answer = Arc<dyn Fn(&str, &str) -> Result<ProviderOutput, String> + Send + Sync>;
+pub(crate) type Answer = Arc<dyn Fn(&str, &str) -> Result<ProviderOutput, String> + Send + Sync>;
 
 struct Fake {
     answer: Answer,
@@ -43,7 +43,7 @@ impl Provider for Fake {
     }
 }
 
-fn factory(usage: u64, answer: Answer) -> (Arc<Mutex<Vec<String>>>, Factory) {
+pub(crate) fn factory(usage: u64, answer: Answer) -> (Arc<Mutex<Vec<String>>>, Factory) {
     let calls: Arc<Mutex<Vec<String>>> = Arc::default();
     let c2 = Arc::clone(&calls);
     let make: Factory = Arc::new(move |_model, system| {
@@ -59,7 +59,7 @@ fn factory(usage: u64, answer: Answer) -> (Arc<Mutex<Vec<String>>>, Factory) {
 
 /// Participants talk; the checker meets the one criterion, citing the
 /// first entry it was shown.
-fn agreeable() -> Answer {
+pub(crate) fn agreeable() -> Answer {
     Arc::new(|kind, user| {
         let text = match kind {
             "checker" => {
@@ -78,14 +78,14 @@ fn agreeable() -> Answer {
     })
 }
 
-fn tmp(tag: &str) -> PathBuf {
+pub(crate) fn tmp(tag: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("tole-discuss-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     d
 }
 
-fn config() -> Config {
+pub(crate) fn config() -> Config {
     crate::config::parse(
         "[profiles.coder]\n[profiles.ops]\n[profiles.scribe.models]\nlight = \"tiny\"\n",
         Path::new("user.toml"),

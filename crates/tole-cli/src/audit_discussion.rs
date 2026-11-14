@@ -37,6 +37,7 @@ fn gate_name(g: &Gate) -> String {
                 Reason::Budget => "budget",
                 Reason::MaxRounds => "max_rounds",
                 Reason::Stalled => "stalled",
+                Reason::Stopped => "stopped",
             }
         ),
     }

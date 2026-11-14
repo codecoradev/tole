@@ -477,6 +477,9 @@ pub enum Reason {
     MaxRounds,
     /// No new information for [`STALL_ROUNDS`] rounds.
     Stalled,
+    /// Someone with the right to (the owner, or the orchestrator that
+    /// started it) stopped it before it finished.
+    Stopped,
 }
 
 /// What happens after a round.
