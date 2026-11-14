@@ -162,7 +162,7 @@ fn nonce() -> String {
     format!("{:016x}", h.finish())
 }
 
-fn real_now() -> i64 {
+pub fn real_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))

@@ -197,6 +197,10 @@ tole hook test gh --event push --payload push.json  # local dry run: sign, filte
 tole status [id]                            # pc / seq / turns / token + cache usage / request-size split; model, effort, context used/window, tokens, compactions (default: latest session)
 tole audit [goal] [--json]                  # this workspace's delegation tree, read-only, capped and redacted (default: list the goals)
 tole audit --discussions                    # the multi-round discussions in the data dir, read-only (also: --discussion <ID>)
+tole delegation approvals list [--all]      # owner-only (#714): the approval requests of delegated children, read-only
+tole delegation approvals show <ID>         # one request in full: who asked, the chain, the call, a redacted input (fenced as data)
+tole delegation approvals allow <ID>        # allow ONE call of ONE request: shows it, then type the id back (--yes skips the typing; --fingerprint <HEX> pins the content)
+tole delegation approvals deny <ID>         # deny it (no answer is a denial too); allow and deny refuse under an agent session
 tole discuss start --question "Q" --criterion "C" --participant coder --participant reviewer --budget 60000 --dry-run  # owner-only multi-round discussion among user-config profiles; the budget is a hard cap; drop --dry-run to run it (also: resume ID, list, show ID)
 tole plugin list                            # every MCP server with its lock state (approved, changed, unapproved, revoked); also: diff NAME, approve NAME [--hash H], revoke NAME
 tole skills list                            # discovered skills with approval status and hash; approve NAME [--hash H], revoke NAME, drafts list|show|reject|verdict|promote|revoke, index|retire|search

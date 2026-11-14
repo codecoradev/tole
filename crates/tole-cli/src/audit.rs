@@ -16,6 +16,7 @@ use std::path::Path;
 
 use serde_json::{json, Value};
 use tole_core::delegation::{Delegation, Mode, Node, NodeStatus};
+use tole_core::delegation_approvals::{Approvals, By, Choice};
 use tole_core::secrets::SecretSet;
 
 use crate::ledger_file::FileStore;
@@ -161,6 +162,85 @@ fn text(nodes: &[Value]) -> String {
     out
 }
 
+fn verdict(v: Choice) -> &'static str {
+    match v {
+        Choice::Allow => "allow",
+        Choice::Deny => "deny",
+    }
+}
+
+/// The approval requests of `goal` (#714): who asked, who decided at which
+/// level, and what became of it. Read from the approvals log next to `log`
+/// (absent: none); the facts of the records, not a clock.
+fn approvals(log: &Path, d: &Delegation<FileStore>, goal: &str, sx: &SecretSet) -> Vec<Value> {
+    let path = crate::delegated_approver::approvals_path(log);
+    let Ok(a) = Approvals::open(FileStore::new(path), d) else {
+        return Vec::new();
+    };
+    a.state()
+        .entries()
+        .filter(|e| e.req.goal == goal)
+        .map(|e| {
+            let r = &e.req;
+            let by = e.decision.as_ref().map(|x| match &x.by {
+                By::Owner => json!({"owner": true, "via": format!("{:?}", x.via).to_lowercase()}),
+                By::Agent { node, level } => json!({"node": node, "level": level, "via": "tool"}),
+            });
+            json!({
+                "request": r.req,
+                "node": r.node,
+                "depth": d.poll(&r.node).map(|n| n.depth),
+                "tool": line(sx, &r.tool, TASK_CHARS),
+                "target": r.target.as_deref().map(|t| line(sx, t, TASK_CHARS)),
+                "display": line(sx, &r.display, TEXT_CHARS),
+                "decided": e.decision.as_ref().map(|x| verdict(x.verdict)),
+                "by": by,
+                "consumed": e.consumed_at.is_some(),
+                "expired": e.expired.map(|x| format!("{:?}", x.0).to_lowercase()),
+            })
+        })
+        .collect()
+}
+
+fn approvals_text(rows: &[Value]) -> String {
+    let mut out = String::new();
+    for v in rows {
+        let s = |k: &str| v[k].as_str().unwrap_or("").to_string();
+        let who = match (v["by"]["owner"].as_bool(), v["by"]["node"].as_str()) {
+            (Some(true), _) => format!("the owner ({})", s_of(&v["by"]["via"])),
+            (_, Some(n)) => format!("{n} (level {})", v["by"]["level"]),
+            _ => String::new(),
+        };
+        let fate = match v["decided"].as_str() {
+            Some(d) => format!(
+                "decided {d} by {who}{}",
+                if v["consumed"] == true {
+                    ", consumed"
+                } else {
+                    ""
+                }
+            ),
+            None => match v["expired"].as_str() {
+                Some(r) => format!("expired ({r}), never decided"),
+                None => "undecided".to_string(),
+            },
+        };
+        out.push_str(&format!(
+            "approval {}: {} {}, asked by {} (depth {}), {fate}\n",
+            s("request"),
+            s("tool"),
+            v["target"].as_str().unwrap_or("-"),
+            s("node"),
+            v["depth"],
+        ));
+    }
+    out
+}
+
+fn s_of(v: &Value) -> &str {
+    v.as_str().unwrap_or("")
+}
+
 /// The audit of the log at `log`: the goals it holds, or the tree of `goal`,
 /// as text or JSON, every string redacted through `secrets`.
 pub fn audit(
@@ -192,7 +272,8 @@ pub fn audit(
                 .into_iter()
                 .map(|n| node_json(&d, n, secrets))
                 .collect();
-            json!({ "log": log, "goal": goal, "nodes": nodes })
+            let approvals = approvals(log, &d, goal, secrets);
+            json!({ "log": log, "goal": goal, "nodes": nodes, "approvals": approvals })
         }
     };
     // Second pass over everything (ids, paths, allow patterns): the capped
@@ -224,7 +305,13 @@ pub fn audit(
                 out
             }
         }
-        Some(_) => text(value["nodes"].as_array().map_or(&[][..], Vec::as_slice)),
+        Some(_) => {
+            let mut out = text(value["nodes"].as_array().map_or(&[][..], Vec::as_slice));
+            out.push_str(&approvals_text(
+                value["approvals"].as_array().map_or(&[][..], Vec::as_slice),
+            ));
+            out
+        }
     })
 }
 

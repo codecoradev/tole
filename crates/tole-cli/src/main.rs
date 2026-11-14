@@ -490,6 +490,13 @@ enum Command {
         #[command(subcommand)]
         action: DiscussAction,
     },
+    /// The owner's side of delegation (#714): read and answer the approval
+    /// requests of delegated children. Owner-only: refuses under an agent
+    /// session.
+    Delegation {
+        #[command(subcommand)]
+        action: DelegationAction,
+    },
     /// Show which model tier `[router]` would pick for a task (#586): a dry
     /// run, no provider is called. `--profile` selects the profile's tiers.
     Route {
@@ -667,6 +674,41 @@ enum Command {
     },
 }
 
+#[derive(Subcommand)]
+enum DelegationAction {
+    /// Approval requests of this workspace's delegated children.
+    Approvals {
+        #[command(subcommand)]
+        action: ApprovalsAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ApprovalsAction {
+    /// The pending requests (all of them with `--all`).
+    List {
+        #[arg(long)]
+        all: bool,
+    },
+    /// One request in full: who asked, the chain, what it would do.
+    Show { id: String },
+    /// Allow ONE call of ONE request: shows it, then asks for the id typed
+    /// back. The child runs the call once, if it is still waiting.
+    Allow {
+        /// The full request id (no prefix, no pattern).
+        id: String,
+        /// Skip typing the id back (the id above is the confirmation).
+        #[arg(long)]
+        yes: bool,
+        /// Pin the content: 12 or more hex characters of the fingerprint
+        /// `show` prints.
+        #[arg(long, value_name = "HEX")]
+        fingerprint: Option<String>,
+    },
+    /// Deny a request (no answer is a denial too).
+    Deny { id: String },
+}
+
 /// `tole config <action>` — an enum so later parts can add variants.
 #[derive(Subcommand)]
 enum DiscussAction {
@@ -803,6 +845,7 @@ fn gate_policy(cmd: &Command) -> GatePolicy {
         | Command::Skills { .. }
         | Command::Curator { .. }
         | Command::Audit { .. }
+        | Command::Delegation { .. }
         | Command::Discuss {
             action: DiscussAction::List { .. } | DiscussAction::Show { .. },
         } => GatePolicy::Skip,
@@ -1757,6 +1800,10 @@ fn dispatch(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::Discuss { action } => discuss_command(action, cfg.as_ref()),
+        Command::Delegation { action } => {
+            let root = resolve_workspace_root(host.workspace.as_ref())?;
+            delegation_command(action, &root)
+        }
         Command::Audit { goal, json, .. } => {
             let root = resolve_workspace_root(host.workspace.as_ref())?;
             let data = tole_core::paths::tole_data_dir().ok_or_else(|| {
@@ -1932,6 +1979,56 @@ impl HostConfig {
 }
 
 /// `tole discuss` (#588): the owner-only entry point.
+/// `tole delegation approvals ...` (#714): the owner answers a delegated
+/// child's request. `allow` and `deny` refuse under an agent session first.
+fn delegation_command(action: DelegationAction, root: &Path) -> Result<()> {
+    use tole_cli::approvals_owner as ao;
+    let DelegationAction::Approvals { action } = action;
+    let data = tole_core::paths::tole_data_dir()
+        .ok_or_else(|| anyhow!("cannot resolve the tole data dir (set CODECORA_HOME or HOME)"))?;
+    let log = tole_cli::delegate::log_path(&data, root)
+        .ok_or_else(|| anyhow!("cannot canonicalize the workspace {}", root.display()))?;
+    let store = tole_cli::delegated_approver::Store::new(log);
+    let secrets = tole_cli::provider_chain::process_secrets(&tole_cli::config_apply::real_env);
+    let ctx = ao::Ctx {
+        store: &store,
+        secrets: &secrets,
+        now: tole_cli::delegated_approver::real_now(),
+    };
+    let env = &tole_cli::config_apply::real_env;
+    let allow = tole_core::delegation_approvals::Choice::Allow;
+    let deny = tole_core::delegation_approvals::Choice::Deny;
+    let out = match action {
+        ApprovalsAction::List { all } => ao::list(&ctx, all),
+        ApprovalsAction::Show { id } => ao::show(&ctx, &id),
+        ApprovalsAction::Deny { id } => ao::decide(&ctx, env, &id, deny, None, ao::Confirm::Yes),
+        ApprovalsAction::Allow {
+            id,
+            yes,
+            fingerprint,
+        } => {
+            let mut ask = |text: &str| {
+                use std::io::{BufRead, Write};
+                print!("{text}\ntype the request id to allow it: ");
+                // A failed flush shows up as an empty answer: not allowed.
+                let _ = std::io::stdout().flush();
+                let mut line = String::new();
+                let _ = std::io::stdin().lock().read_line(&mut line);
+                line
+            };
+            let confirm = if yes {
+                ao::Confirm::Yes
+            } else {
+                ao::Confirm::Typed(&mut ask)
+            };
+            ao::decide(&ctx, env, &id, allow, fingerprint.as_deref(), confirm)
+        }
+    }
+    .map_err(anyhow::Error::msg)?;
+    print!("{out}");
+    Ok(())
+}
+
 fn discuss_command(action: DiscussAction, cfg: Option<&tole_cli::config::Config>) -> Result<()> {
     use tole_cli::discuss;
     let dir = discuss::dir().map_err(anyhow::Error::msg)?;
