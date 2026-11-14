@@ -947,6 +947,12 @@ fn dispatch(cli: Cli) -> Result<()> {
     // Scoped secret release (#598): which tools may hand which secret to
     // the processes they start. Every launcher reads it from here.
     tole_core::secret_release::set_release(cfg.as_ref().map(|c| c.release()).unwrap_or_default());
+    // Extra sensitive file names (#683): user globs plus the project's.
+    tole_core::sensitive::set_extra(
+        cfg.as_ref()
+            .and_then(|c| c.sensitive_files.clone())
+            .unwrap_or_default(),
+    );
     // The selected profile (#584): resolved once, from the layered config
     // (the user layer is its only source). Reads its persona file and
     // nothing else; an unknown name is a startup error. `tole cron`

@@ -384,6 +384,44 @@ fn check_secret(name: &str, b: &SecretBinding) -> Result<(), String> {
     Ok(())
 }
 
+/// A `sensitive_files` entry (#683): a bare file NAME glob (`*` wildcards),
+/// no directory part, at most 128 chars, no control characters.
+fn check_sensitive_glob(g: &str) -> Result<(), String> {
+    if g.trim().is_empty()
+        || g.len() > 128
+        || g.contains(['/', '\\'])
+        || g.chars().any(char::is_control)
+        || g.chars().all(|c| c == '*')
+    {
+        return Err(
+            "sensitive_files: every entry must be a file name or a name glob with `*` \
+             (no directory, not only `*`), e.g. \"*.secret\" or \"vault-*.json\""
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// The sensitive-name globs of the layered config (#683): the user layer's
+/// list followed by the project's. A project can only ADD names (more
+/// files are redacted); nothing a config says can make a built-in name
+/// readable.
+fn layered_sensitive(
+    project: &Option<Vec<String>>,
+    user: &Option<Vec<String>>,
+) -> Option<Vec<String>> {
+    if project.is_none() && user.is_none() {
+        return None;
+    }
+    let mut out: Vec<String> = user.clone().unwrap_or_default();
+    for g in project.iter().flatten() {
+        if !out.contains(g) {
+            out.push(g.clone());
+        }
+    }
+    Some(out)
+}
+
 /// The consumers a layer leaves `name` bound to: its own entry, else the
 /// built-in default (`GITHUB_TOKEN` for gh, git, hook and mcp).
 fn bound_tools(layer: &Option<BTreeMap<String, SecretBinding>>, name: &str) -> Vec<String> {
@@ -592,6 +630,9 @@ pub struct Config {
     /// Scoped secret release (#598), see [`SecretBinding`]; a project
     /// layer can only narrow it.
     pub secrets: Option<BTreeMap<String, SecretBinding>>,
+    /// Extra sensitive file-name globs (#683), e.g. `["*.secret"]`; the
+    /// project layer's list is added to the user's, never replaces it.
+    pub sensitive_files: Option<Vec<String>>,
     /// Keys (rendered names, e.g. `model`, `mission.verify`) whose value
     /// came from the user layer; set by [`layered`], never by the file.
     #[serde(skip)]
@@ -796,6 +837,9 @@ pub fn parse(src: &str, path: &Path) -> Result<Config, ConfigError> {
     }
     for (name, b) in cfg.secrets.iter().flatten() {
         check_secret(name, b).map_err(range)?;
+    }
+    for g in cfg.sensitive_files.iter().flatten() {
+        check_sensitive_glob(g).map_err(range)?;
     }
     if let Some(r) = &cfg.router {
         crate::routing::compile(r).map_err(range)?;
@@ -1009,6 +1053,8 @@ pub fn layered(project: &Config, user: &Config) -> Config {
         router: crate::routing::layered(&project.router, &user.router),
         // A project may only narrow the secret release (#598).
         secrets: layered_secrets(&project.secrets, &user.secrets),
+        // A project can only add sensitive names (#683).
+        sensitive_files: layered_sensitive(&project.sensitive_files, &user.sensitive_files),
         user_keys: BTreeSet::new(),
     };
     if let Some(c) = &user.cron {
@@ -1186,6 +1232,7 @@ pub fn render_with(cfg: &Config, tag: &str, ann: &Annotations) -> Vec<String> {
     list(&mut out, "on_posttool", &cfg.on_posttool);
     list(&mut out, "on_turnend", &cfg.on_turnend);
     list(&mut out, "skill", &cfg.skill);
+    list(&mut out, "sensitive_files", &cfg.sensitive_files);
     scalar(&mut out, "no_skills", cfg.no_skills.map(|b| b.to_string()));
     scalar(
         &mut out,
@@ -2166,6 +2213,27 @@ verify_timeout = 60
         let only_user = layered(&Config::default(), &user);
         assert_eq!(only_user.model.as_deref(), Some("u"));
         assert!(only_user.user_keys.contains("model"));
+    }
+
+    #[test]
+    fn sensitive_files_are_validated_and_a_project_can_only_add() {
+        let user = parse("sensitive_files = [\"*.secret\"]\n", &p()).unwrap();
+        let project = parse("sensitive_files = [\"vault-*.json\", \"*.secret\"]\n", &p()).unwrap();
+        let l = layered(&project, &user);
+        assert_eq!(
+            l.sensitive_files,
+            Some(vec!["*.secret".to_string(), "vault-*.json".to_string()])
+        );
+        // A project with an empty list does not drop the user's.
+        let empty = parse("sensitive_files = []\n", &p()).unwrap();
+        assert_eq!(
+            layered(&empty, &user).sensitive_files,
+            Some(vec!["*.secret".to_string()])
+        );
+        for bad in ["\"\"", "\"*\"", "\"a/b.env\"", "\"a\\\\b\""] {
+            let e = parse(&format!("sensitive_files = [{bad}]\n"), &p()).unwrap_err();
+            assert!(e.message.contains("sensitive_files"), "{bad}: {e}");
+        }
     }
 
     #[test]

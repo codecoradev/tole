@@ -1,6 +1,11 @@
 //! Sensitive files (#598 part b, design `secrets-integrations-design.md` §4):
 //! files whose content is a secret by convention: `.env*`, `*.pem`, `id_*`,
-//! `.npmrc`, `.netrc`, `*.key` (file name, case-insensitive).
+//! `.npmrc`, `.netrc`, `*.key` (file name, case-insensitive), plus (#683)
+//! `*.env`, `*.env.*`, `credentials`, `.git-credentials`, `.pgpass`,
+//! `.htpasswd`, `.pypirc`, `.dockercfg`, `.docker/config.json`, `*.p12`,
+//! `*.pfx`, `*.jks`, `*.keystore`, `*.tfvars`, `kubeconfig` and
+//! `secrets.y*ml`, and any name matching the configured `sensitive_files`
+//! globs (see [`set_extra`]).
 //!
 //! Every tool that returns file bytes shows such a file redacted:
 //! `read_file` returns `KEY=«redacted»` lines (a key file one marker), the
@@ -14,20 +19,89 @@
 
 use serde_json::Value;
 use std::path::Path;
+use std::sync::RwLock;
 
 /// What a hidden value (or a whole key file) becomes.
 pub const REDACTED: &str = "«redacted»";
 
+/// Extra name globs from the config (#683): lowercase, `*` wildcards only.
+static EXTRA: RwLock<Vec<String>> = RwLock::new(Vec::new());
+
+/// Sets the process's extra sensitive-name globs (the host does this once,
+/// from the layered config: the user layer's list plus the project layer's,
+/// which can only add).
+pub fn set_extra(globs: Vec<String>) {
+    if let Ok(mut g) = EXTRA.write() {
+        *g = globs.iter().map(|g| g.to_ascii_lowercase()).collect();
+    }
+}
+
+/// Whether `name` matches `glob` (`*` is any run of characters, the rest is
+/// literal). Both are expected lowercase.
+pub fn glob_match(glob: &str, name: &str) -> bool {
+    let parts: Vec<&str> = glob.split('*').collect();
+    if parts.len() == 1 {
+        return glob == name;
+    }
+    let (first, last) = (parts[0], parts[parts.len() - 1]);
+    if name.len() < first.len() + last.len() || !name.starts_with(first) || !name.ends_with(last) {
+        return false;
+    }
+    let mut rest = &name[first.len()..name.len() - last.len()];
+    for mid in &parts[1..parts.len() - 1] {
+        match rest.find(mid) {
+            Some(i) => rest = &rest[i + mid.len()..],
+            None => return false,
+        }
+    }
+    true
+}
+
 /// Whether a file NAME is sensitive (case-insensitive).
 pub fn is_sensitive_name(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
-    n.starts_with(".env") || n == ".npmrc" || n == ".netrc" || is_key_name(&n)
+    n.starts_with(".env")
+        || n.ends_with(".env")
+        || n.contains(".env.")
+        || matches!(
+            n.as_str(),
+            ".npmrc"
+                | ".netrc"
+                | "credentials"
+                | ".git-credentials"
+                | ".pgpass"
+                | ".htpasswd"
+                | ".pypirc"
+                | ".dockercfg"
+                | "kubeconfig"
+        )
+        || n.ends_with(".tfvars")
+        || glob_match("secrets.y*ml", &n)
+        || is_key_name(&n)
+        || EXTRA
+            .read()
+            .is_ok_and(|g| g.iter().any(|p| glob_match(p, &n)))
+}
+
+/// Whether a file at `p` is sensitive: its name, or `config.json` directly
+/// under a `.docker` directory (it holds registry auth).
+fn is_sensitive_file(p: &Path) -> bool {
+    let name = file_name(p);
+    is_sensitive_name(name)
+        || (name.eq_ignore_ascii_case("config.json")
+            && p.parent()
+                .and_then(Path::file_name)
+                .and_then(|n| n.to_str())
+                .is_some_and(|d| d.eq_ignore_ascii_case(".docker")))
 }
 
 /// Key material: shown as one marker, never line by line.
 fn is_key_name(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
-    n.ends_with(".pem") || n.ends_with(".key") || n.starts_with("id_")
+    [".pem", ".key", ".p12", ".pfx", ".jks", ".keystore"]
+        .iter()
+        .any(|e| n.ends_with(e))
+        || n.starts_with("id_")
 }
 
 fn file_name(p: &Path) -> &str {
@@ -37,7 +111,7 @@ fn file_name(p: &Path) -> &str {
 /// Whether reading `requested` (the name it was asked by), whose real path
 /// is `real`, is sensitive: either name matches.
 pub fn is_sensitive_path(requested: &Path, real: &Path) -> bool {
-    is_sensitive_name(file_name(requested)) || is_sensitive_name(file_name(real))
+    is_sensitive_file(requested) || is_sensitive_file(real)
 }
 
 /// The redacted view of a sensitive file's content. A key file (either
@@ -82,7 +156,7 @@ pub fn redact_diff(diff: &str) -> String {
                     .strip_prefix("a/")
                     .or_else(|| t.strip_prefix("b/"))
                     .unwrap_or(t);
-                is_sensitive_name(file_name(Path::new(t.trim_matches('"'))))
+                is_sensitive_file(Path::new(t.trim_matches('"')))
             });
             in_hunk = false;
             out.push_str(line);
@@ -125,7 +199,7 @@ pub fn redact_hits(v: &mut Value) {
             let names_sensitive = PATH_KEYS.iter().any(|k| {
                 map.get(*k).and_then(Value::as_str).is_some_and(|p| {
                     let p = p.split(':').next().unwrap_or(p);
-                    is_sensitive_name(file_name(Path::new(p)))
+                    is_sensitive_file(Path::new(p))
                 })
             });
             for (k, val) in map.iter_mut() {
@@ -190,6 +264,75 @@ mod tests {
             Path::new("/w/plain.txt")
         ));
         assert!(!is_sensitive_path(Path::new("a.rs"), Path::new("/w/a.rs")));
+    }
+
+    #[test]
+    fn common_secret_files_are_sensitive() {
+        for n in [
+            "prod.env",
+            "config.env",
+            "Prod.ENV",
+            "app.env.local",
+            "credentials",
+            ".git-credentials",
+            ".pgpass",
+            ".htpasswd",
+            ".pypirc",
+            ".dockercfg",
+            "kubeconfig",
+            "secrets.yaml",
+            "secrets.yml",
+            "terraform.tfvars",
+            "prod.auto.tfvars",
+            "cert.p12",
+            "client.pfx",
+            "app.jks",
+            "release.keystore",
+        ] {
+            assert!(is_sensitive_name(n), "{n}");
+        }
+        for n in [
+            "secrets.yaml.rs",
+            "credentials.rs",
+            "tfvars.md",
+            "my.envelope",
+        ] {
+            assert!(!is_sensitive_name(n), "{n}");
+        }
+        assert!(is_sensitive_path(
+            Path::new(".docker/config.json"),
+            Path::new("/w/.docker/config.json")
+        ));
+        assert!(!is_sensitive_path(
+            Path::new("app/config.json"),
+            Path::new("/w/app/config.json")
+        ));
+        // Binary stores are one marker, never line by line.
+        assert_eq!(
+            redact_content(Path::new("a.p12"), Path::new("/w/a.p12"), "x=1\n"),
+            REDACTED
+        );
+        // The diff filter and search hits use the same rule.
+        let d = "diff --git a/prod.env b/prod.env\n@@ -1 +1 @@\n-A=1\n+A=2\n";
+        assert!(!redact_diff(d).contains("A=2"));
+        let mut v = json!({"file": "deploy/prod.env:1", "text": "A=2"});
+        redact_hits(&mut v);
+        assert_eq!(v["text"], json!(REDACTED));
+    }
+
+    #[test]
+    fn extra_globs_extend_the_rule() {
+        assert!(glob_match("vault-*.json", "vault-prod.json"));
+        assert!(glob_match("a*b*c", "aXbYc"));
+        assert!(!glob_match("a*b*c", "acb"));
+        assert!(!glob_match("*.secret", "x.secrets"));
+        assert!(glob_match("exact", "exact") && !glob_match("exact", "exact2"));
+        set_extra(vec!["Vault-*.JSON".into(), "*.secret".into()]);
+        let hit = is_sensitive_name("vault-prod.json") && is_sensitive_name("db.SECRET");
+        let miss = !is_sensitive_name("vault.json");
+        set_extra(Vec::new());
+        assert!(hit && miss);
+        assert!(!is_sensitive_name("vault-prod.json"));
     }
 
     #[test]
