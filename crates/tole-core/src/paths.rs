@@ -112,6 +112,7 @@ pub(crate) fn with_env<R>(vars: &[(&str, Option<&str>)], f: impl FnOnce() -> R) 
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     fn p(s: &str) -> Option<PathBuf> {
         Some(PathBuf::from(s))
     }

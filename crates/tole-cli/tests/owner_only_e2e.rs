@@ -10,8 +10,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(unix)]
 use serde_json::json;
+#[cfg(unix)]
 use tole_core::run_command::RunCommandTool;
+#[cfg(unix)]
 use tole_core::tool::Tool;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);

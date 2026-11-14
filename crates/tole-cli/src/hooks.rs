@@ -263,6 +263,7 @@ mod tests {
         std::fs::write(&short, "too-short\n").unwrap();
         let big = d.join("big");
         std::fs::write(&big, "k".repeat(5_000)).unwrap();
+        #[cfg(unix)]
         let link = d.join("link");
         std::fs::write(d.join("real"), KEY).unwrap();
         #[cfg(unix)]
@@ -271,6 +272,7 @@ mod tests {
             hmac_key_file: Some(p.display().to_string()),
             ..HookConfig::default()
         };
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut cases = vec![
             (HookConfig::default(), "no key"),
             (
