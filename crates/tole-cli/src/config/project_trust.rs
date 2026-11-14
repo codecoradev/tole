@@ -590,5 +590,5 @@ pub fn trust_line(subject: &Subject, store_path: &Path) -> Result<String> {
 }
 
 #[cfg(test)]
-#[path = "config_trust_tests.rs"]
+#[path = "project_trust_tests.rs"]
 mod tests;

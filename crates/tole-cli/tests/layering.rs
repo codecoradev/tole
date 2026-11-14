@@ -31,8 +31,7 @@ use std::path::Path;
 /// Faces: diagnostics and the hook command surface.
 #[rustfmt::skip]
 const KERNEL_MODULES: &[&str] = &[
-    "config", "config_apply", "config_trust", "trust", "hook_filter", "routing", "profile",
-    "session_settings", "owner_only", "discussion_roles", "hooks", "approvals", "approver",
+    "config", "hooks", "approvals", "approver",
     "auth", "protocol", "sibling", "handoff", "tools", "web_builtin", "advisor_host",
     "review_gate",
 ];
@@ -44,7 +43,7 @@ const ENGINE_MODULES: &[&str] = &[
     "discuss_tool", "discussion_host", "skill_approve", "skill_drafts_cli", "skill_recall",
     "skill_propose", "skill_outcome", "curator_cmd", "cron", "tool_roster", "provider_chain",
     "turn_runner", "compaction_host", "session_host", "session_index", "session_tools",
-    "usage_report", "status", "tui_host", "export", "events", "serve_images", 
+    "usage_report", "status", "tui_host", "export", "events", "serve_images",
 ];
 #[rustfmt::skip]
 const FACE_MODULES: &[&str] = &["doctor", "ecosystem", "hook_cli"];
@@ -56,7 +55,19 @@ const BASELINE: &[(&str, &str, &str)] = &[
 ];
 
 /// Old top-level paths that are now re-exports of a module inside another one.
-const ALIASES: &[(&str, &str)] = &[("plugin_gate", "plugin"), ("plugin_cmd", "plugin")];
+const ALIASES: &[(&str, &str)] = &[
+    ("config_apply", "config"),
+    ("config_trust", "config"),
+    ("trust", "config"),
+    ("hook_filter", "config"),
+    ("routing", "config"),
+    ("profile", "config"),
+    ("session_settings", "config"),
+    ("owner_only", "config"),
+    ("discussion_roles", "config"),
+    ("plugin_gate", "plugin"),
+    ("plugin_cmd", "plugin"),
+];
 
 fn level_of(module: &str) -> Option<u8> {
     [KERNEL_MODULES, ENGINE_MODULES, FACE_MODULES]
