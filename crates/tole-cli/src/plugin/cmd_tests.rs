@@ -629,3 +629,24 @@ fn an_unreadable_ledger_is_said_not_silently_skipped() {
     let out = h.run(&v1(), LIST).unwrap();
     assert!(!out.contains("ledger unreadable"), "{out}");
 }
+
+#[test]
+fn a_project_pin_to_another_hash_does_not_block_other_workspaces() {
+    // The ledger holds the user's decisions and is compared with the user
+    // lock: a project lock that pins something else only narrows its own
+    // workspace, and another workspace (no project lock) is unaffected.
+    let h = H::new("projhash", &["cora"]);
+    h.run(&v1(), approve("cora", Some(&hash(&v1())))).unwrap();
+    let path = Lockfile::project_path(&h.dir.join("ws"));
+    let mut project = Lockfile::load(&h.user()).unwrap();
+    project.servers.get_mut("cora").unwrap().manifest_hash = "sha256:newer".into();
+    project.save(&path).unwrap();
+    let out = h.run(&v1(), LIST).unwrap();
+    assert_eq!(rows(&out)[0]["state"], json!("revoked"), "{out}");
+    assert!(
+        !out.contains("edited by hand"),
+        "the project pin is not a hand edit of the user lock: {out}"
+    );
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(h.rows(&v1())[0]["state"], json!("approved"));
+}
