@@ -9,7 +9,7 @@
 
 #[path = "support/test_dir.rs"]
 mod test_dir;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, Instant};
 use test_dir::TestDir;
 use tole_core::mcp::{probe_manifest, probe_manifest_within, McpServerConfig};

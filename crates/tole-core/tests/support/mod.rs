@@ -8,7 +8,7 @@ mod test_dir;
 #[allow(unused_imports)]
 pub use test_dir::{ChildGuard, TestDir, WorkDir};
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, Instant};
 use tole_core::mcp::{register_server_tools, McpServerConfig};
 use tole_core::plugin_lock::ManifestTool;
