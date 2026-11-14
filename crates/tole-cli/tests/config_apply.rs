@@ -268,6 +268,7 @@ fn f_modifying_the_trusted_file_fails_closed_again() {
 
 // ------------------------------------------- (g) server faces never hang
 
+#[cfg(feature = "shell-tools")]
 fn assert_fails_fast_untrusted(args: &[&str]) {
     let (d, home) = project("model = \"m\"\n");
     // Piped (never closed by us) stdin: a prompt would block forever.
