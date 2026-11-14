@@ -31,8 +31,8 @@ pub mod hook_filter;
 pub mod hooks;
 pub mod ledger_file;
 pub mod machine_guard;
-#[cfg(feature = "mcp")]
 pub mod owner_only;
+#[cfg(feature = "mcp")]
 pub mod plugin_cmd;
 pub mod plugin_gate;
 pub mod profile;
