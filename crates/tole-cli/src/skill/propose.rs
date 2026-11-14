@@ -234,5 +234,5 @@ impl Tool for SkillProposeTool {
 }
 
 #[cfg(test)]
-#[path = "skill_propose_tests.rs"]
+#[path = "propose_tests.rs"]
 mod tests;

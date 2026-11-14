@@ -84,5 +84,5 @@ pub fn record_mission(status: &str) {
 }
 
 #[cfg(test)]
-#[path = "skill_outcome_tests.rs"]
+#[path = "outcome_tests.rs"]
 mod tests;

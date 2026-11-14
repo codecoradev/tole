@@ -47,7 +47,20 @@ pub use config::session_settings;
 pub use config::trust;
 #[cfg(feature = "shell-tools")]
 pub mod cron;
-pub mod curator_cmd;
+pub mod skill;
+// `skill/` holds these modules; the re-exports keep the old top-level paths working.
+#[doc(inline)]
+pub use skill::approve as skill_approve;
+#[doc(inline)]
+pub use skill::curator as curator_cmd;
+#[doc(inline)]
+pub use skill::drafts as skill_drafts_cli;
+#[doc(inline)]
+pub use skill::outcome as skill_outcome;
+#[doc(inline)]
+pub use skill::propose as skill_propose;
+#[doc(inline)]
+pub use skill::recall as skill_recall;
 pub mod discuss;
 // `discuss/` holds the modules below; these re-exports keep the old top-level paths working.
 #[doc(inline)]
@@ -80,11 +93,6 @@ pub mod session_host;
 pub mod session_index;
 pub mod session_tools;
 pub mod sibling;
-pub mod skill_approve;
-pub mod skill_drafts_cli;
-pub mod skill_outcome;
-pub mod skill_propose;
-pub mod skill_recall;
 pub mod status;
 pub mod tool_roster;
 pub mod tools;
