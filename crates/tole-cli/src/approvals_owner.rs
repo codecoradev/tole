@@ -316,6 +316,27 @@ pub fn decide(
     })
 }
 
+/// The `tole doctor` line for the mode (#714): what a delegated child does
+/// at a Write its allow list does not cover.
+pub fn doctor_line(cfg: &crate::config::Config) -> String {
+    use tole_core::delegation_approvals::{
+        ApprovalsMode, DEFAULT_APPROVAL_SECS, DEFAULT_LEVEL_SECS,
+    };
+    let d = cfg.delegation.as_ref();
+    let mode = d.and_then(|d| d.approvals).unwrap_or_default();
+    let secs = d
+        .and_then(|d| d.approval_secs)
+        .unwrap_or(DEFAULT_APPROVAL_SECS as u64);
+    let level = d
+        .and_then(|d| d.approval_level_secs)
+        .unwrap_or(DEFAULT_LEVEL_SECS as u64);
+    match mode {
+        ApprovalsMode::Off => "delegation approvals: off (a delegated child's Write its allow list does not cover is denied at once)".into(),
+        ApprovalsMode::Owner => format!("delegation approvals: owner (the child waits up to {secs} s; answer with `tole delegation approvals`; no answer is a denial)"),
+        ApprovalsMode::Chain => format!("delegation approvals: chain (waits up to {secs} s, {level} s per level; a parent holding `delegate_decide` answers within its own list, else the owner; no answer is a denial)"),
+    }
+}
+
 #[cfg(test)]
 #[path = "approvals_owner_tests.rs"]
 mod tests;

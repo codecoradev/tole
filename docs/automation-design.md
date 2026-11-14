@@ -608,12 +608,13 @@ built-in or owner-overridden roles.
      approve a Write) and `TOLE_DISCUSSION_PARTICIPANT=1`; its only Write
      tool is `delegate_report` (one capped file: its contribution);
    - **a Write it wants is denied (fail closed), never routed to the
-     caller's allowlist.** The owner's approval surface for a delegated
-     child does not exist yet (a headless child has no approver, and the
-     `/approvals` queue belongs to serve sessions), so until #714 builds it
-     a reviewer cannot write at all (the design of that surface, a durable
-     queue with escalation up the delegation chain, is
-     [delegation-approvals-design.md](delegation-approvals-design.md)).
+     caller's allowlist.** A reviewer has no Write tool at all (plan mode)
+     and never asks for one: the owner decided (#714) that reviewers stay
+     read-only permanently, so the approval queue that now exists for
+     `delegate` and `execute` children (a durable queue with escalation up
+     the delegation chain, [delegation-approvals-design.md](delegation-approvals-design.md))
+     never carries a reviewer's request, and the `delegate_pending` and
+     `delegate_decide` tools are never registered for a participant.
      This is stricter than the decision above, not weaker;
    - no nested discussions: a session with the participant marker gets no
      delegation host (`Delegator::for_session`), so neither `discuss` nor
@@ -624,3 +625,40 @@ built-in or owner-overridden roles.
 
 Chat channels; a public skill marketplace; hosted cloud; heartbeat/"proactive"
 mode; wake word / voice; computer-use; multi-tenant org model.
+
+## 13. Delegation approvals, as built (#714)
+
+A delegated child (a `tole mission` the `delegate` tool started) used to be
+denied at once at a Write its allow list does not cover, with the result going
+nowhere the owner sees. Built in six parts, all behind `[delegation] approvals
+= "off" | "owner" | "chain"` (user config only; **default `off`**, which is
+today's behavior exactly):
+
+1. `tole_core::delegation_approvals`: the append-only `approvals.jsonl` next to
+   the delegation log (records `request`, `escalate`, `decide`, `consume`,
+   `expire`) and its fold, which re-validates every record against the
+   delegation tree (first valid decision wins, a decision and a consume bind
+   to a SHA-256 fingerprint, consume is one-shot and written before the call
+   runs, no answer is a denial).
+2. The request builder (display capped at 2 KiB, stored input at 16 KiB, one
+   open request per node and 32 per goal) and the child's `DelegatedApprover`:
+   it parks in `decide` (in process, no exit and resume), polling the log, for
+   at most `approval_secs` (default 900, cap 3600) and never past the node's
+   deadline; `interactive()` is false, so Destructive tools are not registered.
+3. `tole delegation approvals list|show|allow|deny` for the owner, and an
+   approvals section in `tole audit`.
+4. `/approvals` in `tole serve` lists and decides the same requests
+   (`dap-*` ids), next to serve's own in-memory queue, which is unchanged.
+5. Agent levels (`chain` mode): `delegate_pending` and `delegate_decide`, only
+   where `delegate` exists and only for a level whose own allow list holds a
+   `delegate_decide` grant; a level decides only what its own allow list would
+   allow, only while it is the request's current level, and never an
+   always-owner request; `escalate` moves it one level up.
+6. `tole doctor` shows the mode, the user guide
+   ([approving-delegated-work.md](approving-delegated-work.md)), the threat
+   model rows and an end-to-end test against the real binary.
+
+Not built, left for later: the `awaiting_approval` count in `delegate_poll`, a
+`fact/approval_<id>` register on the child's own session, an SSE event frame
+for serve, rotation of the approvals log, and exit-and-resume for waits longer
+than an hour.

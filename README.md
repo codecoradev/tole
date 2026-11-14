@@ -21,7 +21,8 @@ automation and secrets release:
   by task weight), and `tole serve --cron` as the in-process ticker.
 - **Profiles and delegation:** `[profiles.<name>]` personas (`--profile`), the
   `delegate` tools (budget carved from the parent, depth-limited, one completion
-  report per child), `tole audit [goal] [--json]` to read the tree, the advisor tier
+  report per child), `tole audit [goal] [--json]` to read the tree, an opt-in approval queue for
+  delegated children (`tole delegation approvals`), the advisor tier
   (`consult_advisor`) and `tole discuss` / the `discuss` tools for budgeted
   multi-round discussions (`tole audit --discussions` reads them).
 - **Skills:** approval is required by default (`tole skills approve`), agents grow
@@ -371,7 +372,7 @@ type or a secret-like key is an error with `file:line`; the file is capped at
 | `[cron]` `daily_token_cap` | (none) | **user config only** (a project's `[cron]` is ignored): tokens all cron agent runs of one UTC day may spend; past it they settle `budget` |
 | `[delegation]` `max_depth`, `max_live_processes`, `goal_budget`, `goal_steps`, `goal_minutes` | (none) | **user config only** (a project's `[delegation]` is ignored): depth below the orchestrator (1–3, default 2), delegated processes live at once before spawns queue (default 8), and a goal's default budget (1,000,000 tokens, 400 steps, 120 minutes; used by the `delegate` tool, next PR) |
 | `[delegation]` `min_free_memory_mb`, `child_memory_mb`, `max_load_per_cpu`, `min_free_disk_mb`, `min_free_pids_percent`, `spawn_interval_secs`, `machine_max_live`, `child_nice` | `1024`, `512`, `1.5`, `2048`, `10`, `2`, max(2, CPUs), `10` | **user config only**: the machine resource guard `delegate` and `delegate_poll` run before every delegated launch. A child starts only when the machine-wide live count is under `machine_max_live`, the last start was at least `spawn_interval_secs` ago, free memory covers `min_free_memory_mb` plus `child_memory_mb` for it and each child still ramping up (cgroup v2 limits count), the one-minute load per CPU is at most `max_load_per_cpu`, `min_free_pids_percent` of the process-id limit is free, and `min_free_disk_mb` is free on the data dir, workspace and worktree filesystems; otherwise the spawn waits in the queue, and the replies carry its `queued_reason` and `waited_secs` (`tole doctor` shows the headroom). Children run at niceness `child_nice`. Zero, negative or absurd values are config errors |
-| `[delegation]` `approvals`, `approval_secs`, `approval_level_secs` | `"off"`, `900`, `120` | **user config only**, for the escalating approval queue of delegated children (#714). `approvals` is `"off"`, `"owner"` or `"chain"`; with `owner` or `chain` a delegated child parks at a non-allowlisted Write instead of denying it, and no answer is a denial. No surface can answer yet (the owner's command, serve and the agent tools come in later steps), so every request expires to a denial; `off` is today's behavior exactly. `approval_secs` (1 to 3600) is how long a request may wait in all, `approval_level_secs` (1 to 3600, at most `approval_secs`) how long each agent level gets before it moves up. No answer is a denial |
+| `[delegation]` `approvals`, `approval_secs`, `approval_level_secs` | `"off"`, `900`, `120` | **user config only**, for the escalating approval queue of delegated children (#714). `approvals` is `"off"`, `"owner"` or `"chain"`; with `owner` or `chain` (both opt-in; `off` stays the default so nothing waits that did not before) a delegated child parks at a non-allowlisted Write instead of denying it, and no answer is a denial. You answer with `tole delegation approvals` or `/approvals` in `tole serve`; in `chain` mode a level holding a `delegate_decide` grant answers first, within its own allow list. `off` is today's behavior exactly. See [docs/approving-delegated-work.md](docs/approving-delegated-work.md). `approval_secs` (1 to 3600) is how long a request may wait in all, `approval_level_secs` (1 to 3600, at most `approval_secs`) how long each agent level gets before it moves up. No answer is a denial |
 | `[cron]` `max_concurrent` | `4` | **user config only**: runs one tick (`tole cron tick`, the `tole serve --cron` ticker) executes at once, 1 to 64; `tole cron tick --max-concurrent N` overrides it for that tick |
 | `[cron]` `timezone` | (none: plain UTC) | **user config only**: the time zone of a job saved without `tole cron create --timezone` (`UTC`, `+07:00` or an IANA name like `Asia/Jakarta`). Jobs saved earlier keep no zone |
 | `[cron]` `tz_source` | `system` on unix, else `offset-only` | **user config only**: where IANA zone names resolve. `system` reads the host's zoneinfo at run time (`$TZDIR`, else `/usr/share/zoneinfo`; no zone data in the binary); `offset-only` takes only `UTC` and fixed offsets |
@@ -562,6 +563,16 @@ is a follow-up. This is also the surface uteke-mobile drives —
 [docs/mobile-control.md](docs/mobile-control.md) is the mobile-control
 guide (#202).
 
+## Approving delegated work
+
+A delegated child has no terminal, so a Write its allow list does not cover is
+denied at once. With `[delegation] approvals = "owner"` (user config; the default
+is `off`) it asks instead and waits, and you answer with `tole delegation
+approvals list|show|allow|deny` or `/approvals` in `tole serve`; no answer is a
+denial. `"chain"` also lets a parent holding a `delegate_decide` grant answer
+within its own authority. `tole doctor` shows the mode. Guide:
+[docs/approving-delegated-work.md](docs/approving-delegated-work.md).
+
 ## Mission mode
 
 ```bash
@@ -645,7 +656,7 @@ injecting fewer items, and the turn proceeds without memory.
   · [PRD](docs/prd.md) · [Epics & roadmap](docs/epics.md) ·
   [Performance record](docs/perf.md) ·
   [Child-agent handoff](docs/child-agents-handoff.md)
-- Upgrading: [Migrating to 0.11](docs/migrating-0.11.md)
+- Upgrading: [Migrating to 0.11](docs/migrating-0.11.md) · Using: [Approving delegated work](docs/approving-delegated-work.md)
 - Design records: [Automation](docs/automation-design.md) ·
   [Profiles, collaboration and secrets](docs/profiles-collaboration-secrets.md) ·
   [Secrets and integrations](docs/secrets-integrations-design.md) ·
