@@ -57,6 +57,10 @@ name = "mcp_secret_grant"
 required-features = ["mcp"]
 
 [[test]]
+name = "mcp_probe"
+required-features = ["mcp"]
+
+[[test]]
 name = "mcp_sandbox"
 required-features = ["mcp"]
 
