@@ -23,7 +23,6 @@ pub use delegation::machine_guard;
 #[doc(inline)]
 pub use delegation::serve_delegation;
 pub mod approver;
-pub mod audit_discussion;
 pub mod auth;
 pub mod compaction_host;
 pub mod config;
@@ -50,8 +49,13 @@ pub use config::trust;
 pub mod cron;
 pub mod curator_cmd;
 pub mod discuss;
-pub mod discuss_tool;
-pub mod discussion_host;
+// `discuss/` holds the modules below; these re-exports keep the old top-level paths working.
+#[doc(inline)]
+pub use discuss::audit as audit_discussion;
+#[doc(inline)]
+pub use discuss::host as discussion_host;
+#[doc(inline)]
+pub use discuss::tool as discuss_tool;
 pub mod doctor;
 pub mod ecosystem;
 pub mod events;

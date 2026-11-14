@@ -957,3 +957,30 @@ fn a_project_pin_to_another_hash_does_not_block_other_workspaces() {
     std::fs::remove_file(&path).unwrap();
     assert_eq!(h.rows(&v1())[0]["state"], json!("approved"));
 }
+
+#[test]
+fn approving_a_newer_manifest_with_project_leaves_every_workspace_consistent() {
+    // `approve --project` approves in the USER lock first (that is the
+    // ledger line) and copies the user's entry into the project lock, so the
+    // user lock and the ledger always agree; dropping the project lock (or
+    // another workspace without one) sees the same approved hash.
+    let h = H::new("projbump", &["cora"]);
+    h.run(&v1(), approve("cora", Some(&hash(&v1())))).unwrap();
+    let mut v2 = v1();
+    v2.1[0].description.push_str(" Now with filters.");
+    let pin = PluginAction::Approve {
+        name: "cora".into(),
+        hash: Some(hash(&v2)),
+        project: true,
+    };
+    h.run(&v2, pin).unwrap();
+    let out = h.run(&v2, LIST).unwrap();
+    assert_eq!(rows(&out)[0]["state"], json!("approved"), "{out}");
+    assert!(!out.contains("edited by hand"), "{out}");
+    std::fs::remove_file(Lockfile::project_path(&h.dir.join("ws"))).unwrap();
+    let out = h.run(&v2, LIST).unwrap();
+    assert_eq!(rows(&out)[0]["state"], json!("approved"), "{out}");
+    assert!(!out.contains("edited by hand"), "{out}");
+    let gate = Gate::load(Some(h.user()), &h.dir.join("ws"));
+    assert!(gate.notes.is_empty(), "{:?}", gate.notes);
+}

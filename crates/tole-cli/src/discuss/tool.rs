@@ -572,5 +572,5 @@ impl Tool for DiscussStopTool {
 }
 
 #[cfg(test)]
-#[path = "discuss_tool_tests.rs"]
+#[path = "tool_tests.rs"]
 mod tests;

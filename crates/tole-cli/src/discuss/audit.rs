@@ -296,5 +296,5 @@ pub fn discussions(
 }
 
 #[cfg(test)]
-#[path = "audit_discussion_tests.rs"]
+#[path = "audit_tests.rs"]
 mod tests;
