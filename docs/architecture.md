@@ -55,6 +55,8 @@ graph TD
 | Session host | `tole-cli: session_host.rs` | Shared open/turn machinery for acp/serve/mcp sessions: per-session jail + approver, busy-flag serialization, `--sessions-dir` override |
 | Ecosystem tools | `cora_search.rs`, `uteke.rs`, `verify_package.rs`, `git.rs`, `gh.rs`, `jobs.rs`, `run_command.rs` | Probe-gated integrations (missing binary ⇒ warning, no phantom tool), argv-validated git/gh, detached jobs, registry pre-install checks |
 
+**uteke room ids.** `uteke_recall` and `uteke_document` accept the legacy room charset (`[a-zA-Z0-9-_]`, no leading hyphen) and uteke 0.24's `category:title` convention (lowercase, exactly one colon, at most 64 characters, e.g. `project:qa-check`), through one shared validator in `uteke.rs`. The built-in `repo-*`, `profile-*` and `agent-*` rooms keep their current names; migrating them is a follow-up, and uteke room aliases keep the old ids working after a rename.
+
 ## 4. Data Model — Storage Backends
 
 **Default: one JSONL file per session (`<session-id>.jsonl`)** — following the pattern proven by Claude Code, Codex (rollout files), and pi (JSONL backend). Optional SQLite backend lives behind the same `Storage` trait for query-heavy consumers.
