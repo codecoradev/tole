@@ -177,6 +177,18 @@ the session directory, or that is `$HOME` itself, `/` or `/proc`, is a
 config error that names the entry. Granting `~/.ssh` and similar is
 allowed (an owner's decision) but `tole doctor` lists it.
 
+Every grant (workspace, `read`, `write`, the install dir of the server) is
+resolved (symlinks, `..`, trailing slashes) at launch, right before the
+spawn, and the **resolved** path, never the spelling in the config, is both
+the source and the destination of the bind, so a link swapped in later is
+either followed to its new, re-checked target on the next launch or
+refused (`$HOME`, its ancestors, the data dir, `/`). Residual: a same-user
+process that swaps a path component between the final resolution and
+bubblewrap's mount is not stopped by user space alone; that attacker
+already owns the owner's account, and the sandbox is for third-party
+servers, which start inside the sandbox and cannot race a bind that
+precedes them.
+
 ## 6. Configuration
 
 Profiles and modes live in the **user config only**

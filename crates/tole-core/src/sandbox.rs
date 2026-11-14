@@ -244,12 +244,14 @@ fn detect_uncached() -> Availability {
 ///   known, an ancestor of `/home` or `/root` is refused instead;
 /// - the tole data dir, anything inside it, or any ancestor of it.
 ///
-/// Names the offending entry.
+/// Returns the RESOLVED path: the caller must bind that one, never the
+/// original, so a symlink swapped in after the check cannot redirect the
+/// bind. Names the offending entry on refusal.
 pub fn check_grant(
     path: &Path,
     home: Option<&Path>,
     data_dir: Option<&Path>,
-) -> Result<(), String> {
+) -> Result<PathBuf, String> {
     let shown = path.display();
     let p = std::fs::canonicalize(path)
         .map_err(|e| format!("sandbox: cannot resolve {shown} ({e}); it is not granted"))?;
@@ -277,7 +279,7 @@ pub fn check_grant(
             ));
         }
     }
-    Ok(())
+    Ok(p)
 }
 
 /// The `bwrap` argument list (without the program name) that runs
@@ -434,27 +436,33 @@ pub fn plan(
 fn build(p: &Policy, env: &Env, server: (&str, &str, &[String])) -> Result<Vec<OsString>, String> {
     let (name, command, args) = server;
     let (home, data_dir) = (env.home.as_deref(), env.data_dir.as_deref());
-    let ws = env.workspace.as_deref();
-    if p.profile.workspace != Workspace::None {
-        let ws = ws.ok_or("no workspace to bind")?;
-        check_grant(ws, home, data_dir)?;
-    }
-    for e in p.profile.read.iter().chain(&p.profile.write) {
-        check_grant(e, home, data_dir)?;
-    }
+    // Everything bound below is the resolved path `check_grant` validated.
+    let ws = match (p.profile.workspace, env.workspace.as_deref()) {
+        (Workspace::None, _) => None,
+        (_, None) => return Err("no workspace to bind".into()),
+        (_, Some(w)) => Some(check_grant(w, home, data_dir)?),
+    };
+    let mut profile = p.profile.clone();
+    let grant = |v: &[PathBuf]| -> Result<Vec<PathBuf>, String> {
+        v.iter().map(|e| check_grant(e, home, data_dir)).collect()
+    };
+    profile.read = grant(&p.profile.read)?;
+    profile.write = grant(&p.profile.write)?;
     let program = which(command, env.path.as_deref())
         .ok_or_else(|| format!("cannot find the server command {command:?} on PATH ({name})"))?;
     let system = ["/usr", "/bin", "/sbin", "/lib"];
-    let prefix = program
-        .parent()
-        .filter(|d| !system.iter().any(|s| d.starts_with(s)))
-        .map(Path::to_path_buf);
-    if let Some(d) = &prefix {
-        check_grant(d, home, data_dir)?;
+    let mut program = program;
+    let mut prefix = None;
+    if let (Some(dir), Some(file)) = (program.parent(), program.file_name()) {
+        if !system.iter().any(|s| dir.starts_with(s)) {
+            let dir = check_grant(dir, home, data_dir)?;
+            program = dir.join(file);
+            prefix = Some(dir);
+        }
     }
     Ok(bwrap_args(
-        &p.profile,
-        ws,
+        &profile,
+        ws.as_deref(),
         prefix.as_deref(),
         &program,
         args,
