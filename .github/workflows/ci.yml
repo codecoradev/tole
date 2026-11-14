@@ -200,7 +200,11 @@ jobs:
           bwrap --unshare-all --unshare-user --disable-userns --ro-bind / / true && echo "bwrap works"
       - name: Sandbox tests
         run: |
-          cargo test -p tole-core \
+          set -o pipefail
+          cargo test -p tole-core --features mcp \
             --test mcp_sandbox --test mcp_sandbox_lifecycle --test mcp_sandbox_idle \
             -- --nocapture --test-threads=1 2>&1 | tee sandbox.log
+          # Belt and braces: TOLE_REQUIRE_BWRAP already fails a skip, and the
+          # tests must really have run (not zero tests, no SKIPPED line).
           if grep -n "SKIPPED" sandbox.log; then echo "a sandbox test was skipped"; exit 1; fi
+          [ "$(grep -c '^test result: ok\. [1-9]' sandbox.log)" -eq 3 ] || { echo "expected 3 test targets with passing tests"; exit 1; }
