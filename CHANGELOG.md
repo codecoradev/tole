@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Approval records and their fold for delegated children, part 1 of #714 (`tole_core::delegation_approvals`, `docs/delegation-approvals-design.md`). An append-only `approvals.jsonl` format with `request`, `escalate`, `decide`, `consume` and `expire` records, folded against the delegation tree: the first valid decision wins, a decision binds to the request's SHA-256 fingerprint (node, session, tool, canonical raw input, target, workspace), a consume is one-shot and written before the call runs, no answer is a denial, and every record is re-validated (forged, out-of-order, replayed, oversized and unknown-field records are ignored). The chain of levels is recorded per request. New `[delegation] approvals` (`off`, `owner`, `chain`; default `off`), `approval_secs` and `approval_level_secs` keys, user config only. Nothing reads the records yet, so there is no behavior change.
+
 ## [0.11.0] — 2026-11-14
 
 ### Security

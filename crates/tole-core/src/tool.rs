@@ -12,7 +12,8 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 
 /// What a tool is allowed to touch. Drives the approval gate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Risk {
     /// Pure read: runs without approval; replay-safe.
     ReadOnly,
