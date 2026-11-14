@@ -5,7 +5,9 @@ Status: **design with owner decisions of 2026-11-14 (§16); #601, epic
 `tole_core::sandbox` and its wiring into the stdio MCP launch (opt-in
 `[sandbox]` in the user config: `mode` off, optional or required,
 profiles `server` and `strict`, network `none` or `host`, connections
-keyed by server name and workspace) and a `tole doctor` line; the rest of
+keyed by server name and workspace) and a `tole doctor` line, plus the first
+slice of phase 4 (#748, §9.3): opt-in `[sandbox.consumers]` for `run_command`
+and `job_start` with the built-in `command` profile and rlimits; the rest of
 §15 is not. Builds on [third-party-plugins-design.md](third-party-plugins-design.md)
 §4.2–4.3 and [secrets-integrations-design.md](secrets-integrations-design.md),
 and on the #594 audit (#675–#684). The feasibility results in §3 were
@@ -214,7 +216,8 @@ hosts = ["api.github.com"]
 profile = "github"
 mode = "required"            # "required" | "optional" | "off"
 
-[sandbox.consumers]          # opt-in for model-driven commands (§9.2)
+[sandbox.consumers]          # opt-in for model-driven commands (§9.2); as built, the
+                             # keys are modes, not profile names: see §9.3
 run_command = "command"      # profile name, or absent = not sandboxed
 job_start = "command"
 cron = "command"
@@ -336,6 +339,86 @@ Notes per consumer:
   tools; they are not wrapped. Their own model commands follow their own
   `[sandbox.consumers]`.
 
+### 9.3 Model commands as implemented (#748, first slice)
+
+Only `run_command` and `job_start` are consumers so far. `verify`, the stop
+gates, cron scripts and deliveries run as before (the owner decided they
+move later, `verify` and `turnend` to sandboxed-by-default); nothing here
+changes their defaults.
+
+```toml
+[sandbox.consumers]            # user config only; every key optional
+run_command = "required"       # "off" (default) | "optional" | "required"
+job_start   = "optional"
+network     = "none"           # "none" (default) | "host" (explicit opt-in)
+cpu_secs     = 3600            # 1 to 86400
+memory_mb    = 16384           # 256 to 1048576, address space per process
+processes    = 4096            # 16 to 65536, processes and threads
+file_size_mb = 4096            # 1 to 1048576, largest file a process writes
+```
+
+- **Profile.** The built-in `command` profile (`tole_core::sandbox::command`):
+  the workspace writable, `.git/hooks`, `.git/config` and `.tole` read-only on
+  top of it, the data dir and `$HOME` absent, a private `/proc`, writable
+  `/tmp` and scratch (tmpfs, gone with the sandbox), no network unless
+  `network = "host"`, and the fixed flags of §5 (`--unshare-all
+  --unshare-user --disable-userns --cap-drop ALL --new-session`,
+  `--die-with-parent` for `run_command`, not for the detached `job_start`).
+  There are no per-consumer profile names yet: `read` / `write` extras and the
+  `[sandbox.profiles]` table are later work.
+- **Workspace.** The session's own directory, passed with every call
+  (`run_command`: its working directory; `job_start`: the workspace root), never
+  kept in process state. It is resolved and refused like every grant (`$HOME`,
+  an ancestor of it, the data dir, `/`), and then the resolved path is the bind.
+  The protected sub-paths are resolved at launch too: a link is followed, its
+  target is what is bound read-only, and one that leads out of the workspace is
+  not in the view at all.
+- **Program and argv.** The command line is split to argv by the tool as
+  before and passed to `bwrap` after `--`; the program is found by bare name
+  on the absolute entries of tole's `PATH` (a relative entry would mean
+  something else inside) and run by its resolved path. A program outside the
+  system dirs gets its own directory bound read-only (resolved, refused when it
+  is `$HOME` or holds it).
+- **Environment.** Unchanged: the ENV-1 scrub with the `[secrets]` release for
+  the tool is applied to the `bwrap` process, so a granted secret reaches the
+  command as it does today and nothing else does; `TOLE_UNDER_SESSION` is
+  still set. No value goes through `--setenv` except `HOME` and `TMPDIR`
+  (`/scratch`). File descriptors above 2 are marked close-on-exec before `bwrap`
+  starts, so nothing tole's parent leaked into tole reaches the sandbox.
+- **Limits.** `RLIMIT_CPU`, `RLIMIT_AS`, `RLIMIT_NPROC` and `RLIMIT_FSIZE` are
+  set (soft and hard, never above what tole already has) between fork and exec
+  of `bwrap`, so everything inside inherits them and cannot raise them. A failure
+  to set one stops the spawn. The kernel counts `RLIMIT_NPROC` per user
+  namespace, so only the sandbox's own processes are counted. Linux only. The
+  `/tmp` tmpfs is not size-limited (`--size` needs a newer bubblewrap than the
+  0.8 minimum); a command can fill memory with it.
+- **Policy.** `off` is today's behaviour. `required` refuses when there is no
+  working sandbox or the workspace cannot be granted. `optional` runs
+  unsandboxed with a warning (printed once per process and tool) when a human
+  is attached, and refuses in an unattended run (`tole serve`, cron). On macOS
+  and Windows there is no sandbox: `required` refuses with that reason and
+  `optional` runs unsandboxed with the warning. A program that is not on `PATH`
+  is refused in every mode. A sandbox never replaces an approval: the tool's
+  risk, the approver, the destructive-argv and session-guard checks run before
+  the launch, exactly as before, and the result (status, stdout, stderr, caps,
+  the 30 s timeout) is the same shape.
+- **Lifecycle.** A timeout or a cancel kills the `bwrap` process; with
+  `--die-with-parent` its init dies with it, and the PID namespace takes every
+  descendant along. A job has no `--die-with-parent`, so a job that was spawned
+  but cannot be tracked (pid file not written) is stopped through its group and
+  the direct children of its launcher (`jobs::kill_detached`).
+- **`tole doctor`** prints the consumers' modes, the network and the limits, says
+  verify, turnend, cron scripts and deliveries are not sandboxed yet, and fails
+  when a `required` consumer has no working sandbox (a warning for `optional`).
+  `tole config check` lists the `sandbox.consumers.*` keys.
+- **Residual.** Only what exists at launch is protected: a `.tole` or `.git/hooks`
+  that does not exist yet can be created by the command (bubblewrap cannot bind
+  a path that is not there without creating it in the real workspace), and a
+  nested repository's `.git/hooks` is not covered. A same-user process racing a
+  path component between resolution and the mount is not stopped (§5). The
+  limits are per process, not a cgroup. Toolchain caches (`~/.cargo`, `~/.npm`)
+  are not visible; the profile has no `read` extras yet.
+
 ### 9.1.1 Life of a sandboxed server
 
 A wrapped stdio server is keyed by server name and resolved workspace, and
@@ -455,7 +538,9 @@ entry.
    address vetting, refusal logging; tests with a local upstream.
 4. **Model-driven commands** (~600): `[sandbox.consumers]` for
    `run_command`, `job_start`, cron scripts and deliveries, `verify`,
-   `turnend`; rlimits; per-consumer tests; migration note.
+   `turnend`; rlimits; per-consumer tests; migration note. First slice done
+   (#748, §9.3): `run_command`, `job_start`, rlimits; cron, `verify` and
+   `turnend` follow.
 5. **Lazy start and idle stop** (~700): register from the locked snapshot,
    start on first call, manifest check at start, idle stop.
 6. **Tool retrieval by meaning** (~900, may split): the search tool over

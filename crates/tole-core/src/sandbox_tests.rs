@@ -117,14 +117,14 @@ fn workspace_policy_none_read_write() {
     assert!(has(&a, &["--chdir", "/w"]));
 
     p.workspace = Workspace::Write;
+    p.protect = ["/w/.git/hooks", "/w/.git/config", "/w/.tole"]
+        .map(PathBuf::from)
+        .into();
     let a = args_of(&p, Some(ws));
     assert!(has(&a, &["--bind", "/w", "/w"]));
     let w = a.iter().position(|x| x == "--bind").unwrap();
     for rel in ["/w/.git/hooks", "/w/.git/config", "/w/.tole"] {
-        assert!(
-            has(&a, &["--ro-bind-try", rel, rel]),
-            "{rel} stays read-only"
-        );
+        assert!(has(&a, &["--ro-bind", rel, rel]), "{rel} stays read-only");
         // and comes after the writable bind, so it wins
         assert!(a.iter().rposition(|x| x == rel).unwrap() > w);
     }

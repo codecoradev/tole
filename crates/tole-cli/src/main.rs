@@ -1066,6 +1066,16 @@ fn dispatch(cli: Cli) -> Result<()> {
     ) {
         eprintln!("tole: warning: {e}");
     }
+    // Sandbox of the commands a model makes the host run (#748): off unless
+    // `[sandbox.consumers]` says so; validated at load, user layer only.
+    if let Err(e) = tole_core::sandbox::command::set_consumers(
+        cfg.as_ref()
+            .and_then(|c| c.sandbox.as_ref())
+            .and_then(|s| s.consumers().ok())
+            .unwrap_or_default(),
+    ) {
+        eprintln!("tole: warning: {e}");
+    }
     // Extra sensitive file names (#683): user globs plus the project's.
     tole_core::sensitive::set_extra(
         cfg.as_ref()

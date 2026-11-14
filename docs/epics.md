@@ -360,7 +360,9 @@ Bot and Nakama; BMAD for collaboration). Design notes:
   - external sandbox wrapper and lazy start (#601; open; design and owner
     decisions in `docs/sandbox-design.md`; first slice done: opt-in
     bubblewrap sandbox for third-party stdio MCP servers on Linux, with a
-    doctor line; lazy start, model commands and the rest follow).
+    doctor line; opt-in `[sandbox.consumers]` for `run_command` and
+    `job_start` with rlimits, #748 first slice done; cron scripts, `verify`,
+    `turnend`, lazy start and the rest follow).
 
 Suggested order: E4 #595 first (other epics reuse it), then E1 #578 → #579,
 E2 #584 → #585, E3 #590 → #591; the rest per each epic's order.

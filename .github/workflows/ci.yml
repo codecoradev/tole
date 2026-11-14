@@ -203,8 +203,9 @@ jobs:
           set -o pipefail
           cargo test -p tole-core --features mcp \
             --test mcp_sandbox --test mcp_sandbox_lifecycle --test mcp_sandbox_idle \
+            --test command_sandbox \
             -- --nocapture --test-threads=1 2>&1 | tee sandbox.log
           # Belt and braces: TOLE_REQUIRE_BWRAP already fails a skip, and the
           # tests must really have run (not zero tests, no SKIPPED line).
           if grep -n "SKIPPED" sandbox.log; then echo "a sandbox test was skipped"; exit 1; fi
-          [ "$(grep -c '^test result: ok\. [1-9]' sandbox.log)" -eq 3 ] || { echo "expected 3 test targets with passing tests"; exit 1; }
+          [ "$(grep -c '^test result: ok\. [1-9]' sandbox.log)" -eq 4 ] || { echo "expected 4 test targets with passing tests"; exit 1; }

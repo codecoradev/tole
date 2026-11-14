@@ -17,7 +17,6 @@ use crate::subprocess::{run_with_timeout, SUBPROCESS_TIMEOUT};
 use crate::tool::{Risk, Tool};
 use serde_json::{json, Value};
 use std::path::PathBuf;
-use std::process::Command;
 
 /// Generic command runner. `cwd` is the jail: the command runs with this
 /// working directory and cannot be re-pointed via the input.
@@ -188,16 +187,27 @@ impl Tool for RunCommandTool {
         // #684, every session kind: never the tole binary, never the
         // session marker.
         crate::session_guard::check_session_argv(&argv, &self.cwd)?;
-        let mut cmd = Command::new(program);
+        // The plain command, or `bwrap ... -- command` when the owner opted
+        // in (`[sandbox.consumers] run_command`, #748); a refusal (required
+        // sandbox, none available) is the tool's error. The approval above
+        // this tool is unchanged: a sandbox never replaces it.
+        let mut cmd = crate::sandbox::command::command_for(
+            crate::sandbox::command::Consumer::RunCommand,
+            &self.cwd,
+            program,
+            &argv[1..],
+        )?;
         // Secret env never reaches children (threat-model ENV-1) unless a
-        // `[secrets]` entry grants it to `run_command` (#598).
+        // `[secrets]` entry grants it to `run_command` (#598). With a
+        // sandbox this scrubs the `bwrap` process, whose environment its
+        // child inherits.
         let release = self
             .release
             .clone()
             .unwrap_or_else(crate::secret_release::release);
         crate::subprocess::scrub_env_with(&mut cmd, "run_command", &release);
         crate::session_guard::mark(&mut cmd);
-        cmd.args(&argv[1..]).current_dir(&self.cwd);
+        cmd.current_dir(&self.cwd);
         let out = run_with_timeout(&mut cmd, SUBPROCESS_TIMEOUT)?;
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);

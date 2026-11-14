@@ -73,5 +73,13 @@ name = "mcp_sandbox_idle"
 required-features = ["mcp"]
 
 [[test]]
+name = "command_sandbox"
+required-features = ["shell-tools"]
+
+[[test]]
+name = "command_sandbox_none"
+required-features = ["shell-tools"]
+
+[[test]]
 name = "mcp_http"
 required-features = ["mcp"]

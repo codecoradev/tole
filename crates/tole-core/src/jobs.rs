@@ -55,6 +55,50 @@ fn new_job_id() -> String {
     format!("j-{ms:x}-{:x}-{n:x}", std::process::id())
 }
 
+/// Direct children of `parent`, from `/proc` (Linux; empty elsewhere).
+fn children_of(parent: u32) -> Vec<u32> {
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    dir.flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| {
+            // `pid (comm) state ppid ...`: comm may hold spaces and parens,
+            // so split after the LAST `)`.
+            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|s| {
+                    let rest = s.rsplit_once(')')?.1.to_owned();
+                    rest.split_whitespace().nth(1)?.parse::<u32>().ok()
+                })
+                == Some(parent)
+        })
+        .collect()
+}
+
+/// Stops a job that was just spawned detached (its own process group) and
+/// reaps it, with what it started: the group, and on Linux the direct
+/// children of the first process too. A sandboxed job (`bwrap`, #748) has a
+/// first process that is only the launcher: its child is the sandbox's init,
+/// in a session of its own, and the death of the init takes every process of
+/// the PID namespace with it, while killing the launcher alone would leave
+/// them all running (a job's sandbox does not die with its parent).
+pub fn kill_detached(mut child: std::process::Child) {
+    #[cfg(unix)]
+    {
+        let pid = child.id();
+        for c in children_of(pid) {
+            // SAFETY: kill takes two integers.
+            unsafe { libc::kill(c as libc::pid_t, libc::SIGKILL) };
+        }
+        // SAFETY: killpg takes two integers; the child's pid is its group id
+        // because the job was spawned with `process_group(0)`.
+        unsafe { libc::killpg(pid as libc::pid_t, libc::SIGKILL) };
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// Read-only introspection of a detached job: running? log tail?
 pub struct JobPollTool {
     root: PathBuf,
@@ -279,6 +323,18 @@ impl Tool for JobStartTool {
         // session marker.
         crate::session_guard::check_session_argv(&argv, &self.root)?;
 
+        // The plain command, or `bwrap ... -- command` when the owner opted
+        // in (`[sandbox.consumers] job_start`, #748). Decided before anything
+        // is created, so a refusal leaves no job directory behind. A job
+        // outlives the call by design: its sandbox does not die with tole.
+        let mut cmd = crate::sandbox::command::command_for(
+            crate::sandbox::command::Consumer::JobStart,
+            &self.root,
+            program,
+            &argv[1..],
+        )
+        .map_err(|e| format!("job_start: {e}"))?;
+
         let id = new_job_id();
         let dir = jobs_root(&self.root).join(&id);
         std::fs::create_dir_all(&dir)
@@ -303,12 +359,10 @@ impl Tool for JobStartTool {
             .try_clone()
             .map_err(|e| format!("job_start: log: {e}"))?;
 
-        let mut cmd = Command::new(program);
         // Secret env never reaches children (threat-model ENV-1).
         crate::subprocess::scrub_env_for(&mut cmd, "job_start");
         crate::session_guard::mark(&mut cmd);
-        cmd.args(&argv[1..])
-            .current_dir(&self.root)
+        cmd.current_dir(&self.root)
             .stdin(Stdio::null())
             .stdout(Stdio::from(log_out))
             .stderr(Stdio::from(log_err));
@@ -328,9 +382,7 @@ impl Tool for JobStartTool {
             // Without the pid file the job is untrackable — a spawn that
             // reports failure must not leave a live orphan behind
             // (CodeCora scan 2026-09-18).
-            let mut child = child;
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_detached(child);
             return Err(format!("job_start: pid file: {e}"));
         }
         if let Some(q) = self.notify.clone() {

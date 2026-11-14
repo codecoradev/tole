@@ -22,6 +22,8 @@
 //! (`required`); `optional` runs unsandboxed with a warning, except in an
 //! unattended run (cron, `serve`), where it is refused too (decision 2).
 
+pub mod command;
+
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -82,6 +84,11 @@ pub struct Profile {
     pub read: Vec<PathBuf>,
     /// Extra writable paths.
     pub write: Vec<PathBuf>,
+    /// Inside a writable workspace: paths re-bound read-only on top of it
+    /// (planted code there would run later outside the sandbox). The caller
+    /// passes RESOLVED paths, so a link is never a bind path; ignored when
+    /// the workspace is not writable.
+    pub protect: Vec<PathBuf>,
 }
 
 /// The built-in profiles: `server` (workspace read-only, no network) and
@@ -97,6 +104,7 @@ pub fn builtin_profile(name: &str) -> Option<Profile> {
         network,
         read: Vec::new(),
         write: Vec::new(),
+        protect: Vec::new(),
     })
 }
 
@@ -243,9 +251,7 @@ fn detect_uncached() -> Availability {
 
 #[cfg(not(target_os = "linux"))]
 fn detect_uncached() -> Availability {
-    Availability::Unavailable(
-        "no sandbox on this platform (Linux only); servers run unsandboxed".into(),
-    )
+    Availability::Unavailable("no sandbox on this platform (Linux only)".into())
 }
 
 /// A profile entry or workspace the sandbox must never grant, judged on
@@ -298,7 +304,8 @@ pub fn check_grant(
 /// The `bwrap` argument list (without the program name) that runs
 /// `program args` in the view of `profile`. Pure: no I/O, no environment.
 /// `prefix` is the install dir of `program` when it is not under a system
-/// dir (bound read-only).
+/// dir (bound read-only). The sandbox dies with tole (see
+/// [`bwrap_args_for`] for the one case that must not).
 pub fn bwrap_args(
     profile: &Profile,
     workspace: Option<&Path>,
@@ -306,11 +313,28 @@ pub fn bwrap_args(
     program: &Path,
     args: &[String],
 ) -> Vec<OsString> {
+    bwrap_args_for(profile, workspace, prefix, program, args, true)
+}
+
+/// [`bwrap_args`] with a choice the caller owns: `die_with_parent` is
+/// `false` only for a detached job (`job_start`), whose process is meant to
+/// outlive the call. Every other flag is fixed.
+pub fn bwrap_args_for(
+    profile: &Profile,
+    workspace: Option<&Path>,
+    prefix: Option<&Path>,
+    program: &Path,
+    args: &[String],
+    die_with_parent: bool,
+) -> Vec<OsString> {
     let mut a: Vec<OsString> = Vec::new();
     let mut push = |parts: &[&str]| a.extend(parts.iter().map(OsString::from));
     // Fixed hardening, always.
     push(&["--unshare-all", "--unshare-user", "--disable-userns"]);
-    push(&["--cap-drop", "ALL", "--new-session", "--die-with-parent"]);
+    push(&["--cap-drop", "ALL", "--new-session"]);
+    if die_with_parent {
+        push(&["--die-with-parent"]);
+    }
     if profile.network == Network::Host {
         push(&["--share-net"]);
     }
@@ -358,9 +382,10 @@ pub fn bwrap_args(
             }
             Workspace::Write => {
                 bind(&mut a, "--bind", ws);
-                // Paths that run later outside the sandbox stay read-only.
-                for rel in [".git/hooks", ".git/config", ".tole"] {
-                    bind(&mut a, "--ro-bind-try", &ws.join(rel));
+                // Paths that run later outside the sandbox stay read-only,
+                // after the writable bind so they win.
+                for p in &profile.protect {
+                    bind(&mut a, "--ro-bind", p);
                 }
                 chdir = ws;
             }
@@ -539,7 +564,9 @@ pub fn doctor_lines(policy: Option<&Policy>, avail: &Availability) -> Vec<String
         }
     });
     if cfg!(not(target_os = "linux")) {
-        out.push("sandbox: this platform has no sandbox; servers run unsandboxed".into());
+        out.push(
+            "sandbox: this platform has no sandbox; servers and commands run unsandboxed".into(),
+        );
     }
     out
 }
