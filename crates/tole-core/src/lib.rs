@@ -111,11 +111,17 @@ pub use secrets::release as secret_release;
 #[doc(inline)]
 pub use secrets::sensitive;
 pub mod sibling_watch;
-pub mod skill_approval;
-pub mod skill_curator;
-pub mod skill_draft;
-pub mod skill_index;
 pub mod skills;
+// `skills/` holds the approval, curator, draft and index modules; these
+// re-exports keep the old top-level paths working.
+#[doc(inline)]
+pub use skills::approval as skill_approval;
+#[doc(inline)]
+pub use skills::curator as skill_curator;
+#[doc(inline)]
+pub use skills::draft as skill_draft;
+#[doc(inline)]
+pub use skills::index as skill_index;
 pub mod state;
 pub mod storage;
 #[cfg(feature = "shell-tools")]

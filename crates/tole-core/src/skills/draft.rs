@@ -798,5 +798,5 @@ fn write_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
 }
 
 #[cfg(test)]
-#[path = "skill_draft_tests.rs"]
+#[path = "draft_tests.rs"]
 mod tests;

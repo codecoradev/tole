@@ -683,5 +683,5 @@ fn copy_dir(from: &Path, to: &Path) -> Result<(), String> {
 }
 
 #[cfg(test)]
-#[path = "skill_curator_tests.rs"]
+#[path = "curator_tests.rs"]
 mod tests;
