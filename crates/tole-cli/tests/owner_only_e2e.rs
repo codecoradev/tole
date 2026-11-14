@@ -131,6 +131,24 @@ fn a_human_at_a_terminal_keeps_working() {
     assert!(!data_files(&home).is_empty());
 }
 
+/// The discussion host is in-process (no tole subprocess), so the argv
+/// refusal and the marker leave it alone: the read-only `discuss list`
+/// works with the marker set and writes nothing.
+#[test]
+fn the_discussion_commands_are_not_broken_by_the_session_marker() {
+    let home = tmpdir();
+    let cwd = project("model = \"m1\"\n");
+    let o = tole(
+        &real(),
+        &cwd,
+        &home,
+        &[("TOLE_UNDER_SESSION", "1")],
+        &["discuss", "list"],
+    );
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(data_files(&home).is_empty(), "{:?}", data_files(&home));
+}
+
 /// The scenario of the issue: a session runs the CLI through run_command.
 /// The tole binary by name is refused; a renamed copy (the documented
 /// residual of the name check) still carries the marker the subcommands
