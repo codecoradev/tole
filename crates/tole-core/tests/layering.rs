@@ -30,10 +30,9 @@ use std::path::Path;
 const KERNEL_MODULES: &[&str] = &[
     "tools",
     "entry", "register", "state", "storage", "machine", "paths", "secrets",
-    "sanitize", "safe_dir", "tool", "approval", "provider", "openai", "mock",
-    "failover", "cancel", "interrupt", "image", "ledger", "transcript",
-    "turn", "compaction", "gate", "replay", "hooks", "subprocess", "process_guard",
-    "sandbox", "systemone",
+    "sanitize", "safe_dir", "tool", "approval", "provider", "cancel", "interrupt",
+    "ledger", "transcript", "turn", "compaction", "gate", "hooks", "subprocess",
+    "process_guard", "sandbox", "systemone",
 ];
 #[rustfmt::skip]
 const ENGINE_MODULES: &[&str] = &[
@@ -56,6 +55,11 @@ const BASELINE: &[(&str, &str, &str)] = &[
 
 /// Old top-level paths that are now re-exports of a module inside another one.
 const ALIASES: &[(&str, &str)] = &[
+    ("openai", "provider"),
+    ("failover", "provider"),
+    ("mock", "provider"),
+    ("replay", "provider"),
+    ("image", "provider"),
     ("file_tools", "tools"),
     ("read_file", "tools"),
     ("todo", "tools"),
