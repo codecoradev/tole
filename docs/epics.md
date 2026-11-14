@@ -308,7 +308,10 @@ Bot and Nakama; BMAD for collaboration). Design notes:
     ledger; part 2 adds budget hard stops and caps to the ledger, the
     built-in scribe and claim-checker roles and the host driver as a
     library, with independent read-only participants through `delegate`,
-    uteke round documents and `tole audit --discussions`; part 3a is the
+    uteke round documents (wired on every entry point by #717: the goal
+    and one digest per round are written when uteke is available, and one
+    note says they are off when it is not) and `tole audit --discussions`;
+    part 3a is the
     owner-only `tole discuss` command; part 3b is the model-facing
     `discuss`, `discuss_status` and `discuss_stop` under the rules of
     `delegate` (the owner chose both entry points, see `automation-design.md`

@@ -196,6 +196,38 @@ impl RoundDocs for UtekeDocs {
     }
 }
 
+/// The note an owner reads, once per discussion, when no document sink is
+/// wired: documents are off, never silently dropped (#717).
+pub const DOCS_OFF_NOTE: &str = "round documents are off: uteke is not available (no `uteke` \
+binary on PATH, or tole is built without shell-tools), so no goal or round document is written";
+
+/// Whether the uteke integration can take documents here.
+#[cfg(feature = "shell-tools")]
+fn uteke_available() -> bool {
+    crate::tool_roster::binary_available("uteke")
+}
+
+#[cfg(not(feature = "shell-tools"))]
+fn uteke_available() -> bool {
+    false
+}
+
+/// The production document sink: uteke (secret-redacted, host-built slug,
+/// no room, parent from the host only) when `available`, otherwise none.
+#[cfg(feature = "shell-tools")]
+fn uteke_docs(available: bool, secrets: &SecretSet) -> Option<Box<dyn RoundDocs>> {
+    available.then(|| {
+        Box::new(UtekeDocs(
+            tole_core::uteke::UtekeDocumentTool::new(None).with_secrets(secrets),
+        )) as Box<dyn RoundDocs>
+    })
+}
+
+#[cfg(not(feature = "shell-tools"))]
+fn uteke_docs(_available: bool, _secrets: &SecretSet) -> Option<Box<dyn RoundDocs>> {
+    None
+}
+
 /// Longest round or goal document, in characters (after redaction).
 pub const MAX_DOC_CHARS: usize = 16_000;
 
@@ -307,6 +339,29 @@ impl Driver {
         make: Factory,
         pot: Arc<Budget>,
     ) -> Result<Driver, String> {
+        Self::from_config_with(
+            cfg,
+            paths,
+            participants,
+            (log, secrets),
+            make,
+            pot,
+            uteke_available(),
+        )
+    }
+
+    /// [`Driver::from_config`] with the uteke probe decided by the caller
+    /// (the one place the production document sink is wired: every entry
+    /// point builds through here).
+    fn from_config_with(
+        cfg: &Config,
+        paths: (Option<&std::path::Path>, Option<&std::path::Path>),
+        participants: &[String],
+        (log, secrets): (DiscussionLog, SecretSet),
+        make: Factory,
+        pot: Arc<Budget>,
+        uteke: bool,
+    ) -> Result<Driver, String> {
         let mut voices = BTreeMap::new();
         for name in participants {
             if Role::of(name).is_some() {
@@ -325,14 +380,16 @@ impl Driver {
         }
         let scribe = discussion_roles::resolve(cfg, Role::Scribe)?.model;
         let checker = discussion_roles::resolve(cfg, Role::ClaimChecker)?.model;
-        Ok(Driver::new(
-            log,
-            secrets,
-            voices,
-            (scribe, checker),
-            make,
-            pot,
-        ))
+        let docs = uteke_docs(uteke, &secrets);
+        let driver = Driver::new(log, secrets, voices, (scribe, checker), make, pot);
+        Ok(match docs {
+            Some(d) => driver.with_docs(d),
+            None => {
+                // One visible note per discussion, not one per round.
+                driver.note(DOCS_OFF_NOTE.to_string());
+                driver
+            }
+        })
     }
 
     #[cfg(test)]

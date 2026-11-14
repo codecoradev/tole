@@ -306,10 +306,15 @@ impl DiscussHost {
         let (summary, risks) = match &out {
             Ok(o) => (
                 format!("discussion `{id}`: {}", describe(o.gate)),
-                if o.gate == Gate::Report {
-                    vec![]
-                } else {
-                    vec![format!("it ended without a report: {}", describe(o.gate))]
+                {
+                    let mut risks = if o.gate == Gate::Report {
+                        vec![]
+                    } else {
+                        vec![format!("it ended without a report: {}", describe(o.gate))]
+                    };
+                    // A document that was not written is never silent.
+                    risks.extend(o.notes.iter().map(|n| self.clean(n)));
+                    risks
                 },
             ),
             Err(e) => (

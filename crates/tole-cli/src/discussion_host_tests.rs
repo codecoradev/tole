@@ -711,3 +711,100 @@ fn round_documents_are_flat_slugs_with_digests_only() {
         out.notes
     );
 }
+
+/// A production-built driver (the `from_config` path every entry point
+/// uses) over a two-profile config.
+fn built(tag: &str, make: Factory, uteke: bool) -> Driver {
+    let cfg = crate::config::parse(
+        "[profiles.coder]\n[profiles.ops]\n[router.tiers]\nlight = \"small\"\n",
+        std::path::Path::new("user.toml"),
+    )
+    .unwrap();
+    let names = vec!["coder".to_string(), "ops".to_string()];
+    Driver::from_config_with(
+        &cfg,
+        (None, None),
+        &names,
+        (log(tag), secrets()),
+        make,
+        Arc::new(Budget::new(1_000_000)),
+        uteke,
+    )
+    .unwrap()
+    .with_clock(|| 1)
+}
+
+#[test]
+fn the_production_builder_carries_a_round_docs_sink() {
+    let (_, make) = script(&[]);
+    // Guard against `docs: None` returning on the production path (#717).
+    let d = built("prod-on", make.clone(), true);
+    #[cfg(feature = "shell-tools")]
+    {
+        assert!(d.docs.is_some(), "uteke is configured: docs must be wired");
+        assert!(d.notes.lock().unwrap().is_empty());
+    }
+    #[cfg(not(feature = "shell-tools"))]
+    assert!(d.docs.is_none());
+    let d = built("prod-off", make, false);
+    assert!(d.docs.is_none());
+    assert_eq!(*d.notes.lock().unwrap(), vec![DOCS_OFF_NOTE.to_string()]);
+}
+
+#[test]
+fn without_uteke_one_note_says_documents_are_off() {
+    let (_, make) = script(&[]);
+    let d = built("off-once", make, false);
+    d.start(contract(100_000, Some(3))).unwrap();
+    let out = d.run().unwrap();
+    assert!(out.rounds >= 2, "several rounds ran: {}", out.rounds);
+    let off = out.notes.iter().filter(|n| *n == DOCS_OFF_NOTE).count();
+    assert_eq!(
+        off, 1,
+        "once per discussion, not per round: {:?}",
+        out.notes
+    );
+}
+
+#[test]
+fn a_failed_document_write_is_loud_and_changes_nothing_else() {
+    let run = |down: bool, tag: &str| {
+        let (_, make) = script(&[]);
+        let d =
+            driver(log(tag), make, 1_000_000).with_docs(Box::new(FakeDocs(Arc::default(), down)));
+        d.start(contract(100_000, Some(2))).unwrap();
+        d.run().unwrap()
+    };
+    let (ok, down) = (run(false, "loud-ok"), run(true, "loud-down"));
+    assert!(down
+        .notes
+        .iter()
+        .any(|n| n.starts_with("uteke document goal-pick-db was not written")));
+    assert!(down
+        .notes
+        .iter()
+        .any(|n| n.starts_with("uteke document goal-pick-db-r1 was not written")));
+    assert_eq!(
+        (ok.gate, ok.rounds, ok.tokens_used),
+        (down.gate, down.rounds, down.tokens_used),
+        "the gate and the rounds do not depend on uteke"
+    );
+}
+
+#[test]
+fn resuming_a_finished_discussion_writes_no_documents_again() {
+    let (_, make) = script(&[]);
+    let docs: Docs = Arc::default();
+    let l = log("resume-docs");
+    let mk = |docs: &Docs| {
+        driver(l.clone(), make.clone(), 1_000_000)
+            .with_docs(Box::new(FakeDocs(Arc::clone(docs), false)))
+    };
+    let d = mk(&docs);
+    d.start(contract(100_000, Some(2))).unwrap();
+    d.run().unwrap();
+    let written = docs.lock().unwrap().len();
+    assert!(written >= 3, "goal and two rounds: {written}");
+    mk(&docs).run().unwrap();
+    assert_eq!(docs.lock().unwrap().len(), written, "no duplicate puts");
+}
