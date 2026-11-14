@@ -10,6 +10,10 @@
 //! workspace or widens a secret, allow pattern or profile: the host library
 //! ([`crate::discussion_host`]) does the work and only the gate decides.
 
+pub mod audit;
+pub mod host;
+pub mod tool;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -203,5 +207,5 @@ pub fn show(
 }
 
 #[cfg(test)]
-#[path = "discuss_tests.rs"]
+#[path = "tests.rs"]
 pub(crate) mod tests;

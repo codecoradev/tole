@@ -7,7 +7,6 @@ pub mod approvals;
 pub mod approvals_owner;
 pub mod approver;
 pub mod audit;
-pub mod audit_discussion;
 pub mod auth;
 pub mod compaction_host;
 pub mod config;
@@ -37,8 +36,13 @@ pub mod delegate;
 pub mod delegate_decide;
 pub mod delegated_approver;
 pub mod discuss;
-pub mod discuss_tool;
-pub mod discussion_host;
+// `discuss/` holds the modules below; these re-exports keep the old top-level paths working.
+#[doc(inline)]
+pub use discuss::audit as audit_discussion;
+#[doc(inline)]
+pub use discuss::host as discussion_host;
+#[doc(inline)]
+pub use discuss::tool as discuss_tool;
 pub mod doctor;
 pub mod ecosystem;
 pub mod events;
