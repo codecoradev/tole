@@ -395,6 +395,11 @@ impl Lockfile {
 /// The lock's bytes: no final symlink followed, never blocking (a FIFO is
 /// refused on the open handle), at most [`MAX_LOCK_BYTES`].
 fn read_lock_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
+    read_bounded(path, MAX_LOCK_BYTES)
+}
+
+/// [`read_lock_bytes`] with another size cap.
+fn read_bounded(path: &Path, max: u64) -> std::io::Result<Vec<u8>> {
     use std::io::Read;
     let mut o = std::fs::OpenOptions::new();
     o.read(true);
@@ -409,11 +414,9 @@ fn read_lock_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
         return Err(std::io::Error::other("not a regular file"));
     }
     let mut buf = Vec::new();
-    f.take(MAX_LOCK_BYTES + 1).read_to_end(&mut buf)?;
-    if meta.len() > MAX_LOCK_BYTES || buf.len() as u64 > MAX_LOCK_BYTES {
-        return Err(std::io::Error::other(format!(
-            "larger than {MAX_LOCK_BYTES} bytes"
-        )));
+    f.take(max + 1).read_to_end(&mut buf)?;
+    if meta.len() > max || buf.len() as u64 > max {
+        return Err(std::io::Error::other(format!("larger than {max} bytes")));
     }
     Ok(buf)
 }
@@ -552,6 +555,86 @@ pub fn ledger_line(event: &str, server: &str, manifest_hash: &str, at: u64) -> S
     .to_string();
     line.push('\n');
     line
+}
+
+/// Largest ledger read for [`check_against_ledger`].
+pub const MAX_LEDGER_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The ledger text. `Ok(None)`: there is no ledger (nothing to compare).
+/// `Err`: it exists but cannot be read (a symlink or other non-file, an
+/// I/O error, larger than [`MAX_LEDGER_BYTES`]): the comparison cannot be
+/// made, and the caller must say so rather than carry on as if it had.
+pub fn read_ledger(path: &Path) -> Result<Option<String>, String> {
+    match read_bounded(path, MAX_LEDGER_BYTES) {
+        Ok(raw) => Ok(Some(String::from_utf8_lossy(&raw).into_owned())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
+/// What the owner's record of approvals says against the lock file.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LedgerCheck {
+    /// Servers the lock shows as trusted but the ledger does not allow, with
+    /// why: the last recorded decision is a revoke (the lock was edited back),
+    /// or the lock's manifest hash is not the last approved one. They are
+    /// treated as revoked until the owner approves them again.
+    pub blocked: Vec<(String, String)>,
+    /// Trusted entries the ledger has no approval for at all (written by
+    /// hand, or approved before the ledger): reported, not blocked.
+    pub unrecorded: Vec<String>,
+    /// Why the ledger could not be read, when it could not: revocations
+    /// recorded there are then not checked.
+    pub unreadable: Option<String>,
+}
+
+/// Compares the lock's trusted entries with the last `approve` / `revoke`
+/// line the ledger holds for each server. Detection, not prevention: the
+/// ledger and the lock are both files of the owner, so a process that can
+/// rewrite both defeats it; an edit of the lock alone is caught.
+pub fn check_against_ledger(lock: &BTreeMap<String, LockEntry>, ledger: &str) -> LedgerCheck {
+    let mut last: BTreeMap<String, (String, String)> = BTreeMap::new();
+    for line in ledger.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if v["kind"] != "plugin" {
+            continue;
+        }
+        let (Some(event), Some(server)) = (v["event"].as_str(), v["server"].as_str()) else {
+            continue;
+        };
+        if matches!(event, "approve" | "revoke") {
+            let hash = v["manifest_hash"].as_str().unwrap_or_default();
+            last.insert(server.to_string(), (event.to_string(), hash.to_string()));
+        }
+    }
+    let mut out = LedgerCheck::default();
+    if last.is_empty() {
+        return out;
+    }
+    for (name, e) in lock {
+        if e.revoked {
+            continue;
+        }
+        match last.get(name) {
+            Some((ev, _)) if ev == "revoke" => out.blocked.push((
+                name.clone(),
+                "the ledger's last decision for it is a revoke, but the lock says approved \
+                 (edited by hand?); approve it again to use it"
+                    .into(),
+            )),
+            Some((_, h)) if *h != e.manifest_hash => out.blocked.push((
+                name.clone(),
+                "its manifest hash is not the one last recorded as approved in the ledger \
+                 (edited by hand?); approve it again to use it"
+                    .into(),
+            )),
+            Some(_) => {}
+            None => out.unrecorded.push(name.clone()),
+        }
+    }
+    out
 }
 
 #[cfg(test)]

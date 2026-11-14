@@ -69,6 +69,12 @@ impl Gate {
                 };
             }
         };
+        // The ledger holds the user's decisions: it is checked against the
+        // user lock, before a project lock narrows it.
+        let mut user_lock = user_lock;
+        if let Some(u) = user.as_deref() {
+            notes.extend(blocked_notes(&apply_ledger(u, &mut user_lock)));
+        }
         let (lock, more) = plugin_lock::effective(&user_lock, &project);
         notes.extend(more);
         Self {
@@ -211,6 +217,49 @@ impl Gate {
         out.extend(self.notes.iter().map(|n| format!("  ! {n}")));
         out
     }
+}
+
+/// One note per server the ledger blocked, and one when the ledger could
+/// not be read at all.
+pub fn blocked_notes(check: &plugin_lock::LedgerCheck) -> Vec<String> {
+    let mut notes: Vec<String> = check
+        .blocked
+        .iter()
+        .map(|(s, why)| format!("plugin lock: `{s}` is not trusted: {why}"))
+        .collect();
+    if let Some(why) = &check.unreadable {
+        notes.push(format!(
+            "plugin ledger unreadable ({why}): revocations recorded there are not checked \
+             against the lock until it is fixed"
+        ));
+    }
+    notes
+}
+
+/// Marks `lock`'s entries the owner's ledger does not allow (see
+/// [`plugin_lock::check_against_ledger`]) as revoked, so a lock edited by
+/// hand cannot bring back a revoked server or re-pin an approved one.
+pub fn apply_ledger(user: &Path, lock: &mut Lockfile) -> plugin_lock::LedgerCheck {
+    let Some(path) = user.parent().map(|d| d.join(plugin_lock::LEDGER_FILE)) else {
+        return plugin_lock::LedgerCheck::default();
+    };
+    let text = match plugin_lock::read_ledger(&path) {
+        Ok(Some(t)) => t,
+        Ok(None) => return plugin_lock::LedgerCheck::default(),
+        Err(why) => {
+            return plugin_lock::LedgerCheck {
+                unreadable: Some(why),
+                ..Default::default()
+            }
+        }
+    };
+    let check = plugin_lock::check_against_ledger(&lock.servers, &text);
+    for (name, _) in &check.blocked {
+        if let Some(e) = lock.servers.get_mut(name) {
+            e.revoked = true;
+        }
+    }
+    check
 }
 
 /// Appends one ledger line next to the user lock `user` (names and

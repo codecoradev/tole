@@ -21,7 +21,9 @@ use tole_core::plugin_lock::{
 use tole_core::sandbox::{Availability, Mode, Policy};
 use tole_core::secrets::SecretSet;
 
-use crate::plugin_gate::{integrity, record_event, render_manifest, source_of, Gate};
+use crate::plugin_gate::{
+    apply_ledger, blocked_notes, integrity, record_event, render_manifest, source_of, Gate,
+};
 
 /// `tole plugin <action>`.
 #[derive(Debug, clap::Subcommand)]
@@ -103,8 +105,14 @@ fn short(hash: &str) -> &str {
 
 /// Runs `action`; the text to print, or the error (exit 1).
 pub fn run(action: PluginAction, ctx: &mut Ctx<'_>) -> Result<String, String> {
-    if matches!(action, PluginAction::Approve { .. }) {
-        crate::owner_only::refuse_under_session("tole plugin approve")?;
+    match &action {
+        PluginAction::Approve { .. } => {
+            crate::owner_only::refuse_under_session("tole plugin approve")?
+        }
+        PluginAction::Revoke { .. } => {
+            crate::owner_only::refuse_under_session("tole plugin revoke")?
+        }
+        _ => {}
     }
     match action {
         PluginAction::List { json } => Ok(list(ctx, json)),
@@ -214,9 +222,23 @@ fn list(ctx: &Ctx<'_>, as_json: bool) -> String {
         }
         None => Lockfile::default(),
     };
-    let user = load(ctx.user.clone(), "user");
+    let mut user = load(ctx.user.clone(), "user");
     let project = load(Some(ctx.project_path()), "project");
     let broken = !notes.is_empty();
+    // A lock edited by hand cannot bring back what the ledger says was
+    // revoked: such an entry is shown and treated as revoked. The ledger
+    // records the USER's decisions, so it is compared with the user lock,
+    // before a project lock narrows it.
+    if let Some(u) = ctx.user.as_deref().filter(|_| !broken) {
+        let check = apply_ledger(u, &mut user);
+        notes.extend(blocked_notes(&check));
+        notes.extend(check.unrecorded.iter().map(|n| {
+            format!(
+                "`{n}` is approved in the lock but the ledger has no approval for it \
+                 (written by hand, or approved before the ledger)"
+            )
+        }));
+    }
     let (eff, more) = plugin_lock::effective(&user, &project);
     notes.extend(more);
     let names: BTreeSet<String> = ctx
@@ -359,6 +381,12 @@ fn diff(ctx: &Ctx<'_>, name: &str) -> Result<String, String> {
     // The merged lock, as `list` and a session see it: a project entry can
     // revoke or re-pin, and then the server must not be started here either.
     let project = Lockfile::load(&ctx.project_path())?;
+    let mut user = user;
+    let ledger_notes = ctx
+        .user
+        .as_deref()
+        .map(|u| blocked_notes(&apply_ledger(u, &mut user)))
+        .unwrap_or_default();
     let (eff, _) = plugin_lock::effective(&user, &project);
     let Some(e) = eff.get(name) else {
         return Ok(format!(
@@ -398,6 +426,9 @@ fn diff(ctx: &Ctx<'_>, name: &str) -> Result<String, String> {
         out.push_str("binary: unchanged\n");
     }
     out.push_str(&secrets_note(ctx, e));
+    for n in &ledger_notes {
+        out.push_str(&format!("! {n}\n"));
+    }
     let blocked = admit_unseen(&eff, name, &source, &live_integrity);
     let why = match (&blocked, ctx.probe) {
         (Some(a), _) => Some(format!("the lock refuses it: {}", state_of(a))),
@@ -549,14 +580,25 @@ fn revoke(
     );
     consent(ctx, &entry.manifest_hash, expect, &q)?;
     lock.servers.get_mut(name).expect("present").revoked = true;
-    lock.save(&path)?;
+    // The ledger first: if the lock then cannot be written, the record
+    // already says revoked and the server stays blocked (fail closed). A
+    // project revoke only narrows, so it is recorded as such and does not
+    // outlive the project lock.
     if let Some(user) = ctx.user.as_deref() {
-        record_event(user, "revoke", name, &entry.manifest_hash);
+        let event = if project { "revoke_project" } else { "revoke" };
+        record_event(user, event, name, &entry.manifest_hash);
     }
-    let mut out = format!("revoked `{name}` in {}\n", path.display());
-    if !entry.secrets.is_empty() {
+    lock.save(&path)?;
+    let mut out = format!(
+        "revoked `{name}` in {}: it is not started again until you approve it again \
+         (`tole plugin approve {name}`)\n",
+        path.display()
+    );
+    if entry.secrets.is_empty() {
+        out.push_str("it held no granted secret\n");
+    } else {
         out.push_str(&format!(
-            "it was granted {}: rotate them if you no longer trust it\n",
+            "it was granted these secrets: rotate them if you no longer trust it: {}\n",
             entry.secrets.join(", ")
         ));
     }
