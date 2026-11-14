@@ -1,7 +1,7 @@
 # Sandbox for third-party servers and model commands — design note
 
-Status: **proposal for owner review (#601, epic #594); nothing here is
-implemented.** Builds on [third-party-plugins-design.md](third-party-plugins-design.md)
+Status: **design with owner decisions of 2026-11-14 (§16); #601, epic
+#594.** The first PR implements the opt-in slice only. Builds on [third-party-plugins-design.md](third-party-plugins-design.md)
 §4.2–4.3 and [secrets-integrations-design.md](secrets-integrations-design.md),
 and on the #594 audit (#675–#684). The feasibility results in §3 were
 measured on 2026-11-13 in a Linux container (kernel 6.18, Ubuntu 24.04).
@@ -122,11 +122,11 @@ case even though the container runs as root.
   `ripgrep` beside `bwrap`. It is a 0.0.x preview whose configuration
   still changes, and on Linux the isolation is bubblewrap anyway. Its one
   extra, the host allowlist, is small enough to provide in tole (§8).
-  Kept as a candidate backend for macOS (open question 4).
+  Kept as a candidate backend for macOS (decision 4).
 - Landlock alone: no mount view, no private `/proc`, and network control
   by port only, with UDP (and so DNS tunnelling) uncovered. It also means
   sandbox code inside tole, against the owner's "external wrapper"
-  decision. Worth keeping as an optional second layer (open question 3).
+  decision. Worth keeping as an optional second layer (decision 3).
 - firejail: setuid root and a large attack surface; refuses
   unprivileged users by default.
 - nsjail: not packaged; same isolation as bwrap at a higher install cost.
@@ -305,7 +305,7 @@ mission `--verify` command and the `on_turnend` stop gates each map to a
 profile in `[sandbox.consumers]`. Absent means "not sandboxed", as today:
 these commands often need the owner's toolchain, and making them sandboxed
 by default would break existing setups. `tole doctor` recommends `command`
-for each one, and a later phase can make it the default (open question 1).
+for each one, and a later phase can make it the default (decision 1).
 
 Notes per consumer:
 
@@ -330,7 +330,7 @@ profile). The result is cached for the process.
 | Mode | Sandbox works | Sandbox unavailable |
 |---|---|---|
 | `required` | runs inside | **not started**: a startup line names the server, the reason and the remedy (install bubblewrap, or set `mode = "optional"` in the user config); its tools are not registered; a call to one returns the same message |
-| `optional` | runs inside | runs **unsandboxed**, with a warning at every start and a ledger entry; refused for unverified servers and (proposed) in unattended runs |
+| `optional` | runs inside | runs **unsandboxed**, with a warning at every start and a ledger entry; refused for unverified servers and, by owner decision 2, in unattended runs |
 | `off` | runs unsandboxed | runs unsandboxed |
 
 A consumer in `[sandbox.consumers]` behaves as `required`: the command is
@@ -419,7 +419,7 @@ entry.
    tests with `tests/fixtures/mock_mcp.py` that check a canary in tole's
    env, a file in a fake data dir and a TCP connect all fail inside; they
    skip with a note when `bwrap` is absent, and CI installs `bubblewrap`.
-3. **Network allowlist** (~800): the proxy, the in-sandbox forwarder,
+3. **Network allowlist** (deferred by owner decision 5; ~800): the proxy, the in-sandbox forwarder,
    address vetting, refusal logging; tests with a local upstream.
 4. **Model-driven commands** (~600): `[sandbox.consumers]` for
    `run_command`, `job_start`, cron scripts and deliveries, `verify`,
@@ -428,29 +428,36 @@ entry.
    start on first call, manifest check at start, idle stop.
 6. **Tool retrieval by meaning** (~900, may split): the search tool over
    third-party definitions through the skills index seam.
-7. **Later, per owner decision:** macOS backend (open question 4), an
-   inner Landlock layer (open question 3), cgroup limits.
+7. **Not planned (owner decisions 3 and 4):** a macOS backend and an
+   inner Landlock layer. Cgroup limits remain later work.
 
-## 16. Open questions for the owner
+## 16. Owner decisions
 
-1. **Default for model commands.** Keep `run_command`, `job_start`, cron
-   scripts, `verify` and `turnend` unsandboxed unless opted in
-   (proposed), or sandbox `verify` and `turnend` by default from phase 4,
-   since they run agent-written code without approval?
-2. **`optional` in unattended runs.** Treat `optional` as `required` in
-   cron, webhook and `serve` runs (proposed), or honour the fallback
-   there too?
-3. **Landlock as an inner layer.** Add a small in-tree Landlock stage
-   (no new crate, `libc` syscalls) inside the bwrap sandbox as defence in
-   depth, and as the only layer where user namespaces are refused? It is
-   tole's own sandbox code, which decision 2 of the third-party design
-   ruled out for the primary mechanism.
-4. **macOS.** Generate Seatbelt profiles in tole, use `srt` as the macOS
-   backend (adds a Node requirement there), or leave macOS without a
-   sandbox for now?
-5. **Allowlist proxy in tole.** Build the small filtering proxy (§8,
-   proposed), or offer only `none` and `full` until an external wrapper
-   with an allowlist is chosen?
-6. **RC-1 wording.** The threat model calls a real argv sandbox "a
-   different product, out of scope". Confirm that opt-in sandboxing of
-   model commands (§9.2) is now in scope, so phase 4 can update that row.
+Decided by the owner on 2026-11-14, replacing the six open questions of
+the proposal.
+
+1. **Default for model commands.** `verify` (and `turnend`) will run
+   sandboxed by default in a later phase. The first sandbox PR is opt-in
+   only: `[sandbox]` is off by default and nothing changes for existing
+   setups.
+2. **`optional` in unattended runs.** An `optional` sandbox is treated as
+   `required` for unattended runs (cron, webhook, `serve` with no human).
+   If the sandbox is unavailable, an unattended run refuses; it never runs
+   unsandboxed.
+3. **Landlock.** No tole-owned Landlock layer now. Bubblewrap first.
+4. **macOS.** No macOS sandbox now. macOS stays unsandboxed and
+   `tole doctor` says so.
+5. **Allowlist proxy.** No host-allowlist proxy yet. Network is all or
+   nothing per sandbox profile (`none` or `host`); phase 3 is deferred.
+6. **RC-1 wording.** The threat-model RC-1 row changes with the first
+   sandbox PR: opt-in sandboxing of third-party servers is in scope.
+
+Rules that stay in force for every implementation phase:
+
+- bwrap's own environment is scrubbed: it is spawned with a cleared
+  environment, never tole's.
+- Secrets are never passed with `--setenv` (they would show in the `bwrap`
+  argv and in `/proc/<pid>/cmdline`); a granted secret reaches the program
+  only through the scrubbed child environment mechanism.
+- `--disable-userns` is always passed (no nested user namespaces).
+- `--cap-drop ALL` is always passed, in particular when tole runs as root.
