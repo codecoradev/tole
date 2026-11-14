@@ -8,7 +8,9 @@
 
 #![cfg(feature = "shell-tools")]
 
-use std::path::{Path, PathBuf};
+mod common;
+use common::TestDir;
+use std::path::Path;
 use std::sync::OnceLock;
 
 use serde_json::{json, Value};
@@ -42,15 +44,12 @@ fn env() {
     });
 }
 
-fn tmp(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("tole-cron-trust-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d.canonicalize().unwrap()
+fn tmp(tag: &str) -> TestDir {
+    TestDir::new(&format!("tole-cron-trust-{tag}"))
 }
 
 /// A cron dir and a workdir that does not hold it.
-fn dirs(tag: &str) -> (PathBuf, PathBuf) {
+fn dirs(tag: &str) -> (TestDir, TestDir) {
     (tmp(&format!("{tag}-cron")), tmp(&format!("{tag}-work")))
 }
 
@@ -224,7 +223,7 @@ fn a_line_of_unknown_origin_is_held_like_an_agents() {
         id: Some("u".into()),
         schedule: "* * * * *".into(),
         prompt: Some("hi".into()),
-        workdir: work.clone(),
+        workdir: work.to_path_buf(),
         ..CreateSpec::default()
     };
     let mut j = cron::create(&cron, spec, cron::now()).unwrap();
@@ -265,7 +264,7 @@ fn an_agent_run_whose_jail_holds_the_cron_dir_is_blocked() {
         id: Some("w".into()),
         schedule: "* * * * *".into(),
         prompt: Some("hi".into()),
-        workdir: work.clone(),
+        workdir: work.to_path_buf(),
         ..CreateSpec::default()
     };
     let b = cron::create(&cron, spec, cron::now()).unwrap().at;

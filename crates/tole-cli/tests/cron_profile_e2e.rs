@@ -8,23 +8,18 @@
 //! request bodies; `uteke` on PATH is a fake that logs its argv.
 #![cfg(all(unix, feature = "shell-tools"))]
 
+mod common;
+use common::TestDir;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-fn tmpdir() -> PathBuf {
-    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let d = std::env::temp_dir().join(format!("tole-cron-prof-{}-{n}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d.canonicalize().unwrap()
+fn tmpdir() -> TestDir {
+    TestDir::new("tole-cron-prof")
 }
 
 fn text(b: &[u8]) -> String {
@@ -104,6 +99,7 @@ struct Env {
     bin: PathBuf,
     url: String,
     /// Run the child with TOLE_SKILL_APPROVAL=required.
+    _root: TestDir,
     required: std::cell::Cell<bool>,
     /// Leave TOLE_SKILL_APPROVAL unset (the default: required).
     default_approval: std::cell::Cell<bool>,
@@ -117,6 +113,7 @@ impl Env {
             cron: root.join("cron"),
             work: root.join("work"),
             bin: root.join("bin"),
+            _root: root,
             url: url.to_string(),
             required: std::cell::Cell::new(false),
             default_approval: std::cell::Cell::new(false),

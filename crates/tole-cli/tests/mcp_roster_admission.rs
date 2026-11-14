@@ -5,6 +5,8 @@
 
 #![cfg(feature = "mcp")]
 
+mod common;
+use common::TestDir;
 use tole_cli::tool_roster::{build, Roster};
 use tole_core::approval::{Approver, ToolRequest, Verdict};
 use tole_core::mcp::McpServerConfig;
@@ -49,8 +51,7 @@ fn has_mcp_read(ws: &std::path::Path, cfg: &McpServerConfig) -> bool {
 
 #[test]
 fn a_changed_server_gets_no_mcp_read_and_an_approved_one_does() {
-    let dir = std::env::temp_dir().join(format!("tole-roster-680-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = TestDir::new("tole-roster-680");
     std::fs::create_dir_all(dir.join("tole")).unwrap();
     std::fs::create_dir_all(dir.join("ws")).unwrap();
     // SAFETY (edition 2021: safe call): the only test in this binary.

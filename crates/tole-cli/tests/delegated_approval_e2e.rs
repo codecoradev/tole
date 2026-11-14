@@ -7,6 +7,8 @@
 
 #![cfg(feature = "shell-tools")]
 
+mod common;
+use common::TestDir;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -95,11 +97,11 @@ struct World {
     home: PathBuf,
     root: PathBuf,
     base: String,
+    _dir: TestDir,
 }
 
 fn world(tag: &str, delegation_cfg: &str) -> World {
-    let d = std::env::temp_dir().join(format!("tole-dap-e2e-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
+    let d = TestDir::new(&format!("tole-dap-e2e-{tag}"));
     let (home, root) = (d.join("home"), d.join("work"));
     std::fs::create_dir_all(home.join("tole")).unwrap();
     std::fs::create_dir_all(&root).unwrap();
@@ -108,6 +110,7 @@ fn world(tag: &str, delegation_cfg: &str) -> World {
         home,
         root: root.canonicalize().unwrap(),
         base: spawn_mock(),
+        _dir: d,
     }
 }
 
