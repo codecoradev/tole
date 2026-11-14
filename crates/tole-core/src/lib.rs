@@ -34,7 +34,6 @@ pub mod approval;
 pub mod cancel;
 pub mod ccimport;
 pub mod child_env;
-pub mod compaction;
 pub mod integrations;
 // `integrations/` holds these modules; the re-exports keep the old top-level paths working.
 #[doc(inline)]
@@ -91,7 +90,6 @@ pub use ledger::tz;
 #[doc(inline)]
 pub use ledger::webhook;
 pub mod systemone;
-pub mod transcript;
 pub mod web;
 // Process hooks spawn subprocesses (issue #110) — same gate as the
 // subprocess helper they build on; mobile/embedder profiles have no
@@ -150,6 +148,11 @@ pub mod storage;
 pub mod subprocess;
 pub mod tool;
 pub mod turn;
+// `turn/` holds the modules below; these re-exports keep the old top-level paths working.
+#[doc(inline)]
+pub use turn::compaction;
+#[doc(inline)]
+pub use turn::transcript;
 pub mod update_check;
 
 /// Semantic version of the durable schema (see storage module docs).
