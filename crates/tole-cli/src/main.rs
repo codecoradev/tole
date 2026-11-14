@@ -1014,6 +1014,15 @@ fn dispatch(cli: Cli) -> Result<()> {
     // Scoped secret release (#598): which tools may hand which secret to
     // the processes they start. Every launcher reads it from here.
     tole_core::secret_release::set_release(cfg.as_ref().map(|c| c.release()).unwrap_or_default());
+    // Sandbox of stdio MCP servers (#601): off unless the user config sets
+    // `[sandbox] mode`; the config was validated at load.
+    if let Err(e) = tole_core::sandbox::set_policy(
+        cfg.as_ref()
+            .and_then(|c| c.sandbox.as_ref())
+            .and_then(|s| s.policy().ok()),
+    ) {
+        eprintln!("tole: warning: {e}");
+    }
     // Extra sensitive file names (#683): user globs plus the project's.
     tole_core::sensitive::set_extra(
         cfg.as_ref()
@@ -3235,7 +3244,14 @@ fn chat_command(
                         ))
                     }
                 });
-                match admitted.and_then(|(s, p, a)| tole_core::mcp::get_server_prompt(&s, &p, a)) {
+                match admitted.and_then(|(s, p, a)| {
+                    tole_core::mcp::get_server_prompt_in(
+                        &s,
+                        host.workspace.as_deref().map(Path::new),
+                        &p,
+                        a,
+                    )
+                }) {
                     Ok(t) if !t.is_empty() => {
                         println!("tole> (mcp prompt)\n{t}");
                         rendered = t;

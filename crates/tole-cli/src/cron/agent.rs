@@ -294,6 +294,9 @@ pub fn run_agent(
     let profile_allow = setup.profile.as_ref().map(|p| p.allow.as_slice());
     let approver = approver(job, profile_allow, queue, &session_id, &path);
     let refused = approver.refused();
+    // A cron run has no human: an `optional` sandbox counts as `required`
+    // (#601).
+    tole_core::sandbox::mark_unattended();
     let mut roster = crate::tool_roster::Roster::new(canon.clone());
     roster.plan_mode = trigger.is_some_and(|t| t.read_only);
     let mut reg = match crate::tool_roster::build(approver, roster) {

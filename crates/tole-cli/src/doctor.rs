@@ -859,6 +859,15 @@ pub fn run_cli(
     };
     let ok = ok && !router_lines.iter().any(|l| l.starts_with("router: ERROR"));
     router_lines.iter().for_each(|l| println!("{l}"));
+    // Sandbox (#601): the backend (bwrap present and usable, or why not) and
+    // the user config's mode. Names and states only.
+    let sandbox = match &user {
+        Some(Ok(c)) => c.sandbox.as_ref().and_then(|s| s.policy().ok()),
+        _ => None,
+    };
+    for l in tole_core::sandbox::doctor_lines(sandbox.as_ref(), &tole_core::sandbox::detect()) {
+        println!("{l}");
+    }
     // Advisor tier (#587): the profiles that declare one, names only. A
     // broken user config is already reported (and failed) above.
     let advisor_lines = match &user {

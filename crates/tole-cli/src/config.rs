@@ -108,6 +108,57 @@ pub struct CronConfig {
     pub tz_source: Option<TzSource>,
 }
 
+/// The `[sandbox]` table (#601). USER LAYER ONLY, like [`CronConfig`]: a
+/// cloned repository must never loosen or switch off its own sandbox.
+/// Off unless `mode` says otherwise; Linux (bubblewrap) only.
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SandboxConfig {
+    /// `off` (default) | `optional` | `required`.
+    pub mode: Option<String>,
+    /// Built-in profile for stdio MCP servers: `server` (default;
+    /// workspace read-only) or `strict` (no workspace).
+    pub profile: Option<String>,
+    /// `none` (default) or `host`.
+    pub network: Option<String>,
+    /// Extra read-only paths.
+    pub read: Option<Vec<String>>,
+    /// Extra writable paths.
+    pub write: Option<Vec<String>>,
+    /// Server names that run unsandboxed (the owner's first-party ones).
+    pub skip: Option<Vec<String>>,
+}
+
+impl SandboxConfig {
+    /// The core policy this table sets; a bad value is an error naming its key.
+    pub fn policy(&self) -> Result<tole_core::sandbox::Policy, String> {
+        use tole_core::sandbox::{builtin_profile, Mode, Network};
+        let mode = match self.mode.as_deref() {
+            None => Mode::Off,
+            Some(s) => Mode::parse(s).ok_or_else(|| {
+                format!("sandbox.mode must be off, optional or required, got {s:?}")
+            })?,
+        };
+        let name = self.profile.as_deref().unwrap_or("server");
+        let mut profile = builtin_profile(name)
+            .ok_or_else(|| format!("sandbox.profile must be server or strict, got {name:?}"))?;
+        profile.network = match self.network.as_deref() {
+            None | Some("none") => Network::None,
+            Some("host") => Network::Host,
+            Some(s) => return Err(format!("sandbox.network must be none or host, got {s:?}")),
+        };
+        let paths = |v: &Option<Vec<String>>| v.iter().flatten().map(Into::into).collect();
+        profile.read = paths(&self.read);
+        profile.write = paths(&self.write);
+        Ok(tole_core::sandbox::Policy {
+            mode,
+            profile_name: name.to_string(),
+            profile,
+            skip: self.skip.clone().unwrap_or_default(),
+        })
+    }
+}
+
 /// The `[curator]` table (#593). USER LAYER ONLY, like [`CronConfig`]: the
 /// skill library is the user's, so a cloned repository's config must not
 /// switch the curator off or shorten how long a skill lives.
@@ -622,6 +673,9 @@ pub struct Config {
     pub tui: Option<TuiConfig>,
     /// Scheduler limits (#579); user layer only, see [`CronConfig`].
     pub cron: Option<CronConfig>,
+    /// The sandbox of stdio MCP servers (#601); user layer only, see
+    /// [`SandboxConfig`].
+    pub sandbox: Option<SandboxConfig>,
     /// The skill curator (#593); user layer only, see [`CuratorConfig`].
     pub curator: Option<CuratorConfig>,
     /// Delegation limits (#585); user layer only, see [`DelegationConfig`].
@@ -858,6 +912,9 @@ pub fn parse(src: &str, path: &Path) -> Result<Config, ConfigError> {
             )));
         }
     }
+    if let Some(s) = &cfg.sandbox {
+        s.policy().map_err(range)?;
+    }
     if let Some(c) = &cfg.curator {
         for (key, v) in [
             ("stale_days", c.stale_days),
@@ -1058,6 +1115,8 @@ pub fn layered(project: &Config, user: &Config) -> Config {
         tui: user.tui.clone(),
         // Nor the scheduler limits (#579).
         cron: user.cron.clone(),
+        // Nor the sandbox (#601): a repository must not loosen its own.
+        sandbox: user.sandbox.clone(),
         // Nor the curator's settings (#593).
         curator: user.curator.clone(),
         // Nor the delegation limits (#585).
@@ -1089,6 +1148,17 @@ pub fn layered(project: &Config, user: &Config) -> Config {
         }
         if c.tz_source.is_some() {
             from_user.insert("cron.tz_source");
+        }
+    }
+    if let Some(s) = &user.sandbox {
+        for (k, set) in [
+            ("sandbox.mode", s.mode.is_some()),
+            ("sandbox.profile", s.profile.is_some()),
+            ("sandbox.network", s.network.is_some()),
+        ] {
+            if set {
+                from_user.insert(k);
+            }
         }
     }
     if let Some(c) = &user.curator {
@@ -1148,6 +1218,9 @@ pub const TUI_IGNORED_NOTE: &str =
 /// Suffix of a project config's `cron` lines in `config check` (#579).
 pub const CRON_IGNORED_NOTE: &str =
     "  IGNORED: a project config cannot set scheduler limits (user config only)";
+/// Suffix of a project config's `sandbox` lines in `config check` (#601).
+pub const SANDBOX_IGNORED_NOTE: &str =
+    "  IGNORED: a project config cannot set the sandbox (user config only)";
 /// Suffix of a project config's `curator` lines in `config check` (#593).
 pub const CURATOR_IGNORED_NOTE: &str =
     "  IGNORED: a project config cannot change the skill curator (user config only)";
@@ -1201,6 +1274,9 @@ pub fn render_with(cfg: &Config, tag: &str, ann: &Annotations) -> Vec<String> {
         }
         if tag == PROJECT_TAG && key.starts_with("cron.") {
             return CRON_IGNORED_NOTE;
+        }
+        if tag == PROJECT_TAG && key.starts_with("sandbox.") {
+            return SANDBOX_IGNORED_NOTE;
         }
         if tag == PROJECT_TAG && key.starts_with("curator.") {
             return CURATOR_IGNORED_NOTE;
@@ -1433,6 +1509,11 @@ pub fn render_with(cfg: &Config, tag: &str, ann: &Annotations) -> Vec<String> {
                 .to_string()
             }),
         );
+    }
+    if let Some(s) = &cfg.sandbox {
+        scalar(&mut out, "sandbox.mode", s.mode.as_deref().map(quote));
+        scalar(&mut out, "sandbox.profile", s.profile.as_deref().map(quote));
+        scalar(&mut out, "sandbox.network", s.network.as_deref().map(quote));
     }
     if let Some(c) = &cfg.curator {
         scalar(
@@ -1774,6 +1855,47 @@ verify_timeout = 60
             shown.contains("delegation.approvals = owner") && shown.contains("IGNORED"),
             "{shown}"
         );
+    }
+
+    #[test]
+    fn sandbox_table_is_off_by_default_strict_and_user_layer_only() {
+        use tole_core::sandbox::{Mode, Network, Workspace};
+        // Absent or empty: off, so nothing changes for existing setups.
+        let none = parse("", &p()).unwrap();
+        assert!(none.sandbox.is_none());
+        let empty = parse("[sandbox]\n", &p()).unwrap();
+        assert_eq!(empty.sandbox.unwrap().policy().unwrap().mode, Mode::Off);
+
+        let c = parse(
+            "[sandbox]\nmode = \"required\"\nprofile = \"strict\"\nnetwork = \"host\"\n\
+             read = [\"/opt/x\"]\nskip = [\"cora\"]\n",
+            &p(),
+        )
+        .unwrap();
+        let pol = c.sandbox.unwrap().policy().unwrap();
+        assert_eq!(pol.mode, Mode::Required);
+        assert_eq!(pol.profile.workspace, Workspace::None);
+        assert_eq!(pol.profile.network, Network::Host);
+        assert_eq!(pol.skip, vec!["cora".to_string()]);
+
+        // Unknown keys and values are errors that name the key.
+        assert!(parse("[sandbox]\nmodes = \"on\"\n", &p()).is_err());
+        for bad in ["mode = \"on\"", "profile = \"x\"", "network = \"some\""] {
+            let e = parse(&format!("[sandbox]\n{bad}\n"), &p())
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("sandbox."), "{e}");
+        }
+    }
+
+    #[test]
+    fn a_project_config_cannot_set_the_sandbox() {
+        let user = parse("[sandbox]\nmode = \"required\"\n", &p()).unwrap();
+        let project = parse("[sandbox]\nmode = \"off\"\nnetwork = \"host\"\n", &p()).unwrap();
+        let eff = layered(&project, &user);
+        assert_eq!(eff.sandbox, user.sandbox, "the user layer wins whole");
+        let eff = layered(&project, &Config::default());
+        assert!(eff.sandbox.is_none(), "a project alone cannot turn it on");
     }
 
     #[test]

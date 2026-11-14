@@ -616,6 +616,9 @@ fn build_with_data_dir(
         };
         let mut cfg = cfg.clone();
         cfg.secret_grant = plugin_gate.secret_grant(&cfg.name);
+        // The sandbox binds THIS session's workspace (#601), never a
+        // process-wide one.
+        cfg.workspace = Some(roster.workspace.clone());
         let cfg = &cfg;
         let names = tole_core::mcp::register_server_tools(&mut reg, cfg, &secrets, &admit);
         if cfg.name == "cora" && !names.is_empty() {
@@ -633,7 +636,10 @@ fn build_with_data_dir(
     if !resource_servers.is_empty() {
         add(
             &mut reg,
-            Box::new(tole_core::mcp::McpReadTool::new(resource_servers)),
+            Box::new(
+                tole_core::mcp::McpReadTool::new(resource_servers)
+                    .in_workspace(roster.workspace.clone()),
+            ),
         )?;
     }
     // Review gate (#534): on only when the agent can actually get a review.
