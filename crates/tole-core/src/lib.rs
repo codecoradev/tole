@@ -43,8 +43,14 @@ pub mod failover;
 pub mod file_tools;
 // Tool-call authorization gate (#303): crate-internal, no public API.
 pub mod delegation;
-pub mod delegation_approvals;
-pub mod delegation_report;
+// `delegation/` holds the approvals, report and resource-guard modules; these
+// re-exports keep the old top-level paths working.
+#[doc(inline)]
+pub use delegation::approvals as delegation_approvals;
+#[doc(inline)]
+pub use delegation::report as delegation_report;
+#[doc(inline)]
+pub use delegation::resource_guard;
 pub mod discussion;
 // The discussion log lives in `discussion/log.rs`; this keeps the old
 // `tole_core::discussion_log` path working.
@@ -86,7 +92,6 @@ pub mod provider;
 pub mod read_file;
 pub mod register;
 pub mod replay;
-pub mod resource_guard;
 pub mod router;
 #[cfg(feature = "shell-tools")]
 pub mod run_command;

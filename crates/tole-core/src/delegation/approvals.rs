@@ -1032,5 +1032,5 @@ impl<S: LedgerStore> Approvals<S> {
 }
 
 #[cfg(test)]
-#[path = "delegation_approvals_tests.rs"]
+#[path = "approvals_tests.rs"]
 mod tests;

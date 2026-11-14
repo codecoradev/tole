@@ -37,6 +37,10 @@
 //! [`Delegation::render_tree`] prints who spawned whom, with what budget,
 //! allowlist, workspace, session and report.
 
+pub mod approvals;
+pub mod report;
+pub mod resource_guard;
+
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
@@ -1294,5 +1298,4 @@ impl<S: LedgerStore> Delegation<S> {
 }
 
 #[cfg(test)]
-#[path = "delegation_tests.rs"]
 mod tests;
