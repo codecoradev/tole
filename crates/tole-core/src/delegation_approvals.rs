@@ -68,6 +68,8 @@ pub const MAX_RECORD_BYTES: usize = 32 << 10;
 pub const MAX_INPUT_BYTES: usize = 16 << 10;
 /// Host-built display kept in a request.
 pub const MAX_DISPLAY_BYTES: usize = 2 << 10;
+/// Pending requests of one goal.
+pub const MAX_PENDING_PER_GOAL: usize = 32;
 /// Default and ceiling of `[delegation] approval_secs`; default of
 /// `approval_level_secs`.
 pub const DEFAULT_APPROVAL_SECS: i64 = 900;
@@ -314,6 +316,10 @@ pub enum ApprovalError {
     LogFull,
     #[error("record over {MAX_RECORD_BYTES} bytes")]
     RecordTooLarge,
+    #[error("node `{0}` already has a pending request")]
+    NodePending(String),
+    #[error("goal `{0}` has {MAX_PENDING_PER_GOAL} pending requests")]
+    GoalFull(String),
 }
 
 /// The delegation tree the fold reads: a node's parent, allow list, status.
@@ -359,6 +365,34 @@ pub fn fingerprint(
 
 fn is_hex64(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+const SECRET_MARKERS: &[&str] = &[
+    "TOKEN",
+    "SECRET",
+    "PASSWORD",
+    "PASSWD",
+    "API_KEY",
+    "APIKEY",
+    "CREDENTIAL",
+    "PRIVATE_KEY",
+];
+
+/// Does the input name a secret variable: an ALL-CAPS word (`GITHUB_TOKEN`)
+/// in a string, or an object key (any case), holding a secret marker? Plain
+/// prose ("a token budget") does not.
+pub fn names_secret(v: &Value) -> bool {
+    let marked = |s: &str| SECRET_MARKERS.iter().any(|m| s.contains(m));
+    match v {
+        Value::String(s) => s
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .any(|w| w.chars().all(|c| !c.is_ascii_lowercase()) && marked(w)),
+        Value::Array(a) => a.iter().any(names_secret),
+        Value::Object(m) => m
+            .iter()
+            .any(|(k, x)| marked(&k.to_ascii_uppercase()) || names_secret(x)),
+        _ => false,
+    }
 }
 
 const COMMAND_TOOLS: &[&str] = &["run_command", "job_start"];
@@ -765,6 +799,29 @@ impl State {
     }
 }
 
+/// What the host asks; the stored [`Request`] is built from it.
+#[derive(Debug, Clone, Copy)]
+pub struct NewRequest<'a> {
+    pub node: &'a str,
+    pub session: &'a str,
+    pub tool: &'a str,
+    pub origin: Origin,
+    pub target: Option<&'a str>,
+    /// The raw input: only the fingerprint (and the secret scan) sees it.
+    pub raw_input: &'a Value,
+    /// The redacted copy that is stored.
+    pub input: &'a Value,
+    pub display: &'a str,
+    /// The host's own finding (a `[secrets]` binding, a redaction hit).
+    pub secrets: bool,
+    pub protected: bool,
+    pub workspace: &'a str,
+    pub approval_secs: i64,
+    pub level_secs: i64,
+    /// Random lowercase alphanumerics (8 to 32) made by the host.
+    pub nonce: &'a str,
+}
+
 /// The approval log: a store plus the fold of everything read from it.
 pub struct Approvals<S: LedgerStore> {
     store: S,
@@ -830,6 +887,91 @@ impl<S: LedgerStore> Approvals<S> {
             self.store.truncate(self.offset)?;
         }
         Ok(())
+    }
+
+    /// Asks: builds the request (display and input capped, chain read from
+    /// the tree, window capped by the node's deadline) and appends it. One
+    /// open request per node and [`MAX_PENDING_PER_GOAL`] per goal. Returns
+    /// the request id.
+    pub fn request(
+        &mut self,
+        tree: &dyn Tree,
+        n: &NewRequest<'_>,
+        now: i64,
+    ) -> Result<String, ApprovalError> {
+        let bad = |m| ApprovalError::Refused(Refusal::Malformed(m));
+        let node = tree.node(n.node).ok_or(bad("unknown node"))?;
+        let nonce_ok = (8..=32).contains(&n.nonce.len())
+            && n.nonce
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
+        if !nonce_ok {
+            return Err(bad("nonce"));
+        }
+        self.sync(tree, true)?;
+        let open = |keep: &dyn Fn(&Entry) -> bool| {
+            self.state
+                .entries()
+                .filter(|e| keep(e))
+                .filter(|e| {
+                    let st = self.state.status(&e.req.req, tree, now);
+                    matches!(st, Some(Status::Pending { .. } | Status::Allowed))
+                })
+                .count()
+        };
+        if open(&|e| e.req.node == n.node) > 0 {
+            return Err(ApprovalError::NodePending(n.node.to_string()));
+        }
+        if open(&|e| e.req.goal == node.goal_id) >= MAX_PENDING_PER_GOAL {
+            return Err(ApprovalError::GoalFull(node.goal_id.clone()));
+        }
+        let mut display = n.display.to_string();
+        let mut truncated = display.len() > MAX_DISPLAY_BYTES;
+        if truncated {
+            let mut cut = MAX_DISPLAY_BYTES;
+            while !display.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            display.truncate(cut);
+        }
+        // A stored copy over the cap is dropped, and the request goes to the
+        // owner: nobody else saw what the fingerprint covers.
+        let big = n.input.to_string().len() > MAX_INPUT_BYTES;
+        truncated |= big;
+        let span = n.approval_secs.clamp(1, MAX_APPROVAL_SECS);
+        let expires_at = now.saturating_add(span).min(node.budget.deadline);
+        let mut r = Request {
+            req: format!("dap-{now:x}-{}", n.nonce),
+            goal: node.goal_id.clone(),
+            node: n.node.to_string(),
+            session: n.session.to_string(),
+            tool: n.tool.to_string(),
+            risk: Risk::Write,
+            origin: n.origin,
+            target: n.target.map(str::to_string),
+            input: if big { Value::Null } else { n.input.clone() },
+            display,
+            truncated,
+            secrets: n.secrets || names_secret(n.raw_input),
+            protected: n.protected,
+            fingerprint: fingerprint(
+                n.node,
+                n.session,
+                n.tool,
+                n.raw_input,
+                n.target,
+                n.workspace,
+            ),
+            workspace: n.workspace.to_string(),
+            chain: Vec::new(),
+            level_secs: n.level_secs,
+            expires_at,
+            at: now,
+        };
+        r.chain = build_chain(tree, node, &r).ok_or(Refusal::ChainMismatch)?;
+        let id = r.req.clone();
+        self.append(tree, Record::Request(r))?;
+        Ok(id)
     }
 
     /// Validates `rec` against a copy of the fold, then appends it. The

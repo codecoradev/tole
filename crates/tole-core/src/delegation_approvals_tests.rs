@@ -1153,3 +1153,245 @@ fn the_switch_defaults_to_off() {
     assert_eq!(p("chain").unwrap(), ApprovalsMode::Chain);
     assert!(p("agent").is_err());
 }
+
+/// `request` for `node` with the given pieces; the target is `src/a.rs`.
+fn ask_new(
+    f: &mut Fx,
+    node: &str,
+    nonce: &str,
+    now: i64,
+    (raw, input, display): (&Value, &Value, &str),
+) -> Result<String, ApprovalError> {
+    ask_flags(
+        f,
+        node,
+        (nonce, now, 900),
+        (raw, input, display),
+        (false, false),
+    )
+}
+
+fn ask_flags(
+    f: &mut Fx,
+    node: &str,
+    (nonce, now, approval_secs): (&str, i64, i64),
+    (raw, input, display): (&Value, &Value, &str),
+    (secrets, protected): (bool, bool),
+) -> Result<String, ApprovalError> {
+    let n = NewRequest {
+        node,
+        session: "sess-kid",
+        tool: "write_file",
+        origin: Origin::Builtin,
+        target: Some("src/a.rs"),
+        raw_input: raw,
+        input,
+        display,
+        secrets,
+        protected,
+        workspace: "/w",
+        approval_secs,
+        level_secs: 120,
+        nonce,
+    };
+    f.a.request(&f.d, &n, now)
+}
+
+fn kid_ask(f: &mut Fx, nonce: &str, now: i64) -> Result<String, ApprovalError> {
+    let kid = f.kid.clone();
+    let i = input();
+    ask_new(f, &kid, nonce, now, (&i, &i, "write_file src/a.rs"))
+}
+
+#[test]
+fn the_builder_fingerprints_the_raw_input_and_reads_the_chain() {
+    let mut f = std_fx();
+    let kid = f.kid.clone();
+    let raw = json!({"path": "src/a.rs", "content": "real"});
+    let shown = json!({"path": "src/a.rs", "content": "[redacted]"});
+    let id = ask_new(&mut f, &kid, "abcdefgh", T, (&raw, &shown, "write_file")).unwrap();
+    assert_eq!(id, format!("dap-{T:x}-abcdefgh"));
+    let r = &f.a.state().entry(&id).unwrap().req;
+    let want = fingerprint(&kid, "sess-kid", "write_file", &raw, Some("src/a.rs"), "/w");
+    assert_eq!((r.fingerprint.clone(), r.input.clone()), (want, shown));
+    assert_eq!(skips(r), [None, None]);
+    assert!(!r.truncated && r.risk == Risk::Write);
+}
+
+#[test]
+fn the_builder_caps_display_and_input_and_sends_the_request_to_the_owner() {
+    let mut f = std_fx();
+    let kid = f.kid.clone();
+    // 2 bytes a char: the cut must land on a boundary.
+    let long = format!("a{}", "é".repeat(MAX_DISPLAY_BYTES));
+    let i = input();
+    let id = ask_new(&mut f, &kid, "aaaaaaaa", T, (&i, &i, &long)).unwrap();
+    let r = &f.a.state().entry(&id).unwrap().req;
+    assert!(r.truncated && r.display.len() <= MAX_DISPLAY_BYTES);
+    assert!(r.display.starts_with("aé") && r.display.chars().skip(1).all(|c| c == 'é'));
+    assert_eq!(skips(r), [Some(Skip::OwnerOnly); 2]);
+    // An input over the cap is not stored; the fingerprint still covers it.
+    let mut f = std_fx();
+    let kid = f.kid.clone();
+    let big = json!({"path": "src/a.rs", "content": "x".repeat(MAX_INPUT_BYTES)});
+    let id = ask_new(&mut f, &kid, "bbbbbbbb", T, (&big, &big, "write_file")).unwrap();
+    let r = &f.a.state().entry(&id).unwrap().req;
+    let fp = fingerprint(&kid, "sess-kid", "write_file", &big, Some("src/a.rs"), "/w");
+    assert!(r.truncated && r.input.is_null() && r.fingerprint == fp);
+    assert_eq!(skips(r), [Some(Skip::OwnerOnly); 2]);
+}
+
+#[test]
+fn a_secret_in_the_raw_input_makes_the_request_owner_only() {
+    let mut f = std_fx();
+    let kid = f.kid.clone();
+    let raw = json!({"path": "src/a.rs", "content": "export GITHUB_TOKEN=x"});
+    let clean = json!({"path": "src/a.rs", "content": "export [redacted]"});
+    let id = ask_new(&mut f, &kid, "cccccccc", T, (&raw, &clean, "write_file")).unwrap();
+    let r = &f.a.state().entry(&id).unwrap().req;
+    assert!(r.secrets);
+    assert_eq!(skips(r), [Some(Skip::OwnerOnly); 2]);
+    assert!(names_secret(&json!({"api_key": 1})));
+    assert!(names_secret(&json!({"Password": 1})));
+    assert!(names_secret(&json!(["x", {"k": "GITHUB_TOKEN"}])));
+    assert!(!names_secret(&json!("see TOKENizer docs")));
+    assert!(!names_secret(
+        &json!({"content": "a token budget and a secret plan"})
+    ));
+}
+
+#[test]
+fn one_open_request_per_node() {
+    let mut f = std_fx();
+    let first = kid_ask(&mut f, "aaaaaaaa", T).unwrap();
+    let e = kid_ask(&mut f, "bbbbbbbb", T + 1).unwrap_err();
+    assert!(matches!(e, ApprovalError::NodePending(_)), "{e}");
+    // A decided request no longer blocks; an allowed, unconsumed one does.
+    decide(&mut f, &first, By::Owner, Choice::Allow, T + 2).unwrap();
+    let e = kid_ask(&mut f, "bbbbbbbb", T + 3).unwrap_err();
+    assert!(matches!(e, ApprovalError::NodePending(_)), "{e}");
+    let kid = f.kid.clone();
+    consume(&mut f, &first, &kid, T + 4).unwrap();
+    let second = kid_ask(&mut f, "bbbbbbbb", T + 5).unwrap();
+    decide(&mut f, &second, By::Owner, Choice::Deny, T + 6).unwrap();
+    let third = kid_ask(&mut f, "cccccccc", T + 7).unwrap();
+    // An expired one frees the node too.
+    let end = f.a.state().entry(&third).unwrap().req.expires_at;
+    kid_ask(&mut f, "dddddddd", end).unwrap();
+}
+
+#[test]
+fn at_most_32_open_requests_per_goal() {
+    let mut f = std_fx();
+    let i = input();
+    let mut asked = 0;
+    for k in 0..40 {
+        let r = DelegateRequest {
+            profile: "p",
+            task: "t",
+            mode: Mode::Execute,
+            budget: BudgetRequest {
+                tokens: Some(1),
+                steps: Some(1),
+                minutes: None,
+            },
+            profile_allow: &[],
+            workspace: None,
+        };
+        let node =
+            f.d.delegate("g", &r, Spend::default(), T)
+                .map(|h| h.node_id);
+        let Ok(node) = node else { continue };
+        let nonce = format!("n{k:07}");
+        match ask_new(&mut f, &node, &nonce, T, (&i, &i, "write_file")) {
+            Ok(_) => asked += 1,
+            Err(ApprovalError::GoalFull(g)) => {
+                assert_eq!((g.as_str(), asked), ("g", 32));
+                return;
+            }
+            Err(e) => panic!("{e}"),
+        }
+    }
+    panic!("the cap never hit after {asked} requests");
+}
+
+#[test]
+fn the_builder_refuses_a_bad_nonce_a_replayed_id_and_caps_the_window_at_the_deadline() {
+    let mut f = std_fx();
+    for bad in ["short", "UPPERCASE1", "has space1", &"a".repeat(33)] {
+        let e = kid_ask(&mut f, bad, T).unwrap_err();
+        assert!(
+            matches!(e, ApprovalError::Refused(Refusal::Malformed(_))),
+            "{bad}"
+        );
+    }
+    let id = kid_ask(&mut f, "aaaaaaaa", T).unwrap();
+    // The same second and nonce from another node: the id is taken.
+    let mid = f.mid.clone();
+    let i = input();
+    let e = ask_new(&mut f, &mid, "aaaaaaaa", T, (&i, &i, "w")).unwrap_err();
+    assert!(
+        matches!(e, ApprovalError::Refused(Refusal::Duplicate)),
+        "{e}"
+    );
+    // A window past the node's deadline is cut to it, never extended.
+    let deadline = f.d.poll(&f.kid).unwrap().budget.deadline;
+    let end = f.a.state().entry(&id).unwrap().req.expires_at;
+    assert_eq!(end, (T + 900).min(deadline));
+    let e = kid_ask(&mut f, "bbbbbbbb", deadline).unwrap_err();
+    assert!(
+        matches!(e, ApprovalError::Refused(Refusal::Malformed(_))),
+        "{e}"
+    );
+}
+
+#[test]
+fn the_hosts_findings_make_the_request_owner_only() {
+    let kid_flags = |secrets, protected| {
+        let mut f = std_fx();
+        let kid = f.kid.clone();
+        let i = input();
+        let id = ask_flags(
+            &mut f,
+            &kid,
+            ("aaaaaaaa", T, 900),
+            (&i, &i, "w"),
+            (secrets, protected),
+        );
+        skips(&f.a.state().entry(&id.unwrap()).unwrap().req)
+    };
+    assert_eq!(kid_flags(false, false), [None, None]);
+    assert_eq!(kid_flags(true, false), [Some(Skip::OwnerOnly); 2]);
+    assert_eq!(kid_flags(false, true), [Some(Skip::OwnerOnly); 2]);
+}
+
+#[test]
+fn the_window_is_clamped_and_cut_at_the_deadline() {
+    let i = input();
+    let window = |secs: i64, at_offset: i64| {
+        let mut f = std_fx();
+        let kid = f.kid.clone();
+        let deadline = f.d.poll(&kid).unwrap().budget.deadline;
+        let now = deadline - at_offset;
+        let id = ask_flags(
+            &mut f,
+            &kid,
+            ("aaaaaaaa", now, secs),
+            (&i, &i, "w"),
+            (false, false),
+        );
+        let end = f.a.state().entry(&id.unwrap()).unwrap().req.expires_at;
+        (end - now, end == deadline)
+    };
+    assert_eq!(
+        window(10_000, 20_000),
+        (MAX_APPROVAL_SECS, false),
+        "capped at an hour"
+    );
+    assert_eq!(window(0, 20_000), (1, false), "at least a second");
+    assert_eq!(
+        window(900, 100),
+        (100, true),
+        "never past the node's deadline"
+    );
+}
