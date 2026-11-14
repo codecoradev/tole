@@ -716,5 +716,5 @@ pub fn cli(action: CuratorAction) -> anyhow::Result<()> {
 }
 
 #[cfg(test)]
-#[path = "curator_cmd_tests.rs"]
+#[path = "curator_tests.rs"]
 mod tests;
