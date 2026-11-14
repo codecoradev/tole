@@ -241,8 +241,8 @@ Everything below is merged; CHANGELOG entries carry the detail.
     and the `doctor` missing-window warning (#481); session forks, `tole branch` and
     `sessions --tree` (#210); image input via `--image` (#212); Claude Code transcript
     import, `tole import-claude` (#381, import only).
-- **0.10.0 (planned):** `tole-tui`, a pi-style terminal UI — bare `tole` opens it; model,
-  reasoning effort, context size and tokens in the footer (epic #464, issues #457–#463). In `develop`: skeleton (#459) and the MVP (#460: streaming transcript, editor, footer, inline approvals, Esc cancel), the model picker, thinking level and slash-command menu (#461), and steering, the follow-up queue, collapsible output, `@file` and markdown/diff styling (#462), and #463's `/export` `/copy`, `/fork` `/tree` and the color themes (`default` / `light` / `mono`, `NO_COLOR`, user-config color overrides). The keybinding config (`[tui.keys]`, user config only) is the last #463 part, so #463 is done.
+- **0.10.0 (released 2026-11-04; 0.10.1 the same day):** `tole-tui`, a pi-style terminal UI — bare `tole` opens it; model,
+  reasoning effort, context size and tokens in the footer (epic #464, issues #457–#463). Shipped: skeleton (#459) and the MVP (#460: streaming transcript, editor, footer, inline approvals, Esc cancel), the model picker, thinking level and slash-command menu (#461), and steering, the follow-up queue, collapsible output, `@file` and markdown/diff styling (#462), and #463's `/export` `/copy`, `/fork` `/tree` and the color themes (`default` / `light` / `mono`, `NO_COLOR`, user-config color overrides). The keybinding config (`[tui.keys]`, user config only) is the last #463 part, so #463 is done.
 - **UI epic #523 (started 2026-11-10):** core seams first, then clients. #524 (serve face for graphical clients) ships in three PRs: the paginated transcript read `GET /sessions/{id}/entries` (done), `POST /sessions {"resume": "<id>"}` (done), and the SSE event stream `GET /sessions/{id}/events` with its own stream cap of 8 (done; #524 is complete). Then #525 (one session-host module, done as a module inside `tole-cli` rather than a new crate until a second consumer exists, sync API; part 1 moves tool registration out of `session_host.rs` (done), part 2 consolidates `TuiSession` with the server host as shared primitives, not a literal merge: session create + index registration (done), one turn runner (done), the register settings (done)), #526 (`tole-tui` split: UI-neutral input seam done, `TuiHost` collapsed to `footer`/`run_turn`/`apply` done, approval-as-state done; rendering split into a `render` module done), #527 GPUI desktop, #528 Flutter client, #529 web client. Images (#559, done): any chat/TUI-host turn can carry images (`/image` in `chat`, pending images on `TuiSession`), ACP accepts `image` content blocks and advertises `promptCapabilities.image`; no model-callable image tool by decision. Image input for graphical clients on the serve face (#558: upload, `images` on a prompt, recorded-image read, quotas) is done. The TUI's own paste and `/image` (#560, done): bracketed paste inserts a block as one edit, `/image` and a pasted image path/data URL attach to the next message; no OS clipboard images by decision. #463 (later TUI polish, in four parts; done): part 1 `/export [path]` (HTML/JSONL) and `/copy` (OSC 52, no native clipboard) is done; part 2 `/fork` and `/tree` (a UI over the #210 session forks; in-file branching stays open) is done; part 3 themes (`default` / `light` / `mono`, `NO_COLOR`, color overrides) is done; part 4 the keybinding config (`[tui.keys]` in the user config: ten rebindable convenience actions, the approval keys, Esc, Ctrl+C, Enter and typing are not rebindable, an invalid keymap falls back to the default with one note) is done. #463 is complete (#567 fork/tree, #568 export/copy, #569 themes, keybindings).
 - **Open backlog:** in-file session branching (#210 follow-up), MCP prompts/resources as quick commands (#213), background detach (#217; serve/MCP faces + job-completion nudge shipped, Ctrl-B/chat key waits for the TUI),
   attaching to a *running* Claude Code process (#381 remainder); the multi-client daemon note ([#382](daemon-design.md)) is parked.
@@ -260,7 +260,7 @@ Bot and Nakama; BMAD for collaboration). Design notes:
   (#582). The scheduler lives inside tole. Status: the ledger core is in
   `tole-core` (`cron`, `ledger`: cron/`@every` parser, append-only
   claim/fold/recovery, catch-up with `missed` records, crash-injection and
-  property tests; per-job time zones since #580). #579 in progress: the file adapter and
+  property tests; per-job time zones since #580). #579 is done: the file adapter and
   `tole cron create|list|pause|resume|remove|runs|tick` with script mode
   landed, then agent mode (session per run, model pin, step/minute
   budgets), the `tole serve --cron` ticker and approvals parking, then
@@ -280,6 +280,10 @@ Bot and Nakama; BMAD for collaboration). Design notes:
   `cron.tz_source` (`system` zoneinfo at run time, or `offset-only`). DST
   gaps and overlaps fire once, `list` shows local time and UTC, and jobs
   without a zone are unchanged. The `bundled` source is not built.
+  #582 is done in three parts: the signature and replay gate for
+  `POST /hooks/<route>` on `tole serve` (v2 signatures since #678), filters
+  and templates that run before any model call, then a delivery that fires
+  its route's cron job, and `tole hook add|list|remove|test`.
 - **E2 — Profiles, delegation, discussion, routing, epic #583:**
   - profiles (#584; config, `--profile`, tiers, room and persona done in
     the PR for #584; `tole cron create --profile` in the #579 closing PR);
@@ -321,7 +325,7 @@ Bot and Nakama; BMAD for collaboration). Design notes:
   and `tole skills drafts list|show|reject|verdict`; part 3 is `promote`
   (exact bytes, the owner's confirmation, tainted and near-duplicate
   drafts gated) and `revoke` (what grew from a poisoned source). #592 is
-  done. #593 in progress: part 1 is the `skill_curator` core in `tole-core`
+  done. #593 is done: part 1 is the `skill_curator` core in `tole-core`
   (usage ledger, derived lifecycle, underperformers, package-aware archive
   and restore with a mutation ledger); part 2 is `tole curator`
   (run/status/pause/restore/pin/lock/adopt) and the recall and load
@@ -333,13 +337,20 @@ Bot and Nakama; BMAD for collaboration). Design notes:
 - **E4 — Secrets and third-party plugins, epic #594:**
   - `SecretSet` at every sink (#595; module, provider body, child minimum
     env, MCP arguments, web, `systemone`, memory loop and `uteke_document`
-    done; export, handoff, digests and skill drafts reuse it as they land);
-  - redacted session log (#596);
-  - shared ruleset with uteke (#597);
-  - scoped release, with no secrets for `run_command` (#598, breaking);
-  - plugin lock and rug-pull guard (#599);
-  - `tole plugin` commands and trust tiers (#600);
-  - external sandbox wrapper and lazy start (#601).
+    done, widened in #681 and #682; live tool events in #677; export,
+    handoff, digests and skill drafts reuse it as they land);
+  - redacted session log (#596; done);
+  - shared ruleset with uteke (#597; open);
+  - scoped release, with no secrets for `run_command` (#598, breaking; done,
+    with sensitive files and `read_file_raw`, #676 for verify and stop gates,
+    #683 for the wider file list);
+  - plugin lock and rug-pull guard (#599; done, with `tole plugin
+    list|diff|approve|revoke`, the source and binary binding of #679 and the
+    unstarted refused servers of #680);
+  - owner-only records and the tole binary refused under a session (#684;
+    done) and the non-dumpable process guard (#675; done);
+  - `tole plugin add`, the description scanner, grants and trust tiers (#600; open: only `list|diff|approve|revoke` shipped, under #599);
+  - external sandbox wrapper and lazy start (#601; open).
 
 Suggested order: E4 #595 first (other epics reuse it), then E1 #578 → #579,
 E2 #584 → #585, E3 #590 → #591; the rest per each epic's order.
