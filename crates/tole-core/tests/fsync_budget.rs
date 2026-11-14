@@ -3,7 +3,10 @@
 //! asserts the budget. Durability is the invariant: the file on disk must
 //! hold the full step whenever a step completes (checked by re-opening it).
 
+#[path = "support/test_dir.rs"]
+mod test_dir;
 use serde_json::{json, Value};
+use test_dir::TestDir;
 use tole_core::approval::AllowlistApprover;
 use tole_core::entry::Entry;
 use tole_core::mock::MockProvider;
@@ -42,10 +45,8 @@ impl Tool for Echo {
 
 const TOOL_STEPS: usize = 10;
 
-fn run(tag: &str, risk: Risk) -> (f64, std::path::PathBuf, String) {
-    let dir = std::env::temp_dir().join(format!("tole-fsync-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+fn run(tag: &str, risk: Risk) -> (f64, TestDir, String) {
+    let dir = TestDir::new(&format!("tole-fsync-{tag}"));
     let mut s = JsonlStorage::create(&dir, tag, None).unwrap();
     let mut reg = ToolRegistry::with_approver(AllowlistApprover::allow_only(vec!["echo".into()]));
     reg.register(Box::new(Echo(risk))).unwrap();

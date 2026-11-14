@@ -10,8 +10,11 @@
 
 #![cfg(unix)]
 
+#[path = "support/test_dir.rs"]
+mod test_dir;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use test_dir::TestDir;
 use tole_core::mcp::{
     conn_key_for, get_server_prompt_in, register_server_tools, McpReadTool, McpServerConfig,
 };
@@ -26,8 +29,11 @@ const CANARY: &str = "sandbox-canary-not-a-credential-0123456789";
 fn out_root() -> &'static Path {
     static ROOT: OnceLock<PathBuf> = OnceLock::new();
     ROOT.get_or_init(|| {
-        let d = std::env::temp_dir().join(format!("tole-sbx-root-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
+        // One fixed directory per target dir: it is the policy's writable
+        // grant for every test of this process, so no per-test guard can own
+        // it. Its per-test subdirectories are recreated by name, so it never
+        // grows from one run to the next.
+        let d = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("shared-sbx-root");
         std::fs::create_dir_all(&d).unwrap();
         let d = std::fs::canonicalize(&d).unwrap();
         let mut profile = sandbox::builtin_profile("server").unwrap();
@@ -137,10 +143,11 @@ fn a_sandboxed_server_sees_a_private_view() {
         return;
     }
     let base = dir("view");
+    let scratch = TestDir::new("tole-sbx-view");
     let (ws, out, data) = (
-        std::env::temp_dir().join(format!("tole-sbx-ws-{}", std::process::id())),
+        scratch.join("ws"),
         base.join("out"),
-        std::env::temp_dir().join(format!("tole-sbx-data-{}/.codecora", std::process::id())),
+        scratch.join("data/.codecora"),
     );
     for d in [&ws, &out, &data] {
         std::fs::create_dir_all(d).unwrap();

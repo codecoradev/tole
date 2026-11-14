@@ -1,8 +1,10 @@
 //! #381: importing a Claude Code session transcript (JSONL) into a tole
 //! session that `resume` can continue.
 
+#[path = "support/test_dir.rs"]
+mod test_dir;
 use serde_json::json;
-use std::path::PathBuf;
+use test_dir::TestDir;
 
 use tole_core::ccimport::{import_file, import_str};
 use tole_core::state::Pc;
@@ -10,19 +12,8 @@ use tole_core::storage::{JsonlStorage, Storage};
 
 const FIXTURE: &str = include_str!("fixtures/cc_session.jsonl");
 
-fn tmpdir(tag: &str) -> PathBuf {
-    // pid + nanos: a recycled pid must not collide with a live dir (#493).
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .subsec_nanos();
-    let d = std::env::temp_dir().join(format!(
-        "tole-ccimport-{tag}-{}-{nanos}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+fn tmpdir(tag: &str) -> TestDir {
+    TestDir::new(&format!("tole-ccimport-{tag}"))
 }
 
 /// A transcript where a tool call was interrupted (tool_use with no

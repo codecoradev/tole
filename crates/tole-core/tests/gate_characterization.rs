@@ -15,9 +15,12 @@
 //! update the matching test in the same change. Everything here is
 //! greppable via the `gate_char_` prefix.
 
+#[path = "support/test_dir.rs"]
+mod test_dir;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use test_dir::TestDir;
 use tole_core::approval::{Approver, ToolRequest, Verdict};
 use tole_core::cancel::CancelToken;
 use tole_core::entry::{EntryType, NewEntry};
@@ -40,13 +43,8 @@ const REPLAY_HOOK_DENIED: &str = "replay denied by pre-hook: denied by pretool h
 // Fixtures
 // ---------------------------------------------------------------------------
 
-fn tmpdir(name: &str) -> std::path::PathBuf {
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let d = std::env::temp_dir().join(format!("tole-gatechar-{name}-{}-{n:x}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+fn tmpdir(name: &str) -> TestDir {
+    TestDir::new(&format!("tole-gatechar-{name}"))
 }
 
 /// Tool with a fixed risk that counts executions.
@@ -228,7 +226,7 @@ mod hooks {
 
     /// A hook command that touches `marker` then exits `code` printing
     /// `reason`. Returns (command line, marker path).
-    pub fn hook(tag: &str, code: i32, reason: &str) -> (String, std::path::PathBuf) {
+    pub fn hook(tag: &str, code: i32, reason: &str) -> (String, std::path::PathBuf, TestDir) {
         let dir = tmpdir(tag);
         let marker = dir.join("ran");
         let script = dir.join("hook.sh");
@@ -241,7 +239,7 @@ mod hooks {
             ),
         )
         .unwrap();
-        (format!("/bin/sh {}", script.display()), marker)
+        (format!("/bin/sh {}", script.display()), marker, dir)
     }
 
     pub fn set_pre(r: &mut Rig, cmd: &str) {
@@ -284,7 +282,7 @@ fn gate_char_fresh_readonly_runs_without_approver_consultation() {
 #[test]
 fn gate_char_fresh_readonly_skips_pre_and_post_hooks() {
     let mut r = rig(Verdict::Deny, &[("r", Risk::ReadOnly)]);
-    let (pre, pre_marker) = hooks::hook("fresh-ro-pre", 2, "nope");
+    let (pre, pre_marker, _guard_pre_marker) = hooks::hook("fresh-ro-pre", 2, "nope");
     hooks::set_pre(&mut r, &pre);
     let (out, _s) = fresh(&r, "r", "fresh-ro-hook");
     assert!(matches!(out, TurnOutcome::Final { .. }), "{out:?}");
@@ -292,7 +290,7 @@ fn gate_char_fresh_readonly_skips_pre_and_post_hooks() {
     assert!(!pre_marker.exists(), "pre-hook must not run for ReadOnly");
 
     let mut r2 = rig(Verdict::Deny, &[("r", Risk::ReadOnly)]);
-    let (post, post_marker) = hooks::hook("fresh-ro-post", 0, "");
+    let (post, post_marker, _guard_post_marker) = hooks::hook("fresh-ro-post", 0, "");
     hooks::set_post(&mut r2, &post);
     let (out, _s) = fresh(&r2, "r", "fresh-ro-post2");
     assert!(matches!(out, TurnOutcome::Final { .. }), "{out:?}");
@@ -449,7 +447,7 @@ fn gate_char_fresh_cancel_after_allow_stops_before_execution() {
 #[test]
 fn gate_char_fresh_pre_hook_deny_records_pre_hook_denial() {
     let mut r = rig(Verdict::Allow, &[("w", Risk::Write)]);
-    let (cmd, marker) = hooks::hook("fresh-hook-deny", 2, "nope");
+    let (cmd, marker, _guard_marker) = hooks::hook("fresh-hook-deny", 2, "nope");
     hooks::set_pre(&mut r, &cmd);
     let (out, s) = fresh(&r, "w", "fresh-hook-deny-run");
     assert!(
@@ -476,7 +474,7 @@ fn gate_char_fresh_pre_hook_pass_and_non_deny_failure_do_not_block() {
     // exit 0 = pass; any non-2 exit is a non-blocking hook failure.
     for (code, tag) in [(0, "fresh-hook-pass"), (1, "fresh-hook-fail")] {
         let mut r = rig(Verdict::Allow, &[("w", Risk::Write)]);
-        let (cmd, marker) = hooks::hook(tag, code, "");
+        let (cmd, marker, _guard_marker) = hooks::hook(tag, code, "");
         hooks::set_pre(&mut r, &cmd);
         let (out, s) = fresh(&r, "w", tag);
         assert!(
@@ -494,7 +492,7 @@ fn gate_char_fresh_pre_hook_pass_and_non_deny_failure_do_not_block() {
 fn gate_char_fresh_order_approver_before_pre_hook() {
     // A denied approval must never run the hook.
     let mut r = rig(Verdict::Deny, &[("w", Risk::Write)]);
-    let (cmd, marker) = hooks::hook("fresh-order", 2, "nope");
+    let (cmd, marker, _guard_marker) = hooks::hook("fresh-order", 2, "nope");
     hooks::set_pre(&mut r, &cmd);
     let (out, s) = fresh(&r, "w", "fresh-order-run");
     assert!(
@@ -513,7 +511,7 @@ fn gate_char_fresh_order_approver_before_pre_hook() {
 #[test]
 fn gate_char_fresh_post_hook_runs_only_for_non_readonly() {
     let mut r = rig(Verdict::Allow, &[("w", Risk::Write)]);
-    let (cmd, marker) = hooks::hook("fresh-post-w", 0, "");
+    let (cmd, marker, _guard_marker) = hooks::hook("fresh-post-w", 0, "");
     hooks::set_post(&mut r, &cmd);
     let (out, _s) = fresh(&r, "w", "fresh-post-w-run");
     assert!(matches!(out, TurnOutcome::Final { .. }), "{out:?}");
@@ -729,7 +727,7 @@ fn gate_char_replay_malformed_args_settle_without_executing_or_consulting() {
 #[test]
 fn gate_char_replay_pre_hook_deny_after_approval() {
     let mut r = rig(Verdict::Allow, &[("w", Risk::Write)]);
-    let (cmd, marker) = hooks::hook("rp-hook-deny", 2, "nope");
+    let (cmd, marker, _guard_marker) = hooks::hook("rp-hook-deny", 2, "nope");
     hooks::set_pre(&mut r, &cmd);
     let (mut s, _) = seed_pending(
         "rp-hook-deny-s",
@@ -761,7 +759,7 @@ fn gate_char_replay_pre_hook_deny_after_approval() {
 #[test]
 fn gate_char_replay_order_approver_before_pre_hook() {
     let mut r = rig(Verdict::Deny, &[("w", Risk::Write)]);
-    let (cmd, marker) = hooks::hook("rp-order", 2, "nope");
+    let (cmd, marker, _guard_marker) = hooks::hook("rp-order", 2, "nope");
     hooks::set_pre(&mut r, &cmd);
     let (mut s, id) = seed_pending("rp-order-s", "w", json!({"n": 1}), ReplaySafety::Guarded);
     let out = replay(&r, &mut s, vec![final_out("x")]);
@@ -784,7 +782,7 @@ fn gate_char_replay_order_approver_before_pre_hook() {
 #[test]
 fn gate_char_replay_readonly_never_runs_pre_hook() {
     let mut r = rig(Verdict::Deny, &[("r", Risk::ReadOnly)]);
-    let (cmd, marker) = hooks::hook("rp-ro-hook", 2, "nope");
+    let (cmd, marker, _guard_marker) = hooks::hook("rp-ro-hook", 2, "nope");
     hooks::set_pre(&mut r, &cmd);
     let (mut s, _) = seed_pending(
         "rp-ro-hook-s",

@@ -42,8 +42,10 @@ fn setup() -> &'static Setup {
     S.get_or_init(|| {
         // Outside `/tmp` (a tmpfs inside the sandbox) and outside any
         // system dir, so "absent" means the sandbox hid it.
-        let base = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-            .join(format!("cmdsbx-{}", std::process::id()));
+        // A fixed directory per target dir (the Setup lives for the whole
+        // process, so no per-test guard can own it): it is emptied here, so
+        // it never grows from one run to the next.
+        let base = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("shared-cmdsbx");
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         let base = std::fs::canonicalize(&base).unwrap();

@@ -45,11 +45,8 @@ pub fn skipped() -> bool {
 }
 
 /// A fresh workspace directory holding the mock server.
-pub fn workspace(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("tole-sbx-life-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    let d = std::fs::canonicalize(&d).unwrap();
+pub fn workspace(tag: &str) -> TestDir {
+    let d = TestDir::new(&format!("tole-sbx-life-{tag}"));
     std::fs::copy(
         concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/mock_mcp.py"),
         d.join("mock_mcp.py"),
