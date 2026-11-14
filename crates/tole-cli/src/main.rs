@@ -13,8 +13,12 @@ use tole_cli::trust::expand_trust;
 #[cfg(all(feature = "mcp", feature = "shell-tools"))]
 use tole_core::approval::AllowlistApprover;
 
+// Test-only scratch directory shared with the integration tests (#781).
 #[cfg(feature = "shell-tools")]
 mod acp;
+#[cfg(test)]
+#[path = "../tests/common/test_dir.rs"]
+mod test_dir;
 use tole_cli::approvals;
 #[cfg(feature = "mcp-http")]
 mod mcp_http;
@@ -4013,12 +4017,10 @@ mod gh_repo_tests {
     fn gh_tool_not_registered_without_detected_repo() {
         // Issue #293: a non-GitHub cwd must yield NO gh tool (no
         // hardcoded fallback repo).
-        let dir = std::env::temp_dir().join(format!("tole-gh-none-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_dir::TestDir::new("tole-gh-none");
         let reg = tool_roster::build(
             tole_core::approval::AllowlistApprover::allow_only(vec![]),
-            Roster::new(dir.clone()),
+            Roster::new(dir.to_path_buf()),
         )
         .unwrap();
         assert!(reg.get("gh").is_none());
@@ -4028,9 +4030,7 @@ mod gh_repo_tests {
     #[test]
     fn detects_repo_from_checkout() {
         // A real checkout: init + remote origin, then detect.
-        let dir = std::env::temp_dir().join(format!("tole-gh-detect-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_dir::TestDir::new("tole-gh-detect");
         let run = |args: &[&str]| {
             std::process::Command::new("git")
                 .args(args)
@@ -4195,13 +4195,10 @@ mod workspace_tests {
     use super::resolve_workspace_root;
     #[test]
     fn workspace_valid_dir_canonicalized() {
-        let dir = std::env::temp_dir().join(format!("tole-ws-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let ws = dir.clone().into_os_string().into_string().unwrap();
+        let dir = crate::test_dir::TestDir::new("tole-ws");
+        let ws = dir.to_path_buf().into_os_string().into_string().unwrap();
         let resolved = resolve_workspace_root(Some(&ws)).unwrap();
         assert_eq!(resolved, dir.canonicalize().unwrap());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -4212,13 +4209,12 @@ mod workspace_tests {
 
     #[test]
     fn workspace_file_rejected() {
-        let f = std::env::temp_dir().join(format!("tole-ws-file-{}", std::process::id()));
-        let _ = std::fs::remove_file(&f);
+        let d = crate::test_dir::TestDir::new("tole-ws-file");
+        let f = d.join("file");
         std::fs::write(&f, "x").unwrap();
-        let ws = f.clone().into_os_string().into_string().unwrap();
+        let ws = f.into_os_string().into_string().unwrap();
         let err = resolve_workspace_root(Some(&ws));
         assert!(err.is_err());
-        let _ = std::fs::remove_file(&f);
     }
 
     #[test]
@@ -4338,7 +4334,7 @@ mod trust_preset_tests {
     fn workspace_preset_refuses_home_and_filesystem_root() {
         use tole_cli::trust::check_workspace_root;
         let ws = vec!["workspace".to_string()];
-        let home = std::env::temp_dir().join(format!("tole-ws-home-{}", std::process::id()));
+        let home = crate::test_dir::TestDir::new("tole-ws-home");
         let project = home.join("project");
         std::fs::create_dir_all(&project).unwrap();
         assert!(check_workspace_root(&ws, Some(&project), Some(&home)).is_ok());
@@ -4465,8 +4461,7 @@ mod skills_wiring_tests {
 
     #[test]
     fn apply_skills_loads_explicit_skill_files_and_registers_tool() {
-        let dir = std::env::temp_dir().join(format!("tole-skills-wire-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = crate::test_dir::TestDir::new("tole-skills-wire");
         std::fs::create_dir_all(dir.join("skills").join("demo")).unwrap();
         std::fs::write(
             dir.join("skills").join("demo").join("SKILL.md"),
@@ -4491,7 +4486,7 @@ mod skills_wiring_tests {
 
     #[test]
     fn apply_skills_no_skills_short_circuits() {
-        let dir = std::env::temp_dir().join(format!("tole-skills-off-{}", std::process::id()));
+        let dir = crate::test_dir::TestDir::new("tole-skills-off");
         std::fs::create_dir_all(dir.join("skills").join("demo")).unwrap();
         std::fs::write(
             dir.join("skills").join("demo").join("SKILL.md"),
@@ -4521,8 +4516,7 @@ mod skills_wiring_tests {
     /// path (no explicit --skill files, discovery only).
     #[test]
     fn apply_skills_in_discovers_from_resolved_root() {
-        let dir = std::env::temp_dir().join(format!("tole-skills-cwd-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = crate::test_dir::TestDir::new("tole-skills-cwd");
         std::fs::create_dir_all(dir.join("skills").join("demo")).unwrap();
         std::fs::write(
             dir.join("skills").join("demo").join("SKILL.md"),
@@ -4530,8 +4524,14 @@ mod skills_wiring_tests {
         )
         .unwrap();
         let mut reg = ToolRegistry::new();
-        let sections =
-            apply_skills_in(&[], Some(dir.clone()), false, &mut reg, &Default::default()).unwrap();
+        let sections = apply_skills_in(
+            &[],
+            Some(dir.to_path_buf()),
+            false,
+            &mut reg,
+            &Default::default(),
+        )
+        .unwrap();
         assert!(
             sections.contains("demo"),
             "discovery index must list the skill: {sections}"
@@ -4633,8 +4633,7 @@ mod chat_todo_tests {
     #[cfg(all(feature = "mcp-http", feature = "shell-tools"))]
     #[test]
     fn mcp_server_registry_file_tools_are_rooted_at_workspace() {
-        let ws = std::env::temp_dir().join(format!("tole-mcp-ws-{}", std::process::id()));
-        std::fs::create_dir_all(&ws).unwrap();
+        let ws = crate::test_dir::TestDir::new("tole-mcp-ws");
         std::fs::write(ws.join("only-in-ws.txt"), "rooted").unwrap();
         let ws_arg = ws.to_str().unwrap().to_string();
         let reg = build_server_registry_for_mcp(Some(&ws_arg), false).unwrap();

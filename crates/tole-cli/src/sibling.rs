@@ -135,8 +135,7 @@ mod tests {
 
     #[test]
     fn the_watcher_turns_a_sibling_write_into_a_queued_notice() {
-        let dir = std::env::temp_dir().join(format!("tole-sibwire-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = crate::test_dir::TestDir::new("tole-sibwire");
         let log = dir.join("tole-agents").join("touch.log");
         let mine = Tracking {
             agent: "a-1".into(),

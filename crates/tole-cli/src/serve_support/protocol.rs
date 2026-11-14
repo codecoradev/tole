@@ -235,15 +235,7 @@ mod tests {
     fn a_file_read_matches_replay_and_skips_a_torn_tail() {
         use tole_core::entry::NewEntry;
         use tole_core::storage::{Commit, JsonlStorage};
-        let dir = std::env::temp_dir().join(format!(
-            "tole-protocol-{}-{:x}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_dir::TestDir::new("tole-protocol");
         let mut s = JsonlStorage::create(&dir, "p1", None).unwrap();
         for t in ["one", "two", "three"] {
             let payload = json!({"role": "user", "text": t});
