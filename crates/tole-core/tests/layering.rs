@@ -28,8 +28,8 @@ use std::path::Path;
 /// Faces: serve-side modules (only a host's serve surface uses them).
 #[rustfmt::skip]
 const KERNEL_MODULES: &[&str] = &[
-    "entry", "register", "state", "storage", "machine", "paths", "secrets", "secret_release",
-    "sensitive", "sanitize", "safe_dir", "tool", "approval", "provider", "openai", "mock",
+    "entry", "register", "state", "storage", "machine", "paths", "secrets",
+    "sanitize", "safe_dir", "tool", "approval", "provider", "openai", "mock",
     "failover", "cancel", "interrupt", "image", "ledger", "cron", "tz", "webhook", "transcript",
     "turn", "compaction", "gate", "replay", "hooks", "subprocess", "process_guard",
     "resource_guard", "sandbox", "file_tools", "read_file", "todo", "systemone",
@@ -55,7 +55,11 @@ const BASELINE: &[(&str, &str, &str)] = &[
 ];
 
 /// Old top-level paths that are now re-exports of a module inside another one.
-const ALIASES: &[(&str, &str)] = &[("discussion_log", "discussion")];
+const ALIASES: &[(&str, &str)] = &[
+    ("discussion_log", "discussion"),
+    ("secret_release", "secrets"),
+    ("sensitive", "secrets"),
+];
 
 fn level_of(module: &str) -> Option<u8> {
     [KERNEL_MODULES, ENGINE_MODULES, FACE_MODULES]

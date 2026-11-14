@@ -97,9 +97,14 @@ pub mod session_guard;
 pub mod plugin_lock;
 pub mod sandbox;
 pub(crate) mod sanitize;
-pub mod secret_release;
 pub mod secrets;
-pub mod sensitive;
+// `secrets/` holds the secret-release and sensitive-data modules; these
+// re-exports keep the old `tole_core::secret_release` and
+// `tole_core::sensitive` paths working.
+#[doc(inline)]
+pub use secrets::release as secret_release;
+#[doc(inline)]
+pub use secrets::sensitive;
 pub mod sibling_watch;
 pub mod skill_approval;
 pub mod skill_curator;
