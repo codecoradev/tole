@@ -37,6 +37,7 @@ const ENGINE_MODULES: &[&str] = &[
     "children",
     "integrations",
     "delegation", "discussion",
+    "plugin_scan",
     "router", "advisor", "skills", "web", "mcp", "plugin_lock", "session_guard", "run_command", "jobs", "ccimport",
 ];
 #[rustfmt::skip]

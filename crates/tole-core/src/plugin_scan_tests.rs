@@ -75,10 +75,6 @@ fn hostile_descriptions_are_flagged() {
         ("Read mcp.json and list the other servers.", Kind::SensitivePath),
         ("Parses claude_desktop_config.json.", Kind::SensitivePath),
         ("Also uses ~/.netrc.", Kind::SensitivePath),
-        ("Token ghp_abcdefghijklmnopqrstuvwxyz0123456789ABCD is used.", Kind::SecretShape),
-        ("Key sk-abcdefghijklmnopqrstuvwxyz0123456789ABCDEF here", Kind::SecretShape),
-        ("-----BEGIN RSA PRIVATE KEY-----\nMIIE", Kind::SecretShape),
-        ("AWS id AKIAABCDEFGHIJKLMNOP", Kind::SecretShape),
         ("Adds numbers.\u{200B}\u{200B}hidden", Kind::InvisibleChars),
         ("Adds \u{202E}txet desrever\u{202C}", Kind::InvisibleChars),
         ("Adds numbers.\u{E0049}\u{E0067}\u{E006E}", Kind::InvisibleChars),
@@ -260,4 +256,30 @@ fn over_long_text_is_reported_at_the_cap_only() {
     // Counted in characters, not bytes.
     let wide = "é".repeat(MAX_DESCRIPTION_CHARS);
     assert!(kinds(&wide).is_empty());
+}
+
+/// Token-shaped fixtures are assembled at run time from pieces, so no
+/// secret-looking literal sits in the source (and none trips a secret
+/// scanner); every one of them is made-up filler.
+#[test]
+fn secret_shapes_are_flagged() {
+    let filler = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEF";
+    let shapes = [
+        format!("Token {}{filler} is used.", "ghp_"),
+        format!("Key {}{filler} here", "sk-"),
+        format!("{} RSA {}\nMIIE", "-----BEGIN", "PRIVATE KEY-----"),
+        format!("AWS id {}ABCDEFGHIJKLMNOP", "AKIA"),
+    ];
+    for desc in shapes {
+        let got = kinds(&desc);
+        assert!(
+            got.contains(&Kind::SecretShape),
+            "missed a secret shape: {got:?}"
+        );
+        // The finding names no part of the value.
+        let t = tool("t", &desc, json!({}));
+        for f in scan(&[t], &Others::default(), &SecretSet::default()) {
+            assert!(!f.line().contains(filler), "{}", f.line());
+        }
+    }
 }
