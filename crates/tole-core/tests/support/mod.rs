@@ -4,6 +4,10 @@
 
 #![allow(dead_code)]
 
+mod test_dir;
+#[allow(unused_imports)]
+pub use test_dir::{ChildGuard, TestDir};
+
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tole_core::mcp::{register_server_tools, McpServerConfig};
