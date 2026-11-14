@@ -356,7 +356,11 @@ fn diff(ctx: &Ctx<'_>, name: &str) -> Result<String, String> {
         Some(p) => Lockfile::load(p)?,
         None => Lockfile::default(),
     };
-    let Some(e) = user.servers.get(name) else {
+    // The merged lock, as `list` and a session see it: a project entry can
+    // revoke or re-pin, and then the server must not be started here either.
+    let project = Lockfile::load(&ctx.project_path())?;
+    let (eff, _) = plugin_lock::effective(&user, &project);
+    let Some(e) = eff.get(name) else {
         return Ok(format!(
             "`{}` is not in your plugin lock; `tole plugin approve {}` shows its tools\n",
             ctx.clean(name),
@@ -394,7 +398,6 @@ fn diff(ctx: &Ctx<'_>, name: &str) -> Result<String, String> {
         out.push_str("binary: unchanged\n");
     }
     out.push_str(&secrets_note(ctx, e));
-    let eff: std::collections::BTreeMap<_, _> = user.servers.clone();
     let blocked = admit_unseen(&eff, name, &source, &live_integrity);
     let why = match (&blocked, ctx.probe) {
         (Some(a), _) => Some(format!("the lock refuses it: {}", state_of(a))),
