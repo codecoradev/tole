@@ -22,6 +22,8 @@
 //! verdict with evidence for every criterion; the orchestrator's own opinion
 //! never reaches it.
 
+pub mod log;
+
 use crate::secrets::SecretSet;
 use crate::skill_draft::is_hidden;
 use serde::{Deserialize, Serialize};
@@ -680,5 +682,4 @@ pub fn checker_request(
 }
 
 #[cfg(test)]
-#[path = "discussion_tests.rs"]
 mod tests;

@@ -46,7 +46,10 @@ pub mod delegation;
 pub mod delegation_approvals;
 pub mod delegation_report;
 pub mod discussion;
-pub mod discussion_log;
+// The discussion log lives in `discussion/log.rs`; this keeps the old
+// `tole_core::discussion_log` path working.
+#[doc(inline)]
+pub use discussion::log as discussion_log;
 pub(crate) mod gate;
 #[cfg(feature = "shell-tools")]
 pub mod gh;
