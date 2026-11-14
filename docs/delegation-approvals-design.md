@@ -3,7 +3,8 @@
 Status: design for #714 (parent #583); the owner's answers to the open
 questions are in section 12. PR 1 (records and fold) implements section 3,
 PR 2 (request builder, caps, the parked approver) section 4.1, PR 3 (the
-owner's command and the audit section) section 5.2 and 6.
+owner's command and the audit section) section 5.2 and 6, PR 4 (serve) the
+second bullet of 5.2.
 Owner decision of 2026-11-14 (in the body of #714): a delegated child that cannot
 decide an approval escalates it up the delegation chain, level by level
 (child, parent, grandparent, ..., the owner), until a level can decide it.
@@ -278,13 +279,22 @@ Two hosts, both owner-only:
   "yes" after `show`, or `--fingerprint <12+ hex chars>` for scripts (the
   content-bound pattern of `plugin approve --hash`); a prefix that is
   ambiguous is refused.
-- `/approvals` in `tole serve` lists delegation requests next to its own
-  (`source: "delegation"`, scanning `<data dir>/delegation/*/approvals.jsonl`,
-  bounded), and `POST /approvals/{id}/decision` routes `dap-*` ids to the
-  delegation queue. No resume thread: the child is already waiting. The
-  route refuses when the serve process itself runs under a session (the same
-  marker check), writes the `Decide` record with `via: serve`, and keeps the
-  #200 trust statement: the bearer token is approval authority.
+- `/approvals` in `tole serve` lists the pending delegation requests next to
+  its own (`source: "delegation"`; scanning `<data dir>/delegation/*/approvals.jsonl`,
+  at most 64 logs, none when the data dir is unresolved or `approvals` is off),
+  and `POST /approvals/{id}/decision` routes `dap-*` ids to the delegation
+  queue, with the CLI's rules because it is the same code (`approvals_owner`):
+  the route refuses (403) when the serve process itself runs under a session
+  (the same marker check), before it looks at the id or the body; the id must
+  be a full request id; the body is `{decision, confirm?, fingerprint?}` and
+  nothing else; `allow` needs `confirm` equal to the id (no "allow all"), `deny`
+  does not; only a pending request is decided (409 with the reason otherwise,
+  404 unknown). It writes the `Decide` record with `via: serve`, bound to the
+  fingerprint, and keeps the #200 trust statement: the bearer token is approval
+  authority. The listing carries the redacted, capped display and the CLI's
+  fenced `text`. No resume thread: the child is already waiting, and serve's
+  in-memory queue, its ids (`apr-*`) and its deny-then-resume are untouched.
+  The SSE event frame of the first draft is not built: a client polls.
 
 A session never reaches either: `run_command` and `job_start` refuse the
 tole binary and mark every process they start (#700). The residual of #684

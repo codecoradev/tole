@@ -113,6 +113,7 @@ impl Fx {
             store: &self.store,
             secrets,
             now,
+            via: Via::Cli,
         }
     }
 }
@@ -266,6 +267,7 @@ fn it_refuses_under_an_agent_session_before_reading_anything() {
         store: &store,
         secrets: &sx,
         now: T,
+        via: Via::Cli,
     };
     for (k, v) in [("TOLE_UNDER_SESSION", "1"), ("TOLE_AGENT_DEPTH", "2")] {
         let env = move |n: &str| (n == k).then(|| v.to_string());

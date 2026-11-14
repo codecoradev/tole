@@ -1994,6 +1994,7 @@ fn delegation_command(action: DelegationAction, root: &Path) -> Result<()> {
         store: &store,
         secrets: &secrets,
         now: tole_cli::delegated_approver::real_now(),
+        via: tole_core::delegation_approvals::Via::Cli,
     };
     let env = &tole_cli::config_apply::real_env;
     let allow = tole_core::delegation_approvals::Choice::Allow;

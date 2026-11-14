@@ -43,6 +43,7 @@ pub mod provider_chain;
 #[cfg(feature = "shell-tools")]
 pub mod review_gate;
 pub mod routing;
+pub mod serve_delegation;
 pub mod serve_images;
 pub mod session_host;
 pub mod session_index;

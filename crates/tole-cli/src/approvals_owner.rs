@@ -37,6 +37,8 @@ pub struct Ctx<'a> {
     pub store: &'a Store,
     pub secrets: &'a SecretSet,
     pub now: i64,
+    /// Which owner surface answers: the command or `tole serve`.
+    pub via: Via,
 }
 
 /// A request id as `tole` writes them: `dap-` and lowercase alphanumerics
@@ -104,7 +106,7 @@ fn target(secrets: &SecretSet, e: &Entry) -> String {
         .map_or("-".into(), |t| line(secrets, t, LINE_CHARS))
 }
 
-fn requests(ctx: &Ctx<'_>) -> Result<Vec<(Entry, Status)>, String> {
+pub(crate) fn requests(ctx: &Ctx<'_>) -> Result<Vec<(Entry, Status)>, String> {
     ctx.store.read(|d, a| {
         let s = a.state();
         s.entries()
@@ -300,7 +302,7 @@ pub fn decide(
         req: id.to_string(),
         by: By::Owner,
         verdict,
-        via: Via::Cli,
+        via: ctx.via,
         fingerprint: e.req.fingerprint.clone(),
         at: ctx.now,
     };
