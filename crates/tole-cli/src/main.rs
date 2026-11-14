@@ -480,6 +480,16 @@ enum Command {
         #[arg(long, value_name = "ID", conflicts_with = "goal")]
         discussion: Option<String>,
     },
+    /// Multi-round discussion (#588), owner-only entry point: start one
+    /// from a shell with an explicit question, acceptance criteria,
+    /// participants, token budget and max rounds, resume it after a crash,
+    /// list or show them. The contract is what you type; participants are
+    /// read-only inline voices (profiles from your user config) and the
+    /// budget is a hard cap.
+    Discuss {
+        #[command(subcommand)]
+        action: DiscussAction,
+    },
     /// Show which model tier `[router]` would pick for a task (#586): a dry
     /// run, no provider is called. `--profile` selects the profile's tiers.
     Route {
@@ -659,6 +669,59 @@ enum Command {
 
 /// `tole config <action>` — an enum so later parts can add variants.
 #[derive(Subcommand)]
+enum DiscussAction {
+    /// Start a discussion and run it to its end (the gate reports or
+    /// escalates; the budget and `--max-rounds` always stop it).
+    Start {
+        /// The question to settle.
+        #[arg(long)]
+        question: String,
+        /// An acceptance criterion the claim-checker verifies. Repeat for
+        /// more (1 to 12).
+        #[arg(long = "criterion", required = true)]
+        criteria: Vec<String>,
+        /// A participant: a profile name from your user config. Repeat for
+        /// more (1 to 8).
+        #[arg(long = "participant", required = true)]
+        participants: Vec<String>,
+        /// Tokens the whole discussion may spend (a hard cap).
+        #[arg(long)]
+        budget: u64,
+        /// Most rounds before an escalation (default 4, at most 10).
+        #[arg(long)]
+        max_rounds: Option<u32>,
+        /// Discussion id (default: d-<unix seconds>).
+        #[arg(long)]
+        id: Option<String>,
+        /// Validate the contract and show what it may cost; call no model
+        /// and write nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Continue a discussion where its ledger stands (after a crash or a
+    /// failed call). A finished one prints its outcome again.
+    Resume {
+        /// The discussion id.
+        id: String,
+    },
+    /// List the discussions.
+    List {
+        /// Print JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one discussion: rounds, gate decisions, cost; never a raw
+    /// contribution.
+    Show {
+        /// The discussion id.
+        id: String,
+        /// Print JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum ConfigAction {
     /// Validate `<cwd>/.tole/config.toml` (or --config) and print what was
     /// parsed plus the effective value and source of each applied key.
@@ -739,7 +802,10 @@ fn gate_policy(cmd: &Command) -> GatePolicy {
         | Command::Approvals { .. }
         | Command::Skills { .. }
         | Command::Curator { .. }
-        | Command::Audit { .. } => GatePolicy::Skip,
+        | Command::Audit { .. }
+        | Command::Discuss {
+            action: DiscussAction::List { .. } | DiscussAction::Show { .. },
+        } => GatePolicy::Skip,
         #[cfg(feature = "shell-tools")]
         Command::Cron { .. } | Command::Hook { .. } => GatePolicy::Skip,
         // `--prompt-file -` consumes stdin as the prompt: a question on
@@ -750,7 +816,8 @@ fn gate_policy(cmd: &Command) -> GatePolicy {
         Command::Run { .. }
         | Command::Chat { .. }
         | Command::Resume { .. }
-        | Command::Mission { .. } => GatePolicy::MayPrompt,
+        | Command::Mission { .. }
+        | Command::Discuss { .. } => GatePolicy::MayPrompt,
         #[cfg(feature = "tui")]
         Command::Tui { .. } => GatePolicy::MayPrompt,
         _ => GatePolicy::NoPrompt,
@@ -1662,6 +1729,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             print!("{out}");
             Ok(())
         }
+        Command::Discuss { action } => discuss_command(action, cfg.as_ref()),
         Command::Audit { goal, json, .. } => {
             let root = resolve_workspace_root(host.workspace.as_ref())?;
             let data = tole_core::paths::tole_data_dir().ok_or_else(|| {
@@ -1843,6 +1911,76 @@ impl HostConfig {
 /// (kept under its old name) overrides it. A missing uteke binary degrades to a warning + no-op
 /// (the same probe contract as the uteke tools).
 #[cfg(feature = "shell-tools")]
+/// `tole discuss` (#588): the owner-only entry point.
+fn discuss_command(action: DiscussAction, cfg: Option<&tole_cli::config::Config>) -> Result<()> {
+    use tole_cli::discuss;
+    let dir = discuss::dir().map_err(anyhow::Error::msg)?;
+    let secrets = tole_cli::provider_chain::process_secrets(&tole_cli::config_apply::real_env);
+    let out = match action {
+        DiscussAction::List { json } => {
+            discuss::show(&dir, None, json, &secrets).map_err(anyhow::Error::msg)?
+        }
+        DiscussAction::Show { id, json } => {
+            discuss::show(&dir, Some(&id), json, &secrets).map_err(anyhow::Error::msg)?
+        }
+        action => {
+            let default = tole_cli::config::Config::default();
+            let cfg = cfg.unwrap_or(&default);
+            let base = tole_cli::config::user_config_path()
+                .and_then(|p| p.parent().map(Path::to_path_buf));
+            let home = std::env::var_os("HOME").map(PathBuf::from);
+            let dry = matches!(action, DiscussAction::Start { dry_run: true, .. });
+            // A dry run calls no model, so it needs no provider config.
+            let make = if dry {
+                tole_cli::discussion_host::factory(
+                    tole_core::openai::OpenAiConfig::new("http://127.0.0.1:1/v1", "dry", "dry"),
+                    secrets.clone(),
+                )
+            } else {
+                let pc = tole_cli::turn_runner::provider_config().map_err(anyhow::Error::msg)?;
+                tole_cli::discussion_host::factory(pc, secrets.clone())
+            };
+            let env = discuss::Env {
+                dir: &dir,
+                cfg,
+                paths: (base.as_deref(), home.as_deref()),
+                secrets,
+                make,
+            };
+            match action {
+                DiscussAction::Start {
+                    question,
+                    criteria,
+                    participants,
+                    budget,
+                    max_rounds,
+                    id,
+                    dry_run,
+                } => {
+                    let args = discuss::StartArgs {
+                        id,
+                        question,
+                        criteria,
+                        participants,
+                        budget_tokens: budget,
+                        max_rounds,
+                    };
+                    if dry_run {
+                        discuss::plan(&args, &env)
+                    } else {
+                        discuss::start(&args, &env)
+                    }
+                }
+                DiscussAction::Resume { id } => discuss::resume(&id, &env),
+                _ => unreachable!("list and show are handled above"),
+            }
+            .map_err(anyhow::Error::msg)?
+        }
+    };
+    print!("{out}");
+    Ok(())
+}
+
 fn resolve_memory(
     chosen: Option<&str>,
     profile_room: Option<&str>,

@@ -16,6 +16,7 @@ pub mod config_trust;
 pub mod cron;
 pub mod curator_cmd;
 pub mod delegate;
+pub mod discuss;
 pub mod discussion_host;
 pub mod discussion_roles;
 pub mod doctor;
