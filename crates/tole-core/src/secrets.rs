@@ -291,15 +291,49 @@ impl SecretSet {
     /// Overlapping matches merge into one span carrying each name once.
     /// Idempotent; never splits a UTF-8 character (every needle is valid
     /// UTF-8, so a match starts and ends on character boundaries).
+    ///
+    /// Text that holds invisible format characters (zero-width space,
+    /// joiners, bidi controls, soft hyphen: [`is_invisible`]) is scanned a
+    /// second time with those characters removed, and the matches are
+    /// mapped back onto the original, so a value split by one is still
+    /// found (#681). Text without any is scanned once.
     pub fn redact<'a>(&self, text: &'a str) -> Cow<'a, str> {
         let inner = &*self.inner;
         if inner.needles.is_empty() {
             return Cow::Borrowed(text);
         }
-        let hay = text.as_bytes();
+        let mut spans = self.scan(text.as_bytes());
+        if has_invisible(text) {
+            // `map[i]` is the byte index in `text` of byte `i` of `plain`.
+            let mut plain = String::with_capacity(text.len());
+            let mut map = Vec::with_capacity(text.len());
+            for (at, c) in text.char_indices() {
+                if !is_invisible(c) {
+                    plain.push(c);
+                    map.extend(at..at + c.len_utf8());
+                }
+            }
+            for (s, e, names) in self.scan(plain.as_bytes()) {
+                spans.push((map[s], map[e - 1] + 1, names));
+            }
+            spans = merge_spans(spans);
+        }
+        if spans.is_empty() {
+            return Cow::Borrowed(text);
+        }
         let mut out = String::new();
         let mut copied = 0usize;
-        let mut span: Option<(usize, usize, Vec<usize>)> = None;
+        for span in spans {
+            copied = emit(&mut out, text, copied, span, &inner.markers);
+        }
+        out.push_str(&text[copied..]);
+        Cow::Owned(out)
+    }
+
+    /// Merged `(start, end, entries)` spans of every needle in `hay`.
+    fn scan(&self, hay: &[u8]) -> Vec<(usize, usize, Vec<usize>)> {
+        let inner = &*self.inner;
+        let mut spans: Vec<(usize, usize, Vec<usize>)> = Vec::new();
         for i in 0..hay.len() {
             let cands = &inner.by_first[hay[i] as usize];
             let Some(nd) = cands
@@ -310,27 +344,17 @@ impl SecretSet {
                 continue;
             };
             let end = i + nd.bytes.len();
-            match &mut span {
+            match spans.last_mut() {
                 Some((_, s_end, names)) if i < *s_end => {
                     *s_end = (*s_end).max(end);
                     if !names.contains(&nd.entry) {
                         names.push(nd.entry);
                     }
                 }
-                _ => {
-                    if let Some(done) = span.take() {
-                        copied = emit(&mut out, text, copied, done, &inner.markers);
-                    }
-                    span = Some((i, end, vec![nd.entry]));
-                }
+                _ => spans.push((i, end, vec![nd.entry])),
             }
         }
-        let Some(done) = span else {
-            return Cow::Borrowed(text);
-        };
-        copied = emit(&mut out, text, copied, done, &inner.markers);
-        out.push_str(&text[copied..]);
-        Cow::Owned(out)
+        spans
     }
 
     /// [`SecretSet::redact`] over every string (object keys included) of a
@@ -442,23 +466,184 @@ fn emit(
     end
 }
 
-/// The forms of a value that can reach a sink: as is, JSON-escaped (inside a
-/// serialized JSON string), base64 standard and URL-safe (no padding: the
-/// padded form contains it), and percent-encoded (upper- and lowercase hex).
+/// Characters that render as nothing (or only reorder text) and that a
+/// command or an encoder can insert inside a value without changing what a
+/// reader sees: soft hyphen, Arabic letter mark, Mongolian vowel separator,
+/// zero-width space and joiners, the bidi marks, overrides and isolates, the
+/// word joiner and invisible operators, and the byte order mark.
+fn is_invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{061C}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}'
+    )
+}
+
+/// Whether `text` holds an invisible character, decided on the UTF-8 bytes
+/// of each one in [`is_invisible`] (no decoding: the common text has none).
+fn has_invisible(text: &str) -> bool {
+    let b = text.as_bytes();
+    b.iter().enumerate().any(|(i, &lead)| {
+        let at = |n: usize| b.get(i + n).copied().unwrap_or(0);
+        match lead {
+            0xC2 => at(1) == 0xAD,
+            0xD8 => at(1) == 0x9C,
+            0xE1 => at(1) == 0xA0 && at(2) == 0x8E,
+            0xE2 => match at(1) {
+                0x80 => matches!(at(2), 0x8B..=0x8F | 0xAA..=0xAE),
+                0x81 => matches!(at(2), 0xA0..=0xA4 | 0xA6..=0xAF),
+                _ => false,
+            },
+            0xEF => at(1) == 0xBB && at(2) == 0xBF,
+            _ => false,
+        }
+    })
+}
+
+type Span = (usize, usize, Vec<usize>);
+
+/// Sort and merge overlapping spans, each entry named once.
+fn merge_spans(mut spans: Vec<Span>) -> Vec<Span> {
+    spans.sort_by_key(|s| (s.0, std::cmp::Reverse(s.1)));
+    let mut out: Vec<Span> = Vec::with_capacity(spans.len());
+    for (s, e, names) in spans {
+        match out.last_mut() {
+            Some((_, o_end, o_names)) if s < *o_end => {
+                *o_end = (*o_end).max(e);
+                for n in names {
+                    if !o_names.contains(&n) {
+                        o_names.push(n);
+                    }
+                }
+            }
+            _ => out.push((s, e, names)),
+        }
+    }
+    out
+}
+
+/// The most needles one value contributes (a bound, so a value never costs
+/// more than a fixed number of probes per candidate first byte).
+const MAX_FORMS: usize = 24;
+
+/// The forms of a value that can reach a sink: as is; JSON-escaped (inside a
+/// serialized JSON string), also with `\/` and `\uXXXX` escapes as other
+/// encoders (Python `ensure_ascii`, PHP) write them; base64 standard and
+/// URL-safe (no padding: the padded form contains it) alone and embedded at
+/// every offset mod 3 of a larger payload (HTTP Basic `user:token`, a docker
+/// `auth`, a base64'd `.env`); hex in lower and upper case; and
+/// percent-encoded (upper- and lowercase hex). At most [`MAX_FORMS`].
 fn forms(value: &str) -> Vec<String> {
+    use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
     let mut v = vec![value.to_string()];
     if let Ok(json) = serde_json::to_string(value) {
         v.push(json[1..json.len() - 1].to_string());
     }
-    v.push(base64::engine::general_purpose::STANDARD_NO_PAD.encode(value));
-    v.push(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value));
+    for slash in [false, true] {
+        for unicode in [
+            None,
+            Some((false, false)),
+            Some((true, false)),
+            Some((false, true)),
+            Some((true, true)),
+        ] {
+            v.push(json_form(value, slash, unicode));
+        }
+    }
+    v.push(STANDARD_NO_PAD.encode(value));
+    v.push(URL_SAFE_NO_PAD.encode(value));
+    for engine in [&STANDARD_NO_PAD, &URL_SAFE_NO_PAD] {
+        for offset in 0..3 {
+            v.push(embedded_base64(engine, value, offset));
+        }
+    }
+    v.push(hex_encode(value, false));
+    v.push(hex_encode(value, true));
     // Only the hex digits differ between the two encodings; literal
     // characters keep their case (lowercasing the whole string would miss
     // `Ab%2fcd` and match unrelated lowercase text).
     v.push(percent_encode(value, true));
     v.push(percent_encode(value, false));
-    v.dedup();
+    let mut seen = std::collections::HashSet::new();
+    v.retain(|f| !f.is_empty() && seen.insert(f.clone()));
+    debug_assert!(v.len() <= MAX_FORMS);
     v
+}
+
+/// The base64 characters of `value` that do not depend on the bytes around
+/// it, when it sits `offset` bytes (mod 3) into a larger payload: the
+/// leading characters that mix in the preceding bytes and the trailing
+/// partial group (it mixes in the following byte) are dropped. A value of
+/// `MIN_SECRET_LEN` bytes keeps at least ten characters.
+fn embedded_base64(engine: &impl Engine, value: &str, offset: usize) -> String {
+    let mut bytes = vec![0u8; offset];
+    bytes.extend_from_slice(value.as_bytes());
+    let enc = engine.encode(&bytes);
+    // 3 bytes = 4 chars, the first value byte sits at `offset`. Offset 1:
+    // chars 0 and 1 hold the preceding byte. Offset 2: chars 0 to 2 do.
+    let skip = [0, 2, 3][offset];
+    let drop_tail = usize::from(!bytes.len().is_multiple_of(3));
+    enc.get(skip..enc.len() - drop_tail)
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn hex_encode(value: &str, upper: bool) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(value.len() * 2);
+    for b in value.bytes() {
+        let _ = if upper {
+            write!(out, "{b:02X}")
+        } else {
+            write!(out, "{b:02x}")
+        };
+    }
+    out
+}
+
+/// `value` as the inside of a JSON string, the way other encoders write it:
+/// `slash` escapes `/` as `\/`; `unicode = Some((upper, all))` writes every
+/// non-ASCII character (every character when `all`) as `\uXXXX` (a surrogate
+/// pair above the BMP) with upper- or lowercase hex digits.
+fn json_form(value: &str, slash: bool, unicode: Option<(bool, bool)>) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(value.len() * 2);
+    let mut units = [0u16; 2];
+    for c in value.chars() {
+        if let Some((upper, all)) = unicode {
+            if all || !c.is_ascii() {
+                for u in c.encode_utf16(&mut units) {
+                    let _ = if upper {
+                        write!(out, "\\u{u:04X}")
+                    } else {
+                        write!(out, "\\u{u:04x}")
+                    };
+                }
+                continue;
+            }
+        }
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '/' if slash => out.push_str("\\/"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// RFC 3986 percent-encoding of everything outside the unreserved set,
@@ -829,6 +1014,201 @@ mod tests {
             s.redact_value(&v),
             serde_json::json!({"pin": "«PIN_SECRET»", "other": 87654321, "f": 1.5})
         );
+    }
+
+    const GH: &str = "tok_0123456789abcdefghijklmnopqrstuvwxyzAB";
+
+    #[test]
+    fn base64_of_an_embedded_secret_is_redacted() {
+        // HTTP Basic / git credential, docker config `auth`, `base64 .env`,
+        // at every offset mod 3, in both alphabets (#681).
+        use base64::engine::general_purpose::{STANDARD, URL_SAFE};
+        let s = set(&[("GITHUB_TOKEN", GH)]);
+        for plain in [
+            format!("x-access-token:{GH}"),
+            format!("user:{GH}"),
+            format!("GITHUB_TOKEN={GH}\n"),
+            format!("a:{GH}:tail"),
+            format!("ab:{GH}!"),
+            format!("abc:{GH}??"),
+        ] {
+            for enc in [STANDARD.encode(&plain), URL_SAFE.encode(&plain)] {
+                let out = s
+                    .redact(&format!("Authorization: Basic {enc}"))
+                    .into_owned();
+                assert!(out.contains("«GITHUB_TOKEN»"), "{plain:?} leaked: {out}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_embedded_url_safe_base64_form_is_redacted() {
+        // A value whose base64 needs `+` and `/` (standard) or `-` and `_`.
+        use base64::engine::general_purpose::{STANDARD, URL_SAFE};
+        let v = "p@ss/w??rd>>>key=1";
+        let s = set(&[("DB_PASSWORD", v)]);
+        for pre in ["a:", "ab:", "abc:"] {
+            let plain = format!("{pre}{v}!!");
+            let (std64, url64) = (STANDARD.encode(&plain), URL_SAFE.encode(&plain));
+            assert_ne!(std64, url64, "{plain}: must exercise both alphabets");
+            for enc in [std64, url64] {
+                let out = s.redact(&format!("Basic {enc}")).into_owned();
+                assert!(out.contains("«DB_PASSWORD»"), "{enc} -> {out}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_embedded_base64_needle_keeps_the_surrounding_text() {
+        use base64::engine::general_purpose::STANDARD;
+        let s = set(&[("GITHUB_TOKEN", GH)]);
+        let enc = STANDARD.encode(format!("user:{GH}"));
+        let out = s.redact(&format!("auth={enc}\n")).into_owned();
+        assert!(out.starts_with("auth=") && out.ends_with('\n'), "{out}");
+        assert_eq!(out.matches("«GITHUB_TOKEN»").count(), 1, "{out}");
+    }
+
+    #[test]
+    fn hex_forms_are_redacted_in_both_cases() {
+        let s = set(&[("GITHUB_TOKEN", GH)]);
+        let lower = hex_encode(GH, false);
+        let upper = hex_encode(GH, true);
+        assert_ne!(lower, upper);
+        assert!(lower.starts_with("746f6b5f"), "sanity: hex of tok_");
+        for hex in [lower, upper] {
+            assert_eq!(s.redact(&format!("od: {hex}.")), "od: «GITHUB_TOKEN».");
+        }
+    }
+
+    #[test]
+    fn json_slash_and_unicode_escape_forms_are_redacted() {
+        let s = set(&[("X_TOKEN", "abc/def/ghi/jkl")]);
+        assert_eq!(
+            s.redact(r#"{"k":"abc\/def\/ghi\/jkl"}"#),
+            r#"{"k":"«X_TOKEN»"}"#
+        );
+        // Python json.dumps(ensure_ascii=True), either case, a surrogate
+        // pair for a character above the BMP, and with `\/` too.
+        let s = set(&[("U_SECRET", "pässwörd/😀-ключ")]);
+        for text in [
+            r#"{"k":"pässwörd/😀-ключ"}"#,
+            r#"{"k":"pässwörd/😀-ключ"}"#,
+            r#"{"k":"pässwörd\/😀-ключ"}"#,
+            r#"{"k":"pässwörd\/😀-ключ"}"#,
+            r#"{"k":"pässwörd/😀-ключ"}"#,
+        ] {
+            assert_eq!(s.redact(text), r#"{"k":"«U_SECRET»"}"#, "{text}");
+        }
+        // Every character escaped, as some encoders do.
+        let all: String = "abcdefgh1"
+            .encode_utf16()
+            .map(|u| format!("\\u{u:04x}"))
+            .collect();
+        let s = set(&[("A_TOKEN", "abcdefgh1")]);
+        assert_eq!(s.redact(&format!("\"{all}\"")), "\"«A_TOKEN»\"");
+    }
+
+    #[test]
+    fn json_form_agrees_with_serde_for_the_plain_escape() {
+        let v = "q\"b\\s/n\nr\rt\tb\u{8}f\u{c}c\u{1}é";
+        let serde = serde_json::to_string(v).unwrap();
+        assert_eq!(json_form(v, false, None), serde[1..serde.len() - 1]);
+    }
+
+    #[test]
+    fn a_secret_split_by_an_invisible_character_is_redacted() {
+        let s = set(&[("GITHUB_TOKEN", GH)]);
+        for zw in [
+            '\u{200b}', '\u{200d}', '\u{feff}', '\u{00ad}', '\u{202e}', '\u{2060}',
+        ] {
+            let split = format!("{}{zw}{}", &GH[..10], &GH[10..]);
+            assert_eq!(
+                s.redact(&format!("x={split};")),
+                "x=«GITHUB_TOKEN»;",
+                "{zw:?}"
+            );
+        }
+        // Several, at the edges and between multibyte neighbours.
+        let text = format!("é\u{200b}{}\u{200b}{}\u{200b}é", &GH[..3], &GH[3..]);
+        assert_eq!(s.redact(&text), "é\u{200b}«GITHUB_TOKEN»\u{200b}é");
+        // A split encoded form is found too (base64 of the value).
+        let enc = base64::engine::general_purpose::STANDARD_NO_PAD.encode(GH);
+        let split = format!("{}\u{200b}{}", &enc[..9], &enc[9..]);
+        assert_eq!(s.redact(&split), "«GITHUB_TOKEN»");
+    }
+
+    #[test]
+    fn invisible_scanning_merges_with_the_plain_scan_and_stays_idempotent() {
+        let s = set(&[("A_TOKEN", "abcdefgh"), ("B_TOKEN", "zzzzyyyy1")]);
+        let text = "abcdefgh a\u{200b}bcdefgh zzzz\u{200b}yyyy1 abcdefgh";
+        let once = s.redact(text).into_owned();
+        assert_eq!(once, "«A_TOKEN» «A_TOKEN» «B_TOKEN» «A_TOKEN»");
+        assert_eq!(s.redact(&once), once);
+        // Overlap across the two scans names each secret once.
+        let s = set(&[("A_TOKEN", "11112222xx"), ("B_TOKEN", "2222xx33334444")]);
+        assert_eq!(
+            s.redact("<11112222\u{200b}xx33334444>"),
+            "<«A_TOKEN»«B_TOKEN»>"
+        );
+    }
+
+    #[test]
+    fn the_byte_check_for_invisible_characters_agrees_with_the_char_check() {
+        for c in (0..=0xFFFFu32).filter_map(char::from_u32) {
+            let text = format!("a{c}b");
+            assert_eq!(has_invisible(&text), is_invisible(c), "U+{:04X}", c as u32);
+        }
+    }
+
+    #[test]
+    fn invisible_characters_alone_redact_nothing() {
+        let s = set(&[("A_TOKEN", "abcdefgh")]);
+        for text in [
+            "plain \u{200b}text\u{feff}",
+            "abcdefg\u{200b}x",
+            "ab\u{200b}cdefg",
+        ] {
+            assert!(matches!(s.redact(text), Cow::Borrowed(_)), "{text:?}");
+        }
+        // A secret that itself holds an invisible character still matches.
+        let s = set(&[("Z_TOKEN", "ab\u{200b}cdefgh")]);
+        assert_eq!(s.redact("x ab\u{200b}cdefgh y"), "x «Z_TOKEN» y");
+    }
+
+    #[test]
+    fn needles_per_value_are_bounded_and_long_enough() {
+        for v in [
+            "abcdefgh",
+            GH,
+            "p@ss/w??rd>>>key=1",
+            "pässwörd/😀-ключ-with-a-long-tail-0123456789",
+            "a\"b\\c\nd/e/f/g/h",
+        ] {
+            let f = forms(v);
+            assert!(f.len() <= MAX_FORMS, "{v}: {}", f.len());
+            // The false-positive floor: no needle is shorter than the
+            // shortest value (8 characters), embedded base64 included.
+            for n in &f {
+                assert!(n.chars().count() >= MIN_SECRET_LEN, "{v}: {n}");
+            }
+        }
+        assert_eq!(forms("abcdefgh").iter().map(|n| n.len()).min(), Some(8));
+        assert!(forms("abcdefgh").iter().all(|n| n.len() >= 8));
+    }
+
+    #[test]
+    fn a_large_text_with_invisible_characters_is_still_linear() {
+        // Not a timing gate: 4 MiB with an invisible character in every
+        // line must finish and redact every planted value.
+        let s = set(&[("GITHUB_TOKEN", GH)]);
+        let unit = format!("{}\u{200b}{}\n", &GH[..7], &GH[7..]);
+        let text = unit.repeat(4 * 1024 * 1024 / unit.len());
+        let out = s.redact(&text);
+        assert_eq!(
+            out.matches("«GITHUB_TOKEN»").count(),
+            text.matches('\n').count()
+        );
+        assert!(!out.contains("tok_"));
     }
 
     /// Throughput measurement, not a gate (no timing assertion): run with

@@ -33,6 +33,26 @@ unoptimized, **~6–8 ms** release. The fold budget is ~20× the unoptimized
 observation: it exists to catch complexity regressions (an O(n²) fold of
 100k records would take minutes), not to race.
 
+## Secret redaction (#681, 2026-11-14)
+
+`SecretSet::redact` is a byte scan over every needle form of every known
+value. #681 added the embedded-base64, hex and `\/` / `\uXXXX` forms (up to 24
+needles per value, was 8) and a second scan for text that holds an invisible
+character. Measured with `cargo test -p tole-core --release --lib
+secrets::tests::throughput -- --ignored --nocapture` (5 secrets, mixed
+source-like text, Linux x86_64):
+
+| Text | Before | After |
+|---|---|---|
+| 4 KiB | 480 MB/s | 350 MB/s |
+| 64 KiB | 659 MB/s | 346 MB/s |
+| 1 MiB | 664 MB/s | 346 MB/s |
+
+A set with no secrets stays a borrowed no-op, and text without invisible
+characters is scanned once (the check reads UTF-8 bytes, no decoding). The
+unit test `a_large_text_with_invisible_characters_is_still_linear` redacts
+4 MiB that carries one in every line, as a guard against a quadratic path.
+
 ## Method
 
 - `crates/tole-core/tests/perf_threshold.rs` — deterministic, no timing
