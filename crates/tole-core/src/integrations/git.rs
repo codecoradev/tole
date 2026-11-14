@@ -447,9 +447,7 @@ mod tests {
 
     #[test]
     fn fake_git_binary_end_to_end() {
-        let dir = std::env::temp_dir().join(format!("tole-git-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_dir::TestDir::new("tole-git");
         let bin = dir.join("git");
         let log = dir.join("argv.log");
         std::fs::write(
@@ -490,9 +488,7 @@ mod tests {
 
     #[test]
     fn fake_git_binary_truncates_large_output_end_to_end() {
-        let dir = std::env::temp_dir().join(format!("tole-git-cap-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_dir::TestDir::new("tole-git-cap");
         let bin = dir.join("git");
         std::fs::write(&bin, "#!/bin/sh\nprintf 'y%.0s' $(seq 1 25000)\n").unwrap();
         #[cfg(unix)]
@@ -515,9 +511,7 @@ mod tests {
     #[test]
     fn a_diff_hides_the_lines_of_a_sensitive_file() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("tole-git-env-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_dir::TestDir::new("tole-git-env");
         let bin = dir.join("git");
         std::fs::write(
             &bin,

@@ -671,10 +671,12 @@ mod uteke_doc {
 
         /// A fake uteke: logs argv (one line per call) and stdin, answers
         /// `doc search` with `search` and `doc get <slug>` from `docs`.
-        fn fake(tag: &str, search: &str, docs: &[(&str, Value)]) -> (UtekeDocIndex, PathBuf) {
-            let dir = std::env::temp_dir().join(format!("tole-skidx-{tag}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).unwrap();
+        fn fake(
+            tag: &str,
+            search: &str,
+            docs: &[(&str, Value)],
+        ) -> (UtekeDocIndex, crate::test_dir::TestDir) {
+            let dir = crate::test_dir::TestDir::new(&format!("tole-skidx-{tag}"));
             for (slug, doc) in docs {
                 std::fs::write(dir.join(format!("{slug}.json")), doc.to_string()).unwrap();
             }
@@ -841,9 +843,8 @@ mod tests {
     use crate::tool::Tool as _;
     use std::sync::Mutex;
 
-    fn ws(tag: &str, skills: &[(&str, &str)]) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("tole-skillsel-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+    fn ws(tag: &str, skills: &[(&str, &str)]) -> crate::test_dir::TestDir {
+        let dir = crate::test_dir::TestDir::new(&format!("tole-skillsel-{tag}"));
         for (name, desc) in skills {
             let d = dir.join("skills").join(name);
             std::fs::create_dir_all(&d).unwrap();
@@ -1051,7 +1052,7 @@ mod tests {
                 ("docs", "Write docs"),
             ],
         );
-        let idx = LocalIndex::new(Some(dir.clone()));
+        let idx = LocalIndex::new(Some(dir.to_path_buf()));
         let got = idx
             .search("release to staging", &SkillFilter::default(), 5)
             .unwrap();
@@ -1077,7 +1078,12 @@ mod tests {
         let dir = ws("tool", &[("deploy", "Local description")]);
         let idx: Arc<dyn SkillIndex> =
             Arc::new(Scripted::new(Ok(vec![("deploy", 0.9), ("ghost", 0.8)])));
-        let tool = SkillSearchTool::new(idx, Some(dir.clone()), SkillFilter::default(), Gate::Open);
+        let tool = SkillSearchTool::new(
+            idx,
+            Some(dir.to_path_buf()),
+            SkillFilter::default(),
+            Gate::Open,
+        );
         assert_eq!(tool.risk(), crate::tool::Risk::ReadOnly);
         let out = tool.execute(json!({"query": "ship", "limit": 99})).unwrap();
         assert_eq!(out["index"], json!("scripted"));
@@ -1143,7 +1149,8 @@ mod tests {
         assert!(selection_block(&sel).contains("cannot be loaded: b"));
         // skill_search: the refused hit has no description.
         let idx3: Arc<dyn SkillIndex> = Arc::new(Scripted::new(Ok(vec![("b", 0.9), ("c", 0.8)])));
-        let tool = SkillSearchTool::new(idx3, Some(dir.clone()), SkillFilter::default(), gate);
+        let tool =
+            SkillSearchTool::new(idx3, Some(dir.to_path_buf()), SkillFilter::default(), gate);
         let out = tool.execute(json!({"query": "x"})).unwrap();
         assert_eq!(out["skills"][0]["name"], json!("b"));
         assert_eq!(out["skills"][0]["available"], json!(false));

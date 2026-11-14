@@ -181,22 +181,20 @@ mod tests {
         0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0, 0x1F, 0x15, 0xC4, 0x89,
     ];
 
-    fn tmp(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("tole-image-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d.canonicalize().unwrap()
+    use crate::test_dir::TestDir;
+    fn tmp(name: &str) -> TestDir {
+        TestDir::new(&format!("tole-image-{name}"))
     }
 
     #[test]
     fn resolves_a_jailed_path_and_roundtrips_to_a_data_url() {
         let ws = tmp("ok");
         std::fs::write(ws.join("a.png"), PNG).unwrap();
-        let r = resolve("a.png", std::slice::from_ref(&ws), None).unwrap();
+        let r = resolve("a.png", &[ws.to_path_buf()], None).unwrap();
         assert_eq!(r.mime, "image/png");
         assert_eq!(r.bytes, PNG.len() as u64);
         assert_eq!(ImageRef::from_value(&r.to_value()), Some(r.clone()));
-        let url = data_url(&r, &[ws]).unwrap();
+        let url = data_url(&r, &[ws.to_path_buf()]).unwrap();
         assert!(url.starts_with("data:image/png;base64,"), "{url}");
     }
 
@@ -207,18 +205,18 @@ mod tests {
         std::fs::write(outside.join("x.png"), PNG).unwrap();
         let e = resolve(
             outside.join("x.png").to_str().unwrap(),
-            std::slice::from_ref(&ws),
+            &[ws.to_path_buf()],
             None,
         )
         .unwrap_err();
         assert!(e.0.contains("outside the workspace jail"), "{e}");
         // `..` escape and a symlink escape are both caught by canonicalize.
-        let e = resolve("../x.png", std::slice::from_ref(&ws), None).unwrap_err();
+        let e = resolve("../x.png", &[ws.to_path_buf()], None).unwrap_err();
         assert!(e.0.contains("outside") || e.0.contains("No such"), "{e}");
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink(outside.join("x.png"), ws.join("l.png")).unwrap();
-            let e = resolve("l.png", &[ws], None).unwrap_err();
+            let e = resolve("l.png", &[ws.to_path_buf()], None).unwrap_err();
             assert!(e.0.contains("outside the workspace jail"), "{e}");
         }
     }
@@ -227,11 +225,14 @@ mod tests {
     fn refuses_non_images_and_oversize() {
         let ws = tmp("bad");
         std::fs::write(ws.join("t.png"), b"just text").unwrap();
-        let e = resolve("t.png", std::slice::from_ref(&ws), None).unwrap_err();
+        let e = resolve("t.png", &[ws.to_path_buf()], None).unwrap_err();
         assert!(e.0.contains("not a png/jpeg/gif/webp"), "{e}");
         let big = vec![0u8; MAX_IMAGE_BYTES as usize + 1];
         std::fs::write(ws.join("b.png"), big).unwrap();
-        assert!(resolve("b.png", &[ws], None).unwrap_err().0.contains("cap"));
+        assert!(resolve("b.png", &[ws.to_path_buf()], None)
+            .unwrap_err()
+            .0
+            .contains("cap"));
     }
 
     #[test]
@@ -254,10 +255,13 @@ mod tests {
     fn a_swapped_file_is_reported_not_sent() {
         let ws = tmp("swap");
         std::fs::write(ws.join("a.png"), PNG).unwrap();
-        let r = resolve("a.png", std::slice::from_ref(&ws), None).unwrap();
+        let r = resolve("a.png", &[ws.to_path_buf()], None).unwrap();
         let mut other = PNG.to_vec();
         other.push(0);
         std::fs::write(ws.join("a.png"), other).unwrap();
-        assert!(data_url(&r, &[ws]).unwrap_err().0.contains("changed"));
+        assert!(data_url(&r, &[ws.to_path_buf()])
+            .unwrap_err()
+            .0
+            .contains("changed"));
     }
 }

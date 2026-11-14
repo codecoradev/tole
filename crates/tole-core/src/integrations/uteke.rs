@@ -364,9 +364,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn document_markdown_is_redacted_before_it_leaves_the_process() {
-        let dir = std::env::temp_dir().join(format!("tole-uteke-595-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_dir::TestDir::new("tole-uteke-595");
         let bin = dir.join("uteke");
         let stored = dir.join("stored.md");
         std::fs::write(
@@ -402,11 +400,9 @@ echo ok
 
     /// A fake uteke that logs its argv, one call per line, and stdin.
     #[cfg(unix)]
-    fn fake_uteke(tag: &str, exit: i32) -> (UtekeDocumentTool, std::path::PathBuf) {
+    fn fake_uteke(tag: &str, exit: i32) -> (UtekeDocumentTool, crate::test_dir::TestDir) {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("tole-uteke-576-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_dir::TestDir::new(&format!("tole-uteke-576-{tag}"));
         let bin = dir.join("uteke");
         let d = dir.display();
         std::fs::write(
