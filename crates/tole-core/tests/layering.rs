@@ -28,8 +28,8 @@ use std::path::Path;
 /// Faces: serve-side modules (only a host's serve surface uses them).
 #[rustfmt::skip]
 const KERNEL_MODULES: &[&str] = &[
-    "entry", "register", "state", "storage", "machine", "paths", "secrets", "secret_release",
-    "sensitive", "sanitize", "safe_dir", "tool", "approval", "provider", "openai", "mock",
+    "entry", "register", "state", "storage", "machine", "paths", "secrets",
+    "sanitize", "safe_dir", "tool", "approval", "provider", "openai", "mock",
     "failover", "cancel", "interrupt", "image", "ledger", "cron", "tz", "webhook", "transcript",
     "turn", "compaction", "gate", "replay", "hooks", "subprocess", "process_guard",
     "sandbox", "file_tools", "read_file", "todo", "systemone",
@@ -60,6 +60,8 @@ const ALIASES: &[(&str, &str)] = &[
     ("delegation_approvals", "delegation"),
     ("delegation_report", "delegation"),
     ("resource_guard", "delegation"),
+    ("secret_release", "secrets"),
+    ("sensitive", "secrets"),
 ];
 
 fn level_of(module: &str) -> Option<u8> {
