@@ -41,8 +41,8 @@ web-builtin = ["dep:nginjen-lite", "dep:url"]
 replay = []
 
 [dependencies]
-tole-core = { version = "0.10.1", path = "../tole-core" }
-tole-tui = { version = "0.10.1", path = "../tole-tui", optional = true }
+tole-core = { version = "0.11.0", path = "../tole-core" }
+tole-tui = { version = "0.11.0", path = "../tole-tui", optional = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }

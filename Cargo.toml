@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/tole-core", "crates/tole-cli", "crates/tole-tui"]
 
 [workspace.package]
-version = "0.10.1"
+version = "0.11.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/codecoradev/tole"
