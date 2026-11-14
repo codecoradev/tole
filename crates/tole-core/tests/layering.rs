@@ -31,8 +31,7 @@ const KERNEL_MODULES: &[&str] = &[
     "tools",
     "entry", "register", "state", "storage", "machine", "paths", "secrets",
     "sanitize", "safe_dir", "tool", "approval", "provider", "cancel", "interrupt",
-    "ledger", "transcript", "turn", "compaction", "gate", "hooks", "subprocess",
-    "process_guard", "sandbox", "systemone",
+    "ledger", "turn", "gate", "hooks", "subprocess", "process_guard", "sandbox", "systemone",
 ];
 #[rustfmt::skip]
 const ENGINE_MODULES: &[&str] = &[
@@ -55,6 +54,8 @@ const BASELINE: &[(&str, &str, &str)] = &[
 
 /// Old top-level paths that are now re-exports of a module inside another one.
 const ALIASES: &[(&str, &str)] = &[
+    ("compaction", "turn"),
+    ("transcript", "turn"),
     ("openai", "provider"),
     ("failover", "provider"),
     ("mock", "provider"),
