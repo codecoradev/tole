@@ -31,17 +31,17 @@ use std::path::Path;
 /// Faces: diagnostics and the hook command surface.
 #[rustfmt::skip]
 const KERNEL_MODULES: &[&str] = &[
-    "config", "hooks", "approvals", "approver",
-    "auth", "protocol", "sibling", "handoff", "tools", "web_builtin", "advisor_host",
+    "config", "hooks", "approvals", "approver", "sibling", "handoff", "tools", "web_builtin", "advisor_host",
     "review_gate",
 ];
 #[rustfmt::skip]
 const ENGINE_MODULES: &[&str] = &[
+    "serve_support",
     "session",
     "skill",
     "delegation",
     "plugin",
-    "discuss", "cron", "tool_roster", "provider_chain", "events", "serve_images",
+    "discuss", "cron", "tool_roster", "provider_chain",
 ];
 #[rustfmt::skip]
 const FACE_MODULES: &[&str] = &["doctor", "ecosystem", "hook_cli"];
@@ -54,6 +54,10 @@ const BASELINE: &[(&str, &str, &str)] = &[
 
 /// Old top-level paths that are now re-exports of a module inside another one.
 const ALIASES: &[(&str, &str)] = &[
+    ("serve_images", "serve_support"),
+    ("events", "serve_support"),
+    ("protocol", "serve_support"),
+    ("auth", "serve_support"),
     ("session_host", "session"),
     ("session_index", "session"),
     ("session_tools", "session"),

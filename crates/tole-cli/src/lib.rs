@@ -23,7 +23,16 @@ pub use delegation::machine_guard;
 #[doc(inline)]
 pub use delegation::serve_delegation;
 pub mod approver;
-pub mod auth;
+pub mod serve_support;
+// `serve_support/` holds these modules; the re-exports keep the old top-level paths working.
+#[doc(inline)]
+pub use serve_support::auth;
+#[doc(inline)]
+pub use serve_support::events;
+#[doc(inline)]
+pub use serve_support::images as serve_images;
+#[doc(inline)]
+pub use serve_support::protocol;
 pub mod session;
 // `session/` holds these modules; the re-exports keep the old top-level paths working.
 #[doc(inline)]
@@ -92,7 +101,6 @@ pub use discuss::host as discussion_host;
 pub use discuss::tool as discuss_tool;
 pub mod doctor;
 pub mod ecosystem;
-pub mod events;
 pub mod handoff;
 pub mod hook_cli;
 pub mod hooks;
@@ -103,11 +111,9 @@ pub mod plugin;
 pub use plugin::cmd as plugin_cmd;
 #[doc(inline)]
 pub use plugin::gate as plugin_gate;
-pub mod protocol;
 pub mod provider_chain;
 #[cfg(feature = "shell-tools")]
 pub mod review_gate;
-pub mod serve_images;
 pub mod sibling;
 pub mod tool_roster;
 pub mod tools;
