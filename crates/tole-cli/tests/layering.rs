@@ -48,9 +48,7 @@ const FACE_MODULES: &[&str] = &["doctor", "ecosystem", "hook_cli"];
 
 /// Known violations (importer, imported, reason). Only ever shrinks.
 #[rustfmt::skip]
-const BASELINE: &[(&str, &str, &str)] = &[
-    ("provider_chain", "doctor", "provider_chain reuses a doctor helper (the two import each other)"),
-];
+const BASELINE: &[(&str, &str, &str)] = &[];
 
 /// Old top-level paths that are now re-exports of a module inside another one.
 const ALIASES: &[(&str, &str)] = &[

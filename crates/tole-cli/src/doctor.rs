@@ -17,6 +17,9 @@
 //! blocker, fix command, timestamp); [`Ledger::summary`] renders the
 //! `READY n-of-m` line.
 
+// `redact_url` lives in `provider_chain` (an engines module) so that module
+// does not import this face; the old `doctor::redact_url` path stays.
+pub use crate::provider_chain::redact_url;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -447,20 +450,6 @@ pub fn secrets_lines(
         tole_core::sensitive::builtin_rules().join(", ")
     ));
     out
-}
-
-pub fn redact_url(url: &str) -> String {
-    let (scheme, rest) = match url.split_once("://") {
-        Some((s, r)) => (format!("{s}://"), r),
-        None => (String::new(), url),
-    };
-    let rest = rest.split(['?', '#']).next().unwrap_or("");
-    let (authority, path) = match rest.find('/') {
-        Some(i) => rest.split_at(i),
-        None => (rest, ""),
-    };
-    let host = authority.rsplit('@').next().unwrap_or("");
-    format!("{scheme}{host}{path}")
 }
 
 /// Strip the API key and any URL credentials from a diagnostic string.
