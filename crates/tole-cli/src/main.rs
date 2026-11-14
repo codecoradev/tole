@@ -1727,6 +1727,10 @@ fn dispatch(cli: Cli) -> Result<()> {
             for l in tole_cli::machine_guard::doctor_lines(&host.delegation, cwd.as_deref(), now) {
                 println!("{l}");
             }
+            println!(
+                "{}",
+                tole_cli::approvals_owner::doctor_line(&host.delegation.cfg)
+            );
             // The plugin lock (#599): each configured server's approval.
             #[cfg(feature = "mcp")]
             if let Some(cwd) = &cwd {

@@ -334,6 +334,17 @@ approvals work), plus `approval_secs` and `approval_level_secs`. `off` is
 today's behavior exactly (stdio approver, Writes denied). The switch lets
 each PR land without enabling the feature (section 10).
 
+**As shipped, the default stays `off`** (owner decision 2 chose `owner` as the
+default of the last PR; the end-to-end test showed what that would change). With
+`owner` a delegated child's non-allowlisted Write no longer fails at once: it
+parks for up to `approval_secs` (900 s by default, up to the node deadline) and
+silently stalls an unattended mission until nobody answers. That is a behavior
+change for every existing user of `delegate`, so it is an opt-in
+(`approvals = "owner"`), and `chain` an opt-in on top of it. Flipping the
+default later is a one-line change (`ApprovalsMode`'s `#[default]`) plus a
+changelog line; the end-to-end test `with_approvals_off_or_unset_...` pins the
+current default.
+
 ## 8. Depth and budget caps are unchanged
 
 - No new delegation: escalation moves a question, not a child. Depth stays
@@ -348,8 +359,7 @@ each PR land without enabling the feature (section 10).
 
 ## 9. Threat model rows
 
-To be added to `docs/threat-model.md` ("Delegation approvals (#714)") with
-the implementation, one row per line below.
+Added to `docs/threat-model.md` ("Delegation approvals (#714)"), one row per line below.
 
 | Threat | Mitigation | Residual |
 |---|---|---|
@@ -417,7 +427,7 @@ denied exactly as today.
 | 3 | `feat(delegate): owner decides delegated approvals with tole` | `tole delegation approvals list\|show\|allow\|deny`, `owner_only` guard, `--fingerprint`, child's `fact/approval_*` register, `tole audit` approvals section; `approvals = "owner"` becomes usable | Agent levels cannot decide; all agent levels are `skipped: no_decide_tool`. Owner-only classes are final here |
 | 4 | `feat(serve): /approvals lists and decides delegation requests` | serve GET merge, `dap-` routing, under-session refusal, event frame | Same as 3 |
 | 5 | `feat(delegate): agent levels decide within their own authority` | `delegate_pending`, `delegate_decide`, registration rule, level windows and escalation, `delegate_poll` count, `approvals = "chain"` usable | Anything outside a level's list, always-owner classes, Destructive; the default is still `off` |
-| 6 | `docs,feat: delegation approvals on by default, threat model, mutation sweep` | default `owner` (or `chain`, see question 2), threat-model section and rows, `automation-design.md` and `epics.md` text, CHANGELOG, a full mutation sweep and the end-to-end tests of section 10 | Reviewer participants stay read-only (question 4); Destructive; every owner-only class |
+| 6 | `docs,feat: delegation approvals on by default, threat model, mutation sweep` (as shipped: the default stays `off`, see section 7) | default `owner` (or `chain`, see question 2), threat-model section and rows, `automation-design.md` and `epics.md` text, CHANGELOG, a full mutation sweep and the end-to-end tests of section 10 | Reviewer participants stay read-only (question 4); Destructive; every owner-only class |
 
 PR 1 is the riskiest to review (the classifier and the predicate), so it
 carries the heaviest tests; PRs 3 and 4 are independent after 2 and can land
@@ -432,7 +442,9 @@ first draft of this note.
    most `approval_secs` (default 900, cap 3600 s). Revisit only if a real
    unattended case appears.
 2. **`chain` ships available, the default stays `owner`**, also after PR 6:
-   agents decide only where the owner granted `delegate_decide`.
+   agents decide only where the owner granted `delegate_decide`. *As shipped:*
+   `chain` and `owner` are both opt-in and the default is still `off`, see
+   section 7.
 3. **External-effect tools (MCP, plugin, skill) are always-owner**, stricter
    than the list in #714; the owner can still allow one call.
 4. **Reviewer participants (#704) stay read-only permanently** and never ask

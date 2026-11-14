@@ -1199,3 +1199,41 @@ into the data dir is not seen. A session with `run_command` has the
 owner's file permissions. These are defense in depth against the plain
 route (the official CLI, the file tools). The real boundary is a sandbox
 that cannot write the data dir (#601).
+
+### Delegation approvals (#714)
+
+A delegated child has no terminal, so a Write its allow list does not cover
+used to be denied at once and nobody saw the question. With `[delegation]
+approvals = "owner"` or `"chain"` the child asks through a durable,
+append-only log (`<data dir>/delegation/<hash>/approvals.jsonl`, outside every
+workspace, mode 0600) and waits; the owner answers with `tole delegation
+approvals` or `/approvals` in `tole serve`; in `chain` mode a parent that holds
+a `delegate_decide` grant answers within its own authority first. No answer is
+a denial. The default is `off`: the child is denied at once, as before.
+Design: [delegation-approvals-design.md](delegation-approvals-design.md).
+
+What a decision is: one allow or deny of one call, bound to a SHA-256
+fingerprint over node, session, tool, canonical raw input, target and
+workspace; consumed (written) before the call runs. It never carries a
+pattern, a budget, a secret or a profile change, and no model-written text.
+The fold re-validates every record, so a forged line does no more than a legal
+one could.
+
+| Threat | Mitigation | Residual |
+|---|---|---|
+| **Injection through a request text** (a child writes a path, a command or an argument crafted to read as an instruction or a pre-approval to the decider) | The decider sees host-built `display` (tool, resolved target, `describe`), fenced and marked as data, never a model-written reason; a request carries no free-text field at all; the fingerprint, not the text, is what is approved; truncated display makes the request owner-only | A decider model may still be influenced by the plausible-looking content of a legitimate request (a file body). Bounded by 2.2 (only what its allow list already allows, inside the workspace guard) |
+| **A child asks for more than its parent holds** | Rule 2.2.3: a level decides only if its own list allows the call; otherwise it cannot decide and the request moves up; at the root the owner decides. A deny pattern of the child or a parent is final and never escalated. Widening (patterns, profile, budget, secrets) is not an approval and is refused or dropped, never escalated | None beyond the owner's own choice to allow |
+| **A parent approves on injected instruction** (its context was poisoned) | The parent decides only within its own allow list and the workspace guard; `delegate_decide` is `Risk::Write`, so at the root the owner's approver sees each decision; at depth >= 1 the tool exists only by explicit grant; `deny` and `escalate` are always available; no always-owner class is decidable | A poisoned level can approve what its list already allows, for its own subtree: the same power it has to do it itself or tell the child to. The grant is the owner's to withhold |
+| **Replay** (an allow reused for another call, node, session, workspace, or twice) | One-shot: `Consume` is written before Allow is returned; the fingerprint is SHA-256 over node, session, tool, canonical raw input, target and workspace; a changed input is a new request; the fold ignores a second `Consume` and a `Decide` after `expired` | An allow is valid for one call by the one waiting process; there is no later reuse path |
+| **Confused deputy** (a level approves in its authority something that acts on the child's workspace, or the owner approves something that reads differently than it runs) | The target is resolved against the **child's** canonical root and must pass the guard; the fingerprint includes the workspace; `display` and fingerprint come from the same host code path as the call; level eligibility is read from the immutable `Node.allow` of the log, not from a request field | The owner confirming a long approval without reading it. Mitigated by the 2 KiB display cap, `show` and `--fingerprint` |
+| **Race between levels** (parent decides as the window closes; two levels decide; owner and parent at once) | One lock; first valid `Decide` in log order wins; validity checked at append time against the derived current level and re-checked by the fold; deny is final; the loser gets `race_lost` | None for correctness. Clock skew is single-host, and the check is by log order and the `at` the lock writer set |
+| **Orphaned requests** (child or level dies; parent settles; process killed while parked; owner away) | Pending requests of a settled node fold to `expired(node_settled)`; dead levels are skipped; a request always expires (`approval_secs`, capped by the node deadline) to deny; recover settles the node; the log is bounded | A request may stay `pending` in the file until the next fold marks it; nothing can use it. An unattended machine just denies |
+| **Flood** (a looping child fills the queue) | At most 1 open request per node and 32 per goal; the log is capped at 8 MiB for new requests and not read past 9 MiB, each line at 32 KiB; each denied request ends that child's turn (`ApprovalRequired`) | A cap hit denies everything new in that goal until the owner clears the file. Rotation of the log is later work |
+| **Forged record** (an interpreter appends a `Decide`) | Fold re-validation; owner-only subcommands refuse under a session; #684 residual | Same as #684: the real boundary is #601 |
+
+Always the owner, never an agent level: secrets, trust and approval records,
+plugin, skill and MCP effects, a Write outside the workspace or onto a file
+another tool executes, an oversized or truncated request. `Destructive` stays
+unreachable (a delegated child is not interactive, so those tools are not
+registered). A discussion participant (#704) never asks and never decides: it
+stays read-only.
