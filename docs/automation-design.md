@@ -556,6 +556,10 @@ report, a write, a roster change or a tool call; the budget and
 participants are user-config profiles; the scribe and the claim-checker are
 built-in or owner-overridden roles.
 
+**Decision (owner, 2026-11-14): (c), in two steps. Step 1 shipped: `tole discuss`
+(owner-only, depth 0, read-only inline participants, `--dry-run` shows the cost,
+`resume` after a crash, `list`/`show`).**
+
 **Recommendation: (c), in two steps.** Ship (a) first: it needs no new trust
 decision, shows the owner what a discussion costs, and exercises the library
 end to end. Then add (b) under the same rules as `delegate` (it is a

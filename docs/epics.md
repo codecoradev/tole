@@ -304,9 +304,10 @@ Bot and Nakama; BMAD for collaboration). Design notes:
     ledger; part 2 adds budget hard stops and caps to the ledger, the
     built-in scribe and claim-checker roles and the host driver as a
     library, with independent read-only participants through `delegate`,
-    uteke round documents and `tole audit --discussions`; how a discussion
-    starts is an open question for the owner, see `automation-design.md`
-    "Entry point: open question");
+    uteke round documents and `tole audit --discussions`; part 3a is the
+    owner-only `tole discuss` command; the owner chose both entry points, so
+    the model-facing tool under the rules of `delegate` follows, see
+    `automation-design.md` "Entry point");
   - `uteke_document` parent (#576; done).
 - **E3 — Skills, epic #589:** `SkillIndex` + uteke doc adapter, K = 5 with
   pinned core (#590), approved-hash loading (#591), propose-only growth with

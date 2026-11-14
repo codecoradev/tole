@@ -1,9 +1,8 @@
 //! The multi-round discussion's host driver (#588, design
 //! `profiles-collaboration-secrets.md` A7, A8.3): runs a discussion over its
 //! ledger ([`tole_core::discussion_log`]) until the gate reports or
-//! escalates. A library only: how a discussion is STARTED (a command, a
-//! model-facing tool, both) is an open question for the owner, see
-//! `docs/automation-design.md` "Entry point: open question".
+//! escalates. A library: the owner starts one with `tole discuss`
+//! ([`crate::discuss`]); see `docs/automation-design.md` "Entry point".
 //!
 //! - **Inline participants.** The orchestrator voices each dormant profile
 //!   from its persona file: one provider call per turn with the fixed
