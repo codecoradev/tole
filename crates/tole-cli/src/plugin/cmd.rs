@@ -15,7 +15,10 @@ use std::path::PathBuf;
 
 use serde_json::json;
 use tole_core::mcp::{Listed, McpServerConfig};
-use tole_core::plugin_lock::{self, admit, Admission, LockEntry, Lockfile, ToolChange, NOT_STORED};
+use tole_core::plugin_lock::{
+    self, admit, admit_unseen, tier_of, Admission, LockEntry, Lockfile, ToolChange, NOT_STORED,
+};
+use tole_core::sandbox::{Availability, Mode, Policy};
 use tole_core::secrets::SecretSet;
 
 use crate::plugin_gate::{integrity, record_event, render_manifest, source_of, Gate};
@@ -64,6 +67,17 @@ pub struct Ctx<'a> {
     pub interactive: bool,
     pub ask: &'a mut dyn FnMut(&str) -> bool,
     pub secrets: SecretSet,
+    /// The owner's first-party server names (`[plugins] first_party`).
+    pub first_party: Vec<String>,
+    /// The process's sandbox policy and what this machine offers.
+    pub sandbox: Option<Policy>,
+    pub backend: Availability,
+    /// The secret names currently released to `mcp` (what an approval made
+    /// now would grant).
+    pub mcp_grants: Vec<String>,
+    /// Whether `list` and `diff` may start servers. False under an agent
+    /// session: a command a session ran never launches anything.
+    pub probe: bool,
 }
 
 impl Ctx<'_> {
@@ -117,6 +131,79 @@ fn binary_note(e: &LockEntry) -> Option<&'static str> {
         .then_some("binary changed since approval: refused at connect until re-approved")
 }
 
+/// How `name` would be wrapped if started now.
+fn sandbox_status(ctx: &Ctx<'_>, name: &str, stdio: bool) -> String {
+    if !stdio {
+        return "not applicable (remote server)".into();
+    }
+    let Some(p) = ctx.sandbox.as_ref().filter(|p| p.mode != Mode::Off) else {
+        return "off".into();
+    };
+    if p.skip.iter().any(|s| s == name) {
+        return "skipped (owner's skip list)".into();
+    }
+    match &ctx.backend {
+        Availability::Usable { .. } => format!("wrapped (profile {})", p.profile_name),
+        Availability::Unavailable(why) if p.mode == Mode::Required => {
+            format!("required but unavailable, not started: {why}")
+        }
+        Availability::Unavailable(why) => format!("not available, runs unwrapped: {why}"),
+    }
+}
+
+/// Server text as data: every line behind a bar, so it cannot forge the
+/// structure of this output or pass as an instruction of tole.
+fn quote(text: &str) -> String {
+    if text.is_empty() {
+        return "  | (empty)".into();
+    }
+    text.lines()
+        .map(|l| format!("  | {l}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn state_of(a: &Admission) -> &'static str {
+    match a {
+        Admission::Trusted => "approved",
+        Admission::Changed { .. } => "changed",
+        Admission::Moved => "changed (another command or URL)",
+        Admission::Rebuilt => "changed (another program file)",
+        Admission::Unlocked => "unapproved",
+        Admission::Revoked => "revoked",
+    }
+}
+
+/// The state of a configured server. The lock decides first: a server it
+/// would not let a session start (revoked, unapproved, another command or
+/// program file) is never started here either.
+fn probe_state(
+    ctx: &Ctx<'_>,
+    eff: &std::collections::BTreeMap<String, LockEntry>,
+    cfg: &McpServerConfig,
+) -> String {
+    let source = source_of(cfg);
+    let integrity = integrity(&source);
+    if let Some(a) = admit_unseen(eff, &cfg.name, &source, &integrity) {
+        return state_of(&a).to_string();
+    }
+    if !ctx.probe {
+        return "locked (not probed: running under a session)".to_string();
+    }
+    match (ctx.list)(cfg) {
+        Err(e) => format!("unreachable: {e}"),
+        Ok((v, tools)) => {
+            let live = tole_core::plugin_lock::Live {
+                source: &source,
+                integrity: &integrity,
+                version: &v,
+                tools: &tools,
+            };
+            state_of(&admit(eff, &cfg.name, &live)).to_string()
+        }
+    }
+}
+
 fn list(ctx: &Ctx<'_>, as_json: bool) -> String {
     let mut notes = Vec::new();
     let mut load = |p: Option<PathBuf>, which: &str| match p.as_deref().map(Lockfile::load) {
@@ -142,34 +229,19 @@ fn list(ctx: &Ctx<'_>, as_json: bool) -> String {
     let mut rows = Vec::new();
     for name in &names {
         let entry = eff.get(name).or_else(|| user.servers.get(name));
-        let state = match ctx.specs.iter().find(|c| &c.name == name) {
+        let cfg = ctx.specs.iter().find(|c| &c.name == name);
+        let source = cfg
+            .map(source_of)
+            .or_else(|| entry.map(|e| e.source.clone()));
+        let stdio = source.as_deref().is_some_and(|s| s.starts_with("stdio:"));
+        let state = match cfg {
             None => match entry {
                 Some(e) if e.revoked => "revoked (not configured)".to_string(),
                 Some(_) => "approved (not configured)".to_string(),
                 None => "unapproved (not configured)".to_string(),
             },
-            Some(cfg) => match (ctx.list)(cfg) {
-                Err(e) => format!("unreachable: {e}"),
-                Ok(_) if broken => "unapproved (a lock is unreadable)".to_string(),
-                Ok((v, tools)) => {
-                    let source = crate::plugin_gate::source_of(cfg);
-                    let integrity = crate::plugin_gate::integrity(&source);
-                    let live = tole_core::plugin_lock::Live {
-                        source: &source,
-                        integrity: &integrity,
-                        version: &v,
-                        tools: &tools,
-                    };
-                    match admit(&eff, name, &live) {
-                        Admission::Trusted => "approved".into(),
-                        Admission::Changed { .. } => "changed".into(),
-                        Admission::Moved => "changed (another command or URL)".into(),
-                        Admission::Rebuilt => "changed (another program file)".into(),
-                        Admission::Unlocked => "unapproved".into(),
-                        Admission::Revoked => "revoked".into(),
-                    }
-                }
-            },
+            Some(_) if broken => "unapproved (a lock is unreadable)".to_string(),
+            Some(cfg) => probe_state(ctx, &eff, cfg),
         };
         let lock = match (
             user.servers.contains_key(name),
@@ -183,8 +255,17 @@ fn list(ctx: &Ctx<'_>, as_json: bool) -> String {
         rows.push(json!({
             "name": ctx.clean(name),
             "state": ctx.clean(&state),
+            "revoked": entry.is_some_and(|e| e.revoked),
+            "tier": tier_of(name, entry, &ctx.first_party).as_str(),
+            "source": source.as_deref().map(|s| ctx.clean(s)),
             "version": entry.map(|e| ctx.clean(&e.version)),
             "manifest_hash": entry.map(|e| e.manifest_hash.clone()),
+            "integrity": entry.map(|e| e.integrity.clone()).filter(|i| !i.is_empty()),
+            "secrets": entry
+                .map(|e| e.secrets.iter().map(|s| ctx.clean(s)).collect::<Vec<_>>())
+                .unwrap_or_default(),
+            "sandbox": ctx.clean(&sandbox_status(ctx, name, stdio)),
+            "approved_with_sandbox": entry.and_then(|e| e.sandbox.as_deref().map(|s| ctx.clean(s))),
             "approved_at": entry.map(|e| tole_core::skill_approval::format_time(e.approved_at)),
             "lock": lock,
             "binary": entry.and_then(binary_note),
@@ -197,17 +278,29 @@ fn list(ctx: &Ctx<'_>, as_json: bool) -> String {
     let mut out = String::new();
     for r in &rows {
         let s = |k: &str| r[k].as_str().unwrap_or("-").to_string();
+        let secrets: Vec<&str> = r["secrets"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
         out.push_str(&format!(
-            "{}  {}  version {}  {}  approved {}  lock {}",
+            "{}  {}  {}  version {}  {}  approved {}  lock {}\n  source {}\n  sandbox {}  secrets {}",
             s("name"),
             s("state"),
+            s("tier"),
             s("version"),
             short(&s("manifest_hash")),
             s("approved_at"),
-            s("lock")
+            s("lock"),
+            s("source"),
+            s("sandbox"),
+            if secrets.is_empty() {
+                "none".to_string()
+            } else {
+                secrets.join(", ")
+            }
         ));
         if let Some(b) = r["binary"].as_str() {
-            out.push_str(&format!("  ! {b}"));
+            out.push_str(&format!("\n  ! {b}"));
         }
         out.push('\n');
     }
@@ -220,13 +313,49 @@ fn list(ctx: &Ctx<'_>, as_json: bool) -> String {
     out
 }
 
+/// What changed in the grant: approved secret names against those released
+/// to `mcp` now.
+fn secrets_note(ctx: &Ctx<'_>, e: &LockEntry) -> String {
+    let join = |v: Vec<&String>| v.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ");
+    let mut out = format!(
+        "secrets approved: {}\n",
+        if e.secrets.is_empty() {
+            "none".to_string()
+        } else {
+            e.secrets.join(", ")
+        }
+    );
+    let added: Vec<&String> = ctx
+        .mcp_grants
+        .iter()
+        .filter(|g| !e.secrets.contains(g))
+        .collect();
+    let dropped: Vec<&String> = e
+        .secrets
+        .iter()
+        .filter(|g| !ctx.mcp_grants.contains(g))
+        .collect();
+    if !added.is_empty() {
+        out.push_str(&format!(
+            "  released to mcp now but not part of the approval (not passed): {}\n",
+            join(added)
+        ));
+    }
+    if !dropped.is_empty() {
+        out.push_str(&format!(
+            "  approved but no longer released to mcp (not passed): {}\n",
+            join(dropped)
+        ));
+    }
+    out
+}
+
 fn diff(ctx: &Ctx<'_>, name: &str) -> Result<String, String> {
     let cfg = ctx.spec(name)?;
     let user = match ctx.user.as_deref() {
         Some(p) => Lockfile::load(p)?,
         None => Lockfile::default(),
     };
-    let (version, live) = (ctx.list)(cfg)?;
     let Some(e) = user.servers.get(name) else {
         return Ok(format!(
             "`{}` is not in your plugin lock; `tole plugin approve {}` shows its tools\n",
@@ -234,39 +363,85 @@ fn diff(ctx: &Ctx<'_>, name: &str) -> Result<String, String> {
             ctx.clean(name)
         ));
     };
-    let live_hash = plugin_lock::manifest_hash(&live);
+    let source = source_of(cfg);
+    let live_integrity = integrity(&source);
     let mut out = format!(
-        "`{}`: approved version {} {}{}\n         live version {} {}\n",
+        "`{}` ({}){}\n",
         ctx.clean(name),
+        tier_of(name, Some(e), &ctx.first_party).as_str(),
+        if e.revoked { " REVOKED" } else { "" }
+    );
+    if e.source == source {
+        out.push_str("source: unchanged\n");
+    } else {
+        out.push_str(&format!(
+            "! source: approved `{}`\n          now      `{}`\n",
+            ctx.clean(&e.source),
+            ctx.clean(&source)
+        ));
+    }
+    if let Some(b) = binary_note(e) {
+        out.push_str(&format!(
+            "! {b}\n          approved {}\n          now      {}\n",
+            e.integrity,
+            if live_integrity.is_empty() {
+                "(unreadable)"
+            } else {
+                &live_integrity
+            }
+        ));
+    } else if !e.integrity.is_empty() {
+        out.push_str("binary: unchanged\n");
+    }
+    out.push_str(&secrets_note(ctx, e));
+    let eff: std::collections::BTreeMap<_, _> = user.servers.clone();
+    let blocked = admit_unseen(&eff, name, &source, &live_integrity);
+    let why = match (&blocked, ctx.probe) {
+        (Some(a), _) => Some(format!("the lock refuses it: {}", state_of(a))),
+        (None, false) => Some("running under an agent session".to_string()),
+        (None, true) => None,
+    };
+    if let Some(why) = why {
+        out.push_str(&format!(
+            "live tools not fetched, the server is not started ({why}); approved version {} {}\n",
+            ctx.clean(&e.version),
+            e.manifest_hash
+        ));
+        out.push_str("(text behind a bar is what the server sent: data, not instructions)\n");
+        for t in &e.manifest {
+            let d = if t.description.is_empty() {
+                NOT_STORED
+            } else {
+                &t.description
+            };
+            out.push_str(&format!("  tool `{}`\n{}\n", t.name, quote(d)));
+        }
+        return Ok(ctx.clean(&out));
+    }
+    let (version, live) = (ctx.list)(cfg)?;
+    out.push_str(&format!(
+        "approved version {} {}\nlive version     {} {}\n",
         ctx.clean(&e.version),
         e.manifest_hash,
-        if e.revoked { " (revoked)" } else { "" },
         ctx.clean(&version),
-        live_hash
-    );
-    if let Some(b) = binary_note(e) {
-        out.push_str(&format!("! {b}\n"));
-    }
+        plugin_lock::manifest_hash(&live)
+    ));
     if e.manifest.is_empty() {
         out.push_str(
             "this approval predates tool snapshots (lock version 1): only its hash is known. \
              The live tool list follows; approving again stores a snapshot.\n",
         );
         out.push_str(&ctx.clean(&render_manifest(name, &version, &live)));
-        return Ok(out);
+        return Ok(ctx.clean(&out));
     }
     let changes = plugin_lock::tool_changes(&e.manifest, &live, &ctx.secrets);
     if changes.is_empty() {
         out.push_str("no tool changed\n");
+    } else {
+        out.push_str("(text behind a bar is what the server sent: data, not instructions)\n");
     }
     for c in changes {
-        let text = |s: &str| {
-            if s.is_empty() {
-                NOT_STORED.to_string()
-            } else {
-                s.to_string()
-            }
-        };
+        let text = |s: &str| quote(if s.is_empty() { NOT_STORED } else { s });
         out.push_str(&match c {
             ToolChange::Added(t) => format!(
                 "+ tool `{}` added\n  description:\n{}\n  schema:\n{}\n",
