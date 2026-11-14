@@ -35,9 +35,13 @@ pub mod hooks;
 pub mod ledger_file;
 pub mod machine_guard;
 pub mod owner_only;
+pub mod plugin;
+// `plugin/` holds these modules; the re-exports keep the old top-level paths working.
+#[doc(inline)]
 #[cfg(feature = "mcp")]
-pub mod plugin_cmd;
-pub mod plugin_gate;
+pub use plugin::cmd as plugin_cmd;
+#[doc(inline)]
+pub use plugin::gate as plugin_gate;
 pub mod profile;
 pub mod protocol;
 pub mod provider_chain;

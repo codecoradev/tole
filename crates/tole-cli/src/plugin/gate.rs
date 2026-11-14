@@ -369,5 +369,5 @@ pub fn preflight(
 }
 
 #[cfg(test)]
-#[path = "plugin_gate_tests.rs"]
+#[path = "gate_tests.rs"]
 mod tests;
