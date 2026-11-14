@@ -5,6 +5,14 @@
 //! queries run in RAM. Writes append one physical line per commit (an array
 //! line groups one atomic transaction); a torn final line is discarded whole.
 //!
+//! **Redacted at the seam (#596):** every entry payload, and the pinned
+//! system prompt, is redacted with the process [`SecretSet`] before its line
+//! is written, and the committed in-memory entry is that same redacted
+//! form. The provider is fed from these entries, so the log stores exactly
+//! what the provider saw and a replay reproduces it. An entry that hid a
+//! secret carries `"redacted": ["NAME", ...]` on the wire (names only).
+//! Older logs, written raw, load unchanged; nothing is rewritten.
+//!
 //! See `docs/architecture.md` §4 for the format rationale and the full line
 //! grammar. Format versions are bumped only on breaking changes; opening a
 //! file written by a **newer** format version is a hard error (refuse to
@@ -19,8 +27,9 @@
 //! ```
 
 use std::collections::BTreeMap;
-use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::ffi::{OsStr, OsString};
+use std::fs::File;
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -29,6 +38,8 @@ use serde_json::Value;
 
 use crate::entry::{Entry, EntryType, NewEntry};
 use crate::register::{is_valid_namespace, RegisterOp, RegisterWrite};
+use crate::safe_dir::{Mode, SafeDir};
+use crate::secrets::SecretSet;
 use crate::state::{MachineState, Pc, StateTransition};
 use crate::STORAGE_VERSION;
 
@@ -183,6 +194,14 @@ pub trait Storage {
         None
     }
 
+    /// The secrets this session's entries are redacted with (#596). The
+    /// turn loop redacts the live observer events with the same set (#677),
+    /// so a live preview never shows what the log hides. Default: the
+    /// process set.
+    fn egress_secrets(&self) -> SecretSet {
+        crate::secrets::process_secrets()
+    }
+
     /// In-memory snapshot of the machine state (pc + seq).
     fn state(&self) -> MachineState;
 
@@ -282,6 +301,10 @@ enum Record {
         entry_type: String,
         timestamp: u64,
         payload: Value,
+        /// Names of the secrets this entry's payload hid (#596); absent in
+        /// older logs and when nothing was redacted.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        redacted: Vec<String>,
     },
     #[serde(rename = "register")]
     Register {
@@ -350,11 +373,17 @@ pub fn is_valid_session_id(id: &str) -> bool {
 pub struct JsonlStorage {
     session_id: String,
     path: PathBuf,
+    /// The session directory, held without following a symlink (#639), and
+    /// the file's name in it: every later open, rename and sync goes through
+    /// the handle, so swapping a directory on `path` for a link cannot
+    /// redirect the session file, its sidecar or the compaction temp file.
+    dir: SafeDir,
+    file_name: OsString,
     writer: BufWriter<File>,
     /// Exclusive advisory lock on the sidecar `<id>.jsonl.lock` (never
     /// renamed, so it survives `compact()`); `None` for read-only handles.
     /// Released by the OS on drop or crash.
-    _lock: Option<File>,
+    _lock: Option<WriterLock>,
     /// File length after the last append this handle made or replayed;
     /// a mismatch before an append means someone else wrote.
     good_len: u64,
@@ -380,9 +409,49 @@ pub struct JsonlStorage {
     registers: BTreeMap<(String, String), Value>,
     usage: Vec<UsageRecord>,
     state: MachineState,
+    /// Per entry id, the names its payload hid (kept for `compact()`).
+    redacted: BTreeMap<String, Vec<String>>,
+    /// The redaction set; `None`: the process set, read per commit.
+    secrets: Option<SecretSet>,
+}
+
+/// The redacted form of an entry payload and the names of the secrets it
+/// hid (#596). Every string is redacted structurally, keys included (and a
+/// secret that is a bare number becomes the marker string), in every form
+/// the set knows: as is, JSON-escaped, base64 and percent-encoded.
+fn redact_payload(set: &SecretSet, payload: &Value) -> (Value, Vec<String>) {
+    if set.is_empty() {
+        return (payload.clone(), Vec::new());
+    }
+    let out = set.redact_value(payload);
+    if out == *payload {
+        return (out, Vec::new());
+    }
+    let (before, after) = (payload.to_string(), out.to_string());
+    let names = set
+        .names()
+        .into_iter()
+        .filter(|n| {
+            let m = format!("«{n}»");
+            after.matches(&m).count() > before.matches(&m).count()
+        })
+        .map(str::to_string)
+        .collect();
+    (out, names)
 }
 
 impl JsonlStorage {
+    /// Redacts with `set` instead of the process set (tests, embedders).
+    pub fn set_secrets(&mut self, set: SecretSet) {
+        self.secrets = Some(set);
+    }
+
+    fn redaction_set(&self) -> SecretSet {
+        self.secrets
+            .clone()
+            .unwrap_or_else(crate::secrets::process_secrets)
+    }
+
     /// Creates a new session file (fails if the path already exists).
     pub fn create(
         dir: impl AsRef<Path>,
@@ -436,9 +505,17 @@ impl JsonlStorage {
                 format!("invalid session id: {session_id:?}"),
             )));
         }
-        let path = dir.as_ref().join(format!("{session_id}.jsonl"));
+        let file_name = OsString::from(format!("{session_id}.jsonl"));
+        let path = dir.as_ref().join(&file_name);
+        // Resolved once; every file below is opened relative to it (#639).
+        let dir_h = SafeDir::open(dir.as_ref())?;
         let created_at = now_ms();
         let cwd = cwd.unwrap_or_default();
+        // The pinned prompt is re-sent on resume: store what the provider
+        // is shown (#596).
+        let system_prompt =
+            system_prompt.map(|p| crate::secrets::process_secrets().redact(p).into_owned());
+        let system_prompt = system_prompt.as_deref();
         let header = HeaderLine {
             v: 1,
             kind: "header".into(),
@@ -450,19 +527,24 @@ impl JsonlStorage {
             name: name.map(str::to_string),
             forked_from: forked_from.clone(),
         };
-        let mut writer = BufWriter::new(
-            OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)?,
-        );
-        let lock = lock_writer(&path)?;
+        let mut writer = BufWriter::new(open_in(
+            &dir_h,
+            &file_name,
+            Mode {
+                write: true,
+                create_new: true,
+                ..Mode::default()
+            },
+        )?);
+        let lock = lock_writer(&dir_h, &file_name)?;
         let header_line = serde_json::to_string(&header)?;
         writeln!(writer, "{header_line}")?;
         writer.flush()?;
         Ok(Self {
             session_id,
             path,
+            dir: dir_h,
+            file_name,
             writer,
             _lock: Some(lock),
             good_len: header_line.len() as u64 + 1,
@@ -477,6 +559,8 @@ impl JsonlStorage {
             registers: BTreeMap::new(),
             usage: Vec::new(),
             state: MachineState::default(),
+            redacted: BTreeMap::new(),
+            secrets: None,
             poisoned: None,
             syncs: 0,
         })
@@ -575,8 +659,23 @@ impl JsonlStorage {
     ///
     /// Older format versions replay cleanly; a newer version is a hard
     /// error. A torn final line (crash mid-append) is discarded whole.
+    ///
+    /// The file is opened once: the replay, the torn-tail repair and every
+    /// later append use that one handle, never the path again. On unix the
+    /// open does not follow a symlink at the last path component and does
+    /// not block on a FIFO, and the handle must be a regular file, so a
+    /// file swapped between a caller's check and this open is refused here
+    /// (#581).
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
-        Self::open_with(path.as_ref(), true)
+        Self::open_with(path.as_ref(), true, None)
+    }
+
+    /// [`JsonlStorage::open`] for a session file in a directory another
+    /// process can write (a cron job's workdir, #581): also refuses a file
+    /// longer than `max_bytes`, checked on the opened handle, and stops
+    /// reading at the cap if the file grows during the replay.
+    pub fn open_bounded(path: impl AsRef<Path>, max_bytes: u64) -> Result<Self, StorageError> {
+        Self::open_with(path.as_ref(), true, Some(max_bytes))
     }
 
     /// Replays a session file for READING only (listings, status): a torn
@@ -584,20 +683,45 @@ impl JsonlStorage {
     /// reader can never cut a line another process is still appending
     /// (scan 2026-10-28). Do not commit through the result.
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self, StorageError> {
-        Self::open_with(path.as_ref(), false)
+        Self::open_with(path.as_ref(), false, None)
     }
 
-    fn open_with(path: &Path, repair: bool) -> Result<Self, StorageError> {
+    fn open_with(path: &Path, repair: bool, cap: Option<u64>) -> Result<Self, StorageError> {
         let path = path.to_path_buf();
+        // The directory is resolved once and held without following a link
+        // (#639); the session file and its sidecar open relative to it.
+        let (dir_h, file_name) = SafeDir::for_file(&path)?;
         // Lock BEFORE reading or repairing: the torn-tail truncation below
         // would cut a line another process is still appending.
         let lock = if repair {
-            Some(lock_writer(&path)?)
+            Some(lock_writer(&dir_h, &file_name)?)
         } else {
             None
         };
-        let file = File::open(&path)?;
-        let mut reader = BufReader::new(file);
+        // One handle for the whole life of this storage. Read-only replays
+        // get a read-only handle: a commit through them fails instead of
+        // writing.
+        let file = open_in(
+            &dir_h,
+            &file_name,
+            Mode {
+                read: true,
+                append: repair,
+                ..Mode::default()
+            },
+        )?;
+        let too_large =
+            |cap: u64| StorageError::Invalid(format!("session file larger than {cap} bytes"));
+        if let Some(cap) = cap {
+            if file.metadata()?.len() > cap {
+                return Err(too_large(cap));
+            }
+        }
+        // The reader is a duplicate of the handle (same open file); appends
+        // go to the end whatever the read offset. Reading stops one byte past
+        // the cap, so a file that grows during the replay is caught below.
+        let limit = cap.map_or(u64::MAX, |c| c.saturating_add(1));
+        let mut reader = BufReader::new(file.try_clone()?.take(limit));
 
         // Header (line 1, mandatory). Read with read_until: a header line
         // WITHOUT its trailing newline (crash mid-header-write) is a torn
@@ -644,14 +768,9 @@ impl JsonlStorage {
         let mut out = Self {
             session_id: header.id.clone(),
             path: path.clone(),
-            // Read-only replays get a read-only handle: a commit through
-            // them fails instead of writing.
-            writer: BufWriter::new(
-                OpenOptions::new()
-                    .append(repair)
-                    .read(!repair)
-                    .open(&path)?,
-            ),
+            dir: dir_h,
+            file_name,
+            writer: BufWriter::new(file),
             _lock: lock,
             good_len: 0,
             created_at: header.created_at,
@@ -665,6 +784,8 @@ impl JsonlStorage {
             registers: BTreeMap::new(),
             usage: Vec::new(),
             state: MachineState::default(),
+            redacted: BTreeMap::new(),
+            secrets: None,
             poisoned: None,
             syncs: 0,
         };
@@ -741,9 +862,18 @@ impl JsonlStorage {
         // A torn tail was discarded during replay. Physically truncate the
         // partial bytes NOW, before the append handle concatenates a new
         // commit line onto the fragment (would corrupt the file forever).
-        if repair && good_bytes < file_len(&out.path)? {
-            truncate_file(&out.path, good_bytes)?;
-            sync_dir(&out.path)?;
+        if let Some(cap) = cap {
+            if reader.get_ref().limit() == 0 {
+                return Err(too_large(cap));
+            }
+        }
+        // Through the handle, not the path: the file truncated is the one
+        // replayed.
+        let handle = out.writer.get_ref();
+        if repair && good_bytes < handle.metadata()?.len() {
+            handle.set_len(good_bytes)?;
+            handle.sync_data()?;
+            out.dir.sync()?;
         }
         // The global seq advances with every record, transition or not.
         out.state.seq = out.state.seq.max(last_seq);
@@ -761,7 +891,11 @@ impl JsonlStorage {
                 entry_type,
                 timestamp,
                 payload,
+                redacted,
             } => {
+                if !redacted.is_empty() {
+                    self.redacted.insert(id.clone(), redacted.clone());
+                }
                 let idx = self.entries.len();
                 self.entries.push(Entry {
                     seq: *seq,
@@ -886,11 +1020,12 @@ impl JsonlStorage {
         &self,
         c: &Commit,
         committed: &[Entry],
+        names: &[Vec<String>],
         seq_after_entries: u64,
     ) -> Result<(String, u64), StorageError> {
         let mut records: Vec<Record> = Vec::new();
         let mut next = seq_after_entries;
-        for e in committed {
+        for (e, redacted) in committed.iter().zip(names) {
             records.push(Record::Entry {
                 seq: e.seq,
                 id: e.id.clone(),
@@ -898,6 +1033,7 @@ impl JsonlStorage {
                 entry_type: e.kind.as_str().to_string(),
                 timestamp: e.timestamp,
                 payload: e.payload.clone(),
+                redacted: redacted.clone(),
             });
         }
         for w in &c.registers {
@@ -943,7 +1079,7 @@ impl JsonlStorage {
 
 /// Returns `true` when the reader is at EOF (used to classify a parse
 /// failure on the final line as a torn write rather than corruption).
-fn is_at_eof(reader: &mut BufReader<File>) -> bool {
+fn is_at_eof(reader: &mut impl Read) -> bool {
     let mut probe = [0u8; 1];
     matches!(reader.read(&mut probe), Ok(0))
 }
@@ -952,71 +1088,141 @@ fn is_at_eof(reader: &mut BufReader<File>) -> bool {
 /// our pid in it (best effort). A sidecar, not the session file: `compact()`
 /// renames a new file over the live path, which would drop a lock held on
 /// the old inode.
-fn lock_writer(path: &Path) -> Result<File, StorageError> {
-    let mut name = path.as_os_str().to_owned();
+fn lock_writer(dir: &SafeDir, file_name: &OsStr) -> Result<WriterLock, StorageError> {
+    let mut name = file_name.to_owned();
     name.push(".lock");
-    #[cfg(unix)]
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let mut b = OpenOptions::new();
-    b.read(true).write(true).create(true).truncate(false);
-    #[cfg(unix)]
-    {
-        // CLOEXEC: a spawned child must not inherit the writer lock. Without
-        // it, an flock held on the fd survives into every child until it
-        // exits (run_command, job_start, nohup-style wrappers), and a later
-        // `resume` is refused with a pid that no longer holds the session.
-        b.custom_flags(libc::O_CLOEXEC);
-    }
-    let mut f = b.open(Path::new(&name))?;
-    match f.try_lock() {
-        Ok(()) => {
-            // The pid is advisory text; a failed write never blocks the open.
-            let _ = f
-                .set_len(0)
-                .and_then(|()| write!(f, "{}", std::process::id()));
-            Ok(f)
+    // CLOEXEC (set by `open_plain`): a spawned child must not inherit the
+    // writer lock. Without it, an flock held on the fd survives into every
+    // child until it exits (run_command, job_start, nohup-style wrappers),
+    // and a later `resume` is refused with a pid that no longer holds the
+    // session. NOFOLLOW and the regular-file check: the pid write below
+    // truncates the file, so a planted symlink must not lead it elsewhere
+    // (#581).
+    let mut f = open_in(
+        dir,
+        &name,
+        Mode {
+            read: true,
+            write: true,
+            create: true,
+            ..Mode::default()
+        },
+    )?;
+    let mut waited = std::time::Duration::ZERO;
+    loop {
+        match f.try_lock() {
+            Ok(()) => {
+                // The pid is advisory text; a failed write never blocks the open.
+                // Rewind first: an earlier attempt read the file, and
+                // `set_len` does not move the cursor, so without this the pid
+                // would land past the old end and the file be NUL-padded.
+                let _ = f
+                    .set_len(0)
+                    .and_then(|()| f.seek(SeekFrom::Start(0)).map(|_| ()))
+                    .and_then(|()| write!(f, "{}", std::process::id()));
+                return Ok(WriterLock::new(f));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                let mut text = String::new();
+                let _ = f.seek(SeekFrom::Start(0));
+                let _ = f.read_to_string(&mut text);
+                let holder: Option<u32> = text.trim().parse().ok();
+                // #552: an flock belongs to the open file description, so a
+                // child forked by ANOTHER thread of this process briefly
+                // holds a duplicate of a descriptor we just closed (until it
+                // execs). A hold that names OUR pid, on a lock no handle of
+                // this process holds, is that transient: retry, bounded
+                // generously (a loaded machine can leave a forked child
+                // unscheduled for seconds, #712). A lock another handle of
+                // this process really holds (#475) and any other holder fail
+                // at once.
+                if holder == Some(std::process::id())
+                    && !in_process_hold(&f)
+                    && waited < SELF_HOLD_RETRY
+                {
+                    std::thread::sleep(SELF_HOLD_STEP);
+                    waited += SELF_HOLD_STEP;
+                    continue;
+                }
+                return Err(StorageError::Locked { holder });
+            }
+            Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
         }
-        Err(std::fs::TryLockError::WouldBlock) => {
-            let mut text = String::new();
-            let _ = f.read_to_string(&mut text);
-            Err(StorageError::Locked {
-                holder: text.trim().parse().ok(),
-            })
-        }
-        Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
     }
 }
 
-/// File length in bytes (used to detect a discarded torn tail on open).
-fn file_len(path: &Path) -> std::io::Result<u64> {
-    Ok(std::fs::metadata(path)?.len())
+/// How long [`lock_writer`] keeps retrying a transient hold that names our
+/// own pid (see #552, #712), in steps of [`SELF_HOLD_STEP`].
+const SELF_HOLD_RETRY: std::time::Duration = std::time::Duration::from_secs(20);
+const SELF_HOLD_STEP: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// The sidecar locks this process holds through a [`WriterLock`], by file
+/// identity. It tells a transient duplicate of a closed descriptor (held by
+/// a child that has not exec'd yet) from a second open in this process.
+fn held_locks() -> &'static std::sync::Mutex<std::collections::HashSet<(u64, u64)>> {
+    static HELD: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<(u64, u64)>>> =
+        std::sync::OnceLock::new();
+    HELD.get_or_init(Default::default)
 }
 
-/// Truncates the file to `len` bytes and fsyncs it.
-fn truncate_file(path: &Path, len: u64) -> std::io::Result<()> {
-    let f = OpenOptions::new().write(true).truncate(false).open(path)?;
-    f.set_len(len)?;
-    f.sync_data()?;
-    Ok(())
+fn lock_identity(f: &File) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    f.metadata().ok().map(|m| (m.dev(), m.ino()))
 }
 
-/// Durability: flush a rename into the parent directory so the directory
-/// entry itself survives a crash. POSIX-only; on non-Unix targets opening
-/// the directory is not possible and we accept the platform's guarantees.
-#[cfg(unix)]
-fn sync_dir(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::ffi::OsStrExt;
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().as_bytes().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    File::open(parent)?.sync_all()
+fn in_process_hold(f: &File) -> bool {
+    lock_identity(f).is_some_and(|k| {
+        held_locks()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&k)
+    })
 }
 
-#[cfg(not(unix))]
-fn sync_dir(_path: &Path) -> std::io::Result<()> {
-    Ok(())
+/// A held writer lock. Dropping it unregisters the lock before the
+/// descriptor closes, so a reopen never mistakes the closing handle for a
+/// live one.
+struct WriterLock {
+    _file: File,
+    key: Option<(u64, u64)>,
+}
+
+impl WriterLock {
+    fn new(file: File) -> Self {
+        let key = lock_identity(&file);
+        if let Some(k) = key {
+            held_locks()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(k);
+        }
+        Self { _file: file, key }
+    }
+}
+
+impl Drop for WriterLock {
+    fn drop(&mut self) {
+        if let Some(k) = self.key {
+            held_locks()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&k);
+        }
+    }
+}
+
+/// Opens `name` in `dir` for a session handle (#581, #639). The open is
+/// relative to the directory handle, so no directory on the way can be a
+/// swapped link; it does not follow a symlink at `name` (`O_NOFOLLOW`) and
+/// does not wait for a FIFO's other end (`O_NONBLOCK`, which has no effect
+/// on a regular file's reads and writes). The handle must be a regular file:
+/// the check is an `fstat` of the opened handle, so the file checked is the
+/// file used.
+fn open_in(dir: &SafeDir, name: &OsStr, mode: Mode) -> Result<File, StorageError> {
+    dir.open_file(name, mode).map_err(|e| match e.kind() {
+        std::io::ErrorKind::InvalidInput => StorageError::Invalid(e.to_string()),
+        _ => StorageError::Io(e),
+    })
 }
 
 fn now_ms() -> u64 {
@@ -1027,6 +1233,10 @@ fn now_ms() -> u64 {
 }
 
 impl Storage for JsonlStorage {
+    fn egress_secrets(&self) -> SecretSet {
+        self.redaction_set()
+    }
+
     fn session_id(&self) -> &str {
         &self.session_id
     }
@@ -1138,6 +1348,9 @@ impl Storage for JsonlStorage {
         // whole by_id index per commit made sessions O(N²) overall.
         let mut new_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut committed: Vec<Entry> = Vec::with_capacity(c.entries.len());
+        // #596: redacted BEFORE encoding; memory keeps the same form.
+        let set = self.redaction_set();
+        let mut names: Vec<Vec<String>> = Vec::with_capacity(c.entries.len());
         let mut next = self.state.seq;
         for e in &c.entries {
             if let Some(p) = &e.parent_id {
@@ -1151,12 +1364,14 @@ impl Storage for JsonlStorage {
             if self.by_id.contains_key(&id) || !new_ids.insert(id.clone()) {
                 return Err(StorageError::Invalid(format!("duplicate entry id: {id}")));
             }
+            let (payload, hid) = redact_payload(&set, &e.payload);
+            names.push(hid);
             committed.push(Entry {
                 seq: next,
                 id,
                 parent_id: e.parent_id.clone(),
                 kind: e.kind.clone(),
-                payload: e.payload.clone(),
+                payload,
                 timestamp: if e.timestamp == 0 {
                     now_ms()
                 } else {
@@ -1166,11 +1381,14 @@ impl Storage for JsonlStorage {
         }
 
         // Encode + append (single physical line = atomic transaction).
-        let (line, final_seq) = self.encode_commit(&c, &committed, next)?;
+        let (line, final_seq) = self.encode_commit(&c, &committed, &names, next)?;
         self.append_line(&line, !c.defer_sync)?;
 
         // Apply to memory only after the byte hit the file.
-        for e in committed.iter() {
+        for (e, hid) in committed.iter().zip(names) {
+            if !hid.is_empty() {
+                self.redacted.insert(e.id.clone(), hid);
+            }
             let idx = self.entries.len();
             self.entries.push(e.clone());
             if let Some(p) = &e.parent_id {
@@ -1224,6 +1442,7 @@ impl Storage for JsonlStorage {
                 entry_type: e.kind.as_str().to_string(),
                 timestamp: e.timestamp,
                 payload: e.payload.clone(),
+                redacted: self.redacted.get(&e.id).cloned().unwrap_or_default(),
             });
         }
         for ((ns, k), v) in &self.registers {
@@ -1255,9 +1474,20 @@ impl Storage for JsonlStorage {
 
         // Write to temp file, fsync, then atomic rename over the live path,
         // then fsync the directory so the rename itself survives a crash.
-        let tmp = self.path.with_extension("jsonl.tmp");
+        let tmp = PathBuf::from(&self.file_name).with_extension("jsonl.tmp");
         {
-            let mut w = BufWriter::new(File::create(&tmp)?);
+            // Never through a symlink planted at the temp path (#581), and
+            // in the held directory whatever happened to the path (#639).
+            let mut w = BufWriter::new(open_in(
+                &self.dir,
+                tmp.as_os_str(),
+                Mode {
+                    write: true,
+                    create: true,
+                    truncate: true,
+                    ..Mode::default()
+                },
+            )?);
             let header = HeaderLine {
                 v: 1,
                 kind: "header".into(),
@@ -1276,22 +1506,31 @@ impl Storage for JsonlStorage {
             w.flush()?;
             w.get_ref().sync_data()?;
         }
-        std::fs::rename(&tmp, &self.path)?;
-        sync_dir(&self.path)?;
+        self.dir.rename(tmp.as_os_str(), &self.file_name)?;
+        self.dir.sync()?;
         // Reopen the writer on the new file. If THIS reopen fails, the
         // rename has already happened: the old writer now points at an
         // unlinked inode, so any further commit would vanish silently.
         // Mark the session poisoned — every subsequent commit fails
         // LOUDLY instead of losing data (CodeCora scan-3: silent loss).
-        self.writer = BufWriter::new(match OpenOptions::new().append(true).open(&self.path) {
-            Ok(w) => w,
-            Err(e) => {
-                self.poisoned = Some(StorageError::Invalid(format!(
-                    "compact(): reopen after rename failed: {e}"
-                )));
-                return Err(e.into());
-            }
-        });
+        self.writer = BufWriter::new(
+            match open_in(
+                &self.dir,
+                &self.file_name,
+                Mode {
+                    append: true,
+                    ..Mode::default()
+                },
+            ) {
+                Ok(w) => w,
+                Err(e) => {
+                    self.poisoned = Some(StorageError::Invalid(format!(
+                        "compact(): reopen after rename failed: {e}"
+                    )));
+                    return Err(e);
+                }
+            },
+        );
         self.good_len = self.writer.get_ref().metadata()?.len();
         self.state.seq = seq;
         // The file was atomically rewritten from COMPLETE records only —
@@ -1310,6 +1549,7 @@ mod poison_tests {
     use super::*;
     use crate::entry::{EntryType, NewEntry};
     use serde_json::json;
+    use std::fs::OpenOptions;
 
     /// Unique per invocation: pid alone collides across concurrent or
     /// pid-reusing runs sharing the temp dir.

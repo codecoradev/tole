@@ -19,10 +19,45 @@ scenarios complete in **< 50 ms** — the budgets are ~40× above observed,
 so a failure means a real regression (e.g. an accidental O(n²) on the
 transcript path), never machine noise.
 
+## Automation ledger (#578, 2026-11-11)
+
+| Scenario | Budget | What it covers |
+|---|---|---|
+| Fold of a 100k-record ledger (10k `job` + 30k × `fire`/`done`/`delivery`) | < 30,000 ms | opening the append-only automation log — the cost every `tole cron tick` pays |
+| `ready(now)` over 10k jobs | < 2,000 ms | computing what is due, including the catch-up spans |
+
+Observed on the dev container (Linux x86_64): fold **~1.2–1.4 s** in the
+unoptimized test build that CI runs, **~220 ms** in release (≈2.2 µs per
+record; 200k records ≈ 510 ms, so linear); `ready` over 10k jobs **~16 ms**
+unoptimized, **~6–8 ms** release. The fold budget is ~20× the unoptimized
+observation: it exists to catch complexity regressions (an O(n²) fold of
+100k records would take minutes), not to race.
+
+## Secret redaction (#681, 2026-11-14)
+
+`SecretSet::redact` is a byte scan over every needle form of every known
+value. #681 added the embedded-base64, hex and `\/` / `\uXXXX` forms (up to 24
+needles per value, was 8) and a second scan for text that holds an invisible
+character. Measured with `cargo test -p tole-core --release --lib
+secrets::tests::throughput -- --ignored --nocapture` (5 secrets, mixed
+source-like text, Linux x86_64):
+
+| Text | Before | After |
+|---|---|---|
+| 4 KiB | 480 MB/s | 350 MB/s |
+| 64 KiB | 659 MB/s | 346 MB/s |
+| 1 MiB | 664 MB/s | 346 MB/s |
+
+A set with no secrets stays a borrowed no-op, and text without invisible
+characters is scanned once (the check reads UTF-8 bytes, no decoding). The
+unit test `a_large_text_with_invisible_characters_is_still_linear` redacts
+4 MiB that carries one in every line, as a guard against a quadratic path.
+
 ## Method
 
 - `crates/tole-core/tests/perf_threshold.rs` — deterministic, no timing
-  flakiness mitigation needed at the 40× margin.
+  flakiness mitigation needed at the 40× margin (the ledger fold gate keeps
+  ~20× over the unoptimized build; see above).
 - If a budget must move, change it HERE and in the test in the same PR,
   with the measurement that justifies it.
 
@@ -43,5 +78,25 @@ transcript path), never machine noise.
 
 ## Cross-build CI
 
-`aarch64-apple-ios` (macos-14) + `aarch64-linux-android` (ubuntu + NDK)
-compile-checks per PR (`cross-compile` job) since #82.
+`aarch64-linux-android` (ubuntu + NDK) compile-checks per PR (`cross-compile`
+job) since #82. The `aarch64-apple-ios` (macos-14) check is commented out in
+`ci.yml` until an Apple runner is available to this repository.
+
+## Binary size and dependencies
+
+Reported, not gated. Release build of `tole` (`cargo build --release -p
+tole-cli`, Linux x86_64), unique crates from `cargo tree -e normal --prefix
+none | sort -u | wc -l`.
+
+| Build (2026-11-13) | `tole` bytes | tole-cli crates | tole-core crates (`--no-default-features`) |
+|---|---|---|---|
+| develop before #625 | 18,184,632 | 264 | 58 |
+| #625, without `web-builtin` | 18,185,208 | 264 | 58 |
+| #625, default (`web-builtin`) | 19,482,712 (+1,297,504, +7.1%) | 299 (30 distinct new crates; 4 build-time proc-macros) | 58 |
+
+The crate counts were measured again after develop moved on (the #588
+discussion ledger landed) and did not change. The `web-builtin` delta is
+nginjen-lite and its `scraper` HTML stack
+(html5ever, cssparser, selectors, phf, string_cache, tendril and helpers).
+A slim build turns it off with `--no-default-features --features
+shell-tools,mcp,mcp-http,tui`.

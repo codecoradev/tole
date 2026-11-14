@@ -76,8 +76,8 @@ jobs:
       - name: Require the review secrets
         env:
           CORA_API_KEY: ${{ secrets.CORA_API_KEY }}
-          CORA_BASE_URL: ${{ secrets.CORA_BASE_URL }}
-          CORA_MODEL: ${{ secrets.CORA_MODEL }}
+          CORA_BASE_URL: ${{ secrets.CORA_BASE_URL || vars.CORA_BASE_URL }}
+          CORA_MODEL: ${{ secrets.CORA_MODEL || vars.CORA_MODEL }}
         run: |
           # No federation token: the stored secrets are required. An empty secret
           # must fail the job: a skipped or fallback review is not a pass.
@@ -93,6 +93,31 @@ jobs:
           done
           exit "$missing"
 
+      # Show which endpoint and model the review runs on. The API key and the
+      # access token are never passed to this step. The expressions mirror the
+      # inputs of the review step below: change both together.
+      # GitHub masks every secret value in logs and summaries, so a base URL
+      # or model stored as a SECRET shows as *** here. Store CORA_BASE_URL and
+      # CORA_MODEL as repository VARIABLES to see them (a secret of the same
+      # name still wins, as before).
+      - name: Show the review endpoint and model
+        env:
+          VIA: ${{ env.ACCESS_TOKEN && 'workload identity federation' || 'stored CORA_* secrets' }}
+          BASE_URL: ${{ env.ACCESS_TOKEN && 'https://api.anthropic.com/v1' || secrets.CORA_BASE_URL || vars.CORA_BASE_URL }}
+          MODEL: ${{ env.ACCESS_TOKEN && (secrets.ANTHROPIC_MODEL || vars.ANTHROPIC_MODEL || 'claude-opus-5-5') || secrets.CORA_MODEL || vars.CORA_MODEL }}
+        run: |
+          # Endpoint without userinfo, query or fragment: scheme://host/path.
+          endpoint=$(printf '%s' "$BASE_URL" | sed -E 's|^([A-Za-z][A-Za-z0-9+.-]*://)([^/@]*@)?([^?#]*).*|\1\3|')
+          echo "Cora review runs via $VIA"
+          echo "  endpoint: ${endpoint:-<not set>}"
+          echo "  model:    ${MODEL:-<not set>}"
+          {
+            echo "### Cora review"
+            echo "- via: $VIA"
+            echo "- endpoint: \`${endpoint:-not set}\`"
+            echo "- model: \`${MODEL:-not set}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Checkout PR head
         uses: actions/checkout@v7
         with:
@@ -106,5 +131,5 @@ jobs:
           # With a federation token, key, base URL and model switch together so the
           # token is only ever sent to api.anthropic.com.
           cora-api-key: ${{ env.ACCESS_TOKEN || secrets.CORA_API_KEY }}
-          cora-base-url: ${{ env.ACCESS_TOKEN && 'https://api.anthropic.com/v1' || secrets.CORA_BASE_URL }}
-          cora-model: ${{ env.ACCESS_TOKEN && (secrets.ANTHROPIC_MODEL || vars.ANTHROPIC_MODEL || 'claude-opus-5-5') || secrets.CORA_MODEL }}
+          cora-base-url: ${{ env.ACCESS_TOKEN && 'https://api.anthropic.com/v1' || secrets.CORA_BASE_URL || vars.CORA_BASE_URL }}
+          cora-model: ${{ env.ACCESS_TOKEN && (secrets.ANTHROPIC_MODEL || vars.ANTHROPIC_MODEL || 'claude-opus-5-5') || secrets.CORA_MODEL || vars.CORA_MODEL }}

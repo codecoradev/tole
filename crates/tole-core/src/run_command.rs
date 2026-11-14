@@ -29,6 +29,8 @@ pub struct RunCommandTool {
     /// binary itself — a child session bypassing the depth cap via
     /// run_command is the verified escape hatch (2026-10-05).
     pub child_agent_mode: bool,
+    /// The secret release for its children (#598); `None`: the process's.
+    pub release: Option<crate::secret_release::Release>,
 }
 
 impl RunCommandTool {
@@ -36,6 +38,7 @@ impl RunCommandTool {
         Self {
             cwd,
             child_agent_mode: false,
+            release: None,
         }
     }
 
@@ -182,9 +185,18 @@ impl Tool for RunCommandTool {
         if self.child_agent_mode {
             crate::agents::check_child_agent_argv(&argv)?;
         }
+        // #684, every session kind: never the tole binary, never the
+        // session marker.
+        crate::session_guard::check_session_argv(&argv, &self.cwd)?;
         let mut cmd = Command::new(program);
-        // Secret env never reaches children (threat-model ENV-1).
-        crate::subprocess::scrub_env_for_child(&mut cmd);
+        // Secret env never reaches children (threat-model ENV-1) unless a
+        // `[secrets]` entry grants it to `run_command` (#598).
+        let release = self
+            .release
+            .clone()
+            .unwrap_or_else(crate::secret_release::release);
+        crate::subprocess::scrub_env_with(&mut cmd, "run_command", &release);
+        crate::session_guard::mark(&mut cmd);
         cmd.args(&argv[1..]).current_dir(&self.cwd);
         let out = run_with_timeout(&mut cmd, SUBPROCESS_TIMEOUT)?;
         let stdout = String::from_utf8_lossy(&out.stdout);
@@ -479,5 +491,76 @@ mod tests {
         );
         assert!(s.contains("characters omitted"));
         assert_eq!(out["stdout_truncated"], true);
+    }
+
+    /// #598: a command gets no secret by default, `GITHUB_TOKEN` included;
+    /// an explicit grant to `run_command` restores that one token.
+    #[cfg(unix)]
+    #[test]
+    fn a_command_gets_no_secret_unless_one_is_granted_to_run_command() {
+        use crate::secret_release::Release;
+        std::env::set_var("GITHUB_TOKEN", "t598-gh-token-value");
+        std::env::set_var("TOLE_T598_OTHER_TOKEN", "t598-other-value");
+        let out = |t: &RunCommandTool, name: &str| {
+            t.execute(json!({"command": format!("printenv {name}")}))
+                .unwrap()["stdout"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        // The process release (the default here): nothing for commands.
+        let mut t = RunCommandTool::new(std::env::temp_dir());
+        assert_eq!(out(&t, "GITHUB_TOKEN"), "");
+        t.release = Some(Release::default().with(
+            "GITHUB_TOKEN",
+            ["gh", "git", "run_command"].map(String::from),
+        ));
+        assert_eq!(out(&t, "GITHUB_TOKEN").trim(), "t598-gh-token-value");
+        assert_eq!(out(&t, "TOLE_T598_OTHER_TOKEN"), "", "only the granted one");
+    }
+
+    /// #684: the tole binary is refused in EVERY session kind, not only
+    /// child agents (the default tool is a root session's).
+    #[cfg(unix)]
+    #[test]
+    fn root_session_refuses_the_tole_binary() {
+        let dir = std::env::temp_dir().join(format!("tole-rc-684-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = RunCommandTool::new(dir.clone());
+        assert!(!t.child_agent_mode);
+        for line in [
+            "tole cron resume job-1",
+            "env tole cron resume job-1",
+            "sh -c 'tole plugin approve x --hash h'",
+            "env -u TOLE_UNDER_SESSION printenv",
+        ] {
+            let err = t
+                .execute(json!({ "command": line }))
+                .err()
+                .unwrap_or_else(|| panic!("must refuse: {line}"));
+            assert!(err.contains("#684"), "{line}: {err}");
+        }
+        // Ordinary commands that mention the name still run.
+        let ok = t.execute(json!({ "command": "echo tole" })).unwrap();
+        assert_eq!(ok["status"], 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #684: what a session starts carries the marker the owner-only
+    /// subcommands refuse on.
+    #[cfg(unix)]
+    #[test]
+    fn spawned_commands_carry_the_session_marker() {
+        let dir = std::env::temp_dir().join(format!("tole-rc-684m-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = RunCommandTool::new(dir.clone());
+        let out = t
+            .execute(json!({ "command": "sh -c 'printenv | grep ^TOLE_UNDER'" }))
+            .unwrap();
+        assert_eq!(out["status"], 0, "{out}");
+        let env = out["stdout"].as_str().unwrap();
+        assert!(env.lines().any(|l| l == "TOLE_UNDER_SESSION=1"), "{env}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

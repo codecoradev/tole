@@ -148,10 +148,12 @@ pub enum TurnOutcome {
 #[allow(unused_variables)]
 pub trait TurnObserver: Send + Sync {
     /// A tool call passed every gate (approval, hooks, loop guard) and
-    /// is about to execute. `input` is the exact call input.
+    /// is about to execute. `input` is the call input, redacted with the
+    /// session's secrets (#677) like everything an observer receives.
     fn tool_started(&self, tool: &str, input: &Value) {}
     /// The tool settled. `preview` is a short output/error excerpt for
-    /// display — never a replacement for the durable settlement.
+    /// display, redacted before it is cut (#677) — never a replacement for
+    /// the durable settlement.
     fn tool_finished(&self, tool: &str, ok: bool, preview: &str) {}
     /// The model's reasoning for the provider step that just completed,
     /// when the provider supplies one (`Provider::last_reasoning`).
@@ -286,6 +288,21 @@ pub fn resume_turn_with_cancel(
     registry: &ToolRegistry,
     cancel: &CancelToken,
 ) -> Result<TurnOutcome, StorageError> {
+    resume_turn_with_observer(s, p, registry, cancel, None)
+}
+
+/// [`resume_turn_with_cancel`] with a progress observer: the replan loop
+/// reports tool and reasoning events, as [`run_turn_with_observer`] does.
+/// A host that budgets a turn by its observer (cron's step budget, #581)
+/// keeps that budget on a resumed turn. A replayed crash intent is not
+/// reported; only the calls the replan loop makes are.
+pub fn resume_turn_with_observer(
+    s: &mut dyn Storage,
+    p: &mut dyn Provider,
+    registry: &ToolRegistry,
+    cancel: &CancelToken,
+    observer: Option<&dyn TurnObserver>,
+) -> Result<TurnOutcome, StorageError> {
     match resume(s)? {
         Resume::Clean => {
             let pc_now = s.state().pc;
@@ -350,9 +367,9 @@ pub fn resume_turn_with_cancel(
             settle_err(s, &handle, &reason)?;
         }
     }
-    // No observer: recovery is an interactive host flow. `resume_turn`
-    // passes a never-cancelled token; serve passes the session's (#318).
-    drive(s, p, registry, cancel, None)
+    // `resume_turn` passes a never-cancelled token; serve passes the
+    // session's (#318). The observer is the caller's (none for recovery).
+    drive(s, p, registry, cancel, observer)
 }
 
 /// Sets the session-scoped `wrote_this_turn` fact (#143). Shared by the
@@ -483,9 +500,10 @@ pub fn call_fingerprint(tool: &str, input: &Value) -> u64 {
 
 /// Bounded display excerpt for observer events (issue #196): the first
 /// ~200 chars of a tool output/error. Display only — the durable
-/// settlement always carries the full value.
-fn short_preview(v: &impl std::fmt::Display) -> String {
-    let raw = v.to_string();
+/// settlement always carries the full value. `raw` is already redacted
+/// (#677): redact first, then cut, so the cut never leaves part of a
+/// secret.
+fn short_preview(raw: &str) -> String {
     let mut out: String = raw.chars().take(200).collect();
     if raw.chars().count() > 200 {
         out.push('…');
@@ -527,6 +545,8 @@ fn drive(
     cancel: &CancelToken,
     observer: Option<&dyn TurnObserver>,
 ) -> Result<TurnOutcome, StorageError> {
+    // #592: a resumed session keeps the taint of what it fetched before.
+    registry.seed_taint(s.entries());
     // E10 loop guard: fingerprint of the last tool call (tool + canonical
     // input), with its consecutive repeat count. Identical calls are
     // never progress.
@@ -743,7 +763,8 @@ fn drive(
         // effect lands — thought first, action after.
         if let Some(o) = observer {
             if let Some(r) = p.last_reasoning() {
-                o.reasoning(&r);
+                // #677: redacted like the log, as every observer event is.
+                o.reasoning(&s.egress_secrets().redact(&r));
             }
         }
         match next {
@@ -971,8 +992,11 @@ fn drive(
                     // Issue #196 phase 1: every gate has passed (approval,
                     // hooks, loop guard, cancel) — the host sees the card
                     // exactly when real work begins.
-                    if let Some(o) = observer {
-                        o.tool_started(&tool, &input);
+                    // #677: observers (serve SSE, ACP, TUI) get what the log
+                    // gets: the redacted form, redacted before any cut.
+                    let live_secrets = observer.map(|_| s.egress_secrets());
+                    if let (Some(o), Some(set)) = (observer, &live_secrets) {
+                        o.tool_started(&tool, &set.redact_value(&input));
                     }
                     let out = match auth.execute(input) {
                         Ok(o) => o,
@@ -983,8 +1007,8 @@ fn drive(
                             if let Some(i) = &hook_input {
                                 registry.post_hook_notify(&tool, i, false);
                             }
-                            if let Some(o) = observer {
-                                o.tool_finished(&tool, false, &short_preview(&e));
+                            if let (Some(o), Some(set)) = (observer, &live_secrets) {
+                                o.tool_finished(&tool, false, &short_preview(&set.redact(&e)));
                             }
                             settle_err(s, &handle, &e)?;
                             // First failure stops the batch; every remaining
@@ -1008,8 +1032,9 @@ fn drive(
                         wrote = true;
                         record_wrote(s)?;
                     }
-                    if let Some(o) = observer {
-                        o.tool_finished(&tool, true, &short_preview(&out));
+                    if let (Some(o), Some(set)) = (observer, &live_secrets) {
+                        let shown = set.redact_value(&out).to_string();
+                        o.tool_finished(&tool, true, &short_preview(&shown));
                     }
                     // #483: settlement fsync deferred to `finish`'s durable
                     // commit; nothing but the observer callback runs between.

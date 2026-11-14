@@ -53,28 +53,64 @@ fn recv_with_grace<T>(rx: &mpsc::Receiver<T>) -> Option<T> {
 /// means the name contains API_KEY/APIKEY, SECRET, TOKEN, PASSWORD/PASSWD,
 /// CREDENTIAL, or PRIVATE_KEY (case-insensitive substring, so
 /// `SECRET_KEY`, `AUTHTOKEN`, `DB_PASSWD` are covered — #284).
-/// Exceptions: GITHUB_TOKEN is kept — gh/git push
-/// auth needs it, and its scope is documented in the threat model.
+/// The name rule is [`crate::secrets::is_secret_name`], shared with the
+/// egress redactor (#595); a variable whose value is a secret tole knows, or
+/// a URL with a password, is removed too ([`crate::secrets::is_secret_var`],
+/// #682). This form keeps NO secret; tole's own launchers
+/// use [`scrub_env_for`], which keeps what the release grants them (#598).
 pub fn scrub_env_for_child(cmd: &mut Command) -> &mut Command {
-    // TOKENIZERS_PARALLELISM is a non-secret HF tuning knob that the
-    // broader TOKEN match would otherwise sweep up.
-    const KEEP: [&str; 2] = ["GITHUB_TOKEN", "TOKENIZERS_PARALLELISM"];
-    for (k, _) in std::env::vars_os() {
+    scrub_env_keeping(cmd, &|_| false)
+}
+
+/// The ENV-1 scrub for a child started by `consumer` (a tool name such as
+/// `run_command`, or a launcher such as `hook`): it keeps only the secrets
+/// the process's release ([`crate::secret_release::release`]) binds to
+/// `consumer` (#598). `run_command`, `job_start` and `cron` get none by
+/// default, `GITHUB_TOKEN` included.
+pub fn scrub_env_for<'a>(cmd: &'a mut Command, consumer: &str) -> &'a mut Command {
+    scrub_env_with(cmd, consumer, &crate::secret_release::release())
+}
+
+/// [`scrub_env_for`] under an explicit release.
+pub fn scrub_env_with<'a>(
+    cmd: &'a mut Command,
+    consumer: &str,
+    release: &crate::secret_release::Release,
+) -> &'a mut Command {
+    scrub_env_keeping(cmd, &|name| release.allows(name, consumer))
+}
+
+/// The ENV-1 scrub keeping exactly the secrets `keep` accepts (by name).
+/// Launchers with a per-instance grant use it (#679: each MCP server keeps
+/// only its approval's secrets).
+pub fn scrub_env_with_keep<'a>(
+    cmd: &'a mut Command,
+    keep: &dyn Fn(&str) -> bool,
+) -> &'a mut Command {
+    scrub_env_keeping(cmd, keep)
+}
+
+/// [`scrub_env_for_child`] that keeps the secret-shaped names in `keep`
+/// (exact, case-insensitive) and nothing else. Child agents use it to
+/// receive their provider key plus their grant (#595, #598).
+pub fn scrub_env_for_child_keeping<'a>(cmd: &'a mut Command, keep: &[&str]) -> &'a mut Command {
+    scrub_env_keeping(cmd, &|name| {
+        keep.iter().any(|n| n.eq_ignore_ascii_case(name))
+    })
+}
+
+fn scrub_env_keeping<'a>(cmd: &'a mut Command, keep: &dyn Fn(&str) -> bool) -> &'a mut Command {
+    // #682: a variable is also a secret by its value (a URL with a password,
+    // or a value tole holds by role: a webhook key, the serve token, a
+    // `${NAME}` header expansion), whatever it is called.
+    let known = crate::secrets::process_secrets();
+    for (k, v) in std::env::vars_os() {
         let Some(name) = k.to_str() else { continue };
-        let upper = name.to_ascii_uppercase();
-        let secret_shaped = [
-            "API_KEY",
-            "APIKEY",
-            "SECRET",
-            "TOKEN",
-            "PASSWORD",
-            "PASSWD",
-            "CREDENTIAL",
-            "PRIVATE_KEY",
-        ]
-        .iter()
-        .any(|m| upper.contains(m));
-        if secret_shaped && !KEEP.contains(&upper.as_str()) {
+        let secret = match v.to_str() {
+            Some(value) => crate::secrets::is_secret_var(name, value, &known),
+            None => crate::secrets::is_secret_name(name),
+        };
+        if secret && !keep(name) {
             cmd.env_remove(name);
         }
     }
@@ -298,6 +334,19 @@ pub fn check_destructive_argv(argv: &[String]) -> Result<(), String> {
 /// (~64KB) would otherwise block on write while we only poll its status,
 /// and we'd time out on a perfectly valid run.
 pub fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> Result<Output, String> {
+    run_with_timeout_or_cancel(cmd, timeout, &crate::cancel::CancelToken::new())
+}
+
+/// Error text of a child killed because `cancel` was set.
+pub const CANCELLED: &str = "subprocess cancelled and was killed";
+
+/// [`run_with_timeout`] that also kills the child once `cancel` is set
+/// (checked at the same 50 ms poll), returning [`CANCELLED`].
+pub fn run_with_timeout_or_cancel(
+    cmd: &mut Command,
+    timeout: Duration,
+    cancel: &crate::cancel::CancelToken,
+) -> Result<Output, String> {
     use std::process::Stdio;
     cmd.stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -316,6 +365,11 @@ pub fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> Result<Output, 
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {
+                if cancel.is_cancelled() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(CANCELLED.into());
+                }
                 if start.elapsed() > timeout {
                     let _ = child.kill();
                     let _ = child.wait();
@@ -400,6 +454,23 @@ pub fn run_with_timeout_stdin(
         stdout,
         stderr,
     })
+}
+
+#[cfg(all(test, unix))]
+mod cancel_tests {
+    use super::*;
+
+    #[test]
+    fn a_set_cancel_token_kills_the_child() {
+        let cancel = crate::cancel::CancelToken::new();
+        cancel.cancel();
+        let start = std::time::Instant::now();
+        let mut cmd = Command::new("sleep");
+        cmd.arg("5");
+        let r = run_with_timeout_or_cancel(&mut cmd, Duration::from_secs(30), &cancel);
+        assert_eq!(r.unwrap_err(), CANCELLED);
+        assert!(start.elapsed() < Duration::from_secs(4));
+    }
 }
 
 #[cfg(test)]

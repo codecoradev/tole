@@ -34,6 +34,15 @@ workflow; the ecosystem-wide standards it follows live in the team knowledge roo
 
 - One logical change per PR; large change-sets (~40+ files) can time out the
   Cora Review job (30-minute limit) — split into ~15–20-file PRs.
+- **PR size.** Keep a PR under about 600 changed lines of code (additions
+  plus deletions, not counting `CHANGELOG.md`, `docs/`, `Cargo.lock`); split
+  anything larger, e.g. into a refactor PR and a behavior PR, or one PR per
+  subsystem. Cora Review reads the whole diff, and it is a merge gate. On
+  recent PRs it took 12 to 14 minutes at +492/-22 and at +1366/-26 (Build and
+  Test take 4 to 6), and the longest reviews ended with "Review could not
+  complete" (empty result), which is not a pass and costs a rerun. Docs and the
+  changelog still count toward what Cora reads (the config cannot exclude
+  them, see #705), so keep those short too.
 - Body sections, in order: **What / Why / Changes / Testing**. A PR without
   them fails the PR Description check.
 - Base every PR on `develop`. PRs into `main` are only accepted from
@@ -90,7 +99,7 @@ three levels:
 
 Review behavior is configured in `.cora.yaml` (focus areas, tole-specific
 rules that encode intentional patterns — env-resolved credentials,
-argv-validated subprocess tools, wire-only redaction — plus ignore rules for
+argv-validated subprocess tools, known-value redaction at the egress sinks — plus ignore rules for
 known FP categories).
 
 Exit-code reference:

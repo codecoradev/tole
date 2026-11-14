@@ -200,6 +200,7 @@ pub fn rows(index: &Path, grep: Option<&str>) -> Vec<Row> {
 }
 
 /// One session as the fork tree sees it (#210).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TreeNode {
     pub id: String,
     /// The session this one was forked from, if it is a fork.
@@ -212,21 +213,69 @@ pub struct TreeNode {
 
 /// The `sessions --tree` lines: roots (and forks whose source is gone)
 /// sorted by id, each fork nested under its source with `└─`.
-pub fn tree_lines(mut nodes: Vec<TreeNode>) -> Vec<String> {
+pub fn tree_lines(nodes: Vec<TreeNode>) -> Vec<String> {
+    tree_order(nodes)
+        .into_iter()
+        .map(|(depth, n)| {
+            let label = match &n.at {
+                Some(at) => format!("{} (@{at})", n.id),
+                None => n.id.clone(),
+            };
+            let pad = if depth == 0 {
+                String::new()
+            } else {
+                format!("{}└─ ", "   ".repeat(depth - 1))
+            };
+            format!("{pad}{label}  {}  {} turns", n.pc, n.turns)
+        })
+        .collect()
+}
+
+/// Every session file in `dir` as a [`TreeNode`], read-only (no writer lock,
+/// no repair): what `sessions --tree` and the TUI's `/tree` are built from.
+/// Unreadable files and ids outside the safe charset are skipped.
+pub fn tree_nodes(dir: &Path) -> Vec<TreeNode> {
+    let mut nodes = Vec::new();
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return nodes;
+    };
+    for entry in rd.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Some(stem) = name.strip_suffix(".jsonl") else {
+            continue;
+        };
+        if !tole_core::storage::is_valid_session_id(stem) {
+            continue;
+        }
+        let Ok(s) = JsonlStorage::open_read_only(entry.path()) else {
+            continue;
+        };
+        nodes.push(TreeNode::of(stem, &s));
+    }
+    nodes
+}
+
+impl TreeNode {
+    /// The node for an already-open session.
+    pub fn of(id: &str, s: &JsonlStorage) -> TreeNode {
+        TreeNode {
+            id: id.to_string(),
+            parent: s.forked_from().map(|o| o.session.clone()),
+            at: s.forked_from().map(|o| o.entry.clone()),
+            pc: format!("{:?}", s.state().pc),
+            turns: tole_core::transcript::turn_count(s.entries()),
+        }
+    }
+}
+
+/// Depth-first order of the fork forest: roots (and forks whose source is
+/// gone) sorted by id, each fork under its source. Depth 0 = a root.
+pub fn tree_order(mut nodes: Vec<TreeNode>) -> Vec<(usize, TreeNode)> {
     nodes.sort_by(|a, b| a.id.cmp(&b.id));
     let known: std::collections::HashSet<String> = nodes.iter().map(|n| n.id.clone()).collect();
     let is_root = |n: &TreeNode| n.parent.as_ref().is_none_or(|p| !known.contains(p));
-    fn walk(n: &TreeNode, all: &[TreeNode], depth: usize, out: &mut Vec<String>) {
-        let label = match &n.at {
-            Some(at) => format!("{} (@{at})", n.id),
-            None => n.id.clone(),
-        };
-        let pad = if depth == 0 {
-            String::new()
-        } else {
-            format!("{}└─ ", "   ".repeat(depth - 1))
-        };
-        out.push(format!("{pad}{label}  {}  {} turns", n.pc, n.turns));
+    fn walk(n: &TreeNode, all: &[TreeNode], depth: usize, out: &mut Vec<(usize, TreeNode)>) {
+        out.push((depth, n.clone()));
         // A forked file cannot cycle (its id is new), but bound the walk anyway.
         if depth < 64 {
             for c in all
@@ -240,6 +289,46 @@ pub fn tree_lines(mut nodes: Vec<TreeNode>) -> Vec<String> {
     let mut out = Vec::new();
     for n in nodes.iter().filter(|n| is_root(n)) {
         walk(n, &nodes, 0, &mut out);
+    }
+    out
+}
+
+/// The family of `current` (#463 `/tree`): the whole fork tree that contains
+/// it, i.e. its parent chain up to the root and every fork below that root
+/// (siblings and grandchildren included), in [`tree_order`] with depths
+/// relative to that root. Empty when `current` is not among `nodes`.
+pub fn family(nodes: Vec<TreeNode>, current: &str) -> Vec<(usize, TreeNode)> {
+    let parent_of: std::collections::HashMap<&str, &str> = nodes
+        .iter()
+        .filter_map(|n| n.parent.as_deref().map(|p| (n.id.as_str(), p)))
+        .collect();
+    let known: std::collections::HashSet<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+    if !known.contains(current) {
+        return Vec::new();
+    }
+    let mut root = current;
+    // Bounded: ids are unique files, so a cycle is corruption, not a case.
+    for _ in 0..64 {
+        match parent_of.get(root) {
+            Some(p) if known.contains(p) => root = p,
+            _ => break,
+        }
+    }
+    let root = root.to_string();
+    let mut base = None;
+    let mut out = Vec::new();
+    for (d, n) in tree_order(nodes) {
+        match base {
+            None if n.id == root => {
+                base = Some(d);
+                out.push((0, n));
+            }
+            // The root's subtree is contiguous: it ends at the first row
+            // that is not deeper than the root.
+            Some(b) if d > b => out.push((d - b, n)),
+            Some(_) => break,
+            None => {}
+        }
     }
     out
 }
@@ -375,5 +464,48 @@ mod tests {
         // An entry whose file is not `<id>.jsonl` never resolves the id.
         append(&idx, &entry("s-other", &d.join("s-live.jsonl"), 7)).unwrap();
         assert!(find(&idx, "s-other").is_none());
+    }
+
+    fn node(id: &str, parent: Option<&str>) -> TreeNode {
+        TreeNode {
+            id: id.into(),
+            parent: parent.map(str::to_string),
+            at: parent.map(|_| "e1".to_string()),
+            pc: "Final".into(),
+            turns: 1,
+        }
+    }
+
+    fn ids(v: &[(usize, TreeNode)]) -> Vec<(usize, &str)> {
+        v.iter().map(|(d, n)| (*d, n.id.as_str())).collect()
+    }
+
+    /// #463: the family is the whole tree around the session, depths are
+    /// relative to its root, other trees and the rest of the forest are out.
+    #[test]
+    fn family_is_the_tree_around_a_session() {
+        let nodes = || {
+            vec![
+                node("a", None),
+                node("b", Some("a")),
+                node("c", Some("a")),
+                node("d", Some("b")),
+                node("x", None),
+                node("y", Some("x")),
+                // a fork whose source file is gone is its own root
+                node("o", Some("gone")),
+                node("p", Some("o")),
+            ]
+        };
+        let want = [(0, "a"), (1, "b"), (2, "d"), (1, "c")];
+        for cur in ["a", "b", "c", "d"] {
+            assert_eq!(ids(&family(nodes(), cur)), want, "from {cur}");
+        }
+        assert_eq!(ids(&family(nodes(), "y")), [(0, "x"), (1, "y")]);
+        assert_eq!(ids(&family(nodes(), "p")), [(0, "o"), (1, "p")]);
+        assert!(family(nodes(), "missing").is_empty());
+        // a corrupt parent cycle terminates
+        let cyc = vec![node("m", Some("n")), node("n", Some("m"))];
+        let _ = family(cyc, "m");
     }
 }

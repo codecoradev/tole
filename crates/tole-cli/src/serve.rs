@@ -8,8 +8,19 @@
 //! - `GET  /sessions`              → list session ids + busy flags
 //! - `GET  /sessions/{id}`         → session status
 //! - `POST /sessions/{id}/prompt`  → run one turn (`{"text": "..."}`)
+//! - `POST /sessions` also takes `{"resume": "<id>"}` to reopen an existing
+//!   session (#524)
+//! - `GET  /sessions/{id}/events?after=<seq>` → Server-Sent Events: durable
+//!   `entry` frames replayed from a `seq`, ephemeral text/tool/approval
+//!   frames (#524; see `tole_cli::events`)
+//! - `GET  /sessions/{id}/entries?after=<seq>&limit=<n>` → one page of the
+//!   session log (#524; see `tole_cli::protocol`)
 //! - `POST /sessions/{id}/interrupt` → steer the running turn without
 //!   cancelling it (`{"text": "...", "urgent": false}`, #377)
+//! - `POST /sessions/{id}/images` → upload one image as the raw body (#558);
+//!   `POST /sessions/{id}/prompt` takes `"images": [<id>]` next to `text`
+//! - `GET  /sessions/{id}/images/{fnv1a64}` → the bytes of an image recorded
+//!   in that session's log (#558; see `tole_cli::serve_images`)
 //!
 //! v1 scope: REST only (MCP-over-HTTP is the follow-up; the engine calls
 //! are identical). Auth is a static bearer token (env `TOLE_SERVE_TOKEN`
@@ -29,7 +40,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tole_cli::session_host::{
-    lock_sessions, open_session, run_session_turn, Sessions, SharedSessions,
+    lock_sessions, open_session, run_session_turn_with_images, Sessions, SharedSessions,
 };
 use tole_core::memory::MemoryConfig;
 use tole_core::storage::Storage;
@@ -47,6 +58,8 @@ pub struct ServeConfig {
     pub sessions_dir: Option<std::path::PathBuf>,
     /// `--on-turnend` stop gates wired onto every session registry.
     pub turnend: Vec<String>,
+    /// `--cron`: host the cron ticker in-process (#579).
+    pub cron: bool,
 }
 
 /// Max concurrently open connections: each pinned thread holds ~8 KiB
@@ -69,9 +82,19 @@ struct State {
     sessions_dir: Option<std::path::PathBuf>,
     turnend: Vec<String>,
     live_connections: std::sync::atomic::AtomicUsize,
+    /// Per-session ephemeral event buses for `GET /sessions/{id}/events`.
+    buses: tole_cli::events::BusRegistry,
+    /// Caps open event streams apart from (and within) the connection cap.
+    streams: Arc<tole_cli::events::StreamLimiter>,
     /// Per-source-IP failed-auth limiter (brute-force hardening), shared
     /// logic with the MCP transport.
     auth_failures: tole_cli::auth::AuthLimiter,
+    /// Image uploads (#558); `None` when no data directory resolves.
+    uploads: Option<tole_cli::serve_images::UploadStore>,
+    /// Webhook routes (#582) from the user config.
+    hooks: std::collections::BTreeMap<String, tole_cli::hooks::Route>,
+    /// The cron dir, whose ledger records seen deliveries (`hook_seen`).
+    hook_dir: Option<std::path::PathBuf>,
 }
 
 /// Read/write ceilings per connection: a client that opens a socket and
@@ -83,11 +106,38 @@ const SERVE_IO_TIMEOUT: Duration = Duration::from_secs(30);
 /// few seconds pin a connection slot indefinitely (slow-loris); this
 /// deadline bounds the whole read.
 const REQUEST_READ_DEADLINE: Duration = Duration::from_secs(15);
+/// Body budget of an authenticated image upload (#558): up to 10 MiB from a
+/// phone link needs more than [`REQUEST_READ_DEADLINE`]. Only granted once the
+/// headers carried the right token.
+const UPLOAD_READ_DEADLINE: Duration = Duration::from_secs(120);
 
 pub fn run_serve(cfg: ServeConfig) -> Result<()> {
     let token = resolve_token(&cfg.token)?;
     let workspace_root = crate::resolve_workspace_root(cfg.workspace.as_ref())
         .context("resolving --workspace for the session jail root")?;
+    // Webhook routes (#582), user config only: a route that cannot load
+    // stops the server here, before it listens.
+    let hook_cfg = match tole_cli::config::user_config_path().filter(|p| p.exists()) {
+        Some(p) => tole_cli::config::load(&p)
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .hooks
+            .unwrap_or_default(),
+        None => Default::default(),
+    };
+    let loopback = cfg.bind == "localhost"
+        || cfg
+            .bind
+            .trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    let hooks = tole_cli::hooks::load(&hook_cfg, loopback, &|k| std::env::var(k).ok())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    tole_cli::hooks::hold_keys(&hooks);
+    let hook_dir = if hooks.is_empty() {
+        None
+    } else {
+        Some(tole_cli::cron::default_dir()?)
+    };
     let addr = format!("{}:{}", cfg.bind, cfg.port);
     let listener = TcpListener::bind(&addr)
         .with_context(|| format!("binding {addr} (in use? change --port)"))?;
@@ -102,13 +152,28 @@ pub fn run_serve(cfg: ServeConfig) -> Result<()> {
         sessions_dir: cfg.sessions_dir.clone(),
         turnend: cfg.turnend.clone(),
         live_connections: std::sync::atomic::AtomicUsize::new(0),
+        buses: tole_cli::events::BusRegistry::default(),
+        streams: tole_cli::events::StreamLimiter::new(tole_cli::events::MAX_STREAMS),
         auth_failures: tole_cli::auth::AuthLimiter::new(),
+        uploads: tole_cli::serve_images::UploadStore::from_env(),
+        hooks,
+        hook_dir,
     });
+    if !state.hooks.is_empty() {
+        let names: Vec<&str> = state.hooks.keys().map(String::as_str).collect();
+        eprintln!("tole serve: webhook routes: {}", names.join(", "));
+    }
     eprintln!(
         "tole serve: listening on http://{addr} ({} allow pattern(s), plan_mode={})",
         cfg.allow_patterns.len(),
         cfg.plan_mode
     );
+    if cfg.cron {
+        let dir = tole_cli::cron::default_dir()?;
+        eprintln!("tole serve: cron ticker on {}", dir.display());
+        let queue = Arc::clone(&state.approvals);
+        std::thread::spawn(move || tole_cli::cron::serve_ticker(&dir, queue));
+    }
     use std::sync::atomic::Ordering;
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
@@ -144,6 +209,49 @@ fn resolve_token(flag: &Option<String>) -> Result<String> {
     anyhow::bail!("refusing to start an unauthenticated server: set --token or TOLE_SERVE_TOKEN")
 }
 
+/// Largest `--token-file`.
+const MAX_TOKEN_FILE: u64 = 4096;
+
+/// The serve bearer token (#682): `--token-file` (a regular file, no link
+/// or FIFO, at most 4 KiB, surrounding whitespace dropped; an empty file is
+/// an error), else `--token`, else `TOLE_SERVE_TOKEN` (blank counts as
+/// unset). Errors never carry the token.
+///
+/// The token becomes a secret held by role, whatever carried it: redacted
+/// on egress, and removed from any child's environment.
+pub fn serve_token(
+    flag: Option<String>,
+    file: Option<&std::path::Path>,
+    env: Option<String>,
+) -> std::result::Result<String, String> {
+    let from_file = match file {
+        Some(p) => {
+            let bytes = tole_core::delegation_report::read_plain_file(p, MAX_TOKEN_FILE)
+                .map_err(|e| format!("--token-file {}: {e}", p.display()))?
+                .ok_or_else(|| format!("--token-file {}: does not exist", p.display()))?;
+            let text = String::from_utf8(bytes)
+                .map_err(|_| format!("--token-file {}: not UTF-8", p.display()))?;
+            if text.trim().is_empty() {
+                return Err(format!("--token-file {}: is empty", p.display()));
+            }
+            Some(text)
+        }
+        None => None,
+    };
+    let token = [from_file, flag, env]
+        .into_iter()
+        .flatten()
+        .map(|t| t.trim().to_string())
+        .find(|t| !t.is_empty())
+        .ok_or_else(|| {
+            "refusing to start an unauthenticated server: set TOLE_SERVE_TOKEN, --token-file \
+             or --token"
+                .to_string()
+        })?;
+    tole_core::secrets::add_role_secret("TOLE_SERVE_TOKEN", &token);
+    Ok(token)
+}
+
 // ---------------------------------------------------------------------------
 // Connection handling
 // ---------------------------------------------------------------------------
@@ -152,7 +260,13 @@ struct Request {
     method: String,
     path: String,
     authorization: Option<String>,
-    body: String,
+    /// `Last-Event-ID`: where an SSE client left off (`EventSource` sends it
+    /// on reconnect).
+    last_event_id: Option<String>,
+    /// Raw body bytes (an image upload is binary; JSON routes decode it).
+    body: Vec<u8>,
+    /// Signature and delivery headers of a webhook (#582).
+    hook: tole_core::webhook::Headers,
 }
 
 /// Why a request could not be read; decides the response (if any).
@@ -161,8 +275,23 @@ enum ReadError {
     Io,
     /// Syntactically unacceptable request: answered with 400.
     Bad(&'static str),
-    /// Declared body over the ceiling: answered with 413.
-    TooLarge,
+    /// Declared body over the ceiling. Carries the `Authorization` header
+    /// so the caller authenticates (and rate-limits) before answering: a
+    /// 413 only for the right token, otherwise the same 401 a small body
+    /// gets. The ceiling depends on the token, so answering 413 before
+    /// auth would be a token-validity oracle outside the limiter (#558).
+    TooLarge { authorization: Option<String> },
+    /// `/hooks/<route>` for a route that does not exist (404, body unread).
+    NoHookRoute,
+    /// A webhook body over its route's cap (413, body unread). Webhooks do
+    /// not use the token, so this is no token oracle.
+    HookTooLarge,
+}
+
+/// The route of a `/hooks/<route>` path.
+fn hook_target(path: &str) -> Option<&str> {
+    path.strip_prefix("/hooks/")
+        .map(|r| r.split('?').next().unwrap_or(r))
 }
 
 /// Ceiling for the request line + all header bytes combined: a client
@@ -171,6 +300,9 @@ enum ReadError {
 const MAX_HEADER_BYTES: usize = 32 * 1024;
 /// Ceiling for a request body.
 const MAX_BODY_BYTES: usize = 1024 * 1024;
+/// Ceiling for an authenticated image upload body (#558): the core's
+/// per-image cap. Unauthenticated requests keep [`MAX_BODY_BYTES`].
+const MAX_UPLOAD_BYTES: usize = tole_core::image::MAX_IMAGE_BYTES as usize;
 
 /// A reader that re-arms the socket read timeout before every read so the
 /// remaining time until `deadline` — not just the per-read timeout —
@@ -192,7 +324,11 @@ impl Read for DeadlineReader<'_> {
     }
 }
 
-fn read_request(stream: &TcpStream) -> Result<Request, ReadError> {
+fn read_request(
+    stream: &TcpStream,
+    token: &str,
+    hooks: &std::collections::BTreeMap<String, tole_cli::hooks::Route>,
+) -> Result<Request, ReadError> {
     let mut reader = BufReader::new(DeadlineReader {
         stream,
         deadline: Instant::now() + REQUEST_READ_DEADLINE,
@@ -217,8 +353,10 @@ fn read_request(stream: &TcpStream) -> Result<Request, ReadError> {
         .ok_or(ReadError::Bad("malformed request line"))?;
     let (method, path) = (method.to_string(), path.to_string());
     let mut authorization = None;
+    let mut last_event_id = None;
     let mut content_length: Option<usize> = None;
     let mut expect_continue = false;
+    let mut hook = tole_core::webhook::Headers::default();
     // The request line counts against the same ceiling as the headers:
     // the documented limit is 32 KiB for both combined.
     let mut header_bytes = request_line.len();
@@ -266,14 +404,52 @@ fn read_request(stream: &TcpStream) -> Result<Request, ReadError> {
             return Err(ReadError::Bad("Transfer-Encoding is not supported"));
         } else if name.eq_ignore_ascii_case("authorization") {
             authorization = Some(value.to_string());
+        } else if name.eq_ignore_ascii_case("last-event-id") {
+            last_event_id = Some(value.to_string());
+        } else if name.eq_ignore_ascii_case("x-tole-timestamp") {
+            hook.timestamp = Some(value.to_string());
+        } else if name.eq_ignore_ascii_case("x-tole-signature") {
+            hook.signature = Some(value.to_string());
+        } else if name.eq_ignore_ascii_case("x-tole-delivery") {
+            hook.delivery = Some(value.to_string());
+        } else if name.eq_ignore_ascii_case("x-hub-signature-256") {
+            hook.github_signature = Some(value.to_string());
+        } else if name.eq_ignore_ascii_case("x-github-delivery") {
+            hook.github_delivery = Some(value.to_string());
+        } else if name.eq_ignore_ascii_case("x-github-event")
+            || name.eq_ignore_ascii_case("x-tole-event")
+        {
+            hook.event = Some(value.to_string());
         } else if name.eq_ignore_ascii_case("expect") && value.eq_ignore_ascii_case("100-continue")
         {
             expect_continue = true;
         }
     }
     let content_length = content_length.unwrap_or(0);
-    if content_length > MAX_BODY_BYTES {
-        return Err(ReadError::TooLarge); // refuse rather than buffer it
+    // A webhook: an unknown route or a body over the route's cap is
+    // answered before a byte of the body is read (#582).
+    if let Some(route) = hook_target(&path) {
+        let cap = hooks.get(route).ok_or(ReadError::NoHookRoute)?.max_body;
+        if content_length > cap {
+            return Err(ReadError::HookTooLarge);
+        }
+    }
+    // The larger upload ceiling only for an image upload that already
+    // carries the right token: pre-auth buffering stays at MAX_BODY_BYTES.
+    let upload = method == "POST"
+        && upload_target(&path).is_some()
+        && tole_cli::auth::bearer_matches(authorization.as_deref(), token);
+    let ceiling = if upload {
+        MAX_UPLOAD_BYTES
+    } else {
+        MAX_BODY_BYTES
+    };
+    if content_length > ceiling {
+        // Refuse rather than buffer it.
+        return Err(ReadError::TooLarge { authorization });
+    }
+    if upload {
+        reader.get_mut().deadline = Instant::now() + UPLOAD_READ_DEADLINE;
     }
     if content_length > 0 && expect_continue {
         // curl sends `Expect: 100-continue` for bodies over ~1 KiB and
@@ -290,7 +466,9 @@ fn read_request(stream: &TcpStream) -> Result<Request, ReadError> {
         method,
         path,
         authorization,
-        body: String::from_utf8_lossy(&body).to_string(),
+        last_event_id,
+        body,
+        hook,
     })
 }
 
@@ -305,9 +483,11 @@ fn reason_phrase(status: u16) -> &'static str {
         405 => "Method Not Allowed",
         409 => "Conflict",
         413 => "Payload Too Large",
+        415 => "Unsupported Media Type",
         429 => "Too Many Requests",
         500 => "Internal Server Error",
         503 => "Service Unavailable",
+        507 => "Insufficient Storage",
         _ => "Unknown",
     }
 }
@@ -338,14 +518,43 @@ impl Drop for ConnGuard {
 
 fn handle_conn(mut stream: TcpStream, state: Arc<State>) {
     let _guard = ConnGuard(Arc::clone(&state));
-    let req = match read_request(&stream) {
+    let req = match read_request(&stream, &state.token, &state.hooks) {
         Ok(r) => r,
         Err(ReadError::Io) => return,
         Err(ReadError::Bad(msg)) => {
             respond(&mut stream, 400, &json!({"error": msg}));
             return;
         }
-        Err(ReadError::TooLarge) => {
+        Err(ReadError::TooLarge { authorization }) => {
+            // Authenticate first, through the same limiter as every other
+            // request, so the answer never tells a wrong token from a right
+            // one without a recorded failure.
+            let peer_ip = stream.peer_addr().ok().map(|a| a.ip());
+            if peer_ip.is_some_and(|ip| state.auth_failures.is_limited(ip)) {
+                respond(
+                    &mut stream,
+                    429,
+                    &json!({"error": "too many failed auth attempts"}),
+                );
+            } else if !tole_cli::auth::bearer_matches(authorization.as_deref(), &state.token) {
+                if let Some(ip) = peer_ip {
+                    state.auth_failures.record_failure(ip);
+                }
+                respond(&mut stream, 401, &json!({"error": "unauthorized"}));
+            } else {
+                respond(
+                    &mut stream,
+                    413,
+                    &json!({"error": "request body too large"}),
+                );
+            }
+            return;
+        }
+        Err(ReadError::NoHookRoute) => {
+            respond(&mut stream, 404, &json!({"error": "no such hook route"}));
+            return;
+        }
+        Err(ReadError::HookTooLarge) => {
             respond(
                 &mut stream,
                 413,
@@ -370,6 +579,15 @@ fn handle_conn(mut stream: TcpStream, state: Arc<State>) {
         return;
     }
 
+    // Webhooks (#582) authenticate by signature, never by the token.
+    if req.method == "POST" {
+        if let Some(route) = hook_target(&req.path) {
+            let (status, payload) = handle_hook(&state, route, &req, peer_ip);
+            respond(&mut stream, status, &payload);
+            return;
+        }
+    }
+
     let authorized = req.path == "/health"
         || tole_cli::auth::bearer_matches(req.authorization.as_deref(), &state.token);
     if !authorized {
@@ -380,8 +598,293 @@ fn handle_conn(mut stream: TcpStream, state: Arc<State>) {
         return;
     }
 
-    let (status, payload) = route(&state, &req.method, &req.path, &req.body);
+    // The event stream owns its connection for as long as it is open, so it
+    // is served here rather than through `route` (which returns one JSON
+    // body).
+    if req.method == "GET" {
+        if let Some((id, query)) = events_target(&req.path) {
+            serve_events(stream, &state, id, query, req.last_event_id.as_deref());
+            return;
+        }
+    }
+
+    // Images (#558): a binary body in, binary bytes out.
+    if req.method == "POST" {
+        if let Some(id) = upload_target(&req.path) {
+            let (status, payload) = upload_image(&state, id, &req.body);
+            respond(&mut stream, status, &payload);
+            return;
+        }
+    }
+    if req.method == "GET" {
+        if let Some((id, hash)) = image_target(&req.path) {
+            match read_image(&state, id, hash) {
+                Ok((mime, data)) => respond_image(&mut stream, &mime, &data),
+                Err((status, payload)) => respond(&mut stream, status, &payload),
+            }
+            return;
+        }
+    }
+
+    let body = String::from_utf8_lossy(&req.body);
+    let (status, payload) = route(&state, &req.method, &req.path, &body);
     respond(&mut stream, status, &payload);
+}
+
+/// `/sessions/{id}/images` -> `id` (the upload route).
+fn upload_target(path: &str) -> Option<&str> {
+    let id = path.strip_prefix("/sessions/")?.strip_suffix("/images")?;
+    (!id.is_empty() && !id.contains('/') && !id.contains('?')).then_some(id)
+}
+
+/// `/sessions/{id}/images/{hash}` -> `(id, hash)` (the read route).
+fn image_target(path: &str) -> Option<(&str, &str)> {
+    let rest = path.strip_prefix("/sessions/")?;
+    let (id, hash) = rest.split_once("/images/")?;
+    let ok = |s: &str| !s.is_empty() && !s.contains('/') && !s.contains('?');
+    (ok(id) && ok(hash)).then_some((id, hash))
+}
+
+fn image_error(e: tole_cli::serve_images::ImageApiError) -> (u16, serde_json::Value) {
+    (e.status(), json!({"error": e.message()}))
+}
+
+/// The JSONL file of a live session, or the 404 answer.
+fn live_session_path(
+    state: &State,
+    id: &str,
+) -> Result<std::path::PathBuf, (u16, serde_json::Value)> {
+    let sessions = lock_sessions(&state.sessions);
+    sessions
+        .get(id)
+        .map(|st| st.path.clone())
+        .ok_or_else(|| (404, json!({"error": "unknown session"})))
+}
+
+/// `POST /sessions/{id}/images` (#558): store the raw body as an image of
+/// a live session; answers the reference (`id`, `mime`, `bytes`, `fnv1a64`).
+fn upload_image(state: &State, id: &str, body: &[u8]) -> (u16, serde_json::Value) {
+    if let Err(resp) = live_session_path(state, id) {
+        return resp;
+    }
+    let Some(store) = state.uploads.as_ref() else {
+        return (
+            503,
+            json!({"error": "image uploads need a data directory (set CODECORA_HOME or HOME)"}),
+        );
+    };
+    match store.store(id, body) {
+        Ok(r) => (200, tole_cli::serve_images::upload_json(&r)),
+        Err(e) => image_error(e),
+    }
+}
+
+/// `GET /sessions/{id}/images/{fnv1a64}` (#558): only an image the session's
+/// log records, re-checked against the jail, its size and its hash.
+fn read_image(
+    state: &State,
+    id: &str,
+    hash: &str,
+) -> Result<(String, Vec<u8>), (u16, serde_json::Value)> {
+    let path = live_session_path(state, id)?;
+    tole_cli::serve_images::read_recorded_in_jail(&path, hash).map_err(image_error)
+}
+
+/// An image body with a fixed type: the recorded mime, never sniffed by
+/// the client (`nosniff`), never cached by a shared cache.
+fn respond_image(stream: &mut TcpStream, mime: &str, data: &[u8]) {
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nX-Content-Type-Options: nosniff\r\nCache-Control: private, no-store\r\nConnection: close\r\n\r\n",
+        data.len()
+    );
+    let _ = stream.write_all(head.as_bytes());
+    let _ = stream.write_all(data);
+    let _ = stream.flush();
+}
+
+/// `/sessions/{id}/events[?query]` -> `(id, query)`.
+fn events_target(path: &str) -> Option<(&str, &str)> {
+    let (path, query) = path.split_once('?').unwrap_or((path, ""));
+    let id = path.strip_prefix("/sessions/")?.strip_suffix("/events")?;
+    (!id.is_empty() && !id.contains('/')).then_some((id, query))
+}
+
+fn write_all(stream: &mut TcpStream, text: &str) -> bool {
+    stream
+        .write_all(text.as_bytes())
+        .and_then(|()| stream.flush())
+        .is_ok()
+}
+
+/// `GET /sessions/{id}/events?after=<seq>` (#524): Server-Sent Events.
+///
+/// Durable `entry` frames replay from `after` (or `Last-Event-ID`) and then
+/// follow the log; ephemeral frames (`text_delta`, `reasoning`,
+/// `tool_started`, `tool_finished`, `approval_*`) are best-effort and not
+/// replayable. See `tole_cli::events` for the model. The stream ends when
+/// the client goes away (a write fails, or the heartbeat finds it dead) or
+/// the session leaves the live map (`closed`).
+fn serve_events(
+    mut stream: TcpStream,
+    state: &Arc<State>,
+    id: &str,
+    query: &str,
+    last_event_id: Option<&str>,
+) {
+    use tole_cli::events::{entry_frame, frame, ApprovalWatch, EntryTail, Heartbeat, HEARTBEAT};
+    let param = |name: &str| {
+        query
+            .split('&')
+            .find_map(|kv| kv.strip_prefix(name).and_then(|v| v.strip_prefix('=')))
+    };
+    // An explicit `after` wins over the header; both are a `seq`.
+    let after = match param("after") {
+        Some(a) => match a.parse::<u64>() {
+            Ok(n) => n,
+            Err(_) => {
+                respond(
+                    &mut stream,
+                    400,
+                    &json!({"error": "after must be a non-negative integer"}),
+                );
+                return;
+            }
+        },
+        None => last_event_id
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0),
+    };
+    let path = {
+        let sessions = lock_sessions(&state.sessions);
+        sessions.get(id).map(|st| st.path.clone())
+    };
+    let Some(path) = path else {
+        respond(&mut stream, 404, &json!({"error": "unknown session"}));
+        return;
+    };
+    let Some(_slot) = state.streams.try_acquire() else {
+        respond(
+            &mut stream,
+            429,
+            &json!({"error": "too many open event streams"}),
+        );
+        return;
+    };
+    // Subscribe BEFORE replaying so no ephemeral frame falls in the gap.
+    let sub = state.buses.subscribe(id);
+    let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nX-Accel-Buffering: no\r\nConnection: close\r\n\r\n";
+    if !write_all(&mut stream, head) {
+        return;
+    }
+
+    let live_busy = |state: &State| -> Option<bool> {
+        let sessions = lock_sessions(&state.sessions);
+        sessions
+            .get(id)
+            .map(|st| *st.busy.lock().expect("busy lock"))
+    };
+    let mut tail = EntryTail::new(path, after);
+    let mut approvals = ApprovalWatch::default();
+    let mut ready_sent = false;
+    let mut hb = Heartbeat::new(
+        tole_cli::events::heartbeat_interval(
+            std::env::var(tole_cli::events::HEARTBEAT_ENV)
+                .ok()
+                .as_deref(),
+        ),
+        Instant::now(),
+    );
+    // Approval state changes go out BEFORE the durable entries of the same
+    // pass, so a decision is announced ahead of the effects it caused.
+    // `Some(n)`: n frames written (0 is normal); `None`: the peer is gone.
+    let send_approvals = |stream: &mut TcpStream, approvals: &mut ApprovalWatch| -> Option<usize> {
+        let mut n = 0;
+        for (name, data) in approvals.poll(&state.approvals.list(Some(id))) {
+            if !write_all(stream, &frame(name, None, &data)) {
+                return None;
+            }
+            n += 1;
+        }
+        Some(n)
+    };
+    loop {
+        if ready_sent {
+            match send_approvals(&mut stream, &mut approvals) {
+                None => return,
+                Some(0) => {}
+                Some(_) => hb.note_write(Instant::now()),
+            }
+        }
+        // Durable frames (a transient read error just retries).
+        if let Ok(entries) = tail.poll() {
+            for e in entries {
+                if !write_all(&mut stream, &entry_frame(&e)) {
+                    return;
+                }
+                hb.note_write(Instant::now());
+            }
+        }
+        if !ready_sent {
+            ready_sent = true;
+            let ready = frame(
+                "ready",
+                None,
+                &json!({"id": id, "after": after, "lastSeq": tail.last_seq(),
+                        "busy": live_busy(state).unwrap_or(false)}),
+            );
+            // The replay is complete; then what is pending right now.
+            if !write_all(&mut stream, &ready) {
+                return;
+            }
+            hb.note_write(Instant::now());
+            if send_approvals(&mut stream, &mut approvals).is_none() {
+                return;
+            }
+        }
+        let dropped = sub.take_dropped();
+        if dropped > 0 {
+            if !write_all(
+                &mut stream,
+                &frame("resync", None, &json!({"dropped": dropped})),
+            ) {
+                return;
+            }
+            hb.note_write(Instant::now());
+        }
+        // Ephemeral frames: wait briefly for one (this is also the poll
+        // interval for the durable tail), then drain what queued up.
+        match sub.rx.recv_timeout(Duration::from_millis(150)) {
+            Ok(first) => {
+                let mut next = Some(first);
+                while let Some(e) = next {
+                    if !write_all(&mut stream, &e.to_frame()) {
+                        return;
+                    }
+                    hb.note_write(Instant::now());
+                    next = sub.rx.try_recv().ok();
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+        }
+        if live_busy(state).is_none() {
+            // Evicted from the live map: say so and end cleanly. Entries
+            // written before the end have been sent (one last poll above).
+            let _ = tail
+                .poll()
+                .map(|rest| rest.iter().all(|e| write_all(&mut stream, &entry_frame(e))));
+            let _ = write_all(&mut stream, &frame("closed", None, &json!({"id": id})));
+            return;
+        }
+        // Silence for HEARTBEAT_SECS: write a comment. This is also how a
+        // dead peer is found (the write fails) and its slot freed.
+        if hb.due(Instant::now()) {
+            if !write_all(&mut stream, HEARTBEAT) {
+                return;
+            }
+            hb.note_write(Instant::now());
+        }
+    }
 }
 
 /// Write the decision audit register onto the session's durable log:
@@ -440,6 +943,276 @@ fn write_approval_audit(
         .map_err(|e| e.to_string())
 }
 
+/// Open (or reopen, `loading`) a serve session and admit it to the live map.
+/// Shared by create and resume so both get the same approver, jail and
+/// capacity rules. `Err` is the HTTP answer.
+fn open_serve_session(
+    state: &State,
+    session_id: &str,
+    cwd: &str,
+    loading: bool,
+) -> Result<(), (u16, serde_json::Value)> {
+    // Issue #200: non-preauthorized Writes queue for a remote
+    // decision (deny now, resumable; allow = one-shot replay).
+    // Queue-time storage path (cora MAJOR): an evicted session's
+    // audit fallback must reopen the EXACT durable file — with
+    // no --sessions-dir the log lives under the session's cwd.
+    let storage_dir = serve_storage_dir(state, cwd);
+    let approver = tole_cli::approvals::QueueApprover::new(
+        state.allow_patterns.clone(),
+        Arc::clone(&state.approvals),
+        session_id,
+        storage_dir.join(format!("{session_id}.jsonl")),
+    );
+    match open_session(
+        session_id,
+        cwd,
+        loading,
+        state.plan_mode,
+        approver,
+        state.memory.clone(),
+        state.sessions_dir.as_deref(),
+        state.turnend.clone(),
+        state.allow_patterns.clone(),
+        // No REST cancel endpoint today (#178): a never-fired
+        // token keeps serve behavior unchanged.
+        tole_core::cancel::CancelToken::default(),
+        // No plan UI on the REST face.
+        None,
+    ) {
+        Ok(session_state) => {
+            // Cap the live map (the registry's admission rule): a
+            // long-running daemon must not grow without bound
+            // (CodeCora scan-3). Eviction drops only the in-memory
+            // handle, never the file; busy sessions are never
+            // evicted, and all-busy at capacity is a 503.
+            if lock_sessions(&state.sessions)
+                .admit(session_id.to_string(), session_state)
+                .is_err()
+            {
+                return Err((503, json!({"error": "all sessions busy — at capacity"})));
+            }
+            Ok(())
+        }
+        // Another process (a TUI, a second serve) holds the writer lock.
+        Err(e) if e.contains("open for writing") => Err((409, json!({"error": e}))),
+        Err(e) => Err((500, json!({"error": e}))),
+    }
+}
+
+/// Where this serve process keeps the session files of `cwd`.
+fn serve_storage_dir(state: &State, cwd: &str) -> std::path::PathBuf {
+    match &state.sessions_dir {
+        Some(d) => d.clone(),
+        None => std::path::Path::new(cwd).join(".tole/sessions"),
+    }
+}
+
+/// `POST /sessions {"resume": "<id>"}` (#524): make an existing session live
+/// again. `cwd` has already passed the jail check, and the id is validated
+/// and only ever joined into the session directory (no client-supplied path),
+/// so a client cannot open a file outside the jail.
+///
+/// - an already-live session is returned as is (200, `alreadyLive`): nothing
+///   is reopened or replaced, so a busy turn is never disturbed, and a client
+///   that reconnects mid-turn gets its id back plus the `busy` flag;
+/// - no such file in that directory is a 404;
+/// - another process holding the session's writer lock is a 409.
+fn resume_session(state: &State, id: &str, cwd: &str) -> (u16, serde_json::Value) {
+    if tole_cli::session_host::validate_session_id(id).is_none() {
+        return (400, json!({"error": "invalid session id"}));
+    }
+    // Live first: the writer lock is held by this very process, so a second
+    // open of the same file would be refused as "locked".
+    {
+        let sessions = lock_sessions(&state.sessions);
+        if let Some(st) = sessions.get(id) {
+            let busy = *st.busy.lock().expect("busy lock");
+            return (
+                200,
+                json!({"sessionId": id, "resumed": false, "alreadyLive": true, "busy": busy}),
+            );
+        }
+    }
+    let file = serve_storage_dir(state, cwd).join(format!("{id}.jsonl"));
+    if !file.is_file() {
+        return (404, json!({"error": "unknown session"}));
+    }
+    if lock_sessions(&state.sessions).ensure_room().is_err() {
+        return (503, json!({"error": "all sessions busy — at capacity"}));
+    }
+    match open_serve_session(state, id, cwd, true) {
+        Ok(()) => (
+            200,
+            json!({"sessionId": id, "workspace": cwd, "resumed": true, "alreadyLive": false}),
+        ),
+        Err(resp) => resp,
+    }
+}
+
+/// An insecure loopback route's delivery: no signature, so the delivery id
+/// and the event are taken as sent (still validated).
+fn insecure_delivery(
+    h: &tole_core::webhook::Headers,
+) -> Result<tole_core::webhook::Verified, tole_core::webhook::Reject> {
+    use tole_core::webhook::{self, Reject};
+    if h.event.as_deref().is_some_and(|e| !webhook::valid_event(e)) {
+        return Err(Reject::BadEvent);
+    }
+    let id = h
+        .delivery
+        .clone()
+        .filter(|d| webhook::valid_delivery(d))
+        .ok_or(Reject::BadDelivery)?;
+    Ok(webhook::Verified {
+        key: id.clone(),
+        delivery: id,
+        event: h.event.clone(),
+    })
+}
+
+/// `POST /hooks/<route>` (#582): the signature check, then the route's rate
+/// limit and the delivery's idempotency, both kept in the cron ledger so
+/// they survive a restart. A failed signature counts toward the source's
+/// failed-auth limit. Answers never echo a header value but the delivery
+/// id, which passed validation.
+fn handle_hook(
+    state: &State,
+    name: &str,
+    req: &Request,
+    peer: Option<std::net::IpAddr>,
+) -> (u16, serde_json::Value) {
+    use tole_core::webhook::{self, Reject};
+    let Some(route) = state.hooks.get(name) else {
+        return (404, json!({"error": "no such hook route"}));
+    };
+    let now = tole_cli::cron::now();
+    let checked = match route.key() {
+        Some(key) => webhook::verify(key, &req.hook, &req.body, now),
+        // An insecure route answers loopback clients only (and loads only
+        // on a loopback bind).
+        None if peer.is_some_and(|ip| ip.is_loopback()) => insecure_delivery(&req.hook),
+        None => Err(Reject::Unsigned),
+    };
+    let verified = match checked {
+        Ok(v) => v,
+        Err(r) => {
+            if r.status() == 401 {
+                if let Some(ip) = peer {
+                    state.auth_failures.record_failure(ip);
+                }
+            }
+            return (r.status(), json!({"error": r.reason()}));
+        }
+    };
+    let Some(dir) = &state.hook_dir else {
+        return (503, json!({"error": "no cron dir for webhook state"}));
+    };
+    let rate = route.rate_per_minute as usize;
+    let outcome = tole_cli::cron::store::with_lock(dir, |l| {
+        if l.state().hooks_since(name, now - 59) >= rate {
+            return Ok(None);
+        }
+        // #678: the key is signed material (the native delivery id, or the
+        // GitHub body's digest), so a capture re-sent under a fresh
+        // delivery header is a duplicate.
+        Ok(Some(l.record_hook(name, &verified.key, now)?))
+    });
+    let id = verified.delivery.as_str();
+    match outcome {
+        Ok(None) => (429, json!({"error": "rate limit for this route"})),
+        Ok(Some(false)) => (200, json!({"status": "duplicate", "delivery": id})),
+        Ok(Some(true)) => hook_action(state, name, route, req, &verified, dir, now),
+        Err(e) => {
+            eprintln!("tole serve: webhook state: {e}");
+            (500, json!({"error": "webhook state unavailable"}))
+        }
+    }
+}
+
+/// A verified, first-seen delivery (#582 part 2): the events allowlist and
+/// the filter run on the payload before any LLM work (`200 ignored`); a
+/// match fires the route's `cron_job` through the claim path a tick uses
+/// (the #640 trust check, delivery, provider, skills, the daily cap) and
+/// answers `202` once the run is claimed. The run gets the fenced, rendered
+/// payload as context for this run only, and no Write tools unless the
+/// route says `allow_writes`.
+fn hook_action(
+    state: &State,
+    name: &str,
+    route: &tole_cli::hooks::Route,
+    req: &Request,
+    verified: &tole_core::webhook::Verified,
+    dir: &std::path::Path,
+    now: i64,
+) -> (u16, serde_json::Value) {
+    use tole_cli::hook_filter;
+    let (id, event) = (verified.delivery.as_str(), verified.event.as_deref());
+    if !hook_filter::event_allowed(route.events.as_deref(), event) {
+        return (
+            200,
+            json!({"status": "ignored", "reason": "event", "delivery": id}),
+        );
+    }
+    let payload = match serde_json::from_slice::<serde_json::Value>(&req.body) {
+        Ok(v) => v,
+        Err(_) if route.filter.is_none() && route.template.is_none() => serde_json::Value::Null,
+        Err(_) => return (400, json!({"error": "the body is not JSON"})),
+    };
+    if route
+        .filter
+        .as_ref()
+        .is_some_and(|f| !hook_filter::matches(f, &payload))
+    {
+        return (
+            200,
+            json!({"status": "ignored", "reason": "filter", "delivery": id}),
+        );
+    }
+    let Some(job) = &route.cron_job else {
+        return (202, json!({"status": "accepted", "delivery": id}));
+    };
+    let secrets = tole_cli::provider_chain::process_secrets(&tole_cli::config_apply::real_env);
+    let rendered = route
+        .template
+        .as_ref()
+        .map(|t| t.render(&payload, &secrets))
+        .unwrap_or_default();
+    let trigger = tole_cli::cron::tick::Trigger {
+        context: hook_filter::fenced(name, event, id, &rendered),
+        read_only: !route.allow_writes,
+    };
+    let opts = tole_cli::cron::TickOptions {
+        approvals: Some(Arc::clone(&state.approvals)),
+        daily_token_cap: tole_cli::cron::daily_token_cap(),
+        ..tole_cli::cron::TickOptions::standalone(1)
+    };
+    let mut report = tole_cli::cron::TickReport::default();
+    match tole_cli::cron::claim_now(dir, job, now, &opts, &mut report) {
+        Ok(Some(c)) => {
+            let fire = c.fire_id().to_string();
+            let claimed = vec![c.with_trigger(trigger)];
+            let dir = dir.to_path_buf();
+            std::thread::spawn(move || {
+                let mut r = tole_cli::cron::TickReport::default();
+                if let Err(e) = tole_cli::cron::tick::run_claimed(&dir, claimed, now, &opts, &mut r)
+                {
+                    eprintln!("tole serve: webhook run: {e}");
+                }
+            });
+            (
+                202,
+                json!({"status": "accepted", "delivery": id, "fire": fire}),
+            )
+        }
+        Ok(None) => (
+            409,
+            json!({"error": "the job did not run (blocked or out of budget; see tole cron list)", "delivery": id}),
+        ),
+        Err(e) => (409, json!({"error": e.to_string(), "delivery": id})),
+    }
+}
+
 fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_json::Value) {
     match (method, path) {
         ("GET", "/health") => (200, json!({"status": "ok"})),
@@ -475,6 +1248,13 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                 Err(e) => return (403, json!({"error": e})),
             };
             let cwd = jailed.as_str();
+            // Resume-by-id (#524): reopen an existing session instead of
+            // creating one. Same jail, same capacity and approval rules.
+            match req.get("resume") {
+                None | Some(serde_json::Value::Null) => {}
+                Some(serde_json::Value::String(id)) => return resume_session(state, id, cwd),
+                Some(_) => return (400, json!({"error": "resume must be a session id string"})),
+            }
             // Capacity first: `open_session` creates the session file on
             // disk, so refusing AFTER it (503) would orphan that file. The
             // re-check at insert time below still guards a concurrent
@@ -483,52 +1263,32 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                 return (503, json!({"error": "all sessions busy — at capacity"}));
             }
             let session_id = tole_cli::session_host::new_session_id("srv");
-            // Issue #200: non-preauthorized Writes queue for a remote
-            // decision (deny now, resumable; allow = one-shot replay).
-            // Queue-time storage path (cora MAJOR): an evicted session's
-            // audit fallback must reopen the EXACT durable file — with
-            // no --sessions-dir the log lives under the session's cwd.
-            let storage_dir: std::path::PathBuf = match &state.sessions_dir {
-                Some(d) => d.clone(),
-                None => std::path::Path::new(cwd).join(".tole/sessions"),
+            match open_serve_session(state, &session_id, cwd, false) {
+                Ok(()) => (200, json!({"sessionId": session_id, "workspace": cwd})),
+                Err(resp) => resp,
+            }
+        }
+        // Cron run results (#579, design §9): the pull delivery target.
+        ("GET", p) if p == "/cron/runs" || p.starts_with("/cron/runs?") => {
+            let query = |key: &str| {
+                p.split_once('?').and_then(|(_, q)| {
+                    q.split('&')
+                        .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))
+                })
             };
-            let approver = tole_cli::approvals::QueueApprover::new(
-                state.allow_patterns.clone(),
-                Arc::clone(&state.approvals),
-                &session_id,
-                storage_dir.join(format!("{session_id}.jsonl")),
-            );
-            match open_session(
-                &session_id,
-                cwd,
-                false,
-                state.plan_mode,
-                approver,
-                state.memory.clone(),
-                state.sessions_dir.as_deref(),
-                state.turnend.clone(),
-                state.allow_patterns.clone(),
-                // No REST cancel endpoint today (#178): a never-fired
-                // token keeps serve behavior unchanged.
-                tole_core::cancel::CancelToken::default(),
-                // No plan UI on the REST face.
-                None,
-            ) {
-                Ok(session_state) => {
-                    // Cap the live map (the registry's admission rule): a
-                    // long-running daemon must not grow without bound
-                    // (CodeCora scan-3). Eviction drops only the in-memory
-                    // handle, never the file; busy sessions are never
-                    // evicted, and all-busy at capacity is a 503.
-                    if lock_sessions(&state.sessions)
-                        .admit(session_id.clone(), session_state)
-                        .is_err()
-                    {
-                        return (503, json!({"error": "all sessions busy — at capacity"}));
-                    }
-                    (200, json!({"sessionId": session_id, "workspace": cwd}))
+            let limit = match query("limit").map(str::parse::<usize>) {
+                None => None,
+                Some(Ok(n)) => Some(n),
+                Some(Err(_)) => return (400, json!({"error": "limit must be a number"})),
+            };
+            let runs = tole_cli::cron::default_dir()
+                .and_then(|dir| tole_cli::cron::runs_json(&dir, query("job"), limit));
+            match runs {
+                Ok(v) => (200, v),
+                Err(e) if e.to_string().starts_with("no job") => {
+                    (404, json!({"error": e.to_string()}))
                 }
-                Err(e) => (500, json!({"error": e})),
+                Err(e) => (500, json!({"error": format!("{e:#}")})),
             }
         }
         // Remote approvals (issue #200): list + decide.
@@ -591,9 +1351,24 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                 // from the capped, one-turn-per-session map.
                 let sessions = Arc::clone(&state.sessions);
                 let sid = session_id.clone();
+                // A session this server does not host is a parked cron run
+                // (#581): it resumes through the cron ledger instead.
+                let serve_session = lock_sessions(&state.sessions).get(&sid).is_some();
+                let queue = Arc::clone(&state.approvals);
                 std::thread::spawn(move || {
-                    if let Err(e) = tole_cli::session_host::resume_session_turn(sessions, &sid) {
-                        eprintln!("tole serve: approval resume failed: {e}");
+                    if serve_session {
+                        if let Err(e) = tole_cli::session_host::resume_session_turn(sessions, &sid)
+                        {
+                            eprintln!("tole serve: approval resume failed: {e}");
+                        }
+                        return;
+                    }
+                    match tole_cli::cron::resume_after_approval(queue, &sid) {
+                        Ok(Some((fire, status))) => {
+                            eprintln!("tole serve: cron run {fire} resumed: {status:?}")
+                        }
+                        Ok(None) => eprintln!("tole serve: no parked cron run for session {sid}"),
+                        Err(e) => eprintln!("tole serve: cron resume failed: {e}"),
                     }
                 });
                 (
@@ -605,6 +1380,9 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
             }
         }
         (method, path) if path.starts_with("/sessions/") => {
+            // The query string belongs to the route, not to the action
+            // name (`entries?after=5` is the `entries` action).
+            let (path, query) = path.split_once('?').unwrap_or((path, ""));
             let rest = &path["/sessions/".len()..];
             // Split once; a bare id (no trailing slash) is the status route.
             let (id, action) = match rest.split_once('/') {
@@ -650,6 +1428,43 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                         }),
                     )
                 }
+                ("GET", id, Some("entries")) => {
+                    // Paginated transcript read (#524). Replays the
+                    // session's FILE, so it works while a turn runs.
+                    let param = |name: &str| {
+                        query
+                            .split('&')
+                            .find_map(|kv| kv.strip_prefix(name).and_then(|v| v.strip_prefix('=')))
+                    };
+                    let (after, limit) = match tole_cli::protocol::parse_entries_query(
+                        param("after"),
+                        param("limit"),
+                    ) {
+                        Ok(v) => v,
+                        Err(tole_cli::protocol::EntriesError::BadQuery(m)) => {
+                            return (400, json!({"error": m}))
+                        }
+                        Err(tole_cli::protocol::EntriesError::Read(m)) => {
+                            return (500, json!({"error": m}))
+                        }
+                    };
+                    let path = {
+                        let sessions = lock_sessions(&state.sessions);
+                        sessions.get(id).map(|st| st.path.clone())
+                    };
+                    let Some(path) = path else {
+                        return (404, json!({"error": "unknown session"}));
+                    };
+                    match tole_cli::protocol::entries_page(&path, id, after, limit) {
+                        Ok(page) => (200, serde_json::to_value(&page).unwrap_or(json!(null))),
+                        Err(tole_cli::protocol::EntriesError::Read(m)) => {
+                            (500, json!({"error": m}))
+                        }
+                        Err(tole_cli::protocol::EntriesError::BadQuery(m)) => {
+                            (400, json!({"error": m}))
+                        }
+                    }
+                }
                 ("POST", id, Some("prompt")) => {
                     let Ok(req) = serde_json::from_str::<serde_json::Value>(body) else {
                         return (400, json!({"error": "invalid JSON body"}));
@@ -657,7 +1472,37 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                     let Some(text) = req.get("text").and_then(|v| v.as_str()) else {
                         return (400, json!({"error": "missing text"}));
                     };
-                    match run_session_turn(Arc::clone(&state.sessions), id, text, None) {
+                    // Images (#558): ids of this session's uploads, resolved
+                    // to durable references before the turn starts.
+                    let images = match req.get("images") {
+                        None | Some(serde_json::Value::Null) => vec![],
+                        Some(v) => {
+                            if lock_sessions(&state.sessions).get(id).is_none() {
+                                return (404, json!({"error": "unknown session"}));
+                            }
+                            let Some(store) = state.uploads.as_ref() else {
+                                return (
+                                    503,
+                                    json!({"error": "image uploads need a data directory"}),
+                                );
+                            };
+                            match store.lookup_all(id, Some(v)) {
+                                Ok(refs) => refs,
+                                Err(e) => return image_error(e),
+                            }
+                        }
+                    };
+                    // An observer (text deltas, tool events) only while an event
+                    // stream is open on this session: with nobody watching the
+                    // turn runs exactly as before streams existed.
+                    let observer = state.buses.observer_for(id);
+                    match run_session_turn_with_images(
+                        Arc::clone(&state.sessions),
+                        id,
+                        text,
+                        &images,
+                        observer,
+                    ) {
                         Ok((stop, Some(final_text))) => {
                             (200, json!({"stopReason": stop, "text": final_text}))
                         }
@@ -746,6 +1591,43 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
 mod tests {
     use super::*;
 
+    /// #682: the token comes from a file first, then the flag, then the
+    /// environment; an empty file is an error, and no error shows a token.
+    #[test]
+    fn the_serve_token_prefers_the_file_and_never_echoes_a_value() {
+        let dir = std::env::temp_dir().join(format!("tole-serve-token-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("token");
+        std::fs::write(&file, "file-token-0682\n").unwrap();
+        let s = |v: &str| Some(v.to_string());
+        assert_eq!(
+            serve_token(None, Some(&file), s("env-token")).unwrap(),
+            "file-token-0682"
+        );
+        assert_eq!(
+            tole_core::secrets::process_secrets().redact("t=file-token-0682"),
+            "t=«TOLE_SERVE_TOKEN»",
+            "the token is a secret held by role"
+        );
+        assert_eq!(
+            serve_token(s(" flag-token "), None, s("env-token")).unwrap(),
+            "flag-token"
+        );
+        assert_eq!(
+            serve_token(s("  "), None, s("env-token")).unwrap(),
+            "env-token"
+        );
+        let empty = dir.join("empty");
+        std::fs::write(&empty, "\n").unwrap();
+        let e = serve_token(None, Some(&empty), s("env-token-0682")).unwrap_err();
+        assert!(e.contains("is empty") && !e.contains("env-token"), "{e}");
+        let e = serve_token(None, Some(&dir.join("missing")), None).unwrap_err();
+        assert!(e.contains("does not exist"), "{e}");
+        let e = serve_token(None, None, s(" ")).unwrap_err();
+        assert!(e.contains("TOLE_SERVE_TOKEN"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn reason_phrases_cover_every_status_the_routes_emit() {
         assert_eq!(reason_phrase(202), "Accepted");
@@ -767,7 +1649,12 @@ mod tests {
             sessions_dir: Some(sessions_dir),
             turnend: vec![],
             live_connections: std::sync::atomic::AtomicUsize::new(0),
+            buses: tole_cli::events::BusRegistry::default(),
+            streams: tole_cli::events::StreamLimiter::new(tole_cli::events::MAX_STREAMS),
             auth_failures: tole_cli::auth::AuthLimiter::new(),
+            uploads: None,
+            hooks: Default::default(),
+            hook_dir: None,
         }
     }
 

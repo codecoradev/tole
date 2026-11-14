@@ -64,6 +64,7 @@ fn generic_resolve_works_for_numbers() {
 #[test]
 fn source_display() {
     assert_eq!(Source::Flag.to_string(), "flag");
+    assert_eq!(Source::Profile.to_string(), "profile");
     assert_eq!(Source::Env.to_string(), "env");
     assert_eq!(Source::Config.to_string(), "config");
     assert_eq!(Source::Default.to_string(), "default");
@@ -838,12 +839,137 @@ fn fill_carries_only_low_risk_provider_values() {
         ProviderFill {
             base_url: s("u"),
             model: s("m"),
-            system_prompt: s("p")
+            system_prompt: s("p"),
+            profile_model: None,
+            profile_system_prompt: None,
+            profile_name: None,
         }
     );
     assert_eq!(
         Settings::fill_from(&Config::default()),
         ProviderFill::default()
+    );
+}
+
+/// #584: a selected profile sits between the per-key flags and the env.
+#[test]
+fn a_delegated_child_takes_allow_and_trust_only_from_its_flags() {
+    let user = cfg(
+        "allow = [\"cfg_*\"]\ntrust = [\"workspace\"]\n[profiles.coder]\nallow = [\"write_*\"]\n",
+    );
+    let profile = crate::profile::Profile::resolve(&user, "coder", None, None).unwrap();
+    let env = env_of(&[
+        ("TOLE_TRUST", "internal"),
+        ("TOLE_DELEGATION_LOG", "/a/delegation.jsonl"),
+        ("TOLE_DELEGATION_NODE", "g-1.1"),
+    ]);
+    let flags = Flags {
+        profile: Some(profile.clone()),
+        ..Flags::default()
+    };
+    let st = Settings::resolve(&flags, &user, &env);
+    assert_eq!(st.allow, None, "no profile, config or env allow");
+    assert_eq!(st.trust, None, "no config or env trust");
+    let flags = Flags {
+        profile: Some(profile),
+        allow: vec!["write_file".into()],
+        ..Flags::default()
+    };
+    let st = Settings::resolve(&flags, &user, &env);
+    assert_eq!(st.allow.unwrap().value, vec!["write_file".to_string()]);
+    // Not delegated: the profile's allow applies as before.
+    let plain = env_of(&[("TOLE_TRUST", "internal")]);
+    let flags = Flags {
+        profile: Some(crate::profile::Profile::resolve(&user, "coder", None, None).unwrap()),
+        ..Flags::default()
+    };
+    let st = Settings::resolve(&flags, &user, &plain);
+    assert_eq!(st.allow.unwrap().value, vec!["write_*".to_string()]);
+    assert!(st.trust.is_some());
+}
+
+#[test]
+fn profile_layer_is_below_flags_and_above_env_and_config() {
+    let user = cfg(
+        "model = \"cfg-model\"\nsystem_prompt = \"cfg prompt\"\nallow = [\"cfg_*\"]\n\
+         skill = [\"/cfg/SKILL.md\"]\n\
+         [profiles.coder]\nallow = [\"write_*\"]\nskills = [\"/p/SKILL.md\"]\n\
+         [profiles.coder.models]\nstandard = \"profile-model\"\n",
+    );
+    let mut profile = crate::profile::Profile::resolve(&user, "coder", None, None).unwrap();
+    profile.system_prompt = s("persona");
+    let env = env_of(&[
+        ("TOLE_BASE_URL", "https://x/v1"),
+        ("TOLE_MODEL", "env-model"),
+        ("TOLE_API_KEY", "sk-env"),
+        ("TOLE_SYSTEM_PROMPT", "env prompt"),
+        ("TOLE_SKILL", "/env/SKILL.md"),
+    ]);
+    let flags = Flags {
+        profile: Some(profile),
+        ..Flags::default()
+    };
+    let st = Settings::resolve(&flags, &user, &env);
+    let m = st.provider.model.as_ref().unwrap();
+    assert_eq!(
+        (m.value.as_str(), m.source),
+        ("profile-model", Source::Profile)
+    );
+    assert_eq!(st.provider.config.as_ref().unwrap().model, "profile-model");
+    let p = st.system_prompt.as_ref().unwrap();
+    assert_eq!((p.value.as_str(), p.source), ("persona", Source::Profile));
+    let a = st.allow.as_ref().unwrap();
+    assert_eq!(
+        (a.value.clone(), a.source),
+        (vec!["write_*".to_string()], Source::Profile)
+    );
+    let k = st.skill.as_ref().unwrap();
+    assert_eq!(
+        (k.value.clone(), k.source),
+        (vec![PathBuf::from("/p/SKILL.md")], Source::Profile)
+    );
+    let r = st.memory_room.as_ref().unwrap();
+    assert_eq!(
+        (r.value.as_str(), r.source),
+        ("profile-coder", Source::Profile)
+    );
+    // Explicit per-key flags still win over the profile.
+    let flags = Flags {
+        system: s("flag prompt"),
+        allow: vec!["flag_*".into()],
+        skill: vec![PathBuf::from("/flag/SKILL.md")],
+        ..flags
+    };
+    let st = Settings::resolve(&flags, &user, &env);
+    assert_eq!(st.system_prompt.unwrap().source, Source::Flag);
+    assert_eq!(st.allow.unwrap().value, vec!["flag_*".to_string()]);
+    assert_eq!(st.skill.unwrap().source, Source::Flag);
+    // Without a profile nothing changes: env model, env prompt, config allow.
+    let st = Settings::resolve(&Flags::default(), &user, &env);
+    assert_eq!(st.provider.model.unwrap().value, "env-model");
+    assert_eq!(st.system_prompt.unwrap().value, "env prompt");
+    assert_eq!(st.allow.unwrap().source, Source::Config);
+    assert_eq!(st.memory_room, None);
+}
+
+#[test]
+fn fill_with_profile_carries_the_profile_model_and_persona() {
+    let c = cfg("model = \"m\"\n[profiles.p.models]\nstandard = \"pm\"\n");
+    let mut prof = crate::profile::Profile::resolve(&c, "p", None, None).unwrap();
+    prof.system_prompt = s("persona");
+    let f = Settings::fill_with_profile(&c, Some(&prof));
+    assert_eq!(
+        (
+            f.model,
+            f.profile_model,
+            f.profile_system_prompt,
+            f.profile_name
+        ),
+        (s("m"), s("pm"), s("persona"), s("p"))
+    );
+    assert_eq!(
+        Settings::fill_with_profile(&c, None),
+        Settings::fill_from(&c)
     );
 }
 
@@ -958,6 +1084,36 @@ fn compaction_settings_resolve_flag_env_config_default() {
     assert_eq!(s.context_window.unwrap().source, Source::Config);
 }
 
+// ------------------------------------------------- review gate (#534)
+
+fn gate(cfg_src: &str, env: &[(&str, &str)]) -> Option<(String, Source)> {
+    Settings::resolve(&Flags::default(), &cfg(cfg_src), &env_of(env))
+        .review_gate
+        .map(|e| (e.value, e.source))
+}
+
+#[test]
+fn review_gate_precedence_env_config_default() {
+    let c = "review_gate = \"warn\"\n";
+    assert_eq!(
+        gate(c, &[("TOLE_REVIEW_GATE", "OFF")]),
+        Some(("off".into(), Source::Env)),
+        "env wins and is normalized"
+    );
+    assert_eq!(gate(c, &[]), Some(("warn".into(), Source::Config)));
+    assert_eq!(gate("", &[]), None, "default = the built-in block");
+    assert_eq!(gate("", &[("TOLE_REVIEW_GATE", " ")]), None);
+}
+
+#[cfg(feature = "shell-tools")]
+#[test]
+fn the_review_gate_env_name_matches_the_gate_module() {
+    assert_eq!(
+        crate::config_apply::REVIEW_GATE_ENV,
+        crate::review_gate::ENV
+    );
+}
+
 // ------------------------------------------------- reasoning effort (#457)
 
 fn effort(flags: &Flags, cfg_src: &str, env: &[(&str, &str)]) -> Option<(String, Source)> {
@@ -1019,6 +1175,162 @@ fn invalid_env_effort_is_reported_not_swallowed() {
     assert_eq!(ok.reasoning_effort.unwrap().value, "high", "canonical form");
 }
 
+// -------------------------------------------------------- tui theme (#463)
+
+/// The user layer carrying `user`, layered under `project` exactly as
+/// startup does.
+fn layered_cfg(project: &str, user: &str) -> Config {
+    crate::config::layered(&cfg(project), &cfg(user))
+}
+
+fn theme_of(c: &Config, env: &[(&str, &str)]) -> Eff<String> {
+    Settings::resolve(&Flags::default(), c, &env_of(env)).tui_theme
+}
+
+#[test]
+fn theme_precedence_env_then_user_config_then_no_color_then_default() {
+    let c = layered_cfg("", "[tui]\ntheme = \"light\"\n");
+    // env TOLE_THEME beats the user config (and NO_COLOR).
+    let e = theme_of(&c, &[("TOLE_THEME", "mono"), ("NO_COLOR", "1")]);
+    assert_eq!((e.value.as_str(), e.source), ("mono", Source::Env));
+    assert_eq!(e.describe(), "(env TOLE_THEME)");
+    // The user config beats NO_COLOR.
+    let e = theme_of(&c, &[("NO_COLOR", "1")]);
+    assert_eq!((e.value.as_str(), e.source), ("light", Source::UserConfig));
+    // NO_COLOR beats the default.
+    let none = layered_cfg("", "");
+    let e = theme_of(&none, &[("NO_COLOR", "1")]);
+    assert_eq!((e.value.as_str(), e.source), ("mono", Source::Env));
+    assert_eq!(e.describe(), "(env NO_COLOR)");
+    // An EMPTY NO_COLOR does not count; nor does a blank TOLE_THEME. Any
+    // other non-empty value does (even "0").
+    assert_eq!(theme_of(&none, &[("NO_COLOR", "")]).source, Source::Default);
+    assert_eq!(theme_of(&none, &[("NO_COLOR", "0")]).value, "mono");
+    let e = theme_of(&none, &[("TOLE_THEME", "  ")]);
+    assert_eq!((e.value.as_str(), e.source), ("default", Source::Default));
+}
+
+#[test]
+fn a_project_config_cannot_set_the_theme_or_colors() {
+    let project = "[tui]\ntheme = \"mono\"\n[tui.colors]\napproval = \"black\"\n";
+    // The file parses, but layering drops it: nothing reaches Settings.
+    let c = layered_cfg(project, "");
+    assert_eq!(c.tui, None);
+    let st = Settings::resolve(&Flags::default(), &c, &env_of(&[]));
+    assert_eq!(st.tui_theme.source, Source::Default);
+    assert_eq!(st.tui_theme.value, "default");
+    assert!(st.tui_colors.is_none());
+    // With a user theme, the user wins outright (no key-by-key merge).
+    let c = layered_cfg(project, "[tui]\ntheme = \"light\"\n");
+    let st = Settings::resolve(&Flags::default(), &c, &env_of(&[]));
+    assert_eq!(st.tui_theme.value, "light");
+    assert!(st.tui_colors.is_none(), "project colors must not merge in");
+}
+
+#[cfg(feature = "tui")]
+#[test]
+fn an_invalid_theme_falls_back_to_default_with_a_note_naming_the_key() {
+    use tole_tui::{parse_spec, Role, Theme};
+    let theme = |user: &str, env: &[(&str, &str)]| {
+        let c = layered_cfg("", user);
+        Settings::resolve(&Flags::default(), &c, &env_of(env)).theme()
+    };
+    assert_eq!(theme("", &[]), (Theme::default(), None));
+    assert_eq!(
+        theme("[tui]\ntheme = \"light\"\n", &[]),
+        (Theme::named("light").unwrap(), None)
+    );
+    // Unknown theme name in the user config.
+    let (t, note) = theme("[tui]\ntheme = \"neon\"\n", &[]);
+    assert_eq!(t, Theme::default());
+    let note = note.unwrap();
+    assert!(
+        note.contains("tui.theme") && note.contains("neon"),
+        "{note}"
+    );
+    assert!(!note.contains('\n'), "one line");
+    // Unknown theme name in the env names the variable.
+    let (_, note) = theme("", &[("TOLE_THEME", "neon")]);
+    assert!(note.unwrap().contains("TOLE_THEME"));
+    // A bad color names the key and the role; the theme is the default (the
+    // valid overrides of the same table are not applied either).
+    let user = "[tui]\ntheme = \"light\"\n[tui.colors]\nnote = \"red\"\ntool = \"ultraviolet\"\n";
+    let (t, note) = theme(user, &[]);
+    assert_eq!(t, Theme::default());
+    let note = note.unwrap();
+    assert!(
+        note.contains("tui.colors") && note.contains("`tool`") && note.contains("ultraviolet"),
+        "{note}"
+    );
+    // A background or conceal request is a refusal like any other.
+    for spec in ["bg:red", "hidden"] {
+        let user = format!("[tui.colors]\nnote = \"{spec}\"\n");
+        let (t, note) = theme(&user, &[]);
+        assert_eq!(t, Theme::default(), "{spec}");
+        assert!(note.unwrap().contains("`note`"), "{spec}");
+    }
+    // Valid overrides apply on top of the chosen theme.
+    let (t, note) = theme("[tui.colors]\ntool = \"#102030 bold\"\n", &[]);
+    assert_eq!(note, None);
+    assert_eq!(t.get(Role::Tool), parse_spec("#102030 bold").unwrap());
+}
+
+#[test]
+fn config_check_shows_the_effective_theme_and_ignores_a_project_theme() {
+    let user = tmpdir();
+    let up = user.join("config.toml");
+    std::fs::write(&up, "[tui]\ntheme = \"light\"\n").unwrap();
+    let dir = tmpdir();
+    let p = dir.join(CONFIG_REL_PATH);
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(&p, "[tui]\ntheme = \"mono\"\n").unwrap();
+    let out = check(&dir, None, Some(&up), &Flags::default(), &env_of(&[])).unwrap();
+    #[cfg(feature = "tui")]
+    assert!(
+        out.contains("tui.theme = \"light\"  [user config]  effective: \"light\"  (user config)"),
+        "{out}"
+    );
+    // A build without the TUI cannot validate a theme: it says so and never
+    // reports an effective value or a verdict.
+    #[cfg(not(feature = "tui"))]
+    assert!(
+        out.contains("tui.theme = \"light\"  [user config]  (not validated: this build has no TUI")
+            && !out.contains("effective: \"light\""),
+        "{out}"
+    );
+    assert!(
+        out.contains("tui.theme = \"mono\"  [config]  IGNORED: a project config cannot set"),
+        "{out}"
+    );
+    #[cfg(feature = "tui")]
+    {
+        let out = check(
+            &dir,
+            None,
+            Some(&up),
+            &Flags::default(),
+            &env_of(&[("TOLE_THEME", "mono")]),
+        )
+        .unwrap();
+        assert!(
+            out.contains("effective: \"mono\"  (env TOLE_THEME)"),
+            "{out}"
+        );
+    }
+    // An invalid value is flagged in the check output.
+    std::fs::write(&up, "[tui]\ntheme = \"neon\"\n").unwrap();
+    let out = check(&dir, None, Some(&up), &Flags::default(), &env_of(&[])).unwrap();
+    #[cfg(feature = "tui")]
+    assert!(out.contains("INVALID: tui.theme = \"neon\""), "{out}");
+    #[cfg(not(feature = "tui"))]
+    assert!(
+        out.contains("not validated") && !out.contains("INVALID"),
+        "{out}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+    let _ = std::fs::remove_dir_all(user);
+}
+
 #[test]
 fn config_check_shows_effective_effort_and_source() {
     let dir = tmpdir();
@@ -1038,4 +1350,126 @@ fn config_check_shows_effective_effort_and_source() {
         "{out}"
     );
     let _ = std::fs::remove_dir_all(dir);
+}
+
+// -------------------------------------------------------- tui keys (#463)
+
+fn keys_of(c: &Config) -> Option<std::collections::BTreeMap<String, Vec<String>>> {
+    Settings::resolve(&Flags::default(), c, &env_of(&[]))
+        .tui_keys
+        .map(|e| e.value)
+}
+
+#[test]
+fn a_project_config_cannot_set_keys_and_the_user_layer_can() {
+    let project = "[tui.keys]\ntoggle_tools = \"f5\"\n";
+    // Layering drops the project table: no keys reach Settings.
+    let c = layered_cfg(project, "");
+    assert_eq!(c.tui, None);
+    assert_eq!(keys_of(&c), None);
+    // The user layer supplies them, as a string or a list, and only it.
+    let c = layered_cfg(
+        project,
+        "[tui.keys]\ntoggle_tools = [\"alt+o\", \"f6\"]\nnewline = \"alt+n\"\n",
+    );
+    let k = keys_of(&c).unwrap();
+    assert_eq!(k["toggle_tools"], vec!["alt+o", "f6"]);
+    assert_eq!(k["newline"], vec!["alt+n"]);
+    let st = Settings::resolve(&Flags::default(), &c, &env_of(&[]));
+    assert_eq!(st.tui_keys.unwrap().source, Source::UserConfig);
+}
+
+#[cfg(feature = "tui")]
+#[test]
+fn an_invalid_keymap_falls_back_to_default_with_one_note_naming_the_key() {
+    use tole_tui::Keymap;
+    let keymap = |user: &str| {
+        let c = layered_cfg("", user);
+        Settings::resolve(&Flags::default(), &c, &env_of(&[])).keymap()
+    };
+    assert_eq!(keymap(""), (Keymap::default(), None));
+    let (k, note) = keymap("[tui.keys]\ntoggle_tools = \"alt+o\"\n");
+    assert_eq!(note, None);
+    assert_ne!(k, Keymap::default());
+    for (user, needles) in [
+        (
+            "[tui.keys]\nnope = \"ctrl+o\"\n",
+            &["unknown action", "nope"][..],
+        ),
+        (
+            "[tui.keys]\ncycle_model = \"ctrl+q\"\n",
+            &["cycle_model", "ctrl+q"][..],
+        ),
+        (
+            "[tui.keys]\ncycle_model = \"y\"\n",
+            &["cycle_model", "bare character"][..],
+        ),
+        (
+            "[tui.keys]\ncycle_model = \"esc\"\n",
+            &["cycle_model", "protected"][..],
+        ),
+        (
+            "[tui.keys]\ncycle_model = \"ctrl+x\"\ntoggle_tools = \"ctrl+x\"\n",
+            &["cycle_model", "toggle_tools", "Ctrl+X"][..],
+        ),
+        // A valid binding next to a bad one: the WHOLE keymap is the default.
+        (
+            "[tui.keys]\nnewline = \"alt+n\"\ncycle_model = \"ctrl+i\"\n",
+            &["cycle_model", "Tab"][..],
+        ),
+    ] {
+        let (k, note) = keymap(user);
+        assert_eq!(k, Keymap::default(), "{user}");
+        let note = note.unwrap();
+        assert!(note.starts_with("keys: ") && !note.contains('\n'), "{note}");
+        assert!(note.ends_with("using the default keys"), "{note}");
+        for n in needles {
+            assert!(note.contains(n), "{user}: {note}");
+        }
+    }
+}
+
+#[test]
+fn config_check_shows_keys_ignores_a_project_table_and_flags_a_bad_one() {
+    let user = tmpdir();
+    let up = user.join("config.toml");
+    std::fs::write(&up, "[tui.keys]\ntoggle_tools = [\"alt+o\", \"f6\"]\n").unwrap();
+    let dir = tmpdir();
+    let p = dir.join(CONFIG_REL_PATH);
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(&p, "[tui.keys]\nnewline = \"f5\"\n").unwrap();
+    let out = check(&dir, None, Some(&up), &Flags::default(), &env_of(&[])).unwrap();
+    #[cfg(feature = "tui")]
+    assert!(
+        out.contains("tui.keys = [1 entries]  [user config]  effective: 1 action(s) rebound")
+            && out.contains("(user config)")
+            && out.contains("  - toggle_tools = [\"alt+o\", \"f6\"]"),
+        "{out}"
+    );
+    #[cfg(not(feature = "tui"))]
+    assert!(
+        out.contains(
+            "tui.keys = [1 entries]  [user config]  (not validated: this build has no TUI"
+        ) && !out.contains("effective: 1 action"),
+        "{out}"
+    );
+    assert!(
+        out.contains("tui.keys = [1 entries]  [config]  IGNORED: a project config cannot set"),
+        "{out}"
+    );
+    std::fs::write(&up, "[tui.keys]\ntoggle_tools = \"o\"\n").unwrap();
+    let out = check(&dir, None, Some(&up), &Flags::default(), &env_of(&[])).unwrap();
+    #[cfg(feature = "tui")]
+    assert!(
+        out.contains("INVALID: tui.keys.toggle_tools: \"o\": a bare character")
+            && out.contains("the default keys are used"),
+        "{out}"
+    );
+    #[cfg(not(feature = "tui"))]
+    assert!(
+        out.contains("not validated") && !out.contains("INVALID"),
+        "{out}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+    let _ = std::fs::remove_dir_all(user);
 }

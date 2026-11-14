@@ -27,6 +27,7 @@
 //! - `memory`   — harness-level uteke memory loop (recall/remember)
 //! - `transcript` — read-side view of turn and usage-row conventions
 
+pub mod advisor;
 #[cfg(feature = "shell-tools")]
 pub mod agents;
 pub mod approval;
@@ -36,10 +37,15 @@ pub mod child_env;
 pub mod compaction;
 #[cfg(feature = "shell-tools")]
 pub mod cora_search;
+pub mod cron;
 pub mod entry;
 pub mod failover;
 pub mod file_tools;
 // Tool-call authorization gate (#303): crate-internal, no public API.
+pub mod delegation;
+pub mod delegation_report;
+pub mod discussion;
+pub mod discussion_log;
 pub(crate) mod gate;
 #[cfg(feature = "shell-tools")]
 pub mod gh;
@@ -49,6 +55,7 @@ pub mod gitea;
 pub mod handoff;
 pub mod image;
 pub mod interrupt;
+pub mod ledger;
 pub mod systemone;
 pub mod todo;
 pub mod transcript;
@@ -70,15 +77,29 @@ pub mod memory;
 pub mod mock;
 pub mod openai;
 pub mod paths;
+pub mod process_guard;
 pub mod provider;
 pub mod read_file;
 pub mod register;
 pub mod replay;
+pub mod resource_guard;
+pub mod router;
 #[cfg(feature = "shell-tools")]
 pub mod run_command;
+pub(crate) mod safe_dir;
+#[cfg(feature = "shell-tools")]
+pub mod session_guard;
 // Approval-surface text sanitizer (#327): crate-internal, no public API.
+pub mod plugin_lock;
 pub(crate) mod sanitize;
+pub mod secret_release;
+pub mod secrets;
+pub mod sensitive;
 pub mod sibling_watch;
+pub mod skill_approval;
+pub mod skill_curator;
+pub mod skill_draft;
+pub mod skill_index;
 pub mod skills;
 pub mod state;
 pub mod storage;
@@ -86,10 +107,12 @@ pub mod storage;
 pub mod subprocess;
 pub mod tool;
 pub mod turn;
+pub mod tz;
 pub mod update_check;
 #[cfg(feature = "shell-tools")]
 pub mod uteke;
 pub mod verify_package;
+pub mod webhook;
 
 /// Semantic version of the durable schema (see storage module docs).
 pub const STORAGE_VERSION: u32 = 1;

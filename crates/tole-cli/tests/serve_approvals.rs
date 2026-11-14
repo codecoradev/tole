@@ -252,7 +252,17 @@ fn approval_allow_round_trip_executes_the_work() {
     assert_eq!(code, 202, "{decision}");
     assert_eq!(decision["resuming"], true);
 
-    // Wait for the resumed turn to settle.
+    // Wait for the resumed turn to land its write. `busy` cannot be the
+    // signal: right after the 202 the resume may not have set it yet, so
+    // a "not busy" read proves nothing and the file may not exist yet
+    // (the CI flake). Poll for the effect itself, then for the settle.
+    let work_file = std::path::Path::new("approved.txt");
+    for _ in 0..100 {
+        if work_file.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
     for _ in 0..50 {
         let (_, st) = serve.http("GET", &format!("/sessions/{sid}/status"), None);
         if st["busy"] != json!(true) {
@@ -267,7 +277,6 @@ fn approval_allow_round_trip_executes_the_work() {
     // jailed to the serve process cwd (the test binary's package dir).
     // Issue #259: the stale-marker cleanup happens BEFORE the run (top
     // of this test), so this assert proves THIS run's write landed.
-    let work_file = std::path::Path::new("approved.txt");
     assert!(work_file.exists(), "the approved write must have executed");
     let _ = std::fs::remove_file(work_file);
 }

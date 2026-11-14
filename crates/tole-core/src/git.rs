@@ -245,7 +245,7 @@ impl Tool for GitTool {
             return Err("git: arguments must not contain NUL bytes".into());
         }
         let mut cmd = Command::new(&self.bin);
-        crate::subprocess::scrub_env_for_child(&mut cmd);
+        crate::subprocess::scrub_env_for(&mut cmd, "git");
         cmd.args(&argv);
         if let Some(dir) = &self.workdir {
             cmd.current_dir(dir);
@@ -257,6 +257,8 @@ impl Tool for GitTool {
             return Err(format!("git exited {}: {}", out.status, snippet));
         }
         let stdout = String::from_utf8_lossy(&out.stdout);
+        // A diff never shows the lines of a sensitive file (#598 part b).
+        let stdout = crate::sensitive::redact_diff(&stdout);
         let (body, truncated) = cap_stdout(stdout.trim());
         Ok(json!({
             "stdout": body,
@@ -505,6 +507,32 @@ mod tests {
             out["stdout"].as_str().unwrap().chars().count(),
             crate::git::STDOUT_CAP_CHARS + 1
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #598 part b: `git diff` never shows the lines of a sensitive file.
+    #[cfg(unix)]
+    #[test]
+    fn a_diff_hides_the_lines_of_a_sensitive_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("tole-git-env-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("git");
+        std::fs::write(
+            &bin,
+            "#!/bin/sh\nprintf 'diff --git a/.env b/.env\\n--- a/.env\\n+++ b/.env\\n\
+             @@ -1 +1 @@\\n-TOKEN=old-secret-1\\n+TOKEN=new-secret-2\\n'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let out = GitTool::new()
+            .with_bin(&bin)
+            .execute(json!({"op":"diff"}))
+            .unwrap();
+        let s = out["stdout"].as_str().unwrap();
+        assert!(!s.contains("secret"), "{s}");
+        assert!(s.contains("+«redacted»"), "{s}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

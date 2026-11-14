@@ -2,6 +2,13 @@
 
 **Status: PARKED (tier B) — 2026-11-04.**
 
+**Update 2026-11-10:** the owner approved the *serve-face* part of the UI epic
+(#523, #524): a graphical client (desktop, phone, web) needs a transcript read,
+resume-by-id and an event stream from `tole serve`. That is additive REST/SSE on the
+existing token-authenticated face, not this document's socket daemon; the daemon
+itself (client registry, idle timeout, hot-reload) stays parked. Shipped so far:
+`GET /sessions/{id}/entries` ([mobile-control.md](mobile-control.md#transcript-read-524)) resume-by-id ([mobile-control.md](mobile-control.md#resume-by-id-524)) and the SSE event stream ([mobile-control.md](mobile-control.md#event-stream-524)).
+
 **Park decision:** tole has no multi-client need today. This note records the
 jcode daemon design so a future need can be evaluated against a written
 reference instead of re-researching jcode. **Do not build it without an

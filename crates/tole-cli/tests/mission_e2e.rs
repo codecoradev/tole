@@ -286,6 +286,171 @@ fn verify_gate_overrides_the_completion_marker() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// Stop gates (`--on-turnend`) need the shell-tools feature.
+#[cfg(feature = "shell-tools")]
+const PROVIDER_KEY: &str = "sk-mission-provider-key-0123456789";
+#[cfg(feature = "shell-tools")]
+const GH_TOKEN: &str = "ghp_missionGithubToken0123456789";
+
+/// A hermetic `tole` command in `dir` with the two secrets in its
+/// environment. Root reads every process's /proc files whatever tole does,
+/// so under root tole runs as `nobody`: the guard is about same-user
+/// children.
+#[cfg(feature = "shell-tools")]
+fn secret_holding_tole(dir: &std::path::Path, base: &str, args: &[&str]) -> Command {
+    let home = dir.join("home");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
+    cmd.args(args)
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .env_remove("TOLE_MEMORY")
+        .env_remove("TOLE_MEMORY_NAMESPACE")
+        .env_remove("TOLE_SYSTEM_PROMPT")
+        .env_remove("TOLE_TRUST")
+        .env_remove("TOLE_AGENT_DEPTH")
+        .env_remove("TOLE_STREAM")
+        .env("CODECORA_HOME", &home)
+        .env("HOME", &home)
+        .env("TOLE_BASE_URL", base)
+        .env("TOLE_MODEL", "mock-model")
+        .env("TOLE_API_KEY", PROVIDER_KEY)
+        .env("GITHUB_TOKEN", GH_TOKEN);
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        use std::os::unix::process::CommandExt;
+        let _ = Command::new("chmod")
+            .args(["-R", "a+rwX"])
+            .arg(dir)
+            .status();
+        // SAFETY: only async-signal-safe calls between fork and exec.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setgroups(0, std::ptr::null()) != 0
+                    || libc::setgid(65534) != 0
+                    || libc::setuid(65534) != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    cmd
+}
+
+/// A mission whose verify command, and a `tole run` whose turn-end stop
+/// gate, record what they can see: their own environment and tole's
+/// (`/proc/$PPID/environ`). `user_config` is the hermetic user config.
+/// Returns [verify env, tole's environ read by verify, gate env, tole's
+/// environ read by the gate].
+#[cfg(feature = "shell-tools")]
+fn children_see(tag: &str, user_config: &str) -> [String; 4] {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = temp_dir(tag);
+    let home = dir.join("home");
+    std::fs::create_dir_all(home.join("tole")).unwrap();
+    std::fs::write(home.join("tole/config.toml"), user_config).unwrap();
+    let probe = |name: &str| {
+        format!(
+            "printenv > {d}/{name}_env.txt; \
+             tr '\\0' '\\n' < /proc/$PPID/environ > {d}/{name}_proc.txt; true",
+            d = dir.display()
+        )
+    };
+    let gate = dir.join("gate.sh");
+    std::fs::write(&gate, format!("#!/bin/sh\n{}\n", probe("gate"))).unwrap();
+    std::fs::set_permissions(&gate, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let sessions = dir.join("sessions");
+    let (s, w, g) = (
+        sessions.to_str().unwrap(),
+        dir.to_str().unwrap(),
+        gate.to_str().unwrap(),
+    );
+    let verify = probe("verify");
+    let mission = ["mission", "-s", s, "--workspace", w, "--yes"];
+    let mission = [&mission[..], &["--verify", &verify, "do it"]].concat();
+    let run = [
+        "run",
+        "-s",
+        s,
+        "--workspace",
+        w,
+        "--allow",
+        "todo_write",
+        "--on-turnend",
+        g,
+        "do it",
+    ];
+    for args in [&mission[..], &run[..]] {
+        let base = spawn_mock("NONE".into());
+        let out = secret_holding_tole(&dir, &base, args)
+            .output()
+            .expect("run tole");
+        assert!(
+            out.status.success(),
+            "{args:?} failed: {}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let read = |f: &str| std::fs::read_to_string(dir.join(f)).unwrap_or_default();
+    let seen = [
+        "verify_env.txt",
+        "verify_proc.txt",
+        "gate_env.txt",
+        "gate_proc.txt",
+    ]
+    .map(read);
+    assert!(!seen[0].is_empty(), "the verify command ran");
+    assert!(!seen[2].is_empty(), "the stop gate ran");
+    let _ = std::fs::remove_dir_all(&dir);
+    seen
+}
+
+/// #676 and #675: the verify command and the stop gates run code the agent
+/// wrote, unattended. By default they get no secret, and they cannot read
+/// the secrets out of tole's own environment through /proc either.
+#[test]
+#[cfg(feature = "shell-tools")]
+fn verify_and_stop_gates_get_no_secret_by_default() {
+    let seen = children_see("noscrt", "");
+    let what = [
+        "verify env",
+        "tole's environ read by verify",
+        "gate env",
+        "tole's environ read by the gate",
+    ];
+    for (what, seen) in what.iter().zip(&seen) {
+        assert!(
+            !seen.contains(PROVIDER_KEY),
+            "{what} holds the provider key"
+        );
+        assert!(!seen.contains(GH_TOKEN), "{what} holds GITHUB_TOKEN");
+    }
+    assert!(
+        seen[0].contains("TOLE_MODEL=mock-model"),
+        "non-secret env stays"
+    );
+}
+
+/// An explicit `[secrets]` grant to `verify` and `turnend` restores a token
+/// for them, and only that token.
+#[test]
+#[cfg(feature = "shell-tools")]
+fn a_secrets_grant_restores_a_token_for_verify_and_stop_gates() {
+    let seen = children_see(
+        "grant",
+        "[secrets]\nGITHUB_TOKEN = { tools = [\"verify\", \"turnend\"] }\n",
+    );
+    for (what, seen) in [("verify env", &seen[0]), ("gate env", &seen[2])] {
+        assert!(seen.contains(GH_TOKEN), "{what} lacks the granted token");
+        assert!(
+            !seen.contains(PROVIDER_KEY),
+            "{what} holds the provider key"
+        );
+    }
+}
+
 /// Budget exhaustion: `--max-steps 1` settles after one turn with a
 /// summary — and the session STAYS resumable (never a dead session).
 #[test]
@@ -451,5 +616,211 @@ fn mission_register_reports_cached_tokens_without_touching_budget_fields() {
     );
     assert!(status_out.contains("first step:"), "{status_out}");
     assert!(status_out.contains("(hit rate 100.0%)"), "{status_out}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A stand-in `cora` that speaks just enough MCP over stdio (`cora mcp`) to
+/// list the two review tools, so the auto-preset attaches them.
+#[cfg(all(unix, feature = "mcp"))]
+fn fake_cora_dir(dir: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let script = r#"#!/usr/bin/env python3
+import json, sys
+def reply(i, result=None, error=None):
+    m = {"jsonrpc": "2.0", "id": i}
+    m["error" if error else "result"] = error or result
+    sys.stdout.write(json.dumps(m) + "\n"); sys.stdout.flush()
+for line in sys.stdin:
+    try:
+        r = json.loads(line)
+    except Exception:
+        continue
+    i, m = r.get("id"), r.get("method")
+    if i is None:
+        continue
+    if m == "initialize":
+        reply(i, {"protocolVersion": r["params"]["protocolVersion"],
+                  "capabilities": {"tools": {}}, "serverInfo": {"name": "cora", "version": "0"}})
+    elif m == "tools/list":
+        schema = {"type": "object", "properties": {"diff": {"type": "string"}}}
+        reply(i, {"tools": [
+            {"name": "cora_review_prepare", "description": "prepare", "inputSchema": schema},
+            {"name": "cora_review_finalize", "description": "finalize", "inputSchema": schema}]})
+    else:
+        reply(i, error={"code": -32601, "message": "method not found"})
+"#;
+    let path = bin.join("cora");
+    std::fs::write(&path, script).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    bin
+}
+
+#[cfg(all(unix, feature = "mcp"))]
+/// #599: the owner's approval of the fake `cora` server (its exact tool
+/// manifest and version) in the user plugin lock of `home`, so the guard
+/// lets it register in an unattended run.
+fn approve_fake_cora(home: &std::path::Path) {
+    use tole_core::plugin_lock::{manifest_hash, LockEntry, Lockfile, ManifestTool, LOCK_FILE};
+    let s = json!({"type": "object", "properties": {"diff": {"type": "string"}}});
+    let tools: Vec<ManifestTool> = ["prepare", "finalize"]
+        .iter()
+        .map(|d| ManifestTool {
+            name: format!("cora_review_{d}"),
+            description: d.to_string(),
+            input_schema: s.clone(),
+        })
+        .collect();
+    let entry = LockEntry {
+        source: "stdio:cora mcp".into(),
+        version: "0".into(),
+        manifest_hash: manifest_hash(&tools),
+        ..Default::default()
+    };
+    let lock = Lockfile {
+        servers: [("cora".to_string(), entry)].into(),
+        ..Default::default()
+    };
+    lock.save(&home.join("tole").join(LOCK_FILE)).unwrap();
+}
+
+/// #536: a mission builds its registry like `run`, so with `cora` on PATH it
+/// has the review tools; its PINNED prompt must then name the review flow
+/// (it used not to), and without the tools it must not. Needs the `mcp`
+/// feature: the `cora mcp` auto-preset does not exist in a build without it.
+#[cfg(all(unix, feature = "mcp"))]
+#[test]
+fn mission_prompt_names_the_cora_review_flow_when_cora_is_attached() {
+    let base = spawn_mock("NONE".into());
+    let dir = temp_dir("review");
+    let bin = fake_cora_dir(&dir);
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let home = dir.join("home");
+    let env = [
+        ("TOLE_BASE_URL".to_string(), base),
+        ("TOLE_MODEL".to_string(), "mock-model".to_string()),
+        ("TOLE_API_KEY".to_string(), "sk-test".to_string()),
+        ("PATH".to_string(), path),
+        ("CODECORA_HOME".to_string(), home.display().to_string()),
+    ];
+    let env_ref: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+
+    let pinned = |extra: &[&str], tag: &str| -> String {
+        let sessions = dir.join(tag);
+        let mut args = vec![
+            "mission",
+            "-s",
+            sessions.to_str().unwrap(),
+            "--yes",
+            "--max-steps",
+            "12",
+        ];
+        args.extend_from_slice(extra);
+        args.push("accomplish the thing");
+        let (_out, err, code) = run_tole(&env_ref, &args);
+        assert_eq!(code, 0, "mission failed: {err}");
+        let file = std::fs::read_dir(&sessions)
+            .unwrap()
+            .flatten()
+            .find(|e| e.file_name().to_string_lossy().ends_with(".jsonl"))
+            .expect("session file");
+        std::fs::read_to_string(file.path()).unwrap()
+    };
+
+    // #599: unapproved, the server is unavailable to an unattended mission:
+    // no review tools, and a note naming the remedy.
+    let sessions = dir.join("unapproved");
+    let (_out, err, code) = run_tole(
+        &env_ref,
+        &[
+            "mission",
+            "-s",
+            sessions.to_str().unwrap(),
+            "--yes",
+            "--max-steps",
+            "12",
+            "go",
+        ],
+    );
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("not approved in the plugin lock"), "{err}");
+    let file = std::fs::read_dir(&sessions)
+        .unwrap()
+        .flatten()
+        .find(|e| e.file_name().to_string_lossy().ends_with(".jsonl"))
+        .unwrap();
+    let log = std::fs::read_to_string(file.path()).unwrap();
+    assert!(!log.contains("mcp_cora_cora_review_prepare"), "{log}");
+
+    approve_fake_cora(&home);
+    let with = pinned(&[], "with");
+    assert!(
+        with.contains("# Code review"),
+        "review section pinned: {with}"
+    );
+    assert!(with.contains("mcp_cora_cora_review_prepare"), "{with}");
+    assert!(
+        with.contains("MISSION MODE"),
+        "mission contract kept: {with}"
+    );
+
+    // Control: the same mission without the auto-preset has no review text.
+    let without = pinned(&["--no-auto-mcp"], "without");
+    assert!(!without.contains("# Code review"), "{without}");
+    assert!(without.contains("MISSION MODE"), "{without}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #593: how a mission ends is recorded for the skill curator. A completed
+/// mission that loaded no skill is a baseline success; an exhausted one is a
+/// baseline failure.
+#[test]
+fn a_mission_records_its_outcome_for_the_curator() {
+    let dir = temp_dir("curator-outcome");
+    let home = dir.join("home");
+    // A user the curator has something to manage for: a draft was made.
+    std::fs::create_dir_all(home.join("tole").join("skill-drafts")).unwrap();
+    let ledger =
+        tole_core::skill_curator::UsageLedger::new(home.join("tole").join("skill-usage.jsonl"));
+    for (max_steps, goal) in [
+        ("12", "accomplish the thing"),
+        ("1", "impossible in one turn"),
+    ] {
+        let base = spawn_mock("NONE".into());
+        let env = [
+            ("TOLE_BASE_URL".to_string(), base),
+            ("TOLE_MODEL".to_string(), "mock-model".to_string()),
+            ("TOLE_API_KEY".to_string(), "sk-test".to_string()),
+            ("CODECORA_HOME".to_string(), home.display().to_string()),
+            ("HOME".to_string(), home.display().to_string()),
+        ];
+        let env_ref: Vec<(&str, &str)> =
+            env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let sessions = dir.join(format!("sessions-{max_steps}"));
+        run_tole(
+            &env_ref,
+            &[
+                "mission",
+                "-s",
+                sessions.to_str().unwrap(),
+                "--yes",
+                "--max-steps",
+                max_steps,
+                goal,
+            ],
+        );
+    }
+    let s = ledger.summary();
+    assert_eq!(
+        (s.baseline.success, s.baseline.failure),
+        (1, 1),
+        "one complete and one exhausted mission: {s:?}"
+    );
+    assert!(s.skills.is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }

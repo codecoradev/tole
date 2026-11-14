@@ -164,3 +164,153 @@ fn stale_handle_refuses_to_append_after_foreign_write() {
         "nothing appended"
     );
 }
+
+/// #552: `flock` belongs to the open file description, so a child forked by
+/// ANOTHER thread briefly holds a duplicate of our lock descriptor until it
+/// execs (CLOEXEC only closes it AT exec). A reopen right after `drop` could
+/// then see `Locked`, with our own pid as the holder. The reopen must ride
+/// that out.
+#[test]
+fn a_reopen_after_drop_survives_children_forked_by_other_threads() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let dir = tmpdir("fork-race");
+    let stop = Arc::new(AtomicBool::new(false));
+    let spawners: Vec<_> = (0..3)
+        .map(|_| {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = Command::new("true").status();
+                }
+            })
+        })
+        .collect();
+
+    let mut failures = Vec::new();
+    for i in 0..6000 {
+        let id = format!("race-{}", i % 8);
+        let path = dir.join(format!("{id}.jsonl"));
+        let s = if path.exists() {
+            JsonlStorage::open(&path)
+        } else {
+            JsonlStorage::create(&dir, &id, None)
+        };
+        match s {
+            Ok(s) => drop(s),
+            Err(e) => failures.push(format!("round {i}: {e:?}")),
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    for t in spawners {
+        t.join().unwrap();
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of 6000 reopens failed, first: {:?}",
+        failures.len(),
+        failures.first()
+    );
+}
+
+/// Stands in for a forked child's duplicate of a closed lock descriptor:
+/// a thread takes the sidecar lock of session `id`, writes our own pid in
+/// it, and holds it for `ms` milliseconds. Returns once the lock is held.
+fn hold_as_duplicate(dir: &std::path::Path, id: &str, ms: u64) -> std::thread::JoinHandle<()> {
+    drop(JsonlStorage::create(dir, id, None).unwrap());
+    let lock_path = dir.join(format!("{id}.jsonl.lock"));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        // Children forked by other tests of this binary can still hold a
+        // duplicate of the lock `create` just released: wait for it.
+        while f.try_lock().is_err() {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        f.set_len(0).unwrap();
+        write!(f, "{}", std::process::id()).unwrap();
+        tx.send(()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    });
+    rx.recv().unwrap();
+    holder
+}
+
+/// #712: a forked child that has not exec'd yet can keep a duplicate of the
+/// closed lock descriptor for much longer than 150 ms on a starved machine
+/// (one CPU, heavy load). The hold names our own pid but no handle of this
+/// process owns it, so the reopen waits it out. The duplicate is simulated
+/// by a thread holding the sidecar lock, with our pid in it, for 700 ms.
+#[test]
+fn a_reopen_waits_out_a_long_lived_duplicate_of_a_closed_lock() {
+    let dir = tmpdir("long-dup");
+    let holder = hold_as_duplicate(&dir, "d", 700);
+    let s = JsonlStorage::open(dir.join("d.jsonl"));
+    assert!(s.is_ok(), "{:?}", s.err());
+    holder.join().unwrap();
+}
+
+/// The retry must not blur the two real refusals: another process holding
+/// the session fails at once, and a second open in THIS process (#475) still
+/// fails, after at most the bounded retry.
+#[test]
+fn real_second_opens_are_still_refused_within_the_bound() {
+    let dir = tmpdir("bound");
+    let mut child = spawn_holder(&dir, "plain");
+    let path = dir.join("held.jsonl");
+    let t = std::time::Instant::now();
+    let err = open_err(&path);
+    assert!(matches!(err, StorageError::Locked { .. }), "{err:?}");
+    assert!(
+        t.elapsed() < std::time::Duration::from_millis(50),
+        "a holder with another pid fails immediately, took {:?}",
+        t.elapsed()
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    let own = JsonlStorage::create(&dir, "own", None).unwrap();
+    let t = std::time::Instant::now();
+    let err = open_err(&dir.join("own.jsonl"));
+    assert!(
+        matches!(err, StorageError::Locked { holder: Some(p) } if p == std::process::id()),
+        "{err:?}"
+    );
+    assert!(
+        t.elapsed() < std::time::Duration::from_millis(1000),
+        "the same-process refusal is bounded, took {:?}",
+        t.elapsed()
+    );
+    drop(own);
+}
+
+/// The retry reads the lock file between attempts, which moves its cursor.
+/// The pid written once the lock IS taken must still land at offset 0, or
+/// the file is NUL-padded and the next refusal cannot name its holder.
+#[test]
+fn the_pid_is_written_cleanly_after_a_retried_acquisition() {
+    let dir = tmpdir("retry-pid");
+    let releaser = hold_as_duplicate(&dir, "r", 40);
+    // Blocks (retrying: the holder is our own pid, but no handle of ours)
+    // until the duplicate is released, then takes the lock.
+    let reopened = JsonlStorage::open(dir.join("r.jsonl")).expect("retry rides out the release");
+    releaser.join().unwrap();
+    let text = std::fs::read(dir.join("r.jsonl.lock")).unwrap();
+    assert_eq!(
+        text,
+        std::process::id().to_string().into_bytes(),
+        "the lock file holds exactly our pid, no padding"
+    );
+    // And a real refusal now still names us.
+    let err = open_err(&dir.join("r.jsonl"));
+    assert!(
+        matches!(err, StorageError::Locked { holder: Some(p) } if p == std::process::id()),
+        "{err:?}"
+    );
+    drop(reopened);
+}

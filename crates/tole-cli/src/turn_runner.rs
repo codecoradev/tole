@@ -6,11 +6,16 @@
 //! turn talks to, with which tools, under which system prompt.
 
 use std::sync::Arc;
+use tole_core::cancel::CancelToken;
 use tole_core::memory::MemoryConfig;
 use tole_core::openai::{OpenAiConfig, OpenAiProvider};
 use tole_core::provider::Provider;
-use tole_core::storage::Storage;
-use tole_core::turn::TurnObserver;
+use tole_core::state::Pc;
+use tole_core::storage::{Storage, StorageError};
+use tole_core::tool::ToolRegistry;
+use tole_core::turn::{self, TurnObserver, TurnOutcome};
+
+use crate::compaction_host::CompactionSettings;
 
 /// The one wording of a missing provider configuration.
 pub const MISSING_PROVIDER_CONFIG: &str = "missing provider config: set TOLE_BASE_URL / \
@@ -34,25 +39,59 @@ pub fn set_image_roots(workspace: Option<std::path::PathBuf>) {
     let _ = IMAGE_ROOTS.set(roots);
 }
 
-fn image_roots() -> Vec<std::path::PathBuf> {
+pub(crate) fn image_roots() -> Vec<std::path::PathBuf> {
     IMAGE_ROOTS.get().cloned().unwrap_or_default()
 }
 
-fn spill_dir() -> Option<std::path::PathBuf> {
+pub(crate) fn spill_dir() -> Option<std::path::PathBuf> {
     tole_core::paths::tole_data_dir().map(|d| d.join("images"))
 }
 
 /// Resolve `--image` specs (workspace-jailed paths or `data:` URLs) to
 /// durable references. Fails loudly on the first bad one.
 pub fn resolve_images(specs: &[String]) -> anyhow::Result<Vec<tole_core::image::ImageRef>> {
-    let roots = image_roots();
     specs
         .iter()
-        .map(|s| {
-            tole_core::image::resolve(s, &roots, spill_dir().as_deref())
-                .map_err(|e| anyhow::anyhow!("--image: {e}"))
-        })
+        .map(|s| resolve_image(s).map_err(|e| anyhow::anyhow!("--image: {e}")))
         .collect()
+}
+
+/// Resolve ONE image spec — a workspace-jailed path or a `data:` URL — to
+/// a durable reference (#559): what `chat`'s `/image` and the TUI host's
+/// pending images use for a later message. Same jail, cap and sniffing as
+/// `--image`.
+pub fn resolve_image(spec: &str) -> Result<tole_core::image::ImageRef, String> {
+    tole_core::image::resolve(spec.trim(), &image_roots(), spill_dir().as_deref())
+        .map_err(|e| e.to_string())
+}
+
+/// Resolve inline base64 image bytes (an ACP `image` content block, #559)
+/// through the same spill-and-reference path as a CLI `data:` URL. The
+/// client's declared MIME type is not trusted: the bytes are sniffed, and
+/// only png/jpeg/gif/webp within the size cap are accepted.
+pub fn resolve_inline_image(base64: &str) -> Result<tole_core::image::ImageRef, String> {
+    // Refuse an oversize payload BEFORE decoding it: 4 base64 chars carry 3
+    // bytes, so anything longer than this cannot fit the cap.
+    let max_b64 = tole_core::image::MAX_IMAGE_BYTES.div_ceil(3) * 4;
+    if base64.trim().len() as u64 > max_b64 {
+        return Err(format!(
+            "image: inline image exceeds the {}-byte cap",
+            tole_core::image::MAX_IMAGE_BYTES
+        ));
+    }
+    tole_core::image::resolve(
+        &format!("data:image;base64,{}", base64.trim()),
+        &[],
+        spill_dir().as_deref(),
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// Whether inline images can be accepted at all: they are spilled to the
+/// data dir, so without one (no HOME / CODECORA_HOME) they are refused.
+/// ACP advertises `promptCapabilities.image` from this.
+pub fn inline_images_supported() -> bool {
+    spill_dir().is_some()
 }
 
 /// The model a session turn uses: the session's durable `fact/model`
@@ -60,7 +99,10 @@ pub fn resolve_images(specs: &[String]) -> anyhow::Result<Vec<tole_core::image::
 /// default, so a session keeps its model across faces and resumes.
 pub fn session_model(storage: &impl Storage, default: &str) -> String {
     storage
-        .get_register("fact", "model")
+        .get_register(
+            crate::session_settings::MODEL.0,
+            crate::session_settings::MODEL.1,
+        )
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
         .filter(|m| !m.is_empty())
@@ -75,7 +117,10 @@ pub fn session_model(storage: &impl Storage, default: &str) -> String {
 /// back to the default.
 pub fn session_effort(storage: &impl Storage, default: Option<&str>) -> Option<String> {
     storage
-        .get_register("fact", "reasoning_effort")
+        .get_register(
+            crate::session_settings::EFFORT.0,
+            crate::session_settings::EFFORT.1,
+        )
         .and_then(serde_json::Value::as_str)
         .and_then(|v| tole_core::openai::parse_reasoning_effort(v).ok())
         .or_else(|| default.map(str::to_string))
@@ -130,6 +175,160 @@ pub fn session_provider(
     })
 }
 
+/// Everything one turn needs besides the session's storage and the prompt
+/// (#525): the one description of "how a turn is run" that the server faces
+/// (`serve`, ACP, MCP) and the TUI share. What differs between faces is
+/// explicit here, not copied code:
+///
+/// - the server faces start a turn straight away and never compact;
+/// - the TUI settles a turn parked mid-flight first and compacts when due.
+pub struct TurnPlan<'a> {
+    /// Provider connection settings (the model register may override the
+    /// model per session, see [`session_provider`]).
+    pub cfg: OpenAiConfig,
+    pub registry: &'a ToolRegistry,
+    pub system_prompt: Option<&'a str>,
+    pub cancel: &'a CancelToken,
+    /// Live text/tool callbacks; attaching one turns provider streaming on.
+    pub observer: Option<&'a Arc<dyn TurnObserver>>,
+    /// Settle a turn parked mid-flight (a provider failure, ...) before a
+    /// new prompt starts. When settling does not end `Final`, that outcome
+    /// IS the answer and the new prompt is not run.
+    pub resolve_parked: bool,
+    /// Compact before the turn when due (`None` = never).
+    pub compaction: Option<CompactionSettings>,
+}
+
+/// Why a turn could not run to an outcome.
+#[derive(Debug)]
+pub enum TurnRunError {
+    /// The provider could not be built (bad config, no failover target, ...).
+    Provider(String),
+    /// The session's storage failed.
+    Storage(StorageError),
+}
+
+impl TurnRunError {
+    /// The plain message the server faces return (the TUI adds its own
+    /// `storage error:` prefix).
+    pub fn into_message(self) -> String {
+        match self {
+            TurnRunError::Provider(e) => e,
+            TurnRunError::Storage(e) => e.to_string(),
+        }
+    }
+}
+
+impl TurnPlan<'_> {
+    fn provider(&self, storage: &impl Storage) -> Result<Box<dyn Provider>, TurnRunError> {
+        session_provider(
+            self.cfg.clone(),
+            storage,
+            self.registry.specs(),
+            self.system_prompt,
+            self.observer,
+        )
+        .map_err(TurnRunError::Provider)
+    }
+}
+
+/// Run one user turn on `storage`: build the session's provider, then
+/// [`run_turn_with`].
+pub fn run_turn_on<S: Storage>(
+    storage: &mut S,
+    plan: &TurnPlan<'_>,
+    prompt: &str,
+) -> Result<TurnOutcome, TurnRunError> {
+    run_turn_on_with_images(storage, plan, prompt, &[])
+}
+
+/// [`run_turn_on`] with images attached to THIS turn's user message (#559):
+/// any turn of a session can carry images, not only the first.
+pub fn run_turn_on_with_images<S: Storage>(
+    storage: &mut S,
+    plan: &TurnPlan<'_>,
+    prompt: &str,
+    images: &[tole_core::image::ImageRef],
+) -> Result<TurnOutcome, TurnRunError> {
+    let mut provider = plan.provider(&*storage)?;
+    run_turn_with_images(storage, &mut *provider, plan, prompt, images)
+}
+
+/// The turn itself, with a provider already built: settle a parked turn
+/// (when the plan asks), compact (when the plan asks and it is due), then run
+/// the prompt.
+pub fn run_turn_with<S: Storage>(
+    storage: &mut S,
+    provider: &mut dyn Provider,
+    plan: &TurnPlan<'_>,
+    prompt: &str,
+) -> Result<TurnOutcome, TurnRunError> {
+    run_turn_with_images(storage, provider, plan, prompt, &[])
+}
+
+/// [`run_turn_with`] with images on the new user message (#559). When a
+/// parked turn does not settle `Final`, the prompt is not run and the
+/// images are not recorded either.
+pub fn run_turn_with_images<S: Storage>(
+    storage: &mut S,
+    provider: &mut dyn Provider,
+    plan: &TurnPlan<'_>,
+    prompt: &str,
+    images: &[tole_core::image::ImageRef],
+) -> Result<TurnOutcome, TurnRunError> {
+    if plan.resolve_parked && !matches!(storage.state().pc, Pc::Idle | Pc::Final) {
+        match turn::resume_turn_with_cancel(storage, provider, plan.registry, plan.cancel)
+            .map_err(TurnRunError::Storage)?
+        {
+            TurnOutcome::Final { .. } => {}
+            other => return Ok(other),
+        }
+    }
+    if let Some(settings) = plan.compaction {
+        crate::compaction_host::for_session(settings, &plan.cfg, &*storage)
+            .before_turn(storage, provider);
+    }
+    turn::run_turn_with_images(
+        storage,
+        provider,
+        plan.registry,
+        prompt,
+        images,
+        plan.cancel,
+        plan.observer.map(|o| o.as_ref()),
+    )
+    .map_err(TurnRunError::Storage)
+}
+
+/// Approvals-only recovery (#200): no new prompt, settle the parked guarded
+/// effect and replan to completion.
+pub fn resume_turn_on<S: Storage>(
+    storage: &mut S,
+    plan: &TurnPlan<'_>,
+) -> Result<TurnOutcome, TurnRunError> {
+    let mut provider = plan.provider(&*storage)?;
+    turn::resume_turn_with_cancel(storage, &mut *provider, plan.registry, plan.cancel)
+        .map_err(TurnRunError::Storage)
+}
+
+/// [`resume_turn_on`] with a provider already built, and with the plan's
+/// observer: a parked turn continued under the same plan as a fresh one
+/// (cron's continuation keeps its step budget, #581).
+pub fn resume_turn_with<S: Storage>(
+    storage: &mut S,
+    provider: &mut dyn Provider,
+    plan: &TurnPlan<'_>,
+) -> Result<TurnOutcome, TurnRunError> {
+    turn::resume_turn_with_observer(
+        storage,
+        provider,
+        plan.registry,
+        plan.cancel,
+        plan.observer.map(|o| o.as_ref()),
+    )
+    .map_err(TurnRunError::Storage)
+}
+
 /// Pre-turn recall (memory loop): the prompt with the recalled block
 /// appended — what the provider sees and the durable log records. No
 /// memory configured, nothing recalled, or a failed recall (reported on
@@ -166,7 +365,16 @@ pub fn remember(
     let Some(mem) = memory else {
         return;
     };
-    match tole_core::memory::remember_session(mem, session_id, first_prompt, last_answer, wrote) {
+    // #595: the summary leaves the process; known secrets never do.
+    let secrets = crate::provider_chain::process_secrets(&crate::config_apply::real_env);
+    match tole_core::memory::remember_session(
+        mem,
+        session_id,
+        first_prompt,
+        last_answer,
+        wrote,
+        &secrets,
+    ) {
         Ok(_) => eprintln!("tole: memory: session summary stored in room {}", mem.room),
         Err(e) => eprintln!("tole: memory remember failed (session unaffected): {e}"),
     }
@@ -316,6 +524,235 @@ mod tests {
         );
         set(&mut st, serde_json::json!(""));
         assert_eq!(session_effort(&st, Some("low")).as_deref(), Some("low"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // ---- the shared turn runner (#525) ----
+
+    use tole_core::mock::MockProvider;
+    use tole_core::provider::ProviderOutput;
+
+    fn final_out(t: &str) -> ProviderOutput {
+        ProviderOutput::Final { text: t.into() }
+    }
+
+    fn plan<'a>(
+        registry: &'a ToolRegistry,
+        cancel: &'a CancelToken,
+        resolve_parked: bool,
+    ) -> TurnPlan<'a> {
+        TurnPlan {
+            cfg: OpenAiConfig::new("http://127.0.0.1:1/v1", "m", "k"),
+            registry,
+            system_prompt: None,
+            cancel,
+            observer: None,
+            resolve_parked,
+            compaction: None,
+        }
+    }
+
+    fn text_of(o: &TurnOutcome) -> &str {
+        match o {
+            TurnOutcome::Final { text, .. } => text,
+            other => panic!("expected Final, got {other:?}"),
+        }
+    }
+
+    /// Park a turn the way a crash does: the user message is durable and the
+    /// machine is mid-flight (`Planning`), as in the core's resume tests.
+    fn park(storage: &mut JsonlStorage) {
+        use tole_core::entry::{EntryType, NewEntry};
+        use tole_core::state::StateTransition;
+        let seq = storage.state().seq;
+        storage
+            .commit(
+                Commit::new()
+                    .entry(NewEntry::root(
+                        EntryType::new(EntryType::MESSAGE),
+                        serde_json::json!({"role": "user", "text": "parked prompt"}),
+                    ))
+                    .transition(StateTransition::from(seq, Pc::Planning)),
+            )
+            .unwrap();
+        assert_eq!(storage.state().pc, Pc::Planning);
+    }
+
+    #[test]
+    fn a_plain_turn_runs_the_prompt_and_appends_to_the_log() {
+        let (mut s, dir) = storage("plain");
+        let reg = ToolRegistry::new();
+        let cancel = CancelToken::default();
+        let mut p = MockProvider::scripted(vec![final_out("hello")]);
+        let out = run_turn_with(&mut s, &mut p, &plan(&reg, &cancel, false), "hi").unwrap();
+        assert_eq!(text_of(&out), "hello");
+        assert!(
+            s.entries().len() >= 2,
+            "user message and answer are durable"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn image(tag: &str) -> tole_core::image::ImageRef {
+        tole_core::image::ImageRef {
+            path: format!("/ws/{tag}.png"),
+            mime: "image/png".into(),
+            bytes: 33,
+            fnv1a64: format!("{tag:0>16}"),
+        }
+    }
+
+    /// #559: an oversize inline image is refused before it is decoded.
+    #[test]
+    fn an_oversize_inline_image_is_refused_before_decoding() {
+        let cap = tole_core::image::MAX_IMAGE_BYTES as usize;
+        let huge = "A".repeat(cap.div_ceil(3) * 4 + 4);
+        let e = resolve_inline_image(&huge).unwrap_err();
+        assert!(e.contains("cap"), "{e}");
+    }
+
+    /// #559: images ride on ANY turn — the second turn's user message
+    /// records its own references, and the first keeps only its own.
+    #[test]
+    fn each_turn_records_its_own_images() {
+        let (mut s, dir) = storage("images");
+        let reg = ToolRegistry::new();
+        let cancel = CancelToken::default();
+        let mut p = MockProvider::scripted(vec![final_out("one"), final_out("two")]);
+        run_turn_with(&mut s, &mut p, &plan(&reg, &cancel, false), "first").unwrap();
+        let (a, b) = (image("a"), image("b"));
+        let out = run_turn_with_images(
+            &mut s,
+            &mut p,
+            &plan(&reg, &cancel, false),
+            "second",
+            &[a.clone(), b.clone()],
+        )
+        .unwrap();
+        assert_eq!(text_of(&out), "two");
+        let users: Vec<_> = s
+            .entries()
+            .iter()
+            .filter(|e| e.payload["role"] == "user")
+            .collect();
+        assert_eq!(users.len(), 2);
+        assert_eq!(users[0].payload["text"], "first");
+        assert!(users[0].payload.get("images").is_none());
+        assert_eq!(users[1].payload["text"], "second");
+        assert_eq!(
+            users[1].payload["images"],
+            serde_json::json!([a.to_value(), b.to_value()])
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_parked_turn_is_settled_first_only_when_the_plan_asks() {
+        let reg = ToolRegistry::new();
+        let cancel = CancelToken::default();
+
+        // TUI-style: the parked turn is resolved (consuming one provider
+        // output), THEN the new prompt runs (consuming the next).
+        let (mut s, dir) = storage("parked-yes");
+        park(&mut s);
+        let mut p = MockProvider::scripted(vec![final_out("settled"), final_out("answer")]);
+        let out = run_turn_with(&mut s, &mut p, &plan(&reg, &cancel, true), "second").unwrap();
+        assert_eq!(text_of(&out), "answer");
+        assert!(
+            s.entries()
+                .iter()
+                .any(|e| e.payload.to_string().contains("settled")),
+            "the parked turn finished before the new prompt"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+
+        // Server-style (the plan does not ask): the core refuses to start a
+        // prompt on a parked session ("resolve the session first"). That is
+        // what the server faces always did, and it is why the TUI asks for
+        // settling: the refusal surfaces as a storage error, nothing runs.
+        let (mut s, dir) = storage("parked-no");
+        park(&mut s);
+        let before = s.entries().len();
+        let mut p = MockProvider::scripted(vec![final_out("answer")]);
+        match run_turn_with(&mut s, &mut p, &plan(&reg, &cancel, false), "second") {
+            Err(TurnRunError::Storage(e)) => {
+                assert!(e.to_string().contains("resolve the session first"), "{e}")
+            }
+            other => panic!("expected the core's refusal, got {other:?}"),
+        }
+        assert_eq!(s.entries().len(), before, "nothing was written");
+        let _ = std::fs::remove_dir_all(dir);
+
+        // When settling does NOT end Final, that outcome is the answer and
+        // the new prompt is not run.
+        let (mut s, dir) = storage("parked-stop");
+        park(&mut s);
+        let mut p = MockProvider::scripted_with_failures(vec![]);
+        let out = run_turn_with(&mut s, &mut p, &plan(&reg, &cancel, true), "second").unwrap();
+        assert!(matches!(out, TurnOutcome::ProviderFailed { .. }), "{out:?}");
+        assert!(
+            !s.entries()
+                .iter()
+                .any(|e| e.payload.to_string().contains("second")),
+            "the new prompt was not started"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn compaction_runs_only_when_the_plan_asks() {
+        use crate::compaction_host::CompactionSettings;
+        let reg = ToolRegistry::new();
+        let cancel = CancelToken::default();
+        let seeded = |tag: &str| {
+            let (mut s, dir) = storage(tag);
+            for n in 0..4 {
+                let mut p = MockProvider::scripted(vec![final_out(&format!("a{n}"))]);
+                run_turn_with(
+                    &mut s,
+                    &mut p,
+                    &plan(&reg, &cancel, false),
+                    &format!("q{n}"),
+                )
+                .unwrap();
+            }
+            // The forced pass of #481: the next prompt compacts first.
+            tole_core::compaction::mark_overflow(&mut s).unwrap();
+            assert!(tole_core::compaction::overflow_pending(&s));
+            (s, dir)
+        };
+
+        // The plan asks: the pending pass runs first (consuming the summary
+        // output) and then the prompt (consuming the answer).
+        let (mut s, dir) = seeded("compact-on");
+        let mut on = plan(&reg, &cancel, false);
+        on.compaction = Some(CompactionSettings::default());
+        let mut p = MockProvider::scripted(vec![final_out("SUMMARY"), final_out("two")]);
+        let out = run_turn_with(&mut s, &mut p, &on, "second").unwrap();
+        assert_eq!(text_of(&out), "two");
+        assert!(!tole_core::compaction::overflow_pending(&s), "the pass ran");
+        let _ = std::fs::remove_dir_all(dir);
+
+        // The plan does not ask (the server faces): nothing is compacted and
+        // the first output answers the prompt.
+        let (mut s, dir) = seeded("compact-off");
+        let mut p = MockProvider::scripted(vec![final_out("two")]);
+        let out = run_turn_with(&mut s, &mut p, &plan(&reg, &cancel, false), "second").unwrap();
+        assert_eq!(text_of(&out), "two");
+        assert!(tole_core::compaction::overflow_pending(&s), "no pass ran");
+        let _ = std::fs::remove_dir_all(dir);
+
+        // Enabled = false in the settings is off even when the plan asks.
+        let (mut s, dir) = seeded("compact-disabled");
+        let mut off = plan(&reg, &cancel, false);
+        off.compaction = Some(CompactionSettings {
+            enabled: false,
+            ..CompactionSettings::default()
+        });
+        let mut p = MockProvider::scripted(vec![final_out("two")]);
+        let out = run_turn_with(&mut s, &mut p, &off, "second").unwrap();
+        assert_eq!(text_of(&out), "two");
+        assert!(tole_core::compaction::overflow_pending(&s));
         let _ = std::fs::remove_dir_all(dir);
     }
 }

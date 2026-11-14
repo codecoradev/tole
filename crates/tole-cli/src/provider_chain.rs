@@ -13,6 +13,7 @@
 use tole_core::failover::{FailoverProvider, Link};
 use tole_core::openai::{OpenAiConfig, OpenAiProvider};
 use tole_core::provider::Provider;
+use tole_core::secrets::SecretSet;
 
 pub const ENV_FALLBACK_BASE_URL: &str = "TOLE_FALLBACK_BASE_URL";
 pub const ENV_FALLBACK_MODEL: &str = "TOLE_FALLBACK_MODEL";
@@ -56,6 +57,34 @@ pub fn label(role: &str, cfg: &OpenAiConfig) -> String {
     )
 }
 
+/// The known secrets of this process (#595): every secret-named env var
+/// plus the values the web backend headers expand from `${NAME}`, whatever
+/// their names, and the secrets tole holds by role (webhook keys, the serve
+/// token, #682). One set for every egress sink a session has.
+pub fn process_secrets(env: &dyn Fn(&str) -> Option<String>) -> SecretSet {
+    tole_core::web::header_secrets(env)
+        .into_iter()
+        .chain(tole_core::secrets::role_secrets())
+        .fold(SecretSet::from_env(), |set, (name, value)| {
+            set.with(&name, &value)
+        })
+}
+
+/// The set the session log redacts with (#596): `base` plus each
+/// provider's key and base-URL password, everything a request body is
+/// redacted with.
+pub fn log_secrets(
+    base: &SecretSet,
+    primary: &OpenAiConfig,
+    reserve: Option<&OpenAiConfig>,
+) -> SecretSet {
+    let set = tole_core::openai::provider_secrets(base, primary);
+    match reserve {
+        Some(r) => tole_core::openai::provider_secrets(&set, r),
+        None => set,
+    }
+}
+
 /// Build the session's provider: `configure` is applied to the primary and,
 /// when configured, to the reserve.
 pub fn build(
@@ -63,17 +92,26 @@ pub fn build(
     env: &dyn Fn(&str) -> Option<String>,
     configure: impl Fn(OpenAiProvider) -> OpenAiProvider,
 ) -> Result<Box<dyn Provider>, String> {
-    let Some(reserve) = fallback_config(&primary, env)? else {
-        return Ok(Box::new(configure(OpenAiProvider::new(primary))));
+    // #595: every known secret of this process is redacted from what the
+    // provider sees, not only its own key. Collected once per session build.
+    let secrets = process_secrets(env);
+    let make = |cfg: OpenAiConfig| configure(OpenAiProvider::new(cfg).with_secrets(&secrets));
+    let reserve = fallback_config(&primary, env)?;
+    // #596: the session log redacts with every secret a provider request
+    // is redacted with (both providers' keys and URL passwords), so the log
+    // never holds a value the provider was not shown redacted.
+    tole_core::secrets::set_process_secrets(log_secrets(&secrets, &primary, reserve.as_ref()));
+    let Some(reserve) = reserve else {
+        return Ok(Box::new(make(primary)));
     };
     let chain = vec![
         Link {
             label: label("primary", &primary),
-            provider: Box::new(configure(OpenAiProvider::new(primary))),
+            provider: Box::new(make(primary)),
         },
         Link {
             label: label("fallback", &reserve),
-            provider: Box::new(configure(OpenAiProvider::new(reserve))),
+            provider: Box::new(make(reserve)),
         },
     ];
     Ok(Box::new(FailoverProvider::new(chain)))
@@ -89,6 +127,34 @@ mod tests {
                 .iter()
                 .find(|(n, _)| *n == k)
                 .map(|(_, v)| v.to_string())
+        }
+    }
+
+    #[test]
+    fn the_log_redacts_every_secret_the_providers_are_shown_redacted() {
+        // #596: the set build installs for the session log includes both
+        // providers keys and URL passwords, which no env name carries.
+        let primary = OpenAiConfig::new(
+            "https://u:pw-primary-0596@a.example/v1",
+            "m",
+            "sk-p-0596-key",
+        );
+        let reserve = OpenAiConfig::new(
+            "https://v:pw-reserve-0596@b.example/v1",
+            "m2",
+            "sk-r-0596-key",
+        );
+        let set = log_secrets(&SecretSet::default(), &primary, Some(&reserve));
+        for v in [
+            "pw-primary-0596",
+            "pw-reserve-0596",
+            "sk-p-0596-key",
+            "sk-r-0596-key",
+        ] {
+            assert!(
+                !set.redact(&format!("x {v} y")).contains(v),
+                "{v} not in the log set"
+            );
         }
     }
 

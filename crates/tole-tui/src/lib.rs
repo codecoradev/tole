@@ -7,10 +7,19 @@
 //! lines are committed to the terminal scrollback, the viewport only holds the
 //! live stream line, the editor and the footer.
 
+mod clipboard;
 mod editor;
 mod files;
+mod input;
+mod keymap;
+#[cfg(test)]
+mod keymap_tests;
 mod menu;
+mod paste;
+mod render;
 mod sanitize;
+mod term_input;
+mod theme;
 mod transcript;
 
 use std::io::{self, Stdout};
@@ -19,25 +28,28 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyboardEnhancementFlags,
     PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use crossterm::{execute, queue};
 use ratatui::backend::{Backend, CrosstermBackend};
-use ratatui::layout::{Constraint, Layout, Position};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
-use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
+use ratatui::text::Line;
+use ratatui::widgets::Paragraph;
+use ratatui::{Terminal, TerminalOptions, Viewport};
 use serde_json::Value;
 use tole_core::approval::Verdict;
 use tole_core::cancel::CancelToken;
+use tole_core::tool::Risk;
 use tole_core::turn::TurnObserver;
 
 pub use editor::Editor;
+pub use input::{Input, Key, KeyPress, Mods};
+pub use keymap::{KeyAction, KeySpec, Keymap};
 pub use menu::{Item, PickKind};
+use render::{styled, wrap};
 pub(crate) use sanitize::{one_line, sanitize};
+pub use theme::{parse_color, parse_spec, Role, Theme, BUILTIN as BUILTIN_THEMES};
 pub use transcript::{Kind, Out, Transcript};
 
 /// live area (5: stream + hint, or a picker/menu) + editor (top border + 4) + footer (1).
@@ -91,6 +103,22 @@ pub enum TurnEnd {
 pub trait TuiHost: Sync {
     /// Current footer fields (called at start and after every turn).
     fn footer(&self) -> Footer;
+    /// The color theme (#463). Read once at start; the scrollback is
+    /// append-only, so it is not switched live. The default is the built-in
+    /// `default` theme.
+    fn theme(&self) -> Theme {
+        Theme::default()
+    }
+    /// The key bindings (#463). Read once at start. The default is the
+    /// built-in keymap (today's keys).
+    fn keymap(&self) -> Keymap {
+        Keymap::default()
+    }
+    /// One note line shown at start (for example why a configured theme or
+    /// keymap was not used).
+    fn startup_note(&self) -> Option<String> {
+        None
+    }
     /// Run one full turn (blocking). Streamed output goes through `observer`;
     /// `cancel` is set by Esc.
     fn run_turn(
@@ -100,46 +128,27 @@ pub trait TuiHost: Sync {
         observer: Arc<dyn TurnObserver>,
     ) -> TurnEnd;
 
-    // Slash-command surface (#461). Called only while no turn runs, so a
-    // host may take its session lock without blocking the UI.
-    /// Model ids for the picker (`/models`).
-    fn models(&self) -> Result<Vec<String>, String> {
-        unsupported()
-    }
-    /// Pin the session model (`fact/model`); applies from the next call.
-    fn set_model(&self, _id: &str) -> Result<(), String> {
-        unsupported()
-    }
-    /// Set (`Some`) or clear (`None`) the session reasoning effort.
-    fn set_effort(&self, _level: Option<&str>) -> Result<(), String> {
-        unsupported()
-    }
-    /// Ask for a compaction pass before the next prompt.
-    fn request_compaction(&self) -> Result<(), String> {
-        unsupported()
-    }
-    /// Start a fresh session; returns its id.
-    fn new_session(&self) -> Result<String, String> {
-        unsupported()
-    }
-    fn sessions(&self) -> Result<Vec<SessionItem>, String> {
-        unsupported()
-    }
-    /// Swap the session turns run against; returns its id.
-    fn switch_session(&self, _id: &str) -> Result<String, String> {
-        unsupported()
-    }
-    fn status_lines(&self) -> Vec<String> {
-        Vec::new()
-    }
-    fn set_name(&self, _name: &str) -> Result<(), String> {
-        unsupported()
+    /// Apply a slash command or hotkey to the session (#461, #526): the one
+    /// call a host implements for everything beyond a turn and the footer, so
+    /// a remote adapter has three methods to write. Called only while no turn
+    /// runs, so a host may take its session lock without blocking the UI. The
+    /// reply carries data only; the wording shown to the user is the UI's.
+    ///
+    /// The default supports nothing but `Status` (no lines) and `Images`
+    /// (none pending).
+    fn apply(&self, cmd: HostCmd) -> Result<HostReply, String> {
+        match cmd {
+            HostCmd::Status => Ok(HostReply::Lines(Vec::new())),
+            HostCmd::Images => Ok(HostReply::Images(Vec::new())),
+            _ => unsupported(),
+        }
     }
 }
 
 /// What the loop asks of the host for a slash command or hotkey (#461). The
-/// host applies it to the session (registers, storage); the loop then
-/// refreshes the footer, so a switch shows on the next draw.
+/// host applies it to the session (registers, storage) through
+/// [`TuiHost::apply`]; the loop then refreshes the footer, so a switch shows
+/// on the next draw.
 #[derive(Debug, PartialEq, Eq)]
 pub enum HostCmd {
     PickModel,
@@ -151,8 +160,74 @@ pub enum HostCmd {
     New,
     PickSession,
     Switch(String),
+    /// `/fork [entry]` (#463): fork the current session at a settled entry
+    /// (`None` = the last one) and switch to the fork. Answers `Session`.
+    Fork(Option<String>),
+    /// `/tree` (#463): the current session's fork family for the picker.
+    /// Answers `Sessions`; picking a row sends `Switch`.
+    PickTree,
     Status,
     Name(String),
+    /// `/image <spec>` or a pasted image path / `data:image/…` URL (#560):
+    /// queue an image for the NEXT message. The host resolves `spec` (jail,
+    /// size cap, type sniffing) and refuses what it cannot attach.
+    AttachImage(String),
+    /// `/image clear`: drop every queued image.
+    ClearImages,
+    /// The images queued for the next message (`/image`, and after a turn
+    /// that may have handed them back).
+    Images,
+    /// `/copy` (#463): the text of the session's last assistant answer.
+    LastAnswer,
+    /// `/export [path]` (#463): write the transcript to a file (format by
+    /// extension, `.html` or `.jsonl`; `None` = the host's default path).
+    /// The host jails the path and refuses to overwrite.
+    Export(Option<String>),
+}
+
+/// What the host answers to a [`HostCmd`] (#526): data, never wording.
+#[derive(Debug, PartialEq, Eq)]
+pub enum HostReply {
+    /// The change was applied (`SetModel`, `SetEffort`, `Compact`, `Name`).
+    Done,
+    /// The session turns now run against (`New`, `Switch`, `Fork`).
+    Session(String),
+    /// Model ids for the picker (`PickModel`).
+    Models(Vec<String>),
+    /// Sessions for the picker (`PickSession`, `PickTree`).
+    Sessions(Vec<SessionItem>),
+    /// Lines to show (`Status`).
+    Lines(Vec<String>),
+    /// The images now queued for the next message, in attach order
+    /// (`AttachImage`, `ClearImages`, `Images`).
+    Images(Vec<ImageItem>),
+    /// The last assistant answer, `None` when the session has none
+    /// (`LastAnswer`).
+    Answer(Option<String>),
+    /// Where the transcript was written (`Export`).
+    Path(String),
+}
+
+/// One image queued for the next message, as the host resolved it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImageItem {
+    pub path: String,
+    /// Sniffed from the bytes: `image/png|jpeg|gif|webp`.
+    pub mime: String,
+    pub bytes: u64,
+}
+
+impl ImageItem {
+    /// `shot.png (image/png, 12 KiB)`: the file name, not the whole path.
+    fn label(&self) -> String {
+        let name = self.path.rsplit(['/', '\\']).next().unwrap_or(&self.path);
+        let size = match self.bytes {
+            b if b < 1024 => format!("{b} B"),
+            b if b < 1024 * 1024 => format!("{} KiB", b.div_ceil(1024)),
+            b => format!("{:.1} MiB", b as f64 / (1024.0 * 1024.0)),
+        };
+        one_line(&format!("{name} ({}, {size})", self.mime))
+    }
 }
 
 /// A past session for the `/resume` picker.
@@ -166,34 +241,111 @@ fn unsupported<T>() -> Result<T, String> {
     Err("not supported by this host".into())
 }
 
-/// A tool call waiting for y/n. Dropping it unanswered denies (fail closed).
-pub struct Pending {
+/// What a UI shows and decides on for one approval, whoever asked (#526): an
+/// in-process turn ([`Prompter::ask`]) or a remote source such as a server's
+/// `/approvals` queue ([`Prompter::post`]). It carries the risk tier, so the
+/// rule that a `Destructive` call is never "allowed always" lives in one place
+/// instead of in each UI.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApprovalRequest {
     text: String,
-    destructive: bool,
-    reply: Sender<Verdict>,
+    risk: Risk,
 }
 
-/// Handed to the host's approver; blocks the turn thread until the UI answers.
+impl ApprovalRequest {
+    /// `text` is reduced to one safe line (control characters removed).
+    pub fn new(text: impl AsRef<str>, risk: Risk) -> Self {
+        Self {
+            text: one_line(text.as_ref()),
+            risk,
+        }
+    }
+
+    /// What is being asked, as one line.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub fn risk(&self) -> Risk {
+        self.risk
+    }
+
+    pub fn is_destructive(&self) -> bool {
+        self.risk == Risk::Destructive
+    }
+
+    /// Whether a UI may offer to allow this kind of call from now on. Never for
+    /// `Destructive`: it is asked every time (the approver never allowlists it).
+    pub fn can_allow_always(&self) -> bool {
+        !self.is_destructive()
+    }
+}
+
+/// An approval waiting for an answer: the request plus where the verdict goes.
+/// The verdict is delivered exactly once, and **dropping the `Pending`
+/// unanswered denies** (fail closed), so a cancelled turn, a vanished UI or a
+/// dropped connection can never leave a call allowed.
+pub struct Pending {
+    request: ApprovalRequest,
+    reply: Option<Box<dyn FnOnce(Verdict) + Send>>,
+}
+
+impl Pending {
+    pub fn new(request: ApprovalRequest, reply: impl FnOnce(Verdict) + Send + 'static) -> Self {
+        Self {
+            request,
+            reply: Some(Box::new(reply)),
+        }
+    }
+
+    pub fn request(&self) -> &ApprovalRequest {
+        &self.request
+    }
+
+    /// Answer and consume.
+    fn resolve(mut self, verdict: Verdict) {
+        if let Some(reply) = self.reply.take() {
+            reply(verdict);
+        }
+    }
+}
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        if let Some(reply) = self.reply.take() {
+            reply(Verdict::Deny);
+        }
+    }
+}
+
+/// Handed to an approval source; puts requests in front of the UI.
 #[derive(Clone)]
 pub struct Prompter(Arc<Mutex<Sender<Pending>>>);
 
 impl Prompter {
-    pub fn ask(&self, text: String, destructive: bool) -> Verdict {
-        let text = one_line(&text);
-        let (reply, answer) = mpsc::channel();
-        let sent = self
-            .0
+    /// Hand a request to the UI without waiting; `reply` gets the verdict once.
+    /// Returns `false` when the UI is gone, in which case `reply` has already
+    /// been called with `Deny`.
+    pub fn post(
+        &self,
+        request: ApprovalRequest,
+        reply: impl FnOnce(Verdict) + Send + 'static,
+    ) -> bool {
+        let pending = Pending::new(request, reply);
+        self.0
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .send(Pending {
-                text,
-                destructive,
-                reply,
-            });
-        if sent.is_err() {
-            return Verdict::Deny;
-        }
-        answer.recv().unwrap_or(Verdict::Deny)
+            .send(pending)
+            .is_ok()
+    }
+
+    /// Ask and block until the UI answers (the in-process turn thread).
+    pub fn ask(&self, request: ApprovalRequest) -> Verdict {
+        let (tx, rx) = mpsc::channel();
+        self.post(request, move |v| {
+            let _ = tx.send(v);
+        });
+        rx.recv().unwrap_or(Verdict::Deny)
     }
 }
 
@@ -272,6 +424,13 @@ pub enum Action {
     Cancel,
     /// A slash command or hotkey for the host; the loop runs it.
     Host(HostCmd),
+    /// A paste that is exactly one image reference (#560): the loop asks the
+    /// host to attach `spec`; if the host refuses, `text` is inserted into the
+    /// editor as an ordinary paste.
+    PasteImage {
+        spec: String,
+        text: String,
+    },
 }
 
 #[derive(Default)]
@@ -298,6 +457,21 @@ pub struct App {
     /// Lazily listed files for the `@` panel.
     files: Option<Vec<String>>,
     at_sel: usize,
+    /// Images the host has queued for the next message (#560), as last
+    /// reported by it.
+    images: Vec<ImageItem>,
+    /// The running turn took queued images; when it ends the loop asks the
+    /// host again (a message that was never recorded hands them back).
+    images_in_flight: bool,
+    /// Set at the end of such a turn: the loop re-reads the host's queue.
+    pub images_stale: bool,
+    /// The OSC 52 sequence `/copy` built; the loop writes it to the terminal
+    /// (the only escape sequence the UI ever emits) via [`App::take_osc52`].
+    osc52: Option<String>,
+    /// Colors (#463); the host supplies it, the UI reads no file or env.
+    theme: Theme,
+    /// Key bindings (#463); the host supplies it, the UI reads no file or env.
+    keymap: Keymap,
 }
 
 /// Follow-ups that may wait, and queue rows shown above the editor.
@@ -311,6 +485,20 @@ impl App {
             footer,
             ..Self::default()
         }
+    }
+
+    pub fn with_theme(footer: Footer, theme: Theme) -> Self {
+        Self {
+            theme,
+            ..Self::new(footer)
+        }
+    }
+
+    /// Use `keymap` for the rebindable actions (and for the key hints).
+    pub fn with_keymap(mut self, keymap: Keymap) -> Self {
+        self.transcript.tools_key = keymap.label(KeyAction::ToggleTools);
+        self.keymap = keymap;
+        self
     }
 
     /// Command names matching the draft while it is a bare `/word`.
@@ -379,19 +567,68 @@ impl App {
 
     /// Compact rows of the follow-up queue (empty when nothing waits).
     pub fn queue_rows(&self, width: usize) -> Vec<String> {
+        self.queue_rows_max(width, QUEUE_ROWS)
+    }
+
+    fn queue_rows_max(&self, width: usize, max: usize) -> Vec<String> {
+        if max == 0 {
+            return Vec::new();
+        }
         let mut rows: Vec<String> = self
             .queue
             .iter()
-            .take(QUEUE_ROWS)
+            .take(max)
             .map(|q| clip(&format!("queued: {}", one_line(q)), width.saturating_sub(1)))
             .collect();
-        if self.queue.len() > QUEUE_ROWS {
-            rows[QUEUE_ROWS - 1] = clip(
-                &format!("+{} more queued", self.queue.len() - QUEUE_ROWS + 1),
+        if self.queue.len() > max {
+            rows[max - 1] = clip(
+                &format!("+{} more queued", self.queue.len() - max + 1),
                 width.saturating_sub(1),
             );
         }
         rows
+    }
+
+    /// The images queued for the next message, as the host last reported.
+    pub fn images(&self) -> &[ImageItem] {
+        &self.images
+    }
+
+    /// Replace the queued-image list with what the host reports.
+    pub fn set_images(&mut self, images: Vec<ImageItem>) {
+        self.images = images;
+    }
+
+    /// The row for queued images (#560), or `None` when nothing is attached.
+    pub fn image_row(&self, width: usize) -> Option<String> {
+        let row = match self.images.as_slice() {
+            [] => return None,
+            [one] => format!("image: {} · next message", one.label()),
+            many => format!(
+                "images ({}): {} · next message",
+                many.len(),
+                many.iter()
+                    .map(ImageItem::label)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
+        Some(clip(&row, width.saturating_sub(1)))
+    }
+
+    /// Rows above the editor: the image row, then the follow-up queue, at
+    /// most `QUEUE_ROWS` together.
+    pub fn pending_rows(&self, width: usize) -> Vec<String> {
+        let mut rows: Vec<String> = self.image_row(width).into_iter().collect();
+        let left = QUEUE_ROWS - rows.len();
+        rows.extend(self.queue_rows_max(width, left));
+        rows
+    }
+
+    /// The host's queue goes with the message that starts a turn.
+    fn images_sent(&mut self) {
+        self.images_in_flight = !self.images.is_empty();
+        self.images.clear();
     }
 
     /// Put queued (and `extra`) messages back in front of the draft; nothing
@@ -422,6 +659,7 @@ impl App {
         let text = self.queue.remove(0);
         self.running = true;
         self.saw_text = false;
+        self.images_sent();
         let echoed = self.transcript.line(Kind::User, &format!("> {text}"));
         self.out.extend(echoed);
         Some(text)
@@ -460,6 +698,11 @@ impl App {
         self.recent.insert(0, id.to_string());
     }
 
+    /// The pending `/copy` sequence, if any (drains).
+    pub fn take_osc52(&mut self) -> Option<String> {
+        self.osc52.take()
+    }
+
     /// A one-line note in the transcript (command feedback).
     pub fn note(&mut self, text: &str) {
         let lines = self.transcript.line(Kind::Note, text);
@@ -481,17 +724,17 @@ impl App {
         Action::Host(HostCmd::SetModel(self.recent[0].clone()))
     }
 
-    fn picker_key(&mut self, code: KeyCode) -> Action {
+    fn picker_key(&mut self, key: Key) -> Action {
         let Some(p) = self.picker.as_mut() else {
             return Action::None;
         };
-        match code {
-            KeyCode::Esc => self.picker = None,
-            KeyCode::Up => p.up(),
-            KeyCode::Down => p.down(),
-            KeyCode::Backspace => p.backspace(),
-            KeyCode::Char(c) => p.type_char(c),
-            KeyCode::Enter => {
+        match key {
+            Key::Esc => self.picker = None,
+            Key::Up => p.up(),
+            Key::Down => p.down(),
+            Key::Backspace => p.backspace(),
+            Key::Char(c) => p.type_char(c),
+            Key::Enter => {
                 let kind = p.kind;
                 let chosen = p.chosen();
                 self.picker = None;
@@ -501,6 +744,12 @@ impl App {
                         Action::Host(HostCmd::SetModel(id))
                     }
                     (PickKind::Session, Some(id)) => Action::Host(HostCmd::Switch(id)),
+                    // /tree lists the open session too: picking it is a no-op.
+                    (PickKind::Tree, Some(id)) if id == self.footer.session => {
+                        self.note(&format!("(already in {id})"));
+                        Action::Redraw
+                    }
+                    (PickKind::Tree, Some(id)) => Action::Host(HostCmd::Switch(id)),
                     _ => Action::Redraw,
                 };
             }
@@ -538,7 +787,20 @@ impl App {
             "/compact" => host(HostCmd::Compact(arg_opt)),
             "/new" => host(HostCmd::New),
             "/resume" => host(HostCmd::PickSession),
+            "/fork" => host(HostCmd::Fork(arg_opt)),
+            "/tree" => host(HostCmd::PickTree),
             "/session" => host(HostCmd::Status),
+            "/image" => match arg {
+                "" => host(HostCmd::Images),
+                "clear" => host(HostCmd::ClearImages),
+                spec => host(HostCmd::AttachImage(spec.to_string())),
+            },
+            "/copy" if arg.is_empty() => host(HostCmd::LastAnswer),
+            "/copy" => {
+                self.note("(usage: /copy; it takes no argument, /export [path] writes a file)");
+                Action::Redraw
+            }
+            "/export" => host(HostCmd::Export(arg_opt)),
             "/name" => match arg_opt {
                 Some(n) => host(HostCmd::Name(n)),
                 None => {
@@ -562,12 +824,53 @@ impl App {
         std::mem::take(&mut self.out)
     }
 
-    pub fn on_key(&mut self, key: KeyEvent) -> Action {
-        if key.kind == KeyEventKind::Release {
+    /// One input (UI-neutral, #526): a key press or a paste. The terminal
+    /// adapter in `term_input` maps crossterm events onto this.
+    pub fn on_input(&mut self, input: Input) -> Action {
+        match input {
+            Input::Key(key) => self.on_key_press(key),
+            Input::Paste(text) => self.on_paste(&text),
+        }
+    }
+
+    /// A pasted block (#560). It never submits, steers or answers anything:
+    /// at an approval prompt it is ignored, in a picker it filters, otherwise
+    /// it lands in the editor as one edit — unless, while idle, it is exactly
+    /// one image reference, which the loop offers to the host to attach.
+    fn on_paste(&mut self, raw: &str) -> Action {
+        self.armed = false;
+        if self.approval.is_some() {
             return Action::None;
         }
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        if ctrl && key.code == KeyCode::Char('c') {
+        let text = paste::normalize(raw);
+        if let Some(p) = self.picker.as_mut() {
+            for c in text.chars().filter(|c| !c.is_control()) {
+                p.type_char(c);
+            }
+            return Action::Redraw;
+        }
+        if text.is_empty() {
+            return Action::None;
+        }
+        if !self.running {
+            if let Some(spec) = paste::image_spec(&text) {
+                return Action::PasteImage { spec, text };
+            }
+        }
+        self.paste_text(&text);
+        Action::Redraw
+    }
+
+    /// Insert an (already normalized) paste into the editor as one edit.
+    pub fn paste_text(&mut self, text: &str) {
+        self.menu_sel = 0;
+        self.at_sel = 0;
+        self.editor.paste(text);
+    }
+
+    fn on_key_press(&mut self, key: KeyPress) -> Action {
+        let ctrl = key.mods.ctrl;
+        if ctrl && key.key == Key::Char('c') {
             if self.running {
                 return self.cancel();
             }
@@ -579,16 +882,19 @@ impl App {
         }
         self.armed = false;
         if let Some(p) = self.approval.take() {
-            return self.answer(p, key.code);
+            return self.answer(p, key);
         }
         if self.picker.is_some() {
-            return self.picker_key(key.code);
+            return self.picker_key(key.key);
         }
+        // Everything below is reached only after the approval prompt, the
+        // picker and Ctrl+C had their say: a keymap cannot intercept them.
         // Hotkeys wait for idle (they take the session lock). Shift+Tab is
         // `BackTab`, a different key code from Enter, so Shift+Enter keeps
         // its newline meaning below.
-        match key.code {
-            KeyCode::Char('o') if ctrl => {
+        let act = self.keymap.action(&key);
+        match act {
+            Some(KeyAction::ToggleTools) => {
                 let mut v = self.transcript.toggle_tools();
                 let state = if self.transcript.expand_tools {
                     "expanded"
@@ -602,7 +908,7 @@ impl App {
                 self.out.extend(v);
                 return Action::Redraw;
             }
-            KeyCode::Char('t') if ctrl => {
+            Some(KeyAction::ToggleReasoning) => {
                 let mut v = self.transcript.toggle_reasoning();
                 let state = if self.transcript.hide_reasoning {
                     "hidden"
@@ -616,21 +922,21 @@ impl App {
                 self.out.extend(v);
                 return Action::Redraw;
             }
-            KeyCode::Char('l') if ctrl => {
+            Some(KeyAction::ModelPicker) => {
                 return if self.running {
                     Action::None
                 } else {
                     Action::Host(HostCmd::PickModel)
                 }
             }
-            KeyCode::Char('p') if ctrl => {
+            Some(KeyAction::CycleModel) => {
                 return if self.running {
                     Action::None
                 } else {
                     self.cycle_model()
                 }
             }
-            KeyCode::BackTab => {
+            Some(KeyAction::CycleThinking) => {
                 return if self.running {
                     Action::None
                 } else {
@@ -641,20 +947,20 @@ impl App {
         }
         if !self.at_matches().is_empty() {
             let n = self.at_matches().len();
-            match key.code {
-                KeyCode::Tab | KeyCode::Enter if self.at_insert() => return Action::Redraw,
-                KeyCode::Up if !key.modifiers.contains(KeyModifiers::ALT) => {
+            match key.key {
+                Key::Tab | Key::Enter if self.at_insert() => return Action::Redraw,
+                Key::Up if !ctrl && !key.mods.alt => {
                     self.at_sel = self.at_sel.min(n - 1).saturating_sub(1);
                     return Action::Redraw;
                 }
-                KeyCode::Down => {
+                Key::Down if !ctrl && !key.mods.alt => {
                     self.at_sel = (self.at_sel + 1).min(n - 1);
                     return Action::Redraw;
                 }
                 _ => {}
             }
         }
-        if key.code == KeyCode::Up && key.modifiers.contains(KeyModifiers::ALT) {
+        if act == Some(KeyAction::PopQueue) {
             return match self.queue.pop() {
                 Some(last) => {
                     self.prepend_draft(vec![last]);
@@ -664,19 +970,19 @@ impl App {
             };
         }
         let menu = self.menu();
-        match key.code {
-            KeyCode::Tab if !menu.is_empty() => {
+        match key.key {
+            Key::Tab if !menu.is_empty() => {
                 let pick = menu[self.menu_sel.min(menu.len() - 1)];
                 self.editor.set(&format!("{pick} "));
                 self.menu_sel = 0;
             }
-            KeyCode::Up if !menu.is_empty() => self.menu_sel = self.menu_sel.saturating_sub(1),
-            KeyCode::Down if !menu.is_empty() => {
+            Key::Up if !menu.is_empty() => self.menu_sel = self.menu_sel.saturating_sub(1),
+            Key::Down if !menu.is_empty() => {
                 self.menu_sel = (self.menu_sel + 1).min(menu.len() - 1)
             }
-            KeyCode::Esc if self.running => return self.cancel(),
+            Key::Esc if self.running => return self.cancel(),
             // Alt+Enter while a turn runs queues a follow-up; idle it is a newline.
-            KeyCode::Enter if self.running && key.modifiers.contains(KeyModifiers::ALT) => {
+            _ if act == Some(KeyAction::QueueFollowUp) && self.running => {
                 let t = self.editor.text().trim();
                 if t.is_empty() || t.starts_with('/') {
                     return Action::None;
@@ -689,14 +995,13 @@ impl App {
                     self.queue.push(text);
                 }
             }
-            KeyCode::Enter
-                if key
-                    .modifiers
-                    .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
-            {
+            // Idle, the follow-up key is a newline (as Alt+Enter always was).
+            _ if matches!(act, Some(KeyAction::Newline | KeyAction::QueueFollowUp)) => {
                 self.editor.newline()
             }
-            KeyCode::Enter => {
+            // Shift/Alt+Enter never send, whatever is (not) bound to them.
+            Key::Enter if key.mods.shift || key.mods.alt => return Action::None,
+            Key::Enter => {
                 if self.running {
                     // Steer: a non-empty, non-slash draft becomes a soft interrupt.
                     let t = self.editor.text().trim();
@@ -714,6 +1019,7 @@ impl App {
                     Some(text) => {
                         self.running = true;
                         self.saw_text = false;
+                        self.images_sent();
                         let echoed = self.transcript.line(Kind::User, &format!("> {text}"));
                         self.out.extend(echoed);
                         Action::Submit(text)
@@ -721,9 +1027,9 @@ impl App {
                     None => Action::Redraw,
                 };
             }
-            // Fallback for terminals that cannot report Shift+Enter.
-            KeyCode::Char('j') if ctrl => self.editor.newline(),
-            KeyCode::Char(c) if !ctrl => {
+            _ if act == Some(KeyAction::HistoryPrev) => self.editor.prev(),
+            _ if act == Some(KeyAction::HistoryNext) => self.editor.next(),
+            Key::Char(c) if !ctrl => {
                 self.menu_sel = 0;
                 self.at_sel = 0;
                 if c == '@' && self.files.is_none() {
@@ -733,25 +1039,26 @@ impl App {
                 }
                 self.editor.insert(c)
             }
-            KeyCode::Backspace => {
+            Key::Backspace => {
                 self.menu_sel = 0;
                 self.at_sel = 0;
                 self.editor.backspace()
             }
-            KeyCode::Up => self.editor.prev(),
-            KeyCode::Down => self.editor.next(),
             _ => return Action::None,
         }
         Action::Redraw
     }
 
-    /// y/n answer; Esc denies AND cancels the turn; anything else re-asks.
-    fn answer(&mut self, p: Pending, code: KeyCode) -> Action {
-        let (verdict, note) = match code {
-            KeyCode::Char('y' | 'Y') => (Verdict::Allow, "allowed"),
-            KeyCode::Char('n' | 'N') => (Verdict::Deny, "denied"),
-            KeyCode::Esc => {
-                let _ = p.reply.send(Verdict::Deny);
+    /// y/n answer (plain keys only); Esc denies AND cancels the turn; anything else re-asks.
+    fn answer(&mut self, p: Pending, key: KeyPress) -> Action {
+        // y / n are the plain keys: Alt+Y or Ctrl+N (a user may bind those to
+        // something else) never answer a prompt by accident.
+        let plain = !key.mods.ctrl && !key.mods.alt;
+        let (verdict, note) = match key.key {
+            Key::Char('y' | 'Y') if plain => (Verdict::Allow, "allowed"),
+            Key::Char('n' | 'N') if plain => (Verdict::Deny, "denied"),
+            Key::Esc => {
+                p.resolve(Verdict::Deny);
                 let lines = self.transcript.line(Kind::Note, "  denied");
                 self.out.extend(lines);
                 self.return_queue(Vec::new());
@@ -762,7 +1069,7 @@ impl App {
                 return Action::None;
             }
         };
-        let _ = p.reply.send(verdict);
+        p.resolve(verdict);
         let lines = self.transcript.line(Kind::Note, &format!("  {note}"));
         self.out.extend(lines);
         Action::Redraw
@@ -786,14 +1093,14 @@ impl App {
             Msg::ToolResult { ok, preview } => self.transcript.tool_result(ok, &preview),
             Msg::Approval(p) => {
                 let mut v = self.transcript.flush();
-                let tag = if p.destructive {
+                let tag = if p.request.is_destructive() {
                     "destructive"
                 } else {
                     "write"
                 };
                 v.extend(
                     self.transcript
-                        .line(Kind::Note, &format!("? {tag}: {}", p.text)),
+                        .line(Kind::Note, &format!("? {tag}: {}", p.request.text())),
                 );
                 self.approval = Some(p);
                 v
@@ -802,6 +1109,7 @@ impl App {
                 self.running = false;
                 self.approval = None;
                 self.footer_stale = true;
+                self.images_stale = std::mem::take(&mut self.images_in_flight);
                 let mut v = self.transcript.flush();
                 let left = std::mem::take(&mut self.leftover);
                 if matches!(end, TurnEnd::Final(_)) {
@@ -827,202 +1135,13 @@ impl App {
         };
         self.out.extend(lines);
     }
-
-    pub fn draw(&self, f: &mut Frame) {
-        let area = f.area();
-        let [live, edit_box, foot] = Layout::vertical([
-            Constraint::Length(LIVE_ROWS),
-            Constraint::Length(EDITOR_ROWS as u16 + 1),
-            Constraint::Length(1),
-        ])
-        .areas(area);
-        // The border shows the session's reasoning level (#461).
-        let level = self.footer.effort.as_deref().unwrap_or("-");
-        let block = Block::new()
-            .borders(Borders::TOP)
-            .title(one_line(&format!(" thinking: {level} ")))
-            .border_style(Style::new().add_modifier(Modifier::DIM));
-        let edit = block.inner(edit_box);
-        f.render_widget(block, edit_box);
-        let w = area.width as usize;
-
-        let mut live_lines = Vec::new();
-        let menu = self.menu();
-        let at = self.at_lines(w);
-        if let Some(p) = &self.picker {
-            live_lines.extend(p.lines(w).into_iter().map(Line::from));
-        } else if let Some(p) = &self.approval {
-            live_lines.push(Line::styled(
-                format!("? {}", clip(&p.text, w.saturating_sub(2))),
-                Style::new().fg(Color::Yellow),
-            ));
-            live_lines.push(Line::from("[y] allow  [n] deny  [Esc] deny + cancel"));
-        } else if !at.is_empty() {
-            live_lines.extend(
-                at.into_iter()
-                    .map(|l| Line::styled(l, Style::new().fg(Color::Cyan))),
-            );
-            live_lines.push(Line::styled(
-                "Tab/Enter inserts the path · Up/Down select · keep typing to filter",
-                Style::new().add_modifier(Modifier::DIM),
-            ));
-        } else if !menu.is_empty() {
-            let sel = self.menu_sel.min(menu.len() - 1);
-            for (i, name) in menu.iter().enumerate().take(LIVE_ROWS as usize) {
-                let help = menu::COMMANDS
-                    .iter()
-                    .find(|c| c.0 == *name)
-                    .map_or("", |c| c.1);
-                let mark = if i == sel { "▸ " } else { "  " };
-                live_lines.push(Line::styled(
-                    clip(&format!("{mark}{name}  {help}"), w),
-                    Style::new().fg(Color::Cyan),
-                ));
-            }
-            live_lines.push(Line::styled(
-                "Tab completes · Up/Down select · Enter runs",
-                Style::new().add_modifier(Modifier::DIM),
-            ));
-        } else {
-            let partial = self
-                .transcript
-                .partial()
-                .map(|(k, t)| styled(k, &tail(t, w)))
-                .unwrap_or_default();
-            live_lines.push(partial);
-            live_lines.extend(
-                self.queue_rows(w)
-                    .into_iter()
-                    .map(|r| Line::styled(r, Style::new().fg(Color::Magenta))),
-            );
-            live_lines.push(Line::styled(
-                if self.running {
-                    "working… Enter steers · Alt+Enter queues · Alt+Up unqueues · Esc cancels"
-                } else if self.armed {
-                    "press Ctrl+C again to quit"
-                } else {
-                    "Enter sends · / commands · @ file · Ctrl+L model · Shift+Tab thinking · Shift+Enter newline"
-                },
-                Style::new().add_modifier(Modifier::DIM),
-            ));
-        }
-        f.render_widget(Paragraph::new(live_lines), live);
-
-        let lines = self.editor.lines();
-        let shown = &lines[lines.len().saturating_sub(EDITOR_ROWS)..];
-        let first = lines.len() - shown.len();
-        let rows: Vec<Line> = shown
-            .iter()
-            .enumerate()
-            .map(|(i, l)| Line::from(format!("{}{l}", if first + i == 0 { "> " } else { "  " })))
-            .collect();
-        f.render_widget(Paragraph::new(rows), edit);
-        let last = shown.last().map_or(0, |l| l.chars().count()) + 2;
-        f.set_cursor_position(Position::new(
-            edit.x + (last as u16).min(edit.width.saturating_sub(1)),
-            edit.y + shown.len().saturating_sub(1) as u16,
-        ));
-
-        f.render_widget(
-            Paragraph::new(Line::styled(
-                self.footer.render(w),
-                Style::new().add_modifier(Modifier::DIM),
-            )),
-            foot,
-        );
-    }
-}
-
-/// The last `width` chars: the live line shows the newest part of the stream.
-fn tail(s: &str, width: usize) -> String {
-    let n = s.chars().count();
-    s.chars().skip(n.saturating_sub(width)).collect()
-}
-
-fn styled(kind: Kind, text: &str) -> Line<'static> {
-    let style = match kind {
-        Kind::User => Style::new().add_modifier(Modifier::BOLD),
-        Kind::Text => Style::new(),
-        Kind::Reasoning => Style::new().fg(Color::DarkGray).add_modifier(Modifier::DIM),
-        Kind::Tool => Style::new().fg(Color::Cyan),
-        Kind::ToolOut => diff_style(text),
-        Kind::Heading => Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
-        Kind::Code => Style::new().add_modifier(Modifier::DIM),
-        Kind::Note => Style::new().fg(Color::Yellow),
-    };
-    if kind == Kind::Text {
-        return Line::from(inline_spans(text));
-    }
-    Line::from(Span::styled(text.to_string(), style))
-}
-
-/// Unified-diff rows in a tool result: `+` green, `-` red, `@@`/headers dim.
-/// The text is already sanitized by the transcript.
-fn diff_style(text: &str) -> Style {
-    let t = text.trim_start();
-    if t.starts_with("+++") || t.starts_with("---") || t.starts_with("@@") {
-        Style::new().add_modifier(Modifier::DIM)
-    } else if t.starts_with('+') {
-        Style::new().fg(Color::Green)
-    } else if t.starts_with('-') {
-        Style::new().fg(Color::Red)
-    } else {
-        Style::new().fg(Color::Cyan).add_modifier(Modifier::DIM)
-    }
-}
-
-/// Minimal inline markdown: `**bold**` and `` `code` ``; an unclosed marker
-/// stays literal. (Not a renderer: no italics, links, lists or tables.)
-fn inline_spans(text: &str) -> Vec<Span<'static>> {
-    let mut out = Vec::new();
-    let mut plain = String::new();
-    let mut rest = text;
-    while let Some(c) = rest.chars().next() {
-        let (open, style) = if rest.starts_with("**") {
-            ("**", Style::new().add_modifier(Modifier::BOLD))
-        } else if c == '`' {
-            ("`", Style::new().fg(Color::Cyan))
-        } else {
-            plain.push(c);
-            rest = &rest[c.len_utf8()..];
-            continue;
-        };
-        match rest[open.len()..].find(open) {
-            Some(end) if end > 0 => {
-                if !plain.is_empty() {
-                    out.push(Span::raw(std::mem::take(&mut plain)));
-                }
-                out.push(Span::styled(
-                    rest[open.len()..open.len() + end].to_string(),
-                    style,
-                ));
-                rest = &rest[open.len() * 2 + end..];
-            }
-            _ => {
-                plain.push_str(open);
-                rest = &rest[open.len()..];
-            }
-        }
-    }
-    if !plain.is_empty() {
-        out.push(Span::raw(plain));
-    }
-    out
-}
-
-/// Wrap a committed line to `width` chars per row (char count, not cell width).
-fn wrap(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
-    let chars: Vec<char> = text.chars().collect();
-    if chars.is_empty() {
-        return vec![String::new()];
-    }
-    chars.chunks(width).map(|c| c.iter().collect()).collect()
 }
 
 /// Raw mode (+ keyboard enhancement, so Shift+Enter is reported on terminals
-/// that speak the kitty protocol; others ignore the sequence) for the guard's
-/// lifetime; Drop restores both even when a panic unwinds through `run`.
+/// that speak the kitty protocol; others ignore the sequence; + bracketed
+/// paste, #560, so a pasted block arrives as one event instead of keys) for
+/// the guard's lifetime; Drop restores all three even when a panic unwinds
+/// through `run`.
 pub struct TerminalGuard;
 
 impl TerminalGuard {
@@ -1031,7 +1150,8 @@ impl TerminalGuard {
         let mut out = io::stdout();
         let _ = queue!(
             out,
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
+            EnableBracketedPaste
         );
         let _ = io::Write::flush(&mut out);
         Ok(Self)
@@ -1040,7 +1160,11 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+        let _ = execute!(
+            io::stdout(),
+            DisableBracketedPaste,
+            PopKeyboardEnhancementFlags
+        );
         let _ = disable_raw_mode();
     }
 }
@@ -1054,7 +1178,10 @@ pub fn run(host: &dyn TuiHost, approvals: Receiver<Pending>) -> io::Result<()> {
             viewport: Viewport::Inline(VIEWPORT_HEIGHT),
         },
     )?;
-    let mut app = App::new(host.footer());
+    let mut app = App::with_theme(host.footer(), host.theme()).with_keymap(host.keymap());
+    if let Some(n) = host.startup_note() {
+        app.note(&format!("({n})"));
+    }
     event_loop(&mut term, host, &mut app, &approvals, |d| {
         if event::poll(d)? {
             event::read().map(Some)
@@ -1083,12 +1210,13 @@ where
         return Ok(());
     }
     let width = term.size().map_err(io_err::<B>)?.width as usize;
+    let theme = &app.theme;
     let lines: Vec<Line> = out
         .iter()
         .flat_map(|o| {
             wrap(&o.text, width)
                 .into_iter()
-                .map(move |t| styled(o.kind, &t))
+                .map(|t| styled(o.kind, &t, theme))
         })
         .collect();
     let h = lines.len().min(u16::MAX as usize) as u16;
@@ -1104,67 +1232,177 @@ use ratatui::widgets::Widget as _;
 /// emits these while idle). Every outcome is a transcript note, and a
 /// successful change marks the footer stale so the next loop turn re-reads it.
 fn run_host_cmd(host: &dyn TuiHost, app: &mut App, cmd: HostCmd) {
-    let done = |app: &mut App, r: Result<String, String>| match r {
-        Ok(m) => {
-            app.footer_stale = true;
-            app.note(&format!("({m})"));
-        }
-        Err(e) => app.note(&format!("(failed: {e})")),
-    };
-    match cmd {
-        HostCmd::PickModel => match host.models() {
-            Ok(ids) if ids.is_empty() => {
-                app.note("(the provider lists no models; use /model <id>)")
-            }
-            Ok(ids) => app.open_picker(
-                PickKind::Model,
-                ids.into_iter().map(|i| Item::new(i.clone(), i)).collect(),
-            ),
-            Err(e) => app.note(&format!("(models: {e}; use /model <id>)")),
-        },
-        HostCmd::SetModel(id) => done(app, host.set_model(&id).map(|()| format!("model → {id}"))),
-        HostCmd::SetEffort(l) => {
-            let shown = l.clone().unwrap_or_else(|| "unset".into());
-            done(
-                app,
-                host.set_effort(l.as_deref())
-                    .map(|()| format!("thinking → {shown}")),
-            )
-        }
+    // What to say, decided before the command is handed over (the host
+    // gets it by value and answers with data only).
+    #[derive(Clone, Copy)]
+    enum Cmd {
+        PickModel,
+        PickSession,
+        Tree,
+        Fork,
+        New,
+        Switch,
+        Status,
+        Change,
+        Attach,
+        Clear,
+        Images,
+        Copy,
+        Export,
+    }
+    let (kind, ok_note) = match &cmd {
+        HostCmd::PickModel => (Cmd::PickModel, String::new()),
+        HostCmd::PickSession => (Cmd::PickSession, String::new()),
+        HostCmd::PickTree => (Cmd::Tree, String::new()),
+        HostCmd::Fork(_) => (Cmd::Fork, String::new()),
+        HostCmd::New => (Cmd::New, String::new()),
+        HostCmd::Switch(_) => (Cmd::Switch, String::new()),
+        HostCmd::Status => (Cmd::Status, String::new()),
+        HostCmd::SetModel(id) => (Cmd::Change, format!("model → {id}")),
+        HostCmd::SetEffort(l) => (
+            Cmd::Change,
+            format!("thinking → {}", l.as_deref().unwrap_or("unset")),
+        ),
         HostCmd::Compact(instructions) => {
             let extra = if instructions.is_some() {
                 "; instructions are not supported yet and were ignored"
             } else {
                 ""
             };
-            done(
-                app,
-                host.request_compaction()
-                    .map(|()| format!("compaction runs before your next prompt{extra}")),
+            (
+                Cmd::Change,
+                format!("compaction runs before your next prompt{extra}"),
             )
         }
-        HostCmd::New => done(
-            app,
-            host.new_session().map(|id| format!("new session {id}")),
+        HostCmd::Name(n) => (Cmd::Change, format!("named {n}")),
+        HostCmd::AttachImage(_) => (Cmd::Attach, String::new()),
+        HostCmd::ClearImages => (Cmd::Clear, String::new()),
+        HostCmd::Images => (Cmd::Images, String::new()),
+        HostCmd::LastAnswer => (Cmd::Copy, String::new()),
+        HostCmd::Export(_) => (Cmd::Export, String::new()),
+    };
+    let had = app.images.len();
+    let done = |app: &mut App, msg: String| {
+        app.footer_stale = true;
+        app.note(&format!("({msg})"));
+    };
+    match (kind, host.apply(cmd)) {
+        (Cmd::PickModel, Ok(HostReply::Models(ids))) if ids.is_empty() => {
+            app.note("(the provider lists no models; use /model <id>)")
+        }
+        (Cmd::PickModel, Ok(HostReply::Models(ids))) => app.open_picker(
+            PickKind::Model,
+            ids.into_iter().map(|i| Item::new(i.clone(), i)).collect(),
         ),
-        HostCmd::PickSession => match host.sessions() {
-            Ok(v) if v.is_empty() => app.note("(no other sessions)"),
-            Ok(v) => app.open_picker(
-                PickKind::Session,
+        (Cmd::PickModel, Err(e)) => app.note(&format!("(models: {e}; use /model <id>)")),
+        (Cmd::PickSession, Ok(HostReply::Sessions(v))) if v.is_empty() => {
+            app.note("(no other sessions)")
+        }
+        (Cmd::PickSession, Ok(HostReply::Sessions(v))) => app.open_picker(
+            PickKind::Session,
+            v.into_iter().map(|s| Item::new(s.id, s.label)).collect(),
+        ),
+        (Cmd::PickSession, Err(e)) => app.note(&format!("(sessions: {e})")),
+        (Cmd::Tree, Ok(HostReply::Sessions(v))) => {
+            if v.len() <= 1 {
+                app.note("(this session has no parent and no forks)");
+            }
+            let current = app.footer.session.clone();
+            app.open_picker(
+                PickKind::Tree,
                 v.into_iter().map(|s| Item::new(s.id, s.label)).collect(),
-            ),
-            Err(e) => app.note(&format!("(sessions: {e})")),
-        },
-        HostCmd::Switch(id) => done(
-            app,
-            host.switch_session(&id).map(|id| format!("resumed {id}")),
-        ),
-        HostCmd::Status => {
-            for l in host.status_lines() {
+            );
+            if let Some(p) = app.picker.as_mut() {
+                p.select(&current);
+            }
+        }
+        (Cmd::Tree, Err(e)) => app.note(&format!("(tree: {e})")),
+        (Cmd::Fork, Ok(HostReply::Session(id))) => done(app, format!("forked → {id}")),
+        (Cmd::Fork, Err(e)) => app.note(&format!("(fork: {e})")),
+        (Cmd::New, Ok(HostReply::Session(id))) => done(app, format!("new session {id}")),
+        (Cmd::Switch, Ok(HostReply::Session(id))) => done(app, format!("resumed {id}")),
+        (Cmd::Status, Ok(HostReply::Lines(lines))) => {
+            for l in lines {
                 app.note(&l);
             }
         }
-        HostCmd::Name(n) => done(app, host.set_name(&n).map(|()| format!("named {n}"))),
+        (Cmd::Change, Ok(HostReply::Done)) => done(app, ok_note),
+        (Cmd::Attach, Ok(HostReply::Images(v))) => attached(app, v),
+        (Cmd::Clear, Ok(HostReply::Images(v))) => {
+            app.set_images(v);
+            app.note(&format!("({had} queued image(s) dropped)"));
+        }
+        (Cmd::Images, Ok(HostReply::Images(v))) => {
+            app.note(&format!(
+                "({} image(s) queued for your next message)",
+                v.len()
+            ));
+            for i in &v {
+                app.note(&format!("  {}", i.label()));
+            }
+            app.set_images(v);
+        }
+        (Cmd::Copy, Ok(HostReply::Answer(answer))) => copy_answer(app, answer),
+        (Cmd::Copy, Err(e)) => app.note(&format!("(/copy: {e})")),
+        (Cmd::Export, Ok(HostReply::Path(p))) => app.note(&format!("(transcript written to {p})")),
+        (Cmd::Export, Err(e)) => app.note(&format!("(/export: {e})")),
+        // The host's own error (jail, size cap, not an image), as chat shows it.
+        (Cmd::Attach | Cmd::Clear | Cmd::Images, Err(e)) => app.note(&format!("(/image: {e})")),
+        (_, Err(e)) => app.note(&format!("(failed: {e})")),
+        // A host answered with the wrong kind of reply: say so, never panic.
+        (_, Ok(other)) => app.note(&format!("(failed: unexpected host reply {other:?})")),
+    }
+}
+
+/// `/copy`: build the OSC 52 sequence for the answer (the loop writes it) and
+/// say what was attempted. A terminal cannot confirm OSC 52, so the note never
+/// claims the clipboard changed.
+fn copy_answer(app: &mut App, answer: Option<String>) {
+    let Some(text) = answer.filter(|t| !t.trim().is_empty()) else {
+        app.note("(nothing to copy: this session has no assistant answer yet)");
+        return;
+    };
+    if text.len() > clipboard::MAX_COPY_BYTES {
+        app.note(&format!(
+            "(the last answer is {} KiB, over the {} KiB /copy limit; use /export to write the transcript to a file)",
+            text.len().div_ceil(1024),
+            clipboard::MAX_COPY_BYTES / 1024
+        ));
+        return;
+    }
+    app.note(&format!(
+        "(sent {} characters to the terminal clipboard; needs OSC 52 support, tmux needs `set -g set-clipboard on`)",
+        text.chars().count()
+    ));
+    app.osc52 = Some(clipboard::osc52(&text));
+}
+
+/// The host accepted an image: show the queue and name the new one.
+fn attached(app: &mut App, images: Vec<ImageItem>) {
+    if let Some(last) = images.last() {
+        app.note(&format!(
+            "(image attached to your next message: {})",
+            last.label()
+        ));
+    }
+    app.set_images(images);
+}
+
+/// A paste that looked like one image reference (#560): attach it, or, when
+/// the host refuses, insert the text after all and say why it was not attached.
+fn attach_pasted(host: &dyn TuiHost, app: &mut App, spec: String, text: &str) {
+    match host.apply(HostCmd::AttachImage(spec)) {
+        Ok(HostReply::Images(v)) => attached(app, v),
+        Ok(other) => {
+            app.paste_text(text);
+            app.note(&format!(
+                "(pasted as text: unexpected host reply {other:?})"
+            ));
+        }
+        Err(e) => {
+            app.paste_text(text);
+            app.note(&format!("(pasted as text, not attached: {e})"));
+        }
     }
 }
 
@@ -1222,6 +1460,13 @@ where
             if std::mem::take(&mut app.footer_stale) {
                 app.footer = host.footer();
             }
+            // A turn that took queued images ended: a message that was never
+            // recorded hands them back, so show what the host queues now.
+            if !app.running() && std::mem::take(&mut app.images_stale) {
+                if let Ok(HostReply::Images(v)) = host.apply(HostCmd::Images) {
+                    app.set_images(v);
+                }
+            }
             if !quitting {
                 if let Some(prompt) = app.start_queued() {
                     cancel = start(prompt);
@@ -1241,8 +1486,12 @@ where
                 continue;
             };
             dirty = true;
-            match ev {
-                Event::Key(k) => match app.on_key(k) {
+            if let Event::Resize(..) = ev {
+                term.autoresize().map_err(io_err::<B>)?;
+                continue;
+            }
+            if let Some(input) = term_input::input_from_event(ev) {
+                match app.on_input(input) {
                     Action::Quit if app.running() => {
                         // Unreachable via keys today (quit needs idle), kept safe.
                         cancel.cancel();
@@ -1261,11 +1510,16 @@ where
                             app.restore_draft(&text);
                         }
                     },
-                    Action::Host(cmd) => run_host_cmd(host, app, cmd),
+                    Action::Host(cmd) => {
+                        run_host_cmd(host, app, cmd);
+                        if let Some(seq) = app.take_osc52() {
+                            // Between frames, on the real terminal: never part of a frame.
+                            let _ = clipboard::emit(&mut io::stdout(), &seq);
+                        }
+                    }
+                    Action::PasteImage { spec, text } => attach_pasted(host, app, spec, &text),
                     Action::Redraw | Action::None => {}
-                },
-                Event::Resize(..) => term.autoresize().map_err(io_err::<B>)?,
-                _ => {}
+                }
             }
         }
     })
@@ -1274,7 +1528,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::render::inline_spans;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::backend::TestBackend;
+    use ratatui::style::{Color, Modifier, Style};
     use std::time::Instant;
 
     fn key(c: KeyCode) -> KeyEvent {
@@ -1317,6 +1574,354 @@ mod tests {
         assert_eq!(cut.chars().count(), 20);
         assert!(cut.ends_with('…'));
         assert!(Footer::default().render(80).contains("effort: -"));
+    }
+
+    // ---- the UI-neutral input seam (#526): no crossterm types below ----
+
+    fn typed_input(app: &mut App, s: &str) {
+        for c in s.chars() {
+            app.on_input(Input::new(Key::Char(c)));
+        }
+    }
+
+    #[test]
+    fn a_draft_is_typed_and_submitted_through_inputs_alone() {
+        let mut app = App::default();
+        typed_input(&mut app, "hello");
+        assert_eq!(
+            app.on_input(Input::new(Key::Enter)),
+            Action::Submit("hello".into())
+        );
+        assert!(app.running());
+    }
+
+    #[test]
+    fn modifiers_change_enter_exactly_as_the_key_table_says() {
+        // Shift+Enter and Alt+Enter (idle) are newlines; plain Enter submits.
+        let mut app = App::default();
+        typed_input(&mut app, "a");
+        app.on_input(Input::shift(Key::Enter));
+        typed_input(&mut app, "b");
+        app.on_input(Input::alt(Key::Enter));
+        typed_input(&mut app, "c");
+        assert_eq!(
+            app.on_input(Input::new(Key::Enter)),
+            Action::Submit("a\nb\nc".into())
+        );
+        // Ctrl+J is the newline fallback for terminals without Shift+Enter.
+        let mut app = App::default();
+        typed_input(&mut app, "x");
+        app.on_input(Input::ctrl(Key::Char('j')));
+        typed_input(&mut app, "y");
+        assert_eq!(
+            app.on_input(Input::new(Key::Enter)),
+            Action::Submit("x\ny".into())
+        );
+    }
+
+    #[test]
+    fn a_key_the_logic_ignores_still_disarms_ctrl_c() {
+        // Ctrl+C once arms; any other key press disarms; Ctrl+C again only
+        // arms again. This is why unmapped keys are `Key::Other`, not dropped.
+        let mut app = App::default();
+        assert_eq!(app.on_input(Input::ctrl(Key::Char('c'))), Action::Redraw);
+        assert_eq!(app.on_input(Input::new(Key::Other)), Action::None);
+        assert_eq!(app.on_input(Input::ctrl(Key::Char('c'))), Action::Redraw);
+        assert_eq!(app.on_input(Input::ctrl(Key::Char('c'))), Action::Quit);
+    }
+
+    #[test]
+    fn shift_tab_is_its_own_key_not_shift_plus_tab() {
+        let mut app = App::new(Footer::default());
+        match app.on_input(Input::new(Key::BackTab)) {
+            Action::Host(HostCmd::SetEffort(_)) => {}
+            other => panic!("BackTab cycles the effort, got {other:?}"),
+        }
+    }
+
+    // ---- #560: pasted text and image attach, through `Input::Paste` ----
+
+    fn item(name: &str) -> ImageItem {
+        ImageItem {
+            path: format!("/ws/{name}"),
+            mime: "image/png".into(),
+            bytes: 1000,
+        }
+    }
+
+    #[test]
+    fn a_paste_is_one_edit_that_never_submits_or_steers() {
+        let mut app = App::default();
+        typed_input(&mut app, "intro ");
+        assert_eq!(
+            app.on_input(Input::Paste("one\r\ntwo\rthree\x1b[2J\n".into())),
+            Action::Redraw,
+            "the newlines in a paste do not submit"
+        );
+        assert_eq!(app.editor.text(), "intro one\ntwo\nthree[2J\n");
+        assert!(!app.running());
+        assert_eq!(
+            app.on_input(Input::new(Key::Enter)),
+            Action::Submit("intro one\ntwo\nthree[2J".into())
+        );
+        // While a turn runs a paste is still only an edit: Enter steers.
+        assert_eq!(
+            app.on_input(Input::Paste("more\nlines".into())),
+            Action::Redraw
+        );
+        assert_eq!(app.editor.text(), "more\nlines");
+        assert_eq!(
+            app.on_input(Input::new(Key::Enter)),
+            Action::Steer("more\nlines".into())
+        );
+        // An empty (or all-control) paste changes nothing.
+        assert_eq!(app.on_input(Input::Paste("\x1b\x07".into())), Action::None);
+    }
+
+    #[test]
+    fn a_paste_never_answers_an_approval_and_disarms_ctrl_c() {
+        let mut app = App::default();
+        let (tx, rx) = mpsc::channel();
+        app.on_msg(Msg::Approval(Pending::new(
+            ApprovalRequest::new("write_file a", Risk::Write),
+            move |v| {
+                let _ = tx.send(v);
+            },
+        )));
+        assert_eq!(app.on_input(Input::Paste("y".into())), Action::None);
+        assert!(rx.try_recv().is_err(), "a pasted `y` is not an answer");
+        assert_eq!(app.editor.text(), "", "nor typed into the draft");
+        app.on_input(Input::new(Key::Char('n')));
+        assert_eq!(rx.try_recv(), Ok(Verdict::Deny));
+
+        let mut app = App::default();
+        assert_eq!(app.on_input(Input::ctrl(Key::Char('c'))), Action::Redraw);
+        app.on_input(Input::Paste("x".into()));
+        assert_eq!(
+            app.on_input(Input::ctrl(Key::Char('c'))),
+            Action::Redraw,
+            "a paste disarms a pending Ctrl+C like any key"
+        );
+    }
+
+    #[test]
+    fn a_paste_filters_an_open_picker() {
+        let mut app = App::default();
+        app.open_picker(
+            PickKind::Model,
+            vec![Item::new("alpha", "alpha"), Item::new("beta", "beta")],
+        );
+        assert_eq!(app.on_input(Input::Paste("bet\n".into())), Action::Redraw);
+        assert_eq!(
+            app.on_input(Input::new(Key::Enter)),
+            Action::Host(HostCmd::SetModel("beta".into()))
+        );
+    }
+
+    #[test]
+    fn only_a_lone_image_reference_pasted_while_idle_is_offered_to_the_host() {
+        let mut app = App::default();
+        assert_eq!(
+            app.on_input(Input::Paste(" 'my shot.png'\r\n".into())),
+            Action::PasteImage {
+                spec: "my shot.png".into(),
+                text: " 'my shot.png'\n".into()
+            }
+        );
+        assert_eq!(app.editor.text(), "", "not inserted (yet)");
+        for text in ["see shot.png", "a.png\nb.png", "notes.txt"] {
+            assert_eq!(app.on_input(Input::Paste(text.into())), Action::Redraw);
+        }
+        // While a turn runs the host is busy: an image path is plain text.
+        let mut app = App::default();
+        typed_input(&mut app, "go");
+        app.on_input(Input::new(Key::Enter));
+        assert_eq!(
+            app.on_input(Input::Paste("shot.png".into())),
+            Action::Redraw
+        );
+        assert_eq!(app.editor.text(), "shot.png");
+    }
+
+    #[test]
+    fn a_pasted_image_is_attached_or_inserted_as_text_with_the_hosts_reason() {
+        let host = FakeHost::answering(vec![Ok(HostReply::Images(vec![item("a.png")]))]);
+        let mut app = App::default();
+        attach_pasted(&host, &mut app, "a.png".into(), "a.png");
+        assert_eq!(host.seen(), vec!["AttachImage(\"a.png\")"]);
+        assert_eq!(app.editor.text(), "");
+        assert_eq!(
+            app.image_row(80).as_deref(),
+            Some("image: a.png (image/png, 1000 B) · next message")
+        );
+        assert!(texts(&mut app)
+            .iter()
+            .any(|n| n == "(image attached to your next message: a.png (image/png, 1000 B))"));
+
+        let host = FakeHost::answering(vec![Err(
+            "image: /x.png: outside the workspace jail — refused".into(),
+        )]);
+        let mut app = App::default();
+        attach_pasted(&host, &mut app, "/x.png".into(), "/x.png");
+        assert_eq!(app.editor.text(), "/x.png", "inserted after all");
+        assert!(app.images().is_empty());
+        assert!(texts(&mut app).iter().any(|n| {
+            n
+            == "(pasted as text, not attached: image: /x.png: outside the workspace jail — refused)"
+        }));
+    }
+
+    #[test]
+    fn slash_image_maps_to_the_three_image_commands() {
+        for (draft, want) in [
+            ("/image shot.png", HostCmd::AttachImage("shot.png".into())),
+            ("/image  clear ", HostCmd::ClearImages),
+            ("/image", HostCmd::Images),
+        ] {
+            let mut app = App::default();
+            typed_input(&mut app, draft);
+            assert_eq!(
+                app.on_input(Input::new(Key::Enter)),
+                Action::Host(want),
+                "{draft}"
+            );
+        }
+        let (notes, _, _) = host_says(
+            HostCmd::AttachImage("/etc/x.png".into()),
+            Err("image: /etc/x.png: outside the workspace jail — refused".into()),
+        );
+        assert_eq!(
+            notes,
+            vec!["(/image: image: /etc/x.png: outside the workspace jail — refused)"]
+        );
+        let host = FakeHost::answering(vec![Ok(HostReply::Images(vec![]))]);
+        let mut app = App::default();
+        app.set_images(vec![item("a.png"), item("b.png")]);
+        run_host_cmd(&host, &mut app, HostCmd::ClearImages);
+        assert!(app.images().is_empty());
+        assert_eq!(texts(&mut app), vec!["(2 queued image(s) dropped)"]);
+        let (notes, _, app) =
+            host_says(HostCmd::Images, Ok(HostReply::Images(vec![item("a.png")])));
+        assert_eq!(
+            notes,
+            vec![
+                "(1 image(s) queued for your next message)",
+                "  a.png (image/png, 1000 B)"
+            ]
+        );
+        assert_eq!(app.images().len(), 1);
+    }
+
+    fn submit(draft: &str) -> Action {
+        let mut app = App::default();
+        typed_input(&mut app, draft);
+        app.on_input(Input::new(Key::Enter))
+    }
+
+    #[test]
+    fn copy_and_export_map_to_host_commands() {
+        assert_eq!(submit("/copy"), Action::Host(HostCmd::LastAnswer));
+        assert_eq!(submit("/export"), Action::Host(HostCmd::Export(None)));
+        assert_eq!(
+            submit("/export  out/my run.html "),
+            Action::Host(HostCmd::Export(Some("out/my run.html".into())))
+        );
+        // `/copy` takes no argument: refused locally, nothing sent.
+        let mut app = App::default();
+        typed_input(&mut app, "/copy now");
+        assert_eq!(app.on_input(Input::new(Key::Enter)), Action::Redraw);
+        assert!(texts(&mut app)[0].contains("usage: /copy"));
+        assert!(menu::matching("/co").contains(&"/copy"));
+        assert!(menu::matching("/ex").contains(&"/export"));
+    }
+
+    #[test]
+    fn copy_notes_what_was_attempted_and_queues_only_the_osc52_sequence() {
+        let answer = "hi \u{e9}\x1b[2J\x07 ]52; end".to_string();
+        let (notes, _, mut app) = host_says(
+            HostCmd::LastAnswer,
+            Ok(HostReply::Answer(Some(answer.clone()))),
+        );
+        assert_eq!(notes.len(), 1);
+        let n = answer.chars().count();
+        assert!(notes[0].contains(&format!("sent {n} characters to the terminal clipboard")));
+        assert!(notes[0].contains("OSC 52") && notes[0].contains("set-clipboard on"));
+        assert!(
+            !notes[0].contains("copied"),
+            "never claims success: {}",
+            notes[0]
+        );
+        assert_eq!(app.take_osc52(), Some(clipboard::osc52(&answer)));
+        assert_eq!(app.take_osc52(), None, "drains");
+    }
+
+    #[test]
+    fn copy_with_no_answer_or_too_large_an_answer_sends_nothing() {
+        for reply in [None, Some("  \n".to_string())] {
+            let (notes, _, mut app) = host_says(HostCmd::LastAnswer, Ok(HostReply::Answer(reply)));
+            assert!(notes[0].contains("nothing to copy"), "{notes:?}");
+            assert_eq!(app.take_osc52(), None);
+        }
+        let at_cap = "a".repeat(clipboard::MAX_COPY_BYTES);
+        let (_, _, mut app) = host_says(HostCmd::LastAnswer, Ok(HostReply::Answer(Some(at_cap))));
+        assert!(app.take_osc52().is_some(), "exactly the cap is allowed");
+        let over = "a".repeat(clipboard::MAX_COPY_BYTES + 1);
+        let (notes, _, mut app) = host_says(HostCmd::LastAnswer, Ok(HostReply::Answer(Some(over))));
+        assert_eq!(app.take_osc52(), None);
+        assert!(
+            notes[0].contains("/export") && notes[0].contains("64 KiB"),
+            "{notes:?}"
+        );
+        let (notes, _, mut app) = host_says(HostCmd::LastAnswer, Err("boom".into()));
+        assert_eq!(notes, vec!["(/copy: boom)"]);
+        assert_eq!(app.take_osc52(), None);
+    }
+
+    #[test]
+    fn export_reports_the_written_path_or_the_hosts_refusal() {
+        let (notes, _, _) = host_says(
+            HostCmd::Export(None),
+            Ok(HostReply::Path("/w/.tole/exports/s-1.html".into())),
+        );
+        assert_eq!(
+            notes,
+            vec!["(transcript written to /w/.tole/exports/s-1.html)"]
+        );
+        let (notes, _, _) = host_says(
+            HostCmd::Export(Some("a.html".into())),
+            Err("a.html exists; pick another path".into()),
+        );
+        assert_eq!(notes, vec!["(/export: a.html exists; pick another path)"]);
+        // A wrong-kind reply is reported, never a panic.
+        let (notes, _, _) = host_says(HostCmd::Export(None), Ok(HostReply::Done));
+        assert!(notes[0].contains("unexpected host reply"));
+    }
+
+    #[test]
+    fn queued_images_leave_with_the_message_and_are_reread_after_the_turn() {
+        let mut app = App::default();
+        app.set_images(vec![item("a.png"), item("b.png")]);
+        assert_eq!(
+            app.pending_rows(200),
+            vec!["images (2): a.png (image/png, 1000 B), b.png (image/png, 1000 B) · next message"]
+        );
+        typed_input(&mut app, "look");
+        app.on_input(Input::new(Key::Enter));
+        assert!(
+            app.images().is_empty(),
+            "the host took them with the message"
+        );
+        assert!(app.pending_rows(200).is_empty());
+        app.on_msg(Msg::Done(TurnEnd::Stopped("provider failed".into())));
+        assert!(
+            std::mem::take(&mut app.images_stale),
+            "the loop asks the host what is queued now"
+        );
+        // A turn without images does not ask.
+        typed_input(&mut app, "plain");
+        app.on_input(Input::new(Key::Enter));
+        app.on_msg(Msg::Done(TurnEnd::Final("ok".into())));
+        assert!(!app.images_stale);
     }
 
     #[test]
@@ -1407,12 +2012,18 @@ mod tests {
     }
 
     fn pending(app: &mut App, destructive: bool) -> Receiver<Verdict> {
-        let (reply, rx) = mpsc::channel();
-        app.on_msg(Msg::Approval(Pending {
-            text: "write_file out.txt".into(),
-            destructive,
-            reply,
-        }));
+        let (tx, rx) = mpsc::channel();
+        let risk = if destructive {
+            Risk::Destructive
+        } else {
+            Risk::Write
+        };
+        app.on_msg(Msg::Approval(Pending::new(
+            ApprovalRequest::new("write_file out.txt", risk),
+            move |v| {
+                let _ = tx.send(v);
+            },
+        )));
         rx
     }
 
@@ -1438,14 +2049,136 @@ mod tests {
         let rx = pending(&mut app, false);
         app.running = true;
         assert_eq!(app.on_key(ctrl('c')), Action::Cancel);
-        assert!(rx.recv().is_err(), "dropped sender = Prompter sees Deny");
+        // The cancelled approval is dropped unanswered: the drop itself delivers
+        // the Deny (fail closed), once, whoever the source is.
+        assert_eq!(rx.recv().unwrap(), Verdict::Deny);
+        assert!(rx.try_recv().is_err(), "exactly one verdict");
     }
 
     #[test]
     fn prompter_denies_when_ui_is_gone() {
         let (p, rx) = approval_channel();
         drop(rx);
-        assert_eq!(p.ask("x".into(), false), Verdict::Deny);
+        assert_eq!(p.ask(ApprovalRequest::new("x", Risk::Write)), Verdict::Deny);
+    }
+
+    // ---- approvals as source-agnostic state (#526) ----
+
+    #[test]
+    fn an_approval_request_is_one_safe_line_and_carries_its_risk_tier() {
+        let r = ApprovalRequest::new("write_file a\x1b[2J\nb", Risk::Write);
+        assert_eq!(r.text(), "write_file a\\u{1b}[2J ⏎ b");
+        assert_eq!(r.risk(), Risk::Write);
+        assert!(!r.is_destructive());
+    }
+
+    #[test]
+    fn allow_always_is_never_offered_for_a_destructive_call() {
+        for (risk, offered) in [
+            (Risk::ReadOnly, true),
+            (Risk::Write, true),
+            (Risk::Destructive, false),
+        ] {
+            let r = ApprovalRequest::new("x", risk);
+            assert_eq!(r.can_allow_always(), offered, "{risk:?}");
+            assert_eq!(r.is_destructive(), risk == Risk::Destructive);
+        }
+    }
+
+    /// A source that is not a turn thread: it posts a request with a reply
+    /// closure (a remote adapter would POST the decision there) and never
+    /// blocks. Everything the UI does with it is observable on `verdicts`.
+    fn remote_source() -> (Prompter, Receiver<Pending>, Arc<Mutex<Vec<Verdict>>>) {
+        let (p, rx) = approval_channel();
+        (p, rx, Arc::new(Mutex::new(Vec::new())))
+    }
+
+    fn post_remote(p: &Prompter, risk: Risk, verdicts: &Arc<Mutex<Vec<Verdict>>>) -> bool {
+        let sink = Arc::clone(verdicts);
+        p.post(ApprovalRequest::new("remote: deploy", risk), move |v| {
+            sink.lock().unwrap().push(v)
+        })
+    }
+
+    #[test]
+    fn a_remote_source_gets_the_users_verdict_exactly_once() {
+        for (k, want) in [('y', Verdict::Allow), ('n', Verdict::Deny)] {
+            let (p, rx, verdicts) = remote_source();
+            assert!(post_remote(&p, Risk::Write, &verdicts));
+            let mut app = App::default();
+            app.on_msg(Msg::Approval(rx.recv().unwrap()));
+            assert!(
+                verdicts.lock().unwrap().is_empty(),
+                "nothing before the user answers"
+            );
+            app.on_key(key(KeyCode::Char(k)));
+            assert_eq!(*verdicts.lock().unwrap(), [want], "{k}");
+            // keys after the answer change nothing
+            app.on_key(key(KeyCode::Char('y')));
+            assert_eq!(verdicts.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn esc_denies_and_cancels_for_a_remote_source_too() {
+        let (p, rx, verdicts) = remote_source();
+        post_remote(&p, Risk::Destructive, &verdicts);
+        let mut app = App::default();
+        app.on_msg(Msg::Approval(rx.recv().unwrap()));
+        assert_eq!(app.on_key(key(KeyCode::Esc)), Action::Cancel);
+        assert_eq!(*verdicts.lock().unwrap(), [Verdict::Deny]);
+    }
+
+    #[test]
+    fn a_destructive_request_is_shown_as_destructive() {
+        let (p, rx, verdicts) = remote_source();
+        post_remote(&p, Risk::Destructive, &verdicts);
+        let mut app = App::default();
+        app.on_msg(Msg::Approval(rx.recv().unwrap()));
+        let notes = texts(&mut app);
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.starts_with("? destructive: remote: deploy")),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn an_approval_that_never_gets_an_answer_is_denied_once_whatever_ended_it() {
+        // 1. the turn ends (or is cancelled) while the approval is open
+        let (p, rx, verdicts) = remote_source();
+        post_remote(&p, Risk::Write, &verdicts);
+        let mut app = App::default();
+        app.on_msg(Msg::Approval(rx.recv().unwrap()));
+        app.on_msg(Msg::Done(TurnEnd::Cancelled));
+        assert_eq!(*verdicts.lock().unwrap(), [Verdict::Deny], "turn ended");
+
+        // 2. a newer approval replaces an unanswered one
+        let (p, rx, verdicts) = remote_source();
+        post_remote(&p, Risk::Write, &verdicts);
+        post_remote(&p, Risk::Write, &verdicts);
+        let mut app = App::default();
+        app.on_msg(Msg::Approval(rx.recv().unwrap()));
+        app.on_msg(Msg::Approval(rx.recv().unwrap()));
+        assert_eq!(
+            *verdicts.lock().unwrap(),
+            [Verdict::Deny],
+            "the replaced one is denied"
+        );
+
+        // 3. the UI goes away with requests still queued
+        let (p, rx, verdicts) = remote_source();
+        post_remote(&p, Risk::Write, &verdicts);
+        post_remote(&p, Risk::Write, &verdicts);
+        drop(rx);
+        assert_eq!(*verdicts.lock().unwrap(), [Verdict::Deny, Verdict::Deny]);
+
+        // 4. posting to a UI that is already gone: refused, denied at once
+        let (p, rx, verdicts) = remote_source();
+        drop(rx);
+        assert!(!post_remote(&p, Risk::Write, &verdicts));
+        assert_eq!(*verdicts.lock().unwrap(), [Verdict::Deny]);
     }
 
     #[test]
@@ -1480,12 +2213,10 @@ mod tests {
         let mut app = App::default();
         app.on_msg(Msg::Text("ok\x1b[2J\rx\nnext".into()));
         app.on_msg(Msg::Done(TurnEnd::Stopped("bad\x1b]0;t\x07".into())));
-        let (reply, _rx) = mpsc::channel();
-        app.on_msg(Msg::Approval(Pending {
-            text: "w\x1b[2K".into(),
-            destructive: false,
-            reply,
-        }));
+        app.on_msg(Msg::Approval(Pending::new(
+            ApprovalRequest::new("w\x1b[2K", Risk::Write),
+            |_| {},
+        )));
         for o in app.take_out() {
             assert!(!o.text.chars().any(|c| c.is_control()), "{:?}", o.text);
         }
@@ -1495,8 +2226,8 @@ mod tests {
         };
         assert!(!f.render(200).chars().any(|c| c.is_control()));
         let (p, rx) = approval_channel();
-        std::thread::spawn(move || p.ask("a\x1b\nb".into(), false));
-        assert_eq!(rx.recv().unwrap().text, "a\\u{1b} ⏎ b");
+        std::thread::spawn(move || p.ask(ApprovalRequest::new("a\x1b\nb", Risk::Write)));
+        assert_eq!(rx.recv().unwrap().request().text(), "a\\u{1b} ⏎ b");
     }
 
     #[test]
@@ -1598,8 +2329,8 @@ mod tests {
         let mut app = App::default();
         assert!(app.menu().is_empty(), "no menu without a slash");
         type_str(&mut app, "/");
-        assert_eq!(app.menu().len(), 8);
-        type_str(&mut app, "co");
+        assert_eq!(app.menu().len(), menu::COMMANDS.len());
+        type_str(&mut app, "com");
         assert_eq!(app.menu(), ["/compact"]);
         app.on_key(key(KeyCode::Tab));
         assert_eq!(app.editor.text(), "/compact ");
@@ -1757,10 +2488,368 @@ mod tests {
         fn run_turn(&self, _: &str, _: &CancelToken, _: Arc<dyn TurnObserver>) -> TurnEnd {
             TurnEnd::Final(String::new())
         }
-        fn set_effort(&self, level: Option<&str>) -> Result<(), String> {
-            *self.0.lock().unwrap() = level.map(str::to_string);
-            Ok(())
+        fn apply(&self, cmd: HostCmd) -> Result<HostReply, String> {
+            match cmd {
+                HostCmd::SetEffort(level) => {
+                    *self.0.lock().unwrap() = level;
+                    Ok(HostReply::Done)
+                }
+                _ => unsupported(),
+            }
         }
+    }
+
+    // ---- the host interface a remote adapter implements (#526) ----
+
+    /// A host with only the three methods the trait asks for: it records
+    /// every command it is given and answers with scripted replies. Nothing in
+    /// it knows about sessions, storage or a terminal.
+    struct FakeHost {
+        seen: Mutex<Vec<String>>,
+        replies: Mutex<std::collections::VecDeque<Result<HostReply, String>>>,
+    }
+
+    impl FakeHost {
+        fn answering(replies: Vec<Result<HostReply, String>>) -> Self {
+            FakeHost {
+                seen: Mutex::new(Vec::new()),
+                replies: Mutex::new(replies.into()),
+            }
+        }
+        fn seen(&self) -> Vec<String> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    impl TuiHost for FakeHost {
+        fn footer(&self) -> Footer {
+            footer()
+        }
+        fn run_turn(&self, _: &str, _: &CancelToken, _: Arc<dyn TurnObserver>) -> TurnEnd {
+            TurnEnd::Final(String::new())
+        }
+        fn apply(&self, cmd: HostCmd) -> Result<HostReply, String> {
+            self.seen.lock().unwrap().push(format!("{cmd:?}"));
+            self.replies
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Err("no scripted reply".into()))
+        }
+    }
+
+    /// Run `cmd` against a host that answers `reply`; the UI's notes and
+    /// whether the footer was marked stale.
+    fn host_says(cmd: HostCmd, reply: Result<HostReply, String>) -> (Vec<String>, bool, App) {
+        let host = FakeHost::answering(vec![reply]);
+        let mut app = App {
+            footer_stale: false,
+            ..App::default()
+        };
+        run_host_cmd(&host, &mut app, cmd);
+        assert_eq!(host.seen().len(), 1, "exactly one host call per command");
+        let stale = app.footer_stale;
+        (texts(&mut app), stale, app)
+    }
+
+    #[test]
+    fn a_change_is_one_apply_call_and_the_wording_is_the_uis() {
+        let done = || Ok(HostReply::Done);
+        let cases: Vec<(HostCmd, &str)> = vec![
+            (HostCmd::SetModel("m1".into()), "(model → m1)"),
+            (HostCmd::SetEffort(Some("low".into())), "(thinking → low)"),
+            (HostCmd::SetEffort(None), "(thinking → unset)"),
+            (
+                HostCmd::Compact(None),
+                "(compaction runs before your next prompt)",
+            ),
+            (HostCmd::Name("nightly".into()), "(named nightly)"),
+        ];
+        for (cmd, want) in cases {
+            let (notes, stale, _) = host_says(cmd, done());
+            assert!(notes.iter().any(|n| n.contains(want)), "{want}: {notes:?}");
+            assert!(stale, "a change refreshes the footer: {want}");
+        }
+        let (notes, _, _) = host_says(HostCmd::Compact(Some("keep tests".into())), done());
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("instructions are not supported yet")),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn new_and_switch_report_the_session_the_host_names() {
+        let (notes, stale, _) = host_says(HostCmd::New, Ok(HostReply::Session("s-9".into())));
+        assert!(
+            notes.iter().any(|n| n.contains("new session s-9")),
+            "{notes:?}"
+        );
+        assert!(stale);
+        let (notes, _, _) = host_says(
+            HostCmd::Switch("s-1".into()),
+            Ok(HostReply::Session("s-1".into())),
+        );
+        assert!(notes.iter().any(|n| n.contains("resumed s-1")), "{notes:?}");
+    }
+
+    #[test]
+    fn fork_and_tree_commands_map_to_host_actions() {
+        let host = |c| Action::Host(c);
+        let mut app = App::default();
+        assert_eq!(typed(&mut app, "/fork"), host(HostCmd::Fork(None)));
+        assert_eq!(
+            typed(&mut app, "/fork  e-12 "),
+            host(HostCmd::Fork(Some("e-12".into())))
+        );
+        assert_eq!(typed(&mut app, "/tree"), host(HostCmd::PickTree));
+        // the command menu lists both
+        type_str(&mut app, "/f");
+        assert!(app.menu().contains(&"/fork"));
+        app.on_key(key(KeyCode::Esc));
+        // while a turn runs a command is ignored, like /new and /resume
+        let mut app = running_app();
+        for c in ["/fork", "/tree", "/new", "/resume"] {
+            type_str(&mut app, c);
+            assert_eq!(app.on_key(key(KeyCode::Enter)), Action::None, "{c}");
+        }
+    }
+
+    #[test]
+    fn fork_reports_the_new_session_and_refusals_with_the_hosts_error() {
+        let (notes, stale, _) =
+            host_says(HostCmd::Fork(None), Ok(HostReply::Session("s-fork".into())));
+        assert!(
+            notes.iter().any(|n| n.contains("forked → s-fork")),
+            "{notes:?}"
+        );
+        assert!(stale, "the footer is re-read after the switch");
+        let (notes, stale, _) = host_says(
+            HostCmd::Fork(Some("e-9".into())),
+            Err("forking s-1: entry e-9 is not a settled point".into()),
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("(fork: forking s-1: entry e-9 is not a settled point)")),
+            "{notes:?}"
+        );
+        assert!(!stale);
+    }
+
+    fn tree_rows() -> Vec<SessionItem> {
+        vec![
+            SessionItem {
+                id: "s-1".into(),
+                label: "s-1  2 turns".into(),
+            },
+            SessionItem {
+                id: "s-2".into(),
+                label: "└─ s-2 (@e-4)  3 turns  (current)".into(),
+            },
+            SessionItem {
+                id: "s-3".into(),
+                label: "   └─ s-3 (@e-6)  4 turns".into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn tree_picker_shows_the_family_preselects_the_current_and_switches() {
+        let mut app = App::default();
+        app.footer.session = "s-2".into();
+        let host = FakeHost::answering(vec![Ok(HostReply::Sessions(tree_rows()))]);
+        run_host_cmd(&host, &mut app, HostCmd::PickTree);
+        assert_eq!(host.seen(), vec!["PickTree"]);
+        let shown = app.picker_lines();
+        assert!(shown[0].starts_with("tree> "), "{shown:?}");
+        assert!(
+            shown.iter().any(|l| l.contains("▸ └─ s-2 (@e-4)")),
+            "{shown:?}"
+        );
+        assert!(
+            shown.iter().any(|l| l.contains("   └─ s-3")),
+            "indented: {shown:?}"
+        );
+        assert!(shown.iter().any(|l| l.ends_with("(current)")), "{shown:?}");
+        // a family of three: no "alone" note
+        assert!(!texts(&mut app).iter().any(|n| n.contains("no parent")));
+        // Enter on the preselected (current) row switches nowhere
+        assert_eq!(app.on_key(key(KeyCode::Enter)), Action::Redraw);
+        assert!(texts(&mut app).iter().any(|n| n.contains("already in s-2")));
+        // another row switches to exactly that id
+        run_host_cmd(
+            &FakeHost::answering(vec![Ok(HostReply::Sessions(tree_rows()))]),
+            &mut app,
+            HostCmd::PickTree,
+        );
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(
+            app.on_key(key(KeyCode::Enter)),
+            Action::Host(HostCmd::Switch("s-3".into()))
+        );
+        // and the first row goes to the root
+        run_host_cmd(
+            &FakeHost::answering(vec![Ok(HostReply::Sessions(tree_rows()))]),
+            &mut app,
+            HostCmd::PickTree,
+        );
+        app.on_key(key(KeyCode::Up));
+        assert_eq!(
+            app.on_key(key(KeyCode::Enter)),
+            Action::Host(HostCmd::Switch("s-1".into()))
+        );
+    }
+
+    #[test]
+    fn a_lone_session_in_tree_is_shown_with_a_note() {
+        let one = vec![SessionItem {
+            id: "s-1".into(),
+            label: "s-1  1 turns  (current)".into(),
+        }];
+        let (notes, _, app) = host_says(HostCmd::PickTree, Ok(HostReply::Sessions(one)));
+        assert!(
+            notes.iter().any(|n| n.contains("no parent and no forks")),
+            "{notes:?}"
+        );
+        assert!(app.picker_lines().iter().any(|l| l.contains("s-1")));
+        let (notes, _, _) = host_says(HostCmd::PickTree, Err("boom".into()));
+        assert!(
+            notes.iter().any(|n| n.contains("(tree: boom)")),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn pickers_open_from_the_hosts_data_and_empty_or_failed_ones_say_so() {
+        let ids = vec!["gpt-a".to_string(), "gpt-b".to_string()];
+        let (_, stale, app) = host_says(HostCmd::PickModel, Ok(HostReply::Models(ids)));
+        assert!(!stale, "a picker changes nothing");
+        let shown = app.picker_lines().join("\n");
+        assert!(
+            shown.contains("gpt-a") && shown.contains("gpt-b"),
+            "{shown}"
+        );
+        let (notes, _, app) = host_says(HostCmd::PickModel, Ok(HostReply::Models(vec![])));
+        assert!(app.picker_lines().is_empty());
+        assert!(
+            notes.iter().any(|n| n.contains("lists no models")),
+            "{notes:?}"
+        );
+        let (notes, _, _) = host_says(HostCmd::PickModel, Err("offline".into()));
+        assert!(notes
+            .iter()
+            .any(|n| n.contains("(models: offline; use /model <id>)")));
+
+        let rows = vec![SessionItem {
+            id: "s-2".into(),
+            label: "fix parser".into(),
+        }];
+        let (_, _, app) = host_says(HostCmd::PickSession, Ok(HostReply::Sessions(rows)));
+        let shown = app.picker_lines().join("\n");
+        assert!(shown.contains("fix parser"), "{shown}");
+        let (notes, _, _) = host_says(HostCmd::PickSession, Ok(HostReply::Sessions(vec![])));
+        assert!(
+            notes.iter().any(|n| n.contains("no other sessions")),
+            "{notes:?}"
+        );
+        let (notes, _, _) = host_says(HostCmd::PickSession, Err("no index".into()));
+        assert!(notes.iter().any(|n| n.contains("(sessions: no index)")));
+    }
+
+    #[test]
+    fn status_lines_are_shown_as_given() {
+        let lines = vec!["session: s-1".to_string(), "model: m".to_string()];
+        let (notes, stale, _) = host_says(HostCmd::Status, Ok(HostReply::Lines(lines)));
+        assert!(notes.contains(&"session: s-1".to_string()), "{notes:?}");
+        assert!(notes.contains(&"model: m".to_string()));
+        assert!(!stale);
+    }
+
+    #[test]
+    fn a_failing_host_is_reported_and_leaves_the_footer_alone() {
+        let (notes, stale, _) = host_says(HostCmd::SetModel("x".into()), Err("nope".into()));
+        assert!(
+            notes.iter().any(|n| n.contains("(failed: nope)")),
+            "{notes:?}"
+        );
+        assert!(!stale, "nothing changed, nothing to refresh");
+    }
+
+    #[test]
+    fn a_reply_of_the_wrong_kind_is_reported_not_a_panic() {
+        // A remote adapter that answers a model change with a model list.
+        let (notes, stale, _) = host_says(
+            HostCmd::SetModel("x".into()),
+            Ok(HostReply::Models(vec!["a".into()])),
+        );
+        assert!(
+            notes.iter().any(|n| n.contains("unexpected host reply")),
+            "{notes:?}"
+        );
+        assert!(!stale);
+    }
+
+    #[test]
+    fn a_host_that_implements_nothing_supports_status_and_refuses_the_rest() {
+        // `Host` (the echo host above) overrides only footer and run_turn.
+        let mut app = App::default();
+        run_host_cmd(&Host, &mut app, HostCmd::Status);
+        assert!(texts(&mut app).is_empty(), "no status lines, no error");
+        for cmd in [
+            HostCmd::PickModel,
+            HostCmd::SetModel("x".into()),
+            HostCmd::New,
+            HostCmd::PickSession,
+        ] {
+            run_host_cmd(&Host, &mut app, cmd);
+        }
+        let notes = texts(&mut app);
+        assert_eq!(notes.len(), 4, "{notes:?}");
+        assert!(
+            notes
+                .iter()
+                .all(|n| n.contains("not supported by this host")),
+            "{notes:?}"
+        );
+    }
+
+    /// #560 through the loop: a terminal paste event becomes one host
+    /// attach call and the image row; a multi-line paste is only drawn.
+    #[test]
+    fn the_loop_attaches_a_pasted_image_and_draws_a_pasted_block() {
+        let host = FakeHost::answering(vec![Ok(HostReply::Images(vec![item("shot.png")]))]);
+        let mut term = Terminal::with_options(
+            TestBackend::new(100, 14),
+            TerminalOptions {
+                viewport: Viewport::Inline(VIEWPORT_HEIGHT),
+            },
+        )
+        .unwrap();
+        let (_p, rx) = approval_channel();
+        let mut script = vec![
+            Some(Event::Paste("shot.png".into())),
+            Some(Event::Paste("first\r\nsecond".into())),
+        ];
+        script.extend(std::iter::repeat_n(None, 3));
+        let mut it = script.into_iter();
+        let mut app = App::new(footer());
+        event_loop(&mut term, &host, &mut app, &rx, |_| {
+            Ok(it.next().unwrap_or(Some(Event::Key(ctrl('c')))))
+        })
+        .unwrap();
+        assert_eq!(host.seen(), vec!["AttachImage(\"shot.png\")"]);
+        assert_eq!(app.editor.text(), "first\nsecond");
+        let text = format!("{}", term.backend());
+        assert!(
+            text.contains("image: shot.png (image/png, 1000 B) · next message"),
+            "{text}"
+        );
+        assert!(
+            text.contains("> first") && text.contains("  second"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -2066,7 +3155,7 @@ mod tests {
                 (Kind::Text, "after"),
             ]
         );
-        let spans = inline_spans("plain **bold** and `code` **open");
+        let spans = inline_spans("plain **bold** and `code` **open", &Theme::default());
         let shown: Vec<_> = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(shown, ["plain ", "bold", " and ", "code", " **open"]);
         assert!(spans[1].style.add_modifier.contains(Modifier::BOLD));
@@ -2085,7 +3174,7 @@ mod tests {
         assert!(out.iter().all(|o| !o.text.chars().any(char::is_control)));
         let style_of = |needle: &str| {
             let o = out.iter().find(|o| o.text.contains(needle)).unwrap();
-            styled(o.kind, &o.text).spans[0].style
+            styled(o.kind, &o.text, &Theme::default()).spans[0].style
         };
         assert_eq!(style_of("+new").fg, Some(Color::Green));
         assert_eq!(style_of("-old").fg, Some(Color::Red));

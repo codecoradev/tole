@@ -38,6 +38,9 @@ pub const DEFAULT_SESSIONS_DIR: &str = ".tole/sessions";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
     Flag,
+    /// The profile selected with `--profile` (#584): below the per-key
+    /// flags, above the environment and the config files.
+    Profile,
     Env,
     /// The project config.
     Config,
@@ -50,6 +53,7 @@ impl fmt::Display for Source {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Source::Flag => "flag",
+            Source::Profile => "profile",
             Source::Env => "env",
             Source::Config => "config",
             Source::UserConfig => "user config",
@@ -156,6 +160,24 @@ pub const CONTEXT_WINDOW_ENV: &str = "TOLE_CONTEXT_WINDOW";
 
 /// Reasoning effort sent as `reasoning_effort` (#457).
 pub const REASONING_EFFORT_ENV: &str = "TOLE_REASONING_EFFORT";
+
+/// Review gate policy (#534). Same name as `review_gate::ENV`, which only
+/// exists with `shell-tools`; a test below keeps the two equal.
+pub const REVIEW_GATE_ENV: &str = "TOLE_REVIEW_GATE";
+
+/// TUI theme name (#463): between the (absent) flag and the user config.
+pub const THEME_ENV: &str = "TOLE_THEME";
+
+/// <https://no-color.org>: a set, non-empty `NO_COLOR` asks for no color; here
+/// it selects the `mono` theme unless the user chose a theme explicitly.
+///
+/// Checked 2026-11-11: no-color.org itself was NOT reachable from this
+/// session (host outside the network allowlist), so its text is not quoted
+/// here. The condition (set AND non-empty, any value) is the one crossterm
+/// 0.29 implements and cites that page for, in `Colored::ansi_color_disabled`:
+/// `!std::env::var("NO_COLOR").unwrap_or("".to_string()).is_empty()`. Verify
+/// against the page when the network allows.
+pub const NO_COLOR_ENV: &str = "NO_COLOR";
 
 /// Real environment lookup for [`Settings::resolve`].
 pub fn real_env(name: &str) -> Option<String> {
@@ -294,6 +316,13 @@ pub struct ProviderFill {
     pub base_url: Option<String>,
     pub model: Option<String>,
     pub system_prompt: Option<String>,
+    /// The selected profile's model (#584): beats the env model.
+    pub profile_model: Option<String>,
+    /// The selected profile's persona (#584): beats `TOLE_SYSTEM_PROMPT`.
+    pub profile_system_prompt: Option<String>,
+    /// The selected profile's name (#584): the scope of recalled skills
+    /// (#590).
+    pub profile_name: Option<String>,
 }
 
 static FILL: OnceLock<ProviderFill> = OnceLock::new();
@@ -311,7 +340,23 @@ fn fill() -> ProviderFill {
 /// `OpenAiConfig::from_env()`: identical when no config was installed.
 pub fn provider_config() -> Option<OpenAiConfig> {
     let f = fill();
-    resolve_provider(f.base_url.as_deref(), f.model.as_deref(), &real_env).config
+    let mut cfg = resolve_provider(f.base_url.as_deref(), f.model.as_deref(), &real_env).config;
+    if let (Some(c), Some(m)) = (cfg.as_mut(), nonblank(f.profile_model)) {
+        c.model = m;
+    }
+    cfg
+}
+
+/// The selected profile's persona, for the server faces: above
+/// `TOLE_SYSTEM_PROMPT` and the config (#584).
+pub fn profile_system_prompt() -> Option<String> {
+    nonblank(fill().profile_system_prompt)
+}
+
+/// The selected profile's name (`--profile`), `None` without one: the
+/// profile scope of the skills a session recalls (#590).
+pub fn profile_name() -> Option<String> {
+    nonblank(fill().profile_name)
 }
 
 static EFFORT: OnceLock<Option<String>> = OnceLock::new();
@@ -381,6 +426,8 @@ pub struct Flags {
     pub no_compaction: bool,
     /// `--effort` (#457; already validated by the flag parser).
     pub reasoning_effort: Option<String>,
+    /// The profile `--profile` selected, already resolved (#584).
+    pub profile: Option<crate::profile::Profile>,
 }
 
 /// `tole mission --verify-timeout` default.
@@ -424,6 +471,22 @@ pub struct Settings {
     /// (#457), canonical lowercase; `None` = not sent. An invalid ENV value
     /// is kept as typed so [`Settings::effort_error`] can name it.
     pub reasoning_effort: Option<Eff<String>>,
+    /// `--review-gate` / `TOLE_REVIEW_GATE` > config `review_gate` (#534);
+    /// `None` = the built-in default (`block`). The flag reaches here as
+    /// the env var `main` exports it to.
+    pub review_gate: Option<Eff<String>>,
+    /// TUI theme name (#463): `TOLE_THEME` > user config `tui.theme` >
+    /// `NO_COLOR` (-> `mono`) > `default`. The project config is not a
+    /// source (see [`crate::config::layered`]).
+    pub tui_theme: Eff<String>,
+    /// Per-role color overrides from the user config's `tui.colors`.
+    pub tui_colors: Option<Eff<BTreeMap<String, String>>>,
+    /// Key bindings from the user config's `tui.keys` (#463): action ->
+    /// key specs. No env var; the project config is not a source.
+    pub tui_keys: Option<Eff<BTreeMap<String, Vec<String>>>>,
+    /// The memory loop's uteke room from the selected profile (#584);
+    /// `TOLE_MEMORY_NAMESPACE` (a child's mailbox) still wins over it.
+    pub memory_room: Option<Eff<String>>,
 }
 
 impl Settings {
@@ -465,6 +528,53 @@ impl Settings {
             let (v, s) = resolve_bool(flag, c);
             Eff::new(v, s)
         };
+        // The profile layer (#584): a value the selected profile sets takes
+        // the flag's slot when the flag is absent, then is relabeled.
+        let prof = flags.profile.as_ref();
+        let profiled = |flag: Option<String>, p: Option<String>| match flag {
+            Some(f) => (Some(f), false),
+            None => {
+                let p = nonblank(p);
+                let from = p.is_some();
+                (p, from)
+            }
+        };
+        let relabel = |e: Option<Eff<String>>, from_profile: bool| {
+            e.map(|mut e| {
+                if from_profile && e.source == Source::Flag {
+                    e.source = Source::Profile;
+                }
+                e
+            })
+        };
+        let (system_flag, system_from_profile) = profiled(
+            flags.system.clone(),
+            prof.and_then(|p| p.system_prompt.clone()),
+        );
+        // A delegated child (#585) gets exactly the allow patterns and trust
+        // presets its parent passed as flags (parent ∩ profile): never the
+        // profile's, the config's or the environment's, which could be wider.
+        let delegated = tole_core::child_env::delegation(env).is_some();
+        let (allow_flag, allow_source) = match prof {
+            _ if delegated => (flags.allow.clone(), Source::Flag),
+            Some(p) if flags.allow.is_empty() && !p.allow.is_empty() => {
+                (p.allow.clone(), Source::Profile)
+            }
+            _ => (flags.allow.clone(), Source::Flag),
+        };
+        let (skill_flag, skill_source) = match prof {
+            Some(p) if flags.skill.is_empty() && !p.skills.is_empty() => {
+                (p.skills.clone(), Source::Profile)
+            }
+            _ => (flags.skill.clone(), Source::Flag),
+        };
+        let mut provider = resolve_provider(cfg.base_url.as_deref(), cfg.model.as_deref(), env);
+        if let Some(m) = prof.and_then(|p| nonblank(p.model.clone())) {
+            if let Some(c) = provider.config.as_mut() {
+                c.model = m.clone();
+            }
+            provider.model = Some(Eff::new(m, Source::Profile));
+        }
         let env_trust = env("TOLE_TRUST")
             .map(|v| split_env_list(&v))
             .unwrap_or_default();
@@ -486,20 +596,32 @@ impl Settings {
                 cfg.memory.clone(),
             )
             .map(|(v, s)| Eff::from_pair((v.trim().to_string(), s), "TOLE_MEMORY")),
-            system_prompt: resolve_string(
-                // `--system ""` stays an explicit (empty) prompt, as before.
-                flags.system.clone(),
-                env("TOLE_SYSTEM_PROMPT"),
-                cfg.system_prompt.clone(),
-            )
-            .map(|p| Eff::from_pair(p, "TOLE_SYSTEM_PROMPT")),
-            provider: resolve_provider(cfg.base_url.as_deref(), cfg.model.as_deref(), env),
+            system_prompt: relabel(
+                resolve_string(
+                    // `--system ""` stays an explicit (empty) prompt, as before.
+                    system_flag,
+                    env("TOLE_SYSTEM_PROMPT"),
+                    cfg.system_prompt.clone(),
+                )
+                .map(|p| Eff::from_pair(p, "TOLE_SYSTEM_PROMPT")),
+                system_from_profile,
+            ),
+            provider,
             max_steps: num(flags.max_steps, mission.max_steps),
             max_minutes: num(flags.max_minutes, mission.max_minutes),
             max_tokens: num(flags.max_tokens, mission.max_tokens),
-            trust: resolve_list(&flags.trust, &env_trust, cfg.trust.as_deref())
-                .map(|p| Eff::from_pair(p, "TOLE_TRUST")),
-            allow: list(&flags.allow, &cfg.allow),
+            trust: if delegated {
+                resolve_list(&flags.trust, &[], None).map(|p| Eff::from_pair(p, "TOLE_TRUST"))
+            } else {
+                resolve_list(&flags.trust, &env_trust, cfg.trust.as_deref())
+                    .map(|p| Eff::from_pair(p, "TOLE_TRUST"))
+            },
+            allow: list(&allow_flag, if delegated { &None } else { &cfg.allow }).map(|mut e| {
+                if e.source == Source::Flag {
+                    e.source = allow_source;
+                }
+                e
+            }),
             mcp_server: list(&flags.mcp_server, &cfg.mcp_server),
             on_pretool: list(&flags.on_pretool, &cfg.on_pretool),
             on_posttool: list(&flags.on_posttool, &cfg.on_posttool),
@@ -509,8 +631,13 @@ impl Settings {
                     .skill
                     .as_ref()
                     .map(|v| v.iter().map(PathBuf::from).collect());
-                resolve_list(&flags.skill, &env_skill, cfg_skill.as_deref())
-                    .map(|p| Eff::from_pair(p, SKILL_ENV))
+                resolve_list(&skill_flag, &env_skill, cfg_skill.as_deref()).map(|p| {
+                    let mut e = Eff::from_pair(p, SKILL_ENV);
+                    if e.source == Source::Flag {
+                        e.source = skill_source;
+                    }
+                    e
+                })
             },
             plan_mode: boolean(flags.plan_mode, cfg.plan_mode),
             no_auto_mcp: boolean(flags.no_auto_mcp, cfg.no_auto_mcp),
@@ -553,6 +680,36 @@ impl Settings {
                 let canonical = tole_core::openai::parse_reasoning_effort(&v).unwrap_or(v);
                 Eff::from_pair((canonical, s), REASONING_EFFORT_ENV)
             }),
+            review_gate: resolve_string(None, env(REVIEW_GATE_ENV), cfg.review_gate.clone())
+                .map(|(v, s)| Eff::from_pair((v.trim().to_ascii_lowercase(), s), REVIEW_GATE_ENV)),
+            tui_theme: match resolve_string(
+                None,
+                env(THEME_ENV),
+                cfg.tui.as_ref().and_then(|t| t.theme.clone()),
+            ) {
+                Some(p) => Eff::from_pair((p.0.trim().to_string(), p.1), THEME_ENV),
+                // The no-color.org rule: set AND non-empty (not trimmed).
+                None if env(NO_COLOR_ENV).is_some_and(|v| !v.is_empty()) => {
+                    Eff::env("mono".to_string(), NO_COLOR_ENV)
+                }
+                None => Eff::new("default".to_string(), Source::Default),
+            },
+            tui_colors: cfg
+                .tui
+                .as_ref()
+                .and_then(|t| t.colors.clone())
+                .filter(|c| !c.is_empty())
+                .map(|c| Eff::new(c, Source::Config)),
+            tui_keys: cfg
+                .tui
+                .as_ref()
+                .and_then(|t| t.keys.as_ref())
+                .filter(|k| !k.is_empty())
+                .map(|k| {
+                    let k = k.iter().map(|(a, v)| (a.clone(), v.to_vec())).collect();
+                    Eff::new(k, Source::Config)
+                }),
+            memory_room: prof.map(|p| Eff::new(p.memory_room.clone(), Source::Profile)),
         }
     }
 
@@ -598,6 +755,73 @@ impl Settings {
         one(&mut self.compact_at, "compact_at", user);
         one(&mut self.no_compaction, "no_compaction", user);
         opt(&mut self.reasoning_effort, "reasoning_effort", user);
+        opt(&mut self.review_gate, "review_gate", user);
+        one(&mut self.tui_theme, "tui.theme", user);
+        opt(&mut self.tui_colors, "tui.colors", user);
+        opt(&mut self.tui_keys, "tui.keys", user);
+    }
+
+    /// The theme the TUI will use and the one-line note when the configured
+    /// theme was refused (#463). An invalid theme name or color never aborts:
+    /// the result is the `default` theme plus a note naming the key and the
+    /// problem.
+    #[cfg(feature = "tui")]
+    pub fn theme(&self) -> (tole_tui::Theme, Option<String>) {
+        match self.try_theme() {
+            Ok(t) => (t, None),
+            Err(e) => (
+                tole_tui::Theme::default(),
+                Some(format!("theme: {e}; using the default theme")),
+            ),
+        }
+    }
+
+    /// The key bindings the TUI will use and the one-line note when the
+    /// configured keymap was refused (#463). Like the theme, an invalid
+    /// keymap never aborts: the WHOLE keymap falls back to the default.
+    #[cfg(feature = "tui")]
+    pub fn keymap(&self) -> (tole_tui::Keymap, Option<String>) {
+        match self.try_keymap() {
+            Ok(k) => (k, None),
+            Err(e) => (
+                tole_tui::Keymap::default(),
+                Some(format!("keys: {e}; using the default keys")),
+            ),
+        }
+    }
+
+    #[cfg(feature = "tui")]
+    fn try_keymap(&self) -> Result<tole_tui::Keymap, String> {
+        let over: Vec<(String, Vec<String>)> = self.tui_keys.as_ref().map_or_else(Vec::new, |k| {
+            k.value
+                .iter()
+                .map(|(a, v)| (a.clone(), v.clone()))
+                .collect()
+        });
+        tole_tui::Keymap::from_overrides(&over)
+    }
+
+    #[cfg(feature = "tui")]
+    fn try_theme(&self) -> Result<tole_tui::Theme, String> {
+        let key = match (self.tui_theme.source, self.tui_theme.env) {
+            (Source::Env, Some(name)) => name,
+            _ => "tui.theme",
+        };
+        let name = &self.tui_theme.value;
+        let mut theme = tole_tui::Theme::named(name).ok_or_else(|| {
+            format!(
+                "{key} = {name:?} is not a theme (built-in: {})",
+                tole_tui::BUILTIN_THEMES.join(", ")
+            )
+        })?;
+        if let Some(colors) = &self.tui_colors {
+            for (role, spec) in &colors.value {
+                theme
+                    .set_role(role, spec)
+                    .map_err(|e| format!("tui.colors: {e}"))?;
+            }
+        }
+        Ok(theme)
     }
 
     /// The fill to install for the deep server faces: ONLY the config's own
@@ -607,7 +831,25 @@ impl Settings {
             base_url: nonblank(cfg.base_url.clone()),
             model: nonblank(cfg.model.clone()),
             system_prompt: nonblank(cfg.system_prompt.clone()),
+            profile_model: None,
+            profile_system_prompt: None,
+            profile_name: None,
         }
+    }
+
+    /// [`Settings::fill_from`] plus the selected profile's model and
+    /// persona (#584), which the server faces apply above the env.
+    pub fn fill_with_profile(
+        cfg: &Config,
+        profile: Option<&crate::profile::Profile>,
+    ) -> ProviderFill {
+        let mut f = Self::fill_from(cfg);
+        if let Some(p) = profile {
+            f.profile_model = nonblank(p.model.clone());
+            f.profile_system_prompt = nonblank(p.system_prompt.clone());
+            f.profile_name = nonblank(Some(p.name.clone()));
+        }
+        f
     }
 }
 
@@ -727,6 +969,59 @@ pub fn annotations(s: &Settings) -> BTreeMap<&'static str, String> {
             (e, None) => eff(e, &show_str),
         },
     );
+    m.insert("review_gate", eff(&s.review_gate, &show_str));
+    let theme_problem = |what: &str| -> Option<String> {
+        #[cfg(feature = "tui")]
+        if let Err(e) = s.try_theme() {
+            // Name the key the problem is about; one problem is reported.
+            if e.starts_with(what) {
+                return Some(e);
+            }
+        }
+        let _ = what;
+        None
+    };
+    m.insert(
+        "tui.theme",
+        match theme_problem("tui.theme").or_else(|| theme_problem(THEME_ENV)) {
+            Some(e) => format!("  INVALID: {e}; the default theme is used"),
+            None => format!(
+                "  effective: {}  {}",
+                show_str(&s.tui_theme.value),
+                s.tui_theme.describe()
+            ),
+        },
+    );
+    m.insert(
+        "tui.colors",
+        match (&s.tui_colors, theme_problem("tui.colors")) {
+            (_, Some(e)) => format!("  INVALID: {e}; the default theme is used"),
+            (Some(c), None) => format!(
+                "  effective: {} override(s)  {}",
+                c.value.len(),
+                c.describe()
+            ),
+            (None, None) => "  effective: (none)".to_string(),
+        },
+    );
+    m.insert(
+        "tui.keys",
+        match (&s.tui_keys, keys_problem(s)) {
+            (_, Some(e)) => format!("  INVALID: {e}; the default keys are used"),
+            (Some(k), None) => format!(
+                "  effective: {} action(s) rebound, the rest default  {}",
+                k.value.len(),
+                k.describe()
+            ),
+            (None, None) => "  effective: (default keys)".to_string(),
+        },
+    );
+    // A build without the TUI cannot validate a theme or keymap and does not
+    // use them: say so instead of reporting an effective value or a verdict.
+    #[cfg(not(feature = "tui"))]
+    for k in ["tui.theme", "tui.colors", "tui.keys"] {
+        m.insert(k, NEEDS_TUI.to_string());
+    }
     m.insert(
         "mission.verify_timeout",
         format!(
@@ -738,9 +1033,24 @@ pub fn annotations(s: &Settings) -> BTreeMap<&'static str, String> {
     m
 }
 
+/// The problem with the configured keymap, if any (always `None` in a build
+/// without the TUI, which cannot validate it).
+fn keys_problem(s: &Settings) -> Option<String> {
+    #[cfg(feature = "tui")]
+    return s.try_keymap().err();
+    #[cfg(not(feature = "tui"))]
+    {
+        let _ = s;
+        None
+    }
+}
+
 #[cfg(not(feature = "shell-tools"))]
 const NEEDS_SHELL_TOOLS: &str =
     "  (not supported by this build: needs the shell-tools feature; startup refuses it)";
+#[cfg(not(feature = "tui"))]
+const NEEDS_TUI: &str =
+    "  (not validated: this build has no TUI, so the theme and keys are not used; the file is checked only for its TOML shape)";
 #[cfg(not(feature = "mcp"))]
 const NEEDS_MCP: &str =
     "  (not supported by this build: needs the mcp feature; startup refuses it)";
@@ -866,6 +1176,27 @@ pub fn load_project_config(
     let outcome = config_trust::gate(&subject, origin, &store, io)?;
     let shown = subject.shown();
     let config = crate::config::parse(&outcome.content, &shown).map_err(|e| anyhow!("{e}"))?;
+    if config.tui.is_some() {
+        io.warn(&crate::config::tui_ignored_warning(
+            &config_trust::sanitize(&shown.display().to_string()),
+        ));
+    }
+    if config.profiles.is_some() {
+        io.warn(&crate::config::profiles_ignored_warning(
+            &config_trust::sanitize(&shown.display().to_string()),
+        ));
+    }
+    if config.hooks.is_some() {
+        io.warn(&crate::config::hooks_ignored_warning(
+            &config_trust::sanitize(&shown.display().to_string()),
+        ));
+    }
+    if let Some(w) = crate::routing::project_warning(
+        &config,
+        &config_trust::sanitize(&shown.display().to_string()),
+    ) {
+        io.warn(&w);
+    }
     io.inform(&format!(
         "tole: using config {}",
         config_trust::sanitize(&shown.display().to_string())

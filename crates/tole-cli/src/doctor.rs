@@ -357,6 +357,98 @@ fn tools_check(cfg: &OpenAiConfig, out: &mut Outcome) -> bool {
 
 /// `scheme://host[:port]/path` only: userinfo, query and fragment can carry
 /// credentials and never belong in output or on disk.
+/// The consumers whose children are model-driven commands (#598).
+const COMMAND_CONSUMERS: [&str; 3] = ["run_command", "job_start", "cron"];
+
+/// `tole doctor`'s process-guard line (#675), from
+/// `process_guard::inspection_denied`: whether same-user children are kept
+/// out of this process's `/proc/<pid>/environ` and memory. `None` (no line)
+/// where the platform has no such switch. Names no secret.
+pub fn process_guard_line(denied: Option<bool>) -> Option<String> {
+    Some(if denied? {
+        "process guard: ✓ non-dumpable: same-user children cannot read tole's \
+         /proc/<pid>/environ or memory"
+            .to_string()
+    } else {
+        "process guard: ! dumpable: same-user children can read tole's \
+         /proc/<pid>/environ (every secret it was started with)"
+            .to_string()
+    })
+}
+
+/// `tole doctor`'s secrets report (#598 part b), NAMES only, never values:
+/// each secret set in `env` and the tools the release lets receive it, what
+/// reaches the children of model commands and of a child session, and how
+/// to approve a verbatim read of a sensitive file.
+pub fn secrets_lines(
+    env: &[(String, String)],
+    release: &tole_core::secret_release::Release,
+) -> Vec<String> {
+    let mut names: Vec<&str> = env
+        .iter()
+        .filter(|(k, v)| tole_core::secrets::is_secret_name(k) && !v.trim().is_empty())
+        .map(|(k, _)| k.as_str())
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    let mut out = vec!["secrets (names only):".to_string()];
+    if names.is_empty() {
+        out.push("  - no secret-named variable is set".into());
+    }
+    let mut to_commands = Vec::new();
+    let mut to_children = Vec::new();
+    for n in &names {
+        let tools: Vec<&str> = release
+            .tools(n)
+            .map(|t| t.iter().map(String::as_str).collect())
+            .unwrap_or_default();
+        if tools.is_empty() {
+            out.push(format!(
+                "  - {n}: no tool (scrubbed from every child process)"
+            ));
+            continue;
+        }
+        to_children.push(*n);
+        let risky = tools.iter().any(|t| COMMAND_CONSUMERS.contains(t));
+        if risky {
+            to_commands.push(*n);
+        }
+        out.push(format!(
+            "  {} {n}: {}{}",
+            if risky { "!" } else { "-" },
+            tools.join(", "),
+            if risky {
+                " (every command the model runs can read it)"
+            } else {
+                ""
+            }
+        ));
+    }
+    out.push(format!(
+        "  {} children of run_command, job_start and cron receive: {}",
+        if to_commands.is_empty() { "✓" } else { "!" },
+        if to_commands.is_empty() {
+            "no secret".to_string()
+        } else {
+            to_commands.join(", ")
+        }
+    ));
+    out.push(format!(
+        "  - a child session (agent_start, delegate) receives its provider keys and: {}",
+        if to_children.is_empty() {
+            "nothing else".to_string()
+        } else {
+            to_children.join(", ")
+        }
+    ));
+    out.push(format!(
+        "  - sensitive files ({}) read as KEY=«redacted»; \
+         to read one verbatim, approve its read_file_raw call (or start with --allow read_file_raw)",
+        tole_core::sensitive::builtin_rules().join(", ")
+    ));
+    out
+}
+
 pub fn redact_url(url: &str) -> String {
     let (scheme, rest) = match url.split_once("://") {
         Some((s, r)) => (format!("{s}://"), r),
@@ -729,6 +821,76 @@ pub fn run_cli(
             crate::ecosystem::line(sib, &crate::ecosystem::probe(sib))
         );
     }
+    // Review gate (#534): what a `git commit` needs while cora is attached.
+    #[cfg(feature = "shell-tools")]
+    println!(
+        "{}",
+        crate::review_gate::doctor_line(
+            &crate::config_apply::real_env,
+            &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+        )
+    );
+    // Skill approval (#591; required by default): what a session can load.
+    for l in crate::skill_approve::doctor_lines(
+        &crate::config_apply::real_env,
+        tole_core::skill_approval::Approvals::default_path().as_deref(),
+        std::env::current_dir().ok().as_deref(),
+    ) {
+        println!("{l}");
+    }
+    // Secrets (#598): names and the tools that may receive them, never values.
+    let env: Vec<(String, String)> = std::env::vars().collect();
+    for l in secrets_lines(&env, &tole_core::secret_release::release()) {
+        println!("{l}");
+    }
+    // Process guard (#675): whether this tole is non-dumpable (Linux only).
+    if let Some(l) = process_guard_line(tole_core::process_guard::inspection_denied()) {
+        println!("{l}");
+    }
+    // Model routing (#586): state, rule and tier names only. Tiers and rules
+    // live in the user config; a broken router fails the doctor.
+    let user = crate::config::user_config_path()
+        .filter(|p| p.exists())
+        .map(|p| crate::config::load(&p));
+    let router_lines = match &user {
+        None => crate::routing::doctor_lines(&crate::config::Config::default()),
+        Some(Ok(c)) => crate::routing::doctor_lines(c),
+        Some(Err(e)) => vec![format!("router: ERROR in the user config: {e}")],
+    };
+    let ok = ok && !router_lines.iter().any(|l| l.starts_with("router: ERROR"));
+    router_lines.iter().for_each(|l| println!("{l}"));
+    // Advisor tier (#587): the profiles that declare one, names only. A
+    // broken user config is already reported (and failed) above.
+    let advisor_lines = match &user {
+        None => crate::profile::advisor_doctor_lines(&crate::config::Config::default()),
+        Some(Ok(c)) => crate::profile::advisor_doctor_lines(c),
+        Some(Err(_)) => Vec::new(),
+    };
+    advisor_lines.iter().for_each(|l| println!("{l}"));
+    // Discussion roles (#588): where the scribe's and the claim-checker's
+    // models come from, names only.
+    let role_lines = match &user {
+        None => crate::discussion_roles::doctor_lines(&crate::config::Config::default()),
+        Some(Ok(c)) => crate::discussion_roles::doctor_lines(c),
+        Some(Err(_)) => Vec::new(),
+    };
+    role_lines.iter().for_each(|l| println!("{l}"));
+    // Web tools (#625): which lane each tool uses, names only.
+    for l in crate::tool_roster::web_doctor_lines(&|k: &str| std::env::var(k).ok()) {
+        println!("{l}");
+    }
+    // Skill curator (#593): on or off, and whether the weekly sweep exists.
+    println!("{}", crate::curator_cmd::doctor_line());
+    // Scheduler (#579, P5): a stale ticker while jobs are active fails.
+    #[cfg(feature = "shell-tools")]
+    let ok = {
+        let (lines, cron_ok) = match crate::cron::default_dir() {
+            Ok(dir) => crate::cron::status::doctor(&dir, crate::cron::now()),
+            Err(e) => (vec![format!("  ! cron: {e}")], true),
+        };
+        lines.iter().for_each(|l| println!("{l}"));
+        ok && cron_ok
+    };
     // Only a configured provider has a ledger identity.
     if let (Some(cfg), false) = (cfg, no_ledger) {
         let saved = ledger_path().and_then(|p| {
@@ -757,6 +919,15 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::Arc;
+
+    #[test]
+    fn the_process_guard_line_says_which_state_and_nothing_elsewhere() {
+        let on = process_guard_line(Some(true)).unwrap();
+        assert!(on.contains("✓ non-dumpable"), "{on}");
+        let off = process_guard_line(Some(false)).unwrap();
+        assert!(off.contains("! dumpable"), "{off}");
+        assert_eq!(process_guard_line(None), None, "no line off Linux");
+    }
 
     fn no_env(_: &str) -> Option<String> {
         None
@@ -985,15 +1156,32 @@ mod tests {
 
     #[test]
     fn catalog_flags_an_unreachable_provider() {
-        // Nothing listens on this port.
+        // #712: the port stays bound to a listener that hangs up on every
+        // connection. A port that was bound and then freed can be taken by
+        // another test's server in between (a mock answering `/models`, so
+        // the provider looked reachable and there was no blocker).
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = l.local_addr().unwrap().port();
-        drop(l);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        l.set_nonblocking(true).unwrap();
+        let hangup = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    match l.accept() {
+                        Ok((c, _)) => drop(c),
+                        Err(_) => std::thread::sleep(std::time::Duration::from_millis(2)),
+                    }
+                }
+            })
+        };
         let o = diagnose(
             Some(&cfg_for(format!("http://127.0.0.1:{port}/v1"), "m")),
             &no_env,
             Tier::Catalog,
         );
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        hangup.join().unwrap();
         let b = o.blocker.unwrap();
         assert_eq!(b.check, "models");
         assert!(b.fix.contains("/models"), "{}", b.fix);
@@ -1088,6 +1276,68 @@ mod tests {
         std::fs::write(&path, "{not json").unwrap();
         assert!(Ledger::load(&path).unwrap_err().contains("corrupt"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_secrets_report_names_secrets_and_their_tools_never_values() {
+        let env: Vec<(String, String)> = [
+            ("GITHUB_TOKEN", "ghp-value-0001"),
+            ("NPM_TOKEN", "npm-value-0002"),
+            ("AWS_SECRET_ACCESS_KEY", "aws-value-0003"),
+            ("PATH", "/usr/bin"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let release = tole_core::secret_release::Release::default()
+            .with("NPM_TOKEN", ["run_command".to_string()]);
+        let text = secrets_lines(&env, &release).join("\n");
+        for v in ["ghp-value", "npm-value", "aws-value"] {
+            assert!(!text.contains(v), "a value leaked: {text}");
+        }
+        assert!(
+            text.contains("- GITHUB_TOKEN: gh, git, hook, mcp"),
+            "{text}"
+        );
+        assert!(
+            text.contains("! NPM_TOKEN: run_command (every command"),
+            "{text}"
+        );
+        assert!(text.contains("AWS_SECRET_ACCESS_KEY: no tool"), "{text}");
+        assert!(
+            text.contains("! children of run_command, job_start and cron receive: NPM_TOKEN"),
+            "{text}"
+        );
+        assert!(
+            text.contains("receives its provider keys and: GITHUB_TOKEN, NPM_TOKEN"),
+            "{text}"
+        );
+        assert!(text.contains("read_file_raw"), "{text}");
+        assert!(!text.contains("PATH"), "{text}");
+        // The defaults: nothing reaches a model command.
+        let text =
+            secrets_lines(&env[..1], &tole_core::secret_release::Release::default()).join("\n");
+        assert!(
+            text.contains("✓ children of run_command, job_start and cron receive: no secret"),
+            "{text}"
+        );
+    }
+
+    /// #683: the sensitive-files line is derived from `sensitive.rs`, so a
+    /// rule added there shows in `tole doctor` (the old text listed six).
+    #[test]
+    fn the_sensitive_files_line_lists_every_builtin_rule() {
+        let text = secrets_lines(&[], &tole_core::secret_release::Release::default()).join("\n");
+        let line = text
+            .lines()
+            .find(|l| l.contains("sensitive files"))
+            .unwrap_or_else(|| panic!("no sensitive files line: {text}"));
+        for rule in tole_core::sensitive::builtin_rules() {
+            assert!(line.contains(rule), "{rule} missing from: {line}");
+        }
+        for rule in ["*.env", "credentials", ".pgpass", "kubeconfig", "*.tfvars"] {
+            assert!(line.contains(rule), "{rule} missing from: {line}");
+        }
     }
 
     #[test]

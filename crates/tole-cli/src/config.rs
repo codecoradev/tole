@@ -14,7 +14,7 @@
 //! state.
 
 use serde::Deserialize;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -51,6 +51,532 @@ pub struct MissionConfig {
     pub verify_timeout: Option<u64>,
 }
 
+/// One `[tui.keys]` value: a key spec or a list of them.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(untagged)]
+pub enum KeyList {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl KeyList {
+    pub fn to_vec(&self) -> Vec<String> {
+        match self {
+            KeyList::One(s) => vec![s.clone()],
+            KeyList::Many(v) => v.clone(),
+        }
+    }
+}
+
+/// The `[tui]` table (#463): theme name, per-role color overrides and key
+/// bindings. USER LAYER (and, for the theme, the environment) ONLY: a project
+/// config may carry the table (so the file still parses) but [`layered`]
+/// drops it, because a cloned repository must not control how the approval
+/// prompt looks or which keys do what. Values are validated by `tole-tui`
+/// when the theme / keymap is built; a bad value falls back to the default
+/// with a startup note and never aborts, so only the TOML types are checked
+/// here.
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TuiConfig {
+    /// `default | light | mono`.
+    pub theme: Option<String>,
+    /// Role name -> style spec, e.g. `tool = "blue bold"`.
+    pub colors: Option<std::collections::BTreeMap<String, String>>,
+    /// Action name -> key spec(s), e.g. `toggle_tools = ["ctrl+o", "alt+o"]`.
+    pub keys: Option<std::collections::BTreeMap<String, KeyList>>,
+}
+
+/// The `[cron]` table (#579). USER LAYER ONLY, like [`TuiConfig`]: the
+/// scheduler is global (one job store per user), so a cloned repository's
+/// config must not raise the spending ceiling of every job.
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CronConfig {
+    /// Tokens all agent runs of one UTC day may spend together; past it
+    /// agent runs settle `budget` without calling the provider.
+    pub daily_token_cap: Option<u64>,
+    /// Runs one tick (`tole cron tick`, the `tole serve --cron` ticker)
+    /// executes at once, 1 to [`MAX_CRON_CONCURRENT`] (default 4).
+    pub max_concurrent: Option<usize>,
+    /// The time zone of a job saved without `--timezone` (#580): `UTC`, a
+    /// fixed offset like `+07:00` or an IANA name. Unset: such a job keeps
+    /// plain UTC.
+    pub timezone: Option<String>,
+    /// Where IANA zone names are resolved (#580) [default: `system` on
+    /// unix, else `offset-only`].
+    pub tz_source: Option<TzSource>,
+}
+
+/// The `[curator]` table (#593). USER LAYER ONLY, like [`CronConfig`]: the
+/// skill library is the user's, so a cloned repository's config must not
+/// switch the curator off or shorten how long a skill lives.
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CuratorConfig {
+    /// `false` turns `tole curator run` (and the weekly job) into a no-op
+    /// that says so. Unset: on, the owner's default.
+    pub enabled: Option<bool>,
+    /// Days without use before an agent-grown skill is stale [default 14].
+    pub stale_days: Option<u64>,
+    /// Days without use before it is archived [default 30].
+    pub archive_days: Option<u64>,
+    /// Days a skill that was never used is left alone [default 30].
+    pub grace_days: Option<u64>,
+}
+
+/// The curator's thresholds with the defaults filled in.
+pub fn curator_thresholds(c: Option<&CuratorConfig>) -> tole_core::skill_curator::Thresholds {
+    use tole_core::skill_curator::Thresholds;
+    let d = Thresholds::default();
+    Thresholds {
+        stale_days: c.and_then(|c| c.stale_days).unwrap_or(d.stale_days),
+        archive_days: c.and_then(|c| c.archive_days).unwrap_or(d.archive_days),
+        grace_days: c.and_then(|c| c.grace_days).unwrap_or(d.grace_days),
+    }
+}
+
+/// Upper bound of the curator's day counts (ten years).
+pub const MAX_CURATOR_DAYS: u64 = 3650;
+
+/// One `[hooks.<route>]` table (#582): a `POST /hooks/<route>` on `tole
+/// serve`. USER LAYER ONLY: a cloned repository must not open an endpoint
+/// or change one. The route key itself never lives here: only the name of
+/// the environment variable or the path of the file that holds it.
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HookConfig {
+    /// Environment variable holding the HMAC key.
+    pub hmac_key_env: Option<String>,
+    /// File holding the HMAC key (a regular file, not a link, at most 4 KiB).
+    pub hmac_key_file: Option<String>,
+    /// No signature check; only when `tole serve` binds a loopback address,
+    /// and only for loopback clients.
+    pub insecure_loopback: Option<bool>,
+    /// Deliveries accepted per minute (default 30, 1 to 600).
+    pub rate_per_minute: Option<u32>,
+    /// Largest body (default 262144, at most 1048576).
+    pub max_body_bytes: Option<u64>,
+    /// The job a matching delivery fires (#582 part 2). Unset: deliveries
+    /// are only verified and recorded.
+    pub cron_job: Option<String>,
+    /// Events admitted (`X-GitHub-Event` / `X-Tole-Event`); unset: all.
+    pub events: Option<Vec<String>>,
+    /// The filter a delivery's JSON body must pass.
+    pub filter: Option<crate::hook_filter::FilterConfig>,
+    /// `{dot.path}` template of the context the fired run sees.
+    pub template: Option<String>,
+    /// Let the fired run use the job's Write tools (default: ReadOnly).
+    pub allow_writes: Option<bool>,
+}
+
+/// `cron.tz_source`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TzSource {
+    /// The host's zoneinfo (`$TZDIR`, else `/usr/share/zoneinfo`), read at
+    /// run time; no zone data in the binary.
+    System,
+    /// UTC and fixed offsets only.
+    OffsetOnly,
+}
+
+/// Upper bound of `cron.max_concurrent`.
+pub const MAX_CRON_CONCURRENT: usize = 64;
+
+/// The `[delegation]` table (#585). USER LAYER ONLY, like [`CronConfig`]:
+/// it sets how deep and how wide delegation may go and the default budget
+/// of a goal, so a cloned repository must not raise it.
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DelegationConfig {
+    /// Depth below the orchestrator, 1 to 3 (default 2).
+    pub max_depth: Option<u32>,
+    /// Machine guard: delegated processes live at once before spawns queue.
+    pub max_live_processes: Option<u32>,
+    /// A goal's default budget: prompt + completion units of the provider.
+    pub goal_budget: Option<u64>,
+    /// A goal's default provider steps.
+    pub goal_steps: Option<u32>,
+    /// A goal's default wall-clock minutes.
+    pub goal_minutes: Option<u64>,
+    /// Resource guard (`tole_core::resource_guard`): memory that must stay
+    /// free after a child is reserved, in MiB (default 1024).
+    pub min_free_memory_mb: Option<u64>,
+    /// MiB reserved per child started but not yet ramped up (default 512).
+    pub child_memory_mb: Option<u64>,
+    /// Highest one-minute load per CPU at which a child starts (default 1.5).
+    pub max_load_per_cpu: Option<f64>,
+    /// MiB that must stay free on the data dir, workspace and worktree
+    /// filesystems (default 2048).
+    pub min_free_disk_mb: Option<u64>,
+    /// Percent of the process-id limit that must stay free (default 10).
+    pub min_free_pids_percent: Option<u64>,
+    /// Least seconds between two child starts (default 2).
+    pub spawn_interval_secs: Option<u64>,
+    /// Delegated children live at once on the machine, all goals and
+    /// sessions together (default max(2, CPUs)).
+    pub machine_max_live: Option<u32>,
+    /// Niceness of a delegated child, 0 to 19 (default 10).
+    pub child_nice: Option<u32>,
+}
+
+impl DelegationConfig {
+    /// The resource-guard thresholds this table sets (defaults for the
+    /// rest); an out-of-bounds value is an error naming its key.
+    pub fn resource_thresholds(&self) -> Result<tole_core::resource_guard::Thresholds, String> {
+        tole_core::resource_guard::Thresholds::with(&tole_core::resource_guard::Overrides {
+            min_free_memory_mb: self.min_free_memory_mb,
+            child_memory_mb: self.child_memory_mb,
+            max_load_per_cpu: self.max_load_per_cpu,
+            min_free_disk_mb: self.min_free_disk_mb,
+            min_free_pids_percent: self.min_free_pids_percent,
+            spawn_interval_secs: self.spawn_interval_secs,
+            machine_max_live: self.machine_max_live,
+            child_nice: self.child_nice,
+        })
+    }
+}
+
+/// `[router]` (#586): the RuleRouter, OFF unless `enabled = true`. Tiers and
+/// rules come from the user config only; a project config can only turn
+/// it off or narrow `allow_tiers` (see [`layered`]). Checked by
+/// [`crate::routing`].
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouterConfig {
+    pub enabled: Option<bool>,
+    /// The tiers rules may pick (unset: all).
+    pub allow_tiers: Option<Vec<String>>,
+    /// Models of runs without a profile (a profile's own come from
+    /// `profiles.<name>.models`).
+    pub tiers: Option<RouterTiers>,
+    pub rules: Option<Vec<RouterRule>>,
+}
+
+/// `[router.tiers]`: a model name per tier.
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouterTiers {
+    pub light: Option<String>,
+    pub standard: Option<String>,
+    pub heavy: Option<String>,
+}
+
+/// One `[[router.rules]]` entry; every set condition must hold.
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouterRule {
+    pub name: String,
+    /// `light | standard | heavy`.
+    pub tier: String,
+    /// `chat | run | mission | cron | delegate`.
+    pub kinds: Option<Vec<String>>,
+    pub min_chars: Option<usize>,
+    pub max_chars: Option<usize>,
+    /// `read_only | write | destructive`.
+    pub min_risk: Option<String>,
+    pub max_risk: Option<String>,
+    /// Profiles the rule applies to (unset: runs without a profile only).
+    pub profiles: Option<Vec<String>>,
+    pub jobs: Option<Vec<String>>,
+    pub budget_below: Option<u64>,
+    pub keywords: Option<Vec<String>>,
+}
+
+/// `[profiles.<name>.models]` (#584): model names per task-weight tier.
+/// `default` names the tier a session uses unless something picks another
+/// (the `[router]` of #586, when enabled, for rules that name the profile).
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelTiers {
+    pub light: Option<String>,
+    pub standard: Option<String>,
+    pub heavy: Option<String>,
+    /// Consulted, never executes (#587).
+    pub advisor: Option<String>,
+    /// `light | standard | heavy`; default `standard`.
+    pub default: Option<String>,
+}
+
+/// The executing tiers a `default` may name (`advisor` never executes).
+pub const EXEC_TIERS: [&str; 3] = ["light", "standard", "heavy"];
+
+impl ModelTiers {
+    /// The model of an executing tier, when that tier is set.
+    pub fn tier(&self, name: &str) -> Option<&str> {
+        match name {
+            "light" => self.light.as_deref(),
+            "standard" => self.standard.as_deref(),
+            "heavy" => self.heavy.as_deref(),
+            _ => None,
+        }
+        .filter(|m| !m.trim().is_empty())
+    }
+
+    /// The `default` tier's name (`standard` when unset).
+    pub fn default_tier(&self) -> &str {
+        self.default.as_deref().map(str::trim).unwrap_or("standard")
+    }
+}
+
+/// One `[profiles.<name>]` table (#584): a dormant persona. It holds
+/// configuration only; selecting it (`--profile <name>`) is the only thing
+/// that reads its persona file, and nothing is ever started for it.
+/// USER LAYER ONLY, like `[tui]`: a project config may not define who the
+/// agent is or what it may do without asking (see [`layered`]).
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileConfig {
+    /// Persona file (`~/` expanded; relative to the user config's directory).
+    pub system_prompt_file: Option<String>,
+    /// Tool patterns pre-authorized for this profile (same syntax as `allow`).
+    pub allow: Option<Vec<String>>,
+    /// uteke room of this profile's memory loop (default `profile-<name>`).
+    pub memory_room: Option<String>,
+    /// Skill files preloaded for this profile (same syntax as `skill`).
+    pub skills: Option<Vec<String>>,
+    /// NAMES of the environment secrets this profile may be granted
+    /// (never values; #598 releases them, #585 intersects with the parent).
+    pub grants: Option<Vec<String>>,
+    pub models: Option<ModelTiers>,
+    /// `consult_advisor` calls per run (#587; default 3, 1 to 20). Only with
+    /// `models.advisor` set.
+    pub advisor_max_uses: Option<u32>,
+}
+
+/// One `[secrets]` entry (#598): the tools (and tole launchers) whose
+/// child processes may receive this secret. The KEY is the environment
+/// variable's NAME; a value never belongs in a config file.
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecretBinding {
+    pub tools: Vec<String>,
+}
+
+/// A `[secrets]` key: a secret-shaped environment variable NAME, or a
+/// `*_URL` / `*_URI` name (a connection string with a password is scrubbed
+/// for its value, #682, so it must be grantable).
+fn check_secret(name: &str, b: &SecretBinding) -> Result<(), String> {
+    // Never echo the key or an entry: either may be a value pasted by mistake.
+    let url_name = name.ends_with("_URL") || name.ends_with("_URI");
+    if !valid_grant_name(name) || !(tole_core::secrets::is_secret_name(name) || url_name) {
+        return Err(
+            "secrets: every key must be the NAME of a secret environment variable \
+                    ([A-Z0-9_], containing TOKEN, SECRET, API_KEY, PASSWORD, ... or ending \
+                    in _KEY, _URL, ...), e.g. GITHUB_TOKEN or REDIS_URL; other variables \
+                    already reach every child"
+                .into(),
+        );
+    }
+    let tool_ok = |t: &str| {
+        !t.is_empty()
+            && t.len() <= 64
+            && t.bytes()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_')
+    };
+    if !b.tools.iter().all(|t| tool_ok(t)) {
+        return Err(format!(
+            "secrets.{name}.tools: every entry must be a tool name of a-z, 0-9 or `_` \
+             (e.g. \"gh\", \"git\", \"run_command\")"
+        ));
+    }
+    Ok(())
+}
+
+/// A `sensitive_files` entry (#683): a bare file NAME glob (`*` wildcards),
+/// no directory part, at most 128 chars, no control characters.
+fn check_sensitive_glob(g: &str) -> Result<(), String> {
+    if g.trim().is_empty()
+        || g.len() > 128
+        || g.contains(['/', '\\'])
+        || g.chars().any(char::is_control)
+        || g.chars().all(|c| c == '*')
+    {
+        return Err(
+            "sensitive_files: every entry must be a file name or a name glob with `*` \
+             (no directory, not only `*`), e.g. \"*.secret\" or \"vault-*.json\""
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// The sensitive-name globs of the layered config (#683): the user layer's
+/// list followed by the project's. A project can only ADD names (more
+/// files are redacted); nothing a config says can make a built-in name
+/// readable.
+fn layered_sensitive(
+    project: &Option<Vec<String>>,
+    user: &Option<Vec<String>>,
+) -> Option<Vec<String>> {
+    if project.is_none() && user.is_none() {
+        return None;
+    }
+    let mut out: Vec<String> = user.clone().unwrap_or_default();
+    for g in project.iter().flatten() {
+        if !out.contains(g) {
+            out.push(g.clone());
+        }
+    }
+    Some(out)
+}
+
+/// The consumers a layer leaves `name` bound to: its own entry, else the
+/// built-in default (`GITHUB_TOKEN` for gh, git, hook and mcp).
+fn bound_tools(layer: &Option<BTreeMap<String, SecretBinding>>, name: &str) -> Vec<String> {
+    match layer.as_ref().and_then(|m| m.get(name)) {
+        Some(b) => b.tools.clone(),
+        None => tole_core::secret_release::Release::default()
+            .tools(name)
+            .map(|t| t.iter().cloned().collect())
+            .unwrap_or_default(),
+    }
+}
+
+/// The `[secrets]` of the layered config (#598): the user layer's entries,
+/// where a project entry may only NARROW a binding (its tools ∩ the user's
+/// or the default's). A project file comes from a cloned repository; it
+/// must never hand a secret to a tool the user did not.
+fn layered_secrets(
+    project: &Option<BTreeMap<String, SecretBinding>>,
+    user: &Option<BTreeMap<String, SecretBinding>>,
+) -> Option<BTreeMap<String, SecretBinding>> {
+    let mut out = user.clone().unwrap_or_default();
+    for (name, b) in project.iter().flatten() {
+        let allowed = bound_tools(user, name);
+        let tools = b
+            .tools
+            .iter()
+            .filter(|t| allowed.contains(t))
+            .cloned()
+            .collect();
+        out.insert(name.clone(), SecretBinding { tools });
+    }
+    (project.is_some() || user.is_some()).then_some(out)
+}
+
+/// One warning per project `[secrets]` entry that tries to WIDEN a binding
+/// (those tools are refused), naming the remedy.
+pub fn secrets_widening_warnings(project: &Config, user: &Config, shown: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for (name, b) in project.secrets.iter().flatten() {
+        let allowed = bound_tools(&user.secrets, name);
+        let refused: Vec<&str> = b
+            .tools
+            .iter()
+            .filter(|t| !allowed.contains(t))
+            .map(String::as_str)
+            .collect();
+        if !refused.is_empty() {
+            out.push(format!(
+                "ignoring the grant of {name} to {} in project config {shown}: a project config \
+                 can only narrow a secret's tools. To grant it, add the tools to `{name}` under \
+                 [secrets] in your user config",
+                refused.join(", ")
+            ));
+        }
+    }
+    out
+}
+
+impl Config {
+    /// The secret release this config sets (#598): the defaults, with each
+    /// `[secrets]` entry replacing its name's binding.
+    pub fn release(&self) -> tole_core::secret_release::Release {
+        let mut r = tole_core::secret_release::Release::default();
+        for (name, b) in self.secrets.iter().flatten() {
+            r = r.with(name, b.tools.iter().cloned());
+        }
+        r
+    }
+}
+
+/// Profile names: `[a-z0-9_-]`, 1 to 64 chars, not starting with `-`
+/// (they become `--profile` values and the `profile-<name>` room).
+pub fn valid_profile_name(name: &str) -> bool {
+    (1..=64).contains(&name.len())
+        && !name.starts_with('-')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+}
+
+/// An environment variable NAME as a grant: `[A-Z0-9_]`, not starting with
+/// a digit. Anything else (a value pasted by mistake) is refused.
+fn valid_grant_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.as_bytes()[0].is_ascii_digit()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+}
+
+fn check_profile(name: &str, p: &ProfileConfig) -> Result<(), String> {
+    if !valid_profile_name(name) {
+        return Err(format!(
+            "profile name `{name}` must be 1-64 chars of a-z, 0-9, `_` or `-`, not starting with `-`"
+        ));
+    }
+    // The discussion's built-in roles (#588) take only their models.
+    if let Some(role) = crate::discussion_roles::Role::of(name) {
+        return crate::discussion_roles::check_override(role, p);
+    }
+    if let Some(room) = &p.memory_room {
+        let ok = !room.is_empty()
+            && !room.starts_with('-')
+            && room
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+        if !ok {
+            return Err(format!(
+                "profiles.{name}.memory_room must be [a-zA-Z0-9._-], not starting with `-`"
+            ));
+        }
+    }
+    // Never echo the entry: it may be a value pasted by mistake.
+    if p.grants.iter().flatten().any(|g| !valid_grant_name(g)) {
+        return Err(format!(
+            "profiles.{name}.grants: every entry must be an environment variable NAME              ([A-Z0-9_]), never a value"
+        ));
+    }
+    // The advisor tier (#587): a model that is consulted, never executes.
+    let advisor = p.models.as_ref().and_then(|m| m.advisor.as_deref());
+    if advisor.is_some_and(|a| a.trim().is_empty()) {
+        return Err(format!(
+            "profiles.{name}.models.advisor is blank: name the advisor model or remove the key"
+        ));
+    }
+    if let Some(n) = p.advisor_max_uses {
+        let max = tole_core::advisor::MAX_USES_CEILING;
+        if !(1..=max).contains(&n) {
+            return Err(format!(
+                "profiles.{name}.advisor_max_uses must be 1 to {max}, got {n}"
+            ));
+        }
+        if advisor.is_none() {
+            return Err(format!(
+                "profiles.{name}.advisor_max_uses is set but profiles.{name}.models.advisor is \
+                 not set: declare the advisor model or drop advisor_max_uses"
+            ));
+        }
+    }
+    if let Some(m) = &p.models {
+        let tier = m.default_tier();
+        if !EXEC_TIERS.contains(&tier) {
+            return Err(format!(
+                "profiles.{name}.models.default must be light, standard or heavy, got {tier:?}"
+            ));
+        }
+        if m.tier(tier).is_none() {
+            return Err(format!(
+                "profiles.{name}.models.default is {tier:?} but profiles.{name}.models.{tier} is not set"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The whole file: flat snake_case keys mirroring the global flags, all
 /// optional, plus the single `[mission]` table.
 #[derive(Debug, Default, Clone, PartialEq, Deserialize)]
@@ -81,7 +607,32 @@ pub struct Config {
     /// `reasoning_effort` sent on chat completions (#457):
     /// `minimal | low | medium | high`.
     pub reasoning_effort: Option<String>,
+    /// Review gate before `git commit` (#534): `off | warn | block`. A
+    /// project file can only keep or tighten the gate: see [`layered`].
+    pub review_gate: Option<String>,
     pub mission: Option<MissionConfig>,
+    /// Theme and colors (#463); user layer only, see [`TuiConfig`].
+    pub tui: Option<TuiConfig>,
+    /// Scheduler limits (#579); user layer only, see [`CronConfig`].
+    pub cron: Option<CronConfig>,
+    /// The skill curator (#593); user layer only, see [`CuratorConfig`].
+    pub curator: Option<CuratorConfig>,
+    /// Delegation limits (#585); user layer only, see [`DelegationConfig`].
+    pub delegation: Option<DelegationConfig>,
+    /// Dormant profiles (#584); user layer only, see [`ProfileConfig`].
+    pub profiles: Option<std::collections::BTreeMap<String, ProfileConfig>>,
+    /// Webhook routes of `tole serve` (#582); user layer only, see
+    /// [`HookConfig`].
+    pub hooks: Option<BTreeMap<String, HookConfig>>,
+    /// Model routing (#586); tiers and rules from the user layer only, see
+    /// [`RouterConfig`].
+    pub router: Option<RouterConfig>,
+    /// Scoped secret release (#598), see [`SecretBinding`]; a project
+    /// layer can only narrow it.
+    pub secrets: Option<BTreeMap<String, SecretBinding>>,
+    /// Extra sensitive file-name globs (#683), e.g. `["*.secret"]`; the
+    /// project layer's list is added to the user's, never replaces it.
+    pub sensitive_files: Option<Vec<String>>,
     /// Keys (rendered names, e.g. `model`, `mission.verify`) whose value
     /// came from the user layer; set by [`layered`], never by the file.
     #[serde(skip)]
@@ -160,9 +711,10 @@ pub fn read_source(path: &Path) -> Result<String, ConfigError> {
 
 /// Does this key name look like a secret? Case-insensitive substring
 /// match over `secret`, `password`, `token`, `api_key` (`-` ≙ `_`).
-/// The one schema key that legitimately contains such a word is
-/// `mission.max_tokens` (a budget, not a credential); it is exempted by
-/// exact position in [`check_forbidden`], never by name alone.
+/// The schema keys that legitimately contain such a word are
+/// `mission.max_tokens` and `cron.daily_token_cap` (budgets, not
+/// credentials); they are exempted by exact position in
+/// [`check_forbidden`], never by name alone.
 fn is_secret_name(key: &str) -> bool {
     let k = key.to_ascii_lowercase().replace('-', "_");
     ["secret", "password", "token", "api_key"]
@@ -180,7 +732,15 @@ fn check_forbidden(
 ) -> Result<(), ConfigError> {
     for (k, v) in table.iter() {
         let name: &str = k.get_ref();
-        let allowed = parent == Some("mission") && name == "max_tokens";
+        let allowed = matches!(
+            (parent, name),
+            (Some("mission"), "max_tokens")
+                | (Some("cron"), "daily_token_cap")
+                | (None, "secrets")
+                // `[secrets]` keys are secret NAMES; their values are checked
+                // below and by `check_secret` (never a value).
+                | (Some("secrets"), _)
+        );
         if !allowed && is_secret_name(name) {
             return Err(ConfigError {
                 path: path.to_path_buf(),
@@ -260,10 +820,71 @@ pub fn parse(src: &str, path: &Path) -> Result<Config, ConfigError> {
         tole_core::openai::parse_reasoning_effort(level)
             .map_err(|e| range(format!("reasoning_effort: {e}")))?;
     }
+    if let Some(v) = &cfg.review_gate {
+        if gate_strictness(v).is_none() {
+            return Err(range(format!(
+                "review_gate must be off, warn or block, got {v:?}"
+            )));
+        }
+    }
     if cfg.context_window == Some(0) {
         return Err(range(
             "context_window must be a positive number of tokens".into(),
         ));
+    }
+    for (name, p) in cfg.profiles.iter().flatten() {
+        check_profile(name, p).map_err(range)?;
+    }
+    for (name, b) in cfg.secrets.iter().flatten() {
+        check_secret(name, b).map_err(range)?;
+    }
+    for g in cfg.sensitive_files.iter().flatten() {
+        check_sensitive_glob(g).map_err(range)?;
+    }
+    if let Some(r) = &cfg.router {
+        crate::routing::compile(r).map_err(range)?;
+    }
+    if let Some(n) = cfg.cron.as_ref().and_then(|c| c.max_concurrent) {
+        if !(1..=MAX_CRON_CONCURRENT).contains(&n) {
+            return Err(range(format!(
+                "cron.max_concurrent must be 1 to {MAX_CRON_CONCURRENT}, got {n}"
+            )));
+        }
+    }
+    if let Some(c) = &cfg.curator {
+        for (key, v) in [
+            ("stale_days", c.stale_days),
+            ("archive_days", c.archive_days),
+            ("grace_days", c.grace_days),
+        ] {
+            if v.is_some_and(|n| n > MAX_CURATOR_DAYS) {
+                return Err(range(format!(
+                    "curator.{key} must be at most {MAX_CURATOR_DAYS}"
+                )));
+            }
+        }
+        // The effective pair, defaults filled in, so one key alone cannot
+        // leave `archive_days` at or below `stale_days`.
+        let th = curator_thresholds(Some(c));
+        th.check().map_err(|e| range(format!("curator: {e}")))?;
+    }
+    if let Some(d) = &cfg.delegation {
+        let ceiling = tole_core::delegation::MAX_DEPTH_CEILING;
+        if d.max_depth.is_some_and(|n| !(1..=ceiling).contains(&n)) {
+            return Err(range(format!(
+                "delegation.max_depth must be 1 to {ceiling}"
+            )));
+        }
+        let zero = [
+            ("max_live_processes", d.max_live_processes.map(u64::from)),
+            ("goal_budget", d.goal_budget),
+            ("goal_steps", d.goal_steps.map(u64::from)),
+            ("goal_minutes", d.goal_minutes),
+        ];
+        if let Some((k, _)) = zero.iter().find(|(_, v)| *v == Some(0)) {
+            return Err(range(format!("delegation.{k} must be at least 1")));
+        }
+        d.resource_thresholds().map_err(range)?;
     }
     Ok(cfg)
 }
@@ -272,6 +893,17 @@ pub fn parse(src: &str, path: &Path) -> Result<Config, ConfigError> {
 pub fn load(path: &Path) -> Result<Config, ConfigError> {
     let src = read_source(path)?;
     parse(&src, path)
+}
+
+/// Strictness of a `review_gate` value (`block` > `warn` > `off`); `None`
+/// when it is not one of the three.
+fn gate_strictness(v: &str) -> Option<u8> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "off" => Some(0),
+        "warn" => Some(1),
+        "block" => Some(2),
+        _ => None,
+    }
 }
 
 /// Merge the two layers key by key: the project value wins when it is set
@@ -387,9 +1019,86 @@ pub fn layered(project: &Config, user: &Config) -> Config {
             text,
             u,
         ),
+        // The one key where the project layer does NOT simply win: a cloned
+        // repository must not be able to loosen the review gate the user
+        // chose, so the STRICTER of the two layers applies (a project may
+        // only keep or tighten it).
+        review_gate: match (&project.review_gate, &user.review_gate) {
+            (Some(p), Some(u)) => {
+                if gate_strictness(u) > gate_strictness(p) {
+                    u.clone().into()
+                } else {
+                    p.clone().into()
+                }
+            }
+            (p, u) => p.clone().or_else(|| u.clone()),
+        },
         mission: (project.mission.is_some() || user.mission.is_some()).then_some(mission),
+        // The project layer NEVER supplies the theme, colors or keys (#463).
+        tui: user.tui.clone(),
+        // Nor the scheduler limits (#579).
+        cron: user.cron.clone(),
+        // Nor the curator's settings (#593).
+        curator: user.curator.clone(),
+        // Nor the delegation limits (#585).
+        delegation: user.delegation.clone(),
+        // Nor profiles (#584): a cloned repository must not define personas,
+        // their allow lists or their models.
+        profiles: user.profiles.clone(),
+        // Nor webhook routes (#582): a repository must not open or widen
+        // an endpoint.
+        hooks: user.hooks.clone(),
+        // Routing (#586): tiers and rules from the user only; a project can
+        // only turn it off or narrow the allowed tiers.
+        router: crate::routing::layered(&project.router, &user.router),
+        // A project may only narrow the secret release (#598).
+        secrets: layered_secrets(&project.secrets, &user.secrets),
+        // A project can only add sensitive names (#683).
+        sensitive_files: layered_sensitive(&project.sensitive_files, &user.sensitive_files),
         user_keys: BTreeSet::new(),
     };
+    if let Some(c) = &user.cron {
+        if c.daily_token_cap.is_some() {
+            from_user.insert("cron.daily_token_cap");
+        }
+        if c.max_concurrent.is_some() {
+            from_user.insert("cron.max_concurrent");
+        }
+        if c.timezone.is_some() {
+            from_user.insert("cron.timezone");
+        }
+        if c.tz_source.is_some() {
+            from_user.insert("cron.tz_source");
+        }
+    }
+    if let Some(c) = &user.curator {
+        if c.enabled.is_some() {
+            from_user.insert("curator.enabled");
+        }
+        if c.stale_days.is_some() {
+            from_user.insert("curator.stale_days");
+        }
+        if c.archive_days.is_some() {
+            from_user.insert("curator.archive_days");
+        }
+        if c.grace_days.is_some() {
+            from_user.insert("curator.grace_days");
+        }
+    }
+    if let Some(t) = &user.tui {
+        if t.theme.as_deref().is_some_and(|v| !v.trim().is_empty()) {
+            from_user.insert("tui.theme");
+        }
+        if t.colors.as_ref().is_some_and(|c| !c.is_empty()) {
+            from_user.insert("tui.colors");
+        }
+        if t.keys.as_ref().is_some_and(|k| !k.is_empty()) {
+            from_user.insert("tui.keys");
+        }
+    }
+    if out.review_gate.is_some() && out.review_gate != project.review_gate {
+        from_user.insert("review_gate");
+    }
     out.user_keys = from_user;
     out
 }
@@ -412,6 +1121,51 @@ pub fn render(cfg: &Config) -> Vec<String> {
     render_with(cfg, PROJECT_TAG, &Annotations::new())
 }
 
+/// Suffix of a project config's `tui` lines in `config check` (#463).
+pub const TUI_IGNORED_NOTE: &str =
+    "  IGNORED: a project config cannot set the theme, colors or keys (user config only; the theme also TOLE_THEME)";
+
+/// Suffix of a project config's `cron` lines in `config check` (#579).
+pub const CRON_IGNORED_NOTE: &str =
+    "  IGNORED: a project config cannot set scheduler limits (user config only)";
+/// Suffix of a project config's `curator` lines in `config check` (#593).
+pub const CURATOR_IGNORED_NOTE: &str =
+    "  IGNORED: a project config cannot change the skill curator (user config only)";
+/// Suffix of a project config's `delegation` lines in `config check` (#585).
+pub const DELEGATION_IGNORED_NOTE: &str =
+    "  IGNORED: a project config cannot set delegation limits (user config only)";
+/// Suffix of a project config's `profiles` line in `config check` (#584).
+pub const PROFILES_IGNORED_NOTE: &str =
+    "  IGNORED: a project config cannot define profiles (user config only)";
+
+/// Suffix of a project config's `secrets` lines in `config check` (#598).
+pub const SECRETS_PROJECT_NOTE: &str =
+    "  a project config can only narrow a secret's tools (widening is ignored)";
+
+/// The warning printed at startup when a project config carries `[profiles]`.
+pub fn profiles_ignored_warning(shown: &str) -> String {
+    format!(
+        "ignoring `profiles` in project config {shown}: profiles can only be defined in the \
+         user config"
+    )
+}
+
+/// The warning printed at startup when a project config carries `[hooks]`.
+pub fn hooks_ignored_warning(shown: &str) -> String {
+    format!(
+        "ignoring `hooks` in project config {shown}: webhook routes can only be defined in \
+         the user config"
+    )
+}
+
+/// The warning printed at startup when a project config carries `[tui]`.
+pub fn tui_ignored_warning(shown: &str) -> String {
+    format!(
+        "ignoring `tui` in project config {shown}: the theme, colors and keys can only be set in \
+         the user config (the theme also with TOLE_THEME)"
+    )
+}
+
 /// The `[tag]` on a project config line.
 pub const PROJECT_TAG: &str = "config";
 /// The `[tag]` on a user config line.
@@ -421,7 +1175,24 @@ pub const USER_TAG: &str = "user config";
 pub fn render_with(cfg: &Config, tag: &str, ann: &Annotations) -> Vec<String> {
     let src = tag;
     let mut out = Vec::new();
-    let note = |key: &str| ann.get(key).map_or("", String::as_str);
+    let note = |key: &str| {
+        if tag == PROJECT_TAG && key.starts_with("tui.") {
+            return TUI_IGNORED_NOTE;
+        }
+        if tag == PROJECT_TAG && key.starts_with("cron.") {
+            return CRON_IGNORED_NOTE;
+        }
+        if tag == PROJECT_TAG && key.starts_with("curator.") {
+            return CURATOR_IGNORED_NOTE;
+        }
+        if tag == PROJECT_TAG && key.starts_with("delegation.") {
+            return DELEGATION_IGNORED_NOTE;
+        }
+        if tag == PROJECT_TAG && key == "profiles" {
+            return PROFILES_IGNORED_NOTE;
+        }
+        ann.get(key).map_or("", String::as_str)
+    };
     let scalar = |out: &mut Vec<String>, key: &str, v: Option<String>| {
         if let Some(v) = v {
             out.push(format!("{key} = {v}  [{src}]{}", note(key)));
@@ -461,6 +1232,7 @@ pub fn render_with(cfg: &Config, tag: &str, ann: &Annotations) -> Vec<String> {
     list(&mut out, "on_posttool", &cfg.on_posttool);
     list(&mut out, "on_turnend", &cfg.on_turnend);
     list(&mut out, "skill", &cfg.skill);
+    list(&mut out, "sensitive_files", &cfg.sensitive_files);
     scalar(&mut out, "no_skills", cfg.no_skills.map(|b| b.to_string()));
     scalar(
         &mut out,
@@ -495,6 +1267,106 @@ pub fn render_with(cfg: &Config, tag: &str, ann: &Annotations) -> Vec<String> {
         "reasoning_effort",
         cfg.reasoning_effort.as_deref().map(quote),
     );
+    scalar(
+        &mut out,
+        "review_gate",
+        cfg.review_gate.as_deref().map(quote),
+    );
+    if let Some(t) = &cfg.tui {
+        scalar(&mut out, "tui.theme", t.theme.as_deref().map(quote));
+        if let Some(c) = &t.colors {
+            out.push(format!(
+                "tui.colors = [{} entries]  [{src}]{}",
+                c.len(),
+                note("tui.colors")
+            ));
+            for (role, spec) in c {
+                out.push(format!("  - {role} = {}", quote(spec)));
+            }
+        }
+        if let Some(k) = &t.keys {
+            out.push(format!(
+                "tui.keys = [{} entries]  [{src}]{}",
+                k.len(),
+                note("tui.keys")
+            ));
+            for (action, keys) in k {
+                let shown: Vec<String> = keys.to_vec().iter().map(|s| quote(s)).collect();
+                out.push(format!("  - {action} = [{}]", shown.join(", ")));
+            }
+        }
+    }
+    if let Some(p) = cfg.profiles.as_ref().filter(|p| !p.is_empty()) {
+        // Names only: a profile is shown by `config check --profile <name>`.
+        out.push(format!(
+            "profiles = [{} entries]  [{src}]{}",
+            p.len(),
+            note("profiles")
+        ));
+        for name in p.keys() {
+            out.push(format!("  - {}", quote(name)));
+        }
+    }
+    if let Some(h) = cfg.hooks.as_ref().filter(|h| !h.is_empty()) {
+        // Route names only (#582): never where a key comes from.
+        let ignored = if tag == PROJECT_TAG {
+            "  IGNORED: a project config cannot define webhook routes (user config only)"
+        } else {
+            ""
+        };
+        out.push(format!("hooks = [{} entries]  [{src}]{ignored}", h.len()));
+        for name in h.keys() {
+            out.push(format!("  - {}", quote(name)));
+        }
+    }
+    if let Some(r) = &cfg.router {
+        // Names only (#586): never models or keywords.
+        let narrow = if tag == PROJECT_TAG {
+            "  a project config can only set enabled = false or narrow allow_tiers (tiers and rules are ignored)"
+        } else {
+            ""
+        };
+        let on = if r.enabled == Some(true) { "on" } else { "off" };
+        out.push(format!("router = {on}  [{src}]{narrow}"));
+        if let Some(a) = &r.allow_tiers {
+            out.push(format!("  allow_tiers = [{}]", a.join(", ")));
+        }
+        if let Some(t) = &r.tiers {
+            let set: Vec<&str> = [
+                ("light", &t.light),
+                ("standard", &t.standard),
+                ("heavy", &t.heavy),
+            ]
+            .into_iter()
+            .filter(|(_, m)| m.is_some())
+            .map(|(n, _)| n)
+            .collect();
+            out.push(format!("  tiers = [{}]", set.join(", ")));
+        }
+        for rule in r.rules.iter().flatten() {
+            out.push(format!(
+                "  - rule {} -> {}",
+                quote(&rule.name),
+                quote(&rule.tier)
+            ));
+        }
+    }
+    for (name, b) in cfg.secrets.iter().flatten() {
+        let key = format!("secrets.{name}");
+        let note = if tag == PROJECT_TAG {
+            SECRETS_PROJECT_NOTE
+        } else {
+            ""
+        };
+        out.push(format!(
+            "{key} = [{}]  [{src}]{note}",
+            b.tools
+                .iter()
+                .map(|t| quote(t))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
     if let Some(m) = &cfg.mission {
         scalar(
             &mut out,
@@ -516,6 +1388,80 @@ pub fn render_with(cfg: &Config, tag: &str, ann: &Annotations) -> Vec<String> {
             &mut out,
             "mission.verify_timeout",
             m.verify_timeout.map(|n| n.to_string()),
+        );
+    }
+    if let Some(c) = &cfg.cron {
+        scalar(
+            &mut out,
+            "cron.daily_token_cap",
+            c.daily_token_cap.map(|n| n.to_string()),
+        );
+        scalar(
+            &mut out,
+            "cron.max_concurrent",
+            c.max_concurrent.map(|n| n.to_string()),
+        );
+        scalar(&mut out, "cron.timezone", c.timezone.as_deref().map(quote));
+        scalar(
+            &mut out,
+            "cron.tz_source",
+            c.tz_source.map(|s| {
+                match s {
+                    TzSource::System => "\"system\"",
+                    TzSource::OffsetOnly => "\"offset-only\"",
+                }
+                .to_string()
+            }),
+        );
+    }
+    if let Some(c) = &cfg.curator {
+        scalar(
+            &mut out,
+            "curator.enabled",
+            c.enabled.map(|b| b.to_string()),
+        );
+        for (key, v) in [
+            ("curator.stale_days", c.stale_days),
+            ("curator.archive_days", c.archive_days),
+            ("curator.grace_days", c.grace_days),
+        ] {
+            scalar(&mut out, key, v.map(|n| n.to_string()));
+        }
+    }
+    if let Some(d) = &cfg.delegation {
+        let n = |v: Option<u64>| v.map(|n| n.to_string());
+        scalar(
+            &mut out,
+            "delegation.max_depth",
+            n(d.max_depth.map(u64::from)),
+        );
+        scalar(
+            &mut out,
+            "delegation.max_live_processes",
+            n(d.max_live_processes.map(u64::from)),
+        );
+        scalar(&mut out, "delegation.goal_budget", n(d.goal_budget));
+        scalar(
+            &mut out,
+            "delegation.goal_steps",
+            n(d.goal_steps.map(u64::from)),
+        );
+        scalar(&mut out, "delegation.goal_minutes", n(d.goal_minutes));
+        for (key, v) in [
+            ("min_free_memory_mb", d.min_free_memory_mb),
+            ("child_memory_mb", d.child_memory_mb),
+            ("min_free_disk_mb", d.min_free_disk_mb),
+            ("min_free_pids_percent", d.min_free_pids_percent),
+            ("spawn_interval_secs", d.spawn_interval_secs),
+            ("machine_max_live", d.machine_max_live.map(u64::from)),
+            ("child_nice", d.child_nice.map(u64::from)),
+        ] {
+            scalar(&mut out, &format!("delegation.{key}"), n(v));
+        }
+        scalar(
+            &mut out,
+            "delegation.max_load_per_cpu",
+            d.max_load_per_cpu.map(|v| v.to_string()),
         );
     }
     out
@@ -646,6 +1592,381 @@ verify_timeout = 60
         assert!(lines.contains(&"model = \"m\"  [config]".to_string()));
         assert!(lines.contains(&"  - \"internal\"".to_string()));
         assert!(lines.contains(&"mission.max_tokens = 1000  [config]".to_string()));
+    }
+
+    #[test]
+    fn tui_table_parses_is_strict_and_only_the_user_layer_survives_layering() {
+        let c = parse(
+            "[tui]\ntheme = \"light\"\n[tui.colors]\ntool = \"blue bold\"\n",
+            &p(),
+        )
+        .unwrap();
+        let t = c.tui.as_ref().unwrap();
+        assert_eq!(t.theme.as_deref(), Some("light"));
+        assert_eq!(t.colors.as_ref().unwrap()["tool"], "blue bold");
+        // Unknown keys and wrong types are loud, like any other key; a bad
+        // VALUE is not (it is checked when the theme is built).
+        assert!(parse("[tui]\nthemes = \"x\"\n", &p()).is_err());
+        assert!(parse("[tui]\ntheme = 3\n", &p()).is_err());
+        assert!(parse("[tui]\ntheme = \"neon\"\n", &p()).is_ok());
+        // The project layer never reaches the merged config.
+        let project = parse("[tui]\ntheme = \"mono\"\n", &p()).unwrap();
+        let m = layered(&project, &Config::default());
+        assert_eq!(m.tui, None);
+        assert!(m.user_keys.is_empty());
+        let m = layered(&project, &c);
+        assert_eq!(m.tui, c.tui);
+        assert!(m.user_keys.contains("tui.theme") && m.user_keys.contains("tui.colors"));
+    }
+
+    #[test]
+    fn delegation_table_is_bounded_and_user_layer_only() {
+        let user = parse(
+            "[delegation]\nmax_depth = 3\nmax_live_processes = 2\ngoal_budget = 9\n",
+            &p(),
+        )
+        .unwrap();
+        let d = user.delegation.clone().unwrap();
+        assert_eq!(
+            (d.max_depth, d.max_live_processes, d.goal_budget),
+            (Some(3), Some(2), Some(9))
+        );
+        for bad in [
+            "max_depth = 4",
+            "max_depth = 0",
+            "max_live_processes = 0",
+            "goal_steps = 0",
+            "depth = 2",
+        ] {
+            assert!(
+                parse(&format!("[delegation]\n{bad}\n"), &p()).is_err(),
+                "{bad}"
+            );
+        }
+        let project = parse("[delegation]\nmax_depth = 3\n", &p()).unwrap();
+        assert_eq!(layered(&project, &Config::default()).delegation, None);
+        assert_eq!(layered(&project, &user).delegation, user.delegation);
+        let shown = render(&project).join("\n");
+        assert!(
+            shown.contains("delegation.max_depth = 3") && shown.contains("IGNORED"),
+            "{shown}"
+        );
+    }
+
+    /// The resource-guard keys: bounded, user layer only, shown by
+    /// `config check`.
+    #[test]
+    fn delegation_resource_keys_are_bounded_and_user_layer_only() {
+        let user = parse(
+            "[delegation]\nmin_free_memory_mb = 2048\nchild_memory_mb = 256\n\
+             max_load_per_cpu = 2.5\nmin_free_disk_mb = 4096\nmin_free_pids_percent = 20\n\
+             spawn_interval_secs = 5\nmachine_max_live = 3\nchild_nice = 15\n",
+            &p(),
+        )
+        .unwrap();
+        let t = user
+            .delegation
+            .as_ref()
+            .unwrap()
+            .resource_thresholds()
+            .unwrap();
+        assert_eq!(
+            (
+                t.min_free_memory_mb,
+                t.child_memory_mb,
+                t.max_load_per_cpu,
+                t.min_free_disk_mb,
+                t.min_free_pids_percent,
+                t.spawn_interval_secs,
+                t.machine_max_live,
+                t.child_nice
+            ),
+            (2048, 256, 2.5, 4096, 20, 5, 3, 15)
+        );
+        for bad in [
+            "min_free_memory_mb = 0",
+            "min_free_memory_mb = -1",
+            "child_memory_mb = 0",
+            "max_load_per_cpu = 0.0",
+            "max_load_per_cpu = -2.0",
+            "max_load_per_cpu = 1000.0",
+            "min_free_disk_mb = 0",
+            "min_free_pids_percent = 0",
+            "min_free_pids_percent = 95",
+            "spawn_interval_secs = 0",
+            "machine_max_live = 0",
+            "machine_max_live = 100000",
+            "child_nice = 20",
+            "child_nice = -5",
+            "max_load_per_cpu = \"high\"",
+        ] {
+            assert!(
+                parse(&format!("[delegation]\n{bad}\n"), &p()).is_err(),
+                "{bad}"
+            );
+        }
+        let project = parse("[delegation]\nmachine_max_live = 64\n", &p()).unwrap();
+        assert_eq!(layered(&project, &Config::default()).delegation, None);
+        let shown = render(&project).join("\n");
+        assert!(
+            shown.contains("delegation.machine_max_live = 64") && shown.contains("IGNORED"),
+            "{shown}"
+        );
+        let shown = render(&user).join("\n");
+        assert!(
+            shown.contains("delegation.max_load_per_cpu = 2.5"),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn cron_table_is_strict_and_user_layer_only() {
+        let user = parse("[cron]\ndaily_token_cap = 50000\n", &p()).unwrap();
+        assert_eq!(user.cron.as_ref().unwrap().daily_token_cap, Some(50_000));
+        assert!(parse("[cron]\ndaily_cap = 1\n", &p()).is_err());
+        // Exempt from the secret-name rule only at that exact position.
+        assert!(parse("[cron]\napi_token = \"x\"\n", &p()).is_err());
+        assert!(parse("[mission]\ndaily_token_cap = 1\n", &p()).is_err());
+        assert!(parse("[cron]\ndaily_token_cap = \"1\"\n", &p()).is_err());
+        // #580: the zone keys; an unknown source names the accepted ones.
+        let tz = parse(
+            "[cron]\ntimezone = \"Asia/Jakarta\"\ntz_source = \"offset-only\"\n",
+            &p(),
+        )
+        .unwrap()
+        .cron
+        .unwrap();
+        assert_eq!(
+            (tz.timezone.as_deref(), tz.tz_source),
+            (Some("Asia/Jakarta"), Some(TzSource::OffsetOnly))
+        );
+        let e = parse("[cron]\ntz_source = \"bundled\"\n", &p())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("system") && e.contains("offset-only"), "{e}");
+        let project = parse("[cron]\ndaily_token_cap = 999999999\n", &p()).unwrap();
+        assert_eq!(layered(&project, &Config::default()).cron, None);
+        let m = layered(&project, &user);
+        assert_eq!(m.cron, user.cron);
+        assert!(m.user_keys.contains("cron.daily_token_cap"));
+        let shown = render(&project).join("\n");
+        assert!(shown.contains("cron.daily_token_cap = 999999999") && shown.contains("IGNORED"));
+    }
+
+    /// #582: webhook routes come from the user config only. A project
+    /// config can neither define a route nor change a user route, and
+    /// `config check` shows route names, never where a key comes from.
+    #[test]
+    fn hooks_are_user_layer_only_and_shown_by_name() {
+        let user = parse(
+            "[hooks.gh]\nhmac_key_env = \"GH_HOOK_KEY\"\nrate_per_minute = 5\n",
+            &p(),
+        )
+        .unwrap();
+        let project = parse(
+            "[hooks.gh]\ninsecure_loopback = true\nrate_per_minute = 600\n[hooks.evil]\nhmac_key_env = \"X\"\n",
+            &p(),
+        )
+        .unwrap();
+        assert_eq!(layered(&project, &Config::default()).hooks, None);
+        assert_eq!(layered(&project, &user).hooks, user.hooks);
+        assert!(parse("[hooks.gh]\nsecret = \"x\"\n", &p()).is_err());
+        let shown = render(&user).join("\n");
+        assert!(
+            shown.contains("hooks = [1 entries]") && shown.contains("gh"),
+            "{shown}"
+        );
+        assert!(!shown.contains("GH_HOOK_KEY"), "{shown}");
+        assert!(render(&project).join("\n").contains("IGNORED"));
+    }
+
+    /// #579: `cron.max_concurrent` is a bounded, user-layer-only key.
+    #[test]
+    fn cron_max_concurrent_is_bounded_and_user_layer_only() {
+        let user = parse("[cron]\nmax_concurrent = 8\n", &p()).unwrap();
+        assert_eq!(user.cron.as_ref().unwrap().max_concurrent, Some(8));
+        for bad in ["0", "65", "-1", "\"4\""] {
+            assert!(
+                parse(&format!("[cron]\nmax_concurrent = {bad}\n"), &p()).is_err(),
+                "{bad}"
+            );
+        }
+        let project = parse("[cron]\nmax_concurrent = 64\n", &p()).unwrap();
+        assert_eq!(layered(&project, &Config::default()).cron, None);
+        let m = layered(&project, &user);
+        assert_eq!(m.cron, user.cron);
+        assert!(m.user_keys.contains("cron.max_concurrent"));
+        let shown = render(&project).join("\n");
+        assert!(shown.contains("cron.max_concurrent = 64") && shown.contains("IGNORED"));
+    }
+
+    /// #593: `[curator]` is strict, bounded, and user layer only.
+    #[test]
+    fn curator_table_is_strict_bounded_and_user_layer_only() {
+        let user = parse(
+            "[curator]\nenabled = false\nstale_days = 7\narchive_days = 21\ngrace_days = 5\n",
+            &p(),
+        )
+        .unwrap();
+        let c = user.curator.as_ref().unwrap();
+        assert_eq!(
+            (c.enabled, c.stale_days, c.archive_days, c.grace_days),
+            (Some(false), Some(7), Some(21), Some(5))
+        );
+        let th = curator_thresholds(Some(c));
+        assert_eq!((th.stale_days, th.archive_days, th.grace_days), (7, 21, 5));
+        let d = curator_thresholds(None);
+        assert_eq!((d.stale_days, d.archive_days, d.grace_days), (14, 30, 30));
+
+        assert!(
+            parse("[curator]\nenable = true\n", &p()).is_err(),
+            "unknown key"
+        );
+        assert!(parse("[curator]\nenabled = \"yes\"\n", &p()).is_err());
+        assert!(parse("[curator]\nstale_days = -1\n", &p()).is_err());
+        assert!(
+            parse("[curator]\nstale_days = 3651\n", &p()).is_err(),
+            "too long"
+        );
+        // The pair is checked with defaults filled in: one key alone can
+        // leave archive_days at or below stale_days.
+        for bad in [
+            "stale_days = 30",
+            "archive_days = 14",
+            "stale_days = 0",
+            "stale_days = 20\narchive_days = 20",
+        ] {
+            let e = parse(&format!("[curator]\n{bad}\n"), &p()).unwrap_err();
+            assert!(e.to_string().contains("archive_days"), "{bad}: {e}");
+        }
+        assert!(parse("[curator]\nstale_days = 20\narchive_days = 21\n", &p()).is_ok());
+
+        // A project config can neither switch it off nor shorten a skill's life.
+        let project = parse(
+            "[curator]\nenabled = false\nstale_days = 1\narchive_days = 2\n",
+            &p(),
+        )
+        .unwrap();
+        assert_eq!(layered(&project, &Config::default()).curator, None);
+        let m = layered(&project, &user);
+        assert_eq!(m.curator, user.curator);
+        assert!(m.user_keys.contains("curator.enabled"));
+        assert!(m.user_keys.contains("curator.archive_days"));
+        let shown = render(&project).join("\n");
+        assert!(
+            shown.contains("curator.enabled = false") && shown.contains("IGNORED"),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn profiles_parse_strictly_and_only_the_user_layer_survives_layering() {
+        let src = "[profiles.coder]\nallow = [\"write_*\"]\nmemory_room = \"profile-code\"\n\
+                   grants = [\"GITHUB_TOKEN\"]\n[profiles.coder.models]\nstandard = \"m\"\n";
+        let c = parse(src, &p()).unwrap();
+        let coder = &c.profiles.as_ref().unwrap()["coder"];
+        assert_eq!(coder.allow.as_deref(), Some(&["write_*".to_string()][..]));
+        assert_eq!(coder.models.as_ref().unwrap().default_tier(), "standard");
+        // Unknown keys, bad names, bad rooms and impossible defaults are loud.
+        for (bad, want) in [
+            ("[profiles.coder]\nmodel = \"m\"\n", "unknown field"),
+            ("[profiles.Coder]\n", "profile name `Coder`"),
+            ("[profiles.\"-x\"]\n", "profile name `-x`"),
+            ("[profiles.a]\nmemory_room = \"a b\"\n", "memory_room"),
+            (
+                "[profiles.a.models]\nlight = \"s\"\n",
+                "models.standard is not set",
+            ),
+            (
+                "[profiles.a.models]\nadvisor = \"s\"\ndefault = \"advisor\"\n",
+                "light, standard or heavy",
+            ),
+        ] {
+            let e = parse(bad, &p()).unwrap_err().to_string();
+            assert!(e.contains(want), "{bad:?}: {e}");
+        }
+        // A grant is a NAME; a value pasted by mistake is refused and never echoed.
+        let e = parse("[profiles.a]\ngrants = [\"ghp-abcdef123456\"]\n", &p())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("environment variable NAME") && !e.contains("ghp-abcdef"),
+            "{e}"
+        );
+        // The secret-key guard still applies inside a profile.
+        assert!(parse("[profiles.a]\napi_key = \"x\"\n", &p()).is_err());
+        // The project layer never supplies profiles.
+        let m = layered(&c, &Config::default());
+        assert_eq!(m.profiles, None);
+        let m = layered(&Config::default(), &c);
+        assert_eq!(m.profiles, c.profiles);
+        let lines = render(&c);
+        assert!(lines.iter().any(|l| l
+            == "profiles = [1 entries]  [config]  IGNORED: a project config cannot define profiles (user config only)"));
+        assert!(lines.contains(&"  - \"coder\"".to_string()));
+    }
+
+    #[test]
+    fn tui_keys_parse_as_string_or_list_are_type_strict_and_user_layer_only() {
+        let c = parse(
+            "[tui.keys]\ntoggle_tools = \"ctrl+o\"\nnewline = [\"shift+enter\", \"alt+n\"]\n",
+            &p(),
+        )
+        .unwrap();
+        let k = c.tui.as_ref().unwrap().keys.as_ref().unwrap();
+        assert_eq!(k["toggle_tools"].to_vec(), vec!["ctrl+o"]);
+        assert_eq!(k["newline"].to_vec(), vec!["shift+enter", "alt+n"]);
+        // Wrong types are loud; a bad action NAME or spec is not (it is
+        // checked, with a note, when the keymap is built).
+        assert!(parse("[tui.keys]\ntoggle_tools = 3\n", &p()).is_err());
+        assert!(parse("[tui.keys]\ntoggle_tools = [1]\n", &p()).is_err());
+        assert!(parse("[tui]\nkeys = \"x\"\n", &p()).is_err());
+        assert!(parse("[tui.keys]\nno_such_action = \"ctrl+o\"\n", &p()).is_ok());
+        // The project layer never reaches the merged config.
+        let project = parse("[tui.keys]\ntoggle_tools = \"f5\"\n", &p()).unwrap();
+        let m = layered(&project, &Config::default());
+        assert_eq!(m.tui, None);
+        assert!(m.user_keys.is_empty());
+        let m = layered(&project, &c);
+        assert_eq!(m.tui, c.tui);
+        assert!(m.user_keys.contains("tui.keys"));
+        // `config check` rendering lists the entries.
+        let lines = render(&c);
+        assert!(lines
+            .iter()
+            .any(|l| l.starts_with("tui.keys = [2 entries]  [config]")));
+        assert!(lines.contains(&"  - newline = [\"shift+enter\", \"alt+n\"]".to_string()));
+    }
+
+    #[test]
+    fn review_gate_is_validated_and_a_project_can_only_tighten_it() {
+        assert_eq!(
+            parse("review_gate = \"warn\"\n", &p())
+                .unwrap()
+                .review_gate
+                .as_deref(),
+            Some("warn")
+        );
+        let e = parse("review_gate = \"maybe\"\n", &p()).unwrap_err();
+        assert!(e.message.contains("review_gate must be"), "{e}");
+        let with = |v: &str| parse(&format!("review_gate = \"{v}\"\n"), &p()).unwrap();
+        let eff = |proj: Option<&str>, user: Option<&str>| {
+            let proj = proj.map(with).unwrap_or_default();
+            let user = user.map(with).unwrap_or_default();
+            let m = layered(&proj, &user);
+            (m.review_gate.clone(), m.user_keys.contains("review_gate"))
+        };
+        let s = |v: &str| Some(v.to_string());
+        // A project that loosens what the user chose loses to the user.
+        assert_eq!(eff(Some("off"), Some("block")), (s("block"), true));
+        assert_eq!(eff(Some("warn"), Some("block")), (s("block"), true));
+        // A project that tightens wins; equal is the project's.
+        assert_eq!(eff(Some("block"), Some("off")), (s("block"), false));
+        assert_eq!(eff(Some("warn"), Some("warn")), (s("warn"), false));
+        // One layer only: used as given (the project file is trust-gated).
+        assert_eq!(eff(None, Some("off")), (s("off"), true));
+        assert_eq!(eff(Some("off"), None), (s("off"), false));
+        assert_eq!(eff(None, None), (None, false));
     }
 
     #[test]
@@ -895,10 +2216,98 @@ verify_timeout = 60
     }
 
     #[test]
+    fn sensitive_files_are_validated_and_a_project_can_only_add() {
+        let user = parse("sensitive_files = [\"*.secret\"]\n", &p()).unwrap();
+        let project = parse("sensitive_files = [\"vault-*.json\", \"*.secret\"]\n", &p()).unwrap();
+        let l = layered(&project, &user);
+        assert_eq!(
+            l.sensitive_files,
+            Some(vec!["*.secret".to_string(), "vault-*.json".to_string()])
+        );
+        // A project with an empty list does not drop the user's.
+        let empty = parse("sensitive_files = []\n", &p()).unwrap();
+        assert_eq!(
+            layered(&empty, &user).sensitive_files,
+            Some(vec!["*.secret".to_string()])
+        );
+        for bad in ["\"\"", "\"*\"", "\"a/b.env\"", "\"a\\\\b\""] {
+            let e = parse(&format!("sensitive_files = [{bad}]\n"), &p()).unwrap_err();
+            assert!(e.message.contains("sensitive_files"), "{bad}: {e}");
+        }
+    }
+
+    #[test]
     fn long_system_prompt_is_truncated_for_display() {
         let c = parse(&format!("system_prompt = \"{}\"\n", "x".repeat(200)), &p()).unwrap();
         let line = &render(&c)[0];
         assert!(line.contains("… (200 chars)"), "{line}");
         assert!(line.len() < 150, "{line}");
+    }
+
+    #[test]
+    fn secrets_bind_names_to_tools_and_a_project_can_only_narrow_them() {
+        let p = |src: &str| parse(src, Path::new("c.toml"));
+        let user = p(
+            "[secrets]\nGITHUB_TOKEN = { tools = [\"gh\", \"git\", \"run_command\"] }\n\
+                      NPM_TOKEN = { tools = [\"run_command\"] }\n",
+        )
+        .unwrap();
+        // A key that is a secret NAME is not a forbidden key.
+        let r = user.release();
+        assert!(r.allows("GITHUB_TOKEN", "run_command"));
+        assert!(r.allows("NPM_TOKEN", "run_command"));
+        // A project tries to widen (job_start, a new secret) and narrows git.
+        let project = p(
+            "[secrets]\nGITHUB_TOKEN = { tools = [\"gh\", \"job_start\"] }\n\
+                         AWS_SECRET_ACCESS_KEY = { tools = [\"run_command\"] }\n",
+        )
+        .unwrap();
+        let l = layered(&project, &user).release();
+        assert!(l.allows("GITHUB_TOKEN", "gh"));
+        assert!(!l.allows("GITHUB_TOKEN", "job_start"), "widening refused");
+        assert!(!l.allows("GITHUB_TOKEN", "run_command"), "narrowed");
+        assert!(!l.allows("AWS_SECRET_ACCESS_KEY", "run_command"));
+        let w = secrets_widening_warnings(&project, &user, "p").join("\n");
+        assert!(w.contains("GITHUB_TOKEN to job_start"), "{w}");
+        assert!(w.contains("AWS_SECRET_ACCESS_KEY to run_command"), "{w}");
+        assert!(w.contains("in your user config"), "{w}");
+        // Without a user entry, the default binding is the ceiling.
+        let l = layered(&project, &Config::default()).release();
+        assert!(l.allows("GITHUB_TOKEN", "gh"));
+        assert!(!l.allows("GITHUB_TOKEN", "git"));
+        assert!(!l.allows("GITHUB_TOKEN", "job_start"));
+        // Bad entries name the remedy and never echo a key or value.
+        for (src, needle) in [
+            (
+                "[secrets]\nPATH = { tools = [\"gh\"] }\n",
+                "NAME of a secret",
+            ),
+            (
+                "[secrets]\nghp_abcdefTOKEN = { tools = [\"gh\"] }\n",
+                "NAME of a secret",
+            ),
+            (
+                "[secrets]\nGITHUB_TOKEN = { tools = [\"Run Command\"] }\n",
+                "tool name",
+            ),
+            (
+                "[secrets]\nGITHUB_TOKEN = { tools = [\"gh\"], value = \"x\" }\n",
+                "unknown field",
+            ),
+        ] {
+            let e = p(src).unwrap_err().to_string();
+            assert!(e.contains(needle), "{src}: {e}");
+            assert!(!e.contains("ghp_abcdef"), "{e}");
+        }
+        // A secret-like key anywhere else is still forbidden.
+        let e = p("[mission]\napi_token = \"x\"\n").unwrap_err().to_string();
+        assert!(e.contains("forbidden key"), "{e}");
+        // `config check` shows the binding, and on a project line the rule.
+        let lines = render_with(&project, PROJECT_TAG, &Annotations::new()).join("\n");
+        assert!(
+            lines.contains("secrets.GITHUB_TOKEN = [\"gh\", \"job_start\"]"),
+            "{lines}"
+        );
+        assert!(lines.contains("can only narrow"), "{lines}");
     }
 }

@@ -22,6 +22,12 @@ impl Editor {
         self.text = text.to_string();
     }
 
+    /// Append a pasted block as ONE edit (#560): its newlines stay newlines.
+    pub fn paste(&mut self, text: &str) {
+        self.edited();
+        self.text.push_str(text);
+    }
+
     pub fn newline(&mut self) {
         self.insert('\n');
     }
@@ -151,6 +157,19 @@ mod tests {
         e.prev();
         e.prev();
         assert_eq!(e.text(), "x");
+    }
+
+    #[test]
+    fn a_paste_is_one_edit_appended_to_the_draft() {
+        let mut e = Editor::default();
+        typed(&mut e, "old");
+        e.submit();
+        e.prev();
+        e.paste("\none\ntwo");
+        assert_eq!(e.lines(), ["old", "one", "two"]);
+        // the recalled entry became the draft: Down does not restore it
+        e.next();
+        assert_eq!(e.text(), "old\none\ntwo");
     }
 
     #[test]

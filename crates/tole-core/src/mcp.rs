@@ -1,5 +1,6 @@
 //! MCP client integration (issue #74): tole connects to external MCP
-//! servers over **stdio** and registers their tools into the normal
+//! servers over **stdio** (a spawned process) or **Streamable HTTP(S)**
+//! (#530, a remote endpoint) and registers their tools into the normal
 //! ToolRegistry.
 //!
 //! Trust model (threat-model.md must be read alongside this):
@@ -10,6 +11,12 @@
 //!   settle path and get the same wire fencing as native tools.
 //! - Server env: the child is spawned with the SAME scrubbed env as
 //!   every other subprocess (ENV-1), plus a minimal MCPPATH marker.
+//! - Remote (HTTP) servers: the bearer token is read from the environment
+//!   (`TOLE_MCP_<NAME>_TOKEN`), never from the spec or a config file, is
+//!   sent only to that server's endpoint, and is scrubbed from every error
+//!   (along with the url). `https` is required except for a loopback host,
+//!   a url with credentials is refused, and a redirect to another origin is
+//!   not followed (rmcp's default same-origin policy).
 //! - A server that fails to start or to answer `tools/list` degrades
 //!   to a startup warning (same pattern as the uteke probe) — never a
 //!   phantom tool and never a hard error.
@@ -32,11 +39,14 @@ use std::time::{Duration, Instant};
 /// 2026-09-18: brittle string-prefix matching).
 const TRANSPORT_ERR: &str = "mcp transport";
 
+/// A server's reported version and its full tool list (#599).
+pub type Listed = (String, Vec<crate::plugin_lock::ManifestTool>);
+
 /// Request into the background tokio reactor.
 enum McpRequest {
     ListTools {
         config: McpServerConfig,
-        resp: mpsc::Sender<Result<Vec<(String, String)>, String>>,
+        resp: mpsc::Sender<Result<Listed, String>>,
     },
     Call {
         server: String,
@@ -75,17 +85,32 @@ const MAX_RESULT_CHARS: usize = 256 * 1024;
 /// A hostile server must not flood the chat listing with prompts.
 const MAX_PROMPTS_PER_SERVER: usize = 64;
 
-/// Public config parsed from `--mcp-server <name>=<command...>` flags
-/// (kept simple; a config file can layer on later).
+/// How tole reaches an MCP server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpTransport {
+    /// Spawn `command args...` and speak MCP over its stdio.
+    Stdio { command: String, args: Vec<String> },
+    /// A Streamable HTTP(S) endpoint (#530). The url never carries a
+    /// credential; the bearer token comes from [`token_env_name`].
+    Http { url: String },
+}
+
+/// Public config parsed from `--mcp-server <name>=<spec>` flags
+/// (kept simple; a config file can layer on later). `<spec>` is either a
+/// command line (stdio) or a bare `http(s)://` url (Streamable HTTP).
 #[derive(Debug, Clone)]
 pub struct McpServerConfig {
     pub name: String,
-    pub command: String,
-    pub args: Vec<String>,
+    pub transport: McpTransport,
+    /// The secret NAMES this server's stdio process may receive (#679): the
+    /// grant its plugin-lock approval recorded. `None` (an embedder without
+    /// a lock): whatever the `[secrets]` release binds to `mcp`.
+    pub secret_grant: Option<Vec<String>>,
 }
 
 impl McpServerConfig {
-    /// Parse `name=prog arg1 arg2 ...`.
+    /// Parse `name=prog arg1 arg2 ...` (stdio) or `name=https://host/path`
+    /// (Streamable HTTP).
     pub fn parse(spec: &str) -> Result<Self, String> {
         let (name, rest) = spec
             .split_once('=')
@@ -98,12 +123,229 @@ impl McpServerConfig {
             .next()
             .ok_or_else(|| format!("mcp server {name:?} has no command"))?
             .to_string();
+        if has_http_scheme(&command) {
+            if parts.next().is_some() {
+                return Err(format!(
+                    "mcp server {name:?}: an http(s) spec is the bare url (the token comes from {})",
+                    token_env_name(name)
+                ));
+            }
+            validate_http_url(&command).map_err(|e| format!("mcp server {name:?}: {e}"))?;
+            return Ok(Self {
+                name: name.to_string(),
+                transport: McpTransport::Http { url: command },
+                secret_grant: None,
+            });
+        }
         Ok(Self {
             name: name.to_string(),
-            command,
-            args: parts.map(str::to_string).collect(),
+            transport: McpTransport::Stdio {
+                command,
+                args: parts.map(str::to_string).collect(),
+            },
+            secret_grant: None,
         })
     }
+}
+
+/// The environment variable holding a remote server's bearer token:
+/// `TOLE_MCP_<NAME>_TOKEN`, name upper-cased with `-` as `_`. The token is
+/// never accepted in a spec or config file (those get committed and
+/// printed); `TOKEN` in the name also makes the child-env scrub drop it.
+pub fn token_env_name(server: &str) -> String {
+    format!(
+        "TOLE_MCP_{}_TOKEN",
+        server.to_ascii_uppercase().replace('-', "_")
+    )
+}
+
+fn mcp_token(server: &str) -> Option<String> {
+    std::env::var(token_env_name(server))
+        .ok()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+}
+
+fn has_http_scheme(s: &str) -> bool {
+    split_scheme(s).is_some()
+}
+
+/// `(is_https, rest)` when `s` starts with `http://` or `https://`.
+fn split_scheme(s: &str) -> Option<(bool, &str)> {
+    let lower = |n: usize| s.get(..n).map(|p| p.to_ascii_lowercase());
+    if lower(8).as_deref() == Some("https://") {
+        Some((true, &s[8..]))
+    } else if lower(7).as_deref() == Some("http://") {
+        Some((false, &s[7..]))
+    } else {
+        None
+    }
+}
+
+/// The `host[:port]` part of an http(s) url.
+fn url_authority(url: &str) -> Option<&str> {
+    let (_, rest) = split_scheme(url)?;
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    Some(&rest[..end])
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Refuse what an HTTP MCP url must never be: a non-http(s) scheme,
+/// embedded credentials, an empty/odd host, or plain `http` to anything
+/// but loopback (the bearer token would cross the network in clear).
+fn validate_http_url(url: &str) -> Result<(), String> {
+    let (https, _) = split_scheme(url).ok_or("url must start with http:// or https://")?;
+    // `\` is read as `/` by URL parsers, so the host validated here could
+    // differ from the host that is contacted.
+    if url
+        .chars()
+        .any(|c| c.is_control() || c.is_whitespace() || c == '\\')
+    {
+        return Err("url must not contain whitespace, control characters or backslashes".into());
+    }
+    // The parser the HTTP client uses has the last word: a port above 65535,
+    // `1.2.3.4.5`, an encoded host and the like pass the checks below but
+    // would be refused (or worse) at connect time. Its error text never
+    // echoes the url.
+    url::Url::parse(url).map_err(|e| format!("not a valid url: {e}"))?;
+    let authority = url_authority(url).unwrap_or_default();
+    if authority.is_empty() {
+        return Err("url has no host".into());
+    }
+    if authority.contains('%') {
+        // The parser decodes an encoded host, so the host contacted would not
+        // be the one that was written (and validated) here.
+        return Err("percent-encoded hosts are refused".into());
+    }
+    if authority.contains('@') {
+        return Err(
+            "credentials in the url are refused (put the token in TOLE_MCP_<NAME>_TOKEN)".into(),
+        );
+    }
+    let host = if let Some(inner) = authority.strip_prefix('[') {
+        let (host, tail) = inner
+            .split_once(']')
+            .ok_or("unterminated IPv6 host in url")?;
+        if !(tail.is_empty() || tail.strip_prefix(':').is_some_and(is_port)) {
+            return Err("invalid port in url".into());
+        }
+        host
+    } else {
+        match authority.rsplit_once(':') {
+            Some((host, port)) if is_port(port) => host,
+            Some(_) => return Err("invalid port in url".into()),
+            None => authority,
+        }
+    };
+    if host.is_empty() {
+        return Err("url has no host".into());
+    }
+    if !https && !is_loopback_host(host) {
+        return Err(
+            "plain http is only allowed for a loopback host (localhost, 127.0.0.0/8, ::1); use https"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// reqwest is built with `rustls-no-provider` (so aws-lc is not pulled in
+/// next to the `ring` that ureq already uses) and PANICS when it builds a
+/// client without a process-level provider. Install `ring` once; an `Err`
+/// means the embedder already installed one, which we keep.
+fn ensure_tls_provider() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
+fn is_port(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 5 && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// The host of an `authority` (`host[:port]`, or `[v6][:port]`), without
+/// brackets and port; lenient (validation already ran).
+fn host_part(authority: &str) -> &str {
+    if let Some(inner) = authority.strip_prefix('[') {
+        return inner.split(']').next().unwrap_or_default();
+    }
+    match authority.rsplit_once(':') {
+        Some((host, port)) if is_port(port) => host,
+        _ => authority,
+    }
+}
+
+/// ASCII case-insensitive `str::replace`. URL parsers lowercase the scheme
+/// and host and drop default ports, so the string the operator typed is not
+/// what transport errors echo. Lowercasing ASCII keeps every byte offset.
+fn replace_ci(hay: &str, needle: &str, with: &str) -> String {
+    if needle.is_empty() {
+        return hay.to_string();
+    }
+    let (h, n) = (hay.to_ascii_lowercase(), needle.to_ascii_lowercase());
+    let mut out = String::with_capacity(hay.len());
+    let mut at = 0;
+    while let Some(pos) = h[at..].find(&n) {
+        out.push_str(&hay[at..at + pos]);
+        out.push_str(with);
+        at += pos + n.len();
+    }
+    out.push_str(&hay[at..]);
+    out
+}
+
+/// Scrub what must not reach the transcript, `tole status` or logs from an
+/// error string of a remote server: the bearer token, the url and its
+/// host (a url can be a capability, and transport errors echo it).
+///
+/// Transport errors echo the NORMALIZED url (lowercased scheme and host,
+/// default port elided, fragment dropped), so besides the url as typed the
+/// path and query, the authority and the bare host are scrubbed on their
+/// own, case-insensitively.
+fn scrub_err(cfg: &McpServerConfig, mut msg: String) -> String {
+    if let McpTransport::Http { url } = &cfg.transport {
+        let authority = url_authority(url).unwrap_or_default();
+        let after_authority = split_scheme(url)
+            .map(|(_, rest)| &rest[authority.len()..])
+            .unwrap_or_default();
+        let path_query = after_authority.split('#').next().unwrap_or_default();
+        let without_fragment = url.split('#').next().unwrap_or(url);
+        // What the client really echoes is the parsed, normalized url: scrub
+        // those exact forms too (decoded host, elided port, dropped fragment).
+        if let Ok(parsed) = url::Url::parse(url) {
+            msg = replace_ci(&msg, parsed.as_str(), "<url>");
+            msg = replace_ci(&msg, parsed.as_str().trim_end_matches('/'), "<url>");
+            let mut tail = parsed.path().to_string();
+            if let Some(q) = parsed.query() {
+                tail = format!("{tail}?{q}");
+            }
+            if tail.len() > 1 {
+                msg = replace_ci(&msg, &tail, "<path>");
+            }
+            if let Some(host) = parsed.host_str() {
+                msg = replace_ci(&msg, host, "<host>");
+            }
+        }
+        msg = replace_ci(&msg, url, "<url>");
+        msg = replace_ci(&msg, without_fragment, "<url>");
+        msg = replace_ci(&msg, url.trim_end_matches('/'), "<url>");
+        if path_query.len() > 1 {
+            msg = replace_ci(&msg, path_query, "<path>");
+        }
+        msg = replace_ci(&msg, authority, "<host>");
+        msg = replace_ci(&msg, host_part(authority), "<host>");
+        if let Some(token) = mcp_token(&cfg.name) {
+            msg = msg.replace(&token, "<token>");
+        }
+    }
+    msg
 }
 
 /// Spawn the background tokio reactor if not yet running. Returns the
@@ -244,24 +486,32 @@ struct McpConnection {
 }
 
 impl McpConnection {
-    /// List tool (name, description) pairs from the server.
-    async fn list_tools(&mut self) -> Result<Vec<(String, String)>, String> {
+    /// The server's reported version and every tool it lists, with the
+    /// full description and input schema (the manifest #599 hashes).
+    async fn list_tools(&mut self) -> Result<Listed, String> {
         let tools = self
             .service
             .list_all_tools()
             .await
             .map_err(|e| format!("tools/list failed: {e}"))?;
-        Ok(tools
+        let version = self
+            .service
+            .peer_info()
+            .and_then(|i| i.server_info.as_ref().map(|s| s.version.clone()))
+            .unwrap_or_default();
+        let tools = tools
             .into_iter()
-            .map(|t| {
-                let description = t
+            .map(|t| crate::plugin_lock::ManifestTool {
+                name: t.name.to_string(),
+                description: t
                     .description
                     .as_ref()
                     .map(|d| d.to_string())
-                    .unwrap_or_default();
-                (t.name.to_string(), description)
+                    .unwrap_or_default(),
+                input_schema: serde_json::Value::Object((*t.input_schema).clone()),
             })
-            .collect())
+            .collect();
+        Ok((version, tools))
     }
 
     /// Probe-first (#213): `prompts/list` is only sent when the server
@@ -447,23 +697,72 @@ async fn start_server(
     if conns.contains_key(&cfg.name) {
         return Ok(());
     }
-    let mut std_cmd = std::process::Command::new(&cfg.command);
-    std_cmd.args(&cfg.args);
-    // ENV-1: same secret scrubbing as every other spawn point.
-    crate::subprocess::scrub_env_for_child(&mut std_cmd);
-    let mut tokio_cmd = tokio::process::Command::from(std_cmd);
-    // Evicted/hung connections must not leak orphaned server processes
-    // (CodeCora): kill the child when the connection struct is dropped.
-    tokio_cmd.kill_on_drop(true);
-    let transport = rmcp::transport::child_process::TokioChildProcess::new(tokio_cmd)
-        .map_err(|e| format!("mcp {:?}: failed to start server: {e}", cfg.name))?;
-    let service = tokio::time::timeout(
-        SUBPROCESS_TIMEOUT,
-        rmcp::service::serve_client(rmcp::model::ClientConfig::default(), transport),
-    )
-    .await
-    .map_err(|_| format!("mcp {:?}: handshake timed out", cfg.name))?
-    .map_err(|e| format!("mcp {:?}: handshake failed: {e}", cfg.name))?;
+    let service = match &cfg.transport {
+        McpTransport::Stdio { command, args } => {
+            let mut std_cmd = std::process::Command::new(command);
+            std_cmd.args(args);
+            // ENV-1: same secret scrubbing as every other spawn point, and
+            // only the secrets this server's approval granted (#679).
+            let release = crate::secret_release::release();
+            let grant = cfg.secret_grant.clone();
+            crate::subprocess::scrub_env_with_keep(&mut std_cmd, &|name| {
+                release.allows(name, "mcp")
+                    && grant
+                        .as_ref()
+                        .is_none_or(|g| g.iter().any(|n| n.eq_ignore_ascii_case(name)))
+            });
+            let mut tokio_cmd = tokio::process::Command::from(std_cmd);
+            // Evicted/hung connections must not leak orphaned server processes
+            // (CodeCora): kill the child when the connection struct is dropped.
+            tokio_cmd.kill_on_drop(true);
+            let transport = rmcp::transport::child_process::TokioChildProcess::new(tokio_cmd)
+                .map_err(|e| format!("mcp {:?}: failed to start server: {e}", cfg.name))?;
+            tokio::time::timeout(
+                SUBPROCESS_TIMEOUT,
+                rmcp::service::serve_client(rmcp::model::ClientConfig::default(), transport),
+            )
+            .await
+            .map_err(|_| format!("mcp {:?}: handshake timed out", cfg.name))?
+            .map_err(|e| format!("mcp {:?}: handshake failed: {e}", cfg.name))?
+        }
+        McpTransport::Http { url } => {
+            // Re-validated here: the enum is public, so a config built
+            // without `parse` must not reach the network unchecked.
+            validate_http_url(url).map_err(|e| format!("mcp {:?}: {e}", cfg.name))?;
+            // Re-read at every (re)connect, so a rotated token is picked up
+            // without restarting tole.
+            let token = mcp_token(&cfg.name);
+            ensure_tls_provider();
+            // rmcp builds its default reqwest client with `.expect(..)`, which
+            // can panic (for example when no TLS roots can be loaded). A panic
+            // here would kill the shared reactor thread, and with it every MCP
+            // server of the process, stdio ones included, so degrade to an
+            // ordinary startup warning instead.
+            let transport = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut tcfg =
+                    rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(
+                        url.as_str(),
+                    );
+                if let Some(token) = token {
+                    tcfg = tcfg.auth_header(token);
+                }
+                rmcp::transport::StreamableHttpClientTransport::from_config(tcfg)
+            }))
+            .map_err(|_| {
+                format!(
+                    "mcp {:?}: could not build the HTTP client (are TLS root certificates installed?)",
+                    cfg.name
+                )
+            })?;
+            tokio::time::timeout(
+                SUBPROCESS_TIMEOUT,
+                rmcp::service::serve_client(rmcp::model::ClientConfig::default(), transport),
+            )
+            .await
+            .map_err(|_| format!("mcp {:?}: handshake timed out", cfg.name))?
+            .map_err(|e| format!("mcp {:?}: handshake failed: {e}", cfg.name))?
+        }
+    };
     conns.insert(cfg.name.clone(), McpConnection { service });
     Ok(())
 }
@@ -496,11 +795,16 @@ async fn with_connection<R>(
         &mut McpConnection,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<R, String>> + '_>>,
 ) -> Result<R, String> {
-    start_server(cfg, conns).await?;
+    // Every reactor op funnels through here, so this is the one place
+    // remote-server errors are scrubbed (token, url) before they can reach
+    // a transcript, `tole status` or a log.
+    start_server(cfg, conns)
+        .await
+        .map_err(|e| scrub_err(cfg, e))?;
     let conn = conns
         .get_mut(&cfg.name)
         .ok_or_else(|| format!("mcp {:?} vanished", cfg.name))?;
-    f(conn).await
+    f(conn).await.map_err(|e| scrub_err(cfg, e))
 }
 
 // ---------------------------------------------------------------------------
@@ -515,6 +819,9 @@ pub struct McpTool {
     /// The SERVER-side tool name (what the wire call must use).
     server_tool: String,
     description: String,
+    /// Known secrets redacted from the arguments before they are sent to
+    /// the server (#595). Empty by default.
+    secrets: crate::secrets::SecretSet,
 }
 
 impl McpTool {
@@ -524,7 +831,14 @@ impl McpTool {
             name,
             server_tool,
             description,
+            secrets: crate::secrets::SecretSet::default(),
         }
+    }
+
+    /// Redact these secrets from the arguments sent to the server (#595).
+    pub fn with_secrets(mut self, secrets: &crate::secrets::SecretSet) -> Self {
+        self.secrets = secrets.clone();
+        self
     }
 }
 
@@ -601,7 +915,11 @@ impl Tool for McpTool {
     }
 
     fn execute(&self, input: Value) -> Result<Value, String> {
-        let args = input.get("arguments").cloned().unwrap_or(json!({}));
+        // #595: a server never receives a known secret value, whatever the
+        // model put in the arguments.
+        let args = self
+            .secrets
+            .redact_value(input.get("arguments").unwrap_or(&json!({})));
         let (tx, rx) = mpsc::channel();
         runtime()
             .send(McpRequest::Call {
@@ -801,29 +1119,50 @@ use crate::sanitize::sanitize_one_line;
 const LIST_SYNC_BUDGET: Duration =
     Duration::from_secs(CALL_TIMEOUT.as_secs() + SUBPROCESS_TIMEOUT.as_secs() + 5);
 
-/// Register tools from `cfg` into `reg`. Startup-degrading: any failure
-/// is a warning, never an error (same contract as the uteke probe).
-/// Returns the names registered (empty on failure).
-pub fn register_server_tools(
-    reg: &mut crate::tool::ToolRegistry,
-    cfg: &McpServerConfig,
-) -> Vec<String> {
-    let mut registered = Vec::new();
-    let start = Instant::now();
-    // The reactor's ListTools handler connects on demand (startup is
-    // expected fast; bounded by the subprocess ceiling).
-    let runtime_tx = runtime();
-
+/// `cfg`'s reported version and full tool list (connecting on demand).
+pub fn list_manifest(cfg: &McpServerConfig) -> Result<Listed, String> {
     let (ltx, lrx) = mpsc::channel();
-    runtime_tx
+    runtime()
         .send(McpRequest::ListTools {
             config: cfg.clone(),
             resp: ltx,
         })
-        .map_err(|_| ())
-        .ok();
+        .map_err(|_| "mcp reactor is gone".to_string())?;
     match lrx.recv_timeout(LIST_SYNC_BUDGET) {
-        Ok(Ok(tools)) => {
+        Ok(r) => r,
+        Err(_) => Err("timed out listing tools".into()),
+    }
+}
+
+/// The connect-time guard (#599): given the server name, its reported
+/// version and its full tool list, `Ok` lets its tools register; `Err`
+/// carries the note shown instead (never registered).
+pub type Admit<'a> =
+    &'a dyn Fn(&str, &str, &[crate::plugin_lock::ManifestTool]) -> Result<(), String>;
+
+/// Register tools from `cfg` into `reg`. Startup-degrading: any failure
+/// is a warning, never an error (same contract as the uteke probe).
+/// Returns the names registered (empty on failure). Every tool redacts
+/// `secrets` from the arguments it sends (#595). `admit` sees the whole
+/// live manifest (before the per-server cap) and decides first (#599).
+pub fn register_server_tools(
+    reg: &mut crate::tool::ToolRegistry,
+    cfg: &McpServerConfig,
+    secrets: &crate::secrets::SecretSet,
+    admit: Admit<'_>,
+) -> Vec<String> {
+    let mut registered = Vec::new();
+    let start = Instant::now();
+    match list_manifest(cfg) {
+        Ok((version, manifest)) => {
+            if let Err(note) = admit(&cfg.name, &version, &manifest) {
+                reg.set_mcp_admitted(&cfg.name, false);
+                eprintln!("tole: mcp[{}]: {note}", cfg.name);
+                return registered;
+            }
+            // #680: recorded on this registry, the session's own decision.
+            reg.set_mcp_admitted(&cfg.name, true);
+            let tools = manifest.into_iter().map(|t| (t.name, t.description));
             // Cap registered tools per server: a hostile/buggy server
             // must not flood the registry (and provider tool specs).
             const MAX_TOOLS_PER_SERVER: usize = 64;
@@ -844,12 +1183,15 @@ pub fn register_server_tools(
                 let mut mcp_name = format!("mcp_{}_{}", cfg.name, sanitized);
                 mcp_name.truncate(64);
                 if reg
-                    .register(Box::new(McpTool::new(
-                        cfg.name.clone(),
-                        mcp_name.clone(),
-                        server_tool.clone(),
-                        description,
-                    )))
+                    .register(Box::new(
+                        McpTool::new(
+                            cfg.name.clone(),
+                            mcp_name.clone(),
+                            server_tool.clone(),
+                            description,
+                        )
+                        .with_secrets(secrets),
+                    ))
                     .is_ok()
                 {
                     registered.push(mcp_name);
@@ -867,14 +1209,13 @@ pub fn register_server_tools(
                 start.elapsed()
             );
         }
-        Ok(Err(e)) => eprintln!(
-            "tole: mcp[{}]: listing failed: {e} — server skipped",
-            cfg.name
-        ),
-        Err(_) => eprintln!(
-            "tole: mcp[{}]: timed out listing tools — server skipped",
-            cfg.name
-        ),
+        Err(e) => {
+            reg.set_mcp_admitted(&cfg.name, false);
+            eprintln!(
+                "tole: mcp[{}]: listing failed: {e} — server skipped",
+                cfg.name
+            )
+        }
     }
     registered
 }
@@ -978,5 +1319,99 @@ mod cap_tests {
             "got {}",
             out2.chars().count()
         );
+    }
+}
+
+#[cfg(test)]
+mod scrub_tests {
+    use super::*;
+
+    fn http(name: &str, url: &str) -> McpServerConfig {
+        McpServerConfig::parse(&format!("{name}={url}")).unwrap()
+    }
+
+    /// What reqwest/url echo for a spec: the URL NORMALIZED (scheme and host
+    /// lowercased, default port elided), not the string the operator typed.
+    #[test]
+    fn scrubs_the_normalized_form_of_the_url_too() {
+        let cfg = http(
+            "scrub-a",
+            "https://Example.COM:443/Cap/Path?Key=Sekret#frag",
+        );
+        let leaked = "error sending request for url (https://example.com/Cap/Path?Key=Sekret)";
+        let out = scrub_err(&cfg, leaked.to_string());
+        for secret in ["example.com", "Example", "Sekret", "Cap/Path"] {
+            assert!(
+                !out.to_ascii_lowercase()
+                    .contains(&secret.to_ascii_lowercase()),
+                "{secret:?} leaked: {out}"
+            );
+        }
+        assert!(out.contains("error sending request"), "context kept: {out}");
+    }
+
+    #[test]
+    fn scrubs_host_only_mentions_ports_and_ipv6() {
+        let cfg = http("scrub-b", "https://MCP.Internal.Example:8443/mcp");
+        let out = scrub_err(
+            &cfg,
+            "dns error: failed to lookup mcp.internal.example".into(),
+        );
+        assert!(
+            !out.to_ascii_lowercase().contains("internal.example"),
+            "{out}"
+        );
+
+        let cfg = http("scrub-c", "http://[::1]:7801/mcp");
+        let out = scrub_err(&cfg, "connect error to [::1]:7801 refused".into());
+        assert!(!out.contains("::1"), "{out}");
+    }
+
+    #[test]
+    fn scrubs_the_token_and_leaves_stdio_messages_alone() {
+        std::env::set_var("TOLE_MCP_SCRUB_D_TOKEN", "tok-abcdef-123");
+        let cfg = http("scrub-d", "https://example.com/mcp");
+        let out = scrub_err(&cfg, "401: bad bearer tok-abcdef-123".into());
+        assert!(!out.contains("tok-abcdef-123"), "{out}");
+
+        let stdio = McpServerConfig::parse("fs=npx x").unwrap();
+        let msg = "mcp \"fs\": handshake failed: example.com".to_string();
+        assert_eq!(scrub_err(&stdio, msg.clone()), msg);
+    }
+
+    /// The parser rewrites more than case and ports: an IDNA host becomes
+    /// punycode, a dotted-decimal-with-leading-zeros host an address. The echo
+    /// carries the rewritten form, which only the parsed url knows.
+    #[test]
+    fn scrubs_hosts_the_parser_rewrites() {
+        let cfg = http("scrub-e", "https://M\u{fc}nchen.example/mcp");
+        let out = scrub_err(&cfg, "failed to lookup xn--mnchen-3ya.example".into());
+        assert!(!out.contains("xn--mnchen-3ya"), "{out}");
+
+        let cfg = http(
+            "scrub-f",
+            "https://a.example/mcp?q=a b".replace(' ', "%20").as_str(),
+        );
+        let out = scrub_err(&cfg, "error for url (https://a.example/mcp?q=a%20b)".into());
+        assert!(!out.contains("a%20b"), "{out}");
+    }
+
+    #[test]
+    fn percent_encoded_hosts_are_refused() {
+        assert!(McpServerConfig::parse("a=https://ex%41mple.com/mcp").is_err());
+        assert!(McpServerConfig::parse("a=http://%6c%6f%63alhost/mcp").is_err());
+    }
+
+    #[test]
+    fn urls_with_backslashes_are_refused() {
+        // Parsers treat `\` as `/` in http urls, so the host that was
+        // validated could differ from the host that is contacted.
+        for bad in [
+            "a=https://example.com\\@evil.com/mcp",
+            "a=http://localhost\\.evil.com/mcp",
+            "a=https://example.com/mcp\\x",
+        ] {
+            assert!(McpServerConfig::parse(bad).is_err(), "{bad}");
+        }
     }
 }

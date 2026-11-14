@@ -324,7 +324,7 @@ fn build_registry(size_of: &dyn Fn(usize) -> usize, extra: Option<Box<dyn Tool>>
             Box::new(tole_core::read_file::ReadFileTool::new(root.clone())),
             Box::new(tole_core::file_tools::EditFileTool::new(root.clone())),
             Box::new(tole_core::file_tools::DeleteFileTool::new(root)),
-            Box::new(tole_core::web::WebFetchTool),
+            Box::new(tole_core::web::WebFetchTool::default()),
             Box::new(tole_core::skills::LoadSkillTool::new(None)),
             Box::new(tole_core::todo::TodoWriteTool::new(todo.clone())),
             Box::new(tole_core::todo::TodoReadTool::new(todo)),

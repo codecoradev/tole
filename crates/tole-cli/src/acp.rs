@@ -34,8 +34,8 @@ use std::time::Duration;
 
 use tole_cli::approver::{InteractiveApprover, PromptFn};
 use tole_cli::session_host::{
-    lock_sessions, new_session_id, open_session, run_session_turn, validate_session_id, AdmitError,
-    Sessions,
+    lock_sessions, new_session_id, open_session, run_session_turn_with_images, validate_session_id,
+    AdmitError, Sessions,
 };
 use tole_core::storage::Storage;
 
@@ -49,7 +49,7 @@ const PERMISSION_TIMEOUT: Duration = Duration::from_secs(600);
 /// state, so the override survives `session/load` in a fresh process
 /// and `run_session_turn` (shared with `tole serve`) applies it when
 /// building the provider.
-const MODEL_REGISTER: (&str, &str) = ("fact", "model");
+const MODEL_REGISTER: (&str, &str) = tole_cli::session_settings::MODEL;
 
 // ---------------------------------------------------------------------------
 // Model picker: ACP session config options (issue #176)
@@ -772,7 +772,23 @@ pub fn run_acp(
                         "protocolVersion": ACP_PROTOCOL_VERSION,
                         "agentCapabilities": {
                             "loadSession": true,
-                            "promptCapabilities": {},
+                            // #559: `image` content blocks are accepted
+                            // (spilled + referenced like a CLI `data:`
+                            // URL) whenever there is a spill dir. Audio and
+                            // embedded resources are not: they stay off.
+                            // ACP spec (agentclientprotocol.com, protocol/
+                            // initialization + protocol/content, checked
+                            // 2026-11-11): "image boolean default: false —
+                            // The prompt may include image content blocks";
+                            // an image block "Requires the image prompt
+                            // capability when included in prompts" and
+                            // carries `data` (base64, required), `mimeType`
+                            // (required) and an optional `uri`.
+                            "promptCapabilities": {
+                                "image": tole_cli::turn_runner::inline_images_supported(),
+                                "audio": false,
+                                "embeddedContext": false,
+                            },
                         },
                         "agentInfo": {
                             "name": "tole",
@@ -828,7 +844,7 @@ pub fn run_acp(
                 // Plan publishing (issue #196 phase 4): ACP clients
                 // render the standard `plan` session/update (Termul's
                 // PlanPanel, full-replace semantics).
-                let plan_emitter: tole_cli::session_host::PlanEmitter = {
+                let plan_emitter: tole_cli::tool_roster::PlanEmitter = {
                     let conn = conn.clone();
                     let sid = session_id.clone();
                     Arc::new(move |entries| {
@@ -930,28 +946,16 @@ pub fn run_acp(
                     reply_error(&conn, id, "session/prompt: missing sessionId");
                     continue;
                 };
-                // ACP sends `prompt` as an array of content blocks; a
-                // plain string is accepted for client convenience.
-                let prompt_text = match params.get("prompt") {
-                    Some(Value::Array(blocks)) => blocks
-                        .iter()
-                        .filter_map(|b| b.get("text").and_then(Value::as_str))
-                        .collect::<Vec<_>>()
-                        .join(""),
-                    Some(Value::String(s)) => s.clone(),
-                    _ => {
-                        reply_error(&conn, id, "session/prompt: missing prompt");
-                        continue;
-                    }
-                };
-                // cora scan 2026-10-01 (#155 #4): an empty array or one
-                // carrying only non-text blocks (e.g. images) joins to an
-                // empty string — launching a full agent turn on empty
-                // input must be rejected exactly like a missing prompt.
-                if prompt_text.trim().is_empty() {
-                    reply_error(&conn, id, "session/prompt: missing prompt");
-                    continue;
-                }
+                let (prompt_text, prompt_images) =
+                    match prompt_content(params.get("prompt"), &|b64| {
+                        tole_cli::turn_runner::resolve_inline_image(b64)
+                    }) {
+                        Ok(content) => content,
+                        Err(e) => {
+                            reply_error(&conn, id, &e);
+                            continue;
+                        }
+                    };
                 // The turn runs on its own thread; this reader loop stays
                 // live for permission routing while it runs.
                 let conn = conn.clone();
@@ -975,10 +979,11 @@ pub fn run_acp(
                         current: Mutex::new(None),
                         text_streamed: Arc::clone(&text_streamed),
                     });
-                    match run_session_turn(
+                    match run_session_turn_with_images(
                         sessions,
                         &session_id_clone,
                         &prompt_text,
+                        &prompt_images,
                         Some(Arc::clone(&observer)),
                     ) {
                         Ok((stop, Some(text))) => {
@@ -1189,13 +1194,7 @@ fn set_model_option(
         // Durable write (append-only register entry), replayed by
         // session/load and honored by run_session_turn on every turn.
         let mut storage = state.storage.lock().unwrap_or_else(|p| p.into_inner());
-        let commit =
-            tole_core::storage::Commit::new().register(tole_core::register::RegisterWrite::set(
-                MODEL_REGISTER.0,
-                MODEL_REGISTER.1,
-                json!(value),
-            ));
-        if let Err(e) = storage.commit(commit) {
+        if let Err(e) = tole_cli::session_settings::write_model(&mut *storage, value) {
             reply_error(conn, id, &format!("storing model override: {e}"));
             return;
         }
@@ -1222,6 +1221,61 @@ fn set_model_option(
         result["configOptions"] = Value::Array(opts);
     }
     reply(conn, id, result);
+}
+
+/// Split a `session/prompt` `prompt` into the turn's text and images
+/// (#559). ACP sends an array of content blocks; a plain string is
+/// accepted for client convenience.
+///
+/// - `text` blocks are joined into the user message;
+/// - `image` blocks (`data` = base64, `mimeType`) go through `resolve`, the
+///   same spill-and-reference path as a CLI `data:` URL — the declared MIME
+///   type is not trusted (the bytes are sniffed), the optional `uri` is
+///   never read (no client-named path reaches the filesystem), and one bad
+///   image refuses the whole prompt rather than silently dropping it;
+/// - every other block (audio, resource, resource_link, ...) is ignored, as
+///   the advertised `promptCapabilities` say.
+///
+/// An empty prompt — no text and no image — is refused as "missing prompt"
+/// (cora scan 2026-10-01, #155 #4): a full agent turn never runs on nothing.
+/// An image-only prompt is a real prompt.
+fn prompt_content(
+    prompt: Option<&Value>,
+    resolve: &dyn Fn(&str) -> Result<tole_core::image::ImageRef, String>,
+) -> Result<(String, Vec<tole_core::image::ImageRef>), String> {
+    const MISSING: &str = "session/prompt: missing prompt";
+    let (text, images) = match prompt {
+        Some(Value::String(s)) => (s.clone(), Vec::new()),
+        Some(Value::Array(blocks)) => {
+            let mut text = String::new();
+            let mut images = Vec::new();
+            for b in blocks {
+                match b.get("type").and_then(Value::as_str) {
+                    Some("image") => {
+                        let data = b
+                            .get("data")
+                            .and_then(Value::as_str)
+                            .filter(|d| !d.trim().is_empty())
+                            .ok_or("session/prompt: image block without base64 `data`")?;
+                        let r = resolve(data).map_err(|e| format!("session/prompt: {e}"))?;
+                        images.push(r);
+                    }
+                    Some("text") | None => {
+                        if let Some(t) = b.get("text").and_then(Value::as_str) {
+                            text.push_str(t);
+                        }
+                    }
+                    Some(_) => {}
+                }
+            }
+            (text, images)
+        }
+        _ => return Err(MISSING.into()),
+    };
+    if text.trim().is_empty() && images.is_empty() {
+        return Err(MISSING.into());
+    }
+    Ok((text, images))
 }
 
 fn reply(conn: &Conn, id: Option<Value>, result: Value) {
@@ -1374,5 +1428,67 @@ mod tests {
         assert_eq!(opts[0]["currentValue"], "auto");
         assert_eq!(opts[1]["id"], "model");
         assert_eq!(opts[1]["currentValue"], "model-a");
+    }
+
+    /// A stand-in resolver: records the base64 it was handed as the path.
+    fn fake_resolve(b64: &str) -> Result<tole_core::image::ImageRef, String> {
+        if b64 == "bad" {
+            return Err("image: inline image: not png/jpeg/gif/webp".into());
+        }
+        Ok(tole_core::image::ImageRef {
+            path: format!("/spill/{b64}"),
+            mime: "image/png".into(),
+            bytes: 1,
+            fnv1a64: "0".repeat(16),
+        })
+    }
+
+    #[test]
+    fn prompt_content_maps_text_and_image_blocks() {
+        let p = json!([
+            {"type": "text", "text": "what is "},
+            {"type": "image", "data": "AAA", "mimeType": "image/png"},
+            {"type": "text", "text": "this?"},
+            {"type": "audio", "data": "BBB", "mimeType": "audio/wav"},
+            {"type": "resource_link", "uri": "file:///x", "name": "x"},
+        ]);
+        let (text, images) = prompt_content(Some(&p), &fake_resolve).unwrap();
+        assert_eq!(text, "what is this?");
+        assert_eq!(images.len(), 1, "audio and links stay ignored");
+        assert_eq!(images[0].path, "/spill/AAA");
+        // a plain string is still a prompt
+        let s = json!("hi");
+        assert_eq!(prompt_content(Some(&s), &fake_resolve).unwrap().0, "hi");
+    }
+
+    #[test]
+    fn prompt_content_accepts_image_only_and_refuses_empty() {
+        let only = json!([{"type": "image", "data": "AAA", "mimeType": "image/png"}]);
+        let (text, images) = prompt_content(Some(&only), &fake_resolve).unwrap();
+        assert!(text.is_empty());
+        assert_eq!(images.len(), 1);
+        for empty in [
+            json!([]),
+            json!([{"type": "text", "text": "  "}]),
+            json!([{"type": "audio", "data": "BBB", "mimeType": "audio/wav"}]),
+            json!(42),
+        ] {
+            assert_eq!(
+                prompt_content(Some(&empty), &fake_resolve).unwrap_err(),
+                "session/prompt: missing prompt",
+                "{empty}"
+            );
+        }
+        assert!(prompt_content(None, &fake_resolve).is_err());
+    }
+
+    #[test]
+    fn prompt_content_refuses_a_bad_image_instead_of_dropping_it() {
+        let bad = json!([{"type": "text", "text": "x"}, {"type": "image", "data": "bad"}]);
+        let e = prompt_content(Some(&bad), &fake_resolve).unwrap_err();
+        assert!(e.contains("not png/jpeg/gif/webp"), "{e}");
+        let no_data = json!([{"type": "text", "text": "x"}, {"type": "image"}]);
+        let e = prompt_content(Some(&no_data), &fake_resolve).unwrap_err();
+        assert!(e.contains("without base64"), "{e}");
     }
 }

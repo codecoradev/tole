@@ -15,6 +15,12 @@ use std::path::PathBuf;
 /// Child depth; `1` in a child (the structural depth cap: a child gets
 /// no agent tools and may not respawn tole).
 pub const DEPTH: &str = "TOLE_AGENT_DEPTH";
+/// Set on every process a session's command tools start (`run_command`,
+/// `job_start`, #684): the owner-only subcommands (`tole cron create`,
+/// `plugin approve`, ...) refuse to write when it is present. Defense in
+/// depth, not a boundary: a process that clears its own environment can
+/// drop it (see `docs/threat-model.md`).
+pub const UNDER_SESSION: &str = "TOLE_UNDER_SESSION";
 /// The child's agent id (`a-<hex>-<hex>-<hex>`).
 pub const AGENT_ID: &str = "TOLE_AGENT_ID";
 /// The touch log shared by the siblings of one parent (#380).
@@ -29,6 +35,32 @@ pub const MEMORY: &str = "TOLE_MEMORY";
 /// The uteke room of the memory loop; for a child, its mailbox room
 /// (`agent-<id>`). The name predates rooms.
 pub const MEMORY_ROOM: &str = "TOLE_MEMORY_NAMESPACE";
+/// The delegation log a delegated child shares with its whole tree (#585).
+pub const DELEGATION_LOG: &str = "TOLE_DELEGATION_LOG";
+/// The delegated child's node id in that log (#585).
+pub const DELEGATION_NODE: &str = "TOLE_DELEGATION_NODE";
+/// Where a delegated child writes its one completion report (#585).
+pub const DELEGATION_REPORT: &str = "TOLE_DELEGATION_REPORT";
+
+/// Set on a child that is an independent participant of a discussion
+/// (#704). Such a child can never start a discussion (nor delegate): the
+/// host registers neither tool where it is set.
+pub const DISCUSSION_PARTICIPANT: &str = "TOLE_DISCUSSION_PARTICIPANT";
+
+/// The secret variables a child agent keeps (#595): the provider keys its
+/// own provider chain reads (`TOLE_*`, `OPENAI_*`, the #209 reserve) and the
+/// provider base URLs, which the scrub removes when they carry a password
+/// (#682). Non-secret provider and memory settings (`TOLE_MODEL`,
+/// `TOLE_MEMORY*`, ...) survive the ENV-1 scrub anyway; every other secret
+/// is removed from the child's environment.
+pub const PROVIDER_SECRETS: [&str; 6] = [
+    "TOLE_API_KEY",
+    "OPENAI_API_KEY",
+    "TOLE_FALLBACK_API_KEY",
+    "TOLE_BASE_URL",
+    "OPENAI_BASE_URL",
+    "TOLE_FALLBACK_BASE_URL",
+];
 
 /// Everything a parent passes to one child.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,13 +73,22 @@ pub struct ChildLaunch {
     pub mailbox_room: String,
     /// The handoff role and the handoff file, for a role child.
     pub role: Option<(Role, PathBuf)>,
+    /// The child's depth (1 for `agent_start`; the node depth when
+    /// delegated).
+    pub depth: u32,
+    /// The delegation log and the child's node id, when delegated (#585).
+    pub delegation: Option<(PathBuf, String)>,
+    /// The completion report file, for a delegated child (#585).
+    pub report: Option<PathBuf>,
+    /// The child is an independent discussion participant (#704).
+    pub participant: bool,
 }
 
 impl ChildLaunch {
     /// The environment variables to set on the child process.
     pub fn vars(&self) -> Vec<(&'static str, OsString)> {
         let mut vars = vec![
-            (DEPTH, OsString::from("1")),
+            (DEPTH, OsString::from(self.depth.max(1).to_string())),
             (AGENT_ID, OsString::from(&self.id)),
             (TOUCH_LOG, self.touch_log.clone().into_os_string()),
             (MEMORY_ROOM, OsString::from(&self.mailbox_room)),
@@ -57,13 +98,35 @@ impl ChildLaunch {
             vars.push((ROLE, OsString::from(role.as_str())));
             vars.push((HANDOFF, handoff.clone().into_os_string()));
         }
+        if let Some((log, node)) = &self.delegation {
+            vars.push((DELEGATION_LOG, log.clone().into_os_string()));
+            vars.push((DELEGATION_NODE, OsString::from(node)));
+        }
+        if let Some(report) = &self.report {
+            vars.push((DELEGATION_REPORT, report.clone().into_os_string()));
+        }
+        if self.participant {
+            vars.push((DISCUSSION_PARTICIPANT, OsString::from("1")));
+        }
         vars
     }
+}
+
+/// True in a child that is an independent discussion participant (#704).
+pub fn discussion_participant(env: &dyn Fn(&str) -> Option<String>) -> bool {
+    env(DISCUSSION_PARTICIPANT).is_some_and(|v| !v.trim().is_empty())
 }
 
 /// This process's child depth: `0` when not a child (or unparseable).
 pub fn depth(env: &dyn Fn(&str) -> Option<String>) -> u32 {
     env(DEPTH).and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+}
+
+/// True when this process was started by a session (#684): the
+/// [`UNDER_SESSION`] marker is set, or it is a child agent (depth >= 1).
+/// A human running `tole` from a terminal has neither.
+pub fn under_session(env: &dyn Fn(&str) -> Option<String>) -> bool {
+    env(UNDER_SESSION).is_some_and(|v| !v.trim().is_empty()) || depth(env) >= 1
 }
 
 /// This child's agent id and the shared touch log (#380). `None` when this
@@ -76,6 +139,34 @@ pub fn sibling(env: &dyn Fn(&str) -> Option<String>) -> Option<(String, PathBuf)
         return None;
     }
     Some((agent, PathBuf::from(log)))
+}
+
+/// This delegated child's report file (#585): set, absolute and named
+/// [`crate::delegation_report::REPORT_FILE`].
+pub fn delegation_report(env: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    let p = PathBuf::from(env(DELEGATION_REPORT)?.trim());
+    let named = p
+        .file_name()
+        .is_some_and(|n| n == crate::delegation_report::REPORT_FILE);
+    (p.is_absolute() && named).then_some(p)
+}
+
+/// This delegated child's log and node id (#585): both present, the log
+/// absolute and the node id in the delegation id charset.
+pub fn delegation(env: &dyn Fn(&str) -> Option<String>) -> Option<(PathBuf, String)> {
+    let log = PathBuf::from(env(DELEGATION_LOG)?.trim());
+    let node = env(DELEGATION_NODE)?.trim().to_string();
+    // Node ids look like `g-1f.2.1`: dots separate levels, so a leading,
+    // trailing or doubled dot (and so `.` and `..`) is never one.
+    let ok = !node.is_empty()
+        && node.len() <= 128
+        && !node.starts_with('.')
+        && !node.ends_with('.')
+        && !node.contains("..")
+        && node
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "-_.".contains(c));
+    (log.is_absolute() && ok).then_some((log, node))
 }
 
 /// This child's handoff role and handoff file (#383). Both must be present
@@ -108,6 +199,10 @@ mod tests {
             touch_log: PathBuf::from("/agents/touch.log"),
             mailbox_room: "agent-a-1f-2-0".into(),
             role,
+            depth: 1,
+            delegation: None,
+            report: None,
+            participant: false,
         }
     }
 
@@ -130,6 +225,47 @@ mod tests {
 
         let plain = env_of(launch(None).vars());
         assert_eq!(role(&plain), None, "no role without a role launch");
+        assert_eq!(delegation(&plain), None);
+        assert_eq!(delegation_report(&plain), None);
+        assert!(!discussion_participant(&plain));
+        let mut part = launch(None);
+        part.participant = true;
+        assert!(discussion_participant(&env_of(part.vars())));
+        let mut rep = launch(None);
+        rep.report = Some(PathBuf::from("/a/tole-agents/x/report.json"));
+        let env = env_of(rep.vars());
+        assert_eq!(
+            delegation_report(&env),
+            Some(PathBuf::from("/a/tole-agents/x/report.json"))
+        );
+        for bad in ["rel/report.json", "/a/other.json"] {
+            let env = |k: &str| (k == DELEGATION_REPORT).then(|| bad.to_string());
+            assert_eq!(delegation_report(&env), None, "{bad}");
+        }
+
+        let mut deep = launch(None);
+        deep.depth = 2;
+        deep.delegation = Some((PathBuf::from("/a/delegation.jsonl"), "g-1.2.1".into()));
+        let env = env_of(deep.vars());
+        assert_eq!(depth(&env), 2);
+        assert_eq!(
+            delegation(&env),
+            Some((PathBuf::from("/a/delegation.jsonl"), "g-1.2.1".into()))
+        );
+        let rel = |k: &str| match k {
+            DELEGATION_LOG => Some("rel.jsonl".into()),
+            DELEGATION_NODE => Some("g.1".into()),
+            _ => None,
+        };
+        assert_eq!(delegation(&rel), None, "a relative log is not trusted");
+        for bad in [".", "..", ".g", "g.", "g..1", "G.1", "g/1"] {
+            let env = |k: &str| match k {
+                DELEGATION_LOG => Some("/a/delegation.jsonl".into()),
+                DELEGATION_NODE => Some(bad.to_string()),
+                _ => None,
+            };
+            assert_eq!(delegation(&env), None, "{bad:?}");
+        }
     }
 
     #[test]

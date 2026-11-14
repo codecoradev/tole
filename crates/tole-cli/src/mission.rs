@@ -99,6 +99,12 @@ pub struct MissionConfig {
     pub compaction: tole_cli::compaction_host::CompactionSettings,
     /// Images attached to the first turn only (#212).
     pub images: Vec<tole_core::image::ImageRef>,
+    /// The selected profile's persona (#584): replaces the default base
+    /// prompt of a fresh mission (the mission section is still appended).
+    pub persona: Option<String>,
+    /// The profile's advisor (#587): `(profile, model, max uses)`. `Some`
+    /// registers `consult_advisor`, whose tokens come out of `max_tokens`.
+    pub advisor: Option<(String, String, u32)>,
 }
 
 /// The mission addendum appended to the default system prompt.
@@ -124,6 +130,40 @@ fn mission_prompt(goal: &str, verify: Option<&str>) -> String {
         ));
     }
     p
+}
+
+/// The cora agent-as-reviewer guidance for a mission (#536). A mission gets
+/// the same `build_registry` tools as `run`, including the auto-attached
+/// `mcp_cora_*` surface, but its pinned prompt never named the review flow, so
+/// the one command meant to run unattended was the one that never learned it
+/// exists. Present only when both review tools are registered (no tools, no
+/// instruction). Guidance, not enforcement: a gate before `git commit` is a
+/// separate change.
+fn mission_review_section(registry: &ToolRegistry) -> String {
+    let review = crate::review_section(registry);
+    if review.is_empty() {
+        return String::new();
+    }
+    format!(
+        "{review} Before you end the mission, review the change you made with this \
+         flow, address what it blocks, and include the verdict in your final message."
+    )
+}
+
+/// The system prompt pinned in the header of a FRESH mission session: the
+/// default prompt, the mission addendum, then the review flow when attached.
+fn fresh_mission_prompt(
+    goal: &str,
+    verify: Option<&str>,
+    registry: &ToolRegistry,
+    persona: Option<&str>,
+) -> String {
+    format!(
+        "{}{}{}",
+        persona.map_or_else(|| crate::default_prompt_for(false), str::to_string),
+        mission_prompt(goal, verify),
+        mission_review_section(registry)
+    )
 }
 
 /// Upper bound for `--max-minutes` (10 years): a huge value must neither
@@ -163,9 +203,15 @@ fn verify_run_error(cause: &str, timeout: std::time::Duration) -> String {
 
 /// Run the `--verify` command (sh -c, operator-budgeted timeout).
 /// Returns Ok(()) on exit-0, Err(output tail) otherwise.
+///
+/// The command is the owner's, but what it runs is usually code the agent
+/// just wrote (`cargo test` runs build scripts and tests), with no
+/// approval: it gets the ENV-1 scrub as its own consumer, which receives no
+/// secret unless a `[secrets]` entry grants one to `verify` (#676).
 fn run_verify(cmd: &str, timeout: std::time::Duration) -> Result<(), String> {
     let mut c = std::process::Command::new("sh");
     c.arg("-c").arg(cmd);
+    tole_core::subprocess::scrub_env_for(&mut c, tole_core::secret_release::VERIFY);
     let out = run_with_timeout(&mut c, timeout).map_err(|e| verify_run_error(&e, timeout))?;
     if out.status.success() {
         return Ok(());
@@ -204,6 +250,8 @@ pub fn run_mission(
     cfg: MissionConfig,
     mut registry: ToolRegistry,
     sessions_dir: &std::path::Path,
+    // Model routing (#586) of a fresh mission, before its provider exists.
+    route: &dyn Fn(&mut dyn tole_core::storage::Storage, &ToolRegistry) -> Result<()>,
 ) -> Result<()> {
     let started = std::time::Instant::now();
     let deadline = started + max_minutes_duration(cfg.max_minutes);
@@ -226,15 +274,20 @@ pub fn run_mission(
             // The mission system prompt pins the completion-marker
             // contract and the todo discipline in the session header —
             // resume re-applies it exactly (same as run's pinned prompt).
-            let system_prompt = format!(
-                "{}{}",
-                crate::default_prompt_for(false),
-                mission_prompt(&cfg.goal, cfg.verify.as_deref())
+            let system_prompt = fresh_mission_prompt(
+                &cfg.goal,
+                cfg.verify.as_deref(),
+                &registry,
+                cfg.persona.as_deref(),
             );
-            let storage =
-                JsonlStorage::create_with(sessions_dir, &session_id, None, Some(&system_prompt))
-                    .with_context(|| format!("creating mission session {session_id}"))?;
-            tole_cli::session_index::record(sessions_dir, &session_id, "mission");
+            let storage = tole_cli::session_host::create_session(
+                sessions_dir,
+                &session_id,
+                Some(&system_prompt),
+                None,
+                Some("mission"),
+            )
+            .with_context(|| format!("creating mission session {session_id}"))?;
             eprintln!("mission: session {session_id}");
             (storage, session_id, Some(cfg.goal.clone()))
         }
@@ -242,6 +295,34 @@ pub fn run_mission(
     // Task-list tools (#198): hydrated from the transcript on resume.
     // Missions refuse --plan-mode, so todo_write is always present.
     tole_cli::tool_roster::register_todo(&mut registry, storage.entries(), false)?;
+    // A fresh mission is routed once; a resumed one keeps its model.
+    if cfg.resume_id.is_none() {
+        route(&mut storage, &registry)?;
+    }
+
+    // The advisor (#587): its tokens come out of this mission's budget,
+    // which starts at what the session already spent (a resume included).
+    let advisor = match &cfg.advisor {
+        Some((name, model, max_uses)) => {
+            let budget = std::sync::Arc::new(tole_core::advisor::Budget::new(cfg.max_tokens));
+            budget.charge(tokens_used(&storage));
+            let shared = tole_cli::advisor_host::Shared::new(budget);
+            let secrets =
+                tole_cli::provider_chain::process_secrets(&tole_cli::config_apply::real_env);
+            let tool = tole_cli::advisor_host::ConsultAdvisor::new(
+                std::sync::Arc::clone(&shared),
+                *max_uses,
+                format!("Profile: {name}\nMission goal: {}", cfg.goal),
+                secrets.clone(),
+                tole_cli::advisor_host::factory(provider_cfg.clone(), model, secrets),
+            );
+            registry
+                .register(Box::new(tool))
+                .map_err(anyhow::Error::msg)?;
+            Some(shared)
+        }
+        None => None,
+    };
 
     let system_prompt = storage.system_prompt().map(str::to_owned);
     let mut compactor =
@@ -254,6 +335,13 @@ pub fn run_mission(
         None,
     )
     .map_err(anyhow::Error::msg)?;
+    if let Some(shared) = &advisor {
+        provider = Box::new(tole_cli::advisor_host::Tap::new(
+            provider,
+            std::sync::Arc::clone(shared),
+            true,
+        ));
+    }
 
     let mut turns: u64 = 0;
     let mut verify_failures: u32 = 0;
@@ -333,6 +421,15 @@ pub fn run_mission(
             }
         };
         turns += 1;
+        // The advisor's usage becomes session usage records, so the next
+        // budget check (and a resume) counts it.
+        if let Some(shared) = &advisor {
+            if let Err(e) = tole_cli::advisor_host::record_usage(shared, &mut storage) {
+                eprintln!("mission: {e}");
+                status = "error";
+                break;
+            }
+        }
         match &outcome {
             TurnOutcome::Final { text, .. } => {
                 // Line-exact per the pinned contract ("a line containing
@@ -463,6 +560,8 @@ pub fn run_mission(
             .map_err(|e| anyhow::anyhow!("writing mission summary: {e}"))?;
     }
     println!("mission: {session_id}");
+    // How the mission ended, for the skill curator (#593).
+    tole_cli::skill_outcome::record_mission(status);
     println!("status: {status}");
     println!(
         "turns: {turns}  steps: {}  verify failures: {verify_failures}  wall: {wall_secs}s",
@@ -578,6 +677,53 @@ mod budget_tests {
 
 #[cfg(test)]
 mod verify_error_tests {
+    /// #536: the mission prompt names the cora review flow exactly when both
+    /// review tools are registered, and keeps the completion contract.
+    #[test]
+    fn fresh_mission_prompt_names_the_review_flow_only_when_the_tools_are_attached() {
+        use tole_core::tool::{Risk, Tool};
+        struct Named(&'static str);
+        impl Tool for Named {
+            fn name(&self) -> &str {
+                self.0
+            }
+            fn risk(&self) -> Risk {
+                Risk::ReadOnly
+            }
+            fn execute(&self, _input: serde_json::Value) -> Result<serde_json::Value, String> {
+                Ok(serde_json::Value::Null)
+            }
+        }
+        let mut reg =
+            ToolRegistry::with_approver(tole_core::approval::AllowlistApprover::allow_only(vec![]));
+        let none = fresh_mission_prompt("ship it", Some("cargo test"), &reg, None);
+        assert!(!none.contains("Code review"), "{none}");
+        assert!(none.contains(MISSION_COMPLETE_MARKER), "{none}");
+
+        reg.register(Box::new(Named("mcp_cora_cora_review_prepare")))
+            .unwrap();
+        let half = fresh_mission_prompt("ship it", None, &reg, None);
+        assert!(!half.contains("Code review"), "finalize missing: {half}");
+
+        reg.register(Box::new(Named("mcp_cora_cora_review_finalize")))
+            .unwrap();
+        let both = fresh_mission_prompt("ship it", Some("cargo test"), &reg, None);
+        assert!(both.contains("mcp_cora_cora_review_prepare"), "{both}");
+        assert!(both.contains("should_block"), "{both}");
+        assert!(both.contains("review the change you made"), "{both}");
+        // The mission contract and the goal are untouched, and the review
+        // text comes AFTER them so it cannot displace the marker rules.
+        assert!(both.contains("ship it") && both.contains(MISSION_COMPLETE_MARKER));
+        assert!(both.rfind("# Code review").unwrap() > both.find("MISSION MODE").unwrap());
+
+        // #584: a profile's persona replaces the default base prompt; the
+        // mission contract still follows it.
+        let p = fresh_mission_prompt("ship it", None, &reg, Some("You are the coder."));
+        assert!(p.starts_with("You are the coder."), "{p}");
+        assert!(!p.contains(&crate::default_prompt_for(false)));
+        assert!(p.contains("MISSION MODE") && p.contains(MISSION_COMPLETE_MARKER));
+    }
+
     use super::*;
     use std::time::Duration;
 

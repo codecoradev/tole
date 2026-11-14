@@ -11,7 +11,7 @@
 /// separators, bidi marks/overrides/isolates and zero-width invisibles
 /// (incl. the Arabic letter mark, the Mongolian vowel separator, the word
 /// joiner and the invisible math operators — scan 2026-10-28).
-fn is_unsafe(c: char) -> bool {
+pub(crate) fn is_unsafe(c: char) -> bool {
     c.is_control()
         || matches!(
             c,

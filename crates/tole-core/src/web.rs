@@ -14,6 +14,7 @@
 //! text-only (no JS, no browser), size-capped, content-type
 //! allowlisted.
 
+use crate::secrets::SecretSet;
 use crate::tool::{Risk, Tool};
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -26,6 +27,8 @@ const SNIPPET_CAP_CHARS: usize = 400;
 
 /// Redirect hops allowed before refusing (each hop re-validated).
 const MAX_REDIRECTS: usize = 5;
+/// Characters of fetched text returned to the model.
+const TEXT_CAP_CHARS: usize = 20_000;
 
 /// Resolve `host` to addresses via the OS resolver (same source the
 /// request itself would use).
@@ -257,6 +260,134 @@ fn fetch_agent_vetted() -> ureq::Agent {
     )
 }
 
+/// One GET of a host-side HTTP client (#625, the built-in web tools): no
+/// redirect is followed (the caller sees the 3xx and decides), and the
+/// connection goes through the same vet-and-pin resolver as `web_fetch`.
+#[derive(Debug, Clone)]
+pub struct Hop<'a> {
+    pub url: &'a str,
+    pub headers: &'a [(String, String)],
+    /// Total time for this hop (at most 30 s is used).
+    pub timeout: Duration,
+    /// Body cap in bytes.
+    pub max_bytes: usize,
+    /// `TOLE_WEB_ALLOW_PRIVATE=1`: private and loopback addresses allowed.
+    pub allow_private: bool,
+    /// Over the cap: `true` truncates (and says so), `false` is an error.
+    pub truncate: bool,
+}
+
+/// A hop's response. Header names are lower-case; a redirect (301, 302,
+/// 303, 307, 308 with a `location`) has an empty, unread body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HopResponse {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+    pub truncated: bool,
+}
+
+/// Why a hop produced no response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HopError {
+    /// Not an http(s) URL.
+    InvalidUrl,
+    /// The host resolves to a private or loopback address (SSRF guard).
+    Private(String),
+    /// The body was over the cap (with `truncate: false`).
+    TooLarge(usize),
+    Timeout,
+    Transport(String),
+}
+
+/// `TOLE_WEB_ALLOW_PRIVATE=1`, for [`Hop::allow_private`].
+pub fn allow_private_from_env() -> bool {
+    ssrf_opt_out()
+}
+
+/// The SSRF check on its own, before anything is fetched: `url`'s host must
+/// resolve to public addresses unless `allow_private`.
+pub fn vet_public_url(url: &str, allow_private: bool) -> Result<(), String> {
+    if !redirect_scheme_allowed(url) {
+        return Err("web_fetch: only http(s) URLs".into());
+    }
+    host_is_public_opt(url, allow_private)
+}
+
+/// Performs one hop (see [`Hop`]). The address check runs twice: up front,
+/// so a private host is refused before any connection with a clear error,
+/// and in the connection's own resolver, which pins what it vetted (a DNS
+/// rebinding between the two fails closed).
+pub fn vetted_get(hop: &Hop<'_>) -> Result<HopResponse, HopError> {
+    if !redirect_scheme_allowed(hop.url) {
+        return Err(HopError::InvalidUrl);
+    }
+    vet_public_url(hop.url, hop.allow_private).map_err(HopError::Private)?;
+    let config = ureq::Agent::config_builder()
+        .timeout_global(Some(hop.timeout.min(Duration::from_secs(30))))
+        .max_redirects(0)
+        .http_status_as_error(false)
+        .proxy(None)
+        .build();
+    let agent = ureq::Agent::with_parts(
+        config,
+        ureq::unversioned::transport::DefaultConnector::default(),
+        SsrfResolver {
+            opt_out: hop.allow_private,
+        },
+    );
+    let mut req = agent.get(hop.url);
+    for (k, v) in hop.headers {
+        req = req.header(k.as_str(), v.as_str());
+    }
+    let mut res = req.call().map_err(|e| match e {
+        ureq::Error::Timeout(_) => HopError::Timeout,
+        other => HopError::Transport(other.to_string()),
+    })?;
+    let status = res.status().as_u16();
+    let headers: Vec<(String, String)> = res
+        .headers()
+        .iter()
+        .filter_map(|(k, v)| {
+            Some((
+                k.as_str().to_ascii_lowercase(),
+                v.to_str().ok()?.to_string(),
+            ))
+        })
+        .collect();
+    let redirect = matches!(status, 301 | 302 | 303 | 307 | 308)
+        && headers.iter().any(|(k, _)| k == "location");
+    if redirect {
+        return Ok(HopResponse {
+            status,
+            headers,
+            body: Vec::new(),
+            truncated: false,
+        });
+    }
+    use std::io::Read;
+    let mut body = Vec::new();
+    res.body_mut()
+        .as_reader()
+        .take(hop.max_bytes as u64 + 1)
+        .read_to_end(&mut body)
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::TimedOut => HopError::Timeout,
+            _ => HopError::Transport(e.to_string()),
+        })?;
+    let over = body.len() > hop.max_bytes;
+    if over && !hop.truncate {
+        return Err(HopError::TooLarge(hop.max_bytes));
+    }
+    body.truncate(hop.max_bytes);
+    Ok(HopResponse {
+        status,
+        headers,
+        body,
+        truncated: over,
+    })
+}
+
 /// Search-only plumbing (no user URL → no SSRF surface): a 30 s agent
 /// with AUTO-REDIRECTS OFF.
 fn agent() -> ureq::Agent {
@@ -436,7 +567,54 @@ fn cap_chars(s: &str, cap: usize) -> String {
 /// `web_fetch`: GET a public http(s) URL, allowlist the content type,
 /// cap the body, HTML → text. Read-only and jail-free by design: the
 /// internet is not the workspace.
-pub struct WebFetchTool;
+#[derive(Default)]
+pub struct WebFetchTool {
+    /// A URL carrying a known secret is refused (#595). Empty by default.
+    secrets: SecretSet,
+}
+
+impl WebFetchTool {
+    /// Refuse URLs that carry any of these secrets (#595).
+    pub fn with_secrets(mut self, secrets: &SecretSet) -> Self {
+        self.secrets = secrets.clone();
+        self
+    }
+}
+
+/// #595: a URL is where an exfiltration hides (`https://x/?k=<secret>`), and
+/// a redacted URL would fetch something else, so a URL that carries a known
+/// secret is refused. The error shows the redacted form only.
+fn refuse_secret_url(secrets: &SecretSet, url: &str) -> Result<(), String> {
+    match secrets.redact(url) {
+        std::borrow::Cow::Borrowed(_) => Ok(()),
+        std::borrow::Cow::Owned(r) => Err(format!(
+            "web_fetch: refused, the URL contains a known secret value: {r}"
+        )),
+    }
+}
+
+/// The `(NAME, value)` of every `${NAME}` referenced by the web backend
+/// header settings (`TOLE_WEB_SEARCH_HEADERS`, `TOLE_WEB_FETCH_HEADERS`),
+/// for [`SecretSet::collect`]: a header value is a secret bound to its
+/// backend whatever its variable is called (#595). Unset variables and
+/// malformed settings are skipped here (tool construction reports them).
+pub fn header_secrets(env: &dyn Fn(&str) -> Option<String>) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for var in [SEARCH_HEADERS_ENV, FETCH_HEADERS_ENV] {
+        let Some(raw) = env(var) else { continue };
+        let mut rest = raw.as_str();
+        while let Some(start) = rest.find("${") {
+            let after = &rest[start + 2..];
+            let Some(end) = after.find('}') else { break };
+            let name = &after[..end];
+            if let Some(value) = env(name).filter(|v| !v.is_empty()) {
+                out.push((name.to_string(), value));
+            }
+            rest = &after[end + 1..];
+        }
+    }
+    out
+}
 
 impl Tool for WebFetchTool {
     fn name(&self) -> &str {
@@ -470,6 +648,7 @@ impl Tool for WebFetchTool {
             .filter(|u| !u.is_empty())
             .ok_or("web_fetch: 'url' is required")?
             .to_string();
+        refuse_secret_url(&self.secrets, &url)?;
         if !(url.starts_with("http://") || url.starts_with("https://")) {
             return Err("web_fetch: only http(s) URLs".into());
         }
@@ -616,7 +795,7 @@ const RESERVED_HEADERS: [&str; 5] = [
 /// `${NAME}` references in a header value, expanded from `env`. A
 /// reference to an unset variable is an error naming the variable (never
 /// the value). No other syntax: `$NAME` and `$$` stay literal.
-fn expand_vars(v: &str, env: &dyn Fn(&str) -> Option<String>) -> Result<String, String> {
+fn expand_vars(var: &str, v: &str, env: &dyn Fn(&str) -> Option<String>) -> Result<String, String> {
     let mut out = String::with_capacity(v.len());
     let mut rest = v;
     while let Some(start) = rest.find("${") {
@@ -624,16 +803,14 @@ fn expand_vars(v: &str, env: &dyn Fn(&str) -> Option<String>) -> Result<String, 
         let after = &rest[start + 2..];
         let end = after
             .find('}')
-            .ok_or_else(|| format!("{SEARCH_HEADERS_ENV}: unterminated `${{` in a header value"))?;
+            .ok_or_else(|| format!("{var}: unterminated `${{` in a header value"))?;
         let name = &after[..end];
         if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
-            return Err(format!(
-                "{SEARCH_HEADERS_ENV}: `${{{name}}}` is not a variable name"
-            ));
+            return Err(format!("{var}: `${{{name}}}` is not a variable name"));
         }
         let value = env(name)
             .filter(|v| !v.is_empty())
-            .ok_or_else(|| format!("{SEARCH_HEADERS_ENV}: `${{{name}}}` is not set"))?;
+            .ok_or_else(|| format!("{var}: `${{{name}}}` is not set"))?;
         out.push_str(&value);
         rest = &after[end + 1..];
     }
@@ -652,29 +829,28 @@ fn is_token(name: &str) -> bool {
 /// Parse `TOLE_WEB_SEARCH_HEADERS`. Errors name the header, never its
 /// value (it usually carries a credential).
 fn parse_headers(
+    var: &str,
     raw: &str,
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Result<Vec<(String, String)>, String> {
     let mut out = Vec::new();
     for pair in raw.split(',').map(str::trim).filter(|p| !p.is_empty()) {
-        let (name, value) = pair.split_once('=').ok_or_else(|| {
-            format!("{SEARCH_HEADERS_ENV}: expected `Name=Value`, got a pair without `=`")
-        })?;
+        let (name, value) = pair
+            .split_once('=')
+            .ok_or_else(|| format!("{var}: expected `Name=Value`, got a pair without `=`"))?;
         let name = name.trim();
         if !is_token(name) {
-            return Err(format!(
-                "{SEARCH_HEADERS_ENV}: `{name}` is not a header name"
-            ));
+            return Err(format!("{var}: `{name}` is not a header name"));
         }
         if RESERVED_HEADERS.contains(&name.to_ascii_lowercase().as_str()) {
             return Err(format!(
-                "{SEARCH_HEADERS_ENV}: `{name}` is set by tole itself and cannot be configured"
+                "{var}: `{name}` is set by tole itself and cannot be configured"
             ));
         }
-        let value = expand_vars(value.trim(), env)?;
+        let value = expand_vars(var, value.trim(), env)?;
         if value.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0) {
             return Err(format!(
-                "{SEARCH_HEADERS_ENV}: the value of `{name}` contains a line break"
+                "{var}: the value of `{name}` contains a line break"
             ));
         }
         out.push((name.to_string(), value));
@@ -720,6 +896,8 @@ pub struct WebSearchTool {
     method: SearchMethod,
     headers: Vec<(String, String)>,
     fields: SearchFields,
+    /// Known secrets redacted from the query (#595). Empty by default.
+    secrets: SecretSet,
 }
 
 impl WebSearchTool {
@@ -730,7 +908,14 @@ impl WebSearchTool {
             method: SearchMethod::Get,
             headers: Vec::new(),
             fields: SearchFields::default(),
+            secrets: SecretSet::default(),
         }
+    }
+
+    /// Redact these secrets from every query sent to the backend (#595).
+    pub fn with_secrets(mut self, secrets: &SecretSet) -> Self {
+        self.secrets = secrets.clone();
+        self
     }
 
     /// Probe-gated construction from the process environment: `Ok(None)`
@@ -762,7 +947,7 @@ impl WebSearchTool {
             }
         };
         let headers = match env(SEARCH_HEADERS_ENV) {
-            Some(raw) => parse_headers(&raw, env)?,
+            Some(raw) => parse_headers(SEARCH_HEADERS_ENV, &raw, env)?,
             None => Vec::new(),
         };
         let fields = match env(SEARCH_FIELDS_ENV) {
@@ -774,6 +959,7 @@ impl WebSearchTool {
             method,
             headers,
             fields,
+            secrets: SecretSet::default(),
         }))
     }
 }
@@ -805,6 +991,9 @@ impl Tool for WebSearchTool {
             .map(str::trim)
             .filter(|q| !q.is_empty())
             .ok_or("web_search: 'query' is required")?;
+        // #595: the query is model-written and goes to a third party.
+        let redacted = self.secrets.redact(query);
+        let query = redacted.as_ref();
         let agent = agent();
         let sent = match self.method {
             SearchMethod::Get => {
@@ -849,6 +1038,429 @@ impl Tool for WebSearchTool {
             })
             .unwrap_or_default();
         Ok(json!({"query": query, "results": results}))
+    }
+}
+
+/// Fetch backend URL (#532). Unset: `web_fetch` is the direct fetcher.
+pub const FETCH_URL_ENV: &str = "TOLE_WEB_FETCH_URL";
+/// `GET` (default) or `POST`.
+pub const FETCH_METHOD_ENV: &str = "TOLE_WEB_FETCH_METHOD";
+/// Extra request headers, `Name=Value` pairs separated by commas; sent
+/// only to the backend.
+pub const FETCH_HEADERS_ENV: &str = "TOLE_WEB_FETCH_HEADERS";
+/// Response field mapping: `content=<backend field>`.
+pub const FETCH_FIELDS_ENV: &str = "TOLE_WEB_FETCH_FIELDS";
+
+/// `web_fetch` through a configured backend (`TOLE_WEB_FETCH_URL`), for
+/// pages that need a real browser. Default contract:
+/// `GET {url}?url=<target>` -> `{"content": "<text>"}`; `POST {url}` sends
+/// `{"url": "<target>"}`. Same name, risk and trust model as the direct
+/// fetcher and as `web_search`: ReadOnly, the output is model content and
+/// is never executed.
+///
+/// tole vets the target before anything leaves the machine: https only, no
+/// credentials in the URL, and a host that resolves to public addresses
+/// (`TOLE_WEB_ALLOW_PRIVATE=1` opts out, as for the direct fetcher). The
+/// backend resolves the host again on its own, so this is a guard against
+/// asking a remote service about internal addresses, not a defense against
+/// DNS rebinding at the backend. The target URL is disclosed to the backend
+/// operator. Backend headers are sent only to the backend; redirects from
+/// the backend are not followed; header values never appear in errors.
+pub struct WebBackendFetchTool {
+    backend: String,
+    method: SearchMethod,
+    headers: Vec<(String, String)>,
+    content_field: String,
+    /// A target URL carrying a known secret is refused (#595).
+    secrets: SecretSet,
+}
+
+impl WebBackendFetchTool {
+    /// The default contract for `backend`, no extra headers.
+    pub fn new(backend: impl Into<String>) -> Self {
+        WebBackendFetchTool {
+            backend: backend.into(),
+            method: SearchMethod::Get,
+            headers: Vec::new(),
+            content_field: "content".into(),
+            secrets: SecretSet::default(),
+        }
+    }
+
+    /// Refuse target URLs that carry any of these secrets (#595).
+    pub fn with_secrets(mut self, secrets: &SecretSet) -> Self {
+        self.secrets = secrets.clone();
+        self
+    }
+
+    /// `Ok(None)` when `TOLE_WEB_FETCH_URL` is unset or blank; an error
+    /// naming the variable when the URL, method, headers or fields are
+    /// malformed (startup fails, as for `web_search`).
+    pub fn from_env() -> Result<Option<Self>, String> {
+        Self::from_lookup(&|k| std::env::var(k).ok())
+    }
+
+    /// [`Self::from_env`] over an injected lookup.
+    pub fn from_lookup(env: &dyn Fn(&str) -> Option<String>) -> Result<Option<Self>, String> {
+        let Some(backend) = env(FETCH_URL_ENV)
+            .map(|b| b.trim().to_string())
+            .filter(|b| !b.is_empty())
+        else {
+            return Ok(None);
+        };
+        if !(backend.starts_with("http://") || backend.starts_with("https://")) {
+            return Err(format!("{FETCH_URL_ENV}: expected an http(s) URL"));
+        }
+        let method = match env(FETCH_METHOD_ENV)
+            .map(|m| m.trim().to_ascii_uppercase())
+            .filter(|m| !m.is_empty())
+            .as_deref()
+        {
+            None | Some("GET") => SearchMethod::Get,
+            Some("POST") => SearchMethod::Post,
+            Some(other) => {
+                return Err(format!(
+                    "{FETCH_METHOD_ENV}: expected GET or POST, got `{other}`"
+                ))
+            }
+        };
+        let headers = match env(FETCH_HEADERS_ENV) {
+            Some(raw) => parse_headers(FETCH_HEADERS_ENV, &raw, env)?,
+            None => Vec::new(),
+        };
+        let mut content_field = "content".to_string();
+        if let Some(raw) = env(FETCH_FIELDS_ENV) {
+            for pair in raw.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+                let (wire, backend_field) = pair.split_once('=').ok_or_else(|| {
+                    format!("{FETCH_FIELDS_ENV}: expected `content=<field>`, got `{pair}`")
+                })?;
+                if wire.trim() != "content" {
+                    return Err(format!(
+                        "{FETCH_FIELDS_ENV}: unknown field `{}` (expected content)",
+                        wire.trim()
+                    ));
+                }
+                let f = backend_field.trim();
+                if f.is_empty() {
+                    return Err(format!(
+                        "{FETCH_FIELDS_ENV}: `{pair}` names no backend field"
+                    ));
+                }
+                content_field = f.to_string();
+            }
+        }
+        Ok(Some(WebBackendFetchTool {
+            backend,
+            method,
+            headers,
+            content_field,
+            secrets: SecretSet::default(),
+        }))
+    }
+
+    /// Refuse a target that must not be sent to a remote backend.
+    fn vet_target(url: &str) -> Result<(), String> {
+        let rest = url
+            .strip_prefix("https://")
+            .ok_or("web_fetch: only https URLs go through the fetch backend")?;
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+        if authority.contains('@') {
+            return Err("web_fetch: URLs with credentials are not fetchable".into());
+        }
+        host_is_public_opt(url, ssrf_opt_out())
+    }
+}
+
+impl Tool for WebBackendFetchTool {
+    fn name(&self) -> &str {
+        "web_fetch"
+    }
+    fn risk(&self) -> Risk {
+        Risk::ReadOnly
+    }
+    fn summary(&self) -> String {
+        "Fetch an https URL through the configured fetch backend (it may render JavaScript-heavy \
+         pages) and return its text, size-capped."
+            .into()
+    }
+    fn describe(&self, input: &Value) -> String {
+        format!(
+            "fetch {} via the fetch backend (text-only, size-capped)",
+            input["url"].as_str().unwrap_or("?")
+        )
+    }
+    fn spec(&self) -> Option<Value> {
+        Some(json!({
+            "type": "object",
+            "properties": {"url": {"type": "string",
+                "description": "https URL to fetch"}},
+            "required": ["url"]
+        }))
+    }
+    fn execute(&self, input: Value) -> Result<Value, String> {
+        let target = input["url"]
+            .as_str()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .ok_or("web_fetch: 'url' is required")?;
+        refuse_secret_url(&self.secrets, target)?;
+        Self::vet_target(target)?;
+        let agent = agent();
+        let sent = match self.method {
+            SearchMethod::Get => {
+                let url = format!(
+                    "{}{}url={}",
+                    self.backend,
+                    if self.backend.contains('?') { "&" } else { "?" },
+                    urlencoding_lite(target)
+                );
+                let mut req = agent.get(&url);
+                for (k, v) in &self.headers {
+                    req = req.header(k.as_str(), v.as_str());
+                }
+                req.call()
+            }
+            SearchMethod::Post => {
+                let mut req = agent.post(&self.backend);
+                for (k, v) in &self.headers {
+                    req = req.header(k.as_str(), v.as_str());
+                }
+                req.send_json(json!({"url": target}))
+            }
+        };
+        let mut res = sent.map_err(|e| format!("web_fetch: backend: {e}"))?;
+        use std::io::Read;
+        // The backend's JSON envelope is read under a bound of its own.
+        let mut buf = Vec::new();
+        res.body_mut()
+            .as_reader()
+            .take((FETCH_CAP_BYTES * 2 + 1) as u64)
+            .read_to_end(&mut buf)
+            .map_err(|e| format!("web_fetch: backend read: {e}"))?;
+        if buf.len() > FETCH_CAP_BYTES * 2 {
+            return Err("web_fetch: backend response is too large".into());
+        }
+        let body: Value = serde_json::from_slice(&buf)
+            .map_err(|e| format!("web_fetch: backend returned non-JSON: {e}"))?;
+        let text = body[self.content_field.as_str()].as_str().ok_or_else(|| {
+            format!(
+                "web_fetch: backend response has no string field `{}`",
+                self.content_field
+            )
+        })?;
+        let truncated = text.len() > FETCH_CAP_BYTES;
+        let text = if truncated {
+            let mut end = FETCH_CAP_BYTES;
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            &text[..end]
+        } else {
+            text
+        };
+        // Truncated means cut by EITHER cap: the byte cap above or the
+        // character cap the model sees, so `false` always means complete.
+        let truncated = truncated || text.chars().count() > TEXT_CAP_CHARS;
+        Ok(json!({
+            "url": target,
+            "content_type": "text/plain (via fetch backend)",
+            "truncated": truncated,
+            "text": cap_chars(text, TEXT_CAP_CHARS),
+        }))
+    }
+}
+
+/// The nginjen backend's base URL (#625): with [`NGINJEN_API_KEY_ENV`] set
+/// too, `web_search` and `web_fetch` use the full nginjen service.
+pub const NGINJEN_BASE_URL_ENV: &str = "NGINJEN_BASE_URL";
+/// The nginjen backend's API key, sent as a bearer token to that backend
+/// only; never printed (it is a secret-named variable, so the process
+/// `SecretSet` redacts it everywhere).
+pub const NGINJEN_API_KEY_ENV: &str = "NGINJEN_API_KEY";
+
+/// `(base_url, api_key)` when both nginjen variables are set (non-blank);
+/// `Ok(None)` otherwise. A base URL that is not http(s) is an error naming
+/// the variable, never the key.
+pub fn nginjen_backend(
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<Option<(String, String)>, String> {
+    let nonblank = |k: &str| {
+        env(k)
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    let (Some(base), Some(key)) = (
+        nonblank(NGINJEN_BASE_URL_ENV),
+        nonblank(NGINJEN_API_KEY_ENV),
+    ) else {
+        return Ok(None);
+    };
+    if !redirect_scheme_allowed(&base) {
+        return Err(format!("{NGINJEN_BASE_URL_ENV}: expected an http(s) URL"));
+    }
+    Ok(Some((base.trim_end_matches('/').to_string(), key)))
+}
+
+impl WebSearchTool {
+    /// `web_search` through the nginjen backend: `POST {base}/search` with
+    /// `{"query", "limit"}` and the key as a bearer token, answering
+    /// `{"results":[{title,url,snippet}]}` (the default contract).
+    pub fn nginjen(base: &str, api_key: &str) -> Self {
+        WebSearchTool {
+            backend: format!("{}/search", base.trim_end_matches('/')),
+            method: SearchMethod::Post,
+            headers: vec![("Authorization".into(), format!("Bearer {api_key}"))],
+            fields: SearchFields::default(),
+            secrets: SecretSet::default(),
+        }
+    }
+}
+
+/// `web_fetch` through the nginjen backend (#625): `POST {base}/scrape` with
+/// `{"url", "format"}` and the key as a bearer token.
+///
+/// - The target is vetted before anything leaves: http(s), no credentials,
+///   no known secret, a public host (`TOLE_WEB_ALLOW_PRIVATE=1` opts out).
+/// - A result the backend produced through its Jina Reader fallback
+///   (`"engine_used": "jina"`) is discarded: tole keeps Jina off.
+/// - Redirects from the backend are not followed; its envelope is bounded
+///   and the text capped like the other fetchers.
+pub struct NginjenFetchTool {
+    scrape: String,
+    api_key: String,
+    allow_private: bool,
+    secrets: SecretSet,
+}
+
+impl NginjenFetchTool {
+    pub fn new(base: &str, api_key: &str, allow_private: bool) -> Self {
+        NginjenFetchTool {
+            scrape: format!("{}/scrape", base.trim_end_matches('/')),
+            api_key: api_key.to_string(),
+            allow_private,
+            secrets: SecretSet::default(),
+        }
+    }
+
+    /// Refuse targets that carry any of these secrets (#595).
+    pub fn with_secrets(mut self, secrets: &SecretSet) -> Self {
+        self.secrets = secrets.clone();
+        self
+    }
+}
+
+impl Tool for NginjenFetchTool {
+    fn name(&self) -> &str {
+        "web_fetch"
+    }
+    fn risk(&self) -> Risk {
+        Risk::ReadOnly
+    }
+    fn summary(&self) -> String {
+        "Fetch an http(s) URL through the nginjen backend (it may render JavaScript-heavy pages) \
+         as markdown (default), compact text, plain text, raw HTML or a link list, size-capped. \
+         `compact` is shortest but drops the text of inline bold, italic and code and image alt \
+         text."
+            .into()
+    }
+    fn spec(&self) -> Option<Value> {
+        Some(json!({
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "http(s) URL to fetch"},
+                "format": {"type": "string",
+                    "enum": ["markdown", "compact", "text", "html", "links"],
+                    "description": "Output format (default markdown)"}
+            },
+            "required": ["url"]
+        }))
+    }
+    fn execute(&self, input: Value) -> Result<Value, String> {
+        let target = input["url"]
+            .as_str()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .ok_or("web_fetch: 'url' is required")?;
+        let format = input["format"].as_str().unwrap_or("markdown");
+        let wire = match format {
+            "markdown" => "markdown",
+            "compact" => "compact",
+            "text" => "content",
+            "html" => "rawHtml",
+            "links" => "links",
+            other => {
+                return Err(format!(
+                    "web_fetch: unknown format `{other}` (markdown, compact, text, html or links)"
+                ))
+            }
+        };
+        refuse_secret_url(&self.secrets, target)?;
+        if !redirect_scheme_allowed(target) {
+            return Err("web_fetch: only http(s) URLs".into());
+        }
+        let authority = target
+            .split_once("://")
+            .map(|(_, rest)| rest.split(['/', '?', '#']).next().unwrap_or(""))
+            .unwrap_or("");
+        if authority.contains('@') {
+            return Err("web_fetch: URLs with credentials are not fetchable".into());
+        }
+        host_is_public_opt(target, self.allow_private)?;
+        let mut res = agent()
+            .post(&self.scrape)
+            .header("Authorization", &format!("Bearer {}", self.api_key))
+            .send_json(json!({"url": target, "format": wire}))
+            .map_err(|e| {
+                format!(
+                    "web_fetch: nginjen backend: {}",
+                    self.secrets.redact(&e.to_string())
+                )
+            })?;
+        use std::io::Read;
+        let mut buf = Vec::new();
+        res.body_mut()
+            .as_reader()
+            .take((FETCH_CAP_BYTES * 2 + 1) as u64)
+            .read_to_end(&mut buf)
+            .map_err(|e| format!("web_fetch: nginjen backend read: {e}"))?;
+        if buf.len() > FETCH_CAP_BYTES * 2 {
+            return Err("web_fetch: nginjen backend response is too large".into());
+        }
+        let body: Value = serde_json::from_slice(&buf)
+            .map_err(|_| "web_fetch: nginjen backend returned non-JSON".to_string())?;
+        if body["engine_used"] == "jina" {
+            return Err(
+                "web_fetch: the nginjen backend answered through its Jina Reader fallback, which \
+                 tole keeps off; the result was discarded"
+                    .into(),
+            );
+        }
+        let content = body["content"]
+            .as_str()
+            .ok_or("web_fetch: nginjen backend response has no `content`")?;
+        let mut out = json!({
+            "url": target,
+            "content_type": "via nginjen backend",
+            "format": format,
+        });
+        if format == "links" {
+            let links: Vec<Value> = serde_json::from_str::<Vec<Value>>(content)
+                .unwrap_or_default()
+                .into_iter()
+                .take(200)
+                .map(|l| {
+                    json!({
+                        "url": cap_chars(l["url"].as_str().unwrap_or(""), 2_000),
+                        "text": cap_chars(l["text"].as_str().unwrap_or(""), 200),
+                    })
+                })
+                .collect();
+            out["links"] = json!(links);
+            return Ok(out);
+        }
+        out["truncated"] = json!(content.chars().count() > TEXT_CAP_CHARS);
+        out["text"] = json!(cap_chars(content, TEXT_CAP_CHARS));
+        Ok(out)
     }
 }
 
@@ -1026,7 +1638,7 @@ mod tests {
         );
 
         // Fetch an HTML page: text extracted.
-        let fetch = WebFetchTool;
+        let fetch = WebFetchTool::default();
         let out = fetch
             .execute(json!({"url": format!("{base}/page")}))
             .unwrap();
@@ -1359,5 +1971,299 @@ mod tests {
         );
         // The description of the call never carries a header value.
         assert!(!t.describe(&json!({"query": "q"})).contains("k-1"));
+    }
+
+    // ---- fetch backend (#532) ----
+
+    /// One-shot backend: replies `status` with `body`, sends the raw
+    /// request (headers and body) back on the channel.
+    fn mock_backend(
+        status: u16,
+        body: String,
+    ) -> (std::net::SocketAddr, std::sync::mpsc::Receiver<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut s, _) = listener.accept().unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(5))).ok();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let n = s.read(&mut chunk).unwrap_or(0);
+                buf.extend_from_slice(&chunk[..n]);
+                let text = String::from_utf8_lossy(&buf).to_string();
+                if let Some(h) = text.find("\r\n\r\n") {
+                    let want = text[..h]
+                        .to_ascii_lowercase()
+                        .split("content-length:")
+                        .nth(1)
+                        .and_then(|v| v.split("\r\n").next())
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if text.len() >= h + 4 + want {
+                        break;
+                    }
+                }
+                if n == 0 {
+                    break;
+                }
+            }
+            let _ = tx.send(String::from_utf8_lossy(&buf).to_string());
+            let _ = s.write_all(
+                format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+        });
+        (addr, rx)
+    }
+
+    fn fetch_tool(addr: std::net::SocketAddr, extra: &[(&str, &str)]) -> WebBackendFetchTool {
+        let url = format!("http://{addr}/fetch");
+        let mut pairs = vec![(FETCH_URL_ENV, url.as_str())];
+        pairs.extend_from_slice(extra);
+        WebBackendFetchTool::from_lookup(&lookup(&pairs))
+            .unwrap()
+            .unwrap()
+    }
+
+    // ---- known-secret redaction (#595) ----
+
+    fn web_secrets() -> SecretSet {
+        SecretSet::collect(
+            [(
+                "TOLE_TEST_WEB_TOKEN".to_string(),
+                "web-secret/0123456".to_string(),
+            )],
+            std::iter::empty(),
+        )
+    }
+
+    #[test]
+    fn search_query_reaches_the_backend_redacted() {
+        let (addr, rx) = mock_backend(200, json!({"results": []}).to_string());
+        let t = WebSearchTool::new(format!("http://{addr}/search")).with_secrets(&web_secrets());
+        let out = t
+            .execute(json!({"query": "leak web-secret/0123456 now"}))
+            .unwrap();
+        let req = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let line = req.lines().next().unwrap();
+        assert!(!req.contains("web-secret"), "{req}");
+        // `«`/`»` are percent-encoded on the wire.
+        assert!(line.contains("TOLE_TEST_WEB_TOKEN"), "{line}");
+        assert_eq!(out["query"], "leak «TOLE_TEST_WEB_TOKEN» now");
+    }
+
+    #[test]
+    fn fetch_urls_carrying_a_known_secret_are_refused_before_any_request() {
+        let direct = WebFetchTool::default().with_secrets(&web_secrets());
+        // Unroutable on purpose: a refusal must happen before any I/O.
+        let err = direct
+            .execute(json!({"url": "http://192.0.2.1/?k=web-secret/0123456"}))
+            .unwrap_err();
+        assert!(
+            err.contains("known secret") && err.contains("«TOLE_TEST_WEB_TOKEN»"),
+            "{err}"
+        );
+        assert!(!err.contains("web-secret"), "{err}");
+        let backend =
+            WebBackendFetchTool::new("http://192.0.2.1/fetch").with_secrets(&web_secrets());
+        // Percent-encoded form of the value is caught too.
+        let err = backend
+            .execute(json!({"url": "https://example.com/p?k=web-secret%2F0123456"}))
+            .unwrap_err();
+        assert!(err.contains("known secret"), "{err}");
+    }
+
+    #[test]
+    fn header_secrets_are_the_expanded_header_variables() {
+        let env = lookup(&[
+            (
+                SEARCH_HEADERS_ENV,
+                "Authorization=Bearer ${NGX_KEY}, X-Other=${UNSET}",
+            ),
+            (FETCH_HEADERS_ENV, "X-Key=${FETCH_KEY}"),
+            ("NGX_KEY", "ngx-value-0123"),
+            ("FETCH_KEY", "fetch-value-0123"),
+        ]);
+        assert_eq!(
+            header_secrets(&env),
+            vec![
+                ("NGX_KEY".to_string(), "ngx-value-0123".to_string()),
+                ("FETCH_KEY".to_string(), "fetch-value-0123".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn fetch_backend_is_off_unless_configured_and_bad_config_fails() {
+        assert!(WebBackendFetchTool::from_lookup(&lookup(&[]))
+            .unwrap()
+            .is_none());
+        assert!(
+            WebBackendFetchTool::from_lookup(&lookup(&[(FETCH_URL_ENV, "  ")]))
+                .unwrap()
+                .is_none()
+        );
+        for (k, v, needle) in [
+            (FETCH_URL_ENV, "ftp://x", "expected an http(s) URL"),
+            (FETCH_METHOD_ENV, "PUT", "expected GET or POST"),
+            (FETCH_HEADERS_ENV, "Host=x", "cannot be configured"),
+            (FETCH_HEADERS_ENV, "A=${NOPE}", "`${NOPE}` is not set"),
+            (FETCH_FIELDS_ENV, "text=body", "unknown field `text`"),
+            (FETCH_FIELDS_ENV, "content=", "names no backend field"),
+        ] {
+            let mut pairs = vec![(FETCH_URL_ENV, "http://b/f")];
+            pairs.push((k, v));
+            let e = WebBackendFetchTool::from_lookup(&lookup(&pairs))
+                .err()
+                .unwrap();
+            assert!(
+                e.contains(needle) && e.contains("TOLE_WEB_FETCH"),
+                "{v:?} -> {e}"
+            );
+        }
+    }
+
+    /// Targets that must never reach a remote backend are refused first:
+    /// the mock backend must not even see a connection.
+    #[test]
+    fn fetch_backend_refuses_bad_targets_before_sending_anything() {
+        let _env = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("TOLE_WEB_ALLOW_PRIVATE");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let t = fetch_tool(addr, &[]);
+        for target in [
+            "http://example.com/",
+            "https://user:pw@example.com/",
+            "https://u@example.com/",
+            "https://127.0.0.1/x",
+            "https://localhost/x",
+            "https://10.1.2.3/x",
+            "https://169.254.169.254/latest",
+            "file:///etc/passwd",
+            "ftp://example.com/",
+        ] {
+            assert!(t.execute(json!({"url": target})).is_err(), "{target}");
+        }
+        assert!(t.execute(json!({})).is_err());
+        assert!(
+            listener.accept().is_err(),
+            "a refused target reached the backend"
+        );
+    }
+
+    #[test]
+    fn fetch_backend_get_sends_encoded_target_and_headers_only_to_backend() {
+        let _env = ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOLE_WEB_ALLOW_PRIVATE", "1");
+        let (addr, rx) = mock_backend(200, json!({"page": "hello <b>world</b>"}).to_string());
+        let t = fetch_tool(
+            addr,
+            &[
+                (FETCH_HEADERS_ENV, "Authorization=Bearer ${KEY}"),
+                (FETCH_FIELDS_ENV, "content=page"),
+                ("KEY", "sekret-1"),
+            ],
+        );
+        let out = t.execute(json!({"url": "https://127.0.0.1/a?x=1&y=2"}));
+        std::env::remove_var("TOLE_WEB_ALLOW_PRIVATE");
+        let out = out.unwrap();
+        assert_eq!(out["text"], "hello <b>world</b>");
+        assert_eq!(out["truncated"], false);
+        assert_eq!(out["url"], "https://127.0.0.1/a?x=1&y=2");
+        let req = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let line = req.lines().next().unwrap();
+        assert!(line.starts_with("GET /fetch?url=https"), "{line}");
+        assert!(
+            line.contains("%26y%3D2") && !line.contains("&y=2"),
+            "{line}"
+        );
+        assert!(req
+            .to_ascii_lowercase()
+            .contains("authorization: bearer sekret-1"));
+        // Neither the description nor the spec carries the credential.
+        let shown = format!(
+            "{} {}",
+            t.describe(&json!({"url": "https://x"})),
+            t.summary()
+        );
+        assert!(!shown.contains("sekret-1"));
+    }
+
+    #[test]
+    fn fetch_backend_post_sends_json_and_errors_never_echo_headers() {
+        let _env = ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOLE_WEB_ALLOW_PRIVATE", "1");
+        let (addr, rx) = mock_backend(200, json!({"content": "ok"}).to_string());
+        let t = fetch_tool(addr, &[(FETCH_METHOD_ENV, "POST")]);
+        let out = t.execute(json!({"url": "https://127.0.0.1/p"})).unwrap();
+        assert_eq!(out["text"], "ok");
+        let req = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(req.starts_with("POST /fetch "), "{req}");
+        let body: Value = serde_json::from_str(&req[req.find("\r\n\r\n").unwrap() + 4..]).unwrap();
+        assert_eq!(body, json!({"url": "https://127.0.0.1/p"}));
+        // A failing backend: the error names the status, not the secret.
+        let (addr, _rx) = mock_backend(500, "{}".into());
+        let t = fetch_tool(
+            addr,
+            &[(FETCH_HEADERS_ENV, "X-Key=${K}"), ("K", "sekret-2")],
+        );
+        let e = t
+            .execute(json!({"url": "https://127.0.0.1/p"}))
+            .err()
+            .unwrap();
+        std::env::remove_var("TOLE_WEB_ALLOW_PRIVATE");
+        assert!(e.contains("500") && !e.contains("sekret-2"), "{e}");
+    }
+
+    #[test]
+    fn fetch_backend_output_is_capped_and_shape_checked() {
+        let _env = ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOLE_WEB_ALLOW_PRIVATE", "1");
+        // Over the byte cap but inside the envelope bound: truncated.
+        let big = "é".repeat(FETCH_CAP_BYTES / 2 + 1000);
+        let (addr, _rx) = mock_backend(200, json!({"content": big}).to_string());
+        let out = fetch_tool(addr, &[])
+            .execute(json!({"url": "https://127.0.0.1/p"}))
+            .unwrap();
+        assert_eq!(out["truncated"], true);
+        assert!(out["text"].as_str().unwrap().chars().count() <= 20_001);
+        // Between the character cap and the byte cap: still truncated.
+        let mid = "a".repeat(TEXT_CAP_CHARS + 500);
+        let (addr, _rx) = mock_backend(200, json!({"content": mid}).to_string());
+        let out = fetch_tool(addr, &[])
+            .execute(json!({"url": "https://127.0.0.1/p"}))
+            .unwrap();
+        assert_eq!(out["truncated"], true, "cut to 20k chars must say so");
+        // Under both caps: complete.
+        let (addr, _rx) = mock_backend(200, json!({"content": "short"}).to_string());
+        let out = fetch_tool(addr, &[])
+            .execute(json!({"url": "https://127.0.0.1/p"}))
+            .unwrap();
+        assert_eq!(out["truncated"], false);
+        // No such field, not JSON, and an oversize envelope are errors.
+        for (body, needle) in [
+            (
+                json!({"other": "x"}).to_string(),
+                "no string field `content`",
+            ),
+            ("<html>".to_string(), "non-JSON"),
+            ("x".repeat(FETCH_CAP_BYTES * 2 + 10), "too large"),
+        ] {
+            let (addr, _rx) = mock_backend(200, body);
+            let e = fetch_tool(addr, &[])
+                .execute(json!({"url": "https://127.0.0.1/p"}))
+                .err()
+                .unwrap();
+            assert!(e.contains(needle), "{needle}: {e}");
+        }
+        std::env::remove_var("TOLE_WEB_ALLOW_PRIVATE");
     }
 }

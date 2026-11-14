@@ -8,8 +8,8 @@
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tole_cli::session_host::UpdatePlanTool;
 use tole_cli::session_tools::SessionToolState;
+use tole_cli::tool_roster::UpdatePlanTool;
 use tole_cli::tools::WriteFileTool;
 use tole_core::approval::{Approver, ToolRequest, Verdict};
 use tole_core::tool::{Tool, ToolRegistry};
@@ -53,7 +53,6 @@ fn all_tools() -> Vec<Box<dyn Tool>> {
         Box::new(tole_core::read_file::ReadFileTool::new(root.clone())),
         Box::new(tole_core::file_tools::EditFileTool::new(root.clone())),
         Box::new(tole_core::file_tools::DeleteFileTool::new(root.clone())),
-        Box::new(tole_core::web::WebFetchTool),
         Box::new(tole_core::skills::LoadSkillTool::new(None)),
         Box::new(WriteFileTool::new(root.clone())),
         Box::new(UpdatePlanTool::new(Arc::new(|_| {}))),
@@ -61,8 +60,29 @@ fn all_tools() -> Vec<Box<dyn Tool>> {
     let todo = tole_core::todo::TodoState::new();
     tools.push(Box::new(tole_core::todo::TodoWriteTool::new(todo.clone())));
     tools.push(Box::new(tole_core::todo::TodoReadTool::new(todo)));
-    if let Ok(Some(t)) = tole_core::web::WebSearchTool::from_env() {
-        tools.push(Box::new(t));
+    // The web tools the default build registers (#625): the built-in pair
+    // with `web-builtin`, else the direct fetcher (and search only with a
+    // backend).
+    #[cfg(feature = "web-builtin")]
+    {
+        let http = Arc::new(tole_cli::web_builtin::TolHttp::new(
+            &tole_core::secrets::SecretSet::default(),
+            false,
+        ));
+        tools.push(Box::new(tole_cli::web_builtin::BuiltinFetchTool::new(
+            Arc::clone(&http),
+        )));
+        tools.push(Box::new(tole_cli::web_builtin::BuiltinSearchTool::new(
+            http,
+            &tole_core::secrets::SecretSet::default(),
+        )));
+    }
+    #[cfg(not(feature = "web-builtin"))]
+    {
+        tools.push(Box::new(tole_core::web::WebFetchTool::default()));
+        if let Ok(Some(t)) = tole_core::web::WebSearchTool::from_env() {
+            tools.push(Box::new(t));
+        }
     }
     let state = SessionToolState::new(vec![], false, None, root, None, vec![]);
     tools.extend(state.tools());
@@ -141,7 +161,9 @@ fn git_and_systemone_summaries_are_static() {
 /// registry's `tools` array as it goes over the wire (characters of its
 /// compact JSON, counted by the same `wire_stats` the usage ledger uses).
 /// Measured 2026-10-09: 13,879 chars for 27 tools (no `web_search`: its
-/// key is not set in CI). Bound = ceil(measured * 1.25) rounded up. A
+/// key is not set in CI); 2026-11-13: 16,032 chars for 30 tools, with the
+/// built-in `web_search` and `web_fetch` of `web-builtin` (#625), still
+/// under the bound. Bound = ceil(measured * 1.25) rounded up. A
 /// bump needs a written justification in the PR, like the mission bounds
 /// in `crates/tole-core/tests/wire_size_missions.rs`.
 const FULL_REGISTRY_TOOLS_CHARS_BOUND: u64 = 18_000;

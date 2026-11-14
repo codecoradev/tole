@@ -26,9 +26,12 @@
 //! - the run_command/job_start bypass (spawning `tole` by name) is
 //!   closed in child mode by `check_child_agent_argv` (wired via
 //!   `in_child_mode` on those tools).
-//! - env: the child INHERITS the parent env (it needs the provider
-//!   key) — the normal secret scrub is deliberately NOT applied here;
-//!   isolation comes from depth + jail + policy visibility instead.
+//! - env: the child gets the ENV-1-scrubbed parent env plus only the
+//!   provider keys it needs (`child_env::PROVIDER_SECRETS`, #595); every
+//!   other secret-shaped variable (MCP tokens, the serve token, ...) is
+//!   removed, `GITHUB_TOKEN` included, unless `ChildOpts::keep_secrets`
+//!   carries it: the host passes its grant there (#598, the secrets its
+//!   release binds to some consumer, narrowed by a profile).
 
 use crate::tool::{Risk, Tool};
 use serde_json::{json, Value};
@@ -277,6 +280,20 @@ fn agents_root(root: &std::path::Path) -> PathBuf {
     root.join(AGENTS_DIR)
 }
 
+/// The directory child agent dirs live in, under a session's root.
+pub fn agents_dir(root: &std::path::Path) -> PathBuf {
+    agents_root(root)
+}
+
+/// One child agent's dir (its meta, log, pid and `sessions/`). `None` for
+/// an id that is not one plain path component: empty, `.`, `..`, a leading
+/// dot, or a `/` or `\\` anywhere, so no id can name a directory outside
+/// (or hidden inside) the agents dir.
+pub fn agent_dir(root: &std::path::Path, id: &str) -> Option<PathBuf> {
+    let plain = !id.is_empty() && !id.starts_with('.') && !id.contains(['/', '\\']);
+    plain.then(|| agents_root(root).join(id))
+}
+
 /// Result<bool> like jobs.rs (CodeCora PR #174 round 2): a ps failure
 /// must NOT be read as "process dead" — on ps-less hosts that would
 /// consume-and-wipe a live child's mailbox and undercount the cap.
@@ -370,9 +387,22 @@ fn mailbox_ns_for(id: &str) -> String {
     format!("agent-{id}")
 }
 
+/// Largest child-written file (meta, handoff) the parent reads.
+const MAX_CHILD_FILE: u64 = 64 * 1024;
+
+/// A file in a child's agent dir, which the child can replace: read
+/// without blocking (a FIFO), without following a symlink, regular files
+/// only, at most `cap` bytes. `Ok(None)` when it does not exist.
+fn read_child_text(path: &std::path::Path, cap: u64) -> Result<Option<String>, String> {
+    crate::delegation_report::read_plain_file(path, cap)?
+        .map(|b| String::from_utf8(b).map_err(|_| "not UTF-8".to_string()))
+        .transpose()
+}
+
 fn read_meta(dir: &std::path::Path) -> Result<AgentMeta, String> {
-    let raw =
-        std::fs::read_to_string(dir.join("meta.json")).map_err(|e| format!("agent meta: {e}"))?;
+    let raw = read_child_text(&dir.join("meta.json"), MAX_CHILD_FILE)
+        .map_err(|e| format!("agent meta: {e}"))?
+        .ok_or("agent meta: missing")?;
     serde_json::from_str(&raw).map_err(|e| format!("agent meta parse: {e}"))
 }
 
@@ -397,7 +427,7 @@ fn live_agents(root: &std::path::Path) -> Result<usize, String> {
     };
     for e in root_dir.flatten() {
         let dir = e.path();
-        let Ok(pid) = std::fs::read_to_string(dir.join("pid")) else {
+        let Ok(Some(pid)) = read_child_text(&dir.join("pid"), 64) else {
             continue;
         };
         if let Ok(pid) = pid.trim().parse::<u32>() {
@@ -522,6 +552,34 @@ pub struct AgentStartTool {
     /// parent's list (CodeCora PR #174 round 2 — a non-interactive
     /// parent must not let the model hand a child broader writes).
     pub parent_allows: Vec<String>,
+    /// How the child is launched; [`ChildOpts::default`] is the classic
+    /// `tole run` child at depth 1.
+    pub opts: ChildOpts,
+}
+
+/// Launch options a delegating host (#585) sets on top of the classic
+/// child: the caps there were already enforced by `tole_core::delegation`.
+#[derive(Debug, Clone, Default)]
+pub struct ChildOpts {
+    /// The child subcommand and its own flags (`["mission", "--max-steps",
+    /// ...]`); empty means `run`.
+    pub command: Vec<std::ffi::OsString>,
+    /// The child's depth; 0 means 1.
+    pub depth: u32,
+    /// Set by the delegate tool: the depth refusal and the allow-subset
+    /// check were done by the delegation tree, which may go deeper than 1.
+    pub delegated: bool,
+    /// The delegation log and node id passed to the child.
+    pub delegation: Option<(PathBuf, String)>,
+    /// Secret NAMES the child keeps besides its provider keys (the
+    /// parent grant ∩ the profile's grants).
+    pub keep_secrets: Vec<String>,
+    /// Set by the delegate tool: the child starts at least this nice
+    /// ([`crate::resource_guard::apply_child_nice`]).
+    pub nice: Option<u32>,
+    /// Set for an independent discussion participant (#704): the child's
+    /// environment says so, and it may not start a discussion.
+    pub participant: bool,
 }
 
 impl AgentStartTool {
@@ -534,6 +592,7 @@ impl AgentStartTool {
             max_concurrent: DEFAULT_MAX_CONCURRENT,
             timeout_secs: DEFAULT_TIMEOUT_SECS,
             parent_allows: Vec::new(),
+            opts: ChildOpts::default(),
         }
     }
 
@@ -626,7 +685,7 @@ impl Tool for AgentStartTool {
     }
 
     fn execute(&self, input: Value) -> Result<Value, String> {
-        if self.depth >= 1 {
+        if self.depth >= 1 && !self.opts.delegated {
             return Err(
                 "agent_start: child agents cannot spawn children — the agent tree is capped at \
                  one level (issue #171)"
@@ -720,6 +779,11 @@ impl Tool for AgentStartTool {
         if role.is_some() && !allows.iter().any(|a| a == "handoff_submit") {
             allows.push("handoff_submit".to_string());
         }
+        // Likewise a delegated child's `delegate_report` (#585): one capped
+        // file at the path chosen here.
+        if self.opts.delegated && !allows.iter().any(|a| a == "delegate_report") {
+            allows.push("delegate_report".to_string());
+        }
         // Issue #234: hold the flock across count + register — the
         // count-then-spawn window is the TOCTOU the scan flagged. The
         // guard releases when `_lock` drops (spawn errors included).
@@ -734,7 +798,8 @@ impl Tool for AgentStartTool {
         }
 
         let id = new_agent_id();
-        let dir = agents_root(&self.root).join(&id);
+        let dir = agent_dir(&self.root, &id)
+            .ok_or_else(|| format!("agent_start: invalid agent id {id:?}"))?;
         std::fs::create_dir_all(&dir)
             .map_err(|e| format!("agent_start: creating {}: {e}", dir.display()))?;
         #[cfg(unix)]
@@ -805,9 +870,12 @@ impl Tool for AgentStartTool {
             .map_err(|e| format!("agent_start: log: {e}"))?;
 
         let mut cmd = Command::new(&self.bin);
-        // Deliberately NO env scrub: the child IS a tole session and
-        // needs the provider key. Isolation = depth cap + jail + the
-        // approved child allowlist (see the module doc).
+        // The child IS a tole session: it gets the scrubbed env plus its
+        // provider keys and its grant, nothing else secret (#595, #598). Isolation beyond
+        // that = depth cap + jail + the approved child allowlist.
+        let mut keep: Vec<&str> = crate::child_env::PROVIDER_SECRETS.to_vec();
+        keep.extend(self.opts.keep_secrets.iter().map(String::as_str));
+        crate::subprocess::scrub_env_for_child_keeping(&mut cmd, &keep);
         // The launch contract (child_env): depth 1, the child's identity
         // and the touch log shared with its siblings (#380), its mailbox
         // room, and for a role child its role and handoff file (#383).
@@ -816,10 +884,21 @@ impl Tool for AgentStartTool {
             touch_log: agents_root(&self.root).join("touch.log"),
             mailbox_room: mailbox_ns.clone(),
             role: role.map(|r| (r, dir.join(HANDOFF_FILE))),
+            depth: self.opts.depth,
+            delegation: self.opts.delegation.clone(),
+            report: self
+                .opts
+                .delegated
+                .then(|| dir.join(crate::delegation_report::REPORT_FILE)),
+            participant: self.opts.participant,
         };
-        cmd.envs(launch.vars())
-            .arg("run")
-            .arg("--sessions-dir")
+        cmd.envs(launch.vars());
+        if self.opts.command.is_empty() {
+            cmd.arg("run");
+        } else {
+            cmd.args(&self.opts.command);
+        }
+        cmd.arg("--sessions-dir")
             .arg(&sessions_dir)
             .arg("--workspace")
             .arg(&child_cwd);
@@ -840,6 +919,9 @@ impl Tool for AgentStartTool {
         {
             use std::os::unix::process::CommandExt;
             cmd.process_group(0);
+        }
+        if let Some(nice) = self.opts.nice {
+            crate::resource_guard::apply_child_nice(&mut cmd, nice);
         }
         let mut child = cmd
             .spawn()
@@ -944,8 +1026,10 @@ impl Tool for AgentPollTool {
             return Err(format!("agent_poll: invalid agent id {id:?}"));
         }
         let dir = agents_root(&self.root).join(id);
-        let pid: u32 = std::fs::read_to_string(dir.join("pid"))
-            .map_err(|_| format!("agent_poll: unknown agent {id}"))?
+        let pid: u32 = read_child_text(&dir.join("pid"), 64)
+            .ok()
+            .flatten()
+            .ok_or_else(|| format!("agent_poll: unknown agent {id}"))?
             .trim()
             .parse()
             .map_err(|_| format!("agent_poll: corrupt pid file for {id}"))?;
@@ -961,7 +1045,20 @@ impl Tool for AgentPollTool {
 
         // Bounded log tail (same read-window discipline as job_poll).
         let mut tail = String::new();
-        if let Ok(mut f) = std::fs::File::open(dir.join("log")) {
+        let mut log = std::fs::OpenOptions::new();
+        log.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // The child can replace its log: never block on a FIFO or follow
+            // a symlink, and read regular files only.
+            log.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let log = log
+            .open(dir.join("log"))
+            .ok()
+            .filter(|f| f.metadata().is_ok_and(|m| m.is_file()));
+        if let Some(mut f) = log {
             use std::io::{Read, Seek, SeekFrom};
             let len = f.metadata().map(|m| m.len()).unwrap_or(0);
             let start = len.saturating_sub(READ_WINDOW);
@@ -1021,9 +1118,9 @@ fn attach_handoff(dir: &std::path::Path, meta: &AgentMeta, out: &mut Value) {
         return;
     };
     out["role"] = json!(role.as_str());
-    let raw = match std::fs::read_to_string(dir.join(HANDOFF_FILE)) {
-        Ok(raw) => raw,
-        Err(_) => {
+    let raw = match read_child_text(&dir.join(HANDOFF_FILE), MAX_CHILD_FILE) {
+        Ok(Some(raw)) => raw,
+        _ => {
             // Nothing submitted.
             if role.requires_verification() {
                 out["gate"] = json!("unverified");
@@ -1460,6 +1557,50 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// #595: the child keeps its provider key and plain settings, but no
+    /// other secret of the parent (it inherited the full env before).
+    #[cfg(unix)]
+    #[test]
+    fn child_env_has_its_provider_key_but_no_other_secret() {
+        let d = tmp("minenv");
+        // TOLE_FALLBACK_API_KEY stands in for the provider keys: nothing in
+        // tole-core reads it, so setting it cannot disturb parallel tests.
+        std::env::set_var("TOLE_FALLBACK_API_KEY", "sk-child-needs-this");
+        std::env::set_var("TOLE_TEST_595_MCP_TOKEN", "parent-only-secret");
+        std::env::set_var("TOLE_TEST_595_PLAIN", "plain-setting");
+        let p = d.join("dump-env");
+        let dump = d.join("env.txt");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n%s\\n%s\\n' \"$TOLE_FALLBACK_API_KEY\" \"$TOLE_TEST_595_MCP_TOKEN\" \"$TOLE_TEST_595_PLAIN\" > \"{}.tmp\" && mv \"{0}.tmp\" \"{0}\"\nexit 0\n",
+            dump.display()
+        );
+        std::fs::write(&p, script).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755));
+        AgentStartTool::new(&p, d.clone())
+            .execute(json!({"prompt": "x"}))
+            .unwrap();
+        std::env::remove_var("TOLE_FALLBACK_API_KEY");
+        std::env::remove_var("TOLE_TEST_595_MCP_TOKEN");
+        std::env::remove_var("TOLE_TEST_595_PLAIN");
+        let mut dumped = None;
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if let Ok(t) = std::fs::read_to_string(&dump) {
+                dumped = Some(t);
+                break;
+            }
+        }
+        let dumped = dumped.expect("child never dumped its env");
+        let lines: Vec<&str> = dumped.lines().collect();
+        assert_eq!(
+            lines,
+            vec!["sk-child-needs-this", "", "plain-setting"],
+            "provider key kept, other secret removed, plain var kept"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     // ---- #383 handoff roles ----
 
     /// Start a child through a script that dumps its argv and the handoff
@@ -1831,6 +1972,7 @@ mod tests {
             max_concurrent: 1,
             timeout_secs: start.timeout_secs,
             parent_allows: Vec::new(),
+            opts: ChildOpts::default(),
         };
         let (r1, r2) = std::thread::scope(|s| {
             let h1 = s.spawn(|| start.execute(json!({"prompt": "a"})));
@@ -2106,5 +2248,20 @@ mod tests {
         assert!(poll.execute(json!({"agent": "nope"})).is_err());
         assert!(poll.execute(json!({"agent": "../escape"})).is_err());
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// #621 review: an agent dir is always one plain component under the
+    /// agents dir.
+    #[test]
+    fn agent_dir_takes_only_one_plain_component() {
+        let root = std::path::Path::new("/w");
+        assert_eq!(
+            agent_dir(root, "a-1f-2-0"),
+            Some(PathBuf::from("/w").join(AGENTS_DIR).join("a-1f-2-0"))
+        );
+        assert!(agent_dir(root, "g.1.2").is_some(), "dots inside are fine");
+        for bad in ["", ".", "..", ".hidden", "a/b", "../x", "a\\b", "/abs"] {
+            assert_eq!(agent_dir(root, bad), None, "{bad:?}");
+        }
     }
 }

@@ -527,6 +527,7 @@ pub fn trust_cmd(
     store_path: &Path,
     io: &mut dyn ConfigTrustIo,
 ) -> Result<()> {
+    crate::owner_only::refuse_under_session("tole config trust").map_err(|e| anyhow!(e))?;
     let (subject, _) = Subject::resolve(cwd, explicit)?;
     if explicit.is_none() && !subject.file.exists() {
         bail!("no {CONFIG_REL_PATH} in {}", cwd.display());

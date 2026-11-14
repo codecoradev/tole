@@ -1,6 +1,7 @@
 name: Publish to crates.io
 
 on:
+  workflow_call: {}
   release:
     types: [published]
   workflow_dispatch:
