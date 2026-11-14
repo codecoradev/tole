@@ -336,6 +336,21 @@ Notes per consumer:
   tools; they are not wrapped. Their own model commands follow their own
   `[sandbox.consumers]`.
 
+### 9.1.1 Life of a sandboxed server
+
+A wrapped stdio server is keyed by server name and resolved workspace, and
+belongs to the sessions that registered it: each session's tool registry
+holds a claim, and the server is stopped (process killed, config dropped)
+when the last claim is released, so dropping one session never stops a
+server another session with the same key still uses. A server unused for
+`[sandbox] idle_secs` (default 900, 1 to 86400) is stopped too and starts
+again on its session's next call. `[sandbox] max_servers` (default 16, 1 to
+64) caps the wrapped servers a process runs at once: a launch past it is
+refused with a message naming the limit, never by evicting another
+session's server, and a released slot is reusable. Servers that are not
+wrapped (sandbox off, HTTP, skipped) keep the old process-lifetime
+behaviour.
+
 ## 10. Failure behaviour
 
 At startup tole resolves the backend once: `bwrap` on `PATH`, version

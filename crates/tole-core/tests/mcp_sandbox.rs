@@ -37,6 +37,8 @@ fn out_root() -> &'static Path {
             profile_name: "server".into(),
             profile,
             skip: vec!["plainsrv".into()],
+            max_servers: sandbox::DEFAULT_MAX_SERVERS,
+            idle_secs: sandbox::DEFAULT_IDLE_SECS,
         }))
         .unwrap();
         d
@@ -68,7 +70,14 @@ fn dir(tag: &str) -> PathBuf {
 }
 
 /// Starts a server that records what it sees into `out`, then serves.
-fn start(name: &str, ws: &Path, out: &Path, data: &Path, port: u16) -> McpServerConfig {
+/// The registry must stay alive: it holds the session's claim on the server.
+fn start(
+    name: &str,
+    ws: &Path,
+    out: &Path,
+    data: &Path,
+    port: u16,
+) -> (McpServerConfig, tole_core::tool::ToolRegistry) {
     use std::os::unix::fs::PermissionsExt;
     std::fs::copy(
         concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/mock_mcp.py"),
@@ -102,7 +111,7 @@ fn start(name: &str, ws: &Path, out: &Path, data: &Path, port: u16) -> McpServer
     let accept = |_: &str, _: &str, _: &[ManifestTool]| Ok(());
     let mut reg = tole_core::tool::ToolRegistry::new();
     register_server_tools(&mut reg, &cfg, &SecretSet::default(), &accept);
-    cfg
+    (cfg, reg)
 }
 
 fn read(out: &Path, f: &str) -> String {
@@ -141,7 +150,7 @@ fn a_sandboxed_server_sees_a_private_view() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
 
-    let cfg = start("sbx-view", &ws, &out, &data, port);
+    let (cfg, _reg) = start("sbx-view", &ws, &out, &data, port);
     assert!(ran(&out) && handshakes(&cfg), "the sandboxed server ran");
     assert_eq!(read(&out, "net"), "blocked", "no network");
     assert_eq!(read(&out, "data"), "no", "the data dir is absent");
@@ -269,9 +278,9 @@ fn one_server_name_in_two_workspaces_is_two_servers_that_never_mix() {
         let accept = |_: &str, _: &str, _: &[ManifestTool]| Ok(());
         let mut reg = tole_core::tool::ToolRegistry::new();
         register_server_tools(&mut reg, &cfg, &SecretSet::default(), &accept);
-        cfg
+        (cfg, reg)
     };
-    let (ca, cb) = (register(&wa), register(&wb));
+    let ((ca, _ra), (cb, _rb)) = (register(&wa), register(&wb));
     assert_ne!(ca.conn_key(), cb.conn_key());
     for (ws, tag) in [(&wa, "sa"), (&wb, "sb")] {
         let m = std::fs::read_to_string(out.join(format!("marker-{tag}"))).unwrap_or_default();

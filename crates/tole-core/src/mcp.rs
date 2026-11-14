@@ -70,6 +70,12 @@ enum McpRequest {
         uri: String,
         resp: mpsc::Sender<Result<String, String>>,
     },
+    /// A session registered a sandboxed server under `key` (#601).
+    Acquire { key: String },
+    /// A session that held `key` ended; the last one stops the server.
+    Release { key: String },
+    /// How many server connections are live (diagnostics, tests).
+    Count { resp: mpsc::Sender<usize> },
 }
 
 /// Handle to the single background runtime. Spawned lazily on first
@@ -426,7 +432,19 @@ fn runtime() -> mpsc::Sender<McpRequest> {
                         // Serialized request handling: MCP servers are
                         // single-stdio and tole is single-agent; no need
                         // for concurrency inside the reactor.
-                        while let Ok(req) = rx.recv() {
+                        // Sessions holding each wrapped server (#601).
+                        let mut refs: std::collections::HashMap<String, usize> =
+                            std::collections::HashMap::new();
+                        loop {
+                            let req = match rx.recv_timeout(reap_tick()) {
+                                Ok(r) => r,
+                                Err(mpsc::RecvTimeoutError::Timeout) => {
+                                    reap_idle(&mut conns);
+                                    continue;
+                                }
+                                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                            };
+                            reap_idle(&mut conns);
                             // Every operation is bounded INSIDE the
                             // reactor (CodeCora: the sync side's
                             // recv_timeout abandons but cannot cancel a
@@ -518,6 +536,26 @@ fn runtime() -> mpsc::Sender<McpRequest> {
                                     };
                                     let _ = resp.send(r);
                                 }
+                                McpRequest::Acquire { key } => {
+                                    *refs.entry(key).or_insert(0) += 1;
+                                }
+                                McpRequest::Release { key } => {
+                                    let left = refs.get_mut(&key).map(|n| {
+                                        *n = n.saturating_sub(1);
+                                        *n
+                                    });
+                                    if left == Some(0) {
+                                        // The last session using it ended:
+                                        // drop the connection (kills the
+                                        // server process) and its config.
+                                        refs.remove(&key);
+                                        conns.remove(&key);
+                                        configs.remove(&key);
+                                    }
+                                }
+                                McpRequest::Count { resp } => {
+                                    let _ = resp.send(conns.len());
+                                }
                                 McpRequest::ReadResource { server, uri, resp } => {
                                     let r = match lookup(&configs, &server) {
                                         Some(config) => {
@@ -547,6 +585,64 @@ fn runtime() -> mpsc::Sender<McpRequest> {
 /// are !Send-safe to keep there), keyed by server name.
 struct McpConnection {
     service: rmcp::service::RunningService<rmcp::service::RoleClient, rmcp::model::ClientConfig>,
+    /// Last use: a wrapped server idle past the policy's limit is stopped.
+    used: Instant,
+}
+
+/// How often the reactor looks for idle wrapped servers.
+fn reap_tick() -> Duration {
+    let idle = crate::sandbox::policy().map_or(30, |p| p.idle_secs);
+    Duration::from_secs((idle / 2).clamp(1, 30))
+}
+
+/// Stops wrapped (`name@workspace`) servers unused for the policy's
+/// `idle_secs`. Their config and their sessions stay: the next call starts
+/// the server again. Anything else (no sandbox, HTTP, skipped) is untouched.
+fn reap_idle(conns: &mut std::collections::HashMap<String, McpConnection>) {
+    let Some(p) = crate::sandbox::policy() else {
+        return;
+    };
+    let idle = Duration::from_secs(p.idle_secs);
+    conns.retain(|key, c| !(key.contains('@') && c.used.elapsed() > idle));
+}
+
+/// A session's claim on one sandboxed server (#601): held by the session's
+/// tool registry, and released when it drops. The reactor stops the server
+/// when the last claim on its key is released, so a daemon hosting many
+/// sessions never keeps a server for a session that ended.
+pub struct ServerLease {
+    key: String,
+}
+
+impl ServerLease {
+    /// A claim on `cfg`'s server; `None` when the sandbox does not wrap it.
+    fn acquire(cfg: &McpServerConfig) -> Option<std::sync::Arc<Self>> {
+        let key = cfg.conn_key();
+        if !key.contains('@') {
+            return None;
+        }
+        runtime()
+            .send(McpRequest::Acquire { key: key.clone() })
+            .ok()?;
+        Some(std::sync::Arc::new(Self { key }))
+    }
+}
+
+impl Drop for ServerLease {
+    fn drop(&mut self) {
+        let _ = runtime().send(McpRequest::Release {
+            key: self.key.clone(),
+        });
+    }
+}
+
+/// How many MCP server connections this process holds (diagnostics).
+pub fn live_connections() -> usize {
+    let (tx, rx) = mpsc::channel();
+    if runtime().send(McpRequest::Count { resp: tx }).is_err() {
+        return 0;
+    }
+    rx.recv_timeout(LIST_SYNC_BUDGET).unwrap_or(0)
 }
 
 impl McpConnection {
@@ -761,6 +857,18 @@ async fn start_server(
     if conns.contains_key(&cfg.conn_key()) {
         return Ok(());
     }
+    // A cap on sandboxed servers (#601): a launch past it is refused, never
+    // at the cost of another session's server.
+    if cfg.conn_key().contains('@') {
+        let cap = crate::sandbox::policy().map_or(usize::MAX, |p| p.max_servers);
+        if conns.keys().filter(|k| k.contains('@')).count() >= cap {
+            return Err(format!(
+                "mcp {:?}: not started, {cap} sandboxed servers are already running \
+                 (limit `[sandbox] max_servers`); end a session or raise the limit",
+                cfg.name
+            ));
+        }
+    }
     let service = match &cfg.transport {
         McpTransport::Stdio { command, args } => {
             // Sandbox (#601): off unless the owner's user config asks. When
@@ -845,7 +953,13 @@ async fn start_server(
             .map_err(|e| format!("mcp {:?}: handshake failed: {e}", cfg.name))?
         }
     };
-    conns.insert(cfg.conn_key(), McpConnection { service });
+    conns.insert(
+        cfg.conn_key(),
+        McpConnection {
+            service,
+            used: Instant::now(),
+        },
+    );
     Ok(())
 }
 
@@ -886,6 +1000,7 @@ async fn with_connection<R>(
     let conn = conns
         .get_mut(&cfg.conn_key())
         .ok_or_else(|| format!("mcp {:?} vanished", cfg.name))?;
+    conn.used = Instant::now();
     f(conn).await.map_err(|e| scrub_err(cfg, e))
 }
 
@@ -1266,6 +1381,10 @@ pub fn register_server_tools(
 ) -> Vec<String> {
     let mut registered = Vec::new();
     let start = Instant::now();
+    // The session's claim on a sandboxed server: held by the registry only
+    // once the server is admitted; otherwise it drops here and the server
+    // is stopped.
+    let lease = ServerLease::acquire(cfg);
     match list_manifest(cfg) {
         Ok((version, manifest)) => {
             if let Err(note) = admit(&cfg.name, &version, &manifest) {
@@ -1275,6 +1394,9 @@ pub fn register_server_tools(
             }
             // #680: recorded on this registry, the session's own decision.
             reg.set_mcp_admitted(&cfg.name, true);
+            if let Some(l) = lease {
+                reg.hold(l);
+            }
             let tools = manifest.into_iter().map(|t| (t.name, t.description));
             // Cap registered tools per server: a hostile/buggy server
             // must not flood the registry (and provider tool specs).

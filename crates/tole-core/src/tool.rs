@@ -103,6 +103,9 @@ pub struct ToolRegistry {
     /// Per registry, so sessions with different plugin locks in one process
     /// (serve, the cron loop) never share a decision.
     mcp_admitted: std::collections::BTreeSet<String>,
+    /// Guards released when the registry (the session) is dropped, e.g. the
+    /// lease of a sandboxed MCP server (#601).
+    holds: Vec<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 impl ToolRegistry {
@@ -122,7 +125,13 @@ impl ToolRegistry {
             hooks: None,
             taint: None,
             mcp_admitted: Default::default(),
+            holds: Vec::new(),
         }
+    }
+
+    /// Keeps `guard` alive as long as this registry lives.
+    pub fn hold(&mut self, guard: std::sync::Arc<dyn std::any::Any + Send + Sync>) {
+        self.holds.push(guard);
     }
 
     /// Records whether the MCP server `name` passed this registry's

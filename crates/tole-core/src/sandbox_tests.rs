@@ -288,6 +288,8 @@ fn policy(mode: Mode) -> Policy {
         profile_name: "server".into(),
         profile: server(),
         skip: vec!["cora".into()],
+        max_servers: DEFAULT_MAX_SERVERS,
+        idle_secs: DEFAULT_IDLE_SECS,
     }
 }
 

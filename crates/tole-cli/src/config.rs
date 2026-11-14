@@ -127,6 +127,12 @@ pub struct SandboxConfig {
     pub write: Option<Vec<String>>,
     /// Server names that run unsandboxed (the owner's first-party ones).
     pub skip: Option<Vec<String>>,
+    /// Most sandboxed servers at once, 1 to 64 (default 16): a launch past
+    /// it is refused.
+    pub max_servers: Option<usize>,
+    /// Seconds a sandboxed server may sit unused before it is stopped,
+    /// 1 to 86400 (default 900); it restarts on its next call.
+    pub idle_secs: Option<u64>,
 }
 
 impl SandboxConfig {
@@ -150,11 +156,32 @@ impl SandboxConfig {
         let paths = |v: &Option<Vec<String>>| v.iter().flatten().map(Into::into).collect();
         profile.read = paths(&self.read);
         profile.write = paths(&self.write);
+        use tole_core::sandbox::{
+            DEFAULT_IDLE_SECS, DEFAULT_MAX_SERVERS, IDLE_SECS_RANGE, MAX_SERVERS_RANGE,
+        };
+        let max_servers = self.max_servers.unwrap_or(DEFAULT_MAX_SERVERS);
+        if !MAX_SERVERS_RANGE.contains(&max_servers) {
+            return Err(format!(
+                "sandbox.max_servers must be {} to {}, got {max_servers}",
+                MAX_SERVERS_RANGE.start(),
+                MAX_SERVERS_RANGE.end()
+            ));
+        }
+        let idle_secs = self.idle_secs.unwrap_or(DEFAULT_IDLE_SECS);
+        if !IDLE_SECS_RANGE.contains(&idle_secs) {
+            return Err(format!(
+                "sandbox.idle_secs must be {} to {}, got {idle_secs}",
+                IDLE_SECS_RANGE.start(),
+                IDLE_SECS_RANGE.end()
+            ));
+        }
         Ok(tole_core::sandbox::Policy {
             mode,
             profile_name: name.to_string(),
             profile,
             skip: self.skip.clone().unwrap_or_default(),
+            max_servers,
+            idle_secs,
         })
     }
 }
@@ -1878,6 +1905,23 @@ verify_timeout = 60
         assert_eq!(pol.profile.network, Network::Host);
         assert_eq!(pol.skip, vec!["cora".to_string()]);
 
+        // Lifecycle limits: defaults, and bounds that name the key.
+        assert_eq!(pol.max_servers, tole_core::sandbox::DEFAULT_MAX_SERVERS);
+        assert_eq!(pol.idle_secs, tole_core::sandbox::DEFAULT_IDLE_SECS);
+        let c = parse("[sandbox]\nmax_servers = 4\nidle_secs = 60\n", &p()).unwrap();
+        let pol = c.sandbox.unwrap().policy().unwrap();
+        assert_eq!((pol.max_servers, pol.idle_secs), (4, 60));
+        for bad in [
+            "max_servers = 0",
+            "max_servers = 65",
+            "idle_secs = 0",
+            "idle_secs = 86401",
+        ] {
+            let e = parse(&format!("[sandbox]\n{bad}\n"), &p())
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("sandbox."), "{bad}: {e}");
+        }
         // Unknown keys and values are errors that name the key.
         assert!(parse("[sandbox]\nmodes = \"on\"\n", &p()).is_err());
         for bad in ["mode = \"on\"", "profile = \"x\"", "network = \"some\""] {

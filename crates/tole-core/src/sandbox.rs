@@ -108,7 +108,20 @@ pub struct Policy {
     pub profile: Profile,
     /// Server names left unsandboxed (the owner's first-party servers).
     pub skip: Vec<String>,
+    /// Most sandboxed servers this process keeps running at once; a launch
+    /// beyond it is refused (never evicting another session's server).
+    pub max_servers: usize,
+    /// Seconds a sandboxed server may sit unused before it is stopped (it
+    /// restarts on its next call).
+    pub idle_secs: u64,
 }
+
+/// Default and bounds of [`Policy::max_servers`].
+pub const DEFAULT_MAX_SERVERS: usize = 16;
+pub const MAX_SERVERS_RANGE: std::ops::RangeInclusive<usize> = 1..=64;
+/// Default and bounds of [`Policy::idle_secs`].
+pub const DEFAULT_IDLE_SECS: u64 = 900;
+pub const IDLE_SECS_RANGE: std::ops::RangeInclusive<u64> = 1..=86_400;
 
 /// Owner config, set once per process: the same for every session.
 /// Per-session state (the workspace) is never kept here: it travels with
