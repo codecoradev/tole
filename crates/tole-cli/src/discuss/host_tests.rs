@@ -808,3 +808,206 @@ fn resuming_a_finished_discussion_writes_no_documents_again() {
     mk(&docs).run().unwrap();
     assert_eq!(docs.lock().unwrap().len(), written, "no duplicate puts");
 }
+
+// ------------------------------------------------ one retry on a timeout (#756)
+
+fn times_out(usage: Option<u64>) -> Reply {
+    fails_with("timeout: global", usage)
+}
+
+fn fails_with(msg: &'static str, usage: Option<u64>) -> Reply {
+    Reply {
+        respond: Arc::new(move |_| Err(msg.to_string())),
+        usage,
+    }
+}
+
+fn retries(st: &State) -> Vec<(String, String)> {
+    st.reservations
+        .values()
+        .filter_map(|r| r.retry_of.clone().map(|of| (r.what.clone(), of)))
+        .collect()
+}
+
+#[test]
+fn a_participant_timeout_is_retried_once_charged_and_recorded() {
+    let (s, make) = script(&[
+        (
+            "coder",
+            vec![times_out(Some(40)), text("coder retried", 60)],
+        ),
+        ("checker", vec![checker_met(1)]),
+    ]);
+    let l = log("retry-ok");
+    let d = driver(l.clone(), make, 1_000_000);
+    d.start(contract(100_000, None)).unwrap();
+    let out = d.run().unwrap();
+    assert_eq!(out.gate, Gate::Report);
+    assert_eq!(kinds(&s), ["coder", "coder", "ops", "checker"]);
+    // Both calls are charged, to the ledger and to the goal's pot.
+    assert_eq!(out.tokens_used, 40 + 60 + 100 + 50);
+    assert_eq!(d.pot.used(), 250);
+    // Recorded: the second reservation names the timed-out first one.
+    let st = l.state().unwrap();
+    let r = retries(&st);
+    assert_eq!(r.len(), 1, "{r:?}");
+    assert_eq!(r[0].0, "participant-coder");
+    assert_eq!(st.reservations[&r[0].1].settled, Some(40));
+    assert!(st.reservations[&r[0].1].retry_of.is_none());
+    assert!(st
+        .contributions
+        .iter()
+        .any(|c| c.participant == "coder" && c.text.contains("coder retried")));
+    assert!(out.notes.iter().any(|n| n.contains("timed out")), "{out:?}");
+}
+
+#[test]
+fn a_second_timeout_fails_the_turn_as_before_and_resume_goes_on() {
+    let (s, make) = script(&[(
+        "coder",
+        vec![times_out(Some(40)), times_out(Some(50)), text("late", 10)],
+    )]);
+    let l = log("retry-twice");
+    let d = driver(l.clone(), make, 1_000_000);
+    d.start(contract(100_000, Some(1))).unwrap();
+    let e = d.run().unwrap_err();
+    assert!(
+        e.contains("coder's turn in round 1") && e.contains("timeout"),
+        "{e}"
+    );
+    assert_eq!(kinds(&s), ["coder", "coder"], "at most one retry per call");
+    let st = l.state().unwrap();
+    assert_eq!(st.tokens_used, 90, "both timed-out calls are counted");
+    assert_eq!(retries(&st).len(), 1);
+    assert!(st.contributions.is_empty(), "nothing was recorded");
+    // Resumed: the turn is a new call, with its own single retry allowance.
+    d.run().unwrap();
+    assert_eq!(&kinds(&s)[..3], ["coder", "coder", "coder"]);
+}
+
+#[test]
+fn only_a_provider_timeout_is_retried() {
+    for (i, msg) in [
+        "upstream 500",
+        "http status: 504 \u{2014} gateway timeout",
+        "http status: 429 \u{2014} timeout: global",
+        "http status: 400 \u{2014} json: timeout: global",
+        "io: Connection reset by peer",
+        "malformed response: timeout: global",
+        "stream read: timed out",
+        "provider call thread died",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (s, make) = script(&[("coder", vec![fails_with(msg, Some(5))])]);
+        let l = log(&format!("retry-other-{i}"));
+        let d = driver(l.clone(), make, 1_000_000);
+        d.start(contract(100_000, Some(1))).unwrap();
+        let e = d.run().unwrap_err();
+        assert!(e.contains("coder's turn in round 1"), "{msg}: {e}");
+        assert_eq!(kinds(&s), ["coder"], "{msg} must not be retried");
+        assert!(retries(&l.state().unwrap()).is_empty(), "{msg}");
+    }
+    // The body-read form of the timeout (`json: timeout: global ...`) is one.
+    let (s, make) = script(&[(
+        "coder",
+        vec![
+            fails_with("json: timeout: global at line 1 column 1", Some(5)),
+            text("ok", 5),
+        ],
+    )]);
+    let d = driver(log("retry-json"), make, 1_000_000);
+    d.start(contract(100_000, Some(1))).unwrap();
+    d.run().unwrap();
+    assert_eq!(&kinds(&s)[..2], ["coder", "coder"]);
+}
+
+#[test]
+fn a_scribe_timeout_is_retried_once_and_a_second_one_falls_back_as_before() {
+    let big = "x".repeat(discussion::VERBATIM_ROUND_CHARS);
+    // Retry succeeds: the digest is used.
+    let (s, make) = script(&[
+        ("coder", vec![text(&big, 100)]),
+        (
+            "scribe",
+            vec![
+                times_out(Some(30)),
+                good_scribe(&["coder and ops weighed in"]),
+            ],
+        ),
+    ]);
+    let l = log("retry-scribe");
+    let d = driver(l.clone(), make, 1_000_000);
+    d.start(contract(100_000, Some(1))).unwrap();
+    d.run().unwrap();
+    assert_eq!(kinds(&s).iter().filter(|k| *k == "scribe").count(), 2);
+    let st = l.state().unwrap();
+    assert!(matches!(st.summaries[&1], RoundSummary::Digest(_)));
+    let r = retries(&st);
+    assert_eq!(r.len(), 1, "{r:?}");
+    assert_eq!(r[0].0, "scribe");
+    assert_eq!(st.reservations[&r[0].1].what, "scribe");
+    assert_eq!(st.reservations[&r[0].1].settled, Some(30));
+    assert_eq!(
+        st.tokens_used,
+        100 + 100 + 30 + 300 + 50,
+        "every call counted"
+    );
+    // Two timeouts: the digest is refused as today, after exactly two calls.
+    let (s, make) = script(&[
+        ("coder", vec![text(&big, 100)]),
+        ("scribe", vec![times_out(Some(30)), times_out(Some(30))]),
+    ]);
+    let l = log("retry-scribe-twice");
+    let d = driver(l.clone(), make, 1_000_000);
+    d.start(contract(100_000, Some(1))).unwrap();
+    d.run().unwrap();
+    assert_eq!(kinds(&s).iter().filter(|k| *k == "scribe").count(), 2);
+    match &l.state().unwrap().summaries[&1] {
+        RoundSummary::Fallback {
+            reason,
+            contributions,
+            ..
+        } => {
+            assert!(reason.contains("the scribe failed"), "{reason}");
+            assert_eq!(contributions.len(), 2, "dissent is passed on as written");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn the_checker_is_not_retried() {
+    let (s, make) = script(&[("checker", vec![times_out(Some(10)), checker_met(1)])]);
+    let l = log("retry-checker");
+    let d = driver(l.clone(), make, 1_000_000);
+    d.start(contract(100_000, Some(1))).unwrap();
+    let out = d.run().unwrap();
+    assert_eq!(kinds(&s).iter().filter(|k| *k == "checker").count(), 1);
+    assert_ne!(out.gate, Gate::Report, "the unread checklist meets nothing");
+    assert!(retries(&l.state().unwrap()).is_empty());
+}
+
+#[test]
+fn a_retry_that_does_not_fit_the_budget_is_the_budget_stop() {
+    // The first voice times out after reporting 2,000 tokens; the retry's
+    // estimate no longer fits the 4,000 budget: the hard stop, no second call.
+    let (s, make) = script(&[("coder", vec![times_out(Some(2_000)), text("never", 1)])]);
+    let l = log("retry-budget");
+    let d = driver(l.clone(), make, 1_000_000);
+    d.start(contract(4_000, None)).unwrap();
+    let out = d.run().unwrap();
+    assert_eq!(out.gate, Gate::Escalate(Reason::Budget));
+    assert_eq!(kinds(&s), ["coder"], "the retry that did not fit never ran");
+    assert_eq!(out.tokens_used, 2_000);
+    assert!(retries(&l.state().unwrap()).is_empty());
+    // The goal's pot is a hard stop for the retry too.
+    let (s, make) = script(&[("coder", vec![times_out(Some(2_000)), text("never", 1)])]);
+    let d = driver(log("retry-pot"), make, 1_000_000);
+    d.start(contract(100_000, None)).unwrap();
+    d.pot.charge(996_000);
+    let out = d.run().unwrap();
+    assert_eq!(out.gate, Gate::Escalate(Reason::Budget));
+    assert_eq!(kinds(&s), ["coder"]);
+}

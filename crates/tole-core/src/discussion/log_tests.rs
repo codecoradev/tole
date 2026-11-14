@@ -755,3 +755,78 @@ fn a_log_reached_through_a_symlink_is_refused() {
     assert!(l.start(contract(None, 10_000), 1).is_err(), "lock");
     assert_eq!(l.state().unwrap().next(), Next::NeedContract);
 }
+
+// ------------------------------------------------ one retry on a timeout (#756)
+
+#[test]
+fn a_retry_is_one_charged_recorded_call_of_a_settled_one() {
+    let l = log("retry");
+    l.start(contract(None, 10_000), 1).unwrap();
+    let c1 = go(l.reserve(1, "participant-coder", 3_000, 2).unwrap());
+    let retry = |what: &str, round: u32, of: &str| l.reserve_retry(round, what, 100, of, 3);
+    assert!(
+        retry("participant-coder", 1, &c1).is_err(),
+        "not settled yet"
+    );
+    l.settle(&c1, 500, 4).unwrap();
+    assert!(
+        retry("participant-coder", 1, "c99").is_err(),
+        "unknown call"
+    );
+    assert!(retry("scribe", 1, &c1).is_err(), "another kind of call");
+    assert!(retry("participant-coder", 2, &c1).is_err(), "another round");
+    let c2 = go(retry("participant-coder", 1, &c1).unwrap());
+    let st = l.state().unwrap();
+    assert_eq!(st.reservations[&c2].retry_of.as_deref(), Some(c1.as_str()));
+    assert_eq!(st.reservations[&c1].retry_of, None);
+    assert_eq!(st.tokens_used, 500 + 100, "charged like any call");
+    l.settle(&c2, 80, 5).unwrap();
+    // One retry per call, and a retry is never retried: the ledger refuses
+    // both, whatever the host does.
+    let e = retry("participant-coder", 1, &c1).unwrap_err();
+    assert!(e.contains("already retried"), "{e}");
+    let e = retry("participant-coder", 1, &c2).unwrap_err();
+    assert!(e.contains("itself a retry"), "{e}");
+    assert_eq!(l.state().unwrap().tokens_used, 500 + 80);
+}
+
+#[test]
+fn a_retry_that_does_not_fit_records_the_budget_escalation() {
+    let l = log("retry-budget");
+    l.start(contract(None, 1_000), 1).unwrap();
+    let c1 = go(l.reserve(1, "participant-coder", 400, 2).unwrap());
+    l.settle(&c1, 400, 3).unwrap();
+    match l
+        .reserve_retry(1, "participant-coder", 700, &c1, 4)
+        .unwrap()
+    {
+        Reserve::Stop(g) => assert_eq!(g, Gate::Escalate(Reason::Budget)),
+        Reserve::Go(c) => panic!("a retry over the budget was reserved: {c}"),
+    }
+    let st = l.state().unwrap();
+    assert_eq!(st.gates[&1], Gate::Escalate(Reason::Budget));
+    assert_eq!(st.tokens_used, 400, "nothing was reserved");
+    assert!(matches!(st.next(), Next::Finish { .. }));
+}
+
+#[test]
+fn the_retry_note_is_an_optional_field_old_ledgers_and_readers_agree_on() {
+    // A line written before the field existed still reads, as no retry.
+    let old =
+        r#"{"seq":3,"t":1,"event":"reserve","round":1,"call":"c3","what":"scribe","tokens":5}"#;
+    let line: Line = serde_json::from_str(old).unwrap();
+    assert!(matches!(line.event, Event::Reserve { retry_of: None, .. }));
+    // An ordinary reservation is written exactly as before (no new key); a
+    // retry carries the note.
+    let ev = |retry_of: Option<&str>| Event::Reserve {
+        round: 1,
+        call: "c4".into(),
+        what: "scribe".into(),
+        tokens: 5,
+        retry_of: retry_of.map(str::to_string),
+    };
+    let plain = serde_json::to_string(&ev(None)).unwrap();
+    assert!(!plain.contains("retry_of"), "{plain}");
+    let noted = serde_json::to_string(&ev(Some("c3"))).unwrap();
+    assert!(noted.contains(r#""retry_of":"c3""#), "{noted}");
+}
