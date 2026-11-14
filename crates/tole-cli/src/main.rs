@@ -1904,13 +1904,6 @@ impl HostConfig {
     }
 }
 
-/// Memory backend resolution: `chosen` is the already-resolved backend
-/// name (`--memory` flag > `TOLE_MEMORY` env > project config, see
-/// `config_apply::Settings`); `uteke` is the only backend. The room follows
-/// the ecosystem `repo-<dir>` convention unless `TOLE_MEMORY_NAMESPACE`
-/// (kept under its old name) overrides it. A missing uteke binary degrades to a warning + no-op
-/// (the same probe contract as the uteke tools).
-#[cfg(feature = "shell-tools")]
 /// `tole discuss` (#588): the owner-only entry point.
 fn discuss_command(action: DiscussAction, cfg: Option<&tole_cli::config::Config>) -> Result<()> {
     use tole_cli::discuss;
@@ -1981,6 +1974,13 @@ fn discuss_command(action: DiscussAction, cfg: Option<&tole_cli::config::Config>
     Ok(())
 }
 
+/// Memory backend resolution: `chosen` is the already-resolved backend
+/// name (`--memory` flag > `TOLE_MEMORY` env > project config, see
+/// `config_apply::Settings`); `uteke` is the only backend. The room follows
+/// the ecosystem `repo-<dir>` convention unless `TOLE_MEMORY_NAMESPACE`
+/// (kept under its old name) overrides it. A missing uteke binary degrades to a warning + no-op
+/// (the same probe contract as the uteke tools).
+#[cfg(feature = "shell-tools")]
 fn resolve_memory(
     chosen: Option<&str>,
     profile_room: Option<&str>,
