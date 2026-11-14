@@ -441,11 +441,11 @@ pub fn secrets_lines(
             to_children.join(", ")
         }
     ));
-    out.push(
-        "  - sensitive files (.env*, *.pem, id_*, .npmrc, .netrc, *.key) read as KEY=«redacted»; \
-         to read one verbatim, approve its read_file_raw call (or start with --allow read_file_raw)"
-            .into(),
-    );
+    out.push(format!(
+        "  - sensitive files ({}) read as KEY=«redacted»; \
+         to read one verbatim, approve its read_file_raw call (or start with --allow read_file_raw)",
+        tole_core::sensitive::builtin_rules().join(", ")
+    ));
     out
 }
 
@@ -1321,6 +1321,23 @@ mod tests {
             text.contains("✓ children of run_command, job_start and cron receive: no secret"),
             "{text}"
         );
+    }
+
+    /// #683: the sensitive-files line is derived from `sensitive.rs`, so a
+    /// rule added there shows in `tole doctor` (the old text listed six).
+    #[test]
+    fn the_sensitive_files_line_lists_every_builtin_rule() {
+        let text = secrets_lines(&[], &tole_core::secret_release::Release::default()).join("\n");
+        let line = text
+            .lines()
+            .find(|l| l.contains("sensitive files"))
+            .unwrap_or_else(|| panic!("no sensitive files line: {text}"));
+        for rule in tole_core::sensitive::builtin_rules() {
+            assert!(line.contains(rule), "{rule} missing from: {line}");
+        }
+        for rule in ["*.env", "credentials", ".pgpass", "kubeconfig", "*.tfvars"] {
+            assert!(line.contains(rule), "{rule} missing from: {line}");
+        }
     }
 
     #[test]

@@ -64,27 +64,49 @@ pub fn glob_match(glob: &str, name: &str) -> bool {
     true
 }
 
+/// The built-in sensitive name globs (lowercase, `*` wildcards), the single
+/// source for [`is_sensitive_name`] and for what `tole doctor` lists. The
+/// `.docker/config.json` rule is by path, see [`BUILTIN_PATH_RULES`].
+pub const BUILTIN_NAME_GLOBS: &[&str] = &[
+    ".env*",
+    "*.env",
+    "*.env.*",
+    "*.pem",
+    "*.key",
+    "*.p12",
+    "*.pfx",
+    "*.jks",
+    "*.keystore",
+    "id_*",
+    ".npmrc",
+    ".netrc",
+    "credentials",
+    ".git-credentials",
+    ".pgpass",
+    ".htpasswd",
+    ".pypirc",
+    ".dockercfg",
+    "kubeconfig",
+    "*.tfvars",
+    "secrets.y*ml",
+];
+
+/// Built-in sensitive rules that match a path rather than a bare name.
+pub const BUILTIN_PATH_RULES: &[&str] = &[".docker/config.json"];
+
+/// Every built-in rule as shown to the user (`tole doctor`).
+pub fn builtin_rules() -> Vec<&'static str> {
+    BUILTIN_NAME_GLOBS
+        .iter()
+        .chain(BUILTIN_PATH_RULES)
+        .copied()
+        .collect()
+}
+
 /// Whether a file NAME is sensitive (case-insensitive).
 pub fn is_sensitive_name(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
-    n.starts_with(".env")
-        || n.ends_with(".env")
-        || n.contains(".env.")
-        || matches!(
-            n.as_str(),
-            ".npmrc"
-                | ".netrc"
-                | "credentials"
-                | ".git-credentials"
-                | ".pgpass"
-                | ".htpasswd"
-                | ".pypirc"
-                | ".dockercfg"
-                | "kubeconfig"
-        )
-        || n.ends_with(".tfvars")
-        || glob_match("secrets.y*ml", &n)
-        || is_key_name(&n)
+    BUILTIN_NAME_GLOBS.iter().any(|g| glob_match(g, &n))
         || EXTRA
             .read()
             .is_ok_and(|g| g.iter().any(|p| glob_match(p, &n)))
@@ -250,6 +272,55 @@ fn hide_strings(v: &mut Value) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// #683: the rule list `tole doctor` prints is the list the matcher uses.
+    /// Every glob matches a name made from it, and a name in every family
+    /// stays sensitive, so a rule cannot be added to one and not the other.
+    #[test]
+    fn the_builtin_rules_are_what_the_matcher_uses() {
+        for g in BUILTIN_NAME_GLOBS {
+            let sample = g.replace('*', "x");
+            assert!(is_sensitive_name(&sample), "{g} -> {sample}");
+            assert!(is_sensitive_name(&sample.to_ascii_uppercase()), "{g}");
+        }
+        for r in BUILTIN_PATH_RULES {
+            assert!(
+                is_sensitive_path(Path::new(r), Path::new(r)),
+                "{r} is a path rule"
+            );
+        }
+        let rules = builtin_rules();
+        for n in [
+            ".env",
+            "a.env",
+            "a.env.b",
+            "a.pem",
+            "a.key",
+            "a.p12",
+            "a.pfx",
+            "a.jks",
+            "a.keystore",
+            "id_rsa",
+            ".npmrc",
+            ".netrc",
+            "credentials",
+            ".git-credentials",
+            ".pgpass",
+            ".htpasswd",
+            ".pypirc",
+            ".dockercfg",
+            "kubeconfig",
+            "a.tfvars",
+            "secrets.yaml",
+            "secrets.yml",
+        ] {
+            assert!(is_sensitive_name(n), "{n}");
+            assert!(
+                rules.iter().any(|g| glob_match(g, n)),
+                "{n} is sensitive but not in the listed rules"
+            );
+        }
+    }
 
     #[test]
     fn sensitive_names_match_case_insensitively() {
