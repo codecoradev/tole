@@ -1156,15 +1156,32 @@ mod tests {
 
     #[test]
     fn catalog_flags_an_unreachable_provider() {
-        // Nothing listens on this port.
+        // #712: the port stays bound to a listener that hangs up on every
+        // connection. A port that was bound and then freed can be taken by
+        // another test's server in between (a mock answering `/models`, so
+        // the provider looked reachable and there was no blocker).
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = l.local_addr().unwrap().port();
-        drop(l);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        l.set_nonblocking(true).unwrap();
+        let hangup = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    match l.accept() {
+                        Ok((c, _)) => drop(c),
+                        Err(_) => std::thread::sleep(std::time::Duration::from_millis(2)),
+                    }
+                }
+            })
+        };
         let o = diagnose(
             Some(&cfg_for(format!("http://127.0.0.1:{port}/v1"), "m")),
             &no_env,
             Tier::Catalog,
         );
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        hangup.join().unwrap();
         let b = o.blocker.unwrap();
         assert_eq!(b.check, "models");
         assert!(b.fix.contains("/models"), "{}", b.fix);

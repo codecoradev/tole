@@ -70,6 +70,15 @@ fn spawn_mock(reject: bool) -> String {
     format!("http://{addr}/v1")
 }
 
+/// Serialises `fork`+`exec` of a child against the creation of a session
+/// fixture. The session's writer lock is an `flock` on an open file
+/// description, which a child forked by ANOTHER test thread duplicates until
+/// it execs; the `tole` this test then spawns saw the lock held by the test
+/// process ("session is open for writing by pid ...", #646). `spawn` returns
+/// only once the child has exec'd, so while this mutex is held no such
+/// duplicate exists.
+static SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn tole(url: &str, env: &[(&str, &str)], args: &[&str]) -> (String, String, i32) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
     cmd.args(args)
@@ -91,7 +100,11 @@ fn tole(url: &str, env: &[(&str, &str)], args: &[&str]) -> (String, String, i32)
     for (k, v) in env {
         cmd.env(k, v);
     }
-    let mut child = cmd.spawn().expect("run tole");
+    let mut child = {
+        // #646: no fork may overlap a fixture's open session (see `session`).
+        let _g = SPAWN.lock().unwrap_or_else(|p| p.into_inner());
+        cmd.spawn().expect("run tole")
+    };
     drop(child.stdin.take());
     let out = child.wait_with_output().unwrap();
     (
@@ -112,6 +125,7 @@ fn session(tag: &str, register: Option<&str>) -> std::path::PathBuf {
             .as_nanos()
     ));
     std::fs::create_dir_all(&dir).unwrap();
+    let _g = SPAWN.lock().unwrap_or_else(|p| p.into_inner());
     let mut s = JsonlStorage::create(&dir, "s-eff", None).unwrap();
     if let Some(level) = register {
         s.commit(Commit::new().register(RegisterWrite::set(
@@ -200,4 +214,41 @@ fn a_rejecting_provider_still_answers_without_the_parameter() {
     assert_eq!(code, 0, "{err}");
     assert!(out.contains("EFFORT::none"), "{out}\n{err}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #646: children forked by other threads must not leave the fixture's
+/// session locked for the `tole` that resumes it. Six threads keep
+/// spawning `tole` while the main thread repeatedly writes a session and
+/// resumes it; every resume must be answered.
+#[test]
+fn a_resume_is_never_refused_by_children_forked_by_other_threads() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let url = spawn_mock(false);
+    let stop = Arc::new(AtomicBool::new(false));
+    let spawners: Vec<_> = (0..6)
+        .map(|_| {
+            let (stop, url) = (stop.clone(), url.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = tole(&url, &[], &["--version"]);
+                }
+            })
+        })
+        .collect();
+    let mut failures = Vec::new();
+    for i in 0..200 {
+        let dir = session("fork-race", Some("high"));
+        let (out, err, code) = resume(&url, &[], &dir);
+        if code != 0 || !out.contains("EFFORT::high") {
+            failures.push(format!("round {i}: code {code}: {err}"));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    stop.store(true, Ordering::Relaxed);
+    for t in spawners {
+        t.join().unwrap();
+    }
+    assert!(failures.is_empty(), "{failures:?}");
 }

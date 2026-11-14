@@ -214,6 +214,47 @@ fn a_reopen_after_drop_survives_children_forked_by_other_threads() {
     );
 }
 
+/// Stands in for a forked child's duplicate of a closed lock descriptor:
+/// a thread takes the sidecar lock of session `id`, writes our own pid in
+/// it, and holds it for `ms` milliseconds. Returns once the lock is held.
+fn hold_as_duplicate(dir: &std::path::Path, id: &str, ms: u64) -> std::thread::JoinHandle<()> {
+    drop(JsonlStorage::create(dir, id, None).unwrap());
+    let lock_path = dir.join(format!("{id}.jsonl.lock"));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        // Children forked by other tests of this binary can still hold a
+        // duplicate of the lock `create` just released: wait for it.
+        while f.try_lock().is_err() {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        f.set_len(0).unwrap();
+        write!(f, "{}", std::process::id()).unwrap();
+        tx.send(()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    });
+    rx.recv().unwrap();
+    holder
+}
+
+/// #712: a forked child that has not exec'd yet can keep a duplicate of the
+/// closed lock descriptor for much longer than 150 ms on a starved machine
+/// (one CPU, heavy load). The hold names our own pid but no handle of this
+/// process owns it, so the reopen waits it out. The duplicate is simulated
+/// by a thread holding the sidecar lock, with our pid in it, for 700 ms.
+#[test]
+fn a_reopen_waits_out_a_long_lived_duplicate_of_a_closed_lock() {
+    let dir = tmpdir("long-dup");
+    let holder = hold_as_duplicate(&dir, "d", 700);
+    let s = JsonlStorage::open(dir.join("d.jsonl"));
+    assert!(s.is_ok(), "{:?}", s.err());
+    holder.join().unwrap();
+}
+
 /// The retry must not blur the two real refusals: another process holding
 /// the session fails at once, and a second open in THIS process (#475) still
 /// fails, after at most the bounded retry.
@@ -254,13 +295,9 @@ fn real_second_opens_are_still_refused_within_the_bound() {
 #[test]
 fn the_pid_is_written_cleanly_after_a_retried_acquisition() {
     let dir = tmpdir("retry-pid");
-    let held = JsonlStorage::create(&dir, "r", None).unwrap();
-    let releaser = std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(40));
-        drop(held);
-    });
-    // Blocks (retrying: the holder is our own pid) until the other thread
-    // drops its writer, then takes the lock.
+    let releaser = hold_as_duplicate(&dir, "r", 40);
+    // Blocks (retrying: the holder is our own pid, but no handle of ours)
+    // until the duplicate is released, then takes the lock.
     let reopened = JsonlStorage::open(dir.join("r.jsonl")).expect("retry rides out the release");
     releaser.join().unwrap();
     let text = std::fs::read(dir.join("r.jsonl.lock")).unwrap();
