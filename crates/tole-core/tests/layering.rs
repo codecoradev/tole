@@ -30,10 +30,8 @@ use std::path::Path;
 const KERNEL_MODULES: &[&str] = &[
     "tools",
     "entry", "register", "state", "storage", "machine", "paths", "secrets",
-    "sanitize", "safe_dir", "tool", "approval", "provider", "openai", "mock",
-    "failover", "cancel", "interrupt", "image", "ledger", 
-    "turn", "gate", "replay", "hooks", "subprocess", "process_guard",
-    "sandbox", "systemone",
+    "sanitize", "safe_dir", "tool", "approval", "provider", "cancel", "interrupt",
+    "ledger", "turn", "gate", "hooks", "subprocess", "process_guard", "sandbox", "systemone",
 ];
 #[rustfmt::skip]
 const ENGINE_MODULES: &[&str] = &[
@@ -58,6 +56,11 @@ const BASELINE: &[(&str, &str, &str)] = &[
 const ALIASES: &[(&str, &str)] = &[
     ("compaction", "turn"),
     ("transcript", "turn"),
+    ("openai", "provider"),
+    ("failover", "provider"),
+    ("mock", "provider"),
+    ("replay", "provider"),
+    ("image", "provider"),
     ("file_tools", "tools"),
     ("read_file", "tools"),
     ("todo", "tools"),

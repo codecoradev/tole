@@ -53,7 +53,6 @@ pub use integrations::uteke;
 #[doc(inline)]
 pub use integrations::verify_package;
 pub mod entry;
-pub mod failover;
 pub mod tools;
 // `tools/` holds these modules; the re-exports keep the old top-level paths working.
 #[doc(inline)]
@@ -79,7 +78,6 @@ pub mod discussion;
 pub use discussion::log as discussion_log;
 pub(crate) mod gate;
 pub mod handoff;
-pub mod image;
 pub mod interrupt;
 pub mod ledger;
 // `ledger/` holds the modules below; these re-exports keep the old top-level paths working.
@@ -105,13 +103,21 @@ pub mod mcp;
 pub mod mcp_server;
 #[cfg(feature = "shell-tools")]
 pub mod memory;
-pub mod mock;
-pub mod openai;
 pub mod paths;
 pub mod process_guard;
 pub mod provider;
+// `provider/` holds the modules below; these re-exports keep the old top-level paths working.
+#[doc(inline)]
+pub use provider::failover;
+#[doc(inline)]
+pub use provider::image;
+#[doc(inline)]
+pub use provider::mock;
+#[doc(inline)]
+pub use provider::openai;
+#[doc(inline)]
+pub use provider::replay;
 pub mod register;
-pub mod replay;
 pub mod router;
 #[cfg(feature = "shell-tools")]
 pub mod run_command;
