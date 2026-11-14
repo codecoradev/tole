@@ -26,8 +26,10 @@
 //! thread; native code talks to it over an mpsc channel with a
 //! hard timeout (the same discipline as run_with_timeout).
 
+mod probe;
 use crate::subprocess::SUBPROCESS_TIMEOUT;
 use crate::tool::{Risk, Tool};
+pub use probe::{probe_manifest, probe_manifest_within};
 use serde_json::{json, Value};
 use std::sync::mpsc;
 use std::sync::OnceLock;
