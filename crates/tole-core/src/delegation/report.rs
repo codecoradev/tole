@@ -209,5 +209,5 @@ impl Tool for DelegateReportTool {
 }
 
 #[cfg(test)]
-#[path = "delegation_report_tests.rs"]
+#[path = "report_tests.rs"]
 mod tests;

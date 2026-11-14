@@ -32,11 +32,11 @@ const KERNEL_MODULES: &[&str] = &[
     "sanitize", "safe_dir", "tool", "approval", "provider", "openai", "mock",
     "failover", "cancel", "interrupt", "image", "ledger", "cron", "tz", "webhook", "transcript",
     "turn", "compaction", "gate", "replay", "hooks", "subprocess", "process_guard",
-    "resource_guard", "sandbox", "file_tools", "read_file", "todo", "systemone",
+    "sandbox", "file_tools", "read_file", "todo", "systemone",
 ];
 #[rustfmt::skip]
 const ENGINE_MODULES: &[&str] = &[
-    "delegation", "delegation_approvals", "delegation_report", "discussion",
+    "delegation", "discussion",
     "router", "advisor", "skills", "skill_approval", "skill_curator", "skill_draft",
     "skill_index", "web", "mcp", "plugin_lock", "agents", "child_env", "handoff",
     "sibling_watch", "session_guard", "run_command", "jobs", "memory", "uteke", "gh", "git",
@@ -57,6 +57,9 @@ const BASELINE: &[(&str, &str, &str)] = &[
 /// Old top-level paths that are now re-exports of a module inside another one.
 const ALIASES: &[(&str, &str)] = &[
     ("discussion_log", "discussion"),
+    ("delegation_approvals", "delegation"),
+    ("delegation_report", "delegation"),
+    ("resource_guard", "delegation"),
     ("secret_release", "secrets"),
     ("sensitive", "secrets"),
 ];
