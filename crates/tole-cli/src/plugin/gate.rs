@@ -249,13 +249,21 @@ impl Gate {
     }
 }
 
-/// One note per server the ledger blocked.
+/// One note per server the ledger blocked, and one when the ledger could
+/// not be read at all.
 pub fn blocked_notes(check: &plugin_lock::LedgerCheck) -> Vec<String> {
-    check
+    let mut notes: Vec<String> = check
         .blocked
         .iter()
         .map(|(s, why)| format!("plugin lock: `{s}` is not trusted: {why}"))
-        .collect()
+        .collect();
+    if let Some(why) = &check.unreadable {
+        notes.push(format!(
+            "plugin ledger unreadable ({why}): revocations recorded there are not checked \
+             against the lock until it is fixed"
+        ));
+    }
+    notes
 }
 
 /// Marks `lock`'s entries the owner's ledger does not allow (see
@@ -265,12 +273,18 @@ pub fn apply_ledger(
     user: &Path,
     lock: &mut BTreeMap<String, LockEntry>,
 ) -> plugin_lock::LedgerCheck {
-    let Some(text) = user
-        .parent()
-        .map(|d| d.join(plugin_lock::LEDGER_FILE))
-        .and_then(|p| plugin_lock::read_ledger(&p))
-    else {
+    let Some(path) = user.parent().map(|d| d.join(plugin_lock::LEDGER_FILE)) else {
         return plugin_lock::LedgerCheck::default();
+    };
+    let text = match plugin_lock::read_ledger(&path) {
+        Ok(Some(t)) => t,
+        Ok(None) => return plugin_lock::LedgerCheck::default(),
+        Err(why) => {
+            return plugin_lock::LedgerCheck {
+                unreadable: Some(why),
+                ..Default::default()
+            }
+        }
     };
     let check = plugin_lock::check_against_ledger(lock, &text);
     for (name, _) in &check.blocked {

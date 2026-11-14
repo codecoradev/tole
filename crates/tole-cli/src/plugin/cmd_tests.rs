@@ -913,3 +913,26 @@ fn a_remote_probe_never_carries_a_bearer_token_to_an_unapproved_url() {
     assert!(!e.contains("bearer-0600-secret"));
     assert!(!h.user().exists());
 }
+
+#[cfg(unix)]
+#[test]
+fn an_unreadable_ledger_is_said_not_silently_skipped() {
+    let h = H::new("badledger", &["cora"]);
+    h.run(&v1(), approve("cora", Some(&hash(&v1())))).unwrap();
+    let ledger = h.user().with_file_name(plugin_lock::LEDGER_FILE);
+    // A ledger that is a symlink is not followed: the check cannot be made.
+    let real = h.dir.join("elsewhere.jsonl");
+    std::fs::rename(&ledger, &real).unwrap();
+    std::os::unix::fs::symlink(&real, &ledger).unwrap();
+    let out = h.run(&v1(), LIST).unwrap();
+    assert!(out.contains("plugin ledger unreadable"), "{out}");
+    let gate = Gate::load(Some(h.user()), &h.dir.join("ws"));
+    assert!(gate
+        .notes
+        .iter()
+        .any(|n| n.contains("plugin ledger unreadable")));
+    // Missing is not an error: there is nothing to compare.
+    std::fs::remove_file(&ledger).unwrap();
+    let out = h.run(&v1(), LIST).unwrap();
+    assert!(!out.contains("ledger unreadable"), "{out}");
+}
