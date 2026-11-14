@@ -79,11 +79,14 @@ impl Gate {
                 };
             }
         };
-        let (mut lock, more) = plugin_lock::effective(&user_lock, &project);
-        notes.extend(more);
+        // The ledger holds the user's decisions: it is checked against the
+        // user lock, before a project lock narrows it.
+        let mut user_lock = user_lock;
         if let Some(u) = user.as_deref() {
-            notes.extend(blocked_notes(&apply_ledger(u, &mut lock)));
+            notes.extend(blocked_notes(&apply_ledger(u, &mut user_lock)));
         }
+        let (lock, more) = plugin_lock::effective(&user_lock, &project);
+        notes.extend(more);
         Self {
             lock,
             notes,
@@ -263,10 +266,7 @@ pub fn blocked_notes(check: &plugin_lock::LedgerCheck) -> Vec<String> {
 /// Marks `lock`'s entries the owner's ledger does not allow (see
 /// [`plugin_lock::check_against_ledger`]) as revoked, so a lock edited by
 /// hand cannot bring back a revoked server or re-pin an approved one.
-pub fn apply_ledger(
-    user: &Path,
-    lock: &mut BTreeMap<String, LockEntry>,
-) -> plugin_lock::LedgerCheck {
+pub fn apply_ledger(user: &Path, lock: &mut Lockfile) -> plugin_lock::LedgerCheck {
     let Some(path) = user.parent().map(|d| d.join(plugin_lock::LEDGER_FILE)) else {
         return plugin_lock::LedgerCheck::default();
     };
@@ -280,9 +280,9 @@ pub fn apply_ledger(
             }
         }
     };
-    let check = plugin_lock::check_against_ledger(lock, &text);
+    let check = plugin_lock::check_against_ledger(&lock.servers, &text);
     for (name, _) in &check.blocked {
-        if let Some(e) = lock.get_mut(name) {
+        if let Some(e) = lock.servers.get_mut(name) {
             e.revoked = true;
         }
     }

@@ -238,15 +238,15 @@ fn list(ctx: &Ctx<'_>, as_json: bool) -> String {
         }
         None => Lockfile::default(),
     };
-    let user = load(ctx.user.clone(), "user");
+    let mut user = load(ctx.user.clone(), "user");
     let project = load(Some(ctx.project_path()), "project");
     let broken = !notes.is_empty();
-    let (mut eff, more) = plugin_lock::effective(&user, &project);
-    notes.extend(more);
     // A lock edited by hand cannot bring back what the ledger says was
-    // revoked: such an entry is shown and treated as revoked.
+    // revoked: such an entry is shown and treated as revoked. The ledger
+    // records the USER's decisions, so it is compared with the user lock,
+    // before a project lock narrows it.
     if let Some(u) = ctx.user.as_deref().filter(|_| !broken) {
-        let check = apply_ledger(u, &mut eff);
+        let check = apply_ledger(u, &mut user);
         notes.extend(blocked_notes(&check));
         notes.extend(check.unrecorded.iter().map(|n| {
             format!(
@@ -255,6 +255,8 @@ fn list(ctx: &Ctx<'_>, as_json: bool) -> String {
             )
         }));
     }
+    let (eff, more) = plugin_lock::effective(&user, &project);
+    notes.extend(more);
     let names: BTreeSet<String> = ctx
         .specs
         .iter()
@@ -395,12 +397,13 @@ fn diff(ctx: &Ctx<'_>, name: &str) -> Result<String, String> {
     // The merged lock, as `list` and a session see it: a project entry can
     // revoke or re-pin, and then the server must not be started here either.
     let project = Lockfile::load(&ctx.project_path())?;
-    let (mut eff, _) = plugin_lock::effective(&user, &project);
+    let mut user = user;
     let ledger_notes = ctx
         .user
         .as_deref()
-        .map(|u| blocked_notes(&apply_ledger(u, &mut eff)))
+        .map(|u| blocked_notes(&apply_ledger(u, &mut user)))
         .unwrap_or_default();
+    let (eff, _) = plugin_lock::effective(&user, &project);
     let Some(e) = eff.get(name) else {
         return Ok(format!(
             "`{}` is not in your plugin lock; `tole plugin approve {}` shows its tools\n",
