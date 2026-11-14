@@ -4,7 +4,7 @@ Status: design for #714 (parent #583); the owner's answers to the open
 questions are in section 12. PR 1 (records and fold) implements section 3,
 PR 2 (request builder, caps, the parked approver) section 4.1, PR 3 (the
 owner's command and the audit section) section 5.2 and 6, PR 4 (serve) the
-second bullet of 5.2.
+second bullet of 5.2, PR 5 (agent levels) section 5.1.
 Owner decision of 2026-11-14 (in the body of #714): a delegated child that cannot
 decide an approval escalates it up the delegation chain, level by level
 (child, parent, grandparent, ..., the owner), until a level can decide it.
@@ -245,6 +245,15 @@ a discussion participant (no `TOLE_DISCUSSION_PARTICIPANT`), and whose
 allow list holds a `delegate_decide` pattern (the owner or the parent put
 it there; `child_allow` passes it down only if the parent covers it). A node
 without the pattern is `skipped: no_decide_tool` in every chain.
+
+**As built (PR 5).** Registration is `Delegator::grants_decide`: mode `chain`,
+and the session's own allow list holds the grant (`has_decide_tool`). The
+tools live in `delegate_decide.rs`; `delegate_pending` shows ids, level, child
+and time left as structure and everything the child wrote (display, input) as
+redacted, capped, fenced data. `delegate_decide`'s refusals come from the
+fold's rules (the request names its eligible levels, computed from each
+level's recorded allow list), plus a running check and a closed input. The
+`awaiting_approval` count in `delegate_poll` is not built.
 
 - `delegate_pending` (`Risk::ReadOnly`): requests whose **current level** is
   this node. Output is data: fenced, redacted, capped (the `discuss_status`

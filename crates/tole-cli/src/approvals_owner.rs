@@ -58,7 +58,7 @@ fn cap(s: &str, max: usize) -> String {
 
 /// Data for the terminal: redacted first (so a secret is matched whole),
 /// control characters other than newline dropped, capped.
-fn block(secrets: &SecretSet, s: &str, max: usize) -> String {
+pub(crate) fn block(secrets: &SecretSet, s: &str, max: usize) -> String {
     let redacted = secrets.redact(s);
     let clean: String = redacted
         .chars()
@@ -69,7 +69,7 @@ fn block(secrets: &SecretSet, s: &str, max: usize) -> String {
 
 /// `text` between fences longer than any run of `~` it holds, so it cannot
 /// close its own fence.
-fn fenced(label: &str, text: &str) -> String {
+pub(crate) fn fenced(label: &str, text: &str) -> String {
     let mut fence = "~~~".to_string();
     while text.contains(&fence) {
         fence.push('~');

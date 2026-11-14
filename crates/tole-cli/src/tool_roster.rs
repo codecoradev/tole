@@ -376,6 +376,18 @@ fn build_with_data_dir(
                 }),
             )?;
         }
+        // The agent-level approval tools (#714) exist where `delegate` does,
+        // in `chain` mode, for a level whose allow list grants them.
+        if host.grants_decide() {
+            add(
+                &mut reg,
+                Box::new(crate::delegate_decide::DelegatePendingTool { host: host.clone() }),
+            )?;
+            add(
+                &mut reg,
+                Box::new(crate::delegate_decide::DelegateDecideTool { host: host.clone() }),
+            )?;
+        }
         // The discussion tools (#588) exist exactly where `delegate` does:
         // the same host, so the same depth limit, and they need a provider.
         if let (Some(data), Some(pc)) = (
@@ -848,6 +860,56 @@ mod tests {
         plan.plan_mode = true;
         let reg = build(Human, plan).unwrap();
         assert!(all.iter().all(|t| reg.get(t).is_none()));
+    }
+
+    /// #714: the agent-level approval tools come with `delegate`, in `chain`
+    /// mode, for a level whose allow list grants them; never in `off` or
+    /// `owner` mode, without the grant, or in plan mode.
+    #[test]
+    fn approval_tools_come_only_in_chain_mode_with_a_grant() {
+        let ws = workspace("decide-roster");
+        let build_with = |mode: &str, allows: &[&str], plan: bool| {
+            let cfg = crate::config::parse(
+                &format!("[delegation]\napprovals = \"{mode}\"\n"),
+                std::path::Path::new("u.toml"),
+            )
+            .unwrap();
+            let mut roster = Roster::new(ws.clone());
+            roster.agents = Some(AgentTools {
+                parent_allows: allows.iter().map(|s| s.to_string()).collect(),
+                delegation: Some(crate::delegate::Setup {
+                    cfg,
+                    data_dir: Some(ws.join("data")),
+                    ..Default::default()
+                }),
+                ..AgentTools::default()
+            });
+            roster.plan_mode = plan;
+            build(Human, roster).unwrap()
+        };
+        let both = |reg: &ToolRegistry| {
+            (
+                reg.get("delegate_pending").map(|t| t.risk()),
+                reg.get("delegate_decide").map(|t| t.risk()),
+            )
+        };
+        let reg = build_with("chain", &["delegate_decide"], false);
+        assert!(reg.get("delegate").is_some());
+        assert_eq!(both(&reg), (Some(Risk::ReadOnly), Some(Risk::Write)));
+        for (mode, allows) in [
+            ("off", &["delegate_decide"][..]),
+            ("owner", &["delegate_decide"][..]),
+            ("chain", &[][..]),
+            ("chain", &["write_file"][..]),
+        ] {
+            let reg = build_with(mode, allows, false);
+            assert!(reg.get("delegate").is_some(), "{mode}");
+            assert_eq!(both(&reg), (None, None), "{mode} {allows:?}");
+        }
+        assert_eq!(
+            both(&build_with("chain", &["delegate_decide"], true)),
+            (None, None)
+        );
     }
 
     /// #581: `cron_create` is a session face's tool. A cron run (no
