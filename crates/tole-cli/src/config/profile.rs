@@ -193,11 +193,8 @@ fn read_persona(path: &Path) -> Result<String, String> {
 mod tests {
     use super::*;
 
-    fn tmp(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("tole-profile-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
+    fn tmp(tag: &str) -> crate::test_dir::TestDir {
+        crate::test_dir::TestDir::new(&format!("tole-profile-{tag}"))
     }
 
     fn cfg(src: &str) -> Config {
@@ -244,7 +241,6 @@ system_prompt_file = "missing-on-purpose.md"
         // resolving `coder` never touched it.
         let err = Profile::resolve(&cfg(TWO), "reviewer", Some(&d), Some(&home)).unwrap_err();
         assert!(err.contains("missing-on-purpose.md"), "{err}");
-        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
@@ -369,6 +365,5 @@ system_prompt_file = "missing-on-purpose.md"
         let c = cfg("[profiles.a]\nsystem_prompt_file = \"rel.md\"\n");
         let e = Profile::resolve(&c, "a", None, None).unwrap_err();
         assert!(e.contains("cannot resolve"), "{e}");
-        let _ = std::fs::remove_dir_all(&d);
     }
 }
