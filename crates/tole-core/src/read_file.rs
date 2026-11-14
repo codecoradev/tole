@@ -113,8 +113,8 @@ impl Tool for ReadFileTool {
 
     fn summary(&self) -> String {
         if self.raw {
-            return "Read a sensitive file (.env*, *.pem, id_*, .npmrc, .netrc, *.key) VERBATIM, \
-                    values included. Needs the user's approval; use read_file for anything else."
+            return "Read a sensitive file (one read_file redacts) VERBATIM, values included. \
+                    Needs the user's approval; use read_file for anything else."
                 .into();
         }
         "Read a text file inside the workspace. Returns at most 20000 chars; if `truncated`, \
@@ -573,6 +573,21 @@ mod tests {
         let out = t.execute(json!({"path": "a.rs"})).unwrap();
         assert_eq!(out["content"], json!("fn a() {}\n"));
         assert!(out.get("redacted").is_none());
+    }
+
+    /// The raw tool's description points at the sensitive-file rule instead
+    /// of listing names, so it cannot drift from `sensitive.rs`.
+    #[test]
+    fn raw_summary_does_not_enumerate_sensitive_names() {
+        let summary = ReadFileTool::raw(std::env::temp_dir()).summary();
+        assert_eq!(
+            summary,
+            "Read a sensitive file (one read_file redacts) VERBATIM, values included. \
+             Needs the user's approval; use read_file for anything else."
+        );
+        for glob in crate::sensitive::BUILTIN_NAME_GLOBS {
+            assert!(!summary.contains(glob), "summary lists {glob}");
+        }
     }
 
     /// A FIFO named like a secret never hangs the read (opened without
