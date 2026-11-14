@@ -103,7 +103,10 @@ fn owner_commands() -> Vec<Vec<&'static str>> {
         vec!["delegation", "approvals", "deny", "dap-1-abcdefgh"],
     ];
     #[cfg(feature = "mcp")]
-    v.push(vec!["plugin", "approve", "evil", "--hash", "sha256:00"]);
+    {
+        v.push(vec!["plugin", "approve", "evil", "--hash", "sha256:00"]);
+        v.push(vec!["plugin", "revoke", "evil", "--hash", "sha256:00"]);
+    }
     v
 }
 

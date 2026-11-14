@@ -402,3 +402,41 @@ fn admit_unseen_decides_without_the_tool_list() {
     );
     assert_eq!(go("s", "stdio:srv a", "sha256:aa"), None);
 }
+
+#[test]
+fn the_ledger_blocks_a_lock_edited_back_or_re_pinned() {
+    let entry = |h: &str, revoked| LockEntry {
+        manifest_hash: h.into(),
+        revoked,
+        ..Default::default()
+    };
+    let line = |ev: &str, s: &str, h: &str| ledger_line(ev, s, h, 1);
+    let ledger = [
+        line("approve", "a", "sha256:1"),
+        line("revoke", "a", "sha256:1"),
+        line("approve", "b", "sha256:2"),
+        line("manifest_change", "b", "sha256:9"),
+        line("approve", "c", "sha256:3"),
+        "not json\n".to_string(),
+        "{\"kind\":\"other\",\"event\":\"revoke\",\"server\":\"d\"}\n".to_string(),
+    ]
+    .concat();
+    let mut lock = BTreeMap::new();
+    lock.insert("a".to_string(), entry("sha256:1", false)); // edited back
+    lock.insert("b".to_string(), entry("sha256:2", false)); // fine
+    lock.insert("c".to_string(), entry("sha256:evil", false)); // re-pinned
+    lock.insert("d".to_string(), entry("sha256:4", false)); // never recorded
+    lock.insert("e".to_string(), entry("sha256:5", true)); // already revoked
+    let c = check_against_ledger(&lock, &ledger);
+    let blocked: Vec<&str> = c.blocked.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(blocked, vec!["a", "c"]);
+    assert_eq!(c.unrecorded, vec!["d".to_string()]);
+    // An approve after the revoke lifts it.
+    let again = format!("{ledger}{}", line("approve", "a", "sha256:1"));
+    assert!(!check_against_ledger(&lock, &again)
+        .blocked
+        .iter()
+        .any(|(n, _)| n == "a"));
+    // No ledger lines at all: nothing to compare.
+    assert_eq!(check_against_ledger(&lock, ""), LedgerCheck::default());
+}
