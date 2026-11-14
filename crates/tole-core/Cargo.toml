@@ -57,5 +57,21 @@ name = "mcp_secret_grant"
 required-features = ["mcp"]
 
 [[test]]
+name = "mcp_sandbox"
+required-features = ["mcp"]
+
+[[test]]
+name = "mcp_sandbox_off"
+required-features = ["mcp"]
+
+[[test]]
+name = "mcp_sandbox_lifecycle"
+required-features = ["mcp"]
+
+[[test]]
+name = "mcp_sandbox_idle"
+required-features = ["mcp"]
+
+[[test]]
 name = "mcp_http"
 required-features = ["mcp"]

@@ -1,11 +1,12 @@
 # Sandbox for third-party servers and model commands — design note
 
 Status: **design with owner decisions of 2026-11-14 (§16); #601, epic
-#594.** The first slice is built in two PRs: the core module
-`tole_core::sandbox` (profiles, the bwrap argument builder, grant checks,
-backend detection and the launch plan; unit-tested, not wired yet), then
-its wiring into the stdio MCP launch, the `[sandbox]` config and
-`tole doctor`. Builds on [third-party-plugins-design.md](third-party-plugins-design.md)
+#594.** The first slice is implemented: the core module
+`tole_core::sandbox` and its wiring into the stdio MCP launch (opt-in
+`[sandbox]` in the user config: `mode` off, optional or required,
+profiles `server` and `strict`, network `none` or `host`, connections
+keyed by server name and workspace) and a `tole doctor` line; the rest of
+§15 is not. Builds on [third-party-plugins-design.md](third-party-plugins-design.md)
 §4.2–4.3 and [secrets-integrations-design.md](secrets-integrations-design.md),
 and on the #594 audit (#675–#684). The feasibility results in §3 were
 measured on 2026-11-13 in a Linux container (kernel 6.18, Ubuntu 24.04).
@@ -334,6 +335,21 @@ Notes per consumer:
 - Child agents (`agent_start`, `delegate`) are tole processes with their own
   tools; they are not wrapped. Their own model commands follow their own
   `[sandbox.consumers]`.
+
+### 9.1.1 Life of a sandboxed server
+
+A wrapped stdio server is keyed by server name and resolved workspace, and
+belongs to the sessions that registered it: each session's tool registry
+holds a claim, and the server is stopped (process killed, config dropped)
+when the last claim is released, so dropping one session never stops a
+server another session with the same key still uses. A server unused for
+`[sandbox] idle_secs` (default 900, 1 to 86400) is stopped too and starts
+again on its session's next call. `[sandbox] max_servers` (default 16, 1 to
+64) caps the wrapped servers a process runs at once: a launch past it is
+refused with a message naming the limit, never by evicting another
+session's server, and a released slot is reusable. Servers that are not
+wrapped (sandbox off, HTTP, skipped) keep the old process-lifetime
+behaviour.
 
 ## 10. Failure behaviour
 

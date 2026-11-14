@@ -112,6 +112,9 @@ const REQUEST_READ_DEADLINE: Duration = Duration::from_secs(15);
 const UPLOAD_READ_DEADLINE: Duration = Duration::from_secs(120);
 
 pub fn run_serve(cfg: ServeConfig) -> Result<()> {
+    // No human answers a serve session's start-up: an `optional` sandbox
+    // counts as `required` here (#601).
+    tole_core::sandbox::mark_unattended();
     let token = resolve_token(&cfg.token)?;
     let workspace_root = crate::resolve_workspace_root(cfg.workspace.as_ref())
         .context("resolving --workspace for the session jail root")?;

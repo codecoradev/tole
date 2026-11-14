@@ -70,6 +70,12 @@ enum McpRequest {
         uri: String,
         resp: mpsc::Sender<Result<String, String>>,
     },
+    /// A session registered a sandboxed server under `key` (#601).
+    Acquire { key: String },
+    /// A session that held `key` ended; the last one stops the server.
+    Release { key: String },
+    /// How many server connections are live (diagnostics, tests).
+    Count { resp: mpsc::Sender<usize> },
 }
 
 /// Handle to the single background runtime. Spawned lazily on first
@@ -106,9 +112,48 @@ pub struct McpServerConfig {
     /// grant its plugin-lock approval recorded. `None` (an embedder without
     /// a lock): whatever the `[secrets]` release binds to `mcp`.
     pub secret_grant: Option<Vec<String>>,
+    /// The workspace of the session that owns this server: what a
+    /// sandboxed stdio server binds (#601). `None`: the current directory.
+    pub workspace: Option<std::path::PathBuf>,
+}
+
+/// Identity of a server's connection in the reactor. Plain `name` unless the
+/// sandbox wraps this stdio server (#601): then `name@<workspace>`, so two
+/// sessions of one process that register the same server name with
+/// different workspaces get two server processes, each with its own
+/// workspace bind, and a session can only reach the server started for its
+/// own workspace. Without a sandbox the key is the name, as before.
+pub fn conn_key_for(name: &str, workspace: Option<&std::path::Path>) -> String {
+    let wrapped = crate::sandbox::policy()
+        .is_some_and(|p| p.mode != crate::sandbox::Mode::Off && !p.skip.iter().any(|s| s == name));
+    if !wrapped {
+        return name.to_string();
+    }
+    let ws = workspace
+        .map(std::path::Path::to_path_buf)
+        .or_else(|| std::env::current_dir().ok())
+        .map(|w| std::fs::canonicalize(&w).unwrap_or(w));
+    match ws {
+        Some(w) => format!("{name}@{}", w.display()),
+        None => name.to_string(),
+    }
+}
+
+/// The server name of a connection key (the part before `@`).
+fn key_name(key: &str) -> &str {
+    key.split('@').next().unwrap_or(key)
 }
 
 impl McpServerConfig {
+    /// This server's reactor connection key (see [`conn_key_for`]); HTTP
+    /// servers are not sandboxed and keep their name.
+    pub fn conn_key(&self) -> String {
+        match self.transport {
+            McpTransport::Stdio { .. } => conn_key_for(&self.name, self.workspace.as_deref()),
+            McpTransport::Http { .. } => self.name.clone(),
+        }
+    }
+
     /// Parse `name=prog arg1 arg2 ...` (stdio) or `name=https://host/path`
     /// (Streamable HTTP).
     pub fn parse(spec: &str) -> Result<Self, String> {
@@ -135,6 +180,7 @@ impl McpServerConfig {
                 name: name.to_string(),
                 transport: McpTransport::Http { url: command },
                 secret_grant: None,
+                workspace: None,
             });
         }
         Ok(Self {
@@ -144,6 +190,7 @@ impl McpServerConfig {
                 args: parts.map(str::to_string).collect(),
             },
             secret_grant: None,
+            workspace: None,
         })
     }
 }
@@ -348,6 +395,21 @@ fn scrub_err(cfg: &McpServerConfig, mut msg: String) -> String {
     msg
 }
 
+/// The config registered under `key`; a sandbox key (`name@workspace`) that
+/// was never registered falls back to the plain name only for servers the
+/// sandbox does not wrap (HTTP, or skipped), never to another workspace's.
+fn lookup(
+    configs: &std::collections::HashMap<String, McpServerConfig>,
+    key: &str,
+) -> Option<McpServerConfig> {
+    configs.get(key).cloned().or_else(|| {
+        configs
+            .get(key_name(key))
+            .filter(|c| c.conn_key() == c.name)
+            .cloned()
+    })
+}
+
 /// Spawn the background tokio reactor if not yet running. Returns the
 /// request channel.
 fn runtime() -> mpsc::Sender<McpRequest> {
@@ -370,7 +432,19 @@ fn runtime() -> mpsc::Sender<McpRequest> {
                         // Serialized request handling: MCP servers are
                         // single-stdio and tole is single-agent; no need
                         // for concurrency inside the reactor.
-                        while let Ok(req) = rx.recv() {
+                        // Sessions holding each wrapped server (#601).
+                        let mut refs: std::collections::HashMap<String, usize> =
+                            std::collections::HashMap::new();
+                        loop {
+                            let req = match rx.recv_timeout(reap_tick()) {
+                                Ok(r) => r,
+                                Err(mpsc::RecvTimeoutError::Timeout) => {
+                                    reap_idle(&mut conns);
+                                    continue;
+                                }
+                                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                            };
+                            reap_idle(&mut conns);
                             // Every operation is bounded INSIDE the
                             // reactor (CodeCora: the sync side's
                             // recv_timeout abandons but cannot cancel a
@@ -380,14 +454,14 @@ fn runtime() -> mpsc::Sender<McpRequest> {
                             // reconnects.
                             match req {
                                 McpRequest::ListTools { config, resp } => {
-                                    configs.insert(config.name.clone(), config.clone());
+                                    configs.insert(config.conn_key(), config.clone());
                                     let op = with_connection(&config, &mut conns, |c| {
                                         Box::pin(async move { c.list_tools().await })
                                     });
                                     let r = match tokio::time::timeout(SUBPROCESS_TIMEOUT, op).await {
                                         Ok(r) => r,
                                         Err(_) => {
-                                            conns.remove(&config.name);
+                                            conns.remove(&config.conn_key());
                                             Err(format!(
                                                 "mcp {:?}: tools/list timed out; connection dropped",
                                                 config.name
@@ -404,7 +478,8 @@ fn runtime() -> mpsc::Sender<McpRequest> {
                                 } => {
                                     let Some(config) = configs.get(&server).cloned() else {
                                         let _ = resp.send(Err(format!(
-                                            "mcp server {server:?} was never registered"
+                                            "mcp server {:?} was never registered",
+                                            key_name(&server)
                                         )));
                                         continue;
                                     };
@@ -417,7 +492,8 @@ fn runtime() -> mpsc::Sender<McpRequest> {
                                         Err(_) => {
                                             conns.remove(&server);
                                             Err(format!(
-                                                "mcp {server:?}: call {tool:?} timed out; connection dropped"
+                                                "mcp {:?}: call {tool:?} timed out; connection dropped",
+                                                key_name(&server)
                                             ))
                                         }
                                     };
@@ -433,7 +509,7 @@ fn runtime() -> mpsc::Sender<McpRequest> {
                                     let _ = resp.send(r);
                                 }
                                 McpRequest::Probe { config, resp } => {
-                                    configs.insert(config.name.clone(), config.clone());
+                                    configs.insert(config.conn_key(), config.clone());
                                     let r = run_op(&config, &mut conns, SUBPROCESS_TIMEOUT, |c| {
                                         Box::pin(async move { c.probe().await })
                                     })
@@ -446,26 +522,52 @@ fn runtime() -> mpsc::Sender<McpRequest> {
                                     args,
                                     resp,
                                 } => {
-                                    let r = match configs.get(&server).cloned() {
+                                    let r = match lookup(&configs, &server) {
                                         Some(config) => {
                                             run_op(&config, &mut conns, CALL_TIMEOUT, move |c| {
                                                 Box::pin(async move { c.get_prompt(&name, args).await })
                                             })
                                             .await
                                         }
-                                        None => Err(format!("mcp server {server:?} was never registered")),
+                                        None => Err(format!(
+                                            "mcp server {:?} was never registered",
+                                            key_name(&server)
+                                        )),
                                     };
                                     let _ = resp.send(r);
                                 }
+                                McpRequest::Acquire { key } => {
+                                    *refs.entry(key).or_insert(0) += 1;
+                                }
+                                McpRequest::Release { key } => {
+                                    let left = refs.get_mut(&key).map(|n| {
+                                        *n = n.saturating_sub(1);
+                                        *n
+                                    });
+                                    if left == Some(0) {
+                                        // The last session using it ended:
+                                        // drop the connection (kills the
+                                        // server process) and its config.
+                                        refs.remove(&key);
+                                        conns.remove(&key);
+                                        configs.remove(&key);
+                                    }
+                                }
+                                McpRequest::Count { resp } => {
+                                    let _ = resp.send(conns.len());
+                                }
                                 McpRequest::ReadResource { server, uri, resp } => {
-                                    let r = match configs.get(&server).cloned() {
+                                    let r = match lookup(&configs, &server) {
                                         Some(config) => {
                                             run_op(&config, &mut conns, CALL_TIMEOUT, move |c| {
                                                 Box::pin(async move { c.read_resource(&uri).await })
                                             })
                                             .await
                                         }
-                                        None => Err(format!("mcp server {server:?} was never registered")),
+                                        None => Err(format!(
+                                            "mcp server {:?} was never registered",
+                                            key_name(&server)
+                                        )),
                                     };
                                     let _ = resp.send(r);
                                 }
@@ -483,6 +585,64 @@ fn runtime() -> mpsc::Sender<McpRequest> {
 /// are !Send-safe to keep there), keyed by server name.
 struct McpConnection {
     service: rmcp::service::RunningService<rmcp::service::RoleClient, rmcp::model::ClientConfig>,
+    /// Last use: a wrapped server idle past the policy's limit is stopped.
+    used: Instant,
+}
+
+/// How often the reactor looks for idle wrapped servers.
+fn reap_tick() -> Duration {
+    let idle = crate::sandbox::policy().map_or(30, |p| p.idle_secs);
+    Duration::from_secs((idle / 2).clamp(1, 30))
+}
+
+/// Stops wrapped (`name@workspace`) servers unused for the policy's
+/// `idle_secs`. Their config and their sessions stay: the next call starts
+/// the server again. Anything else (no sandbox, HTTP, skipped) is untouched.
+fn reap_idle(conns: &mut std::collections::HashMap<String, McpConnection>) {
+    let Some(p) = crate::sandbox::policy() else {
+        return;
+    };
+    let idle = Duration::from_secs(p.idle_secs);
+    conns.retain(|key, c| !(key.contains('@') && c.used.elapsed() > idle));
+}
+
+/// A session's claim on one sandboxed server (#601): held by the session's
+/// tool registry, and released when it drops. The reactor stops the server
+/// when the last claim on its key is released, so a daemon hosting many
+/// sessions never keeps a server for a session that ended.
+pub struct ServerLease {
+    key: String,
+}
+
+impl ServerLease {
+    /// A claim on `cfg`'s server; `None` when the sandbox does not wrap it.
+    fn acquire(cfg: &McpServerConfig) -> Option<std::sync::Arc<Self>> {
+        let key = cfg.conn_key();
+        if !key.contains('@') {
+            return None;
+        }
+        runtime()
+            .send(McpRequest::Acquire { key: key.clone() })
+            .ok()?;
+        Some(std::sync::Arc::new(Self { key }))
+    }
+}
+
+impl Drop for ServerLease {
+    fn drop(&mut self) {
+        let _ = runtime().send(McpRequest::Release {
+            key: self.key.clone(),
+        });
+    }
+}
+
+/// How many MCP server connections this process holds (diagnostics).
+pub fn live_connections() -> usize {
+    let (tx, rx) = mpsc::channel();
+    if runtime().send(McpRequest::Count { resp: tx }).is_err() {
+        return 0;
+    }
+    rx.recv_timeout(LIST_SYNC_BUDGET).unwrap_or(0)
 }
 
 impl McpConnection {
@@ -694,13 +854,43 @@ async fn start_server(
     cfg: &McpServerConfig,
     conns: &mut std::collections::HashMap<String, McpConnection>,
 ) -> Result<(), String> {
-    if conns.contains_key(&cfg.name) {
+    if conns.contains_key(&cfg.conn_key()) {
         return Ok(());
+    }
+    // A cap on sandboxed servers (#601): a launch past it is refused, never
+    // at the cost of another session's server.
+    if cfg.conn_key().contains('@') {
+        let cap = crate::sandbox::policy().map_or(usize::MAX, |p| p.max_servers);
+        if conns.keys().filter(|k| k.contains('@')).count() >= cap {
+            return Err(format!(
+                "mcp {:?}: not started, {cap} sandboxed servers are already running \
+                 (limit `[sandbox] max_servers`); end a session or raise the limit",
+                cfg.name
+            ));
+        }
     }
     let service = match &cfg.transport {
         McpTransport::Stdio { command, args } => {
-            let mut std_cmd = std::process::Command::new(command);
-            std_cmd.args(args);
+            // Sandbox (#601): off unless the owner's user config asks. When
+            // on, the server runs as `bwrap <flags> -- <server>`; the ENV-1
+            // scrub below then applies to the `bwrap` process itself.
+            let mut std_cmd =
+                match crate::sandbox::launch(&cfg.name, cfg.workspace.as_deref(), command, args) {
+                    crate::sandbox::Launch::Direct { warning } => {
+                        if let Some(w) = warning {
+                            eprintln!("tole: {w}");
+                        }
+                        let mut c = std::process::Command::new(command);
+                        c.args(args);
+                        c
+                    }
+                    crate::sandbox::Launch::Sandboxed { program, args } => {
+                        let mut c = std::process::Command::new(program);
+                        c.args(args);
+                        c
+                    }
+                    crate::sandbox::Launch::Refused(why) => return Err(why),
+                };
             // ENV-1: same secret scrubbing as every other spawn point, and
             // only the secrets this server's approval granted (#679).
             let release = crate::secret_release::release();
@@ -763,7 +953,13 @@ async fn start_server(
             .map_err(|e| format!("mcp {:?}: handshake failed: {e}", cfg.name))?
         }
     };
-    conns.insert(cfg.name.clone(), McpConnection { service });
+    conns.insert(
+        cfg.conn_key(),
+        McpConnection {
+            service,
+            used: Instant::now(),
+        },
+    );
     Ok(())
 }
 
@@ -783,7 +979,7 @@ async fn run_op<R>(
         Err(_) => Err(format!("{TRANSPORT_ERR}: mcp {:?}: timed out", cfg.name)),
     };
     if r.as_ref().is_err_and(|e| e.starts_with(TRANSPORT_ERR)) {
-        conns.remove(&cfg.name);
+        conns.remove(&cfg.conn_key());
     }
     r
 }
@@ -802,8 +998,9 @@ async fn with_connection<R>(
         .await
         .map_err(|e| scrub_err(cfg, e))?;
     let conn = conns
-        .get_mut(&cfg.name)
+        .get_mut(&cfg.conn_key())
         .ok_or_else(|| format!("mcp {:?} vanished", cfg.name))?;
+    conn.used = Instant::now();
     f(conn).await.map_err(|e| scrub_err(cfg, e))
 }
 
@@ -814,6 +1011,8 @@ async fn with_connection<R>(
 /// An MCP-server-backed tool in the registry. Executes over the reactor.
 pub struct McpTool {
     server: String,
+    /// The reactor connection this tool calls (see [`conn_key_for`]).
+    key: String,
     /// Registry-facing name (prefixed: `mcp_<server>_<tool>`).
     name: String,
     /// The SERVER-side tool name (what the wire call must use).
@@ -827,12 +1026,20 @@ pub struct McpTool {
 impl McpTool {
     pub fn new(server: String, name: String, server_tool: String, description: String) -> Self {
         Self {
+            key: server.clone(),
             server,
             name,
             server_tool,
             description,
             secrets: crate::secrets::SecretSet::default(),
         }
+    }
+
+    /// Calls go to the connection `key` (a sandboxed server of this
+    /// session's workspace), not to the plain server name.
+    pub fn with_key(mut self, key: String) -> Self {
+        self.key = key;
+        self
     }
 
     /// Redact these secrets from the arguments sent to the server (#595).
@@ -923,7 +1130,7 @@ impl Tool for McpTool {
         let (tx, rx) = mpsc::channel();
         runtime()
             .send(McpRequest::Call {
-                server: self.server.clone(),
+                server: self.key.clone(),
                 tool: self.server_tool.clone(),
                 args,
                 resp: tx,
@@ -997,9 +1204,20 @@ pub fn get_server_prompt(
     name: &str,
     args: std::collections::BTreeMap<String, String>,
 ) -> Result<String, String> {
+    get_server_prompt_in(server, None, name, args)
+}
+
+/// [`get_server_prompt`] for the server of the session with `workspace`
+/// (what a sandboxed server was started for; `None`: the current dir).
+pub fn get_server_prompt_in(
+    server: &str,
+    workspace: Option<&std::path::Path>,
+    name: &str,
+    args: std::collections::BTreeMap<String, String>,
+) -> Result<String, String> {
     ask(
         |resp| McpRequest::GetPrompt {
-            server: server.to_string(),
+            server: conn_key_for(server, workspace),
             name: name.to_string(),
             args,
             resp,
@@ -1042,11 +1260,21 @@ pub fn parse_prompt_command(line: &str) -> Option<Result<PromptCommand, String>>
 /// at construction from the capability probe, never from model input.
 pub struct McpReadTool {
     servers: Vec<String>,
+    workspace: Option<std::path::PathBuf>,
 }
 
 impl McpReadTool {
     pub fn new(servers: Vec<String>) -> Self {
-        Self { servers }
+        Self {
+            servers,
+            workspace: None,
+        }
+    }
+
+    /// The session's workspace: which sandboxed server instance is read.
+    pub fn in_workspace(mut self, workspace: std::path::PathBuf) -> Self {
+        self.workspace = Some(workspace);
+        self
     }
 }
 
@@ -1097,7 +1325,7 @@ impl Tool for McpReadTool {
         }
         let result = ask(
             |resp| McpRequest::ReadResource {
-                server: server.clone(),
+                server: conn_key_for(&server, self.workspace.as_deref()),
                 uri,
                 resp,
             },
@@ -1153,6 +1381,10 @@ pub fn register_server_tools(
 ) -> Vec<String> {
     let mut registered = Vec::new();
     let start = Instant::now();
+    // The session's claim on a sandboxed server: held by the registry only
+    // once the server is admitted; otherwise it drops here and the server
+    // is stopped.
+    let lease = ServerLease::acquire(cfg);
     match list_manifest(cfg) {
         Ok((version, manifest)) => {
             if let Err(note) = admit(&cfg.name, &version, &manifest) {
@@ -1162,6 +1394,9 @@ pub fn register_server_tools(
             }
             // #680: recorded on this registry, the session's own decision.
             reg.set_mcp_admitted(&cfg.name, true);
+            if let Some(l) = lease {
+                reg.hold(l);
+            }
             let tools = manifest.into_iter().map(|t| (t.name, t.description));
             // Cap registered tools per server: a hostile/buggy server
             // must not flood the registry (and provider tool specs).
@@ -1190,7 +1425,8 @@ pub fn register_server_tools(
                             server_tool.clone(),
                             description,
                         )
-                        .with_secrets(secrets),
+                        .with_secrets(secrets)
+                        .with_key(cfg.conn_key()),
                     ))
                     .is_ok()
                 {
