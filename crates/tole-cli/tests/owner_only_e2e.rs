@@ -93,6 +93,14 @@ fn owner_commands() -> Vec<Vec<&'static str>> {
         vec!["skills", "approve", "evil", "--hash", "sha256:00"],
         vec!["skills", "drafts", "promote", "d-1", "--hash", "sha256:00"],
         vec!["config", "trust", "--yes"],
+        vec![
+            "delegation",
+            "approvals",
+            "allow",
+            "dap-1-abcdefgh",
+            "--yes",
+        ],
+        vec!["delegation", "approvals", "deny", "dap-1-abcdefgh"],
     ];
     #[cfg(feature = "mcp")]
     v.push(vec!["plugin", "approve", "evil", "--hash", "sha256:00"]);
@@ -132,6 +140,35 @@ fn a_human_at_a_terminal_keeps_working() {
     let o = tole(&real(), &cwd, &home, &[], &["config", "trust", "--yes"]);
     assert!(o.status.success(), "{}", text(&o));
     assert!(!data_files(&home).is_empty());
+}
+
+/// #714: a human reads the approval queue (empty here) and a request that
+/// does not exist is refused by name, not by the session guard.
+#[test]
+fn the_owner_reads_and_decides_at_a_terminal() {
+    let home = tmpdir();
+    let cwd = tmpdir();
+    let o = tole(
+        &real(),
+        &cwd,
+        &home,
+        &[],
+        &["delegation", "approvals", "list"],
+    );
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(
+        text(&o).contains("no pending approval requests"),
+        "{}",
+        text(&o)
+    );
+    let args = ["delegation", "approvals", "deny", "dap-1-abcdefgh"];
+    let o = tole(&real(), &cwd, &home, &[], &args);
+    assert!(
+        !o.status.success() && text(&o).contains("no approval request"),
+        "{}",
+        text(&o)
+    );
+    assert!(!text(&o).contains("#684"), "{}", text(&o));
 }
 
 /// The discussion host is in-process (no tole subprocess), so the argv

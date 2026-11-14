@@ -4,6 +4,7 @@
 //! drift from production behavior (CodeCora scan 2026-09-18).
 pub mod advisor_host;
 pub mod approvals;
+pub mod approvals_owner;
 pub mod approver;
 pub mod audit;
 pub mod audit_discussion;

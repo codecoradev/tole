@@ -2,7 +2,8 @@
 
 Status: design for #714 (parent #583); the owner's answers to the open
 questions are in section 12. PR 1 (records and fold) implements section 3,
-PR 2 (request builder, caps, the parked approver) section 4.1.
+PR 2 (request builder, caps, the parked approver) section 4.1, PR 3 (the
+owner's command and the audit section) section 5.2 and 6.
 Owner decision of 2026-11-14 (in the body of #714): a delegated child that cannot
 decide an approval escalates it up the delegation chain, level by level
 (child, parent, grandparent, ..., the owner), until a level can decide it.
