@@ -467,3 +467,150 @@ fn doctor_says_what_is_there_and_that_off_is_off() {
     assert!(lines[0].contains("bubblewrap 0.9.0 usable"));
     assert!(lines[1].contains("mode required") && lines[1].contains("network none"));
 }
+
+/// The bind source is the resolved path that was validated, never the
+/// original: a link swapped in after the check cannot redirect it (review).
+#[cfg(unix)]
+#[test]
+fn binds_use_the_resolved_path_not_the_link() {
+    let t = tree("resolved");
+    let real = t.home.join("proj");
+    let link = t.base.join("link-to-proj");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let mut p = policy(Mode::Required);
+    p.profile.read = vec![link.clone()];
+    p.profile.write = vec![link.clone()];
+    let l = plan(
+        Some(&p),
+        &usable(),
+        false,
+        &env_for(&t, &link),
+        ("s", "sh", &[]),
+    );
+    let Launch::Sandboxed { args, .. } = l else {
+        panic!("{l:?}")
+    };
+    assert!(
+        args.iter().any(|a| a == real.as_os_str()),
+        "binds the target"
+    );
+    assert!(
+        !args.iter().any(|a| a == link.as_os_str()),
+        "never the link itself"
+    );
+}
+
+/// Property over a temp tree with links, `..` and trailing slashes: every
+/// path in the argv under the tree is the resolved path check_grant
+/// accepted, never the spelling that was given.
+#[cfg(unix)]
+#[test]
+fn the_argv_never_holds_a_path_other_than_the_validated_one() {
+    let t = tree("prop");
+    let real = t.home.join("proj");
+    let link = t.base.join("l1");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let spellings = [
+        link.clone(),
+        PathBuf::from(format!("{}/", link.display())),
+        real.join("../proj"),
+        t.base.join("l1/../proj"),
+        real.clone(),
+    ];
+    let root = t.base.to_str().unwrap().to_string();
+    for given in &spellings {
+        let mut p = policy(Mode::Required);
+        p.profile.read = vec![given.clone()];
+        p.profile.write = vec![given.clone()];
+        let l = plan(
+            Some(&p),
+            &usable(),
+            false,
+            &env_for(&t, given),
+            ("s", "sh", &[]),
+        );
+        let Launch::Sandboxed { args, .. } = l else {
+            panic!("{given:?}: {l:?}")
+        };
+        let resolved = std::fs::canonicalize(given).unwrap();
+        for a in args
+            .iter()
+            .filter(|a| a.to_string_lossy().starts_with(&root))
+        {
+            assert_eq!(Path::new(a), resolved, "{given:?} leaked as {a:?}");
+        }
+    }
+}
+
+/// Every launch resolves again: a link swapped after an earlier plan is
+/// followed to its NEW target (and refused when that is $HOME), never to a
+/// cached one.
+#[cfg(unix)]
+#[test]
+fn a_link_swapped_between_launches_is_resolved_again_or_refused() {
+    let t = tree("swap");
+    let (a, b) = (t.home.join("proj"), t.base.join("out/other"));
+    let link = t.base.join("swap-link");
+    std::os::unix::fs::symlink(&a, &link).unwrap();
+    let go = |ws: &Path| {
+        plan(
+            Some(&policy(Mode::Required)),
+            &usable(),
+            false,
+            &env_for(&t, ws),
+            ("s", "sh", &[]),
+        )
+    };
+    let has = |l: &Launch, p: &Path| match l {
+        Launch::Sandboxed { args, .. } => args.iter().any(|x| x == p.as_os_str()),
+        _ => false,
+    };
+    assert!(has(&go(&link), &a));
+    std::fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(&b, &link).unwrap();
+    let l = go(&link);
+    assert!(has(&l, &b) && !has(&l, &a), "followed the new target");
+    std::fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(&t.home, &link).unwrap();
+    assert!(
+        matches!(go(&link), Launch::Refused(_)),
+        "a link swapped to $HOME is refused"
+    );
+}
+
+/// The server's install dir is bound by its resolved path too, and the
+/// program is addressed through it.
+#[cfg(unix)]
+#[test]
+fn the_program_prefix_is_bound_resolved_and_the_program_runs_through_it() {
+    let t = tree("prefix");
+    let bin = t.base.join("out/other/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(bin.join("srv"), "#!/bin/sh\n").unwrap();
+    let link = t.base.join("binlink");
+    std::os::unix::fs::symlink(&bin, &link).unwrap();
+    let env = Env {
+        path: Some(link.display().to_string()),
+        ..env_for(&t, &t.home.join("proj"))
+    };
+    let l = plan(
+        Some(&policy(Mode::Required)),
+        &usable(),
+        false,
+        &env,
+        ("s", "srv", &[]),
+    );
+    let Launch::Sandboxed { args, .. } = l else {
+        panic!("{l:?}")
+    };
+    assert!(
+        args.iter().any(|a| a == bin.as_os_str()),
+        "binds the target"
+    );
+    assert!(args.iter().any(|a| a == bin.join("srv").as_os_str()));
+    assert!(
+        !args.iter().any(|a| a == link.as_os_str()),
+        "never the link"
+    );
+    assert!(!args.iter().any(|a| a == link.join("srv").as_os_str()));
+}
