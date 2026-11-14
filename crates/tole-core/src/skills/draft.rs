@@ -354,7 +354,7 @@ const RISKY_PHRASES: &[&str] = &[
 
 /// Token shapes that are secrets whatever their value. A small interim set;
 /// the shared ruleset with uteke (#597) replaces it.
-fn secret_shape(text: &str) -> Option<&'static str> {
+pub(crate) fn secret_shape(text: &str) -> Option<&'static str> {
     if text.contains("-----BEGIN") && text.contains("PRIVATE KEY-----") {
         return Some("a private key block");
     }
@@ -407,7 +407,7 @@ pub fn is_hidden(c: char) -> bool {
 
 /// Lowercased, hidden characters removed and whitespace collapsed, so
 /// `ig\u{00AD}nore previous instructions` still matches a phrase.
-fn collapse(text: &str) -> String {
+pub(crate) fn collapse(text: &str) -> String {
     text.chars()
         .filter(|c| !is_hidden(*c) || c.is_whitespace())
         .collect::<String>()

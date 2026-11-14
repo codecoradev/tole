@@ -37,8 +37,9 @@ const KERNEL_MODULES: &[&str] = &[
 ];
 #[rustfmt::skip]
 const ENGINE_MODULES: &[&str] = &[
+    "delegation",
     "plugin",
-    "delegate", "delegate_decide", "delegated_approver", "approvals_owner", "audit", "machine_guard", "ledger_file", "serve_delegation", "discuss", "skill_approve", "skill_drafts_cli", "skill_recall",
+    "discuss", "skill_approve", "skill_drafts_cli", "skill_recall",
     "skill_propose", "skill_outcome", "curator_cmd", "cron", "tool_roster", "provider_chain",
     "turn_runner", "compaction_host", "session_host", "session_index", "session_tools",
     "usage_report", "status", "tui_host", "export", "events", "serve_images",
@@ -54,6 +55,14 @@ const BASELINE: &[(&str, &str, &str)] = &[
 
 /// Old top-level paths that are now re-exports of a module inside another one.
 const ALIASES: &[(&str, &str)] = &[
+    ("delegate", "delegation"),
+    ("delegate_decide", "delegation"),
+    ("delegated_approver", "delegation"),
+    ("approvals_owner", "delegation"),
+    ("audit", "delegation"),
+    ("machine_guard", "delegation"),
+    ("ledger_file", "delegation"),
+    ("serve_delegation", "delegation"),
     ("discuss_tool", "discuss"),
     ("discussion_host", "discuss"),
     ("audit_discussion", "discuss"),

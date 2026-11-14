@@ -252,5 +252,5 @@ impl Tool for DelegateDecideTool {
 }
 
 #[cfg(test)]
-#[path = "delegate_decide_tests.rs"]
+#[path = "decide_tests.rs"]
 mod tests;
