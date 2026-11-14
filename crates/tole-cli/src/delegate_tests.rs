@@ -117,7 +117,7 @@ fn pid_of(out: &Value) -> u32 {
 }
 
 fn wait_dead(pid: u32) {
-    for _ in 0..200 {
+    for _ in 0..WAIT_TICKS {
         if !crate::ledger_file::lease_alive(&crate::ledger_file::lease_of(pid)) {
             return;
         }
@@ -126,11 +126,28 @@ fn wait_dead(pid: u32) {
     panic!("{pid} never died");
 }
 
-/// A data dir outside every test workspace.
+/// Condition waits poll every 25 ms and stop as soon as the condition
+/// holds; this is only the bound (60 s), generous so a machine under heavy
+/// load (a child shell that takes seconds to start) is not mistaken for a
+/// hang (#702).
+const WAIT_TICKS: u32 = 2400;
+
+/// A data dir outside every test workspace, unique to this run: a pid is
+/// reused, and a stale directory of an earlier run must not be shared (#702).
 fn data_dir() -> PathBuf {
-    let d = std::env::temp_dir().join(format!("tole-delegate-data-{}", std::process::id()));
-    std::fs::create_dir_all(&d).unwrap();
-    d.canonicalize().unwrap()
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let d = std::env::temp_dir().join(format!(
+            "tole-delegate-data-{}-{nanos:x}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d.canonicalize().unwrap()
+    })
+    .clone()
 }
 
 fn log_file(root: &Path) -> PathBuf {
@@ -179,7 +196,7 @@ fn tools(h: &std::sync::Arc<Delegator>, root: &Path) -> (DelegateTool, DelegateP
 
 /// Waits for a file the fake child writes.
 fn wait_for(p: &Path) -> String {
-    for _ in 0..200 {
+    for _ in 0..WAIT_TICKS {
         if let Ok(s) = std::fs::read_to_string(p) {
             if !s.is_empty() {
                 return s;
@@ -196,7 +213,7 @@ fn agent_dir_of(root: &Path, out: &Value) -> PathBuf {
 
 /// Polls until the child has exited; returns the settled poll output.
 fn poll_done(poll: &DelegatePollTool, out: &Value) -> Value {
-    for _ in 0..200 {
+    for _ in 0..WAIT_TICKS {
         let p = poll.execute(json!({"agent": out["agent"]})).unwrap();
         if p["running"] == json!(false) {
             return p;
@@ -665,7 +682,7 @@ fn a_new_delegate_never_starts_ahead_of_an_older_queued_one() {
     // and queues C behind it.
     wait_for(&agent_dir_of(&root, &a).join("env"));
     let pid = u32::try_from(a["pid"].as_u64().unwrap()).unwrap();
-    for _ in 0..200 {
+    for _ in 0..WAIT_TICKS {
         if !crate::ledger_file::lease_alive(&crate::ledger_file::lease_of(pid)) {
             break;
         }
@@ -1000,7 +1017,7 @@ fn an_unpolled_finished_child_is_settled_with_its_report_on_the_next_delegate() 
         .unwrap();
     wait_for(&agent_dir_of(&root, &a).join("env"));
     let pid = u32::try_from(a["pid"].as_u64().unwrap()).unwrap();
-    for _ in 0..200 {
+    for _ in 0..WAIT_TICKS {
         if !crate::ledger_file::lease_alive(&crate::ledger_file::lease_of(pid)) {
             break;
         }
@@ -1085,13 +1102,13 @@ fn mkfifo(p: &Path) {
 }
 
 /// Runs `f` on a thread and fails if it does not return within 5 s.
-fn within_5s<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+fn within_deadline<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let _ = tx.send(f());
     });
-    rx.recv_timeout(std::time::Duration::from_secs(5))
-        .expect("blocked: did not return within 5 s")
+    rx.recv_timeout(std::time::Duration::from_secs(30))
+        .expect("blocked: did not return within 30 s")
 }
 
 #[test]
@@ -1117,7 +1134,7 @@ fn fifos_planted_in_the_agent_dir_never_block_the_parent() {
     mkfifo(&dir.join("log"));
     let poll = std::sync::Arc::new(poll);
     let (p2, o2) = (poll.clone(), out.clone());
-    let p = within_5s(move || poll_done(&p2, &o2));
+    let p = within_deadline(move || poll_done(&p2, &o2));
     let v = &p["delegation"];
     assert_eq!(v["status"], json!("incomplete"), "{p}");
     assert!(
@@ -1128,7 +1145,7 @@ fn fifos_planted_in_the_agent_dir_never_block_the_parent() {
     // The log lock is free: another delegate goes through.
     let start = std::sync::Arc::new(start);
     let s2 = start.clone();
-    let again = within_5s(move || s2.execute(json!({"task": "u", "mode": "consult"})));
+    let again = within_deadline(move || s2.execute(json!({"task": "u", "mode": "consult"})));
     assert!(again.is_ok(), "{again:?}");
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -1177,7 +1194,7 @@ fn an_independent_participant_is_a_consult_child_settled_with_its_report() {
     );
     assert!(n.allow.is_empty(), "a profile without allow gets none");
     let mut got = None;
-    for _ in 0..200 {
+    for _ in 0..WAIT_TICKS {
         if let Some(r) = ind.poll(&node).unwrap() {
             got = Some(r);
             break;

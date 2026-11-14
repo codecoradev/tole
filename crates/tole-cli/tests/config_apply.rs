@@ -14,7 +14,16 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn tmpdir() -> PathBuf {
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let d = std::env::temp_dir().join(format!("tole-apply-e2e-{}-{n}", std::process::id()));
+    // A pid is reused and these directories are never removed, so a stale
+    // one of an earlier run (a trusted project, a populated home) can carry
+    // the same pid and counter: the clock makes the name unique (#702).
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let d = std::env::temp_dir().join(format!(
+        "tole-apply-e2e-{}-{n}-{stamp:x}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&d).unwrap();
     d.canonicalize().unwrap()
 }
