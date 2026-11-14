@@ -6,7 +6,7 @@
 
 mod test_dir;
 #[allow(unused_imports)]
-pub use test_dir::{ChildGuard, TestDir};
+pub use test_dir::{ChildGuard, TestDir, WorkDir};
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};

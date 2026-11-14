@@ -147,6 +147,48 @@ fn make_writable(path: &Path) {
     }
 }
 
+/// A working directory `<root>/w` inside a [`TestDir`]. Its siblings
+/// (`work.with_extension("home")`, a `CODECORA_HOME` outside the workspace)
+/// are created inside the same root, so they go away with it. Derefs to the
+/// working directory.
+#[derive(Debug)]
+pub struct WorkDir {
+    _root: TestDir,
+    work: PathBuf,
+}
+
+impl WorkDir {
+    pub fn new(prefix: &str) -> Self {
+        let root = TestDir::new(prefix);
+        let work = root.path().join("w");
+        std::fs::create_dir_all(&work).expect("create work dir");
+        WorkDir { _root: root, work }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.work
+    }
+}
+
+impl std::ops::Deref for WorkDir {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.work
+    }
+}
+
+impl AsRef<Path> for WorkDir {
+    fn as_ref(&self) -> &Path {
+        &self.work
+    }
+}
+
+impl AsRef<OsStr> for WorkDir {
+    fn as_ref(&self) -> &OsStr {
+        self.work.as_os_str()
+    }
+}
+
 /// Kills and reaps a spawned child when dropped. Declare it after the
 /// [`TestDir`] the child works in: locals drop in reverse order, so the
 /// child is gone before the directory is removed.
