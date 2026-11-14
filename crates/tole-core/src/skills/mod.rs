@@ -16,6 +16,11 @@
 //! every skill on disk; `Approved` loads only owner-approved bytes and
 //! lists every other skill as unavailable ([`crate::skill_approval`]).
 
+pub mod approval;
+pub mod curator;
+pub mod draft;
+pub mod index;
+
 pub use crate::skill_approval::{Gate, LoadError};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};

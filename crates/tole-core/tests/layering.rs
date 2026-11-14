@@ -37,8 +37,7 @@ const KERNEL_MODULES: &[&str] = &[
 #[rustfmt::skip]
 const ENGINE_MODULES: &[&str] = &[
     "delegation", "discussion",
-    "router", "advisor", "skills", "skill_approval", "skill_curator", "skill_draft",
-    "skill_index", "web", "mcp", "plugin_lock", "agents", "child_env", "handoff",
+    "router", "advisor", "skills", "web", "mcp", "plugin_lock", "agents", "child_env", "handoff",
     "sibling_watch", "session_guard", "run_command", "jobs", "memory", "uteke", "gh", "git",
     "gitea", "cora_search", "verify_package", "ccimport",
 ];
@@ -49,8 +48,8 @@ const FACE_MODULES: &[&str] = &["mcp_server", "update_check"];
 #[rustfmt::skip]
 const BASELINE: &[(&str, &str, &str)] = &[
     ("approval", "run_command", "allowlist patterns reuse RunCommandTool::split_argv"),
-    ("gate", "skill_draft", "the gate carries the skill-draft TaintTracker"),
-    ("tool", "skill_draft", "ToolContext stores the skill-draft TaintTracker"),
+    ("gate", "skills", "the gate carries the skill-draft TaintTracker"),
+    ("tool", "skills", "ToolContext stores the skill-draft TaintTracker"),
     ("secrets", "web", "header secret lookup calls web::header_secrets"),
 ];
 
@@ -60,6 +59,10 @@ const ALIASES: &[(&str, &str)] = &[
     ("delegation_approvals", "delegation"),
     ("delegation_report", "delegation"),
     ("resource_guard", "delegation"),
+    ("skill_approval", "skills"),
+    ("skill_curator", "skills"),
+    ("skill_draft", "skills"),
+    ("skill_index", "skills"),
     ("secret_release", "secrets"),
     ("sensitive", "secrets"),
 ];
