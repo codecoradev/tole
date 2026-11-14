@@ -28,11 +28,9 @@ use std::path::Path;
 /// Faces: serve-side modules (only a host's serve surface uses them).
 #[rustfmt::skip]
 const KERNEL_MODULES: &[&str] = &[
-    "session",
-    "tools", "paths", "secrets",
+    "session", "tools", "paths", "secrets",
     "sanitize", "tool", "approval", "provider", "cancel", "interrupt",
-    "ledger", "transcript", "turn", "compaction", "gate", "hooks", "subprocess",
-    "process_guard", "sandbox", "systemone",
+    "ledger", "turn", "gate", "hooks", "subprocess", "process_guard", "sandbox", "systemone",
 ];
 #[rustfmt::skip]
 const ENGINE_MODULES: &[&str] = &[
@@ -61,6 +59,8 @@ const ALIASES: &[(&str, &str)] = &[
     ("storage", "session"),
     ("machine", "session"),
     ("safe_dir", "session"),
+    ("compaction", "turn"),
+    ("transcript", "turn"),
     ("openai", "provider"),
     ("failover", "provider"),
     ("mock", "provider"),

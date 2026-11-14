@@ -7,6 +7,9 @@
 //! no-crash run (proven by the E2 determinism tests at sandwich level and
 //! the E5 golden-file test at loop level).
 
+pub mod compaction;
+pub mod transcript;
+
 use crate::cancel::CancelToken;
 use crate::entry::{EntryType, NewEntry};
 use crate::gate::{self, Denied};
@@ -21,7 +24,6 @@ use crate::register::RegisterWrite;
 use crate::state::{Pc, StateTransition};
 use crate::storage::{Commit, Storage, StorageError, UsageRecord};
 use crate::tool::{Risk, ToolRegistry};
-use crate::transcript;
 use std::time::{Duration, Instant};
 
 /// Hard ceiling on provider steps in one turn (loop-guard).
