@@ -27,15 +27,31 @@ pub mod audit_discussion;
 pub mod auth;
 pub mod compaction_host;
 pub mod config;
-pub mod config_apply;
-pub mod config_trust;
+// `config/` holds the modules below; these re-exports keep the old top-level paths working.
+#[doc(inline)]
+pub use config::apply as config_apply;
+#[doc(inline)]
+pub use config::discussion_roles;
+#[doc(inline)]
+pub use config::hook_filter;
+#[doc(inline)]
+pub use config::owner_only;
+#[doc(inline)]
+pub use config::profile;
+#[doc(inline)]
+pub use config::project_trust as config_trust;
+#[doc(inline)]
+pub use config::routing;
+#[doc(inline)]
+pub use config::session_settings;
+#[doc(inline)]
+pub use config::trust;
 #[cfg(feature = "shell-tools")]
 pub mod cron;
 pub mod curator_cmd;
 pub mod discuss;
 pub mod discuss_tool;
 pub mod discussion_host;
-pub mod discussion_roles;
 pub mod doctor;
 pub mod ecosystem;
 pub mod events;
@@ -43,9 +59,7 @@ pub mod events;
 pub mod export;
 pub mod handoff;
 pub mod hook_cli;
-pub mod hook_filter;
 pub mod hooks;
-pub mod owner_only;
 pub mod plugin;
 // `plugin/` holds these modules; the re-exports keep the old top-level paths working.
 #[doc(inline)]
@@ -53,16 +67,13 @@ pub mod plugin;
 pub use plugin::cmd as plugin_cmd;
 #[doc(inline)]
 pub use plugin::gate as plugin_gate;
-pub mod profile;
 pub mod protocol;
 pub mod provider_chain;
 #[cfg(feature = "shell-tools")]
 pub mod review_gate;
-pub mod routing;
 pub mod serve_images;
 pub mod session_host;
 pub mod session_index;
-pub mod session_settings;
 pub mod session_tools;
 pub mod sibling;
 pub mod skill_approve;
@@ -73,7 +84,6 @@ pub mod skill_recall;
 pub mod status;
 pub mod tool_roster;
 pub mod tools;
-pub mod trust;
 #[cfg(feature = "tui")]
 pub mod tui_host;
 pub mod turn_runner;
