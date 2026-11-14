@@ -38,6 +38,7 @@ const ENGINE_MODULES: &[&str] = &[
     "integrations",
     "delegation", "discussion",
     "router", "advisor", "skills", "web", "mcp", "plugin_lock", "session_guard", "run_command", "jobs", "ccimport",
+    "plugin_launcher",
 ];
 #[rustfmt::skip]
 const FACE_MODULES: &[&str] = &["mcp_server", "update_check"];
