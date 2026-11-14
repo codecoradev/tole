@@ -210,10 +210,31 @@ fn run_tole(env_extra: &[(&str, &str)], args: &[&str], stdin: &str) -> (String, 
             .as_nanos()
     ));
     std::fs::create_dir_all(&dir).unwrap();
+    // The machine guard queues a child while the machine is busy (load per
+    // CPU, free memory, disk, pids, spawn interval). These tests are about
+    // the poll protocol, not the guard, so it is opened as far as its
+    // bounds allow: a loaded CI or build machine must not queue the child
+    // (#702). The guard itself is covered in `delegate_tests` and
+    // `resource_guard_tests`.
+    let cfg_dir = dir.with_extension("home").join("tole");
+    std::fs::create_dir_all(&cfg_dir).unwrap();
+    std::fs::write(
+        cfg_dir.join("config.toml"),
+        "[delegation]\nmax_load_per_cpu = 64\nmin_free_memory_mb = 1\nchild_memory_mb = 1\n\
+         min_free_disk_mb = 1\nmin_free_pids_percent = 1\nspawn_interval_secs = 1\n\
+         machine_max_live = 1024\n",
+    )
+    .unwrap();
     let bin = env!("CARGO_BIN_EXE_tole");
     let mut cmd = std::process::Command::new(bin);
     cmd.args(args)
         .current_dir(&dir)
+        // A home of its own, outside the workspace: delegation keeps one
+        // machine-wide registry under the data dir, and the spawn interval
+        // would queue this child behind any other tole on the machine (a
+        // parallel test, another agent) so the mock never sees an agent id
+        // (#702). The same home also holds the user config and plugin lock.
+        .env("CODECORA_HOME", dir.with_extension("home"))
         .env("TOLE_API_KEY", "test")
         .env("TOLE_MODEL", "mock")
         .env_remove("TOLE_MEMORY")
@@ -257,6 +278,65 @@ fn parent_spawns_child_polls_until_settled() {
     assert!(
         stdout.contains("PARENT_DONE"),
         "stdout={stdout}\nstderr={stderr}"
+    );
+}
+
+/// #702: the run is hermetic. Delegation's machine-wide registry and the
+/// spawn interval live under the home, so a test that used the real one
+/// queued behind any other tole on the machine and flaked. A decoy `HOME`
+/// must stay untouched: the data dir comes from the test's own
+/// `CODECORA_HOME`.
+#[test]
+fn a_run_never_touches_the_machine_home() {
+    let (base, _hits) = spawn_mock();
+    let decoy = std::env::temp_dir().join(format!(
+        "tole-agent-e2e-decoy-{:x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&decoy).unwrap();
+    let (stdout, stderr, code) = run_tole(
+        &[
+            ("TOLE_BASE_URL", base.as_str()),
+            ("HOME", decoy.to_str().unwrap()),
+        ],
+        &[
+            "run",
+            "--allow",
+            "agent_*",
+            "spawn one child for the mission, poll until settled, then report",
+        ],
+        "",
+    );
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    let left: Vec<_> = std::fs::read_dir(&decoy)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name())
+        .collect();
+    assert!(left.is_empty(), "the real home was used: {left:?}");
+    let _ = std::fs::remove_dir_all(&decoy);
+}
+
+/// #702: the run's own home opens the machine guard (the load limit the
+/// guard shows is the opened one), so a busy machine cannot queue the
+/// child. The guard queues on the REAL load, which a test cannot raise on
+/// demand, hence this check that the opened limits are what the binary
+/// applies.
+#[test]
+fn a_run_opens_the_machine_guard() {
+    let (base, _hits) = spawn_mock();
+    let (stdout, stderr, code) = run_tole(
+        &[("TOLE_BASE_URL", base.as_str())],
+        &["doctor", "--tier", "offline", "--no-ledger"],
+        "",
+    );
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert!(
+        stdout.contains("per CPU (max 64.00)"),
+        "the guard keeps its default limits: {stdout}"
     );
 }
 

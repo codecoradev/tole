@@ -17,9 +17,14 @@ static N: AtomicU64 = AtomicU64::new(0);
 
 fn tmpdir(tag: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!(
-        "tole-compaction-e2e-{tag}-{}-{}",
+        "tole-compaction-e2e-{tag}-{}-{}-{:x}",
         std::process::id(),
-        N.fetch_add(1, Ordering::SeqCst)
+        N.fetch_add(1, Ordering::SeqCst),
+        // A pid is reused, so a stale directory of an earlier run can carry
+        // the same name: the clock makes it unique (#702).
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos())
     ));
     std::fs::create_dir_all(&d).unwrap();
     d.canonicalize().unwrap()
@@ -313,31 +318,57 @@ fn an_overflow_ends_the_turn_and_the_next_resume_compacts_first() {
 
 /// #481: `doctor --tier catalog` warns (exit 0) when no window is known,
 /// and is quiet when the catalog or the setting supplies one.
+///
+/// The verdict is read from the `context window` line itself: the report
+/// also carries the machine's delegation headroom (load, memory, disk),
+/// which warns with `  ! ` on any busy or nearly full machine and says
+/// nothing about the window (#702). `tight_guard` makes that unrelated
+/// warning certain, so the test proves the window checks ignore it.
 #[test]
 fn doctor_warns_non_fatally_about_a_missing_window() {
-    let run = |window: Option<u64>, extra: &[(&str, &str)]| {
+    let run = |window: Option<u64>, extra: &[(&str, &str)], tight_guard: bool| {
         let (url, _) = spawn_mock(window);
+        let cwd = tmpdir("doctor");
+        if tight_guard {
+            let cfg = cwd.with_extension("home").join("tole");
+            std::fs::create_dir_all(&cfg).unwrap();
+            // 16 TiB must stay free: no machine has it, so the disk line warns.
+            std::fs::write(
+                cfg.join("config.toml"),
+                "[delegation]\nmin_free_disk_mb = 16777216\n",
+            )
+            .unwrap();
+        }
         let o = tole(
-            &tmpdir("doctor"),
+            &cwd,
             &url,
             &["doctor", "--tier", "catalog", "--no-ledger"],
             extra,
         );
         (o.status.code(), text(&o.stdout))
     };
-    let (code, out) = run(None, &[]);
-    assert_eq!(code, Some(0), "{out}");
-    assert!(out.contains("catalog: m is served"), "{out}");
-    assert!(
-        out.contains("context window") && out.contains("TOLE_CONTEXT_WINDOW"),
-        "{out}"
-    );
-    for (w, extra) in [
-        (Some(10_000), vec![]),
-        (None, vec![("TOLE_CONTEXT_WINDOW", "10000")]),
-    ] {
-        let (code, out) = run(w, &extra);
+    let window_line = |out: &str| {
+        out.lines()
+            .find(|l| l.contains("context window"))
+            .unwrap_or_else(|| panic!("no context window line: {out}"))
+            .to_string()
+    };
+    for tight_guard in [false, true] {
+        let (code, out) = run(None, &[], tight_guard);
         assert_eq!(code, Some(0), "{out}");
-        assert!(!out.contains("  ! "), "{out}");
+        assert!(out.contains("catalog: m is served"), "{out}");
+        let line = window_line(&out);
+        assert!(
+            line.starts_with("  ! ") && line.contains("TOLE_CONTEXT_WINDOW"),
+            "{out}"
+        );
+        for (w, extra) in [
+            (Some(10_000), vec![]),
+            (None, vec![("TOLE_CONTEXT_WINDOW", "10000")]),
+        ] {
+            let (code, out) = run(w, &extra, tight_guard);
+            assert_eq!(code, Some(0), "{out}");
+            assert!(window_line(&out).starts_with("  ✓ "), "{out}");
+        }
     }
 }
