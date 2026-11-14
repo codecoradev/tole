@@ -31,8 +31,7 @@ use std::path::Path;
 /// Faces: diagnostics and the hook command surface.
 #[rustfmt::skip]
 const KERNEL_MODULES: &[&str] = &[
-    "config", "config_apply", "config_trust", "trust", "hook_filter", "routing", "profile",
-    "session_settings", "owner_only", "discussion_roles", "hooks", "approvals", "approver",
+    "config", "hooks", "approvals", "approver",
     "auth", "protocol", "sibling", "handoff", "tools", "web_builtin", "advisor_host",
     "review_gate",
 ];
@@ -56,7 +55,17 @@ const BASELINE: &[(&str, &str, &str)] = &[
 ];
 
 /// Old top-level paths that are now re-exports of a module inside another one.
-const ALIASES: &[(&str, &str)] = &[];
+const ALIASES: &[(&str, &str)] = &[
+    ("config_apply", "config"),
+    ("config_trust", "config"),
+    ("trust", "config"),
+    ("hook_filter", "config"),
+    ("routing", "config"),
+    ("profile", "config"),
+    ("session_settings", "config"),
+    ("owner_only", "config"),
+    ("discussion_roles", "config"),
+];
 
 fn level_of(module: &str) -> Option<u8> {
     [KERNEL_MODULES, ENGINE_MODULES, FACE_MODULES]
