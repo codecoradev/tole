@@ -962,5 +962,5 @@ pub fn describe(outcome: Gate) -> &'static str {
 }
 
 #[cfg(test)]
-#[path = "discussion_log_tests.rs"]
+#[path = "log_tests.rs"]
 mod tests;
