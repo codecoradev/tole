@@ -130,3 +130,31 @@ fn approve_and_list_never_start_an_unverified_server_without_the_sandbox() {
     assert!(!d.join("started").exists(), "list started the server");
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// `tole doctor` warns about an unpinned launcher and a third-party server
+/// no sandbox applies to, without starting anything.
+#[test]
+fn doctor_warns_about_unpinned_launchers_and_unsandboxed_third_party_servers() {
+    let d = tmp("doctor");
+    let o = tole(
+        &d,
+        &[],
+        &[
+            "doctor",
+            "--tier",
+            "offline",
+            "--mcp-server",
+            "pkg=npx -y some-mcp",
+            "--mcp-server",
+            "pinned=npx -y some-mcp@1.2.3",
+        ],
+    );
+    let out = text(&o);
+    assert!(out.contains("pkg: unpinned launcher"), "{out}");
+    assert!(!out.contains("pinned: unpinned launcher"), "{out}");
+    assert!(
+        out.contains("pkg: third-party-unverified stdio server runs with no sandbox"),
+        "{out}"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}

@@ -33,7 +33,28 @@ pub use serve_support::events;
 pub use serve_support::images as serve_images;
 #[doc(inline)]
 pub use serve_support::protocol;
-pub mod compaction_host;
+pub mod session;
+// `session/` holds these modules; the re-exports keep the old top-level paths working.
+#[doc(inline)]
+pub use session::compaction as compaction_host;
+#[doc(inline)]
+#[cfg(feature = "tui")]
+pub use session::export;
+#[doc(inline)]
+pub use session::host as session_host;
+#[doc(inline)]
+pub use session::index as session_index;
+#[doc(inline)]
+pub use session::runner as turn_runner;
+#[doc(inline)]
+pub use session::status;
+#[doc(inline)]
+pub use session::tools as session_tools;
+#[doc(inline)]
+#[cfg(feature = "tui")]
+pub use session::tui as tui_host;
+#[doc(inline)]
+pub use session::usage as usage_report;
 pub mod config;
 // `config/` holds the modules below; these re-exports keep the old top-level paths working.
 #[doc(inline)]
@@ -80,8 +101,6 @@ pub use discuss::host as discussion_host;
 pub use discuss::tool as discuss_tool;
 pub mod doctor;
 pub mod ecosystem;
-#[cfg(feature = "tui")]
-pub mod export;
 pub mod handoff;
 pub mod hook_cli;
 pub mod hooks;
@@ -95,16 +114,8 @@ pub use plugin::gate as plugin_gate;
 pub mod provider_chain;
 #[cfg(feature = "shell-tools")]
 pub mod review_gate;
-pub mod session_host;
-pub mod session_index;
-pub mod session_tools;
 pub mod sibling;
-pub mod status;
 pub mod tool_roster;
 pub mod tools;
-#[cfg(feature = "tui")]
-pub mod tui_host;
-pub mod turn_runner;
-pub mod usage_report;
 #[cfg(feature = "web-builtin")]
 pub mod web_builtin;
