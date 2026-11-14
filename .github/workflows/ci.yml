@@ -151,3 +151,56 @@ jobs:
           key: os-check-${{ matrix.target }}
       - run: cargo check --workspace --all-targets --target ${{ matrix.target }}
       - run: cargo test -p tole-core --no-run --target ${{ matrix.target }}
+
+  # Issue #749: the sandbox integration tests (#601) need a working
+  # bubblewrap; without one they print `SKIPPED:` and pass, so the
+  # hardening (no network, no data dir, no $HOME, read-only workspace,
+  # CapEff 0, per-session binds, server lifecycle) was only exercised on
+  # developer machines. This job installs bubblewrap and sets
+  # TOLE_REQUIRE_BWRAP=1, which turns a skip into a failure. Only the three
+  # sandbox test targets run (the full suite is the Test job).
+  #
+  # Ubuntu 24.04 runners ship AppArmor's
+  # kernel.apparmor_restrict_unprivileged_userns=1, which denies bwrap the
+  # user namespace it needs. The relaxation below is scoped to this job's
+  # ephemeral VM (sysctl -w is not persistent and the runner is discarded);
+  # it changes nothing outside the job. No secrets are used.
+  sandbox-bwrap:
+    name: Sandbox (bubblewrap)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      TOLE_REQUIRE_BWRAP: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: sandbox-bwrap
+      - name: Install bubblewrap
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          bwrap --version
+      - name: Allow unprivileged user namespaces (job-local)
+        run: |
+          for k in kernel.apparmor_restrict_unprivileged_userns kernel.unprivileged_userns_clone user.max_user_namespaces; do
+            echo "before: $k=$(sysctl -n "$k" 2>/dev/null || echo '<absent>')"
+          done
+          if [ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null)" = "1" ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          if [ "$(sysctl -n kernel.unprivileged_userns_clone 2>/dev/null)" = "0" ]; then
+            sudo sysctl -w kernel.unprivileged_userns_clone=1
+          fi
+          for k in kernel.apparmor_restrict_unprivileged_userns kernel.unprivileged_userns_clone; do
+            echo "after: $k=$(sysctl -n "$k" 2>/dev/null || echo '<absent>')"
+          done
+          bwrap --unshare-all --unshare-user --disable-userns --ro-bind / / true && echo "bwrap works"
+      - name: Sandbox tests
+        run: |
+          cargo test -p tole-core \
+            --test mcp_sandbox --test mcp_sandbox_lifecycle --test mcp_sandbox_idle \
+            -- --nocapture --test-threads=1 2>&1 | tee sandbox.log
+          if grep -n "SKIPPED" sandbox.log; then echo "a sandbox test was skipped"; exit 1; fi
