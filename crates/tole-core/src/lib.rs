@@ -37,7 +37,6 @@ pub mod child_env;
 pub mod compaction;
 #[cfg(feature = "shell-tools")]
 pub mod cora_search;
-pub mod cron;
 pub mod entry;
 pub mod failover;
 pub mod file_tools;
@@ -66,6 +65,13 @@ pub mod handoff;
 pub mod image;
 pub mod interrupt;
 pub mod ledger;
+// `ledger/` holds the modules below; these re-exports keep the old top-level paths working.
+#[doc(inline)]
+pub use ledger::cron;
+#[doc(inline)]
+pub use ledger::tz;
+#[doc(inline)]
+pub use ledger::webhook;
 pub mod systemone;
 pub mod todo;
 pub mod transcript;
@@ -128,12 +134,10 @@ pub mod storage;
 pub mod subprocess;
 pub mod tool;
 pub mod turn;
-pub mod tz;
 pub mod update_check;
 #[cfg(feature = "shell-tools")]
 pub mod uteke;
 pub mod verify_package;
-pub mod webhook;
 
 /// Semantic version of the durable schema (see storage module docs).
 pub const STORAGE_VERSION: u32 = 1;
