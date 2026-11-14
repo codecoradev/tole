@@ -13,6 +13,7 @@ const SECRET: &str = "s3cr3t-value-123456";
 
 /// Goal `g` (level 2) -> `mid` (level 1) -> `kid` (asks).
 struct Fx {
+    _dir: crate::test_dir::TestDir,
     log: PathBuf,
     store: Store,
     mid: String,
@@ -24,9 +25,7 @@ fn s(v: &[&str]) -> Vec<String> {
 }
 
 fn fx(tag: &str, root: &[&str], mid: &[&str]) -> Fx {
-    let dir = std::env::temp_dir().join(format!("tole-ddecide-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = crate::test_dir::TestDir::new(&format!("tole-ddecide-{tag}"));
     let log = dir.join("delegation.jsonl");
     let mut d = Delegation::open(FileStore::new(log.clone())).unwrap();
     let root = s(root);
@@ -63,6 +62,7 @@ fn fx(tag: &str, root: &[&str], mid: &[&str]) -> Fx {
     let mid_id = spawn("g", &s(mid), "sess-mid");
     let kid = spawn(&mid_id, &[], "sess-kid");
     Fx {
+        _dir: dir,
         store: Store::new(log.clone()),
         log,
         mid: mid_id,
@@ -392,8 +392,9 @@ fn a_level_that_is_not_running_cannot_decide() {
 fn only_validated_parts_reach_the_approver_prompt() {
     let tool = |v: Value| {
         // describe needs no host state.
+        let (host, _dir) = fake_host();
         let t = DelegateDecideTool {
-            host: Arc::new(fake_host()),
+            host: Arc::new(host),
         };
         t.describe(&v)
     };
@@ -406,29 +407,30 @@ fn only_validated_parts_reach_the_approver_prompt() {
     assert!(!d.contains("IGNORE") && d.contains("<invalid"), "{d}");
 }
 
-fn fake_host() -> Delegator {
+fn fake_host() -> (Delegator, crate::test_dir::TestDir) {
     let env = |_: &str| None;
-    let dir = std::env::temp_dir().join(format!("tole-ddecide-host-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = crate::test_dir::TestDir::new("tole-ddecide-host");
     let setup = crate::delegate::Setup {
-        data_dir: Some(dir.clone()),
+        data_dir: Some(dir.to_path_buf()),
         ..Default::default()
     };
-    Delegator::for_session(
+    let host = Delegator::for_session(
         std::path::PathBuf::from("tole"),
-        dir,
+        dir.to_path_buf(),
         false,
         vec![],
         setup,
         &env,
     )
-    .expect("a root host")
+    .expect("a root host");
+    (host, dir)
 }
 
 /// The roster: the tools come only in `chain` mode, with a grant, where
 /// `delegate` is, and never for a participant.
 #[test]
 fn the_tools_exist_only_in_chain_mode_with_a_grant_and_never_for_a_participant() {
+    let dir = crate::test_dir::TestDir::new("tole-ddecide-rw");
     let setup = |mode: Option<&str>| crate::delegate::Setup {
         cfg: crate::config::parse(
             &mode.map_or(String::new(), |m| {
@@ -437,17 +439,13 @@ fn the_tools_exist_only_in_chain_mode_with_a_grant_and_never_for_a_participant()
             std::path::Path::new("u.toml"),
         )
         .unwrap(),
-        data_dir: Some(
-            std::env::temp_dir().join(format!("tole-ddecide-roster-{}", std::process::id())),
-        ),
+        data_dir: Some(dir.join("roster")),
         ..Default::default()
     };
     let host = |mode: Option<&str>, allow: &[&str], env: &dyn Fn(&str) -> Option<String>| {
-        let dir = std::env::temp_dir().join(format!("tole-ddecide-rw-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
         Delegator::for_session(
             std::path::PathBuf::from("tole"),
-            dir,
+            dir.to_path_buf(),
             false,
             s(allow),
             setup(mode),
@@ -478,7 +476,8 @@ fn the_tools_exist_only_in_chain_mode_with_a_grant_and_never_for_a_participant()
 
 #[test]
 fn the_tools_take_closed_input_and_say_so() {
-    let host = Arc::new(fake_host());
+    let (host, _dir) = fake_host();
+    let host = Arc::new(host);
     let pending = DelegatePendingTool { host: host.clone() };
     assert_eq!(pending.risk(), Risk::ReadOnly);
     let e = pending.execute(json!({"node": "g"})).unwrap_err();

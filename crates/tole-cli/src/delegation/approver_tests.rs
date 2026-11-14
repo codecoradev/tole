@@ -13,8 +13,11 @@ type Hook = Box<dyn FnMut(u32, i64) + Send>;
 
 /// A goal `g` -> `mid` -> `kid` in a temp dir, a fake clock and a hook that
 /// runs at every nap (the owner acting while the child is parked).
-#[derive(Clone)]
 struct Fx {
+    /// Owned by the value `fx` returned only: a clone is held by the nap
+    /// hook of this very value (a cycle that never drops), so it must not
+    /// keep the directory alive.
+    _dir: Option<crate::test_dir::TestDir>,
     log: PathBuf,
     kid: String,
     clock: Arc<AtomicI64>,
@@ -22,11 +25,9 @@ struct Fx {
     hook: Arc<Mutex<Hook>>,
 }
 
-fn tmp(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("tole-dapprover-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d.canonicalize().unwrap()
+use crate::test_dir::TestDir;
+fn tmp(tag: &str) -> TestDir {
+    TestDir::new(&format!("tole-dapprover-{tag}"))
 }
 
 fn s(v: &[&str]) -> Vec<String> {
@@ -72,11 +73,25 @@ fn fx(tag: &str, goal_secs: i64) -> Fx {
     let mid = spawn("g", Some("sess-mid"));
     let kid = spawn(&mid, Some("sess-kid"));
     Fx {
+        _dir: Some(dir),
         log,
         kid,
         clock: Arc::new(AtomicI64::new(T + 5)),
         naps: Arc::new(AtomicU32::new(0)),
         hook: Arc::new(Mutex::new(Box::new(|_, _| {}))),
+    }
+}
+
+impl Clone for Fx {
+    fn clone(&self) -> Self {
+        Fx {
+            _dir: None,
+            log: self.log.clone(),
+            kid: self.kid.clone(),
+            clock: self.clock.clone(),
+            naps: self.naps.clone(),
+            hook: self.hook.clone(),
+        }
     }
 }
 
