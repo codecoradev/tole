@@ -26,6 +26,9 @@
 //! Platform-agnostic: pure std + `base64`, no I/O beyond [`SecretSet::from_env`]
 //! reading the process environment.
 
+pub mod release;
+pub mod sensitive;
+
 use base64::Engine;
 use std::borrow::Cow;
 use std::sync::{Arc, OnceLock, RwLock};
