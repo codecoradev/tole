@@ -16,6 +16,13 @@
 //!
 //! A path counts when the name it was asked by OR its resolved real path
 //! (symlinks followed) matches, so `notes.txt -> .env` is sensitive.
+//!
+//! A hard link is invisible to a name rule (#703): `notes.txt` linked to
+//! `.env` is the same file under an innocuous name, and no path says so. On
+//! Unix `read_file` therefore withholds a regular file with more than one
+//! link ([`has_other_names`]) and points at `read_file_raw`, without looking
+//! at any other name (no directory scan; one `nlink` read from the metadata
+//! it already has). Elsewhere the check never fires.
 
 use serde_json::Value;
 use std::path::Path;
@@ -112,6 +119,22 @@ fn file_name(p: &Path) -> &str {
 /// is `real`, is sensitive: either name matches.
 pub fn is_sensitive_path(requested: &Path, real: &Path) -> bool {
     is_sensitive_file(requested) || is_sensitive_file(real)
+}
+
+/// Whether the regular file behind `meta` has more than one hard link, so
+/// it may be a sensitive file under another name (#703). Unix only: on
+/// other targets the link count is not available and this is always false.
+pub fn has_other_names(meta: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        meta.is_file() && meta.nlink() > 1
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        false
+    }
 }
 
 /// The redacted view of a sensitive file's content. A key file (either

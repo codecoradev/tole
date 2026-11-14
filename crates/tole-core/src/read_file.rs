@@ -7,6 +7,9 @@
 //! [`crate::sensitive`]) comes back redacted, with no content hash. The
 //! same tool built with [`ReadFileTool::raw`] is `read_file_raw`,
 //! `Risk::Write`: the approved, verbatim read (#598 part b).
+//!
+//! A regular file with more than one hard link is withheld by `read_file`
+//! (Unix only, #703): it may be a sensitive file under another name.
 
 use crate::tool::{Risk, Tool};
 use serde_json::{json, Value};
@@ -153,7 +156,7 @@ impl Tool for ReadFileTool {
             return Err("read_file: 'limit' must be at least 1".into());
         }
         let target = self.jailed(path)?;
-        let bytes = read_regular(&target, path)?;
+        let bytes = read_regular(&target, path, !self.raw)?;
         // Lossy decode: source files are UTF-8; anything else still gets
         // a readable form instead of a hard error.
         let mut content = String::from_utf8_lossy(&bytes).into_owned();
@@ -215,8 +218,9 @@ impl Tool for ReadFileTool {
 /// writer appears and reports len() == 0, so the file is opened without
 /// blocking or following a final symlink, checked on the open handle, and
 /// read with a cap (a file swapped in after the check cannot hang or bloat
-/// the read).
-fn read_regular(target: &Path, path: &str) -> Result<Vec<u8>, String> {
+/// the read). With `withhold_linked`, a file with more than one hard link is
+/// refused (#703).
+fn read_regular(target: &Path, path: &str, withhold_linked: bool) -> Result<Vec<u8>, String> {
     use std::io::Read;
     let mut o = std::fs::OpenOptions::new();
     o.read(true);
@@ -237,6 +241,15 @@ fn read_regular(target: &Path, path: &str) -> Result<Vec<u8>, String> {
     if !meta.is_file() {
         return Err(format!(
             "read_file: not a regular file (refusing to read): {path}"
+        ));
+    }
+    // A hard link may be a sensitive file under an innocuous name (#703);
+    // checked on the open handle, so a swap after the check changes nothing.
+    if withhold_linked && crate::sensitive::has_other_names(&meta) {
+        return Err(format!(
+            "read_file: {path} has more than one hard link, so it may be a sensitive file \
+             under another name; withheld. To read it verbatim, call read_file_raw (the user \
+             must approve it)"
         ));
     }
     let too_big = |n: u64| format!("read_file: {path} is {n} bytes (max {MAX_READ_BYTES})");
@@ -580,5 +593,37 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("the read blocked on a FIFO");
         assert!(got.unwrap_err().contains("not a regular file"));
+    }
+    /// #703: a hard link to `.env` under an innocuous name is withheld by
+    /// `read_file`, a single-link file is not, and `read_file_raw` still
+    /// reads the linked file.
+    #[cfg(unix)]
+    #[test]
+    fn a_hard_link_to_a_sensitive_file_is_withheld() {
+        let dir = tmpdir("hardlink");
+        std::fs::write(dir.join(".env"), "TOKEN=hunter2hunter2\n").unwrap();
+        std::fs::write(dir.join("plain.txt"), "hello").unwrap();
+        std::fs::hard_link(dir.join(".env"), dir.join("notes.txt")).unwrap();
+        let t = ReadFileTool::new(dir.clone());
+
+        let err = t.execute(json!({"path": "notes.txt"})).unwrap_err();
+        assert!(
+            err.contains("hard link") && err.contains("read_file_raw"),
+            "{err}"
+        );
+        assert!(!err.contains("hunter2"), "{err}");
+
+        let ok = t.execute(json!({"path": "plain.txt"})).unwrap();
+        assert_eq!(ok["content"], json!("hello"));
+
+        let raw = ReadFileTool::raw(dir.clone())
+            .execute(json!({"path": "notes.txt"}))
+            .unwrap();
+        assert!(raw["content"].as_str().unwrap().contains("hunter2hunter2"));
+
+        // Dropping the other name leaves one link: readable again.
+        std::fs::remove_file(dir.join(".env")).unwrap();
+        let out = t.execute(json!({"path": "notes.txt"})).unwrap();
+        assert!(out["content"].as_str().unwrap().contains("hunter2hunter2"));
     }
 }
