@@ -240,6 +240,50 @@ pub fn tool_changes(
     out
 }
 
+/// How far an MCP server is trusted (design §4.3). Data in the lock entry,
+/// shown by `tole plugin list`; what each tier may do is enforced where the
+/// server is started (sandbox, interactive only), not by this label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Tier {
+    /// The owner's own servers (the first-party list): lock, manifest hash,
+    /// scrubbed environment.
+    FirstParty,
+    /// A third-party server whose namespace the official registry verified
+    /// (set only by registry resolution, a later part).
+    ThirdPartyVerified,
+    /// Anything else: interactive sessions only, sandbox required.
+    ThirdPartyUnverified,
+}
+
+impl Tier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Tier::FirstParty => "first-party",
+            Tier::ThirdPartyVerified => "third-party-verified",
+            Tier::ThirdPartyUnverified => "third-party-unverified",
+        }
+    }
+}
+
+/// The servers that count as first-party until the owner configures
+/// `[plugins] first_party` (design §4.3).
+pub const DEFAULT_FIRST_PARTY: [&str; 4] = ["cora", "uteke", "nginjen", "laya"];
+
+/// The tier of server `name`. A first-party claim holds only for a name on
+/// the owner's `first_party` list, whatever a lock entry says (the lock is a
+/// file, the list is owner config); the stored tier can otherwise only be
+/// third-party, and an entry without one is unverified.
+pub fn tier_of(name: &str, entry: Option<&LockEntry>, first_party: &[String]) -> Tier {
+    if first_party.iter().any(|f| f == name) {
+        return Tier::FirstParty;
+    }
+    match entry.and_then(|e| e.tier) {
+        Some(Tier::ThirdPartyVerified) => Tier::ThirdPartyVerified,
+        _ => Tier::ThirdPartyUnverified,
+    }
+}
+
 /// One approved server.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -275,6 +319,9 @@ pub struct LockEntry {
     /// entry: then only the hash is known).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub manifest: Vec<SnapshotTool>,
+    /// The tier recorded at approval (see [`tier_of`] for how it is read).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<Tier>,
 }
 
 /// A lock file.
@@ -467,6 +514,32 @@ pub fn admit(lock: &BTreeMap<String, LockEntry>, server: &str, live: &Live<'_>) 
         };
     }
     Admission::Trusted
+}
+
+/// What the lock decides about a configured server BEFORE it is started:
+/// `None` when the approved launch identity (command line or URL, program
+/// file) matches and the server may be started to compare its tools;
+/// otherwise why it must not be (never `Trusted` or `Changed`: those need
+/// the live tool list).
+pub fn admit_unseen(
+    lock: &BTreeMap<String, LockEntry>,
+    server: &str,
+    source: &str,
+    integrity: &str,
+) -> Option<Admission> {
+    let Some(e) = lock.get(server) else {
+        return Some(Admission::Unlocked);
+    };
+    if e.revoked {
+        return Some(Admission::Revoked);
+    }
+    if e.source != source {
+        return Some(Admission::Moved);
+    }
+    if !e.integrity.is_empty() && e.integrity != integrity {
+        return Some(Admission::Rebuilt);
+    }
+    None
 }
 
 /// One audit-ledger line (`approve`, `manifest_change`, `revoke`), names and

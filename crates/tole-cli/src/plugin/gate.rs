@@ -121,24 +121,15 @@ impl Gate {
     /// approved under this name never runs. Source and binary changes are
     /// recorded in the ledger.
     pub fn refuse_unseen(&self, server: &str, source: &str) -> Option<String> {
-        let e = match self.lock.get(server) {
-            None => return Some(refusal(server, &Admission::Unlocked)),
-            Some(e) if e.revoked => return Some(refusal(server, &Admission::Revoked)),
-            Some(e) => e,
+        let a = plugin_lock::admit_unseen(&self.lock, server, source, &integrity(source))?;
+        let event = match a {
+            Admission::Moved => "source_change",
+            Admission::Rebuilt => "binary_change",
+            _ => "",
         };
-        let a = if e.source != source {
-            Admission::Moved
-        } else if !e.integrity.is_empty() && integrity(source) != e.integrity {
-            Admission::Rebuilt
-        } else {
-            return None;
-        };
-        let event = if a == Admission::Moved {
-            "source_change"
-        } else {
-            "binary_change"
-        };
-        self.record(event, server, &e.manifest_hash);
+        if let Some(e) = self.lock.get(server).filter(|_| !event.is_empty()) {
+            self.record(event, server, &e.manifest_hash);
+        }
         Some(refusal(server, &a))
     }
 
@@ -184,6 +175,7 @@ impl Gate {
             approved_at: now(),
             revoked: false,
             manifest: plugin_lock::snapshot(tools, &tole_core::secrets::process_secrets()),
+            tier: None,
         };
         lock.servers.insert(server.to_string(), entry.clone());
         lock.save(&path)?;

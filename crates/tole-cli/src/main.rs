@@ -1434,6 +1434,21 @@ fn dispatch(cli: Cli) -> Result<()> {
                 interactive: std::io::stdin().is_terminal() && std::io::stderr().is_terminal(),
                 ask: &mut ask,
                 secrets: tole_cli::provider_chain::process_secrets(&config_apply::real_env),
+                first_party: tole_core::plugin_lock::DEFAULT_FIRST_PARTY
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+                sandbox: tole_core::sandbox::policy(),
+                backend: tole_core::sandbox::detect(),
+                mcp_grants: {
+                    let release = tole_core::secret_release::release();
+                    release
+                        .held_grants()
+                        .into_iter()
+                        .filter(|n| release.allows(n, "mcp"))
+                        .collect()
+                },
+                probe: !tole_core::child_env::under_session(&config_apply::real_env),
             };
             match tole_cli::plugin_cmd::run(action, &mut ctx) {
                 Ok(out) => {
