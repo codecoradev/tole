@@ -510,5 +510,5 @@ pub fn run(action: Option<DraftsAction>, store: &DraftStore) -> anyhow::Result<(
 }
 
 #[cfg(test)]
-#[path = "skill_drafts_cli_tests.rs"]
+#[path = "drafts_tests.rs"]
 mod tests;

@@ -19,6 +19,16 @@ use std::path::{Path, PathBuf};
 use tole_core::ledger::LedgerStore as _;
 use tole_core::plugin_lock::{self, admit, Admission, Live, LockEntry, Lockfile, ManifestTool};
 
+/// What an approval records beyond the tool list (see
+/// [`Gate::approve_with`]).
+#[derive(Debug, Default)]
+pub struct Approval {
+    pub integrity: Option<String>,
+    pub tier: Option<plugin_lock::Tier>,
+    pub sandbox: Option<String>,
+    pub secrets: Option<Vec<String>>,
+}
+
 /// The layered lock of one session.
 pub struct Gate {
     lock: BTreeMap<String, LockEntry>,
@@ -69,6 +79,12 @@ impl Gate {
                 };
             }
         };
+        // The ledger holds the user's decisions: it is checked against the
+        // user lock, before a project lock narrows it.
+        let mut user_lock = user_lock;
+        if let Some(u) = user.as_deref() {
+            notes.extend(blocked_notes(&apply_ledger(u, &mut user_lock)));
+        }
         let (lock, more) = plugin_lock::effective(&user_lock, &project);
         notes.extend(more);
         Self {
@@ -148,6 +164,21 @@ impl Gate {
         version: &str,
         tools: &[ManifestTool],
     ) -> Result<(), String> {
+        self.approve_with(server, source, version, tools, Approval::default())
+    }
+
+    /// [`Gate::approve`] with what the caller measured or decided itself:
+    /// the program hash taken before the server was started, the tier, the
+    /// sandbox profile it ran in and the secret grant (`None`: the `mcp`
+    /// grants held now).
+    pub fn approve_with(
+        &mut self,
+        server: &str,
+        source: &str,
+        version: &str,
+        tools: &[ManifestTool],
+        with: Approval,
+    ) -> Result<(), String> {
         let path = self
             .user_path
             .clone()
@@ -164,18 +195,20 @@ impl Gate {
         let entry = LockEntry {
             source: source.to_string(),
             version: version.to_string(),
-            integrity: integrity(source),
+            integrity: with.integrity.unwrap_or_else(|| integrity(source)),
             manifest_hash: plugin_lock::manifest_hash(tools),
-            secrets: release
-                .held_grants()
-                .into_iter()
-                .filter(|n| release.allows(n, "mcp"))
-                .collect(),
-            sandbox: None,
+            secrets: with.secrets.unwrap_or_else(|| {
+                release
+                    .held_grants()
+                    .into_iter()
+                    .filter(|n| release.allows(n, "mcp"))
+                    .collect()
+            }),
+            sandbox: with.sandbox,
             approved_at: now(),
             revoked: false,
             manifest: plugin_lock::snapshot(tools, &tole_core::secrets::process_secrets()),
-            tier: None,
+            tier: with.tier,
         };
         lock.servers.insert(server.to_string(), entry.clone());
         lock.save(&path)?;
@@ -211,6 +244,49 @@ impl Gate {
         out.extend(self.notes.iter().map(|n| format!("  ! {n}")));
         out
     }
+}
+
+/// One note per server the ledger blocked, and one when the ledger could
+/// not be read at all.
+pub fn blocked_notes(check: &plugin_lock::LedgerCheck) -> Vec<String> {
+    let mut notes: Vec<String> = check
+        .blocked
+        .iter()
+        .map(|(s, why)| format!("plugin lock: `{s}` is not trusted: {why}"))
+        .collect();
+    if let Some(why) = &check.unreadable {
+        notes.push(format!(
+            "plugin ledger unreadable ({why}): revocations recorded there are not checked \
+             against the lock until it is fixed"
+        ));
+    }
+    notes
+}
+
+/// Marks `lock`'s entries the owner's ledger does not allow (see
+/// [`plugin_lock::check_against_ledger`]) as revoked, so a lock edited by
+/// hand cannot bring back a revoked server or re-pin an approved one.
+pub fn apply_ledger(user: &Path, lock: &mut Lockfile) -> plugin_lock::LedgerCheck {
+    let Some(path) = user.parent().map(|d| d.join(plugin_lock::LEDGER_FILE)) else {
+        return plugin_lock::LedgerCheck::default();
+    };
+    let text = match plugin_lock::read_ledger(&path) {
+        Ok(Some(t)) => t,
+        Ok(None) => return plugin_lock::LedgerCheck::default(),
+        Err(why) => {
+            return plugin_lock::LedgerCheck {
+                unreadable: Some(why),
+                ..Default::default()
+            }
+        }
+    };
+    let check = plugin_lock::check_against_ledger(&lock.servers, &text);
+    for (name, _) in &check.blocked {
+        if let Some(e) = lock.servers.get_mut(name) {
+            e.revoked = true;
+        }
+    }
+    check
 }
 
 /// Appends one ledger line next to the user lock `user` (names and

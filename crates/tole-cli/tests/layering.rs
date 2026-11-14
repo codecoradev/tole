@@ -38,10 +38,10 @@ const KERNEL_MODULES: &[&str] = &[
 #[rustfmt::skip]
 const ENGINE_MODULES: &[&str] = &[
     "session",
+    "skill",
     "delegation",
     "plugin",
-    "discuss", "skill_approve", "skill_drafts_cli", "skill_recall",
-    "skill_propose", "skill_outcome", "curator_cmd", "cron", "tool_roster", "provider_chain",   "events", "serve_images",
+    "discuss", "cron", "tool_roster", "provider_chain", "events", "serve_images",
 ];
 #[rustfmt::skip]
 const FACE_MODULES: &[&str] = &["doctor", "ecosystem", "hook_cli"];
@@ -63,6 +63,12 @@ const ALIASES: &[(&str, &str)] = &[
     ("usage_report", "session"),
     ("export", "session"),
     ("tui_host", "session"),
+    ("skill_approve", "skill"),
+    ("skill_drafts_cli", "skill"),
+    ("skill_recall", "skill"),
+    ("skill_propose", "skill"),
+    ("skill_outcome", "skill"),
+    ("curator_cmd", "skill"),
     ("delegate", "delegation"),
     ("delegate_decide", "delegation"),
     ("delegated_approver", "delegation"),
@@ -331,4 +337,34 @@ fn scanner_reads_plain_group_and_nested_paths() {
     let text = "use super::w::X; use super::{p, q::R}; use super::super::s::T;";
     assert_eq!(crate_targets(text, 1), ["w", "p", "q"]);
     assert_eq!(crate_targets(text, 2), ["s"]);
+}
+
+#[test]
+fn every_re_export_of_a_moved_module_has_an_alias() {
+    // `pub use dir::name [as old];` in lib.rs keeps an old path alive; the scan
+    // only sees edges to that old name if ALIASES maps it to `dir`.
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mods = top_level_modules(&src);
+    let lib = fs::read_to_string(src.join("lib.rs")).unwrap();
+    let mut missing = Vec::new();
+    for line in lib.lines() {
+        let Some(rest) = line
+            .strip_prefix("pub use ")
+            .or_else(|| line.strip_prefix("pub(crate) use "))
+        else {
+            continue;
+        };
+        let rest = rest.trim_end_matches(';');
+        let (path, alias) = rest.split_once(" as ").unwrap_or((rest, ""));
+        let (dir, name) = path.split_once("::").unwrap_or((path, ""));
+        let old = if alias.is_empty() { name } else { alias };
+        if mods.contains(dir) && !ALIASES.contains(&(old, dir)) {
+            missing.push(format!("  (\"{old}\", \"{dir}\")"));
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "lib.rs re-exports moved modules that have no ALIASES entry; add:\n{}",
+        missing.join("\n")
+    );
 }
