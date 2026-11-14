@@ -133,7 +133,7 @@ pub struct DelegateIndependent(pub Arc<crate::delegate::Delegator>);
 impl Independent for DelegateIndependent {
     fn start(&self, who: &str, task: &str, tokens: u64, key: &str) -> Result<String, String> {
         self.0
-            .consult(who, &format!("{}\n\n{task}", call_marker(key)), tokens)
+            .consult_participant(who, &format!("{}\n\n{task}", call_marker(key)), tokens)
     }
     fn find(&self, key: &str) -> Result<Option<String>, String> {
         self.0.find_child(&call_marker(key))
@@ -163,7 +163,7 @@ impl Independent for DelegateIndependent {
 /// The first line of an independent child's task: which reserved call
 /// started it, so a resumed driver can find it.
 fn call_marker(key: &str) -> String {
-    format!("[tole discussion call {key}]")
+    format!("{}{key}]", crate::delegate::PARTICIPANT_MARKER)
 }
 
 /// Least tokens carved for an independent participant (a child mission

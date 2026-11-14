@@ -22,17 +22,32 @@ const CONFIG: &str = "[delegation]\ngoal_budget = 100000\n[profiles.coder]\n[pro
     [profiles.wide]\nallow = [\"run_command:cargo *\"]\n[profiles.narrow]\nallow = [\"read_file\"]\n";
 
 fn rig(tag: &str, allows: &[&str], usage: u64, answer: Answer) -> Rig {
+    rig_with(tag, allows, usage, answer, PathBuf::from("/bin/true"))
+}
+
+/// A rig whose children are `bin`, with a machine guard that never waits.
+fn rig_with(tag: &str, allows: &[&str], usage: u64, answer: Answer, bin: PathBuf) -> Rig {
     let root = tmp(&format!("tool-{tag}"));
     let data = root.join("data");
     std::fs::create_dir_all(&data).unwrap();
     let setup = Setup {
         cfg: crate::config::parse(CONFIG, Path::new("user.toml")).unwrap(),
         data_dir: Some(data.clone()),
+        thresholds: Some(tole_core::resource_guard::Thresholds {
+            min_free_memory_mb: 0,
+            child_memory_mb: 0,
+            max_load_per_cpu: 1e9,
+            min_free_disk_mb: 0,
+            min_free_pids_percent: 0,
+            spawn_interval_secs: 0,
+            machine_max_live: 1024,
+            child_nice: 0,
+        }),
         ..Setup::default()
     };
     let delegator = Arc::new(
         Delegator::for_session(
-            PathBuf::from("/bin/true"),
+            bin,
             root.clone(),
             false,
             allows.iter().map(|s| s.to_string()).collect(),
@@ -94,7 +109,11 @@ fn wait_closed(r: &Rig, id: &str) -> Value {
                 return v;
             }
         }
-        assert!(Instant::now() < end, "never closed: {v}");
+        assert!(
+            Instant::now() < end,
+            "never closed: {v} {:?}",
+            discussion_nodes(r)
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
 }
@@ -538,4 +557,139 @@ fn a_session_at_the_goals_depth_limit_has_no_discussion_host() {
         at_limit.is_none(),
         "no Delegator, so neither `delegate` nor the discussion tools exist there"
     );
+}
+
+/// A stand-in `tole` child: records its argv and env, hands in a report.
+fn reviewer_bin(dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let p = dir.join("reviewer-bin");
+    let body = "#!/bin/sh\nprev=\"\"\nfor a in \"$@\"; do [ \"$prev\" = \"--sessions-dir\" ] && D=\"$a\"; \
+        prev=\"$a\"; done\nmkdir -p \"$D\"\nprintf '%s\\n' \"$@\" > \"$D/../argv\"\nenv > \"$D/../env\"\n\
+        printf '%s' '{\"summary\":\"the plan is sound\",\"risks\":[]}' > \"$TOLE_DELEGATION_REPORT\"\n";
+    std::fs::write(&p, body).unwrap();
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    p
+}
+
+fn reviewer_input(modes: Value) -> Value {
+    let mut i = input();
+    i["modes"] = modes;
+    i
+}
+
+fn participant_nodes(r: &Rig) -> Vec<Node> {
+    nodes(r)
+        .into_iter()
+        .filter(|n| n.task.starts_with(crate::delegate::PARTICIPANT_MARKER))
+        .collect()
+}
+
+/// #704: `modes` is a closed enum, one entry per participant; a bad one is
+/// refused before anything is carved or started.
+#[test]
+fn modes_are_a_closed_enum_with_one_entry_per_participant() {
+    let r = rig("modes-bad", &[], 100, agreeable());
+    for (modes, want) in [
+        (json!(["inline"]), "one entry per participant"),
+        (
+            json!(["inline", "inline", "inline"]),
+            "one entry per participant",
+        ),
+        (json!(["inline", "child"]), "inline or reviewer"),
+        (
+            json!(["inline", {"mode": "reviewer"}]),
+            "inline or reviewer",
+        ),
+        (json!(["inline", "Reviewer"]), "inline or reviewer"),
+        (json!("reviewer"), "array"),
+    ] {
+        let err = r.host.start(&reviewer_input(modes.clone())).unwrap_err();
+        assert!(err.contains(want), "{modes}: {err}");
+    }
+    assert!(discussion_nodes(&r).is_empty(), "nothing was carved");
+    assert!(participant_nodes(&r).is_empty());
+    assert!(!r.dir.exists(), "nothing was written");
+    // The opt-in is `modes` only: other spellings stay unknown fields.
+    for field in ["mode", "reviewers", "independent", "tools"] {
+        let mut i = input();
+        i[field] = json!(["reviewer", "reviewer"]);
+        let err = r.host.start(&i).unwrap_err();
+        assert!(err.contains("unknown field"), "{field}: {err}");
+    }
+    // The schema offers the enum, and nothing else is allowed.
+    let spec = DiscussTool(r.host.clone()).spec().unwrap();
+    assert_eq!(
+        spec["properties"]["modes"]["items"]["enum"],
+        json!(["inline", "reviewer"])
+    );
+    assert_eq!(spec["properties"].as_object().unwrap().len(), FIELDS.len());
+}
+
+/// Without `modes` (or with every entry inline) no process starts: the
+/// default is the inline discussion of #701.
+#[test]
+fn inline_is_the_default_and_starts_no_child() {
+    let dir = tmp("bin-inline-default");
+    let r = rig_with("inline-default", &[], 100, agreeable(), reviewer_bin(&dir));
+    for modes in [Value::Null, json!(["inline", "inline"])] {
+        let mut i = input();
+        i["modes"] = modes;
+        let out = r.host.start(&i).unwrap();
+        assert_eq!(out["reviewers"], json!([]));
+        wait_closed(&r, &id_of(&out));
+    }
+    assert!(participant_nodes(&r).is_empty());
+}
+
+/// #704: a reviewer runs as a read-only `consult` child of the caller's
+/// goal: the profile must be seatable, its carve comes from the caller's
+/// budget, and it has no allow list, plan mode and the participant marker.
+#[test]
+fn a_reviewer_is_a_read_only_consult_child_within_the_callers_budget() {
+    let dir = tmp("bin-reviewer");
+    let r = rig_with("reviewer", &[], 100, agreeable(), reviewer_bin(&dir));
+    let out = r
+        .host
+        .start(&reviewer_input(json!(["inline", "reviewer"])))
+        .unwrap();
+    assert_eq!(out["reviewers"], json!(["ops"]));
+    wait_closed(&r, &id_of(&out));
+    let kids = participant_nodes(&r);
+    assert!(!kids.is_empty(), "the reviewer started a child");
+    let goal = nodes(&r).into_iter().find(|n| n.parent.is_none()).unwrap();
+    for k in &kids {
+        assert_eq!(k.profile.as_deref(), Some("ops"));
+        assert_eq!(k.mode, tole_core::delegation::Mode::Consult);
+        assert!(k.allow.is_empty(), "{:?}", k.allow);
+        assert_eq!(k.parent.as_deref(), Some(goal.id.as_str()));
+        assert!(k.budget.tokens >= crate::discussion_host::INDEPENDENT_MIN_TOKENS);
+        assert!(k.budget.tokens <= goal.budget.tokens);
+    }
+    let session = PathBuf::from(kids[0].session.clone().unwrap());
+    let argv = std::fs::read_to_string(session.join("argv")).unwrap();
+    assert!(argv.lines().any(|a| a == "--plan-mode"), "{argv}");
+    let env = std::fs::read_to_string(session.join("env")).unwrap();
+    assert!(env.contains("TOLE_DISCUSSION_PARTICIPANT=1\n"), "{env}");
+    // Everything the caller is charged stays within its budget.
+    let root = nodes(&r).into_iter().find(|n| n.id == goal.id).unwrap();
+    assert!(root.own.tokens <= goal.budget.tokens);
+}
+
+/// A reviewer must be a profile the caller may delegate to, as every
+/// participant: nothing starts for a refused one.
+#[test]
+fn a_reviewer_must_be_a_profile_the_caller_may_seat() {
+    let dir = tmp("bin-reviewer-seat");
+    let r = rig_with(
+        "reviewer-seat",
+        &["read_file"],
+        100,
+        agreeable(),
+        reviewer_bin(&dir),
+    );
+    let mut i = reviewer_input(json!(["inline", "reviewer"]));
+    i["participants"] = json!(["coder", "wide"]);
+    let err = r.host.start(&i).unwrap_err();
+    assert!(err.contains("`wide`"), "{err}");
+    assert!(discussion_nodes(&r).is_empty() && participant_nodes(&r).is_empty());
 }

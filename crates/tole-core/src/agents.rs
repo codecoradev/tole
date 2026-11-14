@@ -577,6 +577,9 @@ pub struct ChildOpts {
     /// Set by the delegate tool: the child starts at least this nice
     /// ([`crate::resource_guard::apply_child_nice`]).
     pub nice: Option<u32>,
+    /// Set for an independent discussion participant (#704): the child's
+    /// environment says so, and it may not start a discussion.
+    pub participant: bool,
 }
 
 impl AgentStartTool {
@@ -887,6 +890,7 @@ impl Tool for AgentStartTool {
                 .opts
                 .delegated
                 .then(|| dir.join(crate::delegation_report::REPORT_FILE)),
+            participant: self.opts.participant,
         };
         cmd.envs(launch.vars());
         if self.opts.command.is_empty() {

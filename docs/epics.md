@@ -312,7 +312,9 @@ Bot and Nakama; BMAD for collaboration). Design notes:
     owner-only `tole discuss` command; part 3b is the model-facing
     `discuss`, `discuss_status` and `discuss_stop` under the rules of
     `delegate` (the owner chose both entry points, see `automation-design.md`
-    "Entry point"); independent child participants for agents are not done);
+    "Entry point"); independent child participants for agents (#704) are in
+    as read-only reviewers whose Write is denied; routing a participant's
+    Write to the owner's approval surface is #714);
   - `uteke_document` parent (#576; done).
 - **E3 — Skills, epic #589:** `SkillIndex` + uteke doc adapter, K = 5 with
   pinned core (#590), approved-hash loading (#591), propose-only growth with

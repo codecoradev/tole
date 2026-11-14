@@ -65,6 +65,14 @@ pub fn discussion_task(id: &str) -> String {
     format!("discussion {id}")
 }
 
+/// The first characters of the task of an independent discussion
+/// participant's child (#704). A `consult` child whose task starts with it is
+/// launched as a participant: plan mode (no Write tool exists), no allow
+/// patterns, and the participant marker in its environment. Only
+/// restrictions hang on it, so a model that writes it into a `delegate` task
+/// only makes its own child stricter.
+pub const PARTICIPANT_MARKER: &str = "[tole discussion call ";
+
 /// The delegation log, next to the agent dirs of the root session.
 pub const LOG_FILE: &str = "delegation.jsonl";
 /// Defaults of a goal's budget when `[delegation]` sets none.
@@ -149,6 +157,8 @@ struct Spec {
     role: Option<String>,
     consumes: Option<Value>,
     keep_mailbox: bool,
+    /// An independent discussion participant (#704), read from the node.
+    participant: bool,
 }
 
 /// One session's delegation host.
@@ -252,6 +262,11 @@ impl Delegator {
         // the agent dirs recorded as sessions and the poll lookups. A
         // workspace that cannot be canonicalized gets no delegate tool.
         let root = root.canonicalize().ok()?;
+        // A discussion participant (#704) neither delegates nor starts a
+        // discussion: no nested discussions, whatever its depth.
+        if tole_core::child_env::discussion_participant(env) {
+            return None;
+        }
         let (log, node, child) = match tole_core::child_env::delegation(env) {
             Some((log, node)) => {
                 let d = Delegation::open(FileStore::new(log.clone())).ok()?;
@@ -370,6 +385,14 @@ impl Delegator {
     }
 
     fn delegate(&self, input: &Value) -> Result<Value, String> {
+        self.delegate_as(input, false)
+    }
+
+    /// `delegate`, as an independent discussion participant when
+    /// `participant` (#704): the child's allow list is empty (the profile's
+    /// patterns are not carried over, so nothing of the profile or the
+    /// caller's allow list can approve a Write) and it launches read-only.
+    fn delegate_as(&self, input: &Value, participant: bool) -> Result<Value, String> {
         let s = |k: &str| input.get(k).and_then(Value::as_str).map(str::to_string);
         let task = s("task")
             .or_else(|| s("prompt"))
@@ -407,6 +430,7 @@ impl Delegator {
             }
         };
         let profile_allow = match &profile {
+            Some(_) if participant => Vec::new(),
             Some(p) => p.allow.clone(),
             None if requested.is_empty() => self.parent_allows.clone(),
             None => requested,
@@ -550,6 +574,7 @@ impl Delegator {
             role: x.role.clone(),
             consumes: x.consumes.clone(),
             keep_mailbox: x.keep_mailbox,
+            participant: n.mode == Mode::Consult && n.task.starts_with(PARTICIPANT_MARKER),
         })
     }
 
@@ -671,6 +696,35 @@ impl Delegator {
             "task": task, "profile": profile, "mode": "consult",
             "budget": {"tokens": tokens},
         }))?;
+        out["node"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| "delegate: no node id".into())
+    }
+
+    /// Starts `task` (which must start with [`PARTICIPANT_MARKER`]) as an
+    /// independent discussion participant (#704): a `consult` child as
+    /// `profile`, with `tokens` carved from this session's budget, under
+    /// every cap, the lease rules and the machine guard of `delegate`, but
+    /// read-only: plan mode, an empty allow list and the participant marker
+    /// in its environment. Any Write it wants is denied (fail closed); the
+    /// owner's approval surface for it is #714. Returns the node id.
+    pub fn consult_participant(
+        &self,
+        profile: &str,
+        task: &str,
+        tokens: u64,
+    ) -> Result<String, String> {
+        if !task.starts_with(PARTICIPANT_MARKER) {
+            return Err("delegate: a participant's task starts with its call marker".into());
+        }
+        let out = self.delegate_as(
+            &json!({
+                "task": task, "profile": profile, "mode": "consult",
+                "budget": {"tokens": tokens},
+            }),
+            true,
+        )?;
         out["node"]
             .as_str()
             .map(str::to_string)
@@ -991,6 +1045,10 @@ fn launch(
     if let Some(p) = &spec.profile {
         command.extend(["--profile".into(), p.into()]);
     }
+    if spec.participant {
+        // No Write tool exists in plan mode (the report tool apart).
+        command.push("--plan-mode".into());
+    }
     let mut start = AgentStartTool::new(spec.bin.clone(), spec.root.clone())
         .with_worktrees(spec.worktrees)
         .with_parent_allows(spec.allow.clone());
@@ -1002,6 +1060,7 @@ fn launch(
         delegation: Some((log.to_path_buf(), spec.node.clone())),
         keep_secrets: spec.keep_secrets.clone(),
         nice: Some(nice),
+        participant: spec.participant,
     };
     let mut input = json!({"prompt": spec.task, "keep_mailbox": spec.keep_mailbox});
     if let Some(r) = &spec.role {

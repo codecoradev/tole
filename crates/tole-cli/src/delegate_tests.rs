@@ -1215,3 +1215,114 @@ fn an_independent_participant_is_a_consult_child_settled_with_its_report() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// The argv and env a node's child recorded, and its node.
+fn recorded(root: &Path, node: &str) -> (Vec<String>, String, tole_core::delegation::Node) {
+    let n = log_of(root).poll(node).cloned().unwrap();
+    let dir = PathBuf::from(n.session.clone().expect("the child started"));
+    let argv = wait_for(&dir.join("argv"))
+        .lines()
+        .map(str::to_string)
+        .collect();
+    (argv, wait_for(&dir.join("env")), n)
+}
+
+const PART_TASK: &str = "[tole discussion call d-1-c1]\n\nreview the plan";
+
+/// #704: an independent participant is read-only whatever its profile
+/// holds: plan mode, an empty allow list (only the harness's report tool is
+/// allowed) and the participant marker in its environment.
+#[test]
+fn a_participant_child_launches_read_only_with_no_profile_allow_and_the_marker() {
+    let root = tmp("participant");
+    let h = host(&root, 0, &["write_*"], PROFILE);
+    let node = h.consult_participant("coder", PART_TASK, 400).unwrap();
+    let (argv, env, n) = recorded(&root, &node);
+    assert!(argv.iter().any(|a| a == "--plan-mode"), "{argv:?}");
+    assert!(
+        n.allow.is_empty(),
+        "the profile's write_file is not carried over: {:?}",
+        n.allow
+    );
+    let allows: Vec<&str> = argv
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| *a == "--allow")
+        .map(|(i, _)| argv[i + 1].as_str())
+        .collect();
+    assert_eq!(allows, ["delegate_report"], "{argv:?}");
+    assert!(env.contains("TOLE_DISCUSSION_PARTICIPANT=1\n"), "{env}");
+    assert_eq!((n.mode, n.budget.tokens), (Mode::Consult, 400));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The restrictions hang on the participant task only: an ordinary
+/// `delegate` child keeps its profile's allow list and has no marker.
+#[test]
+fn an_ordinary_child_is_not_a_participant() {
+    let root = tmp("not-participant");
+    let h = host(&root, 0, &["write_*"], PROFILE);
+    let (start, _) = tools(&h, &root);
+    let out = start
+        .execute(
+            json!({"task": "add the parser", "profile": "coder", "mode": "consult",
+                        "budget": {"tokens": 400}}),
+        )
+        .unwrap();
+    let (argv, env, n) = recorded(&root, out["node"].as_str().unwrap());
+    assert!(!argv.iter().any(|a| a == "--plan-mode"), "{argv:?}");
+    assert_eq!(n.allow, ["write_file"]);
+    assert!(!env.contains("TOLE_DISCUSSION_PARTICIPANT"), "{env}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_participant_needs_its_call_marker_and_a_profile_and_is_carved_never_added() {
+    let root = tmp("participant-refused");
+    let h = host(&root, 0, &["write_*"], PROFILE);
+    let err = h.consult_participant("coder", "review", 100).unwrap_err();
+    assert!(err.contains("call marker"), "{err}");
+    assert!(h.consult_participant("stranger", PART_TASK, 100).is_err());
+    // Never more than is left (the goal has 1000): the carve is capped.
+    let node = h.consult_participant("coder", PART_TASK, 5_000).unwrap();
+    let carved = log_of(&root).poll(&node).unwrap().budget.tokens;
+    assert!(carved <= 1_000, "carved {carved} of a 1000 goal");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// #704: a participant child cannot start a discussion (nor delegate), at
+/// any depth: it gets no host, so no tool is registered for it.
+#[test]
+fn a_discussion_participant_gets_no_delegation_host() {
+    let root = tmp("participant-nohost");
+    let h = host(&root, 0, &["write_*"], PROFILE);
+    let node = h.consult_participant("coder", PART_TASK, 400).unwrap();
+    let n = log_of(&root).poll(&node).cloned().unwrap();
+    let log = log_file(&root).to_string_lossy().to_string();
+    let child_env = |marked: bool| {
+        let (l, n) = (log.clone(), node.clone());
+        move |k: &str| match k {
+            "TOLE_AGENT_DEPTH" => Some("1".to_string()),
+            "TOLE_DELEGATION_LOG" => Some(l.clone()),
+            "TOLE_DELEGATION_NODE" => Some(n.clone()),
+            "TOLE_DISCUSSION_PARTICIPANT" if marked => Some("1".to_string()),
+            _ => None,
+        }
+    };
+    let open = |marked: bool| {
+        Delegator::for_session(
+            PathBuf::from("/bin/true"),
+            root.clone(),
+            false,
+            n.allow.clone(),
+            setup(PROFILE),
+            &child_env(marked),
+        )
+    };
+    assert!(
+        open(false).is_some(),
+        "an unmarked child at depth 1 may delegate"
+    );
+    assert!(open(true).is_none(), "a participant gets no host");
+    let _ = std::fs::remove_dir_all(&root);
+}

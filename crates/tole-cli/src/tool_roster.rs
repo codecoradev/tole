@@ -664,9 +664,25 @@ fn build_with_data_dir(
     let _ = cora_mcp_ok;
     // MCP tools are always Write: plan mode keeps only ReadOnly tools.
     if plan {
-        reg.retain_read_only();
+        keep_read_only(&mut reg, env)?;
     }
     Ok(reg)
+}
+
+/// Plan mode: only ReadOnly tools stay. A delegated child in plan mode (an
+/// independent discussion participant, #704) still hands in its one report:
+/// the tool writes one capped file at the path the parent chose and the
+/// parent adds it to the child's allow list, so it is the only Write tool
+/// left and the only one a participant can call.
+fn keep_read_only(reg: &mut ToolRegistry, env: &dyn Fn(&str) -> Option<String>) -> Result<()> {
+    reg.retain_read_only();
+    if let Some(path) = tole_core::child_env::delegation_report(env) {
+        add(
+            reg,
+            Box::new(tole_core::delegation_report::DelegateReportTool::new(path)),
+        )?;
+    }
+    Ok(())
 }
 
 /// Register `todo_read` / `todo_write` (#198) with state hydrated from the
@@ -730,6 +746,35 @@ mod tests {
         let server = build(AllowlistApprover::allow_only(vec![]), Roster::new(ws)).unwrap();
         assert!(server.get("delete_file").is_none());
         assert!(server.get("write_file").is_some());
+    }
+
+    /// #704: a plan-mode delegated child (a discussion participant) keeps
+    /// its one report tool and no other Write tool; without a report path
+    /// plan mode keeps read-only tools only.
+    #[test]
+    fn plan_mode_keeps_only_the_report_tool_of_a_delegated_child() {
+        let ws = workspace("plan-report");
+        let none = |_: &str| None::<String>;
+        let with = |k: &str| {
+            (k == tole_core::child_env::DELEGATION_REPORT)
+                .then(|| "/tmp/agents/a/report.json".to_string())
+        };
+        for (env, report) in [
+            (&none as &dyn Fn(&str) -> Option<String>, false),
+            (&with, true),
+        ] {
+            let mut reg = build(Human, Roster::new(ws.clone())).unwrap();
+            assert!(reg.get("write_file").is_some());
+            keep_read_only(&mut reg, env).unwrap();
+            assert_eq!(reg.get("delegate_report").is_some(), report);
+            for name in names(&reg) {
+                let risk = reg.get(&name).unwrap().risk();
+                assert!(
+                    risk == Risk::ReadOnly || name == "delegate_report",
+                    "{name} is {risk:?} in plan mode"
+                );
+            }
+        }
     }
 
     #[test]
