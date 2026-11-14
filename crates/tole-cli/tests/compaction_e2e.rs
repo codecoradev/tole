@@ -139,7 +139,9 @@ fn tole(cwd: &Path, url: &str, args: &[&str], extra: &[(&str, &str)]) -> Output 
     c.args(args)
         .current_dir(cwd)
         .stdin(Stdio::null())
-        .env("CODECORA_HOME", cwd.join("home"))
+        // Outside the workspace: a jail that holds the data dir has no file
+        // writers (#684).
+        .env("CODECORA_HOME", cwd.with_extension("home"))
         .env("TOLE_BASE_URL", url)
         .env("TOLE_MODEL", "m")
         .env("TOLE_API_KEY", "k")

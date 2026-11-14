@@ -15,6 +15,12 @@ use std::path::PathBuf;
 /// Child depth; `1` in a child (the structural depth cap: a child gets
 /// no agent tools and may not respawn tole).
 pub const DEPTH: &str = "TOLE_AGENT_DEPTH";
+/// Set on every process a session's command tools start (`run_command`,
+/// `job_start`, #684): the owner-only subcommands (`tole cron create`,
+/// `plugin approve`, ...) refuse to write when it is present. Defense in
+/// depth, not a boundary: a process that clears its own environment can
+/// drop it (see `docs/threat-model.md`).
+pub const UNDER_SESSION: &str = "TOLE_UNDER_SESSION";
 /// The child's agent id (`a-<hex>-<hex>-<hex>`).
 pub const AGENT_ID: &str = "TOLE_AGENT_ID";
 /// The touch log shared by the siblings of one parent (#380).
@@ -99,6 +105,13 @@ impl ChildLaunch {
 /// This process's child depth: `0` when not a child (or unparseable).
 pub fn depth(env: &dyn Fn(&str) -> Option<String>) -> u32 {
     env(DEPTH).and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+}
+
+/// True when this process was started by a session (#684): the
+/// [`UNDER_SESSION`] marker is set, or it is a child agent (depth >= 1).
+/// A human running `tole` from a terminal has neither.
+pub fn under_session(env: &dyn Fn(&str) -> Option<String>) -> bool {
+    env(UNDER_SESSION).is_some_and(|v| !v.trim().is_empty()) || depth(env) >= 1
 }
 
 /// This child's agent id and the shared touch log (#380). `None` when this

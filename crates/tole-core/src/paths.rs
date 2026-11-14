@@ -33,6 +33,33 @@ pub fn tole_data_dir() -> Option<PathBuf> {
     codecora_root().map(|r| r.join("tole"))
 }
 
+/// `p` made absolute and symlink-free as far as it exists: the longest
+/// existing ancestor is canonicalized and the rest appended.
+fn canon_lenient(p: &std::path::Path) -> PathBuf {
+    let mut tail = Vec::new();
+    let mut cur = p;
+    loop {
+        if let Ok(c) = cur.canonicalize() {
+            return tail.iter().rev().fold(c, |acc, n| acc.join(n));
+        }
+        match (cur.parent(), cur.file_name()) {
+            (Some(parent), Some(name)) => {
+                tail.push(name.to_owned());
+                cur = parent;
+            }
+            _ => return p.to_path_buf(),
+        }
+    }
+}
+
+/// True when a file-tool jail at `workspace` and `data_dir` overlap: the
+/// workspace holds the data dir (tole started in `~`), or is inside it.
+/// File tools in such a jail could write owner-only records (#684).
+pub fn jail_overlaps(workspace: &std::path::Path, data_dir: &std::path::Path) -> bool {
+    let (w, d) = (canon_lenient(workspace), canon_lenient(data_dir));
+    d.starts_with(&w) || w.starts_with(&d)
+}
+
 fn resolve_root(
     codecora_home: Option<&str>,
     home: Option<&str>,
@@ -151,5 +178,35 @@ mod tests {
                 assert_eq!(tole_data_dir(), None);
             },
         );
+    }
+
+    /// #684: a file-tool jail that holds (or sits inside) the data dir is
+    /// refused; a sibling directory is not.
+    #[test]
+    fn jail_overlap_with_the_data_dir() {
+        let base = std::env::temp_dir().join(format!("tole-paths-jail-{}", std::process::id()));
+        let data = base.join(".codecora").join("tole");
+        std::fs::create_dir_all(&data).unwrap();
+        let project = base.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        assert!(jail_overlaps(&base, &data), "home holds the data dir");
+        assert!(jail_overlaps(&base.join(".codecora"), &data));
+        assert!(jail_overlaps(&data, &data));
+        assert!(
+            jail_overlaps(&data.join("cron"), &data),
+            "inside the data dir"
+        );
+        assert!(!jail_overlaps(&project, &data));
+        // A data dir that does not exist yet still counts.
+        let fresh = base.join("fresh-home").join(".codecora").join("tole");
+        assert!(jail_overlaps(&base.join("fresh-home"), &fresh));
+        // A symlink into the data dir is followed.
+        #[cfg(unix)]
+        {
+            let link = base.join("project-link");
+            std::os::unix::fs::symlink(&data, &link).unwrap();
+            assert!(jail_overlaps(&link, &data));
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

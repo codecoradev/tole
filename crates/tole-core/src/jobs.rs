@@ -275,6 +275,9 @@ impl Tool for JobStartTool {
         if self.child_agent_mode {
             crate::agents::check_child_agent_argv(&argv)?;
         }
+        // #684, every session kind: never the tole binary, never the
+        // session marker.
+        crate::session_guard::check_session_argv(&argv, &self.root)?;
 
         let id = new_job_id();
         let dir = jobs_root(&self.root).join(&id);
@@ -303,6 +306,7 @@ impl Tool for JobStartTool {
         let mut cmd = Command::new(program);
         // Secret env never reaches children (threat-model ENV-1).
         crate::subprocess::scrub_env_for(&mut cmd, "job_start");
+        crate::session_guard::mark(&mut cmd);
         cmd.args(&argv[1..])
             .current_dir(&self.root)
             .stdin(Stdio::null())
@@ -472,6 +476,37 @@ mod tests {
         assert_eq!(got.len(), 1, "exactly one notice per job");
         assert_eq!(got[0].source, crate::interrupt::Source::Notice);
         assert!(got[0].text.contains(&job), "{}", got[0].text);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #684: `job_start` refuses the tole binary in every session kind and
+    /// marks what it starts.
+    #[cfg(unix)]
+    #[test]
+    fn job_start_refuses_tole_and_marks_jobs() {
+        let dir = tmpdir("owner-684");
+        let start = JobStartTool::new(dir.clone());
+        for line in ["tole cron resume job-1", "nohup tole config trust --yes"] {
+            let err = start
+                .execute(json!({ "command": line }))
+                .err()
+                .unwrap_or_else(|| panic!("must refuse: {line}"));
+            assert!(err.contains("#684"), "{line}: {err}");
+        }
+        let r = start
+            .execute(json!({ "command": "sh -c 'printenv | grep ^TOLE_UNDER'" }))
+            .unwrap();
+        let id = r["job"].as_str().unwrap().to_string();
+        let log = dir.join(JOBS_DIR).join(&id).join("log");
+        let mut text = String::new();
+        for _ in 0..50 {
+            text = std::fs::read_to_string(&log).unwrap_or_default();
+            if !text.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(text.lines().any(|l| l == "TOLE_UNDER_SESSION=1"), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

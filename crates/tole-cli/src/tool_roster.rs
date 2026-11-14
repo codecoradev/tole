@@ -245,6 +245,15 @@ pub fn web_doctor_lines(env: &dyn Fn(&str) -> Option<String>) -> Vec<String> {
 /// gitea, web search, systemone) are absent when their backend is, never
 /// phantoms; a miss is reported on stderr only with `TOLE_VERBOSE=1`.
 pub fn build(approver: impl Approver + 'static, roster: Roster) -> Result<ToolRegistry> {
+    build_with_data_dir(approver, roster, tole_core::paths::tole_data_dir())
+}
+
+/// [`build`] with the tole data dir given (the file-tool jail check, #684).
+fn build_with_data_dir(
+    approver: impl Approver + 'static,
+    roster: Roster,
+    data_dir: Option<PathBuf>,
+) -> Result<ToolRegistry> {
     let interactive = approver.interactive();
     let mut reg = ToolRegistry::with_approver(approver);
     let depth = agent_depth();
@@ -513,12 +522,32 @@ pub fn build(approver: impl Approver + 'static, roster: Roster) -> Result<ToolRe
         )?,
         _ => {}
     }
-    if !plan {
+    // #684: a jail that holds the tole data dir (tole started in `~`) would
+    // let the file tools write owner-only records (cron ledger, plugin
+    // lock, skill approvals, trusted configs, the user config). Every
+    // session kind refuses the mutating file tools there; reads stay.
+    let data_dir_jail = if plan {
+        None
+    } else {
+        data_dir.filter(|d| tole_core::paths::jail_overlaps(root, d))
+    };
+    if let Some(dir) = &data_dir_jail {
+        eprintln!(
+            "tole: warning: the workspace {} overlaps the tole data dir {}; write_file, \
+             edit_file and delete_file are disabled because they could rewrite approvals \
+             and cron jobs. Start tole in a project directory instead.",
+            root.display(),
+            dir.display()
+        );
+    }
+    if !plan && data_dir_jail.is_none() {
         add(
             &mut reg,
             tracked(Box::new(WriteFileTool::new(root.clone()))),
         )?;
         add(&mut reg, tracked(Box::new(EditFileTool::new(root.clone()))))?;
+    }
+    if !plan {
         #[cfg(feature = "shell-tools")]
         {
             // gh is probe-gated (#254): no detected GitHub origin, no tool.
@@ -539,7 +568,7 @@ pub fn build(approver: impl Approver + 'static, roster: Roster) -> Result<ToolRe
         // Destructive: only behind an interactive approver — every call
         // prompts; allowlists and --yes never apply, and a server has no
         // human to ask.
-        if interactive {
+        if interactive && data_dir_jail.is_none() {
             add(
                 &mut reg,
                 tracked(Box::new(DeleteFileTool::new(root.clone()))),
@@ -787,6 +816,36 @@ mod tests {
         plan.agents = Some(AgentTools::default());
         plan.plan_mode = true;
         assert!(build(Human, plan).unwrap().get("cron_create").is_none());
+    }
+
+    /// #684: a workspace that holds the tole data dir (tole started in
+    /// `~`) gets no mutating file tools, in any session kind; reads stay.
+    /// A project directory keeps them.
+    #[test]
+    fn data_dir_in_the_workspace_removes_the_file_writers() {
+        let home = workspace("home-jail");
+        let data = home.join(".codecora").join("tole");
+        std::fs::create_dir_all(&data).unwrap();
+        let project = home.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let with = |ws: &PathBuf, agents: bool| {
+            let mut r = Roster::new(ws.clone());
+            if agents {
+                r.agents = Some(AgentTools::default());
+            }
+            build_with_data_dir(Human, r, Some(data.clone())).unwrap()
+        };
+        let (in_home, in_home_session) = (with(&home, false), with(&home, true));
+        let in_project = with(&project, false);
+        for reg in [&in_home, &in_home_session] {
+            for w in ["write_file", "edit_file", "delete_file"] {
+                assert!(reg.get(w).is_none(), "{w} must be absent in the home jail");
+            }
+            assert!(reg.get("read_file").is_some());
+        }
+        for w in ["write_file", "edit_file", "delete_file"] {
+            assert!(in_project.get(w).is_some(), "{w} stays in a project jail");
+        }
     }
 
     #[test]

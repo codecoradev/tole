@@ -1151,3 +1151,46 @@ not covered: a path that already goes through a link when it is opened (it
 is resolved once, as the path says; the host cannot tell a legitimate link
 such as `/tmp` from a planted one), and non-unix targets, which keep the
 path-based behavior.
+
+### Owner-only records (#684)
+
+Some records mean "the owner did this": a cron job saved with
+`created_by = cli` or enabled with `enabled_by = cli`, a plugin approval,
+a skill approval, a project-config trust, the user config. They are
+written by the official CLI (`tole cron create|resume|edit`, `tole plugin
+approve`, `tole skills approve`, `tole skills drafts promote`, `tole
+config trust`) and sit in the tole data dir (`$CODECORA_HOME/tole`).
+The rules that depend on them (an agent job runs only after a human
+enabled it, only the owner approves) hold only if a session cannot write
+them. Two layers close the direct routes; neither is a boundary.
+
+- **No tole binary from a session.** In every session kind (a root
+  session, a cron agent run, a child agent), `run_command` and `job_start`
+  refuse an argv whose program is the tole binary: by name (`tole`,
+  `tole-cli`, `.exe` forms), or by resolving to the running executable
+  (links included), also behind `env`, `nohup`, `timeout`, `exec` and the
+  like and inside `sh -c` text. Any argument that names the marker below
+  is refused too. A human running `tole` from a terminal is not affected:
+  the check lives in the two tools, not in the CLI.
+- **A marker for what still runs.** Every process those two tools start
+  carries `TOLE_UNDER_SESSION=1` (a child agent also has
+  `TOLE_AGENT_DEPTH >= 1`). The owner-only subcommands above refuse to
+  write when either is set (`owner_only`), before anything is read or
+  saved. The scrub keeps it (it is not secret-shaped) and the model's
+  arguments cannot remove it: `env -u`, `unset` and `NAME=` forms name the
+  marker and are refused.
+- **No file writers in a jail that holds the data dir.** When the
+  workspace contains the tole data dir (tole started in `~`) or sits
+  inside it, every session kind gets no `write_file`, `edit_file` or
+  `delete_file`, and tole warns at startup. Reads stay. Cron agent runs
+  already refused such a workdir (`ledger_in_workdir`).
+
+Residual, deliberately: a renamed or copied tole binary started with a
+cleared environment (`env -i`, a wrapper that drops variables) is
+indistinguishable from a program the owner runs; an interpreter
+(`python`, `sh -c 'echo ... >> file'`, `git` hooks) can write the files
+directly; the jail check compares paths, so a bind mount or a hard link
+into the data dir is not seen. A session with `run_command` has the
+owner's file permissions. These are defense in depth against the plain
+route (the official CLI, the file tools). The real boundary is a sandbox
+that cannot write the data dir (#601).
