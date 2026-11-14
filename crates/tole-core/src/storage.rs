@@ -1165,9 +1165,19 @@ fn held_locks() -> &'static std::sync::Mutex<std::collections::HashSet<(u64, u64
     HELD.get_or_init(Default::default)
 }
 
+/// The file identity for the in-process hold registry: `(dev, ino)` on unix.
+/// Windows has no fork, so the #552/#712 transient duplicate of a closed
+/// descriptor cannot occur — a hold naming our pid there is always real,
+/// there is nothing to register, and the retry never fires (`None`).
+#[cfg(unix)]
 fn lock_identity(f: &File) -> Option<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
     f.metadata().ok().map(|m| (m.dev(), m.ino()))
+}
+
+#[cfg(not(unix))]
+fn lock_identity(_f: &File) -> Option<(u64, u64)> {
+    None
 }
 
 fn in_process_hold(f: &File) -> bool {
