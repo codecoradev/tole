@@ -306,15 +306,16 @@ mod tests {
 
     #[test]
     fn rejects_symlink_escape() {
+        #[cfg_attr(not(unix), allow(unused_variables))]
         let dir = tmpdir("symlink");
         let outside = std::env::temp_dir().join(format!("tole-outside-{}", std::process::id()));
         let _ = std::fs::remove_file(&outside);
         std::fs::write(&outside, "secret").unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(&outside, dir.join("leak.txt")).unwrap();
-        let t = ReadFileTool::new(dir);
         #[cfg(unix)]
         {
+            let t = ReadFileTool::new(dir);
             let err = t.execute(json!({ "path": "leak.txt" })).unwrap_err();
             assert!(err.contains("escape"), "got: {err}");
         }

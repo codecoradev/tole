@@ -3,6 +3,9 @@
 //! names it AND the `[secrets]` release binds it to `mcp`. One test in its
 //! own process: it sets a variable in the process environment.
 
+// The wrapper is a `#!/bin/sh` script.
+#![cfg(unix)]
+
 use tole_core::mcp::{register_server_tools, McpServerConfig};
 use tole_core::plugin_lock::ManifestTool;
 use tole_core::secrets::SecretSet;

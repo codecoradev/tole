@@ -98,6 +98,7 @@ fn a_file_target_symlinked_out_of_the_workdir_fails_delivery_not_the_run() {
     assert!(!outside.join("x.md").exists());
 }
 
+#[cfg(unix)]
 #[test]
 fn a_file_target_under_a_symlinked_directory_creates_nothing_outside_the_workdir() {
     // A cloned repo can ship `out -> /elsewhere`; a target below it must not
@@ -125,6 +126,7 @@ fn a_file_target_under_a_symlinked_directory_creates_nothing_outside_the_workdir
     assert!(left.is_empty(), "created outside the workdir: {left:?}");
 }
 
+#[cfg(unix)]
 #[test]
 fn a_file_target_that_is_itself_a_symlink_is_not_followed() {
     let dir = tmp("symlink-file");

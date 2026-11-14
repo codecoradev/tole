@@ -529,9 +529,12 @@ mod tests {
 
     // ---- the gate itself, against a fake `cora hook verify` ---------------
 
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
     use std::sync::atomic::AtomicUsize;
 
+    #[cfg(unix)]
     struct Fake {
         dir: PathBuf,
         bin: PathBuf,
@@ -539,6 +542,7 @@ mod tests {
 
     /// A fake cora whose `hook verify` exits with whatever the `exit` file
     /// says and counts its invocations in `calls`.
+    #[cfg(unix)]
     fn fake_cora(tag: &str) -> Fake {
         let dir = std::env::temp_dir().join(format!(
             "tole-gate-{tag}-{}-{:x}",
@@ -564,6 +568,7 @@ mod tests {
         f
     }
 
+    #[cfg(unix)]
     impl Fake {
         fn exit(&self, code: i32) {
             std::fs::write(self.dir.join("exit"), code.to_string()).unwrap();
@@ -586,6 +591,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn an_inactive_or_off_gate_never_asks_cora() {
         let f = fake_cora("inactive");
@@ -600,6 +606,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn block_refuses_an_unreviewed_or_blocked_diff_and_passes_a_validated_one() {
         let f = fake_cora("block");
@@ -625,6 +632,7 @@ mod tests {
         assert_eq!(g.check_commit(), Decision::Proceed);
     }
 
+    #[cfg(unix)]
     #[test]
     fn warn_lets_the_commit_through_with_a_note() {
         let f = fake_cora("warn");
@@ -635,6 +643,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn tooling_trouble_fails_open_with_one_note() {
         // An old cora: `hook verify` is a usage error (exit 2).
@@ -656,7 +665,9 @@ mod tests {
         assert!(matches!(gone.check_commit(), Decision::Note(_)));
     }
 
+    #[cfg(unix)]
     struct Probe(Arc<AtomicUsize>);
+    #[cfg(unix)]
     impl Tool for Probe {
         fn name(&self) -> &str {
             "probe"
@@ -670,6 +681,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_decorator_gates_only_commits_and_only_in_the_two_input_shapes() {
         let f = fake_cora("deco");
@@ -708,6 +720,7 @@ mod tests {
         assert!(git.execute(json!({"op": "commit", "message": "x"})).is_ok());
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_warning_is_attached_to_the_result_not_swallowed() {
         let f = fake_cora("note");
@@ -734,6 +747,7 @@ mod tests {
 
     /// The real `git` tool in a real repository: an unreviewed commit does
     /// not happen, and the same commit goes through once cora validates it.
+    #[cfg(unix)]
     #[test]
     fn the_real_git_tool_cannot_commit_an_unreviewed_staged_diff() {
         let f = fake_cora("realgit");
@@ -787,6 +801,7 @@ mod tests {
         assert_eq!(git(&["log", "--oneline"]).lines().count(), 1);
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_commit_call_knows_where_it_commits_and_when_git_is_redirected() {
         let c = |s: &str| git_commit_call(&argv(s));
@@ -828,6 +843,7 @@ mod tests {
     /// `git -C sub commit` commits in `sub`: cora must be asked about THAT
     /// repository, not about the session one (a validated session repo must
     /// not unlock a commit into a nested repo).
+    #[cfg(unix)]
     #[test]
     fn attached_c_and_env_chdir_forms_are_not_missed() {
         let v = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
@@ -848,6 +864,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_commit_in_another_directory_is_verified_there() {
         let f = fake_cora("cdir");
@@ -875,6 +892,7 @@ mod tests {
         assert!(!f.cwds().last().unwrap().ends_with("/sub"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_commit_that_redirects_git_cannot_be_verified_and_is_not_let_through() {
         let f = fake_cora("redir");

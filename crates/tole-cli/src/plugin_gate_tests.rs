@@ -177,6 +177,7 @@ fn a_lock_unreadable_at_start_blocks_approval_even_once_it_reads_again() {
 
 /// #679: the gate binds the approved command line (or URL) and the stdio
 /// program file; the server-reported version and manifest are not enough.
+#[cfg(unix)]
 #[test]
 fn the_gate_binds_the_source_and_the_program_file() {
     use std::os::unix::fs::PermissionsExt;
