@@ -20,6 +20,50 @@ use crate::tool::{Risk, Tool};
 use serde_json::{json, Value};
 use std::process::Command;
 
+/// Longest room id of uteke's `category:title` convention (uteke 0.24).
+const MAX_CONVENTIONAL_ROOM_ID_LEN: usize = 64;
+
+const ROOM_ID_ERR: &str = "room must be [a-zA-Z0-9-_] (not starting with a hyphen) or uteke's \
+     category:title form (lowercase, exactly one colon, at most 64 characters)";
+
+/// True for uteke's `category:title` room id, mirroring uteke 0.24
+/// (`^[a-z][a-z0-9-]*:[a-z0-9][a-z0-9._-]*$`, at most 64 bytes, one colon).
+fn is_category_title_room(id: &str) -> bool {
+    if id.len() > MAX_CONVENTIONAL_ROOM_ID_LEN {
+        return false;
+    }
+    let Some((category, title)) = id.split_once(':') else {
+        return false;
+    };
+    let mut c = category.bytes();
+    let category_ok = matches!(c.next(), Some(b'a'..=b'z'))
+        && c.all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'-'));
+    let mut t = title.bytes();
+    let title_ok = matches!(t.next(), Some(b'a'..=b'z' | b'0'..=b'9'))
+        && t.all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'-'));
+    category_ok && title_ok
+}
+
+/// The one room-id check shared by `uteke_recall` and `uteke_document`.
+///
+/// Accepts the legacy charset `[a-zA-Z0-9-_]` (unchanged, no leading hyphen,
+/// as `repo-*`, `profile-*` and `agent-*` rooms use) and uteke's
+/// `category:title` form. Neither can start with `-`, so a room can never be
+/// parsed as an argv flag; callers also pass it as a positional value after
+/// `room <sub>`, never as a flag.
+fn validate_room_id(room: &str) -> Result<(), String> {
+    let legacy = !room.is_empty()
+        && !room.starts_with('-')
+        && room
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if legacy || is_category_title_room(room) {
+        Ok(())
+    } else {
+        Err(ROOM_ID_ERR.into())
+    }
+}
+
 /// ReadOnly semantic recall over the local uteke store (room-optional).
 #[derive(Debug, Clone)]
 pub struct UtekeRecallTool {
@@ -95,13 +139,7 @@ impl Tool for UtekeRecallTool {
             Some(room) if !room.trim().is_empty() => {
                 // Same argv-flag-injection defense as UtekeDocumentTool:
                 // a room like "--json" must never reach the argv.
-                if room.starts_with('-')
-                    || !room
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-                {
-                    return Err("room must be [a-zA-Z0-9-_] and not start with a hyphen".into());
-                }
+                validate_room_id(room)?;
                 // Room-scoped: uteke room recall <room> "<query>" --limit N --json
                 cmd.arg("room")
                     .arg("recall")
@@ -254,13 +292,7 @@ impl Tool for UtekeDocumentTool {
             .or_else(|| self.default_room.clone())
             .filter(|r| !r.trim().is_empty());
         if let Some(r) = &room {
-            if r.starts_with('-')
-                || !r
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-            {
-                return Err("room must be [a-zA-Z0-9-_] and not start with a hyphen".into());
-            }
+            validate_room_id(r)?;
         }
 
         // 1) Create/update the document (content via stdin: no argv
@@ -496,9 +528,38 @@ echo ok
             .execute(json!({"slug": "ok-slug", "markdown": "# x", "room": "bad room"}))
             .unwrap_err();
         assert!(
-            err.contains("not start with a hyphen") || err.contains("[a-zA-Z0-9-_]"),
+            err.contains("not starting with a hyphen") || err.contains("[a-zA-Z0-9-_]"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn document_room_grammar_boundary() {
+        // Refused ids fail before any spawn, so this never touches a store.
+        let t = UtekeDocumentTool::new(None);
+        for bad in [
+            "-x",
+            "--json",
+            "foo:bar:baz",
+            "Project:x",
+            "project:X",
+            ":x",
+            "x:",
+            "-a:b",
+            "a b:c",
+        ] {
+            let err = t
+                .execute(json!({"slug": "ok-slug", "markdown": "# x", "room": bad}))
+                .unwrap_err();
+            assert!(err.contains("category:title form"), "{bad}: {err}");
+        }
+        let long = format!("a:{}", "b".repeat(63));
+        let err = t
+            .execute(json!({"slug": "ok-slug", "markdown": "# x", "room": long}))
+            .unwrap_err();
+        assert!(err.contains("category:title form"), "{err}");
+        // Accepted ids are pinned through validate_room_id (room_validator_grammar):
+        // executing one would spawn uteke against the real store.
     }
 
     #[test]
@@ -531,7 +592,87 @@ mod regression_tests {
         let err = t
             .execute(json!({"query": "x", "room": "--json"}))
             .unwrap_err();
-        assert!(err.contains("not start with a hyphen"), "{err}");
+        assert!(err.contains("not starting with a hyphen"), "{err}");
+    }
+
+    #[test]
+    fn recall_room_grammar_boundary() {
+        let t = UtekeRecallTool::new();
+        for bad in [
+            "-x",
+            "--json",
+            "foo:bar:baz",
+            "Project:x",
+            "project:X",
+            ":x",
+            "x:",
+            "-a:b",
+            "a b:c",
+        ] {
+            let err = t.execute(json!({"query": "q", "room": bad})).unwrap_err();
+            assert!(err.contains("category:title form"), "{bad}: {err}");
+        }
+        let long = format!("a:{}", "b".repeat(63));
+        let err = t.execute(json!({"query": "q", "room": long})).unwrap_err();
+        assert!(err.contains("category:title form"), "{err}");
+    }
+
+    #[test]
+    fn room_validator_grammar() {
+        for ok in [
+            "ops",
+            "repo-foo_bar",
+            "Profile-Foo",
+            "agent-a-1f-2-0",
+            "_x",
+            "project:qa-check",
+            "research:docker",
+            "team:weekly.standup",
+            "a:0",
+            "x-1:y_z",
+        ] {
+            assert!(validate_room_id(ok).is_ok(), "{ok}");
+        }
+        let at_limit = format!("a:{}", "b".repeat(62));
+        assert_eq!(at_limit.len(), 64);
+        assert!(validate_room_id(&at_limit).is_ok());
+        assert!(validate_room_id(&format!("{at_limit}b")).is_err());
+        for bad in [
+            "",
+            "-x",
+            "--json",
+            "-a:b",
+            "foo:bar:baz",
+            ":x",
+            "x:",
+            ":",
+            "Project:x",
+            "project:X",
+            "1a:b",
+            "a:-b",
+            "a:.b",
+            "a_b:c",
+            "a b",
+            "a:b c",
+            "a:b\n",
+            "project:utéke",
+        ] {
+            assert!(validate_room_id(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn colon_room_is_never_an_argv_flag() {
+        // Every accepted colon id starts with a lowercase letter, so it can
+        // never parse as a flag; call sites pass it as a positional value
+        // after `room recall` / `room add-document`.
+        for id in ["project:qa-check", "a:b", "x-1:0"] {
+            assert!(validate_room_id(id).is_ok());
+            assert!(!id.starts_with('-'));
+        }
+        for id in ["-x", "--json:a", "-p:q", "-:x"] {
+            assert!(validate_room_id(id).is_err(), "{id}");
+        }
     }
 
     #[test]
