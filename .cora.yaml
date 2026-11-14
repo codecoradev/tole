@@ -22,6 +22,12 @@ ignore:
     - "*.lock"
     - "Cargo.lock"
     - "target/"
+    # #705: generated or prose files. NOTE: in cora 0.20 `ignore.files` scopes
+    # the symbol index and the context chain (what is injected as surrounding
+    # code), not the diff the reviewer reads; a PR's own CHANGELOG/docs lines
+    # still count toward its size until cora-code can exclude paths from a diff.
+    - "CHANGELOG.md"
+    - "docs/**"
   rules:
     - "Hardcoded password or secret"
     - "Command injection via exec/system with dynamic input"
