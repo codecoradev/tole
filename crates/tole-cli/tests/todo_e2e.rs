@@ -2,6 +2,8 @@
 //! run` writes a task list, a SECOND process (`tole resume`) reads it
 //! back — hydration from the replayed transcript is the whole point.
 
+mod common;
+use common::TestDir;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -161,15 +163,7 @@ fn run_tole(env: &[(&str, &str)], args: &[&str]) -> (String, String, i32) {
 #[test]
 fn todo_list_survives_process_boundary_via_resume() {
     let base = spawn_mock();
-    let dir = std::env::temp_dir().join(format!(
-        "tole-todo-e2e-{}-{:x}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = TestDir::new("tole-todo-e2e");
     let env = [
         ("TOLE_BASE_URL".to_string(), base.clone()),
         ("TOLE_MODEL".to_string(), "mock-model".to_string()),

@@ -5,22 +5,18 @@
 //! child only, the provider is a local mock that records request bodies,
 //! and `PATH` holds no cora / uteke / gh.
 
+mod common;
+use common::TestDir;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-fn tmpdir() -> PathBuf {
-    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let d = std::env::temp_dir().join(format!("tole-profile-e2e-{}-{n}", std::process::id()));
-    std::fs::create_dir_all(&d).unwrap();
-    d.canonicalize().unwrap()
+fn tmpdir() -> TestDir {
+    TestDir::new("tole-profile-e2e")
 }
 
 fn text(b: &[u8]) -> String {
@@ -74,7 +70,7 @@ fn spawn_mock() -> (String, Seen) {
 }
 
 /// A fresh home whose user config is `config`, plus files beside it.
-fn home_with(config: &str, files: &[(&str, &str)]) -> PathBuf {
+fn home_with(config: &str, files: &[(&str, &str)]) -> TestDir {
     let home = tmpdir();
     let dir = home.join("tole");
     std::fs::create_dir_all(&dir).unwrap();

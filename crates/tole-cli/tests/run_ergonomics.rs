@@ -2,6 +2,8 @@
 //! provider: --prompt-file, --name (sessions listing + resume by name),
 //! and the wall-clock timeout settling resumably.
 
+mod common;
+use common::TestDir;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -110,18 +112,8 @@ fn run_tole(env: &[(&str, &str)], args: &[&str]) -> (String, String, i32) {
     )
 }
 
-fn temp_dir(tag: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!(
-        "tole-ergo-{tag}-{}-{:x}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+fn temp_dir(tag: &str) -> TestDir {
+    TestDir::new(&format!("tole-ergo-{tag}"))
 }
 
 /// --prompt-file feeds the prompt (the echo proves it reached the

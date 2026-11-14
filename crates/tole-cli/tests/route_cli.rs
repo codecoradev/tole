@@ -1,7 +1,9 @@
 //! `tole route` (#586) on the real binary: a dry run that names the tier
 //! and model `[router]` would pick, calls no provider, and redacts.
 
-use std::path::{Path, PathBuf};
+mod common;
+use common::TestDir;
+use std::path::Path;
 use std::process::{Command, Output};
 
 const USER: &str = r#"
@@ -25,9 +27,8 @@ heavy = "coder-big"
 default = "heavy"
 "#;
 
-fn setup(tag: &str, user: &str) -> PathBuf {
-    let base = std::env::temp_dir().join(format!("tole-route-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
+fn setup(tag: &str, user: &str) -> TestDir {
+    let base = TestDir::new(&format!("tole-route-{tag}"));
     std::fs::create_dir_all(base.join("home/tole")).unwrap();
     std::fs::create_dir_all(base.join("cwd")).unwrap();
     std::fs::write(base.join("home/tole/config.toml"), user).unwrap();

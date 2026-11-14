@@ -7,7 +7,7 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -16,6 +16,7 @@ use tole_core::ledger::RunStatus;
 use tole_core::webhook;
 
 mod common;
+use common::TestDir;
 
 const KEY: &str = "hook-key-for-fire-tests-0123456789";
 
@@ -56,9 +57,8 @@ template = "commit: {head_commit.message}"
 "#;
 
 /// A home with the routes, a cron dir with the jobs, a workdir.
-fn setup(tag: &str) -> PathBuf {
-    let base = std::env::temp_dir().join(format!("tole-hookfire-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
+fn setup(tag: &str) -> TestDir {
+    let base = TestDir::new(&format!("tole-hookfire-{tag}"));
     std::fs::create_dir_all(base.join("home/tole")).unwrap();
     std::fs::create_dir_all(base.join("w")).unwrap();
     std::fs::write(base.join("home/tole/config.toml"), CONFIG).unwrap();
@@ -73,13 +73,11 @@ fn setup(tag: &str) -> PathBuf {
     };
     cron::create(&dir, script("ping", false), 1).unwrap();
     cron::create(&dir, script("sleeper", true), 1).unwrap();
-    // A script job written as an agent's: the trust check blocks it.
     let mut forged = cron::create(&dir, script("forged-src", false), 1).unwrap();
     forged.id = "forged".into();
     forged.extra.insert("created_by".into(), "agent".into());
     forged.extra.insert("enabled_by".into(), "cli".into());
     store::with_lock(&dir, |l| Ok(l.put_job(forged)?)).unwrap();
-    // An agent job that may write; a webhook run is ReadOnly all the same.
     let writer = CreateSpec {
         id: Some("writer".into()),
         schedule: "@yearly".into(),

@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 mod common;
+use common::TestDir;
 
 struct ServeProcess {
     child: Child,
@@ -192,18 +193,8 @@ fn spawn_mock() -> String {
     format!("http://{addr}/v1")
 }
 
-fn temp_dir(tag: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!(
-        "tole-approvals-{tag}-{}-{:x}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+fn temp_dir(tag: &str) -> TestDir {
+    TestDir::new(&format!("tole-approvals-{tag}"))
 }
 
 /// The full round trip: queue → allow → work executes → audit register.

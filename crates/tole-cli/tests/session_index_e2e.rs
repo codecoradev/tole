@@ -3,24 +3,17 @@
 //! project B, and `tole resume <id>` from B names the command to run in A.
 //! `CODECORA_HOME` is isolated per test.
 
+mod common;
+use common::TestDir;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-static N: AtomicU64 = AtomicU64::new(0);
-
-fn tmpdir(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!(
-        "tole-index-e2e-{tag}-{}-{}",
-        std::process::id(),
-        N.fetch_add(1, Ordering::SeqCst)
-    ));
-    std::fs::create_dir_all(&d).unwrap();
-    d.canonicalize().unwrap()
+fn tmpdir(tag: &str) -> TestDir {
+    TestDir::new(&format!("tole-index-e2e-{tag}"))
 }
 
 /// Mock provider: every request gets the final answer `ok`.

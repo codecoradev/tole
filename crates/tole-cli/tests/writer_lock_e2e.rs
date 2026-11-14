@@ -3,10 +3,12 @@
 //! holder (no duplicated seq in the file), read-only commands still work,
 //! and once the holder exits the session resumes normally.
 
+mod common;
+use common::TestDir;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
@@ -107,9 +109,7 @@ fn seqs(file: &Path) -> Vec<u64> {
 #[test]
 fn second_process_is_refused_and_the_file_stays_valid() {
     let url = spawn_mock();
-    let d: PathBuf = std::env::temp_dir().join(format!("tole-lock-e2e-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
+    let d = TestDir::new("tole-lock-e2e");
     let o = run(&d, &url, &["run", "first turn"]);
     assert!(o.status.success(), "{}", text(&o.stderr));
     let id = text(&o.stdout)
