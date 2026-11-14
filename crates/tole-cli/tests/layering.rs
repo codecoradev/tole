@@ -37,12 +37,11 @@ const KERNEL_MODULES: &[&str] = &[
 ];
 #[rustfmt::skip]
 const ENGINE_MODULES: &[&str] = &[
+    "session",
     "delegation",
     "plugin",
     "discuss", "skill_approve", "skill_drafts_cli", "skill_recall",
-    "skill_propose", "skill_outcome", "curator_cmd", "cron", "tool_roster", "provider_chain",
-    "turn_runner", "compaction_host", "session_host", "session_index", "session_tools",
-    "usage_report", "status", "tui_host", "export", "events", "serve_images",
+    "skill_propose", "skill_outcome", "curator_cmd", "cron", "tool_roster", "provider_chain",   "events", "serve_images",
 ];
 #[rustfmt::skip]
 const FACE_MODULES: &[&str] = &["doctor", "ecosystem", "hook_cli"];
@@ -55,6 +54,15 @@ const BASELINE: &[(&str, &str, &str)] = &[
 
 /// Old top-level paths that are now re-exports of a module inside another one.
 const ALIASES: &[(&str, &str)] = &[
+    ("session_host", "session"),
+    ("session_index", "session"),
+    ("session_tools", "session"),
+    ("turn_runner", "session"),
+    ("compaction_host", "session"),
+    ("status", "session"),
+    ("usage_report", "session"),
+    ("export", "session"),
+    ("tui_host", "session"),
     ("delegate", "delegation"),
     ("delegate_decide", "delegation"),
     ("delegated_approver", "delegation"),

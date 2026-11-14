@@ -24,7 +24,28 @@ pub use delegation::machine_guard;
 pub use delegation::serve_delegation;
 pub mod approver;
 pub mod auth;
-pub mod compaction_host;
+pub mod session;
+// `session/` holds these modules; the re-exports keep the old top-level paths working.
+#[doc(inline)]
+pub use session::compaction as compaction_host;
+#[doc(inline)]
+#[cfg(feature = "tui")]
+pub use session::export;
+#[doc(inline)]
+pub use session::host as session_host;
+#[doc(inline)]
+pub use session::index as session_index;
+#[doc(inline)]
+pub use session::runner as turn_runner;
+#[doc(inline)]
+pub use session::status;
+#[doc(inline)]
+pub use session::tools as session_tools;
+#[doc(inline)]
+#[cfg(feature = "tui")]
+pub use session::tui as tui_host;
+#[doc(inline)]
+pub use session::usage as usage_report;
 pub mod config;
 // `config/` holds the modules below; these re-exports keep the old top-level paths working.
 #[doc(inline)]
@@ -59,8 +80,6 @@ pub use discuss::tool as discuss_tool;
 pub mod doctor;
 pub mod ecosystem;
 pub mod events;
-#[cfg(feature = "tui")]
-pub mod export;
 pub mod handoff;
 pub mod hook_cli;
 pub mod hooks;
@@ -76,21 +95,13 @@ pub mod provider_chain;
 #[cfg(feature = "shell-tools")]
 pub mod review_gate;
 pub mod serve_images;
-pub mod session_host;
-pub mod session_index;
-pub mod session_tools;
 pub mod sibling;
 pub mod skill_approve;
 pub mod skill_drafts_cli;
 pub mod skill_outcome;
 pub mod skill_propose;
 pub mod skill_recall;
-pub mod status;
 pub mod tool_roster;
 pub mod tools;
-#[cfg(feature = "tui")]
-pub mod tui_host;
-pub mod turn_runner;
-pub mod usage_report;
 #[cfg(feature = "web-builtin")]
 pub mod web_builtin;
