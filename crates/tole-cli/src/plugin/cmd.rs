@@ -395,5 +395,5 @@ pub(crate) fn rows(out: &str) -> Vec<serde_json::Value> {
 }
 
 #[cfg(test)]
-#[path = "plugin_cmd_tests.rs"]
+#[path = "cmd_tests.rs"]
 mod tests;
