@@ -204,4 +204,4 @@ pub fn show(
 
 #[cfg(test)]
 #[path = "discuss_tests.rs"]
-mod tests;
+pub(crate) mod tests;

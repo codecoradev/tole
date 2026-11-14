@@ -579,6 +579,38 @@ fn a_call_is_reserved_before_it_runs_and_settled_after() {
 }
 
 #[test]
+fn a_stop_ends_the_discussion_wherever_it_is_and_only_once() {
+    let l = log("stop");
+    assert!(l.stop(1).is_err(), "nothing to stop before the contract");
+    l.start(contract(None, 100_000), 1).unwrap();
+    l.contribute(1, "coder", "first", 2).unwrap();
+    // Mid-round, with a call in flight.
+    let call = go(l.reserve(1, "participant-ops", 500, 3).unwrap());
+    assert_eq!(l.stop(4).unwrap(), Gate::Escalate(Reason::Stopped));
+    let st = l.state().unwrap();
+    assert_eq!(
+        st.next(),
+        Next::Finish {
+            outcome: Gate::Escalate(Reason::Stopped)
+        }
+    );
+    // The in-flight call still settles (its spend counts), but nobody speaks
+    // after a stop.
+    l.settle(&call, 120, 5).unwrap();
+    assert_eq!(l.state().unwrap().tokens_used, 120);
+    assert!(l.contribute(1, "ops", "too late", 6).is_err());
+    // Stopping again changes nothing; closing records the stop.
+    assert_eq!(l.stop(7).unwrap(), Gate::Escalate(Reason::Stopped));
+    assert_eq!(
+        l.close("stopped", 8).unwrap(),
+        Gate::Escalate(Reason::Stopped)
+    );
+    assert_eq!(l.stop(9).unwrap(), Gate::Escalate(Reason::Stopped));
+    assert_eq!(l.state().unwrap().next(), Next::Done);
+    assert!(describe(Gate::Escalate(Reason::Stopped)).contains("stopped"));
+}
+
+#[test]
 fn a_call_that_does_not_fit_stops_the_discussion_with_an_escalation() {
     let l = log("halt");
     l.start(contract(None, 1_000), 1).unwrap();

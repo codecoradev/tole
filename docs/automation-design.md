@@ -527,15 +527,15 @@ Each PR updates the README status line and `docs/epics.md` in the same PR
 3. Retention: how long to keep `jobs.jsonl` before rotation? (Rotation must
    write a new segment, not rewrite — keeps the append-only rule.)
 
-### Entry point: open question
+### Entry point: decision (c), both
 
 This one is about the multi-round discussion (#588, design
 [profiles-collaboration-secrets.md](profiles-collaboration-secrets.md)
 A8.3), not the scheduler. The discussion runs as a host library
 (`tole_cli::discussion_host`): inline participants, the scribe and the
-claim-checker, the gate, the budget and crash resume all work, but
-**nothing starts a discussion yet**. The owner wants the mode open to agents
-too, not only to the owner. The options and what each costs in security:
+claim-checker, the gate, the budget and crash resume. The owner wants the
+mode open to agents too, not only to the owner. The options considered and
+what each costs in security:
 
 | | (a) owner-only `tole discuss` | (b) model-facing tool | (c) both |
 |---|---|---|---|
@@ -556,18 +556,45 @@ report, a write, a roster change or a tool call; the budget and
 participants are user-config profiles; the scribe and the claim-checker are
 built-in or owner-overridden roles.
 
-**Decision (owner, 2026-11-14): (c), in two steps. Step 1 shipped: `tole discuss`
-(owner-only, depth 0, read-only inline participants, `--dry-run` shows the cost,
-`resume` after a crash, `list`/`show`).**
+**Decision (owner, 2026-11-14): (c), in two steps, both shipped.**
 
-**Recommendation: (c), in two steps.** Ship (a) first: it needs no new trust
-decision, shows the owner what a discussion costs, and exercises the library
-end to end. Then add (b) under the same rules as `delegate` (it is a
-delegation with several voices): carve from the caller, depth cap,
-participants within the caller's allow list, read-only participants by
-default, any Write approval escalated to the owner. (b) alone makes the
-first discussion an agent's, which is the injection path; (a) alone closes
-the mode to agents, which the owner asked to keep open.
+1. `tole discuss start|resume|list|show` (owner-only, depth 0, read-only
+   inline participants; `--dry-run` shows the cost, `resume` continues after
+   a crash).
+2. The model-facing tools `discuss`, `discuss_status` and `discuss_stop`
+   (`tole_cli::discuss_tool`), under exactly the rules of `delegate`:
+   - all three are `Risk::Write`, approved or allowlisted like `delegate`;
+     the prompt shows the question, the participants and the budget;
+   - they exist only where `delegate` does (the same host hands out both,
+     so never at the goal's depth limit, in plan mode or without a
+     provider);
+   - the budget is carved from the caller's remaining budget in the
+     delegation tree (`budget_tokens`, or half of what is left, never more),
+     recorded as a running `consult` node; the tree is charged what the
+     ledger counted when the discussion ends, and a crash is charged the
+     whole carve; at most two discussions run at once per process;
+   - participants are user-config profiles whose allow patterns the caller's
+     own allow list covers (a refusal, where `delegate` trims), never a
+     built-in role; they are inline voices with no tools and no process, so
+     none can start a discussion, call a tool or write, and no Write of
+     theirs can reach the caller's allow list (there is none to ask for);
+   - the input has five fields; `allow`, `profile`, `tools`, `secrets` or
+     any other field is refused, and the id is the host's, so a model adds no
+     secret, allow pattern, profile or budget and cannot name or overwrite
+     the owner's discussions;
+   - management is limited to discussions the same session started (the
+     tree's host-only node, not a task string a model can write):
+     `discuss_status` returns state, tokens and the digests fenced as data;
+     `discuss_stop` records the ledger's own `stopped` escalation, which
+     the driver closes like any other, so no participant text can start,
+     prevent or delay it. An interrupted discussion (its process died) is
+     closed by a stop without a model call, or continued by the owner with
+     `tole discuss resume`.
+
+   Not in this step: independent (child-process) participants for agents.
+   They would hold tools, so they need the owner's approval surface for any
+   Write and the depth rules for a child that may not itself discuss; until
+   then an agent's discussion is inline only.
 
 ## 12. Non-goals
 

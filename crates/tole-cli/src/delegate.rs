@@ -56,6 +56,15 @@ use crate::ledger_file::{lease_alive, lease_of, FileStore};
 use crate::machine_guard::{Gate, Guard, SharedProbe};
 use tole_core::resource_guard::Thresholds;
 
+/// The profile of a discussion's node in the delegation tree. Not a valid
+/// profile name, so `delegate` can never record it.
+pub const DISCUSSION_PROFILE: &str = "(discussion)";
+
+/// The task of discussion `id`'s node.
+pub fn discussion_task(id: &str) -> String {
+    format!("discussion {id}")
+}
+
 /// The delegation log, next to the agent dirs of the root session.
 pub const LOG_FILE: &str = "delegation.jsonl";
 /// Defaults of a goal's budget when `[delegation]` sets none.
@@ -674,6 +683,10 @@ impl Delegator {
     /// this workspace's log. A child's own children (depth 2 and below) are
     /// never searched, so a child cannot plant a match.
     pub fn find_child(&self, marker: &str) -> Result<Option<String>, String> {
+        self.find_direct(|n| n.task.starts_with(marker))
+    }
+
+    fn find_direct(&self, pred: impl Fn(&Node) -> bool) -> Result<Option<String>, String> {
         let me = self.node.lock().map_err(|_| "delegate: poisoned")?.clone();
         if self.child && me.is_none() {
             return Ok(None);
@@ -688,9 +701,131 @@ impl Delegator {
                     .is_some_and(|p| p.parent.is_none()),
             };
             Ok(d.nodes()
-                .filter(|n| mine(n) && n.task.starts_with(marker))
+                .filter(|n| mine(n) && pred(n))
                 .max_by_key(|n| n.seq)
                 .map(|n| n.id.clone()))
+        })
+    }
+
+    /// The layered config and profile roots this session runs with.
+    pub fn setup(&self) -> &Setup {
+        &self.setup
+    }
+
+    /// May this session seat `profile` in a discussion? The profile must
+    /// exist in the user config and every allow pattern it carries must be
+    /// covered by this session's own allow list: a discussion never seats a
+    /// profile that could hold more than the caller (the cover rule
+    /// `delegate` applies to a child, here a refusal instead of a trim).
+    pub fn may_seat(&self, profile: &str) -> Result<(), String> {
+        let p = crate::profile::Profile::resolve(
+            &self.setup.cfg,
+            profile,
+            self.setup.base.as_deref(),
+            self.setup.home.as_deref(),
+        )?;
+        let (_, dropped) = tole_core::delegation::child_allow(&self.parent_allows, &p.allow);
+        if dropped.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "profile `{profile}` may hold allow patterns this session does not ({}): it \
+                 cannot take part in your discussion",
+                dropped.join(", ")
+            ))
+        }
+    }
+
+    /// Carves a discussion's budget from this session's remaining budget (as
+    /// `delegate` does for a child: `tokens` or half of what is left, never
+    /// more) and records it as a running `consult` node, so the tree charges
+    /// the parent what the discussion spends and a crash never refunds it.
+    /// Returns the node and the tokens carved. The node's profile is
+    /// [`DISCUSSION_PROFILE`], a name no config profile can have, so only
+    /// this host can make one.
+    pub fn carve_discussion(&self, id: &str, tokens: Option<u64>) -> Result<(String, u64), String> {
+        self.locked(|d| {
+            Self::recover(d)?;
+            let node = self.node_id(d)?;
+            if !d.may_delegate(&node) {
+                return Err(format!("discuss: `{node}` is at the goal's depth limit"));
+            }
+            let me = d.poll(&node).ok_or("discuss: own node missing")?;
+            let own = match (self.child, me.session.as_deref()) {
+                (true, Some(dir)) => measured(Path::new(dir)).unwrap_or(me.own).max(me.own),
+                _ => me.own,
+            };
+            let req = DelegateRequest {
+                profile: DISCUSSION_PROFILE,
+                task: &discussion_task(id),
+                mode: Mode::Consult,
+                budget: BudgetRequest {
+                    tokens,
+                    steps: Some(1),
+                    minutes: None,
+                },
+                profile_allow: &[],
+                workspace: None,
+            };
+            let h = d
+                .delegate(&node, &req, own, now())
+                .map_err(|e| e.to_string())?;
+            if let Err(e) = d.start(&h.node_id, lease_of(std::process::id()), None, now()) {
+                let _ = d.settle(
+                    &h.node_id,
+                    Outcome::Cancelled,
+                    Spend::default(),
+                    None,
+                    Some("it could not start"),
+                    now(),
+                );
+                return Err(format!("discuss: {e}"));
+            }
+            Ok((h.node_id, h.budget.tokens))
+        })
+    }
+
+    /// The node of discussion `id` if THIS session started it (a direct
+    /// child with the host-only profile and task), else `None`. A model
+    /// manages only its own discussions: it cannot read or stop the owner's
+    /// or a sibling's.
+    pub fn discussion_node(&self, id: &str) -> Result<Option<String>, String> {
+        let task = discussion_task(id);
+        self.find_direct(|n| n.profile.as_deref() == Some(DISCUSSION_PROFILE) && n.task == task)
+    }
+
+    /// Settles discussion node `node` at what the ledger counted, with the
+    /// host-built outcome as its report (never model text). Settling twice
+    /// is a no-op.
+    pub fn settle_discussion(
+        &self,
+        node: &str,
+        spent: u64,
+        summary: &str,
+        risks: Vec<String>,
+    ) -> Result<(), String> {
+        self.locked(|d| {
+            if d.poll(node).is_none_or(|n| n.status.is_terminal()) {
+                return Ok(());
+            }
+            let report = tole_core::delegation::Report {
+                summary: summary.to_string(),
+                risks,
+                ..Default::default()
+            };
+            d.settle(
+                node,
+                Outcome::Ok,
+                Spend {
+                    tokens: spent,
+                    steps: 0,
+                },
+                Some(report),
+                None,
+                now(),
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
         })
     }
 

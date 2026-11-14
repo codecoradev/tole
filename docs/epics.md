@@ -305,9 +305,10 @@ Bot and Nakama; BMAD for collaboration). Design notes:
     built-in scribe and claim-checker roles and the host driver as a
     library, with independent read-only participants through `delegate`,
     uteke round documents and `tole audit --discussions`; part 3a is the
-    owner-only `tole discuss` command; the owner chose both entry points, so
-    the model-facing tool under the rules of `delegate` follows, see
-    `automation-design.md` "Entry point");
+    owner-only `tole discuss` command; part 3b is the model-facing
+    `discuss`, `discuss_status` and `discuss_stop` under the rules of
+    `delegate` (the owner chose both entry points, see `automation-design.md`
+    "Entry point"); independent child participants for agents are not done);
   - `uteke_document` parent (#576; done).
 - **E3 — Skills, epic #589:** `SkillIndex` + uteke doc adapter, K = 5 with
   pinned core (#590), approved-hash loading (#591), propose-only growth with
