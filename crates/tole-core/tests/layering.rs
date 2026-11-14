@@ -28,11 +28,12 @@ use std::path::Path;
 /// Faces: serve-side modules (only a host's serve surface uses them).
 #[rustfmt::skip]
 const KERNEL_MODULES: &[&str] = &[
+    "tools",
     "entry", "register", "state", "storage", "machine", "paths", "secrets",
     "sanitize", "safe_dir", "tool", "approval", "provider", "openai", "mock",
     "failover", "cancel", "interrupt", "image", "ledger",  "transcript",
     "turn", "compaction", "gate", "replay", "hooks", "subprocess", "process_guard",
-    "sandbox", "file_tools", "read_file", "todo", "systemone",
+    "sandbox",  "systemone",
 ];
 #[rustfmt::skip]
 const ENGINE_MODULES: &[&str] = &[
@@ -55,6 +56,9 @@ const BASELINE: &[(&str, &str, &str)] = &[
 
 /// Old top-level paths that are now re-exports of a module inside another one.
 const ALIASES: &[(&str, &str)] = &[
+    ("file_tools", "tools"),
+    ("read_file", "tools"),
+    ("todo", "tools"),
     ("cron", "ledger"),
     ("tz", "ledger"),
     ("webhook", "ledger"),
