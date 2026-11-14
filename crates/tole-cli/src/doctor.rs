@@ -868,6 +868,22 @@ pub fn run_cli(
     for l in tole_core::sandbox::doctor_lines(sandbox.as_ref(), &tole_core::sandbox::detect()) {
         println!("{l}");
     }
+    // Sandbox of model commands (#748): which tools run in the `command`
+    // profile and whether a working sandbox is there for them. A consumer
+    // that cannot run (required, or unattended optional, with no sandbox)
+    // fails the doctor. Names and states only.
+    let consumers = match &user {
+        Some(Ok(c)) => c
+            .sandbox
+            .as_ref()
+            .and_then(|s| s.consumers().ok())
+            .unwrap_or_default(),
+        _ => Default::default(),
+    };
+    let consumer_lines =
+        tole_core::sandbox::command::doctor_lines(&consumers, &tole_core::sandbox::detect());
+    let ok = ok && !consumer_lines.iter().any(|l| l.contains("ERROR"));
+    consumer_lines.iter().for_each(|l| println!("{l}"));
     // Advisor tier (#587): the profiles that declare one, names only. A
     // broken user config is already reported (and failed) above.
     let advisor_lines = match &user {

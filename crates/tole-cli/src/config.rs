@@ -133,9 +133,79 @@ pub struct SandboxConfig {
     /// Seconds a sandboxed server may sit unused before it is stopped,
     /// 1 to 86400 (default 900); it restarts on its next call.
     pub idle_secs: Option<u64>,
+    /// The sandbox of the commands a model makes the host run (#748).
+    pub consumers: Option<SandboxConsumersConfig>,
+}
+
+/// The `[sandbox.consumers]` table (#748): which model-driven commands run
+/// in the `command` profile. USER LAYER ONLY, with the rest of `[sandbox]`.
+/// Everything is off by default; `verify`, the stop gates and cron scripts
+/// are not consumers yet.
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SandboxConsumersConfig {
+    /// `run_command`: `off` (default) | `optional` | `required`.
+    pub run_command: Option<String>,
+    /// `job_start`: `off` (default) | `optional` | `required`.
+    pub job_start: Option<String>,
+    /// Network of the `command` profile: `none` (default) or `host`.
+    pub network: Option<String>,
+    /// Most CPU seconds per process, 1 to 86400 (default 3600).
+    pub cpu_secs: Option<u64>,
+    /// Most address space per process in MiB, 256 to 1048576 (default 16384).
+    pub memory_mb: Option<u64>,
+    /// Most processes and threads in the sandbox, 16 to 65536 (default 4096).
+    pub processes: Option<u64>,
+    /// Largest file a process may write in MiB, 1 to 1048576 (default 4096).
+    pub file_size_mb: Option<u64>,
+}
+
+impl SandboxConsumersConfig {
+    /// The core settings this table sets; a bad value is an error naming its key.
+    pub fn settings(&self) -> Result<tole_core::sandbox::command::Consumers, String> {
+        use tole_core::sandbox::command::{Consumers, Limits};
+        use tole_core::sandbox::{Mode, Network};
+        let mode = |key: &str, v: &Option<String>| match v.as_deref() {
+            None => Ok(Mode::Off),
+            Some(s) => Mode::parse(s).ok_or_else(|| {
+                format!("sandbox.consumers.{key} must be off, optional or required, got {s:?}")
+            }),
+        };
+        let d = Limits::default();
+        let limits = Limits {
+            cpu_secs: self.cpu_secs.unwrap_or(d.cpu_secs),
+            memory_mb: self.memory_mb.unwrap_or(d.memory_mb),
+            processes: self.processes.unwrap_or(d.processes),
+            file_size_mb: self.file_size_mb.unwrap_or(d.file_size_mb),
+        };
+        limits.check()?;
+        Ok(Consumers {
+            run_command: mode("run_command", &self.run_command)?,
+            job_start: mode("job_start", &self.job_start)?,
+            network: match self.network.as_deref() {
+                None | Some("none") => Network::None,
+                Some("host") => Network::Host,
+                Some(s) => {
+                    return Err(format!(
+                        "sandbox.consumers.network must be none or host, got {s:?}"
+                    ))
+                }
+            },
+            limits,
+        })
+    }
 }
 
 impl SandboxConfig {
+    /// The settings of the model-command consumers (all off when the table
+    /// is absent).
+    pub fn consumers(&self) -> Result<tole_core::sandbox::command::Consumers, String> {
+        self.consumers.as_ref().map_or_else(
+            || Ok(tole_core::sandbox::command::Consumers::default()),
+            SandboxConsumersConfig::settings,
+        )
+    }
+
     /// The core policy this table sets; a bad value is an error naming its key.
     pub fn policy(&self) -> Result<tole_core::sandbox::Policy, String> {
         use tole_core::sandbox::{builtin_profile, Mode, Network};
@@ -941,6 +1011,7 @@ pub fn parse(src: &str, path: &Path) -> Result<Config, ConfigError> {
     }
     if let Some(s) = &cfg.sandbox {
         s.policy().map_err(range)?;
+        s.consumers().map_err(range)?;
     }
     if let Some(c) = &cfg.curator {
         for (key, v) in [
@@ -1185,6 +1256,21 @@ pub fn layered(project: &Config, user: &Config) -> Config {
         ] {
             if set {
                 from_user.insert(k);
+            }
+        }
+        if let Some(c) = &s.consumers {
+            for (k, set) in [
+                ("sandbox.consumers.run_command", c.run_command.is_some()),
+                ("sandbox.consumers.job_start", c.job_start.is_some()),
+                ("sandbox.consumers.network", c.network.is_some()),
+                ("sandbox.consumers.cpu_secs", c.cpu_secs.is_some()),
+                ("sandbox.consumers.memory_mb", c.memory_mb.is_some()),
+                ("sandbox.consumers.processes", c.processes.is_some()),
+                ("sandbox.consumers.file_size_mb", c.file_size_mb.is_some()),
+            ] {
+                if set {
+                    from_user.insert(k);
+                }
             }
         }
     }
@@ -1541,6 +1627,24 @@ pub fn render_with(cfg: &Config, tag: &str, ann: &Annotations) -> Vec<String> {
         scalar(&mut out, "sandbox.mode", s.mode.as_deref().map(quote));
         scalar(&mut out, "sandbox.profile", s.profile.as_deref().map(quote));
         scalar(&mut out, "sandbox.network", s.network.as_deref().map(quote));
+        if let Some(c) = &s.consumers {
+            let n = |v: Option<u64>| v.map(|n| n.to_string());
+            for (key, v) in [
+                ("sandbox.consumers.run_command", &c.run_command),
+                ("sandbox.consumers.job_start", &c.job_start),
+                ("sandbox.consumers.network", &c.network),
+            ] {
+                scalar(&mut out, key, v.as_deref().map(quote));
+            }
+            for (key, v) in [
+                ("sandbox.consumers.cpu_secs", c.cpu_secs),
+                ("sandbox.consumers.memory_mb", c.memory_mb),
+                ("sandbox.consumers.processes", c.processes),
+                ("sandbox.consumers.file_size_mb", c.file_size_mb),
+            ] {
+                scalar(&mut out, key, n(v));
+            }
+        }
     }
     if let Some(c) = &cfg.curator {
         scalar(
@@ -1930,6 +2034,99 @@ verify_timeout = 60
                 .to_string();
             assert!(e.contains("sandbox."), "{e}");
         }
+    }
+
+    #[test]
+    fn sandbox_consumers_are_off_by_default_bounded_and_user_layer_only() {
+        use tole_core::sandbox::command::{Consumers, Limits};
+        use tole_core::sandbox::{Mode, Network};
+        // Absent or empty: both off, no network, the default limits.
+        for text in ["", "[sandbox]\n", "[sandbox.consumers]\n"] {
+            let s = match parse(text, &p()).unwrap().sandbox {
+                None => Consumers::default(),
+                Some(s) => s.consumers().unwrap(),
+            };
+            assert_eq!((s.run_command, s.job_start), (Mode::Off, Mode::Off));
+            assert_eq!((s.network, s.limits), (Network::None, Limits::default()));
+        }
+        let c = parse(
+            "[sandbox.consumers]\nrun_command = \"required\"\njob_start = \"optional\"\n\
+             network = \"host\"\ncpu_secs = 60\nmemory_mb = 512\nprocesses = 64\n\
+             file_size_mb = 10\n",
+            &p(),
+        )
+        .unwrap();
+        let s = c.sandbox.unwrap().consumers().unwrap();
+        assert_eq!(
+            (s.run_command, s.job_start),
+            (Mode::Required, Mode::Optional)
+        );
+        assert_eq!(s.network, Network::Host);
+        assert_eq!(
+            s.limits,
+            Limits {
+                cpu_secs: 60,
+                memory_mb: 512,
+                processes: 64,
+                file_size_mb: 10
+            }
+        );
+        // Bad values and unknown keys are errors that name the key.
+        for (bad, key) in [
+            ("run_command = \"on\"", "sandbox.consumers.run_command"),
+            ("job_start = \"yes\"", "sandbox.consumers.job_start"),
+            ("network = \"some\"", "sandbox.consumers.network"),
+            ("cpu_secs = 0", "sandbox.consumers.cpu_secs"),
+            ("cpu_secs = 86401", "sandbox.consumers.cpu_secs"),
+            ("memory_mb = 255", "sandbox.consumers.memory_mb"),
+            ("processes = 15", "sandbox.consumers.processes"),
+            ("processes = 65537", "sandbox.consumers.processes"),
+            ("file_size_mb = 0", "sandbox.consumers.file_size_mb"),
+        ] {
+            let e = parse(&format!("[sandbox.consumers]\n{bad}\n"), &p())
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains(key), "{bad}: {e}");
+        }
+        assert!(parse("[sandbox.consumers]\nverify = \"required\"\n", &p()).is_err());
+        assert!(parse("[sandbox.consumers]\nrun_commands = \"off\"\n", &p()).is_err());
+        // A project config cannot set them; the user layer wins whole.
+        let user = parse("[sandbox.consumers]\nrun_command = \"required\"\n", &p()).unwrap();
+        let project = parse(
+            "[sandbox.consumers]\nrun_command = \"off\"\nnetwork = \"host\"\n",
+            &p(),
+        )
+        .unwrap();
+        assert_eq!(layered(&project, &user).sandbox, user.sandbox);
+        assert!(layered(&project, &Config::default()).sandbox.is_none());
+    }
+
+    #[test]
+    fn config_check_shows_the_consumer_keys() {
+        let user = parse(
+            "[sandbox.consumers]\nrun_command = \"required\"\nnetwork = \"host\"\ncpu_secs = 9\n",
+            &p(),
+        )
+        .unwrap();
+        let lines = render_with(&user, USER_TAG, &Annotations::new());
+        for want in [
+            "sandbox.consumers.run_command = \"required\"",
+            "sandbox.consumers.network = \"host\"",
+            "sandbox.consumers.cpu_secs = 9",
+        ] {
+            assert!(
+                lines.iter().any(|l| l.contains(want)),
+                "{want} in {lines:?}"
+            );
+        }
+        // A project layer's lines are marked ignored.
+        let lines = render_with(&user, PROJECT_TAG, &Annotations::new());
+        let mine: Vec<_> = lines
+            .iter()
+            .filter(|l| l.contains("sandbox.consumers."))
+            .collect();
+        assert_eq!(mine.len(), 3, "{lines:?}");
+        assert!(mine.iter().all(|l| l.contains("IGNORED")), "{lines:?}");
     }
 
     #[test]
