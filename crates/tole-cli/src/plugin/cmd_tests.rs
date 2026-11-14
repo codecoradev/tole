@@ -571,3 +571,38 @@ fn entries_the_ledger_never_saw_are_reported_not_blocked() {
         "{out}"
     );
 }
+
+#[test]
+fn diff_follows_the_project_lock_and_does_not_start_what_it_revokes() {
+    let h = H::new("projdiff", &["cora"]);
+    h.run(&v1(), approve("cora", Some(&hash(&v1())))).unwrap();
+    let pin = PluginAction::Approve {
+        name: "cora".into(),
+        hash: Some(hash(&v1())),
+        project: true,
+    };
+    h.run(&v1(), pin).unwrap();
+    // The project lock (a file of the repository) revokes the server.
+    let path = Lockfile::project_path(&h.dir.join("ws"));
+    let mut project = Lockfile::load(&path).unwrap();
+    project.servers.get_mut("cora").unwrap().revoked = true;
+    project.save(&path).unwrap();
+    let started = std::cell::Cell::new(0);
+    let live = |_: &str| {
+        started.set(started.get() + 1);
+        v1()
+    };
+    let d = h.go(&live, None, diff("cora")).unwrap();
+    assert!(
+        d.contains("live tools not fetched") && d.contains("REVOKED"),
+        "{d}"
+    );
+    assert_eq!(started.get(), 0);
+    // A project pin to another manifest makes it untrusted the same way.
+    project.servers.get_mut("cora").unwrap().revoked = false;
+    project.servers.get_mut("cora").unwrap().manifest_hash = "sha256:other".into();
+    project.save(&path).unwrap();
+    let d = h.go(&live, None, diff("cora")).unwrap();
+    assert!(d.contains("live tools not fetched"), "{d}");
+    assert_eq!(started.get(), 0);
+}

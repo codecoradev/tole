@@ -376,7 +376,10 @@ fn diff(ctx: &Ctx<'_>, name: &str) -> Result<String, String> {
         Some(p) => Lockfile::load(p)?,
         None => Lockfile::default(),
     };
-    let mut eff = user.servers.clone();
+    // The merged lock, as `list` and a session see it: a project entry can
+    // revoke or re-pin, and then the server must not be started here either.
+    let project = Lockfile::load(&ctx.project_path())?;
+    let (mut eff, _) = plugin_lock::effective(&user, &project);
     let ledger_notes = ctx
         .user
         .as_deref()
