@@ -4,3 +4,4 @@
 #[cfg(feature = "mcp")]
 pub mod cmd;
 pub mod gate;
+pub mod warn;

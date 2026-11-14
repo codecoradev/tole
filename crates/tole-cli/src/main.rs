@@ -1445,17 +1445,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                 interactive: std::io::stdin().is_terminal() && std::io::stderr().is_terminal(),
                 ask: &mut ask,
                 secrets: tole_cli::provider_chain::process_secrets(&config_apply::real_env),
-                // The owner's own servers: the built-in names plus the ones
-                // they exempted from the sandbox (`[sandbox] skip`).
-                first_party: tole_core::plugin_lock::DEFAULT_FIRST_PARTY
-                    .iter()
-                    .map(|s| s.to_string())
-                    .chain(
-                        tole_core::sandbox::policy()
-                            .map(|p| p.skip)
-                            .unwrap_or_default(),
-                    )
-                    .collect(),
+                first_party: tole_cli::plugin_gate::first_party_names(),
                 sandbox: tole_core::sandbox::policy(),
                 backend: tole_core::sandbox::detect(),
                 mcp_grants: {
@@ -1787,6 +1777,32 @@ fn dispatch(cli: Cli) -> Result<()> {
                     cwd,
                 );
                 for l in gate.doctor_lines(&names) {
+                    println!("{l}");
+                }
+                // Unpinned launchers, a third-party server no sandbox
+                // applies to, broad grants (#600).
+                let configured: Vec<tole_cli::plugin::warn::Configured> = host
+                    .mcp_server
+                    .iter()
+                    .filter_map(|s| tole_core::mcp::McpServerConfig::parse(s).ok())
+                    .map(|c| tole_cli::plugin::warn::Configured {
+                        name: c.name,
+                        stdio: match c.transport {
+                            tole_core::mcp::McpTransport::Stdio { command, args } => {
+                                Some((command, args))
+                            }
+                            tole_core::mcp::McpTransport::Http { .. } => None,
+                        },
+                    })
+                    .collect();
+                let first_party = tole_cli::plugin_gate::first_party_names();
+                for l in tole_cli::plugin::warn::warnings(
+                    gate.entries(),
+                    &configured,
+                    &first_party,
+                    tole_core::sandbox::policy().as_ref(),
+                    &tole_core::sandbox::detect(),
+                ) {
                     println!("{l}");
                 }
             }
