@@ -123,3 +123,31 @@ jobs:
           echo "CC_aarch64_linux_android=$NDK_BIN/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
           echo "AR_aarch64_linux_android=$NDK_BIN/llvm-ar" >> "$GITHUB_ENV"
       - run: cargo check -p tole-core --target ${{ matrix.target }} --no-default-features
+
+  # v0.11.0 shipped a Windows build break (an ungated std::os::unix use)
+  # that nothing on the PR path compiled. Mirror the release matrix's
+  # native targets (windows-latest / macos-latest, default features,
+  # same toolchain action) so a green PR check means a green release
+  # build. Check-only (no link, no release profile) to keep runner cost
+  # low; the test targets are compiled but not run.
+  os-check:
+    name: OS Check (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: os-check-${{ matrix.target }}
+      - run: cargo check --workspace --all-targets --target ${{ matrix.target }}
+      - run: cargo test -p tole-core --no-run --target ${{ matrix.target }}
