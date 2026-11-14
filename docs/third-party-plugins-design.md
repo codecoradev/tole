@@ -253,3 +253,55 @@ SHA-256: a different source or binary is refused at connect (and reported
 by `list` and `diff`) until it is approved again. The entry's `secrets`
 (the `mcp` grants held at approval) are the server's launch grant,
 intersected with the current `[secrets]` release.
+
+## 9. `tole plugin add`, scan and tiers (#600, first slice)
+
+**Built.** `tole plugin list` and `diff` show source, program hash, secrets,
+sandbox status and the trust tier, and never start a server the lock would
+refuse (revoked, unapproved, another command line or URL, another program
+file) nor anything under an agent session. `tole plugin add name=<command
+line or https url>` starts the server, shows everything the model would read
+(server text behind a bar, as data), the scan report (`tole_core::plugin_scan`:
+hidden-instruction markers, mentions of other servers or tools, sensitive
+paths, invisible and bidi Unicode, secret shapes, over-long text) and any
+unpinned launcher (`npx`, `uvx`, `docker run` without an exact version), and
+locks the server after the owner types `add <name> <first 8 hex of the
+manifest hash>`. A bare `y` is not accepted and there is no `--yes`.
+
+**Tier rules as built.**
+
+| Tier | How it is set | What `add` and `approve` do |
+|---|---|---|
+| first-party | the name is on the owner's list: `cora`, `uteke`, `nginjen`, `laya`, plus `[sandbox] skip` | shared connection as a session would use; `add` refuses such a name (use `approve`) |
+| third-party verified | a lock entry written by registry resolution (a later slice); nothing sets it yet | probe without the sandbox requirement |
+| third-party unverified | everything else, and every server `add` installs | stdio: starts only inside the sandbox (`[sandbox] mode`, Linux with bubblewrap), otherwise refused before anything starts; remote HTTP needs none; interactive only |
+
+Where there is no sandbox (macOS, Windows, Linux without bubblewrap, mode
+`off`, or the name skipped) an unverified stdio server is refused. The owner
+accepts a server explicitly by listing it under `[sandbox] skip`, which makes
+it their own (first-party). A first-party claim in a lock entry is ignored: a
+name must be on the owner's list.
+
+**The probe.** `mcp::probe_manifest` starts the server on its own, lists the
+tools, and kills the whole process group on every exit path (returned,
+failed, timed out, panicked); the server gets no secret, its stderr is
+discarded, and a new third-party server is locked with no secret grant (the
+per-plugin grants of `SecretSet::env_for` are a later slice). The program
+file's hash is taken before the start and checked after it; what is locked is
+the hash taken before, the tool list that was shown, and nothing re-read.
+
+**What is and is not protected.** The lock and the plugin ledger are files of
+the owner. `revoke`, `approve` and `add` refuse under `TOLE_UNDER_SESSION` and
+`TOLE_AGENT_DEPTH`, and the ledger is checked against the lock: a revoked
+entry flipped back by hand, or a re-pinned manifest hash, is treated as
+revoked until the owner approves again. A process that can rewrite the lock
+and the ledger, or a copied `tole` run with a cleared environment, is not
+stopped (same residual as #684). The scan is a report, never a safety label.
+For `npx`, `uvx` and `docker` the integrity covers the launcher, not the
+package: pin the version in the command line.
+
+**Not built yet** (later slices): bundle manifests, per-plugin secret grants
+through `env_for`, resolution through the official MCP Registry with verified
+namespaces, skills from the uteke registry. `add` does not edit the owner's
+config: after it, configure the same command line (`mcp_server` or
+`--mcp-server`); the approval is bound to exactly that source.

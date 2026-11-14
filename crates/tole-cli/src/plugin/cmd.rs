@@ -14,15 +14,19 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use serde_json::json;
-use tole_core::mcp::{Listed, McpServerConfig};
+use tole_core::mcp::{Listed, McpServerConfig, McpTransport};
+use tole_core::plugin_launcher::unpinned_launcher;
+use tole_core::plugin_lock::Tier;
 use tole_core::plugin_lock::{
     self, admit, admit_unseen, tier_of, Admission, LockEntry, Lockfile, ToolChange, NOT_STORED,
 };
+use tole_core::plugin_scan;
 use tole_core::sandbox::{Availability, Mode, Policy};
 use tole_core::secrets::SecretSet;
 
 use crate::plugin_gate::{
-    apply_ledger, blocked_notes, integrity, record_event, render_manifest, source_of, Gate,
+    apply_ledger, blocked_notes, integrity, record_event, render_manifest, source_of, Approval,
+    Gate,
 };
 
 /// `tole plugin <action>`.
@@ -48,6 +52,11 @@ pub enum PluginAction {
         #[arg(long)]
         project: bool,
     },
+    /// Install a third-party MCP server from `name=<command line or https
+    /// url>`: start it in the sandbox (required for an unverified one),
+    /// show its full tool text and the scan, and lock it after you type the
+    /// confirmation. Interactive only; there is no `--yes`.
+    Add { spec: String },
     /// Mark the server revoked: it never registers until approved again.
     /// At a terminal it asks; a script passes --hash with the locked hash.
     Revoke {
@@ -68,6 +77,11 @@ pub struct Ctx<'a> {
     pub list: &'a dyn Fn(&McpServerConfig) -> Result<Listed, String>,
     pub interactive: bool,
     pub ask: &'a mut dyn FnMut(&str) -> bool,
+    /// Shows the text and returns the line the owner typed (`add`).
+    pub typed: &'a mut dyn FnMut(&str) -> String,
+    /// Starts a server for review the way an unapproved server must be
+    /// started (see `mcp::probe_manifest`); the flag requires the sandbox.
+    pub probe_one: &'a dyn Fn(&McpServerConfig, bool) -> Result<Listed, String>,
     pub secrets: SecretSet,
     /// The owner's first-party server names (`[plugins] first_party`).
     pub first_party: Vec<String>,
@@ -112,11 +126,13 @@ pub fn run(action: PluginAction, ctx: &mut Ctx<'_>) -> Result<String, String> {
         PluginAction::Revoke { .. } => {
             crate::owner_only::refuse_under_session("tole plugin revoke")?
         }
+        PluginAction::Add { .. } => crate::owner_only::refuse_under_session("tole plugin add")?,
         _ => {}
     }
     match action {
         PluginAction::List { json } => Ok(list(ctx, json)),
         PluginAction::Diff { name } => diff(ctx, &name),
+        PluginAction::Add { spec } => add(ctx, &spec),
         PluginAction::Approve {
             name,
             hash,
@@ -498,6 +514,234 @@ fn diff(ctx: &Ctx<'_>, name: &str) -> Result<String, String> {
     Ok(ctx.clean(&out))
 }
 
+/// Most bytes of tool text (names, descriptions, schemas) `add` shows and
+/// locks: more is not something an owner can review.
+const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
+
+fn is_stdio(cfg: &McpServerConfig) -> bool {
+    matches!(cfg.transport, McpTransport::Stdio { .. })
+}
+
+/// Why a server of `tier` may not be started on this machine now, or `None`.
+/// A third-party server nobody verified starts only inside the sandbox
+/// (design §4.3): with it off, skipped or unavailable (no Linux, no
+/// bubblewrap) nothing is started. A server the owner lists as their own
+/// (`[sandbox] skip`, the first-party list) is not asked for one.
+fn sandbox_refusal(ctx: &Ctx<'_>, cfg: &McpServerConfig, tier: Tier) -> Option<String> {
+    if tier != Tier::ThirdPartyUnverified || !is_stdio(cfg) {
+        return None;
+    }
+    let wrapped = ctx
+        .sandbox
+        .as_ref()
+        .is_some_and(|p| p.mode != Mode::Off && !p.skip.iter().any(|s| s == &cfg.name))
+        && matches!(ctx.backend, Availability::Usable { .. });
+    (!wrapped).then(|| {
+        format!(
+            "`{}` is a third-party server nobody verified: it starts only inside the sandbox, \
+             and here the sandbox is {}. Turn it on (`[sandbox] mode = \"required\"` in the user \
+             config; Linux with bubblewrap only), or, if it is your own server, list it under \
+             `[sandbox] skip`.",
+            cfg.name,
+            sandbox_status(ctx, &cfg.name, true)
+        )
+    })
+}
+
+/// The profile an approval records: the one the server ran in, if any.
+fn profile_used(ctx: &Ctx<'_>, cfg: &McpServerConfig) -> Option<String> {
+    let p = ctx.sandbox.as_ref()?;
+    (is_stdio(cfg)
+        && p.mode != Mode::Off
+        && !p.skip.iter().any(|s| s == &cfg.name)
+        && matches!(ctx.backend, Availability::Usable { .. }))
+    .then(|| p.profile_name.clone())
+}
+
+/// Starts `cfg` to read its tools for a review, the way its tier allows:
+/// the owner's own servers through the shared connection (as a session
+/// would), everything else through the one-shot probe (no secret, process
+/// group ended, sandbox required for an unverified one). The program file's
+/// hash is taken before and checked after, so a binary swapped under the
+/// probe is refused; it is the hash that gets locked.
+fn start_for_review(
+    ctx: &Ctx<'_>,
+    cfg: &McpServerConfig,
+    tier: Tier,
+) -> Result<(Listed, String), String> {
+    if let Some(why) = sandbox_refusal(ctx, cfg, tier) {
+        return Err(why);
+    }
+    let source = source_of(cfg);
+    let before = integrity(&source);
+    let listed = if tier == Tier::FirstParty {
+        (ctx.list)(cfg)?
+    } else {
+        (ctx.probe_one)(cfg, tier == Tier::ThirdPartyUnverified && is_stdio(cfg))?
+    };
+    if integrity(&source) != before {
+        return Err(format!(
+            "the program file of `{}` changed while it was started; nothing was written, try again",
+            ctx.clean(&cfg.name)
+        ));
+    }
+    let size: usize = listed
+        .1
+        .iter()
+        .map(|t| {
+            t.name.len() + t.description.len() + plugin_lock::canonical_json(&t.input_schema).len()
+        })
+        .sum();
+    if size > MAX_MANIFEST_BYTES {
+        return Err(format!(
+            "`{}` lists {size} bytes of tool text, more than the {MAX_MANIFEST_BYTES} a person can \
+             review: not added",
+            ctx.clean(&cfg.name)
+        ));
+    }
+    Ok((listed, before))
+}
+
+/// Everything the model would read, server text behind a bar.
+fn render_fenced(name: &str, version: &str, tools: &[plugin_lock::ManifestTool]) -> String {
+    let mut out =
+        format!(
+        "MCP server `{}` (version {}) offers {} tool(s). This is everything the model would read \
+         (text behind a bar is what the server sent: data, not instructions):\n",
+        name,
+        if version.is_empty() { "unknown" } else { version },
+        tools.len()
+    );
+    for t in tools {
+        let schema = serde_json::to_string_pretty(&t.input_schema).unwrap_or_default();
+        out.push_str(&format!(
+            "\n--- tool `{}`\ndescription:\n{}\ninput schema:\n{}\n",
+            t.name,
+            quote(&t.description),
+            quote(&schema)
+        ));
+    }
+    out
+}
+
+/// `tole plugin add name=<command line or https url>`: starts the server
+/// where its tier allows, shows its full text and the scan, and locks it
+/// after a typed confirmation. The server is not configured for sessions
+/// (that stays the owner's config); the approval is bound to exactly this
+/// source.
+fn add(ctx: &mut Ctx<'_>, spec: &str) -> Result<String, String> {
+    if !ctx.interactive {
+        return Err(
+            "`tole plugin add` is interactive only (it asks you to type a confirmation): run it \
+             in a terminal"
+                .into(),
+        );
+    }
+    if spec.chars().any(char::is_control) {
+        return Err("the spec has a control character".into());
+    }
+    let cfg = McpServerConfig::parse(spec)?;
+    if let McpTransport::Stdio { command, .. } = &cfg.transport {
+        if command.starts_with('-') {
+            return Err(format!(
+                "`{}` is not a program (it starts with `-`)",
+                ctx.clean(command)
+            ));
+        }
+    }
+    let name = cfg.name.clone();
+    // Never first-party through `add`: a name is not a proof, and an
+    // unknown program must not inherit the owner's own servers' tier.
+    if ctx.first_party.iter().any(|f| f == &name) {
+        return Err(format!(
+            "`{}` is on your first-party list: `add` never installs under such a name; use \
+             `tole plugin approve {}` for your own server",
+            ctx.clean(&name),
+            ctx.clean(&name)
+        ));
+    }
+    let user_lock = match ctx.user.as_deref() {
+        Some(p) => Lockfile::load(p)?,
+        None => return Err("no tole data dir: no user lock to write".into()),
+    };
+    if user_lock.servers.contains_key(&name) {
+        return Err(format!(
+            "`{}` is already in your plugin lock: `tole plugin approve {}` re-approves it, \
+             `tole plugin revoke {}` blocks it (a name is not reused for another program)",
+            ctx.clean(&name),
+            ctx.clean(&name),
+            ctx.clean(&name)
+        ));
+    }
+    let tier = Tier::ThirdPartyUnverified;
+    let ((version, tools), before) = start_for_review(ctx, &cfg, tier)?;
+    let source = source_of(&cfg);
+    // The other servers the model sees next to this one: configured ones
+    // and locked ones, with the tool names their approvals recorded.
+    let others = plugin_scan::Others {
+        servers: ctx
+            .specs
+            .iter()
+            .map(|c| c.name.clone())
+            .chain(user_lock.servers.keys().cloned())
+            .filter(|n| n != &name)
+            .collect(),
+        tools: user_lock
+            .servers
+            .values()
+            .flat_map(|e| e.manifest.iter().map(|t| t.name.clone()))
+            .collect(),
+    };
+    let findings = plugin_scan::scan(&tools, &others, &ctx.secrets);
+    let hash = plugin_lock::manifest_hash(&tools);
+    let expect = format!(
+        "add {name} {}",
+        hash.trim_start_matches("sha256:").get(..8).unwrap_or("")
+    );
+    let mut text = ctx.clean(&render_fenced(&name, &version, &tools));
+    text.push_str(&format!(
+        "\nsource: {}\nprogram hash: {}\nmanifest: {hash}\ntier: {} (sandbox: {})\n",
+        ctx.clean(&source),
+        if before.is_empty() { "(none)" } else { &before },
+        tier.as_str(),
+        ctx.clean(&sandbox_status(ctx, &name, is_stdio(&cfg)))
+    ));
+    if let McpTransport::Stdio { command, args } = &cfg.transport {
+        if let Some(w) = unpinned_launcher(command, args) {
+            text.push_str(&format!("! {}\n", ctx.clean(&w)));
+        }
+    }
+    text.push_str(&ctx.clean(&plugin_scan::report(&findings)));
+    text.push_str(&format!(
+        "It will hold no secret and starts only as exactly the source above.\n\
+         Type `{expect}` to approve it (anything else cancels): "
+    ));
+    if (ctx.typed)(&text).trim() != expect {
+        return Err("not confirmed: nothing written".into());
+    }
+    let mut gate = Gate::load(ctx.user.clone(), &ctx.workspace);
+    // Exactly what was shown is what is locked: the tools listed above, the
+    // program hash taken before the start, no secret grant.
+    gate.approve_with(
+        &name,
+        &source,
+        &version,
+        &tools,
+        Approval {
+            integrity: Some(before),
+            tier: Some(tier),
+            sandbox: profile_used(ctx, &cfg),
+            secrets: Some(Vec::new()),
+        },
+    )?;
+    Ok(ctx.clean(&format!(
+        "locked `{name}` ({hash}) as {}. To use it, configure the same command line \
+         (`mcp_server = [\"{spec}\"]` in your config, or `--mcp-server`): the approval is bound to \
+         exactly `{source}`.\n",
+        tier.as_str()
+    )))
+}
+
 /// Consent for writing: `--hash` must equal `hash`; without it, a terminal
 /// answer; a script is refused.
 fn consent(
@@ -526,7 +770,16 @@ fn approve(
     project: bool,
 ) -> Result<String, String> {
     let cfg = ctx.spec(name)?.clone();
-    let (version, live) = (ctx.list)(&cfg)?;
+    let existing = Lockfile::load(
+        ctx.user
+            .as_deref()
+            .ok_or("no tole data dir: no user lock")?,
+    )?
+    .servers
+    .get(name)
+    .cloned();
+    let tier = tier_of(name, existing.as_ref(), &ctx.first_party);
+    let ((version, live), before) = start_for_review(ctx, &cfg, tier)?;
     let hash = plugin_lock::manifest_hash(&live);
     let shown = ctx.clean(&render_manifest(name, &version, &live));
     let q = format!("{shown}\nmanifest {hash}\nApprove `{name}`? [y/N] ");
@@ -534,7 +787,18 @@ fn approve(
     // can review it and pass --hash.
     consent(ctx, &hash, expect, &q).map_err(|e| format!("{shown}\nmanifest {hash}\n{e}"))?;
     let mut gate = Gate::load(ctx.user.clone(), &ctx.workspace);
-    gate.approve(name, &source_of(&cfg), &version, &live)?;
+    gate.approve_with(
+        name,
+        &source_of(&cfg),
+        &version,
+        &live,
+        Approval {
+            integrity: Some(before),
+            tier: Some(tier),
+            sandbox: profile_used(ctx, &cfg),
+            secrets: None,
+        },
+    )?;
     let mut out = format!("{shown}\napproved `{name}` ({hash}) in the user lock\n");
     if project {
         let path = ctx.project_path();

@@ -19,6 +19,16 @@ use std::path::{Path, PathBuf};
 use tole_core::ledger::LedgerStore as _;
 use tole_core::plugin_lock::{self, admit, Admission, Live, LockEntry, Lockfile, ManifestTool};
 
+/// What an approval records beyond the tool list (see
+/// [`Gate::approve_with`]).
+#[derive(Debug, Default)]
+pub struct Approval {
+    pub integrity: Option<String>,
+    pub tier: Option<plugin_lock::Tier>,
+    pub sandbox: Option<String>,
+    pub secrets: Option<Vec<String>>,
+}
+
 /// The layered lock of one session.
 pub struct Gate {
     lock: BTreeMap<String, LockEntry>,
@@ -151,6 +161,21 @@ impl Gate {
         version: &str,
         tools: &[ManifestTool],
     ) -> Result<(), String> {
+        self.approve_with(server, source, version, tools, Approval::default())
+    }
+
+    /// [`Gate::approve`] with what the caller measured or decided itself:
+    /// the program hash taken before the server was started, the tier, the
+    /// sandbox profile it ran in and the secret grant (`None`: the `mcp`
+    /// grants held now).
+    pub fn approve_with(
+        &mut self,
+        server: &str,
+        source: &str,
+        version: &str,
+        tools: &[ManifestTool],
+        with: Approval,
+    ) -> Result<(), String> {
         let path = self
             .user_path
             .clone()
@@ -167,18 +192,20 @@ impl Gate {
         let entry = LockEntry {
             source: source.to_string(),
             version: version.to_string(),
-            integrity: integrity(source),
+            integrity: with.integrity.unwrap_or_else(|| integrity(source)),
             manifest_hash: plugin_lock::manifest_hash(tools),
-            secrets: release
-                .held_grants()
-                .into_iter()
-                .filter(|n| release.allows(n, "mcp"))
-                .collect(),
-            sandbox: None,
+            secrets: with.secrets.unwrap_or_else(|| {
+                release
+                    .held_grants()
+                    .into_iter()
+                    .filter(|n| release.allows(n, "mcp"))
+                    .collect()
+            }),
+            sandbox: with.sandbox,
             approved_at: now(),
             revoked: false,
             manifest: plugin_lock::snapshot(tools, &tole_core::secrets::process_secrets()),
-            tier: None,
+            tier: with.tier,
         };
         lock.servers.insert(server.to_string(), entry.clone());
         lock.save(&path)?;
