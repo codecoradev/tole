@@ -1426,7 +1426,18 @@ fn dispatch(cli: Cli) -> Result<()> {
                 std::io::stdin().read_line(&mut line).is_ok()
                     && matches!(line.trim(), "y" | "Y" | "yes")
             };
+            // Typed confirmation (`add`): the line the owner types.
+            let mut typed = |q: &str| {
+                use std::io::Write;
+                eprint!("{q}");
+                let _ = std::io::stderr().flush();
+                let mut line = String::new();
+                let _ = std::io::stdin().read_line(&mut line);
+                line
+            };
             let mut ctx = tole_cli::plugin_cmd::Ctx {
+                typed: &mut typed,
+                probe_one: &tole_core::mcp::probe_manifest,
                 specs,
                 user: tole_core::plugin_lock::Lockfile::user_path(),
                 workspace: resolve_workspace_root(host.workspace.as_ref())?,
@@ -1434,9 +1445,16 @@ fn dispatch(cli: Cli) -> Result<()> {
                 interactive: std::io::stdin().is_terminal() && std::io::stderr().is_terminal(),
                 ask: &mut ask,
                 secrets: tole_cli::provider_chain::process_secrets(&config_apply::real_env),
+                // The owner's own servers: the built-in names plus the ones
+                // they exempted from the sandbox (`[sandbox] skip`).
                 first_party: tole_core::plugin_lock::DEFAULT_FIRST_PARTY
                     .iter()
                     .map(|s| s.to_string())
+                    .chain(
+                        tole_core::sandbox::policy()
+                            .map(|p| p.skip)
+                            .unwrap_or_default(),
+                    )
                     .collect(),
                 sandbox: tole_core::sandbox::policy(),
                 backend: tole_core::sandbox::detect(),
