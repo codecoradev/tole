@@ -383,7 +383,7 @@ pub struct JsonlStorage {
     /// Exclusive advisory lock on the sidecar `<id>.jsonl.lock` (never
     /// renamed, so it survives `compact()`); `None` for read-only handles.
     /// Released by the OS on drop or crash.
-    _lock: Option<File>,
+    _lock: Option<WriterLock>,
     /// File length after the last append this handle made or replayed;
     /// a mismatch before an append means someone else wrote.
     good_len: u64,
@@ -1088,7 +1088,7 @@ fn is_at_eof(reader: &mut impl Read) -> bool {
 /// our pid in it (best effort). A sidecar, not the session file: `compact()`
 /// renames a new file over the live path, which would drop a lock held on
 /// the old inode.
-fn lock_writer(dir: &SafeDir, file_name: &OsStr) -> Result<File, StorageError> {
+fn lock_writer(dir: &SafeDir, file_name: &OsStr) -> Result<WriterLock, StorageError> {
     let mut name = file_name.to_owned();
     name.push(".lock");
     // CLOEXEC (set by `open_plain`): a spawned child must not inherit the
@@ -1120,7 +1120,7 @@ fn lock_writer(dir: &SafeDir, file_name: &OsStr) -> Result<File, StorageError> {
                     .set_len(0)
                     .and_then(|()| f.seek(SeekFrom::Start(0)).map(|_| ()))
                     .and_then(|()| write!(f, "{}", std::process::id()));
-                return Ok(f);
+                return Ok(WriterLock::new(f));
             }
             Err(std::fs::TryLockError::WouldBlock) => {
                 let mut text = String::new();
@@ -1130,11 +1130,16 @@ fn lock_writer(dir: &SafeDir, file_name: &OsStr) -> Result<File, StorageError> {
                 // #552: an flock belongs to the open file description, so a
                 // child forked by ANOTHER thread of this process briefly
                 // holds a duplicate of a descriptor we just closed (until it
-                // execs). A hold that names OUR pid is either that transient
-                // or a genuine second open in this process (#475): retry for
-                // a bounded moment, which costs the genuine case almost
-                // nothing. Any other holder fails at once, as before.
-                if holder == Some(std::process::id()) && waited < SELF_HOLD_RETRY {
+                // execs). A hold that names OUR pid, on a lock no handle of
+                // this process holds, is that transient: retry, bounded
+                // generously (a loaded machine can leave a forked child
+                // unscheduled for seconds, #712). A lock another handle of
+                // this process really holds (#475) and any other holder fail
+                // at once.
+                if holder == Some(std::process::id())
+                    && !in_process_hold(&f)
+                    && waited < SELF_HOLD_RETRY
+                {
                     std::thread::sleep(SELF_HOLD_STEP);
                     waited += SELF_HOLD_STEP;
                     continue;
@@ -1146,10 +1151,65 @@ fn lock_writer(dir: &SafeDir, file_name: &OsStr) -> Result<File, StorageError> {
     }
 }
 
-/// How long [`lock_writer`] keeps retrying a lock that names our own pid
-/// (see #552), in steps of [`SELF_HOLD_STEP`].
-const SELF_HOLD_RETRY: std::time::Duration = std::time::Duration::from_millis(150);
+/// How long [`lock_writer`] keeps retrying a transient hold that names our
+/// own pid (see #552, #712), in steps of [`SELF_HOLD_STEP`].
+const SELF_HOLD_RETRY: std::time::Duration = std::time::Duration::from_secs(20);
 const SELF_HOLD_STEP: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// The sidecar locks this process holds through a [`WriterLock`], by file
+/// identity. It tells a transient duplicate of a closed descriptor (held by
+/// a child that has not exec'd yet) from a second open in this process.
+fn held_locks() -> &'static std::sync::Mutex<std::collections::HashSet<(u64, u64)>> {
+    static HELD: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<(u64, u64)>>> =
+        std::sync::OnceLock::new();
+    HELD.get_or_init(Default::default)
+}
+
+fn lock_identity(f: &File) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    f.metadata().ok().map(|m| (m.dev(), m.ino()))
+}
+
+fn in_process_hold(f: &File) -> bool {
+    lock_identity(f).is_some_and(|k| {
+        held_locks()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&k)
+    })
+}
+
+/// A held writer lock. Dropping it unregisters the lock before the
+/// descriptor closes, so a reopen never mistakes the closing handle for a
+/// live one.
+struct WriterLock {
+    _file: File,
+    key: Option<(u64, u64)>,
+}
+
+impl WriterLock {
+    fn new(file: File) -> Self {
+        let key = lock_identity(&file);
+        if let Some(k) = key {
+            held_locks()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(k);
+        }
+        Self { _file: file, key }
+    }
+}
+
+impl Drop for WriterLock {
+    fn drop(&mut self) {
+        if let Some(k) = self.key {
+            held_locks()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&k);
+        }
+    }
+}
 
 /// Opens `name` in `dir` for a session handle (#581, #639). The open is
 /// relative to the directory handle, so no directory on the way can be a
