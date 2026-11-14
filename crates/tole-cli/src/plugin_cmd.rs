@@ -89,6 +89,9 @@ fn short(hash: &str) -> &str {
 
 /// Runs `action`; the text to print, or the error (exit 1).
 pub fn run(action: PluginAction, ctx: &mut Ctx<'_>) -> Result<String, String> {
+    if matches!(action, PluginAction::Approve { .. }) {
+        crate::owner_only::refuse_under_session("tole plugin approve")?;
+    }
     match action {
         PluginAction::List { json } => Ok(list(ctx, json)),
         PluginAction::Diff { name } => diff(ctx, &name),

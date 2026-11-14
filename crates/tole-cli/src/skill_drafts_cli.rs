@@ -459,6 +459,8 @@ pub fn run(action: Option<DraftsAction>, store: &DraftStore) -> anyhow::Result<(
             accept_taint,
         } => {
             use std::io::{BufRead as _, IsTerminal as _, Write as _};
+            crate::owner_only::refuse_under_session("tole skills drafts promote")
+                .map_err(anyhow::Error::msg)?;
             let approvals_path = Approvals::default_path()
                 .context("the CodeCora home is unresolvable (set CODECORA_HOME or HOME)")?;
             let d = store.get(&id).map_err(anyhow::Error::msg)?;

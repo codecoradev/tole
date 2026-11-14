@@ -261,6 +261,8 @@ pub fn cli(action: SkillsAction) -> anyhow::Result<()> {
             workspace,
         } => {
             use std::io::{BufRead as _, IsTerminal as _, Write as _};
+            crate::owner_only::refuse_under_session("tole skills approve")
+                .map_err(anyhow::Error::msg)?;
             let ws = root(workspace)?;
             let (path, mut approvals) = store()?;
             // Show what would be approved first, then ask (or require the

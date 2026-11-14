@@ -906,6 +906,13 @@ fn print_report(verb: &str, r: &TickReport) {
 /// Dispatch for `tole cron <action>` (prints to stdout). `globals` are the
 /// global `--skill` / `--profile` flags; only `create` and `edit` take them.
 pub fn cli(action: CronAction, globals: JobGlobals) -> anyhow::Result<()> {
+    if matches!(
+        action,
+        CronAction::Create { .. } | CronAction::Resume { .. } | CronAction::Edit { .. }
+    ) {
+        crate::owner_only::refuse_under_session("tole cron create|resume|edit")
+            .map_err(anyhow::Error::msg)?;
+    }
     let dir = default_dir()?;
     let t = now();
     let takes_globals = matches!(action, CronAction::Create { .. } | CronAction::Edit { .. });

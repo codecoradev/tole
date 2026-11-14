@@ -166,7 +166,7 @@ impl Pty {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
         cmd.args(args)
             .current_dir(cwd)
-            .env("CODECORA_HOME", cwd.join("home"))
+            .env("CODECORA_HOME", cwd.with_extension("home"))
             .env("TOLE_BASE_URL", url)
             .env("TOLE_MODEL", "m")
             .env("TOLE_API_KEY", "k")
@@ -328,7 +328,7 @@ fn tui_streams_approves_cancels_and_leaves_an_ordinary_session() {
     let listed = Command::new(env!("CARGO_BIN_EXE_tole"))
         .arg("sessions")
         .current_dir(&dir)
-        .env("CODECORA_HOME", dir.join("home"))
+        .env("CODECORA_HOME", dir.with_extension("home"))
         .env("TOLE_NO_UPDATE_CHECK", "1")
         .output()
         .unwrap();
@@ -452,7 +452,7 @@ fn tui_model_picker_and_thinking_reach_the_next_request_and_survive_resume() {
         Command::new(env!("CARGO_BIN_EXE_tole"))
             .args(args)
             .current_dir(&dir)
-            .env("CODECORA_HOME", dir.join("home"))
+            .env("CODECORA_HOME", dir.with_extension("home"))
             .env("TOLE_BASE_URL", &url)
             .env("TOLE_MODEL", "m")
             .env("TOLE_API_KEY", "k")
@@ -756,7 +756,7 @@ fn tui_fork_continues_in_the_new_session_and_tree_switches_back() {
         let o = Command::new(env!("CARGO_BIN_EXE_tole"))
             .args(args)
             .current_dir(&dir)
-            .env("CODECORA_HOME", dir.join("home"))
+            .env("CODECORA_HOME", dir.with_extension("home"))
             .env("TOLE_NO_UPDATE_CHECK", "1")
             .output()
             .unwrap();
@@ -1015,10 +1015,11 @@ fn tui_unknown_theme_shows_one_note_and_uses_the_default() {
 }
 
 /// The user config (`$CODECORA_HOME/tole/config.toml`; the pty fixture sets
-/// `CODECORA_HOME` to `<cwd>/home`).
+/// `CODECORA_HOME` to `<cwd>.home`, outside the workspace, #684).
 fn write_user_config(dir: &Path, body: &str) {
-    std::fs::create_dir_all(dir.join("home/tole")).unwrap();
-    std::fs::write(dir.join("home/tole/config.toml"), body).unwrap();
+    let home = dir.with_extension("home").join("tole");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("config.toml"), body).unwrap();
 }
 
 fn printed(t: &Pty) -> String {
