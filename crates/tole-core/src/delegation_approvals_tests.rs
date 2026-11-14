@@ -1395,3 +1395,33 @@ fn the_window_is_clamped_and_cut_at_the_deadline() {
         "never past the node's deadline"
     );
 }
+
+#[test]
+fn escalate_moves_one_eligible_level_up_and_the_last_goes_to_the_owner() {
+    let mut f = std_fx();
+    let id = kid_ask(&mut f, "aaaaaaaa", T).unwrap();
+    let mid = f.mid.clone();
+    f.a.escalate(&f.d, &id, &mid, T + 1).unwrap();
+    assert_eq!(status(&f, &id, T + 2), Status::Pending { level: Some(1) });
+    // The level that escalated is no longer current.
+    let e = f.a.escalate(&f.d, &id, &mid, T + 2).unwrap_err();
+    assert!(
+        matches!(e, ApprovalError::Refused(Refusal::BadEscalation)),
+        "{e}"
+    );
+    f.a.escalate(&f.d, &id, "g", T + 3).unwrap();
+    assert_eq!(status(&f, &id, T + 4), Status::Pending { level: None });
+    // Nothing is left to escalate to but the owner, who decides.
+    let e = f.a.escalate(&f.d, &id, "g", T + 4).unwrap_err();
+    assert!(
+        matches!(e, ApprovalError::Refused(Refusal::BadEscalation)),
+        "{e}"
+    );
+    let e = f.a.escalate(&f.d, "dap-nope", "g", T + 4).unwrap_err();
+    assert!(matches!(e, ApprovalError::Refused(Refusal::Unknown)), "{e}");
+    // A level that is skipped is passed over: the middle one has no grant.
+    let mut f = fx(&["write_file", "delegate_decide"], &["write_file"]);
+    let id = kid_ask(&mut f, "bbbbbbbb", T).unwrap();
+    f.a.escalate(&f.d, &id, "g", T + 1).unwrap();
+    assert_eq!(status(&f, &id, T + 2), Status::Pending { level: None });
+}
