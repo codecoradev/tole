@@ -5,6 +5,12 @@
 //! testable without a network or API key (Tier A). The real HTTP client
 //! (E4) implements the same trait — the turn loop cannot tell them apart.
 
+pub mod failover;
+pub mod image;
+pub mod mock;
+pub mod openai;
+pub mod replay;
+
 use crate::cancel::CancelToken;
 use crate::entry::Entry;
 use serde_json::Value;
