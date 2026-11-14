@@ -558,14 +558,18 @@ pub fn ledger_line(event: &str, server: &str, manifest_hash: &str, at: u64) -> S
 }
 
 /// Largest ledger read for [`check_against_ledger`].
-pub const MAX_LEDGER_BYTES: u64 = 8 * 1024 * 1024;
+pub const MAX_LEDGER_BYTES: u64 = 64 * 1024 * 1024;
 
-/// The ledger text: `None` when it is missing, not a regular file (a
-/// symlink is not followed), too large or unreadable. The check against it
-/// then has nothing to compare, which is the same as no ledger.
-pub fn read_ledger(path: &Path) -> Option<String> {
-    let raw = read_bounded(path, MAX_LEDGER_BYTES).ok()?;
-    Some(String::from_utf8_lossy(&raw).into_owned())
+/// The ledger text. `Ok(None)`: there is no ledger (nothing to compare).
+/// `Err`: it exists but cannot be read (a symlink or other non-file, an
+/// I/O error, larger than [`MAX_LEDGER_BYTES`]): the comparison cannot be
+/// made, and the caller must say so rather than carry on as if it had.
+pub fn read_ledger(path: &Path) -> Result<Option<String>, String> {
+    match read_bounded(path, MAX_LEDGER_BYTES) {
+        Ok(raw) => Ok(Some(String::from_utf8_lossy(&raw).into_owned())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
 }
 
 /// What the owner's record of approvals says against the lock file.
@@ -579,6 +583,9 @@ pub struct LedgerCheck {
     /// Trusted entries the ledger has no approval for at all (written by
     /// hand, or approved before the ledger): reported, not blocked.
     pub unrecorded: Vec<String>,
+    /// Why the ledger could not be read, when it could not: revocations
+    /// recorded there are then not checked.
+    pub unreadable: Option<String>,
 }
 
 /// Compares the lock's trusted entries with the last `approve` / `revoke`
