@@ -940,5 +940,5 @@ fn speakers(cs: &[discussion::Contribution]) -> String {
 }
 
 #[cfg(test)]
-#[path = "discussion_host_tests.rs"]
+#[path = "host_tests.rs"]
 mod tests;
