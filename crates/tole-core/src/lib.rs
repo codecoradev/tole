@@ -144,6 +144,7 @@ pub mod run_command;
 pub mod session_guard;
 // Approval-surface text sanitizer (#327): crate-internal, no public API.
 pub mod plugin_lock;
+pub mod plugin_scan;
 pub mod sandbox;
 pub(crate) mod sanitize;
 pub mod secrets;
