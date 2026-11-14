@@ -1223,5 +1223,5 @@ pub fn load_user_config(path: Option<&Path>, io: &mut dyn ConfigTrustIo) -> Resu
 }
 
 #[cfg(test)]
-#[path = "config_apply_tests.rs"]
+#[path = "apply_tests.rs"]
 mod tests;
