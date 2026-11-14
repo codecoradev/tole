@@ -53,7 +53,20 @@ pub use integrations::gitea;
 pub use integrations::uteke;
 #[doc(inline)]
 pub use integrations::verify_package;
-pub mod entry;
+pub mod session;
+// `session/` holds these modules; the re-exports keep the old top-level paths working.
+#[doc(inline)]
+pub use session::entry;
+#[doc(inline)]
+pub use session::machine;
+#[doc(inline)]
+pub use session::register;
+#[doc(inline)]
+pub(crate) use session::safe_dir;
+#[doc(inline)]
+pub use session::state;
+#[doc(inline)]
+pub use session::storage;
 pub mod tools;
 // `tools/` holds these modules; the re-exports keep the old top-level paths working.
 #[doc(inline)]
@@ -98,7 +111,6 @@ pub mod web;
 pub mod hooks;
 #[cfg(feature = "shell-tools")]
 pub mod jobs;
-pub mod machine;
 #[cfg(feature = "mcp")]
 pub mod mcp;
 #[cfg(feature = "mcp")]
@@ -119,11 +131,9 @@ pub use provider::mock;
 pub use provider::openai;
 #[doc(inline)]
 pub use provider::replay;
-pub mod register;
 pub mod router;
 #[cfg(feature = "shell-tools")]
 pub mod run_command;
-pub(crate) mod safe_dir;
 #[cfg(feature = "shell-tools")]
 pub mod session_guard;
 // Approval-surface text sanitizer (#327): crate-internal, no public API.
@@ -150,8 +160,6 @@ pub use skills::curator as skill_curator;
 pub use skills::draft as skill_draft;
 #[doc(inline)]
 pub use skills::index as skill_index;
-pub mod state;
-pub mod storage;
 #[cfg(feature = "shell-tools")]
 pub mod subprocess;
 pub mod tool;
