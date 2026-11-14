@@ -79,6 +79,9 @@ impl BudgetTier {
 
 /// Resolved mission parameters.
 pub struct MissionConfig {
+    /// The session's cancel token: the turns and a parked delegated approver
+    /// (#714) watch the same one.
+    pub cancel: tole_core::cancel::CancelToken,
     /// The goal, verbatim from the operator.
     pub goal: String,
     /// Total provider steps across all chained turns.
@@ -408,7 +411,7 @@ pub fn run_mission(
             &registry,
             &prompt,
             first_images,
-            &tole_core::cancel::CancelToken::default(),
+            &cfg.cancel,
             None,
         ) {
             Ok(o) => o,
