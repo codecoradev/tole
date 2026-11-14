@@ -36,7 +36,7 @@ const KERNEL_MODULES: &[&str] = &[
 ];
 #[rustfmt::skip]
 const ENGINE_MODULES: &[&str] = &[
-    "delegation", "delegation_approvals", "delegation_report", "discussion", "discussion_log",
+    "delegation", "delegation_approvals", "delegation_report", "discussion",
     "router", "advisor", "skills", "skill_approval", "skill_curator", "skill_draft",
     "skill_index", "web", "mcp", "plugin_lock", "agents", "child_env", "handoff",
     "sibling_watch", "session_guard", "run_command", "jobs", "memory", "uteke", "gh", "git",
@@ -53,6 +53,9 @@ const BASELINE: &[(&str, &str, &str)] = &[
     ("tool", "skill_draft", "ToolContext stores the skill-draft TaintTracker"),
     ("secrets", "web", "header secret lookup calls web::header_secrets"),
 ];
+
+/// Old top-level paths that are now re-exports of a module inside another one.
+const ALIASES: &[(&str, &str)] = &[("discussion_log", "discussion")];
 
 fn level_of(module: &str) -> Option<u8> {
     [KERNEL_MODULES, ENGINE_MODULES, FACE_MODULES]
@@ -208,6 +211,10 @@ fn scan_edges() -> BTreeMap<(String, String), BTreeSet<String>> {
             .filter(|c| *c != "mod")
             .count();
         for to in crate_targets(&production_text(&file), depth) {
+            let to = ALIASES
+                .iter()
+                .find(|(a, _)| *a == to)
+                .map_or(to, |(_, m)| m.to_string());
             if to != from && mods.contains(&to) {
                 edges
                     .entry((from.clone(), to))
