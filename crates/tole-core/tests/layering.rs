@@ -7,7 +7,8 @@
 //!
 //! Limits of the scan (it is line-based, std only, no parser):
 //! - paths produced by macros (`$crate::`, macro-generated `use`) are not seen;
-//! - `use super::` / `self::` edges stay inside one module and are ignored;
+//! - `super::` chains that climb to the crate root count (by the file's module
+//!   depth); `self::` and `super::` inside an inline `mod {}` are not tracked;
 //! - doc and `//` comments are skipped; the trailing `#[cfg(test)] mod ...`
 //!   block of a file and test files (`*_tests.rs`, `tests.rs`, `tests/`)
 //!   are skipped, so test-only imports are not layering edges;
@@ -129,36 +130,54 @@ fn head(s: &str) -> &str {
     &s[..end]
 }
 
-/// Top-level module names named after each `crate::` in `text`.
-fn crate_targets(text: &str) -> Vec<String> {
-    let mut found = Vec::new();
-    let mut rest = text;
-    while let Some(pos) = rest.find("crate::") {
-        let before = rest[..pos].chars().next_back();
-        rest = &rest[pos + "crate::".len()..];
-        if before.is_some_and(|c| c == '$' || c.is_alphanumeric() || c == '_') {
-            continue; // `$crate::` or `foo_crate::`
-        }
-        if let Some(group) = rest.strip_prefix('{') {
-            let mut depth = 1;
-            let mut item_start = 0;
-            for (i, c) in group.char_indices() {
-                match c {
-                    '{' => depth += 1,
-                    '}' => depth -= 1,
-                    ',' if depth == 1 => {
-                        found.push(head(&group[item_start..i]).to_owned());
-                        item_start = i + 1;
-                    }
-                    _ => {}
-                }
-                if depth == 0 {
-                    found.push(head(&group[item_start..i]).to_owned());
-                    break;
-                }
+/// Top-level module heads of the path after a `crate::`/`super::` prefix;
+/// `{a, b::C}` groups yield one head per item.
+fn path_heads(rest: &str) -> Vec<String> {
+    let Some(group) = rest.strip_prefix('{') else {
+        return vec![head(rest).to_owned()];
+    };
+    let (mut heads, mut depth, mut item_start) = (Vec::new(), 1, 0);
+    for (i, c) in group.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => depth -= 1,
+            ',' if depth == 1 => {
+                heads.push(head(&group[item_start..i]).to_owned());
+                item_start = i + 1;
             }
-        } else {
-            found.push(head(rest).to_owned());
+            _ => {}
+        }
+        if depth == 0 {
+            heads.push(head(&group[item_start..i]).to_owned());
+            break;
+        }
+    }
+    heads
+}
+
+/// Top-level module names named after each `crate::` in `text`, and after
+/// each `super::` chain that climbs to the crate root. `depth` is the length
+/// of the file's module path (`src/a.rs` and `src/a/mod.rs` are 1,
+/// `src/a/b.rs` is 2), so `k` `super::` in a file of depth `k` is `crate::`.
+fn crate_targets(text: &str, depth: usize) -> Vec<String> {
+    let mut found = Vec::new();
+    for (i, _) in text.match_indices("crate::") {
+        let before = text[..i].chars().next_back();
+        if !before.is_some_and(|c| c == '$' || c.is_alphanumeric() || c == '_') {
+            found.extend(path_heads(&text[i + "crate::".len()..])); // not `$crate::`
+        }
+    }
+    for (i, _) in text.match_indices("super::") {
+        let before = text[..i].chars().next_back();
+        if before.is_some_and(|c| c == ':' || c.is_alphanumeric() || c == '_') {
+            continue; // the middle of a chain, or `foo_super::`
+        }
+        let (mut rest, mut climbs) = (&text[i..], 0);
+        while let Some(r) = rest.strip_prefix("super::") {
+            (rest, climbs) = (r, climbs + 1);
+        }
+        if climbs == depth {
+            found.extend(path_heads(rest));
         }
     }
     found
@@ -183,7 +202,12 @@ fn scan_edges() -> BTreeMap<(String, String), BTreeSet<String>> {
         if !mods.contains(&from) {
             continue; // lib.rs
         }
-        for to in crate_targets(&production_text(&file)) {
+        let depth = rel
+            .with_extension("")
+            .iter()
+            .filter(|c| *c != "mod")
+            .count();
+        for to in crate_targets(&production_text(&file), depth) {
             if to != from && mods.contains(&to) {
                 edges
                     .entry((from.clone(), to))
@@ -267,5 +291,10 @@ fn baseline_has_no_stale_entries() {
 #[test]
 fn scanner_reads_plain_group_and_nested_paths() {
     let text = "use crate::a::B;\nuse crate::{c, d::{E, F}, g as h};\nlet x = $crate::z::y; crate::i::j();";
-    assert_eq!(crate_targets(text), ["a", "c", "d", "g", "i"]);
+    assert_eq!(crate_targets(text, 1), ["a", "c", "d", "g", "i"]);
+    // `super::` reaches the crate root from `src/m.rs` (depth 1), and
+    // `super::super::` from `src/m/n.rs` (depth 2); other chains stay inside a module.
+    let text = "use super::w::X; use super::{p, q::R}; use super::super::s::T;";
+    assert_eq!(crate_targets(text, 1), ["w", "p", "q"]);
+    assert_eq!(crate_targets(text, 2), ["s"]);
 }
