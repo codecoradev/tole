@@ -300,6 +300,11 @@ stopped (same residual as #684). The scan is a report, never a safety label.
 For `npx`, `uvx` and `docker` the integrity covers the launcher, not the
 package: pin the version in the command line.
 
+**Doctor.** `tole doctor` warns, without starting anything, about an unpinned
+launcher in a configured server, a third-party stdio server no sandbox
+applies to, and a broad grant (any secret on a third-party server, or more
+than three on any server).
+
 **Not built yet** (later slices): bundle manifests, per-plugin secret grants
 through `env_for`, resolution through the official MCP Registry with verified
 namespaces, skills from the uteke registry. `add` does not edit the owner's

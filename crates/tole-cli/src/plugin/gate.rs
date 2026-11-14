@@ -220,6 +220,12 @@ impl Gate {
         }
     }
 
+    /// The effective lock entries (user lock narrowed by the project lock,
+    /// minus what the ledger blocks).
+    pub fn entries(&self) -> &BTreeMap<String, LockEntry> {
+        &self.lock
+    }
+
     /// `tole doctor`: each configured server's lock state (no connect).
     pub fn doctor_lines(&self, servers: &[String]) -> Vec<String> {
         let mut out = vec!["plugins (MCP servers):".to_string()];
@@ -273,6 +279,20 @@ pub fn apply_ledger(
         }
     }
     check
+}
+
+/// The owner's own servers: the built-in first-party names plus the ones
+/// exempted from the sandbox (`[sandbox] skip`, an explicit "my own server").
+pub fn first_party_names() -> Vec<String> {
+    plugin_lock::DEFAULT_FIRST_PARTY
+        .iter()
+        .map(|s| s.to_string())
+        .chain(
+            tole_core::sandbox::policy()
+                .map(|p| p.skip)
+                .unwrap_or_default(),
+        )
+        .collect()
 }
 
 /// Appends one ledger line next to the user lock `user` (names and
