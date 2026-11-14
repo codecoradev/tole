@@ -106,6 +106,7 @@ fn owner_commands() -> Vec<Vec<&'static str>> {
     {
         v.push(vec!["plugin", "approve", "evil", "--hash", "sha256:00"]);
         v.push(vec!["plugin", "revoke", "evil", "--hash", "sha256:00"]);
+        v.push(vec!["plugin", "add", "evil=true"]);
     }
     v
 }
