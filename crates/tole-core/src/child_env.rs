@@ -42,6 +42,11 @@ pub const DELEGATION_NODE: &str = "TOLE_DELEGATION_NODE";
 /// Where a delegated child writes its one completion report (#585).
 pub const DELEGATION_REPORT: &str = "TOLE_DELEGATION_REPORT";
 
+/// Set on a child that is an independent participant of a discussion
+/// (#704). Such a child can never start a discussion (nor delegate): the
+/// host registers neither tool where it is set.
+pub const DISCUSSION_PARTICIPANT: &str = "TOLE_DISCUSSION_PARTICIPANT";
+
 /// The secret variables a child agent keeps (#595): the provider keys its
 /// own provider chain reads (`TOLE_*`, `OPENAI_*`, the #209 reserve) and the
 /// provider base URLs, which the scrub removes when they carry a password
@@ -75,6 +80,8 @@ pub struct ChildLaunch {
     pub delegation: Option<(PathBuf, String)>,
     /// The completion report file, for a delegated child (#585).
     pub report: Option<PathBuf>,
+    /// The child is an independent discussion participant (#704).
+    pub participant: bool,
 }
 
 impl ChildLaunch {
@@ -98,8 +105,16 @@ impl ChildLaunch {
         if let Some(report) = &self.report {
             vars.push((DELEGATION_REPORT, report.clone().into_os_string()));
         }
+        if self.participant {
+            vars.push((DISCUSSION_PARTICIPANT, OsString::from("1")));
+        }
         vars
     }
+}
+
+/// True in a child that is an independent discussion participant (#704).
+pub fn discussion_participant(env: &dyn Fn(&str) -> Option<String>) -> bool {
+    env(DISCUSSION_PARTICIPANT).is_some_and(|v| !v.trim().is_empty())
 }
 
 /// This process's child depth: `0` when not a child (or unparseable).
@@ -187,6 +202,7 @@ mod tests {
             depth: 1,
             delegation: None,
             report: None,
+            participant: false,
         }
     }
 
@@ -211,6 +227,10 @@ mod tests {
         assert_eq!(role(&plain), None, "no role without a role launch");
         assert_eq!(delegation(&plain), None);
         assert_eq!(delegation_report(&plain), None);
+        assert!(!discussion_participant(&plain));
+        let mut part = launch(None);
+        part.participant = true;
+        assert!(discussion_participant(&env_of(part.vars())));
         let mut rep = launch(None);
         rep.report = Some(PathBuf::from("/a/tole-agents/x/report.json"));
         let env = env_of(rep.vars());

@@ -591,10 +591,32 @@ built-in or owner-overridden roles.
      closed by a stop without a model call, or continued by the owner with
      `tole discuss resume`.
 
-   Not in this step: independent (child-process) participants for agents.
-   They would hold tools, so they need the owner's approval surface for any
-   Write and the depth rules for a child that may not itself discuss; until
-   then an agent's discussion is inline only.
+3. Independent (child-process) participants for agents (#704). `discuss`
+   takes an optional `modes` array (one entry per participant, in order),
+   each `inline` (default) or `reviewer`, a closed enum. The owner's
+   `tole discuss` is unchanged. A reviewer is a `consult` child of the
+   caller's goal started through the same host as `delegate`:
+   - the profile must pass the same seat rule (the caller's allow list
+     covers the profile's), and the budget is carved from the caller's
+     remaining budget (at least 20000 tokens a turn, never added; the
+     discussion also counts the child's spend, so it is charged twice,
+     which only over-counts); depth, live-process cap, machine guard and
+     leases apply as for `delegate`;
+   - it starts **read-only and stays so**: `--plan-mode` (no Write tool
+     exists for it), an empty allow list (the profile's patterns are not
+     carried over, so no allow pattern of the profile or of the caller can
+     approve a Write) and `TOLE_DISCUSSION_PARTICIPANT=1`; its only Write
+     tool is `delegate_report` (one capped file: its contribution);
+   - **a Write it wants is denied (fail closed), never routed to the
+     caller's allowlist.** The owner's approval surface for a delegated
+     child does not exist yet (a headless child has no approver, and the
+     `/approvals` queue belongs to serve sessions), so until #714 builds it
+     a reviewer cannot write at all. This is stricter than the decision
+     above, not weaker;
+   - no nested discussions: a session with the participant marker gets no
+     delegation host (`Delegator::for_session`), so neither `discuss` nor
+     `delegate` is registered for it, at any depth;
+   - unknown fields are still refused; the opt-in is `modes` only.
 
 ## 12. Non-goals
 

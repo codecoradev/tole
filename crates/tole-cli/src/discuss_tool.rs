@@ -9,9 +9,9 @@
 //! - **Depth.** They are registered only where the `delegate` tool is: the
 //!   same [`Delegator`] hands out both, so a session at the goal's depth
 //!   limit has neither. A discussion's participants are inline voices with no
-//!   tools and no process, so none of them can start a discussion, call a
-//!   tool or write; a participant that answers with a tool call is told
-//!   nothing was run.
+//!   tools and no process (unless `modes` makes one a reviewer, below), so
+//!   none of them can start a discussion, call a tool or write; a participant
+//!   that answers with a tool call is told nothing was run.
 //! - **Budget.** The discussion's budget is carved from the caller's
 //!   REMAINING budget in the delegation tree ([`Delegator::carve_discussion`]),
 //!   never added: `budget_tokens` or half of what is left, never more. The
@@ -21,16 +21,23 @@
 //!   every allow pattern a profile carries must be covered by the caller's
 //!   allow list ([`Delegator::may_seat`]). Built-in roles are never
 //!   participants.
-//! - **No new power.** The input has five fields (question, criteria,
-//!   participants, budget, rounds); any other field (`allow`, `profile`,
+//! - **Reviewers (#704).** `modes` (one of `inline`, `reviewer` per
+//!   participant) seats a participant as an independent `consult` child
+//!   ([`DelegateIndependent`]): read-only (plan mode, an empty allow list,
+//!   the participant marker in its environment), so a Write it wants is
+//!   denied, never routed to the caller's allowlist (the owner's approval
+//!   surface is #714), and a session with the marker has no `discuss` or
+//!   `delegate` tool (no nested discussions).
+//! - **No new power.** The input has six fields (question, criteria,
+//!   participants, modes, budget, rounds); any other field (`allow`, `profile`,
 //!   `tools`, `secrets`, ...) is refused, not ignored. The id is the host's,
 //!   so a model cannot name or overwrite the owner's discussions.
 //! - **Management.** `discuss_status` and `discuss_stop` work only on
 //!   discussions THIS session started (the tree's host-only node), never the
 //!   owner's or a sibling's. A stop is the ledger's own escalation, so no
 //!   text a participant wrote can start, prevent or delay it.
-//! - **Writes.** Participants hold no tools, so there is no Write for them to
-//!   want; the owner's `tole discuss` is the only place a discussion's
+//! - **Writes.** Inline participants hold no tools, and a reviewer's Write is
+//!   denied, so there is no Write for either to get through; the owner's `tole discuss` is the only place a discussion's
 //!   outcome becomes action. Status text is fenced as data.
 //! - **Load.** At most [`MAX_LIVE`] discussions run at once in a process.
 
@@ -47,19 +54,25 @@ use tole_core::secrets::SecretSet;
 use tole_core::tool::{Risk, Tool};
 
 use crate::delegate::Delegator;
-use crate::discussion_host::{Driver, Factory};
+use crate::discussion_host::{DelegateIndependent, Driver, Factory};
 
 /// Most discussions running at once in one process.
 pub const MAX_LIVE: usize = 2;
 
 /// The only fields `discuss` takes.
-const FIELDS: [&str; 5] = [
+const FIELDS: [&str; 6] = [
     "question",
     "criteria",
     "participants",
+    "modes",
     "budget_tokens",
     "max_rounds",
 ];
+
+/// How a participant takes part: `inline` (a voice with no tools and no
+/// process, the default) or `reviewer` (an independent, read-only child
+/// process, #704). A closed enum: nothing else is accepted.
+const MODES: [&str; 2] = ["inline", "reviewer"];
 
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
@@ -123,11 +136,12 @@ impl DiscussHost {
     fn driver(
         &self,
         participants: &[String],
+        reviewers: &[String],
         log: DiscussionLog,
         tokens: u64,
     ) -> Result<Driver, String> {
         let setup = self.delegator.setup();
-        Driver::from_config(
+        let driver = Driver::from_config(
             &setup.cfg,
             (setup.base.as_deref(), setup.home.as_deref()),
             participants,
@@ -135,6 +149,16 @@ impl DiscussHost {
             self.secrets.clone(),
             Arc::clone(&self.make),
             Arc::new(Budget::new(tokens)),
+        )?;
+        if reviewers.is_empty() {
+            return Ok(driver);
+        }
+        // Reviewers are `consult` children of this session (read-only, no
+        // allow patterns, no discussion tools): the carve, depth, lease and
+        // machine-guard rules of `delegate` apply to each.
+        driver.with_independent(
+            reviewers,
+            Arc::new(DelegateIndependent(Arc::clone(&self.delegator))),
         )
     }
 
@@ -167,6 +191,7 @@ impl DiscussHost {
             .ok_or("discuss: `question` is a string")?;
         let criteria = strings("criteria")?;
         let participants = strings("participants")?;
+        let reviewers = reviewers_of(obj.get("modes"), &participants)?;
         let requested = match obj.get("budget_tokens") {
             None | Some(Value::Null) => None,
             Some(v) => Some(
@@ -205,6 +230,7 @@ impl DiscussHost {
         }
         self.driver(
             &participants,
+            &reviewers,
             DiscussionLog::at(&self.dir, &id)?,
             requested.unwrap_or(1),
         )?;
@@ -225,7 +251,7 @@ impl DiscussHost {
                 &self.secrets,
             )?;
             let log = DiscussionLog::at(&self.dir, &id)?;
-            let driver = self.driver(&participants, log.clone(), tokens)?;
+            let driver = self.driver(&participants, &reviewers, log.clone(), tokens)?;
             driver.start(contract)?;
             Ok::<_, String>((driver, log))
         })();
@@ -257,7 +283,7 @@ impl DiscussHost {
         }
         Ok(json!({
             "discussion": id, "node": node, "budget_tokens": tokens,
-            "participants": participants, "status": "running",
+            "participants": participants, "reviewers": reviewers, "status": "running",
             "note": "it runs in the background: read it with discuss_status, end it with discuss_stop; \
                      its budget is carved from yours and is charged to you when it ends",
         }))
@@ -346,6 +372,33 @@ impl DiscussHost {
     }
 }
 
+/// The participants that take part as reviewers: `modes` is absent (all
+/// inline) or an array of [`MODES`], one per participant, in order.
+fn reviewers_of(modes: Option<&Value>, participants: &[String]) -> Result<Vec<String>, String> {
+    let list = match modes {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(v) => v
+            .as_array()
+            .ok_or("discuss: `modes` is an array with one of inline or reviewer per participant")?,
+    };
+    if list.len() != participants.len() {
+        return Err(format!(
+            "discuss: `modes` needs one entry per participant ({} participants, {} modes)",
+            participants.len(),
+            list.len()
+        ));
+    }
+    let mut out = Vec::new();
+    for (who, m) in participants.iter().zip(list) {
+        match m.as_str() {
+            Some("inline") => {}
+            Some("reviewer") => out.push(who.clone()),
+            _ => return Err(format!("discuss: a mode is one of {}", MODES.join(" or "))),
+        }
+    }
+    Ok(out)
+}
+
 fn log_of(host: &DiscussHost, id: &str) -> Result<DiscussionLog, String> {
     DiscussionLog::at(&host.dir, id)
 }
@@ -365,7 +418,8 @@ fn log_stop_and_settle(
         .map(|c| c.participants.clone())
         .ok_or("no contract")?;
     let tokens = st.contract.as_ref().map_or(1, |c| c.budget_tokens);
-    let driver = host.driver(&participants, log.clone(), tokens)?;
+    // Closing a stopped discussion makes no model call: no reviewer starts.
+    let driver = host.driver(&participants, &[], log.clone(), tokens)?;
     host.run_to_end(id, node, &driver, log);
     Ok(())
 }
@@ -424,9 +478,11 @@ impl Tool for DiscussTool {
                 "criteria": {"type": "array", "items": {"type": "string"},
                     "description": "1 to 12 acceptance criteria a claim-checker verifies"},
                 "participants": {"type": "array", "items": {"type": "string"},
-                    "description": "1 to 8 configured profile names you may delegate to; they speak read-only, with no tools"},
+                    "description": "1 to 8 configured profile names you may delegate to; they speak read-only, with no tools unless `modes` makes one a reviewer"},
                 "budget_tokens": {"type": "integer",
                     "description": "Carved from your remaining budget (default half of it), never more"},
+                "modes": {"type": "array", "items": {"type": "string", "enum": MODES},
+                    "description": "Optional, one per participant, in order: inline (default) or reviewer. A reviewer runs as its own read-only process (no tools but its report, no Write: a Write it wants is denied, never approved), costs at least 20000 tokens a turn and cannot start a discussion"},
                 "max_rounds": {"type": "integer", "description": "Default 4, at most 10"}
             },
             "required": ["question", "criteria", "participants"],
