@@ -333,3 +333,72 @@ fn a_snapshot_redacts_before_it_caps_and_stays_under_the_lock_cap() {
         LOCK_VERSION
     );
 }
+
+#[test]
+fn a_first_party_claim_needs_the_owners_list() {
+    let fp: Vec<String> = DEFAULT_FIRST_PARTY.iter().map(|s| s.to_string()).collect();
+    let claimed = LockEntry {
+        tier: Some(Tier::FirstParty),
+        ..Default::default()
+    };
+    assert_eq!(tier_of("cora", None, &fp), Tier::FirstParty);
+    assert_eq!(
+        tier_of("evil", Some(&claimed), &fp),
+        Tier::ThirdPartyUnverified
+    );
+    assert_eq!(tier_of("evil", None, &fp), Tier::ThirdPartyUnverified);
+    let verified = LockEntry {
+        tier: Some(Tier::ThirdPartyVerified),
+        ..Default::default()
+    };
+    assert_eq!(tier_of("x", Some(&verified), &fp), Tier::ThirdPartyVerified);
+    assert_eq!(
+        tier_of("x", Some(&verified), &["x".to_string()]),
+        Tier::FirstParty
+    );
+}
+
+#[test]
+fn the_tier_round_trips_in_the_lock_as_kebab_case() {
+    let mut l = Lockfile::default();
+    l.servers.insert(
+        "s".into(),
+        LockEntry {
+            tier: Some(Tier::ThirdPartyUnverified),
+            ..Default::default()
+        },
+    );
+    let json = serde_json::to_string(&l).unwrap();
+    assert!(
+        json.contains("\"tier\":\"third-party-unverified\""),
+        "{json}"
+    );
+    let back: Lockfile = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, l);
+    let none = serde_json::to_string(&Lockfile::default()).unwrap();
+    assert!(!none.contains("tier"));
+}
+
+#[test]
+fn admit_unseen_decides_without_the_tool_list() {
+    let e = LockEntry {
+        source: "stdio:srv a".into(),
+        integrity: "sha256:aa".into(),
+        ..Default::default()
+    };
+    let mut lock = BTreeMap::new();
+    lock.insert("s".to_string(), e.clone());
+    lock.insert("r".to_string(), LockEntry { revoked: true, ..e });
+    let go = |n: &str, src: &str, int: &str| admit_unseen(&lock, n, src, int);
+    assert_eq!(go("none", "x", ""), Some(Admission::Unlocked));
+    assert_eq!(
+        go("r", "stdio:srv a", "sha256:aa"),
+        Some(Admission::Revoked)
+    );
+    assert_eq!(go("s", "stdio:srv b", "sha256:aa"), Some(Admission::Moved));
+    assert_eq!(
+        go("s", "stdio:srv a", "sha256:bb"),
+        Some(Admission::Rebuilt)
+    );
+    assert_eq!(go("s", "stdio:srv a", "sha256:aa"), None);
+}

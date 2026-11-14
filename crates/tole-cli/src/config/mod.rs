@@ -13,6 +13,16 @@
 //! loudly. Pure functions only — cwd and paths are parameters, no global
 //! state.
 
+pub mod apply;
+pub mod discussion_roles;
+pub mod hook_filter;
+pub mod owner_only;
+pub mod profile;
+pub mod project_trust;
+pub mod routing;
+pub mod session_settings;
+pub mod trust;
+
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
