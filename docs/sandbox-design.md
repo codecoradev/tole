@@ -1,7 +1,11 @@
 # Sandbox for third-party servers and model commands — design note
 
 Status: **design with owner decisions of 2026-11-14 (§16); #601, epic
-#594.** The first PR implements the opt-in slice only. Builds on [third-party-plugins-design.md](third-party-plugins-design.md)
+#594.** The first slice is built in two PRs: the core module
+`tole_core::sandbox` (profiles, the bwrap argument builder, grant checks,
+backend detection and the launch plan; unit-tested, not wired yet), then
+its wiring into the stdio MCP launch, the `[sandbox]` config and
+`tole doctor`. Builds on [third-party-plugins-design.md](third-party-plugins-design.md)
 §4.2–4.3 and [secrets-integrations-design.md](secrets-integrations-design.md),
 and on the #594 audit (#675–#684). The feasibility results in §3 were
 measured on 2026-11-13 in a Linux container (kernel 6.18, Ubuntu 24.04).
