@@ -611,8 +611,10 @@ built-in or owner-overridden roles.
      caller's allowlist.** The owner's approval surface for a delegated
      child does not exist yet (a headless child has no approver, and the
      `/approvals` queue belongs to serve sessions), so until #714 builds it
-     a reviewer cannot write at all. This is stricter than the decision
-     above, not weaker;
+     a reviewer cannot write at all (the design of that surface, a durable
+     queue with escalation up the delegation chain, is
+     [delegation-approvals-design.md](delegation-approvals-design.md)).
+     This is stricter than the decision above, not weaker;
    - no nested discussions: a session with the participant marker gets no
      delegation host (`Delegator::for_session`), so neither `discuss` nor
      `delegate` is registered for it, at any depth;

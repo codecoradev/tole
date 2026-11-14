@@ -317,7 +317,8 @@ Bot and Nakama; BMAD for collaboration). Design notes:
     `delegate` (the owner chose both entry points, see `automation-design.md`
     "Entry point"); independent child participants for agents (#704) are in
     as read-only reviewers whose Write is denied; routing a participant's
-    Write to the owner's approval surface is #714);
+    Write to the owner's approval surface is #714, designed in
+    `delegation-approvals-design.md`);
   - `uteke_document` parent (#576; done).
 - **E3 — Skills, epic #589:** `SkillIndex` + uteke doc adapter, K = 5 with
   pinned core (#590), approved-hash loading (#591), propose-only growth with
