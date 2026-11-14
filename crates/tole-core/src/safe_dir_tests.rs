@@ -1,5 +1,7 @@
 use super::*;
-use std::io::{Read, Write};
+#[cfg(unix)]
+use std::io::Read;
+use std::io::Write;
 use std::path::PathBuf;
 
 fn base(tag: &str) -> PathBuf {

@@ -153,14 +153,23 @@ impl Pty {
 
     fn spawn_full(cwd: &Path, url: &str, args: &[String], envs: &[(&str, &str)]) -> Pty {
         let (mut m, mut sl) = (0, 0);
-        let ws = libc::winsize {
+        let mut ws = libc::winsize {
             ws_row: 30,
             ws_col: 100,
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
-        let rc =
-            unsafe { libc::openpty(&mut m, &mut sl, std::ptr::null_mut(), std::ptr::null(), &ws) };
+        // macOS declares the termios and winsize arguments `*mut`, Linux `*const`;
+        // `*mut` coerces to both.
+        let rc = unsafe {
+            libc::openpty(
+                &mut m,
+                &mut sl,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::addr_of_mut!(ws),
+            )
+        };
         assert_eq!(rc, 0, "openpty");
         let (master, slave) = unsafe { (OwnedFd::from_raw_fd(m), OwnedFd::from_raw_fd(sl)) };
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));

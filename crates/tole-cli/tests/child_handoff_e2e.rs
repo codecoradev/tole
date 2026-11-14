@@ -11,7 +11,8 @@
 //!    content), submits passing verification → `closed`;
 //! 3. an `implement` child that closes without any handoff is `unverified`.
 
-#![cfg(feature = "shell-tools")]
+// The only test spawns `#!/bin/sh` fixtures, so the file is unix-only.
+#![cfg(all(unix, feature = "shell-tools"))]
 
 use serde_json::{json, Value};
 use std::io::{Read, Write};

@@ -13,7 +13,7 @@ use std::process::Command;
 // Hard ceiling on any subprocess this tool spawns (SUBPROCESS_TIMEOUT):
 // the turn loop is synchronous — a hung `cora brain` would freeze the
 // whole agent.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use std::time::Duration;
 
 /// ReadOnly search over the current project's symbol index.

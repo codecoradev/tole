@@ -4,6 +4,8 @@
 //! those for any server its admission check did not accept).
 
 #![cfg(feature = "mcp")]
+// The fake servers are `#!/bin/sh` scripts.
+#![cfg(unix)]
 
 use std::path::Path;
 use std::process::{Command, Stdio};

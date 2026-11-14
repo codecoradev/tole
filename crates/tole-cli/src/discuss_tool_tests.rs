@@ -561,13 +561,16 @@ fn a_session_at_the_goals_depth_limit_has_no_discussion_host() {
 
 /// A stand-in `tole` child: records its argv and env, hands in a report.
 fn reviewer_bin(dir: &Path) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let p = dir.join("reviewer-bin");
     let body = "#!/bin/sh\nprev=\"\"\nfor a in \"$@\"; do [ \"$prev\" = \"--sessions-dir\" ] && D=\"$a\"; \
         prev=\"$a\"; done\nmkdir -p \"$D\"\nprintf '%s\\n' \"$@\" > \"$D/../argv\"\nenv > \"$D/../env\"\n\
         printf '%s' '{\"summary\":\"the plan is sound\",\"risks\":[]}' > \"$TOLE_DELEGATION_REPORT\"\n";
     std::fs::write(&p, body).unwrap();
-    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
     p
 }
 
@@ -644,6 +647,7 @@ fn inline_is_the_default_and_starts_no_child() {
 /// #704: a reviewer runs as a read-only `consult` child of the caller's
 /// goal: the profile must be seatable, its carve comes from the caller's
 /// budget, and it has no allow list, plan mode and the participant marker.
+#[cfg(unix)]
 #[test]
 fn a_reviewer_is_a_read_only_consult_child_within_the_callers_budget() {
     let dir = tmp("bin-reviewer");
@@ -677,6 +681,7 @@ fn a_reviewer_is_a_read_only_consult_child_within_the_callers_budget() {
 
 /// A reviewer must be a profile the caller may delegate to, as every
 /// participant: nothing starts for a refused one.
+#[cfg(unix)]
 #[test]
 fn a_reviewer_must_be_a_profile_the_caller_may_seat() {
     let dir = tmp("bin-reviewer-seat");
