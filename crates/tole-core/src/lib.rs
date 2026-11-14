@@ -55,7 +55,14 @@ pub use integrations::uteke;
 pub use integrations::verify_package;
 pub mod entry;
 pub mod failover;
-pub mod file_tools;
+pub mod tools;
+// `tools/` holds these modules; the re-exports keep the old top-level paths working.
+#[doc(inline)]
+pub use tools::file_tools;
+#[doc(inline)]
+pub use tools::read_file;
+#[doc(inline)]
+pub use tools::todo;
 // Tool-call authorization gate (#303): crate-internal, no public API.
 pub mod delegation;
 // `delegation/` holds the approvals, report and resource-guard modules; these
@@ -84,7 +91,6 @@ pub use ledger::tz;
 #[doc(inline)]
 pub use ledger::webhook;
 pub mod systemone;
-pub mod todo;
 pub mod transcript;
 pub mod web;
 // Process hooks spawn subprocesses (issue #110) — same gate as the
@@ -106,7 +112,6 @@ pub mod openai;
 pub mod paths;
 pub mod process_guard;
 pub mod provider;
-pub mod read_file;
 pub mod register;
 pub mod replay;
 pub mod router;
