@@ -1000,6 +1000,18 @@ fn a_forged_request_is_ignored() {
         ("a bad id", Box::new(|r| r.req = "dap-A B".into())),
         ("a foreign id", Box::new(|r| r.req = "req-1".into())),
         ("no window", Box::new(|r| r.level_secs = 0)),
+        (
+            "a level window that overflows",
+            Box::new(|r| r.level_secs = i64::MAX),
+        ),
+        (
+            "a level window over the cap",
+            Box::new(|r| r.level_secs = MAX_APPROVAL_SECS + 1),
+        ),
+        (
+            "a start that overflows the span",
+            Box::new(|r| r.at = i64::MIN),
+        ),
         ("an empty window", Box::new(|r| r.expires_at = r.at)),
         (
             "a window over the cap",

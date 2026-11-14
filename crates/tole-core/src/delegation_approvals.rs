@@ -503,9 +503,9 @@ impl Entry {
     fn slot(&self, at: i64) -> usize {
         let n = self.eligible().len();
         let (mut k, mut start) = (self.cursor, self.win_start);
-        while k < n && at >= start + self.req.level_secs {
+        while k < n && at >= start.saturating_add(self.req.level_secs) {
             k += 1;
-            start += self.req.level_secs;
+            start = start.saturating_add(self.req.level_secs);
         }
         k
     }
@@ -696,8 +696,8 @@ impl State {
         if r.input.to_string().len() > MAX_INPUT_BYTES || !is_hex64(&r.fingerprint) {
             return Err(bad("input or fingerprint"));
         }
-        let span = r.expires_at - r.at;
-        if r.level_secs < 1
+        let span = r.expires_at.checked_sub(r.at).unwrap_or(0);
+        if !(1..=MAX_APPROVAL_SECS).contains(&r.level_secs)
             || !(1..=MAX_APPROVAL_SECS).contains(&span)
             || r.expires_at > node.budget.deadline
         {
