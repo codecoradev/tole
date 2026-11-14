@@ -17,6 +17,7 @@ pub mod config_trust;
 pub mod cron;
 pub mod curator_cmd;
 pub mod delegate;
+pub mod delegate_decide;
 pub mod delegated_approver;
 pub mod discuss;
 pub mod discuss_tool;

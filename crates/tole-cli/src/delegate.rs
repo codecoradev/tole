@@ -295,6 +295,28 @@ impl Delegator {
         })
     }
 
+    /// Does this session get the agent-level approval tools (#714)? Only in
+    /// `[delegation] approvals = "chain"`, and only where its own allow list
+    /// holds a `delegate_decide` grant: the owner typed it, or the parent's
+    /// list covered the profile's pattern (`child_allow` drops what it does
+    /// not). Never for a discussion participant: it has no host at all.
+    pub fn grants_decide(&self) -> bool {
+        let mode = self.setup.cfg.delegation.as_ref().and_then(|d| d.approvals);
+        mode == Some(tole_core::delegation_approvals::ApprovalsMode::Chain)
+            && tole_core::delegation_approvals::has_decide_tool(&self.parent_allows)
+    }
+
+    /// The approvals store of this session's goal and this session's node
+    /// (the level it decides as). `None` before a root has begun a goal. The
+    /// node comes from the host's own state, never from a model string.
+    pub fn level(&self) -> Option<(crate::delegated_approver::Store, String)> {
+        let node = self.node.lock().ok()?.clone()?;
+        Some((
+            crate::delegated_approver::Store::new(self.log.clone()),
+            node,
+        ))
+    }
+
     /// The canonical workspace root every path of this host is keyed on.
     pub fn root(&self) -> &Path {
         &self.root

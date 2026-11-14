@@ -449,7 +449,7 @@ pub fn level_may_decide(allow: &[String], r: &Request) -> bool {
 }
 
 /// Does the list hold a `delegate_decide` grant?
-fn has_decide_tool(allow: &[String]) -> bool {
+pub fn has_decide_tool(allow: &[String]) -> bool {
     let input = Value::Null;
     let tr = ToolRequest {
         tool: "delegate_decide",
@@ -972,6 +972,29 @@ impl<S: LedgerStore> Approvals<S> {
         let id = r.req.clone();
         self.append(tree, Record::Request(r))?;
         Ok(id)
+    }
+
+    /// A level moves the request one level up: `from` is the current level,
+    /// `to` the next eligible one (the owner when none is left).
+    pub fn escalate(
+        &mut self,
+        tree: &dyn Tree,
+        req: &str,
+        from: &str,
+        now: i64,
+    ) -> Result<(), ApprovalError> {
+        self.sync(tree, true)?;
+        let e = self.state.entry(req).ok_or(Refusal::Unknown)?;
+        let (elig, k) = (e.eligible(), e.slot(now));
+        let to = elig.get(k + 1).map(|i| e.req.chain[*i].node.clone());
+        let rec = Record::Escalate {
+            req: req.to_string(),
+            from: from.to_string(),
+            to,
+            reason: EscalateReason::Explicit,
+            at: now,
+        };
+        self.append(tree, rec)
     }
 
     /// Validates `rec` against a copy of the fold, then appends it. The
