@@ -219,6 +219,13 @@ pub struct DelegationConfig {
     pub machine_max_live: Option<u32>,
     /// Niceness of a delegated child, 0 to 19 (default 10).
     pub child_nice: Option<u32>,
+    /// Escalating approval queue for delegated children (#714): `off`
+    /// (default; a child's Write stays denied), `owner` or `chain`.
+    pub approvals: Option<tole_core::delegation_approvals::ApprovalsMode>,
+    /// Seconds a request waits in all, 1 to 3600 (default 900).
+    pub approval_secs: Option<u64>,
+    /// Seconds each agent level gets before it moves up (default 120).
+    pub approval_level_secs: Option<u64>,
 }
 
 impl DelegationConfig {
@@ -885,6 +892,19 @@ pub fn parse(src: &str, path: &Path) -> Result<Config, ConfigError> {
             return Err(range(format!("delegation.{k} must be at least 1")));
         }
         d.resource_thresholds().map_err(range)?;
+        let max = tole_core::delegation_approvals::MAX_APPROVAL_SECS as u64;
+        let (total, level) = (d.approval_secs, d.approval_level_secs);
+        for (k, v) in [("approval_secs", total), ("approval_level_secs", level)] {
+            if v.is_some_and(|n| !(1..=max).contains(&n)) {
+                return Err(range(format!("delegation.{k} must be 1 to {max}")));
+            }
+        }
+        let default = tole_core::delegation_approvals::DEFAULT_APPROVAL_SECS as u64;
+        if level.is_some_and(|l| l > total.unwrap_or(default)) {
+            return Err(range(
+                "delegation.approval_level_secs must not exceed approval_secs".into(),
+            ));
+        }
     }
     Ok(cfg)
 }
@@ -1463,6 +1483,14 @@ pub fn render_with(cfg: &Config, tag: &str, ann: &Annotations) -> Vec<String> {
             "delegation.max_load_per_cpu",
             d.max_load_per_cpu.map(|v| v.to_string()),
         );
+        let mode = d.approvals.map(|m| format!("{m:?}").to_ascii_lowercase());
+        scalar(&mut out, "delegation.approvals", mode);
+        scalar(&mut out, "delegation.approval_secs", n(d.approval_secs));
+        scalar(
+            &mut out,
+            "delegation.approval_level_secs",
+            n(d.approval_level_secs),
+        );
     }
     out
 }
@@ -1715,6 +1743,35 @@ verify_timeout = 60
         let shown = render(&user).join("\n");
         assert!(
             shown.contains("delegation.max_load_per_cpu = 2.5"),
+            "{shown}"
+        );
+    }
+
+    /// The approvals switch (#714): off unless set, bounded, user layer only.
+    #[test]
+    fn delegation_approvals_switch_defaults_off_and_is_bounded() {
+        use tole_core::delegation_approvals::ApprovalsMode;
+        let d = |src: &str| parse(src, &p()).map(|c| c.delegation.unwrap_or_default());
+        assert_eq!(d("[delegation]\nmax_depth = 2\n").unwrap().approvals, None);
+        let on = d("[delegation]\napprovals = \"chain\"\napproval_secs = 3600\n").unwrap();
+        assert_eq!(on.approvals, Some(ApprovalsMode::Chain));
+        for bad in [
+            "approvals = \"agent\"",
+            "approvals = true",
+            "approval_secs = 0",
+            "approval_secs = 3601",
+            "approval_level_secs = 0",
+            "approval_level_secs = 901",
+            "approval_secs = 60\napproval_level_secs = 61",
+        ] {
+            assert!(d(&format!("[delegation]\n{bad}\n")).is_err(), "{bad}");
+        }
+        assert!(d("[delegation]\napproval_secs = 60\napproval_level_secs = 60\n").is_ok());
+        let project = parse("[delegation]\napprovals = \"owner\"\n", &p()).unwrap();
+        assert_eq!(layered(&project, &Config::default()).delegation, None);
+        let shown = render(&project).join("\n");
+        assert!(
+            shown.contains("delegation.approvals = owner") && shown.contains("IGNORED"),
             "{shown}"
         );
     }

@@ -513,7 +513,7 @@ fn short_preview(raw: &str) -> String {
 
 /// Canonical JSON string: object keys sorted recursively, so `{a,b}` and
 /// `{b,a}` fingerprint identically.
-fn canonical_json(v: &Value) -> String {
+pub(crate) fn canonical_json(v: &Value) -> String {
     match v {
         Value::Object(map) => {
             let mut keys: Vec<&str> = map.keys().map(String::as_str).collect();

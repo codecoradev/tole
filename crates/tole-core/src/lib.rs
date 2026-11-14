@@ -43,6 +43,7 @@ pub mod failover;
 pub mod file_tools;
 // Tool-call authorization gate (#303): crate-internal, no public API.
 pub mod delegation;
+pub mod delegation_approvals;
 pub mod delegation_report;
 pub mod discussion;
 pub mod discussion_log;

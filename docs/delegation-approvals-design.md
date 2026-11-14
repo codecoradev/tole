@@ -1,7 +1,8 @@
 # Delegation approvals: escalation up the chain — design note
 
-Status: design for #714 (parent #583). No code in this note's PR. Owner
-decision of 2026-11-14 (in the body of #714): a delegated child that cannot
+Status: design for #714 (parent #583); the owner's answers to the open
+questions are in section 12, and PR 1 (records and fold) implements section 3.
+Owner decision of 2026-11-14 (in the body of #714): a delegated child that cannot
 decide an approval escalates it up the delegation chain, level by level
 (child, parent, grandparent, ..., the owner), until a level can decide it.
 The owner is the last level. No answer means **denied**, never allowed.
@@ -97,8 +98,7 @@ A request in any of these classes skips every agent level (each recorded as
 | Oversized | display truncated, or input over the record cap (16 KiB) |
 
 The "external effects" and "oversized" rows go slightly beyond the list in
-#714; they apply the same rule to what a level cannot inspect (open
-question 3).
+#714; they apply the same rule to what a level cannot inspect (owner decision 3).
 
 ### 2.4 Destructive and depth
 
@@ -123,10 +123,10 @@ Records (`#[serde(tag = "kind")]`):
 
 | Record | Fields | Written by |
 |---|---|---|
-| `Request` | `req` (`dap-<time hex>-<random>`), `goal`, `node`, `session` (the child's agent dir), `tool`, `risk`, `target`, `input` (redacted as in session logs, #596, capped), `display` (host-built from `Tool::describe` + `target`, redacted, capped 2 KiB, `truncated` flag), `fingerprint`, `workspace` (canonical), `chain` (levels: node, depth, `eligible` or `skipped` + reason), `level_secs`, `expires_at`, `at` | the child's host process, never a model string |
-| `Escalate` | `req`, `from`, `to`, `reason` (`timeout` `skipped` `explicit` `dead`), `at` | a level (explicit) or the waiting child (timeout, observed) |
-| `Decide` | `req`, `by` (`{agent: node, level}` or `{owner: surface}`), `verdict` (`allow` or `deny`), `via` (`tool` `cli` `serve`), `at` | the deciding host, under the lock, after the checks of 2.2 |
-| `Consume` | `req`, `node`, `at` | the child's approver, **before** it returns Allow (write-ahead) |
+| `Request` | `req` (`dap-<time hex>-<random>`), `goal`, `node`, `session` (the child's agent dir), `tool`, `risk`, `target`, `input` (redacted as in session logs, #596, capped), `display` (host-built from `Tool::describe` + `target`, redacted, capped 2 KiB, `truncated` flag), `fingerprint`, `workspace` (canonical), `origin` (built-in, MCP, plugin, skill), `secrets` and `protected` (host-resolved flags, set when the tool is bound in `[secrets]`, the input names a secret or redaction changed it), `chain` (levels: node, depth, and a `skipped` reason when not eligible), `level_secs`, `expires_at`, `at` | the child's host process, never a model string |
+| `Escalate` | `req`, `from`, `to` (absent: the owner), `reason` (`timeout` `skipped` `explicit` `dead`; only `explicit` and `dead` move the request, the others record what the clock and the chain already did), `at` | a level (explicit) or the waiting child (timeout, observed) |
+| `Decide` | `req`, `by` (`{agent: {node, level}}` or `owner`), `verdict` (`allow` or `deny`), `via` (`tool` for an agent, `cli` or `serve` for the owner), `fingerprint` (of the request, so a decision names the call it covers), `at` | the deciding host, under the lock, after the checks of 2.2 |
+| `Consume` | `req`, `node`, `fingerprint` (of the call about to run), `at` | the child's approver, **before** it returns Allow (write-ahead) |
 | `Expire` | `req`, `reason` (`timeout` `orphaned` `node_settled`), `at` | the waiting child, the owner CLI or serve (lazily); also derived at fold |
 
 Fold state per request: `pending(level)`, `allowed`, `denied`, `consumed`,
@@ -205,7 +205,7 @@ and cross-process (not an in-memory `Mutex<Vec>`); the key is the request
 and node, not `(session, u64)`; the hash is SHA-256; the approver blocks
 instead of denying first. `turn.rs` and `resume_turn` need **no change**:
 serve and cron keep their current deny-then-resume path unchanged.
-(Parking for hours, which would need exit-and-resume, is open question 1.)
+(Parking for hours, which would need exit-and-resume, is out of scope: owner decision 1.)
 
 ### 4.3 Timeouts and the current level
 
@@ -391,8 +391,8 @@ denied exactly as today.
 
 | # | PR | Delivers | Still denied after it |
 |---|---|---|---|
-| 1 | `feat(delegation): approval records and fold in tole-core` | `tole_core::delegation_approvals`: records, fold, chain building from the tree, authority predicate, always-owner classifier, SHA-256 fingerprint, shared `canonical_json`. Pure and fully unit-tested. | Everything (no host wiring) |
-| 2 | `feat(delegate): park a delegated child at an approval (off by default)` | `[delegation] approvals/approval_secs/approval_level_secs` (`off` default), approvals store in the host, `DelegatedApprover` (park, poll, timeout, cancel, caps, `interactive() == false`), write-ahead `Consume`, orphaning in `recover` | Every request expires to deny; no surface yet decides |
+| 1 | `feat(delegation): approval records and fold in tole-core` | `tole_core::delegation_approvals`: records, fold, chain building from the tree, authority predicate, always-owner classifier, SHA-256 fingerprint, shared `canonical_json`, the validating `append` with the record and log caps, and the `[delegation] approvals` switch (`off`) with `approval_secs` and `approval_level_secs`. Pure and fully unit-tested. | Everything (no host wiring) |
+| 2 | `feat(delegate): park a delegated child at an approval (off by default)` | the request builder (display and input caps, one pending request per node and 32 per goal), approvals store in the host, `DelegatedApprover` (park, poll, timeout, cancel, caps, `interactive() == false`), write-ahead `Consume`, orphaning in `recover` | Every request expires to deny; no surface yet decides |
 | 3 | `feat(delegate): owner decides delegated approvals with tole` | `tole delegation approvals list\|show\|allow\|deny`, `owner_only` guard, `--fingerprint`, child's `fact/approval_*` register, `tole audit` approvals section; `approvals = "owner"` becomes usable | Agent levels cannot decide; all agent levels are `skipped: no_decide_tool`. Owner-only classes are final here |
 | 4 | `feat(serve): /approvals lists and decides delegation requests` | serve GET merge, `dap-` routing, under-session refusal, event frame | Same as 3 |
 | 5 | `feat(delegate): agent levels decide within their own authority` | `delegate_pending`, `delegate_decide`, registration rule, level windows and escalation, `delegate_poll` count, `approvals = "chain"` usable | Anything outside a level's list, always-owner classes, Destructive; the default is still `off` |
@@ -402,33 +402,21 @@ PR 1 is the riskiest to review (the classifier and the predicate), so it
 carries the heaviest tests; PRs 3 and 4 are independent after 2 and can land
 in either order.
 
-## 12. Open questions for the owner
+## 12. Owner decisions
 
-Only real ones, each with a recommendation.
+Decided by the owner on 2026-11-14; they replace the open questions of the
+first draft of this note.
 
-1. **Park in the process, or exit and resume?** In-process (4.1) is simple
-   and exact, but a child waits at most `approval_secs` (default 15 min,
-   max 1 h). A mission that must wait overnight needs exit-and-resume, which
-   means a node that can rejoin the tree (a new `Resume` record and a way to
-   start the process). *Recommendation:* in-process now, with the 3600 s
-   cap; revisit only if a real unattended case appears.
-2. **Default of `approvals` after PR 6: `owner` or `chain`?** `owner` gives
-   one decision-maker (you) and no agent ever approves; `chain` implements
-   the full escalation. *Recommendation:* ship `chain` available but default
-   `owner`, so agents decide only where the owner granted `delegate_decide`.
-3. **Are external-effect tools (MCP, plugin, skill) always-owner?** #714
-   lists plugin and skill approvals; MCP and plugin-supplied tools are the
-   same kind of effect a level cannot inspect. *Recommendation:* yes, treat
-   them as always-owner (stricter than the list; an owner can still allow
-   one call).
-4. **Should reviewer participants (#704) ever be able to ask for a Write?**
-   They run in plan mode, so there is nothing to approve. Letting them ask
-   would need a new mode. *Recommendation:* no; keep reviewers read-only
-   permanently, so #714 changes `delegate` and `execute` children only.
-5. **May an agent's `delegate_decide` be allowlisted so it needs no owner
-   prompt at the root?** It is the knob that turns "the owner approves
-   everything" into "the orchestrator approves within its list".
-   *Recommendation:* allowed only by an explicit `--allow delegate_decide`
-   typed by the owner (it is `Risk::Write`, so it prompts by default); a
-   profile may list it but, like every pattern, it takes effect only where
-   the parent's list covers it.
+1. **The child parks in the process, not exit-and-resume.** A child waits at
+   most `approval_secs` (default 900, cap 3600 s). Revisit only if a real
+   unattended case appears.
+2. **`chain` ships available, the default stays `owner`**, also after PR 6:
+   agents decide only where the owner granted `delegate_decide`.
+3. **External-effect tools (MCP, plugin, skill) are always-owner**, stricter
+   than the list in #714; the owner can still allow one call.
+4. **Reviewer participants (#704) stay read-only permanently** and never ask
+   for a Write; #714 changes `delegate` and `execute` children only.
+5. **`delegate_decide` may be allowlisted only by an explicit `--allow
+   delegate_decide` typed by the owner** (it is `Risk::Write`, so it prompts
+   by default). A profile may list it but, like every pattern, it takes
+   effect only where the parent's list covers it.
