@@ -19,7 +19,7 @@ use tole_core::plugin_lock::ManifestTool;
 use tole_core::sandbox::{self, Availability, Launch, Mode, Policy};
 use tole_core::secrets::SecretSet;
 
-const CANARY: &str = "ghp_sandboxcanary0123456789abcdefghijkl";
+const CANARY: &str = "sandbox-canary-not-a-credential-0123456789";
 
 /// The scratch root every test of this process writes evidence under; the
 /// policy grants it as a writable path. Sets the policy exactly once.
@@ -219,6 +219,16 @@ fn the_connection_key_carries_the_workspace_only_for_sandboxed_servers() {
         ka,
         conn_key_for("srv", Some(&a)),
         "stable for one workspace"
+    );
+    // The key uses the resolved workspace, like the bind does: a link and
+    // its target are one workspace.
+    let link = a.with_file_name("kl-link");
+    let _ = std::fs::remove_file(&link);
+    std::os::unix::fs::symlink(&a, &link).unwrap();
+    assert_eq!(
+        ka,
+        conn_key_for("srv", Some(&link)),
+        "link and target agree"
     );
     assert_eq!(conn_key_for("plainsrv", Some(&a)), "plainsrv", "skipped");
     let http = McpServerConfig::parse("web=https://example.com/mcp").unwrap();

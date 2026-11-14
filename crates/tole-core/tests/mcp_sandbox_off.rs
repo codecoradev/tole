@@ -10,7 +10,7 @@ use tole_core::mcp::{register_server_tools, McpServerConfig};
 use tole_core::plugin_lock::ManifestTool;
 use tole_core::secrets::SecretSet;
 
-const CANARY: &str = "ghp_sandboxoffcanary0123456789abcdefghij";
+const CANARY: &str = "sandbox-off-canary-not-a-credential-0123456789";
 
 #[test]
 fn without_a_policy_the_launch_is_unchanged() {
