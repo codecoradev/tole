@@ -90,7 +90,7 @@ three levels:
 
 Review behavior is configured in `.cora.yaml` (focus areas, tole-specific
 rules that encode intentional patterns — env-resolved credentials,
-argv-validated subprocess tools, wire-only redaction — plus ignore rules for
+argv-validated subprocess tools, known-value redaction at the egress sinks — plus ignore rules for
 known FP categories).
 
 Exit-code reference:
