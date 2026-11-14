@@ -650,6 +650,17 @@ fn add(ctx: &mut Ctx<'_>, spec: &str) -> Result<String, String> {
         }
     }
     let name = cfg.name.clone();
+    // A remote server is sent the bearer token its NAME has in the
+    // environment: never to a URL nobody approved.
+    if matches!(cfg.transport, McpTransport::Http { .. }) {
+        let var = tole_core::mcp::token_env_name(&name);
+        if crate::config_apply::real_env(&var).is_some() {
+            return Err(format!(
+                "{var} is set: the probe would send that bearer token to a URL you have not \
+                 approved. Unset it for this command, or pick another name"
+            ));
+        }
+    }
     // Never first-party through `add`: a name is not a proof, and an
     // unknown program must not inherit the owner's own servers' tier.
     if ctx.first_party.iter().any(|f| f == &name) {

@@ -893,3 +893,23 @@ fn approve_applies_the_same_tier_rule_to_a_server_nobody_verified() {
     );
     assert_eq!(lock.servers["third"].sandbox.as_deref(), Some("server"));
 }
+
+#[test]
+fn a_remote_probe_never_carries_a_bearer_token_to_an_unapproved_url() {
+    let h = adder("add-token", false);
+    type_for(&h, &v1(), "tokname");
+    // SAFETY (edition 2021: safe call): a variable only this test reads.
+    std::env::set_var("TOLE_MCP_TOKNAME_TOKEN", "bearer-0600-secret");
+    let e = h
+        .go(
+            &|_| v1(),
+            Some(true),
+            add("tokname=https://example.com/mcp"),
+        )
+        .unwrap_err();
+    std::env::remove_var("TOLE_MCP_TOKNAME_TOKEN");
+    assert!(e.contains("TOLE_MCP_TOKNAME_TOKEN is set"), "{e}");
+    assert!(h.probes.borrow().is_empty(), "nothing was started");
+    assert!(!e.contains("bearer-0600-secret"));
+    assert!(!h.user().exists());
+}
