@@ -1461,8 +1461,28 @@ fn dispatch(cli: Cli) -> Result<()> {
             let sessions_dir = sessions_dir.clone();
             std::fs::create_dir_all(&sessions_dir)
                 .with_context(|| format!("creating {}", sessions_dir.display()))?;
-            let registry =
-                build_registry(build_approver(&allow_patterns, yes), &host, &allow_patterns)?;
+            // A delegated child parks at an approval instead of denying at
+            // EOF, only when `[delegation] approvals` is on (#714).
+            let cancel = tole_core::cancel::CancelToken::new();
+            let parked = tole_cli::delegated_approver::for_child(
+                &config_apply::real_env,
+                host.delegation.cfg.delegation.as_ref(),
+                tole_cli::delegated_approver::Params {
+                    patterns: allow_patterns.clone(),
+                    auto_write: yes,
+                    root: resolve_workspace_root(host.workspace.as_ref())?.canonicalize()?,
+                    data_dir: tole_core::paths::tole_data_dir(),
+                    secrets: std::sync::Arc::new(tole_core::secrets::SecretSet::from_env()),
+                    cancel: cancel.clone(),
+                    timing: Default::default(),
+                },
+            );
+            let registry = match parked {
+                Some(a) => build_registry(a, &host, &allow_patterns)?,
+                None => {
+                    build_registry(build_approver(&allow_patterns, yes), &host, &allow_patterns)?
+                }
+            };
             // Model routing (#586): a delegated child (TOLE_AGENT_DEPTH >= 1)
             // routes as `delegate`; a broken router fails before the
             // mission's session exists.
@@ -1476,6 +1496,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             };
             mission::run_mission(
                 mission::MissionConfig {
+                    cancel,
                     goal,
                     max_steps: tier.max_steps,
                     max_minutes: tier.max_minutes,
