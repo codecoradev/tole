@@ -34,10 +34,10 @@ const KERNEL_MODULES: &[&str] = &[
 ];
 #[rustfmt::skip]
 const ENGINE_MODULES: &[&str] = &[
+    "children",
     "integrations",
     "delegation", "discussion",
-    "router", "advisor", "skills", "web", "mcp", "plugin_lock", "agents", "child_env", "handoff",
-    "sibling_watch", "session_guard", "run_command", "jobs", "memory", "ccimport",
+    "router", "advisor", "skills", "web", "mcp", "plugin_lock", "session_guard", "run_command", "jobs", "ccimport",
 ];
 #[rustfmt::skip]
 const FACE_MODULES: &[&str] = &["mcp_server", "update_check"];
@@ -53,6 +53,11 @@ const BASELINE: &[(&str, &str, &str)] = &[
 
 /// Old top-level paths that are now re-exports of a module inside another one.
 const ALIASES: &[(&str, &str)] = &[
+    ("agents", "children"),
+    ("child_env", "children"),
+    ("handoff", "children"),
+    ("sibling_watch", "children"),
+    ("memory", "children"),
     ("entry", "session"),
     ("register", "session"),
     ("state", "session"),

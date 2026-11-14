@@ -28,12 +28,23 @@
 //! - `transcript` — read-side view of turn and usage-row conventions
 
 pub mod advisor;
+pub mod children;
+// `children/` holds these modules; the re-exports keep the old top-level paths working.
+#[doc(inline)]
 #[cfg(feature = "shell-tools")]
-pub mod agents;
+pub use children::agents;
+#[doc(inline)]
+pub use children::child_env;
+#[doc(inline)]
+pub use children::handoff;
+#[doc(inline)]
+#[cfg(feature = "shell-tools")]
+pub use children::memory;
+#[doc(inline)]
+pub use children::sibling_watch;
 pub mod approval;
 pub mod cancel;
 pub mod ccimport;
-pub mod child_env;
 pub mod integrations;
 // `integrations/` holds these modules; the re-exports keep the old top-level paths working.
 #[doc(inline)]
@@ -90,7 +101,6 @@ pub mod discussion;
 #[doc(inline)]
 pub use discussion::log as discussion_log;
 pub(crate) mod gate;
-pub mod handoff;
 pub mod interrupt;
 pub mod ledger;
 // `ledger/` holds the modules below; these re-exports keep the old top-level paths working.
@@ -113,8 +123,6 @@ pub mod jobs;
 pub mod mcp;
 #[cfg(feature = "mcp")]
 pub mod mcp_server;
-#[cfg(feature = "shell-tools")]
-pub mod memory;
 pub mod paths;
 pub mod process_guard;
 pub mod provider;
@@ -146,7 +154,6 @@ pub mod secrets;
 pub use secrets::release as secret_release;
 #[doc(inline)]
 pub use secrets::sensitive;
-pub mod sibling_watch;
 pub mod skills;
 // `skills/` holds the approval, curator, draft and index modules; these
 // re-exports keep the old top-level paths working.
