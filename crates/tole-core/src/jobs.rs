@@ -412,11 +412,9 @@ impl Tool for JobStartTool {
 mod tests {
     use super::*;
 
-    fn tmpdir(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("tole-jobs-{}-{}", name, std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
+    use crate::test_dir::TestDir;
+    fn tmpdir(name: &str) -> TestDir {
+        TestDir::new(&format!("tole-jobs-{name}"))
     }
 
     #[test]
@@ -430,7 +428,7 @@ mod tests {
         let blob = "x".repeat(10 * 1024 * 1024 + 4096);
         std::fs::write(job_dir.join("log"), blob).unwrap();
 
-        let poll = JobPollTool::new(dir.clone());
+        let poll = JobPollTool::new(dir.to_path_buf());
         let out = poll.execute(json!({ "job": "j-logcap-test" })).unwrap();
         assert_eq!(out["running"], json!(true));
         // job_poll is Risk::ReadOnly: the bounded tail read must NOT
@@ -450,14 +448,14 @@ mod tests {
     #[test]
     fn start_then_poll_completes_with_log() {
         let dir = tmpdir("cycle");
-        let start = JobStartTool::new(dir.clone());
+        let start = JobStartTool::new(dir.to_path_buf());
         let out = start
             .execute(json!({ "command": "sh -c 'echo job-done; sleep 0.4'" }))
             .unwrap();
         let job = out["job"].as_str().unwrap().to_string();
         assert!(out["pid"].is_u64(), "spawn must return the pid");
         // Poll immediately: whatever the state, the shape must hold.
-        let poll = JobPollTool::new(dir.clone());
+        let poll = JobPollTool::new(dir.to_path_buf());
         let first = poll.execute(json!({ "job": job })).unwrap();
         assert_eq!(first["job"], json!(job));
         // Give the job time to finish, then: not running, log captured.
@@ -471,7 +469,7 @@ mod tests {
     #[test]
     fn start_rejects_unspawnable_program() {
         let dir = tmpdir("badprog");
-        let start = JobStartTool::new(dir);
+        let start = JobStartTool::new(dir.to_path_buf());
         let err = start
             .execute(json!({ "command": "definitely-not-a-program-xyz --flag" }))
             .unwrap_err();
@@ -481,7 +479,7 @@ mod tests {
     #[test]
     fn poll_rejects_unknown_job() {
         let dir = tmpdir("unknown");
-        let poll = JobPollTool::new(dir);
+        let poll = JobPollTool::new(dir.to_path_buf());
         let err = poll.execute(json!({ "job": "j-nope" })).unwrap_err();
         assert!(err.contains("unknown job"));
     }
@@ -489,7 +487,7 @@ mod tests {
     #[test]
     fn poll_rejects_path_tricks() {
         let dir = tmpdir("tricks");
-        let poll = JobPollTool::new(dir);
+        let poll = JobPollTool::new(dir.to_path_buf());
         assert!(poll.execute(json!({ "job": "../escape" })).is_err());
         assert!(poll.execute(json!({ "job": "j/BAD" })).is_err());
         assert!(poll.execute(json!({ "job": "" })).is_err());
@@ -498,22 +496,22 @@ mod tests {
     #[test]
     fn start_rejects_empty_command() {
         let dir = tmpdir("empty");
-        let start = JobStartTool::new(dir);
+        let start = JobStartTool::new(dir.to_path_buf());
         assert!(start.execute(json!({ "command": "   " })).is_err());
     }
 
     #[test]
     fn start_is_write_and_poll_is_read_only() {
         let dir = tmpdir("risk");
-        assert_eq!(JobStartTool::new(dir.clone()).risk(), Risk::Write);
-        assert_eq!(JobPollTool::new(dir).risk(), Risk::ReadOnly);
+        assert_eq!(JobStartTool::new(dir.to_path_buf()).risk(), Risk::Write);
+        assert_eq!(JobPollTool::new(dir.to_path_buf()).risk(), Risk::ReadOnly);
     }
 
     #[test]
     fn completion_notice_is_queued_when_the_job_exits() {
         let dir = tmpdir("notice");
         let q = crate::interrupt::InterruptQueue::default();
-        let start = JobStartTool::new(dir.clone()).with_completion_notice(q.clone());
+        let start = JobStartTool::new(dir.to_path_buf()).with_completion_notice(q.clone());
         let out = start
             .execute(json!({ "command": "sh -c 'sleep 0.3'" }))
             .unwrap();
@@ -537,7 +535,7 @@ mod tests {
     #[test]
     fn job_start_refuses_tole_and_marks_jobs() {
         let dir = tmpdir("owner-684");
-        let start = JobStartTool::new(dir.clone());
+        let start = JobStartTool::new(dir.to_path_buf());
         for line in ["tole cron resume job-1", "nohup tole config trust --yes"] {
             let err = start
                 .execute(json!({ "command": line }))

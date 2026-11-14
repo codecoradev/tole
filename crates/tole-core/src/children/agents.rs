@@ -1257,19 +1257,9 @@ mod tests {
         }
     }
 
-    fn tmp(tag: &str) -> PathBuf {
-        // Unique PER CALL: pid alone is not enough — CI hit "Text file
-        // busy" when a second exec of the same fixed dump path raced a
-        // still-open write fd (PR #203 run). A monotonic suffix gives
-        // every call its own directory; no cross-test exec/write races
-        // are possible by construction.
-        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let d =
-            std::env::temp_dir().join(format!("tole-agents-{tag}-{}-{n:x}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
+    use crate::test_dir::TestDir;
+    fn tmp(tag: &str) -> TestDir {
+        TestDir::new(&format!("tole-agents-{tag}"))
     }
 
     #[test]
@@ -1482,7 +1472,7 @@ mod tests {
             std::fs::write(&p, script).unwrap();
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755));
-            let start = AgentStartTool::new(&p, d.clone());
+            let start = AgentStartTool::new(&p, d.to_path_buf());
             let out = start
                 .execute(json!({"prompt": "--yes sneaky mission"}))
                 .unwrap();
@@ -1529,7 +1519,7 @@ mod tests {
             std::fs::write(&p, script).unwrap();
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755));
-            let out = AgentStartTool::new(&p, d.clone())
+            let out = AgentStartTool::new(&p, d.to_path_buf())
                 .execute(json!({"prompt": "x"}))
                 .unwrap();
             let mut dumped = None;
@@ -1577,7 +1567,7 @@ mod tests {
         std::fs::write(&p, script).unwrap();
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755));
-        AgentStartTool::new(&p, d.clone())
+        AgentStartTool::new(&p, d.to_path_buf())
             .execute(json!({"prompt": "x"}))
             .unwrap();
         std::env::remove_var("TOLE_FALLBACK_API_KEY");
@@ -1713,7 +1703,7 @@ mod tests {
     #[test]
     fn bad_roles_and_consumes_are_refused_before_anything_is_spawned() {
         let d = tmp("badrole");
-        let t = AgentStartTool::new(fake_child(&d), d.clone());
+        let t = AgentStartTool::new(fake_child(&d), d.to_path_buf());
         for bad in [
             json!({"prompt": "x", "role": "boss"}),
             json!({"prompt": "x", "role": 7}),
@@ -1784,7 +1774,7 @@ mod tests {
         };
         write_meta(&dir, &meta).unwrap();
         assert_eq!(live_agents(&d).unwrap(), 1, "the real agent, however old");
-        let polled = AgentPollTool::new(d.clone())
+        let polled = AgentPollTool::new(d.to_path_buf())
             .execute(json!({"agent": id}))
             .unwrap();
         assert_eq!(polled["running"], json!(true));
@@ -1800,7 +1790,7 @@ mod tests {
             0,
             "no cap slot for a recycled pid"
         );
-        let polled = AgentPollTool::new(d.clone())
+        let polled = AgentPollTool::new(d.to_path_buf())
             .execute(json!({"agent": "a-dead-agent"}))
             .unwrap();
         assert_eq!(polled["running"], json!(false));
@@ -1898,7 +1888,7 @@ mod tests {
     #[test]
     fn depth_one_refuses_to_spawn() {
         let d = tmp("depth");
-        let t = AgentStartTool::new(fake_child(&d), d.clone()).at_depth(1);
+        let t = AgentStartTool::new(fake_child(&d), d.to_path_buf()).at_depth(1);
         let err = t
             .execute(json!({"prompt": "grandchild attempt"}))
             .unwrap_err();
@@ -1909,8 +1899,8 @@ mod tests {
     #[test]
     fn spawn_poll_settle_roundtrip() {
         let d = tmp("roundtrip");
-        let start = AgentStartTool::new(fake_child(&d), d.clone());
-        let poll = AgentPollTool::new(d.clone());
+        let start = AgentStartTool::new(fake_child(&d), d.to_path_buf());
+        let poll = AgentPollTool::new(d.to_path_buf());
         let out = start.execute(json!({"prompt": "do the thing"})).unwrap();
         let id = out["agent"].as_str().unwrap().to_string();
         assert!(valid_agent_id(&id));
@@ -1941,7 +1931,7 @@ mod tests {
     fn concurrency_cap_enforced() {
         let d = tmp("cap");
         // Cap 1 + a child that sleeps: the second spawn must refuse.
-        let start = AgentStartTool::new(sleeper_child(&d, 3), d.clone());
+        let start = AgentStartTool::new(sleeper_child(&d, 3), d.to_path_buf());
         let start = AgentStartTool {
             max_concurrent: 1,
             ..start
@@ -1959,13 +1949,13 @@ mod tests {
     #[test]
     fn concurrent_starts_cannot_exceed_the_cap() {
         let d = tmp("cap-race");
-        let start = AgentStartTool::new(sleeper_child(&d, 3), d.clone());
+        let start = AgentStartTool::new(sleeper_child(&d, 3), d.to_path_buf());
         let start = AgentStartTool {
             max_concurrent: 1,
             ..start
         };
         let s1 = AgentStartTool {
-            root: d.clone(),
+            root: d.to_path_buf(),
             bin: start.bin.clone(),
             depth: 0,
             worktree_mode: false,
@@ -1994,11 +1984,11 @@ mod tests {
     fn consumed_flag_survives_a_new_poll_instance() {
         let d = tmp("consumed-persist");
         let bin = fake_child(&d);
-        let start = AgentStartTool::new(&bin, d.clone());
+        let start = AgentStartTool::new(&bin, d.to_path_buf());
         let out = start.execute(json!({"prompt": "quick"})).unwrap();
         let id = out["agent"].as_str().unwrap().to_string();
         // Wait for the fake child to settle.
-        let poll = AgentPollTool::new(d.clone());
+        let poll = AgentPollTool::new(d.to_path_buf());
         for _ in 0..50 {
             std::thread::sleep(std::time::Duration::from_millis(100));
             let st = poll.execute(json!({"agent": id})).unwrap();
@@ -2021,7 +2011,7 @@ mod tests {
             |_| {},
         );
         // A brand-new instance = a new parent process.
-        let poll2 = AgentPollTool::new(d.clone());
+        let poll2 = AgentPollTool::new(d.to_path_buf());
         let again = poll2.execute(json!({"agent": id})).unwrap();
         assert!(
             again.get("summary").is_none(),
@@ -2042,9 +2032,9 @@ mod tests {
     #[test]
     fn agent_tools_are_write_tier_because_poll_mutates() {
         let d = tmp("risk-tier");
-        assert_eq!(AgentPollTool::new(d.clone()).risk(), Risk::Write);
+        assert_eq!(AgentPollTool::new(d.to_path_buf()).risk(), Risk::Write);
         assert_eq!(
-            AgentStartTool::new("/bin/true", d.clone()).risk(),
+            AgentStartTool::new("/bin/true", d.to_path_buf()).risk(),
             Risk::Write
         );
         let _ = std::fs::remove_dir_all(&d);
@@ -2056,11 +2046,11 @@ mod tests {
     fn recall_error_keeps_mailbox_unconsumed_and_retries() {
         let d = tmp("recall-err");
         let bin = fake_child(&d);
-        let start = AgentStartTool::new(&bin, d.clone());
+        let start = AgentStartTool::new(&bin, d.to_path_buf());
         let out = start.execute(json!({"prompt": "quick"})).unwrap();
         let id = out["agent"].as_str().unwrap().to_string();
         let dir = agents_root(&d).join(&id);
-        let poll = AgentPollTool::new(d.clone());
+        let poll = AgentPollTool::new(d.to_path_buf());
         let mut meta = read_meta(&dir).unwrap();
         let mut out = json!({});
         poll.consume_mailbox(
@@ -2121,7 +2111,7 @@ mod tests {
         write_meta(&dir, &meta).unwrap();
         let recalled = std::sync::Mutex::new(Vec::<String>::new());
         let cleaned = std::sync::Mutex::new(Vec::<String>::new());
-        let poll = AgentPollTool::new(d.clone());
+        let poll = AgentPollTool::new(d.to_path_buf());
         let mut out = json!({});
         poll.consume_mailbox(
             &dir,
@@ -2150,7 +2140,7 @@ mod tests {
             Command::new("git").arg("init").arg("-q").current_dir(&d),
             crate::subprocess::SUBPROCESS_TIMEOUT,
         );
-        let start = AgentStartTool::new(fake_child(&d), d.clone()).with_worktrees(true);
+        let start = AgentStartTool::new(fake_child(&d), d.to_path_buf()).with_worktrees(true);
         let out = start
             .execute(json!({"prompt": "isolated mission"}))
             .unwrap();
@@ -2176,7 +2166,7 @@ mod tests {
     #[test]
     fn child_allowlist_is_subset_of_parent_scope() {
         let d = tmp("subset");
-        let start = AgentStartTool::new(fake_child(&d), d.clone())
+        let start = AgentStartTool::new(fake_child(&d), d.to_path_buf())
             .with_parent_allows(vec!["write_*".to_string(), "git".to_string()]);
         // wider-than-parent → refused
         let err = start
@@ -2224,7 +2214,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         // A parent deny never "covers" a child allow request.
         let d = tmp("deny-cover");
-        let start = AgentStartTool::new(fake_child(&d), d.clone())
+        let start = AgentStartTool::new(fake_child(&d), d.to_path_buf())
             .with_parent_allows(vec!["!*".to_string()]);
         let err = start
             .execute(json!({"prompt": "x", "allow": ["write_file"]}))
@@ -2236,7 +2226,7 @@ mod tests {
     #[test]
     fn bad_inputs_refused() {
         let d = tmp("inputs");
-        let t = AgentStartTool::new(fake_child(&d), d.clone());
+        let t = AgentStartTool::new(fake_child(&d), d.to_path_buf());
         assert!(t.execute(json!({})).is_err());
         assert!(t.execute(json!({"prompt": "  "})).is_err());
         assert!(
@@ -2244,7 +2234,7 @@ mod tests {
                 .is_err(),
             "leading-dash allow pattern must be refused"
         );
-        let poll = AgentPollTool::new(d.clone());
+        let poll = AgentPollTool::new(d.to_path_buf());
         assert!(poll.execute(json!({"agent": "nope"})).is_err());
         assert!(poll.execute(json!({"agent": "../escape"})).is_err());
         let _ = std::fs::remove_dir_all(&d);
