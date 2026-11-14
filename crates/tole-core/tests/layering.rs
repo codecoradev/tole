@@ -30,7 +30,7 @@ use std::path::Path;
 const KERNEL_MODULES: &[&str] = &[
     "entry", "register", "state", "storage", "machine", "paths", "secrets",
     "sanitize", "safe_dir", "tool", "approval", "provider", "openai", "mock",
-    "failover", "cancel", "interrupt", "image", "ledger", "cron", "tz", "webhook", "transcript",
+    "failover", "cancel", "interrupt", "image", "ledger",  "transcript",
     "turn", "compaction", "gate", "replay", "hooks", "subprocess", "process_guard",
     "sandbox", "file_tools", "read_file", "todo", "systemone",
 ];
@@ -55,6 +55,9 @@ const BASELINE: &[(&str, &str, &str)] = &[
 
 /// Old top-level paths that are now re-exports of a module inside another one.
 const ALIASES: &[(&str, &str)] = &[
+    ("cron", "ledger"),
+    ("tz", "ledger"),
+    ("webhook", "ledger"),
     ("discussion_log", "discussion"),
     ("delegation_approvals", "delegation"),
     ("delegation_report", "delegation"),

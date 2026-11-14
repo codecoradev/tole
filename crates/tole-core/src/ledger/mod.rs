@@ -46,6 +46,10 @@
 //! (forward compatibility); a known kind with a newer `v` is a hard error
 //! (refuse to guess). A torn or unparseable final line is discarded.
 
+pub mod cron;
+pub mod tz;
+pub mod webhook;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
