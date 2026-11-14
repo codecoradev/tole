@@ -347,5 +347,5 @@ impl Approver for DelegatedApprover {
 }
 
 #[cfg(test)]
-#[path = "delegated_approver_tests.rs"]
+#[path = "approver_tests.rs"]
 mod tests;

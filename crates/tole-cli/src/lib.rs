@@ -4,9 +4,25 @@
 //! drift from production behavior (CodeCora scan 2026-09-18).
 pub mod advisor_host;
 pub mod approvals;
-pub mod approvals_owner;
+pub mod delegation;
+// `delegation/` holds these modules; the re-exports keep the old top-level paths working.
+#[doc(inline)]
+pub use delegation::approvals_owner;
+#[doc(inline)]
+pub use delegation::approver as delegated_approver;
+#[doc(inline)]
+pub use delegation::audit;
+#[doc(inline)]
+pub use delegation::decide as delegate_decide;
+#[doc(inline)]
+pub use delegation::delegate;
+#[doc(inline)]
+pub use delegation::ledger_file;
+#[doc(inline)]
+pub use delegation::machine_guard;
+#[doc(inline)]
+pub use delegation::serve_delegation;
 pub mod approver;
-pub mod audit;
 pub mod audit_discussion;
 pub mod auth;
 pub mod compaction_host;
@@ -33,9 +49,6 @@ pub use config::trust;
 #[cfg(feature = "shell-tools")]
 pub mod cron;
 pub mod curator_cmd;
-pub mod delegate;
-pub mod delegate_decide;
-pub mod delegated_approver;
 pub mod discuss;
 pub mod discuss_tool;
 pub mod discussion_host;
@@ -47,8 +60,6 @@ pub mod export;
 pub mod handoff;
 pub mod hook_cli;
 pub mod hooks;
-pub mod ledger_file;
-pub mod machine_guard;
 pub mod plugin;
 // `plugin/` holds these modules; the re-exports keep the old top-level paths working.
 #[doc(inline)]
@@ -60,7 +71,6 @@ pub mod protocol;
 pub mod provider_chain;
 #[cfg(feature = "shell-tools")]
 pub mod review_gate;
-pub mod serve_delegation;
 pub mod serve_images;
 pub mod session_host;
 pub mod session_index;
