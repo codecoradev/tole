@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.11.0] — unreleased
+## [0.11.0] — 2026-11-14
 
 ### Security
 - `read_file` withholds a file with more than one hard link (#703). A hard link to `.env` under another name (`notes.txt`) matched no name rule and was returned verbatim. On Unix a regular file whose `nlink` is above 1 is now refused, and the refusal points to `read_file_raw` (approval); a single-link file is unaffected, and nothing changes on other platforms. It reads only the `nlink` of the metadata it already has: no directory scan, so a legitimately linked file (a hard-linked build artifact) needs `read_file_raw` too. The git diff filter and `cora_search` hits stay name-based.
