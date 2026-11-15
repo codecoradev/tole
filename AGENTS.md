@@ -11,6 +11,9 @@ continuity, infra facts.
 - `crates/tole-core` — platform-agnostic library (state machine, JSONL
   storage, `Tool`/`Approver`/`Storage`/`Provider` traits, tools, provider).
   Published to crates.io; embedders build `--no-default-features`.
+- `crates/tole-tui` — inline terminal UI over `tole-core` (presentation and
+  event loop). Published to crates.io; `tole-cli` depends on it (default
+  `tui` feature).
 - `crates/tole-cli` — headless CLI host (the `tole` binary). Published to
   crates.io; during work always run the freshly built
   `./target/release/tole`, never a PATH-resolved one.
@@ -117,7 +120,9 @@ of reinventing or brute-forcing:
   (anything `pub` in a published crate); changing a ledger, session, lock or
   config file format; touching the sandbox, approval, allowlist or secret
   redaction paths. Put what they showed (callers, tests to rerun) in the PR
-  description.
+  description. On Rust these commands are noisy (calls resolve by bare name,
+  macro bodies are not parsed; #669): treat the output as a pointer and verify
+  every caller and test with grep before acting on it.
 
 **Team knowledge rooms (semantic memory) — continuity across sessions:**
 

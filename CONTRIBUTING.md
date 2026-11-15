@@ -84,7 +84,9 @@ Get them earlier, on your own machine:
 4. For a refactor, run `cora callers <symbol>`, `cora impact <symbol>` and
    `cora affected <files>` first when you move, rename or remove a public item,
    change a ledger, session, lock or config format, or touch the sandbox,
-   approval, allowlist or secret-redaction paths.
+   approval, allowlist or secret-redaction paths. These commands are noisy on
+   Rust (#669): treat the output as a pointer and verify callers and tests
+   with grep before acting.
 
 The local run does not replace the CI Cora Review job, which remains the merge
 gate (see Merge gate above).
