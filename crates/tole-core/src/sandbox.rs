@@ -23,6 +23,7 @@
 //! unattended run (cron, `serve`), where it is refused too (decision 2).
 
 pub mod command;
+pub mod report;
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
