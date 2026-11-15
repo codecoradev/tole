@@ -229,39 +229,50 @@ fn is_executable(p: &Path) -> bool {
     p.is_file()
 }
 
+/// Most nested gitdirs (`.gitmodules` paths plus `.tole-worktrees` entries) a
+/// launch will protect; more is refused, not skipped.
+const MAX_NESTED: usize = 64;
+
 /// What to mount read-only over a RESOLVED workspace so the paths that run
 /// code later outside the sandbox cannot be changed from inside
-/// ([`Profile::protect`]): the WHOLE `.git` directory, and `.tole`.
+/// ([`Profile::protect`]): the whole top-level `.git` directory, `.tole`, and
+/// the gitdirs inside the workspace that can be named cheaply and
+/// deterministically (below).
 ///
 /// Locking a few leaves of a writable `.git` is not enough (#849): a mount
 /// point cannot be renamed, but its ancestor can (`mv .git .g && cp -a .g
-/// .git`), and with `.git` made a writable mount point git still honours
-/// redirect and exec files inside it (`commondir`, `gitdir`, `config.worktree`,
-/// `info/`, `modules/*/{hooks,config}`, `worktrees/*`, `objects/info/alternates`)
-/// that point at a planted gitdir in the workspace, whose `hooks` and
-/// `core.fsmonitor` a later `git commit` outside the sandbox runs; a leaf that
-/// does not exist yet can be created inside. So `.git` is bound read-only as a
-/// whole: it cannot be renamed, removed, replaced or written, and its content
-/// is unchanged from inside. The cost is that git commands that write
+/// .git`), and a writable `.git` is redirected with `commondir` and the like to
+/// a planted gitdir whose `hooks` and `core.fsmonitor` a later `git commit`
+/// outside the sandbox runs; a leaf that does not exist yet can be created
+/// inside. So `.git` is bound read-only as a whole: it cannot be renamed,
+/// removed, replaced or written. The cost is that git commands that write
 /// (`add`, `commit`, `checkout`, `branch`, `stash`, `gc`, `config`, ...) fail
 /// with "Read-only file system" inside a sandboxed command; reads work.
 ///
-/// A `.git` gitdir FILE (worktree, submodule) is bound read-only itself, so it
-/// cannot be swapped for a directory; the directory it points to is not in the
-/// sandbox's view unless it is inside the workspace, and then it is not
-/// protected. `.tole` is bound read-only.
+/// The same reasoning covers a nested gitdir, which the owner's git runs from
+/// the outer repository too (`git status` in the outer repo fires a nested
+/// `core.fsmonitor`):
+/// - a `.git` gitdir FILE (top level, submodule, worktree) is bound read-only
+///   itself, and so is the directory it points to when that is inside the
+///   workspace (outside it, it is not in the sandbox's view at all);
+/// - every `path` of `.gitmodules` and every `.tole-worktrees/<id>` (at most
+///   [`MAX_NESTED`]): its `.git`, file or directory, the same way.
 ///
-/// A symbolic link at `.git`, `.git/hooks`, `.git/config` or `.tole` cannot be
-/// protected by a mount (the link is removed and replaced, or it leads to a
-/// writable place inside the workspace), so it is an error and the launch
-/// follows the consumer's policy: refused when required. A path that does not
-/// exist at launch is not protected (bubblewrap would have to create the mount
-/// point in the real workspace, and an empty read-only `.git` there would
-/// break repository discovery; see the design note, residual).
+/// A symbolic link anywhere in that chain (`.git`, `.git/hooks`, `.git/config`,
+/// `.tole`, `.gitmodules`, a submodule path, `.tole-worktrees`, a gitdir
+/// target), a path that escapes the workspace, an unreadable or oversized
+/// `.gitmodules` or more than [`MAX_NESTED`] entries is an error and the launch
+/// follows the consumer's policy: refused when required. NOT protected: a
+/// nested repository that is in neither `.gitmodules` nor `.tole-worktrees`
+/// (no workspace scan), and a path that does not exist at launch (bubblewrap
+/// would have to create the mount point in the real workspace, and an empty
+/// read-only `.git` there would break repository discovery); see the design
+/// note, residual.
 pub fn protect_plan(ws: &Path) -> Result<Vec<PathBuf>, String> {
     use std::fs::symlink_metadata;
-    let mut protect = Vec::new();
-    let check = |p: &Path| -> Result<bool, String> {
+    let mut protect: Vec<PathBuf> = Vec::new();
+    // Whether `p` exists, refusing a link.
+    let exists = |p: &Path| -> Result<bool, String> {
         match symlink_metadata(p) {
             Ok(m) if m.file_type().is_symlink() => Err(format!(
                 "{} is a symbolic link, which a mount cannot protect (the command could replace \\
@@ -273,25 +284,154 @@ pub fn protect_plan(ws: &Path) -> Result<Vec<PathBuf>, String> {
             Err(e) => Err(format!("cannot inspect {} ({e})", p.display())),
         }
     };
-    let git = ws.join(".git");
-    if check(&git)? {
-        // The two leaves are inside the read-only mount; a link there would
-        // still lead a git on the host to a writable place.
-        if symlink_metadata(&git).is_ok_and(|m| m.is_dir()) {
+    // `.git` at `git` (top level or nested): the file or directory, then the
+    // gitdir a file points to.
+    let add_git = |git: &Path, out: &mut Vec<PathBuf>| -> Result<(), String> {
+        if !exists(git)? {
+            return Ok(());
+        }
+        let meta =
+            symlink_metadata(git).map_err(|e| format!("cannot inspect {} ({e})", git.display()))?;
+        if meta.is_dir() {
+            // Inside the read-only mount, but a link here would still lead a
+            // git on the host to a writable place.
             for leaf in ["hooks", "config"] {
-                check(&git.join(leaf))?;
+                exists(&git.join(leaf))?;
+            }
+        } else if let Some(target) = gitdir_target(ws, git)? {
+            if !out.iter().any(|p| target.starts_with(p)) {
+                out.push(target);
             }
         }
-        protect.push(git);
-    }
+        if !out.iter().any(|p| git.starts_with(p)) {
+            out.push(git.to_path_buf());
+        }
+        Ok(())
+    };
+    add_git(&ws.join(".git"), &mut protect)?;
     let tole = ws.join(".tole");
-    if check(&tole)? {
+    if exists(&tole)? {
         protect.push(tole);
+    }
+    let mut nested: Vec<PathBuf> = Vec::new();
+    // Submodule paths.
+    let modules = ws.join(".gitmodules");
+    if exists(&modules)? {
+        for rel in gitmodules_paths(&modules)? {
+            let mut p = ws.to_path_buf();
+            for c in rel.components() {
+                p.push(c);
+                exists(&p)?;
+            }
+            nested.push(p.join(".git"));
+        }
+    }
+    // Child-agent worktrees.
+    let wts = ws.join(".tole-worktrees");
+    if exists(&wts)? {
+        let entries =
+            std::fs::read_dir(&wts).map_err(|e| format!("cannot read {} ({e})", wts.display()))?;
+        for e in entries.flatten() {
+            exists(&e.path())?;
+            nested.push(e.path().join(".git"));
+        }
+    }
+    if nested.len() > MAX_NESTED {
+        return Err(format!(
+            "more than {MAX_NESTED} nested gitdirs (.gitmodules, .tole-worktrees) to protect"
+        ));
+    }
+    for git in nested {
+        add_git(&git, &mut protect)?;
     }
     // The workspace is resolved, so each of these is already its own resolved
     // path; keep only what is inside it.
     protect.retain(|p| p.starts_with(ws));
     Ok(protect)
+}
+
+/// The directory a gitdir FILE points to, when it is inside the workspace and
+/// exists: `Ok(None)` for a target outside (not in the sandbox's view) or
+/// missing, an error when the file cannot be read or the path passes through a
+/// link.
+fn gitdir_target(ws: &Path, file: &Path) -> Result<Option<PathBuf>, String> {
+    use std::io::Read;
+    let shown = file.display();
+    let mut text = String::new();
+    std::fs::File::open(file)
+        .and_then(|f| f.take(4096).read_to_string(&mut text))
+        .map_err(|e| format!("cannot read gitdir file {shown} ({e})"))?;
+    let Some(rel) = text.lines().find_map(|l| l.strip_prefix("gitdir:")) else {
+        return Ok(None);
+    };
+    let rel = Path::new(rel.trim());
+    let abs = if rel.is_absolute() {
+        rel.to_path_buf()
+    } else {
+        file.parent().unwrap_or(ws).join(rel)
+    };
+    // `..` and `.` resolved by text, to compare with the real path below.
+    let mut norm = PathBuf::new();
+    for c in abs.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                norm.pop();
+            }
+            std::path::Component::CurDir => {}
+            c => norm.push(c),
+        }
+    }
+    if !norm.starts_with(ws) {
+        return Ok(None);
+    }
+    match std::fs::canonicalize(&norm) {
+        Ok(real) if real == norm => Ok(Some(norm)),
+        Ok(_) => Err(format!(
+            "the gitdir {} points to ({}) passes through a symbolic link",
+            shown,
+            norm.display()
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("cannot resolve the gitdir of {shown} ({e})")),
+    }
+}
+
+/// The `path` values of a `.gitmodules` file, relative and inside the
+/// workspace (no root, no `..`), at most [`MAX_NESTED`] and 64 KiB read.
+fn gitmodules_paths(file: &Path) -> Result<Vec<PathBuf>, String> {
+    use std::io::Read;
+    let mut text = String::new();
+    std::fs::File::open(file)
+        .and_then(|f| f.take(64 * 1024).read_to_string(&mut text))
+        .map_err(|e| format!("cannot read {} ({e})", file.display()))?;
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        if k.trim() != "path" {
+            continue;
+        }
+        let v = v.trim().trim_matches('"');
+        let p = Path::new(v);
+        let bad = v.is_empty()
+            || p.is_absolute()
+            || p.components()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)));
+        if bad {
+            return Err(format!(
+                ".gitmodules names the path {v:?}, which is empty, absolute or leaves the workspace"
+            ));
+        }
+        out.push(p.to_path_buf());
+        if out.len() > MAX_NESTED {
+            return Err(format!(
+                "{} names more than {MAX_NESTED} submodules",
+                file.display()
+            ));
+        }
+    }
+    Ok(out)
 }
 
 fn build(
@@ -443,6 +583,11 @@ pub fn command_for(
             args,
             limits,
         } => {
+            // The plan was made a moment ago; make sure what it protects did
+            // not change (a path that appeared, a link swapped in) before the
+            // command line is handed out.
+            recheck_plan(workspace, &args)
+                .map_err(|why| format!("{}: not run, {why}", consumer.name()))?;
             let mut c = Command::new(program);
             c.args(args);
             harden(&mut c, limits);
@@ -450,6 +595,33 @@ pub fn command_for(
         }
         CommandLaunch::Refused(why) => Err(why),
     }
+}
+
+/// Plans the protected paths of `workspace` again and requires every one to be
+/// bound read-only in `args` (the argument list built from the first plan): a
+/// path that appeared since, or a link swapped in for a directory (which makes
+/// the plan an error), refuses the launch. What remains is the window between
+/// this check and the mount in `bwrap`, which only a same-user process racing
+/// the path can use (design note, section 5).
+pub(crate) fn recheck_plan(workspace: &Path, args: &[OsString]) -> Result<(), String> {
+    let ws = std::fs::canonicalize(workspace).map_err(|e| {
+        format!(
+            "the workspace {} cannot be resolved ({e})",
+            workspace.display()
+        )
+    })?;
+    for p in protect_plan(&ws)? {
+        let bound = args
+            .windows(3)
+            .any(|w| w[0] == "--ro-bind" && w[1] == p.as_os_str() && w[2] == p.as_os_str());
+        if !bound {
+            return Err(format!(
+                "{} appeared or changed while the sandbox was being set up",
+                p.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// A fallback to no sandbox is warned about once per process and tool, not

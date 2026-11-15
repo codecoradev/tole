@@ -528,8 +528,8 @@ file_size_mb = 4096            # 1 to 1048576, largest file a process writes
   (`EXDEV`, the kernel refuses links across mounts), and its tree is byte for
   byte unchanged from inside. The same holds for `.tole`.
 
-  **Cost.** Inside a sandboxed `run_command`, `job_start`, verify or stop gate,
-  git commands that write fail: `add`, `commit`, `checkout`, `branch`, `stash`,
+  **Cost.** Inside a sandboxed `run_command` or `job_start` (the other
+  consumers get the same profile as they land), git commands that write fail: `add`, `commit`, `checkout`, `branch`, `stash`,
   `rebase`, `gc`, `config`, `remote add` (the error is git's own, "Read-only file
   system", `git stash` exits 1 with no message). Reads work: `log`, `diff`,
   `show`, `status` (without refreshing the index, no hang), `rev-parse`,
@@ -537,15 +537,31 @@ file_size_mb = 4096            # 1 to 1048576, largest file a process writes
   command; it does so through a tool outside the sandbox, or the owner does.
   There is no setting to make `.git` writable.
 
-  A `.git` that is a gitdir FILE (worktree, submodule) is bound read-only
-  itself, so it cannot be swapped for a directory; the directory it points to
-  is not in the sandbox's view unless it is inside the workspace, and then it is
-  writable. A SYMBOLIC LINK at `.git`, `.git/hooks`, `.git/config` or `.tole`
-  cannot be protected by a mount (the command removes the link and makes a real
-  directory, or the link leads to a writable place in the workspace), so the
-  launch is refused (or, for `optional`, follows the fallback policy) with the
-  path in the reason: make it a real path. Links elsewhere inside `.git` are not
-  inspected.
+  **Nested gitdirs.** The owner's git also runs a nested repository's config
+  and hooks when it is run in the OUTER repository (a planted
+  `core.fsmonitor` in a submodule's config fires on a plain `git status`,
+  `git diff` or `git add -A` there, not only inside the submodule). So a `.git`
+  gitdir FILE (top level, submodule, worktree) is bound read-only itself, and
+  so is the directory it points to when that is inside the workspace (outside
+  the workspace it is not in the sandbox's view at all). The nested gitdirs
+  that can be named cheaply and deterministically are protected the same way,
+  without scanning the workspace: every `path` of `.gitmodules` and every
+  `.tole-worktrees/<id>` (child-agent worktrees), at most 64 together. A
+  SYMBOLIC LINK anywhere in that chain (`.git`, `.git/hooks`, `.git/config`,
+  `.tole`, `.gitmodules`, a submodule path, `.tole-worktrees` or one of its
+  entries, a gitdir target), a path that leaves the workspace, an unreadable
+  or oversized `.gitmodules`, or more than 64 entries refuses the launch (for
+  `optional`, the fallback policy applies) with the cause in the reason:
+  a mount cannot protect a link (the command removes it and makes a real
+  directory, or the link leads to a writable place). Links elsewhere inside
+  `.git` are not inspected.
+
+  **Plan and launch.** The protected paths are planned, the argument list is
+  built, and the plan is made again right before the command line is handed
+  out: a `.git` that appeared in between, or a directory swapped for a link,
+  refuses the launch. Only the window between that check and the mount in
+  `bwrap` is left, which a same-user process racing the path could use (§5).
+
 - **Program and argv.** The command line is split to argv by the tool as
   before and passed to `bwrap` after `--`; the program is found by bare name
   on the absolute entries of tole's `PATH` (a relative entry would mean
@@ -591,20 +607,30 @@ file_size_mb = 4096            # 1 to 1048576, largest file a process writes
   refused). A grant that touches `$HOME` (marked `REFUSED`, it is never bound)
   or a credential directory (`.ssh`, `.gnupg`, `.aws`, `.azure`, `.kube`,
   `.docker`, `.netrc`, `.config/gcloud`; marked `SENSITIVE`) is flagged on its line.
-- **Residual.** Only what exists at launch is protected: a `.git` or `.tole`
-  that does not exist yet can be created by the command (an empty read-only
-  mount over a missing `.git` would create a directory in the real workspace and
-  break repository discovery; a launch creates nothing there), so a `git init`
-  run inside the sandbox makes a repository whose hooks the owner should review
-  before running git there. Nested repositories and submodule worktrees inside
-  the workspace are mounted as part of the writable workspace: their own `.git`
-  (a directory or a gitdir file) is NOT protected, only the workspace's top
-  level `.git`. Files outside `.git` that run on the owner's host later are not
-  protected and cannot be by a mount: `.envrc`, `Makefile`, package scripts,
-  `build.rs`, CI configs, `.husky`, `.pre-commit-config.yaml`, `lefthook`,
-  `.vscode/tasks.json`, `.gitattributes` and the like. A sandboxed command can
-  still plant them: the owner must review the diff before running the project's
-  tooling on the host. A same-user process racing a
+- **Residual.** What is protected is what existed at launch, and only what
+  is listed above:
+  - A `.git` or `.tole` that did not exist at launch is not protected (an
+    empty read-only mount over a missing `.git` would create a directory in
+    the real workspace and break repository discovery; a launch creates
+    nothing there). A `git init` run inside the sandbox, or a `.git` made after
+    a detached `job_start` began, leaves a repository whose hooks and config
+    the host runs later. "Nothing can be created in `.git` or `.tole`" holds
+    only when they existed at launch.
+  - A nested repository that is in neither `.gitmodules` nor
+    `.tole-worktrees` (a vendored clone, any `x/.git`) is part of the writable
+    workspace and is NOT protected: its config and hooks can be written, and
+    the owner's `git status` in the outer repository can fire a planted
+    nested `core.fsmonitor`.
+  - Files outside `.git` that run on the owner's host later cannot be
+    protected by a mount: `.envrc`, Makefile, package scripts, `build.rs`, CI
+    configs, `.husky`, `.pre-commit-config.yaml`, lefthook,
+    `.vscode/tasks.json`, `.gitattributes` and the like.
+  - A diff does not show `.git` internals or a nested repository's config. Treat
+    a workspace a sandboxed command wrote into as untrusted until the owner has
+    inspected what git will run (`git config --list --show-origin` in the outer
+    repository and in each nested one, the hooks directories, the gitdir files),
+    or work from a fresh clone.
+  - A same-user process racing a
   path component between resolution and the mount is not stopped (§5). The
   limits are per process, not a cgroup. Toolchain caches (`~/.cargo`, `~/.npm`)
   are not visible; the profile has no `read` extras yet.

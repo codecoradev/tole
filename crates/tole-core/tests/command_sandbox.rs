@@ -873,3 +873,153 @@ fn the_same_consumer_settings_are_fine_and_different_ones_are_refused() {
     assert!(command::set_consumers(other).is_err());
     assert_eq!(command::consumers(), current, "unchanged after the refusal");
 }
+
+/// The owner's `git status`, `diff` and `add -A` on the HOST in `w`: what a
+/// nested planted config or hook would fire on.
+fn host_git_routine(w: &Path) {
+    for args in [&["status", "--short"][..], &["diff"], &["add", "-A"]] {
+        let _ = host_git_out(w, args);
+    }
+}
+
+/// A registered submodule `sub`: its `.git` is a gitdir FILE inside the
+/// workspace pointing at `../.git/modules/sub`. The reviewer's attack moved it
+/// aside, copied the gitdir in as a real directory and set a `core.fsmonitor`
+/// in it; the owner's plain `git status` in the OUTER repository then ran the
+/// script. Now the nested `.git` file is its own read-only mount.
+#[test]
+fn a_registered_submodule_cannot_get_a_planted_fsmonitor() {
+    if skipped() {
+        return;
+    }
+    let w = repo("submod");
+    let sub_src = ws("submod-src");
+    host_git(&sub_src, &["init", "-q"]);
+    std::fs::write(sub_src.join("s"), "s\n").unwrap();
+    host_git(&sub_src, &["add", "s"]);
+    host_git(&sub_src, &["commit", "-q", "-m", "s"]);
+    host_git(
+        &w,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            sub_src.to_str().unwrap(),
+            "sub",
+        ],
+    );
+    host_git(&w, &["commit", "-q", "-m", "add sub"]);
+    assert!(w.join("sub/.git").is_file(), "a gitdir file");
+    let mark = w.join("PWNED_FSM");
+    std::fs::write(
+        w.join("fsm.sh"),
+        format!("#!/bin/sh\ntouch {}\n", mark.display()),
+    )
+    .unwrap();
+    std::fs::write(
+        w.join("attack.sh"),
+        format!(
+            "mv sub/.git sub/.gx && cp -a .git/modules/sub sub/.git\n\
+             git config -f sub/.git/config core.fsmonitor {}/fsm.sh\n",
+            w.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        w.join("fsm.sh"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
+    let before = tree(&w.join(".git"));
+    let tool = RunCommandTool::new(w.clone());
+    let out = run(&tool, "sh attack.sh");
+    assert_ne!(out["status"], 0, "the first step must fail: {out}");
+    assert!(
+        w.join("sub/.git").is_file(),
+        "the gitdir file is still there"
+    );
+    assert!(!w.join("sub/.gx").exists());
+    assert_eq!(
+        tree(&w.join(".git")),
+        before,
+        "from the sandbox, nothing changed"
+    );
+    host_git_routine(&w);
+    assert!(!mark.exists(), "the planted fsmonitor ran on the host");
+}
+
+/// `git init --separate-git-dir=ws/.gd`: the top-level `.git` is a file whose
+/// target is inside the workspace. The target is read-only too.
+#[test]
+fn a_separate_git_dir_inside_the_workspace_cannot_get_a_hook() {
+    if skipped() {
+        return;
+    }
+    let w = ws("sepgit");
+    let gd = w.join(".gd");
+    host_git(
+        &w,
+        &["init", "-q", "--separate-git-dir", gd.to_str().unwrap()],
+    );
+    assert!(w.join(".git").is_file());
+    std::fs::write(w.join("f"), "one\n").unwrap();
+    host_git(&w, &["add", "f"]);
+    host_git(&w, &["commit", "-q", "-m", "one"]);
+    let mark = w.join("PWNED_HOOK");
+    std::fs::write(
+        w.join("attack.sh"),
+        format!(
+            "mkdir -p .gd/hooks && printf '#!/bin/sh\\ntouch {}\\n' > .gd/hooks/pre-commit \
+             && chmod +x .gd/hooks/pre-commit\n",
+            mark.display()
+        ),
+    )
+    .unwrap();
+    let before = tree(&gd);
+    let tool = RunCommandTool::new(w.clone());
+    all_fail(
+        &tool,
+        &[
+            "sh attack.sh",
+            "rm -rf .gd",
+            "mv .gd .gd2",
+            "sh -c 'echo x > .gd/config'",
+            "sh -c 'rm .git && mkdir -p .git/hooks'",
+        ],
+    );
+    assert_eq!(tree(&gd), before, "the separate gitdir changed");
+    std::fs::write(w.join("f"), "two\n").unwrap();
+    host_git(&w, &["commit", "-q", "-am", "two"]);
+    assert!(!mark.exists(), "the planted hook ran on the host");
+}
+
+/// A child agent's worktree (`.tole-worktrees/<id>`): its `.git` file cannot be
+/// replaced by a directory with hooks.
+#[test]
+fn a_child_worktree_git_file_cannot_be_replaced() {
+    if skipped() {
+        return;
+    }
+    let w = repo("wtree");
+    host_git(
+        &w,
+        &["worktree", "add", "-q", ".tole-worktrees/wt1", "-b", "wt1"],
+    );
+    assert!(w.join(".tole-worktrees/wt1/.git").is_file());
+    let before = tree(&w.join(".git"));
+    let tool = RunCommandTool::new(w.clone());
+    all_fail(
+        &tool,
+        &[
+            "rm -f .tole-worktrees/wt1/.git",
+            "mv .tole-worktrees/wt1/.git .tole-worktrees/wt1/.gx",
+            "sh -c 'rm .tole-worktrees/wt1/.git && mkdir -p .tole-worktrees/wt1/.git/hooks'",
+            "sh -c 'echo x >> .tole-worktrees/wt1/.git'",
+        ],
+    );
+    assert!(w.join(".tole-worktrees/wt1/.git").is_file());
+    assert_eq!(tree(&w.join(".git")), before);
+    host_git(&w.join(".tole-worktrees/wt1"), &["status", "--short"]);
+}

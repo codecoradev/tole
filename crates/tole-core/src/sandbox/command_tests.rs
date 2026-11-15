@@ -791,3 +791,182 @@ fn doctor_says_what_is_there_and_that_off_is_off() {
     let l = doctor_lines(&on(Mode::Off, Mode::Off), &gone());
     assert!(!l.iter().any(|x| x.contains("ERROR")));
 }
+
+// Nested gitdirs (#849 follow-up): what the plan names, and what it refuses.
+
+/// A fresh resolved directory and the guard that removes it.
+fn keep(tag: &str) -> (TestDir, PathBuf) {
+    let g = tmp(tag);
+    let p = std::fs::canonicalize(&*g).unwrap();
+    (g, p)
+}
+
+fn rw(p: &Path) -> String {
+    p.display().to_string()
+}
+
+/// A registered submodule: its `.git` is a gitdir FILE inside the workspace,
+/// pointing into the (read-only) top-level `.git/modules`.
+#[cfg(unix)]
+#[test]
+fn a_submodule_listed_in_gitmodules_gets_its_git_file_bound_read_only() {
+    let (_guard, ws) = keep("nested-sub");
+    std::fs::create_dir_all(ws.join(".git/modules/sub")).unwrap();
+    std::fs::create_dir_all(ws.join("libs/sub")).unwrap();
+    std::fs::write(ws.join("libs/sub/.git"), "gitdir: ../../.git/modules/sub\n").unwrap();
+    std::fs::write(
+        ws.join(".gitmodules"),
+        "[submodule \"sub\"]\n\tpath = libs/sub\n\turl = x\n",
+    )
+    .unwrap();
+    let plan = protect_plan(&ws).unwrap();
+    assert!(plan.contains(&ws.join(".git")));
+    assert!(plan.contains(&ws.join("libs/sub/.git")), "{plan:?}");
+    // The gitdir it points to is inside the already read-only .git.
+    assert!(!plan.contains(&ws.join(".git/modules/sub")), "{plan:?}");
+    let a = run_argv(&ws);
+    let f = rw(&ws.join("libs/sub/.git"));
+    assert!(has(&a, &["--ro-bind", &f, &f]));
+}
+
+/// `git init --separate-git-dir=ws/.gd`: the top-level `.git` file points into
+/// the workspace, and the target is bound read-only too.
+#[cfg(unix)]
+#[test]
+fn a_top_level_gitdir_file_pointing_inside_the_workspace_binds_the_target_too() {
+    let (_guard, ws) = keep("sepgit");
+    std::fs::create_dir_all(ws.join(".gd/hooks")).unwrap();
+    std::fs::write(
+        ws.join(".git"),
+        format!("gitdir: {}\n", ws.join(".gd").display()),
+    )
+    .unwrap();
+    let plan = protect_plan(&ws).unwrap();
+    assert!(plan.contains(&ws.join(".gd")), "{plan:?}");
+    assert!(plan.contains(&ws.join(".git")), "{plan:?}");
+    // A relative target, and one that leaves the workspace (not in the view).
+    std::fs::write(ws.join(".git"), "gitdir: .gd\n").unwrap();
+    assert!(protect_plan(&ws).unwrap().contains(&ws.join(".gd")));
+    std::fs::write(ws.join(".git"), "gitdir: /elsewhere/x\n").unwrap();
+    assert_eq!(protect_plan(&ws).unwrap(), [ws.join(".git")]);
+}
+
+#[cfg(unix)]
+#[test]
+fn child_agent_worktrees_get_their_git_file_bound_read_only() {
+    let (_guard, ws) = keep("wts");
+    std::fs::create_dir_all(ws.join(".git/worktrees/wt1")).unwrap();
+    std::fs::create_dir_all(ws.join(".tole-worktrees/wt1")).unwrap();
+    std::fs::write(
+        ws.join(".tole-worktrees/wt1/.git"),
+        format!("gitdir: {}\n", ws.join(".git/worktrees/wt1").display()),
+    )
+    .unwrap();
+    let plan = protect_plan(&ws).unwrap();
+    assert!(
+        plan.contains(&ws.join(".tole-worktrees/wt1/.git")),
+        "{plan:?}"
+    );
+}
+
+/// Refused, not skipped: a link anywhere in the chain, a path that leaves the
+/// workspace, too many entries.
+#[cfg(unix)]
+#[test]
+fn a_link_or_an_escape_in_the_nested_chain_is_refused() {
+    use std::os::unix::fs::symlink;
+    let guards = std::cell::RefCell::new(Vec::new());
+    let fresh = |tag: &str| {
+        let (g, p) = keep(tag);
+        guards.borrow_mut().push(g);
+        p
+    };
+    // `.gitmodules` that is a link.
+    let ws = fresh("nest-l1");
+    std::fs::write(ws.join("real"), "").unwrap();
+    symlink(ws.join("real"), ws.join(".gitmodules")).unwrap();
+    assert!(protect_plan(&ws).unwrap_err().contains("symbolic link"));
+    // A submodule path that is a link, or passes through one.
+    let ws = fresh("nest-l2");
+    std::fs::create_dir_all(ws.join("real")).unwrap();
+    symlink(ws.join("real"), ws.join("sub")).unwrap();
+    std::fs::write(ws.join(".gitmodules"), "[submodule \"s\"]\n\tpath = sub\n").unwrap();
+    assert!(protect_plan(&ws).unwrap_err().contains("symbolic link"));
+    // Paths that leave the workspace.
+    for bad in ["../outside", "/etc", "a/../../b", ""] {
+        let ws = fresh("nest-esc");
+        std::fs::write(
+            ws.join(".gitmodules"),
+            format!("[submodule \"s\"]\n\tpath = {bad}\n"),
+        )
+        .unwrap();
+        assert!(
+            protect_plan(&ws).unwrap_err().contains(".gitmodules"),
+            "{bad:?}"
+        );
+    }
+    // A gitdir target that passes through a link inside the workspace.
+    let ws = fresh("nest-l3");
+    std::fs::create_dir_all(ws.join("real/gd")).unwrap();
+    symlink(ws.join("real"), ws.join("lnk")).unwrap();
+    std::fs::write(ws.join(".git"), "gitdir: lnk/gd\n").unwrap();
+    assert!(protect_plan(&ws).unwrap_err().contains("symbolic link"));
+    // A worktrees entry that is a link.
+    let ws = fresh("nest-l4");
+    std::fs::create_dir_all(ws.join(".tole-worktrees")).unwrap();
+    std::fs::create_dir_all(ws.join("real")).unwrap();
+    symlink(ws.join("real"), ws.join(".tole-worktrees/wt")).unwrap();
+    assert!(protect_plan(&ws).unwrap_err().contains("symbolic link"));
+    // More than the bound.
+    let ws = fresh("nest-many");
+    let many: String = (0..=MAX_NESTED)
+        .map(|i| format!("[submodule \"s{i}\"]\n\tpath = m{i}\n"))
+        .collect();
+    std::fs::write(ws.join(".gitmodules"), many).unwrap();
+    assert!(protect_plan(&ws).unwrap_err().contains("more than"));
+}
+
+/// Pinned so the doc stays exact: no workspace scan, a nested repository that
+/// is in neither `.gitmodules` nor `.tole-worktrees` is not protected.
+#[test]
+fn an_arbitrary_nested_repository_is_not_protected() {
+    let (_guard, ws) = keep("nest-arb");
+    std::fs::create_dir_all(ws.join("vendor/x/.git/hooks")).unwrap();
+    assert!(protect_plan(&ws).unwrap().is_empty());
+}
+
+/// #849 (TOCTOU): the plan is made again right before the command line is
+/// handed out. A `.git` that appeared since, or a directory swapped for a
+/// link, refuses the launch.
+#[cfg(unix)]
+#[test]
+fn a_path_that_appears_or_becomes_a_link_between_plan_and_launch_is_refused() {
+    use std::os::unix::fs::symlink;
+    let (_guard, ws) = keep("recheck");
+    let c = on(Mode::Required, Mode::Required);
+    let args_of = |ws: &Path| match plan_command(
+        &c,
+        &usable(),
+        false,
+        &env_in(ws),
+        Consumer::RunCommand,
+        ("sh", &[]),
+    ) {
+        CommandLaunch::Sandboxed { args, .. } => args,
+        other => panic!("{other:?}"),
+    };
+    // Planned with no `.git`; one appears.
+    let args = args_of(&ws);
+    assert!(recheck_plan(&ws, &args).is_ok());
+    std::fs::create_dir_all(ws.join(".git/hooks")).unwrap();
+    let e = recheck_plan(&ws, &args).unwrap_err();
+    assert!(e.contains("appeared or changed"), "{e}");
+    // Planned with a real `.git`; swapped for a link.
+    let args = args_of(&ws);
+    assert!(recheck_plan(&ws, &args).is_ok());
+    std::fs::remove_dir_all(ws.join(".git")).unwrap();
+    std::fs::create_dir_all(ws.join("elsewhere/hooks")).unwrap();
+    symlink(ws.join("elsewhere"), ws.join(".git")).unwrap();
+    let e = recheck_plan(&ws, &args).unwrap_err();
+    assert!(e.contains("symbolic link"), "{e}");
+}
