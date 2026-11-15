@@ -2122,6 +2122,14 @@ fn discuss_command(action: DiscussAction, cfg: Option<&tole_cli::config::Config>
             discuss::show(&dir, Some(&id), json, &secrets).map_err(anyhow::Error::msg)?
         }
         action => {
+            // Starting or resuming spends the owner's budget and writes a
+            // discussion ledger: owner-only like `cron create`, `plugin
+            // approve` and `config trust` (#684, #813). A dry run calls no
+            // model and writes nothing, so it stays available.
+            if !matches!(action, DiscussAction::Start { dry_run: true, .. }) {
+                tole_cli::owner_only::refuse_under_session("tole discuss start|resume")
+                    .map_err(anyhow::Error::msg)?;
+            }
             let default = tole_cli::config::Config::default();
             let cfg = cfg.unwrap_or(&default);
             let base = tole_cli::config::user_config_path()
