@@ -755,7 +755,7 @@ enum DiscussAction {
         #[arg(long = "criterion", required = true)]
         criteria: Vec<String>,
         /// A participant: a profile name from your user config. Repeat for
-        /// more (1 to 8).
+        /// more (any number; 8 is recommended, more only adds cost).
         #[arg(long = "participant", required = true)]
         participants: Vec<String>,
         /// Tokens the whole discussion may spend (a hard cap).
@@ -2270,6 +2270,9 @@ fn discuss_command(action: DiscussAction, cfg: Option<&tole_cli::config::Config>
                         budget_tokens: budget,
                         max_rounds,
                     };
+                    for line in discuss::advice_for(&args, &env.secrets) {
+                        eprintln!("tole: advice: {line}");
+                    }
                     if dry_run {
                         discuss::plan(&args, &env)
                     } else {

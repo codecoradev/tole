@@ -99,6 +99,30 @@ pub struct Voice {
     pub model: Option<String>,
 }
 
+/// What one round of `c` reserves at least, in tokens: a call per participant
+/// (its round-1 request and the reply room) and the claim-checker's call over
+/// no contributions at all. Persona text, the contributions the checker is
+/// shown and a scribe (a large round) all add to it, so it is a floor. It is
+/// what the ledger reserves, not what is spent: replies that come in shorter
+/// than the room still fit a smaller budget, but never one below the first
+/// call's own reservation.
+pub fn round_floor(c: &Contract) -> u64 {
+    let tokens = |req: Vec<(&'static str, String)>, reply: u64| {
+        (req.iter().map(|(_, s)| s.len()).sum::<usize>() / 4) as u64 + reply
+    };
+    let voices: u64 = c
+        .participants
+        .iter()
+        .map(|p| {
+            tokens(
+                participant_request(c, 1, p, None, None),
+                PARTICIPANT_REPLY_TOKENS,
+            )
+        })
+        .sum();
+    voices + tokens(checker_request(c, &[]), CHECKER_REPLY_TOKENS)
+}
+
 /// A discussion's budget carved from the goal's pot: `requested`, or half
 /// of what is left; never more than is left.
 pub fn carve(requested: Option<u64>, pot: &Budget) -> Result<u64, String> {
@@ -822,6 +846,17 @@ impl Driver {
                 c.budget_tokens
             ),
         ];
+        if outcome == Gate::Escalate(discussion::Reason::Budget) && st.summaries.is_empty() {
+            // Round 1 never finished: say why, not just "the budget is spent".
+            out.push(format!(
+                "Round 1 did not finish: the budget of {} tokens did not fit the next call, and one \
+                 round of {} participants is reserved at about {} tokens at least. Raise --budget \
+                 or seat fewer participants.",
+                c.budget_tokens,
+                c.participants.len(),
+                round_floor(c)
+            ));
+        }
         match st.verdicts.iter().next_back() {
             None => out.push("Checklist: not checked yet.".into()),
             Some((round, verdicts)) => {
