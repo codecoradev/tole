@@ -245,13 +245,7 @@ mod tests {
     }
 
     fn session(prompts: &[u64]) -> JsonlStorage {
-        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let d = std::env::temp_dir().join(format!(
-            "tole-compactor-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-        ));
-        std::fs::create_dir_all(&d).unwrap();
+        let d = crate::test_dir::TestDir::new("tole-compactor");
         let mut s = JsonlStorage::create(&d, "s", None).unwrap();
         for (i, t) in prompts.iter().enumerate() {
             let msg = |role: &str| {

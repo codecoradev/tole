@@ -595,16 +595,9 @@ mod tests {
         assert_eq!((f.folder.as_str(), f.session.as_str()), ("proj", "s-1"));
     }
 
-    use std::path::PathBuf;
-
-    fn tmp(tag: &str) -> PathBuf {
-        let n = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let d = std::env::temp_dir().join(format!("tole-tuihost-{tag}-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
-        d
+    use crate::test_dir::TestDir;
+    fn tmp(tag: &str) -> TestDir {
+        TestDir::new(&format!("tole-tuihost-{tag}"))
     }
 
     fn session(dir: &std::path::Path, id: &str) -> TuiSession {
@@ -949,7 +942,7 @@ mod tests {
                 &crate::session_index::Entry {
                     id: id.into(),
                     file: dir.join(format!("{id}.jsonl")),
-                    cwd: dir.clone(),
+                    cwd: dir.to_path_buf(),
                     face: "tui".into(),
                     created_at: 1,
                 },
