@@ -106,6 +106,9 @@ fn discussion_json(id: &str, st: &State, secrets: &SecretSet) -> Value {
     let rounds: Vec<u32> = {
         let mut r: Vec<u32> = st.contributions.iter().map(|c| c.round).collect();
         r.extend(st.gates.keys());
+        // A round that never completed still shows its calls: a retry or a
+        // charged timeout there is otherwise visible only in the raw log.
+        r.extend(st.reservations.values().map(|x| x.round));
         r.sort_unstable();
         r.dedup();
         r
@@ -127,6 +130,21 @@ fn discussion_json(id: &str, st: &State, secrets: &SecretSet) -> Value {
                     "met": v.met, "evidence": v.evidence})).collect::<Vec<_>>()),
                 "gate": st.gates.get(r).map(gate_name),
                 "tokens": spent,
+                "retries": st
+                    .reservations
+                    .values()
+                    .filter(|x| x.round == *r && x.retry_of.is_some())
+                    .count(),
+                "charged": st
+                    .reservations
+                    .values()
+                    .filter(|x| x.round == *r)
+                    .filter_map(|x| x.charged.as_ref().map(|why| json!({
+                        "call": x.what,
+                        "why": why,
+                        "tokens": x.settled.unwrap_or(x.tokens),
+                    })))
+                    .collect::<Vec<_>>(),
             })
         })
         .collect();
@@ -175,6 +193,19 @@ fn text_of(v: &Value) -> String {
             r["tokens"],
             r["gate"].as_str().unwrap_or("-")
         ));
+        if let Some(n) = r["retries"].as_u64().filter(|n| *n > 0) {
+            out.push(format!(
+                "    {n} call(s) retried once after a provider timeout"
+            ));
+        }
+        for c in r["charged"].as_array().into_iter().flatten() {
+            out.push(format!(
+                "    {} charged {} tokens at its estimate ({}: no usage reported)",
+                s(&c["call"]),
+                c["tokens"],
+                s(&c["why"])
+            ));
+        }
         let sm = &r["summary"];
         match sm["kind"].as_str() {
             Some("digest") => {

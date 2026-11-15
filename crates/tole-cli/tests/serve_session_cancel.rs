@@ -22,19 +22,13 @@ struct ServeProcess {
     child: Child,
     addr: String,
     token: String,
+    /// Dropped after `Drop::drop` has killed `child`.
+    _cwd: common::TestDir,
 }
 
 impl ServeProcess {
     fn spawn(base_url: &str) -> Arc<Self> {
-        let cwd = std::env::temp_dir().join(format!(
-            "tole-serve-cancel-{}-{:x}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis(),
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&cwd).unwrap();
+        let cwd = common::TestDir::new("tole-serve-cancel");
         let token = "test-token-123".to_string();
         let (child, port) = common::spawn_listening(|port| {
             let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
@@ -60,6 +54,7 @@ impl ServeProcess {
             child,
             addr: format!("127.0.0.1:{port}"),
             token,
+            _cwd: cwd,
         });
         // The listener is up; also confirm the HTTP face answers.
         let deadline = std::time::Instant::now() + Duration::from_secs(20);

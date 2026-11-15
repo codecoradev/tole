@@ -4,6 +4,8 @@
 
 #![cfg(feature = "shell-tools")]
 
+mod common;
+use common::TestDir;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -39,8 +41,9 @@ fn tzif(offset: i32, footer: &str) -> Vec<u8> {
 fn env() {
     static ONCE: OnceLock<()> = OnceLock::new();
     ONCE.get_or_init(|| {
-        let base = std::env::temp_dir().join(format!("tole-cron-tz-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+        // One fixed directory per target dir: it must outlive every test of
+        // this process, so a per-run guard cannot own it (it is not `tole-*`).
+        let base = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("shared-cron-tz");
         std::fs::create_dir_all(base.join("zoneinfo/Asia")).unwrap();
         std::fs::create_dir_all(base.join("home")).unwrap();
         std::fs::write(
@@ -53,12 +56,11 @@ fn env() {
     });
 }
 
-fn tmp(tag: &str) -> (PathBuf, PathBuf) {
-    let d = std::env::temp_dir().join(format!("tole-cron-tz-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
+fn tmp(tag: &str) -> (TestDir, PathBuf, PathBuf) {
+    let d = TestDir::new(&format!("tole-cron-tz-{tag}"));
     std::fs::create_dir_all(d.join("w")).unwrap();
-    let d = d.canonicalize().unwrap();
-    (d.join("cron"), d.join("w"))
+    let (cron, work) = (d.join("cron"), d.join("w"));
+    (d, cron, work)
 }
 
 fn script(work: &Path, id: &str, tz: Option<&str>) -> CreateSpec {
@@ -75,7 +77,7 @@ fn script(work: &Path, id: &str, tz: Option<&str>) -> CreateSpec {
 #[test]
 fn a_job_runs_on_its_zones_wall_clock_and_lists_both_times() {
     env();
-    let (dir, work) = tmp("wall");
+    let (_guard, dir, work) = tmp("wall");
     for (id, tz) in [("off", "+07:00"), ("iana", "Asia/Jakarta")] {
         let job = cron::create(&dir, script(&work, id, Some(tz)), T).unwrap();
         assert_eq!(job.timezone.as_deref(), Some(tz));
@@ -100,7 +102,7 @@ fn a_job_runs_on_its_zones_wall_clock_and_lists_both_times() {
 #[test]
 fn a_job_without_a_zone_keeps_plain_utc_and_the_same_records() {
     env();
-    let (dir, work) = tmp("plain");
+    let (_guard, dir, work) = tmp("plain");
     let job = cron::create(&dir, script(&work, "p", None), T).unwrap();
     assert!(job.timezone.is_none());
     let row = &cron::list(&dir).unwrap()[0];
@@ -118,7 +120,7 @@ fn a_job_without_a_zone_keeps_plain_utc_and_the_same_records() {
 #[test]
 fn an_unknown_or_invalid_zone_is_refused_on_save_with_a_remedy() {
     env();
-    let (dir, work) = tmp("bad");
+    let (_guard, dir, work) = tmp("bad");
     for (tz, want) in [
         ("Mars/Olympus", "zoneinfo"),
         ("+25:00", "+07:00"),
@@ -151,7 +153,7 @@ fn an_unknown_or_invalid_zone_is_refused_on_save_with_a_remedy() {
 #[test]
 fn edit_keeps_or_changes_the_zone() {
     env();
-    let (dir, work) = tmp("edit");
+    let (_guard, dir, work) = tmp("edit");
     cron::create(&dir, script(&work, "e", Some("+07:00")), T).unwrap();
     let renamed = EditSpec {
         name: Some("renamed".into()),

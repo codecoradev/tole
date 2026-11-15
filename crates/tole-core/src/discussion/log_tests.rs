@@ -6,11 +6,9 @@ fn strs(v: &[&str]) -> Vec<String> {
     v.iter().map(|s| s.to_string()).collect()
 }
 
-fn dir(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("tole-discuss-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+use crate::test_dir::TestDir;
+fn dir(tag: &str) -> TestDir {
+    TestDir::new(&format!("tole-discuss-{tag}"))
 }
 
 fn contract(rounds: Option<u32>, budget: u64) -> Contract {
@@ -26,8 +24,9 @@ fn contract(rounds: Option<u32>, budget: u64) -> Contract {
     .unwrap()
 }
 
-fn log(tag: &str) -> DiscussionLog {
-    DiscussionLog::at(&dir(tag), "pick-db").unwrap()
+fn log(tag: &str) -> (DiscussionLog, TestDir) {
+    let d = dir(tag);
+    (DiscussionLog::at(&d, "pick-db").unwrap(), d)
 }
 
 /// Both participants speak, the (small) round is passed on as written, and
@@ -63,7 +62,7 @@ fn play_round(l: &DiscussionLog, round: u32, met: bool, t: u64) -> Vec<Contribut
 
 #[test]
 fn a_discussion_runs_to_a_checked_report_and_every_step_is_in_the_file() {
-    let l = log("report");
+    let (l, _dir) = log("report");
     assert_eq!(l.state().unwrap().next(), Next::NeedContract);
     l.start(contract(None, 10_000), 1).unwrap();
     assert_eq!(
@@ -131,7 +130,7 @@ fn dir_of(l: &DiscussionLog) -> PathBuf {
 
 #[test]
 fn the_steps_cannot_be_skipped_repeated_or_reordered() {
-    let l = log("order");
+    let (l, _dir) = log("order");
     assert!(l.contribute(1, "coder", "x", 1).is_err(), "no contract yet");
     l.start(contract(None, 10_000), 1).unwrap();
     assert!(l.start(contract(None, 10_000), 2).is_err(), "one contract");
@@ -219,7 +218,7 @@ fn the_steps_cannot_be_skipped_repeated_or_reordered() {
 #[test]
 fn the_gate_is_computed_from_the_ledger_not_supplied() {
     // Max rounds.
-    let l = log("maxr");
+    let (l, _dir) = log("maxr");
     l.start(contract(Some(1), 10_000), 1).unwrap();
     play_round(&l, 1, false, 2);
     assert_eq!(l.decide(1, 3).unwrap(), Gate::Escalate(Reason::MaxRounds));
@@ -229,7 +228,7 @@ fn the_gate_is_computed_from_the_ledger_not_supplied() {
     );
 
     // Budget, from the usage lines.
-    let l = log("budget");
+    let (l, _dir) = log("budget");
     l.start(contract(None, 1000), 1).unwrap();
     play_round(&l, 1, false, 2);
     l.usage(1, 600, 3).unwrap();
@@ -237,7 +236,7 @@ fn the_gate_is_computed_from_the_ledger_not_supplied() {
     assert_eq!(l.decide(1, 4).unwrap(), Gate::Escalate(Reason::Budget));
 
     // A flag the host saw: a pending approval beats even a met criterion.
-    let l = log("flags");
+    let (l, _dir) = log("flags");
     l.start(contract(None, 10_000), 1).unwrap();
     play_round(&l, 1, true, 2);
     l.flags(1, false, true, 3).unwrap();
@@ -284,7 +283,7 @@ fn digest_round(l: &DiscussionLog, round: u32, delta: &[&str]) {
 
 #[test]
 fn two_rounds_without_news_stall_the_discussion() {
-    let l = log("stall");
+    let (l, _dir) = log("stall");
     l.start(contract(None, 1_000_000), 1).unwrap();
     digest_round(&l, 1, &[]);
     assert_eq!(l.state().unwrap().stalled_rounds(), 1);
@@ -294,7 +293,7 @@ fn two_rounds_without_news_stall_the_discussion() {
     assert_eq!(l.decide(2, 14).unwrap(), Gate::Escalate(Reason::Stalled));
 
     // News in between resets the count.
-    let l = log("news");
+    let (l, _dir) = log("news");
     l.start(contract(None, 1_000_000), 1).unwrap();
     digest_round(&l, 1, &[]);
     l.decide(1, 13).unwrap();
@@ -305,7 +304,7 @@ fn two_rounds_without_news_stall_the_discussion() {
 
 #[test]
 fn a_big_round_cannot_be_passed_on_verbatim() {
-    let l = log("bigverbatim");
+    let (l, _dir) = log("bigverbatim");
     l.start(contract(None, 10_000), 1).unwrap();
     let big = "y".repeat(crate::discussion::VERBATIM_ROUND_CHARS);
     let a = l.contribute(1, "coder", &big, 2).unwrap();
@@ -322,7 +321,7 @@ fn a_big_round_cannot_be_passed_on_verbatim() {
 
 #[test]
 fn the_roster_can_change_between_rounds_within_the_contract() {
-    let l = log("roster");
+    let (l, _dir) = log("roster");
     l.start(contract(None, 10_000), 1).unwrap();
     assert!(l.set_roster(1, &strs(&["stranger"]), 2).is_err());
     assert!(l.set_roster(1, &[], 2).is_err());
@@ -361,7 +360,7 @@ fn the_roster_can_change_between_rounds_within_the_contract() {
 
 #[test]
 fn a_crash_resumes_from_the_file_and_a_torn_last_line_is_ignored() {
-    let l = log("resume");
+    let (l, _dir) = log("resume");
     l.start(contract(None, 10_000), 1).unwrap();
     l.contribute(1, "coder", "before the crash", 2).unwrap();
     let before = l.state().unwrap().next();
@@ -413,12 +412,12 @@ fn ids_sizes_and_missing_files_are_handled() {
 #[test]
 fn concurrent_writers_never_share_a_turn_or_an_entry_id() {
     use std::sync::{Arc, Barrier};
-    let l = log("race");
+    let (l, _dir) = log("race");
     l.start(contract(None, 10_000), 1).unwrap();
     // Both participants try to speak at once, over and over across fresh
     // discussions' worth of attempts: each can speak once, ids stay unique.
     for attempt in 0..20 {
-        let l = log(&format!("race-{attempt}"));
+        let (l, _dir) = log(&format!("race-{attempt}"));
         l.start(contract(None, 10_000), 1).unwrap();
         let gate = Arc::new(Barrier::new(4));
         let results: Vec<_> = ["coder", "ops", "coder", "ops"]
@@ -454,7 +453,7 @@ fn concurrent_writers_never_share_a_turn_or_an_entry_id() {
 
 #[test]
 fn the_step_after_a_crash_is_not_glued_onto_the_torn_line() {
-    let l = log("torn-append");
+    let (l, _dir) = log("torn-append");
     l.start(contract(None, 10_000), 1).unwrap();
     l.contribute(1, "coder", "before the crash", 2).unwrap();
     // The process died mid-write of ops's line: bytes with no newline.
@@ -491,7 +490,7 @@ fn the_step_after_a_crash_is_not_glued_onto_the_torn_line() {
 
 #[test]
 fn a_tear_inside_a_multibyte_character_does_not_make_the_log_unreadable() {
-    let l = log("torn-utf8");
+    let (l, _dir) = log("torn-utf8");
     l.start(contract(None, 10_000), 1).unwrap();
     let mut f = std::fs::OpenOptions::new()
         .append(true)
@@ -517,7 +516,7 @@ fn a_tear_inside_a_multibyte_character_does_not_make_the_log_unreadable() {
 
 #[test]
 fn a_log_that_is_only_a_torn_line_restarts_clean() {
-    let l = log("torn-only");
+    let (l, _dir) = log("torn-only");
     std::fs::create_dir_all(l.path.parent().unwrap()).unwrap();
     std::fs::write(&l.path, br#"{"seq":1,"t":1,"event":"contr"#).unwrap();
     assert_eq!(l.state().unwrap().next(), Next::NeedContract);
@@ -542,7 +541,7 @@ fn go(r: Reserve) -> String {
 
 #[test]
 fn a_call_is_reserved_before_it_runs_and_settled_after() {
-    let l = log("reserve");
+    let (l, _dir) = log("reserve");
     l.start(contract(None, 10_000), 1).unwrap();
     let call = go(l.reserve(1, "participant-coder", 3_000, 2).unwrap());
     let st = l.state().unwrap();
@@ -580,7 +579,7 @@ fn a_call_is_reserved_before_it_runs_and_settled_after() {
 
 #[test]
 fn a_stop_ends_the_discussion_wherever_it_is_and_only_once() {
-    let l = log("stop");
+    let (l, _dir) = log("stop");
     assert!(l.stop(1).is_err(), "nothing to stop before the contract");
     l.start(contract(None, 100_000), 1).unwrap();
     l.contribute(1, "coder", "first", 2).unwrap();
@@ -612,7 +611,7 @@ fn a_stop_ends_the_discussion_wherever_it_is_and_only_once() {
 
 #[test]
 fn a_call_that_does_not_fit_stops_the_discussion_with_an_escalation() {
-    let l = log("halt");
+    let (l, _dir) = log("halt");
     l.start(contract(None, 1_000), 1).unwrap();
     l.contribute(1, "coder", "first", 2).unwrap();
     // Mid-round: the next call does not fit what is left.
@@ -638,7 +637,7 @@ fn a_call_that_does_not_fit_stops_the_discussion_with_an_escalation() {
 
 #[test]
 fn a_reservation_is_only_for_the_round_in_progress() {
-    let l = log("reserveround");
+    let (l, _dir) = log("reserveround");
     assert!(l.reserve(1, "scribe", 1, 1).is_err(), "no contract yet");
     l.start(contract(Some(1), 10_000), 1).unwrap();
     assert!(l.reserve(2, "scribe", 1, 2).is_err());
@@ -653,7 +652,7 @@ fn a_reservation_is_only_for_the_round_in_progress() {
 
 #[test]
 fn an_unsettled_reservation_survives_a_crash_and_stays_counted() {
-    let l = log("reservecrash");
+    let (l, _dir) = log("reservecrash");
     l.start(contract(None, 10_000), 1).unwrap();
     let call = go(l.reserve(1, "participant-coder", 2_500, 2).unwrap());
     // The process died during the call: a restarted one sees it open, and
@@ -676,7 +675,7 @@ fn a_refused_digest_falls_back_to_the_round_as_written() {
         contributions: cs,
         reason: reason.into(),
     };
-    let l = log("fallback");
+    let (l, _dir) = log("fallback");
     l.start(contract(None, 10_000), 1).unwrap();
     let big = "y".repeat(crate::discussion::VERBATIM_ROUND_CHARS);
     let a = l.contribute(1, "coder", &big, 2).unwrap();
@@ -691,7 +690,7 @@ fn a_refused_digest_falls_back_to_the_round_as_written() {
     assert_eq!(st.next(), Next::Check { round: 1 });
     assert!(!st.summaries[&1].delta_empty(), "a fallback never stalls");
     // A small round has no fallback: it is passed on as written anyway.
-    let l = log("fallbacksmall");
+    let (l, _dir) = log("fallbacksmall");
     l.start(contract(None, 10_000), 1).unwrap();
     let a = l.contribute(1, "coder", "a", 2).unwrap();
     let b = l.contribute(1, "ops", "b", 2).unwrap();
@@ -700,7 +699,7 @@ fn a_refused_digest_falls_back_to_the_round_as_written() {
 
 #[test]
 fn records_and_the_log_are_capped() {
-    let l = log("caps");
+    let (l, _dir) = log("caps");
     l.start(contract(None, 100_000), 1).unwrap();
     let huge = "z".repeat(MAX_RECORD_BYTES);
     let e = l.contribute(1, "coder", &huge, 2).unwrap_err();
@@ -754,4 +753,128 @@ fn a_log_reached_through_a_symlink_is_refused() {
     std::os::unix::fs::symlink(&target, d.join("pick-db.jsonl.lock")).unwrap();
     assert!(l.start(contract(None, 10_000), 1).is_err(), "lock");
     assert_eq!(l.state().unwrap().next(), Next::NeedContract);
+}
+
+// ------------------------------------------------ one retry on a timeout (#756)
+
+#[test]
+fn a_retry_is_one_charged_recorded_call_of_a_settled_one() {
+    let (l, _dir) = log("retry");
+    l.start(contract(None, 10_000), 1).unwrap();
+    let c1 = go(l.reserve(1, "participant-coder", 3_000, 2).unwrap());
+    let retry = |what: &str, round: u32, of: &str| l.reserve_retry(round, what, 100, of, 3);
+    assert!(
+        retry("participant-coder", 1, &c1).is_err(),
+        "not settled yet"
+    );
+    l.settle(&c1, 500, 4).unwrap();
+    assert!(
+        retry("participant-coder", 1, "c99").is_err(),
+        "unknown call"
+    );
+    assert!(retry("scribe", 1, &c1).is_err(), "another kind of call");
+    assert!(retry("participant-coder", 2, &c1).is_err(), "another round");
+    let c2 = go(retry("participant-coder", 1, &c1).unwrap());
+    let st = l.state().unwrap();
+    assert_eq!(st.reservations[&c2].retry_of.as_deref(), Some(c1.as_str()));
+    assert_eq!(st.reservations[&c1].retry_of, None);
+    assert_eq!(st.tokens_used, 500 + 100, "charged like any call");
+    l.settle(&c2, 80, 5).unwrap();
+    // One retry per call, and a retry is never retried: the ledger refuses
+    // both, whatever the host does.
+    let e = retry("participant-coder", 1, &c1).unwrap_err();
+    assert!(e.contains("already retried"), "{e}");
+    let e = retry("participant-coder", 1, &c2).unwrap_err();
+    assert!(e.contains("itself a retry"), "{e}");
+    assert_eq!(l.state().unwrap().tokens_used, 500 + 80);
+}
+
+#[test]
+fn a_retry_that_does_not_fit_records_the_budget_escalation() {
+    let (l, _dir) = log("retry-budget");
+    l.start(contract(None, 1_000), 1).unwrap();
+    let c1 = go(l.reserve(1, "participant-coder", 400, 2).unwrap());
+    l.settle(&c1, 400, 3).unwrap();
+    match l
+        .reserve_retry(1, "participant-coder", 700, &c1, 4)
+        .unwrap()
+    {
+        Reserve::Stop(g) => assert_eq!(g, Gate::Escalate(Reason::Budget)),
+        Reserve::Go(c) => panic!("a retry over the budget was reserved: {c}"),
+    }
+    let st = l.state().unwrap();
+    assert_eq!(st.gates[&1], Gate::Escalate(Reason::Budget));
+    assert_eq!(st.tokens_used, 400, "nothing was reserved");
+    assert!(matches!(st.next(), Next::Finish { .. }));
+}
+
+#[test]
+fn the_retry_note_is_an_optional_field_old_ledgers_and_readers_agree_on() {
+    // A line written before the field existed still reads, as no retry.
+    let old =
+        r#"{"seq":3,"t":1,"event":"reserve","round":1,"call":"c3","what":"scribe","tokens":5}"#;
+    let line: Line = serde_json::from_str(old).unwrap();
+    assert!(matches!(line.event, Event::Reserve { retry_of: None, .. }));
+    // An ordinary reservation is written exactly as before (no new key); a
+    // retry carries the note.
+    let ev = |retry_of: Option<&str>| Event::Reserve {
+        round: 1,
+        call: "c4".into(),
+        what: "scribe".into(),
+        tokens: 5,
+        retry_of: retry_of.map(str::to_string),
+    };
+    let plain = serde_json::to_string(&ev(None)).unwrap();
+    assert!(!plain.contains("retry_of"), "{plain}");
+    let noted = serde_json::to_string(&ev(Some("c3"))).unwrap();
+    assert!(noted.contains(r#""retry_of":"c3""#), "{noted}");
+}
+
+// ------------------------------------------------ a charged call (#804)
+
+#[test]
+fn a_charged_settle_costs_the_estimate_once_and_says_why() {
+    let d = dir("charged");
+    let l = DiscussionLog::at(&d, "pick-db").unwrap();
+    l.start(contract(None, 10_000), 1).unwrap();
+    let c1 = go(l.reserve(1, "participant-coder", 3_000, 2).unwrap());
+    assert_eq!(l.settle_charged(&c1, "timeout", 3).unwrap(), 3_000);
+    let st = l.state().unwrap();
+    assert_eq!(st.reservations[&c1].settled, Some(3_000));
+    assert_eq!(st.reservations[&c1].charged.as_deref(), Some("timeout"));
+    assert_eq!(st.tokens_used, 3_000);
+    // The settle is final: a resume (or a second settle of any kind) is
+    // refused and charges nothing more.
+    assert!(l.settle_charged(&c1, "timeout", 4).is_err());
+    assert!(l.settle(&c1, 9_000, 5).is_err());
+    assert_eq!(l.state().unwrap().tokens_used, 3_000);
+    // A charge is exactly the call's own estimate (its carve), no more.
+    let c2 = go(l.reserve(1, "participant-ops", 700, 6).unwrap());
+    assert_eq!(l.settle_charged(&c2, "unreported", 7).unwrap(), 700);
+    assert_eq!(l.state().unwrap().tokens_used, 3_700);
+    assert!(l.settle_charged("c99", "timeout", 8).is_err());
+    // Re-reading the file folds to the same state (a resume).
+    drop(l);
+    let again = DiscussionLog::at(&d, "pick-db").unwrap().state().unwrap();
+    assert_eq!(again.tokens_used, 3_700);
+    assert_eq!(
+        again.reservations[&c2].charged.as_deref(),
+        Some("unreported")
+    );
+}
+
+#[test]
+fn the_charge_note_is_an_optional_field_old_ledgers_and_readers_agree_on() {
+    let old = r#"{"seq":4,"t":1,"event":"settle","call":"c3","tokens":5}"#;
+    let line: Line = serde_json::from_str(old).unwrap();
+    assert!(matches!(line.event, Event::Settle { charged: None, .. }));
+    let ev = |charged: Option<&str>| Event::Settle {
+        call: "c3".into(),
+        tokens: 5,
+        charged: charged.map(str::to_string),
+    };
+    let plain = serde_json::to_string(&ev(None)).unwrap();
+    assert!(!plain.contains("charged"), "{plain}");
+    let noted = serde_json::to_string(&ev(Some("timeout"))).unwrap();
+    assert!(noted.contains(r#""charged":"timeout""#), "{noted}");
 }

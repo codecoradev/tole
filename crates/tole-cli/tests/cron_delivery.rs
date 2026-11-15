@@ -2,7 +2,9 @@
 //! `command:`, and redaction of web-header secrets from run output.
 #![cfg(feature = "shell-tools")]
 
-use std::path::{Path, PathBuf};
+mod common;
+use common::TestDir;
+use std::path::Path;
 
 use serde_json::json;
 use tole_cli::cron::{self, store, CreateSpec, TickOptions};
@@ -12,11 +14,8 @@ use tole_core::ledger::{DeliveryStatus, RunStatus};
 const T: i64 = 1_767_225_600;
 const OPTS: TickOptions = TickOptions::standalone(4);
 
-fn tmp(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("tole-cronctl-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d.canonicalize().unwrap()
+fn tmp(tag: &str) -> TestDir {
+    TestDir::new(&format!("tole-cronctl-{tag}"))
 }
 
 fn script(dir: &Path, id: &str, schedule: &str, line: &str, deliver: &[&str]) -> CreateSpec {

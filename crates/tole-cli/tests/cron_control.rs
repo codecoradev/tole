@@ -2,7 +2,7 @@
 //! doctor, `runs_json` and `GET /cron/runs` on `tole serve`.
 #![cfg(feature = "shell-tools")]
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use tole_cli::cron::{self, status, store, CreateSpec, EditSpec, TickOptions};
@@ -12,11 +12,8 @@ use tole_core::ledger::RunStatus;
 const T: i64 = 1_767_225_600;
 const OPTS: TickOptions = TickOptions::standalone(4);
 
-fn tmp(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("tole-cronctl-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d.canonicalize().unwrap()
+fn tmp(tag: &str) -> TestDir {
+    TestDir::new(&format!("tole-cronctl-{tag}"))
 }
 
 fn script(dir: &Path, id: &str, schedule: &str, line: &str, deliver: &[&str]) -> CreateSpec {
@@ -79,7 +76,7 @@ fn cancel_stops_a_running_script() {
     let dir = tmp("cancel");
     cron::create(&dir, script(&dir, "z", "* * * * *", "sleep 30", &[]), T).unwrap();
     assert!(cron::cancel(&dir, "z").is_err(), "nothing running yet");
-    let d2 = dir.clone();
+    let d2 = dir.to_path_buf();
     let start = Instant::now();
     let runner = std::thread::spawn(move || cron::tick(&d2, T + 60, &OPTS).unwrap());
     let fires = loop {
@@ -137,7 +134,7 @@ fn an_agent_job_cannot_be_edited_into_a_script() {
         id: Some("a".into()),
         schedule: "@daily".into(),
         prompt: Some("hi".into()),
-        workdir: dir.clone(),
+        workdir: dir.to_path_buf(),
         ..CreateSpec::default()
     };
     cron::create(&dir, spec, T).unwrap();
@@ -189,6 +186,7 @@ fn runs_json_lists_newest_first_with_output_and_deliveries() {
 }
 
 mod common;
+use common::TestDir;
 
 /// One request to a local server: `(status code, body)`.
 fn http_get(port: u16, path: &str, token: Option<&str>) -> (u16, serde_json::Value) {

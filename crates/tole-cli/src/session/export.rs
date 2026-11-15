@@ -332,14 +332,9 @@ mod tests {
         ]
     }
 
-    fn ws(tag: &str) -> PathBuf {
-        let n = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let d = std::env::temp_dir().join(format!("tole-export-{tag}-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
-        d.canonicalize().unwrap()
+    use crate::test_dir::TestDir;
+    fn ws(tag: &str) -> TestDir {
+        TestDir::new(&format!("tole-export-{tag}"))
     }
 
     #[test]

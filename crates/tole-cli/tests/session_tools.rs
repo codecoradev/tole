@@ -1,14 +1,15 @@
 //! #137: session_tools unit tests — multi-session routing semantics
 //! without an LLM (CI-safe).
 
+mod common;
+use common::TestDir;
 use serde_json::json;
 use std::sync::Arc;
 use tole_cli::session_tools::SessionToolState;
 use tole_core::tool::Tool;
 
-fn ws(tag: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("tole-sess-tools-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
+fn ws(tag: &str) -> TestDir {
+    let d = TestDir::new(&format!("tole-sess-tools-{tag}"));
     std::fs::create_dir_all(d.join("a")).unwrap();
     std::fs::create_dir_all(d.join("b")).unwrap();
     std::fs::write(d.join("a/note.txt"), "ALPHA").unwrap();
@@ -117,7 +118,7 @@ fn resolver_routes_to_session_jail() {
 #[test]
 fn unknown_session_is_a_clear_error() {
     let root = ws("unknown-sid");
-    let state = SessionToolState::new(vec![], false, None, root, None, vec![]);
+    let state = SessionToolState::new(vec![], false, None, root.to_path_buf(), None, vec![]);
     let tools = state.tools();
     let err = tool_by_name(&tools, "tole_session_status")
         .execute(json!({"session_id": "nope"}))
@@ -131,14 +132,13 @@ fn unknown_session_is_a_clear_error() {
 #[test]
 fn sessions_dir_override_relocates_the_jsonl() {
     let dir = ws("sdir-override");
-    let store = std::env::temp_dir().join(format!("tole-sess-store-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&store);
+    let store = TestDir::new("tole-sess-store");
     let state = SessionToolState::new(
         vec![],
         false,
         None,
         std::path::PathBuf::from(&dir),
-        Some(store.clone()),
+        Some(store.to_path_buf()),
         vec![],
     );
     let tools = state.tools();

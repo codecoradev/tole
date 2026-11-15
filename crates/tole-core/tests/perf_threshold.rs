@@ -7,8 +7,11 @@
 //! harness regresses past the documented budget (CI-enforced), and
 //! docs/perf.md is the human-readable record.
 
+#[path = "support/test_dir.rs"]
+mod test_dir;
 use serde_json::json;
 use std::time::Instant;
+use test_dir::TestDir;
 use tole_core::approval::AllowlistApprover;
 use tole_core::mock::MockProvider;
 use tole_core::provider::ProviderOutput;
@@ -38,11 +41,8 @@ impl Tool for EchoTool {
     }
 }
 
-fn tmpdir(tag: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("tole-perf-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+fn tmpdir(tag: &str) -> TestDir {
+    TestDir::new(&format!("tole-perf-{tag}"))
 }
 
 #[test]

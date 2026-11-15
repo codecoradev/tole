@@ -3,6 +3,8 @@
 //! 50,000-char file is read in 3 chunks by following `next_offset`, and
 //! the mission concludes. No network.
 
+mod common;
+use common::TestDir;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -127,14 +129,7 @@ fn spawn_mock(offsets: Arc<Mutex<Vec<u64>>>) -> String {
 fn mission_reads_a_50k_char_file_in_three_chunks() {
     let offsets = Arc::new(Mutex::new(Vec::new()));
     let base = spawn_mock(offsets.clone());
-    let dir = std::env::temp_dir().join(format!(
-        "tole-readfile-e2e-{}-{:x}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let dir = TestDir::new("tole-readfile-e2e");
     let ws = dir.join("ws");
     std::fs::create_dir_all(&ws).unwrap();
     // 50,000 chars including multibyte ones (so bytes != chars).

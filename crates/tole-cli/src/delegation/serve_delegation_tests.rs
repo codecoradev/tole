@@ -11,11 +11,9 @@ use crate::ledger_file::FileStore;
 const T: i64 = 1_000_000;
 const SECRET: &str = "s3cr3t-value-123456";
 
-fn data_dir(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("tole-sdeleg-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+use crate::test_dir::TestDir;
+fn data_dir(tag: &str) -> TestDir {
+    TestDir::new(&format!("tole-sdeleg-{tag}"))
 }
 
 struct Goal3 {
@@ -226,7 +224,7 @@ fn only_a_full_id_and_a_well_formed_body_are_accepted() {
     let data = data_dir("shape");
     let g = goal(&data, "aaa");
     let id = g.ask("aaaaaaaa", T, false, "w");
-    let d = Some(data.as_path());
+    let d = Some(data.path());
     for bad in ["all", "dap-*", "dap-", "dap-ABC", "*"] {
         let (code, v) = post(d, bad, allow_body(bad), T + 1);
         assert_eq!(code, 400, "{bad}: {v}");
@@ -250,7 +248,7 @@ fn allow_must_repeat_the_request_id() {
     let data = data_dir("confirm");
     let g = goal(&data, "aaa");
     let id = g.ask("aaaaaaaa", T, false, "w");
-    let d = Some(data.as_path());
+    let d = Some(data.path());
     for body in [
         json!({"decision": "allow"}),
         json!({"decision": "allow", "confirm": "all"}),
@@ -287,7 +285,7 @@ fn deny_needs_no_confirmation_and_is_recorded_via_serve() {
 fn only_a_pending_request_is_decided_and_the_answer_says_why() {
     let data = data_dir("states");
     let g = goal(&data, "aaa");
-    let d = Some(data.as_path());
+    let d = Some(data.path());
     let (code, v) = post(d, "dap-1-abcdefgh", json!({"decision": "deny"}), T);
     assert_eq!(
         (code, v["error"].as_str()),
@@ -351,7 +349,7 @@ fn the_fingerprint_pins_the_content_and_the_owner_can_answer_what_no_agent_can()
     let g = goal(&data, "aaa");
     let other = goal(&data, "bbb");
     let id = other.ask("aaaaaaaa", T, true, "needs the owner");
-    let d = Some(data.as_path());
+    let d = Some(data.path());
     let fp = other.entry(&id).req.fingerprint.clone();
     for bad in ["abc", "zzzzzzzzzzzz", &"0".repeat(64)] {
         let body = json!({"decision": "allow", "confirm": id, "fingerprint": bad});

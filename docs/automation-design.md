@@ -572,7 +572,7 @@ built-in or owner-overridden roles.
      delegation tree (`budget_tokens`, or half of what is left, never more),
      recorded as a running `consult` node; the tree is charged what the
      ledger counted when the discussion ends, and a crash is charged the
-     whole carve; at most two discussions run at once per process;
+     whole carve (so is a call that ended in a timeout, below); at most two discussions run at once per process;
    - participants are user-config profiles whose allow patterns the caller's
      own allow list covers (a refusal, where `delegate` trims), never a
      built-in role; they are inline voices with no tools and no process, so
@@ -640,6 +640,40 @@ IGNORED), and an invalid env value is a startup error naming the variable,
 never a silent fall back to 120 s. `tole config check` and `tole doctor` show
 the effective value and where it came from. The advisor's provider keeps its
 own 120 s.
+
+### A timed-out call is charged its estimate (#804)
+
+The discussion budget is a hard cap, so the ledger must not undercount a call
+whose cost it cannot see. A call that fails with no usage reported used to
+settle at 0, yet after a timeout the provider may have generated, and billed,
+most of the reply before the client gave up, and the retry of #756 doubles the
+exposure. The rule is now the one a crash already had:
+
+- a call that fails with no reported usage, after the request may have left,
+  settles at its reserved estimate (the call's own carve, never more) and the
+  settle record says why: `charged: "timeout"` for the transport timeout,
+  `charged: "unreported"` for any other such failure. A call that reported
+  usage settles at that usage, as before; a call that succeeded without usage
+  keeps its estimate, as before;
+- a failure that provably came before the request left (a refused connection,
+  DNS, a rejected URL, the TLS handshake, a `timeout: connect`) stays at 0.
+  The classifier (`tole_core::failover::request_may_have_been_sent`) is a
+  closed list of anchored prefixes of the transport's own error text: any
+  other text, an unknown one included, and any failover chain (an earlier link
+  may have sent) is charged. When it cannot tell, it charges;
+- the retry still goes through `admit`: two timeouts cost two estimates, and
+  the second retry or the next resume that no longer fits is the existing
+  budget escalation, so the discussion stops at the cap instead of running past
+  it. The goal's pot (the delegation tree) is charged the same amount;
+- the settle record is final (`settle` of a settled call is refused and the
+  fold ignores a second one), so a resume after a timeout never charges a
+  settled call again; only an unsettled reservation is counted at its
+  estimate, as before;
+- the ledger format is unchanged for old readers and files: `charged` is an
+  optional field of the `settle` event, skipped when absent. `tole audit
+  --discussion` lists every round that has a call, not only one with a
+  contribution or a gate, and shows its retries and charged calls (text and
+  `--json`, `charged: [{call, why, tokens}]`).
 
 ## 12. Non-goals
 

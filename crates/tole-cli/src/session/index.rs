@@ -360,18 +360,10 @@ fn preview(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
-    static N: AtomicU64 = AtomicU64::new(0);
-
-    fn tmp() -> PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "tole-session-index-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::SeqCst)
-        ));
-        std::fs::create_dir_all(&d).unwrap();
-        d.canonicalize().unwrap()
+    use crate::test_dir::TestDir;
+    fn tmp() -> TestDir {
+        TestDir::new("tole-session-index")
     }
 
     fn entry(id: &str, file: &Path, at: u64) -> Entry {

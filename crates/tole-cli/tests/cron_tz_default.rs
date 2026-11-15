@@ -3,6 +3,8 @@
 
 #![cfg(feature = "shell-tools")]
 
+mod common;
+use common::TestDir;
 use tole_cli::cron::{self, CreateSpec, EditSpec};
 
 /// 2026-01-01T00:00:00Z.
@@ -10,8 +12,7 @@ const T: i64 = 1_767_225_600;
 
 #[test]
 fn a_new_job_takes_cron_timezone_and_an_edit_never_adds_one() {
-    let base = std::env::temp_dir().join(format!("tole-cron-tzdef-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
+    let base = TestDir::new("tole-cron-tzdef");
     std::fs::create_dir_all(base.join("home/tole")).unwrap();
     std::fs::create_dir_all(base.join("w")).unwrap();
     std::env::set_var("CODECORA_HOME", base.join("home"));

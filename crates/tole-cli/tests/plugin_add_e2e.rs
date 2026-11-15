@@ -7,12 +7,13 @@
 #![cfg(feature = "mcp")]
 #![cfg(unix)]
 
-use std::path::{Path, PathBuf};
+mod common;
+use common::TestDir;
+use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
-fn tmp(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("tole-plugin-add-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
+fn tmp(tag: &str) -> TestDir {
+    let d = TestDir::new(&format!("tole-plugin-add-{tag}"));
     std::fs::create_dir_all(d.join("home/tole")).unwrap();
     std::fs::create_dir_all(d.join("ws")).unwrap();
     d

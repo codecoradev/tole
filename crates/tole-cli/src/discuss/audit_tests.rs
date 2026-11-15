@@ -8,11 +8,9 @@ fn secrets() -> SecretSet {
     SecretSet::collect([("AUDIT_API_KEY".to_string(), SECRET.to_string())], [])
 }
 
-fn tmp(tag: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("tole-auditdisc-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+use crate::test_dir::TestDir;
+fn tmp(tag: &str) -> TestDir {
+    TestDir::new(&format!("tole-auditdisc-{tag}"))
 }
 
 /// Round 1: two speakers, a digest (a claim quoting the secret), a met
@@ -130,4 +128,69 @@ fn a_symlinked_log_is_not_read() {
     // The listing skips it (not a regular file).
     let text = discussions(&dir, None, false, &secrets()).unwrap();
     assert!(text.starts_with("no discussions"), "{text}");
+}
+
+/// Round 1 never completed: the coder's call timed out and was charged, its
+/// retry too; no contribution, no gate.
+fn incomplete(dir: &Path) {
+    let l = DiscussionLog::at(dir, "stuck").unwrap();
+    let c = Contract::new(
+        "stuck",
+        "Which cache?",
+        &["a choice is named".to_string()],
+        &["coder".to_string(), "ops".to_string()],
+        10_000,
+        None,
+        &SecretSet::default(),
+    )
+    .unwrap();
+    l.start(c, 1).unwrap();
+    let Reserve::Go(c1) = l.reserve(1, "participant-coder", 2_000, 2).unwrap() else {
+        panic!()
+    };
+    l.settle_charged(&c1, "timeout", 3).unwrap();
+    let Reserve::Go(c2) = l
+        .reserve_retry(1, "participant-coder", 2_000, &c1, 4)
+        .unwrap()
+    else {
+        panic!()
+    };
+    l.settle_charged(&c2, "timeout", 5).unwrap();
+}
+
+#[test]
+fn a_round_that_never_completed_shows_its_retry_and_charged_timeouts() {
+    let dir = tmp("stuck");
+    incomplete(&dir);
+    let text = discussions(&dir, Some("stuck"), false, &secrets()).unwrap();
+    for want in [
+        "round 1: 4000 tokens, gate -",
+        "1 call(s) retried once after a provider timeout",
+        "participant-coder charged 2000 tokens at its estimate (timeout: no usage reported)",
+    ] {
+        assert!(text.contains(want), "{want}:\n{text}");
+    }
+    assert_eq!(
+        text.matches("charged 2000 tokens").count(),
+        2,
+        "both calls:\n{text}"
+    );
+    let json = discussions(&dir, Some("stuck"), true, &secrets()).unwrap();
+    let v: Value = serde_json::from_str(&json).unwrap();
+    let r = &v["rounds"][0];
+    assert_eq!(v["rounds"].as_array().unwrap().len(), 1);
+    assert_eq!(r["round"], 1);
+    assert_eq!(r["tokens"], 4000);
+    assert_eq!(r["retries"], 1);
+    assert_eq!(r["gate"], Value::Null);
+    assert_eq!(r["charged"].as_array().unwrap().len(), 2);
+    assert_eq!(r["charged"][0]["why"], "timeout");
+    assert_eq!(r["charged"][0]["tokens"], 2000);
+    // A round with no charged call lists none.
+    let ok = tmp("stuck-ok");
+    discussion(&ok);
+    let v: Value =
+        serde_json::from_str(&discussions(&ok, Some("pick-db"), true, &secrets()).unwrap())
+            .unwrap();
+    assert_eq!(v["rounds"][0]["charged"].as_array().unwrap().len(), 0);
 }

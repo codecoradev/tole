@@ -373,12 +373,9 @@ impl Tool for DeleteFileTool {
 mod tests {
     use super::*;
 
-    fn tmpdir(name: &str) -> PathBuf {
-        let d =
-            std::env::temp_dir().join(format!("tole-file-tools-{}-{}", name, std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
+    use crate::test_dir::TestDir;
+    fn tmpdir(name: &str) -> TestDir {
+        TestDir::new(&format!("tole-file-tools-{name}"))
     }
 
     fn write(root: &Path, rel: &str, content: &str) {
@@ -405,7 +402,7 @@ mod tests {
         let stale = dir.join(format!(".tole-edit-{}.tmp", std::process::id()));
         std::fs::write(&stale, "garbage").unwrap();
         let h = content_hash(&std::fs::read_to_string(dir.join("f.txt")).unwrap());
-        let t = EditFileTool::new(dir.clone());
+        let t = EditFileTool::new(dir.to_path_buf());
         t.execute(json!({
             "path": "f.txt",
             "old_hash": h,
@@ -423,7 +420,7 @@ mod tests {
     fn edit_applies_with_fresh_anchor_and_returns_new_hash() {
         let dir = tmpdir("edit-ok");
         write(&dir, "src/lib.rs", "fn a() {}\nfn b() {}\n");
-        let t = EditFileTool::new(dir.clone());
+        let t = EditFileTool::new(dir.to_path_buf());
         let original = std::fs::read_to_string(dir.join("src/lib.rs")).unwrap();
         let out = t
             .execute(json!({
@@ -456,7 +453,7 @@ mod tests {
     fn edit_refuses_stale_anchor() {
         let dir = tmpdir("edit-stale");
         write(&dir, "src/lib.rs", "one\ntwo\n");
-        let t = EditFileTool::new(dir.clone());
+        let t = EditFileTool::new(dir.to_path_buf());
         let stale_hash = content_hash("different content entirely");
         let err = t
             .execute(json!({
@@ -483,7 +480,7 @@ mod tests {
         let dir = tmpdir("edit-ambig");
         write(&dir, "dup.txt", "x\nx\n");
         write(&dir, "no.txt", "a\n");
-        let t = EditFileTool::new(dir.clone());
+        let t = EditFileTool::new(dir.to_path_buf());
         // 2 matches -> refused, file unchanged.
         let dup = std::fs::read_to_string(dir.join("dup.txt")).unwrap();
         let err = t
@@ -519,7 +516,7 @@ mod tests {
     fn edit_rejects_jail_escapes() {
         let dir = tmpdir("edit-jail");
         write(&dir, "in.txt", "x");
-        let t = EditFileTool::new(dir.clone());
+        let t = EditFileTool::new(dir.to_path_buf());
         for bad in ["/etc/passwd", "../escape.txt", "a/../../esc.txt"] {
             assert!(
                 t.execute(json!({
@@ -538,7 +535,7 @@ mod tests {
     fn edit_empty_new_text_deletes_match() {
         let dir = tmpdir("edit-del-match");
         write(&dir, "f.txt", "keep\nDROP ME\nkeep\n");
-        let t = EditFileTool::new(dir.clone());
+        let t = EditFileTool::new(dir.to_path_buf());
         let original = std::fs::read_to_string(dir.join("f.txt")).unwrap();
         t.execute(json!({
             "path": "f.txt",
@@ -557,7 +554,7 @@ mod tests {
     fn edit_refuses_directory_and_missing_file() {
         let dir = tmpdir("edit-dir");
         std::fs::create_dir_all(dir.join("sub")).unwrap();
-        let t = EditFileTool::new(dir.clone());
+        let t = EditFileTool::new(dir.to_path_buf());
         let err = t
             .execute(json!({
                 "path": "sub",
@@ -590,7 +587,7 @@ mod tests {
     fn delete_removes_file() {
         let dir = tmpdir("del-ok");
         write(&dir, "scratch.txt", "bye");
-        let t = DeleteFileTool::new(dir.clone());
+        let t = DeleteFileTool::new(dir.to_path_buf());
         let out = t.execute(json!({ "path": "scratch.txt" })).unwrap();
         assert_eq!(out["deleted"], json!(true));
         assert!(!dir.join("scratch.txt").exists());
@@ -600,7 +597,7 @@ mod tests {
     fn delete_refuses_directories_and_escapes() {
         let dir = tmpdir("del-dir");
         std::fs::create_dir_all(dir.join("sub")).unwrap();
-        let t = DeleteFileTool::new(dir.clone());
+        let t = DeleteFileTool::new(dir.to_path_buf());
         let err = t.execute(json!({ "path": "sub" })).unwrap_err();
         assert!(
             err.contains("directory"),
@@ -614,7 +611,7 @@ mod tests {
     #[test]
     fn delete_missing_file_is_actionable_error() {
         let dir = tmpdir("del-missing");
-        let t = DeleteFileTool::new(dir.clone());
+        let t = DeleteFileTool::new(dir.to_path_buf());
         let err = t.execute(json!({ "path": "ghost.txt" })).unwrap_err();
         assert!(
             err.contains("not found"),

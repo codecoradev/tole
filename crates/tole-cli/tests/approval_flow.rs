@@ -2,6 +2,8 @@
 //! write request → (scripted) y/N prompt → denied recorded / allowed
 //! executed, over the real turn loop and JSONL storage.
 
+mod common;
+use common::TestDir;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
@@ -47,11 +49,8 @@ impl Tool for Bomb {
     }
 }
 
-fn tmpdir(name: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("tole-cli-e2e-{}-{}", name, std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+fn tmpdir(name: &str) -> TestDir {
+    TestDir::new(&format!("tole-cli-e2e-{name}"))
 }
 
 fn registry_with(dir: &Path, approver: impl Approver + 'static, with_bomb: bool) -> ToolRegistry {

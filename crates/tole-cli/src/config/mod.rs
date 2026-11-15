@@ -1828,15 +1828,10 @@ pub fn check(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use crate::test_dir::TestDir;
 
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    fn tmpdir() -> PathBuf {
-        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let d = std::env::temp_dir().join(format!("tole-config-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
-        d
+    fn tmpdir() -> TestDir {
+        TestDir::new("tole-config")
     }
 
     fn p() -> PathBuf {

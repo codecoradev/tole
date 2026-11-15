@@ -7,11 +7,9 @@ use tole_core::ledger::Lease;
 const T: i64 = 1_000_000;
 const SECRET: &str = "sk-audit-0123456789abcdef";
 
-fn tmp(tag: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("tole-audit-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d.canonicalize().unwrap()
+use crate::test_dir::TestDir;
+fn tmp(tag: &str) -> TestDir {
+    TestDir::new(&format!("tole-audit-{tag}"))
 }
 
 fn secrets() -> SecretSet {

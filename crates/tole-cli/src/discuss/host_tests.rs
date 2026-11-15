@@ -162,11 +162,9 @@ fn secrets() -> SecretSet {
     SecretSet::default().with("MY_TOKEN", SECRET)
 }
 
-fn log(tag: &str) -> DiscussionLog {
-    let d = std::env::temp_dir().join(format!("tole-dhost-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    DiscussionLog::at(&d, "pick-db").unwrap()
+fn log(tag: &str) -> (DiscussionLog, crate::test_dir::TestDir) {
+    let d = crate::test_dir::TestDir::new(&format!("tole-dhost-{tag}"));
+    (DiscussionLog::at(&d, "pick-db").unwrap(), d)
 }
 
 fn contract(budget: u64, rounds: Option<u32>) -> Contract {
@@ -225,7 +223,8 @@ fn kinds(s: &Shared) -> Vec<String> {
 #[test]
 fn a_small_discussion_runs_to_a_checked_report() {
     let (s, make) = script(&[("checker", vec![checker_met(1)])]);
-    let d = driver(log("report"), make, 1_000_000);
+    let (lg, _dir) = log("report");
+    let d = driver(lg, make, 1_000_000);
     d.start(contract(100_000, None)).unwrap();
     let out = d.run().unwrap();
     assert_eq!(out.gate, Gate::Report);
@@ -277,7 +276,8 @@ fn a_big_round_is_digested_and_a_refused_digest_falls_back() {
             ],
         ),
     ]);
-    let d = driver(log("digest"), make, 1_000_000);
+    let (lg, _dir) = log("digest");
+    let d = driver(lg, make, 1_000_000);
     d.start(contract(100_000, Some(3))).unwrap();
     let out = d.run().unwrap();
     assert_eq!(out.gate, Gate::Escalate(Reason::MaxRounds));
@@ -318,7 +318,8 @@ fn a_big_round_is_digested_and_a_refused_digest_falls_back() {
 fn the_budget_is_a_hard_stop_with_an_escalation() {
     // The first voice spends 2,000; the second's estimate no longer fits.
     let (s, make) = script(&[("coder", vec![text("ok", 2_000)])]);
-    let d = driver(log("budget"), make, 1_000_000);
+    let (lg, _dir) = log("budget");
+    let d = driver(lg, make, 1_000_000);
     d.start(contract(4_000, None)).unwrap();
     let out = d.run().unwrap();
     assert_eq!(out.gate, Gate::Escalate(Reason::Budget));
@@ -332,7 +333,8 @@ fn the_budget_is_a_hard_stop_with_an_escalation() {
     // The goal's pot stops it too, even when the discussion's own budget
     // would not.
     let (s, make) = script(&[]);
-    let d = driver(log("pot"), make, 1_000_000);
+    let (lg, _dir) = log("pot");
+    let d = driver(lg, make, 1_000_000);
     d.start(contract(1_000_000, None)).unwrap();
     d.pot.charge(1_000_000 - 10);
     assert_eq!(d.run().unwrap().gate, Gate::Escalate(Reason::Budget));
@@ -347,7 +349,8 @@ fn a_budget_is_carved_from_the_goal_and_never_exceeds_it() {
     assert!(carve(Some(10_001), &pot).is_err());
     assert!(carve(Some(0), &pot).is_err());
     let (_, make) = script(&[]);
-    let d = driver(log("carve"), make, 10_000);
+    let (lg, _dir) = log("carve");
+    let d = driver(lg, make, 10_000);
     let e = d.start(contract(10_001, None)).unwrap_err();
     assert!(e.contains("left in the goal's budget"), "{e}");
 }
@@ -356,7 +359,7 @@ fn a_budget_is_carved_from_the_goal_and_never_exceeds_it() {
 fn a_crash_resumes_without_running_a_finished_turn_or_spending_twice() {
     // The second voice's provider fails: the run stops, resumable.
     let (s, make) = script(&[("ops", vec![fails(Some(7))])]);
-    let l = log("resume");
+    let (l, _dir) = log("resume");
     let d = driver(l.clone(), make.clone(), 1_000_000);
     d.start(contract(100_000, Some(1))).unwrap();
     let e = d.run().unwrap_err();
@@ -409,7 +412,8 @@ fn what_a_model_writes_never_acts() {
             vec![text(r#"[{"met": true, "evidence": ["e999"]}]"#, 50)],
         ),
     ]);
-    let d = driver(log("hostile"), make, 1_000_000);
+    let (lg, _dir) = log("hostile");
+    let d = driver(lg, make, 1_000_000);
     d.start(contract(100_000, Some(2))).unwrap();
     let out = d.run().unwrap();
     assert_ne!(out.gate, Gate::Report, "only a checked checklist reports");
@@ -425,9 +429,7 @@ fn what_a_model_writes_never_acts() {
 
 #[test]
 fn participants_are_user_profiles_and_never_a_role() {
-    let dir = std::env::temp_dir().join(format!("tole-dhost-config-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = crate::test_dir::TestDir::new("tole-dhost-config");
     std::fs::write(dir.join("coder.md"), "You write Rust.").unwrap();
     let cfg = crate::config::parse(
         "[profiles.coder]\nsystem_prompt_file = \"coder.md\"\n[profiles.coder.models]\n\
@@ -438,13 +440,16 @@ fn participants_are_user_profiles_and_never_a_role() {
     .unwrap();
     let (_, make) = script(&[]);
     let pot = Arc::new(Budget::new(1_000));
+    let cfg_dirs = std::cell::RefCell::new(Vec::new());
     let mk = |names: &[&str]| {
+        let (cfg_log, cfg_dir) = log("cfg");
+        cfg_dirs.borrow_mut().push(cfg_dir);
         let names: Vec<String> = names.iter().map(|s| s.to_string()).collect();
         Driver::from_config(
             &cfg,
             (Some(&dir), None),
             &names,
-            log("cfg"),
+            cfg_log,
             secrets(),
             make.clone(),
             Arc::clone(&pot),
@@ -517,7 +522,8 @@ impl Independent for Child {
 fn an_independent_participant_runs_as_a_read_only_child_and_is_polled_on_resume() {
     let (s, make) = script(&[]);
     let child = Arc::new(Child::default());
-    let d = driver(log("independent"), make.clone(), 1_000_000)
+    let (lg, _dir) = log("independent");
+    let d = driver(lg, make.clone(), 1_000_000)
         .with_independent(&["ops".to_string()], child.clone())
         .unwrap()
         .with_poll_every(std::time::Duration::ZERO);
@@ -546,13 +552,14 @@ fn an_independent_participant_runs_as_a_read_only_child_and_is_polled_on_resume(
     assert!(!c.contains(SECRET) && !c.contains("<<<END"), "{c}");
     // Only voices can be independent.
     let (_, make2) = script(&[]);
-    assert!(driver(log("ind-bad"), make2, 1)
+    let (bad_log, _bad_dir) = log("ind-bad");
+    assert!(driver(bad_log, make2, 1)
         .with_independent(&["stranger".to_string()], child.clone())
         .is_err());
 
     // A crash left a child running: the resumed driver polls it, never
     // starts another.
-    let l = log("ind-resume");
+    let (l, _dir) = log("ind-resume");
     let (_, make3) = script(&[]);
     let child = Arc::new(Child::default());
     let d = driver(l.clone(), make3, 1_000_000)
@@ -579,7 +586,7 @@ fn an_independent_participant_runs_as_a_read_only_child_and_is_polled_on_resume(
     // A crash between the child's start and the bind of its handle: the
     // intent (the reservation) is in the ledger, the child is found by its
     // call, bound and polled; no second child, no second reservation.
-    let l = log("ind-unbound");
+    let (l, _dir) = log("ind-unbound");
     let (_, make4) = script(&[]);
     let child = Arc::new(Child::default());
     let d = driver(l.clone(), make4, 1_000_000)
@@ -613,7 +620,7 @@ fn an_independent_participant_runs_as_a_read_only_child_and_is_polled_on_resume(
     );
     assert_eq!(out.tokens_used, 1_234 + 100 + 50);
     // An intent with no child behind it starts one, under the same call.
-    let l = log("ind-intent");
+    let (l, _dir) = log("ind-intent");
     let (_, make5) = script(&[]);
     let child = Arc::new(Child::default());
     let d = driver(l.clone(), make5, 1_000_000)
@@ -664,8 +671,8 @@ fn round_documents_are_flat_slugs_with_digests_only() {
         ("scribe", vec![good_scribe(&["first positions"])]),
     ]);
     let docs: Docs = Arc::default();
-    let d = driver(log("docs"), make, 1_000_000)
-        .with_docs(Box::new(FakeDocs(Arc::clone(&docs), false)));
+    let (lg, _dir) = log("docs");
+    let d = driver(lg, make, 1_000_000).with_docs(Box::new(FakeDocs(Arc::clone(&docs), false)));
     d.start(contract(100_000, Some(2))).unwrap();
     let out = d.run().unwrap();
     assert!(out.notes.is_empty(), "{:?}", out.notes);
@@ -700,8 +707,8 @@ fn round_documents_are_flat_slugs_with_digests_only() {
 
     // uteke failing never stops the discussion; the owner is told.
     let (_, make) = script(&[]);
-    let d = driver(log("docs-down"), make, 1_000_000)
-        .with_docs(Box::new(FakeDocs(Arc::default(), true)));
+    let (lg, _dir) = log("docs-down");
+    let d = driver(lg, make, 1_000_000).with_docs(Box::new(FakeDocs(Arc::default(), true)));
     d.start(contract(100_000, Some(1))).unwrap();
     let out = d.run().unwrap();
     assert!(!out.notes.is_empty());
@@ -714,31 +721,33 @@ fn round_documents_are_flat_slugs_with_digests_only() {
 
 /// A production-built driver (the `from_config` path every entry point
 /// uses) over a two-profile config.
-fn built(tag: &str, make: Factory, uteke: bool) -> Driver {
+fn built(tag: &str, make: Factory, uteke: bool) -> (Driver, crate::test_dir::TestDir) {
     let cfg = crate::config::parse(
         "[profiles.coder]\n[profiles.ops]\n[router.tiers]\nlight = \"small\"\n",
         std::path::Path::new("user.toml"),
     )
     .unwrap();
     let names = vec!["coder".to_string(), "ops".to_string()];
-    Driver::from_config_with(
+    let (lg, dir) = log(tag);
+    let driver = Driver::from_config_with(
         &cfg,
         (None, None),
         &names,
-        (log(tag), secrets()),
+        (lg, secrets()),
         make,
         Arc::new(Budget::new(1_000_000)),
         uteke,
     )
     .unwrap()
-    .with_clock(|| 1)
+    .with_clock(|| 1);
+    (driver, dir)
 }
 
 #[test]
 fn the_production_builder_carries_a_round_docs_sink() {
     let (_, make) = script(&[]);
     // Guard against `docs: None` returning on the production path (#717).
-    let d = built("prod-on", make.clone(), true);
+    let (d, _dir) = built("prod-on", make.clone(), true);
     #[cfg(feature = "shell-tools")]
     {
         assert!(d.docs.is_some(), "uteke is configured: docs must be wired");
@@ -746,7 +755,7 @@ fn the_production_builder_carries_a_round_docs_sink() {
     }
     #[cfg(not(feature = "shell-tools"))]
     assert!(d.docs.is_none());
-    let d = built("prod-off", make, false);
+    let (d, _dir) = built("prod-off", make, false);
     assert!(d.docs.is_none());
     assert_eq!(*d.notes.lock().unwrap(), vec![DOCS_OFF_NOTE.to_string()]);
 }
@@ -754,7 +763,7 @@ fn the_production_builder_carries_a_round_docs_sink() {
 #[test]
 fn without_uteke_one_note_says_documents_are_off() {
     let (_, make) = script(&[]);
-    let d = built("off-once", make, false);
+    let (d, _dir) = built("off-once", make, false);
     d.start(contract(100_000, Some(3))).unwrap();
     let out = d.run().unwrap();
     assert!(out.rounds >= 2, "several rounds ran: {}", out.rounds);
@@ -770,8 +779,8 @@ fn without_uteke_one_note_says_documents_are_off() {
 fn a_failed_document_write_is_loud_and_changes_nothing_else() {
     let run = |down: bool, tag: &str| {
         let (_, make) = script(&[]);
-        let d =
-            driver(log(tag), make, 1_000_000).with_docs(Box::new(FakeDocs(Arc::default(), down)));
+        let (lg, _dir) = log(tag);
+        let d = driver(lg, make, 1_000_000).with_docs(Box::new(FakeDocs(Arc::default(), down)));
         d.start(contract(100_000, Some(2))).unwrap();
         d.run().unwrap()
     };
@@ -795,7 +804,7 @@ fn a_failed_document_write_is_loud_and_changes_nothing_else() {
 fn resuming_a_finished_discussion_writes_no_documents_again() {
     let (_, make) = script(&[]);
     let docs: Docs = Arc::default();
-    let l = log("resume-docs");
+    let (l, _dir) = log("resume-docs");
     let mk = |docs: &Docs| {
         driver(l.clone(), make.clone(), 1_000_000)
             .with_docs(Box::new(FakeDocs(Arc::clone(docs), false)))
@@ -807,6 +816,211 @@ fn resuming_a_finished_discussion_writes_no_documents_again() {
     assert!(written >= 3, "goal and two rounds: {written}");
     mk(&docs).run().unwrap();
     assert_eq!(docs.lock().unwrap().len(), written, "no duplicate puts");
+}
+
+// ------------------------------------------------ one retry on a timeout (#756)
+
+fn times_out(usage: Option<u64>) -> Reply {
+    fails_with("timeout: global", usage)
+}
+
+fn fails_with(msg: &'static str, usage: Option<u64>) -> Reply {
+    Reply {
+        respond: Arc::new(move |_| Err(msg.to_string())),
+        usage,
+    }
+}
+
+fn retries(st: &State) -> Vec<(String, String)> {
+    st.reservations
+        .values()
+        .filter_map(|r| r.retry_of.clone().map(|of| (r.what.clone(), of)))
+        .collect()
+}
+
+#[test]
+fn a_participant_timeout_is_retried_once_charged_and_recorded() {
+    let (s, make) = script(&[
+        (
+            "coder",
+            vec![times_out(Some(40)), text("coder retried", 60)],
+        ),
+        ("checker", vec![checker_met(1)]),
+    ]);
+    let (l, _dir) = log("retry-ok");
+    let d = driver(l.clone(), make, 1_000_000);
+    d.start(contract(100_000, None)).unwrap();
+    let out = d.run().unwrap();
+    assert_eq!(out.gate, Gate::Report);
+    assert_eq!(kinds(&s), ["coder", "coder", "ops", "checker"]);
+    // Both calls are charged, to the ledger and to the goal's pot.
+    assert_eq!(out.tokens_used, 40 + 60 + 100 + 50);
+    assert_eq!(d.pot.used(), 250);
+    // Recorded: the second reservation names the timed-out first one.
+    let st = l.state().unwrap();
+    let r = retries(&st);
+    assert_eq!(r.len(), 1, "{r:?}");
+    assert_eq!(r[0].0, "participant-coder");
+    assert_eq!(st.reservations[&r[0].1].settled, Some(40));
+    assert!(st.reservations[&r[0].1].retry_of.is_none());
+    assert!(st
+        .contributions
+        .iter()
+        .any(|c| c.participant == "coder" && c.text.contains("coder retried")));
+    assert!(out.notes.iter().any(|n| n.contains("timed out")), "{out:?}");
+}
+
+#[test]
+fn a_second_timeout_fails_the_turn_as_before_and_resume_goes_on() {
+    let (s, make) = script(&[(
+        "coder",
+        vec![times_out(Some(40)), times_out(Some(50)), text("late", 10)],
+    )]);
+    let (l, _dir) = log("retry-twice");
+    let d = driver(l.clone(), make, 1_000_000);
+    d.start(contract(100_000, Some(1))).unwrap();
+    let e = d.run().unwrap_err();
+    assert!(
+        e.contains("coder's turn in round 1") && e.contains("timeout"),
+        "{e}"
+    );
+    assert_eq!(kinds(&s), ["coder", "coder"], "at most one retry per call");
+    let st = l.state().unwrap();
+    assert_eq!(st.tokens_used, 90, "both timed-out calls are counted");
+    assert_eq!(retries(&st).len(), 1);
+    assert!(st.contributions.is_empty(), "nothing was recorded");
+    // Resumed: the turn is a new call, with its own single retry allowance.
+    d.run().unwrap();
+    assert_eq!(&kinds(&s)[..3], ["coder", "coder", "coder"]);
+}
+
+#[test]
+fn only_a_provider_timeout_is_retried() {
+    for (i, msg) in [
+        "upstream 500",
+        "http status: 504 \u{2014} gateway timeout",
+        "http status: 429 \u{2014} timeout: global",
+        "http status: 400 \u{2014} json: timeout: global",
+        "io: Connection reset by peer",
+        "malformed response: timeout: global",
+        "stream read: timed out",
+        "provider call thread died",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (s, make) = script(&[("coder", vec![fails_with(msg, Some(5))])]);
+        let (l, _dir) = log(&format!("retry-other-{i}"));
+        let d = driver(l.clone(), make, 1_000_000);
+        d.start(contract(100_000, Some(1))).unwrap();
+        let e = d.run().unwrap_err();
+        assert!(e.contains("coder's turn in round 1"), "{msg}: {e}");
+        assert_eq!(kinds(&s), ["coder"], "{msg} must not be retried");
+        assert!(retries(&l.state().unwrap()).is_empty(), "{msg}");
+    }
+    // The body-read form of the timeout (`json: timeout: global ...`) is one.
+    let (s, make) = script(&[(
+        "coder",
+        vec![
+            fails_with("json: timeout: global at line 1 column 1", Some(5)),
+            text("ok", 5),
+        ],
+    )]);
+    let (lg, _dir) = log("retry-json");
+    let d = driver(lg, make, 1_000_000);
+    d.start(contract(100_000, Some(1))).unwrap();
+    d.run().unwrap();
+    assert_eq!(&kinds(&s)[..2], ["coder", "coder"]);
+}
+
+#[test]
+fn a_scribe_timeout_is_retried_once_and_a_second_one_falls_back_as_before() {
+    let big = "x".repeat(discussion::VERBATIM_ROUND_CHARS);
+    // Retry succeeds: the digest is used.
+    let (s, make) = script(&[
+        ("coder", vec![text(&big, 100)]),
+        (
+            "scribe",
+            vec![
+                times_out(Some(30)),
+                good_scribe(&["coder and ops weighed in"]),
+            ],
+        ),
+    ]);
+    let (l, _dir) = log("retry-scribe");
+    let d = driver(l.clone(), make, 1_000_000);
+    d.start(contract(100_000, Some(1))).unwrap();
+    d.run().unwrap();
+    assert_eq!(kinds(&s).iter().filter(|k| *k == "scribe").count(), 2);
+    let st = l.state().unwrap();
+    assert!(matches!(st.summaries[&1], RoundSummary::Digest(_)));
+    let r = retries(&st);
+    assert_eq!(r.len(), 1, "{r:?}");
+    assert_eq!(r[0].0, "scribe");
+    assert_eq!(st.reservations[&r[0].1].what, "scribe");
+    assert_eq!(st.reservations[&r[0].1].settled, Some(30));
+    assert_eq!(
+        st.tokens_used,
+        100 + 100 + 30 + 300 + 50,
+        "every call counted"
+    );
+    // Two timeouts: the digest is refused as today, after exactly two calls.
+    let (s, make) = script(&[
+        ("coder", vec![text(&big, 100)]),
+        ("scribe", vec![times_out(Some(30)), times_out(Some(30))]),
+    ]);
+    let (l, _dir) = log("retry-scribe-twice");
+    let d = driver(l.clone(), make, 1_000_000);
+    d.start(contract(100_000, Some(1))).unwrap();
+    d.run().unwrap();
+    assert_eq!(kinds(&s).iter().filter(|k| *k == "scribe").count(), 2);
+    match &l.state().unwrap().summaries[&1] {
+        RoundSummary::Fallback {
+            reason,
+            contributions,
+            ..
+        } => {
+            assert!(reason.contains("the scribe failed"), "{reason}");
+            assert_eq!(contributions.len(), 2, "dissent is passed on as written");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn the_checker_is_not_retried() {
+    let (s, make) = script(&[("checker", vec![times_out(Some(10)), checker_met(1)])]);
+    let (l, _dir) = log("retry-checker");
+    let d = driver(l.clone(), make, 1_000_000);
+    d.start(contract(100_000, Some(1))).unwrap();
+    let out = d.run().unwrap();
+    assert_eq!(kinds(&s).iter().filter(|k| *k == "checker").count(), 1);
+    assert_ne!(out.gate, Gate::Report, "the unread checklist meets nothing");
+    assert!(retries(&l.state().unwrap()).is_empty());
+}
+
+#[test]
+fn a_retry_that_does_not_fit_the_budget_is_the_budget_stop() {
+    // The first voice times out after reporting 2,000 tokens; the retry's
+    // estimate no longer fits the 4,000 budget: the hard stop, no second call.
+    let (s, make) = script(&[("coder", vec![times_out(Some(2_000)), text("never", 1)])]);
+    let (l, _dir) = log("retry-budget");
+    let d = driver(l.clone(), make, 1_000_000);
+    d.start(contract(4_000, None)).unwrap();
+    let out = d.run().unwrap();
+    assert_eq!(out.gate, Gate::Escalate(Reason::Budget));
+    assert_eq!(kinds(&s), ["coder"], "the retry that did not fit never ran");
+    assert_eq!(out.tokens_used, 2_000);
+    assert!(retries(&l.state().unwrap()).is_empty());
+    // The goal's pot is a hard stop for the retry too.
+    let (s, make) = script(&[("coder", vec![times_out(Some(2_000)), text("never", 1)])]);
+    let (lg, _dir) = log("retry-pot");
+    let d = driver(lg, make, 1_000_000);
+    d.start(contract(100_000, None)).unwrap();
+    d.pot.charge(996_000);
+    let out = d.run().unwrap();
+    assert_eq!(out.gate, Gate::Escalate(Reason::Budget));
+    assert_eq!(kinds(&s), ["coder"]);
 }
 
 #[test]
@@ -825,4 +1039,151 @@ fn the_factory_builds_providers_with_the_configured_request_timeout() {
     // `factory` builds through the same function.
     let make = factory(cfg, secrets(), secs(33));
     let _ = make(Some("other"), "sys");
+}
+
+// ------------------------------------------------ a timeout is charged (#804)
+
+/// The estimate the driver reserves for the first call of the coder: read
+/// off a run whose first call times out under a big budget.
+fn first_estimate(tag: &str) -> u64 {
+    let (_, make) = script(&[("coder", vec![times_out(None), text("ok", 1)])]);
+    let l = log(tag);
+    let d = driver(l.clone(), make, 10_000_000);
+    d.start(contract(1_000_000, Some(1))).unwrap();
+    d.run().unwrap();
+    let st = l.state().unwrap();
+    let first = st
+        .reservations
+        .values()
+        .find(|r| r.what == "participant-coder" && r.retry_of.is_none())
+        .unwrap();
+    first.tokens
+}
+
+fn charged(st: &State) -> Vec<(String, u64)> {
+    st.reservations
+        .values()
+        .filter_map(|r| r.charged.clone().map(|why| (why, r.settled.unwrap())))
+        .collect()
+}
+
+#[test]
+fn a_timed_out_call_with_no_usage_is_charged_its_estimate_and_says_why() {
+    let est = first_estimate("charge-est");
+    assert!(est > 100, "the estimate is not the 0 of a free call: {est}");
+    let (_, make) = script(&[("coder", vec![times_out(None), text("late", 10)])]);
+    let l = log("charge-one");
+    let d = driver(l.clone(), make, 10_000_000);
+    d.start(contract(1_000_000, None)).unwrap();
+    d.run().unwrap();
+    let st = l.state().unwrap();
+    assert_eq!(charged(&st), [("timeout".to_string(), est)]);
+    // The charge reaches the ledger and the goal's pot alike.
+    assert!(st.tokens_used >= est + 10);
+    assert_eq!(d.pot.used(), st.tokens_used);
+}
+
+#[test]
+fn a_reported_usage_still_wins_over_the_estimate_on_a_timeout() {
+    let (_, make) = script(&[("coder", vec![times_out(Some(40)), text("ok", 60)])]);
+    let l = log("charge-usage");
+    let d = driver(l.clone(), make, 10_000_000);
+    d.start(contract(1_000_000, Some(1))).unwrap();
+    d.run().unwrap();
+    assert!(charged(&l.state().unwrap()).is_empty());
+}
+
+#[test]
+fn two_timeouts_cost_two_estimates_and_the_budget_stops_the_discussion() {
+    let est = first_estimate("charge-two-est");
+    // Room for two estimates, not three.
+    let (s, make) = script(&[("coder", vec![times_out(None), times_out(None)])]);
+    let l = log("charge-two");
+    let d = driver(l.clone(), make, 10_000_000);
+    d.start(contract(2 * est + 10, None)).unwrap();
+    let e = d.run().unwrap_err();
+    assert!(e.contains("timeout"), "{e}");
+    assert_eq!(kinds(&s), ["coder", "coder"]);
+    let st = l.state().unwrap();
+    assert_eq!(st.tokens_used, 2 * est, "not 0: two estimates");
+    assert_eq!(d.pot.used(), 2 * est, "the goal's pot is charged too");
+    assert_eq!(retries(&st).len(), 1);
+    assert_eq!(charged(&st).len(), 2);
+    // Resume: a third call no longer fits; the existing escalation stops it,
+    // and nothing already settled is charged again.
+    let out = d.run().unwrap();
+    assert_eq!(out.gate, Gate::Escalate(Reason::Budget));
+    assert_eq!(kinds(&s), ["coder", "coder"], "no third call was made");
+    assert_eq!(out.tokens_used, 2 * est, "resume does not double charge");
+    assert_eq!(l.state().unwrap().tokens_used, 2 * est);
+    assert_eq!(d.pot.used(), 2 * est);
+}
+
+#[test]
+fn a_retry_that_does_not_fit_after_a_charged_timeout_is_the_budget_stop() {
+    let est = first_estimate("charge-fit-est");
+    let (s, make) = script(&[("coder", vec![times_out(None), text("never", 1)])]);
+    let l = log("charge-fit");
+    let d = driver(l.clone(), make, 10_000_000);
+    d.start(contract(2 * est - 1, None)).unwrap();
+    let out = d.run().unwrap();
+    assert_eq!(out.gate, Gate::Escalate(Reason::Budget));
+    assert_eq!(kinds(&s), ["coder"]);
+    assert_eq!(out.tokens_used, est);
+}
+
+#[test]
+fn a_failure_before_the_request_left_is_not_charged() {
+    for (i, msg) in ["connection failed", "host not found", "rustls: bad cert"]
+        .into_iter()
+        .enumerate()
+    {
+        let (s, make) = script(&[("coder", vec![fails_with(msg, None)])]);
+        let l = log(&format!("charge-pre-{i}"));
+        let d = driver(l.clone(), make, 10_000_000);
+        d.start(contract(100_000, Some(1))).unwrap();
+        d.run().unwrap_err();
+        assert_eq!(kinds(&s), ["coder"], "{msg}");
+        let st = l.state().unwrap();
+        assert_eq!(st.tokens_used, 0, "{msg}");
+        assert!(charged(&st).is_empty(), "{msg}");
+        assert_eq!(d.pot.used(), 0, "{msg}");
+    }
+    // A connect timeout is retried like any timeout, and still free.
+    let (s, make) = script(&[(
+        "coder",
+        vec![
+            fails_with("timeout: connect", None),
+            fails_with("timeout: connect", None),
+        ],
+    )]);
+    let l = log("charge-pre-connect");
+    let d = driver(l.clone(), make, 10_000_000);
+    d.start(contract(100_000, Some(1))).unwrap();
+    d.run().unwrap_err();
+    assert_eq!(kinds(&s), ["coder", "coder"]);
+    assert_eq!(l.state().unwrap().tokens_used, 0);
+}
+
+#[test]
+fn any_other_failure_without_usage_after_the_send_is_charged_unreported() {
+    let est = first_estimate("charge-other-est");
+    for (i, msg) in [
+        "io: Connection reset by peer",
+        "http status: 502 \u{2014} bad gateway",
+        "stream read: timed out",
+        "unheard of",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (_, make) = script(&[("coder", vec![fails_with(msg, None)])]);
+        let l = log(&format!("charge-other-{i}"));
+        let d = driver(l.clone(), make, 10_000_000);
+        d.start(contract(100_000, Some(1))).unwrap();
+        d.run().unwrap_err();
+        let st = l.state().unwrap();
+        assert_eq!(charged(&st), [("unreported".to_string(), est)], "{msg}");
+        assert_eq!(d.pot.used(), est, "{msg}");
+    }
 }

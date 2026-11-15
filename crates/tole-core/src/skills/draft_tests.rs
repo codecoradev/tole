@@ -35,10 +35,9 @@ fn rules(f: &[Finding]) -> Vec<&str> {
     f.iter().map(|f| f.rule.as_str()).collect()
 }
 
-fn tmp(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("tole-draft-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    d
+use crate::test_dir::TestDir;
+fn tmp(tag: &str) -> TestDir {
+    TestDir::new(&format!("tole-draft-{tag}"))
 }
 
 #[test]
@@ -199,7 +198,8 @@ fn taint_records_only_untrusted_tools_and_is_shared_by_clones() {
 
 #[test]
 fn the_store_keeps_drafts_apart_from_skills_and_decides_once() {
-    let store = DraftStore::new(tmp("store").join(DRAFTS_DIR));
+    let scratch = tmp("store");
+    let store = DraftStore::new(scratch.join(DRAFTS_DIR));
     let (d, md) = gate(&proposal(good()), &ctx(), &SecretSet::default()).unwrap();
     store.create(&d, &md).unwrap();
     assert!(store.create(&d, &md).is_err(), "never overwritten");
@@ -219,7 +219,8 @@ fn the_store_keeps_drafts_apart_from_skills_and_decides_once() {
 
 #[test]
 fn an_unreadable_draft_is_skipped_by_list() {
-    let root = tmp("skip").join(DRAFTS_DIR);
+    let scratch = tmp("skip");
+    let root = scratch.join(DRAFTS_DIR);
     let store = DraftStore::new(&root);
     let (d, md) = gate(&proposal(good()), &ctx(), &SecretSet::default()).unwrap();
     store.create(&d, &md).unwrap();
@@ -238,7 +239,8 @@ fn promotion() -> Promotion {
 
 #[test]
 fn promote_and_revoke_move_a_draft_along_one_path() {
-    let store = DraftStore::new(tmp("promote").join(DRAFTS_DIR));
+    let scratch = tmp("promote");
+    let store = DraftStore::new(scratch.join(DRAFTS_DIR));
     let (d, md) = gate(&proposal(good()), &ctx(), &SecretSet::default()).unwrap();
     store.create(&d, &md).unwrap();
     assert!(store.decide(&d.id, DraftStatus::Promoted).is_err());
@@ -255,7 +257,8 @@ fn promote_and_revoke_move_a_draft_along_one_path() {
 
 #[test]
 fn drafts_are_found_by_a_source_session() {
-    let store = DraftStore::new(tmp("bysession").join(DRAFTS_DIR));
+    let scratch = tmp("bysession");
+    let store = DraftStore::new(scratch.join(DRAFTS_DIR));
     let (a, am) = gate(&proposal(good()), &ctx(), &SecretSet::default()).unwrap();
     store.create(&a, &am).unwrap();
     let mut c = ctx();

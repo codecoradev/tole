@@ -46,6 +46,51 @@ pub fn leading_error(message: &str) -> &str {
         .map_or(message, |(head, _)| head)
 }
 
+/// Is this error the provider's own request timeout (#756)? Only the
+/// transport's `timeout: <phase>` text counts, as the whole message or after
+/// the `json: ` prefix of a reply cut while it was read. Anchored on purpose:
+/// an `http status: 504 ...` error (a 4xx/5xx the server answered, whatever
+/// its body says) and any other failure never qualify.
+pub fn is_timeout_error(message: &str) -> bool {
+    let m = leading_error(message).trim_start().to_ascii_lowercase();
+    let m = m.strip_prefix("json: ").unwrap_or(&m);
+    m.starts_with("timeout: ")
+}
+
+/// Error texts (lowercase prefixes of the error) that prove the request never
+/// left: the failure came before anything was sent. The list is closed on
+/// purpose: anything else is treated as sent.
+const NOT_SENT_PREFIXES: &[&str] = &[
+    "host not found",
+    "connection failed",
+    "timeout: resolve",
+    "timeout: connect",
+    "bad uri",
+    "invalid proxy url",
+    "connect proxy failed",
+    "tls required",
+    "configured for https only",
+    "rustls: ",
+    "native-tls: ",
+    "pem: ",
+    "model-capability error: the transcript has image input",
+];
+
+/// Could the request of a failed call have reached the provider (#804)? Then
+/// the provider may have generated, and billed, any part of the reply while
+/// reporting no usage to us: a host with a hard budget charges such a call
+/// its estimate. Conservative in the safe direction: only the closed list of
+/// pre-send failures (a refused connection, DNS, the TLS handshake, a
+/// rejected URL) says `false`; every other text, an unknown one included, and
+/// any failover chain (an earlier link may have sent) says `true`.
+pub fn request_may_have_been_sent(message: &str) -> bool {
+    if message.contains(FAILOVER_MARKER) {
+        return true;
+    }
+    let m = message.trim_start().to_ascii_lowercase();
+    !NOT_SENT_PREFIXES.iter().any(|p| m.starts_with(p))
+}
+
 /// Does this provider error mean "provider unavailable" (fail over) rather
 /// than "request wrong" (fail loud)?
 pub fn is_failover_error(message: &str) -> bool {
@@ -455,5 +500,68 @@ mod tests {
         let route = f.last_route().unwrap();
         assert_eq!(route["provider"], "primary");
         assert_eq!(route["failover"]["from"], "reserve");
+    }
+
+    #[test]
+    fn only_the_transports_own_timeout_is_a_timeout_error() {
+        for yes in [
+            "timeout: global",
+            "timeout: recv body",
+            "Timeout: global",
+            "json: timeout: global at line 1 column 1",
+            "timeout: global [after failover from primary: io: refused]",
+        ] {
+            assert!(is_timeout_error(yes), "{yes}");
+        }
+        for no in [
+            "",
+            "http status: 504 \u{2014} gateway timeout",
+            "http status: 429 \u{2014} timeout: global",
+            "http status: 408 \u{2014} request timeout",
+            "io: Connection reset",
+            "stream read: timed out",
+            "malformed response: timeout: global",
+            "the call timeout: global was mentioned",
+            "model-capability error: timeout: global",
+        ] {
+            assert!(!is_timeout_error(no), "{no}");
+        }
+    }
+
+    #[test]
+    fn only_a_failure_before_the_send_is_known_not_to_have_been_sent() {
+        for not_sent in [
+            "host not found",
+            "connection failed",
+            "timeout: resolve",
+            "timeout: connect",
+            "Host Not Found",
+            "rustls: invalid certificate",
+            "bad uri: nope",
+            "model-capability error: the transcript has image input but model m is declared non-vision",
+        ] {
+            assert!(!request_may_have_been_sent(not_sent), "{not_sent}");
+        }
+        for sent in [
+            "timeout: global",
+            "timeout: receive response",
+            "timeout: per read",
+            "json: timeout: global at line 1 column 1",
+            "io: Connection reset by peer",
+            "io: connection failed",
+            "stream read: timed out",
+            "http status: 500 \u{2014} boom",
+            "malformed response: no choices[0].message",
+            "provider call thread died",
+            "something nobody has seen before",
+            "",
+            // A failover chain: an earlier link may have sent.
+            "connection failed [after failover from primary: timeout: global]",
+            // The marker words later in a message do not anchor.
+            "the host not found it",
+            "http status: 502 \u{2014} connection failed",
+        ] {
+            assert!(request_may_have_been_sent(sent), "{sent}");
+        }
     }
 }

@@ -6,20 +6,18 @@
 //! - All ops through the `Storage` trait (callers use `dyn Storage` here to
 //!   prove no backend-specific code leaks).
 
+#[path = "support/test_dir.rs"]
+mod test_dir;
 use serde_json::json;
+use test_dir::TestDir;
 
 use tole_core::entry::{EntryType, NewEntry};
 use tole_core::register::{is_valid_namespace, RegisterWrite};
 use tole_core::state::{Pc, StateTransition};
 use tole_core::storage::{Commit, JsonlStorage, Storage, StorageError, UsageRecord};
 
-fn tmpdir(tag: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("tole-e1-{}-{}", tag, std::process::id()));
-    // Clear any stale dir from a previous run of the same pid — leftover
-    // state must never leak between tests (CodeCora scan 2026-09-18).
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+fn tmpdir(tag: &str) -> TestDir {
+    TestDir::new(&format!("tole-e1-{tag}"))
 }
 
 fn message(payload: serde_json::Value) -> NewEntry {

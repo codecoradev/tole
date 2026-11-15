@@ -4,6 +4,8 @@
 //! End to end with the REAL binary and a mock provider that echoes the
 //! model it was asked for.
 
+mod common;
+use common::TestDir;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -106,16 +108,8 @@ fn tole(url: &str, args: &[&str], stdin: &str) -> (String, String, i32) {
 }
 
 /// A settled session whose model was picked in ACP.
-fn picked_session(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "tole-session-model-{tag}-{}-{:x}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+fn picked_session(tag: &str) -> TestDir {
+    let dir = TestDir::new(&format!("tole-session-model-{tag}"));
     let mut s = JsonlStorage::create(&dir, "s-picked", None).unwrap();
     s.commit(Commit::new().register(RegisterWrite::set("fact", "model", json!("picked-model"))))
         .unwrap();

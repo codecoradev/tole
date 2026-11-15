@@ -1,7 +1,10 @@
 //! E3 — Tier A tests: provider abstraction, tool registry, and the full
 //! turn loop on the mock provider (no network, deterministic, fast).
 
+#[path = "support/test_dir.rs"]
+mod test_dir;
 use serde_json::{json, Value};
+use test_dir::TestDir;
 use tole_core::approval::AllowlistApprover;
 use tole_core::entry::Entry;
 use tole_core::mock::MockProvider;
@@ -49,16 +52,8 @@ impl Tool for WriteTool {
     }
 }
 
-fn tmpdir(name: &str) -> std::path::PathBuf {
-    // Unique PER CALL (pid + monotonic counter): two tests sharing a tag
-    // (e.g. "unknown") must never remove_dir_all each other's directory
-    // when the harness runs them in parallel.
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let d = std::env::temp_dir().join(format!("cora-e3-{}-{}-{n:x}", name, std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+fn tmpdir(name: &str) -> TestDir {
+    TestDir::new(&format!("cora-e3-{name}"))
 }
 
 /// Mock that reports provider usage like OpenAI does.
@@ -1247,12 +1242,8 @@ struct GateScript {
 /// Build a gate hook command line: a sh script that emits `reason` and
 /// exits with `code`. Returns (command_line, _dir_keepalive).
 #[cfg(feature = "shell-tools")]
-fn gate_cmd(g: &GateScript) -> (String, std::path::PathBuf) {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static SEQ: AtomicU32 = AtomicU32::new(0);
-    let n = SEQ.fetch_add(1, Ordering::SeqCst);
-    let dir = std::env::temp_dir().join(format!("tole-gate-{}-{n}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+fn gate_cmd(g: &GateScript) -> (String, TestDir) {
+    let dir = TestDir::new("tole-gate");
     let path = dir.join("gate.sh");
     std::fs::write(
         &path,
@@ -1304,9 +1295,10 @@ fn stop_gate_deny_blocks_final_and_forces_continuation() {
     let dir = tmpdir("gate-deny");
     let mut s = JsonlStorage::create(&dir, "gd", None).unwrap();
     // stateful gate: first run exits 2, later runs exit 0
-    let counter = std::env::temp_dir().join(format!("tole-gate-count-{}", std::process::id()));
+    let scratch = TestDir::new("tole-gate-count");
+    let counter = scratch.join("counter");
     let _ = std::fs::remove_file(&counter);
-    let gate = std::env::temp_dir().join(format!("tole-gate-once-{}", std::process::id()));
+    let gate = scratch.join("gate.sh");
     std::fs::write(
         &gate,
         format!(
@@ -1432,9 +1424,10 @@ fn stop_gate_nonzero_exit_denies_with_stdout_reason() {
     let dir = tmpdir("gate-nonzero");
     let mut s = JsonlStorage::create(&dir, "gnz", None).unwrap();
     // stateful gate: first run exits 101 (verdict), later runs pass
-    let counter = std::env::temp_dir().join(format!("tole-gate-nz-{}", std::process::id()));
+    let scratch = TestDir::new("tole-gate-nz");
+    let counter = scratch.join("counter");
     let _ = std::fs::remove_file(&counter);
-    let gate = std::env::temp_dir().join(format!("tole-gate-nzsh-{}", std::process::id()));
+    let gate = scratch.join("gate.sh");
     std::fs::write(
         &gate,
         format!(
@@ -1477,9 +1470,10 @@ fn stop_gate_payload_is_per_turn_not_history() {
     let dir = tmpdir("gate-perturn");
     let mut s = JsonlStorage::create(&dir, "gpt", None).unwrap();
     // Gate script: dump the payload's tools array, then pass.
-    let dump = std::env::temp_dir().join(format!("tole-gate-dump-{}", std::process::id()));
+    let scratch = TestDir::new("tole-gate-dump");
+    let dump = scratch.join("dump");
     let _ = std::fs::remove_file(&dump);
-    let gate = std::env::temp_dir().join(format!("tole-gate-dumpsh-{}", std::process::id()));
+    let gate = scratch.join("gate.sh");
     std::fs::write(
         &gate,
         format!(
@@ -1546,9 +1540,10 @@ fn stop_gate_payload_keeps_tools_across_own_denial() {
     // just re-finalizing.
     let dir = tmpdir("gate-feedback");
     let mut s = JsonlStorage::create(&dir, "gfb", None).unwrap();
-    let dump = std::env::temp_dir().join(format!("tole-gate-fb-{}", std::process::id()));
+    let scratch = TestDir::new("tole-gate-fb");
+    let dump = scratch.join("dump");
     let _ = std::fs::remove_file(&dump);
-    let gate = std::env::temp_dir().join(format!("tole-gate-fbsh-{}", std::process::id()));
+    let gate = scratch.join("gate.sh");
     std::fs::write(
         &gate,
         format!("#!/bin/sh\ntee -a {} >/dev/null\nexit 2\n", dump.display()),

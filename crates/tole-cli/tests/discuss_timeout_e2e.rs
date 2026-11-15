@@ -2,18 +2,16 @@
 //! a provider that answers participants only after a delay. A timeout below
 //! the delay fails the turn with `timeout`; a larger one lets it finish.
 
+mod common;
+use common::TestDir;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
-fn tmp(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("tole-disc-timeout-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d.canonicalize().unwrap()
+fn tmp(tag: &str) -> TestDir {
+    TestDir::new(&format!("tole-disc-timeout-{tag}"))
 }
 
 /// A provider whose participant turns take `delay` to answer (the checker is
@@ -82,7 +80,7 @@ fn spawn_slow_mock(delay: Duration) -> String {
     format!("http://{addr}/v1")
 }
 
-fn home(tag: &str, user_config: &str) -> PathBuf {
+fn home(tag: &str, user_config: &str) -> TestDir {
     let home = tmp(tag);
     std::fs::create_dir_all(home.join("tole")).unwrap();
     std::fs::write(
@@ -93,7 +91,7 @@ fn home(tag: &str, user_config: &str) -> PathBuf {
     home
 }
 
-fn discuss(home: &PathBuf, base: &str, timeout_env: Option<&str>) -> Output {
+fn discuss(home: &std::path::Path, base: &str, timeout_env: Option<&str>) -> Output {
     let mut c = Command::new(env!("CARGO_BIN_EXE_tole"));
     c.args([
         "discuss",

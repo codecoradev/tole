@@ -3,18 +3,13 @@
 //! environment (the child gets an explicit cwd and its own env, with an
 //! empty `CODECORA_HOME` so no user config leaks in).
 
+mod common;
+use common::TestDir;
 use std::path::Path;
-use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicU64, Ordering};
 
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-fn tmpdir() -> PathBuf {
-    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let d = std::env::temp_dir().join(format!("tole-cfg-e2e-{}-{n}", std::process::id()));
-    std::fs::create_dir_all(&d).unwrap();
-    d
+fn tmpdir() -> TestDir {
+    TestDir::new("tole-cfg-e2e")
 }
 
 fn tole(cwd: &Path, args: &[&str]) -> Output {

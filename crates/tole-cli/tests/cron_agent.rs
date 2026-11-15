@@ -3,6 +3,8 @@
 //! standalone, parked in `/approvals` under serve), budgets, model pin.
 #![cfg(feature = "shell-tools")]
 
+mod common;
+use common::TestDir;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -140,11 +142,10 @@ fn provider() {
     });
 }
 
-fn tmp(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("tole-cron-agent-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
+fn tmp(tag: &str) -> TestDir {
+    let d = TestDir::new(&format!("tole-cron-agent-{tag}"));
     std::fs::create_dir_all(d.join("w")).unwrap();
-    d.canonicalize().unwrap()
+    d
 }
 
 /// The job's workdir: next to the cron dir `dir`, never holding it (a run
@@ -698,7 +699,7 @@ fn a_planted_session_symlink_or_fifo_refuses_the_resume() {
         }
         queue.decide(&queue.list(Some(&session))[0].id, true);
         let (tx, rx) = std::sync::mpsc::channel();
-        let (d, s) = (dir.clone(), session.clone());
+        let (d, s) = (dir.to_path_buf(), session.clone());
         let q = Arc::clone(&queue);
         std::thread::spawn(move || {
             let o = TickOptions {
@@ -741,7 +742,8 @@ fn a_session_swapped_after_the_resume_check_is_refused_at_the_open() {
         queue.decide(&queue.list(Some(&session))[0].id, true);
         let file = work(&dir).join(format!(".tole/sessions/{session}.jsonl"));
         // The swap, after the check.
-        let outside = tmp(&format!("resume-race-{planted}-outside")).join("parked.jsonl");
+        let outside_dir = tmp(&format!("resume-race-{planted}-outside"));
+        let outside = outside_dir.join("parked.jsonl");
         std::fs::rename(&file, &outside).unwrap();
         let _ =
             std::fs::remove_file(work(&dir).join(format!(".tole/sessions/{session}.jsonl.lock")));

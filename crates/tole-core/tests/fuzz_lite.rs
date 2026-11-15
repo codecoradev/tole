@@ -8,7 +8,10 @@
 //! subprocess), so the whole file is gated (#310).
 #![cfg(feature = "shell-tools")]
 
+#[path = "support/test_dir.rs"]
+mod test_dir;
 use serde_json::{json, Value};
+use test_dir::TestDir;
 use tole_core::file_tools::{DeleteFileTool, EditFileTool};
 use tole_core::git::GitTool;
 use tole_core::read_file::ReadFileTool;
@@ -16,11 +19,8 @@ use tole_core::run_command::RunCommandTool;
 use tole_core::subprocess::check_destructive_argv;
 use tole_core::tool::Tool;
 
-fn tmpdir(tag: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("tole-fuzz-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+fn tmpdir(tag: &str) -> TestDir {
+    TestDir::new(&format!("tole-fuzz-{tag}"))
 }
 
 /// Tiny deterministic LCG — same corpus every run.
@@ -132,11 +132,11 @@ fn tools_never_panic_on_hostile_input() {
     let dir = tmpdir("hostile");
     let mut rng = Lcg(0x746f6c65); // "tole"
     let strings = hostile_strings();
-    let read = ReadFileTool::new(dir.clone());
-    let edit = EditFileTool::new(dir.clone());
-    let delete = DeleteFileTool::new(dir.clone());
-    let git = GitTool::new().in_dir(dir.clone());
-    let run = RunCommandTool::new(dir.clone());
+    let read = ReadFileTool::new(dir.to_path_buf());
+    let edit = EditFileTool::new(dir.to_path_buf());
+    let delete = DeleteFileTool::new(dir.to_path_buf());
+    let git = GitTool::new().in_dir(dir.to_path_buf());
+    let run = RunCommandTool::new(dir.to_path_buf());
 
     for i in 0..400 {
         let input = hostile_json(&mut rng, &strings, 3);

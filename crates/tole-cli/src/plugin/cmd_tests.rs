@@ -49,6 +49,7 @@ const LIST: PluginAction = PluginAction::List { json: true };
 /// A user lock under `dir/data`, a workspace `dir/ws`, and the secret
 /// `TOLE_T599_TOKEN` known to the redactor.
 struct H {
+    _guard: crate::test_dir::TestDir,
     dir: PathBuf,
     specs: Vec<McpServerConfig>,
     grants: std::cell::RefCell<Vec<String>>,
@@ -66,9 +67,7 @@ struct H {
 
 impl H {
     fn new(tag: &str, names: &[&str]) -> Self {
-        let dir =
-            std::env::temp_dir().join(format!("tole-plugin-cmd-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = crate::test_dir::TestDir::new(&format!("tole-plugin-cmd-{tag}"));
         std::fs::create_dir_all(dir.join("ws")).unwrap();
         std::fs::create_dir_all(dir.join("data")).unwrap();
         let specs = names
@@ -77,6 +76,7 @@ impl H {
             .collect();
         Self {
             dir: dir.canonicalize().unwrap(),
+            _guard: dir,
             specs,
             grants: Default::default(),
             probe: true,

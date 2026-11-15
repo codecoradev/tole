@@ -1,6 +1,8 @@
 //! `tole cron` (#579): job store, script runs, tick loop, recovery.
 #![cfg(feature = "shell-tools")]
 
+mod common;
+use common::TestDir;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -11,11 +13,8 @@ use tole_core::ledger::{DeliveryStatus, Due, Lease, RunStatus};
 const T: i64 = 1_767_225_600;
 const OPTS: TickOptions = TickOptions::standalone(4);
 
-fn tmp(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("tole-cron-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+fn tmp(tag: &str) -> TestDir {
+    TestDir::new(&format!("tole-cron-{tag}"))
 }
 
 fn script(dir: &Path, id: &str, schedule: &str, line: &str) -> CreateSpec {

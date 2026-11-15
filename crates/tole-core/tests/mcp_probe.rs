@@ -7,17 +7,17 @@
 
 #![cfg(target_os = "linux")]
 
-use std::path::{Path, PathBuf};
+#[path = "support/test_dir.rs"]
+mod test_dir;
+use std::path::Path;
 use std::time::{Duration, Instant};
+use test_dir::TestDir;
 use tole_core::mcp::{probe_manifest, probe_manifest_within, McpServerConfig};
 
 const SECRET: &str = "probe-secret-0123456789abcdef";
 
-fn dir(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("tole-probe-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+fn dir(tag: &str) -> TestDir {
+    TestDir::new(&format!("tole-probe-{tag}"))
 }
 
 fn cfg(d: &Path, mode: &str) -> McpServerConfig {

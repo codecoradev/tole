@@ -42,7 +42,7 @@ use tole_core::discussion::{
 };
 use tole_core::discussion_log::{describe, DiscussionLog, Next, Reserve, State};
 use tole_core::entry::{Entry, EntryType};
-use tole_core::provider::{Provider, ProviderOutput};
+use tole_core::provider::{Provider, ProviderError, ProviderOutput};
 use tole_core::secrets::SecretSet;
 
 use crate::config::Config;
@@ -269,6 +269,9 @@ fn now_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+/// A settled provider call: its ledger call id and the provider's answer.
+type Attempted = (String, Result<ProviderOutput, ProviderError>);
+
 /// What a call came back with.
 enum Called {
     Text(String),
@@ -483,7 +486,13 @@ impl Driver {
 
     /// Reserves `need` tokens for a call in the ledger: its call id, or
     /// `None` when it does not fit (the escalation is then recorded).
-    fn admit(&self, round: u32, what: &str, need: u64) -> Result<Option<String>, String> {
+    fn admit(
+        &self,
+        round: u32,
+        what: &str,
+        need: u64,
+        retry_of: Option<&str>,
+    ) -> Result<Option<String>, String> {
         // The pot cannot fit it: ask for more than any budget, so the ledger
         // records the escalation.
         let ask = if need > self.pot.left() {
@@ -491,7 +500,12 @@ impl Driver {
         } else {
             need
         };
-        Ok(match self.log.reserve(round, what, ask, (self.now)())? {
+        let now = (self.now)();
+        let reserved = match retry_of {
+            None => self.log.reserve(round, what, ask, now)?,
+            Some(of) => self.log.reserve_retry(round, what, ask, of, now)?,
+        };
+        Ok(match reserved {
             Reserve::Go(call) => Some(call),
             Reserve::Stop(_) => None,
         })
@@ -524,7 +538,7 @@ impl Driver {
                     }
                     _ => {
                         let need = (task.len() as u64 / 4).max(INDEPENDENT_MIN_TOKENS);
-                        let Some(call) = self.admit(round, &what, need)? else {
+                        let Some(call) = self.admit(round, &what, need, None)? else {
                             return Ok(None);
                         };
                         (call, need)
@@ -556,7 +570,13 @@ impl Driver {
         }
     }
 
-    /// One provider call, paid for in the ledger and the pot.
+    /// One provider call, paid for in the ledger and the pot. With `retry`
+    /// (participant turns and the scribe), a call that failed with the
+    /// provider's own timeout (and only that) is made once more (#756): the
+    /// retry is a call like any other, reserved against the same budget (a
+    /// retry that does not fit is the budget stop), settled, and recorded in
+    /// the ledger as the retry of the timed-out call. A second timeout, or
+    /// any other failure, is returned as before.
     fn call(
         &self,
         round: u32,
@@ -564,7 +584,45 @@ impl Driver {
         model: Option<&str>,
         request: &[(&'static str, String)],
         reply: u64,
+        retry: bool,
     ) -> Result<Result<Called, Failed>, String> {
+        let mut retry_of: Option<String> = None;
+        loop {
+            let (call, out) = match self.attempt(round, what, model, request, reply, &retry_of)? {
+                Some(done) => done,
+                None => return Ok(Ok(Called::Stopped)),
+            };
+            if let Err(e) = &out {
+                if retry && retry_of.is_none() && tole_core::failover::is_timeout_error(&e.0) {
+                    self.note(format!(
+                        "round {round}: the {what} call timed out; retrying it once"
+                    ));
+                    retry_of = Some(call);
+                    continue;
+                }
+            }
+            return Ok(match out {
+                Ok(ProviderOutput::Final { text }) => Ok(Called::Text(text)),
+                Ok(_) => Err(Failed::ToolCall),
+                Err(e) => Err(Failed::Provider(format!(
+                    "the provider failed: {}",
+                    discussion::sanitize(&e.0, &self.secrets, 300).text
+                ))),
+            });
+        }
+    }
+
+    /// One reserved, settled provider call: its call id and what came back,
+    /// or `None` when it does not fit the budget.
+    fn attempt(
+        &self,
+        round: u32,
+        what: &str,
+        model: Option<&str>,
+        request: &[(&'static str, String)],
+        reply: u64,
+        retry_of: &Option<String>,
+    ) -> Result<Option<Attempted>, String> {
         let system = request
             .iter()
             .find(|(r, _)| *r == "system")
@@ -574,8 +632,8 @@ impl Driver {
             .find(|(r, _)| *r == "user")
             .map_or("", |(_, s)| s);
         let need = ((system.len() + user.len()) / 4) as u64 + reply;
-        let Some(call) = self.admit(round, what, need)? else {
-            return Ok(Ok(Called::Stopped));
+        let Some(call) = self.admit(round, what, need, retry_of.as_deref())? else {
+            return Ok(None);
         };
         let sent = Entry {
             seq: 1,
@@ -588,22 +646,36 @@ impl Driver {
         let mut provider = (self.make)(model, system);
         let out = provider.complete(std::slice::from_ref(&sent));
         // What was spent is counted, whatever the outcome; with no usage
-        // reported, the estimate.
-        let spent = match provider.last_usage() {
-            Some(u) => crate::advisor_host::tokens(&u),
-            None if out.is_ok() => need,
-            None => 0,
+        // reported, the estimate. That includes a failure after the request
+        // may have left (a timeout above all): the provider can have
+        // generated, and billed, the reply before we gave up, so the call
+        // is charged its estimate, like a crashed one (#804). Only a failure
+        // that provably came before anything was sent costs nothing.
+        let spent = match (provider.last_usage(), &out) {
+            (Some(u), _) => {
+                let spent = crate::advisor_host::tokens(&u);
+                self.log.settle(&call, spent, (self.now)())?;
+                spent
+            }
+            (None, Ok(_)) => {
+                self.log.settle(&call, need, (self.now)())?;
+                need
+            }
+            (None, Err(e)) if tole_core::failover::request_may_have_been_sent(&e.0) => {
+                let why = if tole_core::failover::is_timeout_error(&e.0) {
+                    "timeout"
+                } else {
+                    "unreported"
+                };
+                self.log.settle_charged(&call, why, (self.now)())?
+            }
+            (None, Err(_)) => {
+                self.log.settle(&call, 0, (self.now)())?;
+                0
+            }
         };
-        self.log.settle(&call, spent, (self.now)())?;
         self.pot.charge(spent);
-        Ok(match out {
-            Ok(ProviderOutput::Final { text }) => Ok(Called::Text(text)),
-            Ok(_) => Err(Failed::ToolCall),
-            Err(e) => Err(Failed::Provider(format!(
-                "the provider failed: {}",
-                discussion::sanitize(&e.0, &self.secrets, 300).text
-            ))),
-        })
+        Ok(Some((call, out)))
     }
 
     fn contribute(&self, st: &State, round: u32, who: &str) -> Result<(), String> {
@@ -637,6 +709,7 @@ impl Driver {
             voice.model.as_deref(),
             &req,
             PARTICIPANT_REPLY_TOKENS,
+            true,
         )? {
             Ok(Called::Stopped) => return Ok(()),
             Ok(Called::Text(t)) => t,
@@ -680,6 +753,7 @@ impl Driver {
             self.scribe.as_deref(),
             &req,
             SCRIBE_REPLY_TOKENS,
+            true,
         )? {
             Ok(Called::Stopped) => return Ok(()),
             Ok(Called::Text(raw)) => {
@@ -711,6 +785,7 @@ impl Driver {
             self.checker.as_deref(),
             &req,
             CHECKER_REPLY_TOKENS,
+            false,
         )? {
             Ok(Called::Stopped) => return Ok(()),
             Ok(Called::Text(raw)) => {

@@ -3,8 +3,11 @@
 //! names it; replay from the log reproduces the provider's view exactly;
 //! an old raw log still loads unchanged.
 
+#[path = "support/test_dir.rs"]
+mod test_dir;
 use base64::Engine;
 use serde_json::{json, Value};
+use test_dir::TestDir;
 use tole_core::entry::{Entry, EntryType, NewEntry};
 use tole_core::openai::{OpenAiConfig, OpenAiProvider};
 use tole_core::provider::{Provider, ProviderError, ProviderOutput};
@@ -21,13 +24,8 @@ fn set() -> SecretSet {
     SecretSet::default().with(NAME, V)
 }
 
-fn tmpdir(tag: &str) -> std::path::PathBuf {
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let d = std::env::temp_dir().join(format!("tole-596-{tag}-{}-{n}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+fn tmpdir(tag: &str) -> TestDir {
+    TestDir::new(&format!("tole-596-{tag}"))
 }
 
 /// Every form of `V` a sink could carry.

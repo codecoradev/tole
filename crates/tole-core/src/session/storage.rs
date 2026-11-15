@@ -1561,17 +1561,8 @@ mod poison_tests {
     use serde_json::json;
     use std::fs::OpenOptions;
 
-    /// Unique per invocation: pid alone collides across concurrent or
-    /// pid-reusing runs sharing the temp dir.
-    fn uniq_dir(tag: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "tole-{tag}-{}-{:x}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ))
+    fn uniq_dir(tag: &str) -> crate::test_dir::TestDir {
+        crate::test_dir::TestDir::new(&format!("tole-{tag}"))
     }
 
     fn msg(v: Value) -> NewEntry {

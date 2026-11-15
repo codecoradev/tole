@@ -4,11 +4,13 @@
 //! provider answers with the system message it received.
 #![cfg(all(unix, feature = "shell-tools"))]
 
+mod common;
+use common::TestDir;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
@@ -77,9 +79,8 @@ fn spawn_mock() -> String {
 /// A workspace with four skills and a fake `uteke` whose semantic search
 /// returns `beta` (0.9), `gamma` (0.2, below the floor) and `delta` (0.8,
 /// retired). It logs every call.
-fn fixture(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("tole-skidx-e2e-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+fn fixture(tag: &str) -> TestDir {
+    let dir = TestDir::new(&format!("tole-skidx-e2e-{tag}"));
     for n in ["alpha", "beta", "gamma", "delta"] {
         let d = dir.join("ws").join("skills").join(n);
         std::fs::create_dir_all(&d).unwrap();

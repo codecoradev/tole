@@ -2,10 +2,13 @@
 //! classification is checked against real transport/HTTP error text) and
 //! the real turn loop (so the route lands in the durable usage ledger).
 
+#[path = "support/test_dir.rs"]
+mod test_dir;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::time::Duration;
+use test_dir::TestDir;
 use tole_core::failover::{is_failover_error, FailoverProvider, Link};
 use tole_core::openai::{OpenAiConfig, OpenAiProvider};
 use tole_core::provider::Provider;
@@ -100,11 +103,8 @@ fn real_error_text_is_classified() {
     );
 }
 
-fn tmpdir(tag: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("tole-failover-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+fn tmpdir(tag: &str) -> TestDir {
+    TestDir::new(&format!("tole-failover-{tag}"))
 }
 
 #[test]

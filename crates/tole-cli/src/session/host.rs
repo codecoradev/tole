@@ -584,20 +584,13 @@ fn log_outcome(outcome: &tole_core::turn::TurnOutcome) {
 mod eviction_tests {
     use super::*;
 
-    struct TmpDir(PathBuf);
+    struct TmpDir(crate::test_dir::TestDir);
     impl TmpDir {
         fn new(tag: &str) -> Self {
-            let d = std::env::temp_dir().join(format!("tole-evict-{tag}-{}", std::process::id()));
-            std::fs::create_dir_all(&d).unwrap();
-            Self(d)
+            Self(crate::test_dir::TestDir::new(&format!("tole-evict-{tag}")))
         }
         fn path(&self) -> &std::path::Path {
-            &self.0
-        }
-    }
-    impl Drop for TmpDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            self.0.path()
         }
     }
 
@@ -765,11 +758,9 @@ mod roster_tests {
     use tole_core::approval::AllowlistApprover;
     use tole_core::tool::Risk;
 
-    fn open(tag: &str, plan_mode: bool) -> SessionState {
-        let ws = std::env::temp_dir().join(format!("tole-sh-roster-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&ws);
-        std::fs::create_dir_all(&ws).unwrap();
-        open_session(
+    fn open(tag: &str, plan_mode: bool) -> (SessionState, crate::test_dir::TestDir) {
+        let ws = crate::test_dir::TestDir::new(&format!("tole-sh-roster-{tag}"));
+        let state = open_session(
             "s-roster",
             ws.to_str().unwrap(),
             false,
@@ -782,7 +773,8 @@ mod roster_tests {
             tole_core::cancel::CancelToken::default(),
             None,
         )
-        .unwrap()
+        .unwrap();
+        (state, ws)
     }
 
     /// #420: server sessions build their tools through the shared roster —
@@ -790,13 +782,13 @@ mod roster_tests {
     /// behind a non-interactive approver; plan mode leaves ReadOnly only).
     #[test]
     fn server_sessions_use_the_shared_roster() {
-        let s = open("full", false);
+        let (s, _ws) = open("full", false);
         assert!(s.registry.get("verify_package").is_some());
         assert!(s.registry.get("write_file").is_some());
         assert!(s.registry.get("todo_write").is_some());
         assert!(s.registry.get("delete_file").is_none());
 
-        let p = open("plan", true);
+        let (p, _ws2) = open("plan", true);
         assert!(p.registry.get("read_file").is_some());
         assert!(p.registry.get("todo_read").is_some());
         for name in ["write_file", "run_command", "agent_start", "todo_write"] {
