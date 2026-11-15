@@ -550,7 +550,8 @@ pub fn refusal(server: &str, a: &Admission) -> String {
         Admission::Changed { locked, live } => format!(
             "its tools or version changed since you approved them (approved {locked}, now {live}): \
              not registered. Start `tole` in a terminal to review the new tool list and re-approve \
-             it ({server})"
+             it, or run `tole plugin approve {server}` (a server that starts lazily is not \
+             offered at start-up) ({server})"
         ),
         Admission::Revoked => {
             format!("revoked in the plugin lock: its tools are not registered ({server})")
@@ -792,8 +793,16 @@ pub fn preflight(
         // A re-approval of changed tools never widens what the entry holds:
         // its grants, bundle and tier carry over. A new server holds no
         // secret unless it is the owner's own (first-party).
-        let (secrets, bundle, tier) = match gate.lock.get(&cfg.name) {
-            Some(e) => (Some(e.secrets.clone()), e.bundle.clone(), e.tier),
+        // Read from the USER lock, which the approval rewrites: the gate's
+        // view is narrowed by a project lock, and a repository's pin must
+        // never shrink what the user lock grants for good.
+        let held = gate
+            .user_path
+            .as_deref()
+            .and_then(|u| Lockfile::load(u).ok())
+            .and_then(|l| l.servers.get(&cfg.name).cloned());
+        let (secrets, bundle, tier) = match held {
+            Some(e) => (Some(e.secrets), e.bundle, e.tier),
             None => (
                 (job.tier != plugin_lock::Tier::FirstParty).then(Vec::new),
                 None,

@@ -317,6 +317,39 @@ fn a_changed_bundle_server_keeps_its_bundle_and_grant_when_re_approved() {
 }
 
 #[test]
+fn a_project_pin_never_shrinks_the_user_grant_on_a_re_approval() {
+    let f = Fixture::new("cora");
+    let held = vec!["GITHUB_TOKEN".to_string(), "OTHER_SECRET".to_string()];
+    f.gate()
+        .approve_with(
+            "cora",
+            &source_of(&f.cfg),
+            "1",
+            &old_tools(),
+            Approval {
+                secrets: Some(held.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    // A repository pins the same approval with ONE of the two grants.
+    let mut pin = f.lock_entry();
+    pin.secrets = vec!["GITHUB_TOKEN".into()];
+    let mut project = Lockfile::default();
+    project.servers.insert("cora".into(), pin);
+    project.save(&Lockfile::project_path(&f.ws)).unwrap();
+    let mut gate = f.gate();
+    let seen = f.prompts(&mut gate, true);
+    assert_eq!(seen.len(), 1, "offered once");
+    let e = f.lock_entry();
+    assert_eq!(e.secrets, held, "the user lock keeps both grants");
+    assert_eq!(
+        e.manifest_hash,
+        tole_core::plugin_lock::manifest_hash(&tools())
+    );
+}
+
+#[test]
 fn an_owner_who_declines_a_changed_server_changes_nothing() {
     let f = Fixture::new("cora");
     f.gate()

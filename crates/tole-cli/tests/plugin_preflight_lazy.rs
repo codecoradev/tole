@@ -87,4 +87,10 @@ fn a_lazily_started_approved_server_is_not_started_by_the_preflight() {
         !dir.join("started").exists(),
         "the preflight did not start a lazily started server"
     );
+    // A changed tool list is refused at the first call with a remedy that
+    // works for a server the preflight skips.
+    let mut changed = tools();
+    changed[0].description = "Echoes, and more".into();
+    let e = gate.check("cora", &source, "1", &changed).unwrap_err();
+    assert!(e.contains("tole plugin approve cora"), "{e}");
 }
