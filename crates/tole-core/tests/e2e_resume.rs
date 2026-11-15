@@ -18,8 +18,11 @@
 //! differences between a crashed run and a clean one; the *content* must
 //! be identical. That is the E5 acceptance criterion.
 
+#[path = "support/test_dir.rs"]
+mod test_dir;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
+use test_dir::TestDir;
 use tole_core::approval::AllowlistApprover;
 use tole_core::entry::{EntryType, NewEntry};
 use tole_core::machine::{begin, ReplaySafety};
@@ -77,11 +80,8 @@ fn registry(with_hang: bool) -> ToolRegistry {
     r
 }
 
-fn tmpdir(name: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("cora-e5-{}-{}", name, std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+fn tmpdir(name: &str) -> TestDir {
+    TestDir::new(&format!("cora-e5-{name}"))
 }
 
 /// Canonical golden rendering of a session: the durable content only.

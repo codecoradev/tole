@@ -4,10 +4,13 @@
 //! session's `CancelToken` interrupt queue at the moments a real client
 //! could (while a tool runs, while the provider call is in flight).
 
+#[path = "support/test_dir.rs"]
+mod test_dir;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use test_dir::TestDir;
 use tole_core::approval::AllowlistApprover;
 use tole_core::cancel::CancelToken;
 use tole_core::entry::Entry;
@@ -16,13 +19,8 @@ use tole_core::storage::{JsonlStorage, Storage};
 use tole_core::tool::{Risk, Tool, ToolRegistry};
 use tole_core::turn::{run_turn_with_cancel, TurnOutcome};
 
-fn tmpdir(name: &str) -> std::path::PathBuf {
-    static SEQ: AtomicUsize = AtomicUsize::new(0);
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let d = std::env::temp_dir().join(format!("tole-int-{name}-{}-{n}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+fn tmpdir(name: &str) -> TestDir {
+    TestDir::new(&format!("tole-int-{name}"))
 }
 
 /// ReadOnly tool that counts executions and, when armed, pushes an

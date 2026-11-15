@@ -5,7 +5,10 @@
 
 #![cfg(unix)]
 
+#[path = "support/test_dir.rs"]
+mod test_dir;
 use std::os::unix::fs::PermissionsExt;
+use test_dir::TestDir;
 use tole_core::mcp::{register_server_tools, McpServerConfig};
 use tole_core::plugin_lock::ManifestTool;
 use tole_core::secrets::SecretSet;
@@ -17,8 +20,7 @@ fn without_a_policy_the_launch_is_unchanged() {
     assert!(tole_core::sandbox::policy().is_none());
     // The reactor key is the plain name: behaviour unchanged.
     assert_eq!(tole_core::mcp::conn_key_for("off", None), "off");
-    let base = std::env::temp_dir().join(format!("tole-sbx-off-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
+    let base = TestDir::new("tole-sbx-off");
     let (ws, out) = (base.join("ws"), base.join("out"));
     for d in [&ws, &out] {
         std::fs::create_dir_all(d).unwrap();

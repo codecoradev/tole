@@ -6,16 +6,16 @@
 //! each sandwich point; after resume, the observable durable state
 //! (entries, registers, machine position) must equal the reference.
 
+#[path = "support/test_dir.rs"]
+mod test_dir;
 use serde_json::{json, Value};
+use test_dir::TestDir;
 use tole_core::machine::{begin, finish, resume, EffectHandle, ReplaySafety, Resume, PENDING_KEY};
 use tole_core::state::{Pc, StateTransition};
 use tole_core::storage::{Commit, JsonlStorage, Storage, StorageError};
 
-fn tmpdir(name: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("cora-e2-{}-{}", name, std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+fn tmpdir(name: &str) -> TestDir {
+    TestDir::new(&format!("cora-e2-{name}"))
 }
 
 /// Where to simulate the crash, relative to the sandwich.

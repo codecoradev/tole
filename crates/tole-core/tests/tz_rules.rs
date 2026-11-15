@@ -2,6 +2,9 @@
 //! string, wall-clock to instant mapping across DST, and replaceable
 //! sources of zone data. The schedules that use them follow in part 2.
 
+#[path = "support/test_dir.rs"]
+mod test_dir;
+use test_dir::TestDir;
 use tole_core::cron::days_from_civil;
 use tole_core::tz::{self, Local, OffsetOnly, TzError, Zone, ZoneSource, ZoneinfoDir};
 
@@ -189,8 +192,8 @@ fn names_and_offsets_are_validated_with_a_remedy() {
 #[cfg(unix)]
 #[test]
 fn a_zoneinfo_dir_stays_inside_itself_and_never_blocks() {
-    let root = std::env::temp_dir().join(format!("tole-tz-dir-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    let scratch = TestDir::new("tole-tz-dir");
+    let root = scratch.join("zones");
     std::fs::create_dir_all(root.join("Asia")).unwrap();
     let jakarta = tzif(&[], &[(7 * 3_600, 0)], "<+07>-7");
     std::fs::write(root.join("Asia/Jakarta"), &jakarta).unwrap();
