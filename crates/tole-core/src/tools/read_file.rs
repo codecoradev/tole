@@ -270,19 +270,16 @@ fn read_regular(target: &Path, path: &str, withhold_linked: bool) -> Result<Vec<
 mod tests {
     use super::*;
 
-    fn tmpdir(name: &str) -> PathBuf {
-        let d =
-            std::env::temp_dir().join(format!("tole-core-read-{}-{}", name, std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
+    use crate::test_dir::TestDir;
+    fn tmpdir(name: &str) -> TestDir {
+        TestDir::new(&format!("tole-core-read-{name}"))
     }
 
     #[test]
     fn reads_file_inside_jail() {
         let dir = tmpdir("ok");
         std::fs::write(dir.join("a.txt"), "hello").unwrap();
-        let t = ReadFileTool::new(dir.clone());
+        let t = ReadFileTool::new(dir.to_path_buf());
         let out = t.execute(json!({ "path": "a.txt" })).unwrap();
         assert_eq!(out["content"], json!("hello"));
         assert_eq!(out["bytes"], json!(5));
@@ -290,7 +287,7 @@ mod tests {
 
     #[test]
     fn rejects_empty_path() {
-        let t = ReadFileTool::new(tmpdir("empty"));
+        let t = ReadFileTool::new(tmpdir("empty").to_path_buf());
         let err = t.execute(json!({ "path": "" })).unwrap_err();
         assert!(err.to_string().contains("path is empty"), "{err}");
     }
@@ -298,7 +295,7 @@ mod tests {
     #[test]
     fn rejects_absolute_and_traversal() {
         let dir = tmpdir("jail");
-        let t = ReadFileTool::new(dir);
+        let t = ReadFileTool::new(dir.to_path_buf());
         assert!(t.execute(json!({ "path": "/etc/passwd" })).is_err());
         assert!(t.execute(json!({ "path": "../secret" })).is_err());
         assert!(t.execute(json!({ "path": "a/../../secret" })).is_err());
@@ -308,14 +305,14 @@ mod tests {
     fn rejects_symlink_escape() {
         #[cfg_attr(not(unix), allow(unused_variables))]
         let dir = tmpdir("symlink");
-        let outside = std::env::temp_dir().join(format!("tole-outside-{}", std::process::id()));
-        let _ = std::fs::remove_file(&outside);
+        let outside_dir = crate::test_dir::TestDir::new("tole-outside");
+        let outside = outside_dir.join("secret.txt");
         std::fs::write(&outside, "secret").unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(&outside, dir.join("leak.txt")).unwrap();
         #[cfg(unix)]
         {
-            let t = ReadFileTool::new(dir);
+            let t = ReadFileTool::new(dir.to_path_buf());
             let err = t.execute(json!({ "path": "leak.txt" })).unwrap_err();
             assert!(err.contains("escape"), "got: {err}");
         }
@@ -325,7 +322,7 @@ mod tests {
     #[test]
     fn missing_file_reports_not_found() {
         let dir = tmpdir("missing");
-        let t = ReadFileTool::new(dir);
+        let t = ReadFileTool::new(dir.to_path_buf());
         let err = t.execute(json!({ "path": "nope.txt" })).unwrap_err();
         assert!(err.contains("not found"), "got: {err}");
         assert!(!err.contains("escape"), "missing ≠ escape: {err}");
@@ -335,15 +332,15 @@ mod tests {
         t.execute(input).unwrap()
     }
 
-    fn file_tool(name: &str, content: &str) -> ReadFileTool {
+    fn file_tool(name: &str, content: &str) -> (ReadFileTool, TestDir) {
         let dir = tmpdir(name);
         std::fs::write(dir.join("f.txt"), content).unwrap();
-        ReadFileTool::new(dir)
+        (ReadFileTool::new(dir.to_path_buf()), dir)
     }
 
     #[test]
     fn small_file_reports_untruncated_and_total() {
-        let t = file_tool("small", "hello");
+        let (t, _dir) = file_tool("small", "hello");
         let out = read(&t, json!({ "path": "f.txt" }));
         assert_eq!(out["content"], json!("hello"));
         assert_eq!(out["truncated"], json!(false));
@@ -358,7 +355,7 @@ mod tests {
 
     #[test]
     fn exactly_cap_is_not_truncated() {
-        let t = file_tool("exact", &"a".repeat(MAX_READ_CHARS));
+        let (t, _dir) = file_tool("exact", &"a".repeat(MAX_READ_CHARS));
         let out = read(&t, json!({ "path": "f.txt" }));
         assert_eq!(out["truncated"], json!(false));
         assert_eq!(out["total_chars"], json!(MAX_READ_CHARS));
@@ -368,7 +365,7 @@ mod tests {
 
     #[test]
     fn one_over_cap_is_truncated_with_next_offset() {
-        let t = file_tool("over", &"a".repeat(MAX_READ_CHARS + 1));
+        let (t, _dir) = file_tool("over", &"a".repeat(MAX_READ_CHARS + 1));
         let out = read(&t, json!({ "path": "f.txt" }));
         assert_eq!(out["truncated"], json!(true));
         assert_eq!(out["total_chars"], json!(MAX_READ_CHARS + 1));
@@ -387,7 +384,7 @@ mod tests {
         // 1-, 2-, 3- and 4-byte chars, mixed so every boundary kind occurs.
         let unit = "aé日本語😀x";
         let text: String = unit.repeat(40);
-        let t = file_tool("multibyte", &text);
+        let (t, _dir) = file_tool("multibyte", &text);
         for limit in [1usize, 2, 3, 7, 13, 1000] {
             let mut out = String::new();
             let mut offset = 0u64;
@@ -411,7 +408,7 @@ mod tests {
 
     #[test]
     fn offset_is_in_chars_not_bytes() {
-        let t = file_tool("charoff", "é日😀z");
+        let (t, _dir) = file_tool("charoff", "é日😀z");
         let r = read(&t, json!({ "path": "f.txt", "offset": 2, "limit": 2 }));
         assert_eq!(r["content"], json!("😀z"));
         assert_eq!(r["bytes"], json!("é日😀z".len()));
@@ -420,7 +417,7 @@ mod tests {
 
     #[test]
     fn offset_beyond_end_is_empty_not_error() {
-        let t = file_tool("beyond", "abc");
+        let (t, _dir) = file_tool("beyond", "abc");
         for off in [3u64, 4, 1_000_000] {
             let r = read(&t, json!({ "path": "f.txt", "offset": off }));
             assert_eq!(r["content"], json!(""));
@@ -432,7 +429,7 @@ mod tests {
 
     #[test]
     fn limit_is_clamped_to_default_max() {
-        let t = file_tool("clamp", &"b".repeat(MAX_READ_CHARS + 500));
+        let (t, _dir) = file_tool("clamp", &"b".repeat(MAX_READ_CHARS + 500));
         let r = read(&t, json!({ "path": "f.txt", "limit": 1_000_000 }));
         assert_eq!(r["content"].as_str().unwrap().len(), MAX_READ_CHARS);
         assert_eq!(r["truncated"], json!(true));
@@ -444,7 +441,7 @@ mod tests {
 
     #[test]
     fn invalid_offset_or_limit_is_a_tool_error() {
-        let t = file_tool("badargs", "abc");
+        let (t, _dir) = file_tool("badargs", "abc");
         for bad in [json!(-1), json!(1.5), json!("2"), json!(true), json!([1])] {
             for key in ["offset", "limit"] {
                 let err = t
@@ -461,13 +458,13 @@ mod tests {
 
     #[test]
     fn crlf_is_preserved_and_empty_file_is_fine() {
-        let t = file_tool("crlf", "a\r\nb\r\n");
+        let (t, _dir) = file_tool("crlf", "a\r\nb\r\n");
         let r = read(&t, json!({ "path": "f.txt" }));
         assert_eq!(r["content"], json!("a\r\nb\r\n"));
         assert_eq!(r["total_chars"], json!(6));
         let r = read(&t, json!({ "path": "f.txt", "offset": 1, "limit": 2 }));
         assert_eq!(r["content"], json!("\r\n"));
-        let e = file_tool("empty", "");
+        let (e, _dir) = file_tool("empty", "");
         for input in [
             json!({ "path": "f.txt" }),
             json!({ "path": "f.txt", "offset": 0 }),
@@ -493,7 +490,7 @@ mod tests {
     fn rejects_directory_read() {
         let dir = tmpdir("dir");
         std::fs::create_dir_all(dir.join("subdir")).unwrap();
-        let t = ReadFileTool::new(dir);
+        let t = ReadFileTool::new(dir.to_path_buf());
         let err = t.execute(json!({ "path": "subdir" })).unwrap_err();
         assert!(err.contains("directory"), "got: {err}");
     }
@@ -507,7 +504,7 @@ mod tests {
         // The whole test runs under a hard timeout: a regression turns
         // into a test timeout, not an infinite CI hang.
         let dir = tmpdir("fifo");
-        let t = ReadFileTool::new(dir.clone());
+        let t = ReadFileTool::new(dir.to_path_buf());
         let fifo = dir.join("pipe");
         let created = std::process::Command::new("mkfifo")
             .arg(&fifo)
@@ -544,7 +541,7 @@ mod tests {
         std::fs::write(dir.join(".ENV.Local"), "TOKEN=abcdefgh123\n").unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(dir.join(".env"), dir.join("notes.txt")).unwrap();
-        let t = ReadFileTool::new(dir.clone());
+        let t = ReadFileTool::new(dir.to_path_buf());
         assert_eq!(t.risk(), Risk::ReadOnly);
         let out = t.execute(json!({"path": ".env"})).unwrap();
         assert_eq!(
@@ -564,7 +561,7 @@ mod tests {
             assert!(!out.to_string().contains("hunter2"), "{out}");
         }
         // The raw read: its own tool, Risk::Write, so it needs approval.
-        let raw = ReadFileTool::raw(dir.clone());
+        let raw = ReadFileTool::raw(dir.to_path_buf());
         assert_eq!((raw.name(), raw.risk()), ("read_file_raw", Risk::Write));
         let out = raw.execute(json!({"path": ".env"})).unwrap();
         assert!(out["content"].as_str().unwrap().contains("hunter2hunter2"));
@@ -603,7 +600,7 @@ mod tests {
         assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(ReadFileTool::raw(dir).execute(json!({"path": ".env"})));
+            let _ = tx.send(ReadFileTool::raw(dir.to_path_buf()).execute(json!({"path": ".env"})));
         });
         let got = rx
             .recv_timeout(std::time::Duration::from_secs(5))
@@ -620,7 +617,7 @@ mod tests {
         std::fs::write(dir.join(".env"), "TOKEN=hunter2hunter2\n").unwrap();
         std::fs::write(dir.join("plain.txt"), "hello").unwrap();
         std::fs::hard_link(dir.join(".env"), dir.join("notes.txt")).unwrap();
-        let t = ReadFileTool::new(dir.clone());
+        let t = ReadFileTool::new(dir.to_path_buf());
 
         let err = t.execute(json!({"path": "notes.txt"})).unwrap_err();
         assert!(
@@ -632,7 +629,7 @@ mod tests {
         let ok = t.execute(json!({"path": "plain.txt"})).unwrap();
         assert_eq!(ok["content"], json!("hello"));
 
-        let raw = ReadFileTool::raw(dir.clone())
+        let raw = ReadFileTool::raw(dir.to_path_buf())
             .execute(json!({"path": "notes.txt"}))
             .unwrap();
         assert!(raw["content"].as_str().unwrap().contains("hunter2hunter2"));

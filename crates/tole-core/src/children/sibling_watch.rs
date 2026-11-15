@@ -328,11 +328,9 @@ impl SiblingWatcher {
 mod tests {
     use super::*;
 
-    fn tmp(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("tole-sib-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
+    use crate::test_dir::TestDir;
+    fn tmp(tag: &str) -> TestDir {
+        TestDir::new(&format!("tole-sib-{tag}"))
     }
 
     fn pair(
@@ -342,7 +340,7 @@ mod tests {
         TouchRecorder,
         SiblingWatcher,
         SiblingWatcher,
-        PathBuf,
+        crate::test_dir::TestDir,
     ) {
         let d = tmp(tag);
         let log = d.join("tole-agents").join("touch.log");

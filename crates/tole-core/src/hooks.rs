@@ -153,7 +153,6 @@ pub fn turnend_hook(command_line: &str) -> ProcessHook {
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::sync::atomic::{AtomicU32, Ordering};
 
     fn hook(cmd: &str) -> ProcessHook {
         let mut h = ProcessHook::new(cmd);
@@ -161,15 +160,11 @@ mod tests {
         h
     }
 
-    static SCRIPT_SEQ: AtomicU32 = AtomicU32::new(0);
-
     /// Write a shell script and hook it — whitespace splitting means
     /// complex hooks are SCRIPT FILES, which is the documented v0
     /// contract ("wrap complex commands in a script").
-    fn script_hook(body: &str) -> (ProcessHook, std::path::PathBuf) {
-        let n = SCRIPT_SEQ.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("tole-hook-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+    fn script_hook(body: &str) -> (ProcessHook, crate::test_dir::TestDir) {
+        let dir = crate::test_dir::TestDir::new("tole-hook");
         let path = dir.join("hook.sh");
         std::fs::write(&path, body).unwrap();
         (hook(&format!("/bin/sh {}", path.display())), dir)
@@ -212,8 +207,8 @@ mod tests {
 
     #[test]
     fn stdin_payload_reaches_the_hook() {
-        let capture =
-            std::env::temp_dir().join(format!("tole-hook-payload-{}.json", std::process::id()));
+        let capture_dir = crate::test_dir::TestDir::new("tole-hook-payload");
+        let capture = capture_dir.join("payload.json");
         let body = format!("cat > {}\necho -n ok\n", capture.display());
         let (h, dir) = script_hook(&body);
         assert_eq!(
@@ -227,8 +222,7 @@ mod tests {
         assert_eq!(payload["tool"], "write_file");
         assert_eq!(payload["input"]["path"], "x");
         assert_eq!(payload["ok"], true);
-        let _ = std::fs::remove_file(&capture);
-        let _ = std::fs::remove_dir_all(&dir);
+        drop(dir);
     }
 
     #[test]
