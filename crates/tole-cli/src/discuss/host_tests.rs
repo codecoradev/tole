@@ -817,3 +817,21 @@ fn resuming_a_finished_discussion_writes_no_documents_again() {
     mk(&docs).run().unwrap();
     assert_eq!(docs.lock().unwrap().len(), written, "no duplicate puts");
 }
+
+#[test]
+fn the_factory_builds_providers_with_the_configured_request_timeout() {
+    let cfg = tole_core::openai::OpenAiConfig::new("http://127.0.0.1:1/v1", "k", "m");
+    let secs = std::time::Duration::from_secs;
+    let p = |t: u64| provider(&cfg, &secrets(), None, "sys", secs(t));
+    assert_eq!(p(600).request_timeout(), secs(600));
+    assert_eq!(p(10).request_timeout(), secs(10));
+    // Nothing is installed in this test process: the default stays 120 s.
+    assert_eq!(crate::config_apply::discussion_timeout(), secs(120));
+    assert_eq!(
+        p(crate::config_apply::discussion_timeout().as_secs()).request_timeout(),
+        secs(120)
+    );
+    // `factory` builds through the same function.
+    let make = factory(cfg, secrets(), secs(33));
+    let _ = make(Some("other"), "sys");
+}
