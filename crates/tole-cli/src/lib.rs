@@ -108,6 +108,7 @@ pub mod ecosystem;
 pub mod handoff;
 pub mod hook_cli;
 pub mod hooks;
+pub mod no_config_guard;
 pub mod plugin;
 pub mod sandbox_cmd;
 pub mod sandbox_flags;

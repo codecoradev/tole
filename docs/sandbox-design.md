@@ -379,6 +379,14 @@ servers; `[sandbox.consumers]` is not touched by either.
   both flags once `mark_unattended()` ran, so a flag that slipped past
   the host check still cannot unsandbox a cron job or a serve session.
   `tole plugin` refuses both flags.
+- `--no-config` (#855) drops the whole user config, the sandbox mode, the
+  consumers and the secret release with it, so it follows the same rule as
+  the two flags: refused under an agent session (`TOLE_UNDER_SESSION`, child
+  agent) and for `tole serve`, `tole acp` and `tole mcp`; honoured for the
+  owner at a terminal (`no_config_guard`). The marker is an environment
+  variable, so this covers processes tole started, not a script that strips
+  it; a different `CODECORA_HOME` is the owner's own choice and is not
+  refused.
 - A sandbox never replaces an approval (#684, #700, #714): the flags change
   where a server runs, not whether it is approved; the plugin lock, ledger
   and `Admission` checks run as before.
