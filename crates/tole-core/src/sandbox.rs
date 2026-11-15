@@ -23,6 +23,7 @@
 //! unattended run (cron, `serve`), where it is refused too (decision 2).
 
 pub mod command;
+pub mod flags;
 pub mod report;
 
 use std::collections::BTreeMap;
@@ -176,7 +177,13 @@ pub fn set_policy(p: Option<Policy>) -> Result<(), String> {
 }
 
 /// The process's policy, `None` when the sandbox is not configured.
+///
+/// `--no-sandbox` (#750) reads as "not configured" here, but only while the
+/// run is attended: an unattended process always gets the configured policy.
 pub fn policy() -> Option<Policy> {
+    if flags::no_sandbox_active() {
+        return None;
+    }
     POLICY.get().cloned().flatten()
 }
 
@@ -593,6 +600,7 @@ pub fn doctor_lines(policy: Option<&Policy>, avail: &Availability) -> Vec<String
             "sandbox: this platform has no sandbox; servers and commands run unsandboxed".into(),
         );
     }
+    out.extend(flags::note());
     out
 }
 

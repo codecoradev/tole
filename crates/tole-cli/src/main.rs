@@ -201,6 +201,27 @@ struct Cli {
     #[arg(long, global = true, value_name = "NAME")]
     profile: Option<String>,
 
+    /// Run every stdio MCP server in this sandbox profile (#750): built in
+    /// (`server`, `strict`) or defined in `[sandbox.profiles]` of the USER
+    /// config. It only selects: it does not define a profile, loosen one or
+    /// turn the sandbox on, and a session (agent, child, cron job) cannot
+    /// pass it.
+    #[arg(
+        long,
+        global = true,
+        value_name = "PROFILE",
+        conflicts_with = "no_sandbox"
+    )]
+    sandbox: Option<String>,
+
+    /// Start stdio MCP servers unsandboxed for this run (#750). Owner at a
+    /// terminal only: refused under an agent session, in `tole serve`/`acp`
+    /// and in any run without a terminal while `[sandbox] mode` is
+    /// `required` or `optional`. `tole doctor` and the startup log say it
+    /// overrode the config.
+    #[arg(long, global = true)]
+    no_sandbox: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -807,6 +828,24 @@ fn bare_tui_args() -> Option<Vec<std::ffi::OsString>> {
     .then(|| vec!["tole".into(), "tui".into()])
 }
 
+/// `(unattended, starts no server)` of a subcommand, for the sandbox flags
+/// (#750): `serve`, `acp` and the MCP stdio server never have a human;
+/// `cron`, `hook` and `sandbox` start no MCP server.
+fn sandbox_flag_class(cmd: &Command) -> (bool, bool) {
+    #[allow(unused_mut)]
+    let mut class = (false, matches!(cmd, Command::Sandbox { .. }));
+    #[cfg(feature = "shell-tools")]
+    {
+        class.0 |= matches!(cmd, Command::Serve { .. } | Command::Acp { .. });
+        class.1 |= matches!(cmd, Command::Cron { .. } | Command::Hook { .. });
+    }
+    #[cfg(all(feature = "mcp", feature = "shell-tools"))]
+    {
+        class.0 |= matches!(cmd, Command::Mcp { .. });
+    }
+    class
+}
+
 fn main() {
     // First, before any thread or child exists (#675): a same-user child
     // must not read this process's environment through /proc/<ppid>/environ
@@ -1071,11 +1110,38 @@ fn dispatch(cli: Cli) -> Result<()> {
     tole_core::secret_release::set_release(cfg.as_ref().map(|c| c.release()).unwrap_or_default());
     // Sandbox of stdio MCP servers (#601): off unless the user config sets
     // `[sandbox] mode`; the config was validated at load.
-    if let Err(e) = tole_core::sandbox::set_policy(
-        cfg.as_ref()
-            .and_then(|c| c.sandbox.as_ref())
-            .and_then(|s| s.policy().ok()),
-    ) {
+    let sandbox_cfg = cfg.as_ref().and_then(|c| c.sandbox.as_ref());
+    let mut sandbox_policy = sandbox_cfg.and_then(|s| s.policy().ok());
+    // `--sandbox <profile>` / `--no-sandbox` (#750): owner at a terminal
+    // only; a refusal stops the run before any server starts.
+    {
+        use std::io::IsTerminal;
+        let flags = tole_cli::sandbox_flags::Flags {
+            sandbox: cli.sandbox.clone(),
+            no_sandbox: cli.no_sandbox,
+        };
+        let (unattended_command, no_server) = sandbox_flag_class(&cli.command);
+        let ctx = tole_cli::sandbox_flags::Context {
+            under_session: tole_core::child_env::under_session(&|k| std::env::var(k).ok()),
+            unattended_command,
+            meaningless: no_server,
+            tty: std::io::stdin().is_terminal() && std::io::stderr().is_terminal(),
+        };
+        match tole_cli::sandbox_flags::apply(&flags, sandbox_policy.as_ref(), sandbox_cfg, &ctx) {
+            Err(e) => return Err(anyhow!("{e}")),
+            Ok(None) => {}
+            Ok(Some(o)) => {
+                if o.policy.is_some() {
+                    sandbox_policy = o.policy;
+                }
+                let _ = tole_core::sandbox::flags::set(o.over);
+                if let Some(n) = tole_core::sandbox::flags::note() {
+                    eprintln!("tole: {n}");
+                }
+            }
+        }
+    }
+    if let Err(e) = tole_core::sandbox::set_policy(sandbox_policy) {
         eprintln!("tole: warning: {e}");
     }
     // Sandbox of the commands a model makes the host run (#748): off unless
