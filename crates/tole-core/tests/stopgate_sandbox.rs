@@ -213,13 +213,16 @@ fn the_verify_command_runs_in_the_command_profile() {
     if skipped() {
         return;
     }
-    let (mut cmd, sandboxed) = command::command_in_cwd(
+    let command::Launched { mut cmd, report } = command::command_in_cwd(
         Consumer::Verify,
         "sh",
         &["-c".into(), format!("{}; exit 3", probe("verify"))],
     )
     .unwrap();
-    assert!(sandboxed);
+    assert!(
+        report.is_some(),
+        "wrapped, so a launcher report comes with it"
+    );
     tole_core::subprocess::scrub_env_for(&mut cmd, tole_core::secret_release::VERIFY);
     let out = tole_core::subprocess::run_with_timeout(&mut cmd, Duration::from_secs(60)).unwrap();
     assert_eq!(out.status.code(), Some(3), "the exit status is the verdict");

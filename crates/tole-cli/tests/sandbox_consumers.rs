@@ -171,8 +171,8 @@ fn a_project_config_cannot_set_consumers() {
 }
 
 /// Slice 2: `verify` and `turnend` are consumers. A required one with no
-/// sandbox fails the doctor; an optional stop gate only warns; an optional
-/// `verify` fails it too (a mission is unattended, optional is required).
+/// sandbox fails the doctor; so does an optional stop gate or `verify` (both
+/// run unattended, so optional is required).
 #[test]
 fn doctor_covers_verify_and_turnend() {
     let (code, out) = doctor(Some(
@@ -191,13 +191,17 @@ fn doctor_covers_verify_and_turnend() {
     );
     assert!(
         l.iter()
-            .any(|x| x.contains("WARNING turnend") && x.contains("unattended")),
+            .any(|x| x.contains("ERROR turnend") && x.contains("unattended")),
         "{out}"
     );
 
     let (code, out) = doctor(Some("[sandbox.consumers]\nturnend = \"optional\"\n"));
-    assert_eq!(code, Some(0), "an optional stop gate only warns: {out}");
-    assert!(out.contains("sandbox consumers: WARNING turnend"), "{out}");
+    assert_ne!(
+        code,
+        Some(0),
+        "an optional stop gate cannot fall back: {out}"
+    );
+    assert!(out.contains("sandbox consumers: ERROR turnend"), "{out}");
 
     let (code, out) = doctor(Some("[sandbox.consumers]\nverify = \"optional\"\n"));
     assert_ne!(code, Some(0), "{out}");

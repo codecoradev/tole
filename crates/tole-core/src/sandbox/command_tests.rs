@@ -912,24 +912,28 @@ fn the_verify_command_is_sh_dash_c_with_the_string_as_one_argument() {
 }
 
 #[test]
-fn a_mission_is_unattended_so_optional_verify_is_required() {
+fn a_mission_and_a_stop_gate_are_unattended_so_optional_is_required() {
     assert!(Consumer::Verify.always_unattended());
-    for k in [Consumer::RunCommand, Consumer::JobStart, Consumer::TurnEnd] {
+    assert!(Consumer::TurnEnd.always_unattended());
+    for k in [Consumer::RunCommand, Consumer::JobStart] {
         assert!(
             !k.always_unattended(),
-            "{k:?}: only verify runs in a mission"
+            "{k:?}: only verify and the stop gates have nobody to answer"
         );
     }
-    // `launch_command` passes `true` for verify, and then a missing sandbox
-    // refuses even for `optional`.
+    // `launch_command` passes `true` for them, and then a missing sandbox
+    // refuses even for `optional`, which `run_command` would run unsandboxed
+    // with a human attached.
     let c = all(Mode::Optional);
-    let CommandLaunch::Refused(why) = plan(&c, &gone(), true, Consumer::Verify) else {
-        panic!("optional verify without a sandbox must refuse")
-    };
-    assert!(
-        why.starts_with("verify: ") && why.contains("unattended"),
-        "{why}"
-    );
+    for k in [Consumer::Verify, Consumer::TurnEnd] {
+        let CommandLaunch::Refused(why) = plan(&c, &gone(), true, k) else {
+            panic!("optional {k:?} without a sandbox must refuse")
+        };
+        assert!(
+            why.starts_with(&format!("{}: ", k.name())) && why.contains("unattended"),
+            "{why}"
+        );
+    }
 }
 
 #[test]
@@ -1054,10 +1058,11 @@ fn doctor_lists_verify_and_turnend_and_fails_for_a_required_one_without_a_sandbo
                 && x.contains("refused (required)")),
         "{l:?}"
     );
+    // An optional stop gate cannot fall back either: nobody answers while the
+    // model is finishing.
     assert!(
-        l.iter().any(
-            |x| x.starts_with("sandbox consumers: WARNING turnend") && x.contains("unattended")
-        ),
+        l.iter()
+            .any(|x| x.starts_with("sandbox consumers: ERROR turnend") && x.contains("unattended")),
         "{l:?}"
     );
     // An optional verify cannot fall back: a mission is unattended.
@@ -1091,37 +1096,69 @@ fn the_launcher_report_has_an_exit_code_only_when_the_command_ended() {
 }
 
 #[test]
-fn doctor_warns_when_verify_needs_a_toolchain_the_sandbox_cannot_see() {
+fn doctor_warns_when_verify_or_a_gate_needs_a_toolchain_the_sandbox_cannot_see() {
     let home = tmp("toolchain-home");
     let c = Consumers {
         verify: Mode::Required,
         ..Consumers::default()
     };
-    let lines = |h: Option<&Path>| doctor_lines_for(&c, &usable(), h);
+    let lines = |c: &Consumers, h: Option<&Path>| doctor_lines_for(c, &usable(), h);
+    // The exact notes: no run of spaces where a line continuation was meant.
+    let note = |names: &str| {
+        format!(
+            "sandbox consumers: a sandboxed command ({names}) can also fail deterministically \
+             for lack of network (network none unless the owner wrote host) or under the \
+             address-space limit (memory_mb); the model is told to fix it like any failure"
+        )
+    };
+    let warning = |names: &str, dirs: &str| {
+        format!(
+            "sandbox consumers: WARNING sandboxed {names}: {dirs} exist but are not visible \
+             inside the sandbox ($HOME is absent), so a command that needs them (cargo, \
+             rustc) fails every time, for example with exit 127, and uses up the three \
+             strikes of a verify or the three denials of a stop gate"
+        )
+    };
     // No toolchain dir: no warning, but the plain note about deterministic
     // failures stays (network, address space).
-    let l = lines(Some(&home));
-    assert!(!l.iter().any(|x| x.contains("WARNING verify")), "{l:?}");
-    assert!(
-        l.iter()
-            .any(|x| x.contains("fail deterministically") && x.contains("network")),
-        "{l:?}"
-    );
+    let l = lines(&c, Some(&home));
+    assert!(!l.iter().any(|x| x.contains("WARNING sandboxed")), "{l:?}");
+    assert!(l.contains(&note("verify")), "{l:?}");
     std::fs::create_dir_all(home.join(".cargo/bin")).unwrap();
     std::fs::create_dir_all(home.join(".rustup")).unwrap();
-    let l = lines(Some(&home));
-    let w = l
-        .iter()
-        .find(|x| x.starts_with("sandbox consumers: WARNING verify"))
-        .unwrap_or_else(|| panic!("{l:?}"));
-    assert!(
-        w.contains(".cargo/bin") && w.contains(".rustup") && w.contains("three strikes"),
-        "{w}"
+    let dirs = format!(
+        "{}, {}",
+        home.join(".cargo/bin").display(),
+        home.join(".rustup").display()
     );
+    let l = lines(&c, Some(&home));
+    assert!(l.contains(&warning("verify", &dirs)), "{l:?}");
+    assert!(l.contains(&note("verify")), "{l:?}");
+    for x in &l {
+        assert!(!x.contains("  "), "a run of spaces in {x:?}");
+    }
     assert!(!l.iter().any(|x| x.contains("ERROR")), "a warning only");
-    // Verify off: nothing to say about it.
-    let off = doctor_lines_for(&Consumers::default(), &usable(), Some(&home));
-    assert!(!off.iter().any(|x| x.contains("WARNING verify")), "{off:?}");
+    // The stop gates have the same problem, and the lines name them.
+    let both = Consumers {
+        verify: Mode::Required,
+        turnend: Mode::Required,
+        ..Consumers::default()
+    };
+    let l = lines(&both, Some(&home));
+    assert!(l.contains(&warning("verify and turnend", &dirs)), "{l:?}");
+    let gate = Consumers {
+        turnend: Mode::Required,
+        ..Consumers::default()
+    };
+    let l = lines(&gate, Some(&home));
+    assert!(l.contains(&warning("turnend", &dirs)), "{l:?}");
+    assert!(l.contains(&note("turnend")), "{l:?}");
+    // Both off: nothing to say about them.
+    let off = lines(&Consumers::default(), Some(&home));
+    assert!(
+        !off.iter().any(|x| x.contains("WARNING sandboxed")),
+        "{off:?}"
+    );
 }
 
 // Nested gitdirs (#849 follow-up): what the plan names, and what it refuses.

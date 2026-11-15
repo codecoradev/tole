@@ -74,10 +74,11 @@ impl Consumer {
     }
 
     /// The mission `--verify` command only runs inside `tole mission`, an
-    /// autonomous run with nobody to answer a prompt: for it `optional` is
-    /// always `required`, whatever the process flag says.
+    /// autonomous run with nobody to answer a prompt, and a stop gate runs
+    /// while the model is finishing, with nobody answering either: for both
+    /// `optional` is always `required`, whatever the process flag says.
     pub fn always_unattended(self) -> bool {
-        self == Consumer::Verify
+        matches!(self, Consumer::Verify | Consumer::TurnEnd)
     }
 
     /// The owner's stop gate is a program path or name (`./gate.sh`,
@@ -967,8 +968,12 @@ pub struct Launched {
 /// (checked: a missing bind source and a missing program both print
 /// `bwrap: ...`, exit 1 and report no exit code), whatever the exit status
 /// says. (`child-pid` is written before the mounts are made, so it proves
-/// nothing.) The command inherits the descriptor and could write to it, but it
-/// can only make the report agree with what it really did.
+/// nothing.) `bwrap` writes its own `exit-code` line last, when the command has
+/// ended, and the last one wins. Whether the command can reach the status
+/// descriptor at all depends on the `bwrap` version (with 0.9.0 it is closed
+/// inside the sandbox: `echo >&3` fails with `EBADF`); a report that cannot be
+/// parsed or has no `exit-code` reads as "the launcher failed", which the
+/// caller turns into a refusal or a deny, never into a pass.
 pub struct LauncherReport {
     #[cfg(target_os = "linux")]
     read: std::fs::File,
@@ -1358,7 +1363,7 @@ pub fn doctor_lines_for(c: &Consumers, avail: &Availability, home: Option<&Path>
                     (Mode::Required, _) => ("ERROR", "refused (required)"),
                     (Mode::Optional, true) => (
                         "ERROR",
-                        "refused: a mission is an unattended run, where optional counts as required",
+                        "refused: a mission or a stop gate runs unattended, where optional counts as required",
                     ),
                     (Mode::Optional, false) => (
                         "WARNING",
@@ -1391,7 +1396,7 @@ pub fn doctor_lines_for(c: &Consumers, avail: &Availability, home: Option<&Path>
             ));
         }
         out.push(format!(
-            "sandbox consumers: a sandboxed {names} command can also fail deterministically \
+            "sandbox consumers: a sandboxed command ({names}) can also fail deterministically \
              for lack of network (network none unless the owner wrote host) or under the \
              address-space limit (memory_mb); the model is told to fix it like any failure"
         ));
