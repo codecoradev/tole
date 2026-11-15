@@ -1327,37 +1327,40 @@ fn approve(ctx: &mut Ctx<'_>, name: &str, opts: Approve<'_>) -> Result<String, S
     let ((version, live), before) = start_for_review(ctx, &cfg, tier)?;
     let hash = plugin_lock::manifest_hash(&live);
     let mut shown = ctx.clean(&render_manifest(name, &version, &live));
+    // A changed sandbox profile is the owner's decision at a terminal: a
+    // script's `--hash` consents to a tool list, never to a wider sandbox
+    // (#750). Decided against the LEDGER's record of the approved profile,
+    // not the lock file alone: a lock hash edited to match a widened profile
+    // is itself a move, and so is a lock entry deleted (the ledger still
+    // holds the profile that was approved).
+    let one: std::collections::BTreeMap<String, LockEntry> = existing
+        .iter()
+        .map(|e| (name.to_string(), e.clone()))
+        .collect();
+    let moved = plugin_lock::profile_moved(
+        &one,
+        ledger.as_deref(),
+        name,
+        live_profile(ctx, &cfg).as_ref(),
+    );
     if let Some(e) = &existing {
         shown.push('\n');
         shown.push_str(&ctx.clean(&profile_note(ctx, e, &cfg)));
-        // A changed sandbox profile is the owner's decision at a terminal: a
-        // script's `--hash` consents to a tool list, never to a wider
-        // sandbox (#750).
-        // Decided against the LEDGER's record of the approved profile, not
-        // the lock file alone: a lock hash edited to match a widened profile
-        // is itself a move.
-        let one = std::collections::BTreeMap::from([(name.to_string(), e.clone())]);
-        let moved = plugin_lock::profile_moved(
-            &one,
-            ledger.as_deref(),
-            name,
-            live_profile(ctx, &cfg).as_ref(),
+    }
+    if moved {
+        shown.push_str(
+            "! the sandbox profile differs from the one your ledger recorded at approval \
+             (changed in the config, or the lock was edited)\n",
         );
-        if moved {
-            shown.push_str(
-                "! the sandbox profile differs from the one your ledger recorded at approval \
-                 (changed in the config, or the lock was edited)\n",
-            );
-        }
-        if moved && !ctx.interactive {
-            return Err(format!(
-                "{shown}\nthe sandbox profile of `{}` is not the one you approved: only an \
-                 interactive approval at a terminal accepts a changed profile (review it with \
-                 `tole sandbox show {}`); a script cannot",
-                ctx.clean(name),
-                ctx.clean(name)
-            ));
-        }
+    }
+    if moved && !ctx.interactive {
+        return Err(format!(
+            "{shown}\nthe sandbox profile of `{}` is not the one you approved: only an \
+             interactive approval at a terminal accepts a changed profile (review it with \
+             `tole sandbox show {}`); a script cannot",
+            ctx.clean(name),
+            ctx.clean(name)
+        ));
     }
     if let Some((l, _)) = &bundle {
         shown.push('\n');
@@ -1456,11 +1459,39 @@ fn revoke_secret(
             path.display()
         ));
     }
-    let q = format!(
-        "Withdraw secret {} from `{}`? It stays approved without it. [y/N] ",
+    // An entry approved before grants were recorded (#825) is not tracked by
+    // the ledger. Adopting it records what stays granted, so what is adopted
+    // is the owner's decision at a terminal, shown in the prompt: a script's
+    // `--hash` (or a `--hash` typed at a terminal, which shows nothing) only
+    // narrows and leaves the entry untracked, otherwise a secret added to
+    // the lock by hand would become permanent through a narrowing command.
+    let kept: Vec<String> = entry
+        .secrets
+        .iter()
+        .filter(|s| *s != secret)
+        .cloned()
+        .collect();
+    let untracked = !project
+        && ctx.user.as_deref().is_some_and(|user| {
+            plugin_lock::read_ledger(&user.with_file_name(plugin_lock::LEDGER_FILE))
+                .ok()
+                .flatten()
+                .is_some_and(|l| !plugin_lock::secrets_recorded(&l, name))
+        });
+    let adopt = untracked && ctx.interactive && expect.is_none();
+    let mut q = format!(
+        "Withdraw secret {} from `{}`? It stays approved without it.\n",
         ctx.clean(secret),
         ctx.clean(name)
     );
+    if adopt && !kept.is_empty() {
+        q.push_str(&format!(
+            "The ledger will record these grants as yours, as they are in the lock: {}\n\
+             (a secret you did not grant: say no, and remove it from the lock first)\n",
+            ctx.clean(&kept.join(", "))
+        ));
+    }
+    q.push_str("[y/N] ");
     consent(ctx, &hash, expect, &q)?;
     entry.secrets.retain(|s| s != secret);
     // The ledger first (as `revoke`): a lock that then cannot be written
@@ -1473,30 +1504,28 @@ fn revoke_secret(
         } else {
             "secret_revoke"
         };
-        // An entry approved before grants were recorded (#825) becomes
-        // ledger-tracked here: the owner's decision also records what stays
-        // granted, otherwise the ledger would show only the revoke and block
-        // the remaining grants. An entry that is already tracked is left
-        // alone, so a hand-added grant is never adopted by this command.
-        let adopt = !project
-            && plugin_lock::read_ledger(&user.with_file_name(plugin_lock::LEDGER_FILE))
-                .ok()
-                .flatten()
-                .is_some_and(|l| !plugin_lock::secrets_recorded(&l, name));
         if adopt {
-            for kept in &entry.secrets {
+            for kept in &kept {
                 record_secret(user, "secret_grant", name, kept);
             }
         }
         record_secret(user, event, name, secret);
     }
     lock.save(&path)?;
-    Ok(ctx.clean(&format!(
+    let mut out = format!(
         "withdrew secret {secret} from `{name}` in {}: it is not passed when the server starts \
          again; a process that is already running keeps it, so rotate the secret if you no \
          longer trust the server\n",
         path.display()
-    )))
+    );
+    if untracked && !adopt && !kept.is_empty() {
+        out.push_str(
+            "the remaining grants are still not recorded in your ledger (a hand-added one is \
+             not detected): run `tole plugin approve` at a terminal, or this command without \
+             --hash at one, to record them\n",
+        );
+    }
+    Ok(ctx.clean(&out))
 }
 
 fn revoke(

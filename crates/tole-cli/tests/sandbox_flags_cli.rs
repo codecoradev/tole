@@ -72,17 +72,33 @@ fn no_sandbox_with_the_sandbox_off_changes_nothing() {
 }
 
 #[test]
-fn sandbox_flag_selects_only_a_user_layer_profile_and_doctor_says_so() {
+fn sandbox_flag_is_refused_for_a_script_without_a_terminal() {
+    // The harness has no terminal: exactly a script's situation (#846). A
+    // valid user-defined profile is refused (before the fix the run
+    // succeeded and doctor printed "overrides the config").
     let b = setup("sel", REQUIRED);
-    let out = text(&tole(&b, false, &["--sandbox", "net", "doctor"]));
-    assert!(
-        out.contains("--sandbox net overrides the config (profile server)"),
-        "{out}"
-    );
-    assert!(
-        out.contains("sandbox: mode required, profile net, network host"),
-        "{out}"
-    );
+    for profile in ["net", "strict"] {
+        let o = tole(&b, false, &["--sandbox", profile, "doctor"]);
+        let out = text(&o);
+        assert!(!o.status.success(), "{out}");
+        assert!(
+            out.contains("--sandbox is refused in an unattended run"),
+            "{out}"
+        );
+        assert!(!out.contains("overrides the config"), "{out}");
+    }
+    // `serve` without a terminal: refused before it binds. This proves
+    // "refused without a terminal" only; that `serve`, `acp` and `mcp` are
+    // unattended even at a terminal is pinned by `sandbox_flag_class_tests`
+    // in main.rs.
+    #[cfg(feature = "shell-tools")]
+    {
+        let out = text(&tole(&b, false, &["--sandbox", "net", "serve"]));
+        assert!(
+            out.contains("--sandbox is refused in an unattended run"),
+            "{out}"
+        );
+    }
     let o = tole(&b, false, &["--sandbox", "nope", "doctor"]);
     assert!(!o.status.success());
     assert!(text(&o).contains("unknown sandbox profile"), "{}", text(&o));

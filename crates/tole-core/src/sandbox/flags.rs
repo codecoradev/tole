@@ -6,11 +6,11 @@
 //! a flag: the owner's config is what trust and approval decisions read
 //! (first-party names, the `plugin add` probe, the command consumers). Only
 //! [`super::session_policy`], what this run's stdio MCP servers start under,
-//! applies the override, and it ignores `--no-sandbox` once the process is
+//! applies the override, and it ignores both flags once the process is
 //! marked unattended, so even a flag that slipped through a host check can
-//! never turn the sandbox off for a cron job, a `tole serve` session or any
-//! other run without a human. The note says a flag overrode the config
-//! (startup log, `tole doctor`).
+//! never turn the sandbox off, or widen its profile, for a cron job, a
+//! `tole serve` session or any other run marked without a human (#846). The
+//! note says a flag overrode the config (startup log, `tole doctor`).
 
 use super::{unattended, Mode, Policy, Profile};
 use std::sync::OnceLock;
@@ -48,12 +48,13 @@ pub fn current() -> Option<Override> {
 
 /// The configured policy `p` as THIS RUN's stdio MCP servers see it
 /// ([`super::session_policy`]): `--no-sandbox` (attended only) reads as no
-/// policy, `--sandbox <p>` replaces the profile of every server. Nothing
+/// policy, `--sandbox <p>` (attended only) replaces the profile of every
+/// server; an unattended process gets the configured policy. Nothing
 /// else reads this: the configured policy stays what the owner wrote.
 pub fn apply(p: Option<Policy>) -> Option<Policy> {
     match OVERRIDE.get() {
         Some(Override::NoSandbox { .. }) if !unattended() => None,
-        Some(Override::Profile { name, profile, .. }) => p.map(|mut p| {
+        Some(Override::Profile { name, profile, .. }) if !unattended() => p.map(|mut p| {
             p.profile_name = name.clone();
             p.profile = profile.clone();
             p.servers.clear();
@@ -88,6 +89,12 @@ pub fn note() -> Option<String> {
             "sandbox: --no-sandbox overrides the config (mode {}) for this run; stdio MCP servers \
              start unsandboxed",
             mode_word(*configured)
+        ),
+        Override::Profile {
+            name, configured, ..
+        } if unattended() => format!(
+            "sandbox: --sandbox {name} is ignored in an unattended run; the configured profile \
+             {configured} applies"
         ),
         Override::Profile {
             name, configured, ..

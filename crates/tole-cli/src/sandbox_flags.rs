@@ -10,8 +10,14 @@
 //!   and any run without a terminal count as unattended; there, a configured
 //!   `required` (and `optional`, which counts as `required` without a human)
 //!   mode is not switched off: the run is refused. Defense in depth in the
-//!   core: [`tole_core::sandbox::policy`] ignores the flag once the process
-//!   is marked unattended.
+//!   core: [`tole_core::sandbox::session_policy`] ignores the flag once the
+//!   process is marked unattended.
+//! - **`--sandbox <profile>` never in an unattended run either (#846).** A
+//!   profile can be wider than the configured one (a user-defined one), and
+//!   the plugin lock only compares a profile for entries that recorded one,
+//!   so a flag chosen by a script would loosen the sandbox without a human.
+//!   The same unattended test applies; the core ignores the profile
+//!   override once the process is marked unattended.
 //! - **`--sandbox <profile>` only selects.** The profile must be built in or
 //!   defined in the USER config (a project config cannot define one), it does
 //!   not turn the sandbox on when the mode is `off`, and it never defines a
@@ -132,6 +138,15 @@ pub fn apply(
     let profile = cfg
         .resolve_profile(name)
         .map_err(|e| format!("--sandbox: {e}"))?;
+    // A profile may be wider than the configured one, and a flag can never
+    // loosen the sandbox without a human: the same test as `--no-sandbox`.
+    if ctx.unattended_command || !ctx.tty {
+        return Err(
+            "--sandbox is refused in an unattended run (a profile can be wider than the \
+             configured one); run it from a terminal, or set the profile in the user config"
+                .into(),
+        );
+    }
     Ok(Some(Outcome {
         over: Override::Profile {
             name: name.to_string(),
