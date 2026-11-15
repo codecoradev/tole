@@ -166,20 +166,40 @@ pub const DISCUSSION_TIMEOUT_ENV: &str = "TOLE_DISCUSSION_TIMEOUT_SECS";
 
 /// Default discussion request timeout: the provider's own default, unchanged.
 pub const DEFAULT_DISCUSSION_TIMEOUT_SECS: u64 = 120;
-/// Lower bound of the discussion request timeout (#786), in seconds.
-pub const MIN_DISCUSSION_TIMEOUT_SECS: u64 = 1;
+/// Lower bound of the discussion request timeout in the user config (#813),
+/// in seconds. No real model answers a non-streaming discussion call in under
+/// 10 s, so a smaller value is a typo or a unit slip that would only burn the
+/// discussion budget on timeouts.
+pub const MIN_DISCUSSION_TIMEOUT_SECS: u64 = 10;
+/// Lower bound of `TOLE_DISCUSSION_TIMEOUT_SECS` (#786), in seconds: the env
+/// may go below the config floor, as the documented test hook (#813).
+pub const MIN_DISCUSSION_TIMEOUT_ENV_SECS: u64 = 1;
 /// Upper bound of the discussion request timeout (#786), in seconds.
 pub const MAX_DISCUSSION_TIMEOUT_SECS: u64 = 3600;
 
-/// Whether `n` is an allowed discussion request timeout.
+/// Whether `n` is an allowed `[discussions] request_timeout_secs`.
 pub fn discussion_timeout_in_range(n: u64) -> bool {
     (MIN_DISCUSSION_TIMEOUT_SECS..=MAX_DISCUSSION_TIMEOUT_SECS).contains(&n)
 }
 
-/// The shared wording of the bounds, for the config and env errors.
+/// Whether `n` is an allowed `TOLE_DISCUSSION_TIMEOUT_SECS`.
+pub fn discussion_timeout_env_in_range(n: u64) -> bool {
+    (MIN_DISCUSSION_TIMEOUT_ENV_SECS..=MAX_DISCUSSION_TIMEOUT_SECS).contains(&n)
+}
+
+/// The wording of the config bounds, for the config error.
 pub fn discussion_timeout_bounds() -> String {
     format!(
         "a whole number of seconds from {MIN_DISCUSSION_TIMEOUT_SECS} to \
+         {MAX_DISCUSSION_TIMEOUT_SECS} (the floor is {MIN_DISCUSSION_TIMEOUT_SECS} s; \
+         {DISCUSSION_TIMEOUT_ENV} may go down to {MIN_DISCUSSION_TIMEOUT_ENV_SECS} s as a test hook)"
+    )
+}
+
+/// The wording of the env bounds, for the env error.
+pub fn discussion_timeout_env_bounds() -> String {
+    format!(
+        "a whole number of seconds from {MIN_DISCUSSION_TIMEOUT_ENV_SECS} to \
          {MAX_DISCUSSION_TIMEOUT_SECS}"
     )
 }
@@ -562,7 +582,7 @@ impl Settings {
         let v = self.request_timeout_env_invalid.as_ref()?;
         Some(format!(
             "{DISCUSSION_TIMEOUT_ENV} must be {}, got {v:?}",
-            discussion_timeout_bounds()
+            discussion_timeout_env_bounds()
         ))
     }
 
@@ -652,7 +672,7 @@ impl Settings {
         {
             None => (None, None),
             Some(v) => match v.trim().parse::<u64>() {
-                Ok(n) if discussion_timeout_in_range(n) => (Some(n), None),
+                Ok(n) if discussion_timeout_env_in_range(n) => (Some(n), None),
                 _ => (None, Some(v)),
             },
         };

@@ -337,6 +337,40 @@ pub fn doctor_line(cfg: &crate::config::Config) -> String {
     }
 }
 
+/// The `tole doctor` hint for an unset `[delegation] approvals` (#813): it
+/// fires only when delegation is in use and the key is not set at all (an
+/// explicit `off` is a decision, not a gap). "In use" is the narrowest
+/// evidence there is, since every parent session can delegate: the user
+/// config has a `[delegation]` table, or this workspace's delegation log
+/// (`log`) already holds a recorded delegated run.
+pub fn doctor_hint(cfg: &crate::config::Config, log: Option<&std::path::Path>) -> Option<String> {
+    if cfg
+        .delegation
+        .as_ref()
+        .is_some_and(|d| d.approvals.is_some())
+    {
+        return None;
+    }
+    let configured = cfg.delegation.is_some();
+    let recorded = log
+        .and_then(|p| std::fs::metadata(p).ok())
+        .is_some_and(|m| m.is_file() && m.len() > 0);
+    if !(configured || recorded) {
+        return None;
+    }
+    let why = if recorded {
+        "this workspace has recorded delegated runs"
+    } else {
+        "the user config has a [delegation] table"
+    };
+    Some(format!(
+        "  ! delegation approvals: not set and {why}: without an approver, an unattended \
+         delegated child's Write its allow list does not cover is denied at once; \
+         to be asked instead, set `approvals = \"owner\"` (or \"chain\") under `[delegation]` \
+         in the user config and answer with `tole delegation approvals`"
+    ))
+}
+
 #[cfg(test)]
 #[path = "approvals_owner_tests.rs"]
 mod tests;

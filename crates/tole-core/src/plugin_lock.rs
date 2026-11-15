@@ -619,6 +619,21 @@ pub fn bundle_ledger_line(
     line
 }
 
+/// The audit line of a plain (non-bundle) approval: [`ledger_line`] plus a
+/// marker that this approval's secret grants are recorded as `secret_grant`
+/// lines right after it (#825), even when there are none. Without the marker
+/// an `approve` line is an older one, whose entry's `secrets` (#679) the
+/// ledger cannot vouch for.
+pub fn plain_ledger_line(server: &str, manifest_hash: &str, at: u64) -> String {
+    let mut line = serde_json::json!({
+        "v": 1, "kind": "plugin", "event": "approve", "server": server,
+        "manifest_hash": manifest_hash, "secrets_recorded": true, "at": at,
+    })
+    .to_string();
+    line.push('\n');
+    line
+}
+
 /// The audit line of one secret grant or revoke (`secret_grant`,
 /// `secret_revoke`): the secret's NAME, never a value.
 pub fn secret_ledger_line(event: &str, server: &str, secret: &str, at: u64) -> String {
@@ -646,6 +661,31 @@ pub fn read_ledger(path: &Path) -> Result<Option<String>, String> {
     }
 }
 
+/// Whether the ledger holds `server`'s current secret grants (#825): its
+/// last approval recorded them (a bundle approval, or a plain one with the
+/// `secrets_recorded` marker) or a `secret_grant` line followed it. `false`
+/// for an older approval, whose grants only the lock knows.
+pub fn secrets_recorded(ledger: &str, server: &str) -> bool {
+    let mut tracked = false;
+    for line in ledger.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if v["kind"] != "plugin" || v["server"] != server {
+            continue;
+        }
+        match v["event"].as_str() {
+            Some("approve") => {
+                tracked = v["bundle_hash"].is_string() || v["secrets_recorded"] == true;
+            }
+            Some("revoke") => tracked = false,
+            Some("secret_grant") => tracked = true,
+            _ => {}
+        }
+    }
+    tracked
+}
+
 /// What the owner's record of approvals says against the lock file.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LedgerCheck {
@@ -657,6 +697,11 @@ pub struct LedgerCheck {
     /// Trusted entries the ledger has no approval for at all (written by
     /// hand, or approved before the ledger): reported, not blocked.
     pub unrecorded: Vec<String>,
+    /// Trusted entries holding secrets the ledger cannot vouch for: approved
+    /// before approvals recorded their grants (#825), with no grant line
+    /// since. Reported, not blocked (a one-time migration); the owner's next
+    /// approval, or `revoke --secret`, records them.
+    pub secrets_unrecorded: Vec<String>,
     /// Why the ledger could not be read, when it could not: revocations
     /// recorded there are then not checked.
     pub unreadable: Option<String>,
@@ -672,6 +717,10 @@ pub fn check_against_ledger(lock: &BTreeMap<String, LockEntry>, ledger: &str) ->
     type Last = (String, String, Option<String>);
     let mut last: BTreeMap<String, Last> = BTreeMap::new();
     let mut granted: BTreeMap<String, std::collections::BTreeSet<String>> = BTreeMap::new();
+    // Servers whose current approval has its grants in the ledger: a bundle
+    // approval, a plain one that says so, or one with a grant line since. An
+    // older plain approval is not (the migration case, #825).
+    let mut tracked: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for line in ledger.lines() {
         let Ok(v) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -686,15 +735,22 @@ pub fn check_against_ledger(lock: &BTreeMap<String, LockEntry>, ledger: &str) ->
             "approve" | "revoke" => {
                 let hash = v["manifest_hash"].as_str().unwrap_or_default();
                 let bundle = v["bundle_hash"].as_str().map(str::to_string);
+                let recorded =
+                    event == "approve" && (bundle.is_some() || v["secrets_recorded"] == true);
                 last.insert(server.to_string(), (event.into(), hash.into(), bundle));
                 // An approval starts a new grant set: grants never carry over.
                 granted.remove(server);
+                tracked.remove(server);
+                if recorded {
+                    tracked.insert(server.to_string());
+                }
             }
             "secret_grant" | "secret_revoke" => {
                 let secret = v["secret"].as_str().unwrap_or_default().to_string();
                 let set = granted.entry(server.to_string()).or_default();
                 if event == "secret_grant" {
                     set.insert(secret);
+                    tracked.insert(server.to_string());
                 } else {
                     set.remove(&secret);
                 }
@@ -732,13 +788,23 @@ pub fn check_against_ledger(lock: &BTreeMap<String, LockEntry>, ledger: &str) ->
                 "its plugin manifest record is not the one last recorded as approved in the \
                  ledger (added, removed or re-pinned by hand?); approve it again to use it",
             )),
-            // Grants are ledger-tracked for a bundle approval. A plain entry's
-            // `secrets` (#679) predate this and are not in the ledger.
-            Some((_, _, Some(_))) if !e.secrets.iter().all(held) => out.blocked.push(blocked(
-                "it holds a secret grant the ledger does not show as granted, or shows as \
+            // Grants are ledger-authoritative for a bundle approval and for a
+            // plain one that recorded them (#825). An older plain approval
+            // has no grant lines: its `secrets` (#679) are reported, not
+            // blocked, until the owner's next approval or `revoke --secret`.
+            Some((_, _, b))
+                if (b.is_some() || tracked.contains(name)) && !e.secrets.iter().all(held) =>
+            {
+                out.blocked.push(blocked(
+                    "it holds a secret grant the ledger does not show as granted, or shows as \
                      revoked (edited by hand?); approve it again to use it",
-            )),
-            Some(_) => {}
+                ))
+            }
+            Some((_, _, b)) => {
+                if b.is_none() && !tracked.contains(name) && !e.secrets.is_empty() {
+                    out.secrets_unrecorded.push(name.clone());
+                }
+            }
             // No approval line at all. A plain entry may predate the ledger
             // (reported only), but a bundle record never does: it exists only
             // through an approval that writes a line.
