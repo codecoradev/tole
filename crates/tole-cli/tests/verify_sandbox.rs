@@ -376,6 +376,67 @@ fn a_launcher_failure_is_a_refusal_not_a_verify_failure() {
     drop(dir);
 }
 
+/// A workspace layout the command profile refuses (an uninitialized
+/// submodule, a linked worktree inside the workspace) is a refused verify, not
+/// a silent skip and not an unsandboxed run: the mission ends `verify_refused`
+/// before a model turn, says why, and the command never runs. A mission is
+/// unattended, so `optional` does not fall back either (`run_command` would,
+/// with a human attached).
+#[test]
+fn a_workspace_layout_the_profile_refuses_refuses_the_verify() {
+    if !bwrap_works() {
+        return;
+    }
+    for mode in ["required", "optional"] {
+        for layout in ["submodule", "worktree"] {
+            let (dir, ws, home) = project(&format!("layout-{layout}-{mode}"));
+            let real = std::fs::canonicalize(&ws).unwrap();
+            let needle = match layout {
+                "submodule" => {
+                    std::fs::write(
+                        ws.join(".gitmodules"),
+                        "[submodule \"s\"]\n\tpath = s\n\turl = ../s\n",
+                    )
+                    .unwrap();
+                    "not initialized"
+                }
+                _ => {
+                    std::fs::create_dir_all(ws.join(".git/worktrees/w1")).unwrap();
+                    std::fs::create_dir_all(ws.join("wt")).unwrap();
+                    std::fs::write(ws.join("wt/.git"), "gitdir: x\n").unwrap();
+                    std::fs::write(
+                        ws.join(".git/worktrees/w1/gitdir"),
+                        format!("{}/wt/.git\n", real.display()),
+                    )
+                    .unwrap();
+                    "linked worktree"
+                }
+            };
+            let r = mission(
+                &ws,
+                &home,
+                &format!("[sandbox.consumers]\nverify = \"{mode}\"\n"),
+                &path_env(),
+                "touch verify-ran",
+            );
+            let why = format!("{layout}/{mode}\n{}\n{}", r.stdout, r.stderr);
+            assert_ne!(r.code, 0, "{why}");
+            assert!(r.stdout.contains("status: verify_refused"), "{why}");
+            assert!(!r.stdout.contains("status: complete"), "{why}");
+            assert!(
+                r.stderr.contains("verify refused") && r.stderr.contains(needle),
+                "the reason is shown: {why}"
+            );
+            assert!(
+                r.stdout.contains("turns: 0"),
+                "stopped before a turn: {why}"
+            );
+            assert!(!ws.join("verify-ran").exists(), "never ran: {why}");
+            drop(dir);
+        }
+    }
+}
+
 /// The launcher cannot even be started (it passed the self-test and was
 /// gone after): the spawn error is a refusal too.
 #[test]

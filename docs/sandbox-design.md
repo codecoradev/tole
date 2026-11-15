@@ -759,7 +759,11 @@ setting. Nothing about it is sandboxed by default in this slice. The
   backend, workspace grant, protected paths), so the mission ends before any
   model turn is spent, with status `verify_refused`, a non-zero exit and
   `MISSION_COMPLETE` never asked for: the model cannot fix a missing sandbox,
-  so the refusal is not fed back or counted against the three-strike cap
+  and a workspace layout the `command` profile refuses (§9.3: uninitialized or
+  nested submodule, linked worktree inside the workspace, unprotectable `.git`
+  link chain) is the same refusal with the profile's reason, never an
+  unsandboxed run (a mission is unattended, so `optional` has no fallback);
+  the refusal is not fed back or counted against the three-strike cap
   (`verify_failures` stays 0).
 - **The launcher failing is not the command failing.** A sandbox that passed
   the check can still fail to start the command: `bwrap` gone after the
