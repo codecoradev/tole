@@ -16,6 +16,14 @@ workflow; the ecosystem-wide standards it follows live in the team knowledge roo
   `refactor:`, `test:`). The PR title becomes the squash commit message.
 - **Pre-commit**: `cargo fmt` → `cargo clippy --workspace --all-targets -- -D
   warnings` → `cargo test --workspace`. CI enforces the same set.
+- **Test directories** (#781): a test that needs a scratch directory uses
+  `TestDir` (`crates/*/tests/support/test_dir.rs` or `tests/common/test_dir.rs`,
+  and the `crate::test_dir` module in unit tests), never a hand-built
+  `std::env::temp_dir().join(..)`. It removes itself when dropped, also on a
+  panic; `TOLE_KEEP_TEST_DIRS=1` keeps the directories for debugging. A child
+  process that may still use the directory is killed and reaped first (see
+  `ChildGuard`). CI runs the tests with a private `TMPDIR` and fails if a
+  `tole-*` or `cora-*` entry is left behind.
 - **Code review**: every PR gets a Cora review (below) plus maintainer review
   before merge. CI must be green.
 
