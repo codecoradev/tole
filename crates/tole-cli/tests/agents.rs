@@ -8,7 +8,7 @@
 //! installed; the child loop degrades gracefully without it).
 
 mod common;
-use common::{TestDir, WorkDir};
+use common::{wait_until, TestDir, WorkDir, WAIT};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -202,6 +202,36 @@ fn decide(body: &Value) -> Value {
     )
 }
 
+/// Is `pid` a live process (a zombie awaiting its reaper counts as gone)?
+fn process_running(pid: u32) -> bool {
+    std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .map(|o| {
+            let stat = String::from_utf8_lossy(&o.stdout);
+            let stat = stat.trim();
+            o.status.success() && !stat.is_empty() && !stat.starts_with('Z')
+        })
+        .unwrap_or(false)
+}
+
+/// Waits for every child agent the run under `work` detached (its pid files
+/// under `tole-agents/`) to exit.
+fn wait_for_children(work: &std::path::Path) {
+    let pids: Vec<u32> = std::fs::read_dir(work.join("tole-agents"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| std::fs::read_to_string(e.path().join("pid")).ok())
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
+    for pid in pids {
+        wait_until(WAIT, "a detached child agent to exit", || {
+            !process_running(pid)
+        });
+    }
+}
+
 fn run_tole(env_extra: &[(&str, &str)], args: &[&str], stdin: &str) -> (String, String, i32) {
     let dir = WorkDir::new("tole-agent-e2e");
     // The machine guard queues a child while the machine is busy (load per
@@ -248,6 +278,11 @@ fn run_tole(env_extra: &[(&str, &str)], args: &[&str], stdin: &str) -> (String, 
         .write_all(stdin.as_bytes())
         .unwrap();
     let out = child.wait_with_output().unwrap();
+    // The children the run detached outlive it by design and keep writing
+    // under the directory (their `sessions/`). Wait until they are gone
+    // before the guard removes it, or a child on a starved CPU recreates the
+    // tree after the removal and leaves it behind (#826).
+    wait_for_children(&dir);
     (
         String::from_utf8_lossy(&out.stdout).into_owned(),
         String::from_utf8_lossy(&out.stderr).into_owned(),

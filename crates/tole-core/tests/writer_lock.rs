@@ -63,7 +63,10 @@ fn spawn_holder(dir: &std::path::Path, mode: &str) -> Child {
     loop {
         line.clear();
         assert!(out.read_line(&mut line).unwrap() > 0, "child died early");
-        if line.trim() == "ready" {
+        // libtest prints `test child_holder ... ` (no newline) on the same
+        // stdout before the test runs, so on a starved CPU the marker can
+        // trail that prefix instead of sitting on a line of its own.
+        if line.trim().ends_with("ready") {
             break;
         }
     }
