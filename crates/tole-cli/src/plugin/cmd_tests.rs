@@ -1617,3 +1617,109 @@ fn a_script_cannot_approve_past_a_profile_the_lock_was_edited_to_match() {
     assert_eq!(lock_entry(&h).sandbox_hash, Some(wide));
     assert_eq!(h.rows(&v1())[0]["state"], json!("approved"));
 }
+
+// ---- the ledger, not the raw lock, decides on approve (#841) ----
+
+/// A lock edit alone cannot lift the sandbox requirement: nothing writes
+/// `third-party-verified` and no ledger line records a tier, so a lock that
+/// claims it is an unverified server.
+#[test]
+fn a_lock_claiming_verified_does_not_lift_the_sandbox_requirement_on_approve() {
+    let mut h = H::new("tier-forged", &["srv"]);
+    h.first_party = Some(Vec::new());
+    let mut lock = Lockfile::default();
+    lock.servers.insert(
+        "srv".into(),
+        LockEntry {
+            source: "stdio:true".into(),
+            manifest_hash: "sha256:old".into(),
+            tier: Some(Tier::ThirdPartyVerified),
+            ..Default::default()
+        },
+    );
+    lock.save(&h.user()).unwrap();
+    // The display says unverified too.
+    assert_eq!(h.rows(&v1())[0]["tier"], json!("third-party-unverified"));
+    // No working sandbox: a script's approve must be refused before anything
+    // starts (a verified tier would have skipped this and run it unwrapped).
+    let e = h
+        .run(&v1(), approve("srv", Some(&hash(&v1()))))
+        .unwrap_err();
+    assert!(e.contains("only inside the sandbox"), "{e}");
+    assert!(h.probes.borrow().is_empty(), "started unsandboxed");
+    assert_eq!(
+        Lockfile::load(&h.user()).unwrap().servers["srv"].manifest_hash,
+        "sha256:old"
+    );
+}
+
+/// A lock that drops the `bundle` record would turn a bundle approval into a
+/// plain one: no `--bundle-hash` review for a script, and every `mcp` secret
+/// granted instead of the owner's per-secret choice. The ledger recorded a
+/// bundle approval, so `approve` refuses and writes nothing.
+#[test]
+fn a_lock_without_the_bundle_record_cannot_be_approved_as_a_plain_server() {
+    let (h, _dir) = installed("bundle-stripped");
+    h.grants.borrow_mut().push("OTHER_KEY".into());
+    let mut lock = Lockfile::load(&h.user()).unwrap();
+    lock.servers.get_mut("srv").unwrap().bundle = None;
+    lock.save(&h.user()).unwrap();
+    let ledger_before = ledger_of(&h);
+    let e = h
+        .run(&v1(), approve("srv", Some(&hash(&v1()))))
+        .unwrap_err();
+    assert!(e.contains("not the one your ledger recorded"), "{e}");
+    // The terminal path is refused the same way: only `--manifest` names it.
+    let e = h
+        .go(&|_| v1(), Some(true), approve("srv", None))
+        .unwrap_err();
+    assert!(e.contains("--manifest"), "{e}");
+    assert_eq!(ledger_of(&h), ledger_before);
+    assert_eq!(entry(&h).secrets, ["A_TOKEN"]);
+    assert!(entry(&h).bundle.is_none());
+}
+
+/// The same disagreement the other way: a record the ledger never approved
+/// (a plain approval with a bundle added by hand).
+#[test]
+fn a_bundle_record_the_ledger_never_approved_stops_approve() {
+    let h = profiled("bundle-added");
+    h.run(&v1(), approve("srv", Some(&hash(&v1())))).unwrap();
+    let dir = manifest(&h, BUNDLE);
+    let l = crate::plugin::bundle::load(&dir).unwrap();
+    let mut lock = Lockfile::load(&h.user()).unwrap();
+    lock.servers.get_mut("srv").unwrap().bundle = Some(plugin_lock::BundleRef {
+        plugin: "acme".into(),
+        version: "1.2.0".into(),
+        hash: l.hash.clone(),
+        path: l.path.display().to_string(),
+    });
+    lock.save(&h.user()).unwrap();
+    let ledger_before = ledger_of(&h);
+    let e = h
+        .run(&v1(), approve("srv", Some(&hash(&v1()))))
+        .unwrap_err();
+    assert!(e.contains("not the one your ledger recorded"), "{e}");
+    assert_eq!(ledger_of(&h), ledger_before);
+}
+
+/// An unedited bundle server is still re-approved from its recorded manifest,
+/// and `--manifest` names it when the lock and the ledger disagree.
+#[test]
+fn a_bundle_server_is_re_approved_from_the_ledger_agreed_record_or_an_explicit_manifest() {
+    let (h, dir) = installed("bundle-reapprove");
+    h.go(&|_| v1(), Some(true), approve("srv", None)).unwrap();
+    assert!(entry(&h).bundle.is_some());
+    let mut lock = Lockfile::load(&h.user()).unwrap();
+    lock.servers.get_mut("srv").unwrap().bundle = None;
+    lock.save(&h.user()).unwrap();
+    let act = PluginAction::Approve {
+        name: "srv".into(),
+        hash: None,
+        project: false,
+        bundle_hash: None,
+        manifest: Some(dir.join(crate::plugin::bundle::FILE)),
+    };
+    h.go(&|_| v1(), Some(true), act).unwrap();
+    assert_eq!(entry(&h).bundle.unwrap().plugin, "acme");
+}

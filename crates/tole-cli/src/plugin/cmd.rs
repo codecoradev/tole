@@ -133,6 +133,18 @@ impl Ctx<'_> {
     }
 }
 
+/// The tier a decision may rely on. No ledger line records a tier, so the
+/// ledger cannot vouch for a lock's `third-party-verified`, and nothing
+/// legitimate writes it yet: a lock claiming it counts as unverified, so a
+/// lock edit cannot lift the sandbox requirement. First-party stays the
+/// owner's list (see [`tier_of`]).
+fn trusted_tier(name: &str, entry: Option<&LockEntry>, first_party: &[String]) -> Tier {
+    match tier_of(name, entry, first_party) {
+        Tier::ThirdPartyVerified => Tier::ThirdPartyUnverified,
+        other => other,
+    }
+}
+
 fn short(hash: &str) -> &str {
     &hash[..hash.len().min(19)]
 }
@@ -351,7 +363,7 @@ fn list(ctx: &Ctx<'_>, as_json: bool) -> String {
             "name": ctx.clean(name),
             "state": ctx.clean(&state),
             "revoked": entry.is_some_and(|e| e.revoked),
-            "tier": tier_of(name, entry, &ctx.first_party).as_str(),
+            "tier": trusted_tier(name, entry, &ctx.first_party).as_str(),
             "source": source.as_deref().map(|s| ctx.clean(s)),
             "version": entry.map(|e| ctx.clean(&e.version)),
             "manifest_hash": entry.map(|e| e.manifest_hash.clone()),
@@ -522,7 +534,7 @@ fn diff(ctx: &Ctx<'_>, name: &str) -> Result<String, String> {
     let mut out = format!(
         "`{}` ({}){}\n",
         ctx.clean(name),
-        tier_of(name, Some(e), &ctx.first_party).as_str(),
+        trusted_tier(name, Some(e), &ctx.first_party).as_str(),
         if e.revoked { " REVOKED" } else { "" }
     );
     if e.source == source {
@@ -1224,9 +1236,27 @@ fn bundle_of(
     ctx: &Ctx<'_>,
     name: &str,
     existing: Option<&LockEntry>,
+    ledger: Option<&str>,
     over: Option<&Path>,
     cfg: &McpServerConfig,
 ) -> Result<Option<(Loaded, bundle::ServerDecl)>, String> {
+    // The ledger is the authority on whether this server was approved from a
+    // bundle: a lock that drops the record (a script then needs no
+    // `--bundle-hash`, and the plain path grants every `mcp` secret), adds
+    // one, or re-pins it disagrees with the last approval and is not trusted.
+    // The owner can still name the manifest with `--manifest` (reviewed below).
+    if let (Some(text), None) = (ledger, over) {
+        let approved = plugin_lock::ledger_bundle(text, name).flatten();
+        let locked = existing.and_then(|e| e.bundle.as_ref()).map(|b| &b.hash);
+        if approved.as_ref() != locked {
+            return Err(format!(
+                "the plugin manifest record of `{0}` in the lock is not the one your ledger \
+                 recorded at its last approval (edited by hand?), so nothing is approved on it: \
+                 name the manifest yourself with `tole plugin approve {0} --manifest <file>`",
+                ctx.clean(name)
+            ));
+        }
+    }
     let recorded = existing
         .and_then(|e| e.bundle.as_ref())
         .map(|b| PathBuf::from(&b.path));
@@ -1278,8 +1308,22 @@ fn approve(ctx: &mut Ctx<'_>, name: &str, opts: Approve<'_>) -> Result<String, S
     .servers
     .get(name)
     .cloned();
-    let tier = tier_of(name, existing.as_ref(), &ctx.first_party);
-    let bundle = bundle_of(ctx, name, existing.as_ref(), manifest, &cfg)?;
+    let ledger = ctx
+        .user
+        .as_deref()
+        .and_then(|u| u.parent().map(|d| d.join(plugin_lock::LEDGER_FILE)))
+        .map(|p| plugin_lock::read_ledger(&p))
+        .transpose()?
+        .flatten();
+    let tier = trusted_tier(name, existing.as_ref(), &ctx.first_party);
+    let bundle = bundle_of(
+        ctx,
+        name,
+        existing.as_ref(),
+        ledger.as_deref(),
+        manifest,
+        &cfg,
+    )?;
     let ((version, live), before) = start_for_review(ctx, &cfg, tier)?;
     let hash = plugin_lock::manifest_hash(&live);
     let mut shown = ctx.clean(&render_manifest(name, &version, &live));
@@ -1293,13 +1337,6 @@ fn approve(ctx: &mut Ctx<'_>, name: &str, opts: Approve<'_>) -> Result<String, S
         // the lock file alone: a lock hash edited to match a widened profile
         // is itself a move.
         let one = std::collections::BTreeMap::from([(name.to_string(), e.clone())]);
-        let ledger = ctx
-            .user
-            .as_deref()
-            .and_then(|u| u.parent().map(|d| d.join(plugin_lock::LEDGER_FILE)))
-            .map(|p| plugin_lock::read_ledger(&p))
-            .transpose()?
-            .flatten();
         let moved = plugin_lock::profile_moved(
             &one,
             ledger.as_deref(),

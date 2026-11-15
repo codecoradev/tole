@@ -779,6 +779,24 @@ pub fn ledger_profile(ledger: &str, server: &str) -> Option<(Option<String>, Opt
     rec
 }
 
+/// The bundle hash the ledger recorded on `server`'s LAST `approve` line:
+/// `None` when the ledger holds no approval of it, `Some(None)` when the last
+/// approval was a plain one (no bundle), `Some(Some(hash))` for a bundle
+/// approval. A `revoke` does not reset it: a revoked bundle server is still
+/// a bundle server, so a lock that drops the record cannot turn it plain.
+pub fn ledger_bundle(ledger: &str, server: &str) -> Option<Option<String>> {
+    let mut rec = None;
+    for line in ledger.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if v["kind"] == "plugin" && v["server"] == server && v["event"] == "approve" {
+            rec = Some(v["bundle_hash"].as_str().map(str::to_string));
+        }
+    }
+    rec
+}
+
 /// Whether the sandbox profile of `server` moved since its approval, decided
 /// by the ledger and never by the lock file alone: a lock record that
 /// differs from the ledger's, or a lock hash the ledger never recorded, is
