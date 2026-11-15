@@ -1231,42 +1231,88 @@ fn an_uninitialized_submodule_refuses_the_launch() {
     assert!(protect_plan(&ws).is_ok());
 }
 
-/// A linked worktree whose `.git` file lives anywhere in the workspace is found
-/// through the back-pointer in the read-only `.git/worktrees/<id>/gitdir`.
+/// A linked worktree inside the workspace but outside `.tole-worktrees` cannot
+/// be protected: it is found through the registry of the gitdir in effect and
+/// refused. A broken registry is refused, never skipped.
 #[cfg(unix)]
 #[test]
-fn a_linked_worktree_elsewhere_in_the_workspace_gets_its_git_file_bound() {
-    let (_g, ws) = keep("linked-wt");
-    std::fs::create_dir_all(ws.join(".git/worktrees/w1")).unwrap();
+fn a_linked_worktree_elsewhere_in_the_workspace_is_refused() {
+    let register = |gitdir: &Path, id: &str, wt_git: &Path| {
+        std::fs::create_dir_all(gitdir.join("worktrees").join(id)).unwrap();
+        std::fs::write(
+            gitdir.join("worktrees").join(id).join("gitdir"),
+            format!("{}\n", wt_git.display()),
+        )
+        .unwrap();
+    };
+    // Top-level `.git` directory.
+    let (_g, ws) = keep("lwt-dir");
     std::fs::create_dir_all(ws.join("other/wt")).unwrap();
-    std::fs::write(
-        ws.join("other/wt/.git"),
-        format!("gitdir: {}\n", ws.join(".git/worktrees/w1").display()),
-    )
-    .unwrap();
+    std::fs::write(ws.join("other/wt/.git"), "gitdir: x\n").unwrap();
+    register(&ws.join(".git"), "w1", &ws.join("other/wt/.git"));
+    let e = protect_plan(&ws).unwrap_err();
+    assert!(
+        e.contains("linked worktree")
+            && e.contains("other/wt/.git")
+            && e.contains(".tole-worktrees"),
+        "{e}"
+    );
+    // The target of a gitdir FILE (separate git dir) is read the same way.
+    let (_g, ws) = keep("lwt-sep");
+    std::fs::create_dir_all(ws.join("other/wt")).unwrap();
+    std::fs::write(ws.join("other/wt/.git"), "gitdir: x\n").unwrap();
+    std::fs::create_dir_all(ws.join(".gd")).unwrap();
+    std::fs::write(ws.join(".git"), "gitdir: .gd\n").unwrap();
+    register(&ws.join(".gd"), "w1", &ws.join("other/wt/.git"));
+    assert!(protect_plan(&ws).unwrap_err().contains("linked worktree"));
+    // Under `.tole-worktrees` (bound whole), outside the workspace (not in the
+    // view) and stale (the path is gone) are fine.
+    let (_g, ws) = keep("lwt-fine");
+    std::fs::create_dir_all(ws.join(".tole-worktrees/a")).unwrap();
+    std::fs::write(ws.join(".tole-worktrees/a/.git"), "gitdir: x\n").unwrap();
+    register(&ws.join(".git"), "a", &ws.join(".tole-worktrees/a/.git"));
+    register(&ws.join(".git"), "b", Path::new("/elsewhere/wt/.git"));
+    register(&ws.join(".git"), "c", &ws.join("gone/.git"));
+    assert!(protect_plan(&ws).is_ok());
+
+    // Refused, never skipped: a link or non-directory `worktrees`, a link or
+    // non-regular back-pointer, too many entries, an oversized pointer.
+    let (_g, ws) = keep("lwt-link-registry");
+    std::fs::create_dir_all(ws.join(".git")).unwrap();
+    std::fs::create_dir_all(ws.join("real")).unwrap();
+    std::os::unix::fs::symlink(ws.join("real"), ws.join(".git/worktrees")).unwrap();
+    assert!(protect_plan(&ws).unwrap_err().contains("not a directory"));
+    let (_g, ws) = keep("lwt-file-registry");
+    std::fs::create_dir_all(ws.join(".git")).unwrap();
+    std::fs::write(ws.join(".git/worktrees"), "x").unwrap();
+    assert!(protect_plan(&ws).unwrap_err().contains("not a directory"));
+    let (_g, ws) = keep("lwt-link-pointer");
+    std::fs::create_dir_all(ws.join(".git/worktrees/w1")).unwrap();
+    std::fs::write(ws.join("target"), "/elsewhere/.git\n").unwrap();
+    std::os::unix::fs::symlink(ws.join("target"), ws.join(".git/worktrees/w1/gitdir")).unwrap();
+    assert!(protect_plan(&ws)
+        .unwrap_err()
+        .contains("not a regular file"));
+    let (_g, ws) = keep("lwt-dir-pointer");
+    std::fs::create_dir_all(ws.join(".git/worktrees/w1/gitdir")).unwrap();
+    assert!(protect_plan(&ws)
+        .unwrap_err()
+        .contains("not a regular file"));
+    let (_g, ws) = keep("lwt-many");
+    for i in 0..=MAX_NESTED {
+        register(
+            &ws.join(".git"),
+            &format!("w{i}"),
+            Path::new("/elsewhere/.git"),
+        );
+    }
+    assert!(protect_plan(&ws).unwrap_err().contains("more than"));
+    let (_g, ws) = keep("lwt-big");
+    std::fs::create_dir_all(ws.join(".git/worktrees/w1")).unwrap();
     std::fs::write(
         ws.join(".git/worktrees/w1/gitdir"),
-        format!("{}\n", ws.join("other/wt/.git").display()),
+        format!("/elsewhere/{}\n", "x".repeat(5000)),
     )
     .unwrap();
-    std::fs::write(ws.join(".git/worktrees/w1/commondir"), "../..\n").unwrap();
-    let plan = protect_plan(&ws).unwrap();
-    assert!(plan.contains(&ws.join("other/wt/.git")), "{plan:?}");
-    // A back-pointer outside the workspace is not in the view; a stale one
-    // (the worktree is gone) binds nothing; a link in the chain is refused.
-    std::fs::write(ws.join(".git/worktrees/w1/gitdir"), "/elsewhere/wt/.git\n").unwrap();
-    assert_eq!(protect_plan(&ws).unwrap(), [ws.join(".git")]);
-    std::fs::write(
-        ws.join(".git/worktrees/w1/gitdir"),
-        format!("{}\n", ws.join("gone/.git").display()),
-    )
-    .unwrap();
-    assert_eq!(protect_plan(&ws).unwrap(), [ws.join(".git")]);
-    std::os::unix::fs::symlink(ws.join("other"), ws.join("lnk")).unwrap();
-    std::fs::write(
-        ws.join(".git/worktrees/w1/gitdir"),
-        format!("{}\n", ws.join("lnk/wt/.git").display()),
-    )
-    .unwrap();
-    assert!(protect_plan(&ws).unwrap_err().contains("symbolic link"));
+    assert!(protect_plan(&ws).unwrap_err().contains("larger than"));
 }

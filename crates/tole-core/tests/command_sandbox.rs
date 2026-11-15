@@ -1203,32 +1203,53 @@ fn an_uninitialized_submodule_refuses_the_launch_and_nothing_runs() {
     assert_ne!(ok["status"], 0, "now protected: {ok}");
 }
 
-/// A linked worktree that lives elsewhere in the workspace (not under
-/// `.tole-worktrees`) is found through the back-pointer in the read-only
-/// `.git/worktrees/<id>/gitdir`: its `.git` file cannot be replaced.
+/// A linked worktree elsewhere in the workspace (not under `.tole-worktrees`)
+/// cannot be protected: the launch is refused and the command never runs.
 #[test]
-fn a_linked_worktree_elsewhere_in_the_workspace_keeps_its_git_file() {
+fn a_linked_worktree_elsewhere_in_the_workspace_refuses_the_launch() {
     if skipped() {
         return;
     }
     let w = repo("linkedwt");
     host_git(&w, &["worktree", "add", "-q", "other/wt", "-b", "wtb"]);
     assert!(w.join("other/wt/.git").is_file());
-    let before = tree(&w.join(".git"));
     let tool = RunCommandTool::new(w.clone());
-    all_fail(
-        &tool,
-        &[
-            "rm -f other/wt/.git",
-            "mv other/wt/.git other/wt/.gx",
-            "sh -c 'rm other/wt/.git && mkdir -p other/wt/.git/hooks'",
-            "sh -c 'echo x >> other/wt/.git'",
-        ],
+    let e = tool
+        .execute(json!({"command": format!("touch {}", w.join("ran").display())}))
+        .unwrap_err();
+    assert!(
+        e.contains("linked worktree") && e.contains("other/wt/.git"),
+        "{e}"
     );
-    assert!(w.join("other/wt/.git").is_file());
-    assert_eq!(tree(&w.join(".git")), before);
-    // The worktree's files are still editable (only `.git` is bound).
-    let out = run(&tool, "sh -c 'echo y > other/wt/f2'");
+    assert!(!w.join("ran").exists(), "the command never ran");
+    // Removed, the workspace launches again.
+    host_git(&w, &["worktree", "remove", "--force", "other/wt"]);
+    let out = run(&tool, "sh -c 'echo ok'");
     assert_eq!(out["status"], 0, "{out}");
-    host_git(&w.join("other/wt"), &["status", "--short"]);
+}
+
+/// The same with a separate git dir: the registry is in `.gd/worktrees`, the
+/// target of the `.git` file, not in a `.git` directory.
+#[test]
+fn a_linked_worktree_of_a_separate_git_dir_refuses_the_launch() {
+    if skipped() {
+        return;
+    }
+    let w = ws("linkedwt-sep");
+    let gd = w.join(".gd");
+    host_git(
+        &w,
+        &["init", "-q", "--separate-git-dir", gd.to_str().unwrap()],
+    );
+    std::fs::write(w.join("f"), "one\n").unwrap();
+    host_git(&w, &["add", "f"]);
+    host_git(&w, &["commit", "-q", "-m", "one"]);
+    host_git(&w, &["worktree", "add", "-q", "other/wt", "-b", "wtb"]);
+    assert!(gd.join("worktrees").is_dir());
+    let tool = RunCommandTool::new(w.clone());
+    let e = tool
+        .execute(json!({"command": format!("touch {}", w.join("ran").display())}))
+        .unwrap_err();
+    assert!(e.contains("linked worktree"), "{e}");
+    assert!(!w.join("ran").exists(), "the command never ran");
 }

@@ -563,10 +563,7 @@ file_size_mb = 4096            # 1 to 1048576, largest file a process writes
   that can be named cheaply and deterministically are protected without
   scanning the workspace: every `path` of `.gitmodules` (at most 64, each of
   which must be an initialized submodule with a `.git`) gets its
-  `.git` bound the same way, every linked worktree registered in the read-only
-  `.git/worktrees/<id>/gitdir` whose `.git` file lies inside the workspace (at
-  most 64; back-pointers read whole and bounded, no link followed) gets its
-  `.git` file bound read-only wherever it is, `.gitmodules` itself is bound read-only (it is the
+  `.git` bound the same way, `.gitmodules` itself is bound read-only (it is the
   input of the plan: a command that could rewrite it would take a submodule out
   of the next launch's plan), and the whole `.tole-worktrees` directory
   (child-agent worktrees) is read-only, so no entry can be removed or replaced
@@ -574,7 +571,16 @@ file_size_mb = 4096            # 1 to 1048576, largest file a process writes
   cannot change files inside a child agent's worktree.
 
   Layouts the plan cannot cover are REFUSED, not half protected (the launch
-  fails with the cause; `optional` follows its fallback policy): a submodule
+  fails with the cause; `optional` follows its fallback policy): a linked
+  worktree (`git worktree add`) whose `.git` file lies inside the workspace but
+  not under `.tole-worktrees` (found through the registry
+  `<gitdir>/worktrees/<id>/gitdir` of the gitdir in effect, the top-level `.git`
+  directory or the target of a gitdir file such as a separate git dir; a
+  worktree outside the workspace is not in the sandbox's view, and a stale
+  pointer whose path is gone is fine; a `worktrees` that is a link or not a
+  directory, a back-pointer that is a link or not a regular file, more than 64
+  entries or an oversized pointer are refused too, never skipped; remove the
+  worktree with `git worktree remove` or keep it outside the workspace); a submodule
   listed in `.gitmodules` that is not initialized (a missing path, an empty
   directory as after a clone without `--recursive`, a directory without `.git`,
   a regular file: there is no `.git` to bind, and a command could `git init` one

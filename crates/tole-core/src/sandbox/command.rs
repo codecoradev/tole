@@ -358,46 +358,10 @@ pub fn protect_plan(ws: &Path) -> Result<Vec<PathBuf>, String> {
             nested.push(p.join(".git"));
         }
     }
-    // Linked worktrees anywhere in the workspace: the read-only `.git/worktrees`
-    // holds a back-pointer (`<id>/gitdir`) to each one's `.git` file. Bounded,
-    // no link followed, only what lies inside the workspace.
-    let registered = ws.join(".git/worktrees");
-    if std::fs::symlink_metadata(ws.join(".git")).is_ok_and(|m| m.is_dir())
-        && std::fs::symlink_metadata(&registered).is_ok_and(|m| m.is_dir())
-    {
-        let entries = std::fs::read_dir(&registered)
-            .map_err(|e| format!("cannot read {} ({e})", registered.display()))?;
-        for (i, e) in entries.enumerate() {
-            let e = e.map_err(|e| format!("cannot read {} ({e})", registered.display()))?;
-            if i >= MAX_NESTED {
-                return Err(format!(
-                    "{} lists more than {MAX_NESTED} linked worktrees",
-                    registered.display()
-                ));
-            }
-            let back = e.path().join("gitdir");
-            if !std::fs::symlink_metadata(&back).is_ok_and(|m| m.is_file()) {
-                continue;
-            }
-            let text = read_bounded(&back, 4096)?;
-            let wt_git = lexical(Path::new(text.trim()));
-            if !wt_git.is_absolute() || !wt_git.starts_with(ws) {
-                continue;
-            }
-            let mut p = ws.to_path_buf();
-            for c in wt_git
-                .strip_prefix(ws)
-                .unwrap_or(Path::new(""))
-                .components()
-            {
-                p.push(c);
-                if p != wt_git {
-                    exists(&p)?;
-                }
-            }
-            nested.push(wt_git);
-        }
-    }
+    // A linked worktree whose `.git` file lies inside the workspace, but not
+    // under `.tole-worktrees` (which is bound whole), cannot be protected: it is
+    // found through the registry of the gitdir in effect, and refused.
+    refuse_linked_worktrees(ws)?;
     // The file that names the submodules is itself bound read-only: it is the
     // input of this plan, so a command that could rewrite it would take a
     // submodule out of the next launch's plan.
@@ -512,6 +476,107 @@ fn check_gitdir_content(dir: &Path, covered: bool) -> Result<(), String> {
             if multi_linked(&m) {
                 return Err(twin(&e.path()));
             }
+        }
+    }
+    Ok(())
+}
+
+/// The gitdir in effect for `ws`: the top-level `.git` directory, or the
+/// directory a `.git` gitdir file names (inside the workspace or not, it is read
+/// on the host). `None` when there is none or the target does not exist.
+fn effective_gitdir(ws: &Path) -> Result<Option<PathBuf>, String> {
+    let git = ws.join(".git");
+    let Ok(meta) = std::fs::symlink_metadata(&git) else {
+        return Ok(None);
+    };
+    if meta.is_dir() {
+        return Ok(Some(git));
+    }
+    if !meta.is_file() {
+        return Ok(None);
+    }
+    let text = read_bounded(&git, 4096)?;
+    let Some(rel) = text.lines().find_map(|l| l.strip_prefix("gitdir:")) else {
+        return Ok(None);
+    };
+    let rel = Path::new(rel.trim());
+    let abs = if rel.is_absolute() {
+        rel.to_path_buf()
+    } else {
+        ws.join(rel)
+    };
+    let dir = lexical(&abs);
+    Ok(std::fs::symlink_metadata(&dir)
+        .is_ok_and(|m| m.is_dir())
+        .then_some(dir))
+}
+
+/// Refuses a workspace that has a linked worktree (`git worktree add`) whose
+/// `.git` file lies inside the workspace but not under `.tole-worktrees`. The
+/// registry is `<gitdir>/worktrees/<id>/gitdir`, a back-pointer to that file.
+/// A `worktrees` that is a link or not a directory, a back-pointer that is a
+/// link or not a regular file, more than [`MAX_NESTED`] entries or an oversized
+/// pointer are refused too, never skipped; a stale pointer (the path no longer
+/// exists) and a worktree outside the workspace (not in the sandbox's view) are
+/// fine.
+fn refuse_linked_worktrees(ws: &Path) -> Result<(), String> {
+    use std::fs::symlink_metadata;
+    let Some(gitdir) = effective_gitdir(ws)? else {
+        return Ok(());
+    };
+    let registry = gitdir.join("worktrees");
+    match symlink_metadata(&registry) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("cannot inspect {} ({e})", registry.display())),
+        Ok(m) if m.is_dir() => {}
+        Ok(_) => {
+            return Err(format!(
+                "{} is a link or not a directory; the linked worktrees it should list cannot \
+                 be checked",
+                registry.display()
+            ))
+        }
+    }
+    let entries = std::fs::read_dir(&registry)
+        .map_err(|e| format!("cannot read {} ({e})", registry.display()))?;
+    let tole_wts = ws.join(".tole-worktrees");
+    for (i, e) in entries.enumerate() {
+        let e = e.map_err(|e| format!("cannot read {} ({e})", registry.display()))?;
+        if i >= MAX_NESTED {
+            return Err(format!(
+                "{} lists more than {MAX_NESTED} linked worktrees",
+                registry.display()
+            ));
+        }
+        let back = e.path().join("gitdir");
+        match symlink_metadata(&back) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("cannot inspect {} ({e})", back.display())),
+            Ok(m) if m.is_file() => {}
+            Ok(_) => {
+                return Err(format!(
+                    "{} is a link or not a regular file; the worktree it names cannot be checked",
+                    back.display()
+                ))
+            }
+        }
+        let text = read_bounded(&back, 4096)?;
+        let named = Path::new(text.trim());
+        let wt_git = lexical(&if named.is_absolute() {
+            named.to_path_buf()
+        } else {
+            e.path().join(named)
+        });
+        if wt_git.starts_with(ws)
+            && !wt_git.starts_with(&tole_wts)
+            && symlink_metadata(&wt_git).is_ok()
+        {
+            return Err(format!(
+                "the linked worktree at {} lies inside the workspace outside .tole-worktrees, \
+                 and the sandbox cannot protect its .git file; refused (remove it with git \
+                 worktree remove, or keep worktrees outside the workspace)",
+                wt_git.display()
+            ));
         }
     }
     Ok(())
