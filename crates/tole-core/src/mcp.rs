@@ -876,23 +876,22 @@ async fn start_server(
             // Sandbox (#601): off unless the owner's user config asks. When
             // on, the server runs as `bwrap <flags> -- <server>`; the ENV-1
             // scrub below then applies to the `bwrap` process itself.
-            let mut std_cmd =
-                match crate::sandbox::launch(&cfg.name, cfg.workspace.as_deref(), command, args) {
-                    crate::sandbox::Launch::Direct { warning } => {
-                        if let Some(w) = warning {
-                            eprintln!("tole: {w}");
-                        }
-                        let mut c = std::process::Command::new(command);
-                        c.args(args);
-                        c
-                    }
-                    crate::sandbox::Launch::Sandboxed { program, args } => {
-                        let mut c = std::process::Command::new(program);
-                        c.args(args);
-                        c
-                    }
-                    crate::sandbox::Launch::Refused(why) => return Err(why),
-                };
+            let launch = crate::sandbox::launch(&cfg.name, cfg.workspace.as_deref(), command, args);
+            // One start-up line per server: sandboxed, unsandboxed, or refused (#809).
+            crate::sandbox::report::log_startup_once(&cfg.name, &launch);
+            let mut std_cmd = match launch {
+                crate::sandbox::Launch::Direct { .. } => {
+                    let mut c = std::process::Command::new(command);
+                    c.args(args);
+                    c
+                }
+                crate::sandbox::Launch::Sandboxed { program, args } => {
+                    let mut c = std::process::Command::new(program);
+                    c.args(args);
+                    c
+                }
+                crate::sandbox::Launch::Refused(why) => return Err(why),
+            };
             // ENV-1: same secret scrubbing as every other spawn point, and
             // only the secrets this server's approval granted (#679).
             let release = crate::secret_release::release();

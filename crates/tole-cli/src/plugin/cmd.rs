@@ -25,8 +25,8 @@ use tole_core::sandbox::{Availability, Mode, Policy};
 use tole_core::secrets::SecretSet;
 
 use crate::plugin_gate::{
-    apply_ledger, blocked_notes, integrity, record_event, render_manifest, source_of, Approval,
-    Gate,
+    apply_ledger, blocked_notes, ensure_ledger_readable, integrity, record_event, render_manifest,
+    source_of, Approval, Gate,
 };
 
 /// `tole plugin <action>`.
@@ -675,6 +675,9 @@ fn add(ctx: &mut Ctx<'_>, spec: &str) -> Result<String, String> {
             ctx.clean(&name)
         ));
     }
+    if let Some(u) = ctx.user.as_deref() {
+        ensure_ledger_readable(u)?;
+    }
     let user_lock = match ctx.user.as_deref() {
         Some(p) => Lockfile::load(p)?,
         None => return Err("no tole data dir: no user lock to write".into()),
@@ -786,6 +789,9 @@ fn approve(
     project: bool,
 ) -> Result<String, String> {
     let cfg = ctx.spec(name)?.clone();
+    if let Some(u) = ctx.user.as_deref() {
+        ensure_ledger_readable(u)?;
+    }
     let existing = Lockfile::load(
         ctx.user
             .as_deref()

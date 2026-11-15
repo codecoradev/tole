@@ -873,6 +873,34 @@ pub fn run_cli(
         tole_core::sandbox::command::doctor_lines(&consumers, &tole_core::sandbox::detect());
     let ok = ok && !consumer_lines.iter().any(|l| l.contains("ERROR"));
     consumer_lines.iter().for_each(|l| println!("{l}"));
+    // Grants of each sandboxed stdio server and consumer (#809): mode,
+    // workspace and extra paths, network, the decision, and any grant that
+    // touches `$HOME` or a credential directory. Paths the owner wrote.
+    #[cfg(feature = "mcp")]
+    let servers: Vec<String> = match &user {
+        Some(Ok(c)) => c
+            .mcp_server
+            .iter()
+            .flatten()
+            .filter_map(|s| tole_core::mcp::McpServerConfig::parse(s).ok())
+            .filter(|m| matches!(m.transport, tole_core::mcp::McpTransport::Stdio { .. }))
+            .map(|m| m.name)
+            .collect(),
+        _ => Vec::new(),
+    };
+    #[cfg(not(feature = "mcp"))]
+    let servers: Vec<String> = Vec::new();
+    for l in tole_core::sandbox::report::doctor_grant_lines(
+        sandbox.as_ref(),
+        &consumers,
+        &tole_core::sandbox::detect(),
+        tole_core::sandbox::unattended(),
+        &servers,
+        std::env::var_os("HOME").map(PathBuf::from).as_deref(),
+        tole_core::paths::tole_data_dir().as_deref(),
+    ) {
+        println!("{l}");
+    }
     // Advisor tier (#587): the profiles that declare one, names only. A
     // broken user config is already reported (and failed) above.
     let advisor_lines = match &user {

@@ -1,6 +1,6 @@
 //! #684 end-to-end with the REAL binary: the owner-only subcommands
 //! (`cron create|resume|edit`, `plugin approve`, `skills approve`,
-//! `config trust`) refuse to write under a session (`TOLE_UNDER_SESSION`,
+//! `config trust`, `discuss start|resume`) refuse to write under a session (`TOLE_UNDER_SESSION`,
 //! or a child agent's `TOLE_AGENT_DEPTH`), and a human at a terminal keeps
 //! working. `CODECORA_HOME` is set on the CHILD only.
 
@@ -96,6 +96,19 @@ fn owner_commands() -> Vec<Vec<&'static str>> {
             "--yes",
         ],
         vec!["delegation", "approvals", "deny", "dap-1-abcdefgh"],
+        vec![
+            "discuss",
+            "start",
+            "--question",
+            "q",
+            "--criterion",
+            "c",
+            "--participant",
+            "p",
+            "--budget",
+            "1000",
+        ],
+        vec!["discuss", "resume", "d-1"],
     ];
     #[cfg(feature = "mcp")]
     {
@@ -122,6 +135,35 @@ fn owner_only_subcommands_refuse_under_a_session_and_write_nothing() {
         }
         assert_eq!(data_files(&home), Vec::<String>::new(), "nothing written");
     }
+}
+
+/// #813: a dry run calls no model and writes nothing, so the guard leaves it
+/// alone (it may still fail later for lack of profiles; not by the guard).
+#[test]
+fn a_discuss_dry_run_is_not_an_owner_decision() {
+    let home = tmpdir();
+    let bare = tmpdir();
+    let o = tole(
+        &real(),
+        &bare,
+        &home,
+        SESSION,
+        &[
+            "discuss",
+            "start",
+            "--dry-run",
+            "--question",
+            "q",
+            "--criterion",
+            "c",
+            "--participant",
+            "p",
+            "--budget",
+            "1000",
+        ],
+    );
+    assert!(!text(&o).contains("agent session"), "{}", text(&o));
+    assert_eq!(data_files(&home), Vec::<String>::new(), "nothing written");
 }
 
 #[test]
