@@ -7,8 +7,9 @@ Status: **design with owner decisions of 2026-11-14 (§16); #601, epic
 profiles `server` and `strict`, network `none` or `host`, connections
 keyed by server name and workspace) and a `tole doctor` line, plus the first
 slice of phase 4 (#748, §9.3): opt-in `[sandbox.consumers]` for `run_command`
-and `job_start` with the built-in `command` profile and rlimits; the rest of
-§15 is not. Builds on [third-party-plugins-design.md](third-party-plugins-design.md)
+and `job_start` with the built-in `command` profile and rlimits; and the
+per-server profiles of #810 (§6.1: named profiles, `[sandbox.servers]`,
+`tole sandbox list|show|set`); the rest of §15 is not. Builds on [third-party-plugins-design.md](third-party-plugins-design.md)
 §4.2–4.3 and [secrets-integrations-design.md](secrets-integrations-design.md),
 and on the #594 audit (#675–#684). The feasibility results in §3 were
 measured on 2026-11-13 in a Linux container (kernel 6.18, Ubuntu 24.04).
@@ -247,6 +248,51 @@ Rules:
 - **Flags.** `--sandbox <profile>` / `--no-sandbox` on `run`, `mission`
   and `chat` may narrow per session; `--no-sandbox` cannot turn off a
   `required` server (the server is then not started).
+
+### 6.1 Named profiles and per-server bindings, as built (#810)
+
+The design block above is the target shape; what is built is smaller and
+user-layer only:
+
+```toml
+[sandbox]
+mode = "required"
+
+[sandbox.profiles.net]       # your own name; `server` and `strict` are built in and cannot be redefined
+workspace = "read"           # none | read (default) | write
+network = "host"             # none (default) | host
+read = ["/opt/data"]         # extra read-only paths
+write = []                   # extra writable paths
+
+[sandbox.servers.github]     # the MCP server NAME (not `name@workspace`)
+profile = "net"              # server | strict | a profile defined above
+```
+
+- A server with a `[sandbox.servers.<name>]` entry runs in that profile;
+  every other server runs in the default (`[sandbox] profile`, which may
+  also name a defined profile, else `server`). The grants of the named
+  profile are checked at each launch exactly like the default's
+  (`check_grant`: no `/`, `$HOME`, data dir, `/proc`, `/sys`, `/dev`).
+  `[sandbox] skip` still wins: a skipped server is not sandboxed.
+- No `hosts` and no `allowlist` network (owner decision 5), and no
+  per-server `mode` yet: the mode is the global one. Consumers
+  (`[sandbox.consumers]`) keep the built-in `command` profile; naming a
+  profile for a consumer is not built.
+- **A project config can never loosen a profile.** The whole `[sandbox]`
+  table is user-layer only: layering copies the user's table and nothing
+  of the project's, so a repository cannot define a profile, bind a server
+  or narrow one either. `tole config check` marks such project lines
+  `IGNORED` and prints, from the user layer, `sandbox effective:` lines
+  with the profile of the default and of each bound server and its source.
+- `tole sandbox list` shows the mode, the default profile, every profile
+  and the bound servers; `tole sandbox show <server>` shows one server's
+  profile, source and grants; `tole sandbox set <server> --profile <p>`
+  writes `[sandbox.servers.<server>]` in the user config (the rest of the
+  file is kept, the result is re-parsed and must differ only by that
+  binding) and refuses under an agent session (#684). `--profile` is the
+  global flag of `tole`; for `tole sandbox` it names the sandbox profile,
+  not a persona. Profiles are defined by editing the file. Not built: the
+  profile name and hash in the plugin lock entry.
 
 ## 7. Default profiles
 

@@ -24,6 +24,7 @@ fn policy(mode: Mode) -> Policy {
         mode,
         profile_name: "server".into(),
         profile: builtin_profile("server").unwrap(),
+        servers: Default::default(),
         skip: vec!["trusted".into()],
         max_servers: 16,
         idle_secs: 900,
@@ -135,6 +136,44 @@ fn doctor_lists_grants_and_marks_the_sensitive_ones() {
     assert!(text.contains("REFUSED"), "home is refused: {text}");
     assert!(text.contains("sandbox mcp[files]: sandboxed"));
     assert!(text.contains("mcp[trusted]: unsandboxed (listed in [sandbox] skip)"));
+}
+
+#[test]
+fn doctor_lists_the_grants_of_a_bound_servers_own_profile() {
+    let (d, home) = home_tree("tole-rep-bound");
+    let mut open = builtin_profile("server").unwrap();
+    open.network = crate::sandbox::Network::Host;
+    open.read = vec![home.join("proj")];
+    let mut p = policy(Mode::Required);
+    p.servers.insert(
+        "gh".into(),
+        crate::sandbox::ServerProfile {
+            name: "open".into(),
+            profile: open,
+        },
+    );
+    let text = doctor_grant_lines(
+        Some(&p),
+        &Consumers::default(),
+        &usable(&d),
+        false,
+        &["gh".into(), "files".into()],
+        Some(&home),
+        None,
+    )
+    .join("\n");
+    assert!(
+        text.contains("sandbox mcp[gh]: mode required, workspace read-only, network host"),
+        "{text}"
+    );
+    assert!(
+        text.contains("sandbox mcp[files]: mode required, workspace read-only, network none"),
+        "{text}"
+    );
+    assert!(
+        text.matches("proj\n").count() == 1,
+        "only gh has the read grant: {text}"
+    );
 }
 
 #[test]

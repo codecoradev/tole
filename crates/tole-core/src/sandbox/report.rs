@@ -163,7 +163,13 @@ pub fn doctor_grant_lines(
                 out.push(format!("{label}: unsandboxed (listed in [sandbox] skip)"));
                 continue;
             }
-            out.extend(profile_lines(&label, p.mode, &p.profile, home, data_dir));
+            out.extend(profile_lines(
+                &label,
+                p.mode,
+                p.profile_for(name).1,
+                home,
+                data_dir,
+            ));
             out.extend(d.iter().map(|d| format!("{label}: {}", decision_text(d))));
         }
     }
