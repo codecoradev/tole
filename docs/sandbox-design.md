@@ -562,7 +562,13 @@ file_size_mb = 4096            # 1 to 1048576, largest file a process writes
   the workspace it is not in the sandbox's view at all). The nested gitdirs
   that can be named cheaply and deterministically are protected the same way,
   without scanning the workspace: every `path` of `.gitmodules` and every
-  `.tole-worktrees/<id>` (child-agent worktrees), at most 64 together. A
+  `.tole-worktrees/<id>` (child-agent worktrees), at most 64 together.
+  Git reads `.gitmodules` as a config file and the file is writable from the
+  sandbox, so only a plain subset is accepted and anything git could read
+  differently refuses the launch: `[submodule "name"]` sections with `key =
+  value` lines, blank lines and whole-line `#`/`;` comments; a comment after a
+  value, a quote, an escape or a continuation, another section or a key outside
+  a submodule section is refused (`path = sub # note` is `sub` to git). A
   SYMBOLIC LINK anywhere in that chain (`.git`, `.git/hooks`, `.git/config`,
   `.tole`, `.gitmodules`, a submodule path, `.tole-worktrees` or one of its
   entries, a gitdir target), a path that leaves the workspace, an unreadable

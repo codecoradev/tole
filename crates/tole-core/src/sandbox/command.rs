@@ -509,17 +509,66 @@ fn read_bounded(file: &Path, max: u64) -> Result<String, String> {
 /// The `path` values of a `.gitmodules` file, relative and inside the
 /// workspace (no root, no `..`), at most [`MAX_NESTED`] entries, in a file of
 /// at most 64 KiB (a larger one is refused).
+///
+/// Git parses `.gitmodules` as a config file (comments after a value, quoting,
+/// escapes, line continuation, case-insensitive names), and a plan that read it
+/// differently from git would leave a registered submodule unprotected (the
+/// file is writable from the sandbox: `path = sub # note` is `sub` for git).
+/// So only a plain subset is accepted and anything else refuses the launch:
+/// blank lines, whole-line `#`/`;` comments, `[submodule "name"]` headers (the
+/// name without `"` or `\`), and `key = value` lines inside one whose value has
+/// no `#`, `;`, `"` or `\`.
 fn gitmodules_paths(file: &Path) -> Result<Vec<PathBuf>, String> {
+    let shown = file.display();
+    let unsupported = |n: usize, why: &str| {
+        format!(
+            "{shown}:{n}: {why}; the sandbox reads only plain `[submodule \"name\"]` sections \
+             with `key = value` lines (no comment after a value, quote or escape) and refuses \
+             anything else, because git would read it differently"
+        )
+    };
     let text = read_bounded(file, 64 * 1024)?;
     let mut out = Vec::new();
-    for line in text.lines() {
-        let Some((k, v)) = line.split_once('=') else {
-            continue;
-        };
-        if k.trim() != "path" {
+    let mut in_submodule = false;
+    for (i, raw) in text.lines().enumerate() {
+        let n = i + 1;
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
             continue;
         }
-        let v = v.trim().trim_matches('"');
+        if let Some(rest) = line.strip_prefix('[') {
+            let name = rest
+                .strip_suffix(']')
+                .and_then(|r| r.split_once(' '))
+                .filter(|(sec, _)| sec.eq_ignore_ascii_case("submodule"))
+                .and_then(|(_, q)| q.strip_prefix('"')?.strip_suffix('"'));
+            match name {
+                Some(name) if !name.contains(['"', '\\']) => in_submodule = true,
+                _ => {
+                    return Err(unsupported(
+                        n,
+                        "a section header that is not `[submodule \"name\"]`",
+                    ))
+                }
+            }
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            return Err(unsupported(n, "a line that is not `key = value`"));
+        };
+        if !in_submodule {
+            return Err(unsupported(n, "a key outside a submodule section"));
+        }
+        let (k, v) = (k.trim(), v.trim());
+        if v.contains(['#', ';', '"', '\\']) {
+            return Err(unsupported(
+                n,
+                "a value with a comment character, quote or escape",
+            ));
+        }
+        if !k.eq_ignore_ascii_case("path") {
+            continue;
+        }
         let p = Path::new(v);
         let bad = v.is_empty()
             || p.is_absolute()
@@ -532,10 +581,7 @@ fn gitmodules_paths(file: &Path) -> Result<Vec<PathBuf>, String> {
         }
         out.push(p.to_path_buf());
         if out.len() > MAX_NESTED {
-            return Err(format!(
-                "{} names more than {MAX_NESTED} submodules",
-                file.display()
-            ));
+            return Err(format!("{shown} names more than {MAX_NESTED} submodules"));
         }
     }
     Ok(out)

@@ -1082,3 +1082,46 @@ fn a_fifo_in_the_protected_names_does_not_hang_the_plan() {
     std::fs::write(ws.join(".gitmodules"), "[submodule \"s\"]\n\tpath = sub\n").unwrap();
     assert!(bounded(ws.clone()).unwrap().contains(&ws.join("sub/.git")));
 }
+
+/// Git reads `.gitmodules` as a config file, and the file is writable from the
+/// sandbox: whatever git would read differently is refused, not guessed.
+#[test]
+fn a_gitmodules_git_could_read_differently_is_refused() {
+    let plan = |text: &str| {
+        let (_g, ws) = keep("gm-syntax");
+        std::fs::write(ws.join(".gitmodules"), text).unwrap();
+        protect_plan(&ws)
+    };
+    for (bad, why) in [
+        ("[submodule \"s\"]\n\tpath = sub # note\n", "inline #"),
+        ("[submodule \"s\"]\n\tpath = sub ; note\n", "inline ;"),
+        ("[submodule \"s\"]\n\tpath = \"sub\"\n", "quoted value"),
+        ("[submodule \"s\"]\n\tpath = su\\\n\tb\n", "continuation"),
+        (
+            "[submodule \"s\"]\n\turl = http://h/x#frag\n",
+            "# in another value",
+        ),
+        ("[core]\n\tpath = sub\n", "other section"),
+        ("[submodule.s]\n\tpath = sub\n", "old header syntax"),
+        ("[submodule \"a\\\"b\"]\n\tpath = sub\n", "escaped name"),
+        ("path = sub\n", "key outside a section"),
+        ("[submodule \"s\"]\n\tpath sub\n", "not key = value"),
+    ] {
+        let e = plan(bad).unwrap_err();
+        assert!(
+            e.contains("plain") && e.contains(".gitmodules"),
+            "{why}: {e}"
+        );
+    }
+    // The plain subset git reads the same way: case-insensitive names, CRLF,
+    // whole-line comments, other plain keys.
+    let (_g, ws) = keep("gm-plain");
+    std::fs::create_dir_all(ws.join("sub")).unwrap();
+    std::fs::write(ws.join("sub/.git"), "gitdir: /elsewhere\n").unwrap();
+    std::fs::write(
+        ws.join(".gitmodules"),
+        "# comment\r\n[Submodule \"s\"]\r\n\tPATH = sub\r\n\turl = https://h/x\r\n; more\r\n",
+    )
+    .unwrap();
+    assert!(protect_plan(&ws).unwrap().contains(&ws.join("sub/.git")));
+}
