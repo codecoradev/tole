@@ -331,6 +331,20 @@ pub fn protect_plan(ws: &Path) -> Result<Vec<PathBuf>, String> {
                 p.push(c);
                 exists(&p)?;
             }
+            // A listed submodule that is not initialized has no `.git` to bind,
+            // and a command could create one (`git init sub`, a planted
+            // `core.fsmonitor`) that the owner's `git status` in the outer
+            // repository then runs: refused until it is initialized or removed.
+            let initialized =
+                std::fs::symlink_metadata(&p).is_ok_and(|m| m.is_dir()) && exists(&p.join(".git"))?;
+            if !initialized {
+                return Err(format!(
+                    "the submodule {} is listed in .gitmodules but is not initialized (no .git \
+                     in it), and the sandbox cannot protect a .git a command would create: \
+                     initialize it (git submodule update --init) or remove it",
+                    rel.display()
+                ));
+            }
             // A submodule with submodules of its own: their gitdirs are not
             // named by this plan (only the top-level `.gitmodules` is read), so
             // the layout is refused rather than half protected.
@@ -342,6 +356,46 @@ pub fn protect_plan(ws: &Path) -> Result<Vec<PathBuf>, String> {
                 ));
             }
             nested.push(p.join(".git"));
+        }
+    }
+    // Linked worktrees anywhere in the workspace: the read-only `.git/worktrees`
+    // holds a back-pointer (`<id>/gitdir`) to each one's `.git` file. Bounded,
+    // no link followed, only what lies inside the workspace.
+    let registered = ws.join(".git/worktrees");
+    if std::fs::symlink_metadata(ws.join(".git")).is_ok_and(|m| m.is_dir())
+        && std::fs::symlink_metadata(&registered).is_ok_and(|m| m.is_dir())
+    {
+        let entries = std::fs::read_dir(&registered)
+            .map_err(|e| format!("cannot read {} ({e})", registered.display()))?;
+        for (i, e) in entries.enumerate() {
+            let e = e.map_err(|e| format!("cannot read {} ({e})", registered.display()))?;
+            if i >= MAX_NESTED {
+                return Err(format!(
+                    "{} lists more than {MAX_NESTED} linked worktrees",
+                    registered.display()
+                ));
+            }
+            let back = e.path().join("gitdir");
+            if !std::fs::symlink_metadata(&back).is_ok_and(|m| m.is_file()) {
+                continue;
+            }
+            let text = read_bounded(&back, 4096)?;
+            let wt_git = lexical(Path::new(text.trim()));
+            if !wt_git.is_absolute() || !wt_git.starts_with(ws) {
+                continue;
+            }
+            let mut p = ws.to_path_buf();
+            for c in wt_git
+                .strip_prefix(ws)
+                .unwrap_or(Path::new(""))
+                .components()
+            {
+                p.push(c);
+                if p != wt_git {
+                    exists(&p)?;
+                }
+            }
+            nested.push(wt_git);
         }
     }
     // The file that names the submodules is itself bound read-only: it is the
@@ -463,6 +517,21 @@ fn check_gitdir_content(dir: &Path, covered: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// `p` with `.` and `..` resolved by text (no file system access).
+fn lexical(p: &Path) -> PathBuf {
+    let mut norm = PathBuf::new();
+    for c in p.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                norm.pop();
+            }
+            std::path::Component::CurDir => {}
+            c => norm.push(c),
+        }
+    }
+    norm
+}
+
 /// The directory a gitdir FILE points to, when it is inside the workspace and
 /// exists: `Ok(None)` for a target outside (not in the sandbox's view) or
 /// missing, an error when the file cannot be read or the path passes through a
@@ -480,16 +549,7 @@ fn gitdir_target(ws: &Path, file: &Path) -> Result<Option<PathBuf>, String> {
         file.parent().unwrap_or(ws).join(rel)
     };
     // `..` and `.` resolved by text, to compare with the real path below.
-    let mut norm = PathBuf::new();
-    for c in abs.components() {
-        match c {
-            std::path::Component::ParentDir => {
-                norm.pop();
-            }
-            std::path::Component::CurDir => {}
-            c => norm.push(c),
-        }
-    }
+    let norm = lexical(&abs);
     if !norm.starts_with(ws) {
         return Ok(None);
     }

@@ -44,7 +44,7 @@ the owner's user.
 | S1 | Read tole's environment or memory (`/proc/<ppid>/environ`, `mem`, ptrace) | closed on Linux by non-dumpable (#675) | also closed by a separate mechanism: tole is not in the sandbox's process namespace |
 | S2 | Read secrets kept in files: `~/.netrc`, `~/.ssh`, `~/.aws`, `~/.config/gh`, `.env` files outside the workspace | open | `$HOME` is not mounted |
 | S3 | Write owner-only records: cron ledger, plugin lock, skill approvals, trust store, user config (`~/.codecora`), or run `tole cron create` / `tole plugin approve` (#684) | open | the data dir does not exist inside; the tole CLI there finds no lock, no ledger and nothing to approve |
-| S4 | Plant code that later runs **outside** the sandbox: `.git/hooks`, `.git/config` (`core.hooksPath`, `core.fsmonitor`), `.tole/` config, shell rc files | open | those paths are read-only inside, `$HOME` is absent |
+| S4 | Plant code that later runs **outside** the sandbox: `.git/hooks`, `.git/config` (`core.hooksPath`, `core.fsmonitor`), `.tole/` config, shell rc files | open | `.git`, `.tole/` and the gitdirs listed in §9.3 are read-only inside, `$HOME` is absent; `.git/config` is read-only, but a `core.hooksPath`, `include.path` or `core.fsmonitor` in it that names scripts inside the workspace (husky style) stays writable: see the residuals of §9.3 |
 | S5 | Send data anywhere (exfiltration, a callback to a control server) | open | no network by default; an allowlist of named hosts through a filtering proxy (§8) |
 | S6 | See or signal other processes (other agents, other servers, the owner's shell) | open | private PID namespace, new session (no `TIOCSTI` on the terminal) |
 | S7 | Escape the view by creating a user or mount namespace inside | n/a | refused (`--disable-userns`, probed in §3) |
@@ -561,8 +561,12 @@ file_size_mb = 4096            # 1 to 1048576, largest file a process writes
   so is the directory it points to when that is inside the workspace (outside
   the workspace it is not in the sandbox's view at all). The nested gitdirs
   that can be named cheaply and deterministically are protected without
-  scanning the workspace: every `path` of `.gitmodules` (at most 64) gets its
-  `.git` bound the same way, `.gitmodules` itself is bound read-only (it is the
+  scanning the workspace: every `path` of `.gitmodules` (at most 64, each of
+  which must be an initialized submodule with a `.git`) gets its
+  `.git` bound the same way, every linked worktree registered in the read-only
+  `.git/worktrees/<id>/gitdir` whose `.git` file lies inside the workspace (at
+  most 64; back-pointers read whole and bounded, no link followed) gets its
+  `.git` file bound read-only wherever it is, `.gitmodules` itself is bound read-only (it is the
   input of the plan: a command that could rewrite it would take a submodule out
   of the next launch's plan), and the whole `.tole-worktrees` directory
   (child-agent worktrees) is read-only, so no entry can be removed or replaced
@@ -570,7 +574,13 @@ file_size_mb = 4096            # 1 to 1048576, largest file a process writes
   cannot change files inside a child agent's worktree.
 
   Layouts the plan cannot cover are REFUSED, not half protected (the launch
-  fails with the cause; `optional` follows its fallback policy): a registered
+  fails with the cause; `optional` follows its fallback policy): a submodule
+  listed in `.gitmodules` that is not initialized (a missing path, an empty
+  directory as after a clone without `--recursive`, a directory without `.git`,
+  a regular file: there is no `.git` to bind, and a command could `git init` one
+  with a planted `core.fsmonitor` that the owner's `git status` in the outer
+  repository runs; initialize it with `git submodule update --init` or remove
+  it); a registered
   submodule that has a `.gitmodules` of its own (nested submodules: only the
   top-level `.gitmodules` is read, so the inner gitdirs would be unprotected;
   any depth, each listed submodule directory is checked without following
@@ -666,6 +676,10 @@ file_size_mb = 4096            # 1 to 1048576, largest file a process writes
     a detached `job_start` began, leaves a repository whose hooks and config
     the host runs later. "Nothing can be created in `.git` or `.tole`" holds
     only when they existed at launch.
+  - `.git/config` is read-only, but the settings in it are not checked: a
+    `core.hooksPath`, `include.path`, `core.fsmonitor` or similar that already
+    points to scripts or files inside the workspace (husky-style hook
+    managers) leaves those scripts writable, and the host runs them.
   - A repository whose `commondir` or gitdir lives outside the workspace is
     outside the sandbox's view and not this plan's concern.
   - A nested repository that is in neither `.gitmodules` nor

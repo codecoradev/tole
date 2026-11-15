@@ -1127,3 +1127,108 @@ fn a_gitdir_redirected_by_commondir_inside_the_workspace_refuses_the_launch() {
         "the config was not written"
     );
 }
+
+/// A submodule that is listed but not initialized (a clone without
+/// `--recursive`): `sub/` is an empty directory with no `.git` to bind, and a
+/// command could `git init sub` and plant a `core.fsmonitor` that the host's
+/// plain `git status` in the outer repository runs. The launch is refused.
+#[test]
+fn an_uninitialized_submodule_refuses_the_launch_and_nothing_runs() {
+    if skipped() {
+        return;
+    }
+    let sub_src = ws("uninit-src");
+    host_git(&sub_src, &["init", "-q"]);
+    std::fs::write(sub_src.join("s"), "s\n").unwrap();
+    host_git(&sub_src, &["add", "s"]);
+    host_git(&sub_src, &["commit", "-q", "-m", "s"]);
+    let top = repo("uninit-top");
+    host_git(
+        &top,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            sub_src.to_str().unwrap(),
+            "sub",
+        ],
+    );
+    host_git(&top, &["commit", "-q", "-m", "add sub"]);
+    // A plain clone: the gitlink and `.gitmodules` are there, `sub/` is empty.
+    let clone = ws("uninit-clone");
+    std::fs::remove_dir_all(&clone).unwrap();
+    let out = std::process::Command::new("git")
+        .args(["clone", "-q"])
+        .arg(&top)
+        .arg(&clone)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert!(clone.join("sub").is_dir() && !clone.join("sub/.git").exists());
+    let mark = clone.join("PWNED_FSM");
+    std::fs::write(
+        clone.join("attack.sh"),
+        format!(
+            "git init -q sub\ngit -C sub config core.fsmonitor 'touch {}; echo'\n",
+            mark.display()
+        ),
+    )
+    .unwrap();
+    let tool = RunCommandTool::new(clone.clone());
+    let e = tool
+        .execute(json!({"command": "sh attack.sh"}))
+        .unwrap_err();
+    assert!(
+        e.contains("not initialized") && e.contains("sub") && e.contains("submodule update --init"),
+        "{e}"
+    );
+    assert!(!clone.join("sub/.git").exists(), "the command never ran");
+    host_git_routine(&clone);
+    assert!(!mark.exists(), "nothing ran on the host");
+    // Initialized, the same workspace is usable (and `.git` of `sub` read-only).
+    host_git(
+        &clone,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "update",
+            "--init",
+            "-q",
+        ],
+    );
+    let ok = run(&tool, "sh -c 'echo x > sub/.git/config'");
+    assert_ne!(ok["status"], 0, "now protected: {ok}");
+}
+
+/// A linked worktree that lives elsewhere in the workspace (not under
+/// `.tole-worktrees`) is found through the back-pointer in the read-only
+/// `.git/worktrees/<id>/gitdir`: its `.git` file cannot be replaced.
+#[test]
+fn a_linked_worktree_elsewhere_in_the_workspace_keeps_its_git_file() {
+    if skipped() {
+        return;
+    }
+    let w = repo("linkedwt");
+    host_git(&w, &["worktree", "add", "-q", "other/wt", "-b", "wtb"]);
+    assert!(w.join("other/wt/.git").is_file());
+    let before = tree(&w.join(".git"));
+    let tool = RunCommandTool::new(w.clone());
+    all_fail(
+        &tool,
+        &[
+            "rm -f other/wt/.git",
+            "mv other/wt/.git other/wt/.gx",
+            "sh -c 'rm other/wt/.git && mkdir -p other/wt/.git/hooks'",
+            "sh -c 'echo x >> other/wt/.git'",
+        ],
+    );
+    assert!(w.join("other/wt/.git").is_file());
+    assert_eq!(tree(&w.join(".git")), before);
+    // The worktree's files are still editable (only `.git` is bound).
+    let out = run(&tool, "sh -c 'echo y > other/wt/f2'");
+    assert_eq!(out["status"], 0, "{out}");
+    host_git(&w.join("other/wt"), &["status", "--short"]);
+}

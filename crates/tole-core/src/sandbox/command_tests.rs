@@ -1193,6 +1193,80 @@ fn nested_submodules_commondir_redirects_and_missing_targets_are_refused() {
     // H1: a second hard link to `.gitmodules`.
     let (_g, ws) = keep("refuse-modules-twin");
     std::fs::write(ws.join(".gitmodules"), "[submodule \"s\"]\n\tpath = sub\n").unwrap();
+    std::fs::create_dir_all(ws.join("sub")).unwrap();
+    std::fs::write(ws.join("sub/.git"), "gitdir: /elsewhere\n").unwrap();
     std::fs::hard_link(ws.join(".gitmodules"), ws.join("modules-twin")).unwrap();
     assert!(protect_plan(&ws).unwrap_err().contains("hard links"));
+}
+
+/// A submodule listed in `.gitmodules` but not initialized has no `.git` to
+/// bind; a command could create one. Refused until initialized or removed.
+#[cfg(unix)]
+#[test]
+fn an_uninitialized_submodule_refuses_the_launch() {
+    let listed = "[submodule \"s\"]\n\tpath = sub\n";
+    // Missing path.
+    let (_g, ws) = keep("uninit-missing");
+    std::fs::write(ws.join(".gitmodules"), listed).unwrap();
+    let e = protect_plan(&ws).unwrap_err();
+    assert!(
+        e.contains("not initialized") && e.contains("sub") && e.contains("submodule update --init"),
+        "{e}"
+    );
+    // Empty directory (a clone without --recursive), and a directory with no .git.
+    std::fs::create_dir_all(ws.join("sub")).unwrap();
+    assert!(protect_plan(&ws).unwrap_err().contains("not initialized"));
+    std::fs::write(ws.join("sub/file"), "x").unwrap();
+    assert!(protect_plan(&ws).unwrap_err().contains("not initialized"));
+    // A regular file where the submodule should be.
+    let (_g, ws) = keep("uninit-file");
+    std::fs::write(ws.join(".gitmodules"), listed).unwrap();
+    std::fs::write(ws.join("sub"), "x").unwrap();
+    assert!(protect_plan(&ws).unwrap_err().contains("not initialized"));
+    // Initialized: fine.
+    let (_g, ws) = keep("uninit-ok");
+    std::fs::write(ws.join(".gitmodules"), listed).unwrap();
+    std::fs::create_dir_all(ws.join("sub")).unwrap();
+    std::fs::write(ws.join("sub/.git"), "gitdir: /elsewhere\n").unwrap();
+    assert!(protect_plan(&ws).is_ok());
+}
+
+/// A linked worktree whose `.git` file lives anywhere in the workspace is found
+/// through the back-pointer in the read-only `.git/worktrees/<id>/gitdir`.
+#[cfg(unix)]
+#[test]
+fn a_linked_worktree_elsewhere_in_the_workspace_gets_its_git_file_bound() {
+    let (_g, ws) = keep("linked-wt");
+    std::fs::create_dir_all(ws.join(".git/worktrees/w1")).unwrap();
+    std::fs::create_dir_all(ws.join("other/wt")).unwrap();
+    std::fs::write(
+        ws.join("other/wt/.git"),
+        format!("gitdir: {}\n", ws.join(".git/worktrees/w1").display()),
+    )
+    .unwrap();
+    std::fs::write(
+        ws.join(".git/worktrees/w1/gitdir"),
+        format!("{}\n", ws.join("other/wt/.git").display()),
+    )
+    .unwrap();
+    std::fs::write(ws.join(".git/worktrees/w1/commondir"), "../..\n").unwrap();
+    let plan = protect_plan(&ws).unwrap();
+    assert!(plan.contains(&ws.join("other/wt/.git")), "{plan:?}");
+    // A back-pointer outside the workspace is not in the view; a stale one
+    // (the worktree is gone) binds nothing; a link in the chain is refused.
+    std::fs::write(ws.join(".git/worktrees/w1/gitdir"), "/elsewhere/wt/.git\n").unwrap();
+    assert_eq!(protect_plan(&ws).unwrap(), [ws.join(".git")]);
+    std::fs::write(
+        ws.join(".git/worktrees/w1/gitdir"),
+        format!("{}\n", ws.join("gone/.git").display()),
+    )
+    .unwrap();
+    assert_eq!(protect_plan(&ws).unwrap(), [ws.join(".git")]);
+    std::os::unix::fs::symlink(ws.join("other"), ws.join("lnk")).unwrap();
+    std::fs::write(
+        ws.join(".git/worktrees/w1/gitdir"),
+        format!("{}\n", ws.join("lnk/wt/.git").display()),
+    )
+    .unwrap();
+    assert!(protect_plan(&ws).unwrap_err().contains("symbolic link"));
 }
