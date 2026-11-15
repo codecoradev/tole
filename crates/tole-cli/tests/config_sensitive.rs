@@ -748,6 +748,9 @@ fn mission_verify_timeout_from_config_is_used() {
 // ------------------------------------------------------- face refusals
 
 const NO_CONFIG_HINT: &str = "use --no-config to ignore the config files";
+/// `serve`, `acp` and `mcp` refuse `--no-config` (#855): the way out there
+/// is to edit the config file.
+const EDIT_CONFIG_HINT: &str = "remove it from that config file";
 
 /// The refused command must exit non-zero, print the flag's message plus
 /// the hint, and never have started (no stdout, no provider contact).
@@ -757,7 +760,15 @@ fn assert_refused_with_hint(config: &str, args: &[&str], needle: &str) {
     let err = text(&o.stderr);
     assert!(!o.status.success(), "{args:?} must fail: {err}");
     assert!(err.contains(needle), "{args:?}: want {needle:?} in {err}");
-    assert!(err.contains(NO_CONFIG_HINT), "{args:?}: no hint in {err}");
+    let unattended = matches!(args[0], "serve" | "acp" | "mcp");
+    if unattended {
+        assert!(
+            err.contains(EDIT_CONFIG_HINT) && !err.contains(NO_CONFIG_HINT),
+            "{args:?}: want the edit-the-config hint in {err}"
+        );
+    } else {
+        assert!(err.contains(NO_CONFIG_HINT), "{args:?}: no hint in {err}");
+    }
     assert_eq!(
         text(&o.stdout),
         "",
@@ -766,13 +777,18 @@ fn assert_refused_with_hint(config: &str, args: &[&str], needle: &str) {
     assert!(!err.contains("missing provider config"), "{err}");
     // `--no-config` drops the keys: the same command line no longer trips
     // the refusal (it fails later, if at all, for unrelated reasons).
-    // (`serve` would start listening, so its control is skipped.)
-    if args[0] == "serve" {
-        return;
-    }
+    // The unattended faces refuse the flag itself (#855).
     let mut with_flag = vec!["--no-config"];
     with_flag.extend_from_slice(args);
     let o = finish(base_cmd(&d, &home, &with_flag));
+    if unattended {
+        assert!(
+            !o.status.success() && text(&o.stderr).contains("--no-config is refused for"),
+            "--no-config on {args:?}: {}",
+            text(&o.stderr)
+        );
+        return;
+    }
     assert!(
         !text(&o.stderr).contains(needle),
         "--no-config: {}",
