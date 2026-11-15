@@ -562,3 +562,60 @@ fn the_ledger_is_authoritative_when_the_lock_drops_or_invents_bundle_state() {
         "a plain pre-ledger entry stays unblocked"
     );
 }
+
+#[test]
+fn a_plain_approval_ties_its_secrets_to_the_ledger_and_an_old_one_is_only_reported() {
+    let h = manifest_hash(&base());
+    let plain = |secrets: &[&str]| {
+        let mut l = locked(&base());
+        l.get_mut("cora").unwrap().secrets = secrets.iter().map(|s| s.to_string()).collect();
+        l
+    };
+    let n = |lock: &BTreeMap<String, LockEntry>, l: &str| check_against_ledger(lock, l);
+    // A new-style approval with one recorded grant.
+    let mut ledger = plain_ledger_line("cora", &h, 1);
+    ledger.push_str(&secret_ledger_line("secret_grant", "cora", "A_TOKEN", 1));
+    assert!(n(&plain(&["A_TOKEN"]), &ledger).blocked.is_empty());
+    assert!(n(&plain(&["A_TOKEN"]), &ledger)
+        .secrets_unrecorded
+        .is_empty());
+    // A hand-added grant is not trusted.
+    assert_eq!(
+        n(&plain(&["A_TOKEN", "EVIL_KEY"]), &ledger).blocked.len(),
+        1
+    );
+    // Also on an approval that granted nothing (marker, no grant lines).
+    let none = plain_ledger_line("cora", &h, 1);
+    assert!(n(&plain(&[]), &none).blocked.is_empty());
+    assert_eq!(n(&plain(&["EVIL_KEY"]), &none).blocked.len(), 1);
+    // A revoked grant put back; a re-approval starts from nothing.
+    let mut after = ledger.clone();
+    after.push_str(&secret_ledger_line("secret_revoke", "cora", "A_TOKEN", 2));
+    assert_eq!(n(&plain(&["A_TOKEN"]), &after).blocked.len(), 1);
+    assert!(n(&plain(&[]), &after).blocked.is_empty());
+    after.push_str(&plain_ledger_line("cora", &h, 3));
+    assert_eq!(n(&plain(&["A_TOKEN"]), &after).blocked.len(), 1);
+    // Migration: an approval from before the marker is reported, not blocked,
+    // and so is one with only a (#811-era) revoke line after it.
+    let old = ledger_line("approve", "cora", &h, 1);
+    let c = n(&plain(&["A_TOKEN"]), &old);
+    assert!(c.blocked.is_empty() && c.secrets_unrecorded == vec!["cora".to_string()]);
+    let mut old_revoke = old.clone();
+    old_revoke.push_str(&secret_ledger_line("secret_revoke", "cora", "B_KEY", 2));
+    let c = n(&plain(&["A_TOKEN"]), &old_revoke);
+    assert!(c.blocked.is_empty() && !c.secrets_unrecorded.is_empty());
+    // An old entry without secrets has nothing to report.
+    assert!(n(&plain(&[]), &old).secrets_unrecorded.is_empty());
+    // Once a grant line follows, the entry is ledger-tracked.
+    let mut adopted = old.clone();
+    adopted.push_str(&secret_ledger_line("secret_grant", "cora", "A_TOKEN", 2));
+    assert!(n(&plain(&["A_TOKEN"]), &adopted).blocked.is_empty());
+    assert_eq!(
+        n(&plain(&["A_TOKEN", "EVIL_KEY"]), &adopted).blocked.len(),
+        1
+    );
+    // The helper agrees.
+    assert!(secrets_recorded(&ledger, "cora") && secrets_recorded(&adopted, "cora"));
+    assert!(!secrets_recorded(&old, "cora") && !secrets_recorded(&old_revoke, "cora"));
+    assert!(!secrets_recorded(&ledger, "other"));
+}
