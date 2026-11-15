@@ -2,12 +2,12 @@
 //! `docs/sandbox-design.md` §7 and §9.2, owner decisions of 2026-11-14).
 //!
 //! First slice: `run_command` and `job_start`, the two model-driven tools.
-//! Second slice: the mission `--verify` command, then the `on_turnend` stop
+//! Second slice: the mission `--verify` command and the `on_turnend` stop
 //! gates. The owner opts in per consumer in the user config
-//! (`[sandbox.consumers] run_command | job_start | verify = "off" |
-//! "optional" | "required"`, default off for all of them). The stop gates,
-//! cron scripts and deliveries keep running as before; the types here are
-//! shaped so they can join later.
+//! (`[sandbox.consumers] run_command | job_start | verify | turnend = "off" |
+//! "optional" | "required"`, default off for all of them). Cron scripts and
+//! deliveries keep running as before; the types here are shaped so they can
+//! join later.
 //!
 //! The `command` profile: the workspace writable, with `.git/hooks`,
 //! `.git/config` and `.tole` read-only on top (code planted there would run
@@ -44,18 +44,24 @@ use std::sync::OnceLock;
 /// read-only inside it.
 pub const PROTECTED: [&str; 3] = [".git/hooks", ".git/config", ".tole"];
 
-/// The commands that can be sandboxed: the two model-driven tools and the
-/// mission `--verify` command.
+/// The commands that can be sandboxed: the two model-driven tools, the
+/// mission `--verify` command and the `on_turnend` stop gates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Consumer {
     RunCommand,
     JobStart,
     Verify,
+    TurnEnd,
 }
 
 impl Consumer {
     /// Every consumer, in the order the doctor lists them.
-    pub const ALL: [Consumer; 3] = [Consumer::RunCommand, Consumer::JobStart, Consumer::Verify];
+    pub const ALL: [Consumer; 4] = [
+        Consumer::RunCommand,
+        Consumer::JobStart,
+        Consumer::Verify,
+        Consumer::TurnEnd,
+    ];
 
     /// The consumer's name, as in `[sandbox.consumers]` and `[secrets]`.
     pub fn name(self) -> &'static str {
@@ -63,6 +69,7 @@ impl Consumer {
             Consumer::RunCommand => "run_command",
             Consumer::JobStart => "job_start",
             Consumer::Verify => "verify",
+            Consumer::TurnEnd => "turnend",
         }
     }
 
@@ -71,6 +78,13 @@ impl Consumer {
     /// always `required`, whatever the process flag says.
     pub fn always_unattended(self) -> bool {
         self == Consumer::Verify
+    }
+
+    /// The owner's stop gate is a program path or name (`./gate.sh`,
+    /// `/opt/bin/check`, `cargo`), split from its command line as before;
+    /// the tools take a bare name only.
+    fn runs_paths(self) -> bool {
+        self == Consumer::TurnEnd
     }
 
     /// A detached job outlives the call by design; everything else dies
@@ -142,6 +156,8 @@ pub struct Consumers {
     pub job_start: Mode,
     /// The mission `--verify` command.
     pub verify: Mode,
+    /// The `on_turnend` stop gates.
+    pub turnend: Mode,
     /// Network of the `command` profile: none, or the host's.
     pub network: Network,
     pub limits: Limits,
@@ -153,6 +169,7 @@ impl Default for Consumers {
             run_command: Mode::Off,
             job_start: Mode::Off,
             verify: Mode::Off,
+            turnend: Mode::Off,
             network: Network::None,
             limits: Limits::default(),
         }
@@ -165,6 +182,7 @@ impl Consumers {
             Consumer::RunCommand => self.run_command,
             Consumer::JobStart => self.job_start,
             Consumer::Verify => self.verify,
+            Consumer::TurnEnd => self.turnend,
         }
     }
 }
@@ -238,6 +256,22 @@ fn find_program(name: &str, path: Option<&str>) -> Option<PathBuf> {
         .find(|p| is_executable(p))
 }
 
+/// An executable named by a path: absolute, or relative to the (resolved)
+/// workspace, which is the working directory the command ran in. Only the
+/// directory is resolved, so the program keeps its own name (a multi-call
+/// binary reads it).
+fn path_program(ws: &Path, program: &str) -> Option<PathBuf> {
+    let p = Path::new(program);
+    let p = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        ws.join(p)
+    };
+    let dir = std::fs::canonicalize(p.parent()?).ok()?;
+    let exe = dir.join(p.file_name()?);
+    is_executable(&exe).then_some(exe)
+}
+
 #[cfg(unix)]
 fn is_executable(p: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
@@ -275,17 +309,25 @@ fn build(
         return Err(Fail::Unsandboxable("no workspace to bind".into()));
     };
     let ws = grant(ws)?;
-    if program.contains('/') {
-        return Err(Fail::Missing(format!(
-            "a sandboxed command runs a program by its bare name, got {program:?}"
-        )));
-    }
-    let found = find_program(program, env.path.as_deref()).ok_or_else(|| {
-        Fail::Missing(format!(
-            "{} is not on PATH (failed to spawn the sandboxed command)",
-            program
-        ))
-    })?;
+    let found = if program.contains('/') {
+        if !consumer.runs_paths() {
+            return Err(Fail::Missing(format!(
+                "a sandboxed command runs a program by its bare name, got {program:?}"
+            )));
+        }
+        path_program(&ws, program).ok_or_else(|| {
+            Fail::Missing(format!(
+                "{program} is not an executable file (failed to spawn the sandboxed command)"
+            ))
+        })?
+    } else {
+        find_program(program, env.path.as_deref()).ok_or_else(|| {
+            Fail::Missing(format!(
+                "{} is not on PATH (failed to spawn the sandboxed command)",
+                program
+            ))
+        })?
+    };
     // A program outside the system dirs: its dir is bound read-only, as
     // the resolved path (and run through it) unless the workspace has it.
     let mut exe = found.clone();
@@ -401,9 +443,9 @@ pub fn command_for(
 }
 
 /// [`command_for`] for a command that runs in the process's working
-/// directory (the mission `--verify` command inherits it, so it is the
-/// workspace the sandbox binds). The directory is only looked up when the
-/// sandbox is on. The flag is true when the command is wrapped.
+/// directory (the mission `--verify` command and the stop gates inherit it,
+/// so it is the workspace the sandbox binds). The directory is only looked
+/// up when the sandbox is on. The flag is true when the command is wrapped.
 pub fn command_in_cwd(
     consumer: Consumer,
     program: &str,
@@ -455,7 +497,8 @@ fn command_prepared(
 /// A fallback to no sandbox is warned about once per process and tool, not
 /// on every call (a chatty line per command would drown a terminal).
 fn warn_once(consumer: Consumer, text: &str) {
-    static WARNED: [AtomicBool; 3] = [
+    static WARNED: [AtomicBool; 4] = [
+        AtomicBool::new(false),
         AtomicBool::new(false),
         AtomicBool::new(false),
         AtomicBool::new(false),
@@ -574,9 +617,10 @@ pub fn doctor_lines(c: &Consumers, avail: &Availability) -> Vec<String> {
     let mut out = Vec::new();
     if Consumer::ALL.iter().all(|k| c.mode(*k) == Mode::Off) {
         out.push(
-            "sandbox consumers: run_command off, job_start off, verify off (model commands and \
-             the mission --verify command run unsandboxed; set [sandbox.consumers] run_command \
-             / job_start / verify in the user config to sandbox them)"
+            "sandbox consumers: run_command off, job_start off, verify off, turnend off (model \
+             commands, the mission --verify command and the stop gates run unsandboxed; set \
+             [sandbox.consumers] run_command / job_start / verify / turnend in the user config \
+             to sandbox them)"
                 .into(),
         );
     } else {
@@ -586,11 +630,12 @@ pub fn doctor_lines(c: &Consumers, avail: &Availability) -> Vec<String> {
         };
         let l = c.limits;
         out.push(format!(
-            "sandbox consumers: run_command {}, job_start {}, verify {}, network {net}, limits \
-             cpu {}s memory {}MB processes {} file {}MB",
+            "sandbox consumers: run_command {}, job_start {}, verify {}, turnend {}, network \
+             {net}, limits cpu {}s memory {}MB processes {} file {}MB",
             word(c.run_command),
             word(c.job_start),
             word(c.verify),
+            word(c.turnend),
             l.cpu_secs,
             l.memory_mb,
             l.processes,
@@ -617,9 +662,7 @@ pub fn doctor_lines(c: &Consumers, avail: &Availability) -> Vec<String> {
             }
         }
     }
-    out.push(
-        "sandbox consumers: turnend, cron scripts and deliveries are not sandboxed yet".into(),
-    );
+    out.push("sandbox consumers: cron scripts and deliveries are not sandboxed yet".into());
     out
 }
 

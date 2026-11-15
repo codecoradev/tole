@@ -311,3 +311,113 @@ fn a_failing_sandboxed_verify_is_a_verify_failure_not_a_refusal() {
     assert!(r.stdout.contains("verify failures: 3"), "{}", r.stdout);
     drop(dir);
 }
+
+/// `tole run --on-turnend <gate> "goal"` in `ws` with `user_config`.
+#[cfg(feature = "shell-tools")]
+fn run_with_gate(ws: &Path, home: &Path, user_config: &str, path: &str, gate: &Path) -> Run {
+    std::fs::create_dir_all(home.join("tole")).unwrap();
+    std::fs::write(home.join("tole/config.toml"), user_config).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_tole"))
+        .args(["run", "-s"])
+        .arg(home.join("sessions"))
+        .arg("--workspace")
+        .arg(ws)
+        .arg("--on-turnend")
+        .arg(gate)
+        .arg("do it")
+        .current_dir(ws)
+        .env_clear()
+        .env("PATH", path)
+        .env("TOLE_NO_UPDATE_CHECK", "1")
+        .env("CODECORA_HOME", home)
+        .env("TOLE_BASE_URL", spawn_mock())
+        .env("TOLE_MODEL", "mock-model")
+        .env("TOLE_API_KEY", "sk-test")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run tole");
+    Run {
+        code: out.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&out.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+    }
+}
+
+#[cfg(feature = "shell-tools")]
+fn gate_script(ws: &Path, body: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let gate = ws.join("gate.sh");
+    std::fs::write(&gate, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(&gate, std::fs::Permissions::from_mode(0o755)).unwrap();
+    gate
+}
+
+/// The stop gate with `off` is today's: it runs (here it passes, so the
+/// run finishes), and nothing is protected.
+#[test]
+#[cfg(feature = "shell-tools")]
+fn a_stop_gate_with_the_sandbox_off_is_unchanged() {
+    let (dir, ws, home) = project("gate-off");
+    let gate = gate_script(&ws, "touch gate-ran; echo x > .git/hooks/h; exit 0");
+    let r = run_with_gate(&ws, &home, "", &path_env(), &gate);
+    assert_eq!(r.code, 0, "{}\n{}", r.stdout, r.stderr);
+    assert!(ws.join("gate-ran").exists() && ws.join(".git/hooks/h").exists());
+    drop(dir);
+}
+
+/// A required sandbox that is missing is a DENY of the stop gate: the gate
+/// never ran, the model may not finish on its own say-so, and the run ends
+/// blocked (exit 6) with the reason.
+#[test]
+#[cfg(feature = "shell-tools")]
+fn a_required_stop_gate_without_a_sandbox_blocks_the_turn() {
+    let (dir, ws, home) = project("gate-required");
+    let gate = gate_script(&ws, "touch gate-ran; exit 0");
+    let r = run_with_gate(
+        &ws,
+        &home,
+        "[sandbox.consumers]\nturnend = \"required\"\n",
+        &path_without_bwrap(&dir),
+        &gate,
+    );
+    assert_eq!(
+        r.code, 6,
+        "blocked, not finished: {}\n{}",
+        r.stdout, r.stderr
+    );
+    assert!(
+        r.stderr.contains("stop gate blocked the turn")
+            && r.stderr.contains("sandbox required but unavailable")
+            && r.stderr.contains("sandbox.consumers.turnend"),
+        "{}",
+        r.stderr
+    );
+    assert!(!ws.join("gate-ran").exists(), "the gate never ran");
+    drop(dir);
+}
+
+/// With bubblewrap the gate runs sandboxed and its exit status still passes
+/// the turn.
+#[test]
+#[cfg(feature = "shell-tools")]
+fn a_sandboxed_stop_gate_cannot_write_hooks_and_still_passes_the_turn() {
+    if !bwrap_works() {
+        return;
+    }
+    let (dir, ws, home) = project("gate-bwrap");
+    let gate = gate_script(
+        &ws,
+        "echo ok > gate-made; ! (echo x > .git/hooks/h) 2>/dev/null || { echo hooks writable; exit 1; }",
+    );
+    let r = run_with_gate(
+        &ws,
+        &home,
+        "[sandbox.consumers]\nturnend = \"required\"\n",
+        &path_env(),
+        &gate,
+    );
+    assert_eq!(r.code, 0, "{}\n{}", r.stdout, r.stderr);
+    assert!(ws.join("gate-made").exists());
+    assert!(!ws.join(".git/hooks/h").exists());
+    drop(dir);
+}
