@@ -29,6 +29,8 @@ fn approve(name: &str, hash: Option<&str>) -> PluginAction {
         name: name.into(),
         hash: hash.map(str::to_string),
         project: false,
+        bundle_hash: None,
+        manifest: None,
     }
 }
 
@@ -37,6 +39,7 @@ fn revoke(name: &str, hash: Option<&str>) -> PluginAction {
         name: name.into(),
         hash: hash.map(str::to_string),
         project: false,
+        secret: None,
     }
 }
 
@@ -63,6 +66,9 @@ struct H {
     shown: std::cell::RefCell<String>,
     /// `(server, sandbox required)` of every one-shot probe.
     probes: std::cell::RefCell<Vec<(String, bool)>>,
+    /// Secrets the owner refuses at a prompt, and every question asked.
+    deny: std::cell::RefCell<Vec<String>>,
+    asked: std::cell::RefCell<Vec<String>>,
 }
 
 impl H {
@@ -86,6 +92,8 @@ impl H {
             typed: Default::default(),
             shown: Default::default(),
             probes: Default::default(),
+            deny: Default::default(),
+            asked: Default::default(),
         }
     }
 
@@ -101,7 +109,15 @@ impl H {
         a: PluginAction,
     ) -> Result<String, String> {
         let lister = |c: &McpServerConfig| Ok(live(&c.name));
-        let mut ask = |_: &str| tty == Some(true);
+        let mut ask = |q: &str| {
+            self.asked.borrow_mut().push(q.to_string());
+            tty == Some(true)
+                && !self
+                    .deny
+                    .borrow()
+                    .iter()
+                    .any(|d| q.contains(&format!("Grant secret {d} ")))
+        };
         let probe_one = |c: &McpServerConfig, require: bool| {
             self.probes.borrow_mut().push((c.name.clone(), require));
             Ok(live(&c.name))
@@ -569,12 +585,15 @@ fn a_project_revoke_only_narrows_and_is_recorded_as_such() {
         name: "cora".into(),
         hash: Some(hash(&v1())),
         project: true,
+        bundle_hash: None,
+        manifest: None,
     };
     h.run(&v1(), pin).unwrap();
     let rev = PluginAction::Revoke {
         name: "cora".into(),
         hash: Some(hash(&v1())),
         project: true,
+        secret: None,
     };
     h.run(&v1(), rev).unwrap();
     assert_eq!(h.rows(&v1())[0]["state"], json!("revoked"));
@@ -642,6 +661,8 @@ fn diff_follows_the_project_lock_and_does_not_start_what_it_revokes() {
         name: "cora".into(),
         hash: Some(hash(&v1())),
         project: true,
+        bundle_hash: None,
+        manifest: None,
     };
     h.run(&v1(), pin).unwrap();
     // The project lock (a file of the repository) revokes the server.
@@ -670,7 +691,10 @@ fn diff_follows_the_project_lock_and_does_not_start_what_it_revokes() {
 }
 
 fn add(spec: &str) -> PluginAction {
-    PluginAction::Add { spec: spec.into() }
+    PluginAction::Add {
+        spec: Some(spec.into()),
+        bundle: None,
+    }
 }
 
 fn sandboxed() -> (tole_core::sandbox::Policy, Availability) {
@@ -1009,6 +1033,8 @@ fn approving_a_newer_manifest_with_project_leaves_every_workspace_consistent() {
         name: "cora".into(),
         hash: Some(hash(&v2)),
         project: true,
+        bundle_hash: None,
+        manifest: None,
     };
     h.run(&v2, pin).unwrap();
     let out = h.run(&v2, LIST).unwrap();
@@ -1020,4 +1046,313 @@ fn approving_a_newer_manifest_with_project_leaves_every_workspace_consistent() {
     assert!(!out.contains("edited by hand"), "{out}");
     let gate = Gate::load(Some(h.user()), &h.dir.join("ws"));
     assert!(gate.notes.is_empty(), "{:?}", gate.notes);
+}
+
+// ---- bundle manifests and per-plugin secret grants (#811) ----
+
+const BUNDLE: &str = r#"
+name = "acme"
+version = "1.2.0"
+description = "Acme notes"
+
+[mcp_servers.srv]
+run = "true"
+secrets = ["A_TOKEN", "B_KEY"]
+
+[[skills]]
+name = "triage"
+path = "skills/triage/SKILL.md"
+
+[[hooks]]
+event = "pretool"
+command = "./hooks/check.sh"
+"#;
+
+fn bundle_add(dir: &Path) -> PluginAction {
+    PluginAction::Add {
+        spec: None,
+        bundle: Some(dir.to_path_buf()),
+    }
+}
+
+/// Writes the manifest under `h` and returns its directory.
+fn manifest(h: &H, text: &str) -> PathBuf {
+    let d = h.dir.join("plugin");
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(d.join(crate::plugin::bundle::FILE), text).unwrap();
+    d
+}
+
+fn type_bundle(h: &H, dir: &Path) -> String {
+    let l = crate::plugin::bundle::load(dir).unwrap();
+    let t = format!("add acme {}", &l.hash.trim_start_matches("sha256:")[..8]);
+    *h.typed.borrow_mut() = t.clone();
+    l.hash
+}
+
+fn entry(h: &H) -> LockEntry {
+    Lockfile::load(&h.user()).unwrap().servers["srv"].clone()
+}
+
+fn gate(h: &H) -> Gate {
+    Gate::load(Some(h.user()), &h.dir.join("ws"))
+}
+
+/// A bundle installed with A_TOKEN granted and B_KEY refused.
+fn installed(tag: &str) -> (H, PathBuf) {
+    let mut h = adder(tag, true);
+    h.grants.borrow_mut().push("A_TOKEN".into());
+    h.deny.borrow_mut().push("B_KEY".into());
+    let dir = manifest(&h, BUNDLE);
+    type_bundle(&h, &dir);
+    h.go(&|_| v1(), Some(true), bundle_add(&dir)).unwrap();
+    // The owner then configures the same command line.
+    h.specs.push(McpServerConfig::parse("srv=true").unwrap());
+    (h, dir)
+}
+
+#[test]
+fn add_bundle_shows_the_manifest_asks_each_secret_and_locks_only_the_granted() {
+    let h = adder("bundle-add", true);
+    h.grants.borrow_mut().push("A_TOKEN".into());
+    h.deny.borrow_mut().push("B_KEY".into());
+    let dir = manifest(&h, BUNDLE);
+    let bundle_hash = type_bundle(&h, &dir);
+    let out = h.go(&|_| v1(), Some(true), bundle_add(&dir)).unwrap();
+    let shown = h.shown.borrow().clone();
+    // The manifest and the server's tools are shown as data, with the
+    // limits of this slice said plainly.
+    for want in [
+        "  | name: acme",
+        "  | mcp server `srv`: true",
+        "  |   asks for secret B_KEY",
+        "skills and hooks are declared only",
+        "Search the index.",
+        &bundle_hash,
+    ] {
+        assert!(shown.contains(want), "{want}: {shown}");
+    }
+    // One question per secret, naming the server, before anything is written
+    // for it; the probe got no secret and ran in the sandbox.
+    let asked = h.asked.borrow().clone();
+    assert_eq!(asked.len(), 2, "{asked:?}");
+    assert!(asked[0].contains("A_TOKEN") && asked[0].contains("`srv` only"));
+    assert!(asked[0].contains("it would be passed"), "{}", asked[0]);
+    assert!(asked[1].contains("B_KEY") && asked[1].contains("not passed now"));
+    assert_eq!(*h.probes.borrow(), vec![("srv".to_string(), true)]);
+    // The lock holds the grant that was given, the bundle record and the
+    // tier; the refused secret is nowhere.
+    let e = entry(&h);
+    assert_eq!(e.secrets, ["A_TOKEN"]);
+    let b = e.bundle.unwrap();
+    assert_eq!(
+        (b.plugin.as_str(), b.hash.as_str()),
+        ("acme", bundle_hash.as_str())
+    );
+    assert!(b.path.ends_with("tole-plugin.toml"));
+    assert_eq!(e.tier, Some(Tier::ThirdPartyUnverified));
+    assert!(out.contains("secrets granted: A_TOKEN") && out.contains("not granted: B_KEY"));
+    // The ledger records the approval with the manifest hash and the grant.
+    let ledger = ledger_of(&h);
+    assert!(ledger.contains(&bundle_hash), "{ledger}");
+    assert!(ledger.contains("\"event\":\"secret_grant\"") && ledger.contains("A_TOKEN"));
+    assert!(!ledger.contains("B_KEY"), "{ledger}");
+    // The session sees exactly that grant, once it runs the same command.
+    assert_eq!(
+        gate(&h).secret_grant("srv"),
+        Some(vec!["A_TOKEN".to_string()])
+    );
+    let row = &h.rows(&v1())[0];
+    assert_eq!(row["bundle"]["plugin"], json!("acme"));
+}
+
+#[test]
+fn denying_every_secret_still_installs_the_plugin_with_no_grant() {
+    let h = adder("bundle-deny", true);
+    let dir = manifest(&h, BUNDLE);
+    type_bundle(&h, &dir);
+    h.go(&|_| v1(), Some(false), bundle_add(&dir)).unwrap();
+    // `ask` answers no to everything, and that is the typed line's job only:
+    // the confirmation passed, the grants were all refused.
+    let e = entry(&h);
+    assert!(e.secrets.is_empty() && e.bundle.is_some());
+    assert!(!ledger_of(&h).contains("secret_grant"));
+}
+
+#[test]
+fn a_bundle_is_not_added_without_the_typed_line_or_with_a_bad_manifest() {
+    let h = adder("bundle-bad", true);
+    let dir = manifest(&h, BUNDLE);
+    *h.typed.borrow_mut() = "y".into();
+    let e = h.go(&|_| v1(), Some(true), bundle_add(&dir)).unwrap_err();
+    assert!(e.contains("not confirmed"), "{e}");
+    assert!(!h.user().exists() && h.asked.borrow().is_empty());
+    let started = h.probes.borrow().len();
+    // A script cannot add one.
+    let e = h.run(&v1(), bundle_add(&dir)).unwrap_err();
+    assert!(e.contains("interactive only"), "{e}");
+    // A manifest that is invalid or names a first-party server starts nothing.
+    for text in [
+        "name = \"acme\"\nversion = \"1\"\n",
+        "name = \"acme\"\nversion = \"1\"\n[mcp_servers.cora]\nrun = \"true\"\n",
+    ] {
+        let dir = manifest(&h, text);
+        assert!(h.go(&|_| v1(), Some(true), bundle_add(&dir)).is_err());
+    }
+    assert_eq!(h.probes.borrow().len(), started, "nothing more was started");
+    assert!(!h.user().exists());
+}
+
+#[test]
+fn a_changed_manifest_blocks_the_server_until_it_is_approved_again() {
+    let (h, dir) = installed("bundle-changed");
+    assert_eq!(h.rows(&v1())[0]["state"], json!("approved"));
+    assert!(gate(&h).refuse_unseen("srv", "stdio:true").is_none());
+    // The plugin grows a new request; a comment alone would do the same.
+    std::fs::write(
+        dir.join("tole-plugin.toml"),
+        BUNDLE.replace("B_KEY\"]", "B_KEY\", \"C_TOKEN\"]"),
+    )
+    .unwrap();
+    let r = &h.rows(&v1())[0];
+    assert_eq!(r["state"], json!("changed (plugin manifest)"));
+    let why = gate(&h).refuse_unseen("srv", "stdio:true").unwrap();
+    assert!(why.contains("plugin manifest"), "{why}");
+    assert!(ledger_of(&h).contains("bundle_change"));
+    let d = h.run(&v1(), diff("srv")).unwrap();
+    assert!(d.contains("CHANGED or unreadable since approval"), "{d}");
+    // A script needs the new file hash, and grants nothing.
+    let e = h
+        .run(&v1(), approve("srv", Some(&hash(&v1()))))
+        .unwrap_err();
+    assert!(e.contains("--bundle-hash"), "{e}");
+    let new_hash = crate::plugin::bundle::load(&dir).unwrap().hash;
+    let script = |bundle_hash: &str| PluginAction::Approve {
+        name: "srv".into(),
+        hash: Some(hash(&v1())),
+        project: false,
+        bundle_hash: Some(bundle_hash.into()),
+        manifest: None,
+    };
+    assert!(h.run(&v1(), script("sha256:00")).is_err());
+    h.run(&v1(), script(&new_hash)).unwrap();
+    assert!(entry(&h).secrets.is_empty(), "a script grants no secret");
+    assert_eq!(h.rows(&v1())[0]["state"], json!("approved"));
+    // A terminal approval asks again for all three, whatever was granted
+    // before: nothing carries over.
+    h.asked.borrow_mut().clear();
+    h.deny.borrow_mut().clear();
+    h.deny.borrow_mut().push("C_TOKEN".into());
+    h.go(&|_| v1(), Some(true), approve("srv", None)).unwrap();
+    let asked = h.asked.borrow().clone();
+    assert_eq!(
+        asked.iter().filter(|q| q.contains("Grant secret ")).count(),
+        3,
+        "{asked:?}"
+    );
+    assert_eq!(entry(&h).secrets, ["A_TOKEN", "B_KEY"]);
+    assert_eq!(entry(&h).bundle.unwrap().hash, new_hash);
+}
+
+#[test]
+fn a_missing_manifest_or_another_configured_source_is_refused() {
+    let (h, dir) = installed("bundle-gone");
+    std::fs::remove_file(dir.join("tole-plugin.toml")).unwrap();
+    assert_eq!(
+        h.rows(&v1())[0]["state"],
+        json!("changed (plugin manifest)"),
+        "an unreadable manifest fails closed"
+    );
+    assert!(gate(&h).refuse_unseen("srv", "stdio:true").is_some());
+    // Approving needs a manifest, and it must declare what is configured.
+    assert!(h.go(&|_| v1(), Some(true), approve("srv", None)).is_err());
+    let other = manifest(&h, &BUNDLE.replace("run = \"true\"", "run = \"false\""));
+    let e = h
+        .go(
+            &|_| v1(),
+            Some(true),
+            PluginAction::Approve {
+                name: "srv".into(),
+                hash: None,
+                project: false,
+                bundle_hash: None,
+                manifest: Some(other),
+            },
+        )
+        .unwrap_err();
+    assert!(e.contains("manifest declares"), "{e}");
+}
+
+#[test]
+fn revoke_secret_withdraws_one_grant_and_the_ledger_says_so() {
+    let (h, _dir) = installed("bundle-revoke");
+    h.asked.borrow_mut().clear();
+    let one = |secret: &str, hash: Option<&str>| PluginAction::Revoke {
+        name: "srv".into(),
+        hash: hash.map(str::to_string),
+        project: false,
+        secret: Some(secret.into()),
+    };
+    // Needs consent (a script without the hash, a declined prompt) and a
+    // grant that exists.
+    assert!(h.run(&v1(), one("A_TOKEN", None)).is_err());
+    assert!(h.go(&|_| v1(), Some(false), one("A_TOKEN", None)).is_err());
+    let e = h.run(&v1(), one("B_KEY", Some(&hash(&v1())))).unwrap_err();
+    assert!(e.contains("holds no grant"), "{e}");
+    assert_eq!(entry(&h).secrets, ["A_TOKEN"]);
+    let out = h.run(&v1(), one("A_TOKEN", Some(&hash(&v1())))).unwrap();
+    assert!(out.contains("rotate"), "{out}");
+    // Approved still, with no grant; the session launcher passes nothing.
+    assert!(entry(&h).secrets.is_empty() && !entry(&h).revoked);
+    assert_eq!(h.rows(&v1())[0]["state"], json!("approved"));
+    let g = gate(&h);
+    assert_eq!(g.secret_grant("srv"), Some(Vec::new()));
+    assert!(g.refuse_unseen("srv", "stdio:true").is_none());
+    assert!(ledger_of(&h).contains("\"event\":\"secret_revoke\""));
+    // Putting the grant back by hand is not trusted: the ledger shows it
+    // revoked.
+    let mut lock = Lockfile::load(&h.user()).unwrap();
+    lock.servers.get_mut("srv").unwrap().secrets = vec!["A_TOKEN".into()];
+    lock.save(&h.user()).unwrap();
+    let g = gate(&h);
+    assert!(g.refuse_unseen("srv", "stdio:true").is_some());
+    assert!(
+        g.notes.iter().any(|n| n.contains("secret grant")),
+        "{:?}",
+        g.notes
+    );
+}
+
+#[test]
+fn a_grant_or_manifest_pin_added_by_hand_is_not_trusted() {
+    let (h, _dir) = installed("bundle-hand");
+    let edit = |f: &dyn Fn(&mut LockEntry)| {
+        let mut lock = Lockfile::load(&h.user()).unwrap();
+        f(lock.servers.get_mut("srv").unwrap());
+        lock.save(&h.user()).unwrap();
+    };
+    let original = entry(&h);
+    // A grant the owner never gave.
+    edit(&|e| e.secrets.push("B_KEY".into()));
+    let g = gate(&h);
+    assert!(g.refuse_unseen("srv", "stdio:true").is_some());
+    assert!(g.notes.iter().any(|n| n.contains("secret grant")));
+    // A re-pinned manifest hash.
+    edit(&|e| *e = original.clone());
+    assert!(gate(&h).refuse_unseen("srv", "stdio:true").is_none());
+    edit(&|e| e.bundle.as_mut().unwrap().hash = "sha256:00".into());
+    let g = gate(&h);
+    assert!(g.refuse_unseen("srv", "stdio:true").is_some());
+    assert!(g.notes.iter().any(|n| n.contains("plugin manifest hash")));
+}
+
+#[test]
+fn revoking_a_plugin_server_lists_its_grants_and_a_plugin_name_is_not_reused() {
+    let (h, dir) = installed("bundle-whole");
+    let out = h.run(&v1(), revoke("srv", Some(&hash(&v1())))).unwrap();
+    assert!(out.contains("A_TOKEN") && out.contains("rotate"), "{out}");
+    assert!(gate(&h).refuse_unseen("srv", "stdio:true").is_some());
+    type_bundle(&h, &dir);
+    let e = h.go(&|_| v1(), Some(true), bundle_add(&dir)).unwrap_err();
+    assert!(e.contains("already in your plugin lock"), "{e}");
 }
