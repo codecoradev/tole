@@ -608,17 +608,15 @@ mod tests {
         assert!(missing_handoff_prompt(Role::Implement).contains("without submitting a handoff"));
     }
 
-    fn tool_in(tag: &str, role: Role) -> (HandoffSubmitTool, PathBuf) {
-        let d = std::env::temp_dir().join(format!("tole-handoff-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
+    fn tool_in(tag: &str, role: Role) -> (HandoffSubmitTool, PathBuf, crate::test_dir::TestDir) {
+        let d = crate::test_dir::TestDir::new(&format!("tole-handoff-{tag}"));
         let p = d.join("handoff.json");
-        (HandoffSubmitTool::new(&p, role), p)
+        (HandoffSubmitTool::new(&p, role), p, d)
     }
 
     #[test]
     fn the_submit_tool_writes_a_validated_document_with_the_parents_role() {
-        let (t, p) = tool_in("ok", Role::Implement);
+        let (t, p, _dir) = tool_in("ok", Role::Implement);
         let out = t
             .execute(json!({
                 "summary": "built it",
@@ -640,7 +638,7 @@ mod tests {
 
     #[test]
     fn the_submit_tool_refuses_bad_input_and_writes_nothing() {
-        let (t, p) = tool_in("bad", Role::Explore);
+        let (t, p, _dir) = tool_in("bad", Role::Explore);
         for bad in [
             json!("not an object"),
             json!({"summary": ""}),

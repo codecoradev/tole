@@ -311,18 +311,11 @@ mod tests {
         // `rm -rf ./build` — running it against the SHARED temp dir
         // deleted any peer test's files living at <temp>/build. Each
         // run gets its own scratch jail with a `build` dir inside.
-        let jail = std::env::temp_dir().join(format!(
-            "tole-run-benign-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let jail = crate::test_dir::TestDir::new("tole-run-benign");
         std::fs::create_dir_all(jail.join("build")).unwrap();
         std::fs::write(jail.join("middleware.ts"), "x").unwrap();
         std::fs::write(jail.join("runbook.md"), "x").unwrap();
-        let t = RunCommandTool::new(jail.clone());
+        let t = RunCommandTool::new(jail.to_path_buf());
         for line in [
             "cat middleware.ts",
             "grep shutdown runbook.md",
@@ -420,9 +413,8 @@ mod tests {
     #[test]
     fn execute_cwd_is_jailed() {
         // The command sees the jail as its working directory.
-        let jail = std::env::temp_dir().join("tole-runcommand-jail");
-        std::fs::create_dir_all(&jail).unwrap();
-        let t = RunCommandTool::new(jail.clone());
+        let jail = crate::test_dir::TestDir::new("tole-runcommand-jail");
+        let t = RunCommandTool::new(jail.to_path_buf());
         let out = t.execute(json!({"command": "pwd"})).unwrap();
         // POSIX pwd prints the logical path; canonicalize both sides.
         let got = std::path::Path::new(out["stdout"].as_str().unwrap().trim())
@@ -534,10 +526,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn root_session_refuses_the_tole_binary() {
-        let dir = std::env::temp_dir().join(format!("tole-rc-684-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let t = RunCommandTool::new(dir.clone());
+        let dir = crate::test_dir::TestDir::new("tole-rc-684");
+        let t = RunCommandTool::new(dir.to_path_buf());
         assert!(!t.child_agent_mode);
         for line in [
             "tole cron resume job-1",
@@ -562,9 +552,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn spawned_commands_carry_the_session_marker() {
-        let dir = std::env::temp_dir().join(format!("tole-rc-684m-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let t = RunCommandTool::new(dir.clone());
+        let dir = crate::test_dir::TestDir::new("tole-rc-684m");
+        let t = RunCommandTool::new(dir.to_path_buf());
         let out = t
             .execute(json!({ "command": "sh -c 'printenv | grep ^TOLE_UNDER'" }))
             .unwrap();

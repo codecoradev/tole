@@ -371,9 +371,7 @@ mod tests {
     /// the exact CLI contract stays pinned.
     #[test]
     fn recall_via_fake_binary() {
-        let dir = std::env::temp_dir().join(format!("tole-mem-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_dir::TestDir::new("tole-mem");
         let bin = dir.join("uteke");
         let log = dir.join("argv.log");
         std::fs::write(
@@ -427,9 +425,7 @@ mod tests {
     #[test]
     fn empty_room_falls_back_to_the_legacy_namespace() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("tole-mem-fb-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_dir::TestDir::new("tole-mem-fb");
         let bin = dir.join("uteke");
         let log = dir.join("argv.log");
         std::fs::write(
@@ -472,9 +468,7 @@ mod tests {
     /// element (no shell), typed and tagged for the store.
     #[test]
     fn remember_via_fake_binary() {
-        let dir = std::env::temp_dir().join(format!("tole-mem-w-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_dir::TestDir::new("tole-mem-w");
         let bin = dir.join("uteke");
         let log = dir.join("argv.log");
         std::fs::write(
@@ -516,9 +510,7 @@ mod tests {
 
     #[test]
     fn write_session_is_typed_decision_with_wrote_tag() {
-        let dir = std::env::temp_dir().join(format!("tole-mem-d-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_dir::TestDir::new("tole-mem-d");
         let bin = dir.join("uteke");
         let log = dir.join("argv.log");
         std::fs::write(
@@ -556,9 +548,7 @@ mod tests {
 
     #[test]
     fn remember_newlines_collapsed_to_one_line() {
-        let dir = std::env::temp_dir().join(format!("tole-mem-nl-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_dir::TestDir::new("tole-mem-nl");
         let bin = dir.join("uteke");
         let log = dir.join("argv.log");
         std::fs::write(
@@ -596,9 +586,7 @@ mod tests {
     /// cap would otherwise cut in half.
     #[test]
     fn remember_redacts_known_secrets_before_capping() {
-        let dir = std::env::temp_dir().join(format!("tole-mem-595-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_dir::TestDir::new("tole-mem-595");
         let bin = dir.join("uteke");
         let log = dir.join("argv.log");
         std::fs::write(
@@ -683,25 +671,24 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn fake_uteke(tag: &str, stdout: &str) -> MemoryConfig {
+    fn fake_uteke(tag: &str, stdout: &str) -> (MemoryConfig, crate::test_dir::TestDir) {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("tole-mem-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_dir::TestDir::new(&format!("tole-mem-{tag}"));
         let bin = dir.join("uteke");
         std::fs::write(&bin, format!("#!/bin/sh\ncat <<'EOF'\n{stdout}\nEOF\n")).unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-        MemoryConfig {
+        let cfg = MemoryConfig {
             bin: bin.display().to_string(),
             room: "repo-x".into(),
             limit: 99,
-        }
+        };
+        (cfg, dir)
     }
 
     #[cfg(unix)]
     #[test]
     fn recall_dedups_the_batch() {
-        let cfg = fake_uteke(
+        let (cfg, _dir) = fake_uteke(
             "dedup",
             r#"[{"content":"Same  fact","score":0.9},{"content":"same fact","score":0.8},{"content":"other","score":0.7}]"#,
         );
@@ -715,14 +702,14 @@ mod tests {
     #[test]
     fn malformed_batch_fails_whole_not_silently_fewer() {
         // A hit without content invalidates the batch.
-        let cfg = fake_uteke("nocontent", r#"[{"content":"ok"},{"score":0.4}]"#);
+        let (cfg, _dir) = fake_uteke("nocontent", r#"[{"content":"ok"},{"score":0.4}]"#);
         let e = recall(&cfg, "q").unwrap_err();
         assert!(e.contains("hit #2"), "{e}");
         // A non-array payload is an error, not an empty success.
-        let cfg = fake_uteke("object", r#"{"results":[]}"#);
+        let (cfg, _dir) = fake_uteke("object", r#"{"results":[]}"#);
         assert!(recall(&cfg, "q").unwrap_err().contains("not a JSON array"));
         // A genuinely empty store is still fine.
-        let cfg = fake_uteke("empty", "[]");
+        let (cfg, _dir) = fake_uteke("empty", "[]");
         assert!(recall(&cfg, "q").unwrap().is_empty());
     }
 }
