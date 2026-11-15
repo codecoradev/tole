@@ -214,7 +214,7 @@ pub fn startup_line(policy: Option<&Policy>, name: &str, launch: &Launch) -> Opt
 /// server that restarts after idling does not repeat it).
 pub fn log_startup_once(name: &str, launch: &Launch) {
     static SEEN: Mutex<Option<HashSet<String>>> = Mutex::new(None);
-    let Some(line) = startup_line(super::policy().as_ref(), name, launch) else {
+    let Some(line) = startup_line(super::session_policy().as_ref(), name, launch) else {
         return;
     };
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());

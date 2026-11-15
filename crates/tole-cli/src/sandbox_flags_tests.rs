@@ -55,7 +55,6 @@ fn no_sandbox_at_a_terminal_is_honoured_and_records_the_configured_mode() {
             configured: Mode::Required
         }
     );
-    assert!(o.policy.is_none());
 }
 
 #[test]
@@ -111,23 +110,21 @@ fn both_flags_are_refused_where_no_server_starts() {
 #[test]
 fn sandbox_selects_a_builtin_or_user_profile_for_every_server() {
     let o = run(&prof("net"), USER, ctx()).unwrap().unwrap();
-    let p = o.policy.unwrap();
-    assert_eq!((p.profile_name.as_str(), p.mode), ("net", Mode::Required));
-    assert_eq!(p.profile.network, Network::Host);
-    assert!(p.servers.is_empty(), "bindings do not survive the flag");
-    assert_eq!(
-        o.over,
-        Override::Profile {
-            name: "net".into(),
-            configured: "server".into()
-        }
-    );
-    let p = run(&prof("strict"), USER, ctx())
-        .unwrap()
-        .unwrap()
-        .policy
-        .unwrap();
-    assert_eq!(p.profile_name, "strict");
+    let Override::Profile {
+        name,
+        profile,
+        configured,
+    } = o.over
+    else {
+        panic!("a profile override");
+    };
+    assert_eq!((name.as_str(), configured.as_str()), ("net", "server"));
+    assert_eq!(profile.network, Network::Host);
+    let Override::Profile { name, .. } = run(&prof("strict"), USER, ctx()).unwrap().unwrap().over
+    else {
+        panic!("a profile override");
+    };
+    assert_eq!(name, "strict");
 }
 
 #[test]

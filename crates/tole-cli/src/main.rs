@@ -834,6 +834,12 @@ fn bare_tui_args() -> Option<Vec<std::ffi::OsString>> {
 fn sandbox_flag_class(cmd: &Command) -> (bool, bool) {
     #[allow(unused_mut)]
     let mut class = (false, matches!(cmd, Command::Sandbox { .. }));
+    // `tole plugin add|approve` probes and approves servers: never under a
+    // run flag.
+    #[cfg(feature = "mcp")]
+    {
+        class.1 |= matches!(cmd, Command::Plugin { .. });
+    }
     #[cfg(feature = "shell-tools")]
     {
         class.0 |= matches!(cmd, Command::Serve { .. } | Command::Acp { .. });
@@ -1111,7 +1117,7 @@ fn dispatch(cli: Cli) -> Result<()> {
     // Sandbox of stdio MCP servers (#601): off unless the user config sets
     // `[sandbox] mode`; the config was validated at load.
     let sandbox_cfg = cfg.as_ref().and_then(|c| c.sandbox.as_ref());
-    let mut sandbox_policy = sandbox_cfg.and_then(|s| s.policy().ok());
+    let sandbox_policy = sandbox_cfg.and_then(|s| s.policy().ok());
     // `--sandbox <profile>` / `--no-sandbox` (#750): owner at a terminal
     // only; a refusal stops the run before any server starts.
     {
@@ -1131,9 +1137,6 @@ fn dispatch(cli: Cli) -> Result<()> {
             Err(e) => return Err(anyhow!("{e}")),
             Ok(None) => {}
             Ok(Some(o)) => {
-                if o.policy.is_some() {
-                    sandbox_policy = o.policy;
-                }
                 let _ = tole_core::sandbox::flags::set(o.over);
                 if let Some(n) = tole_core::sandbox::flags::note() {
                     eprintln!("tole: {n}");
@@ -1894,7 +1897,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                     gate.entries(),
                     &configured,
                     &first_party,
-                    tole_core::sandbox::policy().as_ref(),
+                    tole_core::sandbox::session_policy().as_ref(),
                     &tole_core::sandbox::detect(),
                 ) {
                     println!("{l}");

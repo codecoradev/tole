@@ -301,7 +301,7 @@ servers; `[sandbox.consumers]` is not touched by either.
 | Case | `--no-sandbox` | `--sandbox <p>` |
 |---|---|---|
 | under an agent session (`TOLE_UNDER_SESSION`, child agent) | refused | refused |
-| `tole cron`, `tole hook`, `tole sandbox` (no server starts) | refused | refused |
+| `tole cron`, `tole hook`, `tole sandbox`, `tole plugin` (no session server starts, or servers are approved) | refused | refused |
 | `tole serve`, `tole acp`, or stdin/stderr not a terminal, mode `required` or `optional` | refused (optional counts as required without a human) | allowed |
 | mode `off` | no-op | refused: it selects, it does not turn the sandbox on |
 | attended | honoured for the run | profile must be built in or in the USER config |
@@ -313,10 +313,15 @@ servers; `[sandbox.consumers]` is not touched by either.
   unknown name stops startup. It can pick a user-defined profile wider than
   the default (that is the owner's own choice, at a terminal, never from a
   session). The two flags conflict.
-- Second layer in the core: `--no-sandbox` is not part of the stored policy.
-  `tole_core::sandbox::policy()` ignores it once `mark_unattended()` ran, so
-  a flag that slipped past the host check still cannot unsandbox a cron
-  job or a serve session.
+- Two views, so a flag cannot widen its own blast radius: the configured
+  policy (`tole_core::sandbox::policy()`) is the owner's config and is never
+  changed by a flag; it is what the first-party names (`skip`), the sandbox
+  of a `tole plugin add` probe and the command consumers rely on. Only
+  `sandbox::session_policy()` (connection keys, idle stop, the cap, the
+  startup line, `launch_session`) applies the override, and it ignores
+  `--no-sandbox` once `mark_unattended()` ran, so a flag that slipped past
+  the host check still cannot unsandbox a cron job or a serve session.
+  `tole plugin` refuses both flags.
 - A sandbox never replaces an approval (#684, #700, #714): the flags change
   where a server runs, not whether it is approved; the plugin lock, ledger
   and `Admission` checks run as before.

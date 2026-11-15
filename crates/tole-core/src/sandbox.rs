@@ -176,15 +176,24 @@ pub fn set_policy(p: Option<Policy>) -> Result<(), String> {
     }
 }
 
-/// The process's policy, `None` when the sandbox is not configured.
-///
-/// `--no-sandbox` (#750) reads as "not configured" here, but only while the
-/// run is attended: an unattended process always gets the configured policy.
+/// The process's configured policy, `None` when the sandbox is not
+/// configured. This is the OWNER'S config and nothing else: a run flag
+/// (`--no-sandbox`, `--sandbox`, #750) never changes it. Everything that
+/// decides trust or approval from the config reads it: the first-party
+/// names (`skip`), the sandbox of a `tole plugin add` probe, the model
+/// command consumers.
 pub fn policy() -> Option<Policy> {
-    if flags::no_sandbox_active() {
-        return None;
-    }
     POLICY.get().cloned().flatten()
+}
+
+/// The policy THIS RUN's stdio MCP servers start under: [`policy`] with the
+/// run's flag override applied (#750). `--no-sandbox` reads as "not
+/// configured" while the run is attended and is ignored once the process is
+/// unattended; `--sandbox <p>` replaces the profile of every server. Only
+/// the session's server launch path reads this (connection keys, the idle
+/// reaper, the cap, the startup line, [`launch_session`]).
+pub fn session_policy() -> Option<Policy> {
+    flags::apply(policy())
 }
 
 /// Marks this process as an unattended run (cron job, `tole serve`):
@@ -538,10 +547,31 @@ fn build(p: &Policy, env: &Env, server: (&str, &str, &[String])) -> Result<Vec<O
     ))
 }
 
-/// [`plan`] with this process's policy, backend, `PATH` and data dir.
+/// [`plan`] with this process's configured policy, backend, `PATH` and data
+/// dir (a probe, `tole plugin add`: never changed by a run flag).
 /// `workspace` is the session's; without one the current directory is used.
 pub fn launch(name: &str, workspace: Option<&Path>, command: &str, args: &[String]) -> Launch {
-    let policy = policy();
+    launch_under(policy(), name, workspace, command, args)
+}
+
+/// [`launch`] under this run's [`session_policy`]: what a session's stdio
+/// MCP server starts under (the flags of #750 apply).
+pub fn launch_session(
+    name: &str,
+    workspace: Option<&Path>,
+    command: &str,
+    args: &[String],
+) -> Launch {
+    launch_under(session_policy(), name, workspace, command, args)
+}
+
+fn launch_under(
+    policy: Option<Policy>,
+    name: &str,
+    workspace: Option<&Path>,
+    command: &str,
+    args: &[String],
+) -> Launch {
     if policy.as_ref().is_none_or(|p| p.mode == Mode::Off) {
         return Launch::Direct { warning: None };
     }
