@@ -127,6 +127,11 @@ fn discussion_json(id: &str, st: &State, secrets: &SecretSet) -> Value {
                     "met": v.met, "evidence": v.evidence})).collect::<Vec<_>>()),
                 "gate": st.gates.get(r).map(gate_name),
                 "tokens": spent,
+                "retries": st
+                    .reservations
+                    .values()
+                    .filter(|x| x.round == *r && x.retry_of.is_some())
+                    .count(),
             })
         })
         .collect();
@@ -175,6 +180,11 @@ fn text_of(v: &Value) -> String {
             r["tokens"],
             r["gate"].as_str().unwrap_or("-")
         ));
+        if let Some(n) = r["retries"].as_u64().filter(|n| *n > 0) {
+            out.push(format!(
+                "    {n} call(s) retried once after a provider timeout"
+            ));
+        }
         let sm = &r["summary"];
         match sm["kind"].as_str() {
             Some("digest") => {

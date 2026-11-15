@@ -46,6 +46,17 @@ pub fn leading_error(message: &str) -> &str {
         .map_or(message, |(head, _)| head)
 }
 
+/// Is this error the provider's own request timeout (#756)? Only the
+/// transport's `timeout: <phase>` text counts, as the whole message or after
+/// the `json: ` prefix of a reply cut while it was read. Anchored on purpose:
+/// an `http status: 504 ...` error (a 4xx/5xx the server answered, whatever
+/// its body says) and any other failure never qualify.
+pub fn is_timeout_error(message: &str) -> bool {
+    let m = leading_error(message).trim_start().to_ascii_lowercase();
+    let m = m.strip_prefix("json: ").unwrap_or(&m);
+    m.starts_with("timeout: ")
+}
+
 /// Does this provider error mean "provider unavailable" (fail over) rather
 /// than "request wrong" (fail loud)?
 pub fn is_failover_error(message: &str) -> bool {
@@ -455,5 +466,31 @@ mod tests {
         let route = f.last_route().unwrap();
         assert_eq!(route["provider"], "primary");
         assert_eq!(route["failover"]["from"], "reserve");
+    }
+
+    #[test]
+    fn only_the_transports_own_timeout_is_a_timeout_error() {
+        for yes in [
+            "timeout: global",
+            "timeout: recv body",
+            "Timeout: global",
+            "json: timeout: global at line 1 column 1",
+            "timeout: global [after failover from primary: io: refused]",
+        ] {
+            assert!(is_timeout_error(yes), "{yes}");
+        }
+        for no in [
+            "",
+            "http status: 504 \u{2014} gateway timeout",
+            "http status: 429 \u{2014} timeout: global",
+            "http status: 408 \u{2014} request timeout",
+            "io: Connection reset",
+            "stream read: timed out",
+            "malformed response: timeout: global",
+            "the call timeout: global was mentioned",
+            "model-capability error: timeout: global",
+        ] {
+            assert!(!is_timeout_error(no), "{no}");
+        }
     }
 }
