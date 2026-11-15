@@ -59,19 +59,35 @@ pub type Factory = Arc<dyn Fn(Option<&str>, &str) -> Box<dyn Provider> + Send + 
 
 /// The production factory: the run's provider connection, with the process
 /// secrets, no streaming and no fallback chain (as the advisor's).
-pub fn factory(cfg: tole_core::openai::OpenAiConfig, secrets: SecretSet) -> Factory {
-    Arc::new(move |model, system| {
-        let mut c = cfg.clone();
-        if let Some(m) = model {
-            c.model = m.to_string();
-        }
-        Box::new(
-            tole_core::openai::OpenAiProvider::new(c)
-                .with_secrets(&secrets)
-                .with_streaming(false)
-                .with_system_prompt(system),
-        )
-    })
+///
+/// `timeout` is the provider's global request timeout (#786): the budget for
+/// one call as a whole (connect, send and reading the entire reply, which is
+/// not streamed here), not an idle timeout.
+pub fn factory(
+    cfg: tole_core::openai::OpenAiConfig,
+    secrets: SecretSet,
+    timeout: std::time::Duration,
+) -> Factory {
+    Arc::new(move |model, system| Box::new(provider(&cfg, &secrets, model, system, timeout)))
+}
+
+/// One discussion provider, as [`factory`] builds it.
+pub(crate) fn provider(
+    cfg: &tole_core::openai::OpenAiConfig,
+    secrets: &SecretSet,
+    model: Option<&str>,
+    system: &str,
+    timeout: std::time::Duration,
+) -> tole_core::openai::OpenAiProvider {
+    let mut c = cfg.clone();
+    if let Some(m) = model {
+        c.model = m.to_string();
+    }
+    tole_core::openai::OpenAiProvider::new(c)
+        .with_secrets(secrets)
+        .with_streaming(false)
+        .with_timeout(timeout)
+        .with_system_prompt(system)
 }
 
 /// A participant the orchestrator voices inline.
