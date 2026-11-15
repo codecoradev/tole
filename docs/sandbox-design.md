@@ -756,6 +756,15 @@ network setting. Nothing about them is sandboxed by default in this slice.
   gate, and the ENV-1 scrub with the `[secrets]` release for `verify` and
   `turnend` are the same. The scrub is applied to the `bwrap` process, whose
   environment its child inherits.
+- **What a gate's own files are.** A gate script inside the writable workspace
+  (`./gate.sh`) can be rewritten by the agent: the profile protects `.git`
+  and `.tole`, not the gate. The sandbox limits what the gate can do (no
+  network, no `$HOME`, nothing outside the workspace written), not whether the
+  agent can change what the gate checks. Keep the gate outside the workspace
+  (an absolute path in a directory the sandbox binds read-only), or inside
+  `.tole`, when the check must be tamper-proof. `tole serve` and `tole acp`
+  bind the process's working directory as the workspace, so a gate there is
+  refused when that directory is `$HOME` or `/`.
 - **Programs.** `verify` runs `sh` by bare name from `PATH`. A stop gate is the
   owner's command line split on whitespace, so its program may be a path
   (`./gate.sh`, `/opt/bin/check`): a path is resolved (only its directory, so the
@@ -790,9 +799,14 @@ network setting. Nothing about them is sandboxed by default in this slice.
     and the denial cap (3) settles the turn `StopGateBlocked` (`tole run` exit
     6). A refusal is a deny and never a pass; it is not reported as the gate's
     own verdict (the gate did not run). An infrastructure failure of an
-    unsandboxed gate (spawn error, timeout) stays non-blocking as before
-    (#110); for a sandboxed one a launcher that cannot even start is a deny
-    too, while a timeout keeps the old contract.
+    UNSANDBOXED gate (spawn error, timeout) stays non-blocking as before
+    (#110). For a SANDBOXED gate (it went through the launcher) a launcher that
+    cannot even start is a deny too, and so is a timeout (#860): the gate is
+    killed, the reason says "the stop gate timed out after Ns inside the sandbox
+    and was killed; a timeout is not a pass", and it counts toward the
+    denial cap like any denial; a gate that is lost for another reason while
+    running is a deny as well. Before #860 a sandboxed timeout was an `Err` the
+    caller logged, and the gate passed.
   - A failing command inside the sandbox is an ordinary failure, same as plain:
     `verify_failed` after three strikes, a non-zero gate exit denies.
 - **The launcher failing is not the command failing.** A sandbox that passed
