@@ -241,7 +241,7 @@ fn run_command_cannot_reach_the_owner_only_records() {
     let home = tmpdir();
     let work = tmpdir();
     let copy = work.join("helper");
-    std::fs::copy(real(), &copy).unwrap();
+    common::copy_executable(real(), &copy);
     let t = RunCommandTool::new(work.to_path_buf());
     let envs = format!("CODECORA_HOME={}", home.display());
 

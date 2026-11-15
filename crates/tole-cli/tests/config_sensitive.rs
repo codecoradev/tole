@@ -468,10 +468,8 @@ fn config_patterns_hit_the_destructive_wall_in_approver_and_registry() {
 #[cfg(unix)]
 #[allow(dead_code)] // only the shell-tools / mcp tests use it
 fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let p = dir.join(name);
-    std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
-    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    common::write_executable(&p, format!("#!/bin/sh\n{body}\n"));
     p
 }
 

@@ -17,18 +17,15 @@ const VALUE: &str = "gh-grant-test-0123456789abcdef";
 
 /// A wrapper that records its environment, then runs the mock server.
 fn server(dir: &std::path::Path, name: &str, grant: Option<Vec<String>>) -> McpServerConfig {
-    use std::os::unix::fs::PermissionsExt;
     let mock = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/mock_mcp.py");
     let wrapper = dir.join(format!("{name}.sh"));
-    std::fs::write(
+    test_dir::write_executable(
         &wrapper,
         format!(
             "#!/bin/sh\nprintenv > {}\nexec python3 {mock} full\n",
             dir.join(format!("{name}.env")).display()
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     let mut cfg = McpServerConfig::parse(&format!("{name}={}", wrapper.display())).unwrap();
     cfg.secret_grant = grant;
     cfg

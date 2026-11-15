@@ -561,12 +561,7 @@ fn reviewer_bin(dir: &Path) -> PathBuf {
     let body = "#!/bin/sh\nprev=\"\"\nfor a in \"$@\"; do [ \"$prev\" = \"--sessions-dir\" ] && D=\"$a\"; \
         prev=\"$a\"; done\nmkdir -p \"$D\"\nprintf '%s\\n' \"$@\" > \"$D/../argv\"\nenv > \"$D/../env\"\n\
         printf '%s' '{\"summary\":\"the plan is sound\",\"risks\":[]}' > \"$TOLE_DELEGATION_REPORT\"\n";
-    std::fs::write(&p, body).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    crate::test_dir::write_executable(&p, body);
     p
 }
 

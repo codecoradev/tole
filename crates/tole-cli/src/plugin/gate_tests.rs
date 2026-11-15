@@ -179,13 +179,11 @@ fn a_lock_unreadable_at_start_blocks_approval_even_once_it_reads_again() {
 #[cfg(unix)]
 #[test]
 fn the_gate_binds_the_source_and_the_program_file() {
-    use std::os::unix::fs::PermissionsExt;
     let dir = tmp("bind");
     let user = dir.join("data").join(plugin_lock::LOCK_FILE);
     let ws = tmp("bind-ws");
     let prog = dir.join("server.sh");
-    std::fs::write(&prog, "#!/bin/sh\necho v1\n").unwrap();
-    std::fs::set_permissions(&prog, std::fs::Permissions::from_mode(0o755)).unwrap();
+    crate::test_dir::write_executable(&prog, "#!/bin/sh\necho v1\n");
     let source = format!("stdio:{} --stdio", prog.display());
     let mut gate = Gate::load(Some(user.clone()), &ws);
     gate.approve("srv", &source, "1", &tools()).unwrap();

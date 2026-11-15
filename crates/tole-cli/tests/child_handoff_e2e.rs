@@ -191,24 +191,19 @@ fn spawn_mock() -> String {
 /// touched), then execs the real binary.
 #[cfg(unix)]
 fn wrapper(root: &std::path::Path, base: &str) -> std::path::PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let bin_dir = root.join("bin");
     std::fs::create_dir_all(&bin_dir).unwrap();
     let uteke = bin_dir.join("uteke");
-    std::fs::write(&uteke, "#!/bin/sh\necho '[]'\n").unwrap();
+    common::write_executable(&uteke, "#!/bin/sh\necho '[]'\n");
     let w = bin_dir.join("tole-wrapper");
-    std::fs::write(
+    common::write_executable(
         &w,
         format!(
             "#!/bin/sh\nexport PATH=\"{}:$PATH\" TOLE_BASE_URL=\"{base}\" TOLE_API_KEY=test TOLE_MODEL=mock\nunset TOLE_TRUST TOLE_SYSTEM_PROMPT\nexec \"{}\" \"$@\"\n",
             bin_dir.display(),
             env!("CARGO_BIN_EXE_tole")
         ),
-    )
-    .unwrap();
-    for f in [&uteke, &w] {
-        std::fs::set_permissions(f, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    );
     w
 }
 

@@ -7,7 +7,6 @@
 
 #[path = "support/test_dir.rs"]
 mod test_dir;
-use std::os::unix::fs::PermissionsExt;
 use test_dir::TestDir;
 use tole_core::mcp::{register_server_tools, McpServerConfig};
 use tole_core::plugin_lock::ManifestTool;
@@ -36,7 +35,7 @@ fn without_a_policy_the_launch_is_unchanged() {
     .unwrap();
     let wrapper = ws.join("srv.sh");
     let o = out.display();
-    std::fs::write(
+    test_dir::write_executable(
         &wrapper,
         format!(
             "#!/bin/sh\n\
@@ -49,9 +48,7 @@ fn without_a_policy_the_launch_is_unchanged() {
             s = base.join("secret").display(),
             m = ws.join("mock_mcp.py").display(),
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     let mut cfg = McpServerConfig::parse(&format!("off={}", wrapper.display())).unwrap();
     cfg.secret_grant = Some(Vec::new());
     let accept = |_: &str, _: &str, _: &[ManifestTool]| Ok(());

@@ -217,12 +217,10 @@ fn a_profiled_job_runs_with_persona_model_skills_and_memory_room() {
     // A fake uteke: logs its argv, recalls nothing.
     let log = e.bin.join("uteke.log");
     let fake = e.bin.join("uteke");
-    std::fs::write(
+    common::write_executable(
         &fake,
         format!("#!/bin/sh\necho \"$@\" >> {}\necho '[]'\n", log.display()),
-    )
-    .unwrap();
-    std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    );
 
     let out = e.ok(&[
         "cron",

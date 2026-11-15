@@ -10,7 +10,6 @@ use common::TestDir;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -62,8 +61,7 @@ for line in sys.stdin:
         reply(i, error={"code": -32601, "message": "method not found"})
 "#;
     let p = bin.join("cora");
-    std::fs::write(&p, script).unwrap();
-    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    common::write_executable(&p, script);
     bin
 }
 

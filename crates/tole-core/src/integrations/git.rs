@@ -450,16 +450,10 @@ mod tests {
         let dir = crate::test_dir::TestDir::new("tole-git");
         let bin = dir.join("git");
         let log = dir.join("argv.log");
-        std::fs::write(
+        crate::test_dir::write_executable(
             &bin,
             format!("#!/bin/sh\necho \"$@\" > {}\necho ok\n", log.display()),
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        );
         let t = GitTool::new().with_bin(&bin);
         let out = t
             .execute(json!({"op":"commit","message":"feat: x"}))
@@ -490,12 +484,7 @@ mod tests {
     fn fake_git_binary_truncates_large_output_end_to_end() {
         let dir = crate::test_dir::TestDir::new("tole-git-cap");
         let bin = dir.join("git");
-        std::fs::write(&bin, "#!/bin/sh\nprintf 'y%.0s' $(seq 1 25000)\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        crate::test_dir::write_executable(&bin, "#!/bin/sh\nprintf 'y%.0s' $(seq 1 25000)\n");
         let t = GitTool::new().with_bin(&bin);
         let out = t.execute(json!({"op":"status"})).unwrap();
         assert_eq!(out["truncated"], json!(true));
@@ -510,16 +499,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_diff_hides_the_lines_of_a_sensitive_file() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = crate::test_dir::TestDir::new("tole-git-env");
         let bin = dir.join("git");
-        std::fs::write(
+        crate::test_dir::write_executable(
             &bin,
             "#!/bin/sh\nprintf 'diff --git a/.env b/.env\\n--- a/.env\\n+++ b/.env\\n\
              @@ -1 +1 @@\\n-TOKEN=old-secret-1\\n+TOKEN=new-secret-2\\n'\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let out = GitTool::new()
             .with_bin(&bin)
             .execute(json!({"op":"diff"}))

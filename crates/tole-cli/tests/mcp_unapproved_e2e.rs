@@ -21,14 +21,11 @@ fn tmp(tag: &str) -> TestDir {
 
 /// A "server" that only records that it was started.
 fn spy(dir: &Path) -> String {
-    use std::os::unix::fs::PermissionsExt;
     let script = dir.join("spy.sh");
-    std::fs::write(
+    common::write_executable(
         &script,
         format!("#!/bin/sh\ntouch {}/started\nexit 1\n", dir.display()),
-    )
-    .unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     format!("spy={}", script.display())
 }
 

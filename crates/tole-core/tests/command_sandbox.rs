@@ -514,11 +514,9 @@ fn a_program_from_an_owner_dir_runs_through_its_bound_directory() {
     if skipped() {
         return;
     }
-    use std::os::unix::fs::PermissionsExt;
     let bin = ws("ownerbin");
     let p = bin.join("owner-tool");
-    std::fs::write(&p, "#!/bin/sh\necho owner-tool-ran\n").unwrap();
-    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    test_dir::write_executable(&p, "#!/bin/sh\necho owner-tool-ran\n");
     let w = ws("owner-ws");
     let path = format!(
         "{}:{}",
