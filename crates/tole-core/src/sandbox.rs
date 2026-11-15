@@ -490,6 +490,42 @@ pub struct Env {
     pub workspace: Option<PathBuf>,
 }
 
+impl Env {
+    /// What this process sees now: `PATH`, `HOME`, the tole data dir and
+    /// `workspace` (the current directory when `None`).
+    pub fn current(workspace: Option<&Path>) -> Self {
+        Env {
+            path: std::env::var("PATH").ok(),
+            home: std::env::var_os("HOME").map(PathBuf::from),
+            data_dir: crate::paths::tole_data_dir(),
+            workspace: workspace
+                .map(Path::to_path_buf)
+                .or_else(|| std::env::current_dir().ok()),
+        }
+    }
+}
+
+/// Why a launch under `policy` could not be wrapped although the backend is
+/// usable (a granted path that no longer resolves, no workspace, a refused
+/// program directory): `None` when it can, or when no sandbox is configured
+/// for `server`. In mode `optional` [`plan`] starts such a server unwrapped;
+/// a caller that holds an approval recorded WITH a sandbox uses this to
+/// refuse the launch instead (fail closed).
+pub fn build_failure(
+    policy: &Policy,
+    avail: &Availability,
+    env: &Env,
+    server: (&str, &str, &[String]),
+) -> Option<String> {
+    if policy.mode == Mode::Off || policy.skip.iter().any(|s| s == server.0) {
+        return None;
+    }
+    match avail {
+        Availability::Usable { .. } => build(policy, env, server).err(),
+        Availability::Unavailable(_) => None,
+    }
+}
+
 /// Decides one launch. Pure: the caller passes what it found.
 pub fn plan(
     policy: Option<&Policy>,
@@ -594,14 +630,7 @@ fn launch_under(
     if policy.as_ref().is_none_or(|p| p.mode == Mode::Off) {
         return Launch::Direct { warning: None };
     }
-    let env = Env {
-        path: std::env::var("PATH").ok(),
-        home: std::env::var_os("HOME").map(PathBuf::from),
-        data_dir: crate::paths::tole_data_dir(),
-        workspace: workspace
-            .map(Path::to_path_buf)
-            .or_else(|| std::env::current_dir().ok()),
-    };
+    let env = Env::current(workspace);
     plan(
         policy.as_ref(),
         &detect(),

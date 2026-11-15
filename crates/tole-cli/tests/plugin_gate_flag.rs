@@ -49,10 +49,10 @@ fn a_sandbox_flag_profile_cannot_run_an_approved_server_without_a_block() {
     // Approved under the configured profile (what `tole plugin approve` sees).
     let id = configured().applied_profile("srv", &usable()).unwrap();
     let mut gate = Gate::load(Some(user.clone()), &ws).with_backend(usable());
-    assert_eq!(gate.live_profile("srv", "stdio:srv").unwrap(), id);
+    assert_eq!(gate.live_profile("srv", "stdio:true").unwrap(), id);
     gate.approve_with(
         "srv",
-        "stdio:srv",
+        "stdio:true",
         "1",
         &tools(),
         Approval {
@@ -64,7 +64,7 @@ fn a_sandbox_flag_profile_cannot_run_an_approved_server_without_a_block() {
     .unwrap();
     assert!(Gate::load(Some(user.clone()), &ws)
         .with_backend(usable())
-        .refuse_unseen("srv", "stdio:srv")
+        .refuse_unseen("srv", "stdio:true")
         .is_none());
     // `--sandbox strict`: the server would now start under another profile.
     flags::set(Override::Profile {
@@ -75,12 +75,12 @@ fn a_sandbox_flag_profile_cannot_run_an_approved_server_without_a_block() {
     .unwrap();
     let gate = Gate::load(Some(user), &ws).with_backend(usable());
     assert_eq!(
-        gate.live_profile("srv", "stdio:srv").unwrap().name,
+        gate.live_profile("srv", "stdio:true").unwrap().name,
         "strict"
     );
-    let note = gate.refuse_unseen("srv", "stdio:srv").unwrap();
+    let note = gate.refuse_unseen("srv", "stdio:true").unwrap();
     assert!(note.contains("sandbox profile"), "{note}");
-    assert!(gate.check("srv", "stdio:srv", "1", &tools()).is_err());
+    assert!(gate.check("srv", "stdio:true", "1", &tools()).is_err());
     // The configured policy is what approvals and the first-party list read.
     assert_eq!(sandbox::policy().unwrap().profile_name, "server");
 }
