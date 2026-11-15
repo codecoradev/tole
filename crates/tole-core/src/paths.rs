@@ -185,7 +185,7 @@ mod tests {
     /// refused; a sibling directory is not.
     #[test]
     fn jail_overlap_with_the_data_dir() {
-        let base = std::env::temp_dir().join(format!("tole-paths-jail-{}", std::process::id()));
+        let base = crate::test_dir::TestDir::new("tole-paths-jail");
         let data = base.join(".codecora").join("tole");
         std::fs::create_dir_all(&data).unwrap();
         let project = base.join("project");

@@ -2332,8 +2332,7 @@ mod http_error_tests {
             r#"{"error":{"message":"image_url content is not supported by this model"}}"#,
             68,
         );
-        let ws = std::env::temp_dir().join(format!("tole-cap-{}", std::process::id()));
-        std::fs::create_dir_all(&ws).unwrap();
+        let ws = crate::test_dir::TestDir::new("tole-cap");
         let ws = ws.canonicalize().unwrap();
         let png = [0x89u8, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3];
         std::fs::write(ws.join("a.png"), png).unwrap();

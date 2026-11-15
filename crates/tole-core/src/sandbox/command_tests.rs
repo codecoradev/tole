@@ -1,16 +1,9 @@
 use super::*;
 use std::path::Path;
 
-fn tmp(tag: &str) -> PathBuf {
-    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let d = std::env::temp_dir().join(format!(
-        "tole-cmd-{tag}-{}-{}",
-        std::process::id(),
-        N.fetch_add(1, Ordering::SeqCst)
-    ));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    std::fs::canonicalize(&d).unwrap()
+use crate::test_dir::TestDir;
+fn tmp(tag: &str) -> TestDir {
+    TestDir::new(&format!("tole-cmd-{tag}"))
 }
 
 fn usable() -> Availability {
@@ -339,7 +332,8 @@ fn a_program_outside_the_system_dirs_is_bound_resolved_and_run_through_it() {
     let bin = tmp("prefix-bin");
     script(&bin, "mytool");
     // A link to the dir: the bind and the program path use the target.
-    let linkdir = tmp("prefix-links").join("l");
+    let links = tmp("prefix-links");
+    let linkdir = links.join("l");
     std::os::unix::fs::symlink(&bin, &linkdir).unwrap();
     let mut env = env_in(&ws);
     env.path = Some(format!("{}:/usr/bin", linkdir.display()));
@@ -400,7 +394,8 @@ fn a_program_in_the_workspace_is_not_rebound_read_only() {
 #[test]
 fn a_workspace_symlink_is_resolved_and_only_the_target_is_bound() {
     let real = tmp("wsreal");
-    let link = tmp("wslink").join("w");
+    let links = tmp("wslink");
+    let link = links.join("w");
     #[cfg(unix)]
     std::os::unix::fs::symlink(&real, &link).unwrap();
     #[cfg(unix)]
@@ -418,10 +413,10 @@ fn a_workspace_that_is_or_holds_home_or_the_data_dir_is_refused() {
     let data = home.join(".codecora/tole");
     std::fs::create_dir_all(&data).unwrap();
     let mut env = env_in(&home);
-    env.home = Some(home.clone());
+    env.home = Some(home.to_path_buf());
     env.data_dir = Some(data.clone());
     let c = on(Mode::Required, Mode::Required);
-    for ws in [&home, &data, home.parent().unwrap()] {
+    for ws in [home.path(), data.as_path(), home.parent().unwrap()] {
         env.workspace = Some(ws.to_path_buf());
         let l = plan_command(
             &c,

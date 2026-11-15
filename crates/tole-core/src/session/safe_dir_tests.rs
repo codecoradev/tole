@@ -2,14 +2,10 @@ use super::*;
 #[cfg(unix)]
 use std::io::Read;
 use std::io::Write;
-use std::path::PathBuf;
 
-fn base(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("tole-safedir-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    // The OS temp dir may itself be a link (macOS /var): work from its target.
-    d.canonicalize().unwrap()
+use crate::test_dir::TestDir;
+fn base(tag: &str) -> TestDir {
+    TestDir::new(&format!("tole-safedir-{tag}"))
 }
 
 fn create_new() -> Mode {

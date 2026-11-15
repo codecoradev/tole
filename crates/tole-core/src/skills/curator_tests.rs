@@ -2,11 +2,9 @@ use super::*;
 
 const NOW: u64 = 100 * DAY;
 
-fn tmp(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("tole-curator-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+use crate::test_dir::TestDir;
+fn tmp(tag: &str) -> TestDir {
+    TestDir::new(&format!("tole-curator-{tag}"))
 }
 
 fn rec(t: u64, skill: Option<&str>, kind: UsageKind) -> UsageRecord {
@@ -37,7 +35,8 @@ fn life(f: &SkillFacts) -> Option<Lifecycle> {
 
 #[test]
 fn the_ledger_folds_use_per_skill_and_keeps_the_baseline_apart() {
-    let l = UsageLedger::new(tmp("fold").join(USAGE_FILE));
+    let scratch = tmp("fold");
+    let l = UsageLedger::new(scratch.join(USAGE_FILE));
     for r in [
         rec(10, Some("a"), UsageKind::Recalled),
         rec(20, Some("a"), UsageKind::Loaded),
@@ -339,7 +338,8 @@ fn a_restore_whose_ledger_write_fails_is_undone_too() {
 
 #[test]
 fn a_run_outcome_goes_to_each_loaded_skill_or_to_the_baseline() {
-    let l = UsageLedger::new(tmp("outcome").join(USAGE_FILE));
+    let scratch = tmp("outcome");
+    let l = UsageLedger::new(scratch.join(USAGE_FILE));
     let two = ["a".to_string(), "b".to_string()];
     record_outcome(&l, &two, true, 10).unwrap();
     record_outcome(&l, &two[..1], false, 20).unwrap();
