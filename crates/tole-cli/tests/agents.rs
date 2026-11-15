@@ -7,6 +7,8 @@
 //! the durable log tail (never the uteke mailbox — uteke need not be
 //! installed; the child loop degrades gracefully without it).
 
+mod common;
+use common::{TestDir, WorkDir};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -201,15 +203,7 @@ fn decide(body: &Value) -> Value {
 }
 
 fn run_tole(env_extra: &[(&str, &str)], args: &[&str], stdin: &str) -> (String, String, i32) {
-    let dir = std::env::temp_dir().join(format!(
-        "tole-agent-e2e-{}-{:x}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = WorkDir::new("tole-agent-e2e");
     // The machine guard queues a child while the machine is busy (load per
     // CPU, free memory, disk, pids, spawn interval). These tests are about
     // the poll protocol, not the guard, so it is opened as far as its
@@ -289,14 +283,7 @@ fn parent_spawns_child_polls_until_settled() {
 #[test]
 fn a_run_never_touches_the_machine_home() {
     let (base, _hits) = spawn_mock();
-    let decoy = std::env::temp_dir().join(format!(
-        "tole-agent-e2e-decoy-{:x}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&decoy).unwrap();
+    let decoy = TestDir::new("tole-agent-e2e-decoy");
     let (stdout, stderr, code) = run_tole(
         &[
             ("TOLE_BASE_URL", base.as_str()),

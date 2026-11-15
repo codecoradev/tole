@@ -2,10 +2,12 @@
 //! `--on-pretool` exit 2) `resume <id> "<prompt>"` runs a new turn whose
 //! request carries the denial, instead of being refused with rc 1.
 
+mod common;
+use common::WorkDir;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -111,11 +113,8 @@ fn text(b: &[u8]) -> String {
     String::from_utf8_lossy(b).to_string()
 }
 
-fn workdir(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("tole-denial-e2e-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+fn workdir(tag: &str) -> WorkDir {
+    WorkDir::new(&format!("tole-denial-e2e-{tag}"))
 }
 
 fn session_id(cwd: &Path) -> String {
@@ -138,7 +137,7 @@ fn session_id(cwd: &Path) -> String {
 fn denied_first_run(
     tag: &str,
     first_args: &dyn Fn(&Path) -> Vec<String>,
-) -> (Arc<Mutex<Vec<Value>>>, String, PathBuf) {
+) -> (Arc<Mutex<Vec<Value>>>, String, WorkDir) {
     for attempt in 1..=3 {
         let reqs = Arc::new(Mutex::new(Vec::new()));
         let url = spawn_mock(reqs.clone());

@@ -2,17 +2,15 @@
 //! delegation log in the data dir, prints the tree redacted, and writes
 //! nothing.
 
-use std::path::PathBuf;
+mod common;
+use common::TestDir;
 use std::process::Command;
 
 use tole_cli::ledger_file::FileStore;
 use tole_core::delegation::{Budget, Delegation, Goal};
 
-fn tmp(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("tole-audit-cli-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d.canonicalize().unwrap()
+fn tmp(tag: &str) -> TestDir {
+    TestDir::new(&format!("tole-audit-cli-{tag}"))
 }
 
 #[test]

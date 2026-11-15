@@ -10,6 +10,8 @@
 // with the `shell-tools` feature (#349): the bare profile has no such face.
 #![cfg(feature = "shell-tools")]
 
+mod common;
+use common::TestDir;
 use serde_json::{json, Value};
 use std::io::{BufRead, Read, Write};
 use std::net::TcpListener;
@@ -276,17 +278,8 @@ fn spawn_mock() -> String {
     format!("http://{addr}/v1")
 }
 
-fn tmpdir(tag: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!(
-        "tole-acp-cancel-{tag}-{}-{:x}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis(),
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&d).unwrap();
-    d
+fn tmpdir(tag: &str) -> TestDir {
+    TestDir::new(&format!("tole-acp-cancel-{tag}"))
 }
 
 /// Scenario A: cancel while the provider call is in flight → the prompt

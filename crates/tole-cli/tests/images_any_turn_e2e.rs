@@ -7,6 +7,8 @@
 //!   block is spilled and recorded, an image-only prompt runs, other non-text
 //!   blocks stay ignored, and an empty or bad prompt is refused.
 
+mod common;
+use common::TestDir;
 use serde_json::{json, Value};
 #[cfg(feature = "shell-tools")]
 use std::io::BufRead;
@@ -115,17 +117,8 @@ fn spawn_mock() -> (String, Bodies) {
     (format!("http://{addr}/v1"), bodies)
 }
 
-fn tmp(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!(
-        "tole-img-turn-{tag}-{}-{:x}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&d).unwrap();
-    d.canonicalize().unwrap()
+fn tmp(tag: &str) -> TestDir {
+    TestDir::new(&format!("tole-img-turn-{tag}"))
 }
 
 fn base_cmd(url: &str, home: &Path, cwd: &Path) -> Command {

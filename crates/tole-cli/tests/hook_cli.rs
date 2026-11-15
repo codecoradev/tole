@@ -5,17 +5,18 @@
 
 #![cfg(feature = "shell-tools")]
 
+mod common;
+use common::TestDir;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Output};
 
 const KEY: &str = "route-key-for-hook-cli-tests-0123";
 
 /// A home (user config) and a project dir with its own config.
-fn setup(tag: &str) -> PathBuf {
-    let base = std::env::temp_dir().join(format!("tole-hookcli-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
+fn setup(tag: &str) -> TestDir {
+    let base = TestDir::new(&format!("tole-hookcli-{tag}"));
     std::fs::create_dir_all(base.join("home/tole")).unwrap();
     std::fs::create_dir_all(base.join("proj/.tole")).unwrap();
     std::fs::write(
