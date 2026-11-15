@@ -1301,6 +1301,21 @@ fn revoke_secret(
         } else {
             "secret_revoke"
         };
+        // An entry approved before grants were recorded (#825) becomes
+        // ledger-tracked here: the owner's decision also records what stays
+        // granted, otherwise the ledger would show only the revoke and block
+        // the remaining grants. An entry that is already tracked is left
+        // alone, so a hand-added grant is never adopted by this command.
+        let adopt = !project
+            && plugin_lock::read_ledger(&user.with_file_name(plugin_lock::LEDGER_FILE))
+                .ok()
+                .flatten()
+                .is_some_and(|l| !plugin_lock::secrets_recorded(&l, name));
+        if adopt {
+            for kept in &entry.secrets {
+                record_secret(user, "secret_grant", name, kept);
+            }
+        }
         record_secret(user, event, name, secret);
     }
     lock.save(&path)?;

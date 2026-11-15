@@ -366,8 +366,17 @@ each case):
    approved one (re-pinned, removed, or added where the approval was plain),
    or it holds a secret the ledger does not show as granted since the last
    approval (or shows as revoked), or it carries a bundle record with no
-   approval line at all. A plain entry's own `secrets` (#679) are not
-   ledger-tracked. A hand-edited lock cannot add or restore a
+   approval line at all. A plain entry's own `secrets` (#679) are tracked the
+   same way since #825: a plain approval writes `approve` with a
+   `secrets_recorded` marker, then one `secret_grant` line per grant, and a
+   lock grant the ledger does not show is blocked. *Migration:* an `approve`
+   line without the marker (an entry approved before) cannot vouch for its
+   secrets, so such an entry is reported (`LedgerCheck::secrets_unrecorded`,
+   a note in `list` and `doctor`), never blocked; it becomes tracked at its
+   next approval or when the owner runs `revoke --secret` on it (which records
+   the grants that stay, and never adopts anything for an entry already
+   tracked). Until then a hand-added secret on such an entry is not detected.
+   A hand-edited lock cannot add or restore a
    secret or drop the manifest pin, and an approval starts from no grant. Same residual as before: a process that can
    rewrite both files defeats it.
 4. *Declared skills, hooks and paths.* Shown and covered by the file hash,
