@@ -136,6 +136,27 @@ fn serve(mut s: std::net::TcpStream, bodies: Bodies) {
     }
 }
 
+/// `text` without its CSI sequences (`ESC [ ... final byte`), plus, for each
+/// byte of the result, the byte offset in `text` it came from.
+fn strip_csi(text: &str) -> (String, Vec<usize>) {
+    let (mut flat, mut at) = (String::new(), Vec::new());
+    let mut chars = text.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if c == '\x1b' && chars.peek().is_some_and(|(_, n)| *n == '[') {
+            chars.next();
+            for (_, n) in chars.by_ref() {
+                if ('\u{40}'..='\u{7e}').contains(&n) {
+                    break;
+                }
+            }
+            continue;
+        }
+        flat.push(c);
+        at.extend(std::iter::repeat_n(i, c.len_utf8()));
+    }
+    (flat, at)
+}
+
 /// `tole` on a fresh pty; everything it prints lands in `out`.
 struct Pty {
     child: Child,
@@ -241,6 +262,27 @@ impl Pty {
             let o = out.lock().unwrap();
             let text = String::from_utf8_lossy(&o[seen..]).to_string();
             text.find(needle).map(|i| text[..i + needle.len()].len())
+        });
+        self.seen += upto;
+    }
+
+    /// Like [`Pty::expect`], but matches across the terminal's own line
+    /// wrapping (#835). The TUI hard-wraps a long status line at the screen
+    /// width, so a message that embeds a path (whose length depends on where
+    /// the test directory lives) can break inside the needle. Wrapping only
+    /// inserts cursor-movement sequences, so the needle is searched in the
+    /// output with every CSI sequence removed.
+    fn expect_unwrapped(&mut self, needle: &str) {
+        let (out, seen) = (self.out.clone(), self.seen);
+        let what = format!("{needle:?} in the unwrapped screen output");
+        let upto = wait_for(WAIT, &what, || {
+            let o = out.lock().unwrap();
+            let text = String::from_utf8_lossy(&o[seen..]).to_string();
+            let (flat, at) = strip_csi(&text);
+            flat.find(needle).map(|i| {
+                let last = at[i + needle.len() - 1];
+                last + text[last..].chars().next().map_or(0, char::len_utf8)
+            })
         });
         self.seen += upto;
     }
@@ -652,11 +694,11 @@ fn tui_attaches_pasted_and_slash_image_paths_to_the_next_message() {
 
     // Outside the jail: refused with the host's error, nothing queued.
     t.send(&format!("/image {}\r", outside.display()));
-    t.expect("outside the workspace jail");
+    t.expect_unwrapped("outside the workspace jail");
     // A pasted path outside the jail is text after all (and says why).
     t.send("see ");
     t.send(&format!("\x1b[200~{}\x1b[201~", outside.display()));
-    t.expect("pasted as text, not attached");
+    t.expect_unwrapped("pasted as text, not attached");
     t.send("\r");
     t.expect("STREAM-ANSWER");
     t.idle();
@@ -895,7 +937,7 @@ fn tui_export_writes_the_transcript_and_refuses_to_overwrite() {
     t.expect("pick another path");
     t.idle();
     t.send("/export ../escape.html\r");
-    t.expect("outside the workspace jail");
+    t.expect_unwrapped("outside the workspace jail");
     t.idle();
     t.send("/export t.jsonl\r");
     t.expect("transcript written to");
