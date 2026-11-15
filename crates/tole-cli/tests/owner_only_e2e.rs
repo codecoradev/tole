@@ -6,9 +6,10 @@
 
 #![cfg(feature = "shell-tools")]
 
+mod common;
+use common::TestDir;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(unix)]
 use serde_json::json;
@@ -17,14 +18,8 @@ use tole_core::run_command::RunCommandTool;
 #[cfg(unix)]
 use tole_core::tool::Tool;
 
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-fn tmpdir() -> PathBuf {
-    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let d = std::env::temp_dir().join(format!("tole-owner-684-{}-{n}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d.canonicalize().unwrap()
+fn tmpdir() -> TestDir {
+    TestDir::new("tole-owner-684")
 }
 
 /// `tole` with `extra` env on top of a clean session-free environment.
@@ -75,7 +70,7 @@ fn data_files(home: &Path) -> Vec<String> {
     out
 }
 
-fn project(home_for_cfg: &str) -> PathBuf {
+fn project(home_for_cfg: &str) -> TestDir {
     let d = tmpdir();
     std::fs::create_dir_all(d.join(".tole")).unwrap();
     std::fs::write(d.join(".tole/config.toml"), home_for_cfg).unwrap();
@@ -204,7 +199,7 @@ fn run_command_cannot_reach_the_owner_only_records() {
     let work = tmpdir();
     let copy = work.join("helper");
     std::fs::copy(real(), &copy).unwrap();
-    let t = RunCommandTool::new(work.clone());
+    let t = RunCommandTool::new(work.to_path_buf());
     let envs = format!("CODECORA_HOME={}", home.display());
 
     // By name (and behind a wrapper): refused before any spawn.

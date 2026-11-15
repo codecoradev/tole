@@ -9,6 +9,8 @@
 
 #![cfg(feature = "shell-tools")]
 
+mod common;
+use common::TestDir;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -208,8 +210,7 @@ fn tole(
 fn a_sibling_edit_reaches_the_other_child_at_its_next_safe_point() {
     let _serial = serial();
     let base = spawn_mock();
-    let root = std::env::temp_dir().join(format!("tole-sibling-e2e-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    let root = TestDir::new("tole-sibling-e2e");
     let ws = root.join("ws");
     std::fs::create_dir_all(&ws).unwrap();
     std::fs::write(ws.join("shared.txt"), "original contents\n").unwrap();
@@ -253,8 +254,7 @@ fn a_sibling_edit_reaches_the_other_child_at_its_next_safe_point() {
 fn a_notice_reaches_child_a_via(face: &str) {
     let _serial = serial();
     let base = spawn_mock();
-    let root = std::env::temp_dir().join(format!("tole-sibling-{face}-e2e-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    let root = TestDir::new(&format!("tole-sibling-{face}-e2e"));
     let ws = root.join("ws");
     std::fs::create_dir_all(&ws).unwrap();
     std::fs::write(ws.join("shared.txt"), "original contents\n").unwrap();

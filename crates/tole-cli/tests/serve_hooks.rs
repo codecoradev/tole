@@ -8,13 +8,14 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use tole_core::webhook;
 
 mod common;
+use common::TestDir;
 
 const KEY: &str = "hook-key-for-tests-0123456789abcdef";
 
@@ -31,9 +32,8 @@ impl Drop for Serve {
 }
 
 /// A private home (user config) and cron dir.
-fn setup(tag: &str, hooks: &str) -> PathBuf {
-    let base = std::env::temp_dir().join(format!("tole-hooks-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
+fn setup(tag: &str, hooks: &str) -> TestDir {
+    let base = TestDir::new(&format!("tole-hooks-{tag}"));
     std::fs::create_dir_all(base.join("home/tole")).unwrap();
     std::fs::write(base.join("home/tole/config.toml"), hooks).unwrap();
     base

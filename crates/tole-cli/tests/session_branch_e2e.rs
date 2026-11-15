@@ -1,21 +1,19 @@
 //! #210: `tole branch <id>` forks a session at a settled entry and
 //! `tole sessions --tree` shows the shape, with the REAL binary.
 
+mod common;
+use common::TestDir;
 use serde_json::json;
-use std::path::PathBuf;
 use std::process::{Command, Output};
 use tole_core::entry::{EntryType, NewEntry};
 use tole_core::state::{Pc, StateTransition};
 use tole_core::storage::{Commit, JsonlStorage, Storage};
 
-fn tmpdir(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("tole-branch-e2e-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+fn tmpdir(tag: &str) -> TestDir {
+    TestDir::new(&format!("tole-branch-e2e-{tag}"))
 }
 
-fn tole(dir: &PathBuf, args: &[&str]) -> Output {
+fn tole(dir: &std::path::Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_tole"))
         .arg("--sessions-dir")
         .arg(dir)
@@ -25,7 +23,7 @@ fn tole(dir: &PathBuf, args: &[&str]) -> Output {
         .unwrap()
 }
 
-fn seed(dir: &PathBuf) -> String {
+fn seed(dir: &std::path::Path) -> String {
     let mut s = JsonlStorage::create(dir, "s-main", None).unwrap();
     s.commit(Commit::new().entry(NewEntry::root(
         EntryType::new(EntryType::MESSAGE),

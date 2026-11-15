@@ -7,7 +7,7 @@
 
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use tole_cli::delegated_approver::Store;
 use tole_core::delegation::{
@@ -17,6 +17,7 @@ use tole_core::delegation_approvals::{NewRequest, Origin};
 use tole_core::ledger::Lease;
 
 mod common;
+use common::TestDir;
 
 const T: i64 = 4_000_000_000;
 
@@ -90,11 +91,8 @@ impl Drop for Serve {
     }
 }
 
-fn home(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("tole-sdeleg-e2e-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+fn home(tag: &str) -> TestDir {
+    TestDir::new(&format!("tole-sdeleg-e2e-{tag}"))
 }
 
 /// One pending request of a delegated child under `<home>/tole/delegation`.

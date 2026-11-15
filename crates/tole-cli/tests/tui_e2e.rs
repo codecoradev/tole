@@ -4,12 +4,14 @@
 //! one (`tole sessions` lists it).
 #![cfg(all(unix, feature = "tui"))]
 
+mod common;
+use common::WorkDir;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -270,17 +272,8 @@ impl Pty {
     }
 }
 
-fn workdir() -> PathBuf {
-    let d = std::env::temp_dir().join(format!(
-        "tole-tui-e2e-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&d).unwrap();
-    d
+fn workdir() -> WorkDir {
+    WorkDir::new("tole-tui-e2e")
 }
 
 #[test]

@@ -3,6 +3,8 @@
 //! block appears after them (`n/a` for sessions recorded before
 //! `tole_wire` existed).
 
+mod common;
+use common::TestDir;
 use serde_json::{json, Value};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
@@ -48,18 +50,8 @@ fn serial() -> std::sync::MutexGuard<'static, ()> {
     SPAWN.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn tmp(tag: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!(
-        "tole-usage-report-{tag}-{}-{:x}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+fn tmp(tag: &str) -> TestDir {
+    TestDir::new(&format!("tole-usage-report-{tag}"))
 }
 
 fn status(dir: &std::path::Path, id: &str) -> String {

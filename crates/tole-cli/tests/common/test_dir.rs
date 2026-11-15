@@ -41,7 +41,18 @@ impl TestDir {
             Some(d) => PathBuf::from(d),
             None => std::env::temp_dir(),
         };
-        std::fs::create_dir_all(&base).expect("create test temp base");
+        Self::create_in(&base, prefix)
+    }
+
+    /// Like [`TestDir::new`], but always under the system temp dir. For a
+    /// test whose subject must not sit inside this repository's checkout
+    /// (cargo's target dir does, in CI), such as a git probe.
+    pub fn in_system_temp(prefix: &str) -> Self {
+        Self::create_in(&std::env::temp_dir(), prefix)
+    }
+
+    fn create_in(base: &Path, prefix: &str) -> Self {
+        std::fs::create_dir_all(base).expect("create test temp base");
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())

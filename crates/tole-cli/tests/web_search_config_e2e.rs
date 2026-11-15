@@ -1,12 +1,13 @@
 //! #436: a malformed `TOLE_WEB_SEARCH_*` config fails startup loudly with
 //! the REAL binary, naming the variable and never the header value.
 
+mod common;
+use common::TestDir;
 use std::process::Command;
 
 #[test]
 fn a_malformed_search_config_fails_startup_without_echoing_values() {
-    let home = std::env::temp_dir().join(format!("tole-web-search-e2e-{}", std::process::id()));
-    std::fs::create_dir_all(&home).unwrap();
+    let home = TestDir::new("tole-web-search-e2e");
     let o = Command::new(env!("CARGO_BIN_EXE_tole"))
         .args(["run", "hi"])
         .current_dir(&home)
