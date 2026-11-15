@@ -73,6 +73,11 @@ pub enum Event {
         call: String,
         what: String,
         tokens: u64,
+        /// Set when this call is the one retry of the (settled) call it
+        /// names, made after that call timed out (#756): the audit note.
+        /// Old readers ignore the field and count the call like any other.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry_of: Option<String>,
     },
     /// The host's handle of a reserved call that runs elsewhere (a
     /// delegated child's node), so a resumed host polls it instead of
@@ -151,6 +156,8 @@ pub struct Reservation {
     pub tokens: u64,
     pub handle: Option<String>,
     pub settled: Option<u64>,
+    /// The call this one retried after a timeout (#756).
+    pub retry_of: Option<String>,
 }
 
 /// The answer to [`DiscussionLog::reserve`].
@@ -214,6 +221,7 @@ impl State {
                 call,
                 what,
                 tokens,
+                retry_of,
             } => {
                 self.tokens_used = self.tokens_used.saturating_add(tokens);
                 self.reservations.insert(
@@ -224,6 +232,7 @@ impl State {
                         tokens,
                         handle: None,
                         settled: None,
+                        retry_of,
                     },
                 );
             }
@@ -575,6 +584,34 @@ impl DiscussionLog {
         tokens: u64,
         now: u64,
     ) -> Result<Reserve, String> {
+        self.reserve_as(round, what, tokens, None, now)
+    }
+
+    /// [`DiscussionLog::reserve`] for the ONE retry of call `of` after it
+    /// timed out (#756). It is charged and stopped exactly like any call (a
+    /// retry that does not fit records the budget escalation), and is
+    /// recorded with `retry_of` as the audit note. The ledger itself keeps
+    /// the retry single: `of` must be a settled call of the same round and
+    /// kind that is not itself a retry and has not been retried before.
+    pub fn reserve_retry(
+        &self,
+        round: u32,
+        what: &str,
+        tokens: u64,
+        of: &str,
+        now: u64,
+    ) -> Result<Reserve, String> {
+        self.reserve_as(round, what, tokens, Some(of), now)
+    }
+
+    fn reserve_as(
+        &self,
+        round: u32,
+        what: &str,
+        tokens: u64,
+        retry_of: Option<&str>,
+        now: u64,
+    ) -> Result<Reserve, String> {
         if !short_id(what, MAX_WHAT_CHARS, false) {
             return Err(format!(
                 "call kind {what:?}: a short id of a-z, 0-9 and '-'"
@@ -585,6 +622,28 @@ impl DiscussionLog {
         let next = st.next();
         if st.open_round() != Some(round) {
             return Err(Self::refuse(&next, &format!("a call in round {round}")));
+        }
+        if let Some(of) = retry_of {
+            let first = st
+                .reservations
+                .get(of)
+                .ok_or_else(|| format!("no call {of} to retry"))?;
+            if first.round != round || first.what != what {
+                return Err(format!("call {of} is not a {what} call of round {round}"));
+            }
+            if first.settled.is_none() {
+                return Err(format!("call {of} has not settled; it cannot be retried"));
+            }
+            if first.retry_of.is_some() {
+                return Err(format!("call {of} is itself a retry; it is not retried"));
+            }
+            if st
+                .reservations
+                .values()
+                .any(|r| r.retry_of.as_deref() == Some(of))
+            {
+                return Err(format!("call {of} was already retried once"));
+            }
         }
         let c = st.contract.as_ref().ok_or("no contract")?;
         if st.tokens_used.saturating_add(tokens) > c.budget_tokens {
@@ -600,6 +659,7 @@ impl DiscussionLog {
                 call: call.clone(),
                 what: what.to_string(),
                 tokens,
+                retry_of: retry_of.map(str::to_string),
             },
             now,
         )?;
