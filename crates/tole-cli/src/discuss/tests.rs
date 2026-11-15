@@ -322,3 +322,220 @@ fn show_lists_and_reads_a_discussion_and_refuses_a_bad_id() {
     assert!(show(&dir, Some("../etc"), false, &e.secrets).is_err());
     assert!(show(&dir, Some("nope"), false, &e.secrets).is_err());
 }
+
+// ---- #856: the participant count is advice, not a limit ----
+
+fn voice_names(n: usize) -> Vec<String> {
+    (1..=n).map(|i| format!("voice-{i}")).collect()
+}
+
+fn wide_config(n: usize) -> Config {
+    let mut toml: String = voice_names(n)
+        .iter()
+        .map(|v| format!("[profiles.{v}]\n"))
+        .collect();
+    toml.push_str("[profiles.scribe.models]\nlight = \"tiny\"\n");
+    crate::config::parse(&toml, Path::new("user.toml")).unwrap()
+}
+
+fn wide_args(n: usize, budget: u64) -> StartArgs {
+    StartArgs {
+        participants: voice_names(n),
+        ..args(budget)
+    }
+}
+
+/// Every voice speaks 400 characters (a big round, so the scribe digests
+/// it); the scribe cites every entry it was shown; the checker is met.
+fn wide_answers() -> Answer {
+    Arc::new(|kind, user| {
+        let entries = || {
+            user.lines()
+                .filter_map(|l| l.strip_prefix("entry "))
+                .filter_map(|l| {
+                    let id = l.split_whitespace().next()?.to_string();
+                    let by = l.split(" by ").nth(1)?.trim_end_matches(':').to_string();
+                    Some((id, by))
+                })
+                .collect::<Vec<_>>()
+        };
+        let text = match kind {
+            "scribe" => {
+                let claims: Vec<_> = entries()
+                    .into_iter()
+                    .map(|(e, by)| serde_json::json!({"text": "argued", "by": by, "entry": e}))
+                    .collect();
+                serde_json::json!({"claims": claims, "delta": ["round one"]}).to_string()
+            }
+            "checker" => {
+                serde_json::json!([{"met": true, "evidence": [entries()[0].0.clone()]}]).to_string()
+            }
+            who => format!("{who} says use sqlite. {}", "because ".repeat(50)),
+        };
+        Ok(ProviderOutput::Final { text })
+    })
+}
+
+#[test]
+fn the_advice_starts_above_eight_voices_and_never_refuses() {
+    let s = SecretSet::default();
+    for n in [1, 7, 8] {
+        assert!(advice_for(&wide_args(n, 500_000), &s).is_empty(), "{n}");
+    }
+    for n in [9, 12, 16] {
+        let a = advice_for(&wide_args(n, 500_000), &s);
+        assert_eq!(a.len(), 1, "{a:?}");
+        assert!(
+            a[0].starts_with(&format!(
+                "{n} participants: more than 8 voices mostly add cost"
+            )) && a[0].contains("3 to 8 is the sweet spot"),
+            "{a:?}"
+        );
+    }
+    // An invalid contract has no advice; the start reports the error.
+    assert!(advice_for(&wide_args(17, 500_000), &s).is_empty());
+}
+
+#[test]
+fn above_the_ceiling_a_start_is_refused_naming_it_and_writes_nothing() {
+    let dir = tmp("ceiling");
+    let cfg = wide_config(17);
+    let (calls, make) = factory(100, wide_answers());
+    let err = start(&wide_args(17, 500_000), &env(&dir, &cfg, make)).unwrap_err();
+    assert!(
+        err.contains("at most 16") && err.contains("ledger record"),
+        "{err}"
+    );
+    assert!(!dir.join("pick-db.jsonl").exists());
+    assert!(calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn twelve_voices_reach_the_gate_and_the_digest_keeps_every_voice() {
+    let dir = tmp("wide12");
+    let cfg = wide_config(12);
+    let (calls, make) = factory(100, wide_answers());
+    let out = start(&wide_args(12, 500_000), &env(&dir, &cfg, make)).unwrap();
+    assert!(out.contains("12 participants"), "{out}");
+    assert!(out.contains("the acceptance criteria are met"), "{out}");
+    let st = state(&dir);
+    assert!(matches!(st.closed, Some((Gate::Report, _))));
+    // One round: every voice once, a scribe, a checker.
+    let seen = calls.lock().unwrap().clone();
+    assert_eq!(seen.len(), 12 + 2, "{seen:?}");
+    match st.summaries.get(&1).unwrap() {
+        tole_core::discussion::RoundSummary::Digest(d) => {
+            let by: std::collections::BTreeSet<&str> =
+                d.claims.iter().map(|i| i.by.as_str()).collect();
+            assert_eq!(by.len(), 12, "every voice appears in the digest: {by:?}");
+        }
+        other => panic!("a digest was expected: {other:?}"),
+    }
+    assert!(st.tokens_used <= 500_000);
+}
+
+#[test]
+fn a_many_voice_discussion_resumes_where_the_ledger_stands() {
+    let dir = tmp("wide-resume");
+    let cfg = wide_config(12);
+    // voice-7 fails once: six voices spoke, the rest did not.
+    let failed = Arc::new(AtomicUsize::new(0));
+    let f2 = Arc::clone(&failed);
+    let flaky: Answer = Arc::new(move |kind, user| {
+        if kind == "voice-7" && f2.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err("upstream 500".into());
+        }
+        wide_answers()(kind, user)
+    });
+    let (_, make) = factory(100, flaky);
+    let err = start(&wide_args(12, 500_000), &env(&dir, &cfg, make)).unwrap_err();
+    assert!(err.contains("tole discuss resume pick-db"), "{err}");
+    assert_eq!(state(&dir).contributions.len(), 6);
+    let (calls, make) = factory(100, wide_answers());
+    let out = resume("pick-db", &env(&dir, &cfg, make)).unwrap();
+    assert!(out.contains("the acceptance criteria are met"), "{out}");
+    let seen = calls.lock().unwrap().clone();
+    for done in 1..=6 {
+        assert!(
+            !seen.contains(&format!("voice-{done}")),
+            "voice-{done} is not run again: {seen:?}"
+        );
+    }
+    assert_eq!(seen.len(), 6 + 2, "{seen:?}");
+    assert_eq!(state(&dir).contributions.len(), 12);
+}
+
+#[test]
+fn the_ceiling_runs_end_to_end_when_the_scribe_fails_and_the_round_is_kept_as_written() {
+    let dir = tmp("wide16");
+    let cfg = wide_config(16);
+    // A refused digest: all sixteen big contributions go into one record.
+    let hostile: Answer = Arc::new(|kind, user| {
+        if kind == "scribe" {
+            return Ok(ProviderOutput::Final {
+                text: "not json".into(),
+            });
+        }
+        wide_answers()(kind, user)
+    });
+    let (_, make) = factory(100, hostile);
+    let out = start(&wide_args(16, 900_000), &env(&dir, &cfg, make)).unwrap();
+    assert!(out.contains("Outcome: "), "{out}");
+    let st = state(&dir);
+    assert!(st.closed.is_some());
+    assert!(matches!(
+        st.summaries.get(&1),
+        Some(tole_core::discussion::RoundSummary::Fallback { .. })
+    ));
+}
+
+#[test]
+fn the_cost_plan_scales_with_the_voices_and_a_tiny_budget_is_warned_about_first() {
+    let dir = tmp("wide-dry");
+    let s = SecretSet::default();
+    let c = |n: usize, b: u64| contract(&wide_args(n, b), 1, &s).unwrap();
+    let (few, many) = (host::round_floor(&c(2, 1)), host::round_floor(&c(12, 1)));
+    assert!(
+        many > few * 5,
+        "the floor grows with the voices: {few} -> {many}"
+    );
+    // A big budget: the plan shows the floor and what it covers; no warning.
+    let cfg = wide_config(12);
+    let (calls, make) = factory(100, wide_answers());
+    let e = env(&dir, &cfg, make);
+    let out = plan(&wide_args(12, 500_000), &e).unwrap();
+    assert!(
+        out.contains(&format!("a round reserves at least {many} tokens"))
+            && out.contains("covers about 3 round(s)"),
+        "{out}"
+    );
+    assert_eq!(advice_for(&wide_args(12, 500_000), &s).len(), 1);
+    // A tiny budget: the plan and the advice both say one round does not fit,
+    // and the dry run still passes (the owner may want it).
+    let out = plan(&wide_args(12, 2_000), &e).unwrap();
+    assert!(
+        out.contains("does not fit one round of 12 participants"),
+        "{out}"
+    );
+    let a = advice_for(&wide_args(12, 2_000), &s);
+    assert_eq!(a.len(), 2, "{a:?}");
+    assert!(a[1].contains("budget escalation in round 1"), "{a:?}");
+    assert!(calls.lock().unwrap().is_empty());
+    assert!(!dir.join("pick-db.jsonl").exists());
+}
+
+#[test]
+fn a_round_one_budget_escalation_says_why() {
+    let dir = tmp("wide-r1");
+    let cfg = wide_config(12);
+    let (_, make) = factory(100, wide_answers());
+    // Not even the first participant's reservation fits.
+    let out = start(&wide_args(12, 300), &env(&dir, &cfg, make)).unwrap();
+    assert!(
+        out.contains("Round 1 did not finish")
+            && out.contains("one round of 12 participants is reserved at about")
+            && out.contains("needs the owner"),
+        "{out}"
+    );
+    assert!(state(&dir).tokens_used <= 300);
+}
