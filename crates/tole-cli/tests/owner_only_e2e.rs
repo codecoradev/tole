@@ -81,6 +81,7 @@ const SESSION: &[(&str, &str)] = &[("TOLE_UNDER_SESSION", "1")];
 const CHILD: &[(&str, &str)] = &[("TOLE_AGENT_DEPTH", "1")];
 
 fn owner_commands() -> Vec<Vec<&'static str>> {
+    #[cfg_attr(not(feature = "mcp"), allow(unused_mut))]
     let mut v = vec![
         vec!["cron", "create", "@every 10m", "--script", "echo pwned"],
         vec!["cron", "resume", "job-x"],

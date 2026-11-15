@@ -46,6 +46,12 @@ jobs:
           cargo clippy -p tole-cli --no-default-features --features shell-tools -- -D warnings
           cargo test -p tole-cli --no-default-features --features shell-tools
           cargo check -p tole-core --no-default-features --tests
+          # Lint every target (tests, benches) in the profiles the default
+          # Clippy job does not cover (#829).
+          cargo clippy -p tole-core --no-default-features --all-targets -- -D warnings
+          cargo clippy -p tole-cli --no-default-features --all-targets -- -D warnings
+          cargo clippy -p tole-cli --no-default-features --features shell-tools --all-targets -- -D warnings
+          cargo clippy -p tole-tui --no-default-features --all-targets -- -D warnings
 
   fmt:
     name: Format
