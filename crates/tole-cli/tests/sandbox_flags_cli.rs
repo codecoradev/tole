@@ -87,7 +87,10 @@ fn sandbox_flag_is_refused_for_a_script_without_a_terminal() {
         );
         assert!(!out.contains("overrides the config"), "{out}");
     }
-    // `serve` is unattended even at a terminal: refused before it binds.
+    // `serve` without a terminal: refused before it binds. This proves
+    // "refused without a terminal" only; that `serve`, `acp` and `mcp` are
+    // unattended even at a terminal is pinned by `sandbox_flag_class_tests`
+    // in main.rs.
     #[cfg(feature = "shell-tools")]
     {
         let out = text(&tole(&b, false, &["--sandbox", "net", "serve"]));

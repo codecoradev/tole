@@ -363,6 +363,13 @@ servers; `[sandbox.consumers]` is not touched by either.
   unknown name stops startup. It can pick a user-defined profile wider than
   the default (that is the owner's own choice, at a terminal, never from a
   session or a script). The two flags conflict.
+- "At a terminal" means stdin and stderr are both a TTY. A process outside
+  an agent session that fakes a pty (`script`, `unbuffer`) still passes
+  that check, for `--sandbox` and `--no-sandbox` alike; agent sessions and
+  their children are refused through the session marker (#684) whatever
+  they fake, the profile must be built in or defined in the owner's user
+  config, and a plugin lock entry that recorded a profile is still compared
+  at launch.
 - Two views, so a flag cannot widen its own blast radius: the configured
   policy (`tole_core::sandbox::policy()`) is the owner's config and is never
   changed by a flag; it is what the first-party names (`skip`), the sandbox

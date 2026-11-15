@@ -235,3 +235,12 @@ jobs:
           # tests must really have run (not zero tests, no SKIPPED line).
           if grep -n "SKIPPED" sandbox.log; then echo "a sandbox test was skipped"; exit 1; fi
           [ "$(grep -c '^test result: ok\. [1-9]' sandbox.log)" -eq 4 ] || { echo "expected 4 test targets with passing tests"; exit 1; }
+      - name: Lazy-start roster test (tole-cli)
+        run: |
+          set -o pipefail
+          cargo test -p tole-cli --test plugin_gate_roster_lazy \
+            -- --nocapture --test-threads=1 2>&1 | tee roster-lazy.log
+          # It skips without bwrap (TOLE_REQUIRE_BWRAP turns that into a
+          # failure); it must really have run.
+          if grep -n "SKIPPED" roster-lazy.log; then echo "the roster lazy test was skipped"; exit 1; fi
+          [ "$(grep -c '^test result: ok\. 1 passed' roster-lazy.log)" -eq 1 ] || { echo "expected the roster lazy test to pass"; exit 1; }
