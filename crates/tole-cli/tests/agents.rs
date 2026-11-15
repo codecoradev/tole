@@ -8,11 +8,11 @@
 //! installed; the child loop degrades gracefully without it).
 
 mod common;
-use common::{wait_until, TestDir, WorkDir, WAIT};
+use common::{poll_until, wait_until, TestDir, WorkDir, WAIT};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 // Minimal content-driven OpenAI-compatible server. Decision table:
@@ -69,19 +69,33 @@ fn completion_to_sse(reply: &Value) -> String {
     out
 }
 
-fn spawn_mock() -> (String, Arc<AtomicUsize>) {
+/// How long the mock holds back each `agent_poll` answer once the child's
+/// own request is in: the think time of a real model between two polls. The
+/// turn loop trips after 120 polls in one turn, and a mock that answers a
+/// poll at once burns that budget in about a second, so a child that starts
+/// slowly on a loaded machine would abort the parent (#702).
+const POLL_PACE: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// What a mock run observed.
+#[derive(Clone, Default)]
+struct Seen {
+    /// `agent_poll` calls the mock asked the parent for.
+    polls: Arc<AtomicUsize>,
+    /// The mock has answered the child's mission request.
+    child_answered: Arc<AtomicBool>,
+}
+
+fn spawn_mock() -> (String, Seen) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
-    let calls = Arc::new(AtomicUsize::new(0));
-    let hits = Arc::clone(&calls);
-    let _ = &hits; // reserved for request-count assertions
-    let hits2 = Arc::clone(&calls);
+    let seen = Seen::default();
+    let seen2 = seen.clone();
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             // Thread per connection: the parent polls WHILE children
             // call concurrently — a single-threaded accept loop refuses
             // them (found live 2026-10-05).
-            let hits3 = Arc::clone(&hits2);
+            let seen3 = seen2.clone();
             std::thread::spawn(move || {
                 let mut s = stream;
                 let mut buf = Vec::new();
@@ -107,8 +121,18 @@ fn spawn_mock() -> (String, Arc<AtomicUsize>) {
                     }
                 }
                 let streamed = body.get("stream").and_then(Value::as_bool) == Some(true);
-                hits3.fetch_add(1, Ordering::SeqCst);
                 let reply = decide(&body);
+                let is_poll = reply["choices"][0]["message"]["tool_calls"][0]["function"]["name"]
+                    == "agent_poll";
+                if is_poll {
+                    seen3.polls.fetch_add(1, Ordering::SeqCst);
+                    // Hold the answer until the child has asked its question
+                    // (a condition, not a guessed sleep), then pace it.
+                    let _ = poll_until(WAIT, || {
+                        seen3.child_answered.load(Ordering::SeqCst).then_some(())
+                    });
+                    std::thread::sleep(POLL_PACE);
+                }
                 let resp = if streamed {
                     // The headers/body already arrived (body_in parsed it
                     // above); answer with the SSE form.
@@ -127,10 +151,18 @@ fn spawn_mock() -> (String, Arc<AtomicUsize>) {
                     )
                 };
                 let _ = s.write_all(resp.as_bytes());
+                let first_user = body["messages"]
+                    .as_array()
+                    .and_then(|m| m.iter().find(|m| m["role"] == "user"))
+                    .and_then(|m| m["content"].as_str())
+                    .unwrap_or("");
+                if first_user.contains("CHILD_MISSION") {
+                    seen3.child_answered.store(true, Ordering::SeqCst);
+                }
             });
         }
     });
-    (format!("http://{addr}/v1"), calls)
+    (format!("http://{addr}/v1"), seen)
 }
 
 fn completion(msg: Value, finish: &str) -> Value {
@@ -161,7 +193,7 @@ fn decide(body: &Value) -> Value {
         .to_string();
     if first_user.contains("CHILD_MISSION") {
         return completion(
-            json!({"role": "assistant", "content": "CHILD_ANSWER_42"}),
+            json!({"role": "assistant", "content": "CHILD_ANSWER_42\nMISSION_COMPLETE"}),
             "stop",
         );
     }
@@ -193,7 +225,10 @@ fn decide(body: &Value) -> Value {
         .and_then(|rest| rest.split('"').next())
         .unwrap_or("a-unknown")
         .to_string();
-    if content.contains("\"running\": true") || content.contains("\\\"running\\\": true") {
+    // The start result and every `running: true` poll result call for
+    // another poll; only a settled one ends the parent's turn. (The compact
+    // form is what the model sees; the start result has no `running` key.)
+    if !content.contains("\"running\":false") && !content.contains("\"running\": false") {
         return tool_call(2, "agent_poll", json!({"agent": id}));
     }
     completion(
@@ -292,7 +327,7 @@ fn run_tole(env_extra: &[(&str, &str)], args: &[&str], stdin: &str) -> (String, 
 
 #[test]
 fn parent_spawns_child_polls_until_settled() {
-    let (base, _hits) = spawn_mock();
+    let (base, seen) = spawn_mock();
     let (stdout, stderr, code) = run_tole(
         &[("TOLE_BASE_URL", base.as_str())],
         &[
@@ -308,6 +343,19 @@ fn parent_spawns_child_polls_until_settled() {
         stdout.contains("PARENT_DONE"),
         "stdout={stdout}\nstderr={stderr}"
     );
+    // The test is about the poll protocol: the parent really polled, and the
+    // child it polled really ran its mission (before this the mock never
+    // answered a poll, and the child, never told the mission was complete,
+    // spent its whole 200-step budget, which took seconds and grew with the
+    // load).
+    assert!(
+        seen.child_answered.load(Ordering::SeqCst),
+        "the child never asked its question\nstderr={stderr}"
+    );
+    assert!(
+        seen.polls.load(Ordering::SeqCst) >= 1,
+        "the parent never polled\nstdout={stdout}\nstderr={stderr}"
+    );
 }
 
 /// #702: the run is hermetic. Delegation's machine-wide registry and the
@@ -317,7 +365,7 @@ fn parent_spawns_child_polls_until_settled() {
 /// `CODECORA_HOME`.
 #[test]
 fn a_run_never_touches_the_machine_home() {
-    let (base, _hits) = spawn_mock();
+    let (base, _seen) = spawn_mock();
     let decoy = TestDir::new("tole-agent-e2e-decoy");
     let (stdout, stderr, code) = run_tole(
         &[
@@ -349,7 +397,7 @@ fn a_run_never_touches_the_machine_home() {
 /// applies.
 #[test]
 fn a_run_opens_the_machine_guard() {
-    let (base, _hits) = spawn_mock();
+    let (base, _seen) = spawn_mock();
     let (stdout, stderr, code) = run_tole(
         &[("TOLE_BASE_URL", base.as_str())],
         &["doctor", "--tier", "offline", "--no-ledger"],
@@ -364,7 +412,7 @@ fn a_run_opens_the_machine_guard() {
 
 #[test]
 fn depth_one_child_has_no_agent_tools() {
-    let (base, _hits) = spawn_mock();
+    let (base, _seen) = spawn_mock();
     let (stdout, stderr, code) = run_tole(
         &[("TOLE_BASE_URL", base.as_str()), ("TOLE_AGENT_DEPTH", "1")],
         &["run", "DEPTH_PROBE: try spawning a grandchild"],
