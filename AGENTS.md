@@ -11,6 +11,9 @@ continuity, infra facts.
 - `crates/tole-core` — platform-agnostic library (state machine, JSONL
   storage, `Tool`/`Approver`/`Storage`/`Provider` traits, tools, provider).
   Published to crates.io; embedders build `--no-default-features`.
+- `crates/tole-tui` — inline terminal UI over `tole-core` (presentation and
+  event loop). Published to crates.io; `tole-cli` depends on it (default
+  `tui` feature).
 - `crates/tole-cli` — headless CLI host (the `tole` binary). Published to
   crates.io; during work always run the freshly built
   `./target/release/tole`, never a PATH-resolved one.
@@ -18,6 +21,8 @@ continuity, infra facts.
   model, E8 retro.
 - `evals/` — agentic regression harness (Tier 1 CI contracts, Tier 2 live
   missions, Tier 3 baselines).
+- `scripts/` — helper scripts (`review-local.sh`: local Cora review of the
+  branch before a PR).
 - `.cora.yaml` — cora review configuration; known false-positive categories
   are encoded there as rules — extend the rule instead of sprinkling inline
   ignores.
@@ -76,6 +81,21 @@ cora review --staged          # exit 0 clean · exit 2 blocking → fix · exit 
 CI enforces the same set. There is no pre-commit hook installed by default —
 run these yourself.
 
+**Before opening a PR** (agents: mandatory) run Cora on your whole branch, not
+just the staged diff, and fix real findings first:
+
+```bash
+scripts/review-local.sh        # git diff origin/develop...HEAD, split by crate/dir, findings only
+```
+
+The script splits a large diff into chunks of at most 600 changed lines
+(`--max-lines`), so each Cora call stays small; exit 0 means no findings, 2
+means findings, 1 means Cora errored or ran without an LLM (not a pass). State
+the result in the PR **Testing** section (for example "scripts/review-local.sh:
+no findings" or the findings and how each was handled). Without an LLM key, use
+`cora mcp` (`review_prepare` / `review_finalize`) so you are the reviewer. This
+only moves feedback earlier: the CI Cora Review job stays the merge gate.
+
 ## 4. Tooling — cora & team memory first
 
 These sibling tools are the ecosystem's force multipliers. Use them instead
@@ -92,8 +112,17 @@ of reinventing or brute-forcing:
 - `cora query "main -> *"` / `cora trace <sym>` / `cora arch` — structure
   and path questions without reading whole files.
 - `cora dead-code` — after removals; `cora debt` — trend checks.
-- `cora review --staged` before every commit (mandatory, see §3);
-  `cora scan` after significant or security-adjacent changes.
+- `cora review --staged` before every commit and `scripts/review-local.sh`
+  before every PR (mandatory, see §3); `cora scan` after significant or
+  security-adjacent changes.
+- Run the code-intelligence commands (`cora callers` / `cora impact` /
+  `cora affected`) before: moving, renaming or removing a public item
+  (anything `pub` in a published crate); changing a ledger, session, lock or
+  config file format; touching the sandbox, approval, allowlist or secret
+  redaction paths. Put what they showed (callers, tests to rerun) in the PR
+  description. On Rust these commands are noisy (calls resolve by bare name,
+  macro bodies are not parsed; #669): treat the output as a pointer and verify
+  every caller and test with grep before acting on it.
 
 **Team knowledge rooms (semantic memory) — continuity across sessions:**
 
