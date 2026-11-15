@@ -605,10 +605,10 @@ fn build_with_data_dir(
     // The rug-pull guard (#599): a server registers only when its live
     // manifest matches its lock entry.
     #[cfg(feature = "mcp")]
-    let plugin_gate = crate::plugin_gate::Gate::load(
+    let plugin_gate = std::sync::Arc::new(crate::plugin_gate::Gate::load(
         tole_core::plugin_lock::Lockfile::user_path(),
         &roster.workspace,
-    );
+    ));
     #[cfg(feature = "mcp")]
     if !roster.mcp_servers.is_empty() {
         for n in &plugin_gate.notes {
@@ -636,7 +636,27 @@ fn build_with_data_dir(
         // process-wide one.
         cfg.workspace = Some(roster.workspace.clone());
         let cfg = &cfg;
-        let names = tole_core::mcp::register_server_tools(&mut reg, cfg, &secrets, &admit);
+        // Lazy start (#750, opt-in): a locked, sandbox-wrapped stdio server
+        // with a complete, consistent snapshot registers from it; anything
+        // else starts eagerly as before.
+        let lazy = lazy_snapshot(cfg, &plugin_gate);
+        let names = match lazy {
+            Some(tools) => {
+                let (pre, post) = (
+                    std::sync::Arc::clone(&plugin_gate),
+                    std::sync::Arc::clone(&plugin_gate),
+                );
+                let (name, source2) = (cfg.name.clone(), source.clone());
+                let guard = tole_core::mcp::LazyGuard {
+                    pre_start: Box::new(move || {
+                        pre.refuse_unseen(&name, &source2).map_or(Ok(()), Err)
+                    }),
+                    admit: Box::new(move |s, v, t| post.check(s, &source, v, t)),
+                };
+                tole_core::mcp::register_server_tools_lazy(&mut reg, cfg, &secrets, tools, guard)
+            }
+            None => tole_core::mcp::register_server_tools(&mut reg, cfg, &secrets, &admit),
+        };
         if cfg.name == "cora" && !names.is_empty() {
             cora_mcp_ok = true;
         }
@@ -689,6 +709,25 @@ fn build_with_data_dir(
         keep_read_only(&mut reg, env)?;
     }
     Ok(reg)
+}
+
+/// The snapshot a server registers from when lazy start applies (#750):
+/// `[sandbox] lazy_start` is on, the sandbox wraps this stdio server, and its
+/// lock entry stored a complete snapshot that hashes to the entry's
+/// manifest hash. `None`: start it eagerly.
+#[cfg(feature = "mcp")]
+fn lazy_snapshot(
+    cfg: &tole_core::mcp::McpServerConfig,
+    gate: &crate::plugin_gate::Gate,
+) -> Option<Vec<(String, String)>> {
+    if !tole_core::sandbox::lazy_start()
+        || !matches!(cfg.transport, tole_core::mcp::McpTransport::Stdio { .. })
+        || !cfg.conn_key().contains('@')
+    {
+        return None;
+    }
+    let e = gate.entries().get(&cfg.name)?;
+    tole_core::mcp::lazy_tools(&e.manifest, &e.manifest_hash)
 }
 
 /// Plan mode: only ReadOnly tools stay. A delegated child in plan mode (an

@@ -53,6 +53,10 @@ name = "mcp_admission"
 required-features = ["mcp"]
 
 [[test]]
+name = "mcp_lazy"
+required-features = ["mcp"]
+
+[[test]]
 name = "mcp_secret_grant"
 required-features = ["mcp"]
 

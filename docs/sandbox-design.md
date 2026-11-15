@@ -327,8 +327,8 @@ servers; `[sandbox.consumers]` is not touched by either.
   and `Admission` checks run as before.
 - Logged: one startup line and a `tole doctor` line say that a flag
   overrode the config (mode or profile it replaced), and doctor lists the
-  grants of the effective policy. Not built: lazy start from the locked
-  snapshot, the profile name and hash in the lock entry.
+  grants of the effective policy. Lazy start is section 9.1.2; not built:
+  the profile name and hash in the lock entry.
 
 ## 7. Default profiles
 
@@ -522,6 +522,40 @@ refused with a message naming the limit, never by evicting another
 session's server, and a released slot is reusable. Servers that are not
 wrapped (sandbox off, HTTP, skipped) keep the old process-lifetime
 behaviour.
+
+### 9.1.2 Lazy start, as built (#750)
+
+Opt-in: `[sandbox] lazy_start = true` in the user config (default off; a
+project config cannot set it). It applies to a stdio server that is wrapped
+by the sandbox (not `skip`, not `--no-sandbox`) and whose lock entry stored
+a snapshot that is usable as is; every other server starts at session start
+as before.
+
+- **Eligible snapshot** (`tole_core::mcp::lazy_tools`): non-empty; every
+  tool name is a plain name (`A-Za-z0-9_-.`, at most 64); every stored
+  description and schema still hashes to its recorded hash (so none is cut,
+  not stored, redacted or cleaned); and the manifest rebuilt from it hashes
+  to the entry's `manifest_hash` (a stale or hand-edited snapshot fails).
+  Otherwise the server starts eagerly.
+- **Registration** adds the tools from the snapshot and starts nothing. The
+  host still runs the lock's pre-start decision (`refuse_unseen`) at
+  registration, so an unapproved, revoked or moved server registers nothing,
+  exactly as before.
+- **First call** (after the usual per-call approval, which is never
+  skipped) runs, in order, the same steps an eager start runs: the lock's
+  pre-start decision again (a binary swapped since registration is never
+  started), the start through the normal launch path (sandbox plan, the
+  startup line logged once, `max_servers`), and the lock's check of the live
+  manifest and version. A refusal returns the note, stops the server,
+  records the ledger line the eager check records, and refuses every later
+  call of the session without starting it again; no call ever reaches the
+  server. A start that merely fails (cap, program error) is retried by the
+  next call. Idle stop and restart behave as for an eager server.
+- **Not offered while dormant:** resources, prompts and the `/mcp:` listing
+  of a lazy server (the registry marks a server admitted, #680, only after a
+  live check). They are not offered after the first call either in this
+  slice; start the server eagerly (leave `lazy_start` off) to use them.
+- `tole doctor` says when lazy start is on.
 
 ## 10. Failure behaviour
 
