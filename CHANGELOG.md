@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Sandbox profiles per server (#810, part of #750). The user config can define named profiles (`[sandbox.profiles.<name>]`: `workspace`, `network`, `read`, `write`) and bind an MCP server to one (`[sandbox.servers.<name>] profile`), and `[sandbox] profile` can name a defined profile. New `tole sandbox list`, `tole sandbox show <server>` and `tole sandbox set <server> --profile <p>` (user config only; `set` keeps the rest of the file and refuses under an agent session), and `tole config check` prints the effective profile of each server and its source. A project config still cannot set anything under `[sandbox]`, so it can never loosen a profile.
+
 ### Fixed
 - A discussion call that ended in a transport timeout settled at 0 tokens, so the discussion budget (a hard cap) could be exceeded without the ledger knowing, and the retry of #756 doubled the exposure (#804). A call that fails with no reported usage after the request may have left (a timeout above all) is now charged its reserved estimate, never more than its own carve, in the ledger and the goal's pot, like a crashed call; the settle record says why (`charged`: `timeout` or `unreported`, an optional field old ledgers and readers ignore). A failure that provably came before the request left (refused connection, DNS, a rejected URL, the TLS handshake) stays free, and anything the classifier cannot place is charged. The retry still goes through the budget: two timeouts cost two estimates and the discussion stops at the cap with the existing escalation; a resume never charges a settled call again. `tole audit --discussion` now lists a round that never completed and shows its retries and charged calls (text and `--json`).
 

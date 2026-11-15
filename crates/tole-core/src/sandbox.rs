@@ -24,6 +24,7 @@
 
 pub mod command;
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -114,6 +115,10 @@ pub struct Policy {
     pub mode: Mode,
     pub profile_name: String,
     pub profile: Profile,
+    /// Per-server profiles (`[sandbox.servers.<name>]`, #810), by server
+    /// name: a server listed here gets that profile instead of
+    /// [`Policy::profile`]. Set by the owner's user config only.
+    pub servers: BTreeMap<String, ServerProfile>,
     /// Server names left unsandboxed (the owner's first-party servers).
     pub skip: Vec<String>,
     /// Most sandboxed servers this process keeps running at once; a launch
@@ -122,6 +127,24 @@ pub struct Policy {
     /// Seconds a sandboxed server may sit unused before it is stopped (it
     /// restarts on its next call).
     pub idle_secs: u64,
+}
+
+/// A named profile a server is bound to (#810).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerProfile {
+    pub name: String,
+    pub profile: Profile,
+}
+
+impl Policy {
+    /// The profile name and profile `server` runs in: its own entry when
+    /// the owner bound one, else the policy's default.
+    pub fn profile_for(&self, server: &str) -> (&str, &Profile) {
+        match self.servers.get(server) {
+            Some(s) => (&s.name, &s.profile),
+            None => (&self.profile_name, &self.profile),
+        }
+    }
 }
 
 /// Default and bounds of [`Policy::max_servers`].
@@ -475,17 +498,18 @@ fn build(p: &Policy, env: &Env, server: (&str, &str, &[String])) -> Result<Vec<O
     let (name, command, args) = server;
     let (home, data_dir) = (env.home.as_deref(), env.data_dir.as_deref());
     // Everything bound below is the resolved path `check_grant` validated.
-    let ws = match (p.profile.workspace, env.workspace.as_deref()) {
+    let base = p.profile_for(name).1;
+    let ws = match (base.workspace, env.workspace.as_deref()) {
         (Workspace::None, _) => None,
         (_, None) => return Err("no workspace to bind".into()),
         (_, Some(w)) => Some(check_grant(w, home, data_dir)?),
     };
-    let mut profile = p.profile.clone();
+    let mut profile = base.clone();
     let grant = |v: &[PathBuf]| -> Result<Vec<PathBuf>, String> {
         v.iter().map(|e| check_grant(e, home, data_dir)).collect()
     };
-    profile.read = grant(&p.profile.read)?;
-    profile.write = grant(&p.profile.write)?;
+    profile.read = grant(&base.read)?;
+    profile.write = grant(&base.write)?;
     let program = which(command, env.path.as_deref())
         .ok_or_else(|| format!("cannot find the server command {command:?} on PATH ({name})"))?;
     let system = ["/usr", "/bin", "/sbin", "/lib"];
