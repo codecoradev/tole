@@ -847,7 +847,7 @@ fn a_participant_timeout_is_retried_once_charged_and_recorded() {
         ),
         ("checker", vec![checker_met(1)]),
     ]);
-    let l = log("retry-ok");
+    let (l, _dir) = log("retry-ok");
     let d = driver(l.clone(), make, 1_000_000);
     d.start(contract(100_000, None)).unwrap();
     let out = d.run().unwrap();
@@ -876,7 +876,7 @@ fn a_second_timeout_fails_the_turn_as_before_and_resume_goes_on() {
         "coder",
         vec![times_out(Some(40)), times_out(Some(50)), text("late", 10)],
     )]);
-    let l = log("retry-twice");
+    let (l, _dir) = log("retry-twice");
     let d = driver(l.clone(), make, 1_000_000);
     d.start(contract(100_000, Some(1))).unwrap();
     let e = d.run().unwrap_err();
@@ -910,7 +910,7 @@ fn only_a_provider_timeout_is_retried() {
     .enumerate()
     {
         let (s, make) = script(&[("coder", vec![fails_with(msg, Some(5))])]);
-        let l = log(&format!("retry-other-{i}"));
+        let (l, _dir) = log(&format!("retry-other-{i}"));
         let d = driver(l.clone(), make, 1_000_000);
         d.start(contract(100_000, Some(1))).unwrap();
         let e = d.run().unwrap_err();
@@ -926,7 +926,8 @@ fn only_a_provider_timeout_is_retried() {
             text("ok", 5),
         ],
     )]);
-    let d = driver(log("retry-json"), make, 1_000_000);
+    let (lg, _dir) = log("retry-json");
+    let d = driver(lg, make, 1_000_000);
     d.start(contract(100_000, Some(1))).unwrap();
     d.run().unwrap();
     assert_eq!(&kinds(&s)[..2], ["coder", "coder"]);
@@ -946,7 +947,7 @@ fn a_scribe_timeout_is_retried_once_and_a_second_one_falls_back_as_before() {
             ],
         ),
     ]);
-    let l = log("retry-scribe");
+    let (l, _dir) = log("retry-scribe");
     let d = driver(l.clone(), make, 1_000_000);
     d.start(contract(100_000, Some(1))).unwrap();
     d.run().unwrap();
@@ -968,7 +969,7 @@ fn a_scribe_timeout_is_retried_once_and_a_second_one_falls_back_as_before() {
         ("coder", vec![text(&big, 100)]),
         ("scribe", vec![times_out(Some(30)), times_out(Some(30))]),
     ]);
-    let l = log("retry-scribe-twice");
+    let (l, _dir) = log("retry-scribe-twice");
     let d = driver(l.clone(), make, 1_000_000);
     d.start(contract(100_000, Some(1))).unwrap();
     d.run().unwrap();
@@ -989,7 +990,7 @@ fn a_scribe_timeout_is_retried_once_and_a_second_one_falls_back_as_before() {
 #[test]
 fn the_checker_is_not_retried() {
     let (s, make) = script(&[("checker", vec![times_out(Some(10)), checker_met(1)])]);
-    let l = log("retry-checker");
+    let (l, _dir) = log("retry-checker");
     let d = driver(l.clone(), make, 1_000_000);
     d.start(contract(100_000, Some(1))).unwrap();
     let out = d.run().unwrap();
@@ -1003,7 +1004,7 @@ fn a_retry_that_does_not_fit_the_budget_is_the_budget_stop() {
     // The first voice times out after reporting 2,000 tokens; the retry's
     // estimate no longer fits the 4,000 budget: the hard stop, no second call.
     let (s, make) = script(&[("coder", vec![times_out(Some(2_000)), text("never", 1)])]);
-    let l = log("retry-budget");
+    let (l, _dir) = log("retry-budget");
     let d = driver(l.clone(), make, 1_000_000);
     d.start(contract(4_000, None)).unwrap();
     let out = d.run().unwrap();
@@ -1013,7 +1014,8 @@ fn a_retry_that_does_not_fit_the_budget_is_the_budget_stop() {
     assert!(retries(&l.state().unwrap()).is_empty());
     // The goal's pot is a hard stop for the retry too.
     let (s, make) = script(&[("coder", vec![times_out(Some(2_000)), text("never", 1)])]);
-    let d = driver(log("retry-pot"), make, 1_000_000);
+    let (lg, _dir) = log("retry-pot");
+    let d = driver(lg, make, 1_000_000);
     d.start(contract(100_000, None)).unwrap();
     d.pot.charge(996_000);
     let out = d.run().unwrap();
