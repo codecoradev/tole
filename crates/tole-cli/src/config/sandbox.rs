@@ -116,7 +116,6 @@ impl SandboxProfileConfig {
             read: paths(&self.read),
             write: paths(&self.write),
             protect: Vec::new(),
-            anchor: Vec::new(),
         })
     }
 }

@@ -93,12 +93,6 @@ pub struct Profile {
     /// passes RESOLVED paths, so a link is never a bind path; ignored when
     /// the workspace is not writable.
     pub protect: Vec<PathBuf>,
-    /// Inside a writable workspace: directories bound READ-WRITE over
-    /// themselves, before `protect` is applied. A mount point cannot be
-    /// renamed or removed (EBUSY) but its ancestor can, so a directory that
-    /// holds a protected path (`.git` for `.git/hooks`) is made a mount point
-    /// too, without making it read-only. Resolved paths, like `protect`.
-    pub anchor: Vec<PathBuf>,
 }
 
 /// The built-in profiles: `server` (workspace read-only, no network) and
@@ -115,7 +109,6 @@ pub fn builtin_profile(name: &str) -> Option<Profile> {
         read: Vec::new(),
         write: Vec::new(),
         protect: Vec::new(),
-        anchor: Vec::new(),
     })
 }
 
@@ -447,15 +440,8 @@ pub fn bwrap_args_for(
             }
             Workspace::Write => {
                 bind(&mut a, "--bind", ws);
-                // A directory that holds a protected path must not be
-                // renamed or removed aside (the copy would be a plain
-                // directory outside the read-only mounts): bind it writable
-                // over itself, so it is a mount point.
-                for p in &profile.anchor {
-                    bind(&mut a, "--bind", p);
-                }
                 // Paths that run later outside the sandbox stay read-only,
-                // after the writable binds so they win.
+                // after the writable bind so they win.
                 for p in &profile.protect {
                     bind(&mut a, "--ro-bind", p);
                 }

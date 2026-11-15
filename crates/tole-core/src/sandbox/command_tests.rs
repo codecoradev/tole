@@ -141,7 +141,7 @@ fn the_workspace_is_writable_and_is_the_working_directory() {
 }
 
 #[test]
-fn the_protected_paths_are_read_only_on_top_of_the_writable_workspace() {
+fn the_git_dir_and_tole_are_read_only_on_top_of_the_writable_workspace() {
     let ws = tmp("protect");
     for d in [".git/hooks", ".tole"] {
         std::fs::create_dir_all(ws.join(d)).unwrap();
@@ -159,61 +159,45 @@ fn the_protected_paths_are_read_only_on_top_of_the_writable_workspace() {
     }
 }
 
-/// #849: a mount point cannot be renamed but its ancestor can, so `.git` is
-/// bound read-write over itself, after the workspace and BEFORE the read-only
-/// leaves (a later mount wins), and is never read-only itself.
+/// #849: the WHOLE `.git` is one read-only mount: no leaf mounts and no
+/// writable anchor (a writable `.git` can redirect git to a planted gitdir
+/// with `commondir`, whatever is locked inside it).
 #[test]
-fn the_git_dir_is_a_writable_mount_point_so_it_cannot_be_renamed_aside() {
-    let ws = tmp("anchor");
-    for d in [".git/hooks", ".tole"] {
+fn the_whole_git_dir_is_one_read_only_mount_with_no_leaves_and_no_writable_anchor() {
+    let ws = tmp("wholegit");
+    for d in [".git/hooks", ".git/modules/sub/hooks", ".tole"] {
         std::fs::create_dir_all(ws.join(d)).unwrap();
     }
     std::fs::write(ws.join(".git/config"), "x").unwrap();
     let a = run_argv(&ws);
-    let (w, g) = (
-        ws.display().to_string(),
-        ws.join(".git").display().to_string(),
-    );
-    assert!(has(&a, &["--bind", &g, &g]), "{a:?}");
+    let g = ws.join(".git").display().to_string();
+    assert!(has(&a, &["--ro-bind", &g, &g]), "{a:?}");
+    assert!(!has(&a, &["--bind", &g, &g]), ".git is never writable");
     assert!(
-        !has(&a, &["--ro-bind", &g, &g]),
-        ".git itself is not read-only"
-    );
-    let pos = |flag: &str, p: &str| {
-        a.windows(3)
-            .position(|x| x[0] == flag && x[1] == p && x[2] == p)
-            .unwrap()
-    };
-    let (hooks, config) = (format!("{g}/hooks"), format!("{g}/config"));
-    assert!(pos("--bind", &w) < pos("--bind", &g), "after the workspace");
-    assert!(pos("--bind", &g) < pos("--ro-bind", &hooks), "before hooks");
-    assert!(
-        pos("--bind", &g) < pos("--ro-bind", &config),
-        "before config"
+        !a.iter().any(|x| x.starts_with(&format!("{g}/"))),
+        "nothing is mounted inside .git: {a:?}"
     );
 }
 
+/// The mount is made even when `hooks` or `config` is missing, so nothing can
+/// be created inside; a missing `.git` creates nothing.
 #[test]
-fn a_git_dir_without_hooks_is_still_anchored_and_a_missing_one_is_not_created() {
-    let ws = tmp("anchor-nohooks");
+fn a_git_dir_without_hooks_or_config_is_still_read_only_and_a_missing_one_is_not_created() {
+    let ws = tmp("wholegit-bare");
     std::fs::create_dir_all(ws.join(".git")).unwrap();
-    let (anchor, protect) = protect_plan(&ws).unwrap();
-    assert_eq!(anchor, [ws.join(".git")]);
-    assert!(protect.is_empty(), "nothing to make read-only yet");
-    let bare = tmp("anchor-nogit");
-    assert_eq!(protect_plan(&bare).unwrap(), (vec![], vec![]));
+    assert_eq!(protect_plan(&ws).unwrap(), [ws.join(".git")]);
+    let bare = tmp("wholegit-nogit");
+    assert!(protect_plan(&bare).unwrap().is_empty());
     assert!(!bare.join(".git").exists(), "planning creates nothing");
 }
 
 /// A gitdir file (worktree, submodule) is bound read-only itself: it cannot be
-/// replaced by a directory with hooks. Its target is not anchored.
+/// replaced by a directory with hooks. Its target is not bound.
 #[test]
 fn a_gitdir_file_is_bound_read_only_itself() {
     let ws = tmp("gitfile");
     std::fs::write(ws.join(".git"), "gitdir: /elsewhere/.git/worktrees/x\n").unwrap();
-    let (anchor, protect) = protect_plan(&ws).unwrap();
-    assert!(anchor.is_empty());
-    assert_eq!(protect, [ws.join(".git")]);
+    assert_eq!(protect_plan(&ws).unwrap(), [ws.join(".git")]);
     let a = run_argv(&ws);
     let g = ws.join(".git").display().to_string();
     assert!(has(&a, &["--ro-bind", &g, &g]));
@@ -221,7 +205,8 @@ fn a_gitdir_file_is_bound_read_only_itself() {
 }
 
 /// A link cannot be protected by a mount (the command removes it and makes a
-/// real directory), so the launch is refused instead of binding the target.
+/// real directory, or it leads to a writable place), so the launch is refused
+/// instead of binding the target.
 #[cfg(unix)]
 #[test]
 fn a_protected_path_that_is_a_link_is_refused() {
@@ -270,7 +255,7 @@ fn a_protected_path_that_is_a_link_is_refused() {
 #[test]
 fn a_protected_path_that_does_not_exist_is_not_bound() {
     let ws = tmp("absent");
-    assert_eq!(protect_plan(&ws).unwrap(), (vec![], vec![]));
+    assert!(protect_plan(&ws).unwrap().is_empty());
     let a = run_argv(&ws);
     assert!(!a.iter().any(|x| x.ends_with(".tole")), "{a:?}");
     assert!(!a.iter().any(|x| x.ends_with(".git")), "{a:?}");

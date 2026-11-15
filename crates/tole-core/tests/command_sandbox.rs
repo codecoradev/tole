@@ -292,101 +292,261 @@ fn the_tools_checks_run_before_the_sandbox() {
     assert!(e.contains("may not run the tole binary"), "{e}");
 }
 
-/// A workspace with a real repository (`git init`), a `.tole` dir and a
-/// marker in the hooks, so the host state is easy to compare afterwards.
+/// A workspace with a real repository (`git init`, one commit of `f`) and a
+/// `.tole` dir.
 fn repo(tag: &str) -> PathBuf {
     let w = ws(tag);
-    let out = std::process::Command::new("git")
-        .args(["init", "-q"])
-        .arg(&w)
-        .output()
-        .expect("git is needed for this test");
-    assert!(out.status.success(), "git init: {out:?}");
-    std::fs::write(w.join(".git/hooks/marker"), "owner\n").unwrap();
+    host_git(&w, &["init", "-q"]);
+    std::fs::write(w.join("f"), "one\n").unwrap();
+    host_git(&w, &["add", "f"]);
+    host_git(&w, &["commit", "-q", "-m", "one"]);
     std::fs::create_dir_all(w.join(".tole")).unwrap();
     w
 }
 
-/// #849: the leaf mounts alone did not protect `.git/hooks` and `.git/config`:
-/// a mount point cannot be renamed, but its ancestor can, so `mv .git .g &&
-/// cp -a .g .git` gave the command a plain copy to plant a hook in, which a
-/// later `git commit` outside the sandbox ran. Now `.git` is a mount point
-/// too (read-write: git itself keeps working). Every way to move, remove or
-/// replace `.git`, `.git/hooks`, `.git/config` and `.tole` fails.
+/// Runs `git args` on the HOST in `w`, as the owner would later; fails the test
+/// when git fails.
+fn host_git_out(w: &Path, args: &[&str]) -> std::process::Output {
+    std::process::Command::new("git")
+        .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+        .arg("-C")
+        .arg(w)
+        .args(args)
+        .output()
+        .expect("git is needed for this test")
+}
+
+fn host_git(w: &Path, args: &[&str]) {
+    let out = host_git_out(w, args);
+    assert!(out.status.success(), "git {args:?}: {out:?}");
+}
+
+/// Every file, directory and link under `dir` with its bytes, for comparing a
+/// whole tree before and after (not just the leaves).
+fn tree(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    fn walk(base: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>)>) {
+        let mut entries: Vec<_> = std::fs::read_dir(dir).unwrap().flatten().collect();
+        entries.sort_by_key(|e| e.file_name());
+        for e in entries {
+            let p = e.path();
+            let rel = p.strip_prefix(base).unwrap().display().to_string();
+            let t = e.file_type().unwrap();
+            if t.is_dir() {
+                out.push((format!("{rel}/"), Vec::new()));
+                walk(base, &p, out);
+            } else if t.is_symlink() {
+                let to = std::fs::read_link(&p).unwrap();
+                out.push((format!("{rel} -> {}", to.display()), Vec::new()));
+            } else {
+                out.push((rel, std::fs::read(&p).unwrap()));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, dir, &mut out);
+    out
+}
+
+/// Runs each command in the sandbox and asserts it fails (status not 0).
+fn all_fail(tool: &RunCommandTool, attacks: &[&str]) {
+    for a in attacks {
+        let out = run(tool, a);
+        assert_ne!(out["status"], 0, "must fail: {a}: {out}");
+    }
+}
+
+/// #849: the reviewer's attack on a writable `.git` mount point. Git honours
+/// `commondir` INSIDE the gitdir, so pointing it at a planted gitdir in the
+/// workspace made a later `git commit` or `git status` on the HOST run the
+/// planted hook and `core.fsmonitor`. Now `.git` is read-only as a whole: the
+/// write that redirects git fails, and git on the host runs nothing.
 #[test]
-fn a_sandboxed_command_cannot_rename_or_replace_the_git_dir_and_its_leaves() {
+fn a_commondir_redirect_cannot_make_the_host_run_planted_code() {
+    if skipped() {
+        return;
+    }
+    let w = repo("commondir");
+    let (hook_mark, fsm_mark) = (w.join("PWNED_HOOK"), w.join("PWNED_FSM"));
+    std::fs::write(
+        w.join("attack.sh"),
+        format!(
+            "mkdir evil && cp -r .git/objects .git/refs .git/HEAD evil/ && mkdir evil/hooks\n\
+             printf '#!/bin/sh\\ntouch {h}\\n' > evil/hooks/pre-commit\n\
+             chmod +x evil/hooks/pre-commit\n\
+             printf '[core]\\n\\trepositoryformatversion = 0\\n\\tfsmonitor = touch {f}; echo\\n' > evil/config\n\
+             echo ../evil > .git/commondir\n",
+            h = hook_mark.display(),
+            f = fsm_mark.display()
+        ),
+    )
+    .unwrap();
+    let before = tree(&w.join(".git"));
+    let tool = RunCommandTool::new(w.clone());
+    let out = run(&tool, "sh attack.sh");
+    assert_ne!(out["status"], 0, "the redirect must fail: {out}");
+    assert!(!w.join(".git/commondir").exists());
+    // The owner, later, on the host.
+    std::fs::write(w.join("f"), "two\n").unwrap();
+    host_git(&w, &["status", "--short"]);
+    host_git(&w, &["commit", "-q", "-am", "two"]);
+    host_git(&w, &["status", "--short"]);
+    assert!(!hook_mark.exists(), "the planted hook ran on the host");
+    assert!(!fsm_mark.exists(), "the planted fsmonitor ran on the host");
+    // The commit really went to the real repository.
+    let log = host_git_out(&w, &["log", "--oneline"]);
+    assert!(String::from_utf8_lossy(&log.stdout).contains("two"));
+    drop(before);
+}
+
+/// Every way to move, remove, replace or write `.git` (and `.tole`) fails, and
+/// the whole `.git` tree is byte for byte what it was.
+#[test]
+fn every_way_to_move_remove_or_write_the_git_dir_fails_and_its_tree_is_unchanged() {
     if skipped() {
         return;
     }
     let w = repo("gitattack");
-    let before = std::fs::read_to_string(w.join(".git/config")).unwrap();
+    let before = tree(&w.join(".git"));
+    let tole_before = tree(&w.join(".tole"));
     let tool = RunCommandTool::new(w.clone());
-    // Each step prints its exit status; none may succeed.
-    let attacks = [
-        "mv .git .g",
-        "mv .git/hooks .git/hooks.old",
-        "mv .git/config .git/config.old",
-        "mv .tole .tole.old",
-        "rmdir .git/hooks",
-        "rm -rf .git",
-        "rm -rf .tole",
-        "rm -f .git/config",
-        // Replace by rename over the mount point.
-        "sh -c 'mkdir h2 && mv h2 .git/hooks'",
-        "sh -c 'echo x > c2 && mv c2 .git/config'",
-        // The reviewer's chain: the rename is what used to succeed.
-        "sh -c 'mv .git .g && cp -a .g .git && printf x > .git/hooks/pre-commit'",
-        "sh -c 'echo evil > .git/hooks/pre-commit'",
-        "sh -c 'echo [core] >> .git/config'",
-        "sh -c 'echo x > .tole/evil'",
-        // A hard link to the protected inode through the writable anchor would
-        // reach it; the kernel refuses links across mounts (EXDEV).
-        "ln .git/config .git/config2",
-        "ln .git/hooks/marker .git/marker2",
-        "ln .git/config config-in-root",
-    ];
-    for a in attacks {
-        let out = run(&tool, a);
-        assert_ne!(out["status"], 0, "must fail: {a}: {out}");
-    }
-    // Host state: nothing moved, planted or removed.
-    assert!(w.join(".git").is_dir() && !w.join(".g").exists());
-    assert!(w.join(".git/hooks").is_dir() && !w.join(".git/hooks.old").exists());
-    assert_eq!(
-        std::fs::read_to_string(w.join(".git/hooks/marker")).unwrap(),
-        "owner\n"
+    all_fail(
+        &tool,
+        &[
+            "mv .git .g",
+            "rm -rf .git",
+            "rm -rf .tole",
+            "mv .tole .tole.old",
+            "rmdir .git/hooks",
+            "mv .git/hooks .git/hooks.old",
+            "mv .git/config .git/config.old",
+            "rm -f .git/config",
+            "rm -f .git/index",
+            "rm -rf .git/objects",
+            "mkdir .git/x",
+            "touch .git/index.lock",
+            "sh -c 'echo x > .git/HEAD'",
+            "sh -c 'echo x > .git/commondir'",
+            "sh -c 'echo [core] >> .git/config'",
+            "sh -c 'echo x > .git/hooks/pre-commit'",
+            "sh -c 'echo x > .tole/evil'",
+            // Replace by rename over a mount point or into the mount.
+            "sh -c 'mkdir h2 && mv h2 .git/hooks'",
+            "sh -c 'echo x > c2 && mv c2 .git/config'",
+            "sh -c 'mkdir g2 && mv g2 .git'",
+            // The reviewer's first chain: the rename used to succeed.
+            "sh -c 'mv .git .g && cp -a .g .git && printf x > .git/hooks/pre-commit'",
+            // Hard links to a protected inode (EXDEV across mounts).
+            "ln .git/config .git/config2",
+            "ln .git/HEAD head-in-root",
+            "ln .git/hooks/applypatch-msg.sample .git/hooks/h2",
+        ],
     );
-    assert!(!w.join(".git/hooks/pre-commit").exists());
-    for p in [".git/config2", ".git/marker2", "config-in-root"] {
-        assert!(!w.join(p).exists(), "no hard link {p} to a protected inode");
+    assert_eq!(tree(&w.join(".git")), before, ".git changed");
+    assert_eq!(tree(&w.join(".tole")), tole_before, ".tole changed");
+    for p in [".g", ".git.old", "head-in-root"] {
+        assert!(!w.join(p).exists(), "{p}");
     }
-    assert_eq!(
-        std::fs::read_to_string(w.join(".git/config")).unwrap(),
-        before
-    );
-    assert!(w.join(".tole").is_dir() && !w.join(".tole/evil").exists());
 }
 
-/// The anchor must not break git: objects, index and refs stay writable.
+/// A leaf that does not exist under an existing `.git` (a repository made with
+/// `git init --template=`, or stripped) cannot be created either.
 #[test]
-fn git_still_works_inside_the_sandbox() {
+fn a_repo_without_hooks_or_config_cannot_get_them_planted() {
     if skipped() {
         return;
     }
-    let w = repo("gitworks");
+    let w = repo("bareleaves");
+    std::fs::remove_dir_all(w.join(".git/hooks")).unwrap();
+    std::fs::remove_file(w.join(".git/config")).unwrap();
+    let before = tree(&w.join(".git"));
     let tool = RunCommandTool::new(w.clone());
-    let out = run(&tool, "sh -c 'echo a > f && git add f && git -c user.name=t -c user.email=t@t commit -q -m one && git status --short && git log --oneline'");
-    assert_eq!(out["status"], 0, "{out}");
-    assert!(text(&out, "stdout").contains("one"), "{out}");
-    let host = std::process::Command::new("git")
-        .args(["-C"])
-        .arg(&w)
-        .args(["log", "--oneline"])
-        .output()
-        .unwrap();
-    assert!(String::from_utf8_lossy(&host.stdout).contains("one"));
-    // The hooks and the config are still the owner's.
-    assert!(w.join(".git/hooks/marker").exists());
+    all_fail(
+        &tool,
+        &[
+            "mkdir .git/hooks",
+            "sh -c 'mkdir -p .git/hooks && echo x > .git/hooks/pre-commit'",
+            "sh -c 'echo [core] > .git/config'",
+            "sh -c 'echo x > .git/info/exclude2'",
+        ],
+    );
+    assert_eq!(tree(&w.join(".git")), before);
+    assert!(!w.join(".git/hooks").exists() && !w.join(".git/config").exists());
+}
+
+/// A submodule's gitdir lives under `.git/modules/<name>` with its own hooks
+/// and config: they are inside the read-only `.git` too.
+#[test]
+fn a_submodule_gitdir_under_git_modules_cannot_get_a_hook_or_config() {
+    if skipped() {
+        return;
+    }
+    let w = repo("submodule");
+    std::fs::create_dir_all(w.join(".git/modules/sub/hooks")).unwrap();
+    std::fs::write(w.join(".git/modules/sub/config"), "[core]\n").unwrap();
+    let before = tree(&w.join(".git"));
+    let tool = RunCommandTool::new(w.clone());
+    all_fail(
+        &tool,
+        &[
+            "sh -c 'echo x > .git/modules/sub/hooks/pre-commit'",
+            "sh -c 'echo [core] >> .git/modules/sub/config'",
+            "mkdir .git/modules/other",
+            "rm -rf .git/modules",
+            "mv .git/modules .git/modules.old",
+        ],
+    );
+    assert_eq!(tree(&w.join(".git")), before);
+}
+
+/// What still works with a read-only `.git`, and what the model sees when it
+/// does not. Nothing hangs (the tool's own 30 s timeout would fail the test).
+#[test]
+fn git_reads_work_and_git_writes_fail_with_a_clear_error() {
+    if skipped() {
+        return;
+    }
+    let w = repo("gitrw");
+    std::fs::write(w.join("f"), "two\n").unwrap();
+    let before = tree(&w.join(".git"));
+    let tool = RunCommandTool::new(w.clone());
+    let started = Instant::now();
+    for ok in [
+        "git log --oneline",
+        "git diff",
+        "git show --stat HEAD",
+        "git status --short",
+        "git rev-parse HEAD",
+        "git branch --list",
+        "git ls-files",
+    ] {
+        let out = run(&tool, ok);
+        assert_eq!(out["status"], 0, "{ok} must work: {out}");
+    }
+    assert!(text(&run(&tool, "git log --oneline"), "stdout").contains("one"));
+    for bad in [
+        "git add f",
+        "git -c user.name=t -c user.email=t@t commit -qam x",
+        "git branch b",
+        "git checkout -q -b b",
+        "git stash",
+        "git config x.y z",
+        "git remote add o /nonexistent",
+        "git gc -q",
+    ] {
+        let out = run(&tool, bad);
+        assert_ne!(out["status"], 0, "{bad} must fail: {out}");
+        let err = text(&out, "stderr");
+        if bad == "git stash" {
+            // git stash fails with exit 1 and says nothing here.
+            continue;
+        }
+        assert!(
+            err.contains("Read-only file system") || err.contains("read-only"),
+            "{bad}: the model should see why: {out}"
+        );
+    }
+    assert!(started.elapsed() < Duration::from_secs(60), "nothing hangs");
+    assert_eq!(tree(&w.join(".git")), before, "no write got through");
 }
 
 /// A gitdir file (worktree, submodule) cannot be swapped for a directory.
