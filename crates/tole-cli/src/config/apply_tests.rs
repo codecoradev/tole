@@ -1522,11 +1522,17 @@ fn an_invalid_discussion_timeout_env_is_an_error_naming_the_variable() {
         assert_eq!(st.discussion_timeout_error(), None, "{good}");
         assert_eq!(st.request_timeout.value, good.parse::<u64>().unwrap());
     }
+    // The env may go below the config floor of 10 s: the test hook (#813).
+    let st = timeout_of(&Config::default(), &[("TOLE_DISCUSSION_TIMEOUT_SECS", "2")]);
+    assert_eq!(st.discussion_timeout_error(), None);
+    assert_eq!(st.request_timeout.value, 2);
 }
 
 #[test]
 fn the_discussion_timeout_config_is_bounded() {
-    for bad in [0u64, 3601] {
+    // The user-config floor is 10 s (#813): 1..=9 are errors naming the key
+    // and the floor; the env hook still goes down to 1 s (tested above).
+    for bad in [0u64, 1, 5, 9, 3601] {
         let e = crate::config::parse(
             &format!("[discussions]\nrequest_timeout_secs = {bad}\n"),
             Path::new("c.toml"),
@@ -1534,11 +1540,12 @@ fn the_discussion_timeout_config_is_bounded() {
         .unwrap_err();
         assert!(
             e.message.contains("discussions.request_timeout_secs")
-                && e.message.contains("1 to 3600"),
+                && e.message.contains("10 to 3600")
+                && e.message.contains("floor is 10 s"),
             "{e}"
         );
     }
-    for good in [1u64, 3600] {
+    for good in [10u64, 120, 3600] {
         assert!(crate::config::parse(
             &format!("[discussions]\nrequest_timeout_secs = {good}\n"),
             Path::new("c.toml")
