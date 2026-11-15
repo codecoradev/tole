@@ -433,6 +433,28 @@ PR 1 is the riskiest to review (the classifier and the predicate), so it
 carries the heaviest tests; PRs 3 and 4 are independent after 2 and can land
 in either order.
 
+### 7.1 Recommendation for the default (#813 item 1, awaiting the owner)
+
+Nothing changed: the default is still `off`. The decision for the owner is
+whether a fresh install that uses `delegate` should default to `owner`.
+
+| | Keep `off` (recommended) | Default `owner` |
+|---|---|---|
+| Existing unattended `delegate` missions | unchanged: a non-allowlisted Write is denied at once | every such Write parks for up to `approval_secs` (900 s) and stalls the mission when nobody answers |
+| Fresh install, interactive owner | Writes are denied and the child reports it; the owner finds `approvals = "owner"` in the docs | the owner is asked, which is what delegation is for |
+| Safety | strictest (no new decision surface) | no weaker: the owner still decides every request |
+| Change cost | none | one-line `#[default]` change, changelog, migration note, doctor hint, flip of the pinned e2e test |
+
+Recommendation: keep `off` as the default and make the opt-in discoverable
+instead: a `tole doctor` hint that fires only when delegation is in use
+(a `[delegation]` table, a profile with `delegate`, or a recorded delegated
+run) and `approvals` is unset, saying that non-allowlisted Writes are denied
+and naming `approvals = "owner"`. If the owner prefers flipping the default,
+do it for new installs only (no `[delegation]` table and no delegated run in
+the data dir) so unattended users keep today's behavior, and ship the
+migration note in `docs/migrating-0.11.md` in the same PR. Owner decision
+needed; tracked in #813.
+
 ## 12. Owner decisions
 
 Decided by the owner on 2026-11-14; they replace the open questions of the

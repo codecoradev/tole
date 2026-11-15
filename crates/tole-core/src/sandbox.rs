@@ -23,6 +23,7 @@
 //! unattended run (cron, `serve`), where it is refused too (decision 2).
 
 pub mod command;
+pub mod report;
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;

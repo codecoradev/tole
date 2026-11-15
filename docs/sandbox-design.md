@@ -457,6 +457,13 @@ file_size_mb = 4096            # 1 to 1048576, largest file a process writes
   verify, turnend, cron scripts and deliveries are not sandboxed yet, and fails
   when a `required` consumer has no working sandbox (a warning for `optional`).
   `tole config check` lists the `sandbox.consumers.*` keys.
+  For each sandboxed stdio server (from `mcp_server` in the user config) and
+  each consumer that is on, it also prints the mode, the workspace access, the
+  network, every extra `read` / `write` path, and the decision (sandboxed,
+  unsandboxed because there is no backend and the mode is `optional`, or
+  refused). A grant that touches `$HOME` (marked `REFUSED`, it is never bound)
+  or a credential directory (`.ssh`, `.gnupg`, `.aws`, `.azure`, `.kube`,
+  `.docker`, `.netrc`, `.config/gcloud`; marked `SENSITIVE`) is flagged on its line.
 - **Residual.** Only what exists at launch is protected: a `.tole` or `.git/hooks`
   that does not exist yet can be created by the command (bubblewrap cannot bind
   a path that is not there without creating it in the real workspace), and a
@@ -504,7 +511,10 @@ of that program, with tole's note naming the profile.
 Names only, never values or argument contents:
 
 - At startup (stderr, and `tole doctor`): backend and version, or why
-  none is available; each stdio server with its mode and profile name.
+  none is available; each stdio server with its mode and profile name. The
+  server line is logged once per server and process, the first time it
+  starts: `sandboxed`, `unsandboxed` (no backend, `optional`, a human
+  attached), or refused (`required`, or `optional` in an unattended run).
 - Per start (session log entry): server or consumer name, profile name,
   profile hash, sandboxed or not and why.
 - Per proxy refusal: profile name and host name.

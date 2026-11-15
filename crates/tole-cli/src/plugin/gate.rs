@@ -263,10 +263,32 @@ pub fn blocked_notes(check: &plugin_lock::LedgerCheck) -> Vec<String> {
     if let Some(why) = &check.unreadable {
         notes.push(format!(
             "plugin ledger unreadable ({why}): revocations recorded there are not checked \
-             against the lock until it is fixed"
+             against the lock, and `tole plugin add` / `tole plugin approve` refuse, until it \
+             is fixed (make `{}` a regular readable file again, or move it aside if you accept \
+             losing that history)",
+            plugin_lock::LEDGER_FILE
         ));
     }
     notes
+}
+
+/// `Err` when the ledger next to the user lock `user` exists but cannot be
+/// read: a new approval must not be written on top of a history that cannot
+/// be checked (a missing ledger is fine, there is nothing to compare).
+pub fn ensure_ledger_readable(user: &Path) -> Result<(), String> {
+    let Some(path) = user.parent().map(|d| d.join(plugin_lock::LEDGER_FILE)) else {
+        return Ok(());
+    };
+    plugin_lock::read_ledger(&path).map(drop).map_err(|why| {
+        format!(
+            "the plugin ledger cannot be read ({why}), so earlier revocations cannot be checked \
+             and nothing new is approved on top of it. Fix it first: make `{}` a regular \
+             readable file again (not a symlink, under {} MiB), or move it aside if you accept \
+             losing that history, then run the command again; `tole doctor` shows its state",
+            path.display(),
+            plugin_lock::MAX_LEDGER_BYTES / (1024 * 1024)
+        )
+    })
 }
 
 /// Marks `lock`'s entries the owner's ledger does not allow (see

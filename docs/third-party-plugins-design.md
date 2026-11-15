@@ -310,3 +310,18 @@ through `env_for`, resolution through the official MCP Registry with verified
 namespaces, skills from the uteke registry. `add` does not edit the owner's
 config: after it, configure the same command line (`mcp_server` or
 `--mcp-server`); the approval is bound to exactly that source.
+
+## Unreadable plugin ledger (#813 item 3)
+
+A ledger that exists but cannot be read (a symlink, another non-file, an I/O
+error, larger than 64 MiB) is no longer treated as "no history" by the
+commands that write approvals. `tole plugin add` and `tole plugin approve`
+refuse with a message naming the file and the repair (make it a regular
+readable file again, or move it aside if losing that history is acceptable)
+before anything is started or written. A missing ledger is still fine: there
+is nothing to compare. `tole doctor` (the plugins section) and `tole plugin
+list|diff` already reported the unreadable ledger; the note now also says
+that `add` and `approve` refuse until it is fixed. `tole plugin revoke` is
+unchanged on purpose: it only narrows trust, so it must keep working.
+Sessions that connect servers keep failing closed as before: revocations
+recorded in an unreadable ledger cannot be checked, and the note says so.

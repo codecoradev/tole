@@ -641,6 +641,36 @@ never a silent fall back to 120 s. `tole config check` and `tole doctor` show
 the effective value and where it came from. The advisor's provider keeps its
 own 120 s.
 
+### Owner-only entry point, enforced (#813 item 2)
+
+`tole discuss start` and `tole discuss resume` refuse under an agent session
+exactly like the other owner-only writes (`tole cron create|resume|edit`,
+`plugin add|approve|revoke`, `skills approve`, `config trust`; #684): the
+same `owner_only::refuse_under_session` guard, which looks at
+`TOLE_UNDER_SESSION` and `TOLE_AGENT_DEPTH >= 1`, runs before a provider is
+configured or the discussion ledger is touched. Why: both spend the owner's
+token budget and write a ledger, and the contract (question, criteria,
+participants, budget) must be what the owner typed, not what a session's
+text steered; the model-facing `discuss` tools remain the way an agent opens
+one, under `delegate`'s rules. `--dry-run` is exempt: it calls no model and
+writes nothing. `list` and `show` are read-only and stay open.
+
+### Discussion timeout floor: recommendation (#813 item 4, awaiting the owner)
+
+Nothing changed: the floor is still 1 second. Raising it is a behaviour
+change for anyone who set 1 to 9 seconds, so it needs the owner's decision.
+
+| | Keep 1 s | Floor 10 s |
+|---|---|---|
+| A typo or a unit slip (`5` meant as minutes) | accepted; every call times out, and since #756 and #804 each timeout is retried once and charged its reserved estimate, so the discussion burns its budget on nothing | refused at startup with the bounds in the message |
+| Tests of the timeout path | use 1 s through the config or the env | keep 1 s through `TOLE_DISCUSSION_TIMEOUT_SECS` only |
+| Real models | no model answers a non-streaming discussion call in under 10 s | no effect |
+
+Recommendation: raise the floor to 10 s for the user-config key and keep the
+env override unbounded below (down to 1 s) as the documented test hook, with
+`discussion_timeout_bounds()` naming both. Owner decision needed; tracked in
+#813.
+
 ### A timed-out call is charged its estimate (#804)
 
 The discussion budget is a hard cap, so the ledger must not undercount a call

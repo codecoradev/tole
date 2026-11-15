@@ -153,8 +153,8 @@ In every session kind, `run_command` and `job_start` refuse an argv whose progra
 is the tole binary (by name, by resolving to the running executable, behind
 `env`, `nohup` or `sh -c`) and any argument naming `TOLE_UNDER_SESSION`. Every
 process they start carries `TOLE_UNDER_SESSION=1`, and `tole cron
-create|resume|edit`, `plugin approve`, `skills approve`, `skills drafts promote`
-and `config trust` refuse to write when that marker or `TOLE_AGENT_DEPTH >= 1` is
+create|resume|edit`, `plugin approve`, `skills approve`, `skills drafts promote`,
+`discuss start|resume` and `config trust` refuse to write when that marker or `TOLE_AGENT_DEPTH >= 1` is
 set. A human at a terminal is unaffected. A mission that had the model run `tole
 ...` must be run by the owner instead. This is defense in depth, not a boundary:
 a copied binary with a cleared environment, or an interpreter, can still write
