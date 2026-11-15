@@ -339,6 +339,11 @@ fn a_sandboxed_command_cannot_rename_or_replace_the_git_dir_and_its_leaves() {
         "sh -c 'echo evil > .git/hooks/pre-commit'",
         "sh -c 'echo [core] >> .git/config'",
         "sh -c 'echo x > .tole/evil'",
+        // A hard link to the protected inode through the writable anchor would
+        // reach it; the kernel refuses links across mounts (EXDEV).
+        "ln .git/config .git/config2",
+        "ln .git/hooks/marker .git/marker2",
+        "ln .git/config config-in-root",
     ];
     for a in attacks {
         let out = run(&tool, a);
@@ -352,6 +357,9 @@ fn a_sandboxed_command_cannot_rename_or_replace_the_git_dir_and_its_leaves() {
         "owner\n"
     );
     assert!(!w.join(".git/hooks/pre-commit").exists());
+    for p in [".git/config2", ".git/marker2", "config-in-root"] {
+        assert!(!w.join(p).exists(), "no hard link {p} to a protected inode");
+    }
     assert_eq!(
         std::fs::read_to_string(w.join(".git/config")).unwrap(),
         before

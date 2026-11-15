@@ -513,8 +513,10 @@ file_size_mb = 4096            # 1 to 1048576, largest file a process writes
   keep working), after the workspace and before the read-only binds of
   `.git/hooks` and `.git/config` (a later mount wins); `.tole` is bound
   read-only. Moving, removing or replacing `.git`, `.git/hooks`, `.git/config`
-  or `.tole` (rename, `rm`, `rmdir`, rename over them) fails; `git config`
-  writes to the repository config fail by design. A `.git` that is a gitdir
+  or `.tole` (rename, `rm`, `rmdir`, rename over them) fails; so does a hard
+  link to a protected file (the kernel refuses links across mounts, `EXDEV`,
+  so the writable `.git` mount cannot be used to reach the inode of the
+  read-only one); `git config` writes to the repository config fail by design. A `.git` that is a gitdir
   FILE (worktree, submodule) is bound read-only itself, so it cannot be
   swapped for a directory; the directory it points to is not in the sandbox's
   view unless it is inside the workspace, and then it is not protected. A
