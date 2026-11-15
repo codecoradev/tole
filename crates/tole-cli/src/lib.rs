@@ -110,6 +110,7 @@ pub mod hook_cli;
 pub mod hooks;
 pub mod plugin;
 pub mod sandbox_cmd;
+pub mod sandbox_flags;
 // `plugin/` holds these modules; the re-exports keep the old top-level paths working.
 #[doc(inline)]
 #[cfg(feature = "mcp")]

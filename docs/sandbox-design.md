@@ -245,9 +245,7 @@ Rules:
   approve`, `tole skills approve`, `tole config trust`) run as today. Run
   from inside a sandbox, the same commands find no data dir and change
   nothing (S3).
-- **Flags.** `--sandbox <profile>` / `--no-sandbox` on `run`, `mission`
-  and `chat` may narrow per session; `--no-sandbox` cannot turn off a
-  `required` server (the server is then not started).
+- **Flags.** `--sandbox <profile>` / `--no-sandbox`, as built in §6.2.
 
 ### 6.1 Named profiles and per-server bindings, as built (#810)
 
@@ -293,6 +291,44 @@ profile = "net"              # server | strict | a profile defined above
   global flag of `tole`; for `tole sandbox` it names the sandbox profile,
   not a persona. Profiles are defined by editing the file. Not built: the
   profile name and hash in the plugin lock entry.
+
+### 6.2 Flags, as built (#750)
+
+`--sandbox <profile>` and `--no-sandbox` are global flags of `tole`, per
+run, and only the owner at a terminal may pass them. They apply to stdio MCP
+servers; `[sandbox.consumers]` is not touched by either.
+
+| Case | `--no-sandbox` | `--sandbox <p>` |
+|---|---|---|
+| under an agent session (`TOLE_UNDER_SESSION`, child agent) | refused | refused |
+| `tole cron`, `tole hook`, `tole sandbox`, `tole plugin` (no session server starts, or servers are approved) | refused | refused |
+| `tole serve`, `tole acp`, or stdin/stderr not a terminal, mode `required` or `optional` | refused (optional counts as required without a human) | allowed |
+| mode `off` | no-op | refused: it selects, it does not turn the sandbox on |
+| attended | honoured for the run | profile must be built in or in the USER config |
+
+- `--sandbox <p>` replaces the profile of every stdio server for the run,
+  per-server bindings included; the mode, `skip`, caps and the grant checks
+  at each launch are unchanged. It never defines a profile: a project
+  config cannot define one (the user layer is the only source), and an
+  unknown name stops startup. It can pick a user-defined profile wider than
+  the default (that is the owner's own choice, at a terminal, never from a
+  session). The two flags conflict.
+- Two views, so a flag cannot widen its own blast radius: the configured
+  policy (`tole_core::sandbox::policy()`) is the owner's config and is never
+  changed by a flag; it is what the first-party names (`skip`), the sandbox
+  of a `tole plugin add` probe and the command consumers rely on. Only
+  `sandbox::session_policy()` (connection keys, idle stop, the cap, the
+  startup line, `launch_session`) applies the override, and it ignores
+  `--no-sandbox` once `mark_unattended()` ran, so a flag that slipped past
+  the host check still cannot unsandbox a cron job or a serve session.
+  `tole plugin` refuses both flags.
+- A sandbox never replaces an approval (#684, #700, #714): the flags change
+  where a server runs, not whether it is approved; the plugin lock, ledger
+  and `Admission` checks run as before.
+- Logged: one startup line and a `tole doctor` line say that a flag
+  overrode the config (mode or profile it replaced), and doctor lists the
+  grants of the effective policy. Not built: lazy start from the locked
+  snapshot, the profile name and hash in the lock entry.
 
 ## 7. Default profiles
 
