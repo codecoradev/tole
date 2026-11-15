@@ -561,7 +561,7 @@ fn a_hand_edited_lock_cannot_bring_back_a_revoked_server() {
     assert!(gate.refuse_unseen("cora", "stdio:true").is_none());
     assert!(ledger_of(&h)
         .lines()
-        .rfind(|l| !l.contains("secret_grant"))
+        .rfind(|l| !l.contains("secret_grant") && !l.contains("sandbox_profile"))
         .unwrap()
         .contains("\"event\":\"approve\""));
 }
@@ -1154,6 +1154,8 @@ fn entry(h: &H) -> LockEntry {
 
 fn gate(h: &H) -> Gate {
     Gate::load(Some(h.user()), &h.dir.join("ws"))
+        .with_policy(h.sandbox.clone())
+        .with_backend(h.backend.clone())
 }
 
 /// A bundle installed with A_TOKEN granted and B_KEY refused.
@@ -1413,4 +1415,205 @@ fn revoking_a_plugin_server_lists_its_grants_and_a_plugin_name_is_not_reused() {
     type_bundle(&h, &dir);
     let e = h.go(&|_| v1(), Some(true), bundle_add(&dir)).unwrap_err();
     assert!(e.contains("already in your plugin lock"), "{e}");
+}
+
+// ---- the sandbox profile in the lock entry (#750) ----
+
+/// A harness whose servers are third-party and run in the `server` profile.
+fn profiled(tag: &str) -> H {
+    let mut h = H::new(tag, &["srv"]);
+    h.first_party = Some(Vec::new());
+    let (p, b) = sandboxed();
+    h.sandbox = Some(p);
+    h.backend = b;
+    h
+}
+
+fn lock_entry(h: &H) -> tole_core::plugin_lock::LockEntry {
+    Lockfile::load(&h.user()).unwrap().servers["srv"].clone()
+}
+
+fn server_profile_hash() -> String {
+    tole_core::sandbox::builtin_profile("server")
+        .unwrap()
+        .hash()
+}
+
+#[test]
+fn an_approval_records_the_profile_name_and_hash_and_list_shows_them() {
+    let h = profiled("prof-rec");
+    h.run(&v1(), approve("srv", Some(&hash(&v1())))).unwrap();
+    let e = lock_entry(&h);
+    assert_eq!(e.sandbox.as_deref(), Some("server"));
+    assert_eq!(e.sandbox_hash, Some(server_profile_hash()));
+    let r = &h.rows(&v1())[0];
+    assert_eq!(r["state"], json!("approved"));
+    assert_eq!(r["profile"]["name"], json!("server"));
+    assert_eq!(r["profile"]["hash"], json!(server_profile_hash()));
+    assert_eq!(r["profile"]["changed"], json!(false));
+    let text = h.run(&v1(), PluginAction::List { json: false }).unwrap();
+    assert!(text.contains("profile server sha256:"), "{text}");
+    let ledger =
+        std::fs::read_to_string(h.user().with_file_name(plugin_lock::LEDGER_FILE)).unwrap();
+    assert!(
+        ledger.contains("\"event\":\"sandbox_profile\"") && ledger.contains(&server_profile_hash()),
+        "{ledger}"
+    );
+}
+
+#[test]
+fn a_profile_edited_after_approval_blocks_until_an_owner_at_a_terminal_re_approves() {
+    let mut h = profiled("prof-edit");
+    h.run(&v1(), approve("srv", Some(&hash(&v1())))).unwrap();
+    // The owner widens the profile in the user config: network on.
+    h.sandbox.as_mut().unwrap().profile.network = tole_core::sandbox::Network::Host;
+    let r = &h.rows(&v1())[0];
+    assert_eq!(r["state"], json!("changed (sandbox profile)"));
+    assert_eq!(r["profile"]["changed"], json!(true));
+    let d = h.run(&v1(), diff("srv")).unwrap();
+    assert!(
+        d.contains("sandbox profile CHANGED") && d.contains("refused at connect"),
+        "{d}"
+    );
+    // A script's --hash is consent to a tool list, never to a wider sandbox.
+    let e = h
+        .run(&v1(), approve("srv", Some(&hash(&v1()))))
+        .unwrap_err();
+    assert!(e.contains("only an interactive approval"), "{e}");
+    assert_eq!(lock_entry(&h).sandbox_hash, Some(server_profile_hash()));
+    // A declined terminal prompt changes nothing either.
+    assert!(h.go(&|_| v1(), Some(false), approve("srv", None)).is_err());
+    assert_eq!(lock_entry(&h).sandbox_hash, Some(server_profile_hash()));
+    // The terminal yes records the new profile.
+    h.go(&|_| v1(), Some(true), approve("srv", None)).unwrap();
+    assert_ne!(lock_entry(&h).sandbox_hash, Some(server_profile_hash()));
+    assert_eq!(h.rows(&v1())[0]["state"], json!("approved"));
+}
+
+#[test]
+fn a_renamed_profile_with_the_same_grants_and_a_sandbox_turned_off_both_block() {
+    let mut h = profiled("prof-name");
+    h.run(&v1(), approve("srv", Some(&hash(&v1())))).unwrap();
+    let before = h.sandbox.clone();
+    h.sandbox.as_mut().unwrap().profile_name = "other".into();
+    assert_eq!(
+        h.rows(&v1())[0]["state"],
+        json!("changed (sandbox profile)")
+    );
+    h.sandbox = before;
+    assert_eq!(h.rows(&v1())[0]["state"], json!("approved"));
+    h.sandbox.as_mut().unwrap().mode = tole_core::sandbox::Mode::Off;
+    assert_eq!(
+        h.rows(&v1())[0]["state"],
+        json!("changed (sandbox profile)")
+    );
+}
+
+#[test]
+fn an_edit_of_the_lock_alone_cannot_loosen_the_profile() {
+    let mut h = profiled("prof-lockedit");
+    h.run(&v1(), approve("srv", Some(&hash(&v1())))).unwrap();
+    // The profile is widened in config, and the lock is edited to match.
+    h.sandbox.as_mut().unwrap().profile.network = tole_core::sandbox::Network::Host;
+    let wide = h.sandbox.as_ref().unwrap().profile.hash();
+    let mut lock = Lockfile::load(&h.user()).unwrap();
+    lock.servers.get_mut("srv").unwrap().sandbox_hash = Some(wide);
+    lock.save(&h.user()).unwrap();
+    let r = &h.rows(&v1())[0];
+    assert_eq!(r["state"], json!("revoked"), "the ledger disagrees: {r}");
+    // Dropping the record from the lock does not help either.
+    let mut lock = Lockfile::load(&h.user()).unwrap();
+    let e = lock.servers.get_mut("srv").unwrap();
+    e.sandbox_hash = None;
+    e.sandbox = None;
+    lock.save(&h.user()).unwrap();
+    assert_eq!(h.rows(&v1())[0]["state"], json!("revoked"));
+}
+
+#[test]
+fn an_approval_from_before_profiles_were_recorded_is_reported_and_not_blocked() {
+    let h = profiled("prof-old");
+    h.run(&v1(), approve("srv", Some(&hash(&v1())))).unwrap();
+    // Make it an old approval: no hash in the lock, no profile line in the
+    // ledger (a #834-era ledger).
+    let mut lock = Lockfile::load(&h.user()).unwrap();
+    lock.servers.get_mut("srv").unwrap().sandbox_hash = None;
+    lock.save(&h.user()).unwrap();
+    let ledger_path = h.user().with_file_name(plugin_lock::LEDGER_FILE);
+    let kept: String = std::fs::read_to_string(&ledger_path)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.contains("sandbox_profile"))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    std::fs::write(&ledger_path, kept).unwrap();
+    let out = h.run(&v1(), LIST).unwrap();
+    let r = rows(&out);
+    assert_eq!(r[0]["state"], json!("approved"), "{out}");
+    assert!(
+        out.contains("before approvals recorded their sandbox profile"),
+        "{out}"
+    );
+    // A script's approval (nothing changed to consent to) records the profile.
+    h.run(&v1(), approve("srv", Some(&hash(&v1())))).unwrap();
+    assert_eq!(lock_entry(&h).sandbox_hash, Some(server_profile_hash()));
+    assert!(!h
+        .run(&v1(), LIST)
+        .unwrap()
+        .contains("before approvals recorded"));
+}
+
+#[test]
+fn approving_without_a_working_sandbox_records_none_and_a_lost_one_blocks() {
+    let mut h = profiled("prof-backend");
+    h.sandbox.as_mut().unwrap().mode = tole_core::sandbox::Mode::Optional;
+    // Approved while bwrap works: the profile is recorded and applies.
+    h.run(&v1(), approve("srv", Some(&hash(&v1())))).unwrap();
+    assert_eq!(lock_entry(&h).sandbox.as_deref(), Some("server"));
+    assert_eq!(h.rows(&v1())[0]["state"], json!("approved"));
+    // bwrap is gone (mode optional: it would run unwrapped): blocked.
+    h.backend = Availability::Unavailable("bwrap is not on PATH".into());
+    assert_eq!(
+        h.rows(&v1())[0]["state"],
+        json!("changed (sandbox profile)")
+    );
+    // Nothing re-approves it without a sandbox (a third-party server is not
+    // even started without one) ...
+    assert!(h.go(&|_| v1(), Some(true), approve("srv", None)).is_err());
+    // ... while the owner's own server, approved with no working sandbox,
+    // records "no sandbox", which is what admission then compares.
+    h.first_party = Some(vec!["srv".into()]);
+    h.go(&|_| v1(), Some(true), approve("srv", None)).unwrap();
+    let e = lock_entry(&h);
+    assert!(e.sandbox.is_none() && e.sandbox_hash.is_none());
+    assert_eq!(h.rows(&v1())[0]["state"], json!("approved"));
+}
+
+/// The "did the profile move" decision is the ledger's, not the lock file's:
+/// a lock hash edited to match a widened profile must not let a script
+/// approve past it (and so rewrite the ledger's record).
+#[test]
+fn a_script_cannot_approve_past_a_profile_the_lock_was_edited_to_match() {
+    let mut h = profiled("prof-forged");
+    h.run(&v1(), approve("srv", Some(&hash(&v1())))).unwrap();
+    h.sandbox.as_mut().unwrap().profile.network = tole_core::sandbox::Network::Host;
+    let wide = h.sandbox.as_ref().unwrap().profile.hash();
+    let mut lock = Lockfile::load(&h.user()).unwrap();
+    lock.servers.get_mut("srv").unwrap().sandbox_hash = Some(wide.clone());
+    lock.save(&h.user()).unwrap();
+    let ledger_before =
+        std::fs::read_to_string(h.user().with_file_name(plugin_lock::LEDGER_FILE)).unwrap();
+    let e = h
+        .run(&v1(), approve("srv", Some(&hash(&v1()))))
+        .unwrap_err();
+    assert!(e.contains("only an interactive approval"), "{e}");
+    // Nothing was written: the ledger still holds the approved profile.
+    let ledger_after =
+        std::fs::read_to_string(h.user().with_file_name(plugin_lock::LEDGER_FILE)).unwrap();
+    assert_eq!(ledger_before, ledger_after);
+    assert!(!ledger_after.contains(&wide));
+    // A terminal can still accept a real change.
+    h.go(&|_| v1(), Some(true), approve("srv", None)).unwrap();
+    assert_eq!(lock_entry(&h).sandbox_hash, Some(wide));
+    assert_eq!(h.rows(&v1())[0]["state"], json!("approved"));
 }

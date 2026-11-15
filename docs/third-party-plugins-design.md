@@ -408,5 +408,20 @@ the lock is refused.
    the value, which is why the output says to rotate the secret. `revoke
    <server>` blocks the whole server and lists its grants, as before.
 
+7. *The sandbox profile is part of the approval (#750).* A lock entry
+   (format version 4) carries the profile name and a hash of its effective
+   grants (`sandbox`, `sandbox_hash`; `docs/sandbox-design.md` §6.1 says what
+   is hashed). Before a server starts and at every connect the profile it
+   would run in now is compared with the record; a different name or hash, or
+   a sandbox that no longer applies, blocks it (`Admission::ProfileChanged`, a
+   ledger `profile_change`, `changed (sandbox profile)` in `list`). The
+   ledger is authoritative like for secrets: each approval is followed by a
+   `sandbox_profile` line and an entry whose record differs from it is
+   blocked. Re-approval is interactive only (a script's `--hash` is refused
+   for a changed profile). *Migration:* an approval from before has no
+   ledger line and no hash; `LedgerCheck::profile_unrecorded` reports it in
+   `list` and `doctor`, never blocks it, and the next `tole plugin approve`
+   records the profile.
+
 **Out of scope here:** registry resolution, uteke registry skills,
 enforcement of the declared paths, a bundle-wide approve.

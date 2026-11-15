@@ -289,8 +289,58 @@ profile = "net"              # server | strict | a profile defined above
   file is kept, the result is re-parsed and must differ only by that
   binding) and refuses under an agent session (#684). `--profile` is the
   global flag of `tole`; for `tole sandbox` it names the sandbox profile,
-  not a persona. Profiles are defined by editing the file. Not built: the
-  profile name and hash in the plugin lock entry.
+  not a persona. Profiles are defined by editing the file.
+- **The profile in the plugin lock entry (#750, as built).** An approval
+  records the profile name (`sandbox`) and `sandbox_hash` in the lock entry
+  (lock format version 4): SHA-256 over the workspace mode, the network, and
+  the sorted, de-duplicated extra `read` and `write` paths after resolution
+  (symlinks followed as far as the path exists, so a link retargeted after
+  approval is another grant); `protect` only narrows and is not hashed. At
+  every start the profile the server would run in now (the per-server binding
+  or the default, from the process's user-layer policy) is compared with the
+  record, before the server is started and again after it lists its tools:
+  another name, another hash, or no sandbox at all (mode `off`, a `skip`
+  entry) is `Admission::ProfileChanged` and the server is not registered
+  until the owner re-approves. A tighter profile counts too (it is the
+  profile that was not approved), which keeps the rule exact and the
+  `tole plugin diff` output simple. `tole plugin list` shows the profile and
+  hash (`profile ...`, `changed (sandbox profile)`), `diff` prints approved
+  against now. Re-approval of a changed profile is interactive only: a
+  script's `--hash` consents to a tool list, never to a wider sandbox, and
+  agent sessions cannot approve at all. The ledger is the authority: every
+  approval is followed by a `sandbox_profile` line (name and hash, or null
+  for an unsandboxed approval), and a lock whose record differs from it in
+  either direction (hash edited, record dropped, record added) is treated as
+  revoked, so editing the lock alone can never loosen or hide a profile
+  change. A project lock can pin the same record, never replace it: a
+  differing pin makes the server unavailable, a blank one changes nothing.
+  *Migration:* an entry approved before has no hash and no ledger line; it is
+  reported (`tole plugin list`, `tole doctor`: "approved before approvals
+  recorded their sandbox profile"), not blocked, and its profile is not
+  compared until its next `tole plugin approve` records it.
+  *Who decides "moved":* the ledger, never the lock file alone
+  (`plugin_lock::profile_moved`): a lock record that differs from the
+  ledger's last `sandbox_profile` line, or a lock hash the ledger never
+  recorded, is itself a move, so a script's `tole plugin approve --hash`
+  cannot approve past a profile whose lock hash was edited to match a widened
+  config (and so cannot rewrite the ledger's record); only a terminal can.
+  *Backend:* "the profile it would run under" is `Policy::applied_profile`,
+  the one helper approval, admission, `list` and `diff` share: the
+  configured profile only when a working backend exists. With bwrap missing
+  (or user namespaces refused) in mode `optional` the server would run
+  unwrapped, so no profile applies: an approval records no sandbox, and a
+  server approved with one is `ProfileChanged` (not started) until the
+  owner re-approves or the sandbox works again.
+  *Flags:* the gate reads the SESSION view of the policy
+  (`sandbox::session_policy`, the run's `--sandbox <p>` / `--no-sandbox`
+  applied), because that is what the server will actually run under: a
+  `--sandbox` profile other than the approved one, or `--no-sandbox` for a
+  server approved with a sandbox, is `ProfileChanged` and the server is not
+  registered for that run. Approvals (`tole plugin add|approve`, which
+  refuse both flags) and the interactive preflight record the CONFIGURED
+  profile, never a flag's, so a one-off override cannot become the approved
+  profile. Remote servers
+  and first-party or `skip` servers record no profile.
 
 ### 6.2 Flags, as built (#750)
 

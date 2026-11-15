@@ -49,7 +49,7 @@ fn unlocked_is_refused_approval_locks_it_and_a_change_blocks_it_again() {
     let ledger = std::fs::read_to_string(user.with_file_name(plugin_lock::LEDGER_FILE)).unwrap();
     let events: Vec<&str> = ledger
         .lines()
-        .filter(|l| !l.contains("secret_grant"))
+        .filter(|l| !l.contains("secret_grant") && !l.contains("sandbox_profile"))
         .map(|l| {
             serde_json::from_str::<serde_json::Value>(l).unwrap()["event"]
                 .as_str()
@@ -375,4 +375,170 @@ fn a_bundle_approval_records_each_grant_and_a_hand_added_one_is_blocked() {
         "{:?}",
         gate.notes
     );
+}
+
+// ---- the sandbox profile at connect time (#750) ----
+
+fn policy(network: tole_core::sandbox::Network) -> tole_core::sandbox::Policy {
+    use tole_core::sandbox::{builtin_profile, Mode};
+    let mut profile = builtin_profile("server").unwrap();
+    profile.network = network;
+    tole_core::sandbox::Policy {
+        mode: Mode::Required,
+        profile_name: "server".into(),
+        profile,
+        servers: Default::default(),
+        skip: Vec::new(),
+        max_servers: 4,
+        idle_secs: 60,
+    }
+}
+
+fn usable() -> tole_core::sandbox::Availability {
+    tole_core::sandbox::Availability::Usable {
+        bwrap: "/usr/bin/bwrap".into(),
+        version: "0.9.0".into(),
+    }
+}
+
+/// `srv` approved in the profile with no network.
+fn profiled_gate(tag: &str) -> (TestDir, PathBuf, TestDir) {
+    let dir = tmp(tag);
+    let user = dir.join(plugin_lock::LOCK_FILE);
+    let ws = tmp(&format!("{tag}-ws"));
+    let mut gate = Gate::load(Some(user.clone()), &ws)
+        .with_policy(Some(policy(tole_core::sandbox::Network::None)))
+        .with_backend(usable());
+    let id = gate.live_profile("srv", "stdio:srv").unwrap();
+    gate.approve_with(
+        "srv",
+        "stdio:srv",
+        "1",
+        &tools(),
+        Approval {
+            sandbox: Some(id.name),
+            sandbox_hash: Some(id.hash),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    (dir, user, ws)
+}
+
+#[test]
+fn a_profile_edited_in_the_user_config_blocks_the_server_before_and_after_it_starts() {
+    use tole_core::sandbox::Network;
+    let (dir, user, ws) = profiled_gate("prof-conn");
+    let load = |n| {
+        Gate::load(Some(user.clone()), &ws)
+            .with_policy(Some(policy(n)))
+            .with_backend(usable())
+    };
+    let same = load(Network::None);
+    assert!(same.refuse_unseen("srv", "stdio:srv").is_none());
+    assert!(same.check("srv", "stdio:srv", "1", &tools()).is_ok());
+    let wide = load(Network::Host);
+    let note = wide.refuse_unseen("srv", "stdio:srv").unwrap();
+    assert!(note.contains("sandbox profile"), "{note}");
+    let e = wide.check("srv", "stdio:srv", "1", &tools()).unwrap_err();
+    assert!(e.contains("sandbox profile"), "{e}");
+    // No sandbox at all now is a loosening too.
+    let off = Gate::load(Some(user.clone()), &ws).with_policy(None);
+    assert!(off.refuse_unseen("srv", "stdio:srv").is_some());
+    // The change is a ledger line, names and hashes only.
+    let text = std::fs::read_to_string(dir.join(plugin_lock::LEDGER_FILE)).unwrap();
+    assert!(text.contains("\"event\":\"profile_change\""), "{text}");
+}
+
+#[test]
+fn a_project_lock_cannot_loosen_or_replace_the_profile() {
+    use tole_core::sandbox::Network;
+    let (_dir, user, ws) = profiled_gate("prof-proj");
+    // A project lock that pins another profile hash makes the server
+    // unavailable (it cannot replace the user's approval) ...
+    let mut project = Lockfile::load(&user).unwrap();
+    project.servers.get_mut("srv").unwrap().sandbox_hash = Some("sha256:ff".into());
+    project.save(&Lockfile::project_path(&ws)).unwrap();
+    let g = Gate::load(Some(user.clone()), &ws)
+        .with_policy(Some(policy(Network::None)))
+        .with_backend(usable());
+    assert!(g.refuse_unseen("srv", "stdio:srv").is_some());
+    assert!(
+        g.notes
+            .iter()
+            .any(|n| n.contains("another sandbox profile")),
+        "{:?}",
+        g.notes
+    );
+    // ... and one that records no profile changes nothing.
+    let mut project = Lockfile::load(&user).unwrap();
+    let e = project.servers.get_mut("srv").unwrap();
+    e.sandbox = None;
+    e.sandbox_hash = None;
+    project.save(&Lockfile::project_path(&ws)).unwrap();
+    let g = Gate::load(Some(user.clone()), &ws)
+        .with_policy(Some(policy(Network::Host)))
+        .with_backend(usable());
+    assert!(
+        g.refuse_unseen("srv", "stdio:srv").is_some(),
+        "a project lock cannot loosen the user's profile record"
+    );
+}
+
+#[test]
+fn an_old_lock_without_a_profile_is_not_blocked_and_the_note_names_the_migration() {
+    use tole_core::sandbox::Network;
+    let dir = tmp("prof-old");
+    let user = dir.join(plugin_lock::LOCK_FILE);
+    let ws = tmp("prof-old-ws");
+    let mut gate = Gate::load(Some(user.clone()), &ws);
+    gate.approve("srv", "stdio:srv", "1", &tools()).unwrap();
+    // Back to a pre-#750 ledger: approve without a profile line.
+    let ledger = dir.join(plugin_lock::LEDGER_FILE);
+    let kept: String = std::fs::read_to_string(&ledger)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.contains("sandbox_profile"))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    std::fs::write(&ledger, kept).unwrap();
+    let gate = Gate::load(Some(user), &ws).with_policy(Some(policy(Network::Host)));
+    assert_eq!(
+        gate.refuse_unseen("srv", "stdio:srv"),
+        None,
+        "{:?}",
+        gate.notes
+    );
+    assert!(gate.check("srv", "stdio:srv", "1", &tools()).is_ok());
+    assert!(
+        gate.notes.iter().any(
+            |n| n.contains("before approvals recorded their sandbox profile")
+                && n.contains("tole plugin approve srv")
+        ),
+        "{:?}",
+        gate.notes
+    );
+}
+
+/// An approval with a sandbox is a promise that it runs wrapped. With the
+/// mode `optional` and no working backend the server would run unwrapped and
+/// the configured profile still hashes the same: it must be blocked anyway.
+#[test]
+fn an_approved_server_is_blocked_when_the_sandbox_cannot_be_applied_any_more() {
+    use tole_core::sandbox::{Availability, Mode, Network};
+    let (_dir, user, ws) = profiled_gate("prof-nobackend");
+    let mut optional = policy(Network::None);
+    optional.mode = Mode::Optional;
+    let gate = Gate::load(Some(user.clone()), &ws).with_policy(Some(optional.clone()));
+    // Backend works: still admitted.
+    let ok = Gate::load(Some(user.clone()), &ws)
+        .with_policy(Some(optional.clone()))
+        .with_backend(usable());
+    assert!(ok.refuse_unseen("srv", "stdio:srv").is_none());
+    // bwrap went missing: same config, no sandbox applies.
+    let gone = gate.with_backend(Availability::Unavailable("bwrap is not on PATH".into()));
+    assert!(gone.live_profile("srv", "stdio:srv").is_none());
+    let note = gone.refuse_unseen("srv", "stdio:srv").unwrap();
+    assert!(note.contains("sandbox profile"), "{note}");
+    assert!(gone.check("srv", "stdio:srv", "1", &tools()).is_err());
 }

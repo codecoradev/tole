@@ -24,6 +24,7 @@
 
 pub mod command;
 pub mod flags;
+pub mod identity;
 pub mod report;
 
 use std::collections::BTreeMap;

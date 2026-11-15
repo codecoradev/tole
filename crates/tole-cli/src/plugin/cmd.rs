@@ -21,6 +21,7 @@ use tole_core::plugin_lock::{
     self, admit, admit_unseen, tier_of, Admission, LockEntry, Lockfile, ToolChange, NOT_STORED,
 };
 use tole_core::plugin_scan;
+use tole_core::sandbox::identity::ProfileId;
 use tole_core::sandbox::{Availability, Mode, Policy};
 use tole_core::secrets::SecretSet;
 
@@ -207,7 +208,9 @@ fn sandbox_status(ctx: &Ctx<'_>, name: &str, stdio: bool) -> String {
         return "skipped (owner's skip list)".into();
     }
     match &ctx.backend {
-        Availability::Usable { .. } => format!("wrapped (profile {})", p.profile_name),
+        Availability::Usable { .. } => {
+            format!("wrapped (profile {})", p.profile_for(name).0)
+        }
         Availability::Unavailable(why) if p.mode == Mode::Required => {
             format!("required but unavailable, not started: {why}")
         }
@@ -234,6 +237,7 @@ fn state_of(a: &Admission) -> &'static str {
         Admission::Moved => "changed (another command or URL)",
         Admission::Rebuilt => "changed (another program file)",
         Admission::BundleChanged => "changed (plugin manifest)",
+        Admission::ProfileChanged => "changed (sandbox profile)",
         Admission::Unlocked => "unapproved",
         Admission::Revoked => "revoked",
     }
@@ -258,8 +262,9 @@ fn probe_state(
 ) -> String {
     let source = source_of(cfg);
     let integrity = integrity(&source);
-    if let Some(a) =
-        admit_unseen(eff, &cfg.name, &source, &integrity).or_else(|| bundle_refusal(eff, &cfg.name))
+    if let Some(a) = admit_unseen(eff, &cfg.name, &source, &integrity)
+        .or_else(|| bundle_refusal(eff, &cfg.name))
+        .or_else(|| profile_refusal(ctx, eff, cfg))
     {
         return state_of(&a).to_string();
     }
@@ -356,6 +361,14 @@ fn list(ctx: &Ctx<'_>, as_json: bool) -> String {
                 .unwrap_or_default(),
             "sandbox": ctx.clean(&sandbox_status(ctx, name, stdio)),
             "approved_with_sandbox": entry.and_then(|e| e.sandbox.as_deref().map(|s| ctx.clean(s))),
+            "profile": entry.map(|e| json!({
+                "name": e.sandbox.as_deref().map(|s| ctx.clean(s)),
+                "hash": e.sandbox_hash,
+                "live_name": cfg.and_then(|c| live_profile(ctx, c)).map(|p| ctx.clean(&p.name)),
+                "live_hash": cfg.and_then(|c| live_profile(ctx, c)).map(|p| p.hash),
+                "recorded": e.sandbox_hash.is_some(),
+                "changed": cfg.is_some_and(|c| profile_refusal(ctx, &eff, c).is_some()),
+            })),
             "approved_at": entry.map(|e| tole_core::skill_approval::format_time(e.approved_at)),
             "lock": lock,
             "binary": entry.and_then(binary_note),
@@ -397,6 +410,31 @@ fn list(ctx: &Ctx<'_>, as_json: bool) -> String {
         ));
         if let Some(b) = r["binary"].as_str() {
             out.push_str(&format!("\n  ! {b}"));
+        }
+        if let Some(p) = r["profile"].as_object() {
+            let f = |k: &str| p[k].as_str().unwrap_or("-");
+            if p["recorded"] == true {
+                out.push_str(&format!(
+                    "\n  profile {} {}{}",
+                    f("name"),
+                    short(f("hash")),
+                    if p["changed"] == true {
+                        format!(
+                            "  ! CHANGED: now {} {}; refused at connect until re-approved",
+                            f("live_name"),
+                            short(f("live_hash"))
+                        )
+                    } else {
+                        String::new()
+                    }
+                ));
+            } else if r["tier"] != "first-party" && p["name"].is_string() {
+                out.push_str(&format!(
+                    "\n  profile {} (grants not recorded: approved before #750; \
+                     `tole plugin approve` records it)",
+                    f("name")
+                ));
+            }
         }
         if let Some(b) = r["bundle"].as_object() {
             let f = |k: &str| b[k].as_str().unwrap_or("-");
@@ -510,6 +548,7 @@ fn diff(ctx: &Ctx<'_>, name: &str) -> Result<String, String> {
         out.push_str("binary: unchanged\n");
     }
     out.push_str(&secrets_note(ctx, e));
+    out.push_str(&profile_note(ctx, e, cfg));
     for n in &ledger_notes {
         out.push_str(&format!("! {n}\n"));
     }
@@ -535,8 +574,9 @@ fn diff(ctx: &Ctx<'_>, name: &str) -> Result<String, String> {
             }
         ));
     }
-    let blocked =
-        admit_unseen(&eff, name, &source, &live_integrity).or_else(|| bundle_refusal(&eff, name));
+    let blocked = admit_unseen(&eff, name, &source, &live_integrity)
+        .or_else(|| bundle_refusal(&eff, name))
+        .or_else(|| profile_refusal(ctx, &eff, cfg));
     let why = match (&blocked, ctx.probe) {
         (Some(a), _) => Some(format!("the lock refuses it: {}", state_of(a))),
         (None, false) => Some("running under an agent session".to_string()),
@@ -642,14 +682,70 @@ fn sandbox_refusal(ctx: &Ctx<'_>, cfg: &McpServerConfig, tier: Tier) -> Option<S
     })
 }
 
-/// The profile an approval records: the one the server ran in, if any.
-fn profile_used(ctx: &Ctx<'_>, cfg: &McpServerConfig) -> Option<String> {
-    let p = ctx.sandbox.as_ref()?;
-    (is_stdio(cfg)
-        && p.mode != Mode::Off
-        && !p.skip.iter().any(|s| s == &cfg.name)
-        && matches!(ctx.backend, Availability::Usable { .. }))
-    .then(|| p.profile_name.clone())
+/// The profile an approval records: the name and grant hash of the one the
+/// server ran in, if any (#750).
+fn profile_approval(ctx: &Ctx<'_>, cfg: &McpServerConfig) -> Approval {
+    let id = live_profile(ctx, cfg);
+    Approval {
+        sandbox: id.as_ref().map(|p| p.name.clone()),
+        sandbox_hash: id.map(|p| p.hash),
+        ..Default::default()
+    }
+}
+
+/// The profile `cfg` would run in now, as the context's policy has it.
+fn live_profile(ctx: &Ctx<'_>, cfg: &McpServerConfig) -> Option<ProfileId> {
+    ctx.sandbox
+        .as_ref()
+        .filter(|_| is_stdio(cfg))
+        .and_then(|p| p.applied_profile(&cfg.name, &ctx.backend))
+}
+
+/// [`Admission::ProfileChanged`] when `cfg` would run in another sandbox
+/// profile than the approved one (#750).
+fn profile_refusal(
+    ctx: &Ctx<'_>,
+    eff: &std::collections::BTreeMap<String, LockEntry>,
+    cfg: &McpServerConfig,
+) -> Option<Admission> {
+    plugin_lock::profile_admission(eff, &cfg.name, live_profile(ctx, cfg).as_ref())
+}
+
+/// What `list` and `diff` say about the approved profile against the one
+/// in force now.
+fn profile_note(ctx: &Ctx<'_>, e: &LockEntry, cfg: &McpServerConfig) -> String {
+    let live = live_profile(ctx, cfg);
+    let show = |name: Option<&str>, hash: Option<&str>| match (name, hash) {
+        (Some(n), Some(h)) => format!("{} {}", ctx.clean(n), short(h)),
+        (Some(n), None) => format!("{} (grants not recorded)", ctx.clean(n)),
+        _ => "none (not sandboxed)".to_string(),
+    };
+    let approved = show(e.sandbox.as_deref(), e.sandbox_hash.as_deref());
+    let now = show(
+        live.as_ref().map(|p| p.name.as_str()),
+        live.as_ref().map(|p| p.hash.as_str()),
+    );
+    if e.sandbox_hash.is_none() {
+        let mut out = format!("sandbox profile approved: {approved}\n  now: {now}\n");
+        if is_stdio(cfg) {
+            out.push_str(
+                "  no profile hash is recorded (it ran unsandboxed, or was approved before \
+                 profiles were recorded: `list` says which), so a change of the profile is not \
+                 detected; `tole plugin approve` records it\n",
+            );
+        }
+        return out;
+    }
+    let one = std::collections::BTreeMap::from([(cfg.name.clone(), e.clone())]);
+    if plugin_lock::profile_admission(&one, &cfg.name, live.as_ref()).is_some() {
+        format!(
+            "! sandbox profile CHANGED: approved {approved}\n                          now      {now}\n  \
+             refused at connect until re-approved (`tole sandbox show {}`)\n",
+            ctx.clean(&cfg.name)
+        )
+    } else {
+        format!("sandbox profile: unchanged ({approved})\n")
+    }
 }
 
 /// Starts `cfg` to read its tools for a review, the way its tier allows:
@@ -852,9 +948,9 @@ fn add(ctx: &mut Ctx<'_>, spec: &str) -> Result<String, String> {
         Approval {
             integrity: Some(before),
             tier: Some(tier),
-            sandbox: profile_used(ctx, &cfg),
             secrets: Some(Vec::new()),
             bundle: None,
+            ..profile_approval(ctx, &cfg)
         },
     )?;
     Ok(ctx.clean(&format!(
@@ -1068,7 +1164,6 @@ fn add_bundle(ctx: &mut Ctx<'_>, path: &Path) -> Result<String, String> {
             Approval {
                 integrity: Some(before),
                 tier: Some(tier),
-                sandbox: profile_used(ctx, &cfg),
                 secrets: Some(granted.clone()),
                 bundle: Some(plugin_lock::BundleRef {
                     plugin: b.name.clone(),
@@ -1076,6 +1171,7 @@ fn add_bundle(ctx: &mut Ctx<'_>, path: &Path) -> Result<String, String> {
                     hash: loaded.hash.clone(),
                     path: loaded.path.display().to_string(),
                 }),
+                ..profile_approval(ctx, &cfg)
             },
         )
         .map_err(|e| format!("{e}\n(already locked before this error: {out})"))?;
@@ -1187,6 +1283,45 @@ fn approve(ctx: &mut Ctx<'_>, name: &str, opts: Approve<'_>) -> Result<String, S
     let ((version, live), before) = start_for_review(ctx, &cfg, tier)?;
     let hash = plugin_lock::manifest_hash(&live);
     let mut shown = ctx.clean(&render_manifest(name, &version, &live));
+    if let Some(e) = &existing {
+        shown.push('\n');
+        shown.push_str(&ctx.clean(&profile_note(ctx, e, &cfg)));
+        // A changed sandbox profile is the owner's decision at a terminal: a
+        // script's `--hash` consents to a tool list, never to a wider
+        // sandbox (#750).
+        // Decided against the LEDGER's record of the approved profile, not
+        // the lock file alone: a lock hash edited to match a widened profile
+        // is itself a move.
+        let one = std::collections::BTreeMap::from([(name.to_string(), e.clone())]);
+        let ledger = ctx
+            .user
+            .as_deref()
+            .and_then(|u| u.parent().map(|d| d.join(plugin_lock::LEDGER_FILE)))
+            .map(|p| plugin_lock::read_ledger(&p))
+            .transpose()?
+            .flatten();
+        let moved = plugin_lock::profile_moved(
+            &one,
+            ledger.as_deref(),
+            name,
+            live_profile(ctx, &cfg).as_ref(),
+        );
+        if moved {
+            shown.push_str(
+                "! the sandbox profile differs from the one your ledger recorded at approval \
+                 (changed in the config, or the lock was edited)\n",
+            );
+        }
+        if moved && !ctx.interactive {
+            return Err(format!(
+                "{shown}\nthe sandbox profile of `{}` is not the one you approved: only an \
+                 interactive approval at a terminal accepts a changed profile (review it with \
+                 `tole sandbox show {}`); a script cannot",
+                ctx.clean(name),
+                ctx.clean(name)
+            ));
+        }
+    }
     if let Some((l, _)) = &bundle {
         shown.push('\n');
         shown.push_str(&render_bundle(ctx, l));
@@ -1229,9 +1364,9 @@ fn approve(ctx: &mut Ctx<'_>, name: &str, opts: Approve<'_>) -> Result<String, S
         Approval {
             integrity: Some(before),
             tier: Some(tier),
-            sandbox: profile_used(ctx, &cfg),
             secrets: secrets.clone(),
             bundle: bundle_ref,
+            ..profile_approval(ctx, &cfg)
         },
     )?;
     let mut out = format!("{shown}\napproved `{name}` ({hash}) in the user lock\n");

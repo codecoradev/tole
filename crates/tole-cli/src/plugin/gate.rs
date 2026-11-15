@@ -25,7 +25,11 @@ use tole_core::plugin_lock::{self, admit, Admission, Live, LockEntry, Lockfile, 
 pub struct Approval {
     pub integrity: Option<String>,
     pub tier: Option<plugin_lock::Tier>,
+    /// Name of the sandbox profile the server ran in (`None`: unsandboxed).
     pub sandbox: Option<String>,
+    /// Hash of that profile's effective grants (#750); see
+    /// [`tole_core::sandbox::identity`].
+    pub sandbox_hash: Option<String>,
     pub secrets: Option<Vec<String>>,
     /// The bundle manifest the server is approved from (#811). With it, the
     /// ledger records the manifest hash and each secret grant.
@@ -42,6 +46,12 @@ pub struct Gate {
     /// project): nothing is trusted, and no approval is written until it is
     /// fixed and the session restarted, even if the file reads fine later.
     broken: Option<PathBuf>,
+    /// The sandbox policy the live profile of a server is read from: the
+    /// process's, taken when the gate is loaded (see [`Gate::with_policy`]).
+    policy: Option<tole_core::sandbox::Policy>,
+    /// What this machine offers; `None` probes it on first use (see
+    /// [`Gate::with_backend`]).
+    backend: Option<tole_core::sandbox::Availability>,
 }
 
 fn now() -> u64 {
@@ -79,6 +89,8 @@ impl Gate {
                     notes,
                     user_path: user,
                     broken: Some(project_path),
+                    policy: tole_core::sandbox::session_policy(),
+                    backend: None,
                 };
             }
         };
@@ -95,7 +107,46 @@ impl Gate {
             notes,
             user_path: user,
             broken,
+            policy: tole_core::sandbox::session_policy(),
+            backend: None,
         }
+    }
+
+    /// The same gate with a given sandbox backend instead of the probed one
+    /// (tests and embedders).
+    pub fn with_backend(mut self, backend: tole_core::sandbox::Availability) -> Self {
+        self.backend = Some(backend);
+        self
+    }
+
+    /// The sandbox backend of this machine (probed once per process).
+    fn backend(&self) -> tole_core::sandbox::Availability {
+        self.backend
+            .clone()
+            .unwrap_or_else(tole_core::sandbox::detect)
+    }
+
+    /// The same gate reading live sandbox profiles from `policy` instead of
+    /// the process's (embedders and tests; the process's is set once).
+    pub fn with_policy(mut self, policy: Option<tole_core::sandbox::Policy>) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    /// The identity of the sandbox profile `server` would actually run under
+    /// now: `None` for a remote server, with the sandbox off, for a server
+    /// the owner skips, or when no working backend can apply it (bwrap
+    /// missing, mode `optional`: it would run unwrapped). Read at every call, never cached, so an edit of the user
+    /// config is seen at the next start (#750).
+    pub fn live_profile(
+        &self,
+        server: &str,
+        source: &str,
+    ) -> Option<tole_core::sandbox::identity::ProfileId> {
+        source.starts_with("stdio:").then_some(())?;
+        self.policy
+            .as_ref()?
+            .applied_profile(server, &self.backend())
     }
 
     /// The connect-time guard: `Ok` only for an exact match of the
@@ -118,13 +169,17 @@ impl Gate {
         };
         let mut a = admit(&self.lock, server, &live);
         if a == Admission::Trusted {
-            a = self.bundle_check(server).unwrap_or(a);
+            a = self
+                .bundle_check(server)
+                .or_else(|| self.profile_check(server, source))
+                .unwrap_or(a);
         }
         let event = match &a {
             Admission::Changed { .. } => Some("manifest_change"),
             Admission::Moved => Some("source_change"),
             Admission::Rebuilt => Some("binary_change"),
             Admission::BundleChanged => Some("bundle_change"),
+            Admission::ProfileChanged => Some("profile_change"),
             _ => None,
         };
         if let Some(event) = event {
@@ -145,11 +200,13 @@ impl Gate {
     /// recorded in the ledger.
     pub fn refuse_unseen(&self, server: &str, source: &str) -> Option<String> {
         let a = plugin_lock::admit_unseen(&self.lock, server, source, &integrity(source))
-            .or_else(|| self.bundle_check(server))?;
+            .or_else(|| self.bundle_check(server))
+            .or_else(|| self.profile_check(server, source))?;
         let event = match a {
             Admission::Moved => "source_change",
             Admission::Rebuilt => "binary_change",
             Admission::BundleChanged => "bundle_change",
+            Admission::ProfileChanged => "profile_change",
             _ => "",
         };
         if let Some(e) = self.lock.get(server).filter(|_| !event.is_empty()) {
@@ -163,6 +220,18 @@ impl Gate {
     fn bundle_check(&self, server: &str) -> Option<Admission> {
         let live = super::bundle::live_hash(self.lock.get(server)?)?;
         plugin_lock::bundle_admission(&self.lock, server, &live)
+    }
+
+    /// [`Admission::ProfileChanged`] when the sandbox profile `server` would
+    /// run in now is not the approved one (#750). Read from the process's
+    /// policy at every call, never cached, so an edit of the user config is
+    /// seen at the next start.
+    fn profile_check(&self, server: &str, source: &str) -> Option<Admission> {
+        plugin_lock::profile_admission(
+            &self.lock,
+            server,
+            self.live_profile(server, source).as_ref(),
+        )
     }
 
     /// The secret NAMES `server`'s approval granted it (#679), for its
@@ -221,6 +290,7 @@ impl Gate {
                     .collect()
             }),
             sandbox: with.sandbox,
+            sandbox_hash: with.sandbox_hash,
             approved_at: now(),
             revoked: false,
             manifest: plugin_lock::snapshot(tools, &tole_core::secrets::process_secrets()),
@@ -261,6 +331,17 @@ impl Gate {
                 }
             }
         }
+        // The profile follows every approval, bundle or plain (#750): the
+        // ledger then holds what the lock's `sandbox` fields must say.
+        append(
+            &path,
+            plugin_lock::profile_ledger_line(
+                server,
+                entry.sandbox.as_deref(),
+                entry.sandbox_hash.as_deref(),
+                now(),
+            ),
+        );
         self.lock.insert(server.to_string(), entry);
         Ok(())
     }
@@ -313,6 +394,13 @@ pub fn blocked_notes(check: &plugin_lock::LedgerCheck) -> Vec<String> {
             "plugin lock: `{s}` holds secret grants approved before the ledger recorded them, \
              so they cannot be checked; approve it again (or withdraw one with `revoke \
              --secret`) to record them"
+        )
+    }));
+    notes.extend(check.profile_unrecorded.iter().map(|s| {
+        format!(
+            "plugin lock: `{s}` was approved before approvals recorded their sandbox profile, so \
+             a change of its profile is not detected; approve it again (`tole plugin approve \
+             {s}`) to record it"
         )
     }));
     if let Some(why) = &check.unreadable {
@@ -437,6 +525,13 @@ pub fn refusal(server: &str, a: &Admission) -> String {
              registered. Start `tole` in a terminal to review and re-approve it, or run \
              `tole plugin approve {server}` ({server})"
         ),
+        Admission::ProfileChanged => format!(
+            "the sandbox profile it would run in (its name or what it grants) is not the one \
+             you approved, or no sandbox applies to it now: not registered. Review it with \
+             `tole sandbox show {server}` and `tole plugin diff {server}`, then start `tole` \
+             in a terminal or run `tole plugin approve {server}` to approve the new profile \
+             ({server})"
+        ),
         Admission::BundleChanged => format!(
             "its plugin manifest (tole-plugin.toml) is not the one you approved, or cannot be \
              read: not registered, and its secret grants do not apply. Review it and run \
@@ -529,12 +624,21 @@ pub fn preflight(
             version: &version,
             tools: &tools,
         };
-        let why = match admit(&gate.lock, &cfg.name, &live) {
+        let profile = gate.live_profile(&cfg.name, &source);
+        let mut a = admit(&gate.lock, &cfg.name, &live);
+        if a == Admission::Trusted {
+            a = plugin_lock::profile_admission(&gate.lock, &cfg.name, profile.as_ref())
+                .unwrap_or(a);
+        }
+        let why = match a {
             Admission::Unlocked => "is not approved yet",
             Admission::Changed { .. } => "CHANGED since you approved it",
             Admission::Moved => "now runs ANOTHER command or URL than the one you approved",
             Admission::Rebuilt => "now runs ANOTHER program file than the one you approved",
             Admission::BundleChanged => "has a CHANGED plugin manifest",
+            Admission::ProfileChanged => {
+                "would run in ANOTHER sandbox profile than the one you approved"
+            }
             Admission::Trusted | Admission::Revoked => continue,
         };
         let text = format!(
@@ -542,8 +646,30 @@ pub fn preflight(
             render_manifest(&cfg.name, &version, &tools),
             cfg.name
         );
+        // What is recorded is the OWNER'S configured profile, never a flag's:
+        // `--sandbox <p>` / `--no-sandbox` are per-run, and an approval that
+        // took their profile would make a one-off override permanent. A
+        // server that only differs because of such a flag stays blocked for
+        // this run and is not offered for approval.
+        let configured = source
+            .starts_with("stdio:")
+            .then(|| tole_core::sandbox::policy()?.applied_profile(&cfg.name, &gate.backend()))
+            .flatten();
+        if matches!(a, Admission::ProfileChanged) && configured != profile {
+            eprintln!(
+                "tole: mcp[{}]: the sandbox flag of this run gives it another profile than the \
+                 one you approved: not registered; run without the flag",
+                cfg.name
+            );
+            continue;
+        }
         if ask(&text) {
-            if let Err(e) = gate.approve(&cfg.name, &source_of(cfg), &version, &tools) {
+            let with = Approval {
+                sandbox: configured.as_ref().map(|p| p.name.clone()),
+                sandbox_hash: configured.map(|p| p.hash),
+                ..Default::default()
+            };
+            if let Err(e) = gate.approve_with(&cfg.name, &source_of(cfg), &version, &tools, with) {
                 eprintln!("tole: {e}");
             }
         }

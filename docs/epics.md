@@ -390,7 +390,9 @@ Bot and Nakama; BMAD for collaboration). Design notes:
     `--verify` command, the stop gates; `verify` and `turnend` become
     sandboxed by default in a later phase), and #750 for the operability
     pieces: the doctor listing of sensitive grants and startup logging (#809),
-    per-server and named profiles with the CLI (#810, in review), and lazy start
+    per-server and named profiles with the CLI (#810, in review), the profile
+    name and hash in the plugin lock entry with re-approval on change (#750,
+    in review), and lazy start
     with tool retrieval by meaning (no slice issue yet));
 
 Order that was followed: E4 #595 first (other epics reuse it), then E1,
