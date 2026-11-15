@@ -365,7 +365,13 @@ impl OpenAiProvider {
             .new_agent()
     }
 
-    /// Override the default 120s timeout.
+    /// The global request timeout in force.
+    pub fn request_timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    /// Override the default 120s timeout (the global timeout of one request:
+    /// connect, send and reading the whole response).
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.agent = Self::build_chat_agent(timeout);
         self.timeout = timeout;

@@ -395,7 +395,11 @@ fn build_with_data_dir(
             crate::config_apply::provider_config(),
         ) {
             let secrets = crate::provider_chain::process_secrets(&crate::config_apply::real_env);
-            let make = crate::discussion_host::factory(pc, secrets.clone());
+            let make = crate::discussion_host::factory(
+                pc,
+                secrets.clone(),
+                crate::config_apply::discussion_timeout(),
+            );
             let d = crate::discuss_tool::DiscussHost::new(
                 host.clone(),
                 data.join(tole_core::discussion_log::DISCUSSIONS_DIR),

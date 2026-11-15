@@ -621,6 +621,26 @@ built-in or owner-overridden roles.
      `delegate` is registered for it, at any depth;
    - unknown fields are still refused; the opt-in is `modes` only.
 
+### Discussion request timeout (#786)
+
+Discussions do not stream (the whole reply must land before the ledger entry
+is written), so one call is as long as the model's whole generation, and a
+reasoning model on a growing shared context can pass the provider's 120 s
+default. The timeout is therefore a knob, with the house precedence
+(`TOLE_CONTEXT_WINDOW` > config > default, #440): env
+`TOLE_DISCUSSION_TIMEOUT_SECS` > user config `[discussions]
+request_timeout_secs` > 120 (unchanged), a whole number of seconds from 1 to
+3600. `discussion_host::factory` hands it to the provider's `with_timeout`.
+What it covers: the provider's global request timeout, i.e. connect, send and
+reading the entire response of ONE call; it is not an idle timeout and not a
+bound on the discussion, which stays bounded by its budget and `max_rounds`.
+The key is user-layer only (a cloned repository must not stretch how long a
+call may hold a discussion open; `config check` prints the project's value as
+IGNORED), and an invalid env value is a startup error naming the variable,
+never a silent fall back to 120 s. `tole config check` and `tole doctor` show
+the effective value and where it came from. The advisor's provider keeps its
+own 120 s.
+
 ## 12. Non-goals
 
 Chat channels; a public skill marketplace; hosted cloud; heartbeat/"proactive"
