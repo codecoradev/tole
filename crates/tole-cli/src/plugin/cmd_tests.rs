@@ -660,16 +660,17 @@ fn entries_the_ledger_never_saw_are_reported_not_blocked() {
     );
 }
 
-/// #825: revoking one secret of a plain entry approved before grants were
-/// recorded keeps the rest working and puts the entry under the ledger; an
-/// entry that is already under it never has a hand-added grant adopted.
+/// #825, #847: revoking one secret of a plain entry approved before grants
+/// were recorded keeps the rest working. Only the owner at a terminal, shown
+/// what stays, puts the entry under the ledger; a script's revoke only
+/// narrows, so a hand-added grant is never made permanent by it.
 #[test]
-fn revoke_secret_on_a_plain_entry_migrates_it_and_never_adopts_a_hand_added_grant() {
+fn revoke_secret_on_a_plain_entry_is_adopted_only_at_a_terminal_that_shows_what_stays() {
     let h = H::new("plain-revoke", &["a"]);
     h.run(&v1(), approve("a", Some(&hash(&v1())))).unwrap();
-    let one = |secret: &str| PluginAction::Revoke {
+    let one = |secret: &str, hash: Option<String>| PluginAction::Revoke {
         name: "a".into(),
-        hash: Some(hash(&v1())),
+        hash,
         project: false,
         secret: Some(secret.into()),
     };
@@ -677,6 +678,11 @@ fn revoke_secret_on_a_plain_entry_migrates_it_and_never_adopts_a_hand_added_gran
         let mut lock = Lockfile::load(&h.user()).unwrap();
         lock.servers.get_mut("a").unwrap().secrets = s.iter().map(|x| x.to_string()).collect();
         lock.save(&h.user()).unwrap();
+    };
+    let secrets = || {
+        Lockfile::load(&h.user()).unwrap().servers["a"]
+            .secrets
+            .clone()
     };
     let blocked = || gate(&h).entries()["a"].revoked;
     let old_ledger = || {
@@ -686,17 +692,37 @@ fn revoke_secret_on_a_plain_entry_migrates_it_and_never_adopts_a_hand_added_gran
         )
         .unwrap();
     };
-    // A pre-#825 entry with two grants: reported, then migrated by a revoke.
-    set_secrets(&["A_TOKEN", "B_KEY"]);
+    // A pre-#825 entry: the attacker added EVIL_KEY next to A_TOKEN, and runs
+    // a scripted narrowing revoke. It narrows and adopts nothing.
+    set_secrets(&["A_TOKEN", "B_KEY", "EVIL_KEY"]);
     old_ledger();
     assert!(!blocked());
-    h.run(&v1(), one("A_TOKEN")).unwrap();
-    assert_eq!(
-        Lockfile::load(&h.user()).unwrap().servers["a"].secrets,
-        ["B_KEY"]
+    let out = h.run(&v1(), one("A_TOKEN", Some(hash(&v1())))).unwrap();
+    assert!(out.contains("not recorded in your ledger"), "{out}");
+    assert_eq!(secrets(), ["B_KEY", "EVIL_KEY"]);
+    let text = ledger_of(&h);
+    assert!(
+        !text.contains("secret_grant") && !text.contains("EVIL_KEY"),
+        "{text}"
     );
-    let g = gate(&h);
-    assert!(!g.entries()["a"].revoked, "{:?}", g.notes);
+    // Still untracked: the entry keeps working, as before the command.
+    assert!(!blocked());
+    // A terminal with --hash shows nothing to review: it does not adopt either.
+    set_secrets(&["A_TOKEN", "B_KEY", "EVIL_KEY"]);
+    h.go(&|_| v1(), Some(true), one("A_TOKEN", Some(hash(&v1()))))
+        .unwrap();
+    assert!(!ledger_of(&h).contains("secret_grant"));
+    // The owner at a terminal, without --hash, sees what stays and says yes.
+    set_secrets(&["A_TOKEN", "B_KEY"]);
+    h.asked.borrow_mut().clear();
+    h.go(&|_| v1(), Some(true), one("A_TOKEN", None)).unwrap();
+    let q = h.asked.borrow().join("\n");
+    assert!(
+        q.contains("B_KEY") && q.contains("record these grants"),
+        "{q}"
+    );
+    assert_eq!(secrets(), ["B_KEY"]);
+    assert!(!blocked(), "{:?}", gate(&h).notes);
     // Now ledger-tracked: a hand-added grant, or the revoked one, is blocked.
     set_secrets(&["B_KEY", "EVIL_KEY"]);
     assert!(blocked());
@@ -704,9 +730,8 @@ fn revoke_secret_on_a_plain_entry_migrates_it_and_never_adopts_a_hand_added_gran
     assert!(blocked());
     // Revoking from an already tracked entry adopts nothing the ledger lacks.
     set_secrets(&["B_KEY", "EVIL_KEY"]);
-    h.run(&v1(), one("B_KEY")).unwrap();
-    let text = ledger_of(&h);
-    assert!(!text.contains("EVIL_KEY"), "{text}");
+    h.run(&v1(), one("B_KEY", Some(hash(&v1())))).unwrap();
+    assert!(!ledger_of(&h).contains("EVIL_KEY"));
     assert!(blocked());
 }
 
@@ -1488,6 +1513,85 @@ fn a_profile_edited_after_approval_blocks_until_an_owner_at_a_terminal_re_approv
     h.go(&|_| v1(), Some(true), approve("srv", None)).unwrap();
     assert_ne!(lock_entry(&h).sandbox_hash, Some(server_profile_hash()));
     assert_eq!(h.rows(&v1())[0]["state"], json!("approved"));
+}
+
+/// #847: deleting the lock entry must not let a script approve past a
+/// profile the ledger recorded as approved.
+#[test]
+fn a_script_cannot_approve_a_moved_profile_after_the_lock_entry_is_deleted() {
+    let mut h = profiled("prof-nolock");
+    h.run(&v1(), approve("srv", Some(&hash(&v1())))).unwrap();
+    let drop_entry = |h: &H| {
+        let mut lock = Lockfile::load(&h.user()).unwrap();
+        lock.servers.remove("srv");
+        lock.save(&h.user()).unwrap();
+    };
+    h.sandbox.as_mut().unwrap().profile.network = tole_core::sandbox::Network::Host;
+    drop_entry(&h);
+    let e = h
+        .run(&v1(), approve("srv", Some(&hash(&v1()))))
+        .unwrap_err();
+    assert!(e.contains("only an interactive approval"), "{e}");
+    assert!(!Lockfile::load(&h.user())
+        .unwrap()
+        .servers
+        .contains_key("srv"));
+    // The owner at a terminal can accept the changed profile with no entry.
+    h.go(&|_| v1(), Some(true), approve("srv", None)).unwrap();
+    assert_ne!(lock_entry(&h).sandbox_hash, Some(server_profile_hash()));
+    // Unchanged profile, entry deleted: the script's --hash is enough again.
+    drop_entry(&h);
+    h.run(&v1(), approve("srv", Some(&hash(&v1())))).unwrap();
+}
+
+/// #847: an owner's revoke of a SANDBOXED server is undone only at a terminal,
+/// whether the lock entry is kept, deleted, or stripped of its profile; an
+/// unsandboxed one stays re-approvable by a script (nothing was promised).
+#[test]
+fn a_script_cannot_undo_the_revoke_of_a_sandboxed_server_in_any_lock_state() {
+    let script = |h: &H| h.run(&v1(), approve("srv", Some(&hash(&v1()))));
+    let edit = |h: &H, f: &dyn Fn(&mut Lockfile)| {
+        let mut lock = Lockfile::load(&h.user()).unwrap();
+        f(&mut lock);
+        lock.save(&h.user()).unwrap();
+    };
+    let drop_entry: &dyn Fn(&mut Lockfile) = &|l| {
+        l.servers.remove("srv");
+    };
+    let strip: &dyn Fn(&mut Lockfile) = &|l| {
+        let e = l.servers.get_mut("srv").unwrap();
+        e.sandbox = None;
+        e.sandbox_hash = None;
+    };
+    let keep: &dyn Fn(&mut Lockfile) = &|_| {};
+    for (tag, how) in [("kept", keep), ("deleted", drop_entry), ("stripped", strip)] {
+        let h = profiled(&format!("prof-revoke-{tag}"));
+        h.run(&v1(), approve("srv", Some(&hash(&v1())))).unwrap();
+        h.run(&v1(), revoke("srv", Some(&hash(&v1())))).unwrap();
+        // The profile is unchanged: it is the revoke a script cannot undo.
+        edit(&h, how);
+        let e = script(&h).unwrap_err();
+        assert!(e.contains("only an interactive approval"), "{tag}: {e}");
+        assert_ne!(h.rows(&v1())[0]["state"], json!("approved"), "{tag}");
+        // The owner at a terminal can re-approve it, and then a script can
+        // approve again (nothing moved).
+        h.go(&|_| v1(), Some(true), approve("srv", None)).unwrap();
+        assert_eq!(h.rows(&v1())[0]["state"], json!("approved"), "{tag}");
+        h.run(&v1(), approve("srv", Some(&hash(&v1())))).unwrap();
+    }
+    // Unsandboxed: the revoke is undone by a script, entry kept or deleted.
+    for (tag, how) in [("kept", keep), ("deleted", drop_entry)] {
+        let h = H::new(&format!("plain-revoke-{tag}"), &["srv"]);
+        h.run(&v1(), approve("srv", Some(&hash(&v1())))).unwrap();
+        h.run(&v1(), revoke("srv", Some(&hash(&v1())))).unwrap();
+        edit(&h, how);
+        script(&h).unwrap_or_else(|e| panic!("{tag}: {e}"));
+        assert_eq!(h.rows(&v1())[0]["state"], json!("approved"), "{tag}");
+        // And a terminal works the same.
+        h.run(&v1(), revoke("srv", Some(&hash(&v1())))).unwrap();
+        edit(&h, how);
+        h.go(&|_| v1(), Some(true), approve("srv", None)).unwrap();
+    }
 }
 
 #[test]

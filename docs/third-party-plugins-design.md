@@ -382,9 +382,12 @@ each case):
    line without the marker (an entry approved before) cannot vouch for its
    secrets, so such an entry is reported (`LedgerCheck::secrets_unrecorded`,
    a note in `list` and `doctor`), never blocked; it becomes tracked at its
-   next approval or when the owner runs `revoke --secret` on it (which records
-   the grants that stay, and never adopts anything for an entry already
-   tracked). Until then a hand-added secret on such an entry is not detected.
+   next approval or when the owner runs `revoke --secret` on it **at a terminal
+   without `--hash`** (the prompt lists the grants that stay and the ledger
+   records them; nothing is adopted for an entry already tracked). A script's
+   `revoke --secret`, or one with `--hash`, only narrows: it adopts nothing, so
+   it cannot make a hand-added secret permanent (#847). Until then a hand-added
+   secret on such an entry is not detected.
    A hand-edited lock cannot add or restore a
    secret or drop the manifest pin, and an approval starts from no grant. Same residual as before: a process that can
    rewrite both files defeats it.
@@ -427,7 +430,13 @@ the lock is refused.
    ledger is authoritative like for secrets: each approval is followed by a
    `sandbox_profile` line and an entry whose record differs from it is
    blocked. Re-approval is interactive only (a script's `--hash` is refused
-   for a changed profile). *Migration:* an approval from before has no
+   for a changed profile). The move is decided from the ledger even when the
+   lock has no entry for the server (#847), so deleting the entry does not
+   change that. A server the owner REVOKED while it ran in a sandbox profile is
+   re-approved only at a terminal, whatever the lock says (entry kept, edited
+   or deleted) and even with an unchanged profile: a script cannot undo that
+   revoke. A revoked server that ran unsandboxed promised nothing and can still
+   be re-approved by a script with `--hash` (cron and CI approve this way). *Migration:* an approval from before has no
    ledger line and no hash; `LedgerCheck::profile_unrecorded` reports it in
    `list` and `doctor`, never blocks it, and the next `tole plugin approve`
    records the profile.
