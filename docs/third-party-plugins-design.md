@@ -382,9 +382,12 @@ each case):
    line without the marker (an entry approved before) cannot vouch for its
    secrets, so such an entry is reported (`LedgerCheck::secrets_unrecorded`,
    a note in `list` and `doctor`), never blocked; it becomes tracked at its
-   next approval or when the owner runs `revoke --secret` on it (which records
-   the grants that stay, and never adopts anything for an entry already
-   tracked). Until then a hand-added secret on such an entry is not detected.
+   next approval or when the owner runs `revoke --secret` on it **at a terminal
+   without `--hash`** (the prompt lists the grants that stay and the ledger
+   records them; nothing is adopted for an entry already tracked). A script's
+   `revoke --secret`, or one with `--hash`, only narrows: it adopts nothing, so
+   it cannot make a hand-added secret permanent (#847). Until then a hand-added
+   secret on such an entry is not detected.
    A hand-edited lock cannot add or restore a
    secret or drop the manifest pin, and an approval starts from no grant. Same residual as before: a process that can
    rewrite both files defeats it.
@@ -427,7 +430,12 @@ the lock is refused.
    ledger is authoritative like for secrets: each approval is followed by a
    `sandbox_profile` line and an entry whose record differs from it is
    blocked. Re-approval is interactive only (a script's `--hash` is refused
-   for a changed profile). *Migration:* an approval from before has no
+   for a changed profile). The move is decided from the ledger even when the
+   lock has no entry for the server (#847), so deleting the entry does not
+   change that, and neither does a `revoke` before it. Re-approving a revoked
+   server from a script with `--hash` is otherwise allowed (cron and CI can
+   approve this way): the design never required an interactive
+   re-approval after a revoke, only for a changed profile. *Migration:* an approval from before has no
    ledger line and no hash; `LedgerCheck::profile_unrecorded` reports it in
    `list` and `doctor`, never blocks it, and the next `tole plugin approve`
    records the profile.

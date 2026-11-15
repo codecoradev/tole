@@ -764,6 +764,19 @@ fn profile_moved_is_decided_by_the_ledger_and_a_lock_mismatch_is_a_move() {
     assert!(profile_moved(&good, None, "cora", Some(&wide)));
     let none = with_profile(Some("server"), None);
     assert!(!profile_moved(&none, Some(&old), "cora", Some(&wide)));
+    // No lock entry: the ledger's record alone decides (#847).
+    let empty = BTreeMap::new();
+    assert!(!profile_moved(&empty, Some(&ledger), "cora", Some(&ok)));
+    assert!(profile_moved(&empty, Some(&ledger), "cora", Some(&wide)));
+    assert!(profile_moved(&empty, Some(&ledger), "cora", None));
+    assert!(!profile_moved(&empty, Some(&old), "cora", Some(&wide)));
+    assert!(!profile_moved(&empty, None, "cora", Some(&wide)));
+    assert!(!profile_moved(&empty, Some(&ledger), "other", Some(&wide)));
+    // A revoke does not lift it for a deleted entry.
+    let mut revoked = ledger.clone();
+    revoked.push_str(&ledger_line("revoke", "cora", &h, 2));
+    assert!(profile_moved(&empty, Some(&revoked), "cora", Some(&wide)));
+    assert!(!profile_moved(&empty, Some(&revoked), "cora", Some(&ok)));
     // An unsandboxed approval promised nothing.
     let mut unsandboxed = plain_ledger_line("cora", &h, 1);
     unsandboxed.push_str(&profile_ledger_line("cora", None, None, 1));

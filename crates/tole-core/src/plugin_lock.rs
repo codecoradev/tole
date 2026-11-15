@@ -779,6 +779,32 @@ pub fn ledger_profile(ledger: &str, server: &str) -> Option<(Option<String>, Opt
     rec
 }
 
+/// [`ledger_profile`], except that a `revoke` does not clear the record: the
+/// profile of the last approval, revoked or not.
+fn ledger_profile_through_revoke(
+    ledger: &str,
+    server: &str,
+) -> Option<(Option<String>, Option<String>)> {
+    let mut rec = None;
+    for line in ledger.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if v["kind"] != "plugin" || v["server"] != server {
+            continue;
+        }
+        match v["event"].as_str() {
+            Some("approve") => rec = None,
+            Some("sandbox_profile") => {
+                let s = |k: &str| v[k].as_str().map(str::to_string);
+                rec = Some((s("profile"), s("profile_hash")));
+            }
+            _ => {}
+        }
+    }
+    rec
+}
+
 /// The bundle hash the ledger recorded on `server`'s LAST `approve` line:
 /// `None` when the ledger holds no approval of it, `Some(None)` when the last
 /// approval was a plain one (no bundle), `Some(Some(hash))` for a bundle
@@ -813,7 +839,19 @@ pub fn profile_moved(
     live: Option<&crate::sandbox::identity::ProfileId>,
 ) -> bool {
     let Some(e) = lock.get(server) else {
-        return false;
+        // No lock entry (never approved, or deleted by hand): the ledger alone
+        // says what was promised. A recorded profile hash must still equal
+        // the live one, so removing the record cannot approve past a widened
+        // profile. A revoke does not lift it: with the entry kept, a revoked
+        // sandboxed server is refused a script's re-approval too.
+        return ledger
+            .and_then(|text| ledger_profile_through_revoke(text, server))
+            .and_then(|(name, hash)| {
+                hash.map(|h| {
+                    !live.is_some_and(|l| l.hash == h && Some(l.name.as_str()) == name.as_deref())
+                })
+            })
+            .unwrap_or(false);
     };
     if let Some(text) = ledger {
         match ledger_profile(text, server) {
