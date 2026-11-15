@@ -6,20 +6,20 @@
 
 #![cfg(unix)]
 
+#[path = "support/test_dir.rs"]
+mod test_dir;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
+use test_dir::TestDir;
 
 use serde_json::json;
 use tole_core::delegation_report::read_plain_file;
 use tole_core::entry::{EntryType, NewEntry};
 use tole_core::storage::{Commit, JsonlStorage, Storage};
 
-fn tmpdir(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("tole-untrusted-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+fn tmpdir(tag: &str) -> TestDir {
+    TestDir::new(&format!("tole-untrusted-{tag}"))
 }
 
 fn message(text: &str) -> Commit {

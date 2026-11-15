@@ -12,8 +12,7 @@
 
 mod support;
 
-use std::path::PathBuf;
-use support::{live_policy, register, running, skipped, wait_until, workspace};
+use support::{live_policy, register, running, skipped, wait_until, workspace, TestDir};
 use tole_core::mcp::{get_server_prompt_in, live_connections};
 
 const CAP: usize = 3;
@@ -48,7 +47,7 @@ fn a_released_session_stops_its_server_and_the_cap_refuses_the_next() {
 
     // 3. The cap: CAP servers run, the next launch is refused, nothing is
     // evicted, and a released slot is reusable.
-    let wss: Vec<PathBuf> = (1..=CAP + 1)
+    let wss: Vec<TestDir> = (1..=CAP + 1)
         .map(|i| workspace(&format!("lc{i}")))
         .collect();
     let mut held: Vec<_> = wss[..CAP].iter().map(|w| register("cap", w)).collect();

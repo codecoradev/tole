@@ -3,18 +3,18 @@
 //! touched (write-once), and every reader (replay, todo hydration) works on
 //! the fork unchanged because the copied prefix is a plain linear lineage.
 
+#[path = "support/test_dir.rs"]
+mod test_dir;
 use serde_json::json;
+use test_dir::TestDir;
 
 use tole_core::entry::{EntryType, NewEntry};
 use tole_core::state::{Pc, StateTransition};
 use tole_core::storage::{Commit, JsonlStorage, Storage, StorageError};
 use tole_core::todo::TodoState;
 
-fn tmpdir(tag: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("tole-fork-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+fn tmpdir(tag: &str) -> TestDir {
+    TestDir::new(&format!("tole-fork-{tag}"))
 }
 
 fn msg(role: &str, text: &str) -> NewEntry {

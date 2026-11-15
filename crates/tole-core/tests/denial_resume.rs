@@ -3,9 +3,12 @@
 //! `run_turn` (the `resume <id> "<prompt>"` path) settles the parked turn
 //! instead of refusing it. Bare `resume_turn` still replans in place.
 
+#[path = "support/test_dir.rs"]
+mod test_dir;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use test_dir::TestDir;
 use tole_core::approval::{Approver, ToolRequest, Verdict};
 use tole_core::entry::Entry;
 use tole_core::machine::{begin, ReplaySafety};
@@ -82,9 +85,7 @@ fn rig() -> (ToolRegistry, Arc<AtomicUsize>) {
 }
 
 fn tmp(tag: &str) -> JsonlStorage {
-    let d = std::env::temp_dir().join(format!("tole-denial-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
+    let d = TestDir::new(&format!("tole-denial-{tag}"));
     JsonlStorage::create(&d, "s", None).unwrap()
 }
 

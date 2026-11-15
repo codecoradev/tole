@@ -3,12 +3,15 @@
 //! retried (up to 3 retries), `Retry-After` is honored, every retry is a
 //! durable record, and a cancel during a backoff sleep returns promptly.
 
+#[path = "support/test_dir.rs"]
+mod test_dir;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use test_dir::TestDir;
 use tole_core::cancel::CancelToken;
 use tole_core::openai::{OpenAiConfig, OpenAiProvider};
 use tole_core::storage::{JsonlStorage, Storage};
@@ -116,9 +119,7 @@ fn provider(url: String, streaming: bool) -> OpenAiProvider {
 }
 
 fn session(tag: &str) -> JsonlStorage {
-    let dir = std::env::temp_dir().join(format!("tole-478-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = TestDir::new(&format!("tole-478-{tag}"));
     JsonlStorage::create(&dir, tag, None).unwrap()
 }
 

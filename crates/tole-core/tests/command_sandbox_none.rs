@@ -6,8 +6,11 @@
 
 #![cfg(unix)]
 
+#[path = "support/test_dir.rs"]
+mod test_dir;
 use serde_json::json;
 use std::path::PathBuf;
+use test_dir::TestDir;
 use tole_core::jobs::JobStartTool;
 use tole_core::run_command::RunCommandTool;
 use tole_core::sandbox::command::{self, Consumers};
@@ -17,8 +20,7 @@ use tole_core::tool::Tool;
 #[test]
 fn without_a_backend_required_refuses_and_optional_depends_on_who_is_watching() {
     // A PATH that has the programs this test runs but no bwrap.
-    let base = std::env::temp_dir().join(format!("tole-cmd-none-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
+    let base = TestDir::new("tole-cmd-none");
     let (bin, ws) = (base.join("bin"), base.join("ws"));
     for d in [&bin, &ws] {
         std::fs::create_dir_all(d).unwrap();

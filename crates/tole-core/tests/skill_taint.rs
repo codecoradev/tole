@@ -1,7 +1,10 @@
 //! #592: the taint of a session survives a resume, because the registry
 //! folds its tracker over the entries already in the log on the first turn.
 
+#[path = "support/test_dir.rs"]
+mod test_dir;
 use serde_json::{json, Value};
+use test_dir::TestDir;
 use tole_core::entry::Entry;
 use tole_core::provider::{Provider, ProviderError, ProviderOutput};
 use tole_core::skill_draft::TaintTracker;
@@ -55,9 +58,7 @@ fn script(tool: &str) -> Script {
 
 #[test]
 fn a_resumed_session_keeps_the_taint_of_what_it_fetched_before() {
-    let dir = std::env::temp_dir().join(format!("tole-taint-resume-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = TestDir::new("tole-taint-resume");
 
     // Process one fetches from outside.
     let first = TaintTracker::default();
@@ -98,9 +99,7 @@ fn a_resumed_session_keeps_the_taint_of_what_it_fetched_before() {
 
 #[test]
 fn one_registry_reused_across_sessions_tracks_the_session_in_front() {
-    let dir = std::env::temp_dir().join(format!("tole-taint-swap-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = TestDir::new("tole-taint-swap");
     let tracker = TaintTracker::default();
     tracker.mark("webhook");
     let reg = registry(&tracker);
