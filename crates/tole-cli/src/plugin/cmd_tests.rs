@@ -585,6 +585,38 @@ fn a_project_revoke_only_narrows_and_is_recorded_as_such() {
     assert_eq!(h.rows(&v1())[0]["state"], json!("approved"));
 }
 
+/// Makes the ledger next to the user lock a symlink (never followed).
+#[cfg(unix)]
+fn break_ledger(h: &H) -> PathBuf {
+    let ledger = h.user().with_file_name(plugin_lock::LEDGER_FILE);
+    let real = h.dir.join("elsewhere.jsonl");
+    std::fs::write(&real, "").unwrap();
+    std::os::unix::fs::symlink(&real, &ledger).unwrap();
+    ledger
+}
+
+#[cfg(unix)]
+#[test]
+fn approve_and_add_refuse_when_the_ledger_cannot_be_read() {
+    let h = H::new("badledger-write", &["cora"]);
+    let ledger = break_ledger(&h);
+    let e = h
+        .run(&v1(), approve("cora", Some(&hash(&v1()))))
+        .unwrap_err();
+    assert!(e.contains("plugin ledger cannot be read"), "{e}");
+    assert!(
+        e.contains(plugin_lock::LEDGER_FILE) && e.contains("Fix it first"),
+        "{e}"
+    );
+    let e = h.go(&|_| v1(), Some(true), add("srv=true")).unwrap_err();
+    assert!(e.contains("plugin ledger cannot be read"), "{e}");
+    assert!(h.probes.borrow().is_empty(), "nothing was started");
+    assert!(!h.user().exists(), "no approval was written");
+    // Repaired: the same approve goes through. Missing is not an error.
+    std::fs::remove_file(&ledger).unwrap();
+    h.run(&v1(), approve("cora", Some(&hash(&v1())))).unwrap();
+}
+
 #[test]
 fn entries_the_ledger_never_saw_are_reported_not_blocked() {
     let h = H::new("unrecorded", &["a", "b"]);
@@ -931,6 +963,11 @@ fn an_unreadable_ledger_is_said_not_silently_skipped() {
         .notes
         .iter()
         .any(|n| n.contains("plugin ledger unreadable")));
+    let doctor = gate.doctor_lines(&[]).join("\n");
+    assert!(
+        doctor.contains("plugin ledger unreadable") && doctor.contains("`tole plugin approve`"),
+        "{doctor}"
+    );
     // Missing is not an error: there is nothing to compare.
     std::fs::remove_file(&ledger).unwrap();
     let out = h.run(&v1(), LIST).unwrap();
