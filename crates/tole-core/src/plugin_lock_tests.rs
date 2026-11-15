@@ -774,3 +774,17 @@ fn profile_moved_is_decided_by_the_ledger_and_a_lock_mismatch_is_a_move() {
         Some(&wide)
     ));
 }
+
+#[test]
+fn ledger_bundle_is_the_last_approval_and_survives_a_revoke() {
+    let h = manifest_hash(&[]);
+    assert_eq!(ledger_bundle("", "a"), None);
+    let mut l = plain_ledger_line("a", &h, 1);
+    assert_eq!(ledger_bundle(&l, "a"), Some(None));
+    assert_eq!(ledger_bundle(&l, "b"), None);
+    l.push_str(&bundle_ledger_line("approve", "a", &h, "sha256:b1", 2));
+    l.push_str(&ledger_line("revoke", "a", &h, 3));
+    assert_eq!(ledger_bundle(&l, "a"), Some(Some("sha256:b1".to_string())));
+    l.push_str(&plain_ledger_line("a", &h, 4));
+    assert_eq!(ledger_bundle(&l, "a"), Some(None));
+}
