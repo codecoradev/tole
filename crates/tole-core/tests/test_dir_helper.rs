@@ -173,6 +173,15 @@ fn wait_until_looks_once_more_at_the_deadline() {
 fn etxtbsy_failures(rounds: usize, write: impl Fn(&std::path::Path, &str)) -> usize {
     use std::os::unix::process::CommandExt;
     use std::sync::atomic::{AtomicBool, Ordering};
+    /// Stops the forking threads when it drops, also on a panic of the
+    /// writer: `thread::scope` joins them before the panic propagates, so
+    /// they must not wait for a store that never comes.
+    struct StopOnDrop<'a>(&'a AtomicBool);
+    impl Drop for StopOnDrop<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
     let d = TestDir::new("tole-etxtbsy");
     let stop = AtomicBool::new(false);
     let mut busy = 0;
@@ -188,6 +197,7 @@ fn etxtbsy_failures(rounds: usize, write: impl Fn(&std::path::Path, &str)) -> us
                 }
             });
         }
+        let _stop = StopOnDrop(&stop);
         for i in 0..rounds {
             let p = d.join(format!("s{i}"));
             write(&p, "#!/bin/sh\nexit 0\n");
@@ -197,9 +207,19 @@ fn etxtbsy_failures(rounds: usize, write: impl Fn(&std::path::Path, &str)) -> us
                 Err(e) => panic!("exec {}: {e}", p.display()),
             }
         }
-        stop.store(true, Ordering::Relaxed);
     });
     busy
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_failing_stress_run_stops_the_forking_threads_instead_of_hanging() {
+    // The writer panics at once; the forking threads must still end, so the
+    // panic reaches the test instead of the binary hanging.
+    let r = std::panic::catch_unwind(|| {
+        etxtbsy_failures(3, |_, _| panic!("writer failed"));
+    });
+    assert!(r.is_err());
 }
 
 #[cfg(target_os = "linux")]
