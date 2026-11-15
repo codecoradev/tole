@@ -54,9 +54,13 @@ fn no_sandbox_is_refused_without_a_terminal_and_under_a_session() {
         !o.status.success() && out.contains("agent session"),
         "{out}"
     );
-    // `serve` is unattended even at a terminal: the same refusal, before it binds.
-    let out = text(&tole(&b, false, &["--no-sandbox", "serve"]));
-    assert!(out.contains("refused in an unattended run"), "{out}");
+    // `serve` (a `shell-tools` subcommand) is unattended even at a terminal:
+    // the same refusal, before it binds.
+    #[cfg(feature = "shell-tools")]
+    {
+        let out = text(&tole(&b, false, &["--no-sandbox", "serve"]));
+        assert!(out.contains("refused in an unattended run"), "{out}");
+    }
 }
 
 #[test]
