@@ -34,6 +34,12 @@ workflow; the ecosystem-wide standards it follows live in the team knowledge roo
   the test opens), not a sleep of a guessed length. A fixed sleep stays only
   for time that must pass by itself (a whole-second clock tick, a delay that
   is the thing under test).
+- **Scripts a test runs** (#840): write a fake binary or wrapper with
+  `write_executable(path, contents)` (or `copy_executable` for a copied
+  binary), both in `test_dir.rs`, never `std::fs::write` plus
+  `set_permissions(.., 0o755)`. A concurrent `fork()` of another test thread
+  can still hold the write fd, and the `exec` then fails with `ETXTBSY`
+  ("Text file busy"); the helpers return only once no writer is left.
 - **Code review**: every PR gets a Cora review (below) plus maintainer review
   before merge. CI must be green.
 

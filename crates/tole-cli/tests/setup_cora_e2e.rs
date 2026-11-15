@@ -7,7 +7,6 @@
 
 mod common;
 use common::TestDir;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -16,8 +15,7 @@ fn tmpdir(tag: &str) -> TestDir {
 }
 
 fn script(path: &Path, body: &str) {
-    std::fs::write(path, format!("#!/bin/sh\nPATH=/usr/bin:/bin\n{body}")).unwrap();
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    common::write_executable(path, format!("#!/bin/sh\nPATH=/usr/bin:/bin\n{body}"));
 }
 
 /// A fake `cargo` that records its argv and, for `install cora-code`, drops a

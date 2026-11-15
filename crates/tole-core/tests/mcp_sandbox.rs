@@ -85,7 +85,6 @@ fn start(
     data: &Path,
     port: u16,
 ) -> (McpServerConfig, tole_core::tool::ToolRegistry) {
-    use std::os::unix::fs::PermissionsExt;
     std::fs::copy(
         concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/mock_mcp.py"),
         ws.join("mock_mcp.py"),
@@ -93,7 +92,7 @@ fn start(
     .unwrap();
     let wrapper = ws.join("srv.sh");
     let o = out.display();
-    std::fs::write(
+    test_dir::write_executable(
         &wrapper,
         format!(
             "#!/bin/sh\n\
@@ -109,9 +108,7 @@ fn start(
             data = data.display(),
             m = ws.join("mock_mcp.py").display(),
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     let mut cfg = McpServerConfig::parse(&format!("{name}={}", wrapper.display())).unwrap();
     cfg.secret_grant = Some(Vec::new());
     cfg.workspace = Some(ws.to_path_buf());
@@ -257,7 +254,6 @@ fn the_connection_key_carries_the_workspace_only_for_sandboxed_servers() {
 /// session (or any other workspace) only reaches the server started for it.
 #[test]
 fn one_server_name_in_two_workspaces_is_two_servers_that_never_mix() {
-    use std::os::unix::fs::PermissionsExt;
     if skipped().is_some() {
         return;
     }
@@ -270,16 +266,14 @@ fn one_server_name_in_two_workspaces_is_two_servers_that_never_mix() {
         )
         .unwrap();
         let w = ws.join("srv.sh");
-        std::fs::write(
+        test_dir::write_executable(
             &w,
             format!(
                 "#!/bin/sh\ncd \"$(dirname \"$0\")\"\npwd > {o}/marker-$(basename \"$PWD\")\nexec python3 {m} full\n",
                 o = out.display(),
                 m = ws.join("mock_mcp.py").display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&w, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let mut cfg = McpServerConfig::parse(&format!("shared={}", w.display())).unwrap();
         cfg.secret_grant = Some(Vec::new());
         cfg.workspace = Some(ws.to_path_buf());

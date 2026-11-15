@@ -9,7 +9,6 @@ use common::TestDir;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
@@ -120,8 +119,7 @@ fn fixture(tag: &str) -> TestDir {
          *) echo '[]' ;;\n\
          esac\n"
     );
-    std::fs::write(bin.join("uteke"), script).unwrap();
-    std::fs::set_permissions(bin.join("uteke"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    common::write_executable(bin.join("uteke"), script);
     dir
 }
 

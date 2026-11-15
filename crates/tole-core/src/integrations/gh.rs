@@ -607,19 +607,13 @@ mod tests {
         let dir = crate::test_dir::TestDir::new("tole-gh");
         let bin = dir.join("gh");
         let log = dir.join("argv.log");
-        std::fs::write(
+        crate::test_dir::write_executable(
             &bin,
             format!(
                 "#!/bin/sh\necho \"$@\" > {}\necho https://example/pr/1\n",
                 log.display()
             ),
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        );
         let t = GhTool::new("codecoradev/tole").with_bin(&bin);
         let out = t
             .execute(json!({

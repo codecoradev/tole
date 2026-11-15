@@ -530,7 +530,6 @@ mod tests {
     // ---- the gate itself, against a fake `cora hook verify` ---------------
 
     #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
     #[cfg(unix)]
     use std::sync::atomic::AtomicUsize;
 
@@ -546,15 +545,13 @@ mod tests {
     fn fake_cora(tag: &str) -> Fake {
         let dir = crate::test_dir::TestDir::new(&format!("tole-gate-{tag}"));
         let bin = dir.join("cora");
-        std::fs::write(
+        crate::test_dir::write_executable(
             &bin,
             format!(
                 "#!/bin/sh\nd={}\necho x >> \"$d/calls\"\npwd >> \"$d/cwds\"\n[ \"$1 $2\" = \"hook verify\" ] && exit $(cat \"$d/exit\")\nexit 99\n",
                 dir.display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let f = Fake { dir, bin };
         f.exit(0);
         f

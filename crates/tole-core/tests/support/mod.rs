@@ -7,7 +7,8 @@
 mod test_dir;
 #[allow(unused_imports)]
 pub use test_dir::{
-    poll_until, wait_exit, wait_for, wait_until, ChildGuard, TestDir, WorkDir, WAIT,
+    copy_executable, poll_until, wait_exit, wait_for, wait_until, write_executable, ChildGuard,
+    TestDir, WorkDir, WAIT,
 };
 
 use std::path::Path;

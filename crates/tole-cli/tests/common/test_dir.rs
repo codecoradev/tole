@@ -182,6 +182,167 @@ pub fn wait_until(timeout: Duration, what: &str, mut cond: impl FnMut() -> bool)
     wait_for(timeout, what, || cond().then_some(()));
 }
 
+/// Writes `contents` to `path` as an executable (mode 0o755) and returns only
+/// when the script can be exec'd (#840).
+///
+/// The race it removes: the writing thread closes its fd, but a concurrent
+/// `fork()` of another test thread (any `Command::spawn`) may already have
+/// copied it. The child keeps that write fd until its own `exec` (the fd is
+/// `O_CLOEXEC`), and for that moment an `exec` of the script fails with
+/// `ETXTBSY` ("Text file busy"). Renaming or re-chmod-ing does not help (the
+/// inode is the same), and a fixed sleep is a guess. So after writing and
+/// closing, this waits for the fact: no process holds a writable fd to the
+/// file any more. On Linux the kernel answers that exactly (a read lease is
+/// refused while any open file description of the inode can write, including
+/// the copy of a child that is still between `fork` and `exec`, which no
+/// `/proc` scan can see yet); elsewhere the wait is a no-op, those kernels
+/// are not known to hit this.
+///
+/// Use it for every script a test runs; do not combine `std::fs::write` with
+/// `set_permissions(.., 0o755)` by hand.
+#[cfg(unix)]
+#[track_caller]
+pub fn write_executable(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let path = path.as_ref();
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o755)
+            .open(path)
+            .unwrap_or_else(|e| panic!("create {}: {e}", path.display()));
+        f.write_all(contents.as_ref())
+            .unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+        f.flush().unwrap();
+    } // closed here
+      // `mode` is masked by the umask and ignored for an existing file.
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+        .unwrap_or_else(|e| panic!("chmod {}: {e}", path.display()));
+    settle_writes(path);
+}
+
+/// Copies the executable `src` to `dst` (keeping its mode) and returns when
+/// `dst` can be exec'd: the same race as [`write_executable`], for a test
+/// that runs a renamed copy of a binary (#840).
+#[cfg(unix)]
+#[track_caller]
+pub fn copy_executable(src: impl AsRef<Path>, dst: impl AsRef<Path>) {
+    let (src, dst) = (src.as_ref(), dst.as_ref());
+    std::fs::copy(src, dst)
+        .unwrap_or_else(|e| panic!("copy {} to {}: {e}", src.display(), dst.display()));
+    settle_writes(dst);
+}
+
+/// Waits until no open file description of `path` can write (see
+/// [`write_executable`]).
+#[cfg(unix)]
+#[track_caller]
+fn settle_writes(path: &Path) {
+    wait_until(
+        WAIT,
+        &format!("writers of {} to close", path.display()),
+        || writers_gone(path),
+    );
+}
+
+/// True once no open file description of `path` can write. Takes (and at
+/// once drops) a read lease, which Linux refuses with `EAGAIN` while a writer
+/// exists. Where leases are unavailable (`leases-enable=0`, a filesystem
+/// without them) it falls back to scanning `/proc/*/fdinfo`, which is
+/// right except for a child caught mid-`fork`.
+#[cfg(target_os = "linux")]
+fn writers_gone(path: &Path) -> bool {
+    use std::os::fd::AsRawFd;
+    let Ok(f) = std::fs::File::open(path) else {
+        return true;
+    };
+    let fd = f.as_raw_fd();
+    // SAFETY: plain fcntl calls on an fd this function owns.
+    unsafe {
+        if libc::fcntl(fd, libc::F_SETLEASE, libc::F_RDLCK) == 0 {
+            libc::fcntl(fd, libc::F_SETLEASE, libc::F_UNLCK);
+            return true;
+        }
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::EAGAIN) | Some(libc::EBUSY) => false,
+        _ => !has_writer(path),
+    }
+}
+
+/// True when some process still has `path` open for writing, as far as
+/// `/proc` shows.
+#[cfg(target_os = "linux")]
+fn has_writer(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(want) = std::fs::metadata(path) else {
+        return false;
+    };
+    let (dev, ino) = (want.dev(), want.ino());
+    let Ok(procs) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    for proc in procs.flatten() {
+        if !proc
+            .file_name()
+            .to_string_lossy()
+            .bytes()
+            .all(|b| b.is_ascii_digit())
+        {
+            continue;
+        }
+        let Ok(fds) = std::fs::read_dir(proc.path().join("fd")) else {
+            continue; // gone, or not ours
+        };
+        for fd in fds.flatten() {
+            // `metadata` follows the link: same device and inode, whatever
+            // the path the other process opened it by.
+            let Ok(m) = std::fs::metadata(fd.path()) else {
+                continue;
+            };
+            if m.dev() != dev || m.ino() != ino {
+                continue;
+            }
+            let info = proc.path().join("fdinfo").join(fd.file_name());
+            let writable = std::fs::read_to_string(info)
+                .ok()
+                .and_then(|t| {
+                    t.lines()
+                        .find_map(|l| l.strip_prefix("flags:"))
+                        .and_then(|f| u32::from_str_radix(f.trim(), 8).ok())
+                })
+                // O_ACCMODE: 0 read-only, 1 write-only, 2 read-write.
+                .is_none_or(|f| f & 0o3 != 0);
+            if writable {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn writers_gone(_path: &Path) -> bool {
+    true
+}
+
+/// Windows has no `ETXTBSY` and no exec bit: just copy the file.
+#[cfg(not(unix))]
+#[track_caller]
+pub fn copy_executable(src: impl AsRef<Path>, dst: impl AsRef<Path>) {
+    std::fs::copy(src.as_ref(), dst.as_ref()).expect("copy executable");
+}
+
+/// Windows has no `ETXTBSY` and no exec bit: just write the file.
+#[cfg(not(unix))]
+#[track_caller]
+pub fn write_executable(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) {
+    std::fs::write(path.as_ref(), contents).expect("write script");
+}
+
 /// Removes `dir`, retrying after making everything writable (read-only
 /// files and directories) and after a short wait (a child or a scanner that
 /// still holds a file open, mostly on Windows). Never panics.

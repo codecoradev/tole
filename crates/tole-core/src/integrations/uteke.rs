@@ -367,7 +367,7 @@ mod tests {
         let dir = crate::test_dir::TestDir::new("tole-uteke-595");
         let bin = dir.join("uteke");
         let stored = dir.join("stored.md");
-        std::fs::write(
+        crate::test_dir::write_executable(
             &bin,
             format!(
                 "#!/bin/sh
@@ -376,10 +376,7 @@ echo ok
 ",
                 stored.display()
             ),
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let secrets = crate::secrets::SecretSet::collect(
             [(
                 "TOLE_TEST_DOC_TOKEN".to_string(),
@@ -401,19 +398,16 @@ echo ok
     /// A fake uteke that logs its argv, one call per line, and stdin.
     #[cfg(unix)]
     fn fake_uteke(tag: &str, exit: i32) -> (UtekeDocumentTool, crate::test_dir::TestDir) {
-        use std::os::unix::fs::PermissionsExt;
         let dir = crate::test_dir::TestDir::new(&format!("tole-uteke-576-{tag}"));
         let bin = dir.join("uteke");
         let d = dir.display();
-        std::fs::write(
+        crate::test_dir::write_executable(
             &bin,
             format!(
                 "#!/bin/sh\necho \"$*\" >> {d}/argv.log\ncat > /dev/null\n\
                  [ {exit} -ne 0 ] && echo 'parent not found: nope' >&2\nexit {exit}\n"
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let mut t = UtekeDocumentTool::new(None);
         t.bin = bin.display().to_string();
         (t, dir)
