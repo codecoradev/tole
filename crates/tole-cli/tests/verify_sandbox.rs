@@ -313,6 +313,69 @@ fn a_failing_sandboxed_verify_is_a_verify_failure_not_a_refusal() {
     drop(dir);
 }
 
+/// The exit codes `bwrap` and a shell use for their own failures (125, 126,
+/// 127) are the COMMAND's when the command ends with them: `bwrap` reported
+/// the command's exit code, so it is an ordinary failure the model is told
+/// about (three strikes, `verify_failed`), not a refusal.
+#[test]
+fn a_verify_exiting_125_126_or_127_is_a_failure_not_a_refusal() {
+    if !bwrap_works() {
+        return;
+    }
+    for code in [125, 126, 127] {
+        let (dir, ws, home) = project(&format!("exit-{code}"));
+        let r = mission(
+            &ws,
+            &home,
+            "[sandbox.consumers]\nverify = \"required\"\n",
+            &path_env(),
+            &format!("echo out-{code}; exit {code}"),
+        );
+        let why = format!("exit {code}\n{}\n{}", r.stdout, r.stderr);
+        assert_ne!(r.code, 0, "{why}");
+        assert!(r.stdout.contains("status: verify_failed"), "{why}");
+        assert!(!r.stdout.contains("status: verify_refused"), "{why}");
+        assert!(r.stdout.contains("verify failures: 3"), "{why}");
+        assert!(!r.stderr.contains("verify refused"), "{why}");
+        drop(dir);
+    }
+}
+
+/// A command cannot change how it is classified by writing to the launcher's
+/// status descriptor (fd 3). With bubblewrap 0.9.0 the descriptor is closed
+/// inside the sandbox; with a version that leaves it open the command could
+/// write a line, but `bwrap` writes its own `exit-code` last and it wins. Either
+/// way a failing command stays a failure and a passing one passes.
+#[test]
+fn a_verify_writing_to_the_status_descriptor_cannot_change_its_classification() {
+    if !bwrap_works() {
+        return;
+    }
+    let forged =
+        r#"echo '{"exit-code": 0}' >&3 2>/dev/null; echo '{"exit-code": 3}' >&3 2>/dev/null;"#;
+    for (tag, cmd, status, failures) in [
+        ("fail", format!("{forged} exit 3"), "verify_failed", "3"),
+        ("pass", format!("{forged} exit 0"), "complete", "0"),
+    ] {
+        let (dir, ws, home) = project(&format!("fd3-{tag}"));
+        let r = mission(
+            &ws,
+            &home,
+            "[sandbox.consumers]\nverify = \"required\"\n",
+            &path_env(),
+            &cmd,
+        );
+        let why = format!("{tag}\n{}\n{}", r.stdout, r.stderr);
+        assert!(r.stdout.contains(&format!("status: {status}")), "{why}");
+        assert!(
+            r.stdout.contains(&format!("verify failures: {failures}")),
+            "{why}"
+        );
+        assert!(!r.stdout.contains("verify_refused"), "{why}");
+        drop(dir);
+    }
+}
+
 /// A PATH whose `bwrap` is a script: `--version` and the self-test (`... true`)
 /// succeed, so the sandbox looks usable; then `body` runs for every real
 /// launch. With `chmod_after_selftest` the script removes its own execute bit
@@ -458,5 +521,222 @@ fn a_launcher_that_cannot_be_spawned_is_a_refusal() {
         r.stderr
     );
     assert!(r.stdout.contains("verify failures: 0"), "{}", r.stdout);
+    drop(dir);
+}
+
+/// `tole run --on-turnend <gate> "goal"` in `ws` with `user_config`.
+#[cfg(feature = "shell-tools")]
+fn run_with_gate(ws: &Path, home: &Path, user_config: &str, path: &str, gate: &Path) -> Run {
+    std::fs::create_dir_all(home.join("tole")).unwrap();
+    std::fs::write(home.join("tole/config.toml"), user_config).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_tole"))
+        .args(["run", "-s"])
+        .arg(home.join("sessions"))
+        .arg("--workspace")
+        .arg(ws)
+        .arg("--on-turnend")
+        .arg(gate)
+        .arg("do it")
+        .current_dir(ws)
+        .env_clear()
+        .env("PATH", path)
+        .env("TOLE_NO_UPDATE_CHECK", "1")
+        .env("CODECORA_HOME", home)
+        .env("TOLE_BASE_URL", spawn_mock())
+        .env("TOLE_MODEL", "mock-model")
+        .env("TOLE_API_KEY", "sk-test")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run tole");
+    Run {
+        code: out.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&out.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+    }
+}
+
+#[cfg(feature = "shell-tools")]
+fn gate_script(ws: &Path, body: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let gate = ws.join("gate.sh");
+    std::fs::write(&gate, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(&gate, std::fs::Permissions::from_mode(0o755)).unwrap();
+    gate
+}
+
+/// The stop gate with `off` is today's: it runs (here it passes, so the
+/// run finishes), and nothing is protected.
+#[test]
+#[cfg(feature = "shell-tools")]
+fn a_stop_gate_with_the_sandbox_off_is_unchanged() {
+    let (dir, ws, home) = project("gate-off");
+    let gate = gate_script(&ws, "touch gate-ran; echo x > .git/hooks/h; exit 0");
+    let r = run_with_gate(&ws, &home, "", &path_env(), &gate);
+    assert_eq!(r.code, 0, "{}\n{}", r.stdout, r.stderr);
+    assert!(ws.join("gate-ran").exists() && ws.join(".git/hooks/h").exists());
+    drop(dir);
+}
+
+/// A required sandbox that is missing is a DENY of the stop gate: the gate
+/// never ran, the model may not finish on its own say-so, and the run ends
+/// blocked (exit 6) with the reason.
+#[test]
+#[cfg(feature = "shell-tools")]
+fn a_required_stop_gate_without_a_sandbox_blocks_the_turn() {
+    let (dir, ws, home) = project("gate-required");
+    let gate = gate_script(&ws, "touch gate-ran; exit 0");
+    let r = run_with_gate(
+        &ws,
+        &home,
+        "[sandbox.consumers]\nturnend = \"required\"\n",
+        &path_without_bwrap(&dir),
+        &gate,
+    );
+    assert_eq!(
+        r.code, 6,
+        "blocked, not finished: {}\n{}",
+        r.stdout, r.stderr
+    );
+    assert!(
+        r.stderr.contains("stop gate blocked the turn")
+            && r.stderr.contains("sandbox required but unavailable")
+            && r.stderr.contains("sandbox.consumers.turnend"),
+        "{}",
+        r.stderr
+    );
+    assert!(!ws.join("gate-ran").exists(), "the gate never ran");
+    drop(dir);
+}
+
+/// With bubblewrap the gate runs sandboxed and its exit status still passes
+/// the turn.
+#[test]
+#[cfg(feature = "shell-tools")]
+fn a_sandboxed_stop_gate_cannot_write_hooks_and_still_passes_the_turn() {
+    if !bwrap_works() {
+        return;
+    }
+    let (dir, ws, home) = project("gate-bwrap");
+    let gate = gate_script(
+        &ws,
+        "echo ok > gate-made; ! (echo x > .git/hooks/h) 2>/dev/null || { echo hooks writable; exit 1; }",
+    );
+    let r = run_with_gate(
+        &ws,
+        &home,
+        "[sandbox.consumers]\nturnend = \"required\"\n",
+        &path_env(),
+        &gate,
+    );
+    assert_eq!(r.code, 0, "{}\n{}", r.stdout, r.stderr);
+    assert!(ws.join("gate-made").exists());
+    assert!(!ws.join(".git/hooks/h").exists());
+    drop(dir);
+}
+
+/// A launcher that fails is the sandbox's failure, not the gate's verdict: the
+/// turn is still denied (never a pass, exit 6 after the 3-denial cap), but the
+/// reason says the sandbox failed before or while starting the gate, and the
+/// gate never ran.
+#[test]
+#[cfg(feature = "shell-tools")]
+fn a_stop_gate_whose_launcher_fails_is_a_deny_that_says_so() {
+    let (dir, ws, home) = project("gate-launcher");
+    let gate = gate_script(&ws, "touch gate-ran; exit 0");
+    let path = path_with_fake_bwrap(
+        &dir,
+        "echo 'bwrap: setting up uid map: Permission denied' >&2; exit 1",
+        false,
+    );
+    let r = run_with_gate(
+        &ws,
+        &home,
+        "[sandbox.consumers]\nturnend = \"required\"\n",
+        &path,
+        &gate,
+    );
+    assert_eq!(
+        r.code, 6,
+        "denied, never finished: {}\n{}",
+        r.stdout, r.stderr
+    );
+    assert!(
+        r.stderr.contains("stop gate blocked the turn")
+            && r.stderr
+                .contains("the sandbox failed before or while starting the gate")
+            && r.stderr.contains("setting up uid map"),
+        "{}",
+        r.stderr
+    );
+    assert!(!ws.join("gate-ran").exists(), "the gate never ran");
+    drop(dir);
+}
+
+/// A launcher that cannot be spawned after the self-test is a deny too.
+#[test]
+#[cfg(feature = "shell-tools")]
+fn a_stop_gate_whose_launcher_cannot_be_spawned_is_a_deny() {
+    let (dir, ws, home) = project("gate-spawn");
+    let gate = gate_script(&ws, "touch gate-ran; exit 0");
+    let path = path_with_fake_bwrap(&dir, "exit 1", true);
+    let r = run_with_gate(
+        &ws,
+        &home,
+        "[sandbox.consumers]\nturnend = \"required\"\n",
+        &path,
+        &gate,
+    );
+    assert_eq!(r.code, 6, "{}\n{}", r.stdout, r.stderr);
+    assert!(
+        r.stderr.contains("the sandbox did not start"),
+        "{}",
+        r.stderr
+    );
+    assert!(!ws.join("gate-ran").exists());
+    drop(dir);
+}
+
+/// A gate that really exits 125, 126 or 127 is an ordinary deny with its own
+/// output (the exit codes are the gate's, `bwrap` reported them), and one that
+/// exits 0 passes even when it writes to the status descriptor.
+#[test]
+#[cfg(feature = "shell-tools")]
+fn a_sandboxed_gate_exiting_125_126_127_is_its_own_verdict() {
+    if !bwrap_works() {
+        return;
+    }
+    for code in [125, 126, 127] {
+        let (dir, ws, home) = project(&format!("gate-exit-{code}"));
+        let gate = gate_script(&ws, &format!("echo gate-said-{code}; exit {code}"));
+        let r = run_with_gate(
+            &ws,
+            &home,
+            "[sandbox.consumers]\nturnend = \"required\"\n",
+            &path_env(),
+            &gate,
+        );
+        assert_eq!(r.code, 6, "{code}: {}\n{}", r.stdout, r.stderr);
+        assert!(
+            r.stderr.contains(&format!("gate-said-{code}"))
+                && !r.stderr.contains("the sandbox failed"),
+            "{code}: the gate's own output, not a launcher failure: {}",
+            r.stderr
+        );
+        drop(dir);
+    }
+    let (dir, ws, home) = project("gate-fd3");
+    let gate = gate_script(
+        &ws,
+        r#"echo '{"exit-code": 3}' >&3 2>/dev/null; echo ok > gate-made; exit 0"#,
+    );
+    let r = run_with_gate(
+        &ws,
+        &home,
+        "[sandbox.consumers]\nturnend = \"required\"\n",
+        &path_env(),
+        &gate,
+    );
+    assert_eq!(r.code, 0, "{}\n{}", r.stdout, r.stderr);
+    assert!(ws.join("gate-made").exists());
     drop(dir);
 }

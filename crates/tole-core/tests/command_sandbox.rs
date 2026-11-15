@@ -64,6 +64,7 @@ fn setup() -> &'static Setup {
             run_command: Mode::Required,
             job_start: Mode::Required,
             verify: Mode::Required,
+            turnend: Mode::Off,
             network: Network::None,
             limits: LIMITS,
         })

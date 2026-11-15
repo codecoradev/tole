@@ -753,8 +753,8 @@ fn limits_are_bounded() {
 fn the_default_consumers_are_all_off_with_no_network() {
     let c = Consumers::default();
     assert_eq!(
-        (c.run_command, c.job_start, c.verify),
-        (Mode::Off, Mode::Off, Mode::Off)
+        (c.run_command, c.job_start, c.verify, c.turnend),
+        (Mode::Off, Mode::Off, Mode::Off, Mode::Off)
     );
     assert_eq!(c.network, Network::None);
     assert_eq!(consumers(), c, "nothing set: everything off");
@@ -764,12 +764,13 @@ fn the_default_consumers_are_all_off_with_no_network() {
 fn doctor_says_what_is_there_and_that_off_is_off() {
     let off = doctor_lines(&Consumers::default(), &usable());
     assert!(off[0].contains("run_command off, job_start off"), "{off:?}");
-    assert!(off[0].contains("verify off"), "{off:?}");
+    assert!(off[0].contains("verify off, turnend off"), "{off:?}");
     // Only what is still not a consumer is called unsandboxed.
     let last = off.last().unwrap();
     assert!(
-        last.contains("turnend, cron scripts and deliveries are not sandboxed yet")
-            && !last.contains("verify"),
+        last.contains("cron scripts and deliveries are not sandboxed yet")
+            && !last.contains("verify")
+            && !last.contains("turnend"),
         "{off:?}"
     );
     assert!(!off.iter().any(|l| l.contains("ERROR")));
@@ -800,13 +801,14 @@ fn doctor_says_what_is_there_and_that_off_is_off() {
     assert!(!l.iter().any(|x| x.contains("ERROR")));
 }
 
-// Slice 2 (#748): the mission `--verify` command.
+// Slice 2 (#748): the mission `--verify` command and the stop gates.
 
 fn all(mode: Mode) -> Consumers {
     Consumers {
         run_command: mode,
         job_start: mode,
         verify: mode,
+        turnend: mode,
         ..Consumers::default()
     }
 }
@@ -814,13 +816,14 @@ fn all(mode: Mode) -> Consumers {
 #[test]
 fn consumer_names_are_the_config_and_secrets_keys() {
     let names: Vec<_> = Consumer::ALL.iter().map(|k| k.name()).collect();
-    assert_eq!(names, ["run_command", "job_start", "verify"]);
+    assert_eq!(names, ["run_command", "job_start", "verify", "turnend"]);
     assert_eq!(Consumer::Verify.name(), crate::secret_release::VERIFY);
+    assert_eq!(Consumer::TurnEnd.name(), crate::secret_release::TURNEND);
 }
 
 #[test]
-fn verify_has_its_own_mode() {
-    let c = Consumers {
+fn verify_and_turnend_have_their_own_mode() {
+    let mut c = Consumers {
         verify: Mode::Required,
         ..Consumers::default()
     };
@@ -837,53 +840,58 @@ fn verify_has_its_own_mode() {
         CommandLaunch::Sandboxed { .. }
     ));
     assert_eq!(
-        plan(&c, &usable(), false, Consumer::RunCommand),
+        plan(&c, &usable(), false, Consumer::TurnEnd),
         CommandLaunch::Direct { warning: None },
-        "run_command stays off while verify is on"
+        "turnend stays off while verify is on"
     );
+    c.turnend = Mode::Optional;
+    assert!(matches!(
+        plan(&c, &usable(), false, Consumer::TurnEnd),
+        CommandLaunch::Sandboxed { .. }
+    ));
 }
 
-/// Every hardening flag of the command profile is on for verify too: the
-/// same argv as a `run_command` of that program.
+/// Every hardening flag of the command profile is on for the two new
+/// consumers too: the same argv as a `run_command` of that program.
 #[test]
-fn verify_gets_the_same_hardening_as_run_command() {
+fn verify_and_turnend_get_the_same_hardening_as_run_command() {
     let ws = tmp("slice2-flags");
     let c = all(Mode::Required);
     let base = argv(&c, Consumer::RunCommand, &env_in(&ws), &sh_args());
-    let a = argv(&c, Consumer::Verify, &env_in(&ws), &sh_args());
-    assert_eq!(a, base, "one profile for every command");
-    for flag in [
-        "--unshare-all",
-        "--unshare-user",
-        "--disable-userns",
-        "--new-session",
-        "--die-with-parent",
-    ] {
-        assert!(a.contains(&flag.to_string()), "{flag}");
+    for k in [Consumer::Verify, Consumer::TurnEnd] {
+        let a = argv(&c, k, &env_in(&ws), &sh_args());
+        assert_eq!(a, base, "{k:?}: one profile for every command");
+        for flag in [
+            "--unshare-all",
+            "--unshare-user",
+            "--disable-userns",
+            "--new-session",
+            "--die-with-parent",
+        ] {
+            assert!(a.contains(&flag.to_string()), "{k:?}: {flag}");
+        }
+        assert!(has(&a, &["--cap-drop", "ALL"]), "{k:?}");
+        assert!(!a.contains(&"--share-net".to_string()), "{k:?}: no network");
+        let w = ws.display().to_string();
+        assert!(has(&a, &["--bind", &w, &w]), "{k:?}: writable workspace");
     }
-    assert!(has(&a, &["--cap-drop", "ALL"]));
-    assert!(!a.contains(&"--share-net".to_string()), "no network");
-    let w = ws.display().to_string();
-    assert!(has(&a, &["--bind", &w, &w]), "writable workspace");
 }
 
 #[test]
-fn verify_protects_hooks_config_and_tole_dir() {
+fn verify_and_turnend_protect_hooks_config_and_tole_dir() {
     let ws = tmp("slice2-protect");
     for d in [".git/hooks", ".tole"] {
         std::fs::create_dir_all(ws.join(d)).unwrap();
     }
     std::fs::write(ws.join(".git/config"), "[core]\n").unwrap();
     let ws = std::fs::canonicalize(&*ws).unwrap();
-    let a = argv(
-        &all(Mode::Required),
-        Consumer::Verify,
-        &env_in(&ws),
-        &sh_args(),
-    );
-    for rel in PROTECTED {
-        let p = ws.join(rel).display().to_string();
-        assert!(has(&a, &["--ro-bind", &p, &p]), "{rel} read-only");
+    let c = all(Mode::Required);
+    for k in [Consumer::Verify, Consumer::TurnEnd] {
+        let a = argv(&c, k, &env_in(&ws), &sh_args());
+        for rel in PROTECTED {
+            let p = ws.join(rel).display().to_string();
+            assert!(has(&a, &["--ro-bind", &p, &p]), "{k:?}: {rel} read-only");
+        }
     }
 }
 
@@ -904,49 +912,144 @@ fn the_verify_command_is_sh_dash_c_with_the_string_as_one_argument() {
 }
 
 #[test]
-fn a_mission_is_unattended_so_optional_verify_is_required() {
+fn a_mission_and_a_stop_gate_are_unattended_so_optional_is_required() {
     assert!(Consumer::Verify.always_unattended());
+    assert!(Consumer::TurnEnd.always_unattended());
     for k in [Consumer::RunCommand, Consumer::JobStart] {
         assert!(
             !k.always_unattended(),
-            "{k:?}: only verify runs in a mission"
+            "{k:?}: only verify and the stop gates have nobody to answer"
         );
     }
-    // `launch_command` passes `true` for verify, and then a missing sandbox
-    // refuses even for `optional`.
+    // `launch_command` passes `true` for them, and then a missing sandbox
+    // refuses even for `optional`, which `run_command` would run unsandboxed
+    // with a human attached.
     let c = all(Mode::Optional);
-    let CommandLaunch::Refused(why) = plan(&c, &gone(), true, Consumer::Verify) else {
-        panic!("optional verify without a sandbox must refuse")
-    };
-    assert!(
-        why.starts_with("verify: ") && why.contains("unattended"),
-        "{why}"
-    );
-}
-
-#[test]
-fn required_verify_without_a_backend_refuses_naming_the_key() {
-    let c = all(Mode::Required);
-    for unattended in [false, true] {
-        let CommandLaunch::Refused(why) = plan(&c, &gone(), unattended, Consumer::Verify) else {
-            panic!("must refuse")
+    for k in [Consumer::Verify, Consumer::TurnEnd] {
+        let CommandLaunch::Refused(why) = plan(&c, &gone(), true, k) else {
+            panic!("optional {k:?} without a sandbox must refuse")
         };
-        assert!(why.contains("sandbox.consumers.verify"), "{why}");
         assert!(
-            why.contains("no bwrap") && why.contains("install bubblewrap"),
+            why.starts_with(&format!("{}: ", k.name())) && why.contains("unattended"),
             "{why}"
         );
     }
 }
 
 #[test]
-fn doctor_lists_verify_and_fails_for_it_without_a_sandbox() {
+fn required_verify_and_turnend_without_a_backend_refuse_naming_the_key() {
+    let c = all(Mode::Required);
+    for k in [Consumer::Verify, Consumer::TurnEnd] {
+        for unattended in [false, true] {
+            let CommandLaunch::Refused(why) = plan(&c, &gone(), unattended, k) else {
+                panic!("{k:?} must refuse")
+            };
+            assert!(
+                why.contains(&format!("sandbox.consumers.{}", k.name())),
+                "{why}"
+            );
+            assert!(
+                why.contains("no bwrap") && why.contains("install bubblewrap"),
+                "{why}"
+            );
+        }
+    }
+}
+
+#[test]
+fn an_optional_stop_gate_falls_back_only_when_a_human_is_attached() {
+    let c = all(Mode::Optional);
+    assert!(matches!(
+        plan(&c, &gone(), false, Consumer::TurnEnd),
+        CommandLaunch::Direct { warning: Some(_) }
+    ));
+    assert!(matches!(
+        plan(&c, &gone(), true, Consumer::TurnEnd),
+        CommandLaunch::Refused(_)
+    ));
+}
+
+/// The stop gate is a program path or name; the tools take a bare name.
+#[cfg(unix)]
+#[test]
+fn a_stop_gate_may_be_a_path_and_the_tools_may_not() {
+    let ws = tmp("slice2-path-ws");
+    let bin = tmp("slice2-path-bin");
+    let gate = script(&bin, "gate.sh");
+    std::fs::create_dir_all(ws.join("tools")).unwrap();
+    script(&ws.join("tools"), "mine.sh");
+    let ws = std::fs::canonicalize(&*ws).unwrap();
+    let c = all(Mode::Required);
+    let run = |k, prog: &str| plan_command(&c, &usable(), false, &env_in(&ws), k, (prog, &[]));
+    let argv_of = |l: CommandLaunch| match l {
+        CommandLaunch::Sandboxed { args, .. } => args
+            .iter()
+            .map(|x| x.to_string_lossy().into_owned())
+            .collect::<Vec<_>>(),
+        other => panic!("{other:?}"),
+    };
+    // An absolute path outside the system dirs: its dir read-only, run by path.
+    let a = argv_of(run(Consumer::TurnEnd, &gate.display().to_string()));
+    let b = std::fs::canonicalize(&*bin).unwrap().display().to_string();
+    assert!(has(&a, &["--ro-bind-try", &b, &b]), "{a:?}");
+    assert_eq!(a.last().unwrap(), &format!("{b}/gate.sh"));
+    // A relative path is the workspace's, not rebound.
+    let a = argv_of(run(Consumer::TurnEnd, "./tools/mine.sh"));
+    let w = ws.display().to_string();
+    assert_eq!(a.last().unwrap(), &format!("{w}/tools/mine.sh"));
+    let t = format!("{w}/tools");
+    assert!(!has(&a, &["--ro-bind-try", &t, &t]));
+    // A system program by path.
+    assert!(matches!(
+        run(Consumer::TurnEnd, "/bin/sh"),
+        CommandLaunch::Sandboxed { .. }
+    ));
+    // Not an executable file, or missing: refused in every mode.
+    for bad in ["/nonexistent/dir/x", "./tools/none.sh", "./tools"] {
+        let CommandLaunch::Refused(why) = run(Consumer::TurnEnd, bad) else {
+            panic!("{bad}: must refuse")
+        };
+        assert!(why.contains("not an executable file"), "{bad}: {why}");
+    }
+    // The other consumers still take a bare name only.
+    for k in [Consumer::RunCommand, Consumer::JobStart, Consumer::Verify] {
+        let CommandLaunch::Refused(why) = run(k, &gate.display().to_string()) else {
+            panic!("{k:?}: a path must refuse")
+        };
+        assert!(why.contains("bare name"), "{why}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_stop_gate_in_home_is_refused_not_bound() {
+    let ws = tmp("slice2-home-ws");
+    let home = tmp("slice2-home");
+    let gate = script(&home, "gate.sh");
+    let mut env = env_in(&ws);
+    env.home = Some(home.to_path_buf());
+    let CommandLaunch::Refused(why) = plan_command(
+        &all(Mode::Required),
+        &usable(),
+        false,
+        &env,
+        Consumer::TurnEnd,
+        (&gate.display().to_string(), &[]),
+    ) else {
+        panic!("a gate that lives in $HOME itself cannot be granted")
+    };
+    assert!(why.contains("$HOME"), "{why}");
+}
+
+#[test]
+fn doctor_lists_verify_and_turnend_and_fails_for_a_required_one_without_a_sandbox() {
     let mut c = Consumers {
         verify: Mode::Required,
+        turnend: Mode::Optional,
         ..Consumers::default()
     };
     let l = doctor_lines(&c, &usable());
-    assert!(l[0].contains("verify required"), "{l:?}");
+    assert!(l[0].contains("verify required, turnend optional"), "{l:?}");
     assert!(!l.iter().any(|x| x.contains("ERROR")), "{l:?}");
     let l = doctor_lines(&c, &gone());
     assert!(
@@ -955,8 +1058,16 @@ fn doctor_lists_verify_and_fails_for_it_without_a_sandbox() {
                 && x.contains("refused (required)")),
         "{l:?}"
     );
+    // An optional stop gate cannot fall back either: nobody answers while the
+    // model is finishing.
+    assert!(
+        l.iter()
+            .any(|x| x.starts_with("sandbox consumers: ERROR turnend") && x.contains("unattended")),
+        "{l:?}"
+    );
     // An optional verify cannot fall back: a mission is unattended.
     c.verify = Mode::Optional;
+    c.turnend = Mode::Off;
     let l = doctor_lines(&c, &gone());
     assert!(
         l.iter()
@@ -985,37 +1096,69 @@ fn the_launcher_report_has_an_exit_code_only_when_the_command_ended() {
 }
 
 #[test]
-fn doctor_warns_when_verify_needs_a_toolchain_the_sandbox_cannot_see() {
+fn doctor_warns_when_verify_or_a_gate_needs_a_toolchain_the_sandbox_cannot_see() {
     let home = tmp("toolchain-home");
     let c = Consumers {
         verify: Mode::Required,
         ..Consumers::default()
     };
-    let lines = |h: Option<&Path>| doctor_lines_for(&c, &usable(), h);
+    let lines = |c: &Consumers, h: Option<&Path>| doctor_lines_for(c, &usable(), h);
+    // The exact notes: no run of spaces where a line continuation was meant.
+    let note = |names: &str| {
+        format!(
+            "sandbox consumers: a sandboxed command ({names}) can also fail deterministically \
+             for lack of network (network none unless the owner wrote host) or under the \
+             address-space limit (memory_mb); the model is told to fix it like any failure"
+        )
+    };
+    let warning = |names: &str, dirs: &str| {
+        format!(
+            "sandbox consumers: WARNING sandboxed {names}: {dirs} exist but are not visible \
+             inside the sandbox ($HOME is absent), so a command that needs them (cargo, \
+             rustc) fails every time, for example with exit 127, and uses up the three \
+             strikes of a verify or the three denials of a stop gate"
+        )
+    };
     // No toolchain dir: no warning, but the plain note about deterministic
     // failures stays (network, address space).
-    let l = lines(Some(&home));
-    assert!(!l.iter().any(|x| x.contains("WARNING verify")), "{l:?}");
-    assert!(
-        l.iter()
-            .any(|x| x.contains("fail deterministically") && x.contains("network")),
-        "{l:?}"
-    );
+    let l = lines(&c, Some(&home));
+    assert!(!l.iter().any(|x| x.contains("WARNING sandboxed")), "{l:?}");
+    assert!(l.contains(&note("verify")), "{l:?}");
     std::fs::create_dir_all(home.join(".cargo/bin")).unwrap();
     std::fs::create_dir_all(home.join(".rustup")).unwrap();
-    let l = lines(Some(&home));
-    let w = l
-        .iter()
-        .find(|x| x.starts_with("sandbox consumers: WARNING verify"))
-        .unwrap_or_else(|| panic!("{l:?}"));
-    assert!(
-        w.contains(".cargo/bin") && w.contains(".rustup") && w.contains("three strikes"),
-        "{w}"
+    let dirs = format!(
+        "{}, {}",
+        home.join(".cargo/bin").display(),
+        home.join(".rustup").display()
     );
+    let l = lines(&c, Some(&home));
+    assert!(l.contains(&warning("verify", &dirs)), "{l:?}");
+    assert!(l.contains(&note("verify")), "{l:?}");
+    for x in &l {
+        assert!(!x.contains("  "), "a run of spaces in {x:?}");
+    }
     assert!(!l.iter().any(|x| x.contains("ERROR")), "a warning only");
-    // Verify off: nothing to say about it.
-    let off = doctor_lines_for(&Consumers::default(), &usable(), Some(&home));
-    assert!(!off.iter().any(|x| x.contains("WARNING verify")), "{off:?}");
+    // The stop gates have the same problem, and the lines name them.
+    let both = Consumers {
+        verify: Mode::Required,
+        turnend: Mode::Required,
+        ..Consumers::default()
+    };
+    let l = lines(&both, Some(&home));
+    assert!(l.contains(&warning("verify and turnend", &dirs)), "{l:?}");
+    let gate = Consumers {
+        turnend: Mode::Required,
+        ..Consumers::default()
+    };
+    let l = lines(&gate, Some(&home));
+    assert!(l.contains(&warning("turnend", &dirs)), "{l:?}");
+    assert!(l.contains(&note("turnend")), "{l:?}");
+    // Both off: nothing to say about them.
+    let off = lines(&Consumers::default(), Some(&home));
+    assert!(
+        !off.iter().any(|x| x.contains("WARNING sandboxed")),
+        "{off:?}"
+    );
 }
 
 // Nested gitdirs (#849 follow-up): what the plan names, and what it refuses.

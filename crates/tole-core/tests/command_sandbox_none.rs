@@ -2,7 +2,7 @@
 //! sandbox, end to end through the real tools. A PATH without `bwrap` makes
 //! the backend unavailable (this is also what macOS and Windows get), so this
 //! file needs no bubblewrap and runs everywhere unix. `run_command` is
-//! `optional`, `job_start` is `required`.
+//! `optional`, `job_start` is `required`, verify and turnend are `optional`.
 
 #![cfg(unix)]
 
@@ -39,6 +39,7 @@ fn without_a_backend_required_refuses_and_optional_depends_on_who_is_watching() 
         run_command: Mode::Optional,
         job_start: Mode::Required,
         verify: Mode::Optional,
+        turnend: Mode::Optional,
         ..Consumers::default()
     })
     .unwrap();
@@ -68,18 +69,33 @@ fn without_a_backend_required_refuses_and_optional_depends_on_who_is_watching() 
     );
 
     // Slice 2 (#748). The mission `--verify` command is always unattended:
-    // `optional` refuses it even with a human at the terminal, the cause names
-    // the remedy, and the command never ran.
-    let ran = ws.join("verify-ran");
-    let e = command::command_for(
+    // `optional` refuses it even with a human at the terminal, and the cause
+    // names the remedy. The stop gate is `optional` too and just as
+    // unattended (nobody answers while the model finishes): refused as a DENY
+    // (a non-zero exit with the reason), never a pass, and the gate never ran.
+    std::env::set_current_dir(&ws).unwrap();
+    let gate_ran = ws.join("gate-ran");
+    let Err(e) = command::command_in_cwd(
         command::Consumer::Verify,
-        &ws,
         "sh",
-        &["-c".into(), format!("touch {}", ran.display())],
-    )
-    .unwrap_err();
+        &["-c".into(), format!("touch {}", gate_ran.display())],
+    ) else {
+        panic!("an optional verify without a sandbox must refuse")
+    };
     assert!(e.starts_with("verify: ") && e.contains("unattended"), "{e}");
-    assert!(!ran.exists());
+    let gate = ws.join("gate.sh");
+    std::fs::write(&gate, format!("#!/bin/sh\ntouch {}\n", gate_ran.display())).unwrap();
+    std::fs::set_permissions(&gate, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let hook = tole_core::hooks::turnend_hook(&gate.display().to_string());
+    let (code, why) = hook.run_raw(&json!({"event": "turnend"})).unwrap();
+    assert_eq!(code, tole_core::hooks::SANDBOX_REFUSED, "{why}");
+    assert!(
+        why.starts_with("turnend: no sandbox")
+            && why.contains("unattended")
+            && why.contains("sandbox.consumers.turnend"),
+        "{why}"
+    );
+    assert!(!gate_ran.exists(), "a refused gate and verify never ran");
 
     // Unattended (serve, cron): optional counts as required.
     sandbox::mark_unattended();

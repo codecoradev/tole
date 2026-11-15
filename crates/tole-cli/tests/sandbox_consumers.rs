@@ -59,18 +59,17 @@ fn doctor_says_model_commands_are_unsandboxed_by_default() {
         "{out}"
     );
     assert!(
-        l[0].contains("verify off"),
-        "verify is a consumer now: {out}"
+        l[0].contains("verify off, turnend off"),
+        "verify and turnend are consumers now: {out}"
     );
     assert!(
         l.iter()
-            .any(|x| x.contains("turnend, cron scripts and deliveries")
-                && x.contains("not sandboxed yet")),
+            .any(|x| x.contains("cron scripts and deliveries") && x.contains("not sandboxed yet")),
         "{out}"
     );
     assert!(
         !l.iter()
-            .any(|x| x.contains("verify,") && x.contains("not sandboxed yet")),
+            .any(|x| x.contains("verify, turnend") && x.contains("not sandboxed yet")),
         "{out}"
     );
     assert!(!out.contains("sandbox consumers: ERROR"), "{out}");
@@ -127,7 +126,7 @@ fn config_check_shows_the_keys_and_rejects_bad_values() {
         "network = \"any\"",
         "memory_mb = 1",
         "verify = \"always\"",
-        "turnend = \"required\"",
+        "cron = \"required\"",
     ] {
         let o = tole(
             Some(&format!("[sandbox.consumers]\n{bad}\n")),
@@ -137,7 +136,7 @@ fn config_check_shows_the_keys_and_rejects_bad_values() {
         let err = text(&o.stderr);
         assert!(
             err.contains("config.toml")
-                && (err.contains("sandbox.consumers") || err.contains("unknown field `turnend`")),
+                && (err.contains("sandbox.consumers") || err.contains("unknown field `cron`")),
             "{bad}: {err}"
         );
     }
@@ -171,16 +170,18 @@ fn a_project_config_cannot_set_consumers() {
     );
 }
 
-/// Slice 2: `verify` is a consumer. A required one with no sandbox fails the
-/// doctor; an optional one fails it too (a mission is unattended, so optional
-/// counts as required).
+/// Slice 2: `verify` and `turnend` are consumers. A required one with no
+/// sandbox fails the doctor; so does an optional stop gate or `verify` (both
+/// run unattended, so optional is required).
 #[test]
-fn doctor_covers_verify() {
-    let (code, out) = doctor(Some("[sandbox.consumers]\nverify = \"required\"\n"));
+fn doctor_covers_verify_and_turnend() {
+    let (code, out) = doctor(Some(
+        "[sandbox.consumers]\nverify = \"required\"\nturnend = \"optional\"\n",
+    ));
     assert_ne!(code, Some(0), "required verify cannot run: {out}");
     let l = line(&out, "sandbox consumers:");
     assert!(
-        l[0].contains("verify required") && l[0].contains("network none"),
+        l[0].contains("verify required, turnend optional") && l[0].contains("network none"),
         "{out}"
     );
     assert!(
@@ -188,6 +189,19 @@ fn doctor_covers_verify() {
             .any(|x| x.contains("ERROR verify") && x.contains("refused (required)")),
         "{out}"
     );
+    assert!(
+        l.iter()
+            .any(|x| x.contains("ERROR turnend") && x.contains("unattended")),
+        "{out}"
+    );
+
+    let (code, out) = doctor(Some("[sandbox.consumers]\nturnend = \"optional\"\n"));
+    assert_ne!(
+        code,
+        Some(0),
+        "an optional stop gate cannot fall back: {out}"
+    );
+    assert!(out.contains("sandbox consumers: ERROR turnend"), "{out}");
 
     let (code, out) = doctor(Some("[sandbox.consumers]\nverify = \"optional\"\n"));
     assert_ne!(code, Some(0), "{out}");
@@ -198,15 +212,17 @@ fn doctor_covers_verify() {
 }
 
 #[test]
-fn config_check_shows_the_verify_key() {
+fn config_check_shows_the_verify_and_turnend_keys() {
     let o = tole(
-        Some("[sandbox.consumers]\nverify = \"required\"\n"),
+        Some("[sandbox.consumers]\nverify = \"required\"\nturnend = \"optional\"\n"),
         &["config", "check"],
     );
     let out = text(&o.stdout);
     assert!(o.status.success(), "{out} {}", text(&o.stderr));
-    assert!(
-        out.contains("sandbox.consumers.verify = \"required\"  [user config]"),
-        "{out}"
-    );
+    for want in [
+        "sandbox.consumers.verify = \"required\"  [user config]",
+        "sandbox.consumers.turnend = \"optional\"  [user config]",
+    ] {
+        assert!(out.contains(want), "{want} in {out}");
+    }
 }
