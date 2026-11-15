@@ -1133,6 +1133,10 @@ fn dispatch(cli: Cli) -> Result<()> {
     if let Some(msg) = settings.effort_error() {
         anyhow::bail!(msg);
     }
+    if let Some(msg) = settings.discussion_timeout_error() {
+        anyhow::bail!(msg);
+    }
+    config_apply::install_discussion_timeout(&settings.request_timeout);
     config_apply::install_effort(settings.reasoning_effort.as_ref().map(|e| e.value.clone()));
     // A config `review_gate` reaches the roster the same way the flag does:
     // as the env var (child agents inherit it). Flag and env already won
@@ -2129,10 +2133,15 @@ fn discuss_command(action: DiscussAction, cfg: Option<&tole_cli::config::Config>
                 tole_cli::discussion_host::factory(
                     tole_core::openai::OpenAiConfig::new("http://127.0.0.1:1/v1", "dry", "dry"),
                     secrets.clone(),
+                    tole_cli::config_apply::discussion_timeout(),
                 )
             } else {
                 let pc = tole_cli::turn_runner::provider_config().map_err(anyhow::Error::msg)?;
-                tole_cli::discussion_host::factory(pc, secrets.clone())
+                tole_cli::discussion_host::factory(
+                    pc,
+                    secrets.clone(),
+                    tole_cli::config_apply::discussion_timeout(),
+                )
             };
             let env = discuss::Env {
                 dir: &dir,
