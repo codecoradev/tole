@@ -703,14 +703,22 @@ pub fn check_against_ledger(lock: &BTreeMap<String, LockEntry>, ledger: &str) ->
         }
     }
     let mut out = LedgerCheck::default();
-    if last.is_empty() {
-        return out;
-    }
     for (name, e) in lock {
         if e.revoked {
             continue;
         }
         let blocked = |why: &str| (name.clone(), why.to_string());
+        let held = |s: &String| granted.get(name).is_some_and(|g| g.contains(s));
+        // The ledger is the authority for the bundle record and the grants,
+        // so both are compared in BOTH directions: a lock that drops the
+        // `bundle` field (and with it the manifest pin), adds one the ledger
+        // never approved, or (for a bundle approval) holds a secret the ledger
+        // does not show as granted is not trusted, whatever else it says.
+        let approved_bundle = |b: &Option<String>| match (&e.bundle, b) {
+            (Some(r), Some(h)) => &r.hash == h,
+            (None, None) => true,
+            _ => false,
+        };
         match last.get(name) {
             Some((ev, _, _)) if ev == "revoke" => out.blocked.push(blocked(
                 "the ledger's last decision for it is a revoke, but the lock says approved \
@@ -720,31 +728,26 @@ pub fn check_against_ledger(lock: &BTreeMap<String, LockEntry>, ledger: &str) ->
                 "its manifest hash is not the one last recorded as approved in the ledger \
                  (edited by hand?); approve it again to use it",
             )),
-            // A bundle entry's bundle hash and secret grants are checked too:
-            // a re-pinned manifest or a grant added by hand is not trusted.
-            Some((_, _, b))
-                if e.bundle
-                    .as_ref()
-                    .is_some_and(|r| Some(&r.hash) != b.as_ref()) =>
-            {
-                out.blocked.push(blocked(
-                    "its plugin manifest hash is not the one last recorded as approved in the \
-                     ledger (edited by hand?); approve it again to use it",
-                ))
-            }
-            Some(_)
-                if e.bundle.is_some()
-                    && e.secrets
-                        .iter()
-                        .any(|s| !granted.get(name).is_some_and(|g| g.contains(s))) =>
-            {
-                out.blocked.push(blocked(
-                    "it holds a secret grant the ledger does not show as granted, or shows as \
+            Some((_, _, b)) if !approved_bundle(b) => out.blocked.push(blocked(
+                "its plugin manifest record is not the one last recorded as approved in the \
+                 ledger (added, removed or re-pinned by hand?); approve it again to use it",
+            )),
+            // Grants are ledger-tracked for a bundle approval. A plain entry's
+            // `secrets` (#679) predate this and are not in the ledger.
+            Some((_, _, Some(_))) if !e.secrets.iter().all(held) => out.blocked.push(blocked(
+                "it holds a secret grant the ledger does not show as granted, or shows as \
                      revoked (edited by hand?); approve it again to use it",
-                ))
-            }
+            )),
             Some(_) => {}
-            None => out.unrecorded.push(name.clone()),
+            // No approval line at all. A plain entry may predate the ledger
+            // (reported only), but a bundle record never does: it exists only
+            // through an approval that writes a line.
+            None if e.bundle.is_some() => out.blocked.push(blocked(
+                "it carries a plugin manifest record the ledger has no approval for \
+                 (edited by hand?); approve it again to use it",
+            )),
+            None if !last.is_empty() => out.unrecorded.push(name.clone()),
+            None => {}
         }
     }
     out

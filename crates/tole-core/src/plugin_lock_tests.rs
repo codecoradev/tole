@@ -516,3 +516,49 @@ fn the_ledger_ties_secret_grants_and_the_bundle_hash_to_the_owners_decisions() {
     // The audit lines carry names and hashes, never a value.
     assert!(!ledger.contains("secret\":\"sk"));
 }
+
+#[test]
+fn the_ledger_is_authoritative_when_the_lock_drops_or_invents_bundle_state() {
+    let h = manifest_hash(&base());
+    let mut ledger = bundle_ledger_line("approve", "cora", &h, "sha256:b1", 1);
+    ledger.push_str(&secret_ledger_line("secret_grant", "cora", "A_TOKEN", 1));
+    let n =
+        |lock: &BTreeMap<String, LockEntry>, l: &str| check_against_ledger(lock, l).blocked.len();
+    // The honest lock passes.
+    assert_eq!(n(&bundle_lock(&["A_TOKEN"]), &ledger), 0);
+    // Bundle removed + a hand-added secret.
+    let mut l = bundle_lock(&["A_TOKEN", "EVIL_KEY"]);
+    l.get_mut("cora").unwrap().bundle = None;
+    assert_eq!(n(&l, &ledger), 1);
+    // Bundle removed + the granted secret kept: the manifest pin is gone.
+    let mut l = bundle_lock(&["A_TOKEN"]);
+    l.get_mut("cora").unwrap().bundle = None;
+    assert_eq!(n(&l, &ledger), 1);
+    // Bundle removed, no secrets: still not what was approved.
+    let mut l = bundle_lock(&[]);
+    l.get_mut("cora").unwrap().bundle = None;
+    assert_eq!(n(&l, &ledger), 1);
+    // A revoked grant restored (with the bundle intact).
+    let mut after = ledger.clone();
+    after.push_str(&secret_ledger_line("secret_revoke", "cora", "A_TOKEN", 2));
+    assert_eq!(n(&bundle_lock(&["A_TOKEN"]), &after), 1);
+    // ... and with the bundle also removed.
+    let mut l = bundle_lock(&["A_TOKEN"]);
+    l.get_mut("cora").unwrap().bundle = None;
+    assert_eq!(n(&l, &after), 1);
+    // A bundle record invented on an entry whose ledger approval is plain.
+    let plain = ledger_line("approve", "cora", &h, 1);
+    assert_eq!(n(&bundle_lock(&[]), &plain), 1, "bundle record invented");
+    // A plain entry's own secrets (#679) are not ledger-tracked and stay.
+    let mut l = locked(&base());
+    l.get_mut("cora").unwrap().secrets = vec!["A_TOKEN".into()];
+    assert_eq!(n(&l, &plain), 0);
+    // A bundle record with no approval line for the server at all.
+    let other = ledger_line("approve", "zzz", "h", 1);
+    assert_eq!(n(&bundle_lock(&[]), &other), 1);
+    assert_eq!(
+        n(&locked(&base()), &other),
+        0,
+        "a plain pre-ledger entry stays unblocked"
+    );
+}
