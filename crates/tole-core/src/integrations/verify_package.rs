@@ -513,15 +513,13 @@ mod mock_server_tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::sync::atomic::{AtomicU16, Ordering};
-
-    static PORT: AtomicU16 = AtomicU16::new(0);
 
     fn start_mock(
         responder: impl Fn(&str) -> (u16, &'static str) + Send + Sync + 'static,
     ) -> (String, String) {
-        let port = PORT.fetch_add(1, Ordering::SeqCst);
-        let listener = TcpListener::bind(("127.0.0.1", 18000 + (port % 2000))).unwrap();
+        // Port 0: the OS picks a free port, so parallel tests (and other
+        // processes) can never collide on a fixed one.
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
             for stream in listener.incoming() {
