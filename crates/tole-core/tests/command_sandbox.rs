@@ -944,6 +944,19 @@ fn a_registered_submodule_cannot_get_a_planted_fsmonitor() {
         "the gitdir file is still there"
     );
     assert!(!w.join("sub/.gx").exists());
+    // The file that names the submodules cannot be rewritten or removed (the
+    // next launch's plan reads it).
+    all_fail(
+        &tool,
+        &[
+            "sh -c 'echo > .gitmodules'",
+            "rm -f .gitmodules",
+            "mv .gitmodules .gitmodules.old",
+        ],
+    );
+    assert!(std::fs::read_to_string(w.join(".gitmodules"))
+        .unwrap()
+        .contains("path = sub"));
     assert_eq!(
         tree(&w.join(".git")),
         before,
@@ -1020,6 +1033,15 @@ fn a_child_worktree_git_file_cannot_be_replaced() {
             "mv .tole-worktrees/wt1/.git .tole-worktrees/wt1/.gx",
             "sh -c 'rm .tole-worktrees/wt1/.git && mkdir -p .tole-worktrees/wt1/.git/hooks'",
             "sh -c 'echo x >> .tole-worktrees/wt1/.git'",
+        ],
+    );
+    all_fail(
+        &tool,
+        &[
+            "rm -rf .tole-worktrees/wt1",
+            "mv .tole-worktrees/wt1 .tole-worktrees/wt2",
+            "mv .tole-worktrees .tole-worktrees.old",
+            "mkdir .tole-worktrees/wt3",
         ],
     );
     assert!(w.join(".tole-worktrees/wt1/.git").is_file());

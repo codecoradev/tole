@@ -560,9 +560,14 @@ file_size_mb = 4096            # 1 to 1048576, largest file a process writes
   gitdir FILE (top level, submodule, worktree) is bound read-only itself, and
   so is the directory it points to when that is inside the workspace (outside
   the workspace it is not in the sandbox's view at all). The nested gitdirs
-  that can be named cheaply and deterministically are protected the same way,
-  without scanning the workspace: every `path` of `.gitmodules` and every
-  `.tole-worktrees/<id>` (child-agent worktrees), at most 64 together.
+  that can be named cheaply and deterministically are protected without
+  scanning the workspace: every `path` of `.gitmodules` (at most 64) gets its
+  `.git` bound the same way, `.gitmodules` itself is bound read-only (it is the
+  input of the plan: a command that could rewrite it would take a submodule out
+  of the next launch's plan), and the whole `.tole-worktrees` directory
+  (child-agent worktrees) is read-only, so no entry can be removed or replaced
+  and every worktree `.git` file in it is covered. Cost: a sandboxed command
+  cannot change files inside a child agent's worktree.
   Git reads `.gitmodules` as a config file and the file is writable from the
   sandbox, so only a plain subset is accepted and anything git could read
   differently refuses the launch: `[submodule "name"]` sections with `key =
@@ -570,8 +575,7 @@ file_size_mb = 4096            # 1 to 1048576, largest file a process writes
   value, a quote, an escape or a continuation, another section or a key outside
   a submodule section is refused (`path = sub # note` is `sub` to git). A
   SYMBOLIC LINK anywhere in that chain (`.git`, `.git/hooks`, `.git/config`,
-  `.tole`, `.gitmodules`, a submodule path, `.tole-worktrees` or one of its
-  entries, a gitdir target), a path that leaves the workspace, an unreadable
+  `.tole`, `.gitmodules`, a submodule path, `.tole-worktrees`, a gitdir target), a path that leaves the workspace, an unreadable
   `.gitmodules` or gitdir file larger than 64 KiB or 4 KiB (never read in part), or more than 64 entries refuses the launch (for
   `optional`, the fallback policy applies) with the cause in the reason:
   a mount cannot protect a link (the command removes it and makes a real

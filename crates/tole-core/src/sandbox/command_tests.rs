@@ -822,6 +822,8 @@ fn a_submodule_listed_in_gitmodules_gets_its_git_file_bound_read_only() {
     let plan = protect_plan(&ws).unwrap();
     assert!(plan.contains(&ws.join(".git")));
     assert!(plan.contains(&ws.join("libs/sub/.git")), "{plan:?}");
+    // The file that names the submodules is read-only too (the next plan reads it).
+    assert!(plan.contains(&ws.join(".gitmodules")), "{plan:?}");
     // The gitdir it points to is inside the already read-only .git.
     assert!(!plan.contains(&ws.join(".git/modules/sub")), "{plan:?}");
     let a = run_argv(&ws);
@@ -863,8 +865,10 @@ fn child_agent_worktrees_get_their_git_file_bound_read_only() {
     )
     .unwrap();
     let plan = protect_plan(&ws).unwrap();
+    // The whole directory is read-only, which covers every worktree `.git` file.
+    assert!(plan.contains(&ws.join(".tole-worktrees")), "{plan:?}");
     assert!(
-        plan.contains(&ws.join(".tole-worktrees/wt1/.git")),
+        !plan.contains(&ws.join(".tole-worktrees/wt1/.git")),
         "{plan:?}"
     );
 }
@@ -910,12 +914,6 @@ fn a_link_or_an_escape_in_the_nested_chain_is_refused() {
     std::fs::create_dir_all(ws.join("real/gd")).unwrap();
     symlink(ws.join("real"), ws.join("lnk")).unwrap();
     std::fs::write(ws.join(".git"), "gitdir: lnk/gd\n").unwrap();
-    assert!(protect_plan(&ws).unwrap_err().contains("symbolic link"));
-    // A worktrees entry that is a link.
-    let ws = fresh("nest-l4");
-    std::fs::create_dir_all(ws.join(".tole-worktrees")).unwrap();
-    std::fs::create_dir_all(ws.join("real")).unwrap();
-    symlink(ws.join("real"), ws.join(".tole-worktrees/wt")).unwrap();
     assert!(protect_plan(&ws).unwrap_err().contains("symbolic link"));
     // More than the bound.
     let ws = fresh("nest-many");

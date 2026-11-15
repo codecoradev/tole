@@ -229,7 +229,7 @@ fn is_executable(p: &Path) -> bool {
     p.is_file()
 }
 
-/// Most nested gitdirs (`.gitmodules` paths plus `.tole-worktrees` entries) a
+/// Most nested gitdirs (`.gitmodules` paths) a
 /// launch will protect; more is refused, not skipped.
 const MAX_NESTED: usize = 64;
 
@@ -255,7 +255,7 @@ const MAX_NESTED: usize = 64;
 /// - a `.git` gitdir FILE (top level, submodule, worktree) is bound read-only
 ///   itself, and so is the directory it points to when that is inside the
 ///   workspace (outside it, it is not in the sandbox's view at all);
-/// - every `path` of `.gitmodules` and every `.tole-worktrees/<id>` (at most
+/// - every `path` of `.gitmodules` (at most
 ///   [`MAX_NESTED`]): its `.git`, file or directory, the same way.
 ///
 /// A symbolic link anywhere in that chain (`.git`, `.git/hooks`, `.git/config`,
@@ -331,20 +331,20 @@ pub fn protect_plan(ws: &Path) -> Result<Vec<PathBuf>, String> {
             nested.push(p.join(".git"));
         }
     }
-    // Child-agent worktrees.
+    // The file that names the submodules is itself bound read-only: it is the
+    // input of this plan, so a command that could rewrite it would take a
+    // submodule out of the next launch's plan.
+    if exists(&modules)? {
+        protect.push(modules);
+    }
+    // Child-agent worktrees: the whole directory, read-only, so no entry can be
+    // removed or replaced and every worktree `.git` file in it is covered.
     let wts = ws.join(".tole-worktrees");
     if exists(&wts)? {
-        let entries =
-            std::fs::read_dir(&wts).map_err(|e| format!("cannot read {} ({e})", wts.display()))?;
-        for e in entries.flatten() {
-            exists(&e.path())?;
-            nested.push(e.path().join(".git"));
-        }
+        protect.push(wts);
     }
     if nested.len() > MAX_NESTED {
-        return Err(format!(
-            "more than {MAX_NESTED} nested gitdirs (.gitmodules, .tole-worktrees) to protect"
-        ));
+        return Err(format!("more than {MAX_NESTED} submodules to protect"));
     }
     for git in nested {
         add_git(&git, &mut protect)?;
