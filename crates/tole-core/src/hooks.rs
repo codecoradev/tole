@@ -19,6 +19,13 @@ use serde_json::{json, Value};
 use std::process::Command;
 use std::time::Duration;
 
+/// The exit code [`ProcessHook::run_raw`] reports for a gate the sandbox
+/// refused to run (non-zero, so the caller denies).
+pub const SANDBOX_REFUSED: i32 = 126;
+
+/// How `run_with_timeout_stdin` words a spawn failure.
+const SPAWN_FAILED: &str = "failed to spawn subprocess";
+
 /// One configured hook process: program + fixed argv (split at the CLI
 /// boundary; no quoting support in v0 — wrap complex commands in a
 /// script).
@@ -58,12 +65,35 @@ impl ProcessHook {
     /// are non-blocking. A verification gate's nonzero exit IS its
     /// verdict ("tests failing" exits 1, cargo exits 101), not a crash.
     pub fn run_raw(&self, payload: &Value) -> Result<(i32, String), String> {
-        let mut cmd = Command::new(&self.program);
-        cmd.args(&self.args);
+        use crate::sandbox::command::{command_in_cwd, Consumer};
+        // The plain command, or `bwrap ... -- command` when the owner opted
+        // in (`[sandbox.consumers] turnend`, #748). A refusal (required
+        // sandbox, none available) is a DENY, never a pass: the gate did not
+        // run, so the model must not be allowed to finish on its say-so.
+        let (mut cmd, sandboxed) =
+            match command_in_cwd(Consumer::TurnEnd, &self.program, &self.args) {
+                Ok(c) => c,
+                Err(why) => return Ok((SANDBOX_REFUSED, why)),
+            };
         // A stop gate usually runs code the agent wrote (`cargo test`): its
-        // own consumer, which gets no secret by default (#676).
+        // own consumer, which gets no secret by default (#676). With a
+        // sandbox this scrubs the `bwrap` process, whose environment its
+        // child inherits.
         crate::subprocess::scrub_env_for(&mut cmd, crate::secret_release::TURNEND);
-        let out = run_with_timeout_stdin(&mut cmd, self.timeout, payload.to_string().as_bytes())?;
+        let out =
+            match run_with_timeout_stdin(&mut cmd, self.timeout, payload.to_string().as_bytes()) {
+                Ok(o) => o,
+                // A sandboxed gate whose launcher cannot even start did not run
+                // either: that is a deny too (an unsandboxed spawn failure keeps
+                // its non-blocking contract, #110).
+                Err(e) if sandboxed && e.starts_with(SPAWN_FAILED) => {
+                    return Ok((
+                        SANDBOX_REFUSED,
+                        format!("turnend: not run, the sandbox did not start ({e})"),
+                    ))
+                }
+                Err(e) => return Err(e),
+            };
         let mut stdout = out.stdout;
         stdout.truncate(32 * 1024);
         let stdout = String::from_utf8_lossy(&stdout).trim().to_string();
