@@ -11,6 +11,7 @@ use tole_core::provider::ProviderOutput;
 const SECRET: &str = "discuss-tool-secret-0123456789";
 
 struct Rig {
+    _root: crate::test_dir::TestDir,
     host: Arc<DiscussHost>,
     delegator: Arc<Delegator>,
     dir: PathBuf,
@@ -48,7 +49,7 @@ fn rig_with(tag: &str, allows: &[&str], usage: u64, answer: Answer, bin: PathBuf
     let delegator = Arc::new(
         Delegator::for_session(
             bin,
-            root.clone(),
+            root.to_path_buf(),
             false,
             allows.iter().map(|s| s.to_string()).collect(),
             setup,
@@ -66,6 +67,7 @@ fn rig_with(tag: &str, allows: &[&str], usage: u64, answer: Answer, bin: PathBuf
     );
     let log = log_path(&data, &root).unwrap();
     Rig {
+        _root: root,
         host,
         delegator,
         dir,
@@ -544,7 +546,7 @@ fn a_session_at_the_goals_depth_limit_has_no_discussion_host() {
     };
     let at_limit = Delegator::for_session(
         PathBuf::from("/bin/true"),
-        root.clone(),
+        root.to_path_buf(),
         false,
         vec![],
         Setup {

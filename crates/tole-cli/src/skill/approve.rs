@@ -327,10 +327,9 @@ mod tests {
         move |k| (k == APPROVAL_ENV).then(|| v.map(String::from)).flatten()
     }
 
-    fn ws(tag: &str) -> PathBuf {
-        let d =
-            std::env::temp_dir().join(format!("tole-skapprove-cli-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
+    use crate::test_dir::TestDir;
+    fn ws(tag: &str) -> TestDir {
+        let d = TestDir::new(&format!("tole-skapprove-cli-{tag}"));
         let s = d.join("skills").join("demo");
         std::fs::create_dir_all(&s).unwrap();
         std::fs::write(

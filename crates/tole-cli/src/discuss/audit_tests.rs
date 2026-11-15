@@ -8,11 +8,9 @@ fn secrets() -> SecretSet {
     SecretSet::collect([("AUDIT_API_KEY".to_string(), SECRET.to_string())], [])
 }
 
-fn tmp(tag: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("tole-auditdisc-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+use crate::test_dir::TestDir;
+fn tmp(tag: &str) -> TestDir {
+    TestDir::new(&format!("tole-auditdisc-{tag}"))
 }
 
 /// Round 1: two speakers, a digest (a claim quoting the secret), a met

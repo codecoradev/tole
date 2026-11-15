@@ -7,7 +7,7 @@ const DAY: u64 = 86_400;
 const NOW: u64 = 200 * DAY;
 
 struct Rig {
-    root: PathBuf,
+    root: crate::test_dir::TestDir,
     drafts: DraftStore,
     usage: UsageLedger,
     archive: Archive,
@@ -18,10 +18,7 @@ struct Rig {
 
 impl Rig {
     fn new(tag: &str) -> Self {
-        let root =
-            std::env::temp_dir().join(format!("tole-curator-cli-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+        let root = crate::test_dir::TestDir::new(&format!("tole-curator-cli-{tag}"));
         Self {
             drafts: DraftStore::new(root.join("drafts")),
             usage: UsageLedger::new(root.join("usage.jsonl")),
@@ -351,19 +348,17 @@ mod scheduling {
     use super::*;
     use crate::curator_cmd::schedule;
 
-    fn dirs(tag: &str) -> (PathBuf, PathBuf) {
-        let root =
-            std::env::temp_dir().join(format!("tole-curator-sched-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+    fn dirs(tag: &str) -> (crate::test_dir::TestDir, PathBuf, PathBuf) {
+        let root = crate::test_dir::TestDir::new(&format!("tole-curator-sched-{tag}"));
         let (cron, work) = (root.join("cron"), root.join("work"));
         std::fs::create_dir_all(&cron).unwrap();
         std::fs::create_dir_all(&work).unwrap();
-        (cron, work)
+        (root, cron, work)
     }
 
     #[test]
     fn the_weekly_job_is_a_zero_token_script_saved_once_and_removable() {
-        let (cron, work) = dirs("once");
+        let (_root, cron, work) = dirs("once");
         assert!(schedule::line(&cron).contains("not scheduled"));
         let msg = schedule::install(&cron, None, &work, 1_700_000_000).unwrap();
         assert!(
@@ -399,7 +394,7 @@ mod scheduling {
 
     #[test]
     fn a_bad_schedule_or_a_relative_workdir_is_refused() {
-        let (cron, work) = dirs("bad");
+        let (_root, cron, work) = dirs("bad");
         assert!(schedule::install(&cron, Some("not a cron"), &work, 1).is_err());
         assert!(schedule::install(&cron, None, Path::new("relative"), 1).is_err());
         assert!(schedule::find(&cron).is_none());

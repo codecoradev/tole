@@ -5,11 +5,38 @@ use tole_core::delegation::NodeStatus;
 use tole_core::entry::{EntryType, NewEntry};
 use tole_core::storage::{Commit, JsonlStorage, Storage as _, UsageRecord};
 
-fn tmp(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("tole-delegate-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d.canonicalize().unwrap()
+use crate::test_dir::TestDir;
+
+/// A workspace root whose detached children (the fake tole shells below)
+/// are killed before it is removed: their command line holds the root, and
+/// one that starts late would otherwise write into a directory that is gone.
+struct Root(TestDir);
+
+impl std::ops::Deref for Root {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        self.0.path()
+    }
+}
+
+impl AsRef<Path> for Root {
+    fn as_ref(&self) -> &Path {
+        self.0.path()
+    }
+}
+
+impl Drop for Root {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("pkill")
+            .args(["-9", "-f"])
+            .arg(self.0.path())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+}
+
+fn tmp(tag: &str) -> Root {
+    Root(TestDir::new(&format!("tole-delegate-{tag}")))
 }
 
 /// A stand-in tole binary: records its argv and env next to its sessions
@@ -19,7 +46,7 @@ fn fake_tole(dir: &Path, secs: u64) -> PathBuf {
     let p = dir.join(format!("fake-tole-{secs}"));
     let body = format!(
         "#!/bin/sh\nprev=\"\"\nfor a in \"$@\"; do [ \"$prev\" = \"--sessions-dir\" ] && D=\"$a\"; \
-         prev=\"$a\"; done\nmkdir -p \"$D\"\nprintf '%s\\n' \"$@\" > \"$D/../argv\"\n\
+         prev=\"$a\"; done\n[ -d \"${{D%/*/*/*}}\" ] || exit 0\nmkdir -p \"$D\"\nprintf '%s\\n' \"$@\" > \"$D/../argv\"\n\
          cut -d' ' -f19 /proc/$$/stat > \"$D/../nice\" 2>/dev/null\n\
          env > \"$D/../env\"\nsleep {secs}\n"
     );
@@ -140,8 +167,30 @@ fn data_dir() -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
-        let d = std::env::temp_dir().join(format!(
-            "tole-delegate-data-{}-{nanos:x}",
+        // Shared by every test of this process, so no per-test guard can own
+        // it. Stale ones of earlier runs (named by pid and clock, never
+        // shared, #702) are swept here, so at most the runs of the last few
+        // hours leave one small directory each.
+        let base = std::env::temp_dir();
+        if let Ok(rd) = std::fs::read_dir(&base) {
+            for e in rd.flatten() {
+                let old = e
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.elapsed().ok())
+                    .is_some_and(|age| age > std::time::Duration::from_secs(6 * 3600));
+                if old
+                    && e.file_name()
+                        .to_string_lossy()
+                        .starts_with("shared-delegate-data-")
+                {
+                    let _ = std::fs::remove_dir_all(e.path());
+                }
+            }
+        }
+        let d = base.join(format!(
+            "shared-delegate-data-{}-{nanos:x}",
             std::process::id()
         ));
         std::fs::create_dir_all(&d).unwrap();
@@ -476,7 +525,7 @@ fn only_a_session_the_tree_lets_delegate_gets_the_tool() {
     let make = |env: &dyn Fn(&str) -> Option<String>| {
         Delegator::for_session(
             PathBuf::from("tole"),
-            root.clone(),
+            root.to_path_buf(),
             false,
             vec![],
             setup(""),
@@ -858,7 +907,7 @@ fn doctor_shows_the_headroom_and_a_spawn_stuck_in_the_queue() {
     };
     let h = d.delegate("g", &req, Spend::default(), t0).unwrap();
     let setup = Setup {
-        data_dir: Some(data.clone()),
+        data_dir: Some(data.to_path_buf()),
         probe: Some(SharedProbe(std::sync::Arc::new(Dial(AtomicU64::new(100))))),
         thresholds: Some(open_thresholds()),
         ..setup("")
@@ -1165,7 +1214,7 @@ fn an_independent_participant_is_a_consult_child_settled_with_its_report() {
         std::sync::Arc::new(
             Delegator::for_session(
                 bin.clone(),
-                root.clone(),
+                root.to_path_buf(),
                 false,
                 vec!["write_*".into()],
                 setup("[delegation]\ngoal_budget = 100000\ngoal_steps = 100\n[profiles.critic]\n"),
@@ -1312,7 +1361,7 @@ fn a_discussion_participant_gets_no_delegation_host() {
     let open = |marked: bool| {
         Delegator::for_session(
             PathBuf::from("/bin/true"),
-            root.clone(),
+            root.to_path_buf(),
             false,
             n.allow.clone(),
             setup(PROFILE),
