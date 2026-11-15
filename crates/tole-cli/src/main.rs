@@ -4764,3 +4764,52 @@ mod chat_todo_tests {
 #[cfg(test)]
 #[path = "main_gate_tests.rs"]
 mod gate_policy_tests;
+
+/// #846: the table behind the `--sandbox` / `--no-sandbox` refusals. The
+/// end-to-end tests have no terminal, so they cannot tell this
+/// classification from "no terminal"; this pins it per subcommand:
+/// `(unattended, starts no server)`.
+#[cfg(test)]
+mod sandbox_flag_class_tests {
+    use super::{sandbox_flag_class, Cli};
+    use clap::Parser;
+
+    fn class(args: &[&str]) -> (bool, bool) {
+        let mut argv = vec!["tole"];
+        argv.extend_from_slice(args);
+        sandbox_flag_class(&Cli::try_parse_from(argv).unwrap().command)
+    }
+
+    #[test]
+    fn ordinary_commands_are_attended_and_start_servers() {
+        assert_eq!(class(&["doctor"]), (false, false));
+        assert_eq!(class(&["run", "hello"]), (false, false));
+    }
+
+    #[test]
+    fn sandbox_and_plugin_start_no_session_server() {
+        assert_eq!(class(&["sandbox", "list"]), (false, true));
+        #[cfg(feature = "mcp")]
+        assert_eq!(class(&["plugin", "list"]), (false, true));
+    }
+
+    #[cfg(feature = "shell-tools")]
+    #[test]
+    fn serve_and_acp_are_unattended() {
+        assert_eq!(class(&["serve"]), (true, false));
+        assert_eq!(class(&["acp"]), (true, false));
+    }
+
+    #[cfg(all(feature = "mcp", feature = "shell-tools"))]
+    #[test]
+    fn the_mcp_face_is_unattended() {
+        assert_eq!(class(&["mcp"]), (true, false));
+    }
+
+    #[cfg(feature = "shell-tools")]
+    #[test]
+    fn cron_and_hook_start_no_server() {
+        assert_eq!(class(&["cron", "tick"]), (false, true));
+        assert_eq!(class(&["hook", "list"]), (false, true));
+    }
+}

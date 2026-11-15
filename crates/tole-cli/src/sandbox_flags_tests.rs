@@ -83,6 +83,35 @@ fn no_sandbox_is_refused_for_unattended_runs_in_required_and_optional() {
     }
 }
 
+/// #846: a profile can be wider than the configured one, so `--sandbox` has
+/// the same terminal test as `--no-sandbox`, in every mode where it is
+/// otherwise valid.
+#[test]
+fn sandbox_is_refused_without_a_terminal_and_for_unattended_commands() {
+    let unattended = Context {
+        unattended_command: true,
+        ..ctx()
+    };
+    let no_tty = Context {
+        tty: false,
+        ..ctx()
+    };
+    let optional = "[sandbox]\nmode = \"optional\"\n[sandbox.profiles.net]\nnetwork = \"host\"\n";
+    for src in [USER, optional] {
+        for c in [unattended, no_tty] {
+            for name in ["net", "strict"] {
+                let e = run(&prof(name), src, c).unwrap_err();
+                assert!(
+                    e.contains("--sandbox is refused in an unattended run"),
+                    "{e}"
+                );
+            }
+        }
+    }
+    // The same flag at a terminal is accepted.
+    assert!(run(&prof("net"), USER, ctx()).unwrap().is_some());
+}
+
 #[test]
 fn both_flags_are_refused_under_an_agent_session_even_when_attended() {
     let c = Context {
