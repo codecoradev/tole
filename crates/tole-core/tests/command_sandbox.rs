@@ -1048,3 +1048,82 @@ fn a_child_worktree_git_file_cannot_be_replaced() {
     assert_eq!(tree(&w.join(".git")), before);
     host_git(&w.join(".tole-worktrees/wt1"), &["status", "--short"]);
 }
+
+/// F1: a submodule that has submodules of its own. The plan reads only the
+/// top-level `.gitmodules`, so the inner gitdir (reachable through
+/// `mid/inner/.git`) would be unprotected: the launch is refused, the command
+/// never runs, and the host's git runs nothing.
+#[test]
+fn a_submodule_with_submodules_of_its_own_refuses_the_launch() {
+    if skipped() {
+        return;
+    }
+    let mk = |tag: &str| {
+        let d = ws(tag);
+        host_git(&d, &["init", "-q"]);
+        std::fs::write(d.join("f"), "x\n").unwrap();
+        host_git(&d, &["add", "f"]);
+        host_git(&d, &["commit", "-q", "-m", "x"]);
+        d
+    };
+    let allow = ["-c", "protocol.file.allow=always"];
+    let add = |into: &Path, src: &Path, name: &str| {
+        let mut a: Vec<&str> = allow.to_vec();
+        a.extend(["submodule", "add", "-q", src.to_str().unwrap(), name]);
+        host_git(into, &a);
+        host_git(into, &["commit", "-q", "-m", "add"]);
+    };
+    let inner = mk("nest-inner");
+    let mid = mk("nest-mid");
+    add(&mid, &inner, "inner");
+    let top = mk("nest-top");
+    add(&top, &mid, "mid");
+    let mut a: Vec<&str> = allow.to_vec();
+    a.extend(["submodule", "update", "--init", "--recursive", "-q"]);
+    host_git(&top, &a);
+    assert!(top.join("mid/.gitmodules").is_file(), "the layout exists");
+    assert!(top.join("mid/inner/.git").exists());
+    let mark = top.join("PWNED_FSM");
+    let tool = RunCommandTool::new(top.clone());
+    let e = tool
+        .execute(json!({"command": format!("touch {}", top.join("ran").display())}))
+        .unwrap_err();
+    assert!(e.contains("nested submodules") && e.contains("mid"), "{e}");
+    assert!(!top.join("ran").exists(), "the command never ran");
+    host_git_routine(&top);
+    assert!(!mark.exists(), "nothing ran on the host");
+}
+
+/// F2: `.git` is a file whose target is a worktree of a repository that lives
+/// INSIDE the workspace (`repo.git`); `commondir` sends git to its config and
+/// hooks, which were writable. The launch is refused, the command never runs.
+#[test]
+fn a_gitdir_redirected_by_commondir_inside_the_workspace_refuses_the_launch() {
+    if skipped() {
+        return;
+    }
+    let w = ws("commondir-ws");
+    host_git(&w, &["init", "-q", "--bare", "repo.git"]);
+    let wt = w.join("repo.git/worktrees/ws2");
+    std::fs::create_dir_all(&wt).unwrap();
+    std::fs::write(wt.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    std::fs::write(wt.join("commondir"), "../..\n").unwrap();
+    std::fs::write(wt.join("gitdir"), format!("{}\n", w.join(".git").display())).unwrap();
+    std::fs::write(w.join(".git"), format!("gitdir: {}\n", wt.display())).unwrap();
+    host_git(&w, &["status", "--short"]);
+    let mark = w.join("PWNED_FSM");
+    let tool = RunCommandTool::new(w.clone());
+    let e = tool
+        .execute(json!({"command": format!(
+            "git config --file repo.git/config core.fsmonitor 'touch {}; echo'", mark.display())}))
+        .unwrap_err();
+    assert!(e.contains("commondir") && e.contains("redirects"), "{e}");
+    host_git(&w, &["status", "--short"]);
+    assert!(!mark.exists(), "nothing ran on the host");
+    assert!(
+        !std::fs::read_to_string(w.join("repo.git/config"))
+            .unwrap()
+            .contains("fsmonitor"),
+        "the config was not written"
+    );
+}

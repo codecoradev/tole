@@ -568,6 +568,21 @@ file_size_mb = 4096            # 1 to 1048576, largest file a process writes
   (child-agent worktrees) is read-only, so no entry can be removed or replaced
   and every worktree `.git` file in it is covered. Cost: a sandboxed command
   cannot change files inside a child agent's worktree.
+
+  Layouts the plan cannot cover are REFUSED, not half protected (the launch
+  fails with the cause; `optional` follows its fallback policy): a registered
+  submodule that has a `.gitmodules` of its own (nested submodules: only the
+  top-level `.gitmodules` is read, so the inner gitdirs would be unprotected;
+  any depth, each listed submodule directory is checked without following
+  links); a gitdir directory that is not covered by an already read-only
+  path and has a `commondir` or `config.worktree` file (git would be sent to
+  another directory for its config and hooks, writable when it lies inside the
+  workspace), including the top-level `.git` directory itself; a gitdir file
+  whose target inside the workspace does not exist (a command could create
+  it); a `.gitmodules` with a second hard link. A gitdir file whose target is
+  outside the workspace is not in the sandbox's view and stays accepted. A
+  worktree's `commondir` inside the read-only `.git` (`.git/worktrees/<id>`) is
+  normal and not refused.
   Git reads `.gitmodules` as a config file and the file is writable from the
   sandbox, so only a plain subset is accepted and anything git could read
   differently refuses the launch: `[submodule "name"]` sections with `key =
@@ -651,6 +666,8 @@ file_size_mb = 4096            # 1 to 1048576, largest file a process writes
     a detached `job_start` began, leaves a repository whose hooks and config
     the host runs later. "Nothing can be created in `.git` or `.tole`" holds
     only when they existed at launch.
+  - A repository whose `commondir` or gitdir lives outside the workspace is
+    outside the sandbox's view and not this plan's concern.
   - A nested repository that is in neither `.gitmodules` nor
     `.tole-worktrees` (a vendored clone, any `x/.git`) is part of the writable
     workspace and is NOT protected: its config and hooks can be written, and

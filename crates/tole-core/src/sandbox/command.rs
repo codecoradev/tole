@@ -293,7 +293,7 @@ pub fn protect_plan(ws: &Path) -> Result<Vec<PathBuf>, String> {
         let meta =
             symlink_metadata(git).map_err(|e| format!("cannot inspect {} ({e})", git.display()))?;
         if meta.is_dir() {
-            check_gitdir_content(git)?;
+            check_gitdir_content(git, false)?;
         } else if meta.is_file() {
             if multi_linked(&meta) {
                 return Err(format!(
@@ -302,8 +302,11 @@ pub fn protect_plan(ws: &Path) -> Result<Vec<PathBuf>, String> {
                 ));
             }
             if let Some(target) = gitdir_target(ws, git)? {
-                check_gitdir_content(&target)?;
-                if !out.iter().any(|p| target.starts_with(p)) {
+                // A target inside an already read-only directory (a submodule's
+                // gitdir under `.git/modules`) cannot have been redirected since.
+                let covered = out.iter().any(|p| target.starts_with(p));
+                check_gitdir_content(&target, covered)?;
+                if !covered {
                     out.push(target);
                 }
             }
@@ -328,6 +331,16 @@ pub fn protect_plan(ws: &Path) -> Result<Vec<PathBuf>, String> {
                 p.push(c);
                 exists(&p)?;
             }
+            // A submodule with submodules of its own: their gitdirs are not
+            // named by this plan (only the top-level `.gitmodules` is read), so
+            // the layout is refused rather than half protected.
+            if exists(&p.join(".gitmodules"))? {
+                return Err(format!(
+                    "the submodule {} has its own .gitmodules (nested submodules), which the \
+                     sandbox cannot protect; refused",
+                    rel.display()
+                ));
+            }
             nested.push(p.join(".git"));
         }
     }
@@ -335,6 +348,12 @@ pub fn protect_plan(ws: &Path) -> Result<Vec<PathBuf>, String> {
     // input of this plan, so a command that could rewrite it would take a
     // submodule out of the next launch's plan.
     if exists(&modules)? {
+        if std::fs::symlink_metadata(&modules).is_ok_and(|m| multi_linked(&m)) {
+            return Err(format!(
+                "{} has several hard links; a write through another name would change it",
+                modules.display()
+            ));
+        }
         protect.push(modules);
     }
     // Child-agent worktrees: the whole directory, read-only, so no entry can be
@@ -377,8 +396,24 @@ fn multi_linked(_m: &std::fs::Metadata) -> bool {
 /// hard link (a name made earlier, while the path was unprotected, would stay
 /// writable); no entry of `hooks` is a link (it would lead to a writable place
 /// in the workspace). Bounded; anything else fails the launch.
-fn check_gitdir_content(dir: &Path) -> Result<(), String> {
+fn check_gitdir_content(dir: &Path, covered: bool) -> Result<(), String> {
     use std::fs::symlink_metadata;
+    // `commondir` (and `config.worktree`) send git to ANOTHER directory for its
+    // config and hooks; that directory, inside the workspace, would be writable.
+    // Not followed: refused. (Inside an already read-only directory, such as
+    // `.git/worktrees/<id>`, the file is the owner's and cannot have changed.)
+    if !covered {
+        for redirect in ["commondir", "config.worktree"] {
+            let p = dir.join(redirect);
+            if symlink_metadata(&p).is_ok() {
+                return Err(format!(
+                    "{} redirects git to another directory ({redirect}), which the sandbox \
+                     cannot protect; refused",
+                    dir.display()
+                ));
+            }
+        }
+    }
     let link = |p: &Path| {
         format!(
             "{} is a symbolic link, which a mount cannot protect (the command could replace \
@@ -465,7 +500,11 @@ fn gitdir_target(ws: &Path, file: &Path) -> Result<Option<PathBuf>, String> {
             shown,
             norm.display()
         )),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(format!(
+            "the gitdir {shown} points to ({}) is inside the workspace and does not exist; \
+             a command could create it",
+            norm.display()
+        )),
         Err(e) => Err(format!("cannot resolve the gitdir of {shown} ({e})")),
     }
 }

@@ -1123,3 +1123,76 @@ fn a_gitmodules_git_could_read_differently_is_refused() {
     .unwrap();
     assert!(protect_plan(&ws).unwrap().contains(&ws.join("sub/.git")));
 }
+
+/// Layouts the plan cannot cover are refused, not half protected: a submodule
+/// with submodules of its own, a gitdir that redirects to another directory
+/// (`commondir`, `config.worktree`), a target that does not exist, a second
+/// name for `.gitmodules`.
+#[cfg(unix)]
+#[test]
+fn nested_submodules_commondir_redirects_and_missing_targets_are_refused() {
+    // F1: a registered submodule that has its own `.gitmodules`.
+    let (_g, ws) = keep("refuse-nested-submodules");
+    std::fs::create_dir_all(ws.join("mid")).unwrap();
+    std::fs::write(ws.join("mid/.git"), "gitdir: /elsewhere\n").unwrap();
+    std::fs::write(ws.join(".gitmodules"), "[submodule \"m\"]\n\tpath = mid\n").unwrap();
+    assert!(protect_plan(&ws).is_ok(), "a plain submodule is fine");
+    std::fs::write(
+        ws.join("mid/.gitmodules"),
+        "[submodule \"i\"]\n\tpath = inner\n",
+    )
+    .unwrap();
+    let e = protect_plan(&ws).unwrap_err();
+    assert!(e.contains("nested submodules") && e.contains("mid"), "{e}");
+    // A link named `.gitmodules` in the submodule is refused too (not followed).
+    std::fs::remove_file(ws.join("mid/.gitmodules")).unwrap();
+    std::os::unix::fs::symlink(ws.join("x"), ws.join("mid/.gitmodules")).unwrap();
+    assert!(protect_plan(&ws).unwrap_err().contains("symbolic link"));
+
+    // F2: the in-workspace target of a gitdir file redirects with `commondir`.
+    let (_g, ws) = keep("refuse-commondir");
+    std::fs::create_dir_all(ws.join("repo.git/worktrees/ws2")).unwrap();
+    std::fs::write(ws.join("repo.git/worktrees/ws2/commondir"), "../..\n").unwrap();
+    std::fs::write(
+        ws.join(".git"),
+        format!("gitdir: {}\n", ws.join("repo.git/worktrees/ws2").display()),
+    )
+    .unwrap();
+    let e = protect_plan(&ws).unwrap_err();
+    assert!(e.contains("commondir") && e.contains("redirects"), "{e}");
+    // The same for config.worktree, and for a top-level `.git` DIRECTORY.
+    std::fs::remove_file(ws.join("repo.git/worktrees/ws2/commondir")).unwrap();
+    std::fs::write(ws.join("repo.git/worktrees/ws2/config.worktree"), "").unwrap();
+    assert!(protect_plan(&ws).unwrap_err().contains("config.worktree"));
+    let (_g, ws) = keep("refuse-commondir-dir");
+    std::fs::create_dir_all(ws.join(".git")).unwrap();
+    assert!(protect_plan(&ws).is_ok());
+    std::fs::write(ws.join(".git/commondir"), "../other\n").unwrap();
+    assert!(protect_plan(&ws).unwrap_err().contains("commondir"));
+    // Inside the already read-only `.git` a worktree's `commondir` is normal.
+    let (_g, ws) = keep("commondir-covered");
+    std::fs::create_dir_all(ws.join(".git/worktrees/w")).unwrap();
+    std::fs::write(ws.join(".git/worktrees/w/commondir"), "../..\n").unwrap();
+    std::fs::create_dir_all(ws.join("sub")).unwrap();
+    std::fs::write(
+        ws.join("sub/.git"),
+        format!("gitdir: {}\n", ws.join(".git/worktrees/w").display()),
+    )
+    .unwrap();
+    std::fs::write(ws.join(".gitmodules"), "[submodule \"s\"]\n\tpath = sub\n").unwrap();
+    assert!(protect_plan(&ws).is_ok());
+
+    // H2: an in-workspace gitdir target that does not exist (outside: unchanged).
+    let (_g, ws) = keep("refuse-missing-target");
+    std::fs::write(ws.join(".git"), "gitdir: .gd\n").unwrap();
+    let e = protect_plan(&ws).unwrap_err();
+    assert!(e.contains("does not exist"), "{e}");
+    std::fs::write(ws.join(".git"), "gitdir: /elsewhere/none\n").unwrap();
+    assert!(protect_plan(&ws).is_ok());
+
+    // H1: a second hard link to `.gitmodules`.
+    let (_g, ws) = keep("refuse-modules-twin");
+    std::fs::write(ws.join(".gitmodules"), "[submodule \"s\"]\n\tpath = sub\n").unwrap();
+    std::fs::hard_link(ws.join(".gitmodules"), ws.join("modules-twin")).unwrap();
+    assert!(protect_plan(&ws).unwrap_err().contains("hard links"));
+}
