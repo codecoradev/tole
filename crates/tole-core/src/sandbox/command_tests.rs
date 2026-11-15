@@ -141,7 +141,7 @@ fn the_workspace_is_writable_and_is_the_working_directory() {
 }
 
 #[test]
-fn the_protected_paths_are_read_only_on_top_of_the_writable_workspace() {
+fn the_git_dir_and_tole_are_read_only_on_top_of_the_writable_workspace() {
     let ws = tmp("protect");
     for d in [".git/hooks", ".tole"] {
         std::fs::create_dir_all(ws.join(d)).unwrap();
@@ -159,36 +159,106 @@ fn the_protected_paths_are_read_only_on_top_of_the_writable_workspace() {
     }
 }
 
+/// #849: the WHOLE `.git` is one read-only mount: no leaf mounts and no
+/// writable anchor (a writable `.git` can redirect git to a planted gitdir
+/// with `commondir`, whatever is locked inside it).
+#[test]
+fn the_whole_git_dir_is_one_read_only_mount_with_no_leaves_and_no_writable_anchor() {
+    let ws = tmp("wholegit");
+    for d in [".git/hooks", ".git/modules/sub/hooks", ".tole"] {
+        std::fs::create_dir_all(ws.join(d)).unwrap();
+    }
+    std::fs::write(ws.join(".git/config"), "x").unwrap();
+    let a = run_argv(&ws);
+    let g = ws.join(".git").display().to_string();
+    assert!(has(&a, &["--ro-bind", &g, &g]), "{a:?}");
+    assert!(!has(&a, &["--bind", &g, &g]), ".git is never writable");
+    assert!(
+        !a.iter().any(|x| x.starts_with(&format!("{g}/"))),
+        "nothing is mounted inside .git: {a:?}"
+    );
+}
+
+/// The mount is made even when `hooks` or `config` is missing, so nothing can
+/// be created inside; a missing `.git` creates nothing.
+#[test]
+fn a_git_dir_without_hooks_or_config_is_still_read_only_and_a_missing_one_is_not_created() {
+    let ws = tmp("wholegit-bare");
+    std::fs::create_dir_all(ws.join(".git")).unwrap();
+    assert_eq!(protect_plan(&ws).unwrap(), [ws.join(".git")]);
+    let bare = tmp("wholegit-nogit");
+    assert!(protect_plan(&bare).unwrap().is_empty());
+    assert!(!bare.join(".git").exists(), "planning creates nothing");
+}
+
+/// A gitdir file (worktree, submodule) is bound read-only itself: it cannot be
+/// replaced by a directory with hooks. Its target is not bound.
+#[test]
+fn a_gitdir_file_is_bound_read_only_itself() {
+    let ws = tmp("gitfile");
+    std::fs::write(ws.join(".git"), "gitdir: /elsewhere/.git/worktrees/x\n").unwrap();
+    assert_eq!(protect_plan(&ws).unwrap(), [ws.join(".git")]);
+    let a = run_argv(&ws);
+    let g = ws.join(".git").display().to_string();
+    assert!(has(&a, &["--ro-bind", &g, &g]));
+    assert!(!a.contains(&"/elsewhere/.git/worktrees/x".to_string()));
+}
+
+/// A link cannot be protected by a mount (the command removes it and makes a
+/// real directory, or it leads to a writable place), so the launch is refused
+/// instead of binding the target.
 #[cfg(unix)]
 #[test]
-fn a_protected_link_is_followed_and_its_target_is_what_gets_bound() {
-    let ws = tmp("plink");
-    std::fs::create_dir_all(ws.join(".git")).unwrap();
-    std::fs::create_dir_all(ws.join("githooks")).unwrap();
-    std::os::unix::fs::symlink("../githooks", ws.join(".git/hooks")).unwrap();
-    // `.tole` leads out of the workspace: not in the sandbox's view at all.
-    let outside = tmp("plink-out");
-    std::os::unix::fs::symlink(&outside, ws.join(".tole")).unwrap();
-    let a = run_argv(&ws);
-    let target = ws.join("githooks").display().to_string();
-    assert!(has(&a, &["--ro-bind", &target, &target]), "target bound ro");
-    assert!(
-        !a.contains(&outside.display().to_string()),
-        "a target outside the workspace is not bound"
-    );
-    let link = ws.join(".git/hooks").display().to_string();
-    assert!(
-        !a.contains(&link),
-        "the link spelling is never a bind path: {a:?}"
-    );
+fn a_protected_path_that_is_a_link_is_refused() {
+    for (tag, link, target) in [
+        ("git", ".git", "gitdir"),
+        ("hooks", ".git/hooks", "githooks"),
+        ("config", ".git/config", "gitconfig"),
+        ("tole", ".tole", "tole-real"),
+    ] {
+        let ws = tmp(&format!("plink-{tag}"));
+        std::fs::create_dir_all(ws.join(".git")).unwrap();
+        std::fs::create_dir_all(ws.join(target)).unwrap();
+        if link == ".git" {
+            std::fs::remove_dir_all(ws.join(".git")).unwrap();
+        }
+        std::os::unix::fs::symlink(ws.join(target), ws.join(link)).unwrap();
+        let env = env_in(&ws);
+        let l = plan_command(
+            &on(Mode::Required, Mode::Required),
+            &usable(),
+            false,
+            &env,
+            Consumer::RunCommand,
+            ("sh", &[]),
+        );
+        let CommandLaunch::Refused(why) = l else {
+            panic!("{link}: {l:?}")
+        };
+        assert!(why.contains("symbolic link") && why.contains(link), "{why}");
+        // Optional, attended: the owner's own fallback, with the reason.
+        let l = plan_command(
+            &on(Mode::Optional, Mode::Optional),
+            &usable(),
+            false,
+            &env,
+            Consumer::RunCommand,
+            ("sh", &[]),
+        );
+        let CommandLaunch::Direct { warning: Some(w) } = l else {
+            panic!("{link}: {l:?}")
+        };
+        assert!(w.contains("symbolic link"), "{w}");
+    }
 }
 
 #[test]
 fn a_protected_path_that_does_not_exist_is_not_bound() {
     let ws = tmp("absent");
-    assert!(protected_paths(&ws).is_empty());
+    assert!(protect_plan(&ws).unwrap().is_empty());
     let a = run_argv(&ws);
     assert!(!a.iter().any(|x| x.ends_with(".tole")), "{a:?}");
+    assert!(!a.iter().any(|x| x.ends_with(".git")), "{a:?}");
 }
 
 #[test]
@@ -946,4 +1016,529 @@ fn doctor_warns_when_verify_needs_a_toolchain_the_sandbox_cannot_see() {
     // Verify off: nothing to say about it.
     let off = doctor_lines_for(&Consumers::default(), &usable(), Some(&home));
     assert!(!off.iter().any(|x| x.contains("WARNING verify")), "{off:?}");
+}
+
+// Nested gitdirs (#849 follow-up): what the plan names, and what it refuses.
+
+/// A fresh resolved directory and the guard that removes it.
+fn keep(tag: &str) -> (TestDir, PathBuf) {
+    let g = tmp(tag);
+    let p = std::fs::canonicalize(&*g).unwrap();
+    (g, p)
+}
+
+fn rw(p: &Path) -> String {
+    p.display().to_string()
+}
+
+/// A registered submodule: its `.git` is a gitdir FILE inside the workspace,
+/// pointing into the (read-only) top-level `.git/modules`.
+#[cfg(unix)]
+#[test]
+fn a_submodule_listed_in_gitmodules_gets_its_git_file_bound_read_only() {
+    let (_guard, ws) = keep("nested-sub");
+    std::fs::create_dir_all(ws.join(".git/modules/sub")).unwrap();
+    std::fs::create_dir_all(ws.join("libs/sub")).unwrap();
+    std::fs::write(ws.join("libs/sub/.git"), "gitdir: ../../.git/modules/sub\n").unwrap();
+    std::fs::write(
+        ws.join(".gitmodules"),
+        "[submodule \"sub\"]\n\tpath = libs/sub\n\turl = x\n",
+    )
+    .unwrap();
+    let plan = protect_plan(&ws).unwrap();
+    assert!(plan.contains(&ws.join(".git")));
+    assert!(plan.contains(&ws.join("libs/sub/.git")), "{plan:?}");
+    // The file that names the submodules is read-only too (the next plan reads it).
+    assert!(plan.contains(&ws.join(".gitmodules")), "{plan:?}");
+    // The gitdir it points to is inside the already read-only .git.
+    assert!(!plan.contains(&ws.join(".git/modules/sub")), "{plan:?}");
+    let a = run_argv(&ws);
+    let f = rw(&ws.join("libs/sub/.git"));
+    assert!(has(&a, &["--ro-bind", &f, &f]));
+}
+
+/// `git init --separate-git-dir=ws/.gd`: the top-level `.git` file points into
+/// the workspace, and the target is bound read-only too.
+#[cfg(unix)]
+#[test]
+fn a_top_level_gitdir_file_pointing_inside_the_workspace_binds_the_target_too() {
+    let (_guard, ws) = keep("sepgit");
+    std::fs::create_dir_all(ws.join(".gd/hooks")).unwrap();
+    std::fs::write(
+        ws.join(".git"),
+        format!("gitdir: {}\n", ws.join(".gd").display()),
+    )
+    .unwrap();
+    let plan = protect_plan(&ws).unwrap();
+    assert!(plan.contains(&ws.join(".gd")), "{plan:?}");
+    assert!(plan.contains(&ws.join(".git")), "{plan:?}");
+    // A relative target, and one that leaves the workspace (not in the view).
+    std::fs::write(ws.join(".git"), "gitdir: .gd\n").unwrap();
+    assert!(protect_plan(&ws).unwrap().contains(&ws.join(".gd")));
+    std::fs::write(ws.join(".git"), "gitdir: /elsewhere/x\n").unwrap();
+    assert_eq!(protect_plan(&ws).unwrap(), [ws.join(".git")]);
+}
+
+#[cfg(unix)]
+#[test]
+fn child_agent_worktrees_get_their_git_file_bound_read_only() {
+    let (_guard, ws) = keep("wts");
+    std::fs::create_dir_all(ws.join(".git/worktrees/wt1")).unwrap();
+    std::fs::create_dir_all(ws.join(".tole-worktrees/wt1")).unwrap();
+    std::fs::write(
+        ws.join(".tole-worktrees/wt1/.git"),
+        format!("gitdir: {}\n", ws.join(".git/worktrees/wt1").display()),
+    )
+    .unwrap();
+    let plan = protect_plan(&ws).unwrap();
+    // The whole directory is read-only, which covers every worktree `.git` file.
+    assert!(plan.contains(&ws.join(".tole-worktrees")), "{plan:?}");
+    assert!(
+        !plan.contains(&ws.join(".tole-worktrees/wt1/.git")),
+        "{plan:?}"
+    );
+}
+
+/// Refused, not skipped: a link anywhere in the chain, a path that leaves the
+/// workspace, too many entries.
+#[cfg(unix)]
+#[test]
+fn a_link_or_an_escape_in_the_nested_chain_is_refused() {
+    use std::os::unix::fs::symlink;
+    let guards = std::cell::RefCell::new(Vec::new());
+    let fresh = |tag: &str| {
+        let (g, p) = keep(tag);
+        guards.borrow_mut().push(g);
+        p
+    };
+    // `.gitmodules` that is a link.
+    let ws = fresh("nest-l1");
+    std::fs::write(ws.join("real"), "").unwrap();
+    symlink(ws.join("real"), ws.join(".gitmodules")).unwrap();
+    assert!(protect_plan(&ws).unwrap_err().contains("symbolic link"));
+    // A submodule path that is a link, or passes through one.
+    let ws = fresh("nest-l2");
+    std::fs::create_dir_all(ws.join("real")).unwrap();
+    symlink(ws.join("real"), ws.join("sub")).unwrap();
+    std::fs::write(ws.join(".gitmodules"), "[submodule \"s\"]\n\tpath = sub\n").unwrap();
+    assert!(protect_plan(&ws).unwrap_err().contains("symbolic link"));
+    // Paths that leave the workspace.
+    for bad in ["../outside", "/etc", "a/../../b", ""] {
+        let ws = fresh("nest-esc");
+        std::fs::write(
+            ws.join(".gitmodules"),
+            format!("[submodule \"s\"]\n\tpath = {bad}\n"),
+        )
+        .unwrap();
+        assert!(
+            protect_plan(&ws).unwrap_err().contains(".gitmodules"),
+            "{bad:?}"
+        );
+    }
+    // A gitdir target that passes through a link inside the workspace.
+    let ws = fresh("nest-l3");
+    std::fs::create_dir_all(ws.join("real/gd")).unwrap();
+    symlink(ws.join("real"), ws.join("lnk")).unwrap();
+    std::fs::write(ws.join(".git"), "gitdir: lnk/gd\n").unwrap();
+    assert!(protect_plan(&ws).unwrap_err().contains("symbolic link"));
+    // More than the bound.
+    let ws = fresh("nest-many");
+    let many: String = (0..=MAX_NESTED)
+        .map(|i| format!("[submodule \"s{i}\"]\n\tpath = m{i}\n"))
+        .collect();
+    std::fs::write(ws.join(".gitmodules"), many).unwrap();
+    assert!(protect_plan(&ws).unwrap_err().contains("more than"));
+}
+
+/// Pinned so the doc stays exact: no workspace scan, a nested repository that
+/// is in neither `.gitmodules` nor `.tole-worktrees` is not protected.
+#[test]
+fn an_arbitrary_nested_repository_is_not_protected() {
+    let (_guard, ws) = keep("nest-arb");
+    std::fs::create_dir_all(ws.join("vendor/x/.git/hooks")).unwrap();
+    assert!(protect_plan(&ws).unwrap().is_empty());
+}
+
+/// #849 (TOCTOU): the plan is made again right before the command line is
+/// handed out. A `.git` that appeared since, or a directory swapped for a
+/// link, refuses the launch.
+#[cfg(unix)]
+#[test]
+fn a_path_that_appears_or_becomes_a_link_between_plan_and_launch_is_refused() {
+    use std::os::unix::fs::symlink;
+    let (_guard, ws) = keep("recheck");
+    let c = on(Mode::Required, Mode::Required);
+    let args_of = |ws: &Path| match plan_command(
+        &c,
+        &usable(),
+        false,
+        &env_in(ws),
+        Consumer::RunCommand,
+        ("sh", &[]),
+    ) {
+        CommandLaunch::Sandboxed { args, .. } => args,
+        other => panic!("{other:?}"),
+    };
+    // Planned with no `.git`; one appears.
+    let args = args_of(&ws);
+    assert!(recheck_plan(&ws, &args).is_ok());
+    std::fs::create_dir_all(ws.join(".git/hooks")).unwrap();
+    let e = recheck_plan(&ws, &args).unwrap_err();
+    assert!(e.contains("appeared or changed"), "{e}");
+    // Planned with a real `.git`; swapped for a link.
+    let args = args_of(&ws);
+    assert!(recheck_plan(&ws, &args).is_ok());
+    std::fs::remove_dir_all(ws.join(".git")).unwrap();
+    std::fs::create_dir_all(ws.join("elsewhere/hooks")).unwrap();
+    symlink(ws.join("elsewhere"), ws.join(".git")).unwrap();
+    let e = recheck_plan(&ws, &args).unwrap_err();
+    assert!(e.contains("symbolic link"), "{e}");
+}
+
+/// A `.gitmodules` padded past the read bound is refused, not read in part:
+/// git on the host parses all of it, so a registered submodule whose `path`
+/// lies past the cut would go unprotected.
+#[test]
+fn an_oversized_gitmodules_or_gitdir_file_is_refused_not_read_in_part() {
+    let (_g, ws) = keep("oversize-modules");
+    let pad = "# ".to_string() + &"x".repeat(70 * 1024) + "\n";
+    std::fs::write(
+        ws.join(".gitmodules"),
+        format!("{pad}[submodule \"s\"]\n\tpath = libs/s\n"),
+    )
+    .unwrap();
+    let e = protect_plan(&ws).unwrap_err();
+    assert!(
+        e.contains(".gitmodules") && e.contains("larger than"),
+        "{e}"
+    );
+    // Exactly at the bound is fine; one byte over is not.
+    let at = format!("{}\n", "#".repeat(64 * 1024 - 1));
+    std::fs::write(ws.join(".gitmodules"), &at).unwrap();
+    assert!(protect_plan(&ws).is_ok());
+    std::fs::write(ws.join(".gitmodules"), format!("{at}#")).unwrap();
+    assert!(protect_plan(&ws).is_err());
+    // A gitdir file with padding is refused too.
+    let (_g2, ws2) = keep("oversize-gitdir");
+    std::fs::write(
+        ws2.join(".git"),
+        format!("gitdir: .gd\n{}\n", "x".repeat(5000)),
+    )
+    .unwrap();
+    assert!(protect_plan(&ws2).unwrap_err().contains("larger than"));
+}
+
+/// A mount stops writes by path, not by inode, and a gitdir the host's git
+/// follows must not have another way in: a link inside the target's `hooks`,
+/// a second hard link to its config or a hook, a hard-linked gitdir file.
+#[cfg(unix)]
+#[test]
+fn another_name_or_link_into_what_git_runs_is_refused() {
+    use std::os::unix::fs::symlink;
+    let fresh = |tag: &str| keep(tag);
+    // hooks entry that is a link, in a `.git` directory.
+    let (_g, ws) = fresh("alias-hooklink");
+    std::fs::create_dir_all(ws.join(".git/hooks")).unwrap();
+    std::fs::write(ws.join("x.sh"), "#!/bin/sh\n").unwrap();
+    symlink(ws.join("x.sh"), ws.join(".git/hooks/pre-commit")).unwrap();
+    assert!(protect_plan(&ws).unwrap_err().contains("symbolic link"));
+    // The same in the target of a gitdir FILE (separate git dir).
+    let (_g, ws) = fresh("alias-targetlink");
+    std::fs::create_dir_all(ws.join(".gd/hooks")).unwrap();
+    std::fs::write(ws.join("x.sh"), "#!/bin/sh\n").unwrap();
+    symlink(ws.join("x.sh"), ws.join(".gd/hooks/pre-commit")).unwrap();
+    std::fs::write(ws.join(".git"), "gitdir: .gd\n").unwrap();
+    assert!(protect_plan(&ws).unwrap_err().contains("symbolic link"));
+    // `hooks` itself a link inside the target.
+    let (_g, ws) = fresh("alias-targethooks");
+    std::fs::create_dir_all(ws.join(".gd")).unwrap();
+    std::fs::create_dir_all(ws.join("realhooks")).unwrap();
+    symlink(ws.join("realhooks"), ws.join(".gd/hooks")).unwrap();
+    std::fs::write(ws.join(".git"), "gitdir: .gd\n").unwrap();
+    assert!(protect_plan(&ws).unwrap_err().contains("symbolic link"));
+    // A second hard link to the config, to a hook, to a gitdir file.
+    let (_g, ws) = fresh("alias-hard-config");
+    std::fs::create_dir_all(ws.join(".git/hooks")).unwrap();
+    std::fs::write(ws.join(".git/config"), "[core]\n").unwrap();
+    std::fs::hard_link(ws.join(".git/config"), ws.join("config-twin")).unwrap();
+    assert!(protect_plan(&ws).unwrap_err().contains("hard links"));
+    std::fs::remove_file(ws.join("config-twin")).unwrap();
+    assert!(protect_plan(&ws).is_ok());
+    std::fs::write(ws.join(".git/hooks/pre-commit"), "x").unwrap();
+    std::fs::hard_link(ws.join(".git/hooks/pre-commit"), ws.join("hook-twin")).unwrap();
+    assert!(protect_plan(&ws).unwrap_err().contains("hard links"));
+    let (_g, ws) = fresh("alias-hard-gitfile");
+    std::fs::write(ws.join(".git"), "gitdir: /elsewhere\n").unwrap();
+    std::fs::hard_link(ws.join(".git"), ws.join("git-twin")).unwrap();
+    assert!(protect_plan(&ws).unwrap_err().contains("hard links"));
+}
+
+/// A FIFO named `.git`, `.gitmodules` or a submodule's `.git` must not hang the
+/// plan (opening a FIFO for reading blocks until a writer shows up).
+#[cfg(unix)]
+#[test]
+fn a_fifo_in_the_protected_names_does_not_hang_the_plan() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let mkfifo = |p: &Path| {
+        let c = CString::new(p.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    };
+    let bounded = |ws: PathBuf| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(protect_plan(&ws));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("protect_plan hung on a FIFO")
+    };
+    let (_g, ws) = keep("fifo-modules");
+    mkfifo(&ws.join(".gitmodules"));
+    assert!(bounded(ws).unwrap_err().contains("not a regular file"));
+    let (_g, ws) = keep("fifo-git");
+    mkfifo(&ws.join(".git"));
+    let plan = bounded(ws.clone()).unwrap();
+    assert_eq!(plan, [ws.join(".git")], "bound, never read");
+    let (_g, ws) = keep("fifo-sub");
+    std::fs::create_dir_all(ws.join("sub")).unwrap();
+    mkfifo(&ws.join("sub/.git"));
+    std::fs::write(ws.join(".gitmodules"), "[submodule \"s\"]\n\tpath = sub\n").unwrap();
+    assert!(bounded(ws.clone()).unwrap().contains(&ws.join("sub/.git")));
+}
+
+/// Git reads `.gitmodules` as a config file, and the file is writable from the
+/// sandbox: whatever git would read differently is refused, not guessed.
+#[test]
+fn a_gitmodules_git_could_read_differently_is_refused() {
+    let plan = |text: &str| {
+        let (_g, ws) = keep("gm-syntax");
+        std::fs::write(ws.join(".gitmodules"), text).unwrap();
+        protect_plan(&ws)
+    };
+    for (bad, why) in [
+        ("[submodule \"s\"]\n\tpath = sub # note\n", "inline #"),
+        ("[submodule \"s\"]\n\tpath = sub ; note\n", "inline ;"),
+        ("[submodule \"s\"]\n\tpath = \"sub\"\n", "quoted value"),
+        ("[submodule \"s\"]\n\tpath = su\\\n\tb\n", "continuation"),
+        (
+            "[submodule \"s\"]\n\turl = http://h/x#frag\n",
+            "# in another value",
+        ),
+        ("[core]\n\tpath = sub\n", "other section"),
+        ("[submodule.s]\n\tpath = sub\n", "old header syntax"),
+        ("[submodule \"a\\\"b\"]\n\tpath = sub\n", "escaped name"),
+        ("path = sub\n", "key outside a section"),
+        ("[submodule \"s\"]\n\tpath sub\n", "not key = value"),
+    ] {
+        let e = plan(bad).unwrap_err();
+        assert!(
+            e.contains("plain") && e.contains(".gitmodules"),
+            "{why}: {e}"
+        );
+    }
+    // The plain subset git reads the same way: case-insensitive names, CRLF,
+    // whole-line comments, other plain keys.
+    let (_g, ws) = keep("gm-plain");
+    std::fs::create_dir_all(ws.join("sub")).unwrap();
+    std::fs::write(ws.join("sub/.git"), "gitdir: /elsewhere\n").unwrap();
+    std::fs::write(
+        ws.join(".gitmodules"),
+        "# comment\r\n[Submodule \"s\"]\r\n\tPATH = sub\r\n\turl = https://h/x\r\n; more\r\n",
+    )
+    .unwrap();
+    assert!(protect_plan(&ws).unwrap().contains(&ws.join("sub/.git")));
+}
+
+/// Layouts the plan cannot cover are refused, not half protected: a submodule
+/// with submodules of its own, a gitdir that redirects to another directory
+/// (`commondir`, `config.worktree`), a target that does not exist, a second
+/// name for `.gitmodules`.
+#[cfg(unix)]
+#[test]
+fn nested_submodules_commondir_redirects_and_missing_targets_are_refused() {
+    // F1: a registered submodule that has its own `.gitmodules`.
+    let (_g, ws) = keep("refuse-nested-submodules");
+    std::fs::create_dir_all(ws.join("mid")).unwrap();
+    std::fs::write(ws.join("mid/.git"), "gitdir: /elsewhere\n").unwrap();
+    std::fs::write(ws.join(".gitmodules"), "[submodule \"m\"]\n\tpath = mid\n").unwrap();
+    assert!(protect_plan(&ws).is_ok(), "a plain submodule is fine");
+    std::fs::write(
+        ws.join("mid/.gitmodules"),
+        "[submodule \"i\"]\n\tpath = inner\n",
+    )
+    .unwrap();
+    let e = protect_plan(&ws).unwrap_err();
+    assert!(e.contains("nested submodules") && e.contains("mid"), "{e}");
+    // A link named `.gitmodules` in the submodule is refused too (not followed).
+    std::fs::remove_file(ws.join("mid/.gitmodules")).unwrap();
+    std::os::unix::fs::symlink(ws.join("x"), ws.join("mid/.gitmodules")).unwrap();
+    assert!(protect_plan(&ws).unwrap_err().contains("symbolic link"));
+
+    // F2: the in-workspace target of a gitdir file redirects with `commondir`.
+    let (_g, ws) = keep("refuse-commondir");
+    std::fs::create_dir_all(ws.join("repo.git/worktrees/ws2")).unwrap();
+    std::fs::write(ws.join("repo.git/worktrees/ws2/commondir"), "../..\n").unwrap();
+    std::fs::write(
+        ws.join(".git"),
+        format!("gitdir: {}\n", ws.join("repo.git/worktrees/ws2").display()),
+    )
+    .unwrap();
+    let e = protect_plan(&ws).unwrap_err();
+    assert!(e.contains("commondir") && e.contains("redirects"), "{e}");
+    // The same for config.worktree, and for a top-level `.git` DIRECTORY.
+    std::fs::remove_file(ws.join("repo.git/worktrees/ws2/commondir")).unwrap();
+    std::fs::write(ws.join("repo.git/worktrees/ws2/config.worktree"), "").unwrap();
+    assert!(protect_plan(&ws).unwrap_err().contains("config.worktree"));
+    let (_g, ws) = keep("refuse-commondir-dir");
+    std::fs::create_dir_all(ws.join(".git")).unwrap();
+    assert!(protect_plan(&ws).is_ok());
+    std::fs::write(ws.join(".git/commondir"), "../other\n").unwrap();
+    assert!(protect_plan(&ws).unwrap_err().contains("commondir"));
+    // Inside the already read-only `.git` a worktree's `commondir` is normal.
+    let (_g, ws) = keep("commondir-covered");
+    std::fs::create_dir_all(ws.join(".git/worktrees/w")).unwrap();
+    std::fs::write(ws.join(".git/worktrees/w/commondir"), "../..\n").unwrap();
+    std::fs::create_dir_all(ws.join("sub")).unwrap();
+    std::fs::write(
+        ws.join("sub/.git"),
+        format!("gitdir: {}\n", ws.join(".git/worktrees/w").display()),
+    )
+    .unwrap();
+    std::fs::write(ws.join(".gitmodules"), "[submodule \"s\"]\n\tpath = sub\n").unwrap();
+    assert!(protect_plan(&ws).is_ok());
+
+    // H2: an in-workspace gitdir target that does not exist (outside: unchanged).
+    let (_g, ws) = keep("refuse-missing-target");
+    std::fs::write(ws.join(".git"), "gitdir: .gd\n").unwrap();
+    let e = protect_plan(&ws).unwrap_err();
+    assert!(e.contains("does not exist"), "{e}");
+    std::fs::write(ws.join(".git"), "gitdir: /elsewhere/none\n").unwrap();
+    assert!(protect_plan(&ws).is_ok());
+
+    // H1: a second hard link to `.gitmodules`.
+    let (_g, ws) = keep("refuse-modules-twin");
+    std::fs::write(ws.join(".gitmodules"), "[submodule \"s\"]\n\tpath = sub\n").unwrap();
+    std::fs::create_dir_all(ws.join("sub")).unwrap();
+    std::fs::write(ws.join("sub/.git"), "gitdir: /elsewhere\n").unwrap();
+    std::fs::hard_link(ws.join(".gitmodules"), ws.join("modules-twin")).unwrap();
+    assert!(protect_plan(&ws).unwrap_err().contains("hard links"));
+}
+
+/// A submodule listed in `.gitmodules` but not initialized has no `.git` to
+/// bind; a command could create one. Refused until initialized or removed.
+#[cfg(unix)]
+#[test]
+fn an_uninitialized_submodule_refuses_the_launch() {
+    let listed = "[submodule \"s\"]\n\tpath = sub\n";
+    // Missing path.
+    let (_g, ws) = keep("uninit-missing");
+    std::fs::write(ws.join(".gitmodules"), listed).unwrap();
+    let e = protect_plan(&ws).unwrap_err();
+    assert!(
+        e.contains("not initialized") && e.contains("sub") && e.contains("submodule update --init"),
+        "{e}"
+    );
+    // Empty directory (a clone without --recursive), and a directory with no .git.
+    std::fs::create_dir_all(ws.join("sub")).unwrap();
+    assert!(protect_plan(&ws).unwrap_err().contains("not initialized"));
+    std::fs::write(ws.join("sub/file"), "x").unwrap();
+    assert!(protect_plan(&ws).unwrap_err().contains("not initialized"));
+    // A regular file where the submodule should be.
+    let (_g, ws) = keep("uninit-file");
+    std::fs::write(ws.join(".gitmodules"), listed).unwrap();
+    std::fs::write(ws.join("sub"), "x").unwrap();
+    assert!(protect_plan(&ws).unwrap_err().contains("not initialized"));
+    // Initialized: fine.
+    let (_g, ws) = keep("uninit-ok");
+    std::fs::write(ws.join(".gitmodules"), listed).unwrap();
+    std::fs::create_dir_all(ws.join("sub")).unwrap();
+    std::fs::write(ws.join("sub/.git"), "gitdir: /elsewhere\n").unwrap();
+    assert!(protect_plan(&ws).is_ok());
+}
+
+/// A linked worktree inside the workspace but outside `.tole-worktrees` cannot
+/// be protected: it is found through the registry of the gitdir in effect and
+/// refused. A broken registry is refused, never skipped.
+#[cfg(unix)]
+#[test]
+fn a_linked_worktree_elsewhere_in_the_workspace_is_refused() {
+    let register = |gitdir: &Path, id: &str, wt_git: &Path| {
+        std::fs::create_dir_all(gitdir.join("worktrees").join(id)).unwrap();
+        std::fs::write(
+            gitdir.join("worktrees").join(id).join("gitdir"),
+            format!("{}\n", wt_git.display()),
+        )
+        .unwrap();
+    };
+    // Top-level `.git` directory.
+    let (_g, ws) = keep("lwt-dir");
+    std::fs::create_dir_all(ws.join("other/wt")).unwrap();
+    std::fs::write(ws.join("other/wt/.git"), "gitdir: x\n").unwrap();
+    register(&ws.join(".git"), "w1", &ws.join("other/wt/.git"));
+    let e = protect_plan(&ws).unwrap_err();
+    assert!(
+        e.contains("linked worktree")
+            && e.contains("other/wt/.git")
+            && e.contains(".tole-worktrees"),
+        "{e}"
+    );
+    // The target of a gitdir FILE (separate git dir) is read the same way.
+    let (_g, ws) = keep("lwt-sep");
+    std::fs::create_dir_all(ws.join("other/wt")).unwrap();
+    std::fs::write(ws.join("other/wt/.git"), "gitdir: x\n").unwrap();
+    std::fs::create_dir_all(ws.join(".gd")).unwrap();
+    std::fs::write(ws.join(".git"), "gitdir: .gd\n").unwrap();
+    register(&ws.join(".gd"), "w1", &ws.join("other/wt/.git"));
+    assert!(protect_plan(&ws).unwrap_err().contains("linked worktree"));
+    // Under `.tole-worktrees` (bound whole), outside the workspace (not in the
+    // view) and stale (the path is gone) are fine.
+    let (_g, ws) = keep("lwt-fine");
+    std::fs::create_dir_all(ws.join(".tole-worktrees/a")).unwrap();
+    std::fs::write(ws.join(".tole-worktrees/a/.git"), "gitdir: x\n").unwrap();
+    register(&ws.join(".git"), "a", &ws.join(".tole-worktrees/a/.git"));
+    register(&ws.join(".git"), "b", Path::new("/elsewhere/wt/.git"));
+    register(&ws.join(".git"), "c", &ws.join("gone/.git"));
+    assert!(protect_plan(&ws).is_ok());
+
+    // Refused, never skipped: a link or non-directory `worktrees`, a link or
+    // non-regular back-pointer, too many entries, an oversized pointer.
+    let (_g, ws) = keep("lwt-link-registry");
+    std::fs::create_dir_all(ws.join(".git")).unwrap();
+    std::fs::create_dir_all(ws.join("real")).unwrap();
+    std::os::unix::fs::symlink(ws.join("real"), ws.join(".git/worktrees")).unwrap();
+    assert!(protect_plan(&ws).unwrap_err().contains("not a directory"));
+    let (_g, ws) = keep("lwt-file-registry");
+    std::fs::create_dir_all(ws.join(".git")).unwrap();
+    std::fs::write(ws.join(".git/worktrees"), "x").unwrap();
+    assert!(protect_plan(&ws).unwrap_err().contains("not a directory"));
+    let (_g, ws) = keep("lwt-link-pointer");
+    std::fs::create_dir_all(ws.join(".git/worktrees/w1")).unwrap();
+    std::fs::write(ws.join("target"), "/elsewhere/.git\n").unwrap();
+    std::os::unix::fs::symlink(ws.join("target"), ws.join(".git/worktrees/w1/gitdir")).unwrap();
+    assert!(protect_plan(&ws)
+        .unwrap_err()
+        .contains("not a regular file"));
+    let (_g, ws) = keep("lwt-dir-pointer");
+    std::fs::create_dir_all(ws.join(".git/worktrees/w1/gitdir")).unwrap();
+    assert!(protect_plan(&ws)
+        .unwrap_err()
+        .contains("not a regular file"));
+    let (_g, ws) = keep("lwt-many");
+    for i in 0..=MAX_NESTED {
+        register(
+            &ws.join(".git"),
+            &format!("w{i}"),
+            Path::new("/elsewhere/.git"),
+        );
+    }
+    assert!(protect_plan(&ws).unwrap_err().contains("more than"));
+    let (_g, ws) = keep("lwt-big");
+    std::fs::create_dir_all(ws.join(".git/worktrees/w1")).unwrap();
+    std::fs::write(
+        ws.join(".git/worktrees/w1/gitdir"),
+        format!("/elsewhere/{}\n", "x".repeat(5000)),
+    )
+    .unwrap();
+    assert!(protect_plan(&ws).unwrap_err().contains("larger than"));
 }

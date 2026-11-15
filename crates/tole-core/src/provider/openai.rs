@@ -879,6 +879,9 @@ fn drain_detached<R: std::io::Read + Send + 'static>(mut reader: R, live: &Arc<A
         .name("tole-sse-drain".into())
         .spawn(move || {
             let _ = std::io::copy(&mut reader, &mut std::io::sink());
+            // The connection is back in the pool once the reader is
+            // dropped; only then is the slot free (a test waits on it).
+            drop(reader);
             slot.fetch_sub(1, Ordering::SeqCst);
         });
     if spawned.is_err() {
@@ -2685,15 +2688,10 @@ mod streaming_tests {
         a.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Poll until `cond` holds (up to 2 s).
+    /// Poll until `cond` holds (up to the shared 60 s bound: only a failing
+    /// run waits for it, a starved machine must not fail a true condition).
     fn wait_for(cond: impl Fn() -> bool) -> bool {
-        for _ in 0..100 {
-            if cond() {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        cond()
+        crate::test_dir::poll_until(crate::test_dir::WAIT, || cond().then_some(())).is_some()
     }
 
     #[test]
@@ -2703,9 +2701,13 @@ mod streaming_tests {
         for _ in 0..9 {
             let out = p.complete(&[]).unwrap();
             assert!(matches!(out, ProviderOutput::Final { ref text } if text == "hi"));
-            // The drain reads the terminator off-thread; give it a beat so
-            // the next request finds the connection back in the pool.
-            std::thread::sleep(Duration::from_millis(50));
+            // The drain reads the terminator off-thread: wait until it has
+            // finished, so the next request finds the connection back in
+            // the pool (not after a guessed beat).
+            assert!(
+                wait_for(|| count(&p.drain_live) == 0),
+                "the drain never finished"
+            );
         }
         assert_eq!(count(&mock.conns), 1, "9 streamed requests, 1 connection");
     }

@@ -293,46 +293,330 @@ fn the_tools_checks_run_before_the_sandbox() {
     assert!(e.contains("may not run the tole binary"), "{e}");
 }
 
-/// Protected paths that are links are followed: the target is read-only
-/// whatever the link says, and a link to outside reaches nothing.
+/// A workspace with a real repository (`git init`, one commit of `f`) and a
+/// `.tole` dir.
+fn repo(tag: &str) -> PathBuf {
+    let w = ws(tag);
+    host_git(&w, &["init", "-q"]);
+    std::fs::write(w.join("f"), "one\n").unwrap();
+    host_git(&w, &["add", "f"]);
+    host_git(&w, &["commit", "-q", "-m", "one"]);
+    std::fs::create_dir_all(w.join(".tole")).unwrap();
+    w
+}
+
+/// Runs `git args` on the HOST in `w`, as the owner would later; fails the test
+/// when git fails.
+fn host_git_out(w: &Path, args: &[&str]) -> std::process::Output {
+    std::process::Command::new("git")
+        // No background maintenance: a detached `git maintenance`/`gc --auto`
+        // after a commit rewrites `.git` while a test is comparing its tree.
+        .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+        .args(["-c", "gc.auto=0", "-c", "maintenance.auto=false"])
+        .arg("-C")
+        .arg(w)
+        .args(args)
+        .output()
+        .expect("git is needed for this test")
+}
+
+fn host_git(w: &Path, args: &[&str]) {
+    let out = host_git_out(w, args);
+    assert!(out.status.success(), "git {args:?}: {out:?}");
+}
+
+/// Every file, directory and link under `dir` with its bytes, for comparing a
+/// whole tree before and after (not just the leaves).
+fn tree(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    fn walk(base: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>)>) {
+        let mut entries: Vec<_> = std::fs::read_dir(dir).unwrap().flatten().collect();
+        entries.sort_by_key(|e| e.file_name());
+        for e in entries {
+            let p = e.path();
+            let rel = p.strip_prefix(base).unwrap().display().to_string();
+            let t = e.file_type().unwrap();
+            if t.is_dir() {
+                out.push((format!("{rel}/"), Vec::new()));
+                walk(base, &p, out);
+            } else if t.is_symlink() {
+                let to = std::fs::read_link(&p).unwrap();
+                out.push((format!("{rel} -> {}", to.display()), Vec::new()));
+            } else {
+                out.push((rel, std::fs::read(&p).unwrap()));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, dir, &mut out);
+    out
+}
+
+/// Runs each command in the sandbox and asserts it fails (status not 0).
+fn all_fail(tool: &RunCommandTool, attacks: &[&str]) {
+    for a in attacks {
+        let out = run(tool, a);
+        assert_ne!(out["status"], 0, "must fail: {a}: {out}");
+    }
+}
+
+/// #849: the reviewer's attack on a writable `.git` mount point. Git honours
+/// `commondir` INSIDE the gitdir, so pointing it at a planted gitdir in the
+/// workspace made a later `git commit` or `git status` on the HOST run the
+/// planted hook and `core.fsmonitor`. Now `.git` is read-only as a whole: the
+/// write that redirects git fails, and git on the host runs nothing.
 #[test]
-fn a_protected_path_that_is_a_link_cannot_be_used_to_write_through() {
+fn a_commondir_redirect_cannot_make_the_host_run_planted_code() {
     if skipped() {
         return;
     }
-    let w = ws("links");
-    std::fs::create_dir_all(w.join(".git")).unwrap();
-    std::fs::create_dir_all(w.join("githooks")).unwrap();
-    std::fs::write(w.join(".git/config"), "[core]\n").unwrap();
-    std::os::unix::fs::symlink("../githooks", w.join(".git/hooks")).unwrap();
-    let outside = ws("links-outside");
-    std::os::unix::fs::symlink(&outside, w.join(".tole")).unwrap();
+    let w = repo("commondir");
+    let (hook_mark, fsm_mark) = (w.join("PWNED_HOOK"), w.join("PWNED_FSM"));
+    std::fs::write(
+        w.join("attack.sh"),
+        format!(
+            "mkdir evil && cp -r .git/objects .git/refs .git/HEAD evil/ && mkdir evil/hooks\n\
+             printf '#!/bin/sh\\ntouch {h}\\n' > evil/hooks/pre-commit\n\
+             chmod +x evil/hooks/pre-commit\n\
+             printf '[core]\\n\\trepositoryformatversion = 0\\n\\tfsmonitor = touch {f}; echo\\n' > evil/config\n\
+             echo ../evil > .git/commondir\n",
+            h = hook_mark.display(),
+            f = fsm_mark.display()
+        ),
+    )
+    .unwrap();
+    let before = tree(&w.join(".git"));
     let tool = RunCommandTool::new(w.clone());
-    let out = run(
+    let out = run(&tool, "sh attack.sh");
+    assert_ne!(out["status"], 0, "the redirect must fail: {out}");
+    assert!(!w.join(".git/commondir").exists());
+    // The owner, later, on the host.
+    std::fs::write(w.join("f"), "two\n").unwrap();
+    host_git(&w, &["status", "--short"]);
+    host_git(&w, &["commit", "-q", "-am", "two"]);
+    host_git(&w, &["status", "--short"]);
+    assert!(!hook_mark.exists(), "the planted hook ran on the host");
+    assert!(!fsm_mark.exists(), "the planted fsmonitor ran on the host");
+    // The commit really went to the real repository.
+    let log = host_git_out(&w, &["log", "--oneline"]);
+    assert!(String::from_utf8_lossy(&log.stdout).contains("two"));
+    drop(before);
+}
+
+/// Every way to move, remove, replace or write `.git` (and `.tole`) fails, and
+/// the whole `.git` tree is byte for byte what it was.
+#[test]
+fn every_way_to_move_remove_or_write_the_git_dir_fails_and_its_tree_is_unchanged() {
+    if skipped() {
+        return;
+    }
+    let w = repo("gitattack");
+    let before = tree(&w.join(".git"));
+    let tole_before = tree(&w.join(".tole"));
+    let tool = RunCommandTool::new(w.clone());
+    all_fail(
         &tool,
-        "sh -c 'echo x > githooks/a; echo x > .git/hooks/b; echo x > .tole/c; echo x > .git/config; true'",
+        &[
+            "mv .git .g",
+            "rm -rf .git",
+            "rm -rf .tole",
+            "mv .tole .tole.old",
+            "rmdir .git/hooks",
+            "mv .git/hooks .git/hooks.old",
+            "mv .git/config .git/config.old",
+            "rm -f .git/config",
+            "rm -f .git/index",
+            "rm -rf .git/objects",
+            "mkdir .git/x",
+            "touch .git/index.lock",
+            "sh -c 'echo x > .git/HEAD'",
+            "sh -c 'echo x > .git/commondir'",
+            "sh -c 'echo [core] >> .git/config'",
+            "sh -c 'echo x > .git/hooks/pre-commit'",
+            "sh -c 'echo x > .tole/evil'",
+            // Replace by rename over a mount point or into the mount.
+            "sh -c 'mkdir h2 && mv h2 .git/hooks'",
+            "sh -c 'echo x > c2 && mv c2 .git/config'",
+            "sh -c 'mkdir g2 && mv g2 .git'",
+            // The reviewer's first chain: the rename used to succeed.
+            "sh -c 'mv .git .g && cp -a .g .git && printf x > .git/hooks/pre-commit'",
+            // Hard links to a protected inode (EXDEV across mounts).
+            "ln .git/config .git/config2",
+            "ln .git/HEAD head-in-root",
+            "ln .git/hooks/applypatch-msg.sample .git/hooks/h2",
+        ],
     );
-    assert_eq!(out["status"], 0);
-    for p in ["githooks/a", ".git/hooks/b", ".git/config.new"] {
+    assert_eq!(tree(&w.join(".git")), before, ".git changed");
+    assert_eq!(tree(&w.join(".tole")), tole_before, ".tole changed");
+    for p in [".g", ".git.old", "head-in-root"] {
         assert!(!w.join(p).exists(), "{p}");
     }
+}
+
+/// A leaf that does not exist under an existing `.git` (a repository made with
+/// `git init --template=`, or stripped) cannot be created either.
+#[test]
+fn a_repo_without_hooks_or_config_cannot_get_them_planted() {
+    if skipped() {
+        return;
+    }
+    let w = repo("bareleaves");
+    std::fs::remove_dir_all(w.join(".git/hooks")).unwrap();
+    std::fs::remove_file(w.join(".git/config")).unwrap();
+    let before = tree(&w.join(".git"));
+    let tool = RunCommandTool::new(w.clone());
+    all_fail(
+        &tool,
+        &[
+            "mkdir .git/hooks",
+            "sh -c 'mkdir -p .git/hooks && echo x > .git/hooks/pre-commit'",
+            "sh -c 'echo [core] > .git/config'",
+            "sh -c 'echo x > .git/info/exclude2'",
+        ],
+    );
+    assert_eq!(tree(&w.join(".git")), before);
+    assert!(!w.join(".git/hooks").exists() && !w.join(".git/config").exists());
+}
+
+/// A submodule's gitdir lives under `.git/modules/<name>` with its own hooks
+/// and config: they are inside the read-only `.git` too.
+#[test]
+fn a_submodule_gitdir_under_git_modules_cannot_get_a_hook_or_config() {
+    if skipped() {
+        return;
+    }
+    let w = repo("submodule");
+    std::fs::create_dir_all(w.join(".git/modules/sub/hooks")).unwrap();
+    std::fs::write(w.join(".git/modules/sub/config"), "[core]\n").unwrap();
+    let before = tree(&w.join(".git"));
+    let tool = RunCommandTool::new(w.clone());
+    all_fail(
+        &tool,
+        &[
+            "sh -c 'echo x > .git/modules/sub/hooks/pre-commit'",
+            "sh -c 'echo [core] >> .git/modules/sub/config'",
+            "mkdir .git/modules/other",
+            "rm -rf .git/modules",
+            "mv .git/modules .git/modules.old",
+        ],
+    );
+    assert_eq!(tree(&w.join(".git")), before);
+}
+
+/// What still works with a read-only `.git`, and what the model sees when it
+/// does not. Nothing hangs (the tool's own 30 s timeout would fail the test).
+#[test]
+fn git_reads_work_and_git_writes_fail_with_a_clear_error() {
+    if skipped() {
+        return;
+    }
+    let w = repo("gitrw");
+    std::fs::write(w.join("f"), "two\n").unwrap();
+    let before = tree(&w.join(".git"));
+    let tool = RunCommandTool::new(w.clone());
+    let started = Instant::now();
+    for ok in [
+        "git log --oneline",
+        "git diff",
+        "git show --stat HEAD",
+        "git status --short",
+        "git rev-parse HEAD",
+        "git branch --list",
+        "git ls-files",
+    ] {
+        let out = run(&tool, ok);
+        assert_eq!(out["status"], 0, "{ok} must work: {out}");
+    }
+    assert!(text(&run(&tool, "git log --oneline"), "stdout").contains("one"));
+    for bad in [
+        "git add f",
+        "git -c user.name=t -c user.email=t@t commit -qam x",
+        "git branch b",
+        "git checkout -q -b b",
+        "git stash",
+        "git config x.y z",
+        "git remote add o /nonexistent",
+        "git gc -q",
+    ] {
+        let out = run(&tool, bad);
+        assert_ne!(out["status"], 0, "{bad} must fail: {out}");
+        let err = text(&out, "stderr");
+        if bad == "git stash" {
+            // git stash fails with exit 1 and says nothing here.
+            continue;
+        }
+        assert!(
+            err.contains("Read-only file system") || err.contains("read-only"),
+            "{bad}: the model should see why: {out}"
+        );
+    }
+    assert!(started.elapsed() < Duration::from_secs(60), "nothing hangs");
+    assert_eq!(tree(&w.join(".git")), before, "no write got through");
+}
+
+/// A gitdir file (worktree, submodule) cannot be swapped for a directory.
+#[test]
+fn a_gitdir_file_cannot_be_replaced_by_a_directory_with_hooks() {
+    if skipped() {
+        return;
+    }
+    let w = ws("gitfile");
+    std::fs::write(w.join(".git"), "gitdir: /nonexistent/elsewhere\n").unwrap();
+    let tool = RunCommandTool::new(w.clone());
+    for a in [
+        "rm -f .git",
+        "mv .git .g",
+        "sh -c 'rm .git && mkdir -p .git/hooks'",
+        "sh -c 'echo x >> .git'",
+    ] {
+        let out = run(&tool, a);
+        assert_ne!(out["status"], 0, "must fail: {a}: {out}");
+    }
     assert_eq!(
-        std::fs::read_to_string(w.join(".git/config")).unwrap(),
-        "[core]\n"
+        std::fs::read_to_string(w.join(".git")).unwrap(),
+        "gitdir: /nonexistent/elsewhere\n"
     );
-    assert!(
-        !outside.join("c").exists(),
-        "nothing written through the link"
-    );
-    // The same workspace after the link is swapped for a real directory
-    // still protects what is there now.
-    std::fs::remove_file(w.join(".git/hooks")).unwrap();
-    std::fs::create_dir(w.join(".git/hooks")).unwrap();
-    run(&tool, "sh -c 'echo x > .git/hooks/d; true'");
-    assert!(
-        !w.join(".git/hooks/d").exists(),
-        "re-resolved at the next launch"
-    );
+}
+
+/// A link cannot be protected by a mount, so the launch is refused; nothing
+/// runs and nothing is created.
+#[test]
+fn a_symlinked_git_dir_or_leaf_is_refused_not_bound() {
+    if skipped() {
+        return;
+    }
+    for (tag, link) in [
+        ("l-git", ".git"),
+        ("l-hooks", ".git/hooks"),
+        ("l-tole", ".tole"),
+    ] {
+        let w = ws(tag);
+        std::fs::create_dir_all(w.join("real")).unwrap();
+        if link != ".git" {
+            std::fs::create_dir_all(w.join(".git")).unwrap();
+        }
+        std::os::unix::fs::symlink(w.join("real"), w.join(link)).unwrap();
+        let tool = RunCommandTool::new(w.clone());
+        let e = tool.execute(json!({"command": "touch ran"})).unwrap_err();
+        assert!(e.contains("symbolic link") && e.contains(link), "{e}");
+        assert!(!w.join("ran").exists());
+    }
+}
+
+/// Residual, pinned so it stays documented: with no `.git` at launch nothing
+/// is protected and the launch creates nothing on the host; a repository made
+/// inside the sandbox is the owner's to review before running git there.
+#[test]
+fn without_a_git_dir_at_launch_nothing_is_created_or_protected() {
+    if skipped() {
+        return;
+    }
+    let w = ws("nogit");
+    let tool = RunCommandTool::new(w.clone());
+    let out = run(&tool, "sh -c 'test ! -e .git && echo none'");
+    assert_eq!(text(&out, "stdout").trim(), "none");
+    assert!(!w.join(".git").exists(), "the launch did not create .git");
+    assert_eq!(run(&tool, "git init -q")["status"], 0);
+    assert!(w.join(".git/hooks").is_dir(), "git init works inside");
 }
 
 /// Two sessions, two workspaces, at the same time: each sees its own.
@@ -638,4 +922,381 @@ fn the_verify_command_runs_in_the_command_profile() {
         std::fs::read_to_string(w.join(".git/config")).unwrap(),
         "[core]\n"
     );
+}
+
+/// The owner's `git status`, `diff` and `add -A` on the HOST in `w`: what a
+/// nested planted config or hook would fire on.
+fn host_git_routine(w: &Path) {
+    for args in [&["status", "--short"][..], &["diff"], &["add", "-A"]] {
+        let _ = host_git_out(w, args);
+    }
+}
+
+/// A registered submodule `sub`: its `.git` is a gitdir FILE inside the
+/// workspace pointing at `../.git/modules/sub`. The reviewer's attack moved it
+/// aside, copied the gitdir in as a real directory and set a `core.fsmonitor`
+/// in it; the owner's plain `git status` in the OUTER repository then ran the
+/// script. Now the nested `.git` file is its own read-only mount.
+#[test]
+fn a_registered_submodule_cannot_get_a_planted_fsmonitor() {
+    if skipped() {
+        return;
+    }
+    let w = repo("submod");
+    let sub_src = ws("submod-src");
+    host_git(&sub_src, &["init", "-q"]);
+    std::fs::write(sub_src.join("s"), "s\n").unwrap();
+    host_git(&sub_src, &["add", "s"]);
+    host_git(&sub_src, &["commit", "-q", "-m", "s"]);
+    host_git(
+        &w,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            sub_src.to_str().unwrap(),
+            "sub",
+        ],
+    );
+    host_git(&w, &["commit", "-q", "-m", "add sub"]);
+    assert!(w.join("sub/.git").is_file(), "a gitdir file");
+    let mark = w.join("PWNED_FSM");
+    std::fs::write(
+        w.join("fsm.sh"),
+        format!("#!/bin/sh\ntouch {}\n", mark.display()),
+    )
+    .unwrap();
+    std::fs::write(
+        w.join("attack.sh"),
+        format!(
+            "mv sub/.git sub/.gx && cp -a .git/modules/sub sub/.git\n\
+             git config -f sub/.git/config core.fsmonitor {}/fsm.sh\n",
+            w.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        w.join("fsm.sh"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
+    let before = tree(&w.join(".git"));
+    let tool = RunCommandTool::new(w.clone());
+    let out = run(&tool, "sh attack.sh");
+    assert_ne!(out["status"], 0, "the first step must fail: {out}");
+    assert!(
+        w.join("sub/.git").is_file(),
+        "the gitdir file is still there"
+    );
+    assert!(!w.join("sub/.gx").exists());
+    // The file that names the submodules cannot be rewritten or removed (the
+    // next launch's plan reads it).
+    all_fail(
+        &tool,
+        &[
+            "sh -c 'echo > .gitmodules'",
+            "rm -f .gitmodules",
+            "mv .gitmodules .gitmodules.old",
+        ],
+    );
+    assert!(std::fs::read_to_string(w.join(".gitmodules"))
+        .unwrap()
+        .contains("path = sub"));
+    assert_eq!(
+        tree(&w.join(".git")),
+        before,
+        "from the sandbox, nothing changed"
+    );
+    host_git_routine(&w);
+    assert!(!mark.exists(), "the planted fsmonitor ran on the host");
+}
+
+/// `git init --separate-git-dir=ws/.gd`: the top-level `.git` is a file whose
+/// target is inside the workspace. The target is read-only too.
+#[test]
+fn a_separate_git_dir_inside_the_workspace_cannot_get_a_hook() {
+    if skipped() {
+        return;
+    }
+    let w = ws("sepgit");
+    let gd = w.join(".gd");
+    host_git(
+        &w,
+        &["init", "-q", "--separate-git-dir", gd.to_str().unwrap()],
+    );
+    assert!(w.join(".git").is_file());
+    std::fs::write(w.join("f"), "one\n").unwrap();
+    host_git(&w, &["add", "f"]);
+    host_git(&w, &["commit", "-q", "-m", "one"]);
+    let mark = w.join("PWNED_HOOK");
+    std::fs::write(
+        w.join("attack.sh"),
+        format!(
+            "mkdir -p .gd/hooks && printf '#!/bin/sh\\ntouch {}\\n' > .gd/hooks/pre-commit \
+             && chmod +x .gd/hooks/pre-commit\n",
+            mark.display()
+        ),
+    )
+    .unwrap();
+    let before = tree(&gd);
+    let tool = RunCommandTool::new(w.clone());
+    all_fail(
+        &tool,
+        &[
+            "sh attack.sh",
+            "rm -rf .gd",
+            "mv .gd .gd2",
+            "sh -c 'echo x > .gd/config'",
+            "sh -c 'rm .git && mkdir -p .git/hooks'",
+        ],
+    );
+    assert_eq!(tree(&gd), before, "the separate gitdir changed");
+    std::fs::write(w.join("f"), "two\n").unwrap();
+    host_git(&w, &["commit", "-q", "-am", "two"]);
+    assert!(!mark.exists(), "the planted hook ran on the host");
+}
+
+/// A child agent's worktree (`.tole-worktrees/<id>`): its `.git` file cannot be
+/// replaced by a directory with hooks.
+#[test]
+fn a_child_worktree_git_file_cannot_be_replaced() {
+    if skipped() {
+        return;
+    }
+    let w = repo("wtree");
+    host_git(
+        &w,
+        &["worktree", "add", "-q", ".tole-worktrees/wt1", "-b", "wt1"],
+    );
+    assert!(w.join(".tole-worktrees/wt1/.git").is_file());
+    let before = tree(&w.join(".git"));
+    let tool = RunCommandTool::new(w.clone());
+    all_fail(
+        &tool,
+        &[
+            "rm -f .tole-worktrees/wt1/.git",
+            "mv .tole-worktrees/wt1/.git .tole-worktrees/wt1/.gx",
+            "sh -c 'rm .tole-worktrees/wt1/.git && mkdir -p .tole-worktrees/wt1/.git/hooks'",
+            "sh -c 'echo x >> .tole-worktrees/wt1/.git'",
+        ],
+    );
+    all_fail(
+        &tool,
+        &[
+            "rm -rf .tole-worktrees/wt1",
+            "mv .tole-worktrees/wt1 .tole-worktrees/wt2",
+            "mv .tole-worktrees .tole-worktrees.old",
+            "mkdir .tole-worktrees/wt3",
+        ],
+    );
+    assert!(w.join(".tole-worktrees/wt1/.git").is_file());
+    assert_eq!(tree(&w.join(".git")), before);
+    host_git(&w.join(".tole-worktrees/wt1"), &["status", "--short"]);
+}
+
+/// F1: a submodule that has submodules of its own. The plan reads only the
+/// top-level `.gitmodules`, so the inner gitdir (reachable through
+/// `mid/inner/.git`) would be unprotected: the launch is refused, the command
+/// never runs, and the host's git runs nothing.
+#[test]
+fn a_submodule_with_submodules_of_its_own_refuses_the_launch() {
+    if skipped() {
+        return;
+    }
+    let mk = |tag: &str| {
+        let d = ws(tag);
+        host_git(&d, &["init", "-q"]);
+        std::fs::write(d.join("f"), "x\n").unwrap();
+        host_git(&d, &["add", "f"]);
+        host_git(&d, &["commit", "-q", "-m", "x"]);
+        d
+    };
+    let allow = ["-c", "protocol.file.allow=always"];
+    let add = |into: &Path, src: &Path, name: &str| {
+        let mut a: Vec<&str> = allow.to_vec();
+        a.extend(["submodule", "add", "-q", src.to_str().unwrap(), name]);
+        host_git(into, &a);
+        host_git(into, &["commit", "-q", "-m", "add"]);
+    };
+    let inner = mk("nest-inner");
+    let mid = mk("nest-mid");
+    add(&mid, &inner, "inner");
+    let top = mk("nest-top");
+    add(&top, &mid, "mid");
+    let mut a: Vec<&str> = allow.to_vec();
+    a.extend(["submodule", "update", "--init", "--recursive", "-q"]);
+    host_git(&top, &a);
+    assert!(top.join("mid/.gitmodules").is_file(), "the layout exists");
+    assert!(top.join("mid/inner/.git").exists());
+    let mark = top.join("PWNED_FSM");
+    let tool = RunCommandTool::new(top.clone());
+    let e = tool
+        .execute(json!({"command": format!("touch {}", top.join("ran").display())}))
+        .unwrap_err();
+    assert!(e.contains("nested submodules") && e.contains("mid"), "{e}");
+    assert!(!top.join("ran").exists(), "the command never ran");
+    host_git_routine(&top);
+    assert!(!mark.exists(), "nothing ran on the host");
+}
+
+/// F2: `.git` is a file whose target is a worktree of a repository that lives
+/// INSIDE the workspace (`repo.git`); `commondir` sends git to its config and
+/// hooks, which were writable. The launch is refused, the command never runs.
+#[test]
+fn a_gitdir_redirected_by_commondir_inside_the_workspace_refuses_the_launch() {
+    if skipped() {
+        return;
+    }
+    let w = ws("commondir-ws");
+    host_git(&w, &["init", "-q", "--bare", "repo.git"]);
+    let wt = w.join("repo.git/worktrees/ws2");
+    std::fs::create_dir_all(&wt).unwrap();
+    std::fs::write(wt.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    std::fs::write(wt.join("commondir"), "../..\n").unwrap();
+    std::fs::write(wt.join("gitdir"), format!("{}\n", w.join(".git").display())).unwrap();
+    std::fs::write(w.join(".git"), format!("gitdir: {}\n", wt.display())).unwrap();
+    host_git(&w, &["status", "--short"]);
+    let mark = w.join("PWNED_FSM");
+    let tool = RunCommandTool::new(w.clone());
+    let e = tool
+        .execute(json!({"command": format!(
+            "git config --file repo.git/config core.fsmonitor 'touch {}; echo'", mark.display())}))
+        .unwrap_err();
+    assert!(e.contains("commondir") && e.contains("redirects"), "{e}");
+    host_git(&w, &["status", "--short"]);
+    assert!(!mark.exists(), "nothing ran on the host");
+    assert!(
+        !std::fs::read_to_string(w.join("repo.git/config"))
+            .unwrap()
+            .contains("fsmonitor"),
+        "the config was not written"
+    );
+}
+
+/// A submodule that is listed but not initialized (a clone without
+/// `--recursive`): `sub/` is an empty directory with no `.git` to bind, and a
+/// command could `git init sub` and plant a `core.fsmonitor` that the host's
+/// plain `git status` in the outer repository runs. The launch is refused.
+#[test]
+fn an_uninitialized_submodule_refuses_the_launch_and_nothing_runs() {
+    if skipped() {
+        return;
+    }
+    let sub_src = ws("uninit-src");
+    host_git(&sub_src, &["init", "-q"]);
+    std::fs::write(sub_src.join("s"), "s\n").unwrap();
+    host_git(&sub_src, &["add", "s"]);
+    host_git(&sub_src, &["commit", "-q", "-m", "s"]);
+    let top = repo("uninit-top");
+    host_git(
+        &top,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            sub_src.to_str().unwrap(),
+            "sub",
+        ],
+    );
+    host_git(&top, &["commit", "-q", "-m", "add sub"]);
+    // A plain clone: the gitlink and `.gitmodules` are there, `sub/` is empty.
+    let clone = ws("uninit-clone");
+    std::fs::remove_dir_all(&clone).unwrap();
+    let out = std::process::Command::new("git")
+        .args(["clone", "-q"])
+        .arg(&top)
+        .arg(&clone)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert!(clone.join("sub").is_dir() && !clone.join("sub/.git").exists());
+    let mark = clone.join("PWNED_FSM");
+    std::fs::write(
+        clone.join("attack.sh"),
+        format!(
+            "git init -q sub\ngit -C sub config core.fsmonitor 'touch {}; echo'\n",
+            mark.display()
+        ),
+    )
+    .unwrap();
+    let tool = RunCommandTool::new(clone.clone());
+    let e = tool
+        .execute(json!({"command": "sh attack.sh"}))
+        .unwrap_err();
+    assert!(
+        e.contains("not initialized") && e.contains("sub") && e.contains("submodule update --init"),
+        "{e}"
+    );
+    assert!(!clone.join("sub/.git").exists(), "the command never ran");
+    host_git_routine(&clone);
+    assert!(!mark.exists(), "nothing ran on the host");
+    // Initialized, the same workspace is usable (and `.git` of `sub` read-only).
+    host_git(
+        &clone,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "update",
+            "--init",
+            "-q",
+        ],
+    );
+    let ok = run(&tool, "sh -c 'echo x > sub/.git/config'");
+    assert_ne!(ok["status"], 0, "now protected: {ok}");
+}
+
+/// A linked worktree elsewhere in the workspace (not under `.tole-worktrees`)
+/// cannot be protected: the launch is refused and the command never runs.
+#[test]
+fn a_linked_worktree_elsewhere_in_the_workspace_refuses_the_launch() {
+    if skipped() {
+        return;
+    }
+    let w = repo("linkedwt");
+    host_git(&w, &["worktree", "add", "-q", "other/wt", "-b", "wtb"]);
+    assert!(w.join("other/wt/.git").is_file());
+    let tool = RunCommandTool::new(w.clone());
+    let e = tool
+        .execute(json!({"command": format!("touch {}", w.join("ran").display())}))
+        .unwrap_err();
+    assert!(
+        e.contains("linked worktree") && e.contains("other/wt/.git"),
+        "{e}"
+    );
+    assert!(!w.join("ran").exists(), "the command never ran");
+    // Removed, the workspace launches again.
+    host_git(&w, &["worktree", "remove", "--force", "other/wt"]);
+    let out = run(&tool, "sh -c 'echo ok'");
+    assert_eq!(out["status"], 0, "{out}");
+}
+
+/// The same with a separate git dir: the registry is in `.gd/worktrees`, the
+/// target of the `.git` file, not in a `.git` directory.
+#[test]
+fn a_linked_worktree_of_a_separate_git_dir_refuses_the_launch() {
+    if skipped() {
+        return;
+    }
+    let w = ws("linkedwt-sep");
+    let gd = w.join(".gd");
+    host_git(
+        &w,
+        &["init", "-q", "--separate-git-dir", gd.to_str().unwrap()],
+    );
+    std::fs::write(w.join("f"), "one\n").unwrap();
+    host_git(&w, &["add", "f"]);
+    host_git(&w, &["commit", "-q", "-m", "one"]);
+    host_git(&w, &["worktree", "add", "-q", "other/wt", "-b", "wtb"]);
+    assert!(gd.join("worktrees").is_dir());
+    let tool = RunCommandTool::new(w.clone());
+    let e = tool
+        .execute(json!({"command": format!("touch {}", w.join("ran").display())}))
+        .unwrap_err();
+    assert!(e.contains("linked worktree"), "{e}");
+    assert!(!w.join("ran").exists(), "the command never ran");
 }

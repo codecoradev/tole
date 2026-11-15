@@ -135,6 +135,22 @@ fn config_flags_collects_the_security_flags_and_the_subcommands_own_allow() {
 }
 
 #[test]
+#[cfg(feature = "shell-tools")]
+fn the_unattended_faces_do_not_point_at_a_flag_they_refuse() {
+    use tole_cli::config_apply::Source;
+    let e = refuse_unattended(
+        "--skill is not supported by `tole serve`",
+        Some(Source::UserConfig),
+    )
+    .to_string();
+    assert!(e.contains("comes from the user config"), "{e}");
+    assert!(e.contains("remove it from that config file"), "{e}");
+    assert!(!e.contains("use --no-config"), "{e}");
+    let plain = refuse_unattended("--skill is not supported by `tole serve`", None).to_string();
+    assert_eq!(plain, "--skill is not supported by `tole serve`");
+}
+
+#[test]
 fn refuse_adds_the_no_config_hint_only_for_config_values() {
     use tole_cli::config_apply::Source;
     let plain = refuse("--skill is not supported by `tole serve`", None).to_string();

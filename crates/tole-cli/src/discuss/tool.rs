@@ -21,6 +21,12 @@
 //!   every allow pattern a profile carries must be covered by the caller's
 //!   allow list ([`Delegator::may_seat`]). Built-in roles are never
 //!   participants.
+//! - **Advice (#856).** The number of participants is not limited below the
+//!   core's technical ceiling; above [`discussion::RECOMMENDED_PARTICIPANTS`]
+//!   (or when the carved budget cannot fit one round) the result carries an
+//!   `advice` array. It is never an error and never changes what runs: the
+//!   carved budget, `max_rounds` and the reservation before every call still
+//!   bound the cost.
 //! - **Reviewers (#704).** `modes` (one of `inline`, `reviewer` per
 //!   participant) seats a participant as an independent `consult` child
 //!   ([`DelegateIndependent`]): read-only (plan mode, an empty allow list,
@@ -252,10 +258,12 @@ impl DiscussHost {
             )?;
             let log = DiscussionLog::at(&self.dir, &id)?;
             let driver = self.driver(&participants, &reviewers, log.clone(), tokens)?;
+            // Advice, never a refusal: the model sees it in the result.
+            let advice = super::advice(&contract);
             driver.start(contract)?;
-            Ok::<_, String>((driver, log))
+            Ok::<_, String>((driver, log, advice))
         })();
-        let (driver, log) = match started {
+        let (driver, log, advice) = match started {
             Ok(x) => x,
             Err(e) => {
                 // Never ran: it spent nothing, the carve goes back.
@@ -281,12 +289,16 @@ impl DiscussHost {
             let _ = log_stop_and_settle(self, &id, &node, &log_of(self, &id)?);
             return Err(format!("discuss: cannot start its thread: {e}"));
         }
-        Ok(json!({
+        let mut out = json!({
             "discussion": id, "node": node, "budget_tokens": tokens,
             "participants": participants, "reviewers": reviewers, "status": "running",
             "note": "it runs in the background: read it with discuss_status, end it with discuss_stop; \
                      its budget is carved from yours and is charged to you when it ends",
-        }))
+        });
+        if !advice.is_empty() {
+            out["advice"] = json!(advice);
+        }
+        Ok(out)
     }
 
     /// Drives the discussion to its end and settles its node.
@@ -483,7 +495,7 @@ impl Tool for DiscussTool {
                 "criteria": {"type": "array", "items": {"type": "string"},
                     "description": "1 to 12 acceptance criteria a claim-checker verifies"},
                 "participants": {"type": "array", "items": {"type": "string"},
-                    "description": "1 to 8 configured profile names you may delegate to; they speak read-only, with no tools unless `modes` makes one a reviewer"},
+                    "description": "Configured profile names you may delegate to; they speak read-only, with no tools unless `modes` makes one a reviewer. Any number is accepted, but 3 to 8 is the sweet spot: more voices mostly add cost and dilute the debate, and a budget too small for one round of them ends in a budget escalation (the result carries an `advice` line then)"},
                 "budget_tokens": {"type": "integer",
                     "description": "Carved from your remaining budget (default half of it), never more"},
                 "modes": {"type": "array", "items": {"type": "string", "enum": MODES},

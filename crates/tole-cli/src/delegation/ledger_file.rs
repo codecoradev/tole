@@ -208,15 +208,11 @@ mod tests {
     fn an_unreaped_exited_child_is_not_alive() {
         let child = std::process::Command::new("true").spawn().unwrap();
         let lease = lease_of(child.id());
-        let mut gone = false;
-        for _ in 0..200 {
-            if !lease_alive(&lease) {
-                gone = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(gone, "a zombie counted as alive");
+        crate::test_dir::wait_until(
+            crate::test_dir::WAIT,
+            "the exited child to stop counting as alive",
+            || !lease_alive(&lease),
+        );
         assert!(lease_alive(&own_lease()), "this process is alive");
         drop(child); // never waited: stays a zombie until the test ends
     }

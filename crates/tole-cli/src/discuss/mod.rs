@@ -69,21 +69,64 @@ pub fn contract(args: &StartArgs, now: u64, secrets: &SecretSet) -> Result<Contr
 
 /// What the discussion may cost, before it runs: the budget is a hard cap
 /// (every call is reserved in the ledger before it runs), the rounds and
-/// calls are the most the contract allows.
+/// calls are the most the contract allows, and the cost of a round grows
+/// with the number of participants ([`host::round_floor`]).
 pub fn cost_plan(c: &Contract) -> String {
-    let per_round = c.participants.len() + 2;
+    let n = c.participants.len();
+    let per_round = n + 2;
+    let floor = host::round_floor(c);
+    let fit = match c.budget_tokens / floor.max(1) {
+        0 => format!(
+            "This budget does not fit one round of {n} participants (about {floor} tokens \
+             reserved)."
+        ),
+        k => format!(
+            "This budget covers about {} round(s) at that floor.",
+            k.min(u64::from(c.max_rounds))
+        ),
+    };
     format!(
         "Discussion `{}`: {} participants ({}), up to {} rounds, up to {} model calls \
          (each round: one per participant, a scribe and a claim-checker).\n\
+         Estimate: a round reserves at least {floor} tokens ({n} participant calls and a \
+         claim-checker, plus a scribe for a large round); {fit}\n\
          Budget: {} tokens, a hard cap: a call that does not fit stops the discussion \
          with an escalation.",
         c.id,
-        c.participants.len(),
+        n,
         c.participants.join(", "),
         c.max_rounds,
         per_round * c.max_rounds as usize,
         c.budget_tokens
     )
+}
+
+/// What to tell the owner (or the model) before the discussion spends
+/// anything, as lines: the participant advice when there are more than
+/// [`discussion::RECOMMENDED_PARTICIPANTS`], and a warning when the budget
+/// cannot fit one round. Neither refuses the discussion.
+pub fn advice(c: &Contract) -> Vec<String> {
+    let mut out: Vec<String> = discussion::participants_advice(c.participants.len())
+        .into_iter()
+        .collect();
+    let floor = host::round_floor(c);
+    if c.budget_tokens < floor {
+        out.push(format!(
+            "the budget ({} tokens) does not fit one round of {} participants (about {floor} \
+             reserved): the discussion will probably stop with a budget escalation in round 1",
+            c.budget_tokens,
+            c.participants.len()
+        ));
+    }
+    out
+}
+
+/// [`advice`] for what the owner typed, for the terminal before a start or
+/// a dry run; empty when the contract is invalid (the start reports that).
+pub fn advice_for(args: &StartArgs, secrets: &SecretSet) -> Vec<String> {
+    contract(args, now_secs(), secrets)
+        .map(|c| advice(&c))
+        .unwrap_or_default()
 }
 
 fn now_secs() -> u64 {
