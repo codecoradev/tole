@@ -390,18 +390,35 @@ impl Delegator {
     /// ([`settle_finished`]), then lets the tree cancel queued children of
     /// settled parents.
     fn recover(d: &mut Delegation<FileStore>) -> Result<(), String> {
+        Self::recover_with(d, lease_alive)
+    }
+
+    /// [`Self::recover`] with the liveness probe given. It is asked ONCE per
+    /// running node (#712): a child that exits between two probes (its
+    /// report written just before) must not be seen alive by the first and
+    /// gone by the second, which settled it `interrupted` ("process gone")
+    /// and threw its report away. A node alive at the probe stays running
+    /// until the next poll settles it with its report.
+    fn recover_with(
+        d: &mut Delegation<FileStore>,
+        alive: impl Fn(&tole_core::ledger::Lease) -> bool,
+    ) -> Result<(), String> {
         let gone: Vec<Node> = d
             .nodes()
             .filter(|n| n.status == tole_core::delegation::NodeStatus::Running)
-            .filter(|n| n.lease.is_some_and(|l| !lease_alive(&l)))
+            .filter(|n| n.lease.is_some_and(|l| !alive(&l)))
             .cloned()
             .collect();
         for n in &gone {
             settle_finished(d, n)?;
         }
-        d.recover(now(), lease_alive, |n| {
-            n.session.as_deref().map(Path::new).and_then(measured)
-        })
+        // Every node the probe found gone is settled above; the rest were
+        // alive at the probe, so the tree does not probe them again.
+        d.recover(
+            now(),
+            |_| true,
+            |n| n.session.as_deref().map(Path::new).and_then(measured),
+        )
         .map(|_| ())
         .map_err(|e| e.to_string())
     }

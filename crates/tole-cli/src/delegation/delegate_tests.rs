@@ -1014,6 +1014,46 @@ fn a_child_with_a_complete_report_settles_done_and_the_parent_sees_it_fenced() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// #712: a child that exits between two liveness probes of one recovery
+/// pass (report written just before) was alive for the first and gone for
+/// the second, and was settled `interrupted` ("process gone") with its report
+/// thrown away. The probe is asked once: such a node stays running and the
+/// next poll settles it `done` with its report.
+#[test]
+fn a_child_exiting_between_two_probes_is_not_settled_as_gone() {
+    let root = tmp("probe-once");
+    let h = reporting_host(&root, "rep", r#"{"summary":"all good"}"#);
+    let (start, _poll) = tools(&h, &root);
+    let out = start
+        .execute(json!({"task": "review", "mode": "consult"}))
+        .unwrap();
+    let node = out["node"].as_str().unwrap().to_string();
+    let dir = agent_dir_of(&root, &out);
+    wait_for(&dir.join("env"));
+    let report = dir.join(tole_core::delegation_report::REPORT_FILE);
+    crate::test_dir::wait_until(crate::test_dir::WAIT, "the report and the exit", || {
+        report.is_file()
+            && log_of(&root)
+                .poll(&node)
+                .and_then(|n| n.lease)
+                .is_some_and(|l| !lease_alive(&l))
+    });
+    // A probe that sees the child alive once, then gone: the exit lands
+    // between two probes.
+    let probes = std::sync::atomic::AtomicUsize::new(0);
+    h.locked(|d| Delegator::recover_with(d, |_| probes.fetch_add(1, Relaxed) == 0))
+        .unwrap();
+    let n = log_of(&root).poll(&node).cloned().unwrap();
+    assert_eq!(n.status, NodeStatus::Running, "{n:?}");
+    // The next poll (the probe now sees it gone) settles it with its report.
+    h.locked(|d| Delegator::recover_with(d, lease_alive))
+        .unwrap();
+    let n = log_of(&root).poll(&node).cloned().unwrap();
+    assert_eq!(n.status, NodeStatus::Done, "{n:?}");
+    assert_eq!(n.report.as_ref().unwrap().summary, "all good");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn an_incomplete_or_planted_report_leaves_the_run_incomplete() {
     let root = tmp("report-bad");
