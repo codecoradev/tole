@@ -5,7 +5,7 @@
 #![cfg(all(unix, feature = "tui"))]
 
 mod common;
-use common::WorkDir;
+use common::{wait_for, WorkDir, WAIT};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -236,21 +236,13 @@ impl Pty {
 
     /// Wait until `needle` appears in output not yet consumed; consumes up to it.
     fn expect(&mut self, needle: &str) {
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            {
-                let o = self.out.lock().unwrap();
-                let text = String::from_utf8_lossy(&o[self.seen..]).to_string();
-                if let Some(i) = text.find(needle) {
-                    self.seen += text[..i + needle.len()].len();
-                    return;
-                }
-                if Instant::now() > deadline {
-                    panic!("timed out waiting for {needle:?}; got: {text:?}");
-                }
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
+        let (out, seen) = (self.out.clone(), self.seen);
+        let upto = wait_for(WAIT, &format!("{needle:?} in the screen output"), || {
+            let o = out.lock().unwrap();
+            let text = String::from_utf8_lossy(&o[seen..]).to_string();
+            text.find(needle).map(|i| text[..i + needle.len()].len())
+        });
+        self.seen += upto;
     }
 
     /// The turn is over: the idle hint (redrawn when `working…` goes away)
@@ -260,15 +252,15 @@ impl Pty {
     }
 
     fn wait_exit(&mut self) -> Option<i32> {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline {
-            if let Ok(Some(st)) = self.child.try_wait() {
-                return st.code();
-            }
-            std::thread::sleep(Duration::from_millis(25));
+        let child = &mut self.child;
+        let mut code = None;
+        let exited = common::poll_until(WAIT, || {
+            child.try_wait().ok().flatten().map(|st| code = st.code())
+        });
+        if exited.is_none() {
+            let _ = self.child.kill();
         }
-        let _ = self.child.kill();
-        None
+        code
     }
 }
 

@@ -12,12 +12,16 @@
 
 mod test_dir;
 #[allow(unused_imports)]
-pub use test_dir::{ChildGuard, TestDir, WorkDir};
+pub use test_dir::{
+    poll_until, wait_exit, wait_for, wait_until, ChildGuard, TestDir, WorkDir, WAIT,
+};
 
 use std::io::{BufRead, BufReader};
 use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::Duration;
 
 const ATTEMPTS: usize = 5;
@@ -59,4 +63,42 @@ pub fn spawn_listening(mut make: impl FnMut(u16) -> Command) -> (Child, u16) {
         let _ = child.wait();
     }
     panic!("tole serve did not start listening after {ATTEMPTS} attempts");
+}
+
+/// A provider mock's answer held at a gate (#812). The old way was to sleep
+/// two seconds in the mock and a fixed half second in the test before it
+/// cancelled or steered, which assumed the turn had reached the provider by
+/// then (not so on a loaded machine) and that it had not answered yet. The
+/// mock calls [`Gate::hold`] when the request arrives; the test waits for
+/// [`Gate::wait_entered`], acts, then [`Gate::open`]s it.
+#[derive(Default)]
+pub struct Gate {
+    entered: AtomicBool,
+    open: AtomicBool,
+}
+
+impl Gate {
+    pub fn new() -> Arc<Gate> {
+        Arc::new(Gate::default())
+    }
+
+    /// For the mock: records that the request arrived and blocks until the
+    /// gate is opened (bounded, so an abandoned test frees its thread).
+    pub fn hold(&self) {
+        self.entered.store(true, Ordering::SeqCst);
+        wait_until(WAIT, "the test to open the gate", || {
+            self.open.load(Ordering::SeqCst)
+        });
+    }
+
+    /// For the test: the request reached the provider.
+    pub fn wait_entered(&self) {
+        wait_until(WAIT, "the turn to reach the provider", || {
+            self.entered.load(Ordering::SeqCst)
+        });
+    }
+
+    pub fn open(&self) {
+        self.open.store(true, Ordering::SeqCst);
+    }
 }

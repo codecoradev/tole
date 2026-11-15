@@ -248,19 +248,15 @@ fn approval_allow_round_trip_executes_the_work() {
     // a "not busy" read proves nothing and the file may not exist yet
     // (the CI flake). Poll for the effect itself, then for the settle.
     let work_file = std::path::Path::new("approved.txt");
-    for _ in 0..100 {
-        if work_file.exists() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    for _ in 0..50 {
+    common::wait_until(
+        common::WAIT,
+        "the resumed turn to write approved.txt",
+        || work_file.exists(),
+    );
+    common::wait_until(common::WAIT, "the resumed turn to settle", || {
         let (_, st) = serve.http("GET", &format!("/sessions/{sid}/status"), None);
-        if st["busy"] != json!(true) {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
+        st["busy"] != json!(true)
+    });
     // The queue entry is approved; the work landed.
     let (_, list) = serve.http("GET", "/approvals", None);
     assert_eq!(list["approvals"][0]["status"], "approved", "{list}");

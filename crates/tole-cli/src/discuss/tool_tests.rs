@@ -4,7 +4,7 @@ use crate::discuss::tests::{agreeable, factory, tmp, Answer};
 use crate::ledger_file::FileStore;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tole_core::delegation::{Delegation, Node, NodeStatus};
 use tole_core::provider::ProviderOutput;
 
@@ -99,25 +99,19 @@ fn discussion_nodes(r: &Rig) -> Vec<Node> {
 }
 
 fn wait_closed(r: &Rig, id: &str) -> Value {
-    let end = Instant::now() + Duration::from_secs(20);
-    loop {
-        let v = r.host.status(id).unwrap();
-        if v["state"] == "closed" {
+    crate::test_dir::wait_for(
+        crate::test_dir::WAIT,
+        &format!("discussion {id} to close and settle its nodes"),
+        || {
+            let v = r.host.status(id).unwrap();
             // The node is settled right after the ledger closes.
-            let settled = discussion_nodes(r)
-                .iter()
-                .all(|n| n.status != NodeStatus::Running);
-            if settled {
-                return v;
-            }
-        }
-        assert!(
-            Instant::now() < end,
-            "never closed: {v} {:?}",
-            discussion_nodes(r)
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+            (v["state"] == "closed"
+                && discussion_nodes(r)
+                    .iter()
+                    .all(|n| n.status != NodeStatus::Running))
+            .then_some(v)
+        },
+    )
 }
 
 /// A provider whose participants wait until `release` is set.

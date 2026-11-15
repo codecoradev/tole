@@ -15,6 +15,12 @@
 //!   path; [`TestDir::keep`] keeps one.
 //! * A child that may still use the directory must be killed and awaited
 //!   before the guard drops (see [`ChildGuard`]).
+//!
+//! The condition waits of #812 live in the same file ([`wait_until`],
+//! [`wait_for`]): a test that waits for something to happen polls for the
+//! condition up to a generous bound instead of sleeping a fixed time, so a
+//! loaded machine only makes it slower, never red, and a passing run does not
+//! wait longer than the condition needs.
 
 #![allow(dead_code)]
 
@@ -22,7 +28,7 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -112,6 +118,68 @@ impl Drop for TestDir {
         }
         remove_tree(&self.path);
     }
+}
+
+/// The bound a condition wait uses unless a test has a reason for another:
+/// long enough for a machine stuck on one busy CPU, short enough that a
+/// condition that never holds still fails the test in a minute. A run that
+/// passes never waits for it.
+pub const WAIT: Duration = Duration::from_secs(60);
+
+/// Polls `probe` until it returns `Some` and returns that value, or returns
+/// `None` once `timeout` has passed. For a wait whose expiry is an answer
+/// (a child that must be killed when it does not exit), not a failure; use
+/// [`wait_for`] when expiry fails the test.
+///
+/// The probe runs at once, then after 2 ms, doubling up to 50 ms, so a
+/// condition that is already true costs nothing and a slow one is not
+/// hammered. It runs one last time at the deadline, so a long pause of this
+/// thread (a loaded machine) cannot turn a condition that holds into a
+/// timeout. A fixed `thread::sleep` before an assertion is a guess about the
+/// machine; this waits for the fact (#812).
+pub fn poll_until<T>(timeout: Duration, mut probe: impl FnMut() -> Option<T>) -> Option<T> {
+    let start = Instant::now();
+    let mut nap = Duration::from_millis(2);
+    loop {
+        if let Some(v) = probe() {
+            return Some(v);
+        }
+        let spent = start.elapsed();
+        if spent >= timeout {
+            // The pause above may have been the machine's, not the
+            // condition's: look once more before giving up.
+            return probe();
+        }
+        std::thread::sleep(nap.min(timeout - spent));
+        nap = (nap * 2).min(Duration::from_millis(50));
+    }
+}
+
+/// [`poll_until`] that panics with `what` and the bound when the probe is
+/// still `None` after `timeout`, so a failure says what never happened.
+#[track_caller]
+pub fn wait_for<T>(timeout: Duration, what: &str, probe: impl FnMut() -> Option<T>) -> T {
+    match poll_until(timeout, probe) {
+        Some(v) => v,
+        None => panic!("timed out after {timeout:?} waiting for {what}"),
+    }
+}
+
+/// Waits up to `timeout` for `child` to exit and returns its status, or
+/// `None` when it is still running (the caller kills it and fails the test
+/// with what it knows). The child is not reaped on `None`.
+pub fn wait_exit(child: &mut Child, timeout: Duration) -> Option<std::process::ExitStatus> {
+    poll_until(timeout, || child.try_wait().ok().flatten())
+}
+
+/// [`wait_for`] for a plain condition: returns once `cond` holds.
+///
+/// ```ignore
+/// wait_until(WAIT, "the child to write its file", || file.exists());
+/// ```
+#[track_caller]
+pub fn wait_until(timeout: Duration, what: &str, mut cond: impl FnMut() -> bool) {
+    wait_for(timeout, what, || cond().then_some(()));
 }
 
 /// Removes `dir`, retrying after making everything writable (read-only

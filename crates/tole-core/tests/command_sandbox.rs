@@ -9,6 +9,8 @@
 
 #![cfg(unix)]
 
+#[path = "support/test_dir.rs"]
+mod test_dir;
 use serde_json::{json, Value};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -389,14 +391,7 @@ fn host_pids(needle: &str) -> Vec<libc::pid_t> {
 }
 
 fn wait_gone(needle: &str) -> bool {
-    let end = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < end {
-        if !host_runs(needle) {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    !host_runs(needle)
+    test_dir::poll_until(test_dir::WAIT, || (!host_runs(needle)).then_some(())).is_some()
 }
 
 /// The timeout kills the command and everything it started: no orphan is
@@ -446,8 +441,13 @@ fn a_cancel_kills_the_command_and_its_descendants() {
     .unwrap();
     let token = tole_core::cancel::CancelToken::new();
     let t = token.clone();
+    let needle = format!("sleep\0{a}");
     std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(800));
+        // Cancel once the command's descendants run, not after a guess at
+        // how long the sandbox takes to start (#812).
+        test_dir::wait_until(test_dir::WAIT, "the command to start", || {
+            host_runs(&needle)
+        });
         t.cancel();
     });
     let err = tole_core::subprocess::run_with_timeout_or_cancel(
@@ -494,15 +494,10 @@ fn a_job_runs_sandboxed_detached_and_logs() {
     );
     assert!(!cmdline.contains(CANARY), "no secret in the argv");
     let poll = JobPollTool::new(w.clone());
-    let end = Instant::now() + Duration::from_secs(20);
-    let last = loop {
+    let last = test_dir::wait_for(test_dir::WAIT, "the job to finish", || {
         let r = poll.execute(json!({"job": job})).unwrap();
-        if r["running"] == json!(false) || Instant::now() > end {
-            break r;
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    };
-    assert_eq!(last["running"], json!(false), "{last}");
+        (r["running"] == json!(false)).then_some(r)
+    });
     let log = text(&last, "log_tail");
     assert!(
         log.contains("job-ok") && log.contains("home=/scratch") && log.contains("data=no"),
@@ -564,11 +559,7 @@ fn a_job_that_cannot_be_tracked_leaves_no_process_behind() {
             .process_group(0);
         let child = cmd.spawn().unwrap();
         let needle = format!("sleep\0{n}");
-        let end = Instant::now() + Duration::from_secs(10);
-        while !host_runs(&needle) && Instant::now() < end {
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        assert!(host_runs(&needle), "the job started");
+        test_dir::wait_until(test_dir::WAIT, "the job to start", || host_runs(&needle));
         (child, needle)
     };
     // Sanity: ending only the first process leaves the detached sandbox.

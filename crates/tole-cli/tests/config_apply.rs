@@ -265,16 +265,9 @@ fn assert_fails_fast_untrusted(args: &[&str]) {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let start = Instant::now();
-    let status = loop {
-        if let Some(s) = child.try_wait().unwrap() {
-            break s;
-        }
-        if start.elapsed() > Duration::from_secs(10) {
-            let _ = child.kill();
-            panic!("{args:?} hung instead of failing closed");
-        }
-        std::thread::sleep(Duration::from_millis(25));
+    let Some(status) = common::wait_exit(&mut child, common::WAIT) else {
+        let _ = child.kill();
+        panic!("{args:?} hung instead of failing closed");
     };
     assert!(!status.success(), "{args:?}");
     let mut err = String::new();

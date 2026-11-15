@@ -144,20 +144,10 @@ fn pid_of(out: &Value) -> u32 {
 }
 
 fn wait_dead(pid: u32) {
-    for _ in 0..WAIT_TICKS {
-        if !crate::ledger_file::lease_alive(&crate::ledger_file::lease_of(pid)) {
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
-    panic!("{pid} never died");
+    crate::test_dir::wait_until(crate::test_dir::WAIT, &format!("{pid} to die"), || {
+        !crate::ledger_file::lease_alive(&crate::ledger_file::lease_of(pid))
+    });
 }
-
-/// Condition waits poll every 25 ms and stop as soon as the condition
-/// holds; this is only the bound (60 s), generous so a machine under heavy
-/// load (a child shell that takes seconds to start) is not mistaken for a
-/// hang (#702).
-const WAIT_TICKS: u32 = 2400;
 
 /// A data dir outside every test workspace, unique to this run: a pid is
 /// reused, and a stale directory of an earlier run must not be shared (#702).
@@ -245,15 +235,11 @@ fn tools(h: &std::sync::Arc<Delegator>, root: &Path) -> (DelegateTool, DelegateP
 
 /// Waits for a file the fake child writes.
 fn wait_for(p: &Path) -> String {
-    for _ in 0..WAIT_TICKS {
-        if let Ok(s) = std::fs::read_to_string(p) {
-            if !s.is_empty() {
-                return s;
-            }
-        }
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
-    panic!("{} never appeared", p.display());
+    crate::test_dir::wait_for(
+        crate::test_dir::WAIT,
+        &format!("{} to appear", p.display()),
+        || std::fs::read_to_string(p).ok().filter(|s| !s.is_empty()),
+    )
 }
 
 fn agent_dir_of(root: &Path, out: &Value) -> PathBuf {
@@ -262,14 +248,10 @@ fn agent_dir_of(root: &Path, out: &Value) -> PathBuf {
 
 /// Polls until the child has exited; returns the settled poll output.
 fn poll_done(poll: &DelegatePollTool, out: &Value) -> Value {
-    for _ in 0..WAIT_TICKS {
+    crate::test_dir::wait_for(crate::test_dir::WAIT, "the child to exit", || {
         let p = poll.execute(json!({"agent": out["agent"]})).unwrap();
-        if p["running"] == json!(false) {
-            return p;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
-    panic!("child never exited");
+        (p["running"] == json!(false)).then_some(p)
+    })
 }
 
 fn log_of(root: &Path) -> Delegation<FileStore> {
@@ -731,12 +713,7 @@ fn a_new_delegate_never_starts_ahead_of_an_older_queued_one() {
     // and queues C behind it.
     wait_for(&agent_dir_of(&root, &a).join("env"));
     let pid = u32::try_from(a["pid"].as_u64().unwrap()).unwrap();
-    for _ in 0..WAIT_TICKS {
-        if !crate::ledger_file::lease_alive(&crate::ledger_file::lease_of(pid)) {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
+    wait_dead(pid);
     let c_out = start.execute(c("c")).unwrap();
     assert_eq!(c_out["queued"], json!(true), "C waits behind B: {c_out}");
     assert_eq!(
@@ -1066,12 +1043,7 @@ fn an_unpolled_finished_child_is_settled_with_its_report_on_the_next_delegate() 
         .unwrap();
     wait_for(&agent_dir_of(&root, &a).join("env"));
     let pid = u32::try_from(a["pid"].as_u64().unwrap()).unwrap();
-    for _ in 0..WAIT_TICKS {
-        if !crate::ledger_file::lease_alive(&crate::ledger_file::lease_of(pid)) {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
+    wait_dead(pid);
     start
         .execute(json!({"task": "b", "mode": "consult"}))
         .unwrap();
@@ -1242,15 +1214,10 @@ fn an_independent_participant_is_a_consult_child_settled_with_its_report() {
         "read-only, as the profile, with the carve"
     );
     assert!(n.allow.is_empty(), "a profile without allow gets none");
-    let mut got = None;
-    for _ in 0..WAIT_TICKS {
-        if let Some(r) = ind.poll(&node).unwrap() {
-            got = Some(r);
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
-    let (text, spent) = got.expect("the child never ended");
+    let (text, spent) =
+        crate::test_dir::wait_for(crate::test_dir::WAIT, "the child to end", || {
+            ind.poll(&node).unwrap()
+        });
     assert!(
         text.contains("the plan misses backups") && text.contains("Risks: data loss"),
         "{text}"

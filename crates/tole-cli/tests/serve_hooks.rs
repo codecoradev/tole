@@ -234,18 +234,11 @@ fn a_route_without_a_key_or_an_open_route_off_loopback_refuses_to_start() {
             .spawn()
             .unwrap();
         // A server that starts anyway must fail the test, not hang it.
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        let status = loop {
-            if let Some(s) = child.try_wait().unwrap() {
-                break Some(s);
-            }
-            if std::time::Instant::now() > deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                break None;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        };
+        let status = common::wait_exit(&mut child, common::WAIT);
+        if status.is_none() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
         let mut err = String::new();
         if let Some(mut e) = child.stderr.take() {
             let _ = e.read_to_string(&mut err);

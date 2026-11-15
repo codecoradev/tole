@@ -57,14 +57,10 @@ impl ServeProcess {
             _cwd: cwd,
         });
         // The listener is up; also confirm the HTTP face answers.
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
-        while std::time::Instant::now() < deadline {
-            if let Some((200, _)) = proc.request("GET", "/health", "") {
-                return proc;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        panic!("serve did not become healthy");
+        common::wait_until(common::WAIT, "serve to become healthy", || {
+            matches!(proc.request("GET", "/health", ""), Some((200, _)))
+        });
+        proc
     }
 
     /// One HTTP request; returns (status, parsed JSON body). Handles
@@ -120,8 +116,8 @@ impl Drop for ServeProcess {
     }
 }
 
-// Mock provider: a `DELAYED` prompt answers after 2 s; anything else
-// answers immediately (fast follow-up turn).
+// Mock provider: a `DELAYED` prompt is held at a `Gate` until the test
+// opens it; anything else answers immediately (fast follow-up turn).
 //
 // Convert a plain chat-completion reply into an SSE stream body
 // (issue #196 phase 3 mocks).
@@ -189,11 +185,14 @@ fn sse_response(reply: &Value, streamed: bool) -> String {
     }
 }
 
-fn spawn_mock() -> String {
+fn spawn_mock() -> (String, Arc<common::Gate>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
+    let gate = common::Gate::new();
+    let held = gate.clone();
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
+            let gate = held.clone();
             std::thread::spawn(move || {
                 let mut s = stream;
                 let mut buf = Vec::new();
@@ -226,7 +225,7 @@ fn spawn_mock() -> String {
                     .unwrap_or("")
                     .to_string();
                 if last_user.contains("DELAYED") {
-                    std::thread::sleep(Duration::from_secs(2));
+                    gate.hold();
                 }
                 // #377: a transcript carrying the owner's soft interrupt
                 // is answered differently, so the test can see the
@@ -248,12 +247,12 @@ fn spawn_mock() -> String {
             });
         }
     });
-    format!("http://{addr}/v1")
+    (format!("http://{addr}/v1"), gate)
 }
 
 #[test]
 fn serve_cancel_mid_provider_settles_cancelled_and_resumable() {
-    let base = spawn_mock();
+    let (base, gate) = spawn_mock();
     let serve = ServeProcess::spawn(&base);
 
     // Create a session (workspace defaults to the server cwd).
@@ -267,8 +266,8 @@ fn serve_cancel_mid_provider_settles_cancelled_and_resumable() {
     let (code, _) = serve.request("POST", "/sessions/nope/cancel", "").unwrap();
     assert_eq!(code, 404);
 
-    // Start the DELAYED prompt on a background thread; it blocks for
-    // ~2 s at the provider.
+    // Start the DELAYED prompt on a background thread; it blocks at the
+    // provider until the gate opens.
     let thread_serve = Arc::clone(&serve);
     let sid_clone = sid.clone();
     let prompt_thread = std::thread::spawn(move || {
@@ -279,12 +278,13 @@ fn serve_cancel_mid_provider_settles_cancelled_and_resumable() {
         )
     });
     // Cancel while the provider call is in flight.
-    std::thread::sleep(Duration::from_millis(500));
+    gate.wait_entered();
     let (code, ack) = serve
         .request("POST", &format!("/sessions/{sid}/cancel"), "")
         .expect("cancel");
     assert_eq!(code, 200, "{ack}");
     assert_eq!(ack["cancelled"], json!(true));
+    gate.open();
 
     // The blocked prompt settles "cancelled".
     let (pcode, presp) = prompt_thread.join().unwrap().expect("prompt response");
@@ -309,7 +309,7 @@ fn serve_cancel_mid_provider_settles_cancelled_and_resumable() {
 /// steered answer. Idle / unknown / malformed requests are refused.
 #[test]
 fn serve_soft_interrupt_steers_the_running_turn() {
-    let base = spawn_mock();
+    let (base, gate) = spawn_mock();
     let serve = ServeProcess::spawn(&base);
     let (code, created) = serve.request("POST", "/sessions", "{}").expect("create");
     assert_eq!(code, 200, "{created}");
@@ -328,7 +328,7 @@ fn serve_soft_interrupt_steers_the_running_turn() {
     let (code, _) = serve.request("POST", &path, r#"{"nope":1}"#).unwrap();
     assert_eq!(code, 400);
 
-    // A running turn (the first provider call takes ~2 s).
+    // A running turn (the first provider call is held at the gate).
     let thread_serve = Arc::clone(&serve);
     let sid_clone = sid.clone();
     let prompt = std::thread::spawn(move || {
@@ -338,7 +338,7 @@ fn serve_soft_interrupt_steers_the_running_turn() {
             r#"{"text": "DELAYED mission"}"#,
         )
     });
-    std::thread::sleep(Duration::from_millis(500));
+    gate.wait_entered();
     let (code, _) = serve.request("POST", &path, r#"{"text":"   "}"#).unwrap();
     assert_eq!(code, 400, "blank text is refused, not queued");
     let (code, ack) = serve
@@ -347,6 +347,7 @@ fn serve_soft_interrupt_steers_the_running_turn() {
     assert_eq!(code, 202, "{ack}");
     assert_eq!(ack["queued"], json!(true));
     assert_eq!(ack["urgent"], json!(false));
+    gate.open();
 
     let (pcode, presp) = prompt.join().unwrap().expect("prompt response");
     assert_eq!(pcode, 200, "{presp}");
@@ -360,7 +361,7 @@ fn serve_soft_interrupt_steers_the_running_turn() {
 /// provider's per-step wire split is there.
 #[test]
 fn serve_status_json_has_additive_usage_report() {
-    let base = spawn_mock();
+    let (base, _gate) = spawn_mock();
     let serve = ServeProcess::spawn(&base);
     let (_, created) = serve.request("POST", "/sessions", "{}").unwrap();
     let sid = created["sessionId"].as_str().unwrap().to_string();
