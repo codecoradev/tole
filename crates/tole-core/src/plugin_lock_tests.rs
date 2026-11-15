@@ -772,11 +772,54 @@ fn profile_moved_is_decided_by_the_ledger_and_a_lock_mismatch_is_a_move() {
     assert!(!profile_moved(&empty, Some(&old), "cora", Some(&wide)));
     assert!(!profile_moved(&empty, None, "cora", Some(&wide)));
     assert!(!profile_moved(&empty, Some(&ledger), "other", Some(&wide)));
-    // A revoke does not lift it for a deleted entry.
+    // A revoked sandboxed server is moved in every arm: entry kept, entry
+    // deleted, or the lock's profile fields dropped, unchanged profile too.
     let mut revoked = ledger.clone();
     revoked.push_str(&ledger_line("revoke", "cora", &h, 2));
-    assert!(profile_moved(&empty, Some(&revoked), "cora", Some(&wide)));
-    assert!(!profile_moved(&empty, Some(&revoked), "cora", Some(&ok)));
+    for live in [&ok, &wide] {
+        assert!(profile_moved(&empty, Some(&revoked), "cora", Some(live)));
+        assert!(profile_moved(&good, Some(&revoked), "cora", Some(live)));
+        let bare = with_profile(None, None);
+        assert!(profile_moved(&bare, Some(&revoked), "cora", Some(live)));
+    }
+    assert!(profile_moved(&empty, Some(&revoked), "cora", None));
+    // A re-approval ends it: the new approval's own record decides.
+    let mut again = revoked.clone();
+    again.push_str(&plain_ledger_line("cora", &h, 3));
+    assert!(!profile_moved(&empty, Some(&again), "cora", Some(&wide)));
+    again.push_str(&profile_ledger_line(
+        "cora",
+        Some("server"),
+        Some("sha256:aa"),
+        3,
+    ));
+    assert!(!profile_moved(&empty, Some(&again), "cora", Some(&ok)));
+    assert!(profile_moved(&empty, Some(&again), "cora", Some(&wide)));
+    // A revoked approval with no profile line (older) or an unsandboxed one
+    // promised nothing: a script may re-approve it.
+    let mut old_revoked = old.clone();
+    old_revoked.push_str(&ledger_line("revoke", "cora", &h, 2));
+    assert!(!profile_moved(
+        &empty,
+        Some(&old_revoked),
+        "cora",
+        Some(&wide)
+    ));
+    let mut unsb_revoked = plain_ledger_line("cora", &h, 1);
+    unsb_revoked.push_str(&profile_ledger_line("cora", None, None, 1));
+    unsb_revoked.push_str(&ledger_line("revoke", "cora", &h, 2));
+    assert!(!profile_moved(
+        &empty,
+        Some(&unsb_revoked),
+        "cora",
+        Some(&wide)
+    ));
+    assert!(!profile_moved(
+        &with_profile(None, None),
+        Some(&unsb_revoked),
+        "cora",
+        Some(&wide)
+    ));
     // An unsandboxed approval promised nothing.
     let mut unsandboxed = plain_ledger_line("cora", &h, 1);
     unsandboxed.push_str(&profile_ledger_line("cora", None, None, 1));

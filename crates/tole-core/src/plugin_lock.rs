@@ -779,13 +779,14 @@ pub fn ledger_profile(ledger: &str, server: &str) -> Option<(Option<String>, Opt
     rec
 }
 
-/// [`ledger_profile`], except that a `revoke` does not clear the record: the
-/// profile of the last approval, revoked or not.
-fn ledger_profile_through_revoke(
-    ledger: &str,
-    server: &str,
-) -> Option<(Option<String>, Option<String>)> {
-    let mut rec = None;
+/// The ledger's last decision for `server` as `(revoked, profile)`: whether it
+/// is a `revoke`, and the `(name, hash)` the last approval recorded. Unlike
+/// [`ledger_profile`], a `revoke` keeps the profile (it only says the server
+/// is revoked now); a new `approve` clears it until its own profile line.
+type LastDecision = (bool, Option<(Option<String>, Option<String>)>);
+
+fn ledger_last_decision(ledger: &str, server: &str) -> LastDecision {
+    let (mut revoked, mut rec) = (false, None);
     for line in ledger.lines() {
         let Ok(v) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -794,7 +795,8 @@ fn ledger_profile_through_revoke(
             continue;
         }
         match v["event"].as_str() {
-            Some("approve") => rec = None,
+            Some("approve") => (revoked, rec) = (false, None),
+            Some("revoke") => revoked = true,
             Some("sandbox_profile") => {
                 let s = |k: &str| v[k].as_str().map(str::to_string);
                 rec = Some((s("profile"), s("profile_hash")));
@@ -802,7 +804,7 @@ fn ledger_profile_through_revoke(
             _ => {}
         }
     }
-    rec
+    (revoked, rec)
 }
 
 /// The bundle hash the ledger recorded on `server`'s LAST `approve` line:
@@ -824,34 +826,42 @@ pub fn ledger_bundle(ledger: &str, server: &str) -> Option<Option<String>> {
 }
 
 /// Whether the sandbox profile of `server` moved since its approval, decided
-/// by the ledger and never by the lock file alone: a lock record that
-/// differs from the ledger's, or a lock hash the ledger never recorded, is
-/// itself a move (the lock was edited, exactly what [`check_against_ledger`]
-/// blocks). With a record in the ledger, the live profile must equal it; one
-/// that recorded no sandbox admits any (nothing was promised). Without a
-/// ledger (`None`) or an approval with no profile line, only the lock's own
-/// record exists and [`profile_admission`] decides. This is what a script
-/// may not approve past.
+/// by the ledger and never by the lock file alone. This is what a script may
+/// not approve past; only a terminal can.
+///
+/// - **Revoked and sandboxed:** the ledger's last decision is a `revoke` and
+///   the approval it revoked recorded a sandbox profile: moved, whatever the
+///   lock says (entry kept, edited or deleted) and whatever the live profile
+///   is. Only a terminal re-approves it. A revoked server that ran
+///   unsandboxed promised nothing and stays re-approvable by a script.
+/// - **No lock entry** (never approved, or deleted by hand): the ledger's
+///   recorded profile hash alone is compared with the live profile; no record
+///   or no hash admits any.
+/// - **With an entry:** a lock record that differs from the ledger's, or a
+///   lock hash the ledger never recorded, is itself a move (the lock was
+///   edited, exactly what [`check_against_ledger`] blocks). With a record in
+///   the ledger, the live profile must equal it; one that recorded no sandbox
+///   admits any. Without a ledger (`None`) or an approval with no profile
+///   line, only the lock's own record exists and [`profile_admission`]
+///   decides (the migration case).
 pub fn profile_moved(
     lock: &BTreeMap<String, LockEntry>,
     ledger: Option<&str>,
     server: &str,
     live: Option<&crate::sandbox::identity::ProfileId>,
 ) -> bool {
+    let same = |name: &Option<String>, h: &str| {
+        live.is_some_and(|l| l.hash == h && Some(l.name.as_str()) == name.as_deref())
+    };
+    let last = ledger.map(|text| ledger_last_decision(text, server));
+    if let Some((true, Some((_, Some(_))))) = &last {
+        return true;
+    }
     let Some(e) = lock.get(server) else {
-        // No lock entry (never approved, or deleted by hand): the ledger alone
-        // says what was promised. A recorded profile hash must still equal
-        // the live one, so removing the record cannot approve past a widened
-        // profile. A revoke does not lift it: with the entry kept, a revoked
-        // sandboxed server is refused a script's re-approval too.
-        return ledger
-            .and_then(|text| ledger_profile_through_revoke(text, server))
-            .and_then(|(name, hash)| {
-                hash.map(|h| {
-                    !live.is_some_and(|l| l.hash == h && Some(l.name.as_str()) == name.as_deref())
-                })
-            })
-            .unwrap_or(false);
+        return match last {
+            Some((_, Some((name, Some(h))))) => !same(&name, &h),
+            _ => false,
+        };
     };
     if let Some(text) = ledger {
         match ledger_profile(text, server) {
@@ -859,9 +869,7 @@ pub fn profile_moved(
                 if name != e.sandbox || hash != e.sandbox_hash {
                     return true;
                 }
-                return hash.is_some_and(|h| {
-                    !live.is_some_and(|l| l.hash == h && Some(l.name.as_str()) == name.as_deref())
-                });
+                return hash.is_some_and(|h| !same(&name, &h));
             }
             None if e.sandbox_hash.is_some() => return true,
             None => {}

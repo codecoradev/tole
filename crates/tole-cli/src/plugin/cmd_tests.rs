@@ -1542,14 +1542,56 @@ fn a_script_cannot_approve_a_moved_profile_after_the_lock_entry_is_deleted() {
     // Unchanged profile, entry deleted: the script's --hash is enough again.
     drop_entry(&h);
     h.run(&v1(), approve("srv", Some(&hash(&v1())))).unwrap();
-    // A revoke before the deletion does not lift it either.
-    h.run(&v1(), revoke("srv", Some(&hash(&v1())))).unwrap();
-    drop_entry(&h);
-    h.sandbox.as_mut().unwrap().profile.network = tole_core::sandbox::Network::None;
-    let e = h
-        .run(&v1(), approve("srv", Some(&hash(&v1()))))
-        .unwrap_err();
-    assert!(e.contains("only an interactive approval"), "{e}");
+}
+
+/// #847: an owner's revoke of a SANDBOXED server is undone only at a terminal,
+/// whether the lock entry is kept, deleted, or stripped of its profile; an
+/// unsandboxed one stays re-approvable by a script (nothing was promised).
+#[test]
+fn a_script_cannot_undo_the_revoke_of_a_sandboxed_server_in_any_lock_state() {
+    let script = |h: &H| h.run(&v1(), approve("srv", Some(&hash(&v1()))));
+    let edit = |h: &H, f: &dyn Fn(&mut Lockfile)| {
+        let mut lock = Lockfile::load(&h.user()).unwrap();
+        f(&mut lock);
+        lock.save(&h.user()).unwrap();
+    };
+    let drop_entry: &dyn Fn(&mut Lockfile) = &|l| {
+        l.servers.remove("srv");
+    };
+    let strip: &dyn Fn(&mut Lockfile) = &|l| {
+        let e = l.servers.get_mut("srv").unwrap();
+        e.sandbox = None;
+        e.sandbox_hash = None;
+    };
+    let keep: &dyn Fn(&mut Lockfile) = &|_| {};
+    for (tag, how) in [("kept", keep), ("deleted", drop_entry), ("stripped", strip)] {
+        let h = profiled(&format!("prof-revoke-{tag}"));
+        h.run(&v1(), approve("srv", Some(&hash(&v1())))).unwrap();
+        h.run(&v1(), revoke("srv", Some(&hash(&v1())))).unwrap();
+        // The profile is unchanged: it is the revoke a script cannot undo.
+        edit(&h, how);
+        let e = script(&h).unwrap_err();
+        assert!(e.contains("only an interactive approval"), "{tag}: {e}");
+        assert_ne!(h.rows(&v1())[0]["state"], json!("approved"), "{tag}");
+        // The owner at a terminal can re-approve it, and then a script can
+        // approve again (nothing moved).
+        h.go(&|_| v1(), Some(true), approve("srv", None)).unwrap();
+        assert_eq!(h.rows(&v1())[0]["state"], json!("approved"), "{tag}");
+        h.run(&v1(), approve("srv", Some(&hash(&v1())))).unwrap();
+    }
+    // Unsandboxed: the revoke is undone by a script, entry kept or deleted.
+    for (tag, how) in [("kept", keep), ("deleted", drop_entry)] {
+        let h = H::new(&format!("plain-revoke-{tag}"), &["srv"]);
+        h.run(&v1(), approve("srv", Some(&hash(&v1())))).unwrap();
+        h.run(&v1(), revoke("srv", Some(&hash(&v1())))).unwrap();
+        edit(&h, how);
+        script(&h).unwrap_or_else(|e| panic!("{tag}: {e}"));
+        assert_eq!(h.rows(&v1())[0]["state"], json!("approved"), "{tag}");
+        // And a terminal works the same.
+        h.run(&v1(), revoke("srv", Some(&hash(&v1())))).unwrap();
+        edit(&h, how);
+        h.go(&|_| v1(), Some(true), approve("srv", None)).unwrap();
+    }
 }
 
 #[test]

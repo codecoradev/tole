@@ -432,10 +432,11 @@ the lock is refused.
    blocked. Re-approval is interactive only (a script's `--hash` is refused
    for a changed profile). The move is decided from the ledger even when the
    lock has no entry for the server (#847), so deleting the entry does not
-   change that, and neither does a `revoke` before it. Re-approving a revoked
-   server from a script with `--hash` is otherwise allowed (cron and CI can
-   approve this way): the design never required an interactive
-   re-approval after a revoke, only for a changed profile. *Migration:* an approval from before has no
+   change that. A server the owner REVOKED while it ran in a sandbox profile is
+   re-approved only at a terminal, whatever the lock says (entry kept, edited
+   or deleted) and even with an unchanged profile: a script cannot undo that
+   revoke. A revoked server that ran unsandboxed promised nothing and can still
+   be re-approved by a script with `--hash` (cron and CI approve this way). *Migration:* an approval from before has no
    ledger line and no hash; `LedgerCheck::profile_unrecorded` reports it in
    `list` and `doctor`, never blocks it, and the next `tole plugin approve`
    records the profile.
