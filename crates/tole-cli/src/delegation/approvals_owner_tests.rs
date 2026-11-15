@@ -609,3 +609,47 @@ fn deny_never_asks_for_a_typed_id() {
     )
     .unwrap();
 }
+
+// ---------------------------------------------------------- doctor hint (#813)
+
+fn cfg_of(toml: &str) -> crate::config::Config {
+    crate::config::parse(toml, std::path::Path::new("c.toml")).unwrap()
+}
+
+#[test]
+fn the_doctor_hint_fires_only_when_delegation_is_in_use_and_approvals_is_unset() {
+    let dir = crate::test_dir::TestDir::new("tole-aowner-hint");
+    let missing = dir.join("none.jsonl");
+    let empty = dir.join("empty.jsonl");
+    std::fs::write(&empty, "").unwrap();
+    let used = dir.join("used.jsonl");
+    std::fs::write(&used, "{\"k\":1}\n").unwrap();
+    let none = crate::config::Config::default();
+    let table = cfg_of("[delegation]\nmax_depth = 3\n");
+
+    // Not in use: no table, no recorded run (a missing or empty log is none).
+    assert_eq!(doctor_hint(&none, None), None);
+    assert_eq!(doctor_hint(&none, Some(&missing)), None);
+    assert_eq!(doctor_hint(&none, Some(&empty)), None);
+    assert_eq!(doctor_hint(&none, Some(dir.path())), None, "a directory");
+
+    // In use through the config table, or through a recorded run.
+    let h = doctor_hint(&table, None).unwrap();
+    assert!(h.contains("[delegation] table"), "{h}");
+    let h = doctor_hint(&none, Some(&used)).unwrap();
+    assert!(h.contains("recorded delegated runs"), "{h}");
+    for needle in [
+        "denied at once",
+        "approvals = \"owner\"",
+        "chain",
+        "without an approver",
+    ] {
+        assert!(h.contains(needle), "{needle}: {h}");
+    }
+
+    // Set at all (even `off`): the owner decided, no hint.
+    for mode in ["off", "owner", "chain"] {
+        let c = cfg_of(&format!("[delegation]\napprovals = \"{mode}\"\n"));
+        assert_eq!(doctor_hint(&c, Some(&used)), None, "{mode}");
+    }
+}

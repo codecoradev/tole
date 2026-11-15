@@ -439,7 +439,7 @@ Parked means: an issue exists and is open, and nobody works on it until the owne
 
 Owner decisions still open:
 
-- #813: whether `[delegation] approvals` should default to `owner` for installs that use delegation, whether `tole discuss start|resume` is gated under sessions, whether an unreadable plugin ledger blocks `plugin add` and `plugin approve`, and whether the discussion timeout floor (1 second) rises to 10.
+- #813: decided 2026-11-15: `[delegation] approvals` stays `off` with a `tole doctor` hint when delegation is in use and the key is unset; `tole discuss start|resume` refuse under a session; an unreadable plugin ledger blocks `plugin add` and `plugin approve`; the user-config floor of the discussion timeout is 10 s (the env hook still goes down to 1 s).
 - #748: when `verify` and `turnend` become sandboxed by default (decided in principle on 2026-11-14, the phase is not scheduled).
 - #806: the rule that stops a series of merged pull requests from turning develop red. The CONTRIBUTING rule is documented; requiring up-to-date branches or a merge queue is a repository ruleset setting that only the owner can change.
 - #705: Cora Review fails or runs 12 minutes and more on larger PRs; it stays open until cora-code#720 lands and the path exclude is configured here.
