@@ -339,7 +339,10 @@ profile = "net"              # server | strict | a profile defined above
   registered for that run. Approvals (`tole plugin add|approve`, which
   refuse both flags) and the interactive preflight record the CONFIGURED
   profile, never a flag's, so a one-off override cannot become the approved
-  profile. Remote servers
+  profile. The preflight asks the lock before it starts anything (a revoked,
+  moved, rebuilt or profile-changed server is not started, #848) and starts
+  only a server that needs a review, through the one-shot probe with no
+  secret, ended before the session starts. Remote servers
   and first-party or `skip` servers record no profile.
 
 ### 6.2 Flags, as built (#750)
@@ -618,7 +621,7 @@ profile). The result is cached for the process.
 | Mode | Sandbox works | Sandbox unavailable |
 |---|---|---|
 | `required` | runs inside | **not started**: a startup line names the server, the reason and the remedy (install bubblewrap, or set `mode = "optional"` in the user config); its tools are not registered; a call to one returns the same message |
-| `optional` | runs inside | runs **unsandboxed**, with a warning at every start and a ledger entry; refused for unverified servers and, by owner decision 2, in unattended runs |
+| `optional` | runs inside | runs **unsandboxed**, with a warning at every start and a ledger entry; refused for unverified servers and, by owner decision 2, in unattended runs. Refused too when its approval recorded a sandbox profile and the wrapper cannot be built now (a granted path gone, #848): `ProfileChanged` |
 | `off` | runs unsandboxed | runs unsandboxed |
 
 A consumer in `[sandbox.consumers]` behaves as `required`: the command is

@@ -52,6 +52,9 @@ pub struct Gate {
     /// What this machine offers; `None` probes it on first use (see
     /// [`Gate::with_backend`]).
     backend: Option<tole_core::sandbox::Availability>,
+    /// The workspace of the session: what a sandboxed server would bind, so
+    /// the gate can tell whether a recorded sandbox can still be built.
+    workspace: PathBuf,
 }
 
 fn now() -> u64 {
@@ -91,6 +94,7 @@ impl Gate {
                     broken: Some(project_path),
                     policy: tole_core::sandbox::session_policy(),
                     backend: None,
+                    workspace: workspace.to_path_buf(),
                 };
             }
         };
@@ -109,6 +113,7 @@ impl Gate {
             broken,
             policy: tole_core::sandbox::session_policy(),
             backend: None,
+            workspace: workspace.to_path_buf(),
         }
     }
 
@@ -199,9 +204,7 @@ impl Gate {
     /// approved under this name never runs. Source and binary changes are
     /// recorded in the ledger.
     pub fn refuse_unseen(&self, server: &str, source: &str) -> Option<String> {
-        let a = plugin_lock::admit_unseen(&self.lock, server, source, &integrity(source))
-            .or_else(|| self.bundle_check(server))
-            .or_else(|| self.profile_check(server, source))?;
+        let a = self.unseen_admission(server, source)?;
         let event = match a {
             Admission::Moved => "source_change",
             Admission::Rebuilt => "binary_change",
@@ -215,6 +218,16 @@ impl Gate {
         Some(refusal(server, &a))
     }
 
+    /// The pre-start decision behind [`Gate::refuse_unseen`], without the
+    /// ledger line: `None` when the server may be started to compare its
+    /// tools, else why not (`Unlocked` included: such a server needs a
+    /// review, which is the caller's to offer).
+    pub fn unseen_admission(&self, server: &str, source: &str) -> Option<Admission> {
+        plugin_lock::admit_unseen(&self.lock, server, source, &integrity(source))
+            .or_else(|| self.bundle_check(server))
+            .or_else(|| self.profile_check(server, source))
+    }
+
     /// [`Admission::BundleChanged`] when `server`'s bundle manifest file is
     /// not the approved one now (#811).
     fn bundle_check(&self, server: &str) -> Option<Admission> {
@@ -226,12 +239,30 @@ impl Gate {
     /// run in now is not the approved one (#750). Read from the process's
     /// policy at every call, never cached, so an edit of the user config is
     /// seen at the next start.
+    ///
+    /// An approval that recorded a sandbox also needs the sandbox to be
+    /// buildable now (#848): in mode `optional` a launch whose wrapper cannot
+    /// be built (a granted path renamed away, no workspace, a refused program
+    /// directory) would otherwise start unsandboxed, with the hash unchanged
+    /// because a missing path hashes as written.
     fn profile_check(&self, server: &str, source: &str) -> Option<Admission> {
-        plugin_lock::profile_admission(
-            &self.lock,
-            server,
-            self.live_profile(server, source).as_ref(),
+        let live = self.live_profile(server, source);
+        if let Some(a) = plugin_lock::profile_admission(&self.lock, server, live.as_ref()) {
+            return Some(a);
+        }
+        self.lock.get(server)?.sandbox_hash.as_ref()?;
+        let policy = self.policy.as_ref()?;
+        live.as_ref()?;
+        let mut parts = source.strip_prefix("stdio:")?.split_whitespace();
+        let command = parts.next()?;
+        let args: Vec<String> = parts.map(str::to_string).collect();
+        tole_core::sandbox::build_failure(
+            policy,
+            &self.backend(),
+            &tole_core::sandbox::Env::current(Some(&self.workspace)),
+            (server, command, &args),
         )
+        .map(|_| Admission::ProfileChanged)
     }
 
     /// The secret NAMES `server`'s approval granted it (#679), for its
@@ -606,6 +637,15 @@ pub fn source_of(cfg: &tole_core::mcp::McpServerConfig) -> String {
 /// Before an interactive session starts: every server that is unlocked or
 /// changed is shown in full and the owner is asked (`ask` gets the text
 /// and returns the answer). Servers the owner declines stay unavailable.
+///
+/// The lock decides first (#848), exactly as the session roster does: a
+/// server that is revoked, moved, rebuilt, has a changed bundle or would run
+/// in another sandbox profile is NOT started here, and says why. Only a
+/// server that needs a review (never approved, or tools changed) is started,
+/// and only for the listing: through the one-shot probe, with no secret
+/// (`plugin add`'s policy, a review needs none), in its own process group
+/// that ends before the owner is asked. The session never inherits that
+/// connection, so the secrets of the lock's grant are the only ones it sees.
 #[cfg(feature = "mcp")]
 pub fn preflight(
     specs: &[tole_core::mcp::McpServerConfig],
@@ -613,33 +653,57 @@ pub fn preflight(
     ask: &mut dyn FnMut(&str) -> bool,
 ) {
     for cfg in specs {
-        let Ok((version, tools)) = tole_core::mcp::list_manifest(cfg) else {
+        let source = source_of(cfg);
+        if let Some(a) = gate
+            .unseen_admission(&cfg.name, &source)
+            .filter(|a| *a != Admission::Unlocked)
+        {
+            eprintln!(
+                "tole: mcp[{}]: not started: {}",
+                cfg.name,
+                refusal(&cfg.name, &a)
+            );
+            continue;
+        }
+        // A bearer token is never sent to a URL nobody approved (as `add`).
+        if matches!(cfg.transport, tole_core::mcp::McpTransport::Http { .. })
+            && !gate.lock.contains_key(&cfg.name)
+            && crate::config::apply::real_env(&tole_core::mcp::token_env_name(&cfg.name)).is_some()
+        {
+            eprintln!(
+                "tole: mcp[{}]: not started: {} is set and this URL is not approved yet: run \
+                 `tole plugin add` for it",
+                cfg.name,
+                tole_core::mcp::token_env_name(&cfg.name)
+            );
+            continue;
+        }
+        let mut probe = cfg.clone();
+        probe.secret_grant = Some(Vec::new());
+        probe.workspace = Some(gate.workspace.clone());
+        let integrity = integrity(&source);
+        let Ok((version, tools)) = tole_core::mcp::probe_manifest(&probe, false) else {
             continue; // the registration reports the failure
         };
-        let source = source_of(cfg);
-        let integrity = integrity(&source);
+        if self::integrity(&source) != integrity {
+            eprintln!(
+                "tole: mcp[{}]: the program file changed while it was started: not offered",
+                cfg.name
+            );
+            continue;
+        }
         let live = Live {
             source: &source,
             integrity: &integrity,
             version: &version,
             tools: &tools,
         };
-        let profile = gate.live_profile(&cfg.name, &source);
-        let mut a = admit(&gate.lock, &cfg.name, &live);
-        if a == Admission::Trusted {
-            a = plugin_lock::profile_admission(&gate.lock, &cfg.name, profile.as_ref())
-                .unwrap_or(a);
-        }
+        let a = admit(&gate.lock, &cfg.name, &live);
         let why = match a {
             Admission::Unlocked => "is not approved yet",
             Admission::Changed { .. } => "CHANGED since you approved it",
-            Admission::Moved => "now runs ANOTHER command or URL than the one you approved",
-            Admission::Rebuilt => "now runs ANOTHER program file than the one you approved",
-            Admission::BundleChanged => "has a CHANGED plugin manifest",
-            Admission::ProfileChanged => {
-                "would run in ANOTHER sandbox profile than the one you approved"
-            }
-            Admission::Trusted | Admission::Revoked => continue,
+            // Trusted needs nothing; the others were refused before the start.
+            _ => continue,
         };
         let text = format!(
             "{}\nMCP server `{}` {why}. Approve these tools? [y/N] ",
@@ -648,23 +712,14 @@ pub fn preflight(
         );
         // What is recorded is the OWNER'S configured profile, never a flag's:
         // `--sandbox <p>` / `--no-sandbox` are per-run, and an approval that
-        // took their profile would make a one-off override permanent. A
-        // server that only differs because of such a flag stays blocked for
-        // this run and is not offered for approval.
+        // took their profile would make a one-off override permanent.
         let configured = source
             .starts_with("stdio:")
             .then(|| tole_core::sandbox::policy()?.applied_profile(&cfg.name, &gate.backend()))
             .flatten();
-        if matches!(a, Admission::ProfileChanged) && configured != profile {
-            eprintln!(
-                "tole: mcp[{}]: the sandbox flag of this run gives it another profile than the \
-                 one you approved: not registered; run without the flag",
-                cfg.name
-            );
-            continue;
-        }
         if ask(&text) {
             let with = Approval {
+                integrity: Some(integrity.clone()),
                 sandbox: configured.as_ref().map(|p| p.name.clone()),
                 sandbox_hash: configured.map(|p| p.hash),
                 ..Default::default()

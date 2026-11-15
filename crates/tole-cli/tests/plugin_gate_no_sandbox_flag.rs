@@ -41,7 +41,7 @@ fn no_sandbox_blocks_a_server_that_was_approved_with_one() {
         .with_backend(usable())
         .approve_with(
             "srv",
-            "stdio:srv",
+            "stdio:true",
             "1",
             &tools,
             Approval {
@@ -53,15 +53,15 @@ fn no_sandbox_blocks_a_server_that_was_approved_with_one() {
         .unwrap();
     assert!(Gate::load(Some(user.clone()), &ws)
         .with_backend(usable())
-        .refuse_unseen("srv", "stdio:srv")
+        .refuse_unseen("srv", "stdio:true")
         .is_none());
     flags::set(Override::NoSandbox {
         configured: Mode::Required,
     })
     .unwrap();
     let gate = Gate::load(Some(user), &ws).with_backend(usable());
-    assert!(gate.live_profile("srv", "stdio:srv").is_none());
-    let note = gate.refuse_unseen("srv", "stdio:srv").unwrap();
+    assert!(gate.live_profile("srv", "stdio:true").is_none());
+    let note = gate.refuse_unseen("srv", "stdio:true").unwrap();
     assert!(note.contains("sandbox profile"), "{note}");
-    assert!(gate.check("srv", "stdio:srv", "1", &tools).is_err());
+    assert!(gate.check("srv", "stdio:true", "1", &tools).is_err());
 }

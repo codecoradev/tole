@@ -407,10 +407,10 @@ fn profiled_gate(tag: &str) -> (TestDir, PathBuf, TestDir) {
     let mut gate = Gate::load(Some(user.clone()), &ws)
         .with_policy(Some(policy(tole_core::sandbox::Network::None)))
         .with_backend(usable());
-    let id = gate.live_profile("srv", "stdio:srv").unwrap();
+    let id = gate.live_profile("srv", "stdio:true").unwrap();
     gate.approve_with(
         "srv",
-        "stdio:srv",
+        "stdio:true",
         "1",
         &tools(),
         Approval {
@@ -433,16 +433,16 @@ fn a_profile_edited_in_the_user_config_blocks_the_server_before_and_after_it_sta
             .with_backend(usable())
     };
     let same = load(Network::None);
-    assert!(same.refuse_unseen("srv", "stdio:srv").is_none());
-    assert!(same.check("srv", "stdio:srv", "1", &tools()).is_ok());
+    assert!(same.refuse_unseen("srv", "stdio:true").is_none());
+    assert!(same.check("srv", "stdio:true", "1", &tools()).is_ok());
     let wide = load(Network::Host);
-    let note = wide.refuse_unseen("srv", "stdio:srv").unwrap();
+    let note = wide.refuse_unseen("srv", "stdio:true").unwrap();
     assert!(note.contains("sandbox profile"), "{note}");
-    let e = wide.check("srv", "stdio:srv", "1", &tools()).unwrap_err();
+    let e = wide.check("srv", "stdio:true", "1", &tools()).unwrap_err();
     assert!(e.contains("sandbox profile"), "{e}");
     // No sandbox at all now is a loosening too.
     let off = Gate::load(Some(user.clone()), &ws).with_policy(None);
-    assert!(off.refuse_unseen("srv", "stdio:srv").is_some());
+    assert!(off.refuse_unseen("srv", "stdio:true").is_some());
     // The change is a ledger line, names and hashes only.
     let text = std::fs::read_to_string(dir.join(plugin_lock::LEDGER_FILE)).unwrap();
     assert!(text.contains("\"event\":\"profile_change\""), "{text}");
@@ -460,7 +460,7 @@ fn a_project_lock_cannot_loosen_or_replace_the_profile() {
     let g = Gate::load(Some(user.clone()), &ws)
         .with_policy(Some(policy(Network::None)))
         .with_backend(usable());
-    assert!(g.refuse_unseen("srv", "stdio:srv").is_some());
+    assert!(g.refuse_unseen("srv", "stdio:true").is_some());
     assert!(
         g.notes
             .iter()
@@ -478,7 +478,7 @@ fn a_project_lock_cannot_loosen_or_replace_the_profile() {
         .with_policy(Some(policy(Network::Host)))
         .with_backend(usable());
     assert!(
-        g.refuse_unseen("srv", "stdio:srv").is_some(),
+        g.refuse_unseen("srv", "stdio:true").is_some(),
         "a project lock cannot loosen the user's profile record"
     );
 }
@@ -490,7 +490,7 @@ fn an_old_lock_without_a_profile_is_not_blocked_and_the_note_names_the_migration
     let user = dir.join(plugin_lock::LOCK_FILE);
     let ws = tmp("prof-old-ws");
     let mut gate = Gate::load(Some(user.clone()), &ws);
-    gate.approve("srv", "stdio:srv", "1", &tools()).unwrap();
+    gate.approve("srv", "stdio:true", "1", &tools()).unwrap();
     // Back to a pre-#750 ledger: approve without a profile line.
     let ledger = dir.join(plugin_lock::LEDGER_FILE);
     let kept: String = std::fs::read_to_string(&ledger)
@@ -502,12 +502,12 @@ fn an_old_lock_without_a_profile_is_not_blocked_and_the_note_names_the_migration
     std::fs::write(&ledger, kept).unwrap();
     let gate = Gate::load(Some(user), &ws).with_policy(Some(policy(Network::Host)));
     assert_eq!(
-        gate.refuse_unseen("srv", "stdio:srv"),
+        gate.refuse_unseen("srv", "stdio:true"),
         None,
         "{:?}",
         gate.notes
     );
-    assert!(gate.check("srv", "stdio:srv", "1", &tools()).is_ok());
+    assert!(gate.check("srv", "stdio:true", "1", &tools()).is_ok());
     assert!(
         gate.notes.iter().any(
             |n| n.contains("before approvals recorded their sandbox profile")
@@ -532,11 +532,11 @@ fn an_approved_server_is_blocked_when_the_sandbox_cannot_be_applied_any_more() {
     let ok = Gate::load(Some(user.clone()), &ws)
         .with_policy(Some(optional.clone()))
         .with_backend(usable());
-    assert!(ok.refuse_unseen("srv", "stdio:srv").is_none());
+    assert!(ok.refuse_unseen("srv", "stdio:true").is_none());
     // bwrap went missing: same config, no sandbox applies.
     let gone = gate.with_backend(Availability::Unavailable("bwrap is not on PATH".into()));
-    assert!(gone.live_profile("srv", "stdio:srv").is_none());
-    let note = gone.refuse_unseen("srv", "stdio:srv").unwrap();
+    assert!(gone.live_profile("srv", "stdio:true").is_none());
+    let note = gone.refuse_unseen("srv", "stdio:true").unwrap();
     assert!(note.contains("sandbox profile"), "{note}");
-    assert!(gone.check("srv", "stdio:srv", "1", &tools()).is_err());
+    assert!(gone.check("srv", "stdio:true", "1", &tools()).is_err());
 }

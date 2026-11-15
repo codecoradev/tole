@@ -1,0 +1,296 @@
+//! #848: the interactive preflight decides by the lock BEFORE it starts a
+//! server, and what it does start (an unapproved or changed server, to show
+//! its tools) gets no secret and ends before the session starts. Evidence
+//! comes from the host: the fixture wrapper records its start, its
+//! environment and its pid in files.
+
+#![cfg(all(unix, feature = "mcp"))]
+
+mod common;
+use common::{wait_until, write_executable, TestDir, WAIT};
+use std::path::PathBuf;
+use tole_cli::plugin_gate::{preflight, source_of, Approval, Gate};
+use tole_core::approval::{AllowlistApprover, Decision};
+use tole_core::mcp::{register_server_tools, McpServerConfig};
+use tole_core::plugin_lock::{Lockfile, ManifestTool};
+use tole_core::sandbox::{self, Availability, Mode, Network, Policy};
+use tole_core::secrets::SecretSet;
+use tole_core::tool::ToolRegistry;
+
+/// A value the default `[secrets]` release binds to `mcp`.
+const SECRET: &str = "gh-preflight-test-0123456789abcdef";
+
+fn release_secret() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    // SAFETY (edition 2021: safe call): every test sets the same value
+    // first, inside this `Once`, before it starts a child process.
+    ONCE.call_once(|| std::env::set_var("GITHUB_TOKEN", SECRET));
+}
+
+fn tools() -> Vec<ManifestTool> {
+    vec![ManifestTool {
+        name: "echo".into(),
+        description: "Echoes".into(),
+        input_schema: serde_json::json!({"type": "object", "properties": {}}),
+    }]
+}
+
+struct Fixture {
+    dir: TestDir,
+    ws: TestDir,
+    cfg: McpServerConfig,
+    user: PathBuf,
+}
+
+impl Fixture {
+    /// A server `name` whose wrapper writes `start.<pid>` (its environment)
+    /// and `pid` on every start, then runs the logging fixture server.
+    fn new(name: &str) -> Self {
+        release_secret();
+        let dir = TestDir::new(&format!("tole-preflight-{name}"));
+        let mock = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tole-core/tests/fixtures/lazy_mcp.py"
+        );
+        let wrapper = dir.join("server.sh");
+        write_executable(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nprintenv > {d}/env.$$\necho $$ > {d}/pid\nexec python3 {mock} {d}/log Echoes\n",
+                d = dir.display()
+            ),
+        );
+        let cfg = McpServerConfig::parse(&format!("{name}={}", wrapper.display())).unwrap();
+        let user = dir.join("plugins.lock");
+        let ws = TestDir::new(&format!("tole-preflight-{name}-ws"));
+        Fixture { dir, ws, cfg, user }
+    }
+
+    fn gate(&self) -> Gate {
+        Gate::load(Some(self.user.clone()), &self.ws)
+    }
+
+    fn approve(&self, with: Approval) {
+        let source = source_of(&self.cfg);
+        self.gate()
+            .approve_with(&self.cfg.name, &source, "1", &tools(), with)
+            .unwrap();
+    }
+
+    fn started(&self) -> bool {
+        self.dir.join("log").exists() || self.dir.join("pid").exists()
+    }
+
+    /// The environments of every process the wrapper started.
+    fn envs(&self) -> Vec<String> {
+        std::fs::read_dir(&*self.dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with("env."))
+            .map(|e| std::fs::read_to_string(e.path()).unwrap_or_default())
+            .collect()
+    }
+
+    /// Runs the preflight; returns how often the owner was asked.
+    fn preflight(&self, gate: &mut Gate, answer: bool) -> usize {
+        let mut asked = 0;
+        preflight(std::slice::from_ref(&self.cfg), gate, &mut |_| {
+            asked += 1;
+            answer
+        });
+        asked
+    }
+}
+
+#[test]
+fn a_revoked_server_is_not_started_nor_offered() {
+    let f = Fixture::new("pf-revoked");
+    f.approve(Approval::default());
+    let mut lock = Lockfile::load(&f.user).unwrap();
+    lock.servers.get_mut("pf-revoked").unwrap().revoked = true;
+    lock.save(&f.user).unwrap();
+    let mut gate = f.gate();
+    assert_eq!(f.preflight(&mut gate, true), 0, "never offered");
+    assert!(!f.started(), "the process of a revoked server never ran");
+}
+
+#[test]
+fn a_moved_server_is_not_started_nor_offered() {
+    let f = Fixture::new("pf-moved");
+    // Approved for ANOTHER command line than the configured one.
+    f.gate()
+        .approve("pf-moved", "stdio:/bin/other --flag", "1", &tools())
+        .unwrap();
+    let mut gate = f.gate();
+    assert_eq!(f.preflight(&mut gate, true), 0);
+    assert!(!f.started(), "the process of a moved server never ran");
+}
+
+#[test]
+fn a_server_with_a_swapped_binary_is_not_started_nor_offered() {
+    let f = Fixture::new("pf-rebuilt");
+    // The lock holds the hash of another program file under this command.
+    f.approve(Approval {
+        integrity: Some("sha256:0000".into()),
+        ..Default::default()
+    });
+    let mut gate = f.gate();
+    assert_eq!(f.preflight(&mut gate, true), 0);
+    assert!(!f.started(), "a swapped binary never ran");
+}
+
+#[test]
+fn a_server_whose_sandbox_profile_changed_is_not_started_nor_offered() {
+    let f = Fixture::new("pf-profile");
+    f.approve(Approval {
+        sandbox: Some("server".into()),
+        sandbox_hash: Some("sha256:approved".into()),
+        ..Default::default()
+    });
+    // No sandbox applies now (policy off): the approved profile is gone.
+    let mut gate = f.gate().with_policy(None);
+    assert_eq!(f.preflight(&mut gate, true), 0);
+    assert!(!f.started(), "a server in another profile never ran");
+}
+
+#[test]
+fn a_new_server_is_reviewed_without_any_secret_and_its_process_ends() {
+    let f = Fixture::new("pf-new");
+    let mut gate = f.gate();
+    assert_eq!(f.preflight(&mut gate, true), 1, "offered for review");
+    let envs = f.envs();
+    assert_eq!(envs.len(), 1, "started once, for the listing");
+    assert!(
+        !envs[0].contains(SECRET),
+        "a review start gets no mcp-released secret"
+    );
+    // Approved, and the review process does not outlive the preflight.
+    assert!(f.gate().entries().contains_key("pf-new"));
+    let pid: u32 = std::fs::read_to_string(f.dir.join("pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    wait_until(WAIT, "the review process to end", || {
+        !PathBuf::from(format!("/proc/{pid}")).exists()
+            || std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .map_or(true, |s| s.contains(") Z "))
+    });
+}
+
+#[test]
+fn the_session_connection_after_a_preflight_has_only_the_lock_grant() {
+    let f = Fixture::new("pf-grant");
+    let mut gate = f.gate();
+    assert_eq!(f.preflight(&mut gate, true), 1);
+    // The approval grants this server no secret.
+    let mut lock = Lockfile::load(&f.user).unwrap();
+    lock.servers.get_mut("pf-grant").unwrap().secrets.clear();
+    lock.save(&f.user).unwrap();
+
+    // The session, as the roster builds it: the lock's grant, own start.
+    let gate = f.gate();
+    let source = source_of(&f.cfg);
+    let mut cfg = f.cfg.clone();
+    cfg.secret_grant = gate.secret_grant("pf-grant");
+    assert_eq!(cfg.secret_grant, Some(Vec::new()));
+    cfg.workspace = Some(f.ws.path().to_path_buf());
+    let admit = |s: &str, v: &str, t: &[ManifestTool]| gate.check(s, &source, v, t);
+    let mut reg =
+        ToolRegistry::with_approver(AllowlistApprover::new(vec!["mcp_*".into()], Decision::Deny));
+    let names = register_server_tools(&mut reg, &cfg, &SecretSet::default(), &admit);
+    assert_eq!(names.len(), 1, "{names:?}");
+    let envs = f.envs();
+    assert_eq!(envs.len(), 2, "the session starts its own process");
+    assert!(
+        envs.iter().all(|e| !e.contains(SECRET)),
+        "neither the review nor the session got the secret the lock does not grant"
+    );
+}
+
+fn usable() -> Availability {
+    Availability::Usable {
+        bwrap: "/usr/bin/bwrap".into(),
+        version: "0.9.0".into(),
+    }
+}
+
+/// #848 (finding 2): an approval recorded WITH a sandbox is refused, never
+/// run unsandboxed, when the wrapper can no longer be built in mode
+/// `optional`.
+#[test]
+fn a_recorded_sandbox_that_can_no_longer_be_built_is_refused_in_optional_mode() {
+    let dir = TestDir::new("tole-preflight-optional");
+    let ws = TestDir::new("tole-preflight-optional-ws");
+    let granted = std::fs::canonicalize(&*dir).unwrap().join("granted");
+    std::fs::create_dir(&granted).unwrap();
+    let mut profile = sandbox::builtin_profile("server").unwrap();
+    profile.network = Network::None;
+    profile.read = vec![granted.clone()];
+    let policy = Policy {
+        mode: Mode::Optional,
+        profile_name: "server".into(),
+        profile,
+        servers: Default::default(),
+        skip: Vec::new(),
+        max_servers: 4,
+        idle_secs: 60,
+    };
+    let source = "stdio:true";
+    let user = dir.join("plugins.lock");
+    let id = policy.applied_profile("srv", &usable()).unwrap();
+    Gate::load(Some(user.clone()), &ws)
+        .approve_with(
+            "srv",
+            source,
+            "1",
+            &tools(),
+            Approval {
+                sandbox: Some(id.name),
+                sandbox_hash: Some(id.hash),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let gate = || {
+        Gate::load(Some(user.clone()), &ws)
+            .with_policy(Some(policy.clone()))
+            .with_backend(usable())
+    };
+    assert!(
+        gate().refuse_unseen("srv", source).is_none(),
+        "buildable: admitted"
+    );
+    // The granted path is renamed away (same user, no privilege needed).
+    std::fs::rename(&granted, dir.join("moved")).unwrap();
+    let why = gate().refuse_unseen("srv", source).unwrap();
+    assert!(why.contains("sandbox profile"), "{why}");
+    assert!(gate().check("srv", source, "1", &tools()).is_err());
+}
+
+/// A server approved WITHOUT a sandbox keeps `optional`'s meaning.
+#[test]
+fn optional_mode_keeps_running_a_server_that_was_approved_without_a_sandbox() {
+    let dir = TestDir::new("tole-preflight-optional-none");
+    let ws = TestDir::new("tole-preflight-optional-none-ws");
+    let mut profile = sandbox::builtin_profile("server").unwrap();
+    profile.read = vec![dir.join("never-existed")];
+    let policy = Policy {
+        mode: Mode::Optional,
+        profile_name: "server".into(),
+        profile,
+        servers: Default::default(),
+        skip: Vec::new(),
+        max_servers: 4,
+        idle_secs: 60,
+    };
+    let user = dir.join("plugins.lock");
+    // Approved before the sandbox was on: nothing recorded.
+    Gate::load(Some(user.clone()), &ws)
+        .approve("srv", "stdio:true", "1", &tools())
+        .unwrap();
+    let gate = Gate::load(Some(user), &ws)
+        .with_policy(Some(policy))
+        .with_backend(usable());
+    assert!(gate.refuse_unseen("srv", "stdio:true").is_none());
+}
