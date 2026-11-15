@@ -248,7 +248,18 @@ impl Gate {
                     record_secret(&path, "secret_grant", server, secret);
                 }
             }
-            None => self.record("approve", server, &entry.manifest_hash),
+            // A plain approval says its grants are recorded, then writes one
+            // line per granted secret (#825), so a secret added to the lock
+            // by hand afterwards is caught like a bundle's.
+            None => {
+                append(
+                    &path,
+                    plugin_lock::plain_ledger_line(server, &entry.manifest_hash, now()),
+                );
+                for secret in &entry.secrets {
+                    record_secret(&path, "secret_grant", server, secret);
+                }
+            }
         }
         self.lock.insert(server.to_string(), entry);
         Ok(())
@@ -297,6 +308,13 @@ pub fn blocked_notes(check: &plugin_lock::LedgerCheck) -> Vec<String> {
         .iter()
         .map(|(s, why)| format!("plugin lock: `{s}` is not trusted: {why}"))
         .collect();
+    notes.extend(check.secrets_unrecorded.iter().map(|s| {
+        format!(
+            "plugin lock: `{s}` holds secret grants approved before the ledger recorded them, \
+             so they cannot be checked; approve it again (or withdraw one with `revoke \
+             --secret`) to record them"
+        )
+    }));
     if let Some(why) = &check.unreadable {
         notes.push(format!(
             "plugin ledger unreadable ({why}): revocations recorded there are not checked \

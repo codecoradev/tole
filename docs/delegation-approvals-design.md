@@ -433,27 +433,28 @@ PR 1 is the riskiest to review (the classifier and the predicate), so it
 carries the heaviest tests; PRs 3 and 4 are independent after 2 and can land
 in either order.
 
-### 7.1 Recommendation for the default (#813 item 1, awaiting the owner)
+### 7.1 Default of `approvals`: decided (#813 item 1)
 
-Nothing changed: the default is still `off`. The decision for the owner is
-whether a fresh install that uses `delegate` should default to `owner`.
+Decided by the owner on 2026-11-15 ("follow best practice"): the default
+stays `off`, and the opt-in is made discoverable instead.
 
-| | Keep `off` (recommended) | Default `owner` |
+| | Keep `off` (decided) | Default `owner` (rejected) |
 |---|---|---|
 | Existing unattended `delegate` missions | unchanged: a non-allowlisted Write is denied at once | every such Write parks for up to `approval_secs` (900 s) and stalls the mission when nobody answers |
-| Fresh install, interactive owner | Writes are denied and the child reports it; the owner finds `approvals = "owner"` in the docs | the owner is asked, which is what delegation is for |
+| Fresh install, interactive owner | Writes are denied and the child reports it; `tole doctor` names `approvals = "owner"` | the owner is asked, which is what delegation is for |
 | Safety | strictest (no new decision surface) | no weaker: the owner still decides every request |
-| Change cost | none | one-line `#[default]` change, changelog, migration note, doctor hint, flip of the pinned e2e test |
 
-Recommendation: keep `off` as the default and make the opt-in discoverable
-instead: a `tole doctor` hint that fires only when delegation is in use
-(a `[delegation]` table, a profile with `delegate`, or a recorded delegated
-run) and `approvals` is unset, saying that non-allowlisted Writes are denied
-and naming `approvals = "owner"`. If the owner prefers flipping the default,
-do it for new installs only (no `[delegation]` table and no delegated run in
-the data dir) so unattended users keep today's behavior, and ship the
-migration note in `docs/migrating-0.11.md` in the same PR. Owner decision
-needed; tracked in #813.
+As shipped, `tole doctor` prints a hint when delegation is in use and
+`[delegation] approvals` is unset. The condition is deliberately narrow:
+every parent session can delegate, so "available" proves nothing; the hint
+fires only when the user config has a `[delegation]` table, or this
+workspace's delegation log (`<data dir>/delegation/<workspace hash>/delegation.jsonl`)
+is non-empty, that is, a delegated run was recorded. An explicit
+`approvals = "off"` is a decision and silences it, as does `owner` or
+`chain`. The hint says that, without an approver, an unattended delegated
+child's Write that its allow list does not cover is denied at once, and how
+to set `approvals = "owner"` (or `"chain"`) under `[delegation]` in the user
+config. Nothing else changed: no default flip, no migration note.
 
 ## 12. Owner decisions
 

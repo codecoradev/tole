@@ -1,6 +1,8 @@
 //! The discussion request timeout end to end (#786): the real binary against
 //! a provider that answers participants only after a delay. A timeout below
-//! the delay fails the turn with `timeout`; a larger one lets it finish.
+//! the delay fails the turn with `timeout`; a larger one lets it finish. The
+//! user-config floor is 10 s (#813), so every sub-10 s timeout here comes from
+//! `TOLE_DISCUSSION_TIMEOUT_SECS`, the documented test hook.
 
 mod common;
 use common::TestDir;
@@ -167,6 +169,23 @@ fn an_invalid_timeout_env_is_a_startup_error_naming_the_variable() {
         assert!(!o.status.success(), "{bad}: {text}");
         assert!(
             text.contains("TOLE_DISCUSSION_TIMEOUT_SECS"),
+            "{bad}: {text}"
+        );
+    }
+}
+
+#[test]
+fn a_config_timeout_below_the_floor_is_a_startup_error_naming_the_key() {
+    for bad in ["1", "9"] {
+        let h = home(
+            "floor",
+            &format!("[discussions]\nrequest_timeout_secs = {bad}\n"),
+        );
+        let o = discuss(&h, "http://127.0.0.1:1/v1", None);
+        let text = out(&o);
+        assert!(!o.status.success(), "{bad}: {text}");
+        assert!(
+            text.contains("discussions.request_timeout_secs") && text.contains("10 to 3600"),
             "{bad}: {text}"
         );
     }

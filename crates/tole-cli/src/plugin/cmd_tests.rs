@@ -475,6 +475,13 @@ fn diff_reports_the_secret_grant_and_fences_server_text_as_data() {
     let mut lock = Lockfile::load(&h.user()).unwrap();
     lock.servers.get_mut("cora").unwrap().secrets = vec!["OLD_KEY".into()];
     lock.save(&h.user()).unwrap();
+    // An approval from before grants were recorded (#825): the ledger cannot
+    // vouch for the grant, so the entry is reported, not blocked.
+    std::fs::write(
+        h.user().with_file_name(plugin_lock::LEDGER_FILE),
+        plugin_lock::ledger_line("approve", "cora", &hash(&v1()), 1),
+    )
+    .unwrap();
     *h.grants.borrow_mut() = vec!["NEW_KEY".into()];
     let mut live = v1();
     live.1[0].description =
@@ -554,7 +561,7 @@ fn a_hand_edited_lock_cannot_bring_back_a_revoked_server() {
     assert!(gate.refuse_unseen("cora", "stdio:true").is_none());
     assert!(ledger_of(&h)
         .lines()
-        .last()
+        .rfind(|l| !l.contains("secret_grant"))
         .unwrap()
         .contains("\"event\":\"approve\""));
 }
@@ -651,6 +658,56 @@ fn entries_the_ledger_never_saw_are_reported_not_blocked() {
         out.contains("`b` is approved in the lock but the ledger has no approval"),
         "{out}"
     );
+}
+
+/// #825: revoking one secret of a plain entry approved before grants were
+/// recorded keeps the rest working and puts the entry under the ledger; an
+/// entry that is already under it never has a hand-added grant adopted.
+#[test]
+fn revoke_secret_on_a_plain_entry_migrates_it_and_never_adopts_a_hand_added_grant() {
+    let h = H::new("plain-revoke", &["a"]);
+    h.run(&v1(), approve("a", Some(&hash(&v1())))).unwrap();
+    let one = |secret: &str| PluginAction::Revoke {
+        name: "a".into(),
+        hash: Some(hash(&v1())),
+        project: false,
+        secret: Some(secret.into()),
+    };
+    let set_secrets = |s: &[&str]| {
+        let mut lock = Lockfile::load(&h.user()).unwrap();
+        lock.servers.get_mut("a").unwrap().secrets = s.iter().map(|x| x.to_string()).collect();
+        lock.save(&h.user()).unwrap();
+    };
+    let blocked = || gate(&h).entries()["a"].revoked;
+    let old_ledger = || {
+        std::fs::write(
+            h.user().with_file_name(plugin_lock::LEDGER_FILE),
+            plugin_lock::ledger_line("approve", "a", &hash(&v1()), 1),
+        )
+        .unwrap();
+    };
+    // A pre-#825 entry with two grants: reported, then migrated by a revoke.
+    set_secrets(&["A_TOKEN", "B_KEY"]);
+    old_ledger();
+    assert!(!blocked());
+    h.run(&v1(), one("A_TOKEN")).unwrap();
+    assert_eq!(
+        Lockfile::load(&h.user()).unwrap().servers["a"].secrets,
+        ["B_KEY"]
+    );
+    let g = gate(&h);
+    assert!(!g.entries()["a"].revoked, "{:?}", g.notes);
+    // Now ledger-tracked: a hand-added grant, or the revoked one, is blocked.
+    set_secrets(&["B_KEY", "EVIL_KEY"]);
+    assert!(blocked());
+    set_secrets(&["A_TOKEN", "B_KEY"]);
+    assert!(blocked());
+    // Revoking from an already tracked entry adopts nothing the ledger lacks.
+    set_secrets(&["B_KEY", "EVIL_KEY"]);
+    h.run(&v1(), one("B_KEY")).unwrap();
+    let text = ledger_of(&h);
+    assert!(!text.contains("EVIL_KEY"), "{text}");
+    assert!(blocked());
 }
 
 #[test]

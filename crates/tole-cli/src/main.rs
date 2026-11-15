@@ -1783,6 +1783,15 @@ fn dispatch(cli: Cli) -> Result<()> {
                 "{}",
                 tole_cli::approvals_owner::doctor_line(&host.delegation.cfg)
             );
+            // Delegation in use with `approvals` unset (#813): say what the
+            // default `off` means and how to opt in.
+            let log = host.delegation.data_dir.as_deref().zip(cwd.as_deref());
+            let log = log.and_then(|(d, c)| tole_cli::delegate::log_path(d, c));
+            if let Some(h) =
+                tole_cli::approvals_owner::doctor_hint(&host.delegation.cfg, log.as_deref())
+            {
+                println!("{h}");
+            }
             // The plugin lock (#599): each configured server's approval.
             #[cfg(feature = "mcp")]
             if let Some(cwd) = &cwd {

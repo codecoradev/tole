@@ -49,6 +49,7 @@ fn unlocked_is_refused_approval_locks_it_and_a_change_blocks_it_again() {
     let ledger = std::fs::read_to_string(user.with_file_name(plugin_lock::LEDGER_FILE)).unwrap();
     let events: Vec<&str> = ledger
         .lines()
+        .filter(|l| !l.contains("secret_grant"))
         .map(|l| {
             serde_json::from_str::<serde_json::Value>(l).unwrap()["event"]
                 .as_str()
@@ -294,6 +295,60 @@ fn a_changed_or_missing_bundle_manifest_blocks_the_server_and_its_grants() {
     assert!(gate.refuse_unseen("srv", "stdio:srv").is_some());
     std::fs::write(&file, BUNDLE).unwrap();
     assert!(gate.refuse_unseen("srv", "stdio:srv").is_none());
+}
+
+/// #825: a plain approval records its grants, so a secret added to the lock
+/// by hand afterwards is blocked; an entry approved before is only reported.
+#[test]
+fn a_plain_approval_records_each_grant_and_a_hand_added_one_is_blocked() {
+    let dir = tmp("plain-ledger");
+    let ws = tmp("plain-ledger-ws");
+    let user = dir.join("data").join(plugin_lock::LOCK_FILE);
+    let mut gate = Gate::load(Some(user.clone()), &ws);
+    gate.approve_with(
+        "srv",
+        "stdio:srv",
+        "1",
+        &tools(),
+        Approval {
+            integrity: Some(String::new()),
+            secrets: Some(vec!["A_TOKEN".into()]),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let text = ledger(&user);
+    assert!(text.contains("\"secrets_recorded\":true") && text.contains("secret_grant"));
+    assert!(!text.contains("B_KEY"));
+    let gate = Gate::load(Some(user.clone()), &ws);
+    assert!(gate.refuse_unseen("srv", "stdio:srv").is_none());
+    let mut lock = Lockfile::load(&user).unwrap();
+    lock.servers
+        .get_mut("srv")
+        .unwrap()
+        .secrets
+        .push("B_KEY".into());
+    lock.save(&user).unwrap();
+    let gate = Gate::load(Some(user.clone()), &ws);
+    assert!(gate.refuse_unseen("srv", "stdio:srv").is_some());
+    assert!(gate.notes.iter().any(|n| n.contains("secret grant")));
+    // Migration: the same lock against a pre-#825 approval line is not
+    // blocked, but reported.
+    let hash = plugin_lock::manifest_hash(&tools());
+    std::fs::write(
+        user.with_file_name(plugin_lock::LEDGER_FILE),
+        plugin_lock::ledger_line("approve", "srv", &hash, 1),
+    )
+    .unwrap();
+    let gate = Gate::load(Some(user), &ws);
+    assert!(gate.refuse_unseen("srv", "stdio:srv").is_none());
+    assert!(
+        gate.notes
+            .iter()
+            .any(|n| n.contains("before the ledger recorded")),
+        "{:?}",
+        gate.notes
+    );
 }
 
 /// #811: the ledger shows which grants the owner gave.
