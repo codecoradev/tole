@@ -134,7 +134,7 @@ fn path_env() -> String {
 fn path_without_bwrap(dir: &Path) -> String {
     let bin = dir.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
-    for p in ["sh", "touch"] {
+    for p in ["sh", "touch", "chmod"] {
         let src = ["/bin", "/usr/bin"]
             .iter()
             .map(|d| Path::new(d).join(p))
@@ -226,9 +226,9 @@ fn a_required_verify_without_a_sandbox_is_refused_and_the_mission_fails_closed()
         r.stderr
     );
     assert!(!ws.join("verify-ran").exists(), "the command never ran");
-    // Not retried against the model: one turn, no verify failures counted.
+    // Stopped by the start-up check: no model turn was spent, nothing counted.
     assert!(
-        r.stdout.contains("turns: 1") && r.stdout.contains("verify failures: 0"),
+        r.stdout.contains("turns: 0") && r.stdout.contains("verify failures: 0"),
         "{}",
         r.stdout
     );
@@ -250,6 +250,7 @@ fn an_optional_verify_without_a_sandbox_is_refused_too() {
     assert_ne!(r.code, 0, "{}", r.stdout);
     assert!(r.stdout.contains("status: verify_refused"), "{}", r.stdout);
     assert!(r.stderr.contains("unattended"), "{}", r.stderr);
+    assert!(r.stdout.contains("turns: 0"), "{}", r.stdout);
     assert!(!ws.join("verify-ran").exists(), "never ran unsandboxed");
     drop(dir);
 }
@@ -309,5 +310,92 @@ fn a_failing_sandboxed_verify_is_a_verify_failure_not_a_refusal() {
     assert_ne!(r.code, 0);
     assert!(r.stdout.contains("status: verify_failed"), "{}", r.stdout);
     assert!(r.stdout.contains("verify failures: 3"), "{}", r.stdout);
+    drop(dir);
+}
+
+/// A PATH whose `bwrap` is a script: `--version` and the self-test (`... true`)
+/// succeed, so the sandbox looks usable; then `body` runs for every real
+/// launch. With `chmod_after_selftest` the script removes its own execute bit
+/// once it has passed the self-test, so a later launch cannot be spawned.
+fn path_with_fake_bwrap(dir: &Path, body: &str, chmod_after_selftest: bool) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = dir.join("fakebin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let smoke = if chmod_after_selftest {
+        "chmod a-x \"$0\""
+    } else {
+        ":"
+    };
+    let script = format!(
+        "#!/bin/sh\n\
+         case \"$1\" in --version) echo 'bubblewrap 0.9.0'; exit 0;; esac\n\
+         for a in \"$@\"; do last=$a; done\n\
+         if [ \"$last\" = true ]; then {smoke}; exit 0; fi\n\
+         {body}\n"
+    );
+    let fake = bin.join("bwrap");
+    std::fs::write(&fake, script).unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    format!("{}:{}", bin.display(), path_without_bwrap(dir))
+}
+
+/// A launcher that fails (bwrap's own error and exit 1, no exit code of a
+/// command) is the sandbox's failure, not the command's: the mission ends
+/// `verify_refused`, the model is not told to fix it, no strike is counted,
+/// and it is never a pass. A real child exit 3 stays an ordinary failure
+/// (`a_failing_sandboxed_verify_is_a_verify_failure_not_a_refusal`).
+#[test]
+fn a_launcher_failure_is_a_refusal_not_a_verify_failure() {
+    let (dir, ws, home) = project("launcher");
+    let path = path_with_fake_bwrap(
+        &dir,
+        "echo 'bwrap: setting up uid map: Permission denied' >&2; exit 1",
+        false,
+    );
+    let r = mission(
+        &ws,
+        &home,
+        "[sandbox.consumers]\nverify = \"required\"\n",
+        &path,
+        "touch verify-ran",
+    );
+    assert_ne!(r.code, 0, "{}\n{}", r.stdout, r.stderr);
+    assert!(r.stdout.contains("status: verify_refused"), "{}", r.stdout);
+    assert!(!r.stdout.contains("status: verify_failed"), "{}", r.stdout);
+    assert!(
+        r.stderr
+            .contains("the sandbox failed before or while starting")
+            && r.stderr.contains("setting up uid map"),
+        "{}",
+        r.stderr
+    );
+    // The launcher passed the start-up check, so the model turn happened; the
+    // failure was not handed back as a verify failure.
+    assert!(r.stdout.contains("verify failures: 0"), "{}", r.stdout);
+    assert!(!ws.join("verify-ran").exists());
+    drop(dir);
+}
+
+/// The launcher cannot even be started (it passed the self-test and was
+/// gone after): the spawn error is a refusal too.
+#[test]
+fn a_launcher_that_cannot_be_spawned_is_a_refusal() {
+    let (dir, ws, home) = project("spawn");
+    let path = path_with_fake_bwrap(&dir, "exit 1", true);
+    let r = mission(
+        &ws,
+        &home,
+        "[sandbox.consumers]\nverify = \"required\"\n",
+        &path,
+        "touch verify-ran",
+    );
+    assert_ne!(r.code, 0, "{}\n{}", r.stdout, r.stderr);
+    assert!(r.stdout.contains("status: verify_refused"), "{}", r.stdout);
+    assert!(
+        r.stderr.contains("the sandbox did not start"),
+        "{}",
+        r.stderr
+    );
+    assert!(r.stdout.contains("verify failures: 0"), "{}", r.stdout);
     drop(dir);
 }

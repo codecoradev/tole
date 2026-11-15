@@ -204,8 +204,8 @@ fn verify_run_error(cause: &str, timeout: std::time::Duration) -> String {
     )
 }
 
-/// Run the `--verify` command (sh -c, operator-budgeted timeout).
-/// Returns Ok(()) on exit-0, Err(output tail) otherwise.
+/// Run the `--verify` command (sh -c, operator-budgeted timeout) and say what
+/// it came to: passed (exit 0), failed (output tail for the model) or refused.
 ///
 /// The command is the owner's, but what it runs is usually code the agent
 /// just wrote (`cargo test` runs build scripts and tests), with no
@@ -215,16 +215,23 @@ fn verify_run_error(cause: &str, timeout: std::time::Duration) -> String {
 /// With `[sandbox.consumers] verify` on (#748) the same `sh -c` runs in the
 /// `command` profile instead. A mission is an unattended run, so `optional`
 /// counts as `required`, and a sandbox that is required but missing is a
-/// [`Verify::Refused`], never a pass.
+/// [`Verify::Refused`], never a pass. So is a sandbox that is there but fails
+/// to start the command (the launcher failing is not the command failing, and
+/// the model must not be told to fix it): a spawn error of the launcher, or a
+/// non-zero exit for which `bwrap` reported no exit code of the command.
 fn run_verify(cmd: &str, timeout: std::time::Duration) -> Verify {
-    use tole_core::sandbox::command::{command_in_cwd, Consumer};
-    let (mut c, _) = match command_in_cwd(Consumer::Verify, "sh", &["-c".to_string(), cmd.into()]) {
-        Ok(c) => c,
-        Err(why) => return Verify::Refused(why),
-    };
+    use tole_core::sandbox::command::{command_in_cwd, Consumer, Launched};
+    let Launched { cmd: mut c, report } =
+        match command_in_cwd(Consumer::Verify, "sh", &["-c".to_string(), cmd.into()]) {
+            Ok(l) => l,
+            Err(why) => return Verify::Refused(why),
+        };
     tole_core::subprocess::scrub_env_for(&mut c, tole_core::secret_release::VERIFY);
     let out = match run_with_timeout(&mut c, timeout) {
         Ok(o) => o,
+        Err(e) if report.is_some() && e.starts_with(tole_core::subprocess::SPAWN_FAILED) => {
+            return Verify::Refused(format!("verify: not run, the sandbox did not start ({e})"))
+        }
         Err(e) => return Verify::Failed(verify_run_error(&e, timeout)),
     };
     if out.status.success() {
@@ -237,6 +244,15 @@ fn run_verify(cmd: &str, timeout: std::time::Duration) -> Verify {
         let start = chars.len().saturating_sub(800);
         chars[start..].iter().collect()
     };
+    if let (Some(report), Some(code)) = (report, out.status.code()) {
+        if report.command_exit_code() != Some(code) {
+            return Verify::Refused(format!(
+                "verify: not run, the sandbox failed before or while starting the command \
+                 (bwrap exit {code}): {}",
+                tail.trim()
+            ));
+        }
+    }
     Verify::Failed(format!(
         "verify FAILED (exit {}):\n{}",
         out.status.code().unwrap_or(-1),
@@ -415,6 +431,17 @@ pub fn run_mission(
             );
             status = "exhausted_time";
             break;
+        }
+        // A verify the sandbox cannot run is known now: stop before a model turn
+        // is spent on a mission that cannot be verified.
+        if turns == 0 && cfg.verify.is_some() {
+            if let Err(why) = tole_core::sandbox::command::preflight(
+                tole_core::sandbox::command::Consumer::Verify,
+            ) {
+                eprintln!("mission: verify refused before the first turn: {why}");
+                status = "verify_refused";
+                break;
+            }
         }
         let Some(prompt) = continuation.take() else {
             // No continuation queued and no completion declared: a logic

@@ -894,3 +894,56 @@ fn doctor_lists_verify_and_fails_for_it_without_a_sandbox() {
         "{l:?}"
     );
 }
+
+/// The launcher report has an exit code only when the command itself ended
+/// (`child-pid` is written before the mounts are made, so it says nothing).
+#[cfg(target_os = "linux")]
+#[test]
+fn the_launcher_report_has_an_exit_code_only_when_the_command_ended() {
+    let started = r#"{ "child-pid": 5644, "pid-namespace": 4026532268 }"#;
+    assert_eq!(exit_code_of(started), None, "started is not ended");
+    let ended = format!("{started}\n{{ \"exit-code\": 7 }}\n");
+    assert_eq!(exit_code_of(&ended), Some(7));
+    assert_eq!(exit_code_of("{ \"exit-code\": 0 }"), Some(0));
+    for junk in [
+        "",
+        "bwrap: Can't find source path /x",
+        "{ \"exit-code\": \"x\" }",
+    ] {
+        assert_eq!(exit_code_of(junk), None, "{junk:?}");
+    }
+}
+
+#[test]
+fn doctor_warns_when_verify_needs_a_toolchain_the_sandbox_cannot_see() {
+    let home = tmp("toolchain-home");
+    let c = Consumers {
+        verify: Mode::Required,
+        ..Consumers::default()
+    };
+    let lines = |h: Option<&Path>| doctor_lines_for(&c, &usable(), h);
+    // No toolchain dir: no warning, but the plain note about deterministic
+    // failures stays (network, address space).
+    let l = lines(Some(&home));
+    assert!(!l.iter().any(|x| x.contains("WARNING verify")), "{l:?}");
+    assert!(
+        l.iter()
+            .any(|x| x.contains("fail deterministically") && x.contains("network")),
+        "{l:?}"
+    );
+    std::fs::create_dir_all(home.join(".cargo/bin")).unwrap();
+    std::fs::create_dir_all(home.join(".rustup")).unwrap();
+    let l = lines(Some(&home));
+    let w = l
+        .iter()
+        .find(|x| x.starts_with("sandbox consumers: WARNING verify"))
+        .unwrap_or_else(|| panic!("{l:?}"));
+    assert!(
+        w.contains(".cargo/bin") && w.contains(".rustup") && w.contains("three strikes"),
+        "{w}"
+    );
+    assert!(!l.iter().any(|x| x.contains("ERROR")), "a warning only");
+    // Verify off: nothing to say about it.
+    let off = doctor_lines_for(&Consumers::default(), &usable(), Some(&home));
+    assert!(!off.iter().any(|x| x.contains("WARNING verify")), "{off:?}");
+}
