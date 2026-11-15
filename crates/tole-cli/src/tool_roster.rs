@@ -746,10 +746,9 @@ mod tests {
         }
     }
 
-    fn workspace(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("tole-roster-{tag}-{}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
-        d
+    use crate::test_dir::TestDir;
+    fn workspace(tag: &str) -> TestDir {
+        TestDir::new(&format!("tole-roster-{tag}"))
     }
 
     fn names(reg: &ToolRegistry) -> Vec<String> {
@@ -763,9 +762,13 @@ mod tests {
     #[test]
     fn destructive_only_behind_an_interactive_approver() {
         let ws = workspace("destructive");
-        let human = build(Human, Roster::new(ws.clone())).unwrap();
+        let human = build(Human, Roster::new(ws.to_path_buf())).unwrap();
         assert!(human.get("delete_file").is_some());
-        let server = build(AllowlistApprover::allow_only(vec![]), Roster::new(ws)).unwrap();
+        let server = build(
+            AllowlistApprover::allow_only(vec![]),
+            Roster::new(ws.to_path_buf()),
+        )
+        .unwrap();
         assert!(server.get("delete_file").is_none());
         assert!(server.get("write_file").is_some());
     }
@@ -785,7 +788,7 @@ mod tests {
             (&none as &dyn Fn(&str) -> Option<String>, false),
             (&with, true),
         ] {
-            let mut reg = build(Human, Roster::new(ws.clone())).unwrap();
+            let mut reg = build(Human, Roster::new(ws.to_path_buf())).unwrap();
             assert!(reg.get("write_file").is_some());
             keep_read_only(&mut reg, env).unwrap();
             assert_eq!(reg.get("delegate_report").is_some(), report);
@@ -802,7 +805,7 @@ mod tests {
     #[test]
     fn plan_mode_leaves_only_read_only_tools() {
         let ws = workspace("plan");
-        let mut roster = Roster::new(ws);
+        let mut roster = Roster::new(ws.to_path_buf());
         roster.plan_mode = true;
         roster.agents = Some(AgentTools::default());
         let reg = build(Human, roster).unwrap();
@@ -819,9 +822,9 @@ mod tests {
     #[test]
     fn agent_tools_only_when_the_face_allows_children() {
         let ws = workspace("agents");
-        let none = build(Human, Roster::new(ws.clone())).unwrap();
+        let none = build(Human, Roster::new(ws.to_path_buf())).unwrap();
         assert!(none.get("agent_start").is_none());
-        let mut roster = Roster::new(ws);
+        let mut roster = Roster::new(ws.to_path_buf());
         roster.agents = Some(AgentTools::default());
         let parent = build(Human, roster).unwrap();
         // A test process is never a child (no TOLE_AGENT_DEPTH).
@@ -835,15 +838,15 @@ mod tests {
     fn discussion_tools_come_only_with_delegate_and_a_provider() {
         let ws = workspace("discuss-roster");
         let all = ["discuss", "discuss_status", "discuss_stop"];
-        for roster in [Roster::new(ws.clone()), {
-            let mut r = Roster::new(ws.clone());
+        for roster in [Roster::new(ws.to_path_buf()), {
+            let mut r = Roster::new(ws.to_path_buf());
             r.agents = Some(AgentTools::default());
             r
         }] {
             let reg = build(Human, roster).unwrap();
             assert!(all.iter().all(|t| reg.get(t).is_none()));
         }
-        let mut roster = Roster::new(ws.clone());
+        let mut roster = Roster::new(ws.to_path_buf());
         roster.agents = Some(AgentTools {
             delegation: Some(crate::delegate::Setup {
                 data_dir: Some(ws.join("data")),
@@ -856,7 +859,7 @@ mod tests {
         let provider = crate::config_apply::provider_config().is_some();
         assert!(all.iter().all(|t| reg.get(t).is_some() == provider));
         // Plan mode registers no agent tools at all, so no discussion.
-        let mut plan = Roster::new(ws);
+        let mut plan = Roster::new(ws.to_path_buf());
         plan.agents = Some(AgentTools {
             delegation: Some(crate::delegate::Setup::default()),
             ..AgentTools::default()
@@ -878,7 +881,7 @@ mod tests {
                 std::path::Path::new("u.toml"),
             )
             .unwrap();
-            let mut roster = Roster::new(ws.clone());
+            let mut roster = Roster::new(ws.to_path_buf());
             roster.agents = Some(AgentTools {
                 parent_allows: allows.iter().map(|s| s.to_string()).collect(),
                 delegation: Some(crate::delegate::Setup {
@@ -922,14 +925,14 @@ mod tests {
     #[test]
     fn cron_create_only_where_a_face_allows_agents() {
         let ws = workspace("cron-create");
-        assert!(build(Human, Roster::new(ws.clone()))
+        assert!(build(Human, Roster::new(ws.to_path_buf()))
             .unwrap()
             .get("cron_create")
             .is_none());
-        let mut roster = Roster::new(ws.clone());
+        let mut roster = Roster::new(ws.to_path_buf());
         roster.agents = Some(AgentTools::default());
         assert!(build(Human, roster).unwrap().get("cron_create").is_some());
-        let mut plan = Roster::new(ws);
+        let mut plan = Roster::new(ws.to_path_buf());
         plan.agents = Some(AgentTools::default());
         plan.plan_mode = true;
         assert!(build(Human, plan).unwrap().get("cron_create").is_none());
@@ -945,8 +948,8 @@ mod tests {
         std::fs::create_dir_all(&data).unwrap();
         let project = home.join("project");
         std::fs::create_dir_all(&project).unwrap();
-        let with = |ws: &PathBuf, agents: bool| {
-            let mut r = Roster::new(ws.clone());
+        let with = |ws: &std::path::Path, agents: bool| {
+            let mut r = Roster::new(ws.to_path_buf());
             if agents {
                 r.agents = Some(AgentTools::default());
             }

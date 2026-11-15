@@ -536,7 +536,7 @@ mod tests {
 
     #[cfg(unix)]
     struct Fake {
-        dir: PathBuf,
+        dir: crate::test_dir::TestDir,
         bin: PathBuf,
     }
 
@@ -544,15 +544,7 @@ mod tests {
     /// says and counts its invocations in `calls`.
     #[cfg(unix)]
     fn fake_cora(tag: &str) -> Fake {
-        let dir = std::env::temp_dir().join(format!(
-            "tole-gate-{tag}-{}-{:x}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_dir::TestDir::new(&format!("tole-gate-{tag}"));
         let bin = dir.join("cora");
         std::fs::write(
             &bin,
@@ -585,7 +577,7 @@ mod tests {
                 .unwrap_or(0)
         }
         fn gate(&self, policy: Policy) -> Arc<Gate> {
-            let g = Gate::with_cora_bin(policy, self.dir.clone(), self.bin.clone());
+            let g = Gate::with_cora_bin(policy, self.dir.to_path_buf(), self.bin.clone());
             g.activate();
             g
         }
@@ -596,7 +588,7 @@ mod tests {
     fn an_inactive_or_off_gate_never_asks_cora() {
         let f = fake_cora("inactive");
         f.exit(11);
-        let inactive = Gate::with_cora_bin(Policy::Block, f.dir.clone(), f.bin.clone());
+        let inactive = Gate::with_cora_bin(Policy::Block, f.dir.to_path_buf(), f.bin.clone());
         assert_eq!(inactive.check_commit(), Decision::Proceed);
         assert_eq!(f.gate(Policy::Off).check_commit(), Decision::Proceed);
         assert_eq!(
@@ -660,7 +652,7 @@ mod tests {
             "said once, not on every commit"
         );
         // A cora that is not there at all behaves the same.
-        let gone = Gate::with_cora_bin(Policy::Block, f.dir.clone(), f.dir.join("nope"));
+        let gone = Gate::with_cora_bin(Policy::Block, f.dir.to_path_buf(), f.dir.join("nope"));
         gone.activate();
         assert!(matches!(gone.check_commit(), Decision::Note(_)));
     }

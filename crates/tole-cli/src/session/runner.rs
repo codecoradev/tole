@@ -401,11 +401,8 @@ mod tests {
     use tole_core::register::RegisterWrite;
     use tole_core::storage::{Commit, JsonlStorage};
 
-    fn storage(tag: &str) -> (JsonlStorage, std::path::PathBuf) {
-        let dir =
-            std::env::temp_dir().join(format!("tole-turn-runner-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+    fn storage(tag: &str) -> (JsonlStorage, crate::test_dir::TestDir) {
+        let dir = crate::test_dir::TestDir::new(&format!("tole-turn-runner-{tag}"));
         (JsonlStorage::create(&dir, "s", None).unwrap(), dir)
     }
 
@@ -444,11 +441,9 @@ mod tests {
     }
     /// A fake `uteke` that prints `body` and logs its argv.
     #[cfg(unix)]
-    fn fake_uteke(tag: &str, body: &str) -> (MemoryConfig, std::path::PathBuf) {
+    fn fake_uteke(tag: &str, body: &str) -> (MemoryConfig, crate::test_dir::TestDir) {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("tole-turn-mem-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_dir::TestDir::new(&format!("tole-turn-mem-{tag}"));
         let bin = dir.join("uteke");
         std::fs::write(
             &bin,
@@ -503,8 +498,7 @@ mod tests {
 
     #[test]
     fn session_effort_register_wins_over_the_default() {
-        let dir = std::env::temp_dir().join(format!("tole-effort-reg-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_dir::TestDir::new("tole-effort-reg");
         let mut st = tole_core::storage::JsonlStorage::create(&dir, "e1", None).unwrap();
         assert_eq!(session_effort(&st, Some("low")).as_deref(), Some("low"));
         assert_eq!(session_effort(&st, None), None);

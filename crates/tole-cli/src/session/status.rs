@@ -125,15 +125,7 @@ mod tests {
     }
 
     fn store(tag: &str) -> JsonlStorage {
-        let d = std::env::temp_dir().join(format!(
-            "tole-status-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&d).unwrap();
+        let d = crate::test_dir::TestDir::new(&format!("tole-status-{tag}"));
         JsonlStorage::create(&d, "s", None).unwrap()
     }
 

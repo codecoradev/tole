@@ -243,18 +243,15 @@ impl WriteFileTool {
 mod tests {
     use super::*;
 
-    fn tmpdir(name: &str) -> PathBuf {
-        let d =
-            std::env::temp_dir().join(format!("tole-cli-tools-{}-{}", name, std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
+    use crate::test_dir::TestDir;
+    fn tmpdir(name: &str) -> TestDir {
+        TestDir::new(&format!("tole-cli-tools-{name}"))
     }
 
     #[test]
     fn writes_and_reports_bytes() {
         let dir = tmpdir("write-ok");
-        let t = WriteFileTool::new(dir.clone());
+        let t = WriteFileTool::new(dir.to_path_buf());
         let out = t
             .execute(json!({ "path": "notes.txt", "content": "hello" }))
             .unwrap();
@@ -268,7 +265,7 @@ mod tests {
     #[test]
     fn rejects_absolute_and_traversal() {
         let dir = tmpdir("write-jail");
-        let t = WriteFileTool::new(dir);
+        let t = WriteFileTool::new(dir.to_path_buf());
         assert!(t
             .execute(json!({ "path": "/etc/passwd", "content": "x" }))
             .is_err());
@@ -296,7 +293,7 @@ mod tests {
     #[test]
     fn creates_missing_parent_directories() {
         let dir = tmpdir("write-parents");
-        let t = WriteFileTool::new(dir.clone());
+        let t = WriteFileTool::new(dir.to_path_buf());
         t.execute(json!({ "path": "a/b/c.txt", "create_dirs": true, "content": "deep" }))
             .unwrap();
         assert_eq!(

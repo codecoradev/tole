@@ -664,15 +664,7 @@ mod tests {
     fn the_tail_yields_each_entry_once_in_order_and_survives_a_torn_tail() {
         use tole_core::entry::{EntryType, NewEntry};
         use tole_core::storage::Commit;
-        let dir = std::env::temp_dir().join(format!(
-            "tole-events-{}-{:x}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_dir::TestDir::new("tole-events");
         let mut s = JsonlStorage::create(&dir, "t1", None).unwrap();
         let add = |s: &mut JsonlStorage, text: &str| {
             let kind = EntryType::new(EntryType::MESSAGE);

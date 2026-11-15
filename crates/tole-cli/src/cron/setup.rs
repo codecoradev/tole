@@ -295,11 +295,9 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn tmp(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("tole-cron-setup-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d.canonicalize().unwrap()
+    use crate::test_dir::TestDir;
+    fn tmp(tag: &str) -> TestDir {
+        TestDir::new(&format!("tole-cron-setup-{tag}"))
     }
 
     fn skill(root: &Path, name: &str, body: &str) -> PathBuf {

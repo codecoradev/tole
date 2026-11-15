@@ -1623,8 +1623,7 @@ mod tests {
     /// environment; an empty file is an error, and no error shows a token.
     #[test]
     fn the_serve_token_prefers_the_file_and_never_echoes_a_value() {
-        let dir = std::env::temp_dir().join(format!("tole-serve-token-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_dir::TestDir::new("tole-serve-token");
         let file = dir.join("token");
         std::fs::write(&file, "file-token-0682\n").unwrap();
         let s = |v: &str| Some(v.to_string());
@@ -1691,7 +1690,7 @@ mod tests {
     /// workspace root is refused BEFORE any session file is created.
     #[test]
     fn rest_session_cwd_outside_workspace_root_is_refused() {
-        let base = std::env::temp_dir().join(format!("tole-serve-jail-{}", std::process::id()));
+        let base = crate::test_dir::TestDir::new("tole-serve-jail");
         let root = base.join("ws");
         let inside = root.join("sub");
         let sessions = base.join("sessions");

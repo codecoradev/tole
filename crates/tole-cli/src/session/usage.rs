@@ -733,9 +733,7 @@ mod tests {
     fn stats_survive_a_restart_and_match_the_provider_block_exactly() {
         use tole_core::entry::{EntryType, NewEntry};
         use tole_core::storage::{Commit, JsonlStorage, Storage};
-        let dir = std::env::temp_dir().join(format!("tole-turnstats-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_dir::TestDir::new("tole-turnstats");
         let provider_usage = json!({
             "prompt_tokens": 123,
             "completion_tokens": 45,
