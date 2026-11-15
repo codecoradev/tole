@@ -560,7 +560,10 @@ built-in or owner-overridden roles.
 
 1. `tole discuss start|resume|list|show` (owner-only, depth 0, read-only
    inline participants; `--dry-run` shows the cost, `resume` continues after
-   a crash).
+   a crash). The number of participants is advice (8 recommended, #856), not
+   a limit: only a measured technical ceiling (16, the most voices whose
+   worst-case round fits one ledger record) refuses a contract, and the
+   budget, which is a hard cap, bounds the cost.
 2. The model-facing tools `discuss`, `discuss_status` and `discuss_stop`
    (`tole_cli::discuss_tool`), under exactly the rules of `delegate`:
    - all three are `Risk::Write`, approved or allowlisted like `delegate`;

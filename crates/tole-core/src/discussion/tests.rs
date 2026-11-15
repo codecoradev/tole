@@ -70,8 +70,6 @@ fn a_contract_is_validated_and_cleaned() {
     assert!(ok("x", "q", &["c"], &["a"], 0, None).is_err());
     assert!(ok("x", "q", &["c"], &["a"], 1, Some(0)).is_err());
     assert!(ok("x", "q", &["c"], &["a"], 1, Some(11)).is_err());
-    let nine: Vec<&str> = vec!["a", "b", "c", "d", "e", "f", "g", "h", "i"];
-    assert!(ok("x", "q", &["c"], &nine, 1, None).is_err());
     // The question is sanitized like any untrusted text.
     let k = ok(
         "x",
@@ -87,6 +85,43 @@ fn a_contract_is_validated_and_cleaned() {
         "{}",
         k.question
     );
+}
+
+fn voices(n: usize) -> Vec<String> {
+    (1..=n).map(|i| format!("voice-{i}")).collect()
+}
+
+/// #856: the count of voices is advice, not a limit, up to the measured
+/// technical ceiling.
+#[test]
+fn many_participants_are_accepted_up_to_the_measured_ceiling() {
+    let make = |n: usize| Contract::new("x", "q", &strs(&["c"]), &voices(n), 1, None, &secrets());
+    for n in [1, RECOMMENDED_PARTICIPANTS, 9, 12, MAX_PARTICIPANTS] {
+        assert_eq!(make(n).unwrap().participants.len(), n);
+    }
+    let e = make(MAX_PARTICIPANTS + 1).unwrap_err();
+    assert!(
+        e.contains(&format!("at most {MAX_PARTICIPANTS}")) && e.contains("ledger record"),
+        "{e}"
+    );
+    assert!(make(0).unwrap_err().contains("at least one is needed"));
+    assert_eq!((RECOMMENDED_PARTICIPANTS, MAX_PARTICIPANTS), (8, 16));
+}
+
+#[test]
+fn the_advice_starts_above_the_recommendation_and_is_never_an_error() {
+    for n in 0..=RECOMMENDED_PARTICIPANTS {
+        assert_eq!(participants_advice(n), None, "{n}");
+    }
+    let a = participants_advice(9).unwrap();
+    assert!(
+        a.contains("9 participants: more than 8 voices mostly add cost and dilute the debate")
+            && a.contains("3 to 8 is the sweet spot"),
+        "{a}"
+    );
+    assert!(participants_advice(MAX_PARTICIPANTS)
+        .unwrap()
+        .starts_with("16 "));
 }
 
 #[test]

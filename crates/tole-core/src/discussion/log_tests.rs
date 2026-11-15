@@ -878,3 +878,65 @@ fn the_charge_note_is_an_optional_field_old_ledgers_and_readers_agree_on() {
     let noted = serde_json::to_string(&ev(Some("timeout"))).unwrap();
     assert!(noted.contains(r#""charged":"timeout""#), "{noted}");
 }
+
+/// #856: `MAX_PARTICIPANTS` is measured, not chosen. The worst round is
+/// every voice speaking the longest text the sanitizer lets through, in
+/// 4-byte characters, and the scribe's digest being refused: the round is
+/// then kept as written in ONE record.
+#[test]
+fn the_participant_ceiling_is_what_a_worst_case_fallback_record_can_hold() {
+    use crate::discussion::{
+        sanitize, MAX_CONTRIBUTION_CHARS, MAX_PARTICIPANTS, MAX_ROUNDS_CEILING,
+    };
+    let worst = sanitize(
+        &"\u{1F600}".repeat(MAX_CONTRIBUTION_CHARS + 50),
+        &SecretSet::default(),
+        MAX_CONTRIBUTION_CHARS,
+    )
+    .text;
+    assert_eq!(worst.len(), (MAX_CONTRIBUTION_CHARS - 1) * 4 + 3);
+    let voices: Vec<String> = (1..=MAX_PARTICIPANTS)
+        .map(|i| format!("voice-{i}"))
+        .collect();
+    let k = Contract::new(
+        "wide",
+        "Which database?",
+        &strs(&["a choice is named"]),
+        &voices,
+        u64::MAX / 2,
+        Some(MAX_ROUNDS_CEILING),
+        &SecretSet::default(),
+    )
+    .unwrap();
+    let d = dir("ceiling");
+    let l = DiscussionLog::at(&d, "wide").unwrap();
+    l.start(k, 1).unwrap();
+    let cs: Vec<Contribution> = voices
+        .iter()
+        .map(|v| l.contribute(1, v, &worst, 2).unwrap())
+        .collect();
+    let fallback = |cs: Vec<Contribution>| RoundSummary::Fallback {
+        round: 1,
+        contributions: cs,
+        reason: "x".repeat(MAX_FALLBACK_REASON_CHARS),
+    };
+    // The ceiling's record is written...
+    l.summarize(fallback(cs.clone()), 3).unwrap();
+    // ...and one voice more would not fit a record, whatever else is done.
+    let mut more = cs.clone();
+    more.push(more[0].clone());
+    let one_more = serde_json::to_string(&fallback(more)).unwrap().len();
+    assert!(
+        one_more > MAX_RECORD_BYTES,
+        "{one_more} bytes for {} voices fit a record: the ceiling could be raised",
+        MAX_PARTICIPANTS + 1
+    );
+    // A whole worst-case round (contributions and fallback) is about 1 MiB,
+    // so every round the contract allows fits the log, with its close
+    // reserve.
+    let round = std::fs::metadata(d.join("wide.jsonl")).unwrap().len();
+    assert!(
+        round * u64::from(MAX_ROUNDS_CEILING) < MAX_LOG_BYTES - CLOSE_RESERVE,
+        "a worst-case round is {round} bytes"
+    );
+}

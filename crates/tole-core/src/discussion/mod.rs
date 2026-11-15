@@ -33,8 +33,29 @@ use std::collections::BTreeSet;
 pub const DEFAULT_MAX_ROUNDS: u32 = 4;
 /// Most rounds a contract may ask for.
 pub const MAX_ROUNDS_CEILING: u32 = 10;
-/// Most participants in one discussion.
-pub const MAX_PARTICIPANTS: usize = 8;
+/// The most participants a contract accepts: a TECHNICAL ceiling, measured
+/// rather than chosen (#856). Since #856 this is no longer the 8 of earlier
+/// releases: the number of voices is advice ([`RECOMMENDED_PARTICIPANTS`],
+/// [`participants_advice`]), and the token budget (a hard cap, reserved call
+/// by call) is what controls the cost.
+///
+/// What bounds the count is the ledger, not cost. A round that the scribe's
+/// digest does not cover is kept as written in one `Fallback` record
+/// ([`RoundSummary::Fallback`]), and a record over
+/// [`log::MAX_RECORD_BYTES`] (512 KiB) is refused. The worst contribution is
+/// [`MAX_CONTRIBUTION_CHARS`] characters of 4-byte UTF-8 (31 999 bytes), so a
+/// record holds 16 of them and 17 do not (`log_tests.rs` writes exactly that
+/// record for this many voices and measures that one more would not fit).
+/// With ASCII text a record would hold about 60, so the ceiling is the
+/// proven worst case, not a typical one. Everything else scales with the
+/// budget instead of breaking: the scribe's digest and the checker's reply
+/// are capped at [`MAX_REPLY_BYTES`], a digest that drops a voice is refused
+/// into a fallback, and the worst round at this count (about 1 MiB of
+/// records) leaves the 16 MiB log room for all [`MAX_ROUNDS_CEILING`] rounds.
+pub const MAX_PARTICIPANTS: usize = 16;
+/// The number of participants to aim for: more voices mostly add cost and
+/// dilute the debate. Advice only, never an error.
+pub const RECOMMENDED_PARTICIPANTS: usize = 8;
 /// Most acceptance criteria.
 pub const MAX_CRITERIA: usize = 12;
 /// Longest question, criterion and contribution kept, in characters.
@@ -51,6 +72,18 @@ pub const MAX_REPLY_BYTES: usize = 32 * 1024;
 pub const VERBATIM_ROUND_CHARS: usize = 2400;
 /// Rounds with an empty delta in a row that make a discussion stalled.
 pub const STALL_ROUNDS: u32 = 2;
+
+/// The advice for a discussion with `n` participants: `None` up to
+/// [`RECOMMENDED_PARTICIPANTS`], else one line. Never an error: the budget
+/// is what stops a discussion that costs too much.
+pub fn participants_advice(n: usize) -> Option<String> {
+    (n > RECOMMENDED_PARTICIPANTS).then(|| {
+        format!(
+            "{n} participants: more than {RECOMMENDED_PARTICIPANTS} voices mostly add cost and \
+             dilute the debate; 3 to {RECOMMENDED_PARTICIPANTS} is the sweet spot"
+        )
+    })
+}
 
 /// An id: lowercase letters, digits, hyphens, 1 to 48 characters, not
 /// starting with a hyphen. Used for the discussion and its participants, so
@@ -168,10 +201,16 @@ impl Contract {
         if criteria.iter().any(String::is_empty) {
             return Err("an acceptance criterion is empty".into());
         }
-        if participants.is_empty() || participants.len() > MAX_PARTICIPANTS {
+        if participants.is_empty() {
+            return Err("participants: at least one is needed".into());
+        }
+        if participants.len() > MAX_PARTICIPANTS {
             return Err(format!(
-                "1 to {MAX_PARTICIPANTS} participants are needed, got {}",
-                participants.len()
+                "{} participants: at most {MAX_PARTICIPANTS} are accepted, because a round kept as \
+                 written must fit one {}-byte ledger record (more than {RECOMMENDED_PARTICIPANTS} \
+                 is advised against anyway)",
+                participants.len(),
+                log::MAX_RECORD_BYTES
             ));
         }
         let mut seen = BTreeSet::new();
