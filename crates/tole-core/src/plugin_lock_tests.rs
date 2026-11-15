@@ -619,3 +619,118 @@ fn a_plain_approval_ties_its_secrets_to_the_ledger_and_an_old_one_is_only_report
     assert!(!secrets_recorded(&old, "cora") && !secrets_recorded(&old_revoke, "cora"));
     assert!(!secrets_recorded(&ledger, "other"));
 }
+
+// ---- the sandbox profile in the entry and the ledger (#750) ----
+
+fn id(name: &str, hash: &str) -> crate::sandbox::identity::ProfileId {
+    crate::sandbox::identity::ProfileId {
+        name: name.into(),
+        hash: hash.into(),
+    }
+}
+
+fn with_profile(name: Option<&str>, hash: Option<&str>) -> BTreeMap<String, LockEntry> {
+    let mut l = locked(&base());
+    let e = l.get_mut("cora").unwrap();
+    e.sandbox = name.map(str::to_string);
+    e.sandbox_hash = hash.map(str::to_string);
+    l
+}
+
+#[test]
+fn profile_admission_compares_name_and_hash_exactly() {
+    let l = with_profile(Some("server"), Some("sha256:aa"));
+    let ok = id("server", "sha256:aa");
+    assert_eq!(profile_admission(&l, "cora", Some(&ok)), None);
+    for live in [
+        Some(id("server", "sha256:bb")),
+        Some(id("other", "sha256:aa")),
+        None, // no sandbox applies now: a loosening
+    ] {
+        assert_eq!(
+            profile_admission(&l, "cora", live.as_ref()),
+            Some(Admission::ProfileChanged)
+        );
+    }
+    // Nothing recorded (old or unsandboxed approval): nothing to compare.
+    let none = with_profile(Some("server"), None);
+    assert_eq!(profile_admission(&none, "cora", None), None);
+    assert_eq!(profile_admission(&l, "unknown", None), None);
+}
+
+#[test]
+fn a_version_3_lock_without_a_profile_hash_still_loads() {
+    let raw = r#"{"version":3,"servers":{"cora":{"source":"stdio:cora mcp","manifest_hash":"sha256:1","sandbox":"server"}}}"#;
+    let lock: Lockfile = serde_json::from_str(raw).unwrap();
+    assert_eq!(lock.servers["cora"].sandbox_hash, None);
+    assert_eq!(LOCK_VERSION, 4);
+}
+
+#[test]
+fn the_ledger_is_the_authority_for_the_profile_in_both_directions() {
+    let h = manifest_hash(&base());
+    let mut ledger = plain_ledger_line("cora", &h, 1);
+    ledger.push_str(&profile_ledger_line(
+        "cora",
+        Some("server"),
+        Some("sha256:aa"),
+        1,
+    ));
+    let c = |lock: &BTreeMap<String, LockEntry>, l: &str| check_against_ledger(lock, l);
+    let good = with_profile(Some("server"), Some("sha256:aa"));
+    let r = c(&good, &ledger);
+    assert!(r.blocked.is_empty() && r.profile_unrecorded.is_empty());
+    // A hash edited in the lock, a name edited, the record dropped, and a
+    // hash removed are all blocked.
+    for edited in [
+        with_profile(Some("server"), Some("sha256:bb")),
+        with_profile(Some("net"), Some("sha256:aa")),
+        with_profile(None, None),
+        with_profile(Some("server"), None),
+    ] {
+        assert_eq!(c(&edited, &ledger).blocked.len(), 1, "{edited:?}");
+    }
+    // An approval recorded as unsandboxed: a record added by hand is blocked.
+    let mut unsandboxed = plain_ledger_line("cora", &h, 1);
+    unsandboxed.push_str(&profile_ledger_line("cora", None, None, 1));
+    assert!(c(&with_profile(None, None), &unsandboxed)
+        .blocked
+        .is_empty());
+    assert_eq!(c(&good, &unsandboxed).blocked.len(), 1);
+    // A re-approval starts over: the old profile line no longer counts.
+    let mut again = ledger.clone();
+    again.push_str(&plain_ledger_line("cora", &h, 2));
+    assert_eq!(c(&good, &again).blocked.len(), 1);
+    again.push_str(&profile_ledger_line(
+        "cora",
+        Some("server"),
+        Some("sha256:aa"),
+        2,
+    ));
+    assert!(c(&good, &again).blocked.is_empty());
+    // Migration: an approval without a profile line is reported (stdio
+    // entries), not blocked, and a lock hash it never recorded is not trusted.
+    let old = plain_ledger_line("cora", &h, 1);
+    let r = c(&with_profile(Some("server"), None), &old);
+    assert!(r.blocked.is_empty() && r.profile_unrecorded == vec!["cora".to_string()]);
+    assert_eq!(c(&good, &old).blocked.len(), 1);
+}
+
+#[test]
+fn a_project_pin_of_another_profile_makes_the_server_unavailable_and_a_blank_one_loosens_nothing() {
+    let user = Lockfile {
+        servers: with_profile(Some("server"), Some("sha256:aa")),
+        ..Default::default()
+    };
+    let project = |name: Option<&str>, hash: Option<&str>| Lockfile {
+        servers: with_profile(name, hash),
+        ..Default::default()
+    };
+    let (eff, notes) = effective(&user, &project(Some("server"), Some("sha256:aa")));
+    assert!(!eff["cora"].revoked && notes.is_empty());
+    let (eff, notes) = effective(&user, &project(Some("server"), Some("sha256:ff")));
+    assert!(eff["cora"].revoked && notes.len() == 1);
+    let (eff, notes) = effective(&user, &project(None, None));
+    assert!(!eff["cora"].revoked && notes.is_empty());
+    assert_eq!(eff["cora"].sandbox_hash.as_deref(), Some("sha256:aa"));
+}

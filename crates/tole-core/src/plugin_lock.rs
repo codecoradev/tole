@@ -26,6 +26,12 @@
 //!   (`tole-plugin.toml`) it was approved from: [`bundle_admission`] refuses
 //!   the server when that file's hash is no longer the approved one, and
 //!   [`secret_ledger_line`] records each secret grant and revoke.
+//! - The sandbox profile an entry was approved in (#750) is recorded by name
+//!   and by [`crate::sandbox::identity::ProfileId`] hash (workspace, network,
+//!   resolved read and write grants): [`profile_admission`] refuses the
+//!   server when the profile it would run in now is another one, and
+//!   [`profile_ledger_line`] records it so the ledger, not the lock file,
+//!   is the authority.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -35,8 +41,10 @@ use std::path::{Path, PathBuf};
 
 /// Current lock format version; a newer one is refused. Version 2 adds the
 /// per-tool manifest snapshot (`manifest`); version 1 entries load without
-/// one. Version 3 adds the bundle record (`bundle`, #811).
-pub const LOCK_VERSION: u32 = 3;
+/// one. Version 3 adds the bundle record (`bundle`, #811). Version 4 adds
+/// the hash of the sandbox profile (`sandbox_hash`, #750); an entry without
+/// one loads and is reported, not blocked.
+pub const LOCK_VERSION: u32 = 4;
 /// Text a lock entry's snapshot may hold for one server, all tools
 /// together; past it a tool keeps only its hashes.
 pub const SNAPSHOT_BUDGET: usize = 128 * 1024;
@@ -327,9 +335,16 @@ pub struct LockEntry {
     /// lock can drop names.
     #[serde(default)]
     pub secrets: Vec<String>,
-    /// Sandbox profile (recorded; enforcement is a later part).
+    /// Name of the sandbox profile the server was approved in (`None`: it
+    /// was not sandboxed then). With [`LockEntry::sandbox_hash`] it is
+    /// compared with the profile it would run in at every connect (#750).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox: Option<String>,
+    /// [`crate::sandbox::identity::ProfileId`] hash of that profile's
+    /// effective grants (lock version 4). `None` in an older entry or one
+    /// approved unsandboxed: nothing to compare.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_hash: Option<String>,
     /// Seconds since the Unix epoch.
     #[serde(default)]
     pub approved_at: u64,
@@ -472,6 +487,18 @@ pub fn effective(
         if p.revoked {
             u.revoked = true;
         }
+        // A project lock can pin the profile too, but never replace it: a
+        // pin that differs from the user's approval makes the server
+        // unavailable, and a pin of nothing changes nothing.
+        if (p.sandbox_hash.is_some() && p.sandbox_hash != u.sandbox_hash)
+            || (p.sandbox.is_some() && p.sandbox != u.sandbox)
+        {
+            u.revoked = true;
+            notes.push(format!(
+                "plugin lock: the project lock pins `{name}` to another sandbox profile than \
+                 your approval; it stays unavailable until both locks agree"
+            ));
+        }
         if p.manifest_hash != u.manifest_hash {
             u.revoked = true;
             notes.push(format!(
@@ -504,6 +531,29 @@ pub enum Admission {
     /// be read now (#811): its secret grants no longer apply to what is on
     /// disk.
     BundleChanged,
+    /// The sandbox profile the server would run in now (name or effective
+    /// grants) is not the one it was approved in, or the sandbox no longer
+    /// applies to it (#750).
+    ProfileChanged,
+}
+
+/// The sandbox half of the connect-time decision: `None` when `server` has
+/// no recorded profile hash (approved before it was recorded, or
+/// unsandboxed: nothing to compare), or `live` is exactly the approved name
+/// and hash; otherwise [`Admission::ProfileChanged`]. `live` is `None` when
+/// no profile applies to the server now (sandbox off or skipped), which is
+/// a loosening and not admitted. Compared exactly: a tighter profile needs
+/// the owner's approval too, it is simply the one that shows what changed.
+pub fn profile_admission(
+    lock: &BTreeMap<String, LockEntry>,
+    server: &str,
+    live: Option<&crate::sandbox::identity::ProfileId>,
+) -> Option<Admission> {
+    let e = lock.get(server)?;
+    let hash = e.sandbox_hash.as_deref()?;
+    let same =
+        live.is_some_and(|l| l.hash == hash && Some(l.name.as_str()) == e.sandbox.as_deref());
+    (!same).then_some(Admission::ProfileChanged)
 }
 
 /// The bundle half of the connect-time decision: `None` when `server` has no
@@ -634,6 +684,25 @@ pub fn plain_ledger_line(server: &str, manifest_hash: &str, at: u64) -> String {
     line
 }
 
+/// The audit line that follows every approval (#750): the sandbox profile
+/// the entry was approved in, `None` when it was not sandboxed. Without such
+/// a line after the last `approve`, the ledger has no record of the profile
+/// (an older approval) and only the lock knows it.
+pub fn profile_ledger_line(
+    server: &str,
+    name: Option<&str>,
+    hash: Option<&str>,
+    at: u64,
+) -> String {
+    let mut line = serde_json::json!({
+        "v": 1, "kind": "plugin", "event": "sandbox_profile", "server": server,
+        "profile": name, "profile_hash": hash, "at": at,
+    })
+    .to_string();
+    line.push('\n');
+    line
+}
+
 /// The audit line of one secret grant or revoke (`secret_grant`,
 /// `secret_revoke`): the secret's NAME, never a value.
 pub fn secret_ledger_line(event: &str, server: &str, secret: &str, at: u64) -> String {
@@ -702,6 +771,11 @@ pub struct LedgerCheck {
     /// since. Reported, not blocked (a one-time migration); the owner's next
     /// approval, or `revoke --secret`, records them.
     pub secrets_unrecorded: Vec<String>,
+    /// Trusted stdio entries whose approval has no `sandbox_profile` line
+    /// (approved before #750): their profile is not compared at connect.
+    /// Reported, not blocked (a one-time migration); the owner's next
+    /// approval records it.
+    pub profile_unrecorded: Vec<String>,
     /// Why the ledger could not be read, when it could not: revocations
     /// recorded there are then not checked.
     pub unreadable: Option<String>,
@@ -721,6 +795,10 @@ pub fn check_against_ledger(lock: &BTreeMap<String, LockEntry>, ledger: &str) ->
     // approval, a plain one that says so, or one with a grant line since. An
     // older plain approval is not (the migration case, #825).
     let mut tracked: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    // Per server: the sandbox profile (name, hash) the current approval
+    // recorded; absent until a `sandbox_profile` line follows the approval.
+    type Profile = (Option<String>, Option<String>);
+    let mut profiles: BTreeMap<String, Profile> = BTreeMap::new();
     for line in ledger.lines() {
         let Ok(v) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -741,9 +819,14 @@ pub fn check_against_ledger(lock: &BTreeMap<String, LockEntry>, ledger: &str) ->
                 // An approval starts a new grant set: grants never carry over.
                 granted.remove(server);
                 tracked.remove(server);
+                profiles.remove(server);
                 if recorded {
                     tracked.insert(server.to_string());
                 }
+            }
+            "sandbox_profile" => {
+                let s = |k: &str| v[k].as_str().map(str::to_string);
+                profiles.insert(server.to_string(), (s("profile"), s("profile_hash")));
             }
             "secret_grant" | "secret_revoke" => {
                 let secret = v["secret"].as_str().unwrap_or_default().to_string();
@@ -775,6 +858,14 @@ pub fn check_against_ledger(lock: &BTreeMap<String, LockEntry>, ledger: &str) ->
             (None, None) => true,
             _ => false,
         };
+        // The profile is ledger-authoritative in both directions too: the
+        // lock's name and hash must be exactly what the last approval
+        // recorded, and a hash the ledger never recorded is not trusted.
+        // An approval with no profile line at all is the migration case.
+        let profile_edited = match profiles.get(name) {
+            Some((n, h)) => *n != e.sandbox || *h != e.sandbox_hash,
+            None => e.sandbox_hash.is_some(),
+        };
         match last.get(name) {
             Some((ev, _, _)) if ev == "revoke" => out.blocked.push(blocked(
                 "the ledger's last decision for it is a revoke, but the lock says approved \
@@ -787,6 +878,10 @@ pub fn check_against_ledger(lock: &BTreeMap<String, LockEntry>, ledger: &str) ->
             Some((_, _, b)) if !approved_bundle(b) => out.blocked.push(blocked(
                 "its plugin manifest record is not the one last recorded as approved in the \
                  ledger (added, removed or re-pinned by hand?); approve it again to use it",
+            )),
+            Some(_) if profile_edited => out.blocked.push(blocked(
+                "its sandbox profile record is not the one last recorded as approved in the \
+                 ledger (edited by hand?); approve it again to use it",
             )),
             // Grants are ledger-authoritative for a bundle approval and for a
             // plain one that recorded them (#825). An older plain approval
@@ -801,6 +896,9 @@ pub fn check_against_ledger(lock: &BTreeMap<String, LockEntry>, ledger: &str) ->
                 ))
             }
             Some((_, _, b)) => {
+                if !profiles.contains_key(name) && e.source.starts_with("stdio:") {
+                    out.profile_unrecorded.push(name.clone());
+                }
                 if b.is_none() && !tracked.contains(name) && !e.secrets.is_empty() {
                     out.secrets_unrecorded.push(name.clone());
                 }

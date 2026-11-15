@@ -23,6 +23,7 @@
 //! unattended run (cron, `serve`), where it is refused too (decision 2).
 
 pub mod command;
+pub mod identity;
 pub mod report;
 
 use std::collections::BTreeMap;
@@ -387,7 +388,6 @@ pub fn bwrap_args_for(
     }
     push(&["--proc", "/proc", "--dev", "/dev"]);
     push(&["--tmpfs", "/tmp", "--tmpfs", SCRATCH]);
-    drop(push);
     let bind = |a: &mut Vec<OsString>, flag: &str, p: &Path| {
         a.push(flag.into());
         a.push(p.into());
