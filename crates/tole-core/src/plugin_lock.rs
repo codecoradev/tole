@@ -755,6 +755,65 @@ pub fn secrets_recorded(ledger: &str, server: &str) -> bool {
     tracked
 }
 
+/// The sandbox profile `(name, hash)` the ledger recorded for `server`'s
+/// current approval: `None` when the last decision is a revoke, there is no
+/// approval, or no `sandbox_profile` line followed it (an older approval).
+pub fn ledger_profile(ledger: &str, server: &str) -> Option<(Option<String>, Option<String>)> {
+    let mut rec = None;
+    for line in ledger.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if v["kind"] != "plugin" || v["server"] != server {
+            continue;
+        }
+        match v["event"].as_str() {
+            Some("approve") | Some("revoke") => rec = None,
+            Some("sandbox_profile") => {
+                let s = |k: &str| v[k].as_str().map(str::to_string);
+                rec = Some((s("profile"), s("profile_hash")));
+            }
+            _ => {}
+        }
+    }
+    rec
+}
+
+/// Whether the sandbox profile of `server` moved since its approval, decided
+/// by the ledger and never by the lock file alone: a lock record that
+/// differs from the ledger's, or a lock hash the ledger never recorded, is
+/// itself a move (the lock was edited, exactly what [`check_against_ledger`]
+/// blocks). With a record in the ledger, the live profile must equal it; one
+/// that recorded no sandbox admits any (nothing was promised). Without a
+/// ledger (`None`) or an approval with no profile line, only the lock's own
+/// record exists and [`profile_admission`] decides. This is what a script
+/// may not approve past.
+pub fn profile_moved(
+    lock: &BTreeMap<String, LockEntry>,
+    ledger: Option<&str>,
+    server: &str,
+    live: Option<&crate::sandbox::identity::ProfileId>,
+) -> bool {
+    let Some(e) = lock.get(server) else {
+        return false;
+    };
+    if let Some(text) = ledger {
+        match ledger_profile(text, server) {
+            Some((name, hash)) => {
+                if name != e.sandbox || hash != e.sandbox_hash {
+                    return true;
+                }
+                return hash.is_some_and(|h| {
+                    !live.is_some_and(|l| l.hash == h && Some(l.name.as_str()) == name.as_deref())
+                });
+            }
+            None if e.sandbox_hash.is_some() => return true,
+            None => {}
+        }
+    }
+    profile_admission(lock, server, live).is_some()
+}
+
 /// What the owner's record of approvals says against the lock file.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LedgerCheck {

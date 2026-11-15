@@ -734,3 +734,43 @@ fn a_project_pin_of_another_profile_makes_the_server_unavailable_and_a_blank_one
     assert!(!eff["cora"].revoked && notes.is_empty());
     assert_eq!(eff["cora"].sandbox_hash.as_deref(), Some("sha256:aa"));
 }
+
+#[test]
+fn profile_moved_is_decided_by_the_ledger_and_a_lock_mismatch_is_a_move() {
+    let h = manifest_hash(&base());
+    let mut ledger = plain_ledger_line("cora", &h, 1);
+    ledger.push_str(&profile_ledger_line(
+        "cora",
+        Some("server"),
+        Some("sha256:aa"),
+        1,
+    ));
+    let ok = id("server", "sha256:aa");
+    let wide = id("server", "sha256:bb");
+    let good = with_profile(Some("server"), Some("sha256:aa"));
+    let forged = with_profile(Some("server"), Some("sha256:bb"));
+    assert!(!profile_moved(&good, Some(&ledger), "cora", Some(&ok)));
+    assert!(profile_moved(&good, Some(&ledger), "cora", Some(&wide)));
+    // The lock edited to match the widened live profile: the raw lock says
+    // "unchanged", the ledger says moved.
+    assert_eq!(profile_admission(&forged, "cora", Some(&wide)), None);
+    assert!(profile_moved(&forged, Some(&ledger), "cora", Some(&wide)));
+    // A lock hash the ledger never recorded is a move too.
+    let old = plain_ledger_line("cora", &h, 1);
+    assert!(profile_moved(&good, Some(&old), "cora", Some(&ok)));
+    // No ledger at all, or an unrecorded approval without a hash: the lock's
+    // own record (migration).
+    assert!(!profile_moved(&good, None, "cora", Some(&ok)));
+    assert!(profile_moved(&good, None, "cora", Some(&wide)));
+    let none = with_profile(Some("server"), None);
+    assert!(!profile_moved(&none, Some(&old), "cora", Some(&wide)));
+    // An unsandboxed approval promised nothing.
+    let mut unsandboxed = plain_ledger_line("cora", &h, 1);
+    unsandboxed.push_str(&profile_ledger_line("cora", None, None, 1));
+    assert!(!profile_moved(
+        &with_profile(None, None),
+        Some(&unsandboxed),
+        "cora",
+        Some(&wide)
+    ));
+}

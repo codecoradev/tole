@@ -318,6 +318,12 @@ profile = "net"              # server | strict | a profile defined above
   reported (`tole plugin list`, `tole doctor`: "approved before approvals
   recorded their sandbox profile"), not blocked, and its profile is not
   compared until its next `tole plugin approve` records it.
+  *Who decides "moved":* the ledger, never the lock file alone
+  (`plugin_lock::profile_moved`): a lock record that differs from the
+  ledger's last `sandbox_profile` line, or a lock hash the ledger never
+  recorded, is itself a move, so a script's `tole plugin approve --hash`
+  cannot approve past a profile whose lock hash was edited to match a widened
+  config (and so cannot rewrite the ledger's record); only a terminal can.
   *Backend:* "the profile it would run under" is `Policy::applied_profile`,
   the one helper approval, admission, `list` and `diff` share: the
   configured profile only when a working backend exists. With bwrap missing

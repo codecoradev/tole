@@ -1289,9 +1289,30 @@ fn approve(ctx: &mut Ctx<'_>, name: &str, opts: Approve<'_>) -> Result<String, S
         // A changed sandbox profile is the owner's decision at a terminal: a
         // script's `--hash` consents to a tool list, never to a wider
         // sandbox (#750).
+        // Decided against the LEDGER's record of the approved profile, not
+        // the lock file alone: a lock hash edited to match a widened profile
+        // is itself a move.
         let one = std::collections::BTreeMap::from([(name.to_string(), e.clone())]);
-        let moved = plugin_lock::profile_admission(&one, name, live_profile(ctx, &cfg).as_ref());
-        if moved.is_some() && !ctx.interactive {
+        let ledger = ctx
+            .user
+            .as_deref()
+            .and_then(|u| u.parent().map(|d| d.join(plugin_lock::LEDGER_FILE)))
+            .map(|p| plugin_lock::read_ledger(&p))
+            .transpose()?
+            .flatten();
+        let moved = plugin_lock::profile_moved(
+            &one,
+            ledger.as_deref(),
+            name,
+            live_profile(ctx, &cfg).as_ref(),
+        );
+        if moved {
+            shown.push_str(
+                "! the sandbox profile differs from the one your ledger recorded at approval \
+                 (changed in the config, or the lock was edited)\n",
+            );
+        }
+        if moved && !ctx.interactive {
             return Err(format!(
                 "{shown}\nthe sandbox profile of `{}` is not the one you approved: only an \
                  interactive approval at a terminal accepts a changed profile (review it with \

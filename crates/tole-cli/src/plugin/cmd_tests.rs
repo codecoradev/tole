@@ -1588,3 +1588,32 @@ fn approving_without_a_working_sandbox_records_none_and_a_lost_one_blocks() {
     assert!(e.sandbox.is_none() && e.sandbox_hash.is_none());
     assert_eq!(h.rows(&v1())[0]["state"], json!("approved"));
 }
+
+/// The "did the profile move" decision is the ledger's, not the lock file's:
+/// a lock hash edited to match a widened profile must not let a script
+/// approve past it (and so rewrite the ledger's record).
+#[test]
+fn a_script_cannot_approve_past_a_profile_the_lock_was_edited_to_match() {
+    let mut h = profiled("prof-forged");
+    h.run(&v1(), approve("srv", Some(&hash(&v1())))).unwrap();
+    h.sandbox.as_mut().unwrap().profile.network = tole_core::sandbox::Network::Host;
+    let wide = h.sandbox.as_ref().unwrap().profile.hash();
+    let mut lock = Lockfile::load(&h.user()).unwrap();
+    lock.servers.get_mut("srv").unwrap().sandbox_hash = Some(wide.clone());
+    lock.save(&h.user()).unwrap();
+    let ledger_before =
+        std::fs::read_to_string(h.user().with_file_name(plugin_lock::LEDGER_FILE)).unwrap();
+    let e = h
+        .run(&v1(), approve("srv", Some(&hash(&v1()))))
+        .unwrap_err();
+    assert!(e.contains("only an interactive approval"), "{e}");
+    // Nothing was written: the ledger still holds the approved profile.
+    let ledger_after =
+        std::fs::read_to_string(h.user().with_file_name(plugin_lock::LEDGER_FILE)).unwrap();
+    assert_eq!(ledger_before, ledger_after);
+    assert!(!ledger_after.contains(&wide));
+    // A terminal can still accept a real change.
+    h.go(&|_| v1(), Some(true), approve("srv", None)).unwrap();
+    assert_eq!(lock_entry(&h).sandbox_hash, Some(wide));
+    assert_eq!(h.rows(&v1())[0]["state"], json!("approved"));
+}
