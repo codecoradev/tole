@@ -11,7 +11,7 @@
 //!   newer) is never written; `list` reports it.
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::json;
 use tole_core::mcp::{Listed, McpServerConfig, McpTransport};
@@ -24,9 +24,10 @@ use tole_core::plugin_scan;
 use tole_core::sandbox::{Availability, Mode, Policy};
 use tole_core::secrets::SecretSet;
 
+use super::bundle::{self, Loaded};
 use crate::plugin_gate::{
-    apply_ledger, blocked_notes, ensure_ledger_readable, integrity, record_event, render_manifest,
-    source_of, Approval, Gate,
+    apply_ledger, blocked_notes, ensure_ledger_readable, integrity, record_event, record_secret,
+    render_manifest, source_of, Approval, Gate,
 };
 
 /// `tole plugin <action>`.
@@ -51,12 +52,27 @@ pub enum PluginAction {
         /// Also pin it in the project lock (`.tole/plugins.lock`).
         #[arg(long)]
         project: bool,
+        /// A bundle server from a terminal-less script: the manifest file
+        /// hash shown (`tole-plugin.toml`). A script grants no secret.
+        #[arg(long)]
+        bundle_hash: Option<String>,
+        /// Approve it from this bundle manifest (a file or a directory)
+        /// instead of the path recorded in the lock.
+        #[arg(long)]
+        manifest: Option<PathBuf>,
     },
     /// Install a third-party MCP server from `name=<command line or https
-    /// url>`: start it in the sandbox (required for an unverified one),
-    /// show its full tool text and the scan, and lock it after you type the
-    /// confirmation. Interactive only; there is no `--yes`.
-    Add { spec: String },
+    /// url>` or from a bundle manifest (`--bundle <file or directory>`):
+    /// start it in the sandbox (required for an unverified one), show its
+    /// full tool text and the scan, and lock it after you type the
+    /// confirmation. A bundle's secrets are then granted one by one.
+    /// Interactive only; there is no `--yes`.
+    Add {
+        #[arg(required_unless_present = "bundle", conflicts_with = "bundle")]
+        spec: Option<String>,
+        #[arg(long)]
+        bundle: Option<PathBuf>,
+    },
     /// Mark the server revoked: it never registers until approved again.
     /// At a terminal it asks; a script passes --hash with the locked hash.
     Revoke {
@@ -66,6 +82,9 @@ pub enum PluginAction {
         /// Revoke it in the project lock instead of the user lock.
         #[arg(long)]
         project: bool,
+        /// Withdraw only this secret's grant; the server stays approved.
+        #[arg(long)]
+        secret: Option<String>,
     },
 }
 
@@ -132,17 +151,38 @@ pub fn run(action: PluginAction, ctx: &mut Ctx<'_>) -> Result<String, String> {
     match action {
         PluginAction::List { json } => Ok(list(ctx, json)),
         PluginAction::Diff { name } => diff(ctx, &name),
-        PluginAction::Add { spec } => add(ctx, &spec),
+        PluginAction::Add {
+            spec: Some(spec), ..
+        } => add(ctx, &spec),
+        PluginAction::Add {
+            bundle: Some(path), ..
+        } => add_bundle(ctx, &path),
+        PluginAction::Add { .. } => Err("give a `name=<command>` spec or --bundle".into()),
         PluginAction::Approve {
             name,
             hash,
             project,
-        } => approve(ctx, &name, hash.as_deref(), project),
+            bundle_hash,
+            manifest,
+        } => approve(
+            ctx,
+            &name,
+            Approve {
+                expect: hash.as_deref(),
+                project,
+                bundle_hash: bundle_hash.as_deref(),
+                manifest: manifest.as_deref(),
+            },
+        ),
         PluginAction::Revoke {
             name,
             hash,
             project,
-        } => revoke(ctx, &name, hash.as_deref(), project),
+            secret,
+        } => match secret {
+            Some(secret) => revoke_secret(ctx, &name, &secret, hash.as_deref(), project),
+            None => revoke(ctx, &name, hash.as_deref(), project),
+        },
     }
 }
 
@@ -202,6 +242,15 @@ fn state_of(a: &Admission) -> &'static str {
 /// The state of a configured server. The lock decides first: a server it
 /// would not let a session start (revoked, unapproved, another command or
 /// program file) is never started here either.
+/// [`Admission::BundleChanged`] when `name`'s bundle manifest file is not the
+/// approved one now (#811).
+fn bundle_refusal(
+    eff: &std::collections::BTreeMap<String, LockEntry>,
+    name: &str,
+) -> Option<Admission> {
+    plugin_lock::bundle_admission(eff, name, &bundle::live_hash(eff.get(name)?)?)
+}
+
 fn probe_state(
     ctx: &Ctx<'_>,
     eff: &std::collections::BTreeMap<String, LockEntry>,
@@ -209,7 +258,9 @@ fn probe_state(
 ) -> String {
     let source = source_of(cfg);
     let integrity = integrity(&source);
-    if let Some(a) = admit_unseen(eff, &cfg.name, &source, &integrity) {
+    if let Some(a) =
+        admit_unseen(eff, &cfg.name, &source, &integrity).or_else(|| bundle_refusal(eff, &cfg.name))
+    {
         return state_of(&a).to_string();
     }
     if !ctx.probe {
@@ -308,6 +359,12 @@ fn list(ctx: &Ctx<'_>, as_json: bool) -> String {
             "approved_at": entry.map(|e| tole_core::skill_approval::format_time(e.approved_at)),
             "lock": lock,
             "binary": entry.and_then(binary_note),
+            "bundle": entry.and_then(|e| e.bundle.as_ref()).map(|b| json!({
+                "plugin": ctx.clean(&b.plugin),
+                "version": ctx.clean(&b.version),
+                "hash": b.hash,
+                "path": ctx.clean(&b.path),
+            })),
         }));
     }
     if as_json {
@@ -340,6 +397,16 @@ fn list(ctx: &Ctx<'_>, as_json: bool) -> String {
         ));
         if let Some(b) = r["binary"].as_str() {
             out.push_str(&format!("\n  ! {b}"));
+        }
+        if let Some(b) = r["bundle"].as_object() {
+            let f = |k: &str| b[k].as_str().unwrap_or("-");
+            out.push_str(&format!(
+                "\n  plugin {} {}  manifest {}  {}",
+                f("plugin"),
+                f("version"),
+                short(f("hash")),
+                f("path")
+            ));
         }
         out.push('\n');
     }
@@ -446,7 +513,30 @@ fn diff(ctx: &Ctx<'_>, name: &str) -> Result<String, String> {
     for n in &ledger_notes {
         out.push_str(&format!("! {n}\n"));
     }
-    let blocked = admit_unseen(&eff, name, &source, &live_integrity);
+    if let (Some(b), Some(live)) = (&e.bundle, bundle::live_hash(e)) {
+        out.push_str(&format!(
+            "plugin manifest `{}` {}: {}\n",
+            ctx.clean(&b.plugin),
+            ctx.clean(&b.path),
+            if live == b.hash {
+                "unchanged".to_string()
+            } else {
+                format!(
+                    "! CHANGED or unreadable since approval (approved {}, now {}); review it and \
+                     run `tole plugin approve {}`",
+                    b.hash,
+                    if live.is_empty() {
+                        "(unreadable)"
+                    } else {
+                        &live
+                    },
+                    ctx.clean(name)
+                )
+            }
+        ));
+    }
+    let blocked =
+        admit_unseen(&eff, name, &source, &live_integrity).or_else(|| bundle_refusal(&eff, name));
     let why = match (&blocked, ctx.probe) {
         (Some(a), _) => Some(format!("the lock refuses it: {}", state_of(a))),
         (None, false) => Some("running under an agent session".to_string()),
@@ -628,19 +718,10 @@ fn render_fenced(name: &str, version: &str, tools: &[plugin_lock::ManifestTool])
     out
 }
 
-/// `tole plugin add name=<command line or https url>`: starts the server
-/// where its tier allows, shows its full text and the scan, and locks it
-/// after a typed confirmation. The server is not configured for sessions
-/// (that stays the owner's config); the approval is bound to exactly this
-/// source.
-fn add(ctx: &mut Ctx<'_>, spec: &str) -> Result<String, String> {
-    if !ctx.interactive {
-        return Err(
-            "`tole plugin add` is interactive only (it asks you to type a confirmation): run it \
-             in a terminal"
-                .into(),
-        );
-    }
+/// What `add` requires of a new server before anything is started: a safe
+/// spec, no bearer token for an unapproved URL, never a first-party name,
+/// never a name the lock already has. Returns its config and the user lock.
+fn prepare(ctx: &Ctx<'_>, spec: &str) -> Result<(McpServerConfig, Lockfile), String> {
     if spec.chars().any(char::is_control) {
         return Err("the spec has a control character".into());
     }
@@ -691,6 +772,29 @@ fn add(ctx: &mut Ctx<'_>, spec: &str) -> Result<String, String> {
             ctx.clean(&name)
         ));
     }
+    Ok((cfg, user_lock))
+}
+
+fn need_terminal(ctx: &Ctx<'_>) -> Result<(), String> {
+    if ctx.interactive {
+        return Ok(());
+    }
+    Err(
+        "`tole plugin add` is interactive only (it asks you to type a confirmation): run it \
+         in a terminal"
+            .into(),
+    )
+}
+
+/// `tole plugin add name=<command line or https url>`: starts the server
+/// where its tier allows, shows its full text and the scan, and locks it
+/// after a typed confirmation. The server is not configured for sessions
+/// (that stays the owner's config); the approval is bound to exactly this
+/// source.
+fn add(ctx: &mut Ctx<'_>, spec: &str) -> Result<String, String> {
+    need_terminal(ctx)?;
+    let (cfg, user_lock) = prepare(ctx, spec)?;
+    let name = cfg.name.clone();
     let tier = Tier::ThirdPartyUnverified;
     let ((version, tools), before) = start_for_review(ctx, &cfg, tier)?;
     let source = source_of(&cfg);
@@ -761,6 +865,233 @@ fn add(ctx: &mut Ctx<'_>, spec: &str) -> Result<String, String> {
     )))
 }
 
+/// What a requested secret would do if granted now (names only).
+fn secret_status(ctx: &Ctx<'_>, secret: &str) -> &'static str {
+    if ctx
+        .mcp_grants
+        .iter()
+        .any(|g| g.eq_ignore_ascii_case(secret))
+    {
+        "set in your environment and released to `mcp`: it would be passed"
+    } else {
+        "not passed now: not set in your environment, or not released to `mcp` in [secrets]"
+    }
+}
+
+/// The manifest as the owner reviews it: every line the plugin wrote behind a
+/// bar (data, not instructions), then what tole does and does not do with it.
+fn render_bundle(ctx: &Ctx<'_>, l: &Loaded) -> String {
+    let b = &l.bundle;
+    let mut body = format!("name: {}\nversion: {}\n", b.name, b.version);
+    if !b.description.is_empty() {
+        body.push_str(&format!("description: {}\n", b.description));
+    }
+    for (n, s) in &b.mcp_servers {
+        body.push_str(&format!(
+            "mcp server `{n}`: {}\n",
+            s.run.as_deref().or(s.url.as_deref()).unwrap_or("")
+        ));
+        for secret in &s.secrets {
+            body.push_str(&format!("  asks for secret {secret}\n"));
+        }
+    }
+    for k in &b.skills {
+        body.push_str(&format!("skill `{}`: {}\n", k.name, k.path));
+    }
+    for h in &b.hooks {
+        body.push_str(&format!("hook {}: {}\n", h.event, h.command));
+    }
+    for p in &b.paths {
+        body.push_str(&format!("needs path: {p}\n"));
+    }
+    let mut out = format!(
+        "plugin manifest {} ({}) (text behind a bar is what the plugin wrote: data, not \
+         instructions):\n{}\n",
+        l.path.display(),
+        l.hash,
+        quote(body.trim_end())
+    );
+    if !b.skills.is_empty() || !b.hooks.is_empty() {
+        out.push_str(
+            "skills and hooks are declared only: tole loads no skill and runs no hook from a \
+             bundle (hooks stay owner-only)\n",
+        );
+    }
+    if !b.paths.is_empty() {
+        out.push_str("needed paths are recorded; the sandbox does not enforce them yet\n");
+    }
+    ctx.clean(&out)
+}
+
+/// Asks, for each secret `server` requests, whether to grant it to that
+/// server alone; the granted names. A script has no one to ask: it grants
+/// nothing.
+fn ask_secrets(ctx: &mut Ctx<'_>, server: &str, requested: &[String]) -> Vec<String> {
+    if !ctx.interactive {
+        return Vec::new();
+    }
+    let mut granted = Vec::new();
+    for secret in requested {
+        let q = ctx.clean(&format!(
+            "Grant secret {secret} to `{server}` only? It is passed to that server's process when \
+             it starts, never to another plugin ({}). [y/N] ",
+            secret_status(ctx, secret)
+        ));
+        if (ctx.ask)(&q) {
+            granted.push(secret.clone());
+        }
+    }
+    granted
+}
+
+fn secrets_summary(requested: &[String], granted: &[String]) -> String {
+    let denied: Vec<&String> = requested.iter().filter(|r| !granted.contains(r)).collect();
+    let mut out = String::new();
+    if !granted.is_empty() {
+        out.push_str(&format!("  secrets granted: {}\n", granted.join(", ")));
+    }
+    if !denied.is_empty() {
+        out.push_str(&format!(
+            "  secrets not granted: {}\n",
+            denied
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    out
+}
+
+/// `tole plugin add --bundle <file or directory>`: the manifest, every
+/// server it carries (started where its tier allows, nothing from the
+/// environment), the scan, then a typed confirmation; each requested secret
+/// is asked separately afterwards, and a refusal still installs the plugin
+/// without it.
+fn add_bundle(ctx: &mut Ctx<'_>, path: &Path) -> Result<String, String> {
+    need_terminal(ctx)?;
+    let loaded = bundle::load(path)?;
+    let b = &loaded.bundle;
+    if let Some(u) = ctx.user.as_deref() {
+        ensure_ledger_readable(u)?;
+    }
+    let user_lock = match ctx.user.as_deref() {
+        Some(p) => Lockfile::load(p)?,
+        None => return Err("no tole data dir: no user lock to write".into()),
+    };
+    if user_lock
+        .servers
+        .values()
+        .any(|e| e.bundle.as_ref().is_some_and(|r| r.plugin == b.name))
+    {
+        return Err(format!(
+            "a plugin named `{}` is already in your plugin lock: `tole plugin approve <server>` \
+             re-approves its servers (a name is not reused for another bundle)",
+            ctx.clean(&b.name)
+        ));
+    }
+    let tier = Tier::ThirdPartyUnverified;
+    let mut servers = Vec::new();
+    for (n, decl) in &b.mcp_servers {
+        let (cfg, _) = prepare(ctx, &decl.spec(n))?;
+        let (listed, before) = start_for_review(ctx, &cfg, tier)?;
+        servers.push((cfg, decl, listed, before));
+    }
+    let mut text = render_bundle(ctx, &loaded);
+    for (cfg, decl, (version, tools), before) in &servers {
+        let others = plugin_scan::Others {
+            servers: ctx
+                .specs
+                .iter()
+                .map(|c| c.name.clone())
+                .chain(user_lock.servers.keys().cloned())
+                .chain(b.mcp_servers.keys().cloned())
+                .filter(|n| n != &cfg.name)
+                .collect(),
+            tools: user_lock
+                .servers
+                .values()
+                .flat_map(|e| e.manifest.iter().map(|t| t.name.clone()))
+                .collect(),
+        };
+        let findings = plugin_scan::scan(tools, &others, &ctx.secrets);
+        text.push('\n');
+        text.push_str(&ctx.clean(&render_fenced(&cfg.name, version, tools)));
+        text.push_str(&format!(
+            "\nsource: {}\nprogram hash: {}\nmanifest: {}\ntier: {} (sandbox: {})\n",
+            ctx.clean(&source_of(cfg)),
+            if before.is_empty() { "(none)" } else { before },
+            plugin_lock::manifest_hash(tools),
+            tier.as_str(),
+            ctx.clean(&sandbox_status(ctx, &cfg.name, is_stdio(cfg)))
+        ));
+        if let McpTransport::Stdio { command, args } = &cfg.transport {
+            if let Some(w) = unpinned_launcher(command, args) {
+                text.push_str(&format!("! {}\n", ctx.clean(&w)));
+            }
+        }
+        text.push_str(&ctx.clean(&plugin_scan::report(&findings)));
+        if !decl.secrets.is_empty() {
+            text.push_str(&format!(
+                "it asks for {} secret(s); you decide on each one next\n",
+                decl.secrets.len()
+            ));
+        }
+    }
+    let expect = format!(
+        "add {} {}",
+        b.name,
+        loaded
+            .hash
+            .trim_start_matches("sha256:")
+            .get(..8)
+            .unwrap_or("")
+    );
+    text.push_str(&format!(
+        "\nNo secret is passed unless you grant it below. Each server starts only as exactly \
+         the source above, and only while the manifest file is exactly the one above.\n\
+         Type `{expect}` to approve it (anything else cancels): "
+    ));
+    if (ctx.typed)(&text).trim() != expect {
+        return Err("not confirmed: nothing written".into());
+    }
+    let mut gate = Gate::load(ctx.user.clone(), &ctx.workspace);
+    let mut out = String::new();
+    for (cfg, decl, (version, tools), before) in servers {
+        let granted = ask_secrets(ctx, &cfg.name, &decl.secrets);
+        let source = source_of(&cfg);
+        gate.approve_with(
+            &cfg.name,
+            &source,
+            &version,
+            &tools,
+            Approval {
+                integrity: Some(before),
+                tier: Some(tier),
+                sandbox: profile_used(ctx, &cfg),
+                secrets: Some(granted.clone()),
+                bundle: Some(plugin_lock::BundleRef {
+                    plugin: b.name.clone(),
+                    version: b.version.clone(),
+                    hash: loaded.hash.clone(),
+                    path: loaded.path.display().to_string(),
+                }),
+            },
+        )
+        .map_err(|e| format!("{e}\n(already locked before this error: {out})"))?;
+        out.push_str(&format!(
+            "locked `{}` ({}) as {}. To use it, configure `mcp_server = [\"{}\"]` (or \
+             `--mcp-server`): the approval is bound to exactly `{source}`.\n{}",
+            cfg.name,
+            plugin_lock::manifest_hash(&tools),
+            tier.as_str(),
+            decl.spec(&cfg.name),
+            secrets_summary(&decl.secrets, &granted)
+        ));
+    }
+    Ok(ctx.clean(&out))
+}
+
 /// Consent for writing: `--hash` must equal `hash`; without it, a terminal
 /// answer; a script is refused.
 fn consent(
@@ -782,12 +1113,63 @@ fn consent(
     }
 }
 
-fn approve(
-    ctx: &mut Ctx<'_>,
-    name: &str,
-    expect: Option<&str>,
+/// The options of `approve`.
+struct Approve<'a> {
+    expect: Option<&'a str>,
     project: bool,
-) -> Result<String, String> {
+    bundle_hash: Option<&'a str>,
+    manifest: Option<&'a Path>,
+}
+
+/// The bundle manifest `name` is approved from: the path recorded in its lock
+/// entry, or `--manifest`. The configured source must be the one the
+/// manifest declares for `name`.
+fn bundle_of(
+    ctx: &Ctx<'_>,
+    name: &str,
+    existing: Option<&LockEntry>,
+    over: Option<&Path>,
+    cfg: &McpServerConfig,
+) -> Result<Option<(Loaded, bundle::ServerDecl)>, String> {
+    let recorded = existing
+        .and_then(|e| e.bundle.as_ref())
+        .map(|b| PathBuf::from(&b.path));
+    let Some(path) = over.map(Path::to_path_buf).or(recorded) else {
+        return Ok(None);
+    };
+    let loaded = bundle::load(&path)?;
+    let decl = loaded
+        .bundle
+        .mcp_servers
+        .get(name)
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "the manifest {} carries no server `{}`",
+                loaded.path.display(),
+                ctx.clean(name)
+            )
+        })?;
+    let declared = McpServerConfig::parse(&decl.spec(name))?;
+    if source_of(&declared) != source_of(cfg) {
+        return Err(format!(
+            "`{}` is configured as `{}`, but the manifest declares `{}`: configure the declared \
+             source, or approve it without the manifest",
+            ctx.clean(name),
+            ctx.clean(&source_of(cfg)),
+            ctx.clean(&source_of(&declared))
+        ));
+    }
+    Ok(Some((loaded, decl)))
+}
+
+fn approve(ctx: &mut Ctx<'_>, name: &str, opts: Approve<'_>) -> Result<String, String> {
+    let Approve {
+        expect,
+        project,
+        bundle_hash,
+        manifest,
+    } = opts;
     let cfg = ctx.spec(name)?.clone();
     if let Some(u) = ctx.user.as_deref() {
         ensure_ledger_readable(u)?;
@@ -801,13 +1183,43 @@ fn approve(
     .get(name)
     .cloned();
     let tier = tier_of(name, existing.as_ref(), &ctx.first_party);
+    let bundle = bundle_of(ctx, name, existing.as_ref(), manifest, &cfg)?;
     let ((version, live), before) = start_for_review(ctx, &cfg, tier)?;
     let hash = plugin_lock::manifest_hash(&live);
-    let shown = ctx.clean(&render_manifest(name, &version, &live));
+    let mut shown = ctx.clean(&render_manifest(name, &version, &live));
+    if let Some((l, _)) = &bundle {
+        shown.push('\n');
+        shown.push_str(&render_bundle(ctx, l));
+    }
     let q = format!("{shown}\nmanifest {hash}\nApprove `{name}`? [y/N] ");
+    // A script reviews the manifest file too: its hash is part of the consent.
+    if let (Some((l, _)), false) = (&bundle, ctx.interactive) {
+        if bundle_hash.map(str::trim) != Some(l.hash.as_str()) {
+            return Err(format!(
+                "{shown}\nmanifest {hash}\nplugin manifest {}\npass --bundle-hash {} after \
+                 reviewing it (a script grants no secret)",
+                l.path.display(),
+                l.hash
+            ));
+        }
+    }
     // A refusal still shows what was (not) approved, so a script's owner
     // can review it and pass --hash.
     consent(ctx, &hash, expect, &q).map_err(|e| format!("{shown}\nmanifest {hash}\n{e}"))?;
+    // Grants are asked again at every approval, whatever was granted before.
+    let (secrets, bundle_ref, requested) = match &bundle {
+        Some((l, decl)) => (
+            Some(ask_secrets(ctx, name, &decl.secrets)),
+            Some(plugin_lock::BundleRef {
+                plugin: l.bundle.name.clone(),
+                version: l.bundle.version.clone(),
+                hash: l.hash.clone(),
+                path: l.path.display().to_string(),
+            }),
+            decl.secrets.clone(),
+        ),
+        None => (None, None, Vec::new()),
+    };
     let mut gate = Gate::load(ctx.user.clone(), &ctx.workspace);
     gate.approve_with(
         name,
@@ -818,11 +1230,14 @@ fn approve(
             integrity: Some(before),
             tier: Some(tier),
             sandbox: profile_used(ctx, &cfg),
-            secrets: None,
-            bundle: None,
+            secrets: secrets.clone(),
+            bundle: bundle_ref,
         },
     )?;
     let mut out = format!("{shown}\napproved `{name}` ({hash}) in the user lock\n");
+    if let Some(granted) = secrets {
+        out.push_str(&secrets_summary(&requested, &granted));
+    }
     if project {
         let path = ctx.project_path();
         let mut lock = Lockfile::load(&path)?;
@@ -838,6 +1253,63 @@ fn approve(
         out.push_str(&format!("pinned in the project lock {}\n", path.display()));
     }
     Ok(ctx.clean(&out))
+}
+
+/// `tole plugin revoke <name> --secret <NAME>`: withdraws one grant. The
+/// server stays approved but is started without that secret from now on; a
+/// process already running keeps what it got (rotate the secret).
+fn revoke_secret(
+    ctx: &mut Ctx<'_>,
+    name: &str,
+    secret: &str,
+    expect: Option<&str>,
+    project: bool,
+) -> Result<String, String> {
+    let path = if project {
+        ctx.project_path()
+    } else {
+        ctx.user.clone().ok_or("no tole data dir: no user lock")?
+    };
+    let mut lock = Lockfile::load(&path)?;
+    let entry = lock
+        .servers
+        .get_mut(name)
+        .ok_or_else(|| format!("`{}` is not in {}", ctx.clean(name), path.display()))?;
+    let hash = entry.manifest_hash.clone();
+    if !entry.secrets.iter().any(|s| s == secret) {
+        return Err(format!(
+            "`{}` holds no grant for `{}` in {}",
+            ctx.clean(name),
+            ctx.clean(secret),
+            path.display()
+        ));
+    }
+    let q = format!(
+        "Withdraw secret {} from `{}`? It stays approved without it. [y/N] ",
+        ctx.clean(secret),
+        ctx.clean(name)
+    );
+    consent(ctx, &hash, expect, &q)?;
+    entry.secrets.retain(|s| s != secret);
+    // The ledger first (as `revoke`): a lock that then cannot be written
+    // still has a record that the grant is gone, and the check against the
+    // ledger blocks the server until it is approved again. A project revoke
+    // only narrows and is recorded as such.
+    if let Some(user) = ctx.user.as_deref() {
+        let event = if project {
+            "secret_revoke_project"
+        } else {
+            "secret_revoke"
+        };
+        record_secret(user, event, name, secret);
+    }
+    lock.save(&path)?;
+    Ok(ctx.clean(&format!(
+        "withdrew secret {secret} from `{name}` in {}: it is not passed when the server starts \
+         again; a process that is already running keeps it, so rotate the secret if you no \
+         longer trust the server\n",
+        path.display()
+    )))
 }
 
 fn revoke(

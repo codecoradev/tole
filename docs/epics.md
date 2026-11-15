@@ -256,6 +256,7 @@ Everything below is merged; CHANGELOG entries carry the detail.
   - Also: built-in `web_search` and `web_fetch` with the nginjen backend (#625), the Streamable HTTP MCP client (#530), the review gate before `git commit` (#534), `tole setup cora` (#535), the serve face for graphical clients (#524, #558), images on every turn (#559, #560) and the TUI polish of #463.
 - **Since 0.11.0 (on develop, unreleased):**
   - Plugins, #600 slice 1 (parts 1 to 6, merged): `plugin list` and `diff` show source, tier, secrets and sandbox state and start nothing the lock would refuse; `revoke` is owner-only and a hand-edited lock cannot revive a revoke; the description scanner; the one-shot probe for unapproved servers; `tole plugin add` with trust tiers (`first-party`, `third-party-verified`, `third-party-unverified`); `tole doctor` warnings for unpinned launchers, unsandboxed third-party servers and broad grants.
+  - Plugins, #600 slice 2 (#811): bundle manifests (`tole-plugin.toml`, `tole plugin add --bundle`) and per-plugin secret grants approved one by one, withdrawn one by one (`tole plugin revoke --secret`), pinned to the manifest hash and recorded in the ledger.
   - Sandbox (#601, #748): opt-in bubblewrap sandbox for third-party stdio MCP servers (`[sandbox]`), and for `run_command` and `job_start` (`[sandbox.consumers]`, #748 part 1: the built-in `command` profile and rlimits), with named profiles and per-server bindings (#810: `[sandbox.profiles]`, `[sandbox.servers]`, `tole sandbox list|show|set`, user layer only). Linux only; `tole doctor` says so elsewhere. A CI job runs the real-bubblewrap tests on every pull request (#751). Design: `docs/sandbox-design.md`.
   - Delegation approvals (#714, closed, six parts): the durable `approvals.jsonl` queue, a delegated child that parks at an approval and is denied on timeout, `tole delegation approvals`, `/approvals` decisions on `tole serve`, `delegate_pending` and `delegate_decide` for agent levels, and the guide `docs/approving-delegated-work.md`. Off by default (`[delegation] approvals = "off"`; `owner` and `chain` opt in).
   - Discussion: configurable provider timeout (#786), one retry after a timeout (#756), a timed-out call is charged its reserved estimate (#804).
@@ -377,8 +378,8 @@ Bot and Nakama; BMAD for collaboration). Design notes:
     done) and the non-dumpable process guard (#675; done);
   - `tole plugin` commands, scanner, trust tiers and grants (#600; open). Slice 1
     is done (list and diff, owner-only revoke, the description scanner, the
-    one-shot probe, `tole plugin add`, trust tiers, doctor warnings). Slice 2,
-    bundle manifests and per-plugin secret grants, is #811. Registry
+    one-shot probe, `tole plugin add`, trust tiers, doctor warnings). Slice 2
+    (#811, bundle manifests and per-plugin secret grants) is done. Registry
     resolution and uteke registry skills are later slices with no issue yet;
   - external sandbox wrapper and lazy start (#601; open; design and owner
     decisions in `docs/sandbox-design.md`; first slice done: opt-in
@@ -393,7 +394,7 @@ Bot and Nakama; BMAD for collaboration). Design notes:
     with tool retrieval by meaning (no slice issue yet));
 
 Order that was followed: E4 #595 first (other epics reuse it), then E1,
-E2 and E3. Remaining order: #809 and #810 (under #750), #811 (#600 slice 2),
+E2 and E3. Remaining order: #809 and #810 (under #750),
 the rest of #748, then #597.
 Cross-repo in uteke OSS: document similarity (codecoradev/uteke#1730), personal
 skill library (codecoradev/uteke#1731), shared secret-detector crate
@@ -403,7 +404,7 @@ skill library (codecoradev/uteke#1731), shared secret-detector crate
 
 | Area | Open issues |
 |------|-------------|
-| Secrets and plugins (epic #594) | #597 shape detector, #600 plugin commands (slice 2: #811), #601 sandbox (#748 commands, #750 operability: #809, #810) |
+| Secrets and plugins (epic #594) | #597 shape detector, #600 plugin commands (slice 2: #811, done), #601 sandbox (#748 commands, #750 operability: #809, #810) |
 | Security follow-ups | #813 (decisions left from the #714 and #600 reviews) |
 | Collaboration (epic #583) | none; the epic issue only needs closing |
 | Serve for graphical clients | #571, #572, #573, #574, #575 |

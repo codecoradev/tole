@@ -329,8 +329,8 @@ recorded in an unreadable ledger cannot be checked, and the note says so.
 ## 10. Bundle manifests and per-plugin secret grants (#600 slice 2, #811)
 
 Built in two parts: part 1 is the manifest format, the lock record, the
-connect-time pin and the ledger checks (this section's first half); part 2
-adds the commands (`add --bundle`, per-secret approval, `revoke --secret`).
+connect-time pin and the ledger checks; part 2 the commands (`add --bundle`,
+per-secret approval, `revoke --secret`).
 
 **The manifest.** `tole-plugin.toml` (strict TOML, unknown keys refused, at
 most 64 KiB, no control characters) holds `name`, `version`, optional
@@ -365,11 +365,39 @@ each case):
    directions: an entry is blocked when its bundle record is not the last
    approved one (re-pinned, removed, or added where the approval was plain),
    or it holds a secret the ledger does not show as granted since the last
-   approval (or shows as revoked), or it carries a bundle record or secrets
-   with no approval line at all. A hand-edited lock cannot add or restore a
+   approval (or shows as revoked), or it carries a bundle record with no
+   approval line at all. A plain entry's own `secrets` (#679) are not
+   ledger-tracked. A hand-edited lock cannot add or restore a
    secret or drop the manifest pin, and an approval starts from no grant. Same residual as before: a process that can
    rewrite both files defeats it.
 4. *Declared skills, hooks and paths.* Shown and covered by the file hash,
    never acted on: no skill is loaded and no hook is run from a bundle (hooks
    stay owner-only, §1; skills come through the registry, §4.4), and the
    declared paths are recorded for the sandbox slice, not enforced yet.
+
+**Install.** `tole plugin add --bundle <file or directory>` is interactive
+only. It shows the manifest behind a bar (the plugin wrote it: data), probes
+each server the way `add name=<spec>` does (no secret, sandbox required for
+an unverified one, the program hash taken before), shows the tool text and the
+scan, and locks after the owner types `add <plugin> <first 8 hex of the
+manifest file hash>`. Then every secret a server asks for is a separate
+`[y/N]`, naming the secret and the server and saying whether it would be
+passed now. Declining one does not stop the install. A plugin name already in
+the lock is refused.
+
+5. *Re-approval asks again.* `approve` on a bundle server re-reads the
+   manifest (the recorded path, or `--manifest`), requires the configured
+   command line to be the one it declares, shows both texts and asks for every
+   secret anew: grants never carry over a re-approval. A script (no terminal)
+   can approve with `--hash` and `--bundle-hash` and grants nothing; secrets
+   are granted only at a terminal. `approve` is per server: after a manifest
+   change each server of the bundle is approved on its own.
+6. *Revoke.* `tole plugin revoke <server> --secret NAME` removes that one
+   grant from the lock (the ledger line is written first, as for `revoke`) and
+   leaves the server approved; it needs the same consent as `revoke`. It takes
+   effect when the server is next started: a process that already runs keeps
+   the value, which is why the output says to rotate the secret. `revoke
+   <server>` blocks the whole server and lists its grants, as before.
+
+**Out of scope here:** registry resolution, uteke registry skills,
+enforcement of the declared paths, a bundle-wide approve.
