@@ -75,7 +75,28 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # #781: the suites must not leave directories behind. The tests run
+      # with a fresh, private TMPDIR (the cargo step only), and the job fails
+      # when a `tole-*` or `cora-*` entry is still there afterwards, in it or
+      # in cargo's target/tmp (where the integration tests keep theirs).
+      # Process-wide fixtures use fixed `shared-*` names and are not counted.
+      # The directory is under /tmp, not RUNNER_TEMP: that one sits inside
+      # $HOME, and the sandbox tests rightly refuse a workspace under it.
+      - name: Prepare a private TMPDIR
+        run: |
+          rm -rf target/tmp
+          echo "TOLE_TEST_TMP=$(mktemp -d /tmp/tole-test-tmp.XXXXXX)" >> "$GITHUB_ENV"
       - run: cargo test --workspace
+        env:
+          TMPDIR: ${{ env.TOLE_TEST_TMP }}
+      - name: No test directory left behind
+        run: |
+          left=$(find "$TOLE_TEST_TMP" target/tmp -mindepth 1 -maxdepth 1 \( -name 'tole-*' -o -name 'cora-*' \) 2>/dev/null | sort)
+          if [ -n "$left" ]; then
+            echo "::error::the test suites left $(echo "$left" | wc -l) tole-*/cora-* entries behind (#781)"
+            echo "$left" | head -50
+            exit 1
+          fi
 
   # Compile the release profile — catches optimizer-only errors that the
   # dev-profile Check job misses (uteke parity; required check on main).
