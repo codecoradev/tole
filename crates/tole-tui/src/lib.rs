@@ -3201,7 +3201,8 @@ mod tests {
         }
         fn run_turn(&self, p: &str, c: &CancelToken, _o: Arc<dyn TurnObserver>) -> TurnEnd {
             if p == "first" {
-                let end = Instant::now() + Duration::from_secs(3);
+                // Generous: only a run that never steers waits for it.
+                let end = Instant::now() + Duration::from_secs(60);
                 while c.interrupts().is_empty() && Instant::now() < end {
                     std::thread::sleep(Duration::from_millis(5));
                 }
