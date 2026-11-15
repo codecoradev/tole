@@ -4,6 +4,8 @@
 //! setting (flag > env > config), survives `tole resume`, and a provider
 //! that rejects the parameter still answers (one degraded retry).
 
+mod common;
+use common::TestDir;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -115,16 +117,8 @@ fn tole(url: &str, env: &[(&str, &str)], args: &[&str]) -> (String, String, i32)
 }
 
 /// A settled session, optionally with a `fact/reasoning_effort` register.
-fn session(tag: &str, register: Option<&str>) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "tole-session-effort-{tag}-{}-{:x}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+fn session(tag: &str, register: Option<&str>) -> TestDir {
+    let dir = TestDir::new(&format!("tole-session-effort-{tag}"));
     let _g = SPAWN.lock().unwrap_or_else(|p| p.into_inner());
     let mut s = JsonlStorage::create(&dir, "s-eff", None).unwrap();
     if let Some(level) = register {

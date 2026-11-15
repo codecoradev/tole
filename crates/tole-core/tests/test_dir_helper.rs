@@ -90,3 +90,17 @@ fn work_dir_keeps_its_home_twin_inside_the_guard() {
     drop(w);
     assert!(!wp.exists() && !hp.exists());
 }
+
+#[test]
+fn in_system_temp_is_under_the_system_temp_dir() {
+    let d = TestDir::in_system_temp("tole-testdir-sys");
+    let tmp = std::env::temp_dir().canonicalize().unwrap();
+    assert!(
+        d.path().starts_with(&tmp),
+        "{:?} not under {tmp:?}",
+        d.path()
+    );
+    let p = d.path().to_path_buf();
+    drop(d);
+    assert!(!p.exists());
+}

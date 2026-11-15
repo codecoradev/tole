@@ -4,18 +4,13 @@
 //! gets its own `CODECORA_HOME` and an empty directory as `PATH`, so there is
 //! never a `bwrap` and no user config leaks in; nothing here needs bubblewrap.
 
-use std::path::{Path, PathBuf};
+mod common;
+use common::TestDir;
+use std::path::Path;
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicU64, Ordering};
 
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-fn tmpdir() -> PathBuf {
-    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let d = std::env::temp_dir().join(format!("tole-sbxc-e2e-{}-{n}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+fn tmpdir() -> TestDir {
+    TestDir::new("tole-sbxc-e2e")
 }
 
 /// Runs `tole args` with this user config (None: no user config).

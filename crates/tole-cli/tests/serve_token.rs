@@ -11,12 +11,12 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 mod common;
+use common::TestDir;
 
 const TOKEN: &str = "serve-file-token-0682-abcdef";
 
-fn dir(tag: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("tole-serve-token-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
+fn dir(tag: &str) -> TestDir {
+    let d = TestDir::new(&format!("tole-serve-token-{tag}"));
     std::fs::create_dir_all(d.join("home")).unwrap();
     d
 }

@@ -3,6 +3,8 @@
 //! call that is already in flight, instead of waiting for the provider to
 //! answer. Real `tole` binary against a mock that stays silent for a while.
 
+mod common;
+use common::TestDir;
 use serde_json::json;
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -68,11 +70,8 @@ fn serve(text: &'static str, delay: Duration, stream: bool) -> String {
     format!("http://{addr}/v1")
 }
 
-fn tmpdir(tag: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("tole-cancel-e2e-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+fn tmpdir(tag: &str) -> TestDir {
+    TestDir::new(&format!("tole-cancel-e2e-{tag}"))
 }
 
 fn tole(dir: &std::path::Path, base: &str, stream: bool, args: &[&str]) -> std::process::Output {

@@ -5,6 +5,8 @@
 
 #![cfg(feature = "shell-tools")]
 
+mod common;
+use common::TestDir;
 use std::process::{Command, Stdio};
 
 const NOTICES: [&str; 3] = [
@@ -14,13 +16,9 @@ const NOTICES: [&str; 3] = [
 ];
 
 fn startup_stderr(verbose: Option<&str>) -> String {
-    let dir = std::env::temp_dir().join(format!(
-        "tole-quiet-{}-{}",
-        verbose.unwrap_or("default"),
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    // Outside the checkout (cargo's target dir is inside it in CI): the test
+    // is about a cwd that is not a git checkout.
+    let dir = TestDir::in_system_temp(&format!("tole-quiet-{}", verbose.unwrap_or("default")));
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
     cmd.args(["run", "-s", dir.join("sessions").to_str().unwrap(), "hi"])
         .current_dir(&dir)

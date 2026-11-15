@@ -1,6 +1,8 @@
 //! #625 part 2: which lane each web tool uses, and the `tole doctor` lines
 //! (names only, never a URL or a key).
 
+mod common;
+use common::TestDir;
 use tole_cli::tool_roster::{web_doctor_lines, web_lanes, WebLane};
 
 const KEY: &str = "nginjen-lanes-key-0123456789";
@@ -107,9 +109,10 @@ fn the_registry_registers_the_lanes_tools() {
     for k in ["TOLE_WEB_SEARCH_URL", "TOLE_WEB_FETCH_URL"] {
         std::env::remove_var(k);
     }
-    let dir = std::env::temp_dir().join(format!("tole-web-lanes-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let reg = tole_cli::tool_roster::build(Deny, tole_cli::tool_roster::Roster::new(dir)).unwrap();
+    let dir = TestDir::new("tole-web-lanes");
+    let reg =
+        tole_cli::tool_roster::build(Deny, tole_cli::tool_roster::Roster::new(dir.to_path_buf()))
+            .unwrap();
     std::env::remove_var("NGINJEN_BASE_URL");
     std::env::remove_var("NGINJEN_API_KEY");
     let specs = reg.specs();

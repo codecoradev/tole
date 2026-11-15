@@ -5,6 +5,8 @@
 
 #![cfg(all(unix, feature = "mcp"))]
 
+mod common;
+use common::TestDir;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -13,17 +15,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
-fn tmpdir(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!(
-        "tole-gate-e2e-{tag}-{}-{:x}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&d).unwrap();
-    d
+fn tmpdir(tag: &str) -> TestDir {
+    TestDir::new(&format!("tole-gate-e2e-{tag}"))
 }
 
 /// Fake `cora`: `mcp` = a stdio MCP server listing the review tools;
@@ -359,7 +352,8 @@ fn off_and_warn_do_not_refuse_and_the_flag_beats_the_env() {
     assert_eq!(out.code, 0, "{}", out.stderr);
     assert_eq!(commit_count(&r), 1, "off: committed");
 
-    let r2 = repo(&tmpdir("policy2"));
+    let d2 = tmpdir("policy2");
+    let r2 = repo(&d2);
     let out = run_tole(&r2, &bin, &[], &[("TOLE_REVIEW_GATE", "warn")]);
     assert_eq!(commit_count(&r2), 1, "warn: committed");
     assert!(out.tool_result.unwrap().contains("would be refused"));
