@@ -40,15 +40,20 @@ fn tmp(tag: &str) -> Root {
 }
 
 /// A stand-in tole binary: records its argv and env next to its sessions
-/// dir, then sleeps `secs`.
+/// dir, then sleeps `secs`. Each record is written to a temp name and
+/// renamed into place, so a reader that sees the file sees all of it: `env`
+/// (and a long argv) leaves the process in several writes, and a reader
+/// that wakes between two of them would otherwise take a prefix for the
+/// whole file (#828).
 fn fake_tole(dir: &Path, secs: u64) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let p = dir.join(format!("fake-tole-{secs}"));
     let body = format!(
         "#!/bin/sh\nprev=\"\"\nfor a in \"$@\"; do [ \"$prev\" = \"--sessions-dir\" ] && D=\"$a\"; \
-         prev=\"$a\"; done\n[ -d \"${{D%/*/*/*}}\" ] || exit 0\nmkdir -p \"$D\"\nprintf '%s\\n' \"$@\" > \"$D/../argv\"\n\
-         cut -d' ' -f19 /proc/$$/stat > \"$D/../nice\" 2>/dev/null\n\
-         env > \"$D/../env\"\nsleep {secs}\n"
+         prev=\"$a\"; done\n[ -d \"${{D%/*/*/*}}\" ] || exit 0\nmkdir -p \"$D\"\n\
+         printf '%s\\n' \"$@\" > \"$D/../argv.tmp\" && mv \"$D/../argv.tmp\" \"$D/../argv\"\n\
+         cut -d' ' -f19 /proc/$$/stat > \"$D/../nice.tmp\" 2>/dev/null && mv \"$D/../nice.tmp\" \"$D/../nice\"\n\
+         env > \"$D/../env.tmp\" && mv \"$D/../env.tmp\" \"$D/../env\"\nsleep {secs}\n"
     );
     std::fs::write(&p, body).unwrap();
     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -233,13 +238,29 @@ fn tools(h: &std::sync::Arc<Delegator>, root: &Path) -> (DelegateTool, DelegateP
     )
 }
 
-/// Waits for a file the fake child writes.
+/// Waits for a file the fake child writes (it appears whole, see
+/// [`fake_tole`]). On timeout the panic names what is on disk next to it.
+#[track_caller]
 fn wait_for(p: &Path) -> String {
-    crate::test_dir::wait_for(
-        crate::test_dir::WAIT,
-        &format!("{} to appear", p.display()),
-        || std::fs::read_to_string(p).ok().filter(|s| !s.is_empty()),
-    )
+    let got = crate::test_dir::poll_until(crate::test_dir::WAIT, || {
+        std::fs::read_to_string(p).ok().filter(|s| !s.is_empty())
+    });
+    got.unwrap_or_else(|| {
+        let near: Vec<String> = p
+            .parent()
+            .and_then(|d| std::fs::read_dir(d).ok())
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        panic!(
+            "timed out after {:?} waiting for {} to appear; its directory holds {near:?}",
+            crate::test_dir::WAIT,
+            p.display()
+        )
+    })
 }
 
 fn agent_dir_of(root: &Path, out: &Value) -> PathBuf {
