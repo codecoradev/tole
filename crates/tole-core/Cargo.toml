@@ -65,6 +65,10 @@ name = "mcp_probe"
 required-features = ["mcp"]
 
 [[test]]
+name = "mcp_probe_parent_death"
+required-features = ["mcp"]
+
+[[test]]
 name = "mcp_sandbox"
 required-features = ["mcp"]
 

@@ -122,6 +122,39 @@ fn run(
         use std::os::unix::process::CommandExt;
         std_cmd.process_group(0);
     }
+    // The probe's own group no longer receives the terminal's SIGINT, and
+    // tole installs no signal handler: if tole dies mid-probe (Ctrl-C), no
+    // Drop runs. Ask the kernel to kill the server when its parent goes
+    // (Linux; the child is spawned from this probe's thread, which lives
+    // until the probe ends). The check closes the race of a parent that died
+    // before the request took effect. A launcher's own children are covered
+    // by the group kill on a normal end, and by `bwrap --die-with-parent`
+    // inside the sandbox.
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: only async-signal-safe calls (prctl, getppid) run between
+        // fork and exec.
+        let parent = std::process::id() as libc::pid_t;
+        unsafe {
+            std_cmd.pre_exec(move || {
+                if libc::prctl(
+                    libc::PR_SET_PDEATHSIG,
+                    libc::SIGKILL as libc::c_ulong,
+                    0,
+                    0,
+                    0,
+                ) != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() != parent {
+                    return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+                }
+                Ok(())
+            });
+        }
+    }
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

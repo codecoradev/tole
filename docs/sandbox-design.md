@@ -340,10 +340,15 @@ profile = "net"              # server | strict | a profile defined above
   refuse both flags) and the interactive preflight record the CONFIGURED
   profile, never a flag's, so a one-off override cannot become the approved
   profile. The preflight asks the lock before it starts anything (a revoked,
-  moved, rebuilt or profile-changed server is not started, #848) and starts
-  only a server that needs a review, through the one-shot probe with no
-  secret, ended before the session starts. Remote servers
-  and first-party or `skip` servers record no profile.
+  moved, rebuilt or profile-changed server is not started, #848). It then
+  lists the never-approved servers and the approved ones that start eagerly
+  (the listing is how a changed tool list is offered for re-approval, at the
+  price of one extra start of each at every interactive session start; an
+  approved server that starts lazily is not started), through the one-shot
+  probe: no secret, ended before the session starts, sandbox required for a
+  third-party server nobody verified. The probe runs under the CONFIGURED
+  profile, not a `--sandbox <p>` flag's (`--no-sandbox` does not unwrap it).
+  Remote servers and first-party or `skip` servers record no profile.
 
 ### 6.2 Flags, as built (#750)
 

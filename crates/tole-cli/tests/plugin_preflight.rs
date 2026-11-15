@@ -91,15 +91,36 @@ impl Fixture {
             .collect()
     }
 
-    /// Runs the preflight; returns how often the owner was asked.
-    fn preflight(&self, gate: &mut Gate, answer: bool) -> usize {
-        let mut asked = 0;
-        preflight(std::slice::from_ref(&self.cfg), gate, &mut |_| {
-            asked += 1;
+    /// Runs the preflight; the prompts the owner saw.
+    fn prompts(&self, gate: &mut Gate, answer: bool) -> Vec<String> {
+        let mut seen = Vec::new();
+        preflight(std::slice::from_ref(&self.cfg), gate, &mut |t| {
+            seen.push(t.to_string());
             answer
         });
-        asked
+        seen
     }
+
+    /// Runs the preflight; returns how often the owner was asked.
+    fn preflight(&self, gate: &mut Gate, answer: bool) -> usize {
+        self.prompts(gate, answer).len()
+    }
+
+    fn lock_entry(&self) -> tole_core::plugin_lock::LockEntry {
+        Lockfile::load(&self.user)
+            .unwrap()
+            .servers
+            .get(&self.cfg.name)
+            .cloned()
+            .expect("an approved entry")
+    }
+}
+
+/// Another tool list than the fixture server serves.
+fn old_tools() -> Vec<ManifestTool> {
+    let mut t = tools();
+    t[0].description = "Old description".into();
+    t
 }
 
 #[test]
@@ -155,7 +176,7 @@ fn a_server_whose_sandbox_profile_changed_is_not_started_nor_offered() {
 
 #[test]
 fn a_new_server_is_reviewed_without_any_secret_and_its_process_ends() {
-    let f = Fixture::new("pf-new");
+    let f = Fixture::new("cora");
     let mut gate = f.gate();
     assert_eq!(f.preflight(&mut gate, true), 1, "offered for review");
     let envs = f.envs();
@@ -165,7 +186,7 @@ fn a_new_server_is_reviewed_without_any_secret_and_its_process_ends() {
         "a review start gets no mcp-released secret"
     );
     // Approved, and the review process does not outlive the preflight.
-    assert!(f.gate().entries().contains_key("pf-new"));
+    assert!(f.gate().entries().contains_key("cora"));
     let pid: u32 = std::fs::read_to_string(f.dir.join("pid"))
         .unwrap()
         .trim()
@@ -180,19 +201,19 @@ fn a_new_server_is_reviewed_without_any_secret_and_its_process_ends() {
 
 #[test]
 fn the_session_connection_after_a_preflight_has_only_the_lock_grant() {
-    let f = Fixture::new("pf-grant");
+    let f = Fixture::new("uteke");
     let mut gate = f.gate();
     assert_eq!(f.preflight(&mut gate, true), 1);
     // The approval grants this server no secret.
     let mut lock = Lockfile::load(&f.user).unwrap();
-    lock.servers.get_mut("pf-grant").unwrap().secrets.clear();
+    lock.servers.get_mut("uteke").unwrap().secrets.clear();
     lock.save(&f.user).unwrap();
 
     // The session, as the roster builds it: the lock's grant, own start.
     let gate = f.gate();
     let source = source_of(&f.cfg);
     let mut cfg = f.cfg.clone();
-    cfg.secret_grant = gate.secret_grant("pf-grant");
+    cfg.secret_grant = gate.secret_grant("uteke");
     assert_eq!(cfg.secret_grant, Some(Vec::new()));
     cfg.workspace = Some(f.ws.path().to_path_buf());
     let admit = |s: &str, v: &str, t: &[ManifestTool]| gate.check(s, &source, v, t);
@@ -206,6 +227,124 @@ fn the_session_connection_after_a_preflight_has_only_the_lock_grant() {
         envs.iter().all(|e| !e.contains(SECRET)),
         "neither the review nor the session got the secret the lock does not grant"
     );
+}
+
+#[test]
+fn an_approved_unchanged_server_is_listed_once_and_not_offered() {
+    // Lazy start is off: its tools are compared eagerly, so the preflight is
+    // the only place that can offer a changed list; an unchanged one costs
+    // one start and no prompt.
+    let f = Fixture::new("laya");
+    f.approve(Approval::default());
+    let mut gate = f.gate();
+    assert_eq!(f.preflight(&mut gate, true), 0);
+    assert_eq!(f.envs().len(), 1, "listed once");
+}
+
+#[test]
+fn a_changed_server_is_offered_and_a_re_approval_never_widens_its_grant() {
+    let f = Fixture::new("nginjen");
+    // Approved earlier with another tool list and NO secret.
+    f.gate()
+        .approve_with(
+            "nginjen",
+            &source_of(&f.cfg),
+            "1",
+            &old_tools(),
+            Approval {
+                secrets: Some(Vec::new()),
+                tier: Some(tole_core::plugin_lock::Tier::FirstParty),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let mut gate = f.gate();
+    let seen = f.prompts(&mut gate, true);
+    assert_eq!(seen.len(), 1);
+    assert!(
+        seen[0].contains("CHANGED since you approved it"),
+        "{}",
+        seen[0]
+    );
+    assert!(
+        seen[0].contains("It will receive no secret."),
+        "{}",
+        seen[0]
+    );
+    let e = f.lock_entry();
+    assert_eq!(
+        e.manifest_hash,
+        tole_core::plugin_lock::manifest_hash(&tools()),
+        "the new list is what is locked"
+    );
+    assert!(
+        e.secrets.is_empty(),
+        "the released GITHUB_TOKEN was not added to a narrowed grant: {:?}",
+        e.secrets
+    );
+    assert_eq!(e.tier, Some(tole_core::plugin_lock::Tier::FirstParty));
+}
+
+#[test]
+fn a_changed_bundle_server_keeps_its_bundle_and_grant_when_re_approved() {
+    let f = Fixture::new("cora");
+    let manifest = f.dir.join("tole-plugin.toml");
+    std::fs::write(&manifest, "name = \"p\"\n").unwrap();
+    let bundle = tole_core::plugin_lock::BundleRef {
+        plugin: "p".into(),
+        version: "1".into(),
+        hash: tole_core::plugin_lock::sha(&std::fs::read(&manifest).unwrap()),
+        path: manifest.display().to_string(),
+    };
+    f.gate()
+        .approve_with(
+            "cora",
+            &source_of(&f.cfg),
+            "1",
+            &old_tools(),
+            Approval {
+                secrets: Some(Vec::new()),
+                bundle: Some(bundle.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let mut gate = f.gate();
+    assert_eq!(f.preflight(&mut gate, true), 1);
+    let e = f.lock_entry();
+    assert_eq!(e.bundle, Some(bundle), "bundle membership survives");
+    assert!(e.secrets.is_empty(), "{:?}", e.secrets);
+}
+
+#[test]
+fn an_owner_who_declines_a_changed_server_changes_nothing() {
+    let f = Fixture::new("cora");
+    f.gate()
+        .approve_with(
+            "cora",
+            &source_of(&f.cfg),
+            "1",
+            &old_tools(),
+            Approval::default(),
+        )
+        .unwrap();
+    let before = f.lock_entry();
+    let mut gate = f.gate();
+    assert_eq!(f.preflight(&mut gate, false), 1, "asked once");
+    let after = f.lock_entry();
+    assert_eq!(after.manifest_hash, before.manifest_hash);
+    assert_eq!(after.approved_at, before.approved_at);
+}
+
+#[test]
+fn a_third_party_server_nobody_verified_is_not_started_without_a_sandbox() {
+    // Same rule as `tole plugin add`: no sandbox applies here (no policy), so
+    // an unverified third-party stdio server is neither started nor offered.
+    let f = Fixture::new("pf-unverified");
+    let mut gate = f.gate();
+    assert_eq!(f.preflight(&mut gate, true), 0);
+    assert!(!f.started(), "refused before anything started");
+    assert!(!f.gate().entries().contains_key("pf-unverified"));
 }
 
 fn usable() -> Availability {
