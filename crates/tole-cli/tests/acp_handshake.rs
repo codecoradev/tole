@@ -6,6 +6,8 @@
 // with the `shell-tools` feature (#349): the bare profile has no such face.
 #![cfg(feature = "shell-tools")]
 
+mod common;
+use common::TestDir;
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 use std::process::{Child, Command, Stdio};
@@ -77,11 +79,8 @@ impl Drop for AcpProcess {
     }
 }
 
-fn temp_cwd(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("tole-acp-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+fn temp_cwd(tag: &str) -> TestDir {
+    TestDir::new(&format!("tole-acp-{tag}"))
 }
 
 #[test]

@@ -7,23 +7,20 @@
 
 #![cfg(feature = "shell-tools")]
 
+mod common;
+use common::TestDir;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-static COUNTER: AtomicU64 = AtomicU64::new(0);
 const SECRET: &str = "advisor-e2e-secret-0123456789";
 
-fn tmpdir() -> PathBuf {
-    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let d = std::env::temp_dir().join(format!("tole-advisor-e2e-{}-{n}", std::process::id()));
-    std::fs::create_dir_all(&d).unwrap();
-    d.canonicalize().unwrap()
+fn tmpdir() -> TestDir {
+    TestDir::new("tole-advisor-e2e")
 }
 
 type Seen = Arc<Mutex<Vec<Value>>>;
@@ -114,6 +111,7 @@ struct Env {
     cron: PathBuf,
     work: PathBuf,
     url: String,
+    _root: TestDir,
 }
 
 const CONFIG: &str = r#"
@@ -127,11 +125,13 @@ advisor = "wise-model"
 impl Env {
     fn new(url: &str) -> Env {
         let root = tmpdir();
+        let (home, cron, work) = (root.join("home"), root.join("cron"), root.join("work"));
         let e = Env {
-            home: root.join("home"),
-            cron: root.join("cron"),
-            work: root.join("work"),
+            home,
+            cron,
+            work,
             url: url.into(),
+            _root: root,
         };
         for d in [&e.home.join("tole"), &e.cron, &e.work] {
             std::fs::create_dir_all(d).unwrap();

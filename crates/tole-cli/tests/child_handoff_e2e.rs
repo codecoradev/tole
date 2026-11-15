@@ -14,6 +14,8 @@
 // The only test spawns `#!/bin/sh` fixtures, so the file is unix-only.
 #![cfg(all(unix, feature = "shell-tools"))]
 
+mod common;
+use common::TestDir;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -230,13 +232,11 @@ fn settle(poll: &AgentPollTool, id: &str) -> Value {
 #[test]
 fn a_failed_verification_is_not_closed_and_the_fix_child_reads_the_artifact_itself() {
     let base = spawn_mock();
-    let root = std::env::temp_dir().join(format!("tole-handoff-e2e-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir_all(&root).unwrap();
+    let root = TestDir::new("tole-handoff-e2e");
     std::fs::write(root.join("out.txt"), "ARTIFACT_BODY\n").unwrap();
     let bin = wrapper(&root, &base);
-    let start = AgentStartTool::new(&bin, root.clone());
-    let poll = AgentPollTool::new(root.clone());
+    let start = AgentStartTool::new(&bin, root.to_path_buf());
+    let poll = AgentPollTool::new(root.to_path_buf());
 
     // 1. implement child: verification failed.
     let s = start

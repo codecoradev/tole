@@ -7,12 +7,13 @@
 // The fake servers are `#!/bin/sh` scripts.
 #![cfg(unix)]
 
+mod common;
+use common::TestDir;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-fn tmp(tag: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("tole-mcp-unseen-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
+fn tmp(tag: &str) -> TestDir {
+    let d = TestDir::new(&format!("tole-mcp-unseen-{tag}"));
     std::fs::create_dir_all(d.join("home/tole")).unwrap();
     std::fs::create_dir_all(d.join("ws")).unwrap();
     d
