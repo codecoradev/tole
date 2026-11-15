@@ -680,6 +680,7 @@ fn sandboxed() -> (tole_core::sandbox::Policy, Availability) {
             mode: Mode::Required,
             profile_name: "server".into(),
             profile: builtin_profile("server").unwrap(),
+            servers: Default::default(),
             skip: Vec::new(),
             max_servers: 4,
             idle_secs: 60,

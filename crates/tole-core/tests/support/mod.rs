@@ -22,6 +22,7 @@ pub fn live_policy(max_servers: usize, idle_secs: u64) {
         mode: Mode::Required,
         profile_name: "server".into(),
         profile: sandbox::builtin_profile("server").unwrap(),
+        servers: Default::default(),
         skip: Vec::new(),
         max_servers,
         idle_secs,

@@ -126,7 +126,7 @@ pub fn cli(action: HookAction) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn read_config(path: &Path) -> anyhow::Result<String> {
+pub(crate) fn read_config(path: &Path) -> anyhow::Result<String> {
     match tole_core::delegation_report::read_plain_file(path, MAX_CONFIG) {
         Ok(Some(b)) => String::from_utf8(b).map_err(|_| anyhow!("{} is not UTF-8", path.display())),
         Ok(None) => Ok(String::new()),
@@ -143,7 +143,7 @@ fn hooks_of(
 }
 
 /// Writes `text` to `path` through a temporary file and a rename.
-fn write_atomic(path: &Path, text: &str) -> anyhow::Result<()> {
+pub(crate) fn write_atomic(path: &Path, text: &str) -> anyhow::Result<()> {
     let dir = path
         .parent()
         .ok_or_else(|| anyhow!("no parent for {}", path.display()))?;

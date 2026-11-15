@@ -42,6 +42,7 @@ fn out_root() -> &'static Path {
             mode: Mode::Required,
             profile_name: "server".into(),
             profile,
+            servers: Default::default(),
             skip: vec!["plainsrv".into()],
             max_servers: sandbox::DEFAULT_MAX_SERVERS,
             idle_secs: sandbox::DEFAULT_IDLE_SECS,
