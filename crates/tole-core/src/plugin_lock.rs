@@ -22,6 +22,10 @@
 //!   is refused; a hash mismatch never fails open.
 //! - [`ledger_line`] is the append-only audit record of an approval, a
 //!   manifest change or a revocation.
+//! - A [`BundleRef`] (#811) binds an entry to the bundle manifest
+//!   (`tole-plugin.toml`) it was approved from: [`bundle_admission`] refuses
+//!   the server when that file's hash is no longer the approved one, and
+//!   [`secret_ledger_line`] records each secret grant and revoke.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -31,8 +35,8 @@ use std::path::{Path, PathBuf};
 
 /// Current lock format version; a newer one is refused. Version 2 adds the
 /// per-tool manifest snapshot (`manifest`); version 1 entries load without
-/// one.
-pub const LOCK_VERSION: u32 = 2;
+/// one. Version 3 adds the bundle record (`bundle`, #811).
+pub const LOCK_VERSION: u32 = 3;
 /// Text a lock entry's snapshot may hold for one server, all tools
 /// together; past it a tool keeps only its hashes.
 pub const SNAPSHOT_BUDGET: usize = 128 * 1024;
@@ -127,7 +131,8 @@ pub fn terminal_safe(s: &str) -> String {
         .collect()
 }
 
-fn sha(bytes: &[u8]) -> String {
+/// `sha256:<hex>` of `bytes`.
+pub fn sha(bytes: &[u8]) -> String {
     let hex: String = Sha256::digest(bytes)
         .iter()
         .map(|b| format!("{b:02x}"))
@@ -284,6 +289,22 @@ pub fn tier_of(name: &str, entry: Option<&LockEntry>, first_party: &[String]) ->
     }
 }
 
+/// The bundle manifest an entry was approved from (#811).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BundleRef {
+    /// The plugin name the manifest declares.
+    pub plugin: String,
+    /// The version the manifest declares.
+    #[serde(default)]
+    pub version: String,
+    /// `sha256:<hex>` of the manifest file's bytes at approval.
+    pub hash: String,
+    /// Absolute path the manifest was read from; it is re-hashed before the
+    /// server is started.
+    pub path: String,
+}
+
 /// One approved server.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -322,6 +343,11 @@ pub struct LockEntry {
     /// The tier recorded at approval (see [`tier_of`] for how it is read).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tier: Option<Tier>,
+    /// The bundle manifest this server was approved from, if any. The
+    /// `secrets` of such an entry are bound to it: they were approved one by
+    /// one for exactly this manifest hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle: Option<BundleRef>,
 }
 
 /// A lock file.
@@ -474,6 +500,24 @@ pub enum Admission {
     Moved,
     /// The stdio program's file is not the approved binary (#679).
     Rebuilt,
+    /// The bundle manifest the server was approved from changed, or cannot
+    /// be read now (#811): its secret grants no longer apply to what is on
+    /// disk.
+    BundleChanged,
+}
+
+/// The bundle half of the connect-time decision: `None` when `server` has no
+/// bundle record, or the manifest file hashes to the approved hash;
+/// otherwise [`Admission::BundleChanged`]. `live` is the hash of the file at
+/// the recorded path now, empty when it cannot be read (fail closed). A
+/// manifest hash is compared exactly: any byte change needs a new approval.
+pub fn bundle_admission(
+    lock: &BTreeMap<String, LockEntry>,
+    server: &str,
+    live: &str,
+) -> Option<Admission> {
+    let b = lock.get(server)?.bundle.as_ref()?;
+    (live.is_empty() || live != b.hash).then_some(Admission::BundleChanged)
 }
 
 /// What a connect sees of a server, compared against its lock entry.
@@ -557,6 +601,36 @@ pub fn ledger_line(event: &str, server: &str, manifest_hash: &str, at: u64) -> S
     line
 }
 
+/// The audit line of a bundle approval: [`ledger_line`] plus the hash of the
+/// manifest file it was approved from.
+pub fn bundle_ledger_line(
+    event: &str,
+    server: &str,
+    manifest_hash: &str,
+    bundle_hash: &str,
+    at: u64,
+) -> String {
+    let mut line = serde_json::json!({
+        "v": 1, "kind": "plugin", "event": event, "server": server,
+        "manifest_hash": manifest_hash, "bundle_hash": bundle_hash, "at": at,
+    })
+    .to_string();
+    line.push('\n');
+    line
+}
+
+/// The audit line of one secret grant or revoke (`secret_grant`,
+/// `secret_revoke`): the secret's NAME, never a value.
+pub fn secret_ledger_line(event: &str, server: &str, secret: &str, at: u64) -> String {
+    let mut line = serde_json::json!({
+        "v": 1, "kind": "plugin", "event": event, "server": server,
+        "secret": secret, "at": at,
+    })
+    .to_string();
+    line.push('\n');
+    line
+}
+
 /// Largest ledger read for [`check_against_ledger`].
 pub const MAX_LEDGER_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -593,7 +667,11 @@ pub struct LedgerCheck {
 /// ledger and the lock are both files of the owner, so a process that can
 /// rewrite both defeats it; an edit of the lock alone is caught.
 pub fn check_against_ledger(lock: &BTreeMap<String, LockEntry>, ledger: &str) -> LedgerCheck {
-    let mut last: BTreeMap<String, (String, String)> = BTreeMap::new();
+    // Per server: the last approve/revoke (event, manifest hash, bundle
+    // hash) and the secrets the ledger shows granted since that approval.
+    type Last = (String, String, Option<String>);
+    let mut last: BTreeMap<String, Last> = BTreeMap::new();
+    let mut granted: BTreeMap<String, std::collections::BTreeSet<String>> = BTreeMap::new();
     for line in ledger.lines() {
         let Ok(v) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -604,9 +682,24 @@ pub fn check_against_ledger(lock: &BTreeMap<String, LockEntry>, ledger: &str) ->
         let (Some(event), Some(server)) = (v["event"].as_str(), v["server"].as_str()) else {
             continue;
         };
-        if matches!(event, "approve" | "revoke") {
-            let hash = v["manifest_hash"].as_str().unwrap_or_default();
-            last.insert(server.to_string(), (event.to_string(), hash.to_string()));
+        match event {
+            "approve" | "revoke" => {
+                let hash = v["manifest_hash"].as_str().unwrap_or_default();
+                let bundle = v["bundle_hash"].as_str().map(str::to_string);
+                last.insert(server.to_string(), (event.into(), hash.into(), bundle));
+                // An approval starts a new grant set: grants never carry over.
+                granted.remove(server);
+            }
+            "secret_grant" | "secret_revoke" => {
+                let secret = v["secret"].as_str().unwrap_or_default().to_string();
+                let set = granted.entry(server.to_string()).or_default();
+                if event == "secret_grant" {
+                    set.insert(secret);
+                } else {
+                    set.remove(&secret);
+                }
+            }
+            _ => {}
         }
     }
     let mut out = LedgerCheck::default();
@@ -617,19 +710,39 @@ pub fn check_against_ledger(lock: &BTreeMap<String, LockEntry>, ledger: &str) ->
         if e.revoked {
             continue;
         }
+        let blocked = |why: &str| (name.clone(), why.to_string());
         match last.get(name) {
-            Some((ev, _)) if ev == "revoke" => out.blocked.push((
-                name.clone(),
+            Some((ev, _, _)) if ev == "revoke" => out.blocked.push(blocked(
                 "the ledger's last decision for it is a revoke, but the lock says approved \
-                 (edited by hand?); approve it again to use it"
-                    .into(),
+                 (edited by hand?); approve it again to use it",
             )),
-            Some((_, h)) if *h != e.manifest_hash => out.blocked.push((
-                name.clone(),
+            Some((_, h, _)) if *h != e.manifest_hash => out.blocked.push(blocked(
                 "its manifest hash is not the one last recorded as approved in the ledger \
-                 (edited by hand?); approve it again to use it"
-                    .into(),
+                 (edited by hand?); approve it again to use it",
             )),
+            // A bundle entry's bundle hash and secret grants are checked too:
+            // a re-pinned manifest or a grant added by hand is not trusted.
+            Some((_, _, b))
+                if e.bundle
+                    .as_ref()
+                    .is_some_and(|r| Some(&r.hash) != b.as_ref()) =>
+            {
+                out.blocked.push(blocked(
+                    "its plugin manifest hash is not the one last recorded as approved in the \
+                     ledger (edited by hand?); approve it again to use it",
+                ))
+            }
+            Some(_)
+                if e.bundle.is_some()
+                    && e.secrets
+                        .iter()
+                        .any(|s| !granted.get(name).is_some_and(|g| g.contains(s))) =>
+            {
+                out.blocked.push(blocked(
+                    "it holds a secret grant the ledger does not show as granted, or shows as \
+                     revoked (edited by hand?); approve it again to use it",
+                ))
+            }
             Some(_) => {}
             None => out.unrecorded.push(name.clone()),
         }

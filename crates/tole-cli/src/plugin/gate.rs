@@ -27,6 +27,9 @@ pub struct Approval {
     pub tier: Option<plugin_lock::Tier>,
     pub sandbox: Option<String>,
     pub secrets: Option<Vec<String>>,
+    /// The bundle manifest the server is approved from (#811). With it, the
+    /// ledger records the manifest hash and each secret grant.
+    pub bundle: Option<plugin_lock::BundleRef>,
 }
 
 /// The layered lock of one session.
@@ -113,11 +116,15 @@ impl Gate {
             version,
             tools,
         };
-        let a = admit(&self.lock, server, &live);
+        let mut a = admit(&self.lock, server, &live);
+        if a == Admission::Trusted {
+            a = self.bundle_check(server).unwrap_or(a);
+        }
         let event = match &a {
             Admission::Changed { .. } => Some("manifest_change"),
             Admission::Moved => Some("source_change"),
             Admission::Rebuilt => Some("binary_change"),
+            Admission::BundleChanged => Some("bundle_change"),
             _ => None,
         };
         if let Some(event) = event {
@@ -137,16 +144,25 @@ impl Gate {
     /// approved under this name never runs. Source and binary changes are
     /// recorded in the ledger.
     pub fn refuse_unseen(&self, server: &str, source: &str) -> Option<String> {
-        let a = plugin_lock::admit_unseen(&self.lock, server, source, &integrity(source))?;
+        let a = plugin_lock::admit_unseen(&self.lock, server, source, &integrity(source))
+            .or_else(|| self.bundle_check(server))?;
         let event = match a {
             Admission::Moved => "source_change",
             Admission::Rebuilt => "binary_change",
+            Admission::BundleChanged => "bundle_change",
             _ => "",
         };
         if let Some(e) = self.lock.get(server).filter(|_| !event.is_empty()) {
             self.record(event, server, &e.manifest_hash);
         }
         Some(refusal(server, &a))
+    }
+
+    /// [`Admission::BundleChanged`] when `server`'s bundle manifest file is
+    /// not the approved one now (#811).
+    fn bundle_check(&self, server: &str) -> Option<Admission> {
+        let live = super::bundle::live_hash(self.lock.get(server)?)?;
+        plugin_lock::bundle_admission(&self.lock, server, &live)
     }
 
     /// The secret NAMES `server`'s approval granted it (#679), for its
@@ -209,10 +225,31 @@ impl Gate {
             revoked: false,
             manifest: plugin_lock::snapshot(tools, &tole_core::secrets::process_secrets()),
             tier: with.tier,
+            bundle: with.bundle,
         };
         lock.servers.insert(server.to_string(), entry.clone());
         lock.save(&path)?;
-        self.record("approve", server, &entry.manifest_hash);
+        match &entry.bundle {
+            // A bundle approval carries the manifest hash and one ledger line
+            // per granted secret: the ledger can then tell a grant the owner
+            // gave from one added to the lock by hand.
+            Some(b) => {
+                append(
+                    &path,
+                    plugin_lock::bundle_ledger_line(
+                        "approve",
+                        server,
+                        &entry.manifest_hash,
+                        &b.hash,
+                        now(),
+                    ),
+                );
+                for secret in &entry.secrets {
+                    record_secret(&path, "secret_grant", server, secret);
+                }
+            }
+            None => self.record("approve", server, &entry.manifest_hash),
+        }
         self.lock.insert(server.to_string(), entry);
         Ok(())
     }
@@ -312,10 +349,21 @@ pub fn first_party_names() -> Vec<String> {
 /// Appends one ledger line next to the user lock `user` (names and
 /// hashes only).
 pub fn record_event(user: &Path, event: &str, server: &str, hash: &str) {
+    append(user, plugin_lock::ledger_line(event, server, hash, now()));
+}
+
+/// Appends the grant or revoke of one secret (its NAME) of `server`.
+pub fn record_secret(user: &Path, event: &str, server: &str, secret: &str) {
+    append(
+        user,
+        plugin_lock::secret_ledger_line(event, server, secret, now()),
+    );
+}
+
+fn append(user: &Path, line: String) {
     let Some(dir) = user.parent() else {
         return;
     };
-    let line = plugin_lock::ledger_line(event, server, hash, now());
     let mut store = crate::ledger_file::FileStore::new(dir.join(plugin_lock::LEDGER_FILE));
     if let Err(e) = store.append(line.as_bytes()) {
         eprintln!("tole: plugin ledger: {e}");
@@ -347,6 +395,11 @@ pub fn refusal(server: &str, a: &Admission) -> String {
         Admission::Rebuilt => format!(
             "its program file is not the binary you approved (an upgrade or a swap): not \
              registered. Start `tole` in a terminal to review and re-approve it, or run \
+             `tole plugin approve {server}` ({server})"
+        ),
+        Admission::BundleChanged => format!(
+            "its plugin manifest (tole-plugin.toml) is not the one you approved, or cannot be \
+             read: not registered, and its secret grants do not apply. Review it and run \
              `tole plugin approve {server}` ({server})"
         ),
     }
@@ -441,6 +494,7 @@ pub fn preflight(
             Admission::Changed { .. } => "CHANGED since you approved it",
             Admission::Moved => "now runs ANOTHER command or URL than the one you approved",
             Admission::Rebuilt => "now runs ANOTHER program file than the one you approved",
+            Admission::BundleChanged => "has a CHANGED plugin manifest",
             Admission::Trusted | Admission::Revoked => continue,
         };
         let text = format!(

@@ -193,6 +193,7 @@ fn state_of(a: &Admission) -> &'static str {
         Admission::Changed { .. } => "changed",
         Admission::Moved => "changed (another command or URL)",
         Admission::Rebuilt => "changed (another program file)",
+        Admission::BundleChanged => "changed (plugin manifest)",
         Admission::Unlocked => "unapproved",
         Admission::Revoked => "revoked",
     }
@@ -746,6 +747,7 @@ fn add(ctx: &mut Ctx<'_>, spec: &str) -> Result<String, String> {
             tier: Some(tier),
             sandbox: profile_used(ctx, &cfg),
             secrets: Some(Vec::new()),
+            bundle: None,
         },
     )?;
     Ok(ctx.clean(&format!(
@@ -811,6 +813,7 @@ fn approve(
             tier: Some(tier),
             sandbox: profile_used(ctx, &cfg),
             secrets: None,
+            bundle: None,
         },
     )?;
     let mut out = format!("{shown}\napproved `{name}` ({hash}) in the user lock\n");
