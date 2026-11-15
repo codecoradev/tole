@@ -558,7 +558,7 @@ file_size_mb = 4096            # 1 to 1048576, largest file a process writes
   SYMBOLIC LINK anywhere in that chain (`.git`, `.git/hooks`, `.git/config`,
   `.tole`, `.gitmodules`, a submodule path, `.tole-worktrees` or one of its
   entries, a gitdir target), a path that leaves the workspace, an unreadable
-  or oversized `.gitmodules`, or more than 64 entries refuses the launch (for
+  `.gitmodules` or gitdir file larger than 64 KiB or 4 KiB (never read in part), or more than 64 entries refuses the launch (for
   `optional`, the fallback policy applies) with the cause in the reason:
   a mount cannot protect a link (the command removes it and makes a real
   directory, or the link leads to a writable place). Links elsewhere inside

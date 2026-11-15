@@ -970,3 +970,36 @@ fn a_path_that_appears_or_becomes_a_link_between_plan_and_launch_is_refused() {
     let e = recheck_plan(&ws, &args).unwrap_err();
     assert!(e.contains("symbolic link"), "{e}");
 }
+
+/// A `.gitmodules` padded past the read bound is refused, not read in part:
+/// git on the host parses all of it, so a registered submodule whose `path`
+/// lies past the cut would go unprotected.
+#[test]
+fn an_oversized_gitmodules_or_gitdir_file_is_refused_not_read_in_part() {
+    let (_g, ws) = keep("oversize-modules");
+    let pad = "# ".to_string() + &"x".repeat(70 * 1024) + "\n";
+    std::fs::write(
+        ws.join(".gitmodules"),
+        format!("{pad}[submodule \"s\"]\n\tpath = libs/s\n"),
+    )
+    .unwrap();
+    let e = protect_plan(&ws).unwrap_err();
+    assert!(
+        e.contains(".gitmodules") && e.contains("larger than"),
+        "{e}"
+    );
+    // Exactly at the bound is fine; one byte over is not.
+    let at = format!("{}\n", "#".repeat(64 * 1024 - 1));
+    std::fs::write(ws.join(".gitmodules"), &at).unwrap();
+    assert!(protect_plan(&ws).is_ok());
+    std::fs::write(ws.join(".gitmodules"), format!("{at}#")).unwrap();
+    assert!(protect_plan(&ws).is_err());
+    // A gitdir file with padding is refused too.
+    let (_g2, ws2) = keep("oversize-gitdir");
+    std::fs::write(
+        ws2.join(".git"),
+        format!("gitdir: .gd\n{}\n", "x".repeat(5000)),
+    )
+    .unwrap();
+    assert!(protect_plan(&ws2).unwrap_err().contains("larger than"));
+}

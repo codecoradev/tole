@@ -260,7 +260,7 @@ const MAX_NESTED: usize = 64;
 ///
 /// A symbolic link anywhere in that chain (`.git`, `.git/hooks`, `.git/config`,
 /// `.tole`, `.gitmodules`, a submodule path, `.tole-worktrees`, a gitdir
-/// target), a path that escapes the workspace, an unreadable or oversized
+/// target), a path that escapes the workspace, an unreadable or too large
 /// `.gitmodules` or more than [`MAX_NESTED`] entries is an error and the launch
 /// follows the consumer's policy: refused when required. NOT protected: a
 /// nested repository that is in neither `.gitmodules` nor `.tole-worktrees`
@@ -355,12 +355,8 @@ pub fn protect_plan(ws: &Path) -> Result<Vec<PathBuf>, String> {
 /// missing, an error when the file cannot be read or the path passes through a
 /// link.
 fn gitdir_target(ws: &Path, file: &Path) -> Result<Option<PathBuf>, String> {
-    use std::io::Read;
     let shown = file.display();
-    let mut text = String::new();
-    std::fs::File::open(file)
-        .and_then(|f| f.take(4096).read_to_string(&mut text))
-        .map_err(|e| format!("cannot read gitdir file {shown} ({e})"))?;
+    let text = read_bounded(file, 4096)?;
     let Some(rel) = text.lines().find_map(|l| l.strip_prefix("gitdir:")) else {
         return Ok(None);
     };
@@ -396,14 +392,32 @@ fn gitdir_target(ws: &Path, file: &Path) -> Result<Option<PathBuf>, String> {
     }
 }
 
-/// The `path` values of a `.gitmodules` file, relative and inside the
-/// workspace (no root, no `..`), at most [`MAX_NESTED`] and 64 KiB read.
-fn gitmodules_paths(file: &Path) -> Result<Vec<PathBuf>, String> {
+/// The whole text of `file`, which must be at most `max` bytes: a larger file
+/// is an error, never read in part (git on the host parses all of it, so a part
+/// would let what lies past the cut go unprotected).
+fn read_bounded(file: &Path, max: u64) -> Result<String, String> {
     use std::io::Read;
+    let shown = file.display();
+    let f = std::fs::File::open(file).map_err(|e| format!("cannot read {shown} ({e})"))?;
     let mut text = String::new();
-    std::fs::File::open(file)
-        .and_then(|f| f.take(64 * 1024).read_to_string(&mut text))
-        .map_err(|e| format!("cannot read {} ({e})", file.display()))?;
+    // One byte more than `max` tells a file that fits from one that does not,
+    // whatever its size was when it was inspected.
+    f.take(max + 1)
+        .read_to_string(&mut text)
+        .map_err(|e| format!("cannot read {shown} ({e})"))?;
+    if text.len() as u64 > max {
+        return Err(format!(
+            "{shown} is larger than {max} bytes; not read in part"
+        ));
+    }
+    Ok(text)
+}
+
+/// The `path` values of a `.gitmodules` file, relative and inside the
+/// workspace (no root, no `..`), at most [`MAX_NESTED`] entries, in a file of
+/// at most 64 KiB (a larger one is refused).
+fn gitmodules_paths(file: &Path) -> Result<Vec<PathBuf>, String> {
+    let text = read_bounded(file, 64 * 1024)?;
     let mut out = Vec::new();
     for line in text.lines() {
         let Some((k, v)) = line.split_once('=') else {
