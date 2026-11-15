@@ -655,21 +655,23 @@ text steered; the model-facing `discuss` tools remain the way an agent opens
 one, under `delegate`'s rules. `--dry-run` is exempt: it calls no model and
 writes nothing. `list` and `show` are read-only and stay open.
 
-### Discussion timeout floor: recommendation (#813 item 4, awaiting the owner)
+### Discussion timeout floor: decided (#813 item 4)
 
-Nothing changed: the floor is still 1 second. Raising it is a behaviour
-change for anyone who set 1 to 9 seconds, so it needs the owner's decision.
+Decided by the owner on 2026-11-15 ("follow best practice"): the floor of
+the user-config key `[discussions] request_timeout_secs` is 10 seconds.
 
-| | Keep 1 s | Floor 10 s |
-|---|---|---|
-| A typo or a unit slip (`5` meant as minutes) | accepted; every call times out, and since #756 and #804 each timeout is retried once and charged its reserved estimate, so the discussion burns its budget on nothing | refused at startup with the bounds in the message |
-| Tests of the timeout path | use 1 s through the config or the env | keep 1 s through `TOLE_DISCUSSION_TIMEOUT_SECS` only |
-| Real models | no model answers a non-streaming discussion call in under 10 s | no effect |
+| | Floor 10 s (decided) |
+|---|---|
+| A typo or a unit slip (`5` meant as minutes) | refused at startup and by `tole config check`, naming `discussions.request_timeout_secs` and the floor; before, every call timed out and, since #756 and #804, each timeout is retried once and charged its reserved estimate, so the discussion burned its budget on nothing |
+| Tests of the timeout path | keep 1 s through `TOLE_DISCUSSION_TIMEOUT_SECS` only |
+| Real models | no effect: none answers a non-streaming discussion call in under 10 s |
 
-Recommendation: raise the floor to 10 s for the user-config key and keep the
-env override unbounded below (down to 1 s) as the documented test hook, with
-`discussion_timeout_bounds()` naming both. Owner decision needed; tracked in
-#813.
+Bounds: config 10 to 3600 s (values 1 to 9 are an error), env
+`TOLE_DISCUSSION_TIMEOUT_SECS` 1 to 3600 s (the env stays unbounded below
+the config floor on purpose: it is the documented test hook, not a setting
+to rely on). Default 120 s and the upper bound are unchanged.
+`discussion_timeout_bounds()` names the floor and the hook;
+`discussion_timeout_env_bounds()` is the env's wording.
 
 ### A timed-out call is charged its estimate (#804)
 
