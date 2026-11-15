@@ -305,11 +305,11 @@ launcher in a configured server, a third-party stdio server no sandbox
 applies to, and a broad grant (any secret on a third-party server, or more
 than three on any server).
 
-**Not built yet** (later slices): bundle manifests, per-plugin secret grants
-through `env_for`, resolution through the official MCP Registry with verified
-namespaces, skills from the uteke registry. `add` does not edit the owner's
-config: after it, configure the same command line (`mcp_server` or
-`--mcp-server`); the approval is bound to exactly that source.
+**Not built yet** (later slices): resolution through the official MCP Registry
+with verified namespaces, skills from the uteke registry (bundle manifests and
+per-plugin secret grants are §10). `add` does not edit the owner's config:
+after it, configure the same command line (`mcp_server` or `--mcp-server`);
+the approval is bound to exactly that source.
 
 ## Unreadable plugin ledger (#813 item 3)
 
@@ -325,3 +325,51 @@ that `add` and `approve` refuse until it is fixed. `tole plugin revoke` is
 unchanged on purpose: it only narrows trust, so it must keep working.
 Sessions that connect servers keep failing closed as before: revocations
 recorded in an unreadable ledger cannot be checked, and the note says so.
+
+## 10. Bundle manifests and per-plugin secret grants (#600 slice 2, #811)
+
+Built in two parts: part 1 is the manifest format, the lock record, the
+connect-time pin and the ledger checks (this section's first half); part 2
+adds the commands (`add --bundle`, per-secret approval, `revoke --secret`).
+
+**The manifest.** `tole-plugin.toml` (strict TOML, unknown keys refused, at
+most 64 KiB, no control characters) holds `name`, `version`, optional
+`description` and `paths`, one `[mcp_servers.<name>]` table per server (`run`
+= a command line, or `url`; `secrets` = names it asks for) and optional
+`[[skills]]` and `[[hooks]]` declarations. A remote server cannot ask for
+secrets; a secret name must be upper case and secret-shaped
+(`is_secret_name`). Parsing starts nothing.
+
+**Decisions where the design left room** (the more restrictive option in
+each case):
+
+1. *What a grant covers.* The NAME of one environment variable, delivered to
+   the stdio process of that one server when it starts. Not another server of
+   the same bundle (each server is granted separately), not a remote server
+   (refused in the manifest), not a child tole starts for someone else. It
+   never widens the owner's `[secrets]` release: the secret must also be
+   released to `mcp`, otherwise the grant is recorded and passes nothing.
+   Redaction is unchanged and covers every secret, granted or not.
+2. *The manifest is pinned by exact bytes.* The lock entry's `bundle` record
+   holds the SHA-256 of the file and its absolute path (lock format version
+   3); before a server is started and at every connect the file is hashed
+   again. A different hash, a missing or unreadable file, or a path that is no
+   regular file blocks the server (`Admission::BundleChanged`, a ledger
+   `bundle_change`) and its grants do not apply, until it is approved again. A
+   comment-only edit counts: nothing is parsed to decide that a change is
+   harmless.
+3. *Ledger.* A bundle approval writes `approve` with the manifest and bundle
+   hashes, then one `secret_grant` line per granted secret; a withdrawal
+   writes `secret_revoke` (`secret_revoke_project` for a project-lock revoke,
+   which only narrows). The ledger is the authority and is compared in both
+   directions: an entry is blocked when its bundle record is not the last
+   approved one (re-pinned, removed, or added where the approval was plain),
+   or it holds a secret the ledger does not show as granted since the last
+   approval (or shows as revoked), or it carries a bundle record or secrets
+   with no approval line at all. A hand-edited lock cannot add or restore a
+   secret or drop the manifest pin, and an approval starts from no grant. Same residual as before: a process that can
+   rewrite both files defeats it.
+4. *Declared skills, hooks and paths.* Shown and covered by the file hash,
+   never acted on: no skill is loaded and no hook is run from a bundle (hooks
+   stay owner-only, §1; skills come through the registry, §4.4), and the
+   declared paths are recorded for the sandbox slice, not enforced yet.

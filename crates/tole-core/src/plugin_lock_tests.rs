@@ -438,3 +438,127 @@ fn the_ledger_blocks_a_lock_edited_back_or_re_pinned() {
     // No ledger lines at all: nothing to compare.
     assert_eq!(check_against_ledger(&lock, ""), LedgerCheck::default());
 }
+
+fn bundle_lock(secrets: &[&str]) -> BTreeMap<String, LockEntry> {
+    let mut m = locked(&base());
+    let e = m.get_mut("cora").unwrap();
+    e.secrets = secrets.iter().map(|s| s.to_string()).collect();
+    e.bundle = Some(BundleRef {
+        plugin: "acme".into(),
+        version: "1".into(),
+        hash: "sha256:b1".into(),
+        path: "/p/tole-plugin.toml".into(),
+    });
+    m
+}
+
+#[test]
+fn a_bundle_entry_needs_its_manifest_file_unchanged_and_readable() {
+    let lock = bundle_lock(&[]);
+    assert_eq!(bundle_admission(&lock, "cora", "sha256:b1"), None);
+    for live in ["sha256:b2", ""] {
+        assert_eq!(
+            bundle_admission(&lock, "cora", live),
+            Some(Admission::BundleChanged),
+            "{live:?}: fail closed"
+        );
+    }
+    // No bundle record, no such server: nothing to compare.
+    assert_eq!(bundle_admission(&locked(&base()), "cora", ""), None);
+    assert_eq!(bundle_admission(&lock, "other", ""), None);
+}
+
+#[test]
+fn the_bundle_record_round_trips_and_an_old_lock_loads_without_it() {
+    let dir = tmp("bundle-rt");
+    let path = dir.join("plugins.lock");
+    let lock = Lockfile {
+        servers: bundle_lock(&["A_TOKEN"]),
+        ..Default::default()
+    };
+    lock.save(&path).unwrap();
+    assert_eq!(Lockfile::load(&path).unwrap().servers, lock.servers);
+    std::fs::write(
+        &path,
+        r#"{"version":2,"servers":{"s":{"source":"stdio:s","manifest_hash":"sha256:1"}}}"#,
+    )
+    .unwrap();
+    assert!(Lockfile::load(&path).unwrap().servers["s"].bundle.is_none());
+}
+
+#[test]
+fn the_ledger_ties_secret_grants_and_the_bundle_hash_to_the_owners_decisions() {
+    let h = manifest_hash(&base());
+    let mut ledger = String::new();
+    let mut add = |l: String| ledger.push_str(&l);
+    add(bundle_ledger_line("approve", "cora", &h, "sha256:b1", 1));
+    add(secret_ledger_line("secret_grant", "cora", "A_TOKEN", 1));
+    add(secret_ledger_line("secret_grant", "cora", "B_KEY", 1));
+    let blocked = |secrets: &[&str], ledger: &str| {
+        check_against_ledger(&bundle_lock(secrets), ledger).blocked
+    };
+    assert!(blocked(&["A_TOKEN", "B_KEY"], &ledger).is_empty());
+    assert!(blocked(&[], &ledger).is_empty(), "fewer grants are fine");
+    // A grant the ledger never saw.
+    assert_eq!(blocked(&["C_TOKEN"], &ledger).len(), 1);
+    // A revoked grant put back.
+    let mut after = ledger.clone();
+    after.push_str(&secret_ledger_line("secret_revoke", "cora", "B_KEY", 2));
+    assert_eq!(blocked(&["A_TOKEN", "B_KEY"], &after).len(), 1);
+    assert!(blocked(&["A_TOKEN"], &after).is_empty());
+    // A new approval starts from nothing: earlier grants do not carry over.
+    after.push_str(&bundle_ledger_line("approve", "cora", &h, "sha256:b1", 3));
+    assert_eq!(blocked(&["A_TOKEN"], &after).len(), 1);
+    // A re-pinned manifest hash.
+    let mut lock = bundle_lock(&[]);
+    lock.get_mut("cora").unwrap().bundle.as_mut().unwrap().hash = "sha256:evil".into();
+    assert_eq!(check_against_ledger(&lock, &ledger).blocked.len(), 1);
+    // The audit lines carry names and hashes, never a value.
+    assert!(!ledger.contains("secret\":\"sk"));
+}
+
+#[test]
+fn the_ledger_is_authoritative_when_the_lock_drops_or_invents_bundle_state() {
+    let h = manifest_hash(&base());
+    let mut ledger = bundle_ledger_line("approve", "cora", &h, "sha256:b1", 1);
+    ledger.push_str(&secret_ledger_line("secret_grant", "cora", "A_TOKEN", 1));
+    let n =
+        |lock: &BTreeMap<String, LockEntry>, l: &str| check_against_ledger(lock, l).blocked.len();
+    // The honest lock passes.
+    assert_eq!(n(&bundle_lock(&["A_TOKEN"]), &ledger), 0);
+    // Bundle removed + a hand-added secret.
+    let mut l = bundle_lock(&["A_TOKEN", "EVIL_KEY"]);
+    l.get_mut("cora").unwrap().bundle = None;
+    assert_eq!(n(&l, &ledger), 1);
+    // Bundle removed + the granted secret kept: the manifest pin is gone.
+    let mut l = bundle_lock(&["A_TOKEN"]);
+    l.get_mut("cora").unwrap().bundle = None;
+    assert_eq!(n(&l, &ledger), 1);
+    // Bundle removed, no secrets: still not what was approved.
+    let mut l = bundle_lock(&[]);
+    l.get_mut("cora").unwrap().bundle = None;
+    assert_eq!(n(&l, &ledger), 1);
+    // A revoked grant restored (with the bundle intact).
+    let mut after = ledger.clone();
+    after.push_str(&secret_ledger_line("secret_revoke", "cora", "A_TOKEN", 2));
+    assert_eq!(n(&bundle_lock(&["A_TOKEN"]), &after), 1);
+    // ... and with the bundle also removed.
+    let mut l = bundle_lock(&["A_TOKEN"]);
+    l.get_mut("cora").unwrap().bundle = None;
+    assert_eq!(n(&l, &after), 1);
+    // A bundle record invented on an entry whose ledger approval is plain.
+    let plain = ledger_line("approve", "cora", &h, 1);
+    assert_eq!(n(&bundle_lock(&[]), &plain), 1, "bundle record invented");
+    // A plain entry's own secrets (#679) are not ledger-tracked and stay.
+    let mut l = locked(&base());
+    l.get_mut("cora").unwrap().secrets = vec!["A_TOKEN".into()];
+    assert_eq!(n(&l, &plain), 0);
+    // A bundle record with no approval line for the server at all.
+    let other = ledger_line("approve", "zzz", "h", 1);
+    assert_eq!(n(&bundle_lock(&[]), &other), 1);
+    assert_eq!(
+        n(&locked(&base()), &other),
+        0,
+        "a plain pre-ledger entry stays unblocked"
+    );
+}
