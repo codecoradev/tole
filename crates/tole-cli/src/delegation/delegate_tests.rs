@@ -40,15 +40,20 @@ fn tmp(tag: &str) -> Root {
 }
 
 /// A stand-in tole binary: records its argv and env next to its sessions
-/// dir, then sleeps `secs`.
+/// dir, then sleeps `secs`. Each record is written to a temp name and
+/// renamed into place, so a reader that sees the file sees all of it: `env`
+/// (and a long argv) leaves the process in several writes, and a reader
+/// that wakes between two of them would otherwise take a prefix for the
+/// whole file (#828).
 fn fake_tole(dir: &Path, secs: u64) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let p = dir.join(format!("fake-tole-{secs}"));
     let body = format!(
         "#!/bin/sh\nprev=\"\"\nfor a in \"$@\"; do [ \"$prev\" = \"--sessions-dir\" ] && D=\"$a\"; \
-         prev=\"$a\"; done\n[ -d \"${{D%/*/*/*}}\" ] || exit 0\nmkdir -p \"$D\"\nprintf '%s\\n' \"$@\" > \"$D/../argv\"\n\
-         cut -d' ' -f19 /proc/$$/stat > \"$D/../nice\" 2>/dev/null\n\
-         env > \"$D/../env\"\nsleep {secs}\n"
+         prev=\"$a\"; done\n[ -d \"${{D%/*/*/*}}\" ] || exit 0\nmkdir -p \"$D\"\n\
+         printf '%s\\n' \"$@\" > \"$D/../argv.tmp\" && mv \"$D/../argv.tmp\" \"$D/../argv\"\n\
+         cut -d' ' -f19 /proc/$$/stat > \"$D/../nice.tmp\" 2>/dev/null && mv \"$D/../nice.tmp\" \"$D/../nice\"\n\
+         env > \"$D/../env.tmp\" && mv \"$D/../env.tmp\" \"$D/../env\"\nsleep {secs}\n"
     );
     std::fs::write(&p, body).unwrap();
     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -233,13 +238,29 @@ fn tools(h: &std::sync::Arc<Delegator>, root: &Path) -> (DelegateTool, DelegateP
     )
 }
 
-/// Waits for a file the fake child writes.
+/// Waits for a file the fake child writes (it appears whole, see
+/// [`fake_tole`]). On timeout the panic names what is on disk next to it.
+#[track_caller]
 fn wait_for(p: &Path) -> String {
-    crate::test_dir::wait_for(
-        crate::test_dir::WAIT,
-        &format!("{} to appear", p.display()),
-        || std::fs::read_to_string(p).ok().filter(|s| !s.is_empty()),
-    )
+    let got = crate::test_dir::poll_until(crate::test_dir::WAIT, || {
+        std::fs::read_to_string(p).ok().filter(|s| !s.is_empty())
+    });
+    got.unwrap_or_else(|| {
+        let near: Vec<String> = p
+            .parent()
+            .and_then(|d| std::fs::read_dir(d).ok())
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        panic!(
+            "timed out after {:?} waiting for {} to appear; its directory holds {near:?}",
+            crate::test_dir::WAIT,
+            p.display()
+        )
+    })
 }
 
 fn agent_dir_of(root: &Path, out: &Value) -> PathBuf {
@@ -990,6 +1011,46 @@ fn a_child_with_a_complete_report_settles_done_and_the_parent_sees_it_fenced() {
     let d = log_of(&root);
     let n = d.poll(out["node"].as_str().unwrap()).unwrap();
     assert_eq!(n.report.as_ref().unwrap().summary, "the API is fine");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// #712: a child that exits between two liveness probes of one recovery
+/// pass (report written just before) was alive for the first and gone for
+/// the second, and was settled `interrupted` ("process gone") with its report
+/// thrown away. The probe is asked once: such a node stays running and the
+/// next poll settles it `done` with its report.
+#[test]
+fn a_child_exiting_between_two_probes_is_not_settled_as_gone() {
+    let root = tmp("probe-once");
+    let h = reporting_host(&root, "rep", r#"{"summary":"all good"}"#);
+    let (start, _poll) = tools(&h, &root);
+    let out = start
+        .execute(json!({"task": "review", "mode": "consult"}))
+        .unwrap();
+    let node = out["node"].as_str().unwrap().to_string();
+    let dir = agent_dir_of(&root, &out);
+    wait_for(&dir.join("env"));
+    let report = dir.join(tole_core::delegation_report::REPORT_FILE);
+    crate::test_dir::wait_until(crate::test_dir::WAIT, "the report and the exit", || {
+        report.is_file()
+            && log_of(&root)
+                .poll(&node)
+                .and_then(|n| n.lease)
+                .is_some_and(|l| !lease_alive(&l))
+    });
+    // A probe that sees the child alive once, then gone: the exit lands
+    // between two probes.
+    let probes = std::sync::atomic::AtomicUsize::new(0);
+    h.locked(|d| Delegator::recover_with(d, |_| probes.fetch_add(1, Relaxed) == 0))
+        .unwrap();
+    let n = log_of(&root).poll(&node).cloned().unwrap();
+    assert_eq!(n.status, NodeStatus::Running, "{n:?}");
+    // The next poll (the probe now sees it gone) settles it with its report.
+    h.locked(|d| Delegator::recover_with(d, lease_alive))
+        .unwrap();
+    let n = log_of(&root).poll(&node).cloned().unwrap();
+    assert_eq!(n.status, NodeStatus::Done, "{n:?}");
+    assert_eq!(n.report.as_ref().unwrap().summary, "all good");
     let _ = std::fs::remove_dir_all(&root);
 }
 
