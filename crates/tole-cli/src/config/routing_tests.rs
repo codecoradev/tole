@@ -249,11 +249,10 @@ fn the_dry_run_redacts_and_calls_no_provider() {
     assert!(out.contains("configured model: unset"), "{out}");
 }
 
-fn session(tag: &str) -> tole_core::storage::JsonlStorage {
-    let dir = std::env::temp_dir().join(format!("tole-routing-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    tole_core::storage::JsonlStorage::create_named(&dir, "s-1", None, None, None).unwrap()
+fn session(tag: &str) -> (tole_core::storage::JsonlStorage, crate::test_dir::TestDir) {
+    let dir = crate::test_dir::TestDir::new(&format!("tole-routing-{tag}"));
+    let s = tole_core::storage::JsonlStorage::create_named(&dir, "s-1", None, None, None).unwrap();
+    (s, dir)
 }
 
 fn model_of(s: &tole_core::storage::JsonlStorage) -> Option<String> {
@@ -275,7 +274,7 @@ fn cron_brief() -> Brief<'static> {
 fn a_new_session_records_the_route_and_its_model() {
     use tole_core::storage::Storage;
     let secrets = tole_core::secrets::SecretSet::default();
-    let mut s = session("routed");
+    let (mut s, _dir) = session("routed");
     let line = route_new_session(&mut s, &cfg(USER), &cron_brief(), &secrets).unwrap();
     assert!(line.is_some_and(|l| l.contains("light -> small-model")));
     assert_eq!(model_of(&s).as_deref(), Some("small-model"));
@@ -283,7 +282,7 @@ fn a_new_session_records_the_route_and_its_model() {
     assert_eq!(rec["tier"], "light");
     assert_eq!(rec["source"], "rule:short-cron");
     // No match: the decision is recorded, the model is not touched.
-    let mut s = session("default");
+    let (mut s, _dir) = session("default");
     route_new_session(&mut s, &cfg(USER), &brief("hello"), &secrets).unwrap();
     assert_eq!(model_of(&s), None);
     assert_eq!(
@@ -296,7 +295,7 @@ fn a_new_session_records_the_route_and_its_model() {
 fn routing_off_or_an_explicit_model_leaves_the_session_alone() {
     use tole_core::storage::Storage;
     let secrets = tole_core::secrets::SecretSet::default();
-    let mut s = session("off");
+    let (mut s, _dir) = session("off");
     let off = cfg(&USER.replace("enabled = true", ""));
     assert_eq!(
         route_new_session(&mut s, &off, &cron_brief(), &secrets).unwrap(),
@@ -304,7 +303,7 @@ fn routing_off_or_an_explicit_model_leaves_the_session_alone() {
     );
     assert!(s.get_register(ROUTE.0, ROUTE.1).is_none() && model_of(&s).is_none());
     // A session that already has a model (an explicit choice) keeps it.
-    let mut s = session("pinned");
+    let (mut s, _dir) = session("pinned");
     crate::session_settings::write_model(&mut s, "owner-pick").unwrap();
     assert_eq!(
         route_new_session(&mut s, &cfg(USER), &cron_brief(), &secrets).unwrap(),
@@ -312,7 +311,7 @@ fn routing_off_or_an_explicit_model_leaves_the_session_alone() {
     );
     assert_eq!(model_of(&s).as_deref(), Some("owner-pick"));
     // A broken router is an error, and nothing is written.
-    let mut s = session("broken");
+    let (mut s, _dir) = session("broken");
     let broken = cfg(&USER.replace("light = \"small-model\"\n", ""));
     let e = route_new_session(&mut s, &broken, &cron_brief(), &secrets).unwrap_err();
     assert!(e.contains("[router.tiers]"), "{e}");
