@@ -292,46 +292,159 @@ fn the_tools_checks_run_before_the_sandbox() {
     assert!(e.contains("may not run the tole binary"), "{e}");
 }
 
-/// Protected paths that are links are followed: the target is read-only
-/// whatever the link says, and a link to outside reaches nothing.
+/// A workspace with a real repository (`git init`), a `.tole` dir and a
+/// marker in the hooks, so the host state is easy to compare afterwards.
+fn repo(tag: &str) -> PathBuf {
+    let w = ws(tag);
+    let out = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .arg(&w)
+        .output()
+        .expect("git is needed for this test");
+    assert!(out.status.success(), "git init: {out:?}");
+    std::fs::write(w.join(".git/hooks/marker"), "owner\n").unwrap();
+    std::fs::create_dir_all(w.join(".tole")).unwrap();
+    w
+}
+
+/// #849: the leaf mounts alone did not protect `.git/hooks` and `.git/config`:
+/// a mount point cannot be renamed, but its ancestor can, so `mv .git .g &&
+/// cp -a .g .git` gave the command a plain copy to plant a hook in, which a
+/// later `git commit` outside the sandbox ran. Now `.git` is a mount point
+/// too (read-write: git itself keeps working). Every way to move, remove or
+/// replace `.git`, `.git/hooks`, `.git/config` and `.tole` fails.
 #[test]
-fn a_protected_path_that_is_a_link_cannot_be_used_to_write_through() {
+fn a_sandboxed_command_cannot_rename_or_replace_the_git_dir_and_its_leaves() {
     if skipped() {
         return;
     }
-    let w = ws("links");
-    std::fs::create_dir_all(w.join(".git")).unwrap();
-    std::fs::create_dir_all(w.join("githooks")).unwrap();
-    std::fs::write(w.join(".git/config"), "[core]\n").unwrap();
-    std::os::unix::fs::symlink("../githooks", w.join(".git/hooks")).unwrap();
-    let outside = ws("links-outside");
-    std::os::unix::fs::symlink(&outside, w.join(".tole")).unwrap();
+    let w = repo("gitattack");
+    let before = std::fs::read_to_string(w.join(".git/config")).unwrap();
     let tool = RunCommandTool::new(w.clone());
-    let out = run(
-        &tool,
-        "sh -c 'echo x > githooks/a; echo x > .git/hooks/b; echo x > .tole/c; echo x > .git/config; true'",
-    );
-    assert_eq!(out["status"], 0);
-    for p in ["githooks/a", ".git/hooks/b", ".git/config.new"] {
-        assert!(!w.join(p).exists(), "{p}");
+    // Each step prints its exit status; none may succeed.
+    let attacks = [
+        "mv .git .g",
+        "mv .git/hooks .git/hooks.old",
+        "mv .git/config .git/config.old",
+        "mv .tole .tole.old",
+        "rmdir .git/hooks",
+        "rm -rf .git",
+        "rm -rf .tole",
+        "rm -f .git/config",
+        // Replace by rename over the mount point.
+        "sh -c 'mkdir h2 && mv h2 .git/hooks'",
+        "sh -c 'echo x > c2 && mv c2 .git/config'",
+        // The reviewer's chain: the rename is what used to succeed.
+        "sh -c 'mv .git .g && cp -a .g .git && printf x > .git/hooks/pre-commit'",
+        "sh -c 'echo evil > .git/hooks/pre-commit'",
+        "sh -c 'echo [core] >> .git/config'",
+        "sh -c 'echo x > .tole/evil'",
+    ];
+    for a in attacks {
+        let out = run(&tool, a);
+        assert_ne!(out["status"], 0, "must fail: {a}: {out}");
     }
+    // Host state: nothing moved, planted or removed.
+    assert!(w.join(".git").is_dir() && !w.join(".g").exists());
+    assert!(w.join(".git/hooks").is_dir() && !w.join(".git/hooks.old").exists());
+    assert_eq!(
+        std::fs::read_to_string(w.join(".git/hooks/marker")).unwrap(),
+        "owner\n"
+    );
+    assert!(!w.join(".git/hooks/pre-commit").exists());
     assert_eq!(
         std::fs::read_to_string(w.join(".git/config")).unwrap(),
-        "[core]\n"
+        before
     );
-    assert!(
-        !outside.join("c").exists(),
-        "nothing written through the link"
+    assert!(w.join(".tole").is_dir() && !w.join(".tole/evil").exists());
+}
+
+/// The anchor must not break git: objects, index and refs stay writable.
+#[test]
+fn git_still_works_inside_the_sandbox() {
+    if skipped() {
+        return;
+    }
+    let w = repo("gitworks");
+    let tool = RunCommandTool::new(w.clone());
+    let out = run(&tool, "sh -c 'echo a > f && git add f && git -c user.name=t -c user.email=t@t commit -q -m one && git status --short && git log --oneline'");
+    assert_eq!(out["status"], 0, "{out}");
+    assert!(text(&out, "stdout").contains("one"), "{out}");
+    let host = std::process::Command::new("git")
+        .args(["-C"])
+        .arg(&w)
+        .args(["log", "--oneline"])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&host.stdout).contains("one"));
+    // The hooks and the config are still the owner's.
+    assert!(w.join(".git/hooks/marker").exists());
+}
+
+/// A gitdir file (worktree, submodule) cannot be swapped for a directory.
+#[test]
+fn a_gitdir_file_cannot_be_replaced_by_a_directory_with_hooks() {
+    if skipped() {
+        return;
+    }
+    let w = ws("gitfile");
+    std::fs::write(w.join(".git"), "gitdir: /nonexistent/elsewhere\n").unwrap();
+    let tool = RunCommandTool::new(w.clone());
+    for a in [
+        "rm -f .git",
+        "mv .git .g",
+        "sh -c 'rm .git && mkdir -p .git/hooks'",
+        "sh -c 'echo x >> .git'",
+    ] {
+        let out = run(&tool, a);
+        assert_ne!(out["status"], 0, "must fail: {a}: {out}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(w.join(".git")).unwrap(),
+        "gitdir: /nonexistent/elsewhere\n"
     );
-    // The same workspace after the link is swapped for a real directory
-    // still protects what is there now.
-    std::fs::remove_file(w.join(".git/hooks")).unwrap();
-    std::fs::create_dir(w.join(".git/hooks")).unwrap();
-    run(&tool, "sh -c 'echo x > .git/hooks/d; true'");
-    assert!(
-        !w.join(".git/hooks/d").exists(),
-        "re-resolved at the next launch"
-    );
+}
+
+/// A link cannot be protected by a mount, so the launch is refused; nothing
+/// runs and nothing is created.
+#[test]
+fn a_symlinked_git_dir_or_leaf_is_refused_not_bound() {
+    if skipped() {
+        return;
+    }
+    for (tag, link) in [
+        ("l-git", ".git"),
+        ("l-hooks", ".git/hooks"),
+        ("l-tole", ".tole"),
+    ] {
+        let w = ws(tag);
+        std::fs::create_dir_all(w.join("real")).unwrap();
+        if link != ".git" {
+            std::fs::create_dir_all(w.join(".git")).unwrap();
+        }
+        std::os::unix::fs::symlink(w.join("real"), w.join(link)).unwrap();
+        let tool = RunCommandTool::new(w.clone());
+        let e = tool.execute(json!({"command": "touch ran"})).unwrap_err();
+        assert!(e.contains("symbolic link") && e.contains(link), "{e}");
+        assert!(!w.join("ran").exists());
+    }
+}
+
+/// Residual, pinned so it stays documented: with no `.git` at launch nothing
+/// is protected and the launch creates nothing on the host; a repository made
+/// inside the sandbox is the owner's to review before running git there.
+#[test]
+fn without_a_git_dir_at_launch_nothing_is_created_or_protected() {
+    if skipped() {
+        return;
+    }
+    let w = ws("nogit");
+    let tool = RunCommandTool::new(w.clone());
+    let out = run(&tool, "sh -c 'test ! -e .git && echo none'");
+    assert_eq!(text(&out, "stdout").trim(), "none");
+    assert!(!w.join(".git").exists(), "the launch did not create .git");
+    assert_eq!(run(&tool, "git init -q")["status"], 0);
+    assert!(w.join(".git/hooks").is_dir(), "git init works inside");
 }
 
 /// Two sessions, two workspaces, at the same time: each sees its own.

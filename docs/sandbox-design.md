@@ -152,7 +152,7 @@ For each sandboxed process tole runs `bwrap <args> -- <program> <args>`:
 | `/etc`: `ld.so.cache`, `passwd`, `group`, `nsswitch.conf`, `localtime`, `ssl/`, `ca-certificates/`, `alternatives/` | host | read-only |
 | `/etc/resolv.conf`, `/etc/hosts` | host | read-only, only when the profile has network |
 | the program's install prefix (e.g. `/opt/node22`, a venv) | host | read-only |
-| workspace | host | read-only, or read-write per profile; `.git/hooks`, `.git/config` and `.tole/` always re-bound read-only on top |
+| workspace | host | read-only, or read-write per profile; `.git/hooks`, `.git/config` and `.tole/` always re-bound read-only on top, and `.git` made a mount point (§9.3, #849) |
 | scratch (`$TMPDIR`, `$HOME`) | a fresh `0700` dir under the system temp, owned by tole | read-write |
 | extra `read` / `write` paths of the profile | host | as named |
 | `/proc` | new, for the sandbox's PID namespace | — |
@@ -491,7 +491,8 @@ file_size_mb = 4096            # 1 to 1048576, largest file a process writes
 
 - **Profile.** The built-in `command` profile (`tole_core::sandbox::command`):
   the workspace writable, `.git/hooks`, `.git/config` and `.tole` read-only on
-  top of it, the data dir and `$HOME` absent, a private `/proc`, writable
+  top of it and `.git` a mount point that cannot be renamed or removed (next
+  item), the data dir and `$HOME` absent, a private `/proc`, writable
   `/tmp` and scratch (tmpfs, gone with the sandbox), no network unless
   `network = "host"`, and the fixed flags of §5 (`--unshare-all
   --unshare-user --disable-userns --cap-drop ALL --new-session`,
@@ -502,9 +503,27 @@ file_size_mb = 4096            # 1 to 1048576, largest file a process writes
   (`run_command`: its working directory; `job_start`: the workspace root), never
   kept in process state. It is resolved and refused like every grant (`$HOME`,
   an ancestor of it, the data dir, `/`), and then the resolved path is the bind.
-  The protected sub-paths are resolved at launch too: a link is followed, its
-  target is what is bound read-only, and one that leads out of the workspace is
-  not in the view at all.
+  The protected paths are inspected at launch too (see the next item).
+- **Protected paths (#849).** A mount point cannot be renamed or removed
+  (EBUSY), but its ancestor can: with only `.git/hooks` and `.git/config`
+  bound read-only, `mv .git .g && cp -a .g .git` gave the command a plain,
+  writable copy to plant a hook or a `core.fsmonitor` in, which a later `git
+  commit` outside the sandbox ran. So a `.git` directory is bound
+  read-write over itself (objects, index, refs and `git add` / `git commit`
+  keep working), after the workspace and before the read-only binds of
+  `.git/hooks` and `.git/config` (a later mount wins); `.tole` is bound
+  read-only. Moving, removing or replacing `.git`, `.git/hooks`, `.git/config`
+  or `.tole` (rename, `rm`, `rmdir`, rename over them) fails; `git config`
+  writes to the repository config fail by design. A `.git` that is a gitdir
+  FILE (worktree, submodule) is bound read-only itself, so it cannot be
+  swapped for a directory; the directory it points to is not in the sandbox's
+  view unless it is inside the workspace, and then it is not protected. A
+  SYMBOLIC LINK at `.git`, `.git/hooks`, `.git/config` or `.tole` cannot be
+  protected by a mount (the command removes the link and makes a real
+  directory), so the launch is refused (or, for `optional`, follows the
+  fallback policy) with the path in the reason: make it a real path. An
+  earlier version followed such a link and bound its target, which did not stop
+  the replacement.
 - **Program and argv.** The command line is split to argv by the tool as
   before and passed to `bwrap` after `--`; the program is found by bare name
   on the absolute entries of tole's `PATH` (a relative entry would mean
@@ -550,10 +569,13 @@ file_size_mb = 4096            # 1 to 1048576, largest file a process writes
   refused). A grant that touches `$HOME` (marked `REFUSED`, it is never bound)
   or a credential directory (`.ssh`, `.gnupg`, `.aws`, `.azure`, `.kube`,
   `.docker`, `.netrc`, `.config/gcloud`; marked `SENSITIVE`) is flagged on its line.
-- **Residual.** Only what exists at launch is protected: a `.tole` or `.git/hooks`
-  that does not exist yet can be created by the command (bubblewrap cannot bind
-  a path that is not there without creating it in the real workspace), and a
-  nested repository's `.git/hooks` is not covered. A same-user process racing a
+- **Residual.** Only what exists at launch is protected: a `.git`, `.tole` or
+  `.git/hooks` that does not exist yet can be created by the command
+  (bubblewrap cannot bind a path that is not there without creating it in the
+  real workspace; a launch creates nothing there), so a `git init` run inside
+  the sandbox makes a repository whose hooks the owner should review before
+  running git there; and nested repositories and submodules inside the
+  workspace have `.git` directories that are not protected. A same-user process racing a
   path component between resolution and the mount is not stopped (§5). The
   limits are per process, not a cgroup. Toolchain caches (`~/.cargo`, `~/.npm`)
   are not visible; the profile has no `read` extras yet.

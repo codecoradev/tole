@@ -8,8 +8,9 @@
 //! running as before; the types here are shaped so they can join later.
 //!
 //! The `command` profile: the workspace writable, with `.git/hooks`,
-//! `.git/config` and `.tole` read-only on top (code planted there would run
-//! later outside the sandbox), the tole data dir and `$HOME` absent, no
+//! `.git/config` and `.tole` read-only on top and `.git` itself a mount point
+//! that cannot be renamed (code planted there would run later outside the
+//! sandbox), the tole data dir and `$HOME` absent, no
 //! network unless the owner writes `network = "host"`, and the hardening
 //! flags of every sandbox (see [`super::bwrap_args_for`]). The command is
 //! passed to `bwrap` as argv after `--`, never through a shell string.
@@ -177,6 +178,7 @@ pub fn command_profile(network: Network) -> Profile {
         read: Vec::new(),
         write: Vec::new(),
         protect: Vec::new(),
+        anchor: Vec::new(),
     }
 }
 
@@ -229,17 +231,64 @@ fn is_executable(p: &Path) -> bool {
     p.is_file()
 }
 
-/// The protected paths of a RESOLVED workspace that exist and resolve inside
-/// it ([`PROTECTED`], as [`Profile::protect`]). A link is followed, so binding the target keeps it read-only whatever
-/// the link says; one that leads out of the workspace is not in the sandbox's
-/// view at all. A path that does not exist at launch is not protected (see
-/// the design note, residual).
-pub fn protected_paths(ws: &Path) -> Vec<PathBuf> {
-    PROTECTED
-        .iter()
-        .filter_map(|rel| std::fs::canonicalize(ws.join(rel)).ok())
-        .filter(|p| p.starts_with(ws))
-        .collect()
+/// What to mount over a RESOLVED workspace so the paths that run code later
+/// outside the sandbox cannot be changed from inside ([`Profile::anchor`] and
+/// [`Profile::protect`]).
+///
+/// A mount point cannot be renamed or removed, but its ancestor can: with only
+/// `.git/hooks` and `.git/config` bound read-only, `mv .git .g && cp -a .g .git`
+/// gave the command a plain, writable copy that a later `git commit` outside
+/// ran (#849). So a `.git` directory is bound read-write over itself (objects,
+/// index and refs stay writable, `.git` cannot be moved or removed), and
+/// `hooks` and `config` are read-only on top. A `.git` gitdir FILE (worktrees,
+/// submodules) is bound read-only itself, so it cannot be swapped for a
+/// directory; the directory it points to is not in the sandbox's view unless it
+/// is inside the workspace, and then it is not protected. `.tole` is bound
+/// read-only (a mount point, safe as it is).
+///
+/// A symbolic link at any of these places cannot be protected by a mount (the
+/// link is removed and replaced), so it is an error and the launch follows the
+/// consumer's policy: refused when required. A path that does not exist at
+/// launch is not protected (bubblewrap would have to create it in the real
+/// workspace; see the design note, residual).
+pub fn protect_plan(ws: &Path) -> Result<(Vec<PathBuf>, Vec<PathBuf>), String> {
+    use std::fs::symlink_metadata;
+    let (mut anchor, mut protect) = (Vec::new(), Vec::new());
+    let check = |p: &Path| -> Result<Option<std::fs::FileType>, String> {
+        match symlink_metadata(p) {
+            Ok(m) if m.file_type().is_symlink() => Err(format!(
+                "{} is a symbolic link, which a mount cannot protect (the command could replace it); \
+                 make it a real path",
+                p.display()
+            )),
+            Ok(m) => Ok(Some(m.file_type())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("cannot inspect {} ({e})", p.display())),
+        }
+    };
+    let git = ws.join(".git");
+    match check(&git)? {
+        Some(t) if t.is_dir() => {
+            anchor.push(git.clone());
+            for leaf in ["hooks", "config"] {
+                let p = git.join(leaf);
+                if check(&p)?.is_some() {
+                    protect.push(p);
+                }
+            }
+        }
+        Some(_) => protect.push(git),
+        None => {}
+    }
+    let tole = ws.join(".tole");
+    if check(&tole)?.is_some() {
+        protect.push(tole);
+    }
+    // The workspace is resolved, so each of these is already its own resolved
+    // path; keep only what is inside it.
+    anchor.retain(|p| p.starts_with(ws));
+    protect.retain(|p| p.starts_with(ws));
+    Ok((anchor, protect))
 }
 
 fn build(
@@ -283,7 +332,7 @@ fn build(
         }
     }
     let mut profile = command_profile(consumers.network);
-    profile.protect = protected_paths(&ws);
+    (profile.anchor, profile.protect) = protect_plan(&ws).map_err(Fail::Unsandboxable)?;
     Ok(bwrap_args_for(
         &profile,
         Some(&ws),
