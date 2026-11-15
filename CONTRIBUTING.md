@@ -63,6 +63,32 @@ Never merge on schedule or assumption:
 5. CI auto-fix loop: max 3 attempts, then stop and escalate.
 6. Squash-merge, delete the branch, sync `develop`.
 
+## Local review before a PR
+
+The CI Cora Review job takes 12 to 30 minutes on a large diff and can end with
+"could not complete", so findings that arrive late cost a full CI cycle each.
+Get them earlier, on your own machine:
+
+1. `scripts/review-local.sh` reviews `git diff origin/develop...HEAD` (use
+   `--base REF` for another base). It splits the diff by crate or directory
+   into chunks of at most 600 changed lines (`--max-lines N`), runs
+   `cora review` on each chunk and prints only the findings
+   (`--severity` sets the minimum, default `minor`; `--dry-run` prints the
+   chunk plan). Exit `0` = no findings, `2` = findings, `1` = error or no LLM
+   configured (not a pass).
+2. Fix real findings; for a false positive, extend the rule in `.cora.yaml`
+   instead of sprinkling inline ignores.
+3. State the result in the PR **Testing** section. Agent-written PRs must do
+   this; without an LLM key, review through `cora mcp` (`review_prepare` /
+   `review_finalize`).
+4. For a refactor, run `cora callers <symbol>`, `cora impact <symbol>` and
+   `cora affected <files>` first when you move, rename or remove a public item,
+   change a ledger, session, lock or config format, or touch the sandbox,
+   approval, allowlist or secret-redaction paths.
+
+The local run does not replace the CI Cora Review job, which remains the merge
+gate (see Merge gate above).
+
 ## Cora Workflow
 
 Cora (`cora` CLI) is the standard review gate for this repo, wired in at
