@@ -859,7 +859,7 @@ pub fn run_cli(
     // `--sandbox <profile>`: the process policy already carries the profile.
     let sandbox = match tole_core::sandbox::flags::current() {
         Some(tole_core::sandbox::flags::Override::Profile { .. }) => {
-            tole_core::sandbox::policy().or(sandbox)
+            tole_core::sandbox::session_policy().or(sandbox)
         }
         _ => sandbox.filter(|_| !tole_core::sandbox::flags::no_sandbox_active()),
     };

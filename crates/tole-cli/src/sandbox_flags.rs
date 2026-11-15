@@ -14,9 +14,13 @@
 //!   is marked unattended.
 //! - **`--sandbox <profile>` only selects.** The profile must be built in or
 //!   defined in the USER config (a project config cannot define one), it does
-//!   not turn the sandbox on when the mode is `off`, and it never defines or
-//!   loosens a profile. It replaces the profile of every stdio server for the
-//!   run, per-server bindings included.
+//!   not turn the sandbox on when the mode is `off`, and it never defines a
+//!   profile. It replaces the profile of every stdio server for the run,
+//!   per-server bindings included.
+//! - **Only the session's servers.** The flags are an override the core
+//!   applies to this run's stdio MCP servers (`sandbox::session_policy`);
+//!   the configured policy (`sandbox::policy`: first-party names, the
+//!   `plugin add` probe) and the command consumers never see them.
 //!
 //! The startup line and `tole doctor` say when a flag overrode the config
 //! (`tole_core::sandbox::flags::note`).
@@ -52,11 +56,11 @@ pub struct Context {
     pub tty: bool,
 }
 
-/// What an accepted flag changes.
+/// What an accepted flag changes: the override the core applies to this
+/// run's stdio MCP servers (`sandbox::session_policy`). The configured
+/// policy is never rewritten.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Outcome {
-    /// The policy to set, when `--sandbox` replaced the profile.
-    pub policy: Option<Policy>,
     pub over: Override,
 }
 
@@ -113,7 +117,6 @@ pub fn apply(
             ));
         }
         return Ok(Some(Outcome {
-            policy: None,
             over: Override::NoSandbox { configured: mode },
         }));
     }
@@ -129,15 +132,11 @@ pub fn apply(
     let profile = cfg
         .resolve_profile(name)
         .map_err(|e| format!("--sandbox: {e}"))?;
-    let mut policy = base.clone();
-    let configured = std::mem::replace(&mut policy.profile_name, name.to_string());
-    policy.profile = profile;
-    policy.servers.clear();
     Ok(Some(Outcome {
-        policy: Some(policy),
         over: Override::Profile {
             name: name.to_string(),
-            configured,
+            profile,
+            configured: base.profile_name.clone(),
         },
     }))
 }

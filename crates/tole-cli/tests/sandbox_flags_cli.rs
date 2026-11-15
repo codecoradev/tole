@@ -112,6 +112,15 @@ fn the_two_flags_conflict_and_cron_and_sandbox_commands_refuse_them() {
         &["--no-sandbox", "--sandbox", "strict", "doctor"],
     );
     assert!(!o.status.success());
+    // `tole plugin` probes and approves servers: never under a run flag.
+    #[cfg(feature = "mcp")]
+    for flag in [&["--no-sandbox"][..], &["--sandbox", "strict"][..]] {
+        let mut args = flag.to_vec();
+        args.extend(["plugin", "list"]);
+        let o = tole(&b, false, &args);
+        assert!(!o.status.success(), "{}", text(&o));
+        assert!(text(&o).contains("not accepted here"), "{}", text(&o));
+    }
     let o = tole(&b, false, &["--sandbox", "strict", "sandbox", "list"]);
     assert!(text(&o).contains("starts no MCP server"), "{}", text(&o));
 }

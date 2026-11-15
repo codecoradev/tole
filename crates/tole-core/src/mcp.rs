@@ -131,7 +131,7 @@ pub struct McpServerConfig {
 /// workspace bind, and a session can only reach the server started for its
 /// own workspace. Without a sandbox the key is the name, as before.
 pub fn conn_key_for(name: &str, workspace: Option<&std::path::Path>) -> String {
-    let wrapped = crate::sandbox::policy()
+    let wrapped = crate::sandbox::session_policy()
         .is_some_and(|p| p.mode != crate::sandbox::Mode::Off && !p.skip.iter().any(|s| s == name));
     if !wrapped {
         return name.to_string();
@@ -601,7 +601,7 @@ struct McpConnection {
 
 /// How often the reactor looks for idle wrapped servers.
 fn reap_tick() -> Duration {
-    let idle = crate::sandbox::policy().map_or(30, |p| p.idle_secs);
+    let idle = crate::sandbox::session_policy().map_or(30, |p| p.idle_secs);
     Duration::from_secs((idle / 2).clamp(1, 30))
 }
 
@@ -609,7 +609,7 @@ fn reap_tick() -> Duration {
 /// `idle_secs`. Their config and their sessions stay: the next call starts
 /// the server again. Anything else (no sandbox, HTTP, skipped) is untouched.
 fn reap_idle(conns: &mut std::collections::HashMap<String, McpConnection>) {
-    let Some(p) = crate::sandbox::policy() else {
+    let Some(p) = crate::sandbox::session_policy() else {
         return;
     };
     let idle = Duration::from_secs(p.idle_secs);
@@ -870,7 +870,7 @@ async fn start_server(
     // A cap on sandboxed servers (#601): a launch past it is refused, never
     // at the cost of another session's server.
     if cfg.conn_key().contains('@') {
-        let cap = crate::sandbox::policy().map_or(usize::MAX, |p| p.max_servers);
+        let cap = crate::sandbox::session_policy().map_or(usize::MAX, |p| p.max_servers);
         if conns.keys().filter(|k| k.contains('@')).count() >= cap {
             return Err(format!(
                 "mcp {:?}: not started, {cap} sandboxed servers are already running \
@@ -884,7 +884,8 @@ async fn start_server(
             // Sandbox (#601): off unless the owner's user config asks. When
             // on, the server runs as `bwrap <flags> -- <server>`; the ENV-1
             // scrub below then applies to the `bwrap` process itself.
-            let launch = crate::sandbox::launch(&cfg.name, cfg.workspace.as_deref(), command, args);
+            let launch =
+                crate::sandbox::launch_session(&cfg.name, cfg.workspace.as_deref(), command, args);
             // One start-up line per server: sandboxed, unsandboxed, or refused (#809).
             crate::sandbox::report::log_startup_once(&cfg.name, &launch);
             let mut std_cmd = match launch {

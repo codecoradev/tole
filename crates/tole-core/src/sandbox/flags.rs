@@ -1,17 +1,18 @@
 //! What a `--sandbox <profile>` or `--no-sandbox` flag changed for this run
 //! (#750, design section 6).
 //!
-//! The host (the CLI) decides whether a flag may be honoured and applies a
-//! profile override to the [`super::Policy`] it sets. This module keeps the
-//! two facts every other part needs: the note that says a flag overrode the
-//! config (startup log, `tole doctor`), and the `--no-sandbox` switch that
-//! [`super::policy`] consults. That switch is deliberately not part of the
-//! stored policy: [`super::policy`] ignores it once the process is marked
-//! unattended, so even a flag that slipped through a host check can never
-//! turn the sandbox off for a cron job, a `tole serve` session or any other
-//! run without a human.
+//! The host (the CLI) decides whether a flag may be honoured and records
+//! the override here. The configured [`super::policy`] is never changed by
+//! a flag: the owner's config is what trust and approval decisions read
+//! (first-party names, the `plugin add` probe, the command consumers). Only
+//! [`super::session_policy`], what this run's stdio MCP servers start under,
+//! applies the override, and it ignores `--no-sandbox` once the process is
+//! marked unattended, so even a flag that slipped through a host check can
+//! never turn the sandbox off for a cron job, a `tole serve` session or any
+//! other run without a human. The note says a flag overrode the config
+//! (startup log, `tole doctor`).
 
-use super::{unattended, Mode};
+use super::{unattended, Mode, Policy, Profile};
 use std::sync::OnceLock;
 
 /// A per-run flag override, set at most once per process.
@@ -21,7 +22,11 @@ pub enum Override {
     NoSandbox { configured: Mode },
     /// `--sandbox <profile>`: `name` replaced `configured` as the profile
     /// of every stdio server for this run.
-    Profile { name: String, configured: String },
+    Profile {
+        name: String,
+        profile: Profile,
+        configured: String,
+    },
 }
 
 static OVERRIDE: OnceLock<Override> = OnceLock::new();
@@ -39,6 +44,23 @@ pub fn set(o: Override) -> Result<(), String> {
 /// The recorded override, if any.
 pub fn current() -> Option<Override> {
     OVERRIDE.get().cloned()
+}
+
+/// The configured policy `p` as THIS RUN's stdio MCP servers see it
+/// ([`super::session_policy`]): `--no-sandbox` (attended only) reads as no
+/// policy, `--sandbox <p>` replaces the profile of every server. Nothing
+/// else reads this: the configured policy stays what the owner wrote.
+pub fn apply(p: Option<Policy>) -> Option<Policy> {
+    match OVERRIDE.get() {
+        Some(Override::NoSandbox { .. }) if !unattended() => None,
+        Some(Override::Profile { name, profile, .. }) => p.map(|mut p| {
+            p.profile_name = name.clone();
+            p.profile = profile.clone();
+            p.servers.clear();
+            p
+        }),
+        _ => p,
+    }
 }
 
 /// True while `--no-sandbox` is in force: set, and the run is attended.
@@ -67,7 +89,9 @@ pub fn note() -> Option<String> {
              start unsandboxed",
             mode_word(*configured)
         ),
-        Override::Profile { name, configured } => format!(
+        Override::Profile {
+            name, configured, ..
+        } => format!(
             "sandbox: --sandbox {name} overrides the config (profile {configured}) for every \
              stdio MCP server in this run"
         ),

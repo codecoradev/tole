@@ -127,12 +127,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # iOS is off for now: the macos-14 runner is not available to
-          # this repository ("configuration macos-14-arm64-us-default is not
-          # supported"), so the job was cancelled on every run. Re-enable
-          # when an Apple runner is available.
-          # - os: macos-14
-          #   target: aarch64-apple-ios
+          # iOS: macos-14 is not served to this repository (the job was
+          # cancelled before getting a runner, #566); macos-latest is, as
+          # the OS Check job above shows. Check-only, no link, no device.
+          - os: macos-latest
+            target: aarch64-apple-ios
           - os: ubuntu-latest
             target: aarch64-linux-android
     steps:
