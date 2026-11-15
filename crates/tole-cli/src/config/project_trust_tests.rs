@@ -1,25 +1,42 @@
 use super::*;
-use std::sync::atomic::{AtomicU64, Ordering};
+use crate::test_dir::TestDir;
 use std::sync::Mutex;
 
-static COUNTER: AtomicU64 = AtomicU64::new(0);
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-fn tmpdir() -> PathBuf {
-    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let d = std::env::temp_dir().join(format!("tole-trust-{}-{n}", std::process::id()));
-    std::fs::create_dir_all(&d).unwrap();
-    d.canonicalize().unwrap()
+fn tmpdir() -> TestDir {
+    TestDir::new("tole-trust")
 }
 
 /// A project dir with `.tole/config.toml` = `content`, plus a store path
 /// (not yet created) in a separate dir.
-fn project(content: &str) -> (PathBuf, PathBuf) {
+fn project(content: &str) -> (TestDir, StorePath) {
     let d = tmpdir();
     std::fs::create_dir_all(d.join(".tole")).unwrap();
     std::fs::write(d.join(CONFIG_REL_PATH), content).unwrap();
-    let store = tmpdir().join("home").join("tole").join(STORE_FILE);
-    (d, store)
+    let home = tmpdir();
+    let path = home.join("home").join("tole").join(STORE_FILE);
+    (d, StorePath { _home: home, path })
+}
+
+/// A store path (a file of the pending `home` dir) that keeps its directory
+/// alive for the test.
+struct StorePath {
+    _home: TestDir,
+    path: PathBuf,
+}
+
+impl AsRef<Path> for StorePath {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl std::ops::Deref for StorePath {
+    type Target = PathBuf;
+    fn deref(&self) -> &PathBuf {
+        &self.path
+    }
 }
 
 fn write_cfg(dir: &Path, content: &str) {
@@ -362,7 +379,8 @@ fn prompt_text_escapes_content_path_and_diff() {
     let base = tmpdir();
     let dir = base.join("p\u{1b}[2J\u{202e}x");
     std::fs::create_dir_all(dir.join(".tole")).unwrap();
-    let sp = tmpdir().join(STORE_FILE);
+    let sp_home = tmpdir();
+    let sp = sp_home.join(STORE_FILE);
     let old = "model = \"a\"\n";
     let new = "# \u{1b}[2J\r\u{202e}\u{2028}\0\nmodel = \"b\"\u{200b}\n";
     std::fs::write(dir.join(CONFIG_REL_PATH), new).unwrap();
@@ -463,7 +481,8 @@ fn trust_cmd_tty_no_refuses() {
 #[test]
 fn trust_cmd_missing_default_file_errors() {
     let d = tmpdir();
-    let sp = tmpdir().join(STORE_FILE);
+    let sp_home = tmpdir();
+    let sp = sp_home.join(STORE_FILE);
     assert!(trust_cmd(&d, None, true, &sp, &mut Fake::new(true, None)).is_err());
 }
 

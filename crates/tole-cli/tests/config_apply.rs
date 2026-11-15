@@ -3,29 +3,16 @@
 //! keys' precedence and the "no config => nothing changes" invariant.
 //! `CODECORA_HOME` (and every provider variable) is set on the CHILD only.
 
+mod common;
+use common::TestDir;
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-fn tmpdir() -> PathBuf {
-    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    // A pid is reused and these directories are never removed, so a stale
-    // one of an earlier run (a trusted project, a populated home) can carry
-    // the same pid and counter: the clock makes the name unique (#702).
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    let d = std::env::temp_dir().join(format!(
-        "tole-apply-e2e-{}-{n}-{stamp:x}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&d).unwrap();
-    d.canonicalize().unwrap()
+fn tmpdir() -> TestDir {
+    TestDir::new("tole-apply-e2e")
 }
 
 const SCRUBBED: [&str; 13] = [
@@ -66,7 +53,7 @@ fn text(b: &[u8]) -> String {
 }
 
 /// A project dir with `.tole/config.toml` = `content`, and a fresh home.
-fn project(content: &str) -> (PathBuf, PathBuf) {
+fn project(content: &str) -> (TestDir, TestDir) {
     let d = tmpdir();
     std::fs::create_dir_all(d.join(".tole")).unwrap();
     std::fs::write(d.join(".tole/config.toml"), content).unwrap();
@@ -515,7 +502,7 @@ fn config_check_shows_effective_values_and_sources() {
 // ------------------------------------------------------- user config (#433)
 
 /// A home whose user config (`<home>/tole/config.toml`) is `content`.
-fn user_home(content: &str) -> PathBuf {
+fn user_home(content: &str) -> TestDir {
     let home = tmpdir();
     std::fs::create_dir_all(home.join("tole")).unwrap();
     std::fs::write(home.join("tole/config.toml"), content).unwrap();

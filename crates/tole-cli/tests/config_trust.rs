@@ -3,17 +3,13 @@
 //! environment is never touched. Stdin is null and stdout/stderr are
 //! pipes, so the child is non-interactive.
 
-use std::path::{Path, PathBuf};
+mod common;
+use common::TestDir;
+use std::path::Path;
 use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-fn tmpdir() -> PathBuf {
-    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let d = std::env::temp_dir().join(format!("tole-trust-e2e-{}-{n}", std::process::id()));
-    std::fs::create_dir_all(&d).unwrap();
-    d
+fn tmpdir() -> TestDir {
+    TestDir::new("tole-trust-e2e")
 }
 
 fn tole(cwd: &Path, home: &Path, args: &[&str]) -> Output {
@@ -31,7 +27,7 @@ fn text(b: &[u8]) -> String {
     String::from_utf8_lossy(b).to_string()
 }
 
-fn project(content: &str) -> (PathBuf, PathBuf) {
+fn project(content: &str) -> (TestDir, TestDir) {
     let d = tmpdir();
     std::fs::create_dir_all(d.join(".tole")).unwrap();
     std::fs::write(d.join(".tole/config.toml"), content).unwrap();

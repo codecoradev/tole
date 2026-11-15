@@ -1,15 +1,10 @@
 use super::*;
 use crate::config::CONFIG_REL_PATH;
+use crate::test_dir::TestDir;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-fn tmpdir() -> PathBuf {
-    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let d = std::env::temp_dir().join(format!("tole-apply-{}-{n}", std::process::id()));
-    std::fs::create_dir_all(&d).unwrap();
-    d.canonicalize().unwrap()
+fn tmpdir() -> TestDir {
+    TestDir::new("tole-apply")
 }
 
 fn s(v: &str) -> Option<String> {
@@ -724,15 +719,15 @@ impl ConfigTrustIo for Fake {
     }
 }
 
-fn project(content: &str) -> (PathBuf, PathBuf) {
+fn project(content: &str) -> (TestDir, TestDir) {
     let d = tmpdir();
     std::fs::create_dir_all(d.join(".tole")).unwrap();
     std::fs::write(d.join(CONFIG_REL_PATH), content).unwrap();
-    let store = tmpdir()
-        .join("home")
-        .join("tole")
-        .join("trusted-configs.json");
-    (d, store)
+    (d, tmpdir())
+}
+
+fn store_of(home: &Path) -> PathBuf {
+    home.join("home").join("tole").join("trusted-configs.json")
 }
 
 fn no_store() -> Result<PathBuf> {
@@ -751,7 +746,8 @@ fn no_config_is_a_silent_noop_and_never_resolves_the_store() {
 
 #[test]
 fn untrusted_non_interactive_fails_closed_with_the_instruction() {
-    let (d, store) = project("model = \"m\"\n");
+    let (d, home) = project("model = \"m\"\n");
+    let store = store_of(&home);
     let mut io = Fake::new(false, true);
     let e = load_project_config(&d, None, &|| Ok(store.clone()), &mut io).unwrap_err();
     let msg = format!("{e:#}");
@@ -763,7 +759,8 @@ fn untrusted_non_interactive_fails_closed_with_the_instruction() {
 
 #[test]
 fn trusted_config_loads_and_prints_one_using_line() {
-    let (d, store) = project("model = \"m\"\n");
+    let (d, home) = project("model = \"m\"\n");
+    let store = store_of(&home);
     crate::config_trust::record(&store, &d, "model = \"m\"\n").unwrap();
     let mut io = Fake::new(false, false);
     let l = load_project_config(&d, None, &|| Ok(store.clone()), &mut io)
@@ -792,7 +789,8 @@ fn explicit_config_needs_no_store() {
 
 #[test]
 fn changed_file_fails_closed_again() {
-    let (d, store) = project("model = \"m\"\n");
+    let (d, home) = project("model = \"m\"\n");
+    let store = store_of(&home);
     crate::config_trust::record(&store, &d, "model = \"m\"\n").unwrap();
     std::fs::write(d.join(CONFIG_REL_PATH), "model = \"evil\"\n").unwrap();
     let mut io = Fake::new(false, false);
@@ -801,7 +799,8 @@ fn changed_file_fails_closed_again() {
 
 #[test]
 fn invalid_trusted_content_is_a_parse_error() {
-    let (d, store) = project("modle = \"m\"\n");
+    let (d, home) = project("modle = \"m\"\n");
+    let store = store_of(&home);
     crate::config_trust::record(&store, &d, "modle = \"m\"\n").unwrap();
     let mut io = Fake::new(false, false);
     let e = load_project_config(&d, None, &|| Ok(store.clone()), &mut io).unwrap_err();
@@ -811,7 +810,8 @@ fn invalid_trusted_content_is_a_parse_error() {
 
 #[test]
 fn interactive_yes_persists_and_loads() {
-    let (d, store) = project("model = \"m\"\n");
+    let (d, home) = project("model = \"m\"\n");
+    let store = store_of(&home);
     let mut io = Fake::new(true, true);
     let l = load_project_config(&d, None, &|| Ok(store.clone()), &mut io).unwrap();
     assert!(l.is_some());
@@ -1327,8 +1327,6 @@ fn config_check_shows_the_effective_theme_and_ignores_a_project_theme() {
         out.contains("not validated") && !out.contains("INVALID"),
         "{out}"
     );
-    let _ = std::fs::remove_dir_all(dir);
-    let _ = std::fs::remove_dir_all(user);
 }
 
 #[test]
@@ -1349,7 +1347,6 @@ fn config_check_shows_effective_effort_and_source() {
         out.contains("reasoning_effort = \"medium\"  [config]  effective: \"low\"  (env TOLE_REASONING_EFFORT)"),
         "{out}"
     );
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 // -------------------------------------------------------- tui keys (#463)
@@ -1470,8 +1467,6 @@ fn config_check_shows_keys_ignores_a_project_table_and_flags_a_bad_one() {
         out.contains("not validated") && !out.contains("INVALID"),
         "{out}"
     );
-    let _ = std::fs::remove_dir_all(dir);
-    let _ = std::fs::remove_dir_all(user);
 }
 
 // ------------------------------------------- discussion timeout (#786)

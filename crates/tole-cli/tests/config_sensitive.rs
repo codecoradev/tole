@@ -9,22 +9,18 @@
 //! private directory plus `/usr/bin:/bin` (no `cora` auto-preset unless a
 //! test installs a fake one).
 
+mod common;
+use common::TestDir;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-fn tmpdir() -> PathBuf {
-    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let d = std::env::temp_dir().join(format!("tole-sens-e2e-{}-{n}", std::process::id()));
-    std::fs::create_dir_all(&d).unwrap();
-    d.canonicalize().unwrap()
+fn tmpdir() -> TestDir {
+    TestDir::new("tole-sens-e2e")
 }
 
 const SCRUBBED: [&str; 12] = [
@@ -49,7 +45,7 @@ fn text(b: &[u8]) -> String {
 /// [`project_raw`], minus the `no_auto_mcp` line in a build without the
 /// `mcp` feature (there the key is a startup error, tested separately):
 /// lets the same scenario run in every feature profile.
-fn project(content: &str) -> (PathBuf, PathBuf) {
+fn project(content: &str) -> (TestDir, TestDir) {
     if cfg!(feature = "mcp") {
         project_raw(content)
     } else {
@@ -59,7 +55,7 @@ fn project(content: &str) -> (PathBuf, PathBuf) {
 
 /// A project dir with `.tole/config.toml` = `content`, a fresh home, and the
 /// config already trusted.
-fn project_raw(content: &str) -> (PathBuf, PathBuf) {
+fn project_raw(content: &str) -> (TestDir, TestDir) {
     let d = tmpdir();
     std::fs::create_dir_all(d.join(".tole")).unwrap();
     std::fs::write(d.join(".tole/config.toml"), content).unwrap();
@@ -635,7 +631,7 @@ fn no_auto_mcp_from_config_suppresses_the_cora_preset() {
 
 // ------------------------------------------------------- skill / no_skills
 
-fn skill_project(config: &str) -> (PathBuf, PathBuf) {
+fn skill_project(config: &str) -> (TestDir, TestDir) {
     let (d, home) = project(config);
     std::fs::create_dir_all(d.join("skills/demo")).unwrap();
     std::fs::write(
