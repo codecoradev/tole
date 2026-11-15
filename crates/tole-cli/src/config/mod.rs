@@ -155,6 +155,10 @@ pub struct SandboxConfig {
     /// Seconds a sandboxed server may sit unused before it is stopped,
     /// 1 to 86400 (default 900); it restarts on its next call.
     pub idle_secs: Option<u64>,
+    /// Lazy start (#750, default off): a locked, sandboxed stdio server
+    /// whose approval stored a complete tool snapshot registers its tools
+    /// from it and starts on its first call, after the same lock checks.
+    pub lazy_start: Option<bool>,
     /// The sandbox of the commands a model makes the host run (#748).
     pub consumers: Option<SandboxConsumersConfig>,
     /// Named profiles beyond the built-in `server` and `strict` (#810).
@@ -2100,6 +2104,15 @@ verify_timeout = 60
         let c = parse("[sandbox]\nmax_servers = 4\nidle_secs = 60\n", &p()).unwrap();
         let pol = c.sandbox.unwrap().policy().unwrap();
         assert_eq!((pol.max_servers, pol.idle_secs), (4, 60));
+        // Lazy start (#750): off unless the user config says so; a project
+        // config cannot turn it on (the whole table is user-layer only).
+        let off = parse("[sandbox]\nmode = \"off\"\n", &p()).unwrap();
+        assert_eq!(off.sandbox.as_ref().unwrap().lazy_start, None);
+        let on = parse("[sandbox]\nlazy_start = true\n", &p()).unwrap();
+        assert_eq!(on.sandbox.as_ref().unwrap().lazy_start, Some(true));
+        assert!(parse("[sandbox]\nlazy_start = \"yes\"\n", &p()).is_err());
+        let layered = layered(&on, &parse("model = \"m\"\n", &p()).unwrap());
+        assert_eq!(layered.sandbox.and_then(|s| s.lazy_start), None);
         for bad in [
             "max_servers = 0",
             "max_servers = 65",

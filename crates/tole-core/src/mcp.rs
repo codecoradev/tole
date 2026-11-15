@@ -26,9 +26,11 @@
 //! thread; native code talks to it over an mpsc channel with a
 //! hard timeout (the same discipline as run_with_timeout).
 
+mod lazy;
 mod probe;
 use crate::subprocess::SUBPROCESS_TIMEOUT;
 use crate::tool::{Risk, Tool};
+pub use lazy::{lazy_tools, register_server_tools_lazy, LazyGuard, LazyServer};
 pub use probe::{probe_manifest, probe_manifest_within};
 use serde_json::{json, Value};
 use std::sync::mpsc;
@@ -56,6 +58,9 @@ enum McpRequest {
         args: Value,
         resp: mpsc::Sender<Result<String, String>>,
     },
+    /// Stops the connection of `key` (kills its process); its config and
+    /// claims stay (#750: a lazily started server the lock refused).
+    Stop { key: String },
     /// Probe-first discovery of prompts/resources (#213).
     Probe {
         config: McpServerConfig,
@@ -555,6 +560,9 @@ fn runtime() -> mpsc::Sender<McpRequest> {
                                         configs.remove(&key);
                                     }
                                 }
+                                McpRequest::Stop { key } => {
+                                    conns.remove(&key);
+                                }
                                 McpRequest::Count { resp } => {
                                     let _ = resp.send(conns.len());
                                 }
@@ -1023,6 +1031,9 @@ pub struct McpTool {
     /// Known secrets redacted from the arguments before they are sent to
     /// the server (#595). Empty by default.
     secrets: crate::secrets::SecretSet,
+    /// A lazily registered server (#750): its first call starts it and runs
+    /// the lock checks; no call reaches the server before they pass.
+    lazy: Option<std::sync::Arc<LazyServer>>,
 }
 
 impl McpTool {
@@ -1034,7 +1045,14 @@ impl McpTool {
             server_tool,
             description,
             secrets: crate::secrets::SecretSet::default(),
+            lazy: None,
         }
+    }
+
+    /// Marks this tool as one of a lazily registered server (#750).
+    pub(crate) fn with_lazy(mut self, lazy: std::sync::Arc<LazyServer>) -> Self {
+        self.lazy = Some(lazy);
+        self
     }
 
     /// Calls go to the connection `key` (a sandboxed server of this
@@ -1124,6 +1142,11 @@ impl Tool for McpTool {
     }
 
     fn execute(&self, input: Value) -> Result<Value, String> {
+        // #750: a lazy server starts here, after the same checks an eager
+        // start runs; a refusal never reaches the server.
+        if let Some(lazy) = &self.lazy {
+            lazy.ensure()?;
+        }
         // #595: a server never receives a known secret value, whatever the
         // model put in the arguments.
         let args = self
@@ -1370,6 +1393,59 @@ pub fn list_manifest(cfg: &McpServerConfig) -> Result<Listed, String> {
 pub type Admit<'a> =
     &'a dyn Fn(&str, &str, &[crate::plugin_lock::ManifestTool]) -> Result<(), String>;
 
+/// Registers `tools` (server-side name, description) of `cfg` into `reg`,
+/// capped per server, and returns the registry-facing names. Shared by the
+/// eager path (live manifest) and the lazy one (locked snapshot, #750).
+pub(crate) fn register_tools(
+    reg: &mut crate::tool::ToolRegistry,
+    cfg: &McpServerConfig,
+    secrets: &crate::secrets::SecretSet,
+    tools: impl IntoIterator<Item = (String, String)>,
+    lazy: Option<&std::sync::Arc<LazyServer>>,
+) -> Vec<String> {
+    let mut registered = Vec::new();
+    // Cap registered tools per server: a hostile/buggy server
+    // must not flood the registry (and provider tool specs).
+    const MAX_TOOLS_PER_SERVER: usize = 64;
+    for (server_tool, description) in tools.into_iter().take(MAX_TOOLS_PER_SERVER) {
+        // Sanitize the registry-facing name (CodeCora): provider
+        // APIs enforce ^[a-zA-Z0-9_-]{1,64}$ on function names —
+        // one bad server name must not break every completion.
+        let sanitized: String = server_tool
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let mut mcp_name = format!("mcp_{}_{}", cfg.name, sanitized);
+        mcp_name.truncate(64);
+        let mut tool = McpTool::new(
+            cfg.name.clone(),
+            mcp_name.clone(),
+            server_tool.clone(),
+            description,
+        )
+        .with_secrets(secrets)
+        .with_key(cfg.conn_key());
+        if let Some(l) = lazy {
+            tool = tool.with_lazy(std::sync::Arc::clone(l));
+        }
+        if reg.register(Box::new(tool)).is_ok() {
+            registered.push(mcp_name);
+        } else {
+            eprintln!(
+                "tole: mcp[{}]: tool {:?} could not register (name collision?)",
+                cfg.name, server_tool
+            );
+        }
+    }
+    registered
+}
+
 /// Register tools from `cfg` into `reg`. Startup-degrading: any failure
 /// is a warning, never an error (same contract as the uteke probe).
 /// Returns the names registered (empty on failure). Every tool redacts
@@ -1400,46 +1476,7 @@ pub fn register_server_tools(
                 reg.hold(l);
             }
             let tools = manifest.into_iter().map(|t| (t.name, t.description));
-            // Cap registered tools per server: a hostile/buggy server
-            // must not flood the registry (and provider tool specs).
-            const MAX_TOOLS_PER_SERVER: usize = 64;
-            for (server_tool, description) in tools.into_iter().take(MAX_TOOLS_PER_SERVER) {
-                // Sanitize the registry-facing name (CodeCora): provider
-                // APIs enforce ^[a-zA-Z0-9_-]{1,64}$ on function names —
-                // one bad server name must not break every completion.
-                let sanitized: String = server_tool
-                    .chars()
-                    .map(|c| {
-                        if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                            c
-                        } else {
-                            '_'
-                        }
-                    })
-                    .collect();
-                let mut mcp_name = format!("mcp_{}_{}", cfg.name, sanitized);
-                mcp_name.truncate(64);
-                if reg
-                    .register(Box::new(
-                        McpTool::new(
-                            cfg.name.clone(),
-                            mcp_name.clone(),
-                            server_tool.clone(),
-                            description,
-                        )
-                        .with_secrets(secrets)
-                        .with_key(cfg.conn_key()),
-                    ))
-                    .is_ok()
-                {
-                    registered.push(mcp_name);
-                } else {
-                    eprintln!(
-                        "tole: mcp[{}]: tool {:?} could not register (name collision?)",
-                        cfg.name, server_tool
-                    );
-                }
-            }
+            registered = register_tools(reg, cfg, secrets, tools, None);
             eprintln!(
                 "tole: mcp[{}]: {} tool(s) registered in {:?}",
                 cfg.name,
