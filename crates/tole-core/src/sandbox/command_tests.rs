@@ -545,7 +545,7 @@ fn off_is_the_unchanged_direct_path_whatever_the_backend() {
     let direct = CommandLaunch::Direct { warning: None };
     for avail in [usable(), gone()] {
         for unattended in [false, true] {
-            for k in [Consumer::RunCommand, Consumer::JobStart] {
+            for k in Consumer::ALL {
                 assert_eq!(plan(&Consumers::default(), &avail, unattended, k), direct);
             }
         }
@@ -752,7 +752,10 @@ fn limits_are_bounded() {
 #[test]
 fn the_default_consumers_are_all_off_with_no_network() {
     let c = Consumers::default();
-    assert_eq!((c.run_command, c.job_start), (Mode::Off, Mode::Off));
+    assert_eq!(
+        (c.run_command, c.job_start, c.verify),
+        (Mode::Off, Mode::Off, Mode::Off)
+    );
     assert_eq!(c.network, Network::None);
     assert_eq!(consumers(), c, "nothing set: everything off");
 }
@@ -761,9 +764,14 @@ fn the_default_consumers_are_all_off_with_no_network() {
 fn doctor_says_what_is_there_and_that_off_is_off() {
     let off = doctor_lines(&Consumers::default(), &usable());
     assert!(off[0].contains("run_command off, job_start off"), "{off:?}");
-    assert!(off
-        .iter()
-        .any(|l| l.contains("verify") && l.contains("not sandboxed yet")));
+    assert!(off[0].contains("verify off"), "{off:?}");
+    // Only what is still not a consumer is called unsandboxed.
+    let last = off.last().unwrap();
+    assert!(
+        last.contains("turnend, cron scripts and deliveries are not sandboxed yet")
+            && !last.contains("verify"),
+        "{off:?}"
+    );
     assert!(!off.iter().any(|l| l.contains("ERROR")));
 
     let mut c = on(Mode::Required, Mode::Optional);
@@ -790,6 +798,224 @@ fn doctor_says_what_is_there_and_that_off_is_off() {
     // Off consumers never report an error.
     let l = doctor_lines(&on(Mode::Off, Mode::Off), &gone());
     assert!(!l.iter().any(|x| x.contains("ERROR")));
+}
+
+// Slice 2 (#748): the mission `--verify` command.
+
+fn all(mode: Mode) -> Consumers {
+    Consumers {
+        run_command: mode,
+        job_start: mode,
+        verify: mode,
+        ..Consumers::default()
+    }
+}
+
+#[test]
+fn consumer_names_are_the_config_and_secrets_keys() {
+    let names: Vec<_> = Consumer::ALL.iter().map(|k| k.name()).collect();
+    assert_eq!(names, ["run_command", "job_start", "verify"]);
+    assert_eq!(Consumer::Verify.name(), crate::secret_release::VERIFY);
+}
+
+#[test]
+fn verify_has_its_own_mode() {
+    let c = Consumers {
+        verify: Mode::Required,
+        ..Consumers::default()
+    };
+    for k in Consumer::ALL {
+        let want = if k == Consumer::Verify {
+            Mode::Required
+        } else {
+            Mode::Off
+        };
+        assert_eq!(c.mode(k), want, "{k:?}");
+    }
+    assert!(matches!(
+        plan(&c, &usable(), false, Consumer::Verify),
+        CommandLaunch::Sandboxed { .. }
+    ));
+    assert_eq!(
+        plan(&c, &usable(), false, Consumer::RunCommand),
+        CommandLaunch::Direct { warning: None },
+        "run_command stays off while verify is on"
+    );
+}
+
+/// Every hardening flag of the command profile is on for verify too: the
+/// same argv as a `run_command` of that program.
+#[test]
+fn verify_gets_the_same_hardening_as_run_command() {
+    let ws = tmp("slice2-flags");
+    let c = all(Mode::Required);
+    let base = argv(&c, Consumer::RunCommand, &env_in(&ws), &sh_args());
+    let a = argv(&c, Consumer::Verify, &env_in(&ws), &sh_args());
+    assert_eq!(a, base, "one profile for every command");
+    for flag in [
+        "--unshare-all",
+        "--unshare-user",
+        "--disable-userns",
+        "--new-session",
+        "--die-with-parent",
+    ] {
+        assert!(a.contains(&flag.to_string()), "{flag}");
+    }
+    assert!(has(&a, &["--cap-drop", "ALL"]));
+    assert!(!a.contains(&"--share-net".to_string()), "no network");
+    let w = ws.display().to_string();
+    assert!(has(&a, &["--bind", &w, &w]), "writable workspace");
+}
+
+#[test]
+fn verify_protects_hooks_config_and_tole_dir() {
+    let ws = tmp("slice2-protect");
+    for d in [".git/hooks", ".tole"] {
+        std::fs::create_dir_all(ws.join(d)).unwrap();
+    }
+    std::fs::write(ws.join(".git/config"), "[core]\n").unwrap();
+    let ws = std::fs::canonicalize(&*ws).unwrap();
+    let a = argv(
+        &all(Mode::Required),
+        Consumer::Verify,
+        &env_in(&ws),
+        &sh_args(),
+    );
+    for rel in PROTECTED {
+        let p = ws.join(rel).display().to_string();
+        assert!(has(&a, &["--ro-bind", &p, &p]), "{rel} read-only");
+    }
+}
+
+#[test]
+fn the_verify_command_is_sh_dash_c_with_the_string_as_one_argument() {
+    let ws = tmp("slice2-verify");
+    let line = "test -f x && echo 'a b' ; rm -rf $HOME";
+    let a = argv(
+        &all(Mode::Required),
+        Consumer::Verify,
+        &env_in(&ws),
+        &["-c".into(), line.into()],
+    );
+    let n = a.len();
+    assert_eq!(&a[n - 2..], ["-c", line], "the string is one argv element");
+    assert!(a[n - 3].ends_with("/sh"), "{a:?}");
+    assert_eq!(a[n - 4], "--", "after the separator");
+}
+
+#[test]
+fn a_mission_is_unattended_so_optional_verify_is_required() {
+    assert!(Consumer::Verify.always_unattended());
+    for k in [Consumer::RunCommand, Consumer::JobStart] {
+        assert!(
+            !k.always_unattended(),
+            "{k:?}: only verify runs in a mission"
+        );
+    }
+    // `launch_command` passes `true` for verify, and then a missing sandbox
+    // refuses even for `optional`.
+    let c = all(Mode::Optional);
+    let CommandLaunch::Refused(why) = plan(&c, &gone(), true, Consumer::Verify) else {
+        panic!("optional verify without a sandbox must refuse")
+    };
+    assert!(
+        why.starts_with("verify: ") && why.contains("unattended"),
+        "{why}"
+    );
+}
+
+#[test]
+fn required_verify_without_a_backend_refuses_naming_the_key() {
+    let c = all(Mode::Required);
+    for unattended in [false, true] {
+        let CommandLaunch::Refused(why) = plan(&c, &gone(), unattended, Consumer::Verify) else {
+            panic!("must refuse")
+        };
+        assert!(why.contains("sandbox.consumers.verify"), "{why}");
+        assert!(
+            why.contains("no bwrap") && why.contains("install bubblewrap"),
+            "{why}"
+        );
+    }
+}
+
+#[test]
+fn doctor_lists_verify_and_fails_for_it_without_a_sandbox() {
+    let mut c = Consumers {
+        verify: Mode::Required,
+        ..Consumers::default()
+    };
+    let l = doctor_lines(&c, &usable());
+    assert!(l[0].contains("verify required"), "{l:?}");
+    assert!(!l.iter().any(|x| x.contains("ERROR")), "{l:?}");
+    let l = doctor_lines(&c, &gone());
+    assert!(
+        l.iter()
+            .any(|x| x.starts_with("sandbox consumers: ERROR verify")
+                && x.contains("refused (required)")),
+        "{l:?}"
+    );
+    // An optional verify cannot fall back: a mission is unattended.
+    c.verify = Mode::Optional;
+    let l = doctor_lines(&c, &gone());
+    assert!(
+        l.iter()
+            .any(|x| x.starts_with("sandbox consumers: ERROR verify") && x.contains("mission")),
+        "{l:?}"
+    );
+}
+
+/// The launcher report has an exit code only when the command itself ended
+/// (`child-pid` is written before the mounts are made, so it says nothing).
+#[cfg(target_os = "linux")]
+#[test]
+fn the_launcher_report_has_an_exit_code_only_when_the_command_ended() {
+    let started = r#"{ "child-pid": 5644, "pid-namespace": 4026532268 }"#;
+    assert_eq!(exit_code_of(started), None, "started is not ended");
+    let ended = format!("{started}\n{{ \"exit-code\": 7 }}\n");
+    assert_eq!(exit_code_of(&ended), Some(7));
+    assert_eq!(exit_code_of("{ \"exit-code\": 0 }"), Some(0));
+    for junk in [
+        "",
+        "bwrap: Can't find source path /x",
+        "{ \"exit-code\": \"x\" }",
+    ] {
+        assert_eq!(exit_code_of(junk), None, "{junk:?}");
+    }
+}
+
+#[test]
+fn doctor_warns_when_verify_needs_a_toolchain_the_sandbox_cannot_see() {
+    let home = tmp("toolchain-home");
+    let c = Consumers {
+        verify: Mode::Required,
+        ..Consumers::default()
+    };
+    let lines = |h: Option<&Path>| doctor_lines_for(&c, &usable(), h);
+    // No toolchain dir: no warning, but the plain note about deterministic
+    // failures stays (network, address space).
+    let l = lines(Some(&home));
+    assert!(!l.iter().any(|x| x.contains("WARNING verify")), "{l:?}");
+    assert!(
+        l.iter()
+            .any(|x| x.contains("fail deterministically") && x.contains("network")),
+        "{l:?}"
+    );
+    std::fs::create_dir_all(home.join(".cargo/bin")).unwrap();
+    std::fs::create_dir_all(home.join(".rustup")).unwrap();
+    let l = lines(Some(&home));
+    let w = l
+        .iter()
+        .find(|x| x.starts_with("sandbox consumers: WARNING verify"))
+        .unwrap_or_else(|| panic!("{l:?}"));
+    assert!(
+        w.contains(".cargo/bin") && w.contains(".rustup") && w.contains("three strikes"),
+        "{w}"
+    );
+    assert!(!l.iter().any(|x| x.contains("ERROR")), "a warning only");
+    // Verify off: nothing to say about it.
+    let off = doctor_lines_for(&Consumers::default(), &usable(), Some(&home));
+    assert!(!off.iter().any(|x| x.contains("WARNING verify")), "{off:?}");
 }
 
 // Nested gitdirs (#849 follow-up): what the plan names, and what it refuses.

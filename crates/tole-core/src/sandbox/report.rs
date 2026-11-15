@@ -173,7 +173,7 @@ pub fn doctor_grant_lines(
             out.extend(d.iter().map(|d| format!("{label}: {}", decision_text(d))));
         }
     }
-    for k in [Consumer::RunCommand, Consumer::JobStart] {
+    for k in Consumer::ALL {
         let mode = consumers.mode(k);
         if mode == Mode::Off {
             continue;
@@ -186,7 +186,8 @@ pub fn doctor_grant_lines(
             super::command::PROTECTED.join(", ")
         ));
         out.extend(
-            decide(mode, avail, unattended).map(|d| format!("{label}: {}", decision_text(&d))),
+            decide(mode, avail, unattended || k.always_unattended())
+                .map(|d| format!("{label}: {}", decision_text(&d))),
         );
     }
     out

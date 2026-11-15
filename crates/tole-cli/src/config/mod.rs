@@ -169,8 +169,8 @@ pub struct SandboxConfig {
 
 /// The `[sandbox.consumers]` table (#748): which model-driven commands run
 /// in the `command` profile. USER LAYER ONLY, with the rest of `[sandbox]`.
-/// Everything is off by default; `verify`, the stop gates and cron scripts
-/// are not consumers yet.
+/// Everything is off by default; the stop gates, cron scripts and deliveries are not
+/// consumers yet.
 #[derive(Debug, Default, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SandboxConsumersConfig {
@@ -178,6 +178,9 @@ pub struct SandboxConsumersConfig {
     pub run_command: Option<String>,
     /// `job_start`: `off` (default) | `optional` | `required`.
     pub job_start: Option<String>,
+    /// The mission `--verify` command: `off` (default) | `optional` |
+    /// `required`. A mission is unattended, so `optional` counts as `required`.
+    pub verify: Option<String>,
     /// Network of the `command` profile: `none` (default) or `host`.
     pub network: Option<String>,
     /// Most CPU seconds per process, 1 to 86400 (default 3600).
@@ -212,6 +215,7 @@ impl SandboxConsumersConfig {
         Ok(Consumers {
             run_command: mode("run_command", &self.run_command)?,
             job_start: mode("job_start", &self.job_start)?,
+            verify: mode("verify", &self.verify)?,
             network: match self.network.as_deref() {
                 None | Some("none") => Network::None,
                 Some("host") => Network::Host,
@@ -1325,6 +1329,7 @@ pub fn layered(project: &Config, user: &Config) -> Config {
             for (k, set) in [
                 ("sandbox.consumers.run_command", c.run_command.is_some()),
                 ("sandbox.consumers.job_start", c.job_start.is_some()),
+                ("sandbox.consumers.verify", c.verify.is_some()),
                 ("sandbox.consumers.network", c.network.is_some()),
                 ("sandbox.consumers.cpu_secs", c.cpu_secs.is_some()),
                 ("sandbox.consumers.memory_mb", c.memory_mb.is_some()),
@@ -1722,6 +1727,7 @@ pub fn render_with(cfg: &Config, tag: &str, ann: &Annotations) -> Vec<String> {
             for (key, v) in [
                 ("sandbox.consumers.run_command", &c.run_command),
                 ("sandbox.consumers.job_start", &c.job_start),
+                ("sandbox.consumers.verify", &c.verify),
                 ("sandbox.consumers.network", &c.network),
             ] {
                 scalar(&mut out, key, v.as_deref().map(quote));
@@ -2272,20 +2278,23 @@ verify_timeout = 60
                 None => Consumers::default(),
                 Some(s) => s.consumers().unwrap(),
             };
-            assert_eq!((s.run_command, s.job_start), (Mode::Off, Mode::Off));
+            assert_eq!(
+                (s.run_command, s.job_start, s.verify),
+                (Mode::Off, Mode::Off, Mode::Off)
+            );
             assert_eq!((s.network, s.limits), (Network::None, Limits::default()));
         }
         let c = parse(
             "[sandbox.consumers]\nrun_command = \"required\"\njob_start = \"optional\"\n\
-             network = \"host\"\ncpu_secs = 60\nmemory_mb = 512\nprocesses = 64\n\
+             verify = \"required\"\nnetwork = \"host\"\ncpu_secs = 60\nmemory_mb = 512\nprocesses = 64\n\
              file_size_mb = 10\n",
             &p(),
         )
         .unwrap();
         let s = c.sandbox.unwrap().consumers().unwrap();
         assert_eq!(
-            (s.run_command, s.job_start),
-            (Mode::Required, Mode::Optional)
+            (s.run_command, s.job_start, s.verify),
+            (Mode::Required, Mode::Optional, Mode::Required)
         );
         assert_eq!(s.network, Network::Host);
         assert_eq!(
@@ -2301,6 +2310,7 @@ verify_timeout = 60
         for (bad, key) in [
             ("run_command = \"on\"", "sandbox.consumers.run_command"),
             ("job_start = \"yes\"", "sandbox.consumers.job_start"),
+            ("verify = \"on\"", "sandbox.consumers.verify"),
             ("network = \"some\"", "sandbox.consumers.network"),
             ("cpu_secs = 0", "sandbox.consumers.cpu_secs"),
             ("cpu_secs = 86401", "sandbox.consumers.cpu_secs"),
@@ -2314,7 +2324,8 @@ verify_timeout = 60
                 .to_string();
             assert!(e.contains(key), "{bad}: {e}");
         }
-        assert!(parse("[sandbox.consumers]\nverify = \"required\"\n", &p()).is_err());
+        // Cron scripts and deliveries are not consumers yet.
+        assert!(parse("[sandbox.consumers]\ncron = \"required\"\n", &p()).is_err());
         assert!(parse("[sandbox.consumers]\nrun_commands = \"off\"\n", &p()).is_err());
         // A project config cannot set them; the user layer wins whole.
         let user = parse("[sandbox.consumers]\nrun_command = \"required\"\n", &p()).unwrap();

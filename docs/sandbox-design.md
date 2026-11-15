@@ -490,21 +490,24 @@ Notes per consumer:
   long as the job.
 - `verify` and `turnend`: they run code the agent just wrote, unattended,
   without approval (#676). They are the strongest case for opting in.
+  `verify` is a consumer since #748's second slice (§9.4); `turnend` follows.
 - Child agents (`agent_start`, `delegate`) are tole processes with their own
   tools; they are not wrapped. Their own model commands follow their own
   `[sandbox.consumers]`.
 
 ### 9.3 Model commands as implemented (#748, first slice)
 
-Only `run_command` and `job_start` are consumers so far. `verify`, the stop
-gates, cron scripts and deliveries run as before (the owner decided they
-move later, `verify` and `turnend` to sandboxed-by-default); nothing here
-changes their defaults.
+The first slice made `run_command` and `job_start` consumers; the second
+(§9.4) adds `verify`, then `turnend`. The stop gates (until their slice),
+cron scripts and deliveries run as before. Every consumer is off by default;
+the owner decided `verify` and `turnend` become sandboxed by default later
+(§9.4, migration), and nothing here changes their defaults.
 
 ```toml
 [sandbox.consumers]            # user config only; every key optional
 run_command = "required"       # "off" (default) | "optional" | "required"
 job_start   = "optional"
+verify      = "required"       # the mission --verify command (§9.4)
 network     = "none"           # "none" (default) | "host" (explicit opt-in)
 cpu_secs     = 3600            # 1 to 86400
 memory_mb    = 16384           # 256 to 1048576, address space per process
@@ -663,8 +666,9 @@ file_size_mb = 4096            # 1 to 1048576, largest file a process writes
   but cannot be tracked (pid file not written) is stopped through its group and
   the direct children of its launcher (`jobs::kill_detached`).
 - **`tole doctor`** prints the consumers' modes, the network and the limits, says
-  verify, turnend, cron scripts and deliveries are not sandboxed yet, and fails
-  when a `required` consumer has no working sandbox (a warning for `optional`).
+  the stop gates, cron scripts and deliveries are not sandboxed yet, and fails
+  when a `required` consumer has no working sandbox (a warning for `optional`;
+  an error for `optional` `verify`, which a mission treats as `required`).
   `tole config check` lists the `sandbox.consumers.*` keys.
   For each sandboxed stdio server (from `mcp_server` in the user config) and
   each consumer that is on, it also prints the mode, the workspace access, the
@@ -722,6 +726,92 @@ file_size_mb = 4096            # 1 to 1048576, largest file a process writes
   path component between resolution and the mount is not stopped (§5). The
   limits are per process, not a cgroup. Toolchain caches (`~/.cargo`, `~/.npm`)
   are not visible; the profile has no `read` extras yet.
+
+### 9.4 `verify` as implemented (#748, second slice)
+
+```toml
+[sandbox.consumers]
+verify = "required"            # the mission --verify command
+```
+
+Opt-in, exactly like the first slice: default `off`, `optional` or `required`
+in the user config only, the same `command` profile, limits and network
+setting. Nothing about it is sandboxed by default in this slice. The
+`on_turnend` stop gates (`turnend`) follow in their own change.
+
+- **Call site.** `run_verify` in `tole-cli`'s `mission.rs`, the only place the
+  `--verify` string is run (`sh -c <string>`, the string stays one argument).
+  It calls `sandbox::command::command_in_cwd`, which is `command_for` with the
+  process's working directory as the workspace.
+- **Same semantics.** Off, the spawned command is byte for byte the old one.
+  On, exit status, stdout and stderr capture, the `--verify-timeout`, the
+  working directory (the process's own, which is what it inherited;
+  `--workspace` does not change it) and the ENV-1 scrub with the `[secrets]`
+  release for `verify` are the same. The scrub is applied to the `bwrap`
+  process, whose environment its child inherits. `sh` is found by bare name on
+  `PATH`.
+- **Unattended.** A mission is an autonomous run with nobody to answer, so for
+  `verify` `optional` always counts as `required` (the consumer says so itself;
+  the process flag is not needed).
+- **A refusal is never a pass.** With `required` (or `optional`, which is the
+  same here) and no working sandbox the result is `Refused`, not `Failed`. A
+  start-up check runs before the first turn (the same planning a launch does:
+  backend, workspace grant, protected paths), so the mission ends before any
+  model turn is spent, with status `verify_refused`, a non-zero exit and
+  `MISSION_COMPLETE` never asked for: the model cannot fix a missing sandbox,
+  and a workspace layout the `command` profile refuses (§9.3: uninitialized or
+  nested submodule, linked worktree inside the workspace, unprotectable `.git`
+  link chain) is the same refusal with the profile's reason, never an
+  unsandboxed run (a mission is unattended, so `optional` has no fallback);
+  the refusal is not fed back or counted against the three-strike cap
+  (`verify_failures` stays 0).
+- **The launcher failing is not the command failing.** A sandbox that passed
+  the check can still fail to start the command: `bwrap` gone after the
+  self-test, a namespace refused, a mount that cannot be made, a resource limit
+  `bwrap` cannot live under. That is a `Refused` too (a spawn error of the
+  launcher, or a non-zero exit with no command exit code from `bwrap`), reported
+  after the turn that ran, and the model is not told to fix it. The
+  distinction is made with `bwrap --json-status-fd`: `bwrap` writes
+  `{"exit-code": N}` only when the command itself ran and ended, and nothing
+  of the kind for a setup or exec failure (verified: both a missing bind source
+  and a missing program print `bwrap: ...`, exit 1 and report no exit code);
+  `child-pid` is written before the mounts and proves nothing. A stderr-prefix
+  heuristic was rejected: the command could print `bwrap:` itself. The command
+  inherits the status descriptor (fd 3) and could write to it, but it can only
+  make the report agree with what it really did; a command killed by a signal
+  (no exit code) is still counted as its own failure. A refusal never turns
+  into a pass: only exit 0 passes. The session stays resumable
+  (`tole mission --resume ID` after installing bubblewrap or relaxing the
+  setting). The skill curator records no outcome (it is the owner's setting,
+  not the work). A failing command inside the sandbox is an ordinary failure,
+  same as plain: `verify_failed` after three strikes.
+- **Tests.** Argv builder tests per flag (`command_tests.rs`), policy without
+  bubblewrap (`command_sandbox_none.rs`, `verify_sandbox.rs`) and with it
+  (`command_sandbox.rs`, `verify_sandbox.rs`; CI's `Sandbox (bubblewrap)` job
+  runs them with `TOLE_REQUIRE_BWRAP=1`).
+- **A sandboxed verify can fail every time for environmental reasons.** The
+  model is told "verify FAILED" and the three strikes apply as for any failure,
+  but none of these is the model's to fix: a toolchain under `~/.cargo` or
+  `~/.rustup` is not visible (no `$HOME`, no `read` extras yet), so `cargo` is
+  not found (exit 127); the network is `none` unless the owner wrote `network =
+  "host"`, so a fetch or a registry login fails; and `RLIMIT_AS` (`memory_mb`,
+  16 GiB by default) counts address space, which address-hungry tooling can
+  exceed. The strike semantics are unchanged on purpose. `tole doctor` says so
+  when `verify` is on, and warns by name when `~/.cargo/bin` or `~/.rustup`
+  exists. Until the `read` extras land, a `--verify` that needs such a toolchain
+  should stay `off`, or the toolchain should live under a system directory.
+- **Residual.** As §9.3. `--workspace` is not the sandbox workspace, the
+  process's working directory is (the one it ran in before).
+
+**Migration plan (not in this slice).** The owner decided (§16.1) that `verify`
+and `turnend` become sandboxed by default in a later phase. The plan, for that
+phase's own PR: (1) land the `read` extras so a toolchain can be granted; (2)
+the default turns from `off` to `optional` for both, with a release note and a
+`tole doctor` line saying so, so an attended run on a machine without
+bubblewrap keeps working with a warning while a mission already refuses (it is
+unattended); (3) a later release moves it to `required` where a backend
+exists, `off` stays the explicit opt-out in the user config. Until that PR the
+default stays `off`.
 
 ### 9.1.1 Life of a sandboxed server
 
@@ -853,7 +943,7 @@ Names only, never values or argument contents:
 | Finding | What the sandbox closes | What remains |
 |---|---|---|
 | #675 `/proc/<ppid>/environ` (fixed by non-dumpable) | A second, independent wall for sandboxed processes: tole is outside their PID namespace, so a later regression of the dumpable flag (an exec path that forgets it, a setuid transition) does not reopen it for them. Also closes reading secrets from the owner's files (S2), the residual #675 named. | Unsandboxed children (hooks, first-party helpers, commands that did not opt in) rely on non-dumpable alone. Root and `CAP_SYS_PTRACE`. macOS and Windows. Secrets granted to a consumer are visible to it by design. |
-| #676 `--verify` and stop gates with the full environment (fixed by the scrub) | With `verify` / `turnend` opted in: the code the agent wrote can no longer read `$HOME`, write the data dir or `.git/hooks`, or reach the network. | Opt-in, not default. A secret granted to `verify` is still readable by the test code. The verify result itself still decides mission completion. |
+| #676 `--verify` and stop gates with the full environment (fixed by the scrub) | With `verify` opted in (§9.4; `turnend` follows): the code the agent wrote can no longer read `$HOME`, write the data dir or `.git/hooks`, or reach the network. | Opt-in, not default. A secret granted to `verify` is still readable by the test code. The verify result itself still decides mission completion. |
 | #679 lock bound to the name only | Bounds the damage of a re-pointed or swapped server: whatever binary runs under the name gets only the profile (no data dir, no `$HOME`, listed hosts only). The profile hash in the lock entry makes a widened profile need re-approval. | The identity check itself (source and integrity in `admit`) must be fixed in #679; a swapped binary with a broad profile still gets that profile's grants and arguments. |
 | #680 refused server still serves resources and prompts | Nothing directly: the problem is model-visible text, not process authority. Lazy start helps: a server that is not admitted is never started, so it cannot serve anything. | The gate on resources, prompts and the `/mcp:` listing (#680's own fix); prompts and resources outside the manifest hash. |
 | #684 owner-only records writable by the agent | For sandboxed consumers: the data dir is absent, so neither the tole CLI nor a script nor a copied binary can write the cron ledger, plugin lock, skill approvals, trust store or user config; `.tole/` and `.git/hooks` are read-only. | In-process file tools when the workspace contains the data dir (needs #684's jail refusal); consumers that did not opt in; the `tole`-binary refusal and the session marker #684 proposes stay useful as defence in depth. |
@@ -880,8 +970,9 @@ entry.
 4. **Model-driven commands** (~600): `[sandbox.consumers]` for
    `run_command`, `job_start`, cron scripts and deliveries, `verify`,
    `turnend`; rlimits; per-consumer tests; migration note. First slice done
-   (#748, §9.3): `run_command`, `job_start`, rlimits; cron, `verify` and
-   `turnend` follow.
+   (#748, §9.3): `run_command`, `job_start`, rlimits. Second slice (§9.4):
+   `verify` done, then `turnend`, with the migration plan. Cron scripts and
+   deliveries follow.
 5. **Lazy start and idle stop** (~700): register from the locked snapshot,
    start on first call, manifest check at start, idle stop.
 6. **Tool retrieval by meaning** (~900, may split): the search tool over

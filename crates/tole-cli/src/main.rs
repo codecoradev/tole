@@ -309,7 +309,9 @@ enum Command {
         /// Verification command run after each turn; exit 0 = goal
         /// achieved (overrides the model's completion marker). Failures
         /// return to the model with the output; 3 failures settle the
-        /// mission as verify_failed.
+        /// mission as verify_failed. A command the owner's sandbox
+        /// refuses ([sandbox.consumers] verify) settles it as
+        /// verify_refused, without a retry.
         #[arg(long)]
         verify: Option<String>,
 

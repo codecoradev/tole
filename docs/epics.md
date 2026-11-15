@@ -257,7 +257,7 @@ Everything below is merged; CHANGELOG entries carry the detail.
 - **Since 0.11.0 (on develop, unreleased):**
   - Plugins, #600 slice 1 (parts 1 to 6, merged): `plugin list` and `diff` show source, tier, secrets and sandbox state and start nothing the lock would refuse; `revoke` is owner-only and a hand-edited lock cannot revive a revoke; the description scanner; the one-shot probe for unapproved servers; `tole plugin add` with trust tiers (`first-party`, `third-party-verified`, `third-party-unverified`); `tole doctor` warnings for unpinned launchers, unsandboxed third-party servers and broad grants.
   - Plugins, #600 slice 2 (#811): bundle manifests (`tole-plugin.toml`, `tole plugin add --bundle`) and per-plugin secret grants approved one by one, withdrawn one by one (`tole plugin revoke --secret`), pinned to the manifest hash and recorded in the ledger.
-  - Sandbox (#601, #748): opt-in bubblewrap sandbox for third-party stdio MCP servers (`[sandbox]`), and for `run_command` and `job_start` (`[sandbox.consumers]`, #748 part 1: the built-in `command` profile and rlimits), with named profiles and per-server bindings (#810: `[sandbox.profiles]`, `[sandbox.servers]`, `tole sandbox list|show|set`, user layer only). Linux only; `tole doctor` says so elsewhere. A CI job runs the real-bubblewrap tests on every pull request (#751). Design: `docs/sandbox-design.md`.
+  - Sandbox (#601, #748): opt-in bubblewrap sandbox for third-party stdio MCP servers (`[sandbox]`), and for `run_command` and `job_start` (`[sandbox.consumers]`, #748 parts 1 and 2: the built-in `command` profile and rlimits; the mission `--verify` command as `verify`), with named profiles and per-server bindings (#810: `[sandbox.profiles]`, `[sandbox.servers]`, `tole sandbox list|show|set`, user layer only). Linux only; `tole doctor` says so elsewhere. A CI job runs the real-bubblewrap tests on every pull request (#751). Design: `docs/sandbox-design.md`.
   - Delegation approvals (#714, closed, six parts): the durable `approvals.jsonl` queue, a delegated child that parks at an approval and is denied on timeout, `tole delegation approvals`, `/approvals` decisions on `tole serve`, `delegate_pending` and `delegate_decide` for agent levels, and the guide `docs/approving-delegated-work.md`. Off by default (`[delegation] approvals = "off"`; `owner` and `chain` opt in).
   - Discussion: configurable provider timeout (#786), one retry after a timeout (#756), a timed-out call is charged its reserved estimate (#804).
   - Module restructuring (#752, closed, parts 0 to 20): see "Layering and published crates" below.
@@ -385,10 +385,11 @@ Bot and Nakama; BMAD for collaboration). Design notes:
     decisions in `docs/sandbox-design.md`; first slice done: opt-in
     bubblewrap sandbox for third-party stdio MCP servers on Linux, with a
     doctor line; opt-in `[sandbox.consumers]` for `run_command` and
-    `job_start` with rlimits, #748 first slice done). Open: #748 for the rest
-    of the model-driven commands (cron scripts and deliveries, the mission
-    `--verify` command, the stop gates; `verify` and `turnend` become
-    sandboxed by default in a later phase), and #750 for the operability
+    `job_start` with rlimits, #748 first slice done; `verify` second slice,
+    in review). Open: #748 for the rest
+    of the model-driven commands (the stop gates, cron scripts and
+    deliveries; `verify` and `turnend` become sandboxed by default in a later
+    phase, plan in `docs/sandbox-design.md` §9.4), and #750 for the operability
     pieces: the doctor listing of sensitive grants and startup logging (#809),
     per-server and named profiles with the CLI (#810, in review), the profile
     name and hash in the plugin lock entry with re-approval on change (#750,

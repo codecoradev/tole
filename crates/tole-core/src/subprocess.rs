@@ -10,6 +10,10 @@ use std::time::Duration;
 /// Default ceiling for tool subprocesses (mirrors cora_search's E4 value).
 pub const SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How the runners below word a failure to start the child, so a caller can
+/// tell it from the child's own failure.
+pub const SPAWN_FAILED: &str = "failed to spawn subprocess";
+
 /// Per-stream capture ceiling: a hostile or chatty child must not be able
 /// to exhaust host memory before the timeout fires (CodeCora scan
 /// 2026-09-18). Generous on purpose — real tool output (diffs, logs) sits
@@ -353,7 +357,7 @@ pub fn run_with_timeout_or_cancel(
         .stdin(Stdio::null());
     let mut child = cmd
         .spawn()
-        .map_err(|e| format!("failed to spawn subprocess (is it on PATH?): {e}"))?;
+        .map_err(|e| format!("{SPAWN_FAILED} (is it on PATH?): {e}"))?;
     let stdout_pipe = child.stdout.take().expect("stdout piped above");
     let stderr_pipe = child.stderr.take().expect("stderr piped above");
     let (tx_out, rx_out) = mpsc::channel();
@@ -408,7 +412,7 @@ pub fn run_with_timeout_stdin(
         .stdin(Stdio::piped());
     let mut child = cmd
         .spawn()
-        .map_err(|e| format!("failed to spawn subprocess (is it on PATH?): {e}"))?;
+        .map_err(|e| format!("{SPAWN_FAILED} (is it on PATH?): {e}"))?;
     let mut stdin_pipe = child.stdin.take().expect("stdin piped above");
     let data = stdin_data.to_vec();
     let (tx_in, rx_in) = mpsc::channel();

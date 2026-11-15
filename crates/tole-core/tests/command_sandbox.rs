@@ -63,6 +63,7 @@ fn setup() -> &'static Setup {
         sandbox::command::set_consumers(Consumers {
             run_command: Mode::Required,
             job_start: Mode::Required,
+            verify: Mode::Required,
             network: Network::None,
             limits: LIMITS,
         })
@@ -875,6 +876,52 @@ fn the_same_consumer_settings_are_fine_and_different_ones_are_refused() {
     other.network = Network::Host;
     assert!(command::set_consumers(other).is_err());
     assert_eq!(command::consumers(), current, "unchanged after the refusal");
+}
+
+/// Slice 2 (#748): the mission `--verify` command (`sh -c <string>`) runs in
+/// the same `command` profile: the workspace is writable, `.git/hooks`,
+/// `.git/config` and `.tole` are not, `$HOME` and the data dir are absent, and
+/// the exit status and output are what they are without a sandbox.
+#[test]
+fn the_verify_command_runs_in_the_command_profile() {
+    if skipped() {
+        return;
+    }
+    let s = setup();
+    let w = project("verify");
+    let script = format!(
+        "echo \"wsw=$( (echo x > made) 2>/dev/null && echo writable || echo readonly)\"; \
+         echo \"hooks=$( (echo x > .git/hooks/evil) 2>/dev/null && echo writable || echo readonly)\"; \
+         echo \"config=$( (echo x >> .git/config) 2>/dev/null && echo writable || echo readonly)\"; \
+         echo \"tole=$( (echo x > .tole/evil) 2>/dev/null && echo writable || echo readonly)\"; \
+         echo \"home=$(test -e {}/canary && echo visible || echo absent)\"; \
+         echo \"data=$(test -e {} && echo visible || echo absent)\"; \
+         echo err >&2; exit 3",
+        s.home.display(),
+        s.data_secret.display()
+    );
+    let mut cmd =
+        command::command_for(command::Consumer::Verify, &w, "sh", &["-c".into(), script]).unwrap();
+    tole_core::subprocess::scrub_env_for(&mut cmd, tole_core::secret_release::VERIFY);
+    let out = tole_core::subprocess::run_with_timeout(&mut cmd, Duration::from_secs(60)).unwrap();
+    assert_eq!(out.status.code(), Some(3), "the exit status is the verdict");
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "err\n");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let out = json!({ "stdout": stdout });
+    assert_eq!(kv(&out, "wsw"), "writable");
+    assert!(w.join("made").exists(), "the write reached the host");
+    assert_eq!(kv(&out, "hooks"), "readonly", ".git/hooks");
+    assert_eq!(kv(&out, "config"), "readonly", ".git/config");
+    assert_eq!(kv(&out, "tole"), "readonly", ".tole");
+    assert_eq!(kv(&out, "home"), "absent");
+    assert_eq!(kv(&out, "data"), "absent");
+    for p in [".git/hooks/evil", ".tole/evil"] {
+        assert!(!w.join(p).exists(), "{p} was not created on the host");
+    }
+    assert_eq!(
+        std::fs::read_to_string(w.join(".git/config")).unwrap(),
+        "[core]\n"
+    );
 }
 
 /// The owner's `git status`, `diff` and `add -A` on the HOST in `w`: what a

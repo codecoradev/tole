@@ -2,10 +2,12 @@
 //! `docs/sandbox-design.md` §7 and §9.2, owner decisions of 2026-11-14).
 //!
 //! First slice: `run_command` and `job_start`, the two model-driven tools.
-//! The owner opts in per consumer in the user config
-//! (`[sandbox.consumers] run_command = "off" | "optional" | "required"`,
-//! default off). `verify`, the stop gates, cron scripts and deliveries keep
-//! running as before; the types here are shaped so they can join later.
+//! Second slice: the mission `--verify` command, then the `on_turnend` stop
+//! gates. The owner opts in per consumer in the user config
+//! (`[sandbox.consumers] run_command | job_start | verify = "off" |
+//! "optional" | "required"`, default off for all of them). The stop gates,
+//! cron scripts and deliveries keep running as before; the types here are
+//! shaped so they can join later.
 //!
 //! The `command` profile: the workspace writable, with
 //! `.git` (the whole directory) and `.tole` read-only on top (code planted
@@ -22,9 +24,10 @@
 //!   `[secrets]` release for its tool, never through `--setenv`);
 //! - the launcher gets rlimits (CPU, address space, processes, file size)
 //!   and no inherited file descriptor above 2 (Linux only);
-//! - policy: `optional` is `required` in an unattended run; with no working
-//!   sandbox (including macOS and Windows) `required` refuses and
-//!   `optional` runs unsandboxed with a warning when a human is attached.
+//! - policy: `optional` is `required` in an unattended run (a mission's
+//!   `verify` is always one: nobody answers there); with no working sandbox
+//!   (including macOS and Windows) `required` refuses and `optional` runs
+//!   unsandboxed with a warning when a human is attached.
 //!
 //! State is owner config set once per process, never per session: the
 //! workspace travels with each call.
@@ -41,20 +44,33 @@ use std::sync::OnceLock;
 /// read-only inside it.
 pub const PROTECTED: [&str; 2] = [".git", ".tole"];
 
-/// The tools of this slice.
+/// The commands that can be sandboxed: the two model-driven tools and the
+/// mission `--verify` command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Consumer {
     RunCommand,
     JobStart,
+    Verify,
 }
 
 impl Consumer {
-    /// The tool's name, as in `[sandbox.consumers]` and `[secrets]`.
+    /// Every consumer, in the order the doctor lists them.
+    pub const ALL: [Consumer; 3] = [Consumer::RunCommand, Consumer::JobStart, Consumer::Verify];
+
+    /// The consumer's name, as in `[sandbox.consumers]` and `[secrets]`.
     pub fn name(self) -> &'static str {
         match self {
             Consumer::RunCommand => "run_command",
             Consumer::JobStart => "job_start",
+            Consumer::Verify => "verify",
         }
+    }
+
+    /// The mission `--verify` command only runs inside `tole mission`, an
+    /// autonomous run with nobody to answer a prompt: for it `optional` is
+    /// always `required`, whatever the process flag says.
+    pub fn always_unattended(self) -> bool {
+        self == Consumer::Verify
     }
 
     /// A detached job outlives the call by design; everything else dies
@@ -124,6 +140,8 @@ impl Limits {
 pub struct Consumers {
     pub run_command: Mode,
     pub job_start: Mode,
+    /// The mission `--verify` command.
+    pub verify: Mode,
     /// Network of the `command` profile: none, or the host's.
     pub network: Network,
     pub limits: Limits,
@@ -134,6 +152,7 @@ impl Default for Consumers {
         Consumers {
             run_command: Mode::Off,
             job_start: Mode::Off,
+            verify: Mode::Off,
             network: Network::None,
             limits: Limits::default(),
         }
@@ -145,6 +164,7 @@ impl Consumers {
         match c {
             Consumer::RunCommand => self.run_command,
             Consumer::JobStart => self.job_start,
+            Consumer::Verify => self.verify,
         }
     }
 }
@@ -869,7 +889,7 @@ pub fn launch_command(
     plan_command(
         &c,
         &super::detect(),
-        super::unattended(),
+        super::unattended() || consumer.always_unattended(),
         &env,
         consumer,
         (program, args),
@@ -886,6 +906,148 @@ pub fn command_for(
     program: &str,
     args: &[String],
 ) -> Result<Command, String> {
+    command_prepared(consumer, workspace, program, args, false).map(|l| l.cmd)
+}
+
+/// A command ready to spawn. `report` is set when it is wrapped in the sandbox.
+pub struct Launched {
+    pub cmd: Command,
+    pub report: Option<LauncherReport>,
+}
+
+/// What `bwrap` says about the command it ran (`--json-status-fd`).
+///
+/// The launcher's own failures (a user namespace refused after the self-test,
+/// a mount that cannot be made, `bwrap` gone, a limit it cannot live under)
+/// exit non-zero like a failing command does, and the caller must not blame
+/// the command for them. `bwrap` reports `{"exit-code": N}` only when the
+/// command itself ran and ended; a setup or exec failure writes no such line
+/// (checked: a missing bind source and a missing program both print
+/// `bwrap: ...`, exit 1 and report no exit code), whatever the exit status
+/// says. (`child-pid` is written before the mounts are made, so it proves
+/// nothing.) The command inherits the descriptor and could write to it, but it
+/// can only make the report agree with what it really did.
+pub struct LauncherReport {
+    #[cfg(target_os = "linux")]
+    read: std::fs::File,
+    /// The write end, closed when the report is read.
+    #[cfg(target_os = "linux")]
+    write: std::fs::File,
+}
+
+impl LauncherReport {
+    /// The exit code `bwrap` reported for the command, once the process has
+    /// ended; `None` when it reported none (the launcher failed).
+    #[cfg(target_os = "linux")]
+    pub fn command_exit_code(self) -> Option<i32> {
+        use std::io::Read;
+        drop(self.write);
+        let mut read = self.read;
+        let mut text = String::new();
+        // Non-blocking: the process is gone, what it wrote is in the pipe; a
+        // leaked descriptor held by a survivor must not make this wait.
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = read.read(&mut buf) {
+            if n == 0 || text.len() > 64 * 1024 {
+                break;
+            }
+            text.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+        exit_code_of(&text)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn command_exit_code(self) -> Option<i32> {
+        None
+    }
+}
+
+/// The `exit-code` of a `bwrap` JSON status text (objects, one or more lines).
+#[cfg(target_os = "linux")]
+fn exit_code_of(text: &str) -> Option<i32> {
+    let mut out = None;
+    for v in serde_json::Deserializer::from_str(text).into_iter::<serde_json::Value>() {
+        let Ok(v) = v else { break };
+        if let Some(c) = v.get("exit-code").and_then(serde_json::Value::as_i64) {
+            out = i32::try_from(c).ok();
+        }
+    }
+    out
+}
+
+#[cfg(target_os = "linux")]
+fn status_pipe() -> std::io::Result<(std::fs::File, std::fs::File)> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: `fds` is a valid out-array of two ints.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: both are fresh descriptors this function owns.
+    let (r, w) = unsafe {
+        (
+            std::fs::File::from_raw_fd(fds[0]),
+            std::fs::File::from_raw_fd(fds[1]),
+        )
+    };
+    // Only the read end is non-blocking (separate open file descriptions).
+    // SAFETY: plain fcntl on an owned descriptor.
+    unsafe {
+        let fl = libc::fcntl(r.as_raw_fd(), libc::F_GETFL);
+        libc::fcntl(r.as_raw_fd(), libc::F_SETFL, fl | libc::O_NONBLOCK);
+    }
+    Ok((r, w))
+}
+
+/// [`command_for`] for a command that runs in the process's working
+/// directory (the mission `--verify` command inherits it, so it is the
+/// workspace the sandbox binds). The directory is only looked up when the
+/// sandbox is on. A wrapped command comes with a [`LauncherReport`].
+pub fn command_in_cwd(
+    consumer: Consumer,
+    program: &str,
+    args: &[String],
+) -> Result<Launched, String> {
+    let cwd = if consumers().mode(consumer) == Mode::Off {
+        PathBuf::new()
+    } else {
+        std::env::current_dir().map_err(|e| {
+            format!(
+                "{}: not run, the working directory is unknown ({e})",
+                consumer.name()
+            )
+        })?
+    };
+    command_prepared(consumer, &cwd, program, args, true)
+}
+
+/// Whether `consumer` could run a command here now, without running one: the
+/// refusal [`command_in_cwd`] would give, or `Ok`. For a start-up check, so a
+/// run that cannot work stops before it spends anything.
+pub fn preflight(consumer: Consumer) -> Result<(), String> {
+    if consumers().mode(consumer) == Mode::Off {
+        return Ok(());
+    }
+    let cwd = std::env::current_dir().map_err(|e| {
+        format!(
+            "{}: not run, the working directory is unknown ({e})",
+            consumer.name()
+        )
+    })?;
+    match launch_command(consumer, &cwd, "sh", &[]) {
+        CommandLaunch::Refused(why) => Err(why),
+        _ => Ok(()),
+    }
+}
+
+/// [`command_for`] plus the launcher report (when `report` and wrapped).
+fn command_prepared(
+    consumer: Consumer,
+    workspace: &Path,
+    program: &str,
+    args: &[String],
+    report: bool,
+) -> Result<Launched, String> {
     match launch_command(consumer, workspace, program, args) {
         CommandLaunch::Direct { warning } => {
             if let Some(w) = warning {
@@ -893,7 +1055,10 @@ pub fn command_for(
             }
             let mut c = Command::new(program);
             c.args(args);
-            Ok(c)
+            Ok(Launched {
+                cmd: c,
+                report: None,
+            })
         }
         CommandLaunch::Sandboxed {
             program,
@@ -906,9 +1071,31 @@ pub fn command_for(
             recheck_plan(workspace, &args)
                 .map_err(|why| format!("{}: not run, {why}", consumer.name()))?;
             let mut c = Command::new(program);
+            #[cfg(target_os = "linux")]
+            if report {
+                use std::os::fd::AsRawFd;
+                let (read, write) = status_pipe().map_err(|e| {
+                    format!(
+                        "{}: not run, no status pipe for the sandbox ({e})",
+                        consumer.name()
+                    )
+                })?;
+                let fd = write.as_raw_fd();
+                c.arg("--json-status-fd").arg(STATUS_FD.to_string());
+                c.args(args);
+                harden(&mut c, limits, Some(fd));
+                return Ok(Launched {
+                    cmd: c,
+                    report: Some(LauncherReport { read, write }),
+                });
+            }
+            let _ = report;
             c.args(args);
-            harden(&mut c, limits);
-            Ok(c)
+            harden(&mut c, limits, None);
+            Ok(Launched {
+                cmd: c,
+                report: None,
+            })
         }
         CommandLaunch::Refused(why) => Err(why),
     }
@@ -944,7 +1131,11 @@ pub(crate) fn recheck_plan(workspace: &Path, args: &[OsString]) -> Result<(), St
 /// A fallback to no sandbox is warned about once per process and tool, not
 /// on every call (a chatty line per command would drown a terminal).
 fn warn_once(consumer: Consumer, text: &str) {
-    static WARNED: [AtomicBool; 2] = [AtomicBool::new(false), AtomicBool::new(false)];
+    static WARNED: [AtomicBool; 3] = [
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+    ];
     if !WARNED[consumer.index()].swap(true, Ordering::SeqCst) {
         eprintln!("tole: {text}");
     }
@@ -955,7 +1146,7 @@ fn warn_once(consumer: Consumer, text: &str) {
 /// process cannot raise a hard limit it lowered. Only async-signal-safe
 /// calls run there. Linux only.
 #[cfg(target_os = "linux")]
-fn harden(cmd: &mut Command, limits: Limits) {
+fn harden(cmd: &mut Command, limits: Limits, status_fd: Option<std::os::fd::RawFd>) {
     use std::os::unix::process::CommandExt;
     // SAFETY: the closure only calls getrlimit, setrlimit, syscall and
     // fcntl (all async-signal-safe) on values it owns; no allocation, no
@@ -973,13 +1164,26 @@ fn harden(cmd: &mut Command, limits: Limits) {
                 limits.file_size_mb.saturating_mul(1 << 20),
             )?;
             close_inherited_fds();
+            // The status pipe of the launcher goes to fd 3 (the only
+            // descriptor above 2 that survives the exec).
+            if let Some(fd) = status_fd {
+                if fd == STATUS_FD {
+                    libc::fcntl(fd, libc::F_SETFD, 0);
+                } else if libc::dup2(fd, STATUS_FD) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
             Ok(())
         });
     }
 }
 
 #[cfg(not(target_os = "linux"))]
-fn harden(_cmd: &mut Command, _limits: Limits) {}
+fn harden(_cmd: &mut Command, _limits: Limits, _status_fd: Option<i32>) {}
+
+/// The descriptor on which `bwrap` writes its JSON status (`--json-status-fd`).
+#[cfg(target_os = "linux")]
+const STATUS_FD: i32 = 3;
 
 /// Lowers the soft and hard limit of `resource` to `value`, never above what
 /// the process already has. Fails closed: an error stops the spawn.
@@ -1051,16 +1255,37 @@ fn close_inherited_fds() {
 /// A line starting `sandbox consumers: ERROR` (a required consumer with no
 /// working sandbox) makes the doctor fail; an optional one only warns.
 pub fn doctor_lines(c: &Consumers, avail: &Availability) -> Vec<String> {
+    doctor_lines_for(
+        c,
+        avail,
+        std::env::var_os("HOME").map(PathBuf::from).as_deref(),
+    )
+}
+
+/// Toolchain directories under `home` that the sandbox cannot see (it has no
+/// `$HOME`; there are no `read` extras yet), so a command that needs them
+/// fails inside it, for example with exit 127.
+pub fn unseen_toolchain_dirs(home: &Path) -> Vec<PathBuf> {
+    [".cargo/bin", ".rustup"]
+        .iter()
+        .map(|d| home.join(d))
+        .filter(|p| p.is_dir())
+        .collect()
+}
+
+/// [`doctor_lines`] with the home directory given.
+pub fn doctor_lines_for(c: &Consumers, avail: &Availability, home: Option<&Path>) -> Vec<String> {
     let word = |m: Mode| match m {
         Mode::Off => "off",
         Mode::Optional => "optional",
         Mode::Required => "required",
     };
     let mut out = Vec::new();
-    if c.run_command == Mode::Off && c.job_start == Mode::Off {
+    if Consumer::ALL.iter().all(|k| c.mode(*k) == Mode::Off) {
         out.push(
-            "sandbox consumers: run_command off, job_start off (model commands run unsandboxed; \
-             set [sandbox.consumers] run_command / job_start in the user config to sandbox them)"
+            "sandbox consumers: run_command off, job_start off, verify off (model commands and \
+             the mission --verify command run unsandboxed; set [sandbox.consumers] run_command \
+             / job_start / verify in the user config to sandbox them)"
                 .into(),
         );
     } else {
@@ -1070,21 +1295,26 @@ pub fn doctor_lines(c: &Consumers, avail: &Availability) -> Vec<String> {
         };
         let l = c.limits;
         out.push(format!(
-            "sandbox consumers: run_command {}, job_start {}, network {net}, limits cpu {}s \
-             memory {}MB processes {} file {}MB",
+            "sandbox consumers: run_command {}, job_start {}, verify {}, network {net}, limits \
+             cpu {}s memory {}MB processes {} file {}MB",
             word(c.run_command),
             word(c.job_start),
+            word(c.verify),
             l.cpu_secs,
             l.memory_mb,
             l.processes,
             l.file_size_mb
         ));
         if let Availability::Unavailable(why) = avail {
-            for k in [Consumer::RunCommand, Consumer::JobStart] {
-                let (level, tail) = match c.mode(k) {
-                    Mode::Off => continue,
-                    Mode::Required => ("ERROR", "refused (required)"),
-                    Mode::Optional => (
+            for k in Consumer::ALL {
+                let (level, tail) = match (c.mode(k), k.always_unattended()) {
+                    (Mode::Off, _) => continue,
+                    (Mode::Required, _) => ("ERROR", "refused (required)"),
+                    (Mode::Optional, true) => (
+                        "ERROR",
+                        "refused: a mission is an unattended run, where optional counts as required",
+                    ),
+                    (Mode::Optional, false) => (
                         "WARNING",
                         "runs unsandboxed with a warning, refused in unattended runs (optional)",
                     ),
@@ -1096,9 +1326,22 @@ pub fn doctor_lines(c: &Consumers, avail: &Availability) -> Vec<String> {
             }
         }
     }
+    if c.verify != Mode::Off {
+        let dirs = home.map(unseen_toolchain_dirs).unwrap_or_default();
+        if !dirs.is_empty() {
+            let shown: Vec<_> = dirs.iter().map(|d| d.display().to_string()).collect();
+            out.push(format!(
+                "sandbox consumers: WARNING verify is sandboxed and {} exist but are not visible                  inside the sandbox ($HOME is absent): a verify that needs them (cargo, rustc)                  fails every time, for example with exit 127, and uses up the three strikes",
+                shown.join(", ")
+            ));
+        }
+        out.push(
+            "sandbox consumers: a sandboxed verify can also fail deterministically for lack of              network (network none unless the owner wrote host) or under the address-space limit              (memory_mb); the model is told to fix it like any failure"
+                .into(),
+        );
+    }
     out.push(
-        "sandbox consumers: verify, turnend, cron scripts and deliveries are not sandboxed yet"
-            .into(),
+        "sandbox consumers: turnend, cron scripts and deliveries are not sandboxed yet".into(),
     );
     out
 }
