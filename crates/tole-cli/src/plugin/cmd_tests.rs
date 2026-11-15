@@ -1344,7 +1344,7 @@ fn a_grant_or_manifest_pin_added_by_hand_is_not_trusted() {
     edit(&|e| e.bundle.as_mut().unwrap().hash = "sha256:00".into());
     let g = gate(&h);
     assert!(g.refuse_unseen("srv", "stdio:true").is_some());
-    assert!(g.notes.iter().any(|n| n.contains("plugin manifest hash")));
+    assert!(g.notes.iter().any(|n| n.contains("plugin manifest record")));
 }
 
 #[test]
