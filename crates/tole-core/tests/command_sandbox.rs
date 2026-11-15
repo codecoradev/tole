@@ -308,7 +308,10 @@ fn repo(tag: &str) -> PathBuf {
 /// when git fails.
 fn host_git_out(w: &Path, args: &[&str]) -> std::process::Output {
     std::process::Command::new("git")
+        // No background maintenance: a detached `git maintenance`/`gc --auto`
+        // after a commit rewrites `.git` while a test is comparing its tree.
         .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+        .args(["-c", "gc.auto=0", "-c", "maintenance.auto=false"])
         .arg("-C")
         .arg(w)
         .args(args)
