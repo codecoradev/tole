@@ -12,7 +12,9 @@
 //! stdout, a timeout, or a spawn failure is a HOOK FAILURE: recorded to
 //! stderr, never blocks the call. argv execution only (no shell
 //! string). Hooks fire for Write/Destructive tools only — ReadOnly
-//! tools stay zero-overhead.
+//! tools stay zero-overhead. A turn-end gate that runs in the sandbox
+//! (`[sandbox.consumers] turnend`, #748) is stricter: a refusal, a launcher
+//! failure and a timeout are DENIES, never a pass (#860).
 
 use crate::subprocess::run_with_timeout_stdin;
 use serde_json::{json, Value};
@@ -84,13 +86,10 @@ impl ProcessHook {
                 // A sandboxed gate whose launcher cannot even start did not run
                 // either: that is a deny too (an unsandboxed spawn failure keeps
                 // its non-blocking contract, #110).
-                Err(e) if report.is_some() && e.starts_with(crate::subprocess::SPAWN_FAILED) => {
-                    return Ok((
-                        SANDBOX_REFUSED,
-                        format!("turnend: not run, the sandbox did not start ({e})"),
-                    ))
-                }
-                Err(e) => return Err(e),
+                // A sandboxed gate that timed out (or was lost while running) did
+                // not approve anything either: a deny, never a pass (#860). The
+                // unsandboxed path keeps the #110 contract.
+                Err(e) => return sandboxed_failure(e, report.is_some(), self.timeout),
             };
         let mut stdout = out.stdout;
         stdout.truncate(32 * 1024);
@@ -118,6 +117,14 @@ impl ProcessHook {
             }
         }
         Ok((code, stdout))
+    }
+
+    /// The same hook with another time budget. For tests that must not wait
+    /// the real 30 seconds; not part of the supported API.
+    #[doc(hidden)]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 
     /// Run the hook. `Ok(None)` = allow/no-op; `Ok(Some(reason))` =
@@ -183,6 +190,36 @@ impl ToolHooks {
             turnend: Vec::new(),
         }
     }
+}
+
+/// What a failed run of a stop gate comes to. A gate that went through the
+/// sandbox launcher (`sandboxed`) and did not finish is a DENY (exit
+/// [`SANDBOX_REFUSED`]) with the reason: a launcher that could not be spawned,
+/// a timeout (the gate was killed) or a lost child. A gate that approves nothing
+/// must not pass (#860). Unsandboxed, the failure stays a hook failure
+/// (non-blocking, #110), byte for byte as before.
+fn sandboxed_failure(
+    e: String,
+    sandboxed: bool,
+    timeout: Duration,
+) -> Result<(i32, String), String> {
+    if !sandboxed {
+        return Err(e);
+    }
+    let why = if e.starts_with(crate::subprocess::SPAWN_FAILED) {
+        format!("turnend: not run, the sandbox did not start ({e})")
+    } else if e.contains("timed out") {
+        format!(
+            "turnend: the stop gate timed out after {}s inside the sandbox and was killed; \
+             a timeout is not a pass",
+            timeout.as_secs()
+        )
+    } else {
+        format!(
+            "turnend: the stop gate did not finish inside the sandbox ({e}); that is not a pass"
+        )
+    };
+    Ok((SANDBOX_REFUSED, why))
 }
 
 /// Default per-hook timeout for turn-end gates: a verification gate that
@@ -272,6 +309,44 @@ mod tests {
         assert_eq!(payload["input"]["path"], "x");
         assert_eq!(payload["ok"], true);
         drop(dir);
+    }
+
+    #[test]
+    fn a_sandboxed_gate_that_does_not_finish_is_a_deny() {
+        let timeout = Duration::from_secs(30);
+        let timed_out = "subprocess timed out after 30s and was killed".to_string();
+        let (code, why) = sandboxed_failure(timed_out.clone(), true, timeout).unwrap();
+        assert_eq!(code, SANDBOX_REFUSED);
+        assert_eq!(
+            why,
+            "turnend: the stop gate timed out after 30s inside the sandbox and was killed; \
+             a timeout is not a pass"
+        );
+        let (code, why) = sandboxed_failure("wait failed: boom".into(), true, timeout).unwrap();
+        assert_eq!(code, SANDBOX_REFUSED);
+        assert!(
+            why.contains("did not finish") && why.contains("not a pass"),
+            "{why}"
+        );
+        let spawn = format!("{} (is it on PATH?): x", crate::subprocess::SPAWN_FAILED);
+        let (code, why) = sandboxed_failure(spawn, true, timeout).unwrap();
+        assert_eq!(code, SANDBOX_REFUSED);
+        assert!(why.contains("the sandbox did not start"), "{why}");
+        // Unsandboxed: the #110 contract, the error as it was.
+        for e in [timed_out, "wait failed: boom".to_string()] {
+            assert_eq!(sandboxed_failure(e.clone(), false, timeout), Err(e));
+        }
+    }
+
+    /// With the consumer off (the default) a gate that times out is still a
+    /// hook failure the caller logs and does not block on (#110).
+    #[test]
+    fn an_unsandboxed_gate_timeout_stays_a_non_blocking_failure() {
+        let (h, dir) = script_hook("sleep 5\n");
+        let h = h.with_timeout(Duration::from_millis(300));
+        let e = h.run_raw(&json!({})).unwrap_err();
+        assert!(e.contains("timed out"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

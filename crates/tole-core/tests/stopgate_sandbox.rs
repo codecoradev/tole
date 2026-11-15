@@ -206,6 +206,41 @@ fn a_missing_stop_gate_is_a_deny_not_a_pass() {
     );
 }
 
+/// A sandboxed gate that sleeps past its budget is killed and DENIED (exit
+/// 126, the reason says so), never passed (#860). A gate that finishes inside
+/// the same budget keeps its own verdict.
+#[test]
+fn a_sandboxed_gate_that_times_out_is_denied_not_passed() {
+    if skipped() {
+        return;
+    }
+    let s = setup();
+    write_script(&s.ws, "gate-slow.sh", "touch gate-slow-started; sleep 30");
+    let hook = turnend_hook("sh ./gate-slow.sh").with_timeout(Duration::from_secs(2));
+    let started = std::time::Instant::now();
+    let (code, why) = hook
+        .run_raw(&json!({}))
+        .expect("a sandboxed timeout is a deny, not an Err");
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "killed at the budget"
+    );
+    assert_eq!(code, tole_core::hooks::SANDBOX_REFUSED, "{why}");
+    assert_eq!(
+        why,
+        "turnend: the stop gate timed out after 2s inside the sandbox and was killed; \
+         a timeout is not a pass"
+    );
+    assert!(s.ws.join("gate-slow-started").exists(), "the gate did run");
+
+    write_script(&s.ws, "gate-quick.sh", "echo fine");
+    let (code, out) = turnend_hook("sh ./gate-quick.sh")
+        .with_timeout(Duration::from_secs(20))
+        .run_raw(&json!({}))
+        .unwrap();
+    assert_eq!((code, out.as_str()), (0, "fine"));
+}
+
 /// The verify command: `sh -c` in the same profile, exit status and output
 /// as without a sandbox.
 #[test]
