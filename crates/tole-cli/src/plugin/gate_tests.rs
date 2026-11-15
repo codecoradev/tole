@@ -237,3 +237,87 @@ fn the_secret_grant_is_the_approved_entry() {
     );
     assert_eq!(gate.secret_grant("other"), None);
 }
+
+const BUNDLE: &str = "name = \"acme\"\nversion = \"1\"\n[mcp_servers.srv]\nrun = \"srv\"\n\
+                      secrets = [\"A_TOKEN\", \"B_KEY\"]\n";
+
+/// A bundle approval with `secrets` granted, from a manifest file in `dir`.
+fn bundle_gate(tag: &str, secrets: &[&str]) -> (TestDir, PathBuf, PathBuf, TestDir) {
+    let dir = tmp(tag);
+    let ws = tmp(&format!("{tag}-ws"));
+    let user = dir.join("data").join(plugin_lock::LOCK_FILE);
+    let file = dir.join(crate::plugin::bundle::FILE);
+    std::fs::write(&file, BUNDLE).unwrap();
+    let loaded = crate::plugin::bundle::load(&file).unwrap();
+    let mut gate = Gate::load(Some(user.clone()), &ws);
+    gate.approve_with(
+        "srv",
+        "stdio:srv",
+        "1",
+        &tools(),
+        Approval {
+            integrity: Some(String::new()),
+            secrets: Some(secrets.iter().map(|s| s.to_string()).collect()),
+            bundle: Some(plugin_lock::BundleRef {
+                plugin: loaded.bundle.name.clone(),
+                version: loaded.bundle.version.clone(),
+                hash: loaded.hash.clone(),
+                path: loaded.path.display().to_string(),
+            }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    (dir, user, file, ws)
+}
+
+fn ledger(user: &Path) -> String {
+    std::fs::read_to_string(user.with_file_name(plugin_lock::LEDGER_FILE)).unwrap()
+}
+
+/// #811: the entry is bound to the manifest file it was approved from.
+#[test]
+fn a_changed_or_missing_bundle_manifest_blocks_the_server_and_its_grants() {
+    let (_dir, user, file, ws) = bundle_gate("pin", &["A_TOKEN"]);
+    let gate = Gate::load(Some(user.clone()), &ws);
+    assert!(gate.refuse_unseen("srv", "stdio:srv").is_none());
+    assert!(gate.check("srv", "stdio:srv", "1", &tools()).is_ok());
+    assert_eq!(gate.secret_grant("srv"), Some(vec!["A_TOKEN".to_string()]));
+    // Any byte change, a comment included.
+    std::fs::write(&file, format!("{BUNDLE}# harmless\n")).unwrap();
+    let why = gate.refuse_unseen("srv", "stdio:srv").unwrap();
+    assert!(why.contains("plugin manifest"), "{why}");
+    assert!(gate.check("srv", "stdio:srv", "1", &tools()).is_err());
+    assert!(ledger(&user).contains("bundle_change"));
+    // An unreadable manifest fails closed too; the original text admits again.
+    std::fs::remove_file(&file).unwrap();
+    assert!(gate.refuse_unseen("srv", "stdio:srv").is_some());
+    std::fs::write(&file, BUNDLE).unwrap();
+    assert!(gate.refuse_unseen("srv", "stdio:srv").is_none());
+}
+
+/// #811: the ledger shows which grants the owner gave.
+#[test]
+fn a_bundle_approval_records_each_grant_and_a_hand_added_one_is_blocked() {
+    let (_dir, user, _file, ws) = bundle_gate("ledger", &["A_TOKEN"]);
+    let text = ledger(&user);
+    assert!(text.contains("\"bundle_hash\"") && text.contains("\"event\":\"secret_grant\""));
+    assert!(
+        text.contains("A_TOKEN") && !text.contains("B_KEY"),
+        "{text}"
+    );
+    let mut lock = Lockfile::load(&user).unwrap();
+    lock.servers
+        .get_mut("srv")
+        .unwrap()
+        .secrets
+        .push("B_KEY".into());
+    lock.save(&user).unwrap();
+    let gate = Gate::load(Some(user), &ws);
+    assert!(gate.refuse_unseen("srv", "stdio:srv").is_some());
+    assert!(
+        gate.notes.iter().any(|n| n.contains("secret grant")),
+        "{:?}",
+        gate.notes
+    );
+}
