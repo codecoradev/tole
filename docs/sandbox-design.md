@@ -570,7 +570,7 @@ file_size_mb = 4096            # 1 to 1048576, largest file a process writes
   and every worktree `.git` file in it is covered. Cost: a sandboxed command
   cannot change files inside a child agent's worktree.
 
-  Layouts the plan cannot cover are REFUSED, not half protected (the launch
+  The layouts listed here are REFUSED, not half protected (the launch
   fails with the cause; `optional` follows its fallback policy): a linked
   worktree (`git worktree add`) whose `.git` file lies inside the workspace but
   not under `.tole-worktrees` (found through the registry
@@ -688,11 +688,23 @@ file_size_mb = 4096            # 1 to 1048576, largest file a process writes
     managers) leaves those scripts writable, and the host runs them.
   - A repository whose `commondir` or gitdir lives outside the workspace is
     outside the sandbox's view and not this plan's concern.
-  - A nested repository that is in neither `.gitmodules` nor
-    `.tole-worktrees` (a vendored clone, any `x/.git`) is part of the writable
-    workspace and is NOT protected: its config and hooks can be written, and
-    the owner's `git status` in the outer repository can fire a planted
-    nested `core.fsmonitor`.
+  - A nested repository that is not named by `.gitmodules` (an initialized
+    entry) or inside `.tole-worktrees` (a vendored clone, any `x/.git`) is part
+    of the writable workspace and is NOT protected: its config and hooks can be
+    written, and the owner's `git status` in the outer repository can fire a
+    planted `core.fsmonitor`.
+  - A gitlink recorded in the index with no `.gitmodules` entry (the usual
+    accidental embedded repository), including a directory that is empty or
+    missing: nothing names it, so a sandboxed command can `git init` there and
+    plant `core.fsmonitor` or a hook, and the host's plain `git status` in the
+    outer repository runs it. This is not the same as the missing top-level
+    `.git`/`.tole` above.
+  - Only the registry of the top-level gitdir is read for linked worktrees: a
+    worktree of a SUBMODULE (registered in `.git/modules/<name>/worktrees`) that
+    lies elsewhere in the workspace is not refused and not protected.
+  - A gitdir file or worktree back-pointer that names a path lexically outside
+    the workspace but reaching it through an external symlink alias is classed
+    as outside (git writes real paths, so this needs a hand-written pointer).
   - Files outside `.git` that run on the owner's host later cannot be
     protected by a mount: `.envrc`, Makefile, package scripts, `build.rs`, CI
     configs, `.husky`, `.pre-commit-config.yaml`, lefthook,
