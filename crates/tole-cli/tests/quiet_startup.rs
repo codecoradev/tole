@@ -16,7 +16,9 @@ const NOTICES: [&str; 3] = [
 ];
 
 fn startup_stderr(verbose: Option<&str>) -> String {
-    let dir = TestDir::new(&format!("tole-quiet-{}", verbose.unwrap_or("default")));
+    // Outside the checkout (cargo's target dir is inside it in CI): the test
+    // is about a cwd that is not a git checkout.
+    let dir = TestDir::in_system_temp(&format!("tole-quiet-{}", verbose.unwrap_or("default")));
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
     cmd.args(["run", "-s", dir.join("sessions").to_str().unwrap(), "hi"])
         .current_dir(&dir)
