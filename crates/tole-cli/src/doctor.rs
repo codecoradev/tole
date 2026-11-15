@@ -854,6 +854,15 @@ pub fn run_cli(
         Some(Ok(c)) => c.sandbox.as_ref().and_then(|s| s.policy().ok()),
         _ => None,
     };
+    // `--no-sandbox` (#750): the listing below reads "off", and the line
+    // from `doctor_lines` says a flag overrode the config.
+    // `--sandbox <profile>`: the process policy already carries the profile.
+    let sandbox = match tole_core::sandbox::flags::current() {
+        Some(tole_core::sandbox::flags::Override::Profile { .. }) => {
+            tole_core::sandbox::session_policy().or(sandbox)
+        }
+        _ => sandbox.filter(|_| !tole_core::sandbox::flags::no_sandbox_active()),
+    };
     for l in tole_core::sandbox::doctor_lines(sandbox.as_ref(), &tole_core::sandbox::detect()) {
         println!("{l}");
     }

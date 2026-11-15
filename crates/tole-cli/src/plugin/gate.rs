@@ -86,7 +86,7 @@ impl Gate {
                     notes,
                     user_path: user,
                     broken: Some(project_path),
-                    policy: tole_core::sandbox::policy(),
+                    policy: tole_core::sandbox::session_policy(),
                 };
             }
         };
@@ -103,7 +103,7 @@ impl Gate {
             notes,
             user_path: user,
             broken,
-            policy: tole_core::sandbox::policy(),
+            policy: tole_core::sandbox::session_policy(),
         }
     }
 
@@ -624,10 +624,27 @@ pub fn preflight(
             render_manifest(&cfg.name, &version, &tools),
             cfg.name
         );
+        // What is recorded is the OWNER'S configured profile, never a flag's:
+        // `--sandbox <p>` / `--no-sandbox` are per-run, and an approval that
+        // took their profile would make a one-off override permanent. A
+        // server that only differs because of such a flag stays blocked for
+        // this run and is not offered for approval.
+        let configured = source
+            .starts_with("stdio:")
+            .then(|| tole_core::sandbox::policy()?.profile_id(&cfg.name))
+            .flatten();
+        if matches!(a, Admission::ProfileChanged) && configured != profile {
+            eprintln!(
+                "tole: mcp[{}]: the sandbox flag of this run gives it another profile than the \
+                 one you approved: not registered; run without the flag",
+                cfg.name
+            );
+            continue;
+        }
         if ask(&text) {
             let with = Approval {
-                sandbox: profile.as_ref().map(|p| p.name.clone()),
-                sandbox_hash: profile.map(|p| p.hash),
+                sandbox: configured.as_ref().map(|p| p.name.clone()),
+                sandbox_hash: configured.map(|p| p.hash),
                 ..Default::default()
             };
             if let Err(e) = gate.approve_with(&cfg.name, &source_of(cfg), &version, &tools, with) {
