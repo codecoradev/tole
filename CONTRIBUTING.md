@@ -69,7 +69,28 @@ Never merge on schedule or assumption:
 4. Validate every finding against the code: real → fix with a regression
    test; false positive → dismiss **with evidence**.
 5. CI auto-fix loop: max 3 attempts, then stop and escalate.
-6. Squash-merge, delete the branch, sync `develop`.
+6. CI must have run on the merge result: the branch is up to date with
+   `develop` and green on that head (see "Series of dependent PRs" below).
+7. Squash-merge, delete the branch, sync `develop`.
+
+### Series of dependent PRs
+
+Two PRs can each be green alone and still break `develop` together (a
+semantic conflict, for example two PRs editing the same tests; #806). So:
+
+- After each squash merge of a series (or of any PR that touches files other
+  open PRs touch), update the next PR with the new `develop`
+  (`update_pull_request_branch`, or `git merge origin/develop` into the
+  branch; never a force-push) and wait until it is green again before
+  merging it. A green run from before the update does not count.
+- After every merge, look at the push-to-`develop` CI run (it runs on every
+  merge since #762). A red `develop` stops merging until it is fixed or
+  reverted; do not stack more PRs on it.
+- Preferred, and an owner setting: require branches to be up to date before
+  merging on `develop` (strict required status checks), or a merge queue on
+  `develop` and `main`, so CI runs on the merge result and this rule is
+  enforced instead of remembered. A repository ruleset can only be changed
+  by the owner; until it is, the rules above apply.
 
 ## Local review before a PR
 
@@ -184,6 +205,9 @@ cargo build --release -p tole-cli && ./target/release/tole doctor --tier full
 
 It must exit 0 (chat, streaming and a real tool-call loop all green); the
 result is recorded in the coverage ledger (`tole doctor --summary`).
+
+Release checklist, also before tagging: the latest push-to-`develop` CI run
+is green (and the release PR's own run), and no merged PR left `develop` red.
 
 ## Design rules
 
