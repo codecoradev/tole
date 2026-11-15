@@ -810,16 +810,6 @@ pub fn preflight(
             ),
         };
         let shown = secrets.clone().unwrap_or_else(default_grants);
-        let text = format!(
-            "{}\nIt will receive {}.\nMCP server `{}` {why}. Approve these tools? [y/N] ",
-            render_manifest(&cfg.name, &version, &tools),
-            if shown.is_empty() {
-                "no secret".to_string()
-            } else {
-                format!("the secret(s) {}", shown.join(", "))
-            },
-            cfg.name
-        );
         // What is recorded is the OWNER'S configured profile, never a flag's:
         // `--sandbox <p>` / `--no-sandbox` are per-run, and an approval that
         // took their profile would make a one-off override permanent.
@@ -828,6 +818,36 @@ pub fn preflight(
             .starts_with("stdio:")
             .then(|| tole_core::sandbox::policy()?.applied_profile(&cfg.name, &gate.backend()))
             .flatten();
+        // A terminal may approve a moved sandbox profile, but is told: the
+        // same rule `tole plugin approve` applies (`profile_moved`, decided
+        // by the ledger, with or without a lock entry).
+        let ledger = gate
+            .user_path
+            .as_deref()
+            .and_then(|u| u.parent().map(|d| d.join(plugin_lock::LEDGER_FILE)))
+            .and_then(|l| plugin_lock::read_ledger(&l).ok().flatten());
+        let moved = plugin_lock::profile_moved(
+            &gate.lock,
+            ledger.as_deref(),
+            &cfg.name,
+            configured.as_ref(),
+        );
+        let text = format!(
+            "{}\nIt will receive {}.\n{}MCP server `{}` {why}. Approve these tools? [y/N] ",
+            render_manifest(&cfg.name, &version, &tools),
+            if shown.is_empty() {
+                "no secret".to_string()
+            } else {
+                format!("the secret(s) {}", shown.join(", "))
+            },
+            if moved {
+                "! the sandbox profile differs from the one your ledger recorded at approval \
+                 (changed in the config, or the lock was edited or deleted)\n"
+            } else {
+                ""
+            },
+            cfg.name
+        );
         if ask(&text) {
             let with = Approval {
                 integrity: Some(job.integrity.clone()),

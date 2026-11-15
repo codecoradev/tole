@@ -350,6 +350,29 @@ fn a_project_pin_never_shrinks_the_user_grant_on_a_re_approval() {
 }
 
 #[test]
+fn a_server_whose_lock_entry_was_deleted_is_offered_with_the_ledgers_moved_profile_warning() {
+    let f = Fixture::new("cora");
+    // Approved WITH a sandbox profile, then the lock entry is deleted by hand:
+    // the ledger still says what was approved (the rule of `plugin approve`).
+    f.approve(Approval {
+        sandbox: Some("server".into()),
+        sandbox_hash: Some("sha256:approved".into()),
+        ..Default::default()
+    });
+    let mut lock = Lockfile::load(&f.user).unwrap();
+    lock.servers.clear();
+    lock.save(&f.user).unwrap();
+    let mut gate = f.gate();
+    let seen = f.prompts(&mut gate, false);
+    assert_eq!(seen.len(), 1, "a terminal is offered it");
+    assert!(
+        seen[0].contains("differs from the one your ledger recorded"),
+        "{}",
+        seen[0]
+    );
+}
+
+#[test]
 fn an_owner_who_declines_a_changed_server_changes_nothing() {
     let f = Fixture::new("cora");
     f.gate()
