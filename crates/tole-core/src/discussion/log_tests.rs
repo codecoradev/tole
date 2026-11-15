@@ -759,7 +759,7 @@ fn a_log_reached_through_a_symlink_is_refused() {
 
 #[test]
 fn a_retry_is_one_charged_recorded_call_of_a_settled_one() {
-    let l = log("retry");
+    let (l, _dir) = log("retry");
     l.start(contract(None, 10_000), 1).unwrap();
     let c1 = go(l.reserve(1, "participant-coder", 3_000, 2).unwrap());
     let retry = |what: &str, round: u32, of: &str| l.reserve_retry(round, what, 100, of, 3);
@@ -791,7 +791,7 @@ fn a_retry_is_one_charged_recorded_call_of_a_settled_one() {
 
 #[test]
 fn a_retry_that_does_not_fit_records_the_budget_escalation() {
-    let l = log("retry-budget");
+    let (l, _dir) = log("retry-budget");
     l.start(contract(None, 1_000), 1).unwrap();
     let c1 = go(l.reserve(1, "participant-coder", 400, 2).unwrap());
     l.settle(&c1, 400, 3).unwrap();
