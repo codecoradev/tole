@@ -187,6 +187,24 @@ pub fn policy() -> Option<Policy> {
     POLICY.get().cloned().flatten()
 }
 
+static LAZY_START: OnceLock<bool> = OnceLock::new();
+
+/// Sets `[sandbox] lazy_start` (#750) once per process: locked, sandboxed
+/// stdio servers register from the locked snapshot and start on first use.
+/// A second call with another value is refused, like [`set_policy`].
+pub fn set_lazy_start(on: bool) -> Result<(), String> {
+    if *LAZY_START.get_or_init(|| on) == on {
+        Ok(())
+    } else {
+        Err("the sandbox lazy_start setting is already set for this process and differs".into())
+    }
+}
+
+/// Whether lazy start is on (default off).
+pub fn lazy_start() -> bool {
+    LAZY_START.get().copied().unwrap_or(false)
+}
+
 /// Marks this process as an unattended run (cron job, `tole serve`):
 /// no human can answer, so `optional` counts as `required`.
 pub fn mark_unattended() {

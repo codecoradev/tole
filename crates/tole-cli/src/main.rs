@@ -1144,6 +1144,11 @@ fn dispatch(cli: Cli) -> Result<()> {
     if let Err(e) = tole_core::sandbox::set_policy(sandbox_policy) {
         eprintln!("tole: warning: {e}");
     }
+    if let Err(e) =
+        tole_core::sandbox::set_lazy_start(sandbox_cfg.and_then(|s| s.lazy_start).unwrap_or(false))
+    {
+        eprintln!("tole: warning: {e}");
+    }
     // Sandbox of the commands a model makes the host run (#748): off unless
     // `[sandbox.consumers]` says so; validated at load, user layer only.
     if let Err(e) = tole_core::sandbox::command::set_consumers(

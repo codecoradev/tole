@@ -866,6 +866,14 @@ pub fn run_cli(
     for l in tole_core::sandbox::doctor_lines(sandbox.as_ref(), &tole_core::sandbox::detect()) {
         println!("{l}");
     }
+    // Lazy start (#750): which servers register from the lock's snapshot.
+    if matches!(&user, Some(Ok(c)) if c.sandbox.as_ref().and_then(|s| s.lazy_start) == Some(true)) {
+        println!(
+            "sandbox: lazy start on (a locked, sandboxed stdio server with a complete snapshot \
+             starts on its first call, after the same lock checks; any other server starts at \
+             session start)"
+        );
+    }
     // Sandbox of model commands (#748): which tools run in the `command`
     // profile and whether a working sandbox is there for them. A consumer
     // that cannot run (required, or unattended optional, with no sandbox)
