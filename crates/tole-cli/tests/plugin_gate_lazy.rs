@@ -3,7 +3,7 @@
 //! approved profile no longer matches is refused and its process is never
 //! started. The guard is built exactly as the roster builds it.
 
-#![cfg(unix)]
+#![cfg(all(unix, feature = "mcp"))]
 
 mod common;
 use common::TestDir;
