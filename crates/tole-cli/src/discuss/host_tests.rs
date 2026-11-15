@@ -1047,7 +1047,7 @@ fn the_factory_builds_providers_with_the_configured_request_timeout() {
 /// off a run whose first call times out under a big budget.
 fn first_estimate(tag: &str) -> u64 {
     let (_, make) = script(&[("coder", vec![times_out(None), text("ok", 1)])]);
-    let l = log(tag);
+    let (l, _dir) = log(tag);
     let d = driver(l.clone(), make, 10_000_000);
     d.start(contract(1_000_000, Some(1))).unwrap();
     d.run().unwrap();
@@ -1072,7 +1072,7 @@ fn a_timed_out_call_with_no_usage_is_charged_its_estimate_and_says_why() {
     let est = first_estimate("charge-est");
     assert!(est > 100, "the estimate is not the 0 of a free call: {est}");
     let (_, make) = script(&[("coder", vec![times_out(None), text("late", 10)])]);
-    let l = log("charge-one");
+    let (l, _dir) = log("charge-one");
     let d = driver(l.clone(), make, 10_000_000);
     d.start(contract(1_000_000, None)).unwrap();
     d.run().unwrap();
@@ -1086,7 +1086,7 @@ fn a_timed_out_call_with_no_usage_is_charged_its_estimate_and_says_why() {
 #[test]
 fn a_reported_usage_still_wins_over_the_estimate_on_a_timeout() {
     let (_, make) = script(&[("coder", vec![times_out(Some(40)), text("ok", 60)])]);
-    let l = log("charge-usage");
+    let (l, _dir) = log("charge-usage");
     let d = driver(l.clone(), make, 10_000_000);
     d.start(contract(1_000_000, Some(1))).unwrap();
     d.run().unwrap();
@@ -1098,7 +1098,7 @@ fn two_timeouts_cost_two_estimates_and_the_budget_stops_the_discussion() {
     let est = first_estimate("charge-two-est");
     // Room for two estimates, not three.
     let (s, make) = script(&[("coder", vec![times_out(None), times_out(None)])]);
-    let l = log("charge-two");
+    let (l, _dir) = log("charge-two");
     let d = driver(l.clone(), make, 10_000_000);
     d.start(contract(2 * est + 10, None)).unwrap();
     let e = d.run().unwrap_err();
@@ -1123,7 +1123,7 @@ fn two_timeouts_cost_two_estimates_and_the_budget_stops_the_discussion() {
 fn a_retry_that_does_not_fit_after_a_charged_timeout_is_the_budget_stop() {
     let est = first_estimate("charge-fit-est");
     let (s, make) = script(&[("coder", vec![times_out(None), text("never", 1)])]);
-    let l = log("charge-fit");
+    let (l, _dir) = log("charge-fit");
     let d = driver(l.clone(), make, 10_000_000);
     d.start(contract(2 * est - 1, None)).unwrap();
     let out = d.run().unwrap();
@@ -1139,7 +1139,7 @@ fn a_failure_before_the_request_left_is_not_charged() {
         .enumerate()
     {
         let (s, make) = script(&[("coder", vec![fails_with(msg, None)])]);
-        let l = log(&format!("charge-pre-{i}"));
+        let (l, _dir) = log(&format!("charge-pre-{i}"));
         let d = driver(l.clone(), make, 10_000_000);
         d.start(contract(100_000, Some(1))).unwrap();
         d.run().unwrap_err();
@@ -1157,7 +1157,7 @@ fn a_failure_before_the_request_left_is_not_charged() {
             fails_with("timeout: connect", None),
         ],
     )]);
-    let l = log("charge-pre-connect");
+    let (l, _dir) = log("charge-pre-connect");
     let d = driver(l.clone(), make, 10_000_000);
     d.start(contract(100_000, Some(1))).unwrap();
     d.run().unwrap_err();
@@ -1178,7 +1178,7 @@ fn any_other_failure_without_usage_after_the_send_is_charged_unreported() {
     .enumerate()
     {
         let (_, make) = script(&[("coder", vec![fails_with(msg, None)])]);
-        let l = log(&format!("charge-other-{i}"));
+        let (l, _dir) = log(&format!("charge-other-{i}"));
         let d = driver(l.clone(), make, 10_000_000);
         d.start(contract(100_000, Some(1))).unwrap();
         d.run().unwrap_err();
