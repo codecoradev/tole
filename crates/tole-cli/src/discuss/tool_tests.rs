@@ -28,11 +28,22 @@ fn rig(tag: &str, allows: &[&str], usage: u64, answer: Answer) -> Rig {
 
 /// A rig whose children are `bin`, with a machine guard that never waits.
 fn rig_with(tag: &str, allows: &[&str], usage: u64, answer: Answer, bin: PathBuf) -> Rig {
+    rig_cfg(tag, CONFIG, allows, usage, answer, bin)
+}
+
+fn rig_cfg(
+    tag: &str,
+    config: &str,
+    allows: &[&str],
+    usage: u64,
+    answer: Answer,
+    bin: PathBuf,
+) -> Rig {
     let root = tmp(&format!("tool-{tag}"));
     let data = root.join("data");
     std::fs::create_dir_all(&data).unwrap();
     let setup = Setup {
-        cfg: crate::config::parse(CONFIG, Path::new("user.toml")).unwrap(),
+        cfg: crate::config::parse(config, Path::new("user.toml")).unwrap(),
         data_dir: Some(data.clone()),
         thresholds: Some(tole_core::resource_guard::Thresholds {
             min_free_memory_mb: 0,
@@ -688,4 +699,77 @@ fn a_reviewer_must_be_a_profile_the_caller_may_seat() {
     let err = r.host.start(&i).unwrap_err();
     assert!(err.contains("`wide`"), "{err}");
     assert!(discussion_nodes(&r).is_empty() && participant_nodes(&r).is_empty());
+}
+
+// ---- #856: the participant count is advice, not a limit ----
+
+fn wide_rig(tag: &str, goal_budget: u64) -> Rig {
+    let mut cfg = format!("[delegation]\ngoal_budget = {goal_budget}\n");
+    for i in 1..=17 {
+        cfg.push_str(&format!("[profiles.voice-{i}]\n"));
+    }
+    rig_cfg(tag, &cfg, &[], 100, agreeable(), PathBuf::from("/bin/true"))
+}
+
+fn wide_input(n: usize, budget: u64) -> Value {
+    let mut i = input();
+    i["participants"] = json!((1..=n).map(|k| format!("voice-{k}")).collect::<Vec<_>>());
+    i["budget_tokens"] = json!(budget);
+    i["max_rounds"] = json!(1);
+    i
+}
+
+#[test]
+fn the_result_carries_advice_above_eight_voices_and_none_at_eight() {
+    let r = wide_rig("advice", 4_000_000);
+    let at_eight = r.host.start(&wide_input(8, 600_000)).unwrap();
+    assert!(at_eight.get("advice").is_none(), "{at_eight}");
+    wait_closed(&r, &id_of(&at_eight));
+    // Twelve voices are accepted: advice, not an error, and it runs.
+    let out = r.host.start(&wide_input(12, 600_000)).unwrap();
+    assert_eq!(out["status"], "running", "{out}");
+    let advice = out["advice"].as_array().unwrap();
+    assert_eq!(advice.len(), 1, "{out}");
+    let line = advice[0].as_str().unwrap();
+    assert!(
+        line.starts_with("12 participants: more than 8 voices mostly add cost")
+            && line.contains("3 to 8 is the sweet spot"),
+        "{line}"
+    );
+    wait_closed(&r, &id_of(&out));
+}
+
+#[test]
+fn a_budget_that_cannot_fit_one_round_is_advised_not_refused() {
+    let r = wide_rig("advice-tiny", 4_000_000);
+    let out = r.host.start(&wide_input(12, 2_000)).unwrap();
+    let advice = out["advice"].as_array().unwrap();
+    assert_eq!(advice.len(), 2, "{out}");
+    assert!(
+        advice[1]
+            .as_str()
+            .unwrap()
+            .contains("budget escalation in round 1"),
+        "{out}"
+    );
+    // It still cannot spend more than carved: the budget is the hard stop.
+    let v = wait_closed(&r, &id_of(&out));
+    assert!(v["tokens_used"].as_u64().unwrap() <= 2_000, "{v}");
+}
+
+#[test]
+fn above_the_ceiling_the_tool_refuses_before_carving_and_names_it() {
+    let r = wide_rig("ceiling", 4_000_000);
+    let err = r.host.start(&wide_input(17, 600_000)).unwrap_err();
+    assert!(
+        err.contains("at most 16") && err.contains("ledger record"),
+        "{err}"
+    );
+    assert!(discussion_nodes(&r).is_empty(), "nothing was carved");
+    assert!(r.calls.lock().unwrap().is_empty());
+    let spec = DiscussTool(Arc::clone(&r.host)).spec().unwrap().to_string();
+    assert!(
+        !spec.contains("1 to 8") && spec.contains("3 to 8 is the sweet spot"),
+        "{spec}"
+    );
 }

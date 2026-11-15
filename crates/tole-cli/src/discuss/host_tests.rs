@@ -1187,3 +1187,95 @@ fn any_other_failure_without_usage_after_the_send_is_charged_unreported() {
         assert_eq!(d.pot.used(), est, "{msg}");
     }
 }
+
+/// A runner that counts how many children are alive at once.
+#[derive(Default)]
+struct Counting {
+    live: Mutex<std::collections::BTreeSet<String>>,
+    peak: Mutex<usize>,
+    started: Mutex<Vec<String>>,
+}
+
+impl Independent for Counting {
+    fn start(&self, who: &str, _task: &str, _tokens: u64, key: &str) -> Result<String, String> {
+        let node = format!("n-{key}");
+        let mut live = self.live.lock().unwrap();
+        live.insert(node.clone());
+        let mut peak = self.peak.lock().unwrap();
+        *peak = (*peak).max(live.len());
+        self.started.lock().unwrap().push(who.into());
+        Ok(node)
+    }
+    fn find(&self, _key: &str) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+    fn poll(&self, handle: &str) -> Result<Option<(String, u64)>, String> {
+        self.live.lock().unwrap().remove(handle);
+        Ok(Some(("a short review".into(), INDEPENDENT_MIN_TOKENS)))
+    }
+}
+
+/// #856: independent participants take their turns one after the other, so
+/// the number of voices never raises the number of live processes (the
+/// machine guard and depth caps of the delegation tree apply to each child
+/// as before); the cost of a child (at least `INDEPENDENT_MIN_TOKENS`) is
+/// still reserved against the discussion's budget first, which stops a
+/// discussion whose voices cost more than it holds.
+#[test]
+fn sixteen_independent_participants_run_one_process_at_a_time_within_the_budget() {
+    let names: Vec<String> = (1..=16).map(|i| format!("voice-{i}")).collect();
+    let voices: BTreeMap<String, Voice> = names
+        .iter()
+        .map(|n| {
+            (
+                n.clone(),
+                Voice {
+                    persona: None,
+                    model: None,
+                },
+            )
+        })
+        .collect();
+    let mk = |tag: &str, budget: u64| {
+        let (l, dir) = log(tag);
+        let (_s, make) = script(&[("checker", vec![checker_met(1)])]);
+        let runner = Arc::new(Counting::default());
+        let d = Driver::new(
+            l,
+            secrets(),
+            voices.clone(),
+            (None, None),
+            make,
+            Arc::new(Budget::new(10_000_000)),
+        )
+        .with_clock(|| 1)
+        .with_independent(&names, runner.clone())
+        .unwrap()
+        .with_poll_every(std::time::Duration::ZERO);
+        let c = Contract::new(
+            "pick-db",
+            "Which database?",
+            &["a choice is named".to_string()],
+            &names,
+            budget,
+            Some(1),
+            &secrets(),
+        )
+        .unwrap();
+        d.start(c).unwrap();
+        (d, runner, dir)
+    };
+    // A budget for sixteen children: all run, never two at once.
+    let (d, runner, _dir) = mk("wide-ind", 2_000_000);
+    d.run().unwrap();
+    assert_eq!(runner.started.lock().unwrap().len(), 16);
+    assert_eq!(*runner.peak.lock().unwrap(), 1);
+    // A budget for fewer than sixteen: a clear budget stop, not a hang, and
+    // no child is left running.
+    let (d, runner, _dir) = mk("wide-ind-small", 5 * INDEPENDENT_MIN_TOKENS);
+    let out = d.run().unwrap();
+    assert_eq!(out.gate, Gate::Escalate(Reason::Budget));
+    assert!(runner.started.lock().unwrap().len() < 16);
+    assert!(runner.live.lock().unwrap().is_empty());
+    assert_eq!(*runner.peak.lock().unwrap(), 1);
+}
