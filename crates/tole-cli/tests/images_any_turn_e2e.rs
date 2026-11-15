@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 use std::io::BufRead;
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 #[cfg(feature = "shell-tools")]
 use std::sync::mpsc;
@@ -379,7 +379,7 @@ fn acp_image_blocks_are_spilled_recorded_and_image_only_prompts_run() {
     assert_eq!(users[0]["text"], "");
     let img = &users[0]["images"][0];
     assert_eq!(img["mime"], "image/png", "sniffed, not the declared jpeg");
-    let spilled = PathBuf::from(img["path"].as_str().unwrap());
+    let spilled = std::path::PathBuf::from(img["path"].as_str().unwrap());
     assert!(spilled.starts_with(home.join("tole/images")), "{spilled:?}");
     assert_eq!(std::fs::read(&spilled).unwrap(), PNG);
     assert_eq!(users[1]["text"], "and now?");
