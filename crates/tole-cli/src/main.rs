@@ -169,7 +169,9 @@ struct Cli {
     config: Option<PathBuf>,
 
     /// Ignore the project config file AND the user config (#208, #433): no
-    /// discovery, no trust check, no output.
+    /// discovery, no trust check, no output. Owner at a terminal only
+    /// (#855): refused under an agent session and for `serve`, `acp` and
+    /// `mcp`.
     #[arg(long, global = true, conflicts_with = "config")]
     no_config: bool,
 
@@ -867,6 +869,16 @@ fn main() {
     };
     #[cfg(not(feature = "tui"))]
     let cli = Cli::parse();
+    // `--no-config` drops the owner's user config: owner at a terminal only
+    // (#855). Before anything reads the config or starts a command.
+    let no_config_ctx = tole_cli::no_config_guard::Context {
+        under_session: tole_core::child_env::under_session(&|k| std::env::var(k).ok()),
+        unattended_command: sandbox_flag_class(&cli.command).0,
+    };
+    if let Err(e) = tole_cli::no_config_guard::check(cli.no_config, &no_config_ctx) {
+        eprintln!("tole: {e}");
+        std::process::exit(1);
+    }
     // `--review-gate` travels as the env var the roster reads, so child
     // agents (which inherit the environment) are gated the same way.
     #[cfg(feature = "shell-tools")]
@@ -1465,14 +1477,14 @@ fn dispatch(cli: Cli) -> Result<()> {
             // --allow), so --on-pretool/--on-posttool error out loudly
             // instead of being ignored.
             if host.on_pretool_non_empty() || host.on_posttool_non_empty() {
-                return Err(refuse(
+                return Err(refuse_unattended(
                     "--on-pretool/--on-posttool are not supported by `tole mcp` \
                      (server mode pre-authorizes Write tools with --allow instead)",
                     pretool_from_config(&settings),
                 ));
             }
             if !host.on_turnend.is_empty() {
-                return Err(refuse(
+                return Err(refuse_unattended(
                     "--on-turnend is not supported by `tole mcp` (the tool server runs no \
                      turns; stop gates apply to run/chat/resume/serve/acp sessions)",
                     from_config(&settings.on_turnend),
@@ -1712,7 +1724,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             // does not wire local pre/post hooks — approvals happen in
             // the editor via permission requests instead.
             if host.on_pretool_non_empty() || host.on_posttool_non_empty() {
-                return Err(refuse(
+                return Err(refuse_unattended(
                     "--on-pretool/--on-posttool are not supported by `tole acp` \
                      (approvals happen via session/request_permission in the client)",
                     pretool_from_config(&settings),
@@ -1757,7 +1769,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             // flags have no server-face wiring, and a silent no-op is
             // worse than a startup error (scan-3 #9).
             if host.on_pretool_non_empty() || host.on_posttool_non_empty() {
-                return Err(refuse(
+                return Err(refuse_unattended(
                     "--on-pretool/--on-posttool are not supported by `tole serve` \
                      (a server has no local human; pre-authorize Write tools with --allow)",
                     pretool_from_config(&settings),
@@ -2474,16 +2486,38 @@ fn check_client_session_flags(
 /// from a config must never be silently dropped on a face that cannot
 /// honor it.
 fn refuse(msg: &str, layer: Option<tole_cli::config_apply::Source>) -> anyhow::Error {
-    match layer {
-        Some(layer) => anyhow::anyhow!(
-            "{msg} (the value comes from the {}; \
-             use --no-config to ignore the config files)",
-            match layer {
-                tole_cli::config_apply::Source::UserConfig => "user config",
-                _ => "project config",
-            }
-        ),
-        None => anyhow::anyhow!("{msg}"),
+    refuse_for(msg, layer, false)
+}
+
+/// [`refuse`] for `tole serve`, `acp` and `mcp`: `--no-config` is refused
+/// there (#855), so the way out is to edit the config file.
+#[cfg(feature = "shell-tools")]
+fn refuse_unattended(msg: &str, layer: Option<tole_cli::config_apply::Source>) -> anyhow::Error {
+    refuse_for(msg, layer, true)
+}
+
+fn refuse_for(
+    msg: &str,
+    layer: Option<tole_cli::config_apply::Source>,
+    unattended: bool,
+) -> anyhow::Error {
+    let Some(layer) = layer else {
+        return anyhow::anyhow!("{msg}");
+    };
+    let layer = match layer {
+        tole_cli::config_apply::Source::UserConfig => "user config",
+        _ => "project config",
+    };
+    if unattended {
+        anyhow::anyhow!(
+            "{msg} (the value comes from the {layer}; remove it from that config file, \
+             --no-config is refused for this face)"
+        )
+    } else {
+        anyhow::anyhow!(
+            "{msg} (the value comes from the {layer}; \
+             use --no-config to ignore the config files)"
+        )
     }
 }
 
@@ -2536,7 +2570,8 @@ fn check_server_face_flags(
                 tole_cli::config_apply::SKILL_ENV
             );
         }
-        refuse(&e.to_string(), cfg)
+        // `mission` is attended: it keeps the `--no-config` way out.
+        refuse_for(&e.to_string(), cfg, face != "mission")
     })
 }
 
