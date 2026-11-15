@@ -646,13 +646,34 @@ impl Driver {
         let mut provider = (self.make)(model, system);
         let out = provider.complete(std::slice::from_ref(&sent));
         // What was spent is counted, whatever the outcome; with no usage
-        // reported, the estimate.
-        let spent = match provider.last_usage() {
-            Some(u) => crate::advisor_host::tokens(&u),
-            None if out.is_ok() => need,
-            None => 0,
+        // reported, the estimate. That includes a failure after the request
+        // may have left (a timeout above all): the provider can have
+        // generated, and billed, the reply before we gave up, so the call
+        // is charged its estimate, like a crashed one (#804). Only a failure
+        // that provably came before anything was sent costs nothing.
+        let spent = match (provider.last_usage(), &out) {
+            (Some(u), _) => {
+                let spent = crate::advisor_host::tokens(&u);
+                self.log.settle(&call, spent, (self.now)())?;
+                spent
+            }
+            (None, Ok(_)) => {
+                self.log.settle(&call, need, (self.now)())?;
+                need
+            }
+            (None, Err(e)) if tole_core::failover::request_may_have_been_sent(&e.0) => {
+                let why = if tole_core::failover::is_timeout_error(&e.0) {
+                    "timeout"
+                } else {
+                    "unreported"
+                };
+                self.log.settle_charged(&call, why, (self.now)())?
+            }
+            (None, Err(_)) => {
+                self.log.settle(&call, 0, (self.now)())?;
+                0
+            }
         };
-        self.log.settle(&call, spent, (self.now)())?;
         self.pot.charge(spent);
         Ok(Some((call, out)))
     }

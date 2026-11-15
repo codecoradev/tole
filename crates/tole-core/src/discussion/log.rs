@@ -90,6 +90,12 @@ pub enum Event {
     Settle {
         call: String,
         tokens: u64,
+        /// Why the call was charged its estimate though it reported no
+        /// usage (`timeout`, `unreported`; #804): the audit note. Absent on
+        /// a call that settled at what the provider reported. Old readers
+        /// ignore the field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        charged: Option<String>,
     },
     /// What the host saw after `round` that only it can see.
     Flags {
@@ -158,6 +164,8 @@ pub struct Reservation {
     pub settled: Option<u64>,
     /// The call this one retried after a timeout (#756).
     pub retry_of: Option<String>,
+    /// Why a settled call was charged its estimate (#804), if it was.
+    pub charged: Option<String>,
 }
 
 /// The answer to [`DiscussionLog::reserve`].
@@ -233,6 +241,7 @@ impl State {
                         handle: None,
                         settled: None,
                         retry_of,
+                        charged: None,
                     },
                 );
             }
@@ -241,9 +250,14 @@ impl State {
                     r.handle = Some(handle);
                 }
             }
-            Event::Settle { call, tokens } => {
+            Event::Settle {
+                call,
+                tokens,
+                charged,
+            } => {
                 if let Some(r) = self.reservations.get_mut(&call) {
                     if r.settled.is_none() {
+                        r.charged = charged;
                         self.tokens_used = self
                             .tokens_used
                             .saturating_sub(r.tokens)
@@ -693,6 +707,33 @@ impl DiscussionLog {
 
     /// Record what a reserved call spent, once; it replaces the estimate.
     pub fn settle(&self, call: &str, tokens: u64, now: u64) -> Result<(), String> {
+        self.settle_as(call, tokens, None, now)
+    }
+
+    /// [`DiscussionLog::settle`] for a call that reported no usage but may
+    /// have spent (a transport timeout, a failure after the request was
+    /// sent; #804): it is charged its reserved estimate, never more (the
+    /// estimate is the call's carve), and the record says why in `charged`.
+    /// Like any settle it is final: a resume cannot charge the call again.
+    /// Returns the tokens charged.
+    pub fn settle_charged(&self, call: &str, why: &str, now: u64) -> Result<u64, String> {
+        let tokens = self
+            .state()?
+            .reservations
+            .get(call)
+            .map(|r| r.tokens)
+            .ok_or_else(|| format!("no reserved call {call}"))?;
+        self.settle_as(call, tokens, Some(why.to_string()), now)?;
+        Ok(tokens)
+    }
+
+    fn settle_as(
+        &self,
+        call: &str,
+        tokens: u64,
+        charged: Option<String>,
+        now: u64,
+    ) -> Result<(), String> {
         let _guard = self.lock()?;
         let st = self.state()?;
         if st.closed.is_some() {
@@ -708,6 +749,7 @@ impl DiscussionLog {
             Event::Settle {
                 call: call.to_string(),
                 tokens,
+                charged,
             },
             now,
         )

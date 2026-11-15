@@ -1029,3 +1029,150 @@ fn the_factory_builds_providers_with_the_configured_request_timeout() {
     let make = factory(cfg, secrets(), secs(33));
     let _ = make(Some("other"), "sys");
 }
+
+// ------------------------------------------------ a timeout is charged (#804)
+
+/// The estimate the driver reserves for the first call of the coder: read
+/// off a run whose first call times out under a big budget.
+fn first_estimate(tag: &str) -> u64 {
+    let (_, make) = script(&[("coder", vec![times_out(None), text("ok", 1)])]);
+    let l = log(tag);
+    let d = driver(l.clone(), make, 10_000_000);
+    d.start(contract(1_000_000, Some(1))).unwrap();
+    d.run().unwrap();
+    let st = l.state().unwrap();
+    let first = st
+        .reservations
+        .values()
+        .find(|r| r.what == "participant-coder" && r.retry_of.is_none())
+        .unwrap();
+    first.tokens
+}
+
+fn charged(st: &State) -> Vec<(String, u64)> {
+    st.reservations
+        .values()
+        .filter_map(|r| r.charged.clone().map(|why| (why, r.settled.unwrap())))
+        .collect()
+}
+
+#[test]
+fn a_timed_out_call_with_no_usage_is_charged_its_estimate_and_says_why() {
+    let est = first_estimate("charge-est");
+    assert!(est > 100, "the estimate is not the 0 of a free call: {est}");
+    let (_, make) = script(&[("coder", vec![times_out(None), text("late", 10)])]);
+    let l = log("charge-one");
+    let d = driver(l.clone(), make, 10_000_000);
+    d.start(contract(1_000_000, None)).unwrap();
+    d.run().unwrap();
+    let st = l.state().unwrap();
+    assert_eq!(charged(&st), [("timeout".to_string(), est)]);
+    // The charge reaches the ledger and the goal's pot alike.
+    assert!(st.tokens_used >= est + 10);
+    assert_eq!(d.pot.used(), st.tokens_used);
+}
+
+#[test]
+fn a_reported_usage_still_wins_over_the_estimate_on_a_timeout() {
+    let (_, make) = script(&[("coder", vec![times_out(Some(40)), text("ok", 60)])]);
+    let l = log("charge-usage");
+    let d = driver(l.clone(), make, 10_000_000);
+    d.start(contract(1_000_000, Some(1))).unwrap();
+    d.run().unwrap();
+    assert!(charged(&l.state().unwrap()).is_empty());
+}
+
+#[test]
+fn two_timeouts_cost_two_estimates_and_the_budget_stops_the_discussion() {
+    let est = first_estimate("charge-two-est");
+    // Room for two estimates, not three.
+    let (s, make) = script(&[("coder", vec![times_out(None), times_out(None)])]);
+    let l = log("charge-two");
+    let d = driver(l.clone(), make, 10_000_000);
+    d.start(contract(2 * est + 10, None)).unwrap();
+    let e = d.run().unwrap_err();
+    assert!(e.contains("timeout"), "{e}");
+    assert_eq!(kinds(&s), ["coder", "coder"]);
+    let st = l.state().unwrap();
+    assert_eq!(st.tokens_used, 2 * est, "not 0: two estimates");
+    assert_eq!(d.pot.used(), 2 * est, "the goal's pot is charged too");
+    assert_eq!(retries(&st).len(), 1);
+    assert_eq!(charged(&st).len(), 2);
+    // Resume: a third call no longer fits; the existing escalation stops it,
+    // and nothing already settled is charged again.
+    let out = d.run().unwrap();
+    assert_eq!(out.gate, Gate::Escalate(Reason::Budget));
+    assert_eq!(kinds(&s), ["coder", "coder"], "no third call was made");
+    assert_eq!(out.tokens_used, 2 * est, "resume does not double charge");
+    assert_eq!(l.state().unwrap().tokens_used, 2 * est);
+    assert_eq!(d.pot.used(), 2 * est);
+}
+
+#[test]
+fn a_retry_that_does_not_fit_after_a_charged_timeout_is_the_budget_stop() {
+    let est = first_estimate("charge-fit-est");
+    let (s, make) = script(&[("coder", vec![times_out(None), text("never", 1)])]);
+    let l = log("charge-fit");
+    let d = driver(l.clone(), make, 10_000_000);
+    d.start(contract(2 * est - 1, None)).unwrap();
+    let out = d.run().unwrap();
+    assert_eq!(out.gate, Gate::Escalate(Reason::Budget));
+    assert_eq!(kinds(&s), ["coder"]);
+    assert_eq!(out.tokens_used, est);
+}
+
+#[test]
+fn a_failure_before_the_request_left_is_not_charged() {
+    for (i, msg) in ["connection failed", "host not found", "rustls: bad cert"]
+        .into_iter()
+        .enumerate()
+    {
+        let (s, make) = script(&[("coder", vec![fails_with(msg, None)])]);
+        let l = log(&format!("charge-pre-{i}"));
+        let d = driver(l.clone(), make, 10_000_000);
+        d.start(contract(100_000, Some(1))).unwrap();
+        d.run().unwrap_err();
+        assert_eq!(kinds(&s), ["coder"], "{msg}");
+        let st = l.state().unwrap();
+        assert_eq!(st.tokens_used, 0, "{msg}");
+        assert!(charged(&st).is_empty(), "{msg}");
+        assert_eq!(d.pot.used(), 0, "{msg}");
+    }
+    // A connect timeout is retried like any timeout, and still free.
+    let (s, make) = script(&[(
+        "coder",
+        vec![
+            fails_with("timeout: connect", None),
+            fails_with("timeout: connect", None),
+        ],
+    )]);
+    let l = log("charge-pre-connect");
+    let d = driver(l.clone(), make, 10_000_000);
+    d.start(contract(100_000, Some(1))).unwrap();
+    d.run().unwrap_err();
+    assert_eq!(kinds(&s), ["coder", "coder"]);
+    assert_eq!(l.state().unwrap().tokens_used, 0);
+}
+
+#[test]
+fn any_other_failure_without_usage_after_the_send_is_charged_unreported() {
+    let est = first_estimate("charge-other-est");
+    for (i, msg) in [
+        "io: Connection reset by peer",
+        "http status: 502 \u{2014} bad gateway",
+        "stream read: timed out",
+        "unheard of",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (_, make) = script(&[("coder", vec![fails_with(msg, None)])]);
+        let l = log(&format!("charge-other-{i}"));
+        let d = driver(l.clone(), make, 10_000_000);
+        d.start(contract(100_000, Some(1))).unwrap();
+        d.run().unwrap_err();
+        let st = l.state().unwrap();
+        assert_eq!(charged(&st), [("unreported".to_string(), est)], "{msg}");
+        assert_eq!(d.pot.used(), est, "{msg}");
+    }
+}
