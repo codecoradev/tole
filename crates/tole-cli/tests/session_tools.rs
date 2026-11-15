@@ -360,10 +360,9 @@ fn session_detach_tool_flags_only_a_running_turn_and_jobs_nudge_the_session() {
             .execute(json!({"command": "sh -c 'sleep 0.2'"}))
             .unwrap();
         let id = job["job"].as_str().unwrap().to_string();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while token.interrupts().is_empty() && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
+        common::wait_until(common::WAIT, "the finished job's interrupt notice", || {
+            !token.interrupts().is_empty()
+        });
         let q = token.interrupts().drain();
         assert_eq!(q.len(), 1, "{q:?}");
         assert!(q[0].text.contains(&id), "{}", q[0].text);

@@ -11,7 +11,7 @@
 #![cfg(feature = "shell-tools")]
 
 mod common;
-use common::TestDir;
+use common::{Gate, TestDir};
 use serde_json::{json, Value};
 use std::io::{BufRead, Read, Write};
 use std::net::TcpListener;
@@ -134,8 +134,8 @@ impl Drop for AcpProcess {
     }
 }
 
-/// Mock provider: a `DELAYED` prompt gets its answer after a 2 s sleep
-/// (so the cancel can land mid-provider-call); anything else — or any
+/// Mock provider: a `DELAYED` prompt is held at a [`Gate`] until the test
+/// opens it (so the cancel can land mid-provider-call); anything else — or any
 /// step after a tool result — answers immediately with a Final.
 /// `TOOL_MISSION` asks for a write_file tool call instead.
 /// Convert a plain chat-completion reply into an SSE stream body
@@ -206,11 +206,14 @@ fn sse_response(reply: &Value, streamed: bool) -> String {
     }
 }
 
-fn spawn_mock() -> String {
+fn spawn_mock() -> (String, Arc<Gate>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
+    let gate = Gate::new();
+    let held = gate.clone();
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
+            let gate = held.clone();
             std::thread::spawn(move || {
                 let mut s = stream;
                 let mut buf = Vec::new();
@@ -260,7 +263,7 @@ fn spawn_mock() -> String {
                     })
                 } else {
                     if !has_tool_result && last_user.contains("DELAYED") {
-                        std::thread::sleep(Duration::from_secs(2));
+                        gate.hold();
                     }
                     json!({
                         "id": "chatcmpl-mock", "object": "chat.completion", "created": 1,
@@ -275,7 +278,7 @@ fn spawn_mock() -> String {
             });
         }
     });
-    format!("http://{addr}/v1")
+    (format!("http://{addr}/v1"), gate)
 }
 
 fn tmpdir(tag: &str) -> TestDir {
@@ -287,7 +290,7 @@ fn tmpdir(tag: &str) -> TestDir {
 /// a follow-up prompt on the SAME session completes normally.
 #[test]
 fn acp_cancel_mid_provider_settles_cancelled_and_resumable() {
-    let base = spawn_mock();
+    let (base, gate) = spawn_mock();
     let cwd = tmpdir("mid-provider");
     let acp = AcpProcess::spawn(&base);
 
@@ -309,7 +312,7 @@ fn acp_cancel_mid_provider_settles_cancelled_and_resumable() {
         "params": {"sessionId": session_id, "prompt": [{"type": "text", "text": "DELAYED mission"}]}
     }));
     // Let the turn enter the provider call, then cancel.
-    std::thread::sleep(Duration::from_millis(500));
+    gate.wait_entered();
     acp.send(&json!({
         "jsonrpc": "2.0", "method": "session/cancel",
         "params": {"sessionId": session_id}
@@ -320,6 +323,7 @@ fn acp_cancel_mid_provider_settles_cancelled_and_resumable() {
         Some("cancelled"),
         "got {stopped}"
     );
+    gate.open();
 
     // Durable record in the session JSONL.
     let mut found_session = None;
@@ -347,7 +351,7 @@ fn acp_cancel_mid_provider_settles_cancelled_and_resumable() {
 /// `refusal`), and the session is reusable.
 #[test]
 fn acp_cancel_during_pending_permission_settles_cancelled() {
-    let base = spawn_mock();
+    let (base, _gate) = spawn_mock();
     let cwd = tmpdir("pending-permission");
     let acp = AcpProcess::spawn(&base);
 

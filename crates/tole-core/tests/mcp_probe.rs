@@ -26,16 +26,11 @@ fn cfg(d: &Path, mode: &str) -> McpServerConfig {
 }
 
 fn pid(d: &Path, file: &str) -> i32 {
-    let until = Instant::now() + Duration::from_secs(5);
-    loop {
-        if let Ok(s) = std::fs::read_to_string(d.join(file)) {
-            if let Ok(p) = s.trim().parse() {
-                return p;
-            }
-        }
-        assert!(Instant::now() < until, "{file} was never written");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    test_dir::wait_for(test_dir::WAIT, &format!("{file} to be written"), || {
+        std::fs::read_to_string(d.join(file))
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+    })
 }
 
 /// Gone: no such process, or a zombie awaiting its reaper.
@@ -51,16 +46,15 @@ fn gone(pid: i32) -> bool {
 
 fn assert_all_gone(d: &Path) {
     let (server, grandchild) = (pid(d, "server"), pid(d, "grandchild"));
-    let until = Instant::now() + Duration::from_secs(5);
-    while !(gone(server) && gone(grandchild)) {
-        assert!(
-            Instant::now() < until,
-            "left running: server {server} gone={} grandchild {grandchild} gone={}",
-            gone(server),
-            gone(grandchild)
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    let all_gone = test_dir::poll_until(test_dir::WAIT, || {
+        (gone(server) && gone(grandchild)).then_some(())
+    });
+    assert!(
+        all_gone.is_some(),
+        "left running: server {server} gone={} grandchild {grandchild} gone={}",
+        gone(server),
+        gone(grandchild)
+    );
 }
 
 #[test]

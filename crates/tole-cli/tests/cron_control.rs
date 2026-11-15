@@ -77,17 +77,15 @@ fn cancel_stops_a_running_script() {
     cron::create(&dir, script(&dir, "z", "* * * * *", "sleep 30", &[]), T).unwrap();
     assert!(cron::cancel(&dir, "z").is_err(), "nothing running yet");
     let d2 = dir.to_path_buf();
-    let start = Instant::now();
     let runner = std::thread::spawn(move || cron::tick(&d2, T + 60, &OPTS).unwrap());
-    let fires = loop {
-        if let Ok(f) = cron::cancel(&dir, "z") {
-            break f;
-        }
-        assert!(start.elapsed() < Duration::from_secs(10), "never claimed");
-        std::thread::sleep(Duration::from_millis(20));
-    };
+    let fires = common::wait_for(common::WAIT, "the run to be claimed", || {
+        cron::cancel(&dir, "z").ok()
+    });
+    // The script sleeps 30 s: the join returning means it was cancelled,
+    // not left to run out.
+    let started = Instant::now();
     let r = runner.join().unwrap();
-    assert!(start.elapsed() < Duration::from_secs(10), "not cancelled");
+    assert!(started.elapsed() < Duration::from_secs(25), "not cancelled");
     assert_eq!(r.ran, vec![(fires[0].clone(), RunStatus::Cancelled)]);
     assert!(
         !cron::tick::cancel_path(&dir, &fires[0]).exists(),

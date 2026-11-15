@@ -458,10 +458,11 @@ mod tests {
         let poll = JobPollTool::new(dir.to_path_buf());
         let first = poll.execute(json!({ "job": job })).unwrap();
         assert_eq!(first["job"], json!(job));
-        // Give the job time to finish, then: not running, log captured.
-        std::thread::sleep(std::time::Duration::from_millis(600));
-        let second = poll.execute(json!({ "job": job })).unwrap();
-        assert_eq!(second["running"], json!(false));
+        // Wait for the job to finish, then: not running, log captured.
+        let second = crate::test_dir::wait_for(crate::test_dir::WAIT, "the job to finish", || {
+            let r = poll.execute(json!({ "job": job })).unwrap();
+            (r["running"] == json!(false)).then_some(r)
+        });
         assert!(second["log_tail"].as_str().unwrap().contains("job-done"));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -518,10 +519,9 @@ mod tests {
         let job = out["job"].as_str().unwrap().to_string();
         // Nothing yet: the job is still running.
         assert!(q.is_empty());
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while q.is_empty() && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
+        crate::test_dir::wait_until(crate::test_dir::WAIT, "the completion notice", || {
+            !q.is_empty()
+        });
         let got = q.drain();
         assert_eq!(got.len(), 1, "exactly one notice per job");
         assert_eq!(got[0].source, crate::interrupt::Source::Notice);
@@ -548,14 +548,9 @@ mod tests {
             .unwrap();
         let id = r["job"].as_str().unwrap().to_string();
         let log = dir.join(JOBS_DIR).join(&id).join("log");
-        let mut text = String::new();
-        for _ in 0..50 {
-            text = std::fs::read_to_string(&log).unwrap_or_default();
-            if !text.is_empty() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
+        let text = crate::test_dir::wait_for(crate::test_dir::WAIT, "the job's log", || {
+            std::fs::read_to_string(&log).ok().filter(|t| !t.is_empty())
+        });
         assert!(text.lines().any(|l| l == "TOLE_UNDER_SESSION=1"), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
     }

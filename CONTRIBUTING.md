@@ -24,6 +24,16 @@ workflow; the ecosystem-wide standards it follows live in the team knowledge roo
   process that may still use the directory is killed and reaped first (see
   `ChildGuard`). CI runs the tests with a private `TMPDIR` and fails if a
   `tole-*` or `cora-*` entry is left behind.
+- **Waiting in tests** (#812): a test that waits for something to happen
+  (a child to write a file, a server to be busy, a process to exit) polls for
+  the condition with `wait_until(WAIT, "what", || cond)` or `wait_for`
+  (`test_dir.rs`, next to `TestDir`), never `thread::sleep(n)` followed by an
+  assertion and never a hand-written loop with its own short deadline. The
+  bound is generous (60 s) and only a failing run waits for it. A mock that
+  has to hold an answer while the test acts waits on a condition too (a gate
+  the test opens), not a sleep of a guessed length. A fixed sleep stays only
+  for time that must pass by itself (a whole-second clock tick, a delay that
+  is the thing under test).
 - **Code review**: every PR gets a Cora review (below) plus maintainer review
   before merge. CI must be green.
 

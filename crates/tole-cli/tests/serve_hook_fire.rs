@@ -9,7 +9,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tole_cli::cron::{self, store, CreateSpec};
 use tole_core::ledger::RunStatus;
@@ -225,16 +225,16 @@ fn a_matching_delivery_fires_the_job_and_others_are_ignored() {
     // A match fires the job once and answers with the fire.
     let (st, b) = deliver(s.port, "gh", "push", "e-4", PUSH);
     assert!(st.contains("202") && b.contains("\"fire\""), "{st} {b}");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
+    let status = common::wait_for(common::WAIT, "the fired run to settle", || {
         let l = store::open_read(&base.join("cron")).unwrap();
-        if let Some(d) = l.state().dones().find(|d| d.job_id == "ping") {
-            assert_eq!(d.status, RunStatus::Ok);
-            break;
-        }
-        assert!(Instant::now() < deadline, "the fired run never settled");
-        std::thread::sleep(Duration::from_millis(100));
-    }
+        let status = l
+            .state()
+            .dones()
+            .find(|d| d.job_id == "ping")
+            .map(|d| d.status);
+        status
+    });
+    assert_eq!(status, RunStatus::Ok);
     // The same delivery again is a duplicate and fires nothing.
     let (st, _) = deliver(s.port, "gh", "push", "e-4", PUSH);
     assert!(st.contains("200"), "{st}");
@@ -266,17 +266,9 @@ fn a_fired_agent_run_sees_the_rendered_template_and_no_write_tools() {
     let s = spawn_with(&base, Some(&url));
     let (st, b) = deliver(s.port, "agentic", "push", "a-1", PUSH);
     assert!(st.contains("202"), "{st} {b}");
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let request = loop {
-        if let Some(r) = seen.lock().unwrap().first().cloned() {
-            break r;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the fired run never called the provider"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    };
+    let request = common::wait_for(common::WAIT, "the fired run to call the provider", || {
+        seen.lock().unwrap().first().cloned()
+    });
     assert!(
         request.contains("summarize the push"),
         "the job's prompt: {request}"
@@ -294,13 +286,14 @@ fn a_fired_agent_run_sees_the_rendered_template_and_no_write_tools() {
         !request.contains("\"write_file\""),
         "no Write tool: {request}"
     );
-    loop {
+    let done = common::wait_for(common::WAIT, "the fired run to settle", || {
         let l = store::open_read(&base.join("cron")).unwrap();
-        if let Some(d) = l.state().dones().find(|d| d.job_id == "writer") {
-            assert_eq!(d.status, RunStatus::Ok, "{:?}", d.usage);
-            break;
-        }
-        assert!(Instant::now() < deadline, "the fired run never settled");
-        std::thread::sleep(Duration::from_millis(100));
-    }
+        let done = l
+            .state()
+            .dones()
+            .find(|d| d.job_id == "writer")
+            .map(|d| (d.status, format!("{:?}", d.usage)));
+        done
+    });
+    assert_eq!(done.0, RunStatus::Ok, "{}", done.1);
 }

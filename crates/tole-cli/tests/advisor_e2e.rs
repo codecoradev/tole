@@ -170,17 +170,11 @@ impl Env {
             c.env_remove(k);
         }
         let mut child = c.spawn().unwrap();
-        let start = Instant::now();
-        loop {
-            if child.try_wait().unwrap().is_some() {
-                return child.wait_with_output().unwrap();
-            }
-            if start.elapsed() > Duration::from_secs(60) {
-                let _ = child.kill();
-                panic!("{args:?} did not finish in 60s");
-            }
-            std::thread::sleep(Duration::from_millis(20));
+        if common::wait_exit(&mut child, common::WAIT).is_none() {
+            let _ = child.kill();
+            panic!("{args:?} did not finish in {:?}", common::WAIT);
         }
+        child.wait_with_output().unwrap()
     }
 
     fn mission(&self, extra: &[&str]) -> Output {

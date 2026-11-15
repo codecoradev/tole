@@ -12,7 +12,7 @@
 
 mod support;
 
-use support::{live_policy, register, running, skipped, wait_until, workspace, TestDir};
+use support::{live_policy, register, running, skipped, wait_until, workspace, TestDir, WAIT};
 use tole_core::mcp::{get_server_prompt_in, live_connections};
 
 const CAP: usize = 3;
@@ -38,9 +38,10 @@ fn a_released_session_stops_its_server_and_the_cap_refuses_the_next() {
     std::thread::sleep(std::time::Duration::from_millis(600));
     assert!(running(&wa) && live_connections() == 1, "still claimed");
     drop(reg_a2);
-    assert!(
-        wait_until(|| !running(&wa) && live_connections() == 0),
-        "the last release stops the server and the process is gone"
+    wait_until(
+        WAIT,
+        "the last release to stop the server and its process",
+        || !running(&wa) && live_connections() == 0,
     );
     let e = get_server_prompt_in("life", Some(&wa), "review", args()).unwrap_err();
     assert!(e.contains("never registered"), "its config went too: {e}");
@@ -65,7 +66,9 @@ fn a_released_session_stops_its_server_and_the_cap_refuses_the_next() {
     drop(reg4);
     let (_c1, reg1) = held.remove(0);
     drop(reg1);
-    assert!(wait_until(|| live_connections() == CAP - 1), "slot freed");
+    wait_until(WAIT, "the slot to be freed", || {
+        live_connections() == CAP - 1
+    });
     let (_c5, _reg5) = register("cap", &wss[CAP]);
     assert!(
         running(&wss[CAP]) && live_connections() == CAP,
