@@ -830,3 +830,52 @@ fn the_retry_note_is_an_optional_field_old_ledgers_and_readers_agree_on() {
     let noted = serde_json::to_string(&ev(Some("c3"))).unwrap();
     assert!(noted.contains(r#""retry_of":"c3""#), "{noted}");
 }
+
+// ------------------------------------------------ a charged call (#804)
+
+#[test]
+fn a_charged_settle_costs_the_estimate_once_and_says_why() {
+    let d = dir("charged");
+    let l = DiscussionLog::at(&d, "pick-db").unwrap();
+    l.start(contract(None, 10_000), 1).unwrap();
+    let c1 = go(l.reserve(1, "participant-coder", 3_000, 2).unwrap());
+    assert_eq!(l.settle_charged(&c1, "timeout", 3).unwrap(), 3_000);
+    let st = l.state().unwrap();
+    assert_eq!(st.reservations[&c1].settled, Some(3_000));
+    assert_eq!(st.reservations[&c1].charged.as_deref(), Some("timeout"));
+    assert_eq!(st.tokens_used, 3_000);
+    // The settle is final: a resume (or a second settle of any kind) is
+    // refused and charges nothing more.
+    assert!(l.settle_charged(&c1, "timeout", 4).is_err());
+    assert!(l.settle(&c1, 9_000, 5).is_err());
+    assert_eq!(l.state().unwrap().tokens_used, 3_000);
+    // A charge is exactly the call's own estimate (its carve), no more.
+    let c2 = go(l.reserve(1, "participant-ops", 700, 6).unwrap());
+    assert_eq!(l.settle_charged(&c2, "unreported", 7).unwrap(), 700);
+    assert_eq!(l.state().unwrap().tokens_used, 3_700);
+    assert!(l.settle_charged("c99", "timeout", 8).is_err());
+    // Re-reading the file folds to the same state (a resume).
+    drop(l);
+    let again = DiscussionLog::at(&d, "pick-db").unwrap().state().unwrap();
+    assert_eq!(again.tokens_used, 3_700);
+    assert_eq!(
+        again.reservations[&c2].charged.as_deref(),
+        Some("unreported")
+    );
+}
+
+#[test]
+fn the_charge_note_is_an_optional_field_old_ledgers_and_readers_agree_on() {
+    let old = r#"{"seq":4,"t":1,"event":"settle","call":"c3","tokens":5}"#;
+    let line: Line = serde_json::from_str(old).unwrap();
+    assert!(matches!(line.event, Event::Settle { charged: None, .. }));
+    let ev = |charged: Option<&str>| Event::Settle {
+        call: "c3".into(),
+        tokens: 5,
+        charged: charged.map(str::to_string),
+    };
+    let plain = serde_json::to_string(&ev(None)).unwrap();
+    assert!(!plain.contains("charged"), "{plain}");
+    let noted = serde_json::to_string(&ev(Some("timeout"))).unwrap();
+    assert!(noted.contains(r#""charged":"timeout""#), "{noted}");
+}
