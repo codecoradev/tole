@@ -48,7 +48,8 @@ fn a_mission_status_maps_to_success_failure_or_nothing() {
     ] {
         assert_eq!(classify_mission(f), Outcome::Failure, "{f}");
     }
-    for s in ["stopped", "", "anything-else"] {
+    // A refused verify is the owner's sandbox setting, not the agent's work.
+    for s in ["stopped", "verify_refused", "", "anything-else"] {
         assert_eq!(classify_mission(s), Outcome::Skip, "{s}");
     }
 }

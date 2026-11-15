@@ -2,10 +2,12 @@
 //! `docs/sandbox-design.md` §7 and §9.2, owner decisions of 2026-11-14).
 //!
 //! First slice: `run_command` and `job_start`, the two model-driven tools.
-//! The owner opts in per consumer in the user config
-//! (`[sandbox.consumers] run_command = "off" | "optional" | "required"`,
-//! default off). `verify`, the stop gates, cron scripts and deliveries keep
-//! running as before; the types here are shaped so they can join later.
+//! Second slice: the mission `--verify` command, then the `on_turnend` stop
+//! gates. The owner opts in per consumer in the user config
+//! (`[sandbox.consumers] run_command | job_start | verify = "off" |
+//! "optional" | "required"`, default off for all of them). The stop gates,
+//! cron scripts and deliveries keep running as before; the types here are
+//! shaped so they can join later.
 //!
 //! The `command` profile: the workspace writable, with `.git/hooks`,
 //! `.git/config` and `.tole` read-only on top (code planted there would run
@@ -22,9 +24,10 @@
 //!   `[secrets]` release for its tool, never through `--setenv`);
 //! - the launcher gets rlimits (CPU, address space, processes, file size)
 //!   and no inherited file descriptor above 2 (Linux only);
-//! - policy: `optional` is `required` in an unattended run; with no working
-//!   sandbox (including macOS and Windows) `required` refuses and
-//!   `optional` runs unsandboxed with a warning when a human is attached.
+//! - policy: `optional` is `required` in an unattended run (a mission's
+//!   `verify` is always one: nobody answers there); with no working sandbox
+//!   (including macOS and Windows) `required` refuses and `optional` runs
+//!   unsandboxed with a warning when a human is attached.
 //!
 //! State is owner config set once per process, never per session: the
 //! workspace travels with each call.
@@ -41,20 +44,33 @@ use std::sync::OnceLock;
 /// read-only inside it.
 pub const PROTECTED: [&str; 3] = [".git/hooks", ".git/config", ".tole"];
 
-/// The tools of this slice.
+/// The commands that can be sandboxed: the two model-driven tools and the
+/// mission `--verify` command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Consumer {
     RunCommand,
     JobStart,
+    Verify,
 }
 
 impl Consumer {
-    /// The tool's name, as in `[sandbox.consumers]` and `[secrets]`.
+    /// Every consumer, in the order the doctor lists them.
+    pub const ALL: [Consumer; 3] = [Consumer::RunCommand, Consumer::JobStart, Consumer::Verify];
+
+    /// The consumer's name, as in `[sandbox.consumers]` and `[secrets]`.
     pub fn name(self) -> &'static str {
         match self {
             Consumer::RunCommand => "run_command",
             Consumer::JobStart => "job_start",
+            Consumer::Verify => "verify",
         }
+    }
+
+    /// The mission `--verify` command only runs inside `tole mission`, an
+    /// autonomous run with nobody to answer a prompt: for it `optional` is
+    /// always `required`, whatever the process flag says.
+    pub fn always_unattended(self) -> bool {
+        self == Consumer::Verify
     }
 
     /// A detached job outlives the call by design; everything else dies
@@ -124,6 +140,8 @@ impl Limits {
 pub struct Consumers {
     pub run_command: Mode,
     pub job_start: Mode,
+    /// The mission `--verify` command.
+    pub verify: Mode,
     /// Network of the `command` profile: none, or the host's.
     pub network: Network,
     pub limits: Limits,
@@ -134,6 +152,7 @@ impl Default for Consumers {
         Consumers {
             run_command: Mode::Off,
             job_start: Mode::Off,
+            verify: Mode::Off,
             network: Network::None,
             limits: Limits::default(),
         }
@@ -145,6 +164,7 @@ impl Consumers {
         match c {
             Consumer::RunCommand => self.run_command,
             Consumer::JobStart => self.job_start,
+            Consumer::Verify => self.verify,
         }
     }
 }
@@ -360,7 +380,7 @@ pub fn launch_command(
     plan_command(
         &c,
         &super::detect(),
-        super::unattended(),
+        super::unattended() || consumer.always_unattended(),
         &env,
         consumer,
         (program, args),
@@ -377,6 +397,38 @@ pub fn command_for(
     program: &str,
     args: &[String],
 ) -> Result<Command, String> {
+    command_prepared(consumer, workspace, program, args).map(|(c, _)| c)
+}
+
+/// [`command_for`] for a command that runs in the process's working
+/// directory (the mission `--verify` command inherits it, so it is the
+/// workspace the sandbox binds). The directory is only looked up when the
+/// sandbox is on. The flag is true when the command is wrapped.
+pub fn command_in_cwd(
+    consumer: Consumer,
+    program: &str,
+    args: &[String],
+) -> Result<(Command, bool), String> {
+    let cwd = if consumers().mode(consumer) == Mode::Off {
+        PathBuf::new()
+    } else {
+        std::env::current_dir().map_err(|e| {
+            format!(
+                "{}: not run, the working directory is unknown ({e})",
+                consumer.name()
+            )
+        })?
+    };
+    command_prepared(consumer, &cwd, program, args)
+}
+
+/// [`command_for`] plus whether the command is wrapped in the sandbox.
+fn command_prepared(
+    consumer: Consumer,
+    workspace: &Path,
+    program: &str,
+    args: &[String],
+) -> Result<(Command, bool), String> {
     match launch_command(consumer, workspace, program, args) {
         CommandLaunch::Direct { warning } => {
             if let Some(w) = warning {
@@ -384,7 +436,7 @@ pub fn command_for(
             }
             let mut c = Command::new(program);
             c.args(args);
-            Ok(c)
+            Ok((c, false))
         }
         CommandLaunch::Sandboxed {
             program,
@@ -394,7 +446,7 @@ pub fn command_for(
             let mut c = Command::new(program);
             c.args(args);
             harden(&mut c, limits);
-            Ok(c)
+            Ok((c, true))
         }
         CommandLaunch::Refused(why) => Err(why),
     }
@@ -403,7 +455,11 @@ pub fn command_for(
 /// A fallback to no sandbox is warned about once per process and tool, not
 /// on every call (a chatty line per command would drown a terminal).
 fn warn_once(consumer: Consumer, text: &str) {
-    static WARNED: [AtomicBool; 2] = [AtomicBool::new(false), AtomicBool::new(false)];
+    static WARNED: [AtomicBool; 3] = [
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+    ];
     if !WARNED[consumer.index()].swap(true, Ordering::SeqCst) {
         eprintln!("tole: {text}");
     }
@@ -516,10 +572,11 @@ pub fn doctor_lines(c: &Consumers, avail: &Availability) -> Vec<String> {
         Mode::Required => "required",
     };
     let mut out = Vec::new();
-    if c.run_command == Mode::Off && c.job_start == Mode::Off {
+    if Consumer::ALL.iter().all(|k| c.mode(*k) == Mode::Off) {
         out.push(
-            "sandbox consumers: run_command off, job_start off (model commands run unsandboxed; \
-             set [sandbox.consumers] run_command / job_start in the user config to sandbox them)"
+            "sandbox consumers: run_command off, job_start off, verify off (model commands and \
+             the mission --verify command run unsandboxed; set [sandbox.consumers] run_command \
+             / job_start / verify in the user config to sandbox them)"
                 .into(),
         );
     } else {
@@ -529,21 +586,26 @@ pub fn doctor_lines(c: &Consumers, avail: &Availability) -> Vec<String> {
         };
         let l = c.limits;
         out.push(format!(
-            "sandbox consumers: run_command {}, job_start {}, network {net}, limits cpu {}s \
-             memory {}MB processes {} file {}MB",
+            "sandbox consumers: run_command {}, job_start {}, verify {}, network {net}, limits \
+             cpu {}s memory {}MB processes {} file {}MB",
             word(c.run_command),
             word(c.job_start),
+            word(c.verify),
             l.cpu_secs,
             l.memory_mb,
             l.processes,
             l.file_size_mb
         ));
         if let Availability::Unavailable(why) = avail {
-            for k in [Consumer::RunCommand, Consumer::JobStart] {
-                let (level, tail) = match c.mode(k) {
-                    Mode::Off => continue,
-                    Mode::Required => ("ERROR", "refused (required)"),
-                    Mode::Optional => (
+            for k in Consumer::ALL {
+                let (level, tail) = match (c.mode(k), k.always_unattended()) {
+                    (Mode::Off, _) => continue,
+                    (Mode::Required, _) => ("ERROR", "refused (required)"),
+                    (Mode::Optional, true) => (
+                        "ERROR",
+                        "refused: a mission is an unattended run, where optional counts as required",
+                    ),
+                    (Mode::Optional, false) => (
                         "WARNING",
                         "runs unsandboxed with a warning, refused in unattended runs (optional)",
                     ),
@@ -556,8 +618,7 @@ pub fn doctor_lines(c: &Consumers, avail: &Availability) -> Vec<String> {
         }
     }
     out.push(
-        "sandbox consumers: verify, turnend, cron scripts and deliveries are not sandboxed yet"
-            .into(),
+        "sandbox consumers: turnend, cron scripts and deliveries are not sandboxed yet".into(),
     );
     out
 }

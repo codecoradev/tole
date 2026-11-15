@@ -59,8 +59,18 @@ fn doctor_says_model_commands_are_unsandboxed_by_default() {
         "{out}"
     );
     assert!(
+        l[0].contains("verify off"),
+        "verify is a consumer now: {out}"
+    );
+    assert!(
         l.iter()
-            .any(|x| x.contains("verify") && x.contains("not sandboxed yet")),
+            .any(|x| x.contains("turnend, cron scripts and deliveries")
+                && x.contains("not sandboxed yet")),
+        "{out}"
+    );
+    assert!(
+        !l.iter()
+            .any(|x| x.contains("verify,") && x.contains("not sandboxed yet")),
         "{out}"
     );
     assert!(!out.contains("sandbox consumers: ERROR"), "{out}");
@@ -116,7 +126,8 @@ fn config_check_shows_the_keys_and_rejects_bad_values() {
         "run_command = \"always\"",
         "network = \"any\"",
         "memory_mb = 1",
-        "verify = \"required\"",
+        "verify = \"always\"",
+        "turnend = \"required\"",
     ] {
         let o = tole(
             Some(&format!("[sandbox.consumers]\n{bad}\n")),
@@ -126,7 +137,7 @@ fn config_check_shows_the_keys_and_rejects_bad_values() {
         let err = text(&o.stderr);
         assert!(
             err.contains("config.toml")
-                && (err.contains("sandbox.consumers") || err.contains("unknown field `verify`")),
+                && (err.contains("sandbox.consumers") || err.contains("unknown field `turnend`")),
             "{bad}: {err}"
         );
     }
@@ -156,6 +167,46 @@ fn a_project_config_cannot_set_consumers() {
     assert!(
         out.lines()
             .any(|l| l.contains("sandbox.consumers.network") && l.contains("IGNORED")),
+        "{out}"
+    );
+}
+
+/// Slice 2: `verify` is a consumer. A required one with no sandbox fails the
+/// doctor; an optional one fails it too (a mission is unattended, so optional
+/// counts as required).
+#[test]
+fn doctor_covers_verify() {
+    let (code, out) = doctor(Some("[sandbox.consumers]\nverify = \"required\"\n"));
+    assert_ne!(code, Some(0), "required verify cannot run: {out}");
+    let l = line(&out, "sandbox consumers:");
+    assert!(
+        l[0].contains("verify required") && l[0].contains("network none"),
+        "{out}"
+    );
+    assert!(
+        l.iter()
+            .any(|x| x.contains("ERROR verify") && x.contains("refused (required)")),
+        "{out}"
+    );
+
+    let (code, out) = doctor(Some("[sandbox.consumers]\nverify = \"optional\"\n"));
+    assert_ne!(code, Some(0), "{out}");
+    assert!(
+        out.contains("sandbox consumers: ERROR verify") && out.contains("mission"),
+        "{out}"
+    );
+}
+
+#[test]
+fn config_check_shows_the_verify_key() {
+    let o = tole(
+        Some("[sandbox.consumers]\nverify = \"required\"\n"),
+        &["config", "check"],
+    );
+    let out = text(&o.stdout);
+    assert!(o.status.success(), "{out} {}", text(&o.stderr));
+    assert!(
+        out.contains("sandbox.consumers.verify = \"required\"  [user config]"),
         "{out}"
     );
 }

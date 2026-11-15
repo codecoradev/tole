@@ -211,13 +211,24 @@ fn verify_run_error(cause: &str, timeout: std::time::Duration) -> String {
 /// just wrote (`cargo test` runs build scripts and tests), with no
 /// approval: it gets the ENV-1 scrub as its own consumer, which receives no
 /// secret unless a `[secrets]` entry grants one to `verify` (#676).
-fn run_verify(cmd: &str, timeout: std::time::Duration) -> Result<(), String> {
-    let mut c = std::process::Command::new("sh");
-    c.arg("-c").arg(cmd);
+///
+/// With `[sandbox.consumers] verify` on (#748) the same `sh -c` runs in the
+/// `command` profile instead. A mission is an unattended run, so `optional`
+/// counts as `required`, and a sandbox that is required but missing is a
+/// [`Verify::Refused`], never a pass.
+fn run_verify(cmd: &str, timeout: std::time::Duration) -> Verify {
+    use tole_core::sandbox::command::{command_in_cwd, Consumer};
+    let (mut c, _) = match command_in_cwd(Consumer::Verify, "sh", &["-c".to_string(), cmd.into()]) {
+        Ok(c) => c,
+        Err(why) => return Verify::Refused(why),
+    };
     tole_core::subprocess::scrub_env_for(&mut c, tole_core::secret_release::VERIFY);
-    let out = run_with_timeout(&mut c, timeout).map_err(|e| verify_run_error(&e, timeout))?;
+    let out = match run_with_timeout(&mut c, timeout) {
+        Ok(o) => o,
+        Err(e) => return Verify::Failed(verify_run_error(&e, timeout)),
+    };
     if out.status.success() {
-        return Ok(());
+        return Verify::Passed;
     }
     let mut text = String::from_utf8_lossy(&out.stdout).to_string();
     text.push_str(&String::from_utf8_lossy(&out.stderr));
@@ -226,11 +237,25 @@ fn run_verify(cmd: &str, timeout: std::time::Duration) -> Result<(), String> {
         let start = chars.len().saturating_sub(800);
         chars[start..].iter().collect()
     };
-    Err(format!(
+    Verify::Failed(format!(
         "verify FAILED (exit {}):\n{}",
         out.status.code().unwrap_or(-1),
         tail
     ))
+}
+
+/// What running the `--verify` command came to.
+#[derive(Debug, PartialEq, Eq)]
+enum Verify {
+    /// Exit 0.
+    Passed,
+    /// Ran and failed, or did not complete: the output tail goes back to the
+    /// model, which can fix its cause.
+    Failed(String),
+    /// Not run: the sandbox the owner requires is not available (#748). The
+    /// model cannot fix that, so it is not retried and never counts as a
+    /// pass: the mission ends `verify_refused`.
+    Refused(String),
 }
 
 /// Snapshot the durable usage ledger (provider steps so far).
@@ -449,7 +474,15 @@ pub fn run_mission(
                         cmd,
                         std::time::Duration::from_secs(cfg.verify_timeout_secs),
                     ) {
-                        Ok(()) => {
+                        Verify::Refused(why) => {
+                            // Fail closed: no ground truth, so no completion
+                            // and no turn spent on a problem the model
+                            // cannot fix. The session stays resumable.
+                            eprintln!("mission: verify refused: {why}");
+                            status = "verify_refused";
+                            break;
+                        }
+                        Verify::Passed => {
                             if declares {
                                 status = "complete";
                                 break;
@@ -460,7 +493,7 @@ pub fn run_mission(
                                  work toward the goal, then declare it."
                             ));
                         }
-                        Err(output) => {
+                        Verify::Failed(output) => {
                             verify_failures += 1;
                             eprintln!(
                                 "mission: verify failed ({verify_failures}/{VERIFY_FAILURE_CAP})"
@@ -793,7 +826,22 @@ mod verify_error_tests {
 
     #[test]
     fn a_real_timeout_still_says_so() {
-        let e = run_verify("sleep 5", Duration::from_secs(1)).unwrap_err();
+        let Verify::Failed(e) = run_verify("sleep 5", Duration::from_secs(1)) else {
+            panic!("a timeout is a failure the model sees, not a pass or a refusal");
+        };
         assert!(e.contains("timed out after 1s"), "{e}");
+    }
+
+    #[test]
+    fn exit_status_decides_pass_or_fail_with_the_output_tail() {
+        let t = Duration::from_secs(20);
+        assert_eq!(run_verify("exit 0", t), Verify::Passed);
+        let Verify::Failed(e) = run_verify("echo boom; exit 3", t) else {
+            panic!("a non-zero exit is a failure");
+        };
+        assert!(
+            e.starts_with("verify FAILED (exit 3):") && e.contains("boom"),
+            "{e}"
+        );
     }
 }

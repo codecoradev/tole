@@ -38,6 +38,7 @@ fn without_a_backend_required_refuses_and_optional_depends_on_who_is_watching() 
     command::set_consumers(Consumers {
         run_command: Mode::Optional,
         job_start: Mode::Required,
+        verify: Mode::Optional,
         ..Consumers::default()
     })
     .unwrap();
@@ -65,6 +66,20 @@ fn without_a_backend_required_refuses_and_optional_depends_on_who_is_watching() 
         !ws.join("tole-jobs").exists(),
         "a refused job leaves no job directory behind"
     );
+
+    // Slice 2 (#748). The mission `--verify` command is always unattended:
+    // `optional` refuses it even with a human at the terminal, the cause names
+    // the remedy, and the command never ran.
+    let ran = ws.join("verify-ran");
+    let e = command::command_for(
+        command::Consumer::Verify,
+        &ws,
+        "sh",
+        &["-c".into(), format!("touch {}", ran.display())],
+    )
+    .unwrap_err();
+    assert!(e.starts_with("verify: ") && e.contains("unattended"), "{e}");
+    assert!(!ran.exists());
 
     // Unattended (serve, cron): optional counts as required.
     sandbox::mark_unattended();
