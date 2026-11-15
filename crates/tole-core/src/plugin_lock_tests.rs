@@ -215,11 +215,9 @@ fn a_project_lock_only_narrows_the_user_lock() {
     );
 }
 
-fn tmp(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("tole-plugin-lock-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+use crate::test_dir::TestDir;
+fn tmp(tag: &str) -> TestDir {
+    TestDir::new(&format!("tole-plugin-lock-{tag}"))
 }
 
 #[test]

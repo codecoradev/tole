@@ -374,11 +374,9 @@ pub fn format_time(secs: u64) -> String {
 mod tests {
     use super::*;
 
-    fn tmp(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("tole-skapprove-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
+    use crate::test_dir::TestDir;
+    fn tmp(tag: &str) -> TestDir {
+        TestDir::new(&format!("tole-skapprove-{tag}"))
     }
 
     fn write(ws: &Path, rel: &str, body: &str) {

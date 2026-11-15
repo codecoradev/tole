@@ -150,18 +150,15 @@ fn extra_read_and_write_paths_are_bound_as_named() {
 /// A real tree: `home/o/{proj,.codecora/tole}`, a data dir outside the
 /// home (`out/data/tole`, `out/other`) and a symlink to the home.
 struct Tree {
+    _guard: crate::test_dir::TestDir,
     base: PathBuf,
     home: PathBuf,
     data: PathBuf,
 }
 
 fn tree(tag: &str) -> Tree {
-    let base = std::env::temp_dir().join(format!("tole-sbx-unit-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
-    let base = {
-        std::fs::create_dir_all(&base).unwrap();
-        std::fs::canonicalize(&base).unwrap()
-    };
+    let guard = crate::test_dir::TestDir::new(&format!("tole-sbx-unit-{tag}"));
+    let base = guard.to_path_buf();
     for d in [
         "home/o/proj",
         "home/o/.codecora/tole",
@@ -176,6 +173,7 @@ fn tree(tag: &str) -> Tree {
         home: base.join("home/o"),
         data: base.join("home/o/.codecora/tole"),
         base,
+        _guard: guard,
     }
 }
 

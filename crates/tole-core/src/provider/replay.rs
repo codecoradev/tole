@@ -416,9 +416,8 @@ mod tests {
     );
 
     /// Writes SAMPLE into a unique tempdir and returns (path, dir).
-    fn sample_file(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("tole-replay-{}-{tag}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+    fn sample_file(tag: &str) -> (std::path::PathBuf, crate::test_dir::TestDir) {
+        let dir = crate::test_dir::TestDir::new(&format!("tole-replay-{tag}"));
         let p = dir.join("s-test.jsonl");
         let mut f = std::fs::File::create(&p).unwrap();
         f.write_all(SAMPLE.as_bytes()).unwrap();
@@ -451,8 +450,7 @@ mod tests {
 
     #[test]
     fn parse_rejects_trace_without_user_message() {
-        let dir = std::env::temp_dir().join(format!("tole-replay-{}-empty", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_dir::TestDir::new("tole-replay-empty");
         let p = dir.join("s-bad.jsonl");
         std::fs::write(&p, "{\"kind\":\"header\",\"id\":\"s-bad\"}\n").unwrap();
         assert!(MissionTrace::parse(&p, "m", "mm").is_err());
@@ -464,8 +462,7 @@ mod tests {
         // One physical line = one commit, which JsonlStorage may write as
         // a JSON ARRAY of records (durable_metrics in run.py already
         // handles this shape — the Rust parser must too).
-        let dir = std::env::temp_dir().join(format!("tole-replay-{}-arr", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_dir::TestDir::new("tole-replay-arr");
         let p = dir.join("s-arr.jsonl");
         let batched = format!(
             "[{},{}]",
@@ -596,8 +593,7 @@ mod tests {
     #[test]
     fn exact_input_match_wins_over_oldest_same_tool_fallback() {
         // Two recorded run_command calls with different inputs.
-        let dir = std::env::temp_dir().join(format!("tole-replay-{}-two", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_dir::TestDir::new("tole-replay-two");
         let p = dir.join("s-two.jsonl");
         let two = concat!(
             r#"{"kind":"entry","seq":1,"id":"e_1","type":"message","timestamp":1,"payload":{"role":"user","text":"chain"}}"#,

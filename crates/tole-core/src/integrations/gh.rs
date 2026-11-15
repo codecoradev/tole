@@ -604,9 +604,7 @@ mod tests {
         // Write a fake `gh` shell script that records its argv to a file
         // and exits 0. Proves the tool spawns *exactly* the whitelisted
         // argv — no shell interpolation surprises.
-        let dir = std::env::temp_dir().join(format!("tole-gh-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_dir::TestDir::new("tole-gh");
         let bin = dir.join("gh");
         let log = dir.join("argv.log");
         std::fs::write(
