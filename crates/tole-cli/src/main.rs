@@ -668,6 +668,13 @@ enum Command {
         #[command(subcommand)]
         action: tole_cli::hook_cli::HookAction,
     },
+    /// Per-server sandbox profiles (#810): `list` the profiles and bindings,
+    /// `show` the profile one server runs in, `set` binds a server to a
+    /// profile. Writes the user config only; never starts a session.
+    Sandbox {
+        #[command(subcommand)]
+        action: tole_cli::sandbox_cmd::SandboxAction,
+    },
     /// Project config file `.tole/config.toml` (#208): `check` validates
     /// it and shows the effective values, `trust`/`untrust` manage the
     /// trust record. Every key is applied after trust (flag > env > config
@@ -850,6 +857,7 @@ fn gate_policy(cmd: &Command) -> GatePolicy {
         | Command::Curator { .. }
         | Command::Audit { .. }
         | Command::Delegation { .. }
+        | Command::Sandbox { .. }
         | Command::Discuss {
             action: DiscussAction::List { .. } | DiscussAction::Show { .. },
         } => GatePolicy::Skip,
@@ -1095,6 +1103,8 @@ fn dispatch(cli: Cli) -> Result<()> {
         None => None,
         #[cfg(feature = "shell-tools")]
         Some(_) if matches!(cli.command, Command::Cron { .. }) => None,
+        // `tole sandbox set --profile` names a sandbox profile (#810).
+        Some(_) if matches!(cli.command, Command::Sandbox { .. }) => None,
         Some(name) => {
             let base = tole_cli::config::user_config_path()
                 .and_then(|p| p.parent().map(Path::to_path_buf));
@@ -1416,6 +1426,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         ),
         #[cfg(feature = "shell-tools")]
         Command::Hook { action } => tole_cli::hook_cli::cli(action),
+        Command::Sandbox { action } => tole_cli::sandbox_cmd::cli(action, cli.profile.as_deref()),
         Command::Skills { action } => tole_cli::skill_approve::cli(action),
         Command::Curator { action } => tole_cli::curator_cmd::cli(action),
         #[cfg(feature = "mcp")]

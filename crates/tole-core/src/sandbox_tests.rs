@@ -285,6 +285,7 @@ fn policy(mode: Mode) -> Policy {
         mode,
         profile_name: "server".into(),
         profile: server(),
+        servers: Default::default(),
         skip: vec!["cora".into()],
         max_servers: DEFAULT_MAX_SERVERS,
         idle_secs: DEFAULT_IDLE_SECS,
@@ -613,4 +614,64 @@ fn the_program_prefix_is_bound_resolved_and_the_program_runs_through_it() {
         "never the link"
     );
     assert!(!args.iter().any(|a| a == link.join("srv").as_os_str()));
+}
+
+fn bound(name: &str, profile: Profile) -> Policy {
+    let mut p = policy(Mode::Required);
+    p.servers.insert(
+        "net".into(),
+        ServerProfile {
+            name: name.into(),
+            profile,
+        },
+    );
+    p
+}
+
+#[test]
+fn profile_for_prefers_the_servers_own_binding_and_falls_back_to_the_default() {
+    let mut open = server();
+    open.network = Network::Host;
+    let p = bound("open", open.clone());
+    assert_eq!(p.profile_for("net"), ("open", &open));
+    assert_eq!(p.profile_for("other"), ("server", &server()));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_bound_server_launches_with_its_own_profile_and_the_rest_with_the_default() {
+    let mut open = server();
+    open.network = Network::Host;
+    let p = bound("open", open);
+    let argv = |name: &str| match run(Some(&p), &usable(), false, name) {
+        Launch::Sandboxed { args, .. } => args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect::<Vec<_>>(),
+        other => panic!("{other:?}"),
+    };
+    assert!(argv("net").iter().any(|a| a == "--share-net"));
+    assert!(!argv("other").iter().any(|a| a == "--share-net"));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_server_bound_to_a_profile_without_workspace_needs_none() {
+    // The workspace requirement follows the server's profile, not the default's.
+    let strict = builtin_profile("strict").unwrap();
+    let p = bound("strict", strict);
+    let env = Env {
+        path: Some("/usr/bin:/bin".into()),
+        home: Some("/home/o".into()),
+        data_dir: Some("/home/o/.codecora/tole".into()),
+        workspace: None,
+    };
+    assert!(matches!(
+        plan(Some(&p), &usable(), false, &env, ("net", "sh", &[])),
+        Launch::Sandboxed { .. }
+    ));
+    assert!(matches!(
+        plan(Some(&p), &usable(), false, &env, ("other", "sh", &[])),
+        Launch::Refused(_)
+    ));
 }

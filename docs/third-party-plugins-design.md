@@ -361,11 +361,14 @@ each case):
 3. *Ledger.* A bundle approval writes `approve` with the manifest and bundle
    hashes, then one `secret_grant` line per granted secret; a withdrawal
    writes `secret_revoke` (`secret_revoke_project` for a project-lock revoke,
-   which only narrows). The check of the lock against the ledger blocks a
-   bundle entry whose bundle hash is not the last approved one or that holds a
-   grant the ledger does not show as granted since the last approval, or shows
-   as revoked: a hand-edited lock cannot add or restore a secret, and an
-   approval starts from no grant. Same residual as before: a process that can
+   which only narrows). The ledger is the authority and is compared in both
+   directions: an entry is blocked when its bundle record is not the last
+   approved one (re-pinned, removed, or added where the approval was plain),
+   or it holds a secret the ledger does not show as granted since the last
+   approval (or shows as revoked), or it carries a bundle record with no
+   approval line at all. A plain entry's own `secrets` (#679) are not
+   ledger-tracked. A hand-edited lock cannot add or restore a
+   secret or drop the manifest pin, and an approval starts from no grant. Same residual as before: a process that can
    rewrite both files defeats it.
 4. *Declared skills, hooks and paths.* Shown and covered by the file hash,
    never acted on: no skill is loaded and no hook is run from a bundle (hooks

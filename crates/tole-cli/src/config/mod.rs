@@ -20,6 +20,7 @@ pub mod owner_only;
 pub mod profile;
 pub mod project_trust;
 pub mod routing;
+pub mod sandbox;
 pub mod session_settings;
 pub mod trust;
 
@@ -156,6 +157,10 @@ pub struct SandboxConfig {
     pub idle_secs: Option<u64>,
     /// The sandbox of the commands a model makes the host run (#748).
     pub consumers: Option<SandboxConsumersConfig>,
+    /// Named profiles beyond the built-in `server` and `strict` (#810).
+    pub profiles: Option<BTreeMap<String, sandbox::SandboxProfileConfig>>,
+    /// Per-server profile bindings, by server name (#810).
+    pub servers: Option<BTreeMap<String, sandbox::SandboxServerConfig>>,
 }
 
 /// The `[sandbox.consumers]` table (#748): which model-driven commands run
@@ -229,7 +234,7 @@ impl SandboxConfig {
 
     /// The core policy this table sets; a bad value is an error naming its key.
     pub fn policy(&self) -> Result<tole_core::sandbox::Policy, String> {
-        use tole_core::sandbox::{builtin_profile, Mode, Network};
+        use tole_core::sandbox::{Mode, Network};
         let mode = match self.mode.as_deref() {
             None => Mode::Off,
             Some(s) => Mode::parse(s).ok_or_else(|| {
@@ -237,16 +242,24 @@ impl SandboxConfig {
             })?,
         };
         let name = self.profile.as_deref().unwrap_or("server");
-        let mut profile = builtin_profile(name)
-            .ok_or_else(|| format!("sandbox.profile must be server or strict, got {name:?}"))?;
-        profile.network = match self.network.as_deref() {
-            None | Some("none") => Network::None,
-            Some("host") => Network::Host,
+        let mut profile = self
+            .resolve_profile(name)
+            .map_err(|e| format!("sandbox.profile: {e}"))?;
+        match self.network.as_deref() {
+            None => {}
+            Some("none") => profile.network = Network::None,
+            Some("host") => profile.network = Network::Host,
             Some(s) => return Err(format!("sandbox.network must be none or host, got {s:?}")),
-        };
+        }
         let paths = |v: &Option<Vec<String>>| v.iter().flatten().map(Into::into).collect();
-        profile.read = paths(&self.read);
-        profile.write = paths(&self.write);
+        if self.read.is_some() {
+            profile.read = paths(&self.read);
+        }
+        if self.write.is_some() {
+            profile.write = paths(&self.write);
+        }
+        self.check_tables()?;
+        let servers = self.server_profiles()?;
         use tole_core::sandbox::{
             DEFAULT_IDLE_SECS, DEFAULT_MAX_SERVERS, IDLE_SECS_RANGE, MAX_SERVERS_RANGE,
         };
@@ -270,6 +283,7 @@ impl SandboxConfig {
             mode,
             profile_name: name.to_string(),
             profile,
+            servers,
             skip: self.skip.clone().unwrap_or_default(),
             max_servers,
             idle_secs,
@@ -1685,6 +1699,20 @@ pub fn render_with(cfg: &Config, tag: &str, ann: &Annotations) -> Vec<String> {
         scalar(&mut out, "sandbox.mode", s.mode.as_deref().map(quote));
         scalar(&mut out, "sandbox.profile", s.profile.as_deref().map(quote));
         scalar(&mut out, "sandbox.network", s.network.as_deref().map(quote));
+        for (name, p) in s.profiles.iter().flatten() {
+            let k = |f: &str| format!("sandbox.profiles.{name}.{f}");
+            scalar(&mut out, &k("workspace"), p.workspace.as_deref().map(quote));
+            scalar(&mut out, &k("network"), p.network.as_deref().map(quote));
+            list(&mut out, &k("read"), &p.read);
+            list(&mut out, &k("write"), &p.write);
+        }
+        for (name, sv) in s.servers.iter().flatten() {
+            scalar(
+                &mut out,
+                &format!("sandbox.servers.{name}.profile"),
+                sv.profile.as_deref().map(quote),
+            );
+        }
         if let Some(c) = &s.consumers {
             let n = |v: Option<u64>| v.map(|n| n.to_string());
             for (key, v) in [
@@ -1815,6 +1843,10 @@ pub fn check(
             section(&mut lines, cfg, PROJECT_TAG);
         }
         None => lines.push(format!("no {CONFIG_REL_PATH} in {}", cwd.display())),
+    }
+    // The sandbox a session would use: only the user layer feeds it.
+    if let Some(s) = &merged.sandbox {
+        lines.extend(sandbox::effective_lines(s));
     }
     lines.push(
         "note: precedence is flag > env > config > user config > default; a higher layer \
@@ -2087,6 +2119,134 @@ verify_timeout = 60
                 .to_string();
             assert!(e.contains("sandbox."), "{e}");
         }
+    }
+
+    const PROFILES: &str = "[sandbox]\nmode = \"required\"\n\
+        [sandbox.profiles.net]\nnetwork = \"host\"\nread = [\"/opt/data\"]\n\
+        [sandbox.profiles.rw]\nworkspace = \"write\"\n\
+        [sandbox.servers.github]\nprofile = \"net\"\n\
+        [sandbox.servers.build]\nprofile = \"strict\"\n";
+
+    #[test]
+    fn sandbox_profiles_and_server_bindings_resolve_into_the_policy() {
+        use tole_core::sandbox::{Network, Workspace};
+        let c = parse(PROFILES, &p()).unwrap();
+        let sb = c.sandbox.as_ref().unwrap();
+        let pol = sb.policy().unwrap();
+        // The default is untouched by the named profiles.
+        assert_eq!(pol.profile_name, "server");
+        assert_eq!(pol.servers.len(), 2);
+        let (name, net) = pol.profile_for("github");
+        assert_eq!(name, "net");
+        assert_eq!(
+            (net.workspace, net.network),
+            (Workspace::Read, Network::Host)
+        );
+        assert_eq!(net.read, [PathBuf::from("/opt/data")]);
+        let (name, strict) = pol.profile_for("build");
+        assert_eq!((name, strict.workspace), ("strict", Workspace::None));
+        assert_eq!(pol.profile_for("other").0, "server");
+        // A defined profile can also be the default.
+        let c = parse(
+            "[sandbox]\nprofile = \"rw\"\n[sandbox.profiles.rw]\nworkspace = \"write\"\n",
+            &p(),
+        )
+        .unwrap();
+        let pol = c.sandbox.unwrap().policy().unwrap();
+        assert_eq!(pol.profile.workspace, Workspace::Write);
+    }
+
+    #[test]
+    fn sandbox_profile_tables_reject_bad_values_naming_the_key() {
+        for (bad, key) in [
+            (
+                "[sandbox.profiles.a]\nworkspace = \"all\"\n",
+                "sandbox.profiles.a.workspace",
+            ),
+            (
+                "[sandbox.profiles.a]\nnetwork = \"some\"\n",
+                "sandbox.profiles.a.network",
+            ),
+            (
+                "[sandbox.profiles.server]\nnetwork = \"host\"\n",
+                "built in",
+            ),
+            ("[sandbox.profiles.\"a b\"]\n", "sandbox.profiles.a b"),
+            (
+                "[sandbox.servers.s]\nprofile = \"nope\"\n",
+                "sandbox.servers.s.profile",
+            ),
+            ("[sandbox.servers.s]\n", "profile is required"),
+            (
+                "[sandbox.servers.\"s@w\"]\nprofile = \"strict\"\n",
+                "without `@workspace`",
+            ),
+            ("[sandbox]\nprofile = \"nope\"\n", "sandbox.profile"),
+        ] {
+            let e = parse(bad, &p()).unwrap_err().to_string();
+            assert!(e.contains(key), "{bad}: {e}");
+        }
+        // Unknown keys inside the new tables are loud too.
+        assert!(parse("[sandbox.profiles.a]\nnet = \"host\"\n", &p()).is_err());
+        assert!(parse("[sandbox.servers.a]\nmode = \"off\"\n", &p()).is_err());
+    }
+
+    #[test]
+    fn a_project_config_never_defines_a_profile_or_binds_a_server() {
+        let user = parse(
+            "[sandbox]\nmode = \"required\"\n[sandbox.servers.github]\nprofile = \"strict\"\n",
+            &p(),
+        )
+        .unwrap();
+        // The repository tries to widen github and to define a wide profile.
+        let project = parse(
+            "[sandbox]\nmode = \"off\"\n[sandbox.profiles.wide]\nnetwork = \"host\"\n\
+             workspace = \"write\"\n[sandbox.servers.github]\nprofile = \"wide\"\n",
+            &p(),
+        )
+        .unwrap();
+        let merged = layered(&project, &user);
+        assert_eq!(merged.sandbox, user.sandbox);
+        let pol = merged.sandbox.unwrap().policy().unwrap();
+        assert_eq!(pol.profile_for("github").0, "strict");
+        // And a project with no user sandbox gets none.
+        assert!(layered(&project, &Config::default()).sandbox.is_none());
+        // `config check` marks the project's lines as ignored.
+        let lines = render_with(&project, PROJECT_TAG, &Annotations::new());
+        for key in [
+            "sandbox.profiles.wide.network",
+            "sandbox.servers.github.profile",
+        ] {
+            let l = lines.iter().find(|l| l.starts_with(key)).unwrap();
+            assert!(l.ends_with(SANDBOX_IGNORED_NOTE), "{l}");
+        }
+    }
+
+    #[test]
+    fn effective_profile_and_its_source() {
+        use sandbox::Source;
+        let c = parse(PROFILES, &p()).unwrap();
+        let sb = c.sandbox.unwrap();
+        let e = sb.effective("github").unwrap();
+        assert_eq!((e.name.as_str(), e.source), ("net", Source::Server));
+        let e = sb.effective("other").unwrap();
+        assert_eq!(
+            (e.name.as_str(), e.source),
+            ("server", Source::BuiltinDefault)
+        );
+        let sb = parse("[sandbox]\nprofile = \"strict\"\n", &p())
+            .unwrap()
+            .sandbox
+            .unwrap();
+        assert_eq!(sb.effective("x").unwrap().source, Source::UserDefault);
+        let lines = sandbox::effective_lines(&parse(PROFILES, &p()).unwrap().sandbox.unwrap());
+        assert!(lines.contains(
+            &"sandbox effective: server \"github\" profile \"net\" [user config [sandbox.servers]]"
+                .to_string()
+        ));
+        assert!(lines
+            .iter()
+            .any(|l| l.starts_with("sandbox effective: default profile \"server\"")));
     }
 
     #[test]

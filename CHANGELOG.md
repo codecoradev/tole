@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Sandbox profiles per server (#810, part of #750). The user config can define named profiles (`[sandbox.profiles.<name>]`: `workspace`, `network`, `read`, `write`) and bind an MCP server to one (`[sandbox.servers.<name>] profile`), and `[sandbox] profile` can name a defined profile. New `tole sandbox list`, `tole sandbox show <server>` and `tole sandbox set <server> --profile <p>` (user config only; `set` keeps the rest of the file and refuses under an agent session), and `tole config check` prints the effective profile of each server and its source. A project config still cannot set anything under `[sandbox]`, so it can never loosen a profile.
+
 ### Fixed
 - `tole plugin add` and `tole plugin approve` refuse, with a message naming the file and the repair, when the plugin ledger exists but cannot be read, instead of treating it as empty; `tole doctor` and `tole plugin list|diff` say that they refuse (#813 item 3).
 - `tole discuss start` and `tole discuss resume` refuse under an agent session like the other owner-only writes (#684); `--dry-run`, `list` and `show` stay open (#813 item 2). Items 1 (default of `[delegation] approvals`) and 4 (timeout floor) are recommendations in `docs/delegation-approvals-design.md` and `docs/automation-design.md`, awaiting the owner; no behaviour changed.
