@@ -86,17 +86,11 @@ fn base_cmd(cwd: &Path, home: &Path, args: &[&str]) -> Command {
 fn finish(mut c: Command) -> Output {
     c.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = c.spawn().unwrap();
-    let start = Instant::now();
-    loop {
-        if child.try_wait().unwrap().is_some() {
-            return child.wait_with_output().unwrap();
-        }
-        if start.elapsed() > Duration::from_secs(60) {
-            let _ = child.kill();
-            panic!("child did not finish in 60s");
-        }
-        std::thread::sleep(Duration::from_millis(20));
+    if common::wait_exit(&mut child, common::WAIT).is_none() {
+        let _ = child.kill();
+        panic!("child did not finish in {:?}", common::WAIT);
     }
+    child.wait_with_output().unwrap()
 }
 
 // ----------------------------------------------------------------- mock

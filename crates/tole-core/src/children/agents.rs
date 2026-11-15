@@ -1478,16 +1478,11 @@ mod tests {
                 .unwrap();
             // Poll for the dump: under parallel test load the detached
             // child can take longer than a fixed sleep.
-            let mut dumped = None;
-            for _ in 0..50 {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                if let Ok(t) = std::fs::read_to_string(&dump) {
-                    dumped = Some(t);
-                    break;
-                }
-            }
-            let dumped = dumped
-                .unwrap_or_else(|| panic!("child never wrote the argv dump at {}", dump.display()));
+            let dumped = crate::test_dir::wait_for(
+                crate::test_dir::WAIT,
+                &format!("the child's argv dump at {}", dump.display()),
+                || std::fs::read_to_string(&dump).ok(),
+            );
             let argv: Vec<&str> = dumped.lines().collect();
             let id = out["agent"].as_str().unwrap();
             let _ = id;
@@ -1522,17 +1517,12 @@ mod tests {
             let out = AgentStartTool::new(&p, d.to_path_buf())
                 .execute(json!({"prompt": "x"}))
                 .unwrap();
-            let mut dumped = None;
-            for _ in 0..50 {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                if let Ok(t) = std::fs::read_to_string(&dump) {
-                    if t.lines().count() >= 2 {
-                        dumped = Some(t);
-                        break;
-                    }
-                }
-            }
-            let dumped = dumped.expect("child never dumped its env");
+            let dumped =
+                crate::test_dir::wait_for(crate::test_dir::WAIT, "the child's env dump", || {
+                    std::fs::read_to_string(&dump)
+                        .ok()
+                        .filter(|t| t.lines().count() >= 2)
+                });
             let mut lines = dumped.lines();
             let id = out["agent"].as_str().unwrap();
             assert_eq!(lines.next(), Some(id));
@@ -1573,15 +1563,10 @@ mod tests {
         std::env::remove_var("TOLE_FALLBACK_API_KEY");
         std::env::remove_var("TOLE_TEST_595_MCP_TOKEN");
         std::env::remove_var("TOLE_TEST_595_PLAIN");
-        let mut dumped = None;
-        for _ in 0..50 {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            if let Ok(t) = std::fs::read_to_string(&dump) {
-                dumped = Some(t);
-                break;
-            }
-        }
-        let dumped = dumped.expect("child never dumped its env");
+        let dumped =
+            crate::test_dir::wait_for(crate::test_dir::WAIT, "the child's env dump", || {
+                std::fs::read_to_string(&dump).ok()
+            });
         let lines: Vec<&str> = dumped.lines().collect();
         assert_eq!(
             lines,
@@ -1616,20 +1601,17 @@ mod tests {
             .with_parent_allows(allows)
             .execute(input)
             .unwrap();
-        let mut got = None;
-        for _ in 0..50 {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            if let (Ok(a), Ok(e)) = (
+        let (a, e) = crate::test_dir::wait_for(
+            crate::test_dir::WAIT,
+            "the child's argv and env dumps",
+            || match (
                 std::fs::read_to_string(&argv),
                 std::fs::read_to_string(&envf),
             ) {
-                if e.lines().count() >= 2 {
-                    got = Some((a, e));
-                    break;
-                }
-            }
-        }
-        let (a, e) = got.expect("child never dumped");
+                (Ok(a), Ok(e)) if e.lines().count() >= 2 => Some((a, e)),
+                _ => None,
+            },
+        );
         (
             out,
             a.lines().map(str::to_string).collect(),
@@ -1748,7 +1730,10 @@ mod tests {
             .spawn()
             .unwrap();
         let pid = live.id();
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        // The child has exec'd the launcher once its command line shows it.
+        crate::test_dir::wait_until(crate::test_dir::WAIT, "the launcher to be running", || {
+            agent_alive(pid, id).unwrap_or(false)
+        });
         assert!(agent_alive(pid, id).unwrap(), "the agent itself");
         assert!(
             !agent_alive(pid, "a-someone-else").unwrap(),
@@ -1907,16 +1892,11 @@ mod tests {
         assert!(out["mailbox"].as_str().unwrap().starts_with("agent-"));
         // Poll until settled (parallel test load makes fixed sleeps
         // flaky — the child is a detached shell echo).
-        let mut st = None;
-        for _ in 0..50 {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            let r = poll.execute(json!({"agent": id})).unwrap();
-            if r["running"] == json!(false) {
-                st = Some(r);
-                break;
-            }
-        }
-        let st = st.unwrap_or_else(|| panic!("fake child never settled"));
+        let st =
+            crate::test_dir::wait_for(crate::test_dir::WAIT, "the fake child to settle", || {
+                let r = poll.execute(json!({"agent": id})).unwrap();
+                (r["running"] == json!(false)).then_some(r)
+            });
         assert_eq!(st["running"], json!(false), "{st}");
         assert!(
             st["log_tail"].as_str().unwrap().contains("FAKE_AGENT_DONE"),
@@ -1989,13 +1969,10 @@ mod tests {
         let id = out["agent"].as_str().unwrap().to_string();
         // Wait for the fake child to settle.
         let poll = AgentPollTool::new(d.to_path_buf());
-        for _ in 0..50 {
-            std::thread::sleep(std::time::Duration::from_millis(100));
+        crate::test_dir::wait_until(crate::test_dir::WAIT, "the fake child to settle", || {
             let st = poll.execute(json!({"agent": id})).unwrap();
-            if st["running"] == json!(false) {
-                break;
-            }
-        }
+            st["running"] == json!(false)
+        });
         // First consume after settle (recalls + cleans + marks). Stubbed
         // recall: success with an explicit empty result (issue #287 —
         // a real `uteke` may be absent or failing in the test env).

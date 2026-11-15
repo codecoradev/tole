@@ -194,16 +194,13 @@ impl World {
 
     /// The id of the first pending request, waiting for it to appear.
     fn pending(&self) -> String {
-        let end = Instant::now() + Duration::from_secs(60);
-        while Instant::now() < end {
+        common::wait_for(common::WAIT, "an approval request to appear", || {
             let o = self.owner(&["list"]);
             let out = String::from_utf8_lossy(&o.stdout).to_string();
-            if let Some(id) = out.split_whitespace().find(|w| w.starts_with("dap-")) {
-                return id.to_string();
-            }
-            std::thread::sleep(Duration::from_millis(150));
-        }
-        panic!("no approval request appeared");
+            out.split_whitespace()
+                .find(|w| w.starts_with("dap-"))
+                .map(str::to_string)
+        })
     }
 
     fn written(&self) -> Option<String> {
@@ -285,9 +282,40 @@ fn no_answer_is_a_denial() {
     let (log, node) = w.seed();
     let started = Instant::now();
     let (out, _) = finish(w.child(&log, &node));
+    // #812: the window is counted in the log's own whole seconds
+    // (`expires_at` = the request's second + 2), so on the wall clock it is
+    // between one and two seconds: a lower bound of two real seconds from
+    // before the child even started held only while the child took long to
+    // start, and failed on a fast machine. The window is proven in the
+    // log's clock instead: the request's window is the configured 2 s, and
+    // the expiry is recorded no earlier than the end of it.
     assert!(
-        started.elapsed() >= Duration::from_secs(2),
-        "it waited for the window"
+        started.elapsed() >= Duration::from_secs(1),
+        "it was denied at once, not after a window (took {:?})",
+        started.elapsed()
+    );
+    let records = std::fs::read_to_string(log.parent().unwrap().join("approvals.jsonl"))
+        .expect("approvals log");
+    let record = |kind: &str| -> Value {
+        records
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .find(|v| v["kind"] == kind)
+            .unwrap_or_else(|| panic!("no {kind} record in {records}"))
+    };
+    let (request, expire) = (record("request"), record("expire"));
+    let (asked, expires_at) = (
+        request["at"].as_i64().unwrap(),
+        request["expires_at"].as_i64().unwrap(),
+    );
+    assert_eq!(
+        expires_at - asked,
+        2,
+        "the window is approval_secs: {request}"
+    );
+    assert!(
+        expire["at"].as_i64().unwrap() >= expires_at,
+        "it waited for the window: {expire}"
     );
     assert!(w.written().is_none(), "{out}");
     let audit = w.audit();

@@ -214,18 +214,10 @@ fn wrapper(root: &std::path::Path, base: &str) -> std::path::PathBuf {
 
 /// Poll until the child settles; returns the last poll result.
 fn settle(poll: &AgentPollTool, id: &str) -> Value {
-    let deadline = std::time::Instant::now() + Duration::from_secs(90);
-    loop {
+    common::wait_for(Duration::from_secs(120), "the child to settle", || {
         let out = poll.execute(json!({"agent": id})).unwrap();
-        if out["running"] == json!(false) {
-            return out;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "child never settled: {out}"
-        );
-        std::thread::sleep(Duration::from_millis(300));
-    }
+        (out["running"] == json!(false)).then_some(out)
+    })
 }
 
 #[cfg(unix)]

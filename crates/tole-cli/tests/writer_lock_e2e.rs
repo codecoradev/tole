@@ -96,7 +96,13 @@ fn text(b: &[u8]) -> String {
 
 fn seqs(file: &Path) -> Vec<u64> {
     let mut out = Vec::new();
-    for l in std::fs::read_to_string(file).unwrap().lines().skip(1) {
+    // Whole lines only: the writer may be in the middle of one.
+    let all = std::fs::read_to_string(file).unwrap();
+    for l in all
+        .split_inclusive('\n')
+        .filter(|l| l.ends_with('\n'))
+        .skip(1)
+    {
         let v: Value = serde_json::from_str(l).unwrap();
         match v {
             Value::Array(a) => out.extend(a.iter().map(|r| r["seq"].as_u64().unwrap())),
@@ -128,20 +134,28 @@ fn second_process_is_refused_and_the_file_stays_valid() {
         .unwrap();
     let mut a_in = a.stdin.take().unwrap();
     writeln!(a_in, "from A, message 1").unwrap();
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while seqs(&file).len() <= base {
-        assert!(Instant::now() < deadline, "A never wrote");
-        std::thread::sleep(Duration::from_millis(50));
+    common::wait_until(common::WAIT, "A to write its message", || {
+        seqs(&file).len() > base
+    });
+    // A may still be appending (its answer): B must leave what is there
+    // now alone, so the snapshot ends at a whole line and B's refusal is
+    // checked against it below.
+    let mut before = std::fs::read(&file).unwrap();
+    if let Some(end) = before.iter().rposition(|b| *b == b'\n') {
+        before.truncate(end + 1);
     }
-    std::thread::sleep(Duration::from_millis(300));
-    let before = std::fs::read(&file).unwrap();
 
     // Process B: refused, naming A; file untouched.
     let o = run(&d, &url, &["resume", &id, "from B"]);
     assert!(!o.status.success());
     let err = text(&o.stderr);
     assert!(err.contains(&format!("pid {}", a.id())), "{err}");
-    assert_eq!(std::fs::read(&file).unwrap(), before);
+    let after = std::fs::read(&file).unwrap();
+    assert!(after.starts_with(&before), "B changed what A had written");
+    assert!(
+        !text(&after).contains("from B"),
+        "B's message reached the file"
+    );
 
     // Read-only commands work while A holds the lock.
     assert!(run(&d, &url, &["status", &id]).status.success());

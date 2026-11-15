@@ -6,10 +6,11 @@
 
 mod test_dir;
 #[allow(unused_imports)]
-pub use test_dir::{ChildGuard, TestDir, WorkDir};
+pub use test_dir::{
+    poll_until, wait_exit, wait_for, wait_until, ChildGuard, TestDir, WorkDir, WAIT,
+};
 
 use std::path::Path;
-use std::time::{Duration, Instant};
 use tole_core::mcp::{register_server_tools, McpServerConfig};
 use tole_core::plugin_lock::ManifestTool;
 use tole_core::sandbox::{self, Availability, Mode, Policy};
@@ -89,16 +90,4 @@ pub fn running(ws: &Path) -> bool {
                 .map(|b| String::from_utf8_lossy(&b).contains(&needle))
                 .unwrap_or(false)
     })
-}
-
-/// Polls `f` for up to ten seconds.
-pub fn wait_until(f: impl Fn() -> bool) -> bool {
-    let end = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < end {
-        if f() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    f()
 }

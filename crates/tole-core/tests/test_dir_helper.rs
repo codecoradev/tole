@@ -2,7 +2,7 @@
 
 #[path = "support/test_dir.rs"]
 mod test_dir;
-use test_dir::{ChildGuard, TestDir, WorkDir};
+use test_dir::{wait_for, wait_until, ChildGuard, TestDir, WorkDir, WAIT};
 
 #[test]
 fn removes_the_directory_on_drop() {
@@ -103,4 +103,64 @@ fn in_system_temp_is_under_the_system_temp_dir() {
     let p = d.path().to_path_buf();
     drop(d);
     assert!(!p.exists());
+}
+
+// The condition waits (#812).
+
+#[test]
+fn wait_until_returns_at_once_for_a_true_condition() {
+    let start = std::time::Instant::now();
+    wait_until(std::time::Duration::from_secs(30), "nothing", || true);
+    assert!(start.elapsed() < std::time::Duration::from_secs(5));
+}
+
+#[test]
+fn wait_until_waits_for_a_condition_that_becomes_true() {
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let setter = {
+        let flag = flag.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+    };
+    wait_until(WAIT, "the flag", || {
+        flag.load(std::sync::atomic::Ordering::SeqCst)
+    });
+    setter.join().unwrap();
+}
+
+#[test]
+fn wait_for_hands_back_the_value() {
+    let mut n = 0;
+    let got = wait_for(WAIT, "the third probe", || {
+        n += 1;
+        (n == 3).then_some(n * 10)
+    });
+    assert_eq!(got, 30);
+}
+
+#[test]
+fn wait_until_panics_with_what_it_waited_for_and_the_bound() {
+    let r = std::panic::catch_unwind(|| {
+        wait_until(
+            std::time::Duration::from_millis(80),
+            "a file that never comes",
+            || false,
+        );
+    });
+    let msg = *r.unwrap_err().downcast::<String>().unwrap();
+    assert!(msg.contains("a file that never comes"), "{msg}");
+    assert!(msg.contains("80ms"), "{msg}");
+}
+
+#[test]
+fn wait_until_looks_once_more_at_the_deadline() {
+    // A probe that only holds after the bound has passed still wins when
+    // the thread was paused past it: the last look at the deadline decides.
+    let mut calls = 0;
+    wait_until(std::time::Duration::ZERO, "the second look", || {
+        calls += 1;
+        calls >= 2
+    });
 }

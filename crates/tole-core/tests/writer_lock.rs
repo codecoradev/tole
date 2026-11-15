@@ -229,9 +229,9 @@ fn hold_as_duplicate(dir: &std::path::Path, id: &str, ms: u64) -> std::thread::J
             .unwrap();
         // Children forked by other tests of this binary can still hold a
         // duplicate of the lock `create` just released: wait for it.
-        while f.try_lock().is_err() {
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        }
+        test_dir::wait_until(test_dir::WAIT, "the duplicate lock to be released", || {
+            f.try_lock().is_ok()
+        });
         f.set_len(0).unwrap();
         write!(f, "{}", std::process::id()).unwrap();
         tx.send(()).unwrap();

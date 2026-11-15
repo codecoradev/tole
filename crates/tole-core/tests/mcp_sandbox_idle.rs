@@ -8,7 +8,7 @@
 
 mod support;
 
-use support::{live_policy, register, running, skipped, wait_until, workspace};
+use support::{live_policy, register, running, skipped, wait_until, workspace, WAIT};
 use tole_core::mcp::{get_server_prompt_in, live_connections};
 
 #[test]
@@ -20,10 +20,9 @@ fn an_idle_server_is_reaped_and_restarts_on_the_next_call() {
     let ws = workspace("idle");
     let (_cfg, _reg) = register("idle", &ws);
     assert!(running(&ws) && live_connections() == 1);
-    assert!(
-        wait_until(|| !running(&ws) && live_connections() == 0),
-        "unused for idle_secs, the server is stopped"
-    );
+    wait_until(WAIT, "the server to stop, unused for idle_secs", || {
+        !running(&ws) && live_connections() == 0
+    });
     // The session is still alive: its next call starts the server again.
     let args = [("topic".to_string(), "x".to_string())].into();
     assert_eq!(
