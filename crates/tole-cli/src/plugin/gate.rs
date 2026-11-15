@@ -49,6 +49,9 @@ pub struct Gate {
     /// The sandbox policy the live profile of a server is read from: the
     /// process's, taken when the gate is loaded (see [`Gate::with_policy`]).
     policy: Option<tole_core::sandbox::Policy>,
+    /// What this machine offers; `None` probes it on first use (see
+    /// [`Gate::with_backend`]).
+    backend: Option<tole_core::sandbox::Availability>,
 }
 
 fn now() -> u64 {
@@ -87,6 +90,7 @@ impl Gate {
                     user_path: user,
                     broken: Some(project_path),
                     policy: tole_core::sandbox::session_policy(),
+                    backend: None,
                 };
             }
         };
@@ -104,7 +108,22 @@ impl Gate {
             user_path: user,
             broken,
             policy: tole_core::sandbox::session_policy(),
+            backend: None,
         }
+    }
+
+    /// The same gate with a given sandbox backend instead of the probed one
+    /// (tests and embedders).
+    pub fn with_backend(mut self, backend: tole_core::sandbox::Availability) -> Self {
+        self.backend = Some(backend);
+        self
+    }
+
+    /// The sandbox backend of this machine (probed once per process).
+    fn backend(&self) -> tole_core::sandbox::Availability {
+        self.backend
+            .clone()
+            .unwrap_or_else(tole_core::sandbox::detect)
     }
 
     /// The same gate reading live sandbox profiles from `policy` instead of
@@ -114,9 +133,10 @@ impl Gate {
         self
     }
 
-    /// The identity of the sandbox profile `server` would run in now: `None`
-    /// for a remote server, with the sandbox off, or for a server the owner
-    /// skips. Read at every call, never cached, so an edit of the user
+    /// The identity of the sandbox profile `server` would actually run under
+    /// now: `None` for a remote server, with the sandbox off, for a server
+    /// the owner skips, or when no working backend can apply it (bwrap
+    /// missing, mode `optional`: it would run unwrapped). Read at every call, never cached, so an edit of the user
     /// config is seen at the next start (#750).
     pub fn live_profile(
         &self,
@@ -124,7 +144,9 @@ impl Gate {
         source: &str,
     ) -> Option<tole_core::sandbox::identity::ProfileId> {
         source.starts_with("stdio:").then_some(())?;
-        self.policy.as_ref()?.profile_id(server)
+        self.policy
+            .as_ref()?
+            .applied_profile(server, &self.backend())
     }
 
     /// The connect-time guard: `Ok` only for an exact match of the
@@ -631,7 +653,7 @@ pub fn preflight(
         // this run and is not offered for approval.
         let configured = source
             .starts_with("stdio:")
-            .then(|| tole_core::sandbox::policy()?.profile_id(&cfg.name))
+            .then(|| tole_core::sandbox::policy()?.applied_profile(&cfg.name, &gate.backend()))
             .flatten();
         if matches!(a, Admission::ProfileChanged) && configured != profile {
             eprintln!(

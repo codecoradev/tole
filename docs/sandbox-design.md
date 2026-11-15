@@ -318,6 +318,13 @@ profile = "net"              # server | strict | a profile defined above
   reported (`tole plugin list`, `tole doctor`: "approved before approvals
   recorded their sandbox profile"), not blocked, and its profile is not
   compared until its next `tole plugin approve` records it.
+  *Backend:* "the profile it would run under" is `Policy::applied_profile`,
+  the one helper approval, admission, `list` and `diff` share: the
+  configured profile only when a working backend exists. With bwrap missing
+  (or user namespaces refused) in mode `optional` the server would run
+  unwrapped, so no profile applies: an approval records no sandbox, and a
+  server approved with one is `ProfileChanged` (not started) until the
+  owner re-approves or the sandbox works again.
   *Flags:* the gate reads the SESSION view of the policy
   (`sandbox::session_policy`, the run's `--sandbox <p>` / `--no-sandbox`
   applied), because that is what the server will actually run under: a

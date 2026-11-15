@@ -13,6 +13,13 @@ use tole_core::plugin_lock::ManifestTool;
 use tole_core::sandbox::flags::{self, Override};
 use tole_core::sandbox::{self, Mode, Policy};
 
+fn usable() -> tole_core::sandbox::Availability {
+    tole_core::sandbox::Availability::Usable {
+        bwrap: "/usr/bin/bwrap".into(),
+        version: "0.9.0".into(),
+    }
+}
+
 fn tools() -> Vec<ManifestTool> {
     vec![ManifestTool {
         name: "search".into(),
@@ -40,8 +47,8 @@ fn a_sandbox_flag_profile_cannot_run_an_approved_server_without_a_block() {
     let ws = TestDir::new("tole-gate-flag-prof-ws");
     sandbox::set_policy(Some(configured())).unwrap();
     // Approved under the configured profile (what `tole plugin approve` sees).
-    let id = configured().profile_id("srv").unwrap();
-    let mut gate = Gate::load(Some(user.clone()), &ws);
+    let id = configured().applied_profile("srv", &usable()).unwrap();
+    let mut gate = Gate::load(Some(user.clone()), &ws).with_backend(usable());
     assert_eq!(gate.live_profile("srv", "stdio:srv").unwrap(), id);
     gate.approve_with(
         "srv",
@@ -56,6 +63,7 @@ fn a_sandbox_flag_profile_cannot_run_an_approved_server_without_a_block() {
     )
     .unwrap();
     assert!(Gate::load(Some(user.clone()), &ws)
+        .with_backend(usable())
         .refuse_unseen("srv", "stdio:srv")
         .is_none());
     // `--sandbox strict`: the server would now start under another profile.
@@ -65,7 +73,7 @@ fn a_sandbox_flag_profile_cannot_run_an_approved_server_without_a_block() {
         configured: "server".into(),
     })
     .unwrap();
-    let gate = Gate::load(Some(user), &ws);
+    let gate = Gate::load(Some(user), &ws).with_backend(usable());
     assert_eq!(
         gate.live_profile("srv", "stdio:srv").unwrap().name,
         "strict"

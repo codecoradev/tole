@@ -394,13 +394,21 @@ fn policy(network: tole_core::sandbox::Network) -> tole_core::sandbox::Policy {
     }
 }
 
+fn usable() -> tole_core::sandbox::Availability {
+    tole_core::sandbox::Availability::Usable {
+        bwrap: "/usr/bin/bwrap".into(),
+        version: "0.9.0".into(),
+    }
+}
+
 /// `srv` approved in the profile with no network.
 fn profiled_gate(tag: &str) -> (TestDir, PathBuf, TestDir) {
     let dir = tmp(tag);
     let user = dir.join(plugin_lock::LOCK_FILE);
     let ws = tmp(&format!("{tag}-ws"));
     let mut gate = Gate::load(Some(user.clone()), &ws)
-        .with_policy(Some(policy(tole_core::sandbox::Network::None)));
+        .with_policy(Some(policy(tole_core::sandbox::Network::None)))
+        .with_backend(usable());
     let id = gate.live_profile("srv", "stdio:srv").unwrap();
     gate.approve_with(
         "srv",
@@ -421,7 +429,11 @@ fn profiled_gate(tag: &str) -> (TestDir, PathBuf, TestDir) {
 fn a_profile_edited_in_the_user_config_blocks_the_server_before_and_after_it_starts() {
     use tole_core::sandbox::Network;
     let (dir, user, ws) = profiled_gate("prof-conn");
-    let load = |n| Gate::load(Some(user.clone()), &ws).with_policy(Some(policy(n)));
+    let load = |n| {
+        Gate::load(Some(user.clone()), &ws)
+            .with_policy(Some(policy(n)))
+            .with_backend(usable())
+    };
     let same = load(Network::None);
     assert!(same.refuse_unseen("srv", "stdio:srv").is_none());
     assert!(same.check("srv", "stdio:srv", "1", &tools()).is_ok());
@@ -447,7 +459,9 @@ fn a_project_lock_cannot_loosen_or_replace_the_profile() {
     let mut project = Lockfile::load(&user).unwrap();
     project.servers.get_mut("srv").unwrap().sandbox_hash = Some("sha256:ff".into());
     project.save(&Lockfile::project_path(&ws)).unwrap();
-    let g = Gate::load(Some(user.clone()), &ws).with_policy(Some(policy(Network::None)));
+    let g = Gate::load(Some(user.clone()), &ws)
+        .with_policy(Some(policy(Network::None)))
+        .with_backend(usable());
     assert!(g.refuse_unseen("srv", "stdio:srv").is_some());
     assert!(
         g.notes
@@ -462,7 +476,9 @@ fn a_project_lock_cannot_loosen_or_replace_the_profile() {
     e.sandbox = None;
     e.sandbox_hash = None;
     project.save(&Lockfile::project_path(&ws)).unwrap();
-    let g = Gate::load(Some(user.clone()), &ws).with_policy(Some(policy(Network::Host)));
+    let g = Gate::load(Some(user.clone()), &ws)
+        .with_policy(Some(policy(Network::Host)))
+        .with_backend(usable());
     assert!(
         g.refuse_unseen("srv", "stdio:srv").is_some(),
         "a project lock cannot loosen the user's profile record"
@@ -502,4 +518,27 @@ fn an_old_lock_without_a_profile_is_not_blocked_and_the_note_names_the_migration
         "{:?}",
         gate.notes
     );
+}
+
+/// An approval with a sandbox is a promise that it runs wrapped. With the
+/// mode `optional` and no working backend the server would run unwrapped and
+/// the configured profile still hashes the same: it must be blocked anyway.
+#[test]
+fn an_approved_server_is_blocked_when_the_sandbox_cannot_be_applied_any_more() {
+    use tole_core::sandbox::{Availability, Mode, Network};
+    let (_dir, user, ws) = profiled_gate("prof-nobackend");
+    let mut optional = policy(Network::None);
+    optional.mode = Mode::Optional;
+    let gate = Gate::load(Some(user.clone()), &ws).with_policy(Some(optional.clone()));
+    // Backend works: still admitted.
+    let ok = Gate::load(Some(user.clone()), &ws)
+        .with_policy(Some(optional.clone()))
+        .with_backend(usable());
+    assert!(ok.refuse_unseen("srv", "stdio:srv").is_none());
+    // bwrap went missing: same config, no sandbox applies.
+    let gone = gate.with_backend(Availability::Unavailable("bwrap is not on PATH".into()));
+    assert!(gone.live_profile("srv", "stdio:srv").is_none());
+    let note = gone.refuse_unseen("srv", "stdio:srv").unwrap();
+    assert!(note.contains("sandbox profile"), "{note}");
+    assert!(gone.check("srv", "stdio:srv", "1", &tools()).is_err());
 }

@@ -1153,7 +1153,9 @@ fn entry(h: &H) -> LockEntry {
 }
 
 fn gate(h: &H) -> Gate {
-    Gate::load(Some(h.user()), &h.dir.join("ws")).with_policy(h.sandbox.clone())
+    Gate::load(Some(h.user()), &h.dir.join("ws"))
+        .with_policy(h.sandbox.clone())
+        .with_backend(h.backend.clone())
 }
 
 /// A bundle installed with A_TOKEN granted and B_KEY refused.
@@ -1559,4 +1561,30 @@ fn an_approval_from_before_profiles_were_recorded_is_reported_and_not_blocked() 
         .run(&v1(), LIST)
         .unwrap()
         .contains("before approvals recorded"));
+}
+
+#[test]
+fn approving_without_a_working_sandbox_records_none_and_a_lost_one_blocks() {
+    let mut h = profiled("prof-backend");
+    h.sandbox.as_mut().unwrap().mode = tole_core::sandbox::Mode::Optional;
+    // Approved while bwrap works: the profile is recorded and applies.
+    h.run(&v1(), approve("srv", Some(&hash(&v1())))).unwrap();
+    assert_eq!(lock_entry(&h).sandbox.as_deref(), Some("server"));
+    assert_eq!(h.rows(&v1())[0]["state"], json!("approved"));
+    // bwrap is gone (mode optional: it would run unwrapped): blocked.
+    h.backend = Availability::Unavailable("bwrap is not on PATH".into());
+    assert_eq!(
+        h.rows(&v1())[0]["state"],
+        json!("changed (sandbox profile)")
+    );
+    // Nothing re-approves it without a sandbox (a third-party server is not
+    // even started without one) ...
+    assert!(h.go(&|_| v1(), Some(true), approve("srv", None)).is_err());
+    // ... while the owner's own server, approved with no working sandbox,
+    // records "no sandbox", which is what admission then compares.
+    h.first_party = Some(vec!["srv".into()]);
+    h.go(&|_| v1(), Some(true), approve("srv", None)).unwrap();
+    let e = lock_entry(&h);
+    assert!(e.sandbox.is_none() && e.sandbox_hash.is_none());
+    assert_eq!(h.rows(&v1())[0]["state"], json!("approved"));
 }

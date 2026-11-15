@@ -685,11 +685,7 @@ fn sandbox_refusal(ctx: &Ctx<'_>, cfg: &McpServerConfig, tier: Tier) -> Option<S
 /// The profile an approval records: the name and grant hash of the one the
 /// server ran in, if any (#750).
 fn profile_approval(ctx: &Ctx<'_>, cfg: &McpServerConfig) -> Approval {
-    let id = ctx
-        .sandbox
-        .as_ref()
-        .filter(|_| is_stdio(cfg) && matches!(ctx.backend, Availability::Usable { .. }))
-        .and_then(|p| p.profile_id(&cfg.name));
+    let id = live_profile(ctx, cfg);
     Approval {
         sandbox: id.as_ref().map(|p| p.name.clone()),
         sandbox_hash: id.map(|p| p.hash),
@@ -702,7 +698,7 @@ fn live_profile(ctx: &Ctx<'_>, cfg: &McpServerConfig) -> Option<ProfileId> {
     ctx.sandbox
         .as_ref()
         .filter(|_| is_stdio(cfg))
-        .and_then(|p| p.profile_id(&cfg.name))
+        .and_then(|p| p.applied_profile(&cfg.name, &ctx.backend))
 }
 
 /// [`Admission::ProfileChanged`] when `cfg` would run in another sandbox

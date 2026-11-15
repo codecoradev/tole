@@ -66,10 +66,10 @@ impl Profile {
 }
 
 impl Policy {
-    /// The identity of the profile `server` would run in, or `None` when no
-    /// profile applies to it: the sandbox is off or the owner skips it.
-    /// (Whether the server is a stdio one, and whether a backend exists, is
-    /// the caller's to say.)
+    /// The identity of the profile CONFIGURED for `server`, or `None` when
+    /// none applies: the sandbox is off or the owner skips it. It says
+    /// nothing about whether a sandbox can actually be applied; approval and
+    /// admission use [`Policy::applied_profile`].
     pub fn profile_id(&self, server: &str) -> Option<ProfileId> {
         if self.mode == super::Mode::Off || self.skip.iter().any(|s| s == server) {
             return None;
@@ -79,6 +79,21 @@ impl Policy {
             name: name.to_string(),
             hash: profile.hash(),
         })
+    }
+}
+
+impl Policy {
+    /// The identity of the profile `server` actually runs under: as
+    /// [`Policy::profile_id`], and `None` unless `avail` is a usable backend.
+    /// With no working backend a server in mode `optional` runs unwrapped, so
+    /// no profile applies to it, and an approval records (and admission
+    /// compares) exactly that. The one helper approval, admission, `list`
+    /// and `diff` share, so they cannot disagree. (Whether the server is a
+    /// stdio one is the caller's to say.)
+    pub fn applied_profile(&self, server: &str, avail: &super::Availability) -> Option<ProfileId> {
+        matches!(avail, super::Availability::Usable { .. })
+            .then(|| self.profile_id(server))
+            .flatten()
     }
 }
 

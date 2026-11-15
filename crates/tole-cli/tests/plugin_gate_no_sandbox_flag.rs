@@ -9,6 +9,13 @@ use tole_core::plugin_lock::ManifestTool;
 use tole_core::sandbox::flags::{self, Override};
 use tole_core::sandbox::{self, Mode, Policy};
 
+fn usable() -> tole_core::sandbox::Availability {
+    tole_core::sandbox::Availability::Usable {
+        bwrap: "/usr/bin/bwrap".into(),
+        version: "0.9.0".into(),
+    }
+}
+
 #[test]
 fn no_sandbox_blocks_a_server_that_was_approved_with_one() {
     let tools = vec![ManifestTool {
@@ -29,8 +36,9 @@ fn no_sandbox_blocks_a_server_that_was_approved_with_one() {
         idle_secs: 60,
     };
     sandbox::set_policy(Some(configured.clone())).unwrap();
-    let id = configured.profile_id("srv").unwrap();
+    let id = configured.applied_profile("srv", &usable()).unwrap();
     Gate::load(Some(user.clone()), &ws)
+        .with_backend(usable())
         .approve_with(
             "srv",
             "stdio:srv",
@@ -44,13 +52,14 @@ fn no_sandbox_blocks_a_server_that_was_approved_with_one() {
         )
         .unwrap();
     assert!(Gate::load(Some(user.clone()), &ws)
+        .with_backend(usable())
         .refuse_unseen("srv", "stdio:srv")
         .is_none());
     flags::set(Override::NoSandbox {
         configured: Mode::Required,
     })
     .unwrap();
-    let gate = Gate::load(Some(user), &ws);
+    let gate = Gate::load(Some(user), &ws).with_backend(usable());
     assert!(gate.live_profile("srv", "stdio:srv").is_none());
     let note = gate.refuse_unseen("srv", "stdio:srv").unwrap();
     assert!(note.contains("sandbox profile"), "{note}");
