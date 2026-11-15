@@ -13,6 +13,7 @@ const T: i64 = 1_000_000;
 const SECRET: &str = "s3cr3t-value-123456";
 
 struct Fx {
+    _dir: crate::test_dir::TestDir,
     log: PathBuf,
     kid: String,
     store: Store,
@@ -23,8 +24,7 @@ fn s(v: &[&str]) -> Vec<String> {
 }
 
 fn fx(tag: &str) -> Fx {
-    let dir = std::env::temp_dir().join(format!("tole-aowner-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = crate::test_dir::TestDir::new(&format!("tole-aowner-{tag}"));
     std::fs::create_dir_all(dir.join("g")).unwrap();
     let log = dir.join("g").join("delegation.jsonl");
     let mut d = Delegation::open(FileStore::new(log.clone())).unwrap();
@@ -62,6 +62,7 @@ fn fx(tag: &str) -> Fx {
     let mid = spawn("g", "sess-mid");
     let kid = spawn(&mid, "sess-kid");
     Fx {
+        _dir: dir,
         store: Store::new(log.clone()),
         log,
         kid,

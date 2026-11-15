@@ -472,9 +472,9 @@ mod tests {
         }
     }
 
-    fn ws(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("tole-skrecall-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+    use crate::test_dir::TestDir;
+    fn ws(tag: &str) -> TestDir {
+        let dir = TestDir::new(&format!("tole-skrecall-{tag}"));
         for n in ["alpha", "beta", "gamma"] {
             let d = dir.join("skills").join(n);
             std::fs::create_dir_all(&d).unwrap();

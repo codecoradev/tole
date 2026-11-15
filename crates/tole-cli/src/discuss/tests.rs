@@ -78,11 +78,8 @@ pub(crate) fn agreeable() -> Answer {
     })
 }
 
-pub(crate) fn tmp(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("tole-discuss-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+pub(crate) fn tmp(tag: &str) -> crate::test_dir::TestDir {
+    crate::test_dir::TestDir::new(&format!("tole-discuss-{tag}"))
 }
 
 pub(crate) fn config() -> Config {

@@ -162,11 +162,9 @@ fn secrets() -> SecretSet {
     SecretSet::default().with("MY_TOKEN", SECRET)
 }
 
-fn log(tag: &str) -> DiscussionLog {
-    let d = std::env::temp_dir().join(format!("tole-dhost-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    DiscussionLog::at(&d, "pick-db").unwrap()
+fn log(tag: &str) -> (DiscussionLog, crate::test_dir::TestDir) {
+    let d = crate::test_dir::TestDir::new(&format!("tole-dhost-{tag}"));
+    (DiscussionLog::at(&d, "pick-db").unwrap(), d)
 }
 
 fn contract(budget: u64, rounds: Option<u32>) -> Contract {
@@ -225,7 +223,8 @@ fn kinds(s: &Shared) -> Vec<String> {
 #[test]
 fn a_small_discussion_runs_to_a_checked_report() {
     let (s, make) = script(&[("checker", vec![checker_met(1)])]);
-    let d = driver(log("report"), make, 1_000_000);
+    let (lg, _dir) = log("report");
+    let d = driver(lg, make, 1_000_000);
     d.start(contract(100_000, None)).unwrap();
     let out = d.run().unwrap();
     assert_eq!(out.gate, Gate::Report);
@@ -277,7 +276,8 @@ fn a_big_round_is_digested_and_a_refused_digest_falls_back() {
             ],
         ),
     ]);
-    let d = driver(log("digest"), make, 1_000_000);
+    let (lg, _dir) = log("digest");
+    let d = driver(lg, make, 1_000_000);
     d.start(contract(100_000, Some(3))).unwrap();
     let out = d.run().unwrap();
     assert_eq!(out.gate, Gate::Escalate(Reason::MaxRounds));
@@ -318,7 +318,8 @@ fn a_big_round_is_digested_and_a_refused_digest_falls_back() {
 fn the_budget_is_a_hard_stop_with_an_escalation() {
     // The first voice spends 2,000; the second's estimate no longer fits.
     let (s, make) = script(&[("coder", vec![text("ok", 2_000)])]);
-    let d = driver(log("budget"), make, 1_000_000);
+    let (lg, _dir) = log("budget");
+    let d = driver(lg, make, 1_000_000);
     d.start(contract(4_000, None)).unwrap();
     let out = d.run().unwrap();
     assert_eq!(out.gate, Gate::Escalate(Reason::Budget));
@@ -332,7 +333,8 @@ fn the_budget_is_a_hard_stop_with_an_escalation() {
     // The goal's pot stops it too, even when the discussion's own budget
     // would not.
     let (s, make) = script(&[]);
-    let d = driver(log("pot"), make, 1_000_000);
+    let (lg, _dir) = log("pot");
+    let d = driver(lg, make, 1_000_000);
     d.start(contract(1_000_000, None)).unwrap();
     d.pot.charge(1_000_000 - 10);
     assert_eq!(d.run().unwrap().gate, Gate::Escalate(Reason::Budget));
@@ -347,7 +349,8 @@ fn a_budget_is_carved_from_the_goal_and_never_exceeds_it() {
     assert!(carve(Some(10_001), &pot).is_err());
     assert!(carve(Some(0), &pot).is_err());
     let (_, make) = script(&[]);
-    let d = driver(log("carve"), make, 10_000);
+    let (lg, _dir) = log("carve");
+    let d = driver(lg, make, 10_000);
     let e = d.start(contract(10_001, None)).unwrap_err();
     assert!(e.contains("left in the goal's budget"), "{e}");
 }
@@ -356,7 +359,7 @@ fn a_budget_is_carved_from_the_goal_and_never_exceeds_it() {
 fn a_crash_resumes_without_running_a_finished_turn_or_spending_twice() {
     // The second voice's provider fails: the run stops, resumable.
     let (s, make) = script(&[("ops", vec![fails(Some(7))])]);
-    let l = log("resume");
+    let (l, _dir) = log("resume");
     let d = driver(l.clone(), make.clone(), 1_000_000);
     d.start(contract(100_000, Some(1))).unwrap();
     let e = d.run().unwrap_err();
@@ -409,7 +412,8 @@ fn what_a_model_writes_never_acts() {
             vec![text(r#"[{"met": true, "evidence": ["e999"]}]"#, 50)],
         ),
     ]);
-    let d = driver(log("hostile"), make, 1_000_000);
+    let (lg, _dir) = log("hostile");
+    let d = driver(lg, make, 1_000_000);
     d.start(contract(100_000, Some(2))).unwrap();
     let out = d.run().unwrap();
     assert_ne!(out.gate, Gate::Report, "only a checked checklist reports");
@@ -425,9 +429,7 @@ fn what_a_model_writes_never_acts() {
 
 #[test]
 fn participants_are_user_profiles_and_never_a_role() {
-    let dir = std::env::temp_dir().join(format!("tole-dhost-config-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = crate::test_dir::TestDir::new("tole-dhost-config");
     std::fs::write(dir.join("coder.md"), "You write Rust.").unwrap();
     let cfg = crate::config::parse(
         "[profiles.coder]\nsystem_prompt_file = \"coder.md\"\n[profiles.coder.models]\n\
@@ -438,13 +440,16 @@ fn participants_are_user_profiles_and_never_a_role() {
     .unwrap();
     let (_, make) = script(&[]);
     let pot = Arc::new(Budget::new(1_000));
+    let cfg_dirs = std::cell::RefCell::new(Vec::new());
     let mk = |names: &[&str]| {
+        let (cfg_log, cfg_dir) = log("cfg");
+        cfg_dirs.borrow_mut().push(cfg_dir);
         let names: Vec<String> = names.iter().map(|s| s.to_string()).collect();
         Driver::from_config(
             &cfg,
             (Some(&dir), None),
             &names,
-            log("cfg"),
+            cfg_log,
             secrets(),
             make.clone(),
             Arc::clone(&pot),
@@ -517,7 +522,8 @@ impl Independent for Child {
 fn an_independent_participant_runs_as_a_read_only_child_and_is_polled_on_resume() {
     let (s, make) = script(&[]);
     let child = Arc::new(Child::default());
-    let d = driver(log("independent"), make.clone(), 1_000_000)
+    let (lg, _dir) = log("independent");
+    let d = driver(lg, make.clone(), 1_000_000)
         .with_independent(&["ops".to_string()], child.clone())
         .unwrap()
         .with_poll_every(std::time::Duration::ZERO);
@@ -546,13 +552,14 @@ fn an_independent_participant_runs_as_a_read_only_child_and_is_polled_on_resume(
     assert!(!c.contains(SECRET) && !c.contains("<<<END"), "{c}");
     // Only voices can be independent.
     let (_, make2) = script(&[]);
-    assert!(driver(log("ind-bad"), make2, 1)
+    let (bad_log, _bad_dir) = log("ind-bad");
+    assert!(driver(bad_log, make2, 1)
         .with_independent(&["stranger".to_string()], child.clone())
         .is_err());
 
     // A crash left a child running: the resumed driver polls it, never
     // starts another.
-    let l = log("ind-resume");
+    let (l, _dir) = log("ind-resume");
     let (_, make3) = script(&[]);
     let child = Arc::new(Child::default());
     let d = driver(l.clone(), make3, 1_000_000)
@@ -579,7 +586,7 @@ fn an_independent_participant_runs_as_a_read_only_child_and_is_polled_on_resume(
     // A crash between the child's start and the bind of its handle: the
     // intent (the reservation) is in the ledger, the child is found by its
     // call, bound and polled; no second child, no second reservation.
-    let l = log("ind-unbound");
+    let (l, _dir) = log("ind-unbound");
     let (_, make4) = script(&[]);
     let child = Arc::new(Child::default());
     let d = driver(l.clone(), make4, 1_000_000)
@@ -613,7 +620,7 @@ fn an_independent_participant_runs_as_a_read_only_child_and_is_polled_on_resume(
     );
     assert_eq!(out.tokens_used, 1_234 + 100 + 50);
     // An intent with no child behind it starts one, under the same call.
-    let l = log("ind-intent");
+    let (l, _dir) = log("ind-intent");
     let (_, make5) = script(&[]);
     let child = Arc::new(Child::default());
     let d = driver(l.clone(), make5, 1_000_000)
@@ -664,8 +671,8 @@ fn round_documents_are_flat_slugs_with_digests_only() {
         ("scribe", vec![good_scribe(&["first positions"])]),
     ]);
     let docs: Docs = Arc::default();
-    let d = driver(log("docs"), make, 1_000_000)
-        .with_docs(Box::new(FakeDocs(Arc::clone(&docs), false)));
+    let (lg, _dir) = log("docs");
+    let d = driver(lg, make, 1_000_000).with_docs(Box::new(FakeDocs(Arc::clone(&docs), false)));
     d.start(contract(100_000, Some(2))).unwrap();
     let out = d.run().unwrap();
     assert!(out.notes.is_empty(), "{:?}", out.notes);
@@ -700,8 +707,8 @@ fn round_documents_are_flat_slugs_with_digests_only() {
 
     // uteke failing never stops the discussion; the owner is told.
     let (_, make) = script(&[]);
-    let d = driver(log("docs-down"), make, 1_000_000)
-        .with_docs(Box::new(FakeDocs(Arc::default(), true)));
+    let (lg, _dir) = log("docs-down");
+    let d = driver(lg, make, 1_000_000).with_docs(Box::new(FakeDocs(Arc::default(), true)));
     d.start(contract(100_000, Some(1))).unwrap();
     let out = d.run().unwrap();
     assert!(!out.notes.is_empty());
@@ -714,31 +721,33 @@ fn round_documents_are_flat_slugs_with_digests_only() {
 
 /// A production-built driver (the `from_config` path every entry point
 /// uses) over a two-profile config.
-fn built(tag: &str, make: Factory, uteke: bool) -> Driver {
+fn built(tag: &str, make: Factory, uteke: bool) -> (Driver, crate::test_dir::TestDir) {
     let cfg = crate::config::parse(
         "[profiles.coder]\n[profiles.ops]\n[router.tiers]\nlight = \"small\"\n",
         std::path::Path::new("user.toml"),
     )
     .unwrap();
     let names = vec!["coder".to_string(), "ops".to_string()];
-    Driver::from_config_with(
+    let (lg, dir) = log(tag);
+    let driver = Driver::from_config_with(
         &cfg,
         (None, None),
         &names,
-        (log(tag), secrets()),
+        (lg, secrets()),
         make,
         Arc::new(Budget::new(1_000_000)),
         uteke,
     )
     .unwrap()
-    .with_clock(|| 1)
+    .with_clock(|| 1);
+    (driver, dir)
 }
 
 #[test]
 fn the_production_builder_carries_a_round_docs_sink() {
     let (_, make) = script(&[]);
     // Guard against `docs: None` returning on the production path (#717).
-    let d = built("prod-on", make.clone(), true);
+    let (d, _dir) = built("prod-on", make.clone(), true);
     #[cfg(feature = "shell-tools")]
     {
         assert!(d.docs.is_some(), "uteke is configured: docs must be wired");
@@ -746,7 +755,7 @@ fn the_production_builder_carries_a_round_docs_sink() {
     }
     #[cfg(not(feature = "shell-tools"))]
     assert!(d.docs.is_none());
-    let d = built("prod-off", make, false);
+    let (d, _dir) = built("prod-off", make, false);
     assert!(d.docs.is_none());
     assert_eq!(*d.notes.lock().unwrap(), vec![DOCS_OFF_NOTE.to_string()]);
 }
@@ -754,7 +763,7 @@ fn the_production_builder_carries_a_round_docs_sink() {
 #[test]
 fn without_uteke_one_note_says_documents_are_off() {
     let (_, make) = script(&[]);
-    let d = built("off-once", make, false);
+    let (d, _dir) = built("off-once", make, false);
     d.start(contract(100_000, Some(3))).unwrap();
     let out = d.run().unwrap();
     assert!(out.rounds >= 2, "several rounds ran: {}", out.rounds);
@@ -770,8 +779,8 @@ fn without_uteke_one_note_says_documents_are_off() {
 fn a_failed_document_write_is_loud_and_changes_nothing_else() {
     let run = |down: bool, tag: &str| {
         let (_, make) = script(&[]);
-        let d =
-            driver(log(tag), make, 1_000_000).with_docs(Box::new(FakeDocs(Arc::default(), down)));
+        let (lg, _dir) = log(tag);
+        let d = driver(lg, make, 1_000_000).with_docs(Box::new(FakeDocs(Arc::default(), down)));
         d.start(contract(100_000, Some(2))).unwrap();
         d.run().unwrap()
     };
@@ -795,7 +804,7 @@ fn a_failed_document_write_is_loud_and_changes_nothing_else() {
 fn resuming_a_finished_discussion_writes_no_documents_again() {
     let (_, make) = script(&[]);
     let docs: Docs = Arc::default();
-    let l = log("resume-docs");
+    let (l, _dir) = log("resume-docs");
     let mk = |docs: &Docs| {
         driver(l.clone(), make.clone(), 1_000_000)
             .with_docs(Box::new(FakeDocs(Arc::clone(docs), false)))

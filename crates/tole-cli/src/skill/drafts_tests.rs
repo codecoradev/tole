@@ -31,10 +31,9 @@ fn draft_at(
     gate(&p, &ctx, &SecretSet::default()).unwrap()
 }
 
-fn store(tag: &str) -> DraftStore {
-    let d = std::env::temp_dir().join(format!("tole-drafts-cli-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    DraftStore::new(d)
+fn store(tag: &str) -> (DraftStore, TestDir) {
+    let d = crate::test_dir::TestDir::new(&format!("tole-drafts-cli-{tag}"));
+    (DraftStore::new(d.to_path_buf()), d)
 }
 
 #[test]
@@ -50,7 +49,7 @@ fn control_and_invisible_characters_are_shown_as_escapes() {
 
 #[test]
 fn the_list_shows_pending_by_default_and_marks_taint() {
-    let s = store("list");
+    let (s, _dir) = store("list");
     assert_eq!(format_list(&s.list(), false), "no pending drafts");
     assert_eq!(format_list(&s.list(), true), "no drafts");
     let (d, md) = draft(&["web_fetch"], None);
@@ -83,7 +82,7 @@ fn show_lays_out_provenance_taint_dedup_and_both_texts() {
 
 #[test]
 fn reject_and_verdict_act_on_a_pending_draft_once() {
-    let s = store("act");
+    let (s, _dir) = store("act");
     let (d, md) = draft(&[], Some(("release-notes", 0.85)));
     s.create(&d, &md).unwrap();
     run(
@@ -111,16 +110,14 @@ fn reject_and_verdict_act_on_a_pending_draft_once() {
 
 // ---- promote / revoke ------------------------------------------------
 
-fn ws(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("tole-promote-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+use crate::test_dir::TestDir;
+fn ws(tag: &str) -> TestDir {
+    TestDir::new(&format!("tole-promote-{tag}"))
 }
 
 struct Rig {
     store: DraftStore,
-    ws: PathBuf,
+    ws: TestDir,
     approvals: PathBuf,
 }
 

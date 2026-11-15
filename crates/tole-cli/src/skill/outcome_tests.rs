@@ -1,10 +1,9 @@
 use super::*;
 use tole_core::skill_curator::{RunTracker, UsageLedger};
 
-fn ledger(tag: &str) -> UsageLedger {
-    let d = std::env::temp_dir().join(format!("tole-outcome-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    UsageLedger::new(d.join("usage.jsonl"))
+fn ledger(tag: &str) -> (UsageLedger, crate::test_dir::TestDir) {
+    let d = crate::test_dir::TestDir::new(&format!("tole-outcome-{tag}"));
+    (UsageLedger::new(d.join("usage.jsonl")), d)
 }
 
 #[test]
@@ -56,7 +55,7 @@ fn a_mission_status_maps_to_success_failure_or_nothing() {
 
 #[test]
 fn the_outcome_goes_to_what_the_run_loaded_and_a_skip_writes_nothing() {
-    let l = ledger("rec");
+    let (l, _dir) = ledger("rec");
     let t = RunTracker::default();
     record_with(Outcome::Success, &t, &l, 10).unwrap();
     t.note("deploy");
