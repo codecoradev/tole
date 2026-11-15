@@ -280,7 +280,16 @@ Where there is no sandbox (macOS, Windows, Linux without bubblewrap, mode
 `off`, or the name skipped) an unverified stdio server is refused. The owner
 accepts a server explicitly by listing it under `[sandbox] skip`, which makes
 it their own (first-party). A first-party claim in a lock entry is ignored: a
-name must be on the owner's list.
+name must be on the owner's list. A `third-party-verified` claim in a lock
+entry is ignored too for every decision (`approve`, `list`, `diff`): no ledger
+line records a tier and nothing writes it yet, so it counts as unverified
+(#841; a registry slice must record the tier in the ledger before it can be
+honored).
+
+`tole plugin approve` also decides bundle membership by the ledger: when the
+lock's `bundle` record is not the one the last `approve` line recorded
+(dropped, added or re-pinned by hand), it refuses, and only
+`--manifest <file>` (reviewed like any bundle approval) goes on (#841).
 
 **The probe.** `mcp::probe_manifest` starts the server on its own, lists the
 tools, and kills the whole process group on every exit path (returned,

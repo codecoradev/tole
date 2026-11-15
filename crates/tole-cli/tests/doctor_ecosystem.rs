@@ -6,7 +6,6 @@
 
 mod common;
 use common::TestDir;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -16,8 +15,7 @@ fn tmpdir(tag: &str) -> TestDir {
 
 fn fake_bin(dir: &Path, name: &str, version_line: &str) {
     let p = dir.join(name);
-    std::fs::write(&p, format!("#!/bin/sh\necho '{version_line}'\n")).unwrap();
-    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    common::write_executable(&p, format!("#!/bin/sh\necho '{version_line}'\n"));
 }
 
 #[test]

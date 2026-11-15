@@ -318,10 +318,8 @@ fn find_program_skips_every_relative_path_entry() {
 
 #[cfg(unix)]
 fn script(dir: &Path, name: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let p = dir.join(name);
-    std::fs::write(&p, "#!/bin/sh\nexit 0\n").unwrap();
-    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    crate::test_dir::write_executable(&p, "#!/bin/sh\nexit 0\n");
     p
 }
 

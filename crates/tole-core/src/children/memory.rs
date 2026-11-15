@@ -374,19 +374,13 @@ mod tests {
         let dir = crate::test_dir::TestDir::new("tole-mem");
         let bin = dir.join("uteke");
         let log = dir.join("argv.log");
-        std::fs::write(
+        crate::test_dir::write_executable(
             &bin,
             format!(
                 "#!/bin/sh\necho \"$@\" > {}\necho '[{{\"score\":0.8,\"content\":\"remembered fact\",\"result_type\":\"memory\"}}]'\n",
                 log.display()
             ),
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        );
         let cfg = MemoryConfig {
             bin: bin.display().to_string(),
             room: "repo-tole".into(),
@@ -424,19 +418,16 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn empty_room_falls_back_to_the_legacy_namespace() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = crate::test_dir::TestDir::new("tole-mem-fb");
         let bin = dir.join("uteke");
         let log = dir.join("argv.log");
-        std::fs::write(
+        crate::test_dir::write_executable(
             &bin,
             format!(
                 "#!/bin/sh\necho \"$@\" >> {}\nif [ \"$1\" = room ]; then echo '[]'; else echo '[{{\"score\":0.4,\"content\":\"legacy fact\"}}]'; fi\n",
                 log.display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let cfg = MemoryConfig {
             bin: bin.display().to_string(),
             room: "repo-tole".into(),
@@ -471,19 +462,13 @@ mod tests {
         let dir = crate::test_dir::TestDir::new("tole-mem-w");
         let bin = dir.join("uteke");
         let log = dir.join("argv.log");
-        std::fs::write(
+        crate::test_dir::write_executable(
             &bin,
             format!(
                 "#!/bin/sh\necho \"$@\" > {}\necho \"id: mem-123\"\n",
                 log.display()
             ),
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        );
         let cfg = MemoryConfig {
             bin: bin.display().to_string(),
             room: "repo-tole".into(),
@@ -513,19 +498,13 @@ mod tests {
         let dir = crate::test_dir::TestDir::new("tole-mem-d");
         let bin = dir.join("uteke");
         let log = dir.join("argv.log");
-        std::fs::write(
+        crate::test_dir::write_executable(
             &bin,
             format!(
                 "#!/bin/sh\necho \"$@\" > {}\necho \"id: mem-456\"\n",
                 log.display()
             ),
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        );
         let cfg = MemoryConfig {
             bin: bin.display().to_string(),
             room: "repo-tole".into(),
@@ -551,16 +530,10 @@ mod tests {
         let dir = crate::test_dir::TestDir::new("tole-mem-nl");
         let bin = dir.join("uteke");
         let log = dir.join("argv.log");
-        std::fs::write(
+        crate::test_dir::write_executable(
             &bin,
             format!("#!/bin/sh\necho \"$@\" > {}\necho ok\n", log.display()),
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        );
         let cfg = MemoryConfig {
             bin: bin.display().to_string(),
             room: "repo-tole".into(),
@@ -589,16 +562,10 @@ mod tests {
         let dir = crate::test_dir::TestDir::new("tole-mem-595");
         let bin = dir.join("uteke");
         let log = dir.join("argv.log");
-        std::fs::write(
+        crate::test_dir::write_executable(
             &bin,
             format!("#!/bin/sh\necho \"$@\" > {}\necho ok\n", log.display()),
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        );
         let cfg = MemoryConfig {
             bin: bin.display().to_string(),
             room: "repo-tole".into(),
@@ -672,11 +639,9 @@ mod tests {
 
     #[cfg(unix)]
     fn fake_uteke(tag: &str, stdout: &str) -> (MemoryConfig, crate::test_dir::TestDir) {
-        use std::os::unix::fs::PermissionsExt;
         let dir = crate::test_dir::TestDir::new(&format!("tole-mem-{tag}"));
         let bin = dir.join("uteke");
-        std::fs::write(&bin, format!("#!/bin/sh\ncat <<'EOF'\n{stdout}\nEOF\n")).unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_dir::write_executable(&bin, format!("#!/bin/sh\ncat <<'EOF'\n{stdout}\nEOF\n"));
         let cfg = MemoryConfig {
             bin: bin.display().to_string(),
             room: "repo-x".into(),

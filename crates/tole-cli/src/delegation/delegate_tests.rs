@@ -46,7 +46,6 @@ fn tmp(tag: &str) -> Root {
 /// that wakes between two of them would otherwise take a prefix for the
 /// whole file (#828).
 fn fake_tole(dir: &Path, secs: u64) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let p = dir.join(format!("fake-tole-{secs}"));
     let body = format!(
         "#!/bin/sh\nprev=\"\"\nfor a in \"$@\"; do [ \"$prev\" = \"--sessions-dir\" ] && D=\"$a\"; \
@@ -55,8 +54,7 @@ fn fake_tole(dir: &Path, secs: u64) -> PathBuf {
          cut -d' ' -f19 /proc/$$/stat > \"$D/../nice.tmp\" 2>/dev/null && mv \"$D/../nice.tmp\" \"$D/../nice\"\n\
          env > \"$D/../env.tmp\" && mv \"$D/../env.tmp\" \"$D/../env\"\nsleep {secs}\n"
     );
-    std::fs::write(&p, body).unwrap();
-    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    crate::test_dir::write_executable(&p, body);
     p
 }
 
@@ -947,7 +945,6 @@ fn doctor_shows_the_headroom_and_a_spawn_stuck_in_the_queue() {
 /// (raw text written to `$TOLE_DELEGATION_REPORT`, as a hostile child
 /// could too) and exits.
 fn fake_reporter(dir: &Path, name: &str, report: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let body_file = dir.join(format!("{name}.json"));
     std::fs::write(&body_file, report).unwrap();
     let p = dir.join(name);
@@ -957,8 +954,7 @@ fn fake_reporter(dir: &Path, name: &str, report: &str) -> PathBuf {
          cp '{}' \"$TOLE_DELEGATION_REPORT\"\nenv > \"$D/../env\"\n",
         body_file.display()
     );
-    std::fs::write(&p, body).unwrap();
-    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    crate::test_dir::write_executable(&p, body);
     p
 }
 

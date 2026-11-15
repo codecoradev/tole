@@ -667,7 +667,6 @@ mod uteke_doc {
     #[cfg(all(test, unix))]
     mod tests {
         use super::*;
-        use std::os::unix::fs::PermissionsExt;
 
         /// A fake uteke: logs argv (one line per call) and stdin, answers
         /// `doc search` with `search` and `doc get <slug>` from `docs`.
@@ -691,8 +690,7 @@ mod uteke_doc {
                  esac\n"
             );
             let bin = dir.join("uteke");
-            std::fs::write(&bin, script).unwrap();
-            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            crate::test_dir::write_executable(&bin, script);
             (UtekeDocIndex::new(&bin), dir)
         }
 

@@ -1229,9 +1229,7 @@ mod tests {
         #[cfg(unix)]
         {
             let p = dir.join("fake-tole");
-            std::fs::write(&p, "#!/bin/sh\necho FAKE_AGENT_DONE\nexit 0\n").unwrap();
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755));
+            crate::test_dir::write_executable(&p, "#!/bin/sh\necho FAKE_AGENT_DONE\nexit 0\n");
             p
         }
         #[cfg(not(unix))]
@@ -1245,9 +1243,7 @@ mod tests {
         #[cfg(unix)]
         {
             let p = dir.join("sleep-tole");
-            std::fs::write(&p, format!("#!/bin/sh\nsleep {secs}\n")).unwrap();
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755));
+            crate::test_dir::write_executable(&p, format!("#!/bin/sh\nsleep {secs}\n"));
             p
         }
         #[cfg(not(unix))]
@@ -1469,9 +1465,7 @@ mod tests {
                 "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\nexit 0\n",
                 dump.display()
             );
-            std::fs::write(&p, script).unwrap();
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755));
+            crate::test_dir::write_executable(&p, script);
             let start = AgentStartTool::new(&p, d.to_path_buf());
             let out = start
                 .execute(json!({"prompt": "--yes sneaky mission"}))
@@ -1511,9 +1505,7 @@ mod tests {
                 "#!/bin/sh\nprintf '%s\\n%s\\n' \"$TOLE_AGENT_ID\" \"$TOLE_AGENT_TOUCH_LOG\" > \"{}\"\nexit 0\n",
                 dump.display()
             );
-            std::fs::write(&p, script).unwrap();
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755));
+            crate::test_dir::write_executable(&p, script);
             let out = AgentStartTool::new(&p, d.to_path_buf())
                 .execute(json!({"prompt": "x"}))
                 .unwrap();
@@ -1554,9 +1546,7 @@ mod tests {
             "#!/bin/sh\nprintf '%s\\n%s\\n%s\\n' \"$TOLE_FALLBACK_API_KEY\" \"$TOLE_TEST_595_MCP_TOKEN\" \"$TOLE_TEST_595_PLAIN\" > \"{}.tmp\" && mv \"{0}.tmp\" \"{0}\"\nexit 0\n",
             dump.display()
         );
-        std::fs::write(&p, script).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755));
+        crate::test_dir::write_executable(&p, script);
         AgentStartTool::new(&p, d.to_path_buf())
             .execute(json!({"prompt": "x"}))
             .unwrap();
@@ -1594,9 +1584,7 @@ mod tests {
             argv.display(),
             envf.display()
         );
-        std::fs::write(&p, script).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755));
+        crate::test_dir::write_executable(&p, script);
         let out = AgentStartTool::new(&p, d.to_path_buf())
             .with_parent_allows(allows)
             .execute(input)
@@ -1721,9 +1709,7 @@ mod tests {
         // The real launch shape: an interpreter running a script, with the
         // agent's own sessions dir on its command line.
         let script = d.join("fake-launcher");
-        std::fs::write(&script, "#!/bin/sh\nsleep 30\ntrue\n").unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_dir::write_executable(&script, "#!/bin/sh\nsleep 30\ntrue\n");
         let mut live = Command::new(&script)
             .args(["run", "--sessions-dir"])
             .arg(dir.join("sessions"))

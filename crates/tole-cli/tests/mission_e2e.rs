@@ -338,7 +338,6 @@ fn secret_holding_tole(dir: &std::path::Path, base: &str, args: &[&str]) -> Comm
 /// environ read by the gate].
 #[cfg(all(unix, feature = "shell-tools"))]
 fn children_see(tag: &str, user_config: &str) -> [String; 4] {
-    use std::os::unix::fs::PermissionsExt;
     let dir = temp_dir(tag);
     let home = dir.join("home");
     std::fs::create_dir_all(home.join("tole")).unwrap();
@@ -351,8 +350,7 @@ fn children_see(tag: &str, user_config: &str) -> [String; 4] {
         )
     };
     let gate = dir.join("gate.sh");
-    std::fs::write(&gate, format!("#!/bin/sh\n{}\n", probe("gate"))).unwrap();
-    std::fs::set_permissions(&gate, std::fs::Permissions::from_mode(0o755)).unwrap();
+    common::write_executable(&gate, format!("#!/bin/sh\n{}\n", probe("gate")));
     let sessions = dir.join("sessions");
     let (s, w, g) = (
         sessions.to_str().unwrap(),
@@ -616,7 +614,6 @@ fn mission_register_reports_cached_tokens_without_touching_budget_fields() {
 /// list the two review tools, so the auto-preset attaches them.
 #[cfg(all(unix, feature = "mcp"))]
 fn fake_cora_dir(dir: &std::path::Path) -> std::path::PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let bin = dir.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     let script = r#"#!/usr/bin/env python3
@@ -645,8 +642,7 @@ for line in sys.stdin:
         reply(i, error={"code": -32601, "message": "method not found"})
 "#;
     let path = bin.join("cora");
-    std::fs::write(&path, script).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    common::write_executable(&path, script);
     bin
 }
 

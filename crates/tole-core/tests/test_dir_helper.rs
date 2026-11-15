@@ -164,3 +164,98 @@ fn wait_until_looks_once_more_at_the_deadline() {
         calls >= 2
     });
 }
+
+/// Runs a script `rounds` times while three threads fork in a loop (a
+/// `pre_exec` hook forces the fork+exec path instead of `posix_spawn`), and
+/// returns how many runs failed with `ETXTBSY`. `write` is the way the
+/// script is written.
+#[cfg(target_os = "linux")]
+fn etxtbsy_failures(rounds: usize, write: impl Fn(&std::path::Path, &str)) -> usize {
+    use std::os::unix::process::CommandExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    /// Stops the forking threads when it drops, also on a panic of the
+    /// writer: `thread::scope` joins them before the panic propagates, so
+    /// they must not wait for a store that never comes.
+    struct StopOnDrop<'a>(&'a AtomicBool);
+    impl Drop for StopOnDrop<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+    let d = TestDir::new("tole-etxtbsy");
+    let stop = AtomicBool::new(false);
+    let mut busy = 0;
+    std::thread::scope(|s| {
+        for _ in 0..3 {
+            s.spawn(|| {
+                while !stop.load(Ordering::Relaxed) {
+                    let mut c = std::process::Command::new("/bin/true");
+                    // SAFETY: the hook does nothing; it only disables
+                    // posix_spawn so the child is a real fork.
+                    unsafe { c.pre_exec(|| Ok(())) };
+                    let _ = c.status();
+                }
+            });
+        }
+        let _stop = StopOnDrop(&stop);
+        for i in 0..rounds {
+            let p = d.join(format!("s{i}"));
+            write(&p, "#!/bin/sh\nexit 0\n");
+            match std::process::Command::new(&p).status() {
+                Ok(st) => assert!(st.success()),
+                Err(e) if e.raw_os_error() == Some(26) => busy += 1,
+                Err(e) => panic!("exec {}: {e}", p.display()),
+            }
+        }
+    });
+    busy
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_failing_stress_run_stops_the_forking_threads_instead_of_hanging() {
+    // The writer panics at once; the forking threads must still end, so the
+    // panic reaches the test instead of the binary hanging.
+    let r = std::panic::catch_unwind(|| {
+        etxtbsy_failures(3, |_, _| panic!("writer failed"));
+    });
+    assert!(r.is_err());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn write_executable_is_never_text_file_busy_under_concurrent_forks() {
+    // The stress of #840: with the helper, no run may see ETXTBSY.
+    let busy = etxtbsy_failures(400, |p, c| test_dir::write_executable(p, c));
+    assert_eq!(busy, 0, "write_executable left a writer behind");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_plain_write_can_be_text_file_busy_under_concurrent_forks() {
+    // The reproduction of #840: write + chmod by hand. The race is timing
+    // dependent, so this only reports how often it happens (it must not
+    // fail a run that was lucky); the test above holds the contract.
+    use std::os::unix::fs::PermissionsExt;
+    let busy = etxtbsy_failures(400, |p, c| {
+        std::fs::write(p, c).unwrap();
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    });
+    eprintln!("plain write: {busy} of 400 runs were ETXTBSY");
+}
+
+#[cfg(unix)]
+#[test]
+fn write_executable_writes_an_executable_file_and_replaces_an_old_one() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = TestDir::new("tole-writeexec");
+    let p = d.join("run");
+    test_dir::write_executable(&p, "#!/bin/sh\necho one\n");
+    test_dir::write_executable(&p, "#!/bin/sh\necho two\n");
+    assert_eq!(
+        std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+    let out = std::process::Command::new(&p).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "two\n");
+}

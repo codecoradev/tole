@@ -442,18 +442,15 @@ mod tests {
     /// A fake `uteke` that prints `body` and logs its argv.
     #[cfg(unix)]
     fn fake_uteke(tag: &str, body: &str) -> (MemoryConfig, crate::test_dir::TestDir) {
-        use std::os::unix::fs::PermissionsExt;
         let dir = crate::test_dir::TestDir::new(&format!("tole-turn-mem-{tag}"));
         let bin = dir.join("uteke");
-        std::fs::write(
+        crate::test_dir::write_executable(
             &bin,
             format!(
                 "#!/bin/sh\necho \"$@\" >> {}/argv.log\n{body}\n",
                 dir.display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let cfg = MemoryConfig {
             bin: bin.display().to_string(),
             room: "repo-x".into(),
