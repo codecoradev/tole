@@ -293,14 +293,19 @@ pub fn protect_plan(ws: &Path) -> Result<Vec<PathBuf>, String> {
         let meta =
             symlink_metadata(git).map_err(|e| format!("cannot inspect {} ({e})", git.display()))?;
         if meta.is_dir() {
-            // Inside the read-only mount, but a link here would still lead a
-            // git on the host to a writable place.
-            for leaf in ["hooks", "config"] {
-                exists(&git.join(leaf))?;
+            check_gitdir_content(git)?;
+        } else if meta.is_file() {
+            if multi_linked(&meta) {
+                return Err(format!(
+                    "{} has several hard links; a write through another name would change it",
+                    git.display()
+                ));
             }
-        } else if let Some(target) = gitdir_target(ws, git)? {
-            if !out.iter().any(|p| target.starts_with(p)) {
-                out.push(target);
+            if let Some(target) = gitdir_target(ws, git)? {
+                check_gitdir_content(&target)?;
+                if !out.iter().any(|p| target.starts_with(p)) {
+                    out.push(target);
+                }
             }
         }
         if !out.iter().any(|p| git.starts_with(p)) {
@@ -348,6 +353,79 @@ pub fn protect_plan(ws: &Path) -> Result<Vec<PathBuf>, String> {
     // path; keep only what is inside it.
     protect.retain(|p| p.starts_with(ws));
     Ok(protect)
+}
+
+/// Most entries of a `hooks` directory looked at.
+const MAX_HOOKS: usize = 256;
+
+/// Whether `m` is a regular file with more than one name (a hard link).
+#[cfg(unix)]
+fn multi_linked(m: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    m.is_file() && m.nlink() > 1
+}
+
+#[cfg(not(unix))]
+fn multi_linked(_m: &std::fs::Metadata) -> bool {
+    false
+}
+
+/// What the host's git runs inside a gitdir DIRECTORY, checked before it is
+/// bound read-only. A read-only mount stops writes by path, not by inode, so
+/// the places that lead git to code must not have another way in: `hooks` and
+/// `config` are not links; `config` and the files of `hooks` have no second
+/// hard link (a name made earlier, while the path was unprotected, would stay
+/// writable); no entry of `hooks` is a link (it would lead to a writable place
+/// in the workspace). Bounded; anything else fails the launch.
+fn check_gitdir_content(dir: &Path) -> Result<(), String> {
+    use std::fs::symlink_metadata;
+    let link = |p: &Path| {
+        format!(
+            "{} is a symbolic link, which a mount cannot protect (the command could replace \
+             it or write through it); make it a real path",
+            p.display()
+        )
+    };
+    let twin = |p: &Path| {
+        format!(
+            "{} has several hard links; a write through another name would change it",
+            p.display()
+        )
+    };
+    for leaf in ["hooks", "config"] {
+        let p = dir.join(leaf);
+        match symlink_metadata(&p) {
+            Ok(m) if m.file_type().is_symlink() => return Err(link(&p)),
+            Ok(m) if multi_linked(&m) => return Err(twin(&p)),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("cannot inspect {} ({e})", p.display())),
+        }
+    }
+    let hooks = dir.join("hooks");
+    if hooks.is_dir() {
+        let entries = std::fs::read_dir(&hooks)
+            .map_err(|e| format!("cannot read {} ({e})", hooks.display()))?;
+        for (i, e) in entries.enumerate() {
+            let e = e.map_err(|e| format!("cannot read {} ({e})", hooks.display()))?;
+            if i >= MAX_HOOKS {
+                return Err(format!(
+                    "{} has more than {MAX_HOOKS} entries",
+                    hooks.display()
+                ));
+            }
+            let m = e
+                .metadata()
+                .map_err(|e| format!("cannot inspect {} ({e})", hooks.display()))?;
+            if m.file_type().is_symlink() {
+                return Err(link(&e.path()));
+            }
+            if multi_linked(&m) {
+                return Err(twin(&e.path()));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The directory a gitdir FILE points to, when it is inside the workspace and
@@ -398,7 +476,22 @@ fn gitdir_target(ws: &Path, file: &Path) -> Result<Option<PathBuf>, String> {
 fn read_bounded(file: &Path, max: u64) -> Result<String, String> {
     use std::io::Read;
     let shown = file.display();
-    let f = std::fs::File::open(file).map_err(|e| format!("cannot read {shown} ({e})"))?;
+    // A FIFO or a device is not read (opening a FIFO blocks until a writer
+    // shows up): only a regular file, and opened without blocking.
+    let meta = std::fs::symlink_metadata(file).map_err(|e| format!("cannot read {shown} ({e})"))?;
+    if !meta.is_file() {
+        return Err(format!("{shown} is not a regular file"));
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NONBLOCK);
+    }
+    let f = opts
+        .open(file)
+        .map_err(|e| format!("cannot read {shown} ({e})"))?;
     let mut text = String::new();
     // One byte more than `max` tells a file that fits from one that does not,
     // whatever its size was when it was inspected.

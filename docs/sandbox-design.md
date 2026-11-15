@@ -540,9 +540,9 @@ file_size_mb = 4096            # 1 to 1048576, largest file a process writes
   `rm -rf .git` still destroyed HEAD, objects and refs, and a leaf that did not
   exist (a repository made with `git init --template=`) could be created. A
   read-only `.git` is one mount point: it cannot be renamed, removed, replaced
-  or written, nothing can be created in it, a hard link to its files fails
-  (`EXDEV`, the kernel refuses links across mounts), and its tree is byte for
-  byte unchanged from inside. The same holds for `.tole`.
+  or written, nothing can be created in it, a hard link to its files made
+  from inside fails (`EXDEV`, the kernel refuses links across mounts), and its
+  tree is byte for byte unchanged from inside. The same holds for `.tole`.
 
   **Cost.** Inside a sandboxed `run_command` or `job_start` (the other
   consumers get the same profile as they land), git commands that write fail: `add`, `commit`, `checkout`, `branch`, `stash`,
@@ -569,8 +569,17 @@ file_size_mb = 4096            # 1 to 1048576, largest file a process writes
   `.gitmodules` or gitdir file larger than 64 KiB or 4 KiB (never read in part), or more than 64 entries refuses the launch (for
   `optional`, the fallback policy applies) with the cause in the reason:
   a mount cannot protect a link (the command removes it and makes a real
-  directory, or the link leads to a writable place). Links elsewhere inside
-  `.git` are not inspected.
+  directory, or the link leads to a writable place). A read-only mount stops
+  writes by path, not by inode, so what the host's git runs inside a gitdir
+  directory (the top-level `.git`, a nested one, the target of a gitdir file) is
+  also checked: `hooks` and `config` are not links, `config` and the files of
+  `hooks` have no second hard link (a name made earlier would stay writable),
+  no entry of `hooks` (at most 256) is a link, and a gitdir file itself has one
+  name. A FIFO or device named `.git`, `.gitmodules` or a submodule's `.git` is
+  never opened (it would block the launch): `.gitmodules` that is not a regular
+  file refuses the launch, a `.git` that is neither directory nor file is bound
+  without being read. Links and hard links elsewhere inside `.git` (not `hooks`
+  or `config`) are not inspected.
 
   **Plan and launch.** The protected paths are planned, the argument list is
   built, and the plan is made again right before the command line is handed
@@ -641,6 +650,10 @@ file_size_mb = 4096            # 1 to 1048576, largest file a process writes
     protected by a mount: `.envrc`, Makefile, package scripts, `build.rs`, CI
     configs, `.husky`, `.pre-commit-config.yaml`, lefthook,
     `.vscode/tasks.json`, `.gitattributes` and the like.
+  - Hard links and links made before the paths were protected: only `config`,
+    the files of `hooks` and the gitdir files are checked, so another name for
+    some other file inside `.git` (`commondir`, `info/*`, `config.worktree`)
+    that was made while `.git` was unprotected is not detected.
   - A diff does not show `.git` internals or a nested repository's config. Treat
     a workspace a sandboxed command wrote into as untrusted until the owner has
     inspected what git will run (`git config --list --show-origin` in the outer

@@ -1003,3 +1003,82 @@ fn an_oversized_gitmodules_or_gitdir_file_is_refused_not_read_in_part() {
     .unwrap();
     assert!(protect_plan(&ws2).unwrap_err().contains("larger than"));
 }
+
+/// A mount stops writes by path, not by inode, and a gitdir the host's git
+/// follows must not have another way in: a link inside the target's `hooks`,
+/// a second hard link to its config or a hook, a hard-linked gitdir file.
+#[cfg(unix)]
+#[test]
+fn another_name_or_link_into_what_git_runs_is_refused() {
+    use std::os::unix::fs::symlink;
+    let fresh = |tag: &str| keep(tag);
+    // hooks entry that is a link, in a `.git` directory.
+    let (_g, ws) = fresh("alias-hooklink");
+    std::fs::create_dir_all(ws.join(".git/hooks")).unwrap();
+    std::fs::write(ws.join("x.sh"), "#!/bin/sh\n").unwrap();
+    symlink(ws.join("x.sh"), ws.join(".git/hooks/pre-commit")).unwrap();
+    assert!(protect_plan(&ws).unwrap_err().contains("symbolic link"));
+    // The same in the target of a gitdir FILE (separate git dir).
+    let (_g, ws) = fresh("alias-targetlink");
+    std::fs::create_dir_all(ws.join(".gd/hooks")).unwrap();
+    std::fs::write(ws.join("x.sh"), "#!/bin/sh\n").unwrap();
+    symlink(ws.join("x.sh"), ws.join(".gd/hooks/pre-commit")).unwrap();
+    std::fs::write(ws.join(".git"), "gitdir: .gd\n").unwrap();
+    assert!(protect_plan(&ws).unwrap_err().contains("symbolic link"));
+    // `hooks` itself a link inside the target.
+    let (_g, ws) = fresh("alias-targethooks");
+    std::fs::create_dir_all(ws.join(".gd")).unwrap();
+    std::fs::create_dir_all(ws.join("realhooks")).unwrap();
+    symlink(ws.join("realhooks"), ws.join(".gd/hooks")).unwrap();
+    std::fs::write(ws.join(".git"), "gitdir: .gd\n").unwrap();
+    assert!(protect_plan(&ws).unwrap_err().contains("symbolic link"));
+    // A second hard link to the config, to a hook, to a gitdir file.
+    let (_g, ws) = fresh("alias-hard-config");
+    std::fs::create_dir_all(ws.join(".git/hooks")).unwrap();
+    std::fs::write(ws.join(".git/config"), "[core]\n").unwrap();
+    std::fs::hard_link(ws.join(".git/config"), ws.join("config-twin")).unwrap();
+    assert!(protect_plan(&ws).unwrap_err().contains("hard links"));
+    std::fs::remove_file(ws.join("config-twin")).unwrap();
+    assert!(protect_plan(&ws).is_ok());
+    std::fs::write(ws.join(".git/hooks/pre-commit"), "x").unwrap();
+    std::fs::hard_link(ws.join(".git/hooks/pre-commit"), ws.join("hook-twin")).unwrap();
+    assert!(protect_plan(&ws).unwrap_err().contains("hard links"));
+    let (_g, ws) = fresh("alias-hard-gitfile");
+    std::fs::write(ws.join(".git"), "gitdir: /elsewhere\n").unwrap();
+    std::fs::hard_link(ws.join(".git"), ws.join("git-twin")).unwrap();
+    assert!(protect_plan(&ws).unwrap_err().contains("hard links"));
+}
+
+/// A FIFO named `.git`, `.gitmodules` or a submodule's `.git` must not hang the
+/// plan (opening a FIFO for reading blocks until a writer shows up).
+#[cfg(unix)]
+#[test]
+fn a_fifo_in_the_protected_names_does_not_hang_the_plan() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let mkfifo = |p: &Path| {
+        let c = CString::new(p.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    };
+    let bounded = |ws: PathBuf| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(protect_plan(&ws));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("protect_plan hung on a FIFO")
+    };
+    let (_g, ws) = keep("fifo-modules");
+    mkfifo(&ws.join(".gitmodules"));
+    assert!(bounded(ws).unwrap_err().contains("not a regular file"));
+    let (_g, ws) = keep("fifo-git");
+    mkfifo(&ws.join(".git"));
+    let plan = bounded(ws.clone()).unwrap();
+    assert_eq!(plan, [ws.join(".git")], "bound, never read");
+    let (_g, ws) = keep("fifo-sub");
+    std::fs::create_dir_all(ws.join("sub")).unwrap();
+    mkfifo(&ws.join("sub/.git"));
+    std::fs::write(ws.join(".gitmodules"), "[submodule \"s\"]\n\tpath = sub\n").unwrap();
+    assert!(bounded(ws.clone()).unwrap().contains(&ws.join("sub/.git")));
+}
