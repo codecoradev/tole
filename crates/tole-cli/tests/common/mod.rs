@@ -12,7 +12,7 @@
 
 mod test_dir;
 #[allow(unused_imports)]
-pub use test_dir::{ChildGuard, TestDir};
+pub use test_dir::{ChildGuard, TestDir, WorkDir};
 
 use std::io::{BufRead, BufReader};
 use std::net::TcpListener;

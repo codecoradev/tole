@@ -2,7 +2,7 @@
 
 #[path = "common/test_dir.rs"]
 mod test_dir;
-use test_dir::{ChildGuard, TestDir};
+use test_dir::{ChildGuard, TestDir, WorkDir};
 
 #[test]
 fn removes_the_directory_on_drop() {
@@ -78,4 +78,15 @@ fn child_guard_kills_and_reaps_the_child() {
         .unwrap()
         .success();
     assert!(!alive);
+}
+
+#[test]
+fn work_dir_keeps_its_home_twin_inside_the_guard() {
+    let w = WorkDir::new("tole-testdir-work");
+    let home = w.with_extension("home");
+    std::fs::create_dir_all(home.join("tole")).unwrap();
+    assert!(w.is_dir() && home.is_dir());
+    let (wp, hp) = (w.path().to_path_buf(), home);
+    drop(w);
+    assert!(!wp.exists() && !hp.exists());
 }

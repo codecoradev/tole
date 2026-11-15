@@ -1468,3 +1468,137 @@ fn config_check_shows_keys_ignores_a_project_table_and_flags_a_bad_one() {
         "{out}"
     );
 }
+
+// ------------------------------------------- discussion timeout (#786)
+
+fn timeout_of(c: &Config, env: &[(&str, &str)]) -> Settings {
+    Settings::resolve(&Flags::default(), c, &env_of(env))
+}
+
+#[test]
+fn discussion_timeout_env_beats_user_config_beats_default() {
+    let user = cfg("[discussions]\nrequest_timeout_secs = 300\n");
+    let c = crate::config::layered(&Config::default(), &user);
+    let st = timeout_of(&c, &[("TOLE_DISCUSSION_TIMEOUT_SECS", " 600 ")]);
+    assert_eq!(st.request_timeout.value, 600);
+    assert_eq!(st.request_timeout.source, Source::Env);
+    assert_eq!(
+        st.request_timeout.describe(),
+        "(env TOLE_DISCUSSION_TIMEOUT_SECS)"
+    );
+    let st = timeout_of(&c, &[]);
+    assert_eq!(st.request_timeout.value, 300);
+    assert_eq!(st.request_timeout.source, Source::UserConfig);
+    let st = timeout_of(&Config::default(), &[]);
+    assert_eq!(st.request_timeout.value, 120, "the unchanged default");
+    assert_eq!(st.request_timeout.source, Source::Default);
+    assert_eq!(st.discussion_timeout_error(), None);
+    // A blank env counts as unset.
+    let st = timeout_of(&c, &[("TOLE_DISCUSSION_TIMEOUT_SECS", "  ")]);
+    assert_eq!(st.request_timeout.value, 300);
+    assert_eq!(st.discussion_timeout_error(), None);
+}
+
+#[test]
+fn an_invalid_discussion_timeout_env_is_an_error_naming_the_variable() {
+    for bad in ["abc", "0", "-5", "1.5", "3601", "99999999999999999999"] {
+        let st = timeout_of(&Config::default(), &[("TOLE_DISCUSSION_TIMEOUT_SECS", bad)]);
+        let msg = st
+            .discussion_timeout_error()
+            .unwrap_or_else(|| panic!("{bad:?} must be an error"));
+        assert!(
+            msg.contains("TOLE_DISCUSSION_TIMEOUT_SECS")
+                && msg.contains(bad)
+                && msg.contains("1 to 3600"),
+            "{msg}"
+        );
+    }
+    // The bounds themselves are valid.
+    for good in ["1", "3600"] {
+        let st = timeout_of(
+            &Config::default(),
+            &[("TOLE_DISCUSSION_TIMEOUT_SECS", good)],
+        );
+        assert_eq!(st.discussion_timeout_error(), None, "{good}");
+        assert_eq!(st.request_timeout.value, good.parse::<u64>().unwrap());
+    }
+}
+
+#[test]
+fn the_discussion_timeout_config_is_bounded() {
+    for bad in [0u64, 3601] {
+        let e = crate::config::parse(
+            &format!("[discussions]\nrequest_timeout_secs = {bad}\n"),
+            Path::new("c.toml"),
+        )
+        .unwrap_err();
+        assert!(
+            e.message.contains("discussions.request_timeout_secs")
+                && e.message.contains("1 to 3600"),
+            "{e}"
+        );
+    }
+    for good in [1u64, 3600] {
+        assert!(crate::config::parse(
+            &format!("[discussions]\nrequest_timeout_secs = {good}\n"),
+            Path::new("c.toml")
+        )
+        .is_ok());
+    }
+    assert!(crate::config::parse("[discussions]\ntimeout = 30\n", Path::new("c.toml")).is_err());
+}
+
+#[test]
+fn a_project_config_cannot_set_the_discussion_timeout() {
+    let project = cfg("[discussions]\nrequest_timeout_secs = 3600\n");
+    let merged = crate::config::layered(&project, &Config::default());
+    assert_eq!(merged.discussions, None);
+    let st = timeout_of(&merged, &[]);
+    assert_eq!(
+        (st.request_timeout.value, st.request_timeout.source),
+        (120, Source::Default)
+    );
+    // With a user value, the user's wins over a project's larger one.
+    let user = cfg("[discussions]\nrequest_timeout_secs = 200\n");
+    let st = timeout_of(&crate::config::layered(&project, &user), &[]);
+    assert_eq!(
+        (st.request_timeout.value, st.request_timeout.source),
+        (200, Source::UserConfig)
+    );
+}
+
+#[test]
+fn config_check_reports_the_discussion_timeout_and_ignores_a_project_one() {
+    let user = tmpdir();
+    let up = user.join("config.toml");
+    std::fs::write(&up, "[discussions]\nrequest_timeout_secs = 600\n").unwrap();
+    let dir = tmpdir();
+    let p = dir.join(CONFIG_REL_PATH);
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(&p, "[discussions]\nrequest_timeout_secs = 3000\n").unwrap();
+    let out = check(&dir, None, Some(&up), &Flags::default(), &env_of(&[])).unwrap();
+    assert!(
+        out.contains(
+            "discussions.request_timeout_secs = 600  [user config]  effective: 600  (user config)"
+        ),
+        "{out}"
+    );
+    assert!(
+        out.contains(
+            "discussions.request_timeout_secs = 3000  [config]  IGNORED: a project config cannot set"
+        ),
+        "{out}"
+    );
+    let env = env_of(&[("TOLE_DISCUSSION_TIMEOUT_SECS", "900")]);
+    let out = check(&dir, None, Some(&up), &Flags::default(), &env).unwrap();
+    assert!(
+        out.contains("effective: 900  (env TOLE_DISCUSSION_TIMEOUT_SECS)"),
+        "{out}"
+    );
+    let env = env_of(&[("TOLE_DISCUSSION_TIMEOUT_SECS", "soon")]);
+    let out = check(&dir, None, Some(&up), &Flags::default(), &env).unwrap();
+    assert!(
+        out.contains("INVALID: TOLE_DISCUSSION_TIMEOUT_SECS must be"),
+        "{out}"
+    );
+}
