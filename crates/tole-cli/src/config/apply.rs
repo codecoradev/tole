@@ -161,6 +161,29 @@ pub const CONTEXT_WINDOW_ENV: &str = "TOLE_CONTEXT_WINDOW";
 /// Reasoning effort sent as `reasoning_effort` (#457).
 pub const REASONING_EFFORT_ENV: &str = "TOLE_REASONING_EFFORT";
 
+/// Request timeout of one discussion provider call, in seconds (#786).
+pub const DISCUSSION_TIMEOUT_ENV: &str = "TOLE_DISCUSSION_TIMEOUT_SECS";
+
+/// Default discussion request timeout: the provider's own default, unchanged.
+pub const DEFAULT_DISCUSSION_TIMEOUT_SECS: u64 = 120;
+/// Lower bound of the discussion request timeout (#786), in seconds.
+pub const MIN_DISCUSSION_TIMEOUT_SECS: u64 = 1;
+/// Upper bound of the discussion request timeout (#786), in seconds.
+pub const MAX_DISCUSSION_TIMEOUT_SECS: u64 = 3600;
+
+/// Whether `n` is an allowed discussion request timeout.
+pub fn discussion_timeout_in_range(n: u64) -> bool {
+    (MIN_DISCUSSION_TIMEOUT_SECS..=MAX_DISCUSSION_TIMEOUT_SECS).contains(&n)
+}
+
+/// The shared wording of the bounds, for the config and env errors.
+pub fn discussion_timeout_bounds() -> String {
+    format!(
+        "a whole number of seconds from {MIN_DISCUSSION_TIMEOUT_SECS} to \
+         {MAX_DISCUSSION_TIMEOUT_SECS}"
+    )
+}
+
 /// Review gate policy (#534). Same name as `review_gate::ENV`, which only
 /// exists with `shell-tools`; a test below keeps the two equal.
 pub const REVIEW_GATE_ENV: &str = "TOLE_REVIEW_GATE";
@@ -374,6 +397,33 @@ pub fn default_effort() -> Option<String> {
     EFFORT.get().cloned().flatten()
 }
 
+static DISCUSSION_TIMEOUT: OnceLock<(u64, String)> = OnceLock::new();
+
+/// Install the resolved discussion request timeout and where it came from
+/// (first call wins), set once at startup so the discussion factories and
+/// `tole doctor` need no new parameter.
+pub fn install_discussion_timeout(e: &Eff<u64>) {
+    let _ = DISCUSSION_TIMEOUT.set((e.value, e.describe()));
+}
+
+/// The discussion request timeout: the installed value, else the default.
+pub fn discussion_timeout() -> std::time::Duration {
+    std::time::Duration::from_secs(
+        DISCUSSION_TIMEOUT
+            .get()
+            .map_or(DEFAULT_DISCUSSION_TIMEOUT_SECS, |(n, _)| *n),
+    )
+}
+
+/// The `tole doctor` line for the discussion request timeout (#786).
+pub fn discussion_timeout_line() -> String {
+    let (n, src) = DISCUSSION_TIMEOUT
+        .get()
+        .cloned()
+        .unwrap_or((DEFAULT_DISCUSSION_TIMEOUT_SECS, "(default)".to_string()));
+    format!("discussions: request timeout {n}s {src}")
+}
+
 /// The config's `model`, for hosts that need the model name without a
 /// full provider (the ACP advertised "current model").
 pub fn config_model() -> Option<String> {
@@ -467,6 +517,14 @@ pub struct Settings {
     /// `--compact-at` > config > [`tole_core::compaction::Policy::DEFAULT_AT`].
     pub compact_at: Eff<f64>,
     pub no_compaction: Eff<bool>,
+    /// `TOLE_DISCUSSION_TIMEOUT_SECS` > user config
+    /// `[discussions] request_timeout_secs` > 120 (#786). The project layer
+    /// is not a source. An invalid env value is skipped here and reported by
+    /// [`Settings::discussion_timeout_error`].
+    pub request_timeout: Eff<u64>,
+    /// The env value of `request_timeout` when it is not a valid number in
+    /// range, as typed.
+    pub request_timeout_env_invalid: Option<String>,
     /// `--effort` > `TOLE_REASONING_EFFORT` > config `reasoning_effort`
     /// (#457), canonical lowercase; `None` = not sent. An invalid ENV value
     /// is kept as typed so [`Settings::effort_error`] can name it.
@@ -496,6 +554,16 @@ impl Settings {
         let e = self.reasoning_effort.as_ref()?;
         let err = tole_core::openai::parse_reasoning_effort(&e.value).err()?;
         Some(format!("{} {err}", e.env.unwrap_or(REASONING_EFFORT_ENV)))
+    }
+
+    /// The startup error for an invalid `TOLE_DISCUSSION_TIMEOUT_SECS`
+    /// (non-numeric, 0 or out of range): never silently ignored (#786).
+    pub fn discussion_timeout_error(&self) -> Option<String> {
+        let v = self.request_timeout_env_invalid.as_ref()?;
+        Some(format!(
+            "{DISCUSSION_TIMEOUT_ENV} must be {}, got {v:?}",
+            discussion_timeout_bounds()
+        ))
     }
 
     /// THE resolution: startup and `config check` both call this. `cfg` is
@@ -578,6 +646,16 @@ impl Settings {
         let env_trust = env("TOLE_TRUST")
             .map(|v| split_env_list(&v))
             .unwrap_or_default();
+        // `TOLE_DISCUSSION_TIMEOUT_SECS` (#786): a valid value, or the typed
+        // text of an invalid one (blank counts as unset), for the startup error.
+        let env_timeout: (Option<u64>, Option<String>) = match nonblank(env(DISCUSSION_TIMEOUT_ENV))
+        {
+            None => (None, None),
+            Some(v) => match v.trim().parse::<u64>() {
+                Ok(n) if discussion_timeout_in_range(n) => (Some(n), None),
+                _ => (None, Some(v)),
+            },
+        };
         // `TOLE_SKILL` (#434): skill files separated like `PATH` entries.
         let env_skill: Vec<PathBuf> = env(SKILL_ENV)
             .map(|v| {
@@ -671,6 +749,18 @@ impl Settings {
                 Eff::new(v, s)
             },
             no_compaction: boolean(flags.no_compaction, cfg.no_compaction),
+            request_timeout: {
+                let (v, s) = resolve_or(
+                    None,
+                    env_timeout.0,
+                    cfg.discussions
+                        .as_ref()
+                        .and_then(|d| d.request_timeout_secs),
+                    DEFAULT_DISCUSSION_TIMEOUT_SECS,
+                );
+                Eff::from_pair((v, s), DISCUSSION_TIMEOUT_ENV)
+            },
+            request_timeout_env_invalid: env_timeout.1,
             reasoning_effort: resolve_string(
                 flags.reasoning_effort.clone(),
                 env(REASONING_EFFORT_ENV),
@@ -754,6 +844,11 @@ impl Settings {
         opt(&mut self.context_window, "context_window", user);
         one(&mut self.compact_at, "compact_at", user);
         one(&mut self.no_compaction, "no_compaction", user);
+        one(
+            &mut self.request_timeout,
+            "discussions.request_timeout_secs",
+            user,
+        );
         opt(&mut self.reasoning_effort, "reasoning_effort", user);
         opt(&mut self.review_gate, "review_gate", user);
         one(&mut self.tui_theme, "tui.theme", user);
@@ -967,6 +1062,17 @@ pub fn annotations(s: &Settings) -> BTreeMap<&'static str, String> {
         match (&s.reasoning_effort, s.effort_error()) {
             (_, Some(err)) => format!("  INVALID: {err}"),
             (e, None) => eff(e, &show_str),
+        },
+    );
+    m.insert(
+        "discussions.request_timeout_secs",
+        match s.discussion_timeout_error() {
+            Some(err) => format!("  INVALID: {err}"),
+            None => format!(
+                "  effective: {}  {}",
+                s.request_timeout.value,
+                s.request_timeout.describe()
+            ),
         },
     );
     m.insert("review_gate", eff(&s.review_gate, &show_str));
