@@ -44,7 +44,7 @@ the owner's user.
 | S1 | Read tole's environment or memory (`/proc/<ppid>/environ`, `mem`, ptrace) | closed on Linux by non-dumpable (#675) | also closed by a separate mechanism: tole is not in the sandbox's process namespace |
 | S2 | Read secrets kept in files: `~/.netrc`, `~/.ssh`, `~/.aws`, `~/.config/gh`, `.env` files outside the workspace | open | `$HOME` is not mounted |
 | S3 | Write owner-only records: cron ledger, plugin lock, skill approvals, trust store, user config (`~/.codecora`), or run `tole cron create` / `tole plugin approve` (#684) | open | the data dir does not exist inside; the tole CLI there finds no lock, no ledger and nothing to approve |
-| S4 | Plant code that later runs **outside** the sandbox: `.git/hooks`, `.git/config` (`core.hooksPath`, `core.fsmonitor`), `.tole/` config, shell rc files | open | those paths are read-only inside, `$HOME` is absent |
+| S4 | Plant code that later runs **outside** the sandbox: `.git/hooks`, `.git/config` (`core.hooksPath`, `core.fsmonitor`), `.tole/` config, shell rc files | open | `.git`, `.tole/` and the gitdirs listed in §9.3 are read-only inside, `$HOME` is absent; `.git/config` is read-only, but a `core.hooksPath`, `include.path` or `core.fsmonitor` in it that names scripts inside the workspace (husky style) stays writable: see the residuals of §9.3 |
 | S5 | Send data anywhere (exfiltration, a callback to a control server) | open | no network by default; an allowlist of named hosts through a filtering proxy (§8) |
 | S6 | See or signal other processes (other agents, other servers, the owner's shell) | open | private PID namespace, new session (no `TIOCSTI` on the terminal) |
 | S7 | Escape the view by creating a user or mount namespace inside | n/a | refused (`--disable-userns`, probed in §3) |
@@ -152,7 +152,7 @@ For each sandboxed process tole runs `bwrap <args> -- <program> <args>`:
 | `/etc`: `ld.so.cache`, `passwd`, `group`, `nsswitch.conf`, `localtime`, `ssl/`, `ca-certificates/`, `alternatives/` | host | read-only |
 | `/etc/resolv.conf`, `/etc/hosts` | host | read-only, only when the profile has network |
 | the program's install prefix (e.g. `/opt/node22`, a venv) | host | read-only |
-| workspace | host | read-only, or read-write per profile; `.git/hooks`, `.git/config` and `.tole/` always re-bound read-only on top |
+| workspace | host | read-only, or read-write per profile; the whole `.git` and `.tole/` always re-bound read-only on top (§9.3, #849) |
 | scratch (`$TMPDIR`, `$HOME`) | a fresh `0700` dir under the system temp, owned by tole | read-write |
 | extra `read` / `write` paths of the profile | host | as named |
 | `/proc` | new, for the sandbox's PID namespace | — |
@@ -408,7 +408,7 @@ servers; `[sandbox.consumers]` is not touched by either.
 | Profile | Workspace | Network | For |
 |---|---|---|---|
 | `server` | read | none | third-party stdio MCP servers |
-| `command` | write (with `.git/hooks`, `.git/config`, `.tole/` read-only) | none | `run_command`, `job_start`, cron scripts, `verify`, `turnend` |
+| `command` | write (with `.git` and `.tole/` read-only) | none | `run_command`, `job_start`, cron scripts, `verify`, `turnend` |
 | `strict` | none | none | servers that need nothing from the machine |
 
 All three: scratch dir writable, data dir and `$HOME` absent, private
@@ -513,8 +513,8 @@ file_size_mb = 4096            # 1 to 1048576, largest file a process writes
 ```
 
 - **Profile.** The built-in `command` profile (`tole_core::sandbox::command`):
-  the workspace writable, `.git/hooks`, `.git/config` and `.tole` read-only on
-  top of it, the data dir and `$HOME` absent, a private `/proc`, writable
+  the workspace writable, `.git` (the whole directory) and `.tole` read-only on
+  top of it (next item), the data dir and `$HOME` absent, a private `/proc`, writable
   `/tmp` and scratch (tmpfs, gone with the sandbox), no network unless
   `network = "host"`, and the fixed flags of §5 (`--unshare-all
   --unshare-user --disable-userns --cap-drop ALL --new-session`,
@@ -525,9 +525,109 @@ file_size_mb = 4096            # 1 to 1048576, largest file a process writes
   (`run_command`: its working directory; `job_start`: the workspace root), never
   kept in process state. It is resolved and refused like every grant (`$HOME`,
   an ancestor of it, the data dir, `/`), and then the resolved path is the bind.
-  The protected sub-paths are resolved at launch too: a link is followed, its
-  target is what is bound read-only, and one that leads out of the workspace is
-  not in the view at all.
+  The protected paths are inspected at launch too (see the next item).
+- **Protected paths (#849).** The paths that run code later on the owner's
+  host are bound read-only: the WHOLE `.git` directory, and `.tole`. Locking a
+  few leaves of a writable `.git` does not work, and both attempts were
+  reproduced and rejected: (1) with only `.git/hooks` and `.git/config` read-only,
+  `mv .git .g && cp -a .g .git` gave the command a plain writable copy (a mount
+  point cannot be renamed, but its ancestor can); (2) with `.git` made a
+  writable mount point, git still honours `commondir` (and `gitdir`,
+  `config.worktree`, `info/`, `modules/*/{hooks,config}`, `worktrees/*`,
+  `objects/info/alternates`) INSIDE the gitdir, so
+  `echo ../evil > .git/commondir` pointed a later `git commit` or `git status`
+  on the host at a planted gitdir whose `hooks` and `core.fsmonitor` it ran, and
+  `rm -rf .git` still destroyed HEAD, objects and refs, and a leaf that did not
+  exist (a repository made with `git init --template=`) could be created. A
+  read-only `.git` is one mount point: it cannot be renamed, removed, replaced
+  or written, nothing can be created in it, a hard link to its files made
+  from inside fails (`EXDEV`, the kernel refuses links across mounts), and its
+  tree is byte for byte unchanged from inside. The same holds for `.tole`.
+
+  **Cost.** Inside a sandboxed `run_command` or `job_start` (the other
+  consumers get the same profile as they land), git commands that write fail: `add`, `commit`, `checkout`, `branch`, `stash`,
+  `rebase`, `gc`, `config`, `remote add` (the error is git's own, "Read-only file
+  system", `git stash` exits 1 with no message). Reads work: `log`, `diff`,
+  `show`, `status` (without refreshing the index, no hang), `rev-parse`,
+  `branch --list`, `ls-files`. A model cannot commit from inside a sandboxed
+  command; it does so through a tool outside the sandbox, or the owner does.
+  There is no setting to make `.git` writable.
+
+  **Nested gitdirs.** The owner's git also runs a nested repository's config
+  and hooks when it is run in the OUTER repository (a planted
+  `core.fsmonitor` in a submodule's config fires on a plain `git status`,
+  `git diff` or `git add -A` there, not only inside the submodule). So a `.git`
+  gitdir FILE (top level, submodule, worktree) is bound read-only itself, and
+  so is the directory it points to when that is inside the workspace (outside
+  the workspace it is not in the sandbox's view at all). The nested gitdirs
+  that can be named cheaply and deterministically are protected without
+  scanning the workspace: every `path` of `.gitmodules` (at most 64, each of
+  which must be an initialized submodule with a `.git`) gets its
+  `.git` bound the same way, `.gitmodules` itself is bound read-only (it is the
+  input of the plan: a command that could rewrite it would take a submodule out
+  of the next launch's plan), and the whole `.tole-worktrees` directory
+  (child-agent worktrees) is read-only, so no entry can be removed or replaced
+  and every worktree `.git` file in it is covered. Cost: a sandboxed command
+  cannot change files inside a child agent's worktree.
+
+  The layouts listed here are REFUSED, not half protected (the launch
+  fails with the cause; `optional` follows its fallback policy): a linked
+  worktree (`git worktree add`) whose `.git` file lies inside the workspace but
+  not under `.tole-worktrees` (found through the registry
+  `<gitdir>/worktrees/<id>/gitdir` of the gitdir in effect, the top-level `.git`
+  directory or the target of a gitdir file such as a separate git dir; a
+  worktree outside the workspace is not in the sandbox's view, and a stale
+  pointer whose path is gone is fine; a `worktrees` that is a link or not a
+  directory, a back-pointer that is a link or not a regular file, more than 64
+  entries or an oversized pointer are refused too, never skipped; remove the
+  worktree with `git worktree remove` or keep it outside the workspace); a submodule
+  listed in `.gitmodules` that is not initialized (a missing path, an empty
+  directory as after a clone without `--recursive`, a directory without `.git`,
+  a regular file: there is no `.git` to bind, and a command could `git init` one
+  with a planted `core.fsmonitor` that the owner's `git status` in the outer
+  repository runs; initialize it with `git submodule update --init` or remove
+  it); a registered
+  submodule that has a `.gitmodules` of its own (nested submodules: only the
+  top-level `.gitmodules` is read, so the inner gitdirs would be unprotected;
+  any depth, each listed submodule directory is checked without following
+  links); a gitdir directory that is not covered by an already read-only
+  path and has a `commondir` or `config.worktree` file (git would be sent to
+  another directory for its config and hooks, writable when it lies inside the
+  workspace), including the top-level `.git` directory itself; a gitdir file
+  whose target inside the workspace does not exist (a command could create
+  it); a `.gitmodules` with a second hard link. A gitdir file whose target is
+  outside the workspace is not in the sandbox's view and stays accepted. A
+  worktree's `commondir` inside the read-only `.git` (`.git/worktrees/<id>`) is
+  normal and not refused.
+  Git reads `.gitmodules` as a config file and the file is writable from the
+  sandbox, so only a plain subset is accepted and anything git could read
+  differently refuses the launch: `[submodule "name"]` sections with `key =
+  value` lines, blank lines and whole-line `#`/`;` comments; a comment after a
+  value, a quote, an escape or a continuation, another section or a key outside
+  a submodule section is refused (`path = sub # note` is `sub` to git). A
+  SYMBOLIC LINK anywhere in that chain (`.git`, `.git/hooks`, `.git/config`,
+  `.tole`, `.gitmodules`, a submodule path, `.tole-worktrees`, a gitdir target), a path that leaves the workspace, an unreadable
+  `.gitmodules` or gitdir file larger than 64 KiB or 4 KiB (never read in part), or more than 64 entries refuses the launch (for
+  `optional`, the fallback policy applies) with the cause in the reason:
+  a mount cannot protect a link (the command removes it and makes a real
+  directory, or the link leads to a writable place). A read-only mount stops
+  writes by path, not by inode, so what the host's git runs inside a gitdir
+  directory (the top-level `.git`, a nested one, the target of a gitdir file) is
+  also checked: `hooks` and `config` are not links, `config` and the files of
+  `hooks` have no second hard link (a name made earlier would stay writable),
+  no entry of `hooks` (at most 256) is a link, and a gitdir file itself has one
+  name. A FIFO or device named `.git`, `.gitmodules` or a submodule's `.git` is
+  never opened (it would block the launch): `.gitmodules` that is not a regular
+  file refuses the launch, a `.git` that is neither directory nor file is bound
+  without being read. Links and hard links elsewhere inside `.git` (not `hooks`
+  or `config`) are not inspected.
+
+  **Plan and launch.** The protected paths are planned, the argument list is
+  built, and the plan is made again right before the command line is handed
+  out: a `.git` that appeared in between, or a directory swapped for a link,
+  refuses the launch. Only the window between that check and the mount in
+  `bwrap` is left, which a same-user process racing the path could use (§5).
+
 - **Program and argv.** The command line is split to argv by the tool as
   before and passed to `bwrap` after `--`; the program is found by bare name
   on the absolute entries of tole's `PATH` (a relative entry would mean
@@ -573,10 +673,52 @@ file_size_mb = 4096            # 1 to 1048576, largest file a process writes
   refused). A grant that touches `$HOME` (marked `REFUSED`, it is never bound)
   or a credential directory (`.ssh`, `.gnupg`, `.aws`, `.azure`, `.kube`,
   `.docker`, `.netrc`, `.config/gcloud`; marked `SENSITIVE`) is flagged on its line.
-- **Residual.** Only what exists at launch is protected: a `.tole` or `.git/hooks`
-  that does not exist yet can be created by the command (bubblewrap cannot bind
-  a path that is not there without creating it in the real workspace), and a
-  nested repository's `.git/hooks` is not covered. A same-user process racing a
+- **Residual.** What is protected is what existed at launch, and only what
+  is listed above:
+  - A `.git` or `.tole` that did not exist at launch is not protected (an
+    empty read-only mount over a missing `.git` would create a directory in
+    the real workspace and break repository discovery; a launch creates
+    nothing there). A `git init` run inside the sandbox, or a `.git` made after
+    a detached `job_start` began, leaves a repository whose hooks and config
+    the host runs later. "Nothing can be created in `.git` or `.tole`" holds
+    only when they existed at launch.
+  - `.git/config` is read-only, but the settings in it are not checked: a
+    `core.hooksPath`, `include.path`, `core.fsmonitor` or similar that already
+    points to scripts or files inside the workspace (husky-style hook
+    managers) leaves those scripts writable, and the host runs them.
+  - A repository whose `commondir` or gitdir lives outside the workspace is
+    outside the sandbox's view and not this plan's concern.
+  - A nested repository that is not named by `.gitmodules` (an initialized
+    entry) or inside `.tole-worktrees` (a vendored clone, any `x/.git`) is part
+    of the writable workspace and is NOT protected: its config and hooks can be
+    written, and the owner's `git status` in the outer repository can fire a
+    planted `core.fsmonitor`.
+  - A gitlink recorded in the index with no `.gitmodules` entry (the usual
+    accidental embedded repository), including a directory that is empty or
+    missing: nothing names it, so a sandboxed command can `git init` there and
+    plant `core.fsmonitor` or a hook, and the host's plain `git status` in the
+    outer repository runs it. This is not the same as the missing top-level
+    `.git`/`.tole` above.
+  - Only the registry of the top-level gitdir is read for linked worktrees: a
+    worktree of a SUBMODULE (registered in `.git/modules/<name>/worktrees`) that
+    lies elsewhere in the workspace is not refused and not protected.
+  - A gitdir file or worktree back-pointer that names a path lexically outside
+    the workspace but reaching it through an external symlink alias is classed
+    as outside (git writes real paths, so this needs a hand-written pointer).
+  - Files outside `.git` that run on the owner's host later cannot be
+    protected by a mount: `.envrc`, Makefile, package scripts, `build.rs`, CI
+    configs, `.husky`, `.pre-commit-config.yaml`, lefthook,
+    `.vscode/tasks.json`, `.gitattributes` and the like.
+  - Hard links and links made before the paths were protected: only `config`,
+    the files of `hooks` and the gitdir files are checked, so another name for
+    some other file inside `.git` (`commondir`, `info/*`, `config.worktree`)
+    that was made while `.git` was unprotected is not detected.
+  - A diff does not show `.git` internals or a nested repository's config. Treat
+    a workspace a sandboxed command wrote into as untrusted until the owner has
+    inspected what git will run (`git config --list --show-origin` in the outer
+    repository and in each nested one, the hooks directories, the gitdir files),
+    or work from a fresh clone.
+  - A same-user process racing a
   path component between resolution and the mount is not stopped (§5). The
   limits are per process, not a cgroup. Toolchain caches (`~/.cargo`, `~/.npm`)
   are not visible; the profile has no `read` extras yet.

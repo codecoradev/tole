@@ -188,7 +188,7 @@ fn doctor_lists_consumers_with_decision_and_nothing_for_off() {
     let text = lines.join("\n");
     assert!(text
         .contains("sandbox consumer run_command: mode required, workspace writable, network host"));
-    assert!(text.contains(".git/hooks, .git/config, .tole"));
+    assert!(text.contains(".git, .tole"));
     assert!(text.contains("run_command: refused, no sandbox"));
     assert!(!text.contains("job_start"));
     let none = doctor_grant_lines(
