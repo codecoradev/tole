@@ -376,7 +376,7 @@ fn execute(dir: &Path, c: &Claimed, opts: &TickOptions) -> RunResult {
     });
     let started = Instant::now();
     let mut r = if mode(&c.job) == "script" {
-        let out = run_script(&c.job, &cancel);
+        let out = run_script(&c.job, dir, &cancel);
         RunResult {
             status: out.status,
             session_id: None,
@@ -504,6 +504,7 @@ pub fn run_claimed(
     for (c, r) in &settled {
         let _ = std::fs::remove_file(cancel_path(dir, &c.fire.fire_id));
         let info = RunInfo {
+            cron_dir: dir,
             job: &c.job,
             fire_id: &c.fire.fire_id,
             scheduled_for: c.fire.scheduled_for,
@@ -548,7 +549,7 @@ pub struct ScriptOutput {
 /// Runs a script job: argv (no shell), cwd = the job's workdir, the
 /// secret-shaped environment scrubbed, a hard timeout, killed when
 /// `cancel` is set. Zero tokens.
-pub fn run_script(job: &Job, cancel: &CancelToken) -> ScriptOutput {
+pub fn run_script(job: &Job, cron_dir: &Path, cancel: &CancelToken) -> ScriptOutput {
     let start = Instant::now();
     let fail = |status: RunStatus, error: String| ScriptOutput {
         status,
@@ -576,7 +577,7 @@ pub fn run_script(job: &Job, cancel: &CancelToken) -> ScriptOutput {
         .unwrap_or(DEFAULT_TIMEOUT_SECS);
     // The one launcher (#748 slice 3): plain, or in the sandbox when
     // `[sandbox.consumers] cron` is on. A refusal is a failed run that says so.
-    let mut prepared = match super::launch::prepare(job, &argv) {
+    let mut prepared = match super::launch::prepare(job, &argv, cron_dir) {
         Ok(p) => p,
         Err(why) => return refuse(why, start),
     };

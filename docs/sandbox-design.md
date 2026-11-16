@@ -1064,6 +1064,16 @@ commands follow `run_command` and `job_start`. Default `off`, user config only;
   A workdir that holds the repository gets the whole `.git`, `.tole`,
   `.tole-worktrees` and `.gitmodules` paths read-only as for `run_command`; git
   commands that write fail there, as designed.
+- **The cron dir stays out.** The ledger, the run logs, the ticker state and the
+  lock live in the cron dir, which is under the data dir by default (absent from
+  the sandbox, so the default layout is safe) but is wherever `TOLE_CRON_DIR`
+  says. The grant check only knows the data dir, so `launch::prepare` also
+  refuses, for scripts and deliveries, a workdir that holds the cron dir or is
+  inside it (both resolved like the plan resolves paths, links and `..`
+  followed), and a cron dir it cannot resolve: a writable bind of either would
+  let the script append job lines (a forged `created_by`) or edit its run log.
+  Everything a job's definition, trust and deliveries are read from is in that
+  one directory.
 - **Deliveries.** A `command:` delivery gets the run's output on stdin and
   `TOLE_CRON_JOB`, `TOLE_CRON_FIRE` and `TOLE_CRON_STATUS` as before, in the same
   profile and workspace. What it can reach is the profile's: with `network =

@@ -2008,3 +2008,12 @@ fn doctor_reports_the_cron_consumer() {
         "{l:?}"
     );
 }
+
+/// `warn_once` keeps one flag per consumer: every consumer must have a slot.
+#[test]
+fn warn_once_has_a_slot_for_every_consumer() {
+    for (i, k) in Consumer::ALL.iter().enumerate() {
+        assert_eq!(k.index(), i, "{k:?}: ALL is in declaration order");
+        warn_once(*k, &format!("{}: test warning, ignore", k.name()));
+    }
+}

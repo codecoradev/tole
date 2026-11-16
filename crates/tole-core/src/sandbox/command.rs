@@ -37,7 +37,7 @@ use std::ffi::OsString;
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
 /// Paths of the workspace that later run code outside the sandbox: they stay
@@ -1365,13 +1365,11 @@ pub(crate) fn recheck_plan(workspace: &Path, args: &[OsString]) -> Result<(), St
 /// A fallback to no sandbox is warned about once per process and tool, not
 /// on every call (a chatty line per command would drown a terminal).
 fn warn_once(consumer: Consumer, text: &str) {
-    static WARNED: [AtomicBool; 4] = [
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-    ];
-    if !WARNED[consumer.index()].swap(true, Ordering::SeqCst) {
+    // One bit per consumer, so a new consumer needs no new slot.
+    static WARNED: AtomicUsize = AtomicUsize::new(0);
+    const _: () = assert!(Consumer::ALL.len() <= usize::BITS as usize);
+    let bit = 1usize << consumer.index();
+    if WARNED.fetch_or(bit, Ordering::SeqCst) & bit == 0 {
         eprintln!("tole: {text}");
     }
 }

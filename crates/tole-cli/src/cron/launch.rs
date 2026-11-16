@@ -15,7 +15,7 @@
 //! the profile refuses and a launcher that does not start are REFUSALS, never
 //! a run without the sandbox.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use tole_core::ledger::Job;
@@ -70,12 +70,44 @@ impl Prepared {
     }
 }
 
+/// The cron dir (ledger, run logs, ticker state, lock: everything a job's
+/// definition, trust and deliveries are read from) must not be inside the
+/// sandbox's workspace, and the workspace must not be inside it: a writable
+/// bind of either would let the script edit its own future job lines (a forged
+/// `created_by`) or the run log. `TOLE_CRON_DIR` may point anywhere, so the
+/// default data-dir layout is not enough; the grant check only knows the data
+/// dir. Both paths are resolved like the plan resolves them (links and `..`
+/// followed); a cron dir that cannot be resolved fails closed. A workdir that
+/// cannot be resolved is left to `command_in_dir`, which refuses it.
+fn cron_dir_apart_from(cron_dir: &Path, ws: &Path) -> Result<(), String> {
+    let cron = std::fs::canonicalize(cron_dir).map_err(|e| {
+        format!(
+            "cron: not run, the cron dir {} cannot be resolved ({e}); the sandbox cannot tell \
+             whether the job could reach its own ledger",
+            cron_dir.display()
+        )
+    })?;
+    let Ok(ws) = std::fs::canonicalize(ws) else {
+        return Ok(());
+    };
+    if cron.starts_with(&ws) || ws.starts_with(&cron) {
+        return Err(format!(
+            "cron: not run, the workdir {} and the cron dir {} overlap, so a sandboxed command \
+             could write the job ledger or the run log; give the job a workdir apart from the \
+             cron dir (TOLE_CRON_DIR)",
+            ws.display(),
+            cron.display()
+        ));
+    }
+    Ok(())
+}
+
 /// The process for `argv` run by `job`: the plain command in the job's
 /// workdir (or the working directory when it has none) when the sandbox is
 /// off, else `bwrap ... -- argv` with the workdir as the workspace. The
 /// environment is scrubbed as a cron child always was. `Err` is the refusal,
 /// ready to record.
-pub fn prepare(job: &Job, argv: &[String]) -> Result<Prepared, String> {
+pub fn prepare(job: &Job, argv: &[String], cron_dir: &Path) -> Result<Prepared, String> {
     let on = consumers().mode(Consumer::Cron) != Mode::Off;
     let workdir = field(job, "workdir").map(PathBuf::from);
     // The directory the command runs in, which is what the sandbox binds. A
@@ -87,6 +119,9 @@ pub fn prepare(job: &Job, argv: &[String]) -> Result<Prepared, String> {
             .map_err(|e| format!("cron: not run, the working directory is unknown ({e})"))?,
         (None, false) => PathBuf::new(),
     };
+    if on {
+        cron_dir_apart_from(cron_dir, &ws)?;
+    }
     let launched = command_in_dir(Consumer::Cron, &ws, &argv[0], &argv[1..])?;
     let mut cmd = launched.cmd;
     if let Some(w) = &workdir {

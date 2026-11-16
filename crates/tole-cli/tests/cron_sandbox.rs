@@ -582,6 +582,65 @@ fn a_sandboxed_script_is_killed_at_its_timeout() {
     assert!(!e.ws.join("after-sleep").exists());
 }
 
+/// The cron dir holds the ledger and the run logs that decide a job's future
+/// definition and deliveries. `TOLE_CRON_DIR` may be anywhere, so a workdir
+/// that holds the cron dir (or is inside it) would let a sandboxed script
+/// forge job lines: refused, for a script and for a delivery, whatever the
+/// backend. The default layout (the cron dir apart from the workdir) runs.
+#[test]
+fn a_workdir_that_overlaps_the_cron_dir_is_refused_for_script_and_delivery() {
+    for (tag, inside) in [("cron-in-workdir", true), ("workdir-in-cron", false)] {
+        let mut e = Env::new(tag);
+        e.cron = if inside {
+            e.ws.join(".cron")
+        } else {
+            e.root.to_path_buf()
+        };
+        std::fs::create_dir_all(&e.cron).unwrap();
+        e.user_config("[sandbox.consumers]\ncron = \"required\"\n");
+        e.write("job.sh", "#!/bin/sh\ntouch ran-marker\n");
+        e.run_job(
+            &real_path(),
+            "sh job.sh",
+            &e.ws,
+            &["--deliver", "command:touch delivered-marker"],
+        );
+        let row = e.row();
+        assert_eq!(status(&row), "Error", "{tag}");
+        assert_eq!(usage(&row, "sandbox_refused"), Value::Bool(true), "{tag}");
+        let err = usage(&row, "error").as_str().unwrap_or("").to_string();
+        assert!(
+            err.contains("overlap") && err.contains("cron dir"),
+            "{tag}: {err}"
+        );
+        assert!(
+            !e.ws.join("ran-marker").exists(),
+            "{tag}: the script never ran"
+        );
+        let d = delivery(&row, "command:");
+        assert_eq!(d["status"], "failed", "{tag}: {d}");
+        assert!(
+            d["error"].as_str().unwrap_or("").contains("overlap"),
+            "{tag}: the delivery is refused the same way: {d}"
+        );
+        assert!(!e.ws.join("delivered-marker").exists(), "{tag}");
+    }
+}
+
+#[test]
+fn the_default_layout_with_the_cron_dir_apart_from_the_workdir_runs() {
+    if !bwrap_works() {
+        return;
+    }
+    let e = Env::new("apart");
+    e.user_config("[sandbox.consumers]\ncron = \"required\"\n");
+    e.write("job.sh", "#!/bin/sh\ntouch ran-marker\n");
+    e.run_job(&real_path(), "sh job.sh", &e.ws, &[]);
+    let row = e.row();
+    assert_eq!(status(&row), "Ok", "{}", e.log(&row));
+    assert!(e.ws.join("ran-marker").exists());
+}
+
 /// No path around the sandbox: nothing in `src/cron` builds a process of its
 /// own. A script and a delivery both take their `Command` from
 /// `launch::prepare`, which asks `command_in_dir(Consumer::Cron, ..)`.

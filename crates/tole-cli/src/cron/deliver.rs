@@ -130,6 +130,8 @@ pub fn check(job: &Job) -> Result<(), (&'static str, String)> {
 
 /// What a delivery is told about its run.
 pub struct RunInfo<'a> {
+    /// The cron dir (the sandbox keeps a command apart from it).
+    pub cron_dir: &'a Path,
     pub job: &'a Job,
     pub fire_id: &'a str,
     pub scheduled_for: i64,
@@ -251,7 +253,7 @@ fn run_command(run: &RunInfo<'_>, line: &str) -> Result<(), String> {
     // The one launcher (#748 slice 3): plain, or in the sandbox when
     // `[sandbox.consumers] cron` is on (the job's workdir is the workspace; the
     // network and every other grant are the profile's, never widened here).
-    let mut prepared = super::launch::prepare(run.job, &argv)?;
+    let mut prepared = super::launch::prepare(run.job, &argv, run.cron_dir)?;
     prepared
         .cmd
         .env("TOLE_CRON_JOB", &run.job.id)
