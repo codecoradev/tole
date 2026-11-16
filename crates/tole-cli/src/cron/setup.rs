@@ -134,11 +134,20 @@ pub fn pin_profile(profile: &Profile, workdir: &Path) -> Result<BTreeMap<String,
 
 /// The user config (`None` when there is none).
 pub fn user_config() -> Result<Option<Config>, String> {
-    match crate::config::user_config_path().filter(|p| p.exists()) {
-        Some(path) => crate::config::load(&path)
+    let Some(path) = crate::config::user_config_path() else {
+        return Ok(None);
+    };
+    // `exists()` would read an I/O error as "no config" (#864): only an
+    // absent path is none, anything else fails closed.
+    match path.try_exists() {
+        Ok(true) => crate::config::load(&path)
             .map(Some)
             .map_err(|e| e.to_string()),
-        None => Ok(None),
+        Ok(false) => Ok(None),
+        Err(e) => Err(format!(
+            "cannot inspect the user config {} ({e})",
+            path.display()
+        )),
     }
 }
 
