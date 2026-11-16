@@ -321,6 +321,12 @@ pub fn promote(
         ));
     }
     approvals.approve(&pkg, env.now);
+    // The ledger first (#600): a promotion is an approval like `tole skills
+    // approve`, and the ledger is authoritative over the approvals file.
+    crate::skill_approve::record(
+        env.approvals_path,
+        &tole_core::skill_approval::ledger_line("approve", &d.name, &pkg.hash, None, env.now),
+    )?;
     approvals.save(env.approvals_path)?;
     env.store.promote(
         id,
@@ -369,6 +375,16 @@ pub fn revoke_source(
                 let promoted = d.promotion.as_ref();
                 let current = approvals.skills.get(&d.name).map(|a| a.hash.as_str());
                 if promoted.is_some_and(|p| Some(p.package_hash.as_str()) == current) {
+                    crate::skill_approve::record(
+                        approvals_path,
+                        &tole_core::skill_approval::ledger_line(
+                            "revoke",
+                            &d.name,
+                            current.unwrap_or_default(),
+                            None,
+                            now_secs(),
+                        ),
+                    )?;
                     approvals.revoke(&d.name);
                     changed = true;
                     store.revoke(&d.id)?;

@@ -56,6 +56,67 @@ const LIMITS: Limits = Limits {
     entries: MAX_PACKAGE_ENTRIES,
 };
 
+/// The append-only audit ledger next to the approvals file (#600): one line
+/// per approve and revoke, never rewritten. It is authoritative over the
+/// approvals file for every skill it names (see [`check_against_ledger`]).
+pub const LEDGER_FILE: &str = "skill-ledger.jsonl";
+/// Largest ledger read.
+pub const MAX_LEDGER_BYTES: u64 = 16 * 1024 * 1024;
+/// Longest source URL or registry id kept.
+const MAX_SOURCE_FIELD: usize = 512;
+
+/// Where a third-party skill came from, recorded as data (#600). Nothing
+/// here is fetched or verified: it is what the owner states at approval, so
+/// a later review can see the claimed origin next to the approved bytes.
+/// The trust anchor stays the hash of the bytes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Source {
+    /// Where the skill was pulled from (a URL).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Its id in the registry that listed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry_id: Option<String>,
+    /// The commit it was pinned at: 40 or 64 lowercase hex digits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha: Option<String>,
+}
+
+impl Source {
+    /// True when no field is set.
+    pub fn is_empty(&self) -> bool {
+        self.url.is_none() && self.registry_id.is_none() && self.sha.is_none()
+    }
+
+    /// Refuses control characters, over-long fields and a malformed SHA.
+    pub fn validate(&self) -> Result<(), String> {
+        for (what, v) in [
+            ("source url", &self.url),
+            ("registry id", &self.registry_id),
+        ] {
+            if let Some(v) = v {
+                if v.is_empty()
+                    || v.chars().count() > MAX_SOURCE_FIELD
+                    || v.chars().any(char::is_control)
+                {
+                    return Err(format!(
+                        "{what}: 1 to {MAX_SOURCE_FIELD} characters, no control characters"
+                    ));
+                }
+            }
+        }
+        if let Some(sha) = &self.sha {
+            let hex = sha
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+            if !hex || !matches!(sha.len(), 40 | 64) {
+                return Err("pinned sha: 40 or 64 lowercase hex digits".into());
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The owner's approval of one skill.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Approval {
@@ -65,6 +126,9 @@ pub struct Approval {
     pub approved_at: u64,
     /// Files in the approved package.
     pub files: usize,
+    /// The stated origin of a third-party skill (data, never verified).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<Source>,
 }
 
 /// Every approval of this user, by skill name.
@@ -110,12 +174,18 @@ impl Approvals {
     /// Approve `pkg` as it is on disk now, replacing an earlier approval of
     /// the same name (only the latest approved bytes load).
     pub fn approve(&mut self, pkg: &SkillPackage, now: u64) {
+        self.approve_from(pkg, now, None);
+    }
+
+    /// [`Approvals::approve`] recording where the skill came from.
+    pub fn approve_from(&mut self, pkg: &SkillPackage, now: u64, source: Option<Source>) {
         self.skills.insert(
             pkg.name.clone(),
             Approval {
                 hash: pkg.hash.clone(),
                 approved_at: now,
                 files: pkg.files.len(),
+                source: source.filter(|s| !s.is_empty()),
             },
         );
     }
@@ -129,6 +199,122 @@ impl Approvals {
     pub fn is_approved(&self, name: &str, hash: &str) -> bool {
         self.skills.get(name).is_some_and(|a| a.hash == hash)
     }
+}
+
+/// One audit-ledger line (`approve` or `revoke`): the skill name, the
+/// package hash and, for an approval, the stated source. Names, hashes and
+/// the owner's source fields only; never skill text.
+pub fn ledger_line(
+    event: &str,
+    name: &str,
+    hash: &str,
+    source: Option<&Source>,
+    at: u64,
+) -> String {
+    let mut v = serde_json::json!({
+        "v": 1, "kind": "skill", "event": event, "skill": name, "hash": hash, "at": at,
+    });
+    if let Some(src) = source.filter(|s| !s.is_empty()) {
+        v["source"] = serde_json::to_value(src).unwrap_or_default();
+    }
+    let mut line = v.to_string();
+    line.push('\n');
+    line
+}
+
+/// The ledger next to the approvals file `approvals`. `Ok("")`: none yet.
+/// `Err`: it exists but cannot be read safely (fail closed: the approvals
+/// cannot be checked against it).
+pub fn read_ledger(approvals: &Path) -> Result<String, String> {
+    let path = approvals
+        .parent()
+        .map_or_else(|| PathBuf::from(LEDGER_FILE), |d| d.join(LEDGER_FILE));
+    match read_file_capped(&path, MAX_LEDGER_BYTES) {
+        Ok(raw) => Ok(String::from_utf8_lossy(&raw).into_owned()),
+        Err(ReadCapError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
+/// What the ledger says about the approvals file.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LedgerCheck {
+    /// `(skill, why)` for approvals the ledger does not allow.
+    pub blocked: Vec<(String, String)>,
+    /// Approved skills the ledger has no line for (approved before the
+    /// ledger, or written by hand): allowed, but not vouched for.
+    pub unrecorded: Vec<String>,
+}
+
+/// The last ledger decision per skill: `Some(hash)` approved, `None` revoked.
+fn ledger_state(ledger: &str) -> BTreeMap<String, Option<String>> {
+    let mut state = BTreeMap::new();
+    for line in ledger.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v["kind"] != "skill" {
+            continue;
+        }
+        let Some(name) = v["skill"].as_str() else {
+            continue;
+        };
+        match v["event"].as_str() {
+            Some("approve") => {
+                // An approve line without a hash vouches for nothing.
+                state.insert(name.to_string(), v["hash"].as_str().map(str::to_string));
+            }
+            Some("revoke") => {
+                state.insert(name.to_string(), None);
+            }
+            _ => {}
+        }
+    }
+    state
+}
+
+/// Compares `approvals` with the ledger (the append-only record of the
+/// owner's decisions): an approval for a skill whose last ledger line is a
+/// revoke, or whose approved hash is not the ledger's, was written by hand
+/// and is blocked. Skills the ledger never names are `unrecorded`.
+pub fn check_against_ledger(approvals: &Approvals, ledger: &str) -> LedgerCheck {
+    let state = ledger_state(ledger);
+    let mut out = LedgerCheck::default();
+    for (name, a) in &approvals.skills {
+        match state.get(name) {
+            None => out.unrecorded.push(name.clone()),
+            Some(Some(h)) if *h == a.hash => {}
+            Some(Some(h)) => out.blocked.push((
+                name.clone(),
+                format!("its approved hash is not the ledger's ({h})"),
+            )),
+            Some(None) => out.blocked.push((
+                name.clone(),
+                "the ledger records a revoke after its last approval".into(),
+            )),
+        }
+    }
+    out
+}
+
+/// The last `n` ledger lines (`at`, `event`, `hash`) of skill `name`, oldest
+/// first.
+pub fn ledger_history(ledger: &str, name: &str, n: usize) -> Vec<(u64, String, String)> {
+    let mut all: Vec<(u64, String, String)> = ledger
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v["kind"] == "skill" && v["skill"] == name)
+        .filter_map(|v| {
+            Some((
+                v["at"].as_u64()?,
+                v["event"].as_str()?.to_string(),
+                v["hash"].as_str().unwrap_or_default().to_string(),
+            ))
+        })
+        .collect();
+    let from = all.len().saturating_sub(n);
+    all.drain(..from);
+    all
 }
 
 /// One skill's directory, read in full: what an approval covers.
@@ -616,6 +802,94 @@ mod tests {
         let err = Approvals::load(&path).unwrap_err();
         assert!(err.contains("over 1048576 bytes"), "{err}");
         assert_eq!(format_time(1_700_000_000), "2023-11-14 22:13 UTC");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    fn src(sha: &str) -> Source {
+        Source {
+            url: Some("https://example.test/s.git".into()),
+            registry_id: Some("reg/demo".into()),
+            sha: Some(sha.into()),
+        }
+    }
+
+    #[test]
+    fn a_source_is_validated_and_kept_as_data() {
+        let sha = "a".repeat(40);
+        assert!(src(&sha).validate().is_ok());
+        assert!(src(&"b".repeat(64)).validate().is_ok());
+        for bad in ["", "abc", &"A".repeat(40), &"g".repeat(40), &"a".repeat(41)] {
+            assert!(src(bad).validate().is_err(), "{bad}");
+        }
+        let mut s = src(&sha);
+        s.url = Some("https://x\u{1b}[2J".into());
+        assert!(s.validate().is_err());
+        s.url = Some("x".repeat(MAX_SOURCE_FIELD + 1));
+        assert!(s.validate().is_err());
+        // Round trip, and an old approvals file (no `source`) still loads.
+        let ws = tmp("source");
+        skill(&ws, "demo", "b");
+        let pkg = read_package(Some(&ws), "demo").unwrap();
+        let mut a = Approvals::default();
+        a.approve_from(&pkg, 1, Some(src(&sha)));
+        let path = ws.join("approvals.json");
+        a.save(&path).unwrap();
+        assert_eq!(Approvals::load(&path).unwrap(), a);
+        a.approve_from(&pkg, 2, Some(Source::default()));
+        assert_eq!(a.skills["demo"].source, None, "an empty source is none");
+        std::fs::write(
+            &path,
+            r#"{"skills":{"demo":{"hash":"sha256:x","approved_at":1,"files":1}}}"#,
+        )
+        .unwrap();
+        assert_eq!(Approvals::load(&path).unwrap().skills["demo"].source, None);
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn the_ledger_outranks_a_hand_edited_approvals_file() {
+        let ws = tmp("ledger");
+        skill(&ws, "demo", "b");
+        let pkg = read_package(Some(&ws), "demo").unwrap();
+        let mut a = Approvals::default();
+        a.approve(&pkg, 5);
+        // No ledger line: allowed, reported as unrecorded.
+        let c = check_against_ledger(&a, "");
+        assert_eq!(c.unrecorded, ["demo"]);
+        assert!(c.blocked.is_empty());
+        // Approved in the ledger with the same hash: fine.
+        let mut l = ledger_line("approve", "demo", &pkg.hash, None, 5);
+        assert_eq!(check_against_ledger(&a, &l), LedgerCheck::default());
+        // A revoke after it: an approvals file that still holds the entry
+        // (hand edit) is blocked.
+        l.push_str(&ledger_line("revoke", "demo", &pkg.hash, None, 6));
+        let c = check_against_ledger(&a, &l);
+        assert_eq!(c.blocked.len(), 1, "{c:?}");
+        // Approving again lifts it; a different hash in the file does not.
+        let s = src(&"a".repeat(40));
+        l.push_str(&ledger_line("approve", "demo", &pkg.hash, Some(&s), 7));
+        assert_eq!(check_against_ledger(&a, &l), LedgerCheck::default());
+        a.skills.get_mut("demo").unwrap().hash = "sha256:evil".into();
+        assert_eq!(check_against_ledger(&a, &l).blocked.len(), 1);
+        // Junk and foreign lines are ignored; history is the last n, in order.
+        l.push_str("not json\n{\"kind\":\"plugin\",\"skill\":\"demo\"}\n");
+        let h = ledger_history(&l, "demo", 2);
+        assert_eq!(
+            h.iter()
+                .map(|(at, e, _)| (*at, e.as_str()))
+                .collect::<Vec<_>>(),
+            [(6, "revoke"), (7, "approve")]
+        );
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn an_unreadable_ledger_is_an_error_not_no_history() {
+        let ws = tmp("ledger-io");
+        let approvals = ws.join("approvals.json");
+        assert_eq!(read_ledger(&approvals).unwrap(), "");
+        std::fs::create_dir(ws.join(LEDGER_FILE)).unwrap();
+        assert!(read_ledger(&approvals).is_err());
         let _ = std::fs::remove_dir_all(&ws);
     }
 }

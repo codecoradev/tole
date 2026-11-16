@@ -29,7 +29,8 @@ automation and secrets release:
   skills only through drafts (`skill_propose`, `tole skills drafts`), and
   `tole curator` keeps the library small.
 - **Plugins:** every MCP server needs the owner's approval, pinned in a plugin lock
-  (`tole plugin list|diff|approve|revoke|add`).
+  (`tole plugin list|diff|audit|approve|revoke|add`); third-party skills are pinned by
+  approved hash with a stated source in an append-only ledger.
 - **Secrets:** scoped release with `[secrets]`, known-value redaction at every egress
   sink and in the session log, sensitive files read redacted (`read_file_raw` for the
   verbatim read), and owner-only subcommands that refuse under a session
@@ -204,6 +205,7 @@ tole delegation approvals show <ID>         # one request in full: who asked, th
 tole delegation approvals allow <ID>        # allow ONE call of ONE request: shows it, then type the id back (--yes skips the typing; --fingerprint <HEX> pins the content)
 tole delegation approvals deny <ID>         # deny it (no answer is a denial too); allow and deny refuse under an agent session
 tole discuss start --question "Q" --criterion "C" --participant coder --participant reviewer --budget 60000 --dry-run  # owner-only multi-round discussion among user-config profiles; the budget is a hard cap, any number of participants is accepted (8 recommended, 16 at most) and the dry run shows the cost for that many; drop --dry-run to run it (also: resume ID, list, show ID)
+tole plugin audit [NAME] [--json]           # read-only report: tier, approved vs live manifest hash, grants, sandbox profile, scan findings, last sandbox fallbacks, skills with source and ledger (starts only what `list` would)
 tole plugin list                            # every MCP server with its lock state (approved, changed, unapproved, revoked); also: diff NAME, approve NAME [--hash H], revoke NAME
 tole skills list                            # discovered skills with approval status and hash; approve NAME [--hash H], revoke NAME, drafts list|show|reject|verdict|promote|revoke, index|retire|search
 tole curator status                         # the skill curator: run [--dry-run], restore, pin, lock, adopt, pause, schedule

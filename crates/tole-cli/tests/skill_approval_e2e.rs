@@ -223,6 +223,131 @@ fn required_approval_lists_unapproved_skills_by_name_only() {
     assert!(out.contains("good  not approved"), "{out}");
 }
 
+/// #600: a third-party skill is approved with its stated source and a ledger
+/// line; `tole plugin audit` reports it; a revoke is in the append-only
+/// ledger and a hand-restored approvals file does not bring the skill back;
+/// a file changed after approval is refused.
+#[test]
+fn a_pinned_skill_is_audited_and_the_ledger_outranks_the_approvals_file() {
+    let (url, seen) = spawn_mock();
+    let home = tmpdir();
+    let work = tmpdir();
+    skill(&work, "ext", "third party");
+    let out = text(&finish(cmd(&work, &home, &url, None, &["skills", "list"])).stdout);
+    let hash = out.split_whitespace().nth(3).unwrap().to_string();
+    let sha = "d".repeat(40);
+    // A malformed pinned sha is refused before anything is written.
+    let o = finish(cmd(
+        &work,
+        &home,
+        &url,
+        None,
+        &[
+            "skills",
+            "approve",
+            "ext",
+            "--hash",
+            &hash,
+            "--pinned-sha",
+            "xyz",
+        ],
+    ));
+    assert!(!o.status.success());
+    assert!(!home.join("tole").join("skill-ledger.jsonl").exists());
+    let o = finish(cmd(
+        &work,
+        &home,
+        &url,
+        None,
+        &[
+            "skills",
+            "approve",
+            "ext",
+            "--hash",
+            &hash,
+            "--source-url",
+            "https://example.test/ext.git",
+            "--registry-id",
+            "uteke/ext",
+            "--pinned-sha",
+            &sha,
+        ],
+    ));
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    let ledger = std::fs::read_to_string(home.join("tole").join("skill-ledger.jsonl")).unwrap();
+    assert!(
+        ledger.contains("\"event\":\"approve\"") && ledger.contains(&sha),
+        "{ledger}"
+    );
+    assert!(
+        !ledger.contains("body of ext"),
+        "no skill text in the ledger"
+    );
+    // `plugin` exists only with the `mcp` feature.
+    if cfg!(feature = "mcp") {
+        let audit = text(&finish(cmd(&work, &home, &url, None, &["plugin", "audit"])).stdout);
+        assert!(
+            audit.contains("skill ext  approved") && audit.contains(&format!("pinned {sha}")),
+            "{audit}"
+        );
+    }
+    // Loads while approved; refused after the file drifts (unattended run).
+    let o = finish(cmd(&work, &home, &url, None, &["run", "hi"]));
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    assert!(system_of(&seen, 0).contains("ext"));
+    std::fs::write(
+        work.join("skills/ext/SKILL.md"),
+        "---\nname: ext\ndescription: \"d\"\n---\nswapped",
+    )
+    .unwrap();
+    if cfg!(feature = "mcp") {
+        let audit = text(
+            &finish(cmd(
+                &work,
+                &home,
+                &url,
+                None,
+                &["plugin", "audit", "--json"],
+            ))
+            .stdout,
+        );
+        assert!(audit.contains("changed since approval"), "{audit}");
+    }
+    let o = finish(cmd(&work, &home, &url, None, &["run", "hi"]));
+    assert!(
+        !system_of(&seen, 1).contains("ext —"),
+        "drifted skill must not be listed as available"
+    );
+    assert!(
+        text(&o.stderr).contains("unavailable"),
+        "{}",
+        text(&o.stderr)
+    );
+    // Revoke, then put the approvals file back by hand: still refused.
+    let path = home.join("tole").join("skill-approvals.json");
+    let saved = std::fs::read(&path).unwrap();
+    std::fs::write(
+        work.join("skills/ext/SKILL.md"),
+        "---\nname: ext\ndescription: \"third party\"\n---\nbody of ext",
+    )
+    .unwrap();
+    let o = finish(cmd(&work, &home, &url, None, &["skills", "revoke", "ext"]));
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    std::fs::write(&path, saved).unwrap();
+    let o = finish(cmd(&work, &home, &url, None, &["run", "hi"]));
+    assert!(
+        text(&o.stderr).contains("approval ignored"),
+        "{}",
+        text(&o.stderr)
+    );
+    let ledger = std::fs::read_to_string(home.join("tole").join("skill-ledger.jsonl")).unwrap();
+    assert_eq!(
+        ledger.lines().count(),
+        2,
+        "append-only: approve then revoke\n{ledger}"
+    );
+}
+
 #[test]
 fn a_bad_setting_or_a_malformed_approvals_file_fails_startup() {
     let (url, seen) = spawn_mock();

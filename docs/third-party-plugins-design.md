@@ -443,3 +443,40 @@ the lock is refused.
 
 **Out of scope here:** registry resolution, uteke registry skills,
 enforcement of the declared paths, a bundle-wide approve.
+
+## Audit and the skills pin (#600 slice 3)
+
+**`tole plugin audit [name] [--json]`** is the read-only report of §4.5. Per
+server: tier, lock state, approved manifest hash against the live one (the
+server is started exactly as `list` would, never one the lock refuses, never
+under an agent session), binary integrity, secret grants, the sandbox profile
+approved and in force, the scanner's findings (of the live list, or of the
+approval's stored snapshot when nothing was started) and the last three
+`sandbox_fallback` events of the plugin ledger. It prints no tool text beyond
+scanner findings. Every string is redacted, terminal-safe and put on one line.
+It writes nothing.
+
+**Skills.** The trust anchor stays the approved hash of the whole skill
+directory (skills design §4.2): any file changed after approval is refused,
+under `required` approval (the default), in every run including cron and
+`serve`. New in this slice:
+
+- `tole skills approve <name> --source-url U --registry-id R --pinned-sha S`
+  records the stated origin next to the approved bytes. It is **data**: no
+  network fetch or verification (the MCP Registry namespace check is skipped by
+  the owner, and no uteke registry API exists in this repo to verify against).
+  The SHA is validated for shape only (40 or 64 lowercase hex).
+- Every skill approve and revoke is appended to `skill-ledger.jsonl` next to
+  the approvals file, before the approvals file is written. The ledger is
+  authoritative for the skills it names: an approval whose last ledger line is
+  a revoke, or whose hash differs from the ledger's, is dropped at load with a
+  note. An approval the ledger never names (made before this slice) still
+  loads and is not vouched for. An unreadable ledger fails startup. Same
+  residual as the plugin ledger: a process that can rewrite both files is not
+  stopped.
+- `tole skills revoke` is owner-only like `approve`.
+
+**Not built (follow-up):** pulling a skill from the uteke registry at a pinned
+SHA into the local directory. That needs the `uteke skill` Cloud API, which
+cannot be verified offline; until then a third-party skill is placed in a
+skills directory by the owner and approved with its source stated.

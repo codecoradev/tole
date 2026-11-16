@@ -379,8 +379,11 @@ Bot and Nakama; BMAD for collaboration). Design notes:
   - `tole plugin` commands, scanner, trust tiers and grants (#600; open). Slice 1
     is done (list and diff, owner-only revoke, the description scanner, the
     one-shot probe, `tole plugin add`, trust tiers, doctor warnings). Slice 2
-    (#811, bundle manifests and per-plugin secret grants) is done. Registry
-    resolution and uteke registry skills are later slices with no issue yet;
+    (#811, bundle manifests and per-plugin secret grants) is done. Slice 3
+    is done: `tole plugin audit` and the skills pin (stated source, append-only
+    skill ledger, refusal of a drifted or ledger-revoked skill). MCP Registry
+    namespace verification is skipped (owner decision); fetching skills from
+    the uteke registry is a later slice with no issue yet;
   - external sandbox wrapper and lazy start (#601; open; design and owner
     decisions in `docs/sandbox-design.md`; first slice done: opt-in
     bubblewrap sandbox for third-party stdio MCP servers on Linux, with a
@@ -409,7 +412,7 @@ skill library (codecoradev/uteke#1731), shared secret-detector crate
 
 | Area | Open issues |
 |------|-------------|
-| Secrets and plugins (epic #594) | #597 shape detector, #600 plugin commands (slice 2: #811, done), #601 sandbox (#748 commands, #750 operability: #809, #810) |
+| Secrets and plugins (epic #594) | #597 shape detector, #600 plugin commands (slice 2: #811, slice 3 audit and skills pin: done), #601 sandbox (#748 commands, #750 operability: #809, #810) |
 | Security follow-ups | #813 (decisions left from the #714 and #600 reviews) |
 | Collaboration (epic #583) | none; the epic issue only needs closing |
 | Serve for graphical clients | #571, #572, #573, #574, #575 |
