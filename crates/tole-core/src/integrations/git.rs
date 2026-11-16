@@ -184,7 +184,7 @@ impl GitOp {
 }
 
 /// Whether any command consumer (`run_command`, `job_start`, verify, stop
-/// gates, and any added later) runs in the sandbox, which is when this tool
+/// gates, cron scripts and deliveries, and any added later) runs in the sandbox, which is when this tool
 /// hardens its invocation beyond `core.fsmonitor`.
 fn consumers_on() -> bool {
     use crate::sandbox::command::{consumers, Consumer};

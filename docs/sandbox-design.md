@@ -651,8 +651,11 @@ file_size_mb = 4096            # 1 to 1048576, largest file a process writes
   host through add and commit (not fixed with `GIT_CONFIG_GLOBAL` tricks); (3)
   `GIT_CONFIG_NOSYSTEM=1` drops `/etc/gitconfig` (safe.directory, credential
   helpers, user.*, policy), so a repository owned by another user can fail with
-  "dubious ownership" or a commit can fail for want of an identity; (4) a
-  human's own `git commit` still runs in-workspace hook scripts, and a nested
+  "dubious ownership" or a commit can fail for want of an identity; (4) the
+  checks (bare layout, same real `.git`) are made just before git is spawned,
+  so a detached `job_start` that plants a bare layout in that window is not
+  stopped by the tool (the planted layout is then refused by the next call);
+  (5) a human's own `git commit` still runs in-workspace hook scripts, and a nested
   repository's own config is not covered by the pinned flags (see the residuals
   above). The `run_command` and `job_start` summaries tell the model that git
   writes fail in the sandbox and to use the `git` tool, and `tole doctor` says
