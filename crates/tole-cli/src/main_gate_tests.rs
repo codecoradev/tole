@@ -18,6 +18,35 @@ fn skip_list_is_config_upgrade_approvals() {
     assert_eq!(policy(&["approvals", "list"]), GatePolicy::Skip);
 }
 
+/// #863: only the cron subcommands that execute jobs read the user config;
+/// the config gate still skips the project config for all of `cron`.
+#[cfg(feature = "shell-tools")]
+#[test]
+fn only_cron_run_and_tick_load_the_user_config_among_the_skip_list() {
+    let loads = |a: &[&str]| runs_cron_jobs(&parse(a).command);
+    assert!(loads(&["cron", "run", "j"]));
+    assert!(loads(&["cron", "tick"]));
+    for a in [
+        &["cron", "list"][..],
+        &["cron", "status"],
+        &["cron", "create", "@daily", "x"],
+        &["cron", "pause", "j"],
+        &["cron", "remove", "j"],
+        &["cron", "runs"],
+        &["config", "check"],
+        &["hook", "list"],
+        &["sandbox", "list"],
+        &["approvals", "list"],
+        &["run", "hi"],
+    ] {
+        assert!(!loads(a), "{a:?}");
+    }
+    // The gate itself is unchanged: all of `cron` is still on the skip list,
+    // so no PROJECT config is ever loaded for it.
+    assert_eq!(policy(&["cron", "run", "j"]), GatePolicy::Skip);
+    assert_eq!(policy(&["cron", "tick"]), GatePolicy::Skip);
+}
+
 #[test]
 fn only_interactive_cli_commands_may_prompt() {
     assert_eq!(policy(&["run", "hi"]), GatePolicy::MayPrompt);
