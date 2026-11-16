@@ -11,7 +11,7 @@
 //! job sets it). The sessions directory and the consumers are process-wide and
 //! set once here; the refusal side is `command_sandbox_sessions_refused.rs`.
 
-#![cfg(unix)]
+#![cfg(all(unix, feature = "shell-tools"))]
 
 #[path = "support/test_dir.rs"]
 mod test_dir;

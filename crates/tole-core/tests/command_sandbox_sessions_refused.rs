@@ -8,7 +8,7 @@
 //! (bubblewrap)` job sets `TOLE_REQUIRE_BWRAP=1`). Process-wide settings are
 //! set once here, so this is its own test target.
 
-#![cfg(unix)]
+#![cfg(all(unix, feature = "shell-tools"))]
 
 use serde_json::json;
 use std::path::PathBuf;
