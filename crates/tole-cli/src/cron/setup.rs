@@ -134,21 +134,22 @@ pub fn pin_profile(profile: &Profile, workdir: &Path) -> Result<BTreeMap<String,
 
 /// The user config (`None` when there is none).
 pub fn user_config() -> Result<Option<Config>, String> {
-    let Some(path) = crate::config::user_config_path() else {
+    user_config_at(crate::config::user_config_path().as_deref())
+}
+
+/// [`user_config`] for a given path. Only a plainly absent file is none: one
+/// that cannot be inspected is an error (#864) with the path on one line and
+/// the ways out, as everywhere else.
+fn user_config_at(path: Option<&Path>) -> Result<Option<Config>, String> {
+    let Some(path) = path else {
         return Ok(None);
     };
-    // `exists()` would read an I/O error as "no config" (#864): only an
-    // absent path is none, anything else fails closed.
-    match path.try_exists() {
-        Ok(true) => crate::config::load(&path)
-            .map(Some)
-            .map_err(|e| e.to_string()),
-        Ok(false) => Ok(None),
-        Err(e) => Err(format!(
-            "cannot inspect the user config {} ({e})",
-            path.display()
-        )),
+    if !crate::config::user_config_present(path)? {
+        return Ok(None);
     }
+    crate::config::load(path)
+        .map(Some)
+        .map_err(|e| e.to_string())
 }
 
 /// Resolve profile `name` from the user config, the way `--profile` does.
@@ -307,6 +308,27 @@ mod tests {
     use crate::test_dir::TestDir;
     fn tmp(tag: &str) -> TestDir {
         TestDir::new(&format!("tole-cron-setup-{tag}"))
+    }
+
+    /// #864: the cron reader of the user config fails closed on a path it
+    /// cannot inspect, with a one-line path and the ways out (a newline in
+    /// `CODECORA_HOME` must not forge a stderr line); a missing file is none.
+    #[test]
+    fn user_config_at_fails_closed_with_a_single_line_path() {
+        let d = tmp("ucfg");
+        assert_eq!(user_config_at(None), Ok(None));
+        assert_eq!(user_config_at(Some(&d.join("absent.toml"))), Ok(None));
+        let file = d.join("evil\nforged: line");
+        std::fs::write(&file, "x").unwrap();
+        let e = user_config_at(Some(&file.join("config.toml"))).unwrap_err();
+        assert_eq!(e.lines().count(), 1, "{e:?}");
+        assert!(
+            e.contains("cannot inspect the user config")
+                && e.contains("--no-config")
+                && e.contains("CODECORA_HOME")
+                && e.contains("evil\\nforged"),
+            "{e}"
+        );
     }
 
     fn skill(root: &Path, name: &str, body: &str) -> PathBuf {
