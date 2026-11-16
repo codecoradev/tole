@@ -475,3 +475,18 @@ under `required` approval (the default), in every run including cron and
 SHA into the local directory. That needs the `uteke skill` Cloud API, which
 cannot be verified offline; until then a third-party skill is placed in a
 skills directory by the owner and approved with its source stated.
+
+## Audit (#600 slice 3b)
+
+**`tole plugin audit [name] [--json]`** is the read-only report of §4.5. Per
+server: tier, lock state, approved manifest hash against the live one (the
+server is started exactly as `list` would, never one the lock refuses, never
+under an agent session), binary integrity, secret grants, the sandbox profile
+approved and in force, the scanner's findings (of the live list, or of the
+approval's stored snapshot when nothing was started) and the last three
+`sandbox_fallback` events of the plugin ledger. Per skill: status (approved,
+approved but unrecorded in the skill ledger, changed since approval, refused
+by the ledger, not approved), the approved hash against the one on disk, the
+stated source and the last ledger lines. It prints no tool text beyond scanner
+findings. Every string is redacted, terminal-safe and put on one line. It
+writes nothing.

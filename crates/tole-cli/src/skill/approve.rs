@@ -279,6 +279,57 @@ pub fn source_text(s: Option<&Source>) -> String {
     tole_core::plugin_lock::terminal_safe(&out).replace(['\n', '\t'], " ")
 }
 
+/// One audit row (`tole plugin audit`) per discovered skill: status, the
+/// package hash on disk against the approved one, the stated source and the
+/// last ledger lines. Read-only; unreadable approvals or ledger are an error.
+pub fn audit_rows(ws: Option<&Path>) -> Result<Vec<serde_json::Value>, String> {
+    let path = Approvals::default_path()
+        .ok_or("the CodeCora home is unresolvable (set CODECORA_HOME or HOME)")?;
+    audit_rows_at(ws, &path)
+}
+
+fn audit_rows_at(ws: Option<&Path>, path: &Path) -> Result<Vec<serde_json::Value>, String> {
+    use tole_core::skill_approval as sa;
+    let approvals = Approvals::load(path)?;
+    let ledger = sa::read_ledger(path)?;
+    let check = sa::check_against_ledger(&approvals, &ledger);
+    let unrecorded = check.unrecorded;
+    let blocked: std::collections::BTreeMap<String, String> = check.blocked.into_iter().collect();
+    let mut rows = Vec::new();
+    for name in tole_core::skills::skill_names(ws) {
+        let pkg = read_package(ws, &name);
+        let approved = approvals.skills.get(&name);
+        let status = match (&pkg, approved) {
+            (Err(e), _) => format!("unreadable: {e}"),
+            (Ok(_), Some(_)) if blocked.contains_key(&name) => {
+                format!("refused: approval ignored, {}", blocked[&name])
+            }
+            (Ok(p), Some(a)) if a.hash == p.hash && unrecorded.contains(&name) => {
+                "approved, unrecorded in the ledger (loads; approve again to record it)".to_string()
+            }
+            (Ok(p), Some(a)) if a.hash == p.hash => "approved".to_string(),
+            (Ok(_), Some(_)) => "changed since approval: refused until approved again".to_string(),
+            (Ok(_), None) => "not approved: refused".to_string(),
+        };
+        rows.push(serde_json::json!({
+            "name": name,
+            "status": status,
+            "hash": pkg.as_ref().ok().map(|p| p.hash.clone()),
+            "approved_hash": approved.map(|a| a.hash.clone()),
+            "approved_at": approved.map(|a| format_time(a.approved_at)),
+            "source": approved.and_then(|a| a.source.clone()),
+            "source_text": source_text(approved.and_then(|a| a.source.as_ref())),
+            "history": sa::ledger_history(&ledger, &name, 3)
+                .into_iter()
+                .map(|(at, event, hash)| serde_json::json!({
+                    "at": format_time(at), "event": event, "hash": hash,
+                }))
+                .collect::<Vec<_>>(),
+        }));
+    }
+    Ok(rows)
+}
+
 /// Whether the owner consents to approving a package with hash `hash`:
 /// `--hash` must match it; without `--hash` an interactive owner is asked
 /// (`ask` returns their answer) and a non-interactive run is refused.
@@ -633,7 +684,7 @@ mod tests {
     }
 
     /// An approval the ledger never names still loads, but is said so once
-    /// at load; a torn last ledger line is repaired by the
+    /// at load and in the audit; a torn last ledger line is repaired by the
     /// next append; a hash with a newline cannot make a two-line note.
     #[test]
     fn unrecorded_approvals_are_reported_a_torn_tail_is_repaired_and_notes_stay_one_line() {
@@ -646,6 +697,14 @@ mod tests {
         assert!(g.load(Some(&dir), "demo").is_ok(), "still loads");
         assert_eq!(notes.len(), 1, "{notes:?}");
         assert!(notes[0].contains("not in the skill ledger"), "{notes:?}");
+        let rows = audit_rows_at(Some(&dir), &path).unwrap();
+        assert!(
+            rows[0]["status"]
+                .as_str()
+                .unwrap()
+                .starts_with("approved, unrecorded"),
+            "{rows:?}"
+        );
         // A crash cut the ledger mid-line: the next record starts a new line.
         let ledger = dir.join(tole_core::skill_approval::LEDGER_FILE);
         std::fs::write(&ledger, "{\"v\":1,\"kind\":\"skill\",\"event\":\"app").unwrap();
@@ -710,8 +769,11 @@ mod tests {
         let (g, notes) = gate(&path);
         assert!(g.load(Some(&dir), "demo").is_err(), "must stay revoked");
         assert!(notes[0].contains("approval ignored"), "{notes:?}");
-        let shown = status_line(Some(&dir), "demo", &load_checked(&path).unwrap().0);
-        assert!(shown.starts_with("demo  not approved"), "{shown}");
+        let rows = audit_rows_at(Some(&dir), &path).unwrap();
+        assert!(
+            rows[0]["status"].as_str().unwrap().starts_with("refused"),
+            "{rows:?}"
+        );
         // A fresh approval is recorded and loads again; a drifted file does not.
         record(
             &path,
@@ -721,13 +783,12 @@ mod tests {
         assert!(gate(&path).0.load(Some(&dir), "demo").is_ok());
         std::fs::write(dir.join("skills/demo/extra.md"), "drift").unwrap();
         assert!(gate(&path).0.load(Some(&dir), "demo").is_err());
-        let shown = status_line(Some(&dir), "demo", &load_checked(&path).unwrap().0);
-        assert!(shown.contains("changed since approval"), "{shown}");
-        let kept = load_checked(&path).unwrap().0;
-        assert_eq!(
-            kept.skills["demo"].source.as_ref().unwrap().sha,
-            Some(sha())
-        );
+        let rows = audit_rows_at(Some(&dir), &path).unwrap();
+        assert!(rows[0]["status"]
+            .as_str()
+            .unwrap()
+            .contains("changed since approval"));
+        assert_eq!(rows[0]["source"]["sha"], serde_json::json!(sha()));
         // An unreadable ledger fails startup instead of meaning "no history".
         let bad = dir.join("bad");
         std::fs::create_dir_all(bad.join(tole_core::skill_approval::LEDGER_FILE)).unwrap();

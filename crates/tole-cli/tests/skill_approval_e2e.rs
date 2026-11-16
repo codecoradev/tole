@@ -224,11 +224,11 @@ fn required_approval_lists_unapproved_skills_by_name_only() {
 }
 
 /// #600: a third-party skill is approved with its stated source and a ledger
-/// line; `tole skills list` shows it; a revoke is in the append-only
+/// line; `tole plugin audit` reports it; a revoke is in the append-only
 /// ledger and a hand-restored approvals file does not bring the skill back;
 /// a file changed after approval is refused.
 #[test]
-fn a_pinned_skill_keeps_its_source_and_the_ledger_outranks_the_approvals_file() {
+fn a_pinned_skill_is_audited_and_the_ledger_outranks_the_approvals_file() {
     let (url, seen) = spawn_mock();
     let home = tmpdir();
     let work = tmpdir();
@@ -283,11 +283,14 @@ fn a_pinned_skill_keeps_its_source_and_the_ledger_outranks_the_approvals_file() 
         !ledger.contains("body of ext"),
         "no skill text in the ledger"
     );
-    let list = text(&finish(cmd(&work, &home, &url, None, &["skills", "list"])).stdout);
-    assert!(
-        list.contains("ext  approved") && list.contains(&format!("pinned {sha}")),
-        "{list}"
-    );
+    // `plugin` exists only with the `mcp` feature.
+    if cfg!(feature = "mcp") {
+        let audit = text(&finish(cmd(&work, &home, &url, None, &["plugin", "audit"])).stdout);
+        assert!(
+            audit.contains("skill ext  approved") && audit.contains(&format!("pinned {sha}")),
+            "{audit}"
+        );
+    }
     // Loads while approved; refused after the file drifts (unattended run).
     let o = finish(cmd(&work, &home, &url, None, &["run", "hi"]));
     assert!(o.status.success(), "{}", text(&o.stderr));
@@ -297,8 +300,19 @@ fn a_pinned_skill_keeps_its_source_and_the_ledger_outranks_the_approvals_file() 
         "---\nname: ext\ndescription: \"d\"\n---\nswapped",
     )
     .unwrap();
-    let list = text(&finish(cmd(&work, &home, &url, None, &["skills", "list"])).stdout);
-    assert!(list.contains("changed since approval"), "{list}");
+    if cfg!(feature = "mcp") {
+        let audit = text(
+            &finish(cmd(
+                &work,
+                &home,
+                &url,
+                None,
+                &["plugin", "audit", "--json"],
+            ))
+            .stdout,
+        );
+        assert!(audit.contains("changed since approval"), "{audit}");
+    }
     let o = finish(cmd(&work, &home, &url, None, &["run", "hi"]));
     assert!(
         !system_of(&seen, 1).contains("ext —"),
