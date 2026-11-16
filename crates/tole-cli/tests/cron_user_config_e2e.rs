@@ -230,19 +230,31 @@ fn a_broken_user_config_fails_cron_run_closed_but_not_cron_list() {
     let o = e.tole(&["cron", "run", "j"]);
     assert!(!o.status.success(), "{}", text(&o.stdout));
     assert!(
+        text(&o.stderr).contains("config"),
+        "the error stays loud on stderr: {}",
+        text(&o.stderr)
+    );
+    assert!(
         !e.work.join("ran-marker").exists() && seen.lock().unwrap().is_empty(),
         "nothing ran and the provider was never called"
     );
     let o = e.tole(&["cron", "tick"]);
     assert!(!o.status.success(), "tick fails closed too");
+    assert!(
+        text(&o.stderr).contains("config"),
+        "and says why: {}",
+        text(&o.stderr)
+    );
     let o = e.tole(&["cron", "list"]);
     assert!(o.status.success(), "list still works: {}", text(&o.stderr));
 }
 
-/// A project config in the job's directory never configures cron: it would
-/// be a repository deciding how the host runs its own jobs.
+/// REGRESSION GUARD (it passes with and without the #863 fix, on purpose): a
+/// project config in the job's directory never configures cron, because it
+/// would be a repository deciding how the host runs its own jobs. It keeps the
+/// fix from loading the project layer by accident.
 #[test]
-fn a_project_config_is_never_read_for_cron() {
+fn regression_guard_a_project_config_is_never_read_for_cron() {
     let (url, _seen) = spawn_mock();
     let e = Env::new(&url);
     e.create_run_job();
@@ -256,5 +268,30 @@ fn a_project_config_is_never_read_for_cron() {
     assert!(
         e.work.join("ran-marker").exists(),
         "the project file was not read (a parse error would have stopped the run)"
+    );
+}
+
+/// An OS cron launches `tole cron tick` every minute and mails whatever it
+/// prints to stderr (MAILTO): with a valid user config and no terminal a
+/// successful `tick` or `run` must say nothing about the config. (A terminal
+/// still gets the `using user config` line like `tole run`; the harness has no
+/// pty, so that side is the line in `config::apply`.) That the config is still
+/// loaded while quiet is `cron_run_applies_the_owner_sandbox_consumers`, which
+/// also runs without a terminal.
+#[test]
+fn a_successful_tick_or_run_with_a_valid_user_config_is_silent_on_stderr() {
+    let (url, _seen) = spawn_mock();
+    let e = Env::new(&url);
+    e.user_config("[sandbox.consumers]\nnetwork = \"none\"\n");
+    let o = e.tole(&["cron", "tick"]);
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    assert_eq!(text(&o.stderr), "", "tick: nothing for MAILTO to mail");
+    e.create_run_job();
+    let o = e.tole(&["cron", "run", "j"]);
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    assert!(
+        !text(&o.stderr).contains("using user config"),
+        "run: {}",
+        text(&o.stderr)
     );
 }

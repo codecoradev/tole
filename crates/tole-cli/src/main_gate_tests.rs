@@ -24,16 +24,29 @@ fn skip_list_is_config_upgrade_approvals() {
 #[test]
 fn only_cron_run_and_tick_load_the_user_config_among_the_skip_list() {
     let loads = |a: &[&str]| runs_cron_jobs(&parse(a).command);
-    assert!(loads(&["cron", "run", "j"]));
-    assert!(loads(&["cron", "tick"]));
+    // EVERY `CronAction` variant is listed (`runs_cron_jobs` has no wildcard
+    // arm, so a new variant does not compile until it is classified there;
+    // this list is the matching decision record): the two that execute jobs...
+    for a in [&["cron", "run", "j"][..], &["cron", "tick"]] {
+        assert!(loads(a), "{a:?} executes jobs");
+    }
+    // ...and the nine that only edit or read files.
     for a in [
-        &["cron", "list"][..],
+        &["cron", "create", "@daily", "x"][..],
+        &["cron", "edit", "j"],
+        &["cron", "list"],
         &["cron", "status"],
-        &["cron", "create", "@daily", "x"],
+        &["cron", "cancel", "j"],
         &["cron", "pause", "j"],
+        &["cron", "resume", "j"],
         &["cron", "remove", "j"],
         &["cron", "runs"],
-        &["config", "check"],
+    ] {
+        assert!(!loads(a), "{a:?} only edits files");
+    }
+    // Other skip-list commands and the normal ones never load it here.
+    for a in [
+        &["config", "check"][..],
         &["hook", "list"],
         &["sandbox", "list"],
         &["approvals", "list"],

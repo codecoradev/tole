@@ -914,10 +914,21 @@ enum GatePolicy {
 fn runs_cron_jobs(cmd: &Command) -> bool {
     #[cfg(feature = "shell-tools")]
     if let Command::Cron { action } = cmd {
-        return matches!(
-            action,
-            tole_cli::cron::CronAction::Run { .. } | tole_cli::cron::CronAction::Tick { .. }
-        );
+        use tole_cli::cron::CronAction as A;
+        // No wildcard: a new `cron` subcommand must decide here whether it
+        // executes jobs (and so needs the owner's policy) or only edits files.
+        return match action {
+            A::Run { .. } | A::Tick { .. } => true,
+            A::Create { .. }
+            | A::Edit { .. }
+            | A::List
+            | A::Status
+            | A::Cancel { .. }
+            | A::Pause { .. }
+            | A::Resume { .. }
+            | A::Remove { .. }
+            | A::Runs { .. } => false,
+        };
     }
     let _ = cmd;
     false
@@ -1124,9 +1135,17 @@ fn dispatch(cli: Cli) -> Result<()> {
         if (policy == GatePolicy::Skip && !runs_cron_jobs(&cli.command)) || cli.no_config {
             None
         } else {
+            // `tole cron tick` is what an OS cron launches: a `using user config`
+            // line on every successful run would be one mail a minute under
+            // MAILTO. Without a terminal on stderr the line is dropped for the
+            // two job-running commands; an error is never dropped.
+            let quiet = runs_cron_jobs(&cli.command) && {
+                use std::io::IsTerminal;
+                !std::io::stderr().is_terminal()
+            };
             config_apply::load_user_config(
                 tole_cli::config::user_config_path().as_deref(),
-                &mut config_apply::StartupIo::new(false),
+                &mut config_apply::StartupIo::new(false).quiet_inform(quiet),
             )?
         };
     let cfg = match (project_config, user_config) {
