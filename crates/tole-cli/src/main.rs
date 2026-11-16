@@ -906,6 +906,34 @@ enum GatePolicy {
     NoPrompt,
 }
 
+/// The subcommands that EXECUTE cron jobs in this process (`cron run`,
+/// `cron tick`): they load the user layer (never the project config) although
+/// `cron` is on the config skip list, because a job's agent run and script
+/// must see the owner's policy (#863). The rest of `cron` only edits files and
+/// keeps working when the config is broken.
+fn runs_cron_jobs(cmd: &Command) -> bool {
+    #[cfg(feature = "shell-tools")]
+    if let Command::Cron { action } = cmd {
+        use tole_cli::cron::CronAction as A;
+        // No wildcard: a new `cron` subcommand must decide here whether it
+        // executes jobs (and so needs the owner's policy) or only edits files.
+        return match action {
+            A::Run { .. } | A::Tick { .. } => true,
+            A::Create { .. }
+            | A::Edit { .. }
+            | A::List
+            | A::Status
+            | A::Cancel { .. }
+            | A::Pause { .. }
+            | A::Resume { .. }
+            | A::Remove { .. }
+            | A::Runs { .. } => false,
+        };
+    }
+    let _ = cmd;
+    false
+}
+
 fn gate_policy(cmd: &Command) -> GatePolicy {
     match cmd {
         Command::Config { .. }
@@ -1099,14 +1127,27 @@ fn dispatch(cli: Cli) -> Result<()> {
         }
     };
     // User config (#433): same commands, same `--no-config`; no trust gate.
-    let user_config = if policy == GatePolicy::Skip || cli.no_config {
-        None
-    } else {
-        config_apply::load_user_config(
-            tole_cli::config::user_config_path().as_deref(),
-            &mut config_apply::StartupIo::new(false),
-        )?
-    };
+    // The commands that execute cron jobs read it too even though they are on
+    // the skip list (#863): their agent runs and scripts need the owner's
+    // sandbox, consumers, secret release and sensitive files like `tole run`.
+    // A user config that does not parse stops them here (fail closed).
+    let user_config =
+        if (policy == GatePolicy::Skip && !runs_cron_jobs(&cli.command)) || cli.no_config {
+            None
+        } else {
+            // `tole cron tick` is what an OS cron launches: a `using user config`
+            // line on every successful run would be one mail a minute under
+            // MAILTO. Without a terminal on stderr the line is dropped for the
+            // two job-running commands; an error is never dropped.
+            let quiet = runs_cron_jobs(&cli.command) && {
+                use std::io::IsTerminal;
+                !std::io::stderr().is_terminal()
+            };
+            config_apply::load_user_config(
+                tole_cli::config::user_config_path().as_deref(),
+                &mut config_apply::StartupIo::new(false).quiet_inform(quiet),
+            )?
+        };
     let cfg = match (project_config, user_config) {
         (None, None) => None,
         (p, u) => {

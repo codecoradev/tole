@@ -1253,6 +1253,9 @@ pub struct Loaded {
 /// the prompt/protocol channel).
 pub struct StartupIo {
     pub allow_prompt: bool,
+    /// Drop the informational `using ... config` lines (warnings and errors
+    /// still go to stderr). For a command an OS cron launches (#863).
+    quiet_inform: bool,
     inner: StdIo,
 }
 
@@ -1260,8 +1263,15 @@ impl StartupIo {
     pub fn new(allow_prompt: bool) -> Self {
         StartupIo {
             allow_prompt,
+            quiet_inform: false,
             inner: StdIo,
         }
+    }
+
+    /// The same io without the informational lines when `quiet` is true.
+    pub fn quiet_inform(mut self, quiet: bool) -> Self {
+        self.quiet_inform = quiet;
+        self
     }
 }
 
@@ -1270,7 +1280,9 @@ impl ConfigTrustIo for StartupIo {
         self.allow_prompt && self.inner.is_interactive()
     }
     fn inform(&mut self, text: &str) {
-        self.inner.inform(text)
+        if !self.quiet_inform {
+            self.inner.inform(text)
+        }
     }
     fn warn(&mut self, text: &str) {
         self.inner.warn(text)

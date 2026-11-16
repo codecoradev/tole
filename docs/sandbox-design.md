@@ -503,6 +503,15 @@ before (third slice). Every consumer is off by default; the owner decided
 `verify` and `turnend` become sandboxed by default later (§9.4, migration),
 and nothing here changes their defaults.
 
+The owner's `[sandbox]`, `[sandbox.consumers]`, `[secrets]` and
+`[sensitive_files]` apply to a cron AGENT run (its MCP servers, `run_command`,
+`job_start`, verify and stop gates) the same as to `tole run`, since #863:
+`tole cron run` and `tole cron tick` execute jobs in the process, so they load
+the user config even though `cron` is on the config skip list (never the
+project config; a user config that does not parse stops them, it does not run
+the job with defaults). The other `cron` subcommands, which only edit files,
+still skip it. A cron SCRIPT job is not sandboxed yet (third slice).
+
 ```toml
 [sandbox.consumers]            # user config only; every key optional
 run_command = "required"       # "off" (default) | "optional" | "required"
