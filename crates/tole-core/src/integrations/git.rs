@@ -46,8 +46,14 @@
 //!   With no consumer on, hooks and config behave as they always did.
 //!
 //!   Residuals (documented in the design note): a still-running sandboxed
-//!   process (a `job_start` from an earlier turn, a long command) can write the
-//!   config between the vet and the run of a later call; the next call refuses.
+//!   process (a `job_start` from an earlier turn, a long command) that writes
+//!   the config between the vet and the spawn can get that SAME call to execute
+//!   it (the spawned git re-reads the config after the vet; later calls
+//!   refuse); the window is narrow and there is no cheap fix for wildcard keys.
+//!   A sandbox-written `.gitattributes` or `.git/info/attributes` with
+//!   `* filter=lfs` triggers the OWNER's global `filter.lfs.*` command (the
+//!   program is the owner's, its input is attacker-influenced); `gc.autodetach`
+//!   can leave a detached `git maintenance run --auto` that outlives the vet.
 //!   An owner (global) config `include.path` that points at a workspace file is
 //!   the owner's own choice and is not vetted; `GIT_CONFIG_NOSYSTEM=1` drops
 //!   `/etc/gitconfig` (safe.directory, credential helpers, user.*), so a
