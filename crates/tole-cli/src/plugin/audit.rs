@@ -26,6 +26,15 @@ use super::cmd::{collect, probe_listed, short, Ctx, Listing};
 
 /// Ledger events shown per server or skill.
 const LAST_EVENTS: usize = 3;
+/// Most characters of a ledger-derived `profile` or `reason` shown.
+const MAX_LEDGER_TEXT: usize = 300;
+
+fn capped(v: &Value) -> Value {
+    match v.as_str() {
+        Some(s) => Value::String(s.chars().take(MAX_LEDGER_TEXT).collect()),
+        None => Value::Null,
+    }
+}
 
 /// The last `sandbox_fallback` events of `server` in `ledger`, oldest first.
 fn fallbacks(ledger: &str, server: &str) -> Vec<Value> {
@@ -38,8 +47,8 @@ fn fallbacks(ledger: &str, server: &str) -> Vec<Value> {
         .map(|v| {
             json!({
                 "at": v["at"].as_u64().map(format_time),
-                "profile": v["profile"],
-                "reason": v["reason"],
+                "profile": capped(&v["profile"]),
+                "reason": capped(&v["reason"]),
             })
         })
         .collect();

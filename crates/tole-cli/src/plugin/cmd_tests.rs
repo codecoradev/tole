@@ -1920,6 +1920,33 @@ fn audit_starts_nothing_the_lock_would_refuse_and_scans_the_snapshot() {
     assert!(e.contains("neither configured nor"), "{e}");
 }
 
+/// A hash from a hand-edited lock that is not ASCII must not panic the
+/// report (`short` cut bytes), and an over-long ledger reason is capped.
+#[test]
+fn audit_survives_non_ascii_hashes_and_caps_ledger_text() {
+    let h = H::new("audit-utf8", &["cora"]);
+    let weird = "é".repeat(30);
+    let lock = json!({"version": 2, "servers": {"cora": {"source": "stdio:true",
+        "version": "1.0", "manifest_hash": weird}}});
+    std::fs::write(h.user(), lock.to_string()).unwrap();
+    let ledger = h.user().with_file_name(plugin_lock::LEDGER_FILE);
+    let long = json!({"v": 1, "kind": "plugin", "event": "sandbox_fallback",
+        "server": "cora", "profile": "p", "reason": "r".repeat(2000), "at": 1});
+    std::fs::write(&ledger, format!("{long}\n")).unwrap();
+    let out = audit_text(&h, &|_| v1());
+    assert!(out.contains("manifest approved"), "{out}");
+    let r = audit_json(&h, &|_| v1(), None);
+    let reason = r["servers"][0]["sandbox_fallbacks"][0]["reason"]
+        .as_str()
+        .unwrap();
+    assert_eq!(reason.chars().count(), 300);
+    // `list` shares the helper.
+    assert!(!h
+        .run(&v1(), PluginAction::List { json: false })
+        .unwrap()
+        .is_empty());
+}
+
 /// A server name from a hand-edited lock cannot inject into the report.
 #[test]
 fn audit_is_terminal_safe_for_names_from_the_lock() {

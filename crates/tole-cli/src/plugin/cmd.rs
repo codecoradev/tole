@@ -155,8 +155,13 @@ pub(super) fn trusted_tier(name: &str, entry: Option<&LockEntry>, first_party: &
     }
 }
 
+/// The first 19 characters of a hash (`sha256:` and 12 digits). Cut at a
+/// character boundary: a hash from a hand-edited file may not be ASCII.
 pub(super) fn short(hash: &str) -> &str {
-    &hash[..hash.len().min(19)]
+    match hash.char_indices().nth(19) {
+        Some((i, _)) => &hash[..i],
+        None => hash,
+    }
 }
 
 /// Runs `action`; the text to print, or the error (exit 1).
