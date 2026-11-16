@@ -454,8 +454,8 @@ servers; `[sandbox.consumers]` is not touched by either.
   and `Admission` checks run as before.
 - Logged: one startup line and a `tole doctor` line say that a flag
   overrode the config (mode or profile it replaced), and doctor lists the
-  grants of the effective policy. Lazy start is section 9.1.2; not built:
-  the profile name and hash in the lock entry.
+  grants of the effective policy. Lazy start is section 9.1.2; the profile
+  name and hash in the lock entry are built (section 6.1).
 
 ## 7. Default profiles
 
@@ -788,8 +788,10 @@ file_size_mb = 4096            # 1 to 1048576, largest file a process writes
   network, every extra `read` / `write` path, and the decision (sandboxed,
   unsandboxed because there is no backend and the mode is `optional`, or
   refused). A grant that touches `$HOME` (marked `REFUSED`, it is never bound)
-  or a credential directory (`.ssh`, `.gnupg`, `.aws`, `.azure`, `.kube`,
-  `.docker`, `.netrc`, `.config/gcloud`; marked `SENSITIVE`) is flagged on its line.
+  or a credential location (`.ssh`, `.gnupg`, `.aws`, `.azure`, `.kube`,
+  `.docker`, `.netrc`, `.config/gcloud`, `.config/gh`, `.config/glab-cli`,
+  `.config/op`, `.password-store`, `.npmrc`, `.pypirc`, `.cargo/credentials`,
+  `.cargo/credentials.toml`; marked `SENSITIVE`) is flagged on its line.
 - **Residual.** What is protected is what existed at launch, and only what
   is listed above:
   - A `.git` or `.tole` that did not exist at launch is not protected (an
@@ -1129,11 +1131,14 @@ profile). The result is cached for the process.
 | Mode | Sandbox works | Sandbox unavailable |
 |---|---|---|
 | `required` | runs inside | **not started**: a startup line names the server, the reason and the remedy (install bubblewrap, or set `mode = "optional"` in the user config); its tools are not registered; a call to one returns the same message |
-| `optional` | runs inside | runs **unsandboxed**, with a warning at every start and a ledger entry; refused for unverified servers and, by owner decision 2, in unattended runs. Refused too when its approval recorded a sandbox profile and the wrapper cannot be built now (a granted path gone, #848): `ProfileChanged` |
+| `optional` | runs inside | runs **unsandboxed**, with a warning (once per server and process, §11) and a `sandbox_fallback` plugin-ledger line (once per server and session; §11); refused for unverified servers and, by owner decision 2, in unattended runs. Refused too when its approval recorded a sandbox profile and the wrapper cannot be built now (a granted path gone, #848): `ProfileChanged` |
 | `off` | runs unsandboxed | runs unsandboxed |
 
-A consumer in `[sandbox.consumers]` behaves as `required`: the command is
-refused with the reason, never run unsandboxed. A sandbox that starts but
+A consumer in `[sandbox.consumers]` set to `required` (and `verify`, `turnend`
+and `cron`, which are always unattended, so `optional` counts as `required`)
+refuses the command with the reason, never runs it unsandboxed; `run_command`
+and `job_start` set to `optional` run unsandboxed with a warning only while a
+human is attached. A sandbox that starts but
 whose program fails (missing path, denied network) is an ordinary error
 of that program, with tole's note naming the profile.
 
@@ -1144,15 +1149,51 @@ Names only, never values or argument contents:
 - At startup (stderr, and `tole doctor`): backend and version, or why
   none is available; each stdio server with its mode and profile name. The
   server line is logged once per server and process, the first time it
-  starts: `sandboxed`, `unsandboxed` (no backend, `optional`, a human
+  starts: `sandboxed` (with the name of the profile the server runs in and
+  the first 12 hex digits of its hash, `sha256:<12 hex>`; the full hash is in
+  the lock and the ledger), `unsandboxed` (no backend, `optional`, a human
   attached), or refused (`required`, or `optional` in an unattended run).
-- Per start (session log entry): server or consumer name, profile name,
-  profile hash, sandboxed or not and why.
-- Per proxy refusal: profile name and host name.
-- Per `optional` fallback: a ledger entry (server name, reason).
-- Never: environment values, granted secret values, file contents, the
-  full bwrap argument list (it holds local paths; available with
-  `--verbose` only).
+  The line is one line: a control or invisible character in a name or reason
+  is shown as a visible escape.
+- Per approval (plugin ledger, `sandbox_profile` line, #750): server name,
+  profile name and profile hash, or none for an unsandboxed approval. There
+  is no per-start session-log entry: a start is not a decision of the owner,
+  and the session log is the conversation's record.
+- Per proxy refusal: profile name and host name (with the proxy, §8, not
+  built).
+- Per `optional` fallback of an MCP server: a `sandbox_fallback` line in the
+  plugin ledger (`plugin-ledger.jsonl`, next to the lock), appended when the
+  server is admitted and starts unwrapped: `server`, `profile` and
+  `profile_hash` (the configured profile, the one that did not apply),
+  `reason` (one line, at most 300 characters, the cause the warning names),
+  `at`. One line per server and session (not per restart), a new line after
+  what is there, never a change to an earlier one; no check reads it as an
+  approval, a revoke or a profile record. It is written only where the launch
+  really falls back (mode `optional`, a human attached, no working backend or
+  a wrapper that cannot be built), never for `required`, a skipped or remote
+  server, or an unattended run, which refuses instead. The reason is decided
+  from the lock's `source` string split on whitespace (as the profile check
+  does), so for a server with a quoted argument that holds a space it can
+  differ from the launch's own reason.
+- Per `optional` fallback of a command consumer (`run_command`, `job_start`):
+  the warning on stderr, once per process and tool, and the `tole doctor`
+  line only. No ledger or session entry, on purpose: a command consumer has
+  no ledger (the plugin ledger is the record of approved MCP servers; the cron
+  ledger belongs to the scheduler, and cron runs are unattended, so they never
+  fall back), and the session log is written by the turn loop, which a tool
+  does not reach through the `Tool` trait. Adding either would be new
+  machinery for a state the owner already sees in the warning and in doctor.
+- With `TOLE_VERBOSE=1` (the existing verbose switch of #435; there is no
+  `--verbose` flag): the command line of each sandboxed launch, to stderr
+  only, one line, never into the session log or the ledger. An MCP server's is
+  printed at its first start in the process, a consumer's at every command.
+  It is redacted: the values of the process's secret set in all their
+  encodings, and the value of a flag whose name is secret-shaped (`--token x`,
+  `--api-key=x`) or of a `NAME=VALUE` argument with a secret-shaped name
+  (`API_KEY=x`, `-e API_KEY=x`, `--env=API_KEY=x`); a secret tole does not know under an innocent flag name is
+  not recognised, so treat the line as local diagnostics.
+- Never (outside that verbose line): environment values, granted secret
+  values, file contents, the full bwrap argument list (it holds local paths).
 
 ## 12. Cost
 

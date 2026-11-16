@@ -540,3 +540,162 @@ fn an_approved_server_is_blocked_when_the_sandbox_cannot_be_applied_any_more() {
     assert!(note.contains("sandbox profile"), "{note}");
     assert!(gone.check("srv", "stdio:true", "1", &tools()).is_err());
 }
+
+/// The `sandbox_fallback` lines of `server` in the ledger.
+fn fallbacks(user: &Path, server: &str) -> Vec<serde_json::Value> {
+    ledger(user)
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v["event"] == "sandbox_fallback" && v["server"] == server)
+        .collect()
+}
+
+/// A gate with `mode`, backend `avail` and `srv` approved the way the
+/// session approves it now (unsandboxed when nothing applies).
+fn approved_gate(
+    tag: &str,
+    mode: tole_core::sandbox::Mode,
+    avail: tole_core::sandbox::Availability,
+    source: &str,
+) -> (TestDir, PathBuf, TestDir) {
+    let dir = tmp(tag);
+    let user = dir.join(plugin_lock::LOCK_FILE);
+    let ws = tmp(&format!("{tag}-ws"));
+    let mut p = policy(tole_core::sandbox::Network::None);
+    p.mode = mode;
+    let mut gate = Gate::load(Some(user.clone()), &ws)
+        .with_policy(Some(p))
+        .with_backend(avail);
+    let id = gate.live_profile("srv", source);
+    gate.approve_with(
+        "srv",
+        source,
+        "1",
+        &tools(),
+        Approval {
+            sandbox: id.as_ref().map(|i| i.name.clone()),
+            sandbox_hash: id.map(|i| i.hash),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    (dir, user, ws)
+}
+
+#[test]
+fn an_optional_fallback_is_recorded_once_per_gate_after_the_existing_ledger() {
+    use tole_core::sandbox::{Availability, Mode};
+    let gone = || Availability::Unavailable("bubblewrap (bwrap) is not on PATH".into());
+    let (_d, user, ws) = approved_gate("fb-optional", Mode::Optional, gone(), "stdio:true");
+    let before = ledger(&user);
+    let mut p = policy(tole_core::sandbox::Network::None);
+    p.mode = Mode::Optional;
+    let want = p.profile_id("srv").unwrap();
+    let load = || {
+        Gate::load(Some(user.clone()), &ws)
+            .with_policy(Some(p.clone()))
+            .with_backend(gone())
+    };
+    let gate = load();
+    assert!(gate.check("srv", "stdio:true", "1", &tools()).is_ok());
+    // A restart of the same server in the same session adds nothing.
+    assert!(gate.check("srv", "stdio:true", "1", &tools()).is_ok());
+    let after = ledger(&user);
+    assert!(
+        after.starts_with(&before),
+        "append-only: earlier lines are untouched"
+    );
+    let lines = fallbacks(&user, "srv");
+    assert_eq!(lines.len(), 1, "{after}");
+    let v = &lines[0];
+    assert_eq!(v["kind"], "plugin");
+    assert_eq!(v["profile"], want.name.as_str());
+    assert_eq!(v["profile_hash"], want.hash.as_str());
+    assert_eq!(v["reason"], "bubblewrap (bwrap) is not on PATH");
+    assert!(v["at"].as_u64().unwrap() > 0);
+    // The line holds names, a hash, a reason and a time: nothing else.
+    for k in v.as_object().unwrap().keys() {
+        assert!(
+            [
+                "v",
+                "kind",
+                "event",
+                "server",
+                "profile",
+                "profile_hash",
+                "reason",
+                "at"
+            ]
+            .contains(&k.as_str()),
+            "{k}"
+        );
+    }
+    // A new session (a new gate) records its own fallback.
+    assert!(load().check("srv", "stdio:true", "1", &tools()).is_ok());
+    assert_eq!(fallbacks(&user, "srv").len(), 2);
+}
+
+#[test]
+fn no_fallback_is_recorded_where_the_launch_is_not_one() {
+    use tole_core::sandbox::{Availability, Mode};
+    let gone = || Availability::Unavailable("bwrap is not on PATH".into());
+    // `required`: refused at launch, never run unsandboxed.
+    let (_d, user, ws) = approved_gate("fb-required", Mode::Required, gone(), "stdio:true");
+    let mut p = policy(tole_core::sandbox::Network::None);
+    p.mode = Mode::Required;
+    let gate = Gate::load(Some(user.clone()), &ws)
+        .with_policy(Some(p))
+        .with_backend(gone());
+    assert!(gate.check("srv", "stdio:true", "1", &tools()).is_ok());
+    assert!(fallbacks(&user, "srv").is_empty());
+    // A working backend: sandboxed, no fallback.
+    let (_d2, user2, ws2) = approved_gate("fb-usable", Mode::Optional, usable(), "stdio:true");
+    let mut p = policy(tole_core::sandbox::Network::None);
+    p.mode = Mode::Optional;
+    let gate = Gate::load(Some(user2.clone()), &ws2)
+        .with_policy(Some(p.clone()))
+        .with_backend(usable());
+    assert!(gate.check("srv", "stdio:true", "1", &tools()).is_ok());
+    assert!(fallbacks(&user2, "srv").is_empty());
+    // Off, and an owner-skipped server: the sandbox was never asked for.
+    let (_d3, user3, ws3) = approved_gate("fb-off", Mode::Off, gone(), "stdio:true");
+    let mut off = p.clone();
+    off.mode = Mode::Off;
+    let gate = Gate::load(Some(user3.clone()), &ws3)
+        .with_policy(Some(off))
+        .with_backend(gone());
+    assert!(gate.check("srv", "stdio:true", "1", &tools()).is_ok());
+    assert!(fallbacks(&user3, "srv").is_empty());
+    let (_d4, user4, ws4) = approved_gate("fb-skip", Mode::Optional, gone(), "stdio:true");
+    let mut skip = p.clone();
+    skip.skip = vec!["srv".into()];
+    let gate = Gate::load(Some(user4.clone()), &ws4)
+        .with_policy(Some(skip))
+        .with_backend(gone());
+    assert!(gate.check("srv", "stdio:true", "1", &tools()).is_ok());
+    assert!(fallbacks(&user4, "srv").is_empty());
+    // A remote server is not a sandbox candidate.
+    let url = "https://x.example/mcp";
+    let (_d5, user5, ws5) = approved_gate("fb-http", Mode::Optional, gone(), url);
+    let gate = Gate::load(Some(user5.clone()), &ws5)
+        .with_policy(Some(p))
+        .with_backend(gone());
+    assert!(gate.check("srv", url, "1", &tools()).is_ok());
+    assert!(fallbacks(&user5, "srv").is_empty());
+}
+
+#[test]
+fn a_refused_admission_records_no_fallback() {
+    use tole_core::sandbox::{Availability, Mode};
+    let gone = || Availability::Unavailable("bwrap is not on PATH".into());
+    let (_d, user, ws) = approved_gate("fb-refused", Mode::Optional, gone(), "stdio:true");
+    let mut p = policy(tole_core::sandbox::Network::None);
+    p.mode = Mode::Optional;
+    let gate = Gate::load(Some(user.clone()), &ws)
+        .with_policy(Some(p))
+        .with_backend(gone());
+    let mut changed = tools();
+    changed[0].description.push_str(" changed");
+    assert!(gate.check("srv", "stdio:true", "1", &changed).is_err());
+    assert!(fallbacks(&user, "srv").is_empty());
+}

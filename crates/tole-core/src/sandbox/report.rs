@@ -7,6 +7,7 @@
 use super::command::{Consumer, Consumers};
 use super::{check_grant, Availability, Launch, Mode, Network, Policy, Profile, Workspace};
 use std::collections::HashSet;
+use std::ffi::OsString;
 use std::path::{Component, Path};
 use std::sync::Mutex;
 
@@ -53,7 +54,7 @@ fn mode_word(m: Mode) -> &'static str {
 /// inside a credential directory. `None` for anything else. Judged on the
 /// path as given and, when it resolves, on the resolved one too.
 pub fn sensitive_kind(path: &Path, home: Option<&Path>) -> Option<&'static str> {
-    const CREDS: [(&str, &str); 8] = [
+    const CREDS: [(&str, &str); 16] = [
         (".ssh", "ssh keys"),
         (".gnupg", "gpg keys"),
         (".aws", "aws credentials"),
@@ -62,6 +63,14 @@ pub fn sensitive_kind(path: &Path, home: Option<&Path>) -> Option<&'static str> 
         (".docker", "docker credentials"),
         (".netrc", "netrc credentials"),
         (".config/gcloud", "gcloud credentials"),
+        (".config/gh", "github cli credentials"),
+        (".config/glab-cli", "gitlab cli credentials"),
+        (".config/op", "1password cli credentials"),
+        (".password-store", "password store"),
+        (".npmrc", "npm credentials"),
+        (".pypirc", "pypi credentials"),
+        (".cargo/credentials", "cargo credentials"),
+        (".cargo/credentials.toml", "cargo credentials"),
     ];
     let judge = |p: &Path| -> Option<&'static str> {
         if let Some(h) = home {
@@ -193,22 +202,130 @@ pub fn doctor_grant_lines(
     out
 }
 
-/// The start-up line for one launch of server `name`. `None` when the
-/// sandbox is off (nothing to say).
+/// The first 12 hex digits of a `sha256:<hex>` profile hash, as the start-up
+/// line shows it. The full hash is in the lock and the ledger; this is enough
+/// to tell two profiles apart in a log.
+pub fn short_hash(hash: &str) -> String {
+    let hex = hash.strip_prefix("sha256:").unwrap_or(hash);
+    format!("sha256:{}", hex.chars().take(12).collect::<String>())
+}
+
+/// The start-up line for one launch of server `name`: one line, with every
+/// control and invisible character in it (a server or profile name from the
+/// config, a reason) shown as a visible escape. A sandboxed server's line
+/// names the profile IT runs in (its own binding, else the default) and the
+/// short hash of that profile's grants, the identity the lock and the ledger
+/// hold in full. `None` when the sandbox is off (nothing to say).
 pub fn startup_line(policy: Option<&Policy>, name: &str, launch: &Launch) -> Option<String> {
     let p = policy.filter(|p| p.mode != Mode::Off)?;
-    Some(match launch {
-        Launch::Sandboxed { .. } => format!(
-            "mcp[{name}]: sandboxed (profile {}, mode {})",
-            p.profile_name,
-            mode_word(p.mode)
-        ),
+    let line = match launch {
+        Launch::Sandboxed { .. } => {
+            let (profile_name, profile) = p.profile_for(name);
+            format!(
+                "mcp[{name}]: sandboxed (profile {profile_name} {}, mode {})",
+                short_hash(&profile.hash()),
+                mode_word(p.mode)
+            )
+        }
         Launch::Direct { warning: Some(w) } => w.clone(),
         Launch::Direct { warning: None } => {
             format!("mcp[{name}]: unsandboxed (listed in [sandbox] skip)")
         }
         Launch::Refused(why) => why.clone(),
-    })
+    };
+    Some(crate::sanitize::sanitize_one_line(&line))
+}
+
+/// The environment switch that makes the sandbox print the launch command
+/// line to stderr (`TOLE_VERBOSE=1`, the same switch as the probe notices).
+pub const VERBOSE_ENV: &str = "TOLE_VERBOSE";
+
+/// Whether a `TOLE_VERBOSE` value turns verbose output on.
+pub fn verbose_value(v: &str) -> bool {
+    matches!(v.trim(), "1" | "true" | "yes")
+}
+
+/// `argv` as one printable, single-line, redacted string for the verbose
+/// log. Redacted: every value of the process's secret set
+/// ([`crate::secrets::process_secrets`], in all its encodings), and the
+/// value of a flag whose NAME is secret-shaped
+/// ([`crate::secrets::is_secret_name`]: `--token x`, `--api-key=x`). Control
+/// and invisible characters are shown as visible escapes. A best-effort view
+/// for a human reading stderr: a secret tole does not know, passed under an
+/// innocent flag name, is not recognised.
+pub fn redact_argv(argv: &[OsString]) -> String {
+    redact_argv_with(argv, &crate::secrets::process_secrets())
+}
+
+const HIDDEN: &str = "<redacted>";
+
+fn redact_argv_with(argv: &[OsString], set: &crate::secrets::SecretSet) -> String {
+    // A secret-shaped NAME, with any leading dashes and `-` read as `_`.
+    let secret_name = |n: &str| {
+        let name = n.trim_start_matches('-');
+        !name.is_empty() && crate::secrets::is_secret_name(&name.replace('-', "_"))
+    };
+    let secret_flag = |flag: &str| flag.starts_with('-') && secret_name(flag);
+    // `NAME=VALUE` with a secret-shaped NAME, at the start or after another
+    // `=` (`API_KEY=x`, `--api-key=x`, `--env=API_KEY=x`): the value hidden.
+    fn assignment(text: &str, secret_name: &dyn Fn(&str) -> bool) -> Option<String> {
+        let (left, right) = text.split_once('=')?;
+        if secret_name(left) {
+            Some(format!("{left}={HIDDEN}"))
+        } else {
+            assignment(right, secret_name).map(|r| format!("{left}={r}"))
+        }
+    }
+    let mut hide_next = false;
+    let mut out = Vec::with_capacity(argv.len());
+    for a in argv {
+        let text = a.to_string_lossy();
+        let shown = if std::mem::take(&mut hide_next) {
+            HIDDEN.to_string()
+        } else if let Some(hidden) = assignment(&text, &secret_name) {
+            hidden
+        } else {
+            hide_next = secret_flag(&text);
+            set.redact(&text).into_owned()
+        };
+        let shown = crate::sanitize::sanitize_one_line(&shown);
+        let plain = !shown.is_empty()
+            && !shown.contains(|c: char| c.is_whitespace() || c == '\'' || c == '"');
+        out.push(if plain {
+            shown
+        } else {
+            format!("'{}'", shown.replace('\'', "'\\''"))
+        });
+    }
+    out.join(" ")
+}
+
+/// The verbose line for a sandboxed launch of `label` (a server or consumer
+/// name): one line, the command line redacted by [`redact_argv_with`].
+fn launch_argv_line(
+    label: &str,
+    program: &Path,
+    args: &[OsString],
+    set: &crate::secrets::SecretSet,
+) -> String {
+    let mut argv = vec![program.as_os_str().to_os_string()];
+    argv.extend(args.iter().cloned());
+    format!(
+        "{}: sandbox command line: {}",
+        crate::sanitize::sanitize_one_line(label),
+        redact_argv_with(&argv, set)
+    )
+}
+
+/// With `TOLE_VERBOSE=1`: prints the command line of a sandboxed launch of
+/// `label` (a server or consumer name) to stderr, redacted by
+/// [`redact_argv`]. Stderr only, never the session log. Nothing without the
+/// switch.
+pub fn log_launch_argv(label: &str, program: &Path, args: &[OsString]) {
+    if std::env::var(VERBOSE_ENV).is_ok_and(|v| verbose_value(&v)) {
+        let set = crate::secrets::process_secrets();
+        eprintln!("tole: {}", launch_argv_line(label, program, args, &set));
+    }
 }
 
 /// Logs [`startup_line`] to stderr once per server name and process (a
@@ -224,6 +341,9 @@ pub fn log_startup_once(name: &str, launch: &Launch) {
         .insert(name.to_string())
     {
         eprintln!("tole: {line}");
+        if let Launch::Sandboxed { program, args } = launch {
+            log_launch_argv(&format!("mcp[{name}]"), program, args);
+        }
     }
 }
 

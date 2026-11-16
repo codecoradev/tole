@@ -1304,6 +1304,8 @@ fn command_prepared(
             // command line is handed out.
             recheck_plan(workspace, &args)
                 .map_err(|why| format!("{}: not run, {why}", consumer.name()))?;
+            // `TOLE_VERBOSE=1`: the redacted command line, to stderr only.
+            super::report::log_launch_argv(consumer.name(), &program, &args);
             let mut c = Command::new(program);
             #[cfg(target_os = "linux")]
             if report {

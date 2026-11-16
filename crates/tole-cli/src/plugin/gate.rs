@@ -55,6 +55,9 @@ pub struct Gate {
     /// The workspace of the session: what a sandboxed server would bind, so
     /// the gate can tell whether a recorded sandbox can still be built.
     workspace: PathBuf,
+    /// Servers whose `optional` fallback this gate already put in the
+    /// ledger: one line per server and session, not one per restart.
+    fallback_noted: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 fn now() -> u64 {
@@ -95,6 +98,7 @@ impl Gate {
                     policy: tole_core::sandbox::session_policy(),
                     backend: None,
                     workspace: workspace.to_path_buf(),
+                    fallback_noted: Default::default(),
                 };
             }
         };
@@ -114,6 +118,7 @@ impl Gate {
             policy: tole_core::sandbox::session_policy(),
             backend: None,
             workspace: workspace.to_path_buf(),
+            fallback_noted: Default::default(),
         }
     }
 
@@ -190,9 +195,62 @@ impl Gate {
         if let Some(event) = event {
             self.record(event, server, &plugin_lock::manifest_hash(tools));
         }
+        if a == Admission::Trusted {
+            self.record_fallback(server, source);
+        }
         match a {
             Admission::Trusted => Ok(()),
             other => Err(refusal(server, &other)),
+        }
+    }
+
+    /// Puts an `optional` sandbox fallback in the ledger (#750, design §10):
+    /// `server`, admitted now, starts unsandboxed although the owner's config
+    /// sandboxes it (mode `optional`, a human attached, no working backend or
+    /// a wrapper that cannot be built). One `sandbox_fallback` line per
+    /// server and gate, appended after what is already there. Nothing for a
+    /// remote or skipped server, a sandboxed one, or where the launch is
+    /// refused instead (`required`, unattended): the decision is
+    /// [`tole_core::sandbox::fallback_reason`], the one [`tole_core::sandbox::plan`] agrees with.
+    ///
+    /// The command line is rebuilt from the lock `source` by splitting on
+    /// whitespace, as [`Gate::profile_check`] does (no parser of the real
+    /// launch is reusable from here): an argument with a space in it is
+    /// split, so the reason can differ from the launch's for such a server.
+    fn record_fallback(&self, server: &str, source: &str) {
+        let (Some(user), Some(policy)) = (self.user_path.as_deref(), self.policy.as_ref()) else {
+            return;
+        };
+        let Some(rest) = source.strip_prefix("stdio:") else {
+            return;
+        };
+        let mut parts = rest.split_whitespace();
+        let Some(command) = parts.next() else {
+            return;
+        };
+        let args: Vec<String> = parts.map(str::to_string).collect();
+        let Some(why) = tole_core::sandbox::fallback_reason(
+            policy,
+            &self.backend(),
+            tole_core::sandbox::unattended(),
+            &tole_core::sandbox::Env::current(Some(&self.workspace)),
+            (server, command, &args),
+        ) else {
+            return;
+        };
+        let Some(id) = policy.profile_id(server) else {
+            return;
+        };
+        let first = self
+            .fallback_noted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(server.to_string());
+        if first {
+            append(
+                user,
+                plugin_lock::fallback_ledger_line(server, &id.name, &id.hash, &why, now()),
+            );
         }
     }
 

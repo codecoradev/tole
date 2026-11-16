@@ -393,7 +393,9 @@ Bot and Nakama; BMAD for collaboration). Design notes:
     pieces: the doctor listing of sensitive grants and startup logging (#809),
     per-server and named profiles with the CLI (#810, in review), the profile
     name and hash in the plugin lock entry with re-approval on change (#750,
-    in review), and lazy start
+    in review), the profile hash in the startup line, the `sandbox_fallback`
+    ledger line of an `optional` fallback, `TOLE_VERBOSE=1` launch logging and
+    the wider credential list of the doctor listing (#750, in review), and lazy start
     with tool retrieval by meaning (no slice issue yet));
 
 Order that was followed: E4 #595 first (other epics reuse it), then E1,

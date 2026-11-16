@@ -380,6 +380,55 @@ fn optional_without_a_backend_runs_with_a_warning_only_when_attended() {
     ));
 }
 
+/// The ledger records a fallback exactly where `plan` takes one: for every
+/// mode, backend, attendance and skip state, `fallback_reason` is `Some` iff
+/// `plan` starts the server unwrapped with a warning, and it names the
+/// reason. In particular never for `required` or an unattended run.
+#[test]
+fn the_fallback_reason_agrees_with_plan_in_every_state() {
+    let env = Env {
+        path: Some("/usr/bin:/bin".into()),
+        home: Some("/home/o".into()),
+        data_dir: Some("/home/o/.codecora/tole".into()),
+        workspace: Some("/tmp".into()),
+    };
+    let mut fallbacks = 0;
+    for mode in [Mode::Off, Mode::Optional, Mode::Required] {
+        for avail in [usable(), gone()] {
+            for unattended in [false, true] {
+                for name in ["s", "cora"] {
+                    let p = policy(mode);
+                    let launched = plan(Some(&p), &avail, unattended, &env, (name, "sh", &[]));
+                    let reason = fallback_reason(&p, &avail, unattended, &env, (name, "sh", &[]));
+                    let fell_back = matches!(launched, Launch::Direct { warning: Some(_) });
+                    assert_eq!(
+                        reason.is_some(),
+                        fell_back,
+                        "{mode:?} {avail:?} unattended={unattended} {name}"
+                    );
+                    if fell_back {
+                        fallbacks += 1;
+                        assert_eq!(reason.as_deref(), Some("no bwrap"));
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(fallbacks, 1, "optional, no backend, attended, not skipped");
+    // A usable backend whose wrapper cannot be built still falls back in
+    // `optional` (plan does the same) and never in `required`.
+    let nowhere = ("s", "no-such-program-for-tole", &[][..]);
+    let optional = policy(Mode::Optional);
+    let why = fallback_reason(&optional, &usable(), false, &env, nowhere).unwrap();
+    assert!(why.contains("no-such-program-for-tole"), "{why}");
+    assert!(matches!(
+        plan(Some(&optional), &usable(), false, &env, nowhere),
+        Launch::Direct { warning: Some(_) }
+    ));
+    assert!(fallback_reason(&policy(Mode::Required), &usable(), false, &env, nowhere).is_none());
+    assert!(fallback_reason(&optional, &usable(), true, &env, nowhere).is_none());
+}
+
 #[cfg(unix)]
 fn env_for(t: &Tree, ws: &Path) -> Env {
     Env {
