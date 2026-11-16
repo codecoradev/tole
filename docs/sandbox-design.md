@@ -568,23 +568,46 @@ file_size_mb = 4096            # 1 to 1048576, largest file a process writes
 
   **The sessions directory (#866).** Sessions are append-only JSONL, and a
   command that could rewrite them would break resume, the audit and the cost
-  report. The default `.tole/sessions` is under `.tole`, so it is read-only
-  already. When the owner moved it (`-s`, the `sessions_dir` key) into the
-  workspace, the host tells the sandbox (`command::set_sessions_dir`, an
-  absolute path) and the SAME plan (`protect_plan`, re-checked at every launch by
-  `recheck_plan`) binds it read-only as one more protected path: a command can
-  read the entries but not write, create, rename, remove or replace anything in
-  it, while tole itself, a host process outside the sandbox, keeps writing
-  them. By the rules of `.tole`: it must be a real directory directly under the
-  workspace root (a deeper one could be moved away through its parent, which a
-  mount cannot prevent, and replaced by a planted copy tole then writes into:
-  refused, with the remedy `.tole/sessions`, `./sessions` or a directory outside
-  the workspace); a symbolic link, a file, the workspace itself, or a path that
-  reaches the workspace through a link is refused too; one outside the
-  workspace is not in the sandbox's view; one that does not exist yet is not
-  protected (like `.tole`; the session is created before the first command runs,
-  so in practice it exists). The refusal follows the consumer's policy like
-  every other refusal of the plan.
+  report. The default `.tole/sessions` under the sandbox's workspace root is
+  read-only already (it is under `.tole`). But the location is relative to the
+  working directory, and it can be moved (`-s`, the `sessions_dir` key), so it
+  can be inside the workspace without being under the workspace's own `.tole`:
+  with `--workspace /repo` started in `/repo/sub`, the sessions land in
+  `/repo/sub/.tole/sessions` and `job_start`, whose sandbox workspace is
+  `--workspace`, could write them (reproduced; `run_command` is not affected,
+  its workspace is the working directory). So the host always tells the
+  sandbox the EFFECTIVE directory (`command::set_sessions_dir`, an absolute
+  path; `serve`, `acp` and `mcp` keep sessions per session workspace and tell
+  it only an explicit `-s`) and the SAME plan (`protect_plan`, re-checked at
+  every launch by `recheck_plan`) binds it read-only as one more protected
+  path: a command can read the entries but not write, create, rename, remove or
+  replace anything in it, while tole itself, a host process outside the
+  sandbox, keeps writing them. By the rules of `.tole`: it must be a real
+  directory directly under the workspace root (a deeper one could be moved away
+  through its parent, which a mount cannot prevent, and replaced by a planted
+  copy tole then writes into: refused, with the remedy "run tole from the
+  workspace root, use `./sessions`, or a directory outside the workspace"); a
+  symbolic link, a file, the workspace itself, or a path that reaches the
+  workspace through a link is refused too; one outside the workspace is not in
+  the sandbox's view; one that does not exist yet is not protected (like
+  `.tole`; the session is created before the first command runs, so in
+  practice it exists); one under `.git`, `.tole` or `.tole-worktrees` adds
+  nothing. The path is resolved the way the operating system resolves it: the
+  parent chain by `canonicalize`, so a `..` that comes after a symbolic link
+  means the link target's parent and is NOT collapsed as text (collapsing it
+  named another directory than the host uses and protected nothing: reproduced
+  and fixed; the same was true of a gitdir file's target, the gitdir in effect
+  for the worktree registry and a linked worktree's back-pointer, which now use
+  the same resolution; `.gitmodules` paths cannot hold `..` at all). The refusal
+  follows the consumer's policy like every other refusal of the plan, and when
+  the directory cannot be told to the sandbox at all (the working directory is
+  unknown) the host does not start if a command sandbox is `required` or the
+  consumer is always unattended (verify, stop gates), and warns loudly for an
+  `optional` `run_command` or `job_start` with a human attached. API: the
+  function is set-once per process, so an embedder hosting several sessions
+  with different directories protects only the first, and one that never calls
+  it gets no protection for a sessions directory other than `.tole/sessions` of
+  the workspace root.
 
   **Nested gitdirs.** The owner's git also runs a nested repository's config
   and hooks when it is run in the OUTER repository (a planted

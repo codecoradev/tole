@@ -217,6 +217,13 @@ static SESSIONS_DIR: OnceLock<PathBuf> = OnceLock::new();
 /// inside the workspace but outside `.tole` is bound read-only like `.git` and
 /// `.tole` (see [`protect_plan`]). `dir` must be absolute. The same value
 /// again is fine; a different one is refused, like [`set_consumers`].
+///
+/// SET ONCE PER PROCESS: an embedder that hosts several sessions with different
+/// sessions directories protects only the first one it passes. NEVER CALLING it
+/// gives no protection to a sessions directory other than `.tole/sessions` of
+/// the sandbox's workspace root: there is no way for the sandbox to find the
+/// directory by itself. The `tole` binary calls it at start-up with the
+/// directory the command line and config resolve to.
 pub fn set_sessions_dir(dir: PathBuf) -> Result<(), String> {
     if !dir.is_absolute() {
         return Err(format!(
@@ -491,18 +498,45 @@ pub(crate) fn protect_plan_with(
     Ok(protect)
 }
 
+/// `p` resolved the way the operating system resolves it: symbolic links
+/// followed and a `..` that comes after a link taken in the link's target, not
+/// collapsed as text. Only the longest existing prefix can be resolved; the
+/// rest (which does not exist, so no command or host has anything there yet) is
+/// appended. `None` when a non-name component sits in the missing part.
+fn resolved(p: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+    let mut cur = p.to_path_buf();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        if let Ok(c) = std::fs::canonicalize(&cur) {
+            return Some(tail.iter().rev().fold(c, |acc, n| acc.join(n)));
+        }
+        match cur.components().next_back() {
+            Some(Component::Normal(n)) => tail.push(n.to_owned()),
+            _ => return None,
+        }
+        cur = cur.parent()?.to_path_buf();
+    }
+}
+
 /// The sessions directory part of [`protect_plan_with`] (#866).
 fn plan_sessions_dir(ws: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+    use std::path::Component;
     let shown = dir.display();
-    // The directory's PARENT is resolved (a working directory reached through a
-    // link is the same place); the directory itself is not: a link there is
-    // what a command could replace.
-    let dir = lexical(dir);
-    let dir = match (dir.parent(), dir.file_name()) {
-        (Some(parent), Some(name)) => std::fs::canonicalize(parent)
-            .map(|p| p.join(name))
-            .unwrap_or(dir),
-        _ => dir,
+    // The directory's PARENT is resolved by the operating system (a working
+    // directory reached through a link is the same place, and a `..` after a
+    // link means the link target's parent: collapsing it as text would name a
+    // different directory than the host uses); the directory itself is not
+    // resolved: a link there is what a command could replace.
+    let dir = match dir.components().next_back() {
+        Some(Component::Normal(name)) => {
+            let parent = dir.parent().unwrap_or(Path::new("/"));
+            match resolved(parent) {
+                Some(p) => p.join(name),
+                None => lexical(dir),
+            }
+        }
+        _ => resolved(dir).unwrap_or_else(|| lexical(dir)),
     };
     if !dir.starts_with(ws) {
         // Outside the workspace by name. A link that leads into it is the same
@@ -527,32 +561,32 @@ fn plan_sessions_dir(ws: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<()
     if out.iter().any(|p| dir.starts_with(p)) {
         return Ok(());
     }
-    if dir.parent() != Some(ws) {
-        return Err(format!(
-            "the sessions directory {shown} is deeper than a direct child of the workspace: a \
-             command could rename its parent and plant a copy that tole then writes into, and a \
-             mount cannot prevent that; use `.tole/sessions` (the default), a direct child such \
-             as ./sessions, or a directory outside the workspace"
-        ));
-    }
     match std::fs::symlink_metadata(&dir) {
-        Ok(m) if m.file_type().is_symlink() => Err(format!(
-            "the sessions directory {shown} is a symbolic link, which a mount cannot protect \
-             (the command could replace it); make it a real directory"
-        )),
-        Ok(m) if m.is_dir() => {
-            out.push(dir);
-            Ok(())
-        }
-        Ok(_) => Err(format!(
-            "the sessions directory {shown} is not a directory, so it cannot be protected"
-        )),
         // Not created yet: like `.tole`, nothing to bind (bubblewrap would
         // have to create the mount point in the real workspace).
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(format!(
             "cannot inspect the sessions directory {shown} ({e})"
         )),
+        Ok(m) if m.file_type().is_symlink() => Err(format!(
+            "the sessions directory {shown} is a symbolic link, which a mount cannot protect \
+             (the command could replace it); make it a real directory"
+        )),
+        Ok(m) if !m.is_dir() => Err(format!(
+            "the sessions directory {shown} is not a directory, so it cannot be protected"
+        )),
+        Ok(_) if dir.parent() != Some(ws) => Err(format!(
+            "the sessions directory {} is deeper than a direct child of the workspace: a \
+             command could rename its parent and plant a copy that tole then writes into, and a \
+             mount cannot prevent that; use `.tole/sessions` in the workspace root (run tole \
+             from there), a direct child such as ./sessions, or a directory outside the \
+             workspace",
+            dir.display()
+        )),
+        Ok(_) => {
+            out.push(dir);
+            Ok(())
+        }
     }
 }
 
@@ -669,10 +703,9 @@ fn effective_gitdir(ws: &Path) -> Result<Option<PathBuf>, String> {
     } else {
         ws.join(rel)
     };
-    let dir = lexical(&abs);
-    Ok(std::fs::symlink_metadata(&dir)
-        .is_ok_and(|m| m.is_dir())
-        .then_some(dir))
+    // The directory git on the host really reads (a `..` after a link takes
+    // the link target's parent, which collapsing the text would miss).
+    Ok(std::fs::canonicalize(&abs).ok().filter(|d| d.is_dir()))
 }
 
 /// Refuses a workspace that has a linked worktree (`git worktree add`) whose
@@ -726,21 +759,31 @@ fn refuse_linked_worktrees(ws: &Path) -> Result<(), String> {
         }
         let text = read_bounded(&back, 4096)?;
         let named = Path::new(text.trim());
-        let wt_git = lexical(&if named.is_absolute() {
+        let joined = if named.is_absolute() {
             named.to_path_buf()
         } else {
             e.path().join(named)
-        });
-        if wt_git.starts_with(ws)
-            && !wt_git.starts_with(&tole_wts)
-            && symlink_metadata(&wt_git).is_ok()
-        {
-            return Err(format!(
-                "the linked worktree at {} lies inside the workspace outside .tole-worktrees, \
-                 and the sandbox cannot protect its .git file; refused (remove it with git \
-                 worktree remove, or keep worktrees outside the workspace)",
-                wt_git.display()
-            ));
+        };
+        // Both names of the place: the text with `..` collapsed, and what the
+        // operating system resolves (a `..` after a link differs). Either one
+        // inside the workspace and outside `.tole-worktrees` is refused.
+        let mut names = vec![lexical(&joined)];
+        if let Ok(real) = std::fs::canonicalize(&joined) {
+            names.push(real);
+        }
+        for wt_git in names {
+            if wt_git.starts_with(ws)
+                && !wt_git.starts_with(&tole_wts)
+                && symlink_metadata(&wt_git).is_ok()
+            {
+                return Err(format!(
+                    "the linked worktree at {} lies inside the workspace outside \
+                     .tole-worktrees, and the sandbox cannot protect its .git file; refused \
+                     (remove it with git worktree remove, or keep worktrees outside the \
+                     workspace)",
+                    wt_git.display()
+                ));
+            }
         }
     }
     Ok(())
@@ -777,18 +820,20 @@ fn gitdir_target(ws: &Path, file: &Path) -> Result<Option<PathBuf>, String> {
     } else {
         file.parent().unwrap_or(ws).join(rel)
     };
-    // `..` and `.` resolved by text, to compare with the real path below.
+    // `..` and `.` resolved by text, to compare with what the operating system
+    // resolves (a `..` after a link takes the link target's parent: git on the
+    // host follows that, so the real path is canonicalized from `abs`, not from
+    // the collapsed text).
     let norm = lexical(&abs);
-    if !norm.starts_with(ws) {
-        return Ok(None);
-    }
-    match std::fs::canonicalize(&norm) {
-        Ok(real) if real == norm => Ok(Some(norm)),
-        Ok(_) => Err(format!(
-            "the gitdir {} points to ({}) passes through a symbolic link",
+    match std::fs::canonicalize(&abs) {
+        Ok(real) if real == norm => Ok(norm.starts_with(ws).then_some(norm)),
+        Ok(real) if real.starts_with(ws) || norm.starts_with(ws) => Err(format!(
+            "the gitdir {} points to ({}) passes through a symbolic link or a `..` that follows one",
             shown,
-            norm.display()
+            abs.display()
         )),
+        Ok(_) => Ok(None),
+        Err(_) if !norm.starts_with(ws) => Ok(None),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(format!(
             "the gitdir {shown} points to ({}) is inside the workspace and does not exist; \
              a command could create it",

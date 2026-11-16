@@ -1807,3 +1807,76 @@ fn a_sessions_dir_named_through_a_linked_parent_is_bound_by_its_real_path() {
         [ws.join(".git"), ws.join("sessions")]
     );
 }
+
+/// A `..` that comes after a symbolic link means the LINK TARGET's parent: the
+/// host (git, the session writer) resolves it that way, so collapsing it as
+/// text names a different directory and the plan would protect nothing.
+#[cfg(unix)]
+#[test]
+fn a_dotdot_after_a_link_is_resolved_by_the_os_not_collapsed_as_text() {
+    // base/out/lnk -> ws/a/b ; `-s base/out/lnk/../sessions` is ws/a/sessions,
+    // deeper than a direct child: refused (it used to be Ok with nothing bound).
+    let (_g, ws) = sess_ws("sess-dotdot", &["a/sessions", "a/b"]);
+    let out = tmp("sess-dotdot-out");
+    std::fs::create_dir_all(out.join("out")).unwrap();
+    std::os::unix::fs::symlink(ws.join("a/b"), out.join("out/lnk")).unwrap();
+    let named = out.join("out/lnk/../sessions");
+    let e = protect_plan_with(&ws, Some(&named)).unwrap_err();
+    assert!(e.contains("deeper than a direct child"), "{e}");
+    // The same trick naming a direct child is bound by its real path.
+    let (_g, ws) = sess_ws("sess-dotdot-ok", &["sessions", "x"]);
+    let out = tmp("sess-dotdot-ok-out");
+    std::os::unix::fs::symlink(ws.join("x"), out.join("lnk")).unwrap();
+    assert_eq!(
+        protect_plan_with(&ws, Some(&out.join("lnk/../sessions"))).unwrap(),
+        [ws.join(".git"), ws.join("sessions")]
+    );
+}
+
+/// The default location with no `.tole` yet and nothing created: no error (the
+/// `deeper` rule applies to a directory that exists).
+#[test]
+fn an_absent_default_sessions_dir_is_not_an_error() {
+    let (_g, ws) = sess_ws("sess-absent-default", &[]);
+    assert_eq!(
+        protect_plan_with(&ws, Some(&ws.join(".tole/sessions"))).unwrap(),
+        [ws.join(".git")]
+    );
+}
+
+/// The same `..` after a link, in the other places the plan reads a path from:
+/// a gitdir file's target, and a linked worktree's back-pointer.
+#[cfg(unix)]
+#[test]
+fn a_dotdot_after_a_link_in_a_gitdir_or_worktree_pointer_is_not_collapsed_either() {
+    // `.git` is a file: `gitdir: lnk/../gd`, lnk -> ws/b/c. Git resolves it to
+    // ws/b/gd (the real gitdir); as text it is ws/gd (a decoy that exists).
+    let (_g, ws) = keep("dotdot-gitdir");
+    for d in ["b/c", "b/gd/hooks", "gd/hooks"] {
+        std::fs::create_dir_all(ws.join(d)).unwrap();
+    }
+    for g in ["b/gd", "gd"] {
+        std::fs::write(ws.join(g).join("config"), "[core]\n").unwrap();
+    }
+    std::os::unix::fs::symlink(ws.join("b/c"), ws.join("lnk")).unwrap();
+    std::fs::write(ws.join(".git"), "gitdir: lnk/../gd\n").unwrap();
+    let e = protect_plan(&ws).unwrap_err();
+    assert!(
+        e.contains("symbolic link") && e.contains("lnk/../gd"),
+        "{e}"
+    );
+
+    // A linked worktree whose back-pointer reads `<ws>/lnk/../wt/.git`: the
+    // text is ws/wt/.git (absent), the real place is ws/b/wt/.git (inside the
+    // workspace, outside .tole-worktrees): refused like any linked worktree.
+    let (_g, ws) = sess_ws("dotdot-worktree", &["b/c", "b/wt", ".git/worktrees/w1"]);
+    std::fs::write(ws.join("b/wt/.git"), "gitdir: x\n").unwrap();
+    std::os::unix::fs::symlink(ws.join("b/c"), ws.join("lnk")).unwrap();
+    std::fs::write(
+        ws.join(".git/worktrees/w1/gitdir"),
+        format!("{}/lnk/../wt/.git\n", ws.display()),
+    )
+    .unwrap();
+    let e = protect_plan(&ws).unwrap_err();
+    assert!(e.contains("linked worktree"), "{e}");
+}

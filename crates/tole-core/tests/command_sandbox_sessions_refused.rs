@@ -2,7 +2,9 @@
 //! refuses the launch (the consumer is `required`), so nothing runs. A
 //! directory deeper than a direct child of the workspace could be renamed away
 //! through its parent and replaced by a planted copy that tole then writes
-//! into; a mount cannot prevent that, so the layout is refused.
+//! into; a mount cannot prevent that, so the layout is refused. The directory
+//! is named through a link and a `..` (resolved by the operating system, not
+//! collapsed as text).
 //!
 //! Needs a working `bwrap` (`SKIPPED:` line otherwise; CI's `Sandbox
 //! (bubblewrap)` job sets `TOLE_REQUIRE_BWRAP=1`). Process-wide settings are
@@ -26,6 +28,7 @@ fn ws() -> &'static PathBuf {
         let ws = base.join("ws");
         std::fs::create_dir_all(ws.join(".git/hooks")).unwrap();
         std::fs::create_dir_all(ws.join("a/sessions")).unwrap();
+        std::fs::create_dir_all(ws.join("a/b")).unwrap();
         std::fs::write(ws.join(".git/config"), "[core]\n").unwrap();
         let ws = std::fs::canonicalize(&ws).unwrap();
         std::env::set_var("HOME", ws.parent().unwrap());
@@ -44,7 +47,14 @@ fn ws() -> &'static PathBuf {
             },
         })
         .unwrap();
-        command::set_sessions_dir(ws.join("a/sessions")).unwrap();
+        // `-s base/out/lnk/../sessions` with lnk -> ws/a/b: the operating system
+        // resolves it to ws/a/sessions (the `..` after a link is the link
+        // target's parent), which is deeper than a direct child. Collapsing the
+        // `..` as text named `base/out/sessions` and protected nothing.
+        let out = ws.parent().unwrap().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        std::os::unix::fs::symlink(ws.join("a/b"), out.join("lnk")).unwrap();
+        command::set_sessions_dir(out.join("lnk/../sessions")).unwrap();
         ws
     })
 }

@@ -1327,18 +1327,62 @@ fn dispatch(cli: Cli) -> Result<()> {
     #[cfg_attr(not(feature = "shell-tools"), allow(unused_variables))]
     let sessions_dir_override = (settings.sessions_dir.source != config_apply::Source::Default)
         .then(|| PathBuf::from(settings.sessions_dir.value.clone()));
-    // A sessions directory the owner moved (flag or config key) is told to the
-    // command sandbox, which binds it read-only when it is inside the
-    // workspace (#866). The default is under `.tole`, always protected.
-    if let Some(dir) = &sessions_dir_override {
-        let abs = if dir.is_absolute() {
-            Some(dir.clone())
-        } else {
-            std::env::current_dir().ok().map(|cwd| cwd.join(dir))
+    // The EFFECTIVE sessions directory is told to the command sandbox, which
+    // binds it read-only when it is inside the workspace and refuses a layout it
+    // cannot protect (#866). Not only a moved one: the default `.tole/sessions`
+    // is relative to the working directory, and with `--workspace` naming a
+    // parent of it (cwd `/repo/sub`, workspace `/repo`) it is NOT under the
+    // workspace's own `.tole`, which `job_start` (whose sandbox workspace is
+    // `--workspace`) would leave writable. serve, acp and mcp keep sessions per
+    // session workspace unless `-s` moves them, so only an explicit one counts
+    // there. A directory already under `.tole` adds nothing to the plan.
+    {
+        let per_session_face = sandbox_flag_class(&cli.command).0;
+        let effective = match (&sessions_dir_override, per_session_face) {
+            (Some(dir), _) => Some(dir.clone()),
+            (None, false) => Some(sessions_dir.clone()),
+            (None, true) => None,
         };
-        if let Some(abs) = abs {
-            if let Err(e) = tole_core::sandbox::command::set_sessions_dir(abs) {
-                eprintln!("tole: warning: {e}");
+        if let Some(dir) = effective {
+            let told = if dir.is_absolute() {
+                Ok(dir)
+            } else {
+                std::env::current_dir()
+                    .map(|cwd| cwd.join(&dir))
+                    .map_err(|e| {
+                        format!(
+                            "cannot resolve the sessions directory {} against the working \
+                             directory ({e})",
+                            dir.display()
+                        )
+                    })
+            }
+            .and_then(tole_core::sandbox::command::set_sessions_dir);
+            if let Err(e) = told {
+                // Never fail open: where a command sandbox is required (or the
+                // consumer is always unattended: verify, stop gates) the run
+                // does not start; an `optional` run_command/job_start with a
+                // human attached gets a loud warning instead.
+                use tole_core::sandbox::Mode;
+                let c = tole_core::sandbox::command::consumers();
+                let needs_it = c.run_command == Mode::Required
+                    || c.job_start == Mode::Required
+                    || c.verify != Mode::Off
+                    || c.turnend != Mode::Off;
+                if needs_it {
+                    return Err(anyhow!(
+                        "{e}; refusing to start with a command sandbox that cannot protect the \
+                         sessions directory (set the sessions directory with -s to an absolute \
+                         path, or turn the consumer off)"
+                    ));
+                }
+                // Nothing sandboxed, nothing to say.
+                if c.run_command != Mode::Off || c.job_start != Mode::Off {
+                    eprintln!(
+                        "tole: warning: {e}: sandboxed commands are not kept from writing the \
+                         sessions directory"
+                    );
+                }
             }
         }
     }
