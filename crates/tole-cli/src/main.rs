@@ -1393,7 +1393,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             .and_then(tole_core::sandbox::command::set_sessions_dir);
             if let Err(e) = told {
                 // Never fail open: where a command sandbox is required (or the
-                // consumer is always unattended: verify, stop gates) the run
+                // consumer is always unattended: verify, stop gates, cron) the run
                 // does not start; an `optional` run_command/job_start with a
                 // human attached gets a loud warning instead.
                 use tole_core::sandbox::Mode;
@@ -1401,7 +1401,8 @@ fn dispatch(cli: Cli) -> Result<()> {
                 let needs_it = c.run_command == Mode::Required
                     || c.job_start == Mode::Required
                     || c.verify != Mode::Off
-                    || c.turnend != Mode::Off;
+                    || c.turnend != Mode::Off
+                    || c.cron != Mode::Off;
                 if needs_it {
                     return Err(anyhow!(
                         "{e}; refusing to start with a command sandbox that cannot protect the \

@@ -65,6 +65,7 @@ fn setup() -> &'static Setup {
             job_start: Mode::Required,
             verify: Mode::Required,
             turnend: Mode::Off,
+            cron: Mode::Off,
             network: Network::None,
             limits: LIMITS,
         })
