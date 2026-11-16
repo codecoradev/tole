@@ -19,12 +19,26 @@
 //! - ALWAYS `-c core.fsmonitor=false` (performance only, no feature lost: a
 //!   `core.fsmonitor` command in a repository config never runs here);
 //! - when any command consumer is on (`[sandbox.consumers]`), also
-//!   `-c core.hooksPath=<ws>/.git/hooks` (the read-only, owner-trusted hooks
-//!   directory; `/dev/null` when `.git` is not a real directory), so the
-//!   owner's installed hooks still run but a `core.hooksPath` that points at
-//!   scripts inside the writable workspace (husky style) does not;
-//!   `GIT_CONFIG_NOSYSTEM=1`; and `--no-ext-diff --no-textconv` for `diff`.
-//!   With no consumer on, hooks and the rest behave as they always did.
+//!   `-c core.hooksPath=<repo>/.git/hooks`, `GIT_CONFIG_NOSYSTEM=1`, and
+//!   `--no-ext-diff --no-textconv` for `diff`; and the tool REFUSES every op
+//!   unless a real `.git` directory enclosing the workdir was already there
+//!   when the tool was constructed at start-up (a repository a sandboxed
+//!   command created or replaced since is not trusted: its hooks, its
+//!   `filter.*.clean` and `gpg.program` in a config it wrote would run on the
+//!   host) and refuses a workdir that is itself a bare repository (git would
+//!   use it instead of the enclosing repository). The pinned `.git/hooks` is
+//!   read-only and owner-trusted only because of that snapshot (`.git` is
+//!   read-only for a sandboxed command, #849). With no consumer on, hooks and
+//!   the rest behave as they always did.
+//!
+//!   Residuals (owner choices, documented in the design note): the owner's own
+//!   hooks run workspace content (lint, make, npm test, a pre-commit framework
+//!   that runs files a sandboxed command may have modified); an owner config
+//!   `include.path` that points at a workspace file lets that file define
+//!   `filter.*.clean`, `gpg.program` or `core.sshCommand`, which then run on
+//!   the host through add and commit; `GIT_CONFIG_NOSYSTEM=1` drops
+//!   `/etc/gitconfig` (safe.directory, credential helpers, user.*, policy), so
+//!   a repository owned by another user can fail with "dubious ownership".
 
 use crate::subprocess::run_with_timeout;
 use crate::tool::{Risk, Tool};
@@ -180,11 +194,10 @@ fn consumers_on() -> bool {
         .any(|k| c.mode(*k) != crate::sandbox::Mode::Off)
 }
 
-/// The hooks directory to pin when hardened: `<repo>/.git/hooks` of the
-/// nearest enclosing repository when its `.git` is a REAL directory (not a
-/// file or a link: a link or a gitdir file could lead anywhere), else `None`
-/// (hooks off, `/dev/null`).
-fn pinned_hooks_dir(workdir: Option<&Path>) -> Option<PathBuf> {
+/// The `.git` directory of the nearest enclosing repository when it is a
+/// REAL directory (not a file or a link: a link or a gitdir file could lead
+/// anywhere), else `None`. Its `hooks` is the directory pinned when hardened.
+fn real_git_dir(workdir: Option<&Path>) -> Option<PathBuf> {
     let start = match workdir {
         Some(d) => d.to_path_buf(),
         None => std::env::current_dir().ok()?,
@@ -193,7 +206,7 @@ fn pinned_hooks_dir(workdir: Option<&Path>) -> Option<PathBuf> {
     for dir in start.ancestors() {
         let git = dir.join(".git");
         match std::fs::symlink_metadata(&git) {
-            Ok(m) if m.is_dir() => return Some(git.join("hooks")),
+            Ok(m) if m.is_dir() => return Some(git),
             Ok(_) => return None,
             Err(_) => continue,
         }
@@ -228,12 +241,26 @@ pub(crate) fn invocation(
     out
 }
 
+/// Whether `dir` looks like a bare repository (`HEAD`, `objects/`, `refs/`) with
+/// no `.git` of its own: git run there uses it as the repository, not the
+/// enclosing one.
+fn looks_bare(dir: &Path) -> bool {
+    dir.join("HEAD").is_file()
+        && dir.join("objects").is_dir()
+        && dir.join("refs").is_dir()
+        && std::fs::symlink_metadata(dir.join(".git")).is_err()
+}
+
 /// Light git tool. cwd = the repo checkout (jail root for paths is the
 /// same cwd the file tools use).
 #[derive(Debug, Clone)]
 pub struct GitTool {
     pub bin: PathBuf,
     pub workdir: Option<PathBuf>,
+    /// The real `.git` directory that enclosed the workdir when the tool was
+    /// built (at start-up, before any sandboxed command ran): the only
+    /// repository trusted when a command consumer is on (see the module doc).
+    startup_git: Option<PathBuf>,
 }
 
 impl GitTool {
@@ -241,6 +268,41 @@ impl GitTool {
         Self {
             bin: PathBuf::from("git"),
             workdir: None,
+            startup_git: real_git_dir(None),
+        }
+    }
+
+    /// The `.git` directory to trust for this call when a command consumer is
+    /// on, or the reason to refuse: the workdir is a bare repository, no
+    /// repository existed at start-up, or it is not the one found now (swapped
+    /// for a link, a file or another directory).
+    fn trusted_git_dir(&self) -> Result<PathBuf, String> {
+        let wd = self.workdir.as_deref();
+        if let Some(d) = wd {
+            if looks_bare(d) {
+                return Err(format!(
+                    "git: refused: {} looks like a bare repository (HEAD, objects, refs) with no \
+                     .git, and git would use it instead of the enclosing repository; a command \
+                     sandbox is on, so the git tool does not run in it",
+                    d.display()
+                ));
+            }
+        }
+        match (&self.startup_git, real_git_dir(wd)) {
+            (Some(at_start), Some(now)) if *at_start == now => Ok(now),
+            (Some(_), _) => Err(
+                "git: refused: the .git directory of this workspace is not the one that was \
+                 there when the session started (it was replaced, or is no longer a real \
+                 directory); a command sandbox is on, so the git tool does not run in it"
+                    .into(),
+            ),
+            (None, _) => Err(
+                "git: refused: no git repository was present when the session started, and a \
+                 command sandbox is on: a repository a sandboxed command created could carry \
+                 hooks, filters and config that would run on the host through this tool. Create \
+                 the repository yourself, outside the sandbox, and restart the session"
+                    .into(),
+            ),
         }
     }
 
@@ -249,8 +311,12 @@ impl GitTool {
         self
     }
 
+    /// Sets the workdir and takes the start-up snapshot of its repository
+    /// (call this while building the tool, before any command runs).
     pub fn in_dir(mut self, dir: impl Into<PathBuf>) -> Self {
-        self.workdir = Some(dir.into());
+        let dir = dir.into();
+        self.startup_git = real_git_dir(Some(&dir));
+        self.workdir = Some(dir);
         self
     }
 
@@ -318,9 +384,11 @@ impl Tool for GitTool {
             return Err("git: arguments must not contain NUL bytes".into());
         }
         let hardened = consumers_on();
-        let hooks_dir = hardened
-            .then(|| pinned_hooks_dir(self.workdir.as_deref()))
-            .flatten();
+        let hooks_dir = if hardened {
+            Some(self.trusted_git_dir()?.join("hooks"))
+        } else {
+            None
+        };
         let mut cmd = Command::new(&self.bin);
         crate::subprocess::scrub_env_for(&mut cmd, "git");
         if hardened {
@@ -583,28 +651,41 @@ mod tests {
         );
     }
 
-    /// The pinned directory is `.git/hooks` of a REAL `.git` directory found
-    /// from the workdir upward; a gitdir file, a link or no repository pins none.
+    /// The trusted directory is the REAL `.git` directory found from the
+    /// workdir upward; a gitdir file, a link or no repository gives none.
     #[cfg(unix)]
     #[test]
-    fn the_pinned_hooks_directory_needs_a_real_git_directory() {
+    fn the_trusted_git_directory_needs_a_real_git_directory() {
         let d = crate::test_dir::TestDir::new("tole-git-pin");
         let root = std::fs::canonicalize(&*d).unwrap();
         // A monorepo subdirectory finds the enclosing repository.
         std::fs::create_dir_all(root.join("repo/.git")).unwrap();
         std::fs::create_dir_all(root.join("repo/sub/deeper")).unwrap();
         assert_eq!(
-            pinned_hooks_dir(Some(&root.join("repo/sub/deeper"))),
-            Some(root.join("repo/.git/hooks"))
+            real_git_dir(Some(&root.join("repo/sub/deeper"))),
+            Some(root.join("repo/.git"))
         );
         // A gitdir FILE (worktree, submodule): none.
         std::fs::create_dir_all(root.join("wt")).unwrap();
         std::fs::write(root.join("wt/.git"), "gitdir: /elsewhere\n").unwrap();
-        assert_eq!(pinned_hooks_dir(Some(&root.join("wt"))), None);
+        assert_eq!(real_git_dir(Some(&root.join("wt"))), None);
         // A symbolic link: none.
         std::fs::create_dir_all(root.join("lk")).unwrap();
         std::os::unix::fs::symlink(root.join("repo/.git"), root.join("lk/.git")).unwrap();
-        assert_eq!(pinned_hooks_dir(Some(&root.join("lk"))), None);
+        assert_eq!(real_git_dir(Some(&root.join("lk"))), None);
+    }
+
+    /// A directory with HEAD, objects and refs and no `.git` is a bare repository.
+    #[test]
+    fn a_bare_repository_is_recognised_only_without_a_git_entry() {
+        let d = crate::test_dir::TestDir::new("tole-git-bare");
+        assert!(!looks_bare(&d));
+        std::fs::write(d.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::create_dir_all(d.join("objects")).unwrap();
+        std::fs::create_dir_all(d.join("refs")).unwrap();
+        assert!(looks_bare(&d));
+        std::fs::create_dir_all(d.join(".git")).unwrap();
+        assert!(!looks_bare(&d), "a .git of its own makes it a work tree");
     }
 
     #[test]

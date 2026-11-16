@@ -1558,8 +1558,9 @@ pub fn doctor_lines_for(c: &Consumers, avail: &Availability, home: Option<&Path>
     if Consumer::ALL.iter().any(|k| c.mode(*k) != Mode::Off) {
         out.push(
             "sandbox consumers: git writes (add, commit) fail inside a sandboxed command (.git is \
-             read-only); the `git` tool runs outside it with core.fsmonitor off, hooks pinned to \
-             .git/hooks, no system gitconfig"
+             read-only); the `git` tool runs outside it with core.fsmonitor off, no system \
+             gitconfig and hooks pinned to the .git/hooks of a repository that existed when the \
+             session started (it refuses to run in any other)"
                 .into(),
         );
     }

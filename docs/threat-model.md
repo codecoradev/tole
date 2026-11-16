@@ -108,7 +108,7 @@ lives) / **gap** (tracked) / **N/A** (with rationale).
   repository containing it; in a monorepo subdirectory that includes
   modified files of sibling directories. This is not a jail escape: the
   jail (#247) applies to `add` pathspecs (no absolute paths, `..`, or
-  pathspec magic), and the whole git tool is `Risk::Write` (it runs on the host, so with a command consumer on its invocation is hardened: `core.hooksPath` pinned to the owner's `.git/hooks`, no system gitconfig, no external diff drivers; `core.fsmonitor` is always off; #748), so every call
+  pathspec magic), and the whole git tool is `Risk::Write` (it runs on the host, so with a command consumer on its invocation is hardened: `core.hooksPath` pinned to the `.git/hooks` of a repository that existed when the session started, no system gitconfig, no external diff drivers; `core.fsmonitor` is always off; and every op is REFUSED when no real `.git` directory existed at start-up, when it was swapped, or when the workdir is a bare repository, so a repository a sandboxed command created is never run on the host; residuals: the owner's own hooks run workspace content, an owner `include.path` that points at a workspace file can define `filter.*.clean`, `gpg.program` or `core.sshCommand`, and `GIT_CONFIG_NOSYSTEM=1` can cause "dubious ownership"; #748), so every call
   — reads included — goes through the approval gate.
 - **Injection residual** (above) — fences are a mitigation, not immunity;
   the model must still treat fenced content as data.

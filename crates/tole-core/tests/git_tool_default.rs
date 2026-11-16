@@ -21,6 +21,8 @@ fn host_git(dir: &Path, args: &[&str]) {
     let o = Command::new("git")
         .args(args)
         .current_dir(dir)
+        .env("HOME", dir)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
         .output()
         .expect("git on PATH");
     assert!(o.status.success(), "git {args:?}: {o:?}");
@@ -39,9 +41,6 @@ fn without_a_consumer_hooks_are_unchanged_and_fsmonitor_is_always_off() {
     let root = std::fs::canonicalize(&*dir).unwrap();
     let ws = root.join("ws");
     std::fs::create_dir_all(&ws).unwrap();
-    std::fs::create_dir_all(root.join("home")).unwrap();
-    std::env::set_var("HOME", root.join("home"));
-    std::env::set_var("GIT_CONFIG_NOSYSTEM", "1");
     host_git(&ws, &["init", "-q"]);
     host_git(&ws, &["config", "user.name", "t"]);
     host_git(&ws, &["config", "user.email", "t@t"]);

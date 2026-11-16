@@ -626,18 +626,36 @@ file_size_mb = 4096            # 1 to 1048576, largest file a process writes
   runs on the host, git would execute what the repository config and hooks name,
   so its invocation is hardened: ALWAYS `-c core.fsmonitor=false` (performance
   only), and when any command consumer is on (`[sandbox.consumers]`) also
-  `-c core.hooksPath=<repo>/.git/hooks` (the read-only, owner-trusted hooks
-  directory of the nearest enclosing repository, `/dev/null` when its `.git` is
-  not a real directory), `GIT_CONFIG_NOSYSTEM=1`, and `--no-ext-diff
-  --no-textconv` for `diff`. So the owner's own installed hooks (a pre-commit
-  review bot) still run, which a sandboxed command cannot change, while a
-  `core.hooksPath` that points at scripts INSIDE the writable workspace
-  (husky style) no longer runs on the host through the tool. Residual: a human
-  `git commit` in the same repository still runs those husky scripts (that is
-  the owner's own command), and a nested repository's own config is not looked
-  at by the pinned flags (see the residuals above). The `run_command` and
-  `job_start` summaries tell the model that git writes fail in the sandbox and
-  to use the `git` tool, and `tole doctor` says the same when a consumer is on.
+  `-c core.hooksPath=<repo>/.git/hooks`, `GIT_CONFIG_NOSYSTEM=1`, and
+  `--no-ext-diff --no-textconv` for `diff`. And with a consumer on the tool
+  REFUSES every op (status, diff, add, commit; an error that names the cause
+  and the way out) unless a real `.git` DIRECTORY enclosing its workdir was
+  already there when the tool was built at start-up (a snapshot taken in
+  `GitTool::new` / `in_dir`, not per call), still is the same real directory
+  (not swapped for a link, a file or another directory), and the workdir is not
+  itself a bare repository (`HEAD`, `objects/`, `refs/`, no `.git`: git would
+  use it instead of the enclosing one). Why: `protect_plan` cannot bind a
+  `.git` that does not exist at launch, so a sandboxed command in a workspace
+  with no repository could `git init`, write `.git/hooks/pre-commit`, a
+  `[filter "x"] clean=...` or `gpg.program` in `.git/config` and a
+  `.gitattributes`, and the host-side tool would run them; the snapshot means
+  only a repository that existed before any sandboxed command ran is trusted,
+  and the pinned `.git/hooks` is "read-only and owner-trusted" only for that
+  repository. A repository the owner creates mid-session is not used by the tool
+  until the session is restarted. Residuals, owner choices: (1) the owner's own
+  installed hooks run workspace content (lint, make, npm test, a pre-commit
+  framework that runs files a sandboxed command may have modified); (2) an owner
+  config `include.path` that points at a workspace file lets that file define
+  `filter.*.clean`, `gpg.program` or `core.sshCommand`, which then run on the
+  host through add and commit (not fixed with `GIT_CONFIG_GLOBAL` tricks); (3)
+  `GIT_CONFIG_NOSYSTEM=1` drops `/etc/gitconfig` (safe.directory, credential
+  helpers, user.*, policy), so a repository owned by another user can fail with
+  "dubious ownership" or a commit can fail for want of an identity; (4) a
+  human's own `git commit` still runs in-workspace hook scripts, and a nested
+  repository's own config is not covered by the pinned flags (see the residuals
+  above). The `run_command` and `job_start` summaries tell the model that git
+  writes fail in the sandbox and to use the `git` tool, and `tole doctor` says
+  the same when a consumer is on.
 
   **The sessions directory (#866).** Sessions are append-only JSONL, and a
   command that could rewrite them would break resume, the audit and the cost

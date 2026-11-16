@@ -29,6 +29,10 @@ fn host_git(dir: &Path, args: &[&str]) {
     let o = Command::new("git")
         .args(args)
         .current_dir(dir)
+        // No process-wide set_var (the tests run on several threads): the
+        // host git of the fixture gets its environment here.
+        .env("HOME", dir)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
         .output()
         .expect("git on PATH");
     assert!(o.status.success(), "git {args:?}: {o:?}");
@@ -56,10 +60,6 @@ fn repo() -> Repo {
     let dir = TestDir::new("tole-gittool-hard");
     let ws = std::fs::canonicalize(&*dir).unwrap().join("ws");
     std::fs::create_dir_all(&ws).unwrap();
-    let home = ws.parent().unwrap().join("home");
-    std::fs::create_dir_all(&home).unwrap();
-    std::env::set_var("HOME", &home);
-    std::env::set_var("GIT_CONFIG_NOSYSTEM", "1");
     host_git(&ws, &["init", "-q"]);
     host_git(&ws, &["config", "user.name", "t"]);
     host_git(&ws, &["config", "user.email", "t@t"]);
@@ -156,4 +156,145 @@ fn the_run_command_summary_points_at_the_git_tool_when_its_consumer_is_on() {
     );
     let j = tole_core::jobs::JobStartTool::new(w).summary();
     assert!(!j.contains("git tool"), "{j}");
+}
+
+/// What a sandboxed command with a writable workspace and no repository can do:
+/// `git init` there, plant a hook, a clean filter, a `gpg.program` and a
+/// `.gitattributes`, so that the HOST-side tool would run them. Returns the
+/// marker files each of them would create.
+fn plant_a_repository(ws: &Path) -> Vec<PathBuf> {
+    let root = ws.parent().unwrap();
+    let markers: Vec<PathBuf> = ["hook", "filter", "gpg"]
+        .iter()
+        .map(|n| root.join(format!("marker-planted-{n}")))
+        .collect();
+    host_git(ws, &["init", "-q"]);
+    host_git(ws, &["config", "user.name", "t"]);
+    host_git(ws, &["config", "user.email", "t@t"]);
+    script(
+        &ws.join(".git/hooks/pre-commit"),
+        &format!("touch {}", markers[0].display()),
+    );
+    script(
+        &ws.join("clean.sh"),
+        &format!("touch {}\ncat", markers[1].display()),
+    );
+    host_git(
+        ws,
+        &[
+            "config",
+            "filter.x.clean",
+            ws.join("clean.sh").to_str().unwrap(),
+        ],
+    );
+    std::fs::write(ws.join(".gitattributes"), "* filter=x\n").unwrap();
+    script(
+        &ws.join("gpg.sh"),
+        &format!("touch {}\nexit 1", markers[2].display()),
+    );
+    host_git(
+        ws,
+        &["config", "gpg.program", ws.join("gpg.sh").to_str().unwrap()],
+    );
+    host_git(ws, &["config", "commit.gpgsign", "true"]);
+    markers
+}
+
+fn consumers_on() {
+    command::set_consumers(Consumers {
+        run_command: Mode::Required,
+        ..Consumers::default()
+    })
+    .unwrap();
+}
+
+/// The gap: no repository at the workspace root when the session starts, then a
+/// sandboxed command makes one. The tool (built at start-up) must refuse every
+/// op with a clear reason, and nothing the planted repository names may run.
+#[test]
+fn a_repository_created_after_start_up_is_not_trusted_and_nothing_fires() {
+    consumers_on();
+    let dir = TestDir::new("tole-gittool-planted");
+    let ws = std::fs::canonicalize(&*dir).unwrap().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    // Start-up: the tool is built while there is no repository.
+    let tool = GitTool::new().in_dir(&ws);
+    // A sandboxed-style step plants one.
+    std::fs::write(ws.join("f.txt"), "one\n").unwrap();
+    let markers = plant_a_repository(&ws);
+    for input in [
+        json!({"op": "status"}),
+        json!({"op": "diff"}),
+        json!({"op": "add", "paths": ["f.txt"]}),
+        json!({"op": "commit", "message": "x"}),
+    ] {
+        let e = tool.execute(input.clone()).unwrap_err();
+        assert!(
+            e.contains("git: refused: no git repository was present when the session started")
+                && e.contains("restart the session"),
+            "{input}: {e}"
+        );
+    }
+    for m in &markers {
+        assert!(!m.exists(), "{} fired on the host", m.display());
+    }
+    // Nothing was staged or committed either.
+    let log = Command::new("git")
+        .args(["log", "--oneline"])
+        .current_dir(&ws)
+        .output()
+        .unwrap();
+    assert!(!log.status.success(), "no commit exists");
+}
+
+/// The bare variant: the workdir is itself a bare repository (HEAD, objects,
+/// refs, config, no `.git`) while an enclosing repository existed at start-up:
+/// git would use the bare one, so the tool refuses.
+#[test]
+fn a_workdir_that_is_a_bare_repository_is_refused() {
+    consumers_on();
+    let dir = TestDir::new("tole-gittool-bare");
+    let root = std::fs::canonicalize(&*dir).unwrap();
+    host_git(&root, &["init", "-q", "-b", "main"]);
+    let bare = root.join("sub");
+    std::fs::create_dir_all(bare.join("objects")).unwrap();
+    std::fs::create_dir_all(bare.join("refs")).unwrap();
+    std::fs::write(bare.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    std::fs::write(bare.join("config"), "[core]\n\tbare = true\n").unwrap();
+    let tool = GitTool::new().in_dir(&bare);
+    for input in [
+        json!({"op": "status"}),
+        json!({"op": "diff"}),
+        json!({"op": "add", "paths": ["f.txt"]}),
+        json!({"op": "commit", "message": "x"}),
+    ] {
+        let e = tool.execute(input.clone()).unwrap_err();
+        assert!(e.contains("looks like a bare repository"), "{input}: {e}");
+    }
+}
+
+/// A `.git` that was a real directory at start-up and is later swapped for a
+/// link (or something else) is refused per call.
+#[test]
+fn a_git_directory_swapped_after_start_up_is_refused() {
+    consumers_on();
+    let dir = TestDir::new("tole-gittool-swap");
+    let root = std::fs::canonicalize(&*dir).unwrap();
+    let ws = root.join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    host_git(&ws, &["init", "-q"]);
+    let tool = GitTool::new().in_dir(&ws);
+    // Works while it is the same real directory.
+    tool.execute(json!({"op": "status"})).unwrap();
+    // Swapped for a link to another repository.
+    let other = root.join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    host_git(&other, &["init", "-q"]);
+    std::fs::rename(ws.join(".git"), root.join("moved-git")).unwrap();
+    std::os::unix::fs::symlink(other.join(".git"), ws.join(".git")).unwrap();
+    let e = tool.execute(json!({"op": "status"})).unwrap_err();
+    assert!(
+        e.contains("not the one that was there when the session started"),
+        "{e}"
+    );
 }
