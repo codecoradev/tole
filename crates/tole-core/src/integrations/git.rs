@@ -26,9 +26,18 @@
 //!     for a commit made through this tool, the owner's own pre-commit and
 //!     commit-msg included (a human's own `git commit` still runs them);
 //!   - the git process gets an ALLOWLIST environment (`hardened_env`), not the
-//!     tole process's: `PATH` (absolute entries only), locale, `TZ`, `TERM`,
-//!     the temp dir, `HOME` from the account's passwd entry (never `$HOME`)
-//!     and `GIT_TERMINAL_PROMPT=0`. `GIT_CONFIG_GLOBAL|SYSTEM|COUNT|KEY_n|
+//!     tole process's: locale, `TZ`, `TERM`, `HOME` from the account's passwd
+//!     entry (never `$HOME`) and `GIT_TERMINAL_PROMPT=0`; `GIT_AUTHOR_*`,
+//!     `GIT_COMMITTER_*`, `USER`, `LOGNAME` and `TMPDIR` are dropped (identity
+//!     comes from config or passwd, git uses `/tmp`). The git binary and its
+//!     `PATH` are FIXED (`trusted_launch`): `git` is looked up in
+//!     `/usr/local/bin`, `/usr/bin`, `/bin` and `/opt/homebrew/bin` only,
+//!     never in the inherited `PATH` (a sandboxed command that starts tole
+//!     sets it) and never under the workdir, the temp dir or a home; that
+//!     list is also the `PATH` for git's helpers; an embedder with git
+//!     elsewhere uses `GitTool::with_bin` with an absolute path, the CLI
+//!     has no setting (link git into a trusted directory). No descriptor
+//!     above stderr is inherited. `GIT_CONFIG_GLOBAL|SYSTEM|COUNT|KEY_n|
 //!     VALUE_n|PARAMETERS`, `XDG_CONFIG_HOME`, `GIT_EXEC_PATH`, `GIT_ATTR_SOURCE`,
 //!     `GIT_PAGER`, `GIT_SSH*`, ... inherited from a tole started by a
 //!     sandboxed command cannot reach git: the vet reads one file, so any
@@ -62,10 +71,10 @@
 //!   `* filter=lfs` triggers the OWNER's global `filter.lfs.*` command (the
 //!   program is the owner's, its input is attacker-influenced); `gc.autodetach`
 //!   can leave a detached `git maintenance run --auto` that outlives the vet.
-//!   The allowlist keeps `PATH` (absolute entries only: a program the owner's
-//!   config names is found where the owner's `PATH` says) and takes `HOME` from
-//!   the passwd database, so a process run with another `$HOME` uses the
-//!   account's global config.
+//!   A program the owner's own (global) config names is looked up in the fixed
+//!   `PATH`; `HOME` comes from the passwd database, so a process run with
+//!   another `$HOME` uses the account's global config (the sandbox plan refuses
+//!   a grant that holds that home).
 //!   An owner (global) config `include.path` that points at a workspace file is
 //!   the owner's own choice and is not vetted; `GIT_CONFIG_NOSYSTEM=1` drops
 //!   `/etc/gitconfig` (safe.directory, credential helpers, user.*), so a
@@ -300,60 +309,43 @@ pub(crate) fn inert_key(key: &str) -> bool {
     }
 }
 
+/// The directories a hardened git process searches for programs, in order. FIXED:
+/// the inherited `PATH` is never used, because a tole started by a sandboxed
+/// command inherits whatever `PATH` that command set (a directory it can write
+/// would then supply `git`, `sh`, `gpg`, `ssh` or any helper git spawns). An
+/// owner whose git lives elsewhere gives the tool an absolute `bin`
+/// ([`GitTool::with_bin`]; its directory is added) or links it into one of these.
+const TRUSTED_DIRS: [&str; 4] = ["/usr/local/bin", "/usr/bin", "/bin", "/opt/homebrew/bin"];
+
 /// The environment a hardened git process gets: an ALLOWLIST taken from
-/// `parent` (the process environment), plus `HOME` (the account's own home,
-/// see [`account_home`]; the process's `HOME` is NOT used), `GIT_CONFIG_NOSYSTEM`
-/// and `GIT_TERMINAL_PROMPT=0`. A denylist cannot keep up: git(1) and
+/// `parent` (the process environment), plus `PATH` (the fixed `path`),
+/// `HOME` (the account's own home, see [`crate::paths::account_home`]; the
+/// process's `HOME` is NOT used), `GIT_CONFIG_NOSYSTEM` and
+/// `GIT_TERMINAL_PROMPT=0`. A denylist cannot keep up: git(1) and
 /// git-config(1) document dozens of variables that name a program, a config
 /// file or a directory (`GIT_CONFIG_GLOBAL|SYSTEM|COUNT|KEY_n|VALUE_n|PARAMETERS`,
 /// `XDG_CONFIG_HOME`, `GIT_EXEC_PATH`, `GIT_TEMPLATE_DIR`, `GIT_ATTR_SOURCE`,
 /// `GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES`,
 /// `GIT_REPLACE_REF_BASE`, `GIT_NAMESPACE`, `GIT_PROXY_COMMAND`, `GIT_SSH*`,
 /// `GIT_ASKPASS`, `GIT_EDITOR`, `GIT_PAGER`, `GIT_EXTERNAL_DIFF`, and the
-/// loader's `LD_PRELOAD` and `LD_LIBRARY_PATH`, ...), and a
-/// tole process started by a sandboxed command inherits whatever that command
-/// set. Kept: `PATH`, absolute entries only (git finds its helpers and the owner's
-/// programs there; the entries are the owner's, a residual, see the module doc), locale and time zone, `TERM`, the temp dir
-/// and, for Windows hosts, the few variables a process needs to start.
+/// loader's `LD_PRELOAD` and `LD_LIBRARY_PATH`, ...), and a tole process
+/// started by a sandboxed command inherits whatever that command set. Kept:
+/// locale, time zone and `TERM` only. Dropped on purpose: `GIT_AUTHOR_*`,
+/// `GIT_COMMITTER_*`, `USER` and `LOGNAME` (the identity comes from config or
+/// the passwd entry only) and `TMPDIR`/`TEMP`/`TMP` (git falls back to `/tmp`).
 pub(crate) fn hardened_env(
     parent: impl IntoIterator<Item = (OsString, OsString)>,
     home: Option<PathBuf>,
+    path: OsString,
 ) -> Vec<(OsString, OsString)> {
     fn kept(name: &str) -> bool {
-        matches!(
-            name,
-            "PATH"
-                | "LANG"
-                | "LANGUAGE"
-                | "TZ"
-                | "TERM"
-                | "TMPDIR"
-                | "TEMP"
-                | "TMP"
-                | "SYSTEMROOT"
-                | "WINDIR"
-                | "COMSPEC"
-                | "PATHEXT"
-        ) || name.starts_with("LC_")
+        matches!(name, "LANG" | "LANGUAGE" | "TZ" | "TERM") || name.starts_with("LC_")
     }
     let mut out: Vec<(OsString, OsString)> = parent
         .into_iter()
         .filter(|(k, _)| k.to_str().is_some_and(kept))
-        .map(|(k, v)| {
-            // A relative or empty `PATH` entry would resolve `git` (and the
-            // helpers it runs) in the workspace, the directory a sandboxed
-            // command writes: keep absolute entries only.
-            if k == "PATH" {
-                let abs: Vec<PathBuf> = std::env::split_paths(&v)
-                    .filter(|p| p.is_absolute())
-                    .collect();
-                if let Ok(joined) = std::env::join_paths(abs) {
-                    return (k, joined);
-                }
-            }
-            (k, v)
-        })
         .collect();
+    out.push(("PATH".into(), path));
     if let Some(home) = home {
         out.push(("HOME".into(), home.into_os_string()));
     }
@@ -362,50 +354,45 @@ pub(crate) fn hardened_env(
     out
 }
 
-/// The home directory of the account this process runs as, from the passwd
-/// database, NOT from `$HOME`: a process started by a sandboxed command can
-/// inherit a `HOME` (and `XDG_CONFIG_HOME`) pointing at state that command
-/// wrote, which would relocate the owner's global git config (`~/.gitconfig`,
-/// `~/.config/git/config`). `None` when the account has no entry: git then runs
-/// with no global config at all (and a commit may fail for want of an
-/// identity), which is safe.
-#[cfg(unix)]
-fn account_home() -> Option<PathBuf> {
-    use std::os::unix::ffi::OsStrExt;
-    let mut buf = vec![0u8; 1024];
-    loop {
-        // SAFETY: `pwd` and `buf` outlive the call; getpwuid_r writes only
-        // into them and sets `result` to null or to `&mut pwd`.
-        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
-        let mut result: *mut libc::passwd = std::ptr::null_mut();
-        let rc = unsafe {
-            libc::getpwuid_r(
-                libc::geteuid(),
-                &mut pwd,
-                buf.as_mut_ptr().cast(),
-                buf.len(),
-                &mut result,
-            )
-        };
-        if rc == libc::ERANGE && buf.len() < 1 << 20 {
-            let n = buf.len() * 2;
-            buf.resize(n, 0);
-            continue;
-        }
-        if rc != 0 || result.is_null() || pwd.pw_dir.is_null() {
-            return None;
-        }
-        // SAFETY: pw_dir is a NUL-terminated string inside `buf`.
-        let dir = unsafe { std::ffi::CStr::from_ptr(pwd.pw_dir) };
-        let dir = Path::new(std::ffi::OsStr::from_bytes(dir.to_bytes()));
-        return dir.is_absolute().then(|| dir.to_path_buf());
+/// Whether `p` is a regular file with an execute bit.
+fn is_executable(p: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        p.is_file()
     }
 }
 
-#[cfg(not(unix))]
-fn account_home() -> Option<PathBuf> {
-    std::env::var_os("USERPROFILE").map(PathBuf::from)
+/// Marks every file descriptor above stderr close-on-exec in the child (Linux
+/// 5.11+, `close_range` with `CLOSE_RANGE_CLOEXEC`; an older kernel leaves them
+/// as they are), so git does not inherit a pipe or a socket this process was
+/// handed by whatever started it. Stdin is `/dev/null` and stdout and stderr
+/// are pipes (see `run_with_timeout`). The flag, not a close, keeps the
+/// standard library's own exec-error pipe working.
+#[cfg(target_os = "linux")]
+fn close_inherited_fds(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: the closure only makes one raw syscall, which is async-signal-safe.
+    unsafe {
+        cmd.pre_exec(|| {
+            const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
+            libc::syscall(
+                libc::SYS_close_range,
+                3 as libc::c_uint,
+                !0 as libc::c_uint,
+                CLOSE_RANGE_CLOEXEC,
+            );
+            Ok(())
+        });
+    }
 }
+
+#[cfg(not(target_os = "linux"))]
+fn close_inherited_fds(_cmd: &mut Command) {}
 
 /// Light git tool. cwd = the repo checkout (jail root for paths is the
 /// same cwd the file tools use).
@@ -427,6 +414,9 @@ impl GitTool {
         }
     }
 
+    /// Sets the program git runs as. With a command consumer on it must be an
+    /// absolute path, used as given (an embedder's choice); its directory is
+    /// then also searched for the helpers git spawns.
     pub fn with_bin(mut self, bin: impl Into<PathBuf>) -> Self {
         self.bin = bin.into();
         self
@@ -444,21 +434,83 @@ impl GitTool {
         self
     }
 
+    /// With a command consumer on: the git binary and the `PATH` it gets, both
+    /// FIXED (see [`TRUSTED_DIRS`]). A directory under the workdir, the temp
+    /// dir, `$HOME` or the account home is never searched (a sandboxed
+    /// command can write there), and a relative `bin` is refused.
+    fn trusted_launch(&self) -> Result<(PathBuf, OsString), String> {
+        let cwd = std::env::current_dir().ok();
+        let avoid: Vec<PathBuf> = [
+            self.workdir.clone().or(cwd),
+            Some(std::env::temp_dir()),
+            std::env::var_os("HOME").map(PathBuf::from),
+            crate::paths::account_home(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|p| crate::paths::canon_lenient(&p))
+        .collect();
+        let usable = |d: &Path| -> bool {
+            d.is_absolute()
+                && std::fs::canonicalize(d)
+                    .is_ok_and(|c| c.is_dir() && !avoid.iter().any(|a| c.starts_with(a)))
+        };
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        if self.bin.is_absolute() {
+            if let Some(parent) = self.bin.parent() {
+                dirs.push(parent.to_path_buf());
+            }
+        }
+        dirs.extend(TRUSTED_DIRS.iter().map(PathBuf::from).filter(|d| usable(d)));
+        let program = if self.bin.is_absolute() {
+            self.bin.clone()
+        } else if self.bin.components().count() == 1 {
+            dirs.iter()
+                .map(|d| d.join(&self.bin))
+                .find(|p| is_executable(p))
+                .ok_or_else(|| {
+                    format!(
+                        "git: refused: no `{}` in the trusted directories ({}) and a command \
+                         sandbox is on (the inherited PATH is not used: a sandboxed command can \
+                         set it); install git there, link it into one of them, or give the tool \
+                         an absolute `bin`",
+                        self.bin.display(),
+                        TRUSTED_DIRS.join(", ")
+                    )
+                })?
+        } else {
+            return Err(format!(
+                "git: refused: the git program `{}` is a relative path and a command sandbox is on; \
+                 use an absolute path",
+                self.bin.display()
+            ));
+        };
+        let path = std::env::join_paths(&dirs)
+            .map_err(|e| format!("git: refused: cannot build a PATH for git: {e}"))?;
+        Ok((program, path))
+    }
+
     /// A git process with the workdir. Without a consumer (`hardened` false)
     /// the environment is the process's, scrubbed of secrets and of the git
-    /// variables that relocate the repository. With one, git gets an ALLOWLIST
+    /// variables that relocate the repository. With one, the program and its
+    /// `PATH` are fixed ([`Self::trusted_launch`]) and git gets an ALLOWLIST
     /// environment ([`hardened_env`]): nothing else in the process environment
     /// reaches it, so no variable git documents (the config-locating family
     /// `GIT_CONFIG_*`, `GIT_EXEC_PATH`, `GIT_ATTR_SOURCE`, `GIT_PAGER`,
-    /// `GIT_SSH*`, ...) can redirect it to state a sandboxed command wrote.
-    fn command(&self, hardened: bool) -> Command {
-        let mut cmd = Command::new(&self.bin);
+    /// `GIT_SSH*`, ...) can redirect it to state a sandboxed command wrote, and
+    /// no file descriptor beyond stdio is inherited.
+    fn command(&self, hardened: bool) -> Result<Command, String> {
+        let mut cmd;
         if hardened {
+            let (program, path) = self.trusted_launch()?;
+            cmd = Command::new(program);
             cmd.env_clear();
-            for (k, v) in hardened_env(std::env::vars_os(), account_home()) {
+            for (k, v) in hardened_env(std::env::vars_os(), crate::paths::account_home(), path) {
                 cmd.env(k, v);
             }
+            close_inherited_fds(&mut cmd);
         } else {
+            cmd = Command::new(&self.bin);
             crate::subprocess::scrub_env_for(&mut cmd, "git");
             for k in [
                 "GIT_DIR",
@@ -476,13 +528,13 @@ impl GitTool {
         if let Some(dir) = &self.workdir {
             cmd.current_dir(dir);
         }
-        cmd
+        Ok(cmd)
     }
 
     /// Runs a read-only probe (`rev-parse`, `config --file`) with the hardened
     /// options and returns its stdout.
     fn probe(&self, args: &[&str]) -> Result<String, String> {
-        let mut cmd = self.command(true);
+        let mut cmd = self.command(true)?;
         cmd.args([
             "-c",
             "core.fsmonitor=false",
@@ -648,7 +700,7 @@ impl Tool for GitTool {
         if hardened {
             self.vet_repository(op)?;
         }
-        let mut cmd = self.command(hardened);
+        let mut cmd = self.command(hardened)?;
         cmd.args(invocation(op, argv, hardened));
         let out = run_with_timeout(&mut cmd, GIT_TIMEOUT)?;
         if !out.status.success() {
@@ -898,17 +950,58 @@ mod tests {
         );
     }
 
+    /// A descriptor this process was handed (a pipe or socket from whatever started
+    /// it) is not inherited by the hardened git process.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_hardened_git_process_inherits_no_extra_descriptor() {
+        use std::os::fd::AsRawFd;
+        let f = std::fs::File::open("/dev/null").unwrap();
+        // SAFETY: dup of an open descriptor; the copy has no close-on-exec flag.
+        let fd = unsafe { libc::dup(f.as_raw_fd()) };
+        assert!(fd > 2);
+        let listing = |close: bool| -> Vec<String> {
+            let mut c = Command::new("/bin/sh");
+            c.arg("-c")
+                .arg("for f in /proc/$$/fd/*; do echo ${f##*/}; done");
+            if close {
+                close_inherited_fds(&mut c);
+            }
+            let out = c.output().unwrap();
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        };
+        assert!(
+            listing(false).contains(&fd.to_string()),
+            "control: an ordinary spawn inherits the descriptor"
+        );
+        assert!(
+            !listing(true).contains(&fd.to_string()),
+            "the descriptor must not reach the hardened child"
+        );
+        // SAFETY: closing the duplicate made above.
+        unsafe { libc::close(fd) };
+    }
+
     /// With a consumer on, git gets an allowlist environment: every variable that
     /// relocates its config or names a program is dropped, `HOME` is the
     /// account's, never the process's.
     #[test]
     fn the_hardened_environment_is_an_allowlist() {
         let parent: Vec<(OsString, OsString)> = [
-            ("PATH", "/usr/bin:.::rel/bin:/opt/bin"),
+            ("PATH", "/work/space/bin:/tmp/x:.::rel"),
             ("LANG", "C"),
             ("LC_ALL", "C"),
             ("TZ", "UTC"),
             ("TERM", "dumb"),
+            ("TMPDIR", "/hostile/tmp"),
+            ("TEMP", "/hostile/tmp"),
+            ("USER", "mallory"),
+            ("LOGNAME", "mallory"),
+            ("GIT_AUTHOR_NAME", "mallory"),
+            ("GIT_COMMITTER_EMAIL", "m@x"),
             ("HOME", "/hostile"),
             ("XDG_CONFIG_HOME", "/hostile/xdg"),
             ("GIT_CONFIG_GLOBAL", "/hostile/g"),
@@ -944,20 +1037,24 @@ mod tests {
         .iter()
         .map(|(k, v)| (OsString::from(k), OsString::from(v)))
         .collect();
-        let env = hardened_env(parent, Some(PathBuf::from("/home/owner")));
+        let env = hardened_env(
+            parent,
+            Some(PathBuf::from("/home/owner")),
+            OsString::from("/usr/bin:/bin"),
+        );
         let get = |k: &str| {
             env.iter()
                 .filter(|(n, _)| n == k)
                 .map(|(_, v)| v.to_string_lossy().into_owned())
                 .collect::<Vec<_>>()
         };
-        for kept in ["PATH", "LANG", "LC_ALL", "TZ", "TERM"] {
+        for kept in ["LANG", "LC_ALL", "TZ", "TERM"] {
             assert_eq!(get(kept).len(), 1, "{kept} is kept");
         }
         assert_eq!(
             get("PATH"),
-            ["/usr/bin:/opt/bin"],
-            "only absolute PATH entries are kept"
+            ["/usr/bin:/bin"],
+            "PATH is the fixed one, never the inherited"
         );
         assert_eq!(get("HOME"), ["/home/owner"], "HOME comes from the account");
         assert_eq!(get("GIT_CONFIG_NOSYSTEM"), ["1"]);
@@ -983,6 +1080,7 @@ mod tests {
         let env = hardened_env(
             vec![(OsString::from("HOME"), OsString::from("/hostile"))],
             None,
+            OsString::from("/usr/bin"),
         );
         assert!(env.iter().all(|(k, _)| k != "HOME"));
     }

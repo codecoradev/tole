@@ -449,6 +449,28 @@ fn env_child_probe() {
     }
 }
 
+/// Runs `env_child_probe` as a child process of this test binary with `env`
+/// added to its environment (set on the `Command`, never on this process).
+fn run_child(ws: &Path, env: &[(String, String)], name: &str) {
+    let out = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "env_child_probe",
+            "--exact",
+            "--ignored",
+            "--test-threads=1",
+        ])
+        .env(CHILD_DIR, ws)
+        .envs(env.iter().map(|(k, v)| (k, v)))
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && text.contains("1 passed"),
+        "{name}: the child probe did not run: {text} {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// A tole process started by a sandboxed command inherits whatever that command
 /// put in its environment. Every variable that relocates git's config (or names
 /// a program) must be dropped for the tool, which runs on the host: no marker
@@ -547,30 +569,83 @@ fn a_hostile_process_environment_never_reaches_git() {
         m,
     ));
 
+    // Control round: no hostile variable. The ops must SUCCEED (a file is added
+    // and committed), so a refusal by the vet cannot make this test pass
+    // vacuously.
+    std::fs::write(ws.join("f.txt"), "control\n").unwrap();
+    run_child(&ws, &[], "control");
+    assert!(
+        !no_commit(&ws),
+        "the control round did not commit: the tool refused or failed without any hostile variable"
+    );
+
     for (i, (name, env, m)) in vectors.into_iter().enumerate() {
         // New content of a new size each round: git must hash it again, which is
         // what runs a clean filter.
         std::fs::write(ws.join("f.txt"), "f".repeat(i + 2)).unwrap();
-        let out = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "env_child_probe",
-                "--exact",
-                "--ignored",
-                "--test-threads=1",
-            ])
-            .env(CHILD_DIR, &ws)
-            .envs(env)
-            .output()
-            .unwrap();
-        let text = String::from_utf8_lossy(&out.stdout);
-        assert!(
-            out.status.success() && text.contains("1 passed"),
-            "{name}: the child probe did not run: {text} {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        run_child(&ws, &env, name);
         assert!(
             !m.exists(),
             "{name}: something named by the hostile environment fired on the host"
         );
+    }
+}
+
+/// A tole process started by a sandboxed command inherits whatever `PATH` that
+/// command set. The tool must run the real git from its fixed trusted
+/// directories, never a `git` (or a `sh`) found in a directory the sandbox can
+/// write: no marker may appear and the commit must happen. The production
+/// `GitTool::new()` path, in a child process.
+#[test]
+fn a_hostile_path_never_supplies_the_git_binary() {
+    consumers_on();
+    let dir = TestDir::new("tole-gittool-hostile-path");
+    let ws = init_repo(&dir);
+    std::fs::write(ws.join("f.txt"), "f\n").unwrap();
+    let other = TestDir::new("tole-gittool-hostile-path-tmp");
+    let other = std::fs::canonicalize(&*other).unwrap();
+    let mut hostile_dirs = Vec::new();
+    let mut markers = Vec::new();
+    for (name, d) in [("ws", ws.join("hostbin")), ("tmp", other.join("pbin"))] {
+        for prog in ["git", "sh"] {
+            let m = marker(&ws, &format!("path-{name}-{prog}"));
+            script(&d.join(prog), &format!("touch {}\nexit 1", m.display()));
+            markers.push(m);
+        }
+        hostile_dirs.push(d.display().to_string());
+    }
+    // Hostile absolute entries first, then a relative one and an empty one, then
+    // the real PATH.
+    let real = std::env::var("PATH").unwrap_or_default();
+    let path = format!("{}:rel/bin::.:{real}", hostile_dirs.join(":"));
+    run_child(&ws, &[("PATH".into(), path)], "PATH");
+    for m in &markers {
+        assert!(
+            !m.exists(),
+            "{}: a program from the hostile PATH ran",
+            m.display()
+        );
+    }
+    assert!(
+        !no_commit(&ws),
+        "the real git did not run: nothing was committed"
+    );
+}
+
+/// With a command consumer on the git program is looked up in the fixed
+/// trusted directories only: a relative `bin` is refused, and so is a name
+/// that exists nowhere in them.
+#[test]
+fn a_relative_or_unknown_git_program_is_refused() {
+    consumers_on();
+    let dir = TestDir::new("tole-gittool-bin");
+    let ws = init_repo(&dir);
+    for bin in ["bin/git", "tole-no-such-git-program"] {
+        let e = GitTool::new()
+            .in_dir(&ws)
+            .with_bin(bin)
+            .execute(json!({"op": "status"}))
+            .unwrap_err();
+        assert!(e.starts_with("git: refused: "), "{bin}: {e}");
     }
 }

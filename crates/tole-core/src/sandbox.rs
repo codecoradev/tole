@@ -317,7 +317,8 @@ fn detect_uncached() -> Availability {
 /// the fully resolved path (symlinks, `..`, trailing slashes and relative
 /// paths resolved; one that cannot be resolved is refused):
 /// - `/`, or anything in `/proc`, `/sys` or `/dev`;
-/// - `$HOME` or any ancestor of it (`/home`), since that would mount it.
+/// - `$HOME`, the account's passwd home or any ancestor of either (`/home`),
+///   since that would mount it.
 ///   Paths under `$HOME` (a project dir) are fine. When `$HOME` is not
 ///   known, an ancestor of `/home` or `/root` is refused instead;
 /// - the tole data dir, anything inside it, or any ancestor of it.
@@ -348,6 +349,16 @@ pub fn check_grant(
         return Err(format!(
             "sandbox: {shown} is or holds $HOME and cannot be granted"
         ));
+    }
+    // The git tool takes its global config from the passwd home, not `$HOME`
+    // (which a plan takes from the environment): `~/.gitconfig` must never be
+    // sandbox-writable, whatever `$HOME` says.
+    if let Some(h) = crate::paths::account_home() {
+        if crate::paths::canon_lenient(&h).starts_with(&p) {
+            return Err(format!(
+                "sandbox: {shown} is or holds the account's home directory and cannot be granted"
+            ));
+        }
     }
     if let Some(d) = data_dir {
         let d = crate::paths::canon_lenient(d);
