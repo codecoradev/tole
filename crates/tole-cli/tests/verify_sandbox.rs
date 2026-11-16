@@ -99,12 +99,23 @@ struct Run {
 /// where the verify command runs) with `user_config` as the user config.
 /// `path` is the child's PATH.
 fn mission(ws: &Path, home: &Path, user_config: &str, path: &str, verify: &str) -> Run {
+    mission_in(ws, home, user_config, path, verify, &home.join("sessions"))
+}
+
+/// [`mission`] with the sessions directory given (`-s`).
+fn mission_in(
+    ws: &Path,
+    home: &Path,
+    user_config: &str,
+    path: &str,
+    verify: &str,
+    sessions: &Path,
+) -> Run {
     std::fs::create_dir_all(home.join("tole")).unwrap();
     std::fs::write(home.join("tole/config.toml"), user_config).unwrap();
-    let sessions = home.join("sessions");
     let out = Command::new(env!("CARGO_BIN_EXE_tole"))
         .args(["mission", "-s"])
-        .arg(&sessions)
+        .arg(sessions)
         .arg("--workspace")
         .arg(ws)
         .args(["--yes", "--verify", verify, "do it"])
@@ -738,5 +749,72 @@ fn a_sandboxed_gate_exiting_125_126_127_is_its_own_verdict() {
     );
     assert_eq!(r.code, 0, "{}\n{}", r.stdout, r.stderr);
     assert!(ws.join("gate-made").exists());
+    drop(dir);
+}
+
+/// #866: with the sessions directory moved inside the workspace (`-s
+/// ./sessions`), a sandboxed verify command cannot write into it (it is bound
+/// read-only like `.tole`), while the mission itself, a host process, still
+/// writes its session there.
+#[test]
+fn a_sandboxed_verify_cannot_write_a_sessions_dir_inside_the_workspace() {
+    if !bwrap_works() {
+        return;
+    }
+    let (dir, ws, home) = project("sessions-in-ws");
+    let sessions = ws.join("sessions");
+    let cmd = "! (touch sessions/evil) 2>/dev/null && ! (rm -f sessions/*.jsonl) 2>/dev/null \
+               && test -n \"$(ls sessions)\"";
+    let r = mission_in(
+        &ws,
+        &home,
+        "[sandbox.consumers]\nverify = \"required\"\n",
+        &path_env(),
+        cmd,
+        &sessions,
+    );
+    assert_eq!(r.code, 0, "{}\n{}", r.stdout, r.stderr);
+    assert!(r.stdout.contains("status: complete"), "{}", r.stdout);
+    assert!(!sessions.join("evil").exists(), "the write was refused");
+    let files: Vec<_> = std::fs::read_dir(&sessions)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        files.iter().any(|f| f.ends_with(".jsonl")),
+        "the host wrote the session there: {files:?}"
+    );
+    drop(dir);
+}
+
+/// A sessions directory deeper than a direct child is refused (a mount cannot
+/// protect it): the mission ends `verify_refused` before a turn, with the
+/// reason, and the verify never runs.
+#[test]
+fn a_sessions_dir_that_cannot_be_protected_refuses_the_verify() {
+    if !bwrap_works() {
+        return;
+    }
+    let (dir, ws, home) = project("sessions-deep");
+    let sessions = ws.join("a/b");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let r = mission_in(
+        &ws,
+        &home,
+        "[sandbox.consumers]\nverify = \"required\"\n",
+        &path_env(),
+        "touch verify-ran",
+        &sessions,
+    );
+    assert_ne!(r.code, 0, "{}\n{}", r.stdout, r.stderr);
+    assert!(r.stdout.contains("status: verify_refused"), "{}", r.stdout);
+    assert!(
+        r.stderr.contains("the sessions directory")
+            && r.stderr.contains("deeper than a direct child"),
+        "{}",
+        r.stderr
+    );
+    assert!(!ws.join("verify-ran").exists(), "never ran");
     drop(dir);
 }
