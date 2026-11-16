@@ -257,22 +257,33 @@ pub fn redact_argv(argv: &[OsString]) -> String {
     redact_argv_with(argv, &crate::secrets::process_secrets())
 }
 
+const HIDDEN: &str = "<redacted>";
+
 fn redact_argv_with(argv: &[OsString], set: &crate::secrets::SecretSet) -> String {
-    const HIDDEN: &str = "<redacted>";
-    let secret_flag = |flag: &str| {
-        let name = flag.trim_start_matches('-');
-        flag.starts_with('-')
-            && !name.is_empty()
-            && crate::secrets::is_secret_name(&name.replace('-', "_"))
+    // A secret-shaped NAME, with any leading dashes and `-` read as `_`.
+    let secret_name = |n: &str| {
+        let name = n.trim_start_matches('-');
+        !name.is_empty() && crate::secrets::is_secret_name(&name.replace('-', "_"))
     };
+    let secret_flag = |flag: &str| flag.starts_with('-') && secret_name(flag);
+    // `NAME=VALUE` with a secret-shaped NAME, at the start or after another
+    // `=` (`API_KEY=x`, `--api-key=x`, `--env=API_KEY=x`): the value hidden.
+    fn assignment(text: &str, secret_name: &dyn Fn(&str) -> bool) -> Option<String> {
+        let (left, right) = text.split_once('=')?;
+        if secret_name(left) {
+            Some(format!("{left}={HIDDEN}"))
+        } else {
+            assignment(right, secret_name).map(|r| format!("{left}={r}"))
+        }
+    }
     let mut hide_next = false;
     let mut out = Vec::with_capacity(argv.len());
     for a in argv {
         let text = a.to_string_lossy();
         let shown = if std::mem::take(&mut hide_next) {
             HIDDEN.to_string()
-        } else if let Some((flag, _)) = text.split_once('=').filter(|(f, _)| secret_flag(f)) {
-            format!("{flag}={HIDDEN}")
+        } else if let Some(hidden) = assignment(&text, &secret_name) {
+            hidden
         } else {
             hide_next = secret_flag(&text);
             set.redact(&text).into_owned()

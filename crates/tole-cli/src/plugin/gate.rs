@@ -212,6 +212,11 @@ impl Gate {
     /// remote or skipped server, a sandboxed one, or where the launch is
     /// refused instead (`required`, unattended): the decision is
     /// [`tole_core::sandbox::fallback_reason`], the one [`tole_core::sandbox::plan`] agrees with.
+    ///
+    /// The command line is rebuilt from the lock `source` by splitting on
+    /// whitespace, as [`Gate::profile_check`] does (no parser of the real
+    /// launch is reusable from here): an argument with a space in it is
+    /// split, so the reason can differ from the launch's for such a server.
     fn record_fallback(&self, server: &str, source: &str) {
         let (Some(user), Some(policy)) = (self.user_path.as_deref(), self.policy.as_ref()) else {
             return;

@@ -317,6 +317,37 @@ fn the_verbose_argv_hides_secret_flags_and_known_values() {
 }
 
 #[test]
+fn the_verbose_argv_hides_the_value_of_a_secret_named_assignment() {
+    let set = crate::secrets::SecretSet::default();
+    let shown = redact_argv_with(
+        &os(&[
+            "API_KEY=xyz-positional",
+            "-e",
+            "GITHUB_TOKEN=xyz-after-e",
+            "--env=DB_PASSWORD=xyz-nested",
+            "--setenv",
+            "my-api-key=xyz-dashed",
+            "PATH=/usr/bin",
+            "-e",
+            "LANG=C",
+            "--env=HOME=/home/o",
+            "--name=plain",
+            "a=b=c",
+        ]),
+        &set,
+    );
+    for leaked in ["xyz-positional", "xyz-after-e", "xyz-nested", "xyz-dashed"] {
+        assert!(!shown.contains(leaked), "{leaked} leaked: {shown}");
+    }
+    assert_eq!(
+        shown,
+        "API_KEY=<redacted> -e GITHUB_TOKEN=<redacted> --env=DB_PASSWORD=<redacted> \
+         --setenv my-api-key=<redacted> PATH=/usr/bin -e LANG=C --env=HOME=/home/o \
+         --name=plain a=b=c"
+    );
+}
+
+#[test]
 fn the_verbose_argv_is_one_line_and_quotes_what_needs_it() {
     let set = crate::secrets::SecretSet::default();
     let shown = redact_argv_with(&os(&["a b", "", "it's", "x\ny\x1b[31m", "plain"]), &set);

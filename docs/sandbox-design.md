@@ -1167,7 +1167,10 @@ Names only, never values or argument contents:
   approval, a revoke or a profile record. It is written only where the launch
   really falls back (mode `optional`, a human attached, no working backend or
   a wrapper that cannot be built), never for `required`, a skipped or remote
-  server, or an unattended run, which refuses instead.
+  server, or an unattended run, which refuses instead. The reason is decided
+  from the lock's `source` string split on whitespace (as the profile check
+  does), so for a server with a quoted argument that holds a space it can
+  differ from the launch's own reason.
 - Per `optional` fallback of a command consumer (`run_command`, `job_start`):
   the warning on stderr, once per process and tool, and the `tole doctor`
   line only. No ledger or session entry, on purpose: a command consumer has
@@ -1182,7 +1185,8 @@ Names only, never values or argument contents:
   printed at its first start in the process, a consumer's at every command.
   It is redacted: the values of the process's secret set in all their
   encodings, and the value of a flag whose name is secret-shaped (`--token x`,
-  `--api-key=x`); a secret tole does not know under an innocent flag name is
+  `--api-key=x`) or of a `NAME=VALUE` argument with a secret-shaped name
+  (`API_KEY=x`, `-e API_KEY=x`, `--env=API_KEY=x`); a secret tole does not know under an innocent flag name is
   not recognised, so treat the line as local diagnostics.
 - Never (outside that verbose line): environment values, granted secret
   values, file contents, the full bwrap argument list (it holds local paths).
