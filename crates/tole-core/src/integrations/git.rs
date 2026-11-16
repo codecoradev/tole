@@ -25,6 +25,14 @@
 //!   - `-c core.hooksPath=/dev/null` and `--no-verify` on commit: NO hook runs
 //!     for a commit made through this tool, the owner's own pre-commit and
 //!     commit-msg included (a human's own `git commit` still runs them);
+//!   - the git process gets an ALLOWLIST environment (`hardened_env`), not the
+//!     tole process's: `PATH` (absolute entries only), locale, `TZ`, `TERM`,
+//!     the temp dir, `HOME` from the account's passwd entry (never `$HOME`)
+//!     and `GIT_TERMINAL_PROMPT=0`. `GIT_CONFIG_GLOBAL|SYSTEM|COUNT|KEY_n|
+//!     VALUE_n|PARAMETERS`, `XDG_CONFIG_HOME`, `GIT_EXEC_PATH`, `GIT_ATTR_SOURCE`,
+//!     `GIT_PAGER`, `GIT_SSH*`, ... inherited from a tole started by a
+//!     sandboxed command cannot reach git: the vet reads one file, so any
+//!     other way to give git config would bypass it;
 //!   - `GIT_CONFIG_NOSYSTEM=1`, `--no-ext-diff --no-textconv` on diff, and
 //!     `--ignore-submodules=all` on status and diff (so git never descends into
 //!     a nested repository and its unvetted config);
@@ -54,6 +62,10 @@
 //!   `* filter=lfs` triggers the OWNER's global `filter.lfs.*` command (the
 //!   program is the owner's, its input is attacker-influenced); `gc.autodetach`
 //!   can leave a detached `git maintenance run --auto` that outlives the vet.
+//!   The allowlist keeps `PATH` (absolute entries only: a program the owner's
+//!   config names is found where the owner's `PATH` says) and takes `HOME` from
+//!   the passwd database, so a process run with another `$HOME` uses the
+//!   account's global config.
 //!   An owner (global) config `include.path` that points at a workspace file is
 //!   the owner's own choice and is not vetted; `GIT_CONFIG_NOSYSTEM=1` drops
 //!   `/etc/gitconfig` (safe.directory, credential helpers, user.*), so a
@@ -62,6 +74,7 @@
 use crate::subprocess::run_with_timeout;
 use crate::tool::{Risk, Tool};
 use serde_json::{json, Value};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -287,6 +300,113 @@ pub(crate) fn inert_key(key: &str) -> bool {
     }
 }
 
+/// The environment a hardened git process gets: an ALLOWLIST taken from
+/// `parent` (the process environment), plus `HOME` (the account's own home,
+/// see [`account_home`]; the process's `HOME` is NOT used), `GIT_CONFIG_NOSYSTEM`
+/// and `GIT_TERMINAL_PROMPT=0`. A denylist cannot keep up: git(1) and
+/// git-config(1) document dozens of variables that name a program, a config
+/// file or a directory (`GIT_CONFIG_GLOBAL|SYSTEM|COUNT|KEY_n|VALUE_n|PARAMETERS`,
+/// `XDG_CONFIG_HOME`, `GIT_EXEC_PATH`, `GIT_TEMPLATE_DIR`, `GIT_ATTR_SOURCE`,
+/// `GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES`,
+/// `GIT_REPLACE_REF_BASE`, `GIT_NAMESPACE`, `GIT_PROXY_COMMAND`, `GIT_SSH*`,
+/// `GIT_ASKPASS`, `GIT_EDITOR`, `GIT_PAGER`, `GIT_EXTERNAL_DIFF`, and the
+/// loader's `LD_PRELOAD` and `LD_LIBRARY_PATH`, ...), and a
+/// tole process started by a sandboxed command inherits whatever that command
+/// set. Kept: `PATH`, absolute entries only (git finds its helpers and the owner's
+/// programs there; the entries are the owner's, a residual, see the module doc), locale and time zone, `TERM`, the temp dir
+/// and, for Windows hosts, the few variables a process needs to start.
+pub(crate) fn hardened_env(
+    parent: impl IntoIterator<Item = (OsString, OsString)>,
+    home: Option<PathBuf>,
+) -> Vec<(OsString, OsString)> {
+    fn kept(name: &str) -> bool {
+        matches!(
+            name,
+            "PATH"
+                | "LANG"
+                | "LANGUAGE"
+                | "TZ"
+                | "TERM"
+                | "TMPDIR"
+                | "TEMP"
+                | "TMP"
+                | "SYSTEMROOT"
+                | "WINDIR"
+                | "COMSPEC"
+                | "PATHEXT"
+        ) || name.starts_with("LC_")
+    }
+    let mut out: Vec<(OsString, OsString)> = parent
+        .into_iter()
+        .filter(|(k, _)| k.to_str().is_some_and(kept))
+        .map(|(k, v)| {
+            // A relative or empty `PATH` entry would resolve `git` (and the
+            // helpers it runs) in the workspace, the directory a sandboxed
+            // command writes: keep absolute entries only.
+            if k == "PATH" {
+                let abs: Vec<PathBuf> = std::env::split_paths(&v)
+                    .filter(|p| p.is_absolute())
+                    .collect();
+                if let Ok(joined) = std::env::join_paths(abs) {
+                    return (k, joined);
+                }
+            }
+            (k, v)
+        })
+        .collect();
+    if let Some(home) = home {
+        out.push(("HOME".into(), home.into_os_string()));
+    }
+    out.push(("GIT_CONFIG_NOSYSTEM".into(), "1".into()));
+    out.push(("GIT_TERMINAL_PROMPT".into(), "0".into()));
+    out
+}
+
+/// The home directory of the account this process runs as, from the passwd
+/// database, NOT from `$HOME`: a process started by a sandboxed command can
+/// inherit a `HOME` (and `XDG_CONFIG_HOME`) pointing at state that command
+/// wrote, which would relocate the owner's global git config (`~/.gitconfig`,
+/// `~/.config/git/config`). `None` when the account has no entry: git then runs
+/// with no global config at all (and a commit may fail for want of an
+/// identity), which is safe.
+#[cfg(unix)]
+fn account_home() -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut buf = vec![0u8; 1024];
+    loop {
+        // SAFETY: `pwd` and `buf` outlive the call; getpwuid_r writes only
+        // into them and sets `result` to null or to `&mut pwd`.
+        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        let rc = unsafe {
+            libc::getpwuid_r(
+                libc::geteuid(),
+                &mut pwd,
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                &mut result,
+            )
+        };
+        if rc == libc::ERANGE && buf.len() < 1 << 20 {
+            let n = buf.len() * 2;
+            buf.resize(n, 0);
+            continue;
+        }
+        if rc != 0 || result.is_null() || pwd.pw_dir.is_null() {
+            return None;
+        }
+        // SAFETY: pw_dir is a NUL-terminated string inside `buf`.
+        let dir = unsafe { std::ffi::CStr::from_ptr(pwd.pw_dir) };
+        let dir = Path::new(std::ffi::OsStr::from_bytes(dir.to_bytes()));
+        return dir.is_absolute().then(|| dir.to_path_buf());
+    }
+}
+
+#[cfg(not(unix))]
+fn account_home() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE").map(PathBuf::from)
+}
+
 /// Light git tool. cwd = the repo checkout (jail root for paths is the
 /// same cwd the file tools use).
 #[derive(Debug, Clone)]
@@ -324,23 +444,31 @@ impl GitTool {
         self
     }
 
-    /// A git process with the scrubbed environment and the workdir; `hardened`
-    /// adds `GIT_CONFIG_NOSYSTEM=1` (no system-wide gitconfig: its includes and
-    /// hooks are not the owner's).
+    /// A git process with the workdir. Without a consumer (`hardened` false)
+    /// the environment is the process's, scrubbed of secrets and of the git
+    /// variables that relocate the repository. With one, git gets an ALLOWLIST
+    /// environment ([`hardened_env`]): nothing else in the process environment
+    /// reaches it, so no variable git documents (the config-locating family
+    /// `GIT_CONFIG_*`, `GIT_EXEC_PATH`, `GIT_ATTR_SOURCE`, `GIT_PAGER`,
+    /// `GIT_SSH*`, ...) can redirect it to state a sandboxed command wrote.
     fn command(&self, hardened: bool) -> Command {
         let mut cmd = Command::new(&self.bin);
-        crate::subprocess::scrub_env_for(&mut cmd, "git");
-        for k in [
-            "GIT_DIR",
-            "GIT_WORK_TREE",
-            "GIT_COMMON_DIR",
-            "GIT_INDEX_FILE",
-            "GIT_CEILING_DIRECTORIES",
-        ] {
-            cmd.env_remove(k);
-        }
         if hardened {
-            cmd.env("GIT_CONFIG_NOSYSTEM", "1");
+            cmd.env_clear();
+            for (k, v) in hardened_env(std::env::vars_os(), account_home()) {
+                cmd.env(k, v);
+            }
+        } else {
+            crate::subprocess::scrub_env_for(&mut cmd, "git");
+            for k in [
+                "GIT_DIR",
+                "GIT_WORK_TREE",
+                "GIT_COMMON_DIR",
+                "GIT_INDEX_FILE",
+                "GIT_CEILING_DIRECTORIES",
+            ] {
+                cmd.env_remove(k);
+            }
         }
         for (k, v) in &self.env {
             cmd.env(k, v);
@@ -768,6 +896,95 @@ mod tests {
             invocation(GitOp::Add, s(&["add", "."]), true)[4..],
             s(&["add", "."])
         );
+    }
+
+    /// With a consumer on, git gets an allowlist environment: every variable that
+    /// relocates its config or names a program is dropped, `HOME` is the
+    /// account's, never the process's.
+    #[test]
+    fn the_hardened_environment_is_an_allowlist() {
+        let parent: Vec<(OsString, OsString)> = [
+            ("PATH", "/usr/bin:.::rel/bin:/opt/bin"),
+            ("LANG", "C"),
+            ("LC_ALL", "C"),
+            ("TZ", "UTC"),
+            ("TERM", "dumb"),
+            ("HOME", "/hostile"),
+            ("XDG_CONFIG_HOME", "/hostile/xdg"),
+            ("GIT_CONFIG_GLOBAL", "/hostile/g"),
+            ("GIT_CONFIG_SYSTEM", "/hostile/s"),
+            ("GIT_CONFIG", "/hostile/c"),
+            ("GIT_CONFIG_COUNT", "1"),
+            ("GIT_CONFIG_KEY_0", "filter.x.clean"),
+            ("GIT_CONFIG_VALUE_0", "/hostile/x"),
+            ("GIT_CONFIG_PARAMETERS", "'a'='b'"),
+            ("GIT_EXEC_PATH", "/hostile"),
+            ("GIT_TEMPLATE_DIR", "/hostile"),
+            ("GIT_ATTR_SOURCE", "HEAD"),
+            ("GIT_NAMESPACE", "x"),
+            ("GIT_OBJECT_DIRECTORY", "/hostile"),
+            ("GIT_ALTERNATE_OBJECT_DIRECTORIES", "/hostile"),
+            ("GIT_REPLACE_REF_BASE", "refs/x/"),
+            ("GIT_PROXY_COMMAND", "/hostile"),
+            ("GIT_SSH", "/hostile"),
+            ("GIT_SSH_COMMAND", "/hostile"),
+            ("GIT_ASKPASS", "/hostile"),
+            ("GIT_EDITOR", "/hostile"),
+            ("GIT_PAGER", "/hostile"),
+            ("GIT_EXTERNAL_DIFF", "/hostile"),
+            ("GIT_DIR", "/hostile"),
+            ("EDITOR", "/hostile"),
+            ("PAGER", "/hostile"),
+            ("OPENAI_API_KEY", "sk-secret"),
+            ("LD_PRELOAD", "/hostile.so"),
+            ("LD_LIBRARY_PATH", "/hostile"),
+            ("GCONV_PATH", "/hostile"),
+            ("LOCPATH", "/hostile"),
+        ]
+        .iter()
+        .map(|(k, v)| (OsString::from(k), OsString::from(v)))
+        .collect();
+        let env = hardened_env(parent, Some(PathBuf::from("/home/owner")));
+        let get = |k: &str| {
+            env.iter()
+                .filter(|(n, _)| n == k)
+                .map(|(_, v)| v.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        for kept in ["PATH", "LANG", "LC_ALL", "TZ", "TERM"] {
+            assert_eq!(get(kept).len(), 1, "{kept} is kept");
+        }
+        assert_eq!(
+            get("PATH"),
+            ["/usr/bin:/opt/bin"],
+            "only absolute PATH entries are kept"
+        );
+        assert_eq!(get("HOME"), ["/home/owner"], "HOME comes from the account");
+        assert_eq!(get("GIT_CONFIG_NOSYSTEM"), ["1"]);
+        assert_eq!(get("GIT_TERMINAL_PROMPT"), ["0"]);
+        for (k, _) in &env {
+            let k = k.to_str().unwrap();
+            assert!(
+                matches!(
+                    k,
+                    "PATH"
+                        | "LANG"
+                        | "LC_ALL"
+                        | "TZ"
+                        | "TERM"
+                        | "HOME"
+                        | "GIT_CONFIG_NOSYSTEM"
+                        | "GIT_TERMINAL_PROMPT"
+                ),
+                "{k} must not reach git"
+            );
+        }
+        // No account home: no HOME at all (no global config), never the process's.
+        let env = hardened_env(
+            vec![(OsString::from("HOME"), OsString::from("/hostile"))],
+            None,
+        );
+        assert!(env.iter().all(|(k, _)| k != "HOME"));
     }
 
     /// The allowlist admits what `git init`, `git clone` and a user name hold

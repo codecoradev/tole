@@ -427,3 +427,150 @@ fn the_run_command_summary_points_at_the_git_tool_when_its_consumer_is_on() {
     let j = tole_core::jobs::JobStartTool::new(w).summary();
     assert!(!j.contains("git tool"), "{j}");
 }
+
+/// The directory the child probe below runs the production tool in.
+const CHILD_DIR: &str = "TOLE_GIT_ENV_CHILD_DIR";
+
+/// Runs only as a child process of
+/// `a_hostile_process_environment_never_reaches_git` (it is `#[ignore]`d, so a
+/// normal run skips it): the PRODUCTION `GitTool::new()` path, no `with_env`,
+/// under whatever environment the parent gave this process. Its results are
+/// ignored; the parent checks the markers.
+#[test]
+#[ignore = "child of a_hostile_process_environment_never_reaches_git"]
+fn env_child_probe() {
+    let Some(ws) = std::env::var_os(CHILD_DIR) else {
+        return;
+    };
+    consumers_on();
+    let tool = GitTool::new().in_dir(PathBuf::from(ws));
+    for op in ALL_OPS() {
+        let _ = tool.execute(op);
+    }
+}
+
+/// A tole process started by a sandboxed command inherits whatever that command
+/// put in its environment. Every variable that relocates git's config (or names
+/// a program) must be dropped for the tool, which runs on the host: no marker
+/// may appear, whatever the variable. The hostile environment is set on the
+/// child's `Command`, never on this process (no `set_var`).
+#[test]
+fn a_hostile_process_environment_never_reaches_git() {
+    consumers_on();
+    let dir = TestDir::new("tole-gittool-hostile-env");
+    let ws = init_repo(&dir);
+    std::fs::write(ws.join("f.txt"), "f\n").unwrap();
+    std::fs::write(ws.join(".gitattributes"), "* filter=x\n").unwrap();
+    let hostile = ws.parent().unwrap().join("hostile");
+    let clean = |name: &str| {
+        let m = marker(&ws, name);
+        let s = hostile.join(format!("{name}.sh"));
+        script(&s, &format!("touch {}\ncat", m.display()));
+        (m, s.display().to_string())
+    };
+    let cfg = |script: &str| format!("[filter \"x\"]\n\tclean = {script}\n");
+    let write = |p: PathBuf, body: String| {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, body).unwrap();
+        p
+    };
+    // (vector name, environment of the child, marker that must not appear)
+    type Vector<'a> = (&'a str, Vec<(String, String)>, PathBuf);
+    let mut vectors: Vec<Vector> = Vec::new();
+
+    let (m, s) = clean("global");
+    let p = write(hostile.join("global.cfg"), cfg(&s));
+    vectors.push((
+        "GIT_CONFIG_GLOBAL",
+        vec![("GIT_CONFIG_GLOBAL".into(), p.display().to_string())],
+        m,
+    ));
+    let (m, s) = clean("legacy");
+    let p = write(hostile.join("legacy.cfg"), cfg(&s));
+    vectors.push((
+        "GIT_CONFIG",
+        vec![("GIT_CONFIG".into(), p.display().to_string())],
+        m,
+    ));
+    let (m, s) = clean("system");
+    let p = write(hostile.join("system.cfg"), cfg(&s));
+    vectors.push((
+        "GIT_CONFIG_SYSTEM",
+        vec![
+            ("GIT_CONFIG_SYSTEM".into(), p.display().to_string()),
+            ("GIT_CONFIG_NOSYSTEM".into(), "0".into()),
+        ],
+        m,
+    ));
+    let (m, s) = clean("count");
+    vectors.push((
+        "GIT_CONFIG_COUNT/KEY_0/VALUE_0 (filter)",
+        vec![
+            ("GIT_CONFIG_COUNT".into(), "1".into()),
+            ("GIT_CONFIG_KEY_0".into(), "filter.x.clean".into()),
+            ("GIT_CONFIG_VALUE_0".into(), s),
+        ],
+        m,
+    ));
+    let (m, s) = clean("fsmonitor");
+    vectors.push((
+        "GIT_CONFIG_COUNT/KEY_0/VALUE_0 (core.fsmonitor)",
+        vec![
+            ("GIT_CONFIG_COUNT".into(), "1".into()),
+            ("GIT_CONFIG_KEY_0".into(), "core.fsmonitor".into()),
+            ("GIT_CONFIG_VALUE_0".into(), s),
+        ],
+        m,
+    ));
+    let (m, s) = clean("params");
+    vectors.push((
+        "GIT_CONFIG_PARAMETERS",
+        vec![(
+            "GIT_CONFIG_PARAMETERS".into(),
+            format!("'filter.x.clean'='{s}'"),
+        )],
+        m,
+    ));
+    let (m, s) = clean("home");
+    let home = hostile.join("home");
+    write(home.join(".gitconfig"), cfg(&s));
+    vectors.push(("HOME", vec![("HOME".into(), home.display().to_string())], m));
+    let (m, s) = clean("xdg");
+    let xdg = hostile.join("xdg");
+    write(xdg.join("git").join("config"), cfg(&s));
+    vectors.push((
+        "XDG_CONFIG_HOME",
+        vec![
+            ("XDG_CONFIG_HOME".into(), xdg.display().to_string()),
+            ("HOME".into(), hostile.join("nohome").display().to_string()),
+        ],
+        m,
+    ));
+
+    for (i, (name, env, m)) in vectors.into_iter().enumerate() {
+        // New content of a new size each round: git must hash it again, which is
+        // what runs a clean filter.
+        std::fs::write(ws.join("f.txt"), "f".repeat(i + 2)).unwrap();
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "env_child_probe",
+                "--exact",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .env(CHILD_DIR, &ws)
+            .envs(env)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && text.contains("1 passed"),
+            "{name}: the child probe did not run: {text} {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            !m.exists(),
+            "{name}: something named by the hostile environment fired on the host"
+        );
+    }
+}
