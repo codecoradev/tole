@@ -18,6 +18,12 @@ use crate::tool::{Risk, Tool};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
+/// Appended to the summary of `run_command` and `job_start` when their
+/// consumer runs in the sandbox: the `.git` directory is read-only there, so a
+/// git write fails with a read-only error, and the model needs the way out.
+pub(crate) const GIT_NOTE: &str = " Inside the sandbox the .git directory is read-only: git write \
+    operations (add, commit) fail there, use the git tool, which runs outside it.";
+
 /// Generic command runner. `cwd` is the jail: the command runs with this
 /// working directory and cannot be re-pointed via the input.
 #[derive(Debug, Clone)]
@@ -122,8 +128,13 @@ impl Tool for RunCommandTool {
     }
 
     fn summary(&self) -> String {
-        "Run one command (program plus arguments, no shell) in the workspace and return its output."
-            .into()
+        let mut s = String::from(
+            "Run one command (program plus arguments, no shell) in the workspace and return its output.",
+        );
+        if crate::sandbox::command::consumers().run_command != crate::sandbox::Mode::Off {
+            s.push_str(GIT_NOTE);
+        }
+        s
     }
 
     fn describe(&self, input: &Value) -> String {

@@ -1588,6 +1588,19 @@ pub fn doctor_lines_for(c: &Consumers, avail: &Availability, home: Option<&Path>
              address-space limit (memory_mb); the model is told to fix it like any failure"
         ));
     }
+    if Consumer::ALL.iter().any(|k| c.mode(*k) != Mode::Off) {
+        out.push(
+            "sandbox consumers: git writes (add, commit) fail inside a sandboxed command (.git is \
+             read-only); the `git` tool runs outside it with hooks off (the owner's own \
+             pre-commit and commit-msg do not run for its commits), core.fsmonitor off, no \
+             system gitconfig, a fixed git binary and PATH (/usr/local/bin, /usr/bin, /bin, \
+             /opt/homebrew/bin; not the inherited PATH) and only a small allowlist of \
+             environment variables, and refuses a repository whose config holds a key that \
+             can name a program or file, or whose layout is not a plain .git directory (bare, \
+             linked worktree, submodule)"
+                .into(),
+        );
+    }
     if c.cron == Mode::Off {
         out.push(
             "sandbox consumers: cron scripts and command: deliveries run unsandboxed (cron off; \

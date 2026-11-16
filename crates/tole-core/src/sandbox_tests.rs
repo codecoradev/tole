@@ -202,6 +202,23 @@ fn home_and_every_ancestor_of_home_is_refused_but_a_project_under_it_is_not() {
     assert!(!refused(&t, &t.home.join("proj"), &d), "a project dir");
 }
 
+/// The git tool takes its global config from the passwd home, while a plan
+/// takes `$HOME` from the environment: a grant that holds the account's home is
+/// refused whatever `$HOME` says (so `~/.gitconfig` is never sandbox-writable).
+#[test]
+fn a_grant_that_holds_the_account_home_is_refused_whatever_home_says() {
+    let t = tree("acct");
+    let Some(ah) = crate::paths::account_home().filter(|h| h.exists()) else {
+        return;
+    };
+    let other_home = t.home.clone();
+    let e = check_grant(&ah, Some(&other_home), None).unwrap_err();
+    assert!(e.contains("account's home"), "{e}");
+    if let Some(parent) = ah.parent().filter(|p| *p != Path::new("/")) {
+        assert!(check_grant(parent, Some(&other_home), None).is_err());
+    }
+}
+
 #[test]
 fn an_ancestor_of_a_data_dir_outside_home_is_refused() {
     let t = tree("data");
