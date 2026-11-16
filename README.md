@@ -357,7 +357,7 @@ keys and validation, e.g. a skill to preload everywhere. It sits below the
 project file: **flag > env > config > user config > default**, key by key (a
 project key replaces the user key, lists included). It needs no trust record
 (it lives outside any repository, like the trust store), prints
-`tole: using user config <path>`, and `--no-config` ignores it too.
+`tole: using user config <path>`, and `--no-config` ignores it too (when the user config sets `[sandbox]` or `[secrets]`, `--no-config` needs a terminal, see the sandbox design note).
 `tole config check` lists both files and shows which layer wins each key.
 
 **Keys.** Every key is optional; the schema is strict (an unknown key, a wrong

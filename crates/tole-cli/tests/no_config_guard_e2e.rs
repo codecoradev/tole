@@ -65,9 +65,17 @@ fn the_same_commands_work_without_the_flag_or_without_the_marker() {
     // Under a session, WITHOUT the flag: unchanged.
     let o = tole(&b, &[("TOLE_UNDER_SESSION", "1")], &["sessions"]);
     assert!(!text(&o).contains("--no-config is refused"), "{}", text(&o));
-    // No marker, with the flag: not refused for this reason.
+    // No marker, with the flag, no terminal, and a user config that sets
+    // `[sandbox]`: no longer refused as an agent session, but #867 asks for a
+    // terminal then (the e2e in `terminal_guard_e2e` covers the rule; here the
+    // marker-based text is only checked to be absent).
     let o = tole(&b, &[], &["--no-config", "sessions"]);
     assert!(!text(&o).contains("--no-config is refused"), "{}", text(&o));
+    assert!(text(&o).contains("(issue #867)"), "{}", text(&o));
+    // A user config that protects nothing: the flag works without a terminal.
+    std::fs::write(b.join("home/tole/config.toml"), "model = \"m\"\n").unwrap();
+    let o = tole(&b, &[], &["--no-config", "sessions"]);
+    assert!(o.status.success(), "{}", text(&o));
 }
 
 #[test]

@@ -62,13 +62,20 @@ fn an_uninspectable_user_config_path_fails_closed_naming_the_path() {
         err.contains("--no-config") && err.contains("CODECORA_HOME"),
         "{err}"
     );
-    // `--no-config` really is a way out (owner at a terminal, no session).
+    // `--no-config` is the way out for an owner at a TERMINAL (#867: a user
+    // config that cannot be inspected keeps the strict rule, so without a
+    // terminal, as here, it is refused and says so; the pty case is covered in
+    // `terminal_guard_e2e`).
     let o = tole(
         &work,
         &[("CODECORA_HOME", file.to_str().unwrap())],
         &["--no-config", "sessions"],
     );
-    assert!(o.status.success(), "{}", text(&o.stderr));
+    let err = text(&o.stderr);
+    assert!(
+        !o.status.success() && err.contains("needs a terminal") && err.contains("(issue #867)"),
+        "{err}"
+    );
 }
 
 /// A `CODECORA_HOME` with a newline in it cannot forge a second stderr line
