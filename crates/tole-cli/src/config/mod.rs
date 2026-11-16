@@ -48,6 +48,52 @@ pub fn user_config_path() -> Option<PathBuf> {
     tole_core::paths::tole_data_dir().map(|d| d.join(USER_CONFIG_FILE))
 }
 
+/// Longest path shown in a message about the user config.
+const SHOWN_PATH_MAX: usize = 200;
+
+/// `p` for a one-line message (#864): the path comes from the environment
+/// (`CODECORA_HOME`), so a newline or an escape sequence in it must not forge
+/// a second stderr line or drive the terminal. Control characters are shown as
+/// `\n`, `\r` or `\u{..}`, and a path over 200 characters is cut with `...`.
+pub fn one_line_path(p: &std::path::Path) -> String {
+    let mut out = String::new();
+    let mut n = 0;
+    for c in p.display().to_string().chars() {
+        let piece = match c {
+            '\n' => "\\n".to_string(),
+            '\r' => "\\r".to_string(),
+            '\t' => "\\t".to_string(),
+            c if c.is_control() => format!("\\u{{{:x}}}", c as u32),
+            c => c.to_string(),
+        };
+        n += piece.chars().count();
+        if n > SHOWN_PATH_MAX {
+            out.push('\u{2026}');
+            return out;
+        }
+        out.push_str(&piece);
+    }
+    out
+}
+
+/// Whether the user config file is there (#864): `Ok(true)` it is, `Ok(false)`
+/// it is plainly absent, `Err(message)` it cannot be inspected (permission
+/// denied, a parent that is a file, an I/O error). `Path::exists` would read
+/// the last two as "absent" and the owner's sandbox, approvals and secret
+/// settings would silently turn into the defaults. The message names the way
+/// out.
+pub fn user_config_present(path: &std::path::Path) -> Result<bool, String> {
+    path.try_exists().map_err(|e| {
+        format!(
+            "cannot inspect the user config {} ({e}); not running with the default sandbox, \
+             approval and secret settings instead. Fix the path or its permissions, fix or \
+             unset CODECORA_HOME, or pass --no-config to ignore the file for this one run \
+             (owner at a terminal only)",
+            one_line_path(path)
+        )
+    })
+}
+
 /// The `[mission]` table. Types mirror the `tole mission` flags
 /// (`--max-steps/--max-minutes/--max-tokens` are `Option<u64>`,
 /// `--verify` an `Option<String>`, `--verify-timeout` a `u64` with

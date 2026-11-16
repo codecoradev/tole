@@ -400,3 +400,24 @@ mod scheduling {
         assert!(schedule::find(&cron).is_none());
     }
 }
+
+/// #864: `[curator]` is read from the user config; a file that is plainly
+/// absent is no config, one that cannot be inspected is an error (reported
+/// by `curator_config`), never silent defaults.
+#[test]
+fn curator_config_reports_an_uninspectable_user_config() {
+    let d = crate::test_dir::TestDir::new("tole-curator-ucfg");
+    assert_eq!(curator_config_at(None), Ok(None));
+    assert_eq!(curator_config_at(Some(&d.join("absent.toml"))), Ok(None));
+    let file = d.join("a-file");
+    std::fs::write(&file, "x").unwrap();
+    let e = curator_config_at(Some(&file.join("config.toml"))).unwrap_err();
+    assert!(
+        e.contains("cannot inspect the user config") && e.contains("--no-config"),
+        "{e}"
+    );
+    // A readable file still works.
+    let ok = d.join("config.toml");
+    std::fs::write(&ok, "[curator]\nenabled = true\n").unwrap_or_default();
+    assert!(curator_config_at(Some(&ok)).is_ok());
+}

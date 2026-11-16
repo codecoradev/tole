@@ -1676,3 +1676,49 @@ fn the_absent_notice_is_for_the_unusual_cases_only() {
     .unwrap();
     assert!(!n.contains('\u{1b}'), "{n:?}");
 }
+
+#[test]
+fn a_path_in_a_user_config_message_is_one_short_line() {
+    use crate::config::one_line_path;
+    // A newline, a carriage return and an escape sequence cannot forge a line
+    // or drive the terminal.
+    let nasty = Path::new("/x/a\nb\rc\u{1b}[31md/config.toml");
+    let s = one_line_path(nasty);
+    assert!(
+        !s.contains('\n') && !s.contains('\r') && !s.contains('\u{1b}'),
+        "{s:?}"
+    );
+    assert_eq!(s, "/x/a\\nb\\rc\\u{1b}[31md/config.toml");
+    // An over-long path is cut with an ellipsis.
+    let long = format!("/{}", "a".repeat(500));
+    let s = one_line_path(Path::new(&long));
+    assert!(
+        s.chars().count() <= 201 && s.ends_with('\u{2026}'),
+        "{}",
+        s.len()
+    );
+    // An ordinary path is untouched.
+    assert_eq!(
+        one_line_path(Path::new("/h/.codecora/tole/config.toml")),
+        "/h/.codecora/tole/config.toml"
+    );
+}
+
+#[test]
+fn the_messages_carry_a_single_line_path_and_the_error_names_the_way_out() {
+    let d = tmpdir();
+    let file = d.join("evil\nforged: line");
+    std::fs::write(&file, "x").unwrap();
+    let bad = file.join("config.toml");
+    let mut io = Fake::new(false, false);
+    let e = load_user_config(Some(&bad), &mut io)
+        .unwrap_err()
+        .to_string();
+    assert_eq!(e.lines().count(), 1, "{e:?}");
+    assert!(
+        e.contains("--no-config") && e.contains("CODECORA_HOME") && e.contains("evil\\nforged"),
+        "{e}"
+    );
+    let n = absent_user_config_notice(Some(&bad), &ctx(true, false, false)).unwrap();
+    assert_eq!(n.lines().count(), 1, "{n:?}");
+}

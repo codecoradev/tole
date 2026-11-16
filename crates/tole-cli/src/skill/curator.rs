@@ -406,14 +406,30 @@ pub fn edit_state(
 /// The user config's `[curator]` table. A user config that cannot be read
 /// is reported and the defaults apply, as `tole cron` does.
 fn curator_config() -> Option<crate::config::CuratorConfig> {
-    let path = crate::config::user_config_path().filter(|p| p.exists())?;
-    match crate::config::load(&path) {
-        Ok(c) => c.curator,
+    match curator_config_at(crate::config::user_config_path().as_deref()) {
+        Ok(c) => c,
         Err(e) => {
             eprintln!("tole curator: user config not applied: {e}");
             None
         }
     }
+}
+
+/// [`curator_config`] for a given user config path: a file that is plainly
+/// absent is no config; one that cannot be inspected or does not parse is an
+/// error (#864), reported by the caller.
+fn curator_config_at(
+    path: Option<&std::path::Path>,
+) -> Result<Option<crate::config::CuratorConfig>, String> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    if !crate::config::user_config_present(path)? {
+        return Ok(None);
+    }
+    crate::config::load(path)
+        .map(|c| c.curator)
+        .map_err(|e| e.to_string())
 }
 
 /// The weekly sweep as a job on the built-in scheduler (#593).

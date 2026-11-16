@@ -83,8 +83,16 @@ pub fn zones() -> Arc<dyn ZoneSource> {
     ZONES
         .get_or_init(|| {
             let configured = crate::config::user_config_path()
-                .filter(|p| p.exists())
-                .and_then(|p| crate::config::load(&p).ok())
+                .and_then(|p| match crate::config::user_config_present(&p) {
+                    Ok(true) => crate::config::load(&p).ok(),
+                    Ok(false) => None,
+                    // Said once (this runs once per process); the default
+                    // source applies, as for a file that does not parse.
+                    Err(e) => {
+                        eprintln!("tole: user config not applied for cron.tz_source: {e}");
+                        None
+                    }
+                })
                 .and_then(|c| c.cron?.tz_source);
             let system = || -> Arc<dyn ZoneSource> {
                 match std::env::var_os("TZDIR").filter(|d| !d.is_empty()) {

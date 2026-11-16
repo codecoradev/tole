@@ -57,6 +57,56 @@ fn an_uninspectable_user_config_path_fails_closed_naming_the_path() {
         err.contains("user config") && err.contains("not-a-dir"),
         "the error names the path: {err}"
     );
+    // ...and the way out.
+    assert!(
+        err.contains("--no-config") && err.contains("CODECORA_HOME"),
+        "{err}"
+    );
+    // `--no-config` really is a way out (owner at a terminal, no session).
+    let o = tole(
+        &work,
+        &[("CODECORA_HOME", file.to_str().unwrap())],
+        &["--no-config", "sessions"],
+    );
+    assert!(o.status.success(), "{}", text(&o.stderr));
+}
+
+/// A `CODECORA_HOME` with a newline in it cannot forge a second stderr line
+/// in the error or in the notice.
+#[test]
+fn a_newline_in_codecora_home_cannot_forge_a_stderr_line() {
+    let root = TestDir::new("tole-ucfg-nl");
+    let work = root.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let evil = root.join("home\ntole: FORGED line");
+    // As a file: the error path.
+    std::fs::write(&evil, "x").unwrap();
+    let o = tole(
+        &work,
+        &[("CODECORA_HOME", evil.to_str().unwrap())],
+        &["sessions"],
+    );
+    let err = text(&o.stderr);
+    assert!(!o.status.success(), "{err}");
+    assert!(
+        !err.lines().any(|l| l.starts_with("tole: FORGED")),
+        "forged line in {err:?}"
+    );
+    // As a directory: the notice path.
+    let evil_dir = root.join("dir\ntole: FORGED line");
+    std::fs::create_dir_all(&evil_dir).unwrap();
+    let o = tole(
+        &work,
+        &[("CODECORA_HOME", evil_dir.to_str().unwrap())],
+        &["sessions"],
+    );
+    let err = text(&o.stderr);
+    assert!(o.status.success(), "{err}");
+    assert!(err.contains("no user config at"), "{err}");
+    assert!(
+        !err.lines().any(|l| l.starts_with("tole: FORGED")),
+        "forged line in {err:?}"
+    );
 }
 
 #[test]

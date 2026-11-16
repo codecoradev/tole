@@ -1354,23 +1354,16 @@ pub fn load_user_config(path: Option<&Path>, io: &mut dyn ConfigTrustIo) -> Resu
     // `Path::exists` reads an I/O error (permission denied, a parent that is
     // not a directory) as "not there": the owner's policy would silently
     // vanish (#864). Only a path that is really absent is "no user config".
-    match path.try_exists() {
+    match crate::config::user_config_present(path) {
         Ok(true) => {}
         Ok(false) => return Ok(None),
-        Err(e) => {
-            return Err(anyhow!(
-                "cannot inspect the user config {} ({e}); not running with default sandbox, \
-                 approval and secret settings instead (fix the path or its permissions, or \
-                 point CODECORA_HOME elsewhere)",
-                config_trust::sanitize(&path.display().to_string())
-            ))
-        }
+        Err(m) => return Err(anyhow!("{m}")),
     }
     let config = crate::config::load(path).map_err(|e| anyhow!("{e}"))?;
     let shown = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     io.inform(&format!(
         "tole: using user config {}",
-        config_trust::sanitize(&shown.display().to_string())
+        crate::config::one_line_path(&shown)
     ));
     Ok(Some(Loaded { shown, config }))
 }
@@ -1405,7 +1398,7 @@ pub fn absent_user_config_notice(path: Option<&Path>, ctx: &AbsentCtx) -> Option
     (ctx.root_overridden || ctx.under_session || ctx.unattended_command).then(|| {
         format!(
             "tole: no user config at {}; the defaults apply {TAIL}",
-            config_trust::sanitize(&path.display().to_string())
+            crate::config::one_line_path(path)
         )
     })
 }
