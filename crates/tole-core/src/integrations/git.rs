@@ -277,7 +277,13 @@ impl GitTool {
     /// repository existed at start-up, or it is not the one found now (swapped
     /// for a link, a file or another directory).
     fn trusted_git_dir(&self) -> Result<PathBuf, String> {
-        let wd = self.workdir.as_deref();
+        // The directory git runs in: the workdir, else the process's own (the
+        // snapshot was taken from it too).
+        let cwd = self
+            .workdir
+            .clone()
+            .or_else(|| std::env::current_dir().ok());
+        let wd = cwd.as_deref();
         if let Some(d) = wd {
             if looks_bare(d) {
                 return Err(format!(

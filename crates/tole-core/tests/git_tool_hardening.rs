@@ -229,9 +229,15 @@ fn a_repository_created_after_start_up_is_not_trusted_and_nothing_fires() {
         json!({"op": "commit", "message": "x"}),
     ] {
         let e = tool.execute(input.clone()).unwrap_err();
+        // Which reason depends on where the test directory lives: with no
+        // repository above it at all "no git repository was present when the
+        // session started" (and the way out), with one above it (CI checks out
+        // under a repository) "not the one that was there": both refuse.
         assert!(
-            e.contains("git: refused: no git repository was present when the session started")
-                && e.contains("restart the session"),
+            e.starts_with("git: refused: ")
+                && (e.contains("no git repository was present when the session started")
+                    && e.contains("restart the session")
+                    || e.contains("not the one that was there when the session started")),
             "{input}: {e}"
         );
     }
@@ -297,4 +303,34 @@ fn a_git_directory_swapped_after_start_up_is_refused() {
         e.contains("not the one that was there when the session started"),
         "{e}"
     );
+}
+
+/// The same bare check when the tool has NO workdir (it runs in the process's
+/// own directory, which is where its start-up snapshot came from): the bare
+/// layout planted in that directory is refused too, although an enclosing
+/// repository above it is the trusted one.
+#[test]
+fn a_bare_repository_in_the_process_directory_is_refused_without_a_workdir() {
+    consumers_on();
+    let dir = TestDir::new("tole-gittool-bare-cwd");
+    let root = std::fs::canonicalize(&*dir).unwrap();
+    host_git(&root, &["init", "-q", "-b", "main"]);
+    let bare = root.join("sub");
+    std::fs::create_dir_all(bare.join("objects")).unwrap();
+    std::fs::create_dir_all(bare.join("refs")).unwrap();
+    std::fs::write(bare.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    let before = std::env::current_dir().unwrap();
+    std::env::set_current_dir(&bare).unwrap();
+    let tool = GitTool::new();
+    let results: Vec<String> = [
+        json!({"op": "status"}),
+        json!({"op": "commit", "message": "x"}),
+    ]
+    .into_iter()
+    .map(|i| tool.execute(i).unwrap_err())
+    .collect();
+    std::env::set_current_dir(before).unwrap();
+    for e in results {
+        assert!(e.contains("looks like a bare repository"), "{e}");
+    }
 }
