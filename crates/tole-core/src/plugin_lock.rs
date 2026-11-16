@@ -703,6 +703,37 @@ pub fn profile_ledger_line(
     line
 }
 
+/// Longest reason a [`fallback_ledger_line`] keeps.
+const MAX_FALLBACK_REASON: usize = 300;
+
+/// The audit line of an `optional` sandbox that fell back to no sandbox
+/// (#750, design §10 and §11): `server` was started unwrapped although the
+/// owner's config sandboxes it in the profile `profile` / `profile_hash`
+/// (the one that did NOT apply), because of `reason`. A new line, never a
+/// change to an earlier one; no fold reads it as an approval or a revoke.
+/// Names, a hash and the reason only: the reason is one line, control
+/// characters shown as escapes and cut at 300 characters, and no command
+/// line or value is in it.
+pub fn fallback_ledger_line(
+    server: &str,
+    profile: &str,
+    profile_hash: &str,
+    reason: &str,
+    at: u64,
+) -> String {
+    let reason: String = crate::sanitize::sanitize_one_line(reason)
+        .chars()
+        .take(MAX_FALLBACK_REASON)
+        .collect();
+    let mut line = serde_json::json!({
+        "v": 1, "kind": "plugin", "event": "sandbox_fallback", "server": server,
+        "profile": profile, "profile_hash": profile_hash, "reason": reason, "at": at,
+    })
+    .to_string();
+    line.push('\n');
+    line
+}
+
 /// The audit line of one secret grant or revoke (`secret_grant`,
 /// `secret_revoke`): the secret's NAME, never a value.
 pub fn secret_ledger_line(event: &str, server: &str, secret: &str, at: u64) -> String {

@@ -2,7 +2,8 @@ use super::*;
 use crate::sandbox::command::Consumers;
 use crate::sandbox::{builtin_profile, plan, Env};
 use crate::test_dir::TestDir;
-use std::path::PathBuf;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 
 /// A fake `bwrap` in a TestDir: the decision never runs it, only needs a
 /// usable backend value.
@@ -71,9 +72,13 @@ fn the_startup_line_follows_what_plan_decided() {
     };
     let (line, l) = run(&policy(Mode::Required), &usable(&d), false, "s");
     assert!(matches!(l, Launch::Sandboxed { .. }));
+    let hash = builtin_profile("server").unwrap().hash();
     assert_eq!(
         line.unwrap(),
-        "mcp[s]: sandboxed (profile server, mode required)"
+        format!(
+            "mcp[s]: sandboxed (profile server {}, mode required)",
+            short_hash(&hash)
+        )
     );
     let (line, l) = run(&policy(Mode::Optional), &gone(), false, "s");
     assert!(matches!(l, Launch::Direct { warning: Some(_) }));
@@ -201,4 +206,192 @@ fn doctor_lists_consumers_with_decision_and_nothing_for_off() {
         None,
     );
     assert!(none.is_empty());
+}
+
+#[test]
+fn the_short_hash_is_a_prefix_of_the_full_one() {
+    let full = builtin_profile("server").unwrap().hash();
+    let short = short_hash(&full);
+    assert_eq!(short.len(), "sha256:".len() + 12, "{short}");
+    assert!(full.starts_with(&short));
+    // A value that is not a hash is still cut, never panics.
+    assert_eq!(short_hash("abc"), "sha256:abc");
+}
+
+#[test]
+fn the_startup_line_names_the_profile_and_hash_the_server_runs_in() {
+    let d = TestDir::new("tole-rep-own");
+    let mut open = builtin_profile("server").unwrap();
+    open.network = Network::Host;
+    let mut p = policy(Mode::Required);
+    p.servers.insert(
+        "gh".into(),
+        crate::sandbox::ServerProfile {
+            name: "open".into(),
+            profile: open.clone(),
+        },
+    );
+    let sandboxed = Launch::Sandboxed {
+        program: "/usr/bin/bwrap".into(),
+        args: vec![],
+    };
+    let _ = usable(&d);
+    let own = startup_line(Some(&p), "gh", &sandboxed).unwrap();
+    assert_eq!(
+        own,
+        format!(
+            "mcp[gh]: sandboxed (profile open {}, mode required)",
+            short_hash(&open.hash())
+        )
+    );
+    let dflt = startup_line(Some(&p), "files", &sandboxed).unwrap();
+    assert!(dflt.contains("profile server sha256:"), "{dflt}");
+    assert_ne!(own.split("profile ").nth(1), dflt.split("profile ").nth(1));
+}
+
+#[test]
+fn the_startup_line_is_one_line_whatever_the_names_hold() {
+    let mut p = policy(Mode::Required);
+    p.profile_name = "evil\n\x1b[31mprofile".into();
+    let sandboxed = Launch::Sandboxed {
+        program: "/usr/bin/bwrap".into(),
+        args: vec![],
+    };
+    let line = startup_line(Some(&p), "a\nb\x1b]0;x\x07", &sandboxed).unwrap();
+    assert!(!line.contains(['\n', '\r', '\x1b', '\x07']), "{line:?}");
+    assert!(
+        line.contains("\\u{a}") && line.contains("\\u{1b}"),
+        "{line}"
+    );
+    // The refused and unsandboxed texts carry the same names and are cut
+    // the same way.
+    let refused = Launch::Refused("mcp[a\nb]: not started\x1b[2J".into());
+    let line = startup_line(Some(&p), "a", &refused).unwrap();
+    assert!(!line.contains(['\n', '\x1b']), "{line:?}");
+    let warned = Launch::Direct {
+        warning: Some("mcp[x]: no sandbox (why\r\nnext line)".into()),
+    };
+    let line = startup_line(Some(&p), "x", &warned).unwrap();
+    assert!(!line.contains(['\r', '\n']), "{line:?}");
+}
+
+fn os(v: &[&str]) -> Vec<OsString> {
+    v.iter().map(OsString::from).collect()
+}
+
+#[test]
+fn the_verbose_argv_hides_secret_flags_and_known_values() {
+    let set = crate::secrets::SecretSet::default().with("MY_TOKEN", "hunter2-secret-value");
+    let shown = redact_argv_with(
+        &os(&[
+            "/usr/bin/bwrap",
+            "--bind",
+            "/work",
+            "/work",
+            "--",
+            "server",
+            "--token",
+            "tok-123456789",
+            "--api-key=key-123456789",
+            "--password",
+            "pw-123456789",
+            "--name",
+            "plain",
+            "carries-hunter2-secret-value-inside",
+        ]),
+        &set,
+    );
+    for leaked in [
+        "tok-123456789",
+        "key-123456789",
+        "pw-123456789",
+        "hunter2-secret-value",
+    ] {
+        assert!(!shown.contains(leaked), "{leaked} leaked: {shown}");
+    }
+    // What is not secret stays readable.
+    assert!(shown.starts_with("/usr/bin/bwrap --bind /work /work -- server --token <redacted>"));
+    assert!(shown.contains("--api-key=<redacted>") && shown.contains("--name plain"));
+    // A flag that merely ends the list does not hide anything after it.
+    assert_eq!(redact_argv_with(&os(&["--token"]), &set), "--token");
+}
+
+#[test]
+fn the_verbose_argv_is_one_line_and_quotes_what_needs_it() {
+    let set = crate::secrets::SecretSet::default();
+    let shown = redact_argv_with(&os(&["a b", "", "it's", "x\ny\x1b[31m", "plain"]), &set);
+    assert!(!shown.contains(['\n', '\x1b']), "{shown:?}");
+    assert_eq!(shown, "'a b' '' 'it'\\''s' x\\u{a}y\\u{1b}[31m plain");
+}
+
+#[test]
+fn only_the_documented_values_turn_verbose_on() {
+    for on in ["1", "true", "yes", " 1 "] {
+        assert!(verbose_value(on), "{on}");
+    }
+    for off in ["", "0", "false", "no", "on", "2"] {
+        assert!(!verbose_value(off), "{off}");
+    }
+    assert_eq!(VERBOSE_ENV, "TOLE_VERBOSE");
+}
+
+#[test]
+fn credential_directories_are_marked_sensitive() {
+    let d = TestDir::new("tole-rep-creds");
+    let home = d.join("home/o");
+    let cases = [
+        (".ssh", "ssh keys"),
+        (".gnupg/private-keys-v1.d", "gpg keys"),
+        (".aws", "aws credentials"),
+        (".azure", "azure credentials"),
+        (".kube", "kube credentials"),
+        (".docker", "docker credentials"),
+        (".netrc", "netrc credentials"),
+        (".config/gcloud", "gcloud credentials"),
+        (".config/gh", "github cli credentials"),
+        (".config/gh/hosts.yml", "github cli credentials"),
+        (".config/glab-cli", "gitlab cli credentials"),
+        (".config/op", "1password cli credentials"),
+        (".password-store", "password store"),
+        (".npmrc", "npm credentials"),
+        (".pypirc", "pypi credentials"),
+        (".cargo/credentials", "cargo credentials"),
+        (".cargo/credentials.toml", "cargo credentials"),
+    ];
+    for (rel, what) in cases {
+        assert_eq!(
+            sensitive_kind(&home.join(rel), Some(&home)),
+            Some(what),
+            "{rel}"
+        );
+    }
+    // Neighbours that are not credentials stay unmarked: a sibling under
+    // `.config`, the cargo registry cache, an unrelated name.
+    for rel in [
+        ".config",
+        ".config/ghost",
+        ".config/helix",
+        ".cargo",
+        ".cargo/registry",
+        ".cargo/bin",
+        "gh",
+        "proj/.npmrc.d",
+    ] {
+        assert_eq!(sensitive_kind(&home.join(rel), Some(&home)), None, "{rel}");
+    }
+}
+
+#[test]
+fn the_verbose_line_names_the_launch_and_carries_the_redacted_argv() {
+    let set = crate::secrets::SecretSet::default();
+    let line = launch_argv_line(
+        "mcp[a\nb]",
+        Path::new("/usr/bin/bwrap"),
+        &os(&["--unshare-all", "--", "srv", "--token=abcdefghij"]),
+        &set,
+    );
+    assert_eq!(
+        line,
+        "mcp[a\\u{a}b]: sandbox command line: /usr/bin/bwrap --unshare-all -- srv --token=<redacted>"
+    );
 }

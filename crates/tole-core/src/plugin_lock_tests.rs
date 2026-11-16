@@ -844,3 +844,62 @@ fn ledger_bundle_is_the_last_approval_and_survives_a_revoke() {
     l.push_str(&plain_ledger_line("a", &h, 4));
     assert_eq!(ledger_bundle(&l, "a"), Some(None));
 }
+
+#[test]
+fn a_fallback_line_is_one_json_line_with_names_a_hash_and_a_one_line_reason() {
+    let line = fallback_ledger_line(
+        "files",
+        "server",
+        "sha256:aa",
+        "bubblewrap (bwrap) is not on PATH",
+        7,
+    );
+    assert!(line.ends_with('\n') && line.matches('\n').count() == 1);
+    let v: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
+    assert_eq!(v["v"], 1);
+    assert_eq!(v["kind"], "plugin");
+    assert_eq!(v["event"], "sandbox_fallback");
+    assert_eq!(v["server"], "files");
+    assert_eq!(v["profile"], "server");
+    assert_eq!(v["profile_hash"], "sha256:aa");
+    assert_eq!(v["reason"], "bubblewrap (bwrap) is not on PATH");
+    assert_eq!(v["at"], 7);
+    // A reason with control characters stays on one line, shown escaped,
+    // and a long one is cut.
+    let line = fallback_ledger_line("s", "p", "h", "a\nb\x1b[2Jc", 1);
+    assert_eq!(line.matches('\n').count(), 1);
+    assert!(!line.contains('\x1b'));
+    let v: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
+    assert_eq!(v["reason"], "a\\u{a}b\\u{1b}[2Jc");
+    let long = fallback_ledger_line("s", "p", "h", &"x".repeat(5000), 1);
+    let v: serde_json::Value = serde_json::from_str(long.trim_end()).unwrap();
+    assert_eq!(v["reason"].as_str().unwrap().len(), 300);
+}
+
+#[test]
+fn a_fallback_line_changes_no_decision_the_ledger_makes() {
+    let h = manifest_hash(&base());
+    let mut ledger = plain_ledger_line("cora", &h, 1);
+    ledger.push_str(&profile_ledger_line("cora", None, None, 1));
+    let lock = with_profile(None, None);
+    let before = (
+        check_against_ledger(&lock, &ledger).blocked,
+        ledger_profile(&ledger, "cora"),
+        secrets_recorded(&ledger, "cora"),
+        ledger_bundle(&ledger, "cora"),
+    );
+    // Fallback lines at any point (between the approval and its profile
+    // line included) are neither an approval, a revoke nor a profile.
+    let mut with_fallback = plain_ledger_line("cora", &h, 1);
+    with_fallback.push_str(&fallback_ledger_line("cora", "server", "sha256:aa", "x", 2));
+    with_fallback.push_str(&profile_ledger_line("cora", None, None, 1));
+    with_fallback.push_str(&fallback_ledger_line("cora", "server", "sha256:aa", "x", 3));
+    let after = (
+        check_against_ledger(&lock, &with_fallback).blocked,
+        ledger_profile(&with_fallback, "cora"),
+        secrets_recorded(&with_fallback, "cora"),
+        ledger_bundle(&with_fallback, "cora"),
+    );
+    assert_eq!(before, after);
+    assert!(after.0.is_empty());
+}

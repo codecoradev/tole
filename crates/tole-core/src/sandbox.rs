@@ -526,6 +526,28 @@ pub fn build_failure(
     }
 }
 
+/// Why `server` would start UNSANDBOXED under `policy` although a sandbox is
+/// configured for it: `Some(reason)` exactly when [`plan`] returns
+/// `Launch::Direct` with a warning (mode `optional`, a human attached, and
+/// no backend or a wrapper that cannot be built). `None` for a sandboxed,
+/// skipped, refused (`required`, unattended) or unconfigured server, so the
+/// fallback is never reported where [`plan`] does not take it.
+pub fn fallback_reason(
+    policy: &Policy,
+    avail: &Availability,
+    unattended: bool,
+    env: &Env,
+    server: (&str, &str, &[String]),
+) -> Option<String> {
+    if policy.mode != Mode::Optional || unattended || policy.skip.iter().any(|s| s == server.0) {
+        return None;
+    }
+    match avail {
+        Availability::Usable { .. } => build(policy, env, server).err(),
+        Availability::Unavailable(why) => Some(why.clone()),
+    }
+}
+
 /// Decides one launch. Pure: the caller passes what it found.
 pub fn plan(
     policy: Option<&Policy>,

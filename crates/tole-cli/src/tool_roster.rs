@@ -108,7 +108,7 @@ pub fn binary_available(name: &str) -> bool {
 }
 
 /// Env var that turns on the probe notices below (#435).
-pub const VERBOSE_ENV: &str = "TOLE_VERBOSE";
+pub const VERBOSE_ENV: &str = tole_core::sandbox::report::VERBOSE_ENV;
 
 /// A probe miss (an optional binary or the GitHub origin is absent): an
 /// expected state on most machines, so it is printed only with
@@ -122,7 +122,7 @@ fn probe_notice(msg: &str) {
 
 #[cfg_attr(not(feature = "shell-tools"), allow(dead_code))] // probes run only with shell-tools
 fn verbose(env: &dyn Fn(&str) -> Option<String>) -> bool {
-    env(VERBOSE_ENV).is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes"))
+    env(VERBOSE_ENV).is_some_and(|v| tole_core::sandbox::report::verbose_value(&v))
 }
 
 /// The review gate for this session (#534): `Some` only when the policy is
