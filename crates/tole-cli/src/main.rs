@@ -1327,6 +1327,21 @@ fn dispatch(cli: Cli) -> Result<()> {
     #[cfg_attr(not(feature = "shell-tools"), allow(unused_variables))]
     let sessions_dir_override = (settings.sessions_dir.source != config_apply::Source::Default)
         .then(|| PathBuf::from(settings.sessions_dir.value.clone()));
+    // A sessions directory the owner moved (flag or config key) is told to the
+    // command sandbox, which binds it read-only when it is inside the
+    // workspace (#866). The default is under `.tole`, always protected.
+    if let Some(dir) = &sessions_dir_override {
+        let abs = if dir.is_absolute() {
+            Some(dir.clone())
+        } else {
+            std::env::current_dir().ok().map(|cwd| cwd.join(dir))
+        };
+        if let Some(abs) = abs {
+            if let Err(e) = tole_core::sandbox::command::set_sessions_dir(abs) {
+                eprintln!("tole: warning: {e}");
+            }
+        }
+    }
     #[cfg(feature = "mcp")]
     let mcp_specs = merge_mcp_specs(
         &config_apply::values(&settings.mcp_server),

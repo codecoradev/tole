@@ -1685,3 +1685,125 @@ fn a_linked_worktree_elsewhere_in_the_workspace_is_refused() {
     .unwrap();
     assert!(protect_plan(&ws).unwrap_err().contains("larger than"));
 }
+
+// The sessions directory in the plan (#866).
+
+/// A workspace with a `.git` and the given extra directories.
+fn sess_ws(tag: &str, dirs: &[&str]) -> (TestDir, PathBuf) {
+    let (g, ws) = keep(tag);
+    std::fs::create_dir_all(ws.join(".git/hooks")).unwrap();
+    std::fs::write(ws.join(".git/config"), "[core]\n").unwrap();
+    for d in dirs {
+        std::fs::create_dir_all(ws.join(d)).unwrap();
+    }
+    (g, ws)
+}
+
+#[test]
+fn a_direct_child_sessions_dir_is_bound_read_only_after_the_git_dir() {
+    let (_g, ws) = sess_ws("sess-child", &["sessions"]);
+    let plan = protect_plan_with(&ws, Some(&ws.join("sessions"))).unwrap();
+    assert_eq!(plan, [ws.join(".git"), ws.join("sessions")]);
+    // The same plan the argument builder uses reaches the bwrap argv.
+    let a = argv_with_extra_for(&ws, &plan);
+    let p = ws.join("sessions").display().to_string();
+    assert!(has(&a, &["--ro-bind", &p, &p]), "{a:?}");
+    // Without a sessions dir nothing changes (the existing plan).
+    assert_eq!(protect_plan_with(&ws, None).unwrap(), [ws.join(".git")]);
+}
+
+/// Every protected path of a plan is one `--ro-bind p p` in the argv.
+fn argv_with_extra_for(ws: &Path, plan: &[PathBuf]) -> Vec<String> {
+    let mut profile = command_profile(Network::None);
+    profile.protect = plan.to_vec();
+    bwrap_args_for(&profile, Some(ws), None, Path::new("/bin/sh"), &[], true)
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect()
+}
+
+#[test]
+fn a_sessions_dir_outside_missing_or_already_protected_adds_nothing() {
+    let (_g, ws) = sess_ws("sess-none", &[".tole/sessions"]);
+    let outside = tmp("sess-outside");
+    // Outside the workspace: not in the sandbox's view.
+    assert_eq!(
+        protect_plan_with(&ws, Some(&outside)).unwrap(),
+        [ws.join(".git"), ws.join(".tole")]
+    );
+    // Not created yet: nothing to bind (like `.tole`).
+    assert_eq!(
+        protect_plan_with(&ws, Some(&ws.join("later"))).unwrap(),
+        [ws.join(".git"), ws.join(".tole")]
+    );
+    // The default location is under `.tole`, already read-only.
+    assert_eq!(
+        protect_plan_with(&ws, Some(&ws.join(".tole/sessions"))).unwrap(),
+        [ws.join(".git"), ws.join(".tole")]
+    );
+    // A `..` that comes back inside is the same path.
+    let (_g2, ws2) = sess_ws("sess-dots", &["sessions"]);
+    let p = ws2.join("x/../sessions");
+    assert_eq!(
+        protect_plan_with(&ws2, Some(&p)).unwrap(),
+        [ws2.join(".git"), ws2.join("sessions")]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_sessions_dir_that_cannot_be_protected_is_an_error() {
+    let err = |ws: &Path, d: &Path| protect_plan_with(ws, Some(d)).unwrap_err();
+    // Deeper than a direct child (its parent could be renamed and replaced).
+    let (_g, ws) = sess_ws("sess-deep", &["a/sessions"]);
+    let e = err(&ws, &ws.join("a/sessions"));
+    assert!(
+        e.contains("deeper than a direct child") && e.contains(".tole/sessions"),
+        "{e}"
+    );
+    // The workspace itself.
+    let (_g, ws) = sess_ws("sess-ws", &[]);
+    assert!(err(&ws, &ws).contains("is the workspace itself"));
+    // A symbolic link, a file.
+    let (_g, ws) = sess_ws("sess-link", &["real"]);
+    std::os::unix::fs::symlink(ws.join("real"), ws.join("sessions")).unwrap();
+    assert!(err(&ws, &ws.join("sessions")).contains("symbolic link"));
+    let (_g, ws) = sess_ws("sess-file", &[]);
+    std::fs::write(ws.join("sessions"), "x").unwrap();
+    assert!(err(&ws, &ws.join("sessions")).contains("not a directory"));
+    // Outside by name but a link into the workspace: the same place.
+    let (_g, ws) = sess_ws("sess-alias", &["sessions"]);
+    let outside = tmp("sess-alias-out");
+    std::os::unix::fs::symlink(ws.join("sessions"), outside.join("alias")).unwrap();
+    assert!(err(&ws, &outside.join("alias")).contains("through a link"));
+    // The existing refusals are intact: a symlinked `.tole` still refuses
+    // whatever the sessions dir is.
+    let (_g, ws) = sess_ws("sess-tole", &["real-tole", "sessions"]);
+    std::os::unix::fs::symlink(ws.join("real-tole"), ws.join(".tole")).unwrap();
+    assert!(protect_plan_with(&ws, Some(&ws.join("sessions")))
+        .unwrap_err()
+        .contains(".tole"));
+}
+
+#[test]
+fn set_sessions_dir_wants_an_absolute_path() {
+    assert!(set_sessions_dir(PathBuf::from("relative/sessions"))
+        .unwrap_err()
+        .contains("absolute"));
+}
+
+/// A sessions directory named through a link in its PARENT chain (a working
+/// directory under a symlink) is the same place as the real path: bound by its
+/// real path, not refused.
+#[cfg(unix)]
+#[test]
+fn a_sessions_dir_named_through_a_linked_parent_is_bound_by_its_real_path() {
+    let (_g, ws) = sess_ws("sess-parent-link", &["sessions"]);
+    let holder = tmp("sess-parent-link-holder");
+    std::os::unix::fs::symlink(&ws, holder.join("ws-link")).unwrap();
+    let named = holder.join("ws-link/sessions");
+    assert_eq!(
+        protect_plan_with(&ws, Some(&named)).unwrap(),
+        [ws.join(".git"), ws.join("sessions")]
+    );
+}

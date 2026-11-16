@@ -566,6 +566,26 @@ file_size_mb = 4096            # 1 to 1048576, largest file a process writes
   command; it does so through a tool outside the sandbox, or the owner does.
   There is no setting to make `.git` writable.
 
+  **The sessions directory (#866).** Sessions are append-only JSONL, and a
+  command that could rewrite them would break resume, the audit and the cost
+  report. The default `.tole/sessions` is under `.tole`, so it is read-only
+  already. When the owner moved it (`-s`, the `sessions_dir` key) into the
+  workspace, the host tells the sandbox (`command::set_sessions_dir`, an
+  absolute path) and the SAME plan (`protect_plan`, re-checked at every launch by
+  `recheck_plan`) binds it read-only as one more protected path: a command can
+  read the entries but not write, create, rename, remove or replace anything in
+  it, while tole itself, a host process outside the sandbox, keeps writing
+  them. By the rules of `.tole`: it must be a real directory directly under the
+  workspace root (a deeper one could be moved away through its parent, which a
+  mount cannot prevent, and replaced by a planted copy tole then writes into:
+  refused, with the remedy `.tole/sessions`, `./sessions` or a directory outside
+  the workspace); a symbolic link, a file, the workspace itself, or a path that
+  reaches the workspace through a link is refused too; one outside the
+  workspace is not in the sandbox's view; one that does not exist yet is not
+  protected (like `.tole`; the session is created before the first command runs,
+  so in practice it exists). The refusal follows the consumer's policy like
+  every other refusal of the plan.
+
   **Nested gitdirs.** The owner's git also runs a nested repository's config
   and hooks when it is run in the OUTER repository (a planted
   `core.fsmonitor` in a submodule's config fires on a plain `git status`,

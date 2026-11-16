@@ -207,6 +207,30 @@ pub fn consumers() -> Consumers {
     CONSUMERS.get().copied().unwrap_or_default()
 }
 
+/// The sessions directory when the owner moved it (`-s`, `sessions_dir`),
+/// absolute and resolved against the working directory by the host; set once
+/// per process. The default (`.tole/sessions`) needs nothing: it is under
+/// `.tole`, which is always protected.
+static SESSIONS_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Tells the command profile where the sessions are (#866), so a directory
+/// inside the workspace but outside `.tole` is bound read-only like `.git` and
+/// `.tole` (see [`protect_plan`]). `dir` must be absolute. The same value
+/// again is fine; a different one is refused, like [`set_consumers`].
+pub fn set_sessions_dir(dir: PathBuf) -> Result<(), String> {
+    if !dir.is_absolute() {
+        return Err(format!(
+            "the sessions directory {} must be an absolute path",
+            dir.display()
+        ));
+    }
+    if *SESSIONS_DIR.get_or_init(|| dir.clone()) == dir {
+        Ok(())
+    } else {
+        Err("the sessions directory is already set for this process and differs".into())
+    }
+}
+
 /// The built-in `command` profile: workspace writable (the protected paths
 /// are re-bound read-only by the launch), network as the owner chose.
 pub fn command_profile(network: Network) -> Profile {
@@ -324,6 +348,23 @@ const MAX_NESTED: usize = 64;
 /// read-only `.git` there would break repository discovery); see the design
 /// note, residual.
 pub fn protect_plan(ws: &Path) -> Result<Vec<PathBuf>, String> {
+    protect_plan_with(ws, SESSIONS_DIR.get().map(PathBuf::as_path))
+}
+
+/// [`protect_plan`] with the sessions directory given (#866). A sessions
+/// directory inside the workspace is bound read-only too, by the same rules as
+/// `.tole`: it must be a real directory directly under the workspace root (a
+/// mount point cannot be renamed, but an ancestor can, so a deeper one could be
+/// moved away and replaced by a planted copy that the host then writes into);
+/// a link, a file, the workspace itself, a deeper path, or a path that reaches
+/// the workspace through a link is an error and the launch follows the
+/// consumer's policy. One outside the workspace is not in the sandbox's view;
+/// one that does not exist yet is not protected (like `.tole`), and one under
+/// `.git`, `.tole` or `.tole-worktrees` is already read-only.
+pub(crate) fn protect_plan_with(
+    ws: &Path,
+    sessions_dir: Option<&Path>,
+) -> Result<Vec<PathBuf>, String> {
     use std::fs::symlink_metadata;
     let mut protect: Vec<PathBuf> = Vec::new();
     // Whether `p` exists, refusing a link.
@@ -441,10 +482,78 @@ pub fn protect_plan(ws: &Path) -> Result<Vec<PathBuf>, String> {
     for git in nested {
         add_git(&git, &mut protect)?;
     }
+    if let Some(dir) = sessions_dir {
+        plan_sessions_dir(ws, dir, &mut protect)?;
+    }
     // The workspace is resolved, so each of these is already its own resolved
     // path; keep only what is inside it.
     protect.retain(|p| p.starts_with(ws));
     Ok(protect)
+}
+
+/// The sessions directory part of [`protect_plan_with`] (#866).
+fn plan_sessions_dir(ws: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+    let shown = dir.display();
+    // The directory's PARENT is resolved (a working directory reached through a
+    // link is the same place); the directory itself is not: a link there is
+    // what a command could replace.
+    let dir = lexical(dir);
+    let dir = match (dir.parent(), dir.file_name()) {
+        (Some(parent), Some(name)) => std::fs::canonicalize(parent)
+            .map(|p| p.join(name))
+            .unwrap_or(dir),
+        _ => dir,
+    };
+    if !dir.starts_with(ws) {
+        // Outside the workspace by name. A link that leads into it is the same
+        // writable place under another name: refused.
+        let is_link = std::fs::symlink_metadata(&dir).is_ok_and(|m| m.file_type().is_symlink());
+        if is_link && std::fs::canonicalize(&dir).is_ok_and(|c| c.starts_with(ws)) {
+            return Err(format!(
+                "the sessions directory {shown} reaches the workspace through a link, which a \
+                 mount cannot protect; use its real path, or one outside the workspace"
+            ));
+        }
+        return Ok(());
+    }
+    if dir == ws {
+        return Err(format!(
+            "the sessions directory {shown} is the workspace itself, which cannot be made \
+             read-only for a command; use a directory of its own or one outside the workspace"
+        ));
+    }
+    // Already read-only as a whole (the default `.tole/sessions`, or under
+    // `.git`, `.tole-worktrees`).
+    if out.iter().any(|p| dir.starts_with(p)) {
+        return Ok(());
+    }
+    if dir.parent() != Some(ws) {
+        return Err(format!(
+            "the sessions directory {shown} is deeper than a direct child of the workspace: a \
+             command could rename its parent and plant a copy that tole then writes into, and a \
+             mount cannot prevent that; use `.tole/sessions` (the default), a direct child such \
+             as ./sessions, or a directory outside the workspace"
+        ));
+    }
+    match std::fs::symlink_metadata(&dir) {
+        Ok(m) if m.file_type().is_symlink() => Err(format!(
+            "the sessions directory {shown} is a symbolic link, which a mount cannot protect \
+             (the command could replace it); make it a real directory"
+        )),
+        Ok(m) if m.is_dir() => {
+            out.push(dir);
+            Ok(())
+        }
+        Ok(_) => Err(format!(
+            "the sessions directory {shown} is not a directory, so it cannot be protected"
+        )),
+        // Not created yet: like `.tole`, nothing to bind (bubblewrap would
+        // have to create the mount point in the real workspace).
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!(
+            "cannot inspect the sessions directory {shown} ({e})"
+        )),
+    }
 }
 
 /// Most entries of a `hooks` directory looked at.

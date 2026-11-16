@@ -230,11 +230,12 @@ jobs:
           cargo test -p tole-core --features mcp \
             --test mcp_sandbox --test mcp_sandbox_lifecycle --test mcp_sandbox_idle \
             --test command_sandbox --test stopgate_sandbox \
+            --test command_sandbox_sessions --test command_sandbox_sessions_refused \
             -- --nocapture --test-threads=1 2>&1 | tee sandbox.log
           # Belt and braces: TOLE_REQUIRE_BWRAP already fails a skip, and the
           # tests must really have run (not zero tests, no SKIPPED line).
           if grep -n "SKIPPED" sandbox.log; then echo "a sandbox test was skipped"; exit 1; fi
-          [ "$(grep -c '^test result: ok\. [1-9]' sandbox.log)" -eq 5 ] || { echo "expected 5 test targets with passing tests"; exit 1; }
+          [ "$(grep -c '^test result: ok\. [1-9]' sandbox.log)" -eq 7 ] || { echo "expected 7 test targets with passing tests"; exit 1; }
       # The mission verify command and the stop gates end to end with the
       # real binary (#748): a sandboxed verify cannot write .git/hooks.
       - name: Sandbox tests (mission verify, stop gates)
