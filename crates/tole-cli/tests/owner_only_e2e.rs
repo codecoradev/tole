@@ -88,6 +88,8 @@ fn owner_commands() -> Vec<Vec<&'static str>> {
         vec!["cron", "edit", "job-x", "--script", "echo pwned"],
         vec!["skills", "approve", "evil", "--hash", "sha256:00"],
         vec!["skills", "drafts", "promote", "d-1", "--hash", "sha256:00"],
+        vec!["skills", "drafts", "revoke", "s-1"],
+        vec!["skills", "revoke", "evil"],
         vec!["config", "trust", "--yes"],
         vec![
             "delegation",
