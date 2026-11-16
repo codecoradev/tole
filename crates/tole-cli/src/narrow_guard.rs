@@ -42,6 +42,17 @@
 //! started by the owner with their own flags and are exempt. An owner at a
 //! terminal has no marker and is unchanged.
 //!
+//! WITHOUT THE MARKER (#867): the marker is an environment variable a script
+//! can strip, so the guard also applies, marker or not, when the process has no
+//! terminal (stdin AND stderr, the `--no-sandbox` rule) AND the user config sets
+//! `[sandbox]` or `[secrets]` (something worth protecting; a user config that sets
+//! neither leaves owner scripts and CI exactly as before). A tole that tole
+//! itself started (it carries the child variables, `TOLE_AGENT_DEPTH` and the
+//! like, and has no terminal either) is exempt on this path, for the reason
+//! above: its scope is enforced in the parent. An owner at a terminal is
+//! unchanged. Same limit: a deliberate pty, a forged child variable or a cleared
+//! environment gets past it; the sandbox is the boundary.
+//!
 //! WHAT IT CHECKS: flags and environment only. The project config and `--config`
 //! are not inputs here: they pass the owner's trust gate (`tole config trust`).
 //! NOT COVERED: `--profile` (a profile's `allow` replaces the allow list when no
@@ -68,20 +79,40 @@ pub struct Context {
     pub session_marker: bool,
     /// The subcommand is `serve`, `acp` or `mcp`.
     pub exempt_face: bool,
+    /// stdin and stderr are both terminals.
+    pub tty: bool,
+    /// A child variable of a tole that tole itself started is present
+    /// (`TOLE_AGENT_DEPTH`, `TOLE_AGENT_ID`, the delegation variables). Only
+    /// used on the no-terminal path; it never exempts a marked process.
+    pub child_variables: bool,
 }
 
 impl Context {
     /// Reads the markers from `env`.
-    pub fn from_env(env: &dyn Fn(&str) -> Option<String>, exempt_face: bool) -> Self {
+    pub fn from_env(env: &dyn Fn(&str) -> Option<String>, exempt_face: bool, tty: bool) -> Self {
         let set = |k: &str| env(k).is_some_and(|v| !v.trim().is_empty());
         Context {
             session_marker: set(child_env::UNDER_SESSION),
             exempt_face,
+            tty,
+            child_variables: [
+                child_env::DEPTH,
+                child_env::AGENT_ID,
+                child_env::DELEGATION_LOG,
+                child_env::DELEGATION_NODE,
+                child_env::DELEGATION_REPORT,
+            ]
+            .iter()
+            .any(|k| set(k)),
         }
     }
 
-    fn applies(&self) -> bool {
-        self.session_marker && !self.exempt_face
+    /// Whether the guard applies: a marked process (not on the faces), or an
+    /// unmarked one with no terminal that is not a child tole itself started,
+    /// when `protected` (the user config sets something worth protecting).
+    fn applies(&self, protected: bool) -> bool {
+        !self.exempt_face
+            && (self.session_marker || (!self.tty && !self.child_variables && protected))
     }
 }
 
@@ -134,7 +165,8 @@ const WAY_OUT: &str = "an agent session may only narrow the owner's policy; chan
 /// when there is none. `Ok(())`: nothing to refuse. A refusal names the key,
 /// the user-config value and the way out.
 pub fn check(user: Option<&Config>, input: &Inputs, ctx: &Context) -> Result<(), String> {
-    let Some(user) = user.filter(|_| ctx.applies()) else {
+    let protected = user.is_some_and(|u| crate::no_config_guard::protected_keys(u).is_some());
+    let Some(user) = user.filter(|_| ctx.applies(protected)) else {
         return Ok(());
     };
     // allow: non-deny entries a subset, every user deny kept.
@@ -203,6 +235,8 @@ mod tests {
         Context {
             session_marker: true,
             exempt_face: false,
+            tty: false,
+            child_variables: false,
         }
     }
 
@@ -253,22 +287,82 @@ mod tests {
                     .map(|(_, v)| v.to_string())
             }
         };
-        assert!(Context::from_env(&env(&[("TOLE_UNDER_SESSION", "1")]), false).session_marker);
+        assert!(
+            Context::from_env(&env(&[("TOLE_UNDER_SESSION", "1")]), false, false).session_marker
+        );
         // A blank marker is no marker; child variables alone are not the marker.
-        assert!(!Context::from_env(&env(&[("TOLE_UNDER_SESSION", " ")]), false).session_marker);
-        assert!(!Context::from_env(&env(&[("TOLE_AGENT_DEPTH", "1")]), false).session_marker);
+        assert!(
+            !Context::from_env(&env(&[("TOLE_UNDER_SESSION", " ")]), false, false).session_marker
+        );
+        assert!(
+            !Context::from_env(&env(&[("TOLE_AGENT_DEPTH", "1")]), false, false).session_marker
+        );
         // A script a child agent's run_command started carries BOTH, and is
         // guarded: the child variables it inherited do not exempt it.
         let both = Context::from_env(
             &env(&[("TOLE_UNDER_SESSION", "1"), ("TOLE_AGENT_DEPTH", "1")]),
             false,
+            false,
         );
+        assert!(both.child_variables, "child variables are noted");
         let u = user(|c| c.allow = Some(v(&["read_*"])));
         let wide = Inputs {
             allow: v(&["*"]),
             ..Inputs::default()
         };
         assert!(check(Some(&u), &wide, &both).is_err());
+    }
+
+    /// #867: without the marker the guard also applies when there is no
+    /// terminal and the user config sets `[sandbox]` or `[secrets]`; a tole
+    /// that tole itself started (child variables), an owner at a terminal, the
+    /// faces, and a user config that protects nothing are unchanged.
+    #[test]
+    fn without_the_marker_it_applies_to_a_no_terminal_run_under_a_protected_user_config() {
+        let protected = user(|c| {
+            c.allow = Some(v(&["read_*"]));
+            c.sandbox = Some(Default::default());
+        });
+        let plain = user(|c| c.allow = Some(v(&["read_*"])));
+        let wide = Inputs {
+            allow: v(&["*"]),
+            ..Inputs::default()
+        };
+        let script = Context {
+            session_marker: false,
+            exempt_face: false,
+            tty: false,
+            child_variables: false,
+        };
+        // No marker, no terminal, protected: refused.
+        let e = check(Some(&protected), &wide, &script).unwrap_err();
+        assert!(e.contains("--allow") && e.contains("#865"), "{e}");
+        // A user config that protects nothing: unchanged.
+        assert_eq!(check(Some(&plain), &wide, &script), Ok(()));
+        // At a terminal, a child tole itself started, the faces: unchanged.
+        for ctx in [
+            Context {
+                tty: true,
+                ..script
+            },
+            Context {
+                child_variables: true,
+                ..script
+            },
+            Context {
+                exempt_face: true,
+                ..script
+            },
+        ] {
+            assert_eq!(check(Some(&protected), &wide, &ctx), Ok(()), "{ctx:?}");
+        }
+        // Child variables never exempt a MARKED process.
+        let marked = Context {
+            session_marker: true,
+            child_variables: true,
+            ..script
+        };
+        assert!(check(Some(&protected), &wide, &marked).is_err());
     }
 
     #[test]

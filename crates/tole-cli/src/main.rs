@@ -873,9 +873,24 @@ fn main() {
     let cli = Cli::parse();
     // `--no-config` drops the owner's user config: owner at a terminal only
     // (#855). Before anything reads the config or starts a command.
+    // stdin and stderr both terminals: the `--no-sandbox` rule (#867).
+    let has_terminal = {
+        use std::io::IsTerminal;
+        std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
+    };
     let no_config_ctx = tole_cli::no_config_guard::Context {
         under_session: tole_core::child_env::under_session(&|k| std::env::var(k).ok()),
         unattended_command: sandbox_flag_class(&cli.command).0,
+        tty: has_terminal,
+        // The user config is read only to decide, and only when the flag is
+        // given and there is no terminal; unreadable keeps the strict rule.
+        user_protects: (cli.no_config && !has_terminal)
+            .then(|| {
+                tole_cli::no_config_guard::user_config_protects(
+                    tole_cli::config::user_config_path().as_deref(),
+                )
+            })
+            .flatten(),
     };
     if let Err(e) = tole_cli::no_config_guard::check(cli.no_config, &no_config_ctx) {
         eprintln!("tole: {e}");
@@ -1285,8 +1300,12 @@ fn dispatch(cli: Cli) -> Result<()> {
     // not a boundary (the command sandbox is).
     {
         let env = &config_apply::real_env;
+        let tty = {
+            use std::io::IsTerminal;
+            std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
+        };
         let ctx =
-            tole_cli::narrow_guard::Context::from_env(env, sandbox_flag_class(&cli.command).0);
+            tole_cli::narrow_guard::Context::from_env(env, sandbox_flag_class(&cli.command).0, tty);
         let inputs = tole_cli::narrow_guard::Inputs::from_flags(&config_flags(&cli), env);
         tole_cli::narrow_guard::check(user_cfg_for_guard.as_ref(), &inputs, &ctx)
             .map_err(|e| anyhow!("{e}"))?;

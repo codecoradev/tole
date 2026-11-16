@@ -392,9 +392,18 @@ servers; `[sandbox.consumers]` is not touched by either.
   the two flags: refused under an agent session (`TOLE_UNDER_SESSION`, child
   agent) and for `tole serve`, `tole acp` and `tole mcp`; honoured for the
   owner at a terminal (`no_config_guard`). The marker is an environment
-  variable, so this covers processes tole started, not a script that strips
-  it; a different `CODECORA_HOME` is the owner's own choice and is not
-  refused.
+  variable, so that part covers processes tole started, not a script that
+  strips it; a different `CODECORA_HOME` is the owner's own choice and is not
+  refused. For the script that strips it (#867), `--no-config` ALSO needs a
+  terminal (stdin and stderr, the `--no-sandbox` rule) when the USER config
+  sets `[sandbox]` (mode, profiles, servers, consumers) or a non-empty
+  `[secrets]`: a script has no terminal, a deliberate pty is the one thing that
+  gets past it. The user config is read only to decide and fail closed (a file
+  that cannot be inspected or parsed keeps the strict rule). When the user
+  config sets neither, nothing is protected, and owner scripts and CI work
+  exactly as before. The refusal names the keys and ends with `(issue #867)`.
+  The marker is NOT a security boundary and neither is the terminal; the
+  command sandbox, which masks the data dir, is. No new marker was added.
 - The policy lists follow the same marker (#865, `narrow_guard`). The resolved
   lists (`allow`, `trust`, the hook lists) follow `flag > env > config` and a
   higher layer REPLACES the whole list below it, so a `tole run --allow '*'`
@@ -404,7 +413,15 @@ servers; `[sandbox.consumers]` is not touched by either.
   `trust` (flag, else `TOLE_TRUST`) an exact subset of the user's presets, and a
   hook list (`on_pretool`, `on_posttool`, `on_turnend`) must contain every
   user hook; `plan_mode` has no off switch on the command line or in the
-  environment, so nothing needs refusing. It applies to a process with
+  environment, so nothing needs refusing. Without the marker (#867) the same
+  rule also applies to a process with no terminal (stdin and stderr) when the
+  user config sets `[sandbox]` or `[secrets]` and it is not a child tole itself
+  started (it carries the child variables) nor `serve`, `acp` or `mcp`: an owner
+  script or CI that ran `tole run --allow X` against a user config that sets a
+  different `allow` AND `[sandbox]` now needs the pattern in the user config or
+  a terminal; a user config that sets no `[sandbox]` and no `[secrets]` is
+  unchanged. The rest of this bullet describes the marked case. It applies to a
+  process with
   `TOLE_UNDER_SESSION` (set by `run_command` and `job_start` on what they
   start, and by nothing else) that is not `serve`, `acp` or `mcp`; the child
   variables (`TOLE_AGENT_DEPTH` and the like) are inherited by everything a
