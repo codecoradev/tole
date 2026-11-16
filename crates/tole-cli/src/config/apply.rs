@@ -1348,16 +1348,59 @@ pub fn load_project_config(
 /// project config (secret-like keys, trust presets, unknown keys). On
 /// success one `tole: using user config <path>` line goes to `io.inform`.
 pub fn load_user_config(path: Option<&Path>, io: &mut dyn ConfigTrustIo) -> Result<Option<Loaded>> {
-    let Some(path) = path.filter(|p| p.exists()) else {
+    let Some(path) = path else {
         return Ok(None);
     };
+    // `Path::exists` reads an I/O error (permission denied, a parent that is
+    // not a directory) as "not there": the owner's policy would silently
+    // vanish (#864). Only a path that is really absent is "no user config".
+    match crate::config::user_config_present(path) {
+        Ok(true) => {}
+        Ok(false) => return Ok(None),
+        Err(m) => return Err(anyhow!("{m}")),
+    }
     let config = crate::config::load(path).map_err(|e| anyhow!("{e}"))?;
     let shown = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     io.inform(&format!(
         "tole: using user config {}",
-        config_trust::sanitize(&shown.display().to_string())
+        crate::config::one_line_path(&shown)
     ));
     Ok(Some(Loaded { shown, config }))
+}
+
+/// What decides whether an absent user config is announced (#864).
+#[derive(Debug, Clone, Copy)]
+pub struct AbsentCtx {
+    /// `CODECORA_HOME` is set to something (the owner's override, or not).
+    pub root_overridden: bool,
+    /// A session started this process (`child_env::under_session`).
+    pub under_session: bool,
+    /// The subcommand is never attended (`serve`, `acp`, `mcp`).
+    pub unattended_command: bool,
+}
+
+/// The one-line notice for a user config that is not there, or `None` when
+/// saying nothing is right: an owner on the default path with no config chose
+/// the defaults, and an OS cron mails stderr. The notice is for the unusual
+/// cases, where "no file" may be a wrong directory rather than a choice:
+/// the data directory cannot be resolved (`path` is `None`), the root comes
+/// from `CODECORA_HOME`, a session started this process, or the face is
+/// unattended. The absent case only; a file that exists is announced by
+/// [`load_user_config`].
+pub fn absent_user_config_notice(path: Option<&Path>, ctx: &AbsentCtx) -> Option<String> {
+    const TAIL: &str = "(sandbox, approvals and secret release use their defaults)";
+    let Some(path) = path else {
+        return Some(format!(
+            "tole: cannot resolve the tole data directory (HOME is unset or CODECORA_HOME is \
+             relative): no user config is read; the defaults apply {TAIL}"
+        ));
+    };
+    (ctx.root_overridden || ctx.under_session || ctx.unattended_command).then(|| {
+        format!(
+            "tole: no user config at {}; the defaults apply {TAIL}",
+            crate::config::one_line_path(path)
+        )
+    })
 }
 
 #[cfg(test)]

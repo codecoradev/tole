@@ -82,7 +82,14 @@ fn a_no_config_changes_nothing() {
         .stdin(Stdio::null());
     let plain = c.output().unwrap();
     assert!(plain.status.success(), "{}", text(&plain.stderr));
-    assert_eq!(text(&plain.stderr), "", "nothing extra on stderr");
+    // Only the #864 notice: with no resolvable data directory the user config
+    // cannot be read, and that is said once. No project-config chatter.
+    let err = text(&plain.stderr);
+    assert_eq!(err.lines().count(), 1, "{err}");
+    assert!(
+        err.starts_with("tole: cannot resolve the tole data directory"),
+        "{err}"
+    );
     assert!(
         text(&plain.stdout).contains("no sessions in .tole/sessions"),
         "{}",
@@ -94,7 +101,9 @@ fn a_no_config_changes_nothing() {
     assert_eq!(plain.stdout, nc.stdout);
     assert_eq!(nc.stderr, b"");
     // `status` of an unknown id keeps today's failure and message.
-    let st = tole(&d, &home, &["status", "nope"]);
+    // (`--no-config` keeps stderr exactly as it was; without it, the home here is
+    // a `CODECORA_HOME` override with no user config, announced first, #864.)
+    let st = tole(&d, &home, &["--no-config", "status", "nope"]);
     assert!(!st.status.success());
     assert_eq!(
         text(&st.stderr),
@@ -108,7 +117,13 @@ fn a_empty_tole_dir_without_config_toml_is_still_no_config() {
     std::fs::create_dir_all(d.join(".tole/sessions")).unwrap();
     let o = tole(&d, &tmpdir(), &["sessions"]);
     assert!(o.status.success());
-    assert_eq!(text(&o.stderr), "");
+    // No project config: nothing about one. The home here is a
+    // `CODECORA_HOME` override with no user config, which is announced (#864).
+    let err = text(&o.stderr);
+    assert!(
+        err.starts_with("tole: no user config at ") && err.lines().count() == 1,
+        "{err}"
+    );
 }
 
 // ---------------------------------------------- (b) untrusted + non-tty
@@ -149,11 +164,14 @@ fn c_trusted_config_is_used_and_sessions_dir_is_honored_everywhere() {
     let o = tole(&d, &home, &["sessions"]);
     assert!(o.status.success(), "{}", text(&o.stderr));
     let err = text(&o.stderr);
-    assert_eq!(err.lines().count(), 1, "{err}");
+    // The project line, then the #864 notice (the test home is a
+    // `CODECORA_HOME` override with no user config).
+    assert_eq!(err.lines().count(), 2, "{err}");
     assert!(
         err.starts_with("tole: using config ") && err.contains(".tole/config.toml"),
         "{err}"
     );
+    assert!(err.contains("tole: no user config at "), "{err}");
     assert!(text(&o.stdout).contains("no sessions in cfg-sessions"));
     // `status` looks in the same directory as `sessions`.
     let o = tole(&d, &home, &["status", "nope"]);

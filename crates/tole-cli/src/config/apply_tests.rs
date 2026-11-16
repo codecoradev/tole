@@ -1609,3 +1609,116 @@ fn config_check_reports_the_discussion_timeout_and_ignores_a_project_one() {
         "{out}"
     );
 }
+
+// ---- #864: a user config that is not there, or cannot be inspected
+
+#[test]
+fn a_missing_user_config_file_is_none_and_an_uninspectable_path_is_an_error() {
+    let d = tmpdir();
+    let mut io = Fake::new(false, false);
+    // Absent: "no user config".
+    assert!(load_user_config(Some(&d.join("absent.toml")), &mut io)
+        .unwrap()
+        .is_none());
+    assert!(load_user_config(None, &mut io).unwrap().is_none());
+    // A parent that is a FILE: `exists()` says false, `try_exists` is an error.
+    let file = d.join("a-file");
+    std::fs::write(&file, "x").unwrap();
+    let bad = file.join("config.toml");
+    assert!(!bad.exists(), "the old check read this as absent");
+    let e = load_user_config(Some(&bad), &mut io)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains("cannot inspect the user config") && e.contains("a-file"),
+        "{e}"
+    );
+    assert!(io.shown.is_empty(), "nothing announced: {}", io.shown);
+}
+
+fn ctx(root: bool, session: bool, unattended: bool) -> AbsentCtx {
+    AbsentCtx {
+        root_overridden: root,
+        under_session: session,
+        unattended_command: unattended,
+    }
+}
+
+#[test]
+fn the_absent_notice_is_for_the_unusual_cases_only() {
+    let p = Path::new("/h/.codecora/tole/config.toml");
+    // The default path, an attended owner or a cron tick: silent.
+    assert_eq!(
+        absent_user_config_notice(Some(p), &ctx(false, false, false)),
+        None
+    );
+    // Each unusual case alone is announced, naming the path and the effect.
+    for c in [
+        ctx(true, false, false),
+        ctx(false, true, false),
+        ctx(false, false, true),
+    ] {
+        let n = absent_user_config_notice(Some(p), &c).unwrap();
+        assert!(
+            n.starts_with("tole: no user config at /h/.codecora/tole/config.toml")
+                && n.contains("sandbox, approvals and secret release use their defaults"),
+            "{n}"
+        );
+    }
+    // An unresolvable data directory is always announced.
+    let n = absent_user_config_notice(None, &ctx(false, false, false)).unwrap();
+    assert!(n.contains("cannot resolve the tole data directory"), "{n}");
+    // The path is terminal-safe.
+    let n = absent_user_config_notice(
+        Some(Path::new("/x/\u{1b}[31m/c.toml")),
+        &ctx(true, false, false),
+    )
+    .unwrap();
+    assert!(!n.contains('\u{1b}'), "{n:?}");
+}
+
+#[test]
+fn a_path_in_a_user_config_message_is_one_short_line() {
+    use crate::config::one_line_path;
+    // A newline, a carriage return and an escape sequence cannot forge a line
+    // or drive the terminal.
+    let nasty = Path::new("/x/a\nb\rc\u{1b}[31md/config.toml");
+    let s = one_line_path(nasty);
+    assert!(
+        !s.contains('\n') && !s.contains('\r') && !s.contains('\u{1b}'),
+        "{s:?}"
+    );
+    assert_eq!(s, "/x/a\\nb\\rc\\u{1b}[31md/config.toml");
+    // An over-long path is cut with an ellipsis.
+    let long = format!("/{}", "a".repeat(500));
+    let s = one_line_path(Path::new(&long));
+    assert!(
+        s.chars().count() <= 201 && s.ends_with('\u{2026}'),
+        "{}",
+        s.len()
+    );
+    // An ordinary path is untouched.
+    assert_eq!(
+        one_line_path(Path::new("/h/.codecora/tole/config.toml")),
+        "/h/.codecora/tole/config.toml"
+    );
+}
+
+#[test]
+fn the_messages_carry_a_single_line_path_and_the_error_names_the_way_out() {
+    let d = tmpdir();
+    let file = d.join("evil\nforged: line");
+    std::fs::write(&file, "x").unwrap();
+    let bad = file.join("config.toml");
+    let mut io = Fake::new(false, false);
+    let e = load_user_config(Some(&bad), &mut io)
+        .unwrap_err()
+        .to_string();
+    assert_eq!(e.lines().count(), 1, "{e:?}");
+    assert!(
+        e.contains("--no-config") && e.contains("CODECORA_HOME") && e.contains("evil\\nforged"),
+        "{e}"
+    );
+    let n = absent_user_config_notice(Some(&bad), &ctx(true, false, false)).unwrap();
+    assert_eq!(n.lines().count(), 1, "{n:?}");
+}

@@ -120,12 +120,16 @@ pub fn run_serve(cfg: ServeConfig) -> Result<()> {
         .context("resolving --workspace for the session jail root")?;
     // Webhook routes (#582), user config only: a route that cannot load
     // stops the server here, before it listens.
-    let hook_cfg = match tole_cli::config::user_config_path().filter(|p| p.exists()) {
-        Some(p) => tole_cli::config::load(&p)
-            .map_err(|e| anyhow::anyhow!("{e}"))?
-            .hooks
-            .unwrap_or_default(),
-        None => Default::default(),
+    let hook_cfg = match tole_cli::config::user_config_path() {
+        Some(p)
+            if tole_cli::config::user_config_present(&p).map_err(|e| anyhow::anyhow!("{e}"))? =>
+        {
+            tole_cli::config::load(&p)
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+                .hooks
+                .unwrap_or_default()
+        }
+        _ => Default::default(),
     };
     let loopback = cfg.bind == "localhost"
         || cfg

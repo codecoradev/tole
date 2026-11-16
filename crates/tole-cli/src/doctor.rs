@@ -838,9 +838,13 @@ pub fn run_cli(
     }
     // Model routing (#586): state, rule and tier names only. Tiers and rules
     // live in the user config; a broken router fails the doctor.
-    let user = crate::config::user_config_path()
-        .filter(|p| p.exists())
-        .map(|p| crate::config::load(&p));
+    let user = crate::config::user_config_path().and_then(|p| {
+        match crate::config::user_config_present(&p) {
+            Ok(true) => Some(crate::config::load(&p).map_err(|e| e.to_string())),
+            Ok(false) => None,
+            Err(e) => Some(Err(e)),
+        }
+    });
     let router_lines = match &user {
         None => crate::routing::doctor_lines(&crate::config::Config::default()),
         Some(Ok(c)) => crate::routing::doctor_lines(c),

@@ -1131,23 +1131,39 @@ fn dispatch(cli: Cli) -> Result<()> {
     // the skip list (#863): their agent runs and scripts need the owner's
     // sandbox, consumers, secret release and sensitive files like `tole run`.
     // A user config that does not parse stops them here (fail closed).
-    let user_config =
-        if (policy == GatePolicy::Skip && !runs_cron_jobs(&cli.command)) || cli.no_config {
-            None
-        } else {
-            // `tole cron tick` is what an OS cron launches: a `using user config`
-            // line on every successful run would be one mail a minute under
-            // MAILTO. Without a terminal on stderr the line is dropped for the
-            // two job-running commands; an error is never dropped.
-            let quiet = runs_cron_jobs(&cli.command) && {
-                use std::io::IsTerminal;
-                !std::io::stderr().is_terminal()
-            };
-            config_apply::load_user_config(
-                tole_cli::config::user_config_path().as_deref(),
-                &mut config_apply::StartupIo::new(false).quiet_inform(quiet),
-            )?
+    let user_config = if (policy == GatePolicy::Skip && !runs_cron_jobs(&cli.command))
+        || cli.no_config
+    {
+        None
+    } else {
+        // `tole cron tick` is what an OS cron launches: a `using user config`
+        // line on every successful run would be one mail a minute under
+        // MAILTO. Without a terminal on stderr the line is dropped for the
+        // two job-running commands; an error is never dropped.
+        let quiet = runs_cron_jobs(&cli.command) && {
+            use std::io::IsTerminal;
+            !std::io::stderr().is_terminal()
         };
+        let path = tole_cli::config::user_config_path();
+        let loaded = config_apply::load_user_config(
+            path.as_deref(),
+            &mut config_apply::StartupIo::new(false).quiet_inform(quiet),
+        )?;
+        // A missing file is announced only where it may be a wrong
+        // directory rather than a choice (#864); an owner on the default
+        // path, and a cron tick there, stay silent.
+        if loaded.is_none() {
+            let ctx = config_apply::AbsentCtx {
+                root_overridden: std::env::var("CODECORA_HOME").is_ok_and(|v| !v.trim().is_empty()),
+                under_session: tole_core::child_env::under_session(&|k| std::env::var(k).ok()),
+                unattended_command: sandbox_flag_class(&cli.command).0,
+            };
+            if let Some(note) = config_apply::absent_user_config_notice(path.as_deref(), &ctx) {
+                eprintln!("{note}");
+            }
+        }
+        loaded
+    };
     let cfg = match (project_config, user_config) {
         (None, None) => None,
         (p, u) => {
