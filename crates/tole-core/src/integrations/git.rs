@@ -14,31 +14,44 @@
 //! whitelisted — push stays a human action.
 //!
 //! This tool runs on the HOST, outside any command sandbox, and git executes
-//! what the repository's config and hooks name. Hardening (#748, the `.git` of
-//! a sandboxed command is read-only, so writes go through this tool):
-//! - ALWAYS `-c core.fsmonitor=false` (performance only, no feature lost: a
-//!   `core.fsmonitor` command in a repository config never runs here);
-//! - when any command consumer is on (`[sandbox.consumers]`), also
-//!   `-c core.hooksPath=<repo>/.git/hooks`, `GIT_CONFIG_NOSYSTEM=1`, and
-//!   `--no-ext-diff --no-textconv` for `diff`; and the tool REFUSES every op
-//!   unless a real `.git` directory enclosing the workdir was already there
-//!   when the tool was constructed at start-up (a repository a sandboxed
-//!   command created or replaced since is not trusted: its hooks, its
-//!   `filter.*.clean` and `gpg.program` in a config it wrote would run on the
-//!   host) and refuses a workdir that is itself a bare repository (git would
-//!   use it instead of the enclosing repository). The pinned `.git/hooks` is
-//!   read-only and owner-trusted only because of that snapshot (`.git` is
-//!   read-only for a sandboxed command, #849). With no consumer on, hooks and
-//!   the rest behave as they always did.
+//! what the repository's config, hooks and attributes name. Hardening (#748:
+//! the `.git` of a sandboxed command is read-only, so writes go through this
+//! tool). The principle: with any command consumer on (`[sandbox.consumers]`),
+//! NO host-side code execution is reachable from state a sandboxed command can
+//! write, whenever and by whomever the repository was created (no trust in a
+//! repository's identity or age).
+//! - ALWAYS `-c core.fsmonitor=false` (performance only, no feature lost);
+//! - with a consumer on:
+//!   - `-c core.hooksPath=/dev/null` and `--no-verify` on commit: NO hook runs
+//!     for a commit made through this tool, the owner's own pre-commit and
+//!     commit-msg included (a human's own `git commit` still runs them);
+//!   - `GIT_CONFIG_NOSYSTEM=1`, `--no-ext-diff --no-textconv` on diff, and
+//!     `--ignore-submodules=all` on status and diff (so git never descends into
+//!     a nested repository and its unvetted config);
+//!   - before every op the repository is VETTED: git itself says which git
+//!     directory it uses (`rev-parse`, same hardened options) and the tool
+//!     refuses unless that is a plain `.git` directory at the work tree root
+//!     (not bare, not a linked worktree or submodule gitdir file, no separate
+//!     git dir); then that directory's `config` is read WITHOUT running anything
+//!     (`git config --file`, no includes followed) and the tool refuses, naming
+//!     the key and the way out, if it holds any key outside a small allowlist of
+//!     inert ones (see [`inert_key`]): everything that can name a program or a
+//!     file to run or include (`filter.*`, `core.fsmonitor`, `core.hooksPath`,
+//!     `core.sshCommand`, `gpg.*`, `include.*`, `alias.*`, `core.worktree`,
+//!     `extensions.*`, ...) is refused. This holds for a repository a sandboxed
+//!     command created, replaced or rewrote at any time. `add` is also refused
+//!     while the index holds a submodule entry (git would run git inside the
+//!     nested repository, whose config nothing vets, and no option stops that).
 //!
-//!   Residuals (owner choices, documented in the design note): the owner's own
-//!   hooks run workspace content (lint, make, npm test, a pre-commit framework
-//!   that runs files a sandboxed command may have modified); an owner config
-//!   `include.path` that points at a workspace file lets that file define
-//!   `filter.*.clean`, `gpg.program` or `core.sshCommand`, which then run on
-//!   the host through add and commit; `GIT_CONFIG_NOSYSTEM=1` drops
-//!   `/etc/gitconfig` (safe.directory, credential helpers, user.*, policy), so
-//!   a repository owned by another user can fail with "dubious ownership".
+//!   With no consumer on, hooks and config behave as they always did.
+//!
+//!   Residuals (documented in the design note): a still-running sandboxed
+//!   process (a `job_start` from an earlier turn, a long command) can write the
+//!   config between the vet and the run of a later call; the next call refuses.
+//!   An owner (global) config `include.path` that points at a workspace file is
+//!   the owner's own choice and is not vetted; `GIT_CONFIG_NOSYSTEM=1` drops
+//!   `/etc/gitconfig` (safe.directory, credential helpers, user.*), so a
+//!   repository owned by another user can fail with "dubious ownership".
 
 use crate::subprocess::run_with_timeout;
 use crate::tool::{Risk, Tool};
@@ -184,8 +197,8 @@ impl GitOp {
 }
 
 /// Whether any command consumer (`run_command`, `job_start`, verify, stop
-/// gates, cron scripts and deliveries, and any added later) runs in the sandbox, which is when this tool
-/// hardens its invocation beyond `core.fsmonitor`.
+/// gates, cron scripts and deliveries, and any added later) runs in the sandbox,
+/// which is when this tool hardens and vets (see the module doc).
 fn consumers_on() -> bool {
     use crate::sandbox::command::{consumers, Consumer};
     let c = consumers();
@@ -194,61 +207,78 @@ fn consumers_on() -> bool {
         .any(|k| c.mode(*k) != crate::sandbox::Mode::Off)
 }
 
-/// The `.git` directory of the nearest enclosing repository when it is a
-/// REAL directory (not a file or a link: a link or a gitdir file could lead
-/// anywhere), else `None`. Its `hooks` is the directory pinned when hardened.
-fn real_git_dir(workdir: Option<&Path>) -> Option<PathBuf> {
-    let start = match workdir {
-        Some(d) => d.to_path_buf(),
-        None => std::env::current_dir().ok()?,
-    };
-    let start = std::fs::canonicalize(start).ok()?;
-    for dir in start.ancestors() {
-        let git = dir.join(".git");
-        match std::fs::symlink_metadata(&git) {
-            Ok(m) if m.is_dir() => return Some(git),
-            Ok(_) => return None,
-            Err(_) => continue,
-        }
-    }
-    None
-}
-
 /// The full argv after the program: the global `-c` options, then the op's
-/// own argv. `hardened` is [`consumers_on`]; `hooks_dir` the pinned hooks
-/// directory (`None`: `/dev/null`).
-pub(crate) fn invocation(
-    op: GitOp,
-    argv: Vec<String>,
-    hardened: bool,
-    hooks_dir: Option<&Path>,
-) -> Vec<String> {
+/// own argv. `hardened` is [`consumers_on`].
+pub(crate) fn invocation(op: GitOp, argv: Vec<String>, hardened: bool) -> Vec<String> {
     let mut out: Vec<String> = vec!["-c".into(), "core.fsmonitor=false".into()];
     if hardened {
-        let hooks = hooks_dir.map_or_else(|| "/dev/null".to_string(), |d| d.display().to_string());
         out.push("-c".into());
-        out.push(format!("core.hooksPath={hooks}"));
+        out.push("core.hooksPath=/dev/null".into());
     }
     let mut rest = argv.into_iter();
     if let Some(sub) = rest.next() {
         out.push(sub);
-        if hardened && op == GitOp::Diff {
-            out.push("--no-ext-diff".into());
-            out.push("--no-textconv".into());
+        if hardened {
+            match op {
+                GitOp::Diff => {
+                    out.push("--no-ext-diff".into());
+                    out.push("--no-textconv".into());
+                    out.push("--ignore-submodules=all".into());
+                }
+                GitOp::Status => out.push("--ignore-submodules=all".into()),
+                GitOp::Commit => out.push("--no-verify".into()),
+                GitOp::Add => {}
+            }
         }
     }
     out.extend(rest);
     out
 }
 
-/// Whether `dir` looks like a bare repository (`HEAD`, `objects/`, `refs/`) with
-/// no `.git` of its own: git run there uses it as the repository, not the
-/// enclosing one.
-fn looks_bare(dir: &Path) -> bool {
-    dir.join("HEAD").is_file()
-        && dir.join("objects").is_dir()
-        && dir.join("refs").is_dir()
-        && std::fs::symlink_metadata(dir.join(".git")).is_err()
+/// Whether a key of the repository's own `config` is inert: it cannot name a
+/// program or a file for git to run or include. An ALLOWLIST (anything unknown
+/// is refused): git keeps adding keys that name commands. Keys are compared
+/// case-insensitively (a subsection is case-sensitive in git; folding it only
+/// makes this stricter-or-equal for the names allowed here).
+pub(crate) fn inert_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    let Some((section, rest)) = key.split_once('.') else {
+        return false;
+    };
+    let (sub, var) = match rest.rsplit_once('.') {
+        Some((sub, var)) => (Some(sub), var),
+        None => (None, rest),
+    };
+    match (section, sub, var) {
+        (
+            "core",
+            None,
+            "repositoryformatversion"
+            | "filemode"
+            | "bare"
+            | "logallrefupdates"
+            | "ignorecase"
+            | "precomposeunicode"
+            | "symlinks"
+            | "autocrlf"
+            | "eol"
+            | "safecrlf"
+            | "quotepath",
+        ) => true,
+        ("user", None, "name" | "email") => true,
+        ("init", None, "defaultbranch") => true,
+        ("pull", None, "rebase" | "ff") => true,
+        ("push", None, "default" | "autosetupremote") => true,
+        ("fetch", None, "prune") => true,
+        ("merge", None, "ff") => true,
+        ("color", None, "ui") => true,
+        ("status", None, "showuntrackedfiles") => true,
+        ("diff", None, "renames" | "algorithm" | "context") => true,
+        // Only used by fetch and push, which this tool never runs.
+        ("remote", Some(_), "url" | "fetch" | "pushurl") => true,
+        ("branch", Some(_), "remote" | "merge") => true,
+        _ => false,
+    }
 }
 
 /// Light git tool. cwd = the repo checkout (jail root for paths is the
@@ -257,10 +287,9 @@ fn looks_bare(dir: &Path) -> bool {
 pub struct GitTool {
     pub bin: PathBuf,
     pub workdir: Option<PathBuf>,
-    /// The real `.git` directory that enclosed the workdir when the tool was
-    /// built (at start-up, before any sandboxed command ran): the only
-    /// repository trusted when a command consumer is on (see the module doc).
-    startup_git: Option<PathBuf>,
+    /// Extra environment for every git process the tool spawns (embedders,
+    /// tests): applied after the scrub, never read from the process.
+    env: Vec<(String, String)>,
 }
 
 impl GitTool {
@@ -268,47 +297,7 @@ impl GitTool {
         Self {
             bin: PathBuf::from("git"),
             workdir: None,
-            startup_git: real_git_dir(None),
-        }
-    }
-
-    /// The `.git` directory to trust for this call when a command consumer is
-    /// on, or the reason to refuse: the workdir is a bare repository, no
-    /// repository existed at start-up, or it is not the one found now (swapped
-    /// for a link, a file or another directory).
-    fn trusted_git_dir(&self) -> Result<PathBuf, String> {
-        // The directory git runs in: the workdir, else the process's own (the
-        // snapshot was taken from it too).
-        let cwd = self
-            .workdir
-            .clone()
-            .or_else(|| std::env::current_dir().ok());
-        let wd = cwd.as_deref();
-        if let Some(d) = wd {
-            if looks_bare(d) {
-                return Err(format!(
-                    "git: refused: {} looks like a bare repository (HEAD, objects, refs) with no \
-                     .git, and git would use it instead of the enclosing repository; a command \
-                     sandbox is on, so the git tool does not run in it",
-                    d.display()
-                ));
-            }
-        }
-        match (&self.startup_git, real_git_dir(wd)) {
-            (Some(at_start), Some(now)) if *at_start == now => Ok(now),
-            (Some(_), _) => Err(
-                "git: refused: the .git directory of this workspace is not the one that was \
-                 there when the session started (it was replaced, or is no longer a real \
-                 directory); a command sandbox is on, so the git tool does not run in it"
-                    .into(),
-            ),
-            (None, _) => Err(
-                "git: refused: no git repository was present when the session started, and a \
-                 command sandbox is on: a repository a sandboxed command created could carry \
-                 hooks, filters and config that would run on the host through this tool. Create \
-                 the repository yourself, outside the sandbox, and restart the session"
-                    .into(),
-            ),
+            env: Vec::new(),
         }
     }
 
@@ -317,13 +306,145 @@ impl GitTool {
         self
     }
 
-    /// Sets the workdir and takes the start-up snapshot of its repository
-    /// (call this while building the tool, before any command runs).
     pub fn in_dir(mut self, dir: impl Into<PathBuf>) -> Self {
-        let dir = dir.into();
-        self.startup_git = real_git_dir(Some(&dir));
-        self.workdir = Some(dir);
+        self.workdir = Some(dir.into());
         self
+    }
+
+    /// Adds an environment variable to every git process (for example `HOME`,
+    /// `GIT_CONFIG_GLOBAL`), after the scrub.
+    pub fn with_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.env.push((key.into(), value.into()));
+        self
+    }
+
+    /// A git process with the scrubbed environment and the workdir; `hardened`
+    /// adds `GIT_CONFIG_NOSYSTEM=1` (no system-wide gitconfig: its includes and
+    /// hooks are not the owner's).
+    fn command(&self, hardened: bool) -> Command {
+        let mut cmd = Command::new(&self.bin);
+        crate::subprocess::scrub_env_for(&mut cmd, "git");
+        for k in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_COMMON_DIR",
+            "GIT_INDEX_FILE",
+            "GIT_CEILING_DIRECTORIES",
+        ] {
+            cmd.env_remove(k);
+        }
+        if hardened {
+            cmd.env("GIT_CONFIG_NOSYSTEM", "1");
+        }
+        for (k, v) in &self.env {
+            cmd.env(k, v);
+        }
+        if let Some(dir) = &self.workdir {
+            cmd.current_dir(dir);
+        }
+        cmd
+    }
+
+    /// Runs a read-only probe (`rev-parse`, `config --file`) with the hardened
+    /// options and returns its stdout.
+    fn probe(&self, args: &[&str]) -> Result<String, String> {
+        let mut cmd = self.command(true);
+        cmd.args([
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+        ]);
+        cmd.args(args);
+        let out = run_with_timeout(&mut cmd, GIT_TIMEOUT)?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let snippet: String = stderr.chars().take(300).collect();
+            return Err(format!(
+                "git: refused: could not vet the repository ({}): {}",
+                out.status,
+                snippet.trim()
+            ));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    /// With a command consumer on: ask git which git directory it really uses,
+    /// require a plain `.git` directory at the work tree root, and refuse any
+    /// key in its config outside [`inert_key`] (see the module doc).
+    fn vet_repository(&self, op: GitOp) -> Result<(), String> {
+        const WAY_OUT: &str = "a command sandbox is on and a sandboxed command can write \
+             repository state; run git yourself outside the tool, or remove the key";
+        let layout = |why: String| {
+            format!(
+                "git: refused: {why}; the git tool only runs in a plain repository (a `.git` \
+                 directory at the work tree root: not bare, not a linked worktree, a submodule \
+                 or a separate git dir) because it cannot vet any other layout while a command \
+                 sandbox is on. Run git yourself outside the tool"
+            )
+        };
+        let first = self.probe(&["rev-parse", "--is-bare-repository", "--absolute-git-dir"])?;
+        let mut lines = first.lines();
+        if lines.next().map(str::trim) != Some("false") {
+            return Err(layout("the repository git uses is bare".into()));
+        }
+        let gitdir = PathBuf::from(lines.next().unwrap_or("").trim());
+        let second = self.probe(&[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+            "--show-toplevel",
+        ])?;
+        let mut lines = second.lines();
+        let common = PathBuf::from(lines.next().unwrap_or("").trim());
+        let top = PathBuf::from(lines.next().unwrap_or("").trim());
+        let canon = |p: &Path| std::fs::canonicalize(p).ok();
+        let plain = std::fs::symlink_metadata(top.join(".git")).is_ok_and(|m| m.is_dir())
+            && canon(&gitdir).is_some()
+            && canon(&gitdir) == canon(&top.join(".git"))
+            && canon(&common) == canon(&gitdir);
+        if !plain {
+            return Err(layout(format!(
+                "git uses {} for the work tree {}",
+                gitdir.display(),
+                top.display()
+            )));
+        }
+        let config = gitdir.join("config");
+        let listing = self.probe(&[
+            "config",
+            "--file",
+            &config.display().to_string(),
+            "--list",
+            "-z",
+        ])?;
+        for entry in listing.split('\0').filter(|e| !e.is_empty()) {
+            let key = entry.split('\n').next().unwrap_or(entry);
+            if !inert_key(key) {
+                return Err(format!(
+                    "git: refused: {} sets `{key}`, which can name a program or a file for git to \
+                     run on the host; {WAY_OUT}",
+                    config.display()
+                ));
+            }
+        }
+        // `git add` runs git INSIDE a gitlink (submodule) that is dirty, and no
+        // option stops it: the nested repository's own config, which nothing
+        // vets, would run (`filter.*.clean`). The index is in the `.git` a
+        // sandboxed command may have written, so a gitlink there is not the
+        // owner's. Status, diff and commit do not descend (`--ignore-submodules`).
+        if op == GitOp::Add {
+            let staged = self.probe(&["ls-files", "--stage", "-z"])?;
+            if let Some(entry) = staged.split('\0').find(|e| e.starts_with("160000 ")) {
+                let path = entry.split('\t').nth(1).unwrap_or("?");
+                return Err(format!(
+                    "git: refused: the index holds a submodule entry (`{path}`); `git add` would \
+                     run git inside it, with a config nothing vets, while a command sandbox is on. \
+                     Run `git add` yourself outside the tool"
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub fn command_line(&self, input: &Value) -> Result<String, String> {
@@ -390,21 +511,11 @@ impl Tool for GitTool {
             return Err("git: arguments must not contain NUL bytes".into());
         }
         let hardened = consumers_on();
-        let hooks_dir = if hardened {
-            Some(self.trusted_git_dir()?.join("hooks"))
-        } else {
-            None
-        };
-        let mut cmd = Command::new(&self.bin);
-        crate::subprocess::scrub_env_for(&mut cmd, "git");
         if hardened {
-            // No system-wide gitconfig: its includes and hooks are not the owner's.
-            cmd.env("GIT_CONFIG_NOSYSTEM", "1");
+            self.vet_repository(op)?;
         }
-        cmd.args(invocation(op, argv, hardened, hooks_dir.as_deref()));
-        if let Some(dir) = &self.workdir {
-            cmd.current_dir(dir);
-        }
+        let mut cmd = self.command(hardened);
+        cmd.args(invocation(op, argv, hardened));
         let out = run_with_timeout(&mut cmd, GIT_TIMEOUT)?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
@@ -604,94 +715,120 @@ mod tests {
         v.iter().map(|x| x.to_string()).collect()
     }
 
-    /// #748: only `core.fsmonitor=false` without a command consumer, the
-    /// pinned hooks directory, `/dev/null` and the diff options with one.
+    /// #748: only `core.fsmonitor=false` without a command consumer; hooks
+    /// off, `--no-verify` and the submodule/diff options with one.
     #[test]
     fn the_invocation_is_hardened_only_when_a_command_consumer_is_on() {
         let commit = s(&["commit", "-m", "x"]);
         assert_eq!(
-            invocation(GitOp::Commit, commit.clone(), false, None),
+            invocation(GitOp::Commit, commit.clone(), false),
             s(&["-c", "core.fsmonitor=false", "commit", "-m", "x"])
         );
-        // The hardening never touches the op's own arguments.
-        let hooks = Path::new("/ws/.git/hooks");
         assert_eq!(
-            invocation(GitOp::Commit, commit.clone(), true, Some(hooks)),
+            invocation(GitOp::Commit, commit, true),
             s(&[
                 "-c",
                 "core.fsmonitor=false",
                 "-c",
-                "core.hooksPath=/ws/.git/hooks",
+                "core.hooksPath=/dev/null",
                 "commit",
+                "--no-verify",
                 "-m",
                 "x"
             ])
         );
-        // No real `.git` directory: hooks off.
         assert_eq!(
-            invocation(GitOp::Commit, commit, true, None)[3],
-            "core.hooksPath=/dev/null"
-        );
-        // `diff` also gets the driver options, `--staged` stays after them.
-        assert_eq!(
-            invocation(GitOp::Diff, s(&["diff", "--staged"]), true, Some(hooks)),
+            invocation(GitOp::Diff, s(&["diff", "--staged"]), true),
             s(&[
                 "-c",
                 "core.fsmonitor=false",
                 "-c",
-                "core.hooksPath=/ws/.git/hooks",
+                "core.hooksPath=/dev/null",
                 "diff",
                 "--no-ext-diff",
                 "--no-textconv",
+                "--ignore-submodules=all",
                 "--staged"
             ])
         );
         assert_eq!(
-            invocation(GitOp::Diff, s(&["diff"]), false, None),
+            invocation(GitOp::Diff, s(&["diff"]), false),
             s(&["-c", "core.fsmonitor=false", "diff"])
         );
-        // The other ops are not diffs.
-        assert!(
-            !invocation(GitOp::Status, s(&["status", "--short"]), true, None)
-                .contains(&"--no-ext-diff".to_string())
-        );
-    }
-
-    /// The trusted directory is the REAL `.git` directory found from the
-    /// workdir upward; a gitdir file, a link or no repository gives none.
-    #[cfg(unix)]
-    #[test]
-    fn the_trusted_git_directory_needs_a_real_git_directory() {
-        let d = crate::test_dir::TestDir::new("tole-git-pin");
-        let root = std::fs::canonicalize(&*d).unwrap();
-        // A monorepo subdirectory finds the enclosing repository.
-        std::fs::create_dir_all(root.join("repo/.git")).unwrap();
-        std::fs::create_dir_all(root.join("repo/sub/deeper")).unwrap();
+        let status = invocation(GitOp::Status, s(&["status", "--short"]), true);
+        assert!(status.contains(&"--ignore-submodules=all".to_string()));
+        assert!(!status.contains(&"--no-ext-diff".to_string()));
         assert_eq!(
-            real_git_dir(Some(&root.join("repo/sub/deeper"))),
-            Some(root.join("repo/.git"))
+            invocation(GitOp::Add, s(&["add", "."]), true)[4..],
+            s(&["add", "."])
         );
-        // A gitdir FILE (worktree, submodule): none.
-        std::fs::create_dir_all(root.join("wt")).unwrap();
-        std::fs::write(root.join("wt/.git"), "gitdir: /elsewhere\n").unwrap();
-        assert_eq!(real_git_dir(Some(&root.join("wt"))), None);
-        // A symbolic link: none.
-        std::fs::create_dir_all(root.join("lk")).unwrap();
-        std::os::unix::fs::symlink(root.join("repo/.git"), root.join("lk/.git")).unwrap();
-        assert_eq!(real_git_dir(Some(&root.join("lk"))), None);
     }
 
-    /// A directory with HEAD, objects and refs and no `.git` is a bare repository.
+    /// The allowlist admits what `git init`, `git clone` and a user name hold
+    /// and refuses every key that can name a program or a file.
     #[test]
-    fn a_bare_repository_is_recognised_only_without_a_git_entry() {
-        let d = crate::test_dir::TestDir::new("tole-git-bare");
-        assert!(!looks_bare(&d));
-        std::fs::write(d.join("HEAD"), "ref: refs/heads/main\n").unwrap();
-        std::fs::create_dir_all(d.join("objects")).unwrap();
-        std::fs::create_dir_all(d.join("refs")).unwrap();
-        assert!(looks_bare(&d));
-        std::fs::create_dir_all(d.join(".git")).unwrap();
-        assert!(!looks_bare(&d), "a .git of its own makes it a work tree");
+    fn only_inert_config_keys_are_allowed() {
+        for ok in [
+            "core.repositoryformatversion",
+            "core.filemode",
+            "core.bare",
+            "core.logallrefupdates",
+            "Core.IgnoreCase",
+            "user.name",
+            "user.email",
+            "remote.origin.url",
+            "remote.origin.fetch",
+            "branch.main.remote",
+            "branch.feature/x.merge",
+            "init.defaultBranch",
+        ] {
+            assert!(inert_key(ok), "{ok} should be inert");
+        }
+        for bad in [
+            "core.fsmonitor",
+            "core.hookspath",
+            "core.sshcommand",
+            "core.pager",
+            "core.editor",
+            "core.askpass",
+            "core.gitproxy",
+            "core.worktree",
+            "core.attributesfile",
+            "core.excludesfile",
+            "gpg.program",
+            "gpg.format",
+            "commit.gpgsign",
+            "tag.gpgsign",
+            "user.signingkey",
+            "credential.helper",
+            "filter.lfs.clean",
+            "diff.x.textconv",
+            "diff.external",
+            "diff.tool",
+            "merge.x.driver",
+            "mergetool.x.cmd",
+            "alias.st",
+            "include.path",
+            "includeif.gitdir:/x.path",
+            "submodule.x.update",
+            "extensions.worktreeconfig",
+            "remote.origin.vcs",
+            "remote.origin.uploadpack",
+            "remote.origin.receivepack",
+            "url.x.insteadof",
+            "sequence.editor",
+            "web.browser",
+            "trailer.x.cmd",
+            "protocol.ext.allow",
+            "pager.diff",
+            "interactive.difffilter",
+            "sendemail.smtpserver",
+            "lfs.url",
+            "core",
+            "",
+        ] {
+            assert!(!inert_key(bad), "{bad} must be refused");
+        }
     }
 
     #[test]

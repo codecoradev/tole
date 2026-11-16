@@ -22,6 +22,7 @@ fn host_git(dir: &Path, args: &[&str]) {
         .args(args)
         .current_dir(dir)
         .env("HOME", dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .output()
         .expect("git on PATH");
@@ -63,7 +64,10 @@ fn without_a_consumer_hooks_are_unchanged_and_fsmonitor_is_always_off() {
         ],
     );
     std::fs::write(ws.join("f.txt"), "one\n").unwrap();
-    let tool = GitTool::new().in_dir(&ws);
+    let tool = GitTool::new()
+        .in_dir(&ws)
+        .with_env("HOME", ws.display().to_string())
+        .with_env("GIT_CONFIG_GLOBAL", "/dev/null");
     tool.execute(json!({"op": "status"})).unwrap();
     tool.execute(json!({"op": "add", "paths": ["f.txt"]}))
         .unwrap();

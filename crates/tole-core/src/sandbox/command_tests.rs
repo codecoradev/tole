@@ -1902,7 +1902,9 @@ fn doctor_points_at_the_git_tool_only_when_a_consumer_is_on() {
     })
     .unwrap();
     assert!(
-        l.starts_with("sandbox consumers: git writes") && l.contains("`git` tool"),
+        l.starts_with("sandbox consumers: git writes")
+            && l.contains("`git` tool")
+            && l.contains("pre-commit and commit-msg do not run"),
         "{l}"
     );
 }

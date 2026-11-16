@@ -621,43 +621,7 @@ file_size_mb = 4096            # 1 to 1048576, largest file a process writes
   command; it does so through the `git` tool (status, diff, add, commit), which
   runs on the host outside the sandbox, or the owner does. There is no setting
   to make `.git` writable and no `git = "write"` opt-in: a writable `.git` is
-  exactly what #849 closed. The tool is `Risk::Write` through the Approver like
-  any Write tool (never allowlisted blindly: `--allow git` is the owner's
-  explicit choice) and takes data only (a message, relative paths). Because it
-  runs on the host, git would execute what the repository config and hooks name,
-  so its invocation is hardened: ALWAYS `-c core.fsmonitor=false` (performance
-  only), and when any command consumer is on (`[sandbox.consumers]`) also
-  `-c core.hooksPath=<repo>/.git/hooks`, `GIT_CONFIG_NOSYSTEM=1`, and
-  `--no-ext-diff --no-textconv` for `diff`. And with a consumer on the tool
-  REFUSES every op (status, diff, add, commit; an error that names the cause
-  and the way out) unless a real `.git` DIRECTORY enclosing its workdir was
-  already there when the tool was built at start-up (a snapshot taken in
-  `GitTool::new` / `in_dir`, not per call), still is the same real directory
-  (not swapped for a link, a file or another directory), and the workdir is not
-  itself a bare repository (`HEAD`, `objects/`, `refs/`, no `.git`: git would
-  use it instead of the enclosing one). Why: `protect_plan` cannot bind a
-  `.git` that does not exist at launch, so a sandboxed command in a workspace
-  with no repository could `git init`, write `.git/hooks/pre-commit`, a
-  `[filter "x"] clean=...` or `gpg.program` in `.git/config` and a
-  `.gitattributes`, and the host-side tool would run them; the snapshot means
-  only a repository that existed before any sandboxed command ran is trusted,
-  and the pinned `.git/hooks` is "read-only and owner-trusted" only for that
-  repository. A repository the owner creates mid-session is not used by the tool
-  until the session is restarted. Residuals, owner choices: (1) the owner's own
-  installed hooks run workspace content (lint, make, npm test, a pre-commit
-  framework that runs files a sandboxed command may have modified); (2) an owner
-  config `include.path` that points at a workspace file lets that file define
-  `filter.*.clean`, `gpg.program` or `core.sshCommand`, which then run on the
-  host through add and commit (not fixed with `GIT_CONFIG_GLOBAL` tricks); (3)
-  `GIT_CONFIG_NOSYSTEM=1` drops `/etc/gitconfig` (safe.directory, credential
-  helpers, user.*, policy), so a repository owned by another user can fail with
-  "dubious ownership" or a commit can fail for want of an identity; (4) the
-  checks (bare layout, same real `.git`) are made just before git is spawned,
-  so a detached `job_start` that plants a bare layout in that window is not
-  stopped by the tool (the planted layout is then refused by the next call);
-  (5) a human's own `git commit` still runs in-workspace hook scripts, and a nested
-  repository's own config is not covered by the pinned flags (see the residuals
-  above). The `run_command` and `job_start` summaries tell the model that git
+  exactly what #849 closed. The tool is `Risk::Write` through the Approver like any Write tool (never allowlisted blindly: `--allow git` is the owner's explicit choice) and takes data only (a message, relative paths). Because it runs on the host, git would execute what the repository config, hooks and attributes name. The rule: with any command consumer on (`[sandbox.consumers]`), NO host-side code execution is reachable from state a sandboxed command can write, whenever and by whomever the repository was created; the tool does not trust a repository's identity or age (a start-up snapshot was tried and rejected: the tool is rebuilt per serve session, cron run, resume and child, and `protect_plan` cannot bind a `.git` that did not exist at launch, so a repository planted in an earlier session looks like the owner's, and every layout git discovers (a bare directory in an ancestor, ...) is one more case to enumerate). Instead: ALWAYS `-c core.fsmonitor=false`; with a consumer on, `-c core.hooksPath=/dev/null` and `--no-verify` on commit (NO hook runs for a commit made through the tool, the owner's own pre-commit and commit-msg included: a human's own `git commit` still runs them, and a husky or pre-commit-framework setup is simply not run for the model's commits), `GIT_CONFIG_NOSYSTEM=1`, `--no-ext-diff --no-textconv` on diff and `--ignore-submodules=all` on status and diff; and before every op a vet: `git rev-parse` (same hardened options) says which git directory git really uses, the tool refuses unless it is a plain `.git` DIRECTORY at the work tree root, not bare, with the common dir equal to it (so a bare layout, a linked worktree, a submodule gitdir file or a separate git dir are refused: the vet cannot cover them), then `git config --file <gitdir>/config --list -z` (no includes followed, nothing executed) is checked against an ALLOWLIST of inert keys (`core.repositoryformatversion|filemode|bare|logallrefupdates|ignorecase|precomposeunicode|symlinks|autocrlf|eol|safecrlf|quotepath`, `user.name|email`, `init.defaultbranch`, `pull.rebase|ff`, `push.default|autosetupremote`, `fetch.prune`, `merge.ff`, `color.ui`, `status.showuntrackedfiles`, `diff.renames|algorithm|context`, `remote.*.url|fetch|pushurl`, `branch.*.remote|merge`): any other key (`filter.*`, `include.*`, `includeIf.*`, `alias.*`, `core.fsmonitor`, `core.hooksPath`, `core.sshCommand`, `core.pager`, `core.editor`, `core.askPass`, `core.gitProxy`, `core.worktree`, `core.attributesFile`, `gpg.*`, `commit.gpgsign`, `credential.*`, `diff.*.textconv|command`, `merge.*.driver`, `submodule.*`, `extensions.*`, `lfs.*`, ...) makes the tool refuse, naming the key and the way out (run git yourself, or remove the key). The owner's own repository with ordinary config (what `git init` and `git clone` write, plus a user) works. A nested repository or submodule is covered by `--ignore-submodules=all` for status, diff and commit; `git add` is refused while the index holds a submodule entry (git runs git inside a dirty one and nothing stops it: measured). Residuals: (1) a still-running sandboxed process (a `job_start` from an earlier turn, a long-running command) can write the config between the vet and the git spawn of a later call; the next call refuses (the vet is per call, not pinned); the cross-session plant is covered by the vet itself; (2) an owner (global, `~/.gitconfig`) `include.path` that points at a workspace file lets that file define `filter.*.clean`, `gpg.program` or `core.sshCommand` and is not vetted; (3) `GIT_CONFIG_NOSYSTEM=1` drops `/etc/gitconfig` (safe.directory, credential helpers, user.*, policy), so a repository owned by another user can fail with "dubious ownership" or a commit can fail for want of an identity; (4) a human's own `git commit` still runs hook scripts that live in the workspace. The `run_command` and `job_start` summaries tell the model that git
   writes fail in the sandbox and to use the `git` tool, and `tole doctor` says
   the same when a consumer is on.
 
