@@ -13,6 +13,7 @@ use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -162,6 +163,9 @@ struct Pty {
     child: Child,
     master: std::fs::File,
     out: Arc<Mutex<Vec<u8>>>,
+    /// Set by the reader thread once the pty reports end of output (every
+    /// slave end closed and the buffer drained).
+    eof: Arc<AtomicBool>,
     seen: usize,
 }
 
@@ -230,6 +234,8 @@ impl Pty {
         let mut answer = master.try_clone().unwrap();
         let out = Arc::new(Mutex::new(Vec::new()));
         let sink = out.clone();
+        let eof = Arc::new(AtomicBool::new(false));
+        let done = eof.clone();
         std::thread::spawn(move || {
             let mut b = [0u8; 4096];
             while let Ok(n) = reader.read(&mut b) {
@@ -241,11 +247,13 @@ impl Pty {
                 }
                 sink.lock().unwrap().extend_from_slice(&b[..n]);
             }
+            done.store(true, Ordering::SeqCst);
         });
         Pty {
             child,
             master,
             out,
+            eof,
             seen: 0,
         }
     }
@@ -301,6 +309,15 @@ impl Pty {
         });
         if exited.is_none() {
             let _ = self.child.kill();
+        } else {
+            // The child is gone, but the reader thread may not have copied
+            // its last output (the terminal-restore sequences) yet: an
+            // assertion on the final screen must wait for the pty's end of
+            // output, not race it (#877). Expiry is not a failure here, a
+            // grandchild may still hold the slave end; the caller's own
+            // assertion then reports what is missing.
+            let eof = self.eof.clone();
+            let _ = common::poll_until(WAIT, || eof.load(Ordering::SeqCst).then_some(()));
         }
         code
     }
@@ -319,6 +336,10 @@ fn tui_streams_approves_cancels_and_leaves_an_ordinary_session() {
     // 1. streamed answer
     t.send("hello\r");
     t.expect("STREAM-ANSWER");
+    // The answer text lands before the turn is over: a prompt typed now
+    // would steer the still-running turn instead of starting a new one
+    // (#877), so wait for the idle hint before every next prompt.
+    t.idle();
 
     // 2. a write asks inline; `y` lets it run
     t.send("write it\r");
@@ -329,11 +350,15 @@ fn tui_streams_approves_cancels_and_leaves_an_ordinary_session() {
     );
     t.send("y");
     t.expect("WROTE-OK");
+    t.idle();
     assert!(dir.join("out.txt").exists(), "approved write must run");
 
     // 3. Shift+Enter (kitty CSI-u) makes a newline instead of submitting
     t.send("multi1\x1b[13;2umulti2\r");
     t.expect("STREAM-ANSWER");
+    // If "slow" were typed while this turn still runs it would steer it, and
+    // the Esc below would cancel the already-finished turn (#877).
+    t.idle();
 
     // 4. Esc cancels a running turn
     t.send("slow\r");
@@ -558,6 +583,8 @@ fn tui_steers_queues_and_returns_the_queue_on_cancel() {
     t.expect("(turn cancelled)");
     t.send("\r"); // the editor holds "qc" again: sending it runs it
     t.expect("STREAM-ANSWER");
+    // `/quit` is ignored while a turn runs (#877): wait for the turn to end.
+    t.idle();
     t.send("/quit\r");
     assert_eq!(t.wait_exit(), Some(0));
 
