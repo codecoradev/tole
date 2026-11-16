@@ -262,8 +262,17 @@ fn revoke_rejects_pending_drafts_and_withdraws_what_was_promoted() {
     }
     r.go(&a, Some(&a.content_hash), false).unwrap();
     assert!(r.approvals().skills.contains_key("ship-release"));
+    // #600: the promotion is an approval in the append-only skill ledger.
+    let ledger = tole_core::skill_approval::read_ledger(&r.approvals).unwrap();
+    assert_eq!(ledger.lines().count(), 1, "{ledger}");
+    assert!(ledger.contains("\"event\":\"approve\""), "{ledger}");
 
     let lines = revoke_source(&r.store, &r.approvals, "s-bad").unwrap();
+    let ledger = tole_core::skill_approval::read_ledger(&r.approvals).unwrap();
+    assert!(
+        ledger.lines().count() == 2 && ledger.lines().last().unwrap().contains("\"revoke\""),
+        "{ledger}"
+    );
     assert!(
         lines
             .iter()

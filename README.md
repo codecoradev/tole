@@ -29,7 +29,8 @@ automation and secrets release:
   skills only through drafts (`skill_propose`, `tole skills drafts`), and
   `tole curator` keeps the library small.
 - **Plugins:** every MCP server needs the owner's approval, pinned in a plugin lock
-  (`tole plugin list|diff|approve|revoke|add`).
+  (`tole plugin list|diff|approve|revoke|add`); third-party skills are pinned by
+  approved hash with a stated source in an append-only ledger.
 - **Secrets:** scoped release with `[secrets]`, known-value redaction at every egress
   sink and in the session log, sensitive files read redacted (`read_file_raw` for the
   verbatim read), and owner-only subcommands that refuse under a session
