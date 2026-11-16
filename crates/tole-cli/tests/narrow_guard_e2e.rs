@@ -1,4 +1,4 @@
-//! #865: under an agent session (`TOLE_UNDER_SESSION`, no child marker) a flag
+//! #865: under an agent session (`TOLE_UNDER_SESSION`) a flag
 //! or `TOLE_TRUST` may only NARROW the user config's policy lists. Real binary,
 //! scrubbed environment, no provider: a run that gets past the guard stops at
 //! the missing provider, so "not refused" is "the guard's text is absent".
@@ -169,23 +169,46 @@ fn a_narrower_input_a_superset_of_hooks_and_a_key_the_user_does_not_set_pass() {
 }
 
 #[test]
-fn the_exemptions_an_attended_owner_a_child_tole_started_and_the_acp_face() {
+fn the_exemptions_an_attended_owner_and_a_child_tole_started() {
     let root = TestDir::new("tole-narrow-exempt");
     let wide = ["run", "--allow", "edit_*", "--", "hi"];
     // An attended owner: no marker at all.
     let o = tole(&root, Some(USER), &[], &wide);
     assert!(!refused(&o), "{}", text(&o.stderr));
-    // A child tole itself started: its scope is enforced in the parent.
+    // A child tole itself started (agent_start, a delegated child) carries the
+    // child variables but NOT `TOLE_UNDER_SESSION`, which only `run_command`
+    // and `job_start` set: its scope is enforced in the parent.
     for marker in [
         ("TOLE_AGENT_DEPTH", "1"),
         ("TOLE_AGENT_ID", "a-1-2-3"),
         ("TOLE_DELEGATION_NODE", "n1"),
         ("TOLE_DELEGATION_LOG", "/nonexistent/log"),
     ] {
+        let o = tole(&root, Some(USER), &[marker], &wide);
+        assert!(!refused(&o), "{marker:?}: {}", text(&o.stderr));
+    }
+}
+
+/// A script that a child agent's `run_command` started carries the session
+/// marker AND the child variables it inherited: the child variables do not
+/// exempt it, it is guarded like any script-started tole.
+#[test]
+fn a_descendant_script_of_a_child_agent_is_guarded_despite_the_inherited_child_variables() {
+    let root = TestDir::new("tole-narrow-descendant");
+    for marker in [
+        ("TOLE_AGENT_DEPTH", "1"),
+        ("TOLE_AGENT_ID", "a-1-2-3"),
+        ("TOLE_DELEGATION_NODE", "n1"),
+    ] {
         let mut env = SESSION.to_vec();
         env.push(marker);
-        let o = tole(&root, Some(USER), &env, &wide);
-        assert!(!refused(&o), "{marker:?}: {}", text(&o.stderr));
+        let o = tole(
+            &root,
+            Some(USER),
+            &env,
+            &["run", "--allow", "edit_*", "--", "hi"],
+        );
+        assert_refused(&o, &["--allow", "edit_*"]);
     }
 }
 

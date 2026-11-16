@@ -405,10 +405,12 @@ servers; `[sandbox.consumers]` is not touched by either.
   hook list (`on_pretool`, `on_posttool`, `on_turnend`) must contain every
   user hook; `plan_mode` has no off switch on the command line or in the
   environment, so nothing needs refusing. It applies to a process with
-  `TOLE_UNDER_SESSION` and NO child marker (`TOLE_AGENT_DEPTH`,
-  `TOLE_AGENT_ID`, the delegation variables) that is not `serve`, `acp` or
-  `mcp`. A child tole itself starts is exempt because its scope is enforced in
-  the parent: `agent_start` gives a child the patterns glob-covered by the
+  `TOLE_UNDER_SESSION` (set by `run_command` and `job_start` on what they
+  start, and by nothing else) that is not `serve`, `acp` or `mcp`; the child
+  variables (`TOLE_AGENT_DEPTH` and the like) are inherited by everything a
+  child's `run_command` starts, so they do NOT exempt a script at depth 1. A
+  child tole itself starts does not carry `TOLE_UNDER_SESSION` and is exempt
+  because its scope is enforced in the parent: `agent_start` gives a child the patterns glob-covered by the
   parent's own resolved allow list (`list_covers`, every parent deny kept) and
   a delegated child takes allow and trust from its flags alone; that parent
   scope can legitimately be wider than the user config after an owner's

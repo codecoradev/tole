@@ -19,16 +19,20 @@
 //!   turn it off from the command line or the environment), so nothing here
 //!   can loosen it and no refusal path exists for it.
 //!
-//! WHO IT APPLIES TO: a process that carries `TOLE_UNDER_SESSION` (what
-//! `run_command` and `job_start` set on everything they start) and NO child
-//! marker (`TOLE_AGENT_DEPTH`, `TOLE_AGENT_ID`, the delegation variables), and
-//! that is not `serve`, `acp` or `mcp`. A child tole itself starts
-//! (`agent_start`, a delegated child) is exempt: its allow list is enforced in
-//! the parent (`list_covers` against the parent's own scope, which may legitimately
-//! be wider than the user config after an owner's `--allow`), so comparing it
-//! with the user config would refuse a legitimate child. The unattended faces
-//! are started by the owner with their own flags and are exempt too. An owner
-//! at a terminal has no marker and is unchanged.
+//! WHO IT APPLIES TO: a process that carries `TOLE_UNDER_SESSION` and is not
+//! `serve`, `acp` or `mcp`. `TOLE_UNDER_SESSION` is set by `run_command` and
+//! `job_start` on everything THEY start (`session_guard::mark`, their only
+//! callers) and by nothing else, so a tole that is a script's descendant has it,
+//! while a child tole itself starts (`agent_start`, a delegated child) does not:
+//! its allow list is enforced in the parent (`list_covers` against the parent's
+//! own scope, which may legitimately be wider than the user config after an
+//! owner's `--allow`), so comparing it with the user config would refuse a
+//! legitimate child, and it is exempt for lacking the marker. The child
+//! variables (`TOLE_AGENT_DEPTH` and the like) are NOT an exemption: they are
+//! inherited by every process a child's `run_command` starts, so a script
+//! running at depth 1 carries both and is guarded. The unattended faces are
+//! started by the owner with their own flags and are exempt. An owner at a
+//! terminal has no marker and is unchanged.
 //!
 //! WHAT IT CHECKS: flags and environment only. The project config and `--config`
 //! are not inputs here: they pass the owner's trust gate (`tole config trust`).
@@ -45,10 +49,9 @@ use tole_core::child_env;
 /// What the host knows about this run.
 #[derive(Debug, Clone, Copy)]
 pub struct Context {
-    /// `TOLE_UNDER_SESSION` is set (non-blank).
+    /// `TOLE_UNDER_SESSION` is set (non-blank): the process descends from a
+    /// `run_command` or `job_start`.
     pub session_marker: bool,
-    /// A marker of a child tole itself started is present.
-    pub child_marker: bool,
     /// The subcommand is `serve`, `acp` or `mcp`.
     pub exempt_face: bool,
 }
@@ -59,21 +62,12 @@ impl Context {
         let set = |k: &str| env(k).is_some_and(|v| !v.trim().is_empty());
         Context {
             session_marker: set(child_env::UNDER_SESSION),
-            child_marker: [
-                child_env::DEPTH,
-                child_env::AGENT_ID,
-                child_env::DELEGATION_LOG,
-                child_env::DELEGATION_NODE,
-                child_env::DELEGATION_REPORT,
-            ]
-            .iter()
-            .any(|k| set(k)),
             exempt_face,
         }
     }
 
     fn applies(&self) -> bool {
-        self.session_marker && !self.child_marker && !self.exempt_face
+        self.session_marker && !self.exempt_face
     }
 }
 
@@ -194,7 +188,6 @@ mod tests {
     fn session() -> Context {
         Context {
             session_marker: true,
-            child_marker: false,
             exempt_face: false,
         }
     }
@@ -210,7 +203,7 @@ mod tests {
     }
 
     #[test]
-    fn it_applies_only_to_a_session_marked_process_without_child_markers_off_the_faces() {
+    fn it_applies_only_to_a_session_marked_process_off_the_faces() {
         let wide = Inputs {
             allow: v(&["*"]),
             ..Inputs::default()
@@ -218,14 +211,10 @@ mod tests {
         let u = user(|c| c.allow = Some(v(&["read_*"])));
         assert!(check(Some(&u), &wide, &session()).is_err());
         for ctx in [
-            // An attended owner: no marker.
+            // An attended owner, or a child tole itself started (neither has
+            // the marker, which only run_command and job_start set).
             Context {
                 session_marker: false,
-                ..session()
-            },
-            // A child tole itself started.
-            Context {
-                child_marker: true,
                 ..session()
             },
             // serve, acp, mcp.
@@ -241,7 +230,7 @@ mod tests {
     }
 
     #[test]
-    fn markers_are_read_from_the_environment() {
+    fn the_session_marker_is_read_from_the_environment_and_child_variables_do_not_exempt() {
         let env = |pairs: &'static [(&'static str, &'static str)]| {
             move |k: &str| {
                 pairs
@@ -250,22 +239,22 @@ mod tests {
                     .map(|(_, v)| v.to_string())
             }
         };
-        let c = Context::from_env(&env(&[("TOLE_UNDER_SESSION", "1")]), false);
-        assert!(c.session_marker && !c.child_marker);
-        for k in [
-            "TOLE_AGENT_DEPTH",
-            "TOLE_AGENT_ID",
-            "TOLE_DELEGATION_LOG",
-            "TOLE_DELEGATION_NODE",
-            "TOLE_DELEGATION_REPORT",
-        ] {
-            let pairs: &'static [(&str, &str)] =
-                Box::leak(vec![("TOLE_UNDER_SESSION", "1"), (k, "x")].into_boxed_slice());
-            assert!(Context::from_env(&env(pairs), false).child_marker, "{k}");
-        }
-        // A blank marker is no marker.
-        let c = Context::from_env(&env(&[("TOLE_UNDER_SESSION", " ")]), false);
-        assert!(!c.session_marker);
+        assert!(Context::from_env(&env(&[("TOLE_UNDER_SESSION", "1")]), false).session_marker);
+        // A blank marker is no marker; child variables alone are not the marker.
+        assert!(!Context::from_env(&env(&[("TOLE_UNDER_SESSION", " ")]), false).session_marker);
+        assert!(!Context::from_env(&env(&[("TOLE_AGENT_DEPTH", "1")]), false).session_marker);
+        // A script a child agent's run_command started carries BOTH, and is
+        // guarded: the child variables it inherited do not exempt it.
+        let both = Context::from_env(
+            &env(&[("TOLE_UNDER_SESSION", "1"), ("TOLE_AGENT_DEPTH", "1")]),
+            false,
+        );
+        let u = user(|c| c.allow = Some(v(&["read_*"])));
+        let wide = Inputs {
+            allow: v(&["*"]),
+            ..Inputs::default()
+        };
+        assert!(check(Some(&u), &wide, &both).is_err());
     }
 
     #[test]
