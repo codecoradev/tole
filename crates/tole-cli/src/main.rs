@@ -1164,6 +1164,9 @@ fn dispatch(cli: Cli) -> Result<()> {
         }
         loaded
     };
+    // The raw USER config, for the narrow-only guard below (the layered one
+    // cannot tell the user's lists from a project's).
+    let user_cfg_for_guard = user_config.as_ref().map(|l| l.config.clone());
     let cfg = match (project_config, user_config) {
         (None, None) => None,
         (p, u) => {
@@ -1276,6 +1279,17 @@ fn dispatch(cli: Cli) -> Result<()> {
             anyhow::bail!(msg);
         }
         config_apply::install_fill(Settings::fill_with_profile(cfg, profile.as_ref()));
+    }
+    // Under an agent session a flag or the environment may only NARROW the
+    // owner's policy lists (#865); the same marker as the other #684 guards,
+    // not a boundary (the command sandbox is).
+    {
+        let env = &config_apply::real_env;
+        let ctx =
+            tole_cli::narrow_guard::Context::from_env(env, sandbox_flag_class(&cli.command).0);
+        let inputs = tole_cli::narrow_guard::Inputs::from_flags(&config_flags(&cli), env);
+        tole_cli::narrow_guard::check(user_cfg_for_guard.as_ref(), &inputs, &ctx)
+            .map_err(|e| anyhow!("{e}"))?;
     }
     let settings = Settings::resolve(
         &config_apply::Flags {

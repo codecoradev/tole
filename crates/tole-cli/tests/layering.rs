@@ -44,7 +44,7 @@ const ENGINE_MODULES: &[&str] = &[
     "discuss", "cron", "tool_roster", "provider_chain",
 ];
 #[rustfmt::skip]
-const FACE_MODULES: &[&str] = &["doctor", "ecosystem", "hook_cli", "sandbox_cmd", "sandbox_flags", "no_config_guard"];
+const FACE_MODULES: &[&str] = &["doctor", "ecosystem", "hook_cli", "sandbox_cmd", "sandbox_flags", "no_config_guard", "narrow_guard"];
 
 /// Known violations (importer, imported, reason). Only ever shrinks.
 #[rustfmt::skip]

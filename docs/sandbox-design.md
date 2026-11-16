@@ -395,6 +395,30 @@ servers; `[sandbox.consumers]` is not touched by either.
   variable, so this covers processes tole started, not a script that strips
   it; a different `CODECORA_HOME` is the owner's own choice and is not
   refused.
+- The policy lists follow the same marker (#865, `narrow_guard`). The resolved
+  lists (`allow`, `trust`, the hook lists) follow `flag > env > config` and a
+  higher layer REPLACES the whole list below it, so a `tole run --allow '*'`
+  started by a `run_command` script would replace the owner's `allow`. Under
+  a session, for the keys the USER config sets: `allow` must be an exact subset
+  of the user's entries and keep every user deny (`!x`; a flag may add its own),
+  `trust` (flag, else `TOLE_TRUST`) an exact subset of the user's presets, and a
+  hook list (`on_pretool`, `on_posttool`, `on_turnend`) must contain every
+  user hook; `plan_mode` has no off switch on the command line or in the
+  environment, so nothing needs refusing. It applies to a process with
+  `TOLE_UNDER_SESSION` and NO child marker (`TOLE_AGENT_DEPTH`,
+  `TOLE_AGENT_ID`, the delegation variables) that is not `serve`, `acp` or
+  `mcp`. A child tole itself starts is exempt because its scope is enforced in
+  the parent: `agent_start` gives a child the patterns glob-covered by the
+  parent's own resolved allow list (`list_covers`, every parent deny kept) and
+  a delegated child takes allow and trust from its flags alone; that parent
+  scope can legitimately be wider than the user config after an owner's
+  `--allow`, so comparing a child with the user config would refuse a legitimate
+  child. The project config and `--config` are not inputs of the guard: they
+  pass the owner's trust gate. It is keyed on the same environment marker as
+  every #684 guard and #867, so it is NOT a boundary: a copied binary run with a
+  cleared environment, a deliberate pty, or a forged depth marker is not
+  stopped; the boundary is the command sandbox, which masks the data dir
+  (`[sandbox.consumers] run_command = "required"`).
 - A sandbox never replaces an approval (#684, #700, #714): the flags change
   where a server runs, not whether it is approved; the plugin lock, ledger
   and `Admission` checks run as before.
