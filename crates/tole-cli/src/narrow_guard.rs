@@ -23,11 +23,19 @@
 //! `serve`, `acp` or `mcp`. `TOLE_UNDER_SESSION` is set by `run_command` and
 //! `job_start` on everything THEY start (`session_guard::mark`, their only
 //! callers) and by nothing else, so a tole that is a script's descendant has it,
-//! while a child tole itself starts (`agent_start`, a delegated child) does not:
-//! its allow list is enforced in the parent (`list_covers` against the parent's
-//! own scope, which may legitimately be wider than the user config after an
-//! owner's `--allow`), so comparing it with the user config would refuse a
-//! legitimate child, and it is exempt for lacking the marker. The child
+//! while a child tole itself starts (`agent_start`, a delegated child) does not
+//! carry it of its own: its allow list is enforced in the parent (`list_covers`
+//! against the parent's own scope, which may legitimately be wider than the user
+//! config after an owner's `--allow`), so comparing it with the user config would
+//! refuse a legitimate child, and it is exempt for lacking the marker. BUT a
+//! child inherits the marker when its PARENT is itself marked (`agent_start` and
+//! delegation scrub secrets only, so a marked process's children carry
+//! `TOLE_UNDER_SESSION`): a child in a chain that already contains a
+//! script-started tole is guarded too, and if its flags are glob-covered by the
+//! parent but not exact entries of the user config (a script runs
+//! `tole run --allow 'read_*'` and its model calls `agent_start` with
+//! `allow=["read_file"]`) it is refused. That fails safe and only happens in
+//! chains that already contain a marked process. The child
 //! variables (`TOLE_AGENT_DEPTH` and the like) are NOT an exemption: they are
 //! inherited by every process a child's `run_command` starts, so a script
 //! running at depth 1 carries both and is guarded. The unattended faces are
@@ -36,6 +44,11 @@
 //!
 //! WHAT IT CHECKS: flags and environment only. The project config and `--config`
 //! are not inputs here: they pass the owner's trust gate (`tole config trust`).
+//! NOT COVERED: `--profile` (a profile's `allow` replaces the allow list when no
+//! `--allow` flag is given, and a user config that sets a key only under a
+//! profile is unconstrained here), `--yes` (auto-approve), the MCP server flags
+//! and `--workspace`. Profiles live in the user config and are an owner choice;
+//! the rest are separate surfaces.
 //!
 //! WHAT IT IS NOT: a boundary. It is keyed on the same environment marker as
 //! every #684 guard (and #867): a process that clears its environment (a copied
@@ -50,7 +63,8 @@ use tole_core::child_env;
 #[derive(Debug, Clone, Copy)]
 pub struct Context {
     /// `TOLE_UNDER_SESSION` is set (non-blank): the process descends from a
-    /// `run_command` or `job_start`.
+    /// `run_command` or `job_start`, directly or through a marked parent's
+    /// `agent_start` or delegated child (which inherit it).
     pub session_marker: bool,
     /// The subcommand is `serve`, `acp` or `mcp`.
     pub exempt_face: bool,

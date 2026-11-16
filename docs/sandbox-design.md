@@ -409,14 +409,25 @@ servers; `[sandbox.consumers]` is not touched by either.
   start, and by nothing else) that is not `serve`, `acp` or `mcp`; the child
   variables (`TOLE_AGENT_DEPTH` and the like) are inherited by everything a
   child's `run_command` starts, so they do NOT exempt a script at depth 1. A
-  child tole itself starts does not carry `TOLE_UNDER_SESSION` and is exempt
-  because its scope is enforced in the parent: `agent_start` gives a child the patterns glob-covered by the
+  child tole itself starts does not carry `TOLE_UNDER_SESSION` of its own and
+  is exempt because its scope is enforced in the parent (a child whose PARENT
+  is itself marked inherits the marker, see below): `agent_start` gives a child the patterns glob-covered by the
   parent's own resolved allow list (`list_covers`, every parent deny kept) and
   a delegated child takes allow and trust from its flags alone; that parent
   scope can legitimately be wider than the user config after an owner's
   `--allow`, so comparing a child with the user config would refuse a legitimate
-  child. The project config and `--config` are not inputs of the guard: they
-  pass the owner's trust gate. It is keyed on the same environment marker as
+  child. The marker is inherited when the parent is itself marked
+  (`agent_start` and delegation scrub secrets only), so a child in a chain that
+  already contains a script-started tole is guarded too: if its flags are
+  glob-covered by the parent but not exact entries of the user config (a
+  script runs `tole run --allow 'read_*'` and its model calls `agent_start`
+  with `allow=["read_file"]`) it is refused; that fails safe and only happens in
+  chains that already contain a marked process. The project config and
+  `--config` are not inputs of the guard: they pass the owner's trust gate.
+  Not covered: `--profile` (a profile's `allow` replaces the allow list when no
+  `--allow` flag is given, and a user config that sets a key only under a
+  profile is unconstrained here), `--yes`, the MCP server flags and
+  `--workspace`. It is keyed on the same environment marker as
   every #684 guard and #867, so it is NOT a boundary: a copied binary run with a
   cleared environment, a deliberate pty, or a forged depth marker is not
   stopped; the boundary is the command sandbox, which masks the data dir
