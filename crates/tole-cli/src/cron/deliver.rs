@@ -19,7 +19,6 @@
 
 use std::io::Write;
 use std::path::{Component, Path};
-use std::process::Command;
 use std::time::Duration;
 
 use tole_core::ledger::{DeliveryStatus, Job, RunStatus};
@@ -131,6 +130,8 @@ pub fn check(job: &Job) -> Result<(), (&'static str, String)> {
 
 /// What a delivery is told about its run.
 pub struct RunInfo<'a> {
+    /// The cron dir (the sandbox keeps a command apart from it).
+    pub cron_dir: &'a Path,
     pub job: &'a Job,
     pub fire_id: &'a str,
     pub scheduled_for: i64,
@@ -249,20 +250,28 @@ fn safe_parent(root: &Path, dir: &Path) -> Result<std::path::PathBuf, String> {
 fn run_command(run: &RunInfo<'_>, line: &str) -> Result<(), String> {
     let argv = tole_core::run_command::RunCommandTool::split_argv(line)?;
     tole_core::subprocess::check_destructive_argv(&argv)?;
-    let mut cmd = Command::new(&argv[0]);
-    cmd.args(&argv[1..]);
-    if let Some(w) = field(run.job, "workdir") {
-        cmd.current_dir(w);
-    }
-    tole_core::subprocess::scrub_env_for(&mut cmd, "cron");
-    cmd.env("TOLE_CRON_JOB", &run.job.id)
+    // The one launcher (#748 slice 3): plain, or in the sandbox when
+    // `[sandbox.consumers] cron` is on (the job's workdir is the workspace; the
+    // network and every other grant are the profile's, never widened here).
+    let mut prepared = super::launch::prepare(run.job, &argv, run.cron_dir)?;
+    prepared
+        .cmd
+        .env("TOLE_CRON_JOB", &run.job.id)
         .env("TOLE_CRON_FIRE", run.fire_id)
         .env("TOLE_CRON_STATUS", status_text(run.status));
-    let out = tole_core::subprocess::run_with_timeout_stdin(
-        &mut cmd,
+    let out = match tole_core::subprocess::run_with_timeout_stdin(
+        &mut prepared.cmd,
         COMMAND_TIMEOUT,
         run.output.as_bytes(),
-    )?;
+    ) {
+        Ok(o) => o,
+        Err(e) => return Err(prepared.spawn_failure(e)),
+    };
+    // The launcher failing is a failed delivery that says so, not the
+    // command's own exit.
+    if let Some(why) = prepared.launcher_failure(&out) {
+        return Err(why);
+    }
     if out.status.success() {
         return Ok(());
     }

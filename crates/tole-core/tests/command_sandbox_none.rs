@@ -40,6 +40,7 @@ fn without_a_backend_required_refuses_and_optional_depends_on_who_is_watching() 
         job_start: Mode::Required,
         verify: Mode::Optional,
         turnend: Mode::Optional,
+        cron: Mode::Off,
         ..Consumers::default()
     })
     .unwrap();

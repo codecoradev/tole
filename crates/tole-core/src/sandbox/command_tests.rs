@@ -753,8 +753,8 @@ fn limits_are_bounded() {
 fn the_default_consumers_are_all_off_with_no_network() {
     let c = Consumers::default();
     assert_eq!(
-        (c.run_command, c.job_start, c.verify, c.turnend),
-        (Mode::Off, Mode::Off, Mode::Off, Mode::Off)
+        (c.run_command, c.job_start, c.verify, c.turnend, c.cron),
+        (Mode::Off, Mode::Off, Mode::Off, Mode::Off, Mode::Off)
     );
     assert_eq!(c.network, Network::None);
     assert_eq!(consumers(), c, "nothing set: everything off");
@@ -764,13 +764,15 @@ fn the_default_consumers_are_all_off_with_no_network() {
 fn doctor_says_what_is_there_and_that_off_is_off() {
     let off = doctor_lines(&Consumers::default(), &usable());
     assert!(off[0].contains("run_command off, job_start off"), "{off:?}");
-    assert!(off[0].contains("verify off, turnend off"), "{off:?}");
-    // Only what is still not a consumer is called unsandboxed.
+    assert!(
+        off[0].contains("verify off, turnend off, cron off"),
+        "{off:?}"
+    );
+    // Cron is a consumer now: off says so, and nothing says "not yet".
     let last = off.last().unwrap();
     assert!(
-        last.contains("cron scripts and deliveries are not sandboxed yet")
-            && !last.contains("verify")
-            && !last.contains("turnend"),
+        last.contains("cron scripts and command: deliveries run unsandboxed (cron off")
+            && !off.iter().any(|l| l.contains("not sandboxed yet")),
         "{off:?}"
     );
     assert!(!off.iter().any(|l| l.contains("ERROR")));
@@ -816,7 +818,10 @@ fn all(mode: Mode) -> Consumers {
 #[test]
 fn consumer_names_are_the_config_and_secrets_keys() {
     let names: Vec<_> = Consumer::ALL.iter().map(|k| k.name()).collect();
-    assert_eq!(names, ["run_command", "job_start", "verify", "turnend"]);
+    assert_eq!(
+        names,
+        ["run_command", "job_start", "verify", "turnend", "cron"]
+    );
     assert_eq!(Consumer::Verify.name(), crate::secret_release::VERIFY);
     assert_eq!(Consumer::TurnEnd.name(), crate::secret_release::TURNEND);
 }
@@ -1900,4 +1905,136 @@ fn doctor_points_at_the_git_tool_only_when_a_consumer_is_on() {
         l.starts_with("sandbox consumers: git writes") && l.contains("`git` tool"),
         "{l}"
     );
+}
+
+// Slice 3 (#748): cron script jobs and `command:` deliveries.
+
+fn cron_on(mode: Mode) -> Consumers {
+    Consumers {
+        cron: mode,
+        ..Consumers::default()
+    }
+}
+
+#[test]
+fn cron_is_a_consumer_with_its_own_mode_and_off_by_default() {
+    assert_eq!(Consumer::Cron.name(), "cron");
+    let c = cron_on(Mode::Required);
+    for k in Consumer::ALL {
+        let want = if k == Consumer::Cron {
+            Mode::Required
+        } else {
+            Mode::Off
+        };
+        assert_eq!(c.mode(k), want, "{k:?}");
+    }
+    assert_eq!(
+        plan(&Consumers::default(), &gone(), true, Consumer::Cron),
+        CommandLaunch::Direct { warning: None },
+        "off is unchanged, even with no sandbox"
+    );
+}
+
+/// Cron fires from a scheduler: `optional` is `required`, with no fallback
+/// even when the process flag says a human is attached.
+#[test]
+fn an_optional_cron_job_never_falls_back_to_unsandboxed() {
+    assert!(Consumer::Cron.always_unattended());
+    for mode in [Mode::Optional, Mode::Required] {
+        let c = cron_on(mode);
+        for attended in [false, true] {
+            // `launch_command` passes `unattended || always_unattended()`.
+            let CommandLaunch::Refused(why) = plan(
+                &c,
+                &gone(),
+                attended || Consumer::Cron.always_unattended(),
+                Consumer::Cron,
+            ) else {
+                panic!("{mode:?} cron without a sandbox must refuse")
+            };
+            assert!(why.starts_with("cron: "), "{why}");
+            assert!(why.contains("sandbox.consumers.cron"), "{why}");
+        }
+    }
+}
+
+#[test]
+fn a_cron_command_runs_in_the_job_workdir_with_the_one_command_profile() {
+    let ws = tmp("cron-profile");
+    let ws = std::fs::canonicalize(&*ws).unwrap();
+    let c = cron_on(Mode::Required);
+    let a = argv(&c, Consumer::Cron, &env_in(&ws), &sh_args());
+    let w = ws.display().to_string();
+    assert!(has(&a, &["--bind", &w, &w]), "the workdir is the workspace");
+    assert!(has(&a, &["--chdir", &w]), "{a:?}");
+    // The same profile as every other command consumer: nothing widened.
+    let base = argv(
+        &all(Mode::Required),
+        Consumer::RunCommand,
+        &env_in(&ws),
+        &sh_args(),
+    );
+    assert_eq!(a, base, "one profile for every command");
+    // A bare name only, like the model tools (the cron argv check refuses a
+    // path-qualified program before it gets here).
+    let out = plan_command(
+        &c,
+        &usable(),
+        true,
+        &env_in(&ws),
+        Consumer::Cron,
+        ("./job", &[]),
+    );
+    assert!(matches!(out, CommandLaunch::Refused(_)), "{out:?}");
+}
+
+#[test]
+fn a_cron_workdir_the_profile_refuses_is_a_refusal() {
+    let c = cron_on(Mode::Required);
+    for (why, ws) in [
+        ("gone", Path::new("/nonexistent-tole-cron-workdir")),
+        ("root", Path::new("/")),
+    ] {
+        let out = plan_command(
+            &c,
+            &usable(),
+            true,
+            &env_in(ws),
+            Consumer::Cron,
+            ("sh", &sh_args()),
+        );
+        let CommandLaunch::Refused(r) = out else {
+            panic!("{why}: {out:?}")
+        };
+        assert!(r.starts_with("cron: "), "{why}: {r}");
+    }
+}
+
+#[test]
+fn doctor_reports_the_cron_consumer() {
+    let l = doctor_lines_for(&cron_on(Mode::Optional), &usable(), None);
+    assert!(l[0].contains("cron optional"), "{l:?}");
+    assert!(
+        l.iter().any(|x| x
+            .contains("cron scripts and command: deliveries run in the command profile")
+            && x.contains("no unsandboxed fallback")),
+        "{l:?}"
+    );
+    assert!(!l.iter().any(|x| x.contains("not sandboxed yet")), "{l:?}");
+    // Optional counts as required in an unattended run: an ERROR without bwrap.
+    let l = doctor_lines_for(&cron_on(Mode::Optional), &gone(), None);
+    assert!(
+        l.iter()
+            .any(|x| x.contains("ERROR cron has no working sandbox") && x.contains("cron job")),
+        "{l:?}"
+    );
+}
+
+/// `warn_once` keeps one flag per consumer: every consumer must have a slot.
+#[test]
+fn warn_once_has_a_slot_for_every_consumer() {
+    for (i, k) in Consumer::ALL.iter().enumerate() {
+        assert_eq!(k.index(), i, "{k:?}: ALL is in declaration order");
+        warn_once(*k, &format!("{}: test warning, ignore", k.name()));
+    }
 }

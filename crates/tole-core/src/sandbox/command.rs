@@ -37,7 +37,7 @@ use std::ffi::OsString;
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
 /// Paths of the workspace that later run code outside the sandbox: they stay
@@ -45,22 +45,26 @@ use std::sync::OnceLock;
 pub const PROTECTED: [&str; 2] = [".git", ".tole"];
 
 /// The commands that can be sandboxed: the two model-driven tools, the
-/// mission `--verify` command and the `on_turnend` stop gates.
+/// mission `--verify` command, the `on_turnend` stop gates and the cron
+/// script jobs and `command:` deliveries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Consumer {
     RunCommand,
     JobStart,
     Verify,
     TurnEnd,
+    /// A cron script job and a cron `command:` delivery (#748 slice 3).
+    Cron,
 }
 
 impl Consumer {
     /// Every consumer, in the order the doctor lists them.
-    pub const ALL: [Consumer; 4] = [
+    pub const ALL: [Consumer; 5] = [
         Consumer::RunCommand,
         Consumer::JobStart,
         Consumer::Verify,
         Consumer::TurnEnd,
+        Consumer::Cron,
     ];
 
     /// The consumer's name, as in `[sandbox.consumers]` and `[secrets]`.
@@ -70,20 +74,25 @@ impl Consumer {
             Consumer::JobStart => "job_start",
             Consumer::Verify => "verify",
             Consumer::TurnEnd => "turnend",
+            Consumer::Cron => "cron",
         }
     }
 
     /// The mission `--verify` command only runs inside `tole mission`, an
-    /// autonomous run with nobody to answer a prompt, and a stop gate runs
-    /// while the model is finishing, with nobody answering either: for both
-    /// `optional` is always `required`, whatever the process flag says.
+    /// autonomous run with nobody to answer a prompt, a stop gate runs
+    /// while the model is finishing, with nobody answering either, and a
+    /// cron job fires from a scheduler (`tole cron tick`, `tole serve --cron`)
+    /// with nobody attached: for all of them `optional` is always `required`,
+    /// whatever the process flag says. There is no unsandboxed fallback.
     pub fn always_unattended(self) -> bool {
-        matches!(self, Consumer::Verify | Consumer::TurnEnd)
+        matches!(self, Consumer::Verify | Consumer::TurnEnd | Consumer::Cron)
     }
 
     /// The owner's stop gate is a program path or name (`./gate.sh`,
     /// `/opt/bin/check`, `cargo`), split from its command line as before;
-    /// the tools take a bare name only.
+    /// the tools and cron take a bare name only (a cron argv is refused when a
+    /// path-qualified program is saved, and again when it runs, by
+    /// `check_destructive_argv`).
     fn runs_paths(self) -> bool {
         self == Consumer::TurnEnd
     }
@@ -159,6 +168,8 @@ pub struct Consumers {
     pub verify: Mode,
     /// The `on_turnend` stop gates.
     pub turnend: Mode,
+    /// Cron script jobs and `command:` deliveries (always unattended).
+    pub cron: Mode,
     /// Network of the `command` profile: none, or the host's.
     pub network: Network,
     pub limits: Limits,
@@ -171,6 +182,7 @@ impl Default for Consumers {
             job_start: Mode::Off,
             verify: Mode::Off,
             turnend: Mode::Off,
+            cron: Mode::Off,
             network: Network::None,
             limits: Limits::default(),
         }
@@ -184,6 +196,7 @@ impl Consumers {
             Consumer::JobStart => self.job_start,
             Consumer::Verify => self.verify,
             Consumer::TurnEnd => self.turnend,
+            Consumer::Cron => self.cron,
         }
     }
 }
@@ -1223,6 +1236,25 @@ pub fn command_in_cwd(
     command_prepared(consumer, &cwd, program, args, true)
 }
 
+/// [`command_for`] for a command that runs in `workdir`, which is the
+/// workspace the sandbox binds (a cron job's own working directory, #748
+/// slice 3: neither the process's nor a session's). The caller sets the
+/// command's `current_dir` to the same directory. A wrapped command comes
+/// with a [`LauncherReport`].
+///
+/// The plan is made for `workdir` alone: a workdir below a repository root
+/// does not see the repository's `.git` (it is not mounted), one that is or
+/// holds `$HOME` or the tole data dir is refused, and the layouts
+/// [`protect_plan`] cannot protect are refused, all as an `Err`.
+pub fn command_in_dir(
+    consumer: Consumer,
+    workdir: &Path,
+    program: &str,
+    args: &[String],
+) -> Result<Launched, String> {
+    command_prepared(consumer, workdir, program, args, true)
+}
+
 /// Whether `consumer` could run a command here now, without running one: the
 /// refusal [`command_in_cwd`] would give, or `Ok`. For a start-up check, so a
 /// run that cannot work stops before it spends anything.
@@ -1333,13 +1365,11 @@ pub(crate) fn recheck_plan(workspace: &Path, args: &[OsString]) -> Result<(), St
 /// A fallback to no sandbox is warned about once per process and tool, not
 /// on every call (a chatty line per command would drown a terminal).
 fn warn_once(consumer: Consumer, text: &str) {
-    static WARNED: [AtomicBool; 4] = [
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-        AtomicBool::new(false),
-    ];
-    if !WARNED[consumer.index()].swap(true, Ordering::SeqCst) {
+    // One bit per consumer, so a new consumer needs no new slot.
+    static WARNED: AtomicUsize = AtomicUsize::new(0);
+    const _: () = assert!(Consumer::ALL.len() <= usize::BITS as usize);
+    let bit = 1usize << consumer.index();
+    if WARNED.fetch_or(bit, Ordering::SeqCst) & bit == 0 {
         eprintln!("tole: {text}");
     }
 }
@@ -1486,10 +1516,10 @@ pub fn doctor_lines_for(c: &Consumers, avail: &Availability, home: Option<&Path>
     let mut out = Vec::new();
     if Consumer::ALL.iter().all(|k| c.mode(*k) == Mode::Off) {
         out.push(
-            "sandbox consumers: run_command off, job_start off, verify off, turnend off (model \
-             commands, the mission --verify command and the stop gates run unsandboxed; set \
-             [sandbox.consumers] run_command / job_start / verify / turnend in the user config \
-             to sandbox them)"
+            "sandbox consumers: run_command off, job_start off, verify off, turnend off, cron off \
+             (model commands, the mission --verify command, the stop gates and cron scripts and \
+             deliveries run unsandboxed; set [sandbox.consumers] run_command / job_start / \
+             verify / turnend / cron in the user config to sandbox them)"
                 .into(),
         );
     } else {
@@ -1499,12 +1529,13 @@ pub fn doctor_lines_for(c: &Consumers, avail: &Availability, home: Option<&Path>
         };
         let l = c.limits;
         out.push(format!(
-            "sandbox consumers: run_command {}, job_start {}, verify {}, turnend {}, network \
-             {net}, limits cpu {}s memory {}MB processes {} file {}MB",
+            "sandbox consumers: run_command {}, job_start {}, verify {}, turnend {}, cron {}, \
+             network {net}, limits cpu {}s memory {}MB processes {} file {}MB",
             word(c.run_command),
             word(c.job_start),
             word(c.verify),
             word(c.turnend),
+            word(c.cron),
             l.cpu_secs,
             l.memory_mb,
             l.processes,
@@ -1517,7 +1548,7 @@ pub fn doctor_lines_for(c: &Consumers, avail: &Availability, home: Option<&Path>
                     (Mode::Required, _) => ("ERROR", "refused (required)"),
                     (Mode::Optional, true) => (
                         "ERROR",
-                        "refused: a mission or a stop gate runs unattended, where optional counts as required",
+                        "refused: a mission, a stop gate or a cron job runs unattended, where optional counts as required",
                     ),
                     (Mode::Optional, false) => (
                         "WARNING",
@@ -1564,7 +1595,23 @@ pub fn doctor_lines_for(c: &Consumers, avail: &Availability, home: Option<&Path>
                 .into(),
         );
     }
-    out.push("sandbox consumers: cron scripts and deliveries are not sandboxed yet".into());
+    if c.cron == Mode::Off {
+        out.push(
+            "sandbox consumers: cron scripts and command: deliveries run unsandboxed (cron off; \
+             agent jobs use their own run_command and job_start settings)"
+                .into(),
+        );
+    } else {
+        out.push(format!(
+            "sandbox consumers: cron scripts and command: deliveries run in the command profile \
+             (cron {}): a cron job is unattended, so there is no unsandboxed fallback and a \
+             refused or failed launch is a failed run or delivery in the cron ledger; the \
+             workspace is the job's workdir, and a script or delivery that needs the network, \
+             $HOME or files outside its workdir fails there (agent jobs are not covered, they \
+             use run_command and job_start)",
+            word(c.cron)
+        ));
+    }
     out
 }
 

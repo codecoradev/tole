@@ -552,8 +552,8 @@ Notes per consumer:
 ### 9.3 Model commands as implemented (#748, first slice)
 
 The first slice made `run_command` and `job_start` consumers; the second
-(§9.4) added `verify` and `turnend`. Cron scripts and deliveries run as
-before (third slice). Every consumer is off by default; the owner decided
+(§9.4) added `verify` and `turnend`; the third (§9.5) added cron scripts and
+`command:` deliveries. Every consumer is off by default; the owner decided
 `verify` and `turnend` become sandboxed by default later (§9.4, migration),
 and nothing here changes their defaults.
 
@@ -564,7 +564,8 @@ The owner's `[sandbox]`, `[sandbox.consumers]`, `[secrets]` and
 the user config even though `cron` is on the config skip list (never the
 project config; a user config that does not parse stops them, it does not run
 the job with defaults). The other `cron` subcommands, which only edit files,
-still skip it. A cron SCRIPT job is not sandboxed yet (third slice).
+still skip it. A cron SCRIPT job and a `command:` delivery are sandboxed by
+`cron` (§9.5).
 
 ```toml
 [sandbox.consumers]            # user config only; every key optional
@@ -810,9 +811,10 @@ file_size_mb = 4096            # 1 to 1048576, largest file a process writes
   but cannot be tracked (pid file not written) is stopped through its group and
   the direct children of its launcher (`jobs::kill_detached`).
 - **`tole doctor`** prints the consumers' modes, the network and the limits, says
-  cron scripts and deliveries are not sandboxed yet, and fails
+  whether cron scripts and `command:` deliveries are sandboxed (`cron`), and fails
   when a `required` consumer has no working sandbox (a warning for `optional`;
-  an error for `optional` `verify`, which a mission treats as `required`).
+  an error for `optional` `verify`, `turnend` and `cron`, which run unattended and
+  treat `optional` as `required`).
   `tole config check` lists the `sandbox.consumers.*` keys.
   For each sandboxed stdio server (from `mcp_server` in the user config) and
   each consumer that is on, it also prints the mode, the workspace access, the
@@ -1056,6 +1058,99 @@ as before.
   slice; start the server eagerly (leave `lazy_start` off) to use them.
 - `tole doctor` says when lazy start is on.
 
+### 9.5 Cron scripts and deliveries as implemented (#748, third slice)
+
+```toml
+[sandbox.consumers]
+cron = "required"              # "off" (default) | "optional" | "required"
+```
+
+One new consumer key, `cron`, for the two things `tole cron` runs from a job:
+a script job (`--script`) and a `command:` delivery. Both run in the SAME
+`command` profile as every other consumer (same limits, same `network`
+setting, same protected paths); nothing here has a profile of its own and
+nothing is widened. Cron AGENT jobs are not covered by `cron`: their model
+commands follow `run_command` and `job_start`. Default `off`, user config only;
+`cron = "off"` is byte for byte the old behaviour.
+
+- **Unattended, so no fallback.** A cron job fires from a scheduler
+  (`tole cron tick`, `tole serve --cron`) with nobody to answer, so `cron` is
+  `Consumer::always_unattended`, like `verify` and `turnend`: `optional` counts as
+  `required`. A missing backend, a plan the profile refuses (see below) and a
+  launcher that fails or cannot be spawned are REFUSALS. The job never runs
+  unsandboxed, and a launcher failure is never read as a pass. `main.rs` also
+  refuses to start a `cron run` / `cron tick` whose sessions directory cannot be
+  protected (§9.3) when `cron` is on.
+- **One launcher.** `crates/tole-cli/src/cron/launch.rs` (`prepare`) is the only
+  place `cron` builds a process; it asks `command_in_dir(Consumer::Cron, ..)`
+  (`tole_core::sandbox::command`), which is the path `verify` and the stop gates
+  use, with the launcher status from `bwrap --json-status-fd`. The script run
+  (`tick::run_script`) and the delivery (`deliver::run_command`) both call it;
+  a test fails when any other file in `src/cron` builds a `Command`.
+  `check_destructive_argv` still runs first, at save and at run time; it also
+  refuses a path-qualified program, so a cron argv is a bare name found on the
+  job's `PATH` (`sh job.sh`, not `./job.sh`).
+- **The workdir is the workspace.** The plan is made for the job's `workdir`
+  alone (the process's working directory when the job has none; unknown is a
+  refusal), resolved and refused like every grant: gone since the job was saved,
+  `$HOME` or an ancestor, the data dir or an ancestor, `/` are refused, and so
+  are the layouts `protect_plan` cannot protect (submodules not initialized,
+  linked worktrees, a link in the `.git` chain). A workdir BELOW a repository
+  root binds that directory only: the repository's `.git` above it is not in
+  the sandbox at all (not even readable), and `..` is the sandbox's own tmpfs.
+  A workdir that holds the repository gets the whole `.git`, `.tole`,
+  `.tole-worktrees` and `.gitmodules` paths read-only as for `run_command`; git
+  commands that write fail there, as designed.
+- **The cron dir stays out.** The ledger, the run logs, the ticker state and the
+  lock live in the cron dir, which is under the data dir by default (absent from
+  the sandbox, so the default layout is safe) but is wherever `TOLE_CRON_DIR`
+  says. The grant check only knows the data dir, so `launch::prepare` also
+  refuses, for scripts and deliveries, a workdir that holds the cron dir or is
+  inside it (both resolved like the plan resolves paths, links and `..`
+  followed), and a cron dir it cannot resolve: a writable bind of either would
+  let the script append job lines (a forged `created_by`) or edit its run log.
+  Everything a job's definition, trust and deliveries are read from is in that
+  one directory.
+- **Deliveries.** A `command:` delivery gets the run's output on stdin and
+  `TOLE_CRON_JOB`, `TOLE_CRON_FIRE` and `TOLE_CRON_STATUS` as before, in the same
+  profile and workspace. What it can reach is the profile's: with `network =
+  "none"` a delivery that must call a webhook or an SMTP relay fails (set
+  `network = "host"`, which is also granted to the other consumers; there is no
+  per-consumer network), and `$HOME` (`~/.mailrc`, `~/.netrc`, an ssh key) and
+  paths outside the workdir are not visible. A program outside the system
+  directories has its directory bound read-only. A delivery that fails is a
+  `failed` record with its own exit code and the first 200 characters of its
+  stderr, as before; the one that did not run (refusal, launcher failure) is
+  `failed` with `cron: ...` and the reason. A failed delivery never changes the
+  run's status.
+- **Result and the ledger.** stdout is captured (1 MiB cap) and the exit code is
+  the command's own, taken from the launcher's status report when the script
+  is sandboxed: a non-zero exit for which `bwrap` reported no exit code of
+  the command is the launcher failing, and settles the run `error` with
+  `usage.sandbox_refused = true`, the reason in `usage.error` AND in the run's
+  output (so `tole cron runs`, `GET /cron/runs` and the delivery targets show it).
+  A real exit code (including 125, 126, 127) is the script's own verdict. The
+  run status of a refusal is `error`, never `ok`; `usage.sandboxed` says whether
+  the run was wrapped.
+- **Timeout and cancel.** The job's `timeout_secs` (default 300 s) and the 60 s
+  delivery timeout kill the `bwrap` process; `--die-with-parent` takes the
+  sandbox with it. A timeout is an `error` run (`timed out`), not a refusal.
+  `tole cron cancel` kills the same way.
+- **MAILTO.** A refusal is recorded in the ledger and the run log; nothing is
+  printed to stderr for it. The sandbox adds no per-tick stderr line (an
+  `optional` fallback would warn, and cron has none), so an OS cron that mails
+  stderr is not spammed once a minute by a missing backend, and the
+  `using user config` line stays suppressed without a terminal (#868). `tole
+  cron tick` still prints its one report line on stdout as before, and the
+  status of each run in it is `error`.
+- **Doctor.** `tole doctor` prints `cron` with the other consumers, and an
+  ERROR line when it is on and no backend works (also for `optional`).
+- **Residual.** A script file inside the writable workdir can be rewritten by
+  an earlier run; keep it outside the workdir (a bare name on `PATH`). As in
+  §9.3, only what exists at launch is protected. The sandbox does not change
+  who may create a job: `command:` deliveries are still trust-gated to jobs a
+  human saved through the CLI.
+
 ## 10. Failure behaviour
 
 At startup tole resolves the backend once: `bwrap` on `PATH`, version
@@ -1165,8 +1260,8 @@ entry.
    `run_command`, `job_start`, cron scripts and deliveries, `verify`,
    `turnend`; rlimits; per-consumer tests; migration note. First slice done
    (#748, §9.3): `run_command`, `job_start`, rlimits. Second slice done
-   (§9.4): `verify` and `turnend`, with the migration plan. Cron scripts and
-   deliveries follow.
+   (§9.4): `verify` and `turnend`, with the migration plan. Third slice done
+   (§9.5): cron scripts and `command:` deliveries.
 5. **Lazy start and idle stop** (~700): register from the locked snapshot,
    start on first call, manifest check at start, idle stop.
 6. **Tool retrieval by meaning** (~900, may split): the search tool over
