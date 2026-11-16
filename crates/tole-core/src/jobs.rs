@@ -270,8 +270,13 @@ impl Tool for JobStartTool {
     }
 
     fn summary(&self) -> String {
-        "Start a long-running command as a background job; returns a job id to poll with job_poll."
-            .into()
+        let mut s = String::from(
+            "Start a long-running command as a background job; returns a job id to poll with job_poll.",
+        );
+        if crate::sandbox::command::consumers().job_start != crate::sandbox::Mode::Off {
+            s.push_str(crate::run_command::GIT_NOTE);
+        }
+        s
     }
 
     fn describe(&self, input: &Value) -> String {

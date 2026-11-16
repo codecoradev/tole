@@ -12,17 +12,31 @@
 //! charset), and anything unexpected is refused *before* spawning.
 //! `push` and everything network/history-mutating is intentionally NOT
 //! whitelisted — push stays a human action.
+//!
+//! This tool runs on the HOST, outside any command sandbox, and git executes
+//! what the repository's config and hooks name. Hardening (#748, the `.git` of
+//! a sandboxed command is read-only, so writes go through this tool):
+//! - ALWAYS `-c core.fsmonitor=false` (performance only, no feature lost: a
+//!   `core.fsmonitor` command in a repository config never runs here);
+//! - when any command consumer is on (`[sandbox.consumers]`), also
+//!   `-c core.hooksPath=<ws>/.git/hooks` (the read-only, owner-trusted hooks
+//!   directory; `/dev/null` when `.git` is not a real directory), so the
+//!   owner's installed hooks still run but a `core.hooksPath` that points at
+//!   scripts inside the writable workspace (husky style) does not;
+//!   `GIT_CONFIG_NOSYSTEM=1`; and `--no-ext-diff --no-textconv` for `diff`.
+//!   With no consumer on, hooks and the rest behave as they always did.
 
 use crate::subprocess::run_with_timeout;
 use crate::tool::{Risk, Tool};
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-/// Git ops may trigger hooks (pre-commit review bots are common on this
-/// host's global template). LLM-backed hooks routinely exceed the 30s
-/// generic subprocess ceiling, so git gets its own budget.
+/// Git ops may trigger hooks (the owner's installed pre-commit review bots
+/// are common on this host's global template, and still run when a command
+/// consumer is on: see the module doc). LLM-backed hooks routinely exceed the
+/// 30s generic subprocess ceiling, so git gets its own budget.
 const GIT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Allowed `git` subcommands.
@@ -155,6 +169,65 @@ impl GitOp {
     }
 }
 
+/// Whether any command consumer (`run_command`, `job_start`, verify, stop
+/// gates, and any added later) runs in the sandbox, which is when this tool
+/// hardens its invocation beyond `core.fsmonitor`.
+fn consumers_on() -> bool {
+    use crate::sandbox::command::{consumers, Consumer};
+    let c = consumers();
+    Consumer::ALL
+        .iter()
+        .any(|k| c.mode(*k) != crate::sandbox::Mode::Off)
+}
+
+/// The hooks directory to pin when hardened: `<repo>/.git/hooks` of the
+/// nearest enclosing repository when its `.git` is a REAL directory (not a
+/// file or a link: a link or a gitdir file could lead anywhere), else `None`
+/// (hooks off, `/dev/null`).
+fn pinned_hooks_dir(workdir: Option<&Path>) -> Option<PathBuf> {
+    let start = match workdir {
+        Some(d) => d.to_path_buf(),
+        None => std::env::current_dir().ok()?,
+    };
+    let start = std::fs::canonicalize(start).ok()?;
+    for dir in start.ancestors() {
+        let git = dir.join(".git");
+        match std::fs::symlink_metadata(&git) {
+            Ok(m) if m.is_dir() => return Some(git.join("hooks")),
+            Ok(_) => return None,
+            Err(_) => continue,
+        }
+    }
+    None
+}
+
+/// The full argv after the program: the global `-c` options, then the op's
+/// own argv. `hardened` is [`consumers_on`]; `hooks_dir` the pinned hooks
+/// directory (`None`: `/dev/null`).
+pub(crate) fn invocation(
+    op: GitOp,
+    argv: Vec<String>,
+    hardened: bool,
+    hooks_dir: Option<&Path>,
+) -> Vec<String> {
+    let mut out: Vec<String> = vec!["-c".into(), "core.fsmonitor=false".into()];
+    if hardened {
+        let hooks = hooks_dir.map_or_else(|| "/dev/null".to_string(), |d| d.display().to_string());
+        out.push("-c".into());
+        out.push(format!("core.hooksPath={hooks}"));
+    }
+    let mut rest = argv.into_iter();
+    if let Some(sub) = rest.next() {
+        out.push(sub);
+        if hardened && op == GitOp::Diff {
+            out.push("--no-ext-diff".into());
+            out.push("--no-textconv".into());
+        }
+    }
+    out.extend(rest);
+    out
+}
+
 /// Light git tool. cwd = the repo checkout (jail root for paths is the
 /// same cwd the file tools use).
 #[derive(Debug, Clone)]
@@ -244,9 +317,17 @@ impl Tool for GitTool {
         if argv.iter().any(|a| a.contains('\0')) {
             return Err("git: arguments must not contain NUL bytes".into());
         }
+        let hardened = consumers_on();
+        let hooks_dir = hardened
+            .then(|| pinned_hooks_dir(self.workdir.as_deref()))
+            .flatten();
         let mut cmd = Command::new(&self.bin);
         crate::subprocess::scrub_env_for(&mut cmd, "git");
-        cmd.args(&argv);
+        if hardened {
+            // No system-wide gitconfig: its includes and hooks are not the owner's.
+            cmd.env("GIT_CONFIG_NOSYSTEM", "1");
+        }
+        cmd.args(invocation(op, argv, hardened, hooks_dir.as_deref()));
         if let Some(dir) = &self.workdir {
             cmd.current_dir(dir);
         }
@@ -445,6 +526,87 @@ mod tests {
         }
     }
 
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    /// #748: only `core.fsmonitor=false` without a command consumer, the
+    /// pinned hooks directory, `/dev/null` and the diff options with one.
+    #[test]
+    fn the_invocation_is_hardened_only_when_a_command_consumer_is_on() {
+        let commit = s(&["commit", "-m", "x"]);
+        assert_eq!(
+            invocation(GitOp::Commit, commit.clone(), false, None),
+            s(&["-c", "core.fsmonitor=false", "commit", "-m", "x"])
+        );
+        // The hardening never touches the op's own arguments.
+        let hooks = Path::new("/ws/.git/hooks");
+        assert_eq!(
+            invocation(GitOp::Commit, commit.clone(), true, Some(hooks)),
+            s(&[
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.hooksPath=/ws/.git/hooks",
+                "commit",
+                "-m",
+                "x"
+            ])
+        );
+        // No real `.git` directory: hooks off.
+        assert_eq!(
+            invocation(GitOp::Commit, commit, true, None)[3],
+            "core.hooksPath=/dev/null"
+        );
+        // `diff` also gets the driver options, `--staged` stays after them.
+        assert_eq!(
+            invocation(GitOp::Diff, s(&["diff", "--staged"]), true, Some(hooks)),
+            s(&[
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.hooksPath=/ws/.git/hooks",
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--staged"
+            ])
+        );
+        assert_eq!(
+            invocation(GitOp::Diff, s(&["diff"]), false, None),
+            s(&["-c", "core.fsmonitor=false", "diff"])
+        );
+        // The other ops are not diffs.
+        assert!(
+            !invocation(GitOp::Status, s(&["status", "--short"]), true, None)
+                .contains(&"--no-ext-diff".to_string())
+        );
+    }
+
+    /// The pinned directory is `.git/hooks` of a REAL `.git` directory found
+    /// from the workdir upward; a gitdir file, a link or no repository pins none.
+    #[cfg(unix)]
+    #[test]
+    fn the_pinned_hooks_directory_needs_a_real_git_directory() {
+        let d = crate::test_dir::TestDir::new("tole-git-pin");
+        let root = std::fs::canonicalize(&*d).unwrap();
+        // A monorepo subdirectory finds the enclosing repository.
+        std::fs::create_dir_all(root.join("repo/.git")).unwrap();
+        std::fs::create_dir_all(root.join("repo/sub/deeper")).unwrap();
+        assert_eq!(
+            pinned_hooks_dir(Some(&root.join("repo/sub/deeper"))),
+            Some(root.join("repo/.git/hooks"))
+        );
+        // A gitdir FILE (worktree, submodule): none.
+        std::fs::create_dir_all(root.join("wt")).unwrap();
+        std::fs::write(root.join("wt/.git"), "gitdir: /elsewhere\n").unwrap();
+        assert_eq!(pinned_hooks_dir(Some(&root.join("wt"))), None);
+        // A symbolic link: none.
+        std::fs::create_dir_all(root.join("lk")).unwrap();
+        std::os::unix::fs::symlink(root.join("repo/.git"), root.join("lk/.git")).unwrap();
+        assert_eq!(pinned_hooks_dir(Some(&root.join("lk"))), None);
+    }
+
     #[test]
     fn fake_git_binary_end_to_end() {
         let dir = crate::test_dir::TestDir::new("tole-git");
@@ -460,7 +622,8 @@ mod tests {
             .unwrap();
         assert_eq!(out["stdout"], json!("ok"));
         let recorded = std::fs::read_to_string(&log).unwrap();
-        assert_eq!(recorded.trim(), "commit -m feat: x");
+        // Only `core.fsmonitor=false` is added when no command consumer is on.
+        assert_eq!(recorded.trim(), "-c core.fsmonitor=false commit -m feat: x");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

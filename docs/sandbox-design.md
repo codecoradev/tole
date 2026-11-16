@@ -617,8 +617,27 @@ file_size_mb = 4096            # 1 to 1048576, largest file a process writes
   system", `git stash` exits 1 with no message). Reads work: `log`, `diff`,
   `show`, `status` (without refreshing the index, no hang), `rev-parse`,
   `branch --list`, `ls-files`. A model cannot commit from inside a sandboxed
-  command; it does so through a tool outside the sandbox, or the owner does.
-  There is no setting to make `.git` writable.
+  command; it does so through the `git` tool (status, diff, add, commit), which
+  runs on the host outside the sandbox, or the owner does. There is no setting
+  to make `.git` writable and no `git = "write"` opt-in: a writable `.git` is
+  exactly what #849 closed. The tool is `Risk::Write` through the Approver like
+  any Write tool (never allowlisted blindly: `--allow git` is the owner's
+  explicit choice) and takes data only (a message, relative paths). Because it
+  runs on the host, git would execute what the repository config and hooks name,
+  so its invocation is hardened: ALWAYS `-c core.fsmonitor=false` (performance
+  only), and when any command consumer is on (`[sandbox.consumers]`) also
+  `-c core.hooksPath=<repo>/.git/hooks` (the read-only, owner-trusted hooks
+  directory of the nearest enclosing repository, `/dev/null` when its `.git` is
+  not a real directory), `GIT_CONFIG_NOSYSTEM=1`, and `--no-ext-diff
+  --no-textconv` for `diff`. So the owner's own installed hooks (a pre-commit
+  review bot) still run, which a sandboxed command cannot change, while a
+  `core.hooksPath` that points at scripts INSIDE the writable workspace
+  (husky style) no longer runs on the host through the tool. Residual: a human
+  `git commit` in the same repository still runs those husky scripts (that is
+  the owner's own command), and a nested repository's own config is not looked
+  at by the pinned flags (see the residuals above). The `run_command` and
+  `job_start` summaries tell the model that git writes fail in the sandbox and
+  to use the `git` tool, and `tole doctor` says the same when a consumer is on.
 
   **The sessions directory (#866).** Sessions are append-only JSONL, and a
   command that could rewrite them would break resume, the audit and the cost

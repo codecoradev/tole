@@ -1880,3 +1880,24 @@ fn a_dotdot_after_a_link_in_a_gitdir_or_worktree_pointer_is_not_collapsed_either
     let e = protect_plan(&ws).unwrap_err();
     assert!(e.contains("linked worktree"), "{e}");
 }
+
+/// The doctor tells where the way out of a read-only `.git` is when any
+/// command consumer is on, and says nothing about it when none is.
+#[test]
+fn doctor_points_at_the_git_tool_only_when_a_consumer_is_on() {
+    let find = |c: &Consumers| {
+        doctor_lines(c, &usable())
+            .into_iter()
+            .find(|l| l.contains("git writes"))
+    };
+    assert_eq!(find(&Consumers::default()), None);
+    let l = find(&Consumers {
+        turnend: Mode::Required,
+        ..Consumers::default()
+    })
+    .unwrap();
+    assert!(
+        l.starts_with("sandbox consumers: git writes") && l.contains("`git` tool"),
+        "{l}"
+    );
+}

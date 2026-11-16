@@ -108,7 +108,7 @@ lives) / **gap** (tracked) / **N/A** (with rationale).
   repository containing it; in a monorepo subdirectory that includes
   modified files of sibling directories. This is not a jail escape: the
   jail (#247) applies to `add` pathspecs (no absolute paths, `..`, or
-  pathspec magic), and the whole git tool is `Risk::Write`, so every call
+  pathspec magic), and the whole git tool is `Risk::Write` (it runs on the host, so with a command consumer on its invocation is hardened: `core.hooksPath` pinned to the owner's `.git/hooks`, no system gitconfig, no external diff drivers; `core.fsmonitor` is always off; #748), so every call
   — reads included — goes through the approval gate.
 - **Injection residual** (above) — fences are a mitigation, not immunity;
   the model must still treat fenced content as data.
