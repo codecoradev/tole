@@ -21,6 +21,7 @@
 
 pub mod agent;
 pub mod deliver;
+pub mod launch;
 pub mod setup;
 pub mod status;
 pub use crate::ledger_file as store;

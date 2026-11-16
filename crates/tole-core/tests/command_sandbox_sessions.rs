@@ -53,6 +53,7 @@ fn setup() -> &'static Setup {
             job_start: Mode::Off,
             verify: Mode::Off,
             turnend: Mode::Off,
+            cron: Mode::Off,
             network: Network::None,
             limits: Limits {
                 cpu_secs: 120,

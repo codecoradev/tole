@@ -64,13 +64,16 @@ fn doctor_says_model_commands_are_unsandboxed_by_default() {
     );
     assert!(
         l.iter()
-            .any(|x| x.contains("cron scripts and deliveries") && x.contains("not sandboxed yet")),
+            .any(|x| x.contains("cron scripts and command: deliveries run unsandboxed")),
         "{out}"
     );
     assert!(
-        !l.iter()
-            .any(|x| x.contains("verify, turnend") && x.contains("not sandboxed yet")),
-        "{out}"
+        l[0].contains("turnend off, cron off"),
+        "cron is a consumer now: {out}"
+    );
+    assert!(
+        !l.iter().any(|x| x.contains("not sandboxed yet")),
+        "nothing is left that is not a consumer yet: {out}"
     );
     assert!(!out.contains("sandbox consumers: ERROR"), "{out}");
 }
@@ -126,7 +129,8 @@ fn config_check_shows_the_keys_and_rejects_bad_values() {
         "network = \"any\"",
         "memory_mb = 1",
         "verify = \"always\"",
-        "cron = \"required\"",
+        "cron = \"always\"",
+        "crons = \"required\"",
     ] {
         let o = tole(
             Some(&format!("[sandbox.consumers]\n{bad}\n")),
@@ -136,7 +140,7 @@ fn config_check_shows_the_keys_and_rejects_bad_values() {
         let err = text(&o.stderr);
         assert!(
             err.contains("config.toml")
-                && (err.contains("sandbox.consumers") || err.contains("unknown field `cron`")),
+                && (err.contains("sandbox.consumers") || err.contains("unknown field `crons`")),
             "{bad}: {err}"
         );
     }
@@ -225,4 +229,32 @@ fn config_check_shows_the_verify_and_turnend_keys() {
     ] {
         assert!(out.contains(want), "{want} in {out}");
     }
+}
+
+/// Slice 3: `cron` is a consumer. It is always unattended, so a required or an
+/// optional one with no sandbox fails the doctor, and `config check` shows it.
+#[test]
+fn doctor_and_config_check_cover_cron() {
+    let (code, out) = doctor(Some("[sandbox.consumers]\ncron = \"optional\"\n"));
+    assert_ne!(code, Some(0), "optional cron counts as required: {out}");
+    let l = line(&out, "sandbox consumers:");
+    assert!(l[0].contains("cron optional"), "{out}");
+    assert!(
+        l.iter()
+            .any(|x| x.contains("ERROR cron") && x.contains("unattended")),
+        "{out}"
+    );
+    assert!(
+        l.iter().any(|x| x.contains("no unsandboxed fallback")),
+        "{out}"
+    );
+    let o = tole(
+        Some("[sandbox.consumers]\ncron = \"required\"\n"),
+        &["config", "check"],
+    );
+    let out = text(&o.stdout);
+    assert!(
+        out.contains("sandbox.consumers.cron = \"required\"  [user config]"),
+        "{out}"
+    );
 }

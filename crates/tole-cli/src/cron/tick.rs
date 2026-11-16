@@ -20,7 +20,6 @@
 //! secrets and web-header secrets) before it is written to disk.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
@@ -386,6 +385,8 @@ fn execute(dir: &Path, c: &Claimed, opts: &TickOptions) -> RunResult {
                 "exit_code": out.exit_code,
                 "duration_ms": out.duration_ms,
                 "error": out.error,
+                "sandboxed": out.sandboxed,
+                "sandbox_refused": out.refused,
             }),
             output: out.stdout,
         }
@@ -537,6 +538,11 @@ pub struct ScriptOutput {
     pub exit_code: Option<i32>,
     pub duration_ms: u128,
     pub error: Option<String>,
+    /// The script ran inside the sandbox (`[sandbox.consumers] cron`).
+    pub sandboxed: bool,
+    /// The sandbox refused the run (or its launcher failed): the script did
+    /// not run, or did not end, and the status is `error` whatever happened.
+    pub refused: bool,
 }
 
 /// Runs a script job: argv (no shell), cwd = the job's workdir, the
@@ -550,6 +556,8 @@ pub fn run_script(job: &Job, cancel: &CancelToken) -> ScriptOutput {
         exit_code: None,
         duration_ms: start.elapsed().as_millis(),
         error: Some(error),
+        sandboxed: false,
+        refused: false,
     };
     let line = field(job, "script").unwrap_or_default();
     let argv = match tole_core::run_command::RunCommandTool::split_argv(line) {
@@ -566,19 +574,23 @@ pub fn run_script(job: &Job, cancel: &CancelToken) -> ScriptOutput {
         .get("timeout_secs")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(DEFAULT_TIMEOUT_SECS);
-    let mut cmd = Command::new(&argv[0]);
-    cmd.args(&argv[1..]);
-    if let Some(w) = field(job, "workdir") {
-        cmd.current_dir(w);
-    }
-    tole_core::subprocess::scrub_env_for(&mut cmd, "cron");
+    // The one launcher (#748 slice 3): plain, or in the sandbox when
+    // `[sandbox.consumers] cron` is on. A refusal is a failed run that says so.
+    let mut prepared = match super::launch::prepare(job, &argv) {
+        Ok(p) => p,
+        Err(why) => return refuse(why, start),
+    };
+    let sandboxed = prepared.sandboxed();
     let ran = tole_core::subprocess::run_with_timeout_or_cancel(
-        &mut cmd,
+        &mut prepared.cmd,
         Duration::from_secs(timeout),
         cancel,
     );
     match ran {
         Ok(out) => {
+            if let Some(why) = prepared.launcher_failure(&out) {
+                return refuse(why, start);
+            }
             let mut stdout = String::from_utf8_lossy(&out.stdout).into_owned();
             if stdout.len() > MAX_OUTPUT {
                 let mut cut = MAX_OUTPUT;
@@ -598,10 +610,32 @@ pub fn run_script(job: &Job, cancel: &CancelToken) -> ScriptOutput {
                 exit_code: out.status.code(),
                 duration_ms: start.elapsed().as_millis(),
                 error: None,
+                sandboxed,
+                refused: false,
             }
         }
         Err(e) if e == tole_core::subprocess::CANCELLED => fail(RunStatus::Cancelled, e),
+        // The launcher could not even be started: nothing ran.
+        Err(e) if sandboxed && e.starts_with(tole_core::subprocess::SPAWN_FAILED) => {
+            refuse(prepared.spawn_failure(e), start)
+        }
         Err(e) => fail(RunStatus::Error, e),
+    }
+}
+
+/// A script run that never ran because the sandbox refused it (or its
+/// launcher failed): an `error` run whose output and `usage.error` carry the
+/// reason, so `tole cron runs`, `GET /cron/runs` and the delivery targets show
+/// it. Never an `ok`.
+fn refuse(why: String, start: Instant) -> ScriptOutput {
+    ScriptOutput {
+        status: RunStatus::Error,
+        stdout: format!("{why}\n"),
+        exit_code: None,
+        duration_ms: start.elapsed().as_millis(),
+        error: Some(why),
+        sandboxed: false,
+        refused: true,
     }
 }
 

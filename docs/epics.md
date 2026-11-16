@@ -386,9 +386,9 @@ Bot and Nakama; BMAD for collaboration). Design notes:
     bubblewrap sandbox for third-party stdio MCP servers on Linux, with a
     doctor line; opt-in `[sandbox.consumers]` for `run_command` and
     `job_start` with rlimits, #748 first slice done; `verify` and `turnend`,
-    second slice done, in review). Open: #748 for the rest
-    of the model-driven commands (cron scripts and deliveries; `verify` and
-    `turnend` become sandboxed by default in a later phase, plan in
+    second slice done; cron scripts and `command:` deliveries, third slice
+    done, in review). Open: #748 for the migration of `verify` and
+    `turnend` to sandboxed by default in a later phase, plan in
     `docs/sandbox-design.md` §9.4), and #750 for the operability
     pieces: the doctor listing of sensitive grants and startup logging (#809),
     per-server and named profiles with the CLI (#810, in review), the profile

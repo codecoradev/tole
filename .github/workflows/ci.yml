@@ -236,15 +236,15 @@ jobs:
           # tests must really have run (not zero tests, no SKIPPED line).
           if grep -n "SKIPPED" sandbox.log; then echo "a sandbox test was skipped"; exit 1; fi
           [ "$(grep -c '^test result: ok\. [1-9]' sandbox.log)" -eq 7 ] || { echo "expected 7 test targets with passing tests"; exit 1; }
-      # The mission verify command and the stop gates end to end with the
+      # The mission verify command, the stop gates and cron scripts and deliveries end to end with the
       # real binary (#748): a sandboxed verify cannot write .git/hooks.
-      - name: Sandbox tests (mission verify, stop gates)
+      - name: Sandbox tests (mission verify, stop gates, cron)
         run: |
           set -o pipefail
-          cargo test -p tole-cli --test verify_sandbox --test sessions_default_dir_e2e \
+          cargo test -p tole-cli --test verify_sandbox --test sessions_default_dir_e2e --test cron_sandbox \
             -- --nocapture --test-threads=1 2>&1 | tee sandbox-cli.log
           if grep -n "SKIPPED" sandbox-cli.log; then echo "a sandbox test was skipped"; exit 1; fi
-          [ "$(grep -c '^test result: ok\. [1-9]' sandbox-cli.log)" -eq 2 ] || { echo "expected the verify_sandbox and sessions_default_dir_e2e targets to pass"; exit 1; }
+          [ "$(grep -c '^test result: ok\. [1-9]' sandbox-cli.log)" -eq 3 ] || { echo "expected the verify_sandbox, sessions_default_dir_e2e and cron_sandbox targets to pass"; exit 1; }
       - name: Lazy-start roster test (tole-cli)
         run: |
           set -o pipefail

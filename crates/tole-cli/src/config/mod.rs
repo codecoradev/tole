@@ -215,8 +215,8 @@ pub struct SandboxConfig {
 
 /// The `[sandbox.consumers]` table (#748): which model-driven commands run
 /// in the `command` profile. USER LAYER ONLY, with the rest of `[sandbox]`.
-/// Everything is off by default; cron scripts and deliveries are not
-/// consumers yet.
+/// Everything is off by default. `cron` covers cron script jobs and
+/// `command:` deliveries (agent jobs use `run_command` and `job_start`).
 #[derive(Debug, Default, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SandboxConsumersConfig {
@@ -229,6 +229,10 @@ pub struct SandboxConsumersConfig {
     pub verify: Option<String>,
     /// The `on_turnend` stop gates: `off` (default) | `optional` | `required`.
     pub turnend: Option<String>,
+    /// Cron script jobs and `command:` deliveries: `off` (default) |
+    /// `optional` | `required`. A cron job is unattended, so `optional` counts
+    /// as `required`: there is no unsandboxed fallback.
+    pub cron: Option<String>,
     /// Network of the `command` profile: `none` (default) or `host`.
     pub network: Option<String>,
     /// Most CPU seconds per process, 1 to 86400 (default 3600).
@@ -265,6 +269,7 @@ impl SandboxConsumersConfig {
             job_start: mode("job_start", &self.job_start)?,
             verify: mode("verify", &self.verify)?,
             turnend: mode("turnend", &self.turnend)?,
+            cron: mode("cron", &self.cron)?,
             network: match self.network.as_deref() {
                 None | Some("none") => Network::None,
                 Some("host") => Network::Host,
@@ -1380,6 +1385,7 @@ pub fn layered(project: &Config, user: &Config) -> Config {
                 ("sandbox.consumers.job_start", c.job_start.is_some()),
                 ("sandbox.consumers.verify", c.verify.is_some()),
                 ("sandbox.consumers.turnend", c.turnend.is_some()),
+                ("sandbox.consumers.cron", c.cron.is_some()),
                 ("sandbox.consumers.network", c.network.is_some()),
                 ("sandbox.consumers.cpu_secs", c.cpu_secs.is_some()),
                 ("sandbox.consumers.memory_mb", c.memory_mb.is_some()),
@@ -1779,6 +1785,7 @@ pub fn render_with(cfg: &Config, tag: &str, ann: &Annotations) -> Vec<String> {
                 ("sandbox.consumers.job_start", &c.job_start),
                 ("sandbox.consumers.verify", &c.verify),
                 ("sandbox.consumers.turnend", &c.turnend),
+                ("sandbox.consumers.cron", &c.cron),
                 ("sandbox.consumers.network", &c.network),
             ] {
                 scalar(&mut out, key, v.as_deref().map(quote));
@@ -2330,26 +2337,27 @@ verify_timeout = 60
                 Some(s) => s.consumers().unwrap(),
             };
             assert_eq!(
-                (s.run_command, s.job_start, s.verify, s.turnend),
-                (Mode::Off, Mode::Off, Mode::Off, Mode::Off)
+                (s.run_command, s.job_start, s.verify, s.turnend, s.cron),
+                (Mode::Off, Mode::Off, Mode::Off, Mode::Off, Mode::Off)
             );
             assert_eq!((s.network, s.limits), (Network::None, Limits::default()));
         }
         let c = parse(
             "[sandbox.consumers]\nrun_command = \"required\"\njob_start = \"optional\"\n\
-             verify = \"required\"\nturnend = \"optional\"\nnetwork = \"host\"\ncpu_secs = 60\nmemory_mb = 512\nprocesses = 64\n\
+             verify = \"required\"\nturnend = \"optional\"\ncron = \"required\"\nnetwork = \"host\"\ncpu_secs = 60\nmemory_mb = 512\nprocesses = 64\n\
              file_size_mb = 10\n",
             &p(),
         )
         .unwrap();
         let s = c.sandbox.unwrap().consumers().unwrap();
         assert_eq!(
-            (s.run_command, s.job_start, s.verify, s.turnend),
+            (s.run_command, s.job_start, s.verify, s.turnend, s.cron),
             (
                 Mode::Required,
                 Mode::Optional,
                 Mode::Required,
-                Mode::Optional
+                Mode::Optional,
+                Mode::Required
             )
         );
         assert_eq!(s.network, Network::Host);
@@ -2368,6 +2376,7 @@ verify_timeout = 60
             ("job_start = \"yes\"", "sandbox.consumers.job_start"),
             ("verify = \"on\"", "sandbox.consumers.verify"),
             ("turnend = \"1\"", "sandbox.consumers.turnend"),
+            ("cron = \"yes\"", "sandbox.consumers.cron"),
             ("network = \"some\"", "sandbox.consumers.network"),
             ("cpu_secs = 0", "sandbox.consumers.cpu_secs"),
             ("cpu_secs = 86401", "sandbox.consumers.cpu_secs"),
@@ -2381,8 +2390,8 @@ verify_timeout = 60
                 .to_string();
             assert!(e.contains(key), "{bad}: {e}");
         }
-        // Cron scripts and deliveries are not consumers yet.
-        assert!(parse("[sandbox.consumers]\ncron = \"required\"\n", &p()).is_err());
+        // `cron` is a consumer since #748 slice 3; a misspelt key still is not.
+        assert!(parse("[sandbox.consumers]\ncron = \"required\"\n", &p()).is_ok());
         assert!(parse("[sandbox.consumers]\nrun_commands = \"off\"\n", &p()).is_err());
         // A project config cannot set them; the user layer wins whole.
         let user = parse("[sandbox.consumers]\nrun_command = \"required\"\n", &p()).unwrap();

@@ -57,6 +57,7 @@ fn setup() -> &'static Setup {
         sandbox::command::set_consumers(Consumers {
             verify: Mode::Required,
             turnend: Mode::Required,
+            cron: Mode::Off,
             ..Consumers::default()
         })
         .unwrap();
