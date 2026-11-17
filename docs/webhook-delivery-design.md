@@ -29,7 +29,7 @@ anything, and the answer to an approval still arrives through
 url             = "http://127.0.0.1:8787/tole/events"   # http only with allow_loopback
 secret_env      = "TOLE_GATEWAY_SECRET"                 # or secret_file = "/abs/path"
 events          = ["cron_run_finished", "approval_requested", "approval_resolved"]
-allow_loopback  = true     # default false
+allow_loopback  = true     # default false; literal loopback IP or `localhost` hosts only
 allow_private   = false    # default false (RFC 1918, ULA, link-local, metadata ...)
 allow_agent_jobs = false   # default false, see below
 timeout_secs    = 10       # default 10, 1..=30
@@ -57,10 +57,21 @@ timeout_secs    = 10       # default 10, 1..=30
   (see §5), an unknown event name.
 - **A cron job names it** as a `deliver` entry `webhook:<name>`:
   `Target::Webhook(String)` in `cron/deliver.rs` (`parse`, `spec`, `validate`).
-  `validate` checks shape only (the name charset); `check()` (pre-dispatch,
-  P10) resolves the name in the user config and blocks the occurrence with
-  `delivery_invalid` when it does not exist or does not list
+  `validate` checks shape only (the name charset). `check()` (pre-dispatch,
+  P10) is pure and runs **under the host lock** (`claim_one`, `tick.rs` ~188, and
+  `resume_parked`, ~321), so it must not read config or a key file there:
+  it takes a **preloaded destination map** carried in `TickOptions`
+  (name -> events, flags, `allow_agent_jobs`; no secret). The host loads it once
+  at start (`tole serve`, `tole cron tick`, `tole cron create`) through the shared
+  loader `webhook_out::load`, so a `tole cron tick`-only process loads
+  destinations and keys too. It blocks the occurrence with `delivery_invalid`
+  when the name does not exist or the destination does not list
   `cron_run_finished`.
+- **Agent-facing schema.** The cron tool's `deliver` description
+  (`cron/tool.rs`, ~99: "`session` (default), `log` or `file:PATH`") is updated
+  to mention `webhook:<name>` (an existing destination; agent jobs need the
+  destination's `allow_agent_jobs`), so agents learn the target and its rule.
+  `tole cron runs` shows the target as `webhook:<name>`.
 - **Trusted-job rule.** `command:` is trust-gated because it runs code. A
   webhook runs no code and can only reach a destination the owner declared, so
   any CLI-created job may use it. An **agent-created** job (`created_by != cli`)
@@ -87,6 +98,7 @@ passes `webhook::valid_event`):
 | `cron_run_finished` | a run settles (any status, silent output excluded, see below) | destinations a job names in `deliver` |
 | `approval_requested` | `ApprovalQueue::queue_entry` adds a pending entry | destinations listing it in `events` |
 | `approval_resolved` | an entry leaves `Pending`: allow, deny, or expiry | destinations listing it in `events` |
+| `webhook_test` | `tole webhook test <name>` (soon, section 10) | that destination only |
 
 Envelope (one JSON object, UTF-8, at most **16 KiB** after serialization):
 
@@ -101,10 +113,26 @@ Envelope (one JSON object, UTF-8, at most **16 KiB** after serialization):
 }
 ```
 
-- **`id` is stable and deterministic**, the idempotency key: `cron:<fire_id>`,
-  `approval:<approval_id>:requested`, `approval:<approval_id>:resolved`.
-  Deterministic so a re-enqueue after a crash produces the same id; the
-  charset is within `webhook::valid_delivery` (`[A-Za-z0-9._:-]`, at most 128).
+- **`id` is stable and deterministic**, the idempotency key, and always inside
+  `webhook::valid_delivery` (`[A-Za-z0-9._:-]`, at most 128, `ledger/webhook.rs`).
+  Real fire ids are `<job>@<at>/<pid>.<start>` (`ledger/mod.rs`, ~941) and
+  `<parked>/resume.<pid>.<start>` (~1168): they hold `@` and `/`, which that
+  charset rejects, and a long job id can exceed 128. So:
+  - cron: `cron:<readable>:<hash>`, where `<hash>` is the first 16 hex digits of
+    SHA-256 over the **full fire id** and `<readable>` is the fire id with every
+    byte outside `[A-Za-z0-9._-]` replaced by `-`, cut to 64 characters. At most
+    5 + 64 + 1 + 16 = 86 characters. The hash makes it unique; the readable part
+    is for humans.
+  - Not `safe_name` (`tick.rs`, ~74): it maps every other character to `_`
+    (lossy: `a@1/2.3` and `a_1_2.3` give the same name) and has no length cap, so
+    two fire ids can collide and an id can be too long.
+  - A pure function of the fire id, so it is the same in `tole serve` and in
+    `tole cron tick`, on every attempt and after a restart. A resumed run has
+    its own fire id and therefore its own event.
+  - approval: `approval:<approval_id>:requested` and `:resolved` (approval ids,
+    `apr-<hex>-<hex>` and `dap-*`, are inside the charset; the loader rejects an
+    id that is not).
+  - test event: `test:<16 random hex>`.
   It is sent as `X-Tole-Delivery` too.
 - **`v`** is the schema version. Additive fields do not bump it; a removed or
   re-typed field does. A receiver ignores unknown fields and rejects an unknown
@@ -114,9 +142,19 @@ Envelope (one JSON object, UTF-8, at most **16 KiB** after serialization):
 - **`cron_run_finished.data`:** `job` (id), `job_name`, `fire_id`, `status`
   (`RunStatus`, snake_case), `scheduled_for`, `finished_at`, `summary`
   (redacted output, at most **4 KiB**, cut at a character boundary after
-  redaction), `truncated` (bool). A silent run (`deliver::silent`) sends
-  nothing, as every target does today (`skipped` is recorded).
-- **`approval_requested.data`:** `approval_id`, `session_id`, `tool`, `risk`
+  redaction), `truncated` (bool), and `session_id` (`Done.session_id`, so the
+  gateway can link a run to its session transcript). **Silent rule:**
+  `deliver::silent` (`deliver.rs`, ~166) treats empty output as silent for any
+  status. For a webhook that applies only to status `ok`; an `error`, `budget`,
+  `cancelled`, `interrupted` or `awaiting_approval` run with empty output still
+  notifies (empty `summary`), because a failure with no output is what an owner
+  most wants to hear about. A first line `[SILENT]` on an `ok` run stays silent
+  (`skipped` is recorded). Runs blocked **before** dispatch
+  (`delivery_untrusted`, `not_enabled`) never reach a settle; a
+  `cron_run_blocked` event for them is reserved (section 10).
+- **`approval_requested.data`:** `source` (`"serve"`; `"delegation"` reserved),
+  `approval_id`, `session_id`, `job` (the cron job name when the parked session
+  belongs to a cron run, else absent), `tool`, `risk`
   (`"write"`: only non-ReadOnly, non-Destructive calls reach the queue;
   Destructive tools are not registered for a non-interactive approver),
   `summary` (the entry's `description`, redacted, at most **512 bytes**),
@@ -161,85 +199,126 @@ User-Agent:       tole/<version>
   `v2=` value) so the gateway repository, which does not link `tole-core`, can
   pin its verifier to the same bytes. A unit test in `tole-core` checks the
   vector against `webhook::sign`.
+- **Per attempt vs per event:** `X-Tole-Timestamp` (and therefore the
+  signature) is regenerated on every attempt; the event id, the body bytes and
+  `body.at` are not. A gateway applies the window to the timestamp and the
+  dedupe to the id.
 - No GitHub-compat scheme outbound; no v1.
 
 ## 4. Delivery semantics
 
-**At-least-once, no ordering, never blocks.**
+**At-least-once, no ordering, never blocks.** Duplicates are possible and
+documented: a lost 2xx, a crash between send and record, or two drainers
+(below) can each send an event twice. The envelope id is the dedupe key.
 
-- **Where it runs.** One long-lived **sender** (a thread per `tole serve`
-  process, started next to `serve_ticker`, `serve.rs:187`; ureq is blocking and
-  serve is thread-based, there is no async runtime to join). Producers never do
-  network I/O: they redact, serialize, cap, and `enqueue` (a bounded channel
-  send or one appended line) and return. The cron tick's `deliver()` loop
-  (`cron/tick.rs`, runs on the tick thread without the ledger lock) therefore
-  gains no latency, and `QueueApprover::decide` (called on the turn's thread)
-  cannot be slowed by a dead receiver.
-- **Queue bound.** 256 pending events per destination in memory. When full,
-  the new event is dropped, counted, and recorded as failed with reason
-  `queue_full`; nothing blocks. A single in-flight request per destination, so
-  one slow receiver cannot spawn threads or sockets.
-- **Retry.** Up to **6 attempts**; waits 2 s, 10 s, 30 s, 2 min, 10 min (each
-  +/- 20 % jitter). A `Retry-After` on 429/503 is honoured, capped at 10 min.
-  Per-event deadline: `cron_run_finished` 6 h, approval events until the
-  approval's own expiry (900 s), after which the event is `expired`, not sent
-  (a stale `approval_requested` is worse than none). Retry on: connect or TLS
-  error, timeout, 5xx, 408, 429. **No retry** (terminal failure) on any other 4xx
-  (the receiver understood and refused), on a 3xx (redirects are never
-  followed), on a response over the size cap, and on an unresolvable or
-  policy-refused address.
+- **Producers never do network I/O.** They redact, serialize, cap and enqueue,
+  then return. Two producers of cron events: the tick's settle loop
+  (`cron/tick.rs`, ~515, on the tick thread without the ledger lock) and
+  `resume_parked` (`tick.rs`, ~321, an approval-resumed run), so both go through
+  one `webhook_out::enqueue_cron(...)`. The approval producer is the notifier of
+  §8, on the turn's thread. A dead receiver cannot slow either.
+- **The sender.** One long-lived thread per `tole serve` process, started next
+  to `serve_ticker` (`serve.rs`, ~187) **whether or not `--cron` is given**: a
+  serve without `--cron` still needs it for approval events. ureq is blocking
+  and serve is thread-based; there is no async runtime to join. It owns the
+  approval timer of §8.
+- **Cron events: a durable outbox, which the sender treats as untrusted input.**
+  `<cron dir>/outbox.jsonl`: append-only JSONL, mode 0600, one line per
+  `enqueue` (destination, id, the redacted body once, deadline), `attempt`
+  (id, n, at, outcome code, **next_attempt_at**), `done`, `dead`. The body is
+  stored once so every attempt is byte-identical. State survives restart:
+  attempt count and next-attempt time are in the file, and the startup fold
+  resumes them (pending = enqueued, no `done`/`dead`, before its deadline).
+  - *Trust.* 0600 does not stop the same user's interactive agent whose
+    workspace contains the data dir (the cron trust check, `cron/trust.rs`,
+    guards cron agent jobs only), and the sender signs whatever a line says. So
+    before every send the sender re-validates the line: the line is at most
+    32 KiB (each read is bounded; a longer line is skipped and counted as
+    `dead:bad_line`; a torn tail is ignored until completed); the body parses as
+    schema v1 with `v == 1`; `body.destination` equals the line's destination
+    **and** a destination in the loaded user config; `body.type` is in that
+    destination's `events`; `body.id` equals the line's id and passes
+    `webhook::valid_delivery`; the body is at most 16 KiB; `body.at` is not in
+    the future or older than the 6 h deadline. A line that fails is `dead` with a
+    code, never sent. Residual, stated plainly: a process running as the owner
+    can still append a well-formed event for a configured destination (it can
+    equally edit the user config); validation bounds *what* it can make the
+    sender sign, not *whether* the owner's own account can.
+  - *Multi-process.* `tole cron tick` can be a separate short-lived process
+    (system crontab, design §4). It only appends. A `tole serve` sender notices
+    new lines by checking the file length every **5 s** (one `stat`, reading
+    only the tail from its remembered offset, as `serve_support/events.rs`
+    does). When no serve is running, `tole cron tick` drains for at most **20 s**
+    at the end of a tick. The drain lock is **`<cron dir>/outbox.lock`**, an
+    advisory exclusive file lock taken non-blocking (try; the same primitive
+    `with_lock` uses on `jobs.lock`), held for the drain; a process that does
+    not get it does not drain. The lock narrows double sends, it does not make
+    delivery exactly-once (a crash while holding it, or a drainer that outlives
+    a stale lock, can repeat an event).
+  - *Bounds.* The in-memory window is 256 pending events per destination
+    (id, file offset, next-attempt time); the rest stay on disk and are loaded as
+    slots free, so cron events are not dropped at 256. The file side is bounded
+    at **10 000** pending events per destination: past that the new event is
+    refused and the sender records ledger `failed` / `queue_full`.
+  - *Growth.* One `enqueue`, up to ~75 `attempt` lines (see Retry) and one
+    terminal line per event; not rotated in v1, recorded as an accepted residual
+    risk in the threat model (like `hook_seen`). When the sender finds nothing
+    pending it may compact: write a new file holding only unresolved events and
+    rename it over the old one under the drain lock (no line is mutated;
+    resolved history is already in the ledger).
+- **Approval events: volatile.** `ApprovalQueue` is in memory: after a serve
+  restart every pending approval is gone (denied), so replaying
+  `approval_requested` would announce something that cannot be decided. Events
+  live in a bounded in-memory queue (256 per destination, newest dropped when
+  full, counted). The gateway reconciles with `GET /approvals` at start (and
+  after any reconnect).
+- **Retry.** Per event, until its deadline. Retry on: connect or TLS error, DNS
+  failure, timeout, 5xx, 408, 429. **No retry** on another 4xx (the receiver
+  understood and refused), on a 3xx (redirects are never followed), on a
+  response over the size cap, and on an address the policy refuses.
+  - `cron_run_finished`: waits 2 s, 10 s, 30 s, 2 min, then **5 min steps**
+    (each +/- 20 % jitter) until the 6 h deadline (about 75 attempts at most;
+    one request in flight per destination, so the cost is small). `Retry-After`
+    on 429/503 is honoured, capped at 10 min. Deadline passed: `dead:expired`.
+    The 24 h dedupe horizon the receiver keeps (section 3) is longer than the
+    6 h deadline plus the 300 s window, so a late retry is still recognised.
+  - Approval events: 2 s, 10 s, 30 s, 2 min, then stop; also stop at the
+    approval's `expires_at` (900 s). A stale `approval_requested` is worse than
+    none, so it is `expired`, not sent.
 - **Ordering: none guaranteed.** The sender is FIFO per destination, but a
-  failed event is rescheduled while later events go on, so `approval_resolved`
-  can arrive before `approval_requested`. Receivers key state by
-  `approval_id` / `fire_id`; `resolved` wins over `requested` whatever the
-  arrival order. Rationale: head-of-line blocking would let one poisoned event
-  stall every approval.
-- **Idempotency key:** the envelope `id` (also `X-Tole-Delivery`). A receiver
-  that processes an id twice is the receiver's bug; the sender may send it more
-  than once (after a lost 2xx, or a crash between send and record).
-- **Durable outbox for cron results, volatile queue for approvals
-  (recommended).**
-  - `cron_run_finished` is appended to `<cron dir>/outbox.jsonl` (append-only
-    JSONL, mode 0600, the redacted body stored once so every attempt is
-    byte-identical) with lines `enqueue`, `attempt`, `done`, `dead`. Pending =
-    enqueued, neither done nor dead, not past its deadline; a fold at startup
-    resumes them. Needed because `tole cron tick` can be a separate short-lived
-    process (system crontab, design §4) that exits right after the tick: it
-    only appends; the sender in `tole serve` drains it, and `tole cron tick`
-    drains it itself for at most 20 s at the end of a tick if no serve holds
-    the drain lock (a lock file next to the ledger, `store::with_lock` style).
-    Two drainers are harmless anyway because of the idempotency key.
-  - Approval events are **not** persisted. `ApprovalQueue` is in memory: after
-    a `tole serve` restart every pending approval is already gone (denied), so
-    replaying `approval_requested` would announce something that cannot be
-    decided. The gateway reconciles with `GET /approvals` on start.
-  - Why not best-effort for everything: a cron result is the only record the
-    owner gets of an unattended run, and a restart mid-retry (deploy, crash) is
-    exactly when it matters. Why not durable for everything: it would persist
-    dead approvals, and one mechanism per event class costs less than a
-    resurrection filter.
-  - The file grows by one `enqueue` plus at most 6 `attempt` and one terminal
-    line per event and is not rotated (same accepted residual as `hook_seen`,
-    1 line per event; open question 6).
-- **Ledger.** On a terminal state a `cron_run_finished` event writes the normal
-  `delivery` record (`fire_id`, `target = "webhook:gateway"`, `attempt` =
-  attempts made, `status` = `sent` | `failed`, `error` = a short code such as
-  `http_500`, `timeout`, `refused_address`, `queue_full`, `expired`; never the
-  URL, a header, or any response byte), through `l.deliver()` as `tick.rs` does
-  for the other targets. A failed delivery never changes the run status. Approval
-  events have no `fire_id`; their terminal state is the outbox/queue counters
-  and a stderr line from serve (`tole serve: webhook gateway: approval event
-  dropped (http_500)`), with the same redacted code.
-- **Doctor.** `tole doctor` lists each destination (name, host:port only, events,
-  loopback/private flags, never the URL path or query or the secret source),
-  warns on: a failed or dead event in the last 24 h (count and last code), a
-  non-empty pending outbox older than 10 min, a destination whose URL is plain
-  `http` to a non-loopback host (cannot load, shown as an error), and a
-  `webhook:<name>` job whose destination no longer exists.
-- **Shutdown.** The sender is not joined on exit. Pending cron events are
-  already on disk; an attempt in flight is abandoned (the receiver may have
-  seen it, so it is re-sent, which at-least-once allows). Volatile approval
-  events die with the process, like the approvals themselves.
+  failed event is rescheduled while later ones go on, and approvals and cron
+  events are separate queues. `approval_resolved` can arrive before
+  `approval_requested`, and cron results can arrive out of order. Receivers key
+  state by `approval_id` / `fire_id`; `resolved` wins whatever the arrival
+  order. Head-of-line blocking would let one poisoned event stall everything.
+- **Ledger.** `Ledger::deliver` (`ledger/mod.rs`, ~1087) computes `attempt`
+  itself (earlier `delivery` records for that fire and target, plus one),
+  `deliver::deliver()` returns a `(DeliveryStatus, Option<String>)`, `tick.rs`
+  records one row for every target right after the settle, and `DeliveryStatus`
+  has no `Pending`. So: the tick and `resume_parked` **skip** webhook targets
+  when recording (they call `enqueue_cron` instead) and record **nothing at
+  enqueue**; the sender writes the terminal row later (`l.deliver(fire_id,
+  "webhook:<name>", sent | failed, code, now)`, under the ledger lock, from any
+  process). The row's `attempt` is therefore 1; the real number of HTTP
+  attempts lives in the outbox, not in the ledger. `tole cron runs` shows the
+  target as `webhook:<name>` and, until the terminal row exists, nothing for it
+  (a delivery in flight is visible in `tole doctor`, not in the ledger). `error`
+  is a code from a closed set (`http_500`, `timeout`, `dns`, `refused_address`,
+  `queue_full`, `expired`, `bad_line`, `not_implemented`), never a URL, header or
+  response byte. A failed delivery never changes the run status. Approval events
+  have no `fire_id`: their terminal state is the in-memory counters and one
+  stderr line from serve with the same code and the destination name.
+- **Doctor.** Lists each destination (name, host:port only, events,
+  loopback/private flags; never the path, query or secret source) and warns on:
+  failed or dead events in the last 24 h (count, last code); a pending outbox
+  line older than 10 min; a `webhook:<name>` job whose destination is gone; a
+  non-loopback `http` URL (cannot load, shown as an error). **Connectivity:**
+  `tole doctor` makes no network call by default; `tole webhook test <name>`
+  (soon, section 10) sends one signed `webhook_test` event and prints the status
+  code, so a gateway operator can check the wiring without a cron run.
+- **Shutdown.** The sender is not joined on exit. Pending cron events are on
+  disk; an attempt in flight is abandoned (the receiver may have seen it, so it
+  is re-sent). Volatile approval events die with the process.
 
 ## 5. Network policy and SSRF
 
@@ -258,7 +337,17 @@ User-Agent:       tole/<version>
   private: bool }`. `web_fetch` keeps its existing behaviour (`TOLE_WEB_ALLOW_PRIVATE`
   maps to both true). The env proxy stays off: through a proxy the resolver only
   vets the proxy host (the cora finding already recorded in `vetted_config`).
-- **Address policy per destination.** Loopback addresses need `allow_loopback`;
+- **Errors the sender can act on.** Today `SsrfResolver` (`web.rs`, ~206-217)
+  maps both a policy refusal and a DNS failure to `HostNotFound` and prints the
+  host and address with `eprintln!`. For the sender the resolver returns
+  **distinct** errors, `refused_address` (terminal) and `dns` (retryable), and
+  prints nothing (the sender reports a code, section 4; the existing print stays
+  for `web_fetch` only).
+- **Address policy per destination.** Loopback addresses need `allow_loopback`
+  **and** a URL host that is a literal loopback IP (`127.0.0.0/8`, `[::1]`) or
+  `localhost`: an `https://` hostname that a hostile DNS owner points at
+  `127.0.0.1` stays refused, so signed POSTs cannot be aimed at local ports by
+  DNS alone. Loopback addresses need `allow_loopback`;
   every other non-public range (RFC 1918, CGNAT, link-local incl. the cloud
   metadata address, ULA, multicast, the 6to4/Teredo/NAT64 embeddings) needs
   `allow_private`. The policy is applied inside the connection's resolver, on
@@ -296,14 +385,18 @@ User-Agent:       tole/<version>
   provider key or base URL, model output other than the capped cron summary,
   the destination's own URL, paths of the user's home or sessions dir.
   `approval_requested` is deliberately a **pointer**: id, session, tool, risk,
-  short summary. The gateway shows the owner full redacted detail by calling
-  `GET /approvals` itself, over the authenticated serve API, which is the
-  channel that already carries that detail.
-- **Why a summary at all, and why 512 bytes:** the owner needs to recognise the
-  request in a notification; `description` is already redacted text produced by
-  the approver and already returned by `GET /approvals`. It is display text
-  that came from tool input, so it is **untrusted**: the receiver must render
-  it as data (escape for its chat markup) and never parse it.
+  short redacted summary. Anything more the gateway needs it asks serve for over
+  the authenticated API (after the redaction item above).
+- **Why a summary, and why 512 bytes:** the owner needs to recognise the
+  request in a notification. The `description` is display text derived from tool
+  input and is **not redacted today**: `approval_json` (`approvals.rs`, served at
+  `serve.rs` ~1592) returns it as is, and `cron/tool.rs` (~390) only escapes
+  control characters. So `GET /approvals` can show an unredacted value. This
+  note redacts the webhook summary itself (`redact`, then the 512 B cap) and
+  proposes redacting `description` in `GET /approvals` too, as a separate small
+  item (section 10, item 11). The summary is **untrusted** display text: the
+  receiver renders it as data (escapes it for its chat markup) and never parses
+  it.
 - **Agent-written text can never choose or change a destination:** destinations
   exist only in the user config; the payload, the job text and tool output have
   no path into URL, headers, secret or event routing (events are routed by type
@@ -322,114 +415,155 @@ User-Agent:       tole/<version>
 | Secret leakage through retries or the outbox | The destination secret is a role secret, so it is redacted wherever it appears; the outbox stores the already-redacted body only (0600); retries re-sign, they never re-serialize. A value added to the secret set **after** enqueue is not re-redacted in a stored body. | `add_role_secret`; redact before storing; no URL, header or response in the ledger, logs or doctor; leak check (§9). |
 | Log injection (receiver-controlled text into tole logs) | None: response bytes never reach a log; ledger `error` is a fixed code from a closed set; stderr lines use the destination name (charset-restricted) and the same code. | Closed error vocabulary. |
 | Flooding the receiver / being flooded by our own events | Bounded: one request in flight per destination, queue of 256, at most 6 attempts per event, approval events limited by the approval queue itself. | Queue bound, `queue_full` record, doctor warning. |
+| Tampered outbox (an interactive agent or other process of the same user appends or edits lines) | Could make the sender sign a forged event. Cannot reach a destination the config does not name, an event type the destination does not list, or an oversized or malformed body. Can still add a well-formed event for a configured destination (the same account can edit the user config). | Sender re-validates every line before signing (section 4, Trust); 0600 only as a first layer; residual stated. |
 | A notification mistaken for authority | A webhook can say "approval X is pending"; nothing in it executes or grants. | §8. |
 | Destination secret reused as inbound hook key | Cross-protocol confusion. | Loader refuses a destination whose key equals any `[hooks.*]` key held in the process; docs say one secret per purpose. |
 
 ## 8. The single approval gate
 
-- The webhook is a **notification**. It never carries the decision endpoint's
-  credential and no approval link or token; `POST /approvals/{id}/decision`
-  with the serve credential stays the only way to allow or deny.
-- Emission points: `ApprovalQueue::queue_entry` (requested) and every
-  `Pending -> Approved | Denied | Expired` transition. `prune_expired` already
-  returns the ids it expires; `decide` must report whether it **transitioned**
-  the entry (today a repeat decision returns the stored status), so a repeat
-  emits nothing. The queue gets an optional `Arc<dyn Fn(ApprovalEvent) + Send +
-  Sync>` notifier set by serve; the closure only enqueues (never blocks, never
-  fails the approval path). When no destination lists approval events the
-  closure is absent and the path is unchanged.
-- An emission failure never changes an approval, never retries a decision,
-  and never delays the fail-closed `Verdict::Deny` of `QueueApprover::decide`.
-- Unanswered means denied (`EXPIRY_SECS`) whether or not the receiver was told.
-- Not in v1: delegated-child approvals (`dap-*`, durable log, §13 of the
-  automation note; open question 2).
+- The webhook is a **notification**. It carries no credential, no approval link
+  or token; `POST /approvals/{id}/decision` with the serve credential stays the
+  only way to allow or deny. A gateway that is told "approval X is pending"
+  gains nothing it can use except by asking serve.
+- **Emission points, and what the queue must change** (`approvals.rs`):
+  - `queue_entry` emits `approval_requested` (it already has session, tool,
+    description).
+  - `decide()` must report whether it actually **transitioned** the entry
+    (`DecisionOutcome::Decided` gets a `transitioned: bool`; today a repeat
+    returns the stored status), and only a transition emits
+    `approval_resolved` (approved or denied).
+  - **Expiry.** Today `prune_expired` marks `Expired` and, in the same call,
+    drops terminal entries older than `EXPIRY_SECS` (a `retain`), and returns
+    only the ids, which carry no session or tool; and it runs lazily (list,
+    decide, queue). So `approval_resolved expired` cannot be built from what it
+    returns, and an idle serve would never emit it. Change: `prune_expired`
+    returns **full clones** of the entries it moved to `Expired` (taken before
+    the `retain`), and the sender calls it on a **timer, about every 30 s**,
+    emitting one `approval_resolved` (`status = expired`) per clone. The lazy
+    calls elsewhere also emit what they return. Each expiry emits once because
+    the entry leaves `Pending` once.
+  - The queue holds an optional `Arc<dyn Fn(ApprovalEvent) + Send + Sync>`
+    notifier set by serve; the closure only enqueues (no I/O, no blocking, no
+    error to the caller). With no destination listing approval events it is
+    absent and the path is unchanged.
+- An emission failure never changes an approval, never retries a decision and
+  never delays the fail-closed `Verdict::Deny` of `QueueApprover::decide`.
+  Unanswered means denied (`EXPIRY_SECS`) whether or not the receiver was told.
+- **Session ids and rollover.** An approval's `session_id` is the tole session
+  that parked. The gateway starts a new session after 4 h of owner silence
+  (epic #910), so an old `session_id` stays meaningful to the gateway only
+  through its own chat-to-session mapping; the receiver must not assume it is
+  the chat's current session.
+- **Not in v1: delegated-child approvals (`dap-*`).** They live in a durable
+  queue behind a separate route; `GET /approvals` lists them but they emit no
+  webhook. This is a documented v1 gap. `approval_requested.data` carries
+  `source` (`"serve"` now; `"delegation"` later) so adding them is additive, and
+  the gateway's start-up reconciliation via `GET /approvals` already sees them.
 - Design rules kept: `Destructive` is unaffected (never queued through serve,
-  never allowlistable); no new approval path, no bypass; `tole-core` stays
-  platform-agnostic (the sender, config, outbox and notifier live in
-  `tole-cli`; only `vetted_post` and `AddrPolicy` are in `tole-core/web.rs`,
-  which already owns the SSRF code).
+  never allowlistable); no new approval path or bypass; `tole-core` stays
+  platform-agnostic (sender, config, outbox and notifier in `tole-cli`; only
+  `vetted_post` and `AddrPolicy` in `tole-core/web.rs`, which already owns the
+  SSRF code).
 
 ## 9. Test plan, PR split, review
 
-**Unit:** config loader (every refusal in §1, user-only layering, project
+**Unit:** config loader (every refusal in section 1, user-only layering, project
 warning, secret never in `Debug`/errors); `Target::parse`/`check` including the
-agent-job rule and unknown destination; payload builders (caps, truncation at
-char boundary after redaction, 16 KiB envelope, deterministic ids, `summary`
-dropped when over cap); signing against the shared **test vector** and against
-`webhook::verify`; `AddrPolicy` table (loopback only with flag, every private
-form incl. v4-in-v6, rebinding stub resolver, multi-address host with one bad
-address); redirect refused; response over 4 KiB; retry schedule, `Retry-After`
-cap, 4xx-no-retry, deadline expiry (injected clock); outbox fold (torn tail,
-resume, done/dead, expired); queue bound.
+agent-job rule, unknown destination and the preloaded map; event id derivation
+(charset, length, determinism; the two fire ids that collide under `safe_name`
+do not collide here); payload builders (caps, truncation at a char boundary
+after redaction, 16 KiB envelope, `summary` dropped when over cap, silent rule
+by status); signing against the **test vector** (a real hex value computed once
+and pinned, also checked against `webhook::verify`); `AddrPolicy` table
+(loopback only for a literal loopback IP or `localhost`, every private form
+incl. v4-in-v6, a rebinding stub resolver, a multi-address host with one bad
+address, distinct errors for policy refusal and DNS failure); redirect refused;
+response over 4 KiB; retry schedule, `Retry-After` cap, 4xx no-retry, deadline
+expiry (injected clock); outbox fold (torn tail, resume with attempt count,
+done/dead, expired, oversized line, a line failing each validation rule of
+section 4, compaction); queue bounds; `prune_expired` returning full clones and
+`decide` reporting `transitioned`.
 
-**Real-binary e2e** (`crates/tole-cli/tests`, built `./target/release/tole`, a
-local receiver thread that verifies the v2 signature with an independent
-implementation, checks the window and dedupes): cron job with `deliver =
-["webhook:gateway"]` produces exactly one verified delivery with the expected
-payload; approval parked in `tole serve` yields `approval_requested`, a
-decision yields `approval_resolved`, expiry yields `approval_resolved
-expired`. **Failure injection:** receiver returns 500 then 200 (retry, same id,
-new timestamp, same body); returns 400 (no retry, ledger `failed`); never
-answers (timeout, the tick and an approval turn are not delayed beyond a small
-bound, asserted); closed port; `serve` killed mid-retry and restarted (the cron
-event arrives once or twice, same id; the approval event does not); queue full;
-a destination whose host resolves to a private address without the flag is
-refused; 302 is not followed (the redirect target records no hit).
-**Leak check (#781):** run with a canary secret in the environment, in a tool
-result, in the job prompt and in the approval description; assert the canary and
-the destination secret appear in neither the received bodies, the outbox, the
-ledger, doctor output, stderr, nor `config check`.
+**Real-binary e2e** (`crates/tole-cli/tests`, the built `./target/release/tole`,
+a receiver thread verifying the v2 signature with an independent
+implementation, checking the window and deduping): a cron job with `deliver =
+["webhook:gateway"]` yields exactly one verified delivery with the expected
+payload, also when the tick is a separate `tole cron tick` process and serve
+drains the outbox; an approval parked in `tole serve` yields
+`approval_requested`, a decision yields `approval_resolved`, and an idle serve
+yields `approval_resolved expired` within about 30 s of expiry. **Failure
+injection:** 500 then 200 (same id, new timestamp, same body); 400 (no retry,
+ledger `failed`); never answers (timeout; the tick and an approval turn are not
+delayed, asserted); closed port; DNS failure retried; serve killed mid-retry and
+restarted (the cron event arrives, same id; the approval event does not); queue
+full; a host resolving to a private address without the flag refused; 302 not
+followed (the redirect target records no hit); a hand-appended outbox line for a
+destination not in the config, with the wrong `destination`, or oversized is
+not sent. **Leak check (#781):** a canary secret in the environment, a tool
+result, the job prompt and the approval description; neither the canary nor the
+destination secret may appear in received bodies, the outbox, the ledger,
+doctor output, stderr or `config check`.
 
-**Estimated PRs (each under ~600 changed code lines, tests included in the
-count; docs not counted):**
+**Estimated PRs** (each aiming at about 600 changed code lines or fewer, tests
+counted; the first estimate was too low, so more PRs, smaller each):
 
-1. `refactor(web)` / `feat(core)`: `AddrPolicy` + `vetted_post` in
-   `tole-core/web.rs`, `web_fetch` unchanged in behaviour; SSRF and redirect
-   tests (~450). **Independent review** (outbound path).
-2. `feat(cli)`: `[webhook_out]` config, user-only layering, secret loading
-   and role secret, `Target::Webhook`, `check()` rules, `config check`, doctor
-   config lines; no sending yet (~500).
-3. `feat(cron)`: payload, signing, outbox, sender thread, retry, cron
-   integration in `tick.rs`, ledger `delivery`, doctor warnings, test vector and
-   most unit tests (~580). **Independent review** (redaction, outbox, data path).
-4. `feat(serve)`: approval notifier (`approvals.rs`, `serve.rs`), approval
-   events, e2e suite with failure injection and the leak check, threat-model
-   rows, README status line and `docs/epics.md` in the same PR (~450).
-   **Independent review** (touches the approval path).
+1. `feat(core)`: `AddrPolicy` + `vetted_post` in `tole-core/web.rs`. `Hop` is a
+   public struct of a published crate: **keep `allow_private` as it is and add
+   the new field**, do not replace it; `web_fetch` behaviour unchanged. Distinct
+   resolver errors (policy refusal, DNS failure). **Independent review.** (~450)
+2. `feat(cli)`: `[webhook_out]` config, user-only layering, project warning,
+   shared key loader, role secret, `Target::Webhook` with the preloaded
+   destination map in `TickOptions` and `deliver::check`, agent tool schema text,
+   `config check`, doctor config lines. **`Target::Webhook` fails closed here:**
+   until the sender lands, a webhook target records `failed` / `not_implemented`
+   (never a silent `sent`). (~500)
+3. `feat(cli)`: the pure pieces, no network I/O: event ids, payload builders and
+   caps, redaction order, signing and the pinned test vector, outbox format and
+   fold (torn tail, validation rules). (~600)
+4. `feat(cron)`: the sender (thread, retry, drain lock, tick drain, ledger rows,
+   `tick.rs` / `resume_parked` integration, doctor warnings), replacing the
+   `not_implemented` stub. Realistically 900 to 1 200 lines: two PRs (sender
+   core, then tick integration). **Independent review** of both.
+5. `feat(serve)`: approval notifier, `prune_expired` change and 30 s timer,
+   `decide` `transitioned`, approval events, `tole webhook test`, the e2e suite
+   with failure injection and the leak check, threat-model rows, README status
+   line and `docs/epics.md` in the same PR. Expect it to split in two as well
+   (approval path; e2e and docs). **Independent review** (touches the approval
+   path).
 
 Each PR body carries `cora callers` / `cora impact` output for the touched
-public items (`ApprovalQueue`, `Target`, `deliver::deliver`, `web.rs` fns),
-verified by grep as AGENTS.md §4 requires. `tole-core` additions are
-`pub(crate)` where possible: `tole-core` is published, so a public item added
-is a semver commitment.
+public items (`ApprovalQueue`, `Target`, `deliver::deliver`/`check`,
+`TickOptions`, `Hop`, `web.rs` functions), each verified by grep as AGENTS.md
+section 4 requires. New `tole-core` items are `pub(crate)` where possible
+(published crate, semver).
+
+**Needs independent review:** PR 1 (outbound path), the sender PRs (redaction,
+outbox validation, data path), the approval PR (approval path). The outbox
+validation of section 4 is a named review focus.
 
 ## 10. Open questions for the owner
 
-1. **Durable outbox for cron results only, volatile for approvals** (§4).
-   Recommendation: yes. Alternative: best-effort for all (smaller, loses
-   results on restart) or durable for all (resurrects dead approvals).
-2. **Delegation approvals (`dap-*`) in v1?** Recommendation: no; they use a
-   durable log and a separate route, add them once the gateway needs them.
-3. **Approval `summary` text (512 B, redacted) or ids only?** Recommendation:
-   include the summary, so a notification is recognisable even if the gateway
-   cannot reach serve at that moment; it is already exposed by `GET /approvals`.
-4. **Agent-created jobs may use a destination?** Recommendation: default no
-   (`allow_agent_jobs = false`), per destination, so a personal gateway can opt
-   in deliberately.
-5. **`allow_private` without TLS** (a receiver on a LAN)? Recommendation: no;
-   require `https` for everything but loopback. Revisit with a custom CA option
-   only if a real setup needs it.
-6. **Outbox rotation.** Recommendation: none now, as for `hook_seen`; record
-   it as an accepted residual in the threat model (one enqueue and at most 7
-   lines per event).
-7. **Secret rotation without a gap.** Recommendation: single secret per
-   destination in v1, rotate by editing and restarting; add an optional
-   `secret_env_next` (sign with the first, receiver accepts either) only on
-   demand.
-8. **`tole cron tick` drains the outbox for up to 20 s** when no `tole serve`
-   does. Recommendation: yes, otherwise a crontab-only setup never delivers.
-9. **Environment proxy support** for the sender. Recommendation: stay off, as
-   `web_fetch`; a proxied sender would vet the proxy, not the destination.
-10. **Event set growth** (cron failures only, approval-pending reminders,
-    session-turn finished). Recommendation: out of scope; the type list is
-    versioned and additive.
+The independent review's answers are adopted below; each stays open for the
+owner to overrule.
+
+1. **Outbox:** durable for cron results, volatile for approvals, plus
+   reconciliation via `GET /approvals` at gateway start. Recommended.
+2. **Delegation approvals (`dap-*`):** a documented v1 gap (section 8);
+   `approval_requested.data.source` makes adding them additive.
+3. **Approval content:** a 512 B redacted `summary`, `source`, and the cron
+   `job` name where the parked session belongs to a cron run. Recommended.
+4. **Agent-created jobs:** `allow_agent_jobs` stays false by default.
+5. **Plain http:** only for loopback (a literal loopback IP or `localhost`, with
+   `allow_loopback`); no private-range http.
+6. **Outbox rotation:** none in v1; the growth is recorded as a residual risk
+   and the file is compacted when idle (section 4).
+7. **Secret rotation:** a single secret per destination in v1.
+8. **`tole cron tick` drains for up to 20 s** under `outbox.lock` when no serve
+   does. Recommended.
+9. **Environment proxy:** off, as `web_fetch`.
+10. **Soon, not v1 core:** a `webhook_test` event with `tole webhook test
+    <name>`, and a `cron_run_blocked` event for runs blocked before dispatch
+    (`delivery_untrusted`, `not_enabled`, which never reach a settle). Names are
+    reserved; the `events` list rejects unknown names until they ship.
+11. **`GET /approvals` is unredacted** (section 6): redact `description` there
+    too, as a separate small item before or with the approval PR. Recommended.
