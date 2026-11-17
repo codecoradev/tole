@@ -503,6 +503,12 @@ create` may carry one, any other job is `blocked` with `delivery_untrusted`), an
 so uteke-mobile or any client can read results. Telegram/Slack-style targets
 plug into the same `delivery` record later without changing the core.
 
+**Outbound signed webhook target (#911, design only):** a push target for cron
+results and approval requests, so a chat gateway need not hold SSE streams or
+poll. Named destinations in the user config, v2 HMAC signing like the inbound
+gate, at-least-once with a durable outbox for cron results. Full design:
+[webhook-delivery-design.md](webhook-delivery-design.md).
+
 ## 10. Phasing (1 issue = 1 branch = 1 PR, ≲ 20 files each)
 
 1. **Core fold + cron parser + claim/recovery** in `tole-core`, with the
