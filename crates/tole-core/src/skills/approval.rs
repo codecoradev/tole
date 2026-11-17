@@ -440,7 +440,8 @@ pub fn fault_message(approvals: &Path, why: &str) -> String {
     format!(
         "skill ledger {} does not match the checkpoint in {}: {why}. Every skill approval is \
          ignored until you inspect the ledger and accept it with `tole skills recheckpoint` \
-         (deleting or rewriting the ledger forgets revokes: review `tole skills list` after)",
+         (deleting or rewriting the ledger forgets revokes: review `tole skills list` after; \
+         a ledger over 16 MiB must be trimmed by hand first)",
         ledger_path(approvals).display(),
         approvals.display()
     )

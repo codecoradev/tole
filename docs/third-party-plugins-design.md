@@ -490,9 +490,12 @@ can go.
   re-recording; `tole skills list` and `plugin audit` still answer (audit
   reports the fault as an error). A ledger that only grew since the checkpoint
   is valid, so a crash between the ledger append and the approvals write is
-  harmless, and the reverse (a checkpoint ahead of the ledger) cannot happen:
-  the checkpoint is computed from the ledger as read after the append, and
-  `tole` never shortens it. Two owner commands racing leave a checkpoint that
+  harmless, and the reverse (a checkpoint ahead of the ledger) cannot happen
+  across a process crash: the checkpoint is computed from the ledger as read
+  after the append, and `tole` never shortens it. On power loss with reordered,
+  unsynced writes (the approvals temp file and its rename are not fsynced) the
+  checkpoint could reach disk before the ledger tail; the result is still fail
+  closed, a fault with the message and remedy above, never a silent pass. Two owner commands racing leave a checkpoint that
   is a prefix of the ledger at some moment, which is valid.
 - **Recovery.** `tole skills recheckpoint` (owner only) prints the ledger as
   it is (path, size, digest, whether the old checkpoint holds, what it says
@@ -500,6 +503,22 @@ can go.
   it as the new checkpoint. It refuses a ledger that differs from the one
   shown. It changes no approval and brings back no revoke the old ledger held:
   review `tole skills list` afterwards.
+- **Over the cap.** A ledger over 16 MiB blocks everything: reads fail, and so
+  does `recheckpoint`. The owner trims or rotates the file by hand and then
+  runs `tole skills recheckpoint`; revokes that were in the removed part are
+  forgotten, so trim only old lines of skills that no longer exist.
+- **Older tole.** An older `tole` ignores `ledger_checkpoint` (no
+  `deny_unknown_fields`) and its next save drops it, returning the file to the
+  legacy format (with the note) until the next owner write with this version.
+- **Cron.** `cron/setup.rs` used to discard the gate notes, so a ledger fault
+  in a cron run surfaced as plain "skill not approved". The `ERROR:` note is
+  now appended to the recorded `skill_not_approved` detail (the run log, not
+  stderr), so the cause is visible; it still fails closed.
+- **Boundary.** The owner-only guard on `approve`, `revoke`, `adopt` and
+  `recheckpoint` is an environment-marker defense in depth, not a boundary.
+  The real boundary for a script is that the command sandbox keeps the tole
+  data dir out of its write grants; a process that can write the data dir can
+  write the ledger and the approvals file.
 - **Old files.** An approvals file without a checkpoint (written before this
   change, or only ever saved by an embedder) keeps loading; with a non-empty
   ledger it adds one note per startup until the first owner write adds the
