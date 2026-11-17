@@ -304,17 +304,44 @@ pub fn probe(bwrap: &Path) -> Availability {
 /// of the kinds [`transient_spawn_error`] names, still there after retries).
 #[cfg(target_os = "linux")]
 fn probe_classified(bwrap: &Path) -> (Availability, bool) {
+    retry_transient(|| probe_once(bwrap), 50)
+}
+
+/// How many times a probe that failed in a way that may pass is run.
+const PROBE_ATTEMPTS: u64 = 3;
+
+/// Runs `probe` up to [`PROBE_ATTEMPTS`] times while its answer is transient
+/// (the `bool`), sleeping `pause_ms * attempt` between runs; returns the last
+/// answer. A definite answer (usable, or a clean refusal) ends it at once.
+fn retry_transient<F>(mut probe: F, pause_ms: u64) -> (Availability, bool)
+where
+    F: FnMut() -> (Availability, bool),
+{
     let mut last = (Availability::Unavailable(String::new()), false);
-    for attempt in 0..3 {
+    for attempt in 0..PROBE_ATTEMPTS {
         if attempt > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(50 * attempt));
+            std::thread::sleep(std::time::Duration::from_millis(pause_ms * attempt));
         }
-        last = probe_once(bwrap);
+        last = probe();
         if !last.1 {
             break;
         }
     }
     last
+}
+
+/// bwrap's own message for a failure that may pass (EAGAIN, ENOMEM, EINTR:
+/// momentary process or memory pressure while it creates the namespace), as
+/// opposed to a clean refusal ("user namespaces not permitted"). The strerror
+/// texts, which bwrap prints verbatim.
+fn transient_bwrap_message(stderr: &str) -> bool {
+    [
+        "Resource temporarily unavailable",
+        "Cannot allocate memory",
+        "Interrupted system call",
+    ]
+    .iter()
+    .any(|m| stderr.contains(m))
 }
 
 #[cfg(target_os = "linux")]
@@ -350,10 +377,16 @@ fn probe_once(bwrap: &Path) -> (Availability, bool) {
             },
             false,
         ),
-        Ok(o) => no(format!(
-            "bwrap cannot create a sandbox here (user namespaces refused?): {}",
-            String::from_utf8_lossy(&o.stderr).trim()
-        )),
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr);
+            (
+                Availability::Unavailable(format!(
+                    "bwrap cannot create a sandbox here (user namespaces refused?): {}",
+                    err.trim()
+                )),
+                transient_bwrap_message(&err),
+            )
+        }
         Err(e) => spawn_failed(e),
     }
 }
@@ -365,11 +398,20 @@ fn probe_once(bwrap: &Path) -> (Availability, bool) {
 /// is never a permanent "no sandbox" for a long-lived `tole serve`.
 pub fn detect() -> Availability {
     static CACHE: std::sync::Mutex<Option<Availability>> = std::sync::Mutex::new(None);
-    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    detect_cached(&CACHE, detect_uncached)
+}
+
+/// The cache decision of [`detect`]: the cached answer, else `probe`'s, kept
+/// only when it is definite (the `bool` of `probe` is "definite").
+fn detect_cached<F>(cache: &std::sync::Mutex<Option<Availability>>, probe: F) -> Availability
+where
+    F: FnOnce() -> (Availability, bool),
+{
+    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(a) = cache.as_ref() {
         return a.clone();
     }
-    let (a, definite) = detect_uncached();
+    let (a, definite) = probe();
     if definite {
         *cache = Some(a.clone());
     }

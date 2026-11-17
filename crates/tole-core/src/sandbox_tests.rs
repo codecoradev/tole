@@ -806,3 +806,129 @@ fn only_spawn_errors_that_may_pass_are_transient() {
         assert!(!transient_spawn_error(&Error::from(k)), "{k:?}");
     }
 }
+
+// #748: the retry loop and the cache decision of the backend probe.
+
+fn unavail(why: &str) -> Availability {
+    Availability::Unavailable(why.into())
+}
+
+#[test]
+fn a_persistent_transient_probe_runs_exactly_three_times() {
+    let mut n = 0;
+    let (a, transient) = retry_transient(
+        || {
+            n += 1;
+            (unavail("EAGAIN"), true)
+        },
+        0,
+    );
+    assert_eq!(n, 3, "exactly three attempts");
+    assert!(transient && matches!(a, Availability::Unavailable(_)));
+}
+
+#[test]
+fn a_transient_probe_that_then_succeeds_is_usable_and_a_definite_one_stops() {
+    let ok = Availability::Usable {
+        bwrap: "/usr/bin/bwrap".into(),
+        version: "0.9.0".into(),
+    };
+    let mut seq = vec![(unavail("EAGAIN"), true), (ok.clone(), false)].into_iter();
+    let (a, transient) = retry_transient(|| seq.next().unwrap(), 0);
+    assert_eq!((a, transient), (ok, false));
+    assert!(seq.next().is_none(), "stopped at the definite answer");
+    // A definite negative is not retried.
+    let mut n = 0;
+    let (_, transient) = retry_transient(
+        || {
+            n += 1;
+            (unavail("namespaces refused"), false)
+        },
+        0,
+    );
+    assert_eq!((n, transient), (1, false));
+}
+
+#[test]
+fn only_a_definite_answer_is_cached() {
+    let cache = std::sync::Mutex::new(None);
+    let calls = std::cell::Cell::new(0);
+    let probe = |a: Availability, definite: bool| {
+        calls.set(calls.get() + 1);
+        (a, definite)
+    };
+    // Persistent transient: returned, NOT cached, the next call probes again.
+    for want in [1, 2] {
+        let a = detect_cached(&cache, || probe(unavail("EAGAIN"), false));
+        assert!(matches!(a, Availability::Unavailable(_)));
+        assert_eq!(calls.get(), want, "re-probed each time");
+    }
+    // Then a usable answer is cached: no more probes.
+    let ok = Availability::Usable {
+        bwrap: "/usr/bin/bwrap".into(),
+        version: "0.9.0".into(),
+    };
+    assert_eq!(detect_cached(&cache, || probe(ok.clone(), true)), ok);
+    assert_eq!(detect_cached(&cache, || probe(unavail("x"), true)), ok);
+    assert_eq!(calls.get(), 3);
+    // A definite negative is cached too.
+    let cache = std::sync::Mutex::new(None);
+    let n = std::cell::Cell::new(0);
+    for _ in 0..2 {
+        let a = detect_cached(&cache, || {
+            n.set(n.get() + 1);
+            (unavail("no bwrap"), true)
+        });
+        assert_eq!(a, unavail("no bwrap"));
+    }
+    assert_eq!(n.get(), 1);
+}
+
+#[test]
+fn bwrap_messages_for_momentary_pressure_are_transient_and_a_refusal_is_not() {
+    for m in [
+        "bwrap: Creating new namespace failed: Resource temporarily unavailable",
+        "bwrap: fork: Cannot allocate memory",
+        "bwrap: x: Interrupted system call",
+    ] {
+        assert!(transient_bwrap_message(m), "{m}");
+    }
+    for m in [
+        "bwrap: No permissions to creating new namespace, likely because the kernel does not allow non-privileged user namespaces",
+        "bwrap: setting up uid map: Permission denied",
+        "",
+    ] {
+        assert!(!transient_bwrap_message(m), "{m}");
+    }
+}
+
+/// The smoke run's stderr decides: momentary pressure is transient, a clean
+/// refusal is a definite negative (a fake `bwrap` that passes `--version`).
+#[cfg(target_os = "linux")]
+#[test]
+fn the_smoke_runs_stderr_classifies_the_failure() {
+    use std::os::unix::fs::PermissionsExt;
+    let t = crate::test_dir::TestDir::new("tole-sbx-smoke");
+    let classify = |name: &str, stderr: &str| {
+        let dir = t.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("bwrap");
+        std::fs::write(
+            &f,
+            format!(
+                "#!/bin/sh\ncase \"$1\" in --version) echo 'bubblewrap 0.9.0'; exit 0;; esac\n\
+                 echo '{stderr}' >&2\nexit 1\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        probe_once(&f)
+    };
+    let (a, transient) = classify(
+        "eagain",
+        "bwrap: Creating new namespace failed: Resource temporarily unavailable",
+    );
+    assert!(transient && matches!(a, Availability::Unavailable(_)));
+    let (a, transient) = classify("refused", "bwrap: No permissions to creating new namespace");
+    assert!(!transient && matches!(a, Availability::Unavailable(_)));
+}

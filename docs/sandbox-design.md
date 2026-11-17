@@ -1020,6 +1020,11 @@ on every project of that kind, and a missing sandbox into a refusal).
   (§9.4, "The launcher failing is not the command failing"). `verify` ends
   `verify_refused`, a stop gate is denied, as before. An explicit `optional` or
   `required` on a host with no backend still refuses; explicit `off` disables.
+- **What "no backend at all" covers.** Exactly the `Availability::Unavailable`
+  answers of `sandbox::detect`: no `bwrap` on an absolute `PATH` entry, a `bwrap`
+  below 0.8 (no `--disable-userns`), a `bwrap` whose smoke run (`--ro-bind / /
+  true`) fails because it cannot create a namespace (user namespaces refused,
+  also inside a container), and every non-Linux host. Nothing else degrades.
 - **Finding the backend (hardened with the flip).** The default degrades on a
   negative answer, so the answer must be right: `bwrap` is an executable regular
   file in an ABSOLUTE `PATH` entry (a relative or empty entry means the working
@@ -1030,12 +1035,23 @@ on every project of that kind, and a missing sandbox into a refusal).
   reason can hold bwrap's stderr. The probe runs at start-up whenever a consumer
   is only the default (`main.rs`), before any command; serve, acp, mcp and the
   stop gates have no check of their own. A definite answer is cached for the
-  process; a spawn failure that may pass (EAGAIN, ENOMEM, EINTR) is retried three
-  times and, if it persists, answered but not cached. A negative from the probe's
-  own run (bwrap exits non-zero, e.g. namespaces refused under load) is still
-  cached: it cannot be told from a real refusal cheaply. Residual: the first
-  usable candidate is still executed to be probed, as before, and an absolute
-  `PATH` entry the model can write is the owner's to avoid.
+  process; a failure that may pass is retried three times (`retry_transient`)
+  and, if it persists, answered but NOT cached (`detect_cached`). "May pass"
+  means a spawn error of kind WouldBlock, Interrupted or OutOfMemory, or a smoke
+  run whose stderr carries bwrap's strerror text for EAGAIN, ENOMEM or EINTR
+  ("Resource temporarily unavailable", "Cannot allocate memory", "Interrupted
+  system call": momentary process or memory pressure while it makes the
+  namespace). A clean refusal ("No permissions to creating new namespace",
+  "setting up uid map: Permission denied") is a definite negative and is cached.
+  Residuals: (1) a persistent transient failure is answered as "no backend" and
+  probed again on each later launch (each costs up to three attempts), so one
+  such window can run one command unsandboxed, loudly, and the next launch
+  looks again; (2) the classification reads bwrap's message text, so an
+  unrecognised wording of a transient failure is cached as a refusal for the
+  process; (3) the first usable candidate is still executed to be probed, as
+  before, and a writable ABSOLUTE `PATH` directory is still trusted, exactly as
+  for explicit modes: only relative and empty entries (the working directory)
+  were closed.
 - **Opt-out.** `verify = "off"` and `turnend = "off"` under
   `[sandbox.consumers]` in the user config. `required` is the stricter choice
   (no fallback anywhere), for owners whose hosts all have bubblewrap.
