@@ -71,7 +71,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      # EXPERIMENT: kache (local store via actions/cache, no remote/S3).
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
+        with:
+          version: 2.1.1
+          pr-comment: "false"
+          manifest-key: clippy
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
@@ -80,7 +85,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      # EXPERIMENT: kache (local store via actions/cache, no remote/S3).
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
+        with:
+          version: 2.1.1
+          pr-comment: "false"
+          manifest-key: test
       # #781: the suites must not leave directories behind. The tests run
       # with a fresh, private TMPDIR (the cargo step only), and the job fails
       # when a `tole-*` or `cora-*` entry is still there afterwards, in it or
