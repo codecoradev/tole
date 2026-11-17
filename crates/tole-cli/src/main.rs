@@ -1979,6 +1979,21 @@ fn dispatch(cli: Cli) -> Result<()> {
                 sessions_dir: sessions_dir_override,
                 turnend: host.on_turnend.clone(),
                 cron,
+                // Per-session profiles (#740): the user config only, and
+                // only when it is in use (`--no-config` has none).
+                profiles: tole_cli::serve_support::profiles::ProfileSource {
+                    config: if cli.no_config {
+                        None
+                    } else {
+                        tole_cli::config::user_config_path()
+                    },
+                    allow: config_apply::values(&settings.allow),
+                    trust: trust_extra.clone(),
+                    allow_pinned: settings
+                        .allow
+                        .as_ref()
+                        .is_some_and(|e| e.source == config_apply::Source::Flag),
+                },
             })
         }
         Command::Sessions { tree: true, .. } => sessions_tree_command(&sessions_dir),
