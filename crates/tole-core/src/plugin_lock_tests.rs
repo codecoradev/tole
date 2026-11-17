@@ -903,3 +903,30 @@ fn a_fallback_line_changes_no_decision_the_ledger_makes() {
     assert_eq!(before, after);
     assert!(after.0.is_empty());
 }
+
+/// #748: the default flip's fallback line names the consumer and one reason,
+/// is kind `sandbox` (so no plugin fold reads it), and changes no decision.
+#[test]
+fn a_consumer_fallback_line_is_a_sandbox_line_no_plugin_fold_reads() {
+    let line = consumer_fallback_ledger_line("verify", "no bwrap\n\x1b[2J", 9);
+    assert!(line.ends_with('\n') && line.matches('\n').count() == 1);
+    assert!(!line.contains('\x1b'));
+    let v: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
+    assert_eq!(v["kind"], "sandbox");
+    assert_eq!(v["event"], "sandbox_fallback");
+    assert_eq!(v["consumer"], "verify");
+    assert_eq!(v["default"], true);
+    assert_eq!(v["at"], 9);
+    assert_eq!(v["reason"], "no bwrap\\u{a}\\u{1b}[2J");
+    assert!(v.get("server").is_none(), "never a plugin server's line");
+    let long = consumer_fallback_ledger_line("turnend", &"x".repeat(5000), 1);
+    let v: serde_json::Value = serde_json::from_str(long.trim_end()).unwrap();
+    assert_eq!(v["reason"].as_str().unwrap().len(), 300);
+    // The audit of a server named like the consumer does not pick it up.
+    let h = manifest_hash(&base());
+    let mut ledger = plain_ledger_line("verify", &h, 1);
+    let before = check_against_ledger(&with_profile(None, None), &ledger).blocked;
+    ledger.push_str(&line);
+    let after = check_against_ledger(&with_profile(None, None), &ledger).blocked;
+    assert_eq!(before, after);
+}
