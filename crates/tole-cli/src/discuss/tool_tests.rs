@@ -567,10 +567,14 @@ fn a_session_at_the_goals_depth_limit_has_no_discussion_host() {
 }
 
 /// A stand-in `tole` child: records its argv and env, hands in a report.
+/// Each record is written to a temp name and renamed into place, so a
+/// reader that sees the file sees all of it (`env` leaves the process in
+/// several writes; see `delegate_tests::fake_tole`, #702).
 fn reviewer_bin(dir: &Path) -> PathBuf {
     let p = dir.join("reviewer-bin");
     let body = "#!/bin/sh\nprev=\"\"\nfor a in \"$@\"; do [ \"$prev\" = \"--sessions-dir\" ] && D=\"$a\"; \
-        prev=\"$a\"; done\nmkdir -p \"$D\"\nprintf '%s\\n' \"$@\" > \"$D/../argv\"\nenv > \"$D/../env\"\n\
+        prev=\"$a\"; done\nmkdir -p \"$D\"\nprintf '%s\\n' \"$@\" > \"$D/../argv.tmp\" && mv \"$D/../argv.tmp\" \"$D/../argv\"\n\
+        env > \"$D/../env.tmp\" && mv \"$D/../env.tmp\" \"$D/../env\"\n\
         printf '%s' '{\"summary\":\"the plan is sound\",\"risks\":[]}' > \"$TOLE_DELEGATION_REPORT\"\n";
     crate::test_dir::write_executable(&p, body);
     p
