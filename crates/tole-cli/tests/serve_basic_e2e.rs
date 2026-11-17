@@ -117,7 +117,7 @@ fn read_resp(s: &mut TcpStream) -> Resp {
 struct Daemon {
     child: Child,
     port: u16,
-    work: TestDir,
+    _work: TestDir,
     log: PathBuf,
     hash_file: PathBuf,
     _home: TestDir,
@@ -206,7 +206,7 @@ fn spawn(o: Opts) -> Daemon {
             return Daemon {
                 child,
                 port,
-                work,
+                _work: work,
                 log,
                 hash_file,
                 _home: home,
@@ -783,8 +783,6 @@ fn the_mcp_transport_uses_the_same_check() {
         assert!(post(&basic(USER, "wrong password 0742")).starts_with("HTTP/1.1 401"));
     }
     assert!(post(&good()).starts_with("HTTP/1.1 429"));
-    // Keep the workspace alive until here.
-    let _ = &d.work;
 }
 
 /// An upload is authenticated while its headers are read, and the verdict is

@@ -297,11 +297,13 @@ pub fn hash_command(iterations: u32) -> Result<()> {
 /// Terminal attributes to put back: restores echo when dropped, so an early
 /// return or a panic cannot leave the terminal silent. (A signal that kills the
 /// process, Ctrl-C included, is not handled: `stty echo` repairs the terminal.)
+#[cfg(unix)]
 struct EchoGuard {
     fd: std::os::fd::RawFd,
     saved: libc::termios,
 }
 
+#[cfg(unix)]
 impl EchoGuard {
     /// Turn echo off on `fd`; `None` when it is not a terminal.
     fn off(fd: std::os::fd::RawFd) -> Option<Self> {
@@ -320,6 +322,7 @@ impl EchoGuard {
     }
 }
 
+#[cfg(unix)]
 impl Drop for EchoGuard {
     fn drop(&mut self) {
         // SAFETY: restores the attributes read in `off`.
@@ -329,8 +332,13 @@ impl Drop for EchoGuard {
 
 /// Read one line from the terminal with echo off (restored on every exit).
 fn read_hidden(prompt: &str) -> Result<String> {
-    use std::os::fd::AsRawFd;
-    let _echo = EchoGuard::off(std::io::stdin().as_raw_fd());
+    #[cfg(unix)]
+    let _echo = {
+        use std::os::fd::AsRawFd;
+        EchoGuard::off(std::io::stdin().as_raw_fd())
+    };
+    #[cfg(not(unix))]
+    eprintln!("(this platform cannot hide the typed password; pipe it on stdin instead)");
     eprint!("{prompt}");
     let mut line = String::new();
     let read = std::io::stdin().lock().take(4096).read_line(&mut line);
