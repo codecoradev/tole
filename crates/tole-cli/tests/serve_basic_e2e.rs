@@ -130,23 +130,13 @@ impl Drop for Daemon {
     }
 }
 
+#[derive(Default)]
 struct Opts<'a> {
     /// Replaces the default `--auth basic ...` arguments when set.
     args: Option<&'a [&'a str]>,
     extra: &'a [&'a str],
     env: &'a [(&'a str, &'a str)],
     config: Option<&'a str>,
-}
-
-impl Default for Opts<'_> {
-    fn default() -> Self {
-        Opts {
-            args: None,
-            extra: &[],
-            env: &[],
-            config: None,
-        }
-    }
 }
 
 fn free_port() -> u16 {
