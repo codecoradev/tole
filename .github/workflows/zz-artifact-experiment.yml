@@ -1,0 +1,61 @@
+name: zz-artifact-experiment
+on:
+  push:
+    branches: ['ci/dl-artifact-experiment']
+permissions:
+  contents: read
+jobs:
+  build:
+    strategy:
+      matrix:
+        artifact: [tole-x86_64-unknown-linux-gnu, tole-aarch64-apple-darwin]
+        ext: [tar.gz]
+    runs-on: ubuntu-latest
+    env:
+      VERSION: 0.0.0
+    steps:
+      - name: Make a tiny archive
+        run: |
+          mkdir release && cd release
+          echo "fake binary for ${{ matrix.artifact }}" > tole
+          tar czf ${{ matrix.artifact }}-${VERSION}.${{ matrix.ext }} tole
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}-${{ env.VERSION }}
+          path: release/${{ matrix.artifact }}-${{ env.VERSION }}.${{ matrix.ext }}
+  windows:
+    runs-on: windows-latest
+    steps:
+      - name: Make a tiny zip
+        shell: pwsh
+        run: |
+          mkdir release
+          cd release
+          "fake exe" | Out-File tole.exe
+          7z a tole-x86_64-pc-windows-msvc-0.0.0.zip tole.exe
+      - uses: actions/upload-artifact@v7
+        with:
+          name: tole-x86_64-pc-windows-msvc-0.0.0
+          path: release/tole-x86_64-pc-windows-msvc-0.0.0.zip
+  release-sim:
+    needs: [build, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: release-artifacts
+          merge-multiple: true
+      - name: List artifacts
+        run: ls -la release-artifacts/
+      - name: Generate SHA256 checksums
+        run: |
+          cd release-artifacts
+          sha256sum * > checksums-sha256.txt
+          cat checksums-sha256.txt
+      - name: Verify
+        run: |
+          test "$(ls release-artifacts | wc -l)" = 4
+          cd release-artifacts
+          tar tzf tole-aarch64-apple-darwin-0.0.0.tar.gz
+          unzip -l tole-x86_64-pc-windows-msvc-0.0.0.zip
