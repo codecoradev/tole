@@ -30,9 +30,16 @@ impl Drop for Rig {
     /// the test is the test's to release (see `ReleaseOnDrop`).
     fn drop(&mut self) {
         let host = &self.host;
-        crate::test_dir::poll_until(crate::test_dir::WAIT, || {
+        let drained = crate::test_dir::poll_until(crate::test_dir::WAIT, || {
             (host.live_count() == 0).then_some(())
         });
+        if drained.is_none() {
+            eprintln!(
+                "discuss tool test rig: a discussion was still running after {:?}; its thread \
+                 may recreate the test directory and the #781 leak check may follow (#893)",
+                crate::test_dir::WAIT
+            );
+        }
     }
 }
 
@@ -47,7 +54,7 @@ impl Drop for ReleaseOnDrop {
     }
 }
 
-const CONFIG: &str ="[delegation]\ngoal_budget = 100000\n[profiles.coder]\n[profiles.ops]\n\
+const CONFIG: &str = "[delegation]\ngoal_budget = 100000\n[profiles.coder]\n[profiles.ops]\n\
     [profiles.wide]\nallow = [\"run_command:cargo *\"]\n[profiles.narrow]\nallow = [\"read_file\"]\n";
 
 fn rig(tag: &str, allows: &[&str], usage: u64, answer: Answer) -> Rig {
@@ -195,6 +202,7 @@ fn start_returns_at_once_runs_in_the_background_and_settles_the_tree() {
 fn the_budget_is_carved_from_what_is_left_never_added() {
     let release = Arc::new(AtomicBool::new(false));
     let r = rig("carve", &[], 100, blocking(release.clone()));
+    let _gate = ReleaseOnDrop(release.clone());
     // Asks for more than the goal has: capped at what is left (100000).
     let mut big = input();
     big["budget_tokens"] = json!(900_000);
@@ -428,6 +436,7 @@ fn a_session_manages_only_the_discussions_it_started() {
 fn stop_ends_a_running_discussion_with_an_escalation_and_charges_what_it_spent() {
     let release = Arc::new(AtomicBool::new(false));
     let r = rig("stop", &[], 100, blocking(release.clone()));
+    let _gate = ReleaseOnDrop(release.clone());
     let id = id_of(&r.host.start(&input()).unwrap());
     assert_eq!(r.host.status(&id).unwrap()["state"], "running");
     let out = r.host.stop(&id).unwrap();
