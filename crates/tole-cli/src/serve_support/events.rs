@@ -364,13 +364,19 @@ impl EntryTail {
     }
 
     pub fn poll(&mut self) -> Result<Vec<Entry>, String> {
+        // Errors carry a kind only, never a path or file content: the host
+        // may log them.
         let len = std::fs::metadata(&self.path)
-            .map_err(|e| e.to_string())?
+            .map_err(|e| format!("stat: {:?}", e.kind()))?
             .len();
         if self.last_len == Some(len) {
             return Ok(Vec::new());
         }
-        let storage = JsonlStorage::open_read_only(&self.path).map_err(|e| e.to_string())?;
+        let storage = JsonlStorage::open_read_only(&self.path).map_err(|e| match e {
+            tole_core::storage::StorageError::Io(io) => format!("read: io {:?}", io.kind()),
+            tole_core::storage::StorageError::Corrupt(_) => "read: corrupt log".to_string(),
+            _ => "read: log not readable".to_string(),
+        })?;
         let fresh: Vec<Entry> = storage
             .entries()
             .iter()
