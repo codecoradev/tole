@@ -451,7 +451,7 @@ Owner decisions still open:
 - #748: when `verify` and `turnend` become sandboxed by default (decided in principle on 2026-11-14, the phase is not scheduled).
 - #806: the rule that stops a series of merged pull requests from turning develop red. The CONTRIBUTING rule is documented; requiring up-to-date branches or a merge queue is a repository ruleset setting that only the owner can change.
 - #705: Cora Review failing or running 12 minutes and more on larger PRs: cora-code 0.21 chunks the diff and adds `review.exclude` (cora-code#720); the exclude is configured in `.cora.yaml` (closed with that change).
-- #741 and #742: the open questions in the table above. #740 was decided on 2026-11-16 (profile fixed per session process, request wins on resume and is recorded, `[profiles.*]` budget as is, no `memory_room` from a request, profile model else server default) and built as `profile` on `POST /sessions` (create and resume, `docs/mobile-control.md`); what remains of #740 is the `tole sessions list` column and the `tole doctor` line of serve profiles.
+- #741 and #742: the open questions in the table above. #740 was decided on 2026-11-16 (profile fixed per session process, request wins on resume and is recorded, `[profiles.*]` budget as is, no `memory_room` from a request, profile model else server default) and built as `profile` on `POST /sessions` (create and resume, `docs/mobile-control.md`); `tole sessions` shows each session's profile and `tole doctor` lists the serve profiles by name, so #740 is fully done.
 
 ---
 
