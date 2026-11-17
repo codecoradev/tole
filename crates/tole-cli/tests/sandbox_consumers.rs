@@ -50,17 +50,41 @@ fn line<'a>(out: &'a str, starts: &str) -> Vec<&'a str> {
 }
 
 #[test]
-fn doctor_says_model_commands_are_unsandboxed_by_default() {
+fn doctor_says_verify_and_turnend_are_sandboxed_by_default_and_the_rest_not() {
     let (code, out) = doctor(None);
     assert_eq!(code, Some(0), "{out}");
     let l = line(&out, "sandbox consumers:");
+    assert!(l[0].contains("run_command off, job_start off"), "{out}");
     assert!(
-        l[0].contains("run_command off, job_start off") && l[0].contains("unsandboxed"),
-        "{out}"
+        l[0].contains("verify optional (default), turnend optional (default)"),
+        "verify and turnend are optional by default (#748), shown as the default: {out}"
     );
     assert!(
-        l[0].contains("verify off, turnend off"),
-        "verify and turnend are consumers now: {out}"
+        l.iter()
+            .any(|x| x.contains("verify and turnend sandboxed by default")
+                && x.contains("\"off\" in [sandbox.consumers] to opt out")),
+        "{out}"
+    );
+    // This harness has no bwrap on PATH: the default degrades loudly and the
+    // doctor says so (a WARNING, not an ERROR: it does not fail the doctor).
+    for k in ["verify", "turnend"] {
+        assert!(
+            l.iter()
+                .any(|x| x.contains(&format!("WARNING: {k} runs UNSANDBOXED"))
+                    && x.contains("no sandbox is available on this host")
+                    && x.contains(&format!("sandbox.consumers.{k} = \"off\""))),
+            "{k}: {out}"
+        );
+    }
+    assert!(
+        out.contains("sandbox consumer verify: unsandboxed, no sandbox"),
+        "{out}"
+    );
+    assert!(out.contains("(default)"), "{out}");
+    // The `git` tool hardening is for a consumer the owner wrote, not the default.
+    assert!(
+        !l.iter().any(|x| x.contains("git writes (add, commit)")),
+        "{out}"
     );
     assert!(
         l.iter()
@@ -68,7 +92,7 @@ fn doctor_says_model_commands_are_unsandboxed_by_default() {
         "{out}"
     );
     assert!(
-        l[0].contains("turnend off, cron off"),
+        l[0].contains("turnend optional (default), cron off"),
         "cron is a consumer now: {out}"
     );
     assert!(
@@ -229,6 +253,23 @@ fn config_check_shows_the_verify_and_turnend_keys() {
     ] {
         assert!(out.contains(want), "{want} in {out}");
     }
+    assert!(!out.contains("not set, so optional (default)"), "{out}");
+    // Unset keys are the default, said so (#748), not silently absent.
+    let o = tole(
+        Some("[sandbox.consumers]\nverify = \"off\"\n"),
+        &["config", "check"],
+    );
+    let out = text(&o.stdout);
+    assert!(
+        out.contains("sandbox.consumers.turnend: not set, so optional (default)"),
+        "{out}"
+    );
+    assert!(!out.contains("sandbox.consumers.verify: not set"), "{out}");
+    let out = text(&tole(None, &["config", "check"]).stdout);
+    assert!(
+        out.contains("sandbox.consumers.verify: not set, so optional (default)"),
+        "{out}"
+    );
 }
 
 /// Slice 3: `cron` is a consumer. It is always unattended, so a required or an

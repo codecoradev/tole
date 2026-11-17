@@ -248,7 +248,20 @@ fn mission_chains_to_completion_with_summary() {
 fn verify_gate_overrides_the_completion_marker() {
     let dir = temp_dir("verify");
     let base = spawn_mock(dir.join("done.marker"));
+    // `verify` is sandboxed by default (#748) and runs in the process's
+    // working directory, not `--workspace`; this tests the gate, so it opts out.
+    // Its own TestDir (removed on drop, also on a panic), not a sibling of `dir`
+    // that nothing owns (#781: that one was left behind on every run).
+    let home_dir = temp_dir("verify-home");
+    let home = home_dir.join("home");
+    std::fs::create_dir_all(home.join("tole")).unwrap();
+    std::fs::write(
+        home.join("tole/config.toml"),
+        "[sandbox.consumers]\nverify = \"off\"\n",
+    )
+    .unwrap();
     let env = [
+        ("CODECORA_HOME".to_string(), home.display().to_string()),
         ("TOLE_BASE_URL".to_string(), base),
         ("TOLE_MODEL".to_string(), "mock-model".to_string()),
         ("TOLE_API_KEY".to_string(), "sk-test".to_string()),
@@ -341,7 +354,14 @@ fn children_see(tag: &str, user_config: &str) -> [String; 4] {
     let dir = temp_dir(tag);
     let home = dir.join("home");
     std::fs::create_dir_all(home.join("tole")).unwrap();
-    std::fs::write(home.join("tole/config.toml"), user_config).unwrap();
+    // `verify` and `turnend` are sandboxed by default (#748); these probes
+    // write outside the workspace and test the environment scrub, not the
+    // sandbox, so they opt out.
+    std::fs::write(
+        home.join("tole/config.toml"),
+        format!("[sandbox.consumers]\nverify = \"off\"\nturnend = \"off\"\n{user_config}"),
+    )
+    .unwrap();
     let probe = |name: &str| {
         format!(
             "printenv > {d}/{name}_env.txt; \

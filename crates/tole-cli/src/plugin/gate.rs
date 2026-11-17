@@ -586,6 +586,19 @@ pub fn record_secret(user: &Path, event: &str, server: &str, secret: &str) {
     );
 }
 
+/// Puts the default flip's fallback in the ledger next to the user config
+/// (#748): `consumer` (`verify` or `turnend`) is `optional` only by default
+/// and ran without a sandbox because the host has none. The sink the `tole`
+/// binary registers with `tole_core::sandbox::command::set_fallback_sink`.
+pub fn record_consumer_fallback(consumer: &str, reason: &str) {
+    if let Some(user) = crate::config::user_config_path() {
+        append(
+            &user,
+            plugin_lock::consumer_fallback_ledger_line(consumer, reason, now()),
+        );
+    }
+}
+
 fn append(user: &Path, line: String) {
     let Some(dir) = user.parent() else {
         return;

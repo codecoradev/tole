@@ -37,8 +37,16 @@ pub fn decide(mode: Mode, avail: &Availability, unattended: bool) -> Option<Deci
 fn decision_text(d: &Decision) -> String {
     match d {
         Decision::Sandboxed => "sandboxed".into(),
-        Decision::Unsandboxed(why) => format!("unsandboxed, no sandbox ({why}); optional"),
-        Decision::Refused(why) => format!("refused, no sandbox ({why})"),
+        // `why` can come from bwrap's stderr or the PATH lookup: one line, no
+        // control characters.
+        Decision::Unsandboxed(why) => format!(
+            "unsandboxed, no sandbox ({}); optional",
+            crate::sanitize::sanitize_one_line(why)
+        ),
+        Decision::Refused(why) => format!(
+            "refused, no sandbox ({})",
+            crate::sanitize::sanitize_one_line(why)
+        ),
     }
 }
 
@@ -194,10 +202,18 @@ pub fn doctor_grant_lines(
             "{label}: protected read-only in the workspace: {}",
             super::command::PROTECTED.join(", ")
         ));
-        out.extend(
-            decide(mode, avail, unattended || k.always_unattended())
-                .map(|d| format!("{label}: {}", decision_text(&d))),
-        );
+        // The default flip (#748): no backend at all is an unsandboxed run
+        // with a loud note, not a refusal, and it says it is the default.
+        let d = match (consumers.implicit(k), avail) {
+            (true, Availability::Unavailable(why)) => Some(Decision::Unsandboxed(why.clone())),
+            _ => decide(mode, avail, unattended || k.always_unattended()),
+        };
+        let tag = if consumers.implicit(k) {
+            " (default)"
+        } else {
+            ""
+        };
+        out.extend(d.map(|d| format!("{label}: {}{tag}", decision_text(&d))));
     }
     out
 }

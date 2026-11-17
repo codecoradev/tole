@@ -3,7 +3,8 @@
 //! declares the mission complete (so the verify command is the only thing
 //! deciding the outcome).
 //!
-//! - `off` (the default): unchanged, the command runs as before.
+//! - `off` (explicit): unchanged, the command runs as before. The default
+//!   (no key) is `optional` since #748's flip: see the end of this file.
 //! - `required` / `optional` with no `bwrap`: the verify result is a REFUSAL.
 //!   The mission fails closed (`verify_refused`, non-zero exit), the command
 //!   never ran, no turn is spent retrying, and the model's `MISSION_COMPLETE`
@@ -191,23 +192,20 @@ fn project(tag: &str) -> (TestDir, std::path::PathBuf, std::path::PathBuf) {
 }
 
 #[test]
-fn verify_off_is_unchanged_and_explicit_off_is_the_same() {
-    for (tag, cfg) in [
-        ("default", ""),
-        ("off", "[sandbox.consumers]\nverify = \"off\"\n"),
-    ] {
-        let (dir, ws, home) = project(tag);
-        let cmd = "touch verify-ran; echo x > .git/hooks/h";
-        let r = mission(&ws, &home, cfg, &path_env(), cmd);
-        assert_eq!(r.code, 0, "{}\n{}", r.stdout, r.stderr);
-        assert!(r.stdout.contains("status: complete"), "{}", r.stdout);
-        assert!(ws.join("verify-ran").exists(), "{tag}: the command ran");
-        assert!(
-            ws.join(".git/hooks/h").exists(),
-            "{tag}: off is today's behaviour, nothing is protected"
-        );
-        drop(dir);
-    }
+fn verify_off_is_unchanged_when_explicit() {
+    let (dir, ws, home) = project("off");
+    let cmd = "touch verify-ran; echo x > .git/hooks/h";
+    let cfg = "[sandbox.consumers]\nverify = \"off\"\n";
+    let r = mission(&ws, &home, cfg, &path_env(), cmd);
+    assert_eq!(r.code, 0, "{}\n{}", r.stdout, r.stderr);
+    assert!(r.stdout.contains("status: complete"), "{}", r.stdout);
+    assert!(ws.join("verify-ran").exists(), "the command ran");
+    assert!(
+        ws.join(".git/hooks/h").exists(),
+        "off is today's behaviour, nothing is protected"
+    );
+    assert!(!r.stderr.contains("UNSANDBOXED"), "{}", r.stderr);
+    drop(dir);
 }
 
 /// The key fail-closed test: no sandbox, so no verify, so no completion.
@@ -461,7 +459,7 @@ fn a_workspace_layout_the_profile_refuses_refuses_the_verify() {
     if !bwrap_works() {
         return;
     }
-    for mode in ["required", "optional"] {
+    for mode in ["required", "optional", "default"] {
         for layout in ["submodule", "worktree"] {
             let (dir, ws, home) = project(&format!("layout-{layout}-{mode}"));
             let real = std::fs::canonicalize(&ws).unwrap();
@@ -489,7 +487,10 @@ fn a_workspace_layout_the_profile_refuses_refuses_the_verify() {
             let r = mission(
                 &ws,
                 &home,
-                &format!("[sandbox.consumers]\nverify = \"{mode}\"\n"),
+                &match mode {
+                    "default" => String::new(),
+                    _ => format!("[sandbox.consumers]\nverify = \"{mode}\"\n"),
+                },
                 &path_env(),
                 "touch verify-ran",
             );
@@ -582,7 +583,13 @@ fn gate_script(ws: &Path, body: &str) -> std::path::PathBuf {
 fn a_stop_gate_with_the_sandbox_off_is_unchanged() {
     let (dir, ws, home) = project("gate-off");
     let gate = gate_script(&ws, "touch gate-ran; echo x > .git/hooks/h; exit 0");
-    let r = run_with_gate(&ws, &home, "", &path_env(), &gate);
+    let r = run_with_gate(
+        &ws,
+        &home,
+        "[sandbox.consumers]\nturnend = \"off\"\n",
+        &path_env(),
+        &gate,
+    );
     assert_eq!(r.code, 0, "{}\n{}", r.stdout, r.stderr);
     assert!(ws.join("gate-ran").exists() && ws.join(".git/hooks/h").exists());
     drop(dir);
