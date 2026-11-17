@@ -115,7 +115,7 @@ pub fn check_hop(started_https: bool, url: &str, secrets: &SecretSet) -> Result<
     }
     if matches!(secrets.redact(url), std::borrow::Cow::Owned(_)) {
         return Err(HttpError::InvalidUrl(
-            "the URL contains a known secret value".into(),
+            "the URL holds a known secret value or looks like a secret (`redaction_allowlist` keeps a false positive)".into(),
         ));
     }
     Ok(())
@@ -342,7 +342,8 @@ impl Tool for BuiltinFetchTool {
         let format = format_of(format_name)?;
         if let std::borrow::Cow::Owned(r) = self.http.secrets.redact(url) {
             return Err(format!(
-                "web_fetch: refused, the URL contains a known secret value: {r}"
+                "web_fetch: refused, the URL holds a known secret value or looks like a secret \
+                 (`redaction_allowlist` keeps a false positive): {r}"
             ));
         }
         vet_public_url(url, self.http.allow_private)?;

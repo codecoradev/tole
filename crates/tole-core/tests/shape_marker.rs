@@ -1,0 +1,126 @@
+//! #597 review fixes: a `«NAME»` marker is only allowed where it is the
+//! whole secret position; JSON fields are masked by their name; the log
+//! records the masked shape kinds.
+
+#[path = "support/test_dir.rs"]
+mod test_dir;
+use serde_json::{json, Value};
+use test_dir::TestDir;
+use tole_core::entry::{EntryType, NewEntry};
+use tole_core::secrets::SecretSet;
+use tole_core::storage::{Commit, JsonlStorage, Storage};
+
+const U: &str = "Zq8vN2xL5mP9aR4tW7yB3cD6";
+
+fn sets() -> Vec<SecretSet> {
+    vec![
+        SecretSet::default(),
+        SecretSet::default().with("OTHER_TOKEN", "other-known-value-0597"),
+    ]
+}
+
+fn pem() -> (String, Vec<String>) {
+    let body: Vec<String> = (0..3)
+        .map(|i| {
+            format!("MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC{i}x7Zq8vN2xL5mP9aR4tW7y")
+        })
+        .collect();
+    let head = ["-----BEGIN RSA ", "PRIVATE KEY-----"].concat();
+    let foot = ["-----END RSA ", "PRIVATE KEY-----"].concat();
+    (format!("{head}\n{}\n{foot}", body.join("\n")), body)
+}
+
+/// Text that merely CONTAINS a `«NAME»` marker next to a real secret must
+/// not be kept: the marker is only allowed as the whole secret position.
+#[test]
+fn a_marker_next_to_a_real_secret_never_smuggles_it_through() {
+    for s in sets() {
+        for text in [
+            format!("API_KEY=«A»{U}"),
+            format!("API_KEY={U}«A»"),
+            format!("https://«A»:{U}@h"),
+            format!("https://bob:«A»{U}@h"),
+            format!("curl --password=«A»{U} x"),
+            format!("curl -u «A»:{U} x"),
+            format!("curl -u bob:«A»{U} x"),
+        ] {
+            let out = s.redact(&text);
+            assert!(!out.contains(U), "{text:?} leaked: {out}");
+        }
+        let (pem, body) = pem();
+        let plain = s.redact(&pem).into_owned();
+        assert!(
+            !plain.contains(body[1].as_str()),
+            "plain pem leaks: {plain}"
+        );
+        let tampered = pem.replacen(&body[1], &format!("«A»{}", body[1]), 1);
+        let out = s.redact(&tampered);
+        for line in &body {
+            assert!(!out.contains(line.as_str()), "pem line leaked: {out}");
+        }
+    }
+}
+
+/// The legitimate marker positions stay readable: the name survives.
+#[test]
+fn a_marker_that_is_the_whole_secret_position_stays() {
+    let v = "Zq8vN2xL5mP9aR4tW7yB3cD6xx";
+    let s = SecretSet::default().with("MCP_URL", v);
+    for (text, want) in [
+        (
+            format!("https://bob:{v}@host/p"),
+            "https://bob:«MCP_URL»@host/p",
+        ),
+        (
+            format!("curl --password={v} x"),
+            "curl --password=«MCP_URL» x",
+        ),
+        (format!("curl -u bob:{v} x"), "curl -u bob:«MCP_URL» x"),
+        (format!("API_KEY={v}"), "API_KEY=«MCP_URL»"),
+    ] {
+        assert_eq!(s.redact(&text), want, "{text}");
+    }
+}
+
+/// A JSON field whose NAME makes the value secret is masked like
+/// `API_KEY=value` in text (`redact_value` sees one string at a time).
+#[test]
+fn json_fields_are_masked_by_their_name() {
+    for s in sets() {
+        let v = json!({"api_key": U, "nested": [{"password": U}], "note": "plain words"});
+        let out = s.redact_value(&v);
+        assert!(!out.to_string().contains(U), "{out}");
+        assert!(out.to_string().contains("plain words"), "{out}");
+        assert_eq!(s.redact_value(&out), out, "idempotent");
+    }
+}
+
+/// An entry whose payload only had a shape masked still says so.
+#[test]
+fn the_log_records_the_masked_shape_kinds() {
+    let token = ["ghp", "_aB3dE5gH7jK9mN1pQ3rS5tU7vW9xY1zA3bC5"].concat();
+    let dir = TestDir::new("tole-597-kinds");
+    let mut st = JsonlStorage::create(&dir, "k", None).unwrap();
+    st.set_secrets(SecretSet::default());
+    for text in [format!("key {token}"), "nothing here".to_string()] {
+        st.commit(Commit::new().entry(NewEntry::root(
+            EntryType::new(EntryType::MESSAGE),
+            json!({"role": "user", "text": text}),
+        )))
+        .unwrap();
+    }
+    let file = std::fs::read_to_string(dir.join("k.jsonl")).unwrap();
+    let lines: Vec<Value> = file
+        .lines()
+        .skip(1)
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(
+        lines[0]["redacted"],
+        json!(["shape:github-token"]),
+        "{file}"
+    );
+    assert!(lines[1].get("redacted").is_none());
+    drop(st);
+    JsonlStorage::open(dir.join("k.jsonl")).unwrap();
+}

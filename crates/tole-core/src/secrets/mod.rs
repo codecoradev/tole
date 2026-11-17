@@ -391,7 +391,14 @@ impl SecretSet {
             Value::Array(a) => Value::Array(a.iter().map(|v| self.redact_value(v)).collect()),
             Value::Object(o) => Value::Object(
                 o.iter()
-                    .map(|(k, v)| (self.redact(k).into_owned(), self.redact_value(v)))
+                    .map(|(k, v)| {
+                        let key = self.redact(k).into_owned();
+                        let val = match v {
+                            Value::String(s) => Value::String(self.redact_field(&key, s)),
+                            other => self.redact_value(other),
+                        };
+                        (key, val)
+                    })
                     .collect(),
             ),
             // A secret of digits can be a bare JSON number; it becomes the
@@ -401,6 +408,19 @@ impl SecretSet {
                 Cow::Borrowed(_) => value.clone(),
             },
             other => other.clone(),
+        }
+    }
+
+    /// A string FIELD of a JSON object: the value alone is redacted, then
+    /// `key=value` is shown to the shape detector too, so a value that is
+    /// secret only because of its field name is masked like an assignment
+    /// to that name in text (#597).
+    fn redact_field(&self, key: &str, value: &str) -> String {
+        let v = self.redact(value).into_owned();
+        let prefix = format!("{key}=");
+        match shape::redact_shapes(&format!("{prefix}{v}")) {
+            Cow::Owned(o) if o.starts_with(&prefix) => o[prefix.len()..].to_string(),
+            _ => v,
         }
     }
 

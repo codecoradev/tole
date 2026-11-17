@@ -433,7 +433,17 @@ fn redact_payload(set: &SecretSet, payload: &Value) -> (Value, Vec<String>) {
             after.matches(&m).count() > before.matches(&m).count()
         })
         .map(str::to_string)
-        .collect();
+        .collect::<Vec<_>>();
+    // Shape masks (#597) have no name: record each new kind as `shape:<kind>`
+    // in the same field (old logs and readers see plain strings).
+    let kinds = crate::secrets::shape::masked_kinds(&after)
+        .into_iter()
+        .filter(|k| {
+            let m = format!("[REDACTED:{k}]");
+            after.matches(&m).count() > before.matches(&m).count()
+        })
+        .map(|k| format!("shape:{k}"));
+    let names = names.into_iter().chain(kinds).collect();
     (out, names)
 }
 

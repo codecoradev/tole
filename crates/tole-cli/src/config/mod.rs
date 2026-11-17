@@ -1511,6 +1511,15 @@ pub fn hooks_ignored_warning(shown: &str) -> String {
     )
 }
 
+/// The warning printed at startup when a project config carries
+/// `redaction_allowlist` (#597).
+pub fn redaction_allowlist_ignored_warning(shown: &str) -> String {
+    format!(
+        "ignoring `redaction_allowlist` in project config {shown}: the secret-shape allowlist \
+         can only be set in the user config"
+    )
+}
+
 /// The warning printed at startup when a project config carries `[tui]`.
 pub fn tui_ignored_warning(shown: &str) -> String {
     format!(
@@ -3031,6 +3040,11 @@ verify_timeout = 60
         assert_eq!(
             layered(&project, &parse("", &p()).unwrap()).redaction_allowlist,
             None
+        );
+        let w = redaction_allowlist_ignored_warning("p.toml");
+        assert!(
+            w.contains("redaction_allowlist") && w.contains("user config"),
+            "{w}"
         );
         let e = parse("redaction_allowlist = [\"(\"]\n", &p()).unwrap_err();
         assert!(e.message.contains("redaction_allowlist"), "{e}");
