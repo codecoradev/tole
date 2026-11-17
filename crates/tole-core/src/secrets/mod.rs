@@ -191,6 +191,9 @@ struct Inner {
     skipped: Vec<Skipped>,
     /// `«NAME»` per entry.
     markers: Vec<String>,
+    /// The same markers, longest first (built once; the shape pass swaps
+    /// the longest marker that matches at a position).
+    markers_longest_first: Vec<String>,
     /// Every form of every value, longest first.
     needles: Vec<Needle>,
     /// Needle indices by first byte (256 slots; empty when no needles).
@@ -311,8 +314,8 @@ impl SecretSet {
         match self.redact_known(text) {
             // Known values first (their `«NAME»` marker wins), then the
             // shared shape detector for secrets nobody told us about (#597).
-            Cow::Borrowed(t) => shape::redact_shapes(t, &self.inner.markers),
-            Cow::Owned(o) => match shape::redact_shapes(&o, &self.inner.markers) {
+            Cow::Borrowed(t) => shape::redact_shapes(t, &self.inner.markers_longest_first),
+            Cow::Owned(o) => match shape::redact_shapes(&o, &self.inner.markers_longest_first) {
                 Cow::Borrowed(_) => Cow::Owned(o),
                 Cow::Owned(r) => Cow::Owned(r),
             },
@@ -418,7 +421,7 @@ impl SecretSet {
     fn redact_field(&self, key: &str, value: &str) -> String {
         let v = self.redact(value).into_owned();
         let prefix = format!("{key}=");
-        match shape::redact_shapes(&format!("{prefix}{v}"), &self.inner.markers) {
+        match shape::redact_shapes(&format!("{prefix}{v}"), &self.inner.markers_longest_first) {
             Cow::Owned(o) if o.starts_with(&prefix) => o[prefix.len()..].to_string(),
             _ => v,
         }
@@ -464,6 +467,10 @@ impl SecretSet {
             .iter()
             .map(|(n, _)| format!("«{n}»"))
             .collect();
+        inner.markers_longest_first = inner.markers.clone();
+        inner
+            .markers_longest_first
+            .sort_by_key(|m| std::cmp::Reverse(m.len()));
         let mut needles: Vec<Needle> = Vec::new();
         for (idx, (_, value)) in inner.entries.iter().enumerate() {
             for form in forms(value) {

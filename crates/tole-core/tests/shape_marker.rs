@@ -263,3 +263,18 @@ fn a_large_marker_count_is_restored_in_one_pass() {
     let odd = SecretSet::default().redact("«A» qzk99999x qzk0x");
     assert_eq!(odd, "«A» qzk99999x qzk0x");
 }
+
+/// The longest marker that matches wins: with names `A` and `A»B`, the text
+/// `«A»B»<secret>` is ONE marker (`«A»B»`), not `«A»` followed by `B»` (a
+/// non-ASCII neighbour that would switch the detector off for the secret).
+#[test]
+fn the_longest_known_marker_wins() {
+    let (va, vb) = ("kv_Value-0597-aaa", "kv_Value-0597-bbb");
+    // `A` is added first, so only the sort puts `A»B` ahead of it.
+    let s = SecretSet::default().with("A", va).with("A»B", vb);
+    let out = s.redact(&format!("API_KEY={vb}{U}")).into_owned();
+    assert_eq!(out, "API_KEY=[REDACTED:env-secret]");
+    // Each marker alone still keeps its name.
+    assert_eq!(s.redact(&format!("X={vb}")), "X=«A»B»");
+    assert_eq!(s.redact(&format!("X={va}")), "X=«A»");
+}

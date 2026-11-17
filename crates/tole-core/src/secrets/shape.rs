@@ -54,7 +54,8 @@ fn builtin() -> Vec<String> {
 /// Swaps every marker for an ASCII stand-in (see [`T`]): the detector treats
 /// a non-ASCII value as prose, so a secret glued to a marker would otherwise
 /// be skipped. A marker is any of `known` (the set's exact `«NAME»` strings,
-/// whatever characters the name holds, longest first) or a well-formed
+/// whatever characters the name holds, ALREADY sorted longest first: the
+/// longest one that matches wins, so `«A»B»` is not read as `«A»` + `B»`) or a well-formed
 /// `«[A-Za-z0-9_.-]{1,64}»` span. Returns the scan copy, the prefix and the
 /// markers by index. `None` when there is no marker. Never skipped, whatever
 /// bytes the text holds.
@@ -70,16 +71,14 @@ fn swap_markers<'a>(text: &'a str, known: &[String]) -> Option<(String, String, 
         .max()
         .unwrap_or(0);
     let prefix = format!("qz{}", "k".repeat(run + 1));
-    let mut order: Vec<&str> = known.iter().map(String::as_str).collect();
-    order.sort_by_key(|m| std::cmp::Reverse(m.len()));
     let (mut out, mut names): (String, Vec<&str>) = (String::with_capacity(text.len()), Vec::new());
     let mut rest = text;
     while let Some(i) = rest.find('«') {
         let here = &rest[i..];
-        let len = order
+        let len = known
             .iter()
-            .find(|m| !m.is_empty() && here.starts_with(**m))
-            .map(|m| m.len())
+            .find(|m| here.starts_with(m.as_str()))
+            .map(String::len)
             .or_else(|| generic_marker_len(here));
         match len {
             Some(n) => {
@@ -176,7 +175,8 @@ pub fn masked_kinds(text: &str) -> Vec<String> {
 }
 
 /// Masks every secret shape in `text`; borrowed when there is none. `known`
-/// are the set's exact `«NAME»` markers, kept out of the detector's way.
+/// are the set's exact `«NAME»` markers, longest first, kept out of the
+/// detector's way.
 pub fn redact_shapes<'a>(text: &'a str, known: &[String]) -> Cow<'a, str> {
     let set = POLICY.read().ok().and_then(|g| g.clone());
     let (scan, prefix, names) = match swap_markers(text, known) {
