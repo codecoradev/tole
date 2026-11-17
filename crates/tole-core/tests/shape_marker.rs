@@ -124,3 +124,67 @@ fn the_log_records_the_masked_shape_kinds() {
     drop(st);
     JsonlStorage::open(dir.join("k.jsonl")).unwrap();
 }
+
+/// Control bytes (binary or ANSI output, injected text) around a marker do
+/// not switch the protection off: the stand-in is chosen per call.
+#[test]
+fn control_bytes_around_a_marker_do_not_defeat_the_swap() {
+    let secret = "Zx9$kQ2mPz7Lw4Rt8Vb";
+    for s in sets() {
+        for text in [
+            format!("API_KEY=«A»\x01{secret}"),
+            format!("TOKEN=«A»\x02{secret}"),
+            format!("\x01API_KEY=«A»{U}\x02"),
+            format!("\x01\x02 API_KEY=«A»\x01{U}"),
+            format!("API_KEY=\x02«A»{U}"),
+        ] {
+            let out = s.redact(&text);
+            assert!(
+                !out.contains(U) && !out.contains(secret),
+                "{text:?} leaked: {out:?}"
+            );
+        }
+    }
+}
+
+/// A string that looks like a stand-in, supplied by the text, is never
+/// restored as a marker, and does not stop the real markers being swapped.
+#[test]
+fn a_stand_in_look_alike_in_the_text_is_never_restored() {
+    for s in sets() {
+        for text in [
+            "x «A» qzk0x qzkk0x qzkkk1x".to_string(),
+            "qzk0x «A» qzk0x".to_string(),
+            "QZKK0X «A» qZkKk0x".to_string(),
+        ] {
+            assert_eq!(s.redact(&text), text, "{text}");
+        }
+        let out = s
+            .redact(&format!("API_KEY=«A»{U} qzk0x qzkk0x"))
+            .into_owned();
+        assert!(!out.contains(U), "{out}");
+        assert!(
+            out.contains("qzk0x qzkk0x"),
+            "look-alikes kept as written: {out}"
+        );
+    }
+}
+
+/// A marker inside a PEM body, single-line or multi-line, does not break the
+/// key block: the whole key is masked.
+#[test]
+fn a_marker_inside_a_pem_body_does_not_leak_the_key() {
+    let half = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCx7Zq8vN2xL5mP9aR4";
+    let head = ["-----BEGIN RSA ", "PRIVATE KEY-----"].concat();
+    let foot = ["-----END RSA ", "PRIVATE KEY-----"].concat();
+    for s in sets() {
+        for pem in [
+            format!("{head}\n{half}«A»{half}\n{foot}"),
+            format!("{head}\n{half}\n{half}«A»{half}\n{half}\n{foot}"),
+            format!("{head}\n{half}«A»\n{half}\n{foot}"),
+        ] {
+            let out = s.redact(&pem);
+            assert!(!out.contains(half), "pem body leaked: {out}");
+        }
+    }
+}

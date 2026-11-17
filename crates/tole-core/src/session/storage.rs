@@ -10,7 +10,8 @@
 //! is written, and the committed in-memory entry is that same redacted
 //! form. The provider is fed from these entries, so the log stores exactly
 //! what the provider saw and a replay reproduces it. An entry that hid a
-//! secret carries `"redacted": ["NAME", ...]` on the wire (names only).
+//! secret carries `"redacted": ["NAME", ...]` on the wire: the names of known
+//! secrets, and `shape:<kind>` for each secret shape the detector masked.
 //! Older logs, written raw, load unchanged; nothing is rewritten.
 //!
 //! See `docs/architecture.md` §4 for the format rationale and the full line

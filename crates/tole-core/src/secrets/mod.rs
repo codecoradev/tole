@@ -1076,7 +1076,11 @@ mod tests {
                 let out = s
                     .redact(&format!("Authorization: Basic {enc}"))
                     .into_owned();
-                assert!(out.contains("«GITHUB_TOKEN»"), "{plain:?} leaked: {out}");
+                // The shape pass (#597) may mask the whole Basic credential.
+                assert!(
+                    out.contains("«GITHUB_TOKEN»") || out.contains("[REDACTED:basic-auth]"),
+                    "{plain:?} leaked: {out}"
+                );
             }
         }
     }

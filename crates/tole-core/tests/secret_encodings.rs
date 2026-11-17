@@ -26,8 +26,11 @@ fn base64_of_an_embedded_secret_is_redacted() {
         let out = s
             .redact(&format!("Authorization: Basic {enc}"))
             .into_owned();
+        // The known pass names it; the shape pass (#597) may then mask the
+        // whole Basic credential (the marker sits inside base64), losing
+        // the name but never the secret.
         assert!(
-            out.contains("«GITHUB_TOKEN»"),
+            out.contains("«GITHUB_TOKEN»") || out.contains("[REDACTED:basic-auth]"),
             "base64 form of {plain:?} leaked unredacted: {out}"
         );
     }
