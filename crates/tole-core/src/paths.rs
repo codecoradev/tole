@@ -75,8 +75,6 @@ fn resolve_root(
     root.is_absolute().then_some(root)
 }
 
-/// Serializes tests that touch the process environment (CODECORA_HOME /
-/// HOME / USERPROFILE) and restores the previous values afterwards.
 /// The home directory of the account this process runs as, from the passwd
 /// database, NOT from `$HOME`: a process started by a sandboxed command can
 /// inherit a `HOME` pointing at state that command wrote. The `git` tool uses
@@ -123,6 +121,8 @@ pub fn account_home() -> Option<PathBuf> {
     None
 }
 
+/// Serializes tests that touch the process environment (CODECORA_HOME /
+/// HOME / USERPROFILE) and restores the previous values afterwards.
 #[cfg(test)]
 pub(crate) fn with_env<R>(vars: &[(&str, Option<&str>)], f: impl FnOnce() -> R) -> R {
     use std::sync::Mutex;

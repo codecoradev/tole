@@ -317,6 +317,44 @@ pub(crate) fn inert_key(key: &str) -> bool {
 /// ([`GitTool::with_bin`]; its directory is added) or links it into one of these.
 const TRUSTED_DIRS: [&str; 4] = ["/usr/local/bin", "/usr/bin", "/bin", "/opt/homebrew/bin"];
 
+/// The directories no fixed search directory may be under: the workdir, the
+/// temp dir, `$HOME` and the account home (a sandboxed command can write
+/// there), canonicalized. The filesystem root is never one of them, whichever
+/// of them names it (`HOME=/`, a passwd home of `/` in a container, a workdir
+/// of `/`): every path is under `/`, so it would empty the trusted set and
+/// leave the tool unusable. A home of `/` is simply no usable home.
+fn avoid_dirs(
+    workdir: Option<PathBuf>,
+    tmp: PathBuf,
+    home: Option<PathBuf>,
+    account_home: Option<PathBuf>,
+) -> Vec<PathBuf> {
+    [workdir, Some(tmp), home, account_home]
+        .into_iter()
+        .flatten()
+        .map(|p| crate::paths::canon_lenient(&p))
+        .filter(|p| p.parent().is_some())
+        .collect()
+}
+
+/// The `PATH` directories of a hardened git: the directory of an absolute
+/// `bin`, then each of [`TRUSTED_DIRS`] that exists and is not under `avoid`.
+fn search_dirs(bin: &Path, avoid: &[PathBuf]) -> Vec<PathBuf> {
+    let usable = |d: &Path| -> bool {
+        d.is_absolute()
+            && std::fs::canonicalize(d)
+                .is_ok_and(|c| c.is_dir() && !avoid.iter().any(|a| c.starts_with(a)))
+    };
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if bin.is_absolute() {
+        if let Some(parent) = bin.parent() {
+            dirs.push(parent.to_path_buf());
+        }
+    }
+    dirs.extend(TRUSTED_DIRS.iter().map(PathBuf::from).filter(|d| usable(d)));
+    dirs
+}
+
 /// The environment a hardened git process gets: an ALLOWLIST taken from
 /// `parent` (the process environment), plus `PATH` (the fixed `path`),
 /// `HOME` (the account's own home, see [`crate::paths::account_home`]; the
@@ -437,31 +475,18 @@ impl GitTool {
     /// With a command consumer on: the git binary and the `PATH` it gets, both
     /// FIXED (see [`TRUSTED_DIRS`]). A directory under the workdir, the temp
     /// dir, `$HOME` or the account home is never searched (a sandboxed
-    /// command can write there), and a relative `bin` is refused.
+    /// command can write there; a home of `/` counts as no home, see
+    /// [`avoid_dirs`]), and a relative `bin` is refused.
     fn trusted_launch(&self) -> Result<(PathBuf, OsString), String> {
-        let cwd = std::env::current_dir().ok();
-        let avoid: Vec<PathBuf> = [
-            self.workdir.clone().or(cwd),
-            Some(std::env::temp_dir()),
+        let avoid = avoid_dirs(
+            self.workdir
+                .clone()
+                .or_else(|| std::env::current_dir().ok()),
+            std::env::temp_dir(),
             std::env::var_os("HOME").map(PathBuf::from),
             crate::paths::account_home(),
-        ]
-        .into_iter()
-        .flatten()
-        .map(|p| crate::paths::canon_lenient(&p))
-        .collect();
-        let usable = |d: &Path| -> bool {
-            d.is_absolute()
-                && std::fs::canonicalize(d)
-                    .is_ok_and(|c| c.is_dir() && !avoid.iter().any(|a| c.starts_with(a)))
-        };
-        let mut dirs: Vec<PathBuf> = Vec::new();
-        if self.bin.is_absolute() {
-            if let Some(parent) = self.bin.parent() {
-                dirs.push(parent.to_path_buf());
-            }
-        }
-        dirs.extend(TRUSTED_DIRS.iter().map(PathBuf::from).filter(|d| usable(d)));
+        );
+        let dirs = search_dirs(&self.bin, &avoid);
         let program = if self.bin.is_absolute() {
             self.bin.clone()
         } else if self.bin.components().count() == 1 {
@@ -983,6 +1008,37 @@ mod tests {
         );
         // SAFETY: closing the duplicate made above.
         unsafe { libc::close(fd) };
+    }
+
+    /// A home of `/` (`HOME=/`, a service account or container whose passwd home
+    /// is `/`) is no usable home: it must neither empty the fixed search
+    /// directories (everything is under `/`) nor widen anything.
+    #[test]
+    fn a_home_of_root_neither_empties_nor_widens_the_trusted_dirs() {
+        let none: Vec<PathBuf> = search_dirs(Path::new("git"), &[]);
+        assert!(!none.is_empty(), "this host has none of {TRUSTED_DIRS:?}");
+        let root = || Some(PathBuf::from("/"));
+        let avoid = avoid_dirs(
+            Some(PathBuf::from("/")),
+            std::env::temp_dir(),
+            root(),
+            root(),
+        );
+        assert!(
+            avoid.iter().all(|a| a.parent().is_some()),
+            "root in the avoid set: {avoid:?}"
+        );
+        // Same fixed set as with no home at all: not emptied, not widened.
+        assert_eq!(search_dirs(Path::new("git"), &avoid), {
+            let bare = avoid_dirs(None, std::env::temp_dir(), None, None);
+            search_dirs(Path::new("git"), &bare)
+        });
+        // The other entries still keep their effect.
+        let first = std::fs::canonicalize(&none[0]).unwrap();
+        let under = avoid_dirs(None, first.clone(), root(), None);
+        assert!(search_dirs(Path::new("git"), &under)
+            .iter()
+            .all(|d| { std::fs::canonicalize(d).is_ok_and(|c| !c.starts_with(&first)) }));
     }
 
     /// With a consumer on, git gets an allowlist environment: every variable that
