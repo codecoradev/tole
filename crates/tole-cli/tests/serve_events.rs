@@ -241,7 +241,10 @@ fn approval_frames_reach_the_stream() {
         Some(&json!({"text": "TOOL_MISSION write it"}).to_string()),
     );
     assert_eq!(code, 200, "{body}");
-    assert_eq!(body["stopReason"], "refusal", "fail-closed settle");
+    assert_eq!(
+        body["stopReason"], "approval_required",
+        "fail-closed settle"
+    );
 
     let frames = sse.until(WAIT, |f| f.event == "approval_requested");
     let requested = frames.last().unwrap();

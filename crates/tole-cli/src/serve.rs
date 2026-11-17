@@ -44,7 +44,7 @@ use std::time::{Duration, Instant};
 
 use tole_cli::serve_support::profiles::{self, ProfileSource, SessionProfile};
 use tole_cli::session_host::{
-    lock_sessions, open_session_with, run_session_turn_with_images, SessionOverrides, Sessions,
+    lock_sessions, open_session_with, run_session_turn_detailed, SessionOverrides, Sessions,
     SharedSessions,
 };
 use tole_core::memory::MemoryConfig;
@@ -1809,17 +1809,39 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                     // stream is open on this session: with nobody watching the
                     // turn runs exactly as before streams existed.
                     let observer = state.buses.observer_for(id);
-                    match run_session_turn_with_images(
+                    match run_session_turn_detailed(
                         Arc::clone(&state.sessions),
                         id,
                         text,
                         &images,
                         observer,
+                        // The turn snapshots the queue once it holds the
+                        // session (#571); a session runs one turn at a time
+                        // (a second prompt is a 409 before any lookup), so
+                        // an entry of this session newer than the snapshot
+                        // was queued by THIS turn.
+                        Some(&state.approvals),
                     ) {
-                        Ok((stop, Some(final_text))) => {
-                            (200, json!({"stopReason": stop, "text": final_text}))
+                        // A turn waiting for an approval is not a refusal
+                        // (#571). A stop that queued nothing (a pre-tool hook
+                        // denial) is one: nothing waits for a decision.
+                        Ok(r) => {
+                            let approval = r.approval_tool.as_deref().zip(r.queue_mark).and_then(
+                                |(tool, mark)| {
+                                    tole_cli::approvals::approval_required_body(
+                                        &state.approvals,
+                                        id,
+                                        tool,
+                                        mark,
+                                    )
+                                },
+                            );
+                            match (approval, r.text) {
+                                (Some(body), _) => (200, body),
+                                (None, Some(t)) => (200, json!({"stopReason": r.stop, "text": t})),
+                                (None, None) => (200, json!({"stopReason": r.stop})),
+                            }
                         }
-                        Ok((stop, None)) => (200, json!({"stopReason": stop})),
                         Err(e) if e.contains("session is busy") => (409, json!({"error": e})),
                         Err(e) => (500, json!({"error": e})),
                     }

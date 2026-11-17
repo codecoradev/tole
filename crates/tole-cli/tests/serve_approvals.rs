@@ -222,7 +222,10 @@ fn approval_allow_round_trip_executes_the_work() {
         &format!("/sessions/{sid}/prompt"),
         Some(&json!({"text": "TOOL_MISSION write it"}).to_string()),
     );
-    assert_eq!(prompt_body["stopReason"], "refusal", "fail-closed settle");
+    assert_eq!(
+        prompt_body["stopReason"], "approval_required",
+        "fail-closed settle"
+    );
 
     // The queue shows the pending decision.
     let (code, list) = serve.http("GET", "/approvals", None);

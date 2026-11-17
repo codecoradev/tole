@@ -40,6 +40,9 @@ pub struct PendingApproval {
     /// fallback for an evicted session must reopen the EXACT file
     /// (cora MAJOR #3: cwd-dependent layouts defeat daemon-cwd guesses).
     pub storage_path: std::path::PathBuf,
+    /// Position in the queue's monotonic sequence (#571): lets a caller
+    /// tell an entry queued during its own turn from an older one.
+    pub seq: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,6 +67,8 @@ impl ApprovalStatus {
 #[derive(Default)]
 pub struct ApprovalQueue {
     entries: Mutex<Vec<PendingApproval>>,
+    /// Count of entries ever queued; each entry carries its number.
+    seq: std::sync::atomic::AtomicU64,
     /// Approved one-shots keyed by (SESSION, fingerprint) — a shared
     /// tool+input across sessions must never let one session's ALLOW
     /// authorize another's replay (cora MAJOR). Value: tool + granted
@@ -163,19 +168,23 @@ impl ApprovalQueue {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let id = format!("apr-{:x}-{:x}{:x}", now_ms(), nonce, seq);
-        self.entries
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .push(PendingApproval {
-                id: id.clone(),
-                session_id: session_id.to_string(),
-                tool: tool.to_string(),
-                description: description.to_string(),
-                fingerprint,
-                created_at_ms: now_ms(),
-                status: ApprovalStatus::Pending,
-                storage_path,
-            });
+        // The sequence number is taken under the entries lock, so sequence
+        // order is insertion order and `mark()` (which locks too) never
+        // sees a number whose entry is not in the Vec yet.
+        let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        let entry_seq = self.seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        entries.push(PendingApproval {
+            id: id.clone(),
+            session_id: session_id.to_string(),
+            tool: tool.to_string(),
+            description: description.to_string(),
+            fingerprint,
+            created_at_ms: now_ms(),
+            status: ApprovalStatus::Pending,
+            storage_path,
+            seq: entry_seq,
+        });
+        drop(entries);
         id
     }
 
@@ -203,6 +212,29 @@ impl ApprovalQueue {
             .iter()
             .find(|e| e.id == id && e.status == ApprovalStatus::Pending)
             .map(|e| (e.session_id.clone(), e.tool.clone()))
+    }
+
+    /// The queue position now (#571): snapshot it before a turn, then ask
+    /// [`Self::queued_since`] what that turn queued.
+    pub fn mark(&self) -> u64 {
+        let _entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        self.seq.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The newest entry of `session_id` for `tool` queued strictly after
+    /// `mark`, in any status (#571). The session id is part of the key, so
+    /// another session's approval is never returned; the mark excludes
+    /// older entries of the same session and tool, so a stop that queued
+    /// nothing (a pre-tool hook denial) never picks up a stale row.
+    pub fn queued_since(&self, session_id: &str, tool: &str, mark: u64) -> Option<PendingApproval> {
+        self.prune_expired();
+        self.entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .rev()
+            .find(|e| e.session_id == session_id && e.tool == tool && e.seq > mark)
+            .cloned()
     }
 
     /// Apply an operator decision.
@@ -333,6 +365,29 @@ pub fn approval_json(e: &PendingApproval) -> Value {
     })
 }
 
+/// The `POST /sessions/{id}/prompt` body for a turn that stopped on an
+/// approval (#571), or `None` when the stop queued nothing. `mark` is
+/// [`ApprovalQueue::mark`] taken before the turn: only an entry of this
+/// session and `tool` queued DURING the turn counts, so a pre-tool hook
+/// denial (the turn reports the same outcome but nothing waits for a
+/// decision) is `None`, as is an older undecided entry. The body is
+/// `stopReason: "approval_required"` plus the queue row (the
+/// `GET /approvals` shape) while that entry is still pending; when it
+/// expired or was decided in the meantime `approval` is omitted.
+pub fn approval_required_body(
+    queue: &ApprovalQueue,
+    session_id: &str,
+    tool: &str,
+    mark: u64,
+) -> Option<Value> {
+    let e = queue.queued_since(session_id, tool, mark)?;
+    let mut out = json!({"stopReason": "approval_required"});
+    if e.status == ApprovalStatus::Pending {
+        out["approval"] = approval_json(&e);
+    }
+    Some(out)
+}
+
 /// Thin std-only HTTP helper for the CLI consumer (tole serve speaks
 /// one-request-per-connection `Connection: close` — a raw TcpStream is
 /// the dependency-free client).
@@ -458,5 +513,88 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("https://"), "{msg}");
         assert!(msg.contains("plaintext"), "{msg}");
+    }
+
+    fn queue_one(q: &ApprovalQueue, session: &str, tool: &str) -> String {
+        q.queue_entry(session, tool, "d", 7, std::path::PathBuf::from("/x"))
+    }
+
+    /// #571: an entry queued during the turn is named, with its row.
+    #[test]
+    fn approval_required_body_carries_the_row_queued_during_the_turn() {
+        let q = ApprovalQueue::default();
+        let mark = q.mark();
+        let id = queue_one(&q, "s1", "write_file");
+        let b = approval_required_body(&q, "s1", "write_file", mark).unwrap();
+        assert_eq!(b["stopReason"], "approval_required");
+        assert_eq!(b["approval"]["id"], id.as_str());
+        assert_eq!(b["approval"]["tool"], "write_file");
+        assert_eq!(b["approval"]["status"], "pending");
+    }
+
+    /// #571: queued during the turn but decided before the lookup ->
+    /// still `approval_required`, no `approval` key.
+    #[test]
+    fn approval_required_body_without_a_pending_row_omits_approval() {
+        let q = ApprovalQueue::default();
+        let mark = q.mark();
+        let id = queue_one(&q, "s1", "write_file");
+        q.decide(&id, false);
+        let b = approval_required_body(&q, "s1", "write_file", mark).unwrap();
+        assert_eq!(b["stopReason"], "approval_required");
+        assert!(b.get("approval").is_none(), "{b}");
+    }
+
+    /// #571: a stop that queued nothing (pre-tool hook denial) is `None`,
+    /// even with an older undecided entry of the same session and tool.
+    #[test]
+    fn a_stop_that_queued_nothing_is_not_approval_required() {
+        let q = ApprovalQueue::default();
+        let stale = queue_one(&q, "s1", "write_file");
+        let mark = q.mark();
+        assert!(approval_required_body(&q, "s1", "write_file", mark).is_none());
+        // The stale entry is still pending and untouched.
+        assert_eq!(
+            q.peek_pending(&stale).map(|p| p.1),
+            Some("write_file".into())
+        );
+    }
+
+    /// #571: another session's (or another tool's) entry is never returned.
+    #[test]
+    fn approval_required_body_never_leaks_other_sessions() {
+        let q = ApprovalQueue::default();
+        let mark = q.mark();
+        queue_one(&q, "other", "write_file");
+        queue_one(&q, "s1", "edit_file");
+        assert!(approval_required_body(&q, "s1", "write_file", mark).is_none());
+        let own = queue_one(&q, "s1", "write_file");
+        queue_one(&q, "other", "write_file");
+        let b = approval_required_body(&q, "s1", "write_file", mark).unwrap();
+        assert_eq!(b["approval"]["id"], own.as_str());
+        assert_eq!(b["approval"]["sessionId"], "s1");
+    }
+
+    /// #571: under concurrent pushes sequence order is insertion order.
+    #[test]
+    fn sequence_order_is_insertion_order_under_concurrent_pushes() {
+        let q = std::sync::Arc::new(ApprovalQueue::default());
+        let handles: Vec<_> = (0..8)
+            .map(|t| {
+                let q = std::sync::Arc::clone(&q);
+                std::thread::spawn(move || {
+                    for _ in 0..50 {
+                        queue_one(&q, &format!("s{t}"), "write_file");
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let seqs: Vec<u64> = q.list(None).iter().map(|e| e.seq).collect();
+        assert_eq!(seqs.len(), 400);
+        assert!(seqs.windows(2).all(|w| w[0] < w[1]), "{seqs:?}");
+        assert_eq!(q.mark(), 400);
     }
 }

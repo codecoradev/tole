@@ -507,10 +507,43 @@ pub fn run_session_turn_with_images(
     images: &[tole_core::image::ImageRef],
     observer: Option<StdArc<dyn tole_core::turn::TurnObserver>>,
 ) -> Result<(String, Option<String>), String> {
+    run_session_turn_detailed(sessions, session_id, prompt, images, observer, None)
+        .map(|r| (r.stop, r.text))
+}
+
+/// A settled turn with what only `serve` needs on top of the ACP/MCP pair
+/// (#571): which tool the turn stopped on when it waits for an approval.
+/// `stop` keeps the ACP vocabulary (`refusal` for an approval stop).
+#[non_exhaustive]
+pub struct TurnResult {
+    pub stop: String,
+    pub text: Option<String>,
+    /// `Some(tool)` when the outcome was `ApprovalRequired`.
+    pub approval_tool: Option<String>,
+    /// [`crate::approvals::ApprovalQueue::mark`] taken right after the turn
+    /// claimed the session (`Some` when the caller passed a queue): an entry
+    /// of this session newer than it was queued by this turn.
+    pub queue_mark: Option<u64>,
+}
+
+/// [`run_session_turn_with_images`] plus the approval tool of an
+/// approval stop. Only the serve prompt route reads the extra fields; it
+/// passes its approval queue so the snapshot is taken AFTER the busy claim
+/// (an approvals-resume thread claims the same session and could queue an
+/// entry between an earlier snapshot and our claim).
+pub fn run_session_turn_detailed(
+    sessions: SharedSessions,
+    session_id: &str,
+    prompt: &str,
+    images: &[tole_core::image::ImageRef],
+    observer: Option<StdArc<dyn tole_core::turn::TurnObserver>>,
+    approvals: Option<&crate::approvals::ApprovalQueue>,
+) -> Result<TurnResult, String> {
     // Brief map lock: claim the session for this turn. The MAP lock is
     // released here — a running turn holds only its OWN storage lock, so
     // the transport loop stays live (CodeCora deadlock finding).
     let (state, _busy_guard) = lock_sessions(&sessions).claim_turn(session_id)?;
+    let queue_mark = approvals.map(|q| q.mark());
     let SessionState {
         storage,
         registry,
@@ -566,7 +599,16 @@ pub fn run_session_turn_with_images(
     }
     log_outcome(&outcome);
     let stop = stop_reason(&outcome)?;
-    Ok((stop.to_string(), final_text))
+    let approval_tool = match &outcome {
+        tole_core::turn::TurnOutcome::ApprovalRequired { name } => Some(name.clone()),
+        _ => None,
+    };
+    Ok(TurnResult {
+        stop,
+        text: final_text,
+        approval_tool,
+        queue_mark,
+    })
 }
 
 /// Approvals-only recovery over the serve face (issue #200): no new
