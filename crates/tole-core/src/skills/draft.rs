@@ -532,7 +532,7 @@ pub fn name_ok(name: &str) -> Result<(), String> {
 /// The detail never quotes the match.
 pub fn scan_secrets(content: &str, secrets: &SecretSet) -> Vec<Finding> {
     let mut out = Vec::new();
-    if secrets.redact(content) != content {
+    if secrets.redact_known(content) != content {
         out.push(block(
             "secret",
             "the text holds a value of a known secret; remove it",

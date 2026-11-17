@@ -15,19 +15,24 @@
 //! - [`SecretSet::redact`] replaces every known value, and its base64
 //!   (standard and URL-safe), percent-encoded and JSON-escaped forms, with
 //!   `«NAME»`. Matches that overlap are merged into one redacted span, so a
-//!   secret overlapping another never leaks a tail. Text without a match,
-//!   and every text when the set is empty, is returned borrowed (no copy).
+//!   secret overlapping another never leaks a tail. Text without a match is
+//!   returned borrowed (no copy); the known-value pass is skipped when the
+//!   set is empty, the shape pass below is not.
 //!
-//! Matching is a first-byte-indexed scan with needles tried longest first:
-//! no regex or automaton dependency. A set holds a handful of secrets, each
+//! After the known-value pass, [`shape`] masks secret SHAPES nobody told us
+//! about (#597) as `[REDACTED:<kind>]`, with the ruleset shared with uteke.
+//!
+//! Known-value matching is a first-byte-indexed scan with needles tried
+//! longest first: no regex or automaton dependency. A set holds a handful of secrets, each
 //! with up to six forms, so the per-byte work is a table lookup plus, for the
 //! few bytes that start a needle, a short prefix compare.
 //!
-//! Platform-agnostic: pure std + `base64`, no I/O beyond [`SecretSet::from_env`]
+//! Platform-agnostic: pure std + `base64` + `uteke-privacy`, no I/O beyond [`SecretSet::from_env`]
 //! reading the process environment.
 
 pub mod release;
 pub mod sensitive;
+pub mod shape;
 
 use base64::Engine;
 use std::borrow::Cow;
@@ -290,7 +295,9 @@ impl SecretSet {
         self.inner.needles.is_empty()
     }
 
-    /// Replace every known value (and its encoded forms) with `«NAME»`.
+    /// Replace every known value (and its encoded forms) with `«NAME»`,
+    /// then mask the secret shapes the shared detector finds in what is left
+    /// as `[REDACTED:<kind>]` (#597; runs for an empty set too).
     /// Overlapping matches merge into one span carrying each name once.
     /// Idempotent; never splits a UTF-8 character (every needle is valid
     /// UTF-8, so a match starts and ends on character boundaries).
@@ -301,6 +308,19 @@ impl SecretSet {
     /// mapped back onto the original, so a value split by one is still
     /// found (#681). Text without any is scanned once.
     pub fn redact<'a>(&self, text: &'a str) -> Cow<'a, str> {
+        match self.redact_known(text) {
+            // Known values first (their `«NAME»` marker wins), then the
+            // shared shape detector for secrets nobody told us about (#597).
+            Cow::Borrowed(t) => shape::redact_shapes(t),
+            Cow::Owned(o) => match shape::redact_shapes(&o) {
+                Cow::Borrowed(_) => Cow::Owned(o),
+                Cow::Owned(r) => Cow::Owned(r),
+            },
+        }
+    }
+
+    /// The known-value pass of [`SecretSet::redact`].
+    pub(crate) fn redact_known<'a>(&self, text: &'a str) -> Cow<'a, str> {
         let inner = &*self.inner;
         if inner.needles.is_empty() {
             return Cow::Borrowed(text);
@@ -366,9 +386,6 @@ impl SecretSet {
     /// `","` would match across two fields).
     pub fn redact_value(&self, value: &serde_json::Value) -> serde_json::Value {
         use serde_json::Value;
-        if self.is_empty() {
-            return value.clone();
-        }
         match value {
             Value::String(s) => Value::String(self.redact(s).into_owned()),
             Value::Array(a) => Value::Array(a.iter().map(|v| self.redact_value(v)).collect()),

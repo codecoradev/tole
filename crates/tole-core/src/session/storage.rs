@@ -420,9 +420,6 @@ pub struct JsonlStorage {
 /// secret that is a bare number becomes the marker string), in every form
 /// the set knows: as is, JSON-escaped, base64 and percent-encoded.
 fn redact_payload(set: &SecretSet, payload: &Value) -> (Value, Vec<String>) {
-    if set.is_empty() {
-        return (payload.clone(), Vec::new());
-    }
     let out = set.redact_value(payload);
     if out == *payload {
         return (out, Vec::new());

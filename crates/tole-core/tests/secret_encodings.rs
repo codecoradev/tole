@@ -53,17 +53,23 @@ fn hex_json_escape_and_zero_width_forms_are_redacted() {
     assert!(leaks.is_empty(), "missed forms: {leaks:?}");
 }
 
-/// The false-positive floor holds: unrelated text, base64 of other values
-/// and lone invisible characters are left alone.
+/// The false-positive floor holds: unrelated text and lone invisible
+/// characters are left alone. (Basic credentials of OTHER values are masked
+/// since #597, by the shape detector, as `[REDACTED:basic-auth]`, not as a
+/// known value.)
 #[test]
 fn unrelated_text_is_not_redacted() {
     let s = set();
     let b64 = base64::engine::general_purpose::STANDARD;
     for text in [
-        format!("Authorization: Basic {}", b64.encode("user:not-the-token")),
         "plain text \u{200b}with a zero-width space".to_string(),
         "746f6b5f30313233".to_string(), // hex of a prefix only
     ] {
         assert_eq!(s.redact(&text), text);
     }
+    let other = format!("Authorization: Basic {}", b64.encode("user:not-the-token"));
+    assert_eq!(
+        s.redact(&other),
+        "Authorization: Basic [REDACTED:basic-auth]"
+    );
 }
