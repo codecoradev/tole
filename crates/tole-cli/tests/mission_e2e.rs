@@ -250,7 +250,10 @@ fn verify_gate_overrides_the_completion_marker() {
     let base = spawn_mock(dir.join("done.marker"));
     // `verify` is sandboxed by default (#748) and runs in the process's
     // working directory, not `--workspace`; this tests the gate, so it opts out.
-    let home = dir.with_extension("home");
+    // Its own TestDir (removed on drop, also on a panic), not a sibling of `dir`
+    // that nothing owns (#781: that one was left behind on every run).
+    let home_dir = temp_dir("verify-home");
+    let home = home_dir.join("home");
     std::fs::create_dir_all(home.join("tole")).unwrap();
     std::fs::write(
         home.join("tole/config.toml"),
