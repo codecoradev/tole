@@ -8,9 +8,47 @@ use tole_core::storage::{Commit, JsonlStorage, Storage as _, UsageRecord};
 use crate::test_dir::TestDir;
 
 /// A workspace root whose detached children (the fake tole shells below)
-/// are killed before it is removed: their command line holds the root, and
-/// one that starts late would otherwise write into a directory that is gone.
+/// are gone before it is removed. Their command line holds the root, and a
+/// child that outlives the removal writes into a directory that is gone:
+/// `mkdir -p` re-creates it (#897).
+///
+/// `kill -9` only queues the signal: a child that is inside a syscall (the
+/// `mkdir` of the script, in the `D` state under load) finishes that syscall
+/// first, so it can still create the root after a test has removed it and
+/// after a single `pkill` has returned. So the drop kills until no process
+/// names the root any more, and only then lets [`TestDir`] remove it; what a
+/// dying child created in the meantime goes with it.
 struct Root(TestDir);
+
+impl Root {
+    /// Kills every process whose command line holds the root and returns
+    /// once none is left (false after the bound, which is only a guard
+    /// against a process that cannot be killed).
+    fn reap_children(&self) -> bool {
+        let path = self.0.path();
+        let alive = || {
+            std::process::Command::new("pgrep")
+                .args(["-f"])
+                .arg(path)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        };
+        crate::test_dir::poll_until(crate::test_dir::WAIT, || {
+            if !alive() {
+                return Some(());
+            }
+            let _ = std::process::Command::new("pkill")
+                .args(["-9", "-f"])
+                .arg(path)
+                .stderr(std::process::Stdio::null())
+                .status();
+            None
+        })
+        .is_some()
+    }
+}
 
 impl std::ops::Deref for Root {
     type Target = Path;
@@ -27,11 +65,13 @@ impl AsRef<Path> for Root {
 
 impl Drop for Root {
     fn drop(&mut self) {
-        let _ = std::process::Command::new("pkill")
-            .args(["-9", "-f"])
-            .arg(self.0.path())
-            .stderr(std::process::Stdio::null())
-            .status();
+        if !self.reap_children() {
+            eprintln!(
+                "delegate tests: a child of {} survived kill -9; it may recreate the \
+                 directory and the #781 leak check may follow (#897)",
+                self.0.path().display()
+            );
+        }
     }
 }
 
