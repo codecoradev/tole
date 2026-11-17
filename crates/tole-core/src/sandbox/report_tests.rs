@@ -426,3 +426,29 @@ fn the_verbose_line_names_the_launch_and_carries_the_redacted_argv() {
         "mcp[a\\u{a}b]: sandbox command line: /usr/bin/bwrap --unshare-all -- srv --token=<redacted>"
     );
 }
+
+/// #748: the grant listing for a consumer that is `optional` by default says
+/// so, and reports an unsandboxed run (not a refusal) where there is no backend.
+#[test]
+fn the_grant_lines_tag_the_default_and_report_its_degrade() {
+    let d = Consumers::host_default();
+    let text = doctor_grant_lines(None, &d, &gone(), true, &[], None, None).join("\n");
+    assert!(
+        text.contains(
+            "sandbox consumer verify: unsandboxed, no sandbox (bubblewrap (bwrap) is not on PATH); optional (default)"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("refused"), "{text}");
+    // A written optional, unattended, with no backend: refused, no tag.
+    let e = Consumers {
+        verify: Mode::Optional,
+        ..Consumers::default()
+    };
+    let text = doctor_grant_lines(None, &e, &gone(), true, &[], None, None).join("\n");
+    assert!(
+        text.contains("sandbox consumer verify: refused, no sandbox"),
+        "{text}"
+    );
+    assert!(!text.contains("(default)"), "{text}");
+}
