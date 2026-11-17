@@ -168,13 +168,27 @@ impl SessionProfile {
     }
 }
 
-/// The profile a session log recorded (`fact/profile`), if its name is
-/// still a well-formed profile name (a tampered log never yields a path or
-/// message fragment).
-pub fn recorded(storage: &dyn tole_core::storage::Storage) -> Option<String> {
-    let v = storage.get_register(REGISTER_NS, REGISTER_KEY)?;
-    let name = v.get("name")?.as_str()?;
-    config::valid_profile_name(name).then(|| name.to_string())
+/// What a session log says about its profile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Recorded {
+    /// No `fact/profile` entry: the session never had one.
+    None,
+    /// A well-formed profile name.
+    Name(String),
+    /// An entry whose name is not a well-formed profile name (a tampered
+    /// log): never a path or message fragment, and never "no profile".
+    Invalid,
+}
+
+/// The profile a session log recorded (`fact/profile`).
+pub fn recorded(storage: &dyn tole_core::storage::Storage) -> Recorded {
+    let Some(v) = storage.get_register(REGISTER_NS, REGISTER_KEY) else {
+        return Recorded::None;
+    };
+    match v.get("name").and_then(|n| n.as_str()) {
+        Some(n) if config::valid_profile_name(n) => Recorded::Name(n.to_string()),
+        _ => Recorded::Invalid,
+    }
 }
 
 pub const REGISTER_NS: &str = "fact";

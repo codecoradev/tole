@@ -363,6 +363,12 @@ fn without_a_profile_the_session_is_unchanged() {
     let (code, body) = d.post(json!({"cwd": d.cwd("a"), "profile": null}));
     assert_eq!(code, 200, "{body}");
     assert!(body.get("profile").is_none());
+    // The list has no `profile` key for a session without one.
+    let (_, list) = d.http("GET", "/sessions", None);
+    for entry in list["sessions"].as_array().unwrap() {
+        assert!(entry.get("profile").is_none(), "{list}");
+        assert_eq!(entry.as_object().unwrap().len(), 2, "{list}");
+    }
 }
 
 /// An unknown profile is a clear 4xx, never a silent default, and creates no
@@ -605,4 +611,43 @@ fn a_project_config_cannot_add_a_selectable_profile() {
     // The user's own profile still works.
     let (code, _) = d.post(json!({"cwd": d.cwd("a"), "profile": "kai"}));
     assert_eq!(code, 200);
+}
+
+/// A log whose recorded profile name is malformed, or that cannot be read to
+/// look for one, is never resumed under the daemon's defaults (which can be
+/// wider than the recorded profile): 409 / 500 asking for an explicit profile.
+#[test]
+fn a_tampered_or_unreadable_log_is_not_resumed_into_the_defaults() {
+    let mut d = Daemon::spawn(CONFIG, &[]);
+    let id = d.create(json!({"cwd": d.cwd("a"), "profile": "kai"}));
+    d.prompt(&id, "first");
+    d.restart(&[]);
+    // A tampered entry: a recorded name that is not a profile name.
+    {
+        let mut s = tole_core::storage::JsonlStorage::open(d.file("a", &id)).unwrap();
+        s.commit(tole_core::storage::Commit::new().register(
+            tole_core::register::RegisterWrite::set(
+                "fact",
+                "profile",
+                json!({"name": "../../etc/passwd", "atMs": 1}),
+            ),
+        ))
+        .unwrap();
+    }
+    let (code, b) = d.post(json!({"cwd": d.cwd("a"), "resume": id}));
+    assert_eq!(code, 409, "{b}");
+    let msg = b["error"].as_str().unwrap();
+    assert!(msg.contains("explicit") && !msg.contains("passwd"), "{msg}");
+    // An explicit profile still resumes it and is recorded over the bad one.
+    let (code, b) = d.post(json!({"cwd": d.cwd("a"), "resume": id, "profile": "ana"}));
+    assert_eq!(code, 200, "{b}");
+    assert_eq!(d.recorded("a", &id).as_deref(), Some("ana"));
+
+    // A log that cannot be read at all.
+    let broken = d.create(json!({"cwd": d.cwd("b")}));
+    d.restart(&[]);
+    std::fs::write(d.file("b", &broken), "not a session log\n").unwrap();
+    let (code, b) = d.post(json!({"cwd": d.cwd("b"), "resume": broken}));
+    assert_eq!(code, 500, "{b}");
+    assert!(b["error"].as_str().unwrap().contains("explicit"), "{b}");
 }

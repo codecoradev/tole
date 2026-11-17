@@ -1115,31 +1115,50 @@ fn resume_session(
     if lock_sessions(&state.sessions).ensure_room().is_err() {
         return (503, json!({"error": "all sessions busy — at capacity"}));
     }
-    // What the log already says (read-only: the writer lock is taken at open).
-    let recorded = tole_core::storage::JsonlStorage::open_read_only(&file)
-        .ok()
-        .and_then(|s| profiles::recorded(&s));
+    // What the log already says (read-only: the writer lock is taken at
+    // open). A log that cannot be read, or whose recorded name is not a
+    // profile name, is never taken as "no profile": that would resume under
+    // the daemon's defaults, which can be wider than the recorded profile.
+    let recorded = match tole_core::storage::JsonlStorage::open_read_only(&file) {
+        Ok(s) => Ok(profiles::recorded(&s)),
+        Err(e) => Err(e.to_string()),
+    };
     let profile = match requested {
         Some(p) => Some(p),
-        None => match recorded.as_deref().map(|n| state.profiles.select(n)) {
-            None => None,
-            Some(Ok(p)) => Some(p),
-            Some(Err(e)) => {
+        None => match &recorded {
+            Ok(profiles::Recorded::None) => None,
+            Ok(profiles::Recorded::Name(n)) => match state.profiles.select(n) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    return (
+                        409,
+                        json!({"error": format!(
+                            "the session was recorded under profile `{n}`, which cannot be used \
+                             now ({}); resume with an explicit \"profile\"",
+                            e.message()
+                        )}),
+                    )
+                }
+            },
+            Ok(profiles::Recorded::Invalid) => {
                 return (
                     409,
-                    json!({"error": format!(
-                        "the session was recorded under profile `{}`, which cannot be used now \
-                         ({}); resume with an explicit \"profile\"",
-                        recorded.as_deref().unwrap_or_default(),
-                        e.message()
-                    )}),
+                    json!({"error": "the session log records a profile with an invalid name; \
+                            resume with an explicit \"profile\""}),
+                )
+            }
+            Err(_) => {
+                return (
+                    500,
+                    json!({"error": "the session log cannot be read to find the profile it was \
+                            recorded under; fix it or resume with an explicit \"profile\""}),
                 )
             }
         },
     };
     let record = profile
         .as_ref()
-        .is_some_and(|p| recorded.as_deref() != Some(p.name.as_str()));
+        .is_some_and(|p| recorded != Ok(profiles::Recorded::Name(p.name.clone())));
     match open_serve_session(state, id, cwd, true, profile.as_ref(), record) {
         Ok(()) => {
             let mut out = json!({
@@ -1325,11 +1344,14 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
             let list: Vec<_> = sessions
                 .iter()
                 .map(|(id, st)| {
-                    json!({
+                    let mut v = json!({
                         "id": id,
                         "busy": *st.busy.lock().expect("busy lock"),
-                        "profile": st.profile,
-                    })
+                    });
+                    if let Some(p) = &st.profile {
+                        v["profile"] = json!(p);
+                    }
+                    v
                 })
                 .collect();
             (200, json!({"sessions": list}))

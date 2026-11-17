@@ -127,7 +127,9 @@ several personas. `profile` is optional and a session without it is exactly as b
   model (the profile's `default` tier, else the server default), the allow list, and the
   memory room (`memory_room`, default `profile-<name>`; only when the daemon runs with
   `--memory`, and a child's `TOLE_MEMORY_NAMESPACE` still wins). Skills, grants, the
-  advisor and the router stay process-wide on this face. Profiles have no budget
+  advisor and the router stay process-wide on this face, and child agents, the advisor
+  and the router use the daemon's model, not the profile's (they still read the global
+  provider config). Profiles have no budget
   field, so the server's existing budget logic applies unchanged.
 - **Which profiles can be picked:** only the user config's, re-read on every create or
   resume (an edit or removal applies without a restart). A project config cannot define
@@ -148,8 +150,11 @@ several personas. `profile` is optional and a session without it is exactly as b
   log as a `fact/profile` register (a new entry, never a mutation of an old one).
   On resume the request's `profile` wins over the recorded one and is recorded again;
   without one, the recorded profile is used. A recorded profile that is no longer
-  defined is a `409` (never a silent fall-back to the daemon's defaults): resume with an
-  explicit `profile`. Asking for another profile on a session that is already live is a
+  defined, a log entry with a malformed name, or a log that cannot be read to look for one,
+  is a `409` (`500` for an unreadable log), never a silent fall-back to the daemon's
+  defaults: resume with an explicit `profile`. On resume the persona and model come from
+  the effective profile, not from the header pinned when the session was created (a
+  resume without any profile is unchanged). Asking for another profile on a session that is already live is a
   `409`; the same one, or none, returns `alreadyLive` as before. Two concurrent
   resumes with different profiles: one opens the session, the other gets `409`.
 - The success answer carries `"profile": "<name>"` when one was used.
