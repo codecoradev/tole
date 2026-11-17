@@ -180,6 +180,18 @@ pub enum Recorded {
     Invalid,
 }
 
+impl Recorded {
+    /// What a listing shows: the name, `?` for a malformed one (never the
+    /// raw text), nothing when the session has no profile.
+    pub fn label(&self) -> Option<&str> {
+        match self {
+            Recorded::None => None,
+            Recorded::Name(n) => Some(n),
+            Recorded::Invalid => Some("?"),
+        }
+    }
+}
+
 /// The profile a session log recorded (`fact/profile`).
 pub fn recorded(storage: &dyn tole_core::storage::Storage) -> Recorded {
     let Some(v) = storage.get_register(REGISTER_NS, REGISTER_KEY) else {

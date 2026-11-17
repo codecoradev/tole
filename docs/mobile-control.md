@@ -158,6 +158,7 @@ several personas. `profile` is optional and a session without it is exactly as b
   `409`; the same one, or none, returns `alreadyLive` as before. Two concurrent
   resumes with different profiles: one opens the session, the other gets `409`.
 - The success answer carries `"profile": "<name>"` when one was used.
+- **Seeing profiles from the CLI:** `tole sessions` adds a `profile` column when some listed session recorded one (`?` for a malformed recorded name), and `tole doctor` prints `serve profiles: name (room <room>, <n> allow), ...` from the user config (names, rooms and counts only; nothing when no profile is defined).
 
 ## Event stream (#524)
 

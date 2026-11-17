@@ -3340,9 +3340,20 @@ fn sessions_command(sessions_dir: &Path) -> Result<()> {
     }
     // (epoch_secs, id, pc, seq, turns) — epoch secs first so a plain
     // sort_by_key ascending gives newest-first via Reverse.
-    // (epoch_secs, id, pc, seq, turns, name) — epoch secs first so a
+    // (epoch_secs, id, pc, seq, turns, name, profile) — epoch secs first so a
     // plain sort_by_key ascending gives newest-first via Reverse.
-    let mut rows: Vec<(u64, String, String, u64, usize, Option<String>)> = Vec::new();
+    // The last field is the recorded serve profile (#740), shown only when
+    // some session has one.
+    type Row = (
+        u64,
+        String,
+        String,
+        u64,
+        usize,
+        Option<String>,
+        Option<String>,
+    );
+    let mut rows: Vec<Row> = Vec::new();
     for entry in std::fs::read_dir(sessions_dir)?.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
         // strip_suffix, not trim_end_matches: a (weird but possible)
@@ -3375,6 +3386,9 @@ fn sessions_command(sessions_dir: &Path) -> Result<()> {
             s.state().seq,
             turns,
             s.session_name().map(str::to_string),
+            tole_cli::serve_support::profiles::recorded(&s)
+                .label()
+                .map(str::to_string),
         ));
     }
     if rows.is_empty() {
@@ -3382,15 +3396,28 @@ fn sessions_command(sessions_dir: &Path) -> Result<()> {
         return Ok(());
     }
     rows.sort_by_key(|r| std::cmp::Reverse(r.0)); // newest first
-    println!(
-        "{:<26} {:<18} {:<12} {:>5} {:>6}  mtime",
-        "session", "name", "pc", "seq", "turns"
-    );
+    let with_profile = rows.iter().any(|r| r.6.is_some());
+    let head = |profile: &str| {
+        println!(
+            "{:<26} {:<18} {:<12} {:>5} {:>6}  {profile}mtime",
+            "session", "name", "pc", "seq", "turns"
+        )
+    };
+    head(if with_profile {
+        "profile          "
+    } else {
+        ""
+    });
     for row in &rows {
         let mtime = fmt_mtime(std::time::UNIX_EPOCH + std::time::Duration::from_secs(row.0));
         let name = row.5.clone().unwrap_or_else(|| "-".to_string());
+        let profile = if with_profile {
+            format!("{:<16} ", row.6.as_deref().unwrap_or("-"))
+        } else {
+            String::new()
+        };
         println!(
-            "{:<26} {:<18} {:<12} {:>5} {:>6}  {mtime}",
+            "{:<26} {:<18} {:<12} {:>5} {:>6}  {profile}{mtime}",
             row.1, name, row.2, row.3, row.4
         );
     }
