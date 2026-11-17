@@ -634,6 +634,14 @@ enum Command {
         #[arg(long)]
         cron: bool,
     },
+    /// Print a password hash for `tole serve --auth basic` (#742): reads the
+    /// password from stdin (a terminal is asked without echo, twice).
+    #[cfg(feature = "shell-tools")]
+    ServeHash {
+        /// PBKDF2 iterations (at least 10000).
+        #[arg(long, default_value_t = tole_cli::auth::DEFAULT_ITERATIONS)]
+        iterations: u32,
+    },
     /// Interactive terminal UI (what bare `tole` opens on a TTY).
     #[cfg(feature = "tui")]
     #[command(hide = true)]
@@ -1664,6 +1672,8 @@ fn dispatch(cli: Cli) -> Result<()> {
         ),
         #[cfg(feature = "shell-tools")]
         Command::Hook { action } => tole_cli::hook_cli::cli(action),
+        #[cfg(feature = "shell-tools")]
+        Command::ServeHash { iterations } => crate::serve::hash_command(iterations),
         Command::Sandbox { action } => tole_cli::sandbox_cmd::cli(action, cli.profile.as_deref()),
         Command::Skills { action } => tole_cli::skill_approve::cli(action),
         Command::Curator { action } => tole_cli::curator_cmd::cli(action),
