@@ -146,6 +146,9 @@ tole is the agent harness of the CodeCora ecosystem — the hands:
   without losing its work: the `{"text", "urgent"}` message is injected at
   the turn's next safe point as an attributed entry (`409` when no turn
   is running).
+  `POST /sessions {"profile": "<name>"}` (#740, create and resume) opens a
+  session as one `[profiles.<name>]` table of your user config (persona,
+  allow list, memory room, model; fixed for that session).
   `POST /sessions/{id}/detach` (#217) stops waiting without aborting: the
   running tool settles, the turn ends `stopReason: "detached"` (resumable),
   and background jobs keep running and nudge the session when they finish
