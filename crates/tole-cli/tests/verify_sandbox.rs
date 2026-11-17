@@ -999,3 +999,141 @@ fn the_default_stop_gate_whose_launcher_fails_is_still_a_deny() {
     assert!(!r.stderr.contains("UNSANDBOXED"), "{}", r.stderr);
     drop(dir);
 }
+
+// ---------------------------------------------------------------------------
+// #748, security review: nothing but "no backend at all" may downgrade the
+// default, and the backend lookup must not let a bad candidate decide.
+// ---------------------------------------------------------------------------
+
+/// A verify that passes only when the sandbox really protects `.git/hooks`.
+const PROTECTED_VERIFY: &str = "echo ok > made && ! (echo x > .git/hooks/h) 2>/dev/null";
+
+fn plant_script(path: &Path, mode: u32, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, body).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// A file named `bwrap` WITHOUT the execute bit earlier on PATH must not
+/// shadow the real one behind it (the default used to run unsandboxed on
+/// "cannot run bwrap: Permission denied").
+#[test]
+fn a_non_executable_bwrap_earlier_on_path_does_not_downgrade_the_default() {
+    if !bwrap_works() {
+        return;
+    }
+    let (dir, ws, home) = project("dflt-nonexec");
+    let bad = dir.join("badbin");
+    plant_script(&bad.join("bwrap"), 0o644, "#!/bin/sh\nexit 1\n");
+    let path = format!("{}:{}", bad.display(), path_env());
+    let r = mission(&ws, &home, "", &path, PROTECTED_VERIFY);
+    assert_eq!(r.code, 0, "{}\n{}", r.stdout, r.stderr);
+    assert!(r.stdout.contains("status: complete"), "{}", r.stdout);
+    assert!(!r.stderr.contains("UNSANDBOXED"), "{}", r.stderr);
+    assert!(ws.join("made").exists() && !ws.join(".git/hooks/h").exists());
+    drop(dir);
+}
+
+/// A relative PATH entry (`.`) with a model-writable `./bwrap` that fails
+/// must not decide what the sandbox is.
+#[test]
+fn a_relative_path_entry_with_a_hostile_bwrap_does_not_downgrade_the_default() {
+    if !bwrap_works() {
+        return;
+    }
+    let (dir, ws, home) = project("dflt-relpath");
+    // Passes the probe, then runs the command with no sandbox at all.
+    plant_script(
+        &ws.join("bwrap"),
+        0o755,
+        "#!/bin/sh\ncase \"$1\" in --version) echo 'bubblewrap 0.9.0'; exit 0;; esac\n\
+         for a in \"$@\"; do last=$a; done\n\
+         if [ \"$last\" = true ]; then exit 0; fi\n\
+         while [ \"$1\" != -- ]; do shift; done; shift; exec \"$@\"\n",
+    );
+    let path = format!(".:{}", path_env());
+    let r = mission(&ws, &home, "", &path, PROTECTED_VERIFY);
+    assert_eq!(r.code, 0, "{}\n{}", r.stdout, r.stderr);
+    assert!(r.stdout.contains("status: complete"), "{}", r.stdout);
+    assert!(!r.stderr.contains("UNSANDBOXED"), "{}", r.stderr);
+    assert!(!ws.join(".git/hooks/h").exists(), "the sandbox applied");
+    drop(dir);
+}
+
+/// The reason in the warning can hold a backend's stderr: it stays on one
+/// line and carries no escape sequence.
+#[test]
+fn the_fallback_warning_is_one_sanitized_line() {
+    let (dir, ws, home) = project("dflt-sanitize");
+    let fake = dir.join("fakebin");
+    plant_script(
+        &fake.join("bwrap"),
+        0o755,
+        "#!/bin/sh\ncase \"$1\" in --version) echo 'bubblewrap 0.9.0'; exit 0;; esac\n\
+         printf '\\033[31mEVIL\\033[0m\\nSECOND-LINE\\n' >&2\nexit 1\n",
+    );
+    let path = format!("{}:{}", fake.display(), path_without_bwrap(&dir));
+    let r = mission(&ws, &home, "", &path, "touch verify-ran");
+    assert_eq!(r.code, 0, "{}\n{}", r.stdout, r.stderr);
+    assert!(
+        ws.join("verify-ran").exists(),
+        "no usable sandbox: degraded"
+    );
+    assert!(!r.stderr.contains('\x1b'), "{:?}", r.stderr);
+    assert!(r.stderr.contains("WARNING: verify runs UNSANDBOXED"));
+    assert!(
+        r.stderr.lines().all(|l| !l.starts_with("SECOND-LINE")),
+        "the reason must not start a line of its own: {}",
+        r.stderr
+    );
+    drop(dir);
+}
+
+/// The backend is probed at start-up when a consumer is only optional by
+/// default, before any command runs (serve, acp, mcp and the gates have no
+/// start-up check of their own); not at all when both are written off.
+#[test]
+fn the_backend_is_probed_at_start_up_when_a_consumer_is_implicit() {
+    let probes = |cfg: &str, tag: &str| -> usize {
+        let (dir, _ws, home) = project(tag);
+        let fake = dir.join("fakebin");
+        let log = dir.join("calls");
+        plant_script(
+            &fake.join("bwrap"),
+            0o755,
+            &format!("#!/bin/sh\necho \"$1\" >> {}\nexit 1\n", log.display()),
+        );
+        std::fs::create_dir_all(home.join("tole")).unwrap();
+        std::fs::write(home.join("tole/config.toml"), cfg).unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_tole"))
+            .args(["sessions", "-s"])
+            .arg(home.join("sessions"))
+            .current_dir(&dir)
+            .env_clear()
+            .env(
+                "PATH",
+                format!("{}:{}", fake.display(), path_without_bwrap(&dir)),
+            )
+            .env("TOLE_NO_UPDATE_CHECK", "1")
+            .env("CODECORA_HOME", &home)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run tole");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        std::fs::read_to_string(&log).map_or(0, |t| t.lines().count())
+    };
+    assert!(probes("", "probe-default") > 0, "probed at start-up");
+    assert_eq!(
+        probes(
+            "[sandbox.consumers]\nverify = \"off\"\nturnend = \"off\"\n",
+            "probe-off"
+        ),
+        0,
+        "nothing to probe for"
+    );
+}
