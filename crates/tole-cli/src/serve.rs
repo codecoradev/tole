@@ -1809,30 +1809,33 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                     // stream is open on this session: with nobody watching the
                     // turn runs exactly as before streams existed.
                     let observer = state.buses.observer_for(id);
-                    // Snapshot the approval queue before the turn (#571): a
-                    // session runs one turn at a time (a second prompt is a
-                    // 409), so an entry of this session newer than the mark
-                    // was queued by THIS turn.
-                    let mark = state.approvals.mark();
                     match run_session_turn_detailed(
                         Arc::clone(&state.sessions),
                         id,
                         text,
                         &images,
                         observer,
+                        // The turn snapshots the queue once it holds the
+                        // session (#571); a session runs one turn at a time
+                        // (a second prompt is a 409 before any lookup), so
+                        // an entry of this session newer than the snapshot
+                        // was queued by THIS turn.
+                        Some(&state.approvals),
                     ) {
                         // A turn waiting for an approval is not a refusal
                         // (#571). A stop that queued nothing (a pre-tool hook
                         // denial) is one: nothing waits for a decision.
                         Ok(r) => {
-                            let approval = r.approval_tool.as_deref().and_then(|tool| {
-                                tole_cli::approvals::approval_required_body(
-                                    &state.approvals,
-                                    id,
-                                    tool,
-                                    mark,
-                                )
-                            });
+                            let approval = r.approval_tool.as_deref().zip(r.queue_mark).and_then(
+                                |(tool, mark)| {
+                                    tole_cli::approvals::approval_required_body(
+                                        &state.approvals,
+                                        id,
+                                        tool,
+                                        mark,
+                                    )
+                                },
+                            );
                             match (approval, r.text) {
                                 (Some(body), _) => (200, body),
                                 (None, Some(t)) => (200, json!({"stopReason": r.stop, "text": t})),

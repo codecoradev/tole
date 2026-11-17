@@ -168,21 +168,23 @@ impl ApprovalQueue {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let id = format!("apr-{:x}-{:x}{:x}", now_ms(), nonce, seq);
+        // The sequence number is taken under the entries lock, so sequence
+        // order is insertion order and `mark()` (which locks too) never
+        // sees a number whose entry is not in the Vec yet.
+        let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
         let entry_seq = self.seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-        self.entries
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .push(PendingApproval {
-                id: id.clone(),
-                session_id: session_id.to_string(),
-                tool: tool.to_string(),
-                description: description.to_string(),
-                fingerprint,
-                created_at_ms: now_ms(),
-                status: ApprovalStatus::Pending,
-                storage_path,
-                seq: entry_seq,
-            });
+        entries.push(PendingApproval {
+            id: id.clone(),
+            session_id: session_id.to_string(),
+            tool: tool.to_string(),
+            description: description.to_string(),
+            fingerprint,
+            created_at_ms: now_ms(),
+            status: ApprovalStatus::Pending,
+            storage_path,
+            seq: entry_seq,
+        });
+        drop(entries);
         id
     }
 
@@ -215,6 +217,7 @@ impl ApprovalQueue {
     /// The queue position now (#571): snapshot it before a turn, then ask
     /// [`Self::queued_since`] what that turn queued.
     pub fn mark(&self) -> u64 {
+        let _entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
         self.seq.load(std::sync::atomic::Ordering::SeqCst)
     }
 
@@ -570,5 +573,28 @@ mod tests {
         let b = approval_required_body(&q, "s1", "write_file", mark).unwrap();
         assert_eq!(b["approval"]["id"], own.as_str());
         assert_eq!(b["approval"]["sessionId"], "s1");
+    }
+
+    /// #571: under concurrent pushes sequence order is insertion order.
+    #[test]
+    fn sequence_order_is_insertion_order_under_concurrent_pushes() {
+        let q = std::sync::Arc::new(ApprovalQueue::default());
+        let handles: Vec<_> = (0..8)
+            .map(|t| {
+                let q = std::sync::Arc::clone(&q);
+                std::thread::spawn(move || {
+                    for _ in 0..50 {
+                        queue_one(&q, &format!("s{t}"), "write_file");
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let seqs: Vec<u64> = q.list(None).iter().map(|e| e.seq).collect();
+        assert_eq!(seqs.len(), 400);
+        assert!(seqs.windows(2).all(|w| w[0] < w[1]), "{seqs:?}");
+        assert_eq!(q.mark(), 400);
     }
 }
