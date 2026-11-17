@@ -9,9 +9,9 @@ event stream ship with #524, image upload and read with #558; see the UI epic #5
 
 ## The surface uteke-mobile consumes
 
-All routes live under `tole serve` (bearer-token auth on everything
-except `/health`; decisions revalidate per request; auth failures are
-rate-limited per source IP).
+All routes live under `tole serve` (bearer-token auth, or HTTP Basic with
+`--auth basic` (#742, "HTTP Basic auth" below), on everything except `/health`;
+decisions revalidate per request; auth failures are rate-limited per source IP).
 
 | Action | Route | Notes |
 |---|---|---|
@@ -136,9 +136,9 @@ several personas. `profile` is optional and a session without it is exactly as b
   profiles. An unknown name is a `400` that lists the defined names; a malformed name
   (not 1-64 chars of `a-z`, `0-9`, `_`, `-`) or a non-string value is a `400` that does
   not echo it; a profile that cannot be loaded (unreadable persona) is a `500`.
-  Selecting a profile needs the same bearer token as every route; there is no
-  per-profile authorization, so a token holder may pick any profile (#742 is the
-  auth-providers issue).
+  Selecting a profile needs the same credential as every route (the bearer token or,
+  with `--auth basic`, the Basic user); there is no per-profile authorization, so
+  whoever is authenticated may pick any profile.
 - **Allow list precedence** (the one of `--profile` on the CLI): an `--allow` flag of
   `tole serve` pins the daemon's list and the profile's is ignored, so a profile never
   widens it; otherwise a profile that sets `allow` replaces the daemon's config/env
@@ -260,12 +260,85 @@ curl -H "Authorization: Bearer $TOKEN" -o shot.png \
 
 ## Auth model
 
-The serve token **is approval authority** (see the threat model): a
+The serve credential, the token or the Basic password, **is approval authority**
+(see the threat model): a
 phone holding it can let code write to the box. Practical scoping until
 dedicated device tokens exist (#follow-up): run missions under a
 dedicated OS user, keep `--allow`/`--trust` minimal on the serve
 process, and treat the token as a revocable secret (rotate = restart
 serve).
+
+## HTTP Basic auth (#742, first slice)
+
+`tole serve --auth basic` authenticates with HTTP Basic instead of (or next to) the
+static bearer token. It is the small answer for one person with many devices:
+**one user, one password, no scopes, no identity bound to a session** (anyone who
+authenticates sees and resumes every session, as a token holder does). OIDC is a later,
+separate issue (#742 stays open for it); scopes (a read-only credential that cannot
+`POST`) are not built either, so every credential is full authority, approvals included.
+
+```sh
+# 1. Make the hash. The password is read from stdin (a terminal is asked twice,
+#    without echo, restored even on an error; a Ctrl-C at the prompt can leave echo off,
+#    `stty echo` repairs it); it is never an argument and is not printed. At least 8 characters.
+printf '%s' "$PASSWORD" | tole serve-hash > ~/.config/tole-serve.hash   # PBKDF2-HMAC-SHA256, 600000 iterations
+chmod 600 ~/.config/tole-serve.hash
+
+# 2. Serve it. Loopback bind, TLS at a reverse proxy in front.
+tole serve --auth basic --basic-user owner --basic-hash-file ~/.config/tole-serve.hash
+#    or: TOLE_SERVE_BASIC_USER=owner TOLE_SERVE_BASIC_HASH='$pbkdf2-sha256$...' tole serve --auth basic
+curl -u owner:"$PASSWORD" http://127.0.0.1:7801/sessions
+```
+
+- **The hash, never the password, is what the server holds.** Format
+  `$pbkdf2-sha256$i=<iterations>$<salt>$<hash>` (random 16-byte salt). It comes from
+  `--basic-hash-file` (a regular file, at most 4 KiB) or `TOLE_SERVE_BASIC_HASH`; there
+  is no hash flag, because a command-line value is readable by every local process. A
+  hash with fewer than 10000 iterations (or more than 10 million) is refused at start-up,
+  as is a plaintext password given where a hash belongs; no error repeats the value. The
+  hash is held as a secret by role (redacted at every egress sink, removed from children's
+  environments, like the token). Basic is not available from the config file: flags and
+  environment only, so a project config can never turn it on or change the user.
+  Rotating the password = make a new hash and restart.
+- **Hashing is deliberately slow** (PBKDF2, 600000 iterations by default, about a
+  tenth of a second). A header that verified is remembered for 5 minutes (keyed by its
+  SHA-256, in memory, at most 64; a failure is never remembered), so a client that sends
+  the header on every request pays once, not per request. An unauthenticated client can
+  still make the server hash, once per request, up to the per-IP limit below.
+- **One check for every route.** The bearer token and Basic go through the same
+  `Authenticator::check`, in the REST face (including the event stream, entries, images,
+  approvals, cron and the upload path), and in `--transport mcp`. Everything but `/health`
+  and the webhook routes is behind it. Webhooks (`POST /hooks/<route>`) keep their own
+  signature gate: a valid Basic header does not open one and a signature needs no Basic
+  credential. With `--auth basic` a bearer token that is set (`--token-file`,
+  `TOLE_SERVE_TOKEN`) keeps working next to it, for scripts; it is optional there. Without
+  `--auth basic` nothing changes: `--auth token` is the default, the token is required, and
+  a `401` carries no `WWW-Authenticate`.
+- **A `401` says nothing about which part was wrong.** A wrong user, a wrong password, a
+  malformed header and a missing header get the identical response: status `401`, the body
+  `{"error":"unauthorized"}` and `WWW-Authenticate: Basic realm="tole", charset="UTF-8"`
+  (the challenge only when Basic is on). The password hash is computed whether or not the
+  user matched, and compared in constant time (ring's `pbkdf2::verify`; the user name with
+  `ct_eq`), so the answer and its timing do not tell a wrong user from a wrong password.
+  A Basic credential longer than 512 bytes is refused before it is hashed.
+- **Failures are limited** per source IP, as for the token: 10 a minute, then `429` for
+  everything (the right password included, `/health` too) until the window rolls over. The
+  oversized-upload answer (`413`) is given only to a valid credential, as before. Behind a
+  reverse proxy every client has the proxy's address, so ten failures from anywhere lock out
+  everyone for a minute; tole does not read `X-Forwarded-For`. Rate-limit at the proxy as well.
+- **TLS is not served here.** Basic puts the password in every request, so over plain
+  HTTP it is readable by anyone on the path, and the password may be one you use elsewhere
+  (the token at least is single-purpose). Keep the default loopback bind and terminate TLS at
+  a reverse proxy on the same host. `--auth basic` with a non-loopback `--bind` is
+  **refused** unless `--allow-insecure-basic` says TLS ends in front of this server (a
+  container that must bind `0.0.0.0` behind its proxy, say). The static token does not have
+  this refusal (unchanged).
+- **Credentials are never logged**: the server writes no request header anywhere, an error
+  names the flag or file and never a value, and the secret set covers the hash. The password
+  itself is never known to the server, only checked per request.
+- **Every approval still goes through the approval queue.** Basic authenticates the
+  client; it changes no approver, no risk class and no allow list. Whoever holds the
+  password can decide approvals, exactly as a token holder can.
 
 ## What lives where
 
