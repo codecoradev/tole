@@ -734,6 +734,25 @@ pub fn fallback_ledger_line(
     line
 }
 
+/// The audit line of the default flip's fallback (#748): the consumer
+/// `consumer` (`verify` or `turnend`) is `optional` only by default and ran
+/// WITHOUT a sandbox because the host has no backend, for `reason`. Kind
+/// `sandbox`, so no plugin fold reads it; a new line, never a change to an
+/// earlier one. Names and the reason only (one line, escapes, 300 chars).
+pub fn consumer_fallback_ledger_line(consumer: &str, reason: &str, at: u64) -> String {
+    let reason: String = crate::sanitize::sanitize_one_line(reason)
+        .chars()
+        .take(MAX_FALLBACK_REASON)
+        .collect();
+    let mut line = serde_json::json!({
+        "v": 1, "kind": "sandbox", "event": "sandbox_fallback", "consumer": consumer,
+        "default": true, "reason": reason, "at": at,
+    })
+    .to_string();
+    line.push('\n');
+    line
+}
+
 /// The audit line of one secret grant or revoke (`secret_grant`,
 /// `secret_revoke`): the secret's NAME, never a value.
 pub fn secret_ledger_line(event: &str, server: &str, secret: &str, at: u64) -> String {

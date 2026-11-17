@@ -46,6 +46,7 @@ fn ws() -> &'static PathBuf {
                 processes: 512,
                 file_size_mb: 64,
             },
+            ..Consumers::default()
         })
         .unwrap();
         // `-s base/out/lnk/../sessions` with lnk -> ws/a/b: the operating system

@@ -61,6 +61,7 @@ fn setup() -> &'static Setup {
                 processes: 512,
                 file_size_mb: 64,
             },
+            ..Consumers::default()
         })
         .unwrap();
         command::set_sessions_dir(ws.join("sessions")).unwrap();
