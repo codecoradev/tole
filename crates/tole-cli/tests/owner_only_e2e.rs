@@ -1,5 +1,5 @@
 //! #684 end-to-end with the REAL binary: the owner-only subcommands
-//! (`cron create|resume|edit`, `plugin approve`, `skills approve`,
+//! (`cron create|resume|edit`, `plugin approve`, `skills approve|adopt|recheckpoint`,
 //! `config trust`, `discuss start|resume`) refuse to write under a session (`TOLE_UNDER_SESSION`,
 //! or a child agent's `TOLE_AGENT_DEPTH`), and a human at a terminal keeps
 //! working. `CODECORA_HOME` is set on the CHILD only.
@@ -90,6 +90,9 @@ fn owner_commands() -> Vec<Vec<&'static str>> {
         vec!["skills", "drafts", "promote", "d-1", "--hash", "sha256:00"],
         vec!["skills", "drafts", "revoke", "s-1"],
         vec!["skills", "revoke", "evil"],
+        vec!["skills", "adopt", "--all"],
+        vec!["skills", "adopt", "evil"],
+        vec!["skills", "recheckpoint", "--sha256", "sha256:00"],
         vec!["config", "trust", "--yes"],
         vec![
             "delegation",
