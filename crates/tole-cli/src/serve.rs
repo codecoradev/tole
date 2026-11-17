@@ -44,7 +44,7 @@ use std::time::{Duration, Instant};
 
 use tole_cli::serve_support::profiles::{self, ProfileSource, SessionProfile};
 use tole_cli::session_host::{
-    lock_sessions, open_session_with, run_session_turn_with_images, SessionOverrides, Sessions,
+    lock_sessions, open_session_with, run_session_turn_detailed, SessionOverrides, Sessions,
     SharedSessions,
 };
 use tole_core::memory::MemoryConfig;
@@ -1809,17 +1809,31 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                     // stream is open on this session: with nobody watching the
                     // turn runs exactly as before streams existed.
                     let observer = state.buses.observer_for(id);
-                    match run_session_turn_with_images(
+                    match run_session_turn_detailed(
                         Arc::clone(&state.sessions),
                         id,
                         text,
                         &images,
                         observer,
                     ) {
-                        Ok((stop, Some(final_text))) => {
-                            (200, json!({"stopReason": stop, "text": final_text}))
+                        // A turn waiting for an approval is not a refusal
+                        // (#571): say so, with the queue row when it is
+                        // still pending (same shape as GET /approvals).
+                        Ok(r) if r.approval_tool.is_some() => {
+                            let tool = r.approval_tool.as_deref().unwrap_or_default();
+                            (
+                                200,
+                                tole_cli::approvals::approval_required_body(
+                                    &state.approvals,
+                                    id,
+                                    tool,
+                                ),
+                            )
                         }
-                        Ok((stop, None)) => (200, json!({"stopReason": stop})),
+                        Ok(r) => match r.text {
+                            Some(t) => (200, json!({"stopReason": r.stop, "text": t})),
+                            None => (200, json!({"stopReason": r.stop})),
+                        },
                         Err(e) if e.contains("session is busy") => (409, json!({"error": e})),
                         Err(e) => (500, json!({"error": e})),
                     }

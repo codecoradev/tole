@@ -205,6 +205,23 @@ impl ApprovalQueue {
             .map(|e| (e.session_id.clone(), e.tool.clone()))
     }
 
+    /// The pending entry a just-settled prompt of `session_id` stopped on
+    /// (#571): the newest Pending entry of THAT session for `tool`. The
+    /// session id is part of the key, so another session's approval is
+    /// never returned. `None` when it expired or was decided meanwhile.
+    pub fn pending_for(&self, session_id: &str, tool: &str) -> Option<PendingApproval> {
+        self.prune_expired();
+        self.entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .rev()
+            .find(|e| {
+                e.session_id == session_id && e.tool == tool && e.status == ApprovalStatus::Pending
+            })
+            .cloned()
+    }
+
     /// Apply an operator decision.
     pub fn decide(&self, id: &str, allow: bool) -> DecisionOutcome {
         self.prune_expired();
@@ -333,6 +350,21 @@ pub fn approval_json(e: &PendingApproval) -> Value {
     })
 }
 
+/// The `POST /sessions/{id}/prompt` body for a turn that stopped on an
+/// approval (#571): `stopReason: "approval_required"` plus the queue row
+/// (the `GET /approvals` shape) of THIS session's pending entry for
+/// `tool`. When no such entry is pending any more (expired, decided
+/// meanwhile, or a stop that never queued, such as a pre-tool hook
+/// denial) `approval` is omitted and the client falls back to
+/// `GET /approvals`.
+pub fn approval_required_body(queue: &ApprovalQueue, session_id: &str, tool: &str) -> Value {
+    let mut out = json!({"stopReason": "approval_required"});
+    if let Some(e) = queue.pending_for(session_id, tool) {
+        out["approval"] = approval_json(&e);
+    }
+    out
+}
+
 /// Thin std-only HTTP helper for the CLI consumer (tole serve speaks
 /// one-request-per-connection `Connection: close` — a raw TcpStream is
 /// the dependency-free client).
@@ -458,5 +490,53 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("https://"), "{msg}");
         assert!(msg.contains("plaintext"), "{msg}");
+    }
+
+    fn queue_one(q: &ApprovalQueue, session: &str, tool: &str) -> String {
+        q.queue_entry(session, tool, "d", 7, std::path::PathBuf::from("/x"))
+    }
+
+    /// #571: the body names the pending entry of the stopped session.
+    #[test]
+    fn approval_required_body_carries_the_pending_row() {
+        let q = ApprovalQueue::default();
+        let id = queue_one(&q, "s1", "write_file");
+        let b = approval_required_body(&q, "s1", "write_file");
+        assert_eq!(b["stopReason"], "approval_required");
+        assert_eq!(b["approval"]["id"], id.as_str());
+        assert_eq!(b["approval"]["tool"], "write_file");
+        assert_eq!(b["approval"]["status"], "pending");
+    }
+
+    /// #571: queue entry gone (empty queue, or already decided) -> still
+    /// `approval_required`, no `approval` key.
+    #[test]
+    fn approval_required_body_without_a_pending_entry_omits_approval() {
+        let q = ApprovalQueue::default();
+        let b = approval_required_body(&q, "s1", "write_file");
+        assert_eq!(b["stopReason"], "approval_required");
+        assert!(b.get("approval").is_none(), "{b}");
+        let id = queue_one(&q, "s1", "write_file");
+        q.decide(&id, false);
+        let b = approval_required_body(&q, "s1", "write_file");
+        assert_eq!(b["stopReason"], "approval_required");
+        assert!(b.get("approval").is_none(), "{b}");
+    }
+
+    /// #571: another session's (or another tool's) pending approval is
+    /// never returned, and the newest pending entry of the session wins.
+    #[test]
+    fn approval_required_body_never_leaks_other_sessions() {
+        let q = ApprovalQueue::default();
+        queue_one(&q, "other", "write_file");
+        queue_one(&q, "s1", "edit_file");
+        let b = approval_required_body(&q, "s1", "write_file");
+        assert!(b.get("approval").is_none(), "{b}");
+        let old = queue_one(&q, "s1", "write_file");
+        let new = queue_one(&q, "s1", "write_file");
+        let b = approval_required_body(&q, "s1", "write_file");
+        assert_ne!(old, new);
+        assert_eq!(b["approval"]["id"], new.as_str());
+        assert_eq!(b["approval"]["sessionId"], "s1");
     }
 }

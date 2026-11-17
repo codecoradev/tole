@@ -21,6 +21,7 @@ decisions revalidate per request; auth failures are rate-limited per source IP).
 | **Pending approvals** | `GET /approvals` | queue entries: id, session, tool, status; expires to denied after 15 min |
 | **Approve / deny** | `POST /approvals/{id}/decision` `{"decision":"allow"\|"deny"}` | allow = one-shot for exactly that (session, tool+input) + automatic resume; deny = recorded verdict |
 | **Delegated children's approvals** | `GET /approvals` (entries with `source: "delegation"`), `POST /approvals/dap-…/decision` `{"decision":"allow","confirm":"<the same id>"\|"deny","fingerprint"?}` (#714) | the durable queue of delegated children, next to the list above: id, goal, node, tool, target, redacted `display`, age, seconds left, `fingerprint`, the `chain` of levels, and `text` (the whole request fenced as data, as `tole delegation approvals show` prints it). The same bearer token as every route. `allow` must repeat the id as `confirm` (no id, prefix or pattern means "all": `400`); only a pending request is decided (`409` with the reason for an expired, consumed, already decided or settled one, `404` unknown); the decision is bound to the request's fingerprint and recorded `via: serve`; the server refuses (`403`) when it runs under an agent session. No session is resumed (the child is already waiting). Requests exist only when `[delegation] approvals` is on |
+| Prompt stops for an approval | `POST /sessions/{id}/prompt` answers `200 {"stopReason":"approval_required","approval":{"id","tool","status":"pending",…}}` (#571) | the `approval` row is the `GET /approvals` row of THIS session's pending entry (its `id` is what `POST /approvals/{id}/decision` takes); when no entry is pending any more (expired, decided meanwhile, or a stop that never queued, such as a pre-tool hook denial) `approval` is omitted: fall back to `GET /approvals?session=<id>`. Other stops keep `refusal` (stop gate, unknown tool, provider failure, loop); ACP and the MCP session tool keep their own vocabulary (`refusal`) |
 | Cancel a turn | `POST /sessions/{id}/cancel` (#178) | the turn settles `cancelled`, durably |
 | Steer a turn | `POST /sessions/{id}/interrupt` `{text, urgent?}` (#377) | `202` queued; delivered at the turn's next safe point (after the running tool, before the next model call) as an attributed user-role entry, nothing is lost. `urgent` also withdraws a tool call that has not started. `409` when no turn is running, `400` for blank/oversized text or a full queue (16 pending) |
 | Detach a turn | `POST /sessions/{id}/detach` (#217) | `202`; the running tool settles, the turn ends `detached` (resumable) and background jobs keep running, nudging the session when they finish. `409` when no turn is running |
@@ -35,6 +36,9 @@ decisions revalidate per request; auth failures are rate-limited per source IP).
 
 The round trip the app must support (the cross-repo acceptance):
 
+0. A prompt that stops on a Write answers `stopReason: "approval_required"` with the
+   pending row (#571): show the panel from that row, no poll needed. A client that was
+   offline when the request was queued still finds it with step 1.
 1. `GET /approvals` on a poll interval (the push-channel decision —
    ntfy/UnifiedPush vs FCM — belongs to uteke-mobile; tole exposes no
    push endpoint by design, see the threat model).

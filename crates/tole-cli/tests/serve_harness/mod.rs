@@ -153,7 +153,9 @@ impl Drop for Serve {
 
 /// Provider mock: answers every call with a short final text; a request
 /// mentioning "slow" is answered after `slow_ms`; a conversation with
-/// "TOOL_MISSION" asks for a `write_file` (needs approval).
+/// "TOOL_MISSION" asks for a `write_file` (needs approval). #571 outcome
+/// triggers: "UNKNOWN_TOOL" asks for an unregistered tool, "LOOP_TOOL"
+/// repeats one identical read-only call, "PROVIDER_FAIL" answers HTTP 400.
 pub fn spawn_mock(slow_ms: u64) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -192,8 +194,29 @@ pub fn spawn_mock(slow_ms: u64) -> String {
                 // follows the last user message (after a denial the last user
                 // message is the denial note, so the call is repeated for the
                 // approved replay, then answered once a result is in).
-                let wants_tool = !has_tool_result && body.to_string().contains("TOOL_MISSION");
-                let tool_args = "{\"path\":\"approved.txt\",\"content\":\"remote ok\"}";
+                let all = body.to_string();
+                let (tool_name, tool_args, wants_tool) = if all.contains("UNKNOWN_TOOL") {
+                    ("no_such_tool", "{}", true)
+                } else if all.contains("LOOP_TOOL") {
+                    ("read_file", "{\"path\":\"loop.txt\"}", true)
+                } else {
+                    (
+                        "write_file",
+                        "{\"path\":\"approved.txt\",\"content\":\"remote ok\"}",
+                        !has_tool_result && all.contains("TOOL_MISSION"),
+                    )
+                };
+                if all.contains("PROVIDER_FAIL") {
+                    let data = "{\"error\":{\"message\":\"scripted failure\"}}";
+                    let _ = s.write_all(
+                        format!(
+                            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{data}",
+                            data.len()
+                        )
+                        .as_bytes(),
+                    );
+                    return;
+                }
                 let resp = if streamed {
                     let mut out = String::new();
                     if wants_tool {
@@ -201,7 +224,7 @@ pub fn spawn_mock(slow_ms: u64) -> String {
                             "data: {}\n\n",
                             json!({"choices": [{"index": 0, "delta": {"tool_calls": [
                                 {"index": 0, "id": "call_1", "function": {
-                                    "name": "write_file", "arguments": tool_args}}]},
+                                    "name": tool_name, "arguments": tool_args}}]},
                                 "finish_reason": null}]})
                         ));
                     } else {
@@ -224,7 +247,7 @@ pub fn spawn_mock(slow_ms: u64) -> String {
                     let message = if wants_tool {
                         json!({"role": "assistant", "content": null,
                             "tool_calls": [{"id": "call_1", "type": "function",
-                                "function": {"name": "write_file", "arguments": tool_args}}]})
+                                "function": {"name": tool_name, "arguments": tool_args}}]})
                     } else {
                         json!({"role": "assistant", "content": text})
                     };
