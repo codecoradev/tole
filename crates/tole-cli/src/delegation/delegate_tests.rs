@@ -8,9 +8,100 @@ use tole_core::storage::{Commit, JsonlStorage, Storage as _, UsageRecord};
 use crate::test_dir::TestDir;
 
 /// A workspace root whose detached children (the fake tole shells below)
-/// are killed before it is removed: their command line holds the root, and
-/// one that starts late would otherwise write into a directory that is gone.
+/// are gone before it is removed. Their command line holds the root, and a
+/// child that outlives the removal writes into a directory that is gone:
+/// `mkdir -p` re-creates it (#897).
+///
+/// `kill -9` only queues the signal: a child that is inside a syscall (the
+/// `mkdir` of the script, in the `D` state under load) finishes that syscall
+/// first, so it can still create the root after a test has removed it and
+/// after a single `pkill` has returned. So the drop kills until no process
+/// names the root any more, and only then lets [`TestDir`] remove it; what a
+/// dying child created in the meantime goes with it.
 struct Root(TestDir);
+
+impl Root {
+    /// Kills every process whose command line holds the root and returns
+    /// once none is left (false after the bound, which is only a guard
+    /// against a process that cannot be killed).
+    fn reap_children(&self) -> bool {
+        let pattern = ere_literal(self.0.path());
+        let mut warned = false;
+        crate::test_dir::poll_until(crate::test_dir::WAIT, || {
+            match holders(&pattern) {
+                Ok(false) => return Some(()),
+                Ok(true) => {}
+                Err(e) => {
+                    if !std::mem::replace(&mut warned, true) {
+                        eprintln!(
+                            "delegate tests: cannot look for children of the root: {e} (#897)"
+                        );
+                    }
+                    return Some(());
+                }
+            }
+            let _ = std::process::Command::new("pkill")
+                .args(["-9", "-f", "--"])
+                .arg(&pattern)
+                .stderr(std::process::Stdio::null())
+                .status();
+            None
+        })
+        .is_some()
+    }
+}
+
+/// `path` as an extended regular expression that matches exactly that text:
+/// `pgrep -f` and `pkill -f` take a regex, and a temp dir with `(`, `[`, `+`
+/// or `.` in its name would otherwise fail to compile or match something else.
+fn ere_literal(path: &Path) -> String {
+    let mut out = String::new();
+    for c in path.to_string_lossy().chars() {
+        if "\\.[](){}*+?^$|".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Does a live process have `pattern` (an ERE) in its command line? A
+/// missing `pgrep` counts as "no" (the old behavior); an exit code of 2 or
+/// more (bad pattern, error) is an `Err`, not a silent "no".
+fn holders(pattern: &str) -> Result<bool, String> {
+    match std::process::Command::new("pgrep")
+        .args(["-f", "--"])
+        .arg(pattern)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+    {
+        Ok(st) => match st.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            other => Err(format!("pgrep exited with {other:?} for {pattern}")),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("pgrep: {e}")),
+    }
+}
+
+#[test]
+fn a_root_with_regex_metacharacters_is_still_found_and_killed() {
+    let dir = tmp("re(g[e]x+.)");
+    let pattern = ere_literal(&dir);
+    let mut child = std::process::Command::new("sh")
+        .args(["-c", "sleep 60", "sh"])
+        .arg(&*dir)
+        .spawn()
+        .unwrap();
+    // `spawn` returns after the exec, so the command line is in place.
+    assert_eq!(holders(&pattern), Ok(true), "the process is not found");
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert_eq!(holders(&pattern), Ok(false), "the process is still found");
+    assert!(dir.reap_children());
+}
 
 impl std::ops::Deref for Root {
     type Target = Path;
@@ -27,11 +118,13 @@ impl AsRef<Path> for Root {
 
 impl Drop for Root {
     fn drop(&mut self) {
-        let _ = std::process::Command::new("pkill")
-            .args(["-9", "-f"])
-            .arg(self.0.path())
-            .stderr(std::process::Stdio::null())
-            .status();
+        if !self.reap_children() {
+            eprintln!(
+                "delegate tests: a child of {} survived kill -9; it may recreate the \
+                 directory and the #781 leak check may follow (#897)",
+                self.0.path().display()
+            );
+        }
     }
 }
 
