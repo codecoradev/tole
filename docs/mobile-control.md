@@ -170,7 +170,7 @@ Two kinds of frames, deliberately separate:
 | Kind | `event:` | `id:` | Replayable | Data |
 |---|---|---|---|---|
 | **Durable** | `entry` | the entry's `seq` | yes | the log entry exactly as `GET …/entries` returns it |
-| Marker | `ready` | none | no | `{id, after, lastSeq, busy}`, sent once the replay is complete |
+| Marker | `ready` | none | no | `{id, after, lastSeq, busy}`, sent once the replay is complete (withheld while the log cannot be read, so `ready` always follows the full replay) |
 | Ephemeral | `text_delta`, `reasoning` | none | no | `{text}` |
 | Ephemeral | `tool_started` | none | no | `{tool, input}` |
 | Ephemeral | `tool_finished` | none | no | `{tool, ok, preview}` |

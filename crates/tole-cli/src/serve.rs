@@ -883,6 +883,7 @@ fn serve_events(
     let mut tail = EntryTail::new(path, after);
     let mut approvals = ApprovalWatch::default();
     let mut ready_sent = false;
+    let mut replay_err_logged = false;
     let mut hb = Heartbeat::new(
         tole_cli::events::heartbeat_interval(
             std::env::var(tole_cli::events::HEARTBEAT_ENV)
@@ -912,16 +913,32 @@ fn serve_events(
                 Some(_) => hb.note_write(Instant::now()),
             }
         }
-        // Durable frames (a transient read error just retries).
-        if let Ok(entries) = tail.poll() {
-            for e in entries {
-                if !write_all(&mut stream, &entry_frame(&e)) {
-                    return;
+        // Durable frames (a read error just retries on the next pass).
+        let polled = match tail.poll() {
+            Ok(entries) => {
+                for e in entries {
+                    if !write_all(&mut stream, &entry_frame(&e)) {
+                        return;
+                    }
+                    hb.note_write(Instant::now());
                 }
-                hb.note_write(Instant::now());
+                true
             }
-        }
-        if !ready_sent {
+            Err(kind) => {
+                // Once per stream, kind only (no path), so a recurrence is
+                // diagnosable without a line every 150 ms pass.
+                if !replay_err_logged {
+                    replay_err_logged = true;
+                    eprintln!("tole serve: event stream replay could not read the log ({kind})");
+                }
+                false
+            }
+        };
+        // `ready` says the replay is complete, so it waits for a pass that
+        // actually read the log: after a failed read it would announce an
+        // empty replay and a client resuming from `after` would lose every
+        // entry it missed (lossless replay is the point of the log).
+        if !ready_sent && polled {
             ready_sent = true;
             let ready = frame(
                 "ready",
