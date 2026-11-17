@@ -801,6 +801,7 @@ fn serve_events(
     let mut tail = EntryTail::new(path, after);
     let mut approvals = ApprovalWatch::default();
     let mut ready_sent = false;
+    let mut replay_err_logged = false;
     let mut hb = Heartbeat::new(
         tole_cli::events::heartbeat_interval(
             std::env::var(tole_cli::events::HEARTBEAT_ENV)
@@ -841,7 +842,15 @@ fn serve_events(
                 }
                 true
             }
-            Err(_) => false,
+            Err(kind) => {
+                // Once per stream, kind only (no path), so a recurrence is
+                // diagnosable without a line every 150 ms pass.
+                if !replay_err_logged {
+                    replay_err_logged = true;
+                    eprintln!("tole serve: event stream replay could not read the log ({kind})");
+                }
+                false
+            }
         };
         // `ready` says the replay is complete, so it waits for a pass that
         // actually read the log: after a failed read it would announce an

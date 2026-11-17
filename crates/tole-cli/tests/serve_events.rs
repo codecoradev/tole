@@ -188,8 +188,8 @@ fn ready_waits_for_a_replay_that_could_not_read_the_log() {
     // (A bounded look at silence, like the one after `ready` above.)
     let early = sse.next(Duration::from_millis(500));
     assert!(
-        early.as_ref().is_none_or(|f| f.event != "ready"),
-        "ready before the replay could read the log: {early:?}"
+        early.is_none(),
+        "no frame may arrive while the replay cannot read the log: {early:?}"
     );
     std::fs::rename(&away, &file).unwrap();
     let frames = sse.until(WAIT, |f| f.event == "ready");
