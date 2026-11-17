@@ -228,14 +228,25 @@ two `webhook:` targets sends the same id to both destinations.
   outside both locks; the sender never sees an event that was not enqueued.
   - **Crash gap and reconcile.** A crash after `Done` is recorded but before
     `enqueue_cron` loses the event with no row. A **reconcile pass** closes it:
-    every 5 min the sender (and the draining `tole cron tick`) scans the fires
-    that settled in the last 6 h (a short read of the ledger fold) whose job has
-    a webhook target and for which neither an outbox `enqueue` for that
-    (destination, id) nor a terminal `delivery` row exists, and enqueues them.
-    Because the id is deterministic and `enqueue` skips an existing
-    (destination, id), the pass is idempotent. Window bounded by the 6 h
-    deadline: a run older than that is not announced, and `tole cron runs` still
-    shows it.
+    in `tole serve` every 5 min, and at the end of every `tole cron tick` that
+    drains (so it also runs in short-lived ticks), it scans the fires that settled
+    in the last 6 h (the ledger fold the tick already has) whose job has a webhook
+    target and which have **neither** an outbox `enqueue` for that (destination,
+    id) **nor a terminal `delivery` row**. A ledger row of any status, including
+    `skipped` (a silent run, empty `ok` output), is terminal: otherwise silent
+    runs would be re-enqueued every 5 min for 6 h and notify against the silent
+    rule. Mechanics, because `enqueue_cron` takes `outbox.lock` blocking on its
+    own file descriptor (flock on a second descriptor in the same process would
+    self-deadlock): the pass first **collects candidates** (ledger fold, then one
+    outbox fold, no lock held), releases everything, and then calls `enqueue_cron`
+    for each candidate; `enqueue_cron` does the check-then-append **atomically
+    under the outbox lock** (it re-reads the bytes appended since the pass's fold
+    and skips an existing (destination, id)). The pass is therefore idempotent
+    and never holds the lock while calling it. Cost: the ledger fold already
+    done under `jobs.lock` plus one outbox fold (see Growth). The same pass also
+    covers the opposite gap (N10 below): an outbox `done`/`dead` with no ledger
+    row gets its row written. A run older than 6 h is not announced; `tole cron
+    runs` still shows it.
 - **The sender.** One long-lived thread per `tole serve` process, started next
   to `serve_ticker` (`serve.rs`, ~187) **whether or not `--cron` is given**: a
   serve without `--cron` still needs it for approval events. ureq is blocking
@@ -243,11 +254,12 @@ two `webhook:` targets sends the same id to both destinations.
   approval timer of §8.
 - **Cron events: a durable outbox, which the sender treats as untrusted input.**
   `<cron dir>/outbox.jsonl`: append-only JSONL, mode 0600, one line per
-  `enqueue` (destination, id, the redacted body once, deadline), `attempt`
-  (destination, id, n, at, outcome code, **next_attempt_at**, lease), `done`,
-  `dead`. Every line after `enqueue` is keyed by **(destination, id)**, never by
-  id alone. The body is
-  stored once so every attempt is byte-identical. State survives restart:
+  `enqueue` (destination, id, the redacted body once, deadline), `lease`
+  (destination, id, at, `lease_until`), `attempt` (destination, id, **n**, at,
+  outcome code, **next_attempt_at**: a result line), `done`, `dead`. Every line
+  after `enqueue` is keyed by **(destination, id)**, never by id alone. The
+  attempt number `n` is counted **only on `attempt` result lines**, never on
+  leases. The body is stored once so every attempt is byte-identical. State survives restart:
   attempt count and next-attempt time are in the file, and the startup fold
   resumes them (pending = enqueued, no `done`/`dead`, before its deadline).
   - *Trust.* 0600 does not stop the same user's interactive agent whose
@@ -273,38 +285,65 @@ two `webhook:` targets sends the same id to both destinations.
     One lock, **`<cron dir>/outbox.lock`**, an advisory file lock (`std::fs::File`
     locks, released by the OS when the process dies, so there is no stale lock):
     - **Every append** (cron tick, serve, `resume_parked`, the sender's own
-      `attempt`/`done`/`dead` lines) takes it **blocking** (`lock()`, as
+      `lease`/`attempt`/`done`/`dead` lines) takes it **blocking** (`lock()`, as
       `with_lock` does on `jobs.lock`, `delegation/ledger_file.rs` ~133) for the
-      short append only.
+      short append only. **Torn tail:** with several append-only writers, a
+      crash mid-append can leave a last line without `\n`, and the next writer's
+      line would be glued onto it. Under the lock, before appending, the writer
+      checks that the file's last byte is `\n` and, if not, writes `\n` first;
+      the fold counts the fragment as one `bad_line` and goes on.
     - **A drain pass** takes it with **`try_lock()`** (as `session/storage.rs`
       ~1121 does) **per pass, not for its lifetime**: under the lock it reads the
-      tail, selects due events and appends a **lease** (`attempt` line with
-      `lease_until = now + timeout + 5 s`) for each, then releases it. Network I/O
-      happens **without any lock**; the result is appended afterwards under a short
-      blocking lock. Another drainer skips leased events. A process that dies
-      mid-request leaves a lease that simply expires; the event is then sent
-      again. A pass that does not get the lock does nothing.
+      tail, selects **one** due event per destination and appends a `lease` line
+      (`lease_until = now + the destination's timeout_secs + 5 s`), then releases
+      it. Network I/O happens **without any lock**; the `attempt` result line is
+      appended afterwards under a short blocking lock, and only then is the next
+      event of that destination leased. Leasing one at a time keeps a lease from
+      expiring while its event waits behind others. Immediately before sending,
+      the drainer **re-checks that its own lease is still valid** (`now <
+      lease_until`); if not, it re-leases or skips. Another drainer skips leased
+      events. A pass that does not get the lock does nothing.
+    - **Clock and crashes.** Leases use the wall clock. A backward jump is bounded
+      by the fold's cap on far-future leases (below); a crash between a lease and
+      its result leaves the event stuck for at most the largest timeout + 5 s, then
+      it is retried.
     - **Lock order.** The outbox lock and the ledger lock (`jobs.lock`) are
       **never nested**: no path holds one while taking the other (producers
       append after the tick's settle section has released the ledger lock; the
       sender appends its ledger row after releasing the outbox lock), so there is
       no order to invert.
     - Leases narrow double sends; they do not make delivery exactly-once (an
-      expired lease, a lost 2xx, or a send racing a restart can repeat an event).
+      expired lease, a lost 2xx, or a send racing a restart can repeat an event;
+      the receiver dedupes on (destination, id)).
+    - **Fold hardening.** The fold ignores a `lease` whose `lease_until` is more
+      than now + timeout + 5 s + 60 s of skew ahead, and ignores any `lease`,
+      `attempt`, `done` or `dead` line with no prior `enqueue` for that
+      (destination, id). Forged `done`/`dead` lines or a far-future lease are an
+      **availability** attack by the same account, inside the accepted residual of
+      the same-account threat model (above); these two rules are the cheap
+      hardening, not a defence.
   - *Bounds.* The in-memory window is 256 pending events per destination
     (id, file offset, next-attempt time); the rest stay on disk and are loaded as
     slots free, so cron events are not dropped at 256. The file side is bounded
     at **10 000** pending events per destination: past that the new event is
     refused by the producer, which records ledger `failed` / `queue_full`.
-  - *Growth, no compaction in v1.* One `enqueue`, up to ~75 `attempt` lines (see
-    Retry, plus leases) and one terminal line per event. The file is **never
-    rewritten, renamed or truncated**: compaction was considered and dropped,
-    because a line appended by another process between the compactor's read and
-    the rename would land in the old inode and be lost, breaking the durable
-    at-least-once claim. With no rewrite the outbox is **append-only**, as
-    `AGENTS.md` section 6 asks of storage. Growth is a documented residual risk
-    in the threat model (like `hook_seen` and the ledger); the 10 000-pending cap
-    and a doctor warning on the file size (over 64 MiB) stay.
+  - *Growth, no compaction, no checkpoint in v1.* One `enqueue` per event, and per
+    attempt one `lease` and one `attempt` line, plus a terminal line (about 150
+    lines for an event that retries for the whole 6 h, typically 3). The file is
+    **never rewritten, renamed or truncated**: compaction was dropped, because a
+    line appended by another process between the compactor's read and the rename
+    would land in the old inode and be lost. With no rewrite the outbox is
+    **append-only**, as `AGENTS.md` section 6 asks of storage. **Cost:** every
+    fold, including each `tole cron tick` (about once a minute), reads the whole
+    file: O(file size). It is bounded by a **hard cap of 64 MiB**: past it the
+    producer refuses new events (ledger `failed`, `queue_full`) and `tole doctor`
+    errors; below it, doctor warns from 32 MiB. A persisted checkpoint offset
+    (a cache file the fold resumes from, with a full fold as the fallback when it
+    is lost or corrupt) would remove the O(file) cost, but it adds a second file
+    and a staleness rule to a path already carrying a lock protocol, so it is
+    **not in v1** and is an owner question (section 10, item 12). Growth is a
+    documented residual risk in the threat model (like `hook_seen` and the
+    ledger). With nothing pending, the owner may move the file aside.
 - **Approval events: volatile.** `ApprovalQueue` is in memory: after a serve
   restart every pending approval is gone (denied), so replaying
   `approval_requested` would announce something that cannot be decided. Events
@@ -315,9 +354,10 @@ two `webhook:` targets sends the same id to both destinations.
   failure, timeout, 5xx, 408, 429. **No retry** on another 4xx (the receiver
   understood and refused), on a 3xx (redirects are never followed), on a
   response over the size cap, and on an address the policy refuses.
-  - `cron_run_finished`: waits 2 s, 10 s, 30 s, 2 min, then **5 min steps**
-    (each +/- 20 % jitter) until the 6 h deadline (about 75 attempts at most;
-    one request in flight per destination, so the cost is small). `Retry-After`
+  - `cron_run_finished`: waits 2 s, 10 s, 30 s, 2 min between the first
+    five attempts (about 2.7 min in all), then **5 min steps** (each +/- 20 %
+    jitter) until the 6 h deadline: about 71 more, so at most about 76 `attempt`
+    results (one request in flight per destination, so the cost is small). `Retry-After`
     on 429/503 is honoured, capped at 10 min. Deadline passed: `dead:expired`.
     The 24 h dedupe horizon the receiver keeps (section 3) is longer than the
     6 h deadline plus the 300 s window, so a late retry is still recognised.
@@ -338,7 +378,10 @@ two `webhook:` targets sends the same id to both destinations.
   when recording (they call `enqueue_cron` instead) and record **nothing at
   enqueue**; the sender writes the terminal row later (`l.deliver(fire_id,
   "webhook:<name>", sent | failed, code, now)`, under the ledger lock, from any
-  process). The row's `attempt` is therefore 1; the real number of HTTP
+  process). A crash between the outbox `done` and this ledger row would lose the row, so the
+  reconcile pass writes it from the outbox's terminal line (known gap
+  otherwise: `tole cron runs` would show nothing for that run). The row's
+  `attempt` is therefore 1; the real number of HTTP
   attempts lives in the outbox, not in the ledger. `tole cron runs` shows the
   target as `webhook:<name>` and, until the terminal row exists, nothing for it
   (a delivery in flight is visible in `tole doctor`, not in the ledger). `error`
@@ -380,7 +423,8 @@ two `webhook:` targets sends the same id to both destinations.
   break literal constructors. `web_fetch` behaves as today (`allow_private` and
   `TOLE_WEB_ALLOW_PRIVATE` map to both flags true). **`TOLE_WEB_ALLOW_PRIVATE`
   is ignored for webhook destinations** (it is read where
-  `fetch_agent_vetted` builds the resolver, `web.rs` ~258): the policy is
+  `fetch_agent_vetted` builds the resolver, `web.rs` ~258, in
+  `allow_private_from_env` ~304 and in the backend fetch tool ~1171): the policy is
   per destination, from the user config, and nothing in the environment can
   widen it. The env proxy stays off: through a proxy the resolver only
   vets the proxy host (the cora finding already recorded in `vetted_config`).
@@ -461,7 +505,7 @@ two `webhook:` targets sends the same id to both destinations.
 | Replay of a captured delivery | Within 300 s the same `v2` message verifies; after, the timestamp fails. A relabelled event or another destination fails the signature (event, id and destination are signed). | v2 scheme, receiver duty (window + dedupe on `id` for 24 h). A replay alone cannot grant an approval: decisions only arrive on serve with its own credential. |
 | Secret leakage through retries or the outbox | The destination secret is a role secret, so it is redacted wherever it appears; the outbox stores the already-redacted body only (0600); retries re-sign, they never re-serialize. A value added to the secret set **after** enqueue is not re-redacted in a stored body. | `add_role_secret`; redact before storing; no URL, header or response in the ledger, logs or doctor; leak check (§9). |
 | Log injection (receiver-controlled text into tole logs) | None: response bytes never reach a log; ledger `error` is a fixed code from a closed set; stderr lines use the destination name (charset-restricted) and the same code. | Closed error vocabulary. |
-| Flooding the receiver / being flooded by our own events | Bounded: one request in flight per destination; cron events 256 in memory and 10 000 pending on disk per destination, about 75 attempts each over 6 h; approval events 256 in memory, at most 5 attempts and never past their 900 s expiry. | Queue bounds, `queue_full` record by the producer, doctor warning. |
+| Flooding the receiver / being flooded by our own events | Bounded: one request in flight per destination; cron events 256 in memory and 10 000 pending on disk per destination, about 76 attempts each over 6 h; approval events 256 in memory, at most 5 attempts and never past their 900 s expiry. | Queue bounds, `queue_full` record by the producer, doctor warning. |
 | Tampered outbox (an interactive agent or other process of the same user appends or edits lines) | Could make the sender sign a forged event. Cannot reach a destination the config does not name, an event type the destination does not list, or an oversized or malformed body. Can still add a well-formed event for a configured destination (the same account can edit the user config). | Sender re-validates every line before signing (section 4, Trust); 0600 only as a first layer; residual stated. |
 | A notification mistaken for authority | A webhook can say "approval X is pending"; nothing in it executes or grants. | §8. |
 | Destination secret reused as inbound hook key | Cross-protocol confusion. | Loader refuses a destination whose key equals any `[hooks.*]` key held in the process; docs say one secret per purpose. |
@@ -530,8 +574,10 @@ address, distinct errors for policy refusal and DNS failure); redirect refused;
 response over 4 KiB; retry schedule, `Retry-After` cap, 4xx no-retry, deadline
 expiry (injected clock); outbox fold (torn tail, resume with attempt count,
 done/dead, expired, oversized line, a line failing each validation rule of
-section 4, leases, two destinations for one fire id, the reconcile pass); two-process append and drain with a lock race; queue bounds; `prune_expired` returning full clones and
-`decide` reporting `transitioned`.
+section 4, leases, a far-future lease, a torn tail followed by an append, two
+destinations for one fire id, the reconcile pass including a `skipped` run);
+two-process append and drain with a lock race; queue bounds and the 64 MiB cap;
+`prune_expired` returning full clones and `decide` reporting `transitioned`.
 
 **Real-binary e2e** (`crates/tole-cli/tests`, the built `./target/release/tole`,
 a receiver thread verifying the v2 signature with an independent
@@ -611,11 +657,11 @@ owner to overrule.
 4. **Agent-created jobs:** `allow_agent_jobs` stays false by default.
 5. **Plain http:** only for loopback (a literal loopback IP or `localhost`, with
    `allow_loopback`); no private-range http.
-6. **Outbox rotation:** none in v1; the growth is recorded as a residual risk
-   the file is append-only with no compaction (section 4) and a doctor warning on size.
+6. **Outbox rotation:** none in v1. The growth is recorded as a residual risk;
+   the file is append-only with no compaction and a hard 64 MiB cap (section 4).
 7. **Secret rotation:** a single secret per destination in v1.
-8. **`tole cron tick` drains for up to 20 s** under `outbox.lock` when no serve
-   does. Recommended.
+8. **`tole cron tick` drains for up to 20 s** when no serve does, taking
+   `outbox.lock` per pass only (section 4). Recommended.
 9. **Environment proxy:** off, as `web_fetch`.
 10. **Soon, not v1 core:** a `webhook_test` event with `tole webhook test
     <name>`, and a `cron_run_blocked` event for runs blocked before dispatch
@@ -623,3 +669,6 @@ owner to overrule.
     reserved; the `events` list rejects unknown names until they ship.
 11. **`GET /approvals` is unredacted** (section 6): redact `description` there
     too, as a separate small item before or with the approval PR. Recommended.
+12. **Outbox checkpoint.** Without one, every fold reads the whole file (up to the
+    64 MiB cap). Recommendation: not in v1; add a cache-only checkpoint offset
+    if real use gets near 32 MiB.
