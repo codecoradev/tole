@@ -64,9 +64,13 @@ workflow; the ecosystem-wide standards it follows live in the team knowledge roo
   subsystem. Cora Review reads the whole diff, and it is a merge gate. On
   recent PRs it took 12 to 14 minutes at +492/-22 and at +1366/-26 (Build and
   Test take 4 to 6), and the longest reviews ended with "Review could not
-  complete" (empty result), which is not a pass and costs a rerun. Docs and the
-  changelog still count toward what Cora reads (the config cannot exclude
-  them, see #705), so keep those short too.
+  complete" (empty result), which is not a pass and costs a rerun. Since cora
+  0.21 (#705) `review.exclude` in `.cora.yaml` removes `CHANGELOG.md`, `docs/`
+  and the lockfiles from the reviewed diff, and a diff above
+  `review.max_chunk_chars` is reviewed in chunks of whole files, so those
+  files no longer count toward the size; a review that did not cover the whole
+  diff now fails the job instead of passing. Keep the code part of a PR small
+  all the same.
 - Body sections, in order: **What / Why / Changes / Testing**. A PR without
   them fails the PR Description check.
 - Base every PR on `develop`. PRs into `main` are only accepted from
