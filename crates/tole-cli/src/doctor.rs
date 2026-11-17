@@ -887,8 +887,8 @@ pub fn run_cli(
             .sandbox
             .as_ref()
             .and_then(|s| s.consumers().ok())
-            .unwrap_or_default(),
-        _ => Default::default(),
+            .unwrap_or_else(tole_core::sandbox::command::Consumers::host_default),
+        _ => tole_core::sandbox::command::Consumers::host_default(),
     };
     let consumer_lines =
         tole_core::sandbox::command::doctor_lines(&consumers, &tole_core::sandbox::detect());

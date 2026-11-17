@@ -226,13 +226,21 @@ impl GitOp {
 
 /// Whether any command consumer (`run_command`, `job_start`, verify, stop
 /// gates, cron scripts and deliveries, and any added later) runs in the sandbox,
-/// which is when this tool hardens and vets (see the module doc).
+/// which is when this tool hardens and vets (see the module doc). A `verify` or
+/// `turnend` that is `optional` only by the default (#748) does not count: the
+/// default would otherwise turn the hooks-off hardening and the config vet on
+/// for every user of the `git` tool, who wrote nothing. The owner who writes
+/// `verify` or `turnend` (any value but `off`) gets them.
 fn consumers_on() -> bool {
-    use crate::sandbox::command::{consumers, Consumer};
-    let c = consumers();
+    consumers_on_for(&crate::sandbox::command::consumers())
+}
+
+/// [`consumers_on`] for the settings `c`.
+pub(crate) fn consumers_on_for(c: &crate::sandbox::command::Consumers) -> bool {
+    use crate::sandbox::command::Consumer;
     Consumer::ALL
         .iter()
-        .any(|k| c.mode(*k) != crate::sandbox::Mode::Off)
+        .any(|k| c.mode(*k) != crate::sandbox::Mode::Off && !c.implicit(*k))
 }
 
 /// The full argv after the program: the global `-c` options, then the op's
@@ -784,6 +792,45 @@ use git_default;
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// #748: the hooks-off hardening and the config vet follow a consumer the
+    /// owner WROTE. The implicit default of verify and turnend must not turn
+    /// them on for everyone (a direct test, so the guard does not hang on
+    /// unrelated e2e tests).
+    #[test]
+    fn the_default_flip_does_not_turn_the_git_hardening_on() {
+        use crate::sandbox::command::Consumers;
+        use crate::sandbox::Mode;
+        assert!(!consumers_on_for(&Consumers::default()));
+        assert!(!consumers_on_for(&Consumers::host_default()));
+        // Written: verify optional, turnend required, run_command, cron.
+        for c in [
+            Consumers {
+                verify: Mode::Optional,
+                ..Consumers::default()
+            },
+            Consumers {
+                turnend: Mode::Required,
+                ..Consumers::host_default()
+            },
+            Consumers {
+                run_command: Mode::Optional,
+                ..Consumers::host_default()
+            },
+            Consumers {
+                cron: Mode::Required,
+                ..Consumers::host_default()
+            },
+        ] {
+            assert!(consumers_on_for(&c), "{c:?}");
+        }
+        // Only `off` written for the two defaulted ones: still nothing on.
+        assert!(!consumers_on_for(&Consumers {
+            verify: Mode::Off,
+            turnend: Mode::Off,
+            ..Consumers::default()
+        }));
+    }
 
     #[test]
     fn classified_write() {

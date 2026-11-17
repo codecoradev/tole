@@ -67,6 +67,18 @@ fn project_raw(content: &str) -> (TestDir, TestDir) {
     (d, home)
 }
 
+/// A user config that opts `verify` and `turnend` out of the sandbox (#748:
+/// they are sandboxed by default now). For the tests that exercise config
+/// plumbing with a gate script outside the workspace, not the sandbox.
+fn gates_unsandboxed(home: &Path) {
+    std::fs::create_dir_all(home.join("tole")).unwrap();
+    std::fs::write(
+        home.join("tole/config.toml"),
+        "[sandbox.consumers]\nverify = \"off\"\nturnend = \"off\"\n",
+    )
+    .unwrap();
+}
+
 fn base_cmd(cwd: &Path, home: &Path, args: &[&str]) -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_tole"));
     c.args(args)
@@ -528,6 +540,7 @@ fn on_posttool_and_on_turnend_from_config_run() {
         end_hook.display(),
         end.display()
     ));
+    gates_unsandboxed(&home);
     let o = finish(with_provider(base_cmd(&d, &home, &["run", "go"]), &url));
     assert!(o.status.success(), "{}", text(&o.stderr));
     let requests = seen.lock().unwrap().len();
@@ -693,6 +706,7 @@ fn mission_verify_from_config_runs_and_the_flag_overrides_it() {
         "no_auto_mcp = true\n[mission]\nverify = \"touch {}\"\n",
         m_cfg.display()
     ));
+    gates_unsandboxed(&home);
     let o = finish(with_provider(
         base_cmd(&d, &home, &["mission", "goal"]),
         &url,
