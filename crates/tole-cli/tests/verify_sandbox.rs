@@ -825,3 +825,177 @@ fn a_sessions_dir_that_cannot_be_protected_refuses_the_verify() {
     assert!(!ws.join("verify-ran").exists(), "never ran");
     drop(dir);
 }
+
+// ---------------------------------------------------------------------------
+// #748: the default flip. With no `verify` / `turnend` key, the consumer is
+// `optional` BY DEFAULT: sandboxed where a backend works, a loud unsandboxed
+// run only where the host has none at all, and a refusal for everything else.
+// An explicit `optional` / `required` (above) never falls back.
+// ---------------------------------------------------------------------------
+
+/// The ledger line the fallback records (`<home>/tole/plugin-ledger.jsonl`).
+fn fallback_lines(home: &Path, consumer: &str) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(home.join("tole/plugin-ledger.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v["event"] == "sandbox_fallback" && v["consumer"] == consumer)
+        .collect()
+}
+
+/// A user config without the keys (an empty file, or only unrelated ones) is
+/// an existing config from before the flip: its verify is sandboxed now, with
+/// no file migrated. The command passes only when the protected writes fail.
+#[test]
+fn a_config_without_the_keys_sandboxes_verify_by_default() {
+    if !bwrap_works() {
+        return;
+    }
+    for (tag, cfg) in [
+        ("empty", ""),
+        ("unrelated", "[sandbox.consumers]\nrun_command = \"off\"\n"),
+    ] {
+        let (dir, ws, home) = project(&format!("dflt-{tag}"));
+        let cmd = "echo ok > made && ! (echo x > .git/hooks/pre-commit) 2>/dev/null \
+                   && ! (echo x > .tole/evil) 2>/dev/null";
+        let r = mission(&ws, &home, cfg, &path_env(), cmd);
+        assert_eq!(r.code, 0, "{tag}\n{}\n{}", r.stdout, r.stderr);
+        assert!(r.stdout.contains("status: complete"), "{tag}: {}", r.stdout);
+        assert!(
+            ws.join("made").exists(),
+            "{tag}: the workspace write worked"
+        );
+        assert!(!ws.join(".git/hooks/pre-commit").exists(), "{tag}");
+        assert!(
+            fallback_lines(&home, "verify").is_empty(),
+            "{tag}: no fallback"
+        );
+        drop(dir);
+    }
+}
+
+/// A host with no backend at all: the default runs the command unsandboxed,
+/// says so on stderr and puts a `sandbox_fallback` line in the ledger. The
+/// mission completes (it is not refused, as an explicit `optional` is).
+#[test]
+fn the_default_verify_without_any_sandbox_runs_loudly_and_is_ledgered() {
+    let (dir, ws, home) = project("dflt-nosandbox");
+    let r = mission(
+        &ws,
+        &home,
+        "",
+        &path_without_bwrap(&dir),
+        "touch verify-ran",
+    );
+    assert_eq!(r.code, 0, "{}\n{}", r.stdout, r.stderr);
+    assert!(r.stdout.contains("status: complete"), "{}", r.stdout);
+    assert!(ws.join("verify-ran").exists(), "ran, unsandboxed");
+    assert!(
+        r.stderr.contains("WARNING: verify runs UNSANDBOXED")
+            && r.stderr.contains("optional by default")
+            && r.stderr.contains("sandbox.consumers.verify = \"off\""),
+        "{}",
+        r.stderr
+    );
+    let lines = fallback_lines(&home, "verify");
+    assert_eq!(lines.len(), 1, "one ledger line: {lines:?}");
+    assert_eq!(lines[0]["kind"], "sandbox");
+    assert_eq!(lines[0]["default"], true);
+    assert!(lines[0]["reason"].as_str().unwrap().contains("bwrap"));
+    // An explicit `off` is silent and records nothing.
+    let (dir2, ws2, home2) = project("dflt-nosandbox-off");
+    let r = mission(
+        &ws2,
+        &home2,
+        "[sandbox.consumers]\nverify = \"off\"\n",
+        &path_without_bwrap(&dir2),
+        "touch verify-ran",
+    );
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert!(!r.stderr.contains("UNSANDBOXED"), "{}", r.stderr);
+    assert!(fallback_lines(&home2, "verify").is_empty());
+    drop((dir, dir2));
+}
+
+/// The default degrades only for "no backend at all". A backend that exists
+/// and then fails (the self-test passes, the launch does not) is a refusal,
+/// as with `required`: fail closed when we could sandbox and something is wrong.
+#[test]
+fn the_default_verify_whose_launcher_fails_is_still_refused() {
+    for (tag, body, chmod) in [
+        (
+            "fails",
+            "echo 'bwrap: setting up uid map: denied' >&2; exit 1",
+            false,
+        ),
+        ("gone", "exit 1", true),
+    ] {
+        let (dir, ws, home) = project(&format!("dflt-launcher-{tag}"));
+        let path = path_with_fake_bwrap(&dir, body, chmod);
+        let r = mission(&ws, &home, "", &path, "touch verify-ran");
+        assert_ne!(r.code, 0, "{tag}\n{}\n{}", r.stdout, r.stderr);
+        assert!(
+            r.stdout.contains("status: verify_refused"),
+            "{tag}: {}",
+            r.stdout
+        );
+        assert!(
+            !ws.join("verify-ran").exists(),
+            "{tag}: never ran unsandboxed"
+        );
+        assert!(!r.stderr.contains("UNSANDBOXED"), "{tag}: {}", r.stderr);
+        assert!(fallback_lines(&home, "verify").is_empty(), "{tag}");
+        drop(dir);
+    }
+}
+
+/// The stop gate under the default: sandboxed with bubblewrap...
+#[test]
+#[cfg(feature = "shell-tools")]
+fn the_default_stop_gate_is_sandboxed_on_a_bwrap_host() {
+    if !bwrap_works() {
+        return;
+    }
+    let (dir, ws, home) = project("dflt-gate-bwrap");
+    let gate = gate_script(
+        &ws,
+        "echo ok > gate-made; ! (echo x > .git/hooks/h) 2>/dev/null || { echo hooks writable; exit 1; }",
+    );
+    let r = run_with_gate(&ws, &home, "", &path_env(), &gate);
+    assert_eq!(r.code, 0, "{}\n{}", r.stdout, r.stderr);
+    assert!(ws.join("gate-made").exists() && !ws.join(".git/hooks/h").exists());
+    drop(dir);
+}
+
+/// ...a loud unsandboxed run, ledgered, where the host has no backend...
+#[test]
+#[cfg(feature = "shell-tools")]
+fn the_default_stop_gate_without_any_sandbox_runs_loudly_and_is_ledgered() {
+    let (dir, ws, home) = project("dflt-gate-nosandbox");
+    let gate = gate_script(&ws, "touch gate-ran; exit 0");
+    let r = run_with_gate(&ws, &home, "", &path_without_bwrap(&dir), &gate);
+    assert_eq!(r.code, 0, "{}\n{}", r.stdout, r.stderr);
+    assert!(ws.join("gate-ran").exists(), "the gate ran, unsandboxed");
+    assert!(
+        r.stderr.contains("WARNING: turnend runs UNSANDBOXED")
+            && r.stderr.contains("sandbox.consumers.turnend = \"off\""),
+        "{}",
+        r.stderr
+    );
+    assert_eq!(fallback_lines(&home, "turnend").len(), 1);
+    drop(dir);
+}
+
+/// ...and a deny when the backend exists and its launcher fails.
+#[test]
+#[cfg(feature = "shell-tools")]
+fn the_default_stop_gate_whose_launcher_fails_is_still_a_deny() {
+    let (dir, ws, home) = project("dflt-gate-launcher");
+    let gate = gate_script(&ws, "touch gate-ran; exit 0");
+    let path = path_with_fake_bwrap(&dir, "echo 'bwrap: denied' >&2; exit 1", false);
+    let r = run_with_gate(&ws, &home, "", &path, &gate);
+    assert_eq!(r.code, 6, "{}\n{}", r.stdout, r.stderr);
+    assert!(!ws.join("gate-ran").exists(), "never ran unsandboxed");
+    assert!(!r.stderr.contains("UNSANDBOXED"), "{}", r.stderr);
+    drop(dir);
+}
