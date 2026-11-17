@@ -44,6 +44,16 @@ pub enum PluginAction {
     /// What changed since approval, tool by tool: added, removed, changed
     /// description, changed schema.
     Diff { name: String },
+    /// Read-only report of every locked plugin and skill: tier, approved
+    /// against live manifest hash, grants, sandbox profile, scanner
+    /// findings, the last sandbox fallbacks of the ledger, and each skill's
+    /// approved hash and stated source. Writes nothing.
+    Audit {
+        /// Audit only this MCP server (skills are then left out).
+        name: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Show the server's full live tool list, then approve it: answer at a
     /// terminal, or pass --hash with the manifest hash shown.
     Approve {
@@ -118,7 +128,7 @@ pub struct Ctx<'a> {
 
 impl Ctx<'_> {
     /// Redacted, then terminal-safe.
-    fn clean(&self, s: &str) -> String {
+    pub(super) fn clean(&self, s: &str) -> String {
         plugin_lock::terminal_safe(&self.secrets.redact(s))
     }
 
@@ -138,15 +148,20 @@ impl Ctx<'_> {
 /// legitimate writes it yet: a lock claiming it counts as unverified, so a
 /// lock edit cannot lift the sandbox requirement. First-party stays the
 /// owner's list (see [`tier_of`]).
-fn trusted_tier(name: &str, entry: Option<&LockEntry>, first_party: &[String]) -> Tier {
+pub(super) fn trusted_tier(name: &str, entry: Option<&LockEntry>, first_party: &[String]) -> Tier {
     match tier_of(name, entry, first_party) {
         Tier::ThirdPartyVerified => Tier::ThirdPartyUnverified,
         other => other,
     }
 }
 
-fn short(hash: &str) -> &str {
-    &hash[..hash.len().min(19)]
+/// The first 19 characters of a hash (`sha256:` and 12 digits). Cut at a
+/// character boundary: a hash from a hand-edited file may not be ASCII.
+pub(super) fn short(hash: &str) -> &str {
+    match hash.char_indices().nth(19) {
+        Some((i, _)) => &hash[..i],
+        None => hash,
+    }
 }
 
 /// Runs `action`; the text to print, or the error (exit 1).
@@ -164,6 +179,7 @@ pub fn run(action: PluginAction, ctx: &mut Ctx<'_>) -> Result<String, String> {
     match action {
         PluginAction::List { json } => Ok(list(ctx, json)),
         PluginAction::Diff { name } => diff(ctx, &name),
+        PluginAction::Audit { name, json } => super::audit::audit(ctx, name.as_deref(), json),
         PluginAction::Add {
             spec: Some(spec), ..
         } => add(ctx, &spec),
@@ -200,7 +216,7 @@ pub fn run(action: PluginAction, ctx: &mut Ctx<'_>) -> Result<String, String> {
 }
 
 /// Whether the binary on disk still has the hash recorded at approval.
-fn binary_note(e: &LockEntry) -> Option<&'static str> {
+pub(super) fn binary_note(e: &LockEntry) -> Option<&'static str> {
     if e.integrity.is_empty() || !e.source.starts_with("stdio:") {
         return None;
     }
@@ -272,19 +288,31 @@ fn probe_state(
     eff: &std::collections::BTreeMap<String, LockEntry>,
     cfg: &McpServerConfig,
 ) -> String {
+    probe_listed(ctx, eff, cfg).0
+}
+
+/// [`probe_state`] plus the live tool list when the server was started.
+pub(super) fn probe_listed(
+    ctx: &Ctx<'_>,
+    eff: &std::collections::BTreeMap<String, LockEntry>,
+    cfg: &McpServerConfig,
+) -> (String, Option<Listed>) {
     let source = source_of(cfg);
     let integrity = integrity(&source);
     if let Some(a) = admit_unseen(eff, &cfg.name, &source, &integrity)
         .or_else(|| bundle_refusal(eff, &cfg.name))
         .or_else(|| profile_refusal(ctx, eff, cfg))
     {
-        return state_of(&a).to_string();
+        return (state_of(&a).to_string(), None);
     }
     if !ctx.probe {
-        return "locked (not probed: running under a session)".to_string();
+        return (
+            "locked (not probed: running under a session)".to_string(),
+            None,
+        );
     }
     match (ctx.list)(cfg) {
-        Err(e) => format!("unreachable: {e}"),
+        Err(e) => (format!("unreachable: {e}"), None),
         Ok((v, tools)) => {
             let live = tole_core::plugin_lock::Live {
                 source: &source,
@@ -292,12 +320,33 @@ fn probe_state(
                 version: &v,
                 tools: &tools,
             };
-            state_of(&admit(eff, &cfg.name, &live)).to_string()
+            let state = state_of(&admit(eff, &cfg.name, &live)).to_string();
+            (state, Some((v, tools)))
         }
     }
 }
 
+/// What `list` and `audit` both read: one JSON row per server, the lock
+/// notes, and the merged lock the rows were judged against.
+pub(super) struct Listing {
+    pub(super) rows: Vec<serde_json::Value>,
+    pub(super) notes: Vec<String>,
+    pub(super) eff: std::collections::BTreeMap<String, LockEntry>,
+    /// The raw (unsanitized) server name of each row, in row order.
+    pub(super) raw: Vec<String>,
+}
+
+/// The state of a configured server: how `list` and `audit` differ (`audit`
+/// keeps the live tool list it fetched, so a server starts once).
+pub(super) type StateFn<'a> =
+    dyn FnMut(&McpServerConfig, &std::collections::BTreeMap<String, LockEntry>) -> String + 'a;
+
 fn list(ctx: &Ctx<'_>, as_json: bool) -> String {
+    let Listing { rows, notes, .. } = collect(ctx, &mut |cfg, eff| probe_state(ctx, eff, cfg));
+    render_list(ctx, rows, notes, as_json)
+}
+
+pub(super) fn collect(ctx: &Ctx<'_>, state_of_cfg: &mut StateFn<'_>) -> Listing {
     let mut notes = Vec::new();
     let mut load = |p: Option<PathBuf>, which: &str| match p.as_deref().map(Lockfile::load) {
         Some(Ok(l)) => l,
@@ -348,7 +397,7 @@ fn list(ctx: &Ctx<'_>, as_json: bool) -> String {
                 None => "unapproved (not configured)".to_string(),
             },
             Some(_) if broken => "unapproved (a lock is unreadable)".to_string(),
-            Some(cfg) => probe_state(ctx, &eff, cfg),
+            Some(cfg) => state_of_cfg(cfg, &eff),
         };
         let lock = match (
             user.servers.contains_key(name),
@@ -392,6 +441,20 @@ fn list(ctx: &Ctx<'_>, as_json: bool) -> String {
             })),
         }));
     }
+    Listing {
+        rows,
+        notes,
+        eff,
+        raw: names.into_iter().collect(),
+    }
+}
+
+fn render_list(
+    ctx: &Ctx<'_>,
+    rows: Vec<serde_json::Value>,
+    notes: Vec<String>,
+    as_json: bool,
+) -> String {
     if as_json {
         return json!({"servers": rows, "notes": notes.iter().map(|n| ctx.clean(n)).collect::<Vec<_>>()})
             .to_string();
