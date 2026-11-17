@@ -161,9 +161,9 @@ fn data_dir() -> PathBuf {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
         // Shared by every test of this process, so no per-test guard can own
-        // it. Stale ones of earlier runs (named by pid and clock, never
-        // shared, #702) are swept here, so at most the runs of the last few
-        // hours leave one small directory each.
+        // it: it is removed when the process exits (`atexit`, below). Stale
+        // ones of an earlier run that was killed (named by pid and clock,
+        // never shared, #702) are still swept here.
         let base = std::env::temp_dir();
         if let Ok(rd) = std::fs::read_dir(&base) {
             for e in rd.flatten() {
@@ -187,7 +187,17 @@ fn data_dir() -> PathBuf {
             std::process::id()
         ));
         std::fs::create_dir_all(&d).unwrap();
-        d.canonicalize().unwrap()
+        let d = d.canonicalize().unwrap();
+        extern "C" fn remove_data_dir() {
+            if let Some(d) = DIR.get() {
+                let _ = std::fs::remove_dir_all(d);
+            }
+        }
+        // SAFETY: registers a plain `extern "C"` function that takes no
+        // arguments and only removes a directory; a failed registration just
+        // leaves the directory to the sweep above.
+        unsafe { libc::atexit(remove_data_dir) };
+        d
     })
     .clone()
 }
@@ -943,15 +953,21 @@ fn doctor_shows_the_headroom_and_a_spawn_stuck_in_the_queue() {
 
 /// A stand-in child that records its env and argv, then hands in `report`
 /// (raw text written to `$TOLE_DELEGATION_REPORT`, as a hostile child
-/// could too) and exits.
+/// could too) and exits. `argv` and `env` are written to a temp name and
+/// renamed into place, like [`fake_tole`] does: the child's env is the
+/// whole environment of the test run (a CI runner's is over 4 KiB), which
+/// `env` writes in several chunks, and a reader that woke between two of
+/// them took a prefix for the whole file (#702, #828).
 fn fake_reporter(dir: &Path, name: &str, report: &str) -> PathBuf {
     let body_file = dir.join(format!("{name}.json"));
     std::fs::write(&body_file, report).unwrap();
     let p = dir.join(name);
     let body = format!(
         "#!/bin/sh\nprev=\"\"\nfor a in \"$@\"; do [ \"$prev\" = \"--sessions-dir\" ] && D=\"$a\"; \
-         prev=\"$a\"; done\nmkdir -p \"$D\"\nprintf '%s\\n' \"$@\" > \"$D/../argv\"\n\
-         cp '{}' \"$TOLE_DELEGATION_REPORT\"\nenv > \"$D/../env\"\n",
+         prev=\"$a\"; done\nmkdir -p \"$D\"\n\
+         printf '%s\\n' \"$@\" > \"$D/../argv.tmp\" && mv \"$D/../argv.tmp\" \"$D/../argv\"\n\
+         cp '{}' \"$TOLE_DELEGATION_REPORT\"\n\
+         env > \"$D/../env.tmp\" && mv \"$D/../env.tmp\" \"$D/../env\"\n",
         body_file.display()
     );
     crate::test_dir::write_executable(&p, body);
