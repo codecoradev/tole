@@ -146,29 +146,100 @@ impl Approvals {
     }
 
     /// Read `path`. A missing file is no approvals; an unreadable or
-    /// malformed one is an error (fail closed, loudly).
+    /// malformed one is an error (fail closed, loudly). The ledger
+    /// checkpoint (see [`LedgerCheckpoint`]) is not checked here: that is
+    /// [`Approvals::load_with_checkpoint`] plus [`LedgerCheckpoint::verify`].
     pub fn load(path: &Path) -> Result<Self, String> {
+        Self::load_with_checkpoint(path).map(|(a, _)| a)
+    }
+
+    /// [`Approvals::load`] and the ledger checkpoint recorded in the same
+    /// file (`None`: a file written before #879, or by [`Approvals::save`]
+    /// of an embedder that never wrote one). Both come from the same bytes.
+    pub fn load_with_checkpoint(path: &Path) -> Result<(Self, Option<LedgerCheckpoint>), String> {
         match read_file_capped(path, MAX_APPROVALS_BYTES) {
-            Ok(raw) => serde_json::from_slice(&raw)
-                .map_err(|e| format!("{}: malformed skill approvals: {e}", path.display())),
+            Ok(raw) => {
+                let bad = |e: serde_json::Error| {
+                    format!("{}: malformed skill approvals: {e}", path.display())
+                };
+                let approvals = serde_json::from_slice(&raw).map_err(bad)?;
+                let side: CheckpointField = serde_json::from_slice(&raw).map_err(bad)?;
+                Ok((approvals, side.ledger_checkpoint))
+            }
             Err(ReadCapError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
-                Ok(Self::default())
+                Ok((Self::default(), None))
             }
             Err(e) => Err(format!("{}: {e}", path.display())),
         }
     }
 
     /// Write `path` atomically (temp file + rename), creating its directory.
+    ///
+    /// **This does not touch the skill ledger.** An embedder that calls
+    /// [`Approvals::approve`] (or edits `skills`) and `save`s skips the
+    /// append-only audit record: the approval loads, but the ledger shows it
+    /// as unrecorded (and a revoke done this way leaves no revoke line). An
+    /// existing ledger checkpoint is kept as it is, never dropped, so this
+    /// cannot downgrade a checkpointed install. To record a decision, append
+    /// a [`ledger_line`] to the ledger first and then call
+    /// [`Approvals::save_checkpointed`], as `tole skills approve` does.
     pub fn save(&self, path: &Path) -> Result<(), String> {
+        let keep = Self::load_with_checkpoint(path).ok().and_then(|(_, c)| c);
+        self.write(path, keep.as_ref())
+    }
+
+    /// The write that records the ledger: verifies the checkpoint already in
+    /// `path` against the ledger as it is now (an intact ledger only grew,
+    /// which is fine), then writes the approvals with a new checkpoint of
+    /// that same ledger read. Call it AFTER appending the ledger line, so a
+    /// crash in between leaves the ledger longer than the checkpoint (valid)
+    /// and never the reverse. Refuses, writing nothing, when the existing
+    /// checkpoint no longer matches the ledger (see [`LedgerCheckpoint`]).
+    pub fn save_checkpointed(&self, path: &Path) -> Result<LedgerCheckpoint, String> {
+        let old = Self::load_with_checkpoint(path).map(|(_, c)| c)?;
+        let ledger = read_ledger_bytes(path)?;
+        if let Some(old) = &old {
+            old.verify(&ledger)
+                .map_err(|why| fault_message(path, &why))?;
+        }
+        let cp = LedgerCheckpoint::of(&ledger);
+        self.write(path, Some(&cp))?;
+        Ok(cp)
+    }
+
+    fn write(&self, path: &Path, checkpoint: Option<&LedgerCheckpoint>) -> Result<(), String> {
         let dir = path.parent().unwrap_or_else(|| Path::new("."));
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        let json = serde_json::to_vec_pretty(self).map_err(|e| e.to_string())?;
+        let mut value = serde_json::to_value(self).map_err(|e| e.to_string())?;
+        if let (Some(cp), Some(obj)) = (checkpoint, value.as_object_mut()) {
+            obj.insert(
+                CHECKPOINT_KEY.into(),
+                serde_json::to_value(cp).map_err(|e| e.to_string())?,
+            );
+        }
+        let json = serde_json::to_vec_pretty(&value).map_err(|e| e.to_string())?;
         let tmp = dir.join(format!(".{APPROVALS_FILE}.{}.tmp", std::process::id()));
         std::fs::write(&tmp, json).map_err(|e| format!("{}: {e}", tmp.display()))?;
         std::fs::rename(&tmp, path).map_err(|e| {
             let _ = std::fs::remove_file(&tmp);
             format!("{}: {e}", path.display())
         })
+    }
+
+    /// Owner recovery after a [`LedgerCheckpoint`] fault: records `expect`
+    /// (the digest the owner reviewed) as the checkpoint of the ledger as it
+    /// is now, WITHOUT verifying the old one. Refuses when the ledger is no
+    /// longer exactly what `expect` describes. The approvals themselves are
+    /// not changed; no revoke the old ledger held is brought back.
+    pub fn accept_ledger(path: &Path, expect: &LedgerCheckpoint) -> Result<(), String> {
+        let (approvals, _) = Self::load_with_checkpoint(path)?;
+        let ledger = read_ledger_bytes(path)?;
+        if LedgerCheckpoint::of(&ledger) != *expect {
+            return Err(
+                "the skill ledger changed while it was being reviewed: review it again".into(),
+            );
+        }
+        approvals.write(path, Some(expect))
     }
 
     /// Approve `pkg` as it is on disk now, replacing an earlier approval of
@@ -211,11 +282,33 @@ pub fn ledger_line(
     source: Option<&Source>,
     at: u64,
 ) -> String {
+    build_line(event, name, hash, source, at, None)
+}
+
+/// An `approve` line for an approval that already existed when the ledger
+/// did not name it (`tole skills adopt`, #879): [`ledger_line`] plus
+/// `"note":"adopted"`, with the hash and source exactly as the approvals
+/// file stored them.
+pub fn adopted_ledger_line(name: &str, hash: &str, source: Option<&Source>, at: u64) -> String {
+    build_line("approve", name, hash, source, at, Some("adopted"))
+}
+
+fn build_line(
+    event: &str,
+    name: &str,
+    hash: &str,
+    source: Option<&Source>,
+    at: u64,
+    note: Option<&str>,
+) -> String {
     let mut v = serde_json::json!({
         "v": 1, "kind": "skill", "event": event, "skill": name, "hash": hash, "at": at,
     });
     if let Some(src) = source.filter(|s| !s.is_empty()) {
         v["source"] = serde_json::to_value(src).unwrap_or_default();
+    }
+    if let Some(note) = note {
+        v["note"] = note.into();
     }
     let mut line = v.to_string();
     line.push('\n');
@@ -226,18 +319,142 @@ pub fn ledger_line(
 /// `Err`: it exists but cannot be read safely (fail closed: the approvals
 /// cannot be checked against it).
 pub fn read_ledger(approvals: &Path) -> Result<String, String> {
-    let path = approvals
+    read_ledger_bytes(approvals).map(|raw| String::from_utf8_lossy(&raw).into_owned())
+}
+
+/// The ledger file next to the approvals file `approvals`.
+pub fn ledger_path(approvals: &Path) -> PathBuf {
+    approvals
         .parent()
-        .map_or_else(|| PathBuf::from(LEDGER_FILE), |d| d.join(LEDGER_FILE));
+        .map_or_else(|| PathBuf::from(LEDGER_FILE), |d| d.join(LEDGER_FILE))
+}
+
+/// [`read_ledger`] as the raw bytes (what a [`LedgerCheckpoint`] hashes: a
+/// non-UTF-8 byte changes the digest). One read, never more than
+/// [`MAX_LEDGER_BYTES`]; a missing ledger is empty.
+pub fn read_ledger_bytes(approvals: &Path) -> Result<Vec<u8>, String> {
+    let path = ledger_path(approvals);
     match read_file_capped(&path, MAX_LEDGER_BYTES) {
-        Ok(raw) => Ok(String::from_utf8_lossy(&raw).into_owned()),
-        Err(ReadCapError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Ok(raw) => Ok(raw),
+        Err(ReadCapError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(e) => Err(format!(
             "{}: {e}. The skill ledger must be a regular readable file under {} MiB: inspect or \
              restore it. Deleting it forgets every revoke",
             path.display(),
             MAX_LEDGER_BYTES / (1024 * 1024)
         )),
+    }
+}
+
+/// The approvals file key holding the [`LedgerCheckpoint`].
+pub const CHECKPOINT_KEY: &str = "ledger_checkpoint";
+
+#[derive(Deserialize)]
+struct CheckpointField {
+    #[serde(default)]
+    ledger_checkpoint: Option<LedgerCheckpoint>,
+}
+
+/// What the skill ledger looked like when the approvals file was last
+/// written by the owner's commands (#879): its byte length and the SHA-256
+/// of those bytes. The approvals file stores it under [`CHECKPOINT_KEY`].
+///
+/// At load, a ledger that is missing, shorter than `bytes`, or whose first
+/// `bytes` bytes hash differently was deleted, truncated or rewritten by
+/// something other than the append-only owner commands: every approval is
+/// then ignored (fail closed) until the owner inspects the ledger and runs
+/// `tole skills recheckpoint`. A ledger that only grew (the recorded prefix
+/// intact) is valid, so a crash between the ledger append and the approvals
+/// write is harmless.
+///
+/// Residual, stated plainly: this catches deleting, truncating or rewriting
+/// the ledger ALONE. A process able to write BOTH the ledger and the
+/// approvals file can forge a matching checkpoint (the same residual as the
+/// plugin ledger), and one that can append to the ledger can add lines the
+/// owner never wrote (an `approve` line still needs a matching approvals
+/// entry to load anything). An approvals file without a checkpoint is the
+/// pre-#879 format and keeps loading, since it is indistinguishable from an
+/// old install; a downgrade by stripping the field takes a write to the
+/// approvals file and, to hide a revoke, a second write to the ledger.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LedgerCheckpoint {
+    /// Ledger length in bytes.
+    pub bytes: u64,
+    /// `sha256:<hex>` of the ledger's first `bytes` bytes.
+    pub sha256: String,
+}
+
+impl LedgerCheckpoint {
+    /// The checkpoint of exactly these ledger bytes.
+    pub fn of(ledger: &[u8]) -> Self {
+        Self {
+            bytes: ledger.len() as u64,
+            sha256: sha256_tag(ledger),
+        }
+    }
+
+    /// Ok when `ledger` still starts with the recorded bytes (it may have
+    /// grown since); otherwise what is wrong with it. `ledger` is the one
+    /// buffer the caller also parses, so what is verified is what is used.
+    pub fn verify(&self, ledger: &[u8]) -> Result<(), String> {
+        let len = ledger.len() as u64;
+        if len < self.bytes {
+            return Err(if len == 0 {
+                format!(
+                    "it is missing or empty, but {} bytes were recorded (deleted or truncated)",
+                    self.bytes
+                )
+            } else {
+                format!(
+                    "it holds {len} bytes, fewer than the {} recorded (truncated or replaced)",
+                    self.bytes
+                )
+            });
+        }
+        // `bytes <= len`, and `len` is at most MAX_LEDGER_BYTES for a buffer
+        // from `read_ledger_bytes`: the slice is within the buffer.
+        if sha256_tag(&ledger[..self.bytes as usize]) != self.sha256 {
+            return Err(format!(
+                "its first {} bytes are not the ones recorded (rewritten)",
+                self.bytes
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn sha256_tag(bytes: &[u8]) -> String {
+    let hex: String = Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    format!("sha256:{hex}")
+}
+
+/// The error for a ledger that fails its checkpoint: what is wrong and how
+/// the owner recovers.
+pub fn fault_message(approvals: &Path, why: &str) -> String {
+    format!(
+        "skill ledger {} does not match the checkpoint in {}: {why}. Every skill approval is \
+         ignored until you inspect the ledger and accept it with `tole skills recheckpoint` \
+         (deleting or rewriting the ledger forgets revokes: review `tole skills list` after)",
+        ledger_path(approvals).display(),
+        approvals.display()
+    )
+}
+
+/// Checks the checkpoint in `approvals` (if it has one) against the ledger
+/// next to it: `Ok(())` when there is none or it holds, the
+/// [`fault_message`] otherwise. An unreadable ledger or approvals file is an
+/// error too.
+pub fn verify_checkpoint_at(approvals: &Path) -> Result<(), String> {
+    let (_, cp) = Approvals::load_with_checkpoint(approvals)?;
+    match cp {
+        Some(cp) => cp
+            .verify(&read_ledger_bytes(approvals)?)
+            .map_err(|why| fault_message(approvals, &why)),
+        None => Ok(()),
     }
 }
 
@@ -900,5 +1117,170 @@ mod tests {
             "{e}"
         );
         let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    fn demo_approvals(ws: &Path) -> (Approvals, PathBuf) {
+        skill(ws, "demo", "b");
+        let pkg = read_package(Some(ws), "demo").unwrap();
+        let mut a = Approvals::default();
+        a.approve(&pkg, 5);
+        (a, ws.join("approvals.json"))
+    }
+
+    fn append(path: &Path, bytes: &[u8]) {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
+        f.write_all(bytes).unwrap();
+    }
+
+    /// #879: the checkpoint holds for an intact or longer ledger and names
+    /// what is wrong with a missing, shorter or rewritten one (a rewrite of
+    /// the same length and non-UTF-8 bytes included).
+    #[test]
+    fn a_checkpoint_verifies_a_grown_ledger_and_names_every_tampering() {
+        let l = ledger_line("approve", "demo", "sha256:a", None, 1).into_bytes();
+        let cp = LedgerCheckpoint::of(&l);
+        assert_eq!(cp.bytes, l.len() as u64);
+        cp.verify(&l).unwrap();
+        let mut grown = l.clone();
+        grown.extend_from_slice(ledger_line("revoke", "demo", "sha256:a", None, 2).as_bytes());
+        cp.verify(&grown).unwrap();
+        // Deleted, truncated, same-length rewrite, one byte flipped.
+        assert!(cp.verify(b"").unwrap_err().contains("missing or empty"));
+        assert!(cp.verify(&l[..l.len() - 1]).unwrap_err().contains("fewer"));
+        let mut same = l.clone();
+        same[10] ^= 1;
+        assert!(cp.verify(&same).unwrap_err().contains("rewritten"));
+        // Non-UTF-8 bytes: hashed raw, so a lossy-equal rewrite is caught.
+        let mut raw = l.clone();
+        raw.push(0xff);
+        let cp_raw = LedgerCheckpoint::of(&raw);
+        let mut other = l;
+        other.push(0xfe);
+        assert!(cp_raw.verify(&other).unwrap_err().contains("rewritten"));
+        assert_eq!(
+            String::from_utf8_lossy(&raw),
+            String::from_utf8_lossy(&other)
+        );
+    }
+
+    /// #879: `save_checkpointed` records the ledger, a ledger that grew
+    /// after (a crash before the approvals write) stays valid, and deleting,
+    /// truncating or rewriting it is refused with nothing written.
+    #[test]
+    fn save_checkpointed_refuses_a_ledger_that_lost_history() {
+        let ws = tmp("cp-save");
+        let (a, path) = demo_approvals(&ws);
+        let ledger = ws.join(LEDGER_FILE);
+        let l1 = ledger_line("approve", "demo", &a.skills["demo"].hash, None, 5);
+        append(&ledger, l1.as_bytes());
+        let cp = a.save_checkpointed(&path).unwrap();
+        assert_eq!(cp, LedgerCheckpoint::of(l1.as_bytes()));
+        let (loaded, got) = Approvals::load_with_checkpoint(&path).unwrap();
+        assert_eq!((loaded, got), (a.clone(), Some(cp.clone())));
+        verify_checkpoint_at(&path).unwrap();
+
+        // Crash after a ledger append, before the approvals write.
+        append(
+            &ledger,
+            ledger_line("revoke", "demo", "h", None, 6).as_bytes(),
+        );
+        verify_checkpoint_at(&path).unwrap();
+        // The next write moves the checkpoint forward.
+        let cp2 = a.save_checkpointed(&path).unwrap();
+        assert!(cp2.bytes > cp.bytes);
+
+        let before = std::fs::read(&path).unwrap();
+        for bad in [None, Some(&l1.as_bytes()[..10]), Some(&b"{\"x\":1}\n"[..])] {
+            match bad {
+                None => std::fs::remove_file(&ledger).unwrap(),
+                Some(b) => std::fs::write(&ledger, b).unwrap(),
+            }
+            let e = a.save_checkpointed(&path).unwrap_err();
+            assert!(e.contains("tole skills recheckpoint"), "{e}");
+            assert_eq!(std::fs::read(&path).unwrap(), before, "nothing written");
+            assert!(verify_checkpoint_at(&path).is_err());
+        }
+    }
+
+    /// #879: `save` (the embedder's write) never drops a checkpoint, a file
+    /// without one stays loadable (the pre-#879 format), and a malformed
+    /// checkpoint field fails loudly.
+    #[test]
+    fn save_keeps_the_checkpoint_and_an_old_file_still_loads() {
+        let ws = tmp("cp-keep");
+        let (mut a, path) = demo_approvals(&ws);
+        // Old format: no checkpoint, no ledger: loads, nothing to verify.
+        a.save(&path).unwrap();
+        assert_eq!(Approvals::load_with_checkpoint(&path).unwrap().1, None);
+        verify_checkpoint_at(&path).unwrap();
+        // Checkpointed, then an embedder save: the checkpoint stays.
+        append(&ws.join(LEDGER_FILE), b"x\n");
+        let cp = a.save_checkpointed(&path).unwrap();
+        assert!(a.revoke("demo"));
+        a.save(&path).unwrap();
+        assert_eq!(
+            Approvals::load_with_checkpoint(&path).unwrap(),
+            (a.clone(), Some(cp))
+        );
+        // Wrong shape: an error, not "no checkpoint".
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let broken = raw.replace("\"bytes\": 2", "\"bytes\": \"two\"");
+        assert_ne!(raw, broken);
+        std::fs::write(&path, broken).unwrap();
+        assert!(Approvals::load_with_checkpoint(&path)
+            .unwrap_err()
+            .contains("malformed"));
+    }
+
+    /// #879: the owner's recovery records exactly the ledger they reviewed
+    /// and refuses one that changed since.
+    #[test]
+    fn accept_ledger_records_the_reviewed_ledger_only() {
+        let ws = tmp("cp-accept");
+        let (a, path) = demo_approvals(&ws);
+        let ledger = ws.join(LEDGER_FILE);
+        append(&ledger, b"line one\n");
+        a.save_checkpointed(&path).unwrap();
+        std::fs::remove_file(&ledger).unwrap();
+        assert!(verify_checkpoint_at(&path).is_err());
+        let reviewed = LedgerCheckpoint::of(&read_ledger_bytes(&path).unwrap());
+        append(&ledger, b"changed meanwhile\n");
+        let e = Approvals::accept_ledger(&path, &reviewed).unwrap_err();
+        assert!(e.contains("changed while"), "{e}");
+        assert!(verify_checkpoint_at(&path).is_err());
+        let reviewed = LedgerCheckpoint::of(&read_ledger_bytes(&path).unwrap());
+        Approvals::accept_ledger(&path, &reviewed).unwrap();
+        verify_checkpoint_at(&path).unwrap();
+        assert_eq!(Approvals::load(&path).unwrap(), a, "approvals untouched");
+    }
+
+    /// #879: an over-cap ledger is refused before anything is hashed, and
+    /// an adopted line reads as an approval with its note.
+    #[test]
+    fn the_ledger_cap_bounds_the_hashed_read_and_adopted_lines_approve() {
+        let ws = tmp("cp-cap");
+        let path = ws.join("approvals.json");
+        let f = std::fs::File::create(ws.join(LEDGER_FILE)).unwrap();
+        f.set_len(MAX_LEDGER_BYTES + 1).unwrap();
+        assert!(read_ledger_bytes(&path).unwrap_err().contains("16 MiB"));
+        let line = adopted_ledger_line("demo", "sha256:a", None, 9);
+        assert!(line.contains("\"note\":\"adopted\"") && line.ends_with('\n'));
+        let mut a = Approvals::default();
+        a.skills.insert(
+            "demo".into(),
+            Approval {
+                hash: "sha256:a".into(),
+                approved_at: 1,
+                files: 1,
+                source: None,
+            },
+        );
+        assert_eq!(check_against_ledger(&a, &line), LedgerCheck::default());
+        assert_eq!(ledger_history(&line, "demo", 1)[0].1, "approve");
     }
 }

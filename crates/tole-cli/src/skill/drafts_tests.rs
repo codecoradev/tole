@@ -360,3 +360,29 @@ fn promote_refuses_to_write_through_a_symlinked_skills_dir() {
     assert_eq!(r.store.get(&d.id).unwrap().status, DraftStatus::Pending);
     assert!(!r.approvals.exists());
 }
+
+/// #879: a promotion or a revoke-by-source does not quietly re-record a
+/// ledger that was deleted: it stops before anything is written.
+#[test]
+fn promote_and_revoke_refuse_a_ledger_that_lost_history() {
+    let r = Rig::new("cp-fault");
+    let (a, am) = draft_at(&[], None, "s-bad", 1000);
+    let (b, bm) = draft_at(&[], None, "s-ok", 1001);
+    r.seed(&a, &am);
+    r.seed(&b, &bm);
+    r.go(&a, Some(&a.content_hash), false).unwrap();
+    let ledger = r.ws.join(tole_core::skill_approval::LEDGER_FILE);
+    std::fs::remove_file(&ledger).unwrap();
+    let approvals = std::fs::read(&r.approvals).unwrap();
+    // The skill directory is gone, so only the ledger stops the second draft.
+    std::fs::remove_dir_all(r.skill_dir()).unwrap();
+    let err = r.go(&b, Some(&b.content_hash), false).unwrap_err();
+    assert!(err.contains("recheckpoint"), "{err}");
+    assert!(!r.skill_dir().exists(), "no directory written");
+    assert_eq!(r.store.get(&b.id).unwrap().status, DraftStatus::Pending);
+    let err = revoke_source(&r.store, &r.approvals, "s-bad").unwrap_err();
+    assert!(err.contains("recheckpoint"), "{err}");
+    assert!(!ledger.exists(), "no ledger line written");
+    assert_eq!(std::fs::read(&r.approvals).unwrap(), approvals);
+    assert_eq!(r.store.get(&a.id).unwrap().status, DraftStatus::Promoted);
+}
