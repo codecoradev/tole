@@ -19,7 +19,35 @@ struct Rig {
     calls: Arc<Mutex<Vec<String>>>,
 }
 
-const CONFIG: &str = "[delegation]\ngoal_budget = 100000\n[profiles.coder]\n[profiles.ops]\n\
+impl Drop for Rig {
+    /// A discussion runs on its own thread and appends to its ledger, which
+    /// re-creates the ledger's directory when it is gone. So no discussion may
+    /// still be running when `_root` is removed, or the thread recreates
+    /// `tole-discuss-tool-*` after the cleanup and the #781 leak check fails
+    /// (#893). Waits for the fact (the host counts a discussion as live until
+    /// its thread has settled the node), also on a panic. The wait is bounded
+    /// and never panics inside a drop; a discussion that is still blocked by
+    /// the test is the test's to release (see `ReleaseOnDrop`).
+    fn drop(&mut self) {
+        let host = &self.host;
+        crate::test_dir::poll_until(crate::test_dir::WAIT, || {
+            (host.live_count() == 0).then_some(())
+        });
+    }
+}
+
+/// Opens the gate of [`blocking`] when dropped, so a participant the test
+/// holds back cannot outlive a failed assertion. Declare it after the rig: it
+/// then drops first, and the rig's drain finds the discussions ending.
+struct ReleaseOnDrop(Arc<AtomicBool>);
+
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+const CONFIG: &str ="[delegation]\ngoal_budget = 100000\n[profiles.coder]\n[profiles.ops]\n\
     [profiles.wide]\nallow = [\"run_command:cargo *\"]\n[profiles.narrow]\nallow = [\"read_file\"]\n";
 
 fn rig(tag: &str, allows: &[&str], usage: u64, answer: Answer) -> Rig {
@@ -202,6 +230,7 @@ fn a_default_budget_is_half_of_what_is_left() {
 fn at_most_two_discussions_run_at_once() {
     let release = Arc::new(AtomicBool::new(false));
     let r = rig("live", &[], 100, blocking(release.clone()));
+    let _gate = ReleaseOnDrop(release.clone());
     let mut small = input();
     small["budget_tokens"] = json!(10_000);
     let a = r.host.start(&small).unwrap();
