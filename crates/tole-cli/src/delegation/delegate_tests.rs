@@ -25,29 +25,82 @@ impl Root {
     /// once none is left (false after the bound, which is only a guard
     /// against a process that cannot be killed).
     fn reap_children(&self) -> bool {
-        let path = self.0.path();
-        let alive = || {
-            std::process::Command::new("pgrep")
-                .args(["-f"])
-                .arg(path)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .is_ok_and(|s| s.success())
-        };
+        let pattern = ere_literal(self.0.path());
+        let mut warned = false;
         crate::test_dir::poll_until(crate::test_dir::WAIT, || {
-            if !alive() {
-                return Some(());
+            match holders(&pattern) {
+                Ok(false) => return Some(()),
+                Ok(true) => {}
+                Err(e) => {
+                    if !std::mem::replace(&mut warned, true) {
+                        eprintln!(
+                            "delegate tests: cannot look for children of the root: {e} (#897)"
+                        );
+                    }
+                    return Some(());
+                }
             }
             let _ = std::process::Command::new("pkill")
-                .args(["-9", "-f"])
-                .arg(path)
+                .args(["-9", "-f", "--"])
+                .arg(&pattern)
                 .stderr(std::process::Stdio::null())
                 .status();
             None
         })
         .is_some()
     }
+}
+
+/// `path` as an extended regular expression that matches exactly that text:
+/// `pgrep -f` and `pkill -f` take a regex, and a temp dir with `(`, `[`, `+`
+/// or `.` in its name would otherwise fail to compile or match something else.
+fn ere_literal(path: &Path) -> String {
+    let mut out = String::new();
+    for c in path.to_string_lossy().chars() {
+        if "\\.[](){}*+?^$|".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Does a live process have `pattern` (an ERE) in its command line? A
+/// missing `pgrep` counts as "no" (the old behavior); an exit code of 2 or
+/// more (bad pattern, error) is an `Err`, not a silent "no".
+fn holders(pattern: &str) -> Result<bool, String> {
+    match std::process::Command::new("pgrep")
+        .args(["-f", "--"])
+        .arg(pattern)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+    {
+        Ok(st) => match st.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            other => Err(format!("pgrep exited with {other:?} for {pattern}")),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("pgrep: {e}")),
+    }
+}
+
+#[test]
+fn a_root_with_regex_metacharacters_is_still_found_and_killed() {
+    let dir = tmp("re(g[e]x+.)");
+    let pattern = ere_literal(&dir);
+    let mut child = std::process::Command::new("sh")
+        .args(["-c", "sleep 60", "sh"])
+        .arg(&*dir)
+        .spawn()
+        .unwrap();
+    // `spawn` returns after the exec, so the command line is in place.
+    assert_eq!(holders(&pattern), Ok(true), "the process is not found");
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert_eq!(holders(&pattern), Ok(false), "the process is still found");
+    assert!(dir.reap_children());
 }
 
 impl std::ops::Deref for Root {
