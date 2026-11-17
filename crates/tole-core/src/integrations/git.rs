@@ -1028,6 +1028,12 @@ mod tests {
             avoid.iter().all(|a| a.parent().is_some()),
             "root in the avoid set: {avoid:?}"
         );
+        // A temp dir of `/` is dropped too.
+        let tmp_root = avoid_dirs(None, PathBuf::from("/"), None, None);
+        assert!(
+            tmp_root.is_empty(),
+            "root tmp in the avoid set: {tmp_root:?}"
+        );
         // Same fixed set as with no home at all: not emptied, not widened.
         assert_eq!(search_dirs(Path::new("git"), &avoid), {
             let bare = avoid_dirs(None, std::env::temp_dir(), None, None);
