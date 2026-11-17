@@ -294,29 +294,46 @@ pub fn hash_command(iterations: u32) -> Result<()> {
     Ok(())
 }
 
+/// Terminal attributes to put back: restores echo when dropped, so an early
+/// return or a panic cannot leave the terminal silent. (A signal that kills the
+/// process, Ctrl-C included, is not handled: `stty echo` repairs the terminal.)
+struct EchoGuard {
+    fd: std::os::fd::RawFd,
+    saved: libc::termios,
+}
+
+impl EchoGuard {
+    /// Turn echo off on `fd`; `None` when it is not a terminal.
+    fn off(fd: std::os::fd::RawFd) -> Option<Self> {
+        // SAFETY: plain termios calls on a descriptor with a zeroed struct the
+        // kernel fills in; nothing is retained but the saved copy.
+        unsafe {
+            let mut t: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(fd, &mut t) != 0 {
+                return None;
+            }
+            let mut quiet = t;
+            quiet.c_lflag &= !libc::ECHO;
+            libc::tcsetattr(fd, libc::TCSANOW, &quiet);
+            Some(Self { fd, saved: t })
+        }
+    }
+}
+
+impl Drop for EchoGuard {
+    fn drop(&mut self) {
+        // SAFETY: restores the attributes read in `off`.
+        unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.saved) };
+    }
+}
+
 /// Read one line from the terminal with echo off (restored on every exit).
 fn read_hidden(prompt: &str) -> Result<String> {
     use std::os::fd::AsRawFd;
-    let fd = std::io::stdin().as_raw_fd();
-    // SAFETY: plain termios calls on stdin's descriptor with a zeroed struct
-    // the kernel fills in; nothing is retained.
-    let saved = unsafe {
-        let mut t: libc::termios = std::mem::zeroed();
-        (libc::tcgetattr(fd, &mut t) == 0).then_some(t)
-    };
-    if let Some(t) = &saved {
-        let mut quiet = *t;
-        quiet.c_lflag &= !libc::ECHO;
-        // SAFETY: as above.
-        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &quiet) };
-    }
+    let _echo = EchoGuard::off(std::io::stdin().as_raw_fd());
     eprint!("{prompt}");
     let mut line = String::new();
     let read = std::io::stdin().lock().take(4096).read_line(&mut line);
-    if let Some(t) = &saved {
-        // SAFETY: restores the attributes read above.
-        unsafe { libc::tcsetattr(fd, libc::TCSANOW, t) };
-    }
     eprintln!();
     read.context("reading the password")?;
     Ok(line.trim_end_matches(['\n', '\r']).to_string())
@@ -330,6 +347,9 @@ struct Request {
     method: String,
     path: String,
     authorization: Option<String>,
+    /// The verdict `read_request` already reached for this header (only an
+    /// image upload is checked while reading), so it is hashed once.
+    verdict: Option<bool>,
     /// `Last-Event-ID`: where an SSE client left off (`EventSource` sends it
     /// on reconnect).
     last_event_id: Option<String>,
@@ -350,7 +370,10 @@ enum ReadError {
     /// 413 only for the right token, otherwise the same 401 a small body
     /// gets. The ceiling depends on the token, so answering 413 before
     /// auth would be a token-validity oracle outside the limiter (#558).
-    TooLarge { authorization: Option<String> },
+    TooLarge {
+        authorization: Option<String>,
+        verdict: Option<bool>,
+    },
     /// `/hooks/<route>` for a route that does not exist (404, body unread).
     NoHookRoute,
     /// A webhook body over its route's cap (413, body unread). Webhooks do
@@ -508,10 +531,9 @@ fn read_request(
     // The larger upload ceiling only for an image upload that already
     // carries a valid credential: pre-auth buffering stays at MAX_BODY_BYTES.
     // An IP over its failure budget is not even checked (no hashing for it).
-    let upload = method == "POST"
-        && upload_target(&path).is_some()
-        && !limited
-        && auth.check(authorization.as_deref());
+    let verdict = (method == "POST" && upload_target(&path).is_some() && !limited)
+        .then(|| auth.check(authorization.as_deref()));
+    let upload = verdict == Some(true);
     let ceiling = if upload {
         MAX_UPLOAD_BYTES
     } else {
@@ -519,7 +541,10 @@ fn read_request(
     };
     if content_length > ceiling {
         // Refuse rather than buffer it.
-        return Err(ReadError::TooLarge { authorization });
+        return Err(ReadError::TooLarge {
+            authorization,
+            verdict,
+        });
     }
     if upload {
         reader.get_mut().deadline = Instant::now() + UPLOAD_READ_DEADLINE;
@@ -539,6 +564,7 @@ fn read_request(
         method,
         path,
         authorization,
+        verdict,
         last_event_id,
         body,
         hook,
@@ -615,7 +641,10 @@ fn handle_conn(mut stream: TcpStream, state: Arc<State>) {
             respond(&mut stream, 400, &json!({"error": msg}));
             return;
         }
-        Err(ReadError::TooLarge { authorization }) => {
+        Err(ReadError::TooLarge {
+            authorization,
+            verdict,
+        }) => {
             // Authenticate first, through the same limiter as every other
             // request, so the answer never tells a wrong token from a right
             // one without a recorded failure.
@@ -625,7 +654,7 @@ fn handle_conn(mut stream: TcpStream, state: Arc<State>) {
                     429,
                     &json!({"error": "too many failed auth attempts"}),
                 );
-            } else if !state.auth.check(authorization.as_deref()) {
+            } else if !verdict.unwrap_or_else(|| state.auth.check(authorization.as_deref())) {
                 if let Some(ip) = peer_ip {
                     state.auth_failures.record_failure(ip);
                 }
@@ -678,7 +707,10 @@ fn handle_conn(mut stream: TcpStream, state: Arc<State>) {
 
     // The one auth check (#742): every route below this line is behind it,
     // for a bearer token and for Basic alike.
-    let authorized = req.path == "/health" || state.auth.check(req.authorization.as_deref());
+    let authorized = req.path == "/health"
+        || req
+            .verdict
+            .unwrap_or_else(|| state.auth.check(req.authorization.as_deref()));
     if !authorized {
         if let Some(ip) = peer_ip {
             state.auth_failures.record_failure(ip);

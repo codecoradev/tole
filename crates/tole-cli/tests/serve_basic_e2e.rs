@@ -446,6 +446,25 @@ fn the_oversized_upload_answer_is_no_credential_oracle() {
     for auth in [basic(USER, "wrong password 0742"), String::new()] {
         assert_eq!(mid(&auth, 0).status, 401, "{auth}");
     }
+    // A non-upload route over the plain cap: 413 only for a valid credential.
+    let big = |auth: &str| {
+        let mut s = TcpStream::connect(("127.0.0.1", d.port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let auth = if auth.is_empty() {
+            String::new()
+        } else {
+            format!("{auth}\r\n")
+        };
+        write!(
+            s,
+            "POST /sessions HTTP/1.1\r\nHost: x\r\n{auth}Content-Length: 3145728\r\n\
+             Connection: close\r\n\r\n"
+        )
+        .unwrap();
+        read_resp(&mut s)
+    };
+    assert_eq!(big(&good()).status, 413);
+    assert_eq!(big(&basic(USER, "wrong password 0742")).status, 401);
     let r = mid(&good(), 3 * 1024 * 1024);
     assert!(
         r.status != 401 && r.status != 413 && r.status != 0,
@@ -766,4 +785,18 @@ fn the_mcp_transport_uses_the_same_check() {
     assert!(post(&good()).starts_with("HTTP/1.1 429"));
     // Keep the workspace alive until here.
     let _ = &d.work;
+}
+
+/// An upload is authenticated while its headers are read, and the verdict is
+/// handed on: a refused upload counts exactly one failure.
+#[test]
+fn a_refused_upload_counts_one_failure() {
+    let d = spawn(Opts::default());
+    let wrong = basic(USER, "wrong password 0742");
+    for n in 0..10 {
+        let r = send_raw(d.port, "POST", "/sessions/s-1/images", &wrong, b"xx");
+        assert_eq!(r.status, 401, "attempt {n}");
+    }
+    let r = send_raw(d.port, "POST", "/sessions/s-1/images", &good(), b"xx");
+    assert_eq!(r.status, 429, "ten failures, then limited: {}", r.body);
 }

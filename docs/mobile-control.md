@@ -278,7 +278,8 @@ separate issue (#742 stays open for it); scopes (a read-only credential that can
 
 ```sh
 # 1. Make the hash. The password is read from stdin (a terminal is asked twice,
-#    without echo); it is never an argument and is not printed. At least 8 characters.
+#    without echo, restored even on an error; a Ctrl-C at the prompt can leave echo off,
+#    `stty echo` repairs it); it is never an argument and is not printed. At least 8 characters.
 printf '%s' "$PASSWORD" | tole serve-hash > ~/.config/tole-serve.hash   # PBKDF2-HMAC-SHA256, 600000 iterations
 chmod 600 ~/.config/tole-serve.hash
 

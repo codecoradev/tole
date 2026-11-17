@@ -124,7 +124,9 @@ impl PasswordHash {
 
     /// Hash `password` with a fresh random salt.
     pub fn create(password: &[u8], iterations: u32) -> Result<String, String> {
-        if password.len() < MIN_PASSWORD_LEN {
+        // Characters, not bytes, when it is text.
+        let chars = std::str::from_utf8(password).map_or(password.len(), |s| s.chars().count());
+        if chars < MIN_PASSWORD_LEN {
             return Err(format!(
                 "the password must be at least {MIN_PASSWORD_LEN} characters"
             ));
@@ -471,6 +473,9 @@ mod tests {
     #[test]
     fn weak_or_malformed_hashes_and_passwords_are_refused_without_echo() {
         assert!(PasswordHash::create(b"short", MIN_ITERATIONS).is_err());
+        // Seven characters in fourteen bytes is still too short; eight is fine.
+        assert!(PasswordHash::create("ééééééé".as_bytes(), MIN_ITERATIONS).is_err());
+        assert!(PasswordHash::create("éééééééé".as_bytes(), MIN_ITERATIONS).is_ok());
         assert!(PasswordHash::create(b"long enough pw", MIN_ITERATIONS - 1).is_err());
         let h = PasswordHash::create(b"correct horse", MIN_ITERATIONS).unwrap();
         let weak = h.replacen("i=10000", "i=9999", 1);
