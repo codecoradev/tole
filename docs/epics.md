@@ -391,9 +391,10 @@ Bot and Nakama; BMAD for collaboration). Design notes:
     doctor line; opt-in `[sandbox.consumers]` for `run_command` and
     `job_start` with rlimits, #748 first slice done; `verify` and `turnend`,
     second slice done; cron scripts and `command:` deliveries, third slice
-    done, in review). Open: #748 for the migration of `verify` and
-    `turnend` to sandboxed by default in a later phase, plan in
-    `docs/sandbox-design.md` §9.4), and #750 for the operability
+    done; the default flip of `verify` and `turnend` to `optional`, owner
+    decision 2026-11-16, is on `develop` for the next minor, `docs/sandbox-design.md`
+    §9.4). Open: #748 cgroup limits (deferred) and the `git` tool hardening
+    (#873), and #750 for the operability
     pieces: the doctor listing of sensitive grants and startup logging (#809),
     per-server and named profiles with the CLI (#810, in review), the profile
     name and hash in the plugin lock entry with re-approval on change (#750,
@@ -448,7 +449,7 @@ Parked means: an issue exists and is open, and nobody works on it until the owne
 Owner decisions still open:
 
 - #813: decided 2026-11-15: `[delegation] approvals` stays `off` with a `tole doctor` hint when delegation is in use and the key is unset; `tole discuss start|resume` refuse under a session; an unreadable plugin ledger blocks `plugin add` and `plugin approve`; the user-config floor of the discussion timeout is 10 s (the env hook still goes down to 1 s).
-- #748: when `verify` and `turnend` become sandboxed by default (decided in principle on 2026-11-14, the phase is not scheduled).
+- #748: decided 2026-11-16 and 2026-11-17: `verify` and `turnend` are sandboxed by default as `optional` in the next minor (never `required` by default: a sandboxed verify cannot see `~/.cargo`); the implicit default runs unsandboxed with a loud, ledgered warning only on a host with no sandbox backend, an explicit `optional` or `required` never does. Landed on `develop`; the release is the owner's. Whether a later release moves the default to `required` where a backend exists is not decided.
 - #806: the rule that stops a series of merged pull requests from turning develop red. The CONTRIBUTING rule is documented; requiring up-to-date branches or a merge queue is a repository ruleset setting that only the owner can change.
 - #705: Cora Review failing or running 12 minutes and more on larger PRs: cora-code 0.21 chunks the diff and adds `review.exclude` (cora-code#720); the exclude is configured in `.cora.yaml` (closed with that change).
 - #741 and #742: the open questions in the table above. #740 was decided on 2026-11-16 (profile fixed per session process, request wins on resume and is recorded, `[profiles.*]` budget as is, no `memory_room` from a request, profile model else server default) and built as `profile` on `POST /sessions` (create and resume, `docs/mobile-control.md`); `tole sessions` shows each session's profile and `tole doctor` lists the serve profiles by name, so #740 is fully done.

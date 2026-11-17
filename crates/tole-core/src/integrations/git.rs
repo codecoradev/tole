@@ -226,13 +226,17 @@ impl GitOp {
 
 /// Whether any command consumer (`run_command`, `job_start`, verify, stop
 /// gates, cron scripts and deliveries, and any added later) runs in the sandbox,
-/// which is when this tool hardens and vets (see the module doc).
+/// which is when this tool hardens and vets (see the module doc). A `verify` or
+/// `turnend` that is `optional` only by the default (#748) does not count: the
+/// default would otherwise turn the hooks-off hardening and the config vet on
+/// for every user of the `git` tool, who wrote nothing. The owner who writes
+/// `verify` or `turnend` (any value but `off`) gets them.
 fn consumers_on() -> bool {
     use crate::sandbox::command::{consumers, Consumer};
     let c = consumers();
     Consumer::ALL
         .iter()
-        .any(|k| c.mode(*k) != crate::sandbox::Mode::Off)
+        .any(|k| c.mode(*k) != crate::sandbox::Mode::Off && !c.implicit(*k))
 }
 
 /// The full argv after the program: the global `-c` options, then the op's

@@ -194,10 +194,18 @@ pub fn doctor_grant_lines(
             "{label}: protected read-only in the workspace: {}",
             super::command::PROTECTED.join(", ")
         ));
-        out.extend(
-            decide(mode, avail, unattended || k.always_unattended())
-                .map(|d| format!("{label}: {}", decision_text(&d))),
-        );
+        // The default flip (#748): no backend at all is an unsandboxed run
+        // with a loud note, not a refusal, and it says it is the default.
+        let d = match (consumers.implicit(k), avail) {
+            (true, Availability::Unavailable(why)) => Some(Decision::Unsandboxed(why.clone())),
+            _ => decide(mode, avail, unattended || k.always_unattended()),
+        };
+        let tag = if consumers.implicit(k) {
+            " (default)"
+        } else {
+            ""
+        };
+        out.extend(d.map(|d| format!("{label}: {}{tag}", decision_text(&d))));
     }
     out
 }

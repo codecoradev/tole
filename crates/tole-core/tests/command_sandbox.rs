@@ -68,6 +68,7 @@ fn setup() -> &'static Setup {
             cron: Mode::Off,
             network: Network::None,
             limits: LIMITS,
+            ..Consumers::default()
         })
         .unwrap();
         Setup {
