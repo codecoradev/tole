@@ -10,7 +10,8 @@
 //! is written, and the committed in-memory entry is that same redacted
 //! form. The provider is fed from these entries, so the log stores exactly
 //! what the provider saw and a replay reproduces it. An entry that hid a
-//! secret carries `"redacted": ["NAME", ...]` on the wire (names only).
+//! secret carries `"redacted": ["NAME", ...]` on the wire: the names of known
+//! secrets, and `shape:<kind>` for each secret shape the detector masked.
 //! Older logs, written raw, load unchanged; nothing is rewritten.
 //!
 //! See `docs/architecture.md` §4 for the format rationale and the full line
@@ -420,9 +421,6 @@ pub struct JsonlStorage {
 /// secret that is a bare number becomes the marker string), in every form
 /// the set knows: as is, JSON-escaped, base64 and percent-encoded.
 fn redact_payload(set: &SecretSet, payload: &Value) -> (Value, Vec<String>) {
-    if set.is_empty() {
-        return (payload.clone(), Vec::new());
-    }
     let out = set.redact_value(payload);
     if out == *payload {
         return (out, Vec::new());
@@ -436,7 +434,17 @@ fn redact_payload(set: &SecretSet, payload: &Value) -> (Value, Vec<String>) {
             after.matches(&m).count() > before.matches(&m).count()
         })
         .map(str::to_string)
-        .collect();
+        .collect::<Vec<_>>();
+    // Shape masks (#597) have no name: record each new kind as `shape:<kind>`
+    // in the same field (old logs and readers see plain strings).
+    let kinds = crate::secrets::shape::masked_kinds(&after)
+        .into_iter()
+        .filter(|k| {
+            let m = format!("[REDACTED:{k}]");
+            after.matches(&m).count() > before.matches(&m).count()
+        })
+        .map(|k| format!("shape:{k}"));
+    let names = names.into_iter().chain(kinds).collect();
     (out, names)
 }
 

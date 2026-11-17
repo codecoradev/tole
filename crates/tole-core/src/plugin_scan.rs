@@ -341,7 +341,7 @@ pub fn scan_text(text: &str, others: &Others, secrets: &SecretSet) -> Vec<(Kind,
     if let Some(what) = secret_shape(text) {
         out.push((Kind::SecretShape, format!("looks like {what}")));
     }
-    if !secrets.is_empty() && secrets.redact(text) != text {
+    if !secrets.is_empty() && secrets.redact_known(text) != text {
         out.push((
             Kind::SecretShape,
             "holds the value of a secret you hold".into(),

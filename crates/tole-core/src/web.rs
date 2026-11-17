@@ -588,7 +588,8 @@ fn refuse_secret_url(secrets: &SecretSet, url: &str) -> Result<(), String> {
     match secrets.redact(url) {
         std::borrow::Cow::Borrowed(_) => Ok(()),
         std::borrow::Cow::Owned(r) => Err(format!(
-            "web_fetch: refused, the URL contains a known secret value: {r}"
+            "web_fetch: refused, the URL holds a known secret value or looks like a secret \
+             (`redaction_allowlist` keeps a false positive): {r}"
         )),
     }
 }

@@ -15,19 +15,24 @@
 //! - [`SecretSet::redact`] replaces every known value, and its base64
 //!   (standard and URL-safe), percent-encoded and JSON-escaped forms, with
 //!   `«NAME»`. Matches that overlap are merged into one redacted span, so a
-//!   secret overlapping another never leaks a tail. Text without a match,
-//!   and every text when the set is empty, is returned borrowed (no copy).
+//!   secret overlapping another never leaks a tail. Text without a match is
+//!   returned borrowed (no copy); the known-value pass is skipped when the
+//!   set is empty, the shape pass below is not.
 //!
-//! Matching is a first-byte-indexed scan with needles tried longest first:
-//! no regex or automaton dependency. A set holds a handful of secrets, each
+//! After the known-value pass, [`shape`] masks secret SHAPES nobody told us
+//! about (#597) as `[REDACTED:<kind>]`, with the ruleset shared with uteke.
+//!
+//! Known-value matching is a first-byte-indexed scan with needles tried
+//! longest first: no regex or automaton dependency. A set holds a handful of secrets, each
 //! with up to six forms, so the per-byte work is a table lookup plus, for the
 //! few bytes that start a needle, a short prefix compare.
 //!
-//! Platform-agnostic: pure std + `base64`, no I/O beyond [`SecretSet::from_env`]
+//! Platform-agnostic: pure std + `base64` + `uteke-privacy`, no I/O beyond [`SecretSet::from_env`]
 //! reading the process environment.
 
 pub mod release;
 pub mod sensitive;
+pub mod shape;
 
 use base64::Engine;
 use std::borrow::Cow;
@@ -186,6 +191,9 @@ struct Inner {
     skipped: Vec<Skipped>,
     /// `«NAME»` per entry.
     markers: Vec<String>,
+    /// The same markers, longest first (built once; the shape pass swaps
+    /// the longest marker that matches at a position).
+    markers_longest_first: Vec<String>,
     /// Every form of every value, longest first.
     needles: Vec<Needle>,
     /// Needle indices by first byte (256 slots; empty when no needles).
@@ -290,7 +298,9 @@ impl SecretSet {
         self.inner.needles.is_empty()
     }
 
-    /// Replace every known value (and its encoded forms) with `«NAME»`.
+    /// Replace every known value (and its encoded forms) with `«NAME»`,
+    /// then mask the secret shapes the shared detector finds in what is left
+    /// as `[REDACTED:<kind>]` (#597; runs for an empty set too).
     /// Overlapping matches merge into one span carrying each name once.
     /// Idempotent; never splits a UTF-8 character (every needle is valid
     /// UTF-8, so a match starts and ends on character boundaries).
@@ -301,6 +311,19 @@ impl SecretSet {
     /// mapped back onto the original, so a value split by one is still
     /// found (#681). Text without any is scanned once.
     pub fn redact<'a>(&self, text: &'a str) -> Cow<'a, str> {
+        match self.redact_known(text) {
+            // Known values first (their `«NAME»` marker wins), then the
+            // shared shape detector for secrets nobody told us about (#597).
+            Cow::Borrowed(t) => shape::redact_shapes(t, &self.inner.markers_longest_first),
+            Cow::Owned(o) => match shape::redact_shapes(&o, &self.inner.markers_longest_first) {
+                Cow::Borrowed(_) => Cow::Owned(o),
+                Cow::Owned(r) => Cow::Owned(r),
+            },
+        }
+    }
+
+    /// The known-value pass of [`SecretSet::redact`].
+    pub(crate) fn redact_known<'a>(&self, text: &'a str) -> Cow<'a, str> {
         let inner = &*self.inner;
         if inner.needles.is_empty() {
             return Cow::Borrowed(text);
@@ -366,15 +389,19 @@ impl SecretSet {
     /// `","` would match across two fields).
     pub fn redact_value(&self, value: &serde_json::Value) -> serde_json::Value {
         use serde_json::Value;
-        if self.is_empty() {
-            return value.clone();
-        }
         match value {
             Value::String(s) => Value::String(self.redact(s).into_owned()),
             Value::Array(a) => Value::Array(a.iter().map(|v| self.redact_value(v)).collect()),
             Value::Object(o) => Value::Object(
                 o.iter()
-                    .map(|(k, v)| (self.redact(k).into_owned(), self.redact_value(v)))
+                    .map(|(k, v)| {
+                        let key = self.redact(k).into_owned();
+                        let val = match v {
+                            Value::String(s) => Value::String(self.redact_field(&key, s)),
+                            other => self.redact_value(other),
+                        };
+                        (key, val)
+                    })
                     .collect(),
             ),
             // A secret of digits can be a bare JSON number; it becomes the
@@ -384,6 +411,19 @@ impl SecretSet {
                 Cow::Borrowed(_) => value.clone(),
             },
             other => other.clone(),
+        }
+    }
+
+    /// A string FIELD of a JSON object: the value alone is redacted, then
+    /// `key=value` is shown to the shape detector too, so a value that is
+    /// secret only because of its field name is masked like an assignment
+    /// to that name in text (#597).
+    fn redact_field(&self, key: &str, value: &str) -> String {
+        let v = self.redact(value).into_owned();
+        let prefix = format!("{key}=");
+        match shape::redact_shapes(&format!("{prefix}{v}"), &self.inner.markers_longest_first) {
+            Cow::Owned(o) if o.starts_with(&prefix) => o[prefix.len()..].to_string(),
+            _ => v,
         }
     }
 
@@ -427,6 +467,10 @@ impl SecretSet {
             .iter()
             .map(|(n, _)| format!("«{n}»"))
             .collect();
+        inner.markers_longest_first = inner.markers.clone();
+        inner
+            .markers_longest_first
+            .sort_by_key(|m| std::cmp::Reverse(m.len()));
         let mut needles: Vec<Needle> = Vec::new();
         for (idx, (_, value)) in inner.entries.iter().enumerate() {
             for form in forms(value) {
@@ -1039,7 +1083,11 @@ mod tests {
                 let out = s
                     .redact(&format!("Authorization: Basic {enc}"))
                     .into_owned();
-                assert!(out.contains("«GITHUB_TOKEN»"), "{plain:?} leaked: {out}");
+                // The shape pass (#597) may mask the whole Basic credential.
+                assert!(
+                    out.contains("«GITHUB_TOKEN»") || out.contains("[REDACTED:basic-auth]"),
+                    "{plain:?} leaked: {out}"
+                );
             }
         }
     }

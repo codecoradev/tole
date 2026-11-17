@@ -902,6 +902,9 @@ pub struct Config {
     /// Extra sensitive file-name globs (#683), e.g. `["*.secret"]`; the
     /// project layer's list is added to the user's, never replaces it.
     pub sensitive_files: Option<Vec<String>>,
+    /// Regexes of secret-shaped values the detector keeps (#597); user
+    /// layer only: a repository must not exempt its own values.
+    pub redaction_allowlist: Option<Vec<String>>,
     /// Keys (rendered names, e.g. `model`, `mission.verify`) whose value
     /// came from the user layer; set by [`layered`], never by the file.
     #[serde(skip)]
@@ -1121,6 +1124,10 @@ pub fn parse(src: &str, path: &Path) -> Result<Config, ConfigError> {
     }
     for g in cfg.sensitive_files.iter().flatten() {
         check_sensitive_glob(g).map_err(range)?;
+    }
+    if let Some(a) = &cfg.redaction_allowlist {
+        tole_core::secrets::shape::check_allowlist(a)
+            .map_err(|e| range(format!("redaction_allowlist: {e}")))?;
     }
     if let Some(r) = &cfg.router {
         crate::routing::compile(r).map_err(range)?;
@@ -1357,6 +1364,8 @@ pub fn layered(project: &Config, user: &Config) -> Config {
         secrets: layered_secrets(&project.secrets, &user.secrets),
         // A project can only add sensitive names (#683).
         sensitive_files: layered_sensitive(&project.sensitive_files, &user.sensitive_files),
+        // Nor can it exempt values from the secret-shape detector (#597).
+        redaction_allowlist: user.redaction_allowlist.clone(),
         user_keys: BTreeSet::new(),
     };
     if let Some(c) = &user.cron {
@@ -1502,6 +1511,15 @@ pub fn hooks_ignored_warning(shown: &str) -> String {
     )
 }
 
+/// The warning printed at startup when a project config carries
+/// `redaction_allowlist` (#597).
+pub fn redaction_allowlist_ignored_warning(shown: &str) -> String {
+    format!(
+        "ignoring `redaction_allowlist` in project config {shown}: the secret-shape allowlist \
+         can only be set in the user config"
+    )
+}
+
 /// The warning printed at startup when a project config carries `[tui]`.
 pub fn tui_ignored_warning(shown: &str) -> String {
     format!(
@@ -1583,6 +1601,7 @@ pub fn render_with(cfg: &Config, tag: &str, ann: &Annotations) -> Vec<String> {
     list(&mut out, "on_turnend", &cfg.on_turnend);
     list(&mut out, "skill", &cfg.skill);
     list(&mut out, "sensitive_files", &cfg.sensitive_files);
+    list(&mut out, "redaction_allowlist", &cfg.redaction_allowlist);
     scalar(&mut out, "no_skills", cfg.no_skills.map(|b| b.to_string()));
     scalar(
         &mut out,
@@ -3007,6 +3026,28 @@ verify_timeout = 60
             let e = parse(&format!("sensitive_files = [{bad}]\n"), &p()).unwrap_err();
             assert!(e.message.contains("sensitive_files"), "{bad}: {e}");
         }
+    }
+
+    #[test]
+    fn redaction_allowlist_is_validated_and_user_layer_only() {
+        let user = parse("redaction_allowlist = [\"^dev-\"]\n", &p()).unwrap();
+        let project = parse("redaction_allowlist = [\".*\"]\n", &p()).unwrap();
+        assert_eq!(
+            layered(&project, &user).redaction_allowlist,
+            Some(vec!["^dev-".to_string()]),
+            "a project cannot exempt its own values"
+        );
+        assert_eq!(
+            layered(&project, &parse("", &p()).unwrap()).redaction_allowlist,
+            None
+        );
+        let w = redaction_allowlist_ignored_warning("p.toml");
+        assert!(
+            w.contains("redaction_allowlist") && w.contains("user config"),
+            "{w}"
+        );
+        let e = parse("redaction_allowlist = [\"(\"]\n", &p()).unwrap_err();
+        assert!(e.message.contains("redaction_allowlist"), "{e}");
     }
 
     #[test]

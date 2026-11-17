@@ -147,6 +147,28 @@ carry no known secret. A tool still runs with the arguments the model sent; a
 crash-resumed intent re-runs with the logged (redacted) arguments. Nothing to do,
 unless something of yours read a secret value back out of a log.
 
+## Secrets tole never knew are masked too (#597)
+
+On top of the known values, every egress sink and the session log now run the
+secret-shape detector shared with uteke (`uteke-privacy`): AWS, GitHub, npm,
+Slack and Google keys, `sk-` keys, bearer headers, JWTs, PEM private keys, URL
+passwords and `NAME=value` secrets become `prefix[REDACTED:<kind>]`. What changes:
+
+- `SecretSet::redact` and `redact_value` are no longer a no-op on an empty set
+  (embedders: the detector runs whatever the set holds). A JSON field is masked
+  by its NAME too (`{"api_key": "<random>"}`).
+- A `web_fetch` URL that looks like it carries a secret is refused, like one
+  carrying a known value (the error says so and names `redaction_allowlist`).
+- The `"redacted"` field of a log entry also lists `shape:<kind>` for a shape mask.
+- False positives are possible. `token = "abc123def456ghi789jkl"` and a URL built
+  as `https://{user}:{pass}@host` are masked, so an `edit_file` `old_string` copied
+  from masked output will not match the file on disk (read the file, or use
+  `read_file_raw`, and quote it from there).
+
+Migrate: keep a false positive with `redaction_allowlist = ["^ghp_0{20}"]` in the
+USER config (regexes matched against the candidate; a project config cannot set it
+and warns when it tries).
+
 ## A session cannot run `tole`, and owner-only subcommands refuse (#684)
 
 In every session kind, `run_command` and `job_start` refuse an argv whose program

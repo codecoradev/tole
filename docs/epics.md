@@ -249,7 +249,7 @@ Everything below is merged; CHANGELOG entries carry the detail.
 - **0.10.0 (released 2026-11-04; 0.10.1 the same day):** `tole-tui`, a pi-style terminal UI — bare `tole` opens it; model,
   reasoning effort, context size and tokens in the footer (epic #464, issues #457–#463). Shipped: skeleton (#459) and the MVP (#460: streaming transcript, editor, footer, inline approvals, Esc cancel), the model picker, thinking level and slash-command menu (#461), and steering, the follow-up queue, collapsible output, `@file` and markdown/diff styling (#462), and #463's `/export` `/copy`, `/fork` `/tree` and the color themes (`default` / `light` / `mono`, `NO_COLOR`, user-config color overrides). The keybinding config (`[tui.keys]`, user config only) is the last #463 part, so #463 is done.
 - **0.11.0 (released 2026-11-14):** the security and automation release; every BREAKING entry has a migration step (`docs/migrating-0.11.md`).
-  - Secrets: `SecretSet` redaction at every sink, widened to more encodings (#595, #681, #682), live tool events redacted (#677), the redacted session log (#596), scoped release with no secrets for `run_command`, `job_start` and cron scripts by default (#598), more files count as sensitive (#683), non-dumpable processes (#675) and owner-only records refused under a session (#684).
+  - Secrets: `SecretSet` redaction at every sink, widened to more encodings (#595, #681, #682), live tool events redacted (#677), the redacted session log (#596), the shared secret-shape detector (#597), scoped release with no secrets for `run_command`, `job_start` and cron scripts by default (#598), more files count as sensitive (#683), non-dumpable processes (#675) and owner-only records refused under a session (#684).
   - Plugins: the plugin lock and rug-pull guard for MCP servers, bound to source, binary and secrets, with refused servers never started (#599, #679, #680), and `tole plugin list|diff|approve|revoke`.
   - Automation (epic #577): `tole cron` with time zones, parked and agent-created jobs, and signed webhooks with `tole hook`.
   - Collaboration (epics #583, #589): profiles, delegation with budget carve and `tole audit`, the advisor, model routing, skills (approved-hash loading, `skill_propose`, the curator) and multi-round discussion with `tole discuss` and the `discuss` tools. `agent_start` and `agent_poll` are deprecated aliases of `delegate` and `delegate_poll`.
@@ -367,7 +367,7 @@ Bot and Nakama; BMAD for collaboration). Design notes:
     done, widened in #681 and #682; live tool events in #677; export,
     handoff, digests and skill drafts reuse it as they land);
   - redacted session log (#596; done);
-  - shared ruleset with uteke (#597; open; its uteke-side issue codecoradev/uteke#1732, the shared detector crate, is closed);
+  - shared ruleset with uteke (#597; done: `uteke-privacy` 0.24.1 wired into `SecretSet::redact` after the known-value pass, same sinks, `[REDACTED:<kind>]`, `redaction_allowlist` for false positives; the uteke-side issue codecoradev/uteke#1732 is closed);
   - scoped release, with no secrets for `run_command` (#598, breaking; done,
     with sensitive files and `read_file_raw`, #676 for verify and stop gates,
     #683 for the wider file list);
@@ -405,7 +405,7 @@ Bot and Nakama; BMAD for collaboration). Design notes:
 
 Order that was followed: E4 #595 first (other epics reuse it), then E1,
 E2 and E3. Remaining order: #809 and #810 (under #750),
-the rest of #748, then #597.
+and the rest of #748 (#597 is done).
 Cross-repo in uteke OSS: document similarity (codecoradev/uteke#1730), personal
 skill library (codecoradev/uteke#1731), shared secret-detector crate
 (codecoradev/uteke#1732, closed).
@@ -414,7 +414,7 @@ skill library (codecoradev/uteke#1731), shared secret-detector crate
 
 | Area | Open issues |
 |------|-------------|
-| Secrets and plugins (epic #594) | #597 shape detector, #600 plugin commands (slice 2: #811, slice 3a skills pin and 3b audit: done), #601 sandbox (#748 commands, #750 operability: #809, #810) |
+| Secrets and plugins (epic #594) | #600 plugin commands (slice 2: #811, slice 3a skills pin and 3b audit: done), #601 sandbox (#748 commands, #750 operability: #809, #810) |
 | Security follow-ups | #813 (decisions left from the #714 and #600 reviews) |
 | Collaboration (epic #583) | none; the epic issue only needs closing |
 | Serve for graphical clients | #571, #572, #573, #574, #575 |
@@ -443,7 +443,6 @@ Parked means: an issue exists and is open, and nobody works on it until the owne
 | #741 `import-hermes` (session import and profile pack) | `[PLAN]`, same direction. Open question: does the import redact or keep text verbatim |
 | #742 serve auth providers: OIDC (and scopes) | Basic is done (owner decisions of 2026-11-17: Basic first, single user with many devices, no session bound to an identity, TLS at a reverse proxy; `tole serve --auth basic`, `tole serve-hash`, `docs/mobile-control.md`). OIDC and the read-only / full scopes remain, parked until the owner picks the next slice |
 | #527 desktop (GPUI), #528 Flutter, #529 web, #561 UI/UX plan, #523 epic | The UI stack waits on the core seams (done: #524 to #526, #558 to #560) and on the serve items #571 to #575. #529 is low priority and its framework (Svelte or React) is undecided |
-| #597 shape detector | Needs the shared crate of uteke (codecoradev/uteke#1732, closed) wired in; no part has merged |
 | #382 multi-client daemon | Closed as a design note (`docs/daemon-design.md`); no build without a user story |
 
 Owner decisions still open:

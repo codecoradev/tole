@@ -1315,6 +1315,14 @@ fn dispatch(cli: Cli) -> Result<()> {
             .and_then(|c| c.sensitive_files.clone())
             .unwrap_or_default(),
     );
+    // Secret-shape detector allowlist (#597): the user layer's regexes,
+    // validated at config load.
+    if let Some(a) = cfg.as_ref().and_then(|c| c.redaction_allowlist.as_ref()) {
+        if let Err(e) = tole_core::secrets::shape::set_allowlist(a) {
+            eprintln!("tole: redaction_allowlist: {e}");
+            std::process::exit(2);
+        }
+    }
     // The selected profile (#584): resolved once, from the layered config
     // (the user layer is its only source). Reads its persona file and
     // nothing else; an unknown name is a startup error. `tole cron`
