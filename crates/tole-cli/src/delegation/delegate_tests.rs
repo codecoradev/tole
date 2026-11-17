@@ -957,7 +957,7 @@ fn doctor_shows_the_headroom_and_a_spawn_stuck_in_the_queue() {
 /// renamed into place, like [`fake_tole`] does: the child's env is the
 /// whole environment of the test run (a CI runner's is over 4 KiB), which
 /// `env` writes in several chunks, and a reader that woke between two of
-/// them took a prefix for the whole file (#702).
+/// them took a prefix for the whole file (#702, #828).
 fn fake_reporter(dir: &Path, name: &str, report: &str) -> PathBuf {
     let body_file = dir.join(format!("{name}.json"));
     std::fs::write(&body_file, report).unwrap();
