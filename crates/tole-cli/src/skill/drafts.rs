@@ -280,6 +280,9 @@ pub fn promote(
     crate::skill_approve::consent(&d.content_hash, hash, interactive, ask)?;
     // Read before anything is written: a malformed approvals file must not
     // leave an unapproved skill behind.
+    // A ledger that fails its checkpoint (#879) stops the promotion here,
+    // before a directory is created.
+    tole_core::skill_approval::verify_checkpoint_at(env.approvals_path)?;
     let mut approvals = Approvals::load(env.approvals_path)?;
 
     let root = skills_root(env.ws)?;
@@ -327,7 +330,7 @@ pub fn promote(
         env.approvals_path,
         &tole_core::skill_approval::ledger_line("approve", &d.name, &pkg.hash, None, env.now),
     )?;
-    approvals.save(env.approvals_path)?;
+    approvals.save_checkpointed(env.approvals_path)?;
     env.store.promote(
         id,
         Promotion {
@@ -361,6 +364,7 @@ pub fn revoke_source(
     if hits.is_empty() {
         return Err(format!("no draft names {source:?} as a session or id"));
     }
+    tole_core::skill_approval::verify_checkpoint_at(approvals_path)?;
     let mut approvals = Approvals::load(approvals_path)?;
     let mut changed = false;
     let mut lines = Vec::new();
@@ -405,7 +409,7 @@ pub fn revoke_source(
         }
     }
     if changed {
-        approvals.save(approvals_path)?;
+        approvals.save_checkpointed(approvals_path)?;
     }
     if lines.is_empty() {
         lines.push("nothing to revoke: every matching draft was already decided".into());
