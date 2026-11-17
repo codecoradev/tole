@@ -283,7 +283,9 @@ fn is_executable_file(p: &Path) -> bool {
     p.is_file()
 }
 
-#[cfg(target_os = "linux")]
+// The pure probe logic below compiles on Linux (where it is used) and in any
+// test build (where its tests run), never as dead code elsewhere.
+#[cfg(any(target_os = "linux", test))]
 /// Whether a spawn error may pass on its own (no process slot, no memory, a
 /// signal): such a failure says nothing about the host, so it is retried and
 /// never cached as "no sandbox here".
@@ -308,11 +310,13 @@ fn probe_classified(bwrap: &Path) -> (Availability, bool) {
 }
 
 /// How many times a probe that failed in a way that may pass is run.
+#[cfg(any(target_os = "linux", test))]
 const PROBE_ATTEMPTS: u64 = 3;
 
 /// Runs `probe` up to [`PROBE_ATTEMPTS`] times while its answer is transient
 /// (the `bool`), sleeping `pause_ms * attempt` between runs; returns the last
 /// answer. A definite answer (usable, or a clean refusal) ends it at once.
+#[cfg(any(target_os = "linux", test))]
 fn retry_transient<F>(mut probe: F, pause_ms: u64) -> (Availability, bool)
 where
     F: FnMut() -> (Availability, bool),
@@ -334,6 +338,7 @@ where
 /// momentary process or memory pressure while it creates the namespace), as
 /// opposed to a clean refusal ("user namespaces not permitted"). The strerror
 /// texts, which bwrap prints verbatim.
+#[cfg(any(target_os = "linux", test))]
 fn transient_bwrap_message(stderr: &str) -> bool {
     [
         "Resource temporarily unavailable",
