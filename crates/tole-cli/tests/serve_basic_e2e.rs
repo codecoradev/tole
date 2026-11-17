@@ -234,7 +234,7 @@ fn spawn(o: Opts) -> Daemon {
 /// Run `tole serve ...` expecting it to refuse; returns its stderr.
 fn refused(args: &[&str], env: &[(&str, &str)]) -> String {
     let home = TestDir::new("tole-basic-refuse");
-    let out = Command::new(env!("CARGO_BIN_EXE_tole"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tole"))
         .arg("serve")
         .args(["--port", &free_port().to_string()])
         .args(args)
@@ -245,9 +245,27 @@ fn refused(args: &[&str], env: &[(&str, &str)]) -> String {
         .env_remove("TOLE_SERVE_BASIC_HASH")
         .envs(env.iter().copied())
         .stdin(Stdio::null())
-        .output()
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
         .unwrap();
-    assert!(!out.status.success(), "it must refuse to start");
+    // A server that wrongly starts must fail the test, not hang it.
+    let status = common::wait_exit(&mut child, Duration::from_secs(30));
+    if status.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let mut stderr = String::new();
+    let _ = child.stderr.take().unwrap().read_to_string(&mut stderr);
+    assert!(
+        status.is_some_and(|s| !s.success()),
+        "it must refuse to start: {stderr}"
+    );
+    let out = std::process::Output {
+        status: status.unwrap(),
+        stdout: Vec::new(),
+        stderr: stderr.into_bytes(),
+    };
     String::from_utf8_lossy(&out.stderr).to_string()
 }
 
@@ -413,6 +431,38 @@ fn the_oversized_upload_answer_is_no_credential_oracle() {
         assert_eq!(r.status, 401, "{auth}");
         assert!(r.header("www-authenticate").is_some());
     }
+
+    // Between the plain 1 MiB cap and the upload ceiling: only the right
+    // password is allowed to have that body read. The others are answered
+    // 401 at once (the body is declared and never sent, so a server that
+    // waited for it would time out here).
+    let mid = |auth: &str, send: usize| {
+        let mut s = TcpStream::connect(("127.0.0.1", d.port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let auth = if auth.is_empty() {
+            String::new()
+        } else {
+            format!("{auth}\r\n")
+        };
+        write!(
+            s,
+            "POST /sessions/{id}/images HTTP/1.1\r\nHost: x\r\n{auth}Content-Length: 3145728\r\n\
+             Connection: close\r\n\r\n"
+        )
+        .unwrap();
+        let _ = s.write_all(&vec![0u8; send]);
+        read_resp(&mut s)
+    };
+    for auth in [basic(USER, "wrong password 0742"), String::new()] {
+        assert_eq!(mid(&auth, 0).status, 401, "{auth}");
+    }
+    let r = mid(&good(), 3 * 1024 * 1024);
+    assert!(
+        r.status != 401 && r.status != 413 && r.status != 0,
+        "the right password has its 3 MiB body read: {} {}",
+        r.status,
+        r.body
+    );
 }
 
 #[test]

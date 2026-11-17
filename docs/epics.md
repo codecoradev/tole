@@ -440,7 +440,7 @@ Parked means: an issue exists and is open, and nobody works on it until the owne
 | Item | Why it is parked |
 |------|------------------|
 | #741 `import-hermes` (session import and profile pack) | `[PLAN]`, same direction. Open question: does the import redact or keep text verbatim |
-| #742 serve auth providers (basic, OIDC) | `[PLAN]`, waits for the remote client direction. Open questions: Basic first or OIDC straight away, single user with many devices or real multi-user, are sessions bound to an identity, TLS stays at a reverse proxy |
+| #742 serve auth providers: OIDC (and scopes) | Basic is done (owner decisions of 2026-11-17: Basic first, single user with many devices, no session bound to an identity, TLS at a reverse proxy; `tole serve --auth basic`, `tole serve-hash`, `docs/mobile-control.md`). OIDC and the read-only / full scopes remain, parked until the owner picks the next slice |
 | #527 desktop (GPUI), #528 Flutter, #529 web, #561 UI/UX plan, #523 epic | The UI stack waits on the core seams (done: #524 to #526, #558 to #560) and on the serve items #571 to #575. #529 is low priority and its framework (Svelte or React) is undecided |
 | #597 shape detector | Needs the shared crate of uteke (codecoradev/uteke#1732, closed) wired in; no part has merged |
 | #382 multi-client daemon | Closed as a design note (`docs/daemon-design.md`); no build without a user story |
@@ -451,7 +451,7 @@ Owner decisions still open:
 - #748: when `verify` and `turnend` become sandboxed by default (decided in principle on 2026-11-14, the phase is not scheduled).
 - #806: the rule that stops a series of merged pull requests from turning develop red. The CONTRIBUTING rule is documented; requiring up-to-date branches or a merge queue is a repository ruleset setting that only the owner can change.
 - #705: Cora Review failing or running 12 minutes and more on larger PRs: cora-code 0.21 chunks the diff and adds `review.exclude` (cora-code#720); the exclude is configured in `.cora.yaml` (closed with that change).
-- #741 and #742: the open questions in the table above. #740 was decided on 2026-11-16 (profile fixed per session process, request wins on resume and is recorded, `[profiles.*]` budget as is, no `memory_room` from a request, profile model else server default) and built as `profile` on `POST /sessions` (create and resume, `docs/mobile-control.md`); what remains of #740 is the `tole sessions list` column and the `tole doctor` line of serve profiles.
+- #741 (the open question in the table above) and #742 (Basic built, decided 2026-11-17: Basic first, single user with many devices, sessions not bound to an identity, TLS stays at a reverse proxy; OIDC and scopes remain). #740 was decided on 2026-11-16 (profile fixed per session process, request wins on resume and is recorded, `[profiles.*]` budget as is, no `memory_room` from a request, profile model else server default) and built as `profile` on `POST /sessions` (create and resume, `docs/mobile-control.md`); what remains of #740 is the `tole sessions list` column and the `tole doctor` line of serve profiles.
 
 ---
 

@@ -140,7 +140,9 @@ tole is the agent harness of the CodeCora ecosystem — the hands:
 - **tole as an HTTP daemon**: `tole serve` (issue #96) exposes the session
   host over token-authenticated REST — remote clients create sessions, run
   turns, and poll status without SSH-ing into the box. Binds 127.0.0.1 by
-  default. `POST /sessions/{id}/cancel` (#178, REST face) stops an
+  default. `--auth basic` (#742, first slice: one user, a PBKDF2 password hash
+  from `tole serve-hash`, TLS at a reverse proxy) adds HTTP Basic next to the
+  bearer token; OIDC and read-only scopes are not built. `POST /sessions/{id}/cancel` (#178, REST face) stops an
   in-flight turn — it settles `stopReason: "cancelled"`.
   `POST /sessions/{id}/interrupt` (#377) steers the running turn instead,
   without losing its work: the `{"text", "urgent"}` message is injected at
