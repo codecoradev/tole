@@ -47,8 +47,21 @@ fn sessions_show_the_recorded_profile_and_stay_unchanged_without_one() {
     session(&dir, "plain", None);
     let (before, ok) = tole(&["sessions"], &work, &home);
     assert!(ok, "{before}");
-    assert!(!before.contains("profile"), "{before}");
-    assert!(before.contains("mtime"), "{before}");
+    // Golden: header and row, byte for byte (the mtime tail is the clock).
+    let mut lines = before.lines();
+    assert_eq!(
+        lines.next().unwrap(),
+        "session                    name               pc             seq  turns  mtime",
+        "{before}"
+    );
+    let row = lines.next().unwrap();
+    let (cols, mtime) = row.split_at(row.len() - 16);
+    assert_eq!(
+        cols, "plain                      -                  Idle             0      0  ",
+        "{before}"
+    );
+    assert!(mtime.starts_with("20"), "{before}");
+    assert_eq!(lines.next(), None, "{before}");
 
     session(&dir, "with-kai", Some(json!({"name": "kai", "atMs": 1})));
     // A tampered name is a placeholder, never echoed.
@@ -69,7 +82,19 @@ fn sessions_show_the_recorded_profile_and_stay_unchanged_without_one() {
     assert!(after.lines().next().unwrap().contains("profile"), "{after}");
     assert!(row("with-kai").contains(" kai "), "{after}");
     assert!(row("tampered").contains(" ? "), "{after}");
-    assert!(row("plain").contains(" - "), "{after}");
+    // The profile cell is its own column: 16 wide, between turns and mtime.
+    let cell = |id: &str| {
+        let r = row(id);
+        r[r.len() - 33..r.len() - 17].trim_end().to_string()
+    };
+    assert_eq!(cell("with-kai"), "kai", "{after}");
+    assert_eq!(cell("tampered"), "?", "{after}");
+    assert_eq!(cell("plain"), "-", "{after}");
+    assert_eq!(
+        after.lines().next().unwrap().len(),
+        row("plain").len() - 16 + "mtime".len(),
+        "{after}"
+    );
     assert!(
         !after.contains("evil") && !after.contains('\u{1b}'),
         "{after:?}"
