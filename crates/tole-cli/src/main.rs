@@ -615,6 +615,29 @@ enum Command {
         #[arg(long)]
         token_file: Option<std::path::PathBuf>,
 
+        /// Authentication (#742): `token` (default; the bearer token above)
+        /// or `basic` (HTTP Basic, one user, a password hash; the bearer
+        /// token, when one is set, keeps working next to it). TLS is not
+        /// served here: terminate it at a reverse proxy.
+        #[arg(long, default_value = "token", value_parser = ["token", "basic"])]
+        auth: String,
+
+        /// `--auth basic`: the user name (or TOLE_SERVE_BASIC_USER).
+        #[arg(long)]
+        basic_user: Option<String>,
+
+        /// `--auth basic`: read the password hash made by `tole serve-hash`
+        /// from this file (or TOLE_SERVE_BASIC_HASH). There is no hash flag:
+        /// a command-line value is visible to every local process.
+        #[arg(long)]
+        basic_hash_file: Option<std::path::PathBuf>,
+
+        /// `--auth basic` on a non-loopback `--bind`: accept that the
+        /// credentials cross the network in clear text unless TLS is
+        /// terminated in front of this server. Refused without it.
+        #[arg(long)]
+        allow_insecure_basic: bool,
+
         /// Same semantics as `run --allow` (Write pre-authorization).
         #[arg(long = "allow")]
         allow_patterns: Vec<String>,
@@ -1921,6 +1944,10 @@ fn dispatch(cli: Cli) -> Result<()> {
             transport,
             token,
             token_file,
+            auth,
+            basic_user,
+            basic_hash_file,
+            allow_insecure_basic,
             allow_patterns: _,
             workspace,
             memory,
@@ -1946,19 +1973,50 @@ fn dispatch(cli: Cli) -> Result<()> {
                 None => host.memory.clone(),
             };
             let workspace = workspace.or_else(|| host.workspace.clone());
-            // Both transports refuse to start without a token (#96/#137).
+            // Both transports refuse to start without credentials (#96/#137).
             if token.is_some() {
                 eprintln!(
                     "tole serve: warning: --token on the command line is visible to every local \
                      process (ps, /proc/<pid>/cmdline); use TOLE_SERVE_TOKEN or --token-file"
                 );
             }
-            let token = crate::serve::serve_token(
-                token,
-                token_file.as_deref(),
-                std::env::var("TOLE_SERVE_TOKEN").ok(),
-            )
-            .map_err(anyhow::Error::msg)?;
+            let env_token = std::env::var("TOLE_SERVE_TOKEN").ok();
+            let auth = if auth == "basic" {
+                let basic = tole_cli::auth::resolve_basic(
+                    basic_user,
+                    basic_hash_file.as_deref(),
+                    std::env::var("TOLE_SERVE_BASIC_USER").ok(),
+                    std::env::var("TOLE_SERVE_BASIC_HASH").ok(),
+                )
+                .map_err(anyhow::Error::msg)?;
+                // Basic sends a reusable password on every request: in clear
+                // text it is worse than the token, so a bind beyond loopback
+                // needs the owner's word that TLS ends in front of it.
+                if !tole_cli::auth::is_loopback_bind(&bind) && !allow_insecure_basic {
+                    bail!(
+                        "refusing --auth basic on --bind {bind}: HTTP Basic over plain HTTP \
+                         exposes the password to the network. Keep the default loopback bind \
+                         and put a TLS reverse proxy in front, or pass --allow-insecure-basic \
+                         if TLS ends in front of this server"
+                    );
+                }
+                // The bearer token is optional here; one that is set works too.
+                let token =
+                    crate::serve::serve_token_optional(token, token_file.as_deref(), env_token)
+                        .map_err(anyhow::Error::msg)?;
+                tole_cli::auth::Authenticator::new(token, Some(basic))
+            } else {
+                if basic_user.is_some() || basic_hash_file.is_some() || allow_insecure_basic {
+                    bail!(
+                        "--basic-user, --basic-hash-file and --allow-insecure-basic need \
+                         --auth basic"
+                    );
+                }
+                tole_cli::auth::Authenticator::token(
+                    crate::serve::serve_token(token, token_file.as_deref(), env_token)
+                        .map_err(anyhow::Error::msg)?,
+                )
+            };
             if transport == "mcp" {
                 #[cfg(feature = "mcp-http")]
                 {
@@ -1966,7 +2024,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                     return rt.block_on(crate::mcp_http::run_mcp_http(
                         &bind,
                         port,
-                        &token,
+                        auth,
                         allow_patterns,
                         host.plan_mode,
                         memory,
@@ -1981,7 +2039,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             crate::serve::run_serve(crate::serve::ServeConfig {
                 bind,
                 port,
-                token: Some(token),
+                auth,
                 allow_patterns,
                 workspace,
                 plan_mode: host.plan_mode,

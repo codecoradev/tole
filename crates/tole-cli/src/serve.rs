@@ -23,9 +23,12 @@
 //!   in that session's log (#558; see `tole_cli::serve_images`)
 //!
 //! v1 scope: REST only (MCP-over-HTTP is the follow-up; the engine calls
-//! are identical). Auth is a static bearer token (env `TOLE_SERVE_TOKEN`
-//! or `--token`) — refuses to start without one. Binds 127.0.0.1 by
-//! default; `--bind` overrides for trusted networks.
+//! are identical). Auth is a static bearer token (env `TOLE_SERVE_TOKEN`,
+//! `--token-file` or `--token`) or, with `--auth basic`, HTTP Basic against a
+//! password hash (#742; the token still works next to it when one is set) —
+//! refuses to start without credentials. Binds 127.0.0.1 by default; `--bind`
+//! overrides for trusted networks (Basic refuses a non-loopback bind unless
+//! `--allow-insecure-basic`: TLS terminates at a reverse proxy).
 //!
 //! HTTP is hand-rolled on std::net (tole's no-new-deps rule for host
 //! plumbing): HTTP/1.1, Content-Length bodies only, one request per
@@ -50,7 +53,8 @@ use tole_core::storage::Storage;
 pub struct ServeConfig {
     pub bind: String,
     pub port: u16,
-    pub token: Option<String>,
+    /// The one authentication check (#742): bearer token and/or Basic.
+    pub auth: tole_cli::auth::Authenticator,
     pub allow_patterns: Vec<String>,
     pub workspace: Option<String>,
     pub plan_mode: bool,
@@ -82,7 +86,8 @@ struct State {
     profiles: ProfileSource,
     plan_mode: bool,
     memory: Option<MemoryConfig>,
-    token: String,
+    /// Every route's auth, through `Authenticator::check` only (#742).
+    auth: tole_cli::auth::Authenticator,
     /// Jail-of-jails root (canonical): `--workspace`, else the server
     /// cwd. Client-supplied session cwds must resolve inside it.
     workspace_root: std::path::PathBuf,
@@ -122,7 +127,6 @@ pub fn run_serve(cfg: ServeConfig) -> Result<()> {
     // No human answers a serve session's start-up: an `optional` sandbox
     // counts as `required` here (#601).
     tole_core::sandbox::mark_unattended();
-    let token = resolve_token(&cfg.token)?;
     let workspace_root = crate::resolve_workspace_root(cfg.workspace.as_ref())
         .context("resolving --workspace for the session jail root")?;
     // Webhook routes (#582), user config only: a route that cannot load
@@ -138,12 +142,7 @@ pub fn run_serve(cfg: ServeConfig) -> Result<()> {
         }
         _ => Default::default(),
     };
-    let loopback = cfg.bind == "localhost"
-        || cfg
-            .bind
-            .trim_matches(['[', ']'])
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback());
+    let loopback = tole_cli::auth::is_loopback_bind(&cfg.bind);
     let hooks = tole_cli::hooks::load(&hook_cfg, loopback, &|k| std::env::var(k).ok())
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     tole_cli::hooks::hold_keys(&hooks);
@@ -162,7 +161,7 @@ pub fn run_serve(cfg: ServeConfig) -> Result<()> {
         profiles: cfg.profiles.clone(),
         plan_mode: cfg.plan_mode,
         memory: cfg.memory.clone(),
-        token,
+        auth: cfg.auth,
         workspace_root,
         sessions_dir: cfg.sessions_dir.clone(),
         turnend: cfg.turnend.clone(),
@@ -211,19 +210,6 @@ pub fn run_serve(cfg: ServeConfig) -> Result<()> {
     Ok(())
 }
 
-fn resolve_token(flag: &Option<String>) -> Result<String> {
-    if let Some(t) = flag.as_deref().filter(|t| !t.trim().is_empty()) {
-        return Ok(t.trim().to_string());
-    }
-    if let Ok(t) = std::env::var("TOLE_SERVE_TOKEN") {
-        let t = t.trim().to_string();
-        if !t.is_empty() {
-            return Ok(t);
-        }
-    }
-    anyhow::bail!("refusing to start an unauthenticated server: set --token or TOLE_SERVE_TOKEN")
-}
-
 /// Largest `--token-file`.
 const MAX_TOKEN_FILE: u64 = 4096;
 
@@ -239,6 +225,21 @@ pub fn serve_token(
     file: Option<&std::path::Path>,
     env: Option<String>,
 ) -> std::result::Result<String, String> {
+    serve_token_optional(flag, file, env)?.ok_or_else(|| {
+        "refusing to start an unauthenticated server: set TOLE_SERVE_TOKEN, --token-file \
+         or --token"
+            .to_string()
+    })
+}
+
+/// [`serve_token`] where having no token at all is not an error: `--auth
+/// basic` may run with the Basic user alone (#742). A file or value that is
+/// given but unusable is still an error.
+pub fn serve_token_optional(
+    flag: Option<String>,
+    file: Option<&std::path::Path>,
+    env: Option<String>,
+) -> std::result::Result<Option<String>, String> {
     let from_file = match file {
         Some(p) => {
             let bytes = tole_core::delegation_report::read_plain_file(p, MAX_TOKEN_FILE)
@@ -257,13 +258,10 @@ pub fn serve_token(
         .into_iter()
         .flatten()
         .map(|t| t.trim().to_string())
-        .find(|t| !t.is_empty())
-        .ok_or_else(|| {
-            "refusing to start an unauthenticated server: set TOLE_SERVE_TOKEN, --token-file \
-             or --token"
-                .to_string()
-        })?;
-    tole_core::secrets::add_role_secret("TOLE_SERVE_TOKEN", &token);
+        .find(|t| !t.is_empty());
+    if let Some(t) = &token {
+        tole_core::secrets::add_role_secret("TOLE_SERVE_TOKEN", t);
+    }
     Ok(token)
 }
 
@@ -357,6 +355,9 @@ struct Request {
     method: String,
     path: String,
     authorization: Option<String>,
+    /// The verdict `read_request` already reached for this header (only an
+    /// image upload is checked while reading), so it is hashed once.
+    verdict: Option<bool>,
     /// `Last-Event-ID`: where an SSE client left off (`EventSource` sends it
     /// on reconnect).
     last_event_id: Option<String>,
@@ -377,7 +378,10 @@ enum ReadError {
     /// 413 only for the right token, otherwise the same 401 a small body
     /// gets. The ceiling depends on the token, so answering 413 before
     /// auth would be a token-validity oracle outside the limiter (#558).
-    TooLarge { authorization: Option<String> },
+    TooLarge {
+        authorization: Option<String>,
+        verdict: Option<bool>,
+    },
     /// `/hooks/<route>` for a route that does not exist (404, body unread).
     NoHookRoute,
     /// A webhook body over its route's cap (413, body unread). Webhooks do
@@ -423,7 +427,8 @@ impl Read for DeadlineReader<'_> {
 
 fn read_request(
     stream: &TcpStream,
-    token: &str,
+    auth: &tole_cli::auth::Authenticator,
+    limited: bool,
     hooks: &std::collections::BTreeMap<String, tole_cli::hooks::Route>,
 ) -> Result<Request, ReadError> {
     let mut reader = BufReader::new(DeadlineReader {
@@ -532,10 +537,11 @@ fn read_request(
         }
     }
     // The larger upload ceiling only for an image upload that already
-    // carries the right token: pre-auth buffering stays at MAX_BODY_BYTES.
-    let upload = method == "POST"
-        && upload_target(&path).is_some()
-        && tole_cli::auth::bearer_matches(authorization.as_deref(), token);
+    // carries a valid credential: pre-auth buffering stays at MAX_BODY_BYTES.
+    // An IP over its failure budget is not even checked (no hashing for it).
+    let verdict = (method == "POST" && upload_target(&path).is_some() && !limited)
+        .then(|| auth.check(authorization.as_deref()));
+    let upload = verdict == Some(true);
     let ceiling = if upload {
         MAX_UPLOAD_BYTES
     } else {
@@ -543,7 +549,10 @@ fn read_request(
     };
     if content_length > ceiling {
         // Refuse rather than buffer it.
-        return Err(ReadError::TooLarge { authorization });
+        return Err(ReadError::TooLarge {
+            authorization,
+            verdict,
+        });
     }
     if upload {
         reader.get_mut().deadline = Instant::now() + UPLOAD_READ_DEADLINE;
@@ -563,6 +572,7 @@ fn read_request(
         method,
         path,
         authorization,
+        verdict,
         last_event_id,
         body,
         hook,
@@ -590,10 +600,25 @@ fn reason_phrase(status: u16) -> &'static str {
 }
 
 fn respond(stream: &mut TcpStream, status: u16, payload: &serde_json::Value) {
+    respond_with(stream, status, payload, "");
+}
+
+/// The 401 of every refused request: one body whatever was wrong (no user
+/// or password verdict), and the Basic challenge when Basic is on.
+fn respond_unauthorized(stream: &mut TcpStream, auth: &tole_cli::auth::Authenticator) {
+    let extra = auth
+        .challenge()
+        .map(|c| format!("WWW-Authenticate: {c}\r\n"))
+        .unwrap_or_default();
+    respond_with(stream, 401, &json!({"error": "unauthorized"}), &extra);
+}
+
+/// `extra` is zero or more complete `Name: value\r\n` header lines.
+fn respond_with(stream: &mut TcpStream, status: u16, payload: &serde_json::Value, extra: &str) {
     let body = payload.to_string();
     let reason = reason_phrase(status);
     let head = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     let _ = stream.write_all(head.as_bytes());
@@ -615,29 +640,33 @@ impl Drop for ConnGuard {
 
 fn handle_conn(mut stream: TcpStream, state: Arc<State>) {
     let _guard = ConnGuard(Arc::clone(&state));
-    let req = match read_request(&stream, &state.token, &state.hooks) {
+    let peer_ip = stream.peer_addr().ok().map(|a| a.ip());
+    let limited = peer_ip.is_some_and(|ip| state.auth_failures.is_limited(ip));
+    let req = match read_request(&stream, &state.auth, limited, &state.hooks) {
         Ok(r) => r,
         Err(ReadError::Io) => return,
         Err(ReadError::Bad(msg)) => {
             respond(&mut stream, 400, &json!({"error": msg}));
             return;
         }
-        Err(ReadError::TooLarge { authorization }) => {
+        Err(ReadError::TooLarge {
+            authorization,
+            verdict,
+        }) => {
             // Authenticate first, through the same limiter as every other
             // request, so the answer never tells a wrong token from a right
             // one without a recorded failure.
-            let peer_ip = stream.peer_addr().ok().map(|a| a.ip());
-            if peer_ip.is_some_and(|ip| state.auth_failures.is_limited(ip)) {
+            if limited {
                 respond(
                     &mut stream,
                     429,
                     &json!({"error": "too many failed auth attempts"}),
                 );
-            } else if !tole_cli::auth::bearer_matches(authorization.as_deref(), &state.token) {
+            } else if !verdict.unwrap_or_else(|| state.auth.check(authorization.as_deref())) {
                 if let Some(ip) = peer_ip {
                     state.auth_failures.record_failure(ip);
                 }
-                respond(&mut stream, 401, &json!({"error": "unauthorized"}));
+                respond_unauthorized(&mut stream, &state.auth);
             } else {
                 respond(
                     &mut stream,
@@ -664,10 +693,9 @@ fn handle_conn(mut stream: TcpStream, state: Arc<State>) {
     // Auth: bearer token on everything except /health (which carries no
     // information — it is a liveness probe). Failed auths are rate-limited
     // per source IP (CodeCora scan-3 Wave-2: brute-force hardening).
-    let peer_ip = stream.peer_addr().ok().map(|a| a.ip());
 
     // Rate-limit: refuse when this IP has too many recent auth failures.
-    if peer_ip.is_some_and(|ip| state.auth_failures.is_limited(ip)) {
+    if limited {
         respond(
             &mut stream,
             429,
@@ -685,13 +713,17 @@ fn handle_conn(mut stream: TcpStream, state: Arc<State>) {
         }
     }
 
+    // The one auth check (#742): every route below this line is behind it,
+    // for a bearer token and for Basic alike.
     let authorized = req.path == "/health"
-        || tole_cli::auth::bearer_matches(req.authorization.as_deref(), &state.token);
+        || req
+            .verdict
+            .unwrap_or_else(|| state.auth.check(req.authorization.as_deref()));
     if !authorized {
         if let Some(ip) = peer_ip {
             state.auth_failures.record_failure(ip);
         }
-        respond(&mut stream, 401, &json!({"error": "unauthorized"}));
+        respond_unauthorized(&mut stream, &state.auth);
         return;
     }
 
@@ -1925,7 +1957,7 @@ mod tests {
             profiles: Default::default(),
             plan_mode: false,
             memory: None,
-            token: "t".into(),
+            auth: tole_cli::auth::Authenticator::token("t".into()),
             workspace_root: root,
             sessions_dir: Some(sessions_dir),
             turnend: vec![],
