@@ -192,6 +192,17 @@ that makes them stale. This regression has happened twice (#33 and again
   release ranges (v0.9.0: 87 files, ~14.7k lines). The release PR was
   reviewed instead with `cora mcp` `review_prepare` / `review_finalize`
   (agent as reviewer) over ~4k-line chunks, with the verdict posted on the PR.
+- **2026-11-17:** cora-code **0.21.1** is released. The CI action
+  (`codecoradev/cora-review-action@v1`, `cora-version: latest`) therefore
+  runs it: it chunks a large diff (`review.max_chunk_chars`, default 48,000
+  characters), retries an unanswered review in smaller pieces, honours
+  `review.exclude` (set in `.cora.yaml`, #705) and exits 1 on an incomplete
+  review (`review.fail_on_incomplete`). A cora binary can be installed in a
+  container without a build: `CORA_VERSION=v0.21.1 CORA_INSTALL_DIR=<dir> sh
+  install.sh` from the cora-code repository (the `/releases/latest` lookup
+  gets a 403 through the container proxy, so pin the version; checksum-only
+  without cosign). Without an LLM key `cora review --staged --no-llm` runs the
+  deterministic checks only; the agent-as-reviewer path is `cora mcp`.
 - **2026-09-18:** cora 0.13.0 no longer reads the legacy `~/.cora/auth.toml`
   / `~/.cora/config.yaml`. Until re-provisioned with `cora auth login`,
   exports are required: `CORA_API_KEY`, `CORA_BASE_URL`, `CORA_MODEL`

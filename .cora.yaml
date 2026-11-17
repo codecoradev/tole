@@ -22,10 +22,9 @@ ignore:
     - "*.lock"
     - "Cargo.lock"
     - "target/"
-    # #705: generated or prose files. NOTE: in cora 0.20 `ignore.files` scopes
-    # the symbol index and the context chain (what is injected as surrounding
-    # code), not the diff the reviewer reads; a PR's own CHANGELOG/docs lines
-    # still count toward its size until cora-code can exclude paths from a diff.
+    # #705: generated or prose files. `ignore.files` scopes the symbol index
+    # and the context chain (what is injected as surrounding code), not the
+    # diff the reviewer reads; the diff is filtered by `review.exclude` below.
     - "CHANGELOG.md"
     - "docs/**"
   rules:
@@ -48,6 +47,19 @@ ignore:
     #   diagnostics channel. The real constraint (tole-core never writes to
     #   stdout) is enforced precisely by the core-no-stdout rule below.
     - "bug-println"
+
+# #705 (cora 0.21): files removed from the REVIEWED DIFF. They are never sent
+# to the model and never produce a finding, so a PR's changelog, docs and
+# lockfile lines no longer count toward its size. Large diffs are chunked by
+# whole files above review.max_chunk_chars (cora's default), and a review that
+# did not cover the whole diff exits 1 (`fail_on_incomplete`, the default):
+# the CI job fails visibly instead of passing on a partial review.
+review:
+  exclude:
+    - "CHANGELOG.md"
+    - "docs/**"
+    - "*.lock"
+    - "Cargo.lock"
 
 # Deterministic custom rules (no LLM; run by `cora review` and `cora scan`).
 # `languages` takes file extensions, and `exclude` is required.
