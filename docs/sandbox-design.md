@@ -1122,6 +1122,21 @@ commands follow `run_command` and `job_start`. Default `off`, user config only;
 
 ## 10. Failure behaviour
 
+**Finding and probing the backend (#748).** `bwrap` is an executable regular
+file in an ABSOLUTE `PATH` entry; a relative or empty entry (the working
+directory, which the model writes) is skipped, and a file without the execute
+bit does not shadow a working one behind it. The first candidate that passes
+the probe wins. A definite answer is cached for the process; a failure that may
+pass (a spawn error of kind WouldBlock, Interrupted or OutOfMemory, or a smoke
+run whose stderr carries bwrap's strerror text for EAGAIN, ENOMEM or EINTR) is
+retried three times and, if it persists, answered but not cached, so one bad
+moment is not a permanent "no sandbox" for a long-lived `tole serve`. A clean
+refusal ("No permissions to creating new namespace") is cached. Residuals: a
+persistent transient failure is probed again on each later launch; the
+classification reads bwrap's message text, so an unrecognised wording is cached
+as a refusal; the first usable candidate is executed to be probed, and a
+writable ABSOLUTE `PATH` directory is still trusted, as for every mode.
+
 At startup tole resolves the backend once: `bwrap` on `PATH`, version
 ≥ 0.8, then a self-test spawn (`bwrap … -- /bin/true`, ~8 ms) to catch
 kernels or containers that refuse user namespaces (Docker's default
