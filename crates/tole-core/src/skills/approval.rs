@@ -58,7 +58,9 @@ const LIMITS: Limits = Limits {
 
 /// The append-only audit ledger next to the approvals file (#600): one line
 /// per approve and revoke, never rewritten. It is authoritative over the
-/// approvals file for every skill it names (see [`check_against_ledger`]).
+/// approvals file for every skill it names (see [`check_against_ledger`]),
+/// and the approvals file records its length and hash (#879,
+/// [`LedgerCheckpoint`]) so that deleting or truncating it is noticed.
 pub const LEDGER_FILE: &str = "skill-ledger.jsonl";
 /// Largest ledger read.
 pub const MAX_LEDGER_BYTES: u64 = 16 * 1024 * 1024;

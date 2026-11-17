@@ -195,10 +195,14 @@ pub fn doctor_lines(
     path: Option<&Path>,
     workspace: Option<&Path>,
 ) -> Vec<String> {
-    let gate = match gate_from(env, path) {
-        Ok((g, _)) => g,
+    let (gate, notes) = match gate_from(env, path) {
+        Ok(x) => x,
         Err(e) => return vec![format!("  ! skills: {e}")],
     };
+    // A ledger that fails its checkpoint (#879) refuses every approval.
+    if let Some(n) = notes.iter().find(|n| n.starts_with("ERROR: ")) {
+        return vec![format!("  ! skills: {n}")];
+    }
     if gate == Gate::Open {
         return vec![format!(
             "  skills: approval off ({APPROVAL_ENV}=off): every discovered skill loads"
@@ -1121,6 +1125,11 @@ mod tests {
             assert!(audit_rows_at(Some(&dir), &path)
                 .unwrap_err()
                 .contains("recheckpoint"));
+            let doctor = doctor_lines(&env(None), Some(&path), Some(&dir));
+            assert!(
+                doctor.len() == 1 && doctor[0].starts_with("  ! skills: ERROR:"),
+                "{doctor:?}"
+            );
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
