@@ -311,8 +311,8 @@ impl SecretSet {
         match self.redact_known(text) {
             // Known values first (their `«NAME»` marker wins), then the
             // shared shape detector for secrets nobody told us about (#597).
-            Cow::Borrowed(t) => shape::redact_shapes(t),
-            Cow::Owned(o) => match shape::redact_shapes(&o) {
+            Cow::Borrowed(t) => shape::redact_shapes(t, &self.inner.markers),
+            Cow::Owned(o) => match shape::redact_shapes(&o, &self.inner.markers) {
                 Cow::Borrowed(_) => Cow::Owned(o),
                 Cow::Owned(r) => Cow::Owned(r),
             },
@@ -418,7 +418,7 @@ impl SecretSet {
     fn redact_field(&self, key: &str, value: &str) -> String {
         let v = self.redact(value).into_owned();
         let prefix = format!("{key}=");
-        match shape::redact_shapes(&format!("{prefix}{v}")) {
+        match shape::redact_shapes(&format!("{prefix}{v}"), &self.inner.markers) {
             Cow::Owned(o) if o.starts_with(&prefix) => o[prefix.len()..].to_string(),
             _ => v,
         }

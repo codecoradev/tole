@@ -188,3 +188,78 @@ fn a_marker_inside_a_pem_body_does_not_leak_the_key() {
         }
     }
 }
+
+/// Every real marker is swapped, whatever its name holds: a known secret
+/// whose NAME has other characters (an env var like `ProgramFiles(x86)`)
+/// must not leave a non-ASCII `«NAME»` that switches the detector off for a
+/// secret glued to it.
+#[test]
+fn markers_with_unusual_names_never_hide_a_glued_secret() {
+    let value = "kv_Value-0597-known";
+    let long64 = "N".repeat(64);
+    let long65 = "N".repeat(65);
+    let long300 = "L".repeat(300);
+    let names: Vec<&str> = vec![
+        "ProgramFiles(x86)",
+        "A:B",
+        "BASH_FUNC_x%%",
+        "ÄB",
+        "a b",
+        &long64,
+        &long65,
+        &long300,
+        "a»b",
+        "»",
+        "a«b",
+        "«",
+        "qzk",
+        "qzkk0x",
+        "qzkk0x»",
+        "9",
+        "1x",
+        "x",
+        "tab\there",
+        "bell\u{7}",
+        "",
+    ];
+    for name in names {
+        let s = SecretSet::default().with(name, value);
+        for text in [
+            format!("API_KEY={value}{U}"),
+            format!("API_KEY={U}{value}"),
+            format!("https://bob:{value}{U}@h"),
+            format!("https://{value}:{U}@h"),
+            format!("Authorization: Bearer {value}{U}"),
+            format!("curl --password={value}{U} x"),
+        ] {
+            let out = s.redact(&text);
+            assert!(!out.contains(U), "name {name:?}: {text:?} leaked: {out:?}");
+            assert!(
+                !out.contains(value),
+                "name {name:?}: known value leaked: {out:?}"
+            );
+        }
+        // The legitimate position keeps the (unusual) name.
+        let out = s
+            .redact(&format!("API_KEY={value} and https://bob:{value}@h"))
+            .into_owned();
+        assert!(
+            out.contains(&format!("«{name}»")),
+            "name {name:?} lost: {out:?}"
+        );
+    }
+}
+
+/// The restore is one pass: a large marker count stays linear (the old
+/// restore was one `replace` per marker over the whole text).
+#[test]
+fn a_large_marker_count_is_restored_in_one_pass() {
+    let n = 50_000;
+    let text = format!("{}API_KEY={U}", "«A»".repeat(n));
+    let out = SecretSet::default().redact(&text);
+    assert!(!out.contains(U));
+    assert_eq!(out.matches("«A»").count(), n, "every marker restored once");
+    // A stand-in look-alike beyond the swapped indexes is left as written.
+    let odd = SecretSet::default().redact("«A» qzk99999x qzk0x");
+    assert_eq!(odd, "«A» qzk99999x qzk0x");
+}

@@ -51,11 +51,14 @@ fn builtin() -> Vec<String> {
     ]
 }
 
-/// Swaps every `«NAME»` for an ASCII stand-in (see [`T`]): the detector
-/// treats a non-ASCII value as prose, so a secret glued to a marker would
-/// otherwise be skipped. Returns the scan copy, the prefix and the markers.
-/// `None` when there is no marker. Never skipped, whatever bytes the text holds.
-fn swap_markers(text: &str) -> Option<(String, String, Vec<String>)> {
+/// Swaps every marker for an ASCII stand-in (see [`T`]): the detector treats
+/// a non-ASCII value as prose, so a secret glued to a marker would otherwise
+/// be skipped. A marker is any of `known` (the set's exact `«NAME»` strings,
+/// whatever characters the name holds, longest first) or a well-formed
+/// `«[A-Za-z0-9_.-]{1,64}»` span. Returns the scan copy, the prefix and the
+/// markers by index. `None` when there is no marker. Never skipped, whatever
+/// bytes the text holds.
+fn swap_markers<'a>(text: &'a str, known: &[String]) -> Option<(String, String, Vec<&'a str>)> {
     if !text.contains('«') {
         return None;
     }
@@ -67,25 +70,75 @@ fn swap_markers(text: &str) -> Option<(String, String, Vec<String>)> {
         .max()
         .unwrap_or(0);
     let prefix = format!("qz{}", "k".repeat(run + 1));
-    let (mut out, mut names) = (String::with_capacity(text.len()), Vec::new());
+    let mut order: Vec<&str> = known.iter().map(String::as_str).collect();
+    order.sort_by_key(|m| std::cmp::Reverse(m.len()));
+    let (mut out, mut names): (String, Vec<&str>) = (String::with_capacity(text.len()), Vec::new());
     let mut rest = text;
     while let Some(i) = rest.find('«') {
-        let after = &rest[i + '«'.len_utf8()..];
-        let name_len = after
-            .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')))
-            .unwrap_or(after.len());
-        if (1..=64).contains(&name_len) && after[name_len..].starts_with('»') {
-            out.push_str(&rest[..i]);
-            out.push_str(&format!("{prefix}{}x", names.len()));
-            names.push(rest[i..i + '«'.len_utf8() + name_len + '»'.len_utf8()].to_string());
-            rest = &after[name_len + '»'.len_utf8()..];
-        } else {
-            out.push_str(&rest[..i + '«'.len_utf8()]);
-            rest = after;
+        let here = &rest[i..];
+        let len = order
+            .iter()
+            .find(|m| !m.is_empty() && here.starts_with(**m))
+            .map(|m| m.len())
+            .or_else(|| generic_marker_len(here));
+        match len {
+            Some(n) => {
+                out.push_str(&rest[..i]);
+                out.push_str(&prefix);
+                out.push_str(&names.len().to_string());
+                out.push('x');
+                names.push(&here[..n]);
+                rest = &here[n..];
+            }
+            None => {
+                out.push_str(&rest[..i + '«'.len_utf8()]);
+                rest = &here['«'.len_utf8()..];
+            }
         }
     }
     out.push_str(rest);
     Some((out, prefix, names))
+}
+
+/// Length of a well-formed `«NAME»` at the start of `s`, if there is one.
+fn generic_marker_len(s: &str) -> Option<usize> {
+    let after = s.strip_prefix('«')?;
+    let name_len = after
+        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')))
+        .unwrap_or(after.len());
+    ((1..=64).contains(&name_len) && after[name_len..].starts_with('»'))
+        .then(|| '«'.len_utf8() + name_len + '»'.len_utf8())
+}
+
+/// Puts the markers back in ONE pass: every `<prefix><i>x` whose index this
+/// call created becomes its marker; anything else is copied as it is (the
+/// prefix cannot occur in the input, but the pass does not rely on it for
+/// memory safety or time).
+fn restore_markers(masked: &str, prefix: &str, names: &[&str]) -> String {
+    let mut out = String::with_capacity(masked.len());
+    let mut rest = masked;
+    while let Some(i) = rest.find(prefix) {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i + prefix.len()..];
+        let digits = tail.bytes().take_while(u8::is_ascii_digit).count();
+        let marker = tail[digits..]
+            .starts_with('x')
+            .then(|| tail[..digits].parse::<usize>().ok())
+            .flatten()
+            .and_then(|n| names.get(n));
+        match marker {
+            Some(m) => {
+                out.push_str(m);
+                rest = &tail[digits + 1..];
+            }
+            None => {
+                out.push_str(prefix);
+                rest = tail;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 fn policy(user: &[String]) -> Result<Policy, String> {
@@ -122,10 +175,11 @@ pub fn masked_kinds(text: &str) -> Vec<String> {
     out
 }
 
-/// Masks every secret shape in `text`; borrowed when there is none.
-pub fn redact_shapes(text: &str) -> Cow<'_, str> {
+/// Masks every secret shape in `text`; borrowed when there is none. `known`
+/// are the set's exact `«NAME»` markers, kept out of the detector's way.
+pub fn redact_shapes<'a>(text: &'a str, known: &[String]) -> Cow<'a, str> {
     let set = POLICY.read().ok().and_then(|g| g.clone());
-    let (scan, prefix, names) = match swap_markers(text) {
+    let (scan, prefix, names) = match swap_markers(text, known) {
         Some((t, p, n)) => (Cow::Owned(t), p, n),
         None => (Cow::Borrowed(text), String::new(), Vec::new()),
     };
@@ -140,9 +194,8 @@ pub fn redact_shapes(text: &str) -> Cow<'_, str> {
     if out.is_clean() {
         return Cow::Borrowed(text);
     }
-    let mut masked = out.text;
-    for (i, m) in names.iter().enumerate() {
-        masked = masked.replace(&format!("{prefix}{i}x"), m);
+    if names.is_empty() {
+        return Cow::Owned(out.text);
     }
-    Cow::Owned(masked)
+    Cow::Owned(restore_markers(&out.text, &prefix, &names))
 }
