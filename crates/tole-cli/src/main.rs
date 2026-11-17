@@ -1120,6 +1120,17 @@ fn dispatch(cli: Cli) -> Result<()> {
                     &config_apply::real_env,
                 )?;
                 println!("{out}");
+                // An unset verify or turnend is not "off" (#748): say what the
+                // default is, since the listing above shows only written keys.
+                for k in ["verify", "turnend"] {
+                    if !out.contains(&format!("sandbox.consumers.{k} = ")) {
+                        println!(
+                            "sandbox.consumers.{k}: not set, so optional (default): sandboxed \
+                             where bubblewrap works, unsandboxed with a warning only where the \
+                             host has no sandbox; set it to \"off\" in the user config to opt out"
+                        );
+                    }
+                }
                 // Validity != trust: the exit code stays 0 either way.
                 if tole_cli::config::discover(&cwd, explicit).is_some() {
                     let (subject, _) = tole_cli::config_trust::Subject::resolve(&cwd, explicit)?;
@@ -1281,6 +1292,17 @@ fn dispatch(cli: Cli) -> Result<()> {
             .unwrap_or_else(tole_core::sandbox::command::Consumers::host_default),
     ) {
         eprintln!("tole: warning: {e}");
+    }
+    // Probe the backend NOW when a consumer is only optional by default (#748):
+    // the default degrades to "no sandbox" on a negative answer, so the answer
+    // must be had before the model runs a command (serve, acp, mcp and the stop
+    // gates have no start-up check of their own), and a definite one is cached.
+    {
+        use tole_core::sandbox::command::{consumers, Consumer};
+        let c = consumers();
+        if c.implicit(Consumer::Verify) || c.implicit(Consumer::TurnEnd) {
+            let _ = tole_core::sandbox::detect();
+        }
     }
     // The default flip's fallback (verify or turnend, optional by default, no
     // sandbox backend on this host) goes to the ledger as well as stderr.

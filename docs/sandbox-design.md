@@ -1020,6 +1020,22 @@ on every project of that kind, and a missing sandbox into a refusal).
   (§9.4, "The launcher failing is not the command failing"). `verify` ends
   `verify_refused`, a stop gate is denied, as before. An explicit `optional` or
   `required` on a host with no backend still refuses; explicit `off` disables.
+- **Finding the backend (hardened with the flip).** The default degrades on a
+  negative answer, so the answer must be right: `bwrap` is an executable regular
+  file in an ABSOLUTE `PATH` entry (a relative or empty entry means the working
+  directory, which the model writes: a planted `./bwrap` could pass the probe and
+  run the command unsandboxed, or fail it and downgrade the default; both
+  reproduced and closed), the first candidate that works wins, and the
+  texts (stderr line, doctor lines) pass through `sanitize_one_line` because the
+  reason can hold bwrap's stderr. The probe runs at start-up whenever a consumer
+  is only the default (`main.rs`), before any command; serve, acp, mcp and the
+  stop gates have no check of their own. A definite answer is cached for the
+  process; a spawn failure that may pass (EAGAIN, ENOMEM, EINTR) is retried three
+  times and, if it persists, answered but not cached. A negative from the probe's
+  own run (bwrap exits non-zero, e.g. namespaces refused under load) is still
+  cached: it cannot be told from a real refusal cheaply. Residual: the first
+  usable candidate is still executed to be probed, as before, and an absolute
+  `PATH` entry the model can write is the owner's to avoid.
 - **Opt-out.** `verify = "off"` and `turnend = "off"` under
   `[sandbox.consumers]` in the user config. `required` is the stricter choice
   (no fallback anywhere), for owners whose hosts all have bubblewrap.

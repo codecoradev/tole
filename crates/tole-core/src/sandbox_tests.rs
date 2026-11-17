@@ -741,3 +741,68 @@ fn a_server_bound_to_a_profile_without_workspace_needs_none() {
         Launch::Refused(_)
     ));
 }
+
+// #748: the backend lookup must not let a bad candidate decide.
+
+#[cfg(unix)]
+fn plant(dir: &Path, name: &str, mode: u32) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(dir).unwrap();
+    let f = dir.join(name);
+    std::fs::write(&f, "#!/bin/sh\nexit 1\n").unwrap();
+    std::fs::set_permissions(&f, std::fs::Permissions::from_mode(mode)).unwrap();
+    f
+}
+
+#[cfg(unix)]
+#[test]
+fn the_backend_lookup_skips_a_file_without_the_execute_bit() {
+    let t = crate::test_dir::TestDir::new("tole-sbx-cand-exec");
+    let (a, b) = (t.join("a"), t.join("b"));
+    plant(&a, "bwrap", 0o644);
+    let real = plant(&b, "bwrap", 0o755);
+    let path = format!("{}:{}", a.display(), b.display());
+    assert_eq!(backend_candidates("bwrap", Some(&path)), vec![real]);
+    // A directory named bwrap is not a backend either.
+    std::fs::create_dir_all(a.join("d").join("bwrap")).unwrap();
+    let path = format!("{}", a.join("d").display());
+    assert!(backend_candidates("bwrap", Some(&path)).is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn the_backend_lookup_skips_relative_and_empty_path_entries() {
+    // A relative entry (here one that DOES resolve to a real executable
+    // bwrap from the working directory), `.` and an empty entry name a place
+    // the model can write: never a candidate. No chdir: the relative entry is
+    // built from the current directory to the planted one.
+    let t = crate::test_dir::TestDir::new("tole-sbx-cand-rel");
+    let abs = t.join("abs");
+    let real = plant(&abs, "bwrap", 0o755);
+    let cwd = std::env::current_dir().unwrap();
+    let up = "../".repeat(cwd.components().count().saturating_sub(1));
+    let rel = format!("{up}{}", abs.display().to_string().trim_start_matches('/'));
+    assert!(
+        Path::new(&rel).join("bwrap").is_file(),
+        "the relative entry reaches the planted file"
+    );
+    let path = format!("{rel}:.::{}", abs.display());
+    assert_eq!(backend_candidates("bwrap", Some(&path)), vec![real]);
+    assert!(backend_candidates("bwrap", Some(&rel)).is_empty());
+    assert!(backend_candidates("bwrap", None).is_empty());
+}
+
+#[test]
+fn only_spawn_errors_that_may_pass_are_transient() {
+    use std::io::{Error, ErrorKind};
+    for k in [
+        ErrorKind::WouldBlock,
+        ErrorKind::Interrupted,
+        ErrorKind::OutOfMemory,
+    ] {
+        assert!(transient_spawn_error(&Error::from(k)), "{k:?}");
+    }
+    for k in [ErrorKind::NotFound, ErrorKind::PermissionDenied] {
+        assert!(!transient_spawn_error(&Error::from(k)), "{k:?}");
+    }
+}

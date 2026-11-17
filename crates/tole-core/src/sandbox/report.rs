@@ -37,8 +37,16 @@ pub fn decide(mode: Mode, avail: &Availability, unattended: bool) -> Option<Deci
 fn decision_text(d: &Decision) -> String {
     match d {
         Decision::Sandboxed => "sandboxed".into(),
-        Decision::Unsandboxed(why) => format!("unsandboxed, no sandbox ({why}); optional"),
-        Decision::Refused(why) => format!("refused, no sandbox ({why})"),
+        // `why` can come from bwrap's stderr or the PATH lookup: one line, no
+        // control characters.
+        Decision::Unsandboxed(why) => format!(
+            "unsandboxed, no sandbox ({}); optional",
+            crate::sanitize::sanitize_one_line(why)
+        ),
+        Decision::Refused(why) => format!(
+            "refused, no sandbox ({})",
+            crate::sanitize::sanitize_one_line(why)
+        ),
     }
 }
 

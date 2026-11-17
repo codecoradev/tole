@@ -253,6 +253,23 @@ fn config_check_shows_the_verify_and_turnend_keys() {
     ] {
         assert!(out.contains(want), "{want} in {out}");
     }
+    assert!(!out.contains("not set, so optional (default)"), "{out}");
+    // Unset keys are the default, said so (#748), not silently absent.
+    let o = tole(
+        Some("[sandbox.consumers]\nverify = \"off\"\n"),
+        &["config", "check"],
+    );
+    let out = text(&o.stdout);
+    assert!(
+        out.contains("sandbox.consumers.turnend: not set, so optional (default)"),
+        "{out}"
+    );
+    assert!(!out.contains("sandbox.consumers.verify: not set"), "{out}");
+    let out = text(&tole(None, &["config", "check"]).stdout);
+    assert!(
+        out.contains("sandbox.consumers.verify: not set, so optional (default)"),
+        "{out}"
+    );
 }
 
 /// Slice 3: `cron` is a consumer. It is always unattended, so a required or an

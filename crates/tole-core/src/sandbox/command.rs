@@ -1465,6 +1465,8 @@ pub fn set_fallback_sink(sink: FallbackSink) {
 /// sandbox and both ways out.
 pub fn fallback_text(consumer: Consumer, why: &str) -> String {
     let name = consumer.name();
+    // The reason can hold bwrap's stderr: one line, controls shown escaped.
+    let why = crate::sanitize::sanitize_one_line(why);
     format!(
         "WARNING: {name} runs UNSANDBOXED: no sandbox is available on this host ({why}); \
          sandbox.consumers.{name} is optional by default. Install bubblewrap to sandbox it, or \
