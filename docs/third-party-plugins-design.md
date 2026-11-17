@@ -462,14 +462,93 @@ under `required` approval (the default), in every run including cron and
   a revoke, or whose hash differs from the ledger's, is dropped at load with a
   note. An approval the ledger never names (made before this slice, or after
   the ledger file was deleted) still loads, is reported once at startup as
-  unrecorded, and is not vouched for: **deleting
-  `skill-ledger.jsonl` makes every approval unrecorded and so forgets every
-  revoke.** An unreadable or over-16-MiB ledger fails startup with a remedy; a
+  unrecorded, and is not vouched for (`tole skills adopt` records it; since
+  #879 a checkpoint catches a deleted ledger, see below): **deleting
+  `skill-ledger.jsonl` on an approvals file without a checkpoint makes every
+  approval unrecorded and so forgets every revoke.** An unreadable or over-16-MiB ledger fails startup with a remedy; a
   last line torn by a crash is repaired by the next append. Same residual as
   the plugin ledger: a process that can rewrite or delete both files is not
   stopped.
 - `tole skills revoke` and `tole skills drafts revoke` are owner-only like
   `approve` (and `drafts promote`).
+
+### Skill ledger checkpoint and `adopt` (#879)
+
+The first cut left four gaps; this closes them as far as a file-based record
+can go.
+
+- **Checkpoint.** Every owner write (`approve`, `revoke`, `adopt`, a draft
+  promotion or revoke-by-source) appends the ledger line first and then writes
+  `skill-approvals.json` with a `ledger_checkpoint`: `{"bytes": N, "sha256":
+  "sha256:..."}` of the ledger it just wrote (one read of the ledger, so the
+  hash covers the bytes the checkpoint names). At load, an approvals file that
+  carries a checkpoint is checked against the ledger read once: missing,
+  shorter than `bytes`, or a first `bytes` bytes that hash differently is a
+  fault. A fault blocks **every** approval (the skill is listed unavailable)
+  with one `ERROR:` startup note naming what is wrong and the remedy, and the
+  owner's write commands refuse with the same message instead of quietly
+  re-recording; `tole skills list` and `plugin audit` still answer (audit
+  reports the fault as an error). A ledger that only grew since the checkpoint
+  is valid, so a crash between the ledger append and the approvals write is
+  harmless, and the reverse (a checkpoint ahead of the ledger) cannot happen
+  across a process crash: the checkpoint is computed from the ledger as read
+  after the append, and `tole` never shortens it. On power loss with reordered,
+  unsynced writes (the approvals temp file and its rename are not fsynced) the
+  checkpoint could reach disk before the ledger tail; the result is still fail
+  closed, a fault with the message and remedy above, never a silent pass. Two owner commands racing leave a checkpoint that
+  is a prefix of the ledger at some moment, which is valid.
+- **Recovery.** `tole skills recheckpoint` (owner only) prints the ledger as
+  it is (path, size, digest, whether the old checkpoint holds, what it says
+  about each approval) and, after a `y` or `--sha256 <shown digest>`, records
+  it as the new checkpoint. It refuses a ledger that differs from the one
+  shown. It changes no approval and brings back no revoke the old ledger held:
+  review `tole skills list` afterwards.
+- **Over the cap.** A ledger over 16 MiB blocks everything: reads fail, and so
+  does `recheckpoint`. The owner trims or rotates the file by hand and then
+  runs `tole skills recheckpoint`; revokes that were in the removed part are
+  forgotten, so trim only old lines of skills that no longer exist.
+- **Older tole.** An older `tole` ignores `ledger_checkpoint` (no
+  `deny_unknown_fields`) and its next save drops it, returning the file to the
+  legacy format (with the note) until the next owner write with this version.
+- **Cron.** `cron/setup.rs` used to discard the gate notes, so a ledger fault
+  in a cron run surfaced as plain "skill not approved". The `ERROR:` note is
+  now appended to the recorded `skill_not_approved` detail (the run log, not
+  stderr), so the cause is visible; it still fails closed.
+- **Boundary.** The owner-only guard on `approve`, `revoke`, `adopt` and
+  `recheckpoint` is an environment-marker defense in depth, not a boundary.
+  The real boundary for a script is that the command sandbox keeps the tole
+  data dir out of its write grants; a process that can write the data dir can
+  write the ledger and the approvals file.
+- **Old files.** An approvals file without a checkpoint (written before this
+  change, or only ever saved by an embedder) keeps loading; with a non-empty
+  ledger it adds one note per startup until the first owner write adds the
+  checkpoint. The rule for a MISSING field is deliberately "legacy, allowed":
+  it cannot be told from an old install, and stripping it from the approvals
+  file alone gains nothing because the ledger still applies in full; hiding a
+  revoke that way needs a write to the ledger as well.
+- **Adopt.** `tole skills adopt NAME... | --all` (owner only, refused under an
+  agent session) appends an `approve` line with `"note":"adopted"` for each
+  chosen approval the ledger does not name (hash and source exactly as stored),
+  then refreshes the checkpoint. It lists what it adopts first, leaves skills
+  the ledger already records alone, and refuses a name with no approval. It
+  adds no trust: the approvals already loaded.
+- **Embedders.** `Approvals::approve`/`approve_from`/`revoke` and
+  `Approvals::save` change the approvals file only: they write no ledger line,
+  so an approval made that way is `unrecorded` and a revoke leaves no revoke
+  line. `save` keeps an existing checkpoint (it never strips one). To record a
+  decision, append a `ledger_line` (any `LedgerStore`) and then call the
+  additive `Approvals::save_checkpointed`, which verifies the old checkpoint,
+  writes the new one and refuses a ledger that lost history.
+- **Residuals, plainly.** A process able to rewrite BOTH `skill-ledger.jsonl`
+  and `skill-approvals.json` forges a matching checkpoint (same as the plugin
+  ledger); the checkpoint only catches deleting, truncating or rewriting the
+  ledger alone. Lines appended after the last checkpoint write exist only
+  after a crash between the two writes, and are unprotected until the next
+  owner write. Appending lines to the ledger is not detected (it is
+  append-only by design), but an `approve` line only matters for a skill the
+  approvals file names. `plugin list` text output now flattens a newline or
+  tab in a lock key like `plugin audit` does (`--json` keeps the key,
+  escaped).
 
 **Not built (follow-up):** pulling a skill from the uteke registry at a pinned
 SHA into the local directory. That needs the `uteke skill` Cloud API, which

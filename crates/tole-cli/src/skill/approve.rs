@@ -49,17 +49,44 @@ pub fn gate_from(
     }
 }
 
+/// What [`load_verified`] found.
+#[derive(Debug)]
+pub struct Loaded {
+    /// The approvals that may load (empty after a ledger fault).
+    pub approvals: Approvals,
+    /// Startup notes, one line each.
+    pub notes: Vec<String>,
+    /// The ledger fails its checkpoint (#879): why, with the remedy. Every
+    /// approval is ignored and no owner command may write until the owner
+    /// accepts the ledger (`tole skills recheckpoint`).
+    pub ledger_fault: Option<String>,
+}
+
 /// The approvals at `path` minus every approval the append-only skill
 /// ledger next to it does not allow (a revoke recorded after it, or another
 /// hash): a hand-edited approvals file cannot approve what the ledger shows
 /// the owner revoked or never approved at that hash (#600). One note per
 /// dropped approval. An unreadable ledger is an error, never "no history".
-pub fn load_checked(path: &Path) -> Result<(Approvals, Vec<String>), String> {
-    let mut approvals = Approvals::load(path)?;
-    let ledger = tole_core::skill_approval::read_ledger(path)?;
-    let check = tole_core::skill_approval::check_against_ledger(&approvals, &ledger);
-    let mut notes = Vec::new();
+/// A ledger that fails the checkpoint in the approvals file (#879: deleted,
+/// truncated or rewritten) makes every approval blocked, with one error
+/// note naming what is wrong and the remedy.
+pub fn load_verified(path: &Path) -> Result<Loaded, String> {
+    use tole_core::skill_approval as sa;
+    let (mut approvals, checkpoint) = Approvals::load_with_checkpoint(path)?;
+    // One read of the ledger: the same bytes are verified and parsed.
+    let raw = sa::read_ledger_bytes(path)?;
     let one_line = |s: &str| tole_core::plugin_lock::terminal_safe(s).replace(['\n', '\t'], " ");
+    if let Some(why) = checkpoint.as_ref().and_then(|c| c.verify(&raw).err()) {
+        let msg = sa::fault_message(path, &why);
+        return Ok(Loaded {
+            approvals: Approvals::default(),
+            notes: vec![one_line(&format!("ERROR: {msg}"))],
+            ledger_fault: Some(msg),
+        });
+    }
+    let ledger = String::from_utf8_lossy(&raw);
+    let check = sa::check_against_ledger(&approvals, &ledger);
+    let mut notes = Vec::new();
     for (name, why) in &check.blocked {
         approvals.skills.remove(name);
         notes.push(one_line(&format!(
@@ -71,12 +98,31 @@ pub fn load_checked(path: &Path) -> Result<(Approvals, Vec<String>), String> {
     if !check.unrecorded.is_empty() {
         notes.push(one_line(&format!(
             "{} approved skill(s) are not in the skill ledger ({}): they still load; \
-             `tole skills approve <name>` records one",
+             `tole skills adopt --all` records them (or `tole skills approve <name>` one)",
             check.unrecorded.len(),
             check.unrecorded.join(", ")
         )));
     }
-    Ok((approvals, notes))
+    // Only worth saying when there is a ledger whose deletion would go
+    // unnoticed.
+    if checkpoint.is_none() && !raw.is_empty() && !approvals.skills.is_empty() {
+        notes.push(
+            "the skill approvals carry no ledger checkpoint (written before #879): deleting the \
+             ledger would go unnoticed; the next `tole skills approve|revoke|adopt` adds one"
+                .into(),
+        );
+    }
+    Ok(Loaded {
+        approvals,
+        notes,
+        ledger_fault: None,
+    })
+}
+
+/// [`load_verified`] as `(approvals, notes)`; after a ledger fault the
+/// approvals are empty and the error is the one note.
+pub fn load_checked(path: &Path) -> Result<(Approvals, Vec<String>), String> {
+    load_verified(path).map(|l| (l.approvals, l.notes))
 }
 
 /// Appends one line to the skill ledger next to `approvals_path`. The
@@ -149,10 +195,14 @@ pub fn doctor_lines(
     path: Option<&Path>,
     workspace: Option<&Path>,
 ) -> Vec<String> {
-    let gate = match gate_from(env, path) {
-        Ok((g, _)) => g,
+    let (gate, notes) = match gate_from(env, path) {
+        Ok(x) => x,
         Err(e) => return vec![format!("  ! skills: {e}")],
     };
+    // A ledger that fails its checkpoint (#879) refuses every approval.
+    if let Some(n) = notes.iter().find(|n| n.starts_with("ERROR: ")) {
+        return vec![format!("  ! skills: {n}")];
+    }
     if gate == Gate::Open {
         return vec![format!(
             "  skills: approval off ({APPROVAL_ENV}=off): every discovered skill loads"
@@ -224,6 +274,28 @@ pub enum SkillsAction {
     },
     /// Remove a skill's approval; it stays on disk.
     Revoke { name: String },
+    /// Record in the skill ledger the approvals it does not name (made
+    /// before the ledger existed, or while it was missing), as they are
+    /// stored, and refresh the ledger checkpoint. Shows what it adopts;
+    /// skills the ledger already records are left alone. Owner only.
+    Adopt {
+        /// Skills to adopt (default: none; use --all for every unrecorded one).
+        #[arg(required_unless_present = "all")]
+        names: Vec<String>,
+        /// Adopt every approval the ledger does not name.
+        #[arg(long, conflicts_with = "names")]
+        all: bool,
+    },
+    /// After the skill ledger failed its checkpoint (deleted, truncated or
+    /// rewritten): show the ledger as it is and, once you confirm, record it
+    /// as the new checkpoint. It brings back no revoke the old ledger held:
+    /// review `tole skills list` after. Owner only.
+    Recheckpoint {
+        /// Confirm without a prompt: the `sha256:` digest shown for the
+        /// ledger you inspected (refused if the ledger is different now).
+        #[arg(long)]
+        sha256: Option<String>,
+    },
     /// Every discovered skill with its approval status, content hash and
     /// approval time.
     List {
@@ -290,6 +362,9 @@ pub fn audit_rows(ws: Option<&Path>) -> Result<Vec<serde_json::Value>, String> {
 
 fn audit_rows_at(ws: Option<&Path>, path: &Path) -> Result<Vec<serde_json::Value>, String> {
     use tole_core::skill_approval as sa;
+    // A ledger that fails its checkpoint is an error, not a report built on
+    // a ledger that lost history.
+    sa::verify_checkpoint_at(path)?;
     let approvals = Approvals::load(path)?;
     let ledger = sa::read_ledger(path)?;
     let check = sa::check_against_ledger(&approvals, &ledger);
@@ -407,16 +482,140 @@ pub fn approve_from(
     Ok(pkg)
 }
 
+/// `tole skills adopt` (#879): appends an `approve` line (hash and source as
+/// stored, noted as adopted) for each approval the ledger does not name that
+/// the owner selected, then refreshes the checkpoint. Skills the ledger
+/// already records are not touched. Returns the lines to print.
+pub fn adopt(
+    path: &Path,
+    approvals: &Approvals,
+    names: &[String],
+    all: bool,
+    now: u64,
+) -> Result<Vec<String>, String> {
+    use tole_core::skill_approval as sa;
+    let ledger = sa::read_ledger(path)?;
+    let unrecorded = sa::check_against_ledger(approvals, &ledger).unrecorded;
+    let mut out = Vec::new();
+    let chosen: Vec<&String> = if all {
+        unrecorded.iter().collect()
+    } else {
+        if let Some(n) = names.iter().find(|n| !approvals.skills.contains_key(*n)) {
+            return Err(format!("skill {n:?} has no approval to adopt"));
+        }
+        let mut c = Vec::new();
+        for n in names {
+            if !unrecorded.contains(n) {
+                out.push(format!("{n}: already recorded in the ledger, left alone"));
+            } else if !c.contains(&n) {
+                c.push(n);
+            }
+        }
+        c
+    };
+    let mut text = String::new();
+    for name in &chosen {
+        let a = &approvals.skills[*name];
+        out.push(format!(
+            "adopt {name}  {}  approved {}{}",
+            a.hash,
+            format_time(a.approved_at),
+            source_text(a.source.as_ref())
+        ));
+        text.push_str(&sa::adopted_ledger_line(
+            name,
+            &a.hash,
+            a.source.as_ref(),
+            now,
+        ));
+    }
+    let mut out: Vec<String> = out
+        .into_iter()
+        .map(|l| tole_core::plugin_lock::terminal_safe(&l).replace(['\n', '\t'], " "))
+        .collect();
+    // The ledger first, then the approvals file with the new checkpoint.
+    if !text.is_empty() {
+        record(path, &text)?;
+    }
+    if !chosen.is_empty() || !approvals.skills.is_empty() {
+        approvals.save_checkpointed(path)?;
+        out.push(format!(
+            "adopted {} skill(s); ledger checkpoint refreshed",
+            chosen.len()
+        ));
+    } else {
+        out.push("nothing to adopt".into());
+    }
+    Ok(out)
+}
+
+/// What `tole skills recheckpoint` shows before it asks: the ledger as it
+/// is (path, size, digest), whether the old checkpoint holds, and what the
+/// ledger says about each approval. Returns the digest to confirm.
+fn review_ledger(
+    path: &Path,
+) -> Result<(tole_core::skill_approval::LedgerCheckpoint, Vec<String>), String> {
+    use tole_core::skill_approval as sa;
+    if !path.exists() {
+        return Err(format!(
+            "{}: no skill approvals recorded, nothing to checkpoint",
+            path.display()
+        ));
+    }
+    let (approvals, old) = Approvals::load_with_checkpoint(path)?;
+    let raw = sa::read_ledger_bytes(path)?;
+    let cp = sa::LedgerCheckpoint::of(&raw);
+    let text = String::from_utf8_lossy(&raw);
+    let check = sa::check_against_ledger(&approvals, &text);
+    let mut lines = vec![
+        format!(
+            "skill ledger {}: {} bytes, {} line(s), {}",
+            sa::ledger_path(path).display(),
+            cp.bytes,
+            text.lines().count(),
+            cp.sha256
+        ),
+        match old.as_ref().map(|o| o.verify(&raw)) {
+            None => "checkpoint: none recorded yet".to_string(),
+            Some(Ok(())) => "checkpoint: holds (nothing to accept)".to_string(),
+            Some(Err(why)) => format!("checkpoint: FAILS, the ledger {why}"),
+        },
+        format!(
+            "{} approval(s); the ledger blocks {}, does not name {}",
+            approvals.skills.len(),
+            check.blocked.len(),
+            check.unrecorded.len()
+        ),
+    ];
+    lines.extend(
+        check
+            .blocked
+            .iter()
+            .map(|(n, why)| format!("  blocked {n}: {why}")),
+    );
+    lines.extend(check.unrecorded.iter().map(|n| format!("  unrecorded {n}")));
+    let lines = lines
+        .into_iter()
+        .map(|l| tole_core::plugin_lock::terminal_safe(&l).replace(['\n', '\t'], " "))
+        .collect();
+    Ok((cp, lines))
+}
+
 pub fn cli(action: SkillsAction) -> anyhow::Result<()> {
     use anyhow::Context as _;
-    let store = || -> anyhow::Result<(PathBuf, Approvals)> {
+    // `write`: the caller is about to change the approvals, so a ledger that
+    // fails its checkpoint (#879) is an error, never a quiet re-record.
+    let store = |write: bool| -> anyhow::Result<(PathBuf, Approvals)> {
         let path = Approvals::default_path()
             .context("the CodeCora home is unresolvable (set CODECORA_HOME or HOME)")?;
-        let (approvals, notes) = load_checked(&path).map_err(anyhow::Error::msg)?;
-        for n in notes {
+        let loaded = load_verified(&path).map_err(anyhow::Error::msg)?;
+        if let (true, Some(fault)) = (write, &loaded.ledger_fault) {
+            anyhow::bail!("{fault}");
+        }
+        for n in loaded.notes {
             eprintln!("tole: {n}");
         }
-        Ok((path, approvals))
+        Ok((path, loaded.approvals))
     };
     let root = |ws: Option<String>| -> anyhow::Result<PathBuf> {
         match ws {
@@ -439,7 +638,7 @@ pub fn cli(action: SkillsAction) -> anyhow::Result<()> {
             crate::owner_only::refuse_under_session("tole skills approve")
                 .map_err(anyhow::Error::msg)?;
             let ws = root(workspace)?;
-            let (path, mut approvals) = store()?;
+            let (path, mut approvals) = store(true)?;
             // Show what would be approved first, then ask (or require the
             // reviewed --hash when nobody is at a terminal).
             let shown = read_package(Some(&ws), &name).map_err(anyhow::Error::msg)?;
@@ -478,7 +677,9 @@ pub fn cli(action: SkillsAction) -> anyhow::Result<()> {
                 &tole_core::skill_approval::ledger_line("approve", &name, &pkg.hash, src, now),
             )
             .map_err(anyhow::Error::msg)?;
-            approvals.save(&path).map_err(anyhow::Error::msg)?;
+            approvals
+                .save_checkpointed(&path)
+                .map_err(anyhow::Error::msg)?;
             println!("approved {name} ({})", pkg.hash);
         }
         SkillsAction::Drafts { action } => {
@@ -489,7 +690,7 @@ pub fn cli(action: SkillsAction) -> anyhow::Result<()> {
         SkillsAction::Revoke { name } => {
             crate::owner_only::refuse_under_session("tole skills revoke")
                 .map_err(anyhow::Error::msg)?;
-            let (path, mut approvals) = store()?;
+            let (path, mut approvals) = store(true)?;
             let Some(hash) = approvals.skills.get(&name).map(|a| a.hash.clone()) else {
                 anyhow::bail!("skill {name:?} has no approval");
             };
@@ -499,14 +700,61 @@ pub fn cli(action: SkillsAction) -> anyhow::Result<()> {
             )
             .map_err(anyhow::Error::msg)?;
             approvals.revoke(&name);
-            approvals.save(&path).map_err(anyhow::Error::msg)?;
+            approvals
+                .save_checkpointed(&path)
+                .map_err(anyhow::Error::msg)?;
             println!(
                 "revoked {name}: it stays on disk and no longer loads when approval is required"
             );
         }
+        SkillsAction::Adopt { names, all } => {
+            crate::owner_only::refuse_under_session("tole skills adopt")
+                .map_err(anyhow::Error::msg)?;
+            let (path, approvals) = store(true)?;
+            for l in adopt(&path, &approvals, &names, all, now()).map_err(anyhow::Error::msg)? {
+                println!("{l}");
+            }
+        }
+        SkillsAction::Recheckpoint { sha256 } => {
+            use std::io::{BufRead as _, IsTerminal as _, Write as _};
+            crate::owner_only::refuse_under_session("tole skills recheckpoint")
+                .map_err(anyhow::Error::msg)?;
+            let path = Approvals::default_path()
+                .context("the CodeCora home is unresolvable (set CODECORA_HOME or HOME)")?;
+            let (cp, lines) = review_ledger(&path).map_err(anyhow::Error::msg)?;
+            for l in lines {
+                println!("{l}");
+            }
+            let interactive = std::io::stdin().is_terminal();
+            match sha256.as_deref().map(str::trim) {
+                Some(want) if want == cp.sha256 => {}
+                Some(want) => anyhow::bail!(
+                    "the ledger is now {}, not the reviewed {want}: review it again",
+                    cp.sha256
+                ),
+                None if !interactive => anyhow::bail!(
+                    "stdin is not a terminal, so nobody can confirm: pass --sha256 {} after \
+                     inspecting the ledger above",
+                    cp.sha256
+                ),
+                None => {
+                    print!("record this ledger as the checkpoint? [y/N] ");
+                    let _ = std::io::stdout().flush();
+                    let mut line = String::new();
+                    std::io::stdin().lock().read_line(&mut line).ok();
+                    if !matches!(line.trim(), "y" | "Y" | "yes" | "YES" | "Yes") {
+                        anyhow::bail!("not recorded");
+                    }
+                }
+            }
+            Approvals::accept_ledger(&path, &cp).map_err(anyhow::Error::msg)?;
+            println!(
+                "ledger checkpoint recorded; run `tole skills list` and re-approve what you need"
+            );
+        }
         SkillsAction::List { workspace } => {
             let ws = root(workspace)?;
-            let (_, approvals) = store()?;
+            let (_, approvals) = store(false)?;
             let names = tole_core::skills::skill_names(Some(&ws));
             if names.is_empty() {
                 println!("no skills found");
@@ -692,7 +940,7 @@ mod tests {
         let path = dir.join("approvals.json");
         let mut a = Approvals::default();
         let pkg = approve_from(Some(&dir), "demo", None, &mut a, 1, None).unwrap();
-        a.save(&path).unwrap();
+        a.save_checkpointed(&path).unwrap();
         let (g, notes) = gate_from(&env(None), Some(&path)).unwrap();
         assert!(g.load(Some(&dir), "demo").is_ok(), "still loads");
         assert_eq!(notes.len(), 1, "{notes:?}");
@@ -750,7 +998,7 @@ mod tests {
         let path = dir.join("approvals.json");
         let mut a = Approvals::default();
         let pkg = approve_from(Some(&dir), "demo", None, &mut a, 1, Some(source())).unwrap();
-        a.save(&path).unwrap();
+        a.save_checkpointed(&path).unwrap();
         record(
             &path,
             &tole_core::skill_approval::ledger_line("approve", "demo", &pkg.hash, None, 1),
@@ -818,6 +1066,152 @@ mod tests {
         });
         let line = status_line(Some(&dir), "demo", &a);
         assert!(!line.contains('\u{1b}') && !line.contains('\n'), "{line:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An approved and then revoked skill, recorded the way the owner's
+    /// commands do (ledger first, then the checkpointed approvals file).
+    fn revoked_with_checkpoint(dir: &Path, path: &Path) {
+        let mut a = Approvals::default();
+        let pkg = approve_from(Some(dir), "demo", None, &mut a, 1, None).unwrap();
+        for ev in ["approve", "revoke"] {
+            record(
+                path,
+                &tole_core::skill_approval::ledger_line(ev, "demo", &pkg.hash, None, 1),
+            )
+            .unwrap();
+        }
+        // A hand-edit put the approval back after the revoke.
+        a.save_checkpointed(path).unwrap();
+    }
+
+    /// #879: deleting or truncating the ledger no longer forgets a revoke:
+    /// every approval is blocked, with the remedy, and `audit` is an error;
+    /// a ledger that only grew is fine.
+    #[test]
+    fn a_ledger_that_lost_history_blocks_every_approval_with_the_remedy() {
+        let dir = ws("cp-fault");
+        let path = dir.join("approvals.json");
+        revoked_with_checkpoint(&dir, &path);
+        let ledger = dir.join(tole_core::skill_approval::LEDGER_FILE);
+        // Intact (and grown): the revoke still wins, no fault.
+        record(
+            &path,
+            &tole_core::skill_approval::ledger_line("approve", "other", "sha256:z", None, 3),
+        )
+        .unwrap();
+        let l = load_verified(&path).unwrap();
+        assert!(l.ledger_fault.is_none() && l.approvals.skills.is_empty());
+        assert!(l.notes[0].contains("approval ignored"), "{:?}", l.notes);
+        let saved = std::fs::read(&ledger).unwrap();
+
+        for tamper in [None, Some(saved[..saved.len() / 2].to_vec())] {
+            match tamper {
+                None => std::fs::remove_file(&ledger).unwrap(),
+                Some(b) => std::fs::write(&ledger, b).unwrap(),
+            }
+            let l = load_verified(&path).unwrap();
+            let fault = l.ledger_fault.expect("fault");
+            assert!(l.approvals.skills.is_empty(), "everything is blocked");
+            assert!(
+                fault.contains("tole skills recheckpoint") && fault.contains("skill-ledger.jsonl"),
+                "{fault}"
+            );
+            assert_eq!(l.notes.len(), 1);
+            assert!(l.notes[0].starts_with("ERROR: "), "{:?}", l.notes);
+            let (g, notes) = gate_from(&env(None), Some(&path)).unwrap();
+            assert!(g.load(Some(&dir), "demo").is_err());
+            assert_eq!(notes.len(), 1, "{notes:?}");
+            assert!(audit_rows_at(Some(&dir), &path)
+                .unwrap_err()
+                .contains("recheckpoint"));
+            let doctor = doctor_lines(&env(None), Some(&path), Some(&dir));
+            assert!(
+                doctor.len() == 1 && doctor[0].starts_with("  ! skills: ERROR:"),
+                "{doctor:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #879: an approvals file from before the checkpoint keeps loading
+    /// (with one note when a ledger exists) and the first owner write adds
+    /// the checkpoint.
+    #[test]
+    fn an_old_approvals_file_loads_with_a_note_until_the_first_owner_write() {
+        let dir = ws("cp-legacy");
+        let path = dir.join("approvals.json");
+        let mut a = Approvals::default();
+        let pkg = approve_from(Some(&dir), "demo", None, &mut a, 1, None).unwrap();
+        a.save(&path).unwrap();
+        let line = tole_core::skill_approval::ledger_line("approve", "demo", &pkg.hash, None, 1);
+        record(&path, &line).unwrap();
+        let l = load_verified(&path).unwrap();
+        assert!(l.ledger_fault.is_none() && l.approvals.skills.len() == 1);
+        assert_eq!(l.notes.len(), 1, "{:?}", l.notes);
+        assert!(l.notes[0].contains("no ledger checkpoint"), "{:?}", l.notes);
+        // Without a ledger the file is not a downgrade candidate: no note.
+        let bare = dir.join("bare");
+        std::fs::create_dir(&bare).unwrap();
+        a.save(&bare.join("approvals.json")).unwrap();
+        assert!(load_verified(&bare.join("approvals.json"))
+            .unwrap()
+            .notes
+            .iter()
+            .all(|n| !n.contains("checkpoint")));
+        a.save_checkpointed(&path).unwrap();
+        assert!(load_verified(&path).unwrap().notes.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #879: `adopt` records only the approvals the ledger does not name,
+    /// as stored and noted, refreshes the checkpoint and is quiet after.
+    #[test]
+    fn adopt_records_unrecorded_approvals_and_leaves_recorded_ones_alone() {
+        let dir = ws("adopt");
+        let path = dir.join("approvals.json");
+        let mut a = Approvals::default();
+        let pkg = approve_from(Some(&dir), "demo", None, &mut a, 1, Some(source())).unwrap();
+        // A second approval the ledger already records.
+        a.skills.insert("rec".into(), a.skills["demo"].clone());
+        a.save(&path).unwrap();
+        let rec = tole_core::skill_approval::ledger_line("approve", "rec", &pkg.hash, None, 1);
+        record(&path, &rec).unwrap();
+        let ledger = dir.join(tole_core::skill_approval::LEDGER_FILE);
+        let before = std::fs::read_to_string(&ledger).unwrap();
+
+        // Unknown name: refused, nothing written.
+        assert!(adopt(&path, &a, &["nope".into()], false, 7)
+            .unwrap_err()
+            .contains("no approval"));
+        assert_eq!(std::fs::read_to_string(&ledger).unwrap(), before);
+        // A recorded one: reported, left alone.
+        let out = adopt(&path, &a, &["rec".into()], false, 7).unwrap();
+        assert!(out[0].contains("already recorded"), "{out:?}");
+        assert!(out.last().unwrap().contains("adopted 0"), "{out:?}");
+        assert_eq!(std::fs::read_to_string(&ledger).unwrap(), before);
+        // --all adopts the one the ledger does not name.
+        let out = adopt(&path, &a, &[], true, 7).unwrap();
+        assert!(out[0].starts_with("adopt demo  sha256:"), "{out:?}");
+        assert!(out[0].contains("registry uteke/demo"), "{out:?}");
+        assert!(out.last().unwrap().contains("adopted 1"), "{out:?}");
+        let after = std::fs::read_to_string(&ledger).unwrap();
+        let added = after.strip_prefix(&before).unwrap();
+        assert!(
+            added.lines().count() == 1
+                && added.contains("\"skill\":\"demo\"")
+                && added.contains("\"note\":\"adopted\"")
+                && added.contains(&pkg.hash)
+                && added.contains(&sha()),
+            "{added}"
+        );
+        let l = load_verified(&path).unwrap();
+        assert!(l.notes.is_empty(), "noise gone: {:?}", l.notes);
+        assert_eq!(l.approvals.skills.len(), 2);
+        tole_core::skill_approval::verify_checkpoint_at(&path).unwrap();
+        // Nothing left to adopt: no new line.
+        adopt(&path, &l.approvals, &[], true, 8).unwrap();
+        assert_eq!(std::fs::read_to_string(&ledger).unwrap(), after);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

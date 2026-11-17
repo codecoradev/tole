@@ -459,12 +459,16 @@ fn render_list(
         return json!({"servers": rows, "notes": notes.iter().map(|n| ctx.clean(n)).collect::<Vec<_>>()})
             .to_string();
     }
+    // Text output is line-oriented: a newline or tab inside a field (a lock
+    // key from a hand-edited lock) must not forge a line, as in `audit`.
+    // `--json` above keeps the original text, escaped by the encoder.
+    let one = |s: &str| s.replace(['\n', '\t'], " ");
     let mut out = String::new();
     for r in &rows {
-        let s = |k: &str| r[k].as_str().unwrap_or("-").to_string();
-        let secrets: Vec<&str> = r["secrets"]
+        let s = |k: &str| one(r[k].as_str().unwrap_or("-"));
+        let secrets: Vec<String> = r["secrets"]
             .as_array()
-            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).map(one).collect())
             .unwrap_or_default();
         out.push_str(&format!(
             "{}  {}  {}  version {}  {}  approved {}  lock {}\n  source {}\n  sandbox {}  secrets {}",
@@ -484,20 +488,20 @@ fn render_list(
             }
         ));
         if let Some(b) = r["binary"].as_str() {
-            out.push_str(&format!("\n  ! {b}"));
+            out.push_str(&format!("\n  ! {}", one(b)));
         }
         if let Some(p) = r["profile"].as_object() {
-            let f = |k: &str| p[k].as_str().unwrap_or("-");
+            let f = |k: &str| one(p[k].as_str().unwrap_or("-"));
             if p["recorded"] == true {
                 out.push_str(&format!(
                     "\n  profile {} {}{}",
                     f("name"),
-                    short(f("hash")),
+                    short(&f("hash")),
                     if p["changed"] == true {
                         format!(
                             "  ! CHANGED: now {} {}; refused at connect until re-approved",
                             f("live_name"),
-                            short(f("live_hash"))
+                            short(&f("live_hash"))
                         )
                     } else {
                         String::new()
@@ -512,19 +516,19 @@ fn render_list(
             }
         }
         if let Some(b) = r["bundle"].as_object() {
-            let f = |k: &str| b[k].as_str().unwrap_or("-");
+            let f = |k: &str| one(b[k].as_str().unwrap_or("-"));
             out.push_str(&format!(
                 "\n  plugin {} {}  manifest {}  {}",
                 f("plugin"),
                 f("version"),
-                short(f("hash")),
+                short(&f("hash")),
                 f("path")
             ));
         }
         out.push('\n');
     }
     for n in notes {
-        out.push_str(&format!("! {}\n", ctx.clean(&n)));
+        out.push_str(&format!("! {}\n", one(&ctx.clean(&n))));
     }
     if rows.is_empty() {
         out.push_str("no MCP server is configured or locked\n");

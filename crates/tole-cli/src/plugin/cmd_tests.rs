@@ -1962,3 +1962,27 @@ fn audit_is_terminal_safe_for_names_from_the_lock() {
         "a name must not forge a line: {out:?}"
     );
 }
+
+/// #879: `list` flattens a newline or tab in a lock key like `audit` does
+/// (text output), while `--json` keeps the key and escapes it correctly.
+#[test]
+fn list_text_puts_a_lock_key_with_a_newline_on_one_line() {
+    let h = H::new("list-newline", &[]);
+    let evil = "evil\n! forged line\tx";
+    let lock = json!({"version": 2, "servers": {evil: {"source": "stdio:true",
+        "version": "1.0", "manifest_hash": hash(&v1())}}});
+    std::fs::write(h.user(), lock.to_string()).unwrap();
+    let out = h.run(&v1(), PluginAction::List { json: false }).unwrap();
+    assert!(out.contains("evil ! forged line x"), "{out:?}");
+    assert!(
+        !out.lines().any(|l| l.starts_with("! forged")),
+        "a lock key must not forge a line: {out:?}"
+    );
+    let j = h.run(&v1(), LIST).unwrap();
+    let v: Value = serde_json::from_str(&j).unwrap();
+    assert!(
+        v["servers"][0]["name"].as_str().unwrap().contains('\n'),
+        "json keeps the key, escaped by the encoder: {j}"
+    );
+    assert!(j.contains("\\n"), "{j}");
+}

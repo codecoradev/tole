@@ -205,7 +205,11 @@ hashed. A symlink in a package makes it unloadable. A malformed approvals
 file fails startup. `approve --hash` pins the hash the owner reviewed, so a
 file changed between review and approval is refused. The approvals file is
 as strong as the user's home directory: a process that can write it can
-approve anything. Skills the owner names directly (`--skill`, a profile's
+approve anything. The append-only `skill-ledger.jsonl` next to it records each
+approval and revoke, and the approvals file stores the ledger's length and
+SHA-256 (#879), so deleting, truncating or rewriting the ledger alone makes
+every approval refused until the owner runs `tole skills recheckpoint`; a
+process that can write both files forges a matching checkpoint. Skills the owner names directly (`--skill`, a profile's
 `skills`) are not gated. An approval covers the bytes of the package as
 they are when a session starts and loads the skill; it does not vet what a
 `references/` or `scripts/` file does when a skill later tells the model to

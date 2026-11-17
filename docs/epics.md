@@ -381,7 +381,8 @@ Bot and Nakama; BMAD for collaboration). Design notes:
     one-shot probe, `tole plugin add`, trust tiers, doctor warnings). Slice 2
     (#811, bundle manifests and per-plugin secret grants) is done. Slice 3a
     is done: the skills pin (stated source, append-only skill ledger, refusal of
-    a drifted or ledger-revoked skill); `tole plugin audit` (slice 3b) is done too. MCP
+    a drifted or ledger-revoked skill) and, in #879, the ledger checkpoint in the approvals
+    file with `tole skills adopt|recheckpoint`; `tole plugin audit` (slice 3b) is done too. MCP
     Registry namespace verification is skipped (owner decision); fetching skills
     from the uteke registry is a later slice with no issue yet;
   - external sandbox wrapper and lazy start (#601; open; design and owner

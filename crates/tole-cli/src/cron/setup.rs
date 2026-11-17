@@ -172,8 +172,22 @@ pub struct AgentSetup {
 /// approval setting (`TOLE_SKILL_APPROVAL`). The error is the `blocked`
 /// reason code and its detail.
 pub fn resolve(job: &Job) -> Result<AgentSetup, (&'static str, String)> {
-    let (gate, _) = crate::skill_approve::gate_from_env().map_err(|e| ("skill_not_approved", e))?;
-    resolve_with(job, &gate)
+    let (gate, notes) =
+        crate::skill_approve::gate_from_env().map_err(|e| ("skill_not_approved", e))?;
+    resolve_with(job, &gate).map_err(|e| with_ledger_fault(e, &notes))
+}
+
+/// A skill ledger that fails its checkpoint (#879) blocks every approval, so
+/// the job is `skill_not_approved`; the `ERROR:` gate note names the real
+/// cause and goes into the recorded detail (the run log, never stderr).
+fn with_ledger_fault(
+    (code, detail): (&'static str, String),
+    notes: &[String],
+) -> (&'static str, String) {
+    match notes.iter().find(|n| n.starts_with("ERROR: ")) {
+        Some(n) if code == "skill_not_approved" => (code, format!("{detail}; {n}")),
+        _ => (code, detail),
+    }
 }
 
 /// [`resolve`] with an explicit approval gate.
@@ -304,6 +318,18 @@ impl AgentSetup {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_ledger_fault_note_joins_the_not_approved_detail_only() {
+        let note = "ERROR: skill ledger x does not match the checkpoint".to_string();
+        let notes = [note.clone()];
+        let e = with_ledger_fault(("skill_not_approved", "d".into()), &notes);
+        assert_eq!(e.1, format!("d; {note}"));
+        let e = with_ledger_fault(("skill_changed", "d".into()), &notes);
+        assert_eq!(e.1, "d");
+        let e = with_ledger_fault(("skill_not_approved", "d".into()), &[]);
+        assert_eq!(e.1, "d");
+    }
 
     use crate::test_dir::TestDir;
     fn tmp(tag: &str) -> TestDir {
