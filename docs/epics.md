@@ -439,7 +439,6 @@ Parked means: an issue exists and is open, and nobody works on it until the owne
 
 | Item | Why it is parked |
 |------|------------------|
-| #740 serve: per-session profile on `POST /sessions` | `[PLAN]`: the personal-fleet direction is still under discussion with the owner. Open questions: can a profile change mid-session, is the budget one pot per profile or per daemon, may a request override `memory_room`, model pin per request or the profile tiers |
 | #741 `import-hermes` (session import and profile pack) | `[PLAN]`, same direction. Open question: does the import redact or keep text verbatim |
 | #742 serve auth providers (basic, OIDC) | `[PLAN]`, waits for the remote client direction. Open questions: Basic first or OIDC straight away, single user with many devices or real multi-user, are sessions bound to an identity, TLS stays at a reverse proxy |
 | #527 desktop (GPUI), #528 Flutter, #529 web, #561 UI/UX plan, #523 epic | The UI stack waits on the core seams (done: #524 to #526, #558 to #560) and on the serve items #571 to #575. #529 is low priority and its framework (Svelte or React) is undecided |
@@ -452,7 +451,7 @@ Owner decisions still open:
 - #748: when `verify` and `turnend` become sandboxed by default (decided in principle on 2026-11-14, the phase is not scheduled).
 - #806: the rule that stops a series of merged pull requests from turning develop red. The CONTRIBUTING rule is documented; requiring up-to-date branches or a merge queue is a repository ruleset setting that only the owner can change.
 - #705: Cora Review failing or running 12 minutes and more on larger PRs: cora-code 0.21 chunks the diff and adds `review.exclude` (cora-code#720); the exclude is configured in `.cora.yaml` (closed with that change).
-- #740, #741 and #742: the open questions in the table above.
+- #741 and #742: the open questions in the table above. #740 was decided on 2026-11-16 (profile fixed per session process, request wins on resume and is recorded, `[profiles.*]` budget as is, no `memory_room` from a request, profile model else server default) and built as `profile` on `POST /sessions` (create and resume, `docs/mobile-control.md`); what remains of #740 is the `tole sessions list` column and the `tole doctor` line of serve profiles.
 
 ---
 

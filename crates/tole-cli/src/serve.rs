@@ -39,8 +39,10 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use tole_cli::serve_support::profiles::{self, ProfileSource, SessionProfile};
 use tole_cli::session_host::{
-    lock_sessions, open_session, run_session_turn_with_images, Sessions, SharedSessions,
+    lock_sessions, open_session_with, run_session_turn_with_images, SessionOverrides, Sessions,
+    SharedSessions,
 };
 use tole_core::memory::MemoryConfig;
 use tole_core::storage::Storage;
@@ -60,6 +62,9 @@ pub struct ServeConfig {
     pub turnend: Vec<String>,
     /// `--cron`: host the cron ticker in-process (#579).
     pub cron: bool,
+    /// Where per-session profiles come from and what the command line
+    /// permits (#740).
+    pub profiles: ProfileSource,
 }
 
 /// Max concurrently open connections: each pinned thread holds ~8 KiB
@@ -73,6 +78,8 @@ struct State {
     /// every session, decided via /approvals routes.
     approvals: Arc<tole_cli::approvals::ApprovalQueue>,
     allow_patterns: Vec<String>,
+    /// Per-session profiles (#740): user config only.
+    profiles: ProfileSource,
     plan_mode: bool,
     memory: Option<MemoryConfig>,
     token: String,
@@ -152,6 +159,7 @@ pub fn run_serve(cfg: ServeConfig) -> Result<()> {
         sessions: Arc::new(Mutex::new(Sessions::default())),
         approvals: tole_cli::approvals::ApprovalQueue::shared(),
         allow_patterns: cfg.allow_patterns.clone(),
+        profiles: cfg.profiles.clone(),
         plan_mode: cfg.plan_mode,
         memory: cfg.memory.clone(),
         token,
@@ -958,6 +966,8 @@ fn open_serve_session(
     session_id: &str,
     cwd: &str,
     loading: bool,
+    profile: Option<&SessionProfile>,
+    record_profile: bool,
 ) -> Result<(), (u16, serde_json::Value)> {
     // Issue #200: non-preauthorized Writes queue for a remote
     // decision (deny now, resumable; allow = one-shot replay).
@@ -965,29 +975,65 @@ fn open_serve_session(
     // audit fallback must reopen the EXACT durable file — with
     // no --sessions-dir the log lives under the session's cwd.
     let storage_dir = serve_storage_dir(state, cwd);
+    // The session's allow list and memory room (#740): the profile's, by the
+    // precedence in `serve_support::profiles`; unchanged without a profile.
+    let allow = match profile {
+        Some(p) => p.allow.clone(),
+        None => state.allow_patterns.clone(),
+    };
+    let memory = match profile {
+        Some(p) => p.memory(
+            state.memory.as_ref(),
+            std::env::var(tole_core::child_env::MEMORY_ROOM)
+                .ok()
+                .as_deref(),
+        ),
+        None => state.memory.clone(),
+    };
     let approver = tole_cli::approvals::QueueApprover::new(
-        state.allow_patterns.clone(),
+        allow.clone(),
         Arc::clone(&state.approvals),
         session_id,
         storage_dir.join(format!("{session_id}.jsonl")),
     );
-    match open_session(
+    match open_session_with(
         session_id,
         cwd,
         loading,
         state.plan_mode,
         approver,
-        state.memory.clone(),
+        memory,
         state.sessions_dir.as_deref(),
         state.turnend.clone(),
-        state.allow_patterns.clone(),
+        allow,
         // No REST cancel endpoint today (#178): a never-fired
         // token keeps serve behavior unchanged.
         tole_core::cancel::CancelToken::default(),
         // No plan UI on the REST face.
         None,
+        SessionOverrides {
+            system_prompt: profile.and_then(|p| p.system_prompt.clone()),
+            model: profile.and_then(|p| p.model.clone()),
+            profile: profile.map(|p| p.name.clone()),
+        },
     ) {
         Ok(session_state) => {
+            // Record the choice in the session log BEFORE the session is
+            // live (append-only: a new register entry, #740). A log that
+            // cannot take it must not serve a session whose profile is
+            // unrecorded.
+            if let (Some(p), true) = (profile, record_profile) {
+                let mut storage = session_state
+                    .storage
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if let Err(e) = tole_core::storage::Storage::commit(
+                    &mut *storage,
+                    tole_core::storage::Commit::new().register(profiles::record_write(&p.name)),
+                ) {
+                    return Err((500, json!({"error": format!("recording the profile: {e}")})));
+                }
+            }
             // Cap the live map (the registry's admission rule): a
             // long-running daemon must not grow without bound
             // (CodeCora scan-3). Eviction drops only the in-memory
@@ -1025,7 +1071,18 @@ fn serve_storage_dir(state: &State, cwd: &str) -> std::path::PathBuf {
 ///   that reconnects mid-turn gets its id back plus the `busy` flag;
 /// - no such file in that directory is a 404;
 /// - another process holding the session's writer lock is a 409.
-fn resume_session(state: &State, id: &str, cwd: &str) -> (u16, serde_json::Value) {
+///
+/// `profile` (#740) is the request's per-session profile, already checked to
+/// exist. It wins over the one the log recorded; with none requested the
+/// recorded one is used again (refused with 409 when it is no longer defined,
+/// never silently dropped for the daemon's wider defaults). A live session's
+/// profile is fixed for its life: asking for another one is a 409.
+fn resume_session(
+    state: &State,
+    id: &str,
+    cwd: &str,
+    requested: Option<SessionProfile>,
+) -> (u16, serde_json::Value) {
     if tole_cli::session_host::validate_session_id(id).is_none() {
         return (400, json!({"error": "invalid session id"}));
     }
@@ -1034,6 +1091,16 @@ fn resume_session(state: &State, id: &str, cwd: &str) -> (u16, serde_json::Value
     {
         let sessions = lock_sessions(&state.sessions);
         if let Some(st) = sessions.get(id) {
+            if let Some(want) = &requested {
+                if st.profile.as_deref() != Some(want.name.as_str()) {
+                    return (
+                        409,
+                        json!({"error": "the session is live under another profile; a session's \
+                                profile is fixed while its process runs",
+                               "profile": st.profile}),
+                    );
+                }
+            }
             let busy = *st.busy.lock().expect("busy lock");
             return (
                 200,
@@ -1048,11 +1115,60 @@ fn resume_session(state: &State, id: &str, cwd: &str) -> (u16, serde_json::Value
     if lock_sessions(&state.sessions).ensure_room().is_err() {
         return (503, json!({"error": "all sessions busy — at capacity"}));
     }
-    match open_serve_session(state, id, cwd, true) {
-        Ok(()) => (
-            200,
-            json!({"sessionId": id, "workspace": cwd, "resumed": true, "alreadyLive": false}),
-        ),
+    // What the log already says (read-only: the writer lock is taken at
+    // open). A log that cannot be read, or whose recorded name is not a
+    // profile name, is never taken as "no profile": that would resume under
+    // the daemon's defaults, which can be wider than the recorded profile.
+    let recorded = match tole_core::storage::JsonlStorage::open_read_only(&file) {
+        Ok(s) => Ok(profiles::recorded(&s)),
+        Err(e) => Err(e.to_string()),
+    };
+    let profile = match requested {
+        Some(p) => Some(p),
+        None => match &recorded {
+            Ok(profiles::Recorded::None) => None,
+            Ok(profiles::Recorded::Name(n)) => match state.profiles.select(n) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    return (
+                        409,
+                        json!({"error": format!(
+                            "the session was recorded under profile `{n}`, which cannot be used \
+                             now ({}); resume with an explicit \"profile\"",
+                            e.message()
+                        )}),
+                    )
+                }
+            },
+            Ok(profiles::Recorded::Invalid) => {
+                return (
+                    409,
+                    json!({"error": "the session log records a profile with an invalid name; \
+                            resume with an explicit \"profile\""}),
+                )
+            }
+            Err(_) => {
+                return (
+                    500,
+                    json!({"error": "the session log cannot be read to find the profile it was \
+                            recorded under; fix it or resume with an explicit \"profile\""}),
+                )
+            }
+        },
+    };
+    let record = profile
+        .as_ref()
+        .is_some_and(|p| recorded != Ok(profiles::Recorded::Name(p.name.clone())));
+    match open_serve_session(state, id, cwd, true, profile.as_ref(), record) {
+        Ok(()) => {
+            let mut out = json!({
+                "sessionId": id, "workspace": cwd, "resumed": true, "alreadyLive": false
+            });
+            if let Some(p) = &profile {
+                out["profile"] = json!(p.name);
+            }
+            (200, out)
+        }
         Err(resp) => resp,
     }
 }
@@ -1228,10 +1344,14 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
             let list: Vec<_> = sessions
                 .iter()
                 .map(|(id, st)| {
-                    json!({
+                    let mut v = json!({
                         "id": id,
                         "busy": *st.busy.lock().expect("busy lock"),
-                    })
+                    });
+                    if let Some(p) = &st.profile {
+                        v["profile"] = json!(p);
+                    }
+                    v
                 })
                 .collect();
             (200, json!({"sessions": list}))
@@ -1239,6 +1359,28 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
         ("POST", "/sessions") => {
             let Ok(req) = serde_json::from_str::<serde_json::Value>(body) else {
                 return (400, json!({"error": "invalid JSON body"}));
+            };
+            // The memory room belongs to the profile (#740): a request that
+            // names one is refused, never half-honored.
+            if req.get("memory_room").is_some() {
+                return (
+                    400,
+                    json!({"error": "memory_room cannot be set by a request: it comes from the \
+                            session's profile"}),
+                );
+            }
+            let profile = match req.get("profile") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(serde_json::Value::String(name)) => match state.profiles.select(name) {
+                    Ok(p) => Some(p),
+                    Err(e) => return (e.status(), json!({"error": e.message()})),
+                },
+                Some(_) => {
+                    return (
+                        400,
+                        json!({"error": "profile must be a profile name string"}),
+                    )
+                }
             };
             let requested = match req.get("cwd").and_then(|v| v.as_str()) {
                 Some(c) => c.to_string(),
@@ -1259,7 +1401,9 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
             // creating one. Same jail, same capacity and approval rules.
             match req.get("resume") {
                 None | Some(serde_json::Value::Null) => {}
-                Some(serde_json::Value::String(id)) => return resume_session(state, id, cwd),
+                Some(serde_json::Value::String(id)) => {
+                    return resume_session(state, id, cwd, profile)
+                }
                 Some(_) => return (400, json!({"error": "resume must be a session id string"})),
             }
             // Capacity first: `open_session` creates the session file on
@@ -1270,8 +1414,14 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                 return (503, json!({"error": "all sessions busy — at capacity"}));
             }
             let session_id = tole_cli::session_host::new_session_id("srv");
-            match open_serve_session(state, &session_id, cwd, false) {
-                Ok(()) => (200, json!({"sessionId": session_id, "workspace": cwd})),
+            match open_serve_session(state, &session_id, cwd, false, profile.as_ref(), true) {
+                Ok(()) => {
+                    let mut out = json!({"sessionId": session_id, "workspace": cwd});
+                    if let Some(p) = &profile {
+                        out["profile"] = json!(p.name);
+                    }
+                    (200, out)
+                }
                 Err(resp) => resp,
             }
         }
@@ -1673,6 +1823,7 @@ mod tests {
             sessions: Arc::new(Mutex::new(Sessions::default())),
             approvals: tole_cli::approvals::ApprovalQueue::shared(),
             allow_patterns: vec![],
+            profiles: Default::default(),
             plan_mode: false,
             memory: None,
             token: "t".into(),

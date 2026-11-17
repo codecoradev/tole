@@ -41,6 +41,23 @@ pub struct SessionState {
     /// client cancel (ACP `session/cancel`); the turn loop checks it
     /// between steps. `serve` never sets it — REST behavior unchanged.
     pub cancel: tole_core::cancel::CancelToken,
+    /// The model this session is pinned to (a `tole serve` per-session
+    /// profile, #740); `None` = the server default.
+    pub model: Option<String>,
+    /// The per-session profile's name (#740), fixed for this live session;
+    /// `None` = opened without one.
+    pub profile: Option<String>,
+}
+
+/// What a host may fix for ONE session instead of taking the process-wide
+/// values (#740: a `tole serve` per-session profile). The default changes
+/// nothing, so ACP, MCP and a profile-less serve session behave as before.
+#[derive(Debug, Clone, Default)]
+pub struct SessionOverrides {
+    /// Replaces the persona chain (profile > env > config) when `Some`.
+    pub system_prompt: Option<String>,
+    pub model: Option<String>,
+    pub profile: Option<String>,
 }
 
 /// Why a soft interrupt was not queued (#377).
@@ -311,6 +328,38 @@ pub fn open_session(
     cancel: tole_core::cancel::CancelToken,
     plan_emitter: Option<PlanEmitter>,
 ) -> Result<SessionState, String> {
+    open_session_with(
+        session_id,
+        cwd,
+        loading,
+        plan_mode,
+        approver,
+        memory,
+        sessions_dir_override,
+        turnend,
+        parent_allows,
+        cancel,
+        plan_emitter,
+        SessionOverrides::default(),
+    )
+}
+
+/// [`open_session`] with per-session `overrides` (#740).
+#[allow(clippy::too_many_arguments)]
+pub fn open_session_with(
+    session_id: &str,
+    cwd: &str,
+    loading: bool,
+    plan_mode: bool,
+    approver: impl tole_core::approval::Approver + 'static,
+    memory: Option<MemoryConfig>,
+    sessions_dir_override: Option<&std::path::Path>,
+    turnend: Vec<String>,
+    parent_allows: Vec<String>,
+    cancel: tole_core::cancel::CancelToken,
+    plan_emitter: Option<PlanEmitter>,
+    overrides: SessionOverrides,
+) -> Result<SessionState, String> {
     let workspace = PathBuf::from(cwd);
     let workspace_canon = workspace
         .canonicalize()
@@ -318,7 +367,11 @@ pub fn open_session(
     // The selected profile's persona (#584) > TOLE_SYSTEM_PROMPT env >
     // project config (#208; absent unless a trusted config installed it) >
     // none.
-    let system_prompt = crate::config_apply::profile_system_prompt()
+    let system_prompt = overrides
+        .system_prompt
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(crate::config_apply::profile_system_prompt)
         .or_else(|| {
             std::env::var("TOLE_SYSTEM_PROMPT")
                 .ok()
@@ -391,7 +444,19 @@ pub fn open_session(
         busy: StdArc::new(Mutex::new(false)),
         cancel,
         tool_ids: StdArc::new(Mutex::new(0)),
+        model: overrides.model,
+        profile: overrides.profile,
     })
+}
+
+/// The provider config of one turn: the process-wide one, with the session's
+/// pinned model (#740) when it has one.
+fn session_provider_config(model: Option<&str>) -> Result<tole_core::openai::OpenAiConfig, String> {
+    let mut cfg = crate::turn_runner::provider_config()?;
+    if let Some(m) = model.map(str::trim).filter(|m| !m.is_empty()) {
+        cfg.model = m.to_string();
+    }
+    Ok(cfg)
 }
 
 /// Create a session file in `dir` and register it in the global session
@@ -453,6 +518,7 @@ pub fn run_session_turn_with_images(
         system_prompt,
         first_prompt_done,
         cancel,
+        model,
         ..
     } = state;
     let mut final_text: Option<String> = None;
@@ -477,7 +543,7 @@ pub fn run_session_turn_with_images(
     // semantics are unchanged. The same configuration applies to a reserve
     // provider (#209). The turn itself is the shared runner (#525).
     let plan = crate::turn_runner::TurnPlan {
-        cfg: crate::turn_runner::provider_config()?,
+        cfg: session_provider_config(model.as_deref())?,
         registry: &registry,
         system_prompt: system_prompt.as_deref(),
         cancel: &cancel,
@@ -519,6 +585,7 @@ pub fn resume_session_turn(
         registry,
         system_prompt,
         cancel,
+        model,
         ..
     } = state;
     let mut storage = storage.lock().unwrap_or_else(|p| p.into_inner());
@@ -529,7 +596,7 @@ pub fn resume_session_turn(
     // resume, while one that landed earlier had no in-flight turn to
     // target (cancel is unconditional) and must not kill it.
     let plan = crate::turn_runner::TurnPlan {
-        cfg: crate::turn_runner::provider_config()?,
+        cfg: session_provider_config(model.as_deref())?,
         registry: &registry,
         system_prompt: system_prompt.as_deref(),
         cancel: &cancel,
@@ -606,6 +673,8 @@ mod eviction_tests {
             busy: StdArc::new(Mutex::new(busy)),
             cancel: tole_core::cancel::CancelToken::default(),
             tool_ids: StdArc::new(Mutex::new(0)),
+            model: None,
+            profile: None,
         }
     }
 

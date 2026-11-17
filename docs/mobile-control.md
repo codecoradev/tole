@@ -15,7 +15,7 @@ rate-limited per source IP).
 
 | Action | Route | Notes |
 |---|---|---|
-| List sessions | `GET /sessions` | id + busy per session |
+| List sessions | `GET /sessions` | id + busy per session (+ `profile` when it has one, #740) |
 | Start a mission | `POST /sessions` `{cwd}` → `POST /sessions/{id}/prompt` `{text}` | the prompt is the mission goal (`tole mission` semantics chain turns; a serve prompt runs ONE turn — mission chaining over serve is a follow-up) |
 | Mission status | `GET /sessions/{id}/status` | busy flag, entry count, `usage_report` (tokens, cache-hit rate, request-size split; #211), mission cost report (`fact/mission` register, #201) |
 | **Pending approvals** | `GET /approvals` | queue entries: id, session, tool, status; expires to denied after 15 min |
@@ -25,6 +25,7 @@ rate-limited per source IP).
 | Steer a turn | `POST /sessions/{id}/interrupt` `{text, urgent?}` (#377) | `202` queued; delivered at the turn's next safe point (after the running tool, before the next model call) as an attributed user-role entry, nothing is lost. `urgent` also withdraws a tool call that has not started. `409` when no turn is running, `400` for blank/oversized text or a full queue (16 pending) |
 | Detach a turn | `POST /sessions/{id}/detach` (#217) | `202`; the running tool settles, the turn ends `detached` (resumable) and background jobs keep running, nudging the session when they finish. `409` when no turn is running |
 | Live events | `GET /sessions/{id}/events?after=<seq>` (#524) | Server-Sent Events, see [Event stream](#event-stream-524); replays the log from a `seq`, then follows it |
+| Start with a profile | `POST /sessions` `{cwd, "profile": "<name>"}` (#740) | persona, allow list, memory room and model of a user-config profile, see [Session profiles](#session-profiles-740) |
 | Resume a session | `POST /sessions` `{"resume": "<id>"}` (#524) | reopen an existing session, see [Resume by id](#resume-by-id-524) |
 | Read the transcript | `GET /sessions/{id}/entries?after=<seq>&limit=<n>` (#524) | one page of the session's log, see [Transcript read](#transcript-read-524); works while a turn runs |
 | Upload an image | `POST /sessions/{id}/images` (raw body, #558) | returns `{id, mime, bytes, fnv1a64}`; see [Images](#images-558) |
@@ -114,6 +115,49 @@ session's JSONL is what survives).
   `503` at the live-session cap with every session busy.
 - Approvals: a resumed session queues non-preauthorized Writes exactly like a new one.
   Nothing about resuming grants authority; the token is the same.
+
+## Session profiles (#740)
+
+`POST /sessions {"cwd"?, "profile": "<name>"}` (create) and
+`POST /sessions {"resume": "<id>", "profile": "<name>"}` (resume) open the session as
+one `[profiles.<name>]` table of the **user** config (#584), so one daemon can host
+several personas. `profile` is optional and a session without it is exactly as before.
+
+- **What the profile fixes for that session:** the persona (`system_prompt_file`), the
+  model (the profile's `default` tier, else the server default), the allow list, and the
+  memory room (`memory_room`, default `profile-<name>`; only when the daemon runs with
+  `--memory`, and a child's `TOLE_MEMORY_NAMESPACE` still wins). Skills, grants, the
+  advisor and the router stay process-wide on this face, and child agents, the advisor
+  and the router use the daemon's model, not the profile's (they still read the global
+  provider config). Profiles have no budget
+  field, so the server's existing budget logic applies unchanged.
+- **Which profiles can be picked:** only the user config's, re-read on every create or
+  resume (an edit or removal applies without a restart). A project config cannot define
+  profiles. An unknown name is a `400` that lists the defined names; a malformed name
+  (not 1-64 chars of `a-z`, `0-9`, `_`, `-`) or a non-string value is a `400` that does
+  not echo it; a profile that cannot be loaded (unreadable persona) is a `500`.
+  Selecting a profile needs the same bearer token as every route; there is no
+  per-profile authorization, so a token holder may pick any profile (#742 is the
+  auth-providers issue).
+- **Allow list precedence** (the one of `--profile` on the CLI): an `--allow` flag of
+  `tole serve` pins the daemon's list and the profile's is ignored, so a profile never
+  widens it; otherwise a profile that sets `allow` replaces the daemon's config/env
+  list, and one that sets none leaves it. `--trust` presets are added in every case.
+  Every approval still goes through the approval queue (#200, #722).
+- **`memory_room` in a request is refused** (`400`, create and resume): the room comes
+  from the profile and nothing in a request can set or widen it.
+- **Fixed for the life of the session process.** The choice is recorded in the session
+  log as a `fact/profile` register (a new entry, never a mutation of an old one).
+  On resume the request's `profile` wins over the recorded one and is recorded again;
+  without one, the recorded profile is used. A recorded profile that is no longer
+  defined, a log entry with a malformed name, or a log that cannot be read to look for one,
+  is a `409` (`500` for an unreadable log), never a silent fall-back to the daemon's
+  defaults: resume with an explicit `profile`. On resume the persona and model come from
+  the effective profile, not from the header pinned when the session was created (a
+  resume without any profile is unchanged). Asking for another profile on a session that is already live is a
+  `409`; the same one, or none, returns `alreadyLive` as before. Two concurrent
+  resumes with different profiles: one opens the session, the other gets `409`.
+- The success answer carries `"profile": "<name>"` when one was used.
 
 ## Event stream (#524)
 
