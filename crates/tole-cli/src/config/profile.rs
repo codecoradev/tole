@@ -159,6 +159,31 @@ pub fn advisor_doctor_lines(cfg: &Config) -> Vec<String> {
     )]
 }
 
+/// `tole doctor` line of the profiles `tole serve` can open a session as
+/// (#740): `serve profiles: name (room <room>, <n> allow), ...`. Names, rooms
+/// and counts only: never persona text, an allow pattern, a model or a secret.
+/// `None` when the user config defines no profile. A name that is not a
+/// well-formed profile name is shown as `?`, never as written.
+pub fn serve_profiles_doctor_line(cfg: &Config) -> Option<String> {
+    let all = cfg.profiles.as_ref().filter(|p| !p.is_empty())?;
+    let items: Vec<String> = all
+        .iter()
+        .map(|(name, p)| {
+            if !crate::config::valid_profile_name(name) {
+                return "?".to_string();
+            }
+            let room = tole_core::memory::sanitize_namespace(
+                &p.memory_room
+                    .clone()
+                    .unwrap_or_else(|| format!("profile-{name}")),
+            );
+            let allow = p.allow.as_ref().map_or(0, Vec::len);
+            format!("{name} (room {room}, {allow} allow)")
+        })
+        .collect();
+    Some(format!("serve profiles: {}", items.join(", ")))
+}
+
 /// `~/x` against `home`, an absolute path as is, anything else against
 /// `base`. `None` when the needed directory is unknown.
 fn expand(raw: &str, base: Option<&Path>, home: Option<&Path>) -> Option<PathBuf> {
@@ -322,6 +347,24 @@ system_prompt_file = "missing-on-purpose.md"
         );
         let off = advisor_doctor_lines(&Config::default()).join("\n");
         assert!(off.contains("advisor: off"), "{off}");
+    }
+
+    #[test]
+    fn doctor_lists_serve_profiles_by_name_never_their_contents() {
+        let c = cfg(
+            "[profiles.kai]\nsystem_prompt_file = \"SECRET-PERSONA.md\"\n\
+             allow = [\"write_file\", \"run_command\"]\nmemory_room = \"room.k\"\n\
+             [profiles.kai.models]\nstandard = \"hidden-model\"\n[profiles.ana]\n",
+        );
+        let line = serve_profiles_doctor_line(&c).unwrap();
+        assert_eq!(
+            line,
+            "serve profiles: ana (room profile-ana, 0 allow), kai (room room.k, 2 allow)"
+        );
+        for secret in ["SECRET-PERSONA", "write_file", "hidden-model"] {
+            assert!(!line.contains(secret), "{line}");
+        }
+        assert_eq!(serve_profiles_doctor_line(&Config::default()), None);
     }
 
     #[test]

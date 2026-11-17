@@ -930,6 +930,13 @@ pub fn run_cli(
         Some(Err(_)) => Vec::new(),
     };
     advisor_lines.iter().for_each(|l| println!("{l}"));
+    // Profiles `tole serve` can open a session as (#740): names only, from
+    // the user config; nothing is printed when it defines none.
+    if let Some(Ok(c)) = &user {
+        if let Some(l) = crate::profile::serve_profiles_doctor_line(c) {
+            println!("{l}");
+        }
+    }
     // Discussion roles (#588): where the scribe's and the claim-checker's
     // models come from, names only.
     let role_lines = match &user {
