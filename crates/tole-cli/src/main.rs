@@ -1120,6 +1120,17 @@ fn dispatch(cli: Cli) -> Result<()> {
                     &config_apply::real_env,
                 )?;
                 println!("{out}");
+                // An unset verify or turnend is not "off" (#748): say what the
+                // default is, since the listing above shows only written keys.
+                for k in ["verify", "turnend"] {
+                    if !out.contains(&format!("sandbox.consumers.{k} = ")) {
+                        println!(
+                            "sandbox.consumers.{k}: not set, so optional (default): sandboxed \
+                             where bubblewrap works, unsandboxed with a warning only where the \
+                             host has no sandbox; set it to \"off\" in the user config to opt out"
+                        );
+                    }
+                }
                 // Validity != trust: the exit code stays 0 either way.
                 if tole_cli::config::discover(&cwd, explicit).is_some() {
                     let (subject, _) = tole_cli::config_trust::Subject::resolve(&cwd, explicit)?;
@@ -1278,10 +1289,26 @@ fn dispatch(cli: Cli) -> Result<()> {
         cfg.as_ref()
             .and_then(|c| c.sandbox.as_ref())
             .and_then(|s| s.consumers().ok())
-            .unwrap_or_default(),
+            .unwrap_or_else(tole_core::sandbox::command::Consumers::host_default),
     ) {
         eprintln!("tole: warning: {e}");
     }
+    // Probe the backend NOW when a consumer is only optional by default (#748):
+    // the default degrades to "no sandbox" on a negative answer, so the answer
+    // must be had before the model runs a command (serve, acp, mcp and the stop
+    // gates have no start-up check of their own), and a definite one is cached.
+    {
+        use tole_core::sandbox::command::{consumers, Consumer};
+        let c = consumers();
+        if c.implicit(Consumer::Verify) || c.implicit(Consumer::TurnEnd) {
+            let _ = tole_core::sandbox::detect();
+        }
+    }
+    // The default flip's fallback (verify or turnend, optional by default, no
+    // sandbox backend on this host) goes to the ledger as well as stderr.
+    tole_core::sandbox::command::set_fallback_sink(
+        tole_cli::plugin::gate::record_consumer_fallback,
+    );
     // Extra sensitive file names (#683): user globs plus the project's.
     tole_core::sensitive::set_extra(
         cfg.as_ref()
@@ -1427,12 +1454,18 @@ fn dispatch(cli: Cli) -> Result<()> {
                 // consumer is always unattended: verify, stop gates, cron) the run
                 // does not start; an `optional` run_command/job_start with a
                 // human attached gets a loud warning instead.
+                use tole_core::sandbox::command::Consumer;
                 use tole_core::sandbox::Mode;
                 let c = tole_core::sandbox::command::consumers();
+                // A `verify` or `turnend` that is `optional` only by default
+                // (#748) does not stop the start, it warns: a default must
+                // not refuse every run over a sessions path nobody chose.
+                let (v_dflt, t_dflt) =
+                    (c.implicit(Consumer::Verify), c.implicit(Consumer::TurnEnd));
                 let needs_it = c.run_command == Mode::Required
                     || c.job_start == Mode::Required
-                    || c.verify != Mode::Off
-                    || c.turnend != Mode::Off
+                    || (c.verify != Mode::Off && !v_dflt)
+                    || (c.turnend != Mode::Off && !t_dflt)
                     || c.cron != Mode::Off;
                 if needs_it {
                     return Err(anyhow!(
@@ -1442,7 +1475,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                     ));
                 }
                 // Nothing sandboxed, nothing to say.
-                if c.run_command != Mode::Off || c.job_start != Mode::Off {
+                if c.run_command != Mode::Off || c.job_start != Mode::Off || v_dflt || t_dflt {
                     eprintln!(
                         "tole: warning: {e}: sandboxed commands are not kept from writing the \
                          sessions directory"

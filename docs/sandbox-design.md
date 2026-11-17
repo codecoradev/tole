@@ -531,10 +531,11 @@ no registry access.
 
 `run_command`, `job_start`, cron scripts (and `command:` deliveries), the
 mission `--verify` command and the `on_turnend` stop gates each map to a
-profile in `[sandbox.consumers]`. Absent means "not sandboxed", as today:
-these commands often need the owner's toolchain, and making them sandboxed
-by default would break existing setups. `tole doctor` recommends `command`
-for each one, and a later phase can make it the default (decision 1).
+profile in `[sandbox.consumers]`. Absent means "not sandboxed" for
+`run_command`, `job_start` and `cron`: these commands often need the owner's
+toolchain, and making them sandboxed by default would break existing setups.
+Absent means `optional`, sandboxed by default, for `verify` and `turnend`
+since the default flip (§9.4, owner decision of 2026-11-16, #748).
 
 Notes per consumer:
 
@@ -553,9 +554,9 @@ Notes per consumer:
 
 The first slice made `run_command` and `job_start` consumers; the second
 (§9.4) added `verify` and `turnend`; the third (§9.5) added cron scripts and
-`command:` deliveries. Every consumer is off by default; the owner decided
-`verify` and `turnend` become sandboxed by default later (§9.4, migration),
-and nothing here changes their defaults.
+`command:` deliveries. `run_command`, `job_start` and `cron` are off by
+default. `verify` and `turnend` are `optional` by default since the flip (§9.4,
+"The default flip"); this section describes the profile they share.
 
 The owner's `[sandbox]`, `[sandbox.consumers]`, `[secrets]` and
 `[sensitive_files]` apply to a cron AGENT run (its MCP servers, `run_command`,
@@ -571,8 +572,8 @@ still skip it. A cron SCRIPT job and a `command:` delivery are sandboxed by
 [sandbox.consumers]            # user config only; every key optional
 run_command = "required"       # "off" (default) | "optional" | "required"
 job_start   = "optional"
-verify      = "required"       # the mission --verify command (§9.4)
-turnend     = "required"       # the on_turnend stop gates (§9.4)
+verify      = "required"       # absent = optional BY DEFAULT (§9.4); "off" opts out
+turnend     = "required"       # absent = optional BY DEFAULT (§9.4); "off" opts out
 network     = "none"           # "none" (default) | "host" (explicit opt-in)
 cpu_secs     = 3600            # 1 to 86400
 memory_mb    = 16384           # 256 to 1048576, address space per process
@@ -850,9 +851,10 @@ verify  = "required"           # the mission --verify command
 turnend = "required"           # the on_turnend stop gates
 ```
 
-Both are opt-in, exactly like the first slice: default `off`, `optional` or
-`required` in the user config only, the same `command` profile, limits and
-network setting. Nothing about them is sandboxed by default in this slice.
+Both take `off`, `optional` or `required` in the user config only, with the
+same `command` profile, limits and network setting as the first slice. They
+were opt-in in this slice (default `off`); the default is `optional` since the
+flip, see "The default flip" at the end of this section.
 
 - **Call sites.** `verify`: `run_verify` in `tole-cli`'s `mission.rs`, the
   only place the `--verify` string is run (`sh -c <string>`, the string stays
@@ -968,15 +970,110 @@ network setting. Nothing about them is sandboxed by default in this slice.
 - **Residual.** As §9.3. `--workspace` is not the sandbox workspace, the
   process's working directory is (the one both ran in before).
 
-**Migration plan (not in this slice).** The owner decided (§16.1) that `verify`
-and `turnend` become sandboxed by default in a later phase. The plan, for that
-phase's own PR: (1) land the `read` extras so a toolchain can be granted; (2)
-the default turns from `off` to `optional` for both, with a release note and a
-`tole doctor` line saying so, so an attended run on a machine without
-bubblewrap keeps working with a warning while a mission already refuses (it is
-unattended); (3) a later release moves it to `required` where a backend
-exists, `off` stays the explicit opt-out in the user config. Until that PR the
-default stays `off`.
+**The default flip (#748, owner decision of 2026-11-16).** `verify` and
+`turnend` are sandboxed BY DEFAULT as `optional`, in the minor release after the
+one that holds this note. Never `required` by default: a sandboxed verify has
+no `$HOME`, so it cannot see `~/.cargo` or `~/.rustup`, and a `cargo`-based
+`--verify` command exits 127 (§9.4, "A sandboxed verify or gate can fail every
+time for environmental reasons"; `required` would turn that into a failure
+on every project of that kind, and a missing sandbox into a refusal).
+
+- **Three states, kept apart.** An ABSENT `verify` / `turnend` key is the
+  default (`Consumers::host_default`, the `verify_implicit` / `turnend_implicit`
+  flags, set by `SandboxConsumersConfig::settings`). A WRITTEN `optional` is the
+  owner's word and never implicit; so are `required` and `off`. No file is
+  migrated: an existing user config without the keys is sandboxed now.
+  `[sandbox.consumers]` is read from the user config only, as before, and
+  `--no-config` falls back to the default too (it does not turn the sandbox off;
+  when the user config sets `[sandbox]`, `--no-config` still needs a terminal,
+  #849 and #867). `tole doctor` prints `verify optional (default)` for the
+  default and `optional` for a written one; `tole config` prints only the keys
+  that are written.
+- **The rule that makes `optional` safe as a default.** Everywhere else an
+  `optional` verify, stop gate or cron job counts as `required` (they are
+  unattended: no unsandboxed fallback, §16.2). Applied literally to a default,
+  that would make every host without a sandbox refuse every `--verify` and deny
+  every stop gate: Windows, macOS, a Linux without bubblewrap, a container
+  without user namespaces. So the DEFAULT, and only the default, has one
+  exception, owner decision of 2026-11-17 (option 1): where the host has NO
+  sandbox backend at all (`Availability::Unavailable`: not Linux, no `bwrap` on
+  `PATH`, or the self-test of §5 fails), the command runs unsandboxed, loudly:
+  1. one stderr line per process and consumer: `tole: WARNING: verify runs
+     UNSANDBOXED: no sandbox is available on this host (<reason>); ... Install
+     bubblewrap to sandbox it, or set sandbox.consumers.verify = "off" ...`;
+     a mission also prints it at its start-up check;
+  2. one `sandbox_fallback` line in the plugin ledger next to the user config
+     (`{"kind":"sandbox","event":"sandbox_fallback","consumer":"verify",
+     "default":true,"reason":...,"at":...}`; kind `sandbox`, so no plugin fold
+     reads it; the `tole` binary registers the sink with
+     `sandbox::command::set_fallback_sink`, core writes no file);
+  3. `tole doctor`: `sandbox consumers: WARNING: verify runs UNSANDBOXED: no
+     sandbox is available on this host (<reason>) ...` and `sandbox consumer
+     verify: unsandboxed, no sandbox (<reason>); optional (default)`. A
+     WARNING, so it does not fail the doctor (a written `required` or a
+     written `optional` still prints ERROR there).
+- **Everything else still refuses.** The exception is for "no backend at all"
+  only. A backend that exists and cannot sandbox THIS run is a refusal, as with
+  `required`: a workspace layout the profile refuses (§9.3), a grant refused
+  (`$HOME`, the data dir, `/`), no workspace to bind, a program not on `PATH`,
+  and, after the plan, a launcher that fails to start or reports no exit code
+  (§9.4, "The launcher failing is not the command failing"). `verify` ends
+  `verify_refused`, a stop gate is denied, as before. An explicit `optional` or
+  `required` on a host with no backend still refuses; explicit `off` disables.
+- **What "no backend at all" covers.** Exactly the `Availability::Unavailable`
+  answers of `sandbox::detect`: no `bwrap` on an absolute `PATH` entry, a `bwrap`
+  below 0.8 (no `--disable-userns`), a `bwrap` whose smoke run (`--ro-bind / /
+  true`) fails because it cannot create a namespace (user namespaces refused,
+  also inside a container), and every non-Linux host. Nothing else degrades.
+- **Finding the backend (hardened with the flip).** The default degrades on a
+  negative answer, so the answer must be right: `bwrap` is an executable regular
+  file in an ABSOLUTE `PATH` entry (a relative or empty entry means the working
+  directory, which the model writes: a planted `./bwrap` could pass the probe and
+  run the command unsandboxed, or fail it and downgrade the default; both
+  reproduced and closed), the first candidate that works wins, and the
+  texts (stderr line, doctor lines) pass through `sanitize_one_line` because the
+  reason can hold bwrap's stderr. The probe runs at start-up whenever a consumer
+  is only the default (`main.rs`), before any command; serve, acp, mcp and the
+  stop gates have no check of their own. A definite answer is cached for the
+  process; a failure that may pass is retried three times (`retry_transient`)
+  and, if it persists, answered but NOT cached (`detect_cached`). "May pass"
+  means a spawn error of kind WouldBlock, Interrupted or OutOfMemory, or a smoke
+  run whose stderr carries bwrap's strerror text for EAGAIN, ENOMEM or EINTR
+  ("Resource temporarily unavailable", "Cannot allocate memory", "Interrupted
+  system call": momentary process or memory pressure while it makes the
+  namespace). A clean refusal ("No permissions to creating new namespace",
+  "setting up uid map: Permission denied") is a definite negative and is cached.
+  Residuals: (1) a persistent transient failure is answered as "no backend" and
+  probed again on each later launch (each costs up to three attempts), so one
+  such window can run one command unsandboxed, loudly, and the next launch
+  looks again; (2) the classification reads bwrap's message text, so an
+  unrecognised wording of a transient failure is cached as a refusal for the
+  process; (3) the first usable candidate is still executed to be probed, as
+  before, and a writable ABSOLUTE `PATH` directory is still trusted, exactly as
+  for explicit modes: only relative and empty entries (the working directory)
+  were closed.
+- **Opt-out.** `verify = "off"` and `turnend = "off"` under
+  `[sandbox.consumers]` in the user config. `required` is the stricter choice
+  (no fallback anywhere), for owners whose hosts all have bubblewrap.
+- **What the default does not do.** It does not turn on the `git` tool's
+  hooks-off hardening and config vet (§9.3): that stays tied to a consumer the
+  owner WROTE (`integrations::git::consumers_on` ignores an implicit one), or
+  every user of the `git` tool would silently lose their commit hooks and see
+  refusals for ordinary config keys such as `commit.gpgsign`. It also does not
+  refuse to start when the sessions directory cannot be told to the sandbox
+  (§9.3, #866): for a default consumer that is a loud warning, as for an
+  `optional` `run_command`, because a default must not stop every run over a
+  path nobody chose. `run_command`, `job_start` and `cron` defaults, and
+  `always_unattended`, are unchanged: cron has no fallback, ever.
+- **Cost on a host with a backend.** The command runs with no `$HOME`, no
+  network, no toolchain under `~/.cargo`, and `.git` read-only (§9.4, the list
+  above). `tole doctor` warns by name when `~/.cargo/bin` or `~/.rustup`
+  exists. The `read` extras of the earlier plan did not land first: the owner
+  chose `optional` and a loud doctor over waiting for them. A `cargo` verify
+  needs `verify = "off"` (or a toolchain under a system directory) until they do.
+- **Later.** A release may move the default to `required` where a backend
+  exists; `off` stays the opt-out. That is the owner's call, not part of the
+  flip.
 
 ### 9.1.1 Life of a sandboxed server
 
@@ -1121,6 +1218,21 @@ commands follow `run_command` and `job_start`. Default `off`, user config only;
   human saved through the CLI.
 
 ## 10. Failure behaviour
+
+**Finding and probing the backend (#748).** `bwrap` is an executable regular
+file in an ABSOLUTE `PATH` entry; a relative or empty entry (the working
+directory, which the model writes) is skipped, and a file without the execute
+bit does not shadow a working one behind it. The first candidate that passes
+the probe wins. A definite answer is cached for the process; a failure that may
+pass (a spawn error of kind WouldBlock, Interrupted or OutOfMemory, or a smoke
+run whose stderr carries bwrap's strerror text for EAGAIN, ENOMEM or EINTR) is
+retried three times and, if it persists, answered but not cached, so one bad
+moment is not a permanent "no sandbox" for a long-lived `tole serve`. A clean
+refusal ("No permissions to creating new namespace") is cached. Residuals: a
+persistent transient failure is probed again on each later launch; the
+classification reads bwrap's message text, so an unrecognised wording is cached
+as a refusal; the first usable candidate is executed to be probed, and a
+writable ABSOLUTE `PATH` directory is still trusted, as for every mode.
 
 At startup tole resolves the backend once: `bwrap` on `PATH`, version
 ≥ 0.8, then a self-test spawn (`bwrap … -- /bin/true`, ~8 ms) to catch
@@ -1285,11 +1397,16 @@ the proposal.
 1. **Default for model commands.** `verify` (and `turnend`) will run
    sandboxed by default in a later phase. The first sandbox PR is opt-in
    only: `[sandbox]` is off by default and nothing changes for existing
-   setups.
+   setups. Done 2026-11-16 and 2026-11-17 (§9.4, "The default flip"): `optional`
+   by default, never `required` by default, and the DEFAULT (not an
+   explicit `optional`) runs unsandboxed with a loud, ledgered warning on a
+   host with no backend at all, so it never turns a host that cannot sandbox
+   into one that cannot verify.
 2. **`optional` in unattended runs.** An `optional` sandbox is treated as
    `required` for unattended runs (cron, webhook, `serve` with no human).
    If the sandbox is unavailable, an unattended run refuses; it never runs
-   unsandboxed.
+   unsandboxed. The one exception is the implicit default of `verify` and
+   `turnend` on a host with no backend at all (decision 1, §9.4).
 3. **Landlock.** No tole-owned Landlock layer now. Bubblewrap first.
 4. **macOS.** No macOS sandbox now. macOS stays unsandboxed and
    `tole doctor` says so.

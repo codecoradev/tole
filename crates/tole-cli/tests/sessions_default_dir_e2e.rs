@@ -254,9 +254,21 @@ fn an_unresolvable_sessions_dir_warns_for_optional_and_is_silent_when_off() {
             && !err.contains("refusing to start"),
         "{err}"
     );
-    let (err, _) = sessions_from_a_deleted_cwd(&root, "");
+    // Written off: nothing sandboxed, nothing to say.
+    let (err, _) = sessions_from_a_deleted_cwd(
+        &root,
+        "[sandbox.consumers]\nverify = \"off\"\nturnend = \"off\"\n",
+    );
     assert!(
         !err.contains("sessions directory"),
         "no consumer, nothing to say: {err}"
+    );
+    // The default (#748, nothing written): a warning like an optional
+    // run_command, never a refusal to start.
+    let (err, _) = sessions_from_a_deleted_cwd(&root, "");
+    assert!(
+        err.contains("sandboxed commands are not kept from writing the sessions directory")
+            && !err.contains("refusing to start"),
+        "{err}"
     );
 }

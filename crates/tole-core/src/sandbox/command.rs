@@ -5,9 +5,11 @@
 //! Second slice: the mission `--verify` command and the `on_turnend` stop
 //! gates. The owner opts in per consumer in the user config
 //! (`[sandbox.consumers] run_command | job_start | verify | turnend = "off" |
-//! "optional" | "required"`, default off for all of them). Cron scripts and
-//! deliveries keep running as before; the types here are shaped so they can
-//! join later.
+//! "optional" | "required"`). `run_command`, `job_start` and cron are off by
+//! default; `verify` and `turnend` are `optional` BY DEFAULT since #748's flip
+//! ([`Consumers::host_default`], [`Consumers::implicit`]). The library's own
+//! [`Consumers::default`] stays all-off: an embedder that never calls
+//! [`set_consumers`] sandboxes nothing.
 //!
 //! The `command` profile: the workspace writable, with
 //! `.git` (the whole directory) and `.tole` read-only on top (code planted
@@ -28,6 +30,10 @@
 //!   `verify` is always one: nobody answers there); with no working sandbox
 //!   (including macOS and Windows) `required` refuses and `optional` runs
 //!   unsandboxed with a warning when a human is attached.
+//!   The one exception is the IMPLICIT default of `verify` and `turnend`: with
+//!   no sandbox backend at all it runs unsandboxed, loudly
+//!   ([`CommandLaunch::DirectImplicit`], [`note_fallback`]); a backend that
+//!   exists but cannot sandbox the run still refuses.
 //!
 //! State is owner config set once per process, never per session: the
 //! workspace travels with each call.
@@ -173,6 +179,13 @@ pub struct Consumers {
     /// Network of the `command` profile: none, or the host's.
     pub network: Network,
     pub limits: Limits,
+    /// `verify` is `optional` because the owner wrote nothing, not because
+    /// they wrote `optional` (#748, the default flip). Only
+    /// [`Consumers::host_default`] and the config layer set it; it means
+    /// something only while `verify` is [`Mode::Optional`].
+    pub verify_implicit: bool,
+    /// The same for `turnend`.
+    pub turnend_implicit: bool,
 }
 
 impl Default for Consumers {
@@ -185,11 +198,42 @@ impl Default for Consumers {
             cron: Mode::Off,
             network: Network::None,
             limits: Limits::default(),
+            verify_implicit: false,
+            turnend_implicit: false,
         }
     }
 }
 
 impl Consumers {
+    /// What a host that read no `[sandbox.consumers]` key runs with (#748):
+    /// `run_command`, `job_start` and `cron` off, `verify` and `turnend`
+    /// `optional` BY DEFAULT ([`Consumers::implicit`]). [`Default`] stays
+    /// all-off: it is the library's state when no host set anything, and what
+    /// an embedder gets unless it calls [`set_consumers`].
+    pub fn host_default() -> Consumers {
+        Consumers {
+            verify: Mode::Optional,
+            turnend: Mode::Optional,
+            verify_implicit: true,
+            turnend_implicit: true,
+            ..Consumers::default()
+        }
+    }
+
+    /// Whether `c` is `optional` only by the default flip, not by the owner's
+    /// word. Such a consumer sandboxes when a backend works and, where the
+    /// host has none at all, runs unsandboxed with a loud note instead of
+    /// refusing (see [`plan_command`]); an explicit `optional` or `required`
+    /// never does.
+    pub fn implicit(&self, c: Consumer) -> bool {
+        self.mode(c) == Mode::Optional
+            && match c {
+                Consumer::Verify => self.verify_implicit,
+                Consumer::TurnEnd => self.turnend_implicit,
+                _ => false,
+            }
+    }
+
     pub fn mode(&self, c: Consumer) -> Mode {
         match c {
             Consumer::RunCommand => self.run_command,
@@ -269,6 +313,12 @@ pub enum CommandLaunch {
     /// Run as before. `warning` is set when the owner asked for a sandbox
     /// (`optional`) and there is none.
     Direct { warning: Option<String> },
+    /// The default flip's degrade (#748): `verify` or `turnend` is `optional`
+    /// only by default and the host has no sandbox backend at all (`why`).
+    /// Run as before, but the caller says so loudly and records it
+    /// ([`note_fallback`]). Never returned for an explicit mode, nor when a
+    /// backend exists and something else (a workspace layout, a grant) refuses.
+    DirectImplicit { why: String },
     /// Run `program args` (the `bwrap` command line) with these limits.
     Sandboxed {
         program: PathBuf,
@@ -1053,6 +1103,13 @@ pub fn plan_command(
         }
         Availability::Unavailable(why) => Err(Fail::Unsandboxable(why.clone())),
     };
+    // The default flip: no backend at all on this host (not a refused layout,
+    // not a missing program) is a loud unsandboxed run, not a refusal.
+    if let (Err(Fail::Unsandboxable(why)), Availability::Unavailable(_)) = (&built, avail) {
+        if consumers.implicit(consumer) {
+            return CommandLaunch::DirectImplicit { why: why.clone() };
+        }
+    }
     match built {
         Ok((program, args)) => CommandLaunch::Sandboxed {
             program,
@@ -1270,6 +1327,10 @@ pub fn preflight(consumer: Consumer) -> Result<(), String> {
     })?;
     match launch_command(consumer, &cwd, "sh", &[]) {
         CommandLaunch::Refused(why) => Err(why),
+        CommandLaunch::DirectImplicit { why } => {
+            note_fallback(consumer, &why);
+            Ok(())
+        }
         _ => Ok(()),
     }
 }
@@ -1287,6 +1348,15 @@ fn command_prepared(
             if let Some(w) = warning {
                 warn_once(consumer, &w);
             }
+            let mut c = Command::new(program);
+            c.args(args);
+            Ok(Launched {
+                cmd: c,
+                report: None,
+            })
+        }
+        CommandLaunch::DirectImplicit { why } => {
+            note_fallback(consumer, &why);
             let mut c = Command::new(program);
             c.args(args);
             Ok(Launched {
@@ -1366,13 +1436,52 @@ pub(crate) fn recheck_plan(workspace: &Path, args: &[OsString]) -> Result<(), St
 
 /// A fallback to no sandbox is warned about once per process and tool, not
 /// on every call (a chatty line per command would drown a terminal).
-fn warn_once(consumer: Consumer, text: &str) {
+/// Returns whether this call was the first.
+fn warn_once(consumer: Consumer, text: &str) -> bool {
     // One bit per consumer, so a new consumer needs no new slot.
     static WARNED: AtomicUsize = AtomicUsize::new(0);
     const _: () = assert!(Consumer::ALL.len() <= usize::BITS as usize);
     let bit = 1usize << consumer.index();
-    if WARNED.fetch_or(bit, Ordering::SeqCst) & bit == 0 {
+    let first = WARNED.fetch_or(bit, Ordering::SeqCst) & bit == 0;
+    if first {
         eprintln!("tole: {text}");
+    }
+    first
+}
+
+/// The host's recorder of a default-flip fallback: `(consumer name, reason)`.
+type FallbackSink = fn(&str, &str);
+static FALLBACK_SINK: OnceLock<FallbackSink> = OnceLock::new();
+
+/// Registers what records a default-flip fallback (#748), once per process:
+/// the `tole` binary appends a `sandbox_fallback` line to the plugin ledger.
+/// Core writes no file itself. Without a sink only the stderr line is made.
+pub fn set_fallback_sink(sink: FallbackSink) {
+    let _ = FALLBACK_SINK.set(sink);
+}
+
+/// The text of the default-flip fallback (stderr once per process and
+/// consumer, and `tole doctor`): it names the consumer, why there is no
+/// sandbox and both ways out.
+pub fn fallback_text(consumer: Consumer, why: &str) -> String {
+    let name = consumer.name();
+    // The reason can hold bwrap's stderr: one line, controls shown escaped.
+    let why = crate::sanitize::sanitize_one_line(why);
+    format!(
+        "WARNING: {name} runs UNSANDBOXED: no sandbox is available on this host ({why}); \
+         sandbox.consumers.{name} is optional by default. Install bubblewrap to sandbox it, or \
+         set sandbox.consumers.{name} = \"off\" in the user config to silence this"
+    )
+}
+
+/// Says (stderr, once per process and consumer) and records (the registered
+/// sink, same once) that the default `optional` of `consumer` ran without a
+/// sandbox because the host has none.
+pub fn note_fallback(consumer: Consumer, why: &str) {
+    if warn_once(consumer, &fallback_text(consumer, why)) {
+        if let Some(sink) = FALLBACK_SINK.get() {
+            sink(consumer.name(), why);
+        }
     }
 }
 
@@ -1515,6 +1624,15 @@ pub fn doctor_lines_for(c: &Consumers, avail: &Availability, home: Option<&Path>
         Mode::Optional => "optional",
         Mode::Required => "required",
     };
+    // `optional (default)` when the owner wrote nothing (#748), so the
+    // three states (default, written, off) are never confused.
+    let shown = |k: Consumer| {
+        if c.implicit(k) {
+            "optional (default)".to_string()
+        } else {
+            word(c.mode(k)).to_string()
+        }
+    };
     let mut out = Vec::new();
     if Consumer::ALL.iter().all(|k| c.mode(*k) == Mode::Off) {
         out.push(
@@ -1535,16 +1653,36 @@ pub fn doctor_lines_for(c: &Consumers, avail: &Availability, home: Option<&Path>
              network {net}, limits cpu {}s memory {}MB processes {} file {}MB",
             word(c.run_command),
             word(c.job_start),
-            word(c.verify),
-            word(c.turnend),
+            shown(Consumer::Verify),
+            shown(Consumer::TurnEnd),
             word(c.cron),
             l.cpu_secs,
             l.memory_mb,
             l.processes,
             l.file_size_mb
         ));
+        let defaults: Vec<&str> = [Consumer::Verify, Consumer::TurnEnd]
+            .into_iter()
+            .filter(|k| c.implicit(*k))
+            .map(Consumer::name)
+            .collect();
+        if !defaults.is_empty() {
+            out.push(format!(
+                "sandbox consumers: {} sandboxed by default (optional, the owner wrote no key): \
+                 sandboxed where a backend works, unsandboxed with a warning and a ledger line \
+                 only where the host has none; a workspace layout it cannot protect or a launcher \
+                 that fails still stops the command. Git writes fail inside it (.git is \
+                 read-only). Set it to \"off\" in [sandbox.consumers] to opt out, or \
+                 \"required\" to never fall back",
+                defaults.join(" and ")
+            ));
+        }
         if let Availability::Unavailable(why) = avail {
             for k in Consumer::ALL {
+                if c.implicit(k) {
+                    out.push(format!("sandbox consumers: {}", fallback_text(k, why)));
+                    continue;
+                }
                 let (level, tail) = match (c.mode(k), k.always_unattended()) {
                     (Mode::Off, _) => continue,
                     (Mode::Required, _) => ("ERROR", "refused (required)"),
@@ -1588,7 +1726,12 @@ pub fn doctor_lines_for(c: &Consumers, avail: &Availability, home: Option<&Path>
              address-space limit (memory_mb); the model is told to fix it like any failure"
         ));
     }
-    if Consumer::ALL.iter().any(|k| c.mode(*k) != Mode::Off) {
+    // The hardening of the `git` tool is for a consumer the owner wrote, not
+    // for the default (see `integrations::git::consumers_on`).
+    if Consumer::ALL
+        .iter()
+        .any(|k| c.mode(*k) != Mode::Off && !c.implicit(*k))
+    {
         out.push(
             "sandbox consumers: git writes (add, commit) fail inside a sandboxed command (.git is \
              read-only); the `git` tool runs outside it with hooks off (the owner's own \

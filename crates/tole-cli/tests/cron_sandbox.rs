@@ -89,7 +89,12 @@ impl Env {
             &workdir,
         ];
         args.extend_from_slice(extra);
-        let o = self.tole(path, &args);
+        // `create` runs under the real PATH: every `tole` start probes the
+        // backend when verify or turnend is only the default (#748), and a fake
+        // that removes its own execute bit after its first probe must be
+        // spent by the `run`, not by `create`.
+        let real = std::env::var("PATH").unwrap_or_default();
+        let o = self.tole(&real, &args);
         assert!(o.status.success(), "create: {}", text(&o.stderr));
         self.tole(path, &["cron", "run", "j"])
     }

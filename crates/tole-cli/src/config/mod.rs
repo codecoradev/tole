@@ -224,10 +224,13 @@ pub struct SandboxConsumersConfig {
     pub run_command: Option<String>,
     /// `job_start`: `off` (default) | `optional` | `required`.
     pub job_start: Option<String>,
-    /// The mission `--verify` command: `off` (default) | `optional` |
-    /// `required`. A mission is unattended, so `optional` counts as `required`.
+    /// The mission `--verify` command: `optional` (the default when the key is
+    /// absent, #748) | `off` | `required`. A mission is unattended, so a WRITTEN
+    /// `optional` counts as `required`; the default does too, except that it
+    /// runs unsandboxed with a loud note on a host with no sandbox backend.
     pub verify: Option<String>,
-    /// The `on_turnend` stop gates: `off` (default) | `optional` | `required`.
+    /// The `on_turnend` stop gates: `optional` (the default when the key is
+    /// absent, #748) | `off` | `required`; same rules as `verify`.
     pub turnend: Option<String>,
     /// Cron script jobs and `command:` deliveries: `off` (default) |
     /// `optional` | `required`. A cron job is unattended, so `optional` counts
@@ -250,7 +253,13 @@ impl SandboxConsumersConfig {
     pub fn settings(&self) -> Result<tole_core::sandbox::command::Consumers, String> {
         use tole_core::sandbox::command::{Consumers, Limits};
         use tole_core::sandbox::{Mode, Network};
+        // An absent `verify` or `turnend` is `optional` BY DEFAULT (#748), a
+        // written one is the owner's word and never implicit; the other
+        // consumers default to off.
+        let dflt = Consumers::host_default();
         let mode = |key: &str, v: &Option<String>| match v.as_deref() {
+            None if key == "verify" => Ok(dflt.verify),
+            None if key == "turnend" => Ok(dflt.turnend),
             None => Ok(Mode::Off),
             Some(s) => Mode::parse(s).ok_or_else(|| {
                 format!("sandbox.consumers.{key} must be off, optional or required, got {s:?}")
@@ -270,6 +279,8 @@ impl SandboxConsumersConfig {
             verify: mode("verify", &self.verify)?,
             turnend: mode("turnend", &self.turnend)?,
             cron: mode("cron", &self.cron)?,
+            verify_implicit: self.verify.is_none(),
+            turnend_implicit: self.turnend.is_none(),
             network: match self.network.as_deref() {
                 None | Some("none") => Network::None,
                 Some("host") => Network::Host,
@@ -285,11 +296,11 @@ impl SandboxConsumersConfig {
 }
 
 impl SandboxConfig {
-    /// The settings of the model-command consumers (all off when the table
-    /// is absent).
+    /// The settings of the model-command consumers (the defaults when the
+    /// table is absent: `verify` and `turnend` optional, the rest off).
     pub fn consumers(&self) -> Result<tole_core::sandbox::command::Consumers, String> {
         self.consumers.as_ref().map_or_else(
-            || Ok(tole_core::sandbox::command::Consumers::default()),
+            || Ok(tole_core::sandbox::command::Consumers::host_default()),
             SandboxConsumersConfig::settings,
         )
     }
@@ -2326,20 +2337,59 @@ verify_timeout = 60
             .any(|l| l.starts_with("sandbox effective: default profile \"server\"")));
     }
 
+    /// #748: an absent key is the DEFAULT (implicit optional), a written one is
+    /// the owner's word, whatever its value, and `off` is off. The state
+    /// survives the parse, so `tole doctor` and the launcher can tell them apart.
     #[test]
-    fn sandbox_consumers_are_off_by_default_bounded_and_user_layer_only() {
-        use tole_core::sandbox::command::{Consumers, Limits};
+    fn sandbox_consumers_distinguish_absent_from_written() {
+        use tole_core::sandbox::command::Consumer::{TurnEnd, Verify};
+        use tole_core::sandbox::Mode;
+        let c = |t: &str| {
+            parse(t, &p())
+                .unwrap()
+                .sandbox
+                .unwrap()
+                .consumers()
+                .unwrap()
+        };
+        // Only `verify` written (optional): explicit, so not implicit; turnend
+        // is still the default.
+        let s = c("[sandbox.consumers]\nverify = \"optional\"\n");
+        assert_eq!((s.verify, s.turnend), (Mode::Optional, Mode::Optional));
+        assert!(!s.implicit(Verify) && s.implicit(TurnEnd));
+        // Written required / off: never implicit.
+        let s = c("[sandbox.consumers]\nverify = \"required\"\nturnend = \"off\"\n");
+        assert_eq!((s.verify, s.turnend), (Mode::Required, Mode::Off));
+        assert!(!s.implicit(Verify) && !s.implicit(TurnEnd));
+        // Other keys written leave the two defaulted.
+        let s = c("[sandbox.consumers]\nrun_command = \"required\"\n");
+        assert!(s.implicit(Verify) && s.implicit(TurnEnd));
+    }
+
+    #[test]
+    fn sandbox_consumers_default_flip_is_bounded_and_user_layer_only() {
+        use tole_core::sandbox::command::{Consumer, Consumers, Limits};
         use tole_core::sandbox::{Mode, Network};
-        // Absent or empty: both off, no network, the default limits.
+        // Absent or empty (#748): `verify` and `turnend` are optional BY
+        // DEFAULT (implicit), the other three off, no network, the default
+        // limits.
         for text in ["", "[sandbox]\n", "[sandbox.consumers]\n"] {
             let s = match parse(text, &p()).unwrap().sandbox {
-                None => Consumers::default(),
+                None => Consumers::host_default(),
                 Some(s) => s.consumers().unwrap(),
             };
             assert_eq!(
                 (s.run_command, s.job_start, s.verify, s.turnend, s.cron),
-                (Mode::Off, Mode::Off, Mode::Off, Mode::Off, Mode::Off)
+                (
+                    Mode::Off,
+                    Mode::Off,
+                    Mode::Optional,
+                    Mode::Optional,
+                    Mode::Off
+                )
             );
+            assert!(s.implicit(Consumer::Verify) && s.implicit(Consumer::TurnEnd));
+            assert!(!s.implicit(Consumer::RunCommand) && !s.implicit(Consumer::Cron));
             assert_eq!((s.network, s.limits), (Network::None, Limits::default()));
         }
         let c = parse(

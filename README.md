@@ -35,6 +35,14 @@ automation and secrets release:
   sink and in the session log, sensitive files read redacted (`read_file_raw` for the
   verbatim read), and owner-only subcommands that refuse under a session
   ([docs/threat-model.md](docs/threat-model.md)).
+- **Sandbox:** third-party stdio MCP servers can run in bubblewrap (Linux, opt-in),
+  and `[sandbox.consumers]` does the same for model commands. After 0.11 the mission
+  `--verify` command and the `--on-turnend` stop gates are sandboxed BY DEFAULT
+  (`optional`): sandboxed where bubblewrap works, run unsandboxed with a loud warning
+  only on a host with no sandbox at all. A `cargo`-based verify cannot see `~/.cargo`
+  inside it, so set `verify = "off"` / `turnend = "off"` under `[sandbox.consumers]`
+  in the user config to opt out (see [CHANGELOG.md](CHANGELOG.md) and
+  [docs/sandbox-design.md](docs/sandbox-design.md) §9.4).
 - **Web:** built-in `web_search` and `web_fetch`, with an optional nginjen backend.
 
 The multi-client daemon stays design-only ([docs/daemon-design.md](docs/daemon-design.md));
