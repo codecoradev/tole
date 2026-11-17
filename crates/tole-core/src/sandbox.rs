@@ -256,23 +256,118 @@ pub fn which(name: &str, path: Option<&str>) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
+/// Every `name` on `path` that can be the backend, in `PATH` order: an
+/// ABSOLUTE directory entry and an executable regular file. A relative or
+/// empty entry (`.`, `` = the working directory) is skipped: it names a
+/// directory the model can write, so a planted `./bwrap` would decide what the
+/// sandbox is (#748: with the implicit default a bad candidate that fails its
+/// probe would downgrade verify to unsandboxed). A file without the execute
+/// bit is skipped too, so it cannot shadow the real one behind it.
+pub fn backend_candidates(name: &str, path: Option<&str>) -> Vec<PathBuf> {
+    path.unwrap_or_default()
+        .split(':')
+        .filter(|d| Path::new(d).is_absolute())
+        .map(|d| Path::new(d).join(name))
+        .filter(|p| is_executable_file(p))
+        .collect()
+}
+
+#[cfg(unix)]
+fn is_executable_file(p: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(p: &Path) -> bool {
+    p.is_file()
+}
+
+// The pure probe logic below compiles on Linux (where it is used) and in any
+// test build (where its tests run), never as dead code elsewhere.
+#[cfg(any(target_os = "linux", test))]
+/// Whether a spawn error may pass on its own (no process slot, no memory, a
+/// signal): such a failure says nothing about the host, so it is retried and
+/// never cached as "no sandbox here".
+fn transient_spawn_error(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind::{Interrupted, OutOfMemory, WouldBlock};
+    matches!(e.kind(), WouldBlock | Interrupted | OutOfMemory)
+}
+
 /// Checks the backend: `bwrap --version`, then a smoke run of
 /// `bwrap --ro-bind / / true` that catches kernels and containers that
 /// refuse user namespaces.
 #[cfg(target_os = "linux")]
 pub fn probe(bwrap: &Path) -> Availability {
+    probe_classified(bwrap).0
+}
+
+/// [`probe`], and whether a negative answer may be transient (a spawn error
+/// of the kinds [`transient_spawn_error`] names, still there after retries).
+#[cfg(target_os = "linux")]
+fn probe_classified(bwrap: &Path) -> (Availability, bool) {
+    retry_transient(|| probe_once(bwrap), 50)
+}
+
+/// How many times a probe that failed in a way that may pass is run.
+#[cfg(any(target_os = "linux", test))]
+const PROBE_ATTEMPTS: u64 = 3;
+
+/// Runs `probe` up to [`PROBE_ATTEMPTS`] times while its answer is transient
+/// (the `bool`), sleeping `pause_ms * attempt` between runs; returns the last
+/// answer. A definite answer (usable, or a clean refusal) ends it at once.
+#[cfg(any(target_os = "linux", test))]
+fn retry_transient<F>(mut probe: F, pause_ms: u64) -> (Availability, bool)
+where
+    F: FnMut() -> (Availability, bool),
+{
+    let mut last = (Availability::Unavailable(String::new()), false);
+    for attempt in 0..PROBE_ATTEMPTS {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(pause_ms * attempt));
+        }
+        last = probe();
+        if !last.1 {
+            break;
+        }
+    }
+    last
+}
+
+/// bwrap's own message for a failure that may pass (EAGAIN, ENOMEM, EINTR:
+/// momentary process or memory pressure while it creates the namespace), as
+/// opposed to a clean refusal ("user namespaces not permitted"). The strerror
+/// texts, which bwrap prints verbatim.
+#[cfg(any(target_os = "linux", test))]
+fn transient_bwrap_message(stderr: &str) -> bool {
+    [
+        "Resource temporarily unavailable",
+        "Cannot allocate memory",
+        "Interrupted system call",
+    ]
+    .iter()
+    .any(|m| stderr.contains(m))
+}
+
+#[cfg(target_os = "linux")]
+fn probe_once(bwrap: &Path) -> (Availability, bool) {
+    let no = |why: String| (Availability::Unavailable(why), false);
+    let spawn_failed = |e: std::io::Error| {
+        (
+            Availability::Unavailable(format!("cannot run bwrap: {e}")),
+            transient_spawn_error(&e),
+        )
+    };
     let out = match std::process::Command::new(bwrap).arg("--version").output() {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
-        Ok(o) => {
-            return Availability::Unavailable(format!("bwrap --version failed ({})", o.status))
-        }
-        Err(e) => return Availability::Unavailable(format!("cannot run bwrap: {e}")),
+        Ok(o) => return no(format!("bwrap --version failed ({})", o.status)),
+        Err(e) => return spawn_failed(e),
     };
     let Some((major, minor, version)) = parse_version(&out) else {
-        return Availability::Unavailable("cannot read the bwrap version".into());
+        return no("cannot read the bwrap version".into());
     };
     if (major, minor) < MIN_BWRAP {
-        return Availability::Unavailable(format!(
+        return no(format!(
             "bubblewrap {version} is too old (0.8 or later has --disable-userns)"
         ));
     }
@@ -280,37 +375,91 @@ pub fn probe(bwrap: &Path) -> Availability {
         .args(["--ro-bind", "/", "/", "true"])
         .output();
     match smoke {
-        Ok(o) if o.status.success() => Availability::Usable {
-            bwrap: bwrap.to_path_buf(),
-            version,
-        },
-        Ok(o) => Availability::Unavailable(format!(
-            "bwrap cannot create a sandbox here (user namespaces refused?): {}",
-            String::from_utf8_lossy(&o.stderr).trim()
-        )),
-        Err(e) => Availability::Unavailable(format!("cannot run bwrap: {e}")),
-    }
-}
-
-/// The backend of this machine, probed once per process.
-pub fn detect() -> Availability {
-    static CACHE: std::sync::OnceLock<Availability> = std::sync::OnceLock::new();
-    CACHE.get_or_init(detect_uncached).clone()
-}
-
-#[cfg(target_os = "linux")]
-fn detect_uncached() -> Availability {
-    match which("bwrap", std::env::var("PATH").ok().as_deref()) {
-        Some(p) => probe(&p),
-        None => Availability::Unavailable(
-            "bubblewrap (bwrap) is not on PATH; install the bubblewrap package".into(),
+        Ok(o) if o.status.success() => (
+            Availability::Usable {
+                bwrap: bwrap.to_path_buf(),
+                version,
+            },
+            false,
         ),
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr);
+            (
+                Availability::Unavailable(format!(
+                    "bwrap cannot create a sandbox here (user namespaces refused?): {}",
+                    err.trim()
+                )),
+                transient_bwrap_message(&err),
+            )
+        }
+        Err(e) => spawn_failed(e),
     }
+}
+
+/// The backend of this machine, probed once per process. A DEFINITE answer is
+/// cached (a usable bwrap, no bwrap on `PATH`, a refused namespace); a failure
+/// that may be transient (no process slot, no memory) is retried by
+/// [`probe`] and, if it persists, answered but NOT cached, so one bad moment
+/// is never a permanent "no sandbox" for a long-lived `tole serve`.
+pub fn detect() -> Availability {
+    static CACHE: std::sync::Mutex<Option<Availability>> = std::sync::Mutex::new(None);
+    detect_cached(&CACHE, detect_uncached)
+}
+
+/// The cache decision of [`detect`]: the cached answer, else `probe`'s, kept
+/// only when it is definite (the `bool` of `probe` is "definite").
+fn detect_cached<F>(cache: &std::sync::Mutex<Option<Availability>>, probe: F) -> Availability
+where
+    F: FnOnce() -> (Availability, bool),
+{
+    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(a) = cache.as_ref() {
+        return a.clone();
+    }
+    let (a, definite) = probe();
+    if definite {
+        *cache = Some(a.clone());
+    }
+    a
+}
+
+/// The answer, and whether it is definite (may be cached).
+#[cfg(target_os = "linux")]
+fn detect_uncached() -> (Availability, bool) {
+    let found = backend_candidates("bwrap", std::env::var("PATH").ok().as_deref());
+    if found.is_empty() {
+        return (
+            Availability::Unavailable(
+                "bubblewrap (bwrap) is not on an absolute PATH entry; install the bubblewrap package"
+                    .into(),
+            ),
+            true,
+        );
+    }
+    // The first USABLE candidate wins; a bad earlier one does not decide. When
+    // none works the first one's reason is the answer.
+    let mut first = None;
+    let mut definite = true;
+    for p in found {
+        let (a, transient) = probe_classified(&p);
+        if matches!(a, Availability::Usable { .. }) {
+            return (a, true);
+        }
+        definite &= !transient;
+        first.get_or_insert(a);
+    }
+    (
+        first.unwrap_or(Availability::Unavailable(String::new())),
+        definite,
+    )
 }
 
 #[cfg(not(target_os = "linux"))]
-fn detect_uncached() -> Availability {
-    Availability::Unavailable("no sandbox on this platform (Linux only)".into())
+fn detect_uncached() -> (Availability, bool) {
+    (
+        Availability::Unavailable("no sandbox on this platform (Linux only)".into()),
+        true,
+    )
 }
 
 /// A profile entry or workspace the sandbox must never grant, judged on
