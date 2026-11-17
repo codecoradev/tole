@@ -40,6 +40,9 @@ pub struct PendingApproval {
     /// fallback for an evicted session must reopen the EXACT file
     /// (cora MAJOR #3: cwd-dependent layouts defeat daemon-cwd guesses).
     pub storage_path: std::path::PathBuf,
+    /// Position in the queue's monotonic sequence (#571): lets a caller
+    /// tell an entry queued during its own turn from an older one.
+    pub seq: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,6 +67,8 @@ impl ApprovalStatus {
 #[derive(Default)]
 pub struct ApprovalQueue {
     entries: Mutex<Vec<PendingApproval>>,
+    /// Count of entries ever queued; each entry carries its number.
+    seq: std::sync::atomic::AtomicU64,
     /// Approved one-shots keyed by (SESSION, fingerprint) — a shared
     /// tool+input across sessions must never let one session's ALLOW
     /// authorize another's replay (cora MAJOR). Value: tool + granted
@@ -163,6 +168,7 @@ impl ApprovalQueue {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let id = format!("apr-{:x}-{:x}{:x}", now_ms(), nonce, seq);
+        let entry_seq = self.seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
         self.entries
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -175,6 +181,7 @@ impl ApprovalQueue {
                 created_at_ms: now_ms(),
                 status: ApprovalStatus::Pending,
                 storage_path,
+                seq: entry_seq,
             });
         id
     }
@@ -205,20 +212,25 @@ impl ApprovalQueue {
             .map(|e| (e.session_id.clone(), e.tool.clone()))
     }
 
-    /// The pending entry a just-settled prompt of `session_id` stopped on
-    /// (#571): the newest Pending entry of THAT session for `tool`. The
-    /// session id is part of the key, so another session's approval is
-    /// never returned. `None` when it expired or was decided meanwhile.
-    pub fn pending_for(&self, session_id: &str, tool: &str) -> Option<PendingApproval> {
+    /// The queue position now (#571): snapshot it before a turn, then ask
+    /// [`Self::queued_since`] what that turn queued.
+    pub fn mark(&self) -> u64 {
+        self.seq.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The newest entry of `session_id` for `tool` queued strictly after
+    /// `mark`, in any status (#571). The session id is part of the key, so
+    /// another session's approval is never returned; the mark excludes
+    /// older entries of the same session and tool, so a stop that queued
+    /// nothing (a pre-tool hook denial) never picks up a stale row.
+    pub fn queued_since(&self, session_id: &str, tool: &str, mark: u64) -> Option<PendingApproval> {
         self.prune_expired();
         self.entries
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .iter()
             .rev()
-            .find(|e| {
-                e.session_id == session_id && e.tool == tool && e.status == ApprovalStatus::Pending
-            })
+            .find(|e| e.session_id == session_id && e.tool == tool && e.seq > mark)
             .cloned()
     }
 
@@ -351,18 +363,26 @@ pub fn approval_json(e: &PendingApproval) -> Value {
 }
 
 /// The `POST /sessions/{id}/prompt` body for a turn that stopped on an
-/// approval (#571): `stopReason: "approval_required"` plus the queue row
-/// (the `GET /approvals` shape) of THIS session's pending entry for
-/// `tool`. When no such entry is pending any more (expired, decided
-/// meanwhile, or a stop that never queued, such as a pre-tool hook
-/// denial) `approval` is omitted and the client falls back to
-/// `GET /approvals`.
-pub fn approval_required_body(queue: &ApprovalQueue, session_id: &str, tool: &str) -> Value {
+/// approval (#571), or `None` when the stop queued nothing. `mark` is
+/// [`ApprovalQueue::mark`] taken before the turn: only an entry of this
+/// session and `tool` queued DURING the turn counts, so a pre-tool hook
+/// denial (the turn reports the same outcome but nothing waits for a
+/// decision) is `None`, as is an older undecided entry. The body is
+/// `stopReason: "approval_required"` plus the queue row (the
+/// `GET /approvals` shape) while that entry is still pending; when it
+/// expired or was decided in the meantime `approval` is omitted.
+pub fn approval_required_body(
+    queue: &ApprovalQueue,
+    session_id: &str,
+    tool: &str,
+    mark: u64,
+) -> Option<Value> {
+    let e = queue.queued_since(session_id, tool, mark)?;
     let mut out = json!({"stopReason": "approval_required"});
-    if let Some(e) = queue.pending_for(session_id, tool) {
+    if e.status == ApprovalStatus::Pending {
         out["approval"] = approval_json(&e);
     }
-    out
+    Some(out)
 }
 
 /// Thin std-only HTTP helper for the CLI consumer (tole serve speaks
@@ -496,47 +516,59 @@ mod tests {
         q.queue_entry(session, tool, "d", 7, std::path::PathBuf::from("/x"))
     }
 
-    /// #571: the body names the pending entry of the stopped session.
+    /// #571: an entry queued during the turn is named, with its row.
     #[test]
-    fn approval_required_body_carries_the_pending_row() {
+    fn approval_required_body_carries_the_row_queued_during_the_turn() {
         let q = ApprovalQueue::default();
+        let mark = q.mark();
         let id = queue_one(&q, "s1", "write_file");
-        let b = approval_required_body(&q, "s1", "write_file");
+        let b = approval_required_body(&q, "s1", "write_file", mark).unwrap();
         assert_eq!(b["stopReason"], "approval_required");
         assert_eq!(b["approval"]["id"], id.as_str());
         assert_eq!(b["approval"]["tool"], "write_file");
         assert_eq!(b["approval"]["status"], "pending");
     }
 
-    /// #571: queue entry gone (empty queue, or already decided) -> still
-    /// `approval_required`, no `approval` key.
+    /// #571: queued during the turn but decided before the lookup ->
+    /// still `approval_required`, no `approval` key.
     #[test]
-    fn approval_required_body_without_a_pending_entry_omits_approval() {
+    fn approval_required_body_without_a_pending_row_omits_approval() {
         let q = ApprovalQueue::default();
-        let b = approval_required_body(&q, "s1", "write_file");
-        assert_eq!(b["stopReason"], "approval_required");
-        assert!(b.get("approval").is_none(), "{b}");
+        let mark = q.mark();
         let id = queue_one(&q, "s1", "write_file");
         q.decide(&id, false);
-        let b = approval_required_body(&q, "s1", "write_file");
+        let b = approval_required_body(&q, "s1", "write_file", mark).unwrap();
         assert_eq!(b["stopReason"], "approval_required");
         assert!(b.get("approval").is_none(), "{b}");
     }
 
-    /// #571: another session's (or another tool's) pending approval is
-    /// never returned, and the newest pending entry of the session wins.
+    /// #571: a stop that queued nothing (pre-tool hook denial) is `None`,
+    /// even with an older undecided entry of the same session and tool.
+    #[test]
+    fn a_stop_that_queued_nothing_is_not_approval_required() {
+        let q = ApprovalQueue::default();
+        let stale = queue_one(&q, "s1", "write_file");
+        let mark = q.mark();
+        assert!(approval_required_body(&q, "s1", "write_file", mark).is_none());
+        // The stale entry is still pending and untouched.
+        assert_eq!(
+            q.peek_pending(&stale).map(|p| p.1),
+            Some("write_file".into())
+        );
+    }
+
+    /// #571: another session's (or another tool's) entry is never returned.
     #[test]
     fn approval_required_body_never_leaks_other_sessions() {
         let q = ApprovalQueue::default();
+        let mark = q.mark();
         queue_one(&q, "other", "write_file");
         queue_one(&q, "s1", "edit_file");
-        let b = approval_required_body(&q, "s1", "write_file");
-        assert!(b.get("approval").is_none(), "{b}");
-        let old = queue_one(&q, "s1", "write_file");
-        let new = queue_one(&q, "s1", "write_file");
-        let b = approval_required_body(&q, "s1", "write_file");
-        assert_ne!(old, new);
-        assert_eq!(b["approval"]["id"], new.as_str());
+        assert!(approval_required_body(&q, "s1", "write_file", mark).is_none());
+        let own = queue_one(&q, "s1", "write_file");
+        queue_one(&q, "other", "write_file");
+        let b = approval_required_body(&q, "s1", "write_file", mark).unwrap();
+        assert_eq!(b["approval"]["id"], own.as_str());
         assert_eq!(b["approval"]["sessionId"], "s1");
     }
 }

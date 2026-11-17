@@ -620,6 +620,7 @@ mod tests {
             created_at_ms: 0,
             status,
             storage_path: PathBuf::new(),
+            seq: 0,
         }
     }
 

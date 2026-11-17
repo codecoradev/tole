@@ -1809,6 +1809,11 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                     // stream is open on this session: with nobody watching the
                     // turn runs exactly as before streams existed.
                     let observer = state.buses.observer_for(id);
+                    // Snapshot the approval queue before the turn (#571): a
+                    // session runs one turn at a time (a second prompt is a
+                    // 409), so an entry of this session newer than the mark
+                    // was queued by THIS turn.
+                    let mark = state.approvals.mark();
                     match run_session_turn_detailed(
                         Arc::clone(&state.sessions),
                         id,
@@ -1817,23 +1822,23 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                         observer,
                     ) {
                         // A turn waiting for an approval is not a refusal
-                        // (#571): say so, with the queue row when it is
-                        // still pending (same shape as GET /approvals).
-                        Ok(r) if r.approval_tool.is_some() => {
-                            let tool = r.approval_tool.as_deref().unwrap_or_default();
-                            (
-                                200,
+                        // (#571). A stop that queued nothing (a pre-tool hook
+                        // denial) is one: nothing waits for a decision.
+                        Ok(r) => {
+                            let approval = r.approval_tool.as_deref().and_then(|tool| {
                                 tole_cli::approvals::approval_required_body(
                                     &state.approvals,
                                     id,
                                     tool,
-                                ),
-                            )
+                                    mark,
+                                )
+                            });
+                            match (approval, r.text) {
+                                (Some(body), _) => (200, body),
+                                (None, Some(t)) => (200, json!({"stopReason": r.stop, "text": t})),
+                                (None, None) => (200, json!({"stopReason": r.stop})),
+                            }
                         }
-                        Ok(r) => match r.text {
-                            Some(t) => (200, json!({"stopReason": r.stop, "text": t})),
-                            None => (200, json!({"stopReason": r.stop})),
-                        },
                         Err(e) if e.contains("session is busy") => (409, json!({"error": e})),
                         Err(e) => (500, json!({"error": e})),
                     }

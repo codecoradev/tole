@@ -54,16 +54,41 @@ impl Serve {
         Self::spawn_in_env(base, dir, true, env)
     }
 
+    /// A fresh workspace with extra command-line arguments for `tole serve`.
+    pub fn spawn_with_args(base: &str, args: &[&str]) -> Self {
+        let dir = std::env::temp_dir().join(format!(
+            "tole-entries-{}-{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        Self::spawn_in_env_args(base, dir, true, &[], args)
+    }
+
     pub fn spawn_in_env(
         base: &str,
         dir: std::path::PathBuf,
         own_dir: bool,
         env: &[(&str, &str)],
     ) -> Self {
+        Self::spawn_in_env_args(base, dir, own_dir, env, &[])
+    }
+
+    pub fn spawn_in_env_args(
+        base: &str,
+        dir: std::path::PathBuf,
+        own_dir: bool,
+        env: &[(&str, &str)],
+        args: &[&str],
+    ) -> Self {
         let (child, port) = common::spawn_listening(|port| {
             let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
             cmd.args(["serve", "--port", &port.to_string(), "--token", "t0ken"])
                 .args(["--workspace", dir.to_str().unwrap()])
+                .args(args)
                 .current_dir(&dir)
                 .env("TOLE_BASE_URL", base)
                 .env("TOLE_MODEL", "mock-model")

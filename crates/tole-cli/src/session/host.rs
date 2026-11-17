@@ -514,6 +514,7 @@ pub fn run_session_turn_with_images(
 /// A settled turn with what only `serve` needs on top of the ACP/MCP pair
 /// (#571): which tool the turn stopped on when it waits for an approval.
 /// `stop` keeps the ACP vocabulary (`refusal` for an approval stop).
+#[non_exhaustive]
 pub struct TurnResult {
     pub stop: String,
     pub text: Option<String>,
