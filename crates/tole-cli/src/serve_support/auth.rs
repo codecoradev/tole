@@ -443,6 +443,169 @@ mod tests {
         assert!(!bearer_matches(None, "t0ken"));
     }
 
+    fn basic_header(user: &str, pass: &str) -> String {
+        format!("Basic {}", STANDARD.encode(format!("{user}:{pass}")))
+    }
+
+    fn basic_auth(token: Option<&str>) -> Authenticator {
+        let hash = PasswordHash::create(b"correct horse", MIN_ITERATIONS).unwrap();
+        let creds = BasicCredentials::new("owner", PasswordHash::parse(&hash).unwrap()).unwrap();
+        Authenticator::new(token.map(str::to_string), Some(creds))
+    }
+
+    #[test]
+    fn a_hash_round_trips_and_a_wrong_password_fails() {
+        let h = PasswordHash::create(b"correct horse", MIN_ITERATIONS).unwrap();
+        assert!(h.starts_with("$pbkdf2-sha256$i=10000$"), "{h}");
+        let p = PasswordHash::parse(&h).unwrap();
+        assert!(p.verify(b"correct horse"));
+        assert!(!p.verify(b"correct horsE"));
+        assert!(!p.verify(b""));
+        // Two hashes of one password differ (random salt).
+        assert_ne!(
+            h,
+            PasswordHash::create(b"correct horse", MIN_ITERATIONS).unwrap()
+        );
+    }
+
+    #[test]
+    fn weak_or_malformed_hashes_and_passwords_are_refused_without_echo() {
+        assert!(PasswordHash::create(b"short", MIN_ITERATIONS).is_err());
+        assert!(PasswordHash::create(b"long enough pw", MIN_ITERATIONS - 1).is_err());
+        let h = PasswordHash::create(b"correct horse", MIN_ITERATIONS).unwrap();
+        let weak = h.replacen("i=10000", "i=9999", 1);
+        let e = PasswordHash::parse(&weak).err().unwrap();
+        assert!(e.contains("too few") && !e.contains(&weak), "{e}");
+        let huge = h.replacen("i=10000", "i=99999999", 1);
+        assert!(PasswordHash::parse(&huge)
+            .err()
+            .unwrap()
+            .contains("too many"));
+        for bad in [
+            "",
+            "plaintext-password",
+            "$pbkdf2-sha1$i=10000$AAAAAAAAAAAAAAAAAAAAAA$AAAA",
+            "$pbkdf2-sha256$i=10000$AAAA$AAAA",
+            &format!("{h}$extra"),
+        ] {
+            let e = PasswordHash::parse(bad).err().unwrap();
+            assert!(e.contains("malformed"), "{bad}: {e}");
+            assert!(
+                bad.is_empty() || !e.contains(bad),
+                "the error echoed the input"
+            );
+        }
+    }
+
+    #[test]
+    fn basic_accepts_only_the_right_user_and_password() {
+        let a = basic_auth(None);
+        assert!(a.check(Some(&basic_header("owner", "correct horse"))));
+        assert!(!a.check(Some(&basic_header("owner", "wrong password"))));
+        assert!(!a.check(Some(&basic_header("intruder", "correct horse"))));
+        assert!(!a.check(Some(&basic_header("Owner", "correct horse"))));
+        assert!(!a.check(Some(&basic_header("owner", ""))));
+        assert!(!a.check(Some(&basic_header("", ""))));
+        assert!(!a.check(Some("Basic !!!not-base64")));
+        assert!(!a.check(Some(&format!("Basic {}", STANDARD.encode("owner")))));
+        assert!(!a.check(Some("Basic")));
+        assert!(!a.check(Some("Bearer correct horse")));
+        assert!(!a.check(None));
+        // The scheme is case-insensitive; a password may hold ':'.
+        let header = basic_header("owner", "correct horse").replacen("Basic", "bAsIc", 1);
+        assert!(a.check(Some(&header)));
+        // An oversized credential is refused before any hashing.
+        assert!(!a.check(Some(&basic_header("owner", &"x".repeat(2000)))));
+    }
+
+    #[test]
+    fn the_token_and_basic_go_through_the_same_check() {
+        let a = basic_auth(Some("t0ken-0742"));
+        assert!(a.check(Some("Bearer t0ken-0742")));
+        assert!(a.check(Some(&basic_header("owner", "correct horse"))));
+        assert!(!a.check(Some("Bearer t0ken-0743")));
+        // Token only: Basic never passes, and there is no challenge.
+        let t = Authenticator::token("t0ken-0742".into());
+        assert!(t.check(Some("Bearer t0ken-0742")));
+        assert!(!t.check(Some(&basic_header("owner", "correct horse"))));
+        assert!(t.challenge().is_none());
+        assert!(a.challenge().unwrap().starts_with("Basic realm="));
+        // Basic without a token: a bearer never passes.
+        assert!(!basic_auth(None).check(Some("Bearer t0ken-0742")));
+    }
+
+    #[test]
+    fn only_a_verified_header_is_remembered_and_the_memory_is_bounded() {
+        let a = basic_auth(None);
+        let bad = basic_header("owner", "wrong password");
+        assert!(!a.check(Some(&bad)));
+        assert_eq!(a.lock_verified().len(), 0, "a failure is never remembered");
+        let good = basic_header("owner", "correct horse");
+        assert!(a.check(Some(&good)));
+        assert!(a.check(Some(&good)));
+        assert_eq!(a.lock_verified().len(), 1);
+        for n in 0..VERIFIED_MAX + 5 {
+            a.lock_verified()
+                .insert([n as u8; 32], Instant::now() + VERIFIED_TTL);
+        }
+        // A new valid header (another spelling of the scheme) inserts into a
+        // full memory, which is cleared first.
+        let other = good.replacen("Basic", "bAsIc", 1);
+        assert!(a.check(Some(&other)));
+        assert!(a.lock_verified().len() <= VERIFIED_MAX);
+    }
+
+    #[test]
+    fn user_names_and_loopback_binds_are_checked() {
+        let h = || {
+            PasswordHash::parse(&PasswordHash::create(b"correct horse", MIN_ITERATIONS).unwrap())
+                .unwrap()
+        };
+        assert!(BasicCredentials::new("", h()).is_err());
+        assert!(BasicCredentials::new("a:b", h()).is_err());
+        assert!(BasicCredentials::new("a\nb", h()).is_err());
+        assert!(BasicCredentials::new(&"u".repeat(129), h()).is_err());
+        assert!(BasicCredentials::new(" owner ", h()).is_ok());
+        for b in ["127.0.0.1", "localhost", "::1", "[::1]", "127.1.2.3"] {
+            assert!(is_loopback_bind(b), "{b}");
+        }
+        for b in ["0.0.0.0", "192.168.1.5", "::", "example.com", ""] {
+            assert!(!is_loopback_bind(b), "{b}");
+        }
+    }
+
+    #[test]
+    fn resolving_the_credentials_never_echoes_the_hash() {
+        let hash = PasswordHash::create(b"correct horse", MIN_ITERATIONS).unwrap();
+        let dir = crate::test_dir::TestDir::new("tole-basic-resolve");
+        let file = dir.join("hash");
+        std::fs::write(&file, format!("{hash}\n")).unwrap();
+        let s = |v: &str| Some(v.to_string());
+        let ok = resolve_basic(s("owner"), Some(&file), None, None).unwrap();
+        assert!(ok.verify(b"owner:correct horse"));
+        assert!(!ok.verify(b"owner:wrong horse!"));
+        assert_eq!(
+            tole_core::secrets::process_secrets().redact(&format!("h={hash}")),
+            "h=«TOLE_SERVE_BASIC_HASH»",
+            "the hash is a secret held by role"
+        );
+        // Env carries it too; the file wins; the flag user wins over the env.
+        assert!(resolve_basic(None, None, s("owner"), s(&hash)).is_ok());
+        let e = resolve_basic(None, None, None, s(&hash)).err().unwrap();
+        assert!(e.contains("needs a user"), "{e}");
+        let e = resolve_basic(s("owner"), None, None, None).err().unwrap();
+        assert!(e.contains("needs a password hash"), "{e}");
+        let junk = "$pbkdf2-sha256$i=10000$not-a-real-hash-0742$x";
+        let e = resolve_basic(s("owner"), None, None, s(junk))
+            .err()
+            .unwrap();
+        assert!(e.contains("malformed") && !e.contains(junk), "{e}");
+        let e = resolve_basic(s("owner"), Some(&dir.join("missing")), None, None)
+            .err()
+            .unwrap();
+        assert!(e.contains("does not exist"), "{e}");
+    }
+
     #[test]
     fn the_limiter_refuses_after_the_cap_and_recovers_after_the_window() {
         let l = AuthLimiter::new();
