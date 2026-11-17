@@ -830,16 +830,24 @@ fn serve_events(
                 Some(_) => hb.note_write(Instant::now()),
             }
         }
-        // Durable frames (a transient read error just retries).
-        if let Ok(entries) = tail.poll() {
-            for e in entries {
-                if !write_all(&mut stream, &entry_frame(&e)) {
-                    return;
+        // Durable frames (a read error just retries on the next pass).
+        let polled = match tail.poll() {
+            Ok(entries) => {
+                for e in entries {
+                    if !write_all(&mut stream, &entry_frame(&e)) {
+                        return;
+                    }
+                    hb.note_write(Instant::now());
                 }
-                hb.note_write(Instant::now());
+                true
             }
-        }
-        if !ready_sent {
+            Err(_) => false,
+        };
+        // `ready` says the replay is complete, so it waits for a pass that
+        // actually read the log: after a failed read it would announce an
+        // empty replay and a client resuming from `after` would lose every
+        // entry it missed (lossless replay is the point of the log).
+        if !ready_sent && polled {
             ready_sent = true;
             let ready = frame(
                 "ready",

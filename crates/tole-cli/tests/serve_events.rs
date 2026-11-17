@@ -164,6 +164,39 @@ fn a_reconnect_after_a_seq_is_lossless_and_exact() {
     assert!(entry_frames(&got).is_empty());
 }
 
+/// `ready` means "the replay is complete", so it may never be sent while the
+/// replay itself failed: a stream that said `ready` without the entries after
+/// `after` would break the lossless-reconnect guarantee (this was the
+/// `left: [] right: [6, 9]` flake). The session file is made unreadable for
+/// the stream's first replay by moving it away, then put back.
+#[test]
+fn ready_waits_for_a_replay_that_could_not_read_the_log() {
+    let serve = Serve::spawn(&spawn_mock(0));
+    let id = new_session(&serve);
+    serve_harness::prompt(&serve, &id, "one");
+    let want: Vec<u64> = log(&serve, &id)
+        .iter()
+        .map(|e| e["seq"].as_u64().unwrap())
+        .collect();
+    assert!(want.len() >= 2, "user message and answer: {want:?}");
+
+    let file = serve.session_file(&id);
+    let away = file.with_extension("jsonl.away");
+    std::fs::rename(&file, &away).unwrap();
+    let sse = Sse::open(&serve, &events_path(&id), "", true).unwrap();
+    // The log cannot be read, so the replay is not complete: no `ready`.
+    // (A bounded look at silence, like the one after `ready` above.)
+    let early = sse.next(Duration::from_millis(500));
+    assert!(
+        early.as_ref().is_none_or(|f| f.event != "ready"),
+        "ready before the replay could read the log: {early:?}"
+    );
+    std::fs::rename(&away, &file).unwrap();
+    let frames = sse.until(WAIT, |f| f.event == "ready");
+    let ids: Vec<u64> = entry_frames(&frames).iter().filter_map(|f| f.id).collect();
+    assert_eq!(ids, want, "the replay arrives, in full, before ready");
+}
+
 #[test]
 fn streams_need_the_token_refuse_bad_input_and_are_capped() {
     let serve = Serve::spawn(&spawn_mock(0));
