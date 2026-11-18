@@ -113,6 +113,7 @@ pub mod no_config_guard;
 pub mod plugin;
 pub mod sandbox_cmd;
 pub mod sandbox_flags;
+pub mod webhook_cmd;
 pub mod webhook_out;
 // `plugin/` holds these modules; the re-exports keep the old top-level paths working.
 #[doc(inline)]
