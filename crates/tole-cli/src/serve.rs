@@ -1661,8 +1661,36 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                     status,
                     session_id,
                     tool,
+                    transitioned: true,
                     ..
                 } => (session_id, tool, status),
+                // Not the first decision (a repeat, a flip after the fact, or
+                // an entry that had already expired): nothing is audited and
+                // nothing resumes, so the durable trail keeps the verdict that
+                // took effect and the one-shot is not replayed twice. The same
+                // verdict again is idempotent; a different one is a conflict.
+                tole_cli::approvals::DecisionOutcome::Decided { status, .. } => {
+                    let same = match status {
+                        tole_cli::approvals::ApprovalStatus::Approved => allow,
+                        tole_cli::approvals::ApprovalStatus::Denied => !allow,
+                        _ => false,
+                    };
+                    return if same {
+                        (
+                            200,
+                            json!({"id": id, "status": status.as_str(), "resuming": false}),
+                        )
+                    } else {
+                        (
+                            409,
+                            json!({
+                                "error": format!("approval already {}", status.as_str()),
+                                "id": id,
+                                "status": status.as_str(),
+                            }),
+                        )
+                    };
+                }
                 tole_cli::approvals::DecisionOutcome::Unknown => {
                     return (404, json!({"error": "unknown approval id"}));
                 }
@@ -1684,7 +1712,7 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                 // consults the approver, the one-shot matches, the tool
                 // executes. Runs off-thread — the turn may take a while.
                 // Bounded without the connection cap: an approval id is decided
-                // once (a repeat is 404 above) and pending approvals only come
+                // once (a repeat returns above, without a resume) and pending approvals only come
                 // from the capped, one-turn-per-session map.
                 let sessions = Arc::clone(&state.sessions);
                 let sid = session_id.clone();
