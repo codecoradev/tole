@@ -68,6 +68,14 @@ continuity, infra facts.
   evidence), CI auto-fix max 3 attempts then escalate. The Cora Review job
   has a 30-min limit; large change-sets (~40+ files or ~850+ lines) can still
   time out — split into ~15–20-file PRs.
+  **Exception (#914):** a PR whose every file is excluded by `review.exclude`
+  in `.cora.yaml` (docs and changelog only) has nothing for Cora to review; a lockfile is never skipped. The
+  job then skips the review, ends green and writes "Nothing to review" in its
+  summary, and there is no Cora comment. For such a PR the evidence is green CI
+  plus an independent read-only review of the text, named in the PR **Testing**
+  section. The skip is decided by `scripts/cora-all-excluded.sh` as it is on the
+  base branch and fails closed: any file Cora would review, any lockfile, or any doubt runs
+  the review as before.
 
 ## 3. Mandatory pre-commit checks
 
