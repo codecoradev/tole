@@ -409,7 +409,11 @@ two `webhook:` targets sends the same id to both destinations.
   is a code from a closed set (`http_<status>` for a terminal or last HTTP
   status such as `http_500`, `timeout`, `dns`, `refused_address`,
   `redirect_refused`, `queue_full`, `enqueue_failed`, `expired`, `bad_line`,
-  `not_implemented`), never a URL, header or response byte. A failed delivery never changes the run status. Approval events
+  `bad_destination` (a URL, header or scheme no later attempt can fix),
+  `not_implemented`; `transport` and `key_unavailable` appear only on outbox
+  `attempt` lines, never in the ledger: a key that stays unavailable is retried
+  until the deadline and ends as `expired`, on purpose, so fixing the
+  variable or file in time still delivers), never a URL, header or response byte. A failed delivery never changes the run status. The ledger row for a cron event is written only when the event id is the event id of the fire it names (`cron_event_id`); a line that fails this check settles with no row, and a forged first `enqueue` for a predictable id makes the real producer's `enqueue` a no-op (availability, inside the same-account residual). Approval events
   have no `fire_id`: their terminal state is the in-memory counters and one
   stderr line from serve with the same code and the destination name.
 - **Doctor.** Lists each destination (name, host:port only, events,
