@@ -207,6 +207,11 @@ pub fn load(
         // The URL can carry a token in its path or query: it is redacted too,
         // so a run that prints it cannot put it on the wire or on disk.
         tole_core::secrets::add_role_secret(&format!("webhook_out.{name}.url"), url.trim());
+        // A token is often printed alone, not inside the whole URL: each
+        // query value and path segment long enough to be one is held too.
+        for part in url_secret_parts(url.trim()) {
+            tole_core::secrets::add_role_secret(&format!("webhook_out.{name}.url"), &part);
+        }
 
         let events = match &w.events {
             None => BTreeSet::from([Event::CronRunFinished]),
@@ -341,3 +346,21 @@ pub fn doctor_lines_with(
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+/// Query values and path segments of `url` that are long enough to be a
+/// token (a short word such as `hook` is not one and would redact prose).
+fn url_secret_parts(url: &str) -> Vec<String> {
+    const MIN: usize = 12;
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let rest = rest.split('#').next().unwrap_or("");
+    let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
+    let path = path.split_once('/').map_or("", |(_, p)| p);
+    let values = query
+        .split('&')
+        .filter_map(|kv| kv.split_once('=').map(|(_, v)| v));
+    path.split('/')
+        .chain(values)
+        .filter(|p| p.len() >= MIN)
+        .map(str::to_string)
+        .collect()
+}
