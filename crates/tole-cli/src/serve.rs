@@ -1654,6 +1654,7 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                     status,
                     session_id,
                     tool,
+                    ..
                 } => (session_id, tool, status),
                 tole_cli::approvals::DecisionOutcome::Unknown => {
                     return (404, json!({"error": "unknown approval id"}));
