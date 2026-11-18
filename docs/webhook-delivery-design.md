@@ -1,10 +1,15 @@
 # Outbound signed webhook delivery — design note
 
-Status: **in progress.** Built: `vetted_post` and the address policy (#919),
-the `[webhook_out]` config, its user-only layering and the `webhook:<name>`
-cron target, which fails closed with `not_implemented` until the sender lands
-(section 9, PR 2). Not built: the event ids and payloads, the outbox, the
-sender, the approval events and `tole webhook test`. Issue #911, part of the
+Status: **implemented** (#919, #920 and the parts of #911 that followed:
+event ids, payloads and signing, the outbox and sender, cron delivery,
+`tole webhook test`, the approval events, and the real-binary end-to-end tests
+with failure injection and the leak check). The PR split of section 9 was
+carried out in smaller pieces than estimated. Changes made on the way, noted
+where the sections above may still read the first draft: a destination
+URL's long query values and path segments are held as secrets next to the whole
+URL, and the public items that changed are listed in the CHANGELOG. Not built, left open:
+making `POST /approvals/{id}/decision` use `decide`'s `transitioned` (a repeat
+allow audits and resumes twice). Issue #911, part of the
 gateway epic #910 (step G0b). Extends [automation-design.md](automation-design.md) §9
 (delivery without channels) and mirrors the inbound gate of §6 (#582).
 

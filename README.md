@@ -17,8 +17,10 @@ automation and secrets release:
 
 - **Automation:** `tole cron` (scheduled script and agent jobs, per-job time zones,
   parked approvals resumed from `/approvals`), `tole hook` and `POST /hooks/<route>`
-  on `tole serve` (signed webhooks that fire a cron job), `tole route` (model routing
-  by task weight), and `tole serve --cron` as the in-process ticker.
+  on `tole serve` (signed webhooks that fire a cron job), outbound signed webhooks
+  (`[webhook_out.<name>]` in the user config: a finished cron run and approval requests
+  are posted to a receiver such as a chat gateway; `tole webhook test`), `tole route`
+  (model routing by task weight), and `tole serve --cron` as the in-process ticker.
 - **Profiles and delegation:** `[profiles.<name>]` personas (`--profile`), the
   `delegate` tools (budget carved from the parent, depth-limited, one completion
   report per child), `tole audit [goal] [--json]` to read the tree, an opt-in approval queue for
