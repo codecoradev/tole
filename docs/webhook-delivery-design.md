@@ -7,9 +7,10 @@ with failure injection and the leak check). The PR split of section 9 was
 carried out in smaller pieces than estimated. Changes made on the way, noted
 where the sections above may still read the first draft: a destination
 URL's long query values and path segments are held as secrets next to the whole
-URL, and the public items that changed are listed in the CHANGELOG. Not built, left open:
-making `POST /approvals/{id}/decision` use `decide`'s `transitioned` (a repeat
-allow audits and resumes twice). Issue #911, part of the
+URL, and the public items that changed are listed in the CHANGELOG. The
+decision route of `tole serve` now acts only on the first decision, using
+`decide`'s `transitioned` (the follow-up this design note first left open).
+Issue #911, part of the
 gateway epic #910 (step G0b). Extends [automation-design.md](automation-design.md) §9
 (delivery without channels) and mirrors the inbound gate of §6 (#582).
 
