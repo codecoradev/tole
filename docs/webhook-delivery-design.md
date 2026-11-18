@@ -210,6 +210,19 @@ User-Agent:       tole/<version>
   `v2=` value) so the gateway repository, which does not link `tole-core`, can
   pin its verifier to the same bytes. A unit test in `tole-core` checks the
   vector against `webhook::sign`.
+- **Test vector** (computed once with an independent HMAC-SHA256, not with
+  this code; pinned by `tole-core/tests/webhook_core.rs` and by
+  `webhook_out::sign`). Key (ASCII): `tole-test-key-0123456789abcdef`.
+  `X-Tole-Timestamp`: `1795000000`. `X-Tole-Delivery`:
+  `cron:daily-1:0123456789abcdef`. `X-Tole-Event`: `cron_run_finished`. Body
+  (one line, no trailing newline):
+
+  ```
+  {"v":1,"id":"cron:daily-1:0123456789abcdef","type":"cron_run_finished","destination":"gateway","at":1795000000,"data":{"job":"daily","status":"ok","summary":"all good","truncated":false}}
+  ```
+
+  Expected `X-Tole-Signature`:
+  `v2=9d8c931c19daf1192cfb7509c7f10dd86faf8ff0c938ae22d9ca7d99d8764f62`.
 - **Per attempt vs per event:** `X-Tole-Timestamp` (and therefore the
   signature) is regenerated on every attempt; the event id, the body bytes and
   `body.at` are not. A gateway applies the window to the timestamp and the

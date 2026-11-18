@@ -25,6 +25,7 @@ use crate::config::WebhookOutConfig;
 
 pub mod event;
 pub mod outbox;
+pub mod sign;
 
 /// Longest destination name.
 pub const MAX_NAME: usize = 32;
