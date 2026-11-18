@@ -87,6 +87,15 @@ pub struct Leasing {
     pub got_lock: bool,
 }
 
+/// An event with a terminal line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalEvent {
+    pub dest: String,
+    pub id: String,
+    pub fire_id: Option<String>,
+    pub terminal: super::outbox::Terminal,
+}
+
 /// An event this step marked `dead`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Dead {
@@ -240,6 +249,41 @@ impl Outbox {
         })();
         drop(lock);
         r
+    }
+
+    /// Events that reached a terminal line (`done` or `dead`), with the run each
+    /// belongs to when its id matches its body (see `fire_id_of`). The reconcile
+    /// pass uses it to find an event (enqueued within `window` seconds of `now`)
+    /// whose ledger row was never written.
+    pub fn terminal_events(&self, now: i64, window: i64) -> std::io::Result<Vec<TerminalEvent>> {
+        let bytes = self.read_all()?;
+        let mut fold = Fold::default();
+        fold.feed(
+            &bytes,
+            0,
+            FoldOptions {
+                now,
+                max_lease_ahead: 0,
+            },
+        );
+        Ok(fold
+            .entries()
+            .filter_map(|(d, id, e)| {
+                let terminal = e.terminal.clone()?;
+                // Only events of the window: older ones are past what a
+                // reconcile pass would announce anyway.
+                if now.saturating_sub(e.at) > window {
+                    return None;
+                }
+                let fire_id = body_at(&bytes, e.offset).and_then(|b| fire_id_of(&b, id));
+                Some(TerminalEvent {
+                    dest: d.to_string(),
+                    id: id.to_string(),
+                    fire_id,
+                    terminal,
+                })
+            })
+            .collect())
     }
 
     /// The leasing step of a drain pass. With `try_lock`: a pass that does not

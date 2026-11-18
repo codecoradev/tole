@@ -229,6 +229,8 @@ pub(crate) fn immediate(p: &Produced) -> Option<(DeliveryStatus, Option<String>)
 
 /// How often the `tole serve` sender looks at the outbox (one `stat`).
 const SENDER_POLL: Duration = Duration::from_secs(5);
+/// How often the serve sender reconciles the ledger and the outbox.
+const RECONCILE_EVERY_SECS: i64 = 300;
 /// Most passes one look runs back to back: a pass sends one event per
 /// destination, so a backlog is drained in a burst, bounded so a flood cannot
 /// keep one look busy forever.
@@ -247,7 +249,28 @@ const MAX_PASSES_PER_LOOK: usize = 200;
 pub fn spawn_sender(dir: std::path::PathBuf, dests: std::sync::Arc<Destinations>) {
     std::thread::spawn(move || {
         let mut sender = Sender::new(&dir);
+        let mut next_reconcile = 0;
         loop {
+            // At start (a crash recovery) and every 5 minutes: close the gaps
+            // a crash leaves between the ledger and the outbox.
+            if super::now() >= next_reconcile {
+                next_reconcile = super::now() + RECONCILE_EVERY_SECS;
+                let secrets =
+                    crate::provider_chain::process_secrets(&crate::config_apply::real_env);
+                // A panic here must not end delivery either.
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    reconcile(&dir, &dests, super::now(), &secrets)
+                }));
+                match r {
+                    Ok(Ok(r)) if r.enqueued + r.rows > 0 => eprintln!(
+                        "tole serve: webhook reconcile queued {} event(s), wrote {} row(s)",
+                        r.enqueued, r.rows
+                    ),
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => eprintln!("tole serve: webhook reconcile: {e}"),
+                    Err(_) => eprintln!("tole serve: webhook reconcile hit an internal error"),
+                }
+            }
             // A panic must not silently end delivery for the life of serve.
             let look = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 sender.step(&dests, super::now(), &mut |dest, code| {
@@ -521,4 +544,226 @@ fn webhook_targets(dir: &Path) -> std::collections::BTreeSet<String> {
             _ => None,
         })
         .collect()
+}
+
+/// What one reconcile pass did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Reconciled {
+    /// Events queued again for a run that had none.
+    pub enqueued: usize,
+    /// Ledger rows written (a skipped or failed run, or the row of an event
+    /// that finished without one).
+    pub rows: usize,
+}
+
+/// A run older than this is not announced any more: it is past the deadline an
+/// event would have had. `tole cron runs` still shows it.
+const RECONCILE_WINDOW_SECS: i64 = 6 * 3600;
+/// A run younger than this is left to the live tick: its event is queued by
+/// the tick that ran it, after its other targets were delivered (a command
+/// target can take minutes), and a reconcile pass in that window would race it.
+const RECONCILE_GRACE_SECS: i64 = 600;
+/// How much of a run's kept output reconcile reads: the event's summary is cut
+/// far below this.
+const OUTPUT_HEAD_BYTES: u64 = 64 * 1024;
+/// Most events one pass queues, so a long outage cannot make a pass unbounded.
+const RECONCILE_MAX_ENQUEUE: usize = 100;
+
+/// The reconcile pass (#911, design section 4): closes the two gaps a crash
+/// leaves between the ledger and the outbox.
+///
+/// 1. A run settled but its event was never queued (the process died between
+///    the `done` record and the append): for each run that settled in the last
+///    6 h whose job names a configured destination, with neither an outbox
+///    event for it nor a ledger row of any status, queue it (or record
+///    `skipped` for a silent run, `failed` for a refusal). A row of ANY status
+///    counts as terminal: otherwise silent runs would be queued again on every
+///    pass and notify against the silent rule.
+/// 2. An event reached `done` or `dead` but its ledger row was never written
+///    (the process died between the two): write the row from the outbox's
+///    terminal line.
+///
+/// It first COLLECTS what is missing from the ledger and the outbox, holding
+/// no lock, and only then calls `enqueue` (which re-checks atomically under the
+/// outbox lock, so the pass is idempotent) and writes rows (under the ledger
+/// lock). The two locks are never held together.
+pub fn reconcile(
+    dir: &Path,
+    dests: &Destinations,
+    now: i64,
+    secrets: &SecretSet,
+) -> anyhow::Result<Reconciled> {
+    let mut done = Reconciled::default();
+    if dests.is_empty() {
+        return Ok(done);
+    }
+    let outbox = Outbox::new(dir);
+    let events = outbox.fold(crate::webhook_out::outbox::FoldOptions {
+        now,
+        max_lease_ahead: 0,
+    })?;
+
+    // 1. Collect the runs that have neither an event nor a row.
+    struct Missing {
+        name: String,
+        fire_id: String,
+        job: Job,
+        scheduled_for: i64,
+        status: RunStatus,
+        session_id: Option<String>,
+        finished_at: i64,
+    }
+    let mut missing = Vec::new();
+    {
+        let l = store::open_read(dir)?;
+        let st = l.state();
+        for d in st.dones() {
+            let age = now.saturating_sub(d.at);
+            if !(RECONCILE_GRACE_SECS..=RECONCILE_WINDOW_SECS).contains(&age) {
+                continue;
+            }
+            let Some(job) = st.job(&d.job_id).map(|j| j.job.clone()) else {
+                continue;
+            };
+            if job.removed {
+                continue;
+            }
+            for t in super::deliver::targets(&job).unwrap_or_default() {
+                let Target::Webhook(name) = t else { continue };
+                if dests.get(&name).is_none() {
+                    continue;
+                }
+                let target = format!("webhook:{name}");
+                let has_row = st.deliveries(&d.fire_id).any(|x| x.target == target);
+                let id = event::cron_event_id(&d.fire_id);
+                if has_row || events.has(&name, &id) {
+                    continue;
+                }
+                missing.push(Missing {
+                    name,
+                    fire_id: d.fire_id.clone(),
+                    job: job.clone(),
+                    scheduled_for: st.fire(&d.fire_id).map_or(d.at, |f| f.scheduled_for),
+                    status: d.status,
+                    session_id: d.session_id.clone(),
+                    finished_at: d.at,
+                });
+                if missing.len() >= RECONCILE_MAX_ENQUEUE {
+                    break;
+                }
+            }
+            if missing.len() >= RECONCILE_MAX_ENQUEUE {
+                break;
+            }
+        }
+    }
+
+    // Queue them (no ledger lock held), then record what could not be queued.
+    let mut rows = Vec::new();
+    for m in missing {
+        // The run's output was kept, redacted, when it settled, and the live
+        // tick writes the file (even an empty one) before it settles the run. A
+        // file that is not there or cannot be read means this run never went
+        // through the live path (settled at claim time, or recovered after a
+        // crash) or the write failed: leave it. Never guess "silent" from a
+        // missing file, which would record `skipped` for a message the live
+        // tick may still send.
+        let Some(output) = read_output_head(&super::tick::output_path(dir, &m.fire_id)) else {
+            continue;
+        };
+        let facts = RunFacts {
+            job: &m.job,
+            fire_id: &m.fire_id,
+            scheduled_for: m.scheduled_for,
+            status: m.status,
+            output: &output,
+            session_id: m.session_id.as_deref(),
+            finished_at: m.finished_at,
+        };
+        let made = enqueue_run(dir, Some(dests), &m.name, &facts, secrets);
+        match &made {
+            Produced::Queued => done.enqueued += 1,
+            other => {
+                if let Some((status, error)) = immediate(other) {
+                    rows.push((m.fire_id, format!("webhook:{}", m.name), status, error));
+                }
+            }
+        }
+    }
+    if !rows.is_empty() {
+        done.rows += store::with_lock(dir, |l| {
+            let mut n = 0;
+            for (fire, target, status, error) in rows {
+                // Once per run and destination, whoever wrote it first.
+                if l.state().deliveries(&fire).any(|d| d.target == target) {
+                    continue;
+                }
+                if l.deliver(&fire, &target, status, error, now).is_ok() {
+                    n += 1;
+                }
+            }
+            Ok(n)
+        })?;
+    }
+
+    // 2. An event that finished without a ledger row. Only events of the window
+    // are looked at, and the ledger lock is only taken when a row is missing.
+    let settled: Vec<Settled> = outbox
+        .terminal_events(now, RECONCILE_WINDOW_SECS)?
+        .into_iter()
+        .filter(|t| t.fire_id.is_some())
+        .map(|t| {
+            let (status, code) = match t.terminal {
+                crate::webhook_out::outbox::Terminal::Done => (DeliveryStatus::Sent, None),
+                crate::webhook_out::outbox::Terminal::Dead(c) => {
+                    (DeliveryStatus::Failed, Some(known_code(&c).to_string()))
+                }
+            };
+            Settled {
+                dest: t.dest,
+                id: t.id,
+                fire_id: t.fire_id,
+                status,
+                code,
+            }
+        })
+        .collect();
+    let settled: Vec<Settled> = {
+        let l = store::open_read(dir)?;
+        settled
+            .into_iter()
+            .filter(|s| {
+                let target = format!("webhook:{}", s.dest);
+                s.fire_id
+                    .as_deref()
+                    .is_some_and(|f| !l.state().deliveries(f).any(|d| d.target == target))
+            })
+            .collect()
+    };
+    done.rows += record_settled(dir, settled, now)?;
+    Ok(done)
+}
+
+/// The first [`OUTPUT_HEAD_BYTES`] of a run's kept output, or `None` when it is
+/// not there or not a plain file. The path is inside the cron dir, which the
+/// same account can write: the file is opened without following a symlink and
+/// without blocking (a planted FIFO), must be a regular file, and is read up to
+/// a cap, so a planted link cannot put another file in a webhook body and a
+/// huge or special file cannot stall the sender.
+fn read_output_head(path: &Path) -> Option<String> {
+    use std::io::Read;
+    let mut o = std::fs::OpenOptions::new();
+    o.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let f = o.open(path).ok()?;
+    if !f.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    f.take(OUTPUT_HEAD_BYTES).read_to_end(&mut bytes).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
 }
