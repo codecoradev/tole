@@ -1,4 +1,5 @@
 use super::*;
+use crate::webhook_out::KeySource;
 use std::collections::BTreeSet;
 use std::time::Duration;
 use tole_core::web::AddrPolicy;
@@ -14,6 +15,7 @@ fn opts(now: i64) -> FoldOptions {
 
 fn dest(events: &[Event]) -> Destination {
     Destination {
+        key: KeySource::Env("K".into()),
         url: "https://example.com/hook".into(),
         events: events.iter().copied().collect::<BTreeSet<_>>(),
         policy: AddrPolicy::default(),
