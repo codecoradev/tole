@@ -1,7 +1,11 @@
 # Outbound signed webhook delivery — design note
 
-Status: **proposal, nothing implemented.** Issue #911, part of the gateway epic
-#910 (step G0b). Extends [automation-design.md](automation-design.md) §9
+Status: **in progress.** Built: `vetted_post` and the address policy (#919),
+the `[webhook_out]` config, its user-only layering and the `webhook:<name>`
+cron target, which fails closed with `not_implemented` until the sender lands
+(section 9, PR 2). Not built: the event ids and payloads, the outbox, the
+sender, the approval events and `tole webhook test`. Issue #911, part of the
+gateway epic #910 (step G0b). Extends [automation-design.md](automation-design.md) §9
 (delivery without channels) and mirrors the inbound gate of §6 (#582).
 
 **Owner decisions of 2026-11-17 (fixed, not reopened here):** a named
@@ -27,7 +31,7 @@ anything, and the answer to an approval still arrives through
 ```toml
 [webhook_out.gateway]
 url             = "http://127.0.0.1:8787/tole/events"   # http only with allow_loopback
-secret_env      = "TOLE_GATEWAY_SECRET"                 # or secret_file = "/abs/path"
+hmac_key_env      = "TOLE_GATEWAY_SECRET"                 # or hmac_key_file = "/abs/path"
 events          = ["cron_run_finished", "approval_requested", "approval_resolved"]
 allow_loopback  = true     # default false; literal loopback IP or `localhost` hosts only
 allow_private   = false    # default false (RFC 1918, ULA, link-local, metadata ...)
@@ -37,6 +41,10 @@ timeout_secs    = 10       # default 10, 1..=30
 
 - **Name:** `[a-z0-9_-]{1,32}`. Section is `webhook_out`, not `hooks`, so the
   inbound table (`HookConfig`, `config/mod.rs`) keeps its meaning.
+- **Key names:** `hmac_key_env` and `hmac_key_file`, the names `[hooks.*]` uses.
+  The first draft said `secret_env` / `secret_file`, but the config parser
+  refuses every key that contains `secret`, `password`, `token` or `api_key`
+  (a secret must never live in a config file), so those names cannot load.
 - **Secret source:** the same two sources and checks as `[hooks.*]` (`hmac_key_env`
   / `hmac_key_file`: exactly one, at least 16 bytes, a regular file of at most
   4 KiB, no link, no FIFO). Never inline, never shown (not in errors, `config

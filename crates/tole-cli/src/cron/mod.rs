@@ -102,8 +102,9 @@ pub enum CronAction {
         #[arg(long)]
         max_tokens: Option<u64>,
         /// Delivery target, repeatable: `log`, `session`, `file:PATH`
-        /// (inside the workdir) or `command:ARGV` (output on stdin)
-        /// [default: session for agent jobs, log for scripts].
+        /// (inside the workdir), `command:ARGV` (output on stdin) or
+        /// `webhook:NAME` (a `[webhook_out.NAME]` destination of the user
+        /// config) [default: session for agent jobs, log for scripts].
         #[arg(long = "deliver")]
         deliver: Vec<String>,
         /// Save the job paused.
@@ -337,6 +338,24 @@ fn cron_config() -> Option<crate::config::CronConfig> {
         Ok(c) => c?.cron,
         Err(e) => {
             eprintln!("tole cron: user config not applied: {e}");
+            None
+        }
+    }
+}
+
+/// The `[webhook_out]` destinations this process loaded (#911): the ones
+/// `tole serve` installed at start, else the user config's, loaded and
+/// installed on first use. A config that does not load is reported and means
+/// none, so a `webhook:` target is refused (`delivery_invalid`), never sent
+/// somewhere guessed.
+pub fn webhooks() -> Option<std::sync::Arc<crate::webhook_out::Destinations>> {
+    if let Some(d) = crate::webhook_out::loaded() {
+        return Some(d);
+    }
+    match crate::webhook_out::load_user() {
+        Ok(d) => Some(crate::webhook_out::install(d)),
+        Err(e) => {
+            eprintln!("tole cron: webhook destinations not loaded: {e}");
             None
         }
     }
@@ -1094,6 +1113,7 @@ pub fn cli(action: CronAction, globals: JobGlobals) -> anyhow::Result<()> {
         CronAction::Run { job } => {
             let opts = TickOptions {
                 daily_token_cap: daily_token_cap(),
+                webhooks: webhooks(),
                 ..TickOptions::standalone(1)
             };
             print_report("run", &run_now(&dir, &job, t, &opts)?);
@@ -1108,6 +1128,7 @@ pub fn cli(action: CronAction, globals: JobGlobals) -> anyhow::Result<()> {
         } => {
             let opts = TickOptions {
                 daily_token_cap: daily_token_cap(),
+                webhooks: webhooks(),
                 ..TickOptions::standalone(max_concurrent(flag))
             };
             print_report("tick", &tick(&dir, t, &opts)?);
@@ -1128,6 +1149,7 @@ pub fn serve_ticker(dir: &Path, approvals: std::sync::Arc<crate::approvals::Appr
             max_concurrent: max_concurrent(None),
             approvals: Some(std::sync::Arc::clone(&approvals)),
             daily_token_cap: daily_token_cap(),
+            webhooks: webhooks(),
         };
         let dir = dir.to_path_buf();
         std::thread::spawn(move || pass(&dir, &opts));
@@ -1146,6 +1168,7 @@ pub fn resume_after_approval(
         max_concurrent: 1,
         approvals: Some(approvals),
         daily_token_cap: daily_token_cap(),
+        webhooks: webhooks(),
     };
     tick::resume_parked(&default_dir()?, session_id, now(), &opts)
 }

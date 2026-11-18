@@ -185,7 +185,7 @@ pub fn hold_keys(routes: &BTreeMap<String, Route>) {
 
 /// The key file: a regular file (no link, no FIFO), at most
 /// [`MAX_KEY_FILE`] bytes, one trailing newline dropped.
-fn read_key_file(path: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn read_key_file(path: &str) -> Result<Vec<u8>, String> {
     let bytes =
         tole_core::delegation_report::read_plain_file(std::path::Path::new(path), MAX_KEY_FILE)
             .map_err(|e| format!("the key file {path}: {e}"))?

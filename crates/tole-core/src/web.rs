@@ -304,7 +304,10 @@ fn fetch_agent_vetted() -> ureq::Agent {
 }
 
 mod post;
-pub use post::{vetted_post, AddrPolicy, PostError, PostParams, PostResponse, MAX_POST_BODY};
+pub use post::{
+    check_destination_url, vetted_post, AddrPolicy, PostError, PostParams, PostResponse,
+    MAX_POST_BODY,
+};
 
 /// One GET of a host-side HTTP client (#625, the built-in web tools): no
 /// redirect is followed (the caller sees the 3xx and decides), and the

@@ -254,6 +254,14 @@ fn check_url(url: &str, policy: AddrPolicy) -> Result<(), PostError> {
     }
 }
 
+/// The URL rules of [`vetted_post`] on their own, for a caller that wants to
+/// refuse a destination when its configuration is loaded rather than when the
+/// first POST goes out: shape, no credentials in the URL, `https` unless the
+/// host is a loopback host and `policy.loopback` is set. No network.
+pub fn check_destination_url(url: &str, policy: AddrPolicy) -> Result<(), PostError> {
+    check_url(url, policy)
+}
+
 fn check_headers(headers: &[(String, String)]) -> Result<(), PostError> {
     for (name, value) in headers {
         let lower = name.to_ascii_lowercase();

@@ -48,6 +48,11 @@ pub struct TickOptions {
     /// `cron.daily_token_cap` (user config): tokens all agent runs of one
     /// UTC day may spend.
     pub daily_token_cap: Option<u64>,
+    /// The `[webhook_out]` destinations the host loaded at start (#911), so
+    /// a `webhook:<name>` target can be checked without reading the config
+    /// under the host lock. `None`: none loaded, a webhook target is refused.
+    /// A long-running `tole serve` keeps the map it loaded until restart.
+    pub webhooks: Option<Arc<crate::webhook_out::Destinations>>,
 }
 
 impl TickOptions {
@@ -57,6 +62,7 @@ impl TickOptions {
             max_concurrent,
             approvals: None,
             daily_token_cap: None,
+            webhooks: None,
         }
     }
 }
@@ -150,6 +156,8 @@ pub struct ClaimCtx {
     used_today: u64,
     /// The cron dir (an agent run's jail must not hold it, #581).
     dir: std::path::PathBuf,
+    /// The loaded webhook destinations (#911).
+    webhooks: Option<Arc<crate::webhook_out::Destinations>>,
 }
 
 impl ClaimCtx {
@@ -164,6 +172,7 @@ impl ClaimCtx {
             cap: opts.daily_token_cap,
             used_today: tokens_since(l.state(), day_start(now)),
             dir: dir.to_path_buf(),
+            webhooks: opts.webhooks.clone(),
         }
     }
 }
@@ -185,7 +194,7 @@ pub fn claim_one<S: tole_core::ledger::LedgerStore>(
         // it may deliver to: both before the provider.
         let invalid = if let Err(e) = super::trust::check(job, &ctx.dir) {
             Some(e)
-        } else if let Err(e) = deliver::check(job) {
+        } else if let Err(e) = deliver::check(job, ctx.webhooks.as_deref()) {
             Some(e)
         } else if agent && !ctx.provider_ready {
             Some((
@@ -318,7 +327,7 @@ pub fn resume_parked(
         if !ctx.provider_ready {
             anyhow::bail!("{}", crate::turn_runner::MISSING_PROVIDER_CONFIG);
         }
-        if let Err((code, detail)) = deliver::check(&job) {
+        if let Err((code, detail)) = deliver::check(&job, opts.webhooks.as_deref()) {
             anyhow::bail!("{code}: {detail}");
         }
         let setup = super::setup::resolve(&job)

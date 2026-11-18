@@ -146,6 +146,11 @@ pub fn run_serve(cfg: ServeConfig) -> Result<()> {
     let hooks = tole_cli::hooks::load(&hook_cfg, loopback, &|k| std::env::var(k).ok())
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     tole_cli::hooks::hold_keys(&hooks);
+    // Outbound webhook destinations (#911), user config only: one that cannot
+    // load stops the server here too, with its name and the fix. A running
+    // server keeps this map until restart.
+    let webhook_out = tole_cli::webhook_out::load_user().map_err(|e| anyhow::anyhow!("{e}"))?;
+    tole_cli::webhook_out::install(webhook_out);
     let hook_dir = if hooks.is_empty() {
         None
     } else {
@@ -1439,6 +1444,7 @@ fn hook_action(
     let opts = tole_cli::cron::TickOptions {
         approvals: Some(Arc::clone(&state.approvals)),
         daily_token_cap: tole_cli::cron::daily_token_cap(),
+        webhooks: tole_cli::webhook_out::loaded(),
         ..tole_cli::cron::TickOptions::standalone(1)
     };
     let mut report = tole_cli::cron::TickReport::default();
