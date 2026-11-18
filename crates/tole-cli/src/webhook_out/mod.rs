@@ -29,6 +29,7 @@ pub mod probe;
 pub mod send;
 pub mod sign;
 pub mod store;
+pub mod volatile;
 
 /// Longest destination name.
 pub const MAX_NAME: usize = 32;
