@@ -23,13 +23,32 @@ fn err_of(c: WebhookOutConfig) -> String {
     load(&one(c), &env).unwrap_err()
 }
 
-fn tmp_file(name: &str, bytes: &[u8]) -> std::path::PathBuf {
+/// A key file that removes its directory when dropped (the suites must
+/// leave no `tole-*` entry behind, #781).
+struct KeyFile(std::path::PathBuf);
+
+impl std::ops::Deref for KeyFile {
+    type Target = std::path::Path;
+    fn deref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for KeyFile {
+    fn drop(&mut self) {
+        if let Some(dir) = self.0.parent() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+fn tmp_file(name: &str, bytes: &[u8]) -> KeyFile {
     let dir =
         std::env::temp_dir().join(format!("tole-webhook-out-{}-{}", std::process::id(), name));
     std::fs::create_dir_all(&dir).unwrap();
     let p = dir.join("secret");
     std::fs::write(&p, bytes).unwrap();
-    p
+    KeyFile(p)
 }
 
 #[test]
@@ -213,7 +232,7 @@ fn a_symlinked_hmac_key_file_is_refused() {
     let real = tmp_file("link-real", SECRET.as_bytes());
     let link = real.with_file_name("link");
     let _ = std::fs::remove_file(&link);
-    std::os::unix::fs::symlink(&real, &link).unwrap();
+    std::os::unix::fs::symlink(&*real, &link).unwrap();
     let c = WebhookOutConfig {
         hmac_key_env: None,
         hmac_key_file: Some(link.to_str().unwrap().into()),
