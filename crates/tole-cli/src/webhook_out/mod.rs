@@ -24,6 +24,7 @@ use tole_core::web::AddrPolicy;
 use crate::config::WebhookOutConfig;
 
 pub mod event;
+pub mod outbox;
 
 /// Longest destination name.
 pub const MAX_NAME: usize = 32;
