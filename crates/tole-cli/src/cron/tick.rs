@@ -522,6 +522,31 @@ pub fn run_claimed(
         };
         // Checked before the claim; an error here means a hand-edited log.
         for t in deliver::targets(&c.job).unwrap_or_default() {
+            // A webhook target is queued, not sent here: the producer only
+            // appends to the outbox, and the sender writes the ledger row when
+            // the event settles (a refusal or a silent run is recorded now).
+            if let deliver::Target::Webhook(name) = &t {
+                let facts = super::webhook::RunFacts {
+                    job: &c.job,
+                    fire_id: &c.fire.fire_id,
+                    scheduled_for: c.fire.scheduled_for,
+                    status: r.status,
+                    output: &r.output,
+                    session_id: r.session_id.as_deref(),
+                    finished_at: end,
+                };
+                let made = super::webhook::enqueue_run(
+                    dir,
+                    opts.webhooks.as_deref(),
+                    name,
+                    &facts,
+                    &secrets,
+                );
+                if let Some((status, error)) = super::webhook::immediate(&made) {
+                    records.push((c.fire.fire_id.clone(), t.spec(), status, error));
+                }
+                continue;
+            }
             let (status, error) = deliver::deliver(&t, &info, &secrets);
             records.push((c.fire.fire_id.clone(), t.spec(), status, error));
         }

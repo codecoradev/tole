@@ -17,8 +17,8 @@
 //!   declared in `[webhook_out.<name>]` of the user config. The job names the
 //!   destination and nothing else; a job created by an agent may only name
 //!   one whose `allow_agent_jobs` is set (`delivery_untrusted` otherwise).
-//!   The sender is not built yet: until it is, a webhook target records
-//!   `failed` (`not_implemented`), never a silent `sent`.
+//!   Nothing is sent from here: the producer (`cron::webhook`) appends the
+//!   event to the outbox and the sender writes the ledger row when it settles.
 //!
 //! Empty output, or a first line of `[SILENT]`, delivers nothing (every
 //! target records `skipped`).
@@ -231,9 +231,11 @@ pub fn deliver(
         Target::Log | Target::Session => Ok(()),
         Target::File(p) => append_file(run, p),
         Target::Command(line) => run_command(run, line),
-        // The sender is not built yet (#911): fail visibly, never `sent`.
+        // Never reached from the tick (a webhook target goes to the outbox,
+        // see `cron::webhook`): if something calls this, fail visibly and
+        // never claim `sent`.
         Target::Webhook(_) => {
-            Err("not_implemented: webhook delivery is not available in this build yet".to_string())
+            Err("not_implemented: a webhook target is queued, not sent here".to_string())
         }
     };
     match result {

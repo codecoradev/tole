@@ -28,6 +28,7 @@ pub use crate::ledger_file as store;
 pub mod tick;
 pub mod tool;
 pub mod trust;
+pub mod webhook;
 
 use std::path::{Path, PathBuf};
 
@@ -358,6 +359,22 @@ pub fn webhooks() -> Option<std::sync::Arc<crate::webhook_out::Destinations>> {
             eprintln!("tole cron: webhook destinations not loaded: {e}");
             None
         }
+    }
+}
+
+/// How long a standalone `tole cron tick` or `run` spends sending webhook
+/// events after it ran its jobs. Whatever is still pending (a retry waiting
+/// minutes) is left on disk for the next tick or a `tole serve` sender.
+const STANDALONE_DRAIN: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Sends the outbox for a bounded time (#911). Failure is reported, never an
+/// error of the tick: the events are on disk and the next drain retries them.
+fn drain_webhooks(dir: &Path, opts: &TickOptions) {
+    let Some(dests) = opts.webhooks.as_deref().filter(|d| !d.is_empty()) else {
+        return;
+    };
+    if let Err(e) = webhook::drain(dir, dests, STANDALONE_DRAIN) {
+        eprintln!("tole cron: webhook send: {e}");
     }
 }
 
@@ -1117,6 +1134,7 @@ pub fn cli(action: CronAction, globals: JobGlobals) -> anyhow::Result<()> {
                 ..TickOptions::standalone(1)
             };
             print_report("run", &run_now(&dir, &job, t, &opts)?);
+            drain_webhooks(&dir, &opts);
         }
         CronAction::Cancel { job } => {
             for f in cancel(&dir, &job)? {
@@ -1132,6 +1150,7 @@ pub fn cli(action: CronAction, globals: JobGlobals) -> anyhow::Result<()> {
                 ..TickOptions::standalone(max_concurrent(flag))
             };
             print_report("tick", &tick(&dir, t, &opts)?);
+            drain_webhooks(&dir, &opts);
         }
     }
     Ok(())
