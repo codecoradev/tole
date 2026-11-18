@@ -553,6 +553,14 @@ pub fn run_claimed(
     }
     store::with_lock(dir, |l| {
         for (fire_id, target, status, error) in records {
+            // A webhook row is written once per run and destination, by whoever
+            // gets there first (the reconcile pass may have recorded it while
+            // this tick was still delivering to a slow command target).
+            if target.starts_with("webhook:")
+                && l.state().deliveries(&fire_id).any(|d| d.target == target)
+            {
+                continue;
+            }
             if let Err(e) = l.deliver(&fire_id, &target, status, error, end) {
                 first_err.get_or_insert(e.into());
             }

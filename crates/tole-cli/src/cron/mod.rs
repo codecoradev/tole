@@ -373,6 +373,12 @@ fn drain_webhooks(dir: &Path, opts: &TickOptions) {
     let Some(dests) = opts.webhooks.as_deref().filter(|d| !d.is_empty()) else {
         return;
     };
+    // First close what a crash left between the ledger and the outbox (a
+    // short-lived tick may be the only thing that ever runs), then send.
+    let secrets = crate::provider_chain::process_secrets(&crate::config_apply::real_env);
+    if let Err(e) = webhook::reconcile(dir, dests, now(), &secrets) {
+        eprintln!("tole cron: webhook reconcile: {e}");
+    }
     if let Err(e) = webhook::drain(dir, dests, STANDALONE_DRAIN) {
         eprintln!("tole cron: webhook send: {e}");
     }

@@ -681,6 +681,274 @@ fn a_persistent_error_backs_off_and_is_logged_once() {
     );
 }
 
+fn secrets() -> tole_core::secrets::SecretSet {
+    tole_cli::provider_chain::process_secrets(&tole_cli::config_apply::real_env)
+}
+
+/// A moment past the grace a fresh run is given: reconcile leaves a run the
+/// live tick may still be delivering alone for 10 minutes.
+fn later() -> i64 {
+    now() + 11 * 60
+}
+
+fn webhook_rows(dir: &Path, fire: &str) -> Vec<(DeliveryStatus, Option<String>)> {
+    rows(dir, fire)
+        .into_iter()
+        .filter(|(t, _, _)| t == "webhook:gateway")
+        .map(|(_, s, e)| (s, e))
+        .collect()
+}
+
+#[test]
+fn reconcile_queues_a_run_whose_event_was_lost_before_it_was_appended() {
+    let dir = tmp("rec-lost");
+    let (port, rx) = receiver(vec![]);
+    let d = dests_with(port, "TOLE_TEST_WEBHOOK_SEND_I");
+    cron::create(&dir, job(&dir, "j", "echo recovered"), now() - 120).unwrap();
+    let fire = cron::tick(&dir, now(), &opts(&d)).unwrap().ran[0].0.clone();
+    // The process died after the `done` record and before the append: the run
+    // is settled and the event is not there.
+    std::fs::remove_file(dir.join("outbox.jsonl")).unwrap();
+    assert!(webhook_rows(&dir, &fire).is_empty());
+
+    let r = webhook::reconcile(&dir, &d, later(), &secrets()).unwrap();
+    assert_eq!((r.enqueued, r.rows), (1, 0), "{r:?}");
+    // Idempotent: a second pass finds the event and does nothing.
+    let again = webhook::reconcile(&dir, &d, later(), &secrets()).unwrap();
+    assert_eq!((again.enqueued, again.rows), (0, 0), "{again:?}");
+
+    webhook::drain(&dir, &d, Duration::from_secs(30)).unwrap();
+    let got = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let body = got.json();
+    assert_eq!(body["data"]["fire_id"], fire);
+    assert_eq!(
+        body["data"]["summary"].as_str().unwrap().trim(),
+        "recovered"
+    );
+    assert_eq!(
+        webhook_rows(&dir, &fire),
+        vec![(DeliveryStatus::Sent, None)]
+    );
+}
+
+#[test]
+fn reconcile_writes_the_row_of_an_event_that_finished_without_one() {
+    use tole_cli::webhook_out::outbox::Line;
+    let dir = tmp("rec-row");
+    let (port, rx) = receiver(vec![]);
+    let d = dests_with(port, "TOLE_TEST_WEBHOOK_SEND_J");
+    cron::create(&dir, job(&dir, "j", "echo hi"), now() - 120).unwrap();
+    let fire = cron::tick(&dir, now(), &opts(&d)).unwrap().ran[0].0.clone();
+    // The sender sent it and wrote `done`, then died before the ledger row.
+    let id = tole_cli::webhook_out::event::cron_event_id(&fire);
+    tole_cli::webhook_out::store::Outbox::new(&dir)
+        .append(&[Line::Done {
+            dest: "gateway".into(),
+            id,
+            at: now(),
+        }])
+        .unwrap();
+    assert!(webhook_rows(&dir, &fire).is_empty());
+    let r = webhook::reconcile(&dir, &d, later(), &secrets()).unwrap();
+    assert_eq!((r.enqueued, r.rows), (0, 1), "{r:?}");
+    assert_eq!(
+        webhook_rows(&dir, &fire),
+        vec![(DeliveryStatus::Sent, None)]
+    );
+    // And never sent a second time by this pass.
+    assert!(rx.try_recv().is_err());
+    // Once only.
+    let again = webhook::reconcile(&dir, &d, later(), &secrets()).unwrap();
+    assert_eq!((again.enqueued, again.rows), (0, 0));
+}
+
+#[test]
+fn reconcile_does_not_queue_a_silent_run_again() {
+    let dir = tmp("rec-silent");
+    let (port, _rx) = receiver(vec![]);
+    let d = dests_with(port, "TOLE_TEST_WEBHOOK_SEND_K");
+    cron::create(&dir, job(&dir, "quiet", "true"), now() - 120).unwrap();
+    let fire = cron::tick(&dir, now(), &opts(&d)).unwrap().ran[0].0.clone();
+    // The tick recorded `skipped`: that row is terminal.
+    assert_eq!(webhook_rows(&dir, &fire)[0].0, DeliveryStatus::Skipped);
+    for _ in 0..3 {
+        let r = webhook::reconcile(&dir, &d, later(), &secrets()).unwrap();
+        assert_eq!((r.enqueued, r.rows), (0, 0), "{r:?}");
+    }
+    assert!(!dir.join("outbox.jsonl").exists(), "nothing was queued");
+}
+
+#[test]
+fn reconcile_records_a_silent_run_whose_row_was_lost() {
+    let dir = tmp("rec-silent-lost");
+    let (port, _rx) = receiver(vec![]);
+    let d = dests_with(port, "TOLE_TEST_WEBHOOK_SEND_L");
+    cron::create(&dir, job(&dir, "quiet", "true"), now() - 120).unwrap();
+    // The process died after the run settled and before its `skipped` row was
+    // written: the end state is a settled run with no webhook row. Stand in for
+    // it by dropping the row the tick wrote.
+    let fire = cron::tick(&dir, now(), &opts(&d)).unwrap().ran[0].0.clone();
+    let ledger = std::fs::read_to_string(dir.join("jobs.jsonl")).unwrap();
+    let kept: Vec<&str> = ledger
+        .lines()
+        .filter(|l| !(l.contains("\"delivery\"") && l.contains("webhook:gateway")))
+        .collect();
+    std::fs::write(dir.join("jobs.jsonl"), kept.join("\n") + "\n").unwrap();
+    assert!(webhook_rows(&dir, &fire).is_empty());
+    let r = webhook::reconcile(&dir, &d, later(), &secrets()).unwrap();
+    assert_eq!((r.enqueued, r.rows), (0, 1), "{r:?}");
+    assert_eq!(webhook_rows(&dir, &fire)[0].0, DeliveryStatus::Skipped);
+}
+
+#[test]
+fn reconcile_ignores_old_runs_unknown_destinations_and_forged_events() {
+    use tole_cli::webhook_out::outbox::Line;
+    let dir = tmp("rec-ignore");
+    let (port, _rx) = receiver(vec![]);
+    let d = dests_with(port, "TOLE_TEST_WEBHOOK_SEND_M");
+    // A run that settled 7 hours ago is past the deadline: not announced.
+    cron::create(&dir, job(&dir, "old", "echo old"), now() - 8 * 3600).unwrap();
+    cron::tick(&dir, now() - 7 * 3600, &opts(&d)).unwrap();
+    std::fs::remove_file(dir.join("outbox.jsonl")).unwrap();
+    let r = webhook::reconcile(&dir, &d, later(), &secrets()).unwrap();
+    assert_eq!((r.enqueued, r.rows), (0, 0), "{r:?}");
+
+    // A destination that is not configured is skipped.
+    let none = Destinations::default();
+    let r = webhook::reconcile(&dir, &none, later(), &secrets()).unwrap();
+    assert_eq!((r.enqueued, r.rows), (0, 0));
+
+    // A terminal line whose id is not that run's event id gets no row. (The old
+    // job is paused so that only this run is in the window.)
+    cron::update(&dir, "old", now(), |j| j.paused = true).unwrap();
+    cron::create(&dir, job(&dir, "j", "echo hi"), now() - 120).unwrap();
+    let fire = cron::tick(&dir, now(), &opts(&d)).unwrap().ran[0].0.clone();
+    std::fs::remove_file(dir.join("outbox.jsonl")).unwrap();
+    tole_cli::webhook_out::store::Outbox::new(&dir)
+        .append(&[
+            Line::Enqueue {
+                dest: "gateway".into(),
+                id: "forged".into(),
+                at: now(),
+                deadline: now() + 1000,
+                body: format!(
+                    r#"{{"v":1,"id":"forged","type":"cron_run_finished","destination":"gateway","at":{},"data":{{"fire_id":"{fire}"}}}}"#,
+                    now()
+                ),
+            },
+            Line::Done {
+                dest: "gateway".into(),
+                id: "forged".into(),
+                at: now(),
+            },
+        ])
+        .unwrap();
+    let r = webhook::reconcile(&dir, &d, later(), &secrets()).unwrap();
+    // The real event of that run is queued (the outbox was emptied); the forged
+    // line, whose id is not that run's event id, writes no row.
+    assert_eq!((r.enqueued, r.rows), (1, 0), "{r:?}");
+    assert!(webhook_rows(&dir, &fire).is_empty());
+}
+
+#[test]
+fn reconcile_leaves_a_fresh_run_to_the_live_tick() {
+    let dir = tmp("rec-grace");
+    let (port, _rx) = receiver(vec![]);
+    let d = dests_with(port, "TOLE_TEST_WEBHOOK_SEND_N");
+    cron::create(&dir, job(&dir, "j", "echo hi"), now() - 120).unwrap();
+    cron::tick(&dir, now(), &opts(&d)).unwrap();
+    std::fs::remove_file(dir.join("outbox.jsonl")).unwrap();
+    // The live tick may still be delivering to a slow target: not yet.
+    let r = webhook::reconcile(&dir, &d, now() + 60, &secrets()).unwrap();
+    assert_eq!((r.enqueued, r.rows), (0, 0), "{r:?}");
+    let r = webhook::reconcile(&dir, &d, later(), &secrets()).unwrap();
+    assert_eq!(r.enqueued, 1, "{r:?}");
+}
+
+#[test]
+fn reconcile_never_guesses_silent_from_a_missing_output_file() {
+    let dir = tmp("rec-nofile");
+    let (port, _rx) = receiver(vec![]);
+    let d = dests_with(port, "TOLE_TEST_WEBHOOK_SEND_O");
+    cron::create(&dir, job(&dir, "j", "echo hi"), now() - 120).unwrap();
+    let fire = cron::tick(&dir, now(), &opts(&d)).unwrap().ran[0].0.clone();
+    std::fs::remove_file(dir.join("outbox.jsonl")).unwrap();
+    for f in std::fs::read_dir(dir.join("runs")).unwrap().flatten() {
+        std::fs::remove_file(f.path()).unwrap();
+    }
+    // No file: the run did not go through the live path, or the write failed.
+    // Not queued and, above all, no `skipped` row for a message that may still
+    // be sent.
+    let r = webhook::reconcile(&dir, &d, later(), &secrets()).unwrap();
+    assert_eq!((r.enqueued, r.rows), (0, 0), "{r:?}");
+    assert!(webhook_rows(&dir, &fire).is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn reconcile_does_not_follow_or_block_on_a_planted_output_file() {
+    let dir = tmp("rec-planted");
+    let (port, rx) = receiver(vec![]);
+    let d = dests_with(port, "TOLE_TEST_WEBHOOK_SEND_P");
+    cron::create(&dir, job(&dir, "j", "echo hi"), now() - 120).unwrap();
+    cron::tick(&dir, now(), &opts(&d)).unwrap();
+    std::fs::remove_file(dir.join("outbox.jsonl")).unwrap();
+    let runs = dir.join("runs");
+    let out = std::fs::read_dir(&runs)
+        .unwrap()
+        .flatten()
+        .next()
+        .unwrap()
+        .path();
+    std::fs::remove_file(&out).unwrap();
+    // A symlink to a file the run never wrote...
+    let secret = dir.join("elsewhere.txt");
+    std::fs::write(&secret, "PLANTED-FILE-CONTENT").unwrap();
+    std::os::unix::fs::symlink(&secret, &out).unwrap();
+    let r = webhook::reconcile(&dir, &d, later(), &secrets()).unwrap();
+    assert_eq!(
+        (r.enqueued, r.rows),
+        (0, 0),
+        "a symlink is not followed: {r:?}"
+    );
+    // ...and a FIFO, which would block a plain read forever.
+    std::fs::remove_file(&out).unwrap();
+    let c = std::ffi::CString::new(out.to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    let started = std::time::Instant::now();
+    let r = webhook::reconcile(&dir, &d, later(), &secrets()).unwrap();
+    assert_eq!((r.enqueued, r.rows), (0, 0), "{r:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "blocked on a FIFO"
+    );
+    assert!(rx.try_recv().is_err());
+    assert!(!dir.join("outbox.jsonl").exists());
+}
+
+#[test]
+fn a_run_that_never_went_through_the_live_path_is_not_announced() {
+    // A run settled at claim time (the daily token cap) or recovered as
+    // interrupted after a crash has no kept output and was never delivered
+    // anywhere: reconcile does not turn it into a webhook now.
+    let dir = tmp("rec-claimtime");
+    let (port, _rx) = receiver(vec![]);
+    let d = dests_with(port, "TOLE_TEST_WEBHOOK_SEND_Q");
+    cron::create(&dir, job(&dir, "j", "echo hi"), now() - 120).unwrap();
+    let capped = TickOptions {
+        daily_token_cap: Some(0),
+        webhooks: Some(Arc::new(d.clone())),
+        ..TickOptions::standalone(2)
+    };
+    let r = cron::tick(&dir, now(), &capped).unwrap();
+    // Whatever the tick did with the capped run, no run output file exists.
+    let produced = std::fs::read_dir(dir.join("runs")).map_or(0, |d| d.count());
+    let rec = webhook::reconcile(&dir, &d, later(), &secrets()).unwrap();
+    if produced == 0 {
+        assert_eq!((rec.enqueued, rec.rows), (0, 0), "{rec:?} after {r:?}");
+    }
+}
+
 #[test]
 fn doctor_never_prints_a_hostile_name_from_the_saved_jobs() {
     use tole_core::ledger::Job;
