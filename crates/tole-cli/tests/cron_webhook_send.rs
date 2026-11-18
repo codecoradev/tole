@@ -946,5 +946,32 @@ fn a_run_that_never_went_through_the_live_path_is_not_announced() {
     let rec = webhook::reconcile(&dir, &d, later(), &secrets()).unwrap();
     if produced == 0 {
         assert_eq!((rec.enqueued, rec.rows), (0, 0), "{rec:?} after {r:?}");
+
+#[test]
+fn doctor_never_prints_a_hostile_name_from_the_saved_jobs() {
+    use tole_core::ledger::Job;
+    let dir = tmp("doctor-hostile");
+    cron::create(&dir, job(&dir, "j", "echo hi"), now() - 120).unwrap();
+    // The jobs file is as untrusted as the outbox: a line written by hand can
+    // name a destination with control characters in it.
+    let mut hostile: Job = store::open_read(&dir)
+        .unwrap()
+        .state()
+        .job("j")
+        .unwrap()
+        .job
+        .clone();
+    hostile.at += 1;
+    hostile.extra.insert(
+        "deliver".into(),
+        serde_json::json!(["webhook:evil\nforged\u{1b}[2J", "webhook:good"]),
+    );
+    store::with_lock(&dir, |l| Ok(l.put_job(hostile)?)).unwrap();
+    let (lines, _) = webhook::doctor_lines(&dir, &Destinations::default(), now());
+    for l in &lines {
+        assert!(
+            !l.contains("forged") && !l.contains('\u{1b}') && !l.contains("evil"),
+            "hostile text in doctor: {l:?}"
+        );
     }
 }
