@@ -25,6 +25,7 @@ use crate::config::WebhookOutConfig;
 
 pub mod event;
 pub mod outbox;
+pub mod probe;
 pub mod send;
 pub mod sign;
 pub mod store;
@@ -53,6 +54,10 @@ pub enum Event {
     ApprovalRequested,
     /// An approval was decided or expired; sent to destinations that list it.
     ApprovalResolved,
+    /// `tole webhook test <name>`: one signed event to one destination, sent
+    /// directly (never through the outbox). It is not a configurable event, so
+    /// it is not in [`Event::ALL`] and a forged outbox line cannot name it.
+    WebhookTest,
 }
 
 impl Event {
@@ -67,6 +72,7 @@ impl Event {
             Event::CronRunFinished => "cron_run_finished",
             Event::ApprovalRequested => "approval_requested",
             Event::ApprovalResolved => "approval_resolved",
+            Event::WebhookTest => "webhook_test",
         }
     }
 
