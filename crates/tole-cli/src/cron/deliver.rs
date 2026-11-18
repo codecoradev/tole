@@ -13,6 +13,12 @@
 //!   `TOLE_CRON_JOB`/`TOLE_CRON_FIRE`/`TOLE_CRON_STATUS` set. Trust-gated:
 //!   only a job saved by a human through the CLI (`created_by = cli`) may
 //!   run one; any other job is `blocked` (`delivery_untrusted`).
+//! - `webhook:<name>` (#911): a signed POST to a destination the owner
+//!   declared in `[webhook_out.<name>]` of the user config. The job names the
+//!   destination and nothing else; a job created by an agent may only name
+//!   one whose `allow_agent_jobs` is set (`delivery_untrusted` otherwise).
+//!   The sender is not built yet: until it is, a webhook target records
+//!   `failed` (`not_implemented`), never a silent `sent`.
 //!
 //! Empty output, or a first line of `[SILENT]`, delivers nothing (every
 //! target records `skipped`).
@@ -36,6 +42,8 @@ pub enum Target {
     Session,
     File(String),
     Command(String),
+    /// The name of a `[webhook_out.<name>]` destination.
+    Webhook(String),
 }
 
 impl Target {
@@ -66,8 +74,18 @@ impl Target {
                 tole_core::subprocess::check_destructive_argv(&argv)?;
                 Ok(Target::Command(line.to_string()))
             }
+            Some(("webhook", name)) => {
+                if !crate::webhook_out::valid_name(name) {
+                    return Err(format!(
+                        "webhook target `{name}`: a destination name is 1-{} of [a-z0-9_-]",
+                        crate::webhook_out::MAX_NAME
+                    ));
+                }
+                Ok(Target::Webhook(name.to_string()))
+            }
             _ => Err(format!(
-                "unknown delivery target `{spec}` (log, session, file:PATH or command:ARGV)"
+                "unknown delivery target `{spec}` (log, session, file:PATH, command:ARGV or \
+                 webhook:NAME)"
             )),
         }
     }
@@ -79,6 +97,7 @@ impl Target {
             Target::Session => "session".into(),
             Target::File(p) => format!("file:{p}"),
             Target::Command(c) => format!("command:{c}"),
+            Target::Webhook(n) => format!("webhook:{n}"),
         }
     }
 }
@@ -112,20 +131,66 @@ pub fn targets(job: &Job) -> Result<Vec<Target>, String> {
 }
 
 /// Pre-dispatch check (P10): `Err((code, detail))` blocks the occurrence
-/// before anything runs.
-pub fn check(job: &Job) -> Result<(), (&'static str, String)> {
+/// before anything runs. Pure: it runs under the host lock, so it reads no
+/// config and no secret. `webhooks` is the destination map the host loaded at
+/// start (`None`: a standalone tick that loaded none, so a webhook target is
+/// refused, never guessed).
+pub fn check(
+    job: &Job,
+    webhooks: Option<&crate::webhook_out::Destinations>,
+) -> Result<(), (&'static str, String)> {
     let targets = targets(job).map_err(|e| ("delivery_invalid", e))?;
     let trusted = field(job, "created_by") == Some("cli");
-    match targets.iter().find(|t| matches!(t, Target::Command(_))) {
-        Some(t) if !trusted => Err((
-            "delivery_untrusted",
-            format!(
-                "`{}` runs a command, which only a job saved with `tole cron create` may do",
-                t.spec()
-            ),
-        )),
-        _ => Ok(()),
+    if let Some(t) = targets.iter().find(|t| matches!(t, Target::Command(_))) {
+        if !trusted {
+            return Err((
+                "delivery_untrusted",
+                format!(
+                    "`{}` runs a command, which only a job saved with `tole cron create` may do",
+                    t.spec()
+                ),
+            ));
+        }
     }
+    for t in &targets {
+        let Target::Webhook(name) = t else { continue };
+        let dest = webhooks.and_then(|w| w.get(name)).ok_or_else(|| {
+            (
+                "delivery_invalid",
+                format!(
+                    "`{}` names no webhook destination this process loaded: declare \
+                     [webhook_out.{name}] in the user config (a running `tole serve` loads it \
+                     at start)",
+                    t.spec()
+                ),
+            )
+        })?;
+        if !dest
+            .events
+            .contains(&crate::webhook_out::Event::CronRunFinished)
+        {
+            return Err((
+                "delivery_invalid",
+                format!(
+                    "webhook destination `{name}` does not list `cron_run_finished` in its events"
+                ),
+            ));
+        }
+        // An agent can put anything it read into a job's output, so letting
+        // it pick a third-party sink by default would be an exfiltration
+        // channel the owner never opted into.
+        if !trusted && !dest.allow_agent_jobs {
+            return Err((
+                "delivery_untrusted",
+                format!(
+                    "`{}` sends to a webhook destination, which a job created by an agent may \
+                     only do when the destination sets allow_agent_jobs = true",
+                    t.spec()
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// What a delivery is told about its run.
@@ -166,6 +231,10 @@ pub fn deliver(
         Target::Log | Target::Session => Ok(()),
         Target::File(p) => append_file(run, p),
         Target::Command(line) => run_command(run, line),
+        // The sender is not built yet (#911): fail visibly, never `sent`.
+        Target::Webhook(_) => {
+            Err("not_implemented: webhook delivery is not available in this build yet".to_string())
+        }
     };
     match result {
         Ok(()) => (DeliveryStatus::Sent, None),

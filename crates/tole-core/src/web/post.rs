@@ -247,11 +247,27 @@ fn check_url(url: &str, policy: AddrPolicy) -> Result<(), PostError> {
         return Err(PostError::InvalidUrl("credentials in the URL"));
     }
     match uri.scheme_str() {
-        Some("https") => Ok(()),
-        Some("http") if policy.loopback && host_is_loopback(&host) => Ok(()),
-        Some("http") => Err(PostError::SchemeRefused),
-        _ => Err(PostError::InvalidUrl("not an http(s) URL")),
+        Some("https") => {}
+        Some("http") if policy.loopback && host_is_loopback(&host) => {}
+        Some("http") => return Err(PostError::SchemeRefused),
+        _ => return Err(PostError::InvalidUrl("not an http(s) URL")),
     }
+    // A literal IP needs no DNS, so it is vetted here; a name is vetted
+    // against what it resolves to when the request is made.
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if !policy.allows(&host, &[ip]) {
+            return Err(PostError::RefusedAddress);
+        }
+    }
+    Ok(())
+}
+
+/// The URL rules of [`vetted_post`] on their own, for a caller that wants to
+/// refuse a destination when its configuration is loaded rather than when the
+/// first POST goes out: shape, no credentials in the URL, `https` unless the
+/// host is a loopback host and `policy.loopback` is set. No network.
+pub fn check_destination_url(url: &str, policy: AddrPolicy) -> Result<(), PostError> {
+    check_url(url, policy)
 }
 
 fn check_headers(headers: &[(String, String)]) -> Result<(), PostError> {

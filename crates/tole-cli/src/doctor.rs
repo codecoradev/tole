@@ -937,6 +937,13 @@ pub fn run_cli(
             println!("{l}");
         }
     }
+    // Outbound webhook destinations (#911): names, events and flags only, from
+    // the user config; nothing is printed when it defines none.
+    if let Some(Ok(c)) = &user {
+        crate::webhook_out::doctor_lines(c)
+            .iter()
+            .for_each(|l| println!("{l}"));
+    }
     // Discussion roles (#588): where the scribe's and the claim-checker's
     // models come from, names only.
     let role_lines = match &user {

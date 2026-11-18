@@ -426,6 +426,38 @@ pub struct HookConfig {
     pub allow_writes: Option<bool>,
 }
 
+/// One `[webhook_out.<name>]` table (#911): a destination `tole` may push
+/// signed events to (cron results, approval requests). USER LAYER ONLY: a
+/// cloned repository must not open or redirect an outbound path, and no job,
+/// skill or agent text can name a URL, a header or a secret: a cron job only
+/// refers to a destination BY NAME (`deliver = ["webhook:<name>"]`). The
+/// secret never lives here, only the name of the environment variable or the
+/// path of the file that holds it. Design: `docs/webhook-delivery-design.md`.
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebhookOutConfig {
+    /// `https://...`; `http://` only for a loopback host with
+    /// `allow_loopback`.
+    pub url: Option<String>,
+    /// Environment variable holding the HMAC secret.
+    pub hmac_key_env: Option<String>,
+    /// File holding the HMAC secret (a regular file, not a link, at most
+    /// 4 KiB).
+    pub hmac_key_file: Option<String>,
+    /// Events sent (default: `cron_run_finished`). Approval events are
+    /// opt-in.
+    pub events: Option<Vec<String>>,
+    /// Reach a loopback host (`localhost`, a loopback IP), and use `http`
+    /// for it (default false).
+    pub allow_loopback: Option<bool>,
+    /// Reach private and link-local ranges (default false).
+    pub allow_private: Option<bool>,
+    /// Let a job created by an agent name this destination (default false).
+    pub allow_agent_jobs: Option<bool>,
+    /// Whole-request time in seconds (default 10, 1 to 30).
+    pub timeout_secs: Option<u64>,
+}
+
 /// `cron.tz_source`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -893,6 +925,9 @@ pub struct Config {
     /// Webhook routes of `tole serve` (#582); user layer only, see
     /// [`HookConfig`].
     pub hooks: Option<BTreeMap<String, HookConfig>>,
+    /// Outbound webhook destinations (#911); user layer only, see
+    /// [`WebhookOutConfig`].
+    pub webhook_out: Option<BTreeMap<String, WebhookOutConfig>>,
     /// Model routing (#586); tiers and rules from the user layer only, see
     /// [`RouterConfig`].
     pub router: Option<RouterConfig>,
@@ -1357,6 +1392,9 @@ pub fn layered(project: &Config, user: &Config) -> Config {
         // Nor webhook routes (#582): a repository must not open or widen
         // an endpoint.
         hooks: user.hooks.clone(),
+        // Nor outbound destinations (#911): a repository must not open or
+        // redirect an outbound path.
+        webhook_out: user.webhook_out.clone(),
         // Routing (#586): tiers and rules from the user only; a project can
         // only turn it off or narrow the allowed tiers.
         router: crate::routing::layered(&project.router, &user.router),
@@ -1508,6 +1546,15 @@ pub fn hooks_ignored_warning(shown: &str) -> String {
     format!(
         "ignoring `hooks` in project config {shown}: webhook routes can only be defined in \
          the user config"
+    )
+}
+
+/// The warning printed at startup when a project config carries
+/// `[webhook_out]` (#911).
+pub fn webhook_out_ignored_warning(shown: &str) -> String {
+    format!(
+        "ignoring `webhook_out` in project config {shown}: outbound webhook destinations can \
+         only be defined in the user config"
     )
 }
 
@@ -1673,6 +1720,22 @@ pub fn render_with(cfg: &Config, tag: &str, ann: &Annotations) -> Vec<String> {
             note("profiles")
         ));
         for name in p.keys() {
+            out.push(format!("  - {}", quote(name)));
+        }
+    }
+    if let Some(w) = cfg.webhook_out.as_ref().filter(|w| !w.is_empty()) {
+        // Destination names only (#911): never a URL, and never where a
+        // secret comes from.
+        let ignored = if tag == PROJECT_TAG {
+            "  IGNORED: a project config cannot define webhook destinations (user config only)"
+        } else {
+            ""
+        };
+        out.push(format!(
+            "webhook_out = [{} entries]  [{src}]{ignored}",
+            w.len()
+        ));
+        for name in w.keys() {
             out.push(format!("  - {}", quote(name)));
         }
     }
@@ -2570,6 +2633,42 @@ verify_timeout = 60
         );
         assert!(!shown.contains("GH_HOOK_KEY"), "{shown}");
         assert!(render(&project).join("\n").contains("IGNORED"));
+    }
+
+    /// #911: outbound webhook destinations come from the user config only.
+    /// A project config can neither define one nor change a user one, a
+    /// misspelt or extra key is an error, and `config check` shows names, never
+    /// a URL or where a secret comes from.
+    #[test]
+    fn webhook_out_is_user_layer_only_strict_and_shown_by_name() {
+        let user = parse(
+            "[webhook_out.gateway]\nurl = \"https://hooks.example.com/secret-path-token\"\n\
+             hmac_key_env = \"GW_SECRET_VAR\"\nevents = [\"cron_run_finished\"]\n",
+            &p(),
+        )
+        .unwrap();
+        let project = parse(
+            "[webhook_out.gateway]\nurl = \"https://evil.example/\"\nhmac_key_env = \"X\"\n\
+             [webhook_out.evil]\nurl = \"https://evil.example/\"\nhmac_key_env = \"X\"\n",
+            &p(),
+        )
+        .unwrap();
+        assert_eq!(layered(&project, &Config::default()).webhook_out, None);
+        assert_eq!(layered(&project, &user).webhook_out, user.webhook_out);
+        // Unknown field: an error, so a typo never silently drops a setting.
+        assert!(parse("[webhook_out.gw]\nsecret = \"x\"\n", &p()).is_err());
+        assert!(parse("[webhook_out.gw]\ntimeout = 5\n", &p()).is_err());
+        let shown = render(&user).join("\n");
+        assert!(
+            shown.contains("webhook_out = [1 entries]") && shown.contains("gateway"),
+            "{shown}"
+        );
+        assert!(
+            !shown.contains("secret-path-token") && !shown.contains("GW_SECRET_VAR"),
+            "{shown}"
+        );
+        assert!(render(&project).join("\n").contains("IGNORED"));
+        assert!(webhook_out_ignored_warning("p.toml").contains("user config"));
     }
 
     /// #579: `cron.max_concurrent` is a bounded, user-layer-only key.

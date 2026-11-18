@@ -1334,6 +1334,11 @@ pub fn load_project_config(
             &config_trust::sanitize(&shown.display().to_string()),
         ));
     }
+    if config.webhook_out.is_some() {
+        io.warn(&crate::config::webhook_out_ignored_warning(
+            &config_trust::sanitize(&shown.display().to_string()),
+        ));
+    }
     if let Some(w) = crate::routing::project_warning(
         &config,
         &config_trust::sanitize(&shown.display().to_string()),
