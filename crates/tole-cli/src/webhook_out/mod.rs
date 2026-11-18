@@ -23,6 +23,8 @@ use tole_core::web::AddrPolicy;
 
 use crate::config::WebhookOutConfig;
 
+pub mod sign;
+
 /// Longest destination name.
 pub const MAX_NAME: usize = 32;
 /// Default whole-request time.
