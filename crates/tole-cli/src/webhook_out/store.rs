@@ -55,7 +55,7 @@ pub struct Outbox {
 }
 
 /// An event leased to this process, with the body to send.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Leased {
     pub dest: String,
     pub id: String,
@@ -89,6 +89,17 @@ pub struct Dead {
     pub id: String,
     pub fire_id: Option<String>,
     pub code: &'static str,
+}
+
+// The body is redacted but private run output: `Debug` shows the shape only.
+impl std::fmt::Debug for Leased {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Leased")
+            .field("dest", &self.dest)
+            .field("id", &self.id)
+            .field("attempts", &self.attempts)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Outbox {
@@ -130,17 +141,35 @@ impl Outbox {
     }
 
     /// Reads the whole file (a missing one is empty). Reading needs no lock:
-    /// the file is append-only and the fold ignores a torn tail.
+    /// the file is append-only and the fold ignores a torn tail. The file is
+    /// untrusted: it is opened without following a symlink and without
+    /// blocking (a planted FIFO), must be a regular file, and a file over the
+    /// cap is refused instead of read, so a planted huge file cannot exhaust
+    /// memory.
     pub fn read_all(&self) -> std::io::Result<Vec<u8>> {
-        match File::open(&self.file) {
-            Ok(mut f) => {
-                let mut v = Vec::new();
-                f.read_to_end(&mut v)?;
-                Ok(v)
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-            Err(e) => Err(e),
+        let mut o = OpenOptions::new();
+        o.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            o.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
         }
+        let f = match o.open(&self.file) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        let meta = f.metadata()?;
+        if !meta.is_file() {
+            return Err(std::io::Error::other("the outbox is not a regular file"));
+        }
+        if meta.len() > MAX_FILE_BYTES.saturating_mul(2) {
+            return Err(std::io::Error::other("the outbox is far over its size cap"));
+        }
+        let mut v = Vec::new();
+        f.take(MAX_FILE_BYTES.saturating_mul(2) + 1)
+            .read_to_end(&mut v)?;
+        Ok(v)
     }
 
     /// The fold of the whole file.
@@ -275,7 +304,7 @@ impl Outbox {
             let fire = fold
                 .get(d, id)
                 .and_then(|e| body_at(&bytes, e.offset))
-                .and_then(|b| fire_id_of(&b));
+                .and_then(|b| fire_id_of(&b, id));
             kill(&mut lines, &mut out, d, id, fire, outbox::EXPIRED);
         }
         for (d, id, offset) in fold.due(now) {
@@ -297,7 +326,7 @@ impl Outbox {
             out.leased.push(Leased {
                 dest: d.into(),
                 id: id.into(),
-                fire_id: fire_id_of(&body),
+                fire_id: fire_id_of(&body, id),
                 body,
                 lease_until,
                 attempts: entry.map_or(0, |e| e.attempts),
@@ -324,14 +353,20 @@ fn last_byte(f: &mut File) -> std::io::Result<Option<u8>> {
     Ok(Some(b[0]))
 }
 
-/// `data.fire_id` of a body, when it has one (a cron event).
-fn fire_id_of(body: &str) -> Option<String> {
-    serde_json::from_str::<serde_json::Value>(body)
+/// `data.fire_id` of a body, only when `id` is the event id of exactly that
+/// run (`cron_event_id` is a pure function of the fire id). The file is
+/// untrusted: without this check a forged line could name another run's fire
+/// id and make the host write a row against it. A fire id that event.rs cut
+/// at 256 characters does not match either, so it gives `None` (no row)
+/// rather than a row on a run that does not exist.
+fn fire_id_of(body: &str, id: &str) -> Option<String> {
+    let fire = serde_json::from_str::<serde_json::Value>(body)
         .ok()?
         .get("data")?
         .get("fire_id")?
-        .as_str()
-        .map(str::to_string)
+        .as_str()?
+        .to_string();
+    (super::event::cron_event_id(&fire) == id).then_some(fire)
 }
 
 /// The `body` of the `enqueue` line that starts at `offset` in `bytes`, read

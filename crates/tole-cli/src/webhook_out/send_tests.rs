@@ -9,6 +9,11 @@ use tole_core::ledger::DeliveryStatus;
 const NOW: i64 = 1_795_000_000;
 const KEY: &[u8] = b"tole-test-key-0123456789abcdef";
 
+/// The id a real cron event of fire `job@1/2.3` has.
+fn real_id() -> String {
+    crate::webhook_out::event::cron_event_id("job@1/2.3")
+}
+
 struct Seen {
     url: String,
     body: Vec<u8>,
@@ -142,7 +147,8 @@ fn header<'a>(h: &'a [(String, String)], k: &str) -> &'a str {
 #[test]
 fn a_2xx_is_one_signed_send_and_a_sent_row() {
     let r = Rig::new("ok");
-    r.enqueue("g", "cron:a:1");
+    let id = real_id();
+    r.enqueue("g", &id);
     r.fake.will(status(204));
     let s = r.pass(&dests(&["g"]), Some(KEY));
     assert_eq!((s.sent, s.retried, s.dead), (1, 0, 0));
@@ -150,15 +156,15 @@ fn a_2xx_is_one_signed_send_and_a_sent_row() {
     assert_eq!(seen.len(), 1);
     let q = &seen[0];
     assert_eq!(q.url, "https://hooks.example.com/tole?token=abc");
-    assert_eq!(q.body, body("g", "cron:a:1", NOW).as_bytes());
+    assert_eq!(q.body, body("g", &id, NOW).as_bytes());
     // The signature is the native v2 one over exactly these bytes.
     let ts = header(&q.headers, "X-Tole-Timestamp");
     assert_eq!(ts, NOW.to_string());
     assert_eq!(
         header(&q.headers, "X-Tole-Signature"),
-        tole_core::webhook::sign(KEY, ts, "cron:a:1", Some("cron_run_finished"), &q.body)
+        tole_core::webhook::sign(KEY, ts, &id, Some("cron_run_finished"), &q.body)
     );
-    assert_eq!(header(&q.headers, "X-Tole-Delivery"), "cron:a:1");
+    assert_eq!(header(&q.headers, "X-Tole-Delivery"), id);
     assert_eq!(header(&q.headers, "X-Tole-Event"), "cron_run_finished");
     let st = r.settled.borrow();
     assert_eq!(st.len(), 1);
@@ -319,7 +325,7 @@ fn a_pass_does_nothing_while_the_lock_is_held() {
 #[test]
 fn an_event_past_its_deadline_is_never_sent() {
     let r = Rig::new("expired");
-    r.enqueue("g", "a");
+    r.enqueue("g", &real_id());
     r.clock.set(NOW + CRON_DEADLINE_SECS);
     let s = r.pass(&dests(&["g"]), Some(KEY));
     assert_eq!(s.dead, 1);
@@ -486,4 +492,176 @@ fn classification_is_a_closed_table() {
         },
         "only 429 and 503 honour it"
     );
+}
+
+/// A key resolver that must never be asked.
+struct PanicKeys;
+
+impl Keys for PanicKeys {
+    fn key(&self, _: &Destination) -> Result<Vec<u8>, &'static str> {
+        panic!("the key was read for a line that is not valid");
+    }
+}
+
+#[test]
+fn the_key_is_not_read_for_a_forged_line() {
+    for (n, bad) in [
+        "not json".to_string(),
+        body("other", "a", NOW),
+        body("g", "a", NOW).replace(r#""v":1"#, r#""v":2"#),
+        body("g", "a", NOW - CRON_DEADLINE_SECS - 1),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let r = Rig::new(&format!("nokeyread{n}"));
+        r.outbox()
+            .append(&[Line::Enqueue {
+                dest: "g".into(),
+                id: "a".into(),
+                at: NOW,
+                deadline: NOW + CRON_DEADLINE_SECS,
+                body: bad,
+            }])
+            .unwrap();
+        let s = drain_pass(
+            &r.outbox(),
+            &dests(&["g"]),
+            &r.fake,
+            &PanicKeys,
+            &|| r.clock.get(),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(s.dead, 1, "case {n}");
+    }
+}
+
+#[test]
+fn a_forged_attempt_count_cannot_overflow_or_reset_the_backoff() {
+    let r = Rig::new("n-max");
+    r.enqueue("g", "a");
+    r.outbox()
+        .append(&[Line::Attempt {
+            dest: "g".into(),
+            id: "a".into(),
+            n: u32::MAX,
+            at: NOW,
+            outcome: "x".into(),
+            next_at: 0,
+        }])
+        .unwrap();
+    r.fake.will(status(500));
+    // Does not panic; the count stays at the maximum instead of wrapping.
+    let s = r.pass(&dests(&["g"]), Some(KEY));
+    assert_eq!(s.retried, 1);
+    assert_eq!(r.fold().get("g", "a").unwrap().attempts, u32::MAX);
+}
+
+#[test]
+fn a_result_and_its_terminal_line_are_adjacent() {
+    // One write: no other drainer can see the event unleased and due between
+    // the attempt and the done line.
+    let r = Rig::new("adjacent");
+    r.enqueue("g", "a");
+    r.fake.will(status(200));
+    r.pass(&dests(&["g"]), Some(KEY));
+    let text = String::from_utf8(r.outbox().read_all().unwrap()).unwrap();
+    let kinds: Vec<&str> = text
+        .lines()
+        .map(|l| {
+            let v: serde_json::Value = serde_json::from_str(l).unwrap();
+            match v["k"].as_str().unwrap() {
+                "enqueue" => "enqueue",
+                "lease" => "lease",
+                "attempt" => "attempt",
+                "done" => "done",
+                _ => "other",
+            }
+        })
+        .collect();
+    assert_eq!(kinds, ["enqueue", "lease", "attempt", "done"]);
+}
+
+/// A poster that plays the second drainer: while the send is in flight it
+/// tries to lease the same event.
+struct RacingPoster<'a> {
+    outbox: Outbox,
+    leased_meanwhile: &'a Cell<usize>,
+}
+
+impl Poster for RacingPoster<'_> {
+    fn post(&self, _: &Request<'_>) -> Result<Reply, PostError> {
+        let l = self.outbox.lease_due(NOW, &|_| Some(15), 10).unwrap();
+        self.leased_meanwhile.set(l.leased.len());
+        status(200)
+    }
+}
+
+#[test]
+fn a_second_drainer_cannot_lease_an_event_while_it_is_being_sent() {
+    let r = Rig::new("race");
+    r.enqueue("g", "a");
+    let seen = Cell::new(99);
+    let p = RacingPoster {
+        outbox: r.outbox(),
+        leased_meanwhile: &seen,
+    };
+    let s = drain_pass(
+        &r.outbox(),
+        &dests(&["g"]),
+        &p,
+        &FixedKey(Some(KEY)),
+        &|| NOW,
+        &mut |_| {},
+    )
+    .unwrap();
+    assert_eq!(s.sent, 1);
+    assert_eq!(seen.get(), 0, "the lease holds during the send");
+    // And once done, it is not due again.
+    assert!(r
+        .outbox()
+        .lease_due(NOW + 1, &|_| Some(15), 10)
+        .unwrap()
+        .leased
+        .is_empty());
+}
+
+#[test]
+fn a_send_that_could_outlive_its_lease_is_not_started() {
+    let r = Rig::new("lease-margin");
+    r.enqueue("g", "a");
+    // Leased at NOW with 15 s (10 s timeout + 5); by NOW+6 a 10 s send would
+    // end past the lease.
+    let t = Cell::new(NOW);
+    let calls = Cell::new(0);
+    let clock = || {
+        calls.set(calls.get() + 1);
+        // The first read leases; the next reads are "later".
+        if calls.get() == 1 {
+            NOW
+        } else {
+            t.get() + 6
+        }
+    };
+    let s = drain_pass(
+        &r.outbox(),
+        &dests(&["g"]),
+        &r.fake,
+        &FixedKey(Some(KEY)),
+        &clock,
+        &mut |_| {},
+    )
+    .unwrap();
+    assert_eq!(s, PassStats::default());
+    assert!(r.fake.seen.borrow().is_empty());
+}
+
+#[test]
+fn debug_of_a_reply_shows_no_receiver_text() {
+    let reply = Reply {
+        status: 429,
+        retry_after: Some("RECEIVER-TEXT".into()),
+    };
+    assert!(!format!("{reply:?}").contains("RECEIVER-TEXT"));
 }

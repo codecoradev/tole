@@ -40,10 +40,19 @@ pub struct Request<'a> {
 }
 
 /// What came back: the status and a short `Retry-After`, nothing else.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Reply {
     pub status: u16,
     pub retry_after: Option<String>,
+}
+
+// `retry_after` is receiver text: `Debug` shows the status only.
+impl std::fmt::Debug for Reply {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Reply")
+            .field("status", &self.status)
+            .finish_non_exhaustive()
+    }
 }
 
 /// The network, behind a seam: the real one is [`NetPoster`].
@@ -176,7 +185,10 @@ pub fn retry_delay(n: u32, id: &str, retry_after: Option<i64>) -> i64 {
 }
 
 /// A terminal result for the host to record (the ledger `delivery` row of a
-/// cron event). `fire_id` is `None` for an event with no run (an approval).
+/// cron event). `fire_id` is `None` for an event with no run (an approval) and
+/// when the id does not belong to that run. It is advisory: the host must
+/// check that `webhook:<dest>` is a target of that fire's job before it writes
+/// a row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settled {
     pub dest: String,
@@ -259,9 +271,11 @@ fn send_one(
     ev: &Leased,
     stats: &mut PassStats,
 ) -> std::io::Result<()> {
-    let append = |line: Line| {
+    // One call is one write: a result and its terminal line land together, so
+    // no other drainer can see the event unleased and due in between.
+    let append = |lines: &[Line]| {
         outbox
-            .append(&[line])
+            .append(lines)
             .map_err(|_| std::io::Error::other("outbox append failed"))
     };
     let dead = |code: &str, stats: &mut PassStats, settle: &mut dyn FnMut(Settled)| {
@@ -275,33 +289,37 @@ fn send_one(
         });
     };
     let now = clock();
-    // The lease is ours only until it runs out; an earlier destination may
-    // have taken its time. Skipped, the event is leased again on a later pass.
-    if now >= ev.lease_until {
-        return Ok(());
-    }
-    // The destination comes from the loaded map, never from the file.
+    // The destination comes from the loaded map, never from the file. (The
+    // leasing step already skips an unconfigured destination; this is the
+    // second check, kept because the map is an argument.)
     let Some(d) = dests.get(&ev.dest) else {
-        append(Line::Dead {
+        append(&[Line::Dead {
             dest: ev.dest.clone(),
             id: ev.id.clone(),
             at: now,
             code: outbox::BAD_LINE.into(),
-        })?;
+        }])?;
         dead(outbox::BAD_LINE, stats, settle);
         return Ok(());
     };
+    // The lease is ours only until it runs out, and a send may take the whole
+    // timeout: it must END inside the lease. An earlier destination in this
+    // pass may have used up the margin; the event is then leased again on a
+    // later pass.
+    if now.saturating_add(d.timeout.as_secs() as i64) >= ev.lease_until {
+        return Ok(());
+    }
     if let Err(code) = outbox::validate(&ev.dest, &ev.id, &ev.body, Some(d), now) {
-        append(Line::Dead {
+        append(&[Line::Dead {
             dest: ev.dest.clone(),
             id: ev.id.clone(),
             at: now,
             code: code.into(),
-        })?;
+        }])?;
         dead(code, stats, settle);
         return Ok(());
     }
-    let n = ev.attempts + 1;
+    let n = ev.attempts.saturating_add(1);
     let verdict = match keys.key(d) {
         Err(code) => Verdict::Retry {
             code: code.into(),
@@ -323,19 +341,21 @@ fn send_one(
     let at = clock();
     match verdict {
         Verdict::Done => {
-            append(Line::Attempt {
-                dest: ev.dest.clone(),
-                id: ev.id.clone(),
-                n,
-                at,
-                outcome: "sent".into(),
-                next_at: 0,
-            })?;
-            append(Line::Done {
-                dest: ev.dest.clone(),
-                id: ev.id.clone(),
-                at,
-            })?;
+            append(&[
+                Line::Attempt {
+                    dest: ev.dest.clone(),
+                    id: ev.id.clone(),
+                    n,
+                    at,
+                    outcome: "sent".into(),
+                    next_at: 0,
+                },
+                Line::Done {
+                    dest: ev.dest.clone(),
+                    id: ev.id.clone(),
+                    at,
+                },
+            ])?;
             stats.sent += 1;
             settle(Settled {
                 dest: ev.dest.clone(),
@@ -346,31 +366,33 @@ fn send_one(
             });
         }
         Verdict::Retry { code, retry_after } => {
-            append(Line::Attempt {
+            append(&[Line::Attempt {
                 dest: ev.dest.clone(),
                 id: ev.id.clone(),
                 n,
                 at,
                 outcome: code,
                 next_at: at.saturating_add(retry_delay(n, &ev.id, retry_after)),
-            })?;
+            }])?;
             stats.retried += 1;
         }
         Verdict::Dead(code) => {
-            append(Line::Attempt {
-                dest: ev.dest.clone(),
-                id: ev.id.clone(),
-                n,
-                at,
-                outcome: code.clone(),
-                next_at: 0,
-            })?;
-            append(Line::Dead {
-                dest: ev.dest.clone(),
-                id: ev.id.clone(),
-                at,
-                code: code.clone(),
-            })?;
+            append(&[
+                Line::Attempt {
+                    dest: ev.dest.clone(),
+                    id: ev.id.clone(),
+                    n,
+                    at,
+                    outcome: code.clone(),
+                    next_at: 0,
+                },
+                Line::Dead {
+                    dest: ev.dest.clone(),
+                    id: ev.id.clone(),
+                    at,
+                    code: code.clone(),
+                },
+            ])?;
             dead(&code, stats, settle);
         }
     }
