@@ -510,3 +510,126 @@ fn doctor_reports_counts_and_names_but_never_a_url() {
         "{lines:?}"
     );
 }
+
+/// A valid `cron_run_finished` body and its id for a run named `fire`.
+fn built(dest: &str, fire: &str, at: i64) -> (String, String) {
+    use tole_cli::webhook_out::event::{cron_run_finished, CronRun};
+    let run = CronRun {
+        job_id: "j",
+        job_name: None,
+        fire_id: fire,
+        status: tole_core::ledger::RunStatus::Ok,
+        scheduled_for: at,
+        finished_at: at,
+        output: "hi",
+        session_id: None,
+    };
+    let b = cron_run_finished(dest, at, &run, &|s| s.to_string()).unwrap();
+    (b.id, String::from_utf8(b.body).unwrap())
+}
+
+#[test]
+fn a_backlog_is_drained_in_one_look_not_one_event_per_look() {
+    let dir = tmp("backlog");
+    let (port, rx) = receiver(vec![]);
+    let d = dests_with(port, "TOLE_TEST_WEBHOOK_SEND_F");
+    let outbox = tole_cli::webhook_out::store::Outbox::new(&dir);
+    for n in 0..6 {
+        let (id, body) = built("gateway", &format!("j@{n}/1.2"), now());
+        outbox.enqueue("gateway", &id, &body, now()).unwrap();
+    }
+    let mut sender = webhook::Sender::new(&dir);
+    assert!(sender.step(&d, now(), &mut |_, _| {}));
+    let mut got = 0;
+    while rx.recv_timeout(Duration::from_millis(500)).is_ok() {
+        got += 1;
+    }
+    assert_eq!(got, 6, "one look sent the whole backlog");
+}
+
+#[test]
+fn a_hostile_destination_name_or_code_is_never_printed_raw() {
+    use tole_cli::webhook_out::outbox::Line;
+    let dir = tmp("hostile");
+    let (port, _rx) = receiver(vec![]);
+    let d = dests_with(port, "TOLE_TEST_WEBHOOK_SEND_G");
+    let outbox = tole_cli::webhook_out::store::Outbox::new(&dir);
+    let evil = "x`\ntole serve: forged\u{1b}[2J";
+    // An expired event for a destination whose name is hostile, and a dead one
+    // with a hostile code, as another process of the account could append.
+    outbox
+        .append(&[
+            Line::Enqueue {
+                dest: evil.into(),
+                id: "a".into(),
+                at: 0,
+                deadline: 1,
+                body: "{}".into(),
+            },
+            Line::Enqueue {
+                dest: "gateway".into(),
+                id: "b".into(),
+                at: now(),
+                deadline: now() + 1000,
+                body: "{}".into(),
+            },
+            Line::Dead {
+                dest: "gateway".into(),
+                id: "b".into(),
+                at: now(),
+                code: format!("http_{evil}"),
+            },
+        ])
+        .unwrap();
+    let mut sender = webhook::Sender::new(&dir);
+    let mut printed = Vec::new();
+    sender.step(&d, now(), &mut |d, c| printed.push(format!("{d} {c}")));
+    for p in &printed {
+        assert!(
+            !p.contains('\n') && !p.contains('\u{1b}'),
+            "control characters in the log: {p:?}"
+        );
+    }
+    let (lines, _) = webhook::doctor_lines(&dir, &d, now());
+    for l in &lines {
+        assert!(
+            !l.contains('\u{1b}') && !l.contains("forged"),
+            "hostile text in doctor: {l:?}"
+        );
+    }
+    assert!(
+        lines.iter().any(|l| l.contains("(last: other)")),
+        "{lines:?}"
+    );
+}
+
+#[test]
+fn a_paused_job_with_a_removed_destination_does_not_fail_doctor() {
+    let dir = tmp("paused");
+    cron::create(&dir, job(&dir, "j", "echo hi"), now() - 120).unwrap();
+    let (lines, ok) = webhook::doctor_lines(&dir, &Destinations::default(), now());
+    assert!(!ok, "a runnable job to a missing destination: {lines:?}");
+    cron::update(&dir, "j", now(), |j| j.paused = true).unwrap();
+    let (lines, ok) = webhook::doctor_lines(&dir, &Destinations::default(), now());
+    assert!(ok, "a paused job cannot run: {lines:?}");
+}
+
+#[test]
+fn a_persistent_error_backs_off_and_is_logged_once() {
+    let dir = tmp("backoff");
+    let (port, _rx) = receiver(vec![]);
+    let d = dests_with(port, "TOLE_TEST_WEBHOOK_SEND_H");
+    // The outbox is a directory: reading it fails every time.
+    std::fs::create_dir_all(dir.join("outbox.jsonl")).unwrap();
+    let mut sender = webhook::Sender::new(&dir);
+    assert!(
+        sender.step(&d, now(), &mut |_, _| {}),
+        "the first look runs"
+    );
+    // The file did not change and the wake time is in the future: no spin.
+    assert!(!sender.step(&d, now(), &mut |_, _| {}), "backed off");
+    assert!(
+        !sender.step(&d, now() + 1, &mut |_, _| {}),
+        "still backed off"
+    );
+}
