@@ -99,8 +99,11 @@ fn ip_is_private(ip: &std::net::IpAddr) -> bool {
                 )
             };
             // ::/96 IPv4-compatible (legacy) and 64:ff9b::/96 NAT64 both
-            // carry the embedded v4 in segments 6-7.
-            if seg[..6] == [0, 0, 0, 0, 0, 0] || seg[..6] == [0, 0x0064, 0xff9b, 0, 0, 0] {
+            // carry the embedded v4 in segments 6-7. The NAT64 prefix is the
+            // segments 0064:ff9b then four zeros (a first segment of 0 here
+            // matched nothing, so 64:ff9b::a9fe:a9fe, the metadata address,
+            // was let through).
+            if seg[..6] == [0, 0, 0, 0, 0, 0] || seg[..6] == [0x0064, 0xff9b, 0, 0, 0, 0] {
                 return v4_is_private(&v4_from(seg[6], seg[7]));
             }
             // 6to4: 2002:AABB:CCDD::/48 embeds the v4 in segments 1-2.
@@ -1763,6 +1766,8 @@ mod tests {
             "198.20.0.0",
             "223.255.255.255",
             "2606:2800:220:1::1",
+            // NAT64 (64:ff9b::/96) embedding 8.8.8.8
+            "64:ff9b::808:808",
             // 6to4 embedding 8.8.8.8
             "2002:808:808::1",
             // Teredo: server 8.8.8.8, client 1.2.3.4 (NOT = fefd:fcfb)
@@ -1790,6 +1795,12 @@ mod tests {
             "ff02::1",
             "fec0::1",
             "feff::1",
+            // NAT64 (64:ff9b::/96) embedding 10.0.0.1 / 169.254.169.254 /
+            // 127.0.0.1 / 100.64.0.1
+            "64:ff9b::a00:1",
+            "64:ff9b::a9fe:a9fe",
+            "64:ff9b::7f00:1",
+            "64:ff9b::6440:1",
             // 6to4 embedding 10.0.0.1 / 169.254.169.254 / 100.64.0.1
             "2002:a00:1::1",
             "2002:a9fe:a9fe::1",
