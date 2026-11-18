@@ -400,3 +400,21 @@ fn a_literal_private_ip_is_refused_at_load_unless_allowed() {
     };
     assert!(load(&one(ok), &env).is_ok());
 }
+
+/// A token in a destination URL is held on its own, so a job that prints it
+/// bare cannot put it on the wire; short words of the URL are not held.
+#[test]
+fn url_secret_parts_are_the_long_query_values_and_path_segments() {
+    use super::url_secret_parts as parts;
+    assert_eq!(
+        parts("https://h.example/hook?token=abcdef0123456789&x=1"),
+        vec!["abcdef0123456789".to_string()]
+    );
+    assert_eq!(
+        parts("https://h.example/services/T0123456789AB/B0123456789CD#frag"),
+        vec!["T0123456789AB".to_string(), "B0123456789CD".to_string()]
+    );
+    assert!(parts("https://h.example/hook?a=short").is_empty());
+    assert!(parts("https://h.example").is_empty());
+    assert!(parts("not a url").is_empty());
+}
