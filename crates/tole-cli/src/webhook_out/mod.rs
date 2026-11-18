@@ -160,7 +160,14 @@ pub fn load(
                     .filter(|v| !v.is_empty())
                     .ok_or_else(|| err(format!("hmac_key_env names `{var}`, which is not set")))?
                     .into_bytes(),
-                (None, Some(path)) => crate::hooks::read_key_file(path).map_err(err)?,
+                (None, Some(path)) => {
+                    // A relative path would resolve against whatever
+                    // directory the process runs in, e.g. a cloned repo.
+                    if !std::path::Path::new(path).is_absolute() {
+                        return Err(err("hmac_key_file must be an absolute path".into()));
+                    }
+                    crate::hooks::read_key_file(path).map_err(err)?
+                }
             };
         if key.len() < crate::hooks::MIN_KEY {
             return Err(err(format!(
@@ -248,7 +255,7 @@ fn printable(s: &str) -> String {
 }
 
 /// `tole doctor` lines for the destinations (#911): names, events and flags,
-/// never a URL, a header or where a secret comes from. Nothing is printed
+/// never a URL, a header or a secret value. Nothing is printed
 /// when the user config defines none. A destination that does not load is
 /// said with its name and the fix; a long-running `tole serve` keeps the map
 /// it loaded until restart.

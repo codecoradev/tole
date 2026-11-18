@@ -354,3 +354,30 @@ fn doctor_lines_say_what_loaded_and_what_did_not() {
     let l = doctor_lines_with(&c, &env).join("\n");
     assert!(l.contains("NOT LOADED") && l.contains("`gateway`"), "{l}");
 }
+
+#[test]
+fn a_relative_key_file_is_refused() {
+    let c = WebhookOutConfig {
+        hmac_key_env: None,
+        hmac_key_file: Some("wh.key".into()),
+        ..cfg()
+    };
+    assert!(err_of(c).contains("absolute"));
+}
+
+#[test]
+fn a_literal_private_ip_is_refused_at_load_unless_allowed() {
+    for url in ["https://169.254.169.254/x", "https://10.0.0.1/x"] {
+        let c = WebhookOutConfig {
+            url: Some(url.into()),
+            ..cfg()
+        };
+        assert!(err_of(c).contains("refused"), "{url}");
+    }
+    let ok = WebhookOutConfig {
+        url: Some("https://10.0.0.1/x".into()),
+        allow_private: Some(true),
+        ..cfg()
+    };
+    assert!(load(&one(ok), &env).is_ok());
+}

@@ -111,8 +111,18 @@ fn one_bad_address_among_many_refuses_the_host() {
 fn the_url_rules() {
     // https is fine for any host, with any policy.
     assert_eq!(check_url("https://hooks.example.com/tole", NONE), Ok(()));
-    assert_eq!(check_url("https://127.0.0.1:8443/x", NONE), Ok(())); // the resolver decides the address
-                                                                     // http only for a loopback host with the flag.
+    // A literal IP is vetted at once; a name is vetted when it resolves.
+    assert_eq!(
+        check_url("https://127.0.0.1:8443/x", NONE),
+        Err(PostError::RefusedAddress)
+    );
+    assert_eq!(check_url("https://127.0.0.1:8443/x", LOOP), Ok(()));
+    assert_eq!(
+        check_url("https://169.254.169.254/x", NONE),
+        Err(PostError::RefusedAddress)
+    );
+    assert_eq!(check_url("https://10.0.0.5/x", PRIV), Ok(()));
+    // http only for a loopback host with the flag.
     for url in [
         "http://127.0.0.1:8787/e",
         "http://localhost/e",
