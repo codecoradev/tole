@@ -724,6 +724,13 @@ enum Command {
         #[command(subcommand)]
         action: tole_cli::hook_cli::HookAction,
     },
+    /// Outbound webhooks (#911): `test NAME` sends one signed `webhook_test`
+    /// event to a destination of the user config and prints the status the
+    /// receiver answered. Destinations are declared in the user config only.
+    Webhook {
+        #[command(subcommand)]
+        action: tole_cli::webhook_cmd::WebhookAction,
+    },
     /// Per-server sandbox profiles (#810): `list` the profiles and bindings,
     /// `show` the profile one server runs in, `set` binds a server to a
     /// profile. Writes the user config only; never starts a session.
@@ -996,6 +1003,7 @@ fn gate_policy(cmd: &Command) -> GatePolicy {
         } => GatePolicy::Skip,
         #[cfg(feature = "shell-tools")]
         Command::Cron { .. } | Command::Hook { .. } => GatePolicy::Skip,
+        Command::Webhook { .. } => GatePolicy::Skip,
         // `--prompt-file -` consumes stdin as the prompt: a question on
         // the same stream would eat prompt text.
         Command::Run { prompt_file, .. } if prompt_file.as_deref() == Some("-") => {
@@ -1736,6 +1744,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         ),
         #[cfg(feature = "shell-tools")]
         Command::Hook { action } => tole_cli::hook_cli::cli(action),
+        Command::Webhook { action } => tole_cli::webhook_cmd::cli(action),
         #[cfg(feature = "shell-tools")]
         Command::ServeHash { iterations } => crate::serve::hash_command(iterations),
         Command::Sandbox { action } => tole_cli::sandbox_cmd::cli(action, cli.profile.as_deref()),
