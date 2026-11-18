@@ -25,6 +25,7 @@ use crate::config::WebhookOutConfig;
 
 pub mod event;
 pub mod outbox;
+pub mod send;
 pub mod sign;
 pub mod store;
 

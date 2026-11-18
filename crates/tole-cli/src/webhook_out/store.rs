@@ -384,3 +384,9 @@ fn body_at(bytes: &[u8], offset: usize) -> Option<String> {
 #[cfg(test)]
 #[path = "store_tests.rs"]
 mod tests;
+
+/// The temp dir helper of the store tests, shared with the sender tests.
+#[cfg(test)]
+pub(super) mod store_test_dir {
+    pub use super::tests::Dir;
+}
