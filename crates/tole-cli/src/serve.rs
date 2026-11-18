@@ -197,6 +197,13 @@ pub fn run_serve(cfg: ServeConfig) -> Result<()> {
         );
         tole_cli::cron::webhook::spawn_sender(dir, Arc::clone(&webhook_out));
     }
+    // Approval events (#911): when a destination lists them, the approval queue
+    // tells a sender thread about each request and each resolution, and a timer
+    // expires what nobody answers. Absent, the approval paths are unchanged.
+    tole_cli::webhook_out::approval_sender::spawn(
+        Arc::clone(&webhook_out),
+        Arc::clone(&state.approvals),
+    );
     if cfg.cron {
         let dir = tole_cli::cron::default_dir()?;
         eprintln!("tole serve: cron ticker on {}", dir.display());
@@ -1654,6 +1661,7 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                     status,
                     session_id,
                     tool,
+                    ..
                 } => (session_id, tool, status),
                 tole_cli::approvals::DecisionOutcome::Unknown => {
                     return (404, json!({"error": "unknown approval id"}));
