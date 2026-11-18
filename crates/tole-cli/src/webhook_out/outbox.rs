@@ -24,6 +24,8 @@ use super::{event::MAX_BODY, Destination, Event};
 pub const MAX_LINE: usize = 32 * 1024;
 /// How long a cron event may be retried (design section 4).
 pub const CRON_DEADLINE_SECS: i64 = 6 * 3600;
+/// The longest wait a result line may ask for (the `Retry-After` cap).
+pub const MAX_RETRY_WAIT_SECS: i64 = 600;
 /// Clock skew allowed on a body's `at` and a lease.
 pub const SKEW_SECS: i64 = 60;
 /// Pending events per destination the file may hold; past it a producer
@@ -242,7 +244,10 @@ impl Fold {
             Line::Attempt { n, next_at, .. } => match self.live(&key) {
                 Some(e) => {
                     e.attempts = e.attempts.max(n);
-                    e.next_at = next_at;
+                    // Bounded like a lease: a forged far-future `next_at`
+                    // cannot park the event until its deadline.
+                    e.next_at =
+                        next_at.min(opts.now.saturating_add(MAX_RETRY_WAIT_SECS + SKEW_SECS));
                     e.lease_until = 0; // a result ends the lease
                 }
                 None => self.ignored += 1,

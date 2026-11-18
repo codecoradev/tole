@@ -26,6 +26,7 @@ use crate::config::WebhookOutConfig;
 pub mod event;
 pub mod outbox;
 pub mod sign;
+pub mod store;
 
 /// Longest destination name.
 pub const MAX_NAME: usize = 32;
@@ -73,9 +74,21 @@ impl Event {
     }
 }
 
+/// Where a destination's secret comes from, never the secret itself. The
+/// sender resolves it again for every attempt, so a rotated key applies
+/// without a restart and the map the cron tick carries holds no secret.
+#[derive(Clone, PartialEq, Eq)]
+pub enum KeySource {
+    /// An environment variable's name.
+    Env(String),
+    /// An absolute path.
+    File(String),
+}
+
 /// One checked destination. No secret.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Destination {
+    pub key: KeySource,
     pub url: String,
     pub events: BTreeSet<Event>,
     pub policy: AddrPolicy,
@@ -208,6 +221,12 @@ pub fn load(
         out.insert(
             name.clone(),
             Destination {
+                key: match (&w.hmac_key_env, &w.hmac_key_file) {
+                    (Some(var), _) => KeySource::Env(var.clone()),
+                    (None, Some(path)) => KeySource::File(path.clone()),
+                    // Unreachable: the key was resolved above.
+                    (None, None) => KeySource::Env(String::new()),
+                },
                 url: url.trim().to_string(),
                 events,
                 policy,

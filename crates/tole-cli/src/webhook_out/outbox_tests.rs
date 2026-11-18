@@ -1,4 +1,5 @@
 use super::*;
+use crate::webhook_out::KeySource;
 use std::collections::BTreeSet;
 use std::time::Duration;
 use tole_core::web::AddrPolicy;
@@ -14,6 +15,7 @@ fn opts(now: i64) -> FoldOptions {
 
 fn dest(events: &[Event]) -> Destination {
     Destination {
+        key: KeySource::Env("K".into()),
         url: "https://example.com/hook".into(),
         events: events.iter().copied().collect::<BTreeSet<_>>(),
         policy: AddrPolicy::default(),
@@ -515,4 +517,23 @@ fn a_crafted_lease_or_deadline_cannot_overflow_the_fold() {
             body: String::new(),
         }
     );
+}
+
+#[test]
+fn a_far_future_next_attempt_does_not_park_an_event() {
+    let bytes = file(&[
+        enq("g", "a", NOW),
+        Line::Attempt {
+            dest: "g".into(),
+            id: "a".into(),
+            n: 1,
+            at: NOW,
+            outcome: "x".into(),
+            next_at: i64::MAX,
+        },
+    ]);
+    let f = folded(&bytes, NOW);
+    let e = f.get("g", "a").unwrap();
+    assert!(e.next_at <= NOW + MAX_RETRY_WAIT_SECS + SKEW_SECS);
+    assert_eq!(f.due(NOW + MAX_RETRY_WAIT_SECS + SKEW_SECS).len(), 1);
 }
