@@ -166,7 +166,7 @@ pub fn load(
                     if !std::path::Path::new(path).is_absolute() {
                         return Err(err("hmac_key_file must be an absolute path".into()));
                     }
-                    crate::hooks::read_key_file(path).map_err(err)?
+                    crate::hooks::read_secret_file(path).map_err(err)?
                 }
             };
         if key.len() < crate::hooks::MIN_KEY {

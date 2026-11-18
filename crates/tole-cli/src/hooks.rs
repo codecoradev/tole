@@ -183,9 +183,15 @@ pub fn hold_keys(routes: &BTreeMap<String, Route>) {
     }
 }
 
+/// [`read_key_file`] for the other secret-file readers of this crate
+/// (outbound webhook destinations use the same rules).
+pub(crate) fn read_secret_file(path: &str) -> Result<Vec<u8>, String> {
+    read_key_file(path)
+}
+
 /// The key file: a regular file (no link, no FIFO), at most
 /// [`MAX_KEY_FILE`] bytes, one trailing newline dropped.
-pub(crate) fn read_key_file(path: &str) -> Result<Vec<u8>, String> {
+fn read_key_file(path: &str) -> Result<Vec<u8>, String> {
     let bytes =
         tole_core::delegation_report::read_plain_file(std::path::Path::new(path), MAX_KEY_FILE)
             .map_err(|e| format!("the key file {path}: {e}"))?
