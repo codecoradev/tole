@@ -132,6 +132,16 @@ pub fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
         .into()
 }
 
+/// The first 8 bytes of SHA-256 of `input` as 16 lower-case hex digits: a short,
+/// stable, collision-resistant tag for building an event id (#911). Not a MAC
+/// and not secret; `tole-cli` has no `sha2` of its own, so it asks here.
+pub fn short_digest(input: &[u8]) -> String {
+    Sha256::digest(input)[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 /// Constant-time equality (length is not secret here).
 pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0

@@ -303,3 +303,19 @@ fn seen_deliveries_are_kept_for_the_retention_only() {
     assert!(state.hook_seen("gh", "n0"));
     assert!(state.hooks_tracked() <= 3_000, "{}", state.hooks_tracked());
 }
+
+/// #911: the short tag an outbound event id is built from. SHA-256("abc") is
+/// ba7816bf 8f01cfea 414140de ...; the tag is its first 8 bytes.
+#[test]
+fn short_digest_is_the_first_eight_bytes_of_sha256_in_hex() {
+    assert_eq!(webhook::short_digest(b"abc"), "ba7816bf8f01cfea");
+    assert_eq!(webhook::short_digest(b""), "e3b0c44298fc1c14");
+    let tag = webhook::short_digest(b"job@1795000000/12.34");
+    assert_eq!(tag.len(), 16);
+    assert!(tag
+        .bytes()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+    // Stable, and different inputs differ.
+    assert_eq!(tag, webhook::short_digest(b"job@1795000000/12.34"));
+    assert_ne!(tag, webhook::short_digest(b"job@1795000000/12.35"));
+}

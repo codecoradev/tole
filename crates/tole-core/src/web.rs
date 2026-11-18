@@ -202,7 +202,18 @@ fn host_is_public_opt(url: &str, opt_out: bool) -> Result<(), String> {
 /// re-vetted against its own resolution.
 #[derive(Debug)]
 struct SsrfResolver {
-    opt_out: bool,
+    vetting: Vetting,
+}
+
+/// How a resolver vets the addresses it resolved.
+#[derive(Debug, Clone, Copy)]
+enum Vetting {
+    /// `web_fetch` and the built-in web tools: private and loopback refused
+    /// unless `opt_out` (`TOLE_WEB_ALLOW_PRIVATE=1`); a refusal is printed.
+    Fetch { opt_out: bool },
+    /// [`vetted_post`]: a per-destination policy, no environment opt-out;
+    /// nothing is printed and the error says refusal from DNS failure.
+    Post(AddrPolicy),
 }
 
 impl ureq::unversioned::resolver::Resolver for SsrfResolver {
@@ -233,9 +244,18 @@ impl ureq::unversioned::resolver::Resolver for SsrfResolver {
         if addrs.is_empty() {
             return Err(ureq::Error::HostNotFound);
         }
-        if let Err(e) = vet_addrs(&host, &addrs, self.opt_out) {
-            eprintln!("{e}");
-            return Err(ureq::Error::HostNotFound);
+        match self.vetting {
+            Vetting::Fetch { opt_out } => {
+                if let Err(e) = vet_addrs(&host, &addrs, opt_out) {
+                    eprintln!("{e}");
+                    return Err(ureq::Error::HostNotFound);
+                }
+            }
+            Vetting::Post(policy) => {
+                if !policy.allows(&host, &addrs) {
+                    return Err(post::refused_address_error());
+                }
+            }
         }
         let mut out = ureq::unversioned::resolver::ResolvedSocketAddrs::from_fn(|_| {
             std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0)
@@ -276,10 +296,15 @@ fn fetch_agent_vetted() -> ureq::Agent {
         vetted_config(ureq::Agent::config_builder()),
         ureq::unversioned::transport::DefaultConnector::default(),
         SsrfResolver {
-            opt_out: ssrf_opt_out(),
+            vetting: Vetting::Fetch {
+                opt_out: ssrf_opt_out(),
+            },
         },
     )
 }
+
+mod post;
+pub use post::{vetted_post, AddrPolicy, PostError, PostParams, PostResponse, MAX_POST_BODY};
 
 /// One GET of a host-side HTTP client (#625, the built-in web tools): no
 /// redirect is followed (the caller sees the 3xx and decides), and the
@@ -354,7 +379,9 @@ pub fn vetted_get(hop: &Hop<'_>) -> Result<HopResponse, HopError> {
         config,
         ureq::unversioned::transport::DefaultConnector::default(),
         SsrfResolver {
-            opt_out: hop.allow_private,
+            vetting: Vetting::Fetch {
+                opt_out: hop.allow_private,
+            },
         },
     );
     let mut req = agent.get(hop.url);
