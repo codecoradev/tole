@@ -12,6 +12,28 @@ use std::time::{Duration, Instant};
 
 use crate::common;
 
+/// A new workspace directory for one `Serve`. The six tests of a binary run as
+/// threads of ONE process and each starts a serve at once, so a name built from
+/// the pid and the clock alone can repeat (a coarse clock, as on a virtualised CI
+/// host, gives equal readings), and then one test's `Drop` removes the directory
+/// another test is still using (#915: `No such file or directory` from
+/// `GET /sessions/{id}/entries` and `workspace root` on resume). The counter
+/// makes a repeat impossible within a process.
+pub fn workspace_dir() -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    workspace_dir_at(nanos)
+}
+
+/// [`workspace_dir`] for a given clock reading (the test pins it).
+pub fn workspace_dir_at(nanos: u128) -> std::path::PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::env::temp_dir().join(format!("tole-entries-{}-{n}-{nanos:x}", std::process::id()))
+}
+
 pub struct Serve {
     pub child: Child,
     pub port: u16,
@@ -22,14 +44,7 @@ pub struct Serve {
 
 impl Serve {
     pub fn spawn(base: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!(
-            "tole-entries-{}-{:x}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = workspace_dir();
         std::fs::create_dir_all(&dir).unwrap();
         Self::spawn_in(base, dir, true)
     }
@@ -42,28 +57,14 @@ impl Serve {
 
     /// A fresh workspace with extra environment for the serve process.
     pub fn spawn_with_env(base: &str, env: &[(&str, &str)]) -> Self {
-        let dir = std::env::temp_dir().join(format!(
-            "tole-entries-{}-{:x}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = workspace_dir();
         std::fs::create_dir_all(&dir).unwrap();
         Self::spawn_in_env(base, dir, true, env)
     }
 
     /// A fresh workspace with extra command-line arguments for `tole serve`.
     pub fn spawn_with_args(base: &str, args: &[&str]) -> Self {
-        let dir = std::env::temp_dir().join(format!(
-            "tole-entries-{}-{:x}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = workspace_dir();
         std::fs::create_dir_all(&dir).unwrap();
         Self::spawn_in_env_args(base, dir, true, &[], args)
     }

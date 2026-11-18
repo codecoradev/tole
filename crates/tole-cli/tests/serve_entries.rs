@@ -262,3 +262,28 @@ fn resume_refuses_bad_ids_unknown_sessions_other_dirs_and_a_held_lock() {
 
     assert_eq!(post(&second, json!({"resume": id})).0, 200);
 }
+
+/// #915: every test of this binary starts a serve at the same moment, in one
+/// process, and each owns (and removes on drop) its workspace directory. Two
+/// of them must never get the same one, whatever the clock reads.
+#[test]
+fn concurrent_serves_never_share_a_workspace_directory() {
+    let names: Vec<std::path::PathBuf> = (0..8)
+        .map(|_| {
+            std::thread::spawn(|| {
+                (0..200)
+                    .map(|_| serve_harness::workspace_dir_at(42))
+                    .collect::<Vec<_>>()
+            })
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .flat_map(|h| h.join().unwrap())
+        .collect();
+    let unique: std::collections::HashSet<_> = names.iter().collect();
+    assert_eq!(
+        unique.len(),
+        names.len(),
+        "a directory name was handed out twice"
+    );
+}
