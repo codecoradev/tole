@@ -37,7 +37,10 @@ fn test(name: &str) -> Result<()> {
     if dests.is_empty() {
         bail!("no webhook destinations: declare [webhook_out.NAME] in the user config");
     }
-    let now = crate::cron::now();
+    // `cron` is only built with `shell-tools`; this command is not.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
     // Unique per call: the time and this process.
     let nonce = format!(
         "{now}-{}-{}",
