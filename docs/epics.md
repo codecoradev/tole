@@ -251,7 +251,7 @@ Everything below is merged; CHANGELOG entries carry the detail.
 - **0.11.0 (released 2026-11-14):** the security and automation release; every BREAKING entry has a migration step (`docs/migrating-0.11.md`).
   - Secrets: `SecretSet` redaction at every sink, widened to more encodings (#595, #681, #682), live tool events redacted (#677), the redacted session log (#596), the shared secret-shape detector (#597), scoped release with no secrets for `run_command`, `job_start` and cron scripts by default (#598), more files count as sensitive (#683), non-dumpable processes (#675) and owner-only records refused under a session (#684).
   - Plugins: the plugin lock and rug-pull guard for MCP servers, bound to source, binary and secrets, with refused servers never started (#599, #679, #680), and `tole plugin list|diff|approve|revoke`.
-  - Automation (epic #577): `tole cron` with time zones, parked and agent-created jobs, and signed webhooks with `tole hook`.
+  - Automation (epic #577): `tole cron` with time zones, parked and agent-created jobs, signed webhooks with `tole hook`, and outbound signed webhooks (#911, `[webhook_out]`, `tole webhook test`).
   - Collaboration (epics #583, #589): profiles, delegation with budget carve and `tole audit`, the advisor, model routing, skills (approved-hash loading, `skill_propose`, the curator) and multi-round discussion with `tole discuss` and the `discuss` tools. `agent_start` and `agent_poll` are deprecated aliases of `delegate` and `delegate_poll`.
   - Also: built-in `web_search` and `web_fetch` with the nginjen backend (#625), the Streamable HTTP MCP client (#530), the review gate before `git commit` (#534), `tole setup cora` (#535), the serve face for graphical clients (#524, #558), images on every turn (#559, #560) and the TUI polish of #463.
 - **Since 0.11.0 (on develop, unreleased):**
@@ -418,7 +418,7 @@ skill library (codecoradev/uteke#1731), shared secret-detector crate
 | Security follow-ups | #813 (decisions left from the #714 and #600 reviews) |
 | Collaboration (epic #583) | none; the epic issue only needs closing |
 | Serve for graphical clients | #572, #573, #574, #575 (#571 moved to the gateway track) |
-| Gateway (epic #910) | G0a #571 (`approval_required` stop reason, serve protocol only; in review), G0b outbound signed webhook delivery, G1 to G5 in the epic |
+| Gateway (epic #910) | G0a #571 (`approval_required` stop reason, serve protocol only; in review), G0b outbound signed webhook delivery (#911, done), G1 to G5 in the epic |
 | UI stack (epic #523) | #527, #528, #529, #561 (parked) |
 | Tests and CI | #781 (leaked temp dirs), #812 (wait_until helper and a 1-CPU job; covers flaky #702, #712, #738), #806 (develop red after a series of PRs), #705 and #670 (Cora Review in CI), #566 (iOS cross-compile job), #669 (cora code intelligence accuracy) |
 | Docs and process | #807 (local Cora review), #808 (this page) |
