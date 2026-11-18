@@ -23,6 +23,7 @@ use tole_core::web::AddrPolicy;
 
 use crate::config::WebhookOutConfig;
 
+pub mod approval_sender;
 pub mod event;
 pub mod outbox;
 pub mod probe;
@@ -123,6 +124,13 @@ pub struct Destinations(BTreeMap<String, Destination>);
 impl Destinations {
     pub fn get(&self, name: &str) -> Option<&Destination> {
         self.0.get(name)
+    }
+
+    /// Whether any destination lists one of `events`.
+    pub fn any_lists(&self, events: &[Event]) -> bool {
+        self.0
+            .values()
+            .any(|d| events.iter().any(|e| d.events.contains(e)))
     }
 
     pub fn names(&self) -> impl Iterator<Item = &str> {
