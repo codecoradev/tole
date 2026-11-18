@@ -20,6 +20,11 @@ use super::outbox::{
     self, EncodeError, Fold, FoldOptions, Line, MAX_FILE_BYTES, MAX_LINE, SKEW_SECS,
 };
 
+/// How many times `lease_due` retries a lock that looks held, and how long it
+/// waits between tries (about 100 ms in all).
+const LOCK_RETRIES: u32 = 10;
+const LOCK_RETRY_WAIT: std::time::Duration = std::time::Duration::from_millis(10);
+
 /// A producer's failure, as the ledger `error` code it records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnqueueError {
@@ -250,10 +255,23 @@ impl Outbox {
         max_timeout: i64,
     ) -> std::io::Result<Leasing> {
         let lock = self.open_lock()?;
-        match lock.try_lock() {
-            Ok(()) => {}
-            Err(std::fs::TryLockError::WouldBlock) => return Ok(Leasing::default()),
-            Err(std::fs::TryLockError::Error(e)) => return Err(e),
+        // A lock can look held for a few milliseconds without a second
+        // drainer: a child forked by ANOTHER thread of this process holds a
+        // copy of every descriptor that was open at the fork until it execs
+        // (the flock belongs to the open file, not to our handle). A short
+        // retry keeps "busy" for real contention; a longer hold is a real
+        // drainer and the caller looks again soon.
+        let mut tries = 0;
+        loop {
+            match lock.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) if tries < LOCK_RETRIES => {
+                    tries += 1;
+                    std::thread::sleep(LOCK_RETRY_WAIT);
+                }
+                Err(std::fs::TryLockError::WouldBlock) => return Ok(Leasing::default()),
+                Err(std::fs::TryLockError::Error(e)) => return Err(e),
+            }
         }
         let out = self.lease_locked(now, lease_for, max_timeout);
         drop(lock);

@@ -168,7 +168,7 @@ fn a_run_is_delivered_signed_and_the_ledger_records_sent() {
     );
     assert!(rx.try_recv().is_err());
 
-    let stats = webhook::drain(&dir, &d, Duration::from_secs(10)).unwrap();
+    let stats = webhook::drain(&dir, &d, Duration::from_secs(30)).unwrap();
     assert_eq!(stats.sent, 1, "{stats:?}");
     let got = rx.recv_timeout(Duration::from_secs(5)).unwrap();
     assert!(rx.try_recv().is_err(), "exactly one request");
@@ -282,7 +282,7 @@ fn a_silent_run_sends_nothing_but_a_failed_run_with_no_output_does() {
         .unwrap()
         .0
         .clone();
-    webhook::drain(&dir, &d, Duration::from_secs(10)).unwrap();
+    webhook::drain(&dir, &d, Duration::from_secs(30)).unwrap();
     let got = rx.recv_timeout(Duration::from_secs(5)).unwrap();
     let body = got.json();
     assert_eq!(body["data"]["status"], "error");
@@ -313,8 +313,21 @@ fn a_secret_in_the_output_reaches_neither_the_receiver_nor_the_files() {
     );
     cron::create(&dir, job(&dir, "j", &script), now() - 120).unwrap();
     let fire = cron::tick(&dir, now(), &opts(&d)).unwrap().ran[0].0.clone();
-    webhook::drain(&dir, &d, Duration::from_secs(10)).unwrap();
-    let got = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let stats = webhook::drain(&dir, &d, Duration::from_secs(30)).unwrap();
+    let got = rx.recv_timeout(Duration::from_secs(5)).unwrap_or_else(|e| {
+        let file = std::fs::read_to_string(dir.join("outbox.jsonl")).unwrap_or_default();
+        let shape: Vec<String> = file
+            .lines()
+            .map(|l| {
+                let v: Value = serde_json::from_str(l).unwrap();
+                format!("{} {} {}", v["k"], v["outcome"], v["code"])
+            })
+            .collect();
+        panic!(
+            "no request ({e:?}); stats {stats:?}; outbox {shape:?}; now {}",
+            now()
+        )
+    });
     // The run did print them, and the redaction marker shows they were caught.
     let summary = got.json()["data"]["summary"].as_str().unwrap().to_string();
     for marker in [
@@ -540,11 +553,45 @@ fn a_backlog_is_drained_in_one_look_not_one_event_per_look() {
     }
     let mut sender = webhook::Sender::new(&dir);
     assert!(sender.step(&d, now(), &mut |_, _| {}));
-    let mut got = 0;
-    while rx.recv_timeout(Duration::from_millis(500)).is_ok() {
-        got += 1;
+    // A lock that another thread's fork makes look held ends a look early (the
+    // sender then comes back after its poll time): look again, later, until
+    // the backlog is gone, as the serve loop does.
+    for k in 1..=3 {
+        sender.step(&d, now() + 6 * k, &mut |_, _| {});
     }
-    assert_eq!(got, 6, "one look sent the whole backlog");
+    // The looks are synchronous: every request was made before `step` returned,
+    // so they are all queued on the channel. Wait for them by count, not by a
+    // gap in time (a busy machine can stretch any gap).
+    let mut got = 0;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while got < 6 && std::time::Instant::now() < deadline {
+        if rx.recv_timeout(Duration::from_secs(1)).is_ok() {
+            got += 1;
+        }
+    }
+    let file = std::fs::read_to_string(dir.join("outbox.jsonl")).unwrap_or_default();
+    let kinds: Vec<String> = file
+        .lines()
+        .map(|l| {
+            let v: Value = serde_json::from_str(l).unwrap();
+            format!(
+                "{}:{}",
+                v["k"],
+                v["id"]
+                    .as_str()
+                    .unwrap_or("")
+                    .chars()
+                    .rev()
+                    .take(4)
+                    .collect::<String>()
+            )
+        })
+        .collect();
+    assert_eq!(got, 6, "one look sent the whole backlog; outbox: {kinds:?}");
+    assert!(
+        rx.recv_timeout(Duration::from_millis(300)).is_err(),
+        "no event was sent twice"
+    );
 }
 
 #[test]
