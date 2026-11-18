@@ -24,7 +24,6 @@ use tole_core::ledger::DeliveryStatus;
 fn now() -> i64 {
     cron::now()
 }
-const KEY_VAR: &str = "TOLE_TEST_WEBHOOK_SEND_KEY";
 const KEY: &str = "tole-send-test-key-0123456789abcdef";
 
 fn tmp(tag: &str) -> TestDir {
@@ -107,18 +106,25 @@ fn receiver(statuses: Vec<u16>) -> (u16, mpsc::Receiver<Got>) {
     (port, rx)
 }
 
-fn dests(port: u16) -> Destinations {
-    std::env::set_var(KEY_VAR, KEY);
+/// A destination named `gateway` that signs with the variable `var`. The
+/// name is neutral on purpose (no "KEY" or "SECRET" in it): the key must be
+/// kept out of the output by being registered, not by a naming heuristic.
+fn dests_with(port: u16, var: &str) -> Destinations {
+    std::env::set_var(var, KEY);
     let cfg = BTreeMap::from([(
         "gateway".to_string(),
         WebhookOutConfig {
             url: Some(format!("http://127.0.0.1:{port}/hook")),
-            hmac_key_env: Some(KEY_VAR.into()),
+            hmac_key_env: Some(var.into()),
             allow_loopback: Some(true),
             ..WebhookOutConfig::default()
         },
     )]);
     webhook_out::load(&cfg, &|k| std::env::var(k).ok()).unwrap()
+}
+
+fn dests(port: u16) -> Destinations {
+    dests_with(port, "TOLE_TEST_WEBHOOK_SEND_A")
 }
 
 fn job(dir: &Path, id: &str, script: &str) -> CreateSpec {
@@ -214,8 +220,9 @@ fn a_500_is_retried_with_the_same_id_and_body() {
     let d = dests(port);
     cron::create(&dir, job(&dir, "j", "echo hi"), now() - 120).unwrap();
     let fire = cron::tick(&dir, now(), &opts(&d)).unwrap().ran[0].0.clone();
-    // The first wait is 2 s: inside the budget, so one drain does both.
-    let stats = webhook::drain(&dir, &d, Duration::from_secs(10)).unwrap();
+    // The first wait is 2 s: inside the budget, so one drain does both. (No
+    // new pass starts with less than the destination's timeout left.)
+    let stats = webhook::drain(&dir, &d, Duration::from_secs(30)).unwrap();
     assert_eq!((stats.retried, stats.sent), (1, 1), "{stats:?}");
     let first = rx.recv_timeout(Duration::from_secs(5)).unwrap();
     let second = rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -244,9 +251,13 @@ fn a_4xx_is_final_and_recorded_failed() {
         .unwrap();
     assert_eq!(hook.1, DeliveryStatus::Failed);
     assert_eq!(hook.2.as_deref(), Some("http_400"));
-    // Never retried, however long it waits.
-    let again = webhook::drain(&dir, &d, Duration::from_secs(3)).unwrap();
+    // Final: the outbox holds a `dead` line and nothing pending, so no later
+    // drain can send it again.
+    let outbox = std::fs::read_to_string(dir.join("outbox.jsonl")).unwrap();
+    assert!(outbox.contains("\"k\":\"dead\""), "{outbox}");
+    let again = webhook::drain(&dir, &d, Duration::from_secs(1)).unwrap();
     assert_eq!(again.sent + again.retried + again.dead, 0);
+    assert!(rx.try_recv().is_err(), "never sent a second time");
 }
 
 #[test]
@@ -283,31 +294,43 @@ fn a_silent_run_sends_nothing_but_a_failed_run_with_no_output_does() {
 fn a_secret_in_the_output_reaches_neither_the_receiver_nor_the_files() {
     let dir = tmp("leak");
     let (port, rx) = receiver(vec![]);
-    let d = dests(port);
+    // The destination's key and a token in its URL are what a run must not
+    // be able to print onto the wire or the disk.
+    let d = dests_with(port, "TOLE_TEST_WEBHOOK_SEND_B");
     let canary = "canary-secret-value-9f8e7d6c5b4a";
     tole_core::secrets::add_role_secret("webhook_test_canary", canary);
-    // The job's own text must not hold the canary whole (that is the job
-    // definition, not output): the run prints it by joining two halves.
-    let (a, b) = canary.split_at(canary.len() / 2);
-    cron::create(
-        &dir,
-        job(&dir, "j", &format!("printf %s%s {a} {b}")),
-        now() - 120,
-    )
-    .unwrap();
+    // The job's own text must not hold a secret whole (that is the job
+    // definition, not output): the run prints each by joining two halves.
+    let split = |v: &str| {
+        let (a, b) = v.split_at(v.len() / 2);
+        format!("{a} {b}")
+    };
+    let script = format!(
+        "printf %s%s%s {} {} {}",
+        split(canary),
+        split(KEY),
+        split(&format!("http://127.0.0.1:{port}/hook"))
+    );
+    cron::create(&dir, job(&dir, "j", &script), now() - 120).unwrap();
     let fire = cron::tick(&dir, now(), &opts(&d)).unwrap().ran[0].0.clone();
     webhook::drain(&dir, &d, Duration::from_secs(10)).unwrap();
     let got = rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    // The run did print something (the redacted canary), so a clean body is
-    // the redaction at work, not an empty summary.
+    // The run did print them, and the redaction marker shows they were caught.
     let summary = got.json()["data"]["summary"].as_str().unwrap().to_string();
-    assert!(!summary.trim().is_empty(), "the summary is empty");
+    for marker in [
+        "«webhook_test_canary»",
+        "«webhook_out.gateway»",
+        "«webhook_out.gateway.url»",
+    ] {
+        assert!(summary.contains(marker), "no {marker} in: {summary}");
+    }
     let outbox = std::fs::read_to_string(dir.join("outbox.jsonl")).unwrap();
     let ledger = std::fs::read_to_string(dir.join("jobs.jsonl")).unwrap();
     let all = [
         String::from_utf8_lossy(&got.body).to_string(),
         got.headers
             .iter()
+            .filter(|(k, _)| !k.eq_ignore_ascii_case("host"))
             .map(|(k, v)| format!("{k}: {v}"))
             .collect::<Vec<_>>()
             .join("\n"),
@@ -317,6 +340,10 @@ fn a_secret_in_the_output_reaches_neither_the_receiver_nor_the_files() {
     for (n, text) in all.iter().enumerate() {
         assert!(!text.contains(canary), "the canary leaked into #{n}");
         assert!(!text.contains(KEY), "the destination key leaked into #{n}");
+        assert!(
+            !text.contains(&format!("http://127.0.0.1:{port}/hook")),
+            "the destination URL leaked into #{n}"
+        );
     }
     assert!(rows(&dir, &fire)
         .iter()
@@ -361,7 +388,38 @@ fn a_destination_that_is_gone_is_not_sent_to() {
     cron::tick(&dir, now(), &opts(&d)).unwrap();
     // The owner removed the destination before it was sent.
     let none = Destinations::default();
-    let stats = webhook::drain(&dir, &none, Duration::from_secs(2)).unwrap();
+    let started = std::time::Instant::now();
+    let stats = webhook::drain(&dir, &none, Duration::from_secs(20)).unwrap();
     assert_eq!(stats.sent + stats.retried + stats.dead, 0);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "a drain with nothing sendable must not wait out its budget: {:?}",
+        started.elapsed()
+    );
     assert!(rx.try_recv().is_err(), "nothing was sent");
+}
+
+#[test]
+fn a_terminal_row_is_written_once_however_often_it_is_settled() {
+    let dir = tmp("once");
+    let (port, _rx) = receiver(vec![]);
+    let d = dests(port);
+    cron::create(&dir, job(&dir, "j", "echo hi"), now() - 120).unwrap();
+    let fire = cron::tick(&dir, now(), &opts(&d)).unwrap().ran[0].0.clone();
+    let settled = |status| tole_cli::webhook_out::send::Settled {
+        dest: "gateway".into(),
+        id: "x".into(),
+        fire_id: Some(fire.clone()),
+        status,
+        code: None,
+    };
+    let first = webhook::record_settled(&dir, vec![settled(DeliveryStatus::Sent)], now()).unwrap();
+    // A slow drainer, a repeated pass or a later reconcile settles it again.
+    let again = webhook::record_settled(&dir, vec![settled(DeliveryStatus::Sent)], now()).unwrap();
+    assert_eq!((first, again), (1, 0));
+    let n = rows(&dir, &fire)
+        .iter()
+        .filter(|(t, _, _)| t == "webhook:gateway")
+        .count();
+    assert_eq!(n, 1);
 }

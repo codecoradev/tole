@@ -28,7 +28,7 @@ use crate::webhook_out::Destinations;
 
 /// What the producer did with one `webhook:` target of a run.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Produced {
+pub(crate) enum Produced {
     /// On the outbox: the sender writes the ledger row when it settles.
     Queued,
     /// A silent `ok` run: record `skipped`, never send.
@@ -38,16 +38,16 @@ pub enum Produced {
 }
 
 /// A settled run, as the producer needs it.
-pub struct RunFacts<'a> {
-    pub job: &'a Job,
-    pub fire_id: &'a str,
-    pub scheduled_for: i64,
-    pub status: RunStatus,
+pub(crate) struct RunFacts<'a> {
+    pub(crate) job: &'a Job,
+    pub(crate) fire_id: &'a str,
+    pub(crate) scheduled_for: i64,
+    pub(crate) status: RunStatus,
     /// The run's output, already redacted once.
-    pub output: &'a str,
-    pub session_id: Option<&'a str>,
+    pub(crate) output: &'a str,
+    pub(crate) session_id: Option<&'a str>,
     /// When the run settled; stamps the event and the outbox line.
-    pub finished_at: i64,
+    pub(crate) finished_at: i64,
 }
 
 /// Queues the `cron_run_finished` event of a run for destination `name`.
@@ -56,7 +56,7 @@ pub struct RunFacts<'a> {
 /// nothing, but an `error`, `budget`, `cancelled`, `interrupted` or
 /// `awaiting_approval` run with no output still notifies (an empty `summary`),
 /// because a failure with no output is what an owner most wants to hear about.
-pub fn enqueue_run(
+pub(crate) fn enqueue_run(
     dir: &Path,
     dests: Option<&Destinations>,
     name: &str,
@@ -127,6 +127,12 @@ pub fn record_settled(dir: &Path, rows: Vec<Settled>, now: i64) -> anyhow::Resul
                 continue;
             }
             let target = format!("webhook:{}", r.dest);
+            // One terminal row per (run, destination). A delivery row is always
+            // terminal, so an existing one means a slow drainer, a repeated
+            // pass or a later reconcile already recorded it.
+            if l.state().deliveries(fire).any(|d| d.target == target) {
+                continue;
+            }
             if l.deliver(fire, &target, r.status, r.code, now).is_ok() {
                 written += 1;
             }
@@ -135,10 +141,13 @@ pub fn record_settled(dir: &Path, rows: Vec<Settled>, now: i64) -> anyhow::Resul
     })
 }
 
-/// Runs drain passes for at most `budget`. It goes on while a pass did
-/// something, or while a retry falls due inside what is left of the budget
-/// (the first waits are 2 s and 10 s), checking once a second; a longer wait
-/// is for the next drain. Returns what the passes did.
+/// Runs drain passes for about `budget` (a soft bound: a send in flight is
+/// not cut, so a pass may run up to a destination's timeout, at most 30 s,
+/// longer; no new pass starts when less than the longest timeout is left). It
+/// goes on while a pass sent something, while the outbox lock was busy, and
+/// while a retry of a configured destination falls due inside what is left
+/// (the first waits are 2 s and 10 s), checking once a second; a longer wait is
+/// for the next drain. Ledger rows are written even when a pass fails midway.
 pub fn drain(
     dir: &Path,
     dests: &Destinations,
@@ -147,51 +156,70 @@ pub fn drain(
     let started = Instant::now();
     let mut total = send::PassStats::default();
     let outbox = Outbox::new(dir);
+    let longest = dests
+        .names()
+        .filter_map(|n| dests.get(n))
+        .map(|d| d.timeout)
+        .max()
+        .unwrap_or_default();
     loop {
         let mut rows = Vec::new();
-        let stats = send::drain_pass(
+        let pass = send::drain_pass(
             &outbox,
             dests,
             &NetPoster,
             &EnvFileKeys,
             &super::now,
             &mut |s| rows.push(s),
-        )?;
-        record_settled(dir, rows, super::now())?;
+        );
+        // The rows of what this pass already settled are recorded first, so an
+        // error after some events were sent does not leave them without one.
+        let wrote = record_settled(dir, rows, super::now());
+        let stats = pass?;
+        wrote?;
         total.sent += stats.sent;
         total.retried += stats.retried;
         total.dead += stats.dead;
-        total.busy |= stats.busy;
         let left = budget.saturating_sub(started.elapsed());
-        if stats.busy || left.is_zero() {
+        if left < longest.min(budget) || left.is_zero() {
             return Ok(total);
         }
-        let active = stats.sent + stats.retried + stats.dead > 0;
-        if !active && !retry_due_within(&outbox, super::now(), left.as_secs() as i64) {
+        let worked = stats.sent + stats.dead > 0;
+        if worked {
+            continue; // more may be due: no wait between events
+        }
+        if !stats.busy && stats.retried == 0 && !pending_within(&outbox, dests, left) {
             return Ok(total);
         }
+        total.busy |= stats.busy;
         std::thread::sleep(Duration::from_secs(1).min(left));
     }
 }
 
-/// Whether a pending event falls due within `window` seconds (a retry whose
-/// wait is short, or a lease that is about to run out).
-fn retry_due_within(outbox: &Outbox, now: i64, window: i64) -> bool {
+/// Whether an event of a destination that is configured falls due within
+/// `window`: a retry whose wait is short, or a lease about to run out. An
+/// event whose destination is gone is never sent, so it never counts (it would
+/// make every drain wait out the whole budget).
+fn pending_within(outbox: &Outbox, dests: &Destinations, window: Duration) -> bool {
+    let now = super::now();
     let Ok(fold) = outbox.fold(crate::webhook_out::outbox::FoldOptions {
         now,
         max_lease_ahead: 1000,
     }) else {
         return false;
     };
-    let horizon = now.saturating_add(window);
-    let due = fold.entries().any(|(_, _, e)| {
-        e.pending() && e.deadline > now && e.next_at.max(e.lease_until) <= horizon
+    let horizon = now.saturating_add(window.as_secs() as i64);
+    let due = fold.entries().any(|(dest, _, e)| {
+        dests.get(dest).is_some()
+            && e.pending()
+            && e.deadline > now
+            && e.next_at.max(e.lease_until) <= horizon
     });
     due
 }
 
 /// What a skipped or failed outcome records on the ledger.
-pub fn immediate(p: &Produced) -> Option<(DeliveryStatus, Option<String>)> {
+pub(crate) fn immediate(p: &Produced) -> Option<(DeliveryStatus, Option<String>)> {
     match p {
         Produced::Queued => None,
         Produced::Skipped => Some((DeliveryStatus::Skipped, None)),

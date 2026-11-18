@@ -198,6 +198,9 @@ pub fn load(
         if let Ok(text) = std::str::from_utf8(&key) {
             tole_core::secrets::add_role_secret(&format!("webhook_out.{name}"), text);
         }
+        // The URL can carry a token in its path or query: it is redacted too,
+        // so a run that prints it cannot put it on the wire or on disk.
+        tole_core::secrets::add_role_secret(&format!("webhook_out.{name}.url"), url.trim());
 
         let events = match &w.events {
             None => BTreeSet::from([Event::CronRunFinished]),
