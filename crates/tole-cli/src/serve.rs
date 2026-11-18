@@ -107,6 +107,11 @@ struct State {
     hooks: std::collections::BTreeMap<String, tole_cli::hooks::Route>,
     /// The cron dir, whose ledger records seen deliveries (`hook_seen`).
     hook_dir: Option<std::path::PathBuf>,
+    /// Approvals whose first decision took effect in the queue but whose
+    /// durable audit write failed (the client got a 5xx): a retry of the same
+    /// verdict redoes the audit and the resume instead of being told it is a
+    /// repeat.
+    audit_pending: Mutex<std::collections::BTreeSet<String>>,
 }
 
 /// Read/write ceilings per connection: a client that opens a socket and
@@ -177,6 +182,7 @@ pub fn run_serve(cfg: ServeConfig) -> Result<()> {
         uploads: tole_cli::serve_images::UploadStore::from_env(),
         hooks,
         hook_dir,
+        audit_pending: Mutex::default(),
     });
     if !state.hooks.is_empty() {
         let names: Vec<&str> = state.hooks.keys().map(String::as_str).collect();
@@ -1661,35 +1667,46 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                     status,
                     session_id,
                     tool,
-                    transitioned: true,
+                    transitioned,
                     ..
-                } => (session_id, tool, status),
-                // Not the first decision (a repeat, a flip after the fact, or
-                // an entry that had already expired): nothing is audited and
-                // nothing resumes, so the durable trail keeps the verdict that
-                // took effect and the one-shot is not replayed twice. The same
-                // verdict again is idempotent; a different one is a conflict.
-                tole_cli::approvals::DecisionOutcome::Decided { status, .. } => {
+                } => {
                     let same = match status {
                         tole_cli::approvals::ApprovalStatus::Approved => allow,
                         tole_cli::approvals::ApprovalStatus::Denied => !allow,
                         _ => false,
                     };
-                    return if same {
-                        (
-                            200,
-                            json!({"id": id, "status": status.as_str(), "resuming": false}),
-                        )
-                    } else {
-                        (
-                            409,
-                            json!({
-                                "error": format!("approval already {}", status.as_str()),
-                                "id": id,
-                                "status": status.as_str(),
-                            }),
-                        )
-                    };
+                    // Not the first decision (a repeat, a flip after the fact,
+                    // or an entry that had already expired): nothing is audited
+                    // and nothing resumes, so the durable trail keeps the
+                    // verdict that took effect and the one-shot is not replayed
+                    // twice. The same verdict again is idempotent, a different
+                    // one is a conflict. The one exception is a first decision
+                    // whose audit write failed: its retry finishes the job.
+                    let owes_audit = !transitioned
+                        && same
+                        && state
+                            .audit_pending
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .contains(&id);
+                    if !transitioned && !owes_audit {
+                        return if same {
+                            (
+                                200,
+                                json!({"id": id, "status": status.as_str(), "resuming": false}),
+                            )
+                        } else {
+                            (
+                                409,
+                                json!({
+                                    "error": format!("approval already {}", status.as_str()),
+                                    "id": id,
+                                    "status": status.as_str(),
+                                }),
+                            )
+                        };
+                    }
+                    (session_id, tool, status)
                 }
                 tole_cli::approvals::DecisionOutcome::Unknown => {
                     return (404, json!({"error": "unknown approval id"}));
@@ -1701,6 +1718,17 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
             // lock (block: the audit contract outweighs latency here).
             // A total failure is a 5xx, never a silent skip.
             let audit = write_approval_audit(state, &session_id, &id, allow, &tool);
+            {
+                let mut pending = state
+                    .audit_pending
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                if audit.is_err() {
+                    pending.insert(id.clone());
+                } else {
+                    pending.remove(&id);
+                }
+            }
             if audit.is_err() {
                 return (
                     500,
@@ -1712,7 +1740,8 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                 // consults the approver, the one-shot matches, the tool
                 // executes. Runs off-thread — the turn may take a while.
                 // Bounded without the connection cap: an approval id is decided
-                // once (a repeat returns above, without a resume) and pending approvals only come
+                // once (a repeat returns above, without a resume) and pending
+                // approvals only come
                 // from the capped, one-turn-per-session map.
                 let sessions = Arc::clone(&state.sessions);
                 let sid = session_id.clone();
@@ -2042,7 +2071,67 @@ mod tests {
             uploads: None,
             hooks: Default::default(),
             hook_dir: None,
+            audit_pending: Mutex::default(),
         }
+    }
+
+    /// A first decision whose durable audit write failed (the client got a
+    /// 5xx) is finished by a retry of the same verdict: the audit is written
+    /// and the resume starts then, once. The opposite verdict is still a
+    /// conflict, and once the audit is in, a repeat is a plain 200.
+    #[test]
+    fn a_decision_whose_audit_failed_is_finished_by_its_retry() {
+        let base = crate::test_dir::TestDir::new("tole-serve-audit-retry");
+        let root = base.join("ws");
+        let sessions = base.join("sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&sessions).unwrap();
+        let state = test_state(root, sessions);
+        // The session file's directory does not exist yet: the audit cannot
+        // be written.
+        let missing = base.join("later");
+        let id = state.approvals.queue_entry(
+            "srv-audit-retry",
+            "write_file",
+            "write file x.txt",
+            7,
+            missing.join("srv-audit-retry.jsonl"),
+        );
+        let path = format!("/approvals/{id}/decision");
+        let allow = json!({"decision": "allow"}).to_string();
+        let deny = json!({"decision": "deny"}).to_string();
+
+        let (status, body) = route(&state, "POST", &path, &allow);
+        assert_eq!(status, 500, "{body}");
+        // The verdict took effect in the queue; the opposite one conflicts.
+        let (status, body) = route(&state, "POST", &path, &deny);
+        assert_eq!(status, 409, "{body}");
+        // A retry while the audit still cannot be written fails again, and
+        // does not claim to be a repeat.
+        let (status, body) = route(&state, "POST", &path, &allow);
+        assert_eq!(status, 500, "{body}");
+        // The audit can be written now: the retry finishes the decision.
+        std::fs::create_dir_all(&missing).unwrap();
+        tole_core::storage::JsonlStorage::create(&missing, "srv-audit-retry", None).unwrap();
+        let (status, body) = route(&state, "POST", &path, &allow);
+        assert_eq!(status, 202, "{body}");
+        assert_eq!(body["resuming"], true);
+        let audit = std::fs::read_to_string(missing.join("srv-audit-retry.jsonl")).unwrap();
+        assert_eq!(
+            audit.matches(&format!("approval_{id}")).count(),
+            1,
+            "{audit}"
+        );
+        // Done: a further repeat is idempotent and writes nothing.
+        let (status, body) = route(&state, "POST", &path, &allow);
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["resuming"], false);
+        let audit = std::fs::read_to_string(missing.join("srv-audit-retry.jsonl")).unwrap();
+        assert_eq!(
+            audit.matches(&format!("approval_{id}")).count(),
+            1,
+            "{audit}"
+        );
     }
 
     /// cora 0.19 scan MAJOR: REST `POST /sessions` must enforce the same
