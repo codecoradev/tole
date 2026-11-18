@@ -968,7 +968,18 @@ pub fn run_cli(
             Err(e) => (vec![format!("  ! cron: {e}")], true),
         };
         lines.iter().for_each(|l| println!("{l}"));
-        ok && cron_ok
+        // The webhook outbox (#911): counts and names, never a URL or a body.
+        let hook_ok = match (crate::cron::default_dir(), crate::webhook_out::load_user()) {
+            (Ok(dir), Ok(dests)) => {
+                let (lines, hook_ok) =
+                    crate::cron::webhook::doctor_lines(&dir, &dests, crate::cron::now());
+                lines.iter().for_each(|l| println!("{l}"));
+                hook_ok
+            }
+            // A config that does not load is reported above.
+            _ => true,
+        };
+        ok && cron_ok && hook_ok
     };
     // Only a configured provider has a ledger identity.
     if let (Some(cfg), false) = (cfg, no_ledger) {

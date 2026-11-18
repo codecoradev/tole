@@ -423,3 +423,90 @@ fn a_terminal_row_is_written_once_however_often_it_is_settled() {
         .count();
     assert_eq!(n, 1);
 }
+
+#[test]
+fn the_serve_sender_sends_when_the_outbox_grows_and_retries_when_due() {
+    let dir = tmp("sender");
+    let (port, rx) = receiver(vec![500, 200]);
+    let d = dests_with(port, "TOLE_TEST_WEBHOOK_SEND_C");
+    let mut sender = webhook::Sender::new(&dir);
+    // An empty outbox is looked at once, then left alone.
+    assert!(sender.step(&d, now(), &mut |_, _| {}));
+    assert!(!sender.step(&d, now(), &mut |_, _| {}), "nothing changed");
+
+    cron::create(&dir, job(&dir, "j", "echo hi"), now() - 120).unwrap();
+    let fire = cron::tick(&dir, now(), &opts(&d)).unwrap().ran[0].0.clone();
+    let mut failed = Vec::new();
+    // The file grew: a pass runs and gets the 500; the retry is due in 2 s.
+    assert!(sender.step(&d, now(), &mut |d, c| failed
+        .push((d.to_string(), c.to_string()))));
+    assert!(rx.recv_timeout(Duration::from_secs(5)).is_ok());
+    assert!(failed.is_empty(), "a retry is not a failure yet");
+    assert!(
+        !sender.step(&d, now(), &mut |_, _| {}),
+        "no pass before the retry is due"
+    );
+    // Once it is due, the next look sends it.
+    let started = std::time::Instant::now();
+    loop {
+        sender.step(&d, now(), &mut |_, _| {});
+        if rx.try_recv().is_ok() {
+            break;
+        }
+        assert!(started.elapsed() < Duration::from_secs(10), "never retried");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let rows = rows(&dir, &fire);
+    let hook = rows
+        .iter()
+        .find(|(t, _, _)| t == "webhook:gateway")
+        .unwrap();
+    assert_eq!(hook.1, DeliveryStatus::Sent);
+}
+
+#[test]
+fn the_serve_sender_reports_a_failed_delivery_by_name_and_code_only() {
+    let dir = tmp("sender-fail");
+    let (port, _rx) = receiver(vec![403]);
+    let d = dests_with(port, "TOLE_TEST_WEBHOOK_SEND_D");
+    cron::create(&dir, job(&dir, "j", "echo hi"), now() - 120).unwrap();
+    cron::tick(&dir, now(), &opts(&d)).unwrap();
+    let mut sender = webhook::Sender::new(&dir);
+    let mut failed = Vec::new();
+    sender.step(&d, now(), &mut |d, c| {
+        failed.push((d.to_string(), c.to_string()))
+    });
+    assert_eq!(
+        failed,
+        vec![("gateway".to_string(), "http_403".to_string())]
+    );
+}
+
+#[test]
+fn doctor_reports_counts_and_names_but_never_a_url() {
+    let dir = tmp("doctor");
+    let (port, _rx) = receiver(vec![]);
+    let d = dests_with(port, "TOLE_TEST_WEBHOOK_SEND_E");
+    // Nothing configured, nothing queued: silent.
+    let (lines, ok) = webhook::doctor_lines(&dir, &Destinations::default(), now());
+    assert!((lines.is_empty(), ok) == (true, true), "{lines:?}");
+
+    cron::create(&dir, job(&dir, "j", "echo hi"), now() - 120).unwrap();
+    cron::tick(&dir, now(), &opts(&d)).unwrap();
+    let (lines, ok) = webhook::doctor_lines(&dir, &d, now() + 1200);
+    assert!(ok, "{lines:?}");
+    let text = lines.join("\n");
+    assert!(text.contains("1 pending"), "{text}");
+    assert!(text.contains("oldest"), "{text}");
+    assert!(!text.contains("127.0.0.1"), "a URL in doctor: {text}");
+
+    // The destination was removed from the config: an error that names it.
+    let (lines, ok) = webhook::doctor_lines(&dir, &Destinations::default(), now());
+    assert!(!ok);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("webhook:gateway") && l.contains("not configured")),
+        "{lines:?}"
+    );
+}
