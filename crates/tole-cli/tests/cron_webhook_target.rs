@@ -1,7 +1,8 @@
 //! `webhook:<name>` delivery targets (#911 part 2): the target is parsed and
 //! checked against the destinations the host loaded, an agent-created job may
-//! only name a destination that allows it, and until the sender exists a
-//! webhook delivery records `failed` (`not_implemented`), never `sent`.
+//! only name a destination that allows it, and a webhook delivery is queued
+//! (no ledger row until the sender settles it), never recorded `sent` by the
+//! tick itself. Sending is covered by `cron_webhook_send.rs`.
 #![cfg(feature = "shell-tools")]
 
 mod common;
@@ -158,8 +159,8 @@ fn a_standalone_tick_without_destinations_blocks_the_occurrence() {
 }
 
 #[test]
-fn until_the_sender_exists_a_webhook_delivery_fails_visibly() {
-    let dir = tmp("tick-fails");
+fn the_tick_queues_a_webhook_delivery_and_records_nothing_for_it() {
+    let dir = tmp("tick-queues");
     cron::create(&dir, script(&dir, "j", &["webhook:gateway", "log"]), T).unwrap();
     let r = cron::tick(&dir, T + 60, &with(dest(false, &["cron_run_finished"]))).unwrap();
     assert_eq!(r.ran.len(), 1, "{r:?}");
@@ -169,13 +170,16 @@ fn until_the_sender_exists_a_webhook_delivery_fails_visibly() {
         .deliveries(&r.ran[0].0)
         .map(|d| (d.target.clone(), d.status, d.error.clone()))
         .collect();
-    let hook = d.iter().find(|(t, _, _)| t == "webhook:gateway").unwrap();
-    assert_eq!(hook.1, DeliveryStatus::Failed, "{d:?}");
+    // The sender writes the row when the event settles; the tick does not.
     assert!(
-        hook.2.as_deref().unwrap().contains("not_implemented"),
-        "{d:?}"
+        d.iter().all(|(t, _, _)| t != "webhook:gateway"),
+        "no row yet: {d:?}"
     );
     // The other target is unaffected, and the run itself still settled ok.
     let log = d.iter().find(|(t, _, _)| t == "log").unwrap();
     assert_eq!(log.1, DeliveryStatus::Sent, "{d:?}");
+    // The event is on the outbox, nothing was sent.
+    let outbox = std::fs::read_to_string(dir.join("outbox.jsonl")).unwrap();
+    assert_eq!(outbox.lines().count(), 1, "{outbox}");
+    assert!(outbox.contains("\"k\":\"enqueue\""), "{outbox}");
 }
