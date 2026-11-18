@@ -517,7 +517,10 @@ fn webhook_targets(dir: &Path) -> std::collections::BTreeSet<String> {
         .filter_map(|j| super::deliver::targets(&j.job).ok())
         .flatten()
         .filter_map(|t| match t {
-            Target::Webhook(n) => Some(n),
+            // The target parser already requires a valid name; checked again
+            // here because the saved jobs are untrusted input and these names
+            // are printed by `tole doctor`.
+            Target::Webhook(n) if crate::webhook_out::valid_name(&n) => Some(n),
             _ => None,
         })
         .collect()
