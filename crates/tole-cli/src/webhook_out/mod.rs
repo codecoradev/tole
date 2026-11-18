@@ -23,6 +23,7 @@ use tole_core::web::AddrPolicy;
 
 use crate::config::WebhookOutConfig;
 
+pub mod event;
 pub mod sign;
 
 /// Longest destination name.
