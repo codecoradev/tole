@@ -84,7 +84,7 @@ impl Line {
             dest: dest.into(),
             id: id.into(),
             at: now,
-            deadline: now + CRON_DEADLINE_SECS,
+            deadline: now.saturating_add(CRON_DEADLINE_SECS),
             body: body.into(),
         }
     }
@@ -234,7 +234,7 @@ impl Fold {
                 }
             }
             Line::Lease { lease_until, .. } => match self.live(&key) {
-                Some(e) if lease_until <= opts.now + opts.max_lease_ahead => {
+                Some(e) if lease_until <= opts.now.saturating_add(opts.max_lease_ahead) => {
                     e.lease_until = lease_until
                 }
                 _ => self.ignored += 1,
@@ -364,10 +364,12 @@ pub fn validate(
     let Some(at) = v.get("at").and_then(|x| x.as_i64()) else {
         return Err(BAD_LINE);
     };
-    if at > now + SKEW_SECS {
+    // `at` is read from the file: saturating, so a crafted i64::MIN or
+    // i64::MAX cannot overflow (a panic in debug, a wrap in release).
+    if at > now.saturating_add(SKEW_SECS) {
         return Err(BAD_LINE);
     }
-    if now - at > CRON_DEADLINE_SECS {
+    if now.saturating_sub(at) > CRON_DEADLINE_SECS {
         return Err(EXPIRED);
     }
     Ok(())

@@ -450,3 +450,69 @@ fn a_built_event_passes_validation() {
     // And it fits on one outbox line.
     assert!(encode(&Line::enqueue("g", &built.id, &text, NOW)).is_ok());
 }
+
+#[test]
+fn a_crafted_timestamp_cannot_overflow_the_checks() {
+    let d = dest(&[Event::CronRunFinished]);
+    let at = |t: i64| body("g", "i", "cron_run_finished", t);
+    // i64::MIN reads as absurdly old, i64::MAX as from the future: refused,
+    // never a panic and never a wrap that passes the age check.
+    assert_eq!(
+        validate("g", "i", &at(i64::MIN), Some(&d), NOW),
+        Err(EXPIRED)
+    );
+    assert_eq!(
+        validate("g", "i", &at(i64::MAX), Some(&d), NOW),
+        Err(BAD_LINE)
+    );
+    // The same holds when the caller's own clock is extreme.
+    assert_eq!(
+        validate("g", "i", &at(i64::MIN), Some(&d), i64::MAX),
+        Err(EXPIRED)
+    );
+    assert_eq!(
+        validate("g", "i", &at(i64::MAX), Some(&d), i64::MIN),
+        Err(BAD_LINE)
+    );
+}
+
+#[test]
+fn a_crafted_lease_or_deadline_cannot_overflow_the_fold() {
+    let bytes = file(&[
+        Line::Enqueue {
+            dest: "g".into(),
+            id: "a".into(),
+            at: i64::MIN,
+            deadline: i64::MAX,
+            body: String::new(),
+        },
+        Line::Lease {
+            dest: "g".into(),
+            id: "a".into(),
+            at: i64::MIN,
+            lease_until: i64::MAX,
+        },
+    ]);
+    let mut f = Fold::default();
+    f.feed(
+        &bytes,
+        0,
+        FoldOptions {
+            now: i64::MAX,
+            max_lease_ahead: i64::MAX,
+        },
+    );
+    assert!(f.has("g", "a"));
+    let _ = f.due(i64::MAX);
+    let _ = f.expired(i64::MIN);
+    assert_eq!(
+        Line::enqueue("g", "x", "", i64::MAX).clone(),
+        Line::Enqueue {
+            dest: "g".into(),
+            id: "x".into(),
+            at: i64::MAX,
+            deadline: i64::MAX,
+            body: String::new(),
+        }
+    );
+}
