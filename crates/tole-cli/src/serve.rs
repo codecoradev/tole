@@ -150,7 +150,7 @@ pub fn run_serve(cfg: ServeConfig) -> Result<()> {
     // load stops the server here too, with its name and the fix. A running
     // server keeps this map until restart.
     let webhook_out = tole_cli::webhook_out::load_user().map_err(|e| anyhow::anyhow!("{e}"))?;
-    tole_cli::webhook_out::install(webhook_out);
+    let webhook_out = tole_cli::webhook_out::install(webhook_out);
     let hook_dir = if hooks.is_empty() {
         None
     } else {
@@ -187,6 +187,16 @@ pub fn run_serve(cfg: ServeConfig) -> Result<()> {
         cfg.allow_patterns.len(),
         cfg.plan_mode
     );
+    // The webhook sender (#911) runs whether or not `--cron` is given: a
+    // webhook route can run a job without the ticker.
+    if !webhook_out.is_empty() {
+        let dir = tole_cli::cron::default_dir()?;
+        eprintln!(
+            "tole serve: webhook sender for {} destination(s)",
+            webhook_out.len()
+        );
+        tole_cli::cron::webhook::spawn_sender(dir, Arc::clone(&webhook_out));
+    }
     if cfg.cron {
         let dir = tole_cli::cron::default_dir()?;
         eprintln!("tole serve: cron ticker on {}", dir.display());
