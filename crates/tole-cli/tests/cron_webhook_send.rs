@@ -946,6 +946,8 @@ fn a_run_that_never_went_through_the_live_path_is_not_announced() {
     let rec = webhook::reconcile(&dir, &d, later(), &secrets()).unwrap();
     if produced == 0 {
         assert_eq!((rec.enqueued, rec.rows), (0, 0), "{rec:?} after {r:?}");
+    }
+}
 
 #[test]
 fn doctor_never_prints_a_hostile_name_from_the_saved_jobs() {
