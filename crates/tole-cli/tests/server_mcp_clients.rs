@@ -91,6 +91,9 @@ fn owner_servers_go_through_the_lock_and_refused_ones_leave_one_notice_each() {
     lock.save(&d.join("home/tole").join(LOCK_FILE)).unwrap();
 
     let owner = vec![okay, chg, uns, rev];
+    tole_cli::session_host::set_server_skills(
+        tole_cli::session::assemble::ServerSkills::new(vec![], true).unwrap(),
+    );
     tole_cli::session::owner_mcp::set(owner.clone()).unwrap();
     assert_eq!(tole_cli::session::owner_mcp::specs(), owner.as_slice());
     // The list is set once: a second call cannot replace it.

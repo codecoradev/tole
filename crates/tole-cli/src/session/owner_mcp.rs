@@ -16,28 +16,34 @@ use std::sync::OnceLock;
 
 static OWNER: OnceLock<Vec<String>> = OnceLock::new();
 
-/// Installs the owner's server specs (`name=command args`). Each spec is
-/// parsed here so a malformed one stops startup. Fails when a list was
-/// already installed, or in a build without MCP support (nothing to
-/// install there).
+/// Installs the owner's server specs (`name=command args`), once at startup;
+/// an empty list is a choice too ("none configured"). Each spec is parsed here
+/// so a malformed one stops startup. A second call with another list fails:
+/// the list cannot be replaced. In a build without MCP support a non-empty
+/// list is refused (nothing could attach it).
 pub fn set(specs: Vec<String>) -> Result<(), String> {
-    if specs.is_empty() {
-        return Ok(());
-    }
     #[cfg(not(feature = "mcp"))]
-    return Err("MCP client servers need the `mcp` feature (this build lacks it)".into());
+    if !specs.is_empty() {
+        return Err("MCP client servers need the `mcp` feature (this build lacks it)".into());
+    }
     #[cfg(feature = "mcp")]
-    {
-        for s in &specs {
-            tole_core::mcp::McpServerConfig::parse(s)?;
-        }
-        OWNER
-            .set(specs)
-            .map_err(|_| "the owner's MCP servers were already set".to_string())
+    for s in &specs {
+        tole_core::mcp::McpServerConfig::parse(s)?;
+    }
+    match OWNER.set(specs.clone()) {
+        Ok(()) => Ok(()),
+        Err(_) if OWNER.get() == Some(&specs) => Ok(()),
+        Err(_) => Err("the owner's MCP servers were already set".to_string()),
     }
 }
 
-/// The owner's server specs; empty unless [`set`] installed some.
+/// The owner's server specs, or `None` when the entrypoint never called
+/// [`set`] (an error for a session host, never a silent default).
+pub fn get() -> Option<&'static [String]> {
+    OWNER.get().map(Vec::as_slice)
+}
+
+/// [`get`], empty when unset (for readers that only report).
 pub fn specs() -> &'static [String] {
-    OWNER.get().map_or(&[], Vec::as_slice)
+    get().unwrap_or(&[])
 }

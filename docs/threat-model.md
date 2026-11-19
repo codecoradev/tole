@@ -182,6 +182,15 @@ one huge skill file. A FIFO or other non-regular SKILL.md is refused
 without blocking. The approvals file (#591) is capped at 1 MiB the same
 way.
 
+**Server sessions (#945).** `tole serve` and `tole acp` sessions load approved
+skills from the session workspace like the CLI. Their explicit skill files
+are the owner's process-level choice (`--skill`, `TOLE_SKILL`, a profile, the
+user config), checked at startup and again at each session creation (regular
+file, size and body caps). A `skill` named by the PROJECT config stays refused
+on these faces: the config trust binds the config's bytes, not those of the
+file it names inside the served repository, so a later `git pull` would change
+what loads into every new session without an approval.
+
 **Skill index (#590).** With `TOLE_SKILL_INDEX=uteke` a session lists a
 pinned core plus the skills a `uteke doc` index recalls by meaning. The index
 only finds NAMES: every listed description and every loaded body is read

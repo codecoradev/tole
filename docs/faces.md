@@ -60,7 +60,7 @@ true; the status column says where the work is.
 | Capability | CLI | `serve` / ACP session | `tole mcp` | cron | Status |
 |---|---|---|---|---|---|
 | Default system prompt (tool discipline, one context line naming the session's workspace; pinned in the header) | yes | yes (#945) | n/a | cron's own | one path |
-| Skill sections and `load_skill` (approved skills only, #591) | yes | no | no | no | drift #945, needs the owner's go |
+| Skill sections and `load_skill` (approved skills only, #591; discovered in the session workspace; the owner's `--skill`/`--no-skills` for the process; appended to the pinned prompt at creation, so `resume` keeps it) | yes | yes (#945) | no | no | one path |
 | Review guidance (named only when both review tools are present) | yes | yes (#945), and active when the owner has configured the cora review tools as an approved MCP server (#946); otherwise absent | n/a | no | one path in code |
 | Model routing for a new session (#586) | yes | no | n/a | no | drift #945 |
 | MCP client servers (`--mcp-server`, the cora preset) | yes (flag, user or project config, and the cora preset when `cora` is on the PATH) | only the OWNER's list (`tole serve` / `tole acp` `--mcp-server` or the user config, read at start-up; a project-config `mcp_server` is refused at start-up; no PATH preset; never a request field), through the same plugin lock and sandbox rules, `optional` sandbox counts as `required` on `serve`; every tool `Write` through the approval gate; a refused server leaves one notice in the session log (#946) | no | no | policy (a trust boundary: the owner names the servers, a client never does; `tole mcp`, `POST /missions` and cron attach none) |
