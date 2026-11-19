@@ -61,12 +61,12 @@ true; the status column says where the work is.
 |---|---|---|---|---|---|
 | Default system prompt (tool discipline, one context line naming the session's workspace; pinned in the header) | yes | yes (#945) | n/a | cron's own | one path |
 | Skill sections and `load_skill` (approved skills only, #591) | yes | no | no | no | drift #945, needs the owner's go |
-| Review guidance (named only when both review tools are present) | yes | yes (#945) | n/a | no | one path |
+| Review guidance (named only when both review tools are present) | yes | wired (#945), but the cora review tools are MCP tools, so it appears only once server sessions get MCP clients (#946) | n/a | no | one path in code; inactive on server faces until #946 |
 | Model routing for a new session (#586) | yes | no | n/a | no | drift #945 |
 | MCP client servers (`--mcp-server`, the cora preset) | yes | no | no | no | drift #946 (a trust boundary; the owner's configured servers only, never the request) |
-| Plan mode | per process flag | per process flag | per process flag | per job (`read_only`) | drift #947 (per session over `serve`) |
-| Fork, tree, compact, name a session | yes | no | n/a | n/a | drift #947 |
-| Mission chaining with a budget | yes | no | n/a | n/a | drift #947 (the verify command stays owner configuration) |
+| Plan mode | per process flag | per process flag, or per session with `POST /sessions {"plan_mode": true}` (`serve` only, #947; ACP keeps the process flag) | per process flag | per job (`read_only`) | one path for `serve` (a request can only turn it on) |
+| Fork, tree, compact, name a session | yes | yes (`serve` only, #947; ACP has none of these routes) | n/a | n/a | one path for `serve` |
+| Mission chaining with a budget | yes | yes (`serve` only, `POST /missions`, #947; a mission is its own session, one at a time, refused under `--plan-mode`) | n/a | n/a | one path for `serve` (the verify command, the budget ceilings and the workspace are owner configuration; a request may only lower a budget) |
 | Every turn through `turn_runner` | yes (#944) | yes | n/a | yes | one path |
 | Tool roster built by `roster_for` and a `FacePolicy` (#943) | yes | yes | yes | yes | one path |
 | The approval gate (`gate::authorize`) | yes | yes | yes | yes | one path |
