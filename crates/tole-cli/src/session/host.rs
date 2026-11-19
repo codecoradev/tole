@@ -384,14 +384,18 @@ pub fn open_session_with(
     // plan mode, never from a child), and publish plans when the
     // transport renders them. delete_file follows the approver: only an
     // interactive one (ACP) gets it.
-    let mut roster = crate::tool_roster::Roster::new(workspace_canon);
-    roster.plan_mode = plan_mode;
-    roster.agents = Some(crate::tool_roster::AgentTools {
-        worktrees: false,
-        parent_allows,
-        // `tole serve` keeps the classic depth-1 agent tools for now.
-        delegation: None,
-    });
+    let mut roster = crate::session::assemble::roster_for(
+        &crate::session::assemble::FacePolicy::SERVER_SESSION,
+        crate::session::assemble::RosterInputs {
+            workspace: workspace_canon,
+            plan_mode,
+            allow_patterns: &parent_allows,
+            agents_worktree: false,
+            delegation: None,
+            mcp_specs: &[],
+        },
+    )
+    .map_err(|e| e.to_string())?;
     roster.plan_emitter = plan_emitter;
     roster.session = Some(session_id.to_string());
     // #217: a job that exits nudges this session at its next safe point.
