@@ -10,7 +10,13 @@
 
 #![allow(dead_code)]
 
+mod hermetic;
 mod test_dir;
+#[allow(unused_imports)]
+pub use hermetic::{
+    apply_hermetic_env, hermetic_command, path_without_sibling_binaries,
+    path_without_sibling_binaries_from,
+};
 #[allow(unused_imports)]
 pub use test_dir::{
     copy_executable, poll_until, wait_exit, wait_for, wait_until, write_executable, ChildGuard,

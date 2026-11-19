@@ -5,6 +5,8 @@
 pub mod approve;
 pub mod curator;
 pub mod drafts;
+#[cfg(feature = "shell-tools")]
+pub mod fetch;
 pub mod outcome;
 pub mod propose;
 pub mod recall;

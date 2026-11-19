@@ -27,7 +27,7 @@ use serde_json::{json, Value};
 use tole_core::storage::{JsonlStorage, Storage};
 use tole_core::subprocess::run_with_timeout;
 use tole_core::tool::ToolRegistry;
-use tole_core::turn::{run_turn_with_images, TurnOutcome};
+use tole_core::turn::TurnOutcome;
 
 /// The completion marker the mission system prompt pins: a final
 /// message containing this line declares the goal fully achieved.
@@ -95,6 +95,10 @@ pub struct MissionConfig {
     pub verify: Option<String>,
     /// Continue an interrupted mission instead of starting a new one.
     pub resume_id: Option<String>,
+    /// The id of a FRESH mission session, when the caller must know it
+    /// before the loop runs (`tole serve` answers with it up front). `None`
+    /// mints one, as the CLI does. Ignored with `resume_id`.
+    pub fresh_id: Option<String>,
     /// Per-run timeout of the `--verify` command (seconds). Default 300
     /// — `cargo test`-class suites are the advertised use.
     pub verify_timeout_secs: u64,
@@ -292,11 +296,58 @@ fn tokens_used(storage: &JsonlStorage) -> u64 {
 /// operator's flags — Destructive stays structurally un-allowable.
 pub fn run_mission(
     cfg: MissionConfig,
-    mut registry: ToolRegistry,
+    registry: ToolRegistry,
     sessions_dir: &std::path::Path,
     // Model routing (#586) of a fresh mission, before its provider exists.
     route: &dyn Fn(&mut dyn tole_core::storage::Storage, &ToolRegistry) -> Result<()>,
 ) -> Result<()> {
+    let done = run_mission_outcome(cfg, registry, sessions_dir, route)?;
+    println!("mission: {}", done.session_id);
+    println!("status: {}", done.status);
+    println!(
+        "turns: {}  steps: {}  verify failures: {}  wall: {}s",
+        done.turns, done.steps, done.verify_failures, done.wall_secs
+    );
+    // Issue #253 (rescan #25): --verify is a CI-style gate — a mission
+    // that did NOT complete successfully must exit NONZERO so scripts
+    // and the agent loop can branch on it. `complete` (and only a
+    // verified completion) exits 0. (CI cora round on #253: the first
+    // cut compared against a nonexistent "done" — every mission,
+    // including successful ones, exited nonzero. Caught by the
+    // mission_e2e suite.)
+    if done.status != "complete" {
+        anyhow::bail!("mission ended with status: {}", done.status);
+    }
+    Ok(())
+}
+
+/// How a mission ended: what [`run_mission_outcome`] hands back instead of
+/// printing and exiting, so a face other than the CLI (`tole serve`) can
+/// report it. `summary` is the `fact/mission` register that was written.
+#[derive(Debug, Clone)]
+// `tokens` and `summary` are read by `tole serve`, which needs `shell-tools`.
+#[cfg_attr(not(feature = "shell-tools"), allow(dead_code))]
+pub struct MissionOutcome {
+    pub session_id: String,
+    pub status: &'static str,
+    pub turns: u64,
+    pub steps: u64,
+    pub tokens: u64,
+    pub verify_failures: u32,
+    pub wall_secs: u64,
+    pub summary: Value,
+}
+
+/// [`run_mission`] without the console report or the nonzero exit: runs the
+/// loop, writes the durable summary and returns how it ended. An `Err` is a
+/// failure before or while writing the session; a mission that merely did
+/// not complete is an `Ok` outcome with its `status`.
+pub fn run_mission_outcome(
+    cfg: MissionConfig,
+    mut registry: ToolRegistry,
+    sessions_dir: &std::path::Path,
+    route: &dyn Fn(&mut dyn tole_core::storage::Storage, &ToolRegistry) -> Result<()>,
+) -> Result<MissionOutcome> {
     let started = std::time::Instant::now();
     let deadline = started + max_minutes_duration(cfg.max_minutes);
     // Resolve provider config BEFORE the session file exists — a config
@@ -314,7 +365,13 @@ pub fn run_mission(
             (storage, id.clone(), None)
         }
         None => {
-            let session_id = tole_cli::session_host::new_session_id("mission");
+            let session_id = match &cfg.fresh_id {
+                Some(id) => {
+                    validate_session_id(id)?;
+                    id.clone()
+                }
+                None => tole_cli::session_host::new_session_id("mission"),
+            };
             // The mission system prompt pins the completion-marker
             // contract and the todo discipline in the session header —
             // resume re-applies it exactly (same as run's pinned prompt).
@@ -371,6 +428,7 @@ pub fn run_mission(
     let system_prompt = storage.system_prompt().map(str::to_owned);
     let mut compactor =
         tole_cli::compaction_host::for_session(cfg.compaction, &provider_cfg, &storage);
+    let turn_cfg = provider_cfg.clone();
     let mut provider = tole_cli::turn_runner::session_provider(
         provider_cfg,
         &storage,
@@ -457,20 +515,19 @@ pub fn run_mission(
         } else {
             &[]
         };
-        let outcome = match run_turn_with_images(
+        let plan = tole_cli::turn_runner::TurnPlan::new(turn_cfg.clone(), &registry, &cfg.cancel);
+        let outcome = match tole_cli::turn_runner::run_turn_with_images(
             &mut storage,
             &mut provider,
-            &registry,
+            &plan,
             &prompt,
             first_images,
-            &cfg.cancel,
-            None,
         ) {
             Ok(o) => o,
             Err(e) => {
                 // Storage-class failure: still summarize (the "either
                 // way" contract), then surface the error.
-                eprintln!("mission: turn storage error: {e}");
+                eprintln!("mission: turn storage error: {}", e.into_message());
                 status = "error";
                 break;
             }
@@ -622,25 +679,18 @@ pub fn run_mission(
             )
             .map_err(|e| anyhow::anyhow!("writing mission summary: {e}"))?;
     }
-    println!("mission: {session_id}");
     // How the mission ended, for the skill curator (#593).
     tole_cli::skill_outcome::record_mission(status);
-    println!("status: {status}");
-    println!(
-        "turns: {turns}  steps: {}  verify failures: {verify_failures}  wall: {wall_secs}s",
-        steps_used(&storage)
-    );
-    // Issue #253 (rescan #25): --verify is a CI-style gate — a mission
-    // that did NOT complete successfully must exit NONZERO so scripts
-    // and the agent loop can branch on it. `complete` (and only a
-    // verified completion) exits 0. (CI cora round on #253: the first
-    // cut compared against a nonexistent "done" — every mission,
-    // including successful ones, exited nonzero. Caught by the
-    // mission_e2e suite.)
-    if status != "complete" {
-        anyhow::bail!("mission ended with status: {status}");
-    }
-    Ok(())
+    Ok(MissionOutcome {
+        session_id,
+        status,
+        turns,
+        steps: steps_used(&storage),
+        tokens: tokens_used(&storage),
+        verify_failures,
+        wall_secs,
+        summary,
+    })
 }
 
 #[cfg(test)]

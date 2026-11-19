@@ -18,7 +18,7 @@ automation and secrets release:
 - **Automation:** `tole cron` (scheduled script and agent jobs, per-job time zones,
   parked approvals resumed from `/approvals`), `tole hook` and `POST /hooks/<route>`
   on `tole serve` (signed webhooks that fire a cron job), outbound signed webhooks
-  (`[webhook_out.<name>]` in the user config: a finished cron run and approval requests
+  (`[webhook_out.<name>]` in the user config: a finished cron run, approval requests and (opt-in) a finished serve turn
   are posted to a receiver such as a chat gateway; `tole webhook test`), `tole route`
   (model routing by task weight), and `tole serve --cron` as the in-process ticker.
 - **Profiles and delegation:** `[profiles.<name>]` personas (`--profile`), the
@@ -48,12 +48,13 @@ automation and secrets release:
 - **Web:** built-in `web_search` and `web_fetch`, with an optional nginjen backend.
 
 The multi-client daemon stays design-only ([docs/daemon-design.md](docs/daemon-design.md));
-the UI-client seam of `tole serve` (transcript pages, SSE events, image upload) is in.
+the UI-client seam of `tole serve` (transcript pages, SSE events, image upload) is in. The desktop client's local and remote use of that API is a design note with open owner decisions ([docs/desktop-design.md](docs/desktop-design.md)).
 Five faces on one durable core: the CLI (run / chat /
 resume / sessions / jobs / **mission**), `tole mcp` (tool server),
 `tole acp` (editor agent), `tole serve` (REST + multi-session
 MCP-over-HTTP daemon), and the inline terminal UI (`tole-tui`, bare
-`tole` on a TTY; MVP stage, [docs/tui.md](docs/tui.md)). Identity (owner-approved): a chat-first
+`tole` on a TTY; MVP stage, [docs/tui.md](docs/tui.md)); what the faces share and the
+few differences that are deliberate are in [docs/faces.md](docs/faces.md). Identity (owner-approved): a chat-first
 personal assistant WITH a mission mode for autonomous work —
 budgeted turn-chaining (`tole mission --max-steps/--max-minutes/
 --max-tokens/--verify`), durable task-list tools (`todo_write`/
@@ -95,9 +96,12 @@ tole is the agent harness of the CodeCora ecosystem — the hands:
   not a security boundary: see the threat model for what it does not see.
   `--trust internal` allows the `mcp_cora_*` tools without prompting. The
   guidance is in the pinned prompt of `run`, `chat`, the TUI and `mission`
-  (#536). `serve`, `acp` and `mcp` sessions serve their own registry and attach
-  no external MCP server (the flag is refused there), so they have no review
-  tools and no review section.
+  (#536). `serve` and `acp` sessions attach only the MCP servers the OWNER names
+  (`--mcp-server` or the user config, read at start-up, through the same plugin
+  lock; a project-config `mcp_server` is refused at start-up and the cora auto-detection never applies, #946),
+  so they carry the review section when the cora review tools are configured;
+  `tole mcp` and `mission` serve their own registry, refuse the flag and have
+  no review tools.
 - **[uteke](https://github.com/codecoradev/uteke)** (`uteke`) — semantic
   memory. `uteke_recall` (recall) and `uteke_document` (markdown → durable
   knowledge) register automatically when the `uteke` binary is on PATH, and
@@ -219,7 +223,7 @@ tole delegation approvals list [--all]      # owner-only (#714): the approval re
 tole delegation approvals show <ID>         # one request in full: who asked, the chain, the call, a redacted input (fenced as data)
 tole delegation approvals allow <ID>        # allow ONE call of ONE request: shows it, then type the id back (--yes skips the typing; --fingerprint <HEX> pins the content)
 tole delegation approvals deny <ID>         # deny it (no answer is a denial too); allow and deny refuse under an agent session
-tole discuss start --question "Q" --criterion "C" --participant coder --participant reviewer --budget 60000 --dry-run  # owner-only multi-round discussion among user-config profiles; the budget is a hard cap, any number of participants is accepted (8 recommended, 16 at most) and the dry run shows the cost for that many; drop --dry-run to run it (also: resume ID, list, show ID)
+tole discuss start --question "Q" --criterion "C" --participant coder --participant reviewer --budget 60000 --dry-run  # owner-only multi-round discussion among user-config profiles; the budget is a hard cap, any number of participants is accepted (8 recommended, 16 at most) and the dry run shows the cost for that many; a question over 2000 characters or a criterion over 400 is refused with an error naming the limit, never cut; drop --dry-run to run it (also: resume ID, list, show ID)
 tole plugin audit [NAME] [--json]           # read-only report: tier, approved vs live manifest hash, grants, sandbox profile, scan findings, last sandbox fallbacks, skills with source and ledger (starts only what `list` would)
 tole plugin list                            # every MCP server with its lock state (approved, changed, unapproved, revoked); also: diff NAME, approve NAME [--hash H], revoke NAME
 tole skills list                            # discovered skills with approval status and hash; approve NAME [--hash H], revoke NAME, drafts list|show|reject|verdict|promote|revoke, index|retire|search
@@ -275,11 +279,11 @@ Not a sandbox: review what it wrote before you run it), `--skill <path>` (load a
 | `TOLE_CONTEXT_WINDOW` | the model's context window in tokens, for context compaction (#440). Without it, tole reads the window from the provider's `/models` (`context_length`, `max_model_len`, ...) once a prompt passes 8k tokens; with neither, compaction stays off. `chat`, `resume` and `mission` compact between turns once a prompt reaches `--compact-at` (default 0.8) of the window: the settled turns before the last one become one durable `compaction` entry (a fenced summary), the session file keeps everything, and `tole status` lists each compaction. `--no-compaction` (or config `no_compaction = true`) turns it off; config keys `context_window`, `compact_at`. **Gateways whose `/models` carries no window** (the fleet gateway lists only `id`, `created`, `owned_by`) never compact on their own: set `TOLE_CONTEXT_WINDOW` (e.g. `200000`); `tole doctor --tier catalog` warns when no window is known. **Overflow recovery:** if the provider rejects a request as larger than its context window (HTTP 400/413/422 `context_length_exceeded`, "maximum context length", ...) the turn ends with the provider's message and `(compaction will run on the next resume)`; the next `resume <id> "<prompt>"` (or the next `chat` message) first forces one compaction pass — whatever the window or threshold — then runs the prompt. Compaction stays between turns, never inside one; `--no-compaction` also disables the recovery pass. The turn that overflowed is kept verbatim, so if it alone exceeds the window, ask for less output per turn |
 | `TOLE_REASONING_EFFORT` | reasoning effort sent as `reasoning_effort` on chat completions (#457): `minimal`, `low`, `medium` or `high`; unset (default) sends nothing, so the request body is unchanged. Also `--effort <level>` (flag > env > config `reasoning_effort` > user config). A session's durable `fact/reasoning_effort` register overrides it, so a session keeps its level on resume. A provider that answers HTTP 400 naming `reasoning_effort` gets ONE retry without it (remembered for the rest of the turn and recorded under `tole_degraded` in the step's usage row); an invalid level is a startup error. `tole config check` shows the effective value and its source |
 | `TOLE_VISION` | `0` declares the model non-vision: image input (`--image`) fails with a model-capability error before any request; `1` declares it vision-capable. Unset = the server decides (a 400/415/422 that names images becomes the same capability error) |
-| `TOLE_SKILL` | skill files to preload (`SKILL.md` paths, separated like `PATH`); same as repeated `--skill`, which replaces it; refused by the server faces like `--skill` |
-| `TOLE_SKILL_APPROVAL` | `required` (default since 2026-11-11, #591) or `off` (every discovered skill loads, the old behaviour; environment only, no config file can set it): a discovered skill loads only when its whole directory hashes to the owner's approval; a session with unapproved skills prints one startup note with the count and the fix, and `tole doctor` shows the same. `--skill <file>` and a profile's `skills` are not gated (you named the file). Approve with `tole skills approve <name>` (`--hash <sha256:…>` to pin the hash you reviewed), check with `tole skills list` (status, hash, approval time), undo with `tole skills revoke <name>`; `tole skills adopt <name>|--all` records in the skill ledger approvals it does not name, and `tole skills recheckpoint` accepts the ledger after the checkpoint in the approvals file caught it deleted, truncated or rewritten (every approval is refused until then). Approvals live in `$CODECORA_HOME/tole/skill-approvals.json`; any change to any file of a skill needs a new approval. An unapproved skill is listed by name only, as unavailable, and `load_skill` refuses it. Anything else fails startup, and so does a malformed approvals file |
+| `TOLE_SKILL` | skill files to preload (`SKILL.md` paths, separated like `PATH`); same as repeated `--skill`, which replaces it; refused by `tole mcp` and `mission` like `--skill` (`serve` and `acp` load skills, #945) |
+| `TOLE_SKILL_APPROVAL` | `required` (default since 2026-11-11, #591) or `off` (every discovered skill loads, the old behaviour; environment only, no config file can set it): a discovered skill loads only when its whole directory hashes to the owner's approval; a session with unapproved skills prints one startup note with the count and the fix, and `tole doctor` shows the same. `--skill <file>` and a profile's `skills` are not gated (you named the file). Approve with `tole skills approve <name>` (`--hash <sha256:…>` to pin the hash you reviewed), check with `tole skills list` (status, hash, approval time), undo with `tole skills revoke <name>`; `tole skills fetch <registry-id> --pinned-sha <sha256>` approves a skill you placed yourself after checking its hash against your pin and uteke's record (terminal only, downloads nothing, #878); `tole skills adopt <name>|--all` records in the skill ledger approvals it does not name, and `tole skills recheckpoint` accepts the ledger after the checkpoint in the approvals file caught it deleted, truncated or rewritten (every approval is refused until then). Approvals live in `$CODECORA_HOME/tole/skill-approvals.json`; any change to any file of a skill needs a new approval. An unapproved skill is listed by name only, as unavailable, and `load_skill` refuses it. Anything else fails startup, and so does a malformed approvals file |
 | `TOLE_MEMORY` | memory loop backend (`uteke`) — same as `--memory uteke` |
 | `TOLE_NO_UPDATE_CHECK` | `1` disables the startup update-check banner (issue #220) |
-| `TOLE_SKILL_INDEX` | which skills a session is shown (#590): `local` (default; every discovered skill is listed, as before) or `uteke` (the pinned core plus the top K recalled by meaning from the `uteke doc` index for the `run` prompt, and the `skill_search` tool; an interactive session gets the pinned core only). With `--profile <name>` only skills scoped to that profile (or unscoped) are recalled. Every query is redacted against the process secrets before it reaches uteke. Index the skills first with `tole skills index`. `uteke` without the binary falls back to `local` with a note; anything else fails startup |
+| `TOLE_SKILL_INDEX` | which skills a session is shown (#590): `local` (default; every discovered skill is listed, as before) or `uteke` (the pinned core plus the top K recalled by meaning from the uteke skill library (`uteke skill search`, uteke >= 0.24.1; an older uteke falls back to `uteke doc` with a note) for the `run` prompt, and the `skill_search` tool; an interactive session gets the pinned core only). With `--profile <name>` only skills scoped to that profile (or unscoped) are recalled. Every query is redacted against the process secrets before it reaches uteke. Index the skills first with `tole skills index`. `uteke` without the binary falls back to `local` with a note; anything else fails startup |
 | `TOLE_SKILLS_PINNED` | comma-separated skill names always listed with `TOLE_SKILL_INDEX=uteke` (at most 5; a name with no local skill is skipped with a note) |
 | `TOLE_SKILL_RECALL_K` | skills recalled by meaning per task, `0` to `10` (default `5`); anything else fails startup |
 | `TOLE_SKILL_FLOOR` | cosine similarity floor for that recall, `0.0` to `1.0` (default `0.35`: a documented starting value, not a calibrated one; check it with `tole skills search` on your own store); fewer or zero skills is fine |
@@ -484,8 +488,10 @@ name is a startup error that lists the defined ones.
   unregistered).
 - **Faces that refuse a flag refuse it from the config too.** `serve`, `acp`,
   `mcp` and `mission` refuse `--on-pretool`/`--on-posttool` (and `--on-turnend`
-  where the flag is refused), `--skill`, `--no-skills`, `--mcp-server` (and
-  `--plan-mode` on `mission`). A value that arrives from the config is refused
+  where the flag is refused); `mcp` and `mission` also refuse `--skill`,
+  `--no-skills` and `--mcp-server` (`serve` and `acp` accept them, #945, #946,
+  but refuse a `skill` or `mcp_server` that comes from the project config at
+  start-up), and `mission` refuses `--plan-mode`. A value that arrives from the config is refused
   with the same message plus `use --no-config to ignore the project config`;
   tole never silently drops a project's safety hook.
 - **Feature-less builds.** In a build without the `mcp` feature, `mcp_server` /

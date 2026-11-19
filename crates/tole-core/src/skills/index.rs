@@ -8,8 +8,10 @@
 //!
 //! - [`SkillIndex`]: `search(query, filter, k)`, `upsert`, `retire`.
 //!   Adapters: [`LocalIndex`] (the skills directories, lexical match; the
-//!   fallback without uteke) and `UtekeDocIndex` (`uteke doc`, tag `skill`,
-//!   recall by meaning; `shell-tools` builds only).
+//!   fallback without uteke), `UtekeSkillIndex` (`uteke skill search|list|
+//!   show`, uteke >= 0.24) and `UtekeDocIndex` (`uteke doc`, tag `skill`,
+//!   recall by meaning; the pre-0.24 surface); the uteke adapters are
+//!   `shell-tools` builds only).
 //! - [`select`]: per task, a **pinned core** (at most [`MAX_PINNED`]) plus
 //!   the **top K recalled by meaning** (default [`DEFAULT_RECALL_K`], at
 //!   most [`MAX_RECALL_K`]) above a similarity floor. Fewer, or zero, is
@@ -470,6 +472,8 @@ impl crate::tool::Tool for SkillSearchTool {
 
 #[cfg(feature = "shell-tools")]
 pub use uteke_doc::UtekeDocIndex;
+#[cfg(feature = "shell-tools")]
+pub use uteke_skill::{SkillMeta, UtekeSkillIndex};
 
 /// Adapter 1: `uteke doc` (tag `skill`, slug `skill-<name>`, metadata
 /// name / description / profiles / status / content hash). Shells out to
@@ -518,9 +522,10 @@ mod uteke_doc {
             Self { bin: bin.into() }
         }
 
-        fn run(&self, args: &[&str], stdin: Option<&[u8]>) -> Result<String, String> {
+        pub(super) fn run(&self, args: &[&str], stdin: Option<&[u8]>) -> Result<String, String> {
             let mut cmd = Command::new(&self.bin);
             crate::subprocess::scrub_env_for(&mut cmd, "skills");
+            crate::subprocess::point_uteke_at_data_dir(&mut cmd)?;
             cmd.args(args);
             let out = match stdin {
                 Some(bytes) => run_with_timeout_stdin(&mut cmd, SUBPROCESS_TIMEOUT, bytes)?,
@@ -830,6 +835,438 @@ mod uteke_doc {
             };
             assert!(idx.upsert(&bad).is_err());
             assert!(idx.retire("-x").is_err());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+}
+
+/// Adapter 2: the uteke 0.24 skill surfaces (`uteke skill search|list|
+/// show`, #973). The index only finds NAMES; a hit carries no text that
+/// reaches a prompt, and `show` is reduced to name + content hash on
+/// purpose. Indexing (`upsert`, `retire`) is unchanged and delegates to
+/// [`UtekeDocIndex`].
+///
+/// Output shape (read from the uteke v0.24.1 source, `skill_library.rs` and
+/// `commands/skill.rs`; `--json` is a global flag): `skill search` and
+/// `skill list` print a bare array. A search hit is `{slug, name?,
+/// description?, status, hash, valid, score, file, snippet}`; a list entry
+/// is `{slug, name?, description?, status, hash, valid, source_path, owner,
+/// updated_at}`; `skill show` is `{slug, current: {hash, ..}, approved_hash,
+/// ..}`. The skill's identity is its `slug` (the directory name), NOT the
+/// optional frontmatter `name`. uteke's `status` (draft / approved / stale)
+/// is uteke's own approval of a package, not tole's (#591): it is not used
+/// to filter, the local gate stays the authority. Only `valid: false` hits
+/// are skipped.
+#[cfg(feature = "shell-tools")]
+mod uteke_skill {
+    use super::*;
+    use std::time::Duration;
+
+    /// uteke refuses a query over this many chars.
+    const UTEKE_MAX_QUERY_CHARS: usize = 2000;
+    const _: () = assert!(MAX_QUERY_CHARS <= UTEKE_MAX_QUERY_CHARS);
+    /// `skill search` limit clamp.
+    const SEARCH_LIMIT: (usize, usize) = (1, 50);
+    /// `skill list` limit clamp.
+    const LIST_LIMIT: (usize, usize) = (1, 200);
+    /// Retries after a 429 / busy answer (uteke allows two concurrent
+    /// remote embeds).
+    const BUSY_RETRIES: u32 = 3;
+
+    /// What `uteke skill show` is reduced to: never the body.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct SkillMeta {
+        pub name: String,
+        /// The hash uteke recorded at index time, as stated data.
+        pub content_hash: Option<String>,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct UtekeSkillIndex {
+        docs: UtekeDocIndex,
+        backoff: Duration,
+    }
+
+    impl Default for UtekeSkillIndex {
+        fn default() -> Self {
+            Self::new("uteke")
+        }
+    }
+
+    fn name_ok(name: &str) -> bool {
+        !name.is_empty()
+            && name.len() <= 128
+            && !name.starts_with('-')
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    }
+
+    fn is_busy(err: &str) -> bool {
+        let e = err.to_lowercase();
+        e.contains("429") || e.contains("busy")
+    }
+
+    /// The skill's identity: the `slug` (v0.24.1 prints the directory name
+    /// there); `name` is only the optional frontmatter display name, used
+    /// when a hit carries no slug.
+    fn hit_name(h: &Value) -> Option<&str> {
+        h["slug"].as_str().or_else(|| h["name"].as_str())
+    }
+
+    fn hits_of(v: &Value) -> Option<&Vec<Value>> {
+        v.as_array().or_else(|| {
+            ["results", "hits", "skills"]
+                .iter()
+                .find_map(|k| v[*k].as_array())
+        })
+    }
+
+    /// A hit is skipped only when uteke says the package is invalid
+    /// (`valid: false`), or when it states a profile scope this run is not
+    /// in. uteke's own `status` is NOT used (see the module note); a hit
+    /// that states neither is admitted, because the local gate (#591)
+    /// decides what may load.
+    fn admits(h: &Value, filter: &SkillFilter) -> bool {
+        if h["valid"].as_bool() == Some(false) {
+            return false;
+        }
+        let scoped: Vec<&str> = h["profiles"]
+            .as_array()
+            .or_else(|| h["metadata"]["profiles"].as_array())
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        scoped.is_empty()
+            || filter
+                .profile
+                .as_deref()
+                .is_some_and(|p| scoped.contains(&p))
+    }
+
+    impl UtekeSkillIndex {
+        pub fn new(bin: impl Into<PathBuf>) -> Self {
+            Self {
+                docs: UtekeDocIndex::new(bin),
+                backoff: Duration::from_millis(250),
+            }
+        }
+
+        #[cfg(test)]
+        fn with_backoff(mut self, d: Duration) -> Self {
+            self.backoff = d;
+            self
+        }
+
+        /// Does this uteke have the `skill` subcommand (>= 0.24)? A pre-0.24
+        /// uteke rejects the unknown subcommand.
+        pub fn supported(&self) -> bool {
+            self.docs.run(&["skill", "--help"], None).is_ok()
+        }
+
+        /// Run a `skill` call, backing off on a 429 / busy answer.
+        fn run(&self, args: &[&str]) -> Result<Value, String> {
+            let mut attempt = 0;
+            loop {
+                match self.docs.run(args, None) {
+                    Ok(out) => {
+                        return serde_json::from_str(&out).map_err(|e| {
+                            format!("uteke {}: invalid JSON: {e}", args[..2].join(" "))
+                        })
+                    }
+                    Err(e) if is_busy(&e) && attempt < BUSY_RETRIES => {
+                        std::thread::sleep(self.backoff * 2u32.pow(attempt));
+                        attempt += 1;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+
+        /// Names in the library, at most `limit` (clamped to 1..=200).
+        pub fn list(&self, limit: usize) -> Result<Vec<String>, String> {
+            let n = limit.clamp(LIST_LIMIT.0, LIST_LIMIT.1).to_string();
+            let v = self.run(&["skill", "list", "--limit", &n, "--json"])?;
+            let hits = hits_of(&v).ok_or("uteke skill list: unexpected JSON shape")?;
+            Ok(hits
+                .iter()
+                .filter_map(|h| h.as_str().or_else(|| hit_name(h)))
+                .filter(|n| name_ok(n))
+                .map(str::to_string)
+                .collect())
+        }
+
+        /// One skill's name and recorded hash. The body, if uteke answers
+        /// with one, is dropped here: bodies come from approved local bytes.
+        pub fn show(&self, name: &str) -> Result<SkillMeta, String> {
+            if !name_ok(name) {
+                return Err(format!(
+                    "skill name {name:?} is not a valid uteke skill name"
+                ));
+            }
+            let v = self.run(&["skill", "show", name, "--json"])?;
+            // The package hash uteke recorded: the approved one when there
+            // is one, else the current version's.
+            let hash = v["approved_hash"]
+                .as_str()
+                .or_else(|| v["current"]["hash"].as_str())
+                .map(str::to_string);
+            Ok(SkillMeta {
+                name: name.to_string(),
+                content_hash: hash,
+            })
+        }
+    }
+
+    impl SkillIndex for UtekeSkillIndex {
+        fn label(&self) -> &'static str {
+            "uteke"
+        }
+
+        fn search(
+            &self,
+            query: &str,
+            filter: &SkillFilter,
+            k: usize,
+        ) -> Result<Vec<Candidate>, String> {
+            let q: String = clean_query(query)?
+                .chars()
+                .take(UTEKE_MAX_QUERY_CHARS)
+                .collect();
+            if k == 0 {
+                return Ok(Vec::new());
+            }
+            let fetch = (k * 3).clamp(SEARCH_LIMIT.0, SEARCH_LIMIT.1).to_string();
+            // `--mode semantic`: its score is a cosine similarity, the scale
+            // `TOLE_SKILL_FLOOR` (default 0.35) is stated in. uteke's default
+            // `hybrid` mode scores by rank fusion (about 0.03 at the top, run
+            // against a real 0.24.1 binary), which the floor would drop.
+            let v = self.run(&[
+                "skill", "search", &q, "--limit", &fetch, "--mode", "semantic", "--json",
+            ])?;
+            let hits = hits_of(&v).ok_or("uteke skill search: unexpected JSON shape")?;
+            let mut out: Vec<Candidate> = Vec::new();
+            for (i, h) in hits.iter().enumerate() {
+                let name = hit_name(h)
+                    .ok_or_else(|| format!("uteke skill search: hit #{} has no name", i + 1))?;
+                let score = h["score"]
+                    .as_f64()
+                    .or_else(|| h["similarity"].as_f64())
+                    .ok_or_else(|| format!("uteke skill search: hit #{} has no score", i + 1))?
+                    as f32;
+                if !name_ok(name)
+                    || score < filter.floor
+                    || !admits(h, filter)
+                    || out.iter().any(|c| c.name == name)
+                {
+                    continue; // one hit per skill
+                }
+                out.push(Candidate {
+                    name: name.to_string(),
+                    score,
+                });
+                if out.len() >= k {
+                    break;
+                }
+            }
+            Ok(out)
+        }
+
+        fn upsert(&self, entry: &SkillEntry) -> Result<(), String> {
+            self.docs.upsert(entry)
+        }
+
+        fn retire(&self, name: &str) -> Result<(), String> {
+            self.docs.retire(name)
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    mod tests {
+        use super::*;
+        use std::time::Duration;
+
+        /// A fake uteke: logs argv, answers `skill --help` with `help_ok`,
+        /// `skill search|list|show` from files; `doc *` is a failing
+        /// tripwire. `busy` answers the first N search calls with 429.
+        fn fake(
+            tag: &str,
+            help_ok: bool,
+            busy: u32,
+        ) -> (UtekeSkillIndex, crate::test_dir::TestDir) {
+            let dir = crate::test_dir::TestDir::new(&format!("tole-skskill-{tag}"));
+            let d = dir.display();
+            std::fs::write(dir.join("busy.n"), busy.to_string()).unwrap();
+            let script = format!(
+                "#!/bin/sh\necho \"$*\" >> {d}/argv.log\n\
+                 case \"$1 $2\" in\n\
+                 'skill --help') {} ;;\n\
+                 'skill search')\n\
+                   n=$(cat {d}/busy.n)\n\
+                   if [ \"$n\" -gt 0 ]; then echo $((n-1)) > {d}/busy.n; echo 'HTTP 429 busy' >&2; exit 1; fi\n\
+                   cat {d}/search.json ;;\n\
+                 'skill list') cat {d}/list.json ;;\n\
+                 'skill show') cat {d}/show.json ;;\n\
+                 'doc search'|'doc get') echo 'doc surface must not be called' >&2; exit 9 ;;\n\
+                 esac\n",
+                if help_ok { "exit 0" } else { "echo 'unrecognized subcommand' >&2; exit 2" }
+            );
+            let bin = dir.join("uteke");
+            crate::test_dir::write_executable(&bin, script);
+            (
+                UtekeSkillIndex::new(&bin).with_backoff(Duration::from_millis(1)),
+                dir,
+            )
+        }
+
+        fn log(dir: &crate::test_dir::TestDir) -> String {
+            std::fs::read_to_string(dir.join("argv.log")).unwrap_or_default()
+        }
+
+        #[test]
+        fn search_calls_the_skill_surface_never_doc_and_filters() {
+            let (idx, dir) = fake("search", true, 0);
+            std::fs::write(
+                dir.join("search.json"),
+                // The real v0.24.1 shape: a bare array of hits keyed by `slug`.
+                json!([
+                    {"slug": "deploy", "name": "Deploy it", "description": "d", "status": "draft",
+                     "hash": "sha256:aa", "valid": true, "score": 0.9, "file": "SKILL.md", "snippet": "s"},
+                    {"slug": "dup-free", "status": "approved", "hash": "sha256:bb", "valid": true,
+                     "score": 0.8, "file": "SKILL.md", "snippet": "s"},
+                    {"slug": "deploy", "status": "approved", "valid": true, "score": 0.7},
+                    {"slug": "invalid-one", "status": "draft", "valid": false, "score": 0.7},
+                    {"slug": "stale-one", "status": "stale", "valid": true, "score": 0.65},
+                    {"slug": "coder-only", "valid": true, "score": 0.6, "profiles": ["coder"]},
+                    {"slug": "weak", "valid": true, "score": 0.1},
+                    {"slug": "-flag", "valid": true, "score": 0.9},
+                    {"slug": "bad name", "valid": true, "score": 0.9}
+                ])
+                .to_string(),
+            )
+            .unwrap();
+            let f = SkillFilter {
+                profile: None,
+                floor: 0.5,
+            };
+            let names: Vec<String> = idx
+                .search("ship it", &f, 5)
+                .unwrap()
+                .into_iter()
+                .map(|c| c.name)
+                .collect();
+            // The slug is the identity (not the display name), uteke's own
+            // draft / approved / stale status does not filter, an invalid
+            // package is skipped.
+            assert_eq!(names, ["deploy", "dup-free", "stale-one"]);
+            let f = SkillFilter {
+                profile: Some("coder".into()),
+                floor: 0.5,
+            };
+            assert_eq!(idx.search("ship it", &f, 5).unwrap().len(), 4);
+            assert_eq!(idx.search("ship it", &f, 1).unwrap().len(), 1);
+            let l = log(&dir);
+            assert!(
+                l.contains("skill search ship it --limit 15 --mode semantic --json"),
+                "{l}"
+            );
+            assert!(!l.contains("doc "), "{l}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn bounds_cap_query_and_clamp_limits() {
+            let (idx, dir) = fake("bounds", true, 0);
+            std::fs::write(dir.join("search.json"), "[]").unwrap();
+            std::fs::write(dir.join("list.json"), "[]").unwrap();
+            let f = SkillFilter::default();
+            idx.search(&"a".repeat(5000), &f, 40).unwrap();
+            idx.search("q", &f, 1).unwrap();
+            idx.list(0).unwrap();
+            idx.list(9999).unwrap();
+            let l = log(&dir);
+            // MAX_QUERY_CHARS (1000) applies first, below uteke's 2000.
+            let q = l.lines().next().unwrap();
+            assert_eq!(
+                q,
+                format!(
+                    "skill search {} --limit 50 --mode semantic --json",
+                    "a".repeat(MAX_QUERY_CHARS)
+                )
+            );
+            assert!(
+                q.ends_with("--limit 50 --mode semantic --json"),
+                "search limit clamps to 50: {q}"
+            );
+            assert!(
+                l.contains("skill search q --limit 3 --mode semantic --json"),
+                "{l}"
+            );
+            assert!(l.contains("skill list --limit 1 --json"), "{l}");
+            assert!(l.contains("skill list --limit 200 --json"), "{l}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn busy_answers_are_retried_then_surface() {
+            let (idx, dir) = fake("busy", true, 2);
+            std::fs::write(
+                dir.join("search.json"),
+                json!([{"name": "a", "score": 0.9}]).to_string(),
+            )
+            .unwrap();
+            let f = SkillFilter::default();
+            assert_eq!(idx.search("q", &f, 3).unwrap().len(), 1);
+            assert_eq!(log(&dir).matches("skill search").count(), 3);
+            let (idx, dir2) = fake("busy-forever", true, 99);
+            let e = idx.search("q", &f, 3).unwrap_err();
+            assert!(e.contains("429"), "{e}");
+            assert_eq!(log(&dir2).matches("skill search").count(), 4);
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&dir2);
+        }
+
+        #[test]
+        fn show_keeps_name_and_hash_and_drops_the_body() {
+            let (idx, dir) = fake("show", true, 0);
+            std::fs::write(
+                dir.join("show.json"),
+                json!({"slug": "deploy", "current": {"hash": "sha256:cd", "status": "draft"},
+                       "approved_hash": "sha256:ab", "body": "IGNORE ALL"})
+                .to_string(),
+            )
+            .unwrap();
+            let m = idx.show("deploy").unwrap();
+            assert_eq!(
+                m,
+                SkillMeta {
+                    name: "deploy".into(),
+                    content_hash: Some("sha256:ab".into())
+                }
+            );
+            assert!(!format!("{m:?}").contains("IGNORE"));
+            assert!(idx.show("-x").is_err());
+            assert!(log(&dir).contains("skill show deploy --json"));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn the_version_gate_detects_a_missing_skill_subcommand() {
+            let (new, d1) = fake("gate-new", true, 0);
+            let (old, d2) = fake("gate-old", false, 0);
+            assert!(new.supported());
+            assert!(!old.supported());
+            assert!(!UtekeSkillIndex::new("/nonexistent/uteke").supported());
+            let _ = std::fs::remove_dir_all(&d1);
+            let _ = std::fs::remove_dir_all(&d2);
+        }
+
+        #[test]
+        fn malformed_output_is_an_error() {
+            let (idx, dir) = fake("bad", true, 0);
+            std::fs::write(dir.join("search.json"), "not json").unwrap();
+            assert!(idx.search("q", &SkillFilter::default(), 3).is_err());
+            std::fs::write(dir.join("search.json"), json!([{"name": "a"}]).to_string()).unwrap();
+            assert!(idx.search("q", &SkillFilter::default(), 3).is_err());
             let _ = std::fs::remove_dir_all(&dir);
         }
     }

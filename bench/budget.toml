@@ -1,0 +1,69 @@
+# Perf budget (#921). One table per platform, one sub-table per metric.
+#
+#   baseline  what run 1 measured (kept for the record; the gate ignores it)
+#   ceiling   the gate: a measured value above it fails the build
+#
+# Ceiling = baseline x headroom, rounded up. Headroom is NOT aspirational: it
+# only absorbs run-to-run noise, so a failure means a real regression.
+# Ceilings only move DOWN (see README.md, "Ratchet"); a PR that raises one
+# is rejected by the `Perf budget ratchet` job unless a maintainer labels it
+# `perf-budget-raise`.
+#
+# Measured by bench/run.py against the release `tole` and a local mock
+# provider (no network, no secrets). Metric definitions are in that file.
+
+# --- x86_64 Linux (baseline: 2026-11-19, a 4-vCPU LOCAL CONTAINER shared with
+# --- parallel builds, NOT the hosted runner; release profile, tole 0.11.0.
+# --- Re-baselining from the first develop CI runs is a follow-up.)
+
+[x86_64-linux.cold_start_ms]
+# Wall time of `tole --version`, median of 15 spawns, page cache warm.
+# Process spawn is scheduler-bound and the noisiest figure on a shared CI
+# runner, so it gets the widest headroom (x4).
+baseline = 3.4
+ceiling = 14
+
+[x86_64-linux.idle_rss_mb]
+# VmRSS of `tole serve` after /health answers and 1 s of idleness. The
+# "lightweight" claim a user can quote. RSS is stable to ~1%, so headroom is
+# small (x1.3).
+baseline = 15.5
+ceiling = 20
+
+[x86_64-linux.active_rss_mb]
+# Peak RSS (the child's /proc VmHWM) of one `tole run` doing 30 provider round-trips,
+# each a read_file tool call. Catches a transcript or buffer that grows with
+# the session. Stable (20.7 MB across 5 runs), headroom x1.3. The first
+# draft of this file carried 27.9 here: that was the harness's own RSS leaking
+# through wait4 ru_maxrss, not tole's; corrected before merge (see README).
+baseline = 20.7
+ceiling = 27
+
+[x86_64-linux.per_turn_ms]
+# Slope of `tole run` wall time over provider round-trips (30 vs 2), zero
+# latency mock. One round-trip is request build, parse, a tool call and a
+# durable JSONL commit. Run 1 spread 4.1-10.1 ms on a busy container, so
+# headroom is x4.
+baseline = 4.4
+ceiling = 18
+
+# --- aarch64 Linux (baseline: PR #983 CI on the hosted ubuntu-24.04-arm runner,
+# --- 4 vCPU; same headroom factors and metric definitions as above)
+
+[aarch64-linux.cold_start_ms]
+baseline = 2.6
+ceiling = 11
+
+[aarch64-linux.idle_rss_mb]
+baseline = 11.8
+ceiling = 16
+
+[aarch64-linux.active_rss_mb]
+# Baseline from this PR's CI after the VmHWM fix (16.5 MB; the first draft
+# measured the harness's RSS here). Headroom x1.3.
+baseline = 16.5
+ceiling = 22
+
+[aarch64-linux.per_turn_ms]
+baseline = 3.3
+ceiling = 14

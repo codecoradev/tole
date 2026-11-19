@@ -401,3 +401,18 @@ fn a_summary_knows_its_round_and_only_a_digest_can_be_empty_of_news() {
     assert!(m[1].1.contains("<<<BEGIN PREVIOUS ROUND") && m[1].1.contains("[4 / ops] keep SQLite"));
     assert!(id_ok("a-1") && !id_ok("") && !id_ok("-a") && !id_ok("A") && !id_ok(&"a".repeat(49)));
 }
+
+#[test]
+fn an_over_long_question_or_criterion_is_refused_not_truncated() {
+    let ok =
+        |q: &str, c: &str| Contract::new("x", q, &strs(&[c]), &strs(&["a"]), 1, None, &secrets());
+    let at_limit = "q".repeat(MAX_QUESTION_CHARS);
+    assert_eq!(ok(&at_limit, "c").unwrap().question, at_limit);
+    let long = "q".repeat(5148);
+    let e = ok(&long, "c").unwrap_err();
+    assert!(e.contains("5148") && e.contains("2000"), "{e}");
+    let at_limit = "c".repeat(MAX_CRITERION_CHARS);
+    assert_eq!(ok("q", &at_limit).unwrap().criteria[0], at_limit);
+    let e = ok("q", &"c".repeat(837)).unwrap_err();
+    assert!(e.contains("837") && e.contains("400"), "{e}");
+}

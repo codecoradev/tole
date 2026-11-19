@@ -44,11 +44,15 @@ use std::time::{Duration, Instant};
 
 use tole_cli::serve_support::profiles::{self, ProfileSource, SessionProfile};
 use tole_cli::session_host::{
-    lock_sessions, open_session_with, run_session_turn_detailed, SessionOverrides, Sessions,
+    lock_sessions, open_session_with, run_session_turn_with_end, SessionOverrides, Sessions,
     SharedSessions,
 };
 use tole_core::memory::MemoryConfig;
 use tole_core::storage::Storage;
+
+pub mod missions;
+mod models;
+pub mod past_sessions;
 
 pub struct ServeConfig {
     pub bind: String,
@@ -69,6 +73,9 @@ pub struct ServeConfig {
     /// Where per-session profiles come from and what the command line
     /// permits (#740).
     pub profiles: ProfileSource,
+    /// What the owner configured for `POST /missions` (#947): the verify
+    /// command, its timeout and the budget ceilings. Never a request field.
+    pub mission: missions::MissionSettings,
 }
 
 /// Max concurrently open connections: each pinned thread holds ~8 KiB
@@ -112,6 +119,44 @@ struct State {
     /// verdict redoes the audit and the resume instead of being told it is a
     /// repeat.
     audit_pending: Mutex<std::collections::BTreeSet<String>>,
+    /// Owner configuration of `POST /missions` (#947).
+    mission: missions::MissionSettings,
+    /// The missions this process started (one runs at a time).
+    missions: Arc<missions::Missions>,
+    /// What a client may pick for `GET /models` (#574): the owner's list.
+    models: models::ModelCatalog,
+    /// The `turn_finished` webhook callback (#962), set once at start-up when a
+    /// destination lists the event. Empty, no turn path does anything extra.
+    turn_events: std::sync::OnceLock<tole_cli::webhook_out::turn::TurnNotifier>,
+}
+
+/// Announces a settled turn of a `tole serve` session to the destinations that
+/// list `turn_finished` (#962, provisional D5: serve sessions only). `end` is the
+/// typed end built in the session host, with no text in it. The approval id of an
+/// `approval_pending` end is read from the queue entry this turn queued, never
+/// from the outcome. Never blocks beyond a queue push and never fails the turn.
+fn announce_turn(
+    notifier: Option<&tole_cli::webhook_out::turn::TurnNotifier>,
+    approvals: &tole_cli::approvals::ApprovalQueue,
+    session_id: &str,
+    end: Option<tole_cli::webhook_out::turn::TurnEnd>,
+    approval_tool: Option<&str>,
+    queue_mark: Option<u64>,
+) {
+    let (Some(notify), Some(end)) = (notifier, end) else {
+        return;
+    };
+    let approval_id = approval_tool
+        .zip(queue_mark)
+        .and_then(|(tool, mark)| approvals.queued_since(session_id, tool, mark))
+        .filter(|e| e.status == tole_cli::approvals::ApprovalStatus::Pending)
+        .map(|e| e.id);
+    let signal = tole_cli::webhook_out::turn::TurnSignal {
+        session_id: session_id.to_string(),
+        end,
+        approval_id,
+    };
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| notify(signal)));
 }
 
 /// Read/write ceilings per connection: a client that opens a socket and
@@ -183,6 +228,10 @@ pub fn run_serve(cfg: ServeConfig) -> Result<()> {
         hooks,
         hook_dir,
         audit_pending: Mutex::default(),
+        mission: cfg.mission.clone(),
+        missions: Arc::default(),
+        models: models::ModelCatalog::from_env(),
+        turn_events: std::sync::OnceLock::new(),
     });
     if !state.hooks.is_empty() {
         let names: Vec<&str> = state.hooks.keys().map(String::as_str).collect();
@@ -206,10 +255,16 @@ pub fn run_serve(cfg: ServeConfig) -> Result<()> {
     // Approval events (#911): when a destination lists them, the approval queue
     // tells a sender thread about each request and each resolution, and a timer
     // expires what nobody answers. Absent, the approval paths are unchanged.
-    tole_cli::webhook_out::approval_sender::spawn(
+    // The same sender also carries `turn_finished` (#962); its notifier is kept
+    // for the turn routes.
+    if let Some(turns) = tole_cli::webhook_out::approval_sender::spawn(
         Arc::clone(&webhook_out),
         Arc::clone(&state.approvals),
-    );
+    )
+    .turns
+    {
+        let _ = state.turn_events.set(turns);
+    }
     if cfg.cron {
         let dir = tole_cli::cron::default_dir()?;
         eprintln!("tole serve: cron ticker on {}", dir.display());
@@ -1127,6 +1182,7 @@ fn open_serve_session(
     loading: bool,
     profile: Option<&SessionProfile>,
     record_profile: bool,
+    plan_mode: bool,
 ) -> Result<(), (u16, serde_json::Value)> {
     // Issue #200: non-preauthorized Writes queue for a remote
     // decision (deny now, resumable; allow = one-shot replay).
@@ -1159,7 +1215,9 @@ fn open_serve_session(
         session_id,
         cwd,
         loading,
-        state.plan_mode,
+        // A request can only turn plan mode ON for its session; a
+        // process-level plan mode (`--plan-mode`) is never switched off.
+        state.plan_mode || plan_mode,
         approver,
         memory,
         state.sessions_dir.as_deref(),
@@ -1204,11 +1262,21 @@ fn open_serve_session(
             {
                 return Err((503, json!({"error": "all sessions busy — at capacity"})));
             }
+            warm_status(state, session_id);
             Ok(())
         }
         // Another process (a TUI, a second serve) holds the writer lock.
         Err(e) if e.contains("open for writing") => Err((409, json!({"error": e}))),
         Err(e) => Err((500, json!({"error": e}))),
+    }
+}
+
+/// Look up a session's context window off the request path (#573): the
+/// provider's `/models` may be slow and the status route never waits for it.
+fn warm_status(state: &State, id: &str) {
+    let st = lock_sessions(&state.sessions).get(id).cloned();
+    if let Some(st) = st {
+        std::thread::spawn(move || st.warm_status());
     }
 }
 
@@ -1318,7 +1386,7 @@ fn resume_session(
     let record = profile
         .as_ref()
         .is_some_and(|p| recorded != Ok(profiles::Recorded::Name(p.name.clone())));
-    match open_serve_session(state, id, cwd, true, profile.as_ref(), record) {
+    match open_serve_session(state, id, cwd, true, profile.as_ref(), record, false) {
         Ok(()) => {
             let mut out = json!({
                 "sessionId": id, "workspace": cwd, "resumed": true, "alreadyLive": false
@@ -1499,6 +1567,7 @@ fn hook_action(
 fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_json::Value) {
     match (method, path) {
         ("GET", "/health") => (200, json!({"status": "ok"})),
+        ("GET", "/models") => models::list_route(state),
         ("GET", "/sessions") => {
             let sessions = lock_sessions(&state.sessions);
             let list: Vec<_> = sessions
@@ -1515,6 +1584,28 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                 })
                 .collect();
             (200, json!({"sessions": list}))
+        }
+        ("GET", p) if p == "/sessions/index" || p.starts_with("/sessions/index?") => {
+            // Past sessions of this workspace (#572); the route is before
+            // `/sessions/{id}` so `index` is never read as an id.
+            let query = p.split_once('?').map_or("", |(_, q)| q);
+            let dir = match &state.sessions_dir {
+                Some(d) => d.clone(),
+                None => state.workspace_root.join(".tole/sessions"),
+            };
+            let live = |id: &str| {
+                lock_sessions(&state.sessions)
+                    .get(id)
+                    .map(|st| *st.busy.lock().expect("busy lock"))
+            };
+            past_sessions::list(
+                &state.workspace_root,
+                &dir,
+                state.sessions_dir.is_none(),
+                query,
+                past_sessions::LIMITS,
+                &live,
+            )
         }
         ("POST", "/sessions") => {
             let Ok(req) = serde_json::from_str::<serde_json::Value>(body) else {
@@ -1542,6 +1633,14 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                     )
                 }
             };
+            // Plan mode (#947): the same registry filter as `--plan-mode`
+            // (mutation tools absent). A request may turn it on for this
+            // session; there is no way to turn a process-level one off.
+            let plan_mode = match req.get("plan_mode") {
+                None | Some(serde_json::Value::Null) => false,
+                Some(serde_json::Value::Bool(b)) => *b,
+                Some(_) => return (400, json!({"error": "plan_mode must be a boolean"})),
+            };
             let requested = match req.get("cwd").and_then(|v| v.as_str()) {
                 Some(c) => c.to_string(),
                 None => state.workspace_root.to_string_lossy().into_owned(),
@@ -1562,7 +1661,14 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
             match req.get("resume") {
                 None | Some(serde_json::Value::Null) => {}
                 Some(serde_json::Value::String(id)) => {
-                    return resume_session(state, id, cwd, profile)
+                    if plan_mode {
+                        return (
+                            400,
+                            json!({"error": "plan_mode applies when a session is created, not \
+                                    when one is resumed"}),
+                        );
+                    }
+                    return resume_session(state, id, cwd, profile);
                 }
                 Some(_) => return (400, json!({"error": "resume must be a session id string"})),
             }
@@ -1574,9 +1680,20 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                 return (503, json!({"error": "all sessions busy — at capacity"}));
             }
             let session_id = tole_cli::session_host::new_session_id("srv");
-            match open_serve_session(state, &session_id, cwd, false, profile.as_ref(), true) {
+            match open_serve_session(
+                state,
+                &session_id,
+                cwd,
+                false,
+                profile.as_ref(),
+                true,
+                plan_mode,
+            ) {
                 Ok(()) => {
                     let mut out = json!({"sessionId": session_id, "workspace": cwd});
+                    if plan_mode || state.plan_mode {
+                        out["planMode"] = json!(true);
+                    }
                     if let Some(p) = &profile {
                         out["profile"] = json!(p.name);
                     }
@@ -1584,6 +1701,15 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                 }
                 Err(resp) => resp,
             }
+        }
+        // Missions (#947): a mission is its own session, run on a thread.
+        ("POST", "/missions") => missions::start(state, body),
+        ("GET", p) if p.starts_with("/missions/") && !p["/missions/".len()..].contains('/') => {
+            missions::status(state, &p["/missions/".len()..])
+        }
+        ("POST", p) if p.starts_with("/missions/") && p.ends_with("/cancel") => {
+            let id = &p["/missions/".len()..p.len() - "/cancel".len()];
+            missions::cancel(state, id)
         }
         // Cron run results (#579, design §9): the pull delivery target.
         ("GET", p) if p == "/cron/runs" || p.starts_with("/cron/runs?") => {
@@ -1749,11 +1875,37 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                 // (#581): it resumes through the cron ledger instead.
                 let serve_session = lock_sessions(&state.sessions).get(&sid).is_some();
                 let queue = Arc::clone(&state.approvals);
+                let turn_notifier = state.turn_events.get().cloned();
                 std::thread::spawn(move || {
                     if serve_session {
-                        if let Err(e) = tole_cli::session_host::resume_session_turn(sessions, &sid)
-                        {
-                            eprintln!("tole serve: approval resume failed: {e}");
+                        match tole_cli::session_host::resume_session_turn_with_end(
+                            Arc::clone(&sessions),
+                            &sid,
+                            Some(&queue),
+                        ) {
+                            Ok(r) => announce_turn(
+                                turn_notifier.as_ref(),
+                                &queue,
+                                &sid,
+                                r.turn_end,
+                                r.approval_tool.as_deref(),
+                                r.queue_mark,
+                            ),
+                            Err(e) => {
+                                eprintln!("tole serve: approval resume failed: {}", e.message);
+                                announce_turn(
+                                    turn_notifier.as_ref(),
+                                    &queue,
+                                    &sid,
+                                    e.end,
+                                    None,
+                                    None,
+                                );
+                            }
+                        }
+                        let st = lock_sessions(&sessions).get(&sid).cloned();
+                        if let Some(st) = st {
+                            st.warm_status();
                         }
                         return;
                     }
@@ -1791,36 +1943,48 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                     // blocking status on it would pin the endpoint (and
                     // the map) for the entire turn (CodeCora scan
                     // 2026-09-28). try_lock keeps this non-blocking.
-                    let (busy, entries, report) = {
+                    let (busy, entries, report, snapshot, stale) = {
                         let sessions = lock_sessions(&state.sessions);
                         let Some(st) = sessions.get(id) else {
                             return (404, json!({"error": "unknown session"}));
                         };
                         let busy = *st.busy.lock().expect("busy lock");
-                        let (entries, report) = match st.storage.try_lock() {
+                        let row = match st.storage.try_lock() {
+                            // Idle: a live read, which also refreshes the
+                            // snapshot a later busy answer falls back to.
                             Ok(guard) => (
+                                busy,
                                 Some(guard.entries().len()),
                                 // Issue #211: additive usage report.
                                 tole_cli::usage_report::usage_json(guard.entries(), guard.usages()),
+                                Some(st.refresh_status(&*guard)),
+                                false,
                             ),
-                            // turn in flight — skip the count and report
-                            Err(_) => (None, json!(null)),
+                            // Turn in flight: skip the count and report and
+                            // answer from the last-known snapshot (#573),
+                            // which never needs the turn's lock.
+                            Err(_) => (busy, None, json!(null), st.last_status(), true),
                         };
-                        (busy, entries, report)
+                        row
                     };
                     let entries = match entries {
                         Some(n) => json!(n),
                         None => json!(null),
                     };
-                    (
-                        200,
-                        json!({
-                            "id": id,
-                            "entries": entries,
-                            "busy": busy,
-                            "usage_report": report,
-                        }),
-                    )
+                    let mut out = json!({
+                        "id": id,
+                        "entries": entries,
+                        "busy": busy,
+                        "usage_report": report,
+                    });
+                    if let (Some(o), Some(f)) = (
+                        out.as_object_mut(),
+                        tole_cli::status::StatusSnapshot::json_fields(snapshot.as_ref(), stale)
+                            .as_object(),
+                    ) {
+                        o.extend(f.clone());
+                    }
+                    (200, out)
                 }
                 ("GET", id, Some("entries")) => {
                     // Paginated transcript read (#524). Replays the
@@ -1890,7 +2054,7 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                     // stream is open on this session: with nobody watching the
                     // turn runs exactly as before streams existed.
                     let observer = state.buses.observer_for(id);
-                    match run_session_turn_detailed(
+                    let turn = run_session_turn_with_end(
                         Arc::clone(&state.sessions),
                         id,
                         text,
@@ -1902,7 +2066,29 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                         // an entry of this session newer than the snapshot
                         // was queued by THIS turn.
                         Some(&state.approvals),
-                    ) {
+                    );
+                    // The first turn gives the session a prompt to measure:
+                    // learn the context window off this request path (#573).
+                    warm_status(state, id);
+                    match &turn {
+                        Ok(r) => announce_turn(
+                            state.turn_events.get(),
+                            &state.approvals,
+                            id,
+                            r.turn_end,
+                            r.approval_tool.as_deref(),
+                            r.queue_mark,
+                        ),
+                        Err(e) => announce_turn(
+                            state.turn_events.get(),
+                            &state.approvals,
+                            id,
+                            e.end,
+                            None,
+                            None,
+                        ),
+                    }
+                    match turn {
                         // A turn waiting for an approval is not a refusal
                         // (#571). A stop that queued nothing (a pre-tool hook
                         // denial) is one: nothing waits for a decision.
@@ -1923,8 +2109,10 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                                 (None, None) => (200, json!({"stopReason": r.stop})),
                             }
                         }
-                        Err(e) if e.contains("session is busy") => (409, json!({"error": e})),
-                        Err(e) => (500, json!({"error": e})),
+                        Err(e) if e.message.contains("session is busy") => {
+                            (409, json!({"error": e.message}))
+                        }
+                        Err(e) => (500, json!({"error": e.message})),
                     }
                 }
                 ("POST", id, Some("cancel")) => {
@@ -1996,10 +2184,194 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                         (409, json!({"error": "no turn is running in this session"}))
                     }
                 }
+                ("POST", id, Some("fork")) => fork_route(state, id, body),
+                ("GET", id, Some("tree")) => tree_route(state, id),
+                ("POST", id, Some("compact")) => compact_route(state, id),
+                ("POST", id, Some("name")) => name_route(state, id, body),
+                ("POST", id, Some("model")) => models::model_route(state, id, body),
+                ("POST", id, Some("effort")) => models::effort_route(state, id, body),
                 _ => (404, json!({"error": "not found"})),
             }
         }
         _ => (404, json!({"error": "not found"})),
+    }
+}
+
+/// `POST /sessions/{id}/fork {"at"?: <seq>}` (#947): fork the session at a
+/// settled entry into a new session file, through the same
+/// `JsonlStorage::fork` the TUI `/fork` and `tole branch` call. `at` is the
+/// `seq` of an entry as `GET .../entries` shows it (default: the last
+/// settled entry). Writes only the new file and, as the TUI does, one
+/// index line; the source is never touched. The new session is not made
+/// live: `POST /sessions {"resume": "<new id>"}` opens it.
+///
+/// 404 unknown session, 409 while a turn runs (the turn holds the storage
+/// lock; a fork waits for none), 400 for a bad or unsettled `at`.
+fn fork_route(state: &State, id: &str, body: &str) -> (u16, serde_json::Value) {
+    let req = if body.trim().is_empty() {
+        json!({})
+    } else {
+        match serde_json::from_str::<serde_json::Value>(body) {
+            Ok(v) if v.is_object() => v,
+            _ => return (400, json!({"error": "invalid JSON body"})),
+        }
+    };
+    let at_seq = match req.get("at") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => match v.as_u64() {
+            Some(n) => Some(n),
+            None => return (400, json!({"error": "at must be an entry seq (integer)"})),
+        },
+    };
+    let st = {
+        let sessions = lock_sessions(&state.sessions);
+        sessions.get(id).cloned()
+    };
+    let Some(st) = st else {
+        return (404, json!({"error": "unknown session"}));
+    };
+    if *st.busy.lock().expect("busy lock") {
+        return (409, json!({"error": "session is busy: a turn is running"}));
+    }
+    // The turn lock, held across the whole fork as the TUI holds it, so no
+    // turn appends to the source while it is read. A turn that took it
+    // between the check above and here is the same 409.
+    let Ok(guard) = st.storage.try_lock() else {
+        return (409, json!({"error": "session is busy: a turn is running"}));
+    };
+    let at_id = match at_seq {
+        None => None,
+        Some(n) => match guard.entries().iter().find(|e| e.seq == n) {
+            Some(e) => Some(e.id.clone()),
+            None => return (400, json!({"error": format!("no entry with seq {n}")})),
+        },
+    };
+    let Some(dir) = st.path.parent().map(|d| d.to_path_buf()) else {
+        return (500, json!({"error": "session file has no directory"}));
+    };
+    let new_id = tole_cli::session_host::new_session_id("s");
+    let forked =
+        match tole_core::storage::JsonlStorage::fork(&st.path, &dir, &new_id, at_id.as_deref()) {
+            Ok(f) => f,
+            Err(tole_core::storage::StorageError::Invalid(m)) => {
+                return (400, json!({"error": m}));
+            }
+            Err(e) => return (500, json!({"error": format!("forking {id}: {e}")})),
+        };
+    let cut = forked
+        .forked_from()
+        .map(|o| o.entry.clone())
+        .unwrap_or_default();
+    let cut_seq = guard.entries().iter().find(|e| e.id == cut).map(|e| e.seq);
+    drop(forked);
+    drop(guard);
+    tole_cli::session_index::record(&dir, &new_id, "branch");
+    eprintln!("tole: session/{id} forked into {new_id} (serve)");
+    (
+        200,
+        json!({"id": new_id, "forkedFrom": id, "at": cut, "seq": cut_seq}),
+    )
+}
+
+/// `GET /sessions/{id}/tree` (#947): the session's family, from the same
+/// reader as `tole sessions --tree` and the TUI `/tree` (its parent chain
+/// up to the root and every fork below it), read from the session files
+/// so it works while a turn runs. Rows are depth-first, `depth` relative
+/// to the root. 404 for an unknown session.
+fn tree_route(state: &State, id: &str) -> (u16, serde_json::Value) {
+    let path = {
+        let sessions = lock_sessions(&state.sessions);
+        sessions.get(id).map(|st| st.path.clone())
+    };
+    let Some(path) = path else {
+        return (404, json!({"error": "unknown session"}));
+    };
+    let Some(dir) = path.parent() else {
+        return (500, json!({"error": "session file has no directory"}));
+    };
+    let rows: Vec<_> =
+        tole_cli::session_index::family(tole_cli::session_index::tree_nodes(dir), id)
+            .into_iter()
+            .map(|(depth, n)| {
+                json!({
+                    "id": n.id,
+                    "parent": n.parent,
+                    "at": n.at,
+                    "state": n.pc,
+                    "turns": n.turns,
+                    "depth": depth,
+                    "current": n.id == id,
+                })
+            })
+            .collect();
+    (200, json!({"id": id, "tree": rows}))
+}
+
+/// Run `write` on session `id`'s storage under the turn lock, for the routes
+/// that write a `fact/*` register the TUI writes too (#947). 404 for an
+/// unknown session, 409 while a turn runs (the busy flag, then the turn
+/// lock itself: a turn that took it in between is the same 409).
+fn with_idle_session(
+    state: &State,
+    id: &str,
+    write: impl FnOnce(&mut tole_core::storage::JsonlStorage) -> Result<(), (u16, String)>,
+) -> Result<(), (u16, serde_json::Value)> {
+    let st = {
+        let sessions = lock_sessions(&state.sessions);
+        sessions.get(id).cloned()
+    };
+    let Some(st) = st else {
+        return Err((404, json!({"error": "unknown session"})));
+    };
+    let busy = || (409, json!({"error": "session is busy: a turn is running"}));
+    if *st.busy.lock().expect("busy lock") {
+        return Err(busy());
+    }
+    let Ok(mut guard) = st.storage.try_lock() else {
+        return Err(busy());
+    };
+    write(&mut guard).map_err(|(status, e)| (status, json!({"error": e})))?;
+    // A register changed: keep the last-known status snapshot current (#573).
+    st.refresh_status(&*guard);
+    Ok(())
+}
+
+/// `POST /sessions/{id}/compact` (#947): the TUI `/compact`, i.e.
+/// `session_settings::request_compaction`. It records the forced pass of
+/// #481 and the session's NEXT prompt compacts first (when compaction is
+/// enabled); it is not a mid-turn compaction and runs no model call here.
+fn compact_route(state: &State, id: &str) -> (u16, serde_json::Value) {
+    match with_idle_session(state, id, |s| {
+        tole_cli::session_settings::request_compaction(s).map_err(|e| (500, e))
+    }) {
+        Ok(()) => {
+            eprintln!("tole: session/{id} compaction requested (serve)");
+            (200, json!({"id": id, "compaction": "requested"}))
+        }
+        Err(e) => e,
+    }
+}
+
+/// `POST /sessions/{id}/name {"name": "<label>"}` (#947): the TUI `/name`,
+/// i.e. `session_settings::set_name` (the `fact/session_name` register).
+fn name_route(state: &State, id: &str, body: &str) -> (u16, serde_json::Value) {
+    let Ok(req) = serde_json::from_str::<serde_json::Value>(body) else {
+        return (400, json!({"error": "invalid JSON body"}));
+    };
+    let Some(name) = req.get("name").and_then(|v| v.as_str()) else {
+        return (400, json!({"error": "missing name"}));
+    };
+    // The same label rule as the TUI, checked before the session is looked
+    // at so a bad name is a 400 whatever the session's state.
+    let name = match tole_cli::session_settings::clean_label("name", name) {
+        Ok(n) => n,
+        Err(e) => return (400, json!({"error": e})),
+    };
+    match with_idle_session(state, id, |s| {
+        tole_cli::session_settings::set_name(s, &name).map_err(|e| (500, e))
+    }) {
+        Ok(()) => (200, json!({"id": id, "name": name})),
+        Err(e) => e,
     }
 }
 
@@ -2053,6 +2425,12 @@ mod tests {
     }
 
     fn test_state(root: std::path::PathBuf, sessions_dir: std::path::PathBuf) -> State {
+        // The entrypoint fixes the process's skills choice before any
+        // session opens (#945); these tests load none.
+        tole_cli::session_host::set_server_skills(
+            tole_cli::session::assemble::ServerSkills::new(vec![], true).unwrap(),
+        );
+        tole_cli::session::owner_mcp::set(vec![]).unwrap();
         State {
             sessions: Arc::new(Mutex::new(Sessions::default())),
             approvals: tole_cli::approvals::ApprovalQueue::shared(),
@@ -2072,6 +2450,10 @@ mod tests {
             hooks: Default::default(),
             hook_dir: None,
             audit_pending: Mutex::default(),
+            mission: Default::default(),
+            missions: Arc::default(),
+            models: Default::default(),
+            turn_events: std::sync::OnceLock::new(),
         }
     }
 
@@ -2174,6 +2556,499 @@ mod tests {
         let (status, payload) = route(&state, "POST", "/sessions", "{}");
         assert_eq!(status, 200, "{payload}");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// #947: `plan_mode` on `POST /sessions` removes the mutation tools from
+    /// that session's registry (absence, not approval); off by default; a bad
+    /// type is a 400; and a process-level plan mode cannot be disabled.
+    #[test]
+    fn plan_mode_request_filters_the_registry_and_cannot_disable_the_process_flag() {
+        let base = crate::test_dir::TestDir::new("tole-serve-plan-mode");
+        let root = base.join("ws");
+        let sessions = base.join("sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&sessions).unwrap();
+        let mut state = test_state(root.clone(), sessions);
+        let cwd = root.to_str().unwrap();
+        let open = |state: &State, body: serde_json::Value| {
+            let (s, v) = route(state, "POST", "/sessions", &body.to_string());
+            (s, v)
+        };
+        let reg = |state: &State, v: &serde_json::Value| {
+            let id = v["sessionId"].as_str().unwrap().to_string();
+            let st = lock_sessions(&state.sessions).get(&id).cloned().unwrap();
+            st.registry.clone()
+        };
+
+        // Default: write tools present, no planMode on the wire.
+        let (s, v) = open(&state, json!({"cwd": cwd}));
+        assert_eq!(s, 200, "{v}");
+        assert!(v.get("planMode").is_none());
+        assert!(reg(&state, &v).get("write_file").is_some());
+
+        // Explicit false is the default too.
+        let (s, v) = open(&state, json!({"cwd": cwd, "plan_mode": false}));
+        assert_eq!(s, 200, "{v}");
+        assert!(reg(&state, &v).get("write_file").is_some());
+
+        // On: mutation tools are absent, read tools stay.
+        let (s, v) = open(&state, json!({"cwd": cwd, "plan_mode": true}));
+        assert_eq!(s, 200, "{v}");
+        assert_eq!(v["planMode"], true);
+        let r = reg(&state, &v);
+        assert!(r.get("read_file").is_some());
+        for name in ["write_file", "run_command", "agent_start", "todo_write"] {
+            assert!(r.get(name).is_none(), "{name} in plan mode");
+        }
+
+        // Bad type, and the resume combination, are 400s.
+        for bad in [json!("yes"), json!(1), json!([true])] {
+            let (s, _) = open(&state, json!({"cwd": cwd, "plan_mode": bad}));
+            assert_eq!(s, 400);
+        }
+        let (s, _) = open(&state, json!({"resume": "x", "plan_mode": true}));
+        assert_eq!(s, 400);
+
+        // A process-level plan mode cannot be disabled by the request.
+        state.plan_mode = true;
+        let (s, v) = open(&state, json!({"cwd": cwd, "plan_mode": false}));
+        assert_eq!(s, 200, "{v}");
+        assert_eq!(v["planMode"], true);
+        assert!(reg(&state, &v).get("write_file").is_none());
+        let (s, v) = open(&state, json!({"cwd": cwd}));
+        assert_eq!(s, 200, "{v}");
+        assert!(reg(&state, &v).get("write_file").is_none());
+    }
+
+    /// #947: a mission request names only its goal and budgets. `verify` (the
+    /// owner's command) and every other field is a 400 that starts nothing;
+    /// a running mission makes the next one a 409; cancel flips the token of
+    /// the running one only; a plan-mode server refuses to start one.
+    #[test]
+    fn mission_routes_refuse_owner_fields_and_keep_one_mission_at_a_time() {
+        let base = crate::test_dir::TestDir::new("tole-serve-mission");
+        let root = base.join("ws");
+        let sessions = base.join("sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&sessions).unwrap();
+        let mut state = test_state(root, sessions.clone());
+        state.mission.verify = Some("true".into());
+
+        for body in [
+            json!({"goal": "g", "verify": "rm -rf /"}),
+            json!({"goal": "g", "verify": null}),
+            json!({"goal": "g", "sandbox": "off"}),
+            json!({"goal": "g", "cwd": "/"}),
+            json!({"goal": "  "}),
+            json!({"goal": "g", "max_steps": 1000000}),
+        ] {
+            let (s, v) = route(&state, "POST", "/missions", &body.to_string());
+            assert_eq!(s, 400, "{body}: {v}");
+        }
+        let (s, v) = route(
+            &state,
+            "POST",
+            "/missions",
+            &json!({"goal": "g", "verify": "x"}).to_string(),
+        );
+        assert_eq!(s, 400);
+        assert!(v["error"].as_str().unwrap().contains("owner"), "{v}");
+        assert_eq!(std::fs::read_dir(&sessions).unwrap().count(), 0);
+
+        // A running mission (planted) blocks a second one and takes a cancel.
+        let cancel = tole_core::cancel::CancelToken::new();
+        state.missions.plant_running("mission-a", cancel.clone());
+        let (s, _) = route(&state, "POST", "/missions", r#"{"goal":"g"}"#);
+        assert_eq!(s, 409);
+        let (s, v) = route(&state, "GET", "/missions/mission-a", "");
+        assert_eq!(
+            (s, v["status"].clone(), v["running"].clone()),
+            (200, json!("running"), json!(true))
+        );
+        assert!(!cancel.is_cancelled());
+        let (s, _) = route(&state, "POST", "/missions/mission-a/cancel", "");
+        assert_eq!(s, 202);
+        assert!(cancel.is_cancelled());
+        let (s, _) = route(&state, "POST", "/missions/mission-b/cancel", "");
+        assert_eq!(s, 404);
+        let (s, _) = route(&state, "GET", "/missions/mission-b", "");
+        assert_eq!(s, 404);
+
+        // Plan mode: no mission.
+        let mut ro = test_state(state.workspace_root.clone(), sessions);
+        ro.plan_mode = true;
+        let (s, _) = route(&ro, "POST", "/missions", r#"{"goal":"g"}"#);
+        assert_eq!(s, 409);
+    }
+
+    /// Open a serve session in-process and settle one turn in its log, so
+    /// there is something to fork. Returns (session id, seq of the answer).
+    fn session_with_a_turn(state: &State, cwd: &std::path::Path) -> (String, u64) {
+        use tole_core::entry::{EntryType, NewEntry};
+        use tole_core::state::{Pc, StateTransition};
+        use tole_core::storage::Commit;
+        let (status, v) = route(
+            state,
+            "POST",
+            "/sessions",
+            &json!({"cwd": cwd.to_str().unwrap()}).to_string(),
+        );
+        assert_eq!(status, 200, "{v}");
+        let id = v["sessionId"].as_str().unwrap().to_string();
+        let st = lock_sessions(&state.sessions).get(&id).cloned().unwrap();
+        let mut g = st.storage.lock().unwrap();
+        let msg = |role: &str, text: &str| {
+            NewEntry::root(
+                EntryType::new(EntryType::MESSAGE),
+                json!({"role": role, "text": text}),
+            )
+        };
+        g.commit(Commit::new().entry(msg("user", "hi"))).unwrap();
+        let seq = g.state().seq;
+        g.commit(Commit::new().transition(StateTransition::from(seq, Pc::Planning)))
+            .unwrap();
+        let seq = g.state().seq;
+        g.commit(
+            Commit::new()
+                .entry(msg("assistant", "hello"))
+                .transition(StateTransition::from(seq, Pc::Final)),
+        )
+        .unwrap();
+        let answer = g
+            .entries()
+            .iter()
+            .rev()
+            .find(|e| e.payload["role"] == "assistant")
+            .unwrap()
+            .seq;
+        (id, answer)
+    }
+
+    /// #947: fork and tree over serve: success shape, the family tree, 404,
+    /// 409 while busy, and 4xx for an `at` that is not a settled entry.
+    #[test]
+    fn fork_and_tree_routes_answer_success_404_409_and_bad_at() {
+        let base = crate::test_dir::TestDir::new("tole-serve-fork");
+        let root = base.join("ws");
+        let sessions = base.join("sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&sessions).unwrap();
+        let state = test_state(root.clone(), sessions.clone());
+        let (id, answer) = session_with_a_turn(&state, &root);
+
+        // Unknown session: 404 on both routes.
+        let (s, _) = route(&state, "POST", "/sessions/nope/fork", "{}");
+        assert_eq!(s, 404);
+        let (s, _) = route(&state, "GET", "/sessions/nope/tree", "");
+        assert_eq!(s, 404);
+
+        // A user message is not a settled point; an unknown seq is no entry.
+        let user_seq = {
+            let st = lock_sessions(&state.sessions).get(&id).cloned().unwrap();
+            let g = st.storage.lock().unwrap();
+            g.entries()
+                .iter()
+                .find(|e| e.payload["role"] == "user")
+                .unwrap()
+                .seq
+        };
+        let path = format!("/sessions/{id}/fork");
+        for bad in [
+            json!({"at": user_seq}),
+            json!({"at": 99999}),
+            json!({"at": "x"}),
+        ] {
+            let (s, v) = route(&state, "POST", &path, &bad.to_string());
+            assert_eq!(s, 400, "{bad}: {v}");
+        }
+        let (s, _) = route(&state, "POST", &path, "not json");
+        assert_eq!(s, 400);
+        let logs = || {
+            std::fs::read_dir(&sessions)
+                .unwrap()
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().ends_with(".jsonl"))
+                .count()
+        };
+        assert_eq!(logs(), 1, "a refused fork leaves no log behind");
+
+        // 409 while a turn runs.
+        let st = lock_sessions(&state.sessions).get(&id).cloned().unwrap();
+        *st.busy.lock().unwrap() = true;
+        let (s, _) = route(&state, "POST", &path, "{}");
+        assert_eq!(s, 409);
+        *st.busy.lock().unwrap() = false;
+
+        // Success at an explicit seq, and again at the default.
+        let (s, v) = route(&state, "POST", &path, &json!({"at": answer}).to_string());
+        assert_eq!(s, 200, "{v}");
+        assert_eq!(v["forkedFrom"], json!(id));
+        assert_eq!(v["seq"], json!(answer));
+        let fork_id = v["id"].as_str().unwrap().to_string();
+        assert!(sessions.join(format!("{fork_id}.jsonl")).exists());
+        let (s, v) = route(&state, "POST", &path, "");
+        assert_eq!(s, 200, "{v}");
+        let fork2 = v["id"].as_str().unwrap().to_string();
+        assert_ne!(fork2, fork_id);
+
+        // The tree: the source at depth 0, both forks below it.
+        let (s, v) = route(&state, "GET", &format!("/sessions/{id}/tree"), "");
+        assert_eq!(s, 200, "{v}");
+        let rows = v["tree"].as_array().unwrap();
+        assert_eq!(rows.len(), 3, "{v}");
+        assert_eq!(rows[0]["id"], json!(id));
+        assert_eq!(rows[0]["depth"], 0);
+        assert_eq!(rows[0]["current"], true);
+        assert!(rows[0]["parent"].is_null());
+        let child = rows.iter().find(|r| r["id"] == json!(fork_id)).unwrap();
+        assert_eq!(child["parent"], json!(id));
+        assert_eq!(child["depth"], 1);
+        assert_eq!(child["current"], false);
+        assert_eq!(child["turns"], 1);
+        assert!(child["at"].is_string());
+        // The tree is a file read: it answers while a turn runs.
+        *st.busy.lock().unwrap() = true;
+        let (s, _) = route(&state, "GET", &format!("/sessions/{id}/tree"), "");
+        assert_eq!(s, 200);
+        *st.busy.lock().unwrap() = false;
+    }
+
+    /// Open a serve session in-process; returns its id.
+    fn open_session(state: &State, cwd: &std::path::Path) -> String {
+        let (status, v) = route(
+            state,
+            "POST",
+            "/sessions",
+            &json!({"cwd": cwd.to_str().unwrap()}).to_string(),
+        );
+        assert_eq!(status, 200, "{v}");
+        v["sessionId"].as_str().unwrap().to_string()
+    }
+
+    /// #947: compact and name over serve write what the TUI writes (read
+    /// back through the session's own readers), 404 an unknown session, 409
+    /// while a turn runs, and 400 a bad name.
+    #[test]
+    fn compact_and_name_routes_write_the_tui_registers_404_409_and_bad_name() {
+        let base = crate::test_dir::TestDir::new("tole-serve-compact-name");
+        let root = base.join("ws");
+        let sessions = base.join("sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&sessions).unwrap();
+        let state = test_state(root.clone(), sessions);
+        let id = open_session(&state, &root);
+        let st = lock_sessions(&state.sessions).get(&id).cloned().unwrap();
+        let compact = format!("/sessions/{id}/compact");
+        let name = format!("/sessions/{id}/name");
+        let named = json!({"name": "nightly"}).to_string();
+
+        for (path, body) in [
+            ("/sessions/nope/compact", ""),
+            ("/sessions/nope/name", named.as_str()),
+        ] {
+            let (s, _) = route(&state, "POST", path, body);
+            assert_eq!(s, 404, "{path}");
+        }
+
+        // 409 while a turn runs, and nothing is written.
+        *st.busy.lock().unwrap() = true;
+        let (s, _) = route(&state, "POST", &compact, "");
+        assert_eq!(s, 409);
+        let (s, _) = route(&state, "POST", &name, &named);
+        assert_eq!(s, 409);
+        *st.busy.lock().unwrap() = false;
+        {
+            let g = st.storage.lock().unwrap();
+            assert_eq!(g.session_name(), None);
+            assert!(!tole_core::compaction::overflow_pending(&*g));
+        }
+        // The turn lock itself held (a turn between the check and the write).
+        {
+            let _held = st.storage.lock().unwrap();
+            let (s, _) = route(&state, "POST", &compact, "");
+            assert_eq!(s, 409);
+        }
+
+        // Bad names are a 400 and write nothing.
+        for bad in [
+            "not json".to_string(),
+            json!({}).to_string(),
+            json!({"name": 5}).to_string(),
+            json!({"name": "  "}).to_string(),
+            json!({"name": "a\u{1b}b"}).to_string(),
+            json!({"name": "x".repeat(121)}).to_string(),
+        ] {
+            let (s, v) = route(&state, "POST", &name, &bad);
+            assert_eq!(s, 400, "{bad}: {v}");
+        }
+
+        // Success: the response shape and what the TUI would have written.
+        let (s, v) = route(
+            &state,
+            "POST",
+            &name,
+            &json!({"name": " nightly "}).to_string(),
+        );
+        assert_eq!(s, 200, "{v}");
+        assert_eq!(v, json!({"id": id, "name": "nightly"}));
+        let (s, v) = route(&state, "POST", &compact, "");
+        assert_eq!(s, 200, "{v}");
+        assert_eq!(v, json!({"id": id, "compaction": "requested"}));
+        let g = st.storage.lock().unwrap();
+        assert_eq!(g.session_name(), Some("nightly"));
+        assert!(tole_core::compaction::overflow_pending(&*g));
+    }
+
+    /// #574: the model list is the owner's, `model` and `effort` write the
+    /// registers the TUI writes (read back through the session's readers),
+    /// and 404 / 409 / 400 hold, including a model outside the list.
+    #[test]
+    fn model_and_effort_routes_write_the_tui_registers_and_obey_the_allow_list() {
+        let base = crate::test_dir::TestDir::new("tole-serve-model-effort");
+        let root = base.join("ws");
+        let sessions = base.join("sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&sessions).unwrap();
+        let mut state = test_state(root.clone(), sessions);
+        state.models = models::ModelCatalog::new(
+            Some(" gpt-a, gpt-b ,gpt-a,,bad\u{7}id"),
+            Some("gpt-default".into()),
+        );
+        let id = open_session(&state, &root);
+        let st = lock_sessions(&state.sessions).get(&id).cloned().unwrap();
+        let model = format!("/sessions/{id}/model");
+        let effort = format!("/sessions/{id}/effort");
+        let pick = |m: &str| json!({"model": m}).to_string();
+
+        // The list: the default first, then the owner's allow list.
+        let (s, v) = route(&state, "GET", "/models", "");
+        assert_eq!(s, 200);
+        assert_eq!(
+            v,
+            json!({"models": ["gpt-default", "gpt-a", "gpt-b"], "default": "gpt-default"})
+        );
+
+        // 404 on an unknown session.
+        let (s, _) = route(&state, "POST", "/sessions/nope/model", &pick("gpt-a"));
+        assert_eq!(s, 404);
+        let (s, _) = route(
+            &state,
+            "POST",
+            "/sessions/nope/effort",
+            r#"{"effort":"low"}"#,
+        );
+        assert_eq!(s, 404);
+
+        // 409 while a turn runs, and nothing is written.
+        *st.busy.lock().unwrap() = true;
+        assert_eq!(route(&state, "POST", &model, &pick("gpt-a")).0, 409);
+        assert_eq!(route(&state, "POST", &effort, r#"{"effort":"low"}"#).0, 409);
+        *st.busy.lock().unwrap() = false;
+        {
+            let _held = st.storage.lock().unwrap();
+            assert_eq!(route(&state, "POST", &model, &pick("gpt-a")).0, 409);
+            assert_eq!(route(&state, "POST", &effort, r#"{"effort":"low"}"#).0, 409);
+        }
+        {
+            let g = st.storage.lock().unwrap();
+            assert_eq!(tole_cli::turn_runner::session_model(&*g, "dflt"), "dflt");
+            assert_eq!(tole_cli::turn_runner::session_effort(&*g, None), None);
+        }
+
+        // 400: bad bodies, a model outside the list (also a provider URL,
+        // another case, a prefix of an allowed id) and bad levels.
+        for bad in [
+            "not json".to_string(),
+            json!({}).to_string(),
+            json!({"model": 5}).to_string(),
+            json!({"model": "  "}).to_string(),
+            pick("gpt-c"),
+            pick("GPT-A"),
+            pick("gpt"),
+            pick("https://evil.example/v1"),
+            json!({"model": "gpt-a", "base_url": "http://evil", "api_key": "k"})
+                .to_string()
+                .replace("gpt-a", "not-allowed"),
+        ] {
+            let (s, v) = route(&state, "POST", &model, &bad);
+            assert_eq!(s, 400, "{bad}: {v}");
+        }
+        for bad in [
+            "not json".to_string(),
+            json!({}).to_string(),
+            json!({"effort": "ultra"}).to_string(),
+            json!({"effort": ""}).to_string(),
+            json!({"effort": 3}).to_string(),
+        ] {
+            let (s, v) = route(&state, "POST", &effort, &bad);
+            assert_eq!(s, 400, "{bad}: {v}");
+        }
+        {
+            let g = st.storage.lock().unwrap();
+            assert_eq!(tole_cli::turn_runner::session_model(&*g, "dflt"), "dflt");
+            assert_eq!(tole_cli::turn_runner::session_effort(&*g, None), None);
+        }
+
+        // Success: the response shape and the registers the TUI reads.
+        let (s, v) = route(&state, "POST", &model, &pick(" gpt-b "));
+        assert_eq!(s, 200, "{v}");
+        assert_eq!(v, json!({"id": id, "model": "gpt-b"}));
+        let (s, v) = route(&state, "POST", &effort, r#"{"effort":" HIGH "}"#);
+        assert_eq!(s, 200, "{v}");
+        assert_eq!(v, json!({"id": id, "effort": "high"}));
+        {
+            let g = st.storage.lock().unwrap();
+            assert_eq!(g.get_register("fact", "model"), Some(&json!("gpt-b")));
+            assert_eq!(
+                g.get_register("fact", "reasoning_effort"),
+                Some(&json!("high"))
+            );
+            assert_eq!(tole_cli::turn_runner::session_model(&*g, "dflt"), "gpt-b");
+            assert_eq!(
+                tole_cli::turn_runner::session_effort(&*g, Some("low")),
+                Some("high".into())
+            );
+        }
+        // The default is always allowed (switch back); null and "unset" clear.
+        assert_eq!(route(&state, "POST", &model, &pick("gpt-default")).0, 200);
+        let (s, v) = route(&state, "POST", &effort, r#"{"effort":null}"#);
+        assert_eq!((s, v["effort"].clone()), (200, json!(null)));
+        route(&state, "POST", &effort, r#"{"effort":"low"}"#);
+        assert_eq!(
+            route(&state, "POST", &effort, r#"{"effort":"unset"}"#).0,
+            200
+        );
+        let g = st.storage.lock().unwrap();
+        assert_eq!(
+            tole_cli::turn_runner::session_model(&*g, "dflt"),
+            "gpt-default"
+        );
+        assert_eq!(g.get_register("fact", "reasoning_effort"), None);
+    }
+
+    /// #574: with no `TOLE_MODELS` the default is the only model a client
+    /// can pick, and with no default either the list is empty.
+    #[test]
+    fn without_an_owner_list_only_the_default_can_be_picked() {
+        let base = crate::test_dir::TestDir::new("tole-serve-model-default");
+        let root = base.join("ws");
+        let sessions = base.join("sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&sessions).unwrap();
+        let mut state = test_state(root.clone(), sessions);
+        state.models = models::ModelCatalog::new(None, Some("only".into()));
+        let id = open_session(&state, &root);
+        let model = format!("/sessions/{id}/model");
+        assert_eq!(
+            route(&state, "GET", "/models", "").1["models"],
+            json!(["only"])
+        );
+        assert_eq!(route(&state, "POST", &model, r#"{"model":"other"}"#).0, 400);
+        assert_eq!(route(&state, "POST", &model, r#"{"model":"only"}"#).0, 200);
+        state.models = models::ModelCatalog::new(None, None);
+        let (s, v) = route(&state, "GET", "/models", "");
+        assert_eq!((s, v), (200, json!({"models": [], "default": null})));
+        assert_eq!(route(&state, "POST", &model, r#"{"model":"only"}"#).0, 400);
     }
 
     #[test]

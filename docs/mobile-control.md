@@ -16,8 +16,8 @@ decisions revalidate per request; auth failures are rate-limited per source IP).
 | Action | Route | Notes |
 |---|---|---|
 | List sessions | `GET /sessions` | id + busy per session (+ `profile` when it has one, #740) |
-| Start a mission | `POST /sessions` `{cwd}` → `POST /sessions/{id}/prompt` `{text}` | the prompt is the mission goal (`tole mission` semantics chain turns; a serve prompt runs ONE turn — mission chaining over serve is a follow-up) |
-| Mission status | `GET /sessions/{id}/status` | busy flag, entry count, `usage_report` (tokens, cache-hit rate, request-size split; #211), mission cost report (`fact/mission` register, #201) |
+| Start a mission | `POST /sessions` `{cwd}` → `POST /sessions/{id}/prompt` `{text}` | the prompt is the mission goal (`tole mission` semantics chain turns; a serve prompt runs ONE turn; for chained turns use `POST /missions` below, #947) |
+| Mission status | `GET /sessions/{id}/status` | busy flag, entry count, model, effort, context window, name (#573), `usage_report` (tokens, cache-hit rate, request-size split; #211), mission cost report (`fact/mission` register, #201) |
 | **Pending approvals** | `GET /approvals` | queue entries: id, session, tool, status; expires to denied after 15 min |
 | **Approve / deny** | `POST /approvals/{id}/decision` `{"decision":"allow"\|"deny"}` | allow = one-shot for exactly that (session, tool+input) + automatic resume; deny = recorded verdict. Only the first decision counts: the same verdict again answers `200` with `"resuming":false` and audits and resumes nothing; the opposite verdict, or any decision on an entry that already expired, answers `409` with the current `status` |
 | **Delegated children's approvals** | `GET /approvals` (entries with `source: "delegation"`), `POST /approvals/dap-…/decision` `{"decision":"allow","confirm":"<the same id>"\|"deny","fingerprint"?}` (#714) | the durable queue of delegated children, next to the list above: id, goal, node, tool, target, redacted `display`, age, seconds left, `fingerprint`, the `chain` of levels, and `text` (the whole request fenced as data, as `tole delegation approvals show` prints it). The same bearer token as every route. `allow` must repeat the id as `confirm` (no id, prefix or pattern means "all": `400`); only a pending request is decided (`409` with the reason for an expired, consumed, already decided or settled one, `404` unknown); the decision is bound to the request's fingerprint and recorded `via: serve`; the server refuses (`403`) when it runs under an agent session. No session is resumed (the child is already waiting). Requests exist only when `[delegation] approvals` is on |
@@ -26,13 +26,25 @@ decisions revalidate per request; auth failures are rate-limited per source IP).
 | Steer a turn | `POST /sessions/{id}/interrupt` `{text, urgent?}` (#377) | `202` queued; delivered at the turn's next safe point (after the running tool, before the next model call) as an attributed user-role entry, nothing is lost. `urgent` also withdraws a tool call that has not started. `409` when no turn is running, `400` for blank/oversized text or a full queue (16 pending) |
 | Detach a turn | `POST /sessions/{id}/detach` (#217) | `202`; the running tool settles, the turn ends `detached` (resumable) and background jobs keep running, nudging the session when they finish. `409` when no turn is running |
 | Live events | `GET /sessions/{id}/events?after=<seq>` (#524) | Server-Sent Events, see [Event stream](#event-stream-524); replays the log from a `seq`, then follows it |
+| Start in plan mode | `POST /sessions` `{cwd, "plan_mode": true}` (#947) | the same registry filter as `--plan-mode`: mutation tools (write, run_command, agent_start, todo_write, ...) are ABSENT from the session's tool list, not asked about. Answers `planMode: true`. A request can only turn it on: `false` or absence leaves the default, and a `tole serve --plan-mode` process keeps every session in plan mode. `400` for a non-boolean, or combined with `resume` |
 | Start with a profile | `POST /sessions` `{cwd, "profile": "<name>"}` (#740) | persona, allow list, memory room and model of a user-config profile, see [Session profiles](#session-profiles-740) |
+| List past sessions | `GET /sessions/index?limit=<n>&cursor=<c>` (#572) | the sessions of this server's workspace that are not necessarily live, newest first, metadata only; see [Past sessions](#past-sessions-572) |
 | Resume a session | `POST /sessions` `{"resume": "<id>"}` (#524) | reopen an existing session, see [Resume by id](#resume-by-id-524) |
 | Read the transcript | `GET /sessions/{id}/entries?after=<seq>&limit=<n>` (#524) | one page of the session's log, see [Transcript read](#transcript-read-524); works while a turn runs |
 | Upload an image | `POST /sessions/{id}/images` (raw body, #558) | returns `{id, mime, bytes, fnv1a64}`; see [Images](#images-558) |
 | Prompt with images | `POST /sessions/{id}/prompt` `{text, images: [<id>]}` (#558) | the turn records the references, never the blob |
 | Read an image | `GET /sessions/{id}/images/{fnv1a64}` (#558) | only images recorded in that session's log |
 | Cost report | `GET /sessions/{id}/status` | the `mission` register: turns, steps, tokens, wall time, per-risk-tier tool calls |
+| Fork a session | `POST /sessions/{id}/fork` `{"at"?: <seq>}` (#947) | `200 {"id", "forkedFrom", "at", "seq"}`: a NEW session file in the same sessions directory, the lineage up to the settled entry whose `seq` (as `GET …/entries` shows it) is `at`, default the last settled one; same `JsonlStorage::fork` as the TUI `/fork` and `tole branch`, and the source is never touched. The fork is not made live: `POST /sessions {"resume": "<id>"}` opens it. `404` unknown session, `409` while a turn runs, `400` for a bad `at`, an unknown seq or an entry that is not a settled final assistant message |
+| Session family tree | `GET /sessions/{id}/tree` (#947) | `200 {"id", "tree": [{"id", "parent", "at", "state", "turns", "depth", "current"}]}`: the session's parent chain up to the root and every fork below it, depth-first (`depth` 0 = the root), the same reader as `tole sessions --tree` and the TUI `/tree`. Read from the session files, so it answers while a turn runs. `404` unknown session |
+| Request a compaction | `POST /sessions/{id}/compact` (#947) | `200 {"id", "compaction": "requested"}`: the TUI `/compact` (the forced pass of #481). It records the request in the log; the session's NEXT prompt compacts first, when compaction is enabled. No model call runs in the route, and there are no instructions field. `404` unknown session, `409` while a turn runs |
+| Rename a session | `POST /sessions/{id}/name` `{"name": "<label>"}` (#947) | `200 {"id", "name"}` (the trimmed label): the TUI `/name` (the `fact/session_name` register). `400` for a missing, blank, control-character or over-120-character name, `404` unknown session, `409` while a turn runs |
+| List pickable models | `GET /models` (#574) | `200 {"models": ["<id>", ...], "default": "<id>" \| null}`: the models a client may pick, decided by the OWNER: the configured default model (always first, so a client can switch back) plus the ids of `TOLE_MODELS` (comma separated, the variable that advertises the ACP model picker; read once at start-up). With no `TOLE_MODELS` the default is the only entry. The provider's `/models` is not consulted: listing it would let the token holder spend on anything the key reaches |
+| Set the session model | `POST /sessions/{id}/model` `{"model": "<id>"}` (#574) | `200 {"id", "model"}`: writes the `fact/model` register the TUI `/model` writes (through `session_settings`), so it survives `resume`. The request carries an id only, never a provider URL or key: the session keeps the server's provider configuration. `400` for a missing, blank or control-character id and for an id that is not in `GET /models` (exact match), `404` unknown session, `409` while a turn runs |
+| Set the thinking level | `POST /sessions/{id}/effort` `{"effort": "minimal" \| "low" \| "medium" \| "high" \| null}` (#574) | `200 {"id", "effort"}` (canonical level, or `null`): writes or clears `fact/reasoning_effort` as the TUI `/thinking` and `--effort` do; `null` (or `"unset"`) goes back to the default. An invalid level is a `400`, never coerced; `404` unknown session, `409` while a turn runs |
+| Start a mission | `POST /missions` `{"goal", "max_steps"?, "max_minutes"?, "max_tokens"?}` (#947) | `202 {"id", "status": "running"}`. A mission is its own session (its own pinned mission prompt and writer lock, as `tole mission` makes one), so it is NOT under `/sessions/{id}`; it runs the CLI's own loop (`mission::run_mission_outcome`) on a background thread over the serve workspace root. The `fact/mission` summary and the session file are the ones the CLI writes; `POST /sessions {"resume": "<id>"}` opens the session after it ends. The owner's configuration, never the request, decides everything else: the **verify command** and its timeout (`[mission] verify`, `verify_timeout` of the user config, read at start-up like `tole mission`), the budget **ceilings** (the `tole mission` tier, trusted tier or config `max_*`; a request may ask for less, a value above is a `400`), the workspace, the allow list and the sandbox. A body with a `verify` key, or any key besides the four above, is a `400` and starts nothing. Write approvals queue in the same `GET /approvals` queue under the mission id (the mission stops at the first, as the CLI does). `409` while another mission runs (one at a time) and on a `--plan-mode` server, `400` for a bad body |
+| Read a mission | `GET /missions/{id}` (#947) | `200 {"id", "status", "running", ...}`: `status` is `running` or how it ended (the CLI's: `complete`, `exhausted_steps`, `exhausted_tokens`, `exhausted_time`, `verify_failed`, `verify_refused`, `stopped` for an approval stop, a cancel or a provider failure, `error`); once ended also `turns`, `steps`, `tokens`, `wallSeconds` and `summary` (the `fact/mission` register), and `error` when the run could not start. A mission of an earlier server process is read from its session file. `404` unknown |
+| Cancel a mission | `POST /missions/{id}/cancel` (#947) | `202 {"id", "cancelled": true}`; the running turn is cancelled and the mission ends `stopped` with its durable summary. `404` unknown, `409` when it has already ended |
 
 The round trip the app must support (the cross-repo acceptance):
 
@@ -55,11 +67,34 @@ The round trip the app must support (the cross-repo acceptance):
 
 ## Status JSON fields
 
-`GET /sessions/{id}/status` returns `{id, entries, busy, usage_report}`.
-`entries` and `usage_report` are `null` while a turn is in flight (the
-session storage is busy). `usage_report` was added by #211 and is purely
-additive: clients must ignore unknown fields (the existing three keep their
-meaning). Its shape — every unknown value is `null`, never a fabricated 0:
+`GET /sessions/{id}/status` returns `{id, entries, busy, usage_report}` plus
+the session-status fields below (#573). `entries` and `usage_report` are `null`
+while a turn is in flight (the session storage is busy). `usage_report` was
+added by #211 and the status fields by #573; both are purely additive: clients
+must ignore unknown fields (the original keys keep their meaning).
+
+| Field | Meaning |
+|---|---|
+| `model` | the session's pinned model (`fact/model`), else the configured default; `null` if neither |
+| `effort` | the session's `fact/reasoning_effort` register; `null` while unset (the process default is not reported) |
+| `contextWindow` | tokens: the configured window (`TOLE_CONTEXT_WINDOW` / config `context_window`), else the one the provider's `/models` reported for the session's model; `null` when unknown |
+| `contextUsed` | prompt tokens of the last model call since the last compaction (`0` before the first call); with `contextWindow` it is the footer's `used / window` |
+| `name` | `fact/session_name` (`POST /sessions/{id}/name`), else the name the session was created with; `null` if none |
+| `snapshotAt` | epoch milliseconds when these values were read; `null` if there is no snapshot yet |
+| `stale` | `false`: read live from an idle session. `true`: a turn holds the session, so the values are the last-known snapshot, not a live read |
+
+These are the values `tole status` and the TUI footer show for the same
+session (the same snapshot code reads them), so the faces cannot disagree. An
+unknown value is `null`, never a made-up one. The snapshot is refreshed when
+the session opens, when a turn settles, when a register changes (`model`,
+`effort`, `name`, `compact`) and on every idle status read; the route never
+waits for a running turn, so it answers promptly while one runs. During a turn
+the snapshot is the state before it began (a model switch is refused while a
+turn runs, so `model` and `effort` cannot be older than the turn). The context
+window is looked up on the provider off the request path (after the session
+opens or its first turn settles) and cached per model, so a window the
+provider cannot report stays `null` rather than delaying the route. The
+`usage_report` shape — every unknown value is `null`, never a fabricated 0:
 
 | Field | Meaning |
 |---|---|
@@ -103,6 +138,32 @@ session's log, so a client that connects late or reconnects can render history:
 - Entries carry tool inputs and outputs. The token already grants approval authority
   and `POST …/prompt`; the read route adds no new trust, but anything printed into a
   session is readable by every holder of the token.
+
+## Past sessions (#572)
+
+`GET /sessions/index?limit=<n>&cursor=<c>` lists the sessions on disk, so a client can offer "continue" after a
+restart or from a second device. `GET /sessions` stays the live list (`id`, `busy`).
+
+```
+200 {"sessions": [{"id", "name", "folder", "lastActivity", "entries", "turns", "parent", "live", "busy"}],
+     "nextCursor": "<c>" | null, "skipped": <n>, "scanTruncated": <bool>}
+```
+
+- **Metadata only.** `name` is the operator's label (`fact/session_name`, or `null`), `folder` the working
+  directory the session recorded (a session opened by serve records none, so it shows the workspace the directory belongs to), `lastActivity` the session file's
+  modification time in ms, `entries` and `turns` counts, `parent` the session it was forked from, `live`/`busy`
+  whether this process holds it. No prompt, preview, tool output or transcript text is ever returned.
+- **Order and paging.** Newest first (ties by id). `limit` defaults to 50 and is clamped to 100 (`0`, a negative or a
+  non-number is `400`). Pass `nextCursor` back as `cursor` for the next page; `null` means the end. A cursor that is
+  not `<digits>.<session id>` is `400`. A page can hold fewer rows than `limit` while `nextCursor` is set (the
+  per-request ceilings below, or skipped files): keep following it.
+- **Scope.** Only this server's own sessions directory (`--sessions-dir`, else `<workspace>/.tole/sessions`);
+  the request never names a path. With `--sessions-dir` the directory may be shared, so a session whose recorded
+  folder is outside the workspace is left out. An id from the list goes to `POST /sessions {"resume": "<id>"}`.
+- **Bounded cost.** Ordering uses names and file times only. Per request at most 10,000 directory entries are
+  read (`scanTruncated: true` when more exist), at most 200 session files are opened, none over 16 MiB (counted in
+  `skipped`, never replayed) and 64 MiB in total. A torn or unreadable file is skipped (`skipped`), never an error.
+- `401` without the token, like every route.
 
 ## Resume by id (#524)
 

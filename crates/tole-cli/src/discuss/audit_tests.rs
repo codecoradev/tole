@@ -18,7 +18,7 @@ fn tmp(tag: &str) -> TestDir {
 /// shown.
 fn discussion(dir: &Path) {
     let l = DiscussionLog::at(dir, "pick-db").unwrap();
-    let question = format!("Which database? key {SECRET} {}", "q".repeat(2000));
+    let question = format!("Which database? key {SECRET} {}", "q".repeat(1500));
     let c = Contract::new(
         "pick-db",
         &question,

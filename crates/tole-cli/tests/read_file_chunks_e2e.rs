@@ -8,7 +8,7 @@ use common::TestDir;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
 /// Scripted mock: while the latest tool result carries `"next_offset":N`
@@ -137,7 +137,7 @@ fn mission_reads_a_50k_char_file_in_three_chunks() {
     assert_eq!(text.chars().count(), 50_000);
     std::fs::write(ws.join("big.txt"), &text).unwrap();
 
-    let out = Command::new(env!("CARGO_BIN_EXE_tole"))
+    let out = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &dir.join("home"), &[])
         .args([
             "--workspace",
             ws.to_str().unwrap(),

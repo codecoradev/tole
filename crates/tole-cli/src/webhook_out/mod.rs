@@ -30,6 +30,7 @@ pub mod probe;
 pub mod send;
 pub mod sign;
 pub mod store;
+pub mod turn;
 pub mod volatile;
 
 /// Longest destination name.
@@ -56,6 +57,9 @@ pub enum Event {
     ApprovalRequested,
     /// An approval was decided or expired; sent to destinations that list it.
     ApprovalResolved,
+    /// A `tole serve` session's turn ended (#962); sent to destinations that
+    /// list it, never by default. Ids and a status word only (see [`turn`]).
+    TurnFinished,
     /// `tole webhook test <name>`: one signed event to one destination, sent
     /// directly (never through the outbox). It is not a configurable event, so
     /// it is not in [`Event::ALL`] and a forged outbox line cannot name it.
@@ -63,10 +67,11 @@ pub enum Event {
 }
 
 impl Event {
-    pub const ALL: [Event; 3] = [
+    pub const ALL: [Event; 4] = [
         Event::CronRunFinished,
         Event::ApprovalRequested,
         Event::ApprovalResolved,
+        Event::TurnFinished,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -74,6 +79,7 @@ impl Event {
             Event::CronRunFinished => "cron_run_finished",
             Event::ApprovalRequested => "approval_requested",
             Event::ApprovalResolved => "approval_resolved",
+            Event::TurnFinished => "turn_finished",
             Event::WebhookTest => "webhook_test",
         }
     }

@@ -108,7 +108,7 @@ Code: `crates/tole-cli/src/webhook_out/{mod,config,payload,outbox,worker}.rs`
 
 ## 2. Events and payload (schema v1)
 
-Three event types (the `type`, also sent as `X-Tole-Event`, which already
+Four event types (the `type`, also sent as `X-Tole-Event`, which already
 passes `webhook::valid_event`):
 
 | type | emitted when | to |
@@ -116,6 +116,7 @@ passes `webhook::valid_event`):
 | `cron_run_finished` | a run settles (any status, silent output excluded, see below) | destinations a job names in `deliver` |
 | `approval_requested` | `ApprovalQueue::queue_entry` adds a pending entry | destinations listing it in `events` |
 | `approval_resolved` | an entry leaves `Pending`: allow, deny, or expiry | destinations listing it in `events` |
+| `turn_finished` | a `tole serve` session's turn ended (#962, see [turn-finished-event.md](turn-finished-event.md)) | destinations listing it in `events` |
 | `webhook_test` | `tole webhook test <name>` (soon, section 10) | that destination only |
 
 Envelope (one JSON object, UTF-8, at most **16 KiB** after serialization):
@@ -182,6 +183,13 @@ Envelope (one JSON object, UTF-8, at most **16 KiB** after serialization):
 - Fields that would not fit are cut, never the envelope: if the body is still
   over 16 KiB after the caps above, `summary` is dropped and `truncated` is
   set.
+
+The fourth event, `turn_finished` (a serve turn ended, ids and a status word
+only), is specified in [turn-finished-event.md](turn-finished-event.md) (#962)
+and implemented with provisional defaults for the note's open decisions D1-D9
+and D10, the settle counter in the id (`webhook_out/turn.rs` names each one). It rides the volatile queue of section
+8 with a 15 minute horizon (2 s, 10 s, 30 s, 2 min, then every 5 min), and a
+full queue replaces the oldest event of the same session.
 
 ## 3. Signature (mirror of the inbound gate)
 
@@ -703,3 +711,6 @@ owner to overrule.
 12. **Outbox checkpoint.** Without one, every fold reads the whole file (up to the
     64 MiB cap). Recommendation: not in v1; add a cache-only checkpoint offset
     if real use gets near 32 MiB.
+13. **`turn_finished` event (#962).** Proposed in
+    [turn-finished-event.md](turn-finished-event.md); its open questions are
+    listed there (section 11).

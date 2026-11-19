@@ -40,6 +40,16 @@ workflow; the ecosystem-wide standards it follows live in the team knowledge roo
   `set_permissions(.., 0o755)`. A concurrent `fork()` of another test thread
   can still hold the write fd, and the `exec` then fails with `ETXTBSY`
   ("Text file busy"); the helpers return only once no writer is left.
+- **Hermetic e2e tests** (#993): a test that spawns the `tole` binary, or code
+  that spawns external tools (`cora`, `uteke`, `git`, a shell), builds its
+  `Command` with `common::hermetic_command(program, &home, &extra_env)`
+  (`crates/tole-cli/tests/common/hermetic.rs`), never a bare `Command::new`.
+  It sets `HOME` and `CODECORA_HOME` to the test's own home, drops every `PATH`
+  directory holding `cora` or `uteke` (the rest stays, so `sh` and `git` work)
+  and clears the XDG overrides; `extra_env` is applied last, so a test that
+  wants a shim or a decoy overrides there. Without it a test passes in CI and
+  fails, or writes real state, on a machine that has those tools and a
+  `~/.codecora`. Unconverted files are tracked in #993.
 - **Code review**: every PR gets a Cora review (below) plus maintainer review
   before merge. CI must be green.
 
@@ -106,11 +116,21 @@ semantic conflict, for example two PRs editing the same tests; #806). So:
 - After every merge, look at the push-to-`develop` CI run (it runs on every
   merge since #762). A red `develop` stops merging until it is fixed or
   reverted; do not stack more PRs on it.
-- Preferred, and an owner setting: require branches to be up to date before
-  merging on `develop` (strict required status checks), or a merge queue on
-  `develop` and `main`, so CI runs on the merge result and this rule is
-  enforced instead of remembered. A repository ruleset can only be changed
-  by the owner; until it is, the rules above apply.
+- Preferred, and an owner setting: a merge queue on `develop`, so CI runs on
+  the merge result and this rule is enforced instead of remembered. `CI`,
+  `Security` and the PR metadata workflows already run on `merge_group`
+  events with the same check names, so the queue can be switched on without
+  touching the workflows. `Cora Review`, `Message Standard`, `PR Description`
+  and `Conventional Commits` judge the PR itself and are skipped (they report
+  success) on a queue entry; they stay enforced on the PR head. Why a queue
+  and not "require branches to be up to date": a queue costs one CI run
+  (about 8 minutes) per PR, while strict mode makes every open PR re-run
+  after every merge, and the 12 to 30 minute Cora Review job with it.
+  Owner click-path: Settings, Rules, Rulesets, `develop protection`, tick
+  "Require merge queue" (merge method Squash, build concurrency 5, minimum
+  group size 1, status check timeout 60 minutes), keep the ten required
+  checks as they are. A repository ruleset can only be changed by the owner;
+  until it is, the rules above apply.
 
 ## Local review before a PR
 

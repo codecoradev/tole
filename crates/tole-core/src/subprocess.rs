@@ -103,6 +103,45 @@ pub fn scrub_env_for_child_keeping<'a>(cmd: &'a mut Command, keep: &[&str]) -> &
     })
 }
 
+/// The store directory a sibling `uteke` should use: `<CODECORA_HOME>/uteke`
+/// (uteke's own layout, `~/.codecora/uteke`, moved under the CodeCora root).
+/// `Ok(None)` when `CODECORA_HOME` is unset or empty (tole's own rule: empty
+/// counts as unset), so uteke keeps its default under `$HOME`, as tole's own
+/// data does. `Err` when `CODECORA_HOME` is set but not an absolute path:
+/// tole's own data is unresolvable then, and letting uteke fall back to the
+/// real `$HOME` store would be the leak this guards against (fail closed).
+pub fn uteke_store_dir() -> Result<Option<std::path::PathBuf>, String> {
+    if std::env::var("CODECORA_HOME").map_or(true, |v| v.is_empty()) {
+        return Ok(None);
+    }
+    match crate::paths::codecora_root() {
+        Some(root) => Ok(Some(root.join("uteke"))),
+        None => Err(
+            "CODECORA_HOME is not an absolute path: refusing to start uteke, \
+                     which would use the store under the real HOME"
+                .to_owned(),
+        ),
+    }
+}
+
+/// Point a child `uteke` at tole's data root (#992). uteke resolves its
+/// store, embedding model, `uteke.toml` and logs from `--store`, then
+/// `UTEKE_HOME`, then `$HOME/.codecora/uteke`; it knows nothing of
+/// `CODECORA_HOME`. With `CODECORA_HOME` set this exports
+/// `UTEKE_HOME=<CODECORA_HOME>/uteke`, and refuses (`Err`, nothing spawned)
+/// when `CODECORA_HOME` is set but relative. A `UTEKE_HOME` the user set
+/// themselves is kept: it is a deliberate choice of store. Every tole spawn
+/// of `uteke` calls this and does not start the child on `Err`.
+pub fn point_uteke_at_data_dir(cmd: &mut Command) -> Result<&mut Command, String> {
+    if std::env::var("UTEKE_HOME").is_ok_and(|v| !v.is_empty()) {
+        return Ok(cmd);
+    }
+    if let Some(dir) = uteke_store_dir()? {
+        cmd.env("UTEKE_HOME", dir);
+    }
+    Ok(cmd)
+}
+
 fn scrub_env_keeping<'a>(cmd: &'a mut Command, keep: &dyn Fn(&str) -> bool) -> &'a mut Command {
     // #682: a variable is also a secret by its value (a URL with a password,
     // or a value tole holds by role: a webhook key, the serve token, a

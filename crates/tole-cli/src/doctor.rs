@@ -30,7 +30,7 @@ use tole_core::openai::{
 };
 use tole_core::storage::JsonlStorage;
 use tole_core::tool::{Risk, Tool, ToolRegistry};
-use tole_core::turn::{run_turn, TurnOutcome};
+use tole_core::turn::TurnOutcome;
 
 /// Ledger file name under the tole data dir.
 pub const LEDGER_FILE: &str = "doctor-ledger.json";
@@ -237,7 +237,10 @@ fn drive(
             .with_streaming(streaming)
             .with_timeout(FULL_CALL_TIMEOUT)
             .with_tool_specs(registry.specs());
-        run_turn(&mut storage, &mut provider, registry, prompt).map_err(|e| e.to_string())
+        let cancel = tole_core::cancel::CancelToken::default();
+        let plan = crate::turn_runner::TurnPlan::new(cfg.clone(), registry, &cancel);
+        crate::turn_runner::run_turn_with(&mut storage, &mut provider, &plan, prompt)
+            .map_err(crate::turn_runner::TurnRunError::into_message)
     })();
     let _ = std::fs::remove_dir_all(&dir);
     result
@@ -809,6 +812,16 @@ pub fn run_cli(
             "{}",
             crate::ecosystem::line(sib, &crate::ecosystem::probe(sib))
         );
+    }
+    let home_dir = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from);
+    if let Some(w) = crate::ecosystem::store_move_warning(
+        std::env::var("CODECORA_HOME").ok().as_deref(),
+        std::env::var("UTEKE_HOME").ok().as_deref(),
+        home_dir.as_deref(),
+    ) {
+        println!("{w}");
     }
     // Review gate (#534): what a `git commit` needs while cora is attached.
     #[cfg(feature = "shell-tools")]
