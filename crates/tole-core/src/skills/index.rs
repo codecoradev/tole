@@ -525,6 +525,7 @@ mod uteke_doc {
         pub(super) fn run(&self, args: &[&str], stdin: Option<&[u8]>) -> Result<String, String> {
             let mut cmd = Command::new(&self.bin);
             crate::subprocess::scrub_env_for(&mut cmd, "skills");
+            crate::subprocess::point_uteke_at_data_dir(&mut cmd);
             cmd.args(args);
             let out = match stdin {
                 Some(bytes) => run_with_timeout_stdin(&mut cmd, SUBPROCESS_TIMEOUT, bytes)?,

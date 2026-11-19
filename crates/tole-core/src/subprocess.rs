@@ -103,6 +103,35 @@ pub fn scrub_env_for_child_keeping<'a>(cmd: &'a mut Command, keep: &[&str]) -> &
     })
 }
 
+/// The store directory a sibling `uteke` should use: `<CODECORA_HOME>/uteke`,
+/// uteke's own default layout (`~/.codecora/uteke`) moved under the CodeCora
+/// root. `Some` only when `CODECORA_HOME` is set, non-empty and absolute;
+/// without it uteke keeps its own default under `$HOME`, which is what the
+/// user expects.
+pub fn uteke_store_dir() -> Option<std::path::PathBuf> {
+    let set = std::env::var("CODECORA_HOME").is_ok_and(|v| !v.is_empty());
+    set.then(crate::paths::codecora_root)
+        .flatten()
+        .map(|r| r.join("uteke"))
+}
+
+/// Point a child `uteke` at tole's data root (#992). uteke resolves its
+/// store from `--store`, then `UTEKE_HOME`, then `$HOME/.codecora/uteke`;
+/// it knows nothing of `CODECORA_HOME`, so a run with `CODECORA_HOME` set
+/// but a real `HOME` would read and write the real store. With
+/// `CODECORA_HOME` set this exports `UTEKE_HOME=<CODECORA_HOME>/uteke`. A
+/// `UTEKE_HOME` the user set themselves is kept: it is a deliberate choice
+/// of store. Every tole spawn of `uteke` calls this.
+pub fn point_uteke_at_data_dir(cmd: &mut Command) -> &mut Command {
+    let user_set = std::env::var("UTEKE_HOME").is_ok_and(|v| !v.is_empty());
+    if !user_set {
+        if let Some(dir) = uteke_store_dir() {
+            cmd.env("UTEKE_HOME", dir);
+        }
+    }
+    cmd
+}
+
 fn scrub_env_keeping<'a>(cmd: &'a mut Command, keep: &dyn Fn(&str) -> bool) -> &'a mut Command {
     // #682: a variable is also a secret by its value (a URL with a password,
     // or a value tole holds by role: a webhook key, the serve token, a

@@ -129,6 +129,7 @@ pub fn recall(cfg: &MemoryConfig, query: &str) -> Result<Vec<RecallHit>, String>
 fn run_recall(cfg: &MemoryConfig, args: &[&str]) -> Result<Vec<RecallHit>, String> {
     let mut cmd = Command::new(&cfg.bin);
     crate::subprocess::scrub_env_for(&mut cmd, "memory");
+    crate::subprocess::point_uteke_at_data_dir(&mut cmd);
     cmd.args(args);
     let out = run_with_timeout(&mut cmd, SUBPROCESS_TIMEOUT)?;
     if !out.status.success() {
@@ -272,6 +273,7 @@ pub fn remember_session(
     };
     let mut cmd = Command::new(&cfg.bin);
     crate::subprocess::scrub_env_for(&mut cmd, "memory");
+    crate::subprocess::point_uteke_at_data_dir(&mut cmd);
     cmd.arg("remember")
         .arg(&content)
         .arg("--room")

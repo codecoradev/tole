@@ -208,6 +208,19 @@ the active `--profile`, are recalled; `tole skills retire` keeps a skill on disk
 but stops its recall. Skill approval is required by default, so only
 owner-approved content loads (below).
 
+**uteke store location (#992).** uteke resolves its store from `--store`,
+then `UTEKE_HOME`, then `$HOME/.codecora/uteke`; it does not read
+`CODECORA_HOME`. Every uteke tole spawns (the memory loop, `uteke_recall`,
+`uteke_document`, `UtekeSkillIndex` and `UtekeDocIndex`, the child-agent
+mailbox cleanup) therefore gets `UTEKE_HOME=<CODECORA_HOME>/uteke` when
+`CODECORA_HOME` is set, non-empty and absolute, so an isolated run never
+reads or writes the store under the real `HOME`. Residuals: a `UTEKE_HOME`
+the owner already exported wins, as a deliberate choice of store; a relative
+or empty `CODECORA_HOME` is unresolvable (see `paths`) and leaves uteke on its
+own default under `HOME`; the `--version` probe of `tole doctor` is not
+pointed at the store, because it opens none; and a uteke that tole did not
+spawn (a hook, a terminal) is outside this control.
+
 **Registry approval (#878).** `tole skills fetch <id> --pinned-sha <sha256>`
 approves a third-party skill by registry id, and downloads nothing: uteke
 0.24.1 returns no skill body (`skill show` is a manifest, the package hash and

@@ -488,6 +488,7 @@ fn clean_mailbox(ns: &str) {
     // Deleting a room only unlinks its memories, so forget them first.
     forget_listed(&["room", "recall", "--limit", "1000", "--json", "--", ns]);
     let mut drop_room = Command::new("uteke");
+    crate::subprocess::point_uteke_at_data_dir(&mut drop_room);
     drop_room
         .args(["room", "delete", "--confirm", "--", ns])
         .stdin(Stdio::null());
@@ -500,6 +501,7 @@ fn clean_mailbox(ns: &str) {
 /// `{"id"}` or nested `{"memory": {"id"}}` items).
 fn forget_listed(list_args: &[&str]) {
     let mut list = Command::new("uteke");
+    crate::subprocess::point_uteke_at_data_dir(&mut list);
     list.args(list_args).stdin(Stdio::null());
     let Ok(out) =
         crate::subprocess::run_with_timeout(&mut list, crate::subprocess::SUBPROCESS_TIMEOUT)
@@ -521,6 +523,7 @@ fn forget_listed(list_args: &[&str]) {
             .and_then(Value::as_str)
     }) {
         let mut cmd = Command::new("uteke");
+        crate::subprocess::point_uteke_at_data_dir(&mut cmd);
         cmd.args(["forget", "--confirm", "--", id])
             .stdin(Stdio::null());
         let _ =

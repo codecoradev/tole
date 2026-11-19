@@ -135,6 +135,7 @@ impl Tool for UtekeRecallTool {
         }
         let mut cmd = Command::new("uteke");
         crate::subprocess::scrub_env_for(&mut cmd, "uteke");
+        crate::subprocess::point_uteke_at_data_dir(&mut cmd);
         match input.get("room").and_then(Value::as_str) {
             Some(room) if !room.trim().is_empty() => {
                 // Same argv-flag-injection defense as UtekeDocumentTool:
@@ -302,6 +303,7 @@ impl Tool for UtekeDocumentTool {
         //    subprocess timeout every other invocation gets.
         let mut cmd = Command::new(&self.bin);
         crate::subprocess::scrub_env_for(&mut cmd, "uteke");
+        crate::subprocess::point_uteke_at_data_dir(&mut cmd);
         cmd.arg("doc").arg("create").arg(slug);
         if let Some(p) = parent {
             // An unknown parent or a tree past 10 deep is uteke's error,
@@ -329,6 +331,7 @@ impl Tool for UtekeDocumentTool {
             // ENV-1: same secret scrubbing as every other spawn point
             // (CodeCora scan 2026-09-18 — this spawn point missed it).
             crate::subprocess::scrub_env_for(&mut link, "uteke");
+            crate::subprocess::point_uteke_at_data_dir(&mut link);
             link.arg("room")
                 .arg("add-document")
                 .arg(room)
