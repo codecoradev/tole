@@ -209,9 +209,10 @@ pub fn run_serve(cfg: ServeConfig) -> Result<()> {
     let addr = format!("{}:{}", cfg.bind, cfg.port);
     let listener = TcpListener::bind(&addr)
         .with_context(|| format!("binding {addr} (in use? change --port)"))?;
+    let approvals = tole_cli::approvals::ApprovalQueue::shared();
     let state = Arc::new(State {
-        sessions: Arc::new(Mutex::new(Sessions::default())),
-        approvals: tole_cli::approvals::ApprovalQueue::shared(),
+        sessions: Arc::new(Mutex::new(sessions_keeping_pending(&approvals))),
+        approvals,
         allow_patterns: cfg.allow_patterns.clone(),
         profiles: cfg.profiles.clone(),
         plan_mode: cfg.plan_mode,
@@ -1271,6 +1272,15 @@ fn open_serve_session(
     }
 }
 
+/// The live-session map for `tole serve`: a session with a pending approval
+/// is never evicted, because an Allow resumes it in memory (#979).
+fn sessions_keeping_pending(approvals: &Arc<tole_cli::approvals::ApprovalQueue>) -> Sessions {
+    let queue = Arc::clone(approvals);
+    let mut sessions = Sessions::default();
+    sessions.set_keep(Box::new(move |id| queue.has_pending(id)));
+    sessions
+}
+
 /// Look up a session's context window off the request path (#573): the
 /// provider's `/models` may be slow and the status route never waits for it.
 fn warm_status(state: &State, id: &str) {
@@ -1874,6 +1884,28 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                 // A session this server does not host is a parked cron run
                 // (#581): it resumes through the cron ledger instead.
                 let serve_session = lock_sessions(&state.sessions).get(&sid).is_some();
+                // Neither live here nor parked in the cron ledger: nothing
+                // can run the approved call (the session was evicted or its
+                // process restarted). Say so instead of promising a resume.
+                // An error reading the ledger is not a "no": the resume below
+                // surfaces it in the log, as before.
+                if !serve_session && matches!(tole_cli::cron::has_parked_run(&sid), Ok(false)) {
+                    // The grant must not outlive the refusal: a session
+                    // reopened later would consume it silently.
+                    state.approvals.revoke_one_shot(&id);
+                    return (
+                        409,
+                        json!({
+                            "error": "the decision is recorded, but the session is not live in \
+                                      this server and no cron run is parked on it, so nothing \
+                                      was resumed; reopen it with POST /sessions {\"resume\": \
+                                      \"<id>\"} and send a new prompt",
+                            "id": id,
+                            "status": status.as_str(),
+                            "resuming": false,
+                        }),
+                    );
+                }
                 let queue = Arc::clone(&state.approvals);
                 let turn_notifier = state.turn_events.get().cloned();
                 std::thread::spawn(move || {
@@ -2495,9 +2527,11 @@ mod tests {
         // The audit can be written now: the retry finishes the decision.
         std::fs::create_dir_all(&missing).unwrap();
         tole_core::storage::JsonlStorage::create(&missing, "srv-audit-retry", None).unwrap();
+        // The session is not live here, so after the audit nothing resumes:
+        // the answer says so (#979) instead of `resuming: true`.
         let (status, body) = route(&state, "POST", &path, &allow);
-        assert_eq!(status, 202, "{body}");
-        assert_eq!(body["resuming"], true);
+        assert_eq!(status, 409, "{body}");
+        assert_eq!(body["resuming"], false);
         let audit = std::fs::read_to_string(missing.join("srv-audit-retry.jsonl")).unwrap();
         assert_eq!(
             audit.matches(&format!("approval_{id}")).count(),
@@ -2514,6 +2548,49 @@ mod tests {
             1,
             "{audit}"
         );
+    }
+
+    /// #979: an Allow for a session this server no longer hosts, with no
+    /// parked cron run, must not answer `resuming: true`; a Deny is still a
+    /// plain recorded verdict.
+    #[test]
+    fn an_allow_for_a_session_that_is_not_live_is_refused_not_promised() {
+        let base = crate::test_dir::TestDir::new("tole-serve-evicted-allow");
+        let root = base.join("ws");
+        let sessions = base.join("sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&sessions).unwrap();
+        let state = test_state(root, sessions.clone());
+        tole_core::storage::JsonlStorage::create(&sessions, "srv-gone", None).unwrap();
+        let queue = |n: u64| {
+            state.approvals.queue_entry(
+                "srv-gone",
+                "write_file",
+                "write file x.txt",
+                n,
+                sessions.join("srv-gone.jsonl"),
+            )
+        };
+        let id = queue(1);
+        let (status, body) = route(
+            &state,
+            "POST",
+            &format!("/approvals/{id}/decision"),
+            &json!({"decision": "allow"}).to_string(),
+        );
+        assert_eq!(status, 409, "{body}");
+        assert_eq!(body["resuming"], false);
+        assert!(body["error"].as_str().unwrap().contains("not live"));
+        // The refused allow left no one-shot behind (F2).
+        assert!(!state.approvals.has_pending("srv-gone"));
+        let id = queue(2);
+        let (status, body) = route(
+            &state,
+            "POST",
+            &format!("/approvals/{id}/decision"),
+            &json!({"decision": "deny"}).to_string(),
+        );
+        assert_eq!(status, 200, "{body}");
     }
 
     /// cora 0.19 scan MAJOR: REST `POST /sessions` must enforce the same
