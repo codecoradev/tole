@@ -1969,7 +1969,8 @@ fn dispatch(cli: Cli) -> Result<()> {
             }
             check_server_face_flags("acp", &host, &settings, explicit_mcp)?;
             tole_cli::session_host::set_server_skills(
-                tole_cli::session::assemble::ServerSkills::new(host.skills.clone(), host.no_skills),
+                tole_cli::session::assemble::ServerSkills::new(host.skills.clone(), host.no_skills)
+                    .map_err(anyhow::Error::msg)?,
             );
             if host.plan_mode {
                 eprintln!("tole acp: --plan-mode is active — serving read-only tools only");
@@ -2021,7 +2022,8 @@ fn dispatch(cli: Cli) -> Result<()> {
             }
             check_server_face_flags("serve", &host, &settings, explicit_mcp)?;
             tole_cli::session_host::set_server_skills(
-                tole_cli::session::assemble::ServerSkills::new(host.skills.clone(), host.no_skills),
+                tole_cli::session::assemble::ServerSkills::new(host.skills.clone(), host.no_skills)
+                    .map_err(anyhow::Error::msg)?,
             );
             let memory = match memory.as_deref().filter(|s| !s.trim().is_empty()) {
                 Some(m) => resolve_memory(
@@ -2832,6 +2834,26 @@ fn check_server_face_flags(
     // `serve` and `acp` host sessions that load skills (#945), so the owner's
     // `--skill` / `--no-skills` apply there; `mcp` and `mission` still refuse.
     let hosts_skills = matches!(face, "serve" | "acp");
+    // A skill file named by the PROJECT config sits inside the served
+    // repository and its bytes are not bound by the config trust: a later
+    // `git pull` would change what loads into every new session. Refused;
+    // the flag, TOLE_SKILL, a profile and the user config are the owner's own.
+    if hosts_skills
+        && settings
+            .skill
+            .as_ref()
+            .is_some_and(|s| s.source == tole_cli::config_apply::Source::Config)
+    {
+        return Err(refuse_for(
+            &format!(
+                "--skill from the project config is not supported by `tole {face}` (a skill \
+                 file the repository names is not content-bound; pass --skill or TOLE_SKILL, \
+                 or set it in the user config)"
+            ),
+            Some(tole_cli::config_apply::Source::Config),
+            true,
+        ));
+    }
     let (skills, no_skills) = if hosts_skills {
         (&[][..], false)
     } else {

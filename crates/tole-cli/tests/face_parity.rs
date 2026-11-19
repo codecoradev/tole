@@ -118,7 +118,11 @@ fn observed(base: &TestDir) -> BTreeMap<String, BTreeMap<&'static str, bool>> {
     for n in names(&registry(&FacePolicy::CRON, &w, true)) {
         put("cron", n);
     }
-    // A server session is built by the real session host.
+    // A server session is built by the real session host; the entrypoint
+    // (`tole serve`) sets the process's skills choice first (#945).
+    tole_cli::session_host::set_server_skills(
+        tole_cli::session::assemble::ServerSkills::new(vec![], false).unwrap(),
+    );
     let session = tole_cli::session_host::open_session(
         "face-parity",
         w.to_str().unwrap(),

@@ -824,9 +824,14 @@ fn serve_refuses_config_hooks_like_the_flag() {
         &serve,
         "--on-pretool/--on-posttool are not supported by `tole serve`",
     );
-    // `skill` / `no_skills` are no longer refused here: serve sessions load
-    // skills (#945), so the owner's choice applies to them. `tole mcp` and
-    // `tole mission` still refuse them (below).
+    // A skill file the PROJECT config names is not content-bound (#945): refused.
+    assert_refused_with_hint(
+        "skill = [\"s/SKILL.md\"]\n",
+        &serve,
+        "--skill from the project config is not supported by `tole serve`",
+    );
+    // `no_skills` only turns skills off, and is no longer refused: serve
+    // sessions load skills (#945). `tole mcp` and `tole mission` still refuse.
     #[cfg(feature = "mcp")]
     assert_refused_with_hint(
         "mcp_server = [\"a=b\"]\n",
@@ -843,7 +848,11 @@ fn acp_refuses_config_hooks_skills_and_mcp_servers_like_the_flag() {
         &["acp"],
         "--on-pretool/--on-posttool are not supported by `tole acp`",
     );
-    // `skill` / `no_skills` apply to acp sessions now (#945); not refused.
+    assert_refused_with_hint(
+        "skill = [\"s\"]\n",
+        &["acp"],
+        "--skill from the project config is not supported by `tole acp`",
+    );
     #[cfg(feature = "mcp")]
     assert_refused_with_hint(
         "mcp_server = [\"a=b\"]\n",
@@ -1090,4 +1099,43 @@ fn server_faces_name_tole_skill_in_the_refusal() {
         "{err}"
     );
     assert!(err.contains("the value comes from TOLE_SKILL"), "{err}");
+}
+
+/// #945: on `serve` and `acp` the owner's `--skill`, `TOLE_SKILL` and user
+/// config `skill` pass the face check (they reach the startup validation of
+/// the file, which fails here because the file is missing); the project
+/// config's does not.
+#[cfg(feature = "shell-tools")]
+#[test]
+fn server_faces_accept_the_owners_skill_sources_but_not_the_project_config() {
+    let refusal = "is not supported by";
+    for face in [&["serve", "--port", "0", "--token", "t"][..], &["acp"][..]] {
+        let startup_failure = |o: &Output| {
+            let err = text(&o.stderr);
+            assert!(!o.status.success(), "{err}");
+            assert!(err.contains("--skill") && err.contains("nope"), "{err}");
+            assert!(!err.contains(refusal), "{err}");
+        };
+        // Flag.
+        let (d, home) = project("");
+        let mut args = vec!["--skill", "nope/SKILL.md"];
+        args.extend_from_slice(face);
+        startup_failure(&finish(base_cmd(&d, &home, &args)));
+        // TOLE_SKILL.
+        let o = finish(with_env(
+            base_cmd(&d, &home, face),
+            "TOLE_SKILL",
+            "nope/SKILL.md",
+        ));
+        startup_failure(&o);
+        // User config.
+        let (d, home) = project("");
+        std::fs::create_dir_all(home.join("tole")).unwrap();
+        std::fs::write(
+            home.join("tole/config.toml"),
+            "skill = [\"nope/SKILL.md\"]\n",
+        )
+        .unwrap();
+        startup_failure(&finish(base_cmd(&d, &home, face)));
+    }
 }

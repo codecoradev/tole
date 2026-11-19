@@ -371,7 +371,21 @@ pub fn open_session_with(
     plan_emitter: Option<PlanEmitter>,
     overrides: SessionOverrides,
 ) -> Result<SessionState, String> {
-    let skills = SERVER_SKILLS.get().cloned().unwrap_or_default();
+    // An unset cell is an error, never a silent default: a default would lose
+    // the owner's `--no-skills` for an entrypoint that forgot to set it.
+    let skills = match SERVER_SKILLS.get() {
+        Some(s) => s.clone(),
+        #[cfg(test)]
+        None => Default::default(),
+        #[cfg(not(test))]
+        None => {
+            return Err(
+                "server skills are not configured: the entrypoint must call \
+                        session_host::set_server_skills before opening a session"
+                    .into(),
+            )
+        }
+    };
     open_session_inner(
         session_id,
         cwd,
