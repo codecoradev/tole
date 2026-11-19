@@ -83,7 +83,11 @@ fn observe(tag: &str, env: &[(&str, &str)], prep: impl Fn(&TestDir) -> Vec<Strin
     let extra = prep(&base);
     let (url, seen) = mock_provider();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
-    cmd.arg("run")
+    // `--no-auto-mcp`: a `cora` binary on PATH would otherwise attach the cora
+    // MCP preset, which adds tools and (with both review tools) a review
+    // section to the prompt, so the result would depend on the machine.
+    cmd.arg("--no-auto-mcp")
+        .arg("run")
         .args(&extra)
         .arg("go")
         .current_dir(base.join("w"))
@@ -122,6 +126,10 @@ fn observe(tag: &str, env: &[(&str, &str)], prep: impl Fn(&TestDir) -> Vec<Strin
                 .collect()
         })
         .unwrap_or_default();
+    // Tools that exist only when an optional binary is on PATH (`uteke`,
+    // `cora`) are not part of the pinned roster; the rest is.
+    tools
+        .retain(|t| !(t == "cora_search" || t.starts_with("uteke_") || t.starts_with("mcp_cora_")));
     tools.sort();
     Observed {
         system: normalize(msg["content"].as_str().expect("system content")),
@@ -151,7 +159,6 @@ const CONTEXT: &str = "\nContext: working directory <CWD>; today is <DATE> (UTC)
 const ALL_TOOLS: &[&str] = &[
     "agent_poll",
     "agent_start",
-    "cora_search",
     "cron_create",
     "delegate",
     "delegate_poll",
@@ -177,7 +184,6 @@ const ALL_TOOLS: &[&str] = &[
 ];
 
 const READ_ONLY_TOOLS: &[&str] = &[
-    "cora_search",
     "job_poll",
     "read_file",
     "todo_read",
