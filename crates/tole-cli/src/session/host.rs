@@ -599,6 +599,16 @@ fn record_mcp_notices(
         let text = crate::provider_chain::process_secrets(&crate::config_apply::real_env)
             .redact(&text)
             .into_owned();
+        // A resume re-opens the session: the same server and reason is not
+        // appended again (a changed reason is).
+        let seen = storage.entries().iter().any(|e| {
+            e.payload["notice"] == "mcp_server_not_started"
+                && e.payload["server"] == n.server.as_str()
+                && e.payload["error"] == text.as_str()
+        });
+        if seen {
+            continue;
+        }
         storage
             .commit(tole_core::storage::Commit::new().entry(NewEntry::root(
                 EntryType::new(EntryType::ERROR),

@@ -178,8 +178,7 @@ fn owner_servers_go_through_the_lock_and_refused_ones_leave_one_notice_each() {
     let path = session.path.clone();
     drop(log);
     drop(session);
-    // A resumed session records its refusals again (the lock may have
-    // changed since), and still opens.
+    // A resumed session still opens, and its notices are not repeated.
     let again = tole_cli::session_host::open_session(
         "srv-mcp",
         d.join("w").to_str().unwrap(),
@@ -201,7 +200,7 @@ fn owner_servers_go_through_the_lock_and_refused_ones_leave_one_notice_each() {
         .iter()
         .filter(|e| e.payload["notice"] == "mcp_server_not_started")
         .count();
-    assert_eq!(n, 6, "three refusals per open");
+    assert_eq!(n, 3, "a resume does not repeat a notice already in the log");
     let _ = std::fs::remove_dir_all(&d);
 }
 
