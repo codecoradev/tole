@@ -15,7 +15,7 @@ use common::{Gate, TestDir};
 use serde_json::{json, Value};
 use std::io::{BufRead, Read, Write};
 use std::net::TcpListener;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -23,6 +23,8 @@ use std::time::Duration;
 
 struct AcpProcess {
     child: Child,
+    /// Hermetic HOME (#993), removed after `Drop` has killed the child.
+    _home: TestDir,
     rx: mpsc::Receiver<String>,
     stdin: Arc<Mutex<std::process::ChildStdin>>,
     permission_count: Arc<AtomicUsize>,
@@ -30,7 +32,8 @@ struct AcpProcess {
 
 impl AcpProcess {
     fn spawn(base_url: &str) -> Self {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
+        let home = TestDir::new("tole-acp-home");
+        let mut cmd = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), home.path(), &[]);
         cmd.arg("acp")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -68,6 +71,7 @@ impl AcpProcess {
         });
         Self {
             child,
+            _home: home,
             rx,
             stdin,
             permission_count,

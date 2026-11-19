@@ -1183,6 +1183,14 @@ pub fn serve_ticker(dir: &Path, approvals: std::sync::Arc<crate::approvals::Appr
     }
 }
 
+/// True when an unresumed cron run is parked on `session_id`'s approval: the
+/// one case where an Allow for a session `tole serve` does not host resumes
+/// anything. Reads the ledger under its lock; an `Err` means "could not
+/// tell" and must not be taken as "no".
+pub fn has_parked_run(session_id: &str) -> anyhow::Result<bool> {
+    tick::has_parked(&default_dir()?, session_id)
+}
+
 /// `/approvals` allow on a cron run's session (#581, serve route): resumes
 /// the parked run with the same options as the in-process ticker.
 pub fn resume_after_approval(
