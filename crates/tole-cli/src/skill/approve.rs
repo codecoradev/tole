@@ -440,7 +440,7 @@ pub fn consent(
 
 /// Print the package the owner is about to approve: directory, each file
 /// with its size, and the hash.
-pub(crate) fn show_package(pkg: &tole_core::skill_approval::SkillPackage) {
+fn show_package(pkg: &tole_core::skill_approval::SkillPackage) {
     for l in package_listing(pkg) {
         println!("{l}");
     }
