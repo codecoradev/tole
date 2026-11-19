@@ -79,6 +79,11 @@ fn spawn_mock() -> String {
 /// returns `beta` (0.9), `gamma` (0.2, below the floor) and `delta` (0.8,
 /// retired). It logs every call.
 fn fixture(tag: &str) -> TestDir {
+    fixture_with(tag, false)
+}
+
+/// `pre_024`: a uteke without the `skill` subcommand (it exits 2 on it).
+fn fixture_with(tag: &str, pre_024: bool) -> TestDir {
     let dir = TestDir::new(&format!("tole-skidx-e2e-{tag}"));
     for n in ["alpha", "beta", "gamma", "delta"] {
         let d = dir.join("ws").join("skills").join(n);
@@ -110,10 +115,23 @@ fn fixture(tag: &str) -> TestDir {
         {"document": {"slug": "skill-gamma"}, "score": 0.2},
     ]);
     std::fs::write(bin.join("search.json"), hits.to_string()).unwrap();
+    let skill_hits = json!([
+        {"name": "beta", "score": 0.9},
+        {"name": "delta", "score": 0.8, "status": "retired"},
+        {"name": "gamma", "score": 0.2},
+    ]);
+    std::fs::write(bin.join("skill-search.json"), skill_hits.to_string()).unwrap();
+    let skill_help = if pre_024 {
+        "echo 'unrecognized subcommand' >&2; exit 2"
+    } else {
+        "exit 0"
+    };
     let b = bin.display();
     let script = format!(
         "#!/bin/sh\necho \"$*\" >> {b}/argv.log\n\
          case \"$1 $2\" in\n\
+         'skill --help') {skill_help} ;;
+         'skill search') cat {b}/skill-search.json ;;
          'doc search') cat {b}/search.json ;;\n\
          'doc get') cat {b}/$3.json ;;\n\
          *) echo '[]' ;;\n\
@@ -184,12 +202,47 @@ fn uteke_index_lists_pinned_plus_recalled_for_the_run_prompt() {
     assert!(!out.contains("- gamma"), "below the floor: {out}");
     assert!(!out.contains("- delta"), "retired: {out}");
     assert!(out.contains("skill_search"), "{out}");
-    // The recall query is the run prompt; semantic mode.
+    // The recall query is the run prompt, sent to the skill surface (#973),
+    // never to the hidden-in-0.24 document surface.
+    let log = std::fs::read_to_string(dir.join("bin/argv.log")).unwrap();
+    assert!(
+        log.contains("skill search ship the release --limit"),
+        "{log}"
+    );
+    assert!(!log.contains("doc search"), "{log}");
+    assert!(!err.contains("no `skill` subcommand"), "{err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pre_024_uteke_degrades_to_the_doc_surface_with_one_note() {
+    let url = spawn_mock();
+    let dir = fixture_with("pre024", true);
+    let (out, err, code) = run(
+        &dir,
+        &url,
+        &[
+            ("TOLE_SKILL_INDEX", "uteke"),
+            ("TOLE_SKILLS_PINNED", "alpha"),
+        ],
+    );
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        out.contains("- alpha — local alpha\n- beta — local beta\n"),
+        "{out}\n{err}"
+    );
+    assert!(!out.contains("- delta"), "retired: {out}");
+    assert_eq!(
+        out.matches("no `skill` subcommand").count() + err.matches("no `skill` subcommand").count(),
+        1,
+        "exactly one note: {out}\n{err}"
+    );
     let log = std::fs::read_to_string(dir.join("bin/argv.log")).unwrap();
     assert!(
         log.contains("doc search ship the release --mode semantic"),
         "{log}"
     );
+    assert!(!log.contains("skill search"), "{log}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
