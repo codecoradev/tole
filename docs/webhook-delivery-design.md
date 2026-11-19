@@ -286,7 +286,8 @@ two `webhook:` targets sends the same id to both destinations.
   to `serve_ticker` (`serve.rs`, ~187) **whether or not `--cron` is given**: a
   serve without `--cron` still needs it for approval events. ureq is blocking
   and serve is thread-based; there is no async runtime to join. It owns the
-  approval timer of §8.
+  approval timer of §8 (since #980 the approval and turn events are sent by
+  one worker thread per destination next to that timer, see section 4).
 - **Cron events: a durable outbox, which the sender treats as untrusted input.**
   `<cron dir>/outbox.jsonl`: append-only JSONL, mode 0600, one line per
   `enqueue` (destination, id, the redacted body once, deadline), `lease`
@@ -385,6 +386,20 @@ two `webhook:` targets sends the same id to both destinations.
   live in a bounded in-memory queue (256 per destination, newest dropped when
   full, counted). The gateway reconciles with `GET /approvals` at start (and
   after any reconnect).
+- **Approval and turn event delivery: one worker per destination (#980).** The
+  volatile queue is drained by a fixed set of threads started with serve: one
+  worker per destination that lists `approval_requested`, `approval_resolved`
+  or `turn_finished` (the destinations are loaded once, so the count is bounded
+  by the config), and one timer thread that runs the 30 s expiry of section 8
+  and reports dropped events. A worker sends its destination's oldest due event
+  with one request in flight, and after a transient failure stops until its
+  next look a second later. A destination that hangs until its timeout (up to
+  30 s per attempt) therefore delays only its own events: other destinations
+  and the expiry of unanswered approvals keep going. Before, one thread sent
+  every due event in turn, so up to 256 events of one unreachable destination
+  could hold back all the others and the timer. A retry that comes back to a
+  full queue is dropped (counted, never a newer event), given up and reported
+  with the code `queue_full`.
 - **Retry.** Per event, until its deadline. Retry on: connect or TLS error, DNS
   failure, timeout, 5xx, 408, 429. **No retry** on another 4xx (the receiver
   understood and refused), on a 3xx (redirects are never followed), on a

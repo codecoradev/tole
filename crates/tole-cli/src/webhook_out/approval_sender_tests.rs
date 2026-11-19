@@ -646,3 +646,212 @@ fn the_sender_starts_for_a_turn_event_alone() {
         "no destination, no notifier, no thread"
     );
 }
+
+// ---- a hung destination (#980) ----
+
+/// A retry that comes back to a full queue is given up and reported, not lost
+/// in silence.
+#[test]
+fn a_retry_refused_by_a_full_queue_is_given_up_and_reported() {
+    struct FillsThenFails(Arc<VolatileQueue>);
+    impl Poster for FillsThenFails {
+        fn post(&self, _: &Request<'_>) -> Result<Reply, PostError> {
+            // While the event is in flight a new one takes its slot.
+            self.0.push(queued("g", 999)).unwrap();
+            status(500)
+        }
+    }
+    let d = dests(&[("g", &[Event::ApprovalRequested])]);
+    let queue = VolatileQueue::new();
+    for i in 0..crate::webhook_out::volatile::MAX_PER_DESTINATION {
+        queue.push(queued("g", i)).unwrap();
+    }
+    let mut failed = Vec::new();
+    let l = drain(
+        &queue,
+        &|_| true,
+        &d,
+        &|| NOW,
+        &FillsThenFails(Arc::clone(&queue)),
+        &FixedKey(Some(KEY)),
+        &mut |d, c| failed.push((d.to_string(), c.to_string())),
+    );
+    assert_eq!((l.sent, l.retried, l.gave_up), (0, 0, 1));
+    assert_eq!(failed, [("g".to_string(), "queue_full".to_string())]);
+    assert_eq!(
+        queue.len("g"),
+        crate::webhook_out::volatile::MAX_PER_DESTINATION
+    );
+}
+
+fn queued(dest: &str, n: usize) -> Queued {
+    Queued {
+        dest: dest.into(),
+        id: format!("evt-{n}"),
+        event: Event::ApprovalRequested,
+        body: format!("{{\"n\":{n}}}"),
+        deadline: NOW + 900,
+        attempts: 0,
+        next_at: 0,
+        session: None,
+    }
+}
+
+/// A loopback destination at `addr` with `timeout`.
+fn loopback(addr: std::net::SocketAddr, timeout: Duration) -> Destination {
+    Destination {
+        url: format!("http://{addr}/hook"),
+        policy: AddrPolicy::new(true, false),
+        timeout,
+        ..dest(&[Event::ApprovalRequested, Event::TurnFinished])
+    }
+}
+
+/// Accepts and never answers; tells `accepted` about each connection and keeps
+/// it open.
+fn hung_listener(accepted: std::sync::mpsc::Sender<()>) -> std::net::SocketAddr {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let mut open = Vec::new();
+        for s in l.incoming().flatten() {
+            open.push(s);
+            let _ = accepted.send(());
+        }
+    });
+    addr
+}
+
+/// Answers every request 200 and reports the body it read.
+fn healthy_listener(bodies: std::sync::mpsc::Sender<String>) -> std::net::SocketAddr {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for s in l.incoming().flatten() {
+            let mut r = BufReader::new(s);
+            let mut len = 0;
+            loop {
+                let mut line = String::new();
+                if r.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+                if let Some((k, v)) = line.split_once(':') {
+                    if k.eq_ignore_ascii_case("content-length") {
+                        len = v.trim().parse().unwrap_or(0);
+                    }
+                }
+            }
+            let mut body = vec![0; len];
+            let _ = r.read_exact(&mut body);
+            let mut s = r.into_inner();
+            let _ =
+                s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            let _ = bodies.send(String::from_utf8_lossy(&body).into_owned());
+        }
+    });
+    addr
+}
+
+#[test]
+fn a_hung_destination_delays_neither_another_destination_nor_the_expiry_timer() {
+    let (acc_tx, acc_rx) = std::sync::mpsc::channel();
+    let (body_tx, body_rx) = std::sync::mpsc::channel();
+    let hung = hung_listener(acc_tx);
+    let healthy = healthy_listener(body_tx);
+    // The hung destination's timeout outlasts every bound asserted below.
+    let d = Arc::new(Destinations(
+        [
+            (
+                "a-hung".to_string(),
+                loopback(hung, Duration::from_secs(20)),
+            ),
+            (
+                "b-ok".to_string(),
+                loopback(healthy, Duration::from_secs(5)),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+    ));
+    let clock = Arc::new(std::sync::atomic::AtomicI64::new(NOW));
+    let queue = VolatileQueue::new();
+    for n in 0..3 {
+        for dest in ["a-hung", "b-ok"] {
+            queue.push(queued(dest, n)).unwrap();
+        }
+    }
+    let expired = Arc::new(AtomicUsize::new(0));
+    let e = Arc::clone(&expired);
+    let sender = ApprovalSender::new(
+        Arc::clone(&queue),
+        Box::new(move || {
+            e.fetch_add(1, Ordering::SeqCst);
+        }),
+    );
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let c = Arc::clone(&clock);
+    let key: Vec<u8> = std::iter::repeat_n(b'k', 32).collect();
+    struct RuntimeKey(Vec<u8>);
+    impl Keys for RuntimeKey {
+        fn key(&self, _: &Destination) -> Result<Vec<u8>, &'static str> {
+            Ok(self.0.clone())
+        }
+    }
+    let workers = start(
+        Arc::clone(&d),
+        sender,
+        Wiring {
+            poster: Arc::new(NetPoster),
+            keys: Arc::new(RuntimeKey(key)),
+            clock: Arc::new(move || c.load(Ordering::SeqCst)),
+            failed: Arc::new(|_, _| {}),
+            stop: Arc::clone(&stop),
+        },
+    );
+    assert_eq!(workers, 2, "one worker per destination");
+
+    // The hung destination has a request in flight...
+    acc_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the hung destination was never contacted");
+    let started = std::time::Instant::now();
+    // ...and the healthy one still gets all three events, in order.
+    let mut got = Vec::new();
+    for _ in 0..3 {
+        got.push(
+            body_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the healthy destination was held back"),
+        );
+    }
+    assert_eq!(got, ["{\"n\":0}", "{\"n\":1}", "{\"n\":2}"]);
+    // The timer ran at start; 30 s later (on the test clock) it runs again
+    // although the hung send has not timed out.
+    assert!(expired.load(Ordering::SeqCst) >= 1);
+    clock.fetch_add(EXPIRE_EVERY_SECS, Ordering::SeqCst);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while expired.load(Ordering::SeqCst) < 2 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        expired.load(Ordering::SeqCst),
+        2,
+        "the expiry timer stalled"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "the bounds above ran past the hung timeout: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        acc_rx.try_recv().is_err(),
+        "one request in flight per destination"
+    );
+    assert_eq!(
+        queue.len("a-hung"),
+        2,
+        "the hung destination's other events wait"
+    );
+    stop.store(true, Ordering::Relaxed);
+}

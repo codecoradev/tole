@@ -141,9 +141,19 @@ impl VolatileQueue {
     /// poisoned event cannot stall a destination. Events past their deadline are
     /// removed too and returned in `expired`: they are never sent.
     pub fn take_due(&self, now: i64) -> Taken {
+        self.take_due_where(now, &|_| true)
+    }
+
+    /// [`Self::take_due`] for the destinations `wanted` accepts only; the queues
+    /// of the others are left untouched (#980: one worker per destination takes
+    /// its own events only).
+    pub fn take_due_where(&self, now: i64, wanted: &dyn Fn(&str) -> bool) -> Taken {
         let mut m = self.by_dest.lock().unwrap_or_else(|p| p.into_inner());
         let mut out = Taken::default();
-        for q in m.values_mut() {
+        for (dest, q) in m.iter_mut() {
+            if !wanted(dest) {
+                continue;
+            }
             let mut i = 0;
             while i < q.len() {
                 if q[i].deadline <= now {
