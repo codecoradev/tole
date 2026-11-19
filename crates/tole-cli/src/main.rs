@@ -1967,7 +1967,8 @@ fn dispatch(cli: Cli) -> Result<()> {
                     pretool_from_config(&settings),
                 ));
             }
-            check_server_face_flags("acp", &host, &settings, explicit_mcp)?;
+            check_server_face_flags("acp", &host, &settings, false)?;
+            install_owner_mcp("acp", &settings)?;
             tole_cli::session_host::set_server_skills(
                 tole_cli::session::assemble::ServerSkills::new(host.skills.clone(), host.no_skills)
                     .map_err(anyhow::Error::msg)?,
@@ -2020,7 +2021,8 @@ fn dispatch(cli: Cli) -> Result<()> {
                     pretool_from_config(&settings),
                 ));
             }
-            check_server_face_flags("serve", &host, &settings, explicit_mcp)?;
+            check_server_face_flags("serve", &host, &settings, false)?;
+            install_owner_mcp("serve", &settings)?;
             tole_cli::session_host::set_server_skills(
                 tole_cli::session::assemble::ServerSkills::new(host.skills.clone(), host.no_skills)
                     .map_err(anyhow::Error::msg)?,
@@ -2888,6 +2890,41 @@ fn check_server_face_flags(
         // `mission` is attended: it keeps the `--no-config` way out.
         refuse_for(&e.to_string(), cfg, face != "mission")
     })
+}
+
+/// The MCP client servers of the OWNER for a server session (#946), read once
+/// at startup: the `--mcp-server` flag or the user config (the owner typed
+/// both). The merged list the CLI uses is NOT read here: it also holds the
+/// `cora` auto-preset, which attaches on a PATH lookup and must never happen
+/// on a server face. A server specification that comes from the PROJECT
+/// config (a file of the served repository) is refused loudly, as hooks from
+/// it are: a repository must not choose a process to start in the owner's
+/// account.
+#[cfg(feature = "shell-tools")]
+fn owner_mcp_specs(face: &str, settings: &tole_cli::config_apply::Settings) -> Result<Vec<String>> {
+    use tole_cli::config_apply::Source;
+    let Some(e) = settings.mcp_server.as_ref() else {
+        return Ok(Vec::new());
+    };
+    match e.source {
+        Source::Flag | Source::UserConfig => Ok(e.value.clone()),
+        _ => Err(refuse_for(
+            &format!(
+                "an MCP server specification from the project config is not supported by \
+                 `tole {face}` (a repository file must not choose a process to start; set \
+                 `mcp_server` in the user config or pass --mcp-server)"
+            ),
+            Some(Source::Config),
+            true,
+        )),
+    }
+}
+
+/// Installs the owner's MCP servers for the server sessions of `face`.
+#[cfg(feature = "shell-tools")]
+fn install_owner_mcp(face: &str, settings: &tole_cli::config_apply::Settings) -> Result<()> {
+    let specs = owner_mcp_specs(face, settings)?;
+    tole_cli::session::owner_mcp::set(specs).map_err(anyhow::Error::msg)
 }
 
 /// The CLI faces' registry: the shared tool roster behind the

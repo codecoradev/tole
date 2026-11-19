@@ -446,7 +446,10 @@ pub struct FacePolicy {
     pub agents: AgentsPolicy,
     /// May the session use MCP client servers (`--mcp-server`, the cora
     /// auto-preset)? A security boundary: off wherever the face cannot
-    /// vouch for the operator's choice.
+    /// vouch for the operator's choice. On a server session (#946) it is on,
+    /// but the servers come only from [`crate::session::owner_mcp`] (the
+    /// owner's command line or user config, read at startup; empty unless the
+    /// owner configured some) and never from a request or the PATH.
     pub mcp_clients: bool,
 }
 
@@ -470,7 +473,7 @@ impl FacePolicy {
         name: "server-session",
         shell_dir: ShellDir::Workspace,
         agents: AgentsPolicy::Classic,
-        mcp_clients: false,
+        mcp_clients: true,
     };
     /// A cron run.
     pub const CRON: FacePolicy = FacePolicy {
@@ -854,11 +857,9 @@ mod face_policy_tests {
             roster_for(p, i).map(|r| r.mcp_servers.len())
         };
         assert_eq!(mk(&FacePolicy::CLI).unwrap(), 1);
-        for p in [
-            FacePolicy::MCP_SERVER,
-            FacePolicy::SERVER_SESSION,
-            FacePolicy::CRON,
-        ] {
+        // A server session takes what its host passes (the owner's list, #946).
+        assert_eq!(mk(&FacePolicy::SERVER_SESSION).unwrap(), 1);
+        for p in [FacePolicy::MCP_SERVER, FacePolicy::CRON] {
             assert_eq!(mk(&p).unwrap(), 0, "{}", p.name);
         }
     }
