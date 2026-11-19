@@ -238,6 +238,135 @@ pub fn apply_skills_in(
     Ok(sections)
 }
 
+// ---------------------------------------------------------------------------
+// Face policy (#943)
+// ---------------------------------------------------------------------------
+
+/// Where a face's shell tools (`run_command`, `git`, `gh`) run. Files are
+/// jailed to the workspace on every face; only the shell directory differs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShellDir {
+    /// The process working directory (the CLI faces and `tole mcp`).
+    ProcessCwd,
+    /// The session workspace (server faces and cron).
+    Workspace,
+}
+
+/// Which child-agent tools a face gets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentsPolicy {
+    /// None.
+    None,
+    /// The classic depth-1 agent tools, without delegation (serve, ACP).
+    Classic,
+    /// `delegate` / `delegate_poll` over the delegation tree (the CLI faces).
+    Delegating,
+}
+
+/// What differs between faces when a session's tool roster is built, as plain
+/// data: the capabilities a face may have and where its shell tools run.
+/// Identity, auth, input/output format and the approval channel are NOT here
+/// (they are the face's own, see the epic #941). Each constant is the value
+/// the face had before this table existed; nothing changes by moving them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FacePolicy {
+    /// A short name, for tests and diagnostics.
+    pub name: &'static str,
+    pub shell_dir: ShellDir,
+    pub agents: AgentsPolicy,
+    /// May the session use MCP client servers (`--mcp-server`, the cora
+    /// auto-preset)? A security boundary: off wherever the face cannot
+    /// vouch for the operator's choice.
+    pub mcp_clients: bool,
+}
+
+impl FacePolicy {
+    /// `run`, `chat`, `resume`, the TUI and `mission`.
+    pub const CLI: FacePolicy = FacePolicy {
+        name: "cli",
+        shell_dir: ShellDir::ProcessCwd,
+        agents: AgentsPolicy::Delegating,
+        mcp_clients: true,
+    };
+    /// `tole mcp` and the MCP-over-HTTP host (their file tools).
+    pub const MCP_SERVER: FacePolicy = FacePolicy {
+        name: "mcp-server",
+        shell_dir: ShellDir::ProcessCwd,
+        agents: AgentsPolicy::None,
+        mcp_clients: false,
+    };
+    /// A session hosted by `tole serve` or ACP.
+    pub const SERVER_SESSION: FacePolicy = FacePolicy {
+        name: "server-session",
+        shell_dir: ShellDir::Workspace,
+        agents: AgentsPolicy::Classic,
+        mcp_clients: false,
+    };
+    /// A cron run.
+    pub const CRON: FacePolicy = FacePolicy {
+        name: "cron",
+        shell_dir: ShellDir::Workspace,
+        agents: AgentsPolicy::None,
+        mcp_clients: false,
+    };
+}
+
+/// The per-session inputs of [`roster_for`] that are not the face's policy.
+pub struct RosterInputs<'a> {
+    /// The file-tool jail root.
+    pub workspace: PathBuf,
+    pub plan_mode: bool,
+    /// The parent's `--allow` patterns, inherited by child agents.
+    pub allow_patterns: &'a [String],
+    /// Start each child agent in its own git worktree (CLI only).
+    pub agents_worktree: bool,
+    /// The delegation setup, required by [`AgentsPolicy::Delegating`].
+    pub delegation: Option<&'a crate::delegate::Setup>,
+    /// Raw `--mcp-server` specs, read only when the policy allows MCP
+    /// clients.
+    pub mcp_specs: &'a [String],
+}
+
+/// Build the [`Roster`](crate::tool_roster::Roster) a face asks of the shared
+/// tool roster, reading every face difference from `policy`.
+pub fn roster_for(policy: &FacePolicy, i: RosterInputs<'_>) -> Result<crate::tool_roster::Roster> {
+    use crate::tool_roster::{AgentTools, Roster};
+    let mut roster = Roster::new(i.workspace);
+    if policy.shell_dir == ShellDir::ProcessCwd {
+        roster.shell_dir = std::env::current_dir().context("resolving cwd")?;
+    }
+    roster.plan_mode = i.plan_mode;
+    roster.agents = match policy.agents {
+        AgentsPolicy::None => None,
+        AgentsPolicy::Classic => Some(AgentTools {
+            worktrees: false,
+            parent_allows: i.allow_patterns.to_vec(),
+            delegation: None,
+        }),
+        AgentsPolicy::Delegating => Some(AgentTools {
+            worktrees: i.agents_worktree,
+            parent_allows: i.allow_patterns.to_vec(),
+            delegation: Some(
+                i.delegation
+                    .context("a delegating face needs its delegation setup")?
+                    .clone(),
+            ),
+        }),
+    };
+    #[cfg(feature = "mcp")]
+    if policy.mcp_clients {
+        roster.mcp_servers = i
+            .mcp_specs
+            .iter()
+            .map(|s| tole_core::mcp::McpServerConfig::parse(s))
+            .collect::<Result<Vec<_>, String>>()
+            .map_err(anyhow::Error::msg)?;
+    }
+    #[cfg(not(feature = "mcp"))]
+    let _ = (policy.mcp_clients, i.mcp_specs);
+    Ok(roster)
+}
+
 #[cfg(test)]
 mod default_prompt_tests {
     #[test]
@@ -452,5 +581,75 @@ mod skills_wiring_tests {
     fn resolve_workspace_root_none_defaults_to_cwd() {
         let root = resolve_workspace_root(None).unwrap();
         assert_eq!(root, std::env::current_dir().unwrap());
+    }
+}
+
+#[cfg(test)]
+mod face_policy_tests {
+    use super::*;
+
+    fn inputs<'a>(allow: &'a [String], d: Option<&'a crate::delegate::Setup>) -> RosterInputs<'a> {
+        RosterInputs {
+            workspace: std::env::temp_dir(),
+            plan_mode: false,
+            allow_patterns: allow,
+            agents_worktree: true,
+            delegation: d,
+            mcp_specs: &[],
+        }
+    }
+
+    /// The roster of each face, pinned (#943): what the face had before
+    /// `FacePolicy` existed.
+    #[test]
+    fn each_face_keeps_the_roster_it_had() {
+        let allow = vec!["read_file".to_string()];
+        let d = crate::delegate::Setup::default();
+        let cwd = std::env::current_dir().unwrap();
+
+        let r = roster_for(&FacePolicy::CLI, inputs(&allow, Some(&d))).unwrap();
+        assert_eq!(r.shell_dir, cwd);
+        let a = r.agents.expect("cli agents");
+        assert!(a.worktrees && a.delegation.is_some());
+        assert_eq!(a.parent_allows, allow);
+
+        let r = roster_for(&FacePolicy::MCP_SERVER, inputs(&allow, None)).unwrap();
+        assert_eq!(r.shell_dir, cwd);
+        assert!(r.agents.is_none());
+
+        let r = roster_for(&FacePolicy::SERVER_SESSION, inputs(&allow, None)).unwrap();
+        assert_eq!(r.shell_dir, r.workspace);
+        let a = r.agents.expect("server agents");
+        assert!(!a.worktrees && a.delegation.is_none());
+        assert_eq!(a.parent_allows, allow);
+
+        let r = roster_for(&FacePolicy::CRON, inputs(&allow, None)).unwrap();
+        assert_eq!(r.shell_dir, r.workspace);
+        assert!(r.agents.is_none());
+    }
+
+    #[test]
+    fn delegating_without_a_setup_is_refused() {
+        assert!(roster_for(&FacePolicy::CLI, inputs(&[], None)).is_err());
+    }
+
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn mcp_specs_reach_only_faces_that_may_use_clients() {
+        let specs = vec!["fs=npx x".to_string()];
+        let d = crate::delegate::Setup::default();
+        let mk = |p: &FacePolicy| {
+            let mut i = inputs(&[], Some(&d));
+            i.mcp_specs = &specs;
+            roster_for(p, i).map(|r| r.mcp_servers.len())
+        };
+        assert_eq!(mk(&FacePolicy::CLI).unwrap(), 1);
+        for p in [
+            FacePolicy::MCP_SERVER,
+            FacePolicy::SERVER_SESSION,
+            FacePolicy::CRON,
+        ] {
+            assert_eq!(mk(&p).unwrap(), 0, "{}", p.name);
+        }
     }
 }
