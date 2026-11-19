@@ -115,10 +115,15 @@ fn fixture_with(tag: &str, pre_024: bool) -> TestDir {
         {"document": {"slug": "skill-gamma"}, "score": 0.2},
     ]);
     std::fs::write(bin.join("search.json"), hits.to_string()).unwrap();
+    // The real uteke v0.24.1 shape: a bare array keyed by `slug`; an invalid
+    // package is the one it never recalls (delta here).
     let skill_hits = json!([
-        {"name": "beta", "score": 0.9},
-        {"name": "delta", "score": 0.8, "status": "retired"},
-        {"name": "gamma", "score": 0.2},
+        {"slug": "beta", "status": "draft", "hash": "sha256:bb", "valid": true, "score": 0.9,
+         "file": "SKILL.md", "snippet": "s"},
+        {"slug": "delta", "status": "draft", "hash": "sha256:dd", "valid": false, "score": 0.8,
+         "file": "SKILL.md", "snippet": "s"},
+        {"slug": "gamma", "status": "approved", "hash": "sha256:gg", "valid": true, "score": 0.2,
+         "file": "SKILL.md", "snippet": "s"},
     ]);
     std::fs::write(bin.join("skill-search.json"), skill_hits.to_string()).unwrap();
     let skill_help = if pre_024 {

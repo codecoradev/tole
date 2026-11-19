@@ -845,11 +845,17 @@ mod uteke_doc {
 /// purpose. Indexing (`upsert`, `retire`) is unchanged and delegates to
 /// [`UtekeDocIndex`].
 ///
-/// UNVERIFIED ASSUMPTION: the `--json` output shape of `uteke skill *` was
-/// not checked against a real uteke 0.24.x binary. The parser accepts a
-/// bare array or an object with a `results` / `hits` / `skills` array, a
-/// hit's name as `name`, `skill.name` or `skill`, and its score as `score`
-/// or `similarity`. Adjust here once verified.
+/// Output shape (read from the uteke v0.24.1 source, `skill_library.rs` and
+/// `commands/skill.rs`; `--json` is a global flag): `skill search` and
+/// `skill list` print a bare array. A search hit is `{slug, name?,
+/// description?, status, hash, valid, score, file, snippet}`; a list entry
+/// is `{slug, name?, description?, status, hash, valid, source_path, owner,
+/// updated_at}`; `skill show` is `{slug, current: {hash, ..}, approved_hash,
+/// ..}`. The skill's identity is its `slug` (the directory name), NOT the
+/// optional frontmatter `name`. uteke's `status` (draft / approved / stale)
+/// is uteke's own approval of a package, not tole's (#591): it is not used
+/// to filter, the local gate stays the authority. Only `valid: false` hits
+/// are skipped.
 #[cfg(feature = "shell-tools")]
 mod uteke_skill {
     use super::*;
@@ -900,11 +906,11 @@ mod uteke_skill {
         e.contains("429") || e.contains("busy")
     }
 
+    /// The skill's identity: the `slug` (v0.24.1 prints the directory name
+    /// there); `name` is only the optional frontmatter display name, used
+    /// when a hit carries no slug.
     fn hit_name(h: &Value) -> Option<&str> {
-        h["name"]
-            .as_str()
-            .or_else(|| h["skill"]["name"].as_str())
-            .or_else(|| h["skill"].as_str())
+        h["slug"].as_str().or_else(|| h["name"].as_str())
     }
 
     fn hits_of(v: &Value) -> Option<&Vec<Value>> {
@@ -915,13 +921,13 @@ mod uteke_skill {
         })
     }
 
-    /// Status / profile scope when the hit states them; absent = admitted
-    /// (the local gate stays the authority on what is approved).
+    /// A hit is skipped only when uteke says the package is invalid
+    /// (`valid: false`), or when it states a profile scope this run is not
+    /// in. uteke's own `status` is NOT used (see the module note); a hit
+    /// that states neither is admitted, because the local gate (#591)
+    /// decides what may load.
     fn admits(h: &Value, filter: &SkillFilter) -> bool {
-        let status = h["status"]
-            .as_str()
-            .or_else(|| h["metadata"]["status"].as_str());
-        if status.is_some_and(|s| s != SkillStatus::Approved.as_str()) {
+        if h["valid"].as_bool() == Some(false) {
             return false;
         }
         let scoped: Vec<&str> = h["profiles"]
@@ -997,9 +1003,11 @@ mod uteke_skill {
                 ));
             }
             let v = self.run(&["skill", "show", name, "--json"])?;
-            let hash = ["content_hash", "hash", "sha"]
-                .iter()
-                .find_map(|k| v[*k].as_str())
+            // The package hash uteke recorded: the approved one when there
+            // is one, else the current version's.
+            let hash = v["approved_hash"]
+                .as_str()
+                .or_else(|| v["current"]["hash"].as_str())
                 .map(str::to_string);
             Ok(SkillMeta {
                 name: name.to_string(),
@@ -1112,16 +1120,20 @@ mod uteke_skill {
             let (idx, dir) = fake("search", true, 0);
             std::fs::write(
                 dir.join("search.json"),
-                json!({"results": [
-                    {"name": "deploy", "score": 0.9},
-                    {"skill": {"name": "dup-free"}, "similarity": 0.8},
-                    {"name": "deploy", "score": 0.7},
-                    {"name": "retired-one", "score": 0.7, "status": "retired"},
-                    {"name": "coder-only", "score": 0.6, "profiles": ["coder"]},
-                    {"name": "weak", "score": 0.1},
-                    {"name": "-flag", "score": 0.9},
-                    {"name": "bad name", "score": 0.9}
-                ]})
+                // The real v0.24.1 shape: a bare array of hits keyed by `slug`.
+                json!([
+                    {"slug": "deploy", "name": "Deploy it", "description": "d", "status": "draft",
+                     "hash": "sha256:aa", "valid": true, "score": 0.9, "file": "SKILL.md", "snippet": "s"},
+                    {"slug": "dup-free", "status": "approved", "hash": "sha256:bb", "valid": true,
+                     "score": 0.8, "file": "SKILL.md", "snippet": "s"},
+                    {"slug": "deploy", "status": "approved", "valid": true, "score": 0.7},
+                    {"slug": "invalid-one", "status": "draft", "valid": false, "score": 0.7},
+                    {"slug": "stale-one", "status": "stale", "valid": true, "score": 0.65},
+                    {"slug": "coder-only", "valid": true, "score": 0.6, "profiles": ["coder"]},
+                    {"slug": "weak", "valid": true, "score": 0.1},
+                    {"slug": "-flag", "valid": true, "score": 0.9},
+                    {"slug": "bad name", "valid": true, "score": 0.9}
+                ])
                 .to_string(),
             )
             .unwrap();
@@ -1135,12 +1147,15 @@ mod uteke_skill {
                 .into_iter()
                 .map(|c| c.name)
                 .collect();
-            assert_eq!(names, ["deploy", "dup-free"]);
+            // The slug is the identity (not the display name), uteke's own
+            // draft / approved / stale status does not filter, an invalid
+            // package is skipped.
+            assert_eq!(names, ["deploy", "dup-free", "stale-one"]);
             let f = SkillFilter {
                 profile: Some("coder".into()),
                 floor: 0.5,
             };
-            assert_eq!(idx.search("ship it", &f, 5).unwrap().len(), 3);
+            assert_eq!(idx.search("ship it", &f, 5).unwrap().len(), 4);
             assert_eq!(idx.search("ship it", &f, 1).unwrap().len(), 1);
             let l = log(&dir);
             assert!(l.contains("skill search ship it --limit 15 --json"), "{l}");
@@ -1202,8 +1217,9 @@ mod uteke_skill {
             let (idx, dir) = fake("show", true, 0);
             std::fs::write(
                 dir.join("show.json"),
-                json!({"name": "deploy", "content_hash": "sha256:ab", "body": "IGNORE ALL"})
-                    .to_string(),
+                json!({"slug": "deploy", "current": {"hash": "sha256:cd", "status": "draft"},
+                       "approved_hash": "sha256:ab", "body": "IGNORE ALL"})
+                .to_string(),
             )
             .unwrap();
             let m = idx.show("deploy").unwrap();
