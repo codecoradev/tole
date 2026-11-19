@@ -18,7 +18,13 @@ anyhow = "1"
 ureq = { version = "3", features = ["json"] }
 clap = { version = "4", features = ["derive"] }
 
-# Size-focused release profile (default release was 16.7 MB, this ~9 MB).
+# Size-conscious release profile. The ~9 MB / 16.7 MB figures from #482 are
+# stale (the binary has grown with the TUI, MCP-over-HTTP and web-builtin).
+# Measured 2026-11-19, x86_64 Linux, rustc stable, `cargo build --release -p
+# tole-cli` (default features): 23.8 MB stripped (34.5 MB unstripped), 9.8 MB
+# as tar.gz; `--no-default-features`: 10.2 MB. Tried, not adopted: lto = "fat"
+# 21.5 MB (-9%) for 2.2x the build time; opt-level = "s" 18.3 MB (-23%) but
+# slower hot paths. See docs/perf.md.
 # panic = "abort" is deliberately NOT set: tole relies on unwinding (Mutex
 # poison recovery via `lock().unwrap_or_else(|p| p.into_inner())`, turns run on
 # threads / spawn_blocking), and abort would kill every session of a

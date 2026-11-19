@@ -100,3 +100,15 @@ nginjen-lite and its `scraper` HTML stack
 (html5ever, cssparser, selectors, phf, string_cache, tendril and helpers).
 A slim build turns it off with `--no-default-features --features
 shell-tools,mcp,mcp-http,tui`.
+
+The table above is a bigger build than the 9 MB quoted for #482; the
+`web-builtin` row is the unstripped-before-strip figure of that day. Measured
+on 2026-11-19 at 70cffd7 with the exact release command (`cargo build
+--release -p tole-cli`, profile `strip = true`, thin LTO, 1 codegen unit, 4
+cores): 23,776,128 bytes stripped (34,482,104 unstripped; the `strip` step in
+`release.yml` is a no-op after cargo's own), 9.8 MB as tar.gz (the published
+v0.11.0 Linux x86_64 asset is 8.4 MB). `--no-default-features`: 10,180,024
+bytes. Variants tried: `lto = "fat"` 21,543,544 (-9.4%, build 3m52s to 8m32s);
+`opt-level = "s"` 18,276,776 (-23%, slower hot paths). Largest crates by
+`.text` (`cargo bloat --crates`): std 2.9 MiB, tole_cli 2.6, rmcp 2.2,
+tole_core 2.1, serde_core 1.0, tole 0.9, tokio 0.5, serde_json 0.4, rustls 0.4.
