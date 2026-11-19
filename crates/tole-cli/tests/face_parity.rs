@@ -38,6 +38,14 @@ fn machine_dependent(name: &str) -> bool {
     name == "cora_search" || name == "gh" || name.starts_with("uteke_") || name.starts_with("mcp_")
 }
 
+/// A prompt without its one `Context:` line (working directory and date).
+fn without_context(p: &str) -> String {
+    p.lines()
+        .filter(|l| !l.starts_with("Context: working directory "))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn names(reg: &ToolRegistry) -> Vec<String> {
     reg.specs()
         .iter()
@@ -108,12 +116,16 @@ fn observed(base: &TestDir) -> BTreeMap<String, BTreeMap<&'static str, bool>> {
     for n in names(&session.registry) {
         put("server-session", n);
     }
-    // The default system prompt: the CLI composes one, a server session has
-    // none unless a profile, the environment or a trusted config sets it.
-    if !build_default_prompt(false).is_empty() {
-        put("cli", PROMPT_ROW.to_string());
-    }
-    if session.system_prompt.is_some() {
+    // The default system prompt: compare the TEXT, not its presence. A server
+    // session counts as having "the" prompt only when it equals the CLI's
+    // modulo the context line (which names the face's own working directory).
+    let cli_prompt = build_default_prompt(false);
+    put("cli", PROMPT_ROW.to_string());
+    if session
+        .system_prompt
+        .as_deref()
+        .is_some_and(|p| without_context(p) == without_context(&cli_prompt))
+    {
         put("server-session", PROMPT_ROW.to_string());
     }
     // Complete every row to all faces (absent = false), except that cron and

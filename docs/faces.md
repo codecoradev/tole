@@ -25,8 +25,8 @@ a documented row below or a bug.
 
 `crates/tole-cli/tests/face_parity.rs` builds a session through each face with
 the same inputs (the CLI, `tole mcp`, a real `serve`/ACP session from the
-session host, and a cron run) and compares the sorted tool names and whether a
-default system prompt is present. **Every difference must be a row of the table
+session host, and a cron run) and compares the sorted tool names and the text of the
+default system prompt (modulo its one context line). **Every difference must be a row of the table
 below**, with the face cells matching what was built, a status (`policy` or
 `drift #N`) and a reason. A face that gains or loses a tool or a prompt without
 a row fails the build; so does a row that no longer describes a difference. To
@@ -50,7 +50,6 @@ the issue lands, and the test then fails until it is.
 | `skill_propose` | yes | no | yes | no | policy | A skill draft needs a session as its provenance (#592). `tole mcp` has none, and an unattended run does not draft skills for the owner to find later. |
 | `todo_read` | yes | no | yes | yes | policy | The task list is a session record (#198). `tole mcp` serves files and commands, not a session. |
 | `todo_write` | yes | no | yes | yes | policy | The write half of `todo_read`; same reason. |
-| `(system prompt)` | yes | n/a | no | n/a | drift #945 | The CLI composes the default tool-discipline prompt, the review guidance and the skill sections. A `serve`/ACP session uses only a profile, `TOLE_SYSTEM_PROMPT` or a trusted config. |
 <!-- parity:end -->
 
 ## Capabilities the test cannot see in a tool list
@@ -60,9 +59,9 @@ true; the status column says where the work is.
 
 | Capability | CLI | `serve` / ACP session | `tole mcp` | cron | Status |
 |---|---|---|---|---|---|
-| Default system prompt (tool discipline, one context line) | yes | no | n/a | cron's own | drift #945 |
+| Default system prompt (tool discipline, one context line naming the session's workspace; pinned in the header) | yes | yes (#945) | n/a | cron's own | one path |
 | Skill sections and `load_skill` (approved skills only, #591) | yes | no | no | no | drift #945, needs the owner's go |
-| Review guidance (named only when both review tools are present) | yes | no | n/a | no | drift #945 |
+| Review guidance (named only when both review tools are present) | yes | yes (#945) | n/a | no | one path |
 | Model routing for a new session (#586) | yes | no | n/a | no | drift #945 |
 | MCP client servers (`--mcp-server`, the cora preset) | yes | no | no | no | drift #946 (a trust boundary; the owner's configured servers only, never the request) |
 | Plan mode | per process flag | per process flag | per process flag | per job (`read_only`) | drift #947 (per session over `serve`) |
