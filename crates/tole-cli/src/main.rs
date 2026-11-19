@@ -33,10 +33,7 @@ mod setup;
 mod upgrade;
 use tole_core::storage::{JsonlStorage, Storage};
 use tole_core::tool::ToolRegistry;
-use tole_core::turn::{
-    resume_turn_with_cancel, run_turn_with_cancel, run_turn_with_images, TurnOutcome,
-    LOOP_TRIP_AFTER,
-};
+use tole_core::turn::{TurnOutcome, LOOP_TRIP_AFTER};
 
 /// Session id → path (`<dir>/<id>.jsonl`).
 fn session_path(dir: &Path, id: &str) -> PathBuf {
@@ -3029,6 +3026,7 @@ fn run_command(
         host.max_tokens,
     )?;
 
+    let turn_cfg = cfg.clone();
     let mut provider = tole_cli::turn_runner::session_provider(
         cfg,
         &storage,
@@ -3058,15 +3056,15 @@ fn run_command(
             token.cancel();
         })
     });
-    let outcome = run_turn_with_images(
+    let plan = tole_cli::turn_runner::TurnPlan::new(turn_cfg, &registry, &cancel);
+    let outcome = tole_cli::turn_runner::run_turn_with_images(
         &mut storage,
         &mut provider,
-        &registry,
+        &plan,
         &prompt,
         &images,
-        &cancel,
-        None,
-    )?;
+    )
+    .map_err(|e| anyhow::anyhow!(e.into_message()))?;
     // Join ONLY when the timer fired (cora MAJOR): join otherwise blocks
     // for the remaining budget after the turn already finished. Detach —
     // the process exits right after run_command anyway.
@@ -3199,6 +3197,7 @@ fn resume_command(
     // ambient env, which may have changed since).
     let pinned = storage.system_prompt().map(str::to_string);
     let mut compactor = tole_cli::compaction_host::for_session(host.compaction, &cfg, &storage);
+    let turn_cfg = cfg.clone();
     let mut provider = tole_cli::turn_runner::session_provider(
         cfg,
         &storage,
@@ -3218,8 +3217,10 @@ fn resume_command(
             // Context compaction (#440) between the settled turn and the
             // new instruction.
             compactor.before_turn(&mut storage, &mut *provider);
+            let plan = tole_cli::turn_runner::TurnPlan::new(turn_cfg, &registry, &cancel);
             let outcome =
-                run_turn_with_cancel(&mut storage, &mut provider, &registry, text, &cancel)?;
+                tole_cli::turn_runner::run_turn_with(&mut storage, &mut provider, &plan, text)
+                    .map_err(|e| anyhow::anyhow!(e.into_message()))?;
             // Memory loop (CodeCora scan 2026-09-18): a settled resumed
             // turn leaves a summary like `run` does — the continuation is
             // its own durable event. No recall injection here: the resumed
@@ -3234,7 +3235,11 @@ fn resume_command(
             }
             outcome
         }
-        _ => resume_turn_with_cancel(&mut storage, &mut provider, &registry, &cancel)?,
+        _ => {
+            let plan = tole_cli::turn_runner::TurnPlan::new(turn_cfg, &registry, &cancel);
+            tole_cli::turn_runner::resume_turn_with(&mut storage, &mut provider, &plan)
+                .map_err(|e| anyhow::anyhow!(e.into_message()))?
+        }
     };
     report_outcome(&id, outcome);
     Ok(())
@@ -3665,6 +3670,7 @@ fn chat_command(
     // the header-pinned one (see create_with above / JsonlStorage::open).
     let pinned = storage.system_prompt().map(str::to_string);
     let mut compactor = tole_cli::compaction_host::for_session(host.compaction, &cfg, &storage);
+    let turn_cfg = cfg.clone();
     let mut provider = tole_cli::turn_runner::session_provider(
         cfg,
         &storage,
@@ -3846,19 +3852,28 @@ fn chat_command(
                     // Context compaction (#440): only here, between
                     // settled turns.
                     compactor.before_turn(&mut storage, &mut *provider);
-                    break run_turn_with_images(
+                    let plan =
+                        tole_cli::turn_runner::TurnPlan::new(turn_cfg.clone(), &registry, &cancel);
+                    break tole_cli::turn_runner::run_turn_with_images(
                         &mut storage,
                         &mut provider,
-                        &registry,
+                        &plan,
                         &turn_prompt,
                         &turn_images,
-                        &cancel,
-                        None,
-                    );
+                    )
+                    .map_err(tole_cli::turn_runner::TurnRunError::into_message);
                 }
                 _ => {
                     eprintln!("tole> (resolving the interrupted turn…)");
-                    match resume_turn_with_cancel(&mut storage, &mut provider, &registry, &cancel) {
+                    let plan =
+                        tole_cli::turn_runner::TurnPlan::new(turn_cfg.clone(), &registry, &cancel);
+                    match tole_cli::turn_runner::resume_turn_with(
+                        &mut storage,
+                        &mut provider,
+                        &plan,
+                    )
+                    .map_err(tole_cli::turn_runner::TurnRunError::into_message)
+                    {
                         // Landed on a boundary — dispatch the message now.
                         Ok(TurnOutcome::Final { .. }) => continue,
                         // Still stuck (re-denied, provider still down):
