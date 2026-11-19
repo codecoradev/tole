@@ -80,7 +80,9 @@ re-read against `serve.rs`.
   (the turn is run inside the request handler), and progress arrives only on
   the SSE stream. A client opens both.
 - **Streams are capped.** At most 8 SSE streams per server and 32 connections
-  in all (`MAX_STREAMS`, `MAX_CONNECTIONS`). A desktop with several open
+  in all (`MAX_STREAMS`, `MAX_CONNECTIONS`). A connection over the cap is closed
+  with no HTTP response, so a client sees a reset or a timeout, not a `429` or
+  `503`, and must retry with a delay. A desktop with several open
   sessions must not hold one stream per session indefinitely; this matters more
   when a phone or a gateway shares the same server.
 - **Resumed turns have no observer.** After an `allow` answers `202`, the turn
@@ -96,8 +98,8 @@ re-read against `serve.rs`.
 - **`seq` is not dense**; never assume `+1`.
 - **Only the first approval decision counts**; a repeated or opposite decision
   answers as documented, so a retry after a lost response is safe.
-- **`Destructive` tools are unreachable through serve**, and a client never
-  offers "always allow" for them (#523 constraint).
+- **`Destructive` tools are never auto-allowed** (`docs/threat-model.md`), and
+  a client never offers "always allow" for them (#523 constraint).
 
 ### 1.3 Screens and readiness
 
@@ -174,7 +176,7 @@ working directory).
 
 | Threat | Today | Residual |
 |---|---|---|
-| Another local user or process reaches the loopback port | The credential is required on every route but `/health`; failures are limited to 10 a minute per IP and compared in constant time. | Loopback is shared by every local user: anyone who can read the token can approve writes. The token file must be mode `0600` in a directory only the owner can read. `read_plain_file` refuses links and FIFOs but I did not verify that it checks file permissions, so the note does not claim it does. |
+| Another local user or process reaches the loopback port | The credential is required on every route but `/health` and the webhook routes (which keep their own HMAC gate); failures are limited to 10 a minute per IP and compared in constant time. | Loopback is shared by every local user: anyone who can read the token can approve writes. The token file must be mode `0600` in a directory only the owner can read. `read_plain_file` refuses links and FIFOs but I did not verify that it checks file permissions, so the note does not claim it does. |
 | Another local user reads the token from a process list | `--token` is warned about; `--token-file` and `TOLE_SERVE_TOKEN` are the documented carriers. | An environment variable is readable by the same user's processes and, on some systems, by root only; the desktop should prefer a file. |
 | A port squatter binds the port first | None. The client sends the token to whatever answers. | A desktop that sends the bearer token to a loopback port it did not start can hand it to another local process. Mitigation to decide (D1): a Unix socket in a `0700` directory, or a per-start random port plus a token the child receives. |
 
@@ -183,7 +185,7 @@ The unattended side stays the same: `tole serve` calls
 
 ## 3. Remote desktop, without any vendor relay
 
-### 3.1 The reach question and the locked decision
+### 3.1 The reach question and the recorded owner statement
 
 See [the record](#the-no-private-reach-decision-where-it-is-recorded) below.
 This note assumes the decision as recorded and asks the owner to confirm what
@@ -221,7 +223,13 @@ All checked in the code or in the docs cited:
 - `--auth basic` with a non-loopback `--bind` is refused unless
   `--allow-insecure-basic` says TLS ends in front. The static token has no such
   refusal.
-- Credentials are never logged and are held as role secrets.
+- Credentials are held as role secrets (redacted at the egress sinks). This note
+  did not audit every log site, so it does not claim a credential is never
+  logged.
+- The token file is opened without following a link on its last path component
+  and must be a regular file of at most 4 KiB. It is **not** checked for mode or
+  owner: a world-readable token file is accepted silently, so the desktop must
+  create it `0600` itself.
 - Session creation is jailed to `--workspace`.
 
 ### 3.3 What is missing, and what is out of scope
@@ -248,7 +256,7 @@ All checked in the code or in the docs cited:
 | Situation | Behavior | Client rule |
 |---|---|---|
 | SSE drops | The durable log is the truth. Reconnect with `?after=<last seq>` (or `Last-Event-ID`) and receive exactly the missed entries, then `ready`. | Keep the last seen `seq`; back off between reconnects. Ephemeral text deltas of the gap are lost; the final entry is not. |
-| `POST /prompt` connection breaks mid-turn | The turn runs inside the request handler on the server; I found no code that watches the client socket during a turn, so a dropped client does not cancel it. The response cannot be delivered, and a write failure is bounded by the 30 s write timeout. | After a break, reopen the stream, read `GET /entries`, and check `busy` through `GET /sessions` or `/resume` (which returns `busy` for a live session). Do not re-send the prompt without checking, or the turn runs twice. This behavior should be confirmed by a test before the client relies on it (not verified by this note). |
+| `POST /prompt` connection breaks mid-turn | The turn runs inside the request handler on the server; I found no code that watches the client socket during a turn (no `peek`, `shutdown` or `take_error` on the stream, and the only cancel paths are the cancel routes), so a dropped client does not cancel it; this is an absence of code, not a tested behavior. The response cannot be delivered, and a write failure is bounded by the 30 s write timeout. | After a break, reopen the stream, read `GET /entries`, and check `busy` through `GET /sessions`, or through `POST /sessions {"resume": id}`, which answers `alreadyLive` and `busy` for a session that is live. Do not re-send the prompt without checking, or the turn runs twice. This behavior should be confirmed by a test before the client relies on it (not verified by this note). |
 | Client offline while an approval is requested | The request waits in the queue up to 900 s, then expires to denied. | On reconnect, `GET /approvals`. A request that expired is shown as denied; the turn is not stranded. |
 | Approval allowed, then link drops | `202` means the resume runs; it has no observer. | Poll `GET /approvals?session=<id>` and `GET /entries` after reconnect. |
 | Server restarts | Live map and queue are empty; sessions are on disk. | `POST /sessions {"resume": id}`; reload entries. |
