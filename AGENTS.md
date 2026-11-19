@@ -173,6 +173,12 @@ verdict → squash-merge → cleanup → release (bump + CHANGELOG + tag).
   layers (registry / `AllowlistApprover` / host prompt).
 - MCP tools are always `Risk::Write`. Server-supplied metadata is never
   trusted for risk classification.
+- One capability, every face: a new capability goes into the shared assembly
+  (`session::assemble`, `tool_roster`, `turn_runner`), not into one face's
+  code. Ask in review: "does this exist on one face only?" If it must, it is
+  a row in [docs/faces.md](docs/faces.md) with its reason, and
+  `cargo test -p tole-cli --test face_parity` passes (it fails on a
+  difference with no row).
 - Adding code is a last resort — first check whether configuration or an
   existing mechanism solves the problem.
 
