@@ -32,6 +32,20 @@ pub struct AgentTools {
     pub delegation: Option<crate::delegate::Setup>,
 }
 
+/// An MCP server a session did not start, and why (#946). The reason is
+/// built from the plugin lock's refusal text, never from the server's own
+/// output, and carries no secret.
+#[cfg(feature = "mcp")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpNotice {
+    pub server: String,
+    pub reason: String,
+}
+
+/// Collects [`McpNotice`]s while the roster is built.
+#[cfg(feature = "mcp")]
+pub type McpNoticeSink = std::sync::Arc<std::sync::Mutex<Vec<McpNotice>>>;
+
 /// What a face asks of the roster.
 pub struct Roster {
     /// File-tool jail root; job logs live under it too.
@@ -49,6 +63,15 @@ pub struct Roster {
     /// MCP servers whose tools join the session (#74).
     #[cfg(feature = "mcp")]
     pub mcp_servers: Vec<tole_core::mcp::McpServerConfig>,
+    /// Where [`build`] reports the servers it did not start (#946), for a
+    /// face that records them in its session log. `None`: only stderr.
+    #[cfg(feature = "mcp")]
+    pub mcp_notices: Option<McpNoticeSink>,
+    /// Offer `mcp_read` (a ReadOnly tool over the resources of admitted
+    /// servers) when a server has resources. A server face turns it off: on
+    /// it every MCP tool is `Write` and goes through the approval gate.
+    #[cfg(feature = "mcp")]
+    pub mcp_resources: bool,
     /// Plan publishing (#196): only for a transport that renders plans.
     pub plan_emitter: Option<PlanEmitter>,
     /// Where finished background jobs nudge the session (#217).
@@ -69,6 +92,10 @@ impl Roster {
             agents: None,
             #[cfg(feature = "mcp")]
             mcp_servers: Vec::new(),
+            #[cfg(feature = "mcp")]
+            mcp_notices: None,
+            #[cfg(feature = "mcp")]
+            mcp_resources: true,
             plan_emitter: None,
             job_notices: None,
             session: None,
@@ -622,13 +649,28 @@ fn build_with_data_dir(
         // The lock also binds them after connect (`check`), and the
         // server's process gets only the secrets its approval granted.
         let source = crate::plugin_gate::source_of(cfg);
+        let notice = |reason: String| {
+            if let Some(sink) = &roster.mcp_notices {
+                sink.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(McpNotice {
+                        server: cfg.name.clone(),
+                        reason,
+                    });
+            }
+        };
         if let Some(note) = plugin_gate.refuse_unseen(&cfg.name, &source) {
             eprintln!("tole: mcp[{}]: {note}", cfg.name);
             eprintln!("tole: mcp[{}]: no tools registered", cfg.name);
+            notice(note);
             continue;
         }
+        // The refusal of the connect-time check, kept for the notice.
+        let refused = std::cell::RefCell::new(None::<String>);
         let admit = |s: &str, v: &str, t: &[tole_core::plugin_lock::ManifestTool]| {
-            plugin_gate.check(s, &source, v, t)
+            plugin_gate.check(s, &source, v, t).inspect_err(|e| {
+                *refused.borrow_mut() = Some(e.clone());
+            })
         };
         let mut cfg = cfg.clone();
         cfg.secret_grant = plugin_gate.secret_grant(&cfg.name);
@@ -662,9 +704,17 @@ fn build_with_data_dir(
         }
         if names.is_empty() {
             eprintln!("tole: mcp[{}]: no tools registered", cfg.name);
+            notice(refused.take().unwrap_or_else(|| {
+                "it did not start or list its tools (a failed start, or no sandbox could wrap \
+                 it: with no human attached an optional sandbox counts as required)"
+                    .to_string()
+            }));
         }
         // #680: only a server this session admitted is asked for resources.
-        if reg.mcp_admitted(&cfg.name) && tole_core::mcp::probe_server_extras(cfg).resources {
+        if roster.mcp_resources
+            && reg.mcp_admitted(&cfg.name)
+            && tole_core::mcp::probe_server_extras(cfg).resources
+        {
             resource_servers.push(cfg.name.clone());
         }
     }

@@ -2316,6 +2316,7 @@ mod tests {
         tole_cli::session_host::set_server_skills(
             tole_cli::session::assemble::ServerSkills::new(vec![], true).unwrap(),
         );
+        tole_cli::session::owner_mcp::set(vec![]).unwrap();
         State {
             sessions: Arc::new(Mutex::new(Sessions::default())),
             approvals: tole_cli::approvals::ApprovalQueue::shared(),
