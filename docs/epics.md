@@ -445,7 +445,7 @@ Parked means: an issue exists and is open, and nobody works on it until the owne
 |------|------------------|
 | #741 `import-hermes` (session import and profile pack) | `[PLAN]`, same direction. Open question: does the import redact or keep text verbatim |
 | #742 serve auth providers: OIDC (and scopes) | Basic is done (owner decisions of 2026-11-17: Basic first, single user with many devices, no session bound to an identity, TLS at a reverse proxy; `tole serve --auth basic`, `tole serve-hash`, `docs/mobile-control.md`). OIDC and the read-only / full scopes remain, parked until the owner picks the next slice |
-| #527 desktop (GPUI), #528 Flutter, #529 web, #561 UI/UX plan, #523 epic | The UI stack waits on the core seams (done: #524 to #526, #558 to #560) and on the serve items #572 to #575 (#571 moved to the gateway track, epic #910). #529 is low priority and its framework (Svelte or React) is undecided |
+| #527 desktop (GPUI), #528 Flutter, #529 web, #561 UI/UX plan, #523 epic | The UI stack waits on the owner (the core seams #524 to #526 and #558 to #560 and the serve items #572 to #575 are done; #571 moved to the gateway track, epic #910). #529 is low priority and its framework (Svelte or React) is undecided |
 | #382 multi-client daemon | Closed as a design note (`docs/daemon-design.md`); no build without a user story |
 
 Owner decisions still open:

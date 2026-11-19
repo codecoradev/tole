@@ -98,7 +98,7 @@ tole is the agent harness of the CodeCora ecosystem — the hands:
   guidance is in the pinned prompt of `run`, `chat`, the TUI and `mission`
   (#536). `serve` and `acp` sessions attach only the MCP servers the OWNER names
   (`--mcp-server` or the user config, read at start-up, through the same plugin
-  lock; a project-config server and the cora auto-detection never apply, #946),
+  lock; a project-config `mcp_server` is refused at start-up and the cora auto-detection never applies, #946),
   so they carry the review section when the cora review tools are configured;
   `tole mcp` and `mission` serve their own registry, refuse the flag and have
   no review tools.
@@ -488,8 +488,10 @@ name is a startup error that lists the defined ones.
   unregistered).
 - **Faces that refuse a flag refuse it from the config too.** `serve`, `acp`,
   `mcp` and `mission` refuse `--on-pretool`/`--on-posttool` (and `--on-turnend`
-  where the flag is refused), `--skill`, `--no-skills`, `--mcp-server` (and
-  `--plan-mode` on `mission`). A value that arrives from the config is refused
+  where the flag is refused); `mcp` and `mission` also refuse `--skill`,
+  `--no-skills` and `--mcp-server` (`serve` and `acp` accept them, #945, #946,
+  but refuse a `skill` or `mcp_server` that comes from the project config at
+  start-up), and `mission` refuses `--plan-mode`. A value that arrives from the config is refused
   with the same message plus `use --no-config to ignore the project config`;
   tole never silently drops a project's safety hook.
 - **Feature-less builds.** In a build without the `mcp` feature, `mcp_server` /
