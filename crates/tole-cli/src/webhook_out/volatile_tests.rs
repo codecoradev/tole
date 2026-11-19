@@ -508,3 +508,28 @@ fn the_turn_notifier_pushes_without_io_and_survives_a_full_queue() {
     assert_eq!(q.len("g"), MAX_PER_DESTINATION);
     assert_eq!(q.dropped(), 20);
 }
+
+#[test]
+fn a_retried_turn_event_never_evicts_a_newer_one_of_its_session() {
+    // E0 (settle 1) is out for a failed delivery while E1 (settle 2) of the same
+    // session sits in a full queue: requeueing E0 must drop E0, not E1.
+    let q = VolatileQueue::new();
+    q.push(turn_queued("g", "s", 1)).unwrap();
+    let e0 = q.take_due(NOW).due.pop().unwrap();
+    q.push(turn_queued("g", "s", 2)).unwrap();
+    for n in 0..(MAX_PER_DESTINATION - 1) {
+        q.push(turn_queued("g", &format!("other{n}"), 1)).unwrap();
+    }
+    assert_eq!(q.len("g"), MAX_PER_DESTINATION);
+    assert_eq!(q.requeue(e0), Err(Refused::Full));
+    assert_eq!(q.len("g"), MAX_PER_DESTINATION);
+    assert_eq!(q.dropped(), 1);
+    let ids: Vec<String> = std::iter::from_fn(|| q.take_due(NOW).due.pop())
+        .map(|e| e.id)
+        .collect();
+    assert!(ids.contains(&"turn:s:2".to_string()), "newer event kept");
+    assert!(
+        !ids.contains(&"turn:s:1".to_string()),
+        "stale retry dropped"
+    );
+}

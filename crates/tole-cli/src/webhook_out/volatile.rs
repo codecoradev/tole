@@ -161,9 +161,20 @@ impl VolatileQueue {
     }
 
     /// Puts an event back (a retry). It goes to the back; only its own
-    /// `next_at` holds it, and it still counts against the bound.
+    /// `next_at` holds it, and it still counts against the bound. A retry is
+    /// older than anything queued for its session after it was taken, so it
+    /// never takes the D8 overflow replacement: when the queue is full the
+    /// retry is the one dropped (and counted), never a newer event.
     pub fn requeue(&self, event: Queued) -> Result<(), Refused> {
-        self.push(event)
+        let mut m = self.by_dest.lock().unwrap_or_else(|p| p.into_inner());
+        let q = m.entry(event.dest.clone()).or_default();
+        if q.len() >= MAX_PER_DESTINATION {
+            drop(m);
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            return Err(Refused::Full);
+        }
+        q.push_back(event);
+        Ok(())
     }
 }
 
