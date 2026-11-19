@@ -2311,6 +2311,11 @@ mod tests {
     }
 
     fn test_state(root: std::path::PathBuf, sessions_dir: std::path::PathBuf) -> State {
+        // The entrypoint fixes the process's skills choice before any
+        // session opens (#945); these tests load none.
+        tole_cli::session_host::set_server_skills(
+            tole_cli::session::assemble::ServerSkills::new(vec![], true).unwrap(),
+        );
         State {
             sessions: Arc::new(Mutex::new(Sessions::default())),
             approvals: tole_cli::approvals::ApprovalQueue::shared(),
