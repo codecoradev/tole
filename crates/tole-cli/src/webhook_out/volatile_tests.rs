@@ -523,7 +523,9 @@ fn a_retried_turn_event_never_evicts_a_newer_one_of_its_session() {
     assert_eq!(q.len("g"), MAX_PER_DESTINATION);
     assert_eq!(q.requeue(e0), Err(Refused::Full));
     assert_eq!(q.len("g"), MAX_PER_DESTINATION);
-    assert_eq!(q.dropped(), 1);
+    // The sender reports a refused retry itself (`queue_full`), so it is not
+    // counted again as dropped.
+    assert_eq!(q.dropped(), 0);
     let ids: Vec<String> = std::iter::from_fn(|| q.take_due(NOW).due.pop())
         .map(|e| e.id)
         .collect();

@@ -398,7 +398,7 @@ two `webhook:` targets sends the same id to both destinations.
   and the expiry of unanswered approvals keep going. Before, one thread sent
   every due event in turn, so up to 256 events of one unreachable destination
   could hold back all the others and the timer. A retry that comes back to a
-  full queue is dropped (counted, never a newer event), given up and reported
+  full queue is dropped (never a newer event), given up and reported once
   with the code `queue_full`.
 - **Retry.** Per event, until its deadline. Retry on: connect or TLS error, DNS
   failure, timeout, 5xx, 408, 429. **No retry** on another 4xx (the receiver

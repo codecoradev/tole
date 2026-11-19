@@ -228,7 +228,7 @@ fn send_one(
             if queue.requeue(ev).is_ok() {
                 out.retried += 1;
             } else {
-                // The retry is the one dropped (and counted by the queue),
+                // The retry is the one dropped (the queue does not count it),
                 // never a newer event; it is given up and reported.
                 out.gave_up += 1;
                 failed(&dest, QUEUE_FULL);
@@ -317,11 +317,41 @@ pub(crate) struct Wiring {
     pub stop: Arc<AtomicBool>,
 }
 
-/// Starts the timer thread and one worker per destination that lists a
+/// Starts the timer thread, then one worker per destination that lists a
 /// volatile event, and returns how many workers started. The threads are never
 /// joined.
 pub(crate) fn start(dests: Arc<Destinations>, mut sender: ApprovalSender, w: Wiring) -> usize {
     let queue = Arc::clone(&sender.queue);
+    // The timer first, so its first tick never waits behind the workers.
+    let (timer_queue, clock, stop) = (
+        Arc::clone(&queue),
+        Arc::clone(&w.clock),
+        Arc::clone(&w.stop),
+    );
+    let timer = std::thread::Builder::new()
+        .name("tole-webhook-timer".into())
+        .spawn(move || {
+            let mut dropped_seen = 0;
+            while !stop.load(Ordering::Relaxed) {
+                let tick =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sender.tick(clock())));
+                if tick.is_err() {
+                    eprintln!("tole serve: the webhook approval timer hit an internal error");
+                }
+                let dropped = timer_queue.dropped();
+                if dropped != dropped_seen {
+                    eprintln!(
+                        "tole serve: {} webhook event(s) dropped, a destination's queue is full",
+                        dropped - dropped_seen
+                    );
+                    dropped_seen = dropped;
+                }
+                std::thread::sleep(POLL);
+            }
+        });
+    if timer.is_err() {
+        eprintln!("tole serve: could not start the webhook approval timer");
+    }
     let mut workers = 0;
     for name in dests.names() {
         let Some(d) = dests.get(name) else { continue };
@@ -364,31 +394,6 @@ pub(crate) fn start(dests: Arc<Destinations>, mut sender: ApprovalSender, w: Wir
                 eprintln!("tole serve: could not start the webhook event sender for a destination")
             }
         }
-    }
-    let (clock, stop) = (w.clock, w.stop);
-    let timer = std::thread::Builder::new()
-        .name("tole-webhook-timer".into())
-        .spawn(move || {
-            let mut dropped_seen = 0;
-            while !stop.load(Ordering::Relaxed) {
-                let tick =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sender.tick(clock())));
-                if tick.is_err() {
-                    eprintln!("tole serve: the webhook approval timer hit an internal error");
-                }
-                let dropped = queue.dropped();
-                if dropped != dropped_seen {
-                    eprintln!(
-                        "tole serve: {} webhook event(s) dropped, a destination's queue is full",
-                        dropped - dropped_seen
-                    );
-                    dropped_seen = dropped;
-                }
-                std::thread::sleep(POLL);
-            }
-        });
-    if timer.is_err() {
-        eprintln!("tole serve: could not start the webhook approval timer");
     }
     workers
 }

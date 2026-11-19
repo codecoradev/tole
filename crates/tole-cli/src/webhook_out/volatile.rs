@@ -76,7 +76,8 @@ pub enum Refused {
     Full,
 }
 
-/// The bounded queue. One consumer (the sender) and any number of producers.
+/// The bounded queue. One consumer per destination (that destination's sender
+/// worker, #980) and any number of producers.
 #[derive(Default)]
 pub struct VolatileQueue {
     by_dest: Mutex<BTreeMap<String, VecDeque<Queued>>>,
@@ -113,7 +114,8 @@ impl VolatileQueue {
         Ok(())
     }
 
-    /// Events dropped because a destination's queue was full, since start.
+    /// New events dropped (or replaced) because a destination's queue was
+    /// full, since start. A refused retry is not counted here.
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }
@@ -174,13 +176,13 @@ impl VolatileQueue {
     /// `next_at` holds it, and it still counts against the bound. A retry is
     /// older than anything queued for its session after it was taken, so it
     /// never takes the D8 overflow replacement: when the queue is full the
-    /// retry is the one dropped (and counted), never a newer event.
+    /// retry is the one dropped, never a newer event. It is not added to
+    /// [`Self::dropped`]: the sender gives it up and reports it itself
+    /// (`queue_full`), so it is reported once.
     pub fn requeue(&self, event: Queued) -> Result<(), Refused> {
         let mut m = self.by_dest.lock().unwrap_or_else(|p| p.into_inner());
         let q = m.entry(event.dest.clone()).or_default();
         if q.len() >= MAX_PER_DESTINATION {
-            drop(m);
-            self.dropped.fetch_add(1, Ordering::Relaxed);
             return Err(Refused::Full);
         }
         q.push_back(event);
@@ -225,7 +227,7 @@ fn replace_oldest_of_session(q: &mut VecDeque<Queued>, session: Option<&str>) ->
 /// What [`VolatileQueue::take_due`] removed.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Taken {
-    /// One due event per destination, to be sent now.
+    /// One due event per destination asked for, to be sent now.
     pub due: Vec<Queued>,
     /// Events whose deadline passed before they could be sent.
     pub expired: Vec<Queued>,

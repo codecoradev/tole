@@ -826,19 +826,19 @@ fn a_hung_destination_delays_neither_another_destination_nor_the_expiry_timer() 
         );
     }
     assert_eq!(got, ["{\"n\":0}", "{\"n\":1}", "{\"n\":2}"]);
-    // The timer ran at start; 30 s later (on the test clock) it runs again
-    // although the hung send has not timed out.
-    assert!(expired.load(Ordering::SeqCst) >= 1);
+    // The timer runs at start; 30 s later (on the test clock) it runs again
+    // although the hung send has not timed out. Wait for the first tick before
+    // moving the clock, or that tick would land at NOW + 30.
+    let wait_for = |n: usize| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while expired.load(Ordering::SeqCst) < n && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        expired.load(Ordering::SeqCst)
+    };
+    assert_eq!(wait_for(1), 1, "the expiry timer never ran");
     clock.fetch_add(EXPIRE_EVERY_SECS, Ordering::SeqCst);
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while expired.load(Ordering::SeqCst) < 2 && std::time::Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    assert_eq!(
-        expired.load(Ordering::SeqCst),
-        2,
-        "the expiry timer stalled"
-    );
+    assert_eq!(wait_for(2), 2, "the expiry timer stalled");
     assert!(
         started.elapsed() < Duration::from_secs(15),
         "the bounds above ran past the hung timeout: {:?}",
