@@ -238,6 +238,40 @@ pub fn apply_skills_in(
     Ok(sections)
 }
 
+/// Routes a NEW session once (#586), before its provider is built: off
+/// unless `[router] enabled = true`; a session that already has a model is
+/// left alone. A broken router fails the start with its remedy, with secrets
+/// redacted. The one-line decision goes to stderr unless `quiet` (the TUI
+/// owns the screen). Moved here from the `tole` binary so any face can call
+/// it (#943); which faces do is the face policy's business (#945).
+#[allow(clippy::too_many_arguments)]
+pub fn route_session(
+    storage: &mut dyn tole_core::storage::Storage,
+    setup: &crate::delegate::Setup,
+    profile: Option<&str>,
+    kind: tole_core::router::TaskKind,
+    prompt: &str,
+    registry: &ToolRegistry,
+    quiet: bool,
+    budget_left: Option<u64>,
+) -> Result<()> {
+    let brief = tole_core::router::Brief {
+        kind,
+        prompt,
+        max_risk: registry.max_risk(),
+        profile,
+        job: None,
+        budget_left,
+    };
+    let secrets = crate::provider_chain::process_secrets(&crate::config_apply::real_env);
+    let line = crate::routing::route_new_session(storage, &setup.cfg, &brief, &secrets)
+        .map_err(|e| anyhow::anyhow!(secrets.redact(&e).into_owned()))?;
+    if let (Some(l), false) = (line, quiet) {
+        eprintln!("{l}");
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Face policy (#943)
 // ---------------------------------------------------------------------------
