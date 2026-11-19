@@ -222,28 +222,6 @@ fn a_failed_verification_is_not_closed_and_the_fix_child_reads_the_artifact_itse
     let root = TestDir::new("tole-handoff-e2e");
     std::fs::write(root.join("out.txt"), "ARTIFACT_BODY\n").unwrap();
     let bin = wrapper(&root, &base);
-    // `AgentStartTool` and `AgentPollTool` run in this process and spawn the
-    // children and `uteke` with its env, so the hermetic env (#993) is set on
-    // the process itself: HOME and CODECORA_HOME in a test home, PATH with
-    // the wrapper's no-op `uteke` first and no other `cora`/`uteke`
-    // directory, no XDG overrides.
-    let home = root.join("home");
-    std::fs::create_dir_all(&home).unwrap();
-    std::env::set_var("HOME", &home);
-    std::env::set_var("CODECORA_HOME", &home);
-    let path = common::path_without_sibling_binaries();
-    let path =
-        std::env::join_paths(std::iter::once(root.join("bin")).chain(std::env::split_paths(&path)))
-            .unwrap();
-    std::env::set_var("PATH", path);
-    for var in [
-        "XDG_CONFIG_HOME",
-        "XDG_DATA_HOME",
-        "XDG_STATE_HOME",
-        "XDG_CACHE_HOME",
-    ] {
-        std::env::remove_var(var);
-    }
     let start = AgentStartTool::new(&bin, root.to_path_buf());
     let poll = AgentPollTool::new(root.to_path_buf());
 
