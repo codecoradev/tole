@@ -1,0 +1,85 @@
+name: Perf budget
+
+# #921: release perf budget gate. Builds the release `tole` and measures cold
+# start, idle RSS, active-session RSS and per-turn overhead against a local
+# mock provider (127.0.0.1, no network, no secrets), then fails when a metric
+# is over the ceiling in bench/budget.toml. See bench/README.md.
+
+on:
+  pull_request:
+    branches: [develop, main]
+  push:
+    branches: [main, develop]
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  budget:
+    name: Perf budget (${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: x86_64
+          # The same hosted aarch64 runner release.yml builds on.
+          - os: ubuntu-24.04-arm
+            arch: aarch64
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: perf-budget
+      - name: Harness unit tests (budget parser, comparator, ratchet)
+        run: python3 -m unittest discover -s bench -p 'test_*.py' -v
+      - name: Build the release binary
+        run: cargo build --release -p tole-cli
+      - name: Measure and gate
+        run: |
+          set -o pipefail
+          python3 bench/run.py measure --bin target/release/tole --out perf-report.json | tee perf-summary.md
+          cat perf-summary.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: perf-report-${{ matrix.arch }}
+          path: perf-report.json
+          if-no-files-found: warn
+
+  # A ceiling may only move down. Raising one needs the `perf-budget-raise`
+  # label, applied by a maintainer after reading the diff of bench/budget.toml.
+  ratchet:
+    name: Perf budget ratchet
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Ceilings only move down
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          RAISE_OK: ${{ contains(github.event.pull_request.labels.*.name, 'perf-budget-raise') }}
+        run: |
+          if ! git show "origin/$BASE_REF:bench/budget.toml" > /tmp/base-budget.toml 2>/dev/null; then
+            echo "no bench/budget.toml on $BASE_REF yet: nothing to ratchet from"
+            exit 0
+          fi
+          if python3 bench/run.py ratchet --base /tmp/base-budget.toml; then
+            exit 0
+          fi
+          if [ "$RAISE_OK" = "true" ]; then
+            echo "::warning::budget raised under the perf-budget-raise label"
+            exit 0
+          fi
+          exit 1
