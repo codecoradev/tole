@@ -12,8 +12,9 @@
 # Measured by bench/run.py against the release `tole` and a local mock
 # provider (no network, no secrets). Metric definitions are in that file.
 
-# --- x86_64 Linux (baseline: run 1, 2026-11-19, 4-vCPU container shared with
-# --- parallel builds, release profile, tole 0.11.0; median of 3 harness runs)
+# --- x86_64 Linux (baseline: 2026-11-19, a 4-vCPU LOCAL CONTAINER shared with
+# --- parallel builds, NOT the hosted runner; release profile, tole 0.11.0.
+# --- Re-baselining from the first develop CI runs is a follow-up.)
 
 [x86_64-linux.cold_start_ms]
 # Wall time of `tole --version`, median of 15 spawns, page cache warm.
@@ -30,11 +31,13 @@ baseline = 15.5
 ceiling = 20
 
 [x86_64-linux.active_rss_mb]
-# Peak RSS (wait4 ru_maxrss) of one `tole run` doing 30 provider round-trips,
+# Peak RSS (the child's /proc VmHWM) of one `tole run` doing 30 provider round-trips,
 # each a read_file tool call. Catches a transcript or buffer that grows with
-# the session. Stable, headroom x1.3.
-baseline = 27.9
-ceiling = 37
+# the session. Stable (20.7 MB across 5 runs), headroom x1.3. The first
+# draft of this file carried 27.9 here: that was the harness's own RSS leaking
+# through wait4 ru_maxrss, not tole's; corrected before merge (see README).
+baseline = 20.7
+ceiling = 27
 
 [x86_64-linux.per_turn_ms]
 # Slope of `tole run` wall time over provider round-trips (30 vs 2), zero
@@ -44,9 +47,8 @@ ceiling = 37
 baseline = 4.4
 ceiling = 18
 
-# --- aarch64 Linux (baseline: run 1 of this gate on the hosted ubuntu-24.04-arm
-# --- runner, 4 vCPU, PR #983; same headroom factors as x86_64, same metric
-# --- definitions and comments as above)
+# --- aarch64 Linux (baseline: PR #983 CI on the hosted ubuntu-24.04-arm runner,
+# --- 4 vCPU; same headroom factors and metric definitions as above)
 
 [aarch64-linux.cold_start_ms]
 baseline = 2.6
@@ -57,7 +59,9 @@ baseline = 11.8
 ceiling = 16
 
 [aarch64-linux.active_rss_mb]
-baseline = 25.2
+# Provisional: the first draft measured the harness's RSS here (see the
+# x86_64 note), so no valid baseline exists yet. Lowered from this PR's CI
+# numbers in a follow-up commit.
 ceiling = 33
 
 [aarch64-linux.per_turn_ms]

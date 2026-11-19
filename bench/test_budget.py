@@ -41,7 +41,9 @@ class Parse(unittest.TestCase):
         import pathlib
 
         text = (pathlib.Path(__file__).with_name("budget.toml")).read_text()
-        self.assertIn("x86_64-linux", budget.parse_budget(text))
+        parsed = budget.parse_budget(text)
+        for key in ("x86_64-linux", "aarch64-linux"):
+            self.assertEqual(set(parsed[key]), set(budget.METRICS), key)
 
 
 class Compare(unittest.TestCase):
@@ -63,6 +65,14 @@ class Compare(unittest.TestCase):
         del measured["per_turn_ms"]
         with self.assertRaises(budget.BudgetError):
             budget.compare(measured, ceilings)
+
+    def test_unusable_measured_values_are_rejected(self):
+        ceilings = mk()["x"]
+        for bad in (float("nan"), float("inf"), float("-inf"), -0.5, "3", None, True):
+            with self.assertRaises(budget.BudgetError, msg=repr(bad)):
+                budget.compare({**ceilings, "per_turn_ms": bad}, ceilings)
+        # zero is a legal (if suspiciously good) measurement
+        budget.compare({**ceilings, "per_turn_ms": 0.0}, ceilings)
 
     def test_headroom(self):
         v = budget.Verdict("m", 75.0, 100.0)

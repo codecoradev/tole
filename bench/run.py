@@ -12,7 +12,7 @@ no network, no secrets) and compares the result with bench/budget.toml.
 Metrics (all four are budgeted per platform):
   cold_start_ms   wall time of `tole --version`, median of N spawns
   idle_rss_mb     VmRSS of a `tole serve` daemon that is up and idle
-  active_rss_mb   peak RSS (wait4 ru_maxrss) of one `tole run` that makes
+  active_rss_mb   peak RSS (the child's /proc VmHWM) of one `tole run` that makes
                   ROUNDS_LONG provider round-trips, half of them tool calls
   per_turn_ms     slope of `tole run` wall time over provider round-trips:
                   (wall(ROUNDS_LONG) - wall(ROUNDS_SHORT)) / the difference.
@@ -64,6 +64,8 @@ class _Mock(BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
         done = sum(1 for m in body.get("messages", []) if m.get("role") == "tool")
+        with self.server.lock:
+            self.server.requests += 1
         if done < self.server.rounds:
             msg = {
                 "role": "assistant",
@@ -104,8 +106,20 @@ class MockProvider:
     def __init__(self, rounds: int):
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), _Mock)
         self.server.rounds = rounds
+        self.server.requests = 0
+        self.server.lock = threading.Lock()
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}/v1"
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def reset(self, rounds: int) -> None:
+        with self.server.lock:
+            self.server.rounds = rounds
+            self.server.requests = 0
+
+    @property
+    def requests(self) -> int:
+        with self.server.lock:
+            return self.server.requests
 
     def close(self):
         self.server.shutdown()
@@ -141,8 +155,27 @@ class Env:
         return keep
 
 
-def _spawn_wait(cmd: list[str], env: Env, timeout: float = 120.0) -> tuple[float, float]:
-    """Run to exit; return (wall seconds, peak RSS MB from wait4)."""
+class HarnessError(RuntimeError):
+    """The harness itself did not measure what it claims to measure."""
+
+
+def _vm_hwm_mb(pid: int) -> float | None:
+    """Kernel high-water RSS of a live process, or None once it is gone."""
+    try:
+        for line in Path(f"/proc/{pid}/status").read_text().splitlines():
+            if line.startswith("VmHWM:"):
+                return int(line.split()[1]) / 1024.0
+    except OSError:
+        pass
+    return None
+
+
+def _spawn_wait(cmd: list[str], env: Env, timeout: float = 120.0, track_rss: bool = False) -> tuple[float, float]:
+    """Run to exit; return (wall seconds, peak RSS MB). The peak is the child's
+    own /proc VmHWM sampled while it runs (every ~1 ms; the mark is monotone,
+    so a sample after the peak is exact). It is NOT wait4's ru_maxrss: that
+    one inherits the harness (parent) RSS across fork+exec, so it reads the
+    parent's size whenever the parent is larger than the child."""
     errf = tempfile.TemporaryFile()
     t0 = time.perf_counter()
     p = subprocess.Popen(
@@ -150,21 +183,28 @@ def _spawn_wait(cmd: list[str], env: Env, timeout: float = 120.0) -> tuple[float
         stdout=subprocess.DEVNULL, stderr=errf,
     )
     deadline = time.monotonic() + timeout
+    peak = 0.0
     while True:
-        pid, status, ru = os.wait4(p.pid, os.WNOHANG)
+        pid, status, _ru = os.wait4(p.pid, os.WNOHANG)
         if pid:
             break
         if time.monotonic() > deadline:
             p.kill()
             os.wait4(p.pid, 0)
-            raise RuntimeError(f"timeout: {cmd}")
-        time.sleep(0.0005)
+            raise HarnessError(f"timeout: {cmd}")
+        if track_rss:
+            hwm = _vm_hwm_mb(p.pid)
+            if hwm is not None:
+                peak = max(peak, hwm)
+        time.sleep(0.001)
     wall = time.perf_counter() - t0
     p.returncode = os.waitstatus_to_exitcode(status)
     if p.returncode != 0:
         errf.seek(0)
-        raise RuntimeError(f"{cmd} exited {p.returncode}: {errf.read().decode(errors='replace')[-500:]}")
-    return wall, ru.ru_maxrss / 1024.0  # Linux: KiB
+        raise HarnessError(f"{cmd} exited {p.returncode}: {errf.read().decode(errors='replace')[-500:]}")
+    if track_rss and peak <= 0.0:
+        raise HarnessError("could not sample the child's VmHWM (/proc unavailable?)")
+    return wall, peak
 
 
 def cold_start_ms(env: Env) -> tuple[float, list[float]]:
@@ -223,12 +263,27 @@ def idle_rss_mb(env: Env) -> tuple[float, list[float]]:
     return statistics.median(xs), xs
 
 
+def check_round_trips(requests: int, rounds: int) -> None:
+    """A run asked for `rounds` tool calls must reach the provider exactly
+    rounds + 1 times (one per tool call, one for the final answer). Anything
+    else means the loop stopped early or the tool-result shape changed, and
+    the timing and RSS would describe a different workload."""
+    if requests != rounds + 1:
+        raise HarnessError(
+            f"expected {rounds + 1} provider requests for {rounds} tool round-trips, saw {requests}"
+        )
+
+
 def _run_rounds(env: Env, provider: MockProvider, rounds: int) -> tuple[float, float]:
-    provider.server.rounds = rounds
+    provider.reset(rounds)
     sess = env.root / f"sessions-{rounds}-{time.monotonic_ns()}"
-    return _spawn_wait(
-        [env.bin, "--sessions-dir", str(sess), "run", "--yes", "read the file until told to stop"], env
+    out = _spawn_wait(
+        [env.bin, "--sessions-dir", str(sess), "run", "--yes", "read the file until told to stop"],
+        env,
+        track_rss=True,
     )
+    check_round_trips(provider.requests, rounds)
+    return out
 
 
 def session_metrics(env: Env, provider: MockProvider) -> dict:
@@ -237,7 +292,10 @@ def session_metrics(env: Env, provider: MockProvider) -> dict:
     long_ = [_run_rounds(env, provider, ROUNDS_LONG) for _ in range(WALL_RUNS)]
     w_short = statistics.median(w for w, _ in short)
     w_long = statistics.median(w for w, _ in long_)
-    per_turn = (w_long - w_short) * 1000 / (ROUNDS_LONG - ROUNDS_SHORT)
+    # Noise can make the slope dip below zero on a very fast machine; a
+    # negative cost is meaningless, so it is floored at 0 (the comparator
+    # rejects a negative measured value outright).
+    per_turn = max(0.0, (w_long - w_short) * 1000 / (ROUNDS_LONG - ROUNDS_SHORT))
     return {
         "per_turn_ms": per_turn,
         "active_rss_mb": max(r for _, r in long_),
@@ -416,6 +474,9 @@ def main(argv: list[str]) -> int:
     Path(a.out).write_text(json.dumps(report, indent=2) + "\n")
     print(render(report))
     if status == "no-budget":
+        if os.environ.get("CI") == "true" and not a.report_only:
+            print(f"::error::no budget for platform {report['platform']} in bench/budget.toml: add one (a gate that skips is no gate)")
+            return 1
         print(f"::warning::no budget for platform {report['platform']}: measured, not gated")
     if status == "fail":
         for v in report["gate"]["verdicts"]:

@@ -12,6 +12,7 @@ budget.toml shape (see that file for the rationale per metric):
 
 from __future__ import annotations
 
+import math
 import tomllib
 from dataclasses import dataclass
 
@@ -72,7 +73,12 @@ def compare(measured: dict[str, float], ceilings: dict[str, float]) -> list[Verd
     for metric, ceiling in ceilings.items():
         if metric not in measured:
             raise BudgetError(f"metric {metric} is budgeted but the report does not carry it")
-        verdicts.append(Verdict(metric, float(measured[metric]), ceiling))
+        value = measured[metric]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise BudgetError(f"metric {metric}: measured value {value!r} is not a number")
+        if not math.isfinite(value) or value < 0:
+            raise BudgetError(f"metric {metric}: measured value {value!r} is not a finite, non-negative number")
+        verdicts.append(Verdict(metric, float(value), ceiling))
     return verdicts
 
 

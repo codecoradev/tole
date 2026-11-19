@@ -56,30 +56,62 @@ jobs:
           path: perf-report.json
           if-no-files-found: warn
 
-  # A ceiling may only move down. Raising one needs the `perf-budget-raise`
-  # label, applied by a maintainer after reading the diff of bench/budget.toml.
+  # A ceiling may only move down, and the code that judges it is the BASE
+  # branch's, never the PR's: the PR's budget.toml is checked by the base's
+  # bench/budget.py, so a PR cannot weaken the comparator to pass its own
+  # change. A PR that edits the gate itself (bench/*.py, bench/budget.toml,
+  # this workflow) or raises a ceiling needs the `perf-budget-raise` label,
+  # applied by a maintainer after reading the diff. Labels are read live with
+  # `gh pr view`, not from the event payload: adding a label starts no run
+  # (we do not subscribe to `labeled`, to keep the heavy jobs off label
+  # events), and "re-run jobs" replays the old payload, so only a live read
+  # sees the current labels after a re-run.
+  # The first PR to add bench/ has no base copy: this job is a no-op there
+  # (and says so); it enforces from the next PR on.
   ratchet:
     name: Perf budget ratchet
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - name: Ceilings only move down
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.base_ref }}
+          path: base
+      - name: Ceilings only move down, judged by the base branch's code
         env:
           BASE_REF: ${{ github.base_ref }}
-          RAISE_OK: ${{ contains(github.event.pull_request.labels.*.name, 'perf-budget-raise') }}
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
         run: |
-          if ! git show "origin/$BASE_REF:bench/budget.toml" > /tmp/base-budget.toml 2>/dev/null; then
-            echo "no bench/budget.toml on $BASE_REF yet: nothing to ratchet from"
+          if [ ! -f base/bench/run.py ] || [ ! -f base/bench/budget.toml ]; then
+            echo "::notice::no bench/ on $BASE_REF yet (this PR introduces it): nothing to enforce against, the ratchet starts with the next PR"
             exit 0
           fi
-          if python3 bench/run.py ratchet --base /tmp/base-budget.toml; then
-            exit 0
+          labels=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json labels --jq '.labels[].name')
+          raise_ok=false
+          if printf '%s\n' "$labels" | grep -qx 'perf-budget-raise'; then raise_ok=true; fi
+          fail=0
+          touched=$(git diff --name-only "origin/$BASE_REF...HEAD" -- 'bench/*.py' bench/budget.toml .github/workflows/perf-budget.yml)
+          if [ -n "$touched" ]; then
+            echo "this PR edits the perf gate:"
+            printf '%s\n' "$touched"
+            if [ "$raise_ok" != true ]; then
+              echo "::error::editing the perf gate needs the perf-budget-raise label"
+              fail=1
+            fi
           fi
-          if [ "$RAISE_OK" = "true" ]; then
-            echo "::warning::budget raised under the perf-budget-raise label"
-            exit 0
+          # The BASE's harness code judges the HEAD's budget file.
+          if ! python3 base/bench/run.py ratchet --base base/bench/budget.toml --head bench/budget.toml; then
+            if [ "$raise_ok" = true ]; then
+              echo "::warning::budget raised under the perf-budget-raise label"
+            else
+              fail=1
+            fi
           fi
-          exit 1
+          exit $fail
