@@ -51,8 +51,8 @@ use tole_core::memory::MemoryConfig;
 use tole_core::storage::Storage;
 
 pub mod missions;
-pub mod past_sessions;
 mod models;
+pub mod past_sessions;
 
 pub struct ServeConfig {
     pub bind: String,
