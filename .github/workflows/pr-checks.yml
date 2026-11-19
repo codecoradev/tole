@@ -4,6 +4,10 @@ on:
   pull_request:
     types: [opened, edited, synchronize, reopened]
     branches: [develop, main]
+  # Merge queue (#806): these checks judge the PR title, body and commits, which
+  # a queue entry has no copy of; each job below is skipped (reports success)
+  # there so the required check names still report. The PR run is unchanged.
+  merge_group:
 
 jobs:
   branch-naming:
@@ -11,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     # Bot PRs (Dependabot/Renovate) use their own branch names and bodies;
     # same exemption as codecoradev/uteke. Human PRs stay fully checked.
-    if: "!contains(fromJSON('[\"dependabot[bot]\", \"renovate[bot]\", \"github-actions[bot]\", \"app/dependabot\", \"app/renovate\"]'), github.event.pull_request.user.login)"
+    if: "github.event_name != 'merge_group' && !contains(fromJSON('[\"dependabot[bot]\", \"renovate[bot]\", \"github-actions[bot]\", \"app/dependabot\", \"app/renovate\"]'), github.event.pull_request.user.login)"
     steps:
       - name: Check branch name
         env:
@@ -43,7 +47,7 @@ jobs:
     runs-on: ubuntu-latest
     # Bot PRs (Dependabot/Renovate) use their own branch names and bodies;
     # same exemption as codecoradev/uteke. Human PRs stay fully checked.
-    if: "!contains(fromJSON('[\"dependabot[bot]\", \"renovate[bot]\", \"github-actions[bot]\", \"app/dependabot\", \"app/renovate\"]'), github.event.pull_request.user.login)"
+    if: "github.event_name != 'merge_group' && !contains(fromJSON('[\"dependabot[bot]\", \"renovate[bot]\", \"github-actions[bot]\", \"app/dependabot\", \"app/renovate\"]'), github.event.pull_request.user.login)"
     steps:
       - name: Check PR body
         env:
@@ -79,6 +83,7 @@ jobs:
   commit-conventional:
     name: Conventional Commits
     runs-on: ubuntu-latest
+    if: github.event_name != 'merge_group'
     steps:
       - uses: actions/checkout@v7
         with:
@@ -108,7 +113,7 @@ jobs:
     name: Message Standard
     runs-on: ubuntu-latest
     # Bot PRs are exempt, as above.
-    if: "!contains(fromJSON('[\"dependabot[bot]\", \"renovate[bot]\", \"github-actions[bot]\", \"app/dependabot\", \"app/renovate\"]'), github.event.pull_request.user.login)"
+    if: "github.event_name != 'merge_group' && !contains(fromJSON('[\"dependabot[bot]\", \"renovate[bot]\", \"github-actions[bot]\", \"app/dependabot\", \"app/renovate\"]'), github.event.pull_request.user.login)"
     permissions:
       contents: read
       pull-requests: read
