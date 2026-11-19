@@ -267,29 +267,6 @@ fn wait_for_children(work: &std::path::Path) {
     }
 }
 
-/// The inherited `PATH` minus every directory that holds a `cora` or `uteke`
-/// executable. Both are optional sibling tools that tole probes on `PATH`:
-/// `cora` attaches the MCP preset, and `uteke` is the memory backend every
-/// spawned child is forced onto (`TOLE_MEMORY=uteke`). `uteke` resolves its
-/// store from `$HOME` (it ignores `CODECORA_HOME`), so on a machine that has
-/// it these tests would depend on, and write to, the developer's real store
-/// and stall the child on its first-run model setup. CI has neither binary.
-fn path_without_sibling_binaries() -> std::ffi::OsString {
-    let has_sibling = |dir: &std::path::Path| {
-        ["cora", "uteke"]
-            .iter()
-            .any(|name| dir.join(name).is_file())
-    };
-    let kept: Vec<_> = std::env::var_os("PATH")
-        .map(|p| {
-            std::env::split_paths(&p)
-                .filter(|d| !has_sibling(d))
-                .collect()
-        })
-        .unwrap_or_default();
-    std::env::join_paths(kept).unwrap()
-}
-
 fn run_tole(env_extra: &[(&str, &str)], args: &[&str], stdin: &str) -> (String, String, i32) {
     let dir = WorkDir::new("tole-agent-e2e");
     // The machine guard queues a child while the machine is busy (load per
@@ -308,19 +285,16 @@ fn run_tole(env_extra: &[(&str, &str)], args: &[&str], stdin: &str) -> (String, 
     )
     .unwrap();
     let bin = env!("CARGO_BIN_EXE_tole");
-    let mut cmd = std::process::Command::new(bin);
+    // The hermetic environment (`common::hermetic_command`) gives the test its
+    // own home, never the machine's; a test that wants a decoy overrides it
+    // through `env_extra`. The home is outside the workspace: delegation keeps
+    // one machine-wide registry under the data dir, and the spawn interval
+    // would queue this child behind any other tole on the machine (a parallel
+    // test, another agent) so the mock never sees an agent id (#702). The same
+    // home also holds the user config and plugin lock.
+    let mut cmd = common::hermetic_command(bin, &dir.with_extension("home"), &[]);
     cmd.args(args)
         .current_dir(&dir)
-        // The default `HOME` is the test's own home, never the machine's;
-        // a test that wants a decoy overrides it through `env_extra`.
-        .env("HOME", dir.with_extension("home"))
-        .env("PATH", path_without_sibling_binaries())
-        // A home of its own, outside the workspace: delegation keeps one
-        // machine-wide registry under the data dir, and the spawn interval
-        // would queue this child behind any other tole on the machine (a
-        // parallel test, another agent) so the mock never sees an agent id
-        // (#702). The same home also holds the user config and plugin lock.
-        .env("CODECORA_HOME", dir.with_extension("home"))
         .env("TOLE_API_KEY", "test")
         .env("TOLE_MODEL", "mock")
         .env_remove("TOLE_MEMORY")
