@@ -26,6 +26,10 @@ use tole_core::turn::call_fingerprint;
 /// Pending decisions expire to denied after this long (lazily pruned).
 pub const EXPIRY_SECS: u64 = 900;
 
+/// How long after an Allow its session stays protected from eviction while
+/// the resume thread claims the turn.
+const RESUME_GRACE_MS: u64 = 30_000;
+
 /// One queued approval request.
 #[derive(Clone, Debug)]
 pub struct PendingApproval {
@@ -321,6 +325,50 @@ impl ApprovalQueue {
             .map(|e| e.storage_path.clone())
     }
 
+    /// True when `session_id` must stay live in memory: it has a Pending
+    /// entry, or an Allow granted its one-shot less than [`RESUME_GRACE_MS`]
+    /// ago that the resume has not consumed yet. The second case closes the
+    /// gap between the decision and the resume thread claiming the turn (the
+    /// session is idle and no longer Pending there).
+    pub fn has_pending(&self, session_id: &str) -> bool {
+        self.prune_expired();
+        let pending = self
+            .entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .any(|e| e.session_id == session_id && e.status == ApprovalStatus::Pending);
+        pending || {
+            let now = now_ms();
+            self.one_shot
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .iter()
+                .any(|((sid, _), (_, granted))| {
+                    sid == session_id && now.saturating_sub(*granted) < RESUME_GRACE_MS
+                })
+        }
+    }
+
+    /// Withdraw the one-shot an Allow of approval `id` granted, for a decision
+    /// that turned out to resume nothing: a session reopened later must not
+    /// silently consume it.
+    pub fn revoke_one_shot(&self, id: &str) {
+        let key = self
+            .entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| (e.session_id.clone(), e.fingerprint));
+        if let Some(key) = key {
+            self.one_shot
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&key);
+        }
+    }
+
     /// Validate an id WITHOUT mutating: (session_id, tool) when the
     /// entry is Pending. The decision route audits BEFORE deciding, so
     /// a failed audit leaves the queue untouched.
@@ -418,7 +466,7 @@ impl ApprovalQueue {
 
     /// Consume a one-shot approval for a replayed call (exactly once,
     /// and only for the SAME session that queued it).
-    fn take_one_shot(&self, session_id: &str, fingerprint: u64) -> bool {
+    pub(crate) fn take_one_shot(&self, session_id: &str, fingerprint: u64) -> bool {
         self.one_shot
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -1120,6 +1168,29 @@ mod tests {
         ));
         // The one-shot was granted: the replay would be allowed.
         assert!(q.take_one_shot("s1", 7));
+    }
+
+    #[test]
+    fn an_approved_session_stays_held_until_the_resume_consumes_it() {
+        let q = ApprovalQueue::default();
+        let id = queue_one(&q, "s1", "write_file");
+        assert!(q.has_pending("s1"));
+        q.decide(&id, true);
+        // Approved but not yet replayed: still held (the resume window).
+        assert!(q.has_pending("s1"));
+        assert!(!q.has_pending("other"));
+        assert!(q.take_one_shot("s1", 7));
+        assert!(!q.has_pending("s1"));
+    }
+
+    #[test]
+    fn revoking_withdraws_the_one_shot() {
+        let q = ApprovalQueue::default();
+        let id = queue_one(&q, "s1", "write_file");
+        q.decide(&id, true);
+        q.revoke_one_shot(&id);
+        assert!(!q.take_one_shot("s1", 7));
+        assert!(!q.has_pending("s1"));
     }
 
     #[test]
