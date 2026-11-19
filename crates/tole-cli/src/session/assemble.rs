@@ -238,7 +238,6 @@ pub fn apply_skills_in(
     Ok(sections)
 }
 
-<<<<<<< HEAD
 /// Routes a NEW session once (#586), before its provider is built: off
 /// unless `[router] enabled = true`; a session that already has a model is
 /// left alone. A broken router fails the start with its remedy, with secrets
@@ -271,7 +270,8 @@ pub fn route_session(
         eprintln!("{l}");
     }
     Ok(())
-=======
+}
+
 // ---------------------------------------------------------------------------
 // Face policy (#943)
 // ---------------------------------------------------------------------------
@@ -399,7 +399,6 @@ pub fn roster_for(policy: &FacePolicy, i: RosterInputs<'_>) -> Result<crate::too
     #[cfg(not(feature = "mcp"))]
     let _ = (policy.mcp_clients, i.mcp_specs);
     Ok(roster)
->>>>>>> origin/develop
 }
 
 #[cfg(test)]
