@@ -255,13 +255,13 @@ fn make_provider(cfg: &OpenAiConfig, system_prompt: &str) -> Result<Box<dyn Prov
 fn incumbent_default_prompt() -> Result<String> {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let main_rs = manifest
-        .join("../tole-cli/src/main.rs")
+        .join("../tole-cli/src/session/assemble.rs")
         .canonicalize()
-        .context("locating tole-cli/src/main.rs")?;
+        .context("locating tole-cli/src/session/assemble.rs")?;
     let src = std::fs::read_to_string(&main_rs)?;
     let start = src
         .find("fn default_system_prompt()")
-        .context("default_system_prompt not found in tole-cli/src/main.rs")?;
+        .context("default_system_prompt not found in tole-cli/src/session/assemble.rs")?;
     let rest = &src[start..];
     let open = rest.find('"').context("prompt literal not found")?;
     // The literal is a sequence of adjacent "..." segments joined with `\`
@@ -423,4 +423,22 @@ fn collect_traces(
         out.push((model, mission, p));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The replay scorer reads the deployed default prompt out of the CLI
+    /// source text. That must stay exactly the prompt the CLI really uses; a
+    /// move of the function or a change of its literal shape breaks this test
+    /// instead of silently scoring against the wrong text.
+    #[test]
+    fn the_prompt_read_from_source_is_the_one_the_cli_uses() {
+        let from_source = incumbent_default_prompt().unwrap();
+        assert_eq!(
+            from_source,
+            tole_cli::session::assemble::default_system_prompt()
+        );
+    }
 }
