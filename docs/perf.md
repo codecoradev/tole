@@ -53,6 +53,13 @@ characters is scanned once (the check reads UTF-8 bytes, no decoding). The
 unit test `a_large_text_with_invisible_characters_is_still_linear` redacts
 4 MiB that carries one in every line, as a guard against a quadratic path.
 
+## Release perf budget (#921)
+
+A CI gate on the release binary, separate from the threshold tests above:
+cold start, idle RSS, active-session RSS and per-turn overhead, measured with
+the real `tole` and a mock provider, against the ceilings in
+`bench/budget.toml` (ratchet-only-downward). See `bench/README.md`.
+
 ## Method
 
 - `crates/tole-core/tests/perf_threshold.rs` — deterministic, no timing
