@@ -36,7 +36,7 @@ pub mod shape;
 
 use base64::Engine;
 use std::borrow::Cow;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 static PROCESS: RwLock<Option<SecretSet>> = RwLock::new(None);
 static FROM_ENV: OnceLock<SecretSet> = OnceLock::new();
@@ -198,6 +198,36 @@ struct Inner {
     needles: Vec<Needle>,
     /// Needle indices by first byte (256 slots; empty when no needles).
     by_first: Vec<Vec<u32>>,
+    /// Memo of [`SecretSet::redact`] for long texts (#908). The set is
+    /// immutable, so a changed secret set is a new `Inner` with its own empty
+    /// cache; the allowlist is global, so the cache carries its generation.
+    cache: Mutex<RedactCache>,
+}
+
+/// Texts shorter than this are redacted every time (the regex pass is cheap).
+const CACHE_MIN_LEN: usize = 1024;
+/// Bytes of keys plus values one cache may hold; past it the cache is
+/// emptied (a history larger than this simply pays today's cost).
+const CACHE_MAX_BYTES: usize = 64 << 20;
+
+/// Exact-text memo: the key is the whole input, so a hit is byte-for-byte the
+/// same input (no hash collision can return another text's result). The
+/// value is `None` when redaction changed nothing.
+#[derive(Default)]
+struct RedactCache {
+    generation: u64,
+    bytes: usize,
+    map: std::collections::HashMap<Box<str>, Option<Box<str>>>,
+}
+
+impl RedactCache {
+    fn sync(&mut self, generation: u64) {
+        if self.generation != generation {
+            self.map.clear();
+            self.bytes = 0;
+            self.generation = generation;
+        }
+    }
 }
 
 struct Needle {
@@ -311,6 +341,47 @@ impl SecretSet {
     /// mapped back onto the original, so a value split by one is still
     /// found (#681). Text without any is scanned once.
     pub fn redact<'a>(&self, text: &'a str) -> Cow<'a, str> {
+        if text.len() < CACHE_MIN_LEN {
+            return self.redact_uncached(text);
+        }
+        // Read BEFORE computing: the result can only be tagged with a
+        // generation no newer than the allowlist it was computed with.
+        let generation = shape::generation();
+        if let Ok(mut c) = self.inner.cache.lock() {
+            c.sync(generation);
+            if let Some(hit) = c.map.get(text) {
+                return match hit {
+                    Some(out) => Cow::Owned(out.to_string()),
+                    None => Cow::Borrowed(text),
+                };
+            }
+        }
+        let out = self.redact_uncached(text);
+        let cost = text.len() + out.len();
+        if cost <= CACHE_MAX_BYTES {
+            if let Ok(mut c) = self.inner.cache.lock() {
+                // A newer allowlist arrived while computing: this result may
+                // be stale, so it is not stored.
+                if c.generation == generation {
+                    if c.bytes + cost > CACHE_MAX_BYTES {
+                        c.map.clear();
+                        c.bytes = 0;
+                    }
+                    let value = match &out {
+                        Cow::Borrowed(_) => None,
+                        Cow::Owned(o) => Some(o.as_str().into()),
+                    };
+                    c.bytes += cost;
+                    c.map.insert(text.into(), value);
+                }
+            }
+        }
+        out
+    }
+
+    /// [`SecretSet::redact`] without the memo: the reference behaviour.
+    #[doc(hidden)]
+    pub fn redact_uncached<'a>(&self, text: &'a str) -> Cow<'a, str> {
         match self.redact_known(text) {
             // Known values first (their `«NAME»` marker wins), then the
             // shared shape detector for secrets nobody told us about (#597).
