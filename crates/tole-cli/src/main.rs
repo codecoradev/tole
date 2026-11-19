@@ -1968,6 +1968,10 @@ fn dispatch(cli: Cli) -> Result<()> {
                 ));
             }
             check_server_face_flags("acp", &host, &settings, explicit_mcp)?;
+            tole_cli::session_host::set_server_skills(
+                tole_cli::session::assemble::ServerSkills::new(host.skills.clone(), host.no_skills)
+                    .map_err(anyhow::Error::msg)?,
+            );
             if host.plan_mode {
                 eprintln!("tole acp: --plan-mode is active — serving read-only tools only");
             }
@@ -2017,6 +2021,10 @@ fn dispatch(cli: Cli) -> Result<()> {
                 ));
             }
             check_server_face_flags("serve", &host, &settings, explicit_mcp)?;
+            tole_cli::session_host::set_server_skills(
+                tole_cli::session::assemble::ServerSkills::new(host.skills.clone(), host.no_skills)
+                    .map_err(anyhow::Error::msg)?,
+            );
             let memory = match memory.as_deref().filter(|s| !s.trim().is_empty()) {
                 Some(m) => resolve_memory(
                     Some(m),
@@ -2737,13 +2745,13 @@ fn check_client_session_flags(
     if !skills.is_empty() {
         anyhow::bail!(
             "--skill is not supported by `tole {face}` (skills load into \
-             run/chat/resume session system prompts)"
+             run/chat/resume and serve/acp session system prompts)"
         );
     }
     if no_skills {
         anyhow::bail!(
-            "--no-skills is not supported by `tole {face}` (server faces never load \
-             skills — nothing to disable)"
+            "--no-skills is not supported by `tole {face}` (it serves no sessions, so \
+             it loads no skills — nothing to disable)"
         );
     }
     if explicit_mcp_servers {
@@ -2823,18 +2831,46 @@ fn check_server_face_flags(
     settings: &tole_cli::config_apply::Settings,
     explicit_mcp: bool,
 ) -> Result<()> {
-    check_client_session_flags(face, &host.skills, host.no_skills, explicit_mcp).map_err(|e| {
+    // `serve` and `acp` host sessions that load skills (#945), so the owner's
+    // `--skill` / `--no-skills` apply there; `mcp` and `mission` still refuse.
+    let hosts_skills = matches!(face, "serve" | "acp");
+    // A skill file named by the PROJECT config sits inside the served
+    // repository and its bytes are not bound by the config trust: a later
+    // `git pull` would change what loads into every new session. Refused;
+    // the flag, TOLE_SKILL, a profile and the user config are the owner's own.
+    if hosts_skills
+        && settings
+            .skill
+            .as_ref()
+            .is_some_and(|s| s.source == tole_cli::config_apply::Source::Config)
+    {
+        return Err(refuse_for(
+            &format!(
+                "--skill from the project config is not supported by `tole {face}` (a skill \
+                 file the repository names is not content-bound; pass --skill or TOLE_SKILL, \
+                 or set it in the user config)"
+            ),
+            Some(tole_cli::config_apply::Source::Config),
+            true,
+        ));
+    }
+    let (skills, no_skills) = if hosts_skills {
+        (&[][..], false)
+    } else {
+        (&host.skills[..], host.no_skills)
+    };
+    check_client_session_flags(face, skills, no_skills, explicit_mcp).map_err(|e| {
         // Same order as the checks inside: skill, no_skills, mcp_server.
-        let cfg = if !host.skills.is_empty() {
+        let cfg = if !skills.is_empty() {
             from_config(&settings.skill)
-        } else if host.no_skills {
+        } else if no_skills {
             config_layer(settings.no_skills.source)
         } else {
             from_config(&settings.mcp_server)
         };
         // An exported TOLE_SKILL reaches every face: name it, or the
         // refusal would point at a --skill flag nobody typed.
-        let from_env = !host.skills.is_empty()
+        let from_env = !skills.is_empty()
             && settings
                 .skill
                 .as_ref()

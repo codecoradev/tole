@@ -60,7 +60,7 @@ true; the status column says where the work is.
 | Capability | CLI | `serve` / ACP session | `tole mcp` | cron | Status |
 |---|---|---|---|---|---|
 | Default system prompt (tool discipline, one context line naming the session's workspace; pinned in the header) | yes | yes (#945) | n/a | cron's own | one path |
-| Skill sections and `load_skill` (approved skills only, #591) | yes | no | no | no | drift #945, needs the owner's go |
+| Skill sections and `load_skill` (approved skills only, #591; discovered in the session workspace; the owner's `--skill`/`--no-skills` for the process; appended to the pinned prompt at creation, so `resume` keeps it) | yes | yes (#945) | no | no | one path |
 | Review guidance (named only when both review tools are present) | yes | wired (#945), but the cora review tools are MCP tools, so it appears only once server sessions get MCP clients (#946) | n/a | no | one path in code; inactive on server faces until #946 |
 | Model routing for a new session (#586) | yes | no | n/a | no | drift #945 |
 | MCP client servers (`--mcp-server`, the cora preset) | yes | no | no | no | drift #946 (a trust boundary; the owner's configured servers only, never the request) |

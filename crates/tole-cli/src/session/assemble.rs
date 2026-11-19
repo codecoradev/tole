@@ -187,7 +187,7 @@ pub fn resolve_workspace_root(explicit: Option<&String>) -> Result<PathBuf> {
 }
 
 /// Skills wiring (issue #161), used by the CLI commands (run, chat, the TUI).
-/// Server faces do not call it yet (#945). Loads `--skill`
+/// Server faces call it through [`server_session_skills`] (#945). Loads `--skill`
 /// files (loud error on broken ones), and when the workspace exposes a
 /// non-empty skills dir, registers the ReadOnly load_skill tool and
 /// returns the index/section block to append to the system prompt.
@@ -263,6 +263,115 @@ pub fn apply_skills_in(
         sections.push_str(&block);
     }
     Ok(sections)
+}
+
+/// The owner's process-level skills choice for server sessions (#945):
+/// the `--skill` files and `--no-skills` the `tole serve` / `tole acp`
+/// process was started with (flags, `TOLE_SKILL`, config). It is fixed at
+/// startup: no request field, header or tool argument reaches it, so a
+/// client can name neither a skill file, a skills directory nor an approval.
+#[derive(Debug, Clone, Default)]
+pub struct ServerSkills {
+    pub explicit: Vec<PathBuf>,
+    pub no_skills: bool,
+    /// Tests only: the approval gate to use instead of the owner's
+    /// approvals file (which `gate_from_env` reads).
+    #[cfg(test)]
+    pub(crate) gate_override: Option<tole_core::skills::Gate>,
+}
+
+impl ServerSkills {
+    /// The owner's choice, validated: with skills on, every explicit file
+    /// must pass [`validate_explicit_skill`], so a bad one fails the server's
+    /// STARTUP (with the file and the reason) instead of a session later.
+    pub fn new(explicit: Vec<PathBuf>, no_skills: bool) -> Result<Self, String> {
+        if !no_skills {
+            for p in &explicit {
+                validate_explicit_skill(p)?;
+            }
+        }
+        Ok(Self {
+            explicit,
+            no_skills,
+            #[cfg(test)]
+            gate_override: None,
+        })
+    }
+}
+
+/// An explicit `--skill` file of a SERVER face: a regular file (never a FIFO
+/// or device: opening is non-blocking and the file is refused), at most
+/// [`tole_core::skills::MAX_SKILL_FILE_BYTES`], UTF-8, a valid skill, with a
+/// body within [`tole_core::skills::MAX_SKILL_CHARS`]. The CLI's loop reads
+/// its files uncapped; a server must not hang or balloon on a bad path.
+pub fn validate_explicit_skill(path: &std::path::Path) -> Result<(), String> {
+    use tole_core::skills::{MAX_SKILL_CHARS, MAX_SKILL_FILE_BYTES};
+    let bad = |why: String| format!("--skill {}: {why}", path.display());
+    let bytes = tole_core::skills::read_file_capped(path, MAX_SKILL_FILE_BYTES)
+        .map_err(|e| bad(e.to_string()))?;
+    let content = String::from_utf8(bytes).map_err(|_| bad("not UTF-8".into()))?;
+    let name = path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or("skill");
+    let skill = tole_core::skills::parse_skill(&content, name).map_err(bad)?;
+    if skill.body.len() > MAX_SKILL_CHARS {
+        return Err(bad(format!(
+            "the body is {} bytes, over the {MAX_SKILL_CHARS} cap",
+            skill.body.len()
+        )));
+    }
+    Ok(())
+}
+
+/// The skill sections of a server session (#945) and the `load_skill`
+/// registration, through the same [`apply_skills`] the CLI uses: only
+/// APPROVED skills load (#591), discovered in `workspace` (the session's
+/// jail root), plus the process's explicit `--skill` files. `--no-skills`
+/// short-circuits. Callers append the result to the pinned prompt of a NEW
+/// session only (append-only: a stored prompt is never extended).
+pub fn server_session_skills(
+    cfg: &ServerSkills,
+    workspace: &std::path::Path,
+    registry: &mut ToolRegistry,
+) -> Result<String> {
+    if cfg.no_skills {
+        return Ok(String::new());
+    }
+    // The files were checked at startup; check again, as one may have been
+    // swapped since (a FIFO would hang the read below).
+    for p in &cfg.explicit {
+        validate_explicit_skill(p).map_err(anyhow::Error::msg)?;
+    }
+    #[cfg(test)]
+    if let Some(gate) = &cfg.gate_override {
+        let recall = crate::skill_recall::SkillRecall {
+            gate: gate.clone(),
+            ..crate::skill_recall::SkillRecall::from_env(None).map_err(anyhow::Error::msg)?
+        };
+        return apply_skills_in(
+            &cfg.explicit,
+            Some(workspace.to_path_buf()),
+            false,
+            registry,
+            &recall,
+        );
+    }
+    apply_skills(
+        &cfg.explicit,
+        Some(&workspace.display().to_string()),
+        false,
+        registry,
+        None,
+    )
+}
+
+/// Whether a pinned prompt carries the skills index (the local listing or
+/// the recalled selection). A resumed session whose prompt has it needs
+/// `load_skill` back in its registry; one without it gains nothing.
+pub fn prompt_has_skills_index(prompt: &str) -> bool {
+    prompt.contains("\n# Skills available\n") || prompt.contains("\n# Skills\n")
 }
 
 /// Routes a NEW session once (#586), before its provider is built: off
@@ -752,5 +861,93 @@ mod face_policy_tests {
         ] {
             assert_eq!(mk(&p).unwrap(), 0, "{}", p.name);
         }
+    }
+}
+
+#[cfg(test)]
+mod server_skill_file_tests {
+    use super::*;
+
+    const OK: &str = "---\nname: demo\ndescription: \"d\"\n---\nbody";
+
+    fn skill_at(dir: &crate::test_dir::TestDir, content: &str) -> PathBuf {
+        let d = dir.join("demo");
+        std::fs::create_dir_all(&d).unwrap();
+        let f = d.join("SKILL.md");
+        std::fs::write(&f, content).unwrap();
+        f
+    }
+
+    #[test]
+    fn a_valid_explicit_skill_passes_startup() {
+        let dir = crate::test_dir::TestDir::new("tole-sf-ok");
+        let f = skill_at(&dir, OK);
+        assert!(ServerSkills::new(vec![f], false).is_ok());
+    }
+
+    #[test]
+    fn bad_explicit_skills_fail_startup_with_file_and_reason() {
+        let dir = crate::test_dir::TestDir::new("tole-sf-bad");
+        // Over the file cap.
+        let big = skill_at(
+            &dir,
+            &format!(
+                "{OK}{}",
+                "x".repeat(tole_core::skills::MAX_SKILL_FILE_BYTES as usize)
+            ),
+        );
+        let e = ServerSkills::new(vec![big.clone()], false).unwrap_err();
+        assert!(
+            e.contains("--skill") && e.contains(&big.display().to_string()),
+            "{e}"
+        );
+        assert!(e.contains("is over"), "{e}");
+        // Body over the character cap, file under the file cap.
+        let long = skill_at(
+            &dir,
+            &format!("{OK}{}", "x".repeat(tole_core::skills::MAX_SKILL_CHARS)),
+        );
+        let e = ServerSkills::new(vec![long], false).unwrap_err();
+        assert!(e.contains("cap"), "{e}");
+        // A directory.
+        let e = ServerSkills::new(vec![dir.join("demo")], false).unwrap_err();
+        assert!(e.contains("--skill"), "{e}");
+        // Missing.
+        let e = ServerSkills::new(vec![dir.join("nope").join("SKILL.md")], false).unwrap_err();
+        assert!(e.contains("nope"), "{e}");
+        // Not a valid skill.
+        let junk = skill_at(&dir, "no frontmatter");
+        assert!(ServerSkills::new(vec![junk], false).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_fails_startup_without_hanging() {
+        let dir = crate::test_dir::TestDir::new("tole-sf-fifo");
+        let d = dir.join("demo");
+        std::fs::create_dir_all(&d).unwrap();
+        let fifo = d.join("SKILL.md");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let e = ServerSkills::new(vec![fifo], false).unwrap_err();
+        assert!(e.contains("not a regular file"), "{e}");
+    }
+
+    #[test]
+    fn no_skills_does_not_read_the_files() {
+        let dir = crate::test_dir::TestDir::new("tole-sf-off");
+        assert!(ServerSkills::new(vec![dir.join("missing")], true).is_ok());
+    }
+
+    /// A file swapped for a bad one after startup is refused at session
+    /// creation too.
+    #[test]
+    fn a_file_gone_bad_after_startup_fails_session_creation() {
+        let dir = crate::test_dir::TestDir::new("tole-sf-swap");
+        let f = skill_at(&dir, OK);
+        let cfg = ServerSkills::new(vec![f.clone()], false).unwrap();
+        std::fs::remove_file(&f).unwrap();
+        let mut reg = ToolRegistry::new();
+        assert!(server_session_skills(&cfg, &dir, &mut reg).is_err());
     }
 }

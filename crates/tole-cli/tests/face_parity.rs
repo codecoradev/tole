@@ -35,7 +35,16 @@ const PROMPT_ROW: &str = "(system prompt)";
 /// Tools that exist only when an optional binary is on PATH or a repository
 /// is detected; they depend on the machine, not on the face.
 fn machine_dependent(name: &str) -> bool {
-    name == "cora_search" || name == "gh" || name.starts_with("uteke_") || name.starts_with("mcp_")
+    // `load_skill` (and the skills sections of the prompt) exist when skills are
+    // discovered (#945): in the workspace or in the owner's user-global
+    // directory. Both the CLI and server sessions run the same `apply_skills`
+    // (the test compares the prompt text with it below).
+    name == "cora_search"
+        || name == "gh"
+        || name == "load_skill"
+        || name == "skill_search"
+        || name.starts_with("uteke_")
+        || name.starts_with("mcp_")
 }
 
 /// A prompt without its one `Context:` line (working directory and date).
@@ -89,7 +98,18 @@ fn observed(base: &TestDir) -> BTreeMap<String, BTreeMap<&'static str, bool>> {
     };
     // CLI, mcp-server and cron are built through the shared roster, plus the
     // todo tools where the face registers them (CLI, cron; not `tole mcp`).
-    for n in names(&registry(&FacePolicy::CLI, &w, true)) {
+    let mut cli_reg = registry(&FacePolicy::CLI, &w, true);
+    // The CLI's skills step (the same `apply_skills` a server session runs at
+    // creation, #945), whose sections the prompt comparison below includes.
+    let cli_skills = tole_cli::session::assemble::apply_skills(
+        &[],
+        Some(&w.to_str().unwrap().to_string()),
+        false,
+        &mut cli_reg,
+        None,
+    )
+    .unwrap();
+    for n in names(&cli_reg) {
         put("cli", n);
     }
     for n in names(&registry(&FacePolicy::MCP_SERVER, &w, false)) {
@@ -98,7 +118,11 @@ fn observed(base: &TestDir) -> BTreeMap<String, BTreeMap<&'static str, bool>> {
     for n in names(&registry(&FacePolicy::CRON, &w, true)) {
         put("cron", n);
     }
-    // A server session is built by the real session host.
+    // A server session is built by the real session host; the entrypoint
+    // (`tole serve`) sets the process's skills choice first (#945).
+    tole_cli::session_host::set_server_skills(
+        tole_cli::session::assemble::ServerSkills::new(vec![], false).unwrap(),
+    );
     let session = tole_cli::session_host::open_session(
         "face-parity",
         w.to_str().unwrap(),
@@ -119,7 +143,7 @@ fn observed(base: &TestDir) -> BTreeMap<String, BTreeMap<&'static str, bool>> {
     // The default system prompt: compare the TEXT, not its presence. A server
     // session counts as having "the" prompt only when it equals the CLI's
     // modulo the context line (which names the face's own working directory).
-    let cli_prompt = build_default_prompt(false);
+    let cli_prompt = format!("{}{cli_skills}", build_default_prompt(false));
     put("cli", PROMPT_ROW.to_string());
     if session
         .system_prompt

@@ -9,6 +9,10 @@ use tole_cli::session_tools::SessionToolState;
 use tole_core::tool::Tool;
 
 fn ws(tag: &str) -> TestDir {
+    // The entrypoint fixes the skills choice before a session opens (#945).
+    tole_cli::session_host::set_server_skills(
+        tole_cli::session::assemble::ServerSkills::new(vec![], true).unwrap(),
+    );
     let d = TestDir::new(&format!("tole-sess-tools-{tag}"));
     std::fs::create_dir_all(d.join("a")).unwrap();
     std::fs::create_dir_all(d.join("b")).unwrap();
