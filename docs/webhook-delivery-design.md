@@ -183,6 +183,10 @@ Envelope (one JSON object, UTF-8, at most **16 KiB** after serialization):
   over 16 KiB after the caps above, `summary` is dropped and `truncated` is
   set.
 
+A fourth event, `turn_finished` (a serve turn ended, ids and a status word
+only), is proposed in [turn-finished-event.md](turn-finished-event.md) (#962);
+it is not part of this schema until that note is accepted and implemented.
+
 ## 3. Signature (mirror of the inbound gate)
 
 The sender reuses `tole_core::webhook::sign` (`ledger/webhook.rs`, native v2)
@@ -703,3 +707,6 @@ owner to overrule.
 12. **Outbox checkpoint.** Without one, every fold reads the whole file (up to the
     64 MiB cap). Recommendation: not in v1; add a cache-only checkpoint offset
     if real use gets near 32 MiB.
+13. **`turn_finished` event (#962).** Proposed in
+    [turn-finished-event.md](turn-finished-event.md); its open questions are
+    listed there (section 11).
