@@ -16,8 +16,8 @@ ceiling in [`budget.toml`](budget.toml).
 
 The real `target/release/tole`, no test double of the binary. The only fake is
 the provider: an OpenAI-compatible endpoint on `127.0.0.1` inside the harness
-process. No network, no secrets (the API key and serve token are random
-dummy values generated per run). Every run uses a fresh `HOME`, workspace and sessions dir.
+process. No network, no secrets (the provider key and the serve token are
+random throwaway values generated per run). Every run uses a fresh `HOME`, workspace and sessions dir.
 
 | Metric | How |
 |---|---|
@@ -124,7 +124,7 @@ Issue #921 part B is not built here. A follow-up needs:
   canonical one, `tole upgrade` tracks it) and the release archive plus
   checksum from `release.yml`, each as its own number;
 - a timer from "install command starts" to "first successful session turn"
-  through the default first-run flow, with a mock or a scoped test key for the
+  through the default first-run flow, with a mock provider (or a scoped throwaway account) for the
   provider step, recorded to the same report schema;
 - a decision on the runner: install time depends on network and compile time,
   so it is a scheduled or release-time job, not a PR gate, and its number is

@@ -112,9 +112,10 @@ class DummyCredentials(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d1, tempfile.TemporaryDirectory() as d2:
             a = run.Env("/bin/true", Path(d1), "http://127.0.0.1:1/v1")
             b = run.Env("/bin/true", Path(d2), "http://127.0.0.1:1/v1")
-        self.assertNotEqual((a.api_key, a.serve_token), (b.api_key, b.serve_token))
-        self.assertTrue(a.api_key.startswith("sk-") and len(a.api_key) >= 32)
-        self.assertEqual(a.env()["TOLE_API_KEY"], a.api_key)
+        self.assertNotEqual((a.dummy_a, a.dummy_b), (b.dummy_a, b.dummy_b))
+        self.assertNotEqual(a.dummy_a, a.dummy_b)
+        self.assertGreaterEqual(len(a.dummy_a), 32)
+        self.assertEqual(a.env()["TOLE_API_KEY"], a.dummy_a)
 
 
 class NoBudgetOnCi(unittest.TestCase):
