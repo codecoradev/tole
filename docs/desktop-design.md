@@ -52,7 +52,7 @@ unless the status column says otherwise.
 | Send a prompt (blocks until the turn ends) | `POST /sessions/{id}/prompt {text, images?}` | exists |
 | Live stream | `GET /sessions/{id}/events?after=<seq>` (SSE) | exists (#524) |
 | History, paged | `GET /sessions/{id}/entries?after&limit` | exists (#524) |
-| Status, usage | `GET /sessions/{id}/status` | exists; `entries` and `usage_report` are `null` while a turn runs |
+| Status, usage | `GET /sessions/{id}/status` | exists; `entries` and `usage_report` are `null` while a turn runs; `model`, `effort`, `contextWindow`, `contextUsed`, `name` come from a last-known snapshot (`stale: true`, `snapshotAt`) then (#573) |
 | Cancel, steer, detach a turn | `POST /sessions/{id}/cancel`, `/interrupt`, `/detach` | exist |
 | Approvals queue | `GET /approvals`, `GET /approvals?session=<id>` | exists |
 | Decide an approval | `POST /approvals/{id}/decision` | exists |
@@ -91,8 +91,9 @@ re-read against `serve.rs`.
   by `approval_required`. The client watches `approval_requested` frames or
   polls `GET /approvals?session=<id>` after every allow.
 - **`usage_report` and `entries` are `null` while a turn runs** in
-  `GET /status`. Read the footer numbers from the stream and `entries`, not from
-  status during a turn.
+  `GET /status`. Read token numbers from the stream and `entries`. The footer's
+  model, effort, context window and name stay available: they come from the
+  last-known snapshot, flagged `stale: true` with a `snapshotAt` (#573).
 - **Ephemeral frames are best-effort**; the durable `entry` frames are the
   truth, and `?after=<seq>` (or `Last-Event-ID`) replays what was missed.
 - **`seq` is not dense**; never assume `+1`.
@@ -119,7 +120,7 @@ those screens only.
 | Steer, follow-up queue | `POST /interrupt` | exists |
 | Stop | `POST /cancel` | exists |
 | Approval card | `approval_required` row, `GET /approvals`, `POST /decision` | exists |
-| Footer (status, usage) | stream frames, `GET /status` | exists; `null` fields during a turn |
+| Footer (status, usage) | stream frames, `GET /status` | exists; during a turn `usage_report` is `null`, the model, effort and window are a `stale` snapshot (#573) |
 | `@file` panel | none | not planned: serve has no file listing or search route (needs an owner decision on exposing the workspace tree) |
 | Image attach and view | `POST /images`, `GET /images/{hash}` | exists |
 | Model picker, thinking level | none | planned, #574 |

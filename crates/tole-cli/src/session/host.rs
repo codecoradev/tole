@@ -47,6 +47,69 @@ pub struct SessionState {
     /// The per-session profile's name (#740), fixed for this live session;
     /// `None` = opened without one.
     pub profile: Option<String>,
+    /// The last-known status snapshot (#573), refreshed whenever the session
+    /// is read idle, a turn settles or a register changes. A separate lock,
+    /// held only to copy or store, so the status route can read it while a
+    /// turn holds `storage`.
+    pub status: StdArc<Mutex<crate::session::status::StatusCell>>,
+}
+
+impl SessionState {
+    /// The configured model this session falls back to: its profile's, else
+    /// the provider configuration's (`None` when none resolves).
+    fn default_model(&self) -> Option<String> {
+        self.model
+            .clone()
+            .or_else(|| crate::turn_runner::provider_config().ok().map(|c| c.model))
+            .filter(|m| !m.trim().is_empty())
+    }
+
+    /// Re-read the status from `storage` (the caller holds its lock) and keep
+    /// it as the last-known snapshot. Pure: no network, no other lock than
+    /// the small status cell.
+    pub fn refresh_status(&self, storage: &impl Storage) -> crate::session::status::StatusSnapshot {
+        let default = self.default_model();
+        let mut cell = self.status.lock().unwrap_or_else(|p| p.into_inner());
+        let snap = crate::session::status::take_snapshot(storage, default.as_deref(), &cell);
+        cell.store(snap.clone());
+        snap
+    }
+
+    /// The last-known snapshot, never touching `storage`.
+    pub fn last_status(&self) -> Option<crate::session::status::StatusSnapshot> {
+        self.status
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .snapshot()
+            .cloned()
+    }
+
+    /// Ask the provider for the context window once the session has a prompt
+    /// to measure and none is known (a resumed session, or the first turn
+    /// just settled), then refresh the snapshot. Blocks on the network, so
+    /// callers run it off the request path. Never waits for a running turn.
+    pub fn warm_status(&self) {
+        let Ok(mut cfg) = crate::turn_runner::provider_config() else {
+            return;
+        };
+        if let Some(m) = self.model.as_deref().filter(|m| !m.trim().is_empty()) {
+            cfg.model = m.to_string();
+        }
+        let model = {
+            let Ok(g) = self.storage.try_lock() else {
+                return;
+            };
+            if tole_core::compaction::last_prompt_tokens(&*g).is_none() {
+                return;
+            }
+            crate::turn_runner::session_model(&*g, &cfg.model)
+        };
+        if crate::session::status::detect_window(&self.status, &cfg, &model) {
+            if let Ok(g) = self.storage.try_lock() {
+                self.refresh_status(&*g);
+            }
+        }
+    }
 }
 
 /// What a host may fix for ONE session instead of taking the process-wide
@@ -386,6 +449,21 @@ pub fn open_session_with(
             )
         }
     };
+    // Same rule for the owner's MCP servers (#946): an unset cell is an error,
+    // never a silent "none".
+    let mcp: &[String] = match crate::session::owner_mcp::get() {
+        Some(m) => m,
+        #[cfg(test)]
+        None => &[],
+        #[cfg(not(test))]
+        None => {
+            return Err(
+                "the owner's MCP servers are not configured: the entrypoint must call \
+                        session::owner_mcp::set before opening a session"
+                    .into(),
+            )
+        }
+    };
     open_session_inner(
         session_id,
         cwd,
@@ -400,6 +478,7 @@ pub fn open_session_with(
         plan_emitter,
         overrides,
         &skills,
+        mcp,
     )
 }
 
@@ -419,6 +498,7 @@ fn open_session_inner(
     plan_emitter: Option<PlanEmitter>,
     overrides: SessionOverrides,
     skills: &crate::session::assemble::ServerSkills,
+    owner_mcp: &[String],
 ) -> Result<SessionState, String> {
     let workspace = PathBuf::from(cwd);
     let workspace_canon = workspace
@@ -453,10 +533,21 @@ fn open_session_inner(
             allow_patterns: &parent_allows,
             agents_worktree: false,
             delegation: None,
-            mcp_specs: &[],
+            // The owner's servers, read at startup (#946): never from the
+            // request or its overrides.
+            mcp_specs: owner_mcp,
         },
     )
     .map_err(|e| e.to_string())?;
+    #[cfg(feature = "mcp")]
+    let mcp_notices = {
+        let sink = crate::tool_roster::McpNoticeSink::default();
+        roster.mcp_notices = Some(sink.clone());
+        // Every MCP tool on a server face is Write behind the approval gate:
+        // no ReadOnly `mcp_read` (#946).
+        roster.mcp_resources = false;
+        sink
+    };
     roster.plan_emitter = plan_emitter;
     roster.session = Some(session_id.to_string());
     // #217: a job that exits nudges this session at its next safe point.
@@ -520,13 +611,26 @@ fn open_session_inner(
             .map_err(|e| format!("creating session: {e}"))?;
         (st, Some(prompt))
     };
+    // A server the lock refused (or that did not start) is reported once in
+    // the session log, where a client reads it with the entries (#946).
+    #[cfg(feature = "mcp")]
+    let storage = {
+        let mut storage = storage;
+        let notices = mcp_notices
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        record_mcp_notices(&mut storage, &notices)?;
+        storage
+    };
     // Task-list tools (issue #198): registered after the storage open —
     // the state is seeded from the replayed transcript, so crash-resume
     // restores the last list; todo_write is absent under --plan-mode.
     crate::tool_roster::register_todo(&mut reg, storage.entries(), plan_mode)
         .map_err(|e| e.to_string())?;
 
-    Ok(SessionState {
+    let state = SessionState {
+        status: StdArc::default(),
         storage: StdArc::new(Mutex::new(storage)),
         path: dir.join(format!("{session_id}.jsonl")),
         registry: StdArc::new(reg),
@@ -538,7 +642,97 @@ fn open_session_inner(
         tool_ids: StdArc::new(Mutex::new(0)),
         model: overrides.model,
         profile: overrides.profile,
-    })
+    };
+    state.refresh_status(&*state.storage.lock().unwrap_or_else(|p| p.into_inner()));
+    Ok(state)
+}
+
+/// Routes a server session at its first prompt, before any provider call: the
+/// CLI's semantics through the one shared step. Off unless the OWNER's config
+/// enables `[router]`; a session that already has a model (client-set through
+/// the model route, a profile, resume) is left alone; a broken router fails
+/// this prompt with its redacted remedy. A request cannot touch the router.
+fn route_first_prompt(
+    storage: &mut dyn Storage,
+    profile: Option<&str>,
+    prompt: &str,
+    registry: &tole_core::tool::ToolRegistry,
+) -> Result<(), String> {
+    // A config that no longer loads fails the prompt too, redacted like a
+    // router error (its text can echo a value the owner wrote).
+    let secrets = crate::provider_chain::process_secrets(&crate::config_apply::real_env);
+    let cfg = match crate::config::user_config_path() {
+        Some(p) => crate::config::user_config_present(&p)
+            .and_then(|present| {
+                if present {
+                    crate::config::load(&p).map(Some).map_err(|e| e.to_string())
+                } else {
+                    Ok(None)
+                }
+            })
+            .map_err(|e| secrets.redact(&e).into_owned())?,
+        None => None,
+    }
+    .unwrap_or_default();
+    let setup = crate::delegate::Setup {
+        cfg,
+        ..Default::default()
+    };
+    crate::session::assemble::route_session(
+        storage,
+        &setup,
+        profile,
+        tole_core::router::TaskKind::Chat,
+        prompt,
+        registry,
+        false,
+        None,
+    )
+    // `route_session` redacts its own error with the process secrets
+    // (assemble.rs), so this text is already safe to return.
+    .map_err(|e| e.to_string())
+}
+
+/// Appends one `error` entry per MCP server that did not start (#946): the
+/// server's name and the reason, no secret (the reason is the lock's own
+/// text). A root entry the model wire drops, so it never reaches the model.
+#[cfg(feature = "mcp")]
+fn record_mcp_notices(
+    storage: &mut tole_core::storage::JsonlStorage,
+    notices: &[crate::tool_roster::McpNotice],
+) -> Result<(), String> {
+    use tole_core::entry::{EntryType, NewEntry};
+    for n in notices {
+        let text = format!(
+            "MCP server `{}` was not started for this session: {}",
+            n.server, n.reason
+        );
+        // Redacted with the process secrets, as every egress of the log.
+        let text = crate::provider_chain::process_secrets(&crate::config_apply::real_env)
+            .redact(&text)
+            .into_owned();
+        // A resume re-opens the session: the same server and reason is not
+        // appended again (a changed reason is).
+        let seen = storage.entries().iter().any(|e| {
+            e.payload["notice"] == "mcp_server_not_started"
+                && e.payload["server"] == n.server.as_str()
+                && e.payload["error"] == text.as_str()
+        });
+        if seen {
+            continue;
+        }
+        storage
+            .commit(tole_core::storage::Commit::new().entry(NewEntry::root(
+                EntryType::new(EntryType::ERROR),
+                serde_json::json!({
+                    "error": text,
+                    "notice": "mcp_server_not_started",
+                    "server": n.server,
+                }),
+            )))
+            .map_err(|e| format!("recording the MCP notice: {e}"))?;
+    }
+    Ok(())
 }
 
 /// The provider config of one turn: the process-wide one, with the session's
@@ -636,6 +830,7 @@ pub fn run_session_turn_detailed(
     // the transport loop stays live (CodeCora deadlock finding).
     let (state, _busy_guard) = lock_sessions(&sessions).claim_turn(session_id)?;
     let queue_mark = approvals.map(|q| q.mark());
+    let refresher = state.clone();
     let SessionState {
         storage,
         registry,
@@ -644,6 +839,7 @@ pub fn run_session_turn_detailed(
         first_prompt_done,
         cancel,
         model,
+        profile,
         ..
     } = state;
     let mut final_text: Option<String> = None;
@@ -662,6 +858,10 @@ pub fn run_session_turn_detailed(
     // the env default. serve sessions have no setter today, so this is
     // a no-op there.
     let mut storage = storage.lock().unwrap_or_else(|p| p.into_inner());
+    // Model routing (#586, #945): once, at the first prompt of a NEW session.
+    if !*first_prompt_done.lock().expect("fpd lock") && model.is_none() {
+        route_first_prompt(&mut *storage, profile.as_deref(), prompt, &registry)?;
+    }
     // Live-token sinks (issue #196 phase 3): when an observer is wired
     // (ACP, serve with an open event stream), streamed reasoning/content
     // deltas flow to it DURING the provider call; the decisive output
@@ -685,6 +885,8 @@ pub fn run_session_turn_detailed(
         crate::turn_runner::remember(memory.as_ref(), session_id, prompt, text, *wrote);
     }
     *first_prompt_done.lock().expect("fpd lock") = true;
+    // The turn is over: the footer's last-known values are these (#573).
+    refresher.refresh_status(&*storage);
 
     if let tole_core::turn::TurnOutcome::Final { text, .. } = &outcome {
         final_text = Some(text.clone());
@@ -714,6 +916,7 @@ pub fn resume_session_turn(
     session_id: &str,
 ) -> Result<(String, Option<String>), String> {
     let (state, _busy_guard) = lock_sessions(&sessions).claim_turn(session_id)?;
+    let refresher = state.clone();
     let SessionState {
         storage,
         registry,
@@ -740,6 +943,7 @@ pub fn resume_session_turn(
     };
     let outcome =
         crate::turn_runner::resume_turn_on(&mut *storage, &plan).map_err(|e| e.into_message())?;
+    refresher.refresh_status(&*storage);
     let final_text = match &outcome {
         tole_core::turn::TurnOutcome::Final { text, .. } => Some(text.clone()),
         _ => None,
@@ -809,6 +1013,7 @@ mod eviction_tests {
             tool_ids: StdArc::new(Mutex::new(0)),
             model: None,
             profile: None,
+            status: StdArc::default(),
         }
     }
 
@@ -1175,6 +1380,7 @@ mod server_skills_tests {
             None,
             SessionOverrides::default(),
             skills,
+            &[],
         )
         .unwrap()
     }
@@ -1350,6 +1556,7 @@ mod server_skills_tests {
                 ..Default::default()
             },
             &cfg(Gate::Approved(Arc::new(Approvals::default()))),
+            &[],
         )
         .unwrap();
         // The prompt text is the caller's; the registry still obeys the gate.

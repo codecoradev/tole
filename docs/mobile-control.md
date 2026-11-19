@@ -17,7 +17,7 @@ decisions revalidate per request; auth failures are rate-limited per source IP).
 |---|---|---|
 | List sessions | `GET /sessions` | id + busy per session (+ `profile` when it has one, #740) |
 | Start a mission | `POST /sessions` `{cwd}` → `POST /sessions/{id}/prompt` `{text}` | the prompt is the mission goal (`tole mission` semantics chain turns; a serve prompt runs ONE turn; for chained turns use `POST /missions` below, #947) |
-| Mission status | `GET /sessions/{id}/status` | busy flag, entry count, `usage_report` (tokens, cache-hit rate, request-size split; #211), mission cost report (`fact/mission` register, #201) |
+| Mission status | `GET /sessions/{id}/status` | busy flag, entry count, model, effort, context window, name (#573), `usage_report` (tokens, cache-hit rate, request-size split; #211), mission cost report (`fact/mission` register, #201) |
 | **Pending approvals** | `GET /approvals` | queue entries: id, session, tool, status; expires to denied after 15 min |
 | **Approve / deny** | `POST /approvals/{id}/decision` `{"decision":"allow"\|"deny"}` | allow = one-shot for exactly that (session, tool+input) + automatic resume; deny = recorded verdict. Only the first decision counts: the same verdict again answers `200` with `"resuming":false` and audits and resumes nothing; the opposite verdict, or any decision on an entry that already expired, answers `409` with the current `status` |
 | **Delegated children's approvals** | `GET /approvals` (entries with `source: "delegation"`), `POST /approvals/dap-…/decision` `{"decision":"allow","confirm":"<the same id>"\|"deny","fingerprint"?}` (#714) | the durable queue of delegated children, next to the list above: id, goal, node, tool, target, redacted `display`, age, seconds left, `fingerprint`, the `chain` of levels, and `text` (the whole request fenced as data, as `tole delegation approvals show` prints it). The same bearer token as every route. `allow` must repeat the id as `confirm` (no id, prefix or pattern means "all": `400`); only a pending request is decided (`409` with the reason for an expired, consumed, already decided or settled one, `404` unknown); the decision is bound to the request's fingerprint and recorded `via: serve`; the server refuses (`403`) when it runs under an agent session. No session is resumed (the child is already waiting). Requests exist only when `[delegation] approvals` is on |
@@ -67,11 +67,34 @@ The round trip the app must support (the cross-repo acceptance):
 
 ## Status JSON fields
 
-`GET /sessions/{id}/status` returns `{id, entries, busy, usage_report}`.
-`entries` and `usage_report` are `null` while a turn is in flight (the
-session storage is busy). `usage_report` was added by #211 and is purely
-additive: clients must ignore unknown fields (the existing three keep their
-meaning). Its shape — every unknown value is `null`, never a fabricated 0:
+`GET /sessions/{id}/status` returns `{id, entries, busy, usage_report}` plus
+the session-status fields below (#573). `entries` and `usage_report` are `null`
+while a turn is in flight (the session storage is busy). `usage_report` was
+added by #211 and the status fields by #573; both are purely additive: clients
+must ignore unknown fields (the original keys keep their meaning).
+
+| Field | Meaning |
+|---|---|
+| `model` | the session's pinned model (`fact/model`), else the configured default; `null` if neither |
+| `effort` | the session's `fact/reasoning_effort` register; `null` while unset (the process default is not reported) |
+| `contextWindow` | tokens: the configured window (`TOLE_CONTEXT_WINDOW` / config `context_window`), else the one the provider's `/models` reported for the session's model; `null` when unknown |
+| `contextUsed` | prompt tokens of the last model call since the last compaction (`0` before the first call); with `contextWindow` it is the footer's `used / window` |
+| `name` | `fact/session_name` (`POST /sessions/{id}/name`), else the name the session was created with; `null` if none |
+| `snapshotAt` | epoch milliseconds when these values were read; `null` if there is no snapshot yet |
+| `stale` | `false`: read live from an idle session. `true`: a turn holds the session, so the values are the last-known snapshot, not a live read |
+
+These are the values `tole status` and the TUI footer show for the same
+session (the same snapshot code reads them), so the faces cannot disagree. An
+unknown value is `null`, never a made-up one. The snapshot is refreshed when
+the session opens, when a turn settles, when a register changes (`model`,
+`effort`, `name`, `compact`) and on every idle status read; the route never
+waits for a running turn, so it answers promptly while one runs. During a turn
+the snapshot is the state before it began (a model switch is refused while a
+turn runs, so `model` and `effort` cannot be older than the turn). The context
+window is looked up on the provider off the request path (after the session
+opens or its first turn settles) and cached per model, so a window the
+provider cannot report stays `null` rather than delaying the route. The
+`usage_report` shape — every unknown value is `null`, never a fabricated 0:
 
 | Field | Meaning |
 |---|---|
