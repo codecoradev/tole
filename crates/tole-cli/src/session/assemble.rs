@@ -4,12 +4,17 @@
 //! CLI commands could reach them: the explicit `TOLE_SYSTEM_PROMPT`, the
 //! built-in default prompt (plan-mode variant, one context line), and the
 //! cora review guidance that is named only when both review tools are
-//! registered. Moved here unchanged so every face can call the same code.
+//! registered, and the skills wiring (`apply_skills`) with the workspace
+//! resolution it needs. Moved here unchanged so every face can call the same
+//! code.
 //!
 //! `evals/replay` reads [`default_system_prompt`] out of this file's source
 //! (grep-based on purpose, so a copy cannot drift); keep the function name
 //! and the single string literal.
 
+use std::path::PathBuf;
+
+use anyhow::{Context, Result};
 use tole_core::tool::ToolRegistry;
 
 /// Resolution order: --system flag > TOLE_SYSTEM_PROMPT env > none.
@@ -134,6 +139,105 @@ pub fn today_utc() -> String {
     civil_from_days((secs / 86400) as i64)
 }
 
+/// Resolve the file-tools jail root: `--workspace <dir>` when given,
+/// otherwise the process cwd (issue #57). The directory must exist — a
+/// typo silently widening the jail to cwd would be worse than failing.
+/// In tools.rs (not main.rs) so a bin-only crate can unit-test it.
+pub fn resolve_workspace_root(explicit: Option<&String>) -> Result<PathBuf> {
+    match explicit {
+        Some(ws) => {
+            let p = PathBuf::from(ws);
+            let canon = p
+                .canonicalize()
+                .map_err(|e| anyhow::anyhow!("workspace directory {}: {e}", p.display()))?;
+            if !canon.is_dir() {
+                anyhow::bail!("workspace is not a directory: {}", canon.display());
+            }
+            Ok(canon)
+        }
+        None => std::env::current_dir().context("resolving cwd"),
+    }
+}
+
+/// Skills wiring (issue #161), used by the CLI commands (run, chat, the TUI).
+/// Server faces do not call it yet (#945). Loads `--skill`
+/// files (loud error on broken ones), and when the workspace exposes a
+/// non-empty skills dir, registers the ReadOnly load_skill tool and
+/// returns the index/section block to append to the system prompt.
+/// `--no-skills` short-circuits everything.
+///
+/// Discovery root: an explicit `--workspace` wins; absent flags fall
+/// back to the CURRENT DIRECTORY — the same default the file-tools
+/// jail uses (found by the 2026-10-05 sweep: a project with
+/// `<cwd>/skills/` and no flag silently got no discovery).
+///
+/// `brief` is the owner-written task (the `run` prompt): with
+/// `TOLE_SKILL_INDEX=uteke` it is the recall query for the skills shown
+/// (#590); interactive sessions pass `None` and get the pinned core.
+pub fn apply_skills(
+    skills: &[PathBuf],
+    workspace: Option<&String>,
+    no_skills: bool,
+    registry: &mut ToolRegistry,
+    brief: Option<&str>,
+) -> Result<String> {
+    if no_skills {
+        return Ok(String::new());
+    }
+    let ws_root = resolve_workspace_root(workspace)?;
+    let (gate, notes) = crate::skill_approve::gate_from_env().map_err(anyhow::Error::msg)?;
+    for note in notes {
+        eprintln!("tole: {note}");
+    }
+    let recall = crate::skill_recall::SkillRecall {
+        gate,
+        ..crate::skill_recall::SkillRecall::from_env(brief).map_err(anyhow::Error::msg)?
+    };
+    apply_skills_in(skills, Some(ws_root), false, registry, &recall)
+}
+
+/// Testable core of [`apply_skills`] taking the RESOLVED discovery
+/// root (None = caller already resolved to cwd; kept Option so tests
+/// can pass a tmpdir without changing the process cwd). `recall.gate`
+/// decides which discovered skills may load (#591); `--skill` files are
+/// the owner's own choice and are not gated.
+pub fn apply_skills_in(
+    skills: &[PathBuf],
+    ws_root: Option<PathBuf>,
+    no_skills: bool,
+    registry: &mut ToolRegistry,
+    recall: &crate::skill_recall::SkillRecall,
+) -> Result<String> {
+    let mut sections = String::new();
+    if no_skills {
+        return Ok(sections);
+    }
+    let ws_path = ws_root;
+    for path in skills {
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("--skill {}: {e}", path.display()))?;
+        let name = path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("skill")
+            .to_string();
+        let skill = tole_core::skills::parse_skill(&content, &name)
+            .map_err(|e| anyhow::anyhow!("--skill {}: {e}", path.display()))?;
+        sections.push_str(&format!("\n\n# Skill: {}\n{}", skill.name, skill.body));
+    }
+    if !tole_core::skills::available_skills(ws_path.as_deref()).is_empty() {
+        let (block, notes) =
+            crate::skill_recall::skills_section(recall, ws_path.as_deref(), registry)
+                .map_err(anyhow::Error::msg)?;
+        for note in notes {
+            eprintln!("tole: {note}");
+        }
+        sections.push_str(&block);
+    }
+    Ok(sections)
+}
+
 #[cfg(test)]
 mod default_prompt_tests {
     #[test]
@@ -222,5 +326,131 @@ mod default_prompt_tests {
         assert_eq!(super::civil_from_days(0), "1970-01-01");
         assert_eq!(super::civil_from_days(19_723), "2024-01-01");
         assert_eq!(super::civil_from_days(20_646), "2026-07-12");
+    }
+}
+
+#[cfg(test)]
+mod workspace_tests {
+    use super::resolve_workspace_root;
+    #[test]
+    fn workspace_valid_dir_canonicalized() {
+        let dir = crate::test_dir::TestDir::new("tole-ws");
+        let ws = dir.to_path_buf().into_os_string().into_string().unwrap();
+        let resolved = resolve_workspace_root(Some(&ws)).unwrap();
+        assert_eq!(resolved, dir.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn workspace_missing_dir_rejected() {
+        let err = resolve_workspace_root(Some(&"/nonexistent/tole/ws".to_string()));
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn workspace_file_rejected() {
+        let d = crate::test_dir::TestDir::new("tole-ws-file");
+        let f = d.join("file");
+        std::fs::write(&f, "x").unwrap();
+        let ws = f.into_os_string().into_string().unwrap();
+        let err = resolve_workspace_root(Some(&ws));
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn workspace_none_falls_back_to_cwd() {
+        let resolved = resolve_workspace_root(None).unwrap();
+        assert_eq!(resolved, std::env::current_dir().unwrap());
+    }
+}
+
+#[cfg(test)]
+mod skills_wiring_tests {
+    use super::*;
+
+    #[test]
+    fn apply_skills_loads_explicit_skill_files_and_registers_tool() {
+        let dir = crate::test_dir::TestDir::new("tole-skills-wire");
+        std::fs::create_dir_all(dir.join("skills").join("demo")).unwrap();
+        std::fs::write(
+            dir.join("skills").join("demo").join("SKILL.md"),
+            "---\nname: demo\ndescription: \"d\"\n---\nbody",
+        )
+        .unwrap();
+        let mut reg = ToolRegistry::new();
+        let skill_file = dir.join("skills").join("demo").join("SKILL.md");
+        let sections = apply_skills(
+            &[skill_file],
+            Some(&dir.to_string_lossy().to_string()),
+            false,
+            &mut reg,
+            None,
+        )
+        .unwrap();
+        assert!(sections.contains("# Skill: demo"));
+        assert!(sections.contains("body"));
+        assert!(reg.get("load_skill").is_some(), "load_skill registered");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_skills_no_skills_short_circuits() {
+        let dir = crate::test_dir::TestDir::new("tole-skills-off");
+        std::fs::create_dir_all(dir.join("skills").join("demo")).unwrap();
+        std::fs::write(
+            dir.join("skills").join("demo").join("SKILL.md"),
+            "---\nname: demo\ndescription: \"d\"\n---\nbody",
+        )
+        .unwrap();
+        let mut reg = ToolRegistry::new();
+        let sections = apply_skills(
+            &[],
+            Some(&dir.to_string_lossy().to_string()),
+            true,
+            &mut reg,
+            None,
+        )
+        .unwrap();
+        assert!(sections.is_empty());
+        assert!(
+            reg.get("load_skill").is_none(),
+            "--no-skills must not register"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F4 (2026-10-05): discovery must work from the RESOLVED root —
+    /// `apply_skills` with no --workspace now feeds the cwd in here, the
+    /// same default the file-tools jail uses. Pin the resolved-root
+    /// path (no explicit --skill files, discovery only).
+    #[test]
+    fn apply_skills_in_discovers_from_resolved_root() {
+        let dir = crate::test_dir::TestDir::new("tole-skills-cwd");
+        std::fs::create_dir_all(dir.join("skills").join("demo")).unwrap();
+        std::fs::write(
+            dir.join("skills").join("demo").join("SKILL.md"),
+            "---\nname: demo\ndescription: \"d\"\n---\nbody",
+        )
+        .unwrap();
+        let mut reg = ToolRegistry::new();
+        let sections = apply_skills_in(
+            &[],
+            Some(dir.to_path_buf()),
+            false,
+            &mut reg,
+            &Default::default(),
+        )
+        .unwrap();
+        assert!(
+            sections.contains("demo"),
+            "discovery index must list the skill: {sections}"
+        );
+        assert!(reg.get("load_skill").is_some(), "load_skill registered");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_workspace_root_none_defaults_to_cwd() {
+        let root = resolve_workspace_root(None).unwrap();
+        assert_eq!(root, std::env::current_dir().unwrap());
     }
 }
