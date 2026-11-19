@@ -62,8 +62,8 @@ unless the status column says otherwise.
 | Fork, tree | `POST /sessions/{id}/fork`, `GET /sessions/{id}/tree` | exists (#947) |
 | Compact, rename | `POST /sessions/{id}/compact`, `POST /sessions/{id}/name` | exists (#947) |
 | Chained mission with a budget | `POST /missions`, `GET /missions/{id}`, `POST /missions/{id}/cancel` | exists (#947) |
-| Session list of past sessions (name, folder, last activity) | none | **gap, #572** (`GET /sessions` lists only sessions live in the server process) |
-| Model list, set model, set thinking level | none | **gap, #574** (`GET /models`, `POST /sessions/{id}/model`, `POST /sessions/{id}/effort`) |
+| Session list of past sessions (name, folder, last activity) | `GET /sessions/index?limit&cursor` | exists (#572); `GET /sessions` still lists only sessions live in the server process |
+| Model list, set model, set thinking level | `GET /models`, `POST /sessions/{id}/model`, `POST /sessions/{id}/effort` | exists (#574) |
 | Remove or archive a session | none | not planned in any issue read for this note |
 | Server version or capability probe | none | not planned; `/health` returns only `{"status":"ok"}` |
 | Push notification of a pending approval | none | by design (threat model: "no push endpoint in tole"); webhook delivery (#911) exists for the gateway |
@@ -113,7 +113,7 @@ those screens only.
 | Screen or component | Calls | Readiness |
 |---|---|---|
 | Session list (live) | `GET /sessions` | exists |
-| Session list (past sessions, picker) | none | planned, #572 |
+| Session list (past sessions, picker) | `GET /sessions/index` | exists (#572) |
 | Transcript | `GET /entries`, SSE `entry` frames | exists |
 | Streaming text, tool cards | SSE `text_delta`, `tool_started`, `tool_finished` | exists; only for a turn that starts while a stream is open |
 | Composer, send | `POST /prompt` | exists |
@@ -123,7 +123,7 @@ those screens only.
 | Footer (status, usage) | stream frames, `GET /status` | exists; during a turn `usage_report` is `null`, the model, effort and window are a `stale` snapshot (#573) |
 | `@file` panel | none | not planned: serve has no file listing or search route (needs an owner decision on exposing the workspace tree) |
 | Image attach and view | `POST /images`, `GET /images/{hash}` | exists |
-| Model picker, thinking level | none | planned, #574 |
+| Model picker, thinking level | `GET /models`, `POST /model`, `POST /effort` | exists (#574) |
 | Fork, tree, compact, rename | `/fork`, `/tree`, `/compact`, `/name` | exists |
 | Mission panel | `POST /missions` and siblings | exists |
 | Settings, profiles | `profile` on `POST /sessions` | partial: there is no route that lists the defined profile names |
@@ -309,7 +309,7 @@ backend") without a link, so nothing is cited here.
 
 1. Owner answers D1 to D11 (D1 to D5 gate everything; D6 to D8 gate the remote
    first run).
-2. Land #572 (session list) and, if D9 says yes, #574 before #527 starts.
+2. #572 (session list) and #574 (models) have landed; D9 decides whether the first release uses the model picker.
 3. Add the proposed local and remote rows to the threat model once decided.
 4. Decide whether the first client release needs a read-only credential (#742).
 5. #527 and #561 link to this note; their acceptance wording about the

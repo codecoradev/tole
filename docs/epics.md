@@ -393,14 +393,15 @@ Bot and Nakama; BMAD for collaboration). Design notes:
     second slice done; cron scripts and `command:` deliveries, third slice
     done; the default flip of `verify` and `turnend` to `optional`, owner
     decision 2026-11-16, is on `develop` for the next minor, `docs/sandbox-design.md`
-    §9.4). Open: #748 cgroup limits (deferred) and the `git` tool hardening
-    (#873), and #750 for the operability
+    §9.4). Open: the `git` tool hardening
+    (#873); the #748 cgroup limits are evaluated and deferred (`docs/sandbox-design.md`
+    §12.1), and #750 for the operability
     pieces: the doctor listing of sensitive grants and startup logging (#809),
-    per-server and named profiles with the CLI (#810, in review), the profile
+    per-server and named profiles with the CLI (#810, done), the profile
     name and hash in the plugin lock entry with re-approval on change (#750,
-    in review), the profile hash in the startup line, the `sandbox_fallback`
+    done), the profile hash in the startup line, the `sandbox_fallback`
     ledger line of an `optional` fallback, `TOLE_VERBOSE=1` launch logging and
-    the wider credential list of the doctor listing (#750, in review), and lazy start
+    the wider credential list of the doctor listing (#750, done), and lazy start
     with tool retrieval by meaning (no slice issue yet));
 
 Order that was followed: E4 #595 first (other epics reuse it), then E1,
@@ -417,12 +418,12 @@ skill library (codecoradev/uteke#1731), shared secret-detector crate
 | Secrets and plugins (epic #594) | #600 plugin commands (slice 2: #811, slice 3a skills pin and 3b audit: done), #601 sandbox (#748 commands, #750 operability: #809, #810) |
 | Security follow-ups | #813 (decisions left from the #714 and #600 reviews) |
 | Collaboration (epic #583) | none; the epic issue only needs closing |
-| Serve for graphical clients | #572, #573, #574, #575 (#571 moved to the gateway track) |
-| Gateway (epic #910) | G0a #571 (`approval_required` stop reason, serve protocol only; in review), G0b outbound signed webhook delivery (#911, done), `turn_finished` event (#962, implemented with provisional owner decisions D1-D9, not merged until confirmed), G1 to G5 in the epic |
+| Serve for graphical clients | none open: #572, #573, #574 and #575 are done (#571 moved to the gateway track) |
+| Gateway (epic #910) | G0a #571 (`approval_required` stop reason, serve protocol only; done), G0b outbound signed webhook delivery (#911, done), `turn_finished` event (#962, implemented with provisional owner decisions D1-D10, not merged until confirmed), G1 to G5 in the epic |
 | UI stack (epic #523) | #527, #528, #529, #561 (parked) |
 | Tests and CI | #781 (leaked temp dirs), #812 (wait_until helper and a 1-CPU job; covers flaky #702, #712, #738), #806 (develop red after a series of PRs), #705 and #670 (Cora Review in CI), #566 (iOS cross-compile job), #669 (cora code intelligence accuracy) |
 | Docs and process | #807 (local Cora review), #808 (this page) |
-| One assembly for every face (epic #941) | #942 to #944 done (prompt, skills, roster via `FacePolicy`, routing step, every turn through `turn_runner`); #947 done (fork, tree, compact, name, plan mode and mission over `serve`); #948 the parity table [docs/faces.md](faces.md) and its test (done); #945 capability 1 done (default prompt for server sessions; the review guidance is wired but needs the cora MCP tools, so it stays inactive until #946), skills and routing open; #946 awaits an owner decision; #949 has a design note, [docs/desktop-design.md](desktop-design.md), whose decisions D1 to D11 are open for the owner |
+| One assembly for every face (epic #941) | #942 to #944 done (prompt, skills, roster via `FacePolicy`, routing step, every turn through `turn_runner`); #947 done (fork, tree, compact, name, plan mode and mission over `serve`); #948 the parity table [docs/faces.md](faces.md) and its test (done); #945 done (default prompt, approved skills and model routing for server sessions; #971 routes a new session's model once, at its first prompt); #946 done (the owner's MCP client servers on `serve` and `acp` behind the plugin lock, so the review guidance is active when the cora review tools are configured); #949 has a design note, [docs/desktop-design.md](desktop-design.md), whose decisions D1 to D11 are open for the owner |
 
 ## Layering and published crates
 
@@ -444,7 +445,7 @@ Parked means: an issue exists and is open, and nobody works on it until the owne
 |------|------------------|
 | #741 `import-hermes` (session import and profile pack) | `[PLAN]`, same direction. Open question: does the import redact or keep text verbatim |
 | #742 serve auth providers: OIDC (and scopes) | Basic is done (owner decisions of 2026-11-17: Basic first, single user with many devices, no session bound to an identity, TLS at a reverse proxy; `tole serve --auth basic`, `tole serve-hash`, `docs/mobile-control.md`). OIDC and the read-only / full scopes remain, parked until the owner picks the next slice |
-| #527 desktop (GPUI), #528 Flutter, #529 web, #561 UI/UX plan, #523 epic | The UI stack waits on the core seams (done: #524 to #526, #558 to #560) and on the serve items #572 to #575 (#571 moved to the gateway track, epic #910). #529 is low priority and its framework (Svelte or React) is undecided |
+| #527 desktop (GPUI), #528 Flutter, #529 web, #561 UI/UX plan, #523 epic | The UI stack waits on the owner (the core seams #524 to #526 and #558 to #560 and the serve items #572 to #575 are done; #571 moved to the gateway track, epic #910). #529 is low priority and its framework (Svelte or React) is undecided |
 | #382 multi-client daemon | Closed as a design note (`docs/daemon-design.md`); no build without a user story |
 
 Owner decisions still open:
