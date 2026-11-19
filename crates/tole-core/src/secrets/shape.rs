@@ -17,10 +17,22 @@
 //! No IO, no platform assumption: the crate depends on `regex` only.
 
 use std::borrow::Cow;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use uteke_privacy::Policy;
 
 static POLICY: RwLock<Option<Arc<Policy>>> = RwLock::new(None);
+
+/// Bumped (under the write lock, AFTER the new policy is installed) every
+/// time the allowlist is installed. A result cache reads it BEFORE it
+/// computes, so a result is never tagged with a newer generation than the
+/// policy it was computed with (#908).
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// The allowlist generation: changes whenever [`set_allowlist`] installs one.
+pub(crate) fn generation() -> u64 {
+    GENERATION.load(Ordering::SeqCst)
+}
 
 /// The stand-in of a marker while the detector runs: `qz`, one or more `k`,
 /// the marker's index and `x` (`qzkk3x`). Letters and digits only, so a PEM
@@ -152,6 +164,7 @@ pub fn set_allowlist(patterns: &[String]) -> Result<(), String> {
     let policy = policy(patterns)?;
     if let Ok(mut g) = POLICY.write() {
         *g = Some(Arc::new(policy));
+        GENERATION.fetch_add(1, Ordering::SeqCst);
     }
     Ok(())
 }
