@@ -1931,6 +1931,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                     verify: settings.verify.as_ref().map(|v| v.value.clone()),
                     verify_timeout_secs: settings.verify_timeout.value,
                     resume_id: resume,
+                    fresh_id: None,
                     compaction: host.compaction,
                     images,
                     // A profile's persona replaces the default base prompt.
