@@ -208,6 +208,33 @@ the active `--profile`, are recalled; `tole skills retire` keeps a skill on disk
 but stops its recall. Skill approval is required by default, so only
 owner-approved content loads (below).
 
+**uteke store location (#992).** uteke resolves its home, which holds the
+store, the embedding model (`models/`), `uteke.toml`, logs and the server
+routing config, from `--store`, then `UTEKE_HOME`, then `$HOME/.codecora/uteke`;
+it does not read `CODECORA_HOME`. Every uteke tole spawns (the memory loop,
+`uteke_recall`, `uteke_document`, `UtekeSkillIndex` and `UtekeDocIndex`, the
+child-agent mailbox cleanup) therefore gets `UTEKE_HOME=<CODECORA_HOME>/uteke`
+when `CODECORA_HOME` is set, so an isolated run never reads or writes the store
+under the real `HOME`. All of it moves, not only the store: the new directory
+holds no model and no config, so the first recall downloads the model (about
+188 MB) or fails offline or sandboxed, and an owner with a populated
+`~/.codecora/uteke` sees the memory as lost. `tole doctor` warns when
+`CODECORA_HOME` is set, `~/.codecora/uteke` exists and `<CODECORA_HOME>/uteke`
+does not; the remedies are `export UTEKE_HOME=~/.codecora/uteke`, or copying or
+symlinking the directory (at least `models/`). Fail closed: a `CODECORA_HOME`
+that is set, non-empty and relative is unresolvable for tole itself (its own
+data features skip or error; tole does not refuse to start), so no uteke is
+spawned and the caller gets the error `CODECORA_HOME is not an absolute path`
+(the mailbox cleanup, which has no caller to tell, just does not run). An empty
+`CODECORA_HOME` counts as unset, as everywhere in tole, and uteke keeps its own
+default under `HOME`. Residuals: a `UTEKE_HOME` the owner already exported
+wins, as a deliberate choice of store; a uteke an agent runs through
+`run_command` is not covered (it inherits the process environment, so it is
+covered only when the owner exported `UTEKE_HOME` themselves, and the sandbox,
+when on, has no `$HOME` anyway); a uteke tole did not spawn (a hook, a
+terminal) is outside this control; and the `--version` probe of
+`tole doctor` is not pointed at the store, because it opens none.
+
 **Registry approval (#878).** `tole skills fetch <id> --pinned-sha <sha256>`
 approves a third-party skill by registry id, and downloads nothing: uteke
 0.24.1 returns no skill body (`skill show` is a manifest, the package hash and
