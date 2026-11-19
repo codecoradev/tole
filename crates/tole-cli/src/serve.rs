@@ -1996,6 +1996,8 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
                         (409, json!({"error": "no turn is running in this session"}))
                     }
                 }
+                ("POST", id, Some("fork")) => fork_route(state, id, body),
+                ("GET", id, Some("tree")) => tree_route(state, id),
                 ("POST", id, Some("compact")) => compact_route(state, id),
                 ("POST", id, Some("name")) => name_route(state, id, body),
                 _ => (404, json!({"error": "not found"})),
@@ -2003,6 +2005,116 @@ fn route(state: &State, method: &str, path: &str, body: &str) -> (u16, serde_jso
         }
         _ => (404, json!({"error": "not found"})),
     }
+}
+
+/// `POST /sessions/{id}/fork {"at"?: <seq>}` (#947): fork the session at a
+/// settled entry into a new session file, through the same
+/// `JsonlStorage::fork` the TUI `/fork` and `tole branch` call. `at` is the
+/// `seq` of an entry as `GET .../entries` shows it (default: the last
+/// settled entry). Writes only the new file and, as the TUI does, one
+/// index line; the source is never touched. The new session is not made
+/// live: `POST /sessions {"resume": "<new id>"}` opens it.
+///
+/// 404 unknown session, 409 while a turn runs (the turn holds the storage
+/// lock; a fork waits for none), 400 for a bad or unsettled `at`.
+fn fork_route(state: &State, id: &str, body: &str) -> (u16, serde_json::Value) {
+    let req = if body.trim().is_empty() {
+        json!({})
+    } else {
+        match serde_json::from_str::<serde_json::Value>(body) {
+            Ok(v) if v.is_object() => v,
+            _ => return (400, json!({"error": "invalid JSON body"})),
+        }
+    };
+    let at_seq = match req.get("at") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => match v.as_u64() {
+            Some(n) => Some(n),
+            None => return (400, json!({"error": "at must be an entry seq (integer)"})),
+        },
+    };
+    let st = {
+        let sessions = lock_sessions(&state.sessions);
+        sessions.get(id).cloned()
+    };
+    let Some(st) = st else {
+        return (404, json!({"error": "unknown session"}));
+    };
+    if *st.busy.lock().expect("busy lock") {
+        return (409, json!({"error": "session is busy: a turn is running"}));
+    }
+    // The turn lock, held across the whole fork as the TUI holds it, so no
+    // turn appends to the source while it is read. A turn that took it
+    // between the check above and here is the same 409.
+    let Ok(guard) = st.storage.try_lock() else {
+        return (409, json!({"error": "session is busy: a turn is running"}));
+    };
+    let at_id = match at_seq {
+        None => None,
+        Some(n) => match guard.entries().iter().find(|e| e.seq == n) {
+            Some(e) => Some(e.id.clone()),
+            None => return (400, json!({"error": format!("no entry with seq {n}")})),
+        },
+    };
+    let Some(dir) = st.path.parent().map(|d| d.to_path_buf()) else {
+        return (500, json!({"error": "session file has no directory"}));
+    };
+    let new_id = tole_cli::session_host::new_session_id("s");
+    let forked =
+        match tole_core::storage::JsonlStorage::fork(&st.path, &dir, &new_id, at_id.as_deref()) {
+            Ok(f) => f,
+            Err(tole_core::storage::StorageError::Invalid(m)) => {
+                return (400, json!({"error": m}));
+            }
+            Err(e) => return (500, json!({"error": format!("forking {id}: {e}")})),
+        };
+    let cut = forked
+        .forked_from()
+        .map(|o| o.entry.clone())
+        .unwrap_or_default();
+    let cut_seq = guard.entries().iter().find(|e| e.id == cut).map(|e| e.seq);
+    drop(forked);
+    drop(guard);
+    tole_cli::session_index::record(&dir, &new_id, "branch");
+    eprintln!("tole: session/{id} forked into {new_id} (serve)");
+    (
+        200,
+        json!({"id": new_id, "forkedFrom": id, "at": cut, "seq": cut_seq}),
+    )
+}
+
+/// `GET /sessions/{id}/tree` (#947): the session's family, from the same
+/// reader as `tole sessions --tree` and the TUI `/tree` (its parent chain
+/// up to the root and every fork below it), read from the session files
+/// so it works while a turn runs. Rows are depth-first, `depth` relative
+/// to the root. 404 for an unknown session.
+fn tree_route(state: &State, id: &str) -> (u16, serde_json::Value) {
+    let path = {
+        let sessions = lock_sessions(&state.sessions);
+        sessions.get(id).map(|st| st.path.clone())
+    };
+    let Some(path) = path else {
+        return (404, json!({"error": "unknown session"}));
+    };
+    let Some(dir) = path.parent() else {
+        return (500, json!({"error": "session file has no directory"}));
+    };
+    let rows: Vec<_> =
+        tole_cli::session_index::family(tole_cli::session_index::tree_nodes(dir), id)
+            .into_iter()
+            .map(|(depth, n)| {
+                json!({
+                    "id": n.id,
+                    "parent": n.parent,
+                    "at": n.at,
+                    "state": n.pc,
+                    "turns": n.turns,
+                    "depth": depth,
+                    "current": n.id == id,
+                })
+            })
+            .collect();
+    (200, json!({"id": id, "tree": rows}))
 }
 
 /// Run `write` on session `id`'s storage under the turn lock, for the routes
@@ -2241,6 +2353,138 @@ mod tests {
         let (status, payload) = route(&state, "POST", "/sessions", "{}");
         assert_eq!(status, 200, "{payload}");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Open a serve session in-process and settle one turn in its log, so
+    /// there is something to fork. Returns (session id, seq of the answer).
+    fn session_with_a_turn(state: &State, cwd: &std::path::Path) -> (String, u64) {
+        use tole_core::entry::{EntryType, NewEntry};
+        use tole_core::state::{Pc, StateTransition};
+        use tole_core::storage::Commit;
+        let (status, v) = route(
+            state,
+            "POST",
+            "/sessions",
+            &json!({"cwd": cwd.to_str().unwrap()}).to_string(),
+        );
+        assert_eq!(status, 200, "{v}");
+        let id = v["sessionId"].as_str().unwrap().to_string();
+        let st = lock_sessions(&state.sessions).get(&id).cloned().unwrap();
+        let mut g = st.storage.lock().unwrap();
+        let msg = |role: &str, text: &str| {
+            NewEntry::root(
+                EntryType::new(EntryType::MESSAGE),
+                json!({"role": role, "text": text}),
+            )
+        };
+        g.commit(Commit::new().entry(msg("user", "hi"))).unwrap();
+        let seq = g.state().seq;
+        g.commit(Commit::new().transition(StateTransition::from(seq, Pc::Planning)))
+            .unwrap();
+        let seq = g.state().seq;
+        g.commit(
+            Commit::new()
+                .entry(msg("assistant", "hello"))
+                .transition(StateTransition::from(seq, Pc::Final)),
+        )
+        .unwrap();
+        let answer = g
+            .entries()
+            .iter()
+            .rev()
+            .find(|e| e.payload["role"] == "assistant")
+            .unwrap()
+            .seq;
+        (id, answer)
+    }
+
+    /// #947: fork and tree over serve: success shape, the family tree, 404,
+    /// 409 while busy, and 4xx for an `at` that is not a settled entry.
+    #[test]
+    fn fork_and_tree_routes_answer_success_404_409_and_bad_at() {
+        let base = crate::test_dir::TestDir::new("tole-serve-fork");
+        let root = base.join("ws");
+        let sessions = base.join("sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&sessions).unwrap();
+        let state = test_state(root.clone(), sessions.clone());
+        let (id, answer) = session_with_a_turn(&state, &root);
+
+        // Unknown session: 404 on both routes.
+        let (s, _) = route(&state, "POST", "/sessions/nope/fork", "{}");
+        assert_eq!(s, 404);
+        let (s, _) = route(&state, "GET", "/sessions/nope/tree", "");
+        assert_eq!(s, 404);
+
+        // A user message is not a settled point; an unknown seq is no entry.
+        let user_seq = {
+            let st = lock_sessions(&state.sessions).get(&id).cloned().unwrap();
+            let g = st.storage.lock().unwrap();
+            g.entries()
+                .iter()
+                .find(|e| e.payload["role"] == "user")
+                .unwrap()
+                .seq
+        };
+        let path = format!("/sessions/{id}/fork");
+        for bad in [
+            json!({"at": user_seq}),
+            json!({"at": 99999}),
+            json!({"at": "x"}),
+        ] {
+            let (s, v) = route(&state, "POST", &path, &bad.to_string());
+            assert_eq!(s, 400, "{bad}: {v}");
+        }
+        let (s, _) = route(&state, "POST", &path, "not json");
+        assert_eq!(s, 400);
+        let logs = || {
+            std::fs::read_dir(&sessions)
+                .unwrap()
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().ends_with(".jsonl"))
+                .count()
+        };
+        assert_eq!(logs(), 1, "a refused fork leaves no log behind");
+
+        // 409 while a turn runs.
+        let st = lock_sessions(&state.sessions).get(&id).cloned().unwrap();
+        *st.busy.lock().unwrap() = true;
+        let (s, _) = route(&state, "POST", &path, "{}");
+        assert_eq!(s, 409);
+        *st.busy.lock().unwrap() = false;
+
+        // Success at an explicit seq, and again at the default.
+        let (s, v) = route(&state, "POST", &path, &json!({"at": answer}).to_string());
+        assert_eq!(s, 200, "{v}");
+        assert_eq!(v["forkedFrom"], json!(id));
+        assert_eq!(v["seq"], json!(answer));
+        let fork_id = v["id"].as_str().unwrap().to_string();
+        assert!(sessions.join(format!("{fork_id}.jsonl")).exists());
+        let (s, v) = route(&state, "POST", &path, "");
+        assert_eq!(s, 200, "{v}");
+        let fork2 = v["id"].as_str().unwrap().to_string();
+        assert_ne!(fork2, fork_id);
+
+        // The tree: the source at depth 0, both forks below it.
+        let (s, v) = route(&state, "GET", &format!("/sessions/{id}/tree"), "");
+        assert_eq!(s, 200, "{v}");
+        let rows = v["tree"].as_array().unwrap();
+        assert_eq!(rows.len(), 3, "{v}");
+        assert_eq!(rows[0]["id"], json!(id));
+        assert_eq!(rows[0]["depth"], 0);
+        assert_eq!(rows[0]["current"], true);
+        assert!(rows[0]["parent"].is_null());
+        let child = rows.iter().find(|r| r["id"] == json!(fork_id)).unwrap();
+        assert_eq!(child["parent"], json!(id));
+        assert_eq!(child["depth"], 1);
+        assert_eq!(child["current"], false);
+        assert_eq!(child["turns"], 1);
+        assert!(child["at"].is_string());
+        // The tree is a file read: it answers while a turn runs.
+        *st.busy.lock().unwrap() = true;
+        let (s, _) = route(&state, "GET", &format!("/sessions/{id}/tree"), "");
+        assert_eq!(s, 200);
+        *st.busy.lock().unwrap() = false;
     }
 
     /// Open a serve session in-process; returns its id.
