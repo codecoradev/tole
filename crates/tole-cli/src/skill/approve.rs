@@ -266,6 +266,13 @@ pub enum SkillsAction {
         #[arg(long)]
         pinned_sha: Option<String>,
     },
+    #[cfg(feature = "shell-tools")]
+    /// Approve a third-party skill the owner already placed in a skills
+    /// directory, after checking its bytes against the pinned package hash
+    /// and the hash the uteke library recorded for the registry id (#878).
+    /// Fetches nothing: see `docs/skills-registry-design.md`. Owner only,
+    /// at a terminal.
+    Fetch(crate::skill::fetch::FetchArgs),
     /// Skill drafts the agent proposed with `skill_propose` (#592): list,
     /// show, reject, record a reviewer's verdict. A draft never loads.
     Drafts {
@@ -482,6 +489,30 @@ pub fn approve_from(
     Ok(pkg)
 }
 
+/// Approve `name` as it is on disk now (it must still hash to `expect`),
+/// write the ledger line, then save the approvals with a fresh checkpoint.
+/// The ledger first: a crash between the two leaves the skill unapproved,
+/// never approved without a record. Shared by `approve` and `fetch` so both
+/// write the same ledger line shape (#591, #878).
+pub(crate) fn approve_and_record(
+    path: &Path,
+    approvals: &mut Approvals,
+    ws: Option<&Path>,
+    name: &str,
+    expect: &str,
+    source: Option<Source>,
+    now: u64,
+) -> Result<tole_core::skill_approval::SkillPackage, String> {
+    let pkg = approve_from(ws, name, Some(expect), approvals, now, source)?;
+    let src = approvals.skills.get(name).and_then(|a| a.source.as_ref());
+    record(
+        path,
+        &tole_core::skill_approval::ledger_line("approve", name, &pkg.hash, src, now),
+    )?;
+    approvals.save_checkpointed(path)?;
+    Ok(pkg)
+}
+
 /// `tole skills adopt` (#879): appends an `approve` line (hash and source as
 /// stored, noted as adopted) for each approval the ledger does not name that
 /// the owner selected, then refreshes the checkpoint. Skills the ledger
@@ -660,28 +691,20 @@ pub fn cli(action: SkillsAction) -> anyhow::Result<()> {
             };
             // Approve exactly what was shown: the package read again must
             // still hash to it.
-            let pkg = approve_from(
+            let pkg = approve_and_record(
+                &path,
+                &mut approvals,
                 Some(&ws),
                 &name,
-                Some(&shown.hash),
-                &mut approvals,
-                now,
+                &shown.hash,
                 Some(source),
+                now,
             )
             .map_err(anyhow::Error::msg)?;
-            // The ledger first: a crash between the two leaves the skill
-            // unapproved, never approved without a record.
-            let src = approvals.skills.get(&name).and_then(|a| a.source.as_ref());
-            record(
-                &path,
-                &tole_core::skill_approval::ledger_line("approve", &name, &pkg.hash, src, now),
-            )
-            .map_err(anyhow::Error::msg)?;
-            approvals
-                .save_checkpointed(&path)
-                .map_err(anyhow::Error::msg)?;
             println!("approved {name} ({})", pkg.hash);
         }
+        #[cfg(feature = "shell-tools")]
+        SkillsAction::Fetch(a) => return crate::skill::fetch::cli(a),
         SkillsAction::Drafts { action } => {
             let store = tole_core::skill_draft::DraftStore::default_store()
                 .context("the CodeCora home is unresolvable (set CODECORA_HOME or HOME)")?;
