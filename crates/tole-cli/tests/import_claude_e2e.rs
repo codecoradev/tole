@@ -2,17 +2,17 @@
 
 mod common;
 use common::TestDir;
-use std::process::Command;
 
 #[test]
 fn import_claude_creates_a_resumable_session_and_refuses_a_repeat() {
     let dir = TestDir::new("tole-cc-e2e");
+    let home = TestDir::new("tole-cc-e2e-home");
     let fixture = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../tole-core/tests/fixtures/cc_session.jsonl"
     );
     let run = || {
-        Command::new(env!("CARGO_BIN_EXE_tole"))
+        common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &home, &[])
             .arg("--sessions-dir")
             .arg(&dir)
             .args(["import-claude", fixture])

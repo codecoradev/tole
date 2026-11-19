@@ -213,8 +213,9 @@ fn serve_lists_cron_runs_behind_the_token() {
     )
     .unwrap();
     cron::tick(&dir, T + 60, &OPTS).unwrap();
+    let home = tmp("serve-home");
     let (mut child, port) = common::spawn_listening(|port| {
-        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_tole"));
+        let mut cmd = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &home, &[]);
         cmd.args(["serve", "--port", &port.to_string(), "--token", "t0ken"])
             .env("TOLE_CRON_DIR", &dir)
             .current_dir(&dir)

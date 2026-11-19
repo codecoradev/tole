@@ -218,7 +218,9 @@ fn tole(
     id: &str,
     prompt: &str,
 ) -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
+    // Hermetic HOME (#993) next to the workspace, shared by both children.
+    let home = ws.with_file_name("home");
+    let mut cmd = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &home, &[]);
     cmd.args(["run", "--allow", "write_file", "--"])
         .arg(prompt)
         .current_dir(ws)

@@ -10,7 +10,7 @@
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,14 +21,17 @@ use common::TestDir;
 struct ServeProcess {
     child: Child,
     port: u16,
+    /// Hermetic HOME (#993), removed after `Drop` has killed the child.
+    _home: TestDir,
 }
 
 impl ServeProcess {
     /// `_port` is ignored: a free port is chosen (and retried) by
     /// `common::spawn_listening`, which also waits for the listener.
     fn spawn(env: &[(&str, &str)], token: &str, _port: u16) -> Self {
+        let home = TestDir::new("tole-approvals-home");
         let (child, port) = common::spawn_listening(|port| {
-            let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
+            let mut cmd = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &home, &[]);
             cmd.args(["serve", "--port", &port.to_string(), "--token", token])
                 .stdin(Stdio::null())
                 .stdout(Stdio::null());
@@ -37,7 +40,11 @@ impl ServeProcess {
             }
             cmd
         });
-        Self { child, port }
+        Self {
+            child,
+            port,
+            _home: home,
+        }
     }
 
     fn http(&self, method: &str, path: &str, body: Option<&str>) -> (u16, Value) {
@@ -458,7 +465,8 @@ fn cli_consumer_lists_the_queue() {
         Some(&json!({"text": "TOOL_MISSION write"}).to_string()),
     );
 
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_tole"));
+    let home = TestDir::new("tole-approvals-cli-home");
+    let mut cmd = common::hermetic_command(env!("CARGO_BIN_EXE_tole"), &home, &[]);
     cmd.args([
         "approvals",
         "list",
