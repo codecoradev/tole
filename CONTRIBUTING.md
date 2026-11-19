@@ -40,6 +40,16 @@ workflow; the ecosystem-wide standards it follows live in the team knowledge roo
   `set_permissions(.., 0o755)`. A concurrent `fork()` of another test thread
   can still hold the write fd, and the `exec` then fails with `ETXTBSY`
   ("Text file busy"); the helpers return only once no writer is left.
+- **Hermetic e2e tests** (#993): a test that spawns the `tole` binary, or code
+  that spawns external tools (`cora`, `uteke`, `git`, a shell), builds its
+  `Command` with `common::hermetic_command(program, &home, &extra_env)`
+  (`crates/tole-cli/tests/common/hermetic.rs`), never a bare `Command::new`.
+  It sets `HOME` and `CODECORA_HOME` to the test's own home, drops every `PATH`
+  directory holding `cora` or `uteke` (the rest stays, so `sh` and `git` work)
+  and clears the XDG overrides; `extra_env` is applied last, so a test that
+  wants a shim or a decoy overrides there. Without it a test passes in CI and
+  fails, or writes real state, on a machine that has those tools and a
+  `~/.codecora`. Unconverted files are tracked in #993.
 - **Code review**: every PR gets a Cora review (below) plus maintainer review
   before merge. CI must be green.
 
