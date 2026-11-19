@@ -33,6 +33,8 @@ decisions revalidate per request; auth failures are rate-limited per source IP).
 | Prompt with images | `POST /sessions/{id}/prompt` `{text, images: [<id>]}` (#558) | the turn records the references, never the blob |
 | Read an image | `GET /sessions/{id}/images/{fnv1a64}` (#558) | only images recorded in that session's log |
 | Cost report | `GET /sessions/{id}/status` | the `mission` register: turns, steps, tokens, wall time, per-risk-tier tool calls |
+| Fork a session | `POST /sessions/{id}/fork` `{"at"?: <seq>}` (#947) | `200 {"id", "forkedFrom", "at", "seq"}`: a NEW session file in the same sessions directory, the lineage up to the settled entry whose `seq` (as `GET …/entries` shows it) is `at`, default the last settled one; same `JsonlStorage::fork` as the TUI `/fork` and `tole branch`, and the source is never touched. The fork is not made live: `POST /sessions {"resume": "<id>"}` opens it. `404` unknown session, `409` while a turn runs, `400` for a bad `at`, an unknown seq or an entry that is not a settled final assistant message |
+| Session family tree | `GET /sessions/{id}/tree` (#947) | `200 {"id", "tree": [{"id", "parent", "at", "state", "turns", "depth", "current"}]}`: the session's parent chain up to the root and every fork below it, depth-first (`depth` 0 = the root), the same reader as `tole sessions --tree` and the TUI `/tree`. Read from the session files, so it answers while a turn runs. `404` unknown session |
 
 The round trip the app must support (the cross-repo acceptance):
 
