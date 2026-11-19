@@ -2406,22 +2406,16 @@ impl HostConfig {
         quiet: bool,
         budget_left: Option<u64>,
     ) -> Result<()> {
-        let brief = tole_core::router::Brief {
+        tole_cli::session::assemble::route_session(
+            storage,
+            &self.delegation,
+            self.profile_name.as_deref(),
             kind,
             prompt,
-            max_risk: registry.max_risk(),
-            profile: self.profile_name.as_deref(),
-            job: None,
+            registry,
+            quiet,
             budget_left,
-        };
-        let secrets = tole_cli::provider_chain::process_secrets(&tole_cli::config_apply::real_env);
-        let line =
-            tole_cli::routing::route_new_session(storage, &self.delegation.cfg, &brief, &secrets)
-                .map_err(|e| anyhow!(secrets.redact(&e).into_owned()))?;
-        if let (Some(l), false) = (line, quiet) {
-            eprintln!("{l}");
-        }
-        Ok(())
+        )
     }
 
     fn on_pretool_non_empty(&self) -> bool {
