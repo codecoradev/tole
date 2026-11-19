@@ -28,6 +28,7 @@ decisions revalidate per request; auth failures are rate-limited per source IP).
 | Live events | `GET /sessions/{id}/events?after=<seq>` (#524) | Server-Sent Events, see [Event stream](#event-stream-524); replays the log from a `seq`, then follows it |
 | Start in plan mode | `POST /sessions` `{cwd, "plan_mode": true}` (#947) | the same registry filter as `--plan-mode`: mutation tools (write, run_command, agent_start, todo_write, ...) are ABSENT from the session's tool list, not asked about. Answers `planMode: true`. A request can only turn it on: `false` or absence leaves the default, and a `tole serve --plan-mode` process keeps every session in plan mode. `400` for a non-boolean, or combined with `resume` |
 | Start with a profile | `POST /sessions` `{cwd, "profile": "<name>"}` (#740) | persona, allow list, memory room and model of a user-config profile, see [Session profiles](#session-profiles-740) |
+| List past sessions | `GET /sessions/index?limit=<n>&cursor=<c>` (#572) | the sessions of this server's workspace that are not necessarily live, newest first, metadata only; see [Past sessions](#past-sessions-572) |
 | Resume a session | `POST /sessions` `{"resume": "<id>"}` (#524) | reopen an existing session, see [Resume by id](#resume-by-id-524) |
 | Read the transcript | `GET /sessions/{id}/entries?after=<seq>&limit=<n>` (#524) | one page of the session's log, see [Transcript read](#transcript-read-524); works while a turn runs |
 | Upload an image | `POST /sessions/{id}/images` (raw body, #558) | returns `{id, mime, bytes, fnv1a64}`; see [Images](#images-558) |
@@ -114,6 +115,32 @@ session's log, so a client that connects late or reconnects can render history:
 - Entries carry tool inputs and outputs. The token already grants approval authority
   and `POST …/prompt`; the read route adds no new trust, but anything printed into a
   session is readable by every holder of the token.
+
+## Past sessions (#572)
+
+`GET /sessions/index?limit=<n>&cursor=<c>` lists the sessions on disk, so a client can offer "continue" after a
+restart or from a second device. `GET /sessions` stays the live list (`id`, `busy`).
+
+```
+200 {"sessions": [{"id", "name", "folder", "lastActivity", "entries", "turns", "parent", "live", "busy"}],
+     "nextCursor": "<c>" | null, "skipped": <n>, "scanTruncated": <bool>}
+```
+
+- **Metadata only.** `name` is the operator's label (`fact/session_name`, or `null`), `folder` the working
+  directory the session recorded (a session opened by serve records none, so it shows the workspace the directory belongs to), `lastActivity` the session file's
+  modification time in ms, `entries` and `turns` counts, `parent` the session it was forked from, `live`/`busy`
+  whether this process holds it. No prompt, preview, tool output or transcript text is ever returned.
+- **Order and paging.** Newest first (ties by id). `limit` defaults to 50 and is clamped to 100 (`0`, a negative or a
+  non-number is `400`). Pass `nextCursor` back as `cursor` for the next page; `null` means the end. A cursor that is
+  not `<digits>.<session id>` is `400`. A page can hold fewer rows than `limit` while `nextCursor` is set (the
+  per-request ceilings below, or skipped files): keep following it.
+- **Scope.** Only this server's own sessions directory (`--sessions-dir`, else `<workspace>/.tole/sessions`);
+  the request never names a path. With `--sessions-dir` the directory may be shared, so a session whose recorded
+  folder is outside the workspace is left out. An id from the list goes to `POST /sessions {"resume": "<id>"}`.
+- **Bounded cost.** Ordering uses names and file times only. Per request at most 10,000 directory entries are
+  read (`scanTruncated: true` when more exist), at most 200 session files are opened, none over 16 MiB (counted in
+  `skipped`, never replayed) and 64 MiB in total. A torn or unreadable file is skipped (`skipped`), never an error.
+- `401` without the token, like every route.
 
 ## Resume by id (#524)
 
