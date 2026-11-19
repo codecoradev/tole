@@ -422,7 +422,7 @@ skill library (codecoradev/uteke#1731), shared secret-detector crate
 | UI stack (epic #523) | #527, #528, #529, #561 (parked) |
 | Tests and CI | #781 (leaked temp dirs), #812 (wait_until helper and a 1-CPU job; covers flaky #702, #712, #738), #806 (develop red after a series of PRs), #705 and #670 (Cora Review in CI), #566 (iOS cross-compile job), #669 (cora code intelligence accuracy) |
 | Docs and process | #807 (local Cora review), #808 (this page) |
-| One assembly for every face (epic #941) | #942 to #944 done (prompt, skills, roster via `FacePolicy`, routing step, every turn through `turn_runner`); #948 the parity table [docs/faces.md](faces.md) and its test (done); #945 to #947 and #949 open |
+| One assembly for every face (epic #941) | #942 to #944 done (prompt, skills, roster via `FacePolicy`, routing step, every turn through `turn_runner`); #947 done (fork, tree, compact, name, plan mode and mission over `serve`); #948 the parity table [docs/faces.md](faces.md) and its test (done); #945 capability 1 done (default prompt and review guidance for server sessions), skills and routing open; #946 and #949 await owner decisions |
 
 ## Layering and published crates
 

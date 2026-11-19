@@ -64,9 +64,9 @@ true; the status column says where the work is.
 | Review guidance (named only when both review tools are present) | yes | yes (#945) | n/a | no | one path |
 | Model routing for a new session (#586) | yes | no | n/a | no | drift #945 |
 | MCP client servers (`--mcp-server`, the cora preset) | yes | no | no | no | drift #946 (a trust boundary; the owner's configured servers only, never the request) |
-| Plan mode | per process flag | per process flag | per process flag | per job (`read_only`) | drift #947 (per session over `serve`) |
-| Fork, tree, compact, name a session | yes | no | n/a | n/a | drift #947 |
-| Mission chaining with a budget | yes | no | n/a | n/a | drift #947 (the verify command stays owner configuration) |
+| Plan mode | per process flag | per process flag, or per session with `POST /sessions {"plan_mode": true}` (#947) | per process flag | per job (`read_only`) | one path (a request can only turn it on) |
+| Fork, tree, compact, name a session | yes | yes (`serve` routes, #947) | n/a | n/a | one path |
+| Mission chaining with a budget | yes | yes (`POST /missions`, #947; a mission is its own session) | n/a | n/a | one path (the verify command, the ceilings and the workspace stay owner configuration) |
 | Every turn through `turn_runner` | yes (#944) | yes | n/a | yes | one path |
 | Tool roster built by `roster_for` and a `FacePolicy` (#943) | yes | yes | yes | yes | one path |
 | The approval gate (`gate::authorize`) | yes | yes | yes | yes | one path |
